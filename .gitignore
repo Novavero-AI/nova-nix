@@ -1,0 +1,12 @@
+dist-newstyle/
+*.hi
+*.o
+*.dyn_hi
+*.dyn_o
+.ghc.environment.*
+cabal.project.local
+cabal.project.local~
+*~
+.HTF/
+result
+CLAUDE.md
