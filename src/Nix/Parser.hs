@@ -51,30 +51,21 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Nix.Expr.Types (Expr)
-
--- | A parse error with position and message.
-data ParseError = ParseError
-  { peFile :: !Text,
-    peLine :: !Int,
-    peCol :: !Int,
-    peMessage :: !Text
-  }
-  deriving (Eq, Show)
+import Nix.Parser.Expr (parseTopLevel)
+import Nix.Parser.Internal (ParseState (..), runParser)
+import Nix.Parser.Lexer (tokenize)
+import Nix.Parser.ParseError (ParseError (..))
 
 -- | Parse a Nix expression from source text.
 --
 -- The input is the full file contents. The file name is used only for
 -- error messages.
 parseNix :: Text -> Text -> Either ParseError Expr
-parseNix _fileName _source =
-  -- TODO: implement recursive descent parser
-  Left
-    ParseError
-      { peFile = _fileName,
-        peLine = 0,
-        peCol = 0,
-        peMessage = "Parser not yet implemented"
-      }
+parseNix fileName source = do
+  tokens <- tokenize fileName source
+  let st = ParseState {psTokens = tokens, psFile = fileName}
+  (expr, _remaining) <- runParser parseTopLevel st
+  pure expr
 
 -- | Parse a @.nix@ file from disk.
 parseNixFile :: FilePath -> IO (Either ParseError Expr)

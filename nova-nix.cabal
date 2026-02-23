@@ -32,6 +32,10 @@ library
     Nix.Expr
     Nix.Expr.Types
     Nix.Parser
+    Nix.Parser.Expr
+    Nix.Parser.Internal
+    Nix.Parser.Lexer
+    Nix.Parser.ParseError
     Nix.Eval
     Nix.Store
     Nix.Store.Path
