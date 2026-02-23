@@ -115,7 +115,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 | Module | Purpose | Status |
 |--------|---------|--------|
 | `Nix.Derivation` | Derivation type, ATerm serialization, platform detection | Done |
-| `Nix.Hash` | Derivation hashing, store path computation | Stub |
+| `Nix.Hash` | Derivation hashing, store path computation, shared hex/base-32 utilities | Done |
 | `Nix.Store.Path` | Store path types — `StoreDir`, `StorePath`, Windows/Unix support | Done |
 | `Nix.Store.DB` | SQLite store database — path registration, reference tracking | Stub |
 | `Nix.Store` | High-level store operations | Stub |
@@ -159,7 +159,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 **Key numbers:**
 
-- **20 modules** — 13 implemented, 7 scaffold
+- **20 modules** — 14 implemented, 6 scaffold
 - **381 tests** — hand-rolled harness, no framework dependencies
 - **Zero partial functions** — total by construction
 - **Strict by default** — bang patterns on all data fields (except Thunk's Env, which is lazy for knot-tying)

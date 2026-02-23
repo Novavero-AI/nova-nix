@@ -32,6 +32,7 @@ module Nix.Store.Path
   ( -- * Store directory
     StoreDir (..),
     defaultStoreDir,
+    defaultStoreDirText,
     windowsStoreDir,
 
     -- * Store paths
@@ -51,6 +52,10 @@ newtype StoreDir = StoreDir {unStoreDir :: FilePath}
 -- | Default store directory on Unix: @\/nix\/store@.
 defaultStoreDir :: StoreDir
 defaultStoreDir = StoreDir "/nix/store"
+
+-- | Default store directory as 'Text', for use in the evaluator.
+defaultStoreDirText :: Text
+defaultStoreDirText = T.pack (unStoreDir defaultStoreDir)
 
 -- | Default store directory on Windows: @C:\\nix\\store@.
 windowsStoreDir :: StoreDir

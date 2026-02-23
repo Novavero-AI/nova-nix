@@ -61,6 +61,7 @@ module Nix.Derivation
     Platform (..),
     currentPlatform,
     platformToText,
+    textToPlatform,
   )
 where
 
@@ -116,6 +117,16 @@ platformToText Aarch64_Darwin = "aarch64-darwin"
 platformToText X86_64_Windows = "x86_64-windows"
 platformToText Aarch64_Linux = "aarch64-linux"
 platformToText (OtherPlatform t) = t
+
+-- | Parse a Nix platform string into a 'Platform'.
+textToPlatform :: Text -> Platform
+textToPlatform t = case t of
+  "x86_64-linux" -> X86_64_Linux
+  "x86_64-darwin" -> X86_64_Darwin
+  "aarch64-darwin" -> Aarch64_Darwin
+  "x86_64-windows" -> X86_64_Windows
+  "aarch64-linux" -> Aarch64_Linux
+  other -> OtherPlatform other
 
 -- | A single output of a derivation.
 data DerivationOutput = DerivationOutput

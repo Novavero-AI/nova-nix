@@ -26,11 +26,9 @@ module Nix.Eval.IO
 where
 
 import Control.Exception (Exception, SomeException, displayException, fromException, throwIO, try)
+import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), asks, local)
-import qualified Crypto.Hash as CH
-import qualified Data.ByteArray as BA
-import qualified Data.ByteString as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -39,12 +37,11 @@ import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import qualified Data.Text.IO as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Data.Word (Word8)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope)
 import Nix.Eval (eval)
 import Nix.Eval.Types (MonadEval (..), NixValue)
+import Nix.Hash (sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix)
-import NovaCache.Base32 (encode)
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
@@ -68,7 +65,7 @@ instance Exception NixEvalError
 -- | Shared state for IO evaluation.
 --
 -- 'esImportCache' is a shared mutable cache (global across all frames).
--- Single-threaded only — switch to 'MVar' or 'TVar' if concurrent
+-- Single-threaded only — switch to @MVar@ or @TVar@ if concurrent
 -- evaluation is ever added.
 --
 -- 'esBaseDir' is immutable per frame — @import@ uses 'local' to set it
@@ -158,6 +155,13 @@ instance MonadEval EvalIO where
   getCurrentTime = EvalIO (asks esTimestamp)
 
   writeToStore name contents = do
+    -- Validate name to prevent path traversal
+    when (T.any (== '/') name) $
+      throwEvalError ("writeToStore: name must not contain '/': " <> name)
+    when (T.isInfixOf ".." name) $
+      throwEvalError ("writeToStore: name must not contain '..': " <> name)
+    when (T.any (== '\0') name) $
+      throwEvalError ("writeToStore: name must not contain null bytes: " <> name)
     storeDir <- EvalIO (asks esStoreDir)
     let contentHash = sha256Hex (encodeUtf8 contents)
         inner = "nix-store:sha256:" <> contentHash <> ":" <> T.pack storeDir <> ":" <> name
@@ -237,7 +241,7 @@ wrapIO action = EvalIO $ liftIO $ do
 -- | Run an IO evaluation, returning @Left@ on error.
 --
 -- Note: only catches 'NixEvalError'.  Async exceptions
--- ('StackOverflow', 'ThreadKilled', etc.) propagate uncaught.
+-- (@StackOverflow@, @ThreadKilled@, etc.) propagate uncaught.
 runEvalIO :: EvalState -> EvalIO a -> IO (Either Text a)
 runEvalIO st (EvalIO action) = do
   result <- try (runReaderT action st)
@@ -250,24 +254,3 @@ lookupEnvText name = do
   case (result :: Either SomeException (Maybe String)) of
     Left _ -> pure Nothing
     Right mval -> pure mval
-
--- | SHA-256 hex digest of a ByteString.
-sha256Hex :: BS.ByteString -> Text
-sha256Hex bs =
-  let digest = CH.hash bs :: CH.Digest CH.SHA256
-      bytes = BA.unpack digest
-   in T.pack (concatMap byteToHex bytes)
-
--- | Truncate a SHA-256 digest to 20 bytes and Nix-base32 encode.
-truncatedBase32 :: BS.ByteString -> Text
-truncatedBase32 bs =
-  let digest = CH.hash bs :: CH.Digest CH.SHA256
-      bytes20 = BS.pack (take 20 (BA.unpack digest :: [Word8]))
-   in encode bytes20
-
--- | Format a single byte as two hex digits.
-byteToHex :: Word8 -> String
-byteToHex w =
-  let (hi, lo) = quotRem (fromIntegral w :: Int) 16
-      hexDigit n = "0123456789abcdef" !! n
-   in [hexDigit hi, hexDigit lo]

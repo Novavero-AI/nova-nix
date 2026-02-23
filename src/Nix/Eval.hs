@@ -35,6 +35,9 @@ module Nix.Eval
     BuiltinDef (..),
     builtinRegistry,
     builtinNames,
+
+    -- * Platform
+    currentSystemStr,
   )
 where
 
@@ -42,7 +45,6 @@ import Control.Monad (when, (>=>))
 import qualified Crypto.Hash as CH
 import Data.Bits (xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
-import qualified Data.ByteString as BS
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, ord)
 import Data.List (foldl')
 import Data.Map.Strict (Map)
@@ -51,8 +53,7 @@ import Data.Maybe (catMaybes, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Word (Word8)
-import Nix.Derivation (Derivation (..), Platform (..), toATerm)
+import Nix.Derivation (Derivation (..), textToPlatform, toATerm)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
 import Nix.Eval.Types
@@ -80,7 +81,8 @@ import Nix.Expr.Types
     Formals (..),
     NixAtom (..),
   )
-import qualified NovaCache.Base32
+import Nix.Hash (byteToHex, sha256Hex, truncatedBase32)
+import Nix.Store.Path (defaultStoreDirText)
 import qualified System.Info
 
 -- | Evaluate a Nix expression in an environment.
@@ -496,8 +498,6 @@ builtinRegistry =
       -- Control (arity 1)
       builtin1 "throw" builtinThrow,
       builtin1 "abort" builtinThrow,
-      -- System (arity 1)
-      builtin1 "currentSystem" (\_ -> pure (VStr currentSystemStr)),
       -- Attr set operations (arity 1)
       builtin1 "attrNames" builtinAttrNames,
       builtin1 "attrValues" builtinAttrValues,
@@ -1082,6 +1082,10 @@ currentSystemStr = case (System.Info.arch, System.Info.os) of
   ("x86_64", "linux") -> "x86_64-linux"
   (arch, os) -> T.pack arch <> "-" <> T.pack os
 
+-- | Store dir with trailing slash, for building store paths.
+storeDirPrefix :: Text
+storeDirPrefix = defaultStoreDirText <> "/"
+
 -- ---------------------------------------------------------------------------
 -- Batch 1: Trivial pure builtins
 -- ---------------------------------------------------------------------------
@@ -1316,7 +1320,8 @@ compareComponent a b
   | otherwise = if a < b then -1 else 1
   where
     allDigits t = not (T.null t) && T.all isDigit t
-    readInt t = read (T.unpack t) :: Integer
+    readInt :: Text -> Integer
+    readInt = T.foldl' (\acc c -> acc * 10 + fromIntegral (digitToInt c)) (0 :: Integer)
     compare' x y
       | x < y = -1
       | x > y = 1
@@ -1415,10 +1420,12 @@ valueToJSON (VAttrs attrs) = do
   pairs <- mapM (jsonPair attrs) sortedKeys
   pure ("{" <> T.intercalate "," pairs <> "}")
   where
-    jsonPair attrMap key = do
-      val <- force (attrMap Map.! key)
-      jsonVal <- valueToJSON val
-      pure (jsonEscapeString key <> ":" <> jsonVal)
+    jsonPair attrMap key = case Map.lookup key attrMap of
+      Nothing -> pure ""
+      Just thunk -> do
+        val <- force thunk
+        jsonVal <- valueToJSON val
+        pure (jsonEscapeString key <> ":" <> jsonVal)
 valueToJSON (VPath p) = pure (jsonEscapeString p)
 valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
@@ -1583,12 +1590,6 @@ digestToHex digest =
   let bytes = BA.unpack digest
    in T.pack (concatMap byteToHex bytes)
 
-byteToHex :: Word8 -> String
-byteToHex w =
-  let (hi, lo) = quotRem (fromIntegral w :: Int) 16
-      hexDigit n = "0123456789abcdef" !! n
-   in [hexDigit hi, hexDigit lo]
-
 -- ---------------------------------------------------------------------------
 -- Batch 6: deepSeq
 -- ---------------------------------------------------------------------------
@@ -1717,8 +1718,8 @@ builtinToPath other =
 builtinPlaceholder :: (MonadEval m) => NixValue -> m NixValue
 builtinPlaceholder (VStr outputName) =
   let preimage = "nix-output:" <> outputName
-      hashText = truncatedNixBase32 (TE.encodeUtf8 preimage)
-   in pure (VPath ("/nix/store/" <> hashText <> "-" <> outputName))
+      hashText = truncatedBase32 (TE.encodeUtf8 preimage)
+   in pure (VPath (storeDirPrefix <> hashText <> "-" <> outputName))
 builtinPlaceholder other =
   throwEvalError ("builtins.placeholder: expected a string, got " <> typeName other)
 
@@ -1730,9 +1731,9 @@ builtinStorePath other =
 
 validateStorePath :: (MonadEval m) => Text -> m NixValue
 validateStorePath p
-  | "/nix/store/" `T.isPrefixOf` p,
-    T.length p > T.length "/nix/store/",
-    let basename = T.drop (T.length "/nix/store/") p,
+  | storeDirPrefix `T.isPrefixOf` p,
+    T.length p > T.length storeDirPrefix,
+    let basename = T.drop (T.length storeDirPrefix) p,
     T.length basename >= 33,
     T.index basename 32 == '-' =
       pure (VPath p)
@@ -1847,12 +1848,13 @@ builtinFetchTarball other =
 
 builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
 builtinFetchGit (VStr url) = do
-  (code, stdout, stderr) <- runProcess "git" ["clone", "--depth", "1", url, "/tmp/nova-nix-fetchgit"] ""
+  -- Use a content-based temp dir to avoid predictable paths
+  let urlHash = sha256Hex (TE.encodeUtf8 url)
+      tmpDir = "/tmp/nova-nix-fetchgit-" <> urlHash
+  (code, _stdout, stderr) <- runProcess "git" ["clone", "--depth", "1", "--", url, tmpDir] ""
   if code /= 0
     then throwEvalError ("builtins.fetchGit: git clone failed: " <> stderr)
-    else do
-      _ <- pure stdout
-      pure (VPath "/tmp/nova-nix-fetchgit")
+    else pure (VPath tmpDir)
 builtinFetchGit (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchGit" "url" attrs
   builtinFetchGit (VStr url)
@@ -1862,7 +1864,7 @@ builtinFetchGit other =
 -- | Fetch a URL and optionally verify its hash.
 fetchUrlSimple :: (MonadEval m) => Text -> Maybe Text -> m NixValue
 fetchUrlSimple url _sha256 = do
-  (code, stdout, stderr) <- runProcess "curl" ["-sSfL", url] ""
+  (code, stdout, stderr) <- runProcess "curl" ["-sSfL", "--", url] ""
   if code /= 0
     then throwEvalError ("fetch failed: " <> stderr)
     else do
@@ -1942,14 +1944,16 @@ builtinDerivation (VAttrs attrs) = do
 
   -- Serialize to ATerm and hash for drvPath
   let aterm = toATerm drv
-      drvPathHash = truncatedNixBase32 (TE.encodeUtf8 ("text:sha256:" <> sha256HexBS (TE.encodeUtf8 aterm) <> ":/nix/store:" <> drvName <> ".drv"))
-      drvPath = "/nix/store/" <> drvPathHash <> "-" <> drvName <> ".drv"
+      storeRef = ":" <> defaultStoreDirText <> ":"
+      drvPathHash = truncatedBase32 (TE.encodeUtf8 ("text:sha256:" <> sha256Hex (TE.encodeUtf8 aterm) <> storeRef <> drvName <> ".drv"))
+      drvPath = storeDirPrefix <> drvPathHash <> "-" <> drvName <> ".drv"
 
   -- Compute output paths
   let computeOutPath outName =
-        let preimage = "output:" <> outName <> ":sha256:" <> sha256HexBS (TE.encodeUtf8 aterm) <> ":/nix/store:" <> drvName <> (if outName == "out" then "" else "-" <> outName)
-            outHash = truncatedNixBase32 (TE.encodeUtf8 preimage)
-         in "/nix/store/" <> outHash <> "-" <> drvName <> (if outName == "out" then "" else "-" <> outName)
+        let nameSuffix = if outName == "out" then "" else "-" <> outName
+            preimage = "output:" <> outName <> ":sha256:" <> sha256Hex (TE.encodeUtf8 aterm) <> storeRef <> drvName <> nameSuffix
+            outHash = truncatedBase32 (TE.encodeUtf8 preimage)
+         in storeDirPrefix <> outHash <> "-" <> drvName <> nameSuffix
 
   let outPaths = [(outName, computeOutPath outName) | outName <- outputNames]
       mainOutPath = case outPaths of
@@ -1973,16 +1977,6 @@ builtinDerivation (VAttrs attrs) = do
   pure (VAttrs resultAttrs)
 builtinDerivation other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
-
--- | Convert a system string to a Platform.
-textToPlatform :: Text -> Platform
-textToPlatform t = case t of
-  "x86_64-linux" -> X86_64_Linux
-  "x86_64-darwin" -> X86_64_Darwin
-  "aarch64-darwin" -> Aarch64_Darwin
-  "x86_64-windows" -> X86_64_Windows
-  "aarch64-linux" -> Aarch64_Linux
-  other -> OtherPlatform other
 
 -- | Force a thunk to a Text string.
 forceToText :: (MonadEval m) => Thunk -> m Text
@@ -2020,31 +2014,3 @@ collectDrvEnv attrs = do
                 _ -> pure Nothing
             Nothing -> pure Nothing
         _ -> pure Nothing
-
--- ---------------------------------------------------------------------------
--- Shared hashing helpers
--- ---------------------------------------------------------------------------
-
--- | Truncate a SHA-256 digest to 20 bytes and Nix base-32 encode.
-truncatedNixBase32 :: BS.ByteString -> Text
-truncatedNixBase32 bs =
-  let digest = CH.hash bs :: CH.Digest CH.SHA256
-      bytes20 = BS.pack (Prelude.take 20 (BA.unpack digest :: [Word8]))
-   in nixBase32Encode bytes20
-
--- | SHA-256 hex digest of a ByteString.
-sha256HexBS :: BS.ByteString -> Text
-sha256HexBS bs =
-  let digest = CH.hash bs :: CH.Digest CH.SHA256
-      bytes = BA.unpack digest
-   in T.pack (concatMap byteToHexEval bytes)
-
-byteToHexEval :: Word8 -> String
-byteToHexEval w =
-  let (hi, lo) = quotRem (fromIntegral w :: Int) 16
-      hexDigit n = "0123456789abcdef" !! n
-   in [hexDigit hi, hexDigit lo]
-
--- | Nix base-32 encoding using nova-cache.
-nixBase32Encode :: BS.ByteString -> Text
-nixBase32Encode = NovaCache.Base32.encode

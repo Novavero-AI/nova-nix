@@ -1,7 +1,7 @@
 -- | Binary and unary operator evaluation for Nix.
 --
 -- Short-circuiting operators ('OpAnd', 'OpOr', 'OpImpl') are handled
--- directly in 'Nix.Eval.eval' because they must not evaluate both
+-- directly in @Nix.Eval.eval@ because they must not evaluate both
 -- operands.  Everything else lives here.
 module Nix.Eval.Operator
   ( evalBinary,

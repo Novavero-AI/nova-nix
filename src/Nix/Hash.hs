@@ -26,11 +26,17 @@
 --   network transfer integrity.
 --
 -- nova-cache already handles output hashes and file hashes.  This module
--- adds input hash (derivation hash) computation for the evaluator.
+-- adds input hash (derivation hash) computation for the evaluator, plus
+-- shared hashing utilities used by the evaluator and IO layer.
 module Nix.Hash
   ( -- * Derivation hashing
     DrvHash (..),
     hashDerivation,
+
+    -- * Shared hashing utilities
+    sha256Hex,
+    truncatedBase32,
+    byteToHex,
 
     -- * Re-exports from nova-cache
     hashBytes,
@@ -39,8 +45,14 @@ module Nix.Hash
   )
 where
 
+import qualified Crypto.Hash as CH
+import qualified Data.ByteArray as BA
+import qualified Data.ByteString as BS
 import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
+import Data.Word (Word8)
+import NovaCache.Base32 (encode)
 import NovaCache.Hash (formatNixHash, hashBytes, parseNixHash)
 
 -- | A derivation hash — the input hash that determines the store path.
@@ -61,5 +73,25 @@ hashDerivation drvText =
       nixHash = hashBytes drvBytes
    in DrvHash (formatNixHash nixHash)
 
--- Note: encodeUtf8 comes from Data.Text.Encoding.
--- In the full implementation this will use the ATerm serialization.
+-- | SHA-256 hex digest of a ByteString.
+sha256Hex :: BS.ByteString -> Text
+sha256Hex bs =
+  let digest = CH.hash bs :: CH.Digest CH.SHA256
+      bytes = BA.unpack digest
+   in T.pack (concatMap byteToHex bytes)
+
+-- | Truncate a SHA-256 digest to 20 bytes and Nix base-32 encode.
+truncatedBase32 :: BS.ByteString -> Text
+truncatedBase32 bs =
+  let digest = CH.hash bs :: CH.Digest CH.SHA256
+      bytes20 = BS.pack (take 20 (BA.unpack digest :: [Word8]))
+   in encode bytes20
+
+-- | Format a single byte as two lowercase hex digits.
+byteToHex :: Word8 -> String
+byteToHex w =
+  let (hi, lo) = quotRem (fromIntegral w :: Int) 16
+      hexDigit n
+        | n < 10 = toEnum (fromEnum '0' + n)
+        | otherwise = toEnum (fromEnum 'a' + n - 10)
+   in [hexDigit hi, hexDigit lo]

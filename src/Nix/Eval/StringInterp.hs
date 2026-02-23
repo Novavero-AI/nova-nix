@@ -1,8 +1,9 @@
 -- | String interpolation evaluation for Nix.
 --
--- Handles both regular strings (@"..."@) and indented strings (@''...''@).
+-- Handles both regular strings (double-quoted) and indented strings
+-- (double single-quoted).
 -- Takes the evaluator as a parameter to break the import cycle with
--- 'Nix.Eval'.
+-- @Nix.Eval@.
 module Nix.Eval.StringInterp
   ( evalStringParts,
     evalIndStringParts,
@@ -18,13 +19,13 @@ import Nix.Expr.Types (Expr, StringPart (..))
 -- | The evaluator function, passed as a parameter to avoid cyclic imports.
 type Eval m = Env -> Expr -> m NixValue
 
--- | Evaluate the parts of a regular string (@"..."@).
+-- | Evaluate the parts of a regular string (double-quoted).
 evalStringParts :: (MonadEval m) => Eval m -> Env -> [StringPart] -> m Text
 evalStringParts evalFn env parts = do
   chunks <- mapM (evalOnePart evalFn env) parts
   pure (T.concat chunks)
 
--- | Evaluate the parts of an indented string (@''...''@).
+-- | Evaluate the parts of an indented string (double single-quoted).
 --
 -- After interpolation, strips the common leading whitespace from all
 -- non-empty lines (the standard Nix indented-string semantics).
@@ -66,7 +67,7 @@ coerceToString val = case val of
 -- Algorithm (matching C++ Nix):
 -- 1. Split into lines.
 -- 2. Find the minimum indentation of all non-empty lines (excluding
---    the first line, which has no leading whitespace in @''...''@).
+--    the first line, which has no leading whitespace in double single-quoted).
 -- 3. Strip that many spaces/tabs from the front of each line.
 -- 4. Drop a single leading newline if present.
 -- 5. Drop a single trailing newline if present.

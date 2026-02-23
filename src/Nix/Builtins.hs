@@ -1,9 +1,10 @@
--- | Built-in functions for the Nix evaluator.
+-- | Built-in function environment for the Nix evaluator.
 --
 -- Every Nix expression has access to a @builtins@ attribute set containing
--- ~100 functions.  This module provides the initial environment with the
--- subset implemented so far: type checks, basic list/string operations,
--- control flow, and @currentSystem@.
+-- ~100 functions.  This module assembles the initial 'Env' from the
+-- central registry in "Nix.Eval" and adds standard constants
+-- (@true@, @false@, @null@, @storeDir@, @currentTime@,
+-- @currentSystem@, etc.).
 module Nix.Builtins
   ( -- * Builtin registration
     builtinEnv,
@@ -13,7 +14,8 @@ where
 
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
-import Nix.Eval (Env (..), NixValue (..), Thunk (..), builtinNames, evaluated)
+import Nix.Eval (Env (..), NixValue (..), Thunk (..), builtinNames, currentSystemStr, evaluated)
+import Nix.Store.Path (defaultStoreDirText)
 
 -- | The initial environment containing all builtins.
 --
@@ -61,11 +63,12 @@ standardEntries timestamp =
     [ ("true", val (VBool True)),
       ("false", val (VBool False)),
       ("null", val VNull),
-      ("storeDir", val (VStr "/nix/store")),
+      ("storeDir", val (VStr defaultStoreDirText)),
       ("nixVersion", val (VStr "2.24.0")),
       ("langVersion", val (VInt 6)),
       ("nixPath", val (VList [])),
-      ("currentTime", val (VInt timestamp))
+      ("currentTime", val (VInt timestamp)),
+      ("currentSystem", val (VStr currentSystemStr))
     ]
 
 -- | Wrap a value as an already-evaluated thunk.

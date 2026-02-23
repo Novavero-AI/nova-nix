@@ -65,15 +65,15 @@ data NixAtom
 data StringPart
   = -- | Literal text.
     StrLit !Text
-  | -- | Interpolated expression (@${...}@).
+  | -- | Interpolated expression (@${expr}@).
     StrInterp !Expr
   deriving (Eq, Show)
 
 -- | An attribute key: either a static identifier or a dynamic expression.
 data AttrKey
-  = -- | Static key: @{ foo = ...; }@
+  = -- | Static key: @{ foo = val; }@
     StaticKey !Text
-  | -- | Dynamic key: @{ ${expr} = ...; }@
+  | -- | Dynamic key: @{ ${expr} = val; }@
     DynamicKey !Expr
   deriving (Eq, Show)
 
@@ -99,7 +99,7 @@ data Formal = Formal
 data Formals
   = -- | Single identifier: @x: body@
     FormalName !Text
-  | -- | Attribute set pattern: @{ a, b, ... }: body@
+  | -- | Attribute set pattern with optional ellipsis: @{ a, b }: body@
     FormalSet ![Formal] !Bool
   | -- | Named set pattern: @args\@{ a, b }: body@
     FormalNamedSet !Text ![Formal] !Bool
@@ -140,7 +140,7 @@ data Expr
     ELit !NixAtom
   | -- | String with possible interpolations.
     EStr ![StringPart]
-  | -- | Indented string (@''...''@).
+  | -- | Indented string (double single-quoted).
     EIndStr ![StringPart]
   | -- | Variable reference.
     EVar !Text
