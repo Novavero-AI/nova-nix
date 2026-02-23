@@ -34,6 +34,7 @@ module Nix.Builder
   ( -- * Build execution
     BuildResult (..),
     buildDerivation,
+    buildWithDeps,
 
     -- * Build configuration
     BuildConfig (..),
@@ -47,12 +48,18 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
-import Nix.Derivation (Derivation (..), DerivationOutput (..))
+import qualified Data.Text.IO as TIO
+import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
+import qualified Nix.DependencyGraph
+import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Store (Store (..), addToStore, isValid, scanReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
+import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, removeDirectoryRecursive)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
+import qualified System.IO
+import qualified System.IO.Unsafe
 import qualified System.Info
 import qualified System.Process as Proc
 
@@ -89,7 +96,9 @@ data BuildConfig = BuildConfig
     -- | Path to bash executable (shipped with nova-nix on Windows).
     bcBashPath :: !FilePath,
     -- | Enable sandboxing (not yet implemented on Windows).
-    bcSandbox :: !Bool
+    bcSandbox :: !Bool,
+    -- | Binary caches to try before building (checked in priority order).
+    bcCaches :: ![CacheConfig]
   }
   deriving (Eq, Show)
 
@@ -100,7 +109,8 @@ defaultBuildConfig dir =
     { bcStoreDir = dir,
       bcTmpDir = "/tmp/nova-nix-build",
       bcBashPath = "/bin/bash",
-      bcSandbox = False
+      bcSandbox = False,
+      bcCaches = []
     }
 
 -- | Result of a build attempt.
@@ -155,10 +165,10 @@ buildDerivationInner config store drv = do
           builderArgs = map T.unpack (drvArgs drv)
       exitResult <- runBuilder builderPath builderArgs environ buildDir
       case exitResult of
-        Left (exitCode, stderr_) -> do
+        Left (exitCode, stderrText) -> do
           -- 6. Failure: clean up
           cleanupBuildDir buildDir
-          pure (BuildFailure ("builder failed: " <> stderr_) exitCode)
+          pure (BuildFailure ("builder failed: " <> stderrText) exitCode)
         Right () -> do
           -- 7. Success: register each output
           registerResult <- registerOutputs config store drv buildDir outputDirs
@@ -241,8 +251,8 @@ buildEnvironment config drv buildDir outputDirs =
    in -- Priority: output paths > derivation env > standard env
       Map.unions [outputEnv, baseEnv, standardEnv]
 
--- | Default PATH for builds.  Includes the store directory plus standard
--- system directories so that basic commands (mkdir, cp, echo) are available.
+-- | Default PATH for builds.  Includes standard system directories
+-- so that basic commands (mkdir, cp, echo) are available.
 -- In a future sandboxed build, this will be restricted to only the
 -- derivation's declared inputs.
 defaultBuildPath :: Text
@@ -279,10 +289,10 @@ runBuilder builderPath builderArgs environ workDir = do
             Proc.std_out = Proc.CreatePipe,
             Proc.std_err = Proc.CreatePipe
           }
-  (exitCode, _stdout, stderr_) <- Proc.readCreateProcessWithExitCode cp ""
+  (exitCode, _stdout, stderrText) <- Proc.readCreateProcessWithExitCode cp ""
   case exitCode of
     ExitSuccess -> pure (Right ())
-    ExitFailure code -> pure (Left (code, T.pack stderr_))
+    ExitFailure code -> pure (Left (code, T.pack stderrText))
 
 -- ---------------------------------------------------------------------------
 -- Output registration
@@ -346,3 +356,143 @@ collectAllCandidates drv =
       inputDrvPaths = Map.keys (drvInputDrvs drv)
       outputPaths = map doPath (drvOutputs drv)
    in inputSrcs ++ inputDrvPaths ++ outputPaths
+
+-- ---------------------------------------------------------------------------
+-- Dependency-aware build orchestration
+-- ---------------------------------------------------------------------------
+
+-- | Build a derivation and all its transitive dependencies.
+--
+-- 1. Build the dependency graph by reading .drv files from the store.
+-- 2. Topologically sort: leaves (no deps) first.
+-- 3. For each dependency in build order:
+--    a. Already in store? Skip.
+--    b. Available in a binary cache? Substitute.
+--    c. Otherwise: build locally.
+-- 4. Build the root derivation last.
+--
+-- Returns 'BuildSuccess' with the root output path on success, or
+-- 'BuildFailure' if any dependency fails to build or substitute.
+buildWithDeps :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
+buildWithDeps config store rootDrv rootDrvPath =
+  case buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath of
+    Left err -> pure (BuildFailure ("dependency graph error: " <> err) 1)
+    Right depGraph ->
+      case topoSort depGraph of
+        TopoCycle _ ->
+          pure (BuildFailure "dependency cycle detected" 1)
+        TopoSorted buildOrder -> do
+          let drvMap = Map.fromList [(sp, drv) | sp <- buildOrder, Just drv <- [lookupDrv depGraph sp]]
+          result <- buildInOrder config store drvMap buildOrder
+          case result of
+            Left err -> pure (BuildFailure err 1)
+            Right () ->
+              case drvOutputs rootDrv of
+                (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
+                [] -> pure (BuildFailure "no outputs defined" 1)
+
+-- | Look up a derivation in the dependency graph.
+lookupDrv :: DepGraph -> StorePath -> Maybe Derivation
+lookupDrv (Nix.DependencyGraph.DepGraph g) sp =
+  Nix.DependencyGraph.dnDerivation <$> Map.lookup sp g
+
+-- | Read and parse a .drv file from the store.
+--
+-- Since 'buildDepGraph' is pure but needs to read immutable .drv files,
+-- we use 'System.IO.Unsafe.unsafePerformIO'.  This is safe because .drv
+-- files are write-once: their content is determined by their hash, so
+-- repeated reads always yield the same result.
+readDrvFromStore :: BuildConfig -> StorePath -> Either Text Derivation
+readDrvFromStore config sp =
+  let drvFilePath = storePathToFilePath (bcStoreDir config) sp
+   in case unsafeReadFile drvFilePath of
+        Nothing -> Left ("cannot read .drv file: " <> T.pack drvFilePath)
+        Just content -> fromATerm content
+
+-- | Read a file as Text, returning Nothing on any error.
+-- Used only for reading immutable .drv files from the store.
+unsafeReadFile :: FilePath -> Maybe Text
+unsafeReadFile path =
+  case System.IO.Unsafe.unsafePerformIO (try (TIO.readFile path)) of
+    Left (_ :: SomeException) -> Nothing
+    Right content -> Just content
+
+-- ---------------------------------------------------------------------------
+-- Build in topological order
+-- ---------------------------------------------------------------------------
+
+-- | Status tag for dependency resolution status messages.
+data DepStatus = Cached | Substituted | Building
+
+-- | Format a status tag for display.
+statusTag :: DepStatus -> Text
+statusTag Cached = "[cached]"
+statusTag Substituted = "[subst] "
+statusTag Building = "[build] "
+
+-- | Build dependencies in topological order.
+-- Skips paths already in the store, tries substitution, then builds.
+buildInOrder :: BuildConfig -> Store -> Map StorePath Derivation -> [StorePath] -> IO (Either Text ())
+buildInOrder _ _ _ [] = pure (Right ())
+buildInOrder config store drvMap (sp : rest) =
+  case Map.lookup sp drvMap of
+    Nothing ->
+      -- Not a derivation we know about — might be a source path.  Skip.
+      buildInOrder config store drvMap rest
+    Just drv -> do
+      status <- resolveDep config store drv
+      case status of
+        Right depStatus -> do
+          logDepStatus depStatus drv
+          buildInOrder config store drvMap rest
+        Left err ->
+          pure (Left ("building " <> formatDrvName drv <> " failed: " <> err))
+
+-- | Resolve a single dependency: check cache, try substitution, or build.
+resolveDep :: BuildConfig -> Store -> Derivation -> IO (Either Text DepStatus)
+resolveDep config store drv = do
+  cached <- isOutputCached store drv
+  if cached
+    then pure (Right Cached)
+    else do
+      substituted <- trySubstituteOutputs config store drv
+      if substituted
+        then pure (Right Substituted)
+        else do
+          result <- buildDerivation config store drv
+          case result of
+            BuildSuccess _ -> pure (Right Building)
+            BuildFailure msg code ->
+              pure (Left ("exit " <> T.pack (show code) <> ": " <> msg))
+
+-- | Check whether the first output of a derivation is already in the store.
+isOutputCached :: Store -> Derivation -> IO Bool
+isOutputCached store drv = case drvOutputs drv of
+  (out : _) -> isValid store (doPath out)
+  [] -> pure False
+
+-- | Log dependency resolution status to stderr.
+logDepStatus :: DepStatus -> Derivation -> IO ()
+logDepStatus status drv =
+  TIO.hPutStrLn System.IO.stderr ("  " <> statusTag status <> " " <> formatDrvName drv)
+
+-- | Try to substitute all outputs of a derivation from binary caches.
+-- Returns True if all outputs were successfully substituted.
+trySubstituteOutputs :: BuildConfig -> Store -> Derivation -> IO Bool
+trySubstituteOutputs config store drv
+  | null (bcCaches config) = pure False
+  | otherwise = do
+      results <- mapM (trySubstitute store (bcCaches config) . doPath) (drvOutputs drv)
+      pure (all isSubstSuccess results)
+  where
+    isSubstSuccess (SubstSuccess _) = True
+    isSubstSuccess _ = False
+
+-- | Format a derivation name for status output.
+formatDrvName :: Derivation -> Text
+formatDrvName drv =
+  case Map.lookup "name" (drvEnv drv) of
+    Just n -> n
+    Nothing -> case drvOutputs drv of
+      (out : _) -> spName (doPath out)
+      [] -> "<unknown>"

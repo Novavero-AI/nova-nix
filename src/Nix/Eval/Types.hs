@@ -10,6 +10,12 @@ module Nix.Eval.Types
     NixValue (..),
     Thunk (..),
 
+    -- * String context
+    StringContextElement (..),
+    StringContext (..),
+    emptyContext,
+    mkStr,
+
     -- * Environment
     Env (..),
     emptyEnv,
@@ -33,9 +39,42 @@ where
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
 import Data.Text (Text)
 import Nix.Derivation (Derivation)
 import Nix.Expr.Types (Expr, Formals)
+import Nix.Store.Path (StorePath)
+
+-- ---------------------------------------------------------------------------
+-- String context
+-- ---------------------------------------------------------------------------
+
+-- | A single element of string context, tracking where a string
+-- references store paths.
+data StringContextElement
+  = -- | Plain store path reference (inputSrcs).
+    SCPlain !StorePath
+  | -- | Derivation output reference (inputDrvs): .drv path + output name.
+    SCDrvOutput !StorePath !Text
+  | -- | All outputs of a derivation (for drvPath itself).
+    SCAllOutputs !StorePath
+  deriving (Eq, Ord, Show)
+
+-- | Context carried by Nix strings, tracking store path dependencies.
+newtype StringContext = StringContext {unStringContext :: Set StringContextElement}
+  deriving (Eq, Ord, Show, Semigroup, Monoid)
+
+-- | Empty string context (alias for 'mempty').
+emptyContext :: StringContext
+emptyContext = mempty
+
+-- | Smart constructor for context-free strings.
+mkStr :: Text -> NixValue
+mkStr t = VStr t emptyContext
+
+-- ---------------------------------------------------------------------------
+-- Thunks
+-- ---------------------------------------------------------------------------
 
 -- | A thunk: either an unevaluated expression paired with its
 -- capturing environment, or an already-forced value.
@@ -64,8 +103,8 @@ data NixValue
     VBool !Bool
   | -- | The null value.
     VNull
-  | -- | String.
-    VStr !Text
+  | -- | String with dependency context.
+    VStr !Text !StringContext
   | -- | Path.
     VPath !Text
   | -- | List of thunks (lazy elements).
@@ -142,7 +181,7 @@ typeName val = case val of
   VFloat _ -> "a float"
   VBool _ -> "a Boolean"
   VNull -> "null"
-  VStr _ -> "a string"
+  VStr _ _ -> "a string"
   VPath _ -> "a path"
   VList _ -> "a list"
   VAttrs _ -> "a set"

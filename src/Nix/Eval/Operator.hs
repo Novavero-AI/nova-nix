@@ -71,8 +71,8 @@ evalAdd (VInt a) (VInt b) = pure (VInt (a + b))
 evalAdd (VInt a) (VFloat b) = pure (VFloat (fromInteger a + b))
 evalAdd (VFloat a) (VInt b) = pure (VFloat (a + fromInteger b))
 evalAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
-evalAdd (VStr a) (VStr b) = pure (VStr (a <> b))
-evalAdd (VPath a) (VStr b) = pure (VPath (a <> b))
+evalAdd (VStr a ctxA) (VStr b ctxB) = pure (VStr (a <> b) (ctxA <> ctxB))
+evalAdd (VPath a) (VStr b _) = pure (VPath (a <> b))
 evalAdd left right =
   throwEvalError ("cannot add " <> typeName left <> " and " <> typeName right)
 
@@ -131,7 +131,8 @@ nixCompare (VInt a) (VInt b) = pure (a < b)
 nixCompare (VInt a) (VFloat b) = pure (fromInteger a < b)
 nixCompare (VFloat a) (VInt b) = pure (a < fromInteger b)
 nixCompare (VFloat a) (VFloat b) = pure (a < b)
-nixCompare (VStr a) (VStr b) = pure (a < b)
+-- String comparison ignores context (matching real Nix).
+nixCompare (VStr a _) (VStr b _) = pure (a < b)
 nixCompare left right =
   throwEvalError
     ( "cannot compare "
@@ -149,7 +150,8 @@ nixEqual _ (VFloat a) (VInt b) = pure (a == fromInteger b)
 nixEqual _ (VFloat a) (VFloat b) = pure (a == b)
 nixEqual _ (VBool a) (VBool b) = pure (a == b)
 nixEqual _ VNull VNull = pure True
-nixEqual _ (VStr a) (VStr b) = pure (a == b)
+-- String equality ignores context (matching real Nix).
+nixEqual _ (VStr a _) (VStr b _) = pure (a == b)
 nixEqual _ (VPath a) (VPath b) = pure (a == b)
 nixEqual forceThunk (VList as) (VList bs)
   | length as /= length bs = pure False

@@ -15,6 +15,12 @@ module Nix.Eval
     NixValue (..),
     Thunk (..),
 
+    -- * String context (re-exported from Types)
+    StringContextElement (..),
+    StringContext (..),
+    emptyContext,
+    mkStr,
+
     -- * Environment (re-exported from Types)
     Env (..),
     emptyEnv,
@@ -50,10 +56,12 @@ import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, isJust)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm)
+import Nix.Eval.Context (extractInputDrvs, extractInputSrcs)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
 import Nix.Eval.Types
@@ -61,11 +69,15 @@ import Nix.Eval.Types
     MonadEval (..),
     NixValue (..),
     PureEval (..),
+    StringContext (..),
+    StringContextElement (..),
     Thunk (..),
+    emptyContext,
     emptyEnv,
     envInsertThunk,
     envLookup,
     evaluated,
+    mkStr,
     mkThunk,
     pushWithScope,
     runPureEval,
@@ -82,15 +94,15 @@ import Nix.Expr.Types
     NixAtom (..),
   )
 import Nix.Hash (byteToHex, sha256Hex, truncatedBase32)
-import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath)
+import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath)
 import qualified System.Info
 
 -- | Evaluate a Nix expression in an environment.
 eval :: (MonadEval m) => Env -> Expr -> m NixValue
 eval env expr = case expr of
   ELit atom -> evalLit atom
-  EStr parts -> VStr <$> evalStringParts eval env parts
-  EIndStr parts -> VStr <$> evalIndStringParts eval env parts
+  EStr parts -> uncurry VStr <$> evalStringParts eval env parts
+  EIndStr parts -> uncurry VStr <$> evalIndStringParts eval env parts
   EVar name -> evalVar env name
   EAttrs isRec bindings -> evalAttrs env isRec bindings
   EList exprs -> pure (VList (map (mkThunk env) exprs))
@@ -128,7 +140,7 @@ evalLit atom = case atom of
   NixFloat n -> pure (VFloat n)
   NixBool b -> pure (VBool b)
   NixNull -> pure VNull
-  NixUri u -> pure (VStr u)
+  NixUri u -> pure (mkStr u)
   NixPath p -> pure (VPath p)
 
 -- ---------------------------------------------------------------------------
@@ -200,7 +212,7 @@ inheritLookup :: Env -> Text -> Thunk
 inheritLookup env name =
   case envLookup name env of
     Just thunk -> thunk
-    Nothing -> evaluated (VStr ("<undefined: " <> name <> ">"))
+    Nothing -> evaluated (mkStr ("<undefined: " <> name <> ">"))
 
 -- | Build a nested attribute structure from a dotted path.
 -- @a.b.c = expr@ becomes @{ a = { b = { c = thunk; }; }; }@.
@@ -479,7 +491,7 @@ builtinRegistry :: (MonadEval m) => Map Text (BuiltinDef m)
 builtinRegistry =
   Map.fromList
     [ -- Type checking (arity 1)
-      builtin1 "typeOf" (pure . VStr . typeOfValue),
+      builtin1 "typeOf" (pure . mkStr . typeOfValue),
       builtin1 "isNull" (pure . VBool . isNullVal),
       builtin1 "isInt" (pure . VBool . isIntVal),
       builtin1 "isFloat" (pure . VBool . isFloatVal),
@@ -493,7 +505,7 @@ builtinRegistry =
       builtin1 "head" builtinHead,
       builtin1 "tail" builtinTail,
       -- String operations (arity 1)
-      builtin1 "toString" (fmap VStr . coerceToString),
+      builtin1 "toString" (fmap (uncurry VStr) . coerceToString),
       builtin1 "stringLength" builtinStringLength,
       -- Control (arity 1)
       builtin1 "throw" builtinThrow,
@@ -525,66 +537,66 @@ builtinRegistry =
       -- Arity 3
       builtin3 "foldl'" builtinFoldl,
       builtin3 "substring" builtinSubstring,
-      -- Batch 1: Trivial pure
+      -- Numeric
       builtin1 "isPath" (pure . VBool . isPathVal),
       builtin1 "ceil" builtinCeil,
       builtin1 "floor" builtinFloor,
       builtin2 "seq" (\_ b -> pure b),
       builtin2 "trace" (\_ b -> pure b),
       builtin1 "unsafeDiscardStringContext" builtinDiscardContext,
-      builtin1 "unsafeDiscardOutputDependency" builtinDiscardContext,
+      builtin1 "unsafeDiscardOutputDependency" builtinDiscardOutputDep,
+      -- String context introspection
+      builtin1 "hasContext" builtinHasContext,
+      builtin1 "getContext" builtinGetContext,
+      builtin2 "appendContext" builtinAppendContext,
       builtin1 "baseNameOf" builtinBaseNameOf,
       builtin1 "dirOf" builtinDirOf,
       builtin1 "concatLists" builtinConcatLists,
       builtin2 "lessThan" builtinLessThan,
-      -- Batch 2: Arithmetic + bitwise
+      -- Arithmetic + bitwise
       builtin2 "add" builtinAdd,
       builtin2 "sub" builtinSub,
       builtin2 "mul" builtinMul,
-      builtin2 "div" builtinBuiltinDiv,
+      builtin2 "div" builtinDiv,
       builtin2 "bitAnd" builtinBitAnd,
       builtin2 "bitOr" builtinBitOr,
       builtin2 "bitXor" builtinBitXor,
-      -- Batch 3: Attrset higher-order
+      -- Attr set higher-order
       builtin2 "mapAttrs" builtinMapAttrs,
       builtin1 "functionArgs" builtinFunctionArgs,
       builtin2 "zipAttrsWith" builtinZipAttrsWith,
-      -- Batch 4: String operations
+      -- String manipulation
       builtin3 "replaceStrings" builtinReplaceStrings,
       builtin2 "compareVersions" builtinCompareVersions,
       builtin1 "splitVersion" builtinSplitVersion,
       builtin1 "parseDrvName" builtinParseDrvName,
-      -- Batch 5: Serialization + hashing
+      -- Serialization + hashing
       builtin1 "toJSON" builtinToJSON,
       builtin1 "fromJSON" builtinFromJSON,
       builtin2 "hashString" builtinHashString,
-      -- Batch 6: tryEval + deepSeq
+      -- Error handling + sequencing
       builtin1 "tryEval" (\_ -> throwEvalError "unreachable: tryEval handled in evalApp"),
       builtin2 "deepSeq" builtinDeepSeq,
-      -- Batch 7: genericClosure
+      -- Graph traversal
       builtin1 "genericClosure" builtinGenericClosure,
       -- IO builtins (delegate to MonadEval methods)
       builtin1 "import" builtinImport,
       builtin1 "readFile" builtinReadFile,
       builtin1 "pathExists" builtinPathExists,
       builtin1 "readDir" builtinReadDir,
-      -- Batch A: getEnv, toPath
       builtin1 "getEnv" builtinGetEnv,
       builtin1 "toPath" builtinToPath,
-      -- Batch B: placeholder, storePath
+      -- Store path operations
       builtin1 "placeholder" builtinPlaceholder,
       builtin1 "storePath" builtinStorePath,
-      -- Batch C: findFile
       builtin2 "findFile" builtinFindFile,
-      -- Batch D: toFile
       builtin2 "toFile" builtinToFile,
-      -- Batch E: scopedImport
       builtin2 "scopedImport" builtinScopedImport,
-      -- Batch F: fetch builtins
+      -- Network fetchers
       builtin1 "fetchurl" builtinFetchurl,
       builtin1 "fetchTarball" builtinFetchTarball,
       builtin1 "fetchGit" builtinFetchGit,
-      -- Batch H: derivation
+      -- Derivation construction
       builtin1 "derivation" builtinDerivation
     ]
 
@@ -637,7 +649,7 @@ typeOfValue val = case val of
   VFloat _ -> "float"
   VBool _ -> "bool"
   VNull -> "null"
-  VStr _ -> "string"
+  VStr _ _ -> "string"
   VPath _ -> "path"
   VList _ -> "list"
   VAttrs _ -> "set"
@@ -662,7 +674,7 @@ isBoolVal (VBool _) = True
 isBoolVal _ = False
 
 isStringVal :: NixValue -> Bool
-isStringVal (VStr _) = True
+isStringVal (VStr _ _) = True
 isStringVal _ = False
 
 isListVal :: NixValue -> Bool
@@ -701,7 +713,7 @@ builtinTail other = throwEvalError ("builtins.tail: expected a list, got " <> ty
 -- ---------------------------------------------------------------------------
 
 builtinStringLength :: (MonadEval m) => NixValue -> m NixValue
-builtinStringLength (VStr s) = pure (VInt (fromIntegral (T.length s)))
+builtinStringLength (VStr s _) = pure (VInt (fromIntegral (T.length s)))
 builtinStringLength other =
   throwEvalError ("builtins.stringLength: expected a string, got " <> typeName other)
 
@@ -710,7 +722,7 @@ builtinStringLength other =
 -- ---------------------------------------------------------------------------
 
 builtinThrow :: (MonadEval m) => NixValue -> m NixValue
-builtinThrow (VStr msg) = throwEvalError msg
+builtinThrow (VStr msg _) = throwEvalError msg
 builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
@@ -719,7 +731,7 @@ builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <
 
 builtinAttrNames :: (MonadEval m) => NixValue -> m NixValue
 builtinAttrNames (VAttrs attrs) =
-  pure (VList (map (evaluated . VStr) (Map.keys attrs)))
+  pure (VList (map (evaluated . mkStr) (Map.keys attrs)))
 builtinAttrNames other =
   throwEvalError ("builtins.attrNames: expected a set, got " <> typeName other)
 
@@ -747,7 +759,7 @@ listToAttrsPair thunk = do
           Map.lookup "name" attrs
       nameVal <- force nameThunk
       case nameVal of
-        VStr keyName ->
+        VStr keyName _ ->
           case Map.lookup "value" attrs of
             Just valueThunk -> pure (keyName, valueThunk)
             Nothing -> throwEvalError "builtins.listToAttrs: element missing 'value'"
@@ -759,19 +771,19 @@ listToAttrsPair thunk = do
 -- ---------------------------------------------------------------------------
 
 builtinHasAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHasAttr (VStr key) (VAttrs attrs) =
+builtinHasAttr (VStr key _) (VAttrs attrs) =
   pure (VBool (Map.member key attrs))
-builtinHasAttr (VStr _) other =
+builtinHasAttr (VStr _ _) other =
   throwEvalError ("builtins.hasAttr: expected a set, got " <> typeName other)
 builtinHasAttr other _ =
   throwEvalError ("builtins.hasAttr: expected a string, got " <> typeName other)
 
 builtinGetAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinGetAttr (VStr key) (VAttrs attrs) =
+builtinGetAttr (VStr key _) (VAttrs attrs) =
   case Map.lookup key attrs of
     Just thunk -> force thunk
     Nothing -> throwEvalError ("builtins.getAttr: attribute '" <> key <> "' not found")
-builtinGetAttr (VStr _) other =
+builtinGetAttr (VStr _ _) other =
   throwEvalError ("builtins.getAttr: expected a set, got " <> typeName other)
 builtinGetAttr other _ =
   throwEvalError ("builtins.getAttr: expected a string, got " <> typeName other)
@@ -784,7 +796,7 @@ builtinRemoveAttrs (VAttrs attrs) (VList thunks) = do
     forceToString thunk = do
       val <- force thunk
       case val of
-        VStr s -> pure s
+        VStr s _ -> pure s
         _ -> throwEvalError "builtins.removeAttrs: key list must contain strings"
 builtinRemoveAttrs (VAttrs _) other =
   throwEvalError ("builtins.removeAttrs: expected a list, got " <> typeName other)
@@ -800,10 +812,10 @@ builtinIntersectAttrs other _ =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 
 builtinCatAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinCatAttrs (VStr key) (VList thunks) = do
+builtinCatAttrs (VStr key _) (VList thunks) = do
   vals <- catAttrsCollect key thunks
   pure (VList vals)
-builtinCatAttrs (VStr _) other =
+builtinCatAttrs (VStr _ _) other =
   throwEvalError ("builtins.catAttrs: expected a list, got " <> typeName other)
 builtinCatAttrs other _ =
   throwEvalError ("builtins.catAttrs: expected a string, got " <> typeName other)
@@ -1004,7 +1016,7 @@ groupByCollect func (thunk : rest) acc = do
   val <- force thunk
   result <- applyValue func val
   case result of
-    VStr key ->
+    VStr key _ ->
       groupByCollect func rest (Map.insertWith (++) key [thunk] acc)
     _ -> throwEvalError "builtins.groupBy: function must return a string"
 
@@ -1013,16 +1025,18 @@ groupByCollect func (thunk : rest) acc = do
 -- ---------------------------------------------------------------------------
 
 builtinConcatStringsSep :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinConcatStringsSep (VStr sep) (VList thunks) = do
-  strs <- mapM forceToStr thunks
-  pure (VStr (T.intercalate sep strs))
+builtinConcatStringsSep (VStr sep sepCtx) (VList thunks) = do
+  pairs <- mapM forceToStrCtx thunks
+  let texts = map fst pairs
+      mergedCtx = sepCtx <> mconcat (map snd pairs)
+  pure (VStr (T.intercalate sep texts) mergedCtx)
   where
-    forceToStr thunk = do
+    forceToStrCtx thunk = do
       val <- force thunk
       case val of
-        VStr s -> pure s
+        VStr s ctx -> pure (s, ctx)
         _ -> throwEvalError "builtins.concatStringsSep: list elements must be strings"
-builtinConcatStringsSep (VStr _) other =
+builtinConcatStringsSep (VStr _ _) other =
   throwEvalError ("builtins.concatStringsSep: expected a list, got " <> typeName other)
 builtinConcatStringsSep other _ =
   throwEvalError ("builtins.concatStringsSep: expected a string, got " <> typeName other)
@@ -1048,7 +1062,7 @@ foldlStrict op acc (thunk : rest) = do
   foldlStrict op stepped rest
 
 builtinSubstring :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
-builtinSubstring (VInt start) (VInt len) (VStr s) =
+builtinSubstring (VInt start) (VInt len) (VStr s ctx) =
   let clampedStart = max 0 (fromIntegral start)
       -- Nix clamps len to available length (negative len means rest of string)
       available = T.length s - clampedStart
@@ -1056,8 +1070,9 @@ builtinSubstring (VInt start) (VInt len) (VStr s) =
         if len < 0
           then available
           else min (fromIntegral len) available
-   in pure (VStr (T.take clampedLen (T.drop clampedStart s)))
-builtinSubstring _ _ (VStr _) =
+   in -- Context is preserved through substring (matching real Nix).
+      pure (VStr (T.take clampedLen (T.drop clampedStart s)) ctx)
+builtinSubstring _ _ (VStr _ _) =
   throwEvalError "builtins.substring: start and length must be integers"
 builtinSubstring _ _ other =
   throwEvalError ("builtins.substring: expected a string, got " <> typeName other)
@@ -1087,7 +1102,7 @@ storeDirPrefix :: Text
 storeDirPrefix = defaultStoreDirText <> "/"
 
 -- ---------------------------------------------------------------------------
--- Batch 1: Trivial pure builtins
+-- Builtin implementations — numeric + context
 -- ---------------------------------------------------------------------------
 
 isPathVal :: NixValue -> Bool
@@ -1105,25 +1120,150 @@ builtinFloor (VInt n) = pure (VInt n)
 builtinFloor other = throwEvalError ("builtins.floor: expected a number, got " <> typeName other)
 
 builtinDiscardContext :: (MonadEval m) => NixValue -> m NixValue
-builtinDiscardContext (VStr s) = pure (VStr s)
+builtinDiscardContext (VStr s _) = pure (mkStr s)
 builtinDiscardContext other =
   throwEvalError ("builtins.unsafeDiscardStringContext: expected a string, got " <> typeName other)
 
+-- | Strip only derivation output dependencies (SCDrvOutput, SCAllOutputs),
+-- keeping plain store path references (SCPlain).
+builtinDiscardOutputDep :: (MonadEval m) => NixValue -> m NixValue
+builtinDiscardOutputDep (VStr s (StringContext ctx)) =
+  let kept = Set.filter isPlain ctx
+   in pure (VStr s (StringContext kept))
+  where
+    isPlain (SCPlain _) = True
+    isPlain _ = False
+builtinDiscardOutputDep other =
+  throwEvalError ("builtins.unsafeDiscardOutputDependency: expected a string, got " <> typeName other)
+
+-- | Check whether a string has any context elements.
+builtinHasContext :: (MonadEval m) => NixValue -> m NixValue
+builtinHasContext (VStr _ ctx) = pure (VBool (ctx /= emptyContext))
+builtinHasContext other =
+  throwEvalError ("builtins.hasContext: expected a string, got " <> typeName other)
+
+-- | Return the context of a string as an attrset.
+--
+-- Each key is a store path string.  Each value is an attrset with:
+--   - @path@: true if there's a SCPlain reference
+--   - @allOutputs@: true if there's a SCAllOutputs reference
+--   - @outputs@: list of output names from SCDrvOutput references
+builtinGetContext :: (MonadEval m) => NixValue -> m NixValue
+builtinGetContext (VStr _ (StringContext ctx)) = do
+  let grouped = groupContextByPath (Set.toList ctx)
+      attrMap = Map.map contextEntryToAttrs grouped
+  pure (VAttrs attrMap)
+builtinGetContext other =
+  throwEvalError ("builtins.getContext: expected a string, got " <> typeName other)
+
+-- | Intermediate representation for grouping context elements by store path.
+data ContextEntry = ContextEntry
+  { cePath :: !Bool,
+    ceAllOutputs :: !Bool,
+    ceOutputs :: ![Text]
+  }
+
+-- | Group context elements by their store path.
+groupContextByPath :: [StringContextElement] -> Map Text ContextEntry
+groupContextByPath = foldl' addElement Map.empty
+  where
+    addElement acc (SCPlain sp) =
+      Map.insertWith mergeEntry (spToText sp) (ContextEntry True False []) acc
+    addElement acc (SCDrvOutput sp outName) =
+      Map.insertWith mergeEntry (spToText sp) (ContextEntry False False [outName]) acc
+    addElement acc (SCAllOutputs sp) =
+      Map.insertWith mergeEntry (spToText sp) (ContextEntry False True []) acc
+    mergeEntry new old =
+      ContextEntry
+        (cePath new || cePath old)
+        (ceAllOutputs new || ceAllOutputs old)
+        (ceOutputs new ++ ceOutputs old)
+    spToText sp =
+      T.pack (storePathToFilePath defaultStoreDir sp)
+
+-- | Convert a ContextEntry to an attrset thunk.
+contextEntryToAttrs :: ContextEntry -> Thunk
+contextEntryToAttrs entry =
+  let fields =
+        [("path", evaluated (VBool True)) | cePath entry]
+          ++ [("allOutputs", evaluated (VBool True)) | ceAllOutputs entry]
+          ++ [("outputs", evaluated (VList [evaluated (mkStr o) | o <- ceOutputs entry])) | not (null (ceOutputs entry))]
+   in evaluated (VAttrs (Map.fromList fields))
+
+-- | Append context entries to a string from an attrset.
+--
+-- @builtins.appendContext string contextAttrset@ adds the specified
+-- context elements to the string.
+builtinAppendContext :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinAppendContext (VStr s ctx) (VAttrs contextAttrs) = do
+  newCtx <- parseContextAttrs contextAttrs
+  pure (VStr s (ctx <> newCtx))
+builtinAppendContext (VStr _ _) other =
+  throwEvalError ("builtins.appendContext: second argument must be a set, got " <> typeName other)
+builtinAppendContext other _ =
+  throwEvalError ("builtins.appendContext: first argument must be a string, got " <> typeName other)
+
+-- | Parse a context attrset into a StringContext.
+-- Each key is a store path; each value is an attrset with optional
+-- @path@, @allOutputs@, and @outputs@ fields.
+parseContextAttrs :: (MonadEval m) => Map Text Thunk -> m StringContext
+parseContextAttrs attrs = do
+  elements <- mapM parseOneCtx (Map.toList attrs)
+  pure (StringContext (Set.fromList (concat elements)))
+  where
+    parseOneCtx (pathText, thunk) = do
+      val <- force thunk
+      case val of
+        VAttrs inner -> do
+          let sp = case parseStorePath defaultStoreDir pathText of
+                Just parsed -> parsed
+                Nothing -> StorePath (T.take 32 (T.drop (T.length storeDirPrefix) pathText)) (T.drop 33 (T.drop (T.length storeDirPrefix) pathText))
+          hasPath <- getBoolAttr "path" inner
+          hasAllOuts <- getBoolAttr "allOutputs" inner
+          outNames <- getOutputsList inner
+          let pathElems = [SCPlain sp | hasPath]
+              allOutElems = [SCAllOutputs sp | hasAllOuts]
+              outElems = [SCDrvOutput sp o | o <- outNames]
+          pure (pathElems ++ allOutElems ++ outElems)
+        _ -> throwEvalError "builtins.appendContext: context entry must be a set"
+
+    getBoolAttr key attrs' = case Map.lookup key attrs' of
+      Nothing -> pure False
+      Just thunk -> do
+        val <- force thunk
+        case val of
+          VBool b -> pure b
+          _ -> pure False
+
+    getOutputsList attrs' = case Map.lookup "outputs" attrs' of
+      Nothing -> pure []
+      Just thunk -> do
+        val <- force thunk
+        case val of
+          VList thunks -> mapM forceToOutputName thunks
+          _ -> pure []
+
+    forceToOutputName thunk = do
+      val <- force thunk
+      case val of
+        VStr s _ -> pure s
+        _ -> throwEvalError "builtins.appendContext: output name must be a string"
+
 builtinBaseNameOf :: (MonadEval m) => NixValue -> m NixValue
-builtinBaseNameOf (VStr s) = pure (VStr (lastComponent s))
-builtinBaseNameOf (VPath p) = pure (VStr (lastComponent p))
+builtinBaseNameOf (VStr s ctx) = pure (VStr (lastComponent s) ctx)
+builtinBaseNameOf (VPath p) = pure (mkStr (lastComponent p))
 builtinBaseNameOf other =
   throwEvalError ("builtins.baseNameOf: expected a string or path, got " <> typeName other)
 
 lastComponent :: Text -> Text
 lastComponent t = case T.splitOn "/" t of
   [] -> t
-  parts -> case filter (not . T.null) parts of
+  parts -> case reverse (filter (not . T.null) parts) of
     [] -> ""
-    xs -> last xs
+    (final : _) -> final
 
 builtinDirOf :: (MonadEval m) => NixValue -> m NixValue
-builtinDirOf (VStr s) = pure (VStr (dirComponent s))
+builtinDirOf (VStr s ctx) = pure (VStr (dirComponent s) ctx)
 builtinDirOf (VPath p) = pure (VPath (dirComponent p))
 builtinDirOf other =
   throwEvalError ("builtins.dirOf: expected a string or path, got " <> typeName other)
@@ -1152,7 +1292,7 @@ builtinLessThan :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinLessThan a b = VBool <$> nixCompare a b
 
 -- ---------------------------------------------------------------------------
--- Batch 2: Arithmetic + bitwise builtins
+-- Builtin implementations — arithmetic + bitwise
 -- ---------------------------------------------------------------------------
 
 builtinAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -1176,14 +1316,14 @@ builtinMul (VFloat a) (VInt b) = pure (VFloat (a * fromInteger b))
 builtinMul (VFloat a) (VFloat b) = pure (VFloat (a * b))
 builtinMul l r = throwEvalError ("builtins.mul: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
-builtinBuiltinDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinBuiltinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
-builtinBuiltinDiv (VInt a) (VInt b) = pure (VInt (quot a b))
-builtinBuiltinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
-builtinBuiltinDiv (VInt a) (VFloat b) = pure (VFloat (fromInteger a / b))
-builtinBuiltinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromInteger b))
-builtinBuiltinDiv (VFloat a) (VFloat b) = pure (VFloat (a / b))
-builtinBuiltinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeName l <> " and " <> typeName r)
+builtinDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
+builtinDiv (VInt a) (VInt b) = pure (VInt (quot a b))
+builtinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
+builtinDiv (VInt a) (VFloat b) = pure (VFloat (fromInteger a / b))
+builtinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromInteger b))
+builtinDiv (VFloat a) (VFloat b) = pure (VFloat (a / b))
+builtinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
 builtinBitAnd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinBitAnd (VInt a) (VInt b) = pure (VInt (a .&. b))
@@ -1198,7 +1338,7 @@ builtinBitXor (VInt a) (VInt b) = pure (VInt (xor a b))
 builtinBitXor _ _ = throwEvalError "builtins.bitXor: expected two integers"
 
 -- ---------------------------------------------------------------------------
--- Batch 3: Attrset higher-order builtins
+-- Builtin implementations — attr set higher-order
 -- ---------------------------------------------------------------------------
 
 builtinMapAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -1208,7 +1348,7 @@ builtinMapAttrs func (VAttrs attrs) = do
   where
     mapAttrEntry fn (key, thunk) = do
       val <- force thunk
-      partial <- applyValue fn (VStr key)
+      partial <- applyValue fn (mkStr key)
       result <- applyValue partial val
       pure (key, evaluated result)
 builtinMapAttrs _ other =
@@ -1245,32 +1385,36 @@ builtinZipAttrsWith func (VList thunks) = do
         _ -> throwEvalError "builtins.zipAttrsWith: list element must be a set"
     mergeAllAttrs = foldl' (\acc attrs -> Map.unionWith (++) acc (Map.map (: []) attrs)) Map.empty
     applyZip fn (key, thunkList) = do
-      partial <- applyValue fn (VStr key)
+      partial <- applyValue fn (mkStr key)
       result <- applyValue partial (VList thunkList)
       pure (key, evaluated result)
 builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Batch 4: String operations
+-- Builtin implementations — string manipulation
 -- ---------------------------------------------------------------------------
 
 builtinReplaceStrings ::
   (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
-builtinReplaceStrings (VList fromThunks) (VList toThunks) (VStr input) = do
+builtinReplaceStrings (VList fromThunks) (VList toThunks) (VStr input inputCtx) = do
   froms <- mapM forceStr fromThunks
-  tos <- mapM forceStr toThunks
-  when (length froms /= length tos) $
+  toStrs <- mapM forceStr toThunks
+  when (length froms /= length toStrs) $
     throwEvalError "builtins.replaceStrings: 'from' and 'to' must have the same length"
-  let pairs = zip froms tos
-  pure (VStr (replaceAll pairs input))
+  let fromTexts = map fst froms
+      toTexts = map fst toStrs
+      -- Merge contexts: input context + all 'to' string contexts + all 'from' string contexts
+      mergedCtx = inputCtx <> mconcat (map snd froms) <> mconcat (map snd toStrs)
+      pairs = zip fromTexts toTexts
+  pure (VStr (replaceAll pairs input) mergedCtx)
   where
     forceStr thunk = do
       val <- force thunk
       case val of
-        VStr s -> pure s
+        VStr s ctx -> pure (s, ctx)
         _ -> throwEvalError "builtins.replaceStrings: elements must be strings"
-builtinReplaceStrings _ _ (VStr _) =
+builtinReplaceStrings _ _ (VStr _ _) =
   throwEvalError "builtins.replaceStrings: first two arguments must be lists"
 builtinReplaceStrings _ _ other =
   throwEvalError ("builtins.replaceStrings: expected a string, got " <> typeName other)
@@ -1287,10 +1431,14 @@ replaceAll pairs = go
       | otherwise = case findMatch pairs remaining of
           Just (replacement, rest, matched) ->
             if T.null matched
-              then -- empty-from: insert replacement then advance 1 char
-                replacement <> T.singleton (T.head remaining) <> go (T.tail remaining)
+              then case T.uncons remaining of
+                -- empty-from: insert replacement then advance 1 char
+                Just (ch, after) -> replacement <> T.singleton ch <> go after
+                Nothing -> replacement -- unreachable: guarded by T.null above
               else replacement <> go rest
-          Nothing -> T.singleton (T.head remaining) <> go (T.tail remaining)
+          Nothing -> case T.uncons remaining of
+            Just (ch, after) -> T.singleton ch <> go after
+            Nothing -> "" -- unreachable: guarded by T.null above
     findMatch [] _ = Nothing
     findMatch ((from, to) : rest) txt
       | T.null from = Just (to, txt, from)
@@ -1298,7 +1446,7 @@ replaceAll pairs = go
       | otherwise = findMatch rest txt
 
 builtinCompareVersions :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinCompareVersions (VStr a) (VStr b) =
+builtinCompareVersions (VStr a _) (VStr b _) =
   pure (VInt (compareVersionParts (splitVersionStr a) (splitVersionStr b)))
 builtinCompareVersions _ _ = throwEvalError "builtins.compareVersions: expected two strings"
 
@@ -1335,43 +1483,45 @@ splitVersionStr t
        in component : splitVersionAfterComponent rest
 
 splitVersionAfterComponent :: Text -> [Text]
-splitVersionAfterComponent t
-  | T.null t = []
-  | T.head t == '.' = splitVersionStr (T.tail t)
-  | otherwise = splitVersionStr t
+splitVersionAfterComponent t = case T.uncons t of
+  Nothing -> []
+  Just ('.', rest) -> splitVersionStr rest
+  Just _ -> splitVersionStr t
 
 spanComponent :: Text -> (Text, Text)
-spanComponent t
-  | T.null t = ("", "")
-  | isDigit (T.head t) = T.span isDigit t
-  | isAlpha (T.head t) = T.span isAlpha t
-  | otherwise = (T.singleton (T.head t), T.tail t)
+spanComponent t = case T.uncons t of
+  Nothing -> ("", "")
+  Just (c, rest)
+    | isDigit c -> T.span isDigit t
+    | isAlpha c -> T.span isAlpha t
+    | otherwise -> (T.singleton c, rest)
 
 builtinSplitVersion :: (MonadEval m) => NixValue -> m NixValue
-builtinSplitVersion (VStr s) =
-  pure (VList (map (evaluated . VStr) (splitVersionComponents s)))
+builtinSplitVersion (VStr s _) =
+  pure (VList (map (evaluated . mkStr) (splitVersionComponents s)))
 builtinSplitVersion other =
   throwEvalError ("builtins.splitVersion: expected a string, got " <> typeName other)
 
 splitVersionComponents :: Text -> [Text]
-splitVersionComponents t
-  | T.null t = []
-  | T.head t == '.' = "." : splitVersionComponents (T.tail t)
-  | isDigit (T.head t) =
-      let (digits, rest) = T.span isDigit t
-       in digits : splitVersionComponents rest
-  | otherwise =
-      let (alpha, rest) = T.span isAlpha t
-       in alpha : splitVersionComponents rest
+splitVersionComponents t = case T.uncons t of
+  Nothing -> []
+  Just ('.', rest) -> "." : splitVersionComponents rest
+  Just (c, _)
+    | isDigit c ->
+        let (digits, rest) = T.span isDigit t
+         in digits : splitVersionComponents rest
+    | otherwise ->
+        let (alpha, rest) = T.span isAlpha t
+         in alpha : splitVersionComponents rest
 
 builtinParseDrvName :: (MonadEval m) => NixValue -> m NixValue
-builtinParseDrvName (VStr s) =
+builtinParseDrvName (VStr s _) =
   let (name, version) = parseName s
    in pure
         ( VAttrs
             ( Map.fromList
-                [ ("name", evaluated (VStr name)),
-                  ("version", evaluated (VStr version))
+                [ ("name", evaluated (mkStr name)),
+                  ("version", evaluated (mkStr version))
                 ]
             )
         )
@@ -1394,11 +1544,11 @@ findVersionDash t idx
   | otherwise = findVersionDash t (idx + 1)
 
 -- ---------------------------------------------------------------------------
--- Batch 5: Serialization + hashing
+-- Builtin implementations — serialization + hashing
 -- ---------------------------------------------------------------------------
 
 builtinToJSON :: (MonadEval m) => NixValue -> m NixValue
-builtinToJSON val = VStr <$> valueToJSON val
+builtinToJSON val = mkStr <$> valueToJSON val
 
 valueToJSON :: (MonadEval m) => NixValue -> m Text
 valueToJSON VNull = pure "null"
@@ -1410,7 +1560,7 @@ valueToJSON (VFloat f) =
    in -- Nix outputs 1e+40 style, Haskell outputs 1.0e40 style
       -- For simple cases just use show
       pure (T.pack s)
-valueToJSON (VStr s) = pure (jsonEscapeString s)
+valueToJSON (VStr s _) = pure (jsonEscapeString s)
 valueToJSON (VList thunks) = do
   vals <- mapM force thunks
   jsonVals <- mapM valueToJSON vals
@@ -1449,11 +1599,17 @@ jsonEscapeString s = "\"" <> T.concatMap escapeChar s <> "\""
         go 0 acc = acc
         go v acc =
           let (q, r) = quotRem v 16
-              hexChar = "0123456789abcdef" !! r
-           in go q (hexChar : acc)
+           in go q (hexDigit r : acc)
+
+-- | Safe hex digit lookup (total for 0–15).
+hexDigit :: Int -> Char
+hexDigit n
+  | n >= 0 && n <= 9 = chr (ord '0' + n)
+  | n >= 10 && n <= 15 = chr (ord 'a' + n - 10)
+  | otherwise = '?' -- unreachable for valid hex
 
 builtinFromJSON :: (MonadEval m) => NixValue -> m NixValue
-builtinFromJSON (VStr s) = case parseJSON (T.strip s) of
+builtinFromJSON (VStr s _) = case parseJSON (T.strip s) of
   Just (val, rest)
     | T.null (T.strip rest) -> pure val
     | otherwise -> throwEvalError "builtins.fromJSON: trailing content after JSON value"
@@ -1481,7 +1637,7 @@ parseJSONString :: Text -> Maybe (NixValue, Text)
 parseJSONString t = case T.uncons t of
   Just ('"', rest) ->
     let (strVal, remaining) = parseJSONStringContent rest ""
-     in Just (VStr strVal, remaining)
+     in Just (mkStr strVal, remaining)
   _ -> Nothing
 
 parseJSONStringContent :: Text -> Text -> (Text, Text)
@@ -1550,7 +1706,7 @@ parseJSONObjectEntries :: Text -> Map Text Thunk -> Maybe (NixValue, Text)
 parseJSONObjectEntries t acc = case T.uncons (T.stripStart t) of
   Just ('}', rest) -> Just (VAttrs acc, rest)
   _ -> case parseJSONString (T.stripStart t) of
-    Just (VStr key, rest) -> case T.uncons (T.stripStart rest) of
+    Just (VStr key _, rest) -> case T.uncons (T.stripStart rest) of
       Just (':', rest2) -> case parseJSON rest2 of
         Just (val, rest3) ->
           let stripped = T.stripStart rest3
@@ -1564,23 +1720,23 @@ parseJSONObjectEntries t acc = case T.uncons (T.stripStart t) of
     _ -> Nothing
 
 builtinHashString :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHashString (VStr algo) (VStr input) =
+builtinHashString (VStr algo _) (VStr input _) =
   let inputBytes = TE.encodeUtf8 input
    in case algo of
         "sha256" ->
           let digest = CH.hash inputBytes :: CH.Digest CH.SHA256
-           in pure (VStr (digestToHex digest))
+           in pure (mkStr (digestToHex digest))
         "sha512" ->
           let digest = CH.hash inputBytes :: CH.Digest CH.SHA512
-           in pure (VStr (digestToHex digest))
+           in pure (mkStr (digestToHex digest))
         "sha1" ->
           let digest = CH.hash inputBytes :: CH.Digest CH.SHA1
-           in pure (VStr (digestToHex digest))
+           in pure (mkStr (digestToHex digest))
         "md5" ->
           let digest = CH.hash inputBytes :: CH.Digest CH.MD5
-           in pure (VStr (digestToHex digest))
+           in pure (mkStr (digestToHex digest))
         _ -> throwEvalError ("builtins.hashString: unknown hash algorithm '" <> algo <> "'")
-builtinHashString (VStr _) other =
+builtinHashString (VStr _ _) other =
   throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
 builtinHashString other _ =
   throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
@@ -1591,7 +1747,7 @@ digestToHex digest =
    in T.pack (concatMap byteToHex bytes)
 
 -- ---------------------------------------------------------------------------
--- Batch 6: deepSeq
+-- Builtin implementations — deep evaluation
 -- ---------------------------------------------------------------------------
 
 builtinDeepSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -1605,7 +1761,7 @@ deepForce (VAttrs attrs) = mapM_ (force >=> deepForce) (Map.elems attrs)
 deepForce _ = pure ()
 
 -- ---------------------------------------------------------------------------
--- Batch 7: genericClosure
+-- Builtin implementations — graph traversal
 -- ---------------------------------------------------------------------------
 
 builtinGenericClosure :: (MonadEval m) => NixValue -> m NixValue
@@ -1668,7 +1824,7 @@ keyInList key (seen : rest) = do
 -- throws a type error for anything else.
 coerceToPath :: (MonadEval m) => Text -> NixValue -> m Text
 coerceToPath _ (VPath p) = pure p
-coerceToPath _ (VStr s) = pure s
+coerceToPath _ (VStr s _) = pure s
 coerceToPath name other =
   throwEvalError ("builtins." <> name <> ": expected a path or string, got " <> typeName other)
 
@@ -1680,7 +1836,7 @@ builtinImport other =
 builtinReadFile :: (MonadEval m) => NixValue -> m NixValue
 builtinReadFile val = do
   p <- coerceToPath "readFile" val
-  VStr <$> readFileText p
+  mkStr <$> readFileText p
 
 builtinPathExists :: (MonadEval m) => NixValue -> m NixValue
 builtinPathExists val = do
@@ -1691,32 +1847,32 @@ builtinReadDir :: (MonadEval m) => NixValue -> m NixValue
 builtinReadDir val = do
   p <- coerceToPath "readDir" val
   entries <- listDirectory p
-  pure (VAttrs (Map.fromList [(name, evaluated (VStr fileType)) | (name, fileType) <- entries]))
+  pure (VAttrs (Map.fromList [(name, evaluated (mkStr fileType)) | (name, fileType) <- entries]))
 
 -- ---------------------------------------------------------------------------
--- Batch A: getEnv, toPath
+-- Builtin implementations — environment + paths
 -- ---------------------------------------------------------------------------
 
 builtinGetEnv :: (MonadEval m) => NixValue -> m NixValue
-builtinGetEnv (VStr name) = VStr <$> getEnvVar name
+builtinGetEnv (VStr name _) = mkStr <$> getEnvVar name
 builtinGetEnv other =
   throwEvalError ("builtins.getEnv: expected a string, got " <> typeName other)
 
 builtinToPath :: (MonadEval m) => NixValue -> m NixValue
 builtinToPath (VPath p) = pure (VPath p)
-builtinToPath (VStr s)
-  | T.null s = throwEvalError "builtins.toPath: empty path"
-  | T.head s /= '/' = throwEvalError ("builtins.toPath: path must be absolute, got " <> s)
-  | otherwise = pure (VPath s)
+builtinToPath (VStr s _) = case T.uncons s of
+  Nothing -> throwEvalError "builtins.toPath: empty path"
+  Just ('/', _) -> pure (VPath s)
+  Just _ -> throwEvalError ("builtins.toPath: path must be absolute, got " <> s)
 builtinToPath other =
   throwEvalError ("builtins.toPath: expected a string or path, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Batch B: placeholder, storePath
+-- Builtin implementations — store path operations
 -- ---------------------------------------------------------------------------
 
 builtinPlaceholder :: (MonadEval m) => NixValue -> m NixValue
-builtinPlaceholder (VStr outputName) =
+builtinPlaceholder (VStr outputName _) =
   let preimage = "nix-output:" <> outputName
       hashText = truncatedBase32 (TE.encodeUtf8 preimage)
    in pure (VPath (storeDirPrefix <> hashText <> "-" <> outputName))
@@ -1725,7 +1881,7 @@ builtinPlaceholder other =
 
 builtinStorePath :: (MonadEval m) => NixValue -> m NixValue
 builtinStorePath (VPath p) = validateStorePath p
-builtinStorePath (VStr s) = validateStorePath s
+builtinStorePath (VStr s _) = validateStorePath s
 builtinStorePath other =
   throwEvalError ("builtins.storePath: expected a path or string, got " <> typeName other)
 
@@ -1741,11 +1897,11 @@ validateStorePath p
       throwEvalError ("builtins.storePath: not a valid store path: " <> p)
 
 -- ---------------------------------------------------------------------------
--- Batch C: findFile
+-- Builtin implementations — Nix search path
 -- ---------------------------------------------------------------------------
 
 builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinFindFile (VList searchPath) (VStr name) = do
+builtinFindFile (VList searchPath) (VStr name _) = do
   entries <- mapM forceSearchEntry searchPath
   findFirst entries name
 builtinFindFile (VList _) other =
@@ -1768,10 +1924,10 @@ forceSearchEntry thunk = do
       prefixVal <- force prefixThunk
       pathVal <- force pathThunk
       prefix <- case prefixVal of
-        VStr s -> pure s
+        VStr s _ -> pure s
         _ -> throwEvalError "builtins.findFile: 'prefix' must be a string"
       path <- case pathVal of
-        VStr s -> pure s
+        VStr s _ -> pure s
         VPath s -> pure s
         _ -> throwEvalError "builtins.findFile: 'path' must be a string or path"
       pure (prefix, path)
@@ -1800,20 +1956,20 @@ findFirst ((prefix, path) : rest) name
   | otherwise = findFirst rest name
 
 -- ---------------------------------------------------------------------------
--- Batch D: toFile
+-- Builtin implementations — store file creation
 -- ---------------------------------------------------------------------------
 
 builtinToFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinToFile (VStr name) (VStr contents) = do
+builtinToFile (VStr name _) (VStr contents _) = do
   storePath <- writeToStore name contents
   pure (VPath storePath)
-builtinToFile (VStr _) other =
+builtinToFile (VStr _ _) other =
   throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
 builtinToFile other _ =
   throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Batch E: scopedImport
+-- Builtin implementations — scoped import
 -- ---------------------------------------------------------------------------
 
 builtinScopedImport :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -1825,11 +1981,11 @@ builtinScopedImport other _ =
   throwEvalError ("builtins.scopedImport: expected a set, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Batch F: fetchurl, fetchTarball, fetchGit
+-- Builtin implementations — network fetchers
 -- ---------------------------------------------------------------------------
 
 builtinFetchurl :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchurl (VStr url) = fetchUrlSimple url Nothing
+builtinFetchurl (VStr url _) = fetchUrlSimple url Nothing
 builtinFetchurl (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchurl" "url" attrs
   sha256 <- forceOptionalAttrStr attrs "sha256"
@@ -1838,7 +1994,7 @@ builtinFetchurl other =
   throwEvalError ("builtins.fetchurl: expected a string or set, got " <> typeName other)
 
 builtinFetchTarball :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchTarball (VStr url) = fetchUrlSimple url Nothing
+builtinFetchTarball (VStr url _) = fetchUrlSimple url Nothing
 builtinFetchTarball (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchTarball" "url" attrs
   sha256 <- forceOptionalAttrStr attrs "sha256"
@@ -1847,7 +2003,7 @@ builtinFetchTarball other =
   throwEvalError ("builtins.fetchTarball: expected a string or set, got " <> typeName other)
 
 builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchGit (VStr url) = do
+builtinFetchGit (VStr url _) = do
   -- Use a content-based temp dir to avoid predictable paths
   let urlHash = sha256Hex (TE.encodeUtf8 url)
       tmpDir = "/tmp/nova-nix-fetchgit-" <> urlHash
@@ -1857,7 +2013,7 @@ builtinFetchGit (VStr url) = do
     else pure (VPath tmpDir)
 builtinFetchGit (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchGit" "url" attrs
-  builtinFetchGit (VStr url)
+  builtinFetchGit (mkStr url)
 builtinFetchGit other =
   throwEvalError ("builtins.fetchGit: expected a string or set, got " <> typeName other)
 
@@ -1879,7 +2035,7 @@ forceAttrStr builtin key attrs =
     Just thunk -> do
       val <- force thunk
       case val of
-        VStr s -> pure s
+        VStr s _ -> pure s
         VPath p -> pure p
         _ -> throwEvalError (builtin <> ": '" <> key <> "' must be a string")
 
@@ -1891,11 +2047,11 @@ forceOptionalAttrStr attrs key =
     Just thunk -> do
       val <- force thunk
       case val of
-        VStr s -> pure (Just s)
+        VStr s _ -> pure (Just s)
         _ -> pure Nothing
 
 -- ---------------------------------------------------------------------------
--- Batch H: derivation
+-- Builtin implementations — derivation construction
 -- ---------------------------------------------------------------------------
 
 builtinDerivation :: (MonadEval m) => NixValue -> m NixValue
@@ -1923,19 +2079,23 @@ builtinDerivation (VAttrs attrs) = do
         VList thunks -> mapM forceToText thunks
         _ -> throwEvalError "derivation: 'args' must be a list of strings"
 
-  -- Collect all string-coercible attrs into env
-  drvEnvPairs <- collectDrvEnv attrs
+  -- Collect all string-coercible attrs into env WITH their contexts
+  (drvEnvPairs, envContext) <- collectDrvEnvWithContext attrs
+
+  -- Extract input derivations and input sources from the merged context
+  let inputDrvs = extractInputDrvs envContext
+      inputSrcs = extractInputSrcs envContext
 
   -- Build the platform
   let platform = textToPlatform system
 
-  -- Build a minimal ATerm for hashing
+  -- Build the derivation with populated inputs for hashing
   let envMap = Map.fromList drvEnvPairs
       drv =
         Derivation
           { drvOutputs = [],
-            drvInputDrvs = Map.empty,
-            drvInputSrcs = [],
+            drvInputDrvs = inputDrvs,
+            drvInputSrcs = inputSrcs,
             drvPlatform = platform,
             drvBuilder = builder,
             drvArgs = builderArgs,
@@ -1946,7 +2106,12 @@ builtinDerivation (VAttrs attrs) = do
   let aterm = toATerm drv
       storeRef = ":" <> defaultStoreDirText <> ":"
       drvPathHash = truncatedBase32 (TE.encodeUtf8 ("text:sha256:" <> sha256Hex (TE.encodeUtf8 aterm) <> storeRef <> drvName <> ".drv"))
-      drvPath = storeDirPrefix <> drvPathHash <> "-" <> drvName <> ".drv"
+      drvPathText = storeDirPrefix <> drvPathHash <> "-" <> drvName <> ".drv"
+
+  -- Parse drvPath as a StorePath for context
+  let drvSP = case parseStorePath defaultStoreDir drvPathText of
+        Just sp -> sp
+        Nothing -> StorePath (T.take 32 (T.drop (T.length storeDirPrefix) drvPathText)) (drvName <> ".drv")
 
   -- Compute output paths
   let computeOutPath outName =
@@ -1974,21 +2139,26 @@ builtinDerivation (VAttrs attrs) = do
         | (outName, outP) <- outPaths
         ]
 
-  -- Build the complete Derivation with populated outputs
+  -- Build the complete Derivation with populated outputs and inputs
   let completeDrv = drv {drvOutputs = drvOutputsList}
+
+  -- Context for output paths: each output carries SCDrvOutput context
+  -- Context for drvPath: carries SCAllOutputs context
+  let drvPathCtx = StringContext (Set.singleton (SCAllOutputs drvSP))
+      outPathCtx outName = StringContext (Set.singleton (SCDrvOutput drvSP outName))
 
   -- Build result attrset: original attrs + drvPath, outPath, type, per-output attrs
   let baseAttrs =
         Map.fromList $
-          [ ("type", evaluated (VStr "derivation")),
-            ("drvPath", evaluated (VPath drvPath)),
-            ("outPath", evaluated (VPath mainOutPath)),
-            ("name", evaluated (VStr drvName)),
-            ("system", evaluated (VStr system)),
-            ("builder", evaluated (VStr builder)),
+          [ ("type", evaluated (mkStr "derivation")),
+            ("drvPath", evaluated (VStr drvPathText drvPathCtx)),
+            ("outPath", evaluated (VStr mainOutPath (outPathCtx "out"))),
+            ("name", evaluated (mkStr drvName)),
+            ("system", evaluated (mkStr system)),
+            ("builder", evaluated (mkStr builder)),
             ("_derivation", evaluated (VDerivation completeDrv))
           ]
-            ++ [(outName, evaluated (VPath outP)) | (outName, outP) <- outPaths]
+            ++ [(outName, evaluated (VStr outP (outPathCtx outName))) | (outName, outP) <- outPaths]
       -- Merge original attrs underneath so computed attrs take priority
       resultAttrs = Map.union baseAttrs attrs
 
@@ -2001,24 +2171,28 @@ forceToText :: (MonadEval m) => Thunk -> m Text
 forceToText thunk = do
   val <- force thunk
   case val of
-    VStr s -> pure s
+    VStr s _ -> pure s
     VPath p -> pure p
     _ -> throwEvalError ("expected a string, got " <> typeName val)
 
--- | Collect all string-coercible attributes for the derivation environment.
-collectDrvEnv :: (MonadEval m) => Map Text Thunk -> m [(Text, Text)]
-collectDrvEnv attrs = do
+-- | Collect all string-coercible attributes for the derivation environment,
+-- along with the merged string context from all collected values.
+collectDrvEnvWithContext :: (MonadEval m) => Map Text Thunk -> m ([(Text, Text)], StringContext)
+collectDrvEnvWithContext attrs = do
   let pairs = Map.toList attrs
-  catMaybes <$> mapM tryCoerce pairs
+  results <- mapM tryCoerce pairs
+  let envPairs = catMaybes [fmap (\(k, v, _) -> (k, v)) r | r <- results]
+      mergedCtx = mconcat [ctx | Just (_, _, ctx) <- results]
+  pure (envPairs, mergedCtx)
   where
     tryCoerce (key, thunk) = do
       val <- force thunk
       case val of
-        VStr s -> pure (Just (key, s))
-        VPath p -> pure (Just (key, p))
-        VInt n -> pure (Just (key, T.pack (show n)))
-        VBool True -> pure (Just (key, "1"))
-        VBool False -> pure (Just (key, ""))
+        VStr s ctx -> pure (Just (key, s, ctx))
+        VPath p -> pure (Just (key, p, emptyContext))
+        VInt n -> pure (Just (key, T.pack (show n), emptyContext))
+        VBool True -> pure (Just (key, "1", emptyContext))
+        VBool False -> pure (Just (key, "", emptyContext))
         VNull -> pure Nothing
         VList _ -> pure Nothing
         VAttrs innerAttrs ->
@@ -2027,8 +2201,8 @@ collectDrvEnv attrs = do
             Just outThunk -> do
               outVal <- force outThunk
               case outVal of
-                VPath p -> pure (Just (key, p))
-                VStr s -> pure (Just (key, s))
+                VPath p -> pure (Just (key, p, emptyContext))
+                VStr s ctx -> pure (Just (key, s, ctx))
                 _ -> pure Nothing
             Nothing -> pure Nothing
         _ -> pure Nothing

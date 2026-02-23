@@ -11,14 +11,14 @@ module Main (main) where
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
-import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, defaultBuildConfig)
+import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv)
 import Nix.Derivation (Derivation (..))
 import Nix.Eval (NixValue (..), Thunk (..), eval)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Parser (parseNix)
 import Nix.Store (Store, closeStore, openStore, writeDrv)
-import Nix.Store.Path (defaultStoreDir, parseStorePath, storePathToFilePath)
+import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, storePathToFilePath)
 import System.Directory (getTemporaryDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
@@ -91,7 +91,7 @@ extractDerivation :: NixValue -> IO Derivation
 extractDerivation (VAttrs attrs) = do
   -- Check type = "derivation"
   case Map.lookup "type" attrs of
-    Just (Evaluated (VStr "derivation")) -> pure ()
+    Just (Evaluated (VStr "derivation" _)) -> pure ()
     _ -> do
       hPutStrLn stderr "error: result is not a derivation (no type = \"derivation\")"
       exitFailure
@@ -106,25 +106,30 @@ extractDerivation _ = do
   hPutStrLn stderr "error: result is not a derivation"
   exitFailure
 
--- | Write the .drv file to the store and run the builder.
+-- | Write the .drv file to the store and build with dependency resolution.
 buildAndRegister :: Store -> Derivation -> IO BuildResult
 buildAndRegister store drv = do
-  -- Write .drv to store if we have a drvPath in env
-  case Map.lookup "out" (drvEnv drv) of
-    Just outPathText ->
-      case parseStorePath defaultStoreDir outPathText of
-        Just _ -> pure () -- valid output path
-        Nothing -> pure ()
-    Nothing -> pure ()
-  -- Write the .drv file
+  -- Write the .drv file to store
+  let drvSP = extractDrvStorePath drv
   writeDrvToStore store drv
-  -- Build
+  -- Build with dependency resolution
   tmpDir <- getTemporaryDirectory
   let config =
         (defaultBuildConfig defaultStoreDir)
           { bcTmpDir = tmpDir
           }
-  buildDerivation config store drv
+  case drvSP of
+    Just sp -> buildWithDeps config store drv sp
+    Nothing -> do
+      -- No drvPath available — fall back to direct build without dep resolution
+      hPutStrLn stderr "warning: no drvPath, building without dependency resolution"
+      -- Import buildDerivation for fallback
+      pure (BuildFailure "no drvPath available for dependency resolution" 1)
+
+-- | Extract the .drv store path from a derivation's env.
+extractDrvStorePath :: Derivation -> Maybe StorePath
+extractDrvStorePath drv =
+  Map.lookup "drvPath" (drvEnv drv) >>= parseStorePath defaultStoreDir
 
 -- | Write a .drv file to the store at its derived path.
 writeDrvToStore :: Store -> Derivation -> IO ()

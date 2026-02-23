@@ -13,48 +13,51 @@ where
 
 import Data.Text (Text)
 import qualified Data.Text as T
-import Nix.Eval.Types (Env, MonadEval (..), NixValue (..), typeName)
+import Nix.Eval.Context (concatStrings)
+import Nix.Eval.Types (Env, MonadEval (..), NixValue (..), StringContext, emptyContext, typeName)
 import Nix.Expr.Types (Expr, StringPart (..))
 
 -- | The evaluator function, passed as a parameter to avoid cyclic imports.
 type Eval m = Env -> Expr -> m NixValue
 
 -- | Evaluate the parts of a regular string (double-quoted).
-evalStringParts :: (MonadEval m) => Eval m -> Env -> [StringPart] -> m Text
+-- Returns the concatenated text and the merged context from all parts.
+evalStringParts :: (MonadEval m) => Eval m -> Env -> [StringPart] -> m (Text, StringContext)
 evalStringParts evalFn env parts = do
   chunks <- mapM (evalOnePart evalFn env) parts
-  pure (T.concat chunks)
+  pure (concatStrings chunks)
 
 -- | Evaluate the parts of an indented string (double single-quoted).
 --
 -- After interpolation, strips the common leading whitespace from all
 -- non-empty lines (the standard Nix indented-string semantics).
-evalIndStringParts :: (MonadEval m) => Eval m -> Env -> [StringPart] -> m Text
+-- Context is preserved through indentation stripping.
+evalIndStringParts :: (MonadEval m) => Eval m -> Env -> [StringPart] -> m (Text, StringContext)
 evalIndStringParts evalFn env parts = do
-  raw <- evalStringParts evalFn env parts
-  pure (stripIndentation raw)
+  (raw, ctx) <- evalStringParts evalFn env parts
+  pure (stripIndentation raw, ctx)
 
--- | Evaluate a single string part.
-evalOnePart :: (MonadEval m) => Eval m -> Env -> StringPart -> m Text
-evalOnePart _ _ (StrLit txt) = pure txt
+-- | Evaluate a single string part, returning its text and context.
+evalOnePart :: (MonadEval m) => Eval m -> Env -> StringPart -> m (Text, StringContext)
+evalOnePart _ _ (StrLit txt) = pure (txt, emptyContext)
 evalOnePart evalFn env (StrInterp expr) = do
   val <- evalFn env expr
   coerceToString val
 
 -- | Coerce a Nix value to a string for interpolation.
 --
--- Nix coercion rules: strings pass through, integers and floats are
--- shown, paths pass through, null becomes the empty string.  Other
--- types (lists, sets, functions) cannot be coerced.
-coerceToString :: (MonadEval m) => NixValue -> m Text
+-- Nix coercion rules: strings pass through (with context), integers
+-- and floats are shown, paths pass through, null becomes the empty
+-- string.  Other types (lists, sets, functions) cannot be coerced.
+coerceToString :: (MonadEval m) => NixValue -> m (Text, StringContext)
 coerceToString val = case val of
-  VStr s -> pure s
-  VInt n -> pure (T.pack (show n))
-  VFloat n -> pure (T.pack (show n))
-  VPath p -> pure p
-  VNull -> pure ""
-  VBool True -> pure "1"
-  VBool False -> pure ""
+  VStr s ctx -> pure (s, ctx)
+  VInt n -> pure (T.pack (show n), emptyContext)
+  VFloat n -> pure (T.pack (show n), emptyContext)
+  VPath p -> pure (p, emptyContext)
+  VNull -> pure ("", emptyContext)
+  VBool True -> pure ("1", emptyContext)
+  VBool False -> pure ("", emptyContext)
   other ->
     throwEvalError ("cannot coerce " <> typeName other <> " to a string")
 

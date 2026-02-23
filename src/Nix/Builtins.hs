@@ -15,6 +15,7 @@ where
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), builtinNames, currentSystemStr, evaluated)
+import Nix.Eval.Types (mkStr)
 import Nix.Store.Path (defaultStoreDirText)
 
 -- | The initial environment containing all builtins.
@@ -31,12 +32,12 @@ builtinEnv timestamp =
   Env
     { envBindings =
         Map.fromList
-          [ ("true", val (VBool True)),
-            ("false", val (VBool False)),
-            ("null", val VNull),
-            ("import", val (VBuiltin "import" [])),
-            ("derivation", val (VBuiltin "derivation" [])),
-            ("builtins", val (builtinsAttrSet timestamp))
+          [ ("true", evaluated (VBool True)),
+            ("false", evaluated (VBool False)),
+            ("null", evaluated VNull),
+            ("import", evaluated (VBuiltin "import" [])),
+            ("derivation", evaluated (VBuiltin "derivation" [])),
+            ("builtins", evaluated (builtinsAttrSet timestamp))
           ],
       envWithScopes = []
     }
@@ -55,22 +56,18 @@ builtinsAttrSet timestamp =
   VAttrs $ Map.union builtinEntries (standardEntries timestamp)
   where
     builtinEntries =
-      Map.fromList [(name, val (VBuiltin name [])) | name <- builtinNames]
+      Map.fromList [(name, evaluated (VBuiltin name [])) | name <- builtinNames]
 
 standardEntries :: Integer -> Map.Map Text Thunk
 standardEntries timestamp =
   Map.fromList
-    [ ("true", val (VBool True)),
-      ("false", val (VBool False)),
-      ("null", val VNull),
-      ("storeDir", val (VStr defaultStoreDirText)),
-      ("nixVersion", val (VStr "2.24.0")),
-      ("langVersion", val (VInt 6)),
-      ("nixPath", val (VList [])),
-      ("currentTime", val (VInt timestamp)),
-      ("currentSystem", val (VStr currentSystemStr))
+    [ ("true", evaluated (VBool True)),
+      ("false", evaluated (VBool False)),
+      ("null", evaluated VNull),
+      ("storeDir", evaluated (mkStr defaultStoreDirText)),
+      ("nixVersion", evaluated (mkStr "2.24.0")),
+      ("langVersion", evaluated (VInt 6)),
+      ("nixPath", evaluated (VList [])),
+      ("currentTime", evaluated (VInt timestamp)),
+      ("currentSystem", evaluated (mkStr currentSystemStr))
     ]
-
--- | Wrap a value as an already-evaluated thunk.
-val :: NixValue -> Thunk
-val = evaluated
