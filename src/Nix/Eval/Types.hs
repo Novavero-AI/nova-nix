@@ -162,7 +162,28 @@ class (Monad m) => MonadEval m where
   catchEvalError :: m a -> m (Either Text a)
   readFileText :: Text -> m Text
   doesPathExist :: Text -> m Bool
-  listDirectory :: Text -> m [Text]
+
+  -- | List a directory, returning @(name, fileType)@ pairs.
+  -- @fileType@ is one of @"regular"@, @"directory"@, or @"symlink"@
+  -- (matching Nix's @builtins.readDir@ semantics).
+  listDirectory :: Text -> m [(Text, Text)]
+
+  importFile :: Text -> m NixValue
+
+  -- | Look up an environment variable.  Returns @""@ if unset.
+  getEnvVar :: Text -> m Text
+
+  -- | Get the current epoch time (seconds since 1970-01-01).
+  getCurrentTime :: m Integer
+
+  -- | Write a named file to the store, returning the store path.
+  writeToStore :: Text -> Text -> m Text
+
+  -- | Import a file with a custom scope overlaid on builtins.
+  scopedImportFile :: [(Text, Thunk)] -> Text -> m NixValue
+
+  -- | Run an external process: @(command, args, stdin) -> (exitCode, stdout, stderr)@.
+  runProcess :: Text -> [Text] -> Text -> m (Int, Text, Text)
 
 -- | Pure evaluation monad — wraps 'Either Text'.
 -- IO builtins ('readFile', 'import') are unavailable;
@@ -175,4 +196,10 @@ instance MonadEval PureEval where
   catchEvalError (PureEval action) = PureEval (Right action)
   readFileText _ = throwEvalError "readFile: not available in pure evaluation"
   doesPathExist _ = pure False
-  listDirectory _ = throwEvalError "readDir: not available in pure evaluation"
+  listDirectory _ = throwEvalError "builtins.readDir: not available in pure evaluation"
+  importFile _ = throwEvalError "import: not available in pure evaluation"
+  getEnvVar _ = pure ""
+  getCurrentTime = pure 0
+  writeToStore _ _ = throwEvalError "toFile: not available in pure evaluation"
+  scopedImportFile _ _ = throwEvalError "scopedImport: not available in pure evaluation"
+  runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"

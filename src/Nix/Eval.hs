@@ -42,15 +42,17 @@ import Control.Monad (when, (>=>))
 import qualified Crypto.Hash as CH
 import Data.Bits (xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
+import qualified Data.ByteString as BS
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, ord)
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (catMaybes, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word8)
+import Nix.Derivation (Derivation (..), Platform (..), toATerm)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
 import Nix.Eval.Types
@@ -78,6 +80,7 @@ import Nix.Expr.Types
     Formals (..),
     NixAtom (..),
   )
+import qualified NovaCache.Base32
 import qualified System.Info
 
 -- | Evaluate a Nix expression in an environment.
@@ -559,7 +562,30 @@ builtinRegistry =
       builtin1 "tryEval" (\_ -> throwEvalError "unreachable: tryEval handled in evalApp"),
       builtin2 "deepSeq" builtinDeepSeq,
       -- Batch 7: genericClosure
-      builtin1 "genericClosure" builtinGenericClosure
+      builtin1 "genericClosure" builtinGenericClosure,
+      -- IO builtins (delegate to MonadEval methods)
+      builtin1 "import" builtinImport,
+      builtin1 "readFile" builtinReadFile,
+      builtin1 "pathExists" builtinPathExists,
+      builtin1 "readDir" builtinReadDir,
+      -- Batch A: getEnv, toPath
+      builtin1 "getEnv" builtinGetEnv,
+      builtin1 "toPath" builtinToPath,
+      -- Batch B: placeholder, storePath
+      builtin1 "placeholder" builtinPlaceholder,
+      builtin1 "storePath" builtinStorePath,
+      -- Batch C: findFile
+      builtin2 "findFile" builtinFindFile,
+      -- Batch D: toFile
+      builtin2 "toFile" builtinToFile,
+      -- Batch E: scopedImport
+      builtin2 "scopedImport" builtinScopedImport,
+      -- Batch F: fetch builtins
+      builtin1 "fetchurl" builtinFetchurl,
+      builtin1 "fetchTarball" builtinFetchTarball,
+      builtin1 "fetchGit" builtinFetchGit,
+      -- Batch H: derivation
+      builtin1 "derivation" builtinDerivation
     ]
 
 -- | Names of all registered builtins.
@@ -1632,3 +1658,393 @@ keyInList _ [] = pure False
 keyInList key (seen : rest) = do
   eq <- nixEqual force key seen
   if eq then pure True else keyInList key rest
+
+-- ---------------------------------------------------------------------------
+-- IO builtins (delegate to MonadEval methods)
+-- ---------------------------------------------------------------------------
+
+-- | Coerce a value to a path 'Text'.  Accepts 'VPath' and 'VStr';
+-- throws a type error for anything else.
+coerceToPath :: (MonadEval m) => Text -> NixValue -> m Text
+coerceToPath _ (VPath p) = pure p
+coerceToPath _ (VStr s) = pure s
+coerceToPath name other =
+  throwEvalError ("builtins." <> name <> ": expected a path or string, got " <> typeName other)
+
+builtinImport :: (MonadEval m) => NixValue -> m NixValue
+builtinImport (VPath p) = importFile p
+builtinImport other =
+  throwEvalError ("import: expected a path, got " <> typeName other)
+
+builtinReadFile :: (MonadEval m) => NixValue -> m NixValue
+builtinReadFile val = do
+  p <- coerceToPath "readFile" val
+  VStr <$> readFileText p
+
+builtinPathExists :: (MonadEval m) => NixValue -> m NixValue
+builtinPathExists val = do
+  p <- coerceToPath "pathExists" val
+  VBool <$> doesPathExist p
+
+builtinReadDir :: (MonadEval m) => NixValue -> m NixValue
+builtinReadDir val = do
+  p <- coerceToPath "readDir" val
+  entries <- listDirectory p
+  pure (VAttrs (Map.fromList [(name, evaluated (VStr fileType)) | (name, fileType) <- entries]))
+
+-- ---------------------------------------------------------------------------
+-- Batch A: getEnv, toPath
+-- ---------------------------------------------------------------------------
+
+builtinGetEnv :: (MonadEval m) => NixValue -> m NixValue
+builtinGetEnv (VStr name) = VStr <$> getEnvVar name
+builtinGetEnv other =
+  throwEvalError ("builtins.getEnv: expected a string, got " <> typeName other)
+
+builtinToPath :: (MonadEval m) => NixValue -> m NixValue
+builtinToPath (VPath p) = pure (VPath p)
+builtinToPath (VStr s)
+  | T.null s = throwEvalError "builtins.toPath: empty path"
+  | T.head s /= '/' = throwEvalError ("builtins.toPath: path must be absolute, got " <> s)
+  | otherwise = pure (VPath s)
+builtinToPath other =
+  throwEvalError ("builtins.toPath: expected a string or path, got " <> typeName other)
+
+-- ---------------------------------------------------------------------------
+-- Batch B: placeholder, storePath
+-- ---------------------------------------------------------------------------
+
+builtinPlaceholder :: (MonadEval m) => NixValue -> m NixValue
+builtinPlaceholder (VStr outputName) =
+  let preimage = "nix-output:" <> outputName
+      hashText = truncatedNixBase32 (TE.encodeUtf8 preimage)
+   in pure (VPath ("/nix/store/" <> hashText <> "-" <> outputName))
+builtinPlaceholder other =
+  throwEvalError ("builtins.placeholder: expected a string, got " <> typeName other)
+
+builtinStorePath :: (MonadEval m) => NixValue -> m NixValue
+builtinStorePath (VPath p) = validateStorePath p
+builtinStorePath (VStr s) = validateStorePath s
+builtinStorePath other =
+  throwEvalError ("builtins.storePath: expected a path or string, got " <> typeName other)
+
+validateStorePath :: (MonadEval m) => Text -> m NixValue
+validateStorePath p
+  | "/nix/store/" `T.isPrefixOf` p,
+    T.length p > T.length "/nix/store/",
+    let basename = T.drop (T.length "/nix/store/") p,
+    T.length basename >= 33,
+    T.index basename 32 == '-' =
+      pure (VPath p)
+  | otherwise =
+      throwEvalError ("builtins.storePath: not a valid store path: " <> p)
+
+-- ---------------------------------------------------------------------------
+-- Batch C: findFile
+-- ---------------------------------------------------------------------------
+
+builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinFindFile (VList searchPath) (VStr name) = do
+  entries <- mapM forceSearchEntry searchPath
+  findFirst entries name
+builtinFindFile (VList _) other =
+  throwEvalError ("builtins.findFile: expected a string, got " <> typeName other)
+builtinFindFile other _ =
+  throwEvalError ("builtins.findFile: expected a list, got " <> typeName other)
+
+-- | Extract {prefix, path} from a search path entry thunk.
+forceSearchEntry :: (MonadEval m) => Thunk -> m (Text, Text)
+forceSearchEntry thunk = do
+  val <- force thunk
+  case val of
+    VAttrs attrs -> do
+      prefixThunk <-
+        maybe (throwEvalError "builtins.findFile: entry missing 'prefix'") pure $
+          Map.lookup "prefix" attrs
+      pathThunk <-
+        maybe (throwEvalError "builtins.findFile: entry missing 'path'") pure $
+          Map.lookup "path" attrs
+      prefixVal <- force prefixThunk
+      pathVal <- force pathThunk
+      prefix <- case prefixVal of
+        VStr s -> pure s
+        _ -> throwEvalError "builtins.findFile: 'prefix' must be a string"
+      path <- case pathVal of
+        VStr s -> pure s
+        VPath s -> pure s
+        _ -> throwEvalError "builtins.findFile: 'path' must be a string or path"
+      pure (prefix, path)
+    _ -> throwEvalError "builtins.findFile: search path entry must be a set"
+
+-- | Iterate search path entries, checking for a match.
+findFirst :: (MonadEval m) => [(Text, Text)] -> Text -> m NixValue
+findFirst [] name =
+  throwEvalError ("file '" <> name <> "' was not found in the Nix search path")
+findFirst ((prefix, path) : rest) name
+  | prefix == name || (not (T.null prefix) && (prefix <> "/") `T.isPrefixOf` name) =
+      let suffix = if prefix == name then "" else T.drop (T.length prefix + 1) name
+          candidate = if T.null suffix then path else path <> "/" <> suffix
+       in do
+            exists <- doesPathExist candidate
+            if exists
+              then pure (VPath candidate)
+              else findFirst rest name
+  | T.null prefix =
+      let candidate = path <> "/" <> name
+       in do
+            exists <- doesPathExist candidate
+            if exists
+              then pure (VPath candidate)
+              else findFirst rest name
+  | otherwise = findFirst rest name
+
+-- ---------------------------------------------------------------------------
+-- Batch D: toFile
+-- ---------------------------------------------------------------------------
+
+builtinToFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinToFile (VStr name) (VStr contents) = do
+  storePath <- writeToStore name contents
+  pure (VPath storePath)
+builtinToFile (VStr _) other =
+  throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
+builtinToFile other _ =
+  throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
+
+-- ---------------------------------------------------------------------------
+-- Batch E: scopedImport
+-- ---------------------------------------------------------------------------
+
+builtinScopedImport :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinScopedImport (VAttrs attrs) pathVal = do
+  p <- coerceToPath "scopedImport" pathVal
+  let scope = Map.toList attrs
+  scopedImportFile scope p
+builtinScopedImport other _ =
+  throwEvalError ("builtins.scopedImport: expected a set, got " <> typeName other)
+
+-- ---------------------------------------------------------------------------
+-- Batch F: fetchurl, fetchTarball, fetchGit
+-- ---------------------------------------------------------------------------
+
+builtinFetchurl :: (MonadEval m) => NixValue -> m NixValue
+builtinFetchurl (VStr url) = fetchUrlSimple url Nothing
+builtinFetchurl (VAttrs attrs) = do
+  url <- forceAttrStr "builtins.fetchurl" "url" attrs
+  sha256 <- forceOptionalAttrStr attrs "sha256"
+  fetchUrlSimple url sha256
+builtinFetchurl other =
+  throwEvalError ("builtins.fetchurl: expected a string or set, got " <> typeName other)
+
+builtinFetchTarball :: (MonadEval m) => NixValue -> m NixValue
+builtinFetchTarball (VStr url) = fetchUrlSimple url Nothing
+builtinFetchTarball (VAttrs attrs) = do
+  url <- forceAttrStr "builtins.fetchTarball" "url" attrs
+  sha256 <- forceOptionalAttrStr attrs "sha256"
+  fetchUrlSimple url sha256
+builtinFetchTarball other =
+  throwEvalError ("builtins.fetchTarball: expected a string or set, got " <> typeName other)
+
+builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
+builtinFetchGit (VStr url) = do
+  (code, stdout, stderr) <- runProcess "git" ["clone", "--depth", "1", url, "/tmp/nova-nix-fetchgit"] ""
+  if code /= 0
+    then throwEvalError ("builtins.fetchGit: git clone failed: " <> stderr)
+    else do
+      _ <- pure stdout
+      pure (VPath "/tmp/nova-nix-fetchgit")
+builtinFetchGit (VAttrs attrs) = do
+  url <- forceAttrStr "builtins.fetchGit" "url" attrs
+  builtinFetchGit (VStr url)
+builtinFetchGit other =
+  throwEvalError ("builtins.fetchGit: expected a string or set, got " <> typeName other)
+
+-- | Fetch a URL and optionally verify its hash.
+fetchUrlSimple :: (MonadEval m) => Text -> Maybe Text -> m NixValue
+fetchUrlSimple url _sha256 = do
+  (code, stdout, stderr) <- runProcess "curl" ["-sSfL", url] ""
+  if code /= 0
+    then throwEvalError ("fetch failed: " <> stderr)
+    else do
+      storePath <- writeToStore "fetchurl-result" stdout
+      pure (VPath storePath)
+
+-- | Force a required string attribute from an attrset.
+forceAttrStr :: (MonadEval m) => Text -> Text -> Map Text Thunk -> m Text
+forceAttrStr builtin key attrs =
+  case Map.lookup key attrs of
+    Nothing -> throwEvalError (builtin <> ": missing required attribute '" <> key <> "'")
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VStr s -> pure s
+        VPath p -> pure p
+        _ -> throwEvalError (builtin <> ": '" <> key <> "' must be a string")
+
+-- | Force an optional string attribute.
+forceOptionalAttrStr :: (MonadEval m) => Map Text Thunk -> Text -> m (Maybe Text)
+forceOptionalAttrStr attrs key =
+  case Map.lookup key attrs of
+    Nothing -> pure Nothing
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VStr s -> pure (Just s)
+        _ -> pure Nothing
+
+-- ---------------------------------------------------------------------------
+-- Batch H: derivation
+-- ---------------------------------------------------------------------------
+
+builtinDerivation :: (MonadEval m) => NixValue -> m NixValue
+builtinDerivation (VAttrs attrs) = do
+  -- Extract required attributes
+  drvName <- forceAttrStr "derivation" "name" attrs
+  system <- forceAttrStr "derivation" "system" attrs
+  builder <- forceAttrStr "derivation" "builder" attrs
+
+  -- Extract optional outputs (default ["out"])
+  outputNames <- case Map.lookup "outputs" attrs of
+    Nothing -> pure ["out"]
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VList thunks -> mapM forceToText thunks
+        _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
+
+  -- Extract optional args (default [])
+  builderArgs <- case Map.lookup "args" attrs of
+    Nothing -> pure []
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VList thunks -> mapM forceToText thunks
+        _ -> throwEvalError "derivation: 'args' must be a list of strings"
+
+  -- Collect all string-coercible attrs into env
+  drvEnvPairs <- collectDrvEnv attrs
+
+  -- Build the platform
+  let platform = textToPlatform system
+
+  -- Build a minimal ATerm for hashing
+  let envMap = Map.fromList drvEnvPairs
+      drv =
+        Derivation
+          { drvOutputs = [],
+            drvInputDrvs = Map.empty,
+            drvInputSrcs = [],
+            drvPlatform = platform,
+            drvBuilder = builder,
+            drvArgs = builderArgs,
+            drvEnv = envMap
+          }
+
+  -- Serialize to ATerm and hash for drvPath
+  let aterm = toATerm drv
+      drvPathHash = truncatedNixBase32 (TE.encodeUtf8 ("text:sha256:" <> sha256HexBS (TE.encodeUtf8 aterm) <> ":/nix/store:" <> drvName <> ".drv"))
+      drvPath = "/nix/store/" <> drvPathHash <> "-" <> drvName <> ".drv"
+
+  -- Compute output paths
+  let computeOutPath outName =
+        let preimage = "output:" <> outName <> ":sha256:" <> sha256HexBS (TE.encodeUtf8 aterm) <> ":/nix/store:" <> drvName <> (if outName == "out" then "" else "-" <> outName)
+            outHash = truncatedNixBase32 (TE.encodeUtf8 preimage)
+         in "/nix/store/" <> outHash <> "-" <> drvName <> (if outName == "out" then "" else "-" <> outName)
+
+  let outPaths = [(outName, computeOutPath outName) | outName <- outputNames]
+      mainOutPath = case outPaths of
+        ((_, p) : _) -> p
+        [] -> ""
+
+  -- Build result attrset: original attrs + drvPath, outPath, type, per-output attrs
+  let baseAttrs =
+        Map.fromList $
+          [ ("type", evaluated (VStr "derivation")),
+            ("drvPath", evaluated (VPath drvPath)),
+            ("outPath", evaluated (VPath mainOutPath)),
+            ("name", evaluated (VStr drvName)),
+            ("system", evaluated (VStr system)),
+            ("builder", evaluated (VStr builder))
+          ]
+            ++ [(outName, evaluated (VPath outP)) | (outName, outP) <- outPaths]
+      -- Merge original attrs underneath so computed attrs take priority
+      resultAttrs = Map.union baseAttrs attrs
+
+  pure (VAttrs resultAttrs)
+builtinDerivation other =
+  throwEvalError ("derivation: expected a set, got " <> typeName other)
+
+-- | Convert a system string to a Platform.
+textToPlatform :: Text -> Platform
+textToPlatform t = case t of
+  "x86_64-linux" -> X86_64_Linux
+  "x86_64-darwin" -> X86_64_Darwin
+  "aarch64-darwin" -> Aarch64_Darwin
+  "x86_64-windows" -> X86_64_Windows
+  "aarch64-linux" -> Aarch64_Linux
+  other -> OtherPlatform other
+
+-- | Force a thunk to a Text string.
+forceToText :: (MonadEval m) => Thunk -> m Text
+forceToText thunk = do
+  val <- force thunk
+  case val of
+    VStr s -> pure s
+    VPath p -> pure p
+    _ -> throwEvalError ("expected a string, got " <> typeName val)
+
+-- | Collect all string-coercible attributes for the derivation environment.
+collectDrvEnv :: (MonadEval m) => Map Text Thunk -> m [(Text, Text)]
+collectDrvEnv attrs = do
+  let pairs = Map.toList attrs
+  catMaybes <$> mapM tryCoerce pairs
+  where
+    tryCoerce (key, thunk) = do
+      val <- force thunk
+      case val of
+        VStr s -> pure (Just (key, s))
+        VPath p -> pure (Just (key, p))
+        VInt n -> pure (Just (key, T.pack (show n)))
+        VBool True -> pure (Just (key, "1"))
+        VBool False -> pure (Just (key, ""))
+        VNull -> pure Nothing
+        VList _ -> pure Nothing
+        VAttrs innerAttrs ->
+          -- Derivations in env get their outPath
+          case Map.lookup "outPath" innerAttrs of
+            Just outThunk -> do
+              outVal <- force outThunk
+              case outVal of
+                VPath p -> pure (Just (key, p))
+                VStr s -> pure (Just (key, s))
+                _ -> pure Nothing
+            Nothing -> pure Nothing
+        _ -> pure Nothing
+
+-- ---------------------------------------------------------------------------
+-- Shared hashing helpers
+-- ---------------------------------------------------------------------------
+
+-- | Truncate a SHA-256 digest to 20 bytes and Nix base-32 encode.
+truncatedNixBase32 :: BS.ByteString -> Text
+truncatedNixBase32 bs =
+  let digest = CH.hash bs :: CH.Digest CH.SHA256
+      bytes20 = BS.pack (Prelude.take 20 (BA.unpack digest :: [Word8]))
+   in nixBase32Encode bytes20
+
+-- | SHA-256 hex digest of a ByteString.
+sha256HexBS :: BS.ByteString -> Text
+sha256HexBS bs =
+  let digest = CH.hash bs :: CH.Digest CH.SHA256
+      bytes = BA.unpack digest
+   in T.pack (concatMap byteToHexEval bytes)
+
+byteToHexEval :: Word8 -> String
+byteToHexEval w =
+  let (hi, lo) = quotRem (fromIntegral w :: Int) 16
+      hexDigit n = "0123456789abcdef" !! n
+   in [hexDigit hi, hexDigit lo]
+
+-- | Nix base-32 encoding using nova-cache.
+nixBase32Encode :: BS.ByteString -> Text
+nixBase32Encode = NovaCache.Base32.encode

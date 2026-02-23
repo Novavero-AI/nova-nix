@@ -60,13 +60,16 @@ module Nix.Derivation
     -- * Platform
     Platform (..),
     currentPlatform,
+    platformToText,
   )
 where
 
 import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
-import Nix.Store.Path (StorePath)
+import Nix.Store.Path (StorePath (..), storePathToFilePath)
+import qualified Nix.Store.Path as SP
 import qualified System.Info as SI
 
 -- | Target platform for a derivation.
@@ -103,11 +106,16 @@ packPlatform arch os =
         "darwin" -> "darwin"
         "linux" -> "linux"
         other -> other
-   in mconcat [toText archText, "-", toText osText]
+   in mconcat [T.pack archText, "-", T.pack osText]
 
--- | Convert String to Text.
-toText :: String -> Text
-toText = T.pack
+-- | Convert a 'Platform' to its Nix text representation.
+platformToText :: Platform -> Text
+platformToText X86_64_Linux = "x86_64-linux"
+platformToText X86_64_Darwin = "x86_64-darwin"
+platformToText Aarch64_Darwin = "aarch64-darwin"
+platformToText X86_64_Windows = "x86_64-windows"
+platformToText Aarch64_Linux = "aarch64-linux"
+platformToText (OtherPlatform t) = t
 
 -- | A single output of a derivation.
 data DerivationOutput = DerivationOutput
@@ -143,8 +151,90 @@ data Derivation = Derivation
 
 -- | Serialize a derivation to ATerm format (the .drv file format).
 -- This serialization is what gets hashed to compute the store path.
+--
+-- Format: @Derive([outputs],[inputDrvs],[inputSrcs],platform,builder,[args],[env])@
 toATerm :: Derivation -> Text
-toATerm _drv = "" -- TODO: implement ATerm serialization
+toATerm drv =
+  "Derive("
+    <> atermOutputs (drvOutputs drv)
+    <> ","
+    <> atermInputDrvs (drvInputDrvs drv)
+    <> ","
+    <> atermInputSrcs (drvInputSrcs drv)
+    <> ","
+    <> atermString (platformToText (drvPlatform drv))
+    <> ","
+    <> atermString (drvBuilder drv)
+    <> ","
+    <> atermStringList (drvArgs drv)
+    <> ","
+    <> atermEnv (drvEnv drv)
+    <> ")"
+
+-- | Serialize outputs: @[(name,path,hashAlgo,hash)]@
+atermOutputs :: [DerivationOutput] -> Text
+atermOutputs outs =
+  "[" <> T.intercalate "," (map atermOutput outs) <> "]"
+
+atermOutput :: DerivationOutput -> Text
+atermOutput out =
+  "("
+    <> atermString (doName out)
+    <> ","
+    <> atermString (T.pack (storePathToFilePath SP.defaultStoreDir (doPath out)))
+    <> ","
+    <> atermString (doHashAlgo out)
+    <> ","
+    <> atermString (doHash out)
+    <> ")"
+
+-- | Serialize input derivations: @[(drvPath,[outName1,outName2])]@
+-- Sorted by store path for determinism.
+atermInputDrvs :: Map StorePath [Text] -> Text
+atermInputDrvs drvs =
+  let sorted = Map.toAscList drvs
+   in "[" <> T.intercalate "," (map atermInputDrv sorted) <> "]"
+
+atermInputDrv :: (StorePath, [Text]) -> Text
+atermInputDrv (sp, outs) =
+  "("
+    <> atermString (T.pack (storePathToFilePath SP.defaultStoreDir sp))
+    <> ","
+    <> atermStringList outs
+    <> ")"
+
+-- | Serialize input sources: @[path1,path2,...]@
+atermInputSrcs :: [StorePath] -> Text
+atermInputSrcs srcs =
+  "[" <> T.intercalate "," (map (atermString . T.pack . storePathToFilePath SP.defaultStoreDir) srcs) <> "]"
+
+-- | Serialize a list of strings: @[s1,s2,...]@
+atermStringList :: [Text] -> Text
+atermStringList strs =
+  "[" <> T.intercalate "," (map atermString strs) <> "]"
+
+-- | Serialize environment: @[(key,value)]@ sorted by key.
+atermEnv :: Map Text Text -> Text
+atermEnv env =
+  let sorted = Map.toAscList env
+   in "[" <> T.intercalate "," (map atermEnvPair sorted) <> "]"
+
+atermEnvPair :: (Text, Text) -> Text
+atermEnvPair (key, val) =
+  "(" <> atermString key <> "," <> atermString val <> ")"
+
+-- | ATerm string: double-quoted with standard escaping.
+atermString :: Text -> Text
+atermString s = "\"" <> T.concatMap escapeATerm s <> "\""
+
+-- | Escape a character for ATerm format.
+escapeATerm :: Char -> Text
+escapeATerm '\\' = "\\\\"
+escapeATerm '"' = "\\\""
+escapeATerm '\n' = "\\n"
+escapeATerm '\r' = "\\r"
+escapeATerm '\t' = "\\t"
+escapeATerm c = T.singleton c
 
 -- | Parse a .drv file from ATerm format.
 fromATerm :: Text -> Either Text Derivation

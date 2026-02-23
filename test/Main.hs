@@ -2,17 +2,23 @@
 
 module Main (main) where
 
+import Control.Exception (bracket_)
+import Control.Monad (when)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
 import Nix.Builtins (builtinEnv)
-import Nix.Derivation (Platform (..), currentPlatform)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, platformToText, toATerm)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), emptyEnv, eval, runPureEval)
+import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Expr.Types
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, storePathToFilePath, windowsStoreDir)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure, exitSuccess)
+import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 
 -- ---------------------------------------------------------------------------
@@ -64,7 +70,7 @@ tokenTypes = filter (/= TokEOF) . map locToken
 evalNix :: Text -> Either Text NixValue
 evalNix source = case parseNix "<test>" source of
   Left err -> Left (T.pack (show err))
-  Right expr -> runPureEval (eval builtinEnv expr)
+  Right expr -> runPureEval (eval (builtinEnv 0) expr)
 
 -- | Assert that a Nix expression evaluates to the expected value.
 assertEval :: Text -> Text -> NixValue -> TestResult
@@ -1257,6 +1263,455 @@ testBatch7 = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: import and IO builtins (pure)
+-- ---------------------------------------------------------------------------
+
+testImportPure :: IO [Bool]
+testImportPure = do
+  putStrLn "eval/import-pure"
+  sequence
+    [ runTest "import errors in pure mode" $
+        assertEvalFail "import-pure" "import ./foo.nix",
+      runTest "builtins.typeOf import is lambda" $
+        assertEval "typeof-import" "builtins.typeOf import" (VStr "lambda"),
+      runTest "pathExists returns false in pure mode" $
+        assertEval "pathExists-pure" "builtins.pathExists ./nonexistent" (VBool False),
+      runTest "readFile errors in pure mode" $
+        assertEvalFail "readFile-pure" "builtins.readFile ./foo.nix",
+      runTest "readDir errors in pure mode" $
+        assertEvalFail "readDir-pure" "builtins.readDir ./some-dir"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: import and IO builtins (IO)
+-- ---------------------------------------------------------------------------
+
+-- | Parse and evaluate Nix source using the IO evaluator.
+evalNixIO :: FilePath -> Text -> IO (Either Text NixValue)
+evalNixIO baseDir source = case parseNix "<test>" source of
+  Left err -> pure (Left (T.pack (show err)))
+  Right expr -> do
+    st <- newEvalState baseDir
+    runEvalIO st (eval (builtinEnv (esTimestamp st)) expr)
+
+-- | Run a named IO eval test — single label, no double-wrapping.
+runTestIO :: Text -> FilePath -> Text -> NixValue -> IO Bool
+runTestIO label baseDir source expected = do
+  result <- evalNixIO baseDir source
+  runTest label $ assertRight label result $ \actual ->
+    assertEqual label expected actual
+
+-- | Run a named IO eval test that should fail.
+runTestIOFail :: Text -> FilePath -> Text -> IO Bool
+runTestIOFail label baseDir source = do
+  result <- evalNixIO baseDir source
+  runTest label $ assertLeft label result
+
+-- | Quoted path literal for embedding absolute paths in Nix source.
+nixQuotedPath :: FilePath -> Text
+nixQuotedPath p = T.pack (show p)
+
+testImportIO :: IO [Bool]
+testImportIO = do
+  putStrLn "eval/import-io"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-import"
+      subDir = testDir </> "sub"
+      setup = do
+        createDirectoryIfMissing True subDir
+        TIO.writeFile (testDir </> "literal.nix") "42"
+        TIO.writeFile (testDir </> "expr.nix") "1 + 2"
+        TIO.writeFile (testDir </> "nested-inner.nix") "99"
+        TIO.writeFile (testDir </> "nested-outer.nix") "import ./nested-inner.nix"
+        TIO.writeFile (testDir </> "attrset.nix") "{ x = 1; y = 2; }"
+        TIO.writeFile (testDir </> "uses-arg.nix") "let f = x: x + 10; in f 5"
+        TIO.writeFile (subDir </> "from-sub.nix") "7"
+      cleanup = do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+  -- bracket_: cleanup runs even if tests throw
+  bracket_ setup cleanup $
+    sequence
+      [ -- import
+        runTestIO "import literal" testDir "import ./literal.nix" (VInt 42),
+        runTestIO "import expression" testDir "import ./expr.nix" (VInt 3),
+        runTestIO "import nested (A imports B)" testDir "import ./nested-outer.nix" (VInt 99),
+        runTestIO
+          "import cache (same file twice)"
+          testDir
+          "(import ./literal.nix) + (import ./literal.nix)"
+          (VInt 84),
+        runTestIOFail "import nonexistent → error" testDir "import ./nonexistent.nix",
+        runTestIO "import attrset + select" testDir "(import ./attrset.nix).x" (VInt 1),
+        runTestIO "import let/lambda" testDir "import ./uses-arg.nix" (VInt 15),
+        -- import rejects strings (real Nix semantics)
+        runTestIOFail "import rejects string" testDir "import \"./literal.nix\"",
+        -- pathExists
+        runTestIO
+          "pathExists true"
+          testDir
+          ("builtins.pathExists " <> nixQuotedPath (testDir </> "literal.nix"))
+          (VBool True),
+        runTestIO
+          "pathExists false"
+          testDir
+          ("builtins.pathExists " <> nixQuotedPath (testDir </> "nope.nix"))
+          (VBool False),
+        -- readFile
+        runTestIO
+          "readFile contents"
+          testDir
+          ("builtins.readFile " <> nixQuotedPath (testDir </> "literal.nix"))
+          (VStr "42"),
+        runTestIOFail
+          "readFile missing → error"
+          testDir
+          ("builtins.readFile " <> nixQuotedPath (testDir </> "ghost.nix")),
+        -- readDir: entries have correct file types
+        runTestIO
+          "readDir classifies directory"
+          testDir
+          ("(builtins.readDir " <> nixQuotedPath testDir <> ").sub")
+          (VStr "directory"),
+        runTestIO
+          "readDir classifies regular file"
+          testDir
+          ("builtins.getAttr \"literal.nix\" (builtins.readDir " <> nixQuotedPath testDir <> ")")
+          (VStr "regular")
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch A — getEnv, currentTime, toPath
+-- ---------------------------------------------------------------------------
+
+testBatchA :: IO [Bool]
+testBatchA = do
+  putStrLn "eval/builtins-batchA"
+  sequence
+    [ -- getEnv
+      runTest "getEnv pure returns empty" $
+        assertEval "getEnv-pure" "builtins.getEnv \"HOME\"" (VStr ""),
+      runTest "getEnv type error" $
+        assertEvalFail "getEnv-err" "builtins.getEnv 42",
+      -- toPath
+      runTest "toPath absolute" $
+        assertEval "toPath-abs" "builtins.toPath \"/foo/bar\"" (VPath "/foo/bar"),
+      runTest "toPath rejects relative" $
+        assertEvalFail "toPath-rel" "builtins.toPath \"foo/bar\"",
+      runTest "toPath passthrough VPath" $
+        assertEval "toPath-vpath" "builtins.toPath (builtins.toPath \"/foo/bar\")" (VPath "/foo/bar"),
+      runTest "toPath type error" $
+        assertEvalFail "toPath-err" "builtins.toPath 42",
+      runTest "toPath rejects empty" $
+        assertEvalFail "toPath-empty" "builtins.toPath \"\"",
+      -- currentTime
+      runTest "currentTime is int" $
+        assertEval "currentTime" "builtins.typeOf builtins.currentTime" (VStr "int"),
+      runTest "currentTime is 0 in pure" $
+        assertEval "currentTime-pure" "builtins.currentTime" (VInt 0),
+      runTest "currentTime >= 0" $
+        assertEval "currentTime-pos" "builtins.currentTime >= 0" (VBool True)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch A — IO tests (getEnv)
+-- ---------------------------------------------------------------------------
+
+testBatchAIO :: IO [Bool]
+testBatchAIO = do
+  putStrLn "eval/builtins-batchA-io"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-batchA"
+  bracket_
+    (createDirectoryIfMissing True testDir)
+    ( do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+    )
+    $ sequence
+      [ -- getEnv HOME should be non-empty in IO mode
+        do
+          result <- evalNixIO testDir "builtins.getEnv \"PATH\""
+          runTest "getEnv PATH non-empty (IO)" $ assertRight "getEnv-io" result $ \val ->
+            case val of
+              VStr s -> if T.null s then Fail "PATH was empty" else Pass
+              _ -> Fail ("expected VStr, got " <> T.pack (show val)),
+        -- currentTime in IO should be > 0
+        do
+          result <- evalNixIO testDir "builtins.currentTime"
+          runTest "currentTime > 0 (IO)" $ assertRight "currentTime-io" result $ \val ->
+            case val of
+              VInt n -> if n > 0 then Pass else Fail ("expected > 0, got " <> T.pack (show n))
+              _ -> Fail ("expected VInt, got " <> T.pack (show val))
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch B — placeholder, storePath
+-- ---------------------------------------------------------------------------
+
+testBatchB :: IO [Bool]
+testBatchB = do
+  putStrLn "eval/builtins-batchB"
+  sequence
+    [ -- placeholder
+      runTest "placeholder out starts with /nix/store/" $
+        assertRight "placeholder-prefix" (evalNix "builtins.placeholder \"out\"") $ \val ->
+          case val of
+            VPath p -> if "/nix/store/" `T.isPrefixOf` p then Pass else Fail ("bad prefix: " <> p)
+            _ -> Fail ("expected VPath, got " <> T.pack (show val)),
+      runTest "placeholder deterministic" $
+        assertRight "placeholder-det" (evalNix "builtins.placeholder \"out\" == builtins.placeholder \"out\"") $ \val ->
+          assertEqual "deterministic" (VBool True) val,
+      runTest "placeholder out /= placeholder dev" $
+        assertRight "placeholder-diff" (evalNix "builtins.placeholder \"out\" == builtins.placeholder \"dev\"") $ \val ->
+          assertEqual "different" (VBool False) val,
+      runTest "placeholder type error" $
+        assertEvalFail "placeholder-err" "builtins.placeholder 42",
+      -- storePath
+      runTest "storePath valid" $
+        assertEval
+          "storePath-valid"
+          "builtins.storePath \"/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1\""
+          (VPath "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1"),
+      runTest "storePath invalid" $
+        assertEvalFail "storePath-bad" "builtins.storePath \"/tmp/not-a-store-path\"",
+      runTest "storePath type error" $
+        assertEvalFail "storePath-err" "builtins.storePath 42"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch C — findFile
+-- ---------------------------------------------------------------------------
+
+testBatchC :: IO [Bool]
+testBatchC = do
+  putStrLn "eval/builtins-batchC"
+  sequence
+    [ runTest "findFile empty list errors" $
+        assertEvalFail "findFile-empty" "builtins.findFile [ ] \"foo\"",
+      runTest "findFile type error arg1" $
+        assertEvalFail "findFile-err1" "builtins.findFile 42 \"foo\"",
+      runTest "findFile type error arg2" $
+        assertEvalFail "findFile-err2" "builtins.findFile [ ] 42"
+    ]
+
+testBatchCIO :: IO [Bool]
+testBatchCIO = do
+  putStrLn "eval/builtins-batchC-io"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-batchC"
+      nixpkgsDir = testDir </> "nixpkgs"
+  bracket_
+    ( do
+        createDirectoryIfMissing True nixpkgsDir
+        TIO.writeFile (nixpkgsDir </> "default.nix") "42"
+    )
+    ( do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+    )
+    $ sequence
+      [ runTestIO
+          "findFile with matching entry"
+          testDir
+          ( "builtins.findFile [ { prefix = \"nixpkgs\"; path = "
+              <> nixQuotedPath nixpkgsDir
+              <> "; } ] \"nixpkgs\""
+          )
+          (VPath (T.pack nixpkgsDir)),
+        runTestIOFail
+          "findFile no match"
+          testDir
+          "builtins.findFile [ { prefix = \"other\"; path = \"/nope\"; } ] \"nixpkgs\""
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch D — toFile
+-- ---------------------------------------------------------------------------
+
+testBatchD :: IO [Bool]
+testBatchD = do
+  putStrLn "eval/builtins-batchD"
+  sequence
+    [ runTest "toFile pure mode error" $
+        assertEvalFail "toFile-pure" "builtins.toFile \"hello\" \"world\"",
+      runTest "toFile type error arg1" $
+        assertEvalFail "toFile-err1" "builtins.toFile 42 \"world\"",
+      runTest "toFile type error arg2" $
+        assertEvalFail "toFile-err2" "builtins.toFile \"hello\" 42"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch E — scopedImport
+-- ---------------------------------------------------------------------------
+
+testBatchE :: IO [Bool]
+testBatchE = do
+  putStrLn "eval/builtins-batchE"
+  sequence
+    [ runTest "scopedImport pure error" $
+        assertEvalFail "scopedImport-pure" "builtins.scopedImport { } ./foo.nix",
+      runTest "scopedImport type error arg1" $
+        assertEvalFail "scopedImport-err1" "builtins.scopedImport 42 ./foo.nix",
+      runTest "scopedImport type error arg2" $
+        assertEvalFail "scopedImport-err2" "builtins.scopedImport { } 42"
+    ]
+
+testBatchEIO :: IO [Bool]
+testBatchEIO = do
+  putStrLn "eval/builtins-batchE-io"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-batchE"
+  bracket_
+    ( do
+        createDirectoryIfMissing True testDir
+        TIO.writeFile (testDir </> "scoped.nix") "x"
+    )
+    ( do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+    )
+    $ sequence
+      [ runTestIO
+          "scopedImport injects scope"
+          testDir
+          ("builtins.scopedImport { x = 42; } " <> nixQuotedPath (testDir </> "scoped.nix"))
+          (VInt 42)
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch F — fetchurl, fetchTarball, fetchGit
+-- ---------------------------------------------------------------------------
+
+testBatchF :: IO [Bool]
+testBatchF = do
+  putStrLn "eval/builtins-batchF"
+  sequence
+    [ runTest "fetchurl pure error" $
+        assertEvalFail "fetchurl-pure" "builtins.fetchurl \"http://example.com\"",
+      runTest "fetchurl type error" $
+        assertEvalFail "fetchurl-err" "builtins.fetchurl 42",
+      runTest "fetchTarball pure error" $
+        assertEvalFail "fetchTarball-pure" "builtins.fetchTarball \"http://example.com\"",
+      runTest "fetchTarball type error" $
+        assertEvalFail "fetchTarball-err" "builtins.fetchTarball 42",
+      runTest "fetchGit pure error" $
+        assertEvalFail "fetchGit-pure" "builtins.fetchGit \"http://example.com\"",
+      runTest "fetchGit type error" $
+        assertEvalFail "fetchGit-err" "builtins.fetchGit 42"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch G — ATerm serialization
+-- ---------------------------------------------------------------------------
+
+testBatchG :: IO [Bool]
+testBatchG = do
+  putStrLn "derivation/aterm"
+  let minimalDrv =
+        Derivation
+          { drvOutputs = [],
+            drvInputDrvs = Map.empty,
+            drvInputSrcs = [],
+            drvPlatform = X86_64_Linux,
+            drvBuilder = "/bin/sh",
+            drvArgs = [],
+            drvEnv = Map.empty
+          }
+  let drvWithOutput =
+        minimalDrv
+          { drvOutputs =
+              [ DerivationOutput
+                  { doName = "out",
+                    doPath = StorePath "abc" "hello",
+                    doHashAlgo = "",
+                    doHash = ""
+                  }
+              ]
+          }
+  let drvWithEnv =
+        minimalDrv
+          { drvEnv = Map.fromList [("name", "hello"), ("system", "x86_64-linux")]
+          }
+  sequence
+    [ runTest "ATerm minimal" $
+        let aterm = toATerm minimalDrv
+         in if T.isPrefixOf "Derive(" aterm && T.isSuffixOf ")" aterm
+              then Pass
+              else Fail ("bad ATerm: " <> aterm),
+      runTest "ATerm has output" $
+        let aterm = toATerm drvWithOutput
+         in if "\"out\"" `T.isInfixOf` aterm
+              then Pass
+              else Fail ("missing output in ATerm: " <> aterm),
+      runTest "ATerm env sorted" $
+        let aterm = toATerm drvWithEnv
+         in -- "name" should come before "system" in sorted order
+            case (T.breakOn "\"name\"" aterm, T.breakOn "\"system\"" aterm) of
+              ((before1, _), (before2, _)) ->
+                if T.length before1 < T.length before2
+                  then Pass
+                  else Fail ("env not sorted in ATerm: " <> aterm),
+      runTest "ATerm string escaping" $
+        let drv = minimalDrv {drvEnv = Map.fromList [("msg", "hello\nworld")]}
+            aterm = toATerm drv
+         in if "\\n" `T.isInfixOf` aterm
+              then Pass
+              else Fail ("missing escaped newline: " <> aterm),
+      runTest "ATerm deterministic" $
+        assertEqual "deterministic" (toATerm minimalDrv) (toATerm minimalDrv),
+      -- platformToText
+      runTest "platformToText linux" $
+        assertEqual "linux" "x86_64-linux" (platformToText X86_64_Linux),
+      runTest "platformToText darwin" $
+        assertEqual "darwin" "x86_64-darwin" (platformToText X86_64_Darwin),
+      runTest "platformToText aarch64-darwin" $
+        assertEqual "aarch64" "aarch64-darwin" (platformToText Aarch64_Darwin),
+      runTest "platformToText windows" $
+        assertEqual "windows" "x86_64-windows" (platformToText X86_64_Windows),
+      runTest "platformToText aarch64-linux" $
+        assertEqual "aarch64-linux" "aarch64-linux" (platformToText Aarch64_Linux),
+      runTest "platformToText other" $
+        assertEqual "other" "riscv64-freebsd" (platformToText (OtherPlatform "riscv64-freebsd"))
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch H — derivation
+-- ---------------------------------------------------------------------------
+
+testBatchH :: IO [Bool]
+testBatchH = do
+  putStrLn "eval/builtins-batchH"
+  sequence
+    [ runTest "derivation has type" $
+        assertEval
+          "drv-type"
+          "let d = derivation { name = \"hello\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d.type"
+          (VStr "derivation"),
+      runTest "derivation has drvPath" $
+        assertRight "drv-drvPath" (evalNix "let d = derivation { name = \"hello\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d.drvPath") $ \val ->
+          case val of
+            VPath p -> if "/nix/store/" `T.isPrefixOf` p && ".drv" `T.isSuffixOf` p then Pass else Fail ("bad drvPath: " <> p)
+            _ -> Fail ("expected VPath, got " <> T.pack (show val)),
+      runTest "derivation has outPath" $
+        assertRight "drv-outPath" (evalNix "let d = derivation { name = \"hello\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d.outPath") $ \val ->
+          case val of
+            VPath p -> if "/nix/store/" `T.isPrefixOf` p then Pass else Fail ("bad outPath: " <> p)
+            _ -> Fail ("expected VPath, got " <> T.pack (show val)),
+      runTest "derivation missing name" $
+        assertEvalFail "drv-noname" "derivation { system = \"x86_64-linux\"; builder = \"/bin/sh\"; }",
+      runTest "derivation missing system" $
+        assertEvalFail "drv-nosys" "derivation { name = \"hello\"; builder = \"/bin/sh\"; }",
+      runTest "derivation missing builder" $
+        assertEvalFail "drv-nobuilder" "derivation { name = \"hello\"; system = \"x86_64-linux\"; }",
+      runTest "derivation type error" $
+        assertEvalFail "drv-tyerr" "derivation 42",
+      runTest "derivation deterministic" $
+        assertRight "drv-det" (evalNix "let d1 = derivation { name = \"a\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; d2 = derivation { name = \"a\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d1.drvPath == d2.drvPath") $ \val ->
+          assertEqual "deterministic" (VBool True) val
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
 
@@ -1297,7 +1752,20 @@ main = do
           testBatch4,
           testBatch5,
           testBatch6,
-          testBatch7
+          testBatch7,
+          testImportPure,
+          testImportIO,
+          testBatchA,
+          testBatchAIO,
+          testBatchB,
+          testBatchC,
+          testBatchCIO,
+          testBatchD,
+          testBatchE,
+          testBatchEIO,
+          testBatchF,
+          testBatchG,
+          testBatchH
         ]
   let total = length results
       passed = length (filter id results)
