@@ -21,7 +21,7 @@ A pure Haskell implementation of Nix that treats Windows as a first-class target
 
 - **Parser** — Hand-rolled recursive descent parser for the full Nix expression language. 13 precedence levels, all syntax forms. No Megaparsec (hnix proved that was a 10x performance bottleneck).
 - **Lazy Evaluator** — Thunk-based evaluation with environment closures, knot-tying for recursive bindings via Haskell laziness. All 16 AST constructors handled: literals, strings with interpolation, attribute sets (recursive and non-recursive), let bindings, lambdas with formal parameters, if/then/else, with, assert, unary/binary operators, function application, list construction, attribute selection, and has-attribute checks.
-- **17 Built-in Functions** — Type checking (`typeOf`, `isNull`, `isInt`, `isFloat`, `isBool`, `isString`, `isList`, `isAttrs`, `isFunction`), list operations (`length`, `head`, `tail`), string operations (`toString`, `stringLength`), control flow (`throw`, `abort`), and `currentSystem`.
+- **73 Built-in Functions** — Type checks, arithmetic, bitwise, strings, lists, attribute sets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`), JSON (`toJSON`/`fromJSON`), hashing (SHA-256/SHA-512/SHA-1/MD5), version parsing (`compareVersions`, `splitVersion`, `parseDrvName`), `replaceStrings`, `tryEval`, `deepSeq`, `genericClosure`, and more.
 - **Content-Addressed Store** — `/nix/store` on Unix, `C:\nix\store` on Windows, with SQLite metadata tracking (scaffold)
 - **Derivation Types** — ATerm serialization, platform detection via `System.Info` (scaffold)
 - **Hash Integration** — Built on [nova-cache](https://github.com/Novavero-AI/nova-cache) for SHA-256, Nix base32, NAR, narinfo, and Ed25519 signing
@@ -58,34 +58,34 @@ main = do
 
 ```haskell
 import Nix.Parser (parseNix)
-import Nix.Eval (eval, NixValue(..))
+import Nix.Eval (eval, PureEval(..), NixValue(..))
 import Nix.Builtins (builtinEnv)
 
 main :: IO ()
 main = do
   case parseNix "<stdin>" "let x = 5; y = x * 2; in y + 1" of
     Left err -> print err
-    Right expr -> case eval builtinEnv expr of
+    Right expr -> case runPureEval (eval builtinEnv expr) of
       Left err  -> putStrLn ("Error: " ++ show err)
       Right val -> print val  -- VInt 11
 ```
+
+The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, while an IO instance can access the filesystem for `import`, `readFile`, etc.
 
 ### Lazy Evaluation in Action
 
 ```haskell
 -- Nix is lazy: unused bindings are never evaluated
-eval builtinEnv =<< parseNix "<stdin>"
-  "let unused = builtins.throw \"boom\"; x = 42; in x"
+-- runPureEval (eval builtinEnv expr) where expr parses:
+--   "let unused = builtins.throw \"boom\"; x = 42; in x"
 -- Right (VInt 42)  —  "boom" is never triggered
 
 -- Recursive attribute sets with self-reference
-eval builtinEnv =<< parseNix "<stdin>"
-  "rec { a = 1; b = a + 1; c = b * 2; }.c"
+--   "rec { a = 1; b = a + 1; c = b * 2; }.c"
 -- Right (VInt 4)
 
 -- Lambda closures, set patterns with defaults
-eval builtinEnv =<< parseNix "<stdin>"
-  "({ name, greeting ? \"Hello\" }: \"${greeting}, ${name}!\") { name = \"Nix\"; }"
+--   "({ name, greeting ? \"Hello\" }: \"${greeting}, ${name}!\") { name = \"Nix\"; }"
 -- Right (VStr "Hello, Nix!")
 ```
 
@@ -103,11 +103,11 @@ eval builtinEnv =<< parseNix "<stdin>"
 | `Nix.Parser.Expr` | Expression parser — 13 precedence levels, left/right/non-associative operators, application, selection | Done |
 | `Nix.Parser.Internal` | Parser state and combinator internals | Done |
 | `Nix.Parser.ParseError` | Structured parse errors with source positions | Done |
-| `Nix.Eval` | Lazy evaluator — all 16 AST constructors, thunk forcing, env operations, builtin dispatch | Done |
-| `Nix.Eval.Types` | Shared types — `NixValue` (11 constructors), `Thunk` (lazy env for knot-tying), `Env` (lexical + with-scope chain) | Done |
+| `Nix.Eval` | Lazy evaluator — all 16 AST constructors, thunk forcing, env operations, builtin dispatch. Polymorphic via `MonadEval` | Done |
+| `Nix.Eval.Types` | Shared types — `NixValue` (11 constructors), `Thunk` (lazy env for knot-tying), `Env` (lexical + with-scope chain), `MonadEval` typeclass, `PureEval` runner | Done |
 | `Nix.Eval.Operator` | Binary/unary operators — arithmetic with float promotion, deep structural equality, division-by-zero checks | Done |
 | `Nix.Eval.StringInterp` | String interpolation — value coercion, indented string whitespace stripping | Done |
-| `Nix.Builtins` | Built-in function environment — 17 builtins registered as `VBuiltin` values, dispatched in eval | Done |
+| `Nix.Builtins` | Built-in function environment — 73 builtins registered as `VBuiltin` values, dispatched in eval | Done |
 
 ### Infrastructure (Scaffold)
 
@@ -150,6 +150,7 @@ eval builtinEnv =<< parseNix "<stdin>"
 
 **Evaluator design:**
 
+- **MonadEval typeclass** — The evaluator is `eval :: (MonadEval m) => Env -> Expr -> m NixValue`, polymorphic in its effect monad. `PureEval` (newtype over `Either Text`) runs all 306 tests with no IO. An IO instance provides `readFileText`, `doesPathExist`, `listDirectory` for `import` and file builtins.
 - **Thunk-based lazy evaluation** — List elements and attribute set values are stored as unevaluated thunks (`Thunk Expr Env`). Only forced when a value is demanded. `(x: 1) (throw "boom")` returns `1` because `x` is never referenced.
 - **Knot-tying via Haskell laziness** — Recursive `let` and `rec { }` create self-referential environments. The `Thunk` type has a lazy `Env` field so thunks can capture environments that include themselves. Haskell's own laziness resolves the recursion.
 - **With-scope chain** — `Env` has lexical bindings (always win) plus a stack of with-scopes walked innermost-first. `let a = 1; in with { a = 2; }; a` correctly returns `1` because lexical scope takes priority.
@@ -157,8 +158,8 @@ eval builtinEnv =<< parseNix "<stdin>"
 
 **Key numbers:**
 
-- **18 modules** — 11 implemented, 7 scaffold
-- **166 tests** — hand-rolled harness, no framework dependencies
+- **19 modules** — 12 implemented, 7 scaffold
+- **306 tests** — hand-rolled harness, no framework dependencies
 - **Zero partial functions** — total by construction
 - **Strict by default** — bang patterns on all data fields (except Thunk's Env, which is lazy for knot-tying)
 
@@ -190,14 +191,15 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 - [x] **Lexer** — Full Nix tokenization (integers, floats, strings with interpolation, paths, URIs, search paths, operators, keywords)
 - [x] **Parser** — 13 precedence levels, all Nix syntax, structured error reporting (101 tests)
 - [x] **Evaluator** — All 16 AST constructors, lazy thunks, recursive let/rec via knot-tying, with-scope chain (65 tests)
-- [x] **17 builtins** — Type checks, list ops, string ops, control flow, currentSystem
+- [x] **73 builtins** — Type checks, arithmetic, bitwise, strings, lists, attrsets, higher-order, JSON, hashing, version parsing, tryEval, deepSeq, genericClosure (140 tests)
+- [x] **MonadEval refactor** — Evaluator polymorphic in effect monad (`PureEval` for tests, IO for real evaluation)
 
 ### Next
 
-- [ ] **`import`** — Load and evaluate other `.nix` files from disk
+- [ ] **`import`** — Load and evaluate other `.nix` files from disk (IO builtin via MonadEval)
 - [ ] **`derivation`** — The fundamental builtin: attrset → `.drv` build recipe
 - [ ] **String contexts** — Track store path references through string operations
-- [ ] **Full builtins** (~100 total) — `map`, `filter`, `foldl'`, `fetchurl`, `hashString`, `toJSON`, `replaceStrings`, etc.
+- [ ] **Remaining IO builtins** (~27) — `readFile`, `pathExists`, `fetchurl`, `fetchTarball`, `getEnv`, etc.
 - [ ] **ATerm serialization** — Read/write `.drv` files
 - [ ] **Store operations** — Content-addressed store with SQLite metadata
 - [ ] **Substituter** — Download pre-built binaries from binary caches
@@ -210,7 +212,7 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 
 ```bash
 cabal build                              # Build library + CLI
-cabal test                               # Run all 166 tests
+cabal test                               # Run all 306 tests
 cabal build --ghc-options="-Werror"      # Warnings as errors (CI default)
 cabal haddock                            # Generate docs
 ```

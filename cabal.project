@@ -1,1 +1,2 @@
 packages: .
+constraints: nova-cache -compression
