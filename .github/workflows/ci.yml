@@ -10,24 +10,30 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# ---------------------------------------------------------------------------
+# Lint jobs (fast, Linux-only)
+# ---------------------------------------------------------------------------
+
 jobs:
   hlint:
+    name: HLint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: haskell-actions/hlint-setup@v2
         with:
-          version: '3.8'
+          version: "3.8"
       - uses: haskell-actions/hlint-run@v2
         with:
           path: '["src/", "app/", "test/"]'
           fail-on: warning
 
   ormolu:
+    name: Ormolu
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install ormolu
+      - name: Install Ormolu
         run: |
           curl -sL https://github.com/tweag/ormolu/releases/download/0.7.7.0/ormolu-x86_64-linux.zip -o ormolu.zip
           unzip ormolu.zip -d /usr/local/bin
@@ -35,45 +41,73 @@ jobs:
       - name: Check formatting
         run: ormolu -m check $(find src app test -name '*.hs')
 
+  # ---------------------------------------------------------------------------
+  # Build + Test (cross-platform matrix)
+  # ---------------------------------------------------------------------------
+
   build:
+    name: Build (${{ matrix.os }})
     needs: [hlint, ormolu]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: macos-latest
+            name: macOS
+          - os: windows-latest
+            name: Windows
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.6'
-          cabal-version: 'latest'
-      - name: Cache cabal store
+          ghc-version: "9.6"
+          cabal-version: "latest"
+
+      - name: Cache Cabal store
         uses: actions/cache@v4
         with:
           path: ~/.cabal/store
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
           restore-keys: cabal-${{ runner.os }}-
+
       - name: Build
         run: cabal build --ghc-options="-Werror"
+
       - name: Test
         run: cabal test
 
+  # ---------------------------------------------------------------------------
+  # Publish to Hackage (tag-triggered, after all builds pass)
+  # ---------------------------------------------------------------------------
+
   publish:
+    name: Publish to Hackage
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.6'
-          cabal-version: 'latest'
-      - name: Cache cabal store
+          ghc-version: "9.6"
+          cabal-version: "latest"
+
+      - name: Cache Cabal store
         uses: actions/cache@v4
         with:
           path: ~/.cabal/store
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
           restore-keys: cabal-${{ runner.os }}-
+
       - name: Build sdist
         run: cabal sdist
-      - name: Publish to Hackage
+
+      - name: Publish
         env:
           HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
         run: |
