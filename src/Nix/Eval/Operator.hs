@@ -6,6 +6,7 @@
 module Nix.Eval.Operator
   ( evalBinary,
     evalUnary,
+    nixCompare,
     nixEqual,
   )
 where
@@ -13,7 +14,8 @@ where
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Nix.Eval.Types
-  ( NixValue (..),
+  ( MonadEval (..),
+    NixValue (..),
     Thunk,
     typeName,
   )
@@ -21,14 +23,14 @@ import Nix.Expr.Types (BinaryOp (..), UnaryOp (..))
 
 -- | Force function passed by the caller to break the import cycle.
 -- Needed for deep equality on lists and attribute sets.
-type Force = Thunk -> Either Text NixValue
+type Force m = Thunk -> m NixValue
 
 -- | Evaluate a binary operator on two forced values.
 --
 -- The caller must handle short-circuit operators ('OpAnd', 'OpOr',
 -- 'OpImpl') before calling this.  The 'Force' function is used only
 -- for deep structural equality on compound values.
-evalBinary :: Force -> BinaryOp -> NixValue -> NixValue -> Either Text NixValue
+evalBinary :: (MonadEval m) => Force m -> BinaryOp -> NixValue -> NixValue -> m NixValue
 evalBinary forceThunk op left right = case op of
   OpAdd -> evalAdd left right
   OpSub -> evalArith "subtraction" (-) (-) left right
@@ -49,46 +51,47 @@ evalBinary forceThunk op left right = case op of
   OpConcat -> evalConcat left right
   OpUpdate -> evalUpdate left right
   -- Short-circuit ops must be handled by the caller
-  OpAnd -> Left "internal error: OpAnd should be handled by eval"
-  OpOr -> Left "internal error: OpOr should be handled by eval"
-  OpImpl -> Left "internal error: OpImpl should be handled by eval"
+  OpAnd -> throwEvalError "internal error: OpAnd should be handled by eval"
+  OpOr -> throwEvalError "internal error: OpOr should be handled by eval"
+  OpImpl -> throwEvalError "internal error: OpImpl should be handled by eval"
 
 -- | Evaluate a unary operator on a forced value.
-evalUnary :: UnaryOp -> NixValue -> Either Text NixValue
+evalUnary :: (MonadEval m) => UnaryOp -> NixValue -> m NixValue
 evalUnary OpNot val = case val of
-  VBool b -> Right (VBool (not b))
-  other -> Left ("cannot apply ! to " <> typeName other)
+  VBool b -> pure (VBool (not b))
+  other -> throwEvalError ("cannot apply ! to " <> typeName other)
 evalUnary OpNegate val = case val of
-  VInt n -> Right (VInt (negate n))
-  VFloat n -> Right (VFloat (negate n))
-  other -> Left ("cannot negate " <> typeName other)
+  VInt n -> pure (VInt (negate n))
+  VFloat n -> pure (VFloat (negate n))
+  other -> throwEvalError ("cannot negate " <> typeName other)
 
 -- | Addition: int/float arithmetic, string concatenation, path append.
-evalAdd :: NixValue -> NixValue -> Either Text NixValue
-evalAdd (VInt a) (VInt b) = Right (VInt (a + b))
-evalAdd (VInt a) (VFloat b) = Right (VFloat (fromInteger a + b))
-evalAdd (VFloat a) (VInt b) = Right (VFloat (a + fromInteger b))
-evalAdd (VFloat a) (VFloat b) = Right (VFloat (a + b))
-evalAdd (VStr a) (VStr b) = Right (VStr (a <> b))
-evalAdd (VPath a) (VStr b) = Right (VPath (a <> b))
+evalAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+evalAdd (VInt a) (VInt b) = pure (VInt (a + b))
+evalAdd (VInt a) (VFloat b) = pure (VFloat (fromInteger a + b))
+evalAdd (VFloat a) (VInt b) = pure (VFloat (a + fromInteger b))
+evalAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
+evalAdd (VStr a) (VStr b) = pure (VStr (a <> b))
+evalAdd (VPath a) (VStr b) = pure (VPath (a <> b))
 evalAdd left right =
-  Left ("cannot add " <> typeName left <> " and " <> typeName right)
+  throwEvalError ("cannot add " <> typeName left <> " and " <> typeName right)
 
 -- | Generic arithmetic for subtraction and multiplication.
 evalArith ::
+  (MonadEval m) =>
   Text ->
   (Integer -> Integer -> Integer) ->
   (Double -> Double -> Double) ->
   NixValue ->
   NixValue ->
-  Either Text NixValue
+  m NixValue
 evalArith name intOp floatOp left right = case (left, right) of
-  (VInt a, VInt b) -> Right (VInt (intOp a b))
-  (VInt a, VFloat b) -> Right (VFloat (floatOp (fromInteger a) b))
-  (VFloat a, VInt b) -> Right (VFloat (floatOp a (fromInteger b)))
-  (VFloat a, VFloat b) -> Right (VFloat (floatOp a b))
+  (VInt a, VInt b) -> pure (VInt (intOp a b))
+  (VInt a, VFloat b) -> pure (VFloat (floatOp (fromInteger a) b))
+  (VFloat a, VInt b) -> pure (VFloat (floatOp a (fromInteger b)))
+  (VFloat a, VFloat b) -> pure (VFloat (floatOp a b))
   _ ->
-    Left
+    throwEvalError
       ( "cannot apply "
           <> name
           <> " to "
@@ -98,20 +101,20 @@ evalArith name intOp floatOp left right = case (left, right) of
       )
 
 -- | Division with zero check.  Integer division uses 'quot'.
-evalDiv :: NixValue -> NixValue -> Either Text NixValue
+evalDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 evalDiv left right = case (left, right) of
-  (VInt _, VInt 0) -> Left "division by zero"
-  (VInt a, VInt b) -> Right (VInt (quot a b))
+  (VInt _, VInt 0) -> throwEvalError "division by zero"
+  (VInt a, VInt b) -> pure (VInt (quot a b))
   (VInt a, VFloat b)
-    | b == 0 -> Left "division by zero"
-    | otherwise -> Right (VFloat (fromInteger a / b))
-  (VFloat _, VInt 0) -> Left "division by zero"
-  (VFloat a, VInt b) -> Right (VFloat (a / fromInteger b))
+    | b == 0 -> throwEvalError "division by zero"
+    | otherwise -> pure (VFloat (fromInteger a / b))
+  (VFloat _, VInt 0) -> throwEvalError "division by zero"
+  (VFloat a, VInt b) -> pure (VFloat (a / fromInteger b))
   (VFloat a, VFloat b)
-    | b == 0 -> Left "division by zero"
-    | otherwise -> Right (VFloat (a / b))
+    | b == 0 -> throwEvalError "division by zero"
+    | otherwise -> pure (VFloat (a / b))
   _ ->
-    Left
+    throwEvalError
       ( "cannot divide "
           <> typeName left
           <> " by "
@@ -123,14 +126,14 @@ evalDiv left right = case (left, right) of
 -- ---------------------------------------------------------------------------
 
 -- | Ordering comparison for < (reused for >, <=, >= via argument swap).
-nixCompare :: NixValue -> NixValue -> Either Text Bool
-nixCompare (VInt a) (VInt b) = Right (a < b)
-nixCompare (VInt a) (VFloat b) = Right (fromInteger a < b)
-nixCompare (VFloat a) (VInt b) = Right (a < fromInteger b)
-nixCompare (VFloat a) (VFloat b) = Right (a < b)
-nixCompare (VStr a) (VStr b) = Right (a < b)
+nixCompare :: (MonadEval m) => NixValue -> NixValue -> m Bool
+nixCompare (VInt a) (VInt b) = pure (a < b)
+nixCompare (VInt a) (VFloat b) = pure (fromInteger a < b)
+nixCompare (VFloat a) (VInt b) = pure (a < fromInteger b)
+nixCompare (VFloat a) (VFloat b) = pure (a < b)
+nixCompare (VStr a) (VStr b) = pure (a < b)
 nixCompare left right =
-  Left
+  throwEvalError
     ( "cannot compare "
         <> typeName left
         <> " and "
@@ -139,38 +142,38 @@ nixCompare left right =
 
 -- | Deep structural equality.  Forces thunks inside lists and
 -- attribute sets as needed.
-nixEqual :: Force -> NixValue -> NixValue -> Either Text Bool
-nixEqual _ (VInt a) (VInt b) = Right (a == b)
-nixEqual _ (VInt a) (VFloat b) = Right (fromInteger a == b)
-nixEqual _ (VFloat a) (VInt b) = Right (a == fromInteger b)
-nixEqual _ (VFloat a) (VFloat b) = Right (a == b)
-nixEqual _ (VBool a) (VBool b) = Right (a == b)
-nixEqual _ VNull VNull = Right True
-nixEqual _ (VStr a) (VStr b) = Right (a == b)
-nixEqual _ (VPath a) (VPath b) = Right (a == b)
+nixEqual :: (MonadEval m) => Force m -> NixValue -> NixValue -> m Bool
+nixEqual _ (VInt a) (VInt b) = pure (a == b)
+nixEqual _ (VInt a) (VFloat b) = pure (fromInteger a == b)
+nixEqual _ (VFloat a) (VInt b) = pure (a == fromInteger b)
+nixEqual _ (VFloat a) (VFloat b) = pure (a == b)
+nixEqual _ (VBool a) (VBool b) = pure (a == b)
+nixEqual _ VNull VNull = pure True
+nixEqual _ (VStr a) (VStr b) = pure (a == b)
+nixEqual _ (VPath a) (VPath b) = pure (a == b)
 nixEqual forceThunk (VList as) (VList bs)
-  | length as /= length bs = Right False
+  | length as /= length bs = pure False
   | otherwise = listEqual forceThunk as bs
 nixEqual forceThunk (VAttrs as) (VAttrs bs)
-  | Map.keys as /= Map.keys bs = Right False
+  | Map.keys as /= Map.keys bs = pure False
   | otherwise = do
       let pairs = zip (Map.elems as) (Map.elems bs)
       results <- mapM (thunkPairEqual forceThunk) pairs
       pure (and results)
-nixEqual _ _ _ = Right False
+nixEqual _ _ _ = pure False
 
 -- | Pairwise equality of two thunk lists (for list comparison).
-listEqual :: Force -> [Thunk] -> [Thunk] -> Either Text Bool
-listEqual _ [] [] = Right True
+listEqual :: (MonadEval m) => Force m -> [Thunk] -> [Thunk] -> m Bool
+listEqual _ [] [] = pure True
 listEqual forceThunk (a : as) (b : bs) = do
   va <- forceThunk a
   vb <- forceThunk b
   eq <- nixEqual forceThunk va vb
-  if eq then listEqual forceThunk as bs else Right False
-listEqual _ _ _ = Right False
+  if eq then listEqual forceThunk as bs else pure False
+listEqual _ _ _ = pure False
 
 -- | Compare two thunks for equality by forcing both.
-thunkPairEqual :: Force -> (Thunk, Thunk) -> Either Text Bool
+thunkPairEqual :: (MonadEval m) => Force m -> (Thunk, Thunk) -> m Bool
 thunkPairEqual forceThunk (a, b) = do
   va <- forceThunk a
   vb <- forceThunk b
@@ -181,14 +184,14 @@ thunkPairEqual forceThunk (a, b) = do
 -- ---------------------------------------------------------------------------
 
 -- | List concatenation (++).
-evalConcat :: NixValue -> NixValue -> Either Text NixValue
-evalConcat (VList as) (VList bs) = Right (VList (as ++ bs))
+evalConcat :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+evalConcat (VList as) (VList bs) = pure (VList (as ++ bs))
 evalConcat left right =
-  Left ("cannot concatenate " <> typeName left <> " and " <> typeName right)
+  throwEvalError ("cannot concatenate " <> typeName left <> " and " <> typeName right)
 
 -- | Attribute set merge (//).  Right-biased: keys in the right
 -- operand shadow keys in the left.
-evalUpdate :: NixValue -> NixValue -> Either Text NixValue
-evalUpdate (VAttrs as) (VAttrs bs) = Right (VAttrs (Map.union bs as))
+evalUpdate :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+evalUpdate (VAttrs as) (VAttrs bs) = pure (VAttrs (Map.union bs as))
 evalUpdate left right =
-  Left ("cannot merge " <> typeName left <> " and " <> typeName right)
+  throwEvalError ("cannot merge " <> typeName left <> " and " <> typeName right)

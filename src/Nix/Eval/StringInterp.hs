@@ -12,14 +12,14 @@ where
 
 import Data.Text (Text)
 import qualified Data.Text as T
-import Nix.Eval.Types (Env, NixValue (..), typeName)
+import Nix.Eval.Types (Env, MonadEval (..), NixValue (..), typeName)
 import Nix.Expr.Types (Expr, StringPart (..))
 
 -- | The evaluator function, passed as a parameter to avoid cyclic imports.
-type Eval = Env -> Expr -> Either Text NixValue
+type Eval m = Env -> Expr -> m NixValue
 
 -- | Evaluate the parts of a regular string (@"..."@).
-evalStringParts :: Eval -> Env -> [StringPart] -> Either Text Text
+evalStringParts :: (MonadEval m) => Eval m -> Env -> [StringPart] -> m Text
 evalStringParts evalFn env parts = do
   chunks <- mapM (evalOnePart evalFn env) parts
   pure (T.concat chunks)
@@ -28,14 +28,14 @@ evalStringParts evalFn env parts = do
 --
 -- After interpolation, strips the common leading whitespace from all
 -- non-empty lines (the standard Nix indented-string semantics).
-evalIndStringParts :: Eval -> Env -> [StringPart] -> Either Text Text
+evalIndStringParts :: (MonadEval m) => Eval m -> Env -> [StringPart] -> m Text
 evalIndStringParts evalFn env parts = do
   raw <- evalStringParts evalFn env parts
   pure (stripIndentation raw)
 
 -- | Evaluate a single string part.
-evalOnePart :: Eval -> Env -> StringPart -> Either Text Text
-evalOnePart _ _ (StrLit txt) = Right txt
+evalOnePart :: (MonadEval m) => Eval m -> Env -> StringPart -> m Text
+evalOnePart _ _ (StrLit txt) = pure txt
 evalOnePart evalFn env (StrInterp expr) = do
   val <- evalFn env expr
   coerceToString val
@@ -45,17 +45,17 @@ evalOnePart evalFn env (StrInterp expr) = do
 -- Nix coercion rules: strings pass through, integers and floats are
 -- shown, paths pass through, null becomes the empty string.  Other
 -- types (lists, sets, functions) cannot be coerced.
-coerceToString :: NixValue -> Either Text Text
+coerceToString :: (MonadEval m) => NixValue -> m Text
 coerceToString val = case val of
-  VStr s -> Right s
-  VInt n -> Right (T.pack (show n))
-  VFloat n -> Right (T.pack (show n))
-  VPath p -> Right p
-  VNull -> Right ""
-  VBool True -> Right "1"
-  VBool False -> Right ""
+  VStr s -> pure s
+  VInt n -> pure (T.pack (show n))
+  VFloat n -> pure (T.pack (show n))
+  VPath p -> pure p
+  VNull -> pure ""
+  VBool True -> pure "1"
+  VBool False -> pure ""
   other ->
-    Left ("cannot coerce " <> typeName other <> " to a string")
+    throwEvalError ("cannot coerce " <> typeName other <> " to a string")
 
 -- ---------------------------------------------------------------------------
 -- Indented string whitespace stripping

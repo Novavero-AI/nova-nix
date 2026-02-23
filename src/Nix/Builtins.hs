@@ -11,8 +11,7 @@ module Nix.Builtins
 where
 
 import qualified Data.Map.Strict as Map
-import Data.Text (Text)
-import Nix.Eval (Env (..), NixValue (..), Thunk (..), evaluated)
+import Nix.Eval (Env (..), NixValue (..), Thunk (..), builtinNames, evaluated)
 
 -- | The initial environment containing all builtins.
 --
@@ -32,42 +31,23 @@ builtinEnv =
       envWithScopes = []
     }
 
--- | The @builtins@ attribute set.
+-- | The @builtins@ attribute set, derived from the central registry.
 builtinsAttrSet :: NixValue
 builtinsAttrSet =
-  VAttrs $
-    Map.fromList
-      -- Type checking builtins
-      [ builtin "typeOf",
-        builtin "isNull",
-        builtin "isInt",
-        builtin "isFloat",
-        builtin "isBool",
-        builtin "isString",
-        builtin "isList",
-        builtin "isAttrs",
-        builtin "isFunction",
-        -- List operations
-        builtin "length",
-        builtin "head",
-        builtin "tail",
-        -- String operations
-        builtin "toString",
-        builtin "stringLength",
-        -- Control
-        builtin "throw",
-        builtin "abort",
-        -- System
-        builtin "currentSystem",
-        -- Standard values
-        ("true", val (VBool True)),
-        ("false", val (VBool False)),
-        ("null", val VNull)
-      ]
-
--- | Create a builtin function entry (name -> VBuiltin thunk).
-builtin :: Text -> (Text, Thunk)
-builtin name = (name, val (VBuiltin name))
+  VAttrs $ Map.union builtinEntries standardEntries
+  where
+    builtinEntries =
+      Map.fromList [(name, val (VBuiltin name [])) | name <- builtinNames]
+    standardEntries =
+      Map.fromList
+        [ ("true", val (VBool True)),
+          ("false", val (VBool False)),
+          ("null", val VNull),
+          ("storeDir", val (VStr "/nix/store")),
+          ("nixVersion", val (VStr "2.24.0")),
+          ("langVersion", val (VInt 6)),
+          ("nixPath", val (VList []))
+        ]
 
 -- | Wrap a value as an already-evaluated thunk.
 val :: NixValue -> Thunk

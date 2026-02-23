@@ -2,11 +2,12 @@
 
 module Main (main) where
 
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Builtins (builtinEnv)
 import Nix.Derivation (Platform (..), currentPlatform)
-import Nix.Eval (Env (..), NixValue (..), emptyEnv, eval)
+import Nix.Eval (Env (..), NixValue (..), Thunk (..), emptyEnv, eval, runPureEval)
 import Nix.Expr.Types
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
@@ -63,7 +64,7 @@ tokenTypes = filter (/= TokEOF) . map locToken
 evalNix :: Text -> Either Text NixValue
 evalNix source = case parseNix "<test>" source of
   Left err -> Left (T.pack (show err))
-  Right expr -> eval builtinEnv expr
+  Right expr -> runPureEval (eval builtinEnv expr)
 
 -- | Assert that a Nix expression evaluates to the expected value.
 assertEval :: Text -> Text -> NixValue -> TestResult
@@ -429,6 +430,119 @@ testEvalErrors = do
         assertEvalFail "call-non" "42 1",
       runTest "builtins.throw" $
         assertEvalFail "throw" "builtins.throw \"boom\""
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Higher-order builtins
+-- ---------------------------------------------------------------------------
+
+testEvalHigherOrder :: IO [Bool]
+testEvalHigherOrder = do
+  putStrLn "eval/higher-order"
+  sequence
+    [ -- map
+      runTest "map basic" $
+        assertEval "map" "builtins.map (x: x + 1) [ 1 2 3 ] == [ 2 3 4 ]" (VBool True),
+      runTest "map identity" $
+        assertEval "map-id" "builtins.map (x: x) [ 1 2 ] == [ 1 2 ]" (VBool True),
+      runTest "map empty" $
+        assertEval "map-empty" "builtins.map (x: x) [ ]" (VList []),
+      -- filter
+      runTest "filter match" $
+        assertEval "filter" "builtins.filter (x: x == 2) [ 1 2 3 ] == [ 2 ]" (VBool True),
+      runTest "filter none" $
+        assertEval "filter-none" "builtins.filter (x: false) [ 1 2 ] == [ ]" (VBool True),
+      -- foldl'
+      runTest "foldl' sum" $
+        assertEval "foldl-sum" "builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]" (VInt 6),
+      runTest "foldl' string concat" $
+        assertEval "foldl-str" "builtins.foldl' (a: b: a + b) \"\" [ \"x\" \"y\" \"z\" ]" (VStr "xyz"),
+      runTest "foldl' empty" $
+        assertEval "foldl-empty" "builtins.foldl' (a: b: a + b) 0 [ ]" (VInt 0),
+      -- genList
+      runTest "genList basic" $
+        assertEval "genList" "builtins.genList (i: i * 2) 4 == [ 0 2 4 6 ]" (VBool True),
+      runTest "genList zero" $
+        assertEval "genList-0" "builtins.genList (i: i) 0" (VList []),
+      -- sort
+      runTest "sort ints" $
+        assertEval "sort" "builtins.sort (a: b: a < b) [ 3 1 2 ] == [ 1 2 3 ]" (VBool True),
+      runTest "sort already sorted" $
+        assertEval "sort-sorted" "builtins.sort (a: b: a < b) [ 1 2 3 ] == [ 1 2 3 ]" (VBool True),
+      -- concatMap
+      runTest "concatMap" $
+        assertEval "concatMap" "builtins.concatMap (x: [ x (x * 2) ]) [ 1 2 ] == [ 1 2 2 4 ]" (VBool True),
+      -- any
+      runTest "any true" $
+        assertEval "any-t" "builtins.any (x: x == 2) [ 1 2 3 ]" (VBool True),
+      runTest "any false" $
+        assertEval "any-f" "builtins.any (x: x == 5) [ 1 2 3 ]" (VBool False),
+      -- all
+      runTest "all true" $
+        assertEval "all-t" "builtins.all (x: x > 0) [ 1 2 3 ]" (VBool True),
+      runTest "all false" $
+        assertEval "all-f" "builtins.all (x: x > 1) [ 1 2 3 ]" (VBool False),
+      -- elem
+      runTest "elem found" $
+        assertEval "elem-t" "builtins.elem 2 [ 1 2 3 ]" (VBool True),
+      runTest "elem not found" $
+        assertEval "elem-f" "builtins.elem 5 [ 1 2 3 ]" (VBool False),
+      -- elemAt
+      runTest "elemAt valid" $
+        assertEval "elemAt" "builtins.elemAt [ 10 20 30 ] 1" (VInt 20),
+      runTest "elemAt out of bounds" $
+        assertEvalFail "elemAt-oob" "builtins.elemAt [ 1 2 ] 5",
+      -- partition
+      runTest "partition right" $
+        assertEval "partition-right" "(builtins.partition (x: x > 2) [ 1 2 3 4 ]).right == [ 3 4 ]" (VBool True),
+      runTest "partition wrong" $
+        assertEval "partition-wrong" "(builtins.partition (x: x > 2) [ 1 2 3 4 ]).wrong == [ 1 2 ]" (VBool True),
+      -- groupBy
+      runTest "groupBy pos" $
+        assertEval "groupBy-pos" "(builtins.groupBy (x: if x > 0 then \"pos\" else \"neg\") [ 1 (- 2) 3 ]).pos == [ 1 3 ]" (VBool True),
+      runTest "groupBy neg" $
+        assertEval "groupBy-neg" "(builtins.groupBy (x: if x > 0 then \"pos\" else \"neg\") [ 1 (- 2) 3 ]).neg == [ (- 2) ]" (VBool True),
+      -- attrNames
+      runTest "attrNames sorted" $
+        assertEval "attrNames" "builtins.attrNames { b = 2; a = 1; c = 3; } == [ \"a\" \"b\" \"c\" ]" (VBool True),
+      -- attrValues
+      runTest "attrValues count" $
+        assertEval "attrValues" "builtins.length (builtins.attrValues { a = 1; b = 2; })" (VInt 2),
+      -- hasAttr
+      runTest "hasAttr true" $
+        assertEval "hasAttr-t" "builtins.hasAttr \"a\" { a = 1; }" (VBool True),
+      runTest "hasAttr false" $
+        assertEval "hasAttr-f" "builtins.hasAttr \"z\" { a = 1; }" (VBool False),
+      -- getAttr
+      runTest "getAttr" $
+        assertEval "getAttr" "builtins.getAttr \"a\" { a = 42; }" (VInt 42),
+      runTest "getAttr missing" $
+        assertEvalFail "getAttr-miss" "builtins.getAttr \"z\" { a = 1; }",
+      -- removeAttrs
+      runTest "removeAttrs" $
+        assertEval "removeAttrs" "builtins.attrNames (builtins.removeAttrs { a = 1; b = 2; c = 3; } [ \"b\" ]) == [ \"a\" \"c\" ]" (VBool True),
+      -- intersectAttrs
+      runTest "intersectAttrs" $
+        assertEval "intersectAttrs" "(builtins.intersectAttrs { a = 1; b = 2; } { b = 20; c = 30; }).b" (VInt 20),
+      runTest "intersectAttrs keys" $
+        assertEval "intersectAttrs-keys" "builtins.attrNames (builtins.intersectAttrs { a = 1; b = 2; } { b = 20; c = 30; }) == [ \"b\" ]" (VBool True),
+      -- catAttrs
+      runTest "catAttrs" $
+        assertEval "catAttrs" "builtins.catAttrs \"a\" [ { a = 1; } { b = 2; } { a = 3; } ] == [ 1 3 ]" (VBool True),
+      -- listToAttrs
+      runTest "listToAttrs" $
+        assertEval "listToAttrs" "(builtins.listToAttrs [ { name = \"x\"; value = 1; } { name = \"y\"; value = 2; } ]).x" (VInt 1),
+      -- substring
+      runTest "substring basic" $
+        assertEval "substr" "builtins.substring 1 2 \"hello\"" (VStr "el"),
+      runTest "substring clamped" $
+        assertEval "substr-clamp" "builtins.substring 3 100 \"hello\"" (VStr "lo"),
+      -- concatStringsSep
+      runTest "concatStringsSep" $
+        assertEval "concatSep" "builtins.concatStringsSep \", \" [ \"a\" \"b\" \"c\" ]" (VStr "a, b, c"),
+      -- Partial application
+      runTest "partial application" $
+        assertEval "partial" "let f = builtins.map (x: x + 1); in f [ 1 2 3 ] == [ 2 3 4 ]" (VBool True)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -825,6 +939,324 @@ testParserIntegration = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: Batch 1 — Trivial pure builtins + constants
+-- ---------------------------------------------------------------------------
+
+testBatch1 :: IO [Bool]
+testBatch1 = do
+  putStrLn "eval/builtins-batch1"
+  sequence
+    [ -- isPath
+      runTest "isPath true" $
+        assertEval "isPath-t" "builtins.isPath ./foo" (VBool True),
+      runTest "isPath false" $
+        assertEval "isPath-f" "builtins.isPath \"foo\"" (VBool False),
+      -- ceil
+      runTest "ceil float" $
+        assertEval "ceil" "builtins.ceil 1.2" (VInt 2),
+      runTest "ceil int passthrough" $
+        assertEval "ceil-int" "builtins.ceil 5" (VInt 5),
+      runTest "ceil negative" $
+        assertEval "ceil-neg" "builtins.ceil (- 1.7)" (VInt (-1)),
+      runTest "ceil type error" $
+        assertEvalFail "ceil-err" "builtins.ceil \"hi\"",
+      -- floor
+      runTest "floor float" $
+        assertEval "floor" "builtins.floor 1.7" (VInt 1),
+      runTest "floor int passthrough" $
+        assertEval "floor-int" "builtins.floor 5" (VInt 5),
+      runTest "floor negative" $
+        assertEval "floor-neg" "builtins.floor (- 1.2)" (VInt (-2)),
+      -- seq
+      runTest "seq returns second" $
+        assertEval "seq" "builtins.seq 1 42" (VInt 42),
+      -- trace
+      runTest "trace returns second" $
+        assertEval "trace" "builtins.trace \"msg\" 42" (VInt 42),
+      -- unsafeDiscardStringContext
+      runTest "discardContext" $
+        assertEval "discard" "builtins.unsafeDiscardStringContext \"hello\"" (VStr "hello"),
+      -- unsafeDiscardOutputDependency
+      runTest "discardOutputDep" $
+        assertEval "discardOut" "builtins.unsafeDiscardOutputDependency \"hello\"" (VStr "hello"),
+      -- baseNameOf
+      runTest "baseNameOf string" $
+        assertEval "baseName-str" "builtins.baseNameOf \"/foo/bar/baz\"" (VStr "baz"),
+      runTest "baseNameOf path" $
+        assertEval "baseName-path" "builtins.baseNameOf ./foo/bar" (VStr "bar"),
+      runTest "baseNameOf no slash" $
+        assertEval "baseName-flat" "builtins.baseNameOf \"filename\"" (VStr "filename"),
+      runTest "baseNameOf type error" $
+        assertEvalFail "baseName-err" "builtins.baseNameOf 42",
+      -- dirOf
+      runTest "dirOf string" $
+        assertEval "dirOf-str" "builtins.dirOf \"/foo/bar/baz\"" (VStr "/foo/bar"),
+      runTest "dirOf no slash" $
+        assertEval "dirOf-flat" "builtins.dirOf \"filename\"" (VStr "."),
+      -- concatLists
+      runTest "concatLists basic" $
+        assertEval "concatLists" "builtins.concatLists [ [ 1 2 ] [ 3 ] [ 4 5 ] ] == [ 1 2 3 4 5 ]" (VBool True),
+      runTest "concatLists empty" $
+        assertEval "concatLists-empty" "builtins.concatLists [ ]" (VList []),
+      runTest "concatLists type error" $
+        assertEvalFail "concatLists-err" "builtins.concatLists [ 1 2 ]",
+      -- lessThan
+      runTest "lessThan true" $
+        assertEval "lt-t" "builtins.lessThan 1 2" (VBool True),
+      runTest "lessThan false" $
+        assertEval "lt-f" "builtins.lessThan 2 1" (VBool False),
+      runTest "lessThan strings" $
+        assertEval "lt-str" "builtins.lessThan \"a\" \"b\"" (VBool True),
+      -- Constants
+      runTest "storeDir" $
+        assertEval "storeDir" "builtins.storeDir" (VStr "/nix/store"),
+      runTest "nixVersion" $
+        assertEval "nixVersion" "builtins.nixVersion" (VStr "2.24.0"),
+      runTest "langVersion" $
+        assertEval "langVersion" "builtins.langVersion" (VInt 6),
+      runTest "nixPath" $
+        assertEval "nixPath" "builtins.nixPath" (VList [])
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch 2 — Arithmetic + bitwise builtins
+-- ---------------------------------------------------------------------------
+
+testBatch2 :: IO [Bool]
+testBatch2 = do
+  putStrLn "eval/builtins-batch2"
+  sequence
+    [ -- add
+      runTest "add ints" $
+        assertEval "add-int" "builtins.add 3 4" (VInt 7),
+      runTest "add int+float" $
+        assertEval "add-mixed" "builtins.add 1 2.5" (VFloat 3.5),
+      runTest "add type error" $
+        assertEvalFail "add-err" "builtins.add \"a\" 1",
+      -- sub
+      runTest "sub ints" $
+        assertEval "sub-int" "builtins.sub 10 3" (VInt 7),
+      runTest "sub float" $
+        assertEval "sub-float" "builtins.sub 5.5 2.0" (VFloat 3.5),
+      -- mul
+      runTest "mul ints" $
+        assertEval "mul-int" "builtins.mul 3 4" (VInt 12),
+      runTest "mul float" $
+        assertEval "mul-float" "builtins.mul 2 3.0" (VFloat 6.0),
+      -- div
+      runTest "div ints" $
+        assertEval "div-int" "builtins.div 10 3" (VInt 3),
+      runTest "div float" $
+        assertEval "div-float" "builtins.div 7.0 2.0" (VFloat 3.5),
+      runTest "div by zero" $
+        assertEvalFail "div-zero" "builtins.div 1 0",
+      -- bitAnd
+      runTest "bitAnd" $
+        assertEval "bitAnd" "builtins.bitAnd 12 10" (VInt 8),
+      runTest "bitAnd type error" $
+        assertEvalFail "bitAnd-err" "builtins.bitAnd 1.0 2",
+      -- bitOr
+      runTest "bitOr" $
+        assertEval "bitOr" "builtins.bitOr 12 10" (VInt 14),
+      -- bitXor
+      runTest "bitXor" $
+        assertEval "bitXor" "builtins.bitXor 12 10" (VInt 6)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch 3 — Attrset higher-order builtins
+-- ---------------------------------------------------------------------------
+
+testBatch3 :: IO [Bool]
+testBatch3 = do
+  putStrLn "eval/builtins-batch3"
+  sequence
+    [ -- mapAttrs
+      runTest "mapAttrs basic" $
+        assertEval "mapAttrs" "(builtins.mapAttrs (name: val: val + 1) { a = 1; b = 2; }).a" (VInt 2),
+      runTest "mapAttrs name usage" $
+        assertEval "mapAttrs-name" "(builtins.mapAttrs (name: val: name) { a = 1; }).a" (VStr "a"),
+      runTest "mapAttrs type error" $
+        assertEvalFail "mapAttrs-err" "builtins.mapAttrs (n: v: v) [ 1 ]",
+      -- functionArgs
+      runTest "functionArgs set pattern" $
+        assertEval "funcArgs" "(builtins.functionArgs ({ a, b ? 1 }: a)).b" (VBool True),
+      runTest "functionArgs no default" $
+        assertEval "funcArgs-nodef" "(builtins.functionArgs ({ a, b ? 1 }: a)).a" (VBool False),
+      runTest "functionArgs simple lambda" $
+        assertEval "funcArgs-simple" "builtins.functionArgs (x: x)" (VAttrs Map.empty),
+      runTest "functionArgs type error" $
+        assertEvalFail "funcArgs-err" "builtins.functionArgs 42",
+      -- zipAttrsWith
+      runTest "zipAttrsWith basic" $
+        assertEval
+          "zipAttrs"
+          "(builtins.zipAttrsWith (name: vals: builtins.head vals) [ { a = 1; } { a = 2; b = 3; } ]).b"
+          (VInt 3),
+      runTest "zipAttrsWith collect" $
+        assertEval
+          "zipAttrs-collect"
+          "builtins.length (builtins.zipAttrsWith (name: vals: vals) [ { a = 1; } { a = 2; } ]).a"
+          (VInt 2)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch 4 — String operations
+-- ---------------------------------------------------------------------------
+
+testBatch4 :: IO [Bool]
+testBatch4 = do
+  putStrLn "eval/builtins-batch4"
+  sequence
+    [ -- replaceStrings
+      runTest "replaceStrings basic" $
+        assertEval "replace" "builtins.replaceStrings [ \"o\" ] [ \"0\" ] \"foobar\"" (VStr "f00bar"),
+      runTest "replaceStrings multi" $
+        assertEval "replace-multi" "builtins.replaceStrings [ \"a\" \"b\" ] [ \"A\" \"B\" ] \"abc\"" (VStr "ABc"),
+      runTest "replaceStrings empty from" $
+        assertEval "replace-empty" "builtins.replaceStrings [ \"\" ] [ \"x\" ] \"ab\"" (VStr "xaxbx"),
+      runTest "replaceStrings no match" $
+        assertEval "replace-nomatch" "builtins.replaceStrings [ \"z\" ] [ \"Z\" ] \"abc\"" (VStr "abc"),
+      -- compareVersions
+      runTest "compareVersions equal" $
+        assertEval "cmpVer-eq" "builtins.compareVersions \"1.2.3\" \"1.2.3\"" (VInt 0),
+      runTest "compareVersions less" $
+        assertEval "cmpVer-lt" "builtins.compareVersions \"1.2\" \"1.3\"" (VInt (-1)),
+      runTest "compareVersions greater" $
+        assertEval "cmpVer-gt" "builtins.compareVersions \"2.0\" \"1.9\"" (VInt 1),
+      runTest "compareVersions type error" $
+        assertEvalFail "cmpVer-err" "builtins.compareVersions 1 2",
+      -- splitVersion
+      runTest "splitVersion basic" $
+        assertEval "splitVer" "builtins.splitVersion \"1.2.3\" == [ \"1\" \".\" \"2\" \".\" \"3\" ]" (VBool True),
+      runTest "splitVersion pre" $
+        assertEval "splitVer-pre" "builtins.splitVersion \"1.2pre\" == [ \"1\" \".\" \"2\" \"pre\" ]" (VBool True),
+      runTest "splitVersion type error" $
+        assertEvalFail "splitVer-err" "builtins.splitVersion 42",
+      -- parseDrvName
+      runTest "parseDrvName basic" $
+        assertEval "parseDrv" "(builtins.parseDrvName \"hello-1.2.3\").name" (VStr "hello"),
+      runTest "parseDrvName version" $
+        assertEval "parseDrv-ver" "(builtins.parseDrvName \"hello-1.2.3\").version" (VStr "1.2.3"),
+      runTest "parseDrvName no version" $
+        assertEval "parseDrv-nover" "(builtins.parseDrvName \"hello\").version" (VStr ""),
+      runTest "parseDrvName type error" $
+        assertEvalFail "parseDrv-err" "builtins.parseDrvName 42"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch 5 — Serialization + hashing
+-- ---------------------------------------------------------------------------
+
+testBatch5 :: IO [Bool]
+testBatch5 = do
+  putStrLn "eval/builtins-batch5"
+  sequence
+    [ -- toJSON
+      runTest "toJSON int" $
+        assertEval "toJSON-int" "builtins.toJSON 42" (VStr "42"),
+      runTest "toJSON string" $
+        assertEval "toJSON-str" "builtins.toJSON \"hello\"" (VStr "\"hello\""),
+      runTest "toJSON null" $
+        assertEval "toJSON-null" "builtins.toJSON null" (VStr "null"),
+      runTest "toJSON bool" $
+        assertEval "toJSON-bool" "builtins.toJSON true" (VStr "true"),
+      runTest "toJSON list" $
+        assertEval "toJSON-list" "builtins.toJSON [ 1 2 3 ]" (VStr "[1,2,3]"),
+      runTest "toJSON attrs" $
+        assertEval "toJSON-attrs" "builtins.toJSON { a = 1; }" (VStr "{\"a\":1}"),
+      runTest "toJSON lambda error" $
+        assertEvalFail "toJSON-fn" "builtins.toJSON (x: x)",
+      -- fromJSON
+      runTest "fromJSON int" $
+        assertEval "fromJSON-int" "builtins.fromJSON \"42\"" (VInt 42),
+      runTest "fromJSON string" $
+        assertEval "fromJSON-str" "builtins.fromJSON \"\\\"hello\\\"\"" (VStr "hello"),
+      runTest "fromJSON null" $
+        assertEval "fromJSON-null" "builtins.fromJSON \"null\"" VNull,
+      runTest "fromJSON bool" $
+        assertEval "fromJSON-bool" "builtins.fromJSON \"true\"" (VBool True),
+      runTest "fromJSON array" $
+        assertEval "fromJSON-arr" "builtins.length (builtins.fromJSON \"[1,2,3]\")" (VInt 3),
+      runTest "fromJSON object" $
+        assertEval "fromJSON-obj" "(builtins.fromJSON \"{\\\"a\\\": 1}\").a" (VInt 1),
+      runTest "fromJSON roundtrip" $
+        assertEval "fromJSON-rt" "builtins.fromJSON (builtins.toJSON { a = 1; b = [ 2 3 ]; })" (VAttrs (Map.fromList [("a", Evaluated (VInt 1)), ("b", Evaluated (VList [Evaluated (VInt 2), Evaluated (VInt 3)]))])),
+      runTest "fromJSON invalid" $
+        assertEvalFail "fromJSON-bad" "builtins.fromJSON \"not json\"",
+      -- hashString
+      runTest "hashString sha256" $
+        assertEval "hash-sha256" "builtins.hashString \"sha256\" \"hello\"" (VStr "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"),
+      runTest "hashString md5" $
+        assertEval "hash-md5" "builtins.hashString \"md5\" \"hello\"" (VStr "5d41402abc4b2a76b9719d911017c592"),
+      runTest "hashString sha1" $
+        assertEval "hash-sha1" "builtins.hashString \"sha1\" \"hello\"" (VStr "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+      runTest "hashString unknown algo" $
+        assertEvalFail "hash-bad" "builtins.hashString \"sha999\" \"hello\"",
+      runTest "hashString type error" $
+        assertEvalFail "hash-err" "builtins.hashString \"sha256\" 42"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch 6 — tryEval + deepSeq
+-- ---------------------------------------------------------------------------
+
+testBatch6 :: IO [Bool]
+testBatch6 = do
+  putStrLn "eval/builtins-batch6"
+  sequence
+    [ -- tryEval success
+      runTest "tryEval success" $
+        assertEval "tryEval-ok" "(builtins.tryEval 42).value" (VInt 42),
+      runTest "tryEval success flag" $
+        assertEval "tryEval-flag" "(builtins.tryEval 42).success" (VBool True),
+      -- tryEval failure
+      runTest "tryEval catches throw" $
+        assertEval "tryEval-throw" "(builtins.tryEval (builtins.throw \"boom\")).success" (VBool False),
+      runTest "tryEval failure value" $
+        assertEval "tryEval-fval" "(builtins.tryEval (builtins.throw \"boom\")).value" (VBool False),
+      -- tryEval catches type error
+      runTest "tryEval catches type error" $
+        assertEval "tryEval-tyerr" "(builtins.tryEval (1 + \"a\")).success" (VBool False),
+      -- deepSeq
+      runTest "deepSeq returns second" $
+        assertEval "deepSeq" "builtins.deepSeq [ 1 2 3 ] 42" (VInt 42),
+      runTest "deepSeq forces nested" $
+        assertEvalFail "deepSeq-err" "builtins.deepSeq [ (builtins.throw \"boom\") ] 42",
+      runTest "deepSeq forces attrs" $
+        assertEvalFail "deepSeq-attr" "builtins.deepSeq { a = builtins.throw \"boom\"; } 42"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Batch 7 — genericClosure
+-- ---------------------------------------------------------------------------
+
+testBatch7 :: IO [Bool]
+testBatch7 = do
+  putStrLn "eval/builtins-batch7"
+  sequence
+    [ runTest "genericClosure basic" $
+        assertEval
+          "closure-basic"
+          "builtins.length (builtins.genericClosure { startSet = [ { key = 1; } ]; operator = item: [ ]; })"
+          (VInt 1),
+      runTest "genericClosure expansion" $
+        assertEval
+          "closure-expand"
+          "builtins.length (builtins.genericClosure { startSet = [ { key = 1; next = 2; } ]; operator = item: if item.next == 0 then [ ] else [ { key = item.next; next = 0; } ]; })"
+          (VInt 2),
+      runTest "genericClosure dedup" $
+        assertEval
+          "closure-dedup"
+          "builtins.length (builtins.genericClosure { startSet = [ { key = 1; } { key = 1; } ]; operator = item: [ ]; })"
+          (VInt 1),
+      runTest "genericClosure missing startSet" $
+        assertEvalFail "closure-nostart" "builtins.genericClosure { operator = x: [ ]; }",
+      runTest "genericClosure type error" $
+        assertEvalFail "closure-tyerr" "builtins.genericClosure 42"
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
 
@@ -854,10 +1286,18 @@ main = do
           testEvalWith,
           testEvalBuiltins,
           testEvalErrors,
+          testEvalHigherOrder,
           testLexer,
           testParserExprs,
           testParserErrors,
-          testParserIntegration
+          testParserIntegration,
+          testBatch1,
+          testBatch2,
+          testBatch3,
+          testBatch4,
+          testBatch5,
+          testBatch6,
+          testBatch7
         ]
   let total = length results
       passed = length (filter id results)

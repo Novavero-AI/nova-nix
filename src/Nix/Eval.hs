@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | Nix expression evaluator.
 --
 -- Nix evaluation is LAZY.  Attribute set members and list elements
@@ -17,6 +19,10 @@ module Nix.Eval
     Env (..),
     emptyEnv,
 
+    -- * Evaluation monad (re-exported from Types)
+    MonadEval (..),
+    PureEval (..),
+
     -- * Evaluation
     eval,
     force,
@@ -24,19 +30,34 @@ module Nix.Eval
     -- * Helpers (for Builtins)
     typeName,
     evaluated,
+
+    -- * Builtin registry
+    BuiltinDef (..),
+    builtinRegistry,
+    builtinNames,
   )
 where
 
+import Control.Monad (when, (>=>))
+import qualified Crypto.Hash as CH
+import Data.Bits (xor, (.&.), (.|.))
+import qualified Data.ByteArray as BA
+import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, ord)
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
-import Nix.Eval.Operator (evalBinary, evalUnary)
+import qualified Data.Text.Encoding as TE
+import Data.Word (Word8)
+import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
 import Nix.Eval.Types
   ( Env (..),
+    MonadEval (..),
     NixValue (..),
+    PureEval (..),
     Thunk (..),
     emptyEnv,
     envInsertThunk,
@@ -44,6 +65,7 @@ import Nix.Eval.Types
     evaluated,
     mkThunk,
     pushWithScope,
+    runPureEval,
     typeName,
   )
 import Nix.Expr.Types
@@ -59,18 +81,18 @@ import Nix.Expr.Types
 import qualified System.Info
 
 -- | Evaluate a Nix expression in an environment.
-eval :: Env -> Expr -> Either Text NixValue
+eval :: (MonadEval m) => Env -> Expr -> m NixValue
 eval env expr = case expr of
   ELit atom -> evalLit atom
   EStr parts -> VStr <$> evalStringParts eval env parts
   EIndStr parts -> VStr <$> evalIndStringParts eval env parts
   EVar name -> evalVar env name
   EAttrs isRec bindings -> evalAttrs env isRec bindings
-  EList exprs -> Right (VList (map (mkThunk env) exprs))
+  EList exprs -> pure (VList (map (mkThunk env) exprs))
   ESelect target path defExpr -> evalSelect env target path defExpr
   EHasAttr target path -> evalHasAttr env target path
   EApp func arg -> evalApp env func arg
-  ELambda formals body -> Right (VLambda env formals body)
+  ELambda formals body -> pure (VLambda env formals body)
   ELet bindings body -> evalLet env bindings body
   EIf cond thenExpr elseExpr -> evalIf env cond thenExpr elseExpr
   EWith scope body -> evalWith env scope body
@@ -87,64 +109,66 @@ eval env expr = case expr of
     evalBinary force op leftVal rightVal
 
 -- | Force a thunk to a value.
-force :: Thunk -> Either Text NixValue
-force (Evaluated val) = Right val
+force :: (MonadEval m) => Thunk -> m NixValue
+force (Evaluated val) = pure val
 force (Thunk thunkExpr thunkEnv) = eval thunkEnv thunkExpr
 
 -- ---------------------------------------------------------------------------
 -- Literal
 -- ---------------------------------------------------------------------------
 
-evalLit :: NixAtom -> Either Text NixValue
+evalLit :: (MonadEval m) => NixAtom -> m NixValue
 evalLit atom = case atom of
-  NixInt n -> Right (VInt n)
-  NixFloat n -> Right (VFloat n)
-  NixBool b -> Right (VBool b)
-  NixNull -> Right VNull
-  NixUri u -> Right (VStr u)
-  NixPath p -> Right (VPath p)
+  NixInt n -> pure (VInt n)
+  NixFloat n -> pure (VFloat n)
+  NixBool b -> pure (VBool b)
+  NixNull -> pure VNull
+  NixUri u -> pure (VStr u)
+  NixPath p -> pure (VPath p)
 
 -- ---------------------------------------------------------------------------
 -- Variables
 -- ---------------------------------------------------------------------------
 
-evalVar :: Env -> Text -> Either Text NixValue
+evalVar :: (MonadEval m) => Env -> Text -> m NixValue
 evalVar env name =
   case envLookup name env of
     Just thunk -> force thunk
-    Nothing -> Left ("undefined variable '" <> name <> "'")
+    Nothing -> throwEvalError ("undefined variable '" <> name <> "'")
 
 -- ---------------------------------------------------------------------------
 -- Attribute sets
 -- ---------------------------------------------------------------------------
 
-evalAttrs :: Env -> Bool -> [Binding] -> Either Text NixValue
+evalAttrs :: (MonadEval m) => Env -> Bool -> [Binding] -> m NixValue
 evalAttrs env False bindings = evalNonRecAttrs env bindings
 evalAttrs env True bindings = evalRecAttrs env bindings
 
 -- | Non-recursive attribute set: thunks capture the outer environment.
-evalNonRecAttrs :: Env -> [Binding] -> Either Text NixValue
-evalNonRecAttrs env bindings = do
-  attrMap <- evalBindings env env bindings
-  pure (VAttrs attrMap)
+evalNonRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
+evalNonRecAttrs env bindings =
+  case buildBindingsMap env env bindings of
+    Left err -> throwEvalError err
+    Right attrMap -> pure (VAttrs attrMap)
 
 -- | Recursive attribute set: thunks capture the completed environment
 -- (Haskell's laziness ties the knot — Thunk's Env field is lazy).
-evalRecAttrs :: Env -> [Binding] -> Either Text NixValue
+evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
 evalRecAttrs env bindings =
   let recEnv = env {envBindings = Map.union recBindings (envBindings env)}
-      recBindings = case evalBindings recEnv recEnv bindings of
+      recBindings = case buildBindingsMap recEnv recEnv bindings of
         Right m -> m
         Left _ -> Map.empty
-   in Right (VAttrs recBindings)
+   in pure (VAttrs recBindings)
 
--- | Process bindings into a flat attribute map.
+-- | Build a flat attribute map from bindings (pure — only creates
+-- thunks, never forces them).  Used by let, rec {}, and non-rec {}.
 --
 -- Handles nested attribute paths (@a.b.c = 1@) by building nested
 -- 'VAttrs' maps.  Handles @inherit@ by looking up names in the
 -- environment or a source expression.
-evalBindings :: Env -> Env -> [Binding] -> Either Text (Map Text Thunk)
-evalBindings thunkEnv lookupEnv =
+buildBindingsMap :: Env -> Env -> [Binding] -> Either Text (Map Text Thunk)
+buildBindingsMap thunkEnv lookupEnv =
   foldl' mergeBinding (Right Map.empty)
   where
     mergeBinding acc binding = do
@@ -207,44 +231,46 @@ mergeThunks _ new = new
 -- Select / has-attr
 -- ---------------------------------------------------------------------------
 
-evalSelect :: Env -> Expr -> AttrPath -> Maybe Expr -> Either Text NixValue
+evalSelect :: (MonadEval m) => Env -> Expr -> AttrPath -> Maybe Expr -> m NixValue
 evalSelect env target path defExpr = do
   targetVal <- eval env target
   result <- walkAttrPath path targetVal
   case result of
-    Just val -> Right val
+    Just val -> pure val
     Nothing -> case defExpr of
       Just def -> eval env def
-      Nothing -> Left ("attribute path not found in " <> typeName targetVal)
+      Nothing -> throwEvalError ("attribute path not found in " <> typeName targetVal)
 
 -- | Walk an attribute path through nested attribute sets.
 -- Returns @Just value@ if the full path resolves, @Nothing@ if any
 -- key is missing or a non-set is encountered mid-path.
-walkAttrPath :: AttrPath -> NixValue -> Either Text (Maybe NixValue)
-walkAttrPath [] val = Right (Just val)
+walkAttrPath :: (MonadEval m) => AttrPath -> NixValue -> m (Maybe NixValue)
+walkAttrPath [] val = pure (Just val)
 walkAttrPath (key : rest) val = case val of
-  VAttrs attrs -> do
-    keyText <- resolveStaticKey key
-    case Map.lookup keyText attrs of
-      Just thunk -> do
-        inner <- force thunk
-        walkAttrPath rest inner
-      Nothing -> Right Nothing
-  _ -> Right Nothing
+  VAttrs attrs ->
+    case resolveStaticKey key of
+      Left err -> throwEvalError err
+      Right keyText ->
+        case Map.lookup keyText attrs of
+          Just thunk -> do
+            inner <- force thunk
+            walkAttrPath rest inner
+          Nothing -> pure Nothing
+  _ -> pure Nothing
 
-evalHasAttr :: Env -> Expr -> AttrPath -> Either Text NixValue
+evalHasAttr :: (MonadEval m) => Env -> Expr -> AttrPath -> m NixValue
 evalHasAttr env target path = do
   targetVal <- eval env target
   result <- walkAttrPath path targetVal
   case result of
-    Just _ -> Right (VBool True)
-    Nothing -> Right (VBool False)
+    Just _ -> pure (VBool True)
+    Nothing -> pure (VBool False)
 
 -- ---------------------------------------------------------------------------
 -- Application
 -- ---------------------------------------------------------------------------
 
-evalApp :: Env -> Expr -> Expr -> Either Text NixValue
+evalApp :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
 evalApp env funcExpr argExpr = do
   funcVal <- eval env funcExpr
   case funcVal of
@@ -252,15 +278,36 @@ evalApp env funcExpr argExpr = do
       let argThunk = mkThunk env argExpr
       extEnv <- matchFormals closureEnv formals argThunk
       eval extEnv body
-    VBuiltin name -> do
+    VBuiltin "tryEval" [] -> do
+      result <- catchEvalError (eval env argExpr)
+      case result of
+        Right val ->
+          pure
+            ( VAttrs
+                ( Map.fromList
+                    [ ("success", evaluated (VBool True)),
+                      ("value", evaluated val)
+                    ]
+                )
+            )
+        Left _ ->
+          pure
+            ( VAttrs
+                ( Map.fromList
+                    [ ("success", evaluated (VBool False)),
+                      ("value", evaluated (VBool False))
+                    ]
+                )
+            )
+    VBuiltin name accArgs -> do
       argVal <- eval env argExpr
-      applyBuiltin name argVal
-    _ -> Left ("attempt to call " <> typeName funcVal <> ", which is not a function")
+      applyBuiltin name accArgs argVal
+    _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
 
 -- | Match function formals against an argument thunk.
-matchFormals :: Env -> Formals -> Thunk -> Either Text Env
+matchFormals :: (MonadEval m) => Env -> Formals -> Thunk -> m Env
 matchFormals closureEnv (FormalName name) argThunk =
-  Right (envInsertThunk name argThunk closureEnv)
+  pure (envInsertThunk name argThunk closureEnv)
 matchFormals closureEnv (FormalSet formals allowExtra) argThunk = do
   argVal <- force argThunk
   matchFormalSet closureEnv formals allowExtra argVal
@@ -270,34 +317,34 @@ matchFormals closureEnv (FormalNamedSet name formals allowExtra) argThunk = do
   pure (envInsertThunk name argThunk matched)
 
 -- | Match a formal set pattern against a VAttrs argument.
-matchFormalSet :: Env -> [Formal] -> Bool -> NixValue -> Either Text Env
+matchFormalSet :: (MonadEval m) => Env -> [Formal] -> Bool -> NixValue -> m Env
 matchFormalSet closureEnv formals allowExtra argVal =
   case argVal of
     VAttrs attrs -> do
       checkExtraKeys formals allowExtra attrs
-      foldl' (bindFormal attrs) (Right closureEnv) formals
-    _ -> Left ("function expects a set argument, got " <> typeName argVal)
+      foldl' (bindFormal attrs) (pure closureEnv) formals
+    _ -> throwEvalError ("function expects a set argument, got " <> typeName argVal)
 
 -- | Verify that no unexpected keys are present (unless @...@ allows them).
-checkExtraKeys :: [Formal] -> Bool -> Map Text Thunk -> Either Text ()
-checkExtraKeys _ True _ = Right ()
+checkExtraKeys :: (MonadEval m) => [Formal] -> Bool -> Map Text Thunk -> m ()
+checkExtraKeys _ True _ = pure ()
 checkExtraKeys formals False attrs =
   let expected = map fName formals
       actual = Map.keys attrs
       extra = filter (`notElem` expected) actual
    in case extra of
-        [] -> Right ()
-        (k : _) -> Left ("unexpected attribute '" <> k <> "' in function argument")
+        [] -> pure ()
+        (k : _) -> throwEvalError ("unexpected attribute '" <> k <> "' in function argument")
 
 -- | Bind a single formal parameter from the argument attrset.
-bindFormal :: Map Text Thunk -> Either Text Env -> Formal -> Either Text Env
+bindFormal :: (MonadEval m) => Map Text Thunk -> m Env -> Formal -> m Env
 bindFormal attrs acc (Formal name defExpr) = do
   env <- acc
   case Map.lookup name attrs of
-    Just thunk -> Right (envInsertThunk name thunk env)
+    Just thunk -> pure (envInsertThunk name thunk env)
     Nothing -> case defExpr of
-      Just def -> Right (envInsertThunk name (mkThunk env def) env)
-      Nothing -> Left ("missing required attribute '" <> name <> "'")
+      Just def -> pure (envInsertThunk name (mkThunk env def) env)
+      Nothing -> throwEvalError ("missing required attribute '" <> name <> "'")
 
 -- ---------------------------------------------------------------------------
 -- Let / if / with / assert
@@ -305,110 +352,257 @@ bindFormal attrs acc (Formal name defExpr) = do
 
 -- | Let is recursive in Nix: all bindings are visible to each other.
 -- Knot-tying via Haskell laziness (Thunk's Env field is lazy).
-evalLet :: Env -> [Binding] -> Expr -> Either Text NixValue
+evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> m NixValue
 evalLet env bindings body =
   let letEnv = env {envBindings = Map.union letBindings (envBindings env)}
-      letBindings = case evalBindings letEnv letEnv bindings of
+      letBindings = case buildBindingsMap letEnv letEnv bindings of
         Right m -> m
         Left _ -> Map.empty
    in eval letEnv body
 
-evalIf :: Env -> Expr -> Expr -> Expr -> Either Text NixValue
+evalIf :: (MonadEval m) => Env -> Expr -> Expr -> Expr -> m NixValue
 evalIf env cond thenExpr elseExpr = do
   condVal <- eval env cond
   case condVal of
     VBool True -> eval env thenExpr
     VBool False -> eval env elseExpr
-    _ -> Left ("'if' condition must be a Boolean, got " <> typeName condVal)
+    _ -> throwEvalError ("'if' condition must be a Boolean, got " <> typeName condVal)
 
-evalWith :: Env -> Expr -> Expr -> Either Text NixValue
+evalWith :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
 evalWith env scope body = do
   scopeVal <- eval env scope
   case scopeVal of
     VAttrs attrs -> eval (pushWithScope attrs env) body
-    _ -> Left ("'with' requires a set, got " <> typeName scopeVal)
+    _ -> throwEvalError ("'with' requires a set, got " <> typeName scopeVal)
 
-evalAssert :: Env -> Expr -> Expr -> Either Text NixValue
+evalAssert :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
 evalAssert env cond body = do
   condVal <- eval env cond
   case condVal of
     VBool True -> eval env body
-    VBool False -> Left "assertion failed"
-    _ -> Left ("assertion condition must be a Boolean, got " <> typeName condVal)
+    VBool False -> throwEvalError "assertion failed"
+    _ -> throwEvalError ("assertion condition must be a Boolean, got " <> typeName condVal)
 
 -- ---------------------------------------------------------------------------
 -- Short-circuit Boolean operators
 -- ---------------------------------------------------------------------------
 
-evalShortCircuitAnd :: Env -> Expr -> Expr -> Either Text NixValue
+evalShortCircuitAnd :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
 evalShortCircuitAnd env left right = do
   leftVal <- eval env left
   case leftVal of
-    VBool False -> Right (VBool False)
+    VBool False -> pure (VBool False)
     VBool True -> do
       rightVal <- eval env right
       case rightVal of
-        VBool _ -> Right rightVal
-        _ -> Left ("second operand of && must be a Boolean, got " <> typeName rightVal)
-    _ -> Left ("first operand of && must be a Boolean, got " <> typeName leftVal)
+        VBool _ -> pure rightVal
+        _ -> throwEvalError ("second operand of && must be a Boolean, got " <> typeName rightVal)
+    _ -> throwEvalError ("first operand of && must be a Boolean, got " <> typeName leftVal)
 
-evalShortCircuitOr :: Env -> Expr -> Expr -> Either Text NixValue
+evalShortCircuitOr :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
 evalShortCircuitOr env left right = do
   leftVal <- eval env left
   case leftVal of
-    VBool True -> Right (VBool True)
+    VBool True -> pure (VBool True)
     VBool False -> do
       rightVal <- eval env right
       case rightVal of
-        VBool _ -> Right rightVal
-        _ -> Left ("second operand of || must be a Boolean, got " <> typeName rightVal)
-    _ -> Left ("first operand of || must be a Boolean, got " <> typeName leftVal)
+        VBool _ -> pure rightVal
+        _ -> throwEvalError ("second operand of || must be a Boolean, got " <> typeName rightVal)
+    _ -> throwEvalError ("first operand of || must be a Boolean, got " <> typeName leftVal)
 
-evalShortCircuitImpl :: Env -> Expr -> Expr -> Either Text NixValue
+evalShortCircuitImpl :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
 evalShortCircuitImpl env left right = do
   leftVal <- eval env left
   case leftVal of
-    VBool False -> Right (VBool True)
+    VBool False -> pure (VBool True)
     VBool True -> do
       rightVal <- eval env right
       case rightVal of
-        VBool _ -> Right rightVal
-        _ -> Left ("second operand of -> must be a Boolean, got " <> typeName rightVal)
-    _ -> Left ("first operand of -> must be a Boolean, got " <> typeName leftVal)
+        VBool _ -> pure rightVal
+        _ -> throwEvalError ("second operand of -> must be a Boolean, got " <> typeName rightVal)
+    _ -> throwEvalError ("first operand of -> must be a Boolean, got " <> typeName leftVal)
 
 -- ---------------------------------------------------------------------------
--- Builtin dispatch
+-- Builtin registry (single-definition-site for all builtins)
 -- ---------------------------------------------------------------------------
 
--- | Apply a built-in function to a single argument.
-applyBuiltin :: Text -> NixValue -> Either Text NixValue
-applyBuiltin name arg = case name of
-  -- Type checking
-  "typeOf" -> Right (VStr (typeOfValue arg))
-  "isNull" -> Right (VBool (isNullVal arg))
-  "isInt" -> Right (VBool (isIntVal arg))
-  "isFloat" -> Right (VBool (isFloatVal arg))
-  "isBool" -> Right (VBool (isBoolVal arg))
-  "isString" -> Right (VBool (isStringVal arg))
-  "isList" -> Right (VBool (isListVal arg))
-  "isAttrs" -> Right (VBool (isAttrsVal arg))
-  "isFunction" -> Right (VBool (isFunctionVal arg))
-  -- List operations
-  "length" -> builtinLength arg
-  "head" -> builtinHead arg
-  "tail" -> builtinTail arg
-  -- String operations
-  "toString" -> VStr <$> coerceToString arg
-  "stringLength" -> builtinStringLength arg
-  -- Control
-  "throw" -> builtinThrow arg
-  "abort" -> builtinThrow arg
-  -- System
-  "currentSystem" -> Right (VStr currentSystemStr)
-  _ -> Left ("unknown builtin '" <> name <> "'")
+-- | A builtin function definition: its arity and implementation.
+data BuiltinDef m = BuiltinDef
+  { bdArity :: !Int,
+    bdApply :: [NixValue] -> m NixValue
+  }
+
+-- | Define an arity-1 builtin.
+builtin1 :: (MonadEval m) => Text -> (NixValue -> m NixValue) -> (Text, BuiltinDef m)
+builtin1 name f =
+  ( name,
+    BuiltinDef 1 $ \case
+      [a] -> f a
+      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
+  )
+
+-- | Define an arity-2 builtin.
+builtin2 ::
+  (MonadEval m) =>
+  Text ->
+  (NixValue -> NixValue -> m NixValue) ->
+  (Text, BuiltinDef m)
+builtin2 name f =
+  ( name,
+    BuiltinDef 2 $ \case
+      [a, b] -> f a b
+      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
+  )
+
+-- | Define an arity-3 builtin.
+builtin3 ::
+  (MonadEval m) =>
+  Text ->
+  (NixValue -> NixValue -> NixValue -> m NixValue) ->
+  (Text, BuiltinDef m)
+builtin3 name f =
+  ( name,
+    BuiltinDef 3 $ \case
+      [a, b, c] -> f a b c
+      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
+  )
+
+-- | Central registry of all builtins.  Adding a new builtin is a single
+-- entry here plus its implementation function — no other files need changes.
+builtinRegistry :: (MonadEval m) => Map Text (BuiltinDef m)
+builtinRegistry =
+  Map.fromList
+    [ -- Type checking (arity 1)
+      builtin1 "typeOf" (pure . VStr . typeOfValue),
+      builtin1 "isNull" (pure . VBool . isNullVal),
+      builtin1 "isInt" (pure . VBool . isIntVal),
+      builtin1 "isFloat" (pure . VBool . isFloatVal),
+      builtin1 "isBool" (pure . VBool . isBoolVal),
+      builtin1 "isString" (pure . VBool . isStringVal),
+      builtin1 "isList" (pure . VBool . isListVal),
+      builtin1 "isAttrs" (pure . VBool . isAttrsVal),
+      builtin1 "isFunction" (pure . VBool . isFunctionVal),
+      -- List operations (arity 1)
+      builtin1 "length" builtinLength,
+      builtin1 "head" builtinHead,
+      builtin1 "tail" builtinTail,
+      -- String operations (arity 1)
+      builtin1 "toString" (fmap VStr . coerceToString),
+      builtin1 "stringLength" builtinStringLength,
+      -- Control (arity 1)
+      builtin1 "throw" builtinThrow,
+      builtin1 "abort" builtinThrow,
+      -- System (arity 1)
+      builtin1 "currentSystem" (\_ -> pure (VStr currentSystemStr)),
+      -- Attr set operations (arity 1)
+      builtin1 "attrNames" builtinAttrNames,
+      builtin1 "attrValues" builtinAttrValues,
+      builtin1 "listToAttrs" builtinListToAttrs,
+      -- Attr set operations (arity 2)
+      builtin2 "hasAttr" builtinHasAttr,
+      builtin2 "getAttr" builtinGetAttr,
+      builtin2 "removeAttrs" builtinRemoveAttrs,
+      builtin2 "intersectAttrs" builtinIntersectAttrs,
+      builtin2 "catAttrs" builtinCatAttrs,
+      -- List higher-order (arity 2)
+      builtin2 "map" builtinMap,
+      builtin2 "filter" builtinFilter,
+      builtin2 "genList" builtinGenList,
+      builtin2 "sort" builtinSort,
+      builtin2 "concatMap" builtinConcatMap,
+      builtin2 "any" builtinAny,
+      builtin2 "all" builtinAll,
+      builtin2 "elem" builtinElem,
+      builtin2 "elemAt" builtinElemAt,
+      builtin2 "partition" builtinPartition,
+      builtin2 "groupBy" builtinGroupBy,
+      -- String operations (arity 2)
+      builtin2 "concatStringsSep" builtinConcatStringsSep,
+      -- Arity 3
+      builtin3 "foldl'" builtinFoldl,
+      builtin3 "substring" builtinSubstring,
+      -- Batch 1: Trivial pure
+      builtin1 "isPath" (pure . VBool . isPathVal),
+      builtin1 "ceil" builtinCeil,
+      builtin1 "floor" builtinFloor,
+      builtin2 "seq" (\_ b -> pure b),
+      builtin2 "trace" (\_ b -> pure b),
+      builtin1 "unsafeDiscardStringContext" builtinDiscardContext,
+      builtin1 "unsafeDiscardOutputDependency" builtinDiscardContext,
+      builtin1 "baseNameOf" builtinBaseNameOf,
+      builtin1 "dirOf" builtinDirOf,
+      builtin1 "concatLists" builtinConcatLists,
+      builtin2 "lessThan" builtinLessThan,
+      -- Batch 2: Arithmetic + bitwise
+      builtin2 "add" builtinAdd,
+      builtin2 "sub" builtinSub,
+      builtin2 "mul" builtinMul,
+      builtin2 "div" builtinBuiltinDiv,
+      builtin2 "bitAnd" builtinBitAnd,
+      builtin2 "bitOr" builtinBitOr,
+      builtin2 "bitXor" builtinBitXor,
+      -- Batch 3: Attrset higher-order
+      builtin2 "mapAttrs" builtinMapAttrs,
+      builtin1 "functionArgs" builtinFunctionArgs,
+      builtin2 "zipAttrsWith" builtinZipAttrsWith,
+      -- Batch 4: String operations
+      builtin3 "replaceStrings" builtinReplaceStrings,
+      builtin2 "compareVersions" builtinCompareVersions,
+      builtin1 "splitVersion" builtinSplitVersion,
+      builtin1 "parseDrvName" builtinParseDrvName,
+      -- Batch 5: Serialization + hashing
+      builtin1 "toJSON" builtinToJSON,
+      builtin1 "fromJSON" builtinFromJSON,
+      builtin2 "hashString" builtinHashString,
+      -- Batch 6: tryEval + deepSeq
+      builtin1 "tryEval" (\_ -> throwEvalError "unreachable: tryEval handled in evalApp"),
+      builtin2 "deepSeq" builtinDeepSeq,
+      -- Batch 7: genericClosure
+      builtin1 "genericClosure" builtinGenericClosure
+    ]
+
+-- | Names of all registered builtins.
+builtinNames :: [Text]
+builtinNames = Map.keys (builtinRegistry :: Map Text (BuiltinDef PureEval))
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations
+-- Builtin dispatch (partial application via accumulated args)
+-- ---------------------------------------------------------------------------
+
+-- | Arity of a builtin (how many arguments before execution).
+builtinArity :: Text -> Int
+builtinArity name = maybe 1 bdArity (Map.lookup name (builtinRegistry :: Map Text (BuiltinDef PureEval)))
+
+-- | Apply a builtin with accumulated args.  If we have enough args,
+-- execute; otherwise return a partially applied builtin.
+applyBuiltin :: (MonadEval m) => Text -> [NixValue] -> NixValue -> m NixValue
+applyBuiltin name accArgs arg =
+  let allArgs = accArgs ++ [arg]
+      arity = builtinArity name
+   in if length allArgs < arity
+        then pure (VBuiltin name allArgs)
+        else executeBuiltin name allArgs
+
+-- | Apply a function value (lambda or builtin) to one argument.
+-- Used by higher-order builtins to invoke user-supplied functions.
+applyValue :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+applyValue (VLambda closureEnv formals body) arg = do
+  extEnv <- matchFormals closureEnv formals (evaluated arg)
+  eval extEnv body
+applyValue (VBuiltin name accArgs) arg =
+  applyBuiltin name accArgs arg
+applyValue other _ =
+  throwEvalError ("attempt to call " <> typeName other <> ", which is not a function")
+
+-- | Execute a builtin once all arguments are collected.
+executeBuiltin :: (MonadEval m) => Text -> [NixValue] -> m NixValue
+executeBuiltin name args = case Map.lookup name builtinRegistry of
+  Just def -> bdApply def args
+  Nothing -> throwEvalError ("unknown builtin '" <> name <> "'")
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — type checking
 -- ---------------------------------------------------------------------------
 
 typeOfValue :: NixValue -> Text
@@ -422,7 +616,7 @@ typeOfValue val = case val of
   VList _ -> "list"
   VAttrs _ -> "set"
   VLambda {} -> "lambda"
-  VBuiltin _ -> "lambda"
+  VBuiltin _ _ -> "lambda"
   VDerivation _ -> "set"
 
 isNullVal :: NixValue -> Bool
@@ -455,31 +649,402 @@ isAttrsVal _ = False
 
 isFunctionVal :: NixValue -> Bool
 isFunctionVal (VLambda {}) = True
-isFunctionVal (VBuiltin _) = True
+isFunctionVal (VBuiltin _ _) = True
 isFunctionVal _ = False
 
-builtinLength :: NixValue -> Either Text NixValue
-builtinLength (VList xs) = Right (VInt (fromIntegral (length xs)))
-builtinLength other = Left ("builtins.length: expected a list, got " <> typeName other)
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — list (arity 1)
+-- ---------------------------------------------------------------------------
 
-builtinHead :: NixValue -> Either Text NixValue
-builtinHead (VList []) = Left "builtins.head: empty list"
+builtinLength :: (MonadEval m) => NixValue -> m NixValue
+builtinLength (VList xs) = pure (VInt (fromIntegral (length xs)))
+builtinLength other = throwEvalError ("builtins.length: expected a list, got " <> typeName other)
+
+builtinHead :: (MonadEval m) => NixValue -> m NixValue
+builtinHead (VList []) = throwEvalError "builtins.head: empty list"
 builtinHead (VList (x : _)) = force x
-builtinHead other = Left ("builtins.head: expected a list, got " <> typeName other)
+builtinHead other = throwEvalError ("builtins.head: expected a list, got " <> typeName other)
 
-builtinTail :: NixValue -> Either Text NixValue
-builtinTail (VList []) = Left "builtins.tail: empty list"
-builtinTail (VList (_ : xs)) = Right (VList xs)
-builtinTail other = Left ("builtins.tail: expected a list, got " <> typeName other)
+builtinTail :: (MonadEval m) => NixValue -> m NixValue
+builtinTail (VList []) = throwEvalError "builtins.tail: empty list"
+builtinTail (VList (_ : xs)) = pure (VList xs)
+builtinTail other = throwEvalError ("builtins.tail: expected a list, got " <> typeName other)
 
-builtinStringLength :: NixValue -> Either Text NixValue
-builtinStringLength (VStr s) = Right (VInt (fromIntegral (T.length s)))
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — string (arity 1)
+-- ---------------------------------------------------------------------------
+
+builtinStringLength :: (MonadEval m) => NixValue -> m NixValue
+builtinStringLength (VStr s) = pure (VInt (fromIntegral (T.length s)))
 builtinStringLength other =
-  Left ("builtins.stringLength: expected a string, got " <> typeName other)
+  throwEvalError ("builtins.stringLength: expected a string, got " <> typeName other)
 
-builtinThrow :: NixValue -> Either Text NixValue
-builtinThrow (VStr msg) = Left msg
-builtinThrow other = Left ("builtins.throw: expected a string, got " <> typeName other)
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — control
+-- ---------------------------------------------------------------------------
+
+builtinThrow :: (MonadEval m) => NixValue -> m NixValue
+builtinThrow (VStr msg) = throwEvalError msg
+builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <> typeName other)
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — attr set (arity 1)
+-- ---------------------------------------------------------------------------
+
+builtinAttrNames :: (MonadEval m) => NixValue -> m NixValue
+builtinAttrNames (VAttrs attrs) =
+  pure (VList (map (evaluated . VStr) (Map.keys attrs)))
+builtinAttrNames other =
+  throwEvalError ("builtins.attrNames: expected a set, got " <> typeName other)
+
+builtinAttrValues :: (MonadEval m) => NixValue -> m NixValue
+builtinAttrValues (VAttrs attrs) =
+  pure (VList (Map.elems attrs))
+builtinAttrValues other =
+  throwEvalError ("builtins.attrValues: expected a set, got " <> typeName other)
+
+builtinListToAttrs :: (MonadEval m) => NixValue -> m NixValue
+builtinListToAttrs (VList thunks) = do
+  pairs <- mapM listToAttrsPair thunks
+  pure (VAttrs (Map.fromList pairs))
+builtinListToAttrs other =
+  throwEvalError ("builtins.listToAttrs: expected a list, got " <> typeName other)
+
+-- | Extract { name, value } from a thunk for listToAttrs.
+listToAttrsPair :: (MonadEval m) => Thunk -> m (Text, Thunk)
+listToAttrsPair thunk = do
+  val <- force thunk
+  case val of
+    VAttrs attrs -> do
+      nameThunk <-
+        maybe (throwEvalError "builtins.listToAttrs: element missing 'name'") pure $
+          Map.lookup "name" attrs
+      nameVal <- force nameThunk
+      case nameVal of
+        VStr keyName ->
+          case Map.lookup "value" attrs of
+            Just valueThunk -> pure (keyName, valueThunk)
+            Nothing -> throwEvalError "builtins.listToAttrs: element missing 'value'"
+        _ -> throwEvalError "builtins.listToAttrs: 'name' must be a string"
+    _ -> throwEvalError "builtins.listToAttrs: element must be a set"
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — attr set (arity 2)
+-- ---------------------------------------------------------------------------
+
+builtinHasAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinHasAttr (VStr key) (VAttrs attrs) =
+  pure (VBool (Map.member key attrs))
+builtinHasAttr (VStr _) other =
+  throwEvalError ("builtins.hasAttr: expected a set, got " <> typeName other)
+builtinHasAttr other _ =
+  throwEvalError ("builtins.hasAttr: expected a string, got " <> typeName other)
+
+builtinGetAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinGetAttr (VStr key) (VAttrs attrs) =
+  case Map.lookup key attrs of
+    Just thunk -> force thunk
+    Nothing -> throwEvalError ("builtins.getAttr: attribute '" <> key <> "' not found")
+builtinGetAttr (VStr _) other =
+  throwEvalError ("builtins.getAttr: expected a set, got " <> typeName other)
+builtinGetAttr other _ =
+  throwEvalError ("builtins.getAttr: expected a string, got " <> typeName other)
+
+builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinRemoveAttrs (VAttrs attrs) (VList thunks) = do
+  keys <- mapM forceToString thunks
+  pure (VAttrs (foldl' (flip Map.delete) attrs keys))
+  where
+    forceToString thunk = do
+      val <- force thunk
+      case val of
+        VStr s -> pure s
+        _ -> throwEvalError "builtins.removeAttrs: key list must contain strings"
+builtinRemoveAttrs (VAttrs _) other =
+  throwEvalError ("builtins.removeAttrs: expected a list, got " <> typeName other)
+builtinRemoveAttrs other _ =
+  throwEvalError ("builtins.removeAttrs: expected a set, got " <> typeName other)
+
+builtinIntersectAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinIntersectAttrs (VAttrs a) (VAttrs b) =
+  pure (VAttrs (Map.intersection b a))
+builtinIntersectAttrs (VAttrs _) other =
+  throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
+builtinIntersectAttrs other _ =
+  throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
+
+builtinCatAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinCatAttrs (VStr key) (VList thunks) = do
+  vals <- catAttrsCollect key thunks
+  pure (VList vals)
+builtinCatAttrs (VStr _) other =
+  throwEvalError ("builtins.catAttrs: expected a list, got " <> typeName other)
+builtinCatAttrs other _ =
+  throwEvalError ("builtins.catAttrs: expected a string, got " <> typeName other)
+
+-- | Collect values for a given key from a list of attrsets.
+catAttrsCollect :: (MonadEval m) => Text -> [Thunk] -> m [Thunk]
+catAttrsCollect _ [] = pure []
+catAttrsCollect key (thunk : rest) = do
+  val <- force thunk
+  case val of
+    VAttrs attrs ->
+      case Map.lookup key attrs of
+        Just found -> (found :) <$> catAttrsCollect key rest
+        Nothing -> catAttrsCollect key rest
+    _ -> throwEvalError "builtins.catAttrs: list element must be a set"
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — list higher-order (arity 2)
+-- ---------------------------------------------------------------------------
+
+builtinMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinMap func (VList thunks) = do
+  mapped <- mapM (applyToThunk func) thunks
+  pure (VList (map evaluated mapped))
+builtinMap _ other =
+  throwEvalError ("builtins.map: expected a list, got " <> typeName other)
+
+builtinFilter :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinFilter predFn (VList thunks) = do
+  filtered <- filterThunks predFn thunks
+  pure (VList filtered)
+builtinFilter _ other =
+  throwEvalError ("builtins.filter: expected a list, got " <> typeName other)
+
+filterThunks :: (MonadEval m) => NixValue -> [Thunk] -> m [Thunk]
+filterThunks _ [] = pure []
+filterThunks predFn (thunk : rest) = do
+  val <- force thunk
+  result <- applyValue predFn val
+  case result of
+    VBool True -> (thunk :) <$> filterThunks predFn rest
+    VBool False -> filterThunks predFn rest
+    _ -> throwEvalError "builtins.filter: predicate must return a bool"
+
+builtinGenList :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinGenList func (VInt n)
+  | n < 0 = throwEvalError "builtins.genList: length must be non-negative"
+  | otherwise = do
+      vals <- mapM (applyValue func . VInt) [0 .. n - 1]
+      pure (VList (map evaluated vals))
+builtinGenList _ other =
+  throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
+
+builtinSort :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinSort comparator (VList thunks) = do
+  vals <- mapM force thunks
+  sorted <- insertionSort comparator vals
+  pure (VList (map evaluated sorted))
+builtinSort _ other =
+  throwEvalError ("builtins.sort: expected a list, got " <> typeName other)
+
+-- | Stable insertion sort using a user-supplied comparator.
+-- The comparator takes two args (curried) and returns bool.
+insertionSort :: (MonadEval m) => NixValue -> [NixValue] -> m [NixValue]
+insertionSort _ [] = pure []
+insertionSort cmp (x : xs) = do
+  sorted <- insertionSort cmp xs
+  insertSorted cmp x sorted
+
+insertSorted :: (MonadEval m) => NixValue -> NixValue -> [NixValue] -> m [NixValue]
+insertSorted _ val [] = pure [val]
+insertSorted cmp val (y : ys) = do
+  partial <- applyValue cmp val
+  result <- applyValue partial y
+  case result of
+    VBool True -> pure (val : y : ys)
+    VBool False -> (y :) <$> insertSorted cmp val ys
+    _ -> throwEvalError "builtins.sort: comparator must return a bool"
+
+builtinConcatMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinConcatMap func (VList thunks) = do
+  results <- mapM (applyToThunk func) thunks
+  concatted <- mapM extractList results
+  pure (VList (concat concatted))
+builtinConcatMap _ other =
+  throwEvalError ("builtins.concatMap: expected a list, got " <> typeName other)
+
+extractList :: (MonadEval m) => NixValue -> m [Thunk]
+extractList (VList xs) = pure xs
+extractList other =
+  throwEvalError ("builtins.concatMap: function must return a list, got " <> typeName other)
+
+builtinAny :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinAny predFn (VList thunks) = do
+  result <- anyThunk predFn thunks
+  pure (VBool result)
+builtinAny _ other =
+  throwEvalError ("builtins.any: expected a list, got " <> typeName other)
+
+anyThunk :: (MonadEval m) => NixValue -> [Thunk] -> m Bool
+anyThunk _ [] = pure False
+anyThunk predFn (thunk : rest) = do
+  val <- force thunk
+  result <- applyValue predFn val
+  case result of
+    VBool True -> pure True
+    VBool False -> anyThunk predFn rest
+    _ -> throwEvalError "builtins.any: predicate must return a bool"
+
+builtinAll :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinAll predFn (VList thunks) = do
+  result <- allThunk predFn thunks
+  pure (VBool result)
+builtinAll _ other =
+  throwEvalError ("builtins.all: expected a list, got " <> typeName other)
+
+allThunk :: (MonadEval m) => NixValue -> [Thunk] -> m Bool
+allThunk _ [] = pure True
+allThunk predFn (thunk : rest) = do
+  val <- force thunk
+  result <- applyValue predFn val
+  case result of
+    VBool True -> allThunk predFn rest
+    VBool False -> pure False
+    _ -> throwEvalError "builtins.all: predicate must return a bool"
+
+builtinElem :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinElem needle (VList thunks) = do
+  found <- elemCheck needle thunks
+  pure (VBool found)
+builtinElem _ other =
+  throwEvalError ("builtins.elem: expected a list, got " <> typeName other)
+
+elemCheck :: (MonadEval m) => NixValue -> [Thunk] -> m Bool
+elemCheck _ [] = pure False
+elemCheck needle (thunk : rest) = do
+  val <- force thunk
+  eq <- nixEqual force needle val
+  if eq then pure True else elemCheck needle rest
+
+builtinElemAt :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinElemAt (VList thunks) (VInt idx)
+  | idx < 0 || idx >= fromIntegral (length thunks) =
+      throwEvalError
+        ( "builtins.elemAt: index "
+            <> T.pack (show idx)
+            <> " out of bounds for list of length "
+            <> T.pack (show (length thunks))
+        )
+  | otherwise = case drop (fromIntegral idx) thunks of
+      (t : _) -> force t
+      [] -> throwEvalError "builtins.elemAt: index out of bounds"
+builtinElemAt (VList _) other =
+  throwEvalError ("builtins.elemAt: expected an integer, got " <> typeName other)
+builtinElemAt other _ =
+  throwEvalError ("builtins.elemAt: expected a list, got " <> typeName other)
+
+builtinPartition :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinPartition predFn (VList thunks) = do
+  (rightThunks, wrongThunks) <- partitionThunks predFn thunks
+  pure
+    ( VAttrs
+        ( Map.fromList
+            [ ("right", evaluated (VList rightThunks)),
+              ("wrong", evaluated (VList wrongThunks))
+            ]
+        )
+    )
+builtinPartition _ other =
+  throwEvalError ("builtins.partition: expected a list, got " <> typeName other)
+
+partitionThunks :: (MonadEval m) => NixValue -> [Thunk] -> m ([Thunk], [Thunk])
+partitionThunks _ [] = pure ([], [])
+partitionThunks predFn (thunk : rest) = do
+  val <- force thunk
+  result <- applyValue predFn val
+  (rs, ws) <- partitionThunks predFn rest
+  case result of
+    VBool True -> pure (thunk : rs, ws)
+    VBool False -> pure (rs, thunk : ws)
+    _ -> throwEvalError "builtins.partition: predicate must return a bool"
+
+builtinGroupBy :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinGroupBy func (VList thunks) = do
+  groups <- groupByCollect func thunks Map.empty
+  pure (VAttrs (Map.map (evaluated . VList . reverse) groups))
+builtinGroupBy _ other =
+  throwEvalError ("builtins.groupBy: expected a list, got " <> typeName other)
+
+groupByCollect ::
+  (MonadEval m) =>
+  NixValue ->
+  [Thunk] ->
+  Map Text [Thunk] ->
+  m (Map Text [Thunk])
+groupByCollect _ [] acc = pure acc
+groupByCollect func (thunk : rest) acc = do
+  val <- force thunk
+  result <- applyValue func val
+  case result of
+    VStr key ->
+      groupByCollect func rest (Map.insertWith (++) key [thunk] acc)
+    _ -> throwEvalError "builtins.groupBy: function must return a string"
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — string (arity 2)
+-- ---------------------------------------------------------------------------
+
+builtinConcatStringsSep :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinConcatStringsSep (VStr sep) (VList thunks) = do
+  strs <- mapM forceToStr thunks
+  pure (VStr (T.intercalate sep strs))
+  where
+    forceToStr thunk = do
+      val <- force thunk
+      case val of
+        VStr s -> pure s
+        _ -> throwEvalError "builtins.concatStringsSep: list elements must be strings"
+builtinConcatStringsSep (VStr _) other =
+  throwEvalError ("builtins.concatStringsSep: expected a list, got " <> typeName other)
+builtinConcatStringsSep other _ =
+  throwEvalError ("builtins.concatStringsSep: expected a string, got " <> typeName other)
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — arity 3
+-- ---------------------------------------------------------------------------
+
+builtinFoldl :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
+builtinFoldl op initial (VList thunks) =
+  foldlStrict op initial thunks
+builtinFoldl _ _ other =
+  throwEvalError ("builtins.foldl': expected a list, got " <> typeName other)
+
+-- | Strict left fold: apply @op acc elem@ for each element.
+-- @op@ is curried so we call @applyValue op acc@ then @applyValue partial elem@.
+foldlStrict :: (MonadEval m) => NixValue -> NixValue -> [Thunk] -> m NixValue
+foldlStrict _ acc [] = pure acc
+foldlStrict op acc (thunk : rest) = do
+  val <- force thunk
+  partial <- applyValue op acc
+  stepped <- applyValue partial val
+  foldlStrict op stepped rest
+
+builtinSubstring :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
+builtinSubstring (VInt start) (VInt len) (VStr s) =
+  let clampedStart = max 0 (fromIntegral start)
+      -- Nix clamps len to available length (negative len means rest of string)
+      available = T.length s - clampedStart
+      clampedLen =
+        if len < 0
+          then available
+          else min (fromIntegral len) available
+   in pure (VStr (T.take clampedLen (T.drop clampedStart s)))
+builtinSubstring _ _ (VStr _) =
+  throwEvalError "builtins.substring: start and length must be integers"
+builtinSubstring _ _ other =
+  throwEvalError ("builtins.substring: expected a string, got " <> typeName other)
+
+-- ---------------------------------------------------------------------------
+-- Builtin helpers
+-- ---------------------------------------------------------------------------
+
+-- | Apply a function to a forced thunk.
+applyToThunk :: (MonadEval m) => NixValue -> Thunk -> m NixValue
+applyToThunk func thunk = do
+  val <- force thunk
+  applyValue func val
 
 -- | The current system platform string.
 currentSystemStr :: Text
@@ -490,3 +1055,580 @@ currentSystemStr = case (System.Info.arch, System.Info.os) of
   ("aarch64", "linux") -> "aarch64-linux"
   ("x86_64", "linux") -> "x86_64-linux"
   (arch, os) -> T.pack arch <> "-" <> T.pack os
+
+-- ---------------------------------------------------------------------------
+-- Batch 1: Trivial pure builtins
+-- ---------------------------------------------------------------------------
+
+isPathVal :: NixValue -> Bool
+isPathVal (VPath _) = True
+isPathVal _ = False
+
+builtinCeil :: (MonadEval m) => NixValue -> m NixValue
+builtinCeil (VFloat f) = pure (VInt (ceiling f))
+builtinCeil (VInt n) = pure (VInt n)
+builtinCeil other = throwEvalError ("builtins.ceil: expected a number, got " <> typeName other)
+
+builtinFloor :: (MonadEval m) => NixValue -> m NixValue
+builtinFloor (VFloat f) = pure (VInt (floor f))
+builtinFloor (VInt n) = pure (VInt n)
+builtinFloor other = throwEvalError ("builtins.floor: expected a number, got " <> typeName other)
+
+builtinDiscardContext :: (MonadEval m) => NixValue -> m NixValue
+builtinDiscardContext (VStr s) = pure (VStr s)
+builtinDiscardContext other =
+  throwEvalError ("builtins.unsafeDiscardStringContext: expected a string, got " <> typeName other)
+
+builtinBaseNameOf :: (MonadEval m) => NixValue -> m NixValue
+builtinBaseNameOf (VStr s) = pure (VStr (lastComponent s))
+builtinBaseNameOf (VPath p) = pure (VStr (lastComponent p))
+builtinBaseNameOf other =
+  throwEvalError ("builtins.baseNameOf: expected a string or path, got " <> typeName other)
+
+lastComponent :: Text -> Text
+lastComponent t = case T.splitOn "/" t of
+  [] -> t
+  parts -> case filter (not . T.null) parts of
+    [] -> ""
+    xs -> last xs
+
+builtinDirOf :: (MonadEval m) => NixValue -> m NixValue
+builtinDirOf (VStr s) = pure (VStr (dirComponent s))
+builtinDirOf (VPath p) = pure (VPath (dirComponent p))
+builtinDirOf other =
+  throwEvalError ("builtins.dirOf: expected a string or path, got " <> typeName other)
+
+dirComponent :: Text -> Text
+dirComponent t =
+  let idx = T.findIndex (== '/') (T.reverse t)
+   in case idx of
+        Nothing -> "."
+        Just n -> T.take (T.length t - n - 1) t
+
+builtinConcatLists :: (MonadEval m) => NixValue -> m NixValue
+builtinConcatLists (VList thunks) = do
+  sublists <- mapM forceThenExtractList thunks
+  pure (VList (concat sublists))
+  where
+    forceThenExtractList thunk = do
+      val <- force thunk
+      case val of
+        VList xs -> pure xs
+        _ -> throwEvalError "builtins.concatLists: element must be a list"
+builtinConcatLists other =
+  throwEvalError ("builtins.concatLists: expected a list, got " <> typeName other)
+
+builtinLessThan :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinLessThan a b = VBool <$> nixCompare a b
+
+-- ---------------------------------------------------------------------------
+-- Batch 2: Arithmetic + bitwise builtins
+-- ---------------------------------------------------------------------------
+
+builtinAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinAdd (VInt a) (VInt b) = pure (VInt (a + b))
+builtinAdd (VInt a) (VFloat b) = pure (VFloat (fromInteger a + b))
+builtinAdd (VFloat a) (VInt b) = pure (VFloat (a + fromInteger b))
+builtinAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
+builtinAdd l r = throwEvalError ("builtins.add: expected numbers, got " <> typeName l <> " and " <> typeName r)
+
+builtinSub :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinSub (VInt a) (VInt b) = pure (VInt (a - b))
+builtinSub (VInt a) (VFloat b) = pure (VFloat (fromInteger a - b))
+builtinSub (VFloat a) (VInt b) = pure (VFloat (a - fromInteger b))
+builtinSub (VFloat a) (VFloat b) = pure (VFloat (a - b))
+builtinSub l r = throwEvalError ("builtins.sub: expected numbers, got " <> typeName l <> " and " <> typeName r)
+
+builtinMul :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinMul (VInt a) (VInt b) = pure (VInt (a * b))
+builtinMul (VInt a) (VFloat b) = pure (VFloat (fromInteger a * b))
+builtinMul (VFloat a) (VInt b) = pure (VFloat (a * fromInteger b))
+builtinMul (VFloat a) (VFloat b) = pure (VFloat (a * b))
+builtinMul l r = throwEvalError ("builtins.mul: expected numbers, got " <> typeName l <> " and " <> typeName r)
+
+builtinBuiltinDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinBuiltinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
+builtinBuiltinDiv (VInt a) (VInt b) = pure (VInt (quot a b))
+builtinBuiltinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
+builtinBuiltinDiv (VInt a) (VFloat b) = pure (VFloat (fromInteger a / b))
+builtinBuiltinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromInteger b))
+builtinBuiltinDiv (VFloat a) (VFloat b) = pure (VFloat (a / b))
+builtinBuiltinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeName l <> " and " <> typeName r)
+
+builtinBitAnd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinBitAnd (VInt a) (VInt b) = pure (VInt (a .&. b))
+builtinBitAnd _ _ = throwEvalError "builtins.bitAnd: expected two integers"
+
+builtinBitOr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinBitOr (VInt a) (VInt b) = pure (VInt (a .|. b))
+builtinBitOr _ _ = throwEvalError "builtins.bitOr: expected two integers"
+
+builtinBitXor :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinBitXor (VInt a) (VInt b) = pure (VInt (xor a b))
+builtinBitXor _ _ = throwEvalError "builtins.bitXor: expected two integers"
+
+-- ---------------------------------------------------------------------------
+-- Batch 3: Attrset higher-order builtins
+-- ---------------------------------------------------------------------------
+
+builtinMapAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinMapAttrs func (VAttrs attrs) = do
+  mapped <- mapM (mapAttrEntry func) (Map.toList attrs)
+  pure (VAttrs (Map.fromList mapped))
+  where
+    mapAttrEntry fn (key, thunk) = do
+      val <- force thunk
+      partial <- applyValue fn (VStr key)
+      result <- applyValue partial val
+      pure (key, evaluated result)
+builtinMapAttrs _ other =
+  throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
+
+builtinFunctionArgs :: (MonadEval m) => NixValue -> m NixValue
+builtinFunctionArgs (VLambda _ formals _) = pure (formalsToAttrs formals)
+builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs Map.empty)
+builtinFunctionArgs other =
+  throwEvalError ("builtins.functionArgs: expected a function, got " <> typeName other)
+
+formalsToAttrs :: Formals -> NixValue
+formalsToAttrs (FormalName _) = VAttrs Map.empty
+formalsToAttrs (FormalSet formals _) = formalsListToAttrs formals
+formalsToAttrs (FormalNamedSet _ formals _) = formalsListToAttrs formals
+
+formalsListToAttrs :: [Formal] -> NixValue
+formalsListToAttrs formals =
+  VAttrs $
+    Map.fromList
+      [(fName f, evaluated (VBool (isJust (fDefault f)))) | f <- formals]
+
+builtinZipAttrsWith :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinZipAttrsWith func (VList thunks) = do
+  attrSets <- mapM forceToAttrSet thunks
+  let merged = mergeAllAttrs attrSets
+  resultPairs <- mapM (applyZip func) (Map.toList merged)
+  pure (VAttrs (Map.fromList resultPairs))
+  where
+    forceToAttrSet thunk = do
+      val <- force thunk
+      case val of
+        VAttrs attrs -> pure attrs
+        _ -> throwEvalError "builtins.zipAttrsWith: list element must be a set"
+    mergeAllAttrs = foldl' (\acc attrs -> Map.unionWith (++) acc (Map.map (: []) attrs)) Map.empty
+    applyZip fn (key, thunkList) = do
+      partial <- applyValue fn (VStr key)
+      result <- applyValue partial (VList thunkList)
+      pure (key, evaluated result)
+builtinZipAttrsWith _ other =
+  throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
+
+-- ---------------------------------------------------------------------------
+-- Batch 4: String operations
+-- ---------------------------------------------------------------------------
+
+builtinReplaceStrings ::
+  (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
+builtinReplaceStrings (VList fromThunks) (VList toThunks) (VStr input) = do
+  froms <- mapM forceStr fromThunks
+  tos <- mapM forceStr toThunks
+  when (length froms /= length tos) $
+    throwEvalError "builtins.replaceStrings: 'from' and 'to' must have the same length"
+  let pairs = zip froms tos
+  pure (VStr (replaceAll pairs input))
+  where
+    forceStr thunk = do
+      val <- force thunk
+      case val of
+        VStr s -> pure s
+        _ -> throwEvalError "builtins.replaceStrings: elements must be strings"
+builtinReplaceStrings _ _ (VStr _) =
+  throwEvalError "builtins.replaceStrings: first two arguments must be lists"
+builtinReplaceStrings _ _ other =
+  throwEvalError ("builtins.replaceStrings: expected a string, got " <> typeName other)
+
+replaceAll :: [(Text, Text)] -> Text -> Text
+replaceAll pairs = go
+  where
+    go remaining
+      | T.null remaining =
+          -- At end of string, still check for empty-from match
+          case findMatch pairs remaining of
+            Just (replacement, _, _) -> replacement
+            Nothing -> ""
+      | otherwise = case findMatch pairs remaining of
+          Just (replacement, rest, matched) ->
+            if T.null matched
+              then -- empty-from: insert replacement then advance 1 char
+                replacement <> T.singleton (T.head remaining) <> go (T.tail remaining)
+              else replacement <> go rest
+          Nothing -> T.singleton (T.head remaining) <> go (T.tail remaining)
+    findMatch [] _ = Nothing
+    findMatch ((from, to) : rest) txt
+      | T.null from = Just (to, txt, from)
+      | Just suffix <- T.stripPrefix from txt = Just (to, suffix, from)
+      | otherwise = findMatch rest txt
+
+builtinCompareVersions :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinCompareVersions (VStr a) (VStr b) =
+  pure (VInt (compareVersionParts (splitVersionStr a) (splitVersionStr b)))
+builtinCompareVersions _ _ = throwEvalError "builtins.compareVersions: expected two strings"
+
+compareVersionParts :: [Text] -> [Text] -> Integer
+compareVersionParts [] [] = 0
+compareVersionParts [] (_ : _) = -1
+compareVersionParts (_ : _) [] = 1
+compareVersionParts (a : as) (b : bs) =
+  case compareComponent a b of
+    0 -> compareVersionParts as bs
+    n -> n
+
+compareComponent :: Text -> Text -> Integer
+compareComponent a b
+  | a == b = 0
+  | allDigits a && allDigits b = compare' (readInt a) (readInt b)
+  | a == "" = -1
+  | b == "" = 1
+  | otherwise = if a < b then -1 else 1
+  where
+    allDigits t = not (T.null t) && T.all isDigit t
+    readInt t = read (T.unpack t) :: Integer
+    compare' x y
+      | x < y = -1
+      | x > y = 1
+      | otherwise = 0
+
+splitVersionStr :: Text -> [Text]
+splitVersionStr t
+  | T.null t = []
+  | otherwise =
+      let (component, rest) = spanComponent t
+       in component : splitVersionAfterComponent rest
+
+splitVersionAfterComponent :: Text -> [Text]
+splitVersionAfterComponent t
+  | T.null t = []
+  | T.head t == '.' = splitVersionStr (T.tail t)
+  | otherwise = splitVersionStr t
+
+spanComponent :: Text -> (Text, Text)
+spanComponent t
+  | T.null t = ("", "")
+  | isDigit (T.head t) = T.span isDigit t
+  | isAlpha (T.head t) = T.span isAlpha t
+  | otherwise = (T.singleton (T.head t), T.tail t)
+
+builtinSplitVersion :: (MonadEval m) => NixValue -> m NixValue
+builtinSplitVersion (VStr s) =
+  pure (VList (map (evaluated . VStr) (splitVersionComponents s)))
+builtinSplitVersion other =
+  throwEvalError ("builtins.splitVersion: expected a string, got " <> typeName other)
+
+splitVersionComponents :: Text -> [Text]
+splitVersionComponents t
+  | T.null t = []
+  | T.head t == '.' = "." : splitVersionComponents (T.tail t)
+  | isDigit (T.head t) =
+      let (digits, rest) = T.span isDigit t
+       in digits : splitVersionComponents rest
+  | otherwise =
+      let (alpha, rest) = T.span isAlpha t
+       in alpha : splitVersionComponents rest
+
+builtinParseDrvName :: (MonadEval m) => NixValue -> m NixValue
+builtinParseDrvName (VStr s) =
+  let (name, version) = parseName s
+   in pure
+        ( VAttrs
+            ( Map.fromList
+                [ ("name", evaluated (VStr name)),
+                  ("version", evaluated (VStr version))
+                ]
+            )
+        )
+builtinParseDrvName other =
+  throwEvalError ("builtins.parseDrvName: expected a string, got " <> typeName other)
+
+parseName :: Text -> (Text, Text)
+parseName t =
+  case findVersionDash t 0 of
+    Nothing -> (t, "")
+    Just idx -> (T.take idx t, T.drop (idx + 1) t)
+
+findVersionDash :: Text -> Int -> Maybe Int
+findVersionDash t idx
+  | idx >= T.length t = Nothing
+  | T.index t idx == '-'
+      && idx + 1 < T.length t
+      && isDigit (T.index t (idx + 1)) =
+      Just idx
+  | otherwise = findVersionDash t (idx + 1)
+
+-- ---------------------------------------------------------------------------
+-- Batch 5: Serialization + hashing
+-- ---------------------------------------------------------------------------
+
+builtinToJSON :: (MonadEval m) => NixValue -> m NixValue
+builtinToJSON val = VStr <$> valueToJSON val
+
+valueToJSON :: (MonadEval m) => NixValue -> m Text
+valueToJSON VNull = pure "null"
+valueToJSON (VBool True) = pure "true"
+valueToJSON (VBool False) = pure "false"
+valueToJSON (VInt n) = pure (T.pack (show n))
+valueToJSON (VFloat f) =
+  let s = show f
+   in -- Nix outputs 1e+40 style, Haskell outputs 1.0e40 style
+      -- For simple cases just use show
+      pure (T.pack s)
+valueToJSON (VStr s) = pure (jsonEscapeString s)
+valueToJSON (VList thunks) = do
+  vals <- mapM force thunks
+  jsonVals <- mapM valueToJSON vals
+  pure ("[" <> T.intercalate "," jsonVals <> "]")
+valueToJSON (VAttrs attrs) = do
+  let sortedKeys = Map.keys attrs
+  pairs <- mapM (jsonPair attrs) sortedKeys
+  pure ("{" <> T.intercalate "," pairs <> "}")
+  where
+    jsonPair attrMap key = do
+      val <- force (attrMap Map.! key)
+      jsonVal <- valueToJSON val
+      pure (jsonEscapeString key <> ":" <> jsonVal)
+valueToJSON (VPath p) = pure (jsonEscapeString p)
+valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
+valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
+valueToJSON (VDerivation _) = throwEvalError "builtins.toJSON: cannot convert a derivation to JSON"
+
+jsonEscapeString :: Text -> Text
+jsonEscapeString s = "\"" <> T.concatMap escapeChar s <> "\""
+  where
+    escapeChar '"' = "\\\""
+    escapeChar '\\' = "\\\\"
+    escapeChar '\n' = "\\n"
+    escapeChar '\r' = "\\r"
+    escapeChar '\t' = "\\t"
+    escapeChar c
+      | ord c < 0x20 = "\\u" <> T.pack (padHex 4 (showHex' (ord c)))
+      | otherwise = T.singleton c
+    padHex n str = replicate (n - length str) '0' ++ str
+    showHex' 0 = "0"
+    showHex' num = go num ""
+      where
+        go 0 acc = acc
+        go v acc =
+          let (q, r) = quotRem v 16
+              hexChar = "0123456789abcdef" !! r
+           in go q (hexChar : acc)
+
+builtinFromJSON :: (MonadEval m) => NixValue -> m NixValue
+builtinFromJSON (VStr s) = case parseJSON (T.strip s) of
+  Just (val, rest)
+    | T.null (T.strip rest) -> pure val
+    | otherwise -> throwEvalError "builtins.fromJSON: trailing content after JSON value"
+  Nothing -> throwEvalError "builtins.fromJSON: invalid JSON"
+builtinFromJSON other =
+  throwEvalError ("builtins.fromJSON: expected a string, got " <> typeName other)
+
+parseJSON :: Text -> Maybe (NixValue, Text)
+parseJSON t = case T.uncons (T.stripStart t) of
+  Nothing -> Nothing
+  Just ('n', rest)
+    | Just suffix <- T.stripPrefix "ull" rest -> Just (VNull, suffix)
+  Just ('t', rest)
+    | Just suffix <- T.stripPrefix "rue" rest -> Just (VBool True, suffix)
+  Just ('f', rest)
+    | Just suffix <- T.stripPrefix "alse" rest -> Just (VBool False, suffix)
+  Just ('"', _) -> parseJSONString (T.stripStart t)
+  Just ('[', rest) -> parseJSONArray rest
+  Just ('{', rest) -> parseJSONObject rest
+  Just (c, _)
+    | c == '-' || isDigit c -> parseJSONNumber (T.stripStart t)
+  _ -> Nothing
+
+parseJSONString :: Text -> Maybe (NixValue, Text)
+parseJSONString t = case T.uncons t of
+  Just ('"', rest) ->
+    let (strVal, remaining) = parseJSONStringContent rest ""
+     in Just (VStr strVal, remaining)
+  _ -> Nothing
+
+parseJSONStringContent :: Text -> Text -> (Text, Text)
+parseJSONStringContent t acc = case T.uncons t of
+  Nothing -> (acc, "")
+  Just ('"', rest) -> (acc, rest)
+  Just ('\\', rest) -> case T.uncons rest of
+    Just ('"', r) -> parseJSONStringContent r (acc <> "\"")
+    Just ('\\', r) -> parseJSONStringContent r (acc <> "\\")
+    Just ('/', r) -> parseJSONStringContent r (acc <> "/")
+    Just ('n', r) -> parseJSONStringContent r (acc <> "\n")
+    Just ('r', r) -> parseJSONStringContent r (acc <> "\r")
+    Just ('t', r) -> parseJSONStringContent r (acc <> "\t")
+    Just ('u', r) -> case parseHex4 r of
+      Just (codepoint, r2) ->
+        parseJSONStringContent r2 (acc <> T.singleton (chr codepoint))
+      Nothing -> parseJSONStringContent r (acc <> "u")
+    _ -> (acc, rest)
+  Just (c, rest) -> parseJSONStringContent rest (acc <> T.singleton c)
+
+parseHex4 :: Text -> Maybe (Int, Text)
+parseHex4 t
+  | T.length t >= 4 =
+      let hex = T.take 4 t
+       in if T.all isHexDigit hex
+            then Just (readHex4 hex, T.drop 4 t)
+            else Nothing
+  | otherwise = Nothing
+
+readHex4 :: Text -> Int
+readHex4 = T.foldl' (\acc c -> acc * 16 + digitToInt c) 0
+
+parseJSONNumber :: Text -> Maybe (NixValue, Text)
+parseJSONNumber t =
+  let (numStr, rest) = T.span (\c -> isDigit c || c == '.' || c == '-' || c == 'e' || c == 'E' || c == '+') t
+   in if T.null numStr
+        then Nothing
+        else
+          if T.any (\c -> c == '.' || c == 'e' || c == 'E') numStr
+            then case reads (T.unpack numStr) :: [(Double, String)] of
+              [(d, "")] -> Just (VFloat d, rest)
+              _ -> Nothing
+            else case reads (T.unpack numStr) :: [(Integer, String)] of
+              [(n, "")] -> Just (VInt n, rest)
+              _ -> Nothing
+
+parseJSONArray :: Text -> Maybe (NixValue, Text)
+parseJSONArray t = parseJSONArrayElements (T.stripStart t) []
+
+parseJSONArrayElements :: Text -> [Thunk] -> Maybe (NixValue, Text)
+parseJSONArrayElements t acc = case T.uncons (T.stripStart t) of
+  Just (']', rest) -> Just (VList (reverse acc), rest)
+  _ -> case parseJSON t of
+    Just (val, rest) ->
+      let stripped = T.stripStart rest
+       in case T.uncons stripped of
+            Just (',', rest2) -> parseJSONArrayElements rest2 (evaluated val : acc)
+            Just (']', rest2) -> Just (VList (reverse (evaluated val : acc)), rest2)
+            _ -> Nothing
+    Nothing -> Nothing
+
+parseJSONObject :: Text -> Maybe (NixValue, Text)
+parseJSONObject t = parseJSONObjectEntries (T.stripStart t) Map.empty
+
+parseJSONObjectEntries :: Text -> Map Text Thunk -> Maybe (NixValue, Text)
+parseJSONObjectEntries t acc = case T.uncons (T.stripStart t) of
+  Just ('}', rest) -> Just (VAttrs acc, rest)
+  _ -> case parseJSONString (T.stripStart t) of
+    Just (VStr key, rest) -> case T.uncons (T.stripStart rest) of
+      Just (':', rest2) -> case parseJSON rest2 of
+        Just (val, rest3) ->
+          let stripped = T.stripStart rest3
+              updated = Map.insert key (evaluated val) acc
+           in case T.uncons stripped of
+                Just (',', rest4) -> parseJSONObjectEntries rest4 updated
+                Just ('}', rest4) -> Just (VAttrs updated, rest4)
+                _ -> Nothing
+        Nothing -> Nothing
+      _ -> Nothing
+    _ -> Nothing
+
+builtinHashString :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinHashString (VStr algo) (VStr input) =
+  let inputBytes = TE.encodeUtf8 input
+   in case algo of
+        "sha256" ->
+          let digest = CH.hash inputBytes :: CH.Digest CH.SHA256
+           in pure (VStr (digestToHex digest))
+        "sha512" ->
+          let digest = CH.hash inputBytes :: CH.Digest CH.SHA512
+           in pure (VStr (digestToHex digest))
+        "sha1" ->
+          let digest = CH.hash inputBytes :: CH.Digest CH.SHA1
+           in pure (VStr (digestToHex digest))
+        "md5" ->
+          let digest = CH.hash inputBytes :: CH.Digest CH.MD5
+           in pure (VStr (digestToHex digest))
+        _ -> throwEvalError ("builtins.hashString: unknown hash algorithm '" <> algo <> "'")
+builtinHashString (VStr _) other =
+  throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
+builtinHashString other _ =
+  throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
+
+digestToHex :: (BA.ByteArrayAccess a) => a -> Text
+digestToHex digest =
+  let bytes = BA.unpack digest
+   in T.pack (concatMap byteToHex bytes)
+
+byteToHex :: Word8 -> String
+byteToHex w =
+  let (hi, lo) = quotRem (fromIntegral w :: Int) 16
+      hexDigit n = "0123456789abcdef" !! n
+   in [hexDigit hi, hexDigit lo]
+
+-- ---------------------------------------------------------------------------
+-- Batch 6: deepSeq
+-- ---------------------------------------------------------------------------
+
+builtinDeepSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinDeepSeq first second = do
+  deepForce first
+  pure second
+
+deepForce :: (MonadEval m) => NixValue -> m ()
+deepForce (VList thunks) = mapM_ (force >=> deepForce) thunks
+deepForce (VAttrs attrs) = mapM_ (force >=> deepForce) (Map.elems attrs)
+deepForce _ = pure ()
+
+-- ---------------------------------------------------------------------------
+-- Batch 7: genericClosure
+-- ---------------------------------------------------------------------------
+
+builtinGenericClosure :: (MonadEval m) => NixValue -> m NixValue
+builtinGenericClosure (VAttrs attrs) = do
+  startSetThunk <-
+    maybe (throwEvalError "builtins.genericClosure: missing 'startSet'") pure $
+      Map.lookup "startSet" attrs
+  operatorThunk <-
+    maybe (throwEvalError "builtins.genericClosure: missing 'operator'") pure $
+      Map.lookup "operator" attrs
+  startSetVal <- force startSetThunk
+  operatorVal <- force operatorThunk
+  case startSetVal of
+    VList items -> do
+      result <- closureLoop operatorVal items [] []
+      pure (VList (map evaluated result))
+    _ -> throwEvalError "builtins.genericClosure: 'startSet' must be a list"
+builtinGenericClosure other =
+  throwEvalError ("builtins.genericClosure: expected a set, got " <> typeName other)
+
+closureLoop ::
+  (MonadEval m) =>
+  NixValue ->
+  [Thunk] ->
+  [NixValue] ->
+  [NixValue] ->
+  m [NixValue]
+closureLoop _ [] _ acc = pure (reverse acc)
+closureLoop operator (thunk : rest) seenKeys acc = do
+  item <- force thunk
+  key <- extractKey item
+  alreadySeen <- keyInList key seenKeys
+  if alreadySeen
+    then closureLoop operator rest seenKeys acc
+    else do
+      newItems <- applyValue operator item
+      case newItems of
+        VList newThunks ->
+          closureLoop operator (rest ++ newThunks) (key : seenKeys) (item : acc)
+        _ -> throwEvalError "builtins.genericClosure: operator must return a list"
+
+extractKey :: (MonadEval m) => NixValue -> m NixValue
+extractKey (VAttrs attrs) =
+  case Map.lookup "key" attrs of
+    Just thunk -> force thunk
+    Nothing -> throwEvalError "builtins.genericClosure: item missing 'key' attribute"
+extractKey _ = throwEvalError "builtins.genericClosure: item must be a set with 'key'"
+
+keyInList :: (MonadEval m) => NixValue -> [NixValue] -> m Bool
+keyInList _ [] = pure False
+keyInList key (seen : rest) = do
+  eq <- nixEqual force key seen
+  if eq then pure True else keyInList key rest

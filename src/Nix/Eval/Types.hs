@@ -1,3 +1,5 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+
 -- | Shared types for the Nix evaluator.
 --
 -- Extracted into its own module so that 'Nix.Eval.Operator',
@@ -22,6 +24,10 @@ module Nix.Eval.Types
 
     -- * Display
     typeName,
+
+    -- * Evaluation monad
+    MonadEval (..),
+    PureEval (..),
   )
 where
 
@@ -71,7 +77,8 @@ data NixValue
   | -- | A realized derivation (build recipe).
     VDerivation !Derivation
   | -- | Built-in function, dispatched by name.
-    VBuiltin !Text
+    -- Accumulated args support curried partial application.
+    VBuiltin !Text ![NixValue]
   deriving (Eq, Show)
 
 -- | Evaluation environment.
@@ -141,4 +148,31 @@ typeName val = case val of
   VAttrs _ -> "a set"
   VLambda {} -> "a function"
   VDerivation _ -> "a derivation"
-  VBuiltin _ -> "a built-in function"
+  VBuiltin _ _ -> "a built-in function"
+
+-- ---------------------------------------------------------------------------
+-- Evaluation monad
+-- ---------------------------------------------------------------------------
+
+-- | Effect class for Nix evaluation.  Core logic is polymorphic in @m@
+-- so the same evaluator composes into 'PureEval' for tests or @IO@ for
+-- real file-system access (e.g. @import@, @readFile@).
+class (Monad m) => MonadEval m where
+  throwEvalError :: Text -> m a
+  catchEvalError :: m a -> m (Either Text a)
+  readFileText :: Text -> m Text
+  doesPathExist :: Text -> m Bool
+  listDirectory :: Text -> m [Text]
+
+-- | Pure evaluation monad — wraps 'Either Text'.
+-- IO builtins ('readFile', 'import') are unavailable;
+-- everything else evaluates identically to the IO version.
+newtype PureEval a = PureEval {runPureEval :: Either Text a}
+  deriving (Functor, Applicative, Monad)
+
+instance MonadEval PureEval where
+  throwEvalError msg = PureEval (Left msg)
+  catchEvalError (PureEval action) = PureEval (Right action)
+  readFileText _ = throwEvalError "readFile: not available in pure evaluation"
+  doesPathExist _ = pure False
+  listDirectory _ = throwEvalError "readDir: not available in pure evaluation"
