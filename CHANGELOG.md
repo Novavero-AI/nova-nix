@@ -2,6 +2,20 @@
 
 ## 0.1.0.0 — 2026-02-23
 
+### Phase 3: String Contexts + Dependency Resolution + Substituter
+
+- String context tracking on all `VStr` values: `SCPlain`, `SCDrvOutput`, `SCAllOutputs`
+- Context propagation through interpolation, string concatenation, `replaceStrings`, `substring`, `concatStringsSep`, and all string builtins
+- `Nix.Eval.Context` module: pure helpers for context construction, queries, and extraction
+- `derivation` builtin now collects string contexts into `drvInputDrvs` and `drvInputSrcs`
+- New builtins: `hasContext`, `getContext`, `appendContext`
+- `Nix.DependencyGraph`: BFS graph construction with `Data.Sequence` (O(V+E)), topological sort via Kahn's algorithm, cycle detection
+- `Nix.Substituter`: full HTTP binary cache protocol — narinfo fetch/parse, Ed25519 signature verification, NAR download/decompress/unpack, store DB registration, priority-ordered multi-cache
+- `Nix.Builder.buildWithDeps`: recursive dependency resolution — topo sort, cache check, binary substitution, local build fallback
+- CLI `nova-nix build` now builds full dependency trees, not just single derivations
+- Cleanup pass: eliminated all partial functions (`T.head`/`T.tail` to `T.uncons`, `!!` to safe lookup, `last` to pattern match), flattened deeply nested code into composed functions, `Data.Sequence` BFS queues throughout, semantic section organization
+- 494 tests (68 new: string context, context propagation, dependency graph, substituter, build orchestrator)
+
 ### Phase 2: Store + Builder
 
 - Real SQLite-backed store database (`ValidPaths` + `Refs` tables, WAL mode)
