@@ -38,6 +38,10 @@ module Nix.Store.Path
     -- * Store paths
     StorePath (..),
     storePathToFilePath,
+    parseStorePath,
+
+    -- * Constants
+    storePathHashLen,
   )
 where
 
@@ -74,3 +78,25 @@ data StorePath = StorePath
 storePathToFilePath :: StoreDir -> StorePath -> FilePath
 storePathToFilePath (StoreDir dir) sp =
   dir </> T.unpack (spHash sp <> "-" <> spName sp)
+
+-- | Length of the Nix base-32 hash component in store paths (32 chars).
+storePathHashLen :: Int
+storePathHashLen = 32
+
+-- | Parse a full store path string like @\/nix\/store\/abc...-name@ into
+-- a 'StorePath'.  Returns 'Nothing' if the path doesn't match the
+-- expected format: store dir prefix + slash + 32-char hash + dash + name.
+parseStorePath :: StoreDir -> Text -> Maybe StorePath
+parseStorePath (StoreDir dir) path =
+  let prefix = T.pack dir <> "/"
+   in case T.stripPrefix prefix path of
+        Nothing -> Nothing
+        Just rest
+          | T.length rest < storePathHashLen + 2 -> Nothing -- need hash + "-" + name (at least 1 char)
+          | otherwise ->
+              let hashPart = T.take storePathHashLen rest
+                  afterHash = T.drop storePathHashLen rest
+               in case T.uncons afterHash of
+                    Just ('-', name)
+                      | not (T.null name) -> Just (StorePath hashPart name)
+                    _ -> Nothing

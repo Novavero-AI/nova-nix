@@ -247,6 +247,190 @@ escapeATerm '\r' = "\\r"
 escapeATerm '\t' = "\\t"
 escapeATerm c = T.singleton c
 
--- | Parse a .drv file from ATerm format.
+-- ---------------------------------------------------------------------------
+-- ATerm parser (hand-rolled recursive descent)
+-- ---------------------------------------------------------------------------
+
+-- | Parser state: remaining input text.
+newtype Parser a = Parser {runParser :: Text -> Either Text (a, Text)}
+
+instance Functor Parser where
+  fmap f (Parser p) = Parser $ \input -> case p input of
+    Left err -> Left err
+    Right (val, rest) -> Right (f val, rest)
+
+instance Applicative Parser where
+  pure val = Parser $ \input -> Right (val, input)
+  Parser pf <*> Parser pa = Parser $ \input -> case pf input of
+    Left err -> Left err
+    Right (f, rest) -> case pa rest of
+      Left err -> Left err
+      Right (a, rest2) -> Right (f a, rest2)
+
+instance Monad Parser where
+  Parser pa >>= f = Parser $ \input -> case pa input of
+    Left err -> Left err
+    Right (a, rest) -> runParser (f a) rest
+
+parserFail :: Text -> Parser a
+parserFail msg = Parser $ \_ -> Left msg
+
+-- | Consume a specific character.
+pChar :: Char -> Parser ()
+pChar expected = Parser $ \input ->
+  case T.uncons input of
+    Just (c, rest) | c == expected -> Right ((), rest)
+    Just (c, _) -> Left ("expected '" <> T.singleton expected <> "' but got '" <> T.singleton c <> "'")
+    Nothing -> Left ("expected '" <> T.singleton expected <> "' but got end of input")
+
+-- | Consume a specific string prefix.
+pString :: Text -> Parser ()
+pString prefix = Parser $ \input ->
+  case T.stripPrefix prefix input of
+    Just rest -> Right ((), rest)
+    Nothing -> Left ("expected \"" <> prefix <> "\" at: " <> T.take 20 input)
+
+-- | Parse a quoted ATerm string with escape handling.
+pQuotedString :: Parser Text
+pQuotedString = do
+  pChar '"'
+  content <- pStringContent
+  pChar '"'
+  pure content
+
+-- | Parse the contents of a quoted string (up to unescaped quote).
+pStringContent :: Parser Text
+pStringContent = Parser $ \input -> go input T.empty
+  where
+    go remaining acc =
+      case T.uncons remaining of
+        Nothing -> Left "unterminated string"
+        Just ('"', _) -> Right (acc, remaining)
+        Just ('\\', rest) -> case T.uncons rest of
+          Nothing -> Left "unterminated escape"
+          Just ('\\', rest2) -> go rest2 (acc <> "\\")
+          Just ('"', rest2) -> go rest2 (acc <> "\"")
+          Just ('n', rest2) -> go rest2 (acc <> "\n")
+          Just ('r', rest2) -> go rest2 (acc <> "\r")
+          Just ('t', rest2) -> go rest2 (acc <> "\t")
+          Just (c, rest2) -> go rest2 (acc <> "\\" <> T.singleton c)
+        Just (c, rest) -> go rest (acc <> T.singleton c)
+
+-- | Parse a comma-separated list enclosed in brackets: @[item,item,...]@
+pList :: Parser a -> Parser [a]
+pList pItem = do
+  pChar '['
+  items <- pSepBy pItem (pChar ',')
+  pChar ']'
+  pure items
+
+-- | Parse zero or more items separated by a delimiter.
+pSepBy :: Parser a -> Parser () -> Parser [a]
+pSepBy pItem pSep = Parser $ \input ->
+  case runParser pItem input of
+    Left _ -> Right ([], input) -- empty list
+    Right (first, rest) -> goMore rest [first]
+  where
+    goMore remaining acc =
+      case runParser pSep remaining of
+        Left _ -> Right (reverse acc, remaining)
+        Right ((), afterSep) ->
+          case runParser pItem afterSep of
+            Left err -> Left err
+            Right (item, rest2) -> goMore rest2 (item : acc)
+
+-- | Parse a single output tuple: @(name, path, hashAlgo, hash)@.
+pOutput :: Parser DerivationOutput
+pOutput = do
+  pChar '('
+  name <- pQuotedString
+  pChar ','
+  pathStr <- pQuotedString
+  pChar ','
+  hashAlgo <- pQuotedString
+  pChar ','
+  hashVal <- pQuotedString
+  pChar ')'
+  case parseStorePathFromATerm pathStr of
+    Just sp -> pure (DerivationOutput name sp hashAlgo hashVal)
+    Nothing -> parserFail ("invalid output store path: " <> pathStr)
+
+-- | Parse a store path from an ATerm string.
+-- Tries defaultStoreDir first, then Windows store dir.
+parseStorePathFromATerm :: Text -> Maybe StorePath
+parseStorePathFromATerm pathStr =
+  case SP.parseStorePath SP.defaultStoreDir pathStr of
+    Just sp -> Just sp
+    Nothing -> SP.parseStorePath (SP.StoreDir "C:\\nix\\store") pathStr
+
+-- | Parse an input derivation tuple: @(drvPath, [outName1, outName2])@.
+pInputDrv :: Parser (StorePath, [Text])
+pInputDrv = do
+  pChar '('
+  pathStr <- pQuotedString
+  pChar ','
+  outs <- pList pQuotedString
+  pChar ')'
+  case parseStorePathFromATerm pathStr of
+    Just sp -> pure (sp, outs)
+    Nothing -> parserFail ("invalid input drv store path: " <> pathStr)
+
+-- | Parse an input source (quoted store path string).
+pInputSrc :: Parser StorePath
+pInputSrc = do
+  pathStr <- pQuotedString
+  case parseStorePathFromATerm pathStr of
+    Just sp -> pure sp
+    Nothing -> parserFail ("invalid input src store path: " <> pathStr)
+
+-- | Parse an environment pair: @(key, value)@.
+pEnvPair :: Parser (Text, Text)
+pEnvPair = do
+  pChar '('
+  key <- pQuotedString
+  pChar ','
+  val <- pQuotedString
+  pChar ')'
+  pure (key, val)
+
+-- | Parse a full derivation from ATerm format.
+-- Format: @Derive([outputs],[inputDrvs],[inputSrcs],platform,builder,[args],[env])@
+--
+-- Total function: returns @Left@ on any malformed input.
 fromATerm :: Text -> Either Text Derivation
-fromATerm _text = Left "ATerm parser not yet implemented"
+fromATerm input = case runParser pDerivation input of
+  Left err -> Left ("ATerm parse error: " <> err)
+  Right (drv, remaining)
+    | T.null remaining -> Right drv
+    | otherwise -> Left ("ATerm parse error: unexpected trailing: " <> T.take 40 remaining)
+
+pDerivation :: Parser Derivation
+pDerivation = do
+  pString "Derive("
+  outputs <- pList pOutput
+  pChar ','
+  inputDrvsList <- pList pInputDrv
+  pChar ','
+  inputSrcs <- pList pInputSrc
+  pChar ','
+  platformStr <- pQuotedString
+  pChar ','
+  builder <- pQuotedString
+  pChar ','
+  args <- pList pQuotedString
+  pChar ','
+  envPairs <- pList pEnvPair
+  pChar ')'
+  let inputDrvs = Map.fromList inputDrvsList
+      env = Map.fromList envPairs
+      platform = textToPlatform platformStr
+  pure
+    Derivation
+      { drvOutputs = outputs,
+        drvInputDrvs = inputDrvs,
+        drvInputSrcs = inputSrcs,
+        drvPlatform = platform,
+        drvBuilder = builder,
+        drvArgs = args,
+        drvEnv = env
+      }

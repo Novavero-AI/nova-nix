@@ -4,22 +4,29 @@ module Main (main) where
 
 import Control.Exception (bracket_)
 import Control.Monad (when)
+import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
+import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, defaultBuildConfig)
 import Nix.Builtins (builtinEnv)
-import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, platformToText, toATerm)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), emptyEnv, eval, runPureEval)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Expr.Types
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
-import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, storePathToFilePath, windowsStoreDir)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getTemporaryDirectory, removeDirectoryRecursive)
-import System.Exit (exitFailure, exitSuccess)
+import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathExists, scanReferences, setReadOnly, writeDrv)
+import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath)
+import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, storePathToFilePath, windowsStoreDir)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
+import qualified System.Directory as Dir
+import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
+import qualified System.Process as Proc
 
 -- ---------------------------------------------------------------------------
 -- Test harness (same pattern as gbnet-hs, nova-cache)
@@ -35,6 +42,12 @@ runTest name result = case result of
   Fail msg -> do
     putStrLn $ "  FAIL  " ++ T.unpack name ++ ": " ++ T.unpack msg
     pure False
+
+-- | Like 'runTest' but for tests that need IO to produce their result.
+runTestM :: Text -> IO TestResult -> IO Bool
+runTestM name action = do
+  result <- action
+  runTest name result
 
 assertEqual :: (Eq a, Show a) => Text -> a -> a -> TestResult
 assertEqual label expected actual
@@ -1712,6 +1725,759 @@ testBatchH = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: Store.DB (Phase 2, Batch 1)
+-- ---------------------------------------------------------------------------
+
+-- | Helper: run a test with a temporary store DB, cleaning up after.
+withTempStoreDB :: (StoreDir -> IO [Bool]) -> IO [Bool]
+withTempStoreDB action = do
+  tmpBase <- getTemporaryDirectory
+  let tmpStore = tmpBase </> "nova-nix-test-store-db"
+  removeIfExists tmpStore
+  createDirectoryIfMissing True tmpStore
+  results <- action (StoreDir tmpStore)
+  removeIfExists tmpStore
+  pure results
+
+removeIfExists :: FilePath -> IO ()
+removeIfExists path = do
+  exists <- doesDirectoryExist path
+  when exists (removeDirectoryRecursive path)
+
+testStoreDB :: IO [Bool]
+testStoreDB = do
+  putStrLn "store/db"
+  withTempStoreDB $ \storeDir ->
+    sequence
+      [ -- open and close without error
+        runTestM "db open/close" $ do
+          db <- openStoreDB storeDir
+          closeStoreDB db
+          pure Pass,
+        -- isValidPath returns False for unknown path
+        runTestM "db isValidPath false for unknown" $ do
+          db <- openStoreDB storeDir
+          result <- isValidPath db (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" "unknown")
+          closeStoreDB db
+          pure (assertEqual "unknown" False result),
+        -- register + isValidPath returns True
+        runTestM "db register + isValid" $ do
+          db <- openStoreDB storeDir
+          let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2" "hello"
+              reg = PathRegistration sp "sha256:abc" 100 Nothing []
+          registerPath db reg
+          result <- isValidPath db sp
+          closeStoreDB db
+          pure (assertEqual "registered" True result),
+        -- register with refs + query
+        runTestM "db register with refs + query" $ do
+          db <- openStoreDB storeDir
+          let ref1 = StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "dep1"
+              ref2 = StorePath "cccccccccccccccccccccccccccccccc" "dep2"
+              mainSp = StorePath "dddddddddddddddddddddddddddddddd" "mainpkg"
+          registerPath db (PathRegistration ref1 "sha256:r1" 50 Nothing [])
+          registerPath db (PathRegistration ref2 "sha256:r2" 60 Nothing [])
+          registerPath db (PathRegistration mainSp "sha256:m1" 200 Nothing [ref1, ref2])
+          refs <- queryReferences db mainSp
+          closeStoreDB db
+          let ref1Path = T.pack (storePathToFilePath storeDir ref1)
+              ref2Path = T.pack (storePathToFilePath storeDir ref2)
+              hasRef1 = ref1Path `elem` refs
+              hasRef2 = ref2Path `elem` refs
+          pure $
+            if hasRef1 && hasRef2
+              then Pass
+              else Fail ("expected refs to contain both deps, got: " <> T.pack (show refs)),
+        -- queryDeriver nothing
+        runTestM "db queryDeriver nothing" $ do
+          db <- openStoreDB storeDir
+          let sp = StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "noderiver"
+          registerPath db (PathRegistration sp "sha256:nd" 80 Nothing [])
+          result <- queryDeriver db sp
+          closeStoreDB db
+          pure (assertEqual "no deriver" Nothing result),
+        -- queryDeriver just
+        runTestM "db queryDeriver just" $ do
+          db <- openStoreDB storeDir
+          let sp = StorePath "ffffffffffffffffffffffffffffffff" "hasdrv"
+          registerPath db (PathRegistration sp "sha256:hd" 90 (Just "/nix/store/xxx.drv") [])
+          result <- queryDeriver db sp
+          closeStoreDB db
+          pure (assertEqual "has deriver" (Just "/nix/store/xxx.drv") result),
+        -- queryPathInfo
+        runTestM "db queryPathInfo" $ do
+          db <- openStoreDB storeDir
+          let sp = StorePath "gggggggggggggggggggggggggggggggg" "infotest"
+          registerPath db (PathRegistration sp "sha256:info" 150 (Just "/drv") [])
+          minfo <- queryPathInfo db sp
+          closeStoreDB db
+          pure $ case minfo of
+            Nothing -> Fail "expected PathInfo but got Nothing"
+            Just info ->
+              if piNarHash info == "sha256:info"
+                && piNarSize info == 150
+                && piDeriver info == Just "/drv"
+                then Pass
+                else Fail ("bad PathInfo: " <> T.pack (show info)),
+        -- queryPathInfo for unknown returns Nothing
+        runTestM "db queryPathInfo unknown" $ do
+          db <- openStoreDB storeDir
+          minfo <- queryPathInfo db (StorePath "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh" "nope")
+          closeStoreDB db
+          pure (assertEqual "no info" Nothing minfo),
+        -- double register is idempotent
+        runTestM "db double register idempotent" $ do
+          db <- openStoreDB storeDir
+          let sp = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "double"
+              reg = PathRegistration sp "sha256:dup" 120 Nothing []
+          registerPath db reg
+          registerPath db reg
+          result <- isValidPath db sp
+          closeStoreDB db
+          pure (assertEqual "still valid" True result),
+        -- multi-path reference graph
+        runTestM "db multi-path reference graph" $ do
+          db <- openStoreDB storeDir
+          let spA = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "a"
+              spB = StorePath "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk" "b"
+              spC = StorePath "llllllllllllllllllllllllllllllll" "c"
+          registerPath db (PathRegistration spA "sha256:a" 10 Nothing [])
+          registerPath db (PathRegistration spB "sha256:b" 20 Nothing [spA])
+          registerPath db (PathRegistration spC "sha256:c" 30 Nothing [spA, spB])
+          refsC <- queryReferences db spC
+          refsA <- queryReferences db spA
+          closeStoreDB db
+          let aPath = T.pack (storePathToFilePath storeDir spA)
+              bPath = T.pack (storePathToFilePath storeDir spB)
+          pure $
+            if length refsC == 2 && aPath `elem` refsC && bPath `elem` refsC && null refsA
+              then Pass
+              else Fail ("bad ref graph: c refs=" <> T.pack (show refsC) <> " a refs=" <> T.pack (show refsA))
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Store Operations + parseStorePath (Phase 2, Batch 2)
+-- ---------------------------------------------------------------------------
+
+testParseStorePath :: IO [Bool]
+testParseStorePath = do
+  putStrLn "store/parseStorePath"
+  let sd = defaultStoreDir
+  sequence
+    [ runTest "parse valid store path" $
+        assertEqual
+          "valid"
+          (Just (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "hello-2.12"))
+          (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12"),
+      runTest "parse missing prefix" $
+        assertEqual "no prefix" Nothing (parseStorePath sd "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello"),
+      runTest "parse too short hash" $
+        assertEqual "short hash" Nothing (parseStorePath sd "/nix/store/aaa-hello"),
+      runTest "parse missing dash after hash" $
+        assertEqual "no dash" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaahello"),
+      runTest "parse empty name" $
+        assertEqual "empty name" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-"),
+      runTest "parse windows store path" $
+        assertEqual
+          "windows"
+          (Just (StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "pkg"))
+          (parseStorePath windowsStoreDir "C:\\nix\\store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg")
+    ]
+
+-- | Helper: create a fresh temp store for IO tests.
+withTempStore :: (Store -> IO [Bool]) -> IO [Bool]
+withTempStore action = do
+  tmpBase <- getTemporaryDirectory
+  let tmpStore = tmpBase </> "nova-nix-test-store-ops"
+  forceRemoveIfExists tmpStore
+  createDirectoryIfMissing True tmpStore
+  store <- openStore (StoreDir tmpStore)
+  results <- action store
+  closeStore store
+  forceRemoveIfExists tmpStore
+  pure results
+
+-- | Recursively restore writable permissions then remove.
+-- Needed because addToStore/setReadOnly makes paths read-only.
+forceRemoveIfExists :: FilePath -> IO ()
+forceRemoveIfExists path = do
+  exists <- doesDirectoryExist path
+  when exists $ do
+    restoreWritable path
+    removeDirectoryRecursive path
+
+restoreWritable :: FilePath -> IO ()
+restoreWritable path = do
+  isDir <- doesDirectoryExist path
+  when isDir $ do
+    perms <- getPermissions path
+    Dir.setPermissions path (Dir.setOwnerWritable True perms)
+    entries <- Dir.listDirectory path
+    mapM_ (restoreWritable . (path </>)) entries
+  isFile <- Dir.doesFileExist path
+  when isFile $ do
+    perms <- getPermissions path
+    Dir.setPermissions path (Dir.setOwnerWritable True perms)
+
+testStoreOps :: IO [Bool]
+testStoreOps = do
+  putStrLn "store/ops"
+  withTempStore $ \store -> do
+    let sd = stDir store
+    sequence
+      [ -- scanReferences finds embedded store path
+        runTestM "scanReferences finds ref" $ do
+          tmpBase <- getTemporaryDirectory
+          let scanDir = tmpBase </> "nova-nix-test-scan"
+          removeIfExists scanDir
+          createDirectoryIfMissing True scanDir
+          let candidate = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "dep1"
+              prefix = unStoreDir sd
+              refString = prefix <> "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1"
+          BS.writeFile (scanDir </> "output.txt") (TE.encodeUtf8 (T.pack ("hello " <> refString <> " world")))
+          refs <- scanReferences sd [candidate] scanDir
+          removeIfExists scanDir
+          pure $
+            if candidate `elem` refs
+              then Pass
+              else Fail ("expected to find ref, got: " <> T.pack (show refs)),
+        -- scanReferences misses non-matching
+        runTestM "scanReferences misses non-match" $ do
+          tmpBase <- getTemporaryDirectory
+          let scanDir = tmpBase </> "nova-nix-test-scan2"
+          removeIfExists scanDir
+          createDirectoryIfMissing True scanDir
+          let candidate = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "dep1"
+          BS.writeFile (scanDir </> "output.txt") "no store paths here"
+          refs <- scanReferences sd [candidate] scanDir
+          removeIfExists scanDir
+          pure (assertEqual "no refs" [] refs),
+        -- scanReferences ignores partial match
+        runTestM "scanReferences ignores partial" $ do
+          tmpBase <- getTemporaryDirectory
+          let scanDir = tmpBase </> "nova-nix-test-scan3"
+          removeIfExists scanDir
+          createDirectoryIfMissing True scanDir
+          let candidate = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "dep1"
+              prefix = unStoreDir sd
+              -- Only 20 chars of hash — should not match 32-char candidate
+              partialRef = prefix <> "/aaaaaaaaaaaaaaaaaaaa"
+          BS.writeFile (scanDir </> "output.txt") (TE.encodeUtf8 (T.pack partialRef))
+          refs <- scanReferences sd [candidate] scanDir
+          removeIfExists scanDir
+          pure (assertEqual "no partial refs" [] refs),
+        -- addToStore moves dir + registers in DB
+        runTestM "addToStore moves + registers" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-add-src"
+          removeIfExists srcDir
+          createDirectoryIfMissing True srcDir
+          writeFile (srcDir </> "hello.txt") "hello world"
+          let sp = StorePath "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" "addtest"
+          addToStore store srcDir sp Nothing []
+          valid <- isValid store sp
+          exists <- pathExists store sp
+          pure $
+            if valid && exists
+              then Pass
+              else Fail ("valid=" <> T.pack (show valid) <> " exists=" <> T.pack (show exists)),
+        -- addToStore sets read-only
+        runTestM "addToStore sets read-only" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-add-ro"
+          removeIfExists srcDir
+          createDirectoryIfMissing True srcDir
+          writeFile (srcDir </> "data.txt") "data"
+          let sp = StorePath "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" "rotest"
+          addToStore store srcDir sp Nothing []
+          let destFile = storePathToFilePath sd sp </> "data.txt"
+          perms <- getPermissions destFile
+          pure $
+            if not (writable perms)
+              then Pass
+              else Fail "expected read-only but file is writable",
+        -- setReadOnly works on a plain directory
+        runTestM "setReadOnly makes dir read-only" $ do
+          tmpBase <- getTemporaryDirectory
+          let roDir = tmpBase </> "nova-nix-test-readonly"
+          removeIfExists roDir
+          createDirectoryIfMissing True roDir
+          writeFile (roDir </> "f.txt") "content"
+          setReadOnly roDir
+          dirPerms <- getPermissions roDir
+          filePerms <- getPermissions (roDir </> "f.txt")
+          -- Cleanup: restore writable so removeIfExists works
+          Dir.setPermissions roDir (Dir.setOwnerWritable True dirPerms)
+          Dir.setPermissions (roDir </> "f.txt") (Dir.setOwnerWritable True filePerms)
+          removeIfExists roDir
+          pure $
+            if not (writable dirPerms) && not (writable filePerms)
+              then Pass
+              else
+                Fail
+                  ( "dir writable="
+                      <> T.pack (show (writable dirPerms))
+                      <> " file writable="
+                      <> T.pack (show (writable filePerms))
+                  ),
+        -- pathExists true after addToStore
+        runTestM "pathExists after addToStore" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-exists"
+          removeIfExists srcDir
+          createDirectoryIfMissing True srcDir
+          writeFile (srcDir </> "x.txt") "x"
+          let sp = StorePath "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww" "existstest"
+          addToStore store srcDir sp Nothing []
+          exists <- pathExists store sp
+          pure (assertEqual "exists" True exists)
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: fromATerm + Derivation Output Population (Phase 2, Batch 3)
+-- ---------------------------------------------------------------------------
+
+-- | A simple test derivation for round-trip testing.
+simpleTestDrv :: Derivation
+simpleTestDrv =
+  Derivation
+    { drvOutputs =
+        [ DerivationOutput
+            { doName = "out",
+              doPath = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "hello-1.0",
+              doHashAlgo = "",
+              doHash = ""
+            }
+        ],
+      drvInputDrvs = Map.empty,
+      drvInputSrcs = [],
+      drvPlatform = X86_64_Linux,
+      drvBuilder = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bash-5.2/bin/bash",
+      drvArgs = ["-e", "/nix/store/cccccccccccccccccccccccccccccccc-stdenv/setup"],
+      drvEnv = Map.fromList [("name", "hello-1.0"), ("system", "x86_64-linux")]
+    }
+
+-- | A complex test derivation with multiple outputs, input drvs, and input srcs.
+complexTestDrv :: Derivation
+complexTestDrv =
+  Derivation
+    { drvOutputs =
+        [ DerivationOutput "out" (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pkg-2.0") "" "",
+          DerivationOutput "dev" (StorePath "dddddddddddddddddddddddddddddddd" "pkg-2.0-dev") "" ""
+        ],
+      drvInputDrvs =
+        Map.fromList
+          [ (StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "dep1.drv", ["out"]),
+            (StorePath "ffffffffffffffffffffffffffffffff" "dep2.drv", ["out", "lib"])
+          ],
+      drvInputSrcs = [StorePath "gggggggggggggggggggggggggggggggg" "source.tar.gz"],
+      drvPlatform = Aarch64_Darwin,
+      drvBuilder = "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-bash/bin/bash",
+      drvArgs = ["-e", "build.sh"],
+      drvEnv =
+        Map.fromList
+          [ ("buildInputs", "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-dep1"),
+            ("name", "pkg-2.0"),
+            ("out", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-pkg-2.0"),
+            ("system", "aarch64-darwin")
+          ]
+    }
+
+testFromATerm :: IO [Bool]
+testFromATerm = do
+  putStrLn "derivation/fromATerm"
+  sequence
+    [ -- Round-trip: simple derivation
+      runTest "fromATerm round-trip simple" $
+        assertEqual "simple round-trip" (Right simpleTestDrv) (fromATerm (toATerm simpleTestDrv)),
+      -- Round-trip: complex derivation
+      runTest "fromATerm round-trip complex" $
+        assertEqual "complex round-trip" (Right complexTestDrv) (fromATerm (toATerm complexTestDrv)),
+      -- Round-trip: empty derivation (no outputs, no inputs, no args, no env)
+      runTest "fromATerm round-trip empty" $
+        let emptyDrv =
+              Derivation
+                { drvOutputs = [],
+                  drvInputDrvs = Map.empty,
+                  drvInputSrcs = [],
+                  drvPlatform = X86_64_Linux,
+                  drvBuilder = "/bin/true",
+                  drvArgs = [],
+                  drvEnv = Map.empty
+                }
+         in assertEqual "empty round-trip" (Right emptyDrv) (fromATerm (toATerm emptyDrv)),
+      -- Reject empty string
+      runTest "fromATerm rejects empty" $
+        assertLeft "empty" (fromATerm ""),
+      -- Reject malformed
+      runTest "fromATerm rejects malformed" $
+        assertLeft "malformed" (fromATerm "NotADerivation"),
+      -- Reject truncated
+      runTest "fromATerm rejects truncated" $
+        assertLeft "truncated" (fromATerm "Derive(["),
+      -- Escaping round-trip: strings with special chars
+      runTest "fromATerm escaping round-trip" $
+        let escapeDrv =
+              Derivation
+                { drvOutputs =
+                    [ DerivationOutput
+                        { doName = "out",
+                          doPath = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "esc-test",
+                          doHashAlgo = "",
+                          doHash = ""
+                        }
+                    ],
+                  drvInputDrvs = Map.empty,
+                  drvInputSrcs = [],
+                  drvPlatform = X86_64_Linux,
+                  drvBuilder = "/bin/bash",
+                  drvArgs = ["-c", "echo \"hello\nworld\""],
+                  drvEnv = Map.fromList [("msg", "line1\nline2\ttab\\slash")]
+                }
+         in assertEqual "escape round-trip" (Right escapeDrv) (fromATerm (toATerm escapeDrv)),
+      -- writeDrv writes correct ATerm
+      runTestM "writeDrv writes correct ATerm" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-writeDrv"
+        removeIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "test.drv"
+            destFile = storePathToFilePath (stDir store) sp
+        writeDrv store simpleTestDrv sp
+        contents <- TIO.readFile destFile
+        closeStore store
+        removeIfExists tmpStore
+        pure (assertEqual "writeDrv content" (toATerm simpleTestDrv) contents),
+      -- builtinDerivation populates drvOutputs
+      runTest "builtinDerivation populates drvOutputs"
+        $ assertRight
+          "drvOutputs"
+          (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d._derivation")
+        $ \val -> case val of
+          VDerivation drv ->
+            if null (drvOutputs drv)
+              then Fail "drvOutputs is empty"
+              else
+                let firstOut = head (drvOutputs drv)
+                 in if doName firstOut == "out"
+                      then Pass
+                      else Fail ("first output name: " <> doName firstOut)
+          _ -> Fail ("expected VDerivation, got " <> T.pack (show val)),
+      -- builtinDerivation multi-output populates drvOutputs
+      runTest "builtinDerivation multi-output"
+        $ assertRight
+          "multi-output"
+          (evalNix "let d = derivation { name = \"multi\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [\"out\" \"dev\"]; }; in d._derivation")
+        $ \val -> case val of
+          VDerivation drv ->
+            let names = map doName (drvOutputs drv)
+             in if names == ["out", "dev"]
+                  then Pass
+                  else Fail ("output names: " <> T.pack (show names))
+          _ -> Fail ("expected VDerivation, got " <> T.pack (show val))
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Builder (Phase 2, Batch 4)
+-- ---------------------------------------------------------------------------
+
+-- | Create a minimal Derivation for builder tests.
+-- The builder is /bin/sh which writes to $out.
+mkTestBuildDrv :: StoreDir -> StorePath -> Text -> Derivation
+mkTestBuildDrv _sd outSP script =
+  Derivation
+    { drvOutputs =
+        [ DerivationOutput
+            { doName = "out",
+              doPath = outSP,
+              doHashAlgo = "",
+              doHash = ""
+            }
+        ],
+      drvInputDrvs = Map.empty,
+      drvInputSrcs = [],
+      drvPlatform = currentPlatform,
+      drvBuilder = "/bin/sh",
+      drvArgs = ["-c", script],
+      drvEnv = Map.fromList [("name", "test-build"), ("system", platformToText currentPlatform)]
+    }
+
+testBuilder :: IO [Bool]
+testBuilder = do
+  putStrLn "builder"
+  sequence
+    [ -- Build simple script that writes to $out
+      runTestM "build simple script" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder1"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" "simple-test"
+            drv = mkTestBuildDrv (stDir store) outSP "mkdir -p $out && echo hello > $out/result.txt"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder1-tmp"}
+        result <- buildDerivation config store drv
+        closeStore store
+        let ret = case result of
+              BuildSuccess sp -> assertEqual "success path" outSP sp
+              BuildFailure msg code -> Fail ("build failed (" <> T.pack (show code) <> "): " <> msg)
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure ret,
+      -- Build with specific file content
+      runTestM "build writes file content" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder2"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "content-test"
+            drv = mkTestBuildDrv (stDir store) outSP "mkdir -p $out && echo 'test content 42' > $out/data.txt"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder2-tmp"}
+        result <- buildDerivation config store drv
+        ret <- case result of
+          BuildSuccess _ -> do
+            let dataFile = storePathToFilePath (stDir store) outSP </> "data.txt"
+            content <- TIO.readFile dataFile
+            pure $
+              if T.strip content == "test content 42"
+                then Pass
+                else Fail ("unexpected content: " <> content)
+          BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure ret,
+      -- Missing builder fails
+      runTestM "missing builder fails" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder3"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "cccccccccccccccccccccccccccccccc" "fail-test"
+            drv =
+              Derivation
+                { drvOutputs = [DerivationOutput "out" outSP "" ""],
+                  drvInputDrvs = Map.empty,
+                  drvInputSrcs = [],
+                  drvPlatform = currentPlatform,
+                  drvBuilder = "/nonexistent/builder",
+                  drvArgs = [],
+                  drvEnv = Map.empty
+                }
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder3-tmp"}
+        result <- buildDerivation config store drv
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildFailure _ _ -> Pass
+          BuildSuccess _ -> Fail "expected failure for missing builder",
+      -- Exit failure returns error code
+      runTestM "exit failure returns error code" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder4"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "dddddddddddddddddddddddddddddddd" "exitfail"
+            drv = mkTestBuildDrv (stDir store) outSP "exit 42"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder4-tmp"}
+        result <- buildDerivation config store drv
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildFailure _ code -> if code == 42 then Pass else Fail ("expected code 42, got " <> T.pack (show code))
+          BuildSuccess _ -> Fail "expected failure",
+      -- Output at expected path
+      runTestM "output at expected store path" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder5"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "pathtest"
+            drv = mkTestBuildDrv (stDir store) outSP "mkdir -p $out && touch $out/marker"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder5-tmp"}
+        result <- buildDerivation config store drv
+        ret <- case result of
+          BuildSuccess _ -> do
+            let expectedDir = storePathToFilePath (stDir store) outSP
+            exists <- doesDirectoryExist expectedDir
+            pure $ if exists then Pass else Fail "output dir doesn't exist at expected path"
+          BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure ret,
+      -- Path registered in DB after build
+      runTestM "path registered in DB" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder6"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "ffffffffffffffffffffffffffffffff" "dbtest"
+            drv = mkTestBuildDrv (stDir store) outSP "mkdir -p $out && touch $out/file"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder6-tmp"}
+        result <- buildDerivation config store drv
+        ret <- case result of
+          BuildSuccess _ -> do
+            valid <- isValid store outSP
+            pure $ if valid then Pass else Fail "path not valid in DB after build"
+          BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure ret,
+      -- Multiple outputs
+      runTestM "multiple outputs" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder7"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "ggggggggggggggggggggggggggggggg1" "multi"
+            devSP = StorePath "ggggggggggggggggggggggggggggggg2" "multi-dev"
+            drv =
+              Derivation
+                { drvOutputs =
+                    [ DerivationOutput "out" outSP "" "",
+                      DerivationOutput "dev" devSP "" ""
+                    ],
+                  drvInputDrvs = Map.empty,
+                  drvInputSrcs = [],
+                  drvPlatform = currentPlatform,
+                  drvBuilder = "/bin/sh",
+                  drvArgs = ["-c", "mkdir -p $out && echo lib > $out/lib.txt && mkdir -p $dev && echo headers > $dev/include.h"],
+                  drvEnv = Map.fromList [("name", "multi")]
+                }
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder7-tmp"}
+        result <- buildDerivation config store drv
+        ret <- case result of
+          BuildSuccess _ -> do
+            outExists <- doesDirectoryExist (storePathToFilePath (stDir store) outSP)
+            devExists <- doesDirectoryExist (storePathToFilePath (stDir store) devSP)
+            pure $
+              if outExists && devExists
+                then Pass
+                else Fail ("out exists=" <> T.pack (show outExists) <> " dev exists=" <> T.pack (show devExists))
+          BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure ret,
+      -- Cleanup after failure
+      runTestM "cleanup after failure" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder8"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh" "cleantest"
+            drv = mkTestBuildDrv (stDir store) outSP "exit 1"
+            tmpDir = tmpBase </> "nova-nix-test-builder8-tmp"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpDir}
+        _ <- buildDerivation config store drv
+        -- Build dir should be cleaned up
+        let buildDir = tmpDir </> T.unpack (spHash outSP)
+        buildDirExists <- doesDirectoryExist buildDir
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists tmpDir
+        pure $ if not buildDirExists then Pass else Fail "build dir not cleaned up after failure"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: CLI Integration (Phase 2, Batch 5)
+-- ---------------------------------------------------------------------------
+
+-- | End-to-end: eval .nix source → extract derivation → build → verify output.
+evalAndBuild :: StoreDir -> Text -> IO (Either Text (BuildResult, Store))
+evalAndBuild storeDir source = do
+  case parseNix "<test>" source of
+    Left err -> pure (Left ("parse error: " <> T.pack (show err)))
+    Right expr -> do
+      st <- newEvalState "."
+      evalResult <- runEvalIO st (eval (builtinEnv (esTimestamp st)) expr)
+      case evalResult of
+        Left err -> pure (Left ("eval error: " <> err))
+        Right val -> case val of
+          VAttrs attrs -> case Map.lookup "_derivation" attrs of
+            Just (Evaluated (VDerivation drv)) -> do
+              store <- openStore storeDir
+              tmpBase <- getTemporaryDirectory
+              let config = (defaultBuildConfig storeDir) {bcTmpDir = tmpBase </> "nova-nix-e2e-tmp"}
+              result <- buildDerivation config store drv
+              pure (Right (result, store))
+            _ -> pure (Left "no _derivation in result attrs")
+          _ -> pure (Left "result is not an attrset")
+
+testE2E :: IO [Bool]
+testE2E = do
+  putStrLn "cli/e2e"
+  sequence
+    [ -- End-to-end: eval → build a simple derivation
+      runTestM "e2e eval → build" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-e2e1"
+        forceRemoveIfExists tmpStore
+        result <- evalAndBuild (StoreDir tmpStore) "derivation { name = \"e2e-test\"; system = builtins.currentSystem; builder = \"/bin/sh\"; args = [\"-c\" \"mkdir -p $out && echo e2e > $out/e2e.txt\"]; }"
+        ret <- case result of
+          Left err -> pure (Fail err)
+          Right (BuildSuccess _, store) -> do
+            closeStore store
+            pure Pass
+          Right (BuildFailure msg code, store) -> do
+            closeStore store
+            pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (tmpBase </> "nova-nix-e2e-tmp")
+        pure ret,
+      -- Parse error produces Left
+      runTestM "e2e parse error" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-e2e2"
+        forceRemoveIfExists tmpStore
+        result <- evalAndBuild (StoreDir tmpStore) "{{ invalid nix"
+        forceRemoveIfExists tmpStore
+        pure $ case result of
+          Left msg ->
+            if "parse error" `T.isInfixOf` msg
+              then Pass
+              else Fail ("expected parse error, got: " <> msg)
+          Right _ -> Fail "expected error but got success",
+      -- Eval error produces Left
+      runTestM "e2e eval error" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-e2e3"
+        forceRemoveIfExists tmpStore
+        result <- evalAndBuild (StoreDir tmpStore) "derivation { }"
+        forceRemoveIfExists tmpStore
+        pure $ case result of
+          Left msg ->
+            if "error" `T.isInfixOf` T.toLower msg
+              then Pass
+              else Fail ("expected eval error, got: " <> msg)
+          Right _ -> Fail "expected error but got success",
+      -- E2E with subprocess: nova-nix eval on a .nix file
+      runTestM "e2e nova-nix eval subprocess" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-e2e-sub"
+            nixFile = tmpDir </> "test.nix"
+        forceRemoveIfExists tmpDir
+        createDirectoryIfMissing True tmpDir
+        writeFile nixFile "1 + 2"
+        -- Run nova-nix eval via Process
+        (exitCode, stdoutStr, stderrStr) <-
+          Proc.readCreateProcessWithExitCode
+            (Proc.proc "cabal" ["run", "nova-nix", "--", "eval", nixFile])
+            ""
+        forceRemoveIfExists tmpDir
+        pure $ case exitCode of
+          ExitSuccess ->
+            if "VInt 3" `T.isInfixOf` T.pack stdoutStr
+              then Pass
+              else Fail ("expected VInt 3 in output, got: " <> T.pack stdoutStr)
+          ExitFailure code ->
+            Fail ("nova-nix eval failed (" <> T.pack (show code) <> "): stderr=" <> T.pack stderrStr)
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
 
@@ -1765,7 +2531,13 @@ main = do
           testBatchEIO,
           testBatchF,
           testBatchG,
-          testBatchH
+          testBatchH,
+          testStoreDB,
+          testParseStorePath,
+          testStoreOps,
+          testFromATerm,
+          testBuilder,
+          testE2E
         ]
   let total = length results
       passed = length (filter id results)

@@ -53,7 +53,7 @@ import Data.Maybe (catMaybes, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Nix.Derivation (Derivation (..), textToPlatform, toATerm)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
 import Nix.Eval.Types
@@ -82,7 +82,7 @@ import Nix.Expr.Types
     NixAtom (..),
   )
 import Nix.Hash (byteToHex, sha256Hex, truncatedBase32)
-import Nix.Store.Path (defaultStoreDirText)
+import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath)
 import qualified System.Info
 
 -- | Evaluate a Nix expression in an environment.
@@ -1960,6 +1960,23 @@ builtinDerivation (VAttrs attrs) = do
         ((_, p) : _) -> p
         [] -> ""
 
+  -- Build DerivationOutput records for the Derivation value
+  let drvOutputsList =
+        [ DerivationOutput
+            { doName = outName,
+              doPath = case parseStorePath defaultStoreDir outP of
+                Just sp -> sp
+                -- Fallback: construct manually from the path string
+                Nothing -> StorePath (T.take 32 (T.drop (T.length storeDirPrefix) outP)) outName,
+              doHashAlgo = "",
+              doHash = ""
+            }
+        | (outName, outP) <- outPaths
+        ]
+
+  -- Build the complete Derivation with populated outputs
+  let completeDrv = drv {drvOutputs = drvOutputsList}
+
   -- Build result attrset: original attrs + drvPath, outPath, type, per-output attrs
   let baseAttrs =
         Map.fromList $
@@ -1968,7 +1985,8 @@ builtinDerivation (VAttrs attrs) = do
             ("outPath", evaluated (VPath mainOutPath)),
             ("name", evaluated (VStr drvName)),
             ("system", evaluated (VStr system)),
-            ("builder", evaluated (VStr builder))
+            ("builder", evaluated (VStr builder)),
+            ("_derivation", evaluated (VDerivation completeDrv))
           ]
             ++ [(outName, evaluated (VPath outP)) | (outName, outP) <- outPaths]
       -- Merge original attrs underneath so computed attrs take priority
