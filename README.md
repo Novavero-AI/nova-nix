@@ -2,7 +2,7 @@
 <h1>nova-nix</h1>
 <p><strong>Windows-Native Nix in Pure Haskell</strong></p>
 <p>A from-scratch implementation of the Nix package manager — parser, lazy evaluator, content-addressed store, derivation builder, binary substituter — running natively on Windows, macOS, and Linux. No WSL. No Cygwin. No MSYS2.</p>
-<p><a href="#quick-start">Quick Start</a> · <a href="#modules">Modules</a> · <a href="#architecture">Architecture</a> · <a href="#the-hard-problems">Hard Problems</a> · <a href="#roadmap">Roadmap</a> · <a href="#build--test">Build & Test</a></p>
+<p><a href="#quick-start">Quick Start</a> · <a href="#cli">CLI</a> · <a href="#modules">Modules</a> · <a href="#architecture">Architecture</a> · <a href="#the-hard-problems">Hard Problems</a> · <a href="#roadmap">Roadmap</a> · <a href="#build--test">Build & Test</a></p>
 <p>
 
 [![CI](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml)
@@ -22,11 +22,51 @@ A pure Haskell implementation of Nix that treats Windows as a first-class target
 - **Parser** — Hand-rolled recursive descent parser for the full Nix expression language. 13 precedence levels, all syntax forms. Direct `Text` consumption for maximum throughput.
 - **Lazy Evaluator** — Thunk-based evaluation with environment closures, knot-tying for recursive bindings via Haskell laziness. All 16 AST constructors handled: literals, strings with interpolation, attribute sets (recursive and non-recursive), let bindings, lambdas with formal parameters, if/then/else, with, assert, unary/binary operators, function application, list construction, attribute selection, and has-attribute checks.
 - **85 Built-in Functions** — Type checks, arithmetic, bitwise, strings, lists, attribute sets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`), JSON (`toJSON`/`fromJSON`), hashing (SHA-256/SHA-512/SHA-1/MD5), version parsing, `replaceStrings`, `tryEval`, `deepSeq`, `genericClosure`, IO builtins (`import`, `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`), `derivation`, `placeholder`, `storePath`, and more.
-- **Content-Addressed Store** — `/nix/store` on Unix, `C:\nix\store` on Windows, with SQLite metadata tracking (scaffold)
-- **Derivation Types** — ATerm serialization, platform detection via `System.Info`, `derivation` builtin computes `drvPath` and `outPath`
+- **Content-Addressed Store** — `/nix/store` on Unix, `C:\nix\store` on Windows, with real SQLite metadata tracking (ValidPaths + Refs tables, WAL mode)
+- **Derivation Builder** — Full build loop: input validation, temp directory setup, environment construction, process execution, reference scanning, output registration in the store DB
+- **ATerm Serialization** — Full round-trip `.drv` serialization and parsing with string escape handling
 - **Hash Integration** — Built on [nova-cache](https://github.com/Novavero-AI/nova-cache) for SHA-256, Nix base32, NAR, narinfo, and Ed25519 signing
 
 Every module is pure by default. IO lives at the boundaries only.
+
+---
+
+## CLI
+
+```bash
+nova-nix eval FILE.nix          # Evaluate a .nix file, print result
+nova-nix build FILE.nix         # Build a derivation from a .nix file
+```
+
+### Evaluate
+
+```bash
+$ echo '1 + 2' > test.nix
+$ nova-nix eval test.nix
+VInt 3
+
+$ echo '{ x = 1; y = 2; }.x + { x = 1; y = 2; }.y' > test.nix
+$ nova-nix eval test.nix
+VInt 3
+```
+
+### Build
+
+```bash
+$ cat > hello.nix <<'EOF'
+derivation {
+  name = "hello";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  args = [ "-c" "mkdir -p $out && echo 'Hello from nova-nix!' > $out/greeting.txt" ];
+}
+EOF
+
+$ nova-nix build hello.nix
+/nix/store/abc...-hello
+```
+
+The `build` command evaluates the `.nix` file, extracts the derivation, writes the `.drv` to the store, executes the builder, scans output references, and registers the result in the store DB.
 
 ---
 
@@ -110,16 +150,16 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 | `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache, process execution, store writes | Done |
 | `Nix.Builtins` | Built-in function environment — 85 builtins registered as `VBuiltin` values, dispatched in eval | Done |
 
-### Infrastructure (Scaffold)
+### Store + Builder (Implemented)
 
 | Module | Purpose | Status |
 |--------|---------|--------|
-| `Nix.Derivation` | Derivation type, ATerm serialization, platform detection | Done |
+| `Nix.Derivation` | Derivation type, ATerm serialization + parsing (`toATerm`/`fromATerm`), platform detection | Done |
 | `Nix.Hash` | Derivation hashing, store path computation, shared hex/base-32 utilities | Done |
-| `Nix.Store.Path` | Store path types — `StoreDir`, `StorePath`, Windows/Unix support | Done |
-| `Nix.Store.DB` | SQLite store database — path registration, reference tracking | Stub |
-| `Nix.Store` | High-level store operations | Stub |
-| `Nix.Builder` | Derivation builder — `CreateProcess`-based execution | Stub |
+| `Nix.Store.Path` | Store path types — `StoreDir`, `StorePath`, `parseStorePath`, Windows/Unix support | Done |
+| `Nix.Store.DB` | SQLite store database — `ValidPaths` + `Refs` tables, WAL mode, path registration, reference/deriver queries | Done |
+| `Nix.Store` | High-level store operations — `addToStore`, `scanReferences`, `setReadOnly`, `writeDrv` | Done |
+| `Nix.Builder` | Derivation builder — input validation, environment setup, process execution, output registration | Done |
 | `Nix.Substituter` | Binary cache substituter — nova-cache integration | Stub |
 
 ---
@@ -145,7 +185,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
                         │
                IO Boundary (thin)
   ┌───────────────────────────────────────────────────┐
-  │  Store.DB    Store    Builder    Substituter       │
+  │  Eval.IO   Store.DB   Store   Builder   Substituter│
   └───────────────────────────────────────────────────┘
 ```
 
@@ -157,10 +197,19 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 - **With-scope chain** — `Env` has lexical bindings (always win) plus a stack of with-scopes walked innermost-first. `let a = 1; in with { a = 2; }; a` correctly returns `1` because lexical scope takes priority.
 - **Short-circuit operators** — `&&`, `||`, and `->` are handled directly in eval (not delegated to Operator) because they must not evaluate both operands.
 
+**Build loop:**
+
+1. Validate all input sources and input derivation outputs exist in the store
+2. Create a temp build directory with output subdirs (`$out`, `$dev`, etc.)
+3. Construct environment: derivation env + output paths + standard vars (`NIX_BUILD_TOP`, `TMPDIR`, `HOME`/`USERPROFILE`, `NIX_STORE`, `PATH`)
+4. Execute builder via `System.Process.createProcess` (maps to `CreateProcess` on Windows)
+5. On success: scan output for store path references, move to store, set read-only, register in SQLite DB
+6. On failure: clean up temp dir, return error with exit code
+
 **Key numbers:**
 
-- **20 modules** — 14 implemented, 6 scaffold
-- **381 tests** — hand-rolled harness, no framework dependencies
+- **20 modules** — 19 implemented, 1 stub (Substituter)
+- **426 tests** — hand-rolled harness, no framework dependencies
 - **Zero partial functions** — total by construction
 - **Strict by default** — bang patterns on all data fields (except Thunk's Env, which is lazy for knot-tying)
 
@@ -180,6 +229,7 @@ Building Nix on Windows means solving problems nobody has fully solved before:
 | **No bash** | Ship `bash.exe` from MSYS2 (same as Git for Windows) |
 | **Sandboxing** | Unsandboxed initially (macOS did this for years); future: Win32 Job Objects + App Containers |
 | **stdenv bootstrap** | Cross-compile from Linux, or bootstrap from MSYS2 MinGW toolchain |
+| **Cross-device moves** | `renameDirectory` can fail across devices; fallback to recursive copy + remove |
 
 The biggest challenge isn't any single feature — it's **nixpkgs compatibility**. nixpkgs is 80,000+ packages defined as one massive recursive attrset. It exercises every builtin, every edge case in string context tracking, and every lazy evaluation pattern. The evaluator must handle all of this correctly and fast enough (~2-5 seconds for full nixpkgs eval).
 
@@ -194,18 +244,27 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 - [x] **Evaluator** — All 16 AST constructors, lazy thunks, recursive let/rec via knot-tying, with-scope chain (65 tests)
 - [x] **85 builtins** — Type checks, arithmetic, bitwise, strings, lists, attrsets, higher-order, JSON, hashing, version parsing, tryEval, deepSeq, genericClosure, all IO builtins, derivation (240+ tests)
 - [x] **MonadEval refactor** — Evaluator polymorphic in effect monad (`PureEval` for tests, `EvalIO` for real evaluation)
-- [x] **`import` + IO builtins** — `import`, `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`, `currentTime`
-- [x] **`derivation`** — The fundamental builtin: attrset → `.drv` build recipe with computed `drvPath` and `outPath`
-- [x] **ATerm serialization** — Full .drv serialization with string escaping, sorted environments
-- [x] **`placeholder` + `storePath`** — Store path computation via nova-cache hashing
+- [x] **IO builtins** — `import`, `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`, `currentTime`
+- [x] **`derivation`** — The fundamental builtin: attrset to `.drv` build recipe with computed `drvPath` and `outPath`, populated `drvOutputs`
+- [x] **ATerm serialization + parsing** — Full `.drv` round-trip with `toATerm`/`fromATerm`, string escaping, sorted environments
+- [x] **SQLite store DB** — `ValidPaths` + `Refs` tables, WAL mode, registration, validity checks, reference/deriver queries
+- [x] **Store operations** — `parseStorePath`, `addToStore` (cross-device safe), `scanReferences` (byte-scan), `setReadOnly`, `writeDrv`
+- [x] **Builder** — Full build loop: input validation, env setup, process execution, reference scanning, output registration
+- [x] **CLI** — `nova-nix eval FILE.nix` and `nova-nix build FILE.nix`
 
-### Next
+### Next (Phase 3)
 
 - [ ] **String contexts** — Track store path references through string operations
-- [ ] **Store operations** — Content-addressed store with SQLite metadata
-- [ ] **Substituter** — Download pre-built binaries from binary caches
-- [ ] **Builder** — Execute build recipes via `CreateProcess`
+- [ ] **Dependency resolution** — Recursively build input derivations before building dependents
+- [ ] **Substituter** — Download pre-built binaries from binary caches (nova-cache integration)
 - [ ] **nixpkgs evaluation** — The ultimate test: `import <nixpkgs> {}` evaluates correctly
+
+### Long-Term
+
+- [ ] **Flake support**
+- [ ] **Nix daemon protocol compatibility**
+- [ ] **REPL** — `nova-nix repl` interactive evaluator
+- [ ] **Package set for Windows-native builds** (no MSYS2)
 
 ---
 
@@ -213,9 +272,9 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 
 ```bash
 cabal build                              # Build library + CLI
-cabal test                               # Run all 381 tests
+cabal test                               # Run all 426 tests
 cabal build --ghc-options="-Werror"      # Warnings as errors (CI default)
-cabal haddock                            # Generate docs
+cabal haddock                            # Generate API docs
 ```
 
 Requires GHC 9.6 and cabal-install 3.10+.
