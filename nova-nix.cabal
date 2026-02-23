@@ -37,6 +37,9 @@ library
     Nix.Parser.Lexer
     Nix.Parser.ParseError
     Nix.Eval
+    Nix.Eval.Types
+    Nix.Eval.Operator
+    Nix.Eval.StringInterp
     Nix.Store
     Nix.Store.Path
     Nix.Store.DB

@@ -4,8 +4,9 @@ module Main (main) where
 
 import Data.Text (Text)
 import qualified Data.Text as T
+import Nix.Builtins (builtinEnv)
 import Nix.Derivation (Platform (..), currentPlatform)
-import Nix.Eval (Env (..), emptyEnv)
+import Nix.Eval (Env (..), NixValue (..), emptyEnv, eval)
 import Nix.Expr.Types
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
@@ -57,6 +58,23 @@ assertParse label source expected =
 -- | Helper: extract just token types from Located list (drop positions and EOF).
 tokenTypes :: [Located] -> [Token]
 tokenTypes = filter (/= TokEOF) . map locToken
+
+-- | Helper: parse Nix source and evaluate with builtinEnv.
+evalNix :: Text -> Either Text NixValue
+evalNix source = case parseNix "<test>" source of
+  Left err -> Left (T.pack (show err))
+  Right expr -> eval builtinEnv expr
+
+-- | Assert that a Nix expression evaluates to the expected value.
+assertEval :: Text -> Text -> NixValue -> TestResult
+assertEval label source expected =
+  assertRight label (evalNix source) $ \actual ->
+    assertEqual label expected actual
+
+-- | Assert that a Nix expression fails to evaluate.
+assertEvalFail :: Text -> Text -> TestResult
+assertEvalFail label source =
+  assertLeft label (evalNix source)
 
 -- ---------------------------------------------------------------------------
 -- Tests: Expr types (existing)
@@ -132,15 +150,285 @@ testDerivation = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval (existing)
+-- Tests: Eval — Literals
 -- ---------------------------------------------------------------------------
 
-testEval :: IO [Bool]
-testEval = do
-  putStrLn "eval"
+testEvalLiterals :: IO [Bool]
+testEvalLiterals = do
+  putStrLn "eval/literals"
   sequence
     [ runTest "empty env" $
-        assertEqual "emptyEnv" 0 (length ((\(Nix.Eval.Env m) -> m) emptyEnv))
+        assertEqual "emptyEnv" 0 (length (envBindings emptyEnv)),
+      runTest "int" $
+        assertEval "int" "42" (VInt 42),
+      runTest "float" $
+        assertEval "float" "3.14" (VFloat 3.14),
+      runTest "bool true" $
+        assertEval "true" "true" (VBool True),
+      runTest "null" $
+        assertEval "null" "null" VNull,
+      runTest "string" $
+        assertEval "string" "\"hello\"" (VStr "hello")
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Variables
+-- ---------------------------------------------------------------------------
+
+testEvalVariables :: IO [Bool]
+testEvalVariables = do
+  putStrLn "eval/variables"
+  sequence
+    [ runTest "let variable" $
+        assertEval "let-var" "let x = 1; in x" (VInt 1),
+      runTest "undefined variable" $
+        assertEvalFail "undef" "x",
+      runTest "builtin true" $
+        assertEval "builtin-true" "true" (VBool True)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Arithmetic
+-- ---------------------------------------------------------------------------
+
+testEvalArithmetic :: IO [Bool]
+testEvalArithmetic = do
+  putStrLn "eval/arithmetic"
+  sequence
+    [ runTest "int add" $
+        assertEval "add" "1 + 2" (VInt 3),
+      runTest "int sub" $
+        assertEval "sub" "10 - 3" (VInt 7),
+      runTest "int mul" $
+        assertEval "mul" "4 * 5" (VInt 20),
+      runTest "int div" $
+        assertEval "div" "10 / 3" (VInt 3),
+      runTest "float add" $
+        assertEval "float-add" "1.5 + 2.5" (VFloat 4.0),
+      runTest "int-float promotion" $
+        assertEval "promote" "1 + 2.0" (VFloat 3.0),
+      runTest "negate int" $
+        assertEval "negate" "- 5" (VInt (-5)),
+      runTest "division by zero" $
+        assertEvalFail "div0" "1 / 0"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Comparison
+-- ---------------------------------------------------------------------------
+
+testEvalComparison :: IO [Bool]
+testEvalComparison = do
+  putStrLn "eval/comparison"
+  sequence
+    [ runTest "int eq" $
+        assertEval "eq" "1 == 1" (VBool True),
+      runTest "int neq" $
+        assertEval "neq" "1 != 2" (VBool True),
+      runTest "int lt" $
+        assertEval "lt" "1 < 2" (VBool True),
+      runTest "int gte" $
+        assertEval "gte" "3 >= 3" (VBool True),
+      runTest "string compare" $
+        assertEval "str-lt" "\"abc\" < \"def\"" (VBool True)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Logic
+-- ---------------------------------------------------------------------------
+
+testEvalLogic :: IO [Bool]
+testEvalLogic = do
+  putStrLn "eval/logic"
+  sequence
+    [ runTest "and true" $
+        assertEval "and-true" "true && true" (VBool True),
+      runTest "and short-circuit" $
+        assertEval "and-short" "false && true" (VBool False),
+      runTest "or true" $
+        assertEval "or-true" "true || false" (VBool True),
+      runTest "or short-circuit" $
+        assertEval "or-short" "false || true" (VBool True),
+      runTest "not" $
+        assertEval "not" "!false" (VBool True),
+      runTest "implication false->x" $
+        assertEval "impl-false" "false -> false" (VBool True),
+      runTest "implication true->true" $
+        assertEval "impl-true" "true -> true" (VBool True)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Strings
+-- ---------------------------------------------------------------------------
+
+testEvalStrings :: IO [Bool]
+testEvalStrings = do
+  putStrLn "eval/strings"
+  sequence
+    [ runTest "string concat" $
+        assertEval "concat" "\"hello\" + \" world\"" (VStr "hello world"),
+      runTest "string interpolation" $
+        assertEval "interp" "let x = \"world\"; in \"hello ${x}\"" (VStr "hello world"),
+      runTest "interpolation coerce int" $
+        assertEval "coerce-int" "\"val=${builtins.toString 42}\"" (VStr "val=42"),
+      runTest "empty string" $
+        assertEval "empty" "\"\"" (VStr "")
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — If/Assert
+-- ---------------------------------------------------------------------------
+
+testEvalIfAssert :: IO [Bool]
+testEvalIfAssert = do
+  putStrLn "eval/if-assert"
+  sequence
+    [ runTest "if true" $
+        assertEval "if-true" "if true then 1 else 2" (VInt 1),
+      runTest "if false" $
+        assertEval "if-false" "if false then 1 else 2" (VInt 2),
+      runTest "assert pass" $
+        assertEval "assert-pass" "assert true; 42" (VInt 42),
+      runTest "assert fail" $
+        assertEvalFail "assert-fail" "assert false; 42"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Let
+-- ---------------------------------------------------------------------------
+
+testEvalLet :: IO [Bool]
+testEvalLet = do
+  putStrLn "eval/let"
+  sequence
+    [ runTest "simple let" $
+        assertEval "let" "let x = 1; in x" (VInt 1),
+      runTest "multi let" $
+        assertEval "multi" "let x = 1; y = 2; in x + y" (VInt 3),
+      runTest "recursive let" $
+        assertEval "rec-let" "let x = 1; y = x + 1; in y" (VInt 2)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Attribute sets
+-- ---------------------------------------------------------------------------
+
+testEvalAttrs :: IO [Bool]
+testEvalAttrs = do
+  putStrLn "eval/attrs"
+  sequence
+    [ runTest "simple select" $
+        assertEval "select" "{ a = 1; }.a" (VInt 1),
+      runTest "nested select" $
+        assertEval "nested" "{ a = { b = 2; }; }.a.b" (VInt 2),
+      runTest "select or default" $
+        assertEval "default" "{ a = 1; }.b or 42" (VInt 42),
+      runTest "has-attr true" $
+        assertEval "has-true" "{ a = 1; } ? a" (VBool True),
+      runTest "has-attr false" $
+        assertEval "has-false" "{ a = 1; } ? b" (VBool False),
+      runTest "nested attr path" $
+        assertEval "dot-path" "{ a.b.c = 1; }.a.b.c" (VInt 1)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Recursive attribute sets
+-- ---------------------------------------------------------------------------
+
+testEvalRecAttrs :: IO [Bool]
+testEvalRecAttrs = do
+  putStrLn "eval/rec-attrs"
+  sequence
+    [ runTest "rec self-reference" $
+        assertEval "rec-self" "rec { a = 1; b = a + 1; }.b" (VInt 2),
+      runTest "rec mutual reference" $
+        assertEval "rec-mutual" "rec { a = 1; b = a; }.b" (VInt 1)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Lists
+-- ---------------------------------------------------------------------------
+
+testEvalLists :: IO [Bool]
+testEvalLists = do
+  putStrLn "eval/lists"
+  sequence
+    [ runTest "list head" $
+        assertEval "head" "builtins.head [ 1 2 3 ]" (VInt 1),
+      runTest "list length" $
+        assertEval "length" "builtins.length [ 1 2 3 ]" (VInt 3),
+      runTest "list concat" $
+        assertEval "concat" "builtins.length ([ 1 ] ++ [ 2 3 ])" (VInt 3)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Lambda
+-- ---------------------------------------------------------------------------
+
+testEvalLambda :: IO [Bool]
+testEvalLambda = do
+  putStrLn "eval/lambda"
+  sequence
+    [ runTest "identity" $
+        assertEval "id" "(x: x) 42" (VInt 42),
+      runTest "closure" $
+        assertEval "closure" "let f = x: x + 1; in f 5" (VInt 6),
+      runTest "set pattern" $
+        assertEval "set-pat" "({ a, b }: a + b) { a = 1; b = 2; }" (VInt 3),
+      runTest "default param" $
+        assertEval "default" "({ a ? 10 }: a) { }" (VInt 10)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — With
+-- ---------------------------------------------------------------------------
+
+testEvalWith :: IO [Bool]
+testEvalWith = do
+  putStrLn "eval/with"
+  sequence
+    [ runTest "with basic" $
+        assertEval "with" "with { a = 1; }; a" (VInt 1),
+      runTest "with lexical wins" $
+        assertEval "lexical" "let a = 1; in with { a = 2; }; a" (VInt 1)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Builtins
+-- ---------------------------------------------------------------------------
+
+testEvalBuiltins :: IO [Bool]
+testEvalBuiltins = do
+  putStrLn "eval/builtins"
+  sequence
+    [ runTest "typeOf int" $
+        assertEval "typeOf-int" "builtins.typeOf 42" (VStr "int"),
+      runTest "typeOf string" $
+        assertEval "typeOf-str" "builtins.typeOf \"hi\"" (VStr "string"),
+      runTest "isNull true" $
+        assertEval "isNull-t" "builtins.isNull null" (VBool True),
+      runTest "isNull false" $
+        assertEval "isNull-f" "builtins.isNull 1" (VBool False),
+      runTest "stringLength" $
+        assertEval "strlen" "builtins.stringLength \"hello\"" (VInt 5),
+      runTest "toString int" $
+        assertEval "toStr" "builtins.toString 42" (VStr "42")
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval — Errors
+-- ---------------------------------------------------------------------------
+
+testEvalErrors :: IO [Bool]
+testEvalErrors = do
+  putStrLn "eval/errors"
+  sequence
+    [ runTest "type error in add" $
+        assertEvalFail "type-add" "1 + true",
+      runTest "call non-function" $
+        assertEvalFail "call-non" "42 1",
+      runTest "builtins.throw" $
+        assertEvalFail "throw" "builtins.throw \"boom\""
     ]
 
 -- ---------------------------------------------------------------------------
@@ -551,7 +839,21 @@ main = do
         [ testExprTypes,
           testStorePaths,
           testDerivation,
-          testEval,
+          testEvalLiterals,
+          testEvalVariables,
+          testEvalArithmetic,
+          testEvalComparison,
+          testEvalLogic,
+          testEvalStrings,
+          testEvalIfAssert,
+          testEvalLet,
+          testEvalAttrs,
+          testEvalRecAttrs,
+          testEvalLists,
+          testEvalLambda,
+          testEvalWith,
+          testEvalBuiltins,
+          testEvalErrors,
           testLexer,
           testParserExprs,
           testParserErrors,
