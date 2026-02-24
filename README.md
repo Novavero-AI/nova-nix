@@ -64,8 +64,8 @@ nova-nix --nix-path nixpkgs=/path eval FILE   # Add search paths (repeatable)
 ### Evaluate
 
 ```bash
-$ nova-nix eval test.nix
-{ count = 6; greeting = "nova-nix is alive"; hasDerivation = "derivation"; items = [ 2 4 6 8 10 ]; }
+$ nova-nix --strict eval test.nix
+{ count = 6; greeting = "Hello, nova-nix!"; items = [ 2 4 6 8 10 ]; nested = { a = 1; b = 2; c = 4; }; types = { attrs = "set"; int = "int"; list = "list"; string = "string"; }; }
 ```
 
 Inline expressions:
@@ -304,16 +304,15 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 - [x] **Dynamic attribute keys** — `{ ${expr} = val; }` works in all binding contexts with monadic key resolution preserving knot-tying
 - [x] **Directory imports** — `import ./dir` resolves to `./dir/default.nix` automatically
 - [x] **CLI** — `nova-nix eval FILE.nix`, `nova-nix eval --expr 'EXPR'`, `nova-nix build FILE.nix`, `--nix-path NAME=PATH`
+- [x] **Thunk memoization** — Per-thunk `IORef` memo cells matching real Nix in-place mutation. GC reclaims dead thunks naturally.
+- [x] **Regex builtins** — `builtins.match` and `builtins.split` (POSIX ERE via `regex-tdfa`, pure Haskell, cross-platform)
 - [x] **508 tests** — parser, evaluator, store, builder, substituter, dependency graph, search paths, dynamic keys, directory imports, CLI end-to-end
 
 ### Next
 
-- [x] **Thunk memoization** — Per-thunk `IORef` memo cells in `EvalIO` via `forceThunk` `MonadEval` method. Each thunk is evaluated at most once, cached in place (matching real Nix). GC reclaims dead thunks naturally — no unbounded global cache.
-- [x] **Regex builtins** — `builtins.match` and `builtins.split` (POSIX ERE via `regex-tdfa`, pure Haskell, cross-platform)
-- [ ] **nixpkgs evaluation** — The ultimate test: `import <nixpkgs> {}` evaluates correctly
-- [ ] **Memory management** — Depth-limited pretty-printer, lazy higher-order builtins (memo cache is now GC-bounded via per-thunk IORef — no global cache to leak)
-- [ ] **Missing builtins** — Any others nixpkgs demands (discovered iteratively by running `import <nixpkgs> {}`)
-- [ ] **Performance profiling** — Target ~2-5 seconds for full nixpkgs eval
+- [ ] **nixpkgs evaluation** — The ultimate test: `import <nixpkgs> {}` evaluates correctly and fast
+- [ ] **Missing builtins** — Any others nixpkgs demands (discovered iteratively)
+- [ ] **Performance** — Target ~2-5 seconds for full nixpkgs eval
 
 ### Long-Term
 
