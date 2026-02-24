@@ -32,6 +32,24 @@ Every module is pure by default. IO lives at the boundaries only.
 
 ---
 
+## Try It
+
+```bash
+git clone https://github.com/Novavero-AI/nova-nix.git
+cd nova-nix
+cabal run nova-nix -- eval test.nix
+```
+
+Output:
+
+```
+{ count = 6; greeting = "nova-nix is alive"; hasDerivation = "derivation"; items = [ 2 4 6 8 10 ]; }
+```
+
+That's a Nix expression with `let` bindings, `derivation`, `builtins.map`, lambda functions, and arithmetic — parsed, lazily evaluated, and pretty-printed. On Windows, macOS, or Linux.
+
+---
+
 ## CLI
 
 ```bash
@@ -42,13 +60,24 @@ nova-nix build FILE.nix         # Build a derivation from a .nix file
 ### Evaluate
 
 ```bash
-$ echo '1 + 2' > test.nix
 $ nova-nix eval test.nix
-VInt 3
+{ count = 6; greeting = "nova-nix is alive"; hasDerivation = "derivation"; items = [ 2 4 6 8 10 ]; }
+```
 
-$ echo '{ x = 1; y = 2; }.x + { x = 1; y = 2; }.y' > test.nix
-$ nova-nix eval test.nix
-VInt 3
+More examples:
+
+```bash
+$ echo '1 + 2' > simple.nix
+$ nova-nix eval simple.nix
+3
+
+$ echo '{ x = 1; y = 2; }.x + { x = 1; y = 2; }.y' > attrs.nix
+$ nova-nix eval attrs.nix
+3
+
+$ echo 'builtins.map (x: x * x) [1 2 3 4 5]' > squares.nix
+$ nova-nix eval squares.nix
+[ 1 4 9 16 25 ]
 ```
 
 ### Build

@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.1.0.0 — 2026-02-23
+## 0.1.0.0 — 2026-02-24
+
+### Cross-Platform Fixes
+
+- Cross-platform ATerm serialization: `storePathToText` always uses `/` for store paths regardless of OS, `parseStorePath` accepts both `/` and `\`
+- Builder inherits system environment, overlays build env via `Map.union` — fixes silent process failures on Windows (missing `SYSTEMROOT`)
+- Builder PATH derived from builder location (`buildPath`) — includes builder dir and MSYS2 sibling `usr/bin` for coreutils discovery
+- `findTestShell` prefers known Git for Windows bash over WSL launcher (`System32\bash.exe`)
+- Parser strips UTF-8 BOM — Windows editors (Notepad, PowerShell) commonly add byte order marks
+- Demo `test.nix` included: derivations, lambdas, builtins.map, arithmetic — runs on all platforms
 
 ### Phase 3: String Contexts + Dependency Resolution + Substituter
 
