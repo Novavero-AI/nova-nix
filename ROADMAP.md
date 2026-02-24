@@ -26,7 +26,7 @@ The ultimate test: `import <nixpkgs> {}` evaluates correctly.
 
 ## Phase 5: Store Bootstrap + CLI
 
-- **Store bootstrap**: Ship a prebuilt bash + coreutils derivation so nova-nix can build on a fresh Windows machine without Git for Windows. Currently `findTestShell` discovers bash from Git for Windows; bootstrap replaces this with a store path (`/nix/store/xxx-bash-5.2/bin/bash`), matching real Nix's model.
+- **Store bootstrap**: Ship a prebuilt bash + coreutils derivation so nova-nix can build on a fresh Windows machine without Git for Windows. Currently `findTestShell` discovers bash from Git for Windows and `buildPath` derives PATH from the builder's location (including MSYS2 sibling `usr/bin`). Bootstrap replaces both with a store path (`/nix/store/xxx-bash-5.2/bin/bash`) — `buildPath` naturally becomes store-only PATH with zero platform conditionals, matching real Nix's model. Extract `PlatformConfig` record to eliminate remaining `System.Info.os` checks in `Builder.hs`.
 - `nova-nix shell` — enter a development shell (like `nix shell`)
 - `nova-nix repl` — interactive evaluator
 - `nova-nix run` — build and execute

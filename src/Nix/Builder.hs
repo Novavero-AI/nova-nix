@@ -57,7 +57,7 @@ import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, removeDirectoryRecursive)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import qualified System.IO
 import qualified System.IO.Unsafe
 import qualified System.Info
@@ -158,10 +158,10 @@ buildDerivationInner config store drv = do
       mapM_ (createDirectoryIfMissing True . snd) outputDirs
 
       -- 4. Set up environment
-      let environ = buildEnvironment config drv buildDir outputDirs
-
-      -- 5. Run the builder
       let builderPath = T.unpack (drvBuilder drv)
+          environ = buildEnvironment config drv builderPath buildDir outputDirs
+
+          -- 5. Run the builder
           builderArgs = map T.unpack (drvArgs drv)
       exitResult <- runBuilder builderPath builderArgs environ buildDir
       case exitResult of
@@ -228,13 +228,19 @@ cleanupBuildDir dir = do
 -- ---------------------------------------------------------------------------
 
 -- | Build the process environment from the derivation env + standard vars.
+-- The builder path is used to derive PATH entries — the builder's own
+-- directory and its sibling @usr\/bin@ are included so that coreutils
+-- shipped alongside the builder (e.g. Git for Windows' MSYS2 tools)
+-- are available.  This mirrors real Nix where PATH contains only
+-- store paths from declared build dependencies.
 buildEnvironment ::
   BuildConfig ->
   Derivation ->
   FilePath ->
+  FilePath ->
   [(Text, FilePath)] ->
   Map Text Text
-buildEnvironment config drv buildDir outputDirs =
+buildEnvironment config drv builderPath buildDir outputDirs =
   let -- Start with derivation environment
       baseEnv = drvEnv drv
       -- Add output paths: $out, $dev, etc.
@@ -246,20 +252,28 @@ buildEnvironment config drv buildDir outputDirs =
             (envTmpDir, T.pack buildDir),
             (homeEnvVar, T.pack buildDir),
             (envNixStore, T.pack (unStoreDir (bcStoreDir config))),
-            (envPath, defaultBuildPath)
+            (envPath, buildPath builderPath)
           ]
    in -- Priority: output paths > derivation env > standard env
       Map.unions [outputEnv, baseEnv, standardEnv]
 
--- | Default PATH for builds.  Includes standard system directories
--- so that basic commands (mkdir, cp, echo) are available.
--- In a future sandboxed build, this will be restricted to only the
--- derivation's declared inputs.
-defaultBuildPath :: Text
-defaultBuildPath =
-  if System.Info.os == "mingw32"
-    then "C:\\Windows\\System32;C:\\Windows"
-    else "/usr/bin:/bin:/usr/local/bin"
+-- | Construct the build PATH from the builder's location.
+-- Includes the builder's directory, its sibling @usr\/bin@ (for MSYS2
+-- coreutils bundled with Git for Windows), and system directories.
+-- On a bootstrapped store, the builder's dir IS a store path, so this
+-- naturally becomes a store-only PATH.
+buildPath :: FilePath -> Text
+buildPath builderPath =
+  let builderDir = takeDirectory builderPath
+      parentDir = takeDirectory builderDir
+      -- Builder's own dir + coreutils sibling (MSYS2 layout)
+      builderDirs = [builderDir, parentDir </> "usr" </> "bin"]
+      systemDirs =
+        if System.Info.os == "mingw32"
+          then ["C:\\Windows\\System32", "C:\\Windows"]
+          else ["/usr/bin", "/bin", "/usr/local/bin"]
+      sep = if System.Info.os == "mingw32" then ";" else ":"
+   in T.intercalate sep (map T.pack (builderDirs ++ systemDirs))
 
 -- | The home directory environment variable name (platform-dependent).
 homeEnvVar :: Text
