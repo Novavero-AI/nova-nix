@@ -41,6 +41,7 @@ import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
 -- | Parsed CLI options.
 data CliOpts = CliOpts
   { optNixPaths :: ![T.Text],
+    optStrict :: !Bool,
     optCommand :: !Command
   }
 
@@ -51,11 +52,13 @@ data Command
   | CmdHelp
 
 parseArgs :: [String] -> CliOpts
-parseArgs = go (CliOpts [] CmdHelp)
+parseArgs = go (CliOpts [] False CmdHelp)
   where
     go opts [] = opts
     go opts ("--nix-path" : val : rest) =
       go (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
+    go opts ("--strict" : rest) =
+      go (opts {optStrict = True}) rest
     go opts ("eval" : "--expr" : expr : rest) =
       go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
     go opts ("eval" : path : rest) =
@@ -79,8 +82,8 @@ main = do
   args <- getArgs
   let opts = parseArgs args
   case optCommand opts of
-    CmdEvalFile filePath -> evalFile (optNixPaths opts) filePath
-    CmdEvalExpr expr -> evalExpr (optNixPaths opts) expr
+    CmdEvalFile filePath -> evalFile (optStrict opts) (optNixPaths opts) filePath
+    CmdEvalExpr expr -> evalExpr (optStrict opts) (optNixPaths opts) expr
     CmdBuild filePath -> buildFile (optNixPaths opts) filePath
     CmdHelp -> do
       hPutStrLn stderr "Usage: nova-nix [--nix-path NAME=PATH] <command>"
@@ -91,12 +94,13 @@ main = do
       hPutStrLn stderr "  build FILE.nix         Build a derivation from a .nix file"
       hPutStrLn stderr ""
       hPutStrLn stderr "Flags:"
+      hPutStrLn stderr "  --strict               Deep-force all thunks before printing (warning: OOM on large results)"
       hPutStrLn stderr "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)"
       exitFailure
 
 -- | Evaluate a .nix file and print the result.
-evalFile :: [T.Text] -> FilePath -> IO ()
-evalFile extraPaths filePath = do
+evalFile :: Bool -> [T.Text] -> FilePath -> IO ()
+evalFile strict extraPaths filePath = do
   source <- TIO.readFile filePath
   case parseNix (T.pack filePath) source of
     Left err -> do
@@ -105,9 +109,9 @@ evalFile extraPaths filePath = do
     Right expr -> do
       st <- newEvalState (takeDirectory filePath)
       let searchPaths = mergeSearchPaths extraPaths (esSearchPaths st)
-      result <- runEvalIO st $ do
-        val <- eval (builtinEnv (esTimestamp st) searchPaths) expr
-        deepForceValue val
+      result <-
+        runEvalIO st $
+          eval (builtinEnv (esTimestamp st) searchPaths) expr >>= finalize strict
       case result of
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
@@ -115,8 +119,8 @@ evalFile extraPaths filePath = do
         Right forced -> TIO.putStrLn (prettyValue forced)
 
 -- | Evaluate an inline expression and print the result.
-evalExpr :: [T.Text] -> T.Text -> IO ()
-evalExpr extraPaths source = do
+evalExpr :: Bool -> [T.Text] -> T.Text -> IO ()
+evalExpr strict extraPaths source = do
   case parseNix "<expr>" source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
@@ -125,9 +129,9 @@ evalExpr extraPaths source = do
       cwd <- getCurrentDirectory
       st <- newEvalState cwd
       let searchPaths = mergeSearchPaths extraPaths (esSearchPaths st)
-      result <- runEvalIO st $ do
-        val <- eval (builtinEnv (esTimestamp st) searchPaths) expr
-        deepForceValue val
+      result <-
+        runEvalIO st $
+          eval (builtinEnv (esTimestamp st) searchPaths) expr >>= finalize strict
       case result of
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
@@ -218,6 +222,17 @@ writeDrvToStore store drv =
       -- Write .drv to store if a drvPath is available in the env.
       let envDrvPath = Map.lookup "drvPath" (drvEnv drv)
       mapM_ (writeDrv store drv) (envDrvPath >>= parseStorePath defaultStoreDir)
+
+-- ---------------------------------------------------------------------------
+-- Output formatting
+-- ---------------------------------------------------------------------------
+
+-- | Optionally deep-force a value before printing.
+-- With @--strict@, all thunks are recursively materialized.
+-- Without it, thunks display as @«thunk»@ — safe for large results.
+finalize :: (MonadEval m) => Bool -> NixValue -> m NixValue
+finalize True = deepForceValue
+finalize False = pure
 
 -- ---------------------------------------------------------------------------
 -- Deep-force and pretty-print
