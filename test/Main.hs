@@ -23,7 +23,7 @@ import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathExists, scanReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath)
-import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, storePathToFilePath, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
@@ -107,24 +107,27 @@ assertEvalFail label source =
 
 -- | Find a POSIX-compatible shell for builder tests.
 -- On Unix, always @\/bin\/sh@.  On Windows, searches for @bash.exe@
--- in PATH then at known Git for Windows locations.  Real Nix builders
--- always use bash from the store — this bridges the gap until nova-nix
--- bootstraps its own bash derivation.
+-- at known Git for Windows locations first, then PATH.  Checks known
+-- paths first to avoid picking up the WSL launcher at
+-- @C:\\Windows\\System32\\bash.exe@ which exits 1 when WSL is not
+-- configured.  Real Nix builders always use bash from the store —
+-- this bridges the gap until nova-nix bootstraps its own bash
+-- derivation.
 findTestShell :: IO Text
 findTestShell = case SI.os of
   "mingw32" -> do
-    inPath <- Dir.findExecutable "bash"
-    case inPath of
-      Just p -> pure (T.pack p)
-      Nothing -> do
-        let known =
-              [ "C:\\Program Files\\Git\\bin\\bash.exe",
-                "C:\\Program Files (x86)\\Git\\bin\\bash.exe"
-              ]
-        found <- filterM Dir.doesFileExist known
-        case found of
-          (p : _) -> pure (T.pack p)
-          [] ->
+    let known =
+          [ "C:\\Program Files\\Git\\bin\\bash.exe",
+            "C:\\Program Files (x86)\\Git\\bin\\bash.exe"
+          ]
+    found <- filterM Dir.doesFileExist known
+    case found of
+      (p : _) -> pure (T.pack p)
+      [] -> do
+        inPath <- Dir.findExecutable "bash"
+        case inPath of
+          Just p -> pure (T.pack p)
+          Nothing ->
             error
               "bash not found: install Git for Windows or add bash to PATH"
   _ -> pure "/bin/sh"
@@ -178,11 +181,11 @@ testStorePaths = do
         assertEqual "defaultStoreDir" "/nix/store" (unStoreDir defaultStoreDir),
       runTest "windows store dir" $
         assertEqual "windowsStoreDir" "C:\\nix\\store" (unStoreDir windowsStoreDir),
-      runTest "store path to filepath" $
+      runTest "store path to text" $
         assertEqual
-          "storePathToFilePath"
+          "storePathToText"
           "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1"
-          (storePathToFilePath defaultStoreDir sp),
+          (T.unpack (storePathToText defaultStoreDir sp)),
       runTest "store path ordering" $
         let sp2 = StorePath {spHash = "zzz", spName = "later"}
          in assertEqual "Ord" True (sp < sp2)
