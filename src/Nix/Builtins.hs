@@ -9,11 +9,15 @@ module Nix.Builtins
   ( -- * Builtin registration
     builtinEnv,
     builtinEnvWithScope,
+
+    -- * NIX_PATH parsing
+    parseNixPath,
   )
 where
 
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import qualified Data.Text as T
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), builtinNames, currentSystemStr, evaluated)
 import Nix.Eval.Types (mkStr)
 import Nix.Store.Path (defaultStoreDirText)
@@ -26,8 +30,11 @@ import Nix.Store.Path (defaultStoreDirText)
 --
 -- @currentTime@ is an integer constant (seconds since epoch),
 -- passed in at startup.  In tests, pass @0@.
-builtinEnv :: Integer -> Env
-builtinEnv timestamp =
+--
+-- @searchPaths@ populates @builtins.nixPath@.  Parsed from @NIX_PATH@
+-- by 'parseNixPath'.  In tests, pass @[]@.
+builtinEnv :: Integer -> [Thunk] -> Env
+builtinEnv timestamp searchPaths =
   Env
     { envBindings =
         Map.fromList $
@@ -35,7 +42,7 @@ builtinEnv timestamp =
           [ ("true", evaluated (VBool True)),
             ("false", evaluated (VBool False)),
             ("null", evaluated VNull),
-            ("builtins", evaluated (builtinsAttrSet timestamp))
+            ("builtins", evaluated (builtinsAttrSet timestamp searchPaths))
           ]
             -- Top-level builtin functions (available without builtins. prefix)
             ++ map topLevelBuiltin topLevelBuiltinNames,
@@ -70,22 +77,22 @@ topLevelBuiltin name = (name, evaluated (VBuiltin name []))
 
 -- | Like 'builtinEnv' but with additional scope bindings overlaid on
 -- the top-level environment.  Used by @scopedImport@.
-builtinEnvWithScope :: Integer -> [(Text, Thunk)] -> Env
-builtinEnvWithScope timestamp scope =
-  let base = builtinEnv timestamp
+builtinEnvWithScope :: Integer -> [Thunk] -> [(Text, Thunk)] -> Env
+builtinEnvWithScope timestamp searchPaths scope =
+  let base = builtinEnv timestamp searchPaths
       scopeMap = Map.fromList scope
    in base {envBindings = Map.union scopeMap (envBindings base)}
 
 -- | The @builtins@ attribute set, derived from the central registry.
-builtinsAttrSet :: Integer -> NixValue
-builtinsAttrSet timestamp =
-  VAttrs $ Map.union builtinEntries (standardEntries timestamp)
+builtinsAttrSet :: Integer -> [Thunk] -> NixValue
+builtinsAttrSet timestamp searchPaths =
+  VAttrs $ Map.union builtinEntries (standardEntries timestamp searchPaths)
   where
     builtinEntries =
       Map.fromList [(name, evaluated (VBuiltin name [])) | name <- builtinNames]
 
-standardEntries :: Integer -> Map.Map Text Thunk
-standardEntries timestamp =
+standardEntries :: Integer -> [Thunk] -> Map.Map Text Thunk
+standardEntries timestamp searchPaths =
   Map.fromList
     [ ("true", evaluated (VBool True)),
       ("false", evaluated (VBool False)),
@@ -93,7 +100,38 @@ standardEntries timestamp =
       ("storeDir", evaluated (mkStr defaultStoreDirText)),
       ("nixVersion", evaluated (mkStr "2.24.0")),
       ("langVersion", evaluated (VInt 6)),
-      ("nixPath", evaluated (VList [])),
+      ("nixPath", evaluated (VList searchPaths)),
       ("currentTime", evaluated (VInt timestamp)),
       ("currentSystem", evaluated (mkStr currentSystemStr))
     ]
+
+-- ---------------------------------------------------------------------------
+-- NIX_PATH parsing
+-- ---------------------------------------------------------------------------
+
+-- | Parse a @NIX_PATH@-formatted string into a list of search path entry
+-- thunks.  Each entry becomes a @{ prefix, path }@ attrset.
+--
+-- Format: colon-separated entries, each either @name=path@ or plain @path@.
+-- A plain path gets an empty prefix (matching real Nix behaviour).
+--
+-- >>> parseNixPath "nixpkgs=/home/user/nixpkgs:custom=/opt/custom"
+-- [Evaluated (VAttrs {"prefix": "nixpkgs", "path": "/home/user/nixpkgs"}), ...]
+parseNixPath :: Text -> [Thunk]
+parseNixPath raw
+  | T.null raw = []
+  | otherwise = map parseEntry (T.splitOn ":" raw)
+  where
+    parseEntry entry =
+      let (prefix, path) = case T.breakOn "=" entry of
+            (before, after)
+              | T.null after -> ("", before)
+              | otherwise -> (before, T.drop 1 after)
+       in evaluated
+            ( VAttrs
+                ( Map.fromList
+                    [ ("prefix", evaluated (mkStr prefix)),
+                      ("path", evaluated (mkStr path))
+                    ]
+                )
+            )

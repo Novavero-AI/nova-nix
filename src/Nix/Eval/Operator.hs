@@ -31,22 +31,22 @@ type Force m = Thunk -> m NixValue
 -- 'OpImpl') before calling this.  The 'Force' function is used only
 -- for deep structural equality on compound values.
 evalBinary :: (MonadEval m) => Force m -> BinaryOp -> NixValue -> NixValue -> m NixValue
-evalBinary forceThunk op left right = case op of
+evalBinary forceFn op left right = case op of
   OpAdd -> evalAdd left right
   OpSub -> evalArith "subtraction" (-) (-) left right
   OpMul -> evalArith "multiplication" (*) (*) left right
   OpDiv -> evalDiv left right
-  OpEq -> VBool <$> nixEqual forceThunk left right
-  OpNeq -> VBool . not <$> nixEqual forceThunk left right
+  OpEq -> VBool <$> nixEqual forceFn left right
+  OpNeq -> VBool . not <$> nixEqual forceFn left right
   OpLt -> VBool <$> nixCompare left right
   OpLte -> do
     lt <- nixCompare left right
-    eq <- nixEqual forceThunk left right
+    eq <- nixEqual forceFn left right
     pure (VBool (lt || eq))
   OpGt -> VBool <$> nixCompare right left
   OpGte -> do
     gt <- nixCompare right left
-    eq <- nixEqual forceThunk left right
+    eq <- nixEqual forceFn left right
     pure (VBool (gt || eq))
   OpConcat -> evalConcat left right
   OpUpdate -> evalUpdate left right
@@ -153,33 +153,33 @@ nixEqual _ VNull VNull = pure True
 -- String equality ignores context (matching real Nix).
 nixEqual _ (VStr a _) (VStr b _) = pure (a == b)
 nixEqual _ (VPath a) (VPath b) = pure (a == b)
-nixEqual forceThunk (VList as) (VList bs)
+nixEqual forceFn (VList as) (VList bs)
   | length as /= length bs = pure False
-  | otherwise = listEqual forceThunk as bs
-nixEqual forceThunk (VAttrs as) (VAttrs bs)
+  | otherwise = listEqual forceFn as bs
+nixEqual forceFn (VAttrs as) (VAttrs bs)
   | Map.keys as /= Map.keys bs = pure False
   | otherwise = do
       let pairs = zip (Map.elems as) (Map.elems bs)
-      results <- mapM (thunkPairEqual forceThunk) pairs
+      results <- mapM (thunkPairEqual forceFn) pairs
       pure (and results)
 nixEqual _ _ _ = pure False
 
 -- | Pairwise equality of two thunk lists (for list comparison).
 listEqual :: (MonadEval m) => Force m -> [Thunk] -> [Thunk] -> m Bool
 listEqual _ [] [] = pure True
-listEqual forceThunk (a : as) (b : bs) = do
-  va <- forceThunk a
-  vb <- forceThunk b
-  eq <- nixEqual forceThunk va vb
-  if eq then listEqual forceThunk as bs else pure False
+listEqual forceFn (a : as) (b : bs) = do
+  va <- forceFn a
+  vb <- forceFn b
+  eq <- nixEqual forceFn va vb
+  if eq then listEqual forceFn as bs else pure False
 listEqual _ _ _ = pure False
 
 -- | Compare two thunks for equality by forcing both.
 thunkPairEqual :: (MonadEval m) => Force m -> (Thunk, Thunk) -> m Bool
-thunkPairEqual forceThunk (a, b) = do
-  va <- forceThunk a
-  vb <- forceThunk b
-  nixEqual forceThunk va vb
+thunkPairEqual forceFn (a, b) = do
+  va <- forceFn a
+  vb <- forceFn b
+  nixEqual forceFn va vb
 
 -- ---------------------------------------------------------------------------
 -- List / attrset operators

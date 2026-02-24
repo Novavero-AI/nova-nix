@@ -12,7 +12,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig)
-import Nix.Builtins (builtinEnv)
+import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
 import Nix.Eval (Env (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), emptyContext, emptyEnv, eval, mkStr, runPureEval)
@@ -88,7 +88,7 @@ tokenTypes = filter (/= TokEOF) . map locToken
 evalNix :: Text -> Either Text NixValue
 evalNix source = case parseNix "<test>" source of
   Left err -> Left (T.pack (show err))
-  Right expr -> runPureEval (eval (builtinEnv 0) expr)
+  Right expr -> runPureEval (eval (builtinEnv 0 []) expr)
 
 -- | Assert that a Nix expression evaluates to the expected value.
 assertEval :: Text -> Text -> NixValue -> TestResult
@@ -1341,7 +1341,7 @@ evalNixIO baseDir source = case parseNix "<test>" source of
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
     st <- newEvalState baseDir
-    runEvalIO st (eval (builtinEnv (esTimestamp st)) expr)
+    runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
 
 -- | Run a named IO eval test — single label, no double-wrapping.
 runTestIO :: Text -> FilePath -> Text -> NixValue -> IO Bool
@@ -2961,7 +2961,7 @@ evalAndBuild storeDir source = do
     Left err -> pure (Left ("parse error: " <> T.pack (show err)))
     Right expr -> do
       st <- newEvalState "."
-      evalResult <- runEvalIO st (eval (builtinEnv (esTimestamp st)) expr)
+      evalResult <- runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
       case evalResult of
         Left err -> pure (Left ("eval error: " <> err))
         Right val -> case val of
@@ -3060,6 +3060,90 @@ testE2E = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: Phase 4 — search paths, dynamic keys, directory import
+-- ---------------------------------------------------------------------------
+
+testPhase4 :: IO [Bool]
+testPhase4 = do
+  putStrLn "phase4/search-paths"
+  sequence
+    [ -- parseNixPath tests
+      runTest "parseNixPath empty" $
+        assertEqual "empty" [] (parseNixPath ""),
+      runTest "parseNixPath single" $
+        let result = parseNixPath "nixpkgs=/home/user/nixpkgs"
+         in case result of
+              [Evaluated (VAttrs m)] ->
+                case (Map.lookup "prefix" m, Map.lookup "path" m) of
+                  (Just (Evaluated (VStr "nixpkgs" _)), Just (Evaluated (VStr "/home/user/nixpkgs" _))) -> Pass
+                  _ -> Fail "wrong prefix/path"
+              _ -> Fail ("expected one entry, got " <> T.pack (show (length result))),
+      runTest "parseNixPath multiple" $
+        assertEqual "count" 2 (length (parseNixPath "nixpkgs=/nix:custom=/opt")),
+      runTest "parseNixPath plain path" $
+        let result = parseNixPath "/some/path"
+         in case result of
+              [Evaluated (VAttrs m)] ->
+                case (Map.lookup "prefix" m, Map.lookup "path" m) of
+                  (Just (Evaluated (VStr "" _)), Just (Evaluated (VStr "/some/path" _))) -> Pass
+                  _ -> Fail "wrong prefix/path for plain"
+              _ -> Fail "expected one entry",
+      -- ESearchPath parser test
+      runTest "parse <nixpkgs>" $
+        assertParse "search path" "<nixpkgs>" (ESearchPath "nixpkgs"),
+      runTest "parse <nixpkgs/lib>" $
+        assertParse "search path with subpath" "<nixpkgs/lib>" (ESearchPath "nixpkgs/lib"),
+      -- ESearchPath eval (should fail in pure mode since no search paths)
+      runTest "eval <nixpkgs> fails without path" $
+        assertEvalFail "search path not found" "<nixpkgs>",
+      -- Dynamic attribute keys
+      runTest "dynamic key basic" $
+        assertEval "dynamic key" "{ ${\"hello\"} = 42; }.hello" (VInt 42),
+      runTest "dynamic key from let" $
+        assertEval "dynamic key let" "let name = \"x\"; in { ${name} = 1; }.x" (VInt 1),
+      runTest "dynamic key in select" $
+        assertEval "dynamic key select" "let s = { x = 10; }; in s.${\"x\"}" (VInt 10),
+      runTest "dynamic key in hasAttr" $
+        assertEval "dynamic key hasAttr" "let s = { x = 10; }; in s ? ${\"x\"}" (VBool True),
+      runTest "dynamic key hasAttr missing" $
+        assertEval "dynamic key hasAttr missing" "let s = { x = 10; }; in s ? ${\"y\"}" (VBool False)
+    ]
+
+testPhase4IO :: IO [Bool]
+testPhase4IO = do
+  putStrLn "phase4/directory-import"
+  tmpDir <- getTemporaryDirectory
+  let testDir = tmpDir </> "nova-nix-phase4-test"
+      subDir = testDir </> "mypkg"
+      defaultNix = subDir </> "default.nix"
+  -- Create temp directory structure
+  createDirectoryIfMissing True subDir
+  TIO.writeFile defaultNix "42"
+  results <-
+    sequence
+      [ -- Directory import: import ./dir resolves to ./dir/default.nix
+        runTestM "import directory" $ do
+          result <- evalNixIO testDir ("import " <> T.pack "./mypkg")
+          pure $ case result of
+            Right (VInt 42) -> Pass
+            Right other -> Fail ("expected VInt 42, got " <> T.pack (show other))
+            Left err -> Fail ("eval error: " <> err),
+        -- Search path with --nix-path equivalent (populated nixPath)
+        runTestM "search path with populated nixPath" $ do
+          st <- newEvalState testDir
+          let nixPaths = parseNixPath ("mypkg=" <> T.pack subDir)
+              env = builtinEnv (esTimestamp st) nixPaths
+          result <- runEvalIO st (eval env (ESearchPath "mypkg"))
+          pure $ case result of
+            Right (VPath _) -> Pass
+            Right other -> Fail ("expected VPath, got " <> T.pack (show other))
+            Left err -> Fail ("eval error: " <> err)
+      ]
+  -- Cleanup
+  removeDirectoryRecursive testDir
+  pure results
+
+-- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
 
@@ -3126,7 +3210,9 @@ main = do
           testStoreOps,
           testFromATerm,
           testBuilder,
-          testE2E
+          testE2E,
+          testPhase4,
+          testPhase4IO
         ]
   let total = length results
       passed = length (filter id results)

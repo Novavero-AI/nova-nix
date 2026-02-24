@@ -168,4 +168,6 @@ data Expr
     EUnary !UnaryOp !Expr
   | -- | Binary operator application.
     EBinary !BinaryOp !Expr !Expr
+  | -- | Search path lookup: @\<nixpkgs\>@ is @ESearchPath "nixpkgs"@.
+    ESearchPath !Text
   deriving (Eq, Show)

@@ -224,6 +224,20 @@ class (Monad m) => MonadEval m where
   -- | Run an external process: @(command, args, stdin) -> (exitCode, stdout, stderr)@.
   runProcess :: Text -> [Text] -> Text -> m (Int, Text, Text)
 
+  -- | Resolve a path literal to an absolute path.
+  -- In IO evaluation, relative paths are resolved against the current
+  -- file's directory ('esBaseDir').  In pure evaluation, paths are
+  -- returned unchanged.  This ensures that path values captured in
+  -- closures remain valid after the import scope ends.
+  resolvePathLiteral :: Text -> m Text
+
+  -- | Force a thunk to a value, with memoization.
+  -- IO evaluators should cache results (e.g. via 'StableName').
+  -- Pure evaluators re-evaluate each time.
+  -- The first argument is the evaluation function (to break the
+  -- Eval.Types → Eval circular dependency).
+  forceThunk :: (Env -> Expr -> m NixValue) -> Thunk -> m NixValue
+
 -- | Pure evaluation monad — wraps 'Either Text'.
 -- IO builtins ('readFile', 'import') are unavailable;
 -- everything else evaluates identically to the IO version.
@@ -242,3 +256,6 @@ instance MonadEval PureEval where
   writeToStore _ _ = throwEvalError "toFile: not available in pure evaluation"
   scopedImportFile _ _ = throwEvalError "scopedImport: not available in pure evaluation"
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
+  resolvePathLiteral = pure
+  forceThunk _ (Evaluated val) = pure val
+  forceThunk evalFn (Thunk expr env) = evalFn env expr

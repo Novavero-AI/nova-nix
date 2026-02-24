@@ -226,7 +226,17 @@ lexNormalMode st acc
             '>' | Just '=' <- safeHead rest -> emit2 st TokGte acc
             '>' -> emit1 st TokGt acc
             '/' | Just '/' <- safeHead rest -> emit2 st TokUpdate acc
-            '/' -> emit1 st TokSlash acc
+            '/'
+              -- After an expression token, / is always division
+              | prevCanEndExpr -> emit1 st TokSlash acc
+              -- Not after expression: / followed by path char starts an absolute path
+              | Just c2 <- safeHead rest, isPathChar c2 -> lexPath st acc
+              -- Otherwise, division
+              | otherwise -> emit1 st TokSlash acc
+              where
+                prevCanEndExpr = case acc of
+                  (Located _ _ tok : _) -> canFollowWithDivision tok
+                  [] -> False
             '$'
               | Just '{' <- safeHead rest ->
                   emit2 st TokInterpOpen acc
@@ -609,6 +619,25 @@ isSearchPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
 
 isUriChar :: Char -> Bool
 isUriChar c = isAlphaNum c || c `elem` ("%/?:@&=+$,#._~!-" :: [Char])
+
+-- | Whether a token can be the last token of an expression.
+-- Used to decide if @/@ is division or the start of an absolute path.
+-- Real Nix uses the same context-dependent rule in its lexer.
+canFollowWithDivision :: Token -> Bool
+canFollowWithDivision (TokIdent _) = True
+canFollowWithDivision (TokInt _) = True
+canFollowWithDivision (TokFloat _) = True
+canFollowWithDivision (TokPath _) = True
+canFollowWithDivision TokRParen = True
+canFollowWithDivision TokRBracket = True
+canFollowWithDivision TokRBrace = True
+canFollowWithDivision TokInterpClose = True
+canFollowWithDivision TokStringClose = True
+canFollowWithDivision TokIndStringClose = True
+canFollowWithDivision TokTrue = True
+canFollowWithDivision TokFalse = True
+canFollowWithDivision TokNull = True
+canFollowWithDivision _ = False
 
 isIndStringEscape :: Text -> Bool
 isIndStringEscape t = case T.uncons t of

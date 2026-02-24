@@ -49,6 +49,7 @@ where
 
 import Control.Monad (when, (>=>))
 import qualified Crypto.Hash as CH
+import qualified Data.Array as Array
 import Data.Bits (xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, ord)
@@ -96,6 +97,8 @@ import Nix.Expr.Types
 import Nix.Hash (byteToHex, sha256Hex, truncatedBase32)
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath)
 import qualified System.Info
+import Text.Regex.TDFA (matchAllText)
+import qualified Text.Regex.TDFA as RE
 
 -- | Evaluate a Nix expression in an environment.
 eval :: (MonadEval m) => Env -> Expr -> m NixValue
@@ -117,6 +120,7 @@ eval env expr = case expr of
   EUnary op operand -> do
     val <- eval env operand
     evalUnary op val
+  ESearchPath name -> evalSearchPath env name
   EBinary OpAnd left right -> evalShortCircuitAnd env left right
   EBinary OpOr left right -> evalShortCircuitOr env left right
   EBinary OpImpl left right -> evalShortCircuitImpl env left right
@@ -126,9 +130,12 @@ eval env expr = case expr of
     evalBinary force op leftVal rightVal
 
 -- | Force a thunk to a value.
+--
+-- Delegates to 'forceThunk' which is a 'MonadEval' method — this
+-- allows IO evaluators to implement memoization (caching the result
+-- after the first force) while pure evaluators simply re-evaluate.
 force :: (MonadEval m) => Thunk -> m NixValue
-force (Evaluated val) = pure val
-force (Thunk thunkExpr thunkEnv) = eval thunkEnv thunkExpr
+force = forceThunk eval
 
 -- ---------------------------------------------------------------------------
 -- Literal
@@ -141,7 +148,28 @@ evalLit atom = case atom of
   NixBool b -> pure (VBool b)
   NixNull -> pure VNull
   NixUri u -> pure (mkStr u)
-  NixPath p -> pure (VPath p)
+  NixPath p -> VPath <$> resolvePathLiteral p
+
+-- ---------------------------------------------------------------------------
+-- Search paths (<nixpkgs>, <nixpkgs/lib>)
+-- ---------------------------------------------------------------------------
+
+-- | Evaluate a search path expression.
+-- Desugars to @builtins.findFile builtins.nixPath "name"@ — exactly how
+-- real Nix handles @\<name\>@ expressions.
+evalSearchPath :: (MonadEval m) => Env -> Text -> m NixValue
+evalSearchPath env name = do
+  builtinsVal <- evalVar env "builtins"
+  case builtinsVal of
+    VAttrs builtinsAttrs ->
+      case Map.lookup "nixPath" builtinsAttrs of
+        Just nixPathThunk -> do
+          nixPathVal <- force nixPathThunk
+          builtinFindFile nixPathVal (mkStr name)
+        Nothing ->
+          throwEvalError ("file '" <> name <> "' was not found in the Nix search path")
+    _ ->
+      throwEvalError ("file '" <> name <> "' was not found in the Nix search path")
 
 -- ---------------------------------------------------------------------------
 -- Variables
@@ -163,48 +191,117 @@ evalAttrs env True bindings = evalRecAttrs env bindings
 
 -- | Non-recursive attribute set: thunks capture the outer environment.
 evalNonRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
-evalNonRecAttrs env bindings =
-  case buildBindingsMap env env bindings of
-    Left err -> throwEvalError err
-    Right attrMap -> pure (VAttrs attrMap)
+evalNonRecAttrs env bindings = do
+  attrMap <- buildBindingsMapM env env bindings
+  pure (VAttrs attrMap)
 
 -- | Recursive attribute set: thunks capture the completed environment
 -- (Haskell's laziness ties the knot — Thunk's Env field is lazy).
+-- Dynamic keys in recursive attrs evaluate against the outer env
+-- (the rec env is not yet available during key resolution).
 evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
-evalRecAttrs env bindings =
+evalRecAttrs env bindings = do
+  -- Resolve dynamic keys eagerly against the outer env.
+  resolvedBindings <- resolveBindingKeys env bindings
+  -- Now knot-tie: thunks capture recEnv, keys are already resolved.
   let recEnv = env {envBindings = Map.union recBindings (envBindings env)}
-      recBindings = case buildBindingsMap recEnv recEnv bindings of
-        Right m -> m
-        Left _ -> Map.empty
-   in pure (VAttrs recBindings)
+      recBindings = buildResolvedBindingsMap recEnv resolvedBindings
+  pure (VAttrs recBindings)
 
--- | Build a flat attribute map from bindings (pure — only creates
--- thunks, never forces them).  Used by let, rec {}, and non-rec {}.
+-- | Build a flat attribute map from bindings (monadic — resolves
+-- dynamic keys via eval, but only creates thunks for values).
+-- Used by non-rec {}.
+--
+-- @thunkEnv@ is the environment captured by value thunks.
+-- @keyEnv@ is used to evaluate dynamic key expressions.
 --
 -- Handles nested attribute paths (@a.b.c = 1@) by building nested
 -- 'VAttrs' maps.  Handles @inherit@ by looking up names in the
 -- environment or a source expression.
-buildBindingsMap :: Env -> Env -> [Binding] -> Either Text (Map Text Thunk)
-buildBindingsMap thunkEnv lookupEnv =
-  foldl' mergeBinding (Right Map.empty)
+buildBindingsMapM :: (MonadEval m) => Env -> Env -> [Binding] -> m (Map Text Thunk)
+buildBindingsMapM thunkEnv keyEnv = foldlM' mergeBinding Map.empty
   where
-    mergeBinding acc binding = do
-      current <- acc
-      new <- processBinding thunkEnv lookupEnv binding
+    mergeBinding current binding = do
+      new <- processBindingM thunkEnv keyEnv binding
       pure (mergeAttrMaps current new)
 
+-- | Strict left fold over a list in a monad.
+foldlM' :: (Monad m) => (b -> a -> m b) -> b -> [a] -> m b
+foldlM' _ acc [] = pure acc
+foldlM' f !acc (x : xs) = do
+  acc2 <- f acc x
+  foldlM' f acc2 xs
+
 -- | Process a single binding into key-value pairs.
-processBinding :: Env -> Env -> Binding -> Either Text (Map Text Thunk)
-processBinding thunkEnv _ (NamedBinding path bodyExpr) =
-  buildNestedAttr thunkEnv path bodyExpr
-processBinding _ lookupEnv (Inherit Nothing names) =
-  Right $ Map.fromList [(n, inheritLookup lookupEnv n) | n <- names]
-processBinding thunkEnv _ (Inherit (Just fromExpr) names) =
-  Right $
+processBindingM :: (MonadEval m) => Env -> Env -> Binding -> m (Map Text Thunk)
+processBindingM thunkEnv keyEnv (NamedBinding path bodyExpr) =
+  buildNestedAttrM thunkEnv keyEnv path bodyExpr
+processBindingM _ lookupEnv (Inherit Nothing names) =
+  pure $ Map.fromList [(n, inheritLookup lookupEnv n) | n <- names]
+processBindingM thunkEnv _ (Inherit (Just fromExpr) names) =
+  pure $
     Map.fromList
       [ (n, mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))
       | n <- names
       ]
+
+-- ---------------------------------------------------------------------------
+-- Resolved bindings (for knot-tying in rec {} and let)
+-- ---------------------------------------------------------------------------
+
+-- | A binding with all attribute keys pre-resolved to text.
+-- Used by 'evalRecAttrs' and 'evalLet' to separate key resolution
+-- (monadic, may evaluate dynamic keys) from thunk construction
+-- (pure, enables knot-tying).
+data ResolvedBinding
+  = -- | @path = expr@ with all keys resolved to text.
+    ResolvedNamed ![Text] !Expr
+  | -- | @inherit attrs@ from the surrounding scope.
+    ResolvedInherit ![Text]
+  | -- | @inherit (from) attrs@.
+    ResolvedInheritFrom !Expr ![Text]
+
+-- | Resolve all attribute keys in a list of bindings, evaluating
+-- dynamic keys against the given environment.
+resolveBindingKeys :: (MonadEval m) => Env -> [Binding] -> m [ResolvedBinding]
+resolveBindingKeys keyEnv = mapM resolveOne
+  where
+    resolveOne (NamedBinding path bodyExpr) = do
+      resolvedPath <- mapM (resolveKey keyEnv) path
+      pure (ResolvedNamed resolvedPath bodyExpr)
+    resolveOne (Inherit Nothing names) =
+      pure (ResolvedInherit names)
+    resolveOne (Inherit (Just fromExpr) names) =
+      pure (ResolvedInheritFrom fromExpr names)
+
+-- | Build a flat attribute map from pre-resolved bindings (pure).
+-- Thunks capture @thunkEnv@ — suitable for knot-tying.
+buildResolvedBindingsMap :: Env -> [ResolvedBinding] -> Map Text Thunk
+buildResolvedBindingsMap thunkEnv =
+  foldl' mergeBinding Map.empty
+  where
+    mergeBinding current binding =
+      mergeAttrMaps current (processResolved thunkEnv binding)
+
+-- | Process a single resolved binding into key-value pairs (pure).
+processResolved :: Env -> ResolvedBinding -> Map Text Thunk
+processResolved thunkEnv (ResolvedNamed path bodyExpr) =
+  buildResolvedNestedAttr thunkEnv path bodyExpr
+processResolved lookupEnv (ResolvedInherit names) =
+  Map.fromList [(n, inheritLookup lookupEnv n) | n <- names]
+processResolved thunkEnv (ResolvedInheritFrom fromExpr names) =
+  Map.fromList
+    [ (n, mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))
+    | n <- names
+    ]
+
+-- | Build a nested attribute structure from a resolved dotted path (pure).
+buildResolvedNestedAttr :: Env -> [Text] -> Expr -> Map Text Thunk
+buildResolvedNestedAttr _thunkEnv [] _bodyExpr = Map.empty
+buildResolvedNestedAttr thunkEnv [key] bodyExpr =
+  Map.singleton key (mkThunk thunkEnv bodyExpr)
+buildResolvedNestedAttr thunkEnv (key : rest) bodyExpr =
+  Map.singleton key (evaluated (VAttrs (buildResolvedNestedAttr thunkEnv rest bodyExpr)))
 
 -- | Look up a name for @inherit@.  If not found, create a thunk
 -- that will error when forced.
@@ -216,21 +313,27 @@ inheritLookup env name =
 
 -- | Build a nested attribute structure from a dotted path.
 -- @a.b.c = expr@ becomes @{ a = { b = { c = thunk; }; }; }@.
-buildNestedAttr :: Env -> AttrPath -> Expr -> Either Text (Map Text Thunk)
-buildNestedAttr thunkEnv path bodyExpr = case path of
-  [] -> Left "empty attribute path"
-  [key] -> do
-    keyText <- resolveStaticKey key
-    pure (Map.singleton keyText (mkThunk thunkEnv bodyExpr))
-  (key : rest) -> do
-    keyText <- resolveStaticKey key
-    inner <- buildNestedAttr thunkEnv rest bodyExpr
-    pure (Map.singleton keyText (evaluated (VAttrs inner)))
+buildNestedAttrM :: (MonadEval m) => Env -> Env -> AttrPath -> Expr -> m (Map Text Thunk)
+buildNestedAttrM _thunkEnv _keyEnv [] _bodyExpr =
+  throwEvalError "empty attribute path"
+buildNestedAttrM thunkEnv keyEnv [key] bodyExpr = do
+  keyText <- resolveKey keyEnv key
+  pure (Map.singleton keyText (mkThunk thunkEnv bodyExpr))
+buildNestedAttrM thunkEnv keyEnv (key : rest) bodyExpr = do
+  keyText <- resolveKey keyEnv key
+  inner <- buildNestedAttrM thunkEnv keyEnv rest bodyExpr
+  pure (Map.singleton keyText (evaluated (VAttrs inner)))
 
--- | Resolve a static attribute key to its text name.
-resolveStaticKey :: AttrKey -> Either Text Text
-resolveStaticKey (StaticKey name) = Right name
-resolveStaticKey (DynamicKey _) = Left "dynamic attribute keys not yet supported"
+-- | Resolve an attribute key to its text name.
+-- Static keys return immediately; dynamic keys evaluate the expression
+-- and coerce the result to a string.
+resolveKey :: (MonadEval m) => Env -> AttrKey -> m Text
+resolveKey _env (StaticKey name) = pure name
+resolveKey env (DynamicKey expr) = do
+  val <- eval env expr
+  case val of
+    VStr s _ -> pure s
+    _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName val)
 
 -- | Merge two attribute maps.  For overlapping keys where both sides
 -- are attribute sets, merge recursively (for nested attr paths).
@@ -251,7 +354,7 @@ mergeThunks _ new = new
 evalSelect :: (MonadEval m) => Env -> Expr -> AttrPath -> Maybe Expr -> m NixValue
 evalSelect env target path defExpr = do
   targetVal <- eval env target
-  result <- walkAttrPath path targetVal
+  result <- walkAttrPath env path targetVal
   case result of
     Just val -> pure val
     Nothing -> case defExpr of
@@ -261,24 +364,23 @@ evalSelect env target path defExpr = do
 -- | Walk an attribute path through nested attribute sets.
 -- Returns @Just value@ if the full path resolves, @Nothing@ if any
 -- key is missing or a non-set is encountered mid-path.
-walkAttrPath :: (MonadEval m) => AttrPath -> NixValue -> m (Maybe NixValue)
-walkAttrPath [] val = pure (Just val)
-walkAttrPath (key : rest) val = case val of
-  VAttrs attrs ->
-    case resolveStaticKey key of
-      Left err -> throwEvalError err
-      Right keyText ->
-        case Map.lookup keyText attrs of
-          Just thunk -> do
-            inner <- force thunk
-            walkAttrPath rest inner
-          Nothing -> pure Nothing
+-- The @env@ is used only for resolving dynamic keys.
+walkAttrPath :: (MonadEval m) => Env -> AttrPath -> NixValue -> m (Maybe NixValue)
+walkAttrPath _env [] val = pure (Just val)
+walkAttrPath env (key : rest) val = case val of
+  VAttrs attrs -> do
+    keyText <- resolveKey env key
+    case Map.lookup keyText attrs of
+      Just thunk -> do
+        inner <- force thunk
+        walkAttrPath env rest inner
+      Nothing -> pure Nothing
   _ -> pure Nothing
 
 evalHasAttr :: (MonadEval m) => Env -> Expr -> AttrPath -> m NixValue
 evalHasAttr env target path = do
   targetVal <- eval env target
-  result <- walkAttrPath path targetVal
+  result <- walkAttrPath env path targetVal
   case result of
     Just _ -> pure (VBool True)
     Nothing -> pure (VBool False)
@@ -369,13 +471,14 @@ bindFormal attrs acc (Formal name defExpr) = do
 
 -- | Let is recursive in Nix: all bindings are visible to each other.
 -- Knot-tying via Haskell laziness (Thunk's Env field is lazy).
+-- Dynamic keys in let evaluate against the outer env (the let env
+-- is not yet available during key resolution).
 evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> m NixValue
-evalLet env bindings body =
+evalLet env bindings body = do
+  resolvedBindings <- resolveBindingKeys env bindings
   let letEnv = env {envBindings = Map.union letBindings (envBindings env)}
-      letBindings = case buildBindingsMap letEnv letEnv bindings of
-        Right m -> m
-        Left _ -> Map.empty
-   in eval letEnv body
+      letBindings = buildResolvedBindingsMap letEnv resolvedBindings
+  eval letEnv body
 
 evalIf :: (MonadEval m) => Env -> Expr -> Expr -> Expr -> m NixValue
 evalIf env cond thenExpr elseExpr = do
@@ -566,6 +669,8 @@ builtinRegistry =
       builtin1 "functionArgs" builtinFunctionArgs,
       builtin2 "zipAttrsWith" builtinZipAttrsWith,
       -- String manipulation
+      builtin2 "match" builtinMatch,
+      builtin2 "split" builtinSplit,
       builtin3 "replaceStrings" builtinReplaceStrings,
       builtin2 "compareVersions" builtinCompareVersions,
       builtin1 "splitVersion" builtinSplitVersion,
@@ -597,7 +702,11 @@ builtinRegistry =
       builtin1 "fetchTarball" builtinFetchTarball,
       builtin1 "fetchGit" builtinFetchGit,
       -- Derivation construction
-      builtin1 "derivation" builtinDerivation
+      builtin1 "derivation" builtinDerivation,
+      -- Error context (pass-through — context only matters on error)
+      builtin2 "addErrorContext" (\_ val -> pure val),
+      -- Attr position (return null — nixpkgs handles this gracefully)
+      builtin2 "unsafeGetAttrPos" (\_ _ -> pure VNull)
     ]
 
 -- | Names of all registered builtins.
@@ -1444,6 +1553,74 @@ replaceAll pairs = go
       | T.null from = Just (to, txt, from)
       | Just suffix <- T.stripPrefix from txt = Just (to, suffix, from)
       | otherwise = findMatch rest txt
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — regex (POSIX ERE via regex-tdfa)
+-- ---------------------------------------------------------------------------
+
+-- | @builtins.match regex str@: match a POSIX ERE against a string.
+-- The regex is implicitly anchored (must match the entire string).
+-- Returns @null@ if no match, or a list of capture group strings
+-- (empty string for unmatched optional groups).
+builtinMatch :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinMatch (VStr regex _) (VStr str _) = do
+  let anchored = "^" <> T.unpack regex <> "$"
+  case RE.makeRegexM anchored :: Maybe RE.Regex of
+    Nothing ->
+      throwEvalError ("builtins.match: invalid regex: " <> regex)
+    Just compiled ->
+      let matches = matchAllText compiled (T.unpack str)
+       in case matches of
+            [] -> pure VNull
+            (match : _) ->
+              -- match is an Array of (String, (offset, len)) pairs.
+              -- Index 0 is the full match; indices 1.. are capture groups.
+              let groups = Array.elems match
+                  -- Skip index 0 (full match) — return only capture groups.
+                  captureGroups = drop 1 groups
+                  toThunk (s, _) = evaluated (mkStr (T.pack s))
+               in pure (VList (map toThunk captureGroups))
+builtinMatch (VStr _ _) other =
+  throwEvalError ("builtins.match: expected a string, got " <> typeName other)
+builtinMatch other _ =
+  throwEvalError ("builtins.match: expected a string (regex), got " <> typeName other)
+
+-- | @builtins.split regex str@: split a string by a POSIX ERE.
+-- Returns an alternating list of non-matched strings and match-group lists.
+-- Example: @split "(x)" "axbxc"@ → @["a" ["x"] "b" ["x"] "c"]@
+builtinSplit :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinSplit (VStr regex _) (VStr str _) = do
+  case RE.makeRegexM (T.unpack regex) :: Maybe RE.Regex of
+    Nothing ->
+      throwEvalError ("builtins.split: invalid regex: " <> regex)
+    Just compiled ->
+      let allMatches = matchAllText compiled (T.unpack str)
+          strText = T.unpack str
+          result = buildSplitResult strText 0 allMatches
+       in pure (VList result)
+builtinSplit (VStr _ _) other =
+  throwEvalError ("builtins.split: expected a string, got " <> typeName other)
+builtinSplit other _ =
+  throwEvalError ("builtins.split: expected a string (regex), got " <> typeName other)
+
+-- | Build the alternating list for builtins.split.
+buildSplitResult :: String -> Int -> [Array.Array Int (String, (Int, Int))] -> [Thunk]
+buildSplitResult remaining pos [] =
+  -- No more matches — emit the rest of the string.
+  [evaluated (mkStr (T.pack (drop pos remaining)))]
+buildSplitResult remaining pos (match : rest) =
+  let fullMatch = match Array.! 0
+      (_, (matchStart, matchLen)) = fullMatch
+      -- Text before this match
+      before = T.pack (take (matchStart - pos) (drop pos remaining))
+      -- Capture groups (indices 1..)
+      groups = drop 1 (Array.elems match)
+      groupThunks = map (\(s, _) -> evaluated (mkStr (T.pack s))) groups
+      -- Continue after this match
+      afterPos = matchStart + matchLen
+   in evaluated (mkStr before)
+        : evaluated (VList groupThunks)
+        : buildSplitResult remaining afterPos rest
 
 builtinCompareVersions :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinCompareVersions (VStr a _) (VStr b _) =

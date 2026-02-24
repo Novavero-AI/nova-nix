@@ -9,7 +9,7 @@
 --
 -- @
 -- st <- newEvalState "/path/to/project"
--- result <- runEvalIO st (eval (builtinEnv 0) expr)
+-- result <- runEvalIO st (eval (builtinEnv 0 []) expr)
 -- @
 module Nix.Eval.IO
   ( -- * Evaluator
@@ -30,6 +30,7 @@ import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), asks, local)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import qualified Data.IntMap.Strict as IntMap
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -37,15 +38,17 @@ import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import qualified Data.Text.IO as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Nix.Builtins (builtinEnv, builtinEnvWithScope)
+import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
-import Nix.Eval.Types (MonadEval (..), NixValue)
+import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..))
+import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix)
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath (isRelative, takeDirectory, (</>))
+import System.Mem.StableName (StableName, eqStableName, hashStableName, makeStableName)
 import qualified System.Process as Proc
 
 -- ---------------------------------------------------------------------------
@@ -70,24 +73,45 @@ instance Exception NixEvalError
 --
 -- 'esBaseDir' is immutable per frame — @import@ uses 'local' to set it
 -- for nested evaluations, so it is exception-safe with no save\/restore.
+--
+-- 'esSearchPaths' holds parsed @NIX_PATH@ entries as thunks, populating
+-- @builtins.nixPath@.
+-- | Type alias for the thunk memoization cache.
+-- Keyed by 'hashStableName', with collision chains for identity
+-- comparison via 'eqStableName'.
+type MemoCache = IntMap.IntMap [(StableName Expr, NixValue)]
+
 data EvalState = EvalState
   { esImportCache :: !(IORef (Map FilePath NixValue)),
     esBaseDir :: !FilePath,
     esStoreDir :: !FilePath,
-    esTimestamp :: !Integer
+    esTimestamp :: !Integer,
+    esSearchPaths :: ![Thunk],
+    -- | Thunk memoization cache.  Maps thunk identity (via 'StableName'
+    -- on the thunk's Expr) to its forced value.  Shared across all
+    -- frames so recursive attrset members are evaluated at most once.
+    esMemoCache :: !(IORef MemoCache)
   }
 
 -- | Create a fresh evaluation state rooted at the given directory.
+-- Reads @NIX_PATH@ from the environment to populate search paths.
 newEvalState :: FilePath -> IO EvalState
 newEvalState baseDir = do
   cache <- newIORef Map.empty
+  memo <- newIORef IntMap.empty
   now <- fmap (floor . toRational) getPOSIXTime :: IO Integer
+  nixPathStr <- lookupEnvText "NIX_PATH"
+  let searchPaths = case nixPathStr of
+        Just val -> parseNixPath (T.pack val)
+        Nothing -> []
   pure
     EvalState
       { esImportCache = cache,
         esBaseDir = baseDir,
         esStoreDir = "/nix/store",
-        esTimestamp = now
+        esTimestamp = now,
+        esSearchPaths = searchPaths,
+        esMemoCache = memo
       }
 
 -- ---------------------------------------------------------------------------
@@ -122,30 +146,40 @@ instance MonadEval EvalIO where
   importFile rawPath = do
     baseDir <- EvalIO (asks esBaseDir)
     timestamp <- EvalIO (asks esTimestamp)
+    searchPaths <- EvalIO (asks esSearchPaths)
     let raw = T.unpack rawPath
         resolved = if isRelative raw then baseDir </> raw else raw
     canonical <- wrapIO (Dir.canonicalizePath resolved)
+    -- Directory import: append /default.nix if target is a directory
+    target <- wrapIO $ do
+      isDir <- Dir.doesDirectoryExist canonical
+      pure (if isDir then canonical </> "default.nix" else canonical)
     -- Check import cache (readIORef cannot throw, no wrapIO needed)
     cacheRef <- EvalIO (asks esImportCache)
     cache <- EvalIO (liftIO (readIORef cacheRef))
-    case Map.lookup canonical cache of
+    case Map.lookup target cache of
       Just cached -> pure cached
       Nothing -> do
-        source <- wrapIO (TIO.readFile canonical)
-        case parseNix (T.pack canonical) source of
+        source <- wrapIO (TIO.readFile target)
+        case parseNix (T.pack target) source of
           Left err ->
             throwEvalError
-              ("import " <> T.pack canonical <> ": " <> T.pack (show err))
-          Right expr -> do
+              ("import " <> T.pack target <> ": " <> T.pack (show err))
+          Right rawExpr -> do
+            -- Resolve relative paths in the AST to absolute, matching
+            -- real Nix (which resolves at parse time).  This ensures paths
+            -- captured in closures remain valid after the import scope ends.
+            let fileDir = takeDirectory target
+                expr = resolveRelativePaths fileDir rawExpr
             -- local sets new base dir for nested imports — pure, exception-safe
             let nested =
                   EvalIO
                     ( local
-                        (\s -> s {esBaseDir = takeDirectory canonical})
-                        (unEvalIO (eval (builtinEnv timestamp) expr))
+                        (\s -> s {esBaseDir = fileDir})
+                        (unEvalIO (eval (builtinEnv timestamp searchPaths) expr))
                     )
             result <- nested
-            wrapIO (modifyIORef' cacheRef (Map.insert canonical result))
+            wrapIO (modifyIORef' cacheRef (Map.insert target result))
             pure result
 
   getEnvVar name = wrapIO $ do
@@ -176,6 +210,7 @@ instance MonadEval EvalIO where
   scopedImportFile scope rawPath = do
     baseDir <- EvalIO (asks esBaseDir)
     timestamp <- EvalIO (asks esTimestamp)
+    searchPaths <- EvalIO (asks esSearchPaths)
     let raw = T.unpack rawPath
         resolved = if isRelative raw then baseDir </> raw else raw
     canonical <- wrapIO (Dir.canonicalizePath resolved)
@@ -184,12 +219,14 @@ instance MonadEval EvalIO where
       Left err ->
         throwEvalError
           ("scopedImport " <> T.pack canonical <> ": " <> T.pack (show err))
-      Right expr -> do
+      Right rawExpr -> do
+        let fileDir = takeDirectory canonical
+            expr = resolveRelativePaths fileDir rawExpr
         -- No import cache for scoped imports (different scopes = different results)
-        let scopedEnv = builtinEnvWithScope timestamp scope
+        let scopedEnv = builtinEnvWithScope timestamp searchPaths scope
         EvalIO
           ( local
-              (\s -> s {esBaseDir = takeDirectory canonical})
+              (\s -> s {esBaseDir = fileDir})
               (unEvalIO (eval scopedEnv expr))
           )
 
@@ -206,6 +243,42 @@ instance MonadEval EvalIO where
           ExitSuccess -> 0
           ExitFailure n -> n
     pure (code, T.pack stdoutStr, T.pack stderrStr)
+
+  resolvePathLiteral path = do
+    baseDir <- EvalIO (asks esBaseDir)
+    let raw = T.unpack path
+    if isRelative raw
+      then pure (T.pack (baseDir </> raw))
+      else pure path
+
+  forceThunk _ (Evaluated val) = pure val
+  forceThunk evalFn (Thunk expr env) = do
+    memoRef <- EvalIO (asks esMemoCache)
+    sn <- wrapIO (makeStableName $! expr)
+    let snHash = hashStableName sn
+    memo <- wrapIO (readIORef memoRef)
+    -- Look up by hash, then confirm identity with eqStableName
+    case lookupMemo sn (IntMap.lookup snHash memo) of
+      Just val -> pure val
+      Nothing -> do
+        val <- evalFn env expr
+        wrapIO $
+          modifyIORef' memoRef $
+            IntMap.insertWith (++) snHash [(sn, val)]
+        pure val
+
+-- ---------------------------------------------------------------------------
+-- Thunk memoization
+-- ---------------------------------------------------------------------------
+
+-- | Look up a thunk's cached value in a collision chain.
+-- Uses 'eqStableName' for identity comparison (not just hash).
+lookupMemo :: StableName Expr -> Maybe [(StableName Expr, NixValue)] -> Maybe NixValue
+lookupMemo _ Nothing = Nothing
+lookupMemo _ (Just []) = Nothing
+lookupMemo sn (Just ((sn2, val) : rest))
+  | eqStableName sn sn2 = Just val
+  | otherwise = lookupMemo sn (Just rest)
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -254,3 +327,57 @@ lookupEnvText name = do
   case (result :: Either SomeException (Maybe String)) of
     Left _ -> pure Nothing
     Right mval -> pure mval
+
+-- ---------------------------------------------------------------------------
+-- Path resolution (matching real Nix: resolve at parse time)
+-- ---------------------------------------------------------------------------
+
+-- | Resolve all relative 'NixPath' literals in an expression to absolute
+-- paths relative to the given directory.  Real Nix resolves path literals
+-- at parse time based on the source file location.  We do the same right
+-- after parsing in 'importFile' so that paths captured in closures remain
+-- valid after the import scope ends.
+resolveRelativePaths :: FilePath -> Expr -> Expr
+resolveRelativePaths dir = goExpr
+  where
+    goExpr expr = case expr of
+      ELit (NixPath p)
+        | isRelative (T.unpack p) ->
+            ELit (NixPath (T.pack (dir </> T.unpack p)))
+      ELit _ -> expr
+      EStr parts -> EStr (map goPart parts)
+      EIndStr parts -> EIndStr (map goPart parts)
+      EVar _ -> expr
+      EAttrs isRec bindings -> EAttrs isRec (map goBinding bindings)
+      EList elems -> EList (map goExpr elems)
+      ESelect target path mDef ->
+        ESelect (goExpr target) (map goKey path) (fmap goExpr mDef)
+      EHasAttr target path -> EHasAttr (goExpr target) (map goKey path)
+      EApp f x -> EApp (goExpr f) (goExpr x)
+      ELambda formals body -> ELambda (goFormals formals) (goExpr body)
+      ELet bindings body -> ELet (map goBinding bindings) (goExpr body)
+      EIf c t f -> EIf (goExpr c) (goExpr t) (goExpr f)
+      EWith scope body -> EWith (goExpr scope) (goExpr body)
+      EAssert cond body -> EAssert (goExpr cond) (goExpr body)
+      EUnary op e -> EUnary op (goExpr e)
+      EBinary op l r -> EBinary op (goExpr l) (goExpr r)
+      ESearchPath _ -> expr
+
+    goPart part = case part of
+      StrLit _ -> part
+      StrInterp e -> StrInterp (goExpr e)
+
+    goBinding binding = case binding of
+      NamedBinding path e -> NamedBinding (map goKey path) (goExpr e)
+      Inherit from names -> Inherit (fmap goExpr from) names
+
+    goKey key = case key of
+      StaticKey _ -> key
+      DynamicKey e -> DynamicKey (goExpr e)
+
+    goFormals formals = case formals of
+      FormalName _ -> formals
+      FormalSet fs ellipsis -> FormalSet (map goFormal fs) ellipsis
+      FormalNamedSet n fs ellipsis -> FormalNamedSet n (map goFormal fs) ellipsis
+
+    goFormal (Formal n mDef) = Formal n (fmap goExpr mDef)

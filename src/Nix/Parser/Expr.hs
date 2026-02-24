@@ -372,7 +372,7 @@ parseAtom = do
     TokNull -> advance >> pure (ELit NixNull)
     TokUri u -> advance >> pure (ELit (NixUri u))
     TokPath p -> advance >> pure (ELit (NixPath p))
-    TokSearchPath p -> advance >> pure (ELit (NixPath ("<" <> p <> ">")))
+    TokSearchPath p -> advance >> pure (ESearchPath p)
     TokIdent name -> advance >> pure (EVar name)
     TokStringOpen -> parseString
     TokIndStringOpen -> parseIndString
@@ -510,7 +510,27 @@ parseInheritNames = go []
         TokIdent name -> do
           _ <- advance
           go (acc ++ [name])
+        -- Quoted strings for keywords used as attribute names: inherit "or";
+        TokStringOpen -> do
+          _ <- advance
+          name <- parseQuotedInheritName
+          go (acc ++ [name])
         _ -> pure acc
+
+-- | Parse a quoted inherit name: a simple string literal (no interpolation).
+-- Used for keywords like @"or"@ in @inherit (self.trivial) "or";@.
+parseQuotedInheritName :: Parser Text
+parseQuotedInheritName = do
+  tok <- peek
+  case tok of
+    TokStringLit s -> do
+      _ <- advance
+      expect TokStringClose
+      pure s
+    TokStringClose -> do
+      _ <- advance
+      pure ""
+    _ -> parseError ("expected string literal in inherit, got " <> showTok tok)
 
 parseAttrPath :: Parser AttrPath
 parseAttrPath = do
@@ -529,7 +549,9 @@ parseAttrKey = do
     TokInterpOpen -> do
       _ <- advance
       expr <- parseExpr
-      expect TokInterpClose
+      -- In expression context, the lexer doesn't track interpolation
+      -- mode — } is TokRBrace rather than TokInterpClose.
+      expect TokRBrace
       pure (DynamicKey expr)
     _ -> parseError ("expected attribute key, got " <> showTok tok)
 
