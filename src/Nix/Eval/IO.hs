@@ -29,8 +29,7 @@ import Control.Exception (Exception, SomeException, displayException, fromExcept
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), asks, local)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
-import qualified Data.IntMap.Strict as IntMap
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -48,7 +47,6 @@ import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath (isRelative, takeDirectory, (</>))
-import System.Mem.StableName (StableName, eqStableName, hashStableName, makeStableName)
 import qualified System.Process as Proc
 
 -- ---------------------------------------------------------------------------
@@ -76,21 +74,12 @@ instance Exception NixEvalError
 --
 -- 'esSearchPaths' holds parsed @NIX_PATH@ entries as thunks, populating
 -- @builtins.nixPath@.
--- | Type alias for the thunk memoization cache.
--- Keyed by 'hashStableName', with collision chains for identity
--- comparison via 'eqStableName'.
-type MemoCache = IntMap.IntMap [(StableName Expr, NixValue)]
-
 data EvalState = EvalState
   { esImportCache :: !(IORef (Map FilePath NixValue)),
     esBaseDir :: !FilePath,
     esStoreDir :: !FilePath,
     esTimestamp :: !Integer,
-    esSearchPaths :: ![Thunk],
-    -- | Thunk memoization cache.  Maps thunk identity (via 'StableName'
-    -- on the thunk's Expr) to its forced value.  Shared across all
-    -- frames so recursive attrset members are evaluated at most once.
-    esMemoCache :: !(IORef MemoCache)
+    esSearchPaths :: ![Thunk]
   }
 
 -- | Create a fresh evaluation state rooted at the given directory.
@@ -98,7 +87,6 @@ data EvalState = EvalState
 newEvalState :: FilePath -> IO EvalState
 newEvalState baseDir = do
   cache <- newIORef Map.empty
-  memo <- newIORef IntMap.empty
   now <- fmap (floor . toRational) getPOSIXTime :: IO Integer
   nixPathStr <- lookupEnvText "NIX_PATH"
   let searchPaths = case nixPathStr of
@@ -110,8 +98,7 @@ newEvalState baseDir = do
         esBaseDir = baseDir,
         esStoreDir = "/nix/store",
         esTimestamp = now,
-        esSearchPaths = searchPaths,
-        esMemoCache = memo
+        esSearchPaths = searchPaths
       }
 
 -- ---------------------------------------------------------------------------
@@ -252,33 +239,17 @@ instance MonadEval EvalIO where
       else pure path
 
   forceThunk _ (Evaluated val) = pure val
-  forceThunk evalFn (Thunk expr env) = do
-    memoRef <- EvalIO (asks esMemoCache)
-    sn <- wrapIO (makeStableName $! expr)
-    let snHash = hashStableName sn
-    memo <- wrapIO (readIORef memoRef)
-    -- Look up by hash, then confirm identity with eqStableName
-    case lookupMemo sn (IntMap.lookup snHash memo) of
+  forceThunk evalFn (Thunk expr env ref) = do
+    -- Per-thunk IORef memoization: read once, evaluate at most once,
+    -- cache in the thunk's own cell.  Memory is naturally bounded —
+    -- when the thunk is GC'd, so is its cached value.
+    cached <- wrapIO (readIORef ref)
+    case cached of
       Just val -> pure val
       Nothing -> do
         val <- evalFn env expr
-        wrapIO $
-          modifyIORef' memoRef $
-            IntMap.insertWith (++) snHash [(sn, val)]
+        wrapIO (writeIORef ref (Just val))
         pure val
-
--- ---------------------------------------------------------------------------
--- Thunk memoization
--- ---------------------------------------------------------------------------
-
--- | Look up a thunk's cached value in a collision chain.
--- Uses 'eqStableName' for identity comparison (not just hash).
-lookupMemo :: StableName Expr -> Maybe [(StableName Expr, NixValue)] -> Maybe NixValue
-lookupMemo _ Nothing = Nothing
-lookupMemo _ (Just []) = Nothing
-lookupMemo sn (Just ((sn2, val) : rest))
-  | eqStableName sn sn2 = Just val
-  | otherwise = lookupMemo sn (Just rest)
 
 -- ---------------------------------------------------------------------------
 -- Helpers

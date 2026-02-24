@@ -37,6 +37,7 @@ module Nix.Eval.Types
   )
 where
 
+import Data.IORef (IORef, newIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -44,6 +45,7 @@ import Data.Text (Text)
 import Nix.Derivation (Derivation)
 import Nix.Expr.Types (Expr, Formals)
 import Nix.Store.Path (StorePath)
+import System.IO.Unsafe (unsafePerformIO)
 
 -- ---------------------------------------------------------------------------
 -- String context
@@ -78,19 +80,32 @@ mkStr t = VStr t emptyContext
 
 -- | A thunk: either an unevaluated expression paired with its
 -- capturing environment, or an already-forced value.
+--
+-- Each unevaluated thunk carries an 'IORef' memoization cell that
+-- caches the result after the first force — matching real Nix, which
+-- mutates thunks in-place.  The IORef is allocated lazily via
+-- 'unsafePerformIO' in 'mkThunk' so that knot-tying in recursive
+-- @let@ and @rec {}@ works unchanged (the IORef doesn't participate
+-- in the knot).  Memory is naturally bounded: when a thunk is no
+-- longer reachable, both the thunk and its cached value are GC'd.
 data Thunk
   = -- | Unevaluated: Expr is strict, Env is LAZY to allow
-    -- knot-tying in recursive let and rec { }.
-    Thunk !Expr Env
+    -- knot-tying in recursive let and rec { }.  The IORef cell
+    -- is written once on first force, then read on subsequent forces.
+    Thunk !Expr Env !(IORef (Maybe NixValue))
   | Evaluated !NixValue
-  deriving (Show)
+
+instance Show Thunk where
+  show (Evaluated val) = "Evaluated (" ++ show val ++ ")"
+  show (Thunk expr _ _) = "Thunk (" ++ show expr ++ ") <env> <ref>"
 
 -- | Structural equality — compares expressions for unevaluated thunks,
--- values for evaluated ones.  Will diverge on recursive environments;
--- only used in tests on non-recursive structures.
+-- values for evaluated ones.  Ignores the IORef cell and environment.
+-- Will diverge on recursive environments; only used in tests on
+-- non-recursive structures.
 instance Eq Thunk where
   (Evaluated v1) == (Evaluated v2) = v1 == v2
-  (Thunk e1 _) == (Thunk e2 _) = e1 == e2
+  (Thunk e1 _ _) == (Thunk e2 _ _) = e1 == e2
   _ == _ = False
 
 -- | A Nix value — the result of evaluating an expression.
@@ -166,9 +181,28 @@ pushWithScope :: Map Text Thunk -> Env -> Env
 pushWithScope scope env =
   env {envWithScopes = scope : envWithScopes env}
 
--- | Create an unevaluated thunk.
+-- | Create an unevaluated thunk with a fresh memoization cell.
+--
+-- Each thunk gets its own 'IORef' for in-place memoization, matching
+-- real Nix which mutates @Value@ structs on first force.  The cell is
+-- allocated via 'newMemoCell' which uses 'unsafePerformIO' — safe
+-- because 'newIORef' is a pure allocation with no observable side
+-- effects, and the 'NOINLINE' + @seq@ pattern prevents GHC from
+-- floating the allocation to a shared top-level CAF.
 mkThunk :: Env -> Expr -> Thunk
-mkThunk env thunkExpr = Thunk thunkExpr env
+mkThunk env thunkExpr =
+  Thunk thunkExpr env (newMemoCell thunkExpr)
+
+-- | Allocate a fresh memoization cell for a thunk.
+--
+-- @NOINLINE@ prevents inlining so GHC can't see inside or CSE calls.
+-- @seq@ on the argument creates a data dependency that prevents
+-- float-out to a top-level CAF — without this, GHC would hoist
+-- @unsafePerformIO (newIORef Nothing)@ and share ONE cell across
+-- ALL thunks.
+{-# NOINLINE newMemoCell #-}
+newMemoCell :: Expr -> IORef (Maybe NixValue)
+newMemoCell expr = unsafePerformIO (expr `seq` newIORef Nothing)
 
 -- | Wrap an already-computed value as a thunk.
 evaluated :: NixValue -> Thunk
@@ -258,4 +292,4 @@ instance MonadEval PureEval where
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
   resolvePathLiteral = pure
   forceThunk _ (Evaluated val) = pure val
-  forceThunk evalFn (Thunk expr env) = evalFn env expr
+  forceThunk evalFn (Thunk expr env _) = evalFn env expr
