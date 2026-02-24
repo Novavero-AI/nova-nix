@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               nova-nix
-version:            0.1.0.0
+version:            0.1.0.1
 synopsis:           Windows-native Nix implementation in pure Haskell
 description:
   A pure Haskell implementation of the Nix package manager that runs natively
@@ -13,7 +13,7 @@ description:
 
 license:            MIT
 license-file:       LICENSE
-author:             Devon Tomlin, Galen, Kyle Jensen
+author:             Devon Tomlin
 maintainer:         devon.tomlin@novavero.ai
 homepage:           https://github.com/Novavero-AI/nova-nix
 bug-reports:        https://github.com/Novavero-AI/nova-nix/issues
