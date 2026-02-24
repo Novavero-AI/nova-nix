@@ -39,16 +39,16 @@ Every module is pure by default. IO lives at the boundaries only.
 ```bash
 git clone https://github.com/Novavero-AI/nova-nix.git
 cd nova-nix
-cabal run nova-nix -- eval test.nix
+cabal run nova-nix -- --strict eval test.nix
 ```
 
 Output:
 
 ```
-{ count = 6; greeting = "nova-nix is alive"; hasDerivation = "derivation"; items = [ 2 4 6 8 10 ]; }
+{ count = 6; greeting = "Hello, nova-nix!"; items = [ 2 4 6 8 10 ]; nested = { a = 1; b = 2; c = 4; }; types = { attrs = "set"; int = "int"; list = "list"; string = "string"; }; }
 ```
 
-That's a Nix expression with `let` bindings, `derivation`, `builtins.map`, lambda functions, and arithmetic — parsed, lazily evaluated, and pretty-printed. On Windows, macOS, or Linux.
+That's a Nix expression with `let` bindings, `rec` attrs, lambdas, `builtins.map`, `builtins.typeOf`, and arithmetic — parsed, lazily evaluated, and pretty-printed. On Windows, macOS, or Linux.
 
 ---
 
@@ -306,7 +306,7 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 - [x] **CLI** — `nova-nix eval FILE.nix`, `nova-nix eval --expr 'EXPR'`, `nova-nix build FILE.nix`, `--nix-path NAME=PATH`
 - [x] **508 tests** — parser, evaluator, store, builder, substituter, dependency graph, search paths, dynamic keys, directory imports, CLI end-to-end
 
-### Next (Phase 4 — in progress)
+### Next
 
 - [x] **Thunk memoization** — Per-thunk `IORef` memo cells in `EvalIO` via `forceThunk` `MonadEval` method. Each thunk is evaluated at most once, cached in place (matching real Nix). GC reclaims dead thunks naturally — no unbounded global cache.
 - [x] **Regex builtins** — `builtins.match` and `builtins.split` (POSIX ERE via `regex-tdfa`, pure Haskell, cross-platform)
@@ -319,9 +319,7 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 
 - [ ] **`nova-nix shell`** — Enter a development shell (like `nix shell`)
 - [ ] **`nova-nix repl`** — Interactive evaluator
-- [ ] **Flake support**
 - [ ] **Nix daemon protocol compatibility**
-- [ ] **Package set for Windows-native builds** (no MSYS2)
 - [ ] **XZ decompression** — Enable nova-cache compression flag for real binary cache downloads
 
 ---

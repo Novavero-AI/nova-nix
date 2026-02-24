@@ -93,6 +93,7 @@ import Nix.Expr.Types
     Formal (..),
     Formals (..),
     NixAtom (..),
+    StringPart (..),
   )
 import Nix.Hash (byteToHex, sha256Hex, truncatedBase32)
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath)
@@ -304,12 +305,17 @@ buildResolvedNestedAttr thunkEnv (key : rest) bodyExpr =
   Map.singleton key (evaluated (VAttrs (buildResolvedNestedAttr thunkEnv rest bodyExpr)))
 
 -- | Look up a name for @inherit@.  If not found, create a thunk
--- that will error when forced.
+-- that will error when forced (matching real Nix behaviour).
 inheritLookup :: Env -> Text -> Thunk
 inheritLookup env name =
   case envLookup name env of
     Just thunk -> thunk
-    Nothing -> evaluated (mkStr ("<undefined: " <> name <> ">"))
+    Nothing ->
+      -- Deferred error: only triggers if this binding is actually demanded.
+      -- Constructs: builtins.throw "undefined variable '<name>'"
+      let errMsg = "undefined variable '" <> name <> "'"
+          throwExpr = EApp (EVar "throw") (EStr [StrLit errMsg])
+       in mkThunk env throwExpr
 
 -- | Build a nested attribute structure from a dotted path.
 -- @a.b.c = expr@ becomes @{ a = { b = { c = thunk; }; }; }@.
@@ -2311,7 +2317,15 @@ builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
 builtinFetchGit (VStr url _) = do
   -- Use a content-based temp dir to avoid predictable paths
   let urlHash = sha256Hex (TE.encodeUtf8 url)
-      tmpDir = "/tmp/nova-nix-fetchgit-" <> urlHash
+  sysTmpRaw <- getEnvVar "TMPDIR"
+  -- TMPDIR on Unix, TEMP/TMP on Windows; fall back to /tmp
+  sysTmp <-
+    if T.null sysTmpRaw
+      then do
+        winTmp <- getEnvVar "TEMP"
+        pure (if T.null winTmp then "/tmp" else winTmp)
+      else pure sysTmpRaw
+  let tmpDir = sysTmp <> "/nova-nix-fetchgit-" <> urlHash
   (code, _stdout, stderr) <- runProcess "git" ["clone", "--depth", "1", "--", url, tmpDir] ""
   if code /= 0
     then throwEvalError ("builtins.fetchGit: git clone failed: " <> stderr)

@@ -332,9 +332,10 @@ registerOutputs ::
   IO BuildResult
 registerOutputs config store drv _buildDir outputDirs = do
   let allCandidates = collectAllCandidates drv
-      drvPathText = case drvOutputs drv of
-        [] -> Nothing
-        _ -> Just (T.pack (storePathToFilePath (bcStoreDir config) (StorePath "unknown" "unknown")))
+      -- Deriver path is not available from the Derivation type alone;
+      -- the caller (buildWithDeps) would need to pass it through.
+      -- Register with no deriver for now — queryDeriver will return Nothing.
+      drvPathText = Nothing
   -- Register each output
   results <- mapM (registerSingleOutput config store allCandidates drvPathText) (zip (drvOutputs drv) outputDirs)
   case sequence results of

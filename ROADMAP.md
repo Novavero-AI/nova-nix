@@ -1,9 +1,9 @@
 # nova-nix Roadmap
 
-## Current State (Phase 4 In Progress)
+## Current State
 
 - **Parser**: Complete. Full Nix syntax including string interpolation, set patterns, inherit, indented strings, paths, URIs, search paths, dynamic attribute keys.
-- **Evaluator**: 91 builtins, polymorphic via `MonadEval` typeclass. `PureEval` for tests, `EvalIO` for real filesystem access. Per-thunk IORef memoization matching real Nix. Case-dispatch builtin lookup (8.4x speedup).
+- **Evaluator**: 91 builtins, polymorphic via `MonadEval` typeclass. `PureEval` for tests, `EvalIO` for real filesystem access. Per-thunk IORef memoization matching real Nix. Case-dispatch builtin lookup.
 - **String Contexts**: Full tracking on `VStr` — `SCPlain`, `SCDrvOutput`, `SCAllOutputs`. Propagated through interpolation, operators, and all string builtins. `derivation` collects contexts into `drvInputDrvs`/`drvInputSrcs`.
 - **Store**: Real SQLite-backed database (ValidPaths + Refs tables, WAL mode). Full store operations: `addToStore`, `scanReferences`, `setReadOnly`, `writeDrv`, `parseStorePath`.
 - **Builder**: Full build loop with recursive dependency resolution — topological sort, binary cache substitution, local build fallback, output registration.
@@ -16,7 +16,7 @@
 - **CLI**: `nova-nix eval FILE.nix`, `nova-nix eval --expr EXPR`, `nova-nix build FILE.nix`, `--nix-path NAME=PATH`, `--strict`.
 - **Tests**: 508 tests, zero framework dependencies.
 
-## Phase 4 Remaining: nixpkgs Compatibility
+## Next: nixpkgs Compatibility
 
 The ultimate test: `import <nixpkgs> {}` evaluates correctly.
 
@@ -27,13 +27,11 @@ The ultimate test: `import <nixpkgs> {}` evaluates correctly.
 - Profile and optimize the eval hot path
 - Memory management: depth-limited pretty-printer, lazy higher-order builtins
 
-## Phase 5: Store Bootstrap + CLI
+## Future: Store Bootstrap + CLI
 
-- **Store bootstrap**: Ship a prebuilt bash + coreutils derivation so nova-nix can build on a fresh Windows machine without Git for Windows. Currently `findTestShell` discovers bash from Git for Windows and `buildPath` derives PATH from the builder's location (including MSYS2 sibling `usr/bin`). Bootstrap replaces both with a store path (`/nix/store/xxx-bash-5.2/bin/bash`) — `buildPath` naturally becomes store-only PATH with zero platform conditionals, matching real Nix's model. Extract `PlatformConfig` record to eliminate remaining `System.Info.os` checks in `Builder.hs`.
-- `nova-nix shell` — enter a development shell (like `nix shell`)
+- **Store bootstrap**: Ship a prebuilt bash + coreutils derivation so nova-nix can build on a fresh Windows machine without external dependencies.
+- `nova-nix shell` — enter a development shell
 - `nova-nix repl` — interactive evaluator
 - `nova-nix run` — build and execute
-- `nova-nix flake` — flake support
 - Nix daemon protocol compatibility
-- Package set for Windows-native builds (no MSYS2)
-- XZ decompression (enable nova-cache compression flag for real binary cache downloads)
+- XZ decompression for real binary cache downloads

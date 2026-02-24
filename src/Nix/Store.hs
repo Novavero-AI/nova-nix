@@ -128,8 +128,8 @@ addToStore store srcDir sp deriver refs = do
     (stDB store)
     PathRegistration
       { prPath = sp,
-        prNarHash = "sha256:placeholder",
-        prNarSize = 0,
+        prNarHash = "sha256:0000000000000000000000000000000000000000000000000000", -- NAR hashing deferred until nova-cache integration
+        prNarSize = 0, -- Computed size deferred until NAR serialization is wired in
         prDeriver = deriver,
         prReferences = refs
       }

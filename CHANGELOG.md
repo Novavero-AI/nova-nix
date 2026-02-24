@@ -2,7 +2,7 @@
 
 ## 0.1.1.0 — 2026-02-24
 
-### Phase 4: nixpkgs Compatibility (in progress)
+### Phase 4: nixpkgs Compatibility
 
 - **Thunk memoization** — Per-thunk `IORef` memo cells (matching real Nix in-place mutation). `forceThunk` is a `MonadEval` method: IO evaluators memoize per-allocation, pure evaluators re-evaluate. GC reclaims dead thunks naturally — no unbounded global cache. `unsafePerformIO` CAF float-out prevented via `NOINLINE` + `seq` pattern.
 - **8.4x builtin dispatch speedup** — Case dispatch replacing polymorphic `Map` reconstruction on every call. Direct pattern match on builtin name for zero-allocation dispatch in the hot path.
