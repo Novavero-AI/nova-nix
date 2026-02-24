@@ -8,13 +8,14 @@
 -- @
 module Main (main) where
 
+import Control.Monad ((>=>))
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv)
-import Nix.Derivation (Derivation (..))
-import Nix.Eval (NixValue (..), Thunk (..), eval)
+import Nix.Derivation (Derivation (..), DerivationOutput (..))
+import Nix.Eval (MonadEval, NixValue (..), Thunk (..), eval, force)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Parser (parseNix)
 import Nix.Store (Store, closeStore, openStore, writeDrv)
@@ -50,12 +51,14 @@ evalFile filePath = do
       exitFailure
     Right expr -> do
       st <- newEvalState (takeDirectory filePath)
-      result <- runEvalIO st (eval (builtinEnv (esTimestamp st)) expr)
+      result <- runEvalIO st $ do
+        val <- eval (builtinEnv (esTimestamp st)) expr
+        deepForceValue val
       case result of
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
           exitFailure
-        Right val -> print val
+        Right forced -> TIO.putStrLn (prettyValue forced)
 
 -- | Parse, evaluate, extract derivation, build, and print result.
 buildFile :: FilePath -> IO ()
@@ -140,3 +143,58 @@ writeDrvToStore store drv =
       -- Write .drv to store if a drvPath is available in the env.
       let envDrvPath = Map.lookup "drvPath" (drvEnv drv)
       mapM_ (writeDrv store drv) (envDrvPath >>= parseStorePath defaultStoreDir)
+
+-- ---------------------------------------------------------------------------
+-- Deep-force and pretty-print
+-- ---------------------------------------------------------------------------
+
+-- | Recursively force all thunks in a value, returning the fully
+-- materialized tree.  Unlike 'deepForce' (which returns @()@), this
+-- rebuilds the value with all thunks replaced by 'Evaluated'.
+deepForceValue :: (MonadEval m) => NixValue -> m NixValue
+deepForceValue (VList thunks) = do
+  forced <- mapM (force >=> deepForceValue) thunks
+  pure (VList (map Evaluated forced))
+deepForceValue (VAttrs attrs) = do
+  forced <- mapM (force >=> deepForceValue) attrs
+  pure (VAttrs (Map.map Evaluated forced))
+deepForceValue val = pure val
+
+-- | Nix-style pretty-printing of a fully forced value.
+prettyValue :: NixValue -> T.Text
+prettyValue (VInt n) = T.pack (show n)
+prettyValue (VFloat f) = T.pack (show f)
+prettyValue (VBool True) = "true"
+prettyValue (VBool False) = "false"
+prettyValue VNull = "null"
+prettyValue (VStr s _) = "\"" <> escapeNixString s <> "\""
+prettyValue (VPath p) = p
+prettyValue (VList thunks) =
+  "[ " <> T.intercalate " " (map prettyThunk thunks) <> " ]"
+prettyValue (VAttrs attrs) =
+  let entries = Map.toAscList attrs
+      rendered = map (\(k, t) -> k <> " = " <> prettyThunk t <> ";") entries
+   in "{ " <> T.intercalate " " rendered <> " }"
+prettyValue (VLambda {}) = "«lambda»"
+prettyValue (VBuiltin name _) = "«builtin " <> name <> "»"
+prettyValue (VDerivation drv) =
+  case drvOutputs drv of
+    (out : _) -> "«derivation " <> T.pack (storePathToFilePath defaultStoreDir (doPath out)) <> "»"
+    [] -> "«derivation»"
+
+-- | Pretty-print a thunk.  After deep-forcing, all thunks should be
+-- 'Evaluated'; unevaluated thunks render as a placeholder.
+prettyThunk :: Thunk -> T.Text
+prettyThunk (Evaluated val) = prettyValue val
+prettyThunk (Thunk {}) = "«thunk»"
+
+-- | Escape a string for Nix-style output (quotes, backslashes, newlines, tabs, carriage returns).
+escapeNixString :: T.Text -> T.Text
+escapeNixString = T.concatMap escapeChar
+  where
+    escapeChar '\\' = "\\\\"
+    escapeChar '"' = "\\\""
+    escapeChar '\n' = "\\n"
+    escapeChar '\t' = "\\t"
+    escapeChar '\r' = "\\r"
+    escapeChar c = T.singleton c

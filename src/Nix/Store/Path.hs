@@ -38,6 +38,7 @@ module Nix.Store.Path
     -- * Store paths
     StorePath (..),
     storePathToFilePath,
+    storePathToText,
     parseStorePath,
 
     -- * Constants
@@ -79,24 +80,36 @@ storePathToFilePath :: StoreDir -> StorePath -> FilePath
 storePathToFilePath (StoreDir dir) sp =
   dir </> T.unpack (spHash sp <> "-" <> spName sp)
 
+-- | Convert a 'StorePath' to canonical 'Text' with forward slashes.
+-- Unlike 'storePathToFilePath', this always uses @\/@ as the separator,
+-- making it safe for ATerm serialization and cross-platform round-trips.
+storePathToText :: StoreDir -> StorePath -> Text
+storePathToText (StoreDir dir) sp =
+  T.pack dir <> "/" <> spHash sp <> "-" <> spName sp
+
 -- | Length of the Nix base-32 hash component in store paths (32 chars).
 storePathHashLen :: Int
 storePathHashLen = 32
 
 -- | Parse a full store path string like @\/nix\/store\/abc...-name@ into
 -- a 'StorePath'.  Returns 'Nothing' if the path doesn't match the
--- expected format: store dir prefix + slash + 32-char hash + dash + name.
+-- expected format: store dir prefix + separator + 32-char hash + dash + name.
+-- Accepts both @\/@ and @\\@ as the separator after the store dir,
+-- so paths round-trip correctly regardless of which OS serialized them.
 parseStorePath :: StoreDir -> Text -> Maybe StorePath
 parseStorePath (StoreDir dir) path =
-  let prefix = T.pack dir <> "/"
-   in case T.stripPrefix prefix path of
-        Nothing -> Nothing
-        Just rest
-          | T.length rest < storePathHashLen + 2 -> Nothing -- need hash + "-" + name (at least 1 char)
-          | otherwise ->
-              let hashPart = T.take storePathHashLen rest
-                  afterHash = T.drop storePathHashLen rest
-               in case T.uncons afterHash of
-                    Just ('-', name)
-                      | not (T.null name) -> Just (StorePath hashPart name)
-                    _ -> Nothing
+  let dirText = T.pack dir
+      tryWithSep sep = T.stripPrefix (dirText <> sep) path >>= parseRest
+   in case tryWithSep "/" of
+        Just sp -> Just sp
+        Nothing -> tryWithSep "\\"
+  where
+    parseRest rest
+      | T.length rest < storePathHashLen + 2 = Nothing
+      | otherwise =
+          let hashPart = T.take storePathHashLen rest
+              afterHash = T.drop storePathHashLen rest
+           in case T.uncons afterHash of
+                Just ('-', name)
+                  | not (T.null name) -> Just (StorePath hashPart name)
+                _ -> Nothing
