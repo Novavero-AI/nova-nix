@@ -41,13 +41,25 @@ jobs:
       - name: Check formatting
         run: ormolu -m check $(find src app test -name '*.hs')
 
+  cabal-check:
+    name: Cabal Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.6"
+          cabal-version: "latest"
+      - name: Validate package
+        run: cabal check
+
   # ---------------------------------------------------------------------------
   # Build + Test (cross-platform matrix)
   # ---------------------------------------------------------------------------
 
   build:
     name: Build (${{ matrix.os }})
-    needs: [hlint, ormolu]
+    needs: [hlint, ormolu, cabal-check]
     strategy:
       fail-fast: false
       matrix:
