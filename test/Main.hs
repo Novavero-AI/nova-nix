@@ -3,7 +3,7 @@
 module Main (main) where
 
 import Control.Exception (bracket_)
-import Control.Monad (when)
+import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -102,61 +102,32 @@ assertEvalFail label source =
   assertLeft label (evalNix source)
 
 -- ---------------------------------------------------------------------------
--- Platform-aware test helpers for builder tests
+-- Shell discovery for builder tests
 -- ---------------------------------------------------------------------------
 
--- | Whether we are running on Windows.
--- GHC bakes 'System.Info.os' at compile time, so this is a constant.
-isWindows :: Bool
-isWindows = SI.os == "mingw32"
-
--- | Shell executable for builder tests.
-testShell :: Text
-testShell = if isWindows then "cmd.exe" else "/bin/sh"
-
--- | Shell arguments wrapping a script for builder tests.
-testShellArgs :: Text -> [Text]
-testShellArgs script = if isWindows then ["/C", script] else ["-c", script]
-
--- | Platform-aware @mkdir -p@.
-testMkdir :: Text -> Text
-testMkdir dir =
-  if isWindows
-    then "mkdir \"" <> dir <> "\""
-    else "mkdir -p " <> dir
-
--- | Platform-aware @touch@.
-testTouch :: Text -> Text
-testTouch file =
-  if isWindows
-    then "type nul > \"" <> file <> "\""
-    else "touch " <> file
-
--- | Platform-aware @echo content > file@.
-testEchoTo :: Text -> Text -> Text
-testEchoTo content file =
-  if isWindows
-    then "echo " <> content <> " > \"" <> file <> "\""
-    else "echo " <> content <> " > " <> file
-
--- | Platform-aware @exit N@.
-testExit :: Int -> Text
-testExit n =
-  if isWindows
-    then "exit /b " <> T.pack (show n)
-    else "exit " <> T.pack (show n)
-
--- | Environment variable reference for @out@.
-testOutVar :: Text
-testOutVar = if isWindows then "%out%" else "$out"
-
--- | Environment variable reference for @dev@.
-testDevVar :: Text
-testDevVar = if isWindows then "%dev%" else "$dev"
-
--- | Path separator for use inside shell scripts.
-testSep :: Text
-testSep = if isWindows then "\\" else "/"
+-- | Find a POSIX-compatible shell for builder tests.
+-- On Unix, always @\/bin\/sh@.  On Windows, searches for @bash.exe@
+-- in PATH then at known Git for Windows locations.  Real Nix builders
+-- always use bash from the store — this bridges the gap until nova-nix
+-- bootstraps its own bash derivation.
+findTestShell :: IO Text
+findTestShell = case SI.os of
+  "mingw32" -> do
+    inPath <- Dir.findExecutable "bash"
+    case inPath of
+      Just p -> pure (T.pack p)
+      Nothing -> do
+        let known =
+              [ "C:\\Program Files\\Git\\bin\\bash.exe",
+                "C:\\Program Files (x86)\\Git\\bin\\bash.exe"
+              ]
+        found <- filterM Dir.doesFileExist known
+        case found of
+          (p : _) -> pure (T.pack p)
+          [] ->
+            error
+              "bash not found: install Git for Windows or add bash to PATH"
+  _ -> pure "/bin/sh"
 
 -- ---------------------------------------------------------------------------
 -- Tests: Expr types (existing)
@@ -2774,9 +2745,10 @@ testFromATerm = do
 -- ---------------------------------------------------------------------------
 
 -- | Create a minimal Derivation for builder tests.
--- Uses 'testShell'/'testShellArgs' for platform-aware builder selection.
-mkTestBuildDrv :: StoreDir -> StorePath -> Text -> Derivation
-mkTestBuildDrv _sd outSP script =
+-- The shell path is discovered once via 'findTestShell' and threaded through.
+-- All scripts are POSIX shell — bash is used on every platform.
+mkTestBuildDrv :: Text -> StorePath -> Text -> Derivation
+mkTestBuildDrv shell outSP script =
   Derivation
     { drvOutputs =
         [ DerivationOutput
@@ -2789,14 +2761,15 @@ mkTestBuildDrv _sd outSP script =
       drvInputDrvs = Map.empty,
       drvInputSrcs = [],
       drvPlatform = currentPlatform,
-      drvBuilder = testShell,
-      drvArgs = testShellArgs script,
+      drvBuilder = shell,
+      drvArgs = ["-c", script],
       drvEnv = Map.fromList [("name", "test-build"), ("system", platformToText currentPlatform)]
     }
 
 testBuilder :: IO [Bool]
 testBuilder = do
   putStrLn "builder"
+  shell <- findTestShell
   sequence
     [ -- Build simple script that writes to $out
       runTestM "build simple script" $ do
@@ -2805,7 +2778,7 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" "simple-test"
-            drv = mkTestBuildDrv (stDir store) outSP (testMkdir testOutVar <> " && " <> testEchoTo "hello" (testOutVar <> testSep <> "result.txt"))
+            drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo hello > $out/result.txt"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder1-tmp"}
         result <- buildDerivation config store drv
         closeStore store
@@ -2822,7 +2795,7 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "content-test"
-            drv = mkTestBuildDrv (stDir store) outSP (testMkdir testOutVar <> " && " <> testEchoTo "test content 42" (testOutVar <> testSep <> "data.txt"))
+            drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo 'test content 42' > $out/data.txt"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder2-tmp"}
         result <- buildDerivation config store drv
         ret <- case result of
@@ -2870,7 +2843,7 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "dddddddddddddddddddddddddddddddd" "exitfail"
-            drv = mkTestBuildDrv (stDir store) outSP (testExit 42)
+            drv = mkTestBuildDrv shell outSP "exit 42"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder4-tmp"}
         result <- buildDerivation config store drv
         closeStore store
@@ -2886,7 +2859,7 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "pathtest"
-            drv = mkTestBuildDrv (stDir store) outSP (testMkdir testOutVar <> " && " <> testTouch (testOutVar <> testSep <> "marker"))
+            drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/marker"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder5-tmp"}
         result <- buildDerivation config store drv
         ret <- case result of
@@ -2906,7 +2879,7 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "ffffffffffffffffffffffffffffffff" "dbtest"
-            drv = mkTestBuildDrv (stDir store) outSP (testMkdir testOutVar <> " && " <> testTouch (testOutVar <> testSep <> "file"))
+            drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/file"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder6-tmp"}
         result <- buildDerivation config store drv
         ret <- case result of
@@ -2926,14 +2899,6 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "ggggggggggggggggggggggggggggggg1" "multi"
             devSP = StorePath "ggggggggggggggggggggggggggggggg2" "multi-dev"
-            multiScript =
-              testMkdir testOutVar
-                <> " && "
-                <> testEchoTo "lib" (testOutVar <> testSep <> "lib.txt")
-                <> " && "
-                <> testMkdir testDevVar
-                <> " && "
-                <> testEchoTo "headers" (testDevVar <> testSep <> "include.h")
             drv =
               Derivation
                 { drvOutputs =
@@ -2943,8 +2908,8 @@ testBuilder = do
                   drvInputDrvs = Map.empty,
                   drvInputSrcs = [],
                   drvPlatform = currentPlatform,
-                  drvBuilder = testShell,
-                  drvArgs = testShellArgs multiScript,
+                  drvBuilder = shell,
+                  drvArgs = ["-c", "mkdir -p $out && echo lib > $out/lib.txt && mkdir -p $dev && echo headers > $dev/include.h"],
                   drvEnv = Map.fromList [("name", "multi")]
                 }
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder7-tmp"}
@@ -2969,7 +2934,7 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh" "cleantest"
-            drv = mkTestBuildDrv (stDir store) outSP (testExit 1)
+            drv = mkTestBuildDrv shell outSP "exit 1"
             tmpDir = tmpBase </> "nova-nix-test-builder8-tmp"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpDir}
         _ <- buildDerivation config store drv
@@ -3010,23 +2975,21 @@ evalAndBuild storeDir source = do
 testE2E :: IO [Bool]
 testE2E = do
   putStrLn "cli/e2e"
+  shell <- findTestShell
   sequence
     [ -- End-to-end: eval → build a simple derivation
       runTestM "e2e eval → build" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-e2e1"
         forceRemoveIfExists tmpStore
-        let e2eScript = testMkdir testOutVar <> " && " <> testEchoTo "e2e" (testOutVar <> testSep <> "e2e.txt")
-            -- Build the Nix source with platform-aware builder and args.
-            -- The Nix string needs escaped quotes and (on Windows) escaped backslashes.
-            nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+        -- Build the Nix source with the discovered shell path.
+        -- Nix strings use \\ for literal backslash, \" for literal quote.
+        let nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
             e2eSource =
               T.concat
                 [ "derivation { name = \"e2e-test\"; system = builtins.currentSystem; ",
-                  "builder = \"" <> nixEscape testShell <> "\"; ",
-                  "args = [",
-                  T.intercalate " " (map (\a -> "\"" <> nixEscape a <> "\"") (testShellArgs e2eScript)),
-                  "]; }"
+                  "builder = \"" <> nixEscape shell <> "\"; ",
+                  "args = [\"-c\" \"mkdir -p $out && echo e2e > $out/e2e.txt\"]; }"
                 ]
         result <- evalAndBuild (StoreDir tmpStore) e2eSource
         ret <- case result of

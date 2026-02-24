@@ -24,8 +24,9 @@ The ultimate test: `import <nixpkgs> {}` evaluates correctly.
 - Missing builtins that nixpkgs exercises (discovered during real eval)
 - Profile and optimize the eval hot path
 
-## Phase 5: CLI + Developer Experience
+## Phase 5: Store Bootstrap + CLI
 
+- **Store bootstrap**: Ship a prebuilt bash + coreutils derivation so nova-nix can build on a fresh Windows machine without Git for Windows. Currently `findTestShell` discovers bash from Git for Windows; bootstrap replaces this with a store path (`/nix/store/xxx-bash-5.2/bin/bash`), matching real Nix's model.
 - `nova-nix shell` — enter a development shell (like `nix shell`)
 - `nova-nix repl` — interactive evaluator
 - `nova-nix run` — build and execute
