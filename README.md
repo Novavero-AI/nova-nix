@@ -192,7 +192,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 | `Nix.Eval.Operator` | Binary/unary operators — arithmetic with float promotion, deep structural equality, division-by-zero checks | Done |
 | `Nix.Eval.StringInterp` | String interpolation — value coercion with context propagation, indented string whitespace stripping | Done |
 | `Nix.Eval.Context` | String context construction, queries, extraction — pure helpers for building and inspecting store path references | Done |
-| `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache (with directory import), process execution, store writes, NIX_PATH parsing, `StableName`-based thunk memoization | Done |
+| `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache (with directory import), process execution, store writes, NIX_PATH parsing, per-thunk IORef memoization (matching real Nix in-place mutation) | Done |
 | `Nix.Builtins` | Built-in function environment — 91 builtins, search path plumbing (`parseNixPath`), top-level builtin exposure | Done |
 
 ### Store + Builder
@@ -238,7 +238,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 **Evaluator design:**
 
 - **MonadEval typeclass** — The evaluator is `eval :: (MonadEval m) => Env -> Expr -> m NixValue`, polymorphic in its effect monad. `PureEval` (newtype over `Either Text`) runs all pure tests with no IO. `EvalIO` provides `readFileText`, `doesPathExist`, `listDirectory`, `getEnvVar`, `getCurrentTime`, `writeToStore`, `scopedImportFile`, `runProcess` for IO builtins.
-- **Thunk-based lazy evaluation with memoization** — List elements and attribute set values are stored as unevaluated thunks (`Thunk Expr Env`). Only forced when a value is demanded. `(x: 1) (throw "boom")` returns `1` because `x` is never referenced. In `EvalIO`, forced thunks are memoized via `StableName` identity (same approach as hnix and real Nix) — a thunk is evaluated at most once.
+- **Thunk-based lazy evaluation with memoization** — List elements and attribute set values are stored as unevaluated thunks (`Thunk Expr Env`). Only forced when a value is demanded. `(x: 1) (throw "boom")` returns `1` because `x` is never referenced. In `EvalIO`, each thunk carries a per-thunk `IORef` memo cell — forced once, then cached in place (matching real Nix's in-place mutation). Dead thunks are reclaimed by GC naturally.
 - **Knot-tying via Haskell laziness** — Recursive `let` and `rec { }` create self-referential environments. The `Thunk` type has a lazy `Env` field so thunks can capture environments that include themselves. Haskell's own laziness resolves the recursion. Dynamic attribute keys are resolved monadi­cally *before* knot-tying — the two-phase design (`resolveBindingKeys` then `buildResolvedBindingsMap`) cleanly separates key evaluation from value thunk construction.
 - **Search path desugaring** — `<nixpkgs>` is its own AST constructor (`ESearchPath`), desugared at eval time to `builtins.findFile builtins.nixPath "nixpkgs"` — exactly how real Nix handles it. `builtins.nixPath` is populated from `NIX_PATH` and `--nix-path` flags.
 - **With-scope chain** — `Env` has lexical bindings (always win) plus a stack of with-scopes walked innermost-first. `let a = 1; in with { a = 2; }; a` correctly returns `1` because lexical scope takes priority.
@@ -308,10 +308,10 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 
 ### Next (Phase 4 — in progress)
 
-- [x] **Thunk memoization** — `StableName`-based identity caching in `EvalIO` via `forceThunk` `MonadEval` method. `IntMap` keyed by `hashStableName` with collision chains. Shared `IORef MemoCache` across all frames.
+- [x] **Thunk memoization** — Per-thunk `IORef` memo cells in `EvalIO` via `forceThunk` `MonadEval` method. Each thunk is evaluated at most once, cached in place (matching real Nix). GC reclaims dead thunks naturally — no unbounded global cache.
 - [x] **Regex builtins** — `builtins.match` and `builtins.split` (POSIX ERE via `regex-tdfa`, pure Haskell, cross-platform)
 - [ ] **nixpkgs evaluation** — The ultimate test: `import <nixpkgs> {}` evaluates correctly
-- [ ] **Memory management** — Depth-limited pretty-printer, weak-ref or scoped memo cache, lazy higher-order builtins (current `deepForceValue` causes OOM on large attrsets)
+- [ ] **Memory management** — Depth-limited pretty-printer, lazy higher-order builtins (memo cache is now GC-bounded via per-thunk IORef — no global cache to leak)
 - [ ] **Missing builtins** — Any others nixpkgs demands (discovered iteratively by running `import <nixpkgs> {}`)
 - [ ] **Performance profiling** — Target ~2-5 seconds for full nixpkgs eval
 

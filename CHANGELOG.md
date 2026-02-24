@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.1.1.0 — 2026-02-24
 
 ### Phase 4: nixpkgs Compatibility (in progress)
 
-- **Thunk memoization** — `StableName`-based identity caching in `EvalIO`. `forceThunk` is now a `MonadEval` method: IO evaluators memoize (via `IntMap` keyed by `hashStableName` with collision chains), pure evaluators re-evaluate. Shared `IORef MemoCache` in `EvalState`.
+- **Thunk memoization** — Per-thunk `IORef` memo cells (matching real Nix in-place mutation). `forceThunk` is a `MonadEval` method: IO evaluators memoize per-allocation, pure evaluators re-evaluate. GC reclaims dead thunks naturally — no unbounded global cache. `unsafePerformIO` CAF float-out prevented via `NOINLINE` + `seq` pattern.
+- **8.4x builtin dispatch speedup** — Case dispatch replacing polymorphic `Map` reconstruction on every call. Direct pattern match on builtin name for zero-allocation dispatch in the hot path.
 - **Regex builtins** — `builtins.match` and `builtins.split` via `regex-tdfa` (pure Haskell POSIX ERE, cross-platform)
 - `ESearchPath !Text` AST constructor — `<nixpkgs>` is now its own node, desugared at eval time to `builtins.findFile builtins.nixPath "nixpkgs"` (matching real Nix semantics)
 - NIX_PATH parsing: `parseNixPath` converts colon-separated `name=path` entries into `{ prefix, path }` attrset thunks

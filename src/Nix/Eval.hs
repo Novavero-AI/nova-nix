@@ -743,10 +743,138 @@ applyValue other _ =
   throwEvalError ("attempt to call " <> typeName other <> ", which is not a function")
 
 -- | Execute a builtin once all arguments are collected.
+--
+-- Direct case dispatch avoids rebuilding the polymorphic 'builtinRegistry'
+-- Map on every call.  'builtinRegistry' is polymorphic in @m@ so GHC
+-- cannot cache it as a CAF — it gets reconstructed on every use.
+-- Pattern matching on the name is zero-allocation.
 executeBuiltin :: (MonadEval m) => Text -> [NixValue] -> m NixValue
-executeBuiltin name args = case Map.lookup name builtinRegistry of
-  Just def -> bdApply def args
-  Nothing -> throwEvalError ("unknown builtin '" <> name <> "'")
+executeBuiltin name args = case name of
+  -- Type checking (arity 1)
+  "typeOf" -> apply1 (pure . mkStr . typeOfValue)
+  "isNull" -> apply1 (pure . VBool . isNullVal)
+  "isInt" -> apply1 (pure . VBool . isIntVal)
+  "isFloat" -> apply1 (pure . VBool . isFloatVal)
+  "isBool" -> apply1 (pure . VBool . isBoolVal)
+  "isString" -> apply1 (pure . VBool . isStringVal)
+  "isList" -> apply1 (pure . VBool . isListVal)
+  "isAttrs" -> apply1 (pure . VBool . isAttrsVal)
+  "isFunction" -> apply1 (pure . VBool . isFunctionVal)
+  -- List operations (arity 1)
+  "length" -> apply1 builtinLength
+  "head" -> apply1 builtinHead
+  "tail" -> apply1 builtinTail
+  -- String operations (arity 1)
+  "toString" -> apply1 (fmap (uncurry VStr) . coerceToString)
+  "stringLength" -> apply1 builtinStringLength
+  -- Control (arity 1)
+  "throw" -> apply1 builtinThrow
+  "abort" -> apply1 builtinThrow
+  -- Attr set operations (arity 1)
+  "attrNames" -> apply1 builtinAttrNames
+  "attrValues" -> apply1 builtinAttrValues
+  "listToAttrs" -> apply1 builtinListToAttrs
+  -- Attr set operations (arity 2)
+  "hasAttr" -> apply2 builtinHasAttr
+  "getAttr" -> apply2 builtinGetAttr
+  "removeAttrs" -> apply2 builtinRemoveAttrs
+  "intersectAttrs" -> apply2 builtinIntersectAttrs
+  "catAttrs" -> apply2 builtinCatAttrs
+  -- List higher-order (arity 2)
+  "map" -> apply2 builtinMap
+  "filter" -> apply2 builtinFilter
+  "genList" -> apply2 builtinGenList
+  "sort" -> apply2 builtinSort
+  "concatMap" -> apply2 builtinConcatMap
+  "any" -> apply2 builtinAny
+  "all" -> apply2 builtinAll
+  "elem" -> apply2 builtinElem
+  "elemAt" -> apply2 builtinElemAt
+  "partition" -> apply2 builtinPartition
+  "groupBy" -> apply2 builtinGroupBy
+  -- String operations (arity 2)
+  "concatStringsSep" -> apply2 builtinConcatStringsSep
+  -- Arity 3
+  "foldl'" -> apply3 builtinFoldl
+  "substring" -> apply3 builtinSubstring
+  -- Numeric
+  "isPath" -> apply1 (pure . VBool . isPathVal)
+  "ceil" -> apply1 builtinCeil
+  "floor" -> apply1 builtinFloor
+  "seq" -> apply2 (\_ b -> pure b)
+  "trace" -> apply2 (\_ b -> pure b)
+  "unsafeDiscardStringContext" -> apply1 builtinDiscardContext
+  "unsafeDiscardOutputDependency" -> apply1 builtinDiscardOutputDep
+  -- String context introspection
+  "hasContext" -> apply1 builtinHasContext
+  "getContext" -> apply1 builtinGetContext
+  "appendContext" -> apply2 builtinAppendContext
+  "baseNameOf" -> apply1 builtinBaseNameOf
+  "dirOf" -> apply1 builtinDirOf
+  "concatLists" -> apply1 builtinConcatLists
+  "lessThan" -> apply2 builtinLessThan
+  -- Arithmetic + bitwise
+  "add" -> apply2 builtinAdd
+  "sub" -> apply2 builtinSub
+  "mul" -> apply2 builtinMul
+  "div" -> apply2 builtinDiv
+  "bitAnd" -> apply2 builtinBitAnd
+  "bitOr" -> apply2 builtinBitOr
+  "bitXor" -> apply2 builtinBitXor
+  -- Attr set higher-order
+  "mapAttrs" -> apply2 builtinMapAttrs
+  "functionArgs" -> apply1 builtinFunctionArgs
+  "zipAttrsWith" -> apply2 builtinZipAttrsWith
+  -- String manipulation
+  "match" -> apply2 builtinMatch
+  "split" -> apply2 builtinSplit
+  "replaceStrings" -> apply3 builtinReplaceStrings
+  "compareVersions" -> apply2 builtinCompareVersions
+  "splitVersion" -> apply1 builtinSplitVersion
+  "parseDrvName" -> apply1 builtinParseDrvName
+  -- Serialization + hashing
+  "toJSON" -> apply1 builtinToJSON
+  "fromJSON" -> apply1 builtinFromJSON
+  "hashString" -> apply2 builtinHashString
+  -- Error handling + sequencing
+  "tryEval" -> apply1 (\_ -> throwEvalError "unreachable: tryEval handled in evalApp")
+  "deepSeq" -> apply2 builtinDeepSeq
+  -- Graph traversal
+  "genericClosure" -> apply1 builtinGenericClosure
+  -- IO builtins (delegate to MonadEval methods)
+  "import" -> apply1 builtinImport
+  "readFile" -> apply1 builtinReadFile
+  "pathExists" -> apply1 builtinPathExists
+  "readDir" -> apply1 builtinReadDir
+  "getEnv" -> apply1 builtinGetEnv
+  "toPath" -> apply1 builtinToPath
+  -- Store path operations
+  "placeholder" -> apply1 builtinPlaceholder
+  "storePath" -> apply1 builtinStorePath
+  "findFile" -> apply2 builtinFindFile
+  "toFile" -> apply2 builtinToFile
+  "scopedImport" -> apply2 builtinScopedImport
+  -- Network fetchers
+  "fetchurl" -> apply1 builtinFetchurl
+  "fetchTarball" -> apply1 builtinFetchTarball
+  "fetchGit" -> apply1 builtinFetchGit
+  -- Derivation construction
+  "derivation" -> apply1 builtinDerivation
+  -- Error context (pass-through — context only matters on error)
+  "addErrorContext" -> apply2 (\_ val -> pure val)
+  -- Attr position (return null — nixpkgs handles this gracefully)
+  "unsafeGetAttrPos" -> apply2 (\_ _ -> pure VNull)
+  _ -> throwEvalError ("unknown builtin '" <> name <> "'")
+  where
+    apply1 f = case args of
+      [a] -> f a
+      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
+    apply2 f = case args of
+      [a, b] -> f a b
+      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
+    apply3 f = case args of
+      [a, b, c] -> f a b c
+      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — type checking
