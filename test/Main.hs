@@ -1390,7 +1390,7 @@ testImportIO = do
           testDir
           "(import ./literal.nix) + (import ./literal.nix)"
           (VInt 84),
-        runTestIOFail "import nonexistent → error" testDir "import ./nonexistent.nix",
+        runTestIOFail "import nonexistent -> error" testDir "import ./nonexistent.nix",
         runTestIO "import attrset + select" testDir "(import ./attrset.nix).x" (VInt 1),
         runTestIO "import let/lambda" testDir "import ./uses-arg.nix" (VInt 15),
         -- import rejects strings (real Nix semantics)
@@ -1413,7 +1413,7 @@ testImportIO = do
           ("builtins.readFile " <> nixQuotedPath (testDir </> "literal.nix"))
           (mkStr "42"),
         runTestIOFail
-          "readFile missing → error"
+          "readFile missing -> error"
           testDir
           ("builtins.readFile " <> nixQuotedPath (testDir </> "ghost.nix")),
         -- readDir: entries have correct file types
@@ -2047,7 +2047,7 @@ testDepGraph = do
       runTest "single node graph" $ case DepGraph.buildDepGraph readSingle drvA spA of
         Right (DepGraph.DepGraph g) -> assertEqual "single-size" 1 (Map.size g)
         Left err -> Fail ("unexpected error: " <> err),
-      -- Linear chain A→C: topoSort should give [C, A]
+      -- Linear chain A->C: topoSort should give [C, A]
       runTest "linear chain topo" $ case DepGraph.buildDepGraph readChain drvB spB of
         Right graph -> case DepGraph.topoSort graph of
           DepGraph.TopoSorted order ->
@@ -2056,7 +2056,7 @@ testDepGraph = do
               else Fail ("bad order: " <> T.pack (show order))
           DepGraph.TopoCycle cyc -> Fail ("unexpected cycle: " <> T.pack (show cyc))
         Left err -> Fail ("graph build failed: " <> err),
-      -- Diamond D→B,C; B→C: topoSort should have C first, D last
+      -- Diamond D->B,C; B->C: topoSort should have C first, D last
       runTest "diamond topo" $ case DepGraph.buildDepGraph readDiamond drvD spD of
         Right graph -> case DepGraph.topoSort graph of
           DepGraph.TopoSorted order ->
@@ -2079,7 +2079,7 @@ testDepGraph = do
           let deps = DepGraph.directDeps graph spD
            in assertEqual "direct-count" 2 (length deps)
         Left err -> Fail ("graph build failed: " <> err),
-      -- Missing .drv → failure
+      -- Missing .drv -> failure
       runTest "missing drv fails" $ case DepGraph.buildDepGraph readSingle drvB spB of
         Left _ -> Pass
         Right _ -> Fail "expected failure for missing drv",
@@ -2252,7 +2252,7 @@ testBuildOrchestrator = do
                 DepGraph.TopoCycle _ -> Pass
                 DepGraph.TopoSorted _ -> Pass -- Partial sort is also acceptable
               Left _ -> Pass, -- Build graph failure also acceptable
-              -- missing .drv → failure in dep graph
+              -- missing .drv -> failure in dep graph
       runTest "missing drv in dep graph" $
         let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "missing.drv"
             drv =
@@ -2954,7 +2954,7 @@ testBuilder = do
 -- Tests: CLI Integration (Phase 2, Batch 5)
 -- ---------------------------------------------------------------------------
 
--- | End-to-end: eval .nix source → extract derivation → build → verify output.
+-- | End-to-end: eval .nix source -> extract derivation -> build -> verify output.
 evalAndBuild :: StoreDir -> Text -> IO (Either Text (BuildResult, Store))
 evalAndBuild storeDir source = do
   case parseNix "<test>" source of
@@ -2980,8 +2980,8 @@ testE2E = do
   putStrLn "cli/e2e"
   shell <- findTestShell
   sequence
-    [ -- End-to-end: eval → build a simple derivation
-      runTestM "e2e eval → build" $ do
+    [ -- End-to-end: eval -> build a simple derivation
+      runTestM "e2e eval -> build" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-e2e1"
         forceRemoveIfExists tmpStore
