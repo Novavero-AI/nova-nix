@@ -59,13 +59,20 @@ import Nix.Parser.ParseError (ParseError (..))
 -- | Parse a Nix expression from source text.
 --
 -- The input is the full file contents. The file name is used only for
--- error messages.
+-- error messages.  Strips a leading UTF-8 BOM if present — Windows
+-- editors (Notepad, PowerShell) commonly add one.
 parseNix :: Text -> Text -> Either ParseError Expr
 parseNix fileName source = do
-  tokens <- tokenize fileName source
+  tokens <- tokenize fileName (stripBOM source)
   let st = ParseState {psTokens = tokens, psFile = fileName}
   (expr, _remaining) <- runParser parseTopLevel st
   pure expr
+
+-- | Strip a leading UTF-8 byte order mark (U+FEFF) if present.
+stripBOM :: Text -> Text
+stripBOM t = case T.uncons t of
+  Just ('\xFEFF', rest) -> rest
+  _ -> t
 
 -- | Parse a @.nix@ file from disk.
 parseNixFile :: FilePath -> IO (Either ParseError Expr)
