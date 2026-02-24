@@ -4,6 +4,8 @@
 
 ### Phase 4: nixpkgs Compatibility (in progress)
 
+- **Thunk memoization** — `StableName`-based identity caching in `EvalIO`. `forceThunk` is now a `MonadEval` method: IO evaluators memoize (via `IntMap` keyed by `hashStableName` with collision chains), pure evaluators re-evaluate. Shared `IORef MemoCache` in `EvalState`.
+- **Regex builtins** — `builtins.match` and `builtins.split` via `regex-tdfa` (pure Haskell POSIX ERE, cross-platform)
 - `ESearchPath !Text` AST constructor — `<nixpkgs>` is now its own node, desugared at eval time to `builtins.findFile builtins.nixPath "nixpkgs"` (matching real Nix semantics)
 - NIX_PATH parsing: `parseNixPath` converts colon-separated `name=path` entries into `{ prefix, path }` attrset thunks
 - `builtinEnv` now accepts search paths: `builtinEnv :: Integer -> [Thunk] -> Env`
@@ -14,8 +16,10 @@
 - Monadic `resolveKey` replaces pure `resolveStaticKey` — handles both `StaticKey` and `DynamicKey` uniformly
 - CLI `--nix-path NAME=PATH` flag (repeatable, merged with NIX_PATH)
 - CLI `--expr EXPR` for inline expression evaluation
+- CLI deep-force and pretty-printing for eval output
 - `README.md` added to `extra-doc-files` in cabal (shows on Hackage)
 - Parser fix: `TokInterpOpen` in expression context expects `TokRBrace` (not `TokInterpClose`) for closing brace
+- 91 builtins (up from 88)
 - 508 tests (14 new: parseNixPath, search path parsing/eval, dynamic keys, directory import, populated search path resolution)
 
 ## 0.1.0.0 — 2026-02-24
