@@ -120,12 +120,12 @@ jobs:
       - name: Build sdist
         run: cabal sdist
 
-      - name: Publish
+      - name: Upload to Hackage
         env:
           HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
         run: |
-          SDIST=$(cabal sdist | tail -1)
-          curl -X PUT \
-            -H "Authorization: X-ApiKey $HACKAGE_TOKEN" \
-            -F "package=@$SDIST" \
+          SDIST=$(ls dist-newstyle/sdist/nova-nix-*.tar.gz)
+          curl --fail --silent --show-error \
+            --header "Authorization: X-ApiKey ${HACKAGE_TOKEN}" \
+            --form "package=@${SDIST}" \
             https://hackage.haskell.org/packages/
