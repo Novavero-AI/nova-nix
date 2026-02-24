@@ -1,28 +1,31 @@
 # nova-nix Roadmap
 
-## Current State (Phase 3 Complete)
+## Current State (Phase 4 In Progress)
 
-- **Parser**: Complete. Full Nix syntax including string interpolation, set patterns, inherit, indented strings, paths, URIs.
-- **Evaluator**: 88 builtins, polymorphic via `MonadEval` typeclass. `PureEval` for tests, `EvalIO` for real filesystem access.
+- **Parser**: Complete. Full Nix syntax including string interpolation, set patterns, inherit, indented strings, paths, URIs, search paths, dynamic attribute keys.
+- **Evaluator**: 91 builtins, polymorphic via `MonadEval` typeclass. `PureEval` for tests, `EvalIO` for real filesystem access. Per-thunk IORef memoization matching real Nix. Case-dispatch builtin lookup (8.4x speedup).
 - **String Contexts**: Full tracking on `VStr` — `SCPlain`, `SCDrvOutput`, `SCAllOutputs`. Propagated through interpolation, operators, and all string builtins. `derivation` collects contexts into `drvInputDrvs`/`drvInputSrcs`.
 - **Store**: Real SQLite-backed database (ValidPaths + Refs tables, WAL mode). Full store operations: `addToStore`, `scanReferences`, `setReadOnly`, `writeDrv`, `parseStorePath`.
 - **Builder**: Full build loop with recursive dependency resolution — topological sort, binary cache substitution, local build fallback, output registration.
 - **Dependency Graph**: BFS construction with `Data.Sequence` (O(V+E)), Kahn's algorithm topological sort, cycle detection.
 - **Substituter**: HTTP binary cache protocol — narinfo fetch/parse, Ed25519 signature verification, NAR download/decompress/unpack, store registration. Multi-cache with priority ordering.
 - **Derivation**: ATerm round-trip (`toATerm`/`fromATerm`), `builtinDerivation` populates `drvOutputs` with context-derived inputs.
-- **CLI**: `nova-nix eval FILE.nix` and `nova-nix build FILE.nix`.
-- **Tests**: 494 tests, zero framework dependencies.
+- **Search Paths**: `<nixpkgs>` desugars to `builtins.findFile builtins.nixPath name`. NIX_PATH parsed at startup. `--nix-path` CLI flag.
+- **Dynamic Attribute Keys**: `{ ${expr} = val; }` in all contexts. Two-phase resolution preserving knot-tying.
+- **Directory Imports**: `import ./dir` resolves to `./dir/default.nix`.
+- **CLI**: `nova-nix eval FILE.nix`, `nova-nix eval --expr EXPR`, `nova-nix build FILE.nix`, `--nix-path NAME=PATH`, `--strict`.
+- **Tests**: 508 tests, zero framework dependencies.
 
-## Phase 4: nixpkgs Compatibility
+## Phase 4 Remaining: nixpkgs Compatibility
 
 The ultimate test: `import <nixpkgs> {}` evaluates correctly.
 
-- NIX_PATH / `<nixpkgs>` search path resolution for real nixpkgs imports
 - Evaluate real nixpkgs (80,000+ packages as one recursive attrset)
 - Performance target: ~2-5 seconds for full nixpkgs eval
 - Handle all edge cases in builtins, lazy evaluation, and string contexts
 - Missing builtins that nixpkgs exercises (discovered during real eval)
 - Profile and optimize the eval hot path
+- Memory management: depth-limited pretty-printer, lazy higher-order builtins
 
 ## Phase 5: Store Bootstrap + CLI
 

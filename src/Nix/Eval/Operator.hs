@@ -28,7 +28,7 @@ type Force m = Thunk -> m NixValue
 -- | Evaluate a binary operator on two forced values.
 --
 -- The caller must handle short-circuit operators ('OpAnd', 'OpOr',
--- 'OpImpl') before calling this.  The 'Force' function is used only
+-- 'OpImpl') before calling this.  The @Force@ function is used only
 -- for deep structural equality on compound values.
 evalBinary :: (MonadEval m) => Force m -> BinaryOp -> NixValue -> NixValue -> m NixValue
 evalBinary forceFn op left right = case op of

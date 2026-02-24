@@ -120,7 +120,7 @@ standardEntries timestamp searchPaths =
 parseNixPath :: Text -> [Thunk]
 parseNixPath raw
   | T.null raw = []
-  | otherwise = map parseEntry (T.splitOn ":" raw)
+  | otherwise = map parseEntry (splitNixPath raw)
   where
     parseEntry entry =
       let (prefix, path) = case T.breakOn "=" entry of
@@ -135,3 +135,21 @@ parseNixPath raw
                     ]
                 )
             )
+
+-- | Split a NIX_PATH string on colon separators, respecting Windows
+-- drive letters.  A colon followed by @\\@ or @/@ (e.g. @C:\\@) is
+-- part of a path, not a separator.
+splitNixPath :: Text -> [Text]
+splitNixPath = go T.empty
+  where
+    go acc remaining = case T.uncons remaining of
+      Nothing -> [acc | not (T.null acc)]
+      Just (':', rest)
+        | isDriveSep rest -> go (acc <> ":" <> T.take 1 rest) (T.drop 1 rest)
+        | otherwise -> acc : go T.empty rest
+      Just (c, rest) -> go (T.snoc acc c) rest
+    -- After a colon, if the next char is \ or /, it's a drive letter
+    isDriveSep t = case T.uncons t of
+      Just ('\\', _) -> True
+      Just ('/', _) -> True
+      _ -> False

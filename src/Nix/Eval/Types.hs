@@ -185,9 +185,9 @@ pushWithScope scope env =
 --
 -- Each thunk gets its own 'IORef' for in-place memoization, matching
 -- real Nix which mutates @Value@ structs on first force.  The cell is
--- allocated via 'newMemoCell' which uses 'unsafePerformIO' — safe
+-- allocated via @newMemoCell@ which uses 'unsafePerformIO' — safe
 -- because 'newIORef' is a pure allocation with no observable side
--- effects, and the 'NOINLINE' + @seq@ pattern prevents GHC from
+-- effects, and the @NOINLINE@ + @seq@ pattern prevents GHC from
 -- floating the allocation to a shared top-level CAF.
 mkThunk :: Env -> Expr -> Thunk
 mkThunk env thunkExpr =
@@ -260,13 +260,13 @@ class (Monad m) => MonadEval m where
 
   -- | Resolve a path literal to an absolute path.
   -- In IO evaluation, relative paths are resolved against the current
-  -- file's directory ('esBaseDir').  In pure evaluation, paths are
+  -- file's directory (@esBaseDir@).  In pure evaluation, paths are
   -- returned unchanged.  This ensures that path values captured in
   -- closures remain valid after the import scope ends.
   resolvePathLiteral :: Text -> m Text
 
   -- | Force a thunk to a value, with memoization.
-  -- IO evaluators should cache results (e.g. via 'StableName').
+  -- IO evaluators should cache results (via per-thunk @IORef@).
   -- Pure evaluators re-evaluate each time.
   -- The first argument is the evaluation function (to break the
   -- Eval.Types → Eval circular dependency).
