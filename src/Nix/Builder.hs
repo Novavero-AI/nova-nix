@@ -56,6 +56,7 @@ import Nix.Store (Store (..), addToStore, isValid, scanReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, removeDirectoryRecursive)
+import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import qualified System.IO
@@ -288,14 +289,23 @@ homeEnvVar =
 
 -- | Run the builder process, returning either (exitCode, stderr) on failure
 -- or () on success.
+--
+-- The build environment is overlaid on top of the inherited system
+-- environment.  Build variables take priority, but system-critical
+-- variables (e.g. SYSTEMROOT on Windows) pass through.  This matches
+-- unsandboxed build behavior — proper isolation comes with Phase 5.
 runBuilder ::
   FilePath ->
   [String] ->
   Map Text Text ->
   FilePath ->
   IO (Either (Int, Text) ())
-runBuilder builderPath builderArgs environ workDir = do
-  let envList = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList environ]
+runBuilder builderPath builderArgs buildEnv workDir = do
+  systemEnv <- System.Environment.getEnvironment
+  let systemMap = Map.fromList [(T.pack k, T.pack v) | (k, v) <- systemEnv]
+      -- Build env wins over system env
+      mergedEnv = Map.union buildEnv systemMap
+      envList = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList mergedEnv]
       cp =
         (Proc.proc builderPath builderArgs)
           { Proc.cwd = Just workDir,
