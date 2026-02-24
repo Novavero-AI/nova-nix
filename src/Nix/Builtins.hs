@@ -20,10 +20,9 @@ import Nix.Store.Path (defaultStoreDirText)
 
 -- | The initial environment containing all builtins.
 --
--- The top-level scope gets @true@, @false@, @null@, @import@,
--- @derivation@, and @builtins@.
--- The @builtins@ attrset itself also contains @true@, @false@, and
--- @null@ (matching real Nix behavior).
+-- Real Nix exposes a subset of builtins at the top level without
+-- the @builtins.@ prefix.  These are the functions most commonly
+-- used unqualified in nixpkgs and user code.
 --
 -- @currentTime@ is an integer constant (seconds since epoch),
 -- passed in at startup.  In tests, pass @0@.
@@ -31,16 +30,43 @@ builtinEnv :: Integer -> Env
 builtinEnv timestamp =
   Env
     { envBindings =
-        Map.fromList
+        Map.fromList $
+          -- Values
           [ ("true", evaluated (VBool True)),
             ("false", evaluated (VBool False)),
             ("null", evaluated VNull),
-            ("import", evaluated (VBuiltin "import" [])),
-            ("derivation", evaluated (VBuiltin "derivation" [])),
             ("builtins", evaluated (builtinsAttrSet timestamp))
-          ],
+          ]
+            -- Top-level builtin functions (available without builtins. prefix)
+            ++ map topLevelBuiltin topLevelBuiltinNames,
       envWithScopes = []
     }
+
+-- | Builtins exposed at the top level (without @builtins.@ prefix).
+-- This matches real Nix — nixpkgs uses these unqualified everywhere.
+topLevelBuiltinNames :: [Text]
+topLevelBuiltinNames =
+  [ "abort",
+    "baseNameOf",
+    "derivation",
+    "dirOf",
+    "fetchGit",
+    "fetchTarball",
+    "fetchurl",
+    "import",
+    "isNull",
+    "map",
+    "placeholder",
+    "removeAttrs",
+    "scopedImport",
+    "throw",
+    "toFile",
+    "toString"
+  ]
+
+-- | Create a top-level binding for a builtin function.
+topLevelBuiltin :: Text -> (Text, Thunk)
+topLevelBuiltin name = (name, evaluated (VBuiltin name []))
 
 -- | Like 'builtinEnv' but with additional scope bindings overlaid on
 -- the top-level environment.  Used by @scopedImport@.

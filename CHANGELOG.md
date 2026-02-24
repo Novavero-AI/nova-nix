@@ -10,6 +10,7 @@
 - `findTestShell` prefers known Git for Windows bash over WSL launcher (`System32\bash.exe`)
 - Parser strips UTF-8 BOM — Windows editors (Notepad, PowerShell) commonly add byte order marks
 - Demo `test.nix` included: derivations, lambdas, builtins.map, arithmetic — runs on all platforms
+- 16 builtins exposed at top level without `builtins.` prefix (`toString`, `map`, `throw`, `import`, `derivation`, `abort`, `baseNameOf`, `dirOf`, `isNull`, `removeAttrs`, `placeholder`, `scopedImport`, `fetchTarball`, `fetchGit`, `fetchurl`, `toFile`) — matches real Nix language spec, required for nixpkgs compatibility
 
 ### Phase 3: String Contexts + Dependency Resolution + Substituter
 

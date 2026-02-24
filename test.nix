@@ -15,6 +15,6 @@ let
 in {
   greeting = "nova-nix is alive";
   count = 1 + 2 + 3;
-  items = builtins.map (x: x * 2) [1 2 3 4 5];
+  items = map (x: x * 2) [1 2 3 4 5];
   hasDerivation = pkgs.hello.type;
 }
