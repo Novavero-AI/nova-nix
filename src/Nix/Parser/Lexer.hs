@@ -161,9 +161,7 @@ lexNormalMode st acc
                   newSt = advanceCol 1 st {lsInput = rest, lsModes = ModeString : lsModes st}
                in lexLoop newSt (tok : acc)
             '\''
-              | Just '\'' <- safeHead rest,
-                -- make sure it's not ''$ or ''\ or ''' (those are inside indented strings only)
-                not (isIndStringEscape (T.drop 2 (lsInput st))) ->
+              | Just '\'' <- safeHead rest ->
                   let tok = Located (lsLine st) (lsCol st) TokIndStringOpen
                       newSt = advanceCol 2 st {lsInput = T.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
                    in lexLoop newSt (tok : acc)
@@ -638,13 +636,6 @@ canFollowWithDivision TokTrue = True
 canFollowWithDivision TokFalse = True
 canFollowWithDivision TokNull = True
 canFollowWithDivision _ = False
-
-isIndStringEscape :: Text -> Bool
-isIndStringEscape t = case T.uncons t of
-  Just ('\'', _) -> True
-  Just ('$', _) -> True
-  Just ('\\', _) -> True
-  _ -> False
 
 -- ---------------------------------------------------------------------------
 -- Emit helpers

@@ -75,6 +75,7 @@ import Nix.Eval.Types
     Thunk (..),
     emptyContext,
     emptyEnv,
+    envInsert,
     envInsertThunk,
     envLookup,
     evaluated,
@@ -266,15 +267,17 @@ data ResolvedBinding
 -- | Resolve all attribute keys in a list of bindings, evaluating
 -- dynamic keys against the given environment.
 resolveBindingKeys :: (MonadEval m) => Env -> [Binding] -> m [ResolvedBinding]
-resolveBindingKeys keyEnv = mapM resolveOne
+resolveBindingKeys keyEnv = fmap catMaybes . mapM resolveOne
   where
     resolveOne (NamedBinding path bodyExpr) = do
       resolvedPath <- mapM (resolveKey keyEnv) path
-      pure (ResolvedNamed resolvedPath bodyExpr)
+      -- If any key segment is null, skip the entire binding
+      -- (matching real Nix; used by the module system for conditional attrs).
+      pure (fmap (`ResolvedNamed` bodyExpr) (sequence resolvedPath))
     resolveOne (Inherit Nothing names) =
-      pure (ResolvedInherit names)
+      pure (Just (ResolvedInherit names))
     resolveOne (Inherit (Just fromExpr) names) =
-      pure (ResolvedInheritFrom fromExpr names)
+      pure (Just (ResolvedInheritFrom fromExpr names))
 
 -- | Build a flat attribute map from pre-resolved bindings (pure).
 -- Thunks capture @thunkEnv@ — suitable for knot-tying.
@@ -324,22 +327,28 @@ buildNestedAttrM :: (MonadEval m) => Env -> Env -> AttrPath -> Expr -> m (Map Te
 buildNestedAttrM _thunkEnv _keyEnv [] _bodyExpr =
   throwEvalError "empty attribute path"
 buildNestedAttrM thunkEnv keyEnv [key] bodyExpr = do
-  keyText <- resolveKey keyEnv key
-  pure (Map.singleton keyText (mkThunk thunkEnv bodyExpr))
+  resolved <- resolveKey keyEnv key
+  case resolved of
+    Nothing -> pure Map.empty
+    Just keyText -> pure (Map.singleton keyText (mkThunk thunkEnv bodyExpr))
 buildNestedAttrM thunkEnv keyEnv (key : rest) bodyExpr = do
-  keyText <- resolveKey keyEnv key
-  inner <- buildNestedAttrM thunkEnv keyEnv rest bodyExpr
-  pure (Map.singleton keyText (evaluated (VAttrs inner)))
+  resolved <- resolveKey keyEnv key
+  case resolved of
+    Nothing -> pure Map.empty
+    Just keyText -> do
+      inner <- buildNestedAttrM thunkEnv keyEnv rest bodyExpr
+      pure (Map.singleton keyText (evaluated (VAttrs inner)))
 
--- | Resolve an attribute key to its text name.
--- Static keys return immediately; dynamic keys evaluate the expression
--- and coerce the result to a string.
-resolveKey :: (MonadEval m) => Env -> AttrKey -> m Text
-resolveKey _env (StaticKey name) = pure name
+-- | Resolve an attribute key.  Static keys always return 'Just'.
+-- Dynamic keys evaluate to a string or 'null'; null means "skip this binding"
+-- (matching real Nix, used by the module system for conditional attributes).
+resolveKey :: (MonadEval m) => Env -> AttrKey -> m (Maybe Text)
+resolveKey _env (StaticKey name) = pure (Just name)
 resolveKey env (DynamicKey expr) = do
   val <- eval env expr
   case val of
-    VStr s _ -> pure s
+    VStr s _ -> pure (Just s)
+    VNull -> pure Nothing
     _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName val)
 
 -- | Merge two attribute maps.  For overlapping keys where both sides
@@ -376,8 +385,8 @@ walkAttrPath :: (MonadEval m) => Env -> AttrPath -> NixValue -> m (Maybe NixValu
 walkAttrPath _env [] val = pure (Just val)
 walkAttrPath env (key : rest) val = case val of
   VAttrs attrs -> do
-    keyText <- resolveKey env key
-    case Map.lookup keyText attrs of
+    resolved <- resolveKey env key
+    case resolved >>= (`Map.lookup` attrs) of
       Just thunk -> do
         inner <- force thunk
         walkAttrPath env rest inner
@@ -428,6 +437,16 @@ evalApp env funcExpr argExpr = do
     VBuiltin name accArgs -> do
       argVal <- eval env argExpr
       applyBuiltin name accArgs argVal
+    -- __functor support: a set with __functor is callable.
+    -- Semantics: (attrs.__functor attrs) arg
+    VAttrs attrs
+      | Just functorThunk <- Map.lookup "__functor" attrs -> do
+          functor <- force functorThunk
+          -- Apply __functor to the set itself, yielding a function
+          partiallyApplied <- applyValue functor funcVal
+          -- Apply the resulting function to the argument
+          argVal <- eval env argExpr
+          applyValue partiallyApplied argVal
     _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
 
 -- | Match function formals against an argument thunk.
@@ -676,6 +695,7 @@ builtinRegistry =
       -- Attr set higher-order
       builtin2 "mapAttrs" builtinMapAttrs,
       builtin1 "functionArgs" builtinFunctionArgs,
+      builtin2 "setFunctionArgs" builtinSetFunctionArgs,
       builtin2 "zipAttrsWith" builtinZipAttrsWith,
       -- String manipulation
       builtin2 "match" builtinMatch,
@@ -833,6 +853,7 @@ executeBuiltin name args = case name of
   -- Attr set higher-order
   "mapAttrs" -> apply2 builtinMapAttrs
   "functionArgs" -> apply1 builtinFunctionArgs
+  "setFunctionArgs" -> apply2 builtinSetFunctionArgs
   "zipAttrsWith" -> apply2 builtinZipAttrsWith
   -- String manipulation
   "match" -> apply2 builtinMatch
@@ -1643,6 +1664,9 @@ builtinMapAttrs _ other =
 builtinFunctionArgs :: (MonadEval m) => NixValue -> m NixValue
 builtinFunctionArgs (VLambda _ formals _) = pure (formalsToAttrs formals)
 builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs Map.empty)
+-- Callable sets with __functionArgs metadata (from setFunctionArgs).
+builtinFunctionArgs (VAttrs attrs)
+  | Just faThunk <- Map.lookup "__functionArgs" attrs = force faThunk
 builtinFunctionArgs other =
   throwEvalError ("builtins.functionArgs: expected a function, got " <> typeName other)
 
@@ -1656,6 +1680,26 @@ formalsListToAttrs formals =
   VAttrs $
     Map.fromList
       [(fName f, evaluated (VBool (isJust (fDefault f)))) | f <- formals]
+
+-- | @builtins.setFunctionArgs f args@ — wraps @f@ in a callable attrset
+-- with @__functor@ (so it remains callable) and @__functionArgs@ metadata.
+-- Used by nixpkgs @lib.mirrorFunctionArgs@ / @lib.makeOverridable@.
+--
+-- @__functor@ is @self: f@ — a lambda that ignores @self@ and returns
+-- the original function.  The function is captured in the closure env.
+builtinSetFunctionArgs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinSetFunctionArgs func (VAttrs argSpec) =
+  let closureEnv = envInsert "__fn" func emptyEnv
+      -- __functor = self: __fn  (ignores self, returns the original function)
+      functorLambda = VLambda closureEnv (FormalName "_self") (EVar "__fn")
+   in pure $
+        VAttrs $
+          Map.fromList
+            [ ("__functor", evaluated functorLambda),
+              ("__functionArgs", evaluated (VAttrs argSpec))
+            ]
+builtinSetFunctionArgs func args =
+  throwEvalError ("builtins.setFunctionArgs: expected a set as second argument, got " <> typeName args <> " (func: " <> typeName func <> ")")
 
 builtinZipAttrsWith :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinZipAttrsWith func (VList thunks) = do
@@ -1859,7 +1903,7 @@ builtinSplitVersion other =
 splitVersionComponents :: Text -> [Text]
 splitVersionComponents t = case T.uncons t of
   Nothing -> []
-  Just ('.', rest) -> "." : splitVersionComponents rest
+  Just ('.', rest) -> splitVersionComponents rest
   Just (c, _)
     | isDigit c ->
         let (digits, rest) = T.span isDigit t

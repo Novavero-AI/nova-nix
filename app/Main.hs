@@ -60,13 +60,19 @@ parseArgs = go (CliOpts [] False CmdHelp)
       go (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
     go opts ("--strict" : rest) =
       go (opts {optStrict = True}) rest
-    go opts ("eval" : "--expr" : expr : rest) =
-      go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
-    go opts ("eval" : path : rest) =
-      go (opts {optCommand = CmdEvalFile path}) rest
+    go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : path : rest) =
       go (opts {optCommand = CmdBuild path}) rest
     go opts _ = opts
+    -- Sub-parser for eval: handles --strict and --expr interleaved with the file arg.
+    goEval opts [] = opts
+    goEval opts ("--strict" : rest) = goEval (opts {optStrict = True}) rest
+    goEval opts ("--nix-path" : val : rest) =
+      goEval (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
+    goEval opts ("--expr" : expr : rest) =
+      go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
+    goEval opts (path : rest) =
+      go (opts {optCommand = CmdEvalFile path}) rest
 
 -- | Merge --nix-path entries, bundled data dir, and NIX_PATH search paths.
 -- The data dir is appended last so user paths take priority.

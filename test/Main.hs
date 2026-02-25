@@ -1189,9 +1189,9 @@ testBatch4 = do
         assertEvalFail "cmpVer-err" "builtins.compareVersions 1 2",
       -- splitVersion
       runTest "splitVersion basic" $
-        assertEval "splitVer" "builtins.splitVersion \"1.2.3\" == [ \"1\" \".\" \"2\" \".\" \"3\" ]" (VBool True),
+        assertEval "splitVer" "builtins.splitVersion \"1.2.3\" == [ \"1\" \"2\" \"3\" ]" (VBool True),
       runTest "splitVersion pre" $
-        assertEval "splitVer-pre" "builtins.splitVersion \"1.2pre\" == [ \"1\" \".\" \"2\" \"pre\" ]" (VBool True),
+        assertEval "splitVer-pre" "builtins.splitVersion \"1.2pre\" == [ \"1\" \"2\" \"pre\" ]" (VBool True),
       runTest "splitVersion type error" $
         assertEvalFail "splitVer-err" "builtins.splitVersion 42",
       -- parseDrvName
