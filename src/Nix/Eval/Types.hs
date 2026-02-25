@@ -320,28 +320,64 @@ attrSetFromMap = EagerAttrs
 newLazyAttrCache :: Map Text LazyBinding -> IORef (Map Text Thunk)
 newLazyAttrCache bindings = unsafePerformIO (bindings `seq` newIORef Map.empty)
 
--- | Evaluation environment.
+-- | Evaluation environment — scope chain.
 --
--- Variable lookup checks 'envBindings' first (lexical scope always wins),
--- then walks 'envWithScopes' innermost-first.  This correctly handles
--- nested @with@ expressions where inner scopes shadow outer ones, and
--- lexical bindings always take priority.
+-- Each Env holds only its LOCAL bindings and a parent pointer.
+-- Variable lookup walks the chain: local bindings first, then parent,
+-- then grandparent, etc.  With-scopes are checked AFTER exhausting
+-- all lexical bindings in the chain (Nix: lexical always wins).
+--
+-- This avoids O(n) Map.union/insert when extending large envs (e.g.
+-- the 30k-entry nixpkgs rec set).  A function application that adds
+-- 5 formals creates 5 singleton Maps instead of 5 copies of the
+-- 30k-entry map's internal Bin nodes.
 data Env = Env
-  { envBindings :: !(Map Text Thunk),
+  { -- | Local lexical bindings at this scope level.
+    envBindings :: !(Map Text Thunk),
+    -- | Parent scope (Nothing at the root).  LAZY for knot-tying
+    -- in rec {} where recEnv's parent is the outer env.
+    envParent :: !(Maybe Env),
+    -- | With-scopes, innermost first.  Inherited from parent on
+    -- env extension; only 'pushWithScope' adds new entries.
     envWithScopes :: ![AttrSet]
   }
-  deriving (Eq, Show)
+
+-- | Shallow comparison: checks local bindings and with-scopes only.
+-- Ignores parent chain to avoid diverging on deep/recursive envs.
+-- Only used in tests on non-recursive structures.
+instance Eq Env where
+  Env b1 _ w1 == Env b2 _ w2 = b1 == b2 && w1 == w2
+
+-- | Compact show: just the size and structure, not the full contents.
+instance Show Env where
+  show (Env bindings parent withs) =
+    "Env{"
+      ++ show (Map.size bindings)
+      ++ " local"
+      ++ maybe "" (const ", parent") parent
+      ++ ", "
+      ++ show (length withs)
+      ++ " withs}"
 
 -- | Empty environment (no variables in scope).
 emptyEnv :: Env
-emptyEnv = Env Map.empty []
+emptyEnv = Env Map.empty Nothing []
 
--- | Look up a variable: lexical bindings first, then with-scopes.
+-- | Look up a variable: walk the parent chain checking lexical
+-- bindings at each level; fall back to with-scopes (from the
+-- starting env) only after exhausting all lexical scopes.
 envLookup :: Text -> Env -> Maybe Thunk
-envLookup name (Env bindings withs) =
-  case Map.lookup name bindings of
-    Just val -> Just val
-    Nothing -> lookupWithScopes name withs
+envLookup name env = lexicalLookup env
+  where
+    -- With-scopes from the STARTING env: these are the most recent
+    -- and subsume all ancestor with-scopes (children inherit them).
+    withs = envWithScopes env
+    lexicalLookup (Env bindings parent _) =
+      case Map.lookup name bindings of
+        Just val -> Just val
+        Nothing -> case parent of
+          Just p -> lexicalLookup p
+          Nothing -> lookupWithScopes name withs
 
 -- | Walk with-scopes innermost to outermost.
 -- Uses 'attrSetLookup' so that 'LazyAttrs' with-scopes only
@@ -353,18 +389,29 @@ lookupWithScopes name (scope : rest) =
     Just val -> Just val
     Nothing -> lookupWithScopes name rest
 
--- | Insert an already-forced value into the lexical bindings.
+-- | Insert an already-forced value as a new scope level.
+-- Creates a child env with a singleton Map — O(1) instead of
+-- O(log n) Map.insert on the parent's (potentially large) Map.
 envInsert :: Text -> NixValue -> Env -> Env
 envInsert name val env =
-  env {envBindings = Map.insert name (Evaluated val) (envBindings env)}
+  Env
+    { envBindings = Map.singleton name (Evaluated val),
+      envParent = Just env,
+      envWithScopes = envWithScopes env
+    }
 
--- | Insert a thunk into the lexical bindings.
+-- | Insert a thunk as a new scope level.
 envInsertThunk :: Text -> Thunk -> Env -> Env
 envInsertThunk name thunk env =
-  env {envBindings = Map.insert name thunk (envBindings env)}
+  Env
+    { envBindings = Map.singleton name thunk,
+      envParent = Just env,
+      envWithScopes = envWithScopes env
+    }
 
 -- | Push a with-scope onto the scope chain (innermost position).
 -- Accepts 'AttrSet' directly so 'LazyAttrs' with-scopes stay lazy.
+-- Does not create a new parent level — just modifies the with-scope list.
 pushWithScope :: AttrSet -> Env -> Env
 pushWithScope scope env =
   env {envWithScopes = scope : envWithScopes env}

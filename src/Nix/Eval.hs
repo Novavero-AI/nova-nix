@@ -246,7 +246,15 @@ evalRecAttrs env bindings = do
   -- Lazy-valued map for env bindings — uses Data.Map.Lazy so thunks
   -- are stored as unevaluated closures, deferring IORef allocation
   -- until the variable is actually looked up.
-  let recEnv = env {envBindings = MapL.union recBindings (envBindings env)}
+  -- Scope chain: recEnv has rec bindings locally, outer env as parent.
+  -- Avoids O(n) MapL.union on the 30k-entry nixpkgs set — parent
+  -- pointer means outer bindings are shared, not copied.
+  let recEnv =
+        Env
+          { envBindings = recBindings,
+            envParent = Just env,
+            envWithScopes = envWithScopes env
+          }
       -- INTENTIONALLY uses Data.Map.Lazy operations to defer thunk
       -- construction.  Each map value is a closure that allocates
       -- a Thunk + IORef only when forced by variable lookup.
@@ -603,9 +611,15 @@ bindFormal attrs acc (Formal name defExpr) = do
 evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> m NixValue
 evalLet env bindings body = do
   resolvedBindings <- resolveBindingKeys env bindings
-  -- INTENTIONALLY uses Data.Map.Lazy operations to defer thunk
-  -- construction, matching evalRecAttrs.
-  let letEnv = env {envBindings = MapL.union letBindings (envBindings env)}
+  -- Scope chain: let bindings as local scope, outer env as parent.
+  let letEnv =
+        Env
+          { envBindings = letBindings,
+            envParent = Just env,
+            envWithScopes = envWithScopes env
+          }
+      -- INTENTIONALLY uses Data.Map.Lazy operations to defer thunk
+      -- construction, matching evalRecAttrs.
       letBindings = buildResolvedBindingsMapLazy letEnv resolvedBindings
   eval letEnv body
 
@@ -1241,7 +1255,7 @@ builtinGenList func (VInt n)
   | otherwise =
       -- Lazy: each element is a deferred @f i@, forced only on demand.
       let fnThunk = evaluated func
-          env = Env {envBindings = Map.fromList [("__fn", fnThunk)], envWithScopes = []}
+          env = Env {envBindings = Map.fromList [("__fn", fnThunk)], envParent = Nothing, envWithScopes = []}
           mkIndexThunk i = mkThunk env (EApp (EVar "__fn") (ELit (NixInt i)))
        in pure (VList (map mkIndexThunk [0 .. n - 1]))
 builtinGenList _ other =
@@ -1475,6 +1489,7 @@ deferApply func argThunk =
                 [ ("__fn", evaluated func),
                   ("__arg", argThunk)
                 ],
+            envParent = Nothing,
             envWithScopes = []
           }
    in mkSyntheticThunk env (EApp (EVar "__fn") (EVar "__arg"))
@@ -1764,6 +1779,7 @@ builtinMapAttrs func (VAttrs attrs) =
                       ("__key", evaluated (mkStr key)),
                       ("__val", valThunk)
                     ],
+                envParent = Nothing,
                 envWithScopes = []
               }
        in mkSyntheticThunk env (EApp (EApp (EVar "__fn") (EVar "__key")) (EVar "__val"))
