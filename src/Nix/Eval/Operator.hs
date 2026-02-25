@@ -17,6 +17,10 @@ import Nix.Eval.Types
   ( MonadEval (..),
     NixValue (..),
     Thunk,
+    attrSetElems,
+    attrSetFromMap,
+    attrSetKeys,
+    attrSetToMap,
     thunkSameRef,
     typeName,
   )
@@ -158,9 +162,9 @@ nixEqual forceFn (VList as) (VList bs)
   | length as /= length bs = pure False
   | otherwise = listEqual forceFn as bs
 nixEqual forceFn (VAttrs as) (VAttrs bs)
-  | Map.keys as /= Map.keys bs = pure False
+  | attrSetKeys as /= attrSetKeys bs = pure False
   | otherwise = do
-      let pairs = zip (Map.elems as) (Map.elems bs)
+      let pairs = zip (attrSetElems as) (attrSetElems bs)
       results <- mapM (thunkPairEqual forceFn) pairs
       pure (and results)
 nixEqual _ _ _ = pure False
@@ -200,6 +204,8 @@ evalConcat left right =
 -- | Attribute set merge (//).  Right-biased: keys in the right
 -- operand shadow keys in the left.
 evalUpdate :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-evalUpdate (VAttrs as) (VAttrs bs) = pure (VAttrs (Map.union bs as))
+evalUpdate (VAttrs as) (VAttrs bs) =
+  -- Right-biased merge: keys in bs shadow keys in as.
+  pure (VAttrs (attrSetFromMap (Map.union (attrSetToMap bs) (attrSetToMap as))))
 evalUpdate left right =
   throwEvalError ("cannot merge " <> typeName left <> " and " <> typeName right)

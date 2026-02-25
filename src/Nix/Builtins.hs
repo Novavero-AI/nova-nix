@@ -18,7 +18,7 @@ where
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
-import Nix.Eval (Env (..), NixValue (..), Thunk (..), builtinNames, currentSystemStr, evaluated)
+import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, builtinNames, currentSystemStr, evaluated)
 import Nix.Eval.Types (mkStr)
 import Nix.Store.Path (defaultStoreDirText)
 
@@ -86,7 +86,7 @@ builtinEnvWithScope timestamp searchPaths scope =
 -- | The @builtins@ attribute set, derived from the central registry.
 builtinsAttrSet :: Integer -> [Thunk] -> NixValue
 builtinsAttrSet timestamp searchPaths =
-  VAttrs $ Map.union builtinEntries (standardEntries timestamp searchPaths)
+  VAttrs $ attrSetFromMap $ Map.union builtinEntries (standardEntries timestamp searchPaths)
   where
     builtinEntries =
       Map.fromList [(name, evaluated (VBuiltin name [])) | name <- builtinNames]
@@ -129,10 +129,11 @@ parseNixPath raw
               | otherwise -> (before, T.drop 1 after)
        in evaluated
             ( VAttrs
-                ( Map.fromList
-                    [ ("prefix", evaluated (mkStr prefix)),
-                      ("path", evaluated (mkStr path))
-                    ]
+                ( attrSetFromMap $
+                    Map.fromList
+                      [ ("prefix", evaluated (mkStr prefix)),
+                        ("path", evaluated (mkStr path))
+                      ]
                 )
             )
 

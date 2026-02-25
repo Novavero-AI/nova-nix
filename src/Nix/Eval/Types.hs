@@ -10,6 +10,22 @@ module Nix.Eval.Types
     NixValue (..),
     Thunk (..),
 
+    -- * Attribute sets (lazy/eager unified abstraction)
+    AttrSet (..),
+    LazyBinding (..),
+    attrSetLookup,
+    attrSetKeys,
+    attrSetToMap,
+    attrSetFromMap,
+    attrSetMember,
+    attrSetNull,
+    attrSetSize,
+    attrSetElems,
+    attrSetToAscList,
+    attrSetMapWithKey,
+    attrSetUnionWith,
+    newLazyAttrCache,
+
     -- * String context
     StringContextElement (..),
     StringContext (..),
@@ -39,13 +55,13 @@ module Nix.Eval.Types
   )
 where
 
-import Data.IORef (IORef, newIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import Data.Text (Text)
 import Nix.Derivation (Derivation)
-import Nix.Expr.Types (Expr, Formals)
+import Nix.Expr.Types (AttrKey (..), Expr (..), Formals, StringPart (..))
 import Nix.Store.Path (StorePath)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -126,8 +142,8 @@ data NixValue
     VPath !Text
   | -- | List of thunks (lazy elements).
     VList ![Thunk]
-  | -- | Attribute set: name -> thunk (lazy values).
-    VAttrs !(Map Text Thunk)
+  | -- | Attribute set: unified lazy/eager representation.
+    VAttrs !AttrSet
   | -- | Lambda closure: captures environment, formals, body.
     VLambda !Env !Formals !Expr
   | -- | A realized derivation (build recipe).
@@ -136,6 +152,165 @@ data NixValue
     -- Accumulated args support curried partial application.
     VBuiltin !Text ![NixValue]
   deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- Attribute sets (lazy/eager unified abstraction)
+-- ---------------------------------------------------------------------------
+
+-- | Per-key lazy binding recipe.  Used by 'LazyAttrs' to defer
+-- thunk construction until first access.  Only ~50 of nixpkgs' 30k
+-- packages are touched for a typical eval — storing recipes instead
+-- of pre-built thunks avoids ~30k IORef allocations.
+data LazyBinding
+  = -- | Simple @key = expr@ — deferred @mkThunk recEnv expr@.
+    LazyExpr !Expr
+  | -- | @inherit key@ — deferred @inheritLookup recEnv key@.
+    LazyInherit
+  | -- | @inherit (from) key@ — deferred @mkThunk env (ESelect from [StaticKey key] Nothing)@.
+    LazyInheritFrom !Expr
+  | -- | Pre-built thunk (for merged nested paths or other complex cases).
+    PreBuilt !Thunk
+  deriving (Eq, Show)
+
+-- | Attribute set representation: either an eagerly-materialized map
+-- of thunks, or a lazy binding map that defers thunk construction.
+--
+-- The 'LazyAttrs' constructor is used for @rec {}@ and @let@ bindings
+-- in large attribute sets (e.g. nixpkgs' 30k-entry package set).
+-- Thunks + IORefs are only allocated for keys that are actually accessed.
+data AttrSet
+  = -- | Eagerly-materialized attribute set (small sets, non-rec, builtins).
+    EagerAttrs !(Map Text Thunk)
+  | -- | Lazy attribute set: thunks built on demand from binding recipes.
+    -- The 'Env' field is INTENTIONALLY LAZY for knot-tying in rec {}.
+    LazyAttrs
+      -- | Knot-tied recEnv (lazy for knot-tying)
+      Env
+      -- | Key → binding recipe (O(log n) lookup)
+      !(Map Text LazyBinding)
+      -- | Materialized thunk cache (written via unsafePerformIO)
+      !(IORef (Map Text Thunk))
+
+instance Eq AttrSet where
+  EagerAttrs a == EagerAttrs b = a == b
+  a == b = attrSetToMap a == attrSetToMap b
+
+instance Show AttrSet where
+  show (EagerAttrs m) = show m
+  show (LazyAttrs _ bindings _) =
+    "<lazy " ++ show (Map.size bindings) ++ " bindings>"
+
+-- | Look up a single key.  For 'EagerAttrs', pure 'Map.lookup'.
+-- For 'LazyAttrs', checks the cache first, then materializes a
+-- single thunk from the binding recipe on cache miss.
+--
+-- Uses 'unsafePerformIO' for cache writes — safe because this is
+-- idempotent memoization with no observable side effects beyond
+-- caching (same rationale as thunk memoization via 'newMemoCell').
+attrSetLookup :: Text -> AttrSet -> Maybe Thunk
+attrSetLookup key (EagerAttrs m) = Map.lookup key m
+attrSetLookup key (LazyAttrs env bindings cacheRef) =
+  -- Check cache first, then binding map
+  let cached = unsafePerformIO (readIORef cacheRef)
+   in case Map.lookup key cached of
+        Just thunk -> Just thunk
+        Nothing -> case Map.lookup key bindings of
+          Nothing -> Nothing
+          Just recipe ->
+            let thunk = materializeBinding env key recipe
+             in -- Cache the materialized thunk
+                unsafePerformIO $ do
+                  atomicModifyIORef' cacheRef (\c -> (Map.insert key thunk c, ()))
+                  pure (Just thunk)
+
+-- | Materialize a single 'LazyBinding' into a 'Thunk'.
+materializeBinding :: Env -> Text -> LazyBinding -> Thunk
+materializeBinding env _key (LazyExpr expr) = mkThunk env expr
+materializeBinding env key LazyInherit = inheritLookupThunk env key
+materializeBinding env key (LazyInheritFrom fromExpr) =
+  mkThunk env (ESelect fromExpr [StaticKey key] Nothing)
+materializeBinding _env _key (PreBuilt thunk) = thunk
+
+-- | Look up a name for lazy @inherit@.  If not found, create a thunk
+-- that will error when forced (matching real Nix behaviour).
+inheritLookupThunk :: Env -> Text -> Thunk
+inheritLookupThunk env name =
+  case envLookup name env of
+    Just thunk -> thunk
+    Nothing ->
+      let errMsg = "undefined variable '" <> name <> "'"
+          throwExpr = EApp (EVar "throw") (EStr [StrLit errMsg])
+       in mkThunk env throwExpr
+
+-- | All keys in the attribute set.  For 'LazyAttrs', reads keys from
+-- the binding map — zero thunk allocation.
+attrSetKeys :: AttrSet -> [Text]
+attrSetKeys (EagerAttrs m) = Map.keys m
+attrSetKeys (LazyAttrs _ bindings _) = Map.keys bindings
+
+-- | Check key membership without materializing thunks.
+attrSetMember :: Text -> AttrSet -> Bool
+attrSetMember key (EagerAttrs m) = Map.member key m
+attrSetMember key (LazyAttrs _ bindings _) = Map.member key bindings
+
+-- | Check if the attribute set is empty.
+attrSetNull :: AttrSet -> Bool
+attrSetNull (EagerAttrs m) = Map.null m
+attrSetNull (LazyAttrs _ bindings _) = Map.null bindings
+
+-- | Number of attributes.
+attrSetSize :: AttrSet -> Int
+attrSetSize (EagerAttrs m) = Map.size m
+attrSetSize (LazyAttrs _ bindings _) = Map.size bindings
+
+-- | Full materialization: build a 'Map Text Thunk' from all bindings.
+-- For 'LazyAttrs', this allocates thunks + IORefs for every key —
+-- expensive on large sets, avoid on the hot path.
+--
+-- Uses 'unsafePerformIO' to update the cache atomically.
+attrSetToMap :: AttrSet -> Map Text Thunk
+attrSetToMap (EagerAttrs m) = m
+attrSetToMap (LazyAttrs env bindings cacheRef) =
+  unsafePerformIO $ do
+    cached <- readIORef cacheRef
+    if Map.size cached == Map.size bindings
+      then pure cached
+      else do
+        let full = Map.mapWithKey (materializeOne env cached) bindings
+        atomicModifyIORef' cacheRef (const (full, ()))
+        pure full
+  where
+    materializeOne lazyEnv cache key recipe =
+      case Map.lookup key cache of
+        Just thunk -> thunk
+        Nothing -> materializeBinding lazyEnv key recipe
+
+-- | All thunk values (materialized).
+attrSetElems :: AttrSet -> [Thunk]
+attrSetElems = Map.elems . attrSetToMap
+
+-- | Sorted key-value pairs (materialized).
+attrSetToAscList :: AttrSet -> [(Text, Thunk)]
+attrSetToAscList = Map.toAscList . attrSetToMap
+
+-- | Map a function over all key-value pairs (materializes lazy sets).
+attrSetMapWithKey :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
+attrSetMapWithKey f attrs = EagerAttrs (Map.mapWithKey f (attrSetToMap attrs))
+
+-- | Union two attribute sets with a combining function (materializes both).
+attrSetUnionWith :: (Thunk -> Thunk -> Thunk) -> AttrSet -> AttrSet -> AttrSet
+attrSetUnionWith f a b = EagerAttrs (Map.unionWith f (attrSetToMap a) (attrSetToMap b))
+
+-- | Wrap an eager map as an 'AttrSet'.
+attrSetFromMap :: Map Text Thunk -> AttrSet
+attrSetFromMap = EagerAttrs
+
+-- | Allocate a fresh materialization cache for 'LazyAttrs'.
+-- Uses 'unsafePerformIO' with @NOINLINE@ + @seq@ to ensure each
+-- call site gets its own IORef (same pattern as 'newMemoCell').
+{-# NOINLINE newLazyAttrCache #-}
+newLazyAttrCache :: Map Text LazyBinding -> IORef (Map Text Thunk)
+newLazyAttrCache bindings = unsafePerformIO (bindings `seq` newIORef Map.empty)
 
 -- | Evaluation environment.
 --

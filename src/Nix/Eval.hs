@@ -15,6 +15,19 @@ module Nix.Eval
     NixValue (..),
     Thunk (..),
 
+    -- * Attribute sets (re-exported from Types)
+    AttrSet (..),
+    LazyBinding (..),
+    attrSetFromMap,
+    attrSetLookup,
+    attrSetKeys,
+    attrSetToMap,
+    attrSetToAscList,
+    attrSetMember,
+    attrSetElems,
+    attrSetNull,
+    attrSetSize,
+
     -- * String context (re-exported from Types)
     StringContextElement (..),
     StringContext (..),
@@ -54,6 +67,7 @@ import Data.Bits (xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, ord)
 import Data.List (foldl')
+import qualified Data.Map.Lazy as MapL
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, isJust)
@@ -66,13 +80,26 @@ import Nix.Eval.Context (extractInputDrvs, extractInputSrcs)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
 import Nix.Eval.Types
-  ( Env (..),
+  ( AttrSet (..),
+    Env (..),
+    LazyBinding (..),
     MonadEval (..),
     NixValue (..),
     PureEval (..),
     StringContext (..),
     StringContextElement (..),
     Thunk (..),
+    attrSetElems,
+    attrSetFromMap,
+    attrSetKeys,
+    attrSetLookup,
+    attrSetMapWithKey,
+    attrSetMember,
+    attrSetNull,
+    attrSetSize,
+    attrSetToAscList,
+    attrSetToMap,
+    attrSetUnionWith,
     emptyContext,
     emptyEnv,
     envInsert,
@@ -82,6 +109,7 @@ import Nix.Eval.Types
     mkStr,
     mkSyntheticThunk,
     mkThunk,
+    newLazyAttrCache,
     pushWithScope,
     runPureEval,
     typeName,
@@ -165,7 +193,7 @@ evalSearchPath env name = do
   builtinsVal <- evalVar env "builtins"
   case builtinsVal of
     VAttrs builtinsAttrs ->
-      case Map.lookup "nixPath" builtinsAttrs of
+      case attrSetLookup "nixPath" builtinsAttrs of
         Just nixPathThunk -> do
           nixPathVal <- force nixPathThunk
           builtinFindFile nixPathVal (mkStr name)
@@ -196,20 +224,35 @@ evalAttrs env True bindings = evalRecAttrs env bindings
 evalNonRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
 evalNonRecAttrs env bindings = do
   attrMap <- buildBindingsMapM env env bindings
-  pure (VAttrs attrMap)
+  pure (VAttrs (attrSetFromMap attrMap))
 
 -- | Recursive attribute set: thunks capture the completed environment
 -- (Haskell's laziness ties the knot — Thunk's Env field is lazy).
 -- Dynamic keys in recursive attrs evaluate against the outer env
 -- (the rec env is not yet available during key resolution).
+--
+-- Uses 'LazyAttrs' to defer thunk + IORef allocation: only keys that
+-- are actually accessed get materialized.  For nixpkgs' 30k-entry
+-- package set, this avoids ~30k IORef allocations when only ~50
+-- packages are touched.  The env uses Data.Map.Lazy to similarly
+-- defer thunk construction for variable lookups within the rec set.
 evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
 evalRecAttrs env bindings = do
   -- Resolve dynamic keys eagerly against the outer env.
   resolvedBindings <- resolveBindingKeys env bindings
-  -- Now knot-tie: thunks capture recEnv, keys are already resolved.
-  let recEnv = env {envBindings = Map.union recBindings (envBindings env)}
-      recBindings = buildResolvedBindingsMap recEnv resolvedBindings
-  pure (VAttrs recBindings)
+  -- Knot-tied: recEnv references recBindings which captures recEnv.
+  -- Lazy-valued map for env bindings — uses Data.Map.Lazy so thunks
+  -- are stored as unevaluated closures, deferring IORef allocation
+  -- until the variable is actually looked up.
+  let recEnv = env {envBindings = MapL.union recBindings (envBindings env)}
+      -- INTENTIONALLY uses Data.Map.Lazy operations to defer thunk
+      -- construction.  Each map value is a closure that allocates
+      -- a Thunk + IORef only when forced by variable lookup.
+      recBindings = buildResolvedBindingsMapLazy recEnv resolvedBindings
+      -- Build per-key lazy binding recipes for the LazyAttrs.
+      lazyBindingMap = buildLazyBindingMap recEnv resolvedBindings
+      cache = newLazyAttrCache lazyBindingMap
+  pure (VAttrs (LazyAttrs recEnv lazyBindingMap cache))
 
 -- | Build a flat attribute map from bindings (monadic — resolves
 -- dynamic keys via eval, but only creates thunks for values).
@@ -279,26 +322,76 @@ resolveBindingKeys keyEnv = fmap catMaybes . mapM resolveOne
     resolveOne (Inherit (Just fromExpr) names) =
       pure (Just (ResolvedInheritFrom fromExpr names))
 
--- | Build a flat attribute map from pre-resolved bindings (pure).
--- Thunks capture @thunkEnv@ — suitable for knot-tying.
-buildResolvedBindingsMap :: Env -> [ResolvedBinding] -> Map Text Thunk
-buildResolvedBindingsMap thunkEnv =
-  foldl' mergeBinding Map.empty
+-- | Like 'buildResolvedBindingsMap' but uses 'Data.Map.Lazy' operations
+-- so that thunk values are stored as unevaluated closures.  This defers
+-- 'mkThunk' + IORef allocation until the key is actually accessed.
+-- Used by 'evalRecAttrs' and 'evalLet' for the env bindings.
+buildResolvedBindingsMapLazy :: Env -> [ResolvedBinding] -> Map Text Thunk
+buildResolvedBindingsMapLazy thunkEnv =
+  foldl' mergeBindingLazy MapL.empty
   where
-    mergeBinding current binding =
-      mergeAttrMaps current (processResolved thunkEnv binding)
+    mergeBindingLazy current binding =
+      MapL.unionWith mergeThunks current (processResolvedLazy thunkEnv binding)
 
--- | Process a single resolved binding into key-value pairs (pure).
-processResolved :: Env -> ResolvedBinding -> Map Text Thunk
-processResolved thunkEnv (ResolvedNamed path bodyExpr) =
-  buildResolvedNestedAttr thunkEnv path bodyExpr
-processResolved lookupEnv (ResolvedInherit names) =
-  Map.fromList [(n, inheritLookup lookupEnv n) | n <- names]
-processResolved thunkEnv (ResolvedInheritFrom fromExpr names) =
-  Map.fromList
+-- | Like 'processResolved' but uses 'Data.Map.Lazy' operations
+-- to avoid forcing thunk values on map insertion.
+processResolvedLazy :: Env -> ResolvedBinding -> Map Text Thunk
+processResolvedLazy thunkEnv (ResolvedNamed path bodyExpr) =
+  buildResolvedNestedAttrLazy thunkEnv path bodyExpr
+processResolvedLazy lookupEnv (ResolvedInherit names) =
+  MapL.fromList [(n, inheritLookup lookupEnv n) | n <- names]
+processResolvedLazy thunkEnv (ResolvedInheritFrom fromExpr names) =
+  MapL.fromList
     [ (n, mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))
     | n <- names
     ]
+
+-- | Like 'buildResolvedNestedAttr' but uses 'Data.Map.Lazy' operations.
+buildResolvedNestedAttrLazy :: Env -> [Text] -> Expr -> Map Text Thunk
+buildResolvedNestedAttrLazy _thunkEnv [] _bodyExpr = Map.empty
+buildResolvedNestedAttrLazy thunkEnv [key] bodyExpr =
+  MapL.singleton key (mkThunk thunkEnv bodyExpr)
+buildResolvedNestedAttrLazy thunkEnv (key : rest) bodyExpr =
+  MapL.singleton key (evaluated (VAttrs (attrSetFromMap (buildResolvedNestedAttrLazy thunkEnv rest bodyExpr))))
+
+-- | Build per-key lazy binding recipes from resolved bindings.
+-- Simple @key = expr@ bindings become 'LazyExpr' (deferred thunk
+-- construction).  Nested paths and inherits fall back to 'PreBuilt'
+-- with eagerly-constructed thunks (these are rare in nixpkgs).
+buildLazyBindingMap :: Env -> [ResolvedBinding] -> Map Text LazyBinding
+buildLazyBindingMap thunkEnv = foldl' addBinding Map.empty
+  where
+    addBinding acc (ResolvedNamed [key] bodyExpr) =
+      case Map.lookup key acc of
+        Nothing -> Map.insert key (LazyExpr bodyExpr) acc
+        -- Key collision (rare): must merge, so eagerly build both
+        Just existing ->
+          let existingThunk = materializeLazy thunkEnv key existing
+              newThunk = mkThunk thunkEnv bodyExpr
+           in Map.insert key (PreBuilt (mergeThunks existingThunk newThunk)) acc
+    addBinding acc (ResolvedNamed path@(_ : _ : _) bodyExpr) =
+      -- Nested path: build eagerly (rare in large rec sets)
+      let nested = buildResolvedNestedAttr thunkEnv path bodyExpr
+       in foldl' (\a (k, t) -> insertLazyWithMerge thunkEnv a k (PreBuilt t)) acc (Map.toList nested)
+    addBinding acc (ResolvedNamed [] _) = acc
+    addBinding acc (ResolvedInherit names) =
+      foldl' (\a n -> insertLazyWithMerge thunkEnv a n LazyInherit) acc names
+    addBinding acc (ResolvedInheritFrom fromExpr names) =
+      foldl' (\a n -> insertLazyWithMerge thunkEnv a n (LazyInheritFrom fromExpr)) acc names
+
+    insertLazyWithMerge env' acc key new =
+      case Map.lookup key acc of
+        Nothing -> Map.insert key new acc
+        Just existing ->
+          let existingThunk = materializeLazy env' key existing
+              newThunk = materializeLazy env' key new
+           in Map.insert key (PreBuilt (mergeThunks existingThunk newThunk)) acc
+
+    materializeLazy env' _key (LazyExpr expr) = mkThunk env' expr
+    materializeLazy env' bindKey LazyInherit = inheritLookup env' bindKey
+    materializeLazy env' bindKey (LazyInheritFrom fromExpr) =
+      mkThunk env' (ESelect fromExpr [StaticKey bindKey] Nothing)
+    materializeLazy _env' _bindKey (PreBuilt thunk) = thunk
 
 -- | Build a nested attribute structure from a resolved dotted path (pure).
 buildResolvedNestedAttr :: Env -> [Text] -> Expr -> Map Text Thunk
@@ -306,7 +399,7 @@ buildResolvedNestedAttr _thunkEnv [] _bodyExpr = Map.empty
 buildResolvedNestedAttr thunkEnv [key] bodyExpr =
   Map.singleton key (mkThunk thunkEnv bodyExpr)
 buildResolvedNestedAttr thunkEnv (key : rest) bodyExpr =
-  Map.singleton key (evaluated (VAttrs (buildResolvedNestedAttr thunkEnv rest bodyExpr)))
+  Map.singleton key (evaluated (VAttrs (attrSetFromMap (buildResolvedNestedAttr thunkEnv rest bodyExpr))))
 
 -- | Look up a name for @inherit@.  If not found, create a thunk
 -- that will error when forced (matching real Nix behaviour).
@@ -337,7 +430,7 @@ buildNestedAttrM thunkEnv keyEnv (key : rest) bodyExpr = do
     Nothing -> pure Map.empty
     Just keyText -> do
       inner <- buildNestedAttrM thunkEnv keyEnv rest bodyExpr
-      pure (Map.singleton keyText (evaluated (VAttrs inner)))
+      pure (Map.singleton keyText (evaluated (VAttrs (attrSetFromMap inner))))
 
 -- | Resolve an attribute key.  Static keys always return 'Just'.
 -- Dynamic keys evaluate to a string or 'null'; null means "skip this binding"
@@ -360,7 +453,7 @@ mergeAttrMaps = Map.unionWith mergeThunks
 -- merge their contents recursively.  Otherwise the right wins.
 mergeThunks :: Thunk -> Thunk -> Thunk
 mergeThunks (Evaluated (VAttrs a)) (Evaluated (VAttrs b)) =
-  Evaluated (VAttrs (mergeAttrMaps a b))
+  Evaluated (VAttrs (attrSetUnionWith mergeThunks a b))
 mergeThunks _ new = new
 
 -- ---------------------------------------------------------------------------
@@ -386,7 +479,7 @@ walkAttrPath _env [] val = pure (Just val)
 walkAttrPath env (key : rest) val = case val of
   VAttrs attrs -> do
     resolved <- resolveKey env key
-    case resolved >>= (`Map.lookup` attrs) of
+    case resolved >>= (`attrSetLookup` attrs) of
       Just thunk -> do
         inner <- force thunk
         walkAttrPath env rest inner
@@ -419,19 +512,21 @@ evalApp env funcExpr argExpr = do
         Right val ->
           pure
             ( VAttrs
-                ( Map.fromList
-                    [ ("success", evaluated (VBool True)),
-                      ("value", evaluated val)
-                    ]
+                ( attrSetFromMap $
+                    Map.fromList
+                      [ ("success", evaluated (VBool True)),
+                        ("value", evaluated val)
+                      ]
                 )
             )
         Left _ ->
           pure
             ( VAttrs
-                ( Map.fromList
-                    [ ("success", evaluated (VBool False)),
-                      ("value", evaluated (VBool False))
-                    ]
+                ( attrSetFromMap $
+                    Map.fromList
+                      [ ("success", evaluated (VBool False)),
+                        ("value", evaluated (VBool False))
+                      ]
                 )
             )
     VBuiltin name accArgs -> do
@@ -440,7 +535,7 @@ evalApp env funcExpr argExpr = do
     -- __functor support: a set with __functor is callable.
     -- Semantics: (attrs.__functor attrs) arg
     VAttrs attrs
-      | Just functorThunk <- Map.lookup "__functor" attrs -> do
+      | Just functorThunk <- attrSetLookup "__functor" attrs -> do
           functor <- force functorThunk
           -- Apply __functor to the set itself, yielding a function
           partiallyApplied <- applyValue functor funcVal
@@ -473,21 +568,21 @@ matchFormalSet closureEnv formals allowExtra argVal =
     _ -> throwEvalError ("function expects a set argument, got " <> typeName argVal)
 
 -- | Verify that no unexpected keys are present (unless @...@ allows them).
-checkExtraKeys :: (MonadEval m) => [Formal] -> Bool -> Map Text Thunk -> m ()
+checkExtraKeys :: (MonadEval m) => [Formal] -> Bool -> AttrSet -> m ()
 checkExtraKeys _ True _ = pure ()
 checkExtraKeys formals False attrs =
   let expected = map fName formals
-      actual = Map.keys attrs
+      actual = attrSetKeys attrs
       extra = filter (`notElem` expected) actual
    in case extra of
         [] -> pure ()
         (k : _) -> throwEvalError ("unexpected attribute '" <> k <> "' in function argument")
 
 -- | Bind a single formal parameter from the argument attrset.
-bindFormal :: (MonadEval m) => Map Text Thunk -> m Env -> Formal -> m Env
+bindFormal :: (MonadEval m) => AttrSet -> m Env -> Formal -> m Env
 bindFormal attrs acc (Formal name defExpr) = do
   env <- acc
-  case Map.lookup name attrs of
+  case attrSetLookup name attrs of
     Just thunk -> pure (envInsertThunk name thunk env)
     Nothing -> case defExpr of
       Just def -> pure (envInsertThunk name (mkThunk env def) env)
@@ -501,11 +596,15 @@ bindFormal attrs acc (Formal name defExpr) = do
 -- Knot-tying via Haskell laziness (Thunk's Env field is lazy).
 -- Dynamic keys in let evaluate against the outer env (the let env
 -- is not yet available during key resolution).
+--
+-- Uses Data.Map.Lazy for env bindings to defer thunk construction.
 evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> m NixValue
 evalLet env bindings body = do
   resolvedBindings <- resolveBindingKeys env bindings
-  let letEnv = env {envBindings = Map.union letBindings (envBindings env)}
-      letBindings = buildResolvedBindingsMap letEnv resolvedBindings
+  -- INTENTIONALLY uses Data.Map.Lazy operations to defer thunk
+  -- construction, matching evalRecAttrs.
+  let letEnv = env {envBindings = MapL.union letBindings (envBindings env)}
+      letBindings = buildResolvedBindingsMapLazy letEnv resolvedBindings
   eval letEnv body
 
 evalIf :: (MonadEval m) => Env -> Expr -> Expr -> Expr -> m NixValue
@@ -520,7 +619,7 @@ evalWith :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
 evalWith env scope body = do
   scopeVal <- eval env scope
   case scopeVal of
-    VAttrs attrs -> eval (pushWithScope attrs env) body
+    VAttrs attrs -> eval (pushWithScope (attrSetToMap attrs) env) body
     _ -> throwEvalError ("'with' requires a set, got " <> typeName scopeVal)
 
 evalAssert :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
@@ -998,20 +1097,21 @@ builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <
 
 builtinAttrNames :: (MonadEval m) => NixValue -> m NixValue
 builtinAttrNames (VAttrs attrs) =
-  pure (VList (map (evaluated . mkStr) (Map.keys attrs)))
+  -- Zero thunk allocation for LazyAttrs: attrSetKeys reads binding map keys.
+  pure (VList (map (evaluated . mkStr) (attrSetKeys attrs)))
 builtinAttrNames other =
   throwEvalError ("builtins.attrNames: expected a set, got " <> typeName other)
 
 builtinAttrValues :: (MonadEval m) => NixValue -> m NixValue
 builtinAttrValues (VAttrs attrs) =
-  pure (VList (Map.elems attrs))
+  pure (VList (attrSetElems attrs))
 builtinAttrValues other =
   throwEvalError ("builtins.attrValues: expected a set, got " <> typeName other)
 
 builtinListToAttrs :: (MonadEval m) => NixValue -> m NixValue
 builtinListToAttrs (VList thunks) = do
   pairs <- mapM listToAttrsPair thunks
-  pure (VAttrs (Map.fromList pairs))
+  pure (VAttrs (attrSetFromMap (Map.fromList pairs)))
 builtinListToAttrs other =
   throwEvalError ("builtins.listToAttrs: expected a list, got " <> typeName other)
 
@@ -1023,11 +1123,11 @@ listToAttrsPair thunk = do
     VAttrs attrs -> do
       nameThunk <-
         maybe (throwEvalError "builtins.listToAttrs: element missing 'name'") pure $
-          Map.lookup "name" attrs
+          attrSetLookup "name" attrs
       nameVal <- force nameThunk
       case nameVal of
         VStr keyName _ ->
-          case Map.lookup "value" attrs of
+          case attrSetLookup "value" attrs of
             Just valueThunk -> pure (keyName, valueThunk)
             Nothing -> throwEvalError "builtins.listToAttrs: element missing 'value'"
         _ -> throwEvalError "builtins.listToAttrs: 'name' must be a string"
@@ -1039,7 +1139,7 @@ listToAttrsPair thunk = do
 
 builtinHasAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHasAttr (VStr key _) (VAttrs attrs) =
-  pure (VBool (Map.member key attrs))
+  pure (VBool (attrSetMember key attrs))
 builtinHasAttr (VStr _ _) other =
   throwEvalError ("builtins.hasAttr: expected a set, got " <> typeName other)
 builtinHasAttr other _ =
@@ -1047,7 +1147,7 @@ builtinHasAttr other _ =
 
 builtinGetAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGetAttr (VStr key _) (VAttrs attrs) =
-  case Map.lookup key attrs of
+  case attrSetLookup key attrs of
     Just thunk -> force thunk
     Nothing -> throwEvalError ("builtins.getAttr: attribute '" <> key <> "' not found")
 builtinGetAttr (VStr _ _) other =
@@ -1058,7 +1158,8 @@ builtinGetAttr other _ =
 builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinRemoveAttrs (VAttrs attrs) (VList thunks) = do
   keys <- mapM forceToString thunks
-  pure (VAttrs (foldl' (flip Map.delete) attrs keys))
+  let m = attrSetToMap attrs
+  pure (VAttrs (attrSetFromMap (foldl' (flip Map.delete) m keys)))
   where
     forceToString thunk = do
       val <- force thunk
@@ -1072,7 +1173,7 @@ builtinRemoveAttrs other _ =
 
 builtinIntersectAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinIntersectAttrs (VAttrs a) (VAttrs b) =
-  pure (VAttrs (Map.intersection b a))
+  pure (VAttrs (attrSetFromMap (Map.intersection (attrSetToMap b) (attrSetToMap a))))
 builtinIntersectAttrs (VAttrs _) other =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 builtinIntersectAttrs other _ =
@@ -1094,7 +1195,7 @@ catAttrsCollect key (thunk : rest) = do
   val <- force thunk
   case val of
     VAttrs attrs ->
-      case Map.lookup key attrs of
+      case attrSetLookup key attrs of
         Just found -> (found :) <$> catAttrsCollect key rest
         Nothing -> catAttrsCollect key rest
     _ -> throwEvalError "builtins.catAttrs: list element must be a set"
@@ -1251,10 +1352,11 @@ builtinPartition predFn (VList thunks) = do
   (rightThunks, wrongThunks) <- partitionThunks predFn thunks
   pure
     ( VAttrs
-        ( Map.fromList
-            [ ("right", evaluated (VList rightThunks)),
-              ("wrong", evaluated (VList wrongThunks))
-            ]
+        ( attrSetFromMap $
+            Map.fromList
+              [ ("right", evaluated (VList rightThunks)),
+                ("wrong", evaluated (VList wrongThunks))
+              ]
         )
     )
 builtinPartition _ other =
@@ -1274,7 +1376,7 @@ partitionThunks predFn (thunk : rest) = do
 builtinGroupBy :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGroupBy func (VList thunks) = do
   groups <- groupByCollect func thunks Map.empty
-  pure (VAttrs (Map.map (evaluated . VList . reverse) groups))
+  pure (VAttrs (attrSetFromMap (Map.map (evaluated . VList . reverse) groups)))
 builtinGroupBy _ other =
   throwEvalError ("builtins.groupBy: expected a list, got " <> typeName other)
 
@@ -1452,7 +1554,7 @@ builtinGetContext :: (MonadEval m) => NixValue -> m NixValue
 builtinGetContext (VStr _ (StringContext ctx)) = do
   let grouped = groupContextByPath (Set.toList ctx)
       attrMap = Map.map contextEntryToAttrs grouped
-  pure (VAttrs attrMap)
+  pure (VAttrs (attrSetFromMap attrMap))
 builtinGetContext other =
   throwEvalError ("builtins.getContext: expected a string, got " <> typeName other)
 
@@ -1488,7 +1590,7 @@ contextEntryToAttrs entry =
         [("path", evaluated (VBool True)) | cePath entry]
           ++ [("allOutputs", evaluated (VBool True)) | ceAllOutputs entry]
           ++ [("outputs", evaluated (VList [evaluated (mkStr o) | o <- ceOutputs entry])) | not (null (ceOutputs entry))]
-   in evaluated (VAttrs (Map.fromList fields))
+   in evaluated (VAttrs (attrSetFromMap (Map.fromList fields)))
 
 -- | Append context entries to a string from an attrset.
 --
@@ -1496,7 +1598,7 @@ contextEntryToAttrs entry =
 -- context elements to the string.
 builtinAppendContext :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinAppendContext (VStr s ctx) (VAttrs contextAttrs) = do
-  newCtx <- parseContextAttrs contextAttrs
+  newCtx <- parseContextAttrs (attrSetToMap contextAttrs)
   pure (VStr s (ctx <> newCtx))
 builtinAppendContext (VStr _ _) other =
   throwEvalError ("builtins.appendContext: second argument must be a set, got " <> typeName other)
@@ -1527,7 +1629,7 @@ parseContextAttrs attrs = do
           pure (pathElems ++ allOutElems ++ outElems)
         _ -> throwEvalError "builtins.appendContext: context entry must be a set"
 
-    getBoolAttr key attrs' = case Map.lookup key attrs' of
+    getBoolAttr key attrs' = case attrSetLookup key attrs' of
       Nothing -> pure False
       Just thunk -> do
         val <- force thunk
@@ -1535,7 +1637,7 @@ parseContextAttrs attrs = do
           VBool b -> pure b
           _ -> pure False
 
-    getOutputsList attrs' = case Map.lookup "outputs" attrs' of
+    getOutputsList attrs' = case attrSetLookup "outputs" attrs' of
       Nothing -> pure []
       Just thunk -> do
         val <- force thunk
@@ -1644,7 +1746,7 @@ builtinBitXor _ _ = throwEvalError "builtins.bitXor: expected two integers"
 builtinMapAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMapAttrs func (VAttrs attrs) =
   -- Lazy: each attr value is a deferred @f key val@, forced only on demand.
-  pure (VAttrs (Map.mapWithKey deferAttr attrs))
+  pure (VAttrs (attrSetMapWithKey deferAttr attrs))
   where
     deferAttr key valThunk =
       let env =
@@ -1663,23 +1765,24 @@ builtinMapAttrs _ other =
 
 builtinFunctionArgs :: (MonadEval m) => NixValue -> m NixValue
 builtinFunctionArgs (VLambda _ formals _) = pure (formalsToAttrs formals)
-builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs Map.empty)
+builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs (attrSetFromMap Map.empty))
 -- Callable sets with __functionArgs metadata (from setFunctionArgs).
 builtinFunctionArgs (VAttrs attrs)
-  | Just faThunk <- Map.lookup "__functionArgs" attrs = force faThunk
+  | Just faThunk <- attrSetLookup "__functionArgs" attrs = force faThunk
 builtinFunctionArgs other =
   throwEvalError ("builtins.functionArgs: expected a function, got " <> typeName other)
 
 formalsToAttrs :: Formals -> NixValue
-formalsToAttrs (FormalName _) = VAttrs Map.empty
+formalsToAttrs (FormalName _) = VAttrs (attrSetFromMap Map.empty)
 formalsToAttrs (FormalSet formals _) = formalsListToAttrs formals
 formalsToAttrs (FormalNamedSet _ formals _) = formalsListToAttrs formals
 
 formalsListToAttrs :: [Formal] -> NixValue
 formalsListToAttrs formals =
   VAttrs $
-    Map.fromList
-      [(fName f, evaluated (VBool (isJust (fDefault f)))) | f <- formals]
+    attrSetFromMap $
+      Map.fromList
+        [(fName f, evaluated (VBool (isJust (fDefault f)))) | f <- formals]
 
 -- | @builtins.setFunctionArgs f args@ — wraps @f@ in a callable attrset
 -- with @__functor@ (so it remains callable) and @__functionArgs@ metadata.
@@ -1694,10 +1797,11 @@ builtinSetFunctionArgs func (VAttrs argSpec) =
       functorLambda = VLambda closureEnv (FormalName "_self") (EVar "__fn")
    in pure $
         VAttrs $
-          Map.fromList
-            [ ("__functor", evaluated functorLambda),
-              ("__functionArgs", evaluated (VAttrs argSpec))
-            ]
+          attrSetFromMap $
+            Map.fromList
+              [ ("__functor", evaluated functorLambda),
+                ("__functionArgs", evaluated (VAttrs argSpec))
+              ]
 builtinSetFunctionArgs func args =
   throwEvalError ("builtins.setFunctionArgs: expected a set as second argument, got " <> typeName args <> " (func: " <> typeName func <> ")")
 
@@ -1706,14 +1810,14 @@ builtinZipAttrsWith func (VList thunks) = do
   attrSets <- mapM forceToAttrSet thunks
   let merged = mergeAllAttrs attrSets
   resultPairs <- mapM (applyZip func) (Map.toList merged)
-  pure (VAttrs (Map.fromList resultPairs))
+  pure (VAttrs (attrSetFromMap (Map.fromList resultPairs)))
   where
     forceToAttrSet thunk = do
       val <- force thunk
       case val of
-        VAttrs attrs -> pure attrs
+        VAttrs attrs -> pure (attrSetToMap attrs)
         _ -> throwEvalError "builtins.zipAttrsWith: list element must be a set"
-    mergeAllAttrs = foldl' (\acc attrs -> Map.unionWith (++) acc (Map.map (: []) attrs)) Map.empty
+    mergeAllAttrs = foldl' (\acc m -> Map.unionWith (++) acc (Map.map (: []) m)) Map.empty
     applyZip fn (key, thunkList) = do
       partial <- applyValue fn (mkStr key)
       result <- applyValue partial (VList thunkList)
@@ -1917,10 +2021,11 @@ builtinParseDrvName (VStr s _) =
   let (name, version) = parseName s
    in pure
         ( VAttrs
-            ( Map.fromList
-                [ ("name", evaluated (mkStr name)),
-                  ("version", evaluated (mkStr version))
-                ]
+            ( attrSetFromMap $
+                Map.fromList
+                  [ ("name", evaluated (mkStr name)),
+                    ("version", evaluated (mkStr version))
+                  ]
             )
         )
 builtinParseDrvName other =
@@ -1964,8 +2069,9 @@ valueToJSON (VList thunks) = do
   jsonVals <- mapM valueToJSON vals
   pure ("[" <> T.intercalate "," jsonVals <> "]")
 valueToJSON (VAttrs attrs) = do
-  let sortedKeys = Map.keys attrs
-  pairs <- mapM (jsonPair attrs) sortedKeys
+  let m = attrSetToMap attrs
+      sortedKeys = Map.keys m
+  pairs <- mapM (jsonPair m) sortedKeys
   pure ("{" <> T.intercalate "," pairs <> "}")
   where
     jsonPair attrMap key = case Map.lookup key attrMap of
@@ -2102,7 +2208,7 @@ parseJSONObject t = parseJSONObjectEntries (T.stripStart t) Map.empty
 
 parseJSONObjectEntries :: Text -> Map Text Thunk -> Maybe (NixValue, Text)
 parseJSONObjectEntries t acc = case T.uncons (T.stripStart t) of
-  Just ('}', rest) -> Just (VAttrs acc, rest)
+  Just ('}', rest) -> Just (VAttrs (attrSetFromMap acc), rest)
   _ -> case parseJSONString (T.stripStart t) of
     Just (VStr key _, rest) -> case T.uncons (T.stripStart rest) of
       Just (':', rest2) -> case parseJSON rest2 of
@@ -2111,7 +2217,7 @@ parseJSONObjectEntries t acc = case T.uncons (T.stripStart t) of
               updated = Map.insert key (evaluated val) acc
            in case T.uncons stripped of
                 Just (',', rest4) -> parseJSONObjectEntries rest4 updated
-                Just ('}', rest4) -> Just (VAttrs updated, rest4)
+                Just ('}', rest4) -> Just (VAttrs (attrSetFromMap updated), rest4)
                 _ -> Nothing
         Nothing -> Nothing
       _ -> Nothing
@@ -2155,7 +2261,7 @@ builtinDeepSeq first second = do
 
 deepForce :: (MonadEval m) => NixValue -> m ()
 deepForce (VList thunks) = mapM_ (force >=> deepForce) thunks
-deepForce (VAttrs attrs) = mapM_ (force >=> deepForce) (Map.elems attrs)
+deepForce (VAttrs attrs) = mapM_ (force >=> deepForce) (attrSetElems attrs)
 deepForce _ = pure ()
 
 -- ---------------------------------------------------------------------------
@@ -2166,10 +2272,10 @@ builtinGenericClosure :: (MonadEval m) => NixValue -> m NixValue
 builtinGenericClosure (VAttrs attrs) = do
   startSetThunk <-
     maybe (throwEvalError "builtins.genericClosure: missing 'startSet'") pure $
-      Map.lookup "startSet" attrs
+      attrSetLookup "startSet" attrs
   operatorThunk <-
     maybe (throwEvalError "builtins.genericClosure: missing 'operator'") pure $
-      Map.lookup "operator" attrs
+      attrSetLookup "operator" attrs
   startSetVal <- force startSetThunk
   operatorVal <- force operatorThunk
   case startSetVal of
@@ -2203,7 +2309,7 @@ closureLoop operator (thunk : rest) seenKeys acc = do
 
 extractKey :: (MonadEval m) => NixValue -> m NixValue
 extractKey (VAttrs attrs) =
-  case Map.lookup "key" attrs of
+  case attrSetLookup "key" attrs of
     Just thunk -> force thunk
     Nothing -> throwEvalError "builtins.genericClosure: item missing 'key' attribute"
 extractKey _ = throwEvalError "builtins.genericClosure: item must be a set with 'key'"
@@ -2245,7 +2351,7 @@ builtinReadDir :: (MonadEval m) => NixValue -> m NixValue
 builtinReadDir val = do
   p <- coerceToPath "readDir" val
   entries <- listDirectory p
-  pure (VAttrs (Map.fromList [(name, evaluated (mkStr fileType)) | (name, fileType) <- entries]))
+  pure (VAttrs (attrSetFromMap (Map.fromList [(name, evaluated (mkStr fileType)) | (name, fileType) <- entries])))
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — environment + paths
@@ -2315,10 +2421,10 @@ forceSearchEntry thunk = do
     VAttrs attrs -> do
       prefixThunk <-
         maybe (throwEvalError "builtins.findFile: entry missing 'prefix'") pure $
-          Map.lookup "prefix" attrs
+          attrSetLookup "prefix" attrs
       pathThunk <-
         maybe (throwEvalError "builtins.findFile: entry missing 'path'") pure $
-          Map.lookup "path" attrs
+          attrSetLookup "path" attrs
       prefixVal <- force prefixThunk
       pathVal <- force pathThunk
       prefix <- case prefixVal of
@@ -2373,7 +2479,7 @@ builtinToFile other _ =
 builtinScopedImport :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinScopedImport (VAttrs attrs) pathVal = do
   p <- coerceToPath "scopedImport" pathVal
-  let scope = Map.toList attrs
+  let scope = Map.toList (attrSetToMap attrs)
   scopedImportFile scope p
 builtinScopedImport other _ =
   throwEvalError ("builtins.scopedImport: expected a set, got " <> typeName other)
@@ -2434,9 +2540,9 @@ fetchUrlSimple url _sha256 = do
       pure (VPath storePath)
 
 -- | Force a required string attribute from an attrset.
-forceAttrStr :: (MonadEval m) => Text -> Text -> Map Text Thunk -> m Text
+forceAttrStr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
 forceAttrStr builtin key attrs =
-  case Map.lookup key attrs of
+  case attrSetLookup key attrs of
     Nothing -> throwEvalError (builtin <> ": missing required attribute '" <> key <> "'")
     Just thunk -> do
       val <- force thunk
@@ -2446,9 +2552,9 @@ forceAttrStr builtin key attrs =
         _ -> throwEvalError (builtin <> ": '" <> key <> "' must be a string")
 
 -- | Force an optional string attribute.
-forceOptionalAttrStr :: (MonadEval m) => Map Text Thunk -> Text -> m (Maybe Text)
+forceOptionalAttrStr :: (MonadEval m) => AttrSet -> Text -> m (Maybe Text)
 forceOptionalAttrStr attrs key =
-  case Map.lookup key attrs of
+  case attrSetLookup key attrs of
     Nothing -> pure Nothing
     Just thunk -> do
       val <- force thunk
@@ -2468,7 +2574,7 @@ builtinDerivation (VAttrs attrs) = do
   builder <- forceAttrStr "derivation" "builder" attrs
 
   -- Extract optional outputs (default ["out"])
-  outputNames <- case Map.lookup "outputs" attrs of
+  outputNames <- case attrSetLookup "outputs" attrs of
     Nothing -> pure ["out"]
     Just thunk -> do
       val <- force thunk
@@ -2477,7 +2583,7 @@ builtinDerivation (VAttrs attrs) = do
         _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
 
   -- Extract optional args (default [])
-  builderArgs <- case Map.lookup "args" attrs of
+  builderArgs <- case attrSetLookup "args" attrs of
     Nothing -> pure []
     Just thunk -> do
       val <- force thunk
@@ -2486,7 +2592,7 @@ builtinDerivation (VAttrs attrs) = do
         _ -> throwEvalError "derivation: 'args' must be a list of strings"
 
   -- Collect all string-coercible attrs into env WITH their contexts
-  (drvEnvPairs, envContext) <- collectDrvEnvWithContext attrs
+  (drvEnvPairs, envContext) <- collectDrvEnvWithContext (attrSetToMap attrs)
 
   -- Extract input derivations and input sources from the merged context
   let inputDrvs = extractInputDrvs envContext
@@ -2566,9 +2672,9 @@ builtinDerivation (VAttrs attrs) = do
           ]
             ++ [(outName, evaluated (VStr outP (outPathCtx outName))) | (outName, outP) <- outPaths]
       -- Merge original attrs underneath so computed attrs take priority
-      resultAttrs = Map.union baseAttrs attrs
+      resultAttrs = Map.union baseAttrs (attrSetToMap attrs)
 
-  pure (VAttrs resultAttrs)
+  pure (VAttrs (attrSetFromMap resultAttrs))
 builtinDerivation other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
@@ -2603,7 +2709,7 @@ collectDrvEnvWithContext attrs = do
         VList _ -> pure Nothing
         VAttrs innerAttrs ->
           -- Derivations in env get their outPath
-          case Map.lookup "outPath" innerAttrs of
+          case attrSetLookup "outPath" innerAttrs of
             Just outThunk -> do
               outVal <- force outThunk
               case outVal of

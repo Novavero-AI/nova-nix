@@ -16,6 +16,8 @@ import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Lazy as TL
+import qualified Data.Text.Lazy.Builder as TB
 import Nix.Parser.ParseError (ParseError (..))
 
 -- | A positioned token.
@@ -357,10 +359,11 @@ lexIndStringMode st acc
             _ -> lexIndStringLiteral st acc
 
 -- | Lex a literal segment inside a regular string.
+-- Uses 'TB.Builder' for O(1) amortized append instead of O(n) 'T.snoc'.
 lexStringLiteral :: LexState -> [Located] -> Either ParseError [Located]
-lexStringLiteral st0 acc = go st0 T.empty
+lexStringLiteral st0 acc = go st0 mempty
   where
-    go st chunk
+    go st !builder
       | T.null (lsInput st) =
           Left
             ParseError
@@ -373,20 +376,20 @@ lexStringLiteral st0 acc = go st0 T.empty
           let c = T.head (lsInput st)
               rest = T.tail (lsInput st)
            in case c of
-                '"' -> finishChunk st chunk
-                '$' | Just '{' <- safeHead rest -> finishChunk st chunk
+                '"' -> finishChunk st builder
+                '$' | Just '{' <- safeHead rest -> finishChunk st builder
                 '\\' -> case T.uncons rest of
                   Just (ec, rest2) ->
                     let escaped = case ec of
-                          'n' -> "\n"
-                          't' -> "\t"
-                          'r' -> "\r"
-                          '\\' -> "\\"
-                          '"' -> "\""
-                          '$' -> "$"
-                          _ -> T.cons '\\' (T.singleton ec)
+                          'n' -> TB.singleton '\n'
+                          't' -> TB.singleton '\t'
+                          'r' -> TB.singleton '\r'
+                          '\\' -> TB.singleton '\\'
+                          '"' -> TB.singleton '"'
+                          '$' -> TB.singleton '$'
+                          _ -> TB.singleton '\\' <> TB.singleton ec
                         newSt = advanceBy ec (advanceCol 1 st {lsInput = rest2})
-                     in go newSt (chunk <> escaped)
+                     in go newSt (builder <> escaped)
                   Nothing ->
                     Left
                       ParseError
@@ -397,21 +400,28 @@ lexStringLiteral st0 acc = go st0 T.empty
                         }
                 '\n' ->
                   let newSt = st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
-                   in go newSt (chunk <> "\n")
+                   in go newSt (builder <> TB.singleton '\n')
                 _ ->
                   let newSt = advanceCol 1 st {lsInput = rest}
-                   in go newSt (T.snoc chunk c)
-    finishChunk st chunk
-      | T.null chunk = lexStringMode st acc
+                   in go newSt (builder <> TB.singleton c)
+    finishChunk st builder
+      | builderIsEmpty = lexStringMode st acc
       | otherwise =
-          let tok = Located (lsLine st0) (lsCol st0) (TokStringLit chunk)
+          let chunk = TL.toStrict (TB.toLazyText builder)
+              tok = Located (lsLine st0) (lsCol st0) (TokStringLit chunk)
            in lexStringMode st (tok : acc)
+      where
+        builderIsEmpty = TL.null (TB.toLazyText builder)
 
 -- | Lex a literal segment inside an indented string.
+-- No escape sequences here (those are handled by 'lexIndStringMode'),
+-- so the chunk is identical to the source text — count chars, then slice
+-- once at the end.  This avoids O(n^2) 'T.snoc' allocation.
 lexIndStringLiteral :: LexState -> [Located] -> Either ParseError [Located]
-lexIndStringLiteral st0 acc = go st0 T.empty
+lexIndStringLiteral st0 acc = go st0 0
   where
-    go st chunk
+    startInput = lsInput st0
+    go st !consumed
       | T.null (lsInput st) =
           Left
             ParseError
@@ -425,16 +435,16 @@ lexIndStringLiteral st0 acc = go st0 T.empty
            in case T.uncons input of
                 Just ('\'', rest1)
                   | Just ('\'', _) <- T.uncons rest1 ->
-                      finishChunk st chunk
+                      finishChunk st consumed
                 Just ('$', rest1)
                   | Just ('{', _) <- T.uncons rest1 ->
-                      finishChunk st chunk
+                      finishChunk st consumed
                 Just ('\n', rest1) ->
                   let newSt = st {lsInput = rest1, lsLine = lsLine st + 1, lsCol = 1}
-                   in go newSt (T.snoc chunk '\n')
-                Just (c, rest1) ->
+                   in go newSt (consumed + 1)
+                Just (_c, rest1) ->
                   let newSt = advanceCol 1 st {lsInput = rest1}
-                   in go newSt (T.snoc chunk c)
+                   in go newSt (consumed + 1)
                 Nothing ->
                   Left
                     ParseError
@@ -443,10 +453,11 @@ lexIndStringLiteral st0 acc = go st0 T.empty
                         peCol = lsCol st,
                         peMessage = "unterminated indented string"
                       }
-    finishChunk st chunk
-      | T.null chunk = lexIndStringMode st acc
+    finishChunk st consumed
+      | consumed == 0 = lexIndStringMode st acc
       | otherwise =
-          let tok = Located (lsLine st0) (lsCol st0) (TokStringLit chunk)
+          let chunk = T.take consumed startInput
+              tok = Located (lsLine st0) (lsCol st0) (TokStringLit chunk)
            in lexIndStringMode st (tok : acc)
 
 -- ---------------------------------------------------------------------------

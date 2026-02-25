@@ -15,7 +15,7 @@ import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWi
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
-import Nix.Eval (Env (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), emptyContext, emptyEnv, eval, mkStr, runPureEval)
+import Nix.Eval (Env (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, mkStr, runPureEval)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Expr.Types
@@ -1145,7 +1145,7 @@ testBatch3 = do
       runTest "functionArgs no default" $
         assertEval "funcArgs-nodef" "(builtins.functionArgs ({ a, b ? 1 }: a)).a" (VBool False),
       runTest "functionArgs simple lambda" $
-        assertEval "funcArgs-simple" "builtins.functionArgs (x: x)" (VAttrs Map.empty),
+        assertEval "funcArgs-simple" "builtins.functionArgs (x: x)" (VAttrs (attrSetFromMap Map.empty)),
       runTest "functionArgs type error" $
         assertEvalFail "funcArgs-err" "builtins.functionArgs 42",
       -- zipAttrsWith
@@ -1242,7 +1242,7 @@ testBatch5 = do
       runTest "fromJSON object" $
         assertEval "fromJSON-obj" "(builtins.fromJSON \"{\\\"a\\\": 1}\").a" (VInt 1),
       runTest "fromJSON roundtrip" $
-        assertEval "fromJSON-rt" "builtins.fromJSON (builtins.toJSON { a = 1; b = [ 2 3 ]; })" (VAttrs (Map.fromList [("a", Evaluated (VInt 1)), ("b", Evaluated (VList [Evaluated (VInt 2), Evaluated (VInt 3)]))])),
+        assertEval "fromJSON-rt" "builtins.fromJSON (builtins.toJSON { a = 1; b = [ 2 3 ]; })" (VAttrs (attrSetFromMap (Map.fromList [("a", Evaluated (VInt 1)), ("b", Evaluated (VList [Evaluated (VInt 2), Evaluated (VInt 3)]))]))),
       runTest "fromJSON invalid" $
         assertEvalFail "fromJSON-bad" "builtins.fromJSON \"not json\"",
       -- hashString
@@ -1934,7 +1934,7 @@ testDrvContext = do
       runTest "getContext on plain string" $
         assertRight "getCtx-plain" (evalNix "builtins.getContext \"hello\"") $ \val ->
           case val of
-            VAttrs m -> if Map.null m then Pass else Fail "expected empty attrset"
+            VAttrs m -> if attrSetNull m then Pass else Fail "expected empty attrset"
             _ -> Fail ("expected VAttrs, got " <> T.pack (show val)),
       -- getContext: drv outPath has outputs entry
       runTest "getContext on drv outPath"
@@ -1943,9 +1943,9 @@ testDrvContext = do
           (evalNix "builtins.getContext (derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).outPath")
         $ \val -> case val of
           VAttrs m ->
-            if Map.size m == 1
+            if attrSetSize m == 1
               then Pass
-              else Fail ("expected 1 entry, got " <> T.pack (show (Map.size m)))
+              else Fail ("expected 1 entry, got " <> T.pack (show (attrSetSize m)))
           _ -> Fail ("expected VAttrs, got " <> T.pack (show val)),
       -- getContext: drvPath has allOutputs
       runTest "getContext on drvPath has allOutputs"
@@ -2287,7 +2287,7 @@ testBuildOrchestrator = do
                 ]
           )
         $ \case
-          VAttrs attrs -> case Map.lookup "_derivation" attrs of
+          VAttrs attrs -> case attrSetLookup "_derivation" attrs of
             Just (Evaluated (VDerivation drv)) ->
               if Map.null (drvInputDrvs drv)
                 then Fail "expected non-empty drvInputDrvs"
@@ -2971,7 +2971,7 @@ evalAndBuild storeDir source = do
       case evalResult of
         Left err -> pure (Left ("eval error: " <> err))
         Right val -> case val of
-          VAttrs attrs -> case Map.lookup "_derivation" attrs of
+          VAttrs attrs -> case attrSetLookup "_derivation" attrs of
             Just (Evaluated (VDerivation drv)) -> do
               store <- openStore storeDir
               tmpBase <- getTemporaryDirectory
@@ -3080,7 +3080,7 @@ testPhase4 = do
         let result = parseNixPath "nixpkgs=/home/user/nixpkgs"
          in case result of
               [Evaluated (VAttrs m)] ->
-                case (Map.lookup "prefix" m, Map.lookup "path" m) of
+                case (attrSetLookup "prefix" m, attrSetLookup "path" m) of
                   (Just (Evaluated (VStr "nixpkgs" _)), Just (Evaluated (VStr "/home/user/nixpkgs" _))) -> Pass
                   _ -> Fail "wrong prefix/path"
               _ -> Fail ("expected one entry, got " <> T.pack (show (length result))),
@@ -3090,7 +3090,7 @@ testPhase4 = do
         let result = parseNixPath "/some/path"
          in case result of
               [Evaluated (VAttrs m)] ->
-                case (Map.lookup "prefix" m, Map.lookup "path" m) of
+                case (attrSetLookup "prefix" m, attrSetLookup "path" m) of
                   (Just (Evaluated (VStr "" _)), Just (Evaluated (VStr "/some/path" _))) -> Pass
                   _ -> Fail "wrong prefix/path for plain"
               _ -> Fail "expected one entry",

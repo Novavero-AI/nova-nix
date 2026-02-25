@@ -23,7 +23,7 @@ import qualified Data.Text.IO as TIO
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
-import Nix.Eval (MonadEval, NixValue (..), Thunk (..), eval, force)
+import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, force)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Parser (parseNix)
 import Nix.Store (Store, closeStore, openStore, writeDrv)
@@ -181,13 +181,13 @@ buildFile extraPaths dataDir filePath = do
 extractDerivation :: NixValue -> IO Derivation
 extractDerivation (VAttrs attrs) = do
   -- Check type = "derivation"
-  case Map.lookup "type" attrs of
+  case attrSetLookup "type" attrs of
     Just (Evaluated (VStr "derivation" _)) -> pure ()
     _ -> do
       hPutStrLn stderr "error: result is not a derivation (no type = \"derivation\")"
       exitFailure
   -- Try to extract from _derivation key first
-  case Map.lookup "_derivation" attrs of
+  case attrSetLookup "_derivation" attrs of
     Just (Evaluated (VDerivation drv)) -> pure drv
     _ -> do
       hPutStrLn stderr "error: derivation result missing _derivation field"
@@ -255,8 +255,9 @@ deepForceValue (VList thunks) = do
   forced <- mapM (force >=> deepForceValue) thunks
   pure (VList (map Evaluated forced))
 deepForceValue (VAttrs attrs) = do
-  forced <- mapM (force >=> deepForceValue) attrs
-  pure (VAttrs (Map.map Evaluated forced))
+  let m = attrSetToMap attrs
+  forced <- mapM (force >=> deepForceValue) m
+  pure (VAttrs (attrSetFromMap (Map.map Evaluated forced)))
 deepForceValue val = pure val
 
 -- | Nix-style pretty-printing of a fully forced value.
@@ -271,7 +272,7 @@ prettyValue (VPath p) = p
 prettyValue (VList thunks) =
   "[ " <> T.intercalate " " (map prettyThunk thunks) <> " ]"
 prettyValue (VAttrs attrs) =
-  let entries = Map.toAscList attrs
+  let entries = attrSetToAscList attrs
       rendered = map (\(k, t) -> k <> " = " <> prettyThunk t <> ";") entries
    in "{ " <> T.intercalate " " rendered <> " }"
 prettyValue (VLambda {}) = "«lambda»"
