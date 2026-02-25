@@ -21,7 +21,7 @@ A pure Haskell implementation of Nix that treats Windows as a first-class target
 
 - **Parser** — Hand-rolled recursive descent parser for the full Nix expression language. 13 precedence levels, 17 AST constructors, all syntax forms including search paths (`<nixpkgs>`) and dynamic attribute keys (`{ ${expr} = val; }`). Direct `Text` consumption for maximum throughput.
 - **Lazy Evaluator** — Thunk-based evaluation with environment closures, knot-tying for recursive bindings via Haskell laziness. All 17 AST constructors handled: literals, strings with interpolation, attribute sets (recursive and non-recursive), let bindings, lambdas with formal parameters, if/then/else, with, assert, unary/binary operators, function application, list construction, attribute selection, has-attribute checks, and search path resolution.
-- **91 Built-in Functions** — Type checks, arithmetic, bitwise, strings, lists, attribute sets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`), JSON (`toJSON`/`fromJSON`), hashing (SHA-256/SHA-512/SHA-1/MD5), version parsing, `replaceStrings`, `tryEval`, `deepSeq`, `genericClosure`, string context introspection (`hasContext`, `getContext`, `appendContext`), IO builtins (`import`, `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`), `derivation`, `placeholder`, `storePath`, and more. 16 builtins available at top level without `builtins.` prefix (`toString`, `map`, `throw`, `import`, `derivation`, `abort`, `baseNameOf`, `dirOf`, `isNull`, `removeAttrs`, `placeholder`, `scopedImport`, `fetchTarball`, `fetchGit`, `fetchurl`, `toFile`) — matching the real Nix language spec.
+- **101 Built-in Functions** — Type checks, arithmetic, bitwise, strings, lists, attribute sets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON (`toJSON`/`fromJSON`), hashing (SHA-256/SHA-512/SHA-1/MD5), version parsing, `replaceStrings`, `tryEval`, `deepSeq`, `genericClosure`, `setFunctionArgs`/`functionArgs`, string context introspection (`hasContext`, `getContext`, `appendContext`), IO builtins (`import`, `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`), `derivation`, `placeholder`, `storePath`, and more. 16 builtins available at top level without `builtins.` prefix (`toString`, `map`, `throw`, `import`, `derivation`, `abort`, `baseNameOf`, `dirOf`, `isNull`, `removeAttrs`, `placeholder`, `scopedImport`, `fetchTarball`, `fetchGit`, `fetchurl`, `toFile`) — matching the real Nix language spec.
 - **Search Path Resolution** — `<nixpkgs>` desugars to `builtins.findFile builtins.nixPath "nixpkgs"` — matching real Nix semantics. `NIX_PATH` environment variable is parsed at startup, and `--nix-path` CLI flags merge with it. Directory imports (`import ./dir`) resolve to `dir/default.nix` automatically.
 - **Dynamic Attribute Keys** — `{ ${expr} = val; }` fully supported in all contexts: non-recursive attrs, recursive attrs, let bindings, attribute selection, and has-attribute checks. Key resolution is cleanly separated from value thunk construction to preserve knot-tying in recursive bindings.
 - **String Context Tracking** — Every string carries invisible metadata tracking which store paths it references. Context propagates through interpolation, concatenation, `replaceStrings`, and all string operations. The `derivation` builtin collects contexts into `drvInputDrvs` and `drvInputSrcs` — matching real Nix semantics.
@@ -187,13 +187,13 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 | Module | Purpose | Status |
 |--------|---------|--------|
-| `Nix.Eval` | Lazy evaluator — all 17 AST constructors, thunk forcing, env operations, 91-builtin dispatch, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` | Done |
+| `Nix.Eval` | Lazy evaluator — all 17 AST constructors, thunk forcing, env operations, 101-builtin dispatch, `__functor` callable sets, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` | Done |
 | `Nix.Eval.Types` | Shared types — `NixValue` (11 constructors), `Thunk` (lazy env for knot-tying), `Env` (lexical + with-scope chain), `StringContext` (store path tracking), `MonadEval` typeclass, `PureEval` runner | Done |
 | `Nix.Eval.Operator` | Binary/unary operators — arithmetic with float promotion, deep structural equality, division-by-zero checks | Done |
 | `Nix.Eval.StringInterp` | String interpolation — value coercion with context propagation, indented string whitespace stripping | Done |
 | `Nix.Eval.Context` | String context construction, queries, extraction — pure helpers for building and inspecting store path references | Done |
 | `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache (with directory import), process execution, store writes, NIX_PATH parsing, per-thunk IORef memoization (matching real Nix in-place mutation) | Done |
-| `Nix.Builtins` | Built-in function environment — 91 builtins, search path plumbing (`parseNixPath`), top-level builtin exposure | Done |
+| `Nix.Builtins` | Built-in function environment — 101 builtins, search path plumbing (`parseNixPath`), top-level builtin exposure | Done |
 
 ### Store + Builder
 
@@ -256,7 +256,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 **Key numbers:**
 
 - **22 modules** — all implemented
-- **508 tests** — hand-rolled harness, no framework dependencies
+- **511 tests** — hand-rolled harness, no framework dependencies
 - **Zero partial functions** — total by construction, `T.uncons` over `T.head`/`T.tail`
 - **Strict by default** — bang patterns on all data fields (except Thunk's Env, which is lazy for knot-tying)
 
@@ -289,7 +289,7 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 - [x] **Lexer** — Full Nix tokenization (integers, floats, strings with interpolation, paths, URIs, search paths, operators, keywords)
 - [x] **Parser** — 13 precedence levels, all Nix syntax, structured error reporting
 - [x] **Evaluator** — All 17 AST constructors, lazy thunks, recursive let/rec via knot-tying, with-scope chain, dynamic attribute keys
-- [x] **91 builtins** — Type checks, arithmetic, bitwise, strings, lists, attrsets, higher-order, JSON, hashing, regex (`match`/`split` via `regex-tdfa`), version parsing, tryEval, deepSeq, genericClosure, string context introspection, all IO builtins, derivation
+- [x] **101 builtins** — Type checks, arithmetic, bitwise, strings, lists, attrsets, higher-order, JSON, hashing, regex (`match`/`split` via `regex-tdfa`), version parsing, `setFunctionArgs`/`functionArgs`, tryEval, deepSeq, genericClosure, string context introspection, all IO builtins, derivation
 - [x] **MonadEval refactor** — Evaluator polymorphic in effect monad (`PureEval` for tests, `EvalIO` for real evaluation)
 - [x] **IO builtins** — `import` (with directory import support), `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`, `currentTime`
 - [x] **`derivation`** — Attrset to `.drv` build recipe with computed `drvPath` and `outPath`, context-aware input population
@@ -306,20 +306,26 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 - [x] **CLI** — `nova-nix eval FILE.nix`, `nova-nix eval --expr 'EXPR'`, `nova-nix build FILE.nix`, `--nix-path NAME=PATH`
 - [x] **Thunk memoization** — Per-thunk `IORef` memo cells matching real Nix in-place mutation. GC reclaims dead thunks naturally.
 - [x] **Regex builtins** — `builtins.match` and `builtins.split` (POSIX ERE via `regex-tdfa`, pure Haskell, cross-platform)
-- [x] **508 tests** — parser, evaluator, store, builder, substituter, dependency graph, search paths, dynamic keys, directory imports, CLI end-to-end
+- [x] **Callable attribute sets** — `__functor` dispatch: sets with `__functor` are callable, enabling `lib.makeOverridable`, `lib.makeExtensible`, and the nixpkgs override system
+- [x] **Lazy builtins** — `map`, `genList`, `mapAttrs` return deferred thunks (O(1) until demanded). `concatMap` is semi-lazy. Critical for nixpkgs which maps over 80,000+ packages.
+- [x] **Null dynamic keys** — `{ ${null} = val; }` skips the binding, used by the nixpkgs module system for conditional attributes
+- [x] **Bundled `<nix/fetchurl.nix>`** — Ships as Cabal data-file for nixpkgs stdenv bootstrap
+- [x] **nixpkgs module system** — `lib.evalModules`, `lib.mkOption`, `lib.mkIf`, `lib.types.*` all working
+- [x] **nixpkgs lib fully working** — trivial, strings, lists, attrsets, systems, generators, functional patterns (`fix`, `makeOverridable`, `makeExtensible`)
+- [x] **511 tests** — parser, evaluator, store, builder, substituter, dependency graph, search paths, dynamic keys, directory imports, laziness, CLI end-to-end
 
 ### Next
 
-- [ ] **nixpkgs evaluation** — The ultimate test: `import <nixpkgs> {}` evaluates correctly and fast
-- [ ] **Missing builtins** — Any others nixpkgs demands (discovered iteratively)
-- [ ] **Performance** — Target ~2-5 seconds for full nixpkgs eval
+- [ ] **Full `import <nixpkgs> {}` performance** — nixpkgs lib layer evaluates correctly; stdenv bootstrap runs but needs performance optimization for the full 80,000+ package set
+- [ ] **Remaining builtins** — 13 missing (`fromTOML`, `hashFile`, `readFileType`, `traceVerbose`, `break`, `filterSource`, `outputOf`, and fetch variants)
+- [ ] **`nova-nix shell`** — Enter a development shell (like `nix shell`)
+- [ ] **`nova-nix repl`** — Interactive evaluator
 
 ### Long-Term
 
-- [ ] **`nova-nix shell`** — Enter a development shell (like `nix shell`)
-- [ ] **`nova-nix repl`** — Interactive evaluator
 - [ ] **Nix daemon protocol compatibility**
 - [ ] **XZ decompression** — Enable nova-cache compression flag for real binary cache downloads
+- [ ] **Store bootstrap** — Ship prebuilt bash + coreutils for Windows builds
 
 ---
 
@@ -327,7 +333,7 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 
 ```bash
 cabal build                              # Build library + CLI
-cabal test                               # Run all 508 tests
+cabal test                               # Run all 511 tests
 cabal build --ghc-options="-Werror"      # Warnings as errors (CI default)
 cabal haddock                            # Generate API docs
 ```

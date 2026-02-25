@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.3.0 — 2026-02-25
+
+### nixpkgs Compatibility: Module System, Callable Sets, Parser Fixes
+
+- **`__functor` support** — Attribute sets with `__functor` are now callable, matching real Nix. `(set.__functor set) arg` dispatch enables nixpkgs patterns like `lib.makeOverridable` and `lib.setFunctionArgs`.
+- **`builtins.setFunctionArgs`** — Wraps a function in a callable attrset with `__functor` and `__functionArgs` metadata. Used by `lib.mirrorFunctionArgs`, `lib.makeOverridable`, and the entire nixpkgs override system.
+- **Null dynamic keys** — `{ ${null} = val; }` now skips the binding instead of erroring (matching real Nix). Used extensively by the nixpkgs module system for conditional attributes like `${if cond then "key" else null}`.
+- **Indented string interpolation fix** — `''${expr}''` now parses correctly. The lexer had an overzealous guard (`isIndStringEscape`) that blocked `''` from opening an indented string when followed by `$`. This broke `lib.generators` and many nixpkgs files.
+- **`splitVersion` fix** — Dots are separators, not components. `splitVersion "1.2.3"` now returns `["1" "2" "3"]` (was `["1" "." "2" "." "3"]`). Fixes `lib.versions.majorMinor` and all version comparison logic.
+- **`builtins.functionArgs` on callable sets** — Now inspects `__functionArgs` metadata on attrsets produced by `setFunctionArgs`, enabling `lib.functionArgs` to work on overridable functions.
+- **CLI eval sub-parser** — `--strict` and `--nix-path` flags now work after `eval` command (e.g. `nova-nix eval --strict --expr '...'`). Previously only worked before the command.
+- **Bundled `<nix/fetchurl.nix>`** — Ships as a Cabal data-file, added to search paths automatically. nixpkgs stdenv bootstrap imports this file; no system Nix install needed.
+- **nixpkgs module system working** — `lib.evalModules`, `lib.mkOption`, `lib.mkIf`, `lib.types.*` all evaluate correctly.
+- **nixpkgs functional patterns working** — `lib.makeOverridable`, `lib.makeExtensible`, `lib.fix`, `lib.generators.toKeyValue` all correct.
+- **`lib.systems.elaborate` instant** — Was taking minutes before lazy builtins; now returns immediately for any system string.
+- 101 builtins (up from 91), 511 tests
+
 ## 0.1.2.0 — 2026-02-24
 
 ### Lazy Builtins + Correctness Fixes

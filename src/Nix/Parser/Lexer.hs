@@ -310,10 +310,10 @@ lexIndStringMode st acc
                       newSt = advanceCol 3 st {lsInput = rest2}
                    in lexIndStringMode newSt (litTok : acc)
                 Just ('$', rest3)
-                  | Just ('{', _) <- T.uncons rest3 ->
+                  | Just ('{', rest4) <- T.uncons rest3 ->
                       -- ''${ → literal ${
                       let litTok = Located (lsLine st) (lsCol st) (TokStringLit "${")
-                          newSt = advanceCol 4 st {lsInput = rest3}
+                          newSt = advanceCol 4 st {lsInput = rest4}
                        in lexIndStringMode newSt (litTok : acc)
                 Just ('\\', rest3) ->
                   -- ''\x → escape sequence
