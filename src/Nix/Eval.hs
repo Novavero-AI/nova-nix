@@ -619,7 +619,7 @@ evalWith :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
 evalWith env scope body = do
   scopeVal <- eval env scope
   case scopeVal of
-    VAttrs attrs -> eval (pushWithScope (attrSetToMap attrs) env) body
+    VAttrs attrs -> eval (pushWithScope attrs env) body
     _ -> throwEvalError ("'with' requires a set, got " <> typeName scopeVal)
 
 evalAssert :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
@@ -1173,7 +1173,12 @@ builtinRemoveAttrs other _ =
 
 builtinIntersectAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinIntersectAttrs (VAttrs a) (VAttrs b) =
-  pure (VAttrs (attrSetFromMap (Map.intersection (attrSetToMap b) (attrSetToMap a))))
+  -- Iterate keys of 'a' (typically the smaller set, e.g. functionArgs)
+  -- and point-lookup each in 'b' (typically the large set, e.g. nixpkgs).
+  -- This avoids materializing all thunks in 'b'.
+  let keysA = attrSetKeys a
+      result = Map.fromList [(k, thunk) | k <- keysA, Just thunk <- [attrSetLookup k b]]
+   in pure (VAttrs (attrSetFromMap result))
 builtinIntersectAttrs (VAttrs _) other =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 builtinIntersectAttrs other _ =

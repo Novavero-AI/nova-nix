@@ -320,7 +320,7 @@ newLazyAttrCache bindings = unsafePerformIO (bindings `seq` newIORef Map.empty)
 -- lexical bindings always take priority.
 data Env = Env
   { envBindings :: !(Map Text Thunk),
-    envWithScopes :: ![Map Text Thunk]
+    envWithScopes :: ![AttrSet]
   }
   deriving (Eq, Show)
 
@@ -336,10 +336,12 @@ envLookup name (Env bindings withs) =
     Nothing -> lookupWithScopes name withs
 
 -- | Walk with-scopes innermost to outermost.
-lookupWithScopes :: Text -> [Map Text Thunk] -> Maybe Thunk
+-- Uses 'attrSetLookup' so that 'LazyAttrs' with-scopes only
+-- materialize the accessed key, not the entire set.
+lookupWithScopes :: Text -> [AttrSet] -> Maybe Thunk
 lookupWithScopes _ [] = Nothing
 lookupWithScopes name (scope : rest) =
-  case Map.lookup name scope of
+  case attrSetLookup name scope of
     Just val -> Just val
     Nothing -> lookupWithScopes name rest
 
@@ -354,7 +356,8 @@ envInsertThunk name thunk env =
   env {envBindings = Map.insert name thunk (envBindings env)}
 
 -- | Push a with-scope onto the scope chain (innermost position).
-pushWithScope :: Map Text Thunk -> Env -> Env
+-- Accepts 'AttrSet' directly so 'LazyAttrs' with-scopes stay lazy.
+pushWithScope :: AttrSet -> Env -> Env
 pushWithScope scope env =
   env {envWithScopes = scope : envWithScopes env}
 
