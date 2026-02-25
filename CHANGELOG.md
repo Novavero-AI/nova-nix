@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.2.0 — 2026-02-24
+
+### Lazy Builtins + Correctness Fixes
+
+- **Lazy `map`** — returns deferred thunks instead of eagerly forcing all elements. `map f [80000 items]` is now O(1) until elements are demanded.
+- **Lazy `genList`** — each element is a deferred `f(i)` thunk, forced only on demand
+- **Lazy `mapAttrs`** — each attr value is a deferred `f key val` thunk. Critical for nixpkgs which `mapAttrs` over the entire package set.
+- **Semi-lazy `concatMap`** — forces applications to discover list structure for concatenation, but element thunks within sub-lists stay lazy
+- **`@`-pattern scoping fix** — `{ system ? args.system or ..., ... }@args:` now correctly binds the `@`-name before evaluating defaults, matching real Nix. Previously, default expressions couldn't reference the `@`-binding.
+- **Synthetic thunk memo cell fix** — `mkSyntheticThunk` uses env bindings (not expr) for IORef uniqueness, preventing GHC's full-laziness transform from sharing one memo cell across all deferred thunks. Without this, `map f [a b c]` would return `[f(a) f(a) f(a)]`.
+- `deferApply` helper: builds thunks wrapping `EApp (EVar "__fn") (EVar "__arg")` in a self-contained env, reusing existing eval + memoization machinery
+- 511 tests (3 new: map laziness, genList laziness, mapAttrs laziness)
+
 ## 0.1.1.0 — 2026-02-24
 
 ### Phase 4: nixpkgs Compatibility

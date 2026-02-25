@@ -79,6 +79,7 @@ import Nix.Eval.Types
     envLookup,
     evaluated,
     mkStr,
+    mkSyntheticThunk,
     mkThunk,
     pushWithScope,
     runPureEval,
@@ -438,8 +439,10 @@ matchFormals closureEnv (FormalSet formals allowExtra) argThunk = do
   matchFormalSet closureEnv formals allowExtra argVal
 matchFormals closureEnv (FormalNamedSet name formals allowExtra) argThunk = do
   argVal <- force argThunk
-  matched <- matchFormalSet closureEnv formals allowExtra argVal
-  pure (envInsertThunk name argThunk matched)
+  -- Bind the @-pattern name (e.g. "args") BEFORE matching formals so that
+  -- default expressions like @system ? args.system or ...@ can see it.
+  let envWithAt = envInsertThunk name argThunk closureEnv
+  matchFormalSet envWithAt formals allowExtra argVal
 
 -- | Match a formal set pattern against a VAttrs argument.
 matchFormalSet :: (MonadEval m) => Env -> [Formal] -> Bool -> NixValue -> m Env
@@ -1080,9 +1083,9 @@ catAttrsCollect key (thunk : rest) = do
 -- ---------------------------------------------------------------------------
 
 builtinMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMap func (VList thunks) = do
-  mapped <- mapM (applyToThunk func) thunks
-  pure (VList (map evaluated mapped))
+builtinMap func (VList thunks) =
+  -- Lazy: each element is a deferred application, forced only on demand.
+  pure (VList (map (deferApply func) thunks))
 builtinMap _ other =
   throwEvalError ("builtins.map: expected a list, got " <> typeName other)
 
@@ -1106,9 +1109,12 @@ filterThunks predFn (thunk : rest) = do
 builtinGenList :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGenList func (VInt n)
   | n < 0 = throwEvalError "builtins.genList: length must be non-negative"
-  | otherwise = do
-      vals <- mapM (applyValue func . VInt) [0 .. n - 1]
-      pure (VList (map evaluated vals))
+  | otherwise =
+      -- Lazy: each element is a deferred @f i@, forced only on demand.
+      let fnThunk = evaluated func
+          env = Env {envBindings = Map.fromList [("__fn", fnThunk)], envWithScopes = []}
+          mkIndexThunk i = mkThunk env (EApp (EVar "__fn") (ELit (NixInt i)))
+       in pure (VList (map mkIndexThunk [0 .. n - 1]))
 builtinGenList _ other =
   throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
 
@@ -1140,7 +1146,10 @@ insertSorted cmp val (y : ys) = do
 
 builtinConcatMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinConcatMap func (VList thunks) = do
-  results <- mapM (applyToThunk func) thunks
+  -- Semi-eager: must force each application to discover list structure for
+  -- concatenation, but element thunks within those sub-lists stay lazy.
+  let deferredApps = map (deferApply func) thunks
+  results <- mapM force deferredApps
   concatted <- mapM extractList results
   pure (VList (concat concatted))
 builtinConcatMap _ other =
@@ -1324,11 +1333,21 @@ builtinSubstring _ _ other =
 -- Builtin helpers
 -- ---------------------------------------------------------------------------
 
--- | Apply a function to a forced thunk.
-applyToThunk :: (MonadEval m) => NixValue -> Thunk -> m NixValue
-applyToThunk func thunk = do
-  val <- force thunk
-  applyValue func val
+-- | Build a thunk that defers @f arg@ — the application only happens when
+-- the thunk is forced.  Reuses the existing eval machinery via a synthetic
+-- @EApp (EVar "__fn") (EVar "__arg")@ in a self-contained env.
+deferApply :: NixValue -> Thunk -> Thunk
+deferApply func argThunk =
+  let env =
+        Env
+          { envBindings =
+              Map.fromList
+                [ ("__fn", evaluated func),
+                  ("__arg", argThunk)
+                ],
+            envWithScopes = []
+          }
+   in mkSyntheticThunk env (EApp (EVar "__fn") (EVar "__arg"))
 
 -- | The current system platform string.
 currentSystemStr :: Text
@@ -1585,15 +1604,22 @@ builtinBitXor _ _ = throwEvalError "builtins.bitXor: expected two integers"
 -- ---------------------------------------------------------------------------
 
 builtinMapAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMapAttrs func (VAttrs attrs) = do
-  mapped <- mapM (mapAttrEntry func) (Map.toList attrs)
-  pure (VAttrs (Map.fromList mapped))
+builtinMapAttrs func (VAttrs attrs) =
+  -- Lazy: each attr value is a deferred @f key val@, forced only on demand.
+  pure (VAttrs (Map.mapWithKey deferAttr attrs))
   where
-    mapAttrEntry fn (key, thunk) = do
-      val <- force thunk
-      partial <- applyValue fn (mkStr key)
-      result <- applyValue partial val
-      pure (key, evaluated result)
+    deferAttr key valThunk =
+      let env =
+            Env
+              { envBindings =
+                  Map.fromList
+                    [ ("__fn", evaluated func),
+                      ("__key", evaluated (mkStr key)),
+                      ("__val", valThunk)
+                    ],
+                envWithScopes = []
+              }
+       in mkSyntheticThunk env (EApp (EApp (EVar "__fn") (EVar "__key")) (EVar "__val"))
 builtinMapAttrs _ other =
   throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
 

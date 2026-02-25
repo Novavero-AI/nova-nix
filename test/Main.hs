@@ -502,6 +502,8 @@ testEvalHigherOrder = do
         assertEval "map-id" "builtins.map (x: x) [ 1 2 ] == [ 1 2 ]" (VBool True),
       runTest "map empty" $
         assertEval "map-empty" "builtins.map (x: x) [ ]" (VList []),
+      runTest "map lazy" $
+        assertEval "map-lazy" "let xs = builtins.map (x: x * 2) [ 1 (throw \"boom\") 3 ]; in builtins.elemAt xs 0" (VInt 2),
       -- filter
       runTest "filter match" $
         assertEval "filter" "builtins.filter (x: x == 2) [ 1 2 3 ] == [ 2 ]" (VBool True),
@@ -519,6 +521,8 @@ testEvalHigherOrder = do
         assertEval "genList" "builtins.genList (i: i * 2) 4 == [ 0 2 4 6 ]" (VBool True),
       runTest "genList zero" $
         assertEval "genList-0" "builtins.genList (i: i) 0" (VList []),
+      runTest "genList lazy" $
+        assertEval "genList-lazy" "let xs = builtins.genList (i: if i == 0 then 42 else throw \"boom\") 5; in builtins.elemAt xs 0" (VInt 42),
       -- sort
       runTest "sort ints" $
         assertEval "sort" "builtins.sort (a: b: a < b) [ 3 1 2 ] == [ 1 2 3 ]" (VBool True),
@@ -1133,6 +1137,8 @@ testBatch3 = do
         assertEval "mapAttrs-name" "(builtins.mapAttrs (name: val: name) { a = 1; }).a" (mkStr "a"),
       runTest "mapAttrs type error" $
         assertEvalFail "mapAttrs-err" "builtins.mapAttrs (n: v: v) [ 1 ]",
+      runTest "mapAttrs lazy" $
+        assertEval "mapAttrs-lazy" "let s = builtins.mapAttrs (k: v: if k == \"a\" then v else throw \"boom\") { a = 1; b = 2; }; in s.a" (VInt 1),
       -- functionArgs
       runTest "functionArgs set pattern" $
         assertEval "funcArgs" "(builtins.functionArgs ({ a, b ? 1 }: a)).b" (VBool True),

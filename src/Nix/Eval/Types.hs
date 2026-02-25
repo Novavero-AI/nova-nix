@@ -26,6 +26,7 @@ module Nix.Eval.Types
 
     -- * Thunk operations
     mkThunk,
+    mkSyntheticThunk,
     evaluated,
 
     -- * Display
@@ -193,6 +194,18 @@ mkThunk :: Env -> Expr -> Thunk
 mkThunk env thunkExpr =
   Thunk thunkExpr env (newMemoCell thunkExpr)
 
+-- | Like 'mkThunk' but for synthetic thunks that reuse the same 'Expr'
+-- (e.g. @EApp (EVar "__fn") (EVar "__arg")@ in 'deferApply').  Uses the
+-- 'Env' bindings map for cell uniqueness instead of the expression, since
+-- GHC's full-laziness transform would otherwise float the shared expr to
+-- a CAF and all thunks would get the same IORef.
+--
+-- Must only be called with freshly-constructed envs (not knot-tied
+-- recursive envs), since it forces the bindings map to WHNF.
+mkSyntheticThunk :: Env -> Expr -> Thunk
+mkSyntheticThunk env thunkExpr =
+  Thunk thunkExpr env (newSyntheticCell (envBindings env))
+
 -- | Allocate a fresh memoization cell for a thunk.
 --
 -- @NOINLINE@ prevents inlining so GHC can't see inside or CSE calls.
@@ -203,6 +216,12 @@ mkThunk env thunkExpr =
 {-# NOINLINE newMemoCell #-}
 newMemoCell :: Expr -> IORef (Maybe NixValue)
 newMemoCell expr = unsafePerformIO (expr `seq` newIORef Nothing)
+
+-- | Like 'newMemoCell' but keyed on a bindings map instead of an expression.
+-- Used by 'mkSyntheticThunk' where multiple thunks share the same expression.
+{-# NOINLINE newSyntheticCell #-}
+newSyntheticCell :: Map Text Thunk -> IORef (Maybe NixValue)
+newSyntheticCell bindings = unsafePerformIO (bindings `seq` newIORef Nothing)
 
 -- | Wrap an already-computed value as a thunk.
 evaluated :: NixValue -> Thunk
