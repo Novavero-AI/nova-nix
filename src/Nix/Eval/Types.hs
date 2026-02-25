@@ -9,6 +9,7 @@ module Nix.Eval.Types
   ( -- * Values
     NixValue (..),
     Thunk (..),
+    ThunkCell (..),
 
     -- * Attribute sets (lazy/eager unified abstraction)
     AttrSet (..),
@@ -96,34 +97,41 @@ mkStr t = VStr t emptyContext
 -- Thunks
 -- ---------------------------------------------------------------------------
 
--- | A thunk: either an unevaluated expression paired with its
--- capturing environment, or an already-forced value.
+-- | Contents of a thunk's memoization cell.  When forced, 'Pending'
+-- is overwritten with 'Computed', dropping the Expr and Env — they
+-- become unreachable and are GC'd.  This matches C++ Nix, which
+-- overwrites Value structs in place to release closures.
+data ThunkCell
+  = -- | Not yet forced: expression + capturing environment.
+    -- Expr is strict; Env is LAZY for knot-tying in rec {} and let.
+    Pending !Expr Env
+  | -- | Forced: the computed result.  Expr + Env are gone.
+    Computed !NixValue
+  deriving (Show)
+
+-- | A thunk: either an IORef-backed memoization cell (deferred
+-- evaluation), or an already-known value (no IORef needed).
 --
--- Each unevaluated thunk carries an 'IORef' memoization cell that
--- caches the result after the first force — matching real Nix, which
--- mutates thunks in-place.  The IORef is allocated lazily via
--- 'unsafePerformIO' in 'mkThunk' so that knot-tying in recursive
--- @let@ and @rec {}@ works unchanged (the IORef doesn't participate
--- in the knot).  Memory is naturally bounded: when a thunk is no
--- longer reachable, both the thunk and its cached value are GC'd.
+-- Each 'ThunkRef' carries an 'IORef ThunkCell'.  On first force,
+-- the cell is overwritten from @Pending expr env@ to @Computed val@,
+-- which drops all references to the Expr and Env — matching real Nix
+-- which mutates thunks in-place.  The IORef is allocated via
+-- 'unsafePerformIO' in 'mkThunk' so that knot-tying works unchanged.
 data Thunk
-  = -- | Unevaluated: Expr is strict, Env is LAZY to allow
-    -- knot-tying in recursive let and rec { }.  The IORef cell
-    -- is written once on first force, then read on subsequent forces.
-    Thunk !Expr Env !(IORef (Maybe NixValue))
-  | Evaluated !NixValue
+  = -- | Deferred thunk with memoization cell.
+    ThunkRef !(IORef ThunkCell)
+  | -- | Already-known value (no IORef overhead).
+    Evaluated !NixValue
 
 instance Show Thunk where
   show (Evaluated val) = "Evaluated (" ++ show val ++ ")"
-  show (Thunk expr _ _) = "Thunk (" ++ show expr ++ ") <env> <ref>"
+  show (ThunkRef _) = "ThunkRef <ref>"
 
--- | Structural equality — compares expressions for unevaluated thunks,
--- values for evaluated ones.  Ignores the IORef cell and environment.
--- Will diverge on recursive environments; only used in tests on
--- non-recursive structures.
+-- | Equality: compares values for 'Evaluated', IORef identity for
+-- 'ThunkRef'.  Only used in tests on non-recursive structures.
 instance Eq Thunk where
   (Evaluated v1) == (Evaluated v2) = v1 == v2
-  (Thunk e1 _ _) == (Thunk e2 _ _) = e1 == e2
+  (ThunkRef ref1) == (ThunkRef ref2) = ref1 == ref2
   _ == _ = False
 
 -- | A Nix value — the result of evaluating an expression.
@@ -363,15 +371,15 @@ pushWithScope scope env =
 
 -- | Create an unevaluated thunk with a fresh memoization cell.
 --
--- Each thunk gets its own 'IORef' for in-place memoization, matching
--- real Nix which mutates @Value@ structs on first force.  The cell is
--- allocated via @newMemoCell@ which uses 'unsafePerformIO' — safe
--- because 'newIORef' is a pure allocation with no observable side
--- effects, and the @NOINLINE@ + @seq@ pattern prevents GHC from
--- floating the allocation to a shared top-level CAF.
+-- Each thunk gets its own 'IORef ThunkCell'.  On first force the
+-- cell is overwritten from @Pending@ to @Computed@, dropping the
+-- Expr and Env.  The cell is allocated via @newMemoCell@ which uses
+-- 'unsafePerformIO' — safe because 'newIORef' is a pure allocation,
+-- and the @NOINLINE@ + @seq@ pattern prevents GHC from floating the
+-- allocation to a shared top-level CAF.
 mkThunk :: Env -> Expr -> Thunk
 mkThunk env thunkExpr =
-  Thunk thunkExpr env (newMemoCell thunkExpr)
+  ThunkRef (newMemoCell thunkExpr env)
 
 -- | Like 'mkThunk' but for synthetic thunks that reuse the same 'Expr'
 -- (e.g. @EApp (EVar "__fn") (EVar "__arg")@ in 'deferApply').  Uses the
@@ -383,24 +391,27 @@ mkThunk env thunkExpr =
 -- recursive envs), since it forces the bindings map to WHNF.
 mkSyntheticThunk :: Env -> Expr -> Thunk
 mkSyntheticThunk env thunkExpr =
-  Thunk thunkExpr env (newSyntheticCell (envBindings env))
+  ThunkRef (newSyntheticCell (envBindings env) thunkExpr env)
 
 -- | Allocate a fresh memoization cell for a thunk.
 --
 -- @NOINLINE@ prevents inlining so GHC can't see inside or CSE calls.
--- @seq@ on the argument creates a data dependency that prevents
--- float-out to a top-level CAF — without this, GHC would hoist
--- @unsafePerformIO (newIORef Nothing)@ and share ONE cell across
--- ALL thunks.
+-- @seq@ on the expr creates a data dependency that prevents float-out
+-- to a top-level CAF — without this, GHC would hoist the
+-- @unsafePerformIO (newIORef ...)@ and share ONE cell across ALL thunks.
+--
+-- The cell starts as @Pending expr env@, putting both references inside
+-- the IORef.  On force, it's overwritten to @Computed val@, dropping
+-- the Expr and Env so they become unreachable.
 {-# NOINLINE newMemoCell #-}
-newMemoCell :: Expr -> IORef (Maybe NixValue)
-newMemoCell expr = unsafePerformIO (expr `seq` newIORef Nothing)
+newMemoCell :: Expr -> Env -> IORef ThunkCell
+newMemoCell expr env = unsafePerformIO (expr `seq` newIORef (Pending expr env))
 
 -- | Like 'newMemoCell' but keyed on a bindings map instead of an expression.
 -- Used by 'mkSyntheticThunk' where multiple thunks share the same expression.
 {-# NOINLINE newSyntheticCell #-}
-newSyntheticCell :: Map Text Thunk -> IORef (Maybe NixValue)
-newSyntheticCell bindings = unsafePerformIO (bindings `seq` newIORef Nothing)
+newSyntheticCell :: Map Text Thunk -> Expr -> Env -> IORef ThunkCell
+newSyntheticCell bindings expr env = unsafePerformIO (bindings `seq` newIORef (Pending expr env))
 
 -- | Wrap an already-computed value as a thunk.
 evaluated :: NixValue -> Thunk
@@ -411,7 +422,7 @@ evaluated = Evaluated
 -- so deep equality can short-circuit to 'True' without forcing.
 -- Matching real Nix which uses pointer identity for same-thunk comparison.
 thunkSameRef :: Thunk -> Thunk -> Bool
-thunkSameRef (Thunk _ _ ref1) (Thunk _ _ ref2) = ref1 == ref2
+thunkSameRef (ThunkRef ref1) (ThunkRef ref2) = ref1 == ref2
 thunkSameRef _ _ = False
 
 -- | Human-readable type name for error messages.
@@ -498,4 +509,9 @@ instance MonadEval PureEval where
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
   resolvePathLiteral = pure
   forceThunk _ (Evaluated val) = pure val
-  forceThunk evalFn (Thunk expr env _) = evalFn env expr
+  forceThunk evalFn (ThunkRef ref) =
+    -- Read the cell via unsafePerformIO — safe because readIORef has no
+    -- side effects and PureEval never writes back (no memoization).
+    case unsafePerformIO (readIORef ref) of
+      Computed val -> pure val
+      Pending expr env -> evalFn env expr

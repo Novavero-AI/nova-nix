@@ -39,7 +39,7 @@ import qualified Data.Text.IO as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
-import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..))
+import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..), ThunkCell (..))
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix)
@@ -239,16 +239,17 @@ instance MonadEval EvalIO where
       else pure path
 
   forceThunk _ (Evaluated val) = pure val
-  forceThunk evalFn (Thunk expr env ref) = do
-    -- Per-thunk IORef memoization: read once, evaluate at most once,
-    -- cache in the thunk's own cell.  Memory is naturally bounded —
-    -- when the thunk is GC'd, so is its cached value.
-    cached <- wrapIO (readIORef ref)
-    case cached of
-      Just val -> pure val
-      Nothing -> do
+  forceThunk evalFn (ThunkRef ref) = do
+    -- Per-thunk IORef memoization.  On first force, overwrites
+    -- Pending with Computed — dropping the Expr and Env so they
+    -- become unreachable and are GC'd.  Matches C++ Nix which
+    -- mutates Value structs in place.
+    cell <- wrapIO (readIORef ref)
+    case cell of
+      Computed val -> pure val
+      Pending expr env -> do
         val <- evalFn env expr
-        wrapIO (writeIORef ref (Just val))
+        wrapIO (writeIORef ref (Computed val))
         pure val
 
 -- ---------------------------------------------------------------------------

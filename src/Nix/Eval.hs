@@ -14,6 +14,7 @@ module Nix.Eval
   ( -- * Values (re-exported from Types)
     NixValue (..),
     Thunk (..),
+    ThunkCell (..),
 
     -- * Attribute sets (re-exported from Types)
     AttrSet (..),
@@ -89,6 +90,7 @@ import Nix.Eval.Types
     StringContext (..),
     StringContextElement (..),
     Thunk (..),
+    ThunkCell (..),
     attrSetElems,
     attrSetFromMap,
     attrSetKeys,

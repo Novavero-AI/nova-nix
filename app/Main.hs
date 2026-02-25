@@ -286,7 +286,7 @@ prettyValue (VDerivation drv) =
 -- 'Evaluated'; unevaluated thunks render as a placeholder.
 prettyThunk :: Thunk -> T.Text
 prettyThunk (Evaluated val) = prettyValue val
-prettyThunk (Thunk {}) = "«thunk»"
+prettyThunk (ThunkRef {}) = "«thunk»"
 
 -- | Escape a string for Nix-style output (quotes, backslashes, newlines, tabs, carriage returns).
 escapeNixString :: T.Text -> T.Text
