@@ -264,7 +264,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 ## The Hard Problems
 
-Building Nix on Windows means solving problems nobody has fully solved before:
+Building Nix on Windows means solving real platform differences:
 
 | Problem | Solution |
 |---------|----------|
