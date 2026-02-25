@@ -14,13 +14,14 @@ where
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Nix.Eval.Types
-  ( MonadEval (..),
+  ( AttrSet (..),
+    LazyBinding (..),
+    MonadEval (..),
     NixValue (..),
     Thunk,
     attrSetElems,
-    attrSetFromMap,
     attrSetKeys,
-    attrSetToMap,
+    newLazyAttrCache,
     thunkSameRef,
     typeName,
   )
@@ -203,9 +204,35 @@ evalConcat left right =
 
 -- | Attribute set merge (//).  Right-biased: keys in the right
 -- operand shadow keys in the left.
+--
+-- When one side is a 'LazyAttrs', avoid full materialization by
+-- merging binding recipes directly.  This is critical for nixpkgs
+-- where the overlay system does @big_set // small_set@.
 evalUpdate :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-evalUpdate (VAttrs as) (VAttrs bs) =
-  -- Right-biased merge: keys in bs shadow keys in as.
-  pure (VAttrs (attrSetFromMap (Map.union (attrSetToMap bs) (attrSetToMap as))))
+evalUpdate (VAttrs as) (VAttrs bs) = pure (VAttrs (mergeAttrSets as bs))
 evalUpdate left right =
   throwEvalError ("cannot merge " <> typeName left <> " and " <> typeName right)
+
+-- | Merge two 'AttrSet's, right-biased.  Keeps 'LazyAttrs' lazy
+-- when possible — avoids materializing 30k thunks for @big // small@.
+mergeAttrSets :: AttrSet -> AttrSet -> AttrSet
+-- LazyAttrs // EagerAttrs: override binding recipes with pre-built thunks
+mergeAttrSets (LazyAttrs env bindings _cache) (EagerAttrs small) =
+  let overrides = Map.map PreBuilt small
+      merged = Map.union overrides bindings -- overrides shadow originals
+      newCache = newLazyAttrCache merged
+   in LazyAttrs env merged newCache
+-- EagerAttrs // LazyAttrs: lazy set wins on conflicts, eager fills gaps
+mergeAttrSets (EagerAttrs small) (LazyAttrs env bindings _cache) =
+  let fallbacks = Map.map PreBuilt small
+      merged = Map.union bindings fallbacks -- LazyAttrs keys win
+      newCache = newLazyAttrCache merged
+   in LazyAttrs env merged newCache
+-- LazyAttrs // LazyAttrs: merge binding maps, right wins
+mergeAttrSets (LazyAttrs _ leftBindings _) (LazyAttrs env rightBindings _) =
+  let merged = Map.union rightBindings leftBindings -- right wins
+      newCache = newLazyAttrCache merged
+   in LazyAttrs env merged newCache
+-- EagerAttrs // EagerAttrs: standard Map.union
+mergeAttrSets (EagerAttrs as) (EagerAttrs bs) =
+  EagerAttrs (Map.union bs as) -- right-biased: bs shadows as
