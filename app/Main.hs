@@ -28,6 +28,7 @@ import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Parser (parseNix)
 import Nix.Store (Store, closeStore, openStore, writeDrv)
 import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, storePathToFilePath)
+import Paths_nova_nix (getDataDir)
 import System.Directory (getCurrentDirectory, getTemporaryDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
@@ -67,10 +68,11 @@ parseArgs = go (CliOpts [] False CmdHelp)
       go (opts {optCommand = CmdBuild path}) rest
     go opts _ = opts
 
--- | Merge --nix-path entries with the search paths from NIX_PATH.
-mergeSearchPaths :: [T.Text] -> [Thunk] -> [Thunk]
-mergeSearchPaths extraPaths envPaths =
-  concatMap parseNixPath extraPaths ++ envPaths
+-- | Merge --nix-path entries, bundled data dir, and NIX_PATH search paths.
+-- The data dir is appended last so user paths take priority.
+mergeSearchPaths :: [T.Text] -> FilePath -> [Thunk] -> [Thunk]
+mergeSearchPaths extraPaths dataDir envPaths =
+  concatMap parseNixPath extraPaths ++ envPaths ++ parseNixPath (T.pack dataDir)
 
 -- ---------------------------------------------------------------------------
 -- Main
@@ -80,11 +82,12 @@ main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
   args <- getArgs
+  dataDir <- getDataDir
   let opts = parseArgs args
   case optCommand opts of
-    CmdEvalFile filePath -> evalFile (optStrict opts) (optNixPaths opts) filePath
-    CmdEvalExpr expr -> evalExpr (optStrict opts) (optNixPaths opts) expr
-    CmdBuild filePath -> buildFile (optNixPaths opts) filePath
+    CmdEvalFile filePath -> evalFile (optStrict opts) (optNixPaths opts) dataDir filePath
+    CmdEvalExpr expr -> evalExpr (optStrict opts) (optNixPaths opts) dataDir expr
+    CmdBuild filePath -> buildFile (optNixPaths opts) dataDir filePath
     CmdHelp -> do
       hPutStrLn stderr "Usage: nova-nix [--nix-path NAME=PATH] <command>"
       hPutStrLn stderr ""
@@ -99,8 +102,8 @@ main = do
       exitFailure
 
 -- | Evaluate a .nix file and print the result.
-evalFile :: Bool -> [T.Text] -> FilePath -> IO ()
-evalFile strict extraPaths filePath = do
+evalFile :: Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
+evalFile strict extraPaths dataDir filePath = do
   source <- TIO.readFile filePath
   case parseNix (T.pack filePath) source of
     Left err -> do
@@ -108,7 +111,7 @@ evalFile strict extraPaths filePath = do
       exitFailure
     Right expr -> do
       st <- newEvalState (takeDirectory filePath)
-      let searchPaths = mergeSearchPaths extraPaths (esSearchPaths st)
+      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st)
       result <-
         runEvalIO st $
           eval (builtinEnv (esTimestamp st) searchPaths) expr >>= finalize strict
@@ -119,8 +122,8 @@ evalFile strict extraPaths filePath = do
         Right forced -> TIO.putStrLn (prettyValue forced)
 
 -- | Evaluate an inline expression and print the result.
-evalExpr :: Bool -> [T.Text] -> T.Text -> IO ()
-evalExpr strict extraPaths source = do
+evalExpr :: Bool -> [T.Text] -> FilePath -> T.Text -> IO ()
+evalExpr strict extraPaths dataDir source = do
   case parseNix "<expr>" source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
@@ -128,7 +131,7 @@ evalExpr strict extraPaths source = do
     Right expr -> do
       cwd <- getCurrentDirectory
       st <- newEvalState cwd
-      let searchPaths = mergeSearchPaths extraPaths (esSearchPaths st)
+      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st)
       result <-
         runEvalIO st $
           eval (builtinEnv (esTimestamp st) searchPaths) expr >>= finalize strict
@@ -139,8 +142,8 @@ evalExpr strict extraPaths source = do
         Right forced -> TIO.putStrLn (prettyValue forced)
 
 -- | Parse, evaluate, extract derivation, build, and print result.
-buildFile :: [T.Text] -> FilePath -> IO ()
-buildFile extraPaths filePath = do
+buildFile :: [T.Text] -> FilePath -> FilePath -> IO ()
+buildFile extraPaths dataDir filePath = do
   source <- TIO.readFile filePath
   case parseNix (T.pack filePath) source of
     Left err -> do
@@ -148,7 +151,7 @@ buildFile extraPaths filePath = do
       exitFailure
     Right expr -> do
       st <- newEvalState (takeDirectory filePath)
-      let searchPaths = mergeSearchPaths extraPaths (esSearchPaths st)
+      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st)
       result <- runEvalIO st (eval (builtinEnv (esTimestamp st) searchPaths) expr)
       case result of
         Left err -> do
