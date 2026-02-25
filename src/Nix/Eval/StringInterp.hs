@@ -46,9 +46,9 @@ evalOnePart evalFn env (StrInterp expr) = do
 
 -- | Coerce a Nix value to a string for interpolation.
 --
--- Nix coercion rules: strings pass through (with context), integers
--- and floats are shown, paths pass through, null becomes the empty
--- string.  Other types (lists, sets, functions) cannot be coerced.
+-- Strict coercion: strings, ints, floats, paths, null, bools.
+-- Lists, sets (without @__toString@/@outPath@), and functions are errors.
+-- Used by string interpolation (@"${...}"@).
 coerceToString :: (MonadEval m) => NixValue -> m (Text, StringContext)
 coerceToString val = case val of
   VStr s ctx -> pure (s, ctx)

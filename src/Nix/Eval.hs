@@ -617,7 +617,7 @@ builtinRegistry =
       builtin1 "head" builtinHead,
       builtin1 "tail" builtinTail,
       -- String operations (arity 1)
-      builtin1 "toString" (fmap (uncurry VStr) . coerceToString),
+      builtin1 "toString" (fmap (uncurry VStr) . coerceToStringPermissive),
       builtin1 "stringLength" builtinStringLength,
       -- Control (arity 1)
       builtin1 "throw" builtinThrow,
@@ -774,7 +774,7 @@ executeBuiltin name args = case name of
   "head" -> apply1 builtinHead
   "tail" -> apply1 builtinTail
   -- String operations (arity 1)
-  "toString" -> apply1 (fmap (uncurry VStr) . coerceToString)
+  "toString" -> apply1 (fmap (uncurry VStr) . coerceToStringPermissive)
   "stringLength" -> apply1 builtinStringLength
   -- Control (arity 1)
   "throw" -> apply1 builtinThrow
@@ -1348,6 +1348,23 @@ deferApply func argThunk =
             envWithScopes = []
           }
    in mkSyntheticThunk env (EApp (EVar "__fn") (EVar "__arg"))
+
+-- | Permissive coercion used by @builtins.toString@.
+--
+-- Like 'coerceToString' but additionally handles lists: elements are
+-- recursively coerced and joined with spaces, matching real Nix semantics.
+-- @toString [1 2 3]@ gives @"1 2 3"@.
+coerceToStringPermissive :: (MonadEval m) => NixValue -> m (Text, StringContext)
+coerceToStringPermissive (VList thunks) = do
+  parts <- mapM coerceThunk thunks
+  let texts = map fst parts
+      ctx = mconcat (map snd parts)
+  pure (T.intercalate " " texts, ctx)
+  where
+    coerceThunk thunk = do
+      val <- force thunk
+      coerceToStringPermissive val
+coerceToStringPermissive other = coerceToString other
 
 -- | The current system platform string.
 currentSystemStr :: Text
