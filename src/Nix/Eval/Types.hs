@@ -28,6 +28,7 @@ module Nix.Eval.Types
     mkThunk,
     mkSyntheticThunk,
     evaluated,
+    thunkSameRef,
 
     -- * Display
     typeName,
@@ -226,6 +227,14 @@ newSyntheticCell bindings = unsafePerformIO (bindings `seq` newIORef Nothing)
 -- | Wrap an already-computed value as a thunk.
 evaluated :: NixValue -> Thunk
 evaluated = Evaluated
+
+-- | Check if two thunks share the same memoization cell (IORef pointer
+-- equality).  When true, both thunks will always produce the same value,
+-- so deep equality can short-circuit to 'True' without forcing.
+-- Matching real Nix which uses pointer identity for same-thunk comparison.
+thunkSameRef :: Thunk -> Thunk -> Bool
+thunkSameRef (Thunk _ _ ref1) (Thunk _ _ ref2) = ref1 == ref2
+thunkSameRef _ _ = False
 
 -- | Human-readable type name for error messages.
 typeName :: NixValue -> Text

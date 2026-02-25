@@ -17,6 +17,7 @@ import Nix.Eval.Types
   ( MonadEval (..),
     NixValue (..),
     Thunk,
+    thunkSameRef,
     typeName,
   )
 import Nix.Expr.Types (BinaryOp (..), UnaryOp (..))
@@ -167,19 +168,24 @@ nixEqual _ _ _ = pure False
 -- | Pairwise equality of two thunk lists (for list comparison).
 listEqual :: (MonadEval m) => Force m -> [Thunk] -> [Thunk] -> m Bool
 listEqual _ [] [] = pure True
-listEqual forceFn (a : as) (b : bs) = do
-  va <- forceFn a
-  vb <- forceFn b
-  eq <- nixEqual forceFn va vb
-  if eq then listEqual forceFn as bs else pure False
+listEqual forceFn (a : as) (b : bs)
+  | thunkSameRef a b = listEqual forceFn as bs
+  | otherwise = do
+      va <- forceFn a
+      vb <- forceFn b
+      eq <- nixEqual forceFn va vb
+      if eq then listEqual forceFn as bs else pure False
 listEqual _ _ _ = pure False
 
 -- | Compare two thunks for equality by forcing both.
+-- Short-circuits on thunk identity (same IORef = same value).
 thunkPairEqual :: (MonadEval m) => Force m -> (Thunk, Thunk) -> m Bool
-thunkPairEqual forceFn (a, b) = do
-  va <- forceFn a
-  vb <- forceFn b
-  nixEqual forceFn va vb
+thunkPairEqual forceFn (a, b)
+  | thunkSameRef a b = pure True
+  | otherwise = do
+      va <- forceFn a
+      vb <- forceFn b
+      nixEqual forceFn va vb
 
 -- ---------------------------------------------------------------------------
 -- List / attrset operators
