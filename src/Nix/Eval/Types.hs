@@ -40,10 +40,10 @@ module Nix.Eval.Types
     Env (..),
     emptyEnv,
     envLookup,
-    envInsert,
-    envInsertThunk,
-    envInsertMany,
+    envLookupResolved,
+    envFromSlots,
     pushWithScope,
+    indexSlots,
 
     -- * Thunk operations
     mkThunk,
@@ -377,24 +377,24 @@ attrSetFromMap = EagerAttrs
 newLazyAttrCache :: Map Text LazyBinding -> IORef (Map Text Thunk)
 newLazyAttrCache bindings = unsafePerformIO (bindings `seq` newIORef Map.empty)
 
--- | Evaluation environment — scope chain.
+-- | Evaluation environment — scope chain with positional slots.
 --
--- Each Env holds only its LOCAL bindings and a parent pointer.
--- Variable lookup walks the chain: local bindings first, then parent,
--- then grandparent, etc.  With-scopes are checked AFTER exhausting
--- all lexical bindings in the chain (Nix: lexical always wins).
+-- Lambda formals are stored in positional 'envSlots' (de Bruijn-style),
+-- eliminating Map.Bin overhead.  Let\/rec bindings and builtins use
+-- name-based 'envLazyScope'.  Variable lookup has two paths:
 --
--- This avoids O(n) Map.union/insert when extending large envs (e.g.
--- the 30k-entry nixpkgs rec set).  A function application that adds
--- 5 formals creates 5 singleton Maps instead of 5 copies of the
--- 30k-entry map's internal Bin nodes.
+-- * 'envLookupResolved': O(1) array index for 'EResolvedVar'
+-- * 'envLookup': name-based walk for 'EVar' (envLazyScope + with-scopes)
 data Env = Env
-  { -- | Local lexical bindings at this scope level.
-    envBindings :: !(Map Text Thunk),
+  { -- | Positional bindings for lambda formals.
+    -- Indexed by position (0-based), filled by 'matchFormals'.
+    -- Empty for let/rec/builtin envs.
+    envSlots :: ![Thunk],
     -- | Lazy scope shared with a 'LazyAttrs' attr set.
     -- For rec {} and let, this points to the SAME 'LazyAttrs' that
     -- backs the resulting attr set — one map instead of two.
-    -- Variable lookup checks this after 'envBindings', before parent.
+    -- For builtins, holds the top-level bindings (true, false, etc.).
+    -- Variable lookup checks this for name-based 'EVar' lookups.
     envLazyScope :: !(Maybe AttrSet),
     -- | Parent scope (Nothing at the root).  LAZY for knot-tying
     -- in rec {} where recEnv's parent is the outer env.
@@ -404,18 +404,18 @@ data Env = Env
     envWithScopes :: ![AttrSet]
   }
 
--- | Shallow comparison: checks local bindings and with-scopes only.
+-- | Shallow comparison: checks slots and with-scopes only.
 -- Ignores parent chain to avoid diverging on deep/recursive envs.
 -- Only used in tests on non-recursive structures.
 instance Eq Env where
-  Env b1 _ _ w1 == Env b2 _ _ w2 = b1 == b2 && w1 == w2
+  Env s1 _ _ w1 == Env s2 _ _ w2 = s1 == s2 && w1 == w2
 
 -- | Compact show: just the size and structure, not the full contents.
 instance Show Env where
-  show (Env bindings lazyScope parent withs) =
+  show (Env slots lazyScope parent withs) =
     "Env{"
-      ++ show (Map.size bindings)
-      ++ " local"
+      ++ show (length slots)
+      ++ " slots"
       ++ maybe "" (const ", lazyScope") lazyScope
       ++ maybe "" (const ", parent") parent
       ++ ", "
@@ -424,25 +424,44 @@ instance Show Env where
 
 -- | Empty environment (no variables in scope).
 emptyEnv :: Env
-emptyEnv = Env Map.empty Nothing Nothing []
+emptyEnv = Env [] Nothing Nothing []
 
--- | Look up a variable: walk the parent chain checking lexical
--- bindings at each level; fall back to with-scopes (from the
+-- | Look up a resolved variable by level and index.  O(level) parent
+-- hops, then O(index) list indexing.  Total O(level + index), but
+-- both are typically tiny (level 0–3, index 0–5 for lambda formals).
+--
+-- Unreachable branch: the resolution pass guarantees valid indices.
+envLookupResolved :: Int -> Int -> Env -> Thunk
+envLookupResolved 0 idx env = indexSlots (envSlots env) idx
+envLookupResolved lvl idx env = case envParent env of
+  Just parent -> envLookupResolved (lvl - 1) idx parent
+  Nothing -> error "envLookupResolved: level exceeded (unreachable after resolution)"
+
+-- | Index into a slot list by position.  O(n) for position n.
+-- Unreachable branch: the resolution pass guarantees valid indices.
+indexSlots :: [Thunk] -> Int -> Thunk
+indexSlots (x : _) 0 = x
+indexSlots (_ : xs) !n = indexSlots xs (n - 1)
+indexSlots [] _ = error "indexSlots: index out of bounds (unreachable after resolution)"
+
+-- | Name-based variable lookup: walk the parent chain checking
+-- 'envLazyScope' at each level; fall back to with-scopes (from the
 -- starting env) only after exhausting all lexical scopes.
+--
+-- 'envSlots' are positional (no names) and are NOT searched here.
+-- Used for 'EVar' lookups (let\/rec bindings, builtins, with-scopes).
 envLookup :: Text -> Env -> Maybe Thunk
 envLookup name env = lexicalLookup env
   where
     -- With-scopes from the STARTING env: these are the most recent
     -- and subsume all ancestor with-scopes (children inherit them).
     withs = envWithScopes env
-    lexicalLookup (Env bindings lazyScope parent _) =
-      case Map.lookup name bindings of
-        Just val -> Just val
-        Nothing -> case lazyScope of
-          Just scope -> case attrSetLookup name scope of
-            Just val -> Just val
-            Nothing -> goParent parent
+    lexicalLookup (Env _slots lazyScope parent _) =
+      case lazyScope of
+        Just scope -> case attrSetLookup name scope of
+          Just val -> Just val
           Nothing -> goParent parent
+        Nothing -> goParent parent
     goParent (Just p) = lexicalLookup p
     goParent Nothing = lookupWithScopes name withs
 
@@ -456,39 +475,15 @@ lookupWithScopes name (scope : rest) =
     Just val -> Just val
     Nothing -> lookupWithScopes name rest
 
--- | Insert an already-forced value as a new scope level.
--- Creates a child env with a singleton Map — O(1) instead of
--- O(log n) Map.insert on the parent's (potentially large) Map.
-envInsert :: Text -> NixValue -> Env -> Env
-envInsert name val env =
+-- | Create a child env with positional slots (for lambda formals).
+-- Inherits with-scopes from the parent.
+envFromSlots :: [Thunk] -> Env -> Env
+envFromSlots slots parent =
   Env
-    { envBindings = Map.singleton name (Evaluated val),
+    { envSlots = slots,
       envLazyScope = Nothing,
-      envParent = Just env,
-      envWithScopes = envWithScopes env
-    }
-
--- | Insert a thunk as a new scope level.
-envInsertThunk :: Text -> Thunk -> Env -> Env
-envInsertThunk name thunk env =
-  Env
-    { envBindings = Map.singleton name thunk,
-      envLazyScope = Nothing,
-      envParent = Just env,
-      envWithScopes = envWithScopes env
-    }
-
--- | Batch-insert multiple bindings as a single scope level.
--- Creates ONE Env for all bindings instead of N singleton Envs.
--- Used by formal set matching: a function with N formals creates
--- one scope (one Map with N entries) instead of N scopes (N singleton Maps).
-envInsertMany :: Map Text Thunk -> Env -> Env
-envInsertMany bindings env =
-  Env
-    { envBindings = bindings,
-      envLazyScope = Nothing,
-      envParent = Just env,
-      envWithScopes = envWithScopes env
+      envParent = Just parent,
+      envWithScopes = envWithScopes parent
     }
 
 -- | Push a with-scope onto the scope chain (innermost position).
@@ -511,16 +506,16 @@ mkThunk env thunkExpr =
   ThunkRef (newMemoCell thunkExpr env)
 
 -- | Like 'mkThunk' but for synthetic thunks that reuse the same 'Expr'
--- (e.g. @EApp (EVar "__fn") (EVar "__arg")@ in 'deferApply').  Uses the
--- 'Env' bindings map for cell uniqueness instead of the expression, since
--- GHC's full-laziness transform would otherwise float the shared expr to
--- a CAF and all thunks would get the same IORef.
+-- (e.g. @EApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in 'deferApply').
+-- Uses the 'Env' slots list for cell uniqueness instead of the expression,
+-- since GHC's full-laziness transform would otherwise float the shared
+-- expr to a CAF and all thunks would get the same IORef.
 --
 -- Must only be called with freshly-constructed envs (not knot-tied
--- recursive envs), since it forces the bindings map to WHNF.
+-- recursive envs), since it forces the slots list to WHNF.
 mkSyntheticThunk :: Env -> Expr -> Thunk
 mkSyntheticThunk env thunkExpr =
-  ThunkRef (newSyntheticCell (envBindings env) thunkExpr env)
+  ThunkRef (newSyntheticCell (envSlots env) thunkExpr env)
 
 -- | Allocate a fresh memoization cell for a thunk.
 --
@@ -536,11 +531,11 @@ mkSyntheticThunk env thunkExpr =
 newMemoCell :: Expr -> Env -> IORef ThunkCell
 newMemoCell expr env = unsafePerformIO (expr `seq` newIORef (Pending expr env))
 
--- | Like 'newMemoCell' but keyed on a bindings map instead of an expression.
+-- | Like 'newMemoCell' but keyed on a slot list instead of an expression.
 -- Used by 'mkSyntheticThunk' where multiple thunks share the same expression.
 {-# NOINLINE newSyntheticCell #-}
-newSyntheticCell :: Map Text Thunk -> Expr -> Env -> IORef ThunkCell
-newSyntheticCell bindings expr env = unsafePerformIO (bindings `seq` newIORef (Pending expr env))
+newSyntheticCell :: [Thunk] -> Expr -> Env -> IORef ThunkCell
+newSyntheticCell slots expr env = unsafePerformIO (slots `seq` newIORef (Pending expr env))
 
 -- | Wrap an already-computed value as a thunk.
 evaluated :: NixValue -> Thunk

@@ -34,6 +34,7 @@ data-dir: data
 library
   exposed-modules:
     Nix.Expr
+    Nix.Expr.Resolve
     Nix.Expr.Types
     Nix.Parser
     Nix.Parser.Expr

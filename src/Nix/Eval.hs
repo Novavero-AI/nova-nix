@@ -111,10 +111,9 @@ import Nix.Eval.Types
     attrSetUnionWith,
     emptyContext,
     emptyEnv,
-    envInsert,
-    envInsertMany,
-    envInsertThunk,
+    envFromSlots,
     envLookup,
+    envLookupResolved,
     evaluated,
     mkStr,
     mkSyntheticThunk,
@@ -150,6 +149,7 @@ eval env expr = case expr of
   EStr parts -> uncurry VStr <$> evalStringParts eval force applyValue env parts
   EIndStr parts -> uncurry VStr <$> evalIndStringParts eval force applyValue env parts
   EVar name -> evalVar env name
+  EResolvedVar level idx -> force (envLookupResolved level idx env)
   EAttrs isRec bindings -> evalAttrs env isRec bindings
   EList exprs -> pure (VList (map (mkThunk env) exprs))
   ESelect target path defExpr -> evalSelect env target path defExpr
@@ -272,7 +272,7 @@ evalRecAttrs env bindings = do
   -- (already resolved), not from recEnv.
   let recEnv =
         Env
-          { envBindings = Map.empty,
+          { envSlots = [],
             envLazyScope = Just attrSet,
             envParent = Just env,
             envWithScopes = envWithScopes env
@@ -481,32 +481,36 @@ evalApp env funcExpr argExpr = do
     _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
 
 -- | Match function formals against an argument thunk.
+--
+-- Builds a positional slot list matching the indices assigned by
+-- 'Nix.Expr.Resolve':
+--
+-- * @FormalName n@ → @[argThunk]@
+-- * @FormalSet [a, b, c] _@ → @[aThunk, bThunk, cThunk]@
+-- * @FormalNamedSet n [a, b, c] _@ → @[argThunk, aThunk, bThunk, cThunk]@
 matchFormals :: (MonadEval m) => Env -> Formals -> Thunk -> m Env
-matchFormals closureEnv (FormalName name) argThunk =
-  pure (envInsertThunk name argThunk closureEnv)
+matchFormals closureEnv (FormalName _) argThunk =
+  pure (envFromSlots [argThunk] closureEnv)
 matchFormals closureEnv (FormalSet formals allowExtra) argThunk = do
   argVal <- force argThunk
-  matchFormalSet closureEnv formals allowExtra argVal
-matchFormals closureEnv (FormalNamedSet name formals allowExtra) argThunk = do
+  matchFormalSet closureEnv formals allowExtra argVal Nothing
+matchFormals closureEnv (FormalNamedSet _ formals allowExtra) argThunk = do
   argVal <- force argThunk
-  -- Bind the @-pattern name (e.g. "args") BEFORE matching formals so that
-  -- default expressions like @system ? args.system or ...@ can see it.
-  let envWithAt = envInsertThunk name argThunk closureEnv
-  matchFormalSet envWithAt formals allowExtra argVal
+  -- Pass the @-pattern thunk so it goes into slot 0 of the combined env.
+  matchFormalSet closureEnv formals allowExtra argVal (Just argThunk)
 
 -- | Match a formal set pattern against a VAttrs argument.
 --
--- All formals are batched into a SINGLE scope level (one Map, one Env)
--- instead of creating a separate singleton Env per formal.  This reduces
--- Env allocations from O(N) to O(1) per function call — critical for
--- nixpkgs where millions of function calls with 5–30 formals each were
--- creating 7M+ Env objects and 600+ MB of Map.Bin nodes.
+-- All formals are batched into a SINGLE scope level (one slot list)
+-- instead of creating a separate Map per formal.  This replaces
+-- Map.Bin nodes (48 bytes each) with list cons cells (16 bytes each)
+-- and eliminates Text key storage entirely.
 --
 -- Default expressions use formalEnv via knot-tying, so they can
 -- reference other formals — matching real Nix semantics where all
 -- formals are mutually visible (e.g. @{ a ? b, b ? 1 }: a@ yields 1).
-matchFormalSet :: (MonadEval m) => Env -> [Formal] -> Bool -> NixValue -> m Env
-matchFormalSet closureEnv formals allowExtra argVal =
+matchFormalSet :: (MonadEval m) => Env -> [Formal] -> Bool -> NixValue -> Maybe Thunk -> m Env
+matchFormalSet closureEnv formals allowExtra argVal atThunk =
   case argVal of
     VAttrs attrs -> do
       checkExtraKeys formals allowExtra attrs
@@ -516,12 +520,10 @@ matchFormalSet closureEnv formals allowExtra argVal =
       -- Batch all formal bindings into ONE scope level.
       -- Knot-tying: formalEnv is used in mkThunk for defaults,
       -- but mkThunk captures Env lazily (Pending !Expr Env).
-      let formalEnv = envInsertMany formalBindings closureEnv
-          formalBindings =
-            Map.fromList
-              [ (fName formal, resolveOneFormal formal)
-              | formal <- formals
-              ]
+      let formalEnv = envFromSlots formalSlots closureEnv
+          formalSlots = case atThunk of
+            Nothing -> map resolveOneFormal formals
+            Just at -> at : map resolveOneFormal formals
           resolveOneFormal (Formal name defExpr) =
             case attrSetLookup name attrs of
               Just thunk -> thunk
@@ -567,7 +569,7 @@ evalLet env bindings body = do
   resolvedBindings <- resolveBindingKeys env bindings
   let letEnv =
         Env
-          { envBindings = Map.empty,
+          { envSlots = [],
             envLazyScope = Just (LazyAttrs lazyBindingMap cache),
             envParent = Just env,
             envWithScopes = envWithScopes env
@@ -1274,9 +1276,10 @@ builtinGenList func (VInt n)
   | n < 0 = throwEvalError "builtins.genList: length must be non-negative"
   | otherwise =
       -- Lazy: each element is a deferred @f i@, forced only on demand.
+      -- Slot 0 = function.
       let fnThunk = evaluated func
-          env = Env {envBindings = Map.fromList [("__fn", fnThunk)], envLazyScope = Nothing, envParent = Nothing, envWithScopes = []}
-          mkIndexThunk i = mkThunk env (EApp (EVar "__fn") (ELit (NixInt i)))
+          env = Env {envSlots = [fnThunk], envLazyScope = Nothing, envParent = Nothing, envWithScopes = []}
+          mkIndexThunk i = mkThunk env (EApp (EResolvedVar 0 0) (ELit (NixInt i)))
        in pure (VList (map mkIndexThunk [0 .. n - 1]))
 builtinGenList _ other =
   throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
@@ -1508,21 +1511,23 @@ builtinSubstring _ _ other =
 
 -- | Build a thunk that defers @f arg@ — the application only happens when
 -- the thunk is forced.  Reuses the existing eval machinery via a synthetic
--- @EApp (EVar "__fn") (EVar "__arg")@ in a self-contained env.
+-- @EApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in a self-contained env.
+-- Slot 0 = function, slot 1 = argument.
 deferApply :: NixValue -> Thunk -> Thunk
 deferApply func argThunk =
   let env =
         Env
-          { envBindings =
-              Map.fromList
-                [ ("__fn", evaluated func),
-                  ("__arg", argThunk)
-                ],
+          { envSlots = [evaluated func, argThunk],
             envLazyScope = Nothing,
             envParent = Nothing,
             envWithScopes = []
           }
-   in mkSyntheticThunk env (EApp (EVar "__fn") (EVar "__arg"))
+   in mkSyntheticThunk env deferApplyExpr
+
+-- | Shared expression for 'deferApply'.  Allocated once as a CAF.
+deferApplyExpr :: Expr
+deferApplyExpr = EApp (EResolvedVar 0 0) (EResolvedVar 0 1)
+{-# NOINLINE deferApplyExpr #-}
 
 -- | Permissive coercion used by @builtins.toString@.
 --
@@ -1815,24 +1820,25 @@ builtinMapAttrs func (VAttrs attrs) =
   -- Lazy: each attr value is a deferred @f key val@, forced only on demand.
   -- Uses attrSetMapWithKeyLazy to avoid materializing all bindings in
   -- LazyAttrs — each entry stays as a PreBuilt recipe until accessed.
+  -- Slot 0 = function, slot 1 = key, slot 2 = value.
   pure (VAttrs (attrSetMapWithKeyLazy deferAttr attrs))
   where
     deferAttr key valThunk =
       let env =
             Env
-              { envBindings =
-                  Map.fromList
-                    [ ("__fn", evaluated func),
-                      ("__key", evaluated (mkStr key)),
-                      ("__val", valThunk)
-                    ],
+              { envSlots = [evaluated func, evaluated (mkStr key), valThunk],
                 envLazyScope = Nothing,
                 envParent = Nothing,
                 envWithScopes = []
               }
-       in mkSyntheticThunk env (EApp (EApp (EVar "__fn") (EVar "__key")) (EVar "__val"))
+       in mkSyntheticThunk env mapAttrsExpr
 builtinMapAttrs _ other =
   throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
+
+-- | Shared expression for 'builtinMapAttrs'.  Allocated once as a CAF.
+mapAttrsExpr :: Expr
+mapAttrsExpr = EApp (EApp (EResolvedVar 0 0) (EResolvedVar 0 1)) (EResolvedVar 0 2)
+{-# NOINLINE mapAttrsExpr #-}
 
 builtinFunctionArgs :: (MonadEval m) => NixValue -> m NixValue
 builtinFunctionArgs (VLambda _ formals _) = pure (formalsToAttrs formals)
@@ -1863,9 +1869,17 @@ formalsListToAttrs formals =
 -- the original function.  The function is captured in the closure env.
 builtinSetFunctionArgs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSetFunctionArgs func (VAttrs argSpec) =
-  let closureEnv = envInsert "__fn" func emptyEnv
+  -- Closure env holds the function at slot 0.  The __functor lambda
+  -- body is EResolvedVar 1 0: level 1 (past _self's slot), index 0.
+  let closureEnv =
+        Env
+          { envSlots = [evaluated func],
+            envLazyScope = Nothing,
+            envParent = Nothing,
+            envWithScopes = []
+          }
       -- __functor = self: __fn  (ignores self, returns the original function)
-      functorLambda = VLambda closureEnv (FormalName "_self") (EVar "__fn")
+      functorLambda = VLambda closureEnv (FormalName "_self") (EResolvedVar 1 0)
    in pure $
         VAttrs $
           attrSetFromMap $

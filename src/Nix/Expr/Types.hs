@@ -151,4 +151,9 @@ data Expr
     EBinary !BinaryOp !Expr !Expr
   | -- | Search path lookup: @\<nixpkgs\>@ is @ESearchPath "nixpkgs"@.
     ESearchPath !Text
+  | -- | De Bruijn-style resolved variable: @(level, index)@.
+    -- Produced by 'Nix.Expr.Resolve.resolveVars' for variables
+    -- bound by lambda formals.  @level@ counts parent-chain hops;
+    -- @index@ is the positional slot within that env's 'envSlots'.
+    EResolvedVar !Int !Int
   deriving (Eq, Show)

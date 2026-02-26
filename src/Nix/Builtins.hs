@@ -36,17 +36,19 @@ import Nix.Store.Path (defaultStoreDirText)
 builtinEnv :: Integer -> [Thunk] -> Env
 builtinEnv timestamp searchPaths =
   Env
-    { envBindings =
-        Map.fromList $
-          -- Values
-          [ ("true", evaluated (VBool True)),
-            ("false", evaluated (VBool False)),
-            ("null", evaluated VNull),
-            ("builtins", evaluated (builtinsAttrSet timestamp searchPaths))
-          ]
-            -- Top-level builtin functions (available without builtins. prefix)
-            ++ map topLevelBuiltin topLevelBuiltinNames,
-      envLazyScope = Nothing,
+    { envSlots = [],
+      envLazyScope =
+        Just $
+          attrSetFromMap $
+            Map.fromList $
+              -- Values
+              [ ("true", evaluated (VBool True)),
+                ("false", evaluated (VBool False)),
+                ("null", evaluated VNull),
+                ("builtins", evaluated (builtinsAttrSet timestamp searchPaths))
+              ]
+                -- Top-level builtin functions (available without builtins. prefix)
+                ++ map topLevelBuiltin topLevelBuiltinNames,
       envParent = Nothing,
       envWithScopes = []
     }
@@ -83,7 +85,7 @@ builtinEnvWithScope :: Integer -> [Thunk] -> [(Text, Thunk)] -> Env
 builtinEnvWithScope timestamp searchPaths scope =
   let base = builtinEnv timestamp searchPaths
       scopeMap = Map.fromList scope
-   in Env {envBindings = scopeMap, envLazyScope = Nothing, envParent = Just base, envWithScopes = []}
+   in Env {envSlots = [], envLazyScope = Just (attrSetFromMap scopeMap), envParent = Just base, envWithScopes = []}
 
 -- | The @builtins@ attribute set, derived from the central registry.
 builtinsAttrSet :: Integer -> [Thunk] -> NixValue

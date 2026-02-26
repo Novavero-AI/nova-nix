@@ -214,7 +214,7 @@ testEvalLiterals = do
   putStrLn "eval/literals"
   sequence
     [ runTest "empty env" $
-        assertEqual "emptyEnv" 0 (length (envBindings emptyEnv)),
+        assertEqual "emptyEnv" 0 (length (envSlots emptyEnv)),
       runTest "int" $
         assertEval "int" "42" (VInt 42),
       runTest "float" $
@@ -802,15 +802,18 @@ testParserExprs = do
           "a // b // c"
           (EBinary OpUpdate (EVar "a") (EBinary OpUpdate (EVar "b") (EVar "c"))),
       -- Lambda
+      -- After variable resolution, lambda-bound vars become EResolvedVar.
+      -- FormalName "x" → slot 0; FormalSet [a,b] → a=0, b=1;
+      -- FormalNamedSet "args" [a] → args=0, a=1.
       runTest "parse simple lambda" $
-        assertParse "lambda" "x: x" (ELambda (FormalName "x") (EVar "x")),
+        assertParse "lambda" "x: x" (ELambda (FormalName "x") (EResolvedVar 0 0)),
       runTest "parse set pattern lambda" $
         assertParse
           "set pattern"
           "{ a, b }: a"
           ( ELambda
               (FormalSet [Formal "a" Nothing, Formal "b" Nothing] False)
-              (EVar "a")
+              (EResolvedVar 0 0)
           ),
       runTest "parse set pattern with defaults" $
         assertParse
@@ -818,7 +821,7 @@ testParserExprs = do
           "{ a ? 1 }: a"
           ( ELambda
               (FormalSet [Formal "a" (Just (ELit (NixInt 1)))] False)
-              (EVar "a")
+              (EResolvedVar 0 0)
           ),
       runTest "parse set pattern with ellipsis" $
         assertParse
@@ -826,7 +829,7 @@ testParserExprs = do
           "{ a, ... }: a"
           ( ELambda
               (FormalSet [Formal "a" Nothing] True)
-              (EVar "a")
+              (EResolvedVar 0 0)
           ),
       runTest "parse named set pattern (name@{...})" $
         assertParse
@@ -834,7 +837,7 @@ testParserExprs = do
           "args@{ a }: a"
           ( ELambda
               (FormalNamedSet "args" [Formal "a" Nothing] False)
-              (EVar "a")
+              (EResolvedVar 0 1)
           ),
       runTest "parse named set pattern ({...}@name)" $
         assertParse
@@ -842,7 +845,7 @@ testParserExprs = do
           "{ a }@args: a"
           ( ELambda
               (FormalNamedSet "args" [Formal "a" Nothing] False)
-              (EVar "a")
+              (EResolvedVar 0 1)
           ),
       -- Application
       runTest "parse application" $
