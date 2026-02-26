@@ -24,6 +24,8 @@ module Nix.Eval.Types
     attrSetElems,
     attrSetToAscList,
     attrSetMapWithKey,
+    attrSetMapWithKeyLazy,
+    attrSetRemoveKeys,
     attrSetUnionWith,
     newLazyAttrCache,
 
@@ -59,6 +61,7 @@ where
 
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -316,6 +319,27 @@ attrSetToAscList = Map.toAscList . attrSetToMap
 -- | Map a function over all key-value pairs (materializes lazy sets).
 attrSetMapWithKey :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
 attrSetMapWithKey f attrs = EagerAttrs (Map.mapWithKey f (attrSetToMap attrs))
+
+-- | Like 'attrSetMapWithKey' but preserves laziness for 'LazyAttrs'.
+-- Each binding is wrapped in 'PreBuilt' so that materialization (IORef
+-- allocation) only happens when a specific key is accessed.  This avoids
+-- ~30k IORef allocations when @mapAttrs@ is applied to a large set (e.g.
+-- nixpkgs overlays) and only a few keys are actually demanded.
+attrSetMapWithKeyLazy :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
+attrSetMapWithKeyLazy f (EagerAttrs m) = EagerAttrs (Map.mapWithKey f m)
+attrSetMapWithKeyLazy f (LazyAttrs bindings _cache) =
+  let mapped = Map.mapWithKey (\k recipe -> PreBuilt (f k (materializeBinding k recipe))) bindings
+   in LazyAttrs mapped (newLazyAttrCache mapped)
+
+-- | Remove a list of keys from an attribute set without materializing
+-- 'LazyAttrs'.  For 'EagerAttrs', deletes from the map directly.
+-- For 'LazyAttrs', deletes from the binding map and creates a fresh cache.
+attrSetRemoveKeys :: [Text] -> AttrSet -> AttrSet
+attrSetRemoveKeys keys (EagerAttrs m) =
+  EagerAttrs (foldl' (flip Map.delete) m keys)
+attrSetRemoveKeys keys (LazyAttrs bindings _cache) =
+  let newBindings = foldl' (flip Map.delete) bindings keys
+   in LazyAttrs newBindings (newLazyAttrCache newBindings)
 
 -- | Union two attribute sets with a combining function (materializes both).
 attrSetUnionWith :: (Thunk -> Thunk -> Thunk) -> AttrSet -> AttrSet -> AttrSet

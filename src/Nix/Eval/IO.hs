@@ -41,7 +41,7 @@ import qualified Data.Text.IO as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
-import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..), ThunkCell (..))
+import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..), ThunkCell (..), attrSetSize)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix)
@@ -169,7 +169,15 @@ instance MonadEval EvalIO where
                         (unEvalIO (eval (builtinEnv timestamp searchPaths) expr))
                     )
             result <- nested
-            wrapIO (modifyIORef' cacheRef (Map.insert target result))
+            -- Skip caching very large attr sets (e.g. all-packages.nix
+            -- with 30k+ entries) so GC can reclaim them.  nixpkgs only
+            -- imports all-packages.nix once at the top level, so skipping
+            -- the cache for it has zero performance cost.
+            let shouldCache = case result of
+                  VAttrs attrs -> attrSetSize attrs < importCacheMaxAttrs
+                  _ -> True
+            when shouldCache $
+              wrapIO (modifyIORef' cacheRef (Map.insert target result))
             pure result
 
   getEnvVar name = wrapIO $ do
@@ -269,6 +277,16 @@ instance MonadEval EvalIO where
         val <- evalFn env expr
         EvalIO (liftIO (writeIORef ref (Computed val)))
         pure val
+
+-- ---------------------------------------------------------------------------
+-- Constants
+-- ---------------------------------------------------------------------------
+
+-- | Maximum attribute set size for import caching.  Results larger than this
+-- are not cached, allowing GC to reclaim them.  Prevents the import cache
+-- from retaining huge attr sets like nixpkgs' 30k-entry all-packages.nix.
+importCacheMaxAttrs :: Int
+importCacheMaxAttrs = 1000
 
 -- ---------------------------------------------------------------------------
 -- Helpers

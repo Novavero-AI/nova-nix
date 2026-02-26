@@ -27,6 +27,7 @@ module Nix.Eval
     attrSetMember,
     attrSetElems,
     attrSetNull,
+    attrSetRemoveKeys,
     attrSetSize,
 
     -- * String context (re-exported from Types)
@@ -98,9 +99,10 @@ import Nix.Eval.Types
     attrSetFromMap,
     attrSetKeys,
     attrSetLookup,
-    attrSetMapWithKey,
+    attrSetMapWithKeyLazy,
     attrSetMember,
     attrSetNull,
+    attrSetRemoveKeys,
     attrSetSize,
     attrSetToAscList,
     attrSetToMap,
@@ -1201,8 +1203,7 @@ builtinGetAttr other _ =
 builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinRemoveAttrs (VAttrs attrs) (VList thunks) = do
   keys <- mapM forceToString thunks
-  let m = attrSetToMap attrs
-  pure (VAttrs (attrSetFromMap (foldl' (flip Map.delete) m keys)))
+  pure (VAttrs (attrSetRemoveKeys keys attrs))
   where
     forceToString thunk = do
       val <- force thunk
@@ -1822,7 +1823,9 @@ builtinBitXor _ _ = throwEvalError "builtins.bitXor: expected two integers"
 builtinMapAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMapAttrs func (VAttrs attrs) =
   -- Lazy: each attr value is a deferred @f key val@, forced only on demand.
-  pure (VAttrs (attrSetMapWithKey deferAttr attrs))
+  -- Uses attrSetMapWithKeyLazy to avoid materializing all bindings in
+  -- LazyAttrs — each entry stays as a PreBuilt recipe until accessed.
+  pure (VAttrs (attrSetMapWithKeyLazy deferAttr attrs))
   where
     deferAttr key valThunk =
       let env =
@@ -2708,8 +2711,11 @@ builtinDerivation (VAttrs attrs) = do
         VList thunks -> mapM forceToText thunks
         _ -> throwEvalError "derivation: 'args' must be a list of strings"
 
+  -- Materialize once, reuse for both env collection and result merge
+  let materialized = attrSetToMap attrs
+
   -- Collect all string-coercible attrs into env WITH their contexts
-  (drvEnvPairs, envContext) <- collectDrvEnvWithContext (attrSetToMap attrs)
+  (drvEnvPairs, envContext) <- collectDrvEnvWithContext materialized
 
   -- Extract input derivations and input sources from the merged context
   let inputDrvs = extractInputDrvs envContext
@@ -2789,7 +2795,7 @@ builtinDerivation (VAttrs attrs) = do
           ]
             ++ [(outName, evaluated (VStr outP (outPathCtx outName))) | (outName, outP) <- outPaths]
       -- Merge original attrs underneath so computed attrs take priority
-      resultAttrs = Map.union baseAttrs (attrSetToMap attrs)
+      resultAttrs = Map.union baseAttrs materialized
 
   pure (VAttrs (attrSetFromMap resultAttrs))
 builtinDerivation other =
