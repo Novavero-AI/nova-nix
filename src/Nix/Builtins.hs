@@ -46,6 +46,7 @@ builtinEnv timestamp searchPaths =
           ]
             -- Top-level builtin functions (available without builtins. prefix)
             ++ map topLevelBuiltin topLevelBuiltinNames,
+      envLazyScope = Nothing,
       envParent = Nothing,
       envWithScopes = []
     }
@@ -82,7 +83,7 @@ builtinEnvWithScope :: Integer -> [Thunk] -> [(Text, Thunk)] -> Env
 builtinEnvWithScope timestamp searchPaths scope =
   let base = builtinEnv timestamp searchPaths
       scopeMap = Map.fromList scope
-   in Env {envBindings = scopeMap, envParent = Just base, envWithScopes = []}
+   in Env {envBindings = scopeMap, envLazyScope = Nothing, envParent = Just base, envWithScopes = []}
 
 -- | The @builtins@ attribute set, derived from the central registry.
 builtinsAttrSet :: Integer -> [Thunk] -> NixValue

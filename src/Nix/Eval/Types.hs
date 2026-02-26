@@ -391,6 +391,11 @@ newLazyAttrCache bindings = unsafePerformIO (bindings `seq` newIORef Map.empty)
 data Env = Env
   { -- | Local lexical bindings at this scope level.
     envBindings :: !(Map Text Thunk),
+    -- | Lazy scope shared with a 'LazyAttrs' attr set.
+    -- For rec {} and let, this points to the SAME 'LazyAttrs' that
+    -- backs the resulting attr set — one map instead of two.
+    -- Variable lookup checks this after 'envBindings', before parent.
+    envLazyScope :: !(Maybe AttrSet),
     -- | Parent scope (Nothing at the root).  LAZY for knot-tying
     -- in rec {} where recEnv's parent is the outer env.
     envParent :: !(Maybe Env),
@@ -403,14 +408,15 @@ data Env = Env
 -- Ignores parent chain to avoid diverging on deep/recursive envs.
 -- Only used in tests on non-recursive structures.
 instance Eq Env where
-  Env b1 _ w1 == Env b2 _ w2 = b1 == b2 && w1 == w2
+  Env b1 _ _ w1 == Env b2 _ _ w2 = b1 == b2 && w1 == w2
 
 -- | Compact show: just the size and structure, not the full contents.
 instance Show Env where
-  show (Env bindings parent withs) =
+  show (Env bindings lazyScope parent withs) =
     "Env{"
       ++ show (Map.size bindings)
       ++ " local"
+      ++ maybe "" (const ", lazyScope") lazyScope
       ++ maybe "" (const ", parent") parent
       ++ ", "
       ++ show (length withs)
@@ -418,7 +424,7 @@ instance Show Env where
 
 -- | Empty environment (no variables in scope).
 emptyEnv :: Env
-emptyEnv = Env Map.empty Nothing []
+emptyEnv = Env Map.empty Nothing Nothing []
 
 -- | Look up a variable: walk the parent chain checking lexical
 -- bindings at each level; fall back to with-scopes (from the
@@ -429,12 +435,16 @@ envLookup name env = lexicalLookup env
     -- With-scopes from the STARTING env: these are the most recent
     -- and subsume all ancestor with-scopes (children inherit them).
     withs = envWithScopes env
-    lexicalLookup (Env bindings parent _) =
+    lexicalLookup (Env bindings lazyScope parent _) =
       case Map.lookup name bindings of
         Just val -> Just val
-        Nothing -> case parent of
-          Just p -> lexicalLookup p
-          Nothing -> lookupWithScopes name withs
+        Nothing -> case lazyScope of
+          Just scope -> case attrSetLookup name scope of
+            Just val -> Just val
+            Nothing -> goParent parent
+          Nothing -> goParent parent
+    goParent (Just p) = lexicalLookup p
+    goParent Nothing = lookupWithScopes name withs
 
 -- | Walk with-scopes innermost to outermost.
 -- Uses 'attrSetLookup' so that 'LazyAttrs' with-scopes only
@@ -453,6 +463,7 @@ envInsert :: Text -> NixValue -> Env -> Env
 envInsert name val env =
   Env
     { envBindings = Map.singleton name (Evaluated val),
+      envLazyScope = Nothing,
       envParent = Just env,
       envWithScopes = envWithScopes env
     }
@@ -462,6 +473,7 @@ envInsertThunk :: Text -> Thunk -> Env -> Env
 envInsertThunk name thunk env =
   Env
     { envBindings = Map.singleton name thunk,
+      envLazyScope = Nothing,
       envParent = Just env,
       envWithScopes = envWithScopes env
     }
@@ -474,6 +486,7 @@ envInsertMany :: Map Text Thunk -> Env -> Env
 envInsertMany bindings env =
   Env
     { envBindings = bindings,
+      envLazyScope = Nothing,
       envParent = Just env,
       envWithScopes = envWithScopes env
     }

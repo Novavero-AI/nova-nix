@@ -72,7 +72,6 @@ import qualified Data.ByteString as BS
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, isOctDigit, ord)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.List (find, foldl')
-import qualified Data.Map.Lazy as MapL
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
@@ -256,33 +255,32 @@ evalNonRecAttrs env bindings = do
 -- Uses 'LazyAttrs' to defer thunk + IORef allocation: only keys that
 -- are actually accessed get materialized.  For nixpkgs' 30k-entry
 -- package set, this avoids ~30k IORef allocations when only ~50
--- packages are touched.  The env uses Data.Map.Lazy to similarly
--- defer thunk construction for variable lookups within the rec set.
+-- packages are touched.
+--
+-- The env's 'envLazyScope' points to the SAME 'LazyAttrs' that backs
+-- the resulting attr set — one map instead of two.  Variable lookup
+-- and attr set access share a single materialization cache, eliminating
+-- the dual-map space leak where both a lazy Thunk map and a LazyBinding
+-- map retained the entire recursive environment.
 evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
 evalRecAttrs env bindings = do
   -- Resolve dynamic keys eagerly against the outer env.
   resolvedBindings <- resolveBindingKeys env bindings
-  -- Knot-tied: recEnv references recBindings which captures recEnv.
-  -- Lazy-valued map for env bindings — uses Data.Map.Lazy so thunks
-  -- are stored as unevaluated closures, deferring IORef allocation
-  -- until the variable is actually looked up.
-  -- Scope chain: recEnv has rec bindings locally, outer env as parent.
-  -- Avoids O(n) MapL.union on the 30k-entry nixpkgs set — parent
-  -- pointer means outer bindings are shared, not copied.
+  -- Knot-tied: recEnv references attrSet (via envLazyScope) which
+  -- references lazyBindingMap which captures recEnv lazily inside
+  -- each LazyBinding.  The map structure is built from resolvedBindings
+  -- (already resolved), not from recEnv.
   let recEnv =
         Env
-          { envBindings = recBindings,
+          { envBindings = Map.empty,
+            envLazyScope = Just attrSet,
             envParent = Just env,
             envWithScopes = envWithScopes env
           }
-      -- INTENTIONALLY uses Data.Map.Lazy operations to defer thunk
-      -- construction.  Each map value is a closure that allocates
-      -- a Thunk + IORef only when forced by variable lookup.
-      recBindings = buildResolvedBindingsMapLazy recEnv resolvedBindings
-      -- Build per-key lazy binding recipes for the LazyAttrs.
       lazyBindingMap = buildLazyBindingMap recEnv resolvedBindings
       cache = newLazyAttrCache lazyBindingMap
-  pure (VAttrs (LazyAttrs lazyBindingMap cache))
+      attrSet = LazyAttrs lazyBindingMap cache
+  pure (VAttrs attrSet)
 
 -- ---------------------------------------------------------------------------
 -- Resolved bindings (for knot-tying in rec {} and let)
@@ -314,38 +312,6 @@ resolveBindingKeys keyEnv = fmap catMaybes . mapM resolveOne
       pure (Just (ResolvedInherit names))
     resolveOne (Inherit (Just fromExpr) names) =
       pure (Just (ResolvedInheritFrom fromExpr names))
-
--- | Like 'buildResolvedBindingsMap' but uses 'Data.Map.Lazy' operations
--- so that thunk values are stored as unevaluated closures.  This defers
--- 'mkThunk' + IORef allocation until the key is actually accessed.
--- Used by 'evalRecAttrs' and 'evalLet' for the env bindings.
-buildResolvedBindingsMapLazy :: Env -> [ResolvedBinding] -> Map Text Thunk
-buildResolvedBindingsMapLazy thunkEnv =
-  foldl' mergeBindingLazy MapL.empty
-  where
-    mergeBindingLazy current binding =
-      MapL.unionWith mergeThunks current (processResolvedLazy thunkEnv binding)
-
--- | Like 'processResolved' but uses 'Data.Map.Lazy' operations
--- to avoid forcing thunk values on map insertion.
-processResolvedLazy :: Env -> ResolvedBinding -> Map Text Thunk
-processResolvedLazy thunkEnv (ResolvedNamed path bodyExpr) =
-  buildResolvedNestedAttrLazy thunkEnv path bodyExpr
-processResolvedLazy lookupEnv (ResolvedInherit names) =
-  MapL.fromList [(n, inheritLookup lookupEnv n) | n <- names]
-processResolvedLazy thunkEnv (ResolvedInheritFrom fromExpr names) =
-  MapL.fromList
-    [ (n, mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))
-    | n <- names
-    ]
-
--- | Like 'buildResolvedNestedAttr' but uses 'Data.Map.Lazy' operations.
-buildResolvedNestedAttrLazy :: Env -> [Text] -> Expr -> Map Text Thunk
-buildResolvedNestedAttrLazy _thunkEnv [] _bodyExpr = Map.empty
-buildResolvedNestedAttrLazy thunkEnv [key] bodyExpr =
-  MapL.singleton key (mkThunk thunkEnv bodyExpr)
-buildResolvedNestedAttrLazy thunkEnv (key : rest) bodyExpr =
-  MapL.singleton key (evaluated (VAttrs (attrSetFromMap (buildResolvedNestedAttrLazy thunkEnv rest bodyExpr))))
 
 -- | Build per-key lazy binding recipes from resolved bindings.
 -- Simple @key = expr@ bindings become 'LazyExpr' (deferred thunk
@@ -594,20 +560,20 @@ checkMissingFormals attrs formals =
 -- Dynamic keys in let evaluate against the outer env (the let env
 -- is not yet available during key resolution).
 --
--- Uses Data.Map.Lazy for env bindings to defer thunk construction.
+-- Uses 'envLazyScope' to share the same 'LazyAttrs' as evalRecAttrs,
+-- eliminating the dual-map space leak.
 evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> m NixValue
 evalLet env bindings body = do
   resolvedBindings <- resolveBindingKeys env bindings
-  -- Scope chain: let bindings as local scope, outer env as parent.
   let letEnv =
         Env
-          { envBindings = letBindings,
+          { envBindings = Map.empty,
+            envLazyScope = Just (LazyAttrs lazyBindingMap cache),
             envParent = Just env,
             envWithScopes = envWithScopes env
           }
-      -- INTENTIONALLY uses Data.Map.Lazy operations to defer thunk
-      -- construction, matching evalRecAttrs.
-      letBindings = buildResolvedBindingsMapLazy letEnv resolvedBindings
+      lazyBindingMap = buildLazyBindingMap letEnv resolvedBindings
+      cache = newLazyAttrCache lazyBindingMap
   eval letEnv body
 
 evalIf :: (MonadEval m) => Env -> Expr -> Expr -> Expr -> m NixValue
@@ -1309,7 +1275,7 @@ builtinGenList func (VInt n)
   | otherwise =
       -- Lazy: each element is a deferred @f i@, forced only on demand.
       let fnThunk = evaluated func
-          env = Env {envBindings = Map.fromList [("__fn", fnThunk)], envParent = Nothing, envWithScopes = []}
+          env = Env {envBindings = Map.fromList [("__fn", fnThunk)], envLazyScope = Nothing, envParent = Nothing, envWithScopes = []}
           mkIndexThunk i = mkThunk env (EApp (EVar "__fn") (ELit (NixInt i)))
        in pure (VList (map mkIndexThunk [0 .. n - 1]))
 builtinGenList _ other =
@@ -1552,6 +1518,7 @@ deferApply func argThunk =
                 [ ("__fn", evaluated func),
                   ("__arg", argThunk)
                 ],
+            envLazyScope = Nothing,
             envParent = Nothing,
             envWithScopes = []
           }
@@ -1859,6 +1826,7 @@ builtinMapAttrs func (VAttrs attrs) =
                       ("__key", evaluated (mkStr key)),
                       ("__val", valThunk)
                     ],
+                envLazyScope = Nothing,
                 envParent = Nothing,
                 envWithScopes = []
               }
