@@ -18,10 +18,6 @@ module Nix.Parser.Internal
     match,
     tryParser,
     pMany,
-    pSome,
-    sepBy,
-    sepBy1,
-    pOptional,
     atEnd,
 
     -- * Specific expects
@@ -29,9 +25,9 @@ module Nix.Parser.Internal
 
     -- * Errors
     parseError,
-    unexpectedEOF,
-    expectedButGot,
-    currentPos,
+
+    -- * Token display
+    showToken,
   )
 where
 
@@ -72,12 +68,6 @@ instance Monad Parser where
 -- | Run a parser on a token list.
 runParser :: Parser a -> ParseState -> Either ParseError (a, ParseState)
 runParser = unParser
-
--- | Get current position for error messages.
-currentPos :: Parser (Int, Int)
-currentPos = Parser $ \st -> case psTokens st of
-  (Located ln col _ : _) -> Right ((ln, col), st)
-  [] -> Right ((0, 0), st)
 
 -- | Peek at the next token without consuming it.
 peek :: Parser Token
@@ -143,34 +133,6 @@ pMany p = go []
         Nothing -> pure (reverse acc)
         Just val -> go (val : acc)
 
--- | Parse one or more occurrences.
-pSome :: Parser a -> Parser [a]
-pSome p = do
-  first <- p
-  rest <- pMany p
-  pure (first : rest)
-
--- | Parse zero or more separated by a delimiter token.
-sepBy :: Parser a -> Token -> Parser [a]
-sepBy p sep = do
-  result <- tryParser p
-  case result of
-    Nothing -> pure []
-    Just first -> do
-      rest <- pMany (expect sep >> p)
-      pure (first : rest)
-
--- | Parse one or more separated by a delimiter token.
-sepBy1 :: Parser a -> Token -> Parser [a]
-sepBy1 p sep = do
-  first <- p
-  rest <- pMany (expect sep >> p)
-  pure (first : rest)
-
--- | Optionally parse something.
-pOptional :: Parser a -> Parser (Maybe a)
-pOptional = tryParser
-
 -- | Check if we've consumed all tokens.
 atEnd :: Parser Bool
 atEnd = Parser $ \st -> case psTokens st of
@@ -184,37 +146,6 @@ parseError msg = Parser $ \st -> case psTokens st of
   (Located ln col _ : _) ->
     Left ParseError {peFile = psFile st, peLine = ln, peCol = col, peMessage = msg}
   [] -> Left (makeEOF st)
-
--- | Raise an "unexpected end of input" error.
-unexpectedEOF :: Text -> Parser a
-unexpectedEOF ctx = Parser $ \st ->
-  Left
-    ParseError
-      { peFile = psFile st,
-        peLine = 0,
-        peCol = 0,
-        peMessage = "unexpected end of input in " <> ctx
-      }
-
--- | Raise an "expected X but got Y" error.
-expectedButGot :: Text -> Token -> Parser a
-expectedButGot expected tok = Parser $ \st -> case psTokens st of
-  (Located ln col _ : _) ->
-    Left
-      ParseError
-        { peFile = psFile st,
-          peLine = ln,
-          peCol = col,
-          peMessage = "expected " <> expected <> " but got " <> showToken tok
-        }
-  [] ->
-    Left
-      ParseError
-        { peFile = psFile st,
-          peLine = 0,
-          peCol = 0,
-          peMessage = "expected " <> expected <> " but got end of input"
-        }
 
 -- | Consume and return an identifier, or fail.
 expectIdent :: Parser Text

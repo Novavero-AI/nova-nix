@@ -114,7 +114,6 @@ stripLeadingNewline t = case T.uncons t of
 
 -- | Drop a single trailing newline.
 stripTrailingNewline :: Text -> Text
-stripTrailingNewline t
-  | T.null t = t
-  | T.last t == '\n' = T.init t
-  | otherwise = t
+stripTrailingNewline t = case T.unsnoc t of
+  Just (prefix, '\n') -> prefix
+  _ -> t

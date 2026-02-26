@@ -215,24 +215,27 @@ evalUpdate left right =
 
 -- | Merge two 'AttrSet's, right-biased.  Keeps 'LazyAttrs' lazy
 -- when possible — avoids materializing 30k thunks for @big // small@.
+-- Each 'LazyBinding' carries its own env, so merging sets from
+-- different scopes is safe — no env confusion.
 mergeAttrSets :: AttrSet -> AttrSet -> AttrSet
 -- LazyAttrs // EagerAttrs: override binding recipes with pre-built thunks
-mergeAttrSets (LazyAttrs env bindings _cache) (EagerAttrs small) =
+mergeAttrSets (LazyAttrs bindings _cache) (EagerAttrs small) =
   let overrides = Map.map PreBuilt small
       merged = Map.union overrides bindings -- overrides shadow originals
       newCache = newLazyAttrCache merged
-   in LazyAttrs env merged newCache
+   in LazyAttrs merged newCache
 -- EagerAttrs // LazyAttrs: lazy set wins on conflicts, eager fills gaps
-mergeAttrSets (EagerAttrs small) (LazyAttrs env bindings _cache) =
+mergeAttrSets (EagerAttrs small) (LazyAttrs bindings _cache) =
   let fallbacks = Map.map PreBuilt small
       merged = Map.union bindings fallbacks -- LazyAttrs keys win
       newCache = newLazyAttrCache merged
-   in LazyAttrs env merged newCache
--- LazyAttrs // LazyAttrs: merge binding maps, right wins
-mergeAttrSets (LazyAttrs _ leftBindings _) (LazyAttrs env rightBindings _) =
+   in LazyAttrs merged newCache
+-- LazyAttrs // LazyAttrs: merge binding maps, right wins.
+-- Safe because each LazyBinding carries its own env.
+mergeAttrSets (LazyAttrs leftBindings _) (LazyAttrs rightBindings _) =
   let merged = Map.union rightBindings leftBindings -- right wins
       newCache = newLazyAttrCache merged
-   in LazyAttrs env merged newCache
+   in LazyAttrs merged newCache
 -- EagerAttrs // EagerAttrs: standard Map.union
 mergeAttrSets (EagerAttrs as) (EagerAttrs bs) =
   EagerAttrs (Map.union bs as) -- right-biased: bs shadows as

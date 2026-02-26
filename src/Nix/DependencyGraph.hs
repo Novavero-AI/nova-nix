@@ -87,10 +87,10 @@ buildDepGraph readDrv rootDrv rootPath =
                       dnDerivation = drv,
                       dnDeps = deps
                     }
-                visited' = Map.insert sp node visited
-             in case resolveNewDeps readDrv visited' deps of
+                visitedWithNode = Map.insert sp node visited
+             in case resolveNewDeps readDrv visitedWithNode deps of
                   Left err -> Left err
-                  Right newItems -> go visited' (foldl' (|>) rest newItems)
+                  Right newItems -> go visitedWithNode (foldl' (|>) rest newItems)
 
 -- | Resolve unvisited dependencies by reading their .drv files.
 resolveNewDeps ::
@@ -159,9 +159,9 @@ kahnLoop reverseAdj depCount queue sorted sortedCount totalNodes =
     Seq.EmptyL -> TopoSorted (reverse sorted) -- unreachable, guarded above
     sp Seq.:< rest ->
       let dependents = fromMaybe [] (Map.lookup sp reverseAdj)
-          (depCount', newZero) = decrementDependents depCount dependents
-          queue' = foldl' (|>) rest newZero
-       in kahnLoop reverseAdj depCount' queue' (sp : sorted) (sortedCount + 1) totalNodes
+          (updatedDepCount, newZero) = decrementDependents depCount dependents
+          extendedQueue = foldl' (|>) rest newZero
+       in kahnLoop reverseAdj updatedDepCount extendedQueue (sp : sorted) (sortedCount + 1) totalNodes
 
 -- | Decrement in-degree for each dependent; collect any that reach zero.
 decrementDependents :: Map StorePath Int -> [StorePath] -> (Map StorePath Int, [StorePath])
@@ -169,10 +169,10 @@ decrementDependents dc = foldl' step (dc, [])
   where
     step (counts, zeros) dep =
       let newDeg = maybe 0 (subtract 1) (Map.lookup dep counts)
-          counts' = Map.insert dep newDeg counts
+          updatedCounts = Map.insert dep newDeg counts
        in if newDeg == 0
-            then (counts', dep : zeros)
-            else (counts', zeros)
+            then (updatedCounts, dep : zeros)
+            else (updatedCounts, zeros)
 
 -- ---------------------------------------------------------------------------
 -- Queries
@@ -188,8 +188,8 @@ transitiveDeps (DepGraph graph) root = go Set.empty (Seq.singleton root)
         | Set.member sp visited -> go visited rest
         | otherwise ->
             let deps = maybe [] dnDeps (Map.lookup sp graph)
-                visited' = if sp == root then visited else Set.insert sp visited
-             in go visited' (foldl' (|>) rest deps)
+                visitedWithDep = if sp == root then visited else Set.insert sp visited
+             in go visitedWithDep (foldl' (|>) rest deps)
 
 -- | Direct dependencies of a store path.
 directDeps :: DepGraph -> StorePath -> [StorePath]

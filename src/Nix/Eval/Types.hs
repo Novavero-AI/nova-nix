@@ -39,6 +39,7 @@ module Nix.Eval.Types
     envLookup,
     envInsert,
     envInsertThunk,
+    envInsertMany,
     pushWithScope,
 
     -- * Thunk operations
@@ -56,6 +57,7 @@ module Nix.Eval.Types
   )
 where
 
+import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -169,13 +171,22 @@ data NixValue
 -- thunk construction until first access.  Only ~50 of nixpkgs' 30k
 -- packages are touched for a typical eval — storing recipes instead
 -- of pre-built thunks avoids ~30k IORef allocations.
+--
+-- Each binding carries its own 'Env' so that @//@ merges of two
+-- 'LazyAttrs' with different environments remain correct — left-side
+-- bindings keep their original env instead of being re-parented to the
+-- right side's env.  The env is INTENTIONALLY LAZY for knot-tying in
+-- @rec {}@.
 data LazyBinding
-  = -- | Simple @key = expr@ — deferred @mkThunk recEnv expr@.
-    LazyExpr !Expr
-  | -- | @inherit key@ — deferred @inheritLookup recEnv key@.
-    LazyInherit
+  = -- | Simple @key = expr@ — deferred @mkThunk env expr@.
+    -- Env is lazy for knot-tying in rec {}.
+    LazyExpr Env !Expr
+  | -- | @inherit key@ — deferred @inheritLookup env key@.
+    -- Env is lazy for knot-tying in rec {}.
+    LazyInherit Env
   | -- | @inherit (from) key@ — deferred @mkThunk env (ESelect from [StaticKey key] Nothing)@.
-    LazyInheritFrom !Expr
+    -- Env is lazy for knot-tying in rec {}.
+    LazyInheritFrom Env !Expr
   | -- | Pre-built thunk (for merged nested paths or other complex cases).
     PreBuilt !Thunk
   deriving (Eq, Show)
@@ -183,17 +194,17 @@ data LazyBinding
 -- | Attribute set representation: either an eagerly-materialized map
 -- of thunks, or a lazy binding map that defers thunk construction.
 --
--- The 'LazyAttrs' constructor is used for @rec {}@ and @let@ bindings
--- in large attribute sets (e.g. nixpkgs' 30k-entry package set).
+-- The 'LazyAttrs' constructor is used for @rec {}@, @let@, and
+-- non-recursive attribute sets (e.g. nixpkgs' 30k-entry package set).
 -- Thunks + IORefs are only allocated for keys that are actually accessed.
+-- Each 'LazyBinding' carries its own 'Env', so @//@ merges of sets
+-- from different scopes remain correct.
 data AttrSet
-  = -- | Eagerly-materialized attribute set (small sets, non-rec, builtins).
+  = -- | Eagerly-materialized attribute set (small sets, builtins).
     EagerAttrs !(Map Text Thunk)
   | -- | Lazy attribute set: thunks built on demand from binding recipes.
-    -- The 'Env' field is INTENTIONALLY LAZY for knot-tying in rec {}.
+    -- Each 'LazyBinding' carries its own env (lazy for knot-tying).
     LazyAttrs
-      -- | Knot-tied recEnv (lazy for knot-tying)
-      Env
       -- | Key → binding recipe (O(log n) lookup)
       !(Map Text LazyBinding)
       -- | Materialized thunk cache (written via unsafePerformIO)
@@ -205,7 +216,7 @@ instance Eq AttrSet where
 
 instance Show AttrSet where
   show (EagerAttrs m) = show m
-  show (LazyAttrs _ bindings _) =
+  show (LazyAttrs bindings _) =
     "<lazy " ++ show (Map.size bindings) ++ " bindings>"
 
 -- | Look up a single key.  For 'EagerAttrs', pure 'Map.lookup'.
@@ -217,7 +228,7 @@ instance Show AttrSet where
 -- caching (same rationale as thunk memoization via 'newMemoCell').
 attrSetLookup :: Text -> AttrSet -> Maybe Thunk
 attrSetLookup key (EagerAttrs m) = Map.lookup key m
-attrSetLookup key (LazyAttrs env bindings cacheRef) =
+attrSetLookup key (LazyAttrs bindings cacheRef) =
   -- Check cache first, then binding map
   let cached = unsafePerformIO (readIORef cacheRef)
    in case Map.lookup key cached of
@@ -225,19 +236,20 @@ attrSetLookup key (LazyAttrs env bindings cacheRef) =
         Nothing -> case Map.lookup key bindings of
           Nothing -> Nothing
           Just recipe ->
-            let thunk = materializeBinding env key recipe
+            let thunk = materializeBinding key recipe
              in -- Cache the materialized thunk
                 unsafePerformIO $ do
                   atomicModifyIORef' cacheRef (\c -> (Map.insert key thunk c, ()))
                   pure (Just thunk)
 
 -- | Materialize a single 'LazyBinding' into a 'Thunk'.
-materializeBinding :: Env -> Text -> LazyBinding -> Thunk
-materializeBinding env _key (LazyExpr expr) = mkThunk env expr
-materializeBinding env key LazyInherit = inheritLookupThunk env key
-materializeBinding env key (LazyInheritFrom fromExpr) =
+-- Each binding carries its own env, so no separate env parameter needed.
+materializeBinding :: Text -> LazyBinding -> Thunk
+materializeBinding _key (LazyExpr env expr) = mkThunk env expr
+materializeBinding key (LazyInherit env) = inheritLookupThunk env key
+materializeBinding key (LazyInheritFrom env fromExpr) =
   mkThunk env (ESelect fromExpr [StaticKey key] Nothing)
-materializeBinding _env _key (PreBuilt thunk) = thunk
+materializeBinding _key (PreBuilt thunk) = thunk
 
 -- | Look up a name for lazy @inherit@.  If not found, create a thunk
 -- that will error when forced (matching real Nix behaviour).
@@ -254,22 +266,22 @@ inheritLookupThunk env name =
 -- the binding map — zero thunk allocation.
 attrSetKeys :: AttrSet -> [Text]
 attrSetKeys (EagerAttrs m) = Map.keys m
-attrSetKeys (LazyAttrs _ bindings _) = Map.keys bindings
+attrSetKeys (LazyAttrs bindings _) = Map.keys bindings
 
 -- | Check key membership without materializing thunks.
 attrSetMember :: Text -> AttrSet -> Bool
 attrSetMember key (EagerAttrs m) = Map.member key m
-attrSetMember key (LazyAttrs _ bindings _) = Map.member key bindings
+attrSetMember key (LazyAttrs bindings _) = Map.member key bindings
 
 -- | Check if the attribute set is empty.
 attrSetNull :: AttrSet -> Bool
 attrSetNull (EagerAttrs m) = Map.null m
-attrSetNull (LazyAttrs _ bindings _) = Map.null bindings
+attrSetNull (LazyAttrs bindings _) = Map.null bindings
 
 -- | Number of attributes.
 attrSetSize :: AttrSet -> Int
 attrSetSize (EagerAttrs m) = Map.size m
-attrSetSize (LazyAttrs _ bindings _) = Map.size bindings
+attrSetSize (LazyAttrs bindings _) = Map.size bindings
 
 -- | Full materialization: build a 'Map Text Thunk' from all bindings.
 -- For 'LazyAttrs', this allocates thunks + IORefs for every key —
@@ -278,20 +290,20 @@ attrSetSize (LazyAttrs _ bindings _) = Map.size bindings
 -- Uses 'unsafePerformIO' to update the cache atomically.
 attrSetToMap :: AttrSet -> Map Text Thunk
 attrSetToMap (EagerAttrs m) = m
-attrSetToMap (LazyAttrs env bindings cacheRef) =
+attrSetToMap (LazyAttrs bindings cacheRef) =
   unsafePerformIO $ do
     cached <- readIORef cacheRef
     if Map.size cached == Map.size bindings
       then pure cached
       else do
-        let full = Map.mapWithKey (materializeOne env cached) bindings
+        let full = Map.mapWithKey (materializeOne cached) bindings
         atomicModifyIORef' cacheRef (const (full, ()))
         pure full
   where
-    materializeOne lazyEnv cache key recipe =
-      case Map.lookup key cache of
+    materializeOne cached key recipe =
+      case Map.lookup key cached of
         Just thunk -> thunk
-        Nothing -> materializeBinding lazyEnv key recipe
+        Nothing -> materializeBinding key recipe
 
 -- | All thunk values (materialized).
 attrSetElems :: AttrSet -> [Thunk]
@@ -409,6 +421,18 @@ envInsertThunk name thunk env =
       envWithScopes = envWithScopes env
     }
 
+-- | Batch-insert multiple bindings as a single scope level.
+-- Creates ONE Env for all bindings instead of N singleton Envs.
+-- Used by formal set matching: a function with N formals creates
+-- one scope (one Map with N entries) instead of N scopes (N singleton Maps).
+envInsertMany :: Map Text Thunk -> Env -> Env
+envInsertMany bindings env =
+  Env
+    { envBindings = bindings,
+      envParent = Just env,
+      envWithScopes = envWithScopes env
+    }
+
 -- | Push a with-scope onto the scope chain (innermost position).
 -- Accepts 'AttrSet' directly so 'LazyAttrs' with-scopes stay lazy.
 -- Does not create a new parent level — just modifies the with-scope list.
@@ -519,6 +543,13 @@ class (Monad m) => MonadEval m where
   -- | Import a file with a custom scope overlaid on builtins.
   scopedImportFile :: [(Text, Thunk)] -> Text -> m NixValue
 
+  -- | Read raw bytes from a file.  Used by @builtins.hashFile@.
+  readFileBytes :: Text -> m ByteString
+
+  -- | Classify a single filesystem path as @"regular"@, @"directory"@,
+  -- @"symlink"@, or @"unknown"@.  Used by @builtins.readFileType@.
+  getFileType :: Text -> m Text
+
   -- | Run an external process: @(command, args, stdin) -> (exitCode, stdout, stderr)@.
   runProcess :: Text -> [Text] -> Text -> m (Int, Text, Text)
 
@@ -553,6 +584,8 @@ instance MonadEval PureEval where
   getCurrentTime = pure 0
   writeToStore _ _ = throwEvalError "toFile: not available in pure evaluation"
   scopedImportFile _ _ = throwEvalError "scopedImport: not available in pure evaluation"
+  readFileBytes _ = throwEvalError "hashFile: not available in pure evaluation"
+  getFileType _ = throwEvalError "readFileType: not available in pure evaluation"
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
   resolvePathLiteral = pure
   forceThunk _ (Evaluated val) = pure val

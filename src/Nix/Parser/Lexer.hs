@@ -13,7 +13,6 @@ module Nix.Parser.Lexer
 where
 
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
@@ -145,150 +144,144 @@ lexLoop st acc = case lsModes st of
   _ -> lexNormalMode st acc
 
 lexNormalMode :: LexState -> [Located] -> Either ParseError [Located]
-lexNormalMode st acc
-  | T.null (lsInput st) = Right (reverse (Located (lsLine st) (lsCol st) TokEOF : acc))
-  | otherwise =
-      let c = T.head (lsInput st)
-          rest = T.tail (lsInput st)
-       in case c of
-            _ | isSpace c -> lexNormalMode (skipWhitespace st) acc
-            '#' -> lexNormalMode (skipLineComment st) acc
-            '/'
-              | Just '*' <- safeHead rest ->
-                  case skipBlockComment (advanceCol 2 st {lsInput = T.drop 2 (lsInput st)}) of
-                    Left err -> Left err
-                    Right newSt -> lexNormalMode newSt acc
-            '"' ->
-              let tok = Located (lsLine st) (lsCol st) TokStringOpen
-                  newSt = advanceCol 1 st {lsInput = rest, lsModes = ModeString : lsModes st}
+lexNormalMode st acc = case T.uncons (lsInput st) of
+  Nothing -> Right (reverse (Located (lsLine st) (lsCol st) TokEOF : acc))
+  Just (c, rest) -> case c of
+    _ | isSpace c -> lexNormalMode (skipWhitespace st) acc
+    '#' -> lexNormalMode (skipLineComment st) acc
+    '/'
+      | Just '*' <- safeHead rest ->
+          case skipBlockComment (advanceCol 2 st {lsInput = T.drop 2 (lsInput st)}) of
+            Left err -> Left err
+            Right newSt -> lexNormalMode newSt acc
+    '"' ->
+      let tok = Located (lsLine st) (lsCol st) TokStringOpen
+          newSt = advanceCol 1 st {lsInput = rest, lsModes = ModeString : lsModes st}
+       in lexLoop newSt (tok : acc)
+    '\''
+      | Just '\'' <- safeHead rest ->
+          let tok = Located (lsLine st) (lsCol st) TokIndStringOpen
+              newSt = advanceCol 2 st {lsInput = T.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
+           in lexLoop newSt (tok : acc)
+    '.'
+      | Just '.' <- safeHead rest,
+        Just '.' <- safeHead (T.drop 1 rest) ->
+          emit3 st TokEllipsis acc
+    '.'
+      | Just '/' <- safeHead rest ->
+          lexPath st acc
+      | Just '.' <- safeHead rest,
+        Just c2 <- safeHead (T.drop 1 rest),
+        c2 == '/' ->
+          lexPath st acc
+    '.' -> emit1 st TokDot acc
+    ',' -> emit1 st TokComma acc
+    ';' -> emit1 st TokSemicolon acc
+    ':' -> emit1 st TokColon acc
+    '@' -> emit1 st TokAt acc
+    '?' -> emit1 st TokQuestion acc
+    '(' -> emit1 st TokLParen acc
+    ')' -> emit1 st TokRParen acc
+    '[' -> emit1 st TokLBracket acc
+    ']' -> emit1 st TokRBracket acc
+    '{' ->
+      let tok = Located (lsLine st) (lsCol st) TokLBrace
+          newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = lsBraceDepth st + 1}
+       in lexNormalMode newSt (tok : acc)
+    '}' ->
+      case lsModes st of
+        -- closing an interpolation: pop back to string/indstring mode
+        (ModeNormal : outerMode : restModes)
+          | lsBraceDepth st == 0,
+            outerMode == ModeString || outerMode == ModeIndString ->
+              let tok = Located (lsLine st) (lsCol st) TokInterpClose
+                  newSt = advanceCol 1 st {lsInput = rest, lsModes = outerMode : restModes}
                in lexLoop newSt (tok : acc)
-            '\''
-              | Just '\'' <- safeHead rest ->
-                  let tok = Located (lsLine st) (lsCol st) TokIndStringOpen
-                      newSt = advanceCol 2 st {lsInput = T.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
-                   in lexLoop newSt (tok : acc)
-            '.'
-              | Just '.' <- safeHead rest,
-                Just '.' <- safeHead (T.drop 1 rest) ->
-                  emit3 st TokEllipsis acc
-            '.'
-              | Just '/' <- safeHead rest ->
-                  lexPath st acc
-              | Just '.' <- safeHead rest,
-                Just c2 <- safeHead (T.drop 1 rest),
-                c2 == '/' ->
-                  lexPath st acc
-            '.' -> emit1 st TokDot acc
-            ',' -> emit1 st TokComma acc
-            ';' -> emit1 st TokSemicolon acc
-            ':' -> emit1 st TokColon acc
-            '@' -> emit1 st TokAt acc
-            '?' -> emit1 st TokQuestion acc
-            '(' -> emit1 st TokLParen acc
-            ')' -> emit1 st TokRParen acc
-            '[' -> emit1 st TokLBracket acc
-            ']' -> emit1 st TokRBracket acc
-            '{' ->
-              let tok = Located (lsLine st) (lsCol st) TokLBrace
-                  newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = lsBraceDepth st + 1}
-               in lexNormalMode newSt (tok : acc)
-            '}' ->
-              case lsModes st of
-                -- closing an interpolation: pop back to string/indstring mode
-                (ModeNormal : outerMode : restModes)
-                  | lsBraceDepth st == 0,
-                    outerMode == ModeString || outerMode == ModeIndString ->
-                      let tok = Located (lsLine st) (lsCol st) TokInterpClose
-                          newSt = advanceCol 1 st {lsInput = rest, lsModes = outerMode : restModes}
-                       in lexLoop newSt (tok : acc)
-                _ ->
-                  let depth = lsBraceDepth st
-                      newDepth = if depth > 0 then depth - 1 else 0
-                      tok = Located (lsLine st) (lsCol st) TokRBrace
-                      newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = newDepth}
-                   in lexNormalMode newSt (tok : acc)
-            '+' | Just '+' <- safeHead rest -> emit2 st TokConcat acc
-            '+' -> emit1 st TokPlus acc
-            '*' -> emit1 st TokStar acc
-            '-' | Just '>' <- safeHead rest -> emit2 st TokImpl acc
-            '-' -> emit1 st TokMinus acc
-            '!' | Just '=' <- safeHead rest -> emit2 st TokNeq acc
-            '!' -> emit1 st TokNot acc
-            '&' | Just '&' <- safeHead rest -> emit2 st TokAnd acc
-            '|' | Just '|' <- safeHead rest -> emit2 st TokOr acc
-            '=' | Just '=' <- safeHead rest -> emit2 st TokEq acc
-            '=' -> emit1 st TokAssign acc
-            '<' | Just '=' <- safeHead rest -> emit2 st TokLte acc
-            '<'
-              | isAlpha (fromMaybe ' ' (safeHead rest)) || (safeHead rest == Just '_') ->
-                  lexSearchPath st acc
-            '<' -> emit1 st TokLt acc
-            '>' | Just '=' <- safeHead rest -> emit2 st TokGte acc
-            '>' -> emit1 st TokGt acc
-            '/' | Just '/' <- safeHead rest -> emit2 st TokUpdate acc
-            '/'
-              -- After an expression token, / is always division
-              | prevCanEndExpr -> emit1 st TokSlash acc
-              -- Not after expression: / followed by path char starts an absolute path
-              | Just c2 <- safeHead rest, isPathChar c2 -> lexPath st acc
-              -- Otherwise, division
-              | otherwise -> emit1 st TokSlash acc
-              where
-                prevCanEndExpr = case acc of
-                  (Located _ _ tok : _) -> canFollowWithDivision tok
-                  [] -> False
-            '$'
-              | Just '{' <- safeHead rest ->
-                  emit2 st TokInterpOpen acc
-            '~'
-              | Just '/' <- safeHead rest ->
-                  lexPath st acc
-            _ | isDigit c -> lexNumber st acc
-            _ | isIdentStart c -> lexIdentOrKeyword st acc
-            _ ->
-              Left
-                ParseError
-                  { peFile = lsFile st,
-                    peLine = lsLine st,
-                    peCol = lsCol st,
-                    peMessage = "unexpected character: " <> T.singleton c
-                  }
+        _ ->
+          let depth = lsBraceDepth st
+              newDepth = if depth > 0 then depth - 1 else 0
+              tok = Located (lsLine st) (lsCol st) TokRBrace
+              newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = newDepth}
+           in lexNormalMode newSt (tok : acc)
+    '+' | Just '+' <- safeHead rest -> emit2 st TokConcat acc
+    '+' -> emit1 st TokPlus acc
+    '*' -> emit1 st TokStar acc
+    '-' | Just '>' <- safeHead rest -> emit2 st TokImpl acc
+    '-' -> emit1 st TokMinus acc
+    '!' | Just '=' <- safeHead rest -> emit2 st TokNeq acc
+    '!' -> emit1 st TokNot acc
+    '&' | Just '&' <- safeHead rest -> emit2 st TokAnd acc
+    '|' | Just '|' <- safeHead rest -> emit2 st TokOr acc
+    '=' | Just '=' <- safeHead rest -> emit2 st TokEq acc
+    '=' -> emit1 st TokAssign acc
+    '<' | Just '=' <- safeHead rest -> emit2 st TokLte acc
+    '<'
+      | maybe False (\ch -> isAlpha ch || ch == '_') (safeHead rest) ->
+          lexSearchPath st acc
+    '<' -> emit1 st TokLt acc
+    '>' | Just '=' <- safeHead rest -> emit2 st TokGte acc
+    '>' -> emit1 st TokGt acc
+    '/' | Just '/' <- safeHead rest -> emit2 st TokUpdate acc
+    '/'
+      -- After an expression token, / is always division
+      | prevCanEndExpr -> emit1 st TokSlash acc
+      -- Not after expression: / followed by path char starts an absolute path
+      | Just c2 <- safeHead rest, isPathChar c2 -> lexPath st acc
+      -- Otherwise, division
+      | otherwise -> emit1 st TokSlash acc
+      where
+        prevCanEndExpr = case acc of
+          (Located _ _ tok : _) -> canFollowWithDivision tok
+          [] -> False
+    '$'
+      | Just '{' <- safeHead rest ->
+          emit2 st TokInterpOpen acc
+    '~'
+      | Just '/' <- safeHead rest ->
+          lexPath st acc
+    _ | isDigit c -> lexNumber st acc
+    _ | isIdentStart c -> lexIdentOrKeyword st acc
+    _ ->
+      Left
+        ParseError
+          { peFile = lsFile st,
+            peLine = lsLine st,
+            peCol = lsCol st,
+            peMessage = "unexpected character: " <> T.singleton c
+          }
 
 -- ---------------------------------------------------------------------------
 -- String modes
 -- ---------------------------------------------------------------------------
 
 lexStringMode :: LexState -> [Located] -> Either ParseError [Located]
-lexStringMode st acc
-  | T.null (lsInput st) =
-      Left
-        ParseError
-          { peFile = lsFile st,
-            peLine = lsLine st,
-            peCol = lsCol st,
-            peMessage = "unterminated string"
-          }
-  | otherwise =
-      let c = T.head (lsInput st)
-          rest = T.tail (lsInput st)
-       in case c of
-            '"' ->
-              let tok = Located (lsLine st) (lsCol st) TokStringClose
-                  newSt = advanceCol 1 st {lsInput = rest, lsModes = safeTail (lsModes st)}
-               in lexLoop newSt (tok : acc)
-            '$'
-              | Just '{' <- safeHead rest ->
-                  let tok = Located (lsLine st) (lsCol st) TokInterpOpen
-                      newSt =
-                        advanceCol
-                          2
-                          st
-                            { lsInput = T.drop 1 rest,
-                              lsModes = ModeNormal : lsModes st,
-                              lsBraceDepth = 0
-                            }
-                   in lexLoop newSt (tok : acc)
-            _ -> lexStringLiteral st acc
+lexStringMode st acc = case T.uncons (lsInput st) of
+  Nothing ->
+    Left
+      ParseError
+        { peFile = lsFile st,
+          peLine = lsLine st,
+          peCol = lsCol st,
+          peMessage = "unterminated string"
+        }
+  Just (c, rest) -> case c of
+    '"' ->
+      let tok = Located (lsLine st) (lsCol st) TokStringClose
+          newSt = advanceCol 1 st {lsInput = rest, lsModes = safeTail (lsModes st)}
+       in lexLoop newSt (tok : acc)
+    '$'
+      | Just '{' <- safeHead rest ->
+          let tok = Located (lsLine st) (lsCol st) TokInterpOpen
+              newSt =
+                advanceCol
+                  2
+                  st
+                    { lsInput = T.drop 1 rest,
+                      lsModes = ModeNormal : lsModes st,
+                      lsBraceDepth = 0
+                    }
+           in lexLoop newSt (tok : acc)
+    _ -> lexStringLiteral st acc
 
 lexIndStringMode :: LexState -> [Located] -> Either ParseError [Located]
 lexIndStringMode st acc
@@ -363,47 +356,44 @@ lexIndStringMode st acc
 lexStringLiteral :: LexState -> [Located] -> Either ParseError [Located]
 lexStringLiteral st0 acc = go st0 mempty
   where
-    go st !builder
-      | T.null (lsInput st) =
-          Left
-            ParseError
-              { peFile = lsFile st,
-                peLine = lsLine st,
-                peCol = lsCol st,
-                peMessage = "unterminated string"
-              }
-      | otherwise =
-          let c = T.head (lsInput st)
-              rest = T.tail (lsInput st)
-           in case c of
-                '"' -> finishChunk st builder
-                '$' | Just '{' <- safeHead rest -> finishChunk st builder
-                '\\' -> case T.uncons rest of
-                  Just (ec, rest2) ->
-                    let escaped = case ec of
-                          'n' -> TB.singleton '\n'
-                          't' -> TB.singleton '\t'
-                          'r' -> TB.singleton '\r'
-                          '\\' -> TB.singleton '\\'
-                          '"' -> TB.singleton '"'
-                          '$' -> TB.singleton '$'
-                          _ -> TB.singleton '\\' <> TB.singleton ec
-                        newSt = advanceBy ec (advanceCol 1 st {lsInput = rest2})
-                     in go newSt (builder <> escaped)
-                  Nothing ->
-                    Left
-                      ParseError
-                        { peFile = lsFile st,
-                          peLine = lsLine st,
-                          peCol = lsCol st,
-                          peMessage = "unterminated escape in string"
-                        }
-                '\n' ->
-                  let newSt = st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
-                   in go newSt (builder <> TB.singleton '\n')
-                _ ->
-                  let newSt = advanceCol 1 st {lsInput = rest}
-                   in go newSt (builder <> TB.singleton c)
+    go st !builder = case T.uncons (lsInput st) of
+      Nothing ->
+        Left
+          ParseError
+            { peFile = lsFile st,
+              peLine = lsLine st,
+              peCol = lsCol st,
+              peMessage = "unterminated string"
+            }
+      Just (c, rest) -> case c of
+        '"' -> finishChunk st builder
+        '$' | Just '{' <- safeHead rest -> finishChunk st builder
+        '\\' -> case T.uncons rest of
+          Just (ec, rest2) ->
+            let escaped = case ec of
+                  'n' -> TB.singleton '\n'
+                  't' -> TB.singleton '\t'
+                  'r' -> TB.singleton '\r'
+                  '\\' -> TB.singleton '\\'
+                  '"' -> TB.singleton '"'
+                  '$' -> TB.singleton '$'
+                  _ -> TB.singleton '\\' <> TB.singleton ec
+                newSt = advanceBy ec (advanceCol 1 st {lsInput = rest2})
+             in go newSt (builder <> escaped)
+          Nothing ->
+            Left
+              ParseError
+                { peFile = lsFile st,
+                  peLine = lsLine st,
+                  peCol = lsCol st,
+                  peMessage = "unterminated escape in string"
+                }
+        '\n' ->
+          let newSt = st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
+           in go newSt (builder <> TB.singleton '\n')
+        _ ->
+          let newSt = advanceCol 1 st {lsInput = rest}
+           in go newSt (builder <> TB.singleton c)
     finishChunk st builder
       | builderIsEmpty = lexStringMode st acc
       | otherwise =
@@ -470,8 +460,8 @@ lexNumber st acc =
       len = T.length digits
    in case T.uncons after of
         Just ('.', after2)
-          | not (T.null after2),
-            isDigit (T.head after2) ->
+          | Just (d, _) <- T.uncons after2,
+            isDigit d ->
               let (decimals, after3) = T.span isDigit after2
                   fullLen = T.length digits + 1 + T.length decimals
                   val = readDouble digits decimals
@@ -561,7 +551,7 @@ lexPath st acc =
 lexSearchPath :: LexState -> [Located] -> Either ParseError [Located]
 lexSearchPath st acc =
   -- st is at '<', skip it
-  let after = T.tail (lsInput st)
+  let after = T.drop 1 (lsInput st)
       (name, after2) = T.span isSearchPathChar after
    in case T.uncons after2 of
         Just ('>', after3) ->
@@ -591,24 +581,21 @@ skipLineComment st =
         _ -> st {lsInput = after}
 
 skipBlockComment :: LexState -> Either ParseError LexState
-skipBlockComment st
-  | T.null (lsInput st) =
-      Left
-        ParseError
-          { peFile = lsFile st,
-            peLine = lsLine st,
-            peCol = lsCol st,
-            peMessage = "unterminated block comment"
-          }
-  | otherwise =
-      let c = T.head (lsInput st)
-          rest = T.tail (lsInput st)
-       in case c of
-            '*'
-              | Just '/' <- safeHead rest ->
-                  Right (advanceCol 2 st {lsInput = T.tail rest})
-            '\n' -> skipBlockComment st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
-            _ -> skipBlockComment (advanceCol 1 st {lsInput = rest})
+skipBlockComment st = case T.uncons (lsInput st) of
+  Nothing ->
+    Left
+      ParseError
+        { peFile = lsFile st,
+          peLine = lsLine st,
+          peCol = lsCol st,
+          peMessage = "unterminated block comment"
+        }
+  Just (c, rest) -> case c of
+    '*'
+      | Just '/' <- safeHead rest ->
+          Right (advanceCol 2 st {lsInput = T.drop 1 rest})
+    '\n' -> skipBlockComment st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
+    _ -> skipBlockComment (advanceCol 1 st {lsInput = rest})
 
 -- ---------------------------------------------------------------------------
 -- Character predicates
@@ -655,7 +642,7 @@ canFollowWithDivision _ = False
 emit1 :: LexState -> Token -> [Located] -> Either ParseError [Located]
 emit1 st tok acc =
   let located = Located (lsLine st) (lsCol st) tok
-      newSt = advanceCol 1 st {lsInput = T.tail (lsInput st)}
+      newSt = advanceCol 1 st {lsInput = T.drop 1 (lsInput st)}
    in lexNormalMode newSt (located : acc)
 
 emit2 :: LexState -> Token -> [Located] -> Either ParseError [Located]

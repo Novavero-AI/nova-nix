@@ -2057,18 +2057,18 @@ testDepGraph = do
       runTest "linear chain topo" $ case DepGraph.buildDepGraph readChain drvB spB of
         Right graph -> case DepGraph.topoSort graph of
           DepGraph.TopoSorted order ->
-            if length order == 2 && head order == spC
-              then Pass
-              else Fail ("bad order: " <> T.pack (show order))
+            case order of
+              [first, _] | first == spC -> Pass
+              _ -> Fail ("bad order: " <> T.pack (show order))
           DepGraph.TopoCycle cyc -> Fail ("unexpected cycle: " <> T.pack (show cyc))
         Left err -> Fail ("graph build failed: " <> err),
       -- Diamond D->B,C; B->C: topoSort should have C first, D last
       runTest "diamond topo" $ case DepGraph.buildDepGraph readDiamond drvD spD of
         Right graph -> case DepGraph.topoSort graph of
           DepGraph.TopoSorted order ->
-            if length order == 3 && head order == spC && last order == spD
-              then Pass
-              else Fail ("bad diamond order: " <> T.pack (show order))
+            case order of
+              [first, _, lastElem] | first == spC, lastElem == spD -> Pass
+              _ -> Fail ("bad diamond order: " <> T.pack (show order))
           DepGraph.TopoCycle cyc -> Fail ("unexpected cycle: " <> T.pack (show cyc))
         Left err -> Fail ("graph build failed: " <> err),
       -- transitiveDeps
@@ -2727,13 +2727,12 @@ testFromATerm = do
           (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d._derivation")
         $ \val -> case val of
           VDerivation drv ->
-            if null (drvOutputs drv)
-              then Fail "drvOutputs is empty"
-              else
-                let firstOut = head (drvOutputs drv)
-                 in if doName firstOut == "out"
-                      then Pass
-                      else Fail ("first output name: " <> doName firstOut)
+            case drvOutputs drv of
+              [] -> Fail "drvOutputs is empty"
+              (firstOut : _) ->
+                if doName firstOut == "out"
+                  then Pass
+                  else Fail ("first output name: " <> doName firstOut)
           _ -> Fail ("expected VDerivation, got " <> T.pack (show val)),
       -- builtinDerivation multi-output populates drvOutputs
       runTest "builtinDerivation multi-output"

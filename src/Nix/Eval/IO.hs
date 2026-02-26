@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | IO-based Nix evaluator.
@@ -28,7 +29,8 @@ where
 import Control.Exception (Exception, SomeException, displayException, fromException, throwIO, try)
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Reader (ReaderT (..), asks, local)
+import Control.Monad.Reader (ReaderT (..), ask, asks, local)
+import qualified Data.ByteString as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -87,7 +89,7 @@ data EvalState = EvalState
 newEvalState :: FilePath -> IO EvalState
 newEvalState baseDir = do
   cache <- newIORef Map.empty
-  now <- fmap (floor . toRational) getPOSIXTime :: IO Integer
+  now <- fmap floor getPOSIXTime :: IO Integer
   nixPathStr <- lookupEnvText "NIX_PATH"
   let searchPaths = case nixPathStr of
         Just val -> parseNixPath (T.pack val)
@@ -117,7 +119,7 @@ instance MonadEval EvalIO where
   throwEvalError msg = EvalIO (liftIO (throwIO (NixEvalError msg)))
 
   catchEvalError (EvalIO action) = EvalIO $ do
-    st <- asks id
+    st <- ask
     result <- liftIO (try (runReaderT action st))
     pure (case result of Left (NixEvalError msg) -> Left msg; Right val -> Right val)
 
@@ -217,6 +219,10 @@ instance MonadEval EvalIO where
               (unEvalIO (eval scopedEnv expr))
           )
 
+  readFileBytes path = wrapIO (BS.readFile (T.unpack path))
+
+  getFileType path = wrapIO (classifyPath (T.unpack path))
+
   runProcess cmd cmdArgs stdinText = wrapIO $ do
     let cp =
           (Proc.proc (T.unpack cmd) (map T.unpack cmdArgs))
@@ -244,31 +250,42 @@ instance MonadEval EvalIO where
     -- Pending with Computed — dropping the Expr and Env so they
     -- become unreachable and are GC'd.  Matches C++ Nix which
     -- mutates Value structs in place.
-    cell <- wrapIO (readIORef ref)
+    cell <- EvalIO (liftIO (readIORef ref))
     case cell of
       Computed val -> pure val
       Pending expr env -> do
         val <- evalFn env expr
-        wrapIO (writeIORef ref (Computed val))
+        EvalIO (liftIO (writeIORef ref (Computed val)))
         pure val
 
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
 
--- | Classify a directory entry as @"regular"@, @"directory"@, or @"symlink"@
--- (matching Nix's @builtins.readDir@ semantics).
+-- | Classify a filesystem path as @"regular"@, @"directory"@, @"symlink"@,
+-- or @"unknown"@ — matching Nix's @builtins.readDir@ / @readFileType@.
+classifyPath :: FilePath -> IO Text
+classifyPath fp =
+  firstMatch
+    "unknown"
+    [ (Dir.pathIsSymbolicLink fp, "symlink"),
+      (Dir.doesDirectoryExist fp, "directory"),
+      (Dir.doesFileExist fp, "regular")
+    ]
+
+-- | Return the label of the first predicate that holds, or the default.
+firstMatch :: Text -> [(IO Bool, Text)] -> IO Text
+firstMatch def [] = pure def
+firstMatch def ((test, label) : rest) =
+  test >>= \case
+    True -> pure label
+    False -> firstMatch def rest
+
+-- | Classify a directory entry (name relative to parent).
 classifyEntry :: FilePath -> FilePath -> IO (Text, Text)
 classifyEntry parentDir name = do
-  let fullPath = parentDir </> name
-  isSym <- Dir.pathIsSymbolicLink fullPath
-  if isSym
-    then pure (T.pack name, "symlink")
-    else do
-      isDir <- Dir.doesDirectoryExist fullPath
-      if isDir
-        then pure (T.pack name, "directory")
-        else pure (T.pack name, "regular")
+  ty <- classifyPath (parentDir </> name)
+  pure (T.pack name, ty)
 
 -- | Convert IO exceptions to eval errors.
 -- Guards against double-wrapping: if the exception is already a

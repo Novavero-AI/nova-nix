@@ -60,6 +60,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.IO as TIO
 import Nix.Derivation (Derivation, toATerm)
 import Nix.Store.DB
 import Nix.Store.Path
@@ -238,4 +239,4 @@ writeDrv store drv sp = do
   let destPath = storePathToFilePath (stDir store) sp
       aterm = toATerm drv
   createDirectoryIfMissing True (unStoreDir (stDir store))
-  writeFile destPath (T.unpack aterm)
+  TIO.writeFile destPath aterm

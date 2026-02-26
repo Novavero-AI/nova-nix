@@ -66,12 +66,15 @@ import qualified Crypto.Hash as CH
 import qualified Data.Array as Array
 import Data.Bits (xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
-import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, ord)
+import qualified Data.ByteString as BS
+import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, isOctDigit, ord)
 import Data.List (foldl')
 import qualified Data.Map.Lazy as MapL
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, isJust)
+import Data.Maybe (catMaybes, isJust, isNothing)
+import Data.Sequence (Seq (..))
+import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -105,6 +108,7 @@ import Nix.Eval.Types
     emptyContext,
     emptyEnv,
     envInsert,
+    envInsertMany,
     envInsertThunk,
     envLookup,
     evaluated,
@@ -113,7 +117,6 @@ import Nix.Eval.Types
     mkThunk,
     newLazyAttrCache,
     pushWithScope,
-    runPureEval,
     typeName,
   )
 import Nix.Expr.Types
@@ -129,6 +132,8 @@ import Nix.Expr.Types
   )
 import Nix.Hash (byteToHex, sha256Hex, truncatedBase32)
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath)
+import qualified NovaCache.Base32 as Nix32
+import qualified NovaCache.Base64 as B64
 import qualified System.Info
 import Text.Regex.TDFA (matchAllText)
 import qualified Text.Regex.TDFA as RE
@@ -223,10 +228,19 @@ evalAttrs env False bindings = evalNonRecAttrs env bindings
 evalAttrs env True bindings = evalRecAttrs env bindings
 
 -- | Non-recursive attribute set: thunks capture the outer environment.
+--
+-- Uses 'LazyAttrs' to defer thunk + IORef allocation: only keys that
+-- are actually accessed get materialized.  For @all-packages.nix@
+-- with ~15k entries per stdenv stage, this avoids ~15k IORef
+-- allocations when only ~50 packages are touched.  Dynamic keys are
+-- resolved eagerly (they may depend on evaluation), but value thunks
+-- are deferred.
 evalNonRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
 evalNonRecAttrs env bindings = do
-  attrMap <- buildBindingsMapM env env bindings
-  pure (VAttrs (attrSetFromMap attrMap))
+  resolvedBindings <- resolveBindingKeys env bindings
+  let lazyBindingMap = buildLazyBindingMap env resolvedBindings
+      cache = newLazyAttrCache lazyBindingMap
+  pure (VAttrs (LazyAttrs lazyBindingMap cache))
 
 -- | Recursive attribute set: thunks capture the completed environment
 -- (Haskell's laziness ties the knot — Thunk's Env field is lazy).
@@ -262,44 +276,7 @@ evalRecAttrs env bindings = do
       -- Build per-key lazy binding recipes for the LazyAttrs.
       lazyBindingMap = buildLazyBindingMap recEnv resolvedBindings
       cache = newLazyAttrCache lazyBindingMap
-  pure (VAttrs (LazyAttrs recEnv lazyBindingMap cache))
-
--- | Build a flat attribute map from bindings (monadic — resolves
--- dynamic keys via eval, but only creates thunks for values).
--- Used by non-rec {}.
---
--- @thunkEnv@ is the environment captured by value thunks.
--- @keyEnv@ is used to evaluate dynamic key expressions.
---
--- Handles nested attribute paths (@a.b.c = 1@) by building nested
--- 'VAttrs' maps.  Handles @inherit@ by looking up names in the
--- environment or a source expression.
-buildBindingsMapM :: (MonadEval m) => Env -> Env -> [Binding] -> m (Map Text Thunk)
-buildBindingsMapM thunkEnv keyEnv = foldlM' mergeBinding Map.empty
-  where
-    mergeBinding current binding = do
-      new <- processBindingM thunkEnv keyEnv binding
-      pure (mergeAttrMaps current new)
-
--- | Strict left fold over a list in a monad.
-foldlM' :: (Monad m) => (b -> a -> m b) -> b -> [a] -> m b
-foldlM' _ acc [] = pure acc
-foldlM' f !acc (x : xs) = do
-  acc2 <- f acc x
-  foldlM' f acc2 xs
-
--- | Process a single binding into key-value pairs.
-processBindingM :: (MonadEval m) => Env -> Env -> Binding -> m (Map Text Thunk)
-processBindingM thunkEnv keyEnv (NamedBinding path bodyExpr) =
-  buildNestedAttrM thunkEnv keyEnv path bodyExpr
-processBindingM _ lookupEnv (Inherit Nothing names) =
-  pure $ Map.fromList [(n, inheritLookup lookupEnv n) | n <- names]
-processBindingM thunkEnv _ (Inherit (Just fromExpr) names) =
-  pure $
-    Map.fromList
-      [ (n, mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))
-      | n <- names
-      ]
+  pure (VAttrs (LazyAttrs lazyBindingMap cache))
 
 -- ---------------------------------------------------------------------------
 -- Resolved bindings (for knot-tying in rec {} and let)
@@ -353,7 +330,7 @@ processResolvedLazy lookupEnv (ResolvedInherit names) =
 processResolvedLazy thunkEnv (ResolvedInheritFrom fromExpr names) =
   MapL.fromList
     [ (n, mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))
-    | n <- names
+      | n <- names
     ]
 
 -- | Like 'buildResolvedNestedAttr' but uses 'Data.Map.Lazy' operations.
@@ -373,35 +350,35 @@ buildLazyBindingMap thunkEnv = foldl' addBinding Map.empty
   where
     addBinding acc (ResolvedNamed [key] bodyExpr) =
       case Map.lookup key acc of
-        Nothing -> Map.insert key (LazyExpr bodyExpr) acc
+        Nothing -> Map.insert key (LazyExpr thunkEnv bodyExpr) acc
         -- Key collision (rare): must merge, so eagerly build both
         Just existing ->
-          let existingThunk = materializeLazy thunkEnv key existing
+          let existingThunk = materializeLazy key existing
               newThunk = mkThunk thunkEnv bodyExpr
            in Map.insert key (PreBuilt (mergeThunks existingThunk newThunk)) acc
     addBinding acc (ResolvedNamed path@(_ : _ : _) bodyExpr) =
       -- Nested path: build eagerly (rare in large rec sets)
       let nested = buildResolvedNestedAttr thunkEnv path bodyExpr
-       in foldl' (\a (k, t) -> insertLazyWithMerge thunkEnv a k (PreBuilt t)) acc (Map.toList nested)
+       in foldl' (\a (k, t) -> insertLazyWithMerge a k (PreBuilt t)) acc (Map.toList nested)
     addBinding acc (ResolvedNamed [] _) = acc
     addBinding acc (ResolvedInherit names) =
-      foldl' (\a n -> insertLazyWithMerge thunkEnv a n LazyInherit) acc names
+      foldl' (\a n -> insertLazyWithMerge a n (LazyInherit thunkEnv)) acc names
     addBinding acc (ResolvedInheritFrom fromExpr names) =
-      foldl' (\a n -> insertLazyWithMerge thunkEnv a n (LazyInheritFrom fromExpr)) acc names
+      foldl' (\a n -> insertLazyWithMerge a n (LazyInheritFrom thunkEnv fromExpr)) acc names
 
-    insertLazyWithMerge env' acc key new =
+    insertLazyWithMerge acc key new =
       case Map.lookup key acc of
         Nothing -> Map.insert key new acc
         Just existing ->
-          let existingThunk = materializeLazy env' key existing
-              newThunk = materializeLazy env' key new
+          let existingThunk = materializeLazy key existing
+              newThunk = materializeLazy key new
            in Map.insert key (PreBuilt (mergeThunks existingThunk newThunk)) acc
 
-    materializeLazy env' _key (LazyExpr expr) = mkThunk env' expr
-    materializeLazy env' bindKey LazyInherit = inheritLookup env' bindKey
-    materializeLazy env' bindKey (LazyInheritFrom fromExpr) =
-      mkThunk env' (ESelect fromExpr [StaticKey bindKey] Nothing)
-    materializeLazy _env' _bindKey (PreBuilt thunk) = thunk
+    materializeLazy _key (LazyExpr bindEnv expr) = mkThunk bindEnv expr
+    materializeLazy bindKey (LazyInherit bindEnv) = inheritLookup bindEnv bindKey
+    materializeLazy bindKey (LazyInheritFrom bindEnv fromExpr) =
+      mkThunk bindEnv (ESelect fromExpr [StaticKey bindKey] Nothing)
+    materializeLazy _bindKey (PreBuilt thunk) = thunk
 
 -- | Build a nested attribute structure from a resolved dotted path (pure).
 buildResolvedNestedAttr :: Env -> [Text] -> Expr -> Map Text Thunk
@@ -424,24 +401,6 @@ inheritLookup env name =
           throwExpr = EApp (EVar "throw") (EStr [StrLit errMsg])
        in mkThunk env throwExpr
 
--- | Build a nested attribute structure from a dotted path.
--- @a.b.c = expr@ becomes @{ a = { b = { c = thunk; }; }; }@.
-buildNestedAttrM :: (MonadEval m) => Env -> Env -> AttrPath -> Expr -> m (Map Text Thunk)
-buildNestedAttrM _thunkEnv _keyEnv [] _bodyExpr =
-  throwEvalError "empty attribute path"
-buildNestedAttrM thunkEnv keyEnv [key] bodyExpr = do
-  resolved <- resolveKey keyEnv key
-  case resolved of
-    Nothing -> pure Map.empty
-    Just keyText -> pure (Map.singleton keyText (mkThunk thunkEnv bodyExpr))
-buildNestedAttrM thunkEnv keyEnv (key : rest) bodyExpr = do
-  resolved <- resolveKey keyEnv key
-  case resolved of
-    Nothing -> pure Map.empty
-    Just keyText -> do
-      inner <- buildNestedAttrM thunkEnv keyEnv rest bodyExpr
-      pure (Map.singleton keyText (evaluated (VAttrs (attrSetFromMap inner))))
-
 -- | Resolve an attribute key.  Static keys always return 'Just'.
 -- Dynamic keys evaluate to a string or 'null'; null means "skip this binding"
 -- (matching real Nix, used by the module system for conditional attributes).
@@ -453,11 +412,6 @@ resolveKey env (DynamicKey expr) = do
     VStr s _ -> pure (Just s)
     VNull -> pure Nothing
     _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName val)
-
--- | Merge two attribute maps.  For overlapping keys where both sides
--- are attribute sets, merge recursively (for nested attr paths).
-mergeAttrMaps :: Map Text Thunk -> Map Text Thunk -> Map Text Thunk
-mergeAttrMaps = Map.unionWith mergeThunks
 
 -- | Merge two thunks at the same key.  If both are evaluated VAttrs,
 -- merge their contents recursively.  Otherwise the right wins.
@@ -569,12 +523,42 @@ matchFormals closureEnv (FormalNamedSet name formals allowExtra) argThunk = do
   matchFormalSet envWithAt formals allowExtra argVal
 
 -- | Match a formal set pattern against a VAttrs argument.
+--
+-- All formals are batched into a SINGLE scope level (one Map, one Env)
+-- instead of creating a separate singleton Env per formal.  This reduces
+-- Env allocations from O(N) to O(1) per function call — critical for
+-- nixpkgs where millions of function calls with 5–30 formals each were
+-- creating 7M+ Env objects and 600+ MB of Map.Bin nodes.
+--
+-- Default expressions use formalEnv via knot-tying, so they can
+-- reference other formals — matching real Nix semantics where all
+-- formals are mutually visible (e.g. @{ a ? b, b ? 1 }: a@ yields 1).
 matchFormalSet :: (MonadEval m) => Env -> [Formal] -> Bool -> NixValue -> m Env
 matchFormalSet closureEnv formals allowExtra argVal =
   case argVal of
     VAttrs attrs -> do
       checkExtraKeys formals allowExtra attrs
-      foldl' (bindFormal attrs) (pure closureEnv) formals
+      -- Eagerly check required formals BEFORE building the scope,
+      -- so missing-attribute errors are immediate, not deferred.
+      checkMissingFormals attrs formals
+      -- Batch all formal bindings into ONE scope level.
+      -- Knot-tying: formalEnv is used in mkThunk for defaults,
+      -- but mkThunk captures Env lazily (Pending !Expr Env).
+      let formalEnv = envInsertMany formalBindings closureEnv
+          formalBindings =
+            Map.fromList
+              [ (fName formal, resolveOneFormal formal)
+                | formal <- formals
+              ]
+          resolveOneFormal (Formal name defExpr) =
+            case attrSetLookup name attrs of
+              Just thunk -> thunk
+              Nothing -> case defExpr of
+                Just def -> mkThunk formalEnv def
+                -- Unreachable: checkMissingFormals verified all
+                -- required formals (those with no default) are present.
+                Nothing -> error "matchFormalSet: missing required formal (unreachable)"
+      pure formalEnv
     _ -> throwEvalError ("function expects a set argument, got " <> typeName argVal)
 
 -- | Verify that no unexpected keys are present (unless @...@ allows them).
@@ -588,15 +572,12 @@ checkExtraKeys formals False attrs =
         [] -> pure ()
         (k : _) -> throwEvalError ("unexpected attribute '" <> k <> "' in function argument")
 
--- | Bind a single formal parameter from the argument attrset.
-bindFormal :: (MonadEval m) => AttrSet -> m Env -> Formal -> m Env
-bindFormal attrs acc (Formal name defExpr) = do
-  env <- acc
-  case attrSetLookup name attrs of
-    Just thunk -> pure (envInsertThunk name thunk env)
-    Nothing -> case defExpr of
-      Just def -> pure (envInsertThunk name (mkThunk env def) env)
-      Nothing -> throwEvalError ("missing required attribute '" <> name <> "'")
+-- | Check that all required formals (those without defaults) are present.
+checkMissingFormals :: (MonadEval m) => AttrSet -> [Formal] -> m ()
+checkMissingFormals attrs formals =
+  case [fName f | f <- formals, isNothing (fDefault f), not (attrSetMember (fName f) attrs)] of
+    [] -> pure ()
+    (name : _) -> throwEvalError ("missing required attribute '" <> name <> "'")
 
 -- ---------------------------------------------------------------------------
 -- Let / if / with / assert
@@ -804,9 +785,12 @@ builtinRegistry =
       builtin2 "sub" builtinSub,
       builtin2 "mul" builtinMul,
       builtin2 "div" builtinDiv,
+      builtin2 "mod" builtinMod,
       builtin2 "bitAnd" builtinBitAnd,
       builtin2 "bitOr" builtinBitOr,
       builtin2 "bitXor" builtinBitXor,
+      builtin2 "min" builtinMin,
+      builtin2 "max" builtinMax,
       -- Attr set higher-order
       builtin2 "mapAttrs" builtinMapAttrs,
       builtin1 "functionArgs" builtinFunctionArgs,
@@ -850,7 +834,25 @@ builtinRegistry =
       -- Error context (pass-through — context only matters on error)
       builtin2 "addErrorContext" (\_ val -> pure val),
       -- Attr position (return null — nixpkgs handles this gracefully)
-      builtin2 "unsafeGetAttrPos" (\_ _ -> pure VNull)
+      builtin2 "unsafeGetAttrPos" (\_ _ -> pure VNull),
+      -- Debugging (no-ops without --trace-verbose / --debugger)
+      builtin2 "traceVerbose" (\_ b -> pure b),
+      builtin1 "break" pure,
+      -- IO: file hashing + type detection
+      builtin2 "hashFile" builtinHashFile,
+      builtin1 "readFileType" builtinReadFileType,
+      -- Serialization
+      builtin1 "fromTOML" builtinFromTOML,
+      -- Hash conversion
+      builtin1 "convertHash" builtinConvertHash,
+      -- XML serialization
+      builtin1 "toXML" builtinToXML,
+      -- Source filtering
+      builtin2 "filterSource" builtinFilterSource,
+      -- Experimental feature stubs
+      builtin2 "outputOf" builtinOutputOf,
+      builtin1 "fetchTree" builtinFetchTree,
+      builtin1 "fetchClosure" builtinFetchClosure
     ]
 
 -- | Names of all registered builtins.
@@ -962,9 +964,12 @@ executeBuiltin name args = case name of
   "sub" -> apply2 builtinSub
   "mul" -> apply2 builtinMul
   "div" -> apply2 builtinDiv
+  "mod" -> apply2 builtinMod
   "bitAnd" -> apply2 builtinBitAnd
   "bitOr" -> apply2 builtinBitOr
   "bitXor" -> apply2 builtinBitXor
+  "min" -> apply2 builtinMin
+  "max" -> apply2 builtinMax
   -- Attr set higher-order
   "mapAttrs" -> apply2 builtinMapAttrs
   "functionArgs" -> apply1 builtinFunctionArgs
@@ -1009,6 +1014,24 @@ executeBuiltin name args = case name of
   "addErrorContext" -> apply2 (\_ val -> pure val)
   -- Attr position (return null — nixpkgs handles this gracefully)
   "unsafeGetAttrPos" -> apply2 (\_ _ -> pure VNull)
+  -- Debugging (no-ops without --trace-verbose / --debugger)
+  "traceVerbose" -> apply2 (\_ b -> pure b)
+  "break" -> apply1 pure
+  -- IO: file hashing + type detection
+  "hashFile" -> apply2 builtinHashFile
+  "readFileType" -> apply1 builtinReadFileType
+  -- Serialization
+  "fromTOML" -> apply1 builtinFromTOML
+  -- Hash conversion
+  "convertHash" -> apply1 builtinConvertHash
+  -- XML serialization
+  "toXML" -> apply1 builtinToXML
+  -- Source filtering
+  "filterSource" -> apply2 builtinFilterSource
+  -- Experimental feature stubs
+  "outputOf" -> apply2 builtinOutputOf
+  "fetchTree" -> apply1 builtinFetchTree
+  "fetchClosure" -> apply1 builtinFetchClosure
   _ -> throwEvalError ("unknown builtin '" <> name <> "'")
   where
     apply1 f = case args of
@@ -1210,16 +1233,19 @@ builtinCatAttrs other _ =
   throwEvalError ("builtins.catAttrs: expected a string, got " <> typeName other)
 
 -- | Collect values for a given key from a list of attrsets.
+-- Tail-recursive with accumulator to avoid stack overflow on large lists.
 catAttrsCollect :: (MonadEval m) => Text -> [Thunk] -> m [Thunk]
-catAttrsCollect _ [] = pure []
-catAttrsCollect key (thunk : rest) = do
-  val <- force thunk
-  case val of
-    VAttrs attrs ->
-      case attrSetLookup key attrs of
-        Just found -> (found :) <$> catAttrsCollect key rest
-        Nothing -> catAttrsCollect key rest
-    _ -> throwEvalError "builtins.catAttrs: list element must be a set"
+catAttrsCollect key = go []
+  where
+    go !acc [] = pure (reverse acc)
+    go !acc (thunk : rest) = do
+      val <- force thunk
+      case val of
+        VAttrs attrs ->
+          case attrSetLookup key attrs of
+            Just found -> go (found : acc) rest
+            Nothing -> go acc rest
+        _ -> throwEvalError "builtins.catAttrs: list element must be a set"
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — list higher-order (arity 2)
@@ -1264,27 +1290,32 @@ builtinGenList _ other =
 builtinSort :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSort comparator (VList thunks) = do
   vals <- mapM force thunks
-  sorted <- insertionSort comparator vals
+  sorted <- mergeSort comparator vals
   pure (VList (map evaluated sorted))
 builtinSort _ other =
   throwEvalError ("builtins.sort: expected a list, got " <> typeName other)
 
--- | Stable insertion sort using a user-supplied comparator.
+-- | Stable O(n log n) merge sort using a user-supplied comparator.
 -- The comparator takes two args (curried) and returns bool.
-insertionSort :: (MonadEval m) => NixValue -> [NixValue] -> m [NixValue]
-insertionSort _ [] = pure []
-insertionSort cmp (x : xs) = do
-  sorted <- insertionSort cmp xs
-  insertSorted cmp x sorted
+mergeSort :: (MonadEval m) => NixValue -> [NixValue] -> m [NixValue]
+mergeSort _ [] = pure []
+mergeSort _ [x] = pure [x]
+mergeSort cmp xs = do
+  let half = length xs `div` 2
+      (left, right) = splitAt half xs
+  sortedLeft <- mergeSort cmp left
+  sortedRight <- mergeSort cmp right
+  mergeSorted cmp sortedLeft sortedRight
 
-insertSorted :: (MonadEval m) => NixValue -> NixValue -> [NixValue] -> m [NixValue]
-insertSorted _ val [] = pure [val]
-insertSorted cmp val (y : ys) = do
-  partial <- applyValue cmp val
+mergeSorted :: (MonadEval m) => NixValue -> [NixValue] -> [NixValue] -> m [NixValue]
+mergeSorted _ [] ys = pure ys
+mergeSorted _ xs [] = pure xs
+mergeSorted cmp (x : xs) (y : ys) = do
+  partial <- applyValue cmp x
   result <- applyValue partial y
   case result of
-    VBool True -> pure (val : y : ys)
-    VBool False -> (y :) <$> insertSorted cmp val ys
+    VBool True -> (x :) <$> mergeSorted cmp xs (y : ys)
+    VBool False -> (y :) <$> mergeSorted cmp (x : xs) ys
     _ -> throwEvalError "builtins.sort: comparator must return a bool"
 
 builtinConcatMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -1353,16 +1384,18 @@ elemCheck needle (thunk : rest) = do
 
 builtinElemAt :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinElemAt (VList thunks) (VInt idx)
-  | idx < 0 || idx >= fromIntegral (length thunks) =
-      throwEvalError
-        ( "builtins.elemAt: index "
-            <> T.pack (show idx)
-            <> " out of bounds for list of length "
-            <> T.pack (show (length thunks))
-        )
+  | idx < 0 = elemAtOOB idx thunks
   | otherwise = case drop (fromIntegral idx) thunks of
       (t : _) -> force t
-      [] -> throwEvalError "builtins.elemAt: index out of bounds"
+      [] -> elemAtOOB idx thunks
+  where
+    elemAtOOB i ts =
+      throwEvalError
+        ( "builtins.elemAt: index "
+            <> T.pack (show i)
+            <> " out of bounds for list of length "
+            <> T.pack (show (length ts))
+        )
 builtinElemAt (VList _) other =
   throwEvalError ("builtins.elemAt: expected an integer, got " <> typeName other)
 builtinElemAt other _ =
@@ -1383,16 +1416,18 @@ builtinPartition predFn (VList thunks) = do
 builtinPartition _ other =
   throwEvalError ("builtins.partition: expected a list, got " <> typeName other)
 
+-- | Tail-recursive partition with accumulator to avoid stack overflow.
 partitionThunks :: (MonadEval m) => NixValue -> [Thunk] -> m ([Thunk], [Thunk])
-partitionThunks _ [] = pure ([], [])
-partitionThunks predFn (thunk : rest) = do
-  val <- force thunk
-  result <- applyValue predFn val
-  (rs, ws) <- partitionThunks predFn rest
-  case result of
-    VBool True -> pure (thunk : rs, ws)
-    VBool False -> pure (rs, thunk : ws)
-    _ -> throwEvalError "builtins.partition: predicate must return a bool"
+partitionThunks predFn = go [] []
+  where
+    go !rs !ws [] = pure (reverse rs, reverse ws)
+    go !rs !ws (thunk : rest) = do
+      val <- force thunk
+      result <- applyValue predFn val
+      case result of
+        VBool True -> go (thunk : rs) ws rest
+        VBool False -> go rs (thunk : ws) rest
+        _ -> throwEvalError "builtins.partition: predicate must return a bool"
 
 builtinGroupBy :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGroupBy func (VList thunks) = do
@@ -1749,6 +1784,21 @@ builtinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromInteger b))
 builtinDiv (VFloat a) (VFloat b) = pure (VFloat (a / b))
 builtinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
+builtinMod :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinMod _ (VInt 0) = throwEvalError "builtins.mod: division by zero"
+builtinMod (VInt a) (VInt b) = pure (VInt (rem a b))
+builtinMod l r = throwEvalError ("builtins.mod: expected two integers, got " <> typeName l <> " and " <> typeName r)
+
+builtinMin :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinMin a b = do
+  aIsLess <- nixCompare a b
+  pure (if aIsLess then a else b)
+
+builtinMax :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinMax a b = do
+  aIsLess <- nixCompare a b
+  pure (if aIsLess then b else a)
+
 builtinBitAnd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinBitAnd (VInt a) (VInt b) = pure (VInt (a .&. b))
 builtinBitAnd _ _ = throwEvalError "builtins.bitAnd: expected two integers"
@@ -1876,26 +1926,27 @@ builtinReplaceStrings _ _ (VStr _ _) =
 builtinReplaceStrings _ _ other =
   throwEvalError ("builtins.replaceStrings: expected a string, got " <> typeName other)
 
+-- | Replace all occurrences, O(n) via chunk list + T.concat.
 replaceAll :: [(Text, Text)] -> Text -> Text
-replaceAll pairs = go
+replaceAll pairs input = T.concat (go input)
   where
     go remaining
       | T.null remaining =
           -- At end of string, still check for empty-from match
           case findMatch pairs remaining of
-            Just (replacement, _, _) -> replacement
-            Nothing -> ""
+            Just (replacement, _, _) -> [replacement]
+            Nothing -> []
       | otherwise = case findMatch pairs remaining of
           Just (replacement, rest, matched) ->
             if T.null matched
               then case T.uncons remaining of
                 -- empty-from: insert replacement then advance 1 char
-                Just (ch, after) -> replacement <> T.singleton ch <> go after
-                Nothing -> replacement -- unreachable: guarded by T.null above
-              else replacement <> go rest
+                Just (ch, after) -> replacement : T.singleton ch : go after
+                Nothing -> [replacement]
+              else replacement : go rest
           Nothing -> case T.uncons remaining of
-            Just (ch, after) -> T.singleton ch <> go after
-            Nothing -> "" -- unreachable: guarded by T.null above
+            Just (ch, after) -> T.singleton ch : go after
+            Nothing -> []
     findMatch [] _ = Nothing
     findMatch ((from, to) : rest) txt
       | T.null from = Just (to, txt, from)
@@ -1957,9 +2008,11 @@ buildSplitResult remaining pos [] =
   -- No more matches — emit the rest of the string.
   [evaluated (mkStr (T.pack (drop pos remaining)))]
 buildSplitResult remaining pos (match : rest) =
-  let fullMatch = match Array.! 0
-      (_, (matchStart, matchLen)) = fullMatch
-      -- Text before this match
+  let elems = Array.elems match
+      (_, (matchStart, matchLen)) = case elems of
+        (full : _) -> full
+        [] -> ("", (pos, 0)) -- defensive: should not happen from matchAllText
+        -- Text before this match
       before = T.pack (take (matchStart - pos) (drop pos remaining))
       -- Capture groups (indices 1..)
       groups = drop 1 (Array.elems match)
@@ -2061,13 +2114,13 @@ parseName t =
     Just idx -> (T.take idx t, T.drop (idx + 1) t)
 
 findVersionDash :: Text -> Int -> Maybe Int
-findVersionDash t idx
-  | idx >= T.length t = Nothing
-  | T.index t idx == '-'
-      && idx + 1 < T.length t
-      && isDigit (T.index t (idx + 1)) =
-      Just idx
-  | otherwise = findVersionDash t (idx + 1)
+findVersionDash t idx = case T.uncons (T.drop idx t) of
+  Nothing -> Nothing
+  Just ('-', after)
+    | Just (d, _) <- T.uncons after,
+      isDigit d ->
+        Just idx
+  Just _ -> findVersionDash t (idx + 1)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — serialization + hashing
@@ -2163,27 +2216,30 @@ parseJSON t = case T.uncons (T.stripStart t) of
 parseJSONString :: Text -> Maybe (NixValue, Text)
 parseJSONString t = case T.uncons t of
   Just ('"', rest) ->
-    let (strVal, remaining) = parseJSONStringContent rest ""
+    let (strVal, remaining) = parseJSONStringContent rest
      in Just (mkStr strVal, remaining)
   _ -> Nothing
 
-parseJSONStringContent :: Text -> Text -> (Text, Text)
-parseJSONStringContent t acc = case T.uncons t of
-  Nothing -> (acc, "")
-  Just ('"', rest) -> (acc, rest)
-  Just ('\\', rest) -> case T.uncons rest of
-    Just ('"', r) -> parseJSONStringContent r (acc <> "\"")
-    Just ('\\', r) -> parseJSONStringContent r (acc <> "\\")
-    Just ('/', r) -> parseJSONStringContent r (acc <> "/")
-    Just ('n', r) -> parseJSONStringContent r (acc <> "\n")
-    Just ('r', r) -> parseJSONStringContent r (acc <> "\r")
-    Just ('t', r) -> parseJSONStringContent r (acc <> "\t")
-    Just ('u', r) -> case parseHex4 r of
-      Just (codepoint, r2) ->
-        parseJSONStringContent r2 (acc <> T.singleton (chr codepoint))
-      Nothing -> parseJSONStringContent r (acc <> "u")
-    _ -> (acc, rest)
-  Just (c, rest) -> parseJSONStringContent rest (acc <> T.singleton c)
+-- | Parse JSON string content, O(n) via chunk list + T.concat.
+parseJSONStringContent :: Text -> (Text, Text)
+parseJSONStringContent = go []
+  where
+    go !chunks t = case T.uncons t of
+      Nothing -> (T.concat (reverse chunks), "")
+      Just ('"', rest) -> (T.concat (reverse chunks), rest)
+      Just ('\\', rest) -> case T.uncons rest of
+        Just ('"', r) -> go ("\"" : chunks) r
+        Just ('\\', r) -> go ("\\" : chunks) r
+        Just ('/', r) -> go ("/" : chunks) r
+        Just ('n', r) -> go ("\n" : chunks) r
+        Just ('r', r) -> go ("\r" : chunks) r
+        Just ('t', r) -> go ("\t" : chunks) r
+        Just ('u', r) -> case parseHex4 r of
+          Just (codepoint, r2) ->
+            go (T.singleton (chr codepoint) : chunks) r2
+          Nothing -> go ("u" : chunks) r
+        _ -> (T.concat (reverse chunks), rest)
+      Just (c, rest) -> go (T.singleton c : chunks) rest
 
 parseHex4 :: Text -> Maybe (Int, Text)
 parseHex4 t
@@ -2248,21 +2304,7 @@ parseJSONObjectEntries t acc = case T.uncons (T.stripStart t) of
 
 builtinHashString :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHashString (VStr algo _) (VStr input _) =
-  let inputBytes = TE.encodeUtf8 input
-   in case algo of
-        "sha256" ->
-          let digest = CH.hash inputBytes :: CH.Digest CH.SHA256
-           in pure (mkStr (digestToHex digest))
-        "sha512" ->
-          let digest = CH.hash inputBytes :: CH.Digest CH.SHA512
-           in pure (mkStr (digestToHex digest))
-        "sha1" ->
-          let digest = CH.hash inputBytes :: CH.Digest CH.SHA1
-           in pure (mkStr (digestToHex digest))
-        "md5" ->
-          let digest = CH.hash inputBytes :: CH.Digest CH.MD5
-           in pure (mkStr (digestToHex digest))
-        _ -> throwEvalError ("builtins.hashString: unknown hash algorithm '" <> algo <> "'")
+  hashBytesWithAlgo "hashString" algo (TE.encodeUtf8 input)
 builtinHashString (VStr _ _) other =
   throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
 builtinHashString other _ =
@@ -2303,21 +2345,25 @@ builtinGenericClosure (VAttrs attrs) = do
   operatorVal <- force operatorThunk
   case startSetVal of
     VList items -> do
-      result <- closureLoop operatorVal items [] []
+      result <- closureLoop operatorVal (Seq.fromList items) [] []
       pure (VList (map evaluated result))
     _ -> throwEvalError "builtins.genericClosure: 'startSet' must be a list"
 builtinGenericClosure other =
   throwEvalError ("builtins.genericClosure: expected a set, got " <> typeName other)
 
+-- | BFS loop for genericClosure.  Uses Data.Sequence for O(1) queue
+-- append (the old list-based version was O(n) per operator call).
+-- seenKeys is still a linear scan — Nix value equality is monadic so
+-- Set/HashMap is not directly applicable without specialising on key type.
 closureLoop ::
   (MonadEval m) =>
   NixValue ->
-  [Thunk] ->
+  Seq Thunk ->
   [NixValue] ->
   [NixValue] ->
   m [NixValue]
-closureLoop _ [] _ acc = pure (reverse acc)
-closureLoop operator (thunk : rest) seenKeys acc = do
+closureLoop _ Empty _ acc = pure (reverse acc)
+closureLoop operator (thunk :<| rest) seenKeys acc = do
   item <- force thunk
   key <- extractKey item
   alreadySeen <- keyInList key seenKeys
@@ -2327,7 +2373,7 @@ closureLoop operator (thunk : rest) seenKeys acc = do
       newItems <- applyValue operator item
       case newItems of
         VList newThunks ->
-          closureLoop operator (rest ++ newThunks) (key : seenKeys) (item : acc)
+          closureLoop operator (rest <> Seq.fromList newThunks) (key : seenKeys) (item : acc)
         _ -> throwEvalError "builtins.genericClosure: operator must return a list"
 
 extractKey :: (MonadEval m) => NixValue -> m NixValue
@@ -2418,7 +2464,7 @@ validateStorePath p
     T.length p > T.length storeDirPrefix,
     let basename = T.drop (T.length storeDirPrefix) p,
     T.length basename >= 33,
-    T.index basename 32 == '-' =
+    Just ('-', _) <- T.uncons (T.drop 32 basename) =
       pure (VPath p)
   | otherwise =
       throwEvalError ("builtins.storePath: not a valid store path: " <> p)
@@ -2671,7 +2717,7 @@ builtinDerivation (VAttrs attrs) = do
               doHashAlgo = "",
               doHash = ""
             }
-        | (outName, outP) <- outPaths
+          | (outName, outP) <- outPaths
         ]
 
   -- Build the complete Derivation with populated outputs and inputs
@@ -2741,3 +2787,663 @@ collectDrvEnvWithContext attrs = do
                 _ -> pure Nothing
             Nothing -> pure Nothing
         _ -> pure Nothing
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — hashFile, readFileType
+-- ---------------------------------------------------------------------------
+
+-- | @builtins.hashFile algo path@ — hash raw bytes of a file on disk.
+-- Returns base-16 hex string, matching @builtins.hashString@ output format.
+builtinHashFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinHashFile (VStr algo _) (VPath path) = do
+  bytes <- readFileBytes path
+  hashBytesWithAlgo "hashFile" algo bytes
+builtinHashFile (VStr algo _) (VStr path _) = do
+  bytes <- readFileBytes path
+  hashBytesWithAlgo "hashFile" algo bytes
+builtinHashFile (VStr _ _) other =
+  throwEvalError ("builtins.hashFile: expected a path, got " <> typeName other)
+builtinHashFile other _ =
+  throwEvalError ("builtins.hashFile: expected a string, got " <> typeName other)
+
+-- | Shared hash dispatch for raw 'ByteString' input.
+hashBytesWithAlgo :: (MonadEval m) => Text -> Text -> BS.ByteString -> m NixValue
+hashBytesWithAlgo ctx algo bytes = case algo of
+  "sha256" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA256)))
+  "sha512" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA512)))
+  "sha1" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA1)))
+  "md5" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.MD5)))
+  _ -> throwEvalError ("builtins." <> ctx <> ": unknown hash algorithm '" <> algo <> "'")
+
+-- | @builtins.readFileType path@ — classify a filesystem entry.
+-- Returns @"regular"@, @"directory"@, @"symlink"@, or @"unknown"@.
+builtinReadFileType :: (MonadEval m) => NixValue -> m NixValue
+builtinReadFileType (VPath path) = mkStr <$> getFileType path
+builtinReadFileType (VStr path _) = mkStr <$> getFileType path
+builtinReadFileType other =
+  throwEvalError ("builtins.readFileType: expected a path, got " <> typeName other)
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — convertHash
+-- ---------------------------------------------------------------------------
+
+-- | @builtins.convertHash { hash, hashAlgo?, toHashFormat }@ — convert
+-- between hash representations.  Supports base16, nix32, base64, and sri.
+builtinConvertHash :: (MonadEval m) => NixValue -> m NixValue
+builtinConvertHash (VAttrs attrs) = do
+  hashVal <- requireStrAttr "convertHash" "hash" attrs
+  toFmt <- requireStrAttr "convertHash" "toHashFormat" attrs
+  -- Detect input format and decode to raw bytes + algo
+  (algo, rawBytes) <- decodeHashInput attrs hashVal
+  -- Encode to target format
+  case toFmt of
+    "base16" -> pure (mkStr (bytesToHex rawBytes))
+    "nix32" -> pure (mkStr (Nix32.encode rawBytes))
+    "base32" -> pure (mkStr (Nix32.encode rawBytes)) -- deprecated alias
+    "base64" -> pure (mkStr (bytesToBase64 rawBytes))
+    "sri" -> pure (mkStr (algo <> "-" <> bytesToBase64 rawBytes))
+    _ -> throwEvalError ("builtins.convertHash: unknown toHashFormat '" <> toFmt <> "'")
+builtinConvertHash other =
+  throwEvalError ("builtins.convertHash: expected a set, got " <> typeName other)
+
+-- | Extract algo + raw bytes from the hash input, handling SRI, prefixed, and plain formats.
+decodeHashInput :: (MonadEval m) => AttrSet -> Text -> m (Text, BS.ByteString)
+decodeHashInput attrs hashStr
+  -- SRI format: algo-base64
+  | Just (algo, b64) <- parseSRI hashStr = do
+      bytes <- decodeBase64E "convertHash" b64
+      pure (algo, bytes)
+  -- Prefixed format: algo:hex or algo:nix32
+  | Just (algo, rest) <- parseAlgoPrefix hashStr =
+      decodeWithAlgo algo rest
+  -- Plain hash — need hashAlgo attribute
+  | otherwise = do
+      algo <- requireStrAttr "convertHash" "hashAlgo" attrs
+      decodeWithAlgo algo hashStr
+
+-- | Try to decode as hex, then nix32, then base64.
+decodeWithAlgo :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
+decodeWithAlgo algo s
+  | Just bytes <- hexToBytes s = pure (algo, bytes)
+  | Right bytes <- Nix32.decode s = pure (algo, bytes)
+  | Right bytes <- decodeBase64Pure s = pure (algo, bytes)
+  | otherwise = throwEvalError ("builtins.convertHash: cannot decode hash '" <> s <> "'")
+
+-- | Parse @sha256-base64...@ SRI format.
+parseSRI :: Text -> Maybe (Text, Text)
+parseSRI t = case T.breakOn "-" t of
+  (algo, rest)
+    | not (T.null rest) && algo `elem` ["sha256", "sha512", "sha1", "md5"] ->
+        Just (algo, T.drop 1 rest)
+  _ -> Nothing
+
+-- | Parse @sha256:value@ prefixed format.
+parseAlgoPrefix :: Text -> Maybe (Text, Text)
+parseAlgoPrefix t = case T.breakOn ":" t of
+  (algo, rest)
+    | not (T.null rest) && algo `elem` ["sha256", "sha512", "sha1", "md5"] ->
+        Just (algo, T.drop 1 rest)
+  _ -> Nothing
+
+-- | Require a string attribute from an attrset.
+requireStrAttr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
+requireStrAttr ctx key attrs = case attrSetLookup key attrs of
+  Just thunk -> do
+    val <- force thunk
+    case val of
+      VStr s _ -> pure s
+      _ -> throwEvalError ("builtins." <> ctx <> ": " <> key <> " must be a string")
+  Nothing -> throwEvalError ("builtins." <> ctx <> ": missing required attribute '" <> key <> "'")
+
+-- | Encode bytes to base16 hex.
+bytesToHex :: BS.ByteString -> Text
+bytesToHex = T.pack . concatMap byteToHex . BS.unpack
+
+-- | Decode hex string to bytes.
+hexToBytes :: Text -> Maybe BS.ByteString
+hexToBytes t
+  | T.null t = Just BS.empty
+  | odd (T.length t) = Nothing
+  | T.all isHexDigit t = Just (BS.pack (go (T.unpack t)))
+  | otherwise = Nothing
+  where
+    go [] = []
+    go (hi : lo : rest) = fromIntegral (digitToInt hi * 16 + digitToInt lo) : go rest
+    go [_] = [] -- unreachable due to odd check
+
+-- ---------------------------------------------------------------------------
+-- Base64 encode/decode — delegates to nova-cache (base64-bytestring under the hood)
+-- ---------------------------------------------------------------------------
+
+-- | Encode bytes to base64.
+bytesToBase64 :: BS.ByteString -> Text
+bytesToBase64 = B64.encode
+
+-- | Decode base64 text to bytes (pure).
+decodeBase64Pure :: Text -> Either Text BS.ByteString
+decodeBase64Pure t =
+  case B64.decode (T.filter (/= '=') (T.filter (/= '\n') (T.filter (/= '\r') t))) of
+    Right bytes -> Right bytes
+    Left _ -> Left "invalid base64"
+
+-- | Decode base64 with error context for builtins.
+decodeBase64E :: (MonadEval m) => Text -> Text -> m BS.ByteString
+decodeBase64E ctx t = case decodeBase64Pure t of
+  Right bytes -> pure bytes
+  Left _ -> throwEvalError ("builtins." <> ctx <> ": invalid base64 encoding")
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — fromTOML
+-- ---------------------------------------------------------------------------
+
+-- | @builtins.fromTOML str@ — parse a TOML document to a Nix value.
+-- Hand-rolled parser covering the TOML v1.0 subset used by nixpkgs:
+-- bare/quoted keys, dotted keys, basic/literal strings (multiline),
+-- integers (dec/hex/oct/bin), floats (inc. inf/nan), booleans,
+-- inline tables, arrays, array-of-tables, and standard tables.
+-- Datetimes are represented as strings (matching real Nix).
+builtinFromTOML :: (MonadEval m) => NixValue -> m NixValue
+builtinFromTOML (VStr s _) = case parseTOML s of
+  Right val -> pure val
+  Left err -> throwEvalError ("builtins.fromTOML: " <> err)
+builtinFromTOML other =
+  throwEvalError ("builtins.fromTOML: expected a string, got " <> typeName other)
+
+-- | Intermediate TOML value before conversion to NixValue.
+data TOMLValue
+  = TOMLStr !Text
+  | TOMLInt !Integer
+  | TOMLFloat !Double
+  | TOMLBool !Bool
+  | TOMLArray ![TOMLValue]
+  | TOMLTable !(Map Text TOMLValue)
+  deriving (Show)
+
+-- | Parse a TOML document into a NixValue.
+parseTOML :: Text -> Either Text NixValue
+parseTOML input = do
+  table <- parseTOMLDoc (T.lines input)
+  pure (tomlToNix (TOMLTable table))
+
+-- | Convert a TOMLValue to NixValue.
+tomlToNix :: TOMLValue -> NixValue
+tomlToNix val = case val of
+  TOMLStr s -> mkStr s
+  TOMLInt n -> VInt n
+  TOMLFloat d -> VFloat d
+  TOMLBool b -> VBool b
+  TOMLArray xs -> VList (map (evaluated . tomlToNix) xs)
+  TOMLTable m -> VAttrs (attrSetFromMap (Map.map (evaluated . tomlToNix) m))
+
+-- | Parse all lines of a TOML document into a table.
+parseTOMLDoc :: [Text] -> Either Text (Map Text TOMLValue)
+parseTOMLDoc lns = go lns [] Map.empty
+  where
+    go [] _ root = Right root
+    go (line : rest) currentPath root
+      | T.null stripped || T.isPrefixOf "#" stripped =
+          -- Empty line or comment
+          go rest currentPath root
+      | T.isPrefixOf "[[" stripped && T.isSuffixOf "]]" stripped =
+          -- Array of tables: [[key]]
+          let keyStr = T.strip (T.drop 2 (T.dropEnd 2 stripped))
+              keys = parseDottedKey keyStr
+           in go rest keys (insertArrayTable keys root)
+      | T.isPrefixOf "[" stripped && T.isSuffixOf "]" stripped =
+          -- Standard table: [key]
+          let keyStr = T.strip (T.drop 1 (T.dropEnd 1 stripped))
+              keys = parseDottedKey keyStr
+           in go rest keys (ensureTable keys root)
+      | otherwise =
+          -- Key = value pair
+          case parseKVLine stripped of
+            Right (keys, val) ->
+              go rest currentPath (insertNested (currentPath ++ keys) val root)
+            Left err -> Left err
+      where
+        stripped = T.strip line
+
+-- | Parse a key = value line.
+parseKVLine :: Text -> Either Text ([Text], TOMLValue)
+parseKVLine line =
+  let (keyPart, afterEq) = splitAtEquals line
+   in case T.uncons afterEq of
+        Nothing -> Left ("expected '=' in: " <> line)
+        Just _ -> do
+          let val = T.strip afterEq
+          parsed <- parseTOMLValue val
+          Right (parseDottedKey (T.strip keyPart), parsed)
+
+-- | Split a line at the first unquoted '=' sign.
+splitAtEquals :: Text -> (Text, Text)
+splitAtEquals = go T.empty
+  where
+    go acc t = case T.uncons t of
+      Nothing -> (acc, T.empty)
+      Just ('=', rest) -> (acc, rest)
+      Just ('"', rest) ->
+        let (quoted, after) = T.break (== '"') rest
+         in case T.uncons after of
+              Just ('"', r) -> go (acc <> "\"" <> quoted <> "\"") r
+              _ -> go (acc <> "\"" <> quoted) after
+      Just ('\'', rest) ->
+        let (quoted, after) = T.break (== '\'') rest
+         in case T.uncons after of
+              Just ('\'', r) -> go (acc <> "'" <> quoted <> "'") r
+              _ -> go (acc <> "'" <> quoted) after
+      Just (c, rest) -> go (T.snoc acc c) rest
+
+-- | Parse dotted key like @foo.bar."baz qux"@ into @["foo", "bar", "baz qux"]@.
+parseDottedKey :: Text -> [Text]
+parseDottedKey t
+  | T.null t = []
+  | otherwise = case T.uncons t of
+      Just ('"', rest) ->
+        let (key, after) = T.break (== '"') rest
+         in key : parseDottedKey (T.drop 1 (T.stripStart (dropDot after)))
+      Just ('\'', rest) ->
+        let (key, after) = T.break (== '\'') rest
+         in key : parseDottedKey (T.drop 1 (T.stripStart (dropDot after)))
+      _ ->
+        let (key, after) = T.break (\c -> c == '.' || c == '"') t
+         in T.strip key : case T.uncons after of
+              Nothing -> []
+              Just _ -> parseDottedKey (T.drop 1 (T.stripStart after))
+  where
+    dropDot txt = case T.uncons txt of
+      Just ('.', rest) -> rest
+      _ -> txt
+
+-- | Parse a TOML value (right side of '=').
+parseTOMLValue :: Text -> Either Text TOMLValue
+parseTOMLValue t =
+  let stripped = T.strip t
+      -- Strip inline comments (not inside strings)
+      cleaned = stripInlineComment stripped
+   in case T.uncons cleaned of
+        Nothing -> Left "empty value"
+        Just ('"', _)
+          | T.isPrefixOf "\"\"\"" cleaned -> parseMultilineBasicStr (T.drop 3 cleaned)
+          | otherwise -> parseBasicStr (T.drop 1 cleaned)
+        Just ('\'', _)
+          | T.isPrefixOf "'''" cleaned -> parseMultilineLiteralStr (T.drop 3 cleaned)
+          | otherwise -> parseLiteralStr (T.drop 1 cleaned)
+        Just ('{', _) -> parseInlineTable cleaned
+        Just ('[', _) -> parseInlineArray cleaned
+        Just ('t', _)
+          | T.isPrefixOf "true" cleaned -> Right (TOMLBool True)
+        Just ('f', _)
+          | T.isPrefixOf "false" cleaned -> Right (TOMLBool False)
+        Just ('i', _)
+          | T.isPrefixOf "inf" cleaned -> Right (TOMLFloat (1 / 0))
+        Just ('+', rest)
+          | T.isPrefixOf "inf" rest -> Right (TOMLFloat (1 / 0))
+          | T.isPrefixOf "nan" rest -> Right (TOMLFloat (0 / 0))
+        Just ('-', rest)
+          | T.isPrefixOf "inf" rest -> Right (TOMLFloat (negate (1 / 0)))
+          | T.isPrefixOf "nan" rest -> Right (TOMLFloat (0 / 0))
+        Just ('n', _)
+          | T.isPrefixOf "nan" cleaned -> Right (TOMLFloat (0 / 0))
+        _ -> parseTOMLNumberOrDatetime cleaned
+
+-- | Strip inline comment from a value (not inside quotes).
+stripInlineComment :: Text -> Text
+stripInlineComment = go (0 :: Int)
+  where
+    go _ t | T.null t = T.empty
+    go depth t = case T.uncons t of
+      Nothing -> T.empty
+      Just ('#', _) | depth == (0 :: Int) -> T.empty
+      Just ('"', rest)
+        | depth == 0 ->
+            let (str, after) = T.break (== '"') rest
+             in T.cons '"' (str <> T.take 1 after <> go depth (T.drop 1 after))
+      Just ('[', rest) -> T.cons '[' (go (depth + 1) rest)
+      Just ('{', rest) -> T.cons '{' (go (depth + 1) rest)
+      Just (']', rest) -> T.cons ']' (go (max 0 (depth - 1)) rest)
+      Just ('}', rest) -> T.cons '}' (go (max 0 (depth - 1)) rest)
+      Just (c, rest) -> T.cons c (go depth rest)
+
+-- | Parse a basic (double-quoted) TOML string.
+-- O(n) via chunk list + T.concat instead of O(n^2) T.snoc.
+parseBasicStr :: Text -> Either Text TOMLValue
+parseBasicStr = go []
+  where
+    go !chunks t = case T.uncons t of
+      Nothing -> Left "unterminated basic string"
+      Just ('"', _) -> Right (TOMLStr (T.concat (reverse chunks)))
+      Just ('\\', rest) -> case T.uncons rest of
+        Just ('n', r) -> go ("\n" : chunks) r
+        Just ('t', r) -> go ("\t" : chunks) r
+        Just ('r', r) -> go ("\r" : chunks) r
+        Just ('\\', r) -> go ("\\" : chunks) r
+        Just ('"', r) -> go ("\"" : chunks) r
+        Just ('b', r) -> go ("\b" : chunks) r
+        Just ('f', r) -> go ("\f" : chunks) r
+        Just ('u', r) -> case parseHex4 r of
+          Just (cp, r2) -> go (T.singleton (chr cp) : chunks) r2
+          Nothing -> Left "invalid \\u escape"
+        _ -> Left "invalid escape sequence"
+      Just (c, rest) -> go (T.singleton c : chunks) rest
+
+-- | Parse a literal (single-quoted) TOML string.
+parseLiteralStr :: Text -> Either Text TOMLValue
+parseLiteralStr t =
+  let (content, rest) = T.break (== '\'') t
+   in case T.uncons rest of
+        Just ('\'', _) -> Right (TOMLStr content)
+        _ -> Left "unterminated literal string"
+
+-- | Parse a multiline basic string.
+parseMultilineBasicStr :: Text -> Either Text TOMLValue
+parseMultilineBasicStr t =
+  case T.breakOn "\"\"\"" t of
+    (content, rest)
+      | T.isPrefixOf "\"\"\"" rest ->
+          Right (TOMLStr (T.replace "\\\n" "" (stripLeadingNewline content)))
+      | otherwise -> Left ("unterminated multiline basic string, remaining: " <> T.take 20 rest)
+
+-- | Parse a multiline literal string.
+parseMultilineLiteralStr :: Text -> Either Text TOMLValue
+parseMultilineLiteralStr t =
+  case T.breakOn "'''" t of
+    (content, rest)
+      | T.isPrefixOf "'''" rest -> Right (TOMLStr (stripLeadingNewline content))
+      | otherwise -> Left "unterminated multiline literal string"
+
+-- | Strip a leading newline (TOML spec: first newline after opening quotes is trimmed).
+stripLeadingNewline :: Text -> Text
+stripLeadingNewline t = case T.uncons t of
+  Just ('\n', rest) -> rest
+  Just ('\r', rest) -> case T.uncons rest of
+    Just ('\n', r) -> r
+    _ -> rest
+  _ -> t
+
+-- | Parse a TOML number or datetime.
+parseTOMLNumberOrDatetime :: Text -> Either Text TOMLValue
+parseTOMLNumberOrDatetime s
+  -- Hex, octal, binary integers
+  | T.isPrefixOf "0x" s || T.isPrefixOf "0X" s = parseHexInt (T.drop 2 s)
+  | T.isPrefixOf "0o" s || T.isPrefixOf "0O" s = parseOctInt (T.drop 2 s)
+  | T.isPrefixOf "0b" s || T.isPrefixOf "0B" s = parseBinInt (T.drop 2 s)
+  -- Contains date separators → treat as datetime string
+  | T.any (== 'T') s && T.any (== '-') s = Right (TOMLStr s)
+  | T.count "-" s >= 2 && T.any isDigit s = Right (TOMLStr s)
+  | T.any (== ':') s && T.any isDigit s = Right (TOMLStr s)
+  -- Float (has dot or exponent)
+  | T.any (== '.') s || T.any (\c -> c == 'e' || c == 'E') s = parseFloat s
+  -- Plain integer
+  | otherwise = parseInt s
+
+-- | Parse a plain decimal integer, ignoring underscores.
+parseInt :: Text -> Either Text TOMLValue
+parseInt t =
+  let cleaned = T.filter (/= '_') t
+      (sign, digits) = case T.uncons cleaned of
+        Just ('+', rest) -> (1, rest)
+        Just ('-', rest) -> (-1, rest)
+        _ -> (1, cleaned)
+   in case readDecimal digits of
+        Just n -> Right (TOMLInt (sign * n))
+        Nothing -> Left ("invalid integer: " <> t)
+
+parseHexInt :: Text -> Either Text TOMLValue
+parseHexInt t =
+  let cleaned = T.filter (/= '_') t
+   in case readHexT cleaned of
+        Just n -> Right (TOMLInt n)
+        Nothing -> Left ("invalid hex integer: " <> t)
+
+parseOctInt :: Text -> Either Text TOMLValue
+parseOctInt t =
+  let cleaned = T.filter (/= '_') t
+   in case readOctT cleaned of
+        Just n -> Right (TOMLInt n)
+        Nothing -> Left ("invalid octal integer: " <> t)
+
+parseBinInt :: Text -> Either Text TOMLValue
+parseBinInt t =
+  let cleaned = T.filter (/= '_') t
+   in case readBinT cleaned of
+        Just n -> Right (TOMLInt n)
+        Nothing -> Left ("invalid binary integer: " <> t)
+
+parseFloat :: Text -> Either Text TOMLValue
+parseFloat t =
+  let cleaned = T.filter (/= '_') t
+   in case readDouble cleaned of
+        Just d -> Right (TOMLFloat d)
+        Nothing -> Left ("invalid float: " <> t)
+
+-- | Read a decimal integer from Text.
+readDecimal :: Text -> Maybe Integer
+readDecimal t
+  | T.null t = Nothing
+  | T.all isDigit t = Just (T.foldl' (\acc c -> acc * 10 + toInteger (digitToInt c)) 0 t)
+  | otherwise = Nothing
+
+readHexT :: Text -> Maybe Integer
+readHexT t
+  | T.null t = Nothing
+  | T.all isHexDigit t = Just (T.foldl' (\acc c -> acc * 16 + toInteger (digitToInt c)) 0 t)
+  | otherwise = Nothing
+
+readOctT :: Text -> Maybe Integer
+readOctT t
+  | T.null t = Nothing
+  | T.all isOctDigit t =
+      Just (T.foldl' (\acc c -> acc * 8 + toInteger (digitToInt c)) 0 t)
+  | otherwise = Nothing
+
+readBinT :: Text -> Maybe Integer
+readBinT t
+  | T.null t = Nothing
+  | T.all (\c -> c == '0' || c == '1') t =
+      Just (T.foldl' (\acc c -> acc * 2 + toInteger (digitToInt c)) 0 t)
+  | otherwise = Nothing
+
+readDouble :: Text -> Maybe Double
+readDouble t = case reads (T.unpack t) of
+  [(d, "")] -> Just d
+  _ -> Nothing
+
+-- | Parse an inline table: @{ key = val, ... }@.
+parseInlineTable :: Text -> Either Text TOMLValue
+parseInlineTable t = case T.uncons t of
+  Just ('{', rest) ->
+    let inner = T.strip (T.dropWhileEnd (== '}') (T.strip rest))
+     in if T.null inner
+          then Right (TOMLTable Map.empty)
+          else do
+            pairs <- mapM parseInlineKV (splitCommas inner)
+            Right (TOMLTable (Map.fromList (concatMap flattenPair pairs)))
+  _ -> Left "expected '{'"
+  where
+    flattenPair (keys, val) = case keys of
+      [] -> []
+      [k] -> [(k, val)]
+      (k : ks) -> [(k, nestKeys ks val)]
+    nestKeys [] v = v
+    nestKeys (k : ks) v = TOMLTable (Map.singleton k (nestKeys ks v))
+
+-- | Parse an inline array: @[ val, ... ]@.
+parseInlineArray :: Text -> Either Text TOMLValue
+parseInlineArray t = case T.uncons t of
+  Just ('[', rest) ->
+    let inner = T.strip (T.dropWhileEnd (== ']') (T.strip rest))
+     in if T.null inner
+          then Right (TOMLArray [])
+          else do
+            vals <- mapM (parseTOMLValue . T.strip) (splitCommas inner)
+            Right (TOMLArray vals)
+  _ -> Left "expected '['"
+
+-- | Parse a single key=value pair in an inline table.
+parseInlineKV :: Text -> Either Text ([Text], TOMLValue)
+parseInlineKV t =
+  let (keyPart, afterEq) = splitAtEquals (T.strip t)
+   in do
+        val <- parseTOMLValue (T.strip afterEq)
+        Right (parseDottedKey (T.strip keyPart), val)
+
+-- | Split on commas not inside brackets or braces.
+-- O(n) via chunk list + T.concat instead of O(n^2) T.snoc.
+splitCommas :: Text -> [Text]
+splitCommas = go (0 :: Int) []
+  where
+    finalize chunks =
+      let t = T.concat (reverse chunks)
+       in [t | not (T.null (T.strip t))]
+    go _ !chunks t | T.null t = finalize chunks
+    go depth !chunks t = case T.uncons t of
+      Nothing -> finalize chunks
+      Just (',', rest) | depth == 0 -> T.concat (reverse chunks) : go 0 [] rest
+      Just ('[', rest) -> go (depth + 1) ("[" : chunks) rest
+      Just ('{', rest) -> go (depth + 1) ("{" : chunks) rest
+      Just (']', rest) -> go (max 0 (depth - 1)) ("]" : chunks) rest
+      Just ('}', rest) -> go (max 0 (depth - 1)) ("}" : chunks) rest
+      Just ('"', rest) ->
+        let (str, after) = T.break (== '"') rest
+            consumed = "\"" <> str <> T.take 1 after
+         in go depth (consumed : chunks) (T.drop 1 after)
+      Just (c, rest) -> go depth (T.singleton c : chunks) rest
+
+-- | Insert a value at a nested key path into a table.
+insertNested :: [Text] -> TOMLValue -> Map Text TOMLValue -> Map Text TOMLValue
+insertNested [] _ m = m
+insertNested [k] v m = Map.insert k v m
+insertNested (k : ks) v m =
+  let sub = case Map.lookup k m of
+        Just (TOMLTable inner) -> inner
+        _ -> Map.empty
+   in Map.insert k (TOMLTable (insertNested ks v sub)) m
+
+-- | Ensure a table path exists (for @[table]@ headers).
+ensureTable :: [Text] -> Map Text TOMLValue -> Map Text TOMLValue
+ensureTable [] m = m
+ensureTable [k] m = case Map.lookup k m of
+  Just (TOMLTable _) -> m
+  Nothing -> Map.insert k (TOMLTable Map.empty) m
+  _ -> m
+ensureTable (k : ks) m =
+  let sub = case Map.lookup k m of
+        Just (TOMLTable inner) -> inner
+        _ -> Map.empty
+   in Map.insert k (TOMLTable (ensureTable ks sub)) m
+
+-- | Insert an entry into an array-of-tables (@[[table]]@).
+insertArrayTable :: [Text] -> Map Text TOMLValue -> Map Text TOMLValue
+insertArrayTable [] m = m
+insertArrayTable [k] m = case Map.lookup k m of
+  Just (TOMLArray xs) -> Map.insert k (TOMLArray (xs ++ [TOMLTable Map.empty])) m
+  Nothing -> Map.insert k (TOMLArray [TOMLTable Map.empty]) m
+  _ -> Map.insert k (TOMLArray [TOMLTable Map.empty]) m
+insertArrayTable (k : ks) m =
+  let sub = case Map.lookup k m of
+        Just (TOMLTable inner) -> inner
+        Just (TOMLArray xs) ->
+          -- Descend into the last element of the array
+          case reverse xs of
+            (TOMLTable inner : _) -> inner
+            _ -> Map.empty
+        _ -> Map.empty
+      updated = insertArrayTable ks sub
+   in case Map.lookup k m of
+        Just (TOMLArray xs) ->
+          case reverse xs of
+            (TOMLTable _ : prev) ->
+              Map.insert k (TOMLArray (reverse prev ++ [TOMLTable updated])) m
+            _ -> Map.insert k (TOMLTable updated) m
+        _ -> Map.insert k (TOMLTable updated) m
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — toXML
+-- ---------------------------------------------------------------------------
+
+-- | @builtins.toXML val@ — convert a Nix value to its XML representation.
+-- Matches the format defined by the Nix manual: strings, ints, floats,
+-- bools, nulls, lists, and attrsets map to their XML counterparts.
+builtinToXML :: (MonadEval m) => NixValue -> m NixValue
+builtinToXML val = do
+  xml <- valueToXML 0 val
+  pure (mkStr ("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n" <> xml <> "</expr>\n"))
+
+valueToXML :: (MonadEval m) => Int -> NixValue -> m Text
+valueToXML depth val = case val of
+  VStr s _ ->
+    pure (indent depth <> "<string value=" <> xmlQuote s <> " />\n")
+  VInt n ->
+    pure (indent depth <> "<int value=\"" <> T.pack (show n) <> "\" />\n")
+  VFloat d ->
+    pure (indent depth <> "<float value=\"" <> T.pack (show d) <> "\" />\n")
+  VBool True ->
+    pure (indent depth <> "<bool value=\"true\" />\n")
+  VBool False ->
+    pure (indent depth <> "<bool value=\"false\" />\n")
+  VNull ->
+    pure (indent depth <> "<null />\n")
+  VPath p ->
+    pure (indent depth <> "<path value=" <> xmlQuote p <> " />\n")
+  VList thunks -> do
+    items <- mapM (force >=> valueToXML (depth + 1)) thunks
+    pure (indent depth <> "<list>\n" <> T.concat items <> indent depth <> "</list>\n")
+  VAttrs attrs -> do
+    let pairs = attrSetToAscList attrs
+    items <- mapM (attrToXML (depth + 1)) pairs
+    pure (indent depth <> "<attrs>\n" <> T.concat items <> indent depth <> "</attrs>\n")
+  VLambda {} ->
+    pure (indent depth <> "<function />\n")
+  VBuiltin _ _ ->
+    pure (indent depth <> "<function />\n")
+  VDerivation _ ->
+    pure (indent depth <> "<derivation />\n")
+  where
+    attrToXML d (name, thunk) = do
+      v <- force thunk
+      inner <- valueToXML d v
+      pure (indent d <> "<attr name=" <> xmlQuote name <> ">\n" <> inner <> indent d <> "</attr>\n")
+
+indent :: Int -> Text
+indent n = T.replicate (n * 2) " "
+
+xmlQuote :: Text -> Text
+xmlQuote s = "\"" <> T.concatMap escapeChar s <> "\""
+  where
+    escapeChar '<' = "&lt;"
+    escapeChar '>' = "&gt;"
+    escapeChar '&' = "&amp;"
+    escapeChar '"' = "&quot;"
+    escapeChar c = T.singleton c
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — filterSource
+-- ---------------------------------------------------------------------------
+
+-- | @builtins.filterSource filter path@ — copy a path to the store,
+-- filtering entries via a predicate.  The filter function receives
+-- @(path, type)@ where type is @"regular"@, @"directory"@, @"symlink"@,
+-- or @"unknown"@.
+builtinFilterSource :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinFilterSource _filterFn (VPath _path) =
+  throwEvalError "builtins.filterSource: not yet implemented (requires store integration)"
+builtinFilterSource _filterFn (VStr _path _) =
+  throwEvalError "builtins.filterSource: not yet implemented (requires store integration)"
+builtinFilterSource _ other =
+  throwEvalError ("builtins.filterSource: expected a path, got " <> typeName other)
+
+-- ---------------------------------------------------------------------------
+-- Builtin stubs — experimental features
+-- ---------------------------------------------------------------------------
+
+builtinOutputOf :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinOutputOf _ _ =
+  throwEvalError "builtins.outputOf: requires experimental feature 'dynamic-derivations'"
+
+builtinFetchTree :: (MonadEval m) => NixValue -> m NixValue
+builtinFetchTree _ =
+  throwEvalError "builtins.fetchTree: requires experimental feature 'fetch-tree'"
+
+builtinFetchClosure :: (MonadEval m) => NixValue -> m NixValue
+builtinFetchClosure _ =
+  throwEvalError "builtins.fetchClosure: requires experimental feature 'fetch-closure'"

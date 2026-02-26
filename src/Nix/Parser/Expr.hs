@@ -18,7 +18,6 @@ module Nix.Parser.Expr
 where
 
 import Data.Text (Text)
-import qualified Data.Text as T
 import Nix.Expr.Types
 import Nix.Parser.Internal
 import Nix.Parser.Lexer (Token (..))
@@ -36,7 +35,7 @@ parseTopLevel = do
     then pure expr
     else do
       tok <- peek
-      parseError ("unexpected " <> showTok tok <> " after expression")
+      parseError ("unexpected " <> showToken tok <> " after expression")
 
 -- ---------------------------------------------------------------------------
 -- Expression (entry point for precedence climbing)
@@ -105,7 +104,7 @@ trySetLambda = do
       name <- expectIdent
       expect TokColon
       ELambda (FormalNamedSet name formals hasEllipsis) <$> parseExpr
-    _ -> parseError ("expected ':' or '@' after formals, got " <> showTok tok)
+    _ -> parseError ("expected ':' or '@' after formals, got " <> showToken tok)
 
 -- | Parse the inside of @{ ... }@ formals (comma-separated, optional defaults,
 -- optional ellipsis). Expects the closing @}@.
@@ -132,7 +131,7 @@ parseFormalsList acc = do
       then Just <$> parseExpr
       else pure Nothing
   let formal = Formal {fName = name, fDefault = defVal}
-      newAcc = acc ++ [formal]
+      newAcc = formal : acc
   tok <- peek
   case tok of
     TokComma -> do
@@ -143,15 +142,15 @@ parseFormalsList acc = do
         TokEllipsis -> do
           _ <- advance
           expect TokRBrace
-          pure (newAcc, True)
+          pure (reverse newAcc, True)
         TokRBrace -> do
           _ <- advance
-          pure (newAcc, False)
+          pure (reverse newAcc, False)
         _ -> parseFormalsList newAcc
     TokRBrace -> do
       _ <- advance
-      pure (newAcc, False)
-    _ -> parseError ("expected ',' or '}' in formals, got " <> showTok tok)
+      pure (reverse newAcc, False)
+    _ -> parseError ("expected ',' or '}' in formals, got " <> showToken tok)
 
 -- ---------------------------------------------------------------------------
 -- Precedence levels (lowest to highest)
@@ -389,7 +388,7 @@ parseAtom = do
     TokIf -> parseIf
     TokWith -> parseWith
     TokAssert -> parseAssert
-    _ -> parseError ("unexpected " <> showTok tok)
+    _ -> parseError ("unexpected " <> showToken tok)
 
 -- ---------------------------------------------------------------------------
 -- Strings
@@ -424,7 +423,7 @@ parseStringParts closer = go []
           expr <- parseExpr
           expect TokInterpClose
           go (StrInterp expr : acc)
-        _ -> parseError ("unexpected " <> showTok tok <> " in string")
+        _ -> parseError ("unexpected " <> showToken tok <> " in string")
 
 -- ---------------------------------------------------------------------------
 -- Compound expressions
@@ -454,7 +453,7 @@ parseListElems = go []
         _ | canStartAtom tok -> do
           elem_ <- parseSelect
           go (elem_ : acc)
-        _ -> parseError ("unexpected " <> showTok tok <> " in list")
+        _ -> parseError ("unexpected " <> showToken tok <> " in list")
 
 parseAttrSet :: Bool -> Parser Expr
 parseAttrSet isRec =
@@ -509,13 +508,13 @@ parseInheritNames = go []
       case tok of
         TokIdent name -> do
           _ <- advance
-          go (acc ++ [name])
+          go (name : acc)
         -- Quoted strings for keywords used as attribute names: inherit "or";
         TokStringOpen -> do
           _ <- advance
           name <- parseQuotedInheritName
-          go (acc ++ [name])
-        _ -> pure acc
+          go (name : acc)
+        _ -> pure (reverse acc)
 
 -- | Parse a quoted inherit name: a simple string literal (no interpolation).
 -- Used for keywords like @"or"@ in @inherit (self.trivial) "or";@.
@@ -530,7 +529,7 @@ parseQuotedInheritName = do
     TokStringClose -> do
       _ <- advance
       pure ""
-    _ -> parseError ("expected string literal in inherit, got " <> showTok tok)
+    _ -> parseError ("expected string literal in inherit, got " <> showToken tok)
 
 parseAttrPath :: Parser AttrPath
 parseAttrPath = do
@@ -553,7 +552,7 @@ parseAttrKey = do
       -- mode — } is TokRBrace rather than TokInterpClose.
       expect TokRBrace
       pure (DynamicKey expr)
-    _ -> parseError ("expected attribute key, got " <> showTok tok)
+    _ -> parseError ("expected attribute key, got " <> showToken tok)
 
 parseLet :: Parser Expr
 parseLet = do
@@ -621,63 +620,7 @@ canStartAtom TokLBrace = True
 canStartAtom TokLBracket = True
 canStartAtom TokRec = True
 canStartAtom TokLet = True
+canStartAtom TokIf = True
+canStartAtom TokWith = True
+canStartAtom TokAssert = True
 canStartAtom _ = False
-
--- | Show a token for error messages (short form).
-showTok :: Token -> Text
-showTok TokEOF = "end of input"
-showTok TokIf = "'if'"
-showTok TokThen = "'then'"
-showTok TokElse = "'else'"
-showTok TokLet = "'let'"
-showTok TokIn = "'in'"
-showTok TokWith = "'with'"
-showTok TokAssert = "'assert'"
-showTok TokRec = "'rec'"
-showTok TokInherit = "'inherit'"
-showTok TokTrue = "'true'"
-showTok TokFalse = "'false'"
-showTok TokNull = "'null'"
-showTok (TokIdent n) = "'" <> n <> "'"
-showTok (TokInt n) = T.pack (show n)
-showTok (TokFloat d) = T.pack (show d)
-showTok (TokUri u) = "URI '" <> u <> "'"
-showTok (TokPath p) = "path '" <> p <> "'"
-showTok (TokSearchPath p) = "'<" <> p <> ">'"
-showTok TokStringOpen = "'\"'"
-showTok TokStringClose = "'\"'"
-showTok TokIndStringOpen = "'''"
-showTok TokIndStringClose = "'''"
-showTok (TokStringLit _) = "string literal"
-showTok TokInterpOpen = "'${'"
-showTok TokInterpClose = "'}'"
-showTok TokPlus = "'+'"
-showTok TokMinus = "'-'"
-showTok TokStar = "'*'"
-showTok TokSlash = "'/'"
-showTok TokConcat = "'++'"
-showTok TokUpdate = "'//'"
-showTok TokNot = "'!'"
-showTok TokAnd = "'&&'"
-showTok TokOr = "'||'"
-showTok TokImpl = "'->'"
-showTok TokEq = "'=='"
-showTok TokNeq = "'!='"
-showTok TokLt = "'<'"
-showTok TokLte = "'<='"
-showTok TokGt = "'>'"
-showTok TokGte = "'>='"
-showTok TokQuestion = "'?'"
-showTok TokDot = "'.'"
-showTok TokEllipsis = "'...'"
-showTok TokAt = "'@'"
-showTok TokColon = "':'"
-showTok TokSemicolon = "';'"
-showTok TokAssign = "'='"
-showTok TokComma = "','"
-showTok TokLParen = "'('"
-showTok TokRParen = "')'"
-showTok TokLBrace = "'{'"
-showTok TokRBrace = "'}'"
-showTok TokLBracket = "'['"
-showTok TokRBracket = "']'"
