@@ -187,7 +187,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 | Module | Purpose |
 |--------|---------|
-| `Nix.Eval` | Lazy evaluator — all 17 AST constructors, thunk forcing, env operations, 101-builtin dispatch, `__functor` callable sets, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` |
+| `Nix.Eval` | Lazy evaluator — all 17 AST constructors, thunk forcing, env operations, 106-builtin dispatch, `__functor` callable sets, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` |
 | `Nix.Eval.Types` | Shared types — `NixValue` (11 constructors), `Thunk` (lazy env for knot-tying), `Env` (lexical + with-scope chain), `StringContext` (store path tracking), `MonadEval` typeclass, `PureEval` runner |
 | `Nix.Eval.Operator` | Binary/unary operators — arithmetic with float promotion, deep structural equality, division-by-zero checks |
 | `Nix.Eval.StringInterp` | String interpolation — value coercion with context propagation, indented string whitespace stripping |
