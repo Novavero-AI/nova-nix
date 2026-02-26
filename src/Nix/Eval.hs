@@ -13,6 +13,7 @@
 module Nix.Eval
   ( -- * Values (re-exported from Types)
     NixValue (..),
+    CompiledRegex (..),
     Thunk (..),
     ThunkCell (..),
 
@@ -86,6 +87,7 @@ import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
 import Nix.Eval.Types
   ( AttrSet (..),
+    CompiledRegex (..),
     Env (..),
     LazyBinding (..),
     MonadEval (..),
@@ -878,8 +880,25 @@ applyBuiltin name accArgs arg =
   let allArgs = accArgs ++ [arg]
       arity = builtinArity name
    in if length allArgs < arity
-        then pure (VBuiltin name allArgs)
+        then pure (VBuiltin name (precompileArgs name allArgs))
         else executeBuiltin name allArgs
+
+-- | Pre-compile regex patterns at partial application time.
+-- When builtins.match or builtins.split receives its first argument
+-- (the pattern string), compile it immediately and store the compiled
+-- RE.Regex in a VCompiledRegex, replacing the raw VStr.  The compiled
+-- form is carried in VBuiltin's accumulated args and reused on every
+-- subsequent application — zero recompilation.
+precompileArgs :: Text -> [NixValue] -> [NixValue]
+precompileArgs "match" [VStr pat _] =
+  case RE.makeRegexM ("^" <> T.unpack pat <> "$") :: Maybe RE.Regex of
+    Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
+    Nothing -> [VStr pat emptyContext] -- fail later at execute time
+precompileArgs "split" [VStr pat _] =
+  case RE.makeRegexM (T.unpack pat) :: Maybe RE.Regex of
+    Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
+    Nothing -> [VStr pat emptyContext] -- fail later at execute time
+precompileArgs _ args = args
 
 -- | Apply a function value (lambda or builtin) to one argument.
 -- Used by higher-order builtins to invoke user-supplied functions.
@@ -1067,6 +1086,7 @@ typeOfValue val = case val of
   VLambda {} -> "lambda"
   VBuiltin _ _ -> "lambda"
   VDerivation _ -> "set"
+  VCompiledRegex _ -> "lambda"
 
 isNullVal :: NixValue -> Bool
 isNullVal VNull = True
@@ -1969,45 +1989,65 @@ replaceAll pairs input = T.concat (go input)
 -- Returns @null@ if no match, or a list of capture group strings
 -- (empty string for unmatched optional groups).
 builtinMatch :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+-- Pre-compiled path: regex was compiled at partial-application time.
+builtinMatch (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
+  matchWithCompiled compiled str
+-- Fallback: compile from scratch (direct 2-arg call without partial application).
 builtinMatch (VStr regex _) (VStr str _) = do
   let anchored = "^" <> T.unpack regex <> "$"
   case RE.makeRegexM anchored :: Maybe RE.Regex of
     Nothing ->
       throwEvalError ("builtins.match: invalid regex: " <> regex)
-    Just compiled ->
-      let matches = matchAllText compiled (T.unpack str)
-       in case matches of
-            [] -> pure VNull
-            (match : _) ->
-              -- match is an Array of (String, (offset, len)) pairs.
-              -- Index 0 is the full match; indices 1.. are capture groups.
-              let groups = Array.elems match
-                  -- Skip index 0 (full match) — return only capture groups.
-                  captureGroups = drop 1 groups
-                  toThunk (s, _) = evaluated (mkStr (T.pack s))
-               in pure (VList (map toThunk captureGroups))
+    Just compiled -> matchWithCompiled compiled str
 builtinMatch (VStr _ _) other =
+  throwEvalError ("builtins.match: expected a string, got " <> typeName other)
+builtinMatch (VCompiledRegex _) other =
   throwEvalError ("builtins.match: expected a string, got " <> typeName other)
 builtinMatch other _ =
   throwEvalError ("builtins.match: expected a string (regex), got " <> typeName other)
+
+-- | Shared match logic for pre-compiled and freshly-compiled regex paths.
+matchWithCompiled :: (MonadEval m) => RE.Regex -> Text -> m NixValue
+matchWithCompiled compiled str =
+  let matches = matchAllText compiled (T.unpack str)
+   in case matches of
+        [] -> pure VNull
+        (match : _) ->
+          -- match is an Array of (String, (offset, len)) pairs.
+          -- Index 0 is the full match; indices 1.. are capture groups.
+          let groups = Array.elems match
+              -- Skip index 0 (full match) — return only capture groups.
+              captureGroups = drop 1 groups
+              toThunk (s, _) = evaluated (mkStr (T.pack s))
+           in pure (VList (map toThunk captureGroups))
 
 -- | @builtins.split regex str@: split a string by a POSIX ERE.
 -- Returns an alternating list of non-matched strings and match-group lists.
 -- Example: @split "(x)" "axbxc"@ → @["a" ["x"] "b" ["x"] "c"]@
 builtinSplit :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+-- Pre-compiled path: regex was compiled at partial-application time.
+builtinSplit (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
+  splitWithCompiled compiled str
+-- Fallback: compile from scratch (direct 2-arg call without partial application).
 builtinSplit (VStr regex _) (VStr str _) = do
   case RE.makeRegexM (T.unpack regex) :: Maybe RE.Regex of
     Nothing ->
       throwEvalError ("builtins.split: invalid regex: " <> regex)
-    Just compiled ->
-      let allMatches = matchAllText compiled (T.unpack str)
-          strText = T.unpack str
-          result = buildSplitResult strText 0 allMatches
-       in pure (VList result)
+    Just compiled -> splitWithCompiled compiled str
 builtinSplit (VStr _ _) other =
+  throwEvalError ("builtins.split: expected a string, got " <> typeName other)
+builtinSplit (VCompiledRegex _) other =
   throwEvalError ("builtins.split: expected a string, got " <> typeName other)
 builtinSplit other _ =
   throwEvalError ("builtins.split: expected a string (regex), got " <> typeName other)
+
+-- | Shared split logic for pre-compiled and freshly-compiled regex paths.
+splitWithCompiled :: (MonadEval m) => RE.Regex -> Text -> m NixValue
+splitWithCompiled compiled str =
+  let allMatches = matchAllText compiled (T.unpack str)
+      strText = T.unpack str
+      result = buildSplitResult strText 0 allMatches
+   in pure (VList result)
 
 -- | Build the alternating list for builtins.split.
 buildSplitResult :: String -> Int -> [Array.Array Int (String, (Int, Int))] -> [Thunk]
@@ -2167,6 +2207,7 @@ valueToJSON (VPath p) = pure (jsonEscapeString p)
 valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VDerivation _) = throwEvalError "builtins.toJSON: cannot convert a derivation to JSON"
+valueToJSON (VCompiledRegex _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 
 jsonEscapeString :: Text -> Text
 jsonEscapeString s = "\"" <> T.concatMap escapeChar s <> "\""
@@ -3452,6 +3493,8 @@ valueToXML depth val = case val of
     pure (indent depth <> "<function />\n")
   VDerivation _ ->
     pure (indent depth <> "<derivation />\n")
+  VCompiledRegex _ ->
+    pure (indent depth <> "<function />\n")
   where
     attrToXML d (name, thunk) = do
       v <- force thunk

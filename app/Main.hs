@@ -277,6 +277,7 @@ prettyValue (VAttrs attrs) =
    in "{ " <> T.intercalate " " rendered <> " }"
 prettyValue (VLambda {}) = "«lambda»"
 prettyValue (VBuiltin name _) = "«builtin " <> name <> "»"
+prettyValue (VCompiledRegex _) = "«compiled-regex»"
 prettyValue (VDerivation drv) =
   case drvOutputs drv of
     (out : _) -> "«derivation " <> T.pack (storePathToFilePath defaultStoreDir (doPath out)) <> "»"

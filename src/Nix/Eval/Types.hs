@@ -8,6 +8,7 @@
 module Nix.Eval.Types
   ( -- * Values
     NixValue (..),
+    CompiledRegex (..),
     Thunk (..),
     ThunkCell (..),
 
@@ -70,6 +71,23 @@ import Nix.Derivation (Derivation)
 import Nix.Expr.Types (AttrKey (..), Expr (..), Formals, StringPart (..))
 import Nix.Store.Path (StorePath)
 import System.IO.Unsafe (unsafePerformIO)
+import qualified Text.Regex.TDFA as RE
+
+-- ---------------------------------------------------------------------------
+-- Compiled regex
+-- ---------------------------------------------------------------------------
+
+-- | Compiled regex with Eq/Show based on source pattern text.
+-- Carries the pre-compiled 'RE.Regex' alongside the original pattern
+-- so that partial application of @builtins.match@ / @builtins.split@
+-- avoids recompiling the same pattern on every invocation.
+data CompiledRegex = CompiledRegex !Text RE.Regex
+
+instance Eq CompiledRegex where
+  CompiledRegex a _ == CompiledRegex b _ = a == b
+
+instance Show CompiledRegex where
+  show (CompiledRegex pat _) = "CompiledRegex " <> show pat
 
 -- ---------------------------------------------------------------------------
 -- String context
@@ -164,6 +182,9 @@ data NixValue
   | -- | Built-in function, dispatched by name.
     -- Accumulated args support curried partial application.
     VBuiltin !Text ![NixValue]
+  | -- | Pre-compiled regex carried in a partially-applied builtin.
+    -- Internal only — never exposed to Nix code directly.
+    VCompiledRegex !CompiledRegex
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
@@ -534,6 +555,7 @@ typeName val = case val of
   VLambda {} -> "a function"
   VDerivation _ -> "a derivation"
   VBuiltin _ _ -> "a built-in function"
+  VCompiledRegex _ -> "a built-in function"
 
 -- ---------------------------------------------------------------------------
 -- Evaluation monad
