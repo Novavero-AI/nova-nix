@@ -174,39 +174,39 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 ### Parser
 
-| Module | Purpose | Status |
-|--------|---------|--------|
-| `Nix.Expr.Types` | Complete Nix AST — 17 expression constructors (including `ESearchPath`), atoms, formals, operators, string parts, source locations | Done |
-| `Nix.Parser` | Hand-rolled recursive descent parser + lexer. Direct `Text` consumption, source position tracking | Done |
-| `Nix.Parser.Lexer` | Tokenizer — integers, floats, strings with interpolation, paths, URIs, search paths, all operators/keywords | Done |
-| `Nix.Parser.Expr` | Expression parser — 13 precedence levels, left/right/non-associative operators, application, selection, dynamic keys | Done |
-| `Nix.Parser.Internal` | Parser state and combinator internals | Done |
-| `Nix.Parser.ParseError` | Structured parse errors with source positions | Done |
+| Module | Purpose |
+|--------|---------|
+| `Nix.Expr.Types` | Complete Nix AST — 17 expression constructors (including `ESearchPath`), atoms, formals, operators, string parts, source locations |
+| `Nix.Parser` | Hand-rolled recursive descent parser + lexer. Direct `Text` consumption, source position tracking |
+| `Nix.Parser.Lexer` | Tokenizer — integers, floats, strings with interpolation, paths, URIs, search paths, all operators/keywords |
+| `Nix.Parser.Expr` | Expression parser — 13 precedence levels, left/right/non-associative operators, application, selection, dynamic keys |
+| `Nix.Parser.Internal` | Parser state and combinator internals |
+| `Nix.Parser.ParseError` | Structured parse errors with source positions |
 
 ### Evaluator
 
-| Module | Purpose | Status |
-|--------|---------|--------|
-| `Nix.Eval` | Lazy evaluator — all 17 AST constructors, thunk forcing, env operations, 101-builtin dispatch, `__functor` callable sets, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` | Done |
-| `Nix.Eval.Types` | Shared types — `NixValue` (11 constructors), `Thunk` (lazy env for knot-tying), `Env` (lexical + with-scope chain), `StringContext` (store path tracking), `MonadEval` typeclass, `PureEval` runner | Done |
-| `Nix.Eval.Operator` | Binary/unary operators — arithmetic with float promotion, deep structural equality, division-by-zero checks | Done |
-| `Nix.Eval.StringInterp` | String interpolation — value coercion with context propagation, indented string whitespace stripping | Done |
-| `Nix.Eval.Context` | String context construction, queries, extraction — pure helpers for building and inspecting store path references | Done |
-| `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache (with directory import), process execution, store writes, NIX_PATH parsing, per-thunk IORef memoization (matching real Nix in-place mutation) | Done |
-| `Nix.Builtins` | Built-in function environment — 106 builtins, search path plumbing (`parseNixPath`), top-level builtin exposure | Done |
+| Module | Purpose |
+|--------|---------|
+| `Nix.Eval` | Lazy evaluator — all 17 AST constructors, thunk forcing, env operations, 101-builtin dispatch, `__functor` callable sets, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` |
+| `Nix.Eval.Types` | Shared types — `NixValue` (11 constructors), `Thunk` (lazy env for knot-tying), `Env` (lexical + with-scope chain), `StringContext` (store path tracking), `MonadEval` typeclass, `PureEval` runner |
+| `Nix.Eval.Operator` | Binary/unary operators — arithmetic with float promotion, deep structural equality, division-by-zero checks |
+| `Nix.Eval.StringInterp` | String interpolation — value coercion with context propagation, indented string whitespace stripping |
+| `Nix.Eval.Context` | String context construction, queries, extraction — pure helpers for building and inspecting store path references |
+| `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache (with directory import), process execution, store writes, NIX_PATH parsing, per-thunk IORef memoization (matching real Nix in-place mutation) |
+| `Nix.Builtins` | Built-in function environment — 106 builtins, search path plumbing (`parseNixPath`), top-level builtin exposure |
 
 ### Store + Builder
 
-| Module | Purpose | Status |
-|--------|---------|--------|
-| `Nix.Derivation` | Derivation type, ATerm serialization + parsing (`toATerm`/`fromATerm`), platform detection | Done |
-| `Nix.Hash` | Derivation hashing, store path computation, shared hex/base-32 utilities | Done |
-| `Nix.Store.Path` | Store path types — `StoreDir`, `StorePath`, `parseStorePath`, Windows/Unix support | Done |
-| `Nix.Store.DB` | SQLite store database — `ValidPaths` + `Refs` tables, WAL mode, path registration, reference/deriver queries | Done |
-| `Nix.Store` | High-level store operations — `addToStore`, `scanReferences`, `setReadOnly`, `writeDrv` | Done |
-| `Nix.Builder` | Derivation builder — dependency graph construction, topological sort, binary cache substitution, local build with output registration | Done |
-| `Nix.DependencyGraph` | Dependency graph construction (BFS with `Seq` queue) and topological sort (Kahn's algorithm, O(V+E)), cycle detection | Done |
-| `Nix.Substituter` | Binary cache substituter — HTTP narinfo fetch, signature verification, NAR download/decompress/unpack, store registration. Multi-cache with priority ordering | Done |
+| Module | Purpose |
+|--------|---------|
+| `Nix.Derivation` | Derivation type, ATerm serialization + parsing (`toATerm`/`fromATerm`), platform detection |
+| `Nix.Hash` | Derivation hashing, store path computation, shared hex/base-32 utilities |
+| `Nix.Store.Path` | Store path types — `StoreDir`, `StorePath`, `parseStorePath`, Windows/Unix support |
+| `Nix.Store.DB` | SQLite store database — `ValidPaths` + `Refs` tables, WAL mode, path registration, reference/deriver queries |
+| `Nix.Store` | High-level store operations — `addToStore`, `scanReferences`, `setReadOnly`, `writeDrv` |
+| `Nix.Builder` | Derivation builder — dependency graph construction, topological sort, binary cache substitution, local build with output registration |
+| `Nix.DependencyGraph` | Dependency graph construction (BFS with `Seq` queue) and topological sort (Kahn's algorithm, O(V+E)), cycle detection |
+| `Nix.Substituter` | Binary cache substituter — HTTP narinfo fetch, signature verification, NAR download/decompress/unpack, store registration. Multi-cache with priority ordering |
 
 ---
 
@@ -283,38 +283,6 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 ---
 
 ## Roadmap
-
-### Done
-
-- [x] **Lexer** — Full Nix tokenization (integers, floats, strings with interpolation, paths, URIs, search paths, operators, keywords)
-- [x] **Parser** — 13 precedence levels, all Nix syntax, structured error reporting
-- [x] **Evaluator** — All 17 AST constructors, lazy thunks, recursive let/rec via knot-tying, with-scope chain, dynamic attribute keys
-- [x] **106 builtins** — Type checks, arithmetic, bitwise, strings, lists, attrsets, higher-order, JSON, hashing, regex (`match`/`split` via `regex-tdfa`), version parsing, `setFunctionArgs`/`functionArgs`, tryEval, deepSeq, genericClosure, string context introspection, all IO builtins, derivation
-- [x] **MonadEval refactor** — Evaluator polymorphic in effect monad (`PureEval` for tests, `EvalIO` for real evaluation)
-- [x] **IO builtins** — `import` (with directory import support), `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`, `currentTime`
-- [x] **`derivation`** — Attrset to `.drv` build recipe with computed `drvPath` and `outPath`, context-aware input population
-- [x] **String context tracking** — `SCPlain`, `SCDrvOutput`, `SCAllOutputs` on every `VStr`, propagated through interpolation, operators, and all string builtins. `hasContext`, `getContext`, `appendContext` introspection builtins.
-- [x] **ATerm serialization + parsing** — Full `.drv` round-trip with `toATerm`/`fromATerm`, string escaping, sorted environments
-- [x] **SQLite store DB** — `ValidPaths` + `Refs` tables, WAL mode, registration, validity checks, reference/deriver queries
-- [x] **Store operations** — `parseStorePath`, `addToStore` (cross-device safe), `scanReferences` (byte-scan), `setReadOnly`, `writeDrv`
-- [x] **Dependency graph** — BFS construction with `Data.Sequence` (O(V+E)), topological sort via Kahn's algorithm, cycle detection
-- [x] **Builder** — Full build loop with recursive dependency resolution: topo sort, cache check, binary substitution, local build, output registration
-- [x] **Binary substituter** — HTTP binary cache protocol: narinfo fetch/parse, Ed25519 signature verification via nova-cache, NAR download/decompress/unpack, store DB registration. Multi-cache with priority ordering.
-- [x] **NIX_PATH / search path resolution** — `<nixpkgs>` desugars to `builtins.findFile builtins.nixPath name`. `NIX_PATH` parsed at startup. `--nix-path` CLI flag for additional entries.
-- [x] **Dynamic attribute keys** — `{ ${expr} = val; }` works in all binding contexts with monadic key resolution preserving knot-tying
-- [x] **Directory imports** — `import ./dir` resolves to `./dir/default.nix` automatically
-- [x] **CLI** — `nova-nix eval FILE.nix`, `nova-nix eval --expr 'EXPR'`, `nova-nix build FILE.nix`, `--nix-path NAME=PATH`
-- [x] **Thunk memoization** — Per-thunk `IORef` memo cells matching real Nix in-place mutation. GC reclaims dead thunks naturally.
-- [x] **Regex builtins** — `builtins.match` and `builtins.split` (POSIX ERE via `regex-tdfa`, pure Haskell, cross-platform)
-- [x] **Callable attribute sets** — `__functor` dispatch: sets with `__functor` are callable, enabling `lib.makeOverridable`, `lib.makeExtensible`, and the nixpkgs override system
-- [x] **Lazy builtins** — `map`, `genList`, `mapAttrs` return deferred thunks (O(1) until demanded). `concatMap` is semi-lazy. Critical for nixpkgs which maps over 80,000+ packages.
-- [x] **Null dynamic keys** — `{ ${null} = val; }` skips the binding, used by the nixpkgs module system for conditional attributes
-- [x] **Bundled `<nix/fetchurl.nix>`** — Ships as Cabal data-file for nixpkgs stdenv bootstrap
-- [x] **nixpkgs module system** — `lib.evalModules`, `lib.mkOption`, `lib.mkIf`, `lib.types.*` all working
-- [x] **nixpkgs lib fully working** — trivial, strings, lists, attrsets, systems, generators, functional patterns (`fix`, `makeOverridable`, `makeExtensible`)
-- [x] **All 106 builtins** — `fromTOML`, `hashFile`, `readFileType`, `traceVerbose`, `break`, `filterSource`, `outputOf`, `fetchTree`, `fetchClosure`, `convertHash`, `toXML` — all implemented (some as stubs matching real Nix experimental/deprecated status)
-- [x] **Memory optimizations** — Env scope chain with parent pointer (956MB Map.Bin → ~40MB), ThunkCell release after forcing, lazy non-rec attrsets, lazy `//` operator, lazy with-scopes, per-binding Env for correct `//` merges across scopes
-- [x] **511 tests** — parser, evaluator, store, builder, substituter, dependency graph, search paths, dynamic keys, directory imports, laziness, CLI end-to-end
 
 ### Next
 

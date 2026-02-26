@@ -48,8 +48,6 @@
 
 ## 0.1.1.0 — 2026-02-24
 
-### Phase 4: nixpkgs Compatibility
-
 - **Thunk memoization** — Per-thunk `IORef` memo cells (matching real Nix in-place mutation). `forceThunk` is a `MonadEval` method: IO evaluators memoize per-allocation, pure evaluators re-evaluate. GC reclaims dead thunks naturally — no unbounded global cache. `unsafePerformIO` CAF float-out prevented via `NOINLINE` + `seq` pattern.
 - **8.4x builtin dispatch speedup** — Case dispatch replacing polymorphic `Map` reconstruction on every call. Direct pattern match on builtin name for zero-allocation dispatch in the hot path.
 - **Regex builtins** — `builtins.match` and `builtins.split` via `regex-tdfa` (pure Haskell POSIX ERE, cross-platform)
@@ -81,7 +79,7 @@
 - Demo `test.nix` included: derivations, lambdas, builtins.map, arithmetic — runs on all platforms
 - 16 builtins exposed at top level without `builtins.` prefix (`toString`, `map`, `throw`, `import`, `derivation`, `abort`, `baseNameOf`, `dirOf`, `isNull`, `removeAttrs`, `placeholder`, `scopedImport`, `fetchTarball`, `fetchGit`, `fetchurl`, `toFile`) — matches real Nix language spec, required for nixpkgs compatibility
 
-### Phase 3: String Contexts + Dependency Resolution + Substituter
+### String Contexts, Dependency Resolution, Binary Substituter
 
 - String context tracking on all `VStr` values: `SCPlain`, `SCDrvOutput`, `SCAllOutputs`
 - Context propagation through interpolation, string concatenation, `replaceStrings`, `substring`, `concatStringsSep`, and all string builtins
@@ -95,7 +93,7 @@
 - Cleanup pass: eliminated all partial functions (`T.head`/`T.tail` to `T.uncons`, `!!` to safe lookup, `last` to pattern match), flattened deeply nested code into composed functions, `Data.Sequence` BFS queues throughout, semantic section organization
 - 494 tests (68 new: string context, context propagation, dependency graph, substituter, build orchestrator)
 
-### Phase 2: Store + Builder
+### Content-Addressed Store + Derivation Builder
 
 - Real SQLite-backed store database (`ValidPaths` + `Refs` tables, WAL mode)
 - Store operations: `addToStore` (cross-device safe), `scanReferences` (byte-scan for store path references), `setReadOnly` (recursive), `writeDrv`
@@ -106,7 +104,7 @@
 - CLI `nova-nix build FILE.nix`: evaluate, extract derivation, write `.drv`, build, print output path
 - 426 tests (45 new: 10 store DB, 13 store ops, 10 ATerm parser, 8 builder, 4 CLI end-to-end)
 
-### Phase 1: Parser + Evaluator + Builtins
+### Parser, Lazy Evaluator, 85 Builtins
 
 - Full Nix expression parser (hand-rolled recursive descent, 13 precedence levels)
 - Lazy evaluator with thunk-based evaluation, knot-tying for recursive bindings
