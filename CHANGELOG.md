@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.5.0 — 2026-02-26
+
+### New Builtins, Coercion Fixes, CI Cleanup
+
+- **`builtins.warn`** — prints warning to stderr, returns second arg
+- **`builtins.path`** — copies file/dir to store with `SCPlain` context
+- **`builtins.seq` fix** — now forces first arg to WHNF (was silent no-op)
+- **`builtins.trace`/`traceVerbose` fix** — print to stderr via `MonadEval.traceMessage`
+- **`coerceToString` fix** — handle `VAttrs` with `__toString` and `outPath`, enabling `"${pkgs.hello}/bin/hello"` interpolation (was type error on all attrsets)
+- **`fetchTarball` fix** — downloads and extracts via curl|tar pipeline (was returning raw .tar.gz)
+- **`MonadEval`** — added `traceMessage`, `copyPathToStore` methods
+- CI: switched to `haskell-actions/run-ormolu@v16` (matching all Novavero repos)
+- 108 builtins, 511 tests, -Werror clean, ormolu clean, hlint clean
+
 ## 0.1.4.0 — 2026-02-26
 
 ### Memory Optimization + Lazy Non-Rec Attrsets
