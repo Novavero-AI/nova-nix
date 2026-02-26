@@ -45,10 +45,10 @@ resolve stack expr = case expr of
     -- Recursive: binding RHSes see their own names (as NameBarrier).
     let names = collectBindingNames bindings
         newStack = NameBarrier names : stack
-     in EAttrs True (map (resolveBinding newStack) bindings)
+     in EAttrs True (concatMap (resolveBinding newStack) bindings)
   EAttrs False bindings ->
     -- Non-recursive: bindings use the outer scope.
-    EAttrs False (map (resolveBinding stack) bindings)
+    EAttrs False (concatMap (resolveBinding stack) bindings)
   EList elems -> EList (map (resolve stack) elems)
   ESelect target path defExpr ->
     ESelect (resolve stack target) (map (resolveKey stack) path) (fmap (resolve stack) defExpr)
@@ -63,7 +63,7 @@ resolve stack expr = case expr of
     -- Both body and binding RHSes see the let names (as NameBarrier).
     let names = collectBindingNames bindings
         newStack = NameBarrier names : stack
-     in ELet (map (resolveBinding newStack) bindings) (resolve newStack body)
+     in ELet (concatMap (resolveBinding newStack) bindings) (resolve newStack body)
   EIf c t f -> EIf (resolve stack c) (resolve stack t) (resolve stack f)
   EWith scope body ->
     -- with-scope names are unknown statically; no scope change.
@@ -126,12 +126,21 @@ resolveKey _ k@(StaticKey _) = k
 resolveKey stack (DynamicKey e) = DynamicKey (resolve stack e)
 
 -- | Resolve variables inside a binding's RHS.
-resolveBinding :: [ScopeEntry] -> Binding -> Binding
+--
+-- 'Inherit Nothing' is desugared into 'NamedBinding' entries so that
+-- each inherited name goes through normal variable resolution.  This
+-- is necessary because @inherit x@ does a name-based lookup at runtime,
+-- but lambda formals are stored in positional 'envSlots' (no names).
+-- Desugaring @inherit x@ to @x = x;@ lets the RHS 'EVar' resolve to
+-- 'EResolvedVar' when @x@ is a lambda formal.
+resolveBinding :: [ScopeEntry] -> Binding -> [Binding]
 resolveBinding stack (NamedBinding path bodyExpr) =
-  NamedBinding (map (resolveKey stack) path) (resolve stack bodyExpr)
+  [NamedBinding (map (resolveKey stack) path) (resolve stack bodyExpr)]
 resolveBinding stack (Inherit (Just fromExpr) names) =
-  Inherit (Just (resolve stack fromExpr)) names
-resolveBinding _ b@(Inherit Nothing _) = b
+  [Inherit (Just (resolve stack fromExpr)) names]
+resolveBinding stack (Inherit Nothing names) =
+  -- Desugar: inherit x y; → x = x; y = y;
+  [NamedBinding [StaticKey name] (resolve stack (EVar name)) | name <- names]
 
 -- | Resolve variables inside formal default expressions.
 resolveFormalsDefaults :: [ScopeEntry] -> Formals -> Formals

@@ -885,11 +885,13 @@ testParserExprs = do
           "rec attrs"
           "rec { a = 1; }"
           (EAttrs True [NamedBinding [StaticKey "a"] (ELit (NixInt 1))]),
+      -- inherit x y; is desugared to x = x; y = y; by the resolution pass
+      -- (needed because lambda formals are positional, not name-based).
       runTest "parse inherit" $
         assertParse
           "inherit"
           "{ inherit x y; }"
-          (EAttrs False [Inherit Nothing ["x", "y"]]),
+          (EAttrs False [NamedBinding [StaticKey "x"] (EVar "x"), NamedBinding [StaticKey "y"] (EVar "y")]),
       runTest "parse inherit from" $
         assertParse
           "inherit from"
