@@ -11,7 +11,7 @@ description:
   Built on top of @nova-cache@ for NAR serialization, narinfo handling,
   Ed25519 signing, and binary substitution.
 
-license:            MIT
+license:            BSD-3-Clause
 license-file:       LICENSE
 author:             Devon Tomlin
 maintainer:         devon.tomlin@novavero.ai
