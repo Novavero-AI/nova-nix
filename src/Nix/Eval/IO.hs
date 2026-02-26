@@ -27,7 +27,7 @@ module Nix.Eval.IO
 where
 
 import Control.Exception (Exception, SomeException, displayException, fromException, throwIO, try)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
 import qualified Data.ByteString as BS
@@ -49,6 +49,7 @@ import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath (isRelative, takeDirectory, (</>))
+import System.IO (hPutStrLn, stderr)
 import qualified System.Process as Proc
 
 -- ---------------------------------------------------------------------------
@@ -237,6 +238,17 @@ instance MonadEval EvalIO where
           ExitFailure n -> n
     pure (code, T.pack stdoutStr, T.pack stderrStr)
 
+  copyPathToStore srcPath name = do
+    storeDir <- EvalIO (asks esStoreDir)
+    let contentHash = sha256Hex (encodeUtf8 ("source:" <> srcPath <> ":" <> name))
+        inner = "nix-store:sha256:" <> contentHash <> ":" <> T.pack storeDir <> ":" <> name
+        pathHash = truncatedBase32 (encodeUtf8 inner)
+        destPath = T.pack storeDir <> "/" <> pathHash <> "-" <> name
+    wrapIO (copyToStoreIfMissing (T.unpack srcPath) (T.unpack destPath) storeDir)
+    pure destPath
+
+  traceMessage msg = EvalIO (liftIO (hPutStrLn stderr (T.unpack msg)))
+
   resolvePathLiteral path = do
     baseDir <- EvalIO (asks esBaseDir)
     let raw = T.unpack path
@@ -370,3 +382,25 @@ resolveRelativePaths dir = goExpr
       FormalNamedSet n fs ellipsis -> FormalNamedSet n (map goFormal fs) ellipsis
 
     goFormal (Formal n mDef) = Formal n (fmap goExpr mDef)
+
+-- ---------------------------------------------------------------------------
+-- Store copy helpers
+-- ---------------------------------------------------------------------------
+
+-- | Copy a source path (file or directory) to the store if not already present.
+copyToStoreIfMissing :: FilePath -> FilePath -> FilePath -> IO ()
+copyToStoreIfMissing src dest storeDir = do
+  Dir.createDirectoryIfMissing True storeDir
+  alreadyExists <- Dir.doesPathExist dest
+  unless alreadyExists (copyPath src dest)
+
+-- | Copy a file or directory tree to a destination.
+copyPath :: FilePath -> FilePath -> IO ()
+copyPath src dest = do
+  isDir <- Dir.doesDirectoryExist src
+  if isDir
+    then do
+      Dir.createDirectoryIfMissing True dest
+      entries <- Dir.listDirectory src
+      mapM_ (\entry -> copyPath (src </> entry) (dest </> entry)) entries
+    else Dir.copyFile src dest

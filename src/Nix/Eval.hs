@@ -68,11 +68,11 @@ import Data.Bits (xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, isOctDigit, ord)
-import Data.List (foldl')
+import Data.List (find, foldl')
 import qualified Data.Map.Lazy as MapL
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, isJust, isNothing)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -80,7 +80,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm)
-import Nix.Eval.Context (extractInputDrvs, extractInputSrcs)
+import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
 import Nix.Eval.Types
@@ -142,8 +142,8 @@ import qualified Text.Regex.TDFA as RE
 eval :: (MonadEval m) => Env -> Expr -> m NixValue
 eval env expr = case expr of
   ELit atom -> evalLit atom
-  EStr parts -> uncurry VStr <$> evalStringParts eval env parts
-  EIndStr parts -> uncurry VStr <$> evalIndStringParts eval env parts
+  EStr parts -> uncurry VStr <$> evalStringParts eval force applyValue env parts
+  EIndStr parts -> uncurry VStr <$> evalIndStringParts eval force applyValue env parts
   EVar name -> evalVar env name
   EAttrs isRec bindings -> evalAttrs env isRec bindings
   EList exprs -> pure (VList (map (mkThunk env) exprs))
@@ -330,7 +330,7 @@ processResolvedLazy lookupEnv (ResolvedInherit names) =
 processResolvedLazy thunkEnv (ResolvedInheritFrom fromExpr names) =
   MapL.fromList
     [ (n, mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))
-    | n <- names
+      | n <- names
     ]
 
 -- | Like 'buildResolvedNestedAttr' but uses 'Data.Map.Lazy' operations.
@@ -548,7 +548,7 @@ matchFormalSet closureEnv formals allowExtra argVal =
           formalBindings =
             Map.fromList
               [ (fName formal, resolveOneFormal formal)
-              | formal <- formals
+                | formal <- formals
               ]
           resolveOneFormal (Formal name defExpr) =
             case attrSetLookup name attrs of
@@ -768,8 +768,9 @@ builtinRegistry =
       builtin1 "isPath" (pure . VBool . isPathVal),
       builtin1 "ceil" builtinCeil,
       builtin1 "floor" builtinFloor,
-      builtin2 "seq" (\_ b -> pure b),
-      builtin2 "trace" (\_ b -> pure b),
+      builtin2 "seq" builtinSeq,
+      builtin2 "trace" builtinTrace,
+      builtin2 "warn" builtinWarn,
       builtin1 "unsafeDiscardStringContext" builtinDiscardContext,
       builtin1 "unsafeDiscardOutputDependency" builtinDiscardOutputDep,
       -- String context introspection
@@ -835,8 +836,8 @@ builtinRegistry =
       builtin2 "addErrorContext" (\_ val -> pure val),
       -- Attr position (return null — nixpkgs handles this gracefully)
       builtin2 "unsafeGetAttrPos" (\_ _ -> pure VNull),
-      -- Debugging (no-ops without --trace-verbose / --debugger)
-      builtin2 "traceVerbose" (\_ b -> pure b),
+      -- Debugging (traceVerbose: same as trace for now, --trace-verbose not yet gated)
+      builtin2 "traceVerbose" builtinTrace,
       builtin1 "break" pure,
       -- IO: file hashing + type detection
       builtin2 "hashFile" builtinHashFile,
@@ -847,7 +848,8 @@ builtinRegistry =
       builtin1 "convertHash" builtinConvertHash,
       -- XML serialization
       builtin1 "toXML" builtinToXML,
-      -- Source filtering
+      -- Source filtering + path import
+      builtin1 "path" builtinPath,
       builtin2 "filterSource" builtinFilterSource,
       -- Experimental feature stubs
       builtin2 "outputOf" builtinOutputOf,
@@ -947,8 +949,9 @@ executeBuiltin name args = case name of
   "isPath" -> apply1 (pure . VBool . isPathVal)
   "ceil" -> apply1 builtinCeil
   "floor" -> apply1 builtinFloor
-  "seq" -> apply2 (\_ b -> pure b)
-  "trace" -> apply2 (\_ b -> pure b)
+  "seq" -> apply2 builtinSeq
+  "trace" -> apply2 builtinTrace
+  "warn" -> apply2 builtinWarn
   "unsafeDiscardStringContext" -> apply1 builtinDiscardContext
   "unsafeDiscardOutputDependency" -> apply1 builtinDiscardOutputDep
   -- String context introspection
@@ -1014,8 +1017,8 @@ executeBuiltin name args = case name of
   "addErrorContext" -> apply2 (\_ val -> pure val)
   -- Attr position (return null — nixpkgs handles this gracefully)
   "unsafeGetAttrPos" -> apply2 (\_ _ -> pure VNull)
-  -- Debugging (no-ops without --trace-verbose / --debugger)
-  "traceVerbose" -> apply2 (\_ b -> pure b)
+  -- Debugging (traceVerbose: same as trace for now)
+  "traceVerbose" -> apply2 builtinTrace
   "break" -> apply1 pure
   -- IO: file hashing + type detection
   "hashFile" -> apply2 builtinHashFile
@@ -1026,7 +1029,8 @@ executeBuiltin name args = case name of
   "convertHash" -> apply1 builtinConvertHash
   -- XML serialization
   "toXML" -> apply1 builtinToXML
-  -- Source filtering
+  -- Source filtering + path import
+  "path" -> apply1 builtinPath
   "filterSource" -> apply2 builtinFilterSource
   -- Experimental feature stubs
   "outputOf" -> apply2 builtinOutputOf
@@ -1544,7 +1548,7 @@ coerceToStringPermissive (VList thunks) = do
     coerceThunk thunk = do
       val <- force thunk
       coerceToStringPermissive val
-coerceToStringPermissive other = coerceToString other
+coerceToStringPermissive other = coerceToString force applyValue other
 
 -- | The current system platform string.
 currentSystemStr :: Text
@@ -2329,6 +2333,28 @@ deepForce (VList thunks) = mapM_ (force >=> deepForce) thunks
 deepForce (VAttrs attrs) = mapM_ (force >=> deepForce) (attrSetElems attrs)
 deepForce _ = pure ()
 
+-- | @builtins.seq a b@ — evaluate @a@ to WHNF, then return @b@.
+builtinSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinSeq !_first = pure
+
+-- | @builtins.trace msg val@ — print @msg@ to stderr, return @val@.
+builtinTrace :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinTrace msgVal result = do
+  msg <- case msgVal of
+    VStr s _ -> pure s
+    other -> pure (typeName other)
+  traceMessage ("trace: " <> msg)
+  pure result
+
+-- | @builtins.warn msg val@ — print warning to stderr, return @val@.
+builtinWarn :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinWarn msgVal result = do
+  msg <- case msgVal of
+    VStr s _ -> pure s
+    other -> pure (typeName other)
+  traceMessage ("warning: " <> msg)
+  pure result
+
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — graph traversal
 -- ---------------------------------------------------------------------------
@@ -2567,36 +2593,58 @@ builtinFetchurl other =
   throwEvalError ("builtins.fetchurl: expected a string or set, got " <> typeName other)
 
 builtinFetchTarball :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchTarball (VStr url _) = fetchUrlSimple url Nothing
+builtinFetchTarball (VStr url _) = fetchAndExtractTarball url
 builtinFetchTarball (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchTarball" "url" attrs
-  sha256 <- forceOptionalAttrStr attrs "sha256"
-  fetchUrlSimple url sha256
+  fetchAndExtractTarball url
 builtinFetchTarball other =
   throwEvalError ("builtins.fetchTarball: expected a string or set, got " <> typeName other)
 
+-- | Download a tarball, extract it, and return the path to the extracted
+-- directory.  Uses a content-hashed temp directory.  Downloads and extracts
+-- in a single shell pipeline to avoid binary-as-text encoding issues.
+fetchAndExtractTarball :: (MonadEval m) => Text -> m NixValue
+fetchAndExtractTarball url = do
+  sysTmp <- getTempDir
+  let urlHash = sha256Hex (TE.encodeUtf8 url)
+      extractDir = sysTmp <> "/nova-nix-tarball-" <> urlHash
+  -- Single pipeline: mkdir, download, extract with --strip-components=1
+  -- The -- separator prevents argument injection from the URL.
+  (code, _, errOut) <-
+    runProcess
+      "sh"
+      [ "-c",
+        "mkdir -p \"$1\" && curl -sSfL -- \"$2\" | tar -xz -C \"$1\" --strip-components=1",
+        "--",
+        extractDir,
+        url
+      ]
+      ""
+  case code of
+    0 -> pure (VPath extractDir)
+    _ -> throwEvalError ("builtins.fetchTarball: " <> errOut)
+
 builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
 builtinFetchGit (VStr url _) = do
-  -- Use a content-based temp dir to avoid predictable paths
+  sysTmp <- getTempDir
   let urlHash = sha256Hex (TE.encodeUtf8 url)
-  sysTmpRaw <- getEnvVar "TMPDIR"
-  -- TMPDIR on Unix, TEMP/TMP on Windows; fall back to /tmp
-  sysTmp <-
-    if T.null sysTmpRaw
-      then do
-        winTmp <- getEnvVar "TEMP"
-        pure (if T.null winTmp then "/tmp" else winTmp)
-      else pure sysTmpRaw
-  let tmpDir = sysTmp <> "/nova-nix-fetchgit-" <> urlHash
-  (code, _stdout, stderr) <- runProcess "git" ["clone", "--depth", "1", "--", url, tmpDir] ""
-  if code /= 0
-    then throwEvalError ("builtins.fetchGit: git clone failed: " <> stderr)
-    else pure (VPath tmpDir)
+      cloneDir = sysTmp <> "/nova-nix-fetchgit-" <> urlHash
+  (code, _, errOut) <- runProcess "git" ["clone", "--depth", "1", "--", url, cloneDir] ""
+  case code of
+    0 -> pure (VPath cloneDir)
+    _ -> throwEvalError ("builtins.fetchGit: git clone failed: " <> errOut)
 builtinFetchGit (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchGit" "url" attrs
   builtinFetchGit (mkStr url)
 builtinFetchGit other =
   throwEvalError ("builtins.fetchGit: expected a string or set, got " <> typeName other)
+
+-- | Resolve the system temp directory.  Checks @TMPDIR@ (Unix), then
+-- @TEMP@ (Windows), falls back to @\/tmp@.
+getTempDir :: (MonadEval m) => m Text
+getTempDir = do
+  candidates <- mapM getEnvVar ["TMPDIR", "TEMP"]
+  pure (fromMaybe "/tmp" (find (not . T.null) candidates))
 
 -- | Fetch a URL and optionally verify its hash.
 fetchUrlSimple :: (MonadEval m) => Text -> Maybe Text -> m NixValue
@@ -2717,7 +2765,7 @@ builtinDerivation (VAttrs attrs) = do
               doHashAlgo = "",
               doHash = ""
             }
-        | (outName, outP) <- outPaths
+          | (outName, outP) <- outPaths
         ]
 
   -- Build the complete Derivation with populated outputs and inputs
@@ -3415,6 +3463,38 @@ xmlQuote s = "\"" <> T.concatMap escapeChar s <> "\""
     escapeChar '&' = "&amp;"
     escapeChar '"' = "&quot;"
     escapeChar c = T.singleton c
+
+-- ---------------------------------------------------------------------------
+-- Builtin implementations — builtins.path
+-- ---------------------------------------------------------------------------
+
+-- | @builtins.path { path; name?; filter?; sha256?; recursive?; }@
+--
+-- Copy a path to the store and return the store path as a string with
+-- context.  @name@ defaults to the basename of @path@.  @filter@ is
+-- accepted but not yet applied (copies everything).
+builtinPath :: (MonadEval m) => NixValue -> m NixValue
+builtinPath (VAttrs attrs) = do
+  pathStr <- forceAttrStr "builtins.path" "path" attrs
+  nameOverride <- forceOptionalAttrStr attrs "name"
+  let name = fromMaybe (extractBaseName pathStr) nameOverride
+  storePathText <- copyPathToStore pathStr name
+  -- Parse the store path to construct proper SCPlain context
+  case parseStorePath defaultStoreDir storePathText of
+    Just sp -> pure (VStr storePathText (plainContext sp))
+    Nothing -> pure (VStr storePathText emptyContext)
+builtinPath other =
+  throwEvalError ("builtins.path: expected an attribute set, got " <> typeName other)
+
+-- | Extract the last path component from a path string.
+extractBaseName :: Text -> Text
+extractBaseName path =
+  let stripped = T.dropWhileEnd (\c -> c == '/' || c == '\\') path
+   in case T.breakOnEnd "/" stripped of
+        ("", _) -> case T.breakOnEnd "\\" stripped of
+          ("", _) -> stripped
+          (_, name) -> name
+        (_, name) -> name
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — filterSource

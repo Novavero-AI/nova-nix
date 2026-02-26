@@ -14,17 +14,23 @@ where
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.Context (concatStrings)
-import Nix.Eval.Types (Env, MonadEval (..), NixValue (..), StringContext, emptyContext, typeName)
+import Nix.Eval.Types (Env, MonadEval (..), NixValue (..), StringContext, Thunk, attrSetLookup, emptyContext, typeName)
 import Nix.Expr.Types (Expr, StringPart (..))
 
 -- | The evaluator function, passed as a parameter to avoid cyclic imports.
 type Eval m = Env -> Expr -> m NixValue
 
+-- | Force a thunk to a value.
+type Force m = Thunk -> m NixValue
+
+-- | Apply a function value to an argument value.
+type Apply m = NixValue -> NixValue -> m NixValue
+
 -- | Evaluate the parts of a regular string (double-quoted).
 -- Returns the concatenated text and the merged context from all parts.
-evalStringParts :: (MonadEval m) => Eval m -> Env -> [StringPart] -> m (Text, StringContext)
-evalStringParts evalFn env parts = do
-  chunks <- mapM (evalOnePart evalFn env) parts
+evalStringParts :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> [StringPart] -> m (Text, StringContext)
+evalStringParts evalFn forceFn applyFn env parts = do
+  chunks <- mapM (evalOnePart evalFn forceFn applyFn env) parts
   pure (concatStrings chunks)
 
 -- | Evaluate the parts of an indented string (double single-quoted).
@@ -32,34 +38,47 @@ evalStringParts evalFn env parts = do
 -- After interpolation, strips the common leading whitespace from all
 -- non-empty lines (the standard Nix indented-string semantics).
 -- Context is preserved through indentation stripping.
-evalIndStringParts :: (MonadEval m) => Eval m -> Env -> [StringPart] -> m (Text, StringContext)
-evalIndStringParts evalFn env parts = do
-  (raw, ctx) <- evalStringParts evalFn env parts
+evalIndStringParts :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> [StringPart] -> m (Text, StringContext)
+evalIndStringParts evalFn forceFn applyFn env parts = do
+  (raw, ctx) <- evalStringParts evalFn forceFn applyFn env parts
   pure (stripIndentation raw, ctx)
 
 -- | Evaluate a single string part, returning its text and context.
-evalOnePart :: (MonadEval m) => Eval m -> Env -> StringPart -> m (Text, StringContext)
-evalOnePart _ _ (StrLit txt) = pure (txt, emptyContext)
-evalOnePart evalFn env (StrInterp expr) = do
+evalOnePart :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> StringPart -> m (Text, StringContext)
+evalOnePart _ _ _ _ (StrLit txt) = pure (txt, emptyContext)
+evalOnePart evalFn forceFn applyFn env (StrInterp expr) = do
   val <- evalFn env expr
-  coerceToString val
+  coerceToString forceFn applyFn val
 
 -- | Coerce a Nix value to a string for interpolation.
 --
--- Strict coercion: strings, ints, floats, paths, null, bools.
--- Lists, sets (without @__toString@/@outPath@), and functions are errors.
--- Used by string interpolation (@"${...}"@).
-coerceToString :: (MonadEval m) => NixValue -> m (Text, StringContext)
-coerceToString val = case val of
-  VStr s ctx -> pure (s, ctx)
-  VInt n -> pure (T.pack (show n), emptyContext)
-  VFloat n -> pure (T.pack (show n), emptyContext)
-  VPath p -> pure (p, emptyContext)
-  VNull -> pure ("", emptyContext)
-  VBool True -> pure ("1", emptyContext)
-  VBool False -> pure ("", emptyContext)
-  other ->
-    throwEvalError ("cannot coerce " <> typeName other <> " to a string")
+-- Strict coercion: strings, ints, floats, paths, null, bools, and
+-- attribute sets with @__toString@ or @outPath@.
+-- Lists and functions without coercion metadata are errors.
+-- Used by string interpolation (@"${...}"@) and @builtins.toString@.
+coerceToString :: (MonadEval m) => Force m -> Apply m -> NixValue -> m (Text, StringContext)
+coerceToString _ _ (VStr s ctx) = pure (s, ctx)
+coerceToString _ _ (VInt n) = pure (T.pack (show n), emptyContext)
+coerceToString _ _ (VFloat n) = pure (T.pack (show n), emptyContext)
+coerceToString _ _ (VPath p) = pure (p, emptyContext)
+coerceToString _ _ VNull = pure ("", emptyContext)
+coerceToString _ _ (VBool True) = pure ("1", emptyContext)
+coerceToString _ _ (VBool False) = pure ("", emptyContext)
+-- Attribute sets: try __toString first, then outPath
+coerceToString forceFn applyFn (VAttrs attrs) =
+  case attrSetLookup "__toString" attrs of
+    Just toStrThunk -> do
+      toStrFn <- forceFn toStrThunk
+      result <- applyFn toStrFn (VAttrs attrs)
+      coerceToString forceFn applyFn result
+    Nothing -> case attrSetLookup "outPath" attrs of
+      Just outPathThunk -> do
+        outPathVal <- forceFn outPathThunk
+        coerceToString forceFn applyFn outPathVal
+      Nothing ->
+        throwEvalError "cannot coerce a set to a string (missing __toString or outPath)"
+coerceToString _ _ other =
+  throwEvalError ("cannot coerce " <> typeName other <> " to a string")
 
 -- ---------------------------------------------------------------------------
 -- Indented string whitespace stripping

@@ -560,6 +560,14 @@ class (Monad m) => MonadEval m where
   -- closures remain valid after the import scope ends.
   resolvePathLiteral :: Text -> m Text
 
+  -- | Copy a path (file or directory) to the store, returning the store path.
+  -- First argument is the source path, second is the store name.
+  copyPathToStore :: Text -> Text -> m Text
+
+  -- | Print a trace/warning message.
+  -- IO evaluators write to stderr; pure evaluators silently discard.
+  traceMessage :: Text -> m ()
+
   -- | Force a thunk to a value, with memoization.
   -- IO evaluators should cache results (via per-thunk @IORef@).
   -- Pure evaluators re-evaluate each time.
@@ -587,6 +595,8 @@ instance MonadEval PureEval where
   readFileBytes _ = throwEvalError "hashFile: not available in pure evaluation"
   getFileType _ = throwEvalError "readFileType: not available in pure evaluation"
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
+  copyPathToStore _ _ = throwEvalError "builtins.path: not available in pure evaluation"
+  traceMessage _ = pure ()
   resolvePathLiteral = pure
   forceThunk _ (Evaluated val) = pure val
   forceThunk evalFn (ThunkRef ref) =
