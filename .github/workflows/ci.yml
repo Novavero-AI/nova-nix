@@ -34,13 +34,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Ormolu
-        run: |
-          curl -sL https://github.com/tweag/ormolu/releases/download/0.7.7.0/ormolu-x86_64-linux.zip -o ormolu.zip
-          unzip ormolu.zip -d /usr/local/bin
-          chmod +x /usr/local/bin/ormolu
-      - name: Check formatting
-        run: ormolu -m check $(find src app test -name '*.hs')
+      - uses: haskell-actions/run-ormolu@v16
+        with:
+          pattern: |
+            src/**/*.hs
+            app/**/*.hs
+            test/**/*.hs
 
   cabal-check:
     name: Cabal Check

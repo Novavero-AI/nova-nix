@@ -330,7 +330,7 @@ processResolvedLazy lookupEnv (ResolvedInherit names) =
 processResolvedLazy thunkEnv (ResolvedInheritFrom fromExpr names) =
   MapL.fromList
     [ (n, mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))
-      | n <- names
+    | n <- names
     ]
 
 -- | Like 'buildResolvedNestedAttr' but uses 'Data.Map.Lazy' operations.
@@ -548,7 +548,7 @@ matchFormalSet closureEnv formals allowExtra argVal =
           formalBindings =
             Map.fromList
               [ (fName formal, resolveOneFormal formal)
-                | formal <- formals
+              | formal <- formals
               ]
           resolveOneFormal (Formal name defExpr) =
             case attrSetLookup name attrs of
@@ -2765,7 +2765,7 @@ builtinDerivation (VAttrs attrs) = do
               doHashAlgo = "",
               doHash = ""
             }
-          | (outName, outP) <- outPaths
+        | (outName, outP) <- outPaths
         ]
 
   -- Build the complete Derivation with populated outputs and inputs
