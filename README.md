@@ -312,12 +312,13 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 - [x] **Bundled `<nix/fetchurl.nix>`** — Ships as Cabal data-file for nixpkgs stdenv bootstrap
 - [x] **nixpkgs module system** — `lib.evalModules`, `lib.mkOption`, `lib.mkIf`, `lib.types.*` all working
 - [x] **nixpkgs lib fully working** — trivial, strings, lists, attrsets, systems, generators, functional patterns (`fix`, `makeOverridable`, `makeExtensible`)
+- [x] **All 106 builtins** — `fromTOML`, `hashFile`, `readFileType`, `traceVerbose`, `break`, `filterSource`, `outputOf`, `fetchTree`, `fetchClosure`, `convertHash`, `toXML` — all implemented (some as stubs matching real Nix experimental/deprecated status)
+- [x] **Memory optimizations** — Env scope chain with parent pointer (956MB Map.Bin → ~40MB), ThunkCell release after forcing, lazy non-rec attrsets, lazy `//` operator, lazy with-scopes, per-binding Env for correct `//` merges across scopes
 - [x] **511 tests** — parser, evaluator, store, builder, substituter, dependency graph, search paths, dynamic keys, directory imports, laziness, CLI end-to-end
 
 ### Next
 
-- [ ] **Full `import <nixpkgs> {}` performance** — nixpkgs lib layer evaluates correctly; stdenv bootstrap runs but needs performance optimization for the full 80,000+ package set
-- [ ] **Remaining builtins** — 13 missing (`fromTOML`, `hashFile`, `readFileType`, `traceVerbose`, `break`, `filterSource`, `outputOf`, and fetch variants)
+- [ ] **Full `import <nixpkgs> {}` performance** — nixpkgs lib layer evaluates correctly; stdenv bootstrap runs but needs memory optimization for the full 80,000+ package set (currently OOM at 2GB, investigating space leak)
 - [ ] **`nova-nix shell`** — Enter a development shell (like `nix shell`)
 - [ ] **`nova-nix repl`** — Interactive evaluator
 
