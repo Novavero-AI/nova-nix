@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.4.0 — 2026-02-26
+
+### Memory Optimization + Lazy Non-Rec Attrsets
+
+- **Lazy non-rec attrsets** — `evalNonRecAttrs` now uses `LazyAttrs` to defer thunk+IORef allocation until first access. For `all-packages.nix` (~15k entries per stdenv stage), only accessed packages allocate thunks.
+- **Per-binding Env in `LazyBinding`** — Each `LazyExpr`/`LazyInherit`/`LazyInheritFrom` carries its own `Env` instead of sharing one per-attrset. Fixes a bug where `//` merges of `LazyAttrs` from different scopes lost variables — broke `lib.extends` overlay pattern used by `makeExtensibleWithCustomName`.
+- **Batched formal set matching** — `matchFormalSet` creates ONE `Env` with all formals instead of N singleton `Env`s. Uses knot-tying so default expressions can reference other formals, including forward references (`{ a ? b, b ? 1 }: a` → `1`).
+- **Env scope chain** — `Env` now uses a parent pointer chain instead of `Map.union`. Variable lookup walks the chain: local bindings, then parent, then with-scopes. Avoids O(n) `Map.union` when extending large envs (e.g. 30k-entry nixpkgs rec set). Peak Map.Bin heap: 956MB → ~40MB.
+- **ThunkCell release** — On force, `Pending expr env` is overwritten to `Computed val`, dropping all references to `Expr` and `Env` (matching C++ Nix in-place mutation). Previously retained dead closures indefinitely.
+- **Lazy `//` operator** — `mergeAttrSets` preserves `LazyAttrs` when possible, merging binding recipe maps instead of materializing all thunks.
+- **Lazy with-scopes** — `pushWithScope` accepts `AttrSet` directly so `LazyAttrs` with-scopes stay lazy. `lookupWithScopes` uses `attrSetLookup` to materialize only the accessed key.
+- **Key-driven `intersectAttrs`** — Only touches keys present in both sets instead of materializing entire attrsets.
+- **New builtins** — `min`, `max`, `mod`, base64 `encode`/`decode` (via nova-cache 0.2.4)
+- `nova-cache >= 0.2.4` dependency bump
+- 511 tests, -Werror clean, ormolu 0.7.7.0 clean, hlint clean
+
 ## 0.1.3.0 — 2026-02-25
 
 ### nixpkgs Compatibility: Module System, Callable Sets, Parser Fixes
