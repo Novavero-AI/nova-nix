@@ -70,6 +70,7 @@ import Data.Bits (xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, isOctDigit, ord)
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.List (find, foldl')
 import qualified Data.Map.Lazy as MapL
 import Data.Map.Strict (Map)
@@ -138,6 +139,7 @@ import Nix.Hash (byteToHex, sha256Hex, truncatedBase32)
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
+import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info
 import Text.Regex.TDFA (matchAllText)
 import qualified Text.Regex.TDFA as RE
@@ -891,11 +893,12 @@ applyBuiltin name accArgs arg =
 -- subsequent application — zero recompilation.
 precompileArgs :: Text -> [NixValue] -> [NixValue]
 precompileArgs "match" [VStr pat _] =
-  case RE.makeRegexM ("^" <> T.unpack pat <> "$") :: Maybe RE.Regex of
-    Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
-    Nothing -> [VStr pat emptyContext] -- fail later at execute time
+  let anchored = "^" <> pat <> "$"
+   in case cachedCompileRegex anchored of
+        Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
+        Nothing -> [VStr pat emptyContext] -- fail later at execute time
 precompileArgs "split" [VStr pat _] =
-  case RE.makeRegexM (T.unpack pat) :: Maybe RE.Regex of
+  case cachedCompileRegex pat of
     Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
     Nothing -> [VStr pat emptyContext] -- fail later at execute time
 precompileArgs _ args = args
@@ -1984,6 +1987,37 @@ replaceAll pairs input = T.concat (go input)
 -- Builtin implementations — regex (POSIX ERE via regex-tdfa)
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Regex compilation cache
+-- ---------------------------------------------------------------------------
+
+-- | Global regex compilation cache.  Keyed by the raw pattern string
+-- (including anchoring for match).  Idempotent memoization via
+-- unsafePerformIO — same rationale as thunk memoization.
+{-# NOINLINE regexCacheRef #-}
+regexCacheRef :: IORef (Map Text RE.Regex)
+regexCacheRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Compile a regex, using the global cache to avoid recompilation.
+-- Returns Nothing for invalid patterns.  NOINLINE prevents GHC from
+-- inlining and floating the unsafePerformIO reads.
+{-# NOINLINE cachedCompileRegex #-}
+cachedCompileRegex :: Text -> Maybe RE.Regex
+cachedCompileRegex pat =
+  unsafePerformIO $ do
+    cache <- atomicModifyIORef' regexCacheRef (\c -> (c, c))
+    case Map.lookup pat cache of
+      Just compiled -> pure (Just compiled)
+      Nothing -> case RE.makeRegexM (T.unpack pat) :: Maybe RE.Regex of
+        Nothing -> pure Nothing
+        Just compiled -> do
+          atomicModifyIORef' regexCacheRef (\c -> (Map.insert pat compiled c, ()))
+          pure (Just compiled)
+
+-- ---------------------------------------------------------------------------
+-- Regex builtins
+-- ---------------------------------------------------------------------------
+
 -- | @builtins.match regex str@: match a POSIX ERE against a string.
 -- The regex is implicitly anchored (must match the entire string).
 -- Returns @null@ if no match, or a list of capture group strings
@@ -1992,13 +2026,12 @@ builtinMatch :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 -- Pre-compiled path: regex was compiled at partial-application time.
 builtinMatch (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
   matchWithCompiled compiled str
--- Fallback: compile from scratch (direct 2-arg call without partial application).
-builtinMatch (VStr regex _) (VStr str _) = do
-  let anchored = "^" <> T.unpack regex <> "$"
-  case RE.makeRegexM anchored :: Maybe RE.Regex of
-    Nothing ->
-      throwEvalError ("builtins.match: invalid regex: " <> regex)
-    Just compiled -> matchWithCompiled compiled str
+-- Direct 2-arg call: use global compilation cache.
+builtinMatch (VStr regex _) (VStr str _) =
+  let anchored = "^" <> regex <> "$"
+   in case cachedCompileRegex anchored of
+        Nothing -> throwEvalError ("builtins.match: invalid regex: " <> regex)
+        Just compiled -> matchWithCompiled compiled str
 builtinMatch (VStr _ _) other =
   throwEvalError ("builtins.match: expected a string, got " <> typeName other)
 builtinMatch (VCompiledRegex _) other =
@@ -2028,11 +2061,10 @@ builtinSplit :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 -- Pre-compiled path: regex was compiled at partial-application time.
 builtinSplit (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
   splitWithCompiled compiled str
--- Fallback: compile from scratch (direct 2-arg call without partial application).
-builtinSplit (VStr regex _) (VStr str _) = do
-  case RE.makeRegexM (T.unpack regex) :: Maybe RE.Regex of
-    Nothing ->
-      throwEvalError ("builtins.split: invalid regex: " <> regex)
+-- Direct 2-arg call: use global compilation cache.
+builtinSplit (VStr regex _) (VStr str _) =
+  case cachedCompileRegex regex of
+    Nothing -> throwEvalError ("builtins.split: invalid regex: " <> regex)
     Just compiled -> splitWithCompiled compiled str
 builtinSplit (VStr _ _) other =
   throwEvalError ("builtins.split: expected a string, got " <> typeName other)
