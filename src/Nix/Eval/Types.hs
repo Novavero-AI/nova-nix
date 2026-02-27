@@ -213,7 +213,11 @@ data LazyBinding
     -- Env is lazy for knot-tying in rec {}.
     LazyInheritFrom Env !Expr
   | -- | Pre-built thunk (for merged nested paths or other complex cases).
-    PreBuilt !Thunk
+    -- INTENTIONALLY LAZY: attrSetMapWithKeyLazy wraps deferred computations
+    -- here; the Thunk is only forced when the key is actually accessed via
+    -- attrSetLookup (which caches the result).  This avoids materializing
+    -- all 30k entries when mapAttrs is applied to a large set like nixpkgs.
+    PreBuilt Thunk
   deriving (Eq, Show)
 
 -- | Attribute set representation: either an eagerly-materialized map
