@@ -19,9 +19,9 @@
 
 A pure Haskell implementation of Nix that treats Windows as a first-class target:
 
-- **Parser** — Hand-rolled recursive descent parser for the full Nix expression language. 13 precedence levels, 17 AST constructors, all syntax forms including search paths (`<nixpkgs>`) and dynamic attribute keys (`{ ${expr} = val; }`). Direct `Text` consumption for maximum throughput.
-- **Lazy Evaluator** — Thunk-based evaluation with environment closures, knot-tying for recursive bindings via Haskell laziness. All 17 AST constructors handled: literals, strings with interpolation, attribute sets (recursive and non-recursive), let bindings, lambdas with formal parameters, if/then/else, with, assert, unary/binary operators, function application, list construction, attribute selection, has-attribute checks, and search path resolution.
-- **106 Built-in Functions** — Type checks, arithmetic (`min`, `max`, `mod`), bitwise, strings, lists, attribute sets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON (`toJSON`/`fromJSON`), hashing (SHA-256/SHA-512/SHA-1/MD5), base64 (`encode`/`decode`), version parsing, `replaceStrings`, `tryEval`, `deepSeq`, `genericClosure`, `setFunctionArgs`/`functionArgs`, string context introspection (`hasContext`, `getContext`, `appendContext`), IO builtins (`import`, `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`), `derivation`, `placeholder`, `storePath`, and more. 16 builtins available at top level without `builtins.` prefix (`toString`, `map`, `throw`, `import`, `derivation`, `abort`, `baseNameOf`, `dirOf`, `isNull`, `removeAttrs`, `placeholder`, `scopedImport`, `fetchTarball`, `fetchGit`, `fetchurl`, `toFile`) — matching the real Nix language spec.
+- **Parser** — Hand-rolled recursive descent parser for the full Nix expression language. 13 precedence levels, 18 AST constructors, all syntax forms including search paths (`<nixpkgs>`) and dynamic attribute keys (`{ ${expr} = val; }`). Direct `Text` consumption for maximum throughput.
+- **Lazy Evaluator** — Thunk-based evaluation with environment closures, knot-tying for recursive bindings via Haskell laziness. All 18 AST constructors handled: literals, strings with interpolation, attribute sets (recursive and non-recursive), let bindings, lambdas with formal parameters, if/then/else, with, assert, unary/binary operators, function application, list construction, attribute selection, has-attribute checks, and search path resolution.
+- **108 Built-in Functions** — Type checks, arithmetic (`min`, `max`, `mod`), bitwise, strings, lists, attribute sets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON (`toJSON`/`fromJSON`), hashing (SHA-256/SHA-512/SHA-1/MD5), base64 (`encode`/`decode`), version parsing, `replaceStrings`, `tryEval`, `deepSeq`, `genericClosure`, `setFunctionArgs`/`functionArgs`, string context introspection (`hasContext`, `getContext`, `appendContext`), IO builtins (`import`, `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`), `derivation`, `placeholder`, `storePath`, and more. 16 builtins available at top level without `builtins.` prefix (`toString`, `map`, `throw`, `import`, `derivation`, `abort`, `baseNameOf`, `dirOf`, `isNull`, `removeAttrs`, `placeholder`, `scopedImport`, `fetchTarball`, `fetchGit`, `fetchurl`, `toFile`) — matching the real Nix language spec.
 - **Search Path Resolution** — `<nixpkgs>` desugars to `builtins.findFile builtins.nixPath "nixpkgs"` — matching real Nix semantics. `NIX_PATH` environment variable is parsed at startup, and `--nix-path` CLI flags merge with it. Directory imports (`import ./dir`) resolve to `dir/default.nix` automatically.
 - **Dynamic Attribute Keys** — `{ ${expr} = val; }` fully supported in all contexts: non-recursive attrs, recursive attrs, let bindings, attribute selection, and has-attribute checks. Key resolution is cleanly separated from value thunk construction to preserve knot-tying in recursive bindings.
 - **String Context Tracking** — Every string carries invisible metadata tracking which store paths it references. Context propagates through interpolation, concatenation, `replaceStrings`, and all string operations. The `derivation` builtin collects contexts into `drvInputDrvs` and `drvInputSrcs` — matching real Nix semantics.
@@ -176,7 +176,9 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 | Module | Purpose |
 |--------|---------|
-| `Nix.Expr.Types` | Complete Nix AST — 17 expression constructors (including `ESearchPath`), atoms, formals, operators, string parts, source locations |
+| `Nix.Expr` | Re-exports from `Nix.Expr.Types` |
+| `Nix.Expr.Types` | Complete Nix AST — 18 expression constructors (including `ESearchPath`, `EResolvedVar`), atoms, formals, operators, string parts |
+| `Nix.Expr.Resolve` | De Bruijn-style variable resolution pass — replaces `EVar` with `EResolvedVar` for lambda-bound variables at parse time |
 | `Nix.Parser` | Hand-rolled recursive descent parser + lexer. Direct `Text` consumption, source position tracking |
 | `Nix.Parser.Lexer` | Tokenizer — integers, floats, strings with interpolation, paths, URIs, search paths, all operators/keywords |
 | `Nix.Parser.Expr` | Expression parser — 13 precedence levels, left/right/non-associative operators, application, selection, dynamic keys |
@@ -187,13 +189,13 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 | Module | Purpose |
 |--------|---------|
-| `Nix.Eval` | Lazy evaluator — all 17 AST constructors, thunk forcing, env operations, 106-builtin dispatch, `__functor` callable sets, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` |
-| `Nix.Eval.Types` | Shared types — `NixValue` (11 constructors), `Thunk` (lazy env for knot-tying), `Env` (lexical + with-scope chain), `StringContext` (store path tracking), `MonadEval` typeclass, `PureEval` runner |
+| `Nix.Eval` | Lazy evaluator — all 18 AST constructors, thunk forcing, env operations, 108-builtin dispatch, `__functor` callable sets, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` |
+| `Nix.Eval.Types` | Shared types — `NixValue` (11 constructors), `Thunk` (IORef memo cell), `Env` (SmallArray positional slots + scope chain), `AttrSet` (lazy/eager), `StringContext` (store path tracking), `MonadEval` typeclass, `PureEval` runner |
 | `Nix.Eval.Operator` | Binary/unary operators — arithmetic with float promotion, deep structural equality, division-by-zero checks |
 | `Nix.Eval.StringInterp` | String interpolation — value coercion with context propagation, indented string whitespace stripping |
 | `Nix.Eval.Context` | String context construction, queries, extraction — pure helpers for building and inspecting store path references |
 | `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache (with directory import), process execution, store writes, NIX_PATH parsing, per-thunk IORef memoization (matching real Nix in-place mutation) |
-| `Nix.Builtins` | Built-in function environment — 106 builtins, search path plumbing (`parseNixPath`), top-level builtin exposure |
+| `Nix.Builtins` | Built-in function environment — 108 builtins, search path plumbing (`parseNixPath`), top-level builtin exposure |
 
 ### Store + Builder
 
@@ -218,10 +220,11 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
   |                                                 |
   |  Parser --> Expr.Types --> Eval --> Builtins     |
   |                 |           |                    |
-  |          Parser.Lexer    Eval.Types              |
-  |          Parser.Expr     Eval.Operator           |
-  |          Parser.Internal Eval.StringInterp       |
-  |          ParseError      Eval.Context            |
+  |          Expr.Resolve    Eval.Types              |
+  |          Parser.Lexer    Eval.Operator           |
+  |          Parser.Expr     Eval.StringInterp       |
+  |          Parser.Internal Eval.Context            |
+  |          ParseError                              |
   |                             |                    |
   |                        Derivation --> Hash        |
   |                             |                    |
@@ -255,7 +258,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 **Key numbers:**
 
-- **22 modules** — all implemented
+- **23 modules** — all implemented
 - **511 tests** — hand-rolled harness, no framework dependencies
 - **Zero partial functions** — total by construction, `T.uncons` over `T.head`/`T.tail`
 - **Strict by default** — bang patterns on all data fields (except Thunk's Env, which is lazy for knot-tying)
@@ -286,7 +289,7 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 
 ### Next
 
-- [ ] **Full `import <nixpkgs> {}` performance** — nixpkgs lib layer evaluates correctly; stdenv bootstrap runs but needs memory optimization for the full 80,000+ package set (currently OOM at 2GB, investigating space leak)
+- [ ] **Full `import <nixpkgs> {}` performance** — nixpkgs lib layer evaluates correctly; stdenv bootstrap runs but needs further memory optimization for the full 80,000+ package set (de Bruijn indices + SmallArray slots eliminated 1.37 GB of Map.Bin overhead; testing on 16 GB Windows machine in progress)
 - [ ] **`nova-nix shell`** — Enter a development shell (like `nix shell`)
 - [ ] **`nova-nix repl`** — Interactive evaluator
 

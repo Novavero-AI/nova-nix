@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.6.0 — 2026-02-26
+
+### De Bruijn-Style Positional Env + SmallArray Slots
+
+- **De Bruijn-style variable resolution** — New `Nix.Expr.Resolve` pass replaces `EVar` with `EResolvedVar level index` for lambda-bound variables. Called at parse time; all subsequent evaluation uses positional indices instead of name-based `Map` lookups.
+- **Array-based Env** — `envSlots :: SmallArray Thunk` replaces `envBindings :: Map Text Thunk`. Lambda formals get O(1) positional indexing via `indexSmallArray` instead of O(log n) `Map.lookup`. Let/rec bindings and builtins remain in name-based `envLazyScope` (already zero Map.Bin overhead).
+- **Scope chain** — `Env` uses parent pointer chain instead of `Map.union`. Variable lookup walks the chain: positional slots, then `envLazyScope`, then parent, then with-scopes. Avoids O(n) `Map.union` when extending large envs.
+- **Inherit desugaring** — `inherit x;` is desugared to `x = x;` in the resolution pass so inherited lambda formals resolve to `EResolvedVar` (lambda slots have no names at runtime).
+- **Heap savings** — Eliminates 29.9M Map.Bin nodes (1.37 GB) from lambda formals. Replaced by SmallArray (one heap object per env, O(1) index) + scope chain parent pointers.
+- `primitive` dependency added for `Data.Primitive.SmallArray`
+- 108 builtins, 511 tests, -Werror clean, ormolu clean, hlint clean
+
 ## 0.1.5.0 — 2026-02-26
 
 ### New Builtins, Coercion Fixes, CI Cleanup
@@ -57,7 +69,7 @@
 - **Semi-lazy `concatMap`** — forces applications to discover list structure for concatenation, but element thunks within sub-lists stay lazy
 - **`@`-pattern scoping fix** — `{ system ? args.system or ..., ... }@args:` now correctly binds the `@`-name before evaluating defaults, matching real Nix. Previously, default expressions couldn't reference the `@`-binding.
 - **Synthetic thunk memo cell fix** — `mkSyntheticThunk` uses env bindings (not expr) for IORef uniqueness, preventing GHC's full-laziness transform from sharing one memo cell across all deferred thunks. Without this, `map f [a b c]` would return `[f(a) f(a) f(a)]`.
-- `deferApply` helper: builds thunks wrapping `EApp (EVar "__fn") (EVar "__arg")` in a self-contained env, reusing existing eval + memoization machinery
+- `deferApply` helper: builds thunks wrapping `EApp (EResolvedVar 0 0) (EResolvedVar 0 1)` in a self-contained env with positional slots, reusing existing eval + memoization machinery
 - 511 tests (3 new: map laziness, genList laziness, mapAttrs laziness)
 
 ## 0.1.1.0 — 2026-02-24
