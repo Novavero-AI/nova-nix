@@ -33,6 +33,7 @@ module Nix.Store.Path
     StoreDir (..),
     defaultStoreDir,
     defaultStoreDirText,
+    platformStoreDirText,
     windowsStoreDir,
 
     -- * Store paths
@@ -49,6 +50,7 @@ where
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.FilePath ((</>))
+import qualified System.Info
 
 -- | The base directory of the Nix store.
 newtype StoreDir = StoreDir {unStoreDir :: FilePath}
@@ -61,6 +63,16 @@ defaultStoreDir = StoreDir "/nix/store"
 -- | Default store directory as 'Text', for use in the evaluator.
 defaultStoreDirText :: Text
 defaultStoreDirText = T.pack (unStoreDir defaultStoreDir)
+
+-- | Platform-appropriate store directory as 'Text'.
+-- Returns @C:\\nix\\store@ on Windows, @\/nix\/store@ on Unix.
+-- Used for user-facing values like @builtins.storeDir@.
+platformStoreDirText :: Text
+platformStoreDirText = T.pack (unStoreDir platformStoreDir)
+  where
+    platformStoreDir = case System.Info.os of
+      "mingw32" -> windowsStoreDir
+      _ -> defaultStoreDir
 
 -- | Default store directory on Windows: @C:\\nix\\store@.
 windowsStoreDir :: StoreDir

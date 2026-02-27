@@ -24,7 +24,7 @@ import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathExists, scanReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath)
-import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, storePathToFilePath, storePathToText, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
@@ -1074,7 +1074,7 @@ testBatch1 = do
         assertEval "lt-str" "builtins.lessThan \"a\" \"b\"" (VBool True),
       -- Constants
       runTest "storeDir" $
-        assertEval "storeDir" "builtins.storeDir" (mkStr "/nix/store"),
+        assertEval "storeDir" "builtins.storeDir" (mkStr platformStoreDirText),
       runTest "nixVersion" $
         assertEval "nixVersion" "builtins.nixVersion" (mkStr "2.24.0"),
       runTest "langVersion" $

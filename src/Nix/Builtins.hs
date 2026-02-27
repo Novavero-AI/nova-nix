@@ -20,7 +20,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, builtinNames, currentSystemStr, evaluated)
 import Nix.Eval.Types (mkStr)
-import Nix.Store.Path (defaultStoreDirText)
+import Nix.Store.Path (platformStoreDirText)
 
 -- | The initial environment containing all builtins.
 --
@@ -101,7 +101,7 @@ standardEntries timestamp searchPaths =
     [ ("true", evaluated (VBool True)),
       ("false", evaluated (VBool False)),
       ("null", evaluated VNull),
-      ("storeDir", evaluated (mkStr defaultStoreDirText)),
+      ("storeDir", evaluated (mkStr platformStoreDirText)),
       ("nixVersion", evaluated (mkStr "2.24.0")),
       ("langVersion", evaluated (VInt 6)),
       ("nixPath", evaluated (VList searchPaths)),

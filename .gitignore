@@ -10,5 +10,6 @@ cabal.project.local~
 .HTF/
 result
 *.prof
+*.hp
 *.eventlog
 CLAUDE.md
