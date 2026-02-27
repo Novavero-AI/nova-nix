@@ -53,29 +53,24 @@ if [[ -f "$BEFORE/heap-top.txt" && -f "$AFTER/heap-top.txt" ]]; then
   printf "%-10s %-10s %-8s  %s\n" "BEFORE" "AFTER" "DELTA" "CATEGORY"
   printf "%-10s %-10s %-8s  %s\n" "------" "-----" "-----" "--------"
 
-  # Build associative arrays from both files
-  # Then merge and display sorted by AFTER value
+  # Build associative arrays from both files, then merge and display.
+  # parse-hp.sh output format: "%8.1f  %s" — $1 is MB, rest is category.
+  # Use field-based parsing to handle category names with parens/spaces.
   awk '
-    FILENAME == ARGV[1] {
+    {
       gsub(/^[ \t]+/, "")
-      split($0, a, /  +/)
-      before[a[2]] = a[1] + 0
+      mb = $1 + 0
+      # Category is everything after the first field and its trailing spaces
+      cat = $0
+      sub(/^[^ \t]+[ \t]+/, "", cat)
     }
-    FILENAME == ARGV[2] {
-      gsub(/^[ \t]+/, "")
-      split($0, a, /  +/)
-      after[a[2]] = a[1] + 0
-    }
+    FILENAME == ARGV[1] { before[cat] = mb }
+    FILENAME == ARGV[2] { after[cat] = mb }
     END {
-      # Collect all categories
       for (k in before) seen[k] = 1
       for (k in after) seen[k] = 1
 
-      # Print sorted by after value (descending)
-      # Simple approach: collect into array, sort
-      n = 0
       for (k in seen) {
-        n++
         b = before[k] + 0
         a = after[k] + 0
         if (b > 0) {
