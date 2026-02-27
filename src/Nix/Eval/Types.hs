@@ -43,7 +43,6 @@ module Nix.Eval.Types
     envLookupResolved,
     envFromSlots,
     pushWithScope,
-    indexSlots,
 
     -- * Thunk operations
     mkThunk,
@@ -65,6 +64,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Primitive.SmallArray (SmallArray, indexSmallArray, sizeofSmallArray)
 import Data.Set (Set)
 import Data.Text (Text)
 import Nix.Derivation (Derivation)
@@ -388,8 +388,8 @@ newLazyAttrCache bindings = unsafePerformIO (bindings `seq` newIORef Map.empty)
 data Env = Env
   { -- | Positional bindings for lambda formals.
     -- Indexed by position (0-based), filled by 'matchFormals'.
-    -- Empty for let/rec/builtin envs.
-    envSlots :: ![Thunk],
+    -- O(1) lookup via 'indexSmallArray'.  Empty for let/rec/builtin envs.
+    envSlots :: !(SmallArray Thunk),
     -- | Lazy scope shared with a 'LazyAttrs' attr set.
     -- For rec {} and let, this points to the SAME 'LazyAttrs' that
     -- backs the resulting attr set — one map instead of two.
@@ -404,17 +404,18 @@ data Env = Env
     envWithScopes :: ![AttrSet]
   }
 
--- | Shallow comparison: checks slots and with-scopes only.
+-- | Shallow comparison: checks slot count and with-scopes only.
 -- Ignores parent chain to avoid diverging on deep/recursive envs.
 -- Only used in tests on non-recursive structures.
 instance Eq Env where
-  Env s1 _ _ w1 == Env s2 _ _ w2 = s1 == s2 && w1 == w2
+  Env s1 _ _ w1 == Env s2 _ _ w2 =
+    sizeofSmallArray s1 == sizeofSmallArray s2 && w1 == w2
 
 -- | Compact show: just the size and structure, not the full contents.
 instance Show Env where
   show (Env slots lazyScope parent withs) =
     "Env{"
-      ++ show (length slots)
+      ++ show (sizeofSmallArray slots)
       ++ " slots"
       ++ maybe "" (const ", lazyScope") lazyScope
       ++ maybe "" (const ", parent") parent
@@ -424,25 +425,17 @@ instance Show Env where
 
 -- | Empty environment (no variables in scope).
 emptyEnv :: Env
-emptyEnv = Env [] Nothing Nothing []
+emptyEnv = Env mempty Nothing Nothing []
 
 -- | Look up a resolved variable by level and index.  O(level) parent
--- hops, then O(index) list indexing.  Total O(level + index), but
--- both are typically tiny (level 0–3, index 0–5 for lambda formals).
+-- hops, then O(1) array index via 'indexSmallArray'.
 --
 -- Unreachable branch: the resolution pass guarantees valid indices.
 envLookupResolved :: Int -> Int -> Env -> Thunk
-envLookupResolved 0 idx env = indexSlots (envSlots env) idx
+envLookupResolved 0 idx env = indexSmallArray (envSlots env) idx
 envLookupResolved lvl idx env = case envParent env of
   Just parent -> envLookupResolved (lvl - 1) idx parent
   Nothing -> error "envLookupResolved: level exceeded (unreachable after resolution)"
-
--- | Index into a slot list by position.  O(n) for position n.
--- Unreachable branch: the resolution pass guarantees valid indices.
-indexSlots :: [Thunk] -> Int -> Thunk
-indexSlots (x : _) 0 = x
-indexSlots (_ : xs) !n = indexSlots xs (n - 1)
-indexSlots [] _ = error "indexSlots: index out of bounds (unreachable after resolution)"
 
 -- | Name-based variable lookup: walk the parent chain checking
 -- 'envLazyScope' at each level; fall back to with-scopes (from the
@@ -477,7 +470,7 @@ lookupWithScopes name (scope : rest) =
 
 -- | Create a child env with positional slots (for lambda formals).
 -- Inherits with-scopes from the parent.
-envFromSlots :: [Thunk] -> Env -> Env
+envFromSlots :: SmallArray Thunk -> Env -> Env
 envFromSlots slots parent =
   Env
     { envSlots = slots,
@@ -531,10 +524,10 @@ mkSyntheticThunk env thunkExpr =
 newMemoCell :: Expr -> Env -> IORef ThunkCell
 newMemoCell expr env = unsafePerformIO (expr `seq` newIORef (Pending expr env))
 
--- | Like 'newMemoCell' but keyed on a slot list instead of an expression.
+-- | Like 'newMemoCell' but keyed on a SmallArray instead of an expression.
 -- Used by 'mkSyntheticThunk' where multiple thunks share the same expression.
 {-# NOINLINE newSyntheticCell #-}
-newSyntheticCell :: [Thunk] -> Expr -> Env -> IORef ThunkCell
+newSyntheticCell :: SmallArray Thunk -> Expr -> Env -> IORef ThunkCell
 newSyntheticCell slots expr env = unsafePerformIO (slots `seq` newIORef (Pending expr env))
 
 -- | Wrap an already-computed value as a thunk.

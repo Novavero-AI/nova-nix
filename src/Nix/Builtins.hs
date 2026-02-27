@@ -36,7 +36,7 @@ import Nix.Store.Path (defaultStoreDirText)
 builtinEnv :: Integer -> [Thunk] -> Env
 builtinEnv timestamp searchPaths =
   Env
-    { envSlots = [],
+    { envSlots = mempty,
       envLazyScope =
         Just $
           attrSetFromMap $
@@ -85,7 +85,7 @@ builtinEnvWithScope :: Integer -> [Thunk] -> [(Text, Thunk)] -> Env
 builtinEnvWithScope timestamp searchPaths scope =
   let base = builtinEnv timestamp searchPaths
       scopeMap = Map.fromList scope
-   in Env {envSlots = [], envLazyScope = Just (attrSetFromMap scopeMap), envParent = Just base, envWithScopes = []}
+   in Env {envSlots = mempty, envLazyScope = Just (attrSetFromMap scopeMap), envParent = Just base, envWithScopes = []}
 
 -- | The @builtins@ attribute set, derived from the central registry.
 builtinsAttrSet :: Integer -> [Thunk] -> NixValue

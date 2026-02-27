@@ -75,6 +75,7 @@ import Data.List (find, foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
+import Data.Primitive.SmallArray (smallArrayFromListN)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -272,7 +273,7 @@ evalRecAttrs env bindings = do
   -- (already resolved), not from recEnv.
   let recEnv =
         Env
-          { envSlots = [],
+          { envSlots = mempty,
             envLazyScope = Just attrSet,
             envParent = Just env,
             envWithScopes = envWithScopes env
@@ -490,7 +491,7 @@ evalApp env funcExpr argExpr = do
 -- * @FormalNamedSet n [a, b, c] _@ → @[argThunk, aThunk, bThunk, cThunk]@
 matchFormals :: (MonadEval m) => Env -> Formals -> Thunk -> m Env
 matchFormals closureEnv (FormalName _) argThunk =
-  pure (envFromSlots [argThunk] closureEnv)
+  pure (envFromSlots (smallArrayFromListN 1 [argThunk]) closureEnv)
 matchFormals closureEnv (FormalSet formals allowExtra) argThunk = do
   argVal <- force argThunk
   matchFormalSet closureEnv formals allowExtra argVal Nothing
@@ -522,8 +523,10 @@ matchFormalSet closureEnv formals allowExtra argVal atThunk =
       -- but mkThunk captures Env lazily (Pending !Expr Env).
       let formalEnv = envFromSlots formalSlots closureEnv
           formalSlots = case atThunk of
-            Nothing -> map resolveOneFormal formals
-            Just at -> at : map resolveOneFormal formals
+            Nothing ->
+              smallArrayFromListN (length formals) (map resolveOneFormal formals)
+            Just at ->
+              smallArrayFromListN (length formals + 1) (at : map resolveOneFormal formals)
           resolveOneFormal (Formal name defExpr) =
             case attrSetLookup name attrs of
               Just thunk -> thunk
@@ -569,7 +572,7 @@ evalLet env bindings body = do
   resolvedBindings <- resolveBindingKeys env bindings
   let letEnv =
         Env
-          { envSlots = [],
+          { envSlots = mempty,
             envLazyScope = Just (LazyAttrs lazyBindingMap cache),
             envParent = Just env,
             envWithScopes = envWithScopes env
@@ -1278,7 +1281,7 @@ builtinGenList func (VInt n)
       -- Lazy: each element is a deferred @f i@, forced only on demand.
       -- Slot 0 = function.
       let fnThunk = evaluated func
-          env = Env {envSlots = [fnThunk], envLazyScope = Nothing, envParent = Nothing, envWithScopes = []}
+          env = Env {envSlots = smallArrayFromListN 1 [fnThunk], envLazyScope = Nothing, envParent = Nothing, envWithScopes = []}
           mkIndexThunk i = mkThunk env (EApp (EResolvedVar 0 0) (ELit (NixInt i)))
        in pure (VList (map mkIndexThunk [0 .. n - 1]))
 builtinGenList _ other =
@@ -1517,7 +1520,7 @@ deferApply :: NixValue -> Thunk -> Thunk
 deferApply func argThunk =
   let env =
         Env
-          { envSlots = [evaluated func, argThunk],
+          { envSlots = smallArrayFromListN 2 [evaluated func, argThunk],
             envLazyScope = Nothing,
             envParent = Nothing,
             envWithScopes = []
@@ -1826,7 +1829,7 @@ builtinMapAttrs func (VAttrs attrs) =
     deferAttr key valThunk =
       let env =
             Env
-              { envSlots = [evaluated func, evaluated (mkStr key), valThunk],
+              { envSlots = smallArrayFromListN 3 [evaluated func, evaluated (mkStr key), valThunk],
                 envLazyScope = Nothing,
                 envParent = Nothing,
                 envWithScopes = []
@@ -1873,7 +1876,7 @@ builtinSetFunctionArgs func (VAttrs argSpec) =
   -- body is EResolvedVar 1 0: level 1 (past _self's slot), index 0.
   let closureEnv =
         Env
-          { envSlots = [evaluated func],
+          { envSlots = smallArrayFromListN 1 [evaluated func],
             envLazyScope = Nothing,
             envParent = Nothing,
             envWithScopes = []

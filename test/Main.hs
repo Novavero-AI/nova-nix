@@ -6,6 +6,7 @@ import Control.Exception (bracket_)
 import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import Data.Primitive.SmallArray (sizeofSmallArray)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -214,7 +215,7 @@ testEvalLiterals = do
   putStrLn "eval/literals"
   sequence
     [ runTest "empty env" $
-        assertEqual "emptyEnv" 0 (length (envSlots emptyEnv)),
+        assertEqual "emptyEnv" 0 (sizeofSmallArray (envSlots emptyEnv)),
       runTest "int" $
         assertEval "int" "42" (VInt 42),
       runTest "float" $
