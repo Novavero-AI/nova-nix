@@ -69,7 +69,7 @@ trySimpleLambda :: Parser Expr
 trySimpleLambda = do
   name <- expectIdent
   expect TokColon
-  ELambda (FormalName name) <$> parseExpr
+  (\body -> ELambda (FormalName name) body NoCaptureInfo) <$> parseExpr
 
 -- | Try @name\@{ formals }: body@
 tryNamedSetLambda :: Parser Expr
@@ -79,7 +79,7 @@ tryNamedSetLambda = do
   expect TokLBrace
   (formals, hasEllipsis) <- parseFormalsBody
   expect TokColon
-  ELambda (FormalNamedSet name formals hasEllipsis) <$> parseExpr
+  (\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr
 
 -- | Brace at start: could be @{ formals }: body@, @{ formals }\@name: body@, or attr set.
 -- Falls back to parsing as attr set (via implication) if lambda parse fails.
@@ -98,12 +98,12 @@ trySetLambda = do
   case tok of
     TokColon -> do
       _ <- advance
-      ELambda (FormalSet formals hasEllipsis) <$> parseExpr
+      (\body -> ELambda (FormalSet formals hasEllipsis) body NoCaptureInfo) <$> parseExpr
     TokAt -> do
       _ <- advance
       name <- expectIdent
       expect TokColon
-      ELambda (FormalNamedSet name formals hasEllipsis) <$> parseExpr
+      (\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr
     _ -> parseError ("expected ':' or '@' after formals, got " <> showToken tok)
 
 -- | Parse the inside of @{ ... }@ formals (comma-separated, optional defaults,

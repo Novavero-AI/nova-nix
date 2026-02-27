@@ -4,6 +4,57 @@
 Target: `builtins.length (builtins.attrNames (import <nixpkgs> {}))` with `-M4G` cap.
 nixpkgs 24.11 channel. GHC 9.6.7, Windows.
 
+## Profiling Workflow
+
+### Quick reference
+```bash
+# 1. Build (non-prof for -hT, -prof for -hc/-hd/-hr)
+cabal build                                                      # non-prof
+cabal build --enable-profiling --ghc-options="-fprof-auto-top"   # prof
+
+# 2. Run benchmark
+./profiling/bench.sh <label>              # baseline (-s only)
+./profiling/bench.sh <label> -hT          # type breakdown (non-prof)
+./profiling/bench.sh <label> -hc          # cost centre (prof build)
+./profiling/bench.sh <label> -hr          # retainer (prof build)
+./profiling/bench.sh <label> -hT -M8G    # custom heap cap
+
+# 3. Compare runs
+./profiling/compare.sh <before> <after>
+
+# Results stored in: profiling/results/<label>/
+```
+
+### Profiling modes explained (per Simon Marlow's methodology)
+
+| Flag | Build | What it tells you | When to use |
+|------|-------|-------------------|-------------|
+| `-hT` | non-prof | Heap by **type** (Env, THUNK, Map.Bin) | First look — what's big? |
+| `-hd` | prof | Heap by **closure description** (sat_s1234) | Which specific closures? |
+| `-hc` | prof | Heap by **cost centre** (function name) | Which functions allocate? |
+| `-hr` | prof | Heap by **retainer** set | **KEY for space leaks**: what KEEPS data alive? |
+| `-hb` | prof | Heap by **biography** (lag/drag/void) | Is data created too early or kept too late? |
+
+**Space leak diagnosis order** (Marlow's approach):
+1. `-hT` to identify the types growing unboundedly
+2. `-hr` to find what retains those types (the "who keeps it alive" question)
+3. `-hc` to confirm which functions are responsible
+4. Fix, re-bench with `-hT`, compare
+
+### Key insight
+Allocation (`-hc`) is NOT the same as retention (`-hr`). A function can allocate
+very little but retain a lot (by closing over it). For space leaks, `-hr` is
+the critical tool — it answers "why can't the GC collect this?"
+
+### Scaling test (space leak detector)
+Run the same benchmark at 4G, 6G, 8G caps. If max residency grows linearly with
+the cap, you have a space leak (GC pressure keeps otherwise-collectable data alive).
+```bash
+./profiling/bench.sh scaling-4g -hT -M4G
+./profiling/bench.sh scaling-6g -hT -M6G
+./profiling/bench.sh scaling-8g -hT -M8G
+```
+
 ---
 
 ## Iteration 0: Pre de Bruijn (2026-02-26)
@@ -107,8 +158,46 @@ We need the same. The resolution pass already knows which variables each
 lambda uses (de Bruijn indices). We just need to trim the Env when creating
 VLambda.
 
-## Next: Env trimming for VLambda
-- The resolution pass already computes free variables for de Bruijn
-- When creating VLambda, extract only the needed thunks into a fresh Env
-- This breaks the chain: the lambda's Env only holds what it uses
-- Expected impact: massive — eliminates retention of 30k-entry scopes
+## Iteration 6: Retainer profiling (2026-02-27)
+
+### -hr (retainer set breakdown)
+| MB | Retainer | What retains it |
+|----|----------|----------------|
+| 1019.6 | SYSTEM | GHC runtime (GC roots, stacks) |
+| 404.9 | SYSTEM | GHC runtime (secondary) |
+| 376.1 | newSyntheticCell | mkSyntheticThunk: IORef(Pending expr env) |
+| 337.5 | eval | Unevaluated closures in eval loop |
+| 237.0 | forceThunk,evalSelect | Force→select chain, mid-eval Env alive |
+| 149.3 | newSyntheticCell | mkSyntheticThunk (second retainer set) |
+| 134.0 | eval | Eval closures (second set) |
+| 94.1 | forceThunk,evalSelect | Force→select (second set) |
+| 88.9 | newMemoCell,eval,newSyntheticCell | Mixed thunk+eval chain |
+| 69.5 | newSyntheticCell | mkSyntheticThunk (third set) |
+| 68.3 | walkAttrPath | Attribute path traversal |
+| 56.7 | builtinConcatLists | concatLists retaining list thunks |
+
+### Analysis
+- **newSyntheticCell total: ~595 MB** — #1 retainer. Two call sites:
+  - `deferApply` (Eval.hs:1529) — deferred builtins.map application
+  - `builtinMapAttrs` (Eval.hs:1838) — overlay application over 30k keys
+- **eval total: ~471 MB** — unevaluated closures holding Env chains
+- **forceThunk+evalSelect: ~331 MB** — intermediate Envs during attr select
+
+### Key insight
+Even though synthetic Envs have `envParent = Nothing`, the VALUES in their
+slots (especially VLambda closures) carry full parent Env chains. The leak is
+in what's captured inside the slots, not the synthetic Env structure itself.
+
+### Confirmed fix target: closure trimming
+VLambda captures the entire Env chain. A lambda using 3 vars retains 30k
+entries. nixpkgs overlays create thousands of lambdas, each holding the full
+package set. C++ Nix does closure trimming — only captures used variables.
+
+---
+
+## Next: Closure trimming for VLambda
+1. Resolution pass computes free variables per lambda body
+2. ELambda stores a FreeVarSet alongside formals and body
+3. At eval time, VLambda extracts only needed vars into a flat Env (no parent chain)
+4. This breaks retention: trimmed Env has no parent pointer, holds only what's needed
+5. Expected impact: massive — eliminates retention of 30k-entry scopes by lambdas

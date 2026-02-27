@@ -12,4 +12,7 @@ result
 *.prof
 *.hp
 *.eventlog
+*.ps
+*.pdf
+profiling/results/
 CLAUDE.md

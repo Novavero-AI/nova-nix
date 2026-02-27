@@ -65,11 +65,11 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Primitive.SmallArray (SmallArray, indexSmallArray, sizeofSmallArray)
+import Data.Primitive.SmallArray (SmallArray, indexSmallArray, sizeofSmallArray, smallArrayFromListN)
 import Data.Set (Set)
 import Data.Text (Text)
 import Nix.Derivation (Derivation)
-import Nix.Expr.Types (AttrKey (..), Expr (..), Formals, NixAtom (..), StringPart (..))
+import Nix.Expr.Types (AttrKey (..), CaptureInfo (..), Expr (..), Formals, NixAtom (..), StringPart (..))
 import Nix.Store.Path (StorePath)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Text.Regex.TDFA as RE
@@ -525,7 +525,16 @@ cheapThunk _ (ELit (NixInt n)) = Evaluated (VInt n)
 cheapThunk _ (ELit (NixFloat n)) = Evaluated (VFloat n)
 cheapThunk _ (ELit (NixBool b)) = Evaluated (VBool b)
 cheapThunk _ (ELit NixNull) = Evaluated VNull
-cheapThunk env (ELambda formals body) = Evaluated (VLambda env formals body)
+cheapThunk env (ELambda formals body NoCaptureInfo) = Evaluated (VLambda env formals body)
+cheapThunk env (ELambda formals body (Captures captureList)) =
+  let trimmedEnv =
+        Env
+          { envSlots = smallArrayFromListN (length captureList) [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
+            envLazyScope = Nothing,
+            envParent = Nothing,
+            envWithScopes = []
+          }
+   in Evaluated (VLambda trimmedEnv formals body)
 cheapThunk env expr = mkThunk env expr
 
 -- | Allocate a fresh memoization cell for a thunk.

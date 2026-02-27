@@ -75,7 +75,7 @@ import Data.List (find, foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
-import Data.Primitive.SmallArray (smallArrayFromListN)
+import Data.Primitive.SmallArray (SmallArray, indexSmallArray, smallArrayFromListN)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -129,6 +129,7 @@ import Nix.Expr.Types
     AttrPath,
     BinaryOp (..),
     Binding (..),
+    CaptureInfo (..),
     Expr (..),
     Formal (..),
     Formals (..),
@@ -157,7 +158,16 @@ eval env expr = case expr of
   ESelect target path defExpr -> evalSelect env target path defExpr
   EHasAttr target path -> evalHasAttr env target path
   EApp func arg -> evalApp env func arg
-  ELambda formals body -> pure (VLambda env formals body)
+  ELambda formals body NoCaptureInfo -> pure (VLambda env formals body)
+  ELambda formals body (Captures captureList) ->
+    let trimmedEnv =
+          Env
+            { envSlots = smallArrayFromListN (length captureList) [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
+              envLazyScope = Nothing,
+              envParent = Nothing,
+              envWithScopes = []
+            }
+     in pure (VLambda trimmedEnv formals body)
   ELet bindings body -> evalLet env bindings body
   EIf cond thenExpr elseExpr -> evalIf env cond thenExpr elseExpr
   EWith scope body -> evalWith env scope body
@@ -254,35 +264,42 @@ evalNonRecAttrs env bindings = do
 -- Dynamic keys in recursive attrs evaluate against the outer env
 -- (the rec env is not yet available during key resolution).
 --
--- Uses 'LazyAttrs' to defer thunk + IORef allocation: only keys that
--- are actually accessed get materialized.  For nixpkgs' 30k-entry
--- package set, this avoids ~30k IORef allocations when only ~50
--- packages are touched.
+-- Positional path: when all bindings are single static keys, builds
+-- 'envSlots' for variable lookup and 'EagerAttrs' for the return value.
+-- Both reference the SAME thunk objects (no duplication).
 --
+-- Fallback path: uses 'LazyAttrs' to defer thunk + IORef allocation.
 -- The env's 'envLazyScope' points to the SAME 'LazyAttrs' that backs
--- the resulting attr set — one map instead of two.  Variable lookup
--- and attr set access share a single materialization cache, eliminating
--- the dual-map space leak where both a lazy Thunk map and a LazyBinding
--- map retained the entire recursive environment.
+-- the resulting attr set — one map instead of two.
 evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
-evalRecAttrs env bindings = do
-  -- Resolve dynamic keys eagerly against the outer env.
-  resolvedBindings <- resolveBindingKeys env bindings
-  -- Knot-tied: recEnv references attrSet (via envLazyScope) which
-  -- references lazyBindingMap which captures recEnv lazily inside
-  -- each LazyBinding.  The map structure is built from resolvedBindings
-  -- (already resolved), not from recEnv.
-  let recEnv =
-        Env
-          { envSlots = mempty,
-            envLazyScope = Just attrSet,
-            envParent = Just env,
-            envWithScopes = envWithScopes env
-          }
-      lazyBindingMap = buildLazyBindingMap recEnv resolvedBindings
-      cache = newLazyAttrCache lazyBindingMap
-      attrSet = LazyAttrs lazyBindingMap cache
-  pure (VAttrs attrSet)
+evalRecAttrs env bindings
+  | allPositionalBindings bindings =
+      -- Positional path: slots for variable lookup, EagerAttrs for return.
+      let slotCount = bindingSlotCount bindings
+          recEnv =
+            Env
+              { envSlots = slots,
+                envLazyScope = Nothing,
+                envParent = Just env,
+                envWithScopes = envWithScopes env
+              }
+          slots = smallArrayFromListN slotCount (buildSlotThunks recEnv env bindings)
+          attrMap = buildAttrMapFromSlots bindings slots
+       in pure (VAttrs (EagerAttrs attrMap))
+  | otherwise = do
+      -- Fallback: dynamic/nested keys — use LazyAttrs.
+      resolvedBindings <- resolveBindingKeys env bindings
+      let recEnv =
+            Env
+              { envSlots = mempty,
+                envLazyScope = Just attrSet,
+                envParent = Just env,
+                envWithScopes = envWithScopes env
+              }
+          lazyBindingMap = buildLazyBindingMap recEnv resolvedBindings
+          cache = newLazyAttrCache lazyBindingMap
+          attrSet = LazyAttrs lazyBindingMap cache
+      pure (VAttrs attrSet)
 
 -- ---------------------------------------------------------------------------
 -- Resolved bindings (for knot-tying in rec {} and let)
@@ -561,26 +578,100 @@ checkMissingFormals attrs formals =
 -- Let / if / with / assert
 -- ---------------------------------------------------------------------------
 
+-- | Check if all bindings have single static keys (eligible for
+-- positional slot-based evaluation).  Mirrors 'allStaticSingleKey'
+-- in 'Nix.Expr.Resolve'.
+allPositionalBindings :: [Binding] -> Bool
+allPositionalBindings = all isEligible
+  where
+    isEligible (NamedBinding [StaticKey _] _) = True
+    isEligible (Inherit _ _) = True
+    isEligible _ = False
+
+-- | Count the number of positional slots needed for a list of bindings.
+-- Each named binding contributes 1, each inherit contributes its name count.
+bindingSlotCount :: [Binding] -> Int
+bindingSlotCount = foldl' countOne 0
+  where
+    countOne !acc (NamedBinding [StaticKey _] _) = acc + 1
+    countOne !acc (Inherit _ names) = acc + length names
+    countOne !acc _ = acc
+
+-- | Build thunks for positional let\/rec bindings in declaration order.
+-- Returns a list of thunks matching the slot indices assigned by
+-- 'lexicalScopeFromBindings' in the resolve pass.
+--
+-- Inherits are expanded in-place: @inherit x y@ produces thunks at
+-- consecutive slots.  The @thunkEnv@ is the knot-tied let\/rec env;
+-- @outerEnv@ is the parent env used for inherit lookups.
+buildSlotThunks :: Env -> Env -> [Binding] -> [Thunk]
+buildSlotThunks thunkEnv outerEnv = concatMap slotThunk
+  where
+    slotThunk (NamedBinding [StaticKey _] bodyExpr) =
+      [cheapThunk thunkEnv bodyExpr]
+    slotThunk (Inherit Nothing names) =
+      -- inherit x → look up x in the OUTER env (before the let scope).
+      map (inheritLookup outerEnv) names
+    slotThunk (Inherit (Just fromExpr) names) =
+      -- inherit (from) x → ESelect from.x, evaluated in the let env.
+      [mkThunk thunkEnv (ESelect fromExpr [StaticKey name] Nothing) | name <- names]
+    -- Unreachable: allPositionalBindings guards this path.
+    slotThunk _ = []
+
+-- | Build a 'Map Text Thunk' indexing into a 'SmallArray Thunk' by
+-- binding name.  The thunk pointers are shared (no copies).
+-- Used by 'evalRecAttrs' to produce the 'EagerAttrs' return value
+-- while slots serve for variable lookup.
+buildAttrMapFromSlots :: [Binding] -> SmallArray Thunk -> Map Text Thunk
+buildAttrMapFromSlots bindings slots = snd (foldl' addOne (0, Map.empty) bindings)
+  where
+    addOne (!idx, !acc) (NamedBinding [StaticKey name] _) =
+      (idx + 1, Map.insert name (indexSmallArray slots idx) acc)
+    addOne (!idx, !acc) (Inherit _ names) =
+      let acc' = foldl' (\a (offset, name) -> Map.insert name (indexSmallArray slots (idx + offset)) a) acc (zip [0 ..] names)
+       in (idx + length names, acc')
+    -- Unreachable: allPositionalBindings guards this path.
+    addOne (!idx, !acc) _ = (idx, acc)
+
 -- | Let is recursive in Nix: all bindings are visible to each other.
 -- Knot-tying via Haskell laziness (Thunk's Env field is lazy).
 -- Dynamic keys in let evaluate against the outer env (the let env
 -- is not yet available during key resolution).
 --
--- Uses 'envLazyScope' to share the same 'LazyAttrs' as evalRecAttrs,
--- eliminating the dual-map space leak.
+-- Positional path: when all bindings are single static keys, builds
+-- 'envSlots' for O(1) variable lookup and sets 'envLazyScope = Nothing'.
+-- This enables closure trimming to fire on lambdas that reference
+-- let-bound variables.
+--
+-- Fallback path: dynamic\/nested-key blocks use the existing 'LazyAttrs'
+-- path with 'envLazyScope'.
 evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> m NixValue
-evalLet env bindings body = do
-  resolvedBindings <- resolveBindingKeys env bindings
-  let letEnv =
-        Env
-          { envSlots = mempty,
-            envLazyScope = Just (LazyAttrs lazyBindingMap cache),
-            envParent = Just env,
-            envWithScopes = envWithScopes env
-          }
-      lazyBindingMap = buildLazyBindingMap letEnv resolvedBindings
-      cache = newLazyAttrCache lazyBindingMap
-  eval letEnv body
+evalLet env bindings body
+  | allPositionalBindings bindings =
+      -- Positional path: slots for O(1) lookup, no envLazyScope.
+      let slotCount = bindingSlotCount bindings
+          -- Knot-tied: letEnv references slots which reference letEnv lazily.
+          letEnv =
+            Env
+              { envSlots = smallArrayFromListN slotCount (buildSlotThunks letEnv env bindings),
+                envLazyScope = Nothing,
+                envParent = Just env,
+                envWithScopes = envWithScopes env
+              }
+       in eval letEnv body
+  | otherwise = do
+      -- Fallback: dynamic/nested keys — use LazyAttrs.
+      resolvedBindings <- resolveBindingKeys env bindings
+      let letEnv =
+            Env
+              { envSlots = mempty,
+                envLazyScope = Just (LazyAttrs lazyBindingMap cache),
+                envParent = Just env,
+                envWithScopes = envWithScopes env
+              }
+          lazyBindingMap = buildLazyBindingMap letEnv resolvedBindings
+          cache = newLazyAttrCache lazyBindingMap
+      eval letEnv body
 
 evalIf :: (MonadEval m) => Env -> Expr -> Expr -> Expr -> m NixValue
 evalIf env cond thenExpr elseExpr = do

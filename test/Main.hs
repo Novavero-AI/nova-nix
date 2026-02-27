@@ -156,7 +156,7 @@ testExprTypes = do
         let expr = EBinary OpAdd (ELit (NixInt 1)) (ELit (NixInt 2))
          in assertEqual "EBinary" expr expr,
       runTest "lambda" $
-        let expr = ELambda (FormalName "x") (EVar "x")
+        let expr = ELambda (FormalName "x") (EVar "x") NoCaptureInfo
          in assertEqual "ELambda" expr expr,
       runTest "let binding" $
         let expr = ELet [NamedBinding [StaticKey "x"] (ELit (NixInt 1))] (EVar "x")
@@ -807,7 +807,7 @@ testParserExprs = do
       -- FormalName "x" → slot 0; FormalSet [a,b] → a=0, b=1;
       -- FormalNamedSet "args" [a] → args=0, a=1.
       runTest "parse simple lambda" $
-        assertParse "lambda" "x: x" (ELambda (FormalName "x") (EResolvedVar 0 0)),
+        assertParse "lambda" "x: x" (ELambda (FormalName "x") (EResolvedVar 0 0) NoCaptureInfo),
       runTest "parse set pattern lambda" $
         assertParse
           "set pattern"
@@ -815,6 +815,7 @@ testParserExprs = do
           ( ELambda
               (FormalSet [Formal "a" Nothing, Formal "b" Nothing] False)
               (EResolvedVar 0 0)
+              NoCaptureInfo
           ),
       runTest "parse set pattern with defaults" $
         assertParse
@@ -823,6 +824,7 @@ testParserExprs = do
           ( ELambda
               (FormalSet [Formal "a" (Just (ELit (NixInt 1)))] False)
               (EResolvedVar 0 0)
+              NoCaptureInfo
           ),
       runTest "parse set pattern with ellipsis" $
         assertParse
@@ -831,6 +833,7 @@ testParserExprs = do
           ( ELambda
               (FormalSet [Formal "a" Nothing] True)
               (EResolvedVar 0 0)
+              NoCaptureInfo
           ),
       runTest "parse named set pattern (name@{...})" $
         assertParse
@@ -839,6 +842,7 @@ testParserExprs = do
           ( ELambda
               (FormalNamedSet "args" [Formal "a" Nothing] False)
               (EResolvedVar 0 1)
+              NoCaptureInfo
           ),
       runTest "parse named set pattern ({...}@name)" $
         assertParse
@@ -847,6 +851,7 @@ testParserExprs = do
           ( ELambda
               (FormalNamedSet "args" [Formal "a" Nothing] False)
               (EResolvedVar 0 1)
+              NoCaptureInfo
           ),
       -- Application
       runTest "parse application" $
@@ -903,7 +908,7 @@ testParserExprs = do
         assertParse
           "let"
           "let x = 1; in x"
-          (ELet [NamedBinding [StaticKey "x"] (ELit (NixInt 1))] (EVar "x")),
+          (ELet [NamedBinding [StaticKey "x"] (ELit (NixInt 1))] (EResolvedVar 0 0)),
       runTest "parse if-then-else" $
         assertParse
           "if"
@@ -985,7 +990,7 @@ testParserIntegration = do
               [ NamedBinding [StaticKey "x"] (ELit (NixInt 1)),
                 NamedBinding [StaticKey "y"] (ELit (NixInt 2))
               ]
-              (EBinary OpAdd (EVar "x") (EVar "y"))
+              (EBinary OpAdd (EResolvedVar 0 0) (EResolvedVar 0 1))
           ),
       runTest "nested attr set" $
         assertParse
@@ -1000,7 +1005,29 @@ testParserIntegration = do
       runTest "indented string" $
         assertRight "ind string" (parseNix "<test>" "''hello''") $ \case
           EIndStr _ -> Pass
-          other -> Fail ("expected EIndStr, got: " <> T.pack (show other))
+          other -> Fail ("expected EIndStr, got: " <> T.pack (show other)),
+      -- Positional let/rec resolution tests
+      runTest "let inherit from outer lambda" $
+        assertRight "let-inherit-lambda" (parseNix "<test>" "x: let inherit x; in x") $ \case
+          -- x: let inherit x; in x
+          -- The lambda formal x is at level 0, index 0.
+          -- The let scope is level 0 (for the let body).
+          -- inherit x desugars to x = x where RHS resolves against outer
+          -- (the lambda scope), so the let binding's RHS is EResolvedVar 0 0
+          -- (one level up from the let to the lambda).
+          -- The body x resolves to level 0, index 0 (the let scope).
+          ELambda _ (ELet [NamedBinding [StaticKey "x"] _rhsExpr] (EResolvedVar 0 0)) _ -> Pass
+          other -> Fail ("expected ELambda with let-inherit, got: " <> T.pack (show other)),
+      runTest "nested lambda in let" $
+        assertEval
+          "let-nested-lambda"
+          "let f = x: x + 1; g = y: f y; in g 5"
+          (VInt 6),
+      runTest "rec attrs positional resolution" $
+        assertEval
+          "rec-positional"
+          "let s = rec { a = 1; b = a + 1; }; in s.b"
+          (VInt 2)
     ]
 
 -- ---------------------------------------------------------------------------

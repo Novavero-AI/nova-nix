@@ -21,6 +21,9 @@ module Nix.Expr.Types
     Formals (..),
     Formal (..),
 
+    -- * Closure capture info
+    CaptureInfo (..),
+
     -- * Operators
     UnaryOp (..),
     BinaryOp (..),
@@ -86,6 +89,19 @@ data Formals
     FormalNamedSet !Text ![Formal] !Bool
   deriving (Eq, Show)
 
+-- | Closure capture information for lambda trimming.
+--
+-- After 'Nix.Expr.ClosureTrim.trimClosures', lambdas that only reference
+-- a subset of their outer scope carry a 'Captures' list.  At eval time
+-- this drives extraction of exactly those thunks into a flat 'Env',
+-- breaking the retention chain to the full parent scope.
+data CaptureInfo
+  = -- | No capture analysis performed (lambda untrimmed).
+    NoCaptureInfo
+  | -- | Sorted list of @(level, index)@ pairs to extract from the parent env.
+    Captures ![(Int, Int)]
+  deriving (Eq, Show)
+
 -- | Unary operators.
 data UnaryOp
   = OpNot
@@ -136,7 +152,12 @@ data Expr
   | -- | Function application: @f x@.
     EApp !Expr !Expr
   | -- | Lambda: @formals: body@.
-    ELambda !Formals !Expr
+    --
+    -- The 'CaptureInfo' field is populated by 'Nix.Expr.ClosureTrim.trimClosures'
+    -- after variable resolution.  'NoCaptureInfo' means untrimmed (eval
+    -- captures the full parent env); 'Captures' lists exactly which outer
+    -- slots to extract into a flat env.
+    ELambda !Formals !Expr !CaptureInfo
   | -- | Let binding: @let bindings in body@.
     ELet ![Binding] !Expr
   | -- | If-then-else: @if cond then t else f@.

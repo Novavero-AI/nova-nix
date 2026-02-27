@@ -374,7 +374,7 @@ resolveRelativePaths dir = goExpr
         ESelect (goExpr target) (map goKey path) (fmap goExpr mDef)
       EHasAttr target path -> EHasAttr (goExpr target) (map goKey path)
       EApp f x -> EApp (goExpr f) (goExpr x)
-      ELambda formals body -> ELambda (goFormals formals) (goExpr body)
+      ELambda formals body captures -> ELambda (goFormals formals) (goExpr body) captures
       ELet bindings body -> ELet (map goBinding bindings) (goExpr body)
       EIf c t f -> EIf (goExpr c) (goExpr t) (goExpr f)
       EWith scope body -> EWith (goExpr scope) (goExpr body)

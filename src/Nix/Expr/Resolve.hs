@@ -1,10 +1,10 @@
 -- | Variable resolution pass: replaces 'EVar' with 'EResolvedVar'
--- for variables bound by lambda formals.
+-- for variables bound by lambda formals and let\/rec bindings.
 --
--- Lambda formals get positional (de Bruijn-style) indices.  Let\/rec
--- bindings act as name barriers (preventing resolution through them)
--- since they use 'envLazyScope' at runtime, which is already zero-cost.
--- With-scopes and builtins remain name-based.
+-- Lambda formals and eligible let\/rec bindings get positional
+-- (de Bruijn-style) indices via 'LexicalScope'.  Let\/rec blocks with
+-- dynamic keys or nested paths fall back to 'NameBarrier' (name-based
+-- lookup at runtime).  With-scopes and builtins remain name-based.
 --
 -- Called once at parse time ('Nix.Parser.parseNix').
 module Nix.Expr.Resolve
@@ -29,7 +29,8 @@ data ScopeEntry
 
 -- | Resolve variables in an expression.  Replaces 'EVar' with
 -- 'EResolvedVar' where the variable is lexically bound by a lambda
--- formal.  All other variables remain as 'EVar' for name-based lookup.
+-- formal or an eligible let\/rec binding.  Variables in with-scopes,
+-- builtins, and fallback let\/rec blocks remain as 'EVar'.
 resolveVars :: Expr -> Expr
 resolveVars = resolve []
 
@@ -41,11 +42,17 @@ resolve stack expr = case expr of
   EIndStr parts -> EIndStr (map (resolvePart stack) parts)
   EVar name -> resolveVar stack 0 name
   EResolvedVar _ _ -> expr
-  EAttrs True bindings ->
-    -- Recursive: binding RHSes see their own names (as NameBarrier).
-    let names = collectBindingNames bindings
-        newStack = NameBarrier names : stack
-     in EAttrs True (concatMap (resolveBinding newStack) bindings)
+  EAttrs True bindings
+    | allStaticSingleKey bindings ->
+        -- Positional: all bindings are single static keys or inherits.
+        let scope = lexicalScopeFromBindings bindings
+            innerStack = scope : stack
+         in EAttrs True (concatMap (resolveLetBinding stack innerStack) bindings)
+    | otherwise ->
+        -- Fallback: dynamic keys or nested paths — use NameBarrier.
+        let names = collectBindingNames bindings
+            newStack = NameBarrier names : stack
+         in EAttrs True (concatMap (resolveBinding newStack) bindings)
   EAttrs False bindings ->
     -- Non-recursive: bindings use the outer scope.
     EAttrs False (concatMap (resolveBinding stack) bindings)
@@ -55,15 +62,21 @@ resolve stack expr = case expr of
   EHasAttr target path ->
     EHasAttr (resolve stack target) (map (resolveKey stack) path)
   EApp f x -> EApp (resolve stack f) (resolve stack x)
-  ELambda formals body ->
+  ELambda formals body _captures ->
     let scope = lexicalScopeFromFormals formals
         newStack = scope : stack
-     in ELambda (resolveFormalsDefaults newStack formals) (resolve newStack body)
-  ELet bindings body ->
-    -- Both body and binding RHSes see the let names (as NameBarrier).
-    let names = collectBindingNames bindings
-        newStack = NameBarrier names : stack
-     in ELet (concatMap (resolveBinding newStack) bindings) (resolve newStack body)
+     in ELambda (resolveFormalsDefaults newStack formals) (resolve newStack body) NoCaptureInfo
+  ELet bindings body
+    | allStaticSingleKey bindings ->
+        -- Positional: all bindings are single static keys or inherits.
+        let scope = lexicalScopeFromBindings bindings
+            innerStack = scope : stack
+         in ELet (concatMap (resolveLetBinding stack innerStack) bindings) (resolve innerStack body)
+    | otherwise ->
+        -- Fallback: dynamic keys or nested paths — use NameBarrier.
+        let names = collectBindingNames bindings
+            newStack = NameBarrier names : stack
+         in ELet (concatMap (resolveBinding newStack) bindings) (resolve newStack body)
   EIf c t f -> EIf (resolve stack c) (resolve stack t) (resolve stack f)
   EWith scope body ->
     -- with-scope names are unknown statically; no scope change.
@@ -141,6 +154,50 @@ resolveBinding stack (Inherit (Just fromExpr) names) =
 resolveBinding stack (Inherit Nothing names) =
   -- Desugar: inherit x y; → x = x; y = y;
   [NamedBinding [StaticKey name] (resolve stack (EVar name)) | name <- names]
+
+-- | Check if all bindings are eligible for positional resolution:
+-- each binding must be either a single static key or an inherit.
+-- Blocks with dynamic keys (@${expr} = val@) or nested paths
+-- (@a.b = val@) are ineligible and fall back to 'NameBarrier'.
+allStaticSingleKey :: [Binding] -> Bool
+allStaticSingleKey = all isEligible
+  where
+    isEligible (NamedBinding [StaticKey _] _) = True
+    isEligible (Inherit _ _) = True
+    isEligible _ = False
+
+-- | Build a 'LexicalScope' from let\/rec bindings, assigning positional
+-- indices in declaration order.  Inherits are expanded in-place (each
+-- inherited name gets its own index).  Later duplicates win (via
+-- 'Map.fromList' right-bias), matching Nix's last-definition-wins
+-- semantics.
+lexicalScopeFromBindings :: [Binding] -> ScopeEntry
+lexicalScopeFromBindings bindings =
+  LexicalScope (Map.fromList (zip names [0 ..]))
+  where
+    names = concatMap bindingNames bindings
+    bindingNames (NamedBinding [StaticKey name] _) = [name]
+    bindingNames (Inherit _ inheritNames) = inheritNames
+    -- Unreachable: allStaticSingleKey guards this path.
+    bindingNames _ = []
+
+-- | Resolve bindings in a let\/rec block that uses positional resolution.
+-- Takes two stacks: @outerStack@ (before the let scope) and @innerStack@
+-- (with the let's 'LexicalScope' pushed).
+--
+-- Regular bindings resolve their RHS against @innerStack@ (recursive).
+-- @inherit x@ desugars to @x = x@ where the RHS resolves against
+-- @outerStack@ — the inherited name must reference the enclosing scope,
+-- not the let scope being defined.
+resolveLetBinding :: [ScopeEntry] -> [ScopeEntry] -> Binding -> [Binding]
+resolveLetBinding _ innerStack (NamedBinding path bodyExpr) =
+  [NamedBinding (map (resolveKey innerStack) path) (resolve innerStack bodyExpr)]
+resolveLetBinding _ innerStack (Inherit (Just fromExpr) names) =
+  [Inherit (Just (resolve innerStack fromExpr)) names]
+resolveLetBinding outerStack _ (Inherit Nothing names) =
+  -- Desugar: inherit x y; → x = x; y = y;
+  -- RHS resolves against outer scope (before the let bindings).
+  [NamedBinding [StaticKey name] (resolve outerStack (EVar name)) | name <- names]
 
 -- | Resolve variables inside formal default expressions.
 resolveFormalsDefaults :: [ScopeEntry] -> Formals -> Formals

@@ -50,6 +50,7 @@ where
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import Nix.Expr.ClosureTrim (trimClosures)
 import Nix.Expr.Resolve (resolveVars)
 import Nix.Expr.Types (Expr)
 import Nix.Parser.Expr (parseTopLevel)
@@ -67,7 +68,7 @@ parseNix fileName source = do
   tokens <- tokenize fileName (stripBOM source)
   let st = ParseState {psTokens = tokens, psFile = fileName}
   (expr, _remaining) <- runParser parseTopLevel st
-  pure (resolveVars expr)
+  pure (trimClosures (resolveVars expr))
 
 -- | Strip a leading UTF-8 byte order mark (U+FEFF) if present.
 stripBOM :: Text -> Text
