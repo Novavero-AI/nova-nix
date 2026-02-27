@@ -47,6 +47,7 @@ module Nix.Eval.Types
     -- * Thunk operations
     mkThunk,
     mkSyntheticThunk,
+    cheapThunk,
     evaluated,
     thunkSameRef,
 
@@ -68,7 +69,7 @@ import Data.Primitive.SmallArray (SmallArray, indexSmallArray, sizeofSmallArray)
 import Data.Set (Set)
 import Data.Text (Text)
 import Nix.Derivation (Derivation)
-import Nix.Expr.Types (AttrKey (..), Expr (..), Formals, StringPart (..))
+import Nix.Expr.Types (AttrKey (..), Expr (..), Formals, NixAtom (..), StringPart (..))
 import Nix.Store.Path (StorePath)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Text.Regex.TDFA as RE
@@ -509,6 +510,19 @@ mkThunk env thunkExpr =
 mkSyntheticThunk :: Env -> Expr -> Thunk
 mkSyntheticThunk env thunkExpr =
   ThunkRef (newSyntheticCell (envSlots env) thunkExpr env)
+
+-- | Like 'mkThunk' but avoids IORef allocation for trivial expressions.
+-- Resolved variables reuse the existing thunk from the env (no wrapper).
+-- Literals and lambdas use 'Evaluated' directly (no IORef needed).
+-- Everything else falls back to 'mkThunk'.
+cheapThunk :: Env -> Expr -> Thunk
+cheapThunk env (EResolvedVar level idx) = envLookupResolved level idx env
+cheapThunk _ (ELit (NixInt n)) = Evaluated (VInt n)
+cheapThunk _ (ELit (NixFloat n)) = Evaluated (VFloat n)
+cheapThunk _ (ELit (NixBool b)) = Evaluated (VBool b)
+cheapThunk _ (ELit NixNull) = Evaluated VNull
+cheapThunk env (ELambda formals body) = Evaluated (VLambda env formals body)
+cheapThunk env expr = mkThunk env expr
 
 -- | Allocate a fresh memoization cell for a thunk.
 --

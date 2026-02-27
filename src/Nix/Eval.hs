@@ -110,6 +110,7 @@ import Nix.Eval.Types
     attrSetToAscList,
     attrSetToMap,
     attrSetUnionWith,
+    cheapThunk,
     emptyContext,
     emptyEnv,
     envFromSlots,
@@ -152,7 +153,7 @@ eval env expr = case expr of
   EVar name -> evalVar env name
   EResolvedVar level idx -> force (envLookupResolved level idx env)
   EAttrs isRec bindings -> evalAttrs env isRec bindings
-  EList exprs -> pure (VList (map (mkThunk env) exprs))
+  EList exprs -> pure (VList (map (cheapThunk env) exprs))
   ESelect target path defExpr -> evalSelect env target path defExpr
   EHasAttr target path -> evalHasAttr env target path
   EApp func arg -> evalApp env func arg
@@ -440,7 +441,7 @@ evalApp env funcExpr argExpr = do
   funcVal <- eval env funcExpr
   case funcVal of
     VLambda closureEnv formals body -> do
-      let argThunk = mkThunk env argExpr
+      let argThunk = cheapThunk env argExpr
       extEnv <- matchFormals closureEnv formals argThunk
       eval extEnv body
     VBuiltin "tryEval" [] -> do
