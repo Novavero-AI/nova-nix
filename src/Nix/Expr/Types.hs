@@ -142,7 +142,11 @@ data Expr
   | -- | Variable reference.
     EVar !Text
   | -- | Attribute set: @{ bindings }@ or @rec { bindings }@.
-    EAttrs !Bool ![Binding]
+    --
+    -- The 'CaptureInfo' field is populated by 'Nix.Expr.ClosureTrim.trimClosures'
+    -- for recursive attr sets after variable resolution.  Non-recursive sets
+    -- always carry 'NoCaptureInfo'.
+    EAttrs !Bool ![Binding] !CaptureInfo
   | -- | List: @[ e1 e2 e3 ]@.
     EList ![Expr]
   | -- | Attribute selection: @expr.attrpath@ or @expr.attrpath or default@.
@@ -159,7 +163,12 @@ data Expr
     -- slots to extract into a flat env.
     ELambda !Formals !Expr !CaptureInfo
   | -- | Let binding: @let bindings in body@.
-    ELet ![Binding] !Expr
+    --
+    -- The 'CaptureInfo' field is populated by 'Nix.Expr.ClosureTrim.trimClosures'
+    -- after variable resolution.  Positional let blocks that only reference
+    -- a subset of their parent scope carry a 'Captures' list; at eval time
+    -- this drives construction of a trimmed parent env.
+    ELet ![Binding] !Expr !CaptureInfo
   | -- | If-then-else: @if cond then t else f@.
     EIf !Expr !Expr !Expr
   | -- | With expression: @with expr; body@.

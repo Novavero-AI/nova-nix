@@ -40,6 +40,8 @@ NIXPKGS_PATH="C:\\Users\\devon\\nixpkgs-nixos-24.11"
 EVAL_EXPR='builtins.length (builtins.attrNames (import <nixpkgs> {}))'
 DEFAULT_HEAP_CAP="-M4G"
 HEAP_CAP="$DEFAULT_HEAP_CAP"
+BUILD_MODE="standard"   # tracks current build: "standard" or "profiling"
+LAST_BUILD_MODE=""      # tracks previous build to detect mode switches
 
 # ----------------------------------------------------------------
 # Helpers
@@ -57,8 +59,16 @@ needs_profiling_build() {
 
 do_build() {
   local mode="$1"  # "standard" or "profiling"
+  BUILD_MODE="$mode"
   echo ""
   echo "=== Building ($mode) ==="
+  # cabal doesn't relink the exe when switching between standard/profiling
+  # modes, so we must clean the exe build dir before switching.
+  if [[ "$mode" != "$LAST_BUILD_MODE" ]]; then
+    local exe_build_dir="$REPO_ROOT/dist-newstyle/build/x86_64-windows/ghc-9.6.7/nova-nix-*/x/nova-nix"
+    rm -rf $exe_build_dir 2>/dev/null || true
+  fi
+  LAST_BUILD_MODE="$mode"
   if [[ "$mode" == "profiling" ]]; then
     (cd "$REPO_ROOT" && cabal build --enable-profiling --ghc-options="-fprof-late")
   else
@@ -67,12 +77,14 @@ do_build() {
   echo "Build complete."
 }
 
-find_exe() {
-  EXE=$(cd "$REPO_ROOT" && cabal list-bin nova-nix 2>/dev/null)
-  if [[ ! -f "$EXE" ]]; then
-    echo "ERROR: nova-nix executable not found at: $EXE"
-    echo "Run 'cabal build' first (or use --build)."
-    exit 1
+# Run the nova-nix executable via cabal run, which ensures the correct
+# build variant (standard vs profiling) is used.
+#   run_exe <args...>
+run_exe() {
+  if [[ "$BUILD_MODE" == "profiling" ]]; then
+    cabal run --enable-profiling nova-nix -- "$@"
+  else
+    cabal run nova-nix -- "$@"
   fi
 }
 
@@ -98,13 +110,14 @@ run_one_profile() {
 
   local rts_flags=("-s" "$HEAP_CAP" "${rts_filtered[@]+"${rts_filtered[@]}"}")
   echo "  RTS flags: ${rts_flags[*]}"
+  echo "  Build mode: $BUILD_MODE"
   echo "  Output: $out_dir/"
 
   # Record metadata
   cat > "$out_dir/meta.txt" <<EOF
 label: $(basename "$out_dir")
 date: $(date -Iseconds)
-exe: $EXE
+build_mode: $BUILD_MODE
 heap_cap: $HEAP_CAP
 rts_flags: ${rts_flags[*]}
 expr: $EVAL_EXPR
@@ -118,11 +131,11 @@ EOF
   local prof_cwd="$REPO_ROOT/nova-nix.prof"
   rm -f "$hp_cwd" "$prof_cwd"
 
-  # Run
+  # Run via cabal run (ensures correct standard/profiling binary)
   cd "$REPO_ROOT"
   set +e
   NIX_PATH="nixpkgs=$NIXPKGS_PATH" \
-    "$EXE" eval --expr "$EVAL_EXPR" \
+    run_exe eval --expr "$EVAL_EXPR" \
     +RTS "${rts_flags[@]}" -RTS \
     > "$out_dir/eval-output.txt" \
     2> "$out_dir/rts-stats.txt"
@@ -324,16 +337,12 @@ if [[ "$FLAG_FULL" == true ]]; then
   echo ""
   echo "--- Pass 1/3: Type Breakdown (-hT) ---"
   do_build standard
-  find_exe
-  echo "Executable: $EXE"
   run_one_profile "$RESULTS_DIR/hT" -hT
 
   # Pass 2: -hc -p (profiling build — cost centres + time/alloc .prof)
   echo ""
   echo "--- Pass 2/3: Cost Centres + Time Profile (-hc -p) ---"
   do_build profiling
-  find_exe
-  echo "Executable: $EXE"
   run_one_profile "$RESULTS_DIR/hc" -hc -p
 
   # Pass 3: -hr (profiling build — retainers)
@@ -359,10 +368,6 @@ else
       do_build standard
     fi
   fi
-
-  find_exe
-  echo "Executable: $EXE"
-  echo ""
 
   run_one_profile "$RESULTS_DIR" "${RTS_EXTRA[@]+"${RTS_EXTRA[@]}"}"
 

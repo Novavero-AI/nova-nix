@@ -42,20 +42,20 @@ resolve stack expr = case expr of
   EIndStr parts -> EIndStr (map (resolvePart stack) parts)
   EVar name -> resolveVar stack 0 name
   EResolvedVar _ _ -> expr
-  EAttrs True bindings
+  EAttrs True bindings _captureInfo
     | allStaticSingleKey bindings ->
         -- Positional: all bindings are single static keys or inherits.
         let scope = lexicalScopeFromBindings bindings
             innerStack = scope : stack
-         in EAttrs True (concatMap (resolveLetBinding stack innerStack) bindings)
+         in EAttrs True (concatMap (resolveLetBinding stack innerStack) bindings) NoCaptureInfo
     | otherwise ->
         -- Fallback: dynamic keys or nested paths — use NameBarrier.
         let names = collectBindingNames bindings
             newStack = NameBarrier names : stack
-         in EAttrs True (concatMap (resolveBinding newStack) bindings)
-  EAttrs False bindings ->
+         in EAttrs True (concatMap (resolveBinding newStack) bindings) NoCaptureInfo
+  EAttrs False bindings _captureInfo ->
     -- Non-recursive: bindings use the outer scope.
-    EAttrs False (concatMap (resolveBinding stack) bindings)
+    EAttrs False (concatMap (resolveBinding stack) bindings) NoCaptureInfo
   EList elems -> EList (map (resolve stack) elems)
   ESelect target path defExpr ->
     ESelect (resolve stack target) (map (resolveKey stack) path) (fmap (resolve stack) defExpr)
@@ -66,17 +66,17 @@ resolve stack expr = case expr of
     let scope = lexicalScopeFromFormals formals
         newStack = scope : stack
      in ELambda (resolveFormalsDefaults newStack formals) (resolve newStack body) NoCaptureInfo
-  ELet bindings body
+  ELet bindings body _captureInfo
     | allStaticSingleKey bindings ->
         -- Positional: all bindings are single static keys or inherits.
         let scope = lexicalScopeFromBindings bindings
             innerStack = scope : stack
-         in ELet (concatMap (resolveLetBinding stack innerStack) bindings) (resolve innerStack body)
+         in ELet (concatMap (resolveLetBinding stack innerStack) bindings) (resolve innerStack body) NoCaptureInfo
     | otherwise ->
         -- Fallback: dynamic keys or nested paths — use NameBarrier.
         let names = collectBindingNames bindings
             newStack = NameBarrier names : stack
-         in ELet (concatMap (resolveBinding newStack) bindings) (resolve newStack body)
+         in ELet (concatMap (resolveBinding newStack) bindings) (resolve newStack body) NoCaptureInfo
   EIf c t f -> EIf (resolve stack c) (resolve stack t) (resolve stack f)
   EWith scope body ->
     -- with-scope names are unknown statically; no scope change.

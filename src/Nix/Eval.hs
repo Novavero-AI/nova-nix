@@ -153,22 +153,14 @@ eval env expr = case expr of
   EIndStr parts -> uncurry VStr <$> evalIndStringParts eval force applyValue env parts
   EVar name -> evalVar env name
   EResolvedVar level idx -> force (envLookupResolved level idx env)
-  EAttrs isRec bindings -> evalAttrs env isRec bindings
+  EAttrs isRec bindings captureInfo -> evalAttrs env isRec bindings captureInfo
   EList exprs -> pure (VList (map (cheapThunk env) exprs))
   ESelect target path defExpr -> evalSelect env target path defExpr
   EHasAttr target path -> evalHasAttr env target path
   EApp func arg -> evalApp env func arg
-  ELambda formals body NoCaptureInfo -> pure (VLambda env formals body)
-  ELambda formals body (Captures captureList) ->
-    let trimmedEnv =
-          Env
-            { envSlots = smallArrayFromListN (length captureList) [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
-              envLazyScope = Nothing,
-              envParent = Nothing,
-              envWithScopes = []
-            }
-     in pure (VLambda trimmedEnv formals body)
-  ELet bindings body -> evalLet env bindings body
+  ELambda formals body captureInfo ->
+    pure (VLambda (buildCaptureEnv env captureInfo) formals body)
+  ELet bindings body captureInfo -> evalLet env bindings body captureInfo
   EIf cond thenExpr elseExpr -> evalIf env cond thenExpr elseExpr
   EWith scope body -> evalWith env scope body
   EAssert cond body -> evalAssert env cond body
@@ -240,9 +232,9 @@ evalVar env name =
 -- Attribute sets
 -- ---------------------------------------------------------------------------
 
-evalAttrs :: (MonadEval m) => Env -> Bool -> [Binding] -> m NixValue
-evalAttrs env False bindings = evalNonRecAttrs env bindings
-evalAttrs env True bindings = evalRecAttrs env bindings
+evalAttrs :: (MonadEval m) => Env -> Bool -> [Binding] -> CaptureInfo -> m NixValue
+evalAttrs env False bindings _captureInfo = evalNonRecAttrs env bindings
+evalAttrs env True bindings captureInfo = evalRecAttrs env bindings captureInfo
 
 -- | Non-recursive attribute set: thunks capture the outer environment.
 --
@@ -271,17 +263,20 @@ evalNonRecAttrs env bindings = do
 -- Fallback path: uses 'LazyAttrs' to defer thunk + IORef allocation.
 -- The env's 'envLazyScope' points to the SAME 'LazyAttrs' that backs
 -- the resulting attr set — one map instead of two.
-evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
-evalRecAttrs env bindings
+evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> CaptureInfo -> m NixValue
+evalRecAttrs env bindings captureInfo
   | allPositionalBindings bindings =
       -- Positional path: slots for variable lookup, EagerAttrs for return.
       let slotCount = bindingSlotCount bindings
+          parentEnv = buildCaptureEnv env captureInfo
           recEnv =
             Env
               { envSlots = slots,
                 envLazyScope = Nothing,
-                envParent = Just env,
-                envWithScopes = envWithScopes env
+                envParent = Just parentEnv,
+                envWithScopes = case captureInfo of
+                  NoCaptureInfo -> envWithScopes env
+                  Captures _ -> []
               }
           slots = smallArrayFromListN slotCount (buildSlotThunks recEnv env bindings)
           attrMap = buildAttrMapFromSlots bindings slots
@@ -574,6 +569,24 @@ checkMissingFormals attrs formals =
     [] -> pure ()
     (name : _) -> throwEvalError ("missing required attribute '" <> name <> "'")
 
+-- | Build a flat env from capture coordinates, extracting only the
+-- referenced slots from the parent chain.  Returns the original env
+-- unchanged when untrimmed.  Used by lambdas (as closure env), and
+-- by let\/rec blocks (as trimmed parent env) to break the retention
+-- chain to the full outer scope.
+buildCaptureEnv :: Env -> CaptureInfo -> Env
+buildCaptureEnv env NoCaptureInfo = env
+buildCaptureEnv env (Captures captureList) =
+  Env
+    { envSlots =
+        smallArrayFromListN
+          (length captureList)
+          [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
+      envLazyScope = Nothing,
+      envParent = Nothing,
+      envWithScopes = []
+    }
+
 -- ---------------------------------------------------------------------------
 -- Let / if / with / assert
 -- ---------------------------------------------------------------------------
@@ -645,18 +658,21 @@ buildAttrMapFromSlots bindings slots = snd (foldl' addOne (0, Map.empty) binding
 --
 -- Fallback path: dynamic\/nested-key blocks use the existing 'LazyAttrs'
 -- path with 'envLazyScope'.
-evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> m NixValue
-evalLet env bindings body
+evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> CaptureInfo -> m NixValue
+evalLet env bindings body captureInfo
   | allPositionalBindings bindings =
       -- Positional path: slots for O(1) lookup, no envLazyScope.
       let slotCount = bindingSlotCount bindings
+          parentEnv = buildCaptureEnv env captureInfo
           -- Knot-tied: letEnv references slots which reference letEnv lazily.
           letEnv =
             Env
               { envSlots = smallArrayFromListN slotCount (buildSlotThunks letEnv env bindings),
                 envLazyScope = Nothing,
-                envParent = Just env,
-                envWithScopes = envWithScopes env
+                envParent = Just parentEnv,
+                envWithScopes = case captureInfo of
+                  NoCaptureInfo -> envWithScopes env
+                  Captures _ -> []
               }
        in eval letEnv body
   | otherwise = do

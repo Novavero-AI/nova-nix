@@ -457,7 +457,7 @@ parseListElems = go []
 
 parseAttrSet :: Bool -> Parser Expr
 parseAttrSet isRec =
-  EAttrs isRec <$> parseBindings
+  (\bs -> EAttrs isRec bs NoCaptureInfo) <$> parseBindings
 
 parseBindings :: Parser [Binding]
 parseBindings = go []
@@ -559,7 +559,7 @@ parseLet = do
   expect TokLet
   bindings <- parseLetBindings
   expect TokIn
-  ELet bindings <$> parseExpr
+  (\body -> ELet bindings body NoCaptureInfo) <$> parseExpr
 
 parseLetBindings :: Parser [Binding]
 parseLetBindings = go []

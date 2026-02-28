@@ -1,16 +1,18 @@
--- | Closure trimming pass: rewrites lambdas to capture only the free
--- variables their bodies actually use.
+-- | Closure trimming pass: rewrites lambdas, let blocks, and recursive
+-- attr sets to capture only the free variables they actually use.
 --
--- Without trimming, every 'VLambda' retains the ENTIRE parent 'Env'
--- chain.  A lambda using 3 variables retains a 30k-entry nixpkgs
--- scope.  This pass, run after 'resolveVars', attaches a 'Captures'
--- list to each trimmable 'ELambda' so the evaluator can build a flat
--- env with @envParent = Nothing@, breaking the retention chain.
+-- Without trimming, every 'VLambda' and every let\/rec binding thunk
+-- retains the ENTIRE parent 'Env' chain.  A scope using 3 variables
+-- retains a 30k-entry nixpkgs scope.  This pass, run after
+-- 'resolveVars', attaches a 'Captures' list to each trimmable
+-- 'ELambda', 'ELet', and recursive 'EAttrs' so the evaluator can
+-- build a flat env with @envParent = Nothing@, breaking the retention
+-- chain.
 --
--- A lambda is trimmable when its body contains only 'EResolvedVar'
+-- A scope is trimmable when its body contains only 'EResolvedVar'
 -- references to outer scopes (no 'EVar' that resolves through the
--- parent chain).  Lambdas with outer 'EVar' references (let/rec
--- bindings, with-scope lookups) cannot be trimmed because those
+-- parent chain).  Scopes with outer 'EVar' references (with-scope
+-- lookups, non-positional bindings) cannot be trimmed because those
 -- require walking the full parent chain at runtime.
 module Nix.Expr.ClosureTrim
   ( trimClosures,
@@ -26,7 +28,8 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import Nix.Expr.Types
 
--- | Walk the AST and attach 'Captures' info to trimmable lambdas.
+-- | Walk the AST and attach 'Captures' info to trimmable scopes
+-- (lambdas, let blocks, and recursive attr sets).
 trimClosures :: Expr -> Expr
 trimClosures = trimExpr Set.empty
 
@@ -44,12 +47,19 @@ trimExpr innerNames expr = case expr of
   EIndStr parts -> EIndStr (map (trimPart innerNames) parts)
   EVar {} -> expr
   EResolvedVar {} -> expr
-  EAttrs True bindings ->
+  EAttrs True bindings captureInfo ->
     let names = collectBindingNames bindings
         innerNamesRec = Set.union innerNames names
-     in EAttrs True (map (trimBinding innerNamesRec) bindings)
-  EAttrs False bindings ->
-    EAttrs False (map (trimBinding innerNames) bindings)
+        trimmedBindings = map (trimBinding innerNamesRec) bindings
+     in case captureInfo of
+          Captures {} -> EAttrs True trimmedBindings captureInfo
+          NoCaptureInfo ->
+            case trimOneRecAttrs trimmedBindings of
+              Left unchanged -> EAttrs True unchanged NoCaptureInfo
+              Right (captureList, rewrittenBindings) ->
+                EAttrs True rewrittenBindings (Captures captureList)
+  EAttrs False bindings _captureInfo ->
+    EAttrs False (map (trimBinding innerNames) bindings) NoCaptureInfo
   EList elems -> EList (map (trimExpr innerNames) elems)
   ESelect target path defExpr ->
     ESelect
@@ -72,10 +82,19 @@ trimExpr innerNames expr = case expr of
               Left unchanged -> unchanged
               Right (captureList, rewrittenFormals, rewrittenBody) ->
                 ELambda rewrittenFormals rewrittenBody (Captures captureList)
-  ELet bindings body ->
+  ELet bindings body captureInfo ->
     let names = collectBindingNames bindings
         innerNamesLet = Set.union innerNames names
-     in ELet (map (trimBinding innerNamesLet) bindings) (trimExpr innerNamesLet body)
+        trimmedBindings = map (trimBinding innerNamesLet) bindings
+        trimmedBody = trimExpr innerNamesLet body
+     in case captureInfo of
+          Captures {} -> ELet trimmedBindings trimmedBody captureInfo
+          NoCaptureInfo ->
+            case trimOneLetBlock trimmedBindings trimmedBody of
+              Left (unchangedBindings, unchangedBody) ->
+                ELet unchangedBindings unchangedBody NoCaptureInfo
+              Right (captureList, rewrittenBindings, rewrittenBody) ->
+                ELet rewrittenBindings rewrittenBody (Captures captureList)
   EIf c t f ->
     EIf (trimExpr innerNames c) (trimExpr innerNames t) (trimExpr innerNames f)
   EWith scope body ->
@@ -161,10 +180,15 @@ collectFreeVars depth expr = case expr of
   EResolvedVar level idx
     | level > depth -> (Set.singleton (level - depth - 1, idx), False)
     | otherwise -> (Set.empty, False)
-  EAttrs True bindings ->
-    -- Recursive attrs create a NameBarrier (depth + 1)
-    foldBindings (depth + 1) bindings
-  EAttrs False bindings ->
+  EAttrs True bindings captureInfo ->
+    -- Recursive attrs create a scope (depth + 1)
+    let (vs1, h1) = foldBindings (depth + 1) bindings
+        vs2 = case captureInfo of
+          NoCaptureInfo -> Set.empty
+          Captures caps ->
+            Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth]
+     in (Set.union vs1 vs2, h1)
+  EAttrs False bindings _captureInfo ->
     -- Non-recursive attrs: no new scope
     foldBindings depth bindings
   EList elems -> foldExprs depth elems
@@ -196,11 +220,15 @@ collectFreeVars depth expr = case expr of
             Set.fromList
               [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth]
      in (Set.unions [vs1, vs2, vs3], h1 || h2)
-  ELet bindings body_ ->
-    -- Let creates a NameBarrier (depth + 1)
+  ELet bindings body_ captureInfo ->
+    -- Let creates a scope (depth + 1)
     let (vs1, h1) = foldBindings (depth + 1) bindings
         (vs2, h2) = collectFreeVars (depth + 1) body_
-     in (Set.union vs1 vs2, h1 || h2)
+        vs3 = case captureInfo of
+          NoCaptureInfo -> Set.empty
+          Captures caps ->
+            Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth]
+     in (Set.unions [vs1, vs2, vs3], h1 || h2)
   EIf c t f ->
     let (vs1, h1) = collectFreeVars depth c
         (vs2, h2) = collectFreeVars depth t
@@ -291,10 +319,10 @@ rewriteBody depth captureMap expr = case expr of
               -- Unreachable: collectFreeVars found all outer refs
               Nothing -> expr
     | otherwise -> expr
-  EAttrs True bindings ->
-    EAttrs True (map (rewriteBinding (depth + 1) captureMap) bindings)
-  EAttrs False bindings ->
-    EAttrs False (map (rewriteBinding depth captureMap) bindings)
+  EAttrs True bindings captureInfo ->
+    EAttrs True (map (rewriteBinding (depth + 1) captureMap) bindings) (rewriteCaptures depth captureMap captureInfo)
+  EAttrs False bindings captureInfo ->
+    EAttrs False (map (rewriteBinding depth captureMap) bindings) captureInfo
   EList elems -> EList (map (rewriteBody depth captureMap) elems)
   ESelect target path defExpr ->
     ESelect
@@ -312,10 +340,11 @@ rewriteBody depth captureMap expr = case expr of
       (rewriteFormals (depth + 1) captureMap formals)
       (rewriteBody (depth + 1) captureMap body_)
       (rewriteCaptures depth captureMap captures)
-  ELet bindings body_ ->
+  ELet bindings body_ captureInfo ->
     ELet
       (map (rewriteBinding (depth + 1) captureMap) bindings)
       (rewriteBody (depth + 1) captureMap body_)
+      (rewriteCaptures depth captureMap captureInfo)
   EIf c t f ->
     EIf
       (rewriteBody depth captureMap c)
@@ -387,6 +416,41 @@ formalsNames (FormalSet formals _) =
   Set.fromList (map fName formals)
 formalsNames (FormalNamedSet name formals _) =
   Set.insert name (Set.fromList (map fName formals))
+
+-- | Analyze a let block's binding bodies + body for parent references,
+-- produce a capture list + rewritten bindings + body, or return the
+-- originals unchanged if untrimable.
+--
+-- Level 0 = self-references within the let scope (untouched).
+-- Level 1+ = parent chain references (trimmed).
+trimOneLetBlock :: [Binding] -> Expr -> Either ([Binding], Expr) ([(Int, Int)], [Binding], Expr)
+trimOneLetBlock bindings body =
+  let (bindingVars, bindingHasEVar) = foldBindings 0 bindings
+      (bodyVars, bodyHasEVar) = collectFreeVars 0 body
+      freeVars = Set.union bindingVars bodyVars
+      hasOuterEVar = bindingHasEVar || bodyHasEVar
+   in if hasOuterEVar || Set.null freeVars
+        then Left (bindings, body)
+        else
+          let captureList = sortBy (comparing fst <> comparing snd) (Set.toList freeVars)
+              captureMap = Map.fromList (zip captureList [0 ..])
+              rewrittenBindings = map (rewriteBinding 0 captureMap) bindings
+              rewrittenBody = rewriteBody 0 captureMap body
+           in Right (captureList, rewrittenBindings, rewrittenBody)
+
+-- | Analyze a recursive attr set's bindings for parent references,
+-- produce a capture list + rewritten bindings, or return the originals
+-- unchanged if untrimable.
+trimOneRecAttrs :: [Binding] -> Either [Binding] ([(Int, Int)], [Binding])
+trimOneRecAttrs bindings =
+  let (bindingVars, bindingHasEVar) = foldBindings 0 bindings
+   in if bindingHasEVar || Set.null bindingVars
+        then Left bindings
+        else
+          let captureList = sortBy (comparing fst <> comparing snd) (Set.toList bindingVars)
+              captureMap = Map.fromList (zip captureList [0 ..])
+              rewrittenBindings = map (rewriteBinding 0 captureMap) bindings
+           in Right (captureList, rewrittenBindings)
 
 -- | Collect top-level binding names (mirrors 'Nix.Expr.Resolve.collectBindingNames').
 collectBindingNames :: [Binding] -> Set Text

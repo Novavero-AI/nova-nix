@@ -159,10 +159,10 @@ testExprTypes = do
         let expr = ELambda (FormalName "x") (EVar "x") NoCaptureInfo
          in assertEqual "ELambda" expr expr,
       runTest "let binding" $
-        let expr = ELet [NamedBinding [StaticKey "x"] (ELit (NixInt 1))] (EVar "x")
+        let expr = ELet [NamedBinding [StaticKey "x"] (ELit (NixInt 1))] (EVar "x") NoCaptureInfo
          in assertEqual "ELet" expr expr,
       runTest "attrs" $
-        let expr = EAttrs False [NamedBinding [StaticKey "a"] (ELit (NixInt 1))]
+        let expr = EAttrs False [NamedBinding [StaticKey "a"] (ELit (NixInt 1))] NoCaptureInfo
          in assertEqual "EAttrs" expr expr,
       runTest "if-then-else" $
         let expr = EIf (ELit (NixBool True)) (ELit (NixInt 1)) (ELit (NixInt 2))
@@ -880,35 +880,35 @@ testParserExprs = do
         assertParse "has-attr" "a ? b" (EHasAttr (EVar "a") [StaticKey "b"]),
       -- Attr sets
       runTest "parse empty attrs" $
-        assertParse "empty attrs" "{ }" (EAttrs False []),
+        assertParse "empty attrs" "{ }" (EAttrs False [] NoCaptureInfo),
       runTest "parse attrs with binding" $
         assertParse
           "attrs"
           "{ a = 1; }"
-          (EAttrs False [NamedBinding [StaticKey "a"] (ELit (NixInt 1))]),
+          (EAttrs False [NamedBinding [StaticKey "a"] (ELit (NixInt 1))] NoCaptureInfo),
       runTest "parse rec attrs" $
         assertParse
           "rec attrs"
           "rec { a = 1; }"
-          (EAttrs True [NamedBinding [StaticKey "a"] (ELit (NixInt 1))]),
+          (EAttrs True [NamedBinding [StaticKey "a"] (ELit (NixInt 1))] NoCaptureInfo),
       -- inherit x y; is desugared to x = x; y = y; by the resolution pass
       -- (needed because lambda formals are positional, not name-based).
       runTest "parse inherit" $
         assertParse
           "inherit"
           "{ inherit x y; }"
-          (EAttrs False [NamedBinding [StaticKey "x"] (EVar "x"), NamedBinding [StaticKey "y"] (EVar "y")]),
+          (EAttrs False [NamedBinding [StaticKey "x"] (EVar "x"), NamedBinding [StaticKey "y"] (EVar "y")] NoCaptureInfo),
       runTest "parse inherit from" $
         assertParse
           "inherit from"
           "{ inherit (a) x; }"
-          (EAttrs False [Inherit (Just (EVar "a")) ["x"]]),
+          (EAttrs False [Inherit (Just (EVar "a")) ["x"]] NoCaptureInfo),
       -- Let/if/with/assert
       runTest "parse let" $
         assertParse
           "let"
           "let x = 1; in x"
-          (ELet [NamedBinding [StaticKey "x"] (ELit (NixInt 1))] (EResolvedVar 0 0)),
+          (ELet [NamedBinding [StaticKey "x"] (ELit (NixInt 1))] (EResolvedVar 0 0) NoCaptureInfo),
       runTest "parse if-then-else" $
         assertParse
           "if"
@@ -943,7 +943,7 @@ testParserExprs = do
         assertParse
           "or attr key"
           "{ or = 1; }"
-          (EAttrs False [NamedBinding [StaticKey "or"] (ELit (NixInt 1))])
+          (EAttrs False [NamedBinding [StaticKey "or"] (ELit (NixInt 1))] NoCaptureInfo)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -991,6 +991,7 @@ testParserIntegration = do
                 NamedBinding [StaticKey "y"] (ELit (NixInt 2))
               ]
               (EBinary OpAdd (EResolvedVar 0 0) (EResolvedVar 0 1))
+              NoCaptureInfo
           ),
       runTest "nested attr set" $
         assertParse
@@ -999,8 +1000,9 @@ testParserIntegration = do
           ( EAttrs
               False
               [ NamedBinding [StaticKey "a", StaticKey "b", StaticKey "c"] (ELit (NixInt 1)),
-                NamedBinding [StaticKey "d"] (EAttrs False [NamedBinding [StaticKey "e"] (ELit (NixInt 2))])
+                NamedBinding [StaticKey "d"] (EAttrs False [NamedBinding [StaticKey "e"] (ELit (NixInt 2))] NoCaptureInfo)
               ]
+              NoCaptureInfo
           ),
       runTest "indented string" $
         assertRight "ind string" (parseNix "<test>" "''hello''") $ \case
@@ -1016,7 +1018,7 @@ testParserIntegration = do
           -- (the lambda scope), so the let binding's RHS is EResolvedVar 0 0
           -- (one level up from the let to the lambda).
           -- The body x resolves to level 0, index 0 (the let scope).
-          ELambda _ (ELet [NamedBinding [StaticKey "x"] _rhsExpr] (EResolvedVar 0 0)) _ -> Pass
+          ELambda _ (ELet [NamedBinding [StaticKey "x"] _rhsExpr] (EResolvedVar 0 0) _) _ -> Pass
           other -> Fail ("expected ELambda with let-inherit, got: " <> T.pack (show other)),
       runTest "nested lambda in let" $
         assertEval

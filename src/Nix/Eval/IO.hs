@@ -368,14 +368,14 @@ resolveRelativePaths dir = goExpr
       EIndStr parts -> EIndStr (map goPart parts)
       EVar _ -> expr
       EResolvedVar _ _ -> expr
-      EAttrs isRec bindings -> EAttrs isRec (map goBinding bindings)
+      EAttrs isRec bindings captureInfo -> EAttrs isRec (map goBinding bindings) captureInfo
       EList elems -> EList (map goExpr elems)
       ESelect target path mDef ->
         ESelect (goExpr target) (map goKey path) (fmap goExpr mDef)
       EHasAttr target path -> EHasAttr (goExpr target) (map goKey path)
       EApp f x -> EApp (goExpr f) (goExpr x)
       ELambda formals body captures -> ELambda (goFormals formals) (goExpr body) captures
-      ELet bindings body -> ELet (map goBinding bindings) (goExpr body)
+      ELet bindings body captureInfo -> ELet (map goBinding bindings) (goExpr body) captureInfo
       EIf c t f -> EIf (goExpr c) (goExpr t) (goExpr f)
       EWith scope body -> EWith (goExpr scope) (goExpr body)
       EAssert cond body -> EAssert (goExpr cond) (goExpr body)
