@@ -195,9 +195,101 @@ package set. C++ Nix does closure trimming — only captures used variables.
 
 ---
 
-## Next: Closure trimming for VLambda
-1. Resolution pass computes free variables per lambda body
-2. ELambda stores a FreeVarSet alongside formals and body
-3. At eval time, VLambda extracts only needed vars into a flat Env (no parent chain)
-4. This breaks retention: trimmed Env has no parent pointer, holds only what's needed
-5. Expected impact: massive — eliminates retention of 30k-entry scopes by lambdas
+## Iteration 7: VLambda closure trimming (2026-02-28, commit e7c8cbd)
+
+Added `ClosureTrim` pass that analyses lambda bodies for free `EResolvedVar`
+references and annotates `ELambda` with `CaptureInfo`. At eval time,
+`buildCaptureEnv` extracts only referenced slots into a flat Env (no parent chain).
+
+### Implementation
+- `Nix.Expr.ClosureTrim.trimClosures` — post-resolution pass
+- `CaptureInfo` type: `NoCaptureInfo | Captures [(Int,Int)]`
+- `cheapThunk` fast-path for trimmed lambdas (no IORef allocation)
+- `collectFreeVars` computes `(Set (level, index), hasOuterEVar)` per expr
+
+### Results (-hT at 6G cap)
+| MB | Type | Delta |
+|----|------|-------|
+| 952 | Env | baseline |
+| 813 | SmallArray | baseline |
+| 682 | STACK | baseline |
+| 109 | VLambda | measured |
+
+Trimming fires on lambdas, but the dominant retainers are in
+`mkSyntheticThunk`/`eval`/`force` chains — not VLambda closures.
+
+---
+
+## Iteration 8: Let/rec parent chain trimming (2026-02-28, commit a25a9dc)
+
+Extended closure trimming to `ELet` and `EAttrs True` (recursive attr sets).
+These also create new Env scopes that retain the full parent chain.
+
+### Implementation
+- `trimOneLetBlock` — analyses let bindings + body for free vars
+- `trimOneRecAttrs` — analyses rec attr set bindings
+- Positional let/rec resolution in evaluator
+- `ELet` and `EAttrs` carry `CaptureInfo` field
+
+### Results (-hT at 6G cap)
+| MB | Type | Delta from iter7 |
+|----|------|-------------------|
+| 940 | Env | -12 (-1.3%) |
+
+**Barely moved the needle.** Root cause: nixpkgs uses `with lib;` pervasively
+(~2,658 `with` expressions in pkgs/top-level alone). Every let/rec block
+inside a `with` scope has `EVar` references that need name-based runtime
+lookup through with-scopes. The trimmer sees `hasOuterEVar = True` and
+bails out — trimming almost never fires on real nixpkgs code.
+
+---
+
+## Iteration 9: Static with-resolution (2026-03-01, commit 8e1f000)
+
+**Breakthrough:** Resolve `with`-scoped variables statically during the
+resolve pass. Introduced `EWithVar !Text` — a variable known to be resolved
+through `envWithScopes` at runtime, not the parent chain. The trimmer treats
+`EWithVar` differently from `EVar`: it doesn't block trimming, but signals
+that the trimmed env must preserve `envWithScopes`.
+
+### Implementation
+- `EWithVar !Text` — new AST constructor for with-scoped variables
+- `CapturesWithScopes ![(Int,Int)]` — capture info that preserves with-scopes
+- `WithBarrier` scope entry in resolver — doesn't increment de Bruijn level
+- `withScopesForCapture` — appends root scope (builtins) to `envWithScopes` at capture time
+- `evalWithVar` — checks with-scopes first, falls back to parent chain
+
+### Key design decisions
+1. `WithBarrier` does NOT increment de Bruijn level (with doesn't create envParent level)
+2. `resolveVar` continues past `WithBarrier` — lexical scopes below still checked
+3. Initially added `envRootScope` as an Env field — benchmarking showed +142 MB overhead
+   (~18M Envs × 8 bytes). Refactored to function + `withScopesForCapture` helper.
+4. Builtins appended to `envWithScopes` only at capture time (zero per-Env cost)
+
+### Results (-hT at 6G cap)
+| MB | Type | Delta from iter7 |
+|----|------|-------------------|
+| 590 | Env | **-362 (-38%)** |
+| 536 | SmallArray | -277 (-34%) |
+| 448 | STACK | -234 (-34%) |
+
+**~1.3 GB total reduction.** Trimming now fires on the vast majority of
+let/rec/lambda blocks in nixpkgs since `EWithVar` doesn't block trimming.
+
+### Files changed (7 files, +281 -108)
+- `Nix.Expr.Types` — `EWithVar`, `CapturesWithScopes`
+- `Nix.Expr.Resolve` — `WithBarrier`, `EWithVar` emission
+- `Nix.Expr.ClosureTrim` — triple return from `collectFreeVars`, `needsWithScopes` flag
+- `Nix.Eval` — `evalWithVar`, `buildCaptureEnv` for `CapturesWithScopes`
+- `Nix.Eval.Types` — `envRootScope` function, `withScopesForCapture`, `cheapThunk` update
+- `Nix.Eval.IO` — `EWithVar` in `resolveRelativePaths`
+- `test/Main.hs` — 9 new tests
+
+---
+
+## Next: Synthetic thunk trimming
+`mkSyntheticThunk` creates `Pending expr env` capturing the FULL Env.
+- `attrSetMapWithKeyLazy`: 30k synthetic thunks per overlay, each with full scope
+- `deferApply`: deferred function application with full scope
+Trim Env in `Pending expr env` the same way lambdas/lets are trimmed.
+Expected impact: ~683+ MB retained by mkSyntheticThunk chains.
