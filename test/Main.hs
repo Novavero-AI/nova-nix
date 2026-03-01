@@ -447,7 +447,58 @@ testEvalWith = do
     [ runTest "with basic" $
         assertEval "with" "with { a = 1; }; a" (VInt 1),
       runTest "with lexical wins" $
-        assertEval "lexical" "let a = 1; in with { a = 2; }; a" (VInt 1)
+        assertEval "lexical" "let a = 1; in with { a = 2; }; a" (VInt 1),
+      -- EWithVar: with-scoped variable inside lambda (closure trimming must preserve with-scopes)
+      runTest "with inside lambda" $
+        assertEval
+          "with-lambda"
+          "with { a = 1; }; let f = x: a + x; in f 2"
+          (VInt 3),
+      -- Nested with: inner with wins
+      runTest "nested with inner wins" $
+        assertEval
+          "nested-with"
+          "with { a = 1; }; with { a = 2; }; a"
+          (VInt 2),
+      -- Let shadows with
+      runTest "let shadows with" $
+        assertEval
+          "let-shadows-with"
+          "with { a = 1; }; let a = 2; in a"
+          (VInt 2),
+      -- Builtin fallback: builtins still accessible inside with
+      runTest "with builtin fallback" $
+        assertEval
+          "with-builtin"
+          "with { a = 1; }; true"
+          (VBool True),
+      -- Builtin attr fallback: builtins.length still works inside with
+      runTest "with builtin attr fallback" $
+        assertEval
+          "with-builtin-attr"
+          "with { a = 1; }; builtins.length [1 2 3]"
+          (VInt 3),
+      -- With in rec attrs
+      runTest "with in rec attrs" $
+        assertEval
+          "with-rec"
+          "with { a = 1; }; rec { b = a + 1; c = b + 1; }.c"
+          (VInt 3),
+      -- AST test: parse "with a; b" produces EWithVar
+      runTest "parse with produces EWithVar" $
+        assertRight "with-ast" (parseNix "<test>" "with a; b") $ \case
+          EWith (EVar "a") (EWithVar "b") -> Pass
+          other -> Fail ("expected EWith (EVar a) (EWithVar b), got: " <> T.pack (show other)),
+      -- AST test: formal wins over with
+      runTest "parse lambda formal wins over with" $
+        assertRight "formal-wins" (parseNix "<test>" "x: with a; x") $ \case
+          ELambda _ (EWith _ (EResolvedVar 0 0)) _ -> Pass
+          other -> Fail ("expected formal to win, got: " <> T.pack (show other)),
+      -- Trimming test: lambda inside with gets CapturesWithScopes
+      runTest "with lambda trimmed with CapturesWithScopes" $
+        assertRight "with-trim" (parseNix "<test>" "with a; x: b + x") $ \case
+          EWith _ (ELambda _ _ (CapturesWithScopes _)) -> Pass
+          other -> Fail ("expected CapturesWithScopes, got: " <> T.pack (show other))
     ]
 
 -- ---------------------------------------------------------------------------
@@ -918,7 +969,7 @@ testParserExprs = do
         assertParse
           "with"
           "with a; b"
-          (EWith (EVar "a") (EVar "b")),
+          (EWith (EVar "a") (EWithVar "b")),
       runTest "parse assert" $
         assertParse
           "assert"

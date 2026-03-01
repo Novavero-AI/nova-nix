@@ -100,6 +100,9 @@ data CaptureInfo
     NoCaptureInfo
   | -- | Sorted list of @(level, index)@ pairs to extract from the parent env.
     Captures ![(Int, Int)]
+  | -- | Like 'Captures', but the trimmed env must preserve 'envWithScopes'
+    -- (with builtins appended) so that 'EWithVar' references can still be resolved.
+    CapturesWithScopes ![(Int, Int)]
   deriving (Eq, Show)
 
 -- | Unary operators.
@@ -186,4 +189,9 @@ data Expr
     -- bound by lambda formals.  @level@ counts parent-chain hops;
     -- @index@ is the positional slot within that env's 'envSlots'.
     EResolvedVar !Int !Int
+  | -- | Variable resolved via with-scopes (not lexical).
+    -- Produced by 'Nix.Expr.Resolve.resolveVars' for names inside
+    -- a @with@ body that are not found in any lexical scope.
+    -- At runtime, looked up in 'envWithScopes' (with builtins fallback).
+    EWithVar !Text
   deriving (Eq, Show)

@@ -46,6 +46,7 @@ trimExpr innerNames expr = case expr of
   EStr parts -> EStr (map (trimPart innerNames) parts)
   EIndStr parts -> EIndStr (map (trimPart innerNames) parts)
   EVar {} -> expr
+  EWithVar {} -> expr
   EResolvedVar {} -> expr
   EAttrs True bindings captureInfo ->
     let names = collectBindingNames bindings
@@ -53,11 +54,16 @@ trimExpr innerNames expr = case expr of
         trimmedBindings = map (trimBinding innerNamesRec) bindings
      in case captureInfo of
           Captures {} -> EAttrs True trimmedBindings captureInfo
+          CapturesWithScopes {} -> EAttrs True trimmedBindings captureInfo
           NoCaptureInfo ->
             case trimOneRecAttrs trimmedBindings of
               Left unchanged -> EAttrs True unchanged NoCaptureInfo
-              Right (captureList, rewrittenBindings) ->
-                EAttrs True rewrittenBindings (Captures captureList)
+              Right (captureList, rewrittenBindings, needsWithScopes) ->
+                let ci =
+                      if needsWithScopes
+                        then CapturesWithScopes captureList
+                        else Captures captureList
+                 in EAttrs True rewrittenBindings ci
   EAttrs False bindings _captureInfo ->
     EAttrs False (map (trimBinding innerNames) bindings) NoCaptureInfo
   EList elems -> EList (map (trimExpr innerNames) elems)
@@ -77,11 +83,16 @@ trimExpr innerNames expr = case expr of
         trimmedBody = trimExpr formalNames body
      in case captures of
           Captures {} -> ELambda trimmedFormals trimmedBody captures
+          CapturesWithScopes {} -> ELambda trimmedFormals trimmedBody captures
           NoCaptureInfo ->
             case trimOneLambda trimmedFormals trimmedBody of
               Left unchanged -> unchanged
-              Right (captureList, rewrittenFormals, rewrittenBody) ->
-                ELambda rewrittenFormals rewrittenBody (Captures captureList)
+              Right (captureList, rewrittenFormals, rewrittenBody, needsWithScopes) ->
+                let captureInfo =
+                      if needsWithScopes
+                        then CapturesWithScopes captureList
+                        else Captures captureList
+                 in ELambda rewrittenFormals rewrittenBody captureInfo
   ELet bindings body captureInfo ->
     let names = collectBindingNames bindings
         innerNamesLet = Set.union innerNames names
@@ -89,12 +100,17 @@ trimExpr innerNames expr = case expr of
         trimmedBody = trimExpr innerNamesLet body
      in case captureInfo of
           Captures {} -> ELet trimmedBindings trimmedBody captureInfo
+          CapturesWithScopes {} -> ELet trimmedBindings trimmedBody captureInfo
           NoCaptureInfo ->
             case trimOneLetBlock trimmedBindings trimmedBody of
               Left (unchangedBindings, unchangedBody) ->
                 ELet unchangedBindings unchangedBody NoCaptureInfo
-              Right (captureList, rewrittenBindings, rewrittenBody) ->
-                ELet rewrittenBindings rewrittenBody (Captures captureList)
+              Right (captureList, rewrittenBindings, rewrittenBody, needsWithScopes) ->
+                let ci =
+                      if needsWithScopes
+                        then CapturesWithScopes captureList
+                        else Captures captureList
+                 in ELet rewrittenBindings rewrittenBody ci
   EIf c t f ->
     EIf (trimExpr innerNames c) (trimExpr innerNames t) (trimExpr innerNames f)
   EWith scope body ->
@@ -143,160 +159,172 @@ trimFormal (Formal name defExpr) =
 -- lambda's env: a default like @{ x ? outerVar }: x@ references the
 -- closure env, which for a trimmed lambda is the flat capture env.
 -- Missing captures for defaults would cause out-of-bounds slot lookups.
-trimOneLambda :: Formals -> Expr -> Either Expr ([(Int, Int)], Formals, Expr)
+trimOneLambda :: Formals -> Expr -> Either Expr ([(Int, Int)], Formals, Expr, Bool)
 trimOneLambda formals body =
-  let (bodyVars, bodyHasEVar) = collectFreeVars 0 body
-      (formalVars, formalHasEVar) = foldFormalsDefaults 0 formals
+  let (bodyVars, bodyHasEVar, bodyHasWithVar) = collectFreeVars 0 body
+      (formalVars, formalHasEVar, formalHasWithVar) = foldFormalsDefaults 0 formals
       freeVars = Set.union bodyVars formalVars
       hasOuterEVar = bodyHasEVar || formalHasEVar
-   in if hasOuterEVar || Set.null freeVars
+      needsWithScopes = bodyHasWithVar || formalHasWithVar
+   in if hasOuterEVar || (Set.null freeVars && not needsWithScopes)
         then Left (ELambda formals body NoCaptureInfo)
         else
           let captureList = sortBy (comparing fst <> comparing snd) (Set.toList freeVars)
               captureMap = Map.fromList (zip captureList [0 ..])
               rewrittenBody = rewriteBody 0 captureMap body
               rewrittenFormals = rewriteFormals 0 captureMap formals
-           in Right (captureList, rewrittenFormals, rewrittenBody)
+           in Right (captureList, rewrittenFormals, rewrittenBody, needsWithScopes)
 
 -- | Collect free variable references from a lambda body.
 --
--- Returns @(freeVars, hasOuterEVar)@ where:
+-- Returns @(freeVars, hasOuterEVar, hasOuterWithVar)@ where:
 -- * @freeVars@ is the set of @(level, index)@ pairs for 'EResolvedVar'
 --   references that point outside the lambda (level > current depth)
 -- * @hasOuterEVar@ is 'True' if there's any 'EVar' that could reference
 --   the outer scope (not shadowed by inner let/rec/lambda scopes)
+-- * @hasOuterWithVar@ is 'True' if there's any 'EWithVar' that needs
+--   with-scope access (doesn't block trimming, but env must preserve
+--   'envWithScopes' with builtins appended)
 --
 -- @depth@ tracks how many scope-creating constructs we've entered
 -- inside the lambda body (nested lambdas, let, rec attrs).
-collectFreeVars :: Int -> Expr -> (Set (Int, Int), Bool)
+collectFreeVars :: Int -> Expr -> (Set (Int, Int), Bool, Bool)
 collectFreeVars depth expr = case expr of
-  ELit {} -> (Set.empty, False)
+  ELit {} -> (Set.empty, False, False)
   EStr parts -> foldParts depth parts
   EIndStr parts -> foldParts depth parts
   EVar _ ->
     -- Any EVar in the body means we need the parent chain for name lookup.
     -- This makes the lambda untrimable.
-    (Set.empty, True)
+    (Set.empty, True, False)
+  EWithVar _ ->
+    -- Needs with-scopes, but doesn't block trimming.
+    (Set.empty, False, True)
   EResolvedVar level idx
-    | level > depth -> (Set.singleton (level - depth - 1, idx), False)
-    | otherwise -> (Set.empty, False)
+    | level > depth -> (Set.singleton (level - depth - 1, idx), False, False)
+    | otherwise -> (Set.empty, False, False)
   EAttrs True bindings captureInfo ->
     -- Recursive attrs create a scope (depth + 1)
-    let (vs1, h1) = foldBindings (depth + 1) bindings
-        vs2 = case captureInfo of
-          NoCaptureInfo -> Set.empty
+    let (vs1, h1, w1) = foldBindings (depth + 1) bindings
+        (vs2, innerWithVar) = case captureInfo of
+          NoCaptureInfo -> (Set.empty, False)
           Captures caps ->
-            Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth]
-     in (Set.union vs1 vs2, h1)
+            (Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth], False)
+          CapturesWithScopes caps ->
+            (Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth], True)
+     in (Set.union vs1 vs2, h1, w1 || innerWithVar)
   EAttrs False bindings _captureInfo ->
     -- Non-recursive attrs: no new scope
     foldBindings depth bindings
   EList elems -> foldExprs depth elems
   ESelect target path defExpr ->
-    let (vs1, h1) = collectFreeVars depth target
-        (vs2, h2) = foldKeys depth path
-        (vs3, h3) = case defExpr of
-          Nothing -> (Set.empty, False)
+    let (vs1, h1, w1) = collectFreeVars depth target
+        (vs2, h2, w2) = foldKeys depth path
+        (vs3, h3, w3) = case defExpr of
+          Nothing -> (Set.empty, False, False)
           Just e -> collectFreeVars depth e
-     in (Set.unions [vs1, vs2, vs3], h1 || h2 || h3)
+     in (Set.unions [vs1, vs2, vs3], h1 || h2 || h3, w1 || w2 || w3)
   EHasAttr target path ->
-    let (vs1, h1) = collectFreeVars depth target
-        (vs2, h2) = foldKeys depth path
-     in (Set.union vs1 vs2, h1 || h2)
+    let (vs1, h1, w1) = collectFreeVars depth target
+        (vs2, h2, w2) = foldKeys depth path
+     in (Set.union vs1 vs2, h1 || h2, w1 || w2)
   EApp f x ->
-    let (vs1, h1) = collectFreeVars depth f
-        (vs2, h2) = collectFreeVars depth x
-     in (Set.union vs1 vs2, h1 || h2)
+    let (vs1, h1, w1) = collectFreeVars depth f
+        (vs2, h2, w2) = collectFreeVars depth x
+     in (Set.union vs1 vs2, h1 || h2, w1 || w2)
   ELambda formals body_ captures ->
     -- Nested lambda creates a LexicalScope (depth + 1).
     -- If the inner lambda was already trimmed (has Captures), its capture
     -- coordinates are outer references that we must propagate upward —
     -- otherwise an outer lambda won't know it needs those variables.
-    let (vs1, h1) = foldFormalsDefaults (depth + 1) formals
-        (vs2, h2) = collectFreeVars (depth + 1) body_
-        vs3 = case captures of
-          NoCaptureInfo -> Set.empty
+    let (vs1, h1, w1) = foldFormalsDefaults (depth + 1) formals
+        (vs2, h2, w2) = collectFreeVars (depth + 1) body_
+        (vs3, innerWithVar) = case captures of
+          NoCaptureInfo -> (Set.empty, False)
           Captures caps ->
-            Set.fromList
-              [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth]
-     in (Set.unions [vs1, vs2, vs3], h1 || h2)
+            (Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth], False)
+          CapturesWithScopes caps ->
+            (Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth], True)
+     in (Set.unions [vs1, vs2, vs3], h1 || h2, w1 || w2 || innerWithVar)
   ELet bindings body_ captureInfo ->
     -- Let creates a scope (depth + 1)
-    let (vs1, h1) = foldBindings (depth + 1) bindings
-        (vs2, h2) = collectFreeVars (depth + 1) body_
-        vs3 = case captureInfo of
-          NoCaptureInfo -> Set.empty
+    let (vs1, h1, w1) = foldBindings (depth + 1) bindings
+        (vs2, h2, w2) = collectFreeVars (depth + 1) body_
+        (vs3, innerWithVar) = case captureInfo of
+          NoCaptureInfo -> (Set.empty, False)
           Captures caps ->
-            Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth]
-     in (Set.unions [vs1, vs2, vs3], h1 || h2)
+            (Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth], False)
+          CapturesWithScopes caps ->
+            (Set.fromList [(lvl - depth - 1, idx) | (lvl, idx) <- caps, lvl > depth], True)
+     in (Set.unions [vs1, vs2, vs3], h1 || h2, w1 || w2 || innerWithVar)
   EIf c t f ->
-    let (vs1, h1) = collectFreeVars depth c
-        (vs2, h2) = collectFreeVars depth t
-        (vs3, h3) = collectFreeVars depth f
-     in (Set.unions [vs1, vs2, vs3], h1 || h2 || h3)
+    let (vs1, h1, w1) = collectFreeVars depth c
+        (vs2, h2, w2) = collectFreeVars depth t
+        (vs3, h3, w3) = collectFreeVars depth f
+     in (Set.unions [vs1, vs2, vs3], h1 || h2 || h3, w1 || w2 || w3)
   EWith scope body_ ->
     -- With does NOT create a scope frame
-    let (vs1, h1) = collectFreeVars depth scope
-        (vs2, h2) = collectFreeVars depth body_
-     in (Set.union vs1 vs2, h1 || h2)
+    let (vs1, h1, w1) = collectFreeVars depth scope
+        (vs2, h2, w2) = collectFreeVars depth body_
+     in (Set.union vs1 vs2, h1 || h2, w1 || w2)
   EAssert cond body_ ->
-    let (vs1, h1) = collectFreeVars depth cond
-        (vs2, h2) = collectFreeVars depth body_
-     in (Set.union vs1 vs2, h1 || h2)
+    let (vs1, h1, w1) = collectFreeVars depth cond
+        (vs2, h2, w2) = collectFreeVars depth body_
+     in (Set.union vs1 vs2, h1 || h2, w1 || w2)
   EUnary _ operand -> collectFreeVars depth operand
   EBinary _ l r ->
-    let (vs1, h1) = collectFreeVars depth l
-        (vs2, h2) = collectFreeVars depth r
-     in (Set.union vs1 vs2, h1 || h2)
-  ESearchPath {} -> (Set.empty, False)
+    let (vs1, h1, w1) = collectFreeVars depth l
+        (vs2, h2, w2) = collectFreeVars depth r
+     in (Set.union vs1 vs2, h1 || h2, w1 || w2)
+  ESearchPath {} -> (Set.empty, False, False)
 
-foldExprs :: Int -> [Expr] -> (Set (Int, Int), Bool)
-foldExprs depth = foldl' combine (Set.empty, False)
+foldExprs :: Int -> [Expr] -> (Set (Int, Int), Bool, Bool)
+foldExprs depth = foldl' combine (Set.empty, False, False)
   where
-    combine (!acc, !h) e =
-      let (vs, hv) = collectFreeVars depth e
-       in (Set.union acc vs, h || hv)
+    combine (!acc, !h, !w) e =
+      let (vs, hv, wv) = collectFreeVars depth e
+       in (Set.union acc vs, h || hv, w || wv)
 
-foldParts :: Int -> [StringPart] -> (Set (Int, Int), Bool)
-foldParts depth = foldl' combine (Set.empty, False)
+foldParts :: Int -> [StringPart] -> (Set (Int, Int), Bool, Bool)
+foldParts depth = foldl' combine (Set.empty, False, False)
   where
-    combine (!acc, !h) (StrLit _) = (acc, h)
-    combine (!acc, !h) (StrInterp e) =
-      let (vs, hv) = collectFreeVars depth e
-       in (Set.union acc vs, h || hv)
+    combine (!acc, !h, !w) (StrLit _) = (acc, h, w)
+    combine (!acc, !h, !w) (StrInterp e) =
+      let (vs, hv, wv) = collectFreeVars depth e
+       in (Set.union acc vs, h || hv, w || wv)
 
-foldKeys :: Int -> [AttrKey] -> (Set (Int, Int), Bool)
-foldKeys depth = foldl' combine (Set.empty, False)
+foldKeys :: Int -> [AttrKey] -> (Set (Int, Int), Bool, Bool)
+foldKeys depth = foldl' combine (Set.empty, False, False)
   where
-    combine (!acc, !h) (StaticKey _) = (acc, h)
-    combine (!acc, !h) (DynamicKey e) =
-      let (vs, hv) = collectFreeVars depth e
-       in (Set.union acc vs, h || hv)
+    combine (!acc, !h, !w) (StaticKey _) = (acc, h, w)
+    combine (!acc, !h, !w) (DynamicKey e) =
+      let (vs, hv, wv) = collectFreeVars depth e
+       in (Set.union acc vs, h || hv, w || wv)
 
-foldBindings :: Int -> [Binding] -> (Set (Int, Int), Bool)
-foldBindings depth = foldl' combine (Set.empty, False)
+foldBindings :: Int -> [Binding] -> (Set (Int, Int), Bool, Bool)
+foldBindings depth = foldl' combine (Set.empty, False, False)
   where
-    combine (!acc, !h) (NamedBinding path bodyExpr) =
-      let (vs1, h1) = foldKeys depth path
-          (vs2, h2) = collectFreeVars depth bodyExpr
-       in (Set.unions [acc, vs1, vs2], h || h1 || h2)
-    combine (!acc, !h) (Inherit (Just fromExpr) _) =
-      let (vs, hv) = collectFreeVars depth fromExpr
-       in (Set.union acc vs, h || hv)
-    combine (!acc, !h) (Inherit Nothing _) = (acc, h)
+    combine (!acc, !h, !w) (NamedBinding path bodyExpr) =
+      let (vs1, h1, w1) = foldKeys depth path
+          (vs2, h2, w2) = collectFreeVars depth bodyExpr
+       in (Set.unions [acc, vs1, vs2], h || h1 || h2, w || w1 || w2)
+    combine (!acc, !h, !w) (Inherit (Just fromExpr) _) =
+      let (vs, hv, wv) = collectFreeVars depth fromExpr
+       in (Set.union acc vs, h || hv, w || wv)
+    combine (!acc, !h, !w) (Inherit Nothing _) = (acc, h, w)
 
-foldFormalsDefaults :: Int -> Formals -> (Set (Int, Int), Bool)
-foldFormalsDefaults _ (FormalName _) = (Set.empty, False)
+foldFormalsDefaults :: Int -> Formals -> (Set (Int, Int), Bool, Bool)
+foldFormalsDefaults _ (FormalName _) = (Set.empty, False, False)
 foldFormalsDefaults depth (FormalSet formals _) = foldFormals depth formals
 foldFormalsDefaults depth (FormalNamedSet _ formals _) = foldFormals depth formals
 
-foldFormals :: Int -> [Formal] -> (Set (Int, Int), Bool)
-foldFormals depth = foldl' combine (Set.empty, False)
+foldFormals :: Int -> [Formal] -> (Set (Int, Int), Bool, Bool)
+foldFormals depth = foldl' combine (Set.empty, False, False)
   where
-    combine (!acc, !h) (Formal _ Nothing) = (acc, h)
-    combine (!acc, !h) (Formal _ (Just defExpr)) =
-      let (vs, hv) = collectFreeVars depth defExpr
-       in (Set.union acc vs, h || hv)
+    combine (!acc, !h, !w) (Formal _ Nothing) = (acc, h, w)
+    combine (!acc, !h, !w) (Formal _ (Just defExpr)) =
+      let (vs, hv, wv) = collectFreeVars depth defExpr
+       in (Set.union acc vs, h || hv, w || wv)
 
 -- | Rewrite 'EResolvedVar' references in a lambda body to point at
 -- capture positions instead of parent-chain levels.
@@ -311,6 +339,7 @@ rewriteBody depth captureMap expr = case expr of
   EStr parts -> EStr (map (rewritePart depth captureMap) parts)
   EIndStr parts -> EIndStr (map (rewritePart depth captureMap) parts)
   EVar {} -> expr
+  EWithVar {} -> expr
   EResolvedVar level idx
     | level > depth ->
         let outerKey = (level - depth - 1, idx)
@@ -408,6 +437,16 @@ rewriteCaptures depth captureMap (Captures caps) =
                 -- Unreachable: collectFreeVars propagated all inner captures
                 Nothing -> (lvl, idx)
       | otherwise = (lvl, idx)
+rewriteCaptures depth captureMap (CapturesWithScopes caps) =
+  CapturesWithScopes (map rewriteOne caps)
+  where
+    rewriteOne (lvl, idx)
+      | lvl > depth =
+          let outerKey = (lvl - depth - 1, idx)
+           in case Map.lookup outerKey captureMap of
+                Just captureIdx -> (depth + 1, captureIdx)
+                Nothing -> (lvl, idx)
+      | otherwise = (lvl, idx)
 
 -- | Extract names introduced by lambda formals.
 formalsNames :: Formals -> Set Text
@@ -423,34 +462,35 @@ formalsNames (FormalNamedSet name formals _) =
 --
 -- Level 0 = self-references within the let scope (untouched).
 -- Level 1+ = parent chain references (trimmed).
-trimOneLetBlock :: [Binding] -> Expr -> Either ([Binding], Expr) ([(Int, Int)], [Binding], Expr)
+trimOneLetBlock :: [Binding] -> Expr -> Either ([Binding], Expr) ([(Int, Int)], [Binding], Expr, Bool)
 trimOneLetBlock bindings body =
-  let (bindingVars, bindingHasEVar) = foldBindings 0 bindings
-      (bodyVars, bodyHasEVar) = collectFreeVars 0 body
+  let (bindingVars, bindingHasEVar, bindingHasWithVar) = foldBindings 0 bindings
+      (bodyVars, bodyHasEVar, bodyHasWithVar) = collectFreeVars 0 body
       freeVars = Set.union bindingVars bodyVars
       hasOuterEVar = bindingHasEVar || bodyHasEVar
-   in if hasOuterEVar || Set.null freeVars
+      needsWithScopes = bindingHasWithVar || bodyHasWithVar
+   in if hasOuterEVar || (Set.null freeVars && not needsWithScopes)
         then Left (bindings, body)
         else
           let captureList = sortBy (comparing fst <> comparing snd) (Set.toList freeVars)
               captureMap = Map.fromList (zip captureList [0 ..])
               rewrittenBindings = map (rewriteBinding 0 captureMap) bindings
               rewrittenBody = rewriteBody 0 captureMap body
-           in Right (captureList, rewrittenBindings, rewrittenBody)
+           in Right (captureList, rewrittenBindings, rewrittenBody, needsWithScopes)
 
 -- | Analyze a recursive attr set's bindings for parent references,
 -- produce a capture list + rewritten bindings, or return the originals
 -- unchanged if untrimable.
-trimOneRecAttrs :: [Binding] -> Either [Binding] ([(Int, Int)], [Binding])
+trimOneRecAttrs :: [Binding] -> Either [Binding] ([(Int, Int)], [Binding], Bool)
 trimOneRecAttrs bindings =
-  let (bindingVars, bindingHasEVar) = foldBindings 0 bindings
-   in if bindingHasEVar || Set.null bindingVars
+  let (bindingVars, bindingHasEVar, bindingHasWithVar) = foldBindings 0 bindings
+   in if bindingHasEVar || (Set.null bindingVars && not bindingHasWithVar)
         then Left bindings
         else
           let captureList = sortBy (comparing fst <> comparing snd) (Set.toList bindingVars)
               captureMap = Map.fromList (zip captureList [0 ..])
               rewrittenBindings = map (rewriteBinding 0 captureMap) bindings
-           in Right (captureList, rewrittenBindings)
+           in Right (captureList, rewrittenBindings, bindingHasWithVar)
 
 -- | Collect top-level binding names (mirrors 'Nix.Expr.Resolve.collectBindingNames').
 collectBindingNames :: [Binding] -> Set Text

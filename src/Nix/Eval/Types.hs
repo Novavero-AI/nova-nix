@@ -43,6 +43,8 @@ module Nix.Eval.Types
     envLookupResolved,
     envFromSlots,
     pushWithScope,
+    lookupWithScopes,
+    withScopesForCapture,
 
     -- * Thunk operations
     mkThunk,
@@ -406,6 +408,9 @@ data Env = Env
     envParent :: !(Maybe Env),
     -- | With-scopes, innermost first.  Inherited from parent on
     -- env extension; only 'pushWithScope' adds new entries.
+    -- For trimmed envs ('CapturesWithScopes'), the root scope
+    -- (builtins) is appended as the outermost entry so that
+    -- 'EWithVar' can fall back to builtins without a parent chain.
     envWithScopes :: ![AttrSet]
   }
 
@@ -491,6 +496,24 @@ pushWithScope :: AttrSet -> Env -> Env
 pushWithScope scope env =
   env {envWithScopes = scope : envWithScopes env}
 
+-- | Find the root env's lazy scope (builtins) by walking the parent chain.
+-- Returns the 'envLazyScope' of the bottommost env (the one with
+-- @envParent = Nothing@).  This is the builtin env for standard evals.
+envRootScope :: Env -> Maybe AttrSet
+envRootScope env = case envParent env of
+  Nothing -> envLazyScope env
+  Just parent -> envRootScope parent
+
+-- | Build the with-scopes list for a trimmed env that needs with-scope
+-- access ('CapturesWithScopes').  Appends the root scope (builtins)
+-- as the outermost entry so 'EWithVar' can fall back to builtins
+-- without retaining the parent chain.
+withScopesForCapture :: Env -> [AttrSet]
+withScopesForCapture env =
+  case envRootScope env of
+    Just rootScope -> envWithScopes env ++ [rootScope]
+    Nothing -> envWithScopes env
+
 -- | Create an unevaluated thunk with a fresh memoization cell.
 --
 -- Each thunk gets its own 'IORef ThunkCell'.  On first force the
@@ -533,6 +556,15 @@ cheapThunk env (ELambda formals body (Captures captureList)) =
             envLazyScope = Nothing,
             envParent = Nothing,
             envWithScopes = []
+          }
+   in Evaluated (VLambda trimmedEnv formals body)
+cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
+  let trimmedEnv =
+        Env
+          { envSlots = smallArrayFromListN (length captureList) [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
+            envLazyScope = Nothing,
+            envParent = Nothing,
+            envWithScopes = withScopesForCapture env
           }
    in Evaluated (VLambda trimmedEnv formals body)
 cheapThunk env expr = mkThunk env expr

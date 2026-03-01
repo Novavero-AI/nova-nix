@@ -26,6 +26,11 @@ data ScopeEntry
     LexicalScope !(Map Text Int)
   | -- | Let/rec binding names: blocks resolution (handled by name at runtime).
     NameBarrier !(Set Text)
+  | -- | Marks a with-scope boundary on the stack.
+    -- Does NOT increment the de Bruijn level (with doesn't create a
+    -- parent env level at runtime).  Variables not found in any lexical
+    -- scope below a WithBarrier are upgraded to 'EWithVar'.
+    WithBarrier
 
 -- | Resolve variables in an expression.  Replaces 'EVar' with
 -- 'EResolvedVar' where the variable is lexically bound by a lambda
@@ -78,9 +83,11 @@ resolve stack expr = case expr of
             newStack = NameBarrier names : stack
          in ELet (concatMap (resolveBinding newStack) bindings) (resolve newStack body) NoCaptureInfo
   EIf c t f -> EIf (resolve stack c) (resolve stack t) (resolve stack f)
+  EWithVar _ -> expr
   EWith scope body ->
-    -- with-scope names are unknown statically; no scope change.
-    EWith (resolve stack scope) (resolve stack body)
+    -- Push WithBarrier for the body so that unresolved names
+    -- inside a with-scope are upgraded to EWithVar.
+    EWith (resolve stack scope) (resolve (WithBarrier : stack) body)
   EAssert cond body ->
     EAssert (resolve stack cond) (resolve stack body)
   EUnary op operand -> EUnary op (resolve stack operand)
@@ -104,6 +111,14 @@ resolveVar (NameBarrier names : rest) level name =
   if Set.member name names
     then EVar name
     else resolveVar rest (level + 1) name
+resolveVar (WithBarrier : rest) level name =
+  -- WithBarrier does NOT increment level (with doesn't create an env level).
+  -- Continue searching lexical scopes below.  If the name is found in a
+  -- lower LexicalScope, use that.  If it reaches the bottom as EVar
+  -- (not found lexically), upgrade to EWithVar.
+  case resolveVar rest level name of
+    EVar _ -> EWithVar name
+    resolved -> resolved
 
 -- | Build a 'LexicalScope' from lambda formals.
 --

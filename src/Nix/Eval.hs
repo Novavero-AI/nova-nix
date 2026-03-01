@@ -117,12 +117,14 @@ import Nix.Eval.Types
     envLookup,
     envLookupResolved,
     evaluated,
+    lookupWithScopes,
     mkStr,
     mkSyntheticThunk,
     mkThunk,
     newLazyAttrCache,
     pushWithScope,
     typeName,
+    withScopesForCapture,
   )
 import Nix.Expr.Types
   ( AttrKey (..),
@@ -152,6 +154,7 @@ eval env expr = case expr of
   EStr parts -> uncurry VStr <$> evalStringParts eval force applyValue env parts
   EIndStr parts -> uncurry VStr <$> evalIndStringParts eval force applyValue env parts
   EVar name -> evalVar env name
+  EWithVar name -> evalWithVar env name
   EResolvedVar level idx -> force (envLookupResolved level idx env)
   EAttrs isRec bindings captureInfo -> evalAttrs env isRec bindings captureInfo
   EList exprs -> pure (VList (map (cheapThunk env) exprs))
@@ -228,6 +231,17 @@ evalVar env name =
     Just thunk -> force thunk
     Nothing -> throwEvalError ("undefined variable '" <> name <> "'")
 
+-- | Evaluate a with-scoped variable: check with-scopes first (innermost
+-- to outermost), then fall back to the standard name-based lookup
+-- (parent chain to builtins).  For trimmed envs ('CapturesWithScopes'),
+-- the root scope is already appended to 'envWithScopes' so the
+-- with-scope lookup finds builtins without needing a parent chain.
+evalWithVar :: (MonadEval m) => Env -> Text -> m NixValue
+evalWithVar env name =
+  case lookupWithScopes name (envWithScopes env) of
+    Just thunk -> force thunk
+    Nothing -> evalVar env name
+
 -- ---------------------------------------------------------------------------
 -- Attribute sets
 -- ---------------------------------------------------------------------------
@@ -277,6 +291,7 @@ evalRecAttrs env bindings captureInfo
                 envWithScopes = case captureInfo of
                   NoCaptureInfo -> envWithScopes env
                   Captures _ -> []
+                  CapturesWithScopes _ -> withScopesForCapture env
               }
           slots = smallArrayFromListN slotCount (buildSlotThunks recEnv env bindings)
           attrMap = buildAttrMapFromSlots bindings slots
@@ -586,6 +601,16 @@ buildCaptureEnv env (Captures captureList) =
       envParent = Nothing,
       envWithScopes = []
     }
+buildCaptureEnv env (CapturesWithScopes captureList) =
+  Env
+    { envSlots =
+        smallArrayFromListN
+          (length captureList)
+          [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
+      envLazyScope = Nothing,
+      envParent = Nothing,
+      envWithScopes = withScopesForCapture env
+    }
 
 -- ---------------------------------------------------------------------------
 -- Let / if / with / assert
@@ -673,6 +698,7 @@ evalLet env bindings body captureInfo
                 envWithScopes = case captureInfo of
                   NoCaptureInfo -> envWithScopes env
                   Captures _ -> []
+                  CapturesWithScopes _ -> withScopesForCapture env
               }
        in eval letEnv body
   | otherwise = do

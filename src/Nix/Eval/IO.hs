@@ -367,6 +367,7 @@ resolveRelativePaths dir = goExpr
       EStr parts -> EStr (map goPart parts)
       EIndStr parts -> EIndStr (map goPart parts)
       EVar _ -> expr
+      EWithVar _ -> expr
       EResolvedVar _ _ -> expr
       EAttrs isRec bindings captureInfo -> EAttrs isRec (map goBinding bindings) captureInfo
       EList elems -> EList (map goExpr elems)
