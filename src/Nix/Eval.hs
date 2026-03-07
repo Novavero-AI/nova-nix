@@ -2966,8 +2966,16 @@ builtinDerivation (VAttrs attrs) = do
         | (outName, outP) <- outPaths
         ]
 
-  -- Build the complete Derivation with populated outputs and inputs
-  let completeDrv = drv {drvOutputs = drvOutputsList}
+  -- Build the complete Derivation with populated outputs and env.
+  -- The hash was computed from the pre-output drv (drvOutputs = []),
+  -- so adding output paths and drvPath to drvEnv here does not affect
+  -- the content address.  Real Nix .drv files include these in their
+  -- env section — builders read $out etc. from the environment.
+  let completeEnv =
+        Map.union
+          (Map.fromList (("drvPath", drvPathText) : outPaths))
+          envMap
+      completeDrv = drv {drvOutputs = drvOutputsList, drvEnv = completeEnv}
 
   -- Context for output paths: each output carries SCDrvOutput context
   -- Context for drvPath: carries SCAllOutputs context

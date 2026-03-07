@@ -164,9 +164,9 @@ buildFile extraPaths dataDir filePath = do
           TIO.hPutStrLn stderr ("eval error: " <> err)
           exitFailure
         Right val -> do
-          drv <- extractDerivation val
+          (drv, drvSP) <- extractDerivation val
           store <- openStore defaultStoreDir
-          buildResult <- buildAndRegister store drv
+          buildResult <- buildAndRegister store drv drvSP
           closeStore store
           case buildResult of
             BuildSuccess sp ->
@@ -175,10 +175,11 @@ buildFile extraPaths dataDir filePath = do
               TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
               exitFailure
 
--- | Extract a Derivation from an evaluated value.
--- The value should be a VAttrs with type = "derivation" and a _derivation key.
--- Falls back to reading the .drv file via fromATerm if _derivation is not present.
-extractDerivation :: NixValue -> IO Derivation
+-- | Extract a Derivation and its store path from an evaluated value.
+-- The value must be a VAttrs with type = "derivation", a _derivation key
+-- holding the Derivation struct, and a drvPath key holding the .drv store path.
+-- Both are computed by builtinDerivation during evaluation.
+extractDerivation :: NixValue -> IO (Derivation, StorePath)
 extractDerivation (VAttrs attrs) = do
   -- Check type = "derivation"
   case attrSetLookup "type" attrs of
@@ -186,51 +187,42 @@ extractDerivation (VAttrs attrs) = do
     _ -> do
       hPutStrLn stderr "error: result is not a derivation (no type = \"derivation\")"
       exitFailure
-  -- Try to extract from _derivation key first
-  case attrSetLookup "_derivation" attrs of
-    Just (Evaluated (VDerivation drv)) -> pure drv
+  -- Extract the Derivation struct from _derivation
+  drv <- case attrSetLookup "_derivation" attrs of
+    Just (Evaluated (VDerivation d)) -> pure d
     _ -> do
       hPutStrLn stderr "error: derivation result missing _derivation field"
       exitFailure
-extractDerivation (VDerivation drv) = pure drv
+  -- Extract drvPath — this is the store path of the .drv file itself,
+  -- computed by hashing the ATerm serialization during evaluation.
+  drvSP <- case attrSetLookup "drvPath" attrs of
+    Just (Evaluated (VStr path _)) -> case parseStorePath defaultStoreDir path of
+      Just sp -> pure sp
+      Nothing -> do
+        TIO.hPutStrLn stderr ("error: invalid drvPath: " <> path)
+        exitFailure
+    _ -> do
+      hPutStrLn stderr "error: derivation result missing drvPath"
+      exitFailure
+  pure (drv, drvSP)
 extractDerivation _ = do
   hPutStrLn stderr "error: result is not a derivation"
   exitFailure
 
 -- | Write the .drv file to the store and build with dependency resolution.
-buildAndRegister :: Store -> Derivation -> IO BuildResult
-buildAndRegister store drv = do
-  -- Write the .drv file to store
-  let drvSP = extractDrvStorePath drv
-  writeDrvToStore store drv
+-- The drvPath is the store path of the .drv file itself, extracted from
+-- the evaluation result alongside the Derivation struct.
+buildAndRegister :: Store -> Derivation -> StorePath -> IO BuildResult
+buildAndRegister store drv drvSP = do
+  -- Write the .drv file to store at its content-addressed path
+  writeDrv store drv drvSP
   -- Build with dependency resolution
   tmpDir <- getTemporaryDirectory
   let config =
         (defaultBuildConfig defaultStoreDir)
           { bcTmpDir = tmpDir
           }
-  case drvSP of
-    Just sp -> buildWithDeps config store drv sp
-    Nothing -> do
-      -- No drvPath available — fall back to direct build without dep resolution
-      hPutStrLn stderr "warning: no drvPath, building without dependency resolution"
-      -- Import buildDerivation for fallback
-      pure (BuildFailure "no drvPath available for dependency resolution" 1)
-
--- | Extract the .drv store path from a derivation's env.
-extractDrvStorePath :: Derivation -> Maybe StorePath
-extractDrvStorePath drv =
-  Map.lookup "drvPath" (drvEnv drv) >>= parseStorePath defaultStoreDir
-
--- | Write a .drv file to the store at its derived path.
-writeDrvToStore :: Store -> Derivation -> IO ()
-writeDrvToStore store drv =
-  case drvOutputs drv of
-    [] -> pure () -- no outputs, nothing to write
-    _ -> do
-      -- Write .drv to store if a drvPath is available in the env.
-      let envDrvPath = Map.lookup "drvPath" (drvEnv drv)
-      mapM_ (writeDrv store drv) (envDrvPath >>= parseStorePath defaultStoreDir)
+  buildWithDeps config store drv drvSP
 
 -- ---------------------------------------------------------------------------
 -- Output formatting

@@ -44,6 +44,7 @@ where
 
 import Control.Exception (SomeException, try)
 import Control.Monad (when)
+import Data.Char (toLower)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -58,7 +59,7 @@ import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, removeDirectoryRecursive)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (takeDirectory, takeFileName, (</>))
 import qualified System.IO
 import qualified System.IO.Unsafe
 import qualified System.Info
@@ -307,7 +308,7 @@ runBuilder builderPath builderArgs buildEnv workDir = do
       mergedEnv = Map.union buildEnv systemMap
       envList = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList mergedEnv]
       cp =
-        (Proc.proc builderPath builderArgs)
+        (mkBuilderProcess builderPath builderArgs)
           { Proc.cwd = Just workDir,
             Proc.env = Just envList,
             Proc.std_out = Proc.CreatePipe,
@@ -317,6 +318,46 @@ runBuilder builderPath builderArgs buildEnv workDir = do
   case exitCode of
     ExitSuccess -> pure (Right ())
     ExitFailure code -> pure (Left (code, T.pack stderrText))
+
+-- | Create the appropriate process spec for the builder.
+--
+-- On Windows, cmd.exe uses its own command line parser — @\/c@ takes a
+-- raw command string, not individually-quoted arguments.  GHC's 'Proc.proc'
+-- wraps each arg in double quotes for the @CommandLineToArgvW@ convention,
+-- but cmd.exe doesn't use that convention, so a derivation like:
+--
+-- @
+-- derivation { builder = "cmd.exe"; args = [ "\/c" "echo Hello" ]; ... }
+-- @
+--
+-- would fail because GHC quotes @echo Hello@ → @\"echo Hello\"@, and
+-- cmd.exe tries to find an executable literally named @\"echo Hello\"@.
+--
+-- Fix: when the builder is cmd.exe with @\/c@, use 'Proc.shell' which
+-- passes the command string directly to @cmd.exe \/c@ without quoting.
+-- For all other builders, use 'Proc.proc' (standard @CommandLineToArgvW@).
+mkBuilderProcess :: FilePath -> [String] -> Proc.CreateProcess
+mkBuilderProcess builder args
+  | isWindows,
+    isCmdExe builder,
+    Just cmdString <- extractCmdString args =
+      Proc.shell cmdString
+  | otherwise = Proc.proc builder args
+
+-- | Check if the builder is cmd.exe (case-insensitive, handles full paths).
+isCmdExe :: FilePath -> Bool
+isCmdExe path = map toLower (takeFileName path) == "cmd.exe"
+
+-- | Extract the raw command string from cmd.exe args.
+-- Looks for @\/c@ (case-insensitive) and joins everything after it.
+extractCmdString :: [String] -> Maybe String
+extractCmdString (flag : cmdArgs)
+  | map toLower flag == "/c" = Just (unwords cmdArgs)
+extractCmdString _ = Nothing
+
+-- | Whether we are running on Windows (compile-time constant via 'System.Info').
+isWindows :: Bool
+isWindows = System.Info.os == "mingw32"
 
 -- ---------------------------------------------------------------------------
 -- Output registration

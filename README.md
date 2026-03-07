@@ -179,6 +179,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 | `Nix.Expr` | Re-exports from `Nix.Expr.Types` |
 | `Nix.Expr.Types` | Complete Nix AST — 18 expression constructors (including `ESearchPath`, `EResolvedVar`), atoms, formals, operators, string parts |
 | `Nix.Expr.Resolve` | De Bruijn-style variable resolution pass — replaces `EVar` with `EResolvedVar` for lambda-bound variables at parse time |
+| `Nix.Expr.ClosureTrim` | Closure trimming — statically determines free variables per lambda/with to minimize captured environment size |
 | `Nix.Parser` | Hand-rolled recursive descent parser + lexer. Direct `Text` consumption, source position tracking |
 | `Nix.Parser.Lexer` | Tokenizer — integers, floats, strings with interpolation, paths, URIs, search paths, all operators/keywords |
 | `Nix.Parser.Expr` | Expression parser — 13 precedence levels, left/right/non-associative operators, application, selection, dynamic keys |
@@ -258,8 +259,8 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 **Key numbers:**
 
-- **23 modules** — all implemented
-- **511 tests** — hand-rolled harness, no framework dependencies
+- **24 modules** — all implemented
+- **524 tests** — hand-rolled harness, no framework dependencies
 - **Zero partial functions** — total by construction, `T.uncons` over `T.head`/`T.tail`
 - **Strict by default** — bang patterns on all data fields (except Thunk's Env, which is lazy for knot-tying)
 
@@ -305,7 +306,7 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 
 ```bash
 cabal build                              # Build library + CLI
-cabal test                               # Run all 511 tests
+cabal test                               # Run all 524 tests
 cabal build --ghc-options="-Werror"      # Warnings as errors (CI default)
 cabal haddock                            # Generate API docs
 ```

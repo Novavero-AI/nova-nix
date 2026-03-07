@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.7.0 — 2026-03-07
+
+### Build Fix: drvPath Resolution + cmd.exe Quoting
+
+- **Fix: `nova-nix build` drvPath resolution** — `builtinDerivation` now writes `drvPath` and output paths (`out`, `dev`, etc.) into `drvEnv` on the `Derivation` struct. Previously these were only present in the eval result attr set, so `buildAndRegister` could not find the `.drv` store path for dependency resolution (error: "no drvPath available for dependency resolution").
+- **Fix: `extractDerivation` returns `StorePath`** — The CLI `build` command now extracts the `drvPath` `StorePath` directly from the eval result alongside the `Derivation`, passing it explicitly to `buildWithDeps`. Eliminates the fragile `Map.lookup "drvPath" drvEnv` fallback.
+- **Fix: cmd.exe builder quoting on Windows** — New `mkBuilderProcess` detects when the builder is `cmd.exe` with `/c` and uses `Proc.shell` instead of `Proc.proc`. GHC's `proc` wraps each argument in double-quotes for `CommandLineToArgvW`, but cmd.exe doesn't use that convention — `args = [ "/c" "echo Hello" ]` would fail because cmd.exe tried to find an executable literally named `"echo Hello"`.
+- 108 builtins, 524 tests, -Werror clean, ormolu clean, hlint clean
+
 ## 0.1.6.0 — 2026-02-26
 
 ### De Bruijn-Style Positional Env + SmallArray Slots
