@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.7.1 — 2026-03-07
+
+### Hackage Build Fix
+
+- **Fix: `nova-cache < 0.3.1` bound** — Hackage ignores `cabal.project` constraints, so the solver picked `nova-cache-0.3.1.0` (which uses `ram`) alongside `http-client-tls` (which uses `memory`), causing `ByteArrayAccess` instance mismatches. Narrowed bound to `< 0.3.1` to force `nova-cache-0.3.0.0` (which uses `memory`) until `http-client-tls` migrates to `ram`.
+
 ## 0.1.7.0 — 2026-03-07
 
 ### Build Fix: drvPath Resolution + cmd.exe Quoting
