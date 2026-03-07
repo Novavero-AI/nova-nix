@@ -25,7 +25,7 @@ import Nix.Builtins (builtinEnv, parseNixPath)
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, force)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
-import Nix.Parser (parseNix)
+import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (Store, closeStore, openStore, writeDrv)
 import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, storePathToFilePath)
 import Paths_nova_nix (getDataDir)
@@ -110,7 +110,7 @@ main = do
 -- | Evaluate a .nix file and print the result.
 evalFile :: Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
 evalFile strict extraPaths dataDir filePath = do
-  source <- TIO.readFile filePath
+  source <- readFileAutoEncoding filePath
   case parseNix (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
@@ -150,7 +150,7 @@ evalExpr strict extraPaths dataDir source = do
 -- | Parse, evaluate, extract derivation, build, and print result.
 buildFile :: [T.Text] -> FilePath -> FilePath -> IO ()
 buildFile extraPaths dataDir filePath = do
-  source <- TIO.readFile filePath
+  source <- readFileAutoEncoding filePath
   case parseNix (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)

@@ -42,14 +42,18 @@ module Nix.Parser
     parseNix,
     parseNixFile,
 
+    -- * Encoding
+    readFileAutoEncoding,
+
     -- * Errors
     ParseError (..),
   )
 where
 
+import qualified Data.ByteString as BS
 import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.IO as TIO
+import qualified Data.Text.Encoding as TE
 import Nix.Expr.ClosureTrim (trimClosures)
 import Nix.Expr.Resolve (resolveVars)
 import Nix.Expr.Types (Expr)
@@ -77,12 +81,44 @@ stripBOM t = case T.uncons t of
   _ -> t
 
 -- | Parse a @.nix@ file from disk.
+-- Uses 'readFileAutoEncoding' to handle UTF-8, UTF-16 LE, and UTF-16 BE.
 parseNixFile :: FilePath -> IO (Either ParseError Expr)
 parseNixFile path = do
-  source <- TIO.readFile path
-  let fileName = packFilePath path
-  pure $ parseNix fileName source
+  source <- readFileAutoEncoding path
+  pure $ parseNix (T.pack path) source
 
--- | Convert a FilePath to Text for error reporting.
-packFilePath :: FilePath -> Text
-packFilePath = T.pack
+-- ---------------------------------------------------------------------------
+-- Encoding detection
+-- ---------------------------------------------------------------------------
+
+-- | Read a file, detecting encoding from its byte order mark.
+--
+-- Windows tools (PowerShell's @>@ operator, Notepad) commonly write
+-- UTF-16 LE.  Nix files are normally UTF-8, but on a Windows-first
+-- implementation we handle all three BOM variants:
+--
+-- * @FF FE@       → UTF-16 LE (PowerShell default)
+-- * @FE FF@       → UTF-16 BE
+-- * @EF BB BF@    → UTF-8 (BOM stripped)
+-- * No BOM        → UTF-8
+readFileAutoEncoding :: FilePath -> IO Text
+readFileAutoEncoding path = decodeAutoEncoding <$> BS.readFile path
+
+-- | Decode bytes to 'Text' based on byte order mark.
+decodeAutoEncoding :: BS.ByteString -> Text
+decodeAutoEncoding bytes
+  | BS.length bytes >= 2,
+    BS.index bytes 0 == 0xFF,
+    BS.index bytes 1 == 0xFE =
+      TE.decodeUtf16LE (BS.drop 2 bytes)
+  | BS.length bytes >= 2,
+    BS.index bytes 0 == 0xFE,
+    BS.index bytes 1 == 0xFF =
+      TE.decodeUtf16BE (BS.drop 2 bytes)
+  | BS.length bytes >= 3,
+    BS.index bytes 0 == 0xEF,
+    BS.index bytes 1 == 0xBB,
+    BS.index bytes 2 == 0xBF =
+      TE.decodeUtf8 (BS.drop 3 bytes)
+  | otherwise =
+      TE.decodeUtf8 bytes

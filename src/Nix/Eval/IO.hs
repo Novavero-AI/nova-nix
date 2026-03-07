@@ -44,7 +44,7 @@ import Nix.Eval (eval)
 import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..), ThunkCell (..), attrSetSize)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
-import Nix.Parser (parseNix)
+import Nix.Parser (parseNix, readFileAutoEncoding)
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
@@ -124,7 +124,7 @@ instance MonadEval EvalIO where
     result <- liftIO (try (runReaderT action st))
     pure (case result of Left (NixEvalError msg) -> Left msg; Right val -> Right val)
 
-  readFileText path = wrapIO (TIO.readFile (T.unpack path))
+  readFileText path = wrapIO (readFileAutoEncoding (T.unpack path))
 
   doesPathExist path = wrapIO (Dir.doesPathExist (T.unpack path))
 
@@ -150,7 +150,7 @@ instance MonadEval EvalIO where
     case Map.lookup target cache of
       Just cached -> pure cached
       Nothing -> do
-        source <- wrapIO (TIO.readFile target)
+        source <- wrapIO (readFileAutoEncoding target)
         case parseNix (T.pack target) source of
           Left err ->
             throwEvalError
@@ -212,7 +212,7 @@ instance MonadEval EvalIO where
     let raw = T.unpack rawPath
         resolved = if isRelative raw then baseDir </> raw else raw
     canonical <- wrapIO (Dir.canonicalizePath resolved)
-    source <- wrapIO (TIO.readFile canonical)
+    source <- wrapIO (readFileAutoEncoding canonical)
     case parseNix (T.pack canonical) source of
       Left err ->
         throwEvalError
