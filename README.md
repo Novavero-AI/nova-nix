@@ -7,8 +7,8 @@
 
 [![CI](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/nova-nix.svg)](https://hackage.haskell.org/package/nova-nix)
-![Haskell](https://img.shields.io/badge/haskell-GHC%209.6-purple)
-![License](https://img.shields.io/badge/license-MIT-blue)
+![Haskell](https://img.shields.io/badge/haskell-GHC%209.8-purple)
+![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)
 
 </p>
 </div>
@@ -311,10 +311,10 @@ cabal build --ghc-options="-Werror"      # Warnings as errors (CI default)
 cabal haddock                            # Generate API docs
 ```
 
-Requires GHC 9.6 and cabal-install 3.10+.
+Requires GHC 9.8 and cabal-install 3.10+.
 
 ---
 
 <p align="center">
-  <sub>MIT License · <a href="https://github.com/Novavero-AI">Novavero AI</a></sub>
+  <sub>BSD-3-Clause · <a href="https://github.com/Novavero-AI">Novavero AI</a></sub>
 </p>

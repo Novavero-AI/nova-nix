@@ -7,6 +7,9 @@
 - **Fix: `nova-nix build` drvPath resolution** — `builtinDerivation` now writes `drvPath` and output paths (`out`, `dev`, etc.) into `drvEnv` on the `Derivation` struct. Previously these were only present in the eval result attr set, so `buildAndRegister` could not find the `.drv` store path for dependency resolution (error: "no drvPath available for dependency resolution").
 - **Fix: `extractDerivation` returns `StorePath`** — The CLI `build` command now extracts the `drvPath` `StorePath` directly from the eval result alongside the `Derivation`, passing it explicitly to `buildWithDeps`. Eliminates the fragile `Map.lookup "drvPath" drvEnv` fallback.
 - **Fix: cmd.exe builder quoting on Windows** — New `mkBuilderProcess` detects when the builder is `cmd.exe` with `/c` and uses `Proc.shell` instead of `Proc.proc`. GHC's `proc` wraps each argument in double-quotes for `CommandLineToArgvW`, but cmd.exe doesn't use that convention — `args = [ "/c" "echo Hello" ]` would fail because cmd.exe tried to find an executable literally named `"echo Hello"`.
+- **Fix: UTF-16 auto-detection** — New `readFileAutoEncoding` detects UTF-16 LE/BE and UTF-8 BOM at the byte level before decoding. PowerShell's `>` operator writes UTF-16 LE by default — a Windows-first Nix implementation must handle this at the input boundary. Wired into all 5 file-read sites (Parser, Eval/IO, Main).
+- **nova-cache `>= 0.3.0`** — Bumped lower bound to track nova-cache 0.3.x series.
+- **`crypton < 1.1` pin** — `http-client-tls` still uses `memory`'s `ByteArrayAccess`; `crypton >= 1.1` switched to `ram`, causing instance mismatches. Pinned in `cabal.project` until `http-client-tls` migrates.
 - 108 builtins, 524 tests, -Werror clean, ormolu clean, hlint clean
 
 ## 0.1.6.0 — 2026-02-26
