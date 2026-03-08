@@ -33,6 +33,7 @@ module Nix.Store.Path
     StoreDir (..),
     defaultStoreDir,
     defaultStoreDirText,
+    platformStoreDir,
     platformStoreDirText,
     windowsStoreDir,
 
@@ -64,15 +65,20 @@ defaultStoreDir = StoreDir "/nix/store"
 defaultStoreDirText :: Text
 defaultStoreDirText = T.pack (unStoreDir defaultStoreDir)
 
+-- | Platform-appropriate store directory.
+-- Returns @C:\\nix\\store@ on Windows, @\/nix\/store@ on Unix.
+-- Use this for filesystem operations and user-facing output.
+-- Use 'defaultStoreDir' only for Nix-internal canonical paths (ATerm hashing).
+platformStoreDir :: StoreDir
+platformStoreDir = case System.Info.os of
+  "mingw32" -> windowsStoreDir
+  _ -> defaultStoreDir
+
 -- | Platform-appropriate store directory as 'Text'.
 -- Returns @C:\\nix\\store@ on Windows, @\/nix\/store@ on Unix.
 -- Used for user-facing values like @builtins.storeDir@.
 platformStoreDirText :: Text
 platformStoreDirText = T.pack (unStoreDir platformStoreDir)
-  where
-    platformStoreDir = case System.Info.os of
-      "mingw32" -> windowsStoreDir
-      _ -> defaultStoreDir
 
 -- | Default store directory on Windows: @C:\\nix\\store@.
 windowsStoreDir :: StoreDir

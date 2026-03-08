@@ -27,7 +27,7 @@ import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLo
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (Store, closeStore, openStore, writeDrv)
-import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, storePathToFilePath)
+import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, platformStoreDir, storePathToFilePath)
 import Paths_nova_nix (getDataDir)
 import System.Directory (getCurrentDirectory, getTemporaryDirectory)
 import System.Environment (getArgs)
@@ -165,12 +165,12 @@ buildFile extraPaths dataDir filePath = do
           exitFailure
         Right val -> do
           (drv, drvSP) <- extractDerivation val
-          store <- openStore defaultStoreDir
+          store <- openStore platformStoreDir
           buildResult <- buildAndRegister store drv drvSP
           closeStore store
           case buildResult of
             BuildSuccess sp ->
-              TIO.putStrLn (T.pack (storePathToFilePath defaultStoreDir sp))
+              TIO.putStrLn (T.pack (storePathToFilePath platformStoreDir sp))
             BuildFailure msg code -> do
               TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
               exitFailure
@@ -219,7 +219,7 @@ buildAndRegister store drv drvSP = do
   -- Build with dependency resolution
   tmpDir <- getTemporaryDirectory
   let config =
-        (defaultBuildConfig defaultStoreDir)
+        (defaultBuildConfig platformStoreDir)
           { bcTmpDir = tmpDir
           }
   buildWithDeps config store drv drvSP
@@ -272,7 +272,7 @@ prettyValue (VBuiltin name _) = "«builtin " <> name <> "»"
 prettyValue (VCompiledRegex _) = "«compiled-regex»"
 prettyValue (VDerivation drv) =
   case drvOutputs drv of
-    (out : _) -> "«derivation " <> T.pack (storePathToFilePath defaultStoreDir (doPath out)) <> "»"
+    (out : _) -> "«derivation " <> T.pack (storePathToFilePath platformStoreDir (doPath out)) <> "»"
     [] -> "«derivation»"
 
 -- | Pretty-print a thunk.  After deep-forcing, all thunks should be
