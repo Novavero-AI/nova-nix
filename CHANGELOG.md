@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.8.0 — 2026-03-08
+
+### Builder Correctness, Windows Store Paths, Hackage Fix
+
+- **Fix #1: builder no longer pre-creates output paths** — `buildDerivationInner` no longer calls `createDirectoryIfMissing` for `$out`, `$dev`, etc. before running the builder. The builder is now responsible for creating its own outputs, matching real Nix semantics. Builds fail with `"builder succeeded but outputs missing"` if the builder exits successfully but expected outputs don't exist.
+- **File outputs supported** — `$out` can now be a regular file, not just a directory. `registerSingleOutput`, `addToStore`, `scanReferences`, and `pathExists` all use `doesPathExist` instead of `doesDirectoryExist`. `moveOutput` (renamed from `moveDirectory`) handles both files and directories in cross-device fallback. `collectRegularFiles` accepts file paths directly for reference scanning.
+- **Fix #2: Windows store paths use native separators** — CLI now uses `platformStoreDir` (`C:\nix\store` on Windows, `/nix/store` on Unix) for filesystem operations and display. Evaluator internals keep canonical `/nix/store` for ATerm hash compatibility.
+- **Fix: `crypton < 1.1` in .cabal file** — Previous `crypton` pin was only in `cabal.project` (which Hackage ignores). Moved to `.cabal` so the Hackage solver respects it. `crypton >= 1.1` switched from `memory` to `ram` for `ByteArrayAccess`, breaking `http-client-tls`.
+- 108 builtins, 526 tests, -Werror clean, ormolu clean, hlint clean
+
 ## 0.1.7.1 — 2026-03-07
 
 ### Hackage Build Fix
