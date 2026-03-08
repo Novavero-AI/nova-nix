@@ -260,7 +260,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 **Key numbers:**
 
 - **24 modules** — all implemented
-- **524 tests** — hand-rolled harness, no framework dependencies
+- **526 tests** — hand-rolled harness, no framework dependencies
 - **Zero partial functions** — total by construction, `T.uncons` over `T.head`/`T.tail`
 - **Strict by default** — bang patterns on all data fields (except Thunk's Env, which is lazy for knot-tying)
 
