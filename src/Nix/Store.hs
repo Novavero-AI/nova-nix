@@ -69,8 +69,10 @@ import System.Directory
     createDirectoryIfMissing,
     doesDirectoryExist,
     doesFileExist,
+    doesPathExist,
     listDirectory,
     removeDirectoryRecursive,
+    removeFile,
     renamePath,
     setPermissions,
   )
@@ -99,18 +101,18 @@ closeStore = closeStoreDB . stDB
 isValid :: Store -> StorePath -> IO Bool
 isValid = isValidPath . stDB
 
--- | Check if a store path directory exists on disk (regardless of DB).
+-- | Check if a store path exists on disk (file or directory, regardless of DB).
 pathExists :: Store -> StorePath -> IO Bool
-pathExists store sp = doesDirectoryExist (storePathToFilePath (stDir store) sp)
+pathExists store sp = doesPathExist (storePathToFilePath (stDir store) sp)
 
 -- ---------------------------------------------------------------------------
 -- Store operations
 -- ---------------------------------------------------------------------------
 
--- | Move an output directory to the store path, set read-only, and register.
+-- | Move a build output (file or directory) to the store path, set read-only,
+-- and register.
 --
--- If @renameDirectory@ fails (cross-device move), falls back to
--- recursive copy + remove.
+-- If @renamePath@ fails (cross-device move), falls back to copy + remove.
 addToStore ::
   Store ->
   FilePath ->
@@ -118,10 +120,10 @@ addToStore ::
   Maybe Text ->
   [StorePath] ->
   IO ()
-addToStore store srcDir sp deriver refs = do
+addToStore store srcPath sp deriver refs = do
   let destPath = storePathToFilePath (stDir store) sp
   -- Move (or copy) source to store
-  moveDirectory srcDir destPath
+  moveOutput srcPath destPath
   -- Set read-only permissions
   setReadOnly destPath
   -- Register in database
@@ -135,13 +137,19 @@ addToStore store srcDir sp deriver refs = do
         prReferences = refs
       }
 
--- | Cross-device safe directory move.
+-- | Cross-device safe move for files or directories.
 -- Tries 'renamePath' first; on IOException falls back to copy + remove.
-moveDirectory :: FilePath -> FilePath -> IO ()
-moveDirectory src dest =
+moveOutput :: FilePath -> FilePath -> IO ()
+moveOutput src dest =
   renamePath src dest `catch` \(_ :: IOException) -> do
-    copyDirectoryRecursive src dest
-    removeDirectoryRecursive src
+    isDir <- doesDirectoryExist src
+    if isDir
+      then do
+        copyDirectoryRecursive src dest
+        removeDirectoryRecursive src
+      else do
+        copyFile src dest
+        removeFile src
 
 -- | Recursively copy a directory tree.
 copyDirectoryRecursive :: FilePath -> FilePath -> IO ()
@@ -176,15 +184,18 @@ scanReferences storeDir candidates dir = do
     pure (scanBytes prefixBytes prefixLen hashLen contents acc)
   pure [sp | (h, sp) <- Set.toList candidateSet, Set.member h foundHashes]
 
--- | Collect all regular files under a directory, recursively.
+-- | Collect all regular files under a path, recursively.
+-- If the path is itself a regular file, returns it directly.
 collectRegularFiles :: FilePath -> IO [FilePath]
-collectRegularFiles dir = do
-  exists <- doesDirectoryExist dir
-  if not exists
-    then pure []
+collectRegularFiles path = do
+  isDir <- doesDirectoryExist path
+  if isDir
+    then do
+      entries <- listDirectory path
+      concat <$> mapM (classifyAndCollect path) entries
     else do
-      entries <- listDirectory dir
-      concat <$> mapM (classifyAndCollect dir) entries
+      isFile <- doesFileExist path
+      pure [path | isFile]
   where
     classifyAndCollect parent name = do
       let fullPath = parent </> name

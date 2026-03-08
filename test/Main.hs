@@ -3037,6 +3037,41 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
         pure ret,
+      -- Builder succeeds but doesn't create $out -> build fails
+      runTestM "missing output fails build" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-noout"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "nooutput"
+            drv = mkTestBuildDrv shell outSP "echo 'forgot to create output'"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-noout-tmp"}
+        result <- buildDerivation config store drv
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildFailure msg _ ->
+            if T.isInfixOf "outputs missing" msg
+              then Pass
+              else Fail ("expected 'outputs missing' error, got: " <> msg)
+          BuildSuccess _ -> Fail "expected failure when builder doesn't create $out",
+      -- File output (not directory) should succeed
+      runTestM "file output succeeds" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-fileout"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "fileout"
+            drv = mkTestBuildDrv shell outSP "echo 'I am a file output' > $out"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-fileout-tmp"}
+        result <- buildDerivation config store drv
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildSuccess sp -> assertEqual "file output path" outSP sp
+          BuildFailure msg code -> Fail ("file output build failed (" <> T.pack (show code) <> "): " <> msg),
       -- Cleanup after failure
       runTestM "cleanup after failure" $ do
         tmpBase <- getTemporaryDirectory

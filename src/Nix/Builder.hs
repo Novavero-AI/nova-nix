@@ -43,7 +43,7 @@ module Nix.Builder
 where
 
 import Control.Exception (SomeException, try)
-import Control.Monad (when)
+import Control.Monad (filterM, when)
 import Data.Char (toLower)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -56,7 +56,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Store (Store (..), addToStore, isValid, scanReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, removeDirectoryRecursive)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, takeFileName, (</>))
@@ -155,9 +155,9 @@ buildDerivationInner config store drv = do
       let buildDir = computeBuildDir config drv
       createDirectoryIfMissing True buildDir
 
-      -- 3. Create output directories inside build dir
+      -- 3. Compute output paths (but do NOT pre-create them — the builder
+      --    is responsible for creating $out, $dev, etc.)
       let outputDirs = [(doName out, buildDir </> T.unpack (doName out)) | out <- drvOutputs drv]
-      mapM_ (createDirectoryIfMissing True . snd) outputDirs
 
       -- 4. Set up environment
       let builderPath = T.unpack (drvBuilder drv)
@@ -172,11 +172,19 @@ buildDerivationInner config store drv = do
           cleanupBuildDir buildDir
           pure (BuildFailure ("builder failed: " <> stderrText) exitCode)
         Right () -> do
-          -- 7. Success: register each output
-          registerResult <- registerOutputs config store drv buildDir outputDirs
-          -- Clean up build dir
-          cleanupBuildDir buildDir
-          pure registerResult
+          -- 7. Success: validate that the builder created all expected outputs.
+          --    Outputs may be files or directories — both are valid (real Nix
+          --    allows $out to be a single file, a directory tree, or a symlink).
+          missing <- filterM (fmap not . doesPathExist . snd) outputDirs
+          case missing of
+            [] -> do
+              registerResult <- registerOutputs config store drv buildDir outputDirs
+              cleanupBuildDir buildDir
+              pure registerResult
+            _ -> do
+              cleanupBuildDir buildDir
+              let names = T.intercalate ", " (map fst missing)
+              pure (BuildFailure ("builder succeeded but outputs missing: " <> names) 1)
 
 -- ---------------------------------------------------------------------------
 -- Input validation
@@ -398,15 +406,15 @@ registerSingleOutput ::
 registerSingleOutput config store candidates drvPathText (output, (_outName, outDir)) = do
   let targetSP = doPath output
       targetPath = storePathToFilePath (bcStoreDir config) targetSP
-  -- Check if output directory exists (builder should have created it)
-  exists <- doesDirectoryExist outDir
+  -- Check if output exists (file or directory — builder creates it)
+  exists <- doesPathExist outDir
   if not exists
-    then pure (Left ("output directory missing: " <> T.pack outDir))
+    then pure (Left ("output missing: " <> T.pack outDir))
     else do
       -- Scan for references in the output
       refs <- scanReferences (bcStoreDir config) candidates outDir
       -- Check if already in store (e.g. from a previous build)
-      alreadyExists <- doesDirectoryExist targetPath
+      alreadyExists <- doesPathExist targetPath
       if alreadyExists
         then pure (Right ())
         else do
