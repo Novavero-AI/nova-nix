@@ -28,6 +28,7 @@ module Nix.Eval.Types
     attrSetMapWithKeyLazy,
     attrSetRemoveKeys,
     attrSetUnionWith,
+    mappedToLazy,
     newLazyAttrCache,
     newMappedCache,
 
@@ -406,10 +407,40 @@ attrSetMapWithKeyLazy :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
 attrSetMapWithKeyLazy f (EagerAttrs m) = EagerAttrs (Map.mapWithKey f m)
 attrSetMapWithKeyLazy f inner = MappedAttrs f inner (newMappedCache inner)
 
+-- | Convert a 'MappedAttrs' to 'LazyAttrs' without materializing thunks.
+-- Each key gets a 'PreBuilt' wrapper around a lazy closure that defers
+-- the mapping function application until the key is actually accessed.
+-- This allows @//@ merges to stay lazy through 'MappedAttrs' operands
+-- instead of eagerly materializing 30k synthetic thunks.
+--
+-- Nested 'MappedAttrs' chains are flattened by composing the mapping
+-- functions, so @MappedAttrs g (MappedAttrs f base _) _@ becomes a
+-- single 'LazyAttrs' with composed closures @\\k -> g k . f k@.
+--
+-- Non-'MappedAttrs' inputs are returned unchanged.
+mappedToLazy :: AttrSet -> AttrSet
+mappedToLazy (MappedAttrs f inner _) =
+  let bindings = applyMapping f inner
+      cache = newLazyAttrCache bindings
+   in LazyAttrs bindings cache
+  where
+    -- Recursively extract binding recipes, composing mapping functions.
+    -- INTENTIONALLY LAZY inside PreBuilt: neither the mapping function
+    -- nor materializeBinding is called until the key is actually accessed.
+    applyMapping g (EagerAttrs m) =
+      Map.mapWithKey (\k thunk -> PreBuilt (g k thunk)) m
+    applyMapping g (LazyAttrs innerBindings _) =
+      Map.mapWithKey
+        (\k recipe -> PreBuilt (g k (materializeBinding k recipe)))
+        innerBindings
+    applyMapping g (MappedAttrs h innerInner _) =
+      applyMapping (\k thunk -> g k (h k thunk)) innerInner
+mappedToLazy other = other
+
 -- | Remove a list of keys from an attribute set without materializing
 -- 'LazyAttrs'.  For 'EagerAttrs', deletes from the map directly.
 -- For 'LazyAttrs', deletes from the binding map and creates a fresh cache.
--- For 'MappedAttrs', materializes to eager (removeKeys is rare on hot path).
+-- For 'MappedAttrs', converts to lazy first (avoids full materialization).
 attrSetRemoveKeys :: [Text] -> AttrSet -> AttrSet
 attrSetRemoveKeys keys (EagerAttrs m) =
   EagerAttrs (foldl' (flip Map.delete) m keys)
@@ -417,7 +448,7 @@ attrSetRemoveKeys keys (LazyAttrs bindings _cache) =
   let newBindings = foldl' (flip Map.delete) bindings keys
    in LazyAttrs newBindings (newLazyAttrCache newBindings)
 attrSetRemoveKeys keys attrs@(MappedAttrs {}) =
-  EagerAttrs (foldl' (flip Map.delete) (attrSetToMap attrs) keys)
+  attrSetRemoveKeys keys (mappedToLazy attrs)
 
 -- | Union two attribute sets with a combining function (materializes both).
 attrSetUnionWith :: (Thunk -> Thunk -> Thunk) -> AttrSet -> AttrSet -> AttrSet
