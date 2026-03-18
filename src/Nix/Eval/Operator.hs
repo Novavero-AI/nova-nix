@@ -21,6 +21,7 @@ import Nix.Eval.Types
     Thunk,
     attrSetElems,
     attrSetKeys,
+    attrSetToMap,
     newLazyAttrCache,
     thunkSameRef,
     typeName,
@@ -239,3 +240,9 @@ mergeAttrSets (LazyAttrs leftBindings _) (LazyAttrs rightBindings _) =
 -- EagerAttrs // EagerAttrs: standard Map.union
 mergeAttrSets (EagerAttrs as) (EagerAttrs bs) =
   EagerAttrs (Map.union bs as) -- right-biased: bs shadows as
+  -- MappedAttrs: materialize then merge.  The // operator needs the full
+  -- key set anyway, so materialization here is unavoidable.
+mergeAttrSets mapped@(MappedAttrs {}) other =
+  mergeAttrSets (EagerAttrs (attrSetToMap mapped)) other
+mergeAttrSets other mapped@(MappedAttrs {}) =
+  mergeAttrSets other (EagerAttrs (attrSetToMap mapped))

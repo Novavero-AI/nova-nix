@@ -29,6 +29,7 @@ module Nix.Eval.Types
     attrSetRemoveKeys,
     attrSetUnionWith,
     newLazyAttrCache,
+    newMappedCache,
 
     -- * String context
     StringContextElement (..),
@@ -240,6 +241,18 @@ data AttrSet
       !(Map Text LazyBinding)
       -- | Materialized thunk cache (written via unsafePerformIO)
       !(IORef (Map Text Thunk))
+  | -- | Mapped attribute set: defers per-key transformation until lookup.
+    -- Created by @builtins.mapAttrs@ on large sets.  Instead of eagerly
+    -- materializing 30k synthetic thunks, stores the mapping function and
+    -- original set.  Only accessed keys get materialized and cached.
+    -- Composition chains (stacked overlays) remain virtual until forced.
+    MappedAttrs
+      -- | Per-key transformation: @\key valThunk -> resultThunk@
+      !(Text -> Thunk -> Thunk)
+      -- | Original attribute set (may itself be a MappedAttrs)
+      !AttrSet
+      -- | Materialization cache (written via unsafePerformIO)
+      !(IORef (Map Text Thunk))
 
 instance Eq AttrSet where
   EagerAttrs a == EagerAttrs b = a == b
@@ -249,6 +262,8 @@ instance Show AttrSet where
   show (EagerAttrs m) = show m
   show (LazyAttrs bindings _) =
     "<lazy " ++ show (Map.size bindings) ++ " bindings>"
+  show (MappedAttrs _ inner _) =
+    "<mapped over " ++ show inner ++ ">"
 
 -- | Look up a single key.  For 'EagerAttrs', pure 'Map.lookup'.
 -- For 'LazyAttrs', checks the cache first, then materializes a
@@ -272,6 +287,18 @@ attrSetLookup key (LazyAttrs bindings cacheRef) =
                 unsafePerformIO $ do
                   atomicModifyIORef' cacheRef (\c -> (Map.insert key thunk c, ()))
                   pure (Just thunk)
+attrSetLookup key (MappedAttrs f inner cacheRef) =
+  -- Check cache first, then delegate to inner set and apply mapping
+  let cached = unsafePerformIO (readIORef cacheRef)
+   in case Map.lookup key cached of
+        Just thunk -> Just thunk
+        Nothing -> case attrSetLookup key inner of
+          Nothing -> Nothing
+          Just innerThunk ->
+            let thunk = f key innerThunk
+             in unsafePerformIO $ do
+                  atomicModifyIORef' cacheRef (\c -> (Map.insert key thunk c, ()))
+                  pure (Just thunk)
 
 -- | Materialize a single 'LazyBinding' into a 'Thunk'.
 -- Each binding carries its own env, so no separate env parameter needed.
@@ -293,30 +320,34 @@ inheritLookupThunk env name =
           throwExpr = EApp (EVar "throw") (EStr [StrLit errMsg])
        in mkThunk env throwExpr
 
--- | All keys in the attribute set.  For 'LazyAttrs', reads keys from
--- the binding map — zero thunk allocation.
+-- | All keys in the attribute set.  For 'LazyAttrs' and 'MappedAttrs',
+-- reads keys from the underlying structure — zero thunk allocation.
 attrSetKeys :: AttrSet -> [Text]
 attrSetKeys (EagerAttrs m) = Map.keys m
 attrSetKeys (LazyAttrs bindings _) = Map.keys bindings
+attrSetKeys (MappedAttrs _ inner _) = attrSetKeys inner
 
 -- | Check key membership without materializing thunks.
 attrSetMember :: Text -> AttrSet -> Bool
 attrSetMember key (EagerAttrs m) = Map.member key m
 attrSetMember key (LazyAttrs bindings _) = Map.member key bindings
+attrSetMember key (MappedAttrs _ inner _) = attrSetMember key inner
 
 -- | Check if the attribute set is empty.
 attrSetNull :: AttrSet -> Bool
 attrSetNull (EagerAttrs m) = Map.null m
 attrSetNull (LazyAttrs bindings _) = Map.null bindings
+attrSetNull (MappedAttrs _ inner _) = attrSetNull inner
 
 -- | Number of attributes.
 attrSetSize :: AttrSet -> Int
 attrSetSize (EagerAttrs m) = Map.size m
 attrSetSize (LazyAttrs bindings _) = Map.size bindings
+attrSetSize (MappedAttrs _ inner _) = attrSetSize inner
 
 -- | Full materialization: build a 'Map Text Thunk' from all bindings.
--- For 'LazyAttrs', this allocates thunks + IORefs for every key —
--- expensive on large sets, avoid on the hot path.
+-- For 'LazyAttrs' and 'MappedAttrs', this allocates thunks for every
+-- key — expensive on large sets, avoid on the hot path.
 --
 -- Uses 'unsafePerformIO' to update the cache atomically.
 attrSetToMap :: AttrSet -> Map Text Thunk
@@ -335,6 +366,21 @@ attrSetToMap (LazyAttrs bindings cacheRef) =
       case Map.lookup key cached of
         Just thunk -> thunk
         Nothing -> materializeBinding key recipe
+attrSetToMap (MappedAttrs f inner cacheRef) =
+  unsafePerformIO $ do
+    cached <- readIORef cacheRef
+    let innerMap = attrSetToMap inner
+    if Map.size cached == Map.size innerMap
+      then pure cached
+      else do
+        let full = Map.mapWithKey (materializeOne cached) innerMap
+        atomicModifyIORef' cacheRef (const (full, ()))
+        pure full
+  where
+    materializeOne cached key innerThunk =
+      case Map.lookup key cached of
+        Just thunk -> thunk
+        Nothing -> f key innerThunk
 
 -- | All thunk values (materialized).
 attrSetElems :: AttrSet -> [Thunk]
@@ -348,26 +394,30 @@ attrSetToAscList = Map.toAscList . attrSetToMap
 attrSetMapWithKey :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
 attrSetMapWithKey f attrs = EagerAttrs (Map.mapWithKey f (attrSetToMap attrs))
 
--- | Like 'attrSetMapWithKey' but preserves laziness for 'LazyAttrs'.
--- Each binding is wrapped in 'PreBuilt' so that materialization (IORef
--- allocation) only happens when a specific key is accessed.  This avoids
--- ~30k IORef allocations when @mapAttrs@ is applied to a large set (e.g.
--- nixpkgs overlays) and only a few keys are actually demanded.
+-- | Like 'attrSetMapWithKey' but preserves laziness.  For 'LazyAttrs'
+-- and 'MappedAttrs', creates a 'MappedAttrs' wrapper that defers
+-- per-key transformation until lookup time.  This avoids ~30k IORef
+-- allocations when @mapAttrs@ is applied to a large set (e.g. nixpkgs
+-- overlays) and only a few keys are actually demanded.  Composition
+-- chains (stacked overlays) remain virtual: @mapAttrs g (mapAttrs f xs)@
+-- produces @MappedAttrs g (MappedAttrs f xs _) _@ with zero thunk
+-- allocations until a key is accessed.
 attrSetMapWithKeyLazy :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
 attrSetMapWithKeyLazy f (EagerAttrs m) = EagerAttrs (Map.mapWithKey f m)
-attrSetMapWithKeyLazy f (LazyAttrs bindings _cache) =
-  let mapped = Map.mapWithKey (\k recipe -> PreBuilt (f k (materializeBinding k recipe))) bindings
-   in LazyAttrs mapped (newLazyAttrCache mapped)
+attrSetMapWithKeyLazy f inner = MappedAttrs f inner (newMappedCache inner)
 
 -- | Remove a list of keys from an attribute set without materializing
 -- 'LazyAttrs'.  For 'EagerAttrs', deletes from the map directly.
 -- For 'LazyAttrs', deletes from the binding map and creates a fresh cache.
+-- For 'MappedAttrs', materializes to eager (removeKeys is rare on hot path).
 attrSetRemoveKeys :: [Text] -> AttrSet -> AttrSet
 attrSetRemoveKeys keys (EagerAttrs m) =
   EagerAttrs (foldl' (flip Map.delete) m keys)
 attrSetRemoveKeys keys (LazyAttrs bindings _cache) =
   let newBindings = foldl' (flip Map.delete) bindings keys
    in LazyAttrs newBindings (newLazyAttrCache newBindings)
+attrSetRemoveKeys keys attrs@(MappedAttrs {}) =
+  EagerAttrs (foldl' (flip Map.delete) (attrSetToMap attrs) keys)
 
 -- | Union two attribute sets with a combining function (materializes both).
 attrSetUnionWith :: (Thunk -> Thunk -> Thunk) -> AttrSet -> AttrSet -> AttrSet
@@ -383,6 +433,12 @@ attrSetFromMap = EagerAttrs
 {-# NOINLINE newLazyAttrCache #-}
 newLazyAttrCache :: Map Text LazyBinding -> IORef (Map Text Thunk)
 newLazyAttrCache bindings = unsafePerformIO (bindings `seq` newIORef Map.empty)
+
+-- | Allocate a fresh materialization cache for 'MappedAttrs'.
+-- Uses the inner 'AttrSet' as the data dependency to prevent CAF sharing.
+{-# NOINLINE newMappedCache #-}
+newMappedCache :: AttrSet -> IORef (Map Text Thunk)
+newMappedCache inner = unsafePerformIO (inner `seq` newIORef Map.empty)
 
 -- | Evaluation environment — scope chain with positional slots.
 --

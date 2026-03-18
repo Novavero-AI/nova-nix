@@ -65,7 +65,7 @@ do_build() {
   # cabal doesn't relink the exe when switching between standard/profiling
   # modes, so we must clean the exe build dir before switching.
   if [[ "$mode" != "$LAST_BUILD_MODE" ]]; then
-    local exe_build_dir="$REPO_ROOT/dist-newstyle/build/x86_64-windows/ghc-9.6.7/nova-nix-*/x/nova-nix"
+    local exe_build_dir="$REPO_ROOT/dist-newstyle/build/x86_64-windows/ghc-*/nova-nix-*/x/nova-nix"
     rm -rf $exe_build_dir 2>/dev/null || true
   fi
   LAST_BUILD_MODE="$mode"
