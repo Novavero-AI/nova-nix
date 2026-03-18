@@ -20,10 +20,9 @@
 
 ## Next: Full nixpkgs Performance
 
-The lib layer evaluates correctly. stdenv bootstrap runs but OOMs at ~2GB for the full 80,000+ package set.
+The lib layer evaluates correctly. `import <nixpkgs> {}` gets into stdenv bootstrap but consumes all available memory and OOMs regardless of machine (8 GB Mac, 16 GB Windows). Must run with `-M4G` cap to avoid killing other processes. Root cause is GHC per-object overhead (~3x vs C) compounded by nixpkgs being inherently memory-hungry (C++ Nix itself uses 5-10+ GB for full eval — NixOS/nix#8621).
 
-- Investigate and fix remaining space leak in full `import <nixpkgs> {}` eval
-- Performance target: ~2-5 seconds for full nixpkgs eval
+- C FFI data layer to move hot-path structures to C (see #4)
 - Profile the eval hot path — identify remaining allocation sources
 - Missing builtins that nixpkgs exercises (discovered during real eval)
 

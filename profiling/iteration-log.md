@@ -145,7 +145,9 @@ Scaling test reveals the truth:
 | 8G  | 8.4 GB        | 92 GB       |
 
 Live data scales linearly with heap cap. Classic space leak.
-C++ Nix does the same eval in ~1-2 GB.
+C++ Nix also struggles here — `nix-env -qaP` uses ~10 GB RSS (NixOS/nix#8621).
+Simpler evals (single NixOS config) use ~1 GB. No verified number for
+`builtins.attrNames (import <nixpkgs> {})` specifically.
 
 ### Root cause: Env chain retention
 `ELambda formals body -> pure (VLambda env formals body)` (Eval.hs:160)
