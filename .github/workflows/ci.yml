@@ -93,6 +93,31 @@ jobs:
         run: cabal test
 
   # ---------------------------------------------------------------------------
+  # Seed nova-cache (Linux + macOS, main branch only)
+  # ---------------------------------------------------------------------------
+
+  seed-cache:
+    name: Seed Cache (${{ matrix.os }})
+    if: github.ref == 'refs/heads/main'
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+
+      - uses: Novavero-AI/nova-cache/.github/actions/seed@main
+        with:
+          cache-url: https://cache.novavero.ai
+          api-key: ${{ secrets.NOVA_CACHE_API_KEY }}
+
+  # ---------------------------------------------------------------------------
   # Publish to Hackage (tag-triggered, after all builds pass)
   # ---------------------------------------------------------------------------
 
