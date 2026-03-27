@@ -19,8 +19,8 @@ import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
 import Nix.Eval (Env (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, mkStr, runPureEval)
-import Nix.Eval.CAttrSet (cattrsetFree, cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
+import Nix.Eval.CAttrSet (cattrsetFree, cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CThunk (cthunkCount, cthunkGet, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
@@ -3300,43 +3300,43 @@ testSymbol = do
   putStrLn "symbol"
   -- Symbol table is initialized by arenaInit in main bracket.
   sequence
-      [ runTestM "intern returns non-zero" $ do
-          sym <- symbolIntern "hello"
-          pure (if unSymbol sym /= 0 then Pass else Fail "got symbol 0"),
-        runTestM "intern same string returns same symbol" $ do
-          sym1 <- symbolIntern "name"
-          sym2 <- symbolIntern "name"
-          pure (assertEqual "same symbol" sym1 sym2),
-        runTestM "intern different strings returns different symbols" $ do
-          sym1 <- symbolIntern "foo"
-          sym2 <- symbolIntern "bar"
-          pure (if sym1 /= sym2 then Pass else Fail "symbols should differ"),
-        runTestM "symbolText round-trips" $ do
-          sym <- symbolIntern "version"
-          let txt = symbolText sym
-          pure (assertEqual "text" "version" txt),
-        runTestM "symbolLen correct" $ do
-          sym <- symbolIntern "outputs"
-          pure (assertEqual "len" 7 (symbolLen sym)),
-        runTestM "empty string interns" $ do
-          sym <- symbolIntern ""
-          let txt = symbolText sym
-          pure (assertEqual "empty" "" txt),
-        runTestM "symbolCount tracks unique entries" $ do
-          _ <- symbolIntern "alpha"
-          _ <- symbolIntern "beta"
-          _ <- symbolIntern "alpha"
-          count <- symbolCount
-          -- count includes all symbols interned in this bracket,
-          -- so at least the ones from prior tests plus alpha + beta
-          pure (if count >= 2 then Pass else Fail ("count too low: " <> T.pack (show count))),
-        runTestM "many symbols (stress)" $ do
-          let names = map (\i -> "pkg_" <> T.pack (show (i :: Int))) [1 .. 1000]
-          syms <- mapM symbolIntern names
-          -- All unique
-          let unique = length (Set.fromList (map unSymbol syms))
-          pure (assertEqual "1000 unique" 1000 unique)
-      ]
+    [ runTestM "intern returns non-zero" $ do
+        sym <- symbolIntern "hello"
+        pure (if unSymbol sym /= 0 then Pass else Fail "got symbol 0"),
+      runTestM "intern same string returns same symbol" $ do
+        sym1 <- symbolIntern "name"
+        sym2 <- symbolIntern "name"
+        pure (assertEqual "same symbol" sym1 sym2),
+      runTestM "intern different strings returns different symbols" $ do
+        sym1 <- symbolIntern "foo"
+        sym2 <- symbolIntern "bar"
+        pure (if sym1 /= sym2 then Pass else Fail "symbols should differ"),
+      runTestM "symbolText round-trips" $ do
+        sym <- symbolIntern "version"
+        let txt = symbolText sym
+        pure (assertEqual "text" "version" txt),
+      runTestM "symbolLen correct" $ do
+        sym <- symbolIntern "outputs"
+        pure (assertEqual "len" 7 (symbolLen sym)),
+      runTestM "empty string interns" $ do
+        sym <- symbolIntern ""
+        let txt = symbolText sym
+        pure (assertEqual "empty" "" txt),
+      runTestM "symbolCount tracks unique entries" $ do
+        _ <- symbolIntern "alpha"
+        _ <- symbolIntern "beta"
+        _ <- symbolIntern "alpha"
+        count <- symbolCount
+        -- count includes all symbols interned in this bracket,
+        -- so at least the ones from prior tests plus alpha + beta
+        pure (if count >= 2 then Pass else Fail ("count too low: " <> T.pack (show count))),
+      runTestM "many symbols (stress)" $ do
+        let names = map (\i -> "pkg_" <> T.pack (show (i :: Int))) [1 .. 1000]
+        syms <- mapM symbolIntern names
+        -- All unique
+        let unique = length (Set.fromList (map unSymbol syms))
+        pure (assertEqual "1000 unique" 1000 unique)
+    ]
 
 -- ---------------------------------------------------------------------------
 -- C attribute set (FFI)
@@ -3347,145 +3347,145 @@ testCAttrSet = do
   putStrLn "cattrset"
   -- Symbol table is initialized by arenaInit in main bracket.
   sequence
-      [ runTestM "new/free" $ do
-          set <- cattrsetNew 16
-          cattrsetFree set
-          pure Pass,
-        runTestM "insert + freeze + lookup" $ do
-          set <- cattrsetNew 4
-          kName <- symbolIntern "name"
-          kVer <- symbolIntern "version"
-          valName <- newStablePtr ("hello" :: Text)
-          valVer <- newStablePtr ("1.0" :: Text)
-          cattrsetInsert set kName valName
-          cattrsetInsert set kVer valVer
-          cattrsetFreeze set
-          result <- cattrsetLookup set kName
-          case result of
-            Nothing -> do
-              cattrsetFree set
-              freeStablePtr valName
-              freeStablePtr valVer
-              pure (Fail "lookup returned Nothing")
-            Just sp -> do
-              val <- deRefStablePtr sp :: IO Text
-              cattrsetFree set
-              freeStablePtr valName
-              freeStablePtr valVer
-              pure (assertEqual "lookup name" "hello" val),
-        runTestM "lookup missing key returns Nothing" $ do
-          set <- cattrsetNew 4
-          kFoo <- symbolIntern "foo"
-          kBar <- symbolIntern "bar"
-          sp <- newStablePtr ("x" :: Text)
-          cattrsetInsert set kFoo sp
-          cattrsetFreeze set
-          result <- cattrsetLookup set kBar
-          cattrsetFree set
-          freeStablePtr sp
-          pure (case result of Nothing -> Pass; Just _ -> Fail "expected Nothing"),
-        runTestM "size after freeze" $ do
-          set <- cattrsetNew 4
-          k1 <- symbolIntern "a"
-          k2 <- symbolIntern "b"
-          k3 <- symbolIntern "c"
-          sp <- newStablePtr (42 :: Int)
-          cattrsetInsert set k1 sp
-          cattrsetInsert set k2 sp
-          cattrsetInsert set k3 sp
-          cattrsetFreeze set
-          n <- cattrsetSize set
-          cattrsetFree set
-          freeStablePtr sp
-          pure (assertEqual "size" 3 n),
-        runTestM "duplicate keys: last writer wins" $ do
-          set <- cattrsetNew 4
-          kName <- symbolIntern "name"
-          sp1 <- newStablePtr ("first" :: Text)
-          sp2 <- newStablePtr ("second" :: Text)
-          cattrsetInsert set kName sp1
-          cattrsetInsert set kName sp2
-          cattrsetFreeze set
-          n <- cattrsetSize set
-          result <- cattrsetLookup set kName
-          val <- case result of
-            Nothing -> pure "MISSING"
-            Just sp -> deRefStablePtr sp
-          cattrsetFree set
-          freeStablePtr sp1
-          freeStablePtr sp2
-          pure
-            ( if n == 1 && val == ("second" :: Text)
-                then Pass
-                else Fail ("size=" <> T.pack (show n) <> " val=" <> val)
-            ),
-        runTestM "keys returned sorted" $ do
-          set <- cattrsetNew 8
-          -- Insert in reverse order; after freeze keys should be sorted by symbol ID
-          k1 <- symbolIntern "zzz"
-          k2 <- symbolIntern "aaa"
-          k3 <- symbolIntern "mmm"
-          sp <- newStablePtr (0 :: Int)
-          cattrsetInsert set k1 sp
-          cattrsetInsert set k2 sp
-          cattrsetInsert set k3 sp
-          cattrsetFreeze set
-          keys <- cattrsetKeys set
-          cattrsetFree set
-          freeStablePtr sp
-          -- Keys should be sorted by symbol ID (ascending)
-          let ids = map unSymbol keys
-              sorted = ids == foldl (\acc x -> acc ++ [x]) [] (Set.toAscList (Set.fromList ids))
-          pure (if sorted then Pass else Fail ("unsorted: " <> T.pack (show ids))),
-        runTestM "union right-biased" $ do
-          setA <- cattrsetNew 4
-          setB <- cattrsetNew 4
-          kX <- symbolIntern "x"
-          kY <- symbolIntern "y"
-          kZ <- symbolIntern "z"
-          spA <- newStablePtr ("fromA" :: Text)
-          spB <- newStablePtr ("fromB" :: Text)
-          spZ <- newStablePtr ("onlyA" :: Text)
-          cattrsetInsert setA kX spA
-          cattrsetInsert setA kZ spZ
-          cattrsetInsert setB kX spB
-          cattrsetInsert setB kY spB
-          cattrsetFreeze setA
-          cattrsetFreeze setB
-          merged <- cattrsetUnion setA setB
-          n <- cattrsetSize merged
-          resultX <- cattrsetLookup merged kX
-          valX <- case resultX of
-            Nothing -> pure "MISSING"
-            Just sp -> deRefStablePtr sp
-          cattrsetFree setA
-          cattrsetFree setB
-          cattrsetFree merged
-          freeStablePtr spA
-          freeStablePtr spB
-          freeStablePtr spZ
-          pure
-            ( if n == 3 && valX == ("fromB" :: Text)
-                then Pass
-                else Fail ("size=" <> T.pack (show n) <> " x=" <> valX)
-            ),
-        runTestM "stress: 10k entries" $ do
-          set <- cattrsetNew 1024
-          sp <- newStablePtr (0 :: Int)
-          syms <- mapM (\i -> symbolIntern ("key_" <> T.pack (show (i :: Int)))) [1 .. 10000]
-          mapM_ (\sym -> cattrsetInsert set sym sp) syms
-          cattrsetFreeze set
-          n <- cattrsetSize set
-          -- Spot-check a few lookups
-          hit <- cattrsetLookup set (syms !! 5000)
-          cattrsetFree set
-          freeStablePtr sp
-          pure
-            ( if n == 10000 && isJust hit
-                then Pass
-                else Fail ("size=" <> T.pack (show n))
-            )
-      ]
+    [ runTestM "new/free" $ do
+        set <- cattrsetNew 16
+        cattrsetFree set
+        pure Pass,
+      runTestM "insert + freeze + lookup" $ do
+        set <- cattrsetNew 4
+        kName <- symbolIntern "name"
+        kVer <- symbolIntern "version"
+        valName <- newStablePtr ("hello" :: Text)
+        valVer <- newStablePtr ("1.0" :: Text)
+        cattrsetInsert set kName valName
+        cattrsetInsert set kVer valVer
+        cattrsetFreeze set
+        result <- cattrsetLookup set kName
+        case result of
+          Nothing -> do
+            cattrsetFree set
+            freeStablePtr valName
+            freeStablePtr valVer
+            pure (Fail "lookup returned Nothing")
+          Just sp -> do
+            val <- deRefStablePtr sp :: IO Text
+            cattrsetFree set
+            freeStablePtr valName
+            freeStablePtr valVer
+            pure (assertEqual "lookup name" "hello" val),
+      runTestM "lookup missing key returns Nothing" $ do
+        set <- cattrsetNew 4
+        kFoo <- symbolIntern "foo"
+        kBar <- symbolIntern "bar"
+        sp <- newStablePtr ("x" :: Text)
+        cattrsetInsert set kFoo sp
+        cattrsetFreeze set
+        result <- cattrsetLookup set kBar
+        cattrsetFree set
+        freeStablePtr sp
+        pure (case result of Nothing -> Pass; Just _ -> Fail "expected Nothing"),
+      runTestM "size after freeze" $ do
+        set <- cattrsetNew 4
+        k1 <- symbolIntern "a"
+        k2 <- symbolIntern "b"
+        k3 <- symbolIntern "c"
+        sp <- newStablePtr (42 :: Int)
+        cattrsetInsert set k1 sp
+        cattrsetInsert set k2 sp
+        cattrsetInsert set k3 sp
+        cattrsetFreeze set
+        n <- cattrsetSize set
+        cattrsetFree set
+        freeStablePtr sp
+        pure (assertEqual "size" 3 n),
+      runTestM "duplicate keys: last writer wins" $ do
+        set <- cattrsetNew 4
+        kName <- symbolIntern "name"
+        sp1 <- newStablePtr ("first" :: Text)
+        sp2 <- newStablePtr ("second" :: Text)
+        cattrsetInsert set kName sp1
+        cattrsetInsert set kName sp2
+        cattrsetFreeze set
+        n <- cattrsetSize set
+        result <- cattrsetLookup set kName
+        val <- case result of
+          Nothing -> pure "MISSING"
+          Just sp -> deRefStablePtr sp
+        cattrsetFree set
+        freeStablePtr sp1
+        freeStablePtr sp2
+        pure
+          ( if n == 1 && val == ("second" :: Text)
+              then Pass
+              else Fail ("size=" <> T.pack (show n) <> " val=" <> val)
+          ),
+      runTestM "keys returned sorted" $ do
+        set <- cattrsetNew 8
+        -- Insert in reverse order; after freeze keys should be sorted by symbol ID
+        k1 <- symbolIntern "zzz"
+        k2 <- symbolIntern "aaa"
+        k3 <- symbolIntern "mmm"
+        sp <- newStablePtr (0 :: Int)
+        cattrsetInsert set k1 sp
+        cattrsetInsert set k2 sp
+        cattrsetInsert set k3 sp
+        cattrsetFreeze set
+        keys <- cattrsetKeys set
+        cattrsetFree set
+        freeStablePtr sp
+        -- Keys should be sorted by symbol ID (ascending)
+        let ids = map unSymbol keys
+            sorted = ids == foldl (\acc x -> acc ++ [x]) [] (Set.toAscList (Set.fromList ids))
+        pure (if sorted then Pass else Fail ("unsorted: " <> T.pack (show ids))),
+      runTestM "union right-biased" $ do
+        setA <- cattrsetNew 4
+        setB <- cattrsetNew 4
+        kX <- symbolIntern "x"
+        kY <- symbolIntern "y"
+        kZ <- symbolIntern "z"
+        spA <- newStablePtr ("fromA" :: Text)
+        spB <- newStablePtr ("fromB" :: Text)
+        spZ <- newStablePtr ("onlyA" :: Text)
+        cattrsetInsert setA kX spA
+        cattrsetInsert setA kZ spZ
+        cattrsetInsert setB kX spB
+        cattrsetInsert setB kY spB
+        cattrsetFreeze setA
+        cattrsetFreeze setB
+        merged <- cattrsetUnion setA setB
+        n <- cattrsetSize merged
+        resultX <- cattrsetLookup merged kX
+        valX <- case resultX of
+          Nothing -> pure "MISSING"
+          Just sp -> deRefStablePtr sp
+        cattrsetFree setA
+        cattrsetFree setB
+        cattrsetFree merged
+        freeStablePtr spA
+        freeStablePtr spB
+        freeStablePtr spZ
+        pure
+          ( if n == 3 && valX == ("fromB" :: Text)
+              then Pass
+              else Fail ("size=" <> T.pack (show n) <> " x=" <> valX)
+          ),
+      runTestM "stress: 10k entries" $ do
+        set <- cattrsetNew 1024
+        sp <- newStablePtr (0 :: Int)
+        syms <- mapM (\i -> symbolIntern ("key_" <> T.pack (show (i :: Int)))) [1 .. 10000]
+        mapM_ (\sym -> cattrsetInsert set sym sp) syms
+        cattrsetFreeze set
+        n <- cattrsetSize set
+        -- Spot-check a few lookups
+        hit <- cattrsetLookup set (syms !! 5000)
+        cattrsetFree set
+        freeStablePtr sp
+        pure
+          ( if n == 10000 && isJust hit
+              then Pass
+              else Fail ("size=" <> T.pack (show n))
+          )
+    ]
 
 -- ---------------------------------------------------------------------------
 -- C thunk arena (FFI)
