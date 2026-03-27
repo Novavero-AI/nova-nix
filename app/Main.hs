@@ -24,6 +24,7 @@ import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBu
 import Nix.Builtins (builtinEnv, parseNixPath)
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, force)
+import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (Store, closeStore, openStore, writeDrv)
@@ -87,6 +88,8 @@ mergeSearchPaths extraPaths dataDir envPaths =
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
+  -- Initialize C data layer (symbol interning, thunk arena, env allocator)
+  arenaInit
   args <- getArgs
   dataDir <- getDataDir
   let opts = parseArgs args
@@ -279,7 +282,7 @@ prettyValue (VDerivation drv) =
 -- 'Evaluated'; unevaluated thunks render as a placeholder.
 prettyThunk :: Thunk -> T.Text
 prettyThunk (Evaluated val) = prettyValue val
-prettyThunk (ThunkRef {}) = "«thunk»"
+prettyThunk (CThunkRef {}) = "«thunk»"
 
 -- | Escape a string for Nix-style output (quotes, backslashes, newlines, tabs, carriage returns).
 escapeNixString :: T.Text -> T.Text

@@ -15,7 +15,6 @@ module Nix.Eval
     NixValue (..),
     CompiledRegex (..),
     Thunk (..),
-    ThunkCell (..),
 
     -- * Attribute sets (re-exported from Types)
     AttrSet (..),
@@ -75,13 +74,13 @@ import Data.List (find, foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
-import Data.Primitive.SmallArray (SmallArray, indexSmallArray, smallArrayFromListN)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Foreign.Ptr (nullPtr)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm)
 import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
@@ -97,7 +96,7 @@ import Nix.Eval.Types
     StringContext (..),
     StringContextElement (..),
     Thunk (..),
-    ThunkCell (..),
+    allocCSlots,
     attrSetElems,
     attrSetFromMap,
     attrSetKeys,
@@ -110,6 +109,7 @@ import Nix.Eval.Types
     attrSetToAscList,
     attrSetToMap,
     attrSetUnionWith,
+    buildCSlots,
     cheapThunk,
     emptyContext,
     emptyEnv,
@@ -117,6 +117,7 @@ import Nix.Eval.Types
     envLookup,
     envLookupResolved,
     evaluated,
+    fillCSlots,
     lookupWithScopes,
     mkStr,
     mkSyntheticThunk,
@@ -281,11 +282,17 @@ evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> CaptureInfo -> m NixValue
 evalRecAttrs env bindings captureInfo
   | allPositionalBindings bindings =
       -- Positional path: slots for variable lookup, EagerAttrs for return.
+      -- Two-phase knot-tying: allocate C slot array first so recEnv
+      -- can reference slotsPtr, then fill slots with thunks that
+      -- lazily capture recEnv.  fillCSlots is forced by seq before
+      -- the attr map is returned.
       let slotCount = bindingSlotCount bindings
+          slotsPtr = allocCSlots slotCount
           parentEnv = buildCaptureEnv env captureInfo
           recEnv =
             Env
-              { envSlots = slots,
+              { envSlots = slotsPtr,
+                envSlotCount = slotCount,
                 envLazyScope = Nothing,
                 envParent = Just parentEnv,
                 envWithScopes = case captureInfo of
@@ -293,15 +300,17 @@ evalRecAttrs env bindings captureInfo
                   Captures _ -> []
                   CapturesWithScopes _ -> withScopesForCapture env
               }
-          slots = smallArrayFromListN slotCount (buildSlotThunks recEnv env bindings)
-          attrMap = buildAttrMapFromSlots bindings slots
-       in pure (VAttrs (EagerAttrs attrMap))
+          thunkList = buildSlotThunks recEnv env bindings
+          filled = fillCSlots slotsPtr thunkList
+          attrMap = buildAttrMapFromSlots bindings thunkList
+       in filled `seq` pure (VAttrs (EagerAttrs attrMap))
   | otherwise = do
       -- Fallback: dynamic/nested keys — use LazyAttrs.
       resolvedBindings <- resolveBindingKeys env bindings
       let recEnv =
             Env
-              { envSlots = mempty,
+              { envSlots = nullPtr,
+                envSlotCount = 0,
                 envLazyScope = Just attrSet,
                 envParent = Just env,
                 envWithScopes = envWithScopes env
@@ -519,7 +528,8 @@ evalApp env funcExpr argExpr = do
 -- * @FormalNamedSet n [a, b, c] _@ → @[argThunk, aThunk, bThunk, cThunk]@
 matchFormals :: (MonadEval m) => Env -> Formals -> Thunk -> m Env
 matchFormals closureEnv (FormalName _) argThunk =
-  pure (envFromSlots (smallArrayFromListN 1 [argThunk]) closureEnv)
+  let (sp, sc) = buildCSlots [argThunk]
+   in pure (envFromSlots sp sc closureEnv)
 matchFormals closureEnv (FormalSet formals allowExtra) argThunk = do
   argVal <- force argThunk
   matchFormalSet closureEnv formals allowExtra argVal Nothing
@@ -549,12 +559,11 @@ matchFormalSet closureEnv formals allowExtra argVal atThunk =
       -- Batch all formal bindings into ONE scope level.
       -- Knot-tying: formalEnv is used in mkThunk for defaults,
       -- but mkThunk captures Env lazily (Pending !Expr Env).
-      let formalEnv = envFromSlots formalSlots closureEnv
-          formalSlots = case atThunk of
-            Nothing ->
-              smallArrayFromListN (length formals) (map resolveOneFormal formals)
-            Just at ->
-              smallArrayFromListN (length formals + 1) (at : map resolveOneFormal formals)
+      let formalEnv = envFromSlots formalSlotsPtr formalSlotCount closureEnv
+          (formalSlotsPtr, formalSlotCount) = buildCSlots formalThunks
+          formalThunks = case atThunk of
+            Nothing -> map resolveOneFormal formals
+            Just at -> at : map resolveOneFormal formals
           resolveOneFormal (Formal name defExpr) =
             case attrSetLookup name attrs of
               Just thunk -> thunk
@@ -592,25 +601,23 @@ checkMissingFormals attrs formals =
 buildCaptureEnv :: Env -> CaptureInfo -> Env
 buildCaptureEnv env NoCaptureInfo = env
 buildCaptureEnv env (Captures captureList) =
-  Env
-    { envSlots =
-        smallArrayFromListN
-          (length captureList)
-          [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
-      envLazyScope = Nothing,
-      envParent = Nothing,
-      envWithScopes = []
-    }
+  let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
+   in Env
+        { envSlots = slotsPtr,
+          envSlotCount = slotCount,
+          envLazyScope = Nothing,
+          envParent = Nothing,
+          envWithScopes = []
+        }
 buildCaptureEnv env (CapturesWithScopes captureList) =
-  Env
-    { envSlots =
-        smallArrayFromListN
-          (length captureList)
-          [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
-      envLazyScope = Nothing,
-      envParent = Nothing,
-      envWithScopes = withScopesForCapture env
-    }
+  let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
+   in Env
+        { envSlots = slotsPtr,
+          envSlotCount = slotCount,
+          envLazyScope = Nothing,
+          envParent = Nothing,
+          envWithScopes = withScopesForCapture env
+        }
 
 -- ---------------------------------------------------------------------------
 -- Let / if / with / assert
@@ -628,6 +635,8 @@ allPositionalBindings = all isEligible
 
 -- | Count the number of positional slots needed for a list of bindings.
 -- Each named binding contributes 1, each inherit contributes its name count.
+-- Used by knot-tying sites where the count must be known before thunks
+-- are materialized (to pre-allocate the C slot array).
 bindingSlotCount :: [Binding] -> Int
 bindingSlotCount = foldl' countOne 0
   where
@@ -642,11 +651,17 @@ bindingSlotCount = foldl' countOne 0
 -- Inherits are expanded in-place: @inherit x y@ produces thunks at
 -- consecutive slots.  The @thunkEnv@ is the knot-tied let\/rec env;
 -- @outerEnv@ is the parent env used for inherit lookups.
+--
+-- Uses 'mkThunk' (not 'cheapThunk') for body expressions because
+-- @thunkEnv@ is knot-tied: its C slot array is pre-allocated but not
+-- yet filled.  'cheapThunk' would try to peek into unfilled slots for
+-- 'EResolvedVar' references.  'mkThunk' just stores @(expr, env)@
+-- lazily, deferring slot access to force time (when all slots are filled).
 buildSlotThunks :: Env -> Env -> [Binding] -> [Thunk]
 buildSlotThunks thunkEnv outerEnv = concatMap slotThunk
   where
     slotThunk (NamedBinding [StaticKey _] bodyExpr) =
-      [cheapThunk thunkEnv bodyExpr]
+      [mkThunk thunkEnv bodyExpr]
     slotThunk (Inherit Nothing names) =
       -- inherit x → look up x in the OUTER env (before the let scope).
       map (inheritLookup outerEnv) names
@@ -656,20 +671,22 @@ buildSlotThunks thunkEnv outerEnv = concatMap slotThunk
     -- Unreachable: allPositionalBindings guards this path.
     slotThunk _ = []
 
--- | Build a 'Map Text Thunk' indexing into a 'SmallArray Thunk' by
--- binding name.  The thunk pointers are shared (no copies).
+-- | Build a 'Map Text Thunk' from a binding list and corresponding
+-- thunk list (in declaration order).  The thunks are shared (no copies).
 -- Used by 'evalRecAttrs' to produce the 'EagerAttrs' return value
--- while slots serve for variable lookup.
-buildAttrMapFromSlots :: [Binding] -> SmallArray Thunk -> Map Text Thunk
-buildAttrMapFromSlots bindings slots = snd (foldl' addOne (0, Map.empty) bindings)
+-- while C-backed slots serve for variable lookup.
+buildAttrMapFromSlots :: [Binding] -> [Thunk] -> Map Text Thunk
+buildAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
   where
-    addOne (!idx, !acc) (NamedBinding [StaticKey name] _) =
-      (idx + 1, Map.insert name (indexSmallArray slots idx) acc)
-    addOne (!idx, !acc) (Inherit _ names) =
-      let acc' = foldl' (\a (offset, name) -> Map.insert name (indexSmallArray slots (idx + offset)) a) acc (zip [0 ..] names)
-       in (idx + length names, acc')
+    go [] _ !acc = acc
+    go (NamedBinding [StaticKey name] _ : bs) (t : ts) !acc =
+      go bs ts (Map.insert name t acc)
+    go (Inherit _ names : bs) ts !acc =
+      let (used, rest) = splitAt (length names) ts
+          acc' = foldl' (\a (name, t) -> Map.insert name t a) acc (zip names used)
+       in go bs rest acc'
     -- Unreachable: allPositionalBindings guards this path.
-    addOne (!idx, !acc) _ = (idx, acc)
+    go (_ : bs) ts !acc = go bs ts acc
 
 -- | Let is recursive in Nix: all bindings are visible to each other.
 -- Knot-tying via Haskell laziness (Thunk's Env field is lazy).
@@ -687,12 +704,16 @@ evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> CaptureInfo -> m NixValu
 evalLet env bindings body captureInfo
   | allPositionalBindings bindings =
       -- Positional path: slots for O(1) lookup, no envLazyScope.
+      -- Two-phase knot-tying: allocate C slot array first so letEnv
+      -- can reference slotsPtr, then fill slots with thunks that
+      -- lazily capture letEnv.  fillCSlots is forced by seq before eval.
       let slotCount = bindingSlotCount bindings
+          slotsPtr = allocCSlots slotCount
           parentEnv = buildCaptureEnv env captureInfo
-          -- Knot-tied: letEnv references slots which reference letEnv lazily.
           letEnv =
             Env
-              { envSlots = smallArrayFromListN slotCount (buildSlotThunks letEnv env bindings),
+              { envSlots = slotsPtr,
+                envSlotCount = slotCount,
                 envLazyScope = Nothing,
                 envParent = Just parentEnv,
                 envWithScopes = case captureInfo of
@@ -700,13 +721,15 @@ evalLet env bindings body captureInfo
                   Captures _ -> []
                   CapturesWithScopes _ -> withScopesForCapture env
               }
-       in eval letEnv body
+          filled = fillCSlots slotsPtr (buildSlotThunks letEnv env bindings)
+       in filled `seq` eval letEnv body
   | otherwise = do
       -- Fallback: dynamic/nested keys — use LazyAttrs.
       resolvedBindings <- resolveBindingKeys env bindings
       let letEnv =
             Env
-              { envSlots = mempty,
+              { envSlots = nullPtr,
+                envSlotCount = 0,
                 envLazyScope = Just (LazyAttrs lazyBindingMap cache),
                 envParent = Just env,
                 envWithScopes = envWithScopes env
@@ -1415,7 +1438,8 @@ builtinGenList func (VInt n)
       -- Lazy: each element is a deferred @f i@, forced only on demand.
       -- Slot 0 = function.
       let fnThunk = evaluated func
-          env = Env {envSlots = smallArrayFromListN 1 [fnThunk], envLazyScope = Nothing, envParent = Nothing, envWithScopes = []}
+          (sp, sc) = buildCSlots [fnThunk]
+          env = Env {envSlots = sp, envSlotCount = sc, envLazyScope = Nothing, envParent = Nothing, envWithScopes = []}
           mkIndexThunk i = mkThunk env (EApp (EResolvedVar 0 0) (ELit (NixInt i)))
        in pure (VList (map mkIndexThunk [0 .. n - 1]))
 builtinGenList _ other =
@@ -1652,9 +1676,11 @@ builtinSubstring _ _ other =
 -- Slot 0 = function, slot 1 = argument.
 deferApply :: NixValue -> Thunk -> Thunk
 deferApply func argThunk =
-  let env =
+  let (sp, sc) = buildCSlots [evaluated func, argThunk]
+      env =
         Env
-          { envSlots = smallArrayFromListN 2 [evaluated func, argThunk],
+          { envSlots = sp,
+            envSlotCount = sc,
             envLazyScope = Nothing,
             envParent = Nothing,
             envWithScopes = []
@@ -1961,9 +1987,11 @@ builtinMapAttrs func (VAttrs attrs) =
   pure (VAttrs (attrSetMapWithKeyLazy deferAttr attrs))
   where
     deferAttr key valThunk =
-      let env =
+      let (sp, sc) = buildCSlots [evaluated func, evaluated (mkStr key), valThunk]
+          env =
             Env
-              { envSlots = smallArrayFromListN 3 [evaluated func, evaluated (mkStr key), valThunk],
+              { envSlots = sp,
+                envSlotCount = sc,
                 envLazyScope = Nothing,
                 envParent = Nothing,
                 envWithScopes = []
@@ -2008,9 +2036,11 @@ builtinSetFunctionArgs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSetFunctionArgs func (VAttrs argSpec) =
   -- Closure env holds the function at slot 0.  The __functor lambda
   -- body is EResolvedVar 1 0: level 1 (past _self's slot), index 0.
-  let closureEnv =
+  let (sp, sc) = buildCSlots [evaluated func]
+      closureEnv =
         Env
-          { envSlots = smallArrayFromListN 1 [evaluated func],
+          { envSlots = sp,
+            envSlotCount = sc,
             envLazyScope = Nothing,
             envParent = Nothing,
             envWithScopes = []

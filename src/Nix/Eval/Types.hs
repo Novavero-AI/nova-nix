@@ -10,7 +10,6 @@ module Nix.Eval.Types
     NixValue (..),
     CompiledRegex (..),
     Thunk (..),
-    ThunkCell (..),
 
     -- * Attribute sets (lazy/eager unified abstraction)
     AttrSet (..),
@@ -54,6 +53,10 @@ module Nix.Eval.Types
     cheapThunk,
     evaluated,
     thunkSameRef,
+    thunkToCPtr,
+    buildCSlots,
+    allocCSlots,
+    fillCSlots,
 
     -- * Display
     typeName,
@@ -66,14 +69,21 @@ where
 
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.Int (Int64)
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Primitive.SmallArray (SmallArray, indexSmallArray, sizeofSmallArray, smallArrayFromListN)
+import Data.Primitive.SmallArray (SmallArray, indexSmallArray, sizeofSmallArray)
 import Data.Set (Set)
 import Data.Text (Text)
+import Data.Word (Word8)
+import Foreign.Ptr (Ptr, nullPtr)
+import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, newStablePtr)
+import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetGetKey, cattrsetIndex, cattrsetKeys, cattrsetSize)
+import Nix.Eval.CEnv (cenvAllocSlots)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkNew, cthunkNewComputed, cthunkNewComputedBool, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedNull, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.Symbol (symbolIntern, symbolText)
 import Nix.Expr.Types (AttrKey (..), CaptureInfo (..), Expr (..), Formals, NixAtom (..), StringPart (..))
 import Nix.Store.Path (StorePath)
@@ -127,41 +137,34 @@ mkStr t = VStr t emptyContext
 -- Thunks
 -- ---------------------------------------------------------------------------
 
--- | Contents of a thunk's memoization cell.  When forced, 'Pending'
--- is overwritten with 'Computed', dropping the Expr and Env — they
--- become unreachable and are GC'd.  This matches C++ Nix, which
--- overwrites Value structs in place to release closures.
-data ThunkCell
-  = -- | Not yet forced: expression + capturing environment.
-    -- Expr is strict; Env is LAZY for knot-tying in rec {} and let.
-    Pending !Expr Env
-  | -- | Forced: the computed result.  Expr + Env are gone.
-    Computed !NixValue
-  deriving (Show)
-
--- | A thunk: either an IORef-backed memoization cell (deferred
--- evaluation), or an already-known value (no IORef needed).
+-- | A thunk: either a C-backed memoization cell (deferred evaluation),
+-- or an already-known value (no C allocation needed).
 --
--- Each 'ThunkRef' carries an 'IORef ThunkCell'.  On first force,
--- the cell is overwritten from @Pending expr env@ to @Computed val@,
--- which drops all references to the Expr and Env — matching real Nix
--- which mutates thunks in-place.  The IORef is allocated via
--- 'unsafePerformIO' in 'mkThunk' so that knot-tying works unchanged.
+-- Each 'CThunkRef' points to an arena-allocated @nn_thunk_t@ in C.
+-- On first force, the cell transitions PENDING -> BLACKHOLE -> COMPUTED,
+-- which detects infinite recursion (BLACKHOLE) and drops the Expr/Env
+-- references — matching real Nix which mutates thunks in-place.
+--
+-- The C thunk is allocated via 'unsafePerformIO' in 'mkThunk' (same
+-- pattern as the former IORef-based approach) so that knot-tying works
+-- unchanged.  Arena pointers remain valid until 'cthunkDestroy'.
 data Thunk
-  = -- | Deferred thunk with memoization cell.
-    ThunkRef !(IORef ThunkCell)
-  | -- | Already-known value (no IORef overhead).
+  = -- | Deferred thunk: C arena-allocated memoization cell.
+    -- Payload is StablePtr to (Expr, Env) when pending, or
+    -- StablePtr to NixValue when computed.
+    CThunkRef !CThunkPtr
+  | -- | Already-known value (no C allocation overhead).
     Evaluated !NixValue
 
 instance Show Thunk where
   show (Evaluated val) = "Evaluated (" ++ show val ++ ")"
-  show (ThunkRef _) = "ThunkRef <ref>"
+  show (CThunkRef _) = "CThunkRef <ptr>"
 
--- | Equality: compares values for 'Evaluated', IORef identity for
--- 'ThunkRef'.  Only used in tests on non-recursive structures.
+-- | Equality: compares values for 'Evaluated', pointer identity for
+-- 'CThunkRef'.  Only used in tests on non-recursive structures.
 instance Eq Thunk where
   (Evaluated v1) == (Evaluated v2) = v1 == v2
-  (ThunkRef ref1) == (ThunkRef ref2) = ref1 == ref2
+  (CThunkRef p1) == (CThunkRef p2) = p1 == p2
   _ == _ = False
 
 -- | A Nix value — the result of evaluating an expression.
@@ -551,9 +554,11 @@ newMappedCache inner = unsafePerformIO (inner `seq` newIORef Map.empty)
 -- * 'envLookup': name-based walk for 'EVar' (envLazyScope + with-scopes)
 data Env = Env
   { -- | Positional bindings for lambda formals.
-    -- Indexed by position (0-based), filled by 'matchFormals'.
-    -- O(1) lookup via 'indexSmallArray'.  Empty for let/rec/builtin envs.
-    envSlots :: !(SmallArray Thunk),
+    -- C-allocated array of nn_thunk_t* pointers (off GHC heap).
+    -- O(1) lookup via 'peekElemOff'.  'nullPtr' for empty envs.
+    envSlots :: {-# UNPACK #-} !(Ptr CThunkPtr),
+    -- | Number of positional slots.
+    envSlotCount :: {-# UNPACK #-} !Int,
     -- | Lazy scope shared with a 'LazyAttrs' attr set.
     -- For rec {} and let, this points to the SAME 'LazyAttrs' that
     -- backs the resulting attr set — one map instead of two.
@@ -575,14 +580,14 @@ data Env = Env
 -- Ignores parent chain to avoid diverging on deep/recursive envs.
 -- Only used in tests on non-recursive structures.
 instance Eq Env where
-  Env s1 _ _ w1 == Env s2 _ _ w2 =
-    sizeofSmallArray s1 == sizeofSmallArray s2 && w1 == w2
+  Env _ n1 _ _ w1 == Env _ n2 _ _ w2 =
+    n1 == n2 && w1 == w2
 
 -- | Compact show: just the size and structure, not the full contents.
 instance Show Env where
-  show (Env slots lazyScope parent withs) =
+  show (Env _ slotCount lazyScope parent withs) =
     "Env{"
-      ++ show (sizeofSmallArray slots)
+      ++ show slotCount
       ++ " slots"
       ++ maybe "" (const ", lazyScope") lazyScope
       ++ maybe "" (const ", parent") parent
@@ -592,14 +597,19 @@ instance Show Env where
 
 -- | Empty environment (no variables in scope).
 emptyEnv :: Env
-emptyEnv = Env mempty Nothing Nothing []
+emptyEnv = Env nullPtr 0 Nothing Nothing []
 
 -- | Look up a resolved variable by level and index.  O(level) parent
--- hops, then O(1) array index via 'indexSmallArray'.
+-- hops, then O(1) read from the C slot array via 'peekElemOff'.
+--
+-- Returns 'CThunkRef' wrapping the nn_thunk_t* pointer from the slot.
+-- Uses 'unsafePerformIO' for the C array read — safe because the
+-- array is immutable after construction (same as SmallArray indexing).
 --
 -- Unreachable branch: the resolution pass guarantees valid indices.
 envLookupResolved :: Int -> Int -> Env -> Thunk
-envLookupResolved 0 idx env = indexSmallArray (envSlots env) idx
+envLookupResolved 0 idx env =
+  CThunkRef (unsafePerformIO (peekElemOff (envSlots env) idx))
 envLookupResolved lvl idx env = case envParent env of
   Just parent -> envLookupResolved (lvl - 1) idx parent
   Nothing -> error "envLookupResolved: level exceeded (unreachable after resolution)"
@@ -616,7 +626,7 @@ envLookup name env = lexicalLookup env
     -- With-scopes from the STARTING env: these are the most recent
     -- and subsume all ancestor with-scopes (children inherit them).
     withs = envWithScopes env
-    lexicalLookup (Env _slots lazyScope parent _) =
+    lexicalLookup (Env _slots _slotCount lazyScope parent _) =
       case lazyScope of
         Just scope -> case attrSetLookup name scope of
           Just val -> Just val
@@ -636,11 +646,13 @@ lookupWithScopes name (scope : rest) =
     Nothing -> lookupWithScopes name rest
 
 -- | Create a child env with positional slots (for lambda formals).
--- Inherits with-scopes from the parent.
-envFromSlots :: SmallArray Thunk -> Env -> Env
-envFromSlots slots parent =
+-- Inherits with-scopes from the parent.  The C slot array and count
+-- are pre-built by the caller via 'buildCSlots'.
+envFromSlots :: Ptr CThunkPtr -> Int -> Env -> Env
+envFromSlots slotsPtr slotCount parent =
   Env
-    { envSlots = slots,
+    { envSlots = slotsPtr,
+      envSlotCount = slotCount,
       envLazyScope = Nothing,
       envParent = Just parent,
       envWithScopes = envWithScopes parent
@@ -671,29 +683,29 @@ withScopesForCapture env =
     Just rootScope -> envWithScopes env ++ [rootScope]
     Nothing -> envWithScopes env
 
--- | Create an unevaluated thunk with a fresh memoization cell.
+-- | Create an unevaluated thunk with a fresh C arena-allocated cell.
 --
--- Each thunk gets its own 'IORef ThunkCell'.  On first force the
--- cell is overwritten from @Pending@ to @Computed@, dropping the
--- Expr and Env.  The cell is allocated via @newMemoCell@ which uses
--- 'unsafePerformIO' — safe because 'newIORef' is a pure allocation,
--- and the @NOINLINE@ + @seq@ pattern prevents GHC from floating the
--- allocation to a shared top-level CAF.
+-- Each thunk gets its own @nn_thunk_t@ in the C arena.  On first
+-- force the cell transitions PENDING -> BLACKHOLE -> COMPUTED, dropping
+-- the Expr and Env.  The cell is allocated via 'unsafePerformIO' —
+-- safe because C allocation is a pure side effect, and the @NOINLINE@
+-- + @seq@ pattern prevents GHC from floating the allocation to a
+-- shared top-level CAF.
 mkThunk :: Env -> Expr -> Thunk
 mkThunk env thunkExpr =
-  ThunkRef (newMemoCell thunkExpr env)
+  CThunkRef (newThunkPtr thunkExpr env)
 
 -- | Like 'mkThunk' but for synthetic thunks that reuse the same 'Expr'
 -- (e.g. @EApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in 'deferApply').
 -- Uses the 'Env' slots list for cell uniqueness instead of the expression,
 -- since GHC's full-laziness transform would otherwise float the shared
--- expr to a CAF and all thunks would get the same IORef.
+-- expr to a CAF and all thunks would get the same cell.
 --
 -- Must only be called with freshly-constructed envs (not knot-tied
 -- recursive envs), since it forces the slots list to WHNF.
 mkSyntheticThunk :: Env -> Expr -> Thunk
 mkSyntheticThunk env thunkExpr =
-  ThunkRef (newSyntheticCell (envSlots env) thunkExpr env)
+  CThunkRef (newSyntheticThunkPtr (envSlots env) thunkExpr env)
 
 -- | Like 'mkThunk' but avoids IORef allocation for trivial expressions.
 -- Resolved variables reuse the existing thunk from the env (no wrapper).
@@ -707,18 +719,22 @@ cheapThunk _ (ELit (NixBool b)) = Evaluated (VBool b)
 cheapThunk _ (ELit NixNull) = Evaluated VNull
 cheapThunk env (ELambda formals body NoCaptureInfo) = Evaluated (VLambda env formals body)
 cheapThunk env (ELambda formals body (Captures captureList)) =
-  let trimmedEnv =
+  let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
+      trimmedEnv =
         Env
-          { envSlots = smallArrayFromListN (length captureList) [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
+          { envSlots = slotsPtr,
+            envSlotCount = slotCount,
             envLazyScope = Nothing,
             envParent = Nothing,
             envWithScopes = []
           }
    in Evaluated (VLambda trimmedEnv formals body)
 cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
-  let trimmedEnv =
+  let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
+      trimmedEnv =
         Env
-          { envSlots = smallArrayFromListN (length captureList) [envLookupResolved lvl idx env | (lvl, idx) <- captureList],
+          { envSlots = slotsPtr,
+            envSlotCount = slotCount,
             envLazyScope = Nothing,
             envParent = Nothing,
             envWithScopes = withScopesForCapture env
@@ -726,37 +742,129 @@ cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
    in Evaluated (VLambda trimmedEnv formals body)
 cheapThunk env expr = mkThunk env expr
 
--- | Allocate a fresh memoization cell for a thunk.
+-- | Allocate a fresh C arena thunk cell.
 --
 -- @NOINLINE@ prevents inlining so GHC can't see inside or CSE calls.
 -- @seq@ on the expr creates a data dependency that prevents float-out
 -- to a top-level CAF — without this, GHC would hoist the
--- @unsafePerformIO (newIORef ...)@ and share ONE cell across ALL thunks.
+-- @unsafePerformIO@ and share ONE cell across ALL thunks.
 --
--- The cell starts as @Pending expr env@, putting both references inside
--- the IORef.  On force, it's overwritten to @Computed val@, dropping
--- the Expr and Env so they become unreachable.
-{-# NOINLINE newMemoCell #-}
-newMemoCell :: Expr -> Env -> IORef ThunkCell
-newMemoCell expr env = unsafePerformIO (expr `seq` newIORef (Pending expr env))
+-- Creates a StablePtr to the (Expr, Env) pair.  The Expr is strict
+-- (forced by seq), the Env is LAZY (for knot-tying in rec {}).
+-- On force, the pending StablePtr is freed and replaced with a
+-- computed StablePtr to the result NixValue.
+{-# NOINLINE newThunkPtr #-}
+newThunkPtr :: Expr -> Env -> CThunkPtr
+newThunkPtr expr env =
+  unsafePerformIO $ expr `seq` do
+    sp <- newStablePtr (expr, env)
+    cthunkNew (castStablePtrToPtr sp)
 
--- | Like 'newMemoCell' but keyed on a SmallArray instead of an expression.
--- Used by 'mkSyntheticThunk' where multiple thunks share the same expression.
-{-# NOINLINE newSyntheticCell #-}
-newSyntheticCell :: SmallArray Thunk -> Expr -> Env -> IORef ThunkCell
-newSyntheticCell slots expr env = unsafePerformIO (slots `seq` newIORef (Pending expr env))
+-- | Like 'newThunkPtr' but keyed on the env's slot array pointer instead
+-- of the expression.  Used by 'mkSyntheticThunk' where multiple thunks
+-- share the same expression (e.g. 'deferApplyExpr').
+{-# NOINLINE newSyntheticThunkPtr #-}
+newSyntheticThunkPtr :: Ptr CThunkPtr -> Expr -> Env -> CThunkPtr
+newSyntheticThunkPtr slotsKey expr env =
+  unsafePerformIO $ slotsKey `seq` do
+    sp <- newStablePtr (expr, env)
+    cthunkNew (castStablePtrToPtr sp)
 
 -- | Wrap an already-computed value as a thunk.
 evaluated :: NixValue -> Thunk
 evaluated = Evaluated
 
--- | Check if two thunks share the same memoization cell (IORef pointer
+-- | Check if two thunks share the same memoization cell (C pointer
 -- equality).  When true, both thunks will always produce the same value,
 -- so deep equality can short-circuit to 'True' without forcing.
 -- Matching real Nix which uses pointer identity for same-thunk comparison.
 thunkSameRef :: Thunk -> Thunk -> Bool
-thunkSameRef (ThunkRef ref1) (ThunkRef ref2) = ref1 == ref2
+thunkSameRef (CThunkRef p1) (CThunkRef p2) = p1 == p2
 thunkSameRef _ _ = False
+
+-- | Convert a 'Thunk' to a 'CThunkPtr' for storage in a C env slot array.
+-- 'CThunkRef' thunks are already C pointers (zero-cost extraction).
+-- 'Evaluated' scalars (int/float/bool/null) use inline C thunks (no StablePtr).
+-- 'Evaluated' complex values use StablePtr-backed C thunks.
+thunkToCPtr :: Thunk -> CThunkPtr
+thunkToCPtr (CThunkRef ptr) = ptr
+thunkToCPtr (Evaluated (VInt n)) = newComputedIntPtr (fromIntegral n)
+thunkToCPtr (Evaluated (VFloat d)) = newComputedFloatPtr d
+thunkToCPtr (Evaluated (VBool b)) = newComputedBoolPtr (if b then 1 else 0)
+thunkToCPtr (Evaluated VNull) = newComputedNullPtr
+thunkToCPtr (Evaluated val) = newComputedThunkPtr val
+
+-- | Wrap an already-computed 'NixValue' in a C thunk (StablePtr path).
+-- Arena-allocated (O(1)).  Used for complex values (string, list, attrs, etc.).
+{-# NOINLINE newComputedThunkPtr #-}
+newComputedThunkPtr :: NixValue -> CThunkPtr
+newComputedThunkPtr val =
+  unsafePerformIO $ val `seq` do
+    sp <- newStablePtr val
+    cthunkNewComputed (castStablePtrToPtr sp)
+
+-- | Wrap an int64 in a pre-computed C thunk (inline, no StablePtr).
+{-# NOINLINE newComputedIntPtr #-}
+newComputedIntPtr :: Int64 -> CThunkPtr
+newComputedIntPtr n = unsafePerformIO (cthunkNewComputedInt n)
+
+-- | Wrap a double in a pre-computed C thunk (inline, no StablePtr).
+{-# NOINLINE newComputedFloatPtr #-}
+newComputedFloatPtr :: Double -> CThunkPtr
+newComputedFloatPtr d = unsafePerformIO (cthunkNewComputedFloat d)
+
+-- | Wrap a bool in a pre-computed C thunk (inline, no StablePtr).
+{-# NOINLINE newComputedBoolPtr #-}
+newComputedBoolPtr :: Word8 -> CThunkPtr
+newComputedBoolPtr b = unsafePerformIO (cthunkNewComputedBool b)
+
+-- | Wrap null in a pre-computed C thunk (inline, no StablePtr).
+{-# NOINLINE newComputedNullPtr #-}
+newComputedNullPtr :: CThunkPtr
+newComputedNullPtr = unsafePerformIO cthunkNewComputedNull
+
+-- | Build a C-allocated slot array from a list of 'Thunk' values.
+-- Each thunk is converted to 'CThunkPtr' via 'thunkToCPtr'.
+-- Returns the C array pointer and the slot count.
+-- Uses 'unsafePerformIO' — safe because allocation is idempotent.
+{-# NOINLINE buildCSlots #-}
+buildCSlots :: [Thunk] -> (Ptr CThunkPtr, Int)
+buildCSlots thunks = unsafePerformIO $ do
+  let n = length thunks
+  if n == 0
+    then pure (nullPtr, 0)
+    else do
+      arr <- cenvAllocSlots (fromIntegral n)
+      pokeSlots arr 0 thunks
+      pure (arr, n)
+  where
+    pokeSlots _ _ [] = pure ()
+    pokeSlots arr i (t : ts) = do
+      pokeElemOff arr i (thunkToCPtr t)
+      pokeSlots arr (i + 1) ts
+
+-- | Allocate a C slot array of the given size WITHOUT filling it.
+-- Returns 'nullPtr' for size 0.  Used by knot-tying sites (rec {},
+-- let) where the Env must reference the slot pointer before the
+-- thunks are materialized.  Caller MUST fill all slots via 'fillCSlots'
+-- before any slot is read (e.g. before forcing any thunk).
+{-# NOINLINE allocCSlots #-}
+allocCSlots :: Int -> Ptr CThunkPtr
+allocCSlots 0 = nullPtr
+allocCSlots n = unsafePerformIO (cenvAllocSlots (fromIntegral n))
+
+-- | Fill a pre-allocated C slot array with thunks.  Each thunk is
+-- converted to 'CThunkPtr' via 'thunkToCPtr' and poked at its index.
+-- The list length MUST equal the allocated array size.
+-- Used after 'allocCSlots' in knot-tying contexts.
+{-# NOINLINE fillCSlots #-}
+fillCSlots :: Ptr CThunkPtr -> [Thunk] -> ()
+fillCSlots arr thunks = unsafePerformIO (go 0 thunks)
+  where
+    go _ [] = pure ()
+    go !i (t : ts) = do
+      pokeElemOff arr i (thunkToCPtr t)
+      go (i + 1) ts
 
 -- | Human-readable type name for error messages.
 typeName :: NixValue -> Text
@@ -862,9 +970,24 @@ instance MonadEval PureEval where
   traceMessage _ = pure ()
   resolvePathLiteral = pure
   forceThunk _ (Evaluated val) = pure val
-  forceThunk evalFn (ThunkRef ref) =
-    -- Read the cell via unsafePerformIO — safe because readIORef has no
-    -- side effects and PureEval never writes back (no memoization).
-    case unsafePerformIO (readIORef ref) of
-      Computed val -> pure val
-      Pending expr env -> evalFn env expr
+  forceThunk evalFn (CThunkRef ptr) =
+    -- Read the C thunk via unsafePerformIO — safe because reads are
+    -- idempotent and PureEval never writes back (no memoization).
+    -- Does NOT mark blackholes — PureEval may re-force the same thunk.
+    -- Dispatches on val_tag for computed scalars (no StablePtr deref).
+    case unsafePerformIO (cthunkState ptr) of
+      1 {- COMPUTED -} ->
+        let tag = unsafePerformIO (cthunkValueTag ptr)
+         in case tag of
+              0 {- INT -} -> pure (VInt (fromIntegral (unsafePerformIO (cthunkGetInt ptr))))
+              1 {- FLOAT -} -> pure (VFloat (unsafePerformIO (cthunkGetFloat ptr)))
+              2 {- BOOL -} -> pure (VBool (unsafePerformIO (cthunkGetBool ptr) /= 0))
+              3 {- NULL -} -> pure VNull
+              _ {- PTR -} ->
+                let payload = unsafePerformIO (cthunkPayload ptr)
+                    val = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))
+                 in pure val
+      _ {- PENDING or BLACKHOLE -} ->
+        let payload = unsafePerformIO (cthunkPayload ptr)
+            (expr, env) = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))
+         in evalFn env expr

@@ -1,0 +1,263 @@
+-- | C-backed thunk memoization cells via FFI.
+--
+-- Wraps @cbits/nn_thunk.c@ — an arena-allocated mutable cell that
+-- holds either a pending expression (StablePtr to (Expr, Env)) or a
+-- computed value (StablePtr to NixValue).  Replaces Haskell's
+-- @IORef ThunkCell@ (~56 bytes on GHC heap, all GC-traced) with a
+-- 16-byte C struct in an arena (invisible to GHC GC).
+--
+-- Includes blackhole detection: a thunk being forced is marked
+-- BLACKHOLE; if forced again before completion, infinite recursion
+-- is detected (matching C++ Nix behavior).
+--
+-- @
+-- cthunkInit 0
+-- ptr <- cthunkNew pendingStablePtr
+-- cthunkState ptr  -- 0 (PENDING)
+-- cthunkMarkBlackhole ptr  -- 1 (success)
+-- cthunkSetComputed ptr valueStablePtr  -- returns old pending ptr
+-- cthunkState ptr  -- 1 (COMPUTED)
+-- cthunkDestroy
+-- @
+module Nix.Eval.CThunk
+  ( -- * Opaque handle
+    NnThunk,
+    CThunkPtr,
+
+    -- * Lifecycle
+    cthunkInit,
+    cthunkDestroy,
+
+    -- * Allocation
+    cthunkNew,
+    cthunkNewComputed,
+    cthunkNewComputedInt,
+    cthunkNewComputedFloat,
+    cthunkNewComputedBool,
+    cthunkNewComputedNull,
+
+    -- * State queries
+    cthunkState,
+    cthunkPayload,
+    cthunkValueTag,
+    cthunkGetInt,
+    cthunkGetFloat,
+    cthunkGetBool,
+
+    -- * State transitions
+    cthunkMarkBlackhole,
+    cthunkSetComputed,
+    cthunkSetComputedInt,
+    cthunkSetComputedFloat,
+    cthunkSetComputedBool,
+    cthunkSetComputedNull,
+
+    -- * Arena diagnostics / cleanup
+    cthunkCount,
+    cthunkGet,
+  )
+where
+
+import Data.Int (Int64)
+import Data.Word (Word32, Word8)
+import Foreign.C.Types (CDouble (..))
+import Foreign.Ptr (Ptr, nullPtr)
+
+-- | Phantom type for C-side @nn_thunk_t@.
+data NnThunk
+
+-- | Pointer to a C-allocated thunk (lives in arena).
+type CThunkPtr = Ptr NnThunk
+
+-- ---------------------------------------------------------------------------
+-- FFI imports (all unsafe — no callbacks, fast data access)
+-- ---------------------------------------------------------------------------
+
+foreign import ccall unsafe "nn_thunk_init"
+  c_nn_thunk_init :: Word32 -> IO ()
+
+foreign import ccall unsafe "nn_thunk_destroy"
+  c_nn_thunk_destroy :: IO ()
+
+foreign import ccall unsafe "nn_thunk_new"
+  c_nn_thunk_new :: Ptr () -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_computed"
+  c_nn_thunk_new_computed :: Ptr () -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_computed_int"
+  c_nn_thunk_new_computed_int :: Int64 -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_computed_float"
+  c_nn_thunk_new_computed_float :: CDouble -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_computed_bool"
+  c_nn_thunk_new_computed_bool :: Word8 -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_computed_null"
+  c_nn_thunk_new_computed_null :: IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_state"
+  c_nn_thunk_state :: CThunkPtr -> IO Word8
+
+foreign import ccall unsafe "nn_thunk_payload"
+  c_nn_thunk_payload :: CThunkPtr -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_value_tag"
+  c_nn_thunk_value_tag :: CThunkPtr -> IO Word8
+
+foreign import ccall unsafe "nn_thunk_get_int"
+  c_nn_thunk_get_int :: CThunkPtr -> IO Int64
+
+foreign import ccall unsafe "nn_thunk_get_float"
+  c_nn_thunk_get_float :: CThunkPtr -> IO CDouble
+
+foreign import ccall unsafe "nn_thunk_get_bool"
+  c_nn_thunk_get_bool :: CThunkPtr -> IO Word8
+
+foreign import ccall unsafe "nn_thunk_mark_blackhole"
+  c_nn_thunk_mark_blackhole :: CThunkPtr -> IO Int
+
+foreign import ccall unsafe "nn_thunk_set_computed"
+  c_nn_thunk_set_computed :: CThunkPtr -> Ptr () -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_int"
+  c_nn_thunk_set_computed_int :: CThunkPtr -> Int64 -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_float"
+  c_nn_thunk_set_computed_float :: CThunkPtr -> CDouble -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_bool"
+  c_nn_thunk_set_computed_bool :: CThunkPtr -> Word8 -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_null"
+  c_nn_thunk_set_computed_null :: CThunkPtr -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_count"
+  c_nn_thunk_count :: IO Word32
+
+foreign import ccall unsafe "nn_thunk_get"
+  c_nn_thunk_get :: Word32 -> IO CThunkPtr
+
+-- ---------------------------------------------------------------------------
+-- Lifecycle
+-- ---------------------------------------------------------------------------
+
+-- | Initialize the global thunk arena.  Call once before evaluation.
+-- @capacity@ is a hint for thunks per block (0 uses default: 65536).
+cthunkInit :: Word32 -> IO ()
+cthunkInit = c_nn_thunk_init
+
+-- | Destroy the global thunk arena, freeing all C-side memory.
+-- Caller must free all payload StablePtrs first.
+-- All 'CThunkPtr' values become invalid after this call.
+cthunkDestroy :: IO ()
+cthunkDestroy = c_nn_thunk_destroy
+
+-- ---------------------------------------------------------------------------
+-- Allocation
+-- ---------------------------------------------------------------------------
+
+-- | Allocate a new PENDING thunk from the arena.  O(1) amortized.
+-- The payload is an opaque pointer (StablePtr cast to Ptr ()).
+cthunkNew :: Ptr () -> IO CThunkPtr
+cthunkNew = c_nn_thunk_new
+
+-- | Allocate a new pre-COMPUTED thunk with StablePtr payload (complex types).
+cthunkNewComputed :: Ptr () -> IO CThunkPtr
+cthunkNewComputed = c_nn_thunk_new_computed
+
+-- | Allocate a pre-COMPUTED thunk with an inline int64 (no StablePtr).
+cthunkNewComputedInt :: Int64 -> IO CThunkPtr
+cthunkNewComputedInt = c_nn_thunk_new_computed_int
+
+-- | Allocate a pre-COMPUTED thunk with an inline double (no StablePtr).
+cthunkNewComputedFloat :: Double -> IO CThunkPtr
+cthunkNewComputedFloat d = c_nn_thunk_new_computed_float (CDouble d)
+
+-- | Allocate a pre-COMPUTED thunk with an inline bool (no StablePtr).
+cthunkNewComputedBool :: Word8 -> IO CThunkPtr
+cthunkNewComputedBool = c_nn_thunk_new_computed_bool
+
+-- | Allocate a pre-COMPUTED thunk with null value (no StablePtr).
+cthunkNewComputedNull :: IO CThunkPtr
+cthunkNewComputedNull = c_nn_thunk_new_computed_null
+
+-- ---------------------------------------------------------------------------
+-- State queries
+-- ---------------------------------------------------------------------------
+
+-- | Read the current state: 0 = PENDING, 1 = COMPUTED, 2 = BLACKHOLE.
+cthunkState :: CThunkPtr -> IO Word8
+cthunkState = c_nn_thunk_state
+
+-- | Read the payload pointer.  Returns 'nullPtr' for NULL payloads.
+cthunkPayload :: CThunkPtr -> IO (Ptr ())
+cthunkPayload ptr = do
+  p <- c_nn_thunk_payload ptr
+  pure (if p == nullPtr then nullPtr else p)
+
+-- | Read the value tag (valid when state == COMPUTED).
+-- 0=INT, 1=FLOAT, 2=BOOL, 3=NULL, 255=PTR (StablePtr).
+cthunkValueTag :: CThunkPtr -> IO Word8
+cthunkValueTag = c_nn_thunk_value_tag
+
+-- | Read an inline int64 from a COMPUTED thunk (val_tag == 0).
+cthunkGetInt :: CThunkPtr -> IO Int64
+cthunkGetInt = c_nn_thunk_get_int
+
+-- | Read an inline double from a COMPUTED thunk (val_tag == 1).
+cthunkGetFloat :: CThunkPtr -> IO Double
+cthunkGetFloat ptr = do
+  CDouble d <- c_nn_thunk_get_float ptr
+  pure d
+
+-- | Read an inline bool from a COMPUTED thunk (val_tag == 2).
+cthunkGetBool :: CThunkPtr -> IO Word8
+cthunkGetBool = c_nn_thunk_get_bool
+
+-- ---------------------------------------------------------------------------
+-- State transitions
+-- ---------------------------------------------------------------------------
+
+-- | Mark a PENDING thunk as BLACKHOLE (being evaluated).
+-- Returns 'True' on success, 'False' if not PENDING.
+cthunkMarkBlackhole :: CThunkPtr -> IO Bool
+cthunkMarkBlackhole ptr = do
+  result <- c_nn_thunk_mark_blackhole ptr
+  pure (result /= 0)
+
+-- | Set a BLACKHOLE thunk to COMPUTED with a StablePtr value (complex types).
+-- Returns the old payload (pending StablePtr to free), or 'nullPtr'
+-- if the thunk was not in BLACKHOLE state.
+cthunkSetComputed :: CThunkPtr -> Ptr () -> IO (Ptr ())
+cthunkSetComputed = c_nn_thunk_set_computed
+
+-- | Set a BLACKHOLE thunk to COMPUTED with an inline int64 (no StablePtr).
+cthunkSetComputedInt :: CThunkPtr -> Int64 -> IO (Ptr ())
+cthunkSetComputedInt = c_nn_thunk_set_computed_int
+
+-- | Set a BLACKHOLE thunk to COMPUTED with an inline double (no StablePtr).
+cthunkSetComputedFloat :: CThunkPtr -> Double -> IO (Ptr ())
+cthunkSetComputedFloat ptr d = c_nn_thunk_set_computed_float ptr (CDouble d)
+
+-- | Set a BLACKHOLE thunk to COMPUTED with an inline bool (no StablePtr).
+cthunkSetComputedBool :: CThunkPtr -> Word8 -> IO (Ptr ())
+cthunkSetComputedBool = c_nn_thunk_set_computed_bool
+
+-- | Set a BLACKHOLE thunk to COMPUTED with null value (no StablePtr).
+cthunkSetComputedNull :: CThunkPtr -> IO (Ptr ())
+cthunkSetComputedNull = c_nn_thunk_set_computed_null
+
+-- ---------------------------------------------------------------------------
+-- Arena diagnostics / cleanup
+-- ---------------------------------------------------------------------------
+
+-- | Total thunks allocated in the arena.
+cthunkCount :: IO Word32
+cthunkCount = c_nn_thunk_count
+
+-- | Get a thunk by global index (for cleanup iteration).
+-- Returns 'nullPtr' if index is out of range.
+cthunkGet :: Word32 -> IO CThunkPtr
+cthunkGet = c_nn_thunk_get

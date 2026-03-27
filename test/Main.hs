@@ -7,22 +7,24 @@ import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
-import Data.Primitive.SmallArray (sizeofSmallArray)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import Foreign.StablePtr (deRefStablePtr, freeStablePtr, newStablePtr)
+import Foreign.Ptr (nullPtr)
+import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
 import Nix.Eval (Env (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, mkStr, runPureEval)
 import Nix.Eval.CAttrSet (cattrsetFree, cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
+import Nix.Eval.Arena (arenaDestroy, arenaInit)
+import Nix.Eval.CThunk (cthunkCount, cthunkGet, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
-import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolDestroy, symbolInit, symbolIntern, symbolLen, symbolText)
+import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
 import Nix.Expr.Types
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
@@ -219,7 +221,7 @@ testEvalLiterals = do
   putStrLn "eval/literals"
   sequence
     [ runTest "empty env" $
-        assertEqual "emptyEnv" 0 (sizeofSmallArray (envSlots emptyEnv)),
+        assertEqual "emptyEnv" 0 (envSlotCount emptyEnv),
       runTest "int" $
         assertEval "int" "42" (VInt 42),
       runTest "float" $
@@ -3296,8 +3298,8 @@ testPhase4IO = do
 testSymbol :: IO [Bool]
 testSymbol = do
   putStrLn "symbol"
-  bracket_ (symbolInit 0) symbolDestroy $ do
-    sequence
+  -- Symbol table is initialized by arenaInit in main bracket.
+  sequence
       [ runTestM "intern returns non-zero" $ do
           sym <- symbolIntern "hello"
           pure (if unSymbol sym /= 0 then Pass else Fail "got symbol 0"),
@@ -3343,8 +3345,8 @@ testSymbol = do
 testCAttrSet :: IO [Bool]
 testCAttrSet = do
   putStrLn "cattrset"
-  bracket_ (symbolInit 0) symbolDestroy $ do
-    sequence
+  -- Symbol table is initialized by arenaInit in main bracket.
+  sequence
       [ runTestM "new/free" $ do
           set <- cattrsetNew 16
           cattrsetFree set
@@ -3486,11 +3488,138 @@ testCAttrSet = do
       ]
 
 -- ---------------------------------------------------------------------------
+-- C thunk arena (FFI)
+-- ---------------------------------------------------------------------------
+
+testCThunk :: IO [Bool]
+testCThunk = do
+  putStrLn "cthunk"
+  -- Arena is already initialized by main's bracket.
+  -- Each test uses the shared arena (thunks accumulate — that's fine).
+  sequence
+    [ runTestM "new pending + state" $ do
+        sp <- newStablePtr ("pending" :: Text)
+        ptr <- cthunkNew (castStablePtrToPtr sp)
+        state <- cthunkState ptr
+        pure (assertEqual "state" 0 state),
+      runTestM "new computed + state" $ do
+        sp <- newStablePtr ("computed" :: Text)
+        ptr <- cthunkNewComputed (castStablePtrToPtr sp)
+        state <- cthunkState ptr
+        pure (assertEqual "state" 1 state),
+      runTestM "payload round-trips (pending)" $ do
+        sp <- newStablePtr ("hello" :: Text)
+        ptr <- cthunkNew (castStablePtrToPtr sp)
+        payload <- cthunkPayload ptr
+        val <- deRefStablePtr (castPtrToStablePtr payload) :: IO Text
+        pure (assertEqual "payload" "hello" val),
+      runTestM "payload round-trips (computed)" $ do
+        sp <- newStablePtr (42 :: Int)
+        ptr <- cthunkNewComputed (castStablePtrToPtr sp)
+        payload <- cthunkPayload ptr
+        val <- deRefStablePtr (castPtrToStablePtr payload) :: IO Int
+        pure (assertEqual "payload" 42 val),
+      runTestM "mark_blackhole succeeds on pending" $ do
+        sp <- newStablePtr ("x" :: Text)
+        ptr <- cthunkNew (castStablePtrToPtr sp)
+        ok <- cthunkMarkBlackhole ptr
+        state <- cthunkState ptr
+        pure
+          ( if ok && state == 2
+              then Pass
+              else Fail ("ok=" <> T.pack (show ok) <> " state=" <> T.pack (show state))
+          ),
+      runTestM "mark_blackhole fails on computed" $ do
+        sp <- newStablePtr ("x" :: Text)
+        ptr <- cthunkNewComputed (castStablePtrToPtr sp)
+        ok <- cthunkMarkBlackhole ptr
+        pure (if not ok then Pass else Fail "should have failed"),
+      runTestM "mark_blackhole fails on blackhole" $ do
+        sp <- newStablePtr ("x" :: Text)
+        ptr <- cthunkNew (castStablePtrToPtr sp)
+        _ <- cthunkMarkBlackhole ptr
+        ok <- cthunkMarkBlackhole ptr
+        pure (if not ok then Pass else Fail "should have failed"),
+      runTestM "set_computed returns old payload" $ do
+        pendingSp <- newStablePtr ("old" :: Text)
+        ptr <- cthunkNew (castStablePtrToPtr pendingSp)
+        _ <- cthunkMarkBlackhole ptr
+        computedSp <- newStablePtr ("new" :: Text)
+        oldPayload <- cthunkSetComputed ptr (castStablePtrToPtr computedSp)
+        oldVal <- deRefStablePtr (castPtrToStablePtr oldPayload) :: IO Text
+        state <- cthunkState ptr
+        newPayload <- cthunkPayload ptr
+        newVal <- deRefStablePtr (castPtrToStablePtr newPayload) :: IO Text
+        freeStablePtr pendingSp
+        pure
+          ( if oldVal == "old" && newVal == "new" && state == 1
+              then Pass
+              else
+                Fail
+                  ( "old="
+                      <> oldVal
+                      <> " new="
+                      <> newVal
+                      <> " state="
+                      <> T.pack (show state)
+                  )
+          ),
+      runTestM "set_computed fails on pending" $ do
+        sp <- newStablePtr ("x" :: Text)
+        ptr <- cthunkNew (castStablePtrToPtr sp)
+        valSp <- newStablePtr ("v" :: Text)
+        oldPayload <- cthunkSetComputed ptr (castStablePtrToPtr valSp)
+        freeStablePtr valSp
+        pure (if oldPayload == nullPtr then Pass else Fail "should have returned NULL"),
+      runTestM "count tracks allocations" $ do
+        countBefore <- cthunkCount
+        sp <- newStablePtr (0 :: Int)
+        _ <- cthunkNew (castStablePtrToPtr sp)
+        _ <- cthunkNew (castStablePtrToPtr sp)
+        _ <- cthunkNewComputed (castStablePtrToPtr sp)
+        countAfter <- cthunkCount
+        let delta = countAfter - countBefore
+        pure (assertEqual "delta" 3 delta),
+      runTestM "get retrieves by index" $ do
+        countBefore <- cthunkCount
+        sp <- newStablePtr ("indexed" :: Text)
+        ptr <- cthunkNew (castStablePtrToPtr sp)
+        retrieved <- cthunkGet countBefore
+        stateOrig <- cthunkState ptr
+        stateRetrieved <- cthunkState retrieved
+        pure
+          ( if ptr == retrieved && stateOrig == stateRetrieved
+              then Pass
+              else Fail "get returned wrong pointer"
+          ),
+      runTestM "stress: 100k thunks" $ do
+        countBefore <- cthunkCount
+        sp <- newStablePtr (0 :: Int)
+        mapM_ (\_ -> cthunkNew (castStablePtrToPtr sp)) [(1 :: Int) .. 100000]
+        countAfter <- cthunkCount
+        let delta = countAfter - countBefore
+        -- Spot-check: retrieve one from the middle
+        midPtr <- cthunkGet (countBefore + 50000)
+        midState <- cthunkState midPtr
+        pure
+          ( if delta == 100000 && midState == 0
+              then Pass
+              else
+                Fail
+                  ( "delta="
+                      <> T.pack (show delta)
+                      <> " midState="
+                      <> T.pack (show midState)
+                  )
+          )
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
 
 main :: IO ()
-main = do
+main = bracket_ arenaInit arenaDestroy $ do
   hSetBuffering stdout LineBuffering
   putStrLn "nova-nix test suite"
   putStrLn "==================="
@@ -3556,7 +3685,8 @@ main = do
           testPhase4,
           testPhase4IO,
           testSymbol,
-          testCAttrSet
+          testCAttrSet,
+          testCThunk
         ]
   let total = length results
       passed = length (filter id results)

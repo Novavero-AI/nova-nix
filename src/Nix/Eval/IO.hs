@@ -31,7 +31,7 @@ import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
 import qualified Data.ByteString as BS
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -39,9 +39,12 @@ import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import qualified Data.Text.IO as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Foreign.Ptr (Ptr, nullPtr)
+import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
-import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..), ThunkCell (..), attrSetSize)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkMarkBlackhole, cthunkPayload, cthunkSetComputed, cthunkSetComputedBool, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
+import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..), attrSetSize)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix, readFileAutoEncoding)
@@ -265,18 +268,59 @@ instance MonadEval EvalIO where
       else pure path
 
   forceThunk _ (Evaluated val) = pure val
-  forceThunk evalFn (ThunkRef ref) = do
-    -- Per-thunk IORef memoization.  On first force, overwrites
-    -- Pending with Computed — dropping the Expr and Env so they
-    -- become unreachable and are GC'd.  Matches C++ Nix which
-    -- mutates Value structs in place.
-    cell <- EvalIO (liftIO (readIORef ref))
-    case cell of
-      Computed val -> pure val
-      Pending expr env -> do
+  forceThunk evalFn (CThunkRef ptr) = do
+    -- Two-step force protocol via C arena thunk.
+    -- PENDING -> BLACKHOLE -> COMPUTED, with infinite recursion
+    -- detection (BLACKHOLE hit during force = cycle).
+    -- Scalar values (int/float/bool/null) are stored inline in the
+    -- thunk payload (no StablePtr), dispatched via val_tag.
+    state <- EvalIO (liftIO (cthunkState ptr))
+    case state of
+      0 {- PENDING -} -> do
+        payloadPtr <- EvalIO (liftIO (cthunkPayload ptr))
+        let pendingSp = castPtrToStablePtr payloadPtr
+        (expr, env) <- EvalIO (liftIO (deRefStablePtr pendingSp))
+        ok <- EvalIO (liftIO (cthunkMarkBlackhole ptr))
+        unless ok $ throwEvalError "infinite recursion encountered"
         val <- evalFn env expr
-        EvalIO (liftIO (writeIORef ref (Computed val)))
+        -- Store computed value: scalars inline, complex via StablePtr
+        oldPayload <- EvalIO (liftIO (storeComputed ptr val))
+        -- Free the old pending StablePtr (Expr, Env) — they're unreachable now
+        when (oldPayload /= nullPtr) $
+          EvalIO (liftIO (freeStablePtr (castPtrToStablePtr oldPayload)))
         pure val
+      1 {- COMPUTED -} ->
+        -- Read computed value: dispatch on val_tag
+        EvalIO (liftIO (readComputed ptr))
+      _ {- BLACKHOLE -} ->
+        throwEvalError "infinite recursion encountered"
+
+-- | Store a computed NixValue in a C thunk.
+-- Scalars (int, float, bool, null) are stored inline (no StablePtr).
+-- Complex values use StablePtr.  Returns old payload for cleanup.
+storeComputed :: CThunkPtr -> NixValue -> IO (Ptr ())
+storeComputed ptr val = case val of
+  VInt n -> cthunkSetComputedInt ptr (fromIntegral n)
+  VFloat d -> cthunkSetComputedFloat ptr d
+  VBool b -> cthunkSetComputedBool ptr (if b then 1 else 0)
+  VNull -> cthunkSetComputedNull ptr
+  _ -> do
+    valSp <- newStablePtr val
+    cthunkSetComputed ptr (castStablePtrToPtr valSp)
+
+-- | Read a computed NixValue from a C thunk.
+-- Dispatches on val_tag: scalars are read inline, complex via StablePtr.
+readComputed :: CThunkPtr -> IO NixValue
+readComputed ptr = do
+  tag <- cthunkValueTag ptr
+  case tag of
+    0 {- INT -} -> VInt . fromIntegral <$> cthunkGetInt ptr
+    1 {- FLOAT -} -> VFloat <$> cthunkGetFloat ptr
+    2 {- BOOL -} -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
+    3 {- NULL -} -> pure VNull
+    _ {- PTR -} -> do
+      payloadPtr <- cthunkPayload ptr
+      deRefStablePtr (castPtrToStablePtr payloadPtr)
 
 -- ---------------------------------------------------------------------------
 -- Constants

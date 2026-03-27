@@ -18,6 +18,7 @@ where
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, builtinNames, currentSystemStr, evaluated)
 import Nix.Eval.Types (mkStr)
 import Nix.Store.Path (platformStoreDirText)
@@ -36,7 +37,8 @@ import Nix.Store.Path (platformStoreDirText)
 builtinEnv :: Integer -> [Thunk] -> Env
 builtinEnv timestamp searchPaths =
   Env
-    { envSlots = mempty,
+    { envSlots = nullPtr,
+      envSlotCount = 0,
       envLazyScope =
         Just $
           attrSetFromMap $
@@ -85,7 +87,7 @@ builtinEnvWithScope :: Integer -> [Thunk] -> [(Text, Thunk)] -> Env
 builtinEnvWithScope timestamp searchPaths scope =
   let base = builtinEnv timestamp searchPaths
       scopeMap = Map.fromList scope
-   in Env {envSlots = mempty, envLazyScope = Just (attrSetFromMap scopeMap), envParent = Just base, envWithScopes = []}
+   in Env {envSlots = nullPtr, envSlotCount = 0, envLazyScope = Just (attrSetFromMap scopeMap), envParent = Just base, envWithScopes = []}
 
 -- | The @builtins@ attribute set, derived from the central registry.
 builtinsAttrSet :: Integer -> [Thunk] -> NixValue
