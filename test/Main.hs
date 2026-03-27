@@ -6,9 +6,9 @@ import Control.Exception (bracket_)
 import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import Data.Primitive.SmallArray (sizeofSmallArray)
 import qualified Data.Set as Set
-import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
