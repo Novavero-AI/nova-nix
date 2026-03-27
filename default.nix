@@ -1,4 +1,7 @@
-{ pkgs ? import <nixpkgs> {} }:
+{
+  pkgs ? import (builtins.fetchTarball
+    "https://github.com/NixOS/nixpkgs/archive/nixos-24.11.tar.gz") {}
+}:
 
 let
   nova-cache-src = builtins.fetchGit {
