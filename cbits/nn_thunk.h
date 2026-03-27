@@ -116,18 +116,20 @@ uint8_t nn_thunk_get_bool(const nn_thunk_t *thunk);
  * Returns 1 on success, 0 if thunk is not PENDING. */
 int nn_thunk_mark_blackhole(nn_thunk_t *thunk);
 
-/* Transition BLACKHOLE -> COMPUTED with a StablePtr value (NN_VALUE_PTR).
+/* Set a non-COMPUTED thunk to COMPUTED with a StablePtr value (NN_VALUE_PTR).
+ * Accepts PENDING or BLACKHOLE state (skips blackhole for direct memoization).
  * Returns the old payload (pending StablePtr for caller to free).
- * Returns NULL if thunk is not in BLACKHOLE state. */
+ * Returns NULL if thunk is already COMPUTED. */
 void *nn_thunk_set_computed(nn_thunk_t *thunk, void *value);
 
-/* Transition BLACKHOLE -> COMPUTED with inline scalar values.
+/* Set a non-COMPUTED thunk to COMPUTED with inline scalar values.
  * Returns the old payload (pending StablePtr for caller to free).
- * Returns NULL if thunk is not in BLACKHOLE state. */
+ * Returns NULL if thunk is already COMPUTED. */
 void *nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value);
 void *nn_thunk_set_computed_float(nn_thunk_t *thunk, double value);
 void *nn_thunk_set_computed_bool(nn_thunk_t *thunk, uint8_t value);
 void *nn_thunk_set_computed_null(nn_thunk_t *thunk);
+
 
 /* --- Arena diagnostics / cleanup iteration --- */
 

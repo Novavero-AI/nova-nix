@@ -3564,13 +3564,15 @@ testCThunk = do
                       <> T.pack (show state)
                   )
           ),
-      runTestM "set_computed fails on pending" $ do
+      runTestM "set_computed on pending returns old payload" $ do
         sp <- newStablePtr ("x" :: Text)
         ptr <- cthunkNew (castStablePtrToPtr sp)
         valSp <- newStablePtr ("v" :: Text)
         oldPayload <- cthunkSetComputed ptr (castStablePtrToPtr valSp)
-        freeStablePtr valSp
-        pure (if oldPayload == nullPtr then Pass else Fail "should have returned NULL"),
+        -- set_computed accepts PENDING (direct memoization, no blackhole step)
+        oldVal <- deRefStablePtr (castPtrToStablePtr oldPayload) :: IO Text
+        freeStablePtr sp
+        pure (assertEqual "old payload" "x" oldVal),
       runTestM "count tracks allocations" $ do
         countBefore <- cthunkCount
         sp <- newStablePtr (0 :: Int)

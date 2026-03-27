@@ -238,7 +238,7 @@ nn_thunk_mark_blackhole(nn_thunk_t *thunk)
 void *
 nn_thunk_set_computed(nn_thunk_t *thunk, void *value)
 {
-    if (thunk->state != NN_THUNK_BLACKHOLE) return NULL;
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
     void *old = thunk->payload;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_PTR;
@@ -249,7 +249,7 @@ nn_thunk_set_computed(nn_thunk_t *thunk, void *value)
 void *
 nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value)
 {
-    if (thunk->state != NN_THUNK_BLACKHOLE) return NULL;
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
     void *old = thunk->payload;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_INT;
@@ -260,7 +260,7 @@ nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value)
 void *
 nn_thunk_set_computed_float(nn_thunk_t *thunk, double value)
 {
-    if (thunk->state != NN_THUNK_BLACKHOLE) return NULL;
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
     void *old = thunk->payload;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_FLOAT;
@@ -271,7 +271,7 @@ nn_thunk_set_computed_float(nn_thunk_t *thunk, double value)
 void *
 nn_thunk_set_computed_bool(nn_thunk_t *thunk, uint8_t value)
 {
-    if (thunk->state != NN_THUNK_BLACKHOLE) return NULL;
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
     void *old = thunk->payload;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_BOOL;
@@ -282,7 +282,7 @@ nn_thunk_set_computed_bool(nn_thunk_t *thunk, uint8_t value)
 void *
 nn_thunk_set_computed_null(nn_thunk_t *thunk)
 {
-    if (thunk->state != NN_THUNK_BLACKHOLE) return NULL;
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
     void *old = thunk->payload;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_NULL;

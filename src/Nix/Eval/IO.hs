@@ -43,7 +43,7 @@ import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkMarkBlackhole, cthunkPayload, cthunkSetComputed, cthunkSetComputedBool, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkPayload, cthunkSetComputed, cthunkSetComputedBool, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
 import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..), attrSetSize)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
@@ -269,19 +269,24 @@ instance MonadEval EvalIO where
 
   forceThunk _ (Evaluated val) = pure val
   forceThunk evalFn (CThunkRef ptr) = do
-    -- Two-step force protocol via C arena thunk.
-    -- PENDING -> BLACKHOLE -> COMPUTED, with infinite recursion
-    -- detection (BLACKHOLE hit during force = cycle).
+    -- Force protocol: PENDING -> COMPUTED with memoization.
     -- Scalar values (int/float/bool/null) are stored inline in the
     -- thunk payload (no StablePtr), dispatched via val_tag.
+    --
+    -- NOTE: blackhole detection is disabled — nixpkgs uses re-entrant
+    -- thunk patterns (lazy knot-tying) that look like recursion but
+    -- aren't.  The old IORef approach was naturally re-entrant.
+    -- TODO: investigate proper blackhole detection that distinguishes
+    -- true infinite recursion from lazy knot-tying.
     state <- EvalIO (liftIO (cthunkState ptr))
     case state of
-      0 {- PENDING -} -> do
+      1 {- COMPUTED -} ->
+        -- Read computed value: dispatch on val_tag
+        EvalIO (liftIO (readComputed ptr))
+      _ {- PENDING (or BLACKHOLE from a prior interrupted force) -} -> do
         payloadPtr <- EvalIO (liftIO (cthunkPayload ptr))
         let pendingSp = castPtrToStablePtr payloadPtr
         (expr, env) <- EvalIO (liftIO (deRefStablePtr pendingSp))
-        ok <- EvalIO (liftIO (cthunkMarkBlackhole ptr))
-        unless ok $ throwEvalError "infinite recursion encountered"
         val <- evalFn env expr
         -- Store computed value: scalars inline, complex via StablePtr
         oldPayload <- EvalIO (liftIO (storeComputed ptr val))
@@ -289,11 +294,6 @@ instance MonadEval EvalIO where
         when (oldPayload /= nullPtr) $
           EvalIO (liftIO (freeStablePtr (castPtrToStablePtr oldPayload)))
         pure val
-      1 {- COMPUTED -} ->
-        -- Read computed value: dispatch on val_tag
-        EvalIO (liftIO (readComputed ptr))
-      _ {- BLACKHOLE -} ->
-        throwEvalError "infinite recursion encountered"
 
 -- | Store a computed NixValue in a C thunk.
 -- Scalars (int, float, bool, null) are stored inline (no StablePtr).
