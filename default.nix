@@ -10,7 +10,7 @@ let
   };
   ram-src = builtins.fetchGit {
     url = "https://github.com/jappeace/ram.git";
-    ref = "main";
+    ref = "master";
   };
   haskellPackages = pkgs.haskellPackages.override {
     overrides = self: super: {
