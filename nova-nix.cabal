@@ -48,6 +48,8 @@ library
     Nix.Eval.IO
     Nix.Eval.Operator
     Nix.Eval.StringInterp
+    Nix.Eval.Symbol
+    Nix.Eval.CAttrSet
     Nix.Store
     Nix.Store.Path
     Nix.Store.DB
@@ -79,6 +81,11 @@ library
     , text                >= 2.0 && < 2.2
     , time                >= 1.9 && < 1.15
 
+  c-sources:
+    cbits/nn_symbol.c
+    cbits/nn_attrset.c
+  include-dirs:     cbits
+  cc-options:       -std=c99 -Wall -Wextra -pedantic -Werror
   hs-source-dirs:   src
   default-language:  Haskell2010
   default-extensions:

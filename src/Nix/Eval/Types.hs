@@ -73,6 +73,8 @@ import Data.Primitive.SmallArray (SmallArray, indexSmallArray, sizeofSmallArray,
 import Data.Set (Set)
 import Data.Text (Text)
 import Nix.Derivation (Derivation)
+import Nix.Eval.CAttrSet (CAttrSet, cattrsetGetKey, cattrsetIndex, cattrsetKeys, cattrsetSize)
+import Nix.Eval.Symbol (symbolIntern, symbolText)
 import Nix.Expr.Types (AttrKey (..), CaptureInfo (..), Expr (..), Formals, NixAtom (..), StringPart (..))
 import Nix.Store.Path (StorePath)
 import System.IO.Unsafe (unsafePerformIO)
@@ -254,9 +256,21 @@ data AttrSet
       !AttrSet
       -- | Materialization cache (written via unsafePerformIO)
       !(IORef (Map Text Thunk))
+  | -- | C-backed sorted attribute set.  Keys are interned symbols in a
+    -- contiguous C array (binary search for O(log n) lookup on cache-
+    -- friendly memory).  Values are thunks in a parallel 'SmallArray'.
+    -- Eliminates Map.Bin overhead: ~12 bytes/entry vs ~56 bytes/entry.
+    CAttrs
+      -- | C-side sorted symbol map (key lookup via binary search)
+      !CAttrSet
+      -- | Parallel thunk array (same order as sorted C keys)
+      !(SmallArray Thunk)
 
 instance Eq AttrSet where
   EagerAttrs a == EagerAttrs b = a == b
+  CAttrs _ ta == CAttrs _ tb =
+    sizeofSmallArray ta == sizeofSmallArray tb
+      && all (\i -> indexSmallArray ta i == indexSmallArray tb i) [0 .. sizeofSmallArray ta - 1]
   a == b = attrSetToMap a == attrSetToMap b
 
 instance Show AttrSet where
@@ -265,6 +279,8 @@ instance Show AttrSet where
     "<lazy " ++ show (Map.size bindings) ++ " bindings>"
   show (MappedAttrs _ inner _) =
     "<mapped over " ++ show inner ++ ">"
+  show (CAttrs _ thunks) =
+    "<cattrset " ++ show (sizeofSmallArray thunks) ++ " entries>"
 
 -- | Look up a single key.  For 'EagerAttrs', pure 'Map.lookup'.
 -- For 'LazyAttrs', checks the cache first, then materializes a
@@ -300,6 +316,14 @@ attrSetLookup key (MappedAttrs f inner cacheRef) =
              in unsafePerformIO $ do
                   atomicModifyIORef' cacheRef (\c -> (Map.insert key thunk c, ()))
                   pure (Just thunk)
+attrSetLookup key (CAttrs ptr thunks) =
+  -- Intern the key as a symbol, then binary search the C array.
+  -- unsafePerformIO is safe: symbolIntern is idempotent allocation,
+  -- cattrsetIndex is a pure read — same pattern as LazyAttrs cache reads.
+  unsafePerformIO $ do
+    sym <- symbolIntern key
+    midx <- cattrsetIndex ptr sym
+    pure (fmap (indexSmallArray thunks . fromIntegral) midx)
 
 -- | Materialize a single 'LazyBinding' into a 'Thunk'.
 -- Each binding carries its own env, so no separate env parameter needed.
@@ -327,24 +351,33 @@ attrSetKeys :: AttrSet -> [Text]
 attrSetKeys (EagerAttrs m) = Map.keys m
 attrSetKeys (LazyAttrs bindings _) = Map.keys bindings
 attrSetKeys (MappedAttrs _ inner _) = attrSetKeys inner
+attrSetKeys (CAttrs ptr _) =
+  map symbolText (unsafePerformIO (cattrsetKeys ptr))
 
 -- | Check key membership without materializing thunks.
 attrSetMember :: Text -> AttrSet -> Bool
 attrSetMember key (EagerAttrs m) = Map.member key m
 attrSetMember key (LazyAttrs bindings _) = Map.member key bindings
 attrSetMember key (MappedAttrs _ inner _) = attrSetMember key inner
+attrSetMember key (CAttrs ptr _) =
+  unsafePerformIO $ do
+    sym <- symbolIntern key
+    midx <- cattrsetIndex ptr sym
+    pure (case midx of Nothing -> False; Just _ -> True)
 
 -- | Check if the attribute set is empty.
 attrSetNull :: AttrSet -> Bool
 attrSetNull (EagerAttrs m) = Map.null m
 attrSetNull (LazyAttrs bindings _) = Map.null bindings
 attrSetNull (MappedAttrs _ inner _) = attrSetNull inner
+attrSetNull (CAttrs _ thunks) = sizeofSmallArray thunks == 0
 
 -- | Number of attributes.
 attrSetSize :: AttrSet -> Int
 attrSetSize (EagerAttrs m) = Map.size m
 attrSetSize (LazyAttrs bindings _) = Map.size bindings
 attrSetSize (MappedAttrs _ inner _) = attrSetSize inner
+attrSetSize (CAttrs _ thunks) = sizeofSmallArray thunks
 
 -- | Full materialization: build a 'Map Text Thunk' from all bindings.
 -- For 'LazyAttrs' and 'MappedAttrs', this allocates thunks for every
@@ -382,6 +415,17 @@ attrSetToMap (MappedAttrs f inner cacheRef) =
       case Map.lookup key cached of
         Just thunk -> thunk
         Nothing -> f key innerThunk
+attrSetToMap (CAttrs ptr thunks) =
+  unsafePerformIO $ do
+    n <- cattrsetSize ptr
+    pairs <- mapM (materializeEntry n) [0 .. n - 1]
+    pure (Map.fromList pairs)
+  where
+    materializeEntry _ i = do
+      sym <- cattrsetGetKey ptr i
+      let key = symbolText sym
+          thunk = indexSmallArray thunks (fromIntegral i)
+      pure (key, thunk)
 
 -- | All thunk values (materialized).
 attrSetElems :: AttrSet -> [Thunk]
@@ -395,6 +439,8 @@ attrSetToAscList = Map.toAscList . attrSetToMap
 attrSetMapWithKey :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
 attrSetMapWithKey f attrs = EagerAttrs (Map.mapWithKey f (attrSetToMap attrs))
 
+-- Note: CAttrs is handled by the catch-all via attrSetToMap.
+
 -- | Like 'attrSetMapWithKey' but preserves laziness.  For 'LazyAttrs'
 -- and 'MappedAttrs', creates a 'MappedAttrs' wrapper that defers
 -- per-key transformation until lookup time.  This avoids ~30k IORef
@@ -406,6 +452,8 @@ attrSetMapWithKey f attrs = EagerAttrs (Map.mapWithKey f (attrSetToMap attrs))
 attrSetMapWithKeyLazy :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
 attrSetMapWithKeyLazy f (EagerAttrs m) = EagerAttrs (Map.mapWithKey f m)
 attrSetMapWithKeyLazy f inner = MappedAttrs f inner (newMappedCache inner)
+
+-- Note: CAttrs falls into the catch-all above, wrapped in MappedAttrs.
 
 -- | Convert a 'MappedAttrs' to 'LazyAttrs' without materializing thunks.
 -- Each key gets a 'PreBuilt' wrapper around a lazy closure that defers
@@ -435,6 +483,22 @@ mappedToLazy (MappedAttrs f inner _) =
         innerBindings
     applyMapping g (MappedAttrs h innerInner _) =
       applyMapping (\k thunk -> g k (h k thunk)) innerInner
+    applyMapping g (CAttrs ptr thunks) =
+      -- Materialize CAttrs keys and wrap each value in PreBuilt.
+      -- INTENTIONALLY LAZY inside PreBuilt: the mapping function is not
+      -- called until the key is actually accessed via attrSetLookup.
+      let n = sizeofSmallArray thunks
+          pairs =
+            unsafePerformIO $
+              mapM
+                ( \i -> do
+                    sym <- cattrsetGetKey ptr (fromIntegral i)
+                    let key = symbolText sym
+                        thunk = indexSmallArray thunks i
+                    pure (key, PreBuilt (g key thunk))
+                )
+                [0 .. n - 1]
+       in Map.fromList pairs
 mappedToLazy other = other
 
 -- | Remove a list of keys from an attribute set without materializing
@@ -449,6 +513,12 @@ attrSetRemoveKeys keys (LazyAttrs bindings _cache) =
    in LazyAttrs newBindings (newLazyAttrCache newBindings)
 attrSetRemoveKeys keys attrs@(MappedAttrs {}) =
   attrSetRemoveKeys keys (mappedToLazy attrs)
+attrSetRemoveKeys keys (CAttrs ptr thunks) =
+  -- Materialize to EagerAttrs, then remove.  CAttrs is immutable after
+  -- freeze; a proper C-side filtered copy (nn_attrset_remove_keys) would
+  -- avoid the intermediate Map, but removeAttrs is rare in nixpkgs.
+  -- If profiling shows this matters, add the C path.
+  EagerAttrs (foldl' (flip Map.delete) (attrSetToMap (CAttrs ptr thunks)) keys)
 
 -- | Union two attribute sets with a combining function (materializes both).
 attrSetUnionWith :: (Thunk -> Thunk -> Thunk) -> AttrSet -> AttrSet -> AttrSet
