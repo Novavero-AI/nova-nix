@@ -8,6 +8,7 @@ import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Primitive.SmallArray (sizeofSmallArray)
 import qualified Data.Set as Set
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -3478,7 +3479,7 @@ testCAttrSet = do
           cattrsetFree set
           freeStablePtr sp
           pure
-            ( if n == 10000 && hit /= Nothing
+            ( if n == 10000 && isJust hit
                 then Pass
                 else Fail ("size=" <> T.pack (show n))
             )
