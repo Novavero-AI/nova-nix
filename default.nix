@@ -8,8 +8,13 @@ let
     url = "https://github.com/Novavero-AI/nova-cache.git";
     ref = "main";
   };
+  ram-src = builtins.fetchGit {
+    url = "https://github.com/jappeace/ram.git";
+    ref = "main";
+  };
   haskellPackages = pkgs.haskellPackages.override {
     overrides = self: super: {
+      ram = self.callCabal2nix "ram" ram-src {};
       nova-cache = self.callCabal2nix "nova-cache" nova-cache-src {};
     };
   };
