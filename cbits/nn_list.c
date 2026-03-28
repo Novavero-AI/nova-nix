@@ -21,8 +21,10 @@ static void nn_list_track(nn_list_t *list)
 {
     if (g_tracked_count >= g_tracked_cap) {
         uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
-        g_tracked = (nn_list_t **)realloc(
+        nn_list_t **new_arr = (nn_list_t **)realloc(
             g_tracked, (size_t)new_cap * sizeof(nn_list_t *));
+        if (!new_arr) return;
+        g_tracked = new_arr;
         g_tracked_cap = new_cap;
     }
     g_tracked[g_tracked_count++] = list;

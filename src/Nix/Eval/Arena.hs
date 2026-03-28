@@ -76,9 +76,11 @@ arenaDestroy = do
 
 -- | Free all StablePtrs held by thunk payloads.
 -- Uses batch C-side collection to avoid per-thunk FFI crossing.
--- Only frees PENDING payloads (StablePtr to (Expr, Env)) and
--- COMPUTED/NN_VALUE_PTR payloads (StablePtr to NixValue).
--- Inline scalar payloads (INT, FLOAT, BOOL, NULL) are skipped.
+-- Frees payloads from three thunk states:
+--   PENDING:              StablePtr (Expr, Env)
+--   BLACKHOLE:            original PENDING StablePtr (eval failed/in-progress)
+--   COMPUTED/NN_VALUE_PTR: StablePtr NixValue
+-- Inline scalar/C-pointer payloads (INT..CTXSTR) are skipped.
 cleanupStablePtrs :: IO ()
 cleanupStablePtrs = do
   count <- c_nn_arena_stableptr_count

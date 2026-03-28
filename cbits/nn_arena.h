@@ -2,9 +2,14 @@
  * nn_arena.h — Unified arena lifecycle and StablePtr cleanup.
  *
  * Provides batch collection of StablePtr payloads from the thunk arena
- * for efficient cleanup.  Only payloads that are actual StablePtrs
- * (PENDING thunks + COMPUTED/NN_VALUE_PTR thunks) are collected;
- * inline scalar values (INT, FLOAT, BOOL, NULL) are skipped.
+ * for efficient cleanup.  Payloads that are actual StablePtrs are
+ * collected from three thunk states:
+ *   - PENDING: StablePtr (Expr, Env) — unevaluated thunks
+ *   - BLACKHOLE: original PENDING StablePtr — failed-eval thunks
+ *   - COMPUTED/NN_VALUE_PTR: StablePtr NixValue — complex values
+ *
+ * Inline scalar/C-pointer payloads (INT, FLOAT, BOOL, NULL, STR,
+ * PATH, LIST, ATTRS, CTXSTR) are skipped.
  *
  * Used by Haskell-side Arena.hs to free all StablePtrs before
  * destroying the sub-arenas (thunk, env, symbol).

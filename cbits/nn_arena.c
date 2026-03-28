@@ -3,16 +3,17 @@
  *
  * Iterates all thunks via nn_thunk_count/nn_thunk_get and identifies
  * payloads that are Haskell StablePtrs (as opposed to inline scalar
- * values).  Two cases have StablePtr payloads:
+ * values).  Three cases have StablePtr payloads:
  *
  *   1. PENDING thunks: payload = StablePtr (Expr, Env)
- *   2. COMPUTED thunks with val_tag == NN_VALUE_PTR:
+ *   2. BLACKHOLE thunks: payload = original PENDING StablePtr
+ *      (mark_blackhole only changes state, not payload)
+ *   3. COMPUTED thunks with val_tag == NN_VALUE_PTR:
  *      payload = StablePtr NixValue
  *
- * All other COMPUTED thunks (INT, FLOAT, BOOL, NULL) have inline
- * scalar payloads — not StablePtrs, must NOT be freed.
- *
- * BLACKHOLE thunks have stale payloads — also skipped.
+ * All other COMPUTED thunks (INT, FLOAT, BOOL, NULL, STR, PATH,
+ * LIST, ATTRS, CTXSTR) have inline scalar or C-pointer payloads —
+ * not StablePtrs, must NOT be freed.
  */
 
 #include "nn_arena.h"
@@ -33,7 +34,7 @@ nn_arena_stableptr_count(void)
         if (!t) continue;
 
         uint8_t state = nn_thunk_state(t);
-        if (state == NN_THUNK_PENDING) {
+        if (state == NN_THUNK_PENDING || state == NN_THUNK_BLACKHOLE) {
             void *p = nn_thunk_payload(t);
             if (p) count++;
         } else if (state == NN_THUNK_COMPUTED) {
@@ -58,7 +59,7 @@ nn_arena_collect_stableptrs(void **output, uint32_t max_count)
         if (!t) continue;
 
         uint8_t state = nn_thunk_state(t);
-        if (state == NN_THUNK_PENDING) {
+        if (state == NN_THUNK_PENDING || state == NN_THUNK_BLACKHOLE) {
             void *p = nn_thunk_payload(t);
             if (p) output[written++] = p;
         } else if (state == NN_THUNK_COMPUTED) {

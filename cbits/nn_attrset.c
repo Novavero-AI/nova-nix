@@ -29,8 +29,10 @@ static void nn_attrset_track(nn_attrset_t *set)
 {
     if (g_tracked_count >= g_tracked_cap) {
         uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
-        g_tracked = (nn_attrset_t **)realloc(
+        nn_attrset_t **new_arr = (nn_attrset_t **)realloc(
             g_tracked, (size_t)new_cap * sizeof(nn_attrset_t *));
+        if (!new_arr) return;
+        g_tracked = new_arr;
         g_tracked_cap = new_cap;
     }
     g_tracked[g_tracked_count++] = set;
@@ -75,10 +77,19 @@ static int cmp_tagged(const void *a, const void *b);
 /* Grow arrays to at least new_cap. */
 static void grow(nn_attrset_t *set, uint32_t new_cap)
 {
-    set->keys = (nn_symbol_t *)realloc(
+    nn_symbol_t *new_keys = (nn_symbol_t *)realloc(
         set->keys, (size_t)new_cap * sizeof(nn_symbol_t));
-    set->values = (void **)realloc(
+    void **new_values = (void **)realloc(
         set->values, (size_t)new_cap * sizeof(void *));
+    if (!new_keys || !new_values) {
+        /* Realloc failure: keep old arrays, skip growth.
+         * If one succeeded, it's safe — realloc preserves old data. */
+        if (new_keys) set->keys = new_keys;
+        if (new_values) set->values = new_values;
+        return;
+    }
+    set->keys = new_keys;
+    set->values = new_values;
     set->capacity = new_cap;
 }
 
@@ -186,6 +197,11 @@ void nn_attrset_freeze(nn_attrset_t *set)
          */
         nn_tagged_entry_t *tagged = (nn_tagged_entry_t *)malloc(
             (size_t)set->count * sizeof(nn_tagged_entry_t));
+        if (!tagged) {
+            /* Cannot sort — mark frozen with current insertion order. */
+            set->frozen = 1;
+            return;
+        }
         uint32_t i;
         for (i = 0; i < set->count; i++) {
             tagged[i].key = set->keys[i];
