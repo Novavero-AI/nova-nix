@@ -53,6 +53,7 @@ library
     Nix.Eval.CThunk
     Nix.Eval.CEnv
     Nix.Eval.CList
+    Nix.Eval.CCtxStr
     Nix.Eval.Arena
     Nix.Store
     Nix.Store.Path
@@ -90,6 +91,7 @@ library
     cbits/nn_thunk.c
     cbits/nn_env.c
     cbits/nn_list.c
+    cbits/nn_ctxstr.c
     cbits/nn_arena.c
   include-dirs:     cbits
   cc-options:       -std=c99 -Wall -Wextra -pedantic -Werror

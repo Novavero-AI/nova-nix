@@ -44,9 +44,9 @@ import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
 import Nix.Eval.CList (clistToThunkList, thunkListToCList)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
-import Nix.Eval.Types (AttrSet (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, thunkToCPtr)
+import Nix.Eval.Types (AttrSet (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalStringContext, thunkToCPtr, unmarshalStringContext)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix, readFileAutoEncoding)
@@ -270,28 +270,31 @@ instance MonadEval EvalIO where
       else pure path
 
   forceThunk evalFn (Thunk ptr) = do
-    -- Force protocol: PENDING -> COMPUTED with memoization.
+    -- Force protocol: PENDING -> BLACKHOLE -> COMPUTED with memoization.
     -- Scalar values (int/float/bool/null) are stored inline in the
     -- thunk payload (no StablePtr), dispatched via val_tag.
     --
-    -- NOTE: blackhole detection is disabled — nixpkgs uses re-entrant
-    -- thunk patterns (lazy knot-tying) that look like recursion but
-    -- aren't.  The old IORef approach was naturally re-entrant.
-    -- TODO: investigate proper blackhole detection that distinguishes
-    -- true infinite recursion from lazy knot-tying.
+    -- Blackhole detection: PENDING thunks are marked BLACKHOLE before
+    -- evaluation begins.  If evaluation re-enters the same thunk, it
+    -- sees BLACKHOLE and reports infinite recursion.  This is safe with
+    -- knot-tying (evalRecAttrs, evalLet, matchFormalSet) because those
+    -- patterns create distinct thunks sharing an env — no thunk ever
+    -- forces itself.
     state <- EvalIO (liftIO (cthunkState ptr))
     case state of
       1 {- COMPUTED -} ->
-        -- Read computed value: dispatch on val_tag
         EvalIO (liftIO (readComputed ptr))
-      _ {- PENDING (or BLACKHOLE from a prior interrupted force) -} -> do
+      2 {- BLACKHOLE -} ->
+        throwEvalError "infinite recursion encountered"
+      _ {- PENDING -} -> do
         payloadPtr <- EvalIO (liftIO (cthunkPayload ptr))
         let pendingSp = castPtrToStablePtr payloadPtr
         (expr, env) <- EvalIO (liftIO (deRefStablePtr pendingSp))
+        -- Mark blackhole BEFORE evaluation — any re-entry hits the
+        -- BLACKHOLE branch above.
+        _ <- EvalIO (liftIO (cthunkMarkBlackhole ptr))
         val <- evalFn env expr
-        -- Store computed value: scalars inline, complex via StablePtr
         oldPayload <- EvalIO (liftIO (storeComputed ptr val))
-        -- Free the old pending StablePtr (Expr, Env) — they're unreachable now
         when (oldPayload /= nullPtr) $
           EvalIO (liftIO (freeStablePtr (castPtrToStablePtr oldPayload)))
         pure val
@@ -314,8 +317,8 @@ storeComputed ptr val = case val of
         Symbol sym <- symbolIntern t
         cthunkSetComputedStr ptr sym
     | otherwise -> do
-        valSp <- newStablePtr val
-        cthunkSetComputed ptr (castStablePtrToPtr valSp)
+        csptr <- marshalStringContext t ctx
+        cthunkSetComputedCtxStr ptr (castPtr csptr)
   VList thunks -> do
     clist <- thunkListToCList (map thunkToCPtr thunks)
     cthunkSetComputedList ptr (castPtr clist)
@@ -342,6 +345,9 @@ readComputed ptr = do
       thunks <- clistToThunkList (castPtr listPtr)
       pure (VList (map Thunk thunks))
     7 {- ATTRS -} -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
+    8 {- CTXSTR -} -> do
+      csptr <- cthunkGetCtxStr ptr
+      uncurry VStr <$> unmarshalStringContext (castPtr csptr)
     _ {- PTR -} -> do
       payloadPtr <- cthunkPayload ptr
       deRefStablePtr (castPtrToStablePtr payloadPtr)

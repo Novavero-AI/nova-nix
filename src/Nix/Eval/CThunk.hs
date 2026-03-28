@@ -39,6 +39,7 @@ module Nix.Eval.CThunk
     cthunkNewComputedPath,
     cthunkNewComputedList,
     cthunkNewComputedAttrs,
+    cthunkNewComputedCtxStr,
 
     -- * State queries
     cthunkState,
@@ -51,6 +52,7 @@ module Nix.Eval.CThunk
     cthunkGetPath,
     cthunkGetList,
     cthunkGetAttrs,
+    cthunkGetCtxStr,
 
     -- * State transitions
     cthunkMarkBlackhole,
@@ -63,6 +65,7 @@ module Nix.Eval.CThunk
     cthunkSetComputedPath,
     cthunkSetComputedList,
     cthunkSetComputedAttrs,
+    cthunkSetComputedCtxStr,
 
     -- * Arena diagnostics / cleanup
     cthunkCount,
@@ -121,6 +124,9 @@ foreign import ccall unsafe "nn_thunk_new_computed_list"
 foreign import ccall unsafe "nn_thunk_new_computed_attrs"
   c_nn_thunk_new_computed_attrs :: Ptr () -> IO CThunkPtr
 
+foreign import ccall unsafe "nn_thunk_new_computed_ctxstr"
+  c_nn_thunk_new_computed_ctxstr :: Ptr () -> IO CThunkPtr
+
 foreign import ccall unsafe "nn_thunk_state"
   c_nn_thunk_state :: CThunkPtr -> IO Word8
 
@@ -151,6 +157,9 @@ foreign import ccall unsafe "nn_thunk_get_list"
 foreign import ccall unsafe "nn_thunk_get_attrs"
   c_nn_thunk_get_attrs :: CThunkPtr -> IO (Ptr ())
 
+foreign import ccall unsafe "nn_thunk_get_ctxstr"
+  c_nn_thunk_get_ctxstr :: CThunkPtr -> IO (Ptr ())
+
 foreign import ccall unsafe "nn_thunk_mark_blackhole"
   c_nn_thunk_mark_blackhole :: CThunkPtr -> IO Int
 
@@ -180,6 +189,9 @@ foreign import ccall unsafe "nn_thunk_set_computed_list"
 
 foreign import ccall unsafe "nn_thunk_set_computed_attrs"
   c_nn_thunk_set_computed_attrs :: CThunkPtr -> Ptr () -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_ctxstr"
+  c_nn_thunk_set_computed_ctxstr :: CThunkPtr -> Ptr () -> IO (Ptr ())
 
 foreign import ccall unsafe "nn_thunk_count"
   c_nn_thunk_count :: IO Word32
@@ -248,6 +260,11 @@ cthunkNewComputedList = c_nn_thunk_new_computed_list
 cthunkNewComputedAttrs :: Ptr () -> IO CThunkPtr
 cthunkNewComputedAttrs = c_nn_thunk_new_computed_attrs
 
+-- | Allocate a pre-COMPUTED thunk with a CCtxStr pointer (no StablePtr).
+-- For strings with non-empty context (tag 8).
+cthunkNewComputedCtxStr :: Ptr () -> IO CThunkPtr
+cthunkNewComputedCtxStr = c_nn_thunk_new_computed_ctxstr
+
 -- ---------------------------------------------------------------------------
 -- State queries
 -- ---------------------------------------------------------------------------
@@ -297,6 +314,10 @@ cthunkGetList = c_nn_thunk_get_list
 cthunkGetAttrs :: CThunkPtr -> IO (Ptr ())
 cthunkGetAttrs = c_nn_thunk_get_attrs
 
+-- | Read a CCtxStr pointer from a COMPUTED thunk (val_tag == 8).
+cthunkGetCtxStr :: CThunkPtr -> IO (Ptr ())
+cthunkGetCtxStr = c_nn_thunk_get_ctxstr
+
 -- ---------------------------------------------------------------------------
 -- State transitions
 -- ---------------------------------------------------------------------------
@@ -345,6 +366,10 @@ cthunkSetComputedList = c_nn_thunk_set_computed_list
 -- | Set a non-COMPUTED thunk to COMPUTED with a CAttrSet pointer.
 cthunkSetComputedAttrs :: CThunkPtr -> Ptr () -> IO (Ptr ())
 cthunkSetComputedAttrs = c_nn_thunk_set_computed_attrs
+
+-- | Set a non-COMPUTED thunk to COMPUTED with a CCtxStr pointer.
+cthunkSetComputedCtxStr :: CThunkPtr -> Ptr () -> IO (Ptr ())
+cthunkSetComputedCtxStr = c_nn_thunk_set_computed_ctxstr
 
 -- ---------------------------------------------------------------------------
 -- Arena diagnostics / cleanup

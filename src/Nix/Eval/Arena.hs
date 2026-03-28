@@ -20,6 +20,7 @@ import Data.Word (Word32)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (Ptr)
 import Foreign.StablePtr (castPtrToStablePtr, freeStablePtr)
+import Nix.Eval.CCtxStr (cctxstrFreeAll)
 import Nix.Eval.CEnv (cenvDestroy, cenvInit)
 import Nix.Eval.CList (clistFreeAll)
 import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
@@ -66,6 +67,7 @@ arenaInit = do
 arenaDestroy :: IO ()
 arenaDestroy = do
   cleanupStablePtrs
+  cctxstrFreeAll
   clistFreeAll
   cattrsetFreeAll
   cenvDestroy

@@ -1673,6 +1673,23 @@ testBatchCIO = do
       ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: Blackhole (infinite recursion detection)
+-- ---------------------------------------------------------------------------
+
+testBlackhole :: IO [Bool]
+testBlackhole = do
+  putStrLn "eval/blackhole"
+  tmpBase <- getTemporaryDirectory
+  sequence
+    [ runTestIOFail "let x = x; in x" tmpBase "let x = x; in x",
+      runTestIOFail "rec { a = a; }.a" tmpBase "rec { a = a; }.a",
+      runTestIOFail "let a = b; b = a; in a" tmpBase "let a = b; b = a; in a",
+      -- Non-recursive cases must still work
+      runTestIO "rec { a = 1; b = a; }.b" tmpBase "rec { a = 1; b = a; }.b" (VInt 1),
+      runTestIO "let a = 1; b = a + 1; in b" tmpBase "let a = 1; b = a + 1; in b" (VInt 2)
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Tests: Batch D — toFile
 -- ---------------------------------------------------------------------------
 
@@ -3672,6 +3689,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testBatchB,
           testBatchC,
           testBatchCIO,
+          testBlackhole,
           testBatchD,
           testBatchE,
           testBatchEIO,

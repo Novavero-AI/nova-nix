@@ -35,6 +35,8 @@ module Nix.Eval.Types
     StringContext (..),
     emptyContext,
     mkStr,
+    marshalStringContext,
+    unmarshalStringContext,
 
     -- * Environment
     Env (..),
@@ -72,19 +74,21 @@ import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
-import Data.Word (Word8)
+import Data.Word (Word16, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, newStablePtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
+import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CEnv (cenvAllocSlots)
 import Nix.Eval.CList (clistToThunkList, thunkListToCList)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNew, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNew, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), Formals, NixAtom (..))
-import Nix.Store.Path (StorePath)
+import Nix.Store.Path (StorePath (..))
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Text.Regex.TDFA as RE
 
@@ -189,6 +193,9 @@ readThunkValue (Thunk ptr) =
             thunks <- clistToThunkList (castPtr listPtr)
             pure (VList (map Thunk thunks))
           7 {- ATTRS -} -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
+          8 {- CTXSTR -} -> do
+            csptr <- cthunkGetCtxStr ptr
+            uncurry VStr <$> unmarshalStringContext (castPtr csptr)
           _ {- PTR -} -> do
             payload <- cthunkPayload ptr
             deRefStablePtr (castPtrToStablePtr payload)
@@ -609,7 +616,7 @@ evaluated (VAttrs (AttrSet cset)) = Thunk (newComputedAttrsPtr cset)
 evaluated (VPath p) = Thunk (newComputedPathPtr p)
 evaluated (VStr t ctx)
   | ctx == emptyContext = Thunk (newComputedStrPtr t)
-  | otherwise = Thunk (newComputedThunkPtr (VStr t ctx))
+  | otherwise = Thunk (newComputedCtxStrPtr t ctx)
 evaluated (VList thunks) = Thunk (newComputedListPtr thunks)
 evaluated val = Thunk (newComputedThunkPtr val)
 
@@ -678,6 +685,66 @@ newComputedListPtr thunks =
       let ptrs = map thunkToCPtr thunks
       clist <- thunkListToCList ptrs
       cthunkNewComputedList (castPtr clist)
+
+-- | Wrap a string with context in a pre-computed C thunk (no StablePtr).
+-- Interns the text and all StorePath fields as symbols, builds nn_ctxstr_t.
+{-# NOINLINE newComputedCtxStrPtr #-}
+newComputedCtxStrPtr :: Text -> StringContext -> CThunkPtr
+newComputedCtxStrPtr t ctx =
+  unsafePerformIO $
+    t `seq`
+      ctx `seq` do
+        ptr <- marshalStringContext t ctx
+        cthunkNewComputedCtxStr (castPtr ptr)
+
+-- | Marshal Text + StringContext to a C nn_ctxstr_t.
+marshalStringContext :: Text -> StringContext -> IO CCtxStrPtr
+marshalStringContext textVal (StringContext ctxSet) = do
+  Symbol textSym <- symbolIntern textVal
+  let elems = Set.toAscList ctxSet
+      count = fromIntegral (length elems) :: Word16
+  ptr <- cctxstrNew textSym count
+  fillElems ptr 0 elems
+  pure ptr
+  where
+    fillElems _ _ [] = pure ()
+    fillElems ptr !idx (e : es) = do
+      marshalElem ptr idx e
+      fillElems ptr (idx + 1) es
+    marshalElem eptr eidx (SCPlain (StorePath h n)) = do
+      Symbol hashSym <- symbolIntern h
+      Symbol nameSym <- symbolIntern n
+      cctxstrSetPlain eptr eidx hashSym nameSym
+    marshalElem eptr eidx (SCDrvOutput (StorePath h n) out) = do
+      Symbol hashSym <- symbolIntern h
+      Symbol nameSym <- symbolIntern n
+      Symbol outSym <- symbolIntern out
+      cctxstrSetDrvOutput eptr eidx hashSym nameSym outSym
+    marshalElem eptr eidx (SCAllOutputs (StorePath h n)) = do
+      Symbol hashSym <- symbolIntern h
+      Symbol nameSym <- symbolIntern n
+      cctxstrSetAllOutputs eptr eidx hashSym nameSym
+
+-- | Unmarshal a C nn_ctxstr_t back to (Text, StringContext).
+unmarshalStringContext :: CCtxStrPtr -> IO (Text, StringContext)
+unmarshalStringContext ptr = do
+  textSym <- cctxstrText ptr
+  count <- cctxstrCtxCount ptr
+  let textVal = symbolText (Symbol textSym)
+  elems <- mapM (readElem ptr) [0 .. count - 1]
+  pure (textVal, StringContext (Set.fromList elems))
+  where
+    readElem cptr idx = do
+      tag <- cctxstrElemTag cptr idx
+      hashSym <- cctxstrElemHash cptr idx
+      nameSym <- cctxstrElemName cptr idx
+      let sp = StorePath (symbolText (Symbol hashSym)) (symbolText (Symbol nameSym))
+      case tag of
+        0 -> pure (SCPlain sp)
+        1 -> do
+          outSym <- cctxstrElemOutput cptr idx
+          pure (SCDrvOutput sp (symbolText (Symbol outSym)))
+        _ -> pure (SCAllOutputs sp)
 
 -- | Wrap a CAttrSet in a pre-computed C thunk (pointer, no StablePtr).
 {-# NOINLINE newComputedAttrsPtr #-}
@@ -859,6 +926,10 @@ instance MonadEval PureEval where
               7 {- ATTRS -} ->
                 let p = unsafePerformIO (cthunkGetAttrs ptr)
                  in pure (VAttrs (AttrSet (castPtr p)))
+              8 {- CTXSTR -} ->
+                let csptr = unsafePerformIO (cthunkGetCtxStr ptr)
+                    (t, ctx) = unsafePerformIO (unmarshalStringContext (castPtr csptr))
+                 in pure (VStr t ctx)
               _ {- PTR -} ->
                 let payload = unsafePerformIO (cthunkPayload ptr)
                     val = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))
