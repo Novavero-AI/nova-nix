@@ -21,7 +21,9 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), cu
 import Nix.Eval (Env (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, evaluated, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFree, cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
+import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, opApp, opAssert, opAttrs, opBinary, opHasAttr, opIf, opIndStr, opLambda, opLet, opList, opLitBool, opLitFloat, opLitInt, opLitNull, opLitPath, opLitUri, opResolvedVar, opSearchPath, opSelect, opStr, opUnary, opVar, opWith, opWithVar, strpartInterp, strpartLit, unaryNegate)
 import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
+import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
@@ -3641,6 +3643,509 @@ testCThunk = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Bytecode compilation tests
+-- ---------------------------------------------------------------------------
+
+testBytecodeCompile :: IO [Bool]
+testBytecodeCompile = do
+  putStrLn "bytecode"
+  -- Arena (including bytecode store) already initialized by main's bracket.
+  sequence
+    [ runTestM "compile ELit NixInt" $ do
+        idx <- compileExpr (ELit (NixInt 42))
+        op <- cbcOpcode idx
+        a1 <- cbcArg1 idx
+        a2 <- cbcArg2 idx
+        pure
+          ( if op == opLitInt && a1 == 42 && a2 == 0
+              then Pass
+              else Fail ("op=" <> T.pack (show op) <> " a1=" <> T.pack (show a1))
+          ),
+      runTestM "compile ELit NixInt negative" $ do
+        idx <- compileExpr (ELit (NixInt (-1)))
+        op <- cbcOpcode idx
+        a1 <- cbcArg1 idx
+        a2 <- cbcArg2 idx
+        -- -1 as uint64 = 0xFFFFFFFFFFFFFFFF, lo=0xFFFFFFFF, hi=0xFFFFFFFF
+        pure
+          ( if op == opLitInt && a1 == 0xFFFFFFFF && a2 == 0xFFFFFFFF
+              then Pass
+              else
+                Fail
+                  ( "a1="
+                      <> T.pack (show a1)
+                      <> " a2="
+                      <> T.pack (show a2)
+                  )
+          ),
+      runTestM "compile ELit NixBool" $ do
+        idxT <- compileExpr (ELit (NixBool True))
+        idxF <- compileExpr (ELit (NixBool False))
+        opT <- cbcOpcode idxT
+        opF <- cbcOpcode idxF
+        saT <- cbcShortArg idxT
+        saF <- cbcShortArg idxF
+        pure
+          ( if opT == opLitBool && saT == 1 && opF == opLitBool && saF == 0
+              then Pass
+              else Fail "bool encoding mismatch"
+          ),
+      runTestM "compile ELit NixNull" $ do
+        idx <- compileExpr (ELit NixNull)
+        op <- cbcOpcode idx
+        pure (assertEqual "opcode" opLitNull op),
+      runTestM "compile EResolvedVar" $ do
+        idx <- compileExpr (EResolvedVar 3 7)
+        op <- cbcOpcode idx
+        a1 <- cbcArg1 idx
+        a2 <- cbcArg2 idx
+        pure
+          ( if op == opResolvedVar && a1 == 3 && a2 == 7
+              then Pass
+              else
+                Fail
+                  ( "op="
+                      <> T.pack (show op)
+                      <> " a1="
+                      <> T.pack (show a1)
+                      <> " a2="
+                      <> T.pack (show a2)
+                  )
+          ),
+      runTestM "compile EVar" $ do
+        idx <- compileExpr (EVar "hello")
+        op <- cbcOpcode idx
+        sym <- cbcArg1 idx
+        symText <- pure (symbolText (Symbol sym))
+        pure
+          ( if op == opVar && symText == "hello"
+              then Pass
+              else Fail ("op=" <> T.pack (show op) <> " sym=" <> symText)
+          ),
+      runTestM "compile EApp" $ do
+        idx <- compileExpr (EApp (EVar "f") (ELit (NixInt 1)))
+        op <- cbcOpcode idx
+        funcIdx <- cbcArg1 idx
+        argIdx <- cbcArg2 idx
+        funcOp <- cbcOpcode funcIdx
+        argOp <- cbcOpcode argIdx
+        pure
+          ( if op == opApp && funcOp == opVar && argOp == opLitInt
+              then Pass
+              else
+                Fail
+                  ( "op="
+                      <> T.pack (show op)
+                      <> " funcOp="
+                      <> T.pack (show funcOp)
+                      <> " argOp="
+                      <> T.pack (show argOp)
+                  )
+          ),
+      runTestM "compile EIf" $ do
+        idx <-
+          compileExpr
+            (EIf (ELit (NixBool True)) (ELit (NixInt 1)) (ELit (NixInt 2)))
+        op <- cbcOpcode idx
+        condIdx <- cbcArg1 idx
+        thenIdx <- cbcArg2 idx
+        elseIdx <- cbcArg3 idx
+        condOp <- cbcOpcode condIdx
+        thenA1 <- cbcArg1 thenIdx
+        elseA1 <- cbcArg1 elseIdx
+        pure
+          ( if op == opIf && condOp == opLitBool && thenA1 == 1 && elseA1 == 2
+              then Pass
+              else Fail "if structure mismatch"
+          ),
+      runTestM "compile EBinary" $ do
+        idx <-
+          compileExpr
+            (EBinary OpAdd (ELit (NixInt 10)) (ELit (NixInt 20)))
+        op <- cbcOpcode idx
+        fl <- cbcFlags idx
+        leftIdx <- cbcArg1 idx
+        rightIdx <- cbcArg2 idx
+        leftA1 <- cbcArg1 leftIdx
+        rightA1 <- cbcArg1 rightIdx
+        pure
+          ( if op == opBinary && fl == binaryAdd && leftA1 == 10 && rightA1 == 20
+              then Pass
+              else Fail "binary structure mismatch"
+          ),
+      runTestM "compile EUnary" $ do
+        idx <- compileExpr (EUnary OpNegate (ELit (NixInt 5)))
+        op <- cbcOpcode idx
+        fl <- cbcFlags idx
+        operandIdx <- cbcArg1 idx
+        operandA1 <- cbcArg1 operandIdx
+        pure
+          ( if op == opUnary && fl == unaryNegate && operandA1 == 5
+              then Pass
+              else Fail "unary structure mismatch"
+          ),
+      runTestM "compile EList" $ do
+        idx <-
+          compileExpr
+            (EList [ELit (NixInt 1), ELit (NixInt 2), ELit (NixInt 3)])
+        op <- cbcOpcode idx
+        count <- cbcShortArg idx
+        dataOff <- cbcArg1 idx
+        c0 <- cbcData dataOff
+        c1 <- cbcData (dataOff + 1)
+        c2 <- cbcData (dataOff + 2)
+        c0a1 <- cbcArg1 c0
+        c1a1 <- cbcArg1 c1
+        c2a1 <- cbcArg1 c2
+        pure
+          ( if op == opList && count == 3 && c0a1 == 1 && c1a1 == 2 && c2a1 == 3
+              then Pass
+              else
+                Fail
+                  ( "op="
+                      <> T.pack (show op)
+                      <> " count="
+                      <> T.pack (show count)
+                  )
+          ),
+      runTestM "compile EStr with interpolation" $ do
+        idx <-
+          compileExpr
+            (EStr [StrLit "hello ", StrInterp (EVar "name"), StrLit "!"])
+        op <- cbcOpcode idx
+        count <- cbcShortArg idx
+        dataOff <- cbcArg1 idx
+        -- 3 parts × 2 words each = 6 data words
+        tag0 <- cbcData dataOff
+        val0 <- cbcData (dataOff + 1)
+        tag1 <- cbcData (dataOff + 2)
+        val1 <- cbcData (dataOff + 3)
+        tag2 <- cbcData (dataOff + 4)
+        -- tag0=0(lit), tag1=1(interp), tag2=0(lit)
+        interpOp <- cbcOpcode val1
+        pure
+          ( if op == opStr
+              && count == 3
+              && tag0 == strpartLit
+              && tag1 == strpartInterp
+              && tag2 == strpartLit
+              && interpOp == opVar
+              then Pass
+              else
+                Fail
+                  ( "op="
+                      <> T.pack (show op)
+                      <> " count="
+                      <> T.pack (show count)
+                      <> " tag0="
+                      <> T.pack (show tag0)
+                      <> " tag1="
+                      <> T.pack (show tag1)
+                  )
+          ),
+      runTestM "compile EWith" $ do
+        idx <- compileExpr (EWith (EVar "lib") (EVar "x"))
+        op <- cbcOpcode idx
+        scopeIdx <- cbcArg1 idx
+        bodyIdx <- cbcArg2 idx
+        scopeOp <- cbcOpcode scopeIdx
+        bodyOp <- cbcOpcode bodyIdx
+        pure
+          ( if op == opWith && scopeOp == opVar && bodyOp == opVar
+              then Pass
+              else Fail "with structure mismatch"
+          ),
+      runTestM "compile EAssert" $ do
+        idx <- compileExpr (EAssert (ELit (NixBool True)) (ELit (NixInt 1)))
+        op <- cbcOpcode idx
+        condIdx <- cbcArg1 idx
+        bodyIdx <- cbcArg2 idx
+        condOp <- cbcOpcode condIdx
+        bodyOp <- cbcOpcode bodyIdx
+        pure
+          ( if op == opAssert && condOp == opLitBool && bodyOp == opLitInt
+              then Pass
+              else Fail "assert structure mismatch"
+          ),
+      runTestM "compile ELambda (FormalName)" $ do
+        idx <-
+          compileExpr
+            (ELambda (FormalName "x") (EResolvedVar 0 0) NoCaptureInfo)
+        op <- cbcOpcode idx
+        fl <- cbcFlags idx
+        bodyIdx <- cbcArg2 idx
+        bodyOp <- cbcOpcode bodyIdx
+        pure
+          ( if op == opLambda && fl == formalName && bodyOp == opResolvedVar
+              then Pass
+              else
+                Fail
+                  ( "op="
+                      <> T.pack (show op)
+                      <> " flags="
+                      <> T.pack (show fl)
+                  )
+          ),
+      runTestM "compile ELet" $ do
+        idx <-
+          compileExpr
+            ( ELet
+                [NamedBinding [StaticKey "x"] (ELit (NixInt 42))]
+                (EResolvedVar 0 0)
+                NoCaptureInfo
+            )
+        op <- cbcOpcode idx
+        count <- cbcShortArg idx
+        bodyIdx <- cbcArg2 idx
+        bodyOp <- cbcOpcode bodyIdx
+        pure
+          ( if op == opLet && count == 1 && bodyOp == opResolvedVar
+              then Pass
+              else
+                Fail
+                  ( "op="
+                      <> T.pack (show op)
+                      <> " count="
+                      <> T.pack (show count)
+                  )
+          ),
+      runTestM "compile EAttrs" $ do
+        idx <-
+          compileExpr
+            ( EAttrs
+                False
+                [NamedBinding [StaticKey "a"] (ELit (NixInt 1))]
+                NoCaptureInfo
+            )
+        op <- cbcOpcode idx
+        fl <- cbcFlags idx
+        count <- cbcShortArg idx
+        pure
+          ( if op == opAttrs && fl == 0 && count == 1
+              then Pass
+              else Fail "attrs structure mismatch"
+          ),
+      runTestM "compile EAttrs recursive" $ do
+        idx <-
+          compileExpr
+            ( EAttrs
+                True
+                [ NamedBinding [StaticKey "x"] (ELit (NixInt 1)),
+                  NamedBinding [StaticKey "y"] (EResolvedVar 0 0)
+                ]
+                (Captures [(0, 0)])
+            )
+        op <- cbcOpcode idx
+        fl <- cbcFlags idx
+        count <- cbcShortArg idx
+        pure
+          ( if op == opAttrs && fl == 1 && count == 2
+              then Pass
+              else
+                Fail
+                  ( "flags="
+                      <> T.pack (show fl)
+                      <> " count="
+                      <> T.pack (show count)
+                  )
+          ),
+      runTestM "compile ESelect" $ do
+        idx <-
+          compileExpr
+            (ESelect (EVar "x") [StaticKey "a"] Nothing)
+        op <- cbcOpcode idx
+        fl <- cbcFlags idx
+        pure
+          ( if op == opSelect && fl == 0
+              then Pass
+              else Fail ("flags=" <> T.pack (show fl))
+          ),
+      runTestM "compile ESelect with default" $ do
+        idx <-
+          compileExpr
+            (ESelect (EVar "x") [StaticKey "a"] (Just (ELit NixNull)))
+        op <- cbcOpcode idx
+        fl <- cbcFlags idx
+        defIdx <- cbcArg3 idx
+        defOp <- cbcOpcode defIdx
+        pure
+          ( if op == opSelect && fl == 1 && defOp == opLitNull
+              then Pass
+              else Fail ("flags=" <> T.pack (show fl))
+          ),
+      runTestM "compile EHasAttr" $ do
+        idx <-
+          compileExpr
+            (EHasAttr (EVar "x") [StaticKey "a", StaticKey "b"])
+        op <- cbcOpcode idx
+        pathLen <- cbcShortArg idx
+        pure
+          ( if op == opHasAttr && pathLen == 2
+              then Pass
+              else
+                Fail
+                  ( "op="
+                      <> T.pack (show op)
+                      <> " pathLen="
+                      <> T.pack (show pathLen)
+                  )
+          ),
+      runTestM "compile ESearchPath" $ do
+        idx <- compileExpr (ESearchPath "nixpkgs")
+        op <- cbcOpcode idx
+        sym <- cbcArg1 idx
+        pure
+          ( if op == opSearchPath && symbolText (Symbol sym) == "nixpkgs"
+              then Pass
+              else Fail ("op=" <> T.pack (show op))
+          ),
+      runTestM "op_count grows after compilation" $ do
+        before <- cbcOpCount
+        _ <- compileExpr (EApp (EVar "f") (ELit (NixInt 1)))
+        after <- cbcOpCount
+        pure
+          ( if after > before
+              then Pass
+              else
+                Fail
+                  ( "before="
+                      <> T.pack (show before)
+                      <> " after="
+                      <> T.pack (show after)
+                  )
+          ),
+      runTestM "compile ELit NixFloat" $ do
+        idx <- compileExpr (ELit (NixFloat 3.14))
+        op <- cbcOpcode idx
+        pure (assertEqual "opcode" opLitFloat op),
+      runTestM "compile ELit NixUri" $ do
+        idx <- compileExpr (ELit (NixUri "https://example.com"))
+        op <- cbcOpcode idx
+        sym <- cbcArg1 idx
+        pure
+          ( if op == opLitUri && symbolText (Symbol sym) == "https://example.com"
+              then Pass
+              else Fail "uri mismatch"
+          ),
+      runTestM "compile ELit NixPath" $ do
+        idx <- compileExpr (ELit (NixPath "/nix/store/foo"))
+        op <- cbcOpcode idx
+        sym <- cbcArg1 idx
+        pure
+          ( if op == opLitPath && symbolText (Symbol sym) == "/nix/store/foo"
+              then Pass
+              else Fail "path mismatch"
+          ),
+      runTestM "compile Inherit binding" $ do
+        idx <-
+          compileExpr
+            ( EAttrs
+                False
+                [Inherit Nothing ["x", "y"]]
+                NoCaptureInfo
+            )
+        op <- cbcOpcode idx
+        count <- cbcShortArg idx
+        pure
+          ( if op == opAttrs && count == 1
+              then Pass
+              else Fail "inherit binding mismatch"
+          ),
+      runTestM "compile ELambda (FormalSet)" $ do
+        idx <-
+          compileExpr
+            ( ELambda
+                (FormalSet [Formal "a" Nothing, Formal "b" (Just (ELit (NixInt 0)))] False)
+                (EResolvedVar 0 0)
+                NoCaptureInfo
+            )
+        op <- cbcOpcode idx
+        fl <- cbcFlags idx
+        pure
+          ( if op == opLambda && fl == formalSet
+              then Pass
+              else Fail ("flags=" <> T.pack (show fl))
+          ),
+      runTestM "compile ELambda (FormalNamedSet)" $ do
+        idx <-
+          compileExpr
+            ( ELambda
+                (FormalNamedSet "args" [Formal "x" Nothing] True)
+                (EResolvedVar 0 0)
+                NoCaptureInfo
+            )
+        op <- cbcOpcode idx
+        fl <- cbcFlags idx
+        pure
+          ( if op == opLambda && fl == formalNamedSet
+              then Pass
+              else Fail ("flags=" <> T.pack (show fl))
+          ),
+      runTestM "compile CaptureInfo (Captures)" $ do
+        idx <-
+          compileExpr
+            ( ELambda
+                (FormalName "x")
+                (EResolvedVar 0 0)
+                (Captures [(1, 2), (3, 4)])
+            )
+        op <- cbcOpcode idx
+        capOff <- cbcArg3 idx
+        capTag <- cbcData capOff
+        capCount <- cbcData (capOff + 1)
+        capL0 <- cbcData (capOff + 2)
+        capI0 <- cbcData (capOff + 3)
+        capL1 <- cbcData (capOff + 4)
+        capI1 <- cbcData (capOff + 5)
+        pure
+          ( if op == opLambda
+              && capTag == captureSlots
+              && capCount == 2
+              && capL0 == 1
+              && capI0 == 2
+              && capL1 == 3
+              && capI1 == 4
+              then Pass
+              else
+                Fail
+                  ( "capTag="
+                      <> T.pack (show capTag)
+                      <> " capCount="
+                      <> T.pack (show capCount)
+                  )
+          ),
+      runTestM "compile CaptureInfo (CapturesWithScopes)" $ do
+        idx <-
+          compileExpr
+            ( ELambda
+                (FormalName "x")
+                (EResolvedVar 0 0)
+                (CapturesWithScopes [(0, 0)])
+            )
+        capOff <- cbcArg3 idx
+        capTag <- cbcData capOff
+        pure (assertEqual "captureTag" captureWithScopes capTag),
+      runTestM "compile EWithVar" $ do
+        idx <- compileExpr (EWithVar "dynamic")
+        op <- cbcOpcode idx
+        sym <- cbcArg1 idx
+        pure
+          ( if op == opWithVar && symbolText (Symbol sym) == "dynamic"
+              then Pass
+              else Fail "withvar mismatch"
+          ),
+      runTestM "compile EIndStr" $ do
+        idx <- compileExpr (EIndStr [StrLit "indented"])
+        op <- cbcOpcode idx
+        count <- cbcShortArg idx
+        pure
+          ( if op == opIndStr && count == 1
+              then Pass
+              else Fail "indstr mismatch"
+          )
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
 
@@ -3713,7 +4218,8 @@ main = bracket_ arenaInit arenaDestroy $ do
           testPhase4IO,
           testSymbol,
           testCAttrSet,
-          testCThunk
+          testCThunk,
+          testBytecodeCompile
         ]
   let total = length results
       passed = length (filter id results)

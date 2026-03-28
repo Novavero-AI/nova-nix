@@ -20,6 +20,7 @@ import Data.Word (Word32)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (Ptr)
 import Foreign.StablePtr (castPtrToStablePtr, freeStablePtr)
+import Nix.Eval.CBytecode (cbcDestroy, cbcInit)
 import Nix.Eval.CCtxStr (cctxstrFreeAll)
 import Nix.Eval.CEnv (cenvDestroy, cenvInit)
 import Nix.Eval.CList (clistFreeAll)
@@ -48,12 +49,13 @@ foreign import ccall unsafe "nn_attrset_free_all"
 -- ---------------------------------------------------------------------------
 
 -- | Initialize all C data layer arenas.  Call once before evaluation.
--- Initializes: symbol table, thunk arena, env slot allocator.
+-- Initializes: symbol table, thunk arena, env slot allocator, bytecode store.
 arenaInit :: IO ()
 arenaInit = do
   symbolInit 0
   cthunkInit 0
   cenvInit
+  cbcInit 0 0
 
 -- | Destroy all C arenas, properly freeing StablePtrs first.
 --
@@ -61,15 +63,17 @@ arenaInit = do
 -- 2. Frees each StablePtr from Haskell
 -- 3. Frees all tracked CLists (bulk cleanup)
 -- 4. Frees all tracked CAttrSets (bulk cleanup)
--- 5. Destroys env slot pages
--- 6. Destroys thunk arena blocks
--- 7. Destroys symbol table + string arena
+-- 5. Destroys bytecode store
+-- 6. Destroys env slot pages
+-- 7. Destroys thunk arena blocks
+-- 8. Destroys symbol table + string arena
 arenaDestroy :: IO ()
 arenaDestroy = do
   cleanupStablePtrs
   cctxstrFreeAll
   clistFreeAll
   cattrsetFreeAll
+  cbcDestroy
   cenvDestroy
   cthunkDestroy
   symbolDestroy

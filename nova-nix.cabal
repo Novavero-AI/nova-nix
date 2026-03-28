@@ -54,6 +54,8 @@ library
     Nix.Eval.CEnv
     Nix.Eval.CList
     Nix.Eval.CCtxStr
+    Nix.Eval.CBytecode
+    Nix.Eval.Compile
     Nix.Eval.Arena
     Nix.Store
     Nix.Store.Path
@@ -93,6 +95,7 @@ library
     cbits/nn_list.c
     cbits/nn_ctxstr.c
     cbits/nn_arena.c
+    cbits/nn_bytecode.c
   include-dirs:     cbits
   cc-options:       -std=c99 -Wall -Wextra -pedantic -Werror
   hs-source-dirs:   src
