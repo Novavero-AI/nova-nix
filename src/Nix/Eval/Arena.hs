@@ -35,6 +35,13 @@ foreign import ccall unsafe "nn_arena_collect_stableptrs"
   c_nn_arena_collect_stableptrs :: Ptr (Ptr ()) -> Word32 -> IO Word32
 
 -- ---------------------------------------------------------------------------
+-- FFI import for bulk CAttrSet cleanup
+-- ---------------------------------------------------------------------------
+
+foreign import ccall unsafe "nn_attrset_free_all"
+  cattrsetFreeAll :: IO ()
+
+-- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
@@ -50,12 +57,14 @@ arenaInit = do
 --
 -- 1. Collects all StablePtr payloads from thunks (batch C call)
 -- 2. Frees each StablePtr from Haskell
--- 3. Destroys env slot pages
--- 4. Destroys thunk arena blocks
--- 5. Destroys symbol table + string arena
+-- 3. Frees all tracked CAttrSets (bulk cleanup)
+-- 4. Destroys env slot pages
+-- 5. Destroys thunk arena blocks
+-- 6. Destroys symbol table + string arena
 arenaDestroy :: IO ()
 arenaDestroy = do
   cleanupStablePtrs
+  cattrsetFreeAll
   cenvDestroy
   cthunkDestroy
   symbolDestroy

@@ -12,16 +12,16 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import Foreign.Ptr (nullPtr)
-import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
+import Foreign.Ptr (castPtr, nullPtr)
+import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
-import Nix.Eval (Env (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, mkStr, runPureEval)
+import Nix.Eval (Env (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, evaluated, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFree, cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
-import Nix.Eval.CThunk (cthunkCount, cthunkGet, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
+import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
@@ -41,7 +41,7 @@ import qualified System.Info as SI
 import qualified System.Process as Proc
 
 -- ---------------------------------------------------------------------------
--- Test harness (same pattern as gbnet-hs, nova-cache)
+-- Test harness
 -- ---------------------------------------------------------------------------
 
 data TestResult = Pass | Fail !Text
@@ -1334,7 +1334,7 @@ testBatch5 = do
       runTest "fromJSON object" $
         assertEval "fromJSON-obj" "(builtins.fromJSON \"{\\\"a\\\": 1}\").a" (VInt 1),
       runTest "fromJSON roundtrip" $
-        assertEval "fromJSON-rt" "builtins.fromJSON (builtins.toJSON { a = 1; b = [ 2 3 ]; })" (VAttrs (attrSetFromMap (Map.fromList [("a", Evaluated (VInt 1)), ("b", Evaluated (VList [Evaluated (VInt 2), Evaluated (VInt 3)]))]))),
+        assertEval "fromJSON-rt" "builtins.fromJSON (builtins.toJSON { a = 1; b = [ 2 3 ]; })" (VAttrs (attrSetFromMap (Map.fromList [("a", evaluated (VInt 1)), ("b", evaluated (VList [evaluated (VInt 2), evaluated (VInt 3)]))]))),
       runTest "fromJSON invalid" $
         assertEvalFail "fromJSON-bad" "builtins.fromJSON \"not json\"",
       -- hashString
@@ -2379,8 +2379,8 @@ testBuildOrchestrator = do
                 ]
           )
         $ \case
-          VAttrs attrs -> case attrSetLookup "_derivation" attrs of
-            Just (Evaluated (VDerivation drv)) ->
+          VAttrs attrs -> case attrSetLookup "_derivation" attrs >>= readThunkValue of
+            Just (VDerivation drv) ->
               if Map.null (drvInputDrvs drv)
                 then Fail "expected non-empty drvInputDrvs"
                 else Pass
@@ -3113,8 +3113,8 @@ evalAndBuild storeDir source = do
       case evalResult of
         Left err -> pure (Left ("eval error: " <> err))
         Right val -> case val of
-          VAttrs attrs -> case attrSetLookup "_derivation" attrs of
-            Just (Evaluated (VDerivation drv)) -> do
+          VAttrs attrs -> case attrSetLookup "_derivation" attrs >>= readThunkValue of
+            Just (VDerivation drv) -> do
               store <- openStore storeDir
               tmpBase <- getTemporaryDirectory
               let config = (defaultBuildConfig storeDir) {bcTmpDir = tmpBase </> "nova-nix-e2e-tmp"}
@@ -3221,9 +3221,9 @@ testPhase4 = do
       runTest "parseNixPath single" $
         let result = parseNixPath "nixpkgs=/home/user/nixpkgs"
          in case result of
-              [Evaluated (VAttrs m)] ->
-                case (attrSetLookup "prefix" m, attrSetLookup "path" m) of
-                  (Just (Evaluated (VStr "nixpkgs" _)), Just (Evaluated (VStr "/home/user/nixpkgs" _))) -> Pass
+              [thunk] | Just (VAttrs m) <- readThunkValue thunk ->
+                case (attrSetLookup "prefix" m >>= readThunkValue, attrSetLookup "path" m >>= readThunkValue) of
+                  (Just (VStr "nixpkgs" _), Just (VStr "/home/user/nixpkgs" _)) -> Pass
                   _ -> Fail "wrong prefix/path"
               _ -> Fail ("expected one entry, got " <> T.pack (show (length result))),
       runTest "parseNixPath multiple" $
@@ -3231,9 +3231,9 @@ testPhase4 = do
       runTest "parseNixPath plain path" $
         let result = parseNixPath "/some/path"
          in case result of
-              [Evaluated (VAttrs m)] ->
-                case (attrSetLookup "prefix" m, attrSetLookup "path" m) of
-                  (Just (Evaluated (VStr "" _)), Just (Evaluated (VStr "/some/path" _))) -> Pass
+              [thunk] | Just (VAttrs m) <- readThunkValue thunk ->
+                case (attrSetLookup "prefix" m >>= readThunkValue, attrSetLookup "path" m >>= readThunkValue) of
+                  (Just (VStr "" _), Just (VStr "/some/path" _)) -> Pass
                   _ -> Fail "wrong prefix/path for plain"
               _ -> Fail "expected one entry",
       -- ESearchPath parser test
@@ -3342,6 +3342,15 @@ testSymbol = do
 -- C attribute set (FFI)
 -- ---------------------------------------------------------------------------
 
+-- | Cast a StablePtr to CThunkPtr for CAttrSet tests.
+-- CAttrSet stores void* — we use StablePtrs as opaque values in tests.
+spToCPtr :: StablePtr a -> CThunkPtr
+spToCPtr = castPtr . castStablePtrToPtr
+
+-- | Cast a CThunkPtr back to StablePtr for CAttrSet test verification.
+cptrToSp :: CThunkPtr -> StablePtr a
+cptrToSp = castPtrToStablePtr . castPtr
+
 testCAttrSet :: IO [Bool]
 testCAttrSet = do
   putStrLn "cattrset"
@@ -3349,7 +3358,7 @@ testCAttrSet = do
   sequence
     [ runTestM "new/free" $ do
         set <- cattrsetNew 16
-        cattrsetFree set
+        -- set freed by arenaDestroy via nn_attrset_free_all
         pure Pass,
       runTestM "insert + freeze + lookup" $ do
         set <- cattrsetNew 4
@@ -3357,19 +3366,19 @@ testCAttrSet = do
         kVer <- symbolIntern "version"
         valName <- newStablePtr ("hello" :: Text)
         valVer <- newStablePtr ("1.0" :: Text)
-        cattrsetInsert set kName valName
-        cattrsetInsert set kVer valVer
+        cattrsetInsert set kName (spToCPtr valName)
+        cattrsetInsert set kVer (spToCPtr valVer)
         cattrsetFreeze set
         result <- cattrsetLookup set kName
         case result of
           Nothing -> do
-            cattrsetFree set
+            -- set freed by arenaDestroy via nn_attrset_free_all
             freeStablePtr valName
             freeStablePtr valVer
             pure (Fail "lookup returned Nothing")
-          Just sp -> do
-            val <- deRefStablePtr sp :: IO Text
-            cattrsetFree set
+          Just cptr -> do
+            val <- deRefStablePtr (cptrToSp cptr) :: IO Text
+            -- set freed by arenaDestroy via nn_attrset_free_all
             freeStablePtr valName
             freeStablePtr valVer
             pure (assertEqual "lookup name" "hello" val),
@@ -3378,10 +3387,10 @@ testCAttrSet = do
         kFoo <- symbolIntern "foo"
         kBar <- symbolIntern "bar"
         sp <- newStablePtr ("x" :: Text)
-        cattrsetInsert set kFoo sp
+        cattrsetInsert set kFoo (spToCPtr sp)
         cattrsetFreeze set
         result <- cattrsetLookup set kBar
-        cattrsetFree set
+        -- set freed by arenaDestroy via nn_attrset_free_all
         freeStablePtr sp
         pure (case result of Nothing -> Pass; Just _ -> Fail "expected Nothing"),
       runTestM "size after freeze" $ do
@@ -3390,12 +3399,12 @@ testCAttrSet = do
         k2 <- symbolIntern "b"
         k3 <- symbolIntern "c"
         sp <- newStablePtr (42 :: Int)
-        cattrsetInsert set k1 sp
-        cattrsetInsert set k2 sp
-        cattrsetInsert set k3 sp
+        cattrsetInsert set k1 (spToCPtr sp)
+        cattrsetInsert set k2 (spToCPtr sp)
+        cattrsetInsert set k3 (spToCPtr sp)
         cattrsetFreeze set
         n <- cattrsetSize set
-        cattrsetFree set
+        -- set freed by arenaDestroy via nn_attrset_free_all
         freeStablePtr sp
         pure (assertEqual "size" 3 n),
       runTestM "duplicate keys: last writer wins" $ do
@@ -3403,15 +3412,15 @@ testCAttrSet = do
         kName <- symbolIntern "name"
         sp1 <- newStablePtr ("first" :: Text)
         sp2 <- newStablePtr ("second" :: Text)
-        cattrsetInsert set kName sp1
-        cattrsetInsert set kName sp2
+        cattrsetInsert set kName (spToCPtr sp1)
+        cattrsetInsert set kName (spToCPtr sp2)
         cattrsetFreeze set
         n <- cattrsetSize set
         result <- cattrsetLookup set kName
         val <- case result of
           Nothing -> pure "MISSING"
-          Just sp -> deRefStablePtr sp
-        cattrsetFree set
+          Just cptr -> deRefStablePtr (cptrToSp cptr)
+        -- set freed by arenaDestroy via nn_attrset_free_all
         freeStablePtr sp1
         freeStablePtr sp2
         pure
@@ -3426,12 +3435,12 @@ testCAttrSet = do
         k2 <- symbolIntern "aaa"
         k3 <- symbolIntern "mmm"
         sp <- newStablePtr (0 :: Int)
-        cattrsetInsert set k1 sp
-        cattrsetInsert set k2 sp
-        cattrsetInsert set k3 sp
+        cattrsetInsert set k1 (spToCPtr sp)
+        cattrsetInsert set k2 (spToCPtr sp)
+        cattrsetInsert set k3 (spToCPtr sp)
         cattrsetFreeze set
         keys <- cattrsetKeys set
-        cattrsetFree set
+        -- set freed by arenaDestroy via nn_attrset_free_all
         freeStablePtr sp
         -- Keys should be sorted by symbol ID (ascending)
         let ids = map unSymbol keys
@@ -3446,10 +3455,10 @@ testCAttrSet = do
         spA <- newStablePtr ("fromA" :: Text)
         spB <- newStablePtr ("fromB" :: Text)
         spZ <- newStablePtr ("onlyA" :: Text)
-        cattrsetInsert setA kX spA
-        cattrsetInsert setA kZ spZ
-        cattrsetInsert setB kX spB
-        cattrsetInsert setB kY spB
+        cattrsetInsert setA kX (spToCPtr spA)
+        cattrsetInsert setA kZ (spToCPtr spZ)
+        cattrsetInsert setB kX (spToCPtr spB)
+        cattrsetInsert setB kY (spToCPtr spB)
         cattrsetFreeze setA
         cattrsetFreeze setB
         merged <- cattrsetUnion setA setB
@@ -3457,10 +3466,8 @@ testCAttrSet = do
         resultX <- cattrsetLookup merged kX
         valX <- case resultX of
           Nothing -> pure "MISSING"
-          Just sp -> deRefStablePtr sp
-        cattrsetFree setA
-        cattrsetFree setB
-        cattrsetFree merged
+          Just cptr -> deRefStablePtr (cptrToSp cptr)
+        -- sets freed by arenaDestroy via nn_attrset_free_all
         freeStablePtr spA
         freeStablePtr spB
         freeStablePtr spZ
@@ -3473,12 +3480,12 @@ testCAttrSet = do
         set <- cattrsetNew 1024
         sp <- newStablePtr (0 :: Int)
         syms <- mapM (\i -> symbolIntern ("key_" <> T.pack (show (i :: Int)))) [1 .. 10000]
-        mapM_ (\sym -> cattrsetInsert set sym sp) syms
+        mapM_ (\sym -> cattrsetInsert set sym (spToCPtr sp)) syms
         cattrsetFreeze set
         n <- cattrsetSize set
         -- Spot-check a few lookups
         hit <- cattrsetLookup set (syms !! 5000)
-        cattrsetFree set
+        -- set freed by arenaDestroy via nn_attrset_free_all
         freeStablePtr sp
         pure
           ( if n == 10000 && isJust hit

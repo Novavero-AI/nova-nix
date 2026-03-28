@@ -18,7 +18,7 @@ module Nix.Eval
 
     -- * Attribute sets (re-exported from Types)
     AttrSet (..),
-    LazyBinding (..),
+    CAttrSet,
     attrSetFromMap,
     attrSetLookup,
     attrSetKeys,
@@ -51,6 +51,7 @@ module Nix.Eval
     -- * Helpers (for Builtins)
     typeName,
     evaluated,
+    readThunkValue,
 
     -- * Builtin registry
     BuiltinDef (..),
@@ -87,9 +88,9 @@ import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
 import Nix.Eval.Types
   ( AttrSet (..),
+    CAttrSet,
     CompiledRegex (..),
     Env (..),
-    LazyBinding (..),
     MonadEval (..),
     NixValue (..),
     PureEval (..),
@@ -101,7 +102,7 @@ import Nix.Eval.Types
     attrSetFromMap,
     attrSetKeys,
     attrSetLookup,
-    attrSetMapWithKeyLazy,
+    attrSetMapWithKey,
     attrSetMember,
     attrSetNull,
     attrSetRemoveKeys,
@@ -109,6 +110,7 @@ import Nix.Eval.Types
     attrSetToAscList,
     attrSetToMap,
     attrSetUnionWith,
+    buildCAttrSetKeys,
     buildCSlots,
     cheapThunk,
     emptyContext,
@@ -117,13 +119,14 @@ import Nix.Eval.Types
     envLookup,
     envLookupResolved,
     evaluated,
+    fillCAttrSetValues,
     fillCSlots,
     lookupWithScopes,
     mkStr,
     mkSyntheticThunk,
     mkThunk,
-    newLazyAttrCache,
     pushWithScope,
+    readThunkValue,
     typeName,
     withScopesForCapture,
   )
@@ -253,18 +256,16 @@ evalAttrs env True bindings captureInfo = evalRecAttrs env bindings captureInfo
 
 -- | Non-recursive attribute set: thunks capture the outer environment.
 --
--- Uses 'LazyAttrs' to defer thunk + IORef allocation: only keys that
--- are actually accessed get materialized.  For @all-packages.nix@
--- with ~15k entries per stdenv stage, this avoids ~15k IORef
--- allocations when only ~50 packages are touched.  Dynamic keys are
--- resolved eagerly (they may depend on evaluation), but value thunks
--- are deferred.
+-- Eagerly builds all thunks and packs them into a C-backed CAttrSet.
+-- With C arena thunks (~16 bytes, ~20ns allocation), eager construction
+-- is cheaper than the former LazyBinding overhead and moves all data
+-- off the GHC heap.  Dynamic keys are resolved eagerly (they may depend
+-- on evaluation).
 evalNonRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
 evalNonRecAttrs env bindings = do
   resolvedBindings <- resolveBindingKeys env bindings
-  let lazyBindingMap = buildLazyBindingMap env resolvedBindings
-      cache = newLazyAttrCache lazyBindingMap
-  pure (VAttrs (LazyAttrs lazyBindingMap cache))
+  let thunkMap = buildThunkMap env resolvedBindings
+  pure (VAttrs (attrSetFromMap thunkMap))
 
 -- | Recursive attribute set: thunks capture the completed environment
 -- (Haskell's laziness ties the knot — Thunk's Env field is lazy).
@@ -272,16 +273,16 @@ evalNonRecAttrs env bindings = do
 -- (the rec env is not yet available during key resolution).
 --
 -- Positional path: when all bindings are single static keys, builds
--- 'envSlots' for variable lookup and 'EagerAttrs' for the return value.
+-- 'envSlots' for variable lookup and a CAttrSet for the return value.
 -- Both reference the SAME thunk objects (no duplication).
 --
--- Fallback path: uses 'LazyAttrs' to defer thunk + IORef allocation.
--- The env's 'envLazyScope' points to the SAME 'LazyAttrs' that backs
--- the resulting attr set — one map instead of two.
+-- Fallback path: uses two-phase CAttrSet construction for knot-tying.
+-- Allocates keys first (NULL values), creates env referencing the CAttrSet,
+-- builds thunks capturing that env, then fills CAttrSet values.
 evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> CaptureInfo -> m NixValue
 evalRecAttrs env bindings captureInfo
   | allPositionalBindings bindings =
-      -- Positional path: slots for variable lookup, EagerAttrs for return.
+      -- Positional path: slots for variable lookup, CAttrSet for return.
       -- Two-phase knot-tying: allocate C slot array first so recEnv
       -- can reference slotsPtr, then fill slots with thunks that
       -- lazily capture recEnv.  fillCSlots is forced by seq before
@@ -303,11 +304,19 @@ evalRecAttrs env bindings captureInfo
           thunkList = buildSlotThunks recEnv env bindings
           filled = fillCSlots slotsPtr thunkList
           attrMap = buildAttrMapFromSlots bindings thunkList
-       in filled `seq` pure (VAttrs (EagerAttrs attrMap))
+       in filled `seq` pure (VAttrs (attrSetFromMap attrMap))
   | otherwise = do
-      -- Fallback: dynamic/nested keys — use LazyAttrs.
+      -- Fallback: dynamic/nested keys — two-phase CAttrSet.
+      -- 1. Extract keys from resolved bindings
+      -- 2. Build CAttrSet skeleton with keys only (NULL values)
+      -- 3. Create recEnv referencing the CAttrSet
+      -- 4. Build thunks capturing recEnv (PENDING — env is lazy)
+      -- 5. Fill CAttrSet values with thunk pointers
       resolvedBindings <- resolveBindingKeys env bindings
-      let recEnv =
+      let allKeys = concatMap resolvedBindingTopKeys resolvedBindings
+          cset = buildCAttrSetKeys allKeys
+          attrSet = AttrSet cset
+          recEnv =
             Env
               { envSlots = nullPtr,
                 envSlotCount = 0,
@@ -315,10 +324,9 @@ evalRecAttrs env bindings captureInfo
                 envParent = Just env,
                 envWithScopes = envWithScopes env
               }
-          lazyBindingMap = buildLazyBindingMap recEnv resolvedBindings
-          cache = newLazyAttrCache lazyBindingMap
-          attrSet = LazyAttrs lazyBindingMap cache
-      pure (VAttrs attrSet)
+          thunkMap = buildThunkMap recEnv resolvedBindings
+          filled = fillCAttrSetValues cset thunkMap
+       in filled `seq` pure (VAttrs attrSet)
 
 -- ---------------------------------------------------------------------------
 -- Resolved bindings (for knot-tying in rec {} and let)
@@ -351,44 +359,42 @@ resolveBindingKeys keyEnv = fmap catMaybes . mapM resolveOne
     resolveOne (Inherit (Just fromExpr) names) =
       pure (Just (ResolvedInheritFrom fromExpr names))
 
--- | Build per-key lazy binding recipes from resolved bindings.
--- Simple @key = expr@ bindings become 'LazyExpr' (deferred thunk
--- construction).  Nested paths and inherits fall back to 'PreBuilt'
--- with eagerly-constructed thunks (these are rare in nixpkgs).
-buildLazyBindingMap :: Env -> [ResolvedBinding] -> Map Text LazyBinding
-buildLazyBindingMap thunkEnv = foldl' addBinding Map.empty
+-- | Extract top-level keys from a resolved binding (for two-phase CAttrSet).
+-- Nested paths like @a.b.c = expr@ contribute the top-level key @a@.
+resolvedBindingTopKeys :: ResolvedBinding -> [Text]
+resolvedBindingTopKeys (ResolvedNamed (key : _) _) = [key]
+resolvedBindingTopKeys (ResolvedNamed [] _) = []
+resolvedBindingTopKeys (ResolvedInherit names) = names
+resolvedBindingTopKeys (ResolvedInheritFrom _ names) = names
+
+-- | Build a 'Map Text Thunk' from resolved bindings.
+-- Eagerly creates thunks for all bindings — with C arena thunks
+-- (~16 bytes, ~20ns each), this is cheaper than the former LazyBinding
+-- overhead.  Key collisions (e.g. @a.x = 1; a.y = 2@) are merged
+-- recursively via 'mergeThunks'.
+buildThunkMap :: Env -> [ResolvedBinding] -> Map Text Thunk
+buildThunkMap thunkEnv = foldl' addBinding Map.empty
   where
     addBinding acc (ResolvedNamed [key] bodyExpr) =
       case Map.lookup key acc of
-        Nothing -> Map.insert key (LazyExpr thunkEnv bodyExpr) acc
-        -- Key collision (rare): must merge, so eagerly build both
-        Just existing ->
-          let existingThunk = materializeLazy key existing
-              newThunk = mkThunk thunkEnv bodyExpr
-           in Map.insert key (PreBuilt (mergeThunks existingThunk newThunk)) acc
+        Nothing -> Map.insert key (mkThunk thunkEnv bodyExpr) acc
+        Just existingThunk ->
+          let newThunk = mkThunk thunkEnv bodyExpr
+           in Map.insert key (mergeThunks existingThunk newThunk) acc
     addBinding acc (ResolvedNamed path@(_ : _ : _) bodyExpr) =
       -- Nested path: build eagerly (rare in large rec sets)
       let nested = buildResolvedNestedAttr thunkEnv path bodyExpr
-       in foldl' (\a (k, t) -> insertLazyWithMerge a k (PreBuilt t)) acc (Map.toList nested)
+       in foldl' (\a (k, t) -> insertWithMerge a k t) acc (Map.toList nested)
     addBinding acc (ResolvedNamed [] _) = acc
     addBinding acc (ResolvedInherit names) =
-      foldl' (\a n -> insertLazyWithMerge a n (LazyInherit thunkEnv)) acc names
+      foldl' (\a n -> insertWithMerge a n (inheritLookup thunkEnv n)) acc names
     addBinding acc (ResolvedInheritFrom fromExpr names) =
-      foldl' (\a n -> insertLazyWithMerge a n (LazyInheritFrom thunkEnv fromExpr)) acc names
+      foldl' (\a n -> insertWithMerge a n (mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))) acc names
 
-    insertLazyWithMerge acc key new =
+    insertWithMerge acc key thunk =
       case Map.lookup key acc of
-        Nothing -> Map.insert key new acc
-        Just existing ->
-          let existingThunk = materializeLazy key existing
-              newThunk = materializeLazy key new
-           in Map.insert key (PreBuilt (mergeThunks existingThunk newThunk)) acc
-
-    materializeLazy _key (LazyExpr bindEnv expr) = mkThunk bindEnv expr
-    materializeLazy bindKey (LazyInherit bindEnv) = inheritLookup bindEnv bindKey
-    materializeLazy bindKey (LazyInheritFrom bindEnv fromExpr) =
-      mkThunk bindEnv (ESelect fromExpr [StaticKey bindKey] Nothing)
-    materializeLazy _bindKey (PreBuilt thunk) = thunk
+        Nothing -> Map.insert key thunk acc
+        Just existing -> Map.insert key (mergeThunks existing thunk) acc
 
 -- | Build a nested attribute structure from a resolved dotted path (pure).
 buildResolvedNestedAttr :: Env -> [Text] -> Expr -> Map Text Thunk
@@ -423,12 +429,14 @@ resolveKey env (DynamicKey expr) = do
     VNull -> pure Nothing
     _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName val)
 
--- | Merge two thunks at the same key.  If both are evaluated VAttrs,
+-- | Merge two thunks at the same key.  If both are computed VAttrs,
 -- merge their contents recursively.  Otherwise the right wins.
 mergeThunks :: Thunk -> Thunk -> Thunk
-mergeThunks (Evaluated (VAttrs a)) (Evaluated (VAttrs b)) =
-  Evaluated (VAttrs (attrSetUnionWith mergeThunks a b))
-mergeThunks _ new = new
+mergeThunks a b =
+  case (readThunkValue a, readThunkValue b) of
+    (Just (VAttrs aa), Just (VAttrs bb)) ->
+      evaluated (VAttrs (attrSetUnionWith mergeThunks aa bb))
+    _ -> b
 
 -- ---------------------------------------------------------------------------
 -- Select / has-attr
@@ -698,8 +706,8 @@ buildAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
 -- This enables closure trimming to fire on lambdas that reference
 -- let-bound variables.
 --
--- Fallback path: dynamic\/nested-key blocks use the existing 'LazyAttrs'
--- path with 'envLazyScope'.
+-- Fallback path: dynamic\/nested-key blocks use two-phase CAttrSet
+-- construction with 'envLazyScope'.
 evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> CaptureInfo -> m NixValue
 evalLet env bindings body captureInfo
   | allPositionalBindings bindings =
@@ -724,19 +732,21 @@ evalLet env bindings body captureInfo
           filled = fillCSlots slotsPtr (buildSlotThunks letEnv env bindings)
        in filled `seq` eval letEnv body
   | otherwise = do
-      -- Fallback: dynamic/nested keys — use LazyAttrs.
+      -- Fallback: dynamic/nested keys — two-phase CAttrSet.
       resolvedBindings <- resolveBindingKeys env bindings
-      let letEnv =
+      let allKeys = concatMap resolvedBindingTopKeys resolvedBindings
+          cset = buildCAttrSetKeys allKeys
+          letEnv =
             Env
               { envSlots = nullPtr,
                 envSlotCount = 0,
-                envLazyScope = Just (LazyAttrs lazyBindingMap cache),
+                envLazyScope = Just (AttrSet cset),
                 envParent = Just env,
                 envWithScopes = envWithScopes env
               }
-          lazyBindingMap = buildLazyBindingMap letEnv resolvedBindings
-          cache = newLazyAttrCache lazyBindingMap
-      eval letEnv body
+          thunkMap = buildThunkMap letEnv resolvedBindings
+          filled = fillCAttrSetValues cset thunkMap
+       in filled `seq` eval letEnv body
 
 evalIf :: (MonadEval m) => Env -> Expr -> Expr -> Expr -> m NixValue
 evalIf env cond thenExpr elseExpr = do
@@ -1293,7 +1303,7 @@ builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <
 
 builtinAttrNames :: (MonadEval m) => NixValue -> m NixValue
 builtinAttrNames (VAttrs attrs) =
-  -- Zero thunk allocation for LazyAttrs: attrSetKeys reads binding map keys.
+  -- Zero thunk allocation: attrSetKeys reads symbol names from C arrays.
   pure (VList (map (evaluated . mkStr) (attrSetKeys attrs)))
 builtinAttrNames other =
   throwEvalError ("builtins.attrNames: expected a set, got " <> typeName other)
@@ -1980,11 +1990,12 @@ builtinBitXor _ _ = throwEvalError "builtins.bitXor: expected two integers"
 
 builtinMapAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMapAttrs func (VAttrs attrs) =
-  -- Lazy: each attr value is a deferred @f key val@, forced only on demand.
-  -- Uses attrSetMapWithKeyLazy to avoid materializing all bindings in
-  -- LazyAttrs — each entry stays as a PreBuilt recipe until accessed.
+  -- Each attr value is a deferred @f key val@, forced only on demand.
+  -- Eagerly builds all thunks via attrSetMapWithKey — with C arena thunks
+  -- (~16 bytes each), this is cheaper than the former MappedAttrs overhead
+  -- and keeps all data off the GHC heap.
   -- Slot 0 = function, slot 1 = key, slot 2 = value.
-  pure (VAttrs (attrSetMapWithKeyLazy deferAttr attrs))
+  pure (VAttrs (attrSetMapWithKey deferAttr attrs))
   where
     deferAttr key valThunk =
       let (sp, sc) = buildCSlots [evaluated func, evaluated (mkStr key), valThunk]

@@ -88,6 +88,13 @@ const nn_symbol_t *nn_attrset_keys_ptr(const nn_attrset_t *set);
  * Valid until the set is freed. */
 void *const *nn_attrset_values_ptr(const nn_attrset_t *set);
 
+/* --- Lifecycle: bulk cleanup --- */
+
+/* Free all tracked attribute sets at once (arena-style cleanup).
+ * Every set created via nn_attrset_new is automatically tracked.
+ * Call this once at evaluation end, before destroying sub-arenas. */
+void nn_attrset_free_all(void);
+
 /* --- Set operations --- */
 
 /* Create a new set containing only keys present in both `a` and `b`,

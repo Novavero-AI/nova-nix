@@ -23,7 +23,7 @@ import qualified Data.Text.IO as TIO
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
-import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, force)
+import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Parser (parseNix, readFileAutoEncoding)
@@ -186,20 +186,20 @@ extractDerivation :: NixValue -> IO (Derivation, StorePath)
 extractDerivation (VAttrs attrs) = do
   -- Check type = "derivation"
   case attrSetLookup "type" attrs of
-    Just (Evaluated (VStr "derivation" _)) -> pure ()
+    Just thunk | Just (VStr "derivation" _) <- readThunkValue thunk -> pure ()
     _ -> do
       hPutStrLn stderr "error: result is not a derivation (no type = \"derivation\")"
       exitFailure
   -- Extract the Derivation struct from _derivation
   drv <- case attrSetLookup "_derivation" attrs of
-    Just (Evaluated (VDerivation d)) -> pure d
+    Just thunk | Just (VDerivation d) <- readThunkValue thunk -> pure d
     _ -> do
       hPutStrLn stderr "error: derivation result missing _derivation field"
       exitFailure
   -- Extract drvPath — this is the store path of the .drv file itself,
   -- computed by hashing the ATerm serialization during evaluation.
   drvSP <- case attrSetLookup "drvPath" attrs of
-    Just (Evaluated (VStr path _)) -> case parseStorePath defaultStoreDir path of
+    Just thunk | Just (VStr path _) <- readThunkValue thunk -> case parseStorePath defaultStoreDir path of
       Just sp -> pure sp
       Nothing -> do
         TIO.hPutStrLn stderr ("error: invalid drvPath: " <> path)
@@ -244,15 +244,15 @@ finalize False = pure
 
 -- | Recursively force all thunks in a value, returning the fully
 -- materialized tree.  Unlike 'deepForce' (which returns @()@), this
--- rebuilds the value with all thunks replaced by 'Evaluated'.
+-- rebuilds the value with all thunks replaced by computed C thunks.
 deepForceValue :: (MonadEval m) => NixValue -> m NixValue
 deepForceValue (VList thunks) = do
   forced <- mapM (force >=> deepForceValue) thunks
-  pure (VList (map Evaluated forced))
+  pure (VList (map evaluated forced))
 deepForceValue (VAttrs attrs) = do
   let m = attrSetToMap attrs
   forced <- mapM (force >=> deepForceValue) m
-  pure (VAttrs (attrSetFromMap (Map.map Evaluated forced)))
+  pure (VAttrs (attrSetFromMap (Map.map evaluated forced)))
 deepForceValue val = pure val
 
 -- | Nix-style pretty-printing of a fully forced value.
@@ -279,10 +279,9 @@ prettyValue (VDerivation drv) =
     [] -> "«derivation»"
 
 -- | Pretty-print a thunk.  After deep-forcing, all thunks should be
--- 'Evaluated'; unevaluated thunks render as a placeholder.
+-- computed thunks render their value; pending thunks render as a placeholder.
 prettyThunk :: Thunk -> T.Text
-prettyThunk (Evaluated val) = prettyValue val
-prettyThunk (CThunkRef {}) = "«thunk»"
+prettyThunk thunk = maybe "«thunk»" prettyValue (readThunkValue thunk)
 
 -- | Escape a string for Nix-style output (quotes, backslashes, newlines, tabs, carriage returns).
 escapeNixString :: T.Text -> T.Text

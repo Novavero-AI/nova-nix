@@ -8,8 +8,9 @@
 -- Construction is two-phase: insert entries, then freeze (sort + dedup).
 -- After freeze, lookup is O(log n) binary search over contiguous memory.
 --
--- Values are opaque 'StablePtr' handles — the C side never dereferences
--- them.  Haskell is responsible for managing 'StablePtr' lifetimes.
+-- Values are opaque @CThunkPtr@ handles stored as @void*@ on the C side.
+-- The C side never dereferences them.  Thunk lifetimes are managed by
+-- the thunk arena; attribute set cleanup only frees the key\/value arrays.
 module Nix.Eval.CAttrSet
   ( -- * Opaque handle
     CAttrSet,
@@ -45,7 +46,7 @@ import Data.Word (Word32)
 import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Array (peekArray, withArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
-import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr)
+import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.Symbol (Symbol (..))
 
 -- | Opaque handle to a C-allocated attribute set.
@@ -109,7 +110,7 @@ foreign import ccall unsafe "nn_attrset_remove_keys"
 cattrsetNew :: Word32 -> IO CAttrSet
 cattrsetNew = c_nn_attrset_new
 
--- | Free a C-allocated attribute set.  Does NOT free StablePtr values.
+-- | Free a C-allocated attribute set.  Does NOT free thunk values.
 cattrsetFree :: CAttrSet -> IO ()
 cattrsetFree = c_nn_attrset_free
 
@@ -126,10 +127,10 @@ withCAttrSet cap action = do
 -- ---------------------------------------------------------------------------
 
 -- | Insert a key-value pair.  Call before freeze.
--- The value is a StablePtr cast to Ptr () — C never dereferences it.
-cattrsetInsert :: CAttrSet -> Symbol -> StablePtr a -> IO ()
-cattrsetInsert set (Symbol sym) val =
-  c_nn_attrset_insert set sym (stablePtrToVoid val)
+-- The value is a CThunkPtr cast to Ptr () — C never dereferences it.
+cattrsetInsert :: CAttrSet -> Symbol -> CThunkPtr -> IO ()
+cattrsetInsert set (Symbol sym) ptr =
+  c_nn_attrset_insert set sym (castPtr ptr)
 
 -- | Sort and deduplicate.  Must be called once before any queries.
 cattrsetFreeze :: CAttrSet -> IO ()
@@ -140,11 +141,11 @@ cattrsetFreeze = c_nn_attrset_freeze
 -- ---------------------------------------------------------------------------
 
 -- | Look up a key.  Returns 'Nothing' if not found.
--- The returned 'StablePtr' is borrowed — do not free it.
-cattrsetLookup :: CAttrSet -> Symbol -> IO (Maybe (StablePtr a))
+-- The returned 'CThunkPtr' is borrowed — the thunk arena owns it.
+cattrsetLookup :: CAttrSet -> Symbol -> IO (Maybe CThunkPtr)
 cattrsetLookup set (Symbol sym) = do
   ptr <- c_nn_attrset_lookup set sym
-  pure (if ptr == nullPtr then Nothing else Just (voidToStablePtr ptr))
+  pure (if ptr == nullPtr then Nothing else Just (castPtr ptr))
 
 -- | Find the index of a key, or 'Nothing' if not found.
 cattrsetIndex :: CAttrSet -> Symbol -> IO (Maybe Word32)
@@ -153,12 +154,12 @@ cattrsetIndex set (Symbol sym) = do
   pure (if idx < 0 then Nothing else Just (fromIntegral idx))
 
 -- | Get the value at a known index.
-cattrsetGetValue :: CAttrSet -> Word32 -> IO (StablePtr a)
-cattrsetGetValue set idx = voidToStablePtr <$> c_nn_attrset_get_value set idx
+cattrsetGetValue :: CAttrSet -> Word32 -> IO CThunkPtr
+cattrsetGetValue set idx = castPtr <$> c_nn_attrset_get_value set idx
 
--- | Update the value at a known index (for lazy materialization).
-cattrsetSetValue :: CAttrSet -> Word32 -> StablePtr a -> IO ()
-cattrsetSetValue set idx val = c_nn_attrset_set_value set idx (stablePtrToVoid val)
+-- | Update the value at a known index (for two-phase construction).
+cattrsetSetValue :: CAttrSet -> Word32 -> CThunkPtr -> IO ()
+cattrsetSetValue set idx ptr = c_nn_attrset_set_value set idx (castPtr ptr)
 
 -- | Get the key symbol at a known index.
 cattrsetGetKey :: CAttrSet -> Word32 -> IO Symbol
@@ -199,13 +200,3 @@ cattrsetRemoveKeys set syms = do
       n = fromIntegral (length raw)
   withArray raw $ \ptr ->
     c_nn_attrset_remove_keys set ptr n
-
--- ---------------------------------------------------------------------------
--- StablePtr <-> Ptr () casting
--- ---------------------------------------------------------------------------
-
-stablePtrToVoid :: StablePtr a -> Ptr ()
-stablePtrToVoid = castPtr . castStablePtrToPtr
-
-voidToStablePtr :: Ptr () -> StablePtr a
-voidToStablePtr = castPtrToStablePtr . castPtr

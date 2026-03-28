@@ -15,6 +15,9 @@
 
 #include <stdint.h>
 
+/* Bulk-free all tracked attribute sets (called during arena teardown). */
+void nn_attrset_free_all(void);
+
 /* Count how many thunk payloads are StablePtrs (need freeing).
  * Iterates all thunks, checks state + val_tag. */
 uint32_t nn_arena_stableptr_count(void);

@@ -16,6 +16,7 @@
  */
 
 #include "nn_arena.h"
+#include "nn_attrset.h"
 #include "nn_thunk.h"
 
 #include <stddef.h>

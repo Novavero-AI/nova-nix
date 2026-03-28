@@ -10,10 +10,11 @@ module Nix.Eval.Types
     NixValue (..),
     CompiledRegex (..),
     Thunk (..),
+    readThunkValue,
 
-    -- * Attribute sets (lazy/eager unified abstraction)
+    -- * Attribute sets (C-backed sorted arrays)
     AttrSet (..),
-    LazyBinding (..),
+    CAttrSet,
     attrSetLookup,
     attrSetKeys,
     attrSetToMap,
@@ -24,12 +25,10 @@ module Nix.Eval.Types
     attrSetElems,
     attrSetToAscList,
     attrSetMapWithKey,
-    attrSetMapWithKeyLazy,
     attrSetRemoveKeys,
     attrSetUnionWith,
-    mappedToLazy,
-    newLazyAttrCache,
-    newMappedCache,
+    buildCAttrSetKeys,
+    fillCAttrSetValues,
 
     -- * String context
     StringContextElement (..),
@@ -67,13 +66,11 @@ module Nix.Eval.Types
   )
 where
 
+import Control.Monad (forM_)
 import Data.ByteString (ByteString)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Primitive.SmallArray (SmallArray, indexSmallArray, sizeofSmallArray)
 import Data.Set (Set)
 import Data.Text (Text)
 import Data.Word (Word8)
@@ -81,11 +78,11 @@ import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, newStablePtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation)
-import Nix.Eval.CAttrSet (CAttrSet, cattrsetGetKey, cattrsetIndex, cattrsetKeys, cattrsetSize)
+import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CEnv (cenvAllocSlots)
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkNew, cthunkNewComputed, cthunkNewComputedBool, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedNull, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.Symbol (symbolIntern, symbolText)
-import Nix.Expr.Types (AttrKey (..), CaptureInfo (..), Expr (..), Formals, NixAtom (..), StringPart (..))
+import Nix.Expr.Types (CaptureInfo (..), Expr (..), Formals, NixAtom (..))
 import Nix.Store.Path (StorePath)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Text.Regex.TDFA as RE
@@ -137,10 +134,9 @@ mkStr t = VStr t emptyContext
 -- Thunks
 -- ---------------------------------------------------------------------------
 
--- | A thunk: either a C-backed memoization cell (deferred evaluation),
--- or an already-known value (no C allocation needed).
+-- | A thunk: a C arena-allocated memoization cell.
 --
--- Each 'CThunkRef' points to an arena-allocated @nn_thunk_t@ in C.
+-- Each thunk points to an @nn_thunk_t@ in the C arena.
 -- On first force, the cell transitions PENDING -> BLACKHOLE -> COMPUTED,
 -- which detects infinite recursion (BLACKHOLE) and drops the Expr/Env
 -- references — matching real Nix which mutates thunks in-place.
@@ -148,24 +144,46 @@ mkStr t = VStr t emptyContext
 -- The C thunk is allocated via 'unsafePerformIO' in 'mkThunk' (same
 -- pattern as the former IORef-based approach) so that knot-tying works
 -- unchanged.  Arena pointers remain valid until 'cthunkDestroy'.
-data Thunk
-  = -- | Deferred thunk: C arena-allocated memoization cell.
-    -- Payload is StablePtr to (Expr, Env) when pending, or
-    -- StablePtr to NixValue when computed.
-    CThunkRef !CThunkPtr
-  | -- | Already-known value (no C allocation overhead).
-    Evaluated !NixValue
+newtype Thunk = Thunk {unThunk :: CThunkPtr}
 
 instance Show Thunk where
-  show (Evaluated val) = "Evaluated (" ++ show val ++ ")"
-  show (CThunkRef _) = "CThunkRef <ptr>"
+  show (Thunk ptr) =
+    case unsafePerformIO (cthunkState ptr) of
+      1 {- COMPUTED -} -> case readThunkValue (Thunk ptr) of
+        Just val -> "Thunk (" ++ show val ++ ")"
+        Nothing -> "Thunk <computed?>"
+      0 -> "Thunk <pending>"
+      2 -> "Thunk <blackhole>"
+      _ -> "Thunk <unknown>"
 
--- | Equality: compares values for 'Evaluated', pointer identity for
--- 'CThunkRef'.  Only used in tests on non-recursive structures.
+-- | Equality: pointer identity fast path, then value comparison for
+-- COMPUTED thunks.  Only used in tests on non-recursive structures.
 instance Eq Thunk where
-  (Evaluated v1) == (Evaluated v2) = v1 == v2
-  (CThunkRef p1) == (CThunkRef p2) = p1 == p2
-  _ == _ = False
+  (Thunk p1) == (Thunk p2)
+    | p1 == p2 = True
+    | otherwise = case (readThunkValue (Thunk p1), readThunkValue (Thunk p2)) of
+        (Just v1, Just v2) -> v1 == v2
+        _ -> False
+
+-- | Read a COMPUTED thunk's value without forcing.
+-- Returns 'Nothing' for PENDING or BLACKHOLE thunks.
+-- Uses 'unsafePerformIO' — safe because C reads are idempotent.
+readThunkValue :: Thunk -> Maybe NixValue
+readThunkValue (Thunk ptr) =
+  unsafePerformIO $ do
+    state <- cthunkState ptr
+    if state /= 1
+      then pure Nothing
+      else do
+        tag <- cthunkValueTag ptr
+        fmap Just $ case tag of
+          0 {- INT -} -> VInt . fromIntegral <$> cthunkGetInt ptr
+          1 {- FLOAT -} -> VFloat <$> cthunkGetFloat ptr
+          2 {- BOOL -} -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
+          3 {- NULL -} -> pure VNull
+          _ {- PTR -} -> do
+            payload <- cthunkPayload ptr
+            deRefStablePtr (castPtrToStablePtr payload)
 
 -- | A Nix value — the result of evaluating an expression.
 data NixValue
@@ -198,237 +216,76 @@ data NixValue
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
--- Attribute sets (lazy/eager unified abstraction)
+-- Attribute sets (C-backed sorted arrays)
 -- ---------------------------------------------------------------------------
 
--- | Per-key lazy binding recipe.  Used by 'LazyAttrs' to defer
--- thunk construction until first access.  Only ~50 of nixpkgs' 30k
--- packages are touched for a typical eval — storing recipes instead
--- of pre-built thunks avoids ~30k IORef allocations.
+-- | Attribute set backed by a C-allocated sorted key-value array.
 --
--- Each binding carries its own 'Env' so that @//@ merges of two
--- 'LazyAttrs' with different environments remain correct — left-side
--- bindings keep their original env instead of being re-parented to the
--- right side's env.  The env is INTENTIONALLY LAZY for knot-tying in
--- @rec {}@.
-data LazyBinding
-  = -- | Simple @key = expr@ — deferred @mkThunk env expr@.
-    -- Env is lazy for knot-tying in rec {}.
-    LazyExpr Env !Expr
-  | -- | @inherit key@ — deferred @inheritLookup env key@.
-    -- Env is lazy for knot-tying in rec {}.
-    LazyInherit Env
-  | -- | @inherit (from) key@ — deferred @mkThunk env (ESelect from [StaticKey key] Nothing)@.
-    -- Env is lazy for knot-tying in rec {}.
-    LazyInheritFrom Env !Expr
-  | -- | Pre-built thunk (for merged nested paths or other complex cases).
-    -- INTENTIONALLY LAZY: attrSetMapWithKeyLazy wraps deferred computations
-    -- here; the Thunk is only forced when the key is actually accessed via
-    -- attrSetLookup (which caches the result).  This avoids materializing
-    -- all 30k entries when mapAttrs is applied to a large set like nixpkgs.
-    PreBuilt Thunk
-  deriving (Eq, Show)
-
--- | Attribute set representation: either an eagerly-materialized map
--- of thunks, or a lazy binding map that defers thunk construction.
---
--- The 'LazyAttrs' constructor is used for @rec {}@, @let@, and
--- non-recursive attribute sets (e.g. nixpkgs' 30k-entry package set).
--- Thunks + IORefs are only allocated for keys that are actually accessed.
--- Each 'LazyBinding' carries its own 'Env', so @//@ merges of sets
--- from different scopes remain correct.
-data AttrSet
-  = -- | Eagerly-materialized attribute set (small sets, builtins).
-    EagerAttrs !(Map Text Thunk)
-  | -- | Lazy attribute set: thunks built on demand from binding recipes.
-    -- Each 'LazyBinding' carries its own env (lazy for knot-tying).
-    LazyAttrs
-      -- | Key → binding recipe (O(log n) lookup)
-      !(Map Text LazyBinding)
-      -- | Materialized thunk cache (written via unsafePerformIO)
-      !(IORef (Map Text Thunk))
-  | -- | Mapped attribute set: defers per-key transformation until lookup.
-    -- Created by @builtins.mapAttrs@ on large sets.  Instead of eagerly
-    -- materializing 30k synthetic thunks, stores the mapping function and
-    -- original set.  Only accessed keys get materialized and cached.
-    -- Composition chains (stacked overlays) remain virtual until forced.
-    MappedAttrs
-      -- | Per-key transformation: @\key valThunk -> resultThunk@
-      !(Text -> Thunk -> Thunk)
-      -- | Original attribute set (may itself be a MappedAttrs)
-      !AttrSet
-      -- | Materialization cache (written via unsafePerformIO)
-      !(IORef (Map Text Thunk))
-  | -- | C-backed sorted attribute set.  Keys are interned symbols in a
-    -- contiguous C array (binary search for O(log n) lookup on cache-
-    -- friendly memory).  Values are thunks in a parallel 'SmallArray'.
-    -- Eliminates Map.Bin overhead: ~12 bytes/entry vs ~56 bytes/entry.
-    CAttrs
-      -- | C-side sorted symbol map (key lookup via binary search)
-      !CAttrSet
-      -- | Parallel thunk array (same order as sorted C keys)
-      !(SmallArray Thunk)
+-- All keys are interned symbols; values are CThunkPtrs in a parallel
+-- array.  O(log n) binary search on contiguous memory for lookup.
+-- Replaces the former EagerAttrs\/LazyAttrs\/MappedAttrs\/CAttrs ADT
+-- with a single C-backed representation — all attr set data lives off
+-- the GHC heap, dramatically reducing GC pressure for large evaluations.
+newtype AttrSet = AttrSet {unAttrSet :: CAttrSet}
 
 instance Eq AttrSet where
-  EagerAttrs a == EagerAttrs b = a == b
-  CAttrs _ ta == CAttrs _ tb =
-    sizeofSmallArray ta == sizeofSmallArray tb
-      && all (\i -> indexSmallArray ta i == indexSmallArray tb i) [0 .. sizeofSmallArray ta - 1]
   a == b = attrSetToMap a == attrSetToMap b
 
 instance Show AttrSet where
-  show (EagerAttrs m) = show m
-  show (LazyAttrs bindings _) =
-    "<lazy " ++ show (Map.size bindings) ++ " bindings>"
-  show (MappedAttrs _ inner _) =
-    "<mapped over " ++ show inner ++ ">"
-  show (CAttrs _ thunks) =
-    "<cattrset " ++ show (sizeofSmallArray thunks) ++ " entries>"
+  show (AttrSet cset) =
+    let n = unsafePerformIO (cattrsetSize cset)
+     in "<attrset " ++ show n ++ " entries>"
 
--- | Look up a single key.  For 'EagerAttrs', pure 'Map.lookup'.
--- For 'LazyAttrs', checks the cache first, then materializes a
--- single thunk from the binding recipe on cache miss.
---
--- Uses 'unsafePerformIO' for cache writes — safe because this is
--- idempotent memoization with no observable side effects beyond
--- caching (same rationale as thunk memoization via 'newMemoCell').
+-- | Look up a single key via symbol interning + C binary search.
+-- Uses 'unsafePerformIO' — safe because symbolIntern and cattrsetLookup
+-- are idempotent (same key always yields same symbol and same result).
 attrSetLookup :: Text -> AttrSet -> Maybe Thunk
-attrSetLookup key (EagerAttrs m) = Map.lookup key m
-attrSetLookup key (LazyAttrs bindings cacheRef) =
-  -- Check cache first, then binding map
-  let cached = unsafePerformIO (readIORef cacheRef)
-   in case Map.lookup key cached of
-        Just thunk -> Just thunk
-        Nothing -> case Map.lookup key bindings of
-          Nothing -> Nothing
-          Just recipe ->
-            let thunk = materializeBinding key recipe
-             in -- Cache the materialized thunk
-                unsafePerformIO $ do
-                  atomicModifyIORef' cacheRef (\c -> (Map.insert key thunk c, ()))
-                  pure (Just thunk)
-attrSetLookup key (MappedAttrs f inner cacheRef) =
-  -- Check cache first, then delegate to inner set and apply mapping
-  let cached = unsafePerformIO (readIORef cacheRef)
-   in case Map.lookup key cached of
-        Just thunk -> Just thunk
-        Nothing -> case attrSetLookup key inner of
-          Nothing -> Nothing
-          Just innerThunk ->
-            let thunk = f key innerThunk
-             in unsafePerformIO $ do
-                  atomicModifyIORef' cacheRef (\c -> (Map.insert key thunk c, ()))
-                  pure (Just thunk)
-attrSetLookup key (CAttrs ptr thunks) =
-  -- Intern the key as a symbol, then binary search the C array.
-  -- unsafePerformIO is safe: symbolIntern is idempotent allocation,
-  -- cattrsetIndex is a pure read — same pattern as LazyAttrs cache reads.
+attrSetLookup key (AttrSet cset) =
   unsafePerformIO $ do
     sym <- symbolIntern key
-    midx <- cattrsetIndex ptr sym
-    pure (fmap (indexSmallArray thunks . fromIntegral) midx)
+    mptr <- cattrsetLookup cset sym
+    pure (fmap Thunk mptr)
 
--- | Materialize a single 'LazyBinding' into a 'Thunk'.
--- Each binding carries its own env, so no separate env parameter needed.
-materializeBinding :: Text -> LazyBinding -> Thunk
-materializeBinding _key (LazyExpr env expr) = mkThunk env expr
-materializeBinding key (LazyInherit env) = inheritLookupThunk env key
-materializeBinding key (LazyInheritFrom env fromExpr) =
-  mkThunk env (ESelect fromExpr [StaticKey key] Nothing)
-materializeBinding _key (PreBuilt thunk) = thunk
-
--- | Look up a name for lazy @inherit@.  If not found, create a thunk
--- that will error when forced (matching real Nix behaviour).
-inheritLookupThunk :: Env -> Text -> Thunk
-inheritLookupThunk env name =
-  case envLookup name env of
-    Just thunk -> thunk
-    Nothing ->
-      let errMsg = "undefined variable '" <> name <> "'"
-          throwExpr = EApp (EVar "throw") (EStr [StrLit errMsg])
-       in mkThunk env throwExpr
-
--- | All keys in the attribute set.  For 'LazyAttrs' and 'MappedAttrs',
--- reads keys from the underlying structure — zero thunk allocation.
+-- | All keys in sorted order (symbol text from C).
 attrSetKeys :: AttrSet -> [Text]
-attrSetKeys (EagerAttrs m) = Map.keys m
-attrSetKeys (LazyAttrs bindings _) = Map.keys bindings
-attrSetKeys (MappedAttrs _ inner _) = attrSetKeys inner
-attrSetKeys (CAttrs ptr _) =
-  map symbolText (unsafePerformIO (cattrsetKeys ptr))
+attrSetKeys (AttrSet cset) =
+  map symbolText (unsafePerformIO (cattrsetKeys cset))
 
 -- | Check key membership without materializing thunks.
 attrSetMember :: Text -> AttrSet -> Bool
-attrSetMember key (EagerAttrs m) = Map.member key m
-attrSetMember key (LazyAttrs bindings _) = Map.member key bindings
-attrSetMember key (MappedAttrs _ inner _) = attrSetMember key inner
-attrSetMember key (CAttrs ptr _) =
+attrSetMember key (AttrSet cset) =
   unsafePerformIO $ do
     sym <- symbolIntern key
-    midx <- cattrsetIndex ptr sym
+    midx <- cattrsetIndex cset sym
     pure (case midx of Nothing -> False; Just _ -> True)
 
 -- | Check if the attribute set is empty.
 attrSetNull :: AttrSet -> Bool
-attrSetNull (EagerAttrs m) = Map.null m
-attrSetNull (LazyAttrs bindings _) = Map.null bindings
-attrSetNull (MappedAttrs _ inner _) = attrSetNull inner
-attrSetNull (CAttrs _ thunks) = sizeofSmallArray thunks == 0
+attrSetNull (AttrSet cset) =
+  unsafePerformIO (cattrsetSize cset) == 0
 
 -- | Number of attributes.
 attrSetSize :: AttrSet -> Int
-attrSetSize (EagerAttrs m) = Map.size m
-attrSetSize (LazyAttrs bindings _) = Map.size bindings
-attrSetSize (MappedAttrs _ inner _) = attrSetSize inner
-attrSetSize (CAttrs _ thunks) = sizeofSmallArray thunks
+attrSetSize (AttrSet cset) =
+  fromIntegral (unsafePerformIO (cattrsetSize cset))
 
--- | Full materialization: build a 'Map Text Thunk' from all bindings.
--- For 'LazyAttrs' and 'MappedAttrs', this allocates thunks for every
--- key — expensive on large sets, avoid on the hot path.
---
--- Uses 'unsafePerformIO' to update the cache atomically.
+-- | Full materialization: build a 'Map Text Thunk' from all entries.
+-- Iterates the C array and builds a Haskell Map.  Expensive on large
+-- sets — avoid on the hot path.
 attrSetToMap :: AttrSet -> Map Text Thunk
-attrSetToMap (EagerAttrs m) = m
-attrSetToMap (LazyAttrs bindings cacheRef) =
+attrSetToMap (AttrSet cset) =
   unsafePerformIO $ do
-    cached <- readIORef cacheRef
-    if Map.size cached == Map.size bindings
-      then pure cached
+    n <- cattrsetSize cset
+    if n == 0
+      then pure Map.empty
       else do
-        let full = Map.mapWithKey (materializeOne cached) bindings
-        atomicModifyIORef' cacheRef (const (full, ()))
-        pure full
+        pairs <- mapM materializeEntry [0 .. n - 1]
+        pure (Map.fromList pairs)
   where
-    materializeOne cached key recipe =
-      case Map.lookup key cached of
-        Just thunk -> thunk
-        Nothing -> materializeBinding key recipe
-attrSetToMap (MappedAttrs f inner cacheRef) =
-  unsafePerformIO $ do
-    cached <- readIORef cacheRef
-    let innerMap = attrSetToMap inner
-    if Map.size cached == Map.size innerMap
-      then pure cached
-      else do
-        let full = Map.mapWithKey (materializeOne cached) innerMap
-        atomicModifyIORef' cacheRef (const (full, ()))
-        pure full
-  where
-    materializeOne cached key innerThunk =
-      case Map.lookup key cached of
-        Just thunk -> thunk
-        Nothing -> f key innerThunk
-attrSetToMap (CAttrs ptr thunks) =
-  unsafePerformIO $ do
-    n <- cattrsetSize ptr
-    pairs <- mapM (materializeEntry n) [0 .. n - 1]
-    pure (Map.fromList pairs)
-  where
-    materializeEntry _ i = do
-      sym <- cattrsetGetKey ptr i
-      let key = symbolText sym
-          thunk = indexSmallArray thunks (fromIntegral i)
-      pure (key, thunk)
+    materializeEntry i = do
+      sym <- cattrsetGetKey cset i
+      ptr <- cattrsetGetValue cset i
+      pure (symbolText sym, Thunk ptr)
 
 -- | All thunk values (materialized).
 attrSetElems :: AttrSet -> [Thunk]
@@ -438,111 +295,71 @@ attrSetElems = Map.elems . attrSetToMap
 attrSetToAscList :: AttrSet -> [(Text, Thunk)]
 attrSetToAscList = Map.toAscList . attrSetToMap
 
--- | Map a function over all key-value pairs (materializes lazy sets).
+-- | Map a function over all key-value pairs, building a new CAttrSet.
+-- Materializes the source set, applies @f@ to each entry, and rebuilds.
 attrSetMapWithKey :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
-attrSetMapWithKey f attrs = EagerAttrs (Map.mapWithKey f (attrSetToMap attrs))
+attrSetMapWithKey f attrs = attrSetFromMap (Map.mapWithKey f (attrSetToMap attrs))
 
--- Note: CAttrs is handled by the catch-all via attrSetToMap.
-
--- | Like 'attrSetMapWithKey' but preserves laziness.  For 'LazyAttrs'
--- and 'MappedAttrs', creates a 'MappedAttrs' wrapper that defers
--- per-key transformation until lookup time.  This avoids ~30k IORef
--- allocations when @mapAttrs@ is applied to a large set (e.g. nixpkgs
--- overlays) and only a few keys are actually demanded.  Composition
--- chains (stacked overlays) remain virtual: @mapAttrs g (mapAttrs f xs)@
--- produces @MappedAttrs g (MappedAttrs f xs _) _@ with zero thunk
--- allocations until a key is accessed.
-attrSetMapWithKeyLazy :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
-attrSetMapWithKeyLazy f (EagerAttrs m) = EagerAttrs (Map.mapWithKey f m)
-attrSetMapWithKeyLazy f inner = MappedAttrs f inner (newMappedCache inner)
-
--- Note: CAttrs falls into the catch-all above, wrapped in MappedAttrs.
-
--- | Convert a 'MappedAttrs' to 'LazyAttrs' without materializing thunks.
--- Each key gets a 'PreBuilt' wrapper around a lazy closure that defers
--- the mapping function application until the key is actually accessed.
--- This allows @//@ merges to stay lazy through 'MappedAttrs' operands
--- instead of eagerly materializing 30k synthetic thunks.
---
--- Nested 'MappedAttrs' chains are flattened by composing the mapping
--- functions, so @MappedAttrs g (MappedAttrs f base _) _@ becomes a
--- single 'LazyAttrs' with composed closures @\\k -> g k . f k@.
---
--- Non-'MappedAttrs' inputs are returned unchanged.
-mappedToLazy :: AttrSet -> AttrSet
-mappedToLazy (MappedAttrs f inner _) =
-  let bindings = applyMapping f inner
-      cache = newLazyAttrCache bindings
-   in LazyAttrs bindings cache
-  where
-    -- Recursively extract binding recipes, composing mapping functions.
-    -- INTENTIONALLY LAZY inside PreBuilt: neither the mapping function
-    -- nor materializeBinding is called until the key is actually accessed.
-    applyMapping g (EagerAttrs m) =
-      Map.mapWithKey (\k thunk -> PreBuilt (g k thunk)) m
-    applyMapping g (LazyAttrs innerBindings _) =
-      Map.mapWithKey
-        (\k recipe -> PreBuilt (g k (materializeBinding k recipe)))
-        innerBindings
-    applyMapping g (MappedAttrs h innerInner _) =
-      applyMapping (\k thunk -> g k (h k thunk)) innerInner
-    applyMapping g (CAttrs ptr thunks) =
-      -- Materialize CAttrs keys and wrap each value in PreBuilt.
-      -- INTENTIONALLY LAZY inside PreBuilt: the mapping function is not
-      -- called until the key is actually accessed via attrSetLookup.
-      let n = sizeofSmallArray thunks
-          pairs =
-            unsafePerformIO $
-              mapM
-                ( \i -> do
-                    sym <- cattrsetGetKey ptr (fromIntegral i)
-                    let key = symbolText sym
-                        thunk = indexSmallArray thunks i
-                    pure (key, PreBuilt (g key thunk))
-                )
-                [0 .. n - 1]
-       in Map.fromList pairs
-mappedToLazy other = other
-
--- | Remove a list of keys from an attribute set without materializing
--- 'LazyAttrs'.  For 'EagerAttrs', deletes from the map directly.
--- For 'LazyAttrs', deletes from the binding map and creates a fresh cache.
--- For 'MappedAttrs', converts to lazy first (avoids full materialization).
+-- | Remove a list of keys, returning a new CAttrSet.
+-- Uses the C-side @nn_attrset_remove_keys@ for O(n) removal.
+{-# NOINLINE attrSetRemoveKeys #-}
 attrSetRemoveKeys :: [Text] -> AttrSet -> AttrSet
-attrSetRemoveKeys keys (EagerAttrs m) =
-  EagerAttrs (foldl' (flip Map.delete) m keys)
-attrSetRemoveKeys keys (LazyAttrs bindings _cache) =
-  let newBindings = foldl' (flip Map.delete) bindings keys
-   in LazyAttrs newBindings (newLazyAttrCache newBindings)
-attrSetRemoveKeys keys attrs@(MappedAttrs {}) =
-  attrSetRemoveKeys keys (mappedToLazy attrs)
-attrSetRemoveKeys keys (CAttrs ptr thunks) =
-  -- Materialize to EagerAttrs, then remove.  CAttrs is immutable after
-  -- freeze; a proper C-side filtered copy (nn_attrset_remove_keys) would
-  -- avoid the intermediate Map, but removeAttrs is rare in nixpkgs.
-  -- If profiling shows this matters, add the C path.
-  EagerAttrs (foldl' (flip Map.delete) (attrSetToMap (CAttrs ptr thunks)) keys)
+attrSetRemoveKeys keys (AttrSet cset) = unsafePerformIO $ do
+  syms <- mapM symbolIntern keys
+  newSet <- cattrsetRemoveKeys cset syms
+  pure (AttrSet newSet)
 
--- | Union two attribute sets with a combining function (materializes both).
+-- | Union two attribute sets with a combining function.
+-- Materializes both to Maps, applies the combining function, rebuilds.
 attrSetUnionWith :: (Thunk -> Thunk -> Thunk) -> AttrSet -> AttrSet -> AttrSet
-attrSetUnionWith f a b = EagerAttrs (Map.unionWith f (attrSetToMap a) (attrSetToMap b))
+attrSetUnionWith f a b = attrSetFromMap (Map.unionWith f (attrSetToMap a) (attrSetToMap b))
 
--- | Wrap an eager map as an 'AttrSet'.
+-- | Build a CAttrSet from a Haskell 'Map'.  Interns all keys as symbols,
+-- inserts key-value pairs, freezes (sort + dedup).  The canonical entry
+-- point for all attribute set construction.
+--
+-- Uses 'unsafePerformIO' with @NOINLINE@ — safe because C allocation
+-- is idempotent and the resulting CAttrSet is referentially transparent.
+{-# NOINLINE attrSetFromMap #-}
 attrSetFromMap :: Map Text Thunk -> AttrSet
-attrSetFromMap = EagerAttrs
+attrSetFromMap m = m `seq` unsafePerformIO $ do
+  let pairs = Map.toList m
+      n = fromIntegral (length pairs)
+  cset <- cattrsetNew n
+  forM_ pairs $ \(key, Thunk ptr) -> do
+    sym <- symbolIntern key
+    cattrsetInsert cset sym ptr
+  cattrsetFreeze cset
+  pure (AttrSet cset)
 
--- | Allocate a fresh materialization cache for 'LazyAttrs'.
--- Uses 'unsafePerformIO' with @NOINLINE@ + @seq@ to ensure each
--- call site gets its own IORef (same pattern as 'newMemoCell').
-{-# NOINLINE newLazyAttrCache #-}
-newLazyAttrCache :: Map Text LazyBinding -> IORef (Map Text Thunk)
-newLazyAttrCache bindings = unsafePerformIO (bindings `seq` newIORef Map.empty)
+-- | Allocate a CAttrSet skeleton with keys only (NULL values).
+-- Used for two-phase construction in @rec {}@ and @let@ (knot-tying):
+-- keys are known before thunks, so the CAttrSet is built first, then
+-- values are filled via 'fillCAttrSetValues'.
+{-# NOINLINE buildCAttrSetKeys #-}
+buildCAttrSetKeys :: [Text] -> CAttrSet
+buildCAttrSetKeys keys = unsafePerformIO $ do
+  let n = fromIntegral (length keys)
+  cset <- cattrsetNew n
+  forM_ keys $ \key -> do
+    sym <- symbolIntern key
+    cattrsetInsert cset sym nullPtr
+  cattrsetFreeze cset
+  pure cset
 
--- | Allocate a fresh materialization cache for 'MappedAttrs'.
--- Uses the inner 'AttrSet' as the data dependency to prevent CAF sharing.
-{-# NOINLINE newMappedCache #-}
-newMappedCache :: AttrSet -> IORef (Map Text Thunk)
-newMappedCache inner = unsafePerformIO (inner `seq` newIORef Map.empty)
+-- | Fill values into a pre-allocated CAttrSet (two-phase construction).
+-- Looks up each key's index and writes the CThunkPtr at that position.
+-- Keys not found in the CAttrSet are silently ignored (should not happen
+-- in correct knot-tying code).
+{-# NOINLINE fillCAttrSetValues #-}
+fillCAttrSetValues :: CAttrSet -> Map Text Thunk -> ()
+fillCAttrSetValues cset thunkMap = unsafePerformIO $
+  forM_ (Map.toList thunkMap) $ \(key, Thunk ptr) -> do
+    sym <- symbolIntern key
+    midx <- cattrsetIndex cset sym
+    case midx of
+      Just idx -> cattrsetSetValue cset idx ptr
+      Nothing -> pure ()
 
 -- | Evaluation environment — scope chain with positional slots.
 --
@@ -559,9 +376,9 @@ data Env = Env
     envSlots :: {-# UNPACK #-} !(Ptr CThunkPtr),
     -- | Number of positional slots.
     envSlotCount :: {-# UNPACK #-} !Int,
-    -- | Lazy scope shared with a 'LazyAttrs' attr set.
-    -- For rec {} and let, this points to the SAME 'LazyAttrs' that
-    -- backs the resulting attr set — one map instead of two.
+    -- | Name-based scope for variable lookup.
+    -- For rec {} and let, this points to the same CAttrSet that
+    -- backs the resulting attr set.
     -- For builtins, holds the top-level bindings (true, false, etc.).
     -- Variable lookup checks this for name-based 'EVar' lookups.
     envLazyScope :: !(Maybe AttrSet),
@@ -602,14 +419,14 @@ emptyEnv = Env nullPtr 0 Nothing Nothing []
 -- | Look up a resolved variable by level and index.  O(level) parent
 -- hops, then O(1) read from the C slot array via 'peekElemOff'.
 --
--- Returns 'CThunkRef' wrapping the nn_thunk_t* pointer from the slot.
+-- Returns 'Thunk' wrapping the nn_thunk_t* pointer from the slot.
 -- Uses 'unsafePerformIO' for the C array read — safe because the
--- array is immutable after construction (same as SmallArray indexing).
+-- array is immutable after construction.
 --
 -- Unreachable branch: the resolution pass guarantees valid indices.
 envLookupResolved :: Int -> Int -> Env -> Thunk
 envLookupResolved 0 idx env =
-  CThunkRef (unsafePerformIO (peekElemOff (envSlots env) idx))
+  Thunk (unsafePerformIO (peekElemOff (envSlots env) idx))
 envLookupResolved lvl idx env = case envParent env of
   Just parent -> envLookupResolved (lvl - 1) idx parent
   Nothing -> error "envLookupResolved: level exceeded (unreachable after resolution)"
@@ -636,8 +453,8 @@ envLookup name env = lexicalLookup env
     goParent Nothing = lookupWithScopes name withs
 
 -- | Walk with-scopes innermost to outermost.
--- Uses 'attrSetLookup' so that 'LazyAttrs' with-scopes only
--- materialize the accessed key, not the entire set.
+-- Uses 'attrSetLookup' so that with-scopes only look up the
+-- accessed key via C binary search, not the entire set.
 lookupWithScopes :: Text -> [AttrSet] -> Maybe Thunk
 lookupWithScopes _ [] = Nothing
 lookupWithScopes name (scope : rest) =
@@ -659,7 +476,7 @@ envFromSlots slotsPtr slotCount parent =
     }
 
 -- | Push a with-scope onto the scope chain (innermost position).
--- Accepts 'AttrSet' directly so 'LazyAttrs' with-scopes stay lazy.
+-- Accepts 'AttrSet' directly for efficient with-scope lookup.
 -- Does not create a new parent level — just modifies the with-scope list.
 pushWithScope :: AttrSet -> Env -> Env
 pushWithScope scope env =
@@ -693,7 +510,7 @@ withScopesForCapture env =
 -- shared top-level CAF.
 mkThunk :: Env -> Expr -> Thunk
 mkThunk env thunkExpr =
-  CThunkRef (newThunkPtr thunkExpr env)
+  Thunk (newThunkPtr thunkExpr env)
 
 -- | Like 'mkThunk' but for synthetic thunks that reuse the same 'Expr'
 -- (e.g. @EApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in 'deferApply').
@@ -705,19 +522,20 @@ mkThunk env thunkExpr =
 -- recursive envs), since it forces the slots list to WHNF.
 mkSyntheticThunk :: Env -> Expr -> Thunk
 mkSyntheticThunk env thunkExpr =
-  CThunkRef (newSyntheticThunkPtr (envSlots env) thunkExpr env)
+  Thunk (newSyntheticThunkPtr (envSlots env) thunkExpr env)
 
--- | Like 'mkThunk' but avoids IORef allocation for trivial expressions.
+-- | Like 'mkThunk' but avoids C arena allocation for trivial expressions.
 -- Resolved variables reuse the existing thunk from the env (no wrapper).
--- Literals and lambdas use 'Evaluated' directly (no IORef needed).
+-- Literals use inline C scalars (no StablePtr).
+-- Lambdas use pre-computed C thunks with StablePtr.
 -- Everything else falls back to 'mkThunk'.
 cheapThunk :: Env -> Expr -> Thunk
 cheapThunk env (EResolvedVar level idx) = envLookupResolved level idx env
-cheapThunk _ (ELit (NixInt n)) = Evaluated (VInt n)
-cheapThunk _ (ELit (NixFloat n)) = Evaluated (VFloat n)
-cheapThunk _ (ELit (NixBool b)) = Evaluated (VBool b)
-cheapThunk _ (ELit NixNull) = Evaluated VNull
-cheapThunk env (ELambda formals body NoCaptureInfo) = Evaluated (VLambda env formals body)
+cheapThunk _ (ELit (NixInt n)) = Thunk (newComputedIntPtr (fromIntegral n))
+cheapThunk _ (ELit (NixFloat n)) = Thunk (newComputedFloatPtr n)
+cheapThunk _ (ELit (NixBool b)) = Thunk (newComputedBoolPtr (if b then 1 else 0))
+cheapThunk _ (ELit NixNull) = Thunk newComputedNullPtr
+cheapThunk env (ELambda formals body NoCaptureInfo) = evaluated (VLambda env formals body)
 cheapThunk env (ELambda formals body (Captures captureList)) =
   let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
       trimmedEnv =
@@ -728,7 +546,7 @@ cheapThunk env (ELambda formals body (Captures captureList)) =
             envParent = Nothing,
             envWithScopes = []
           }
-   in Evaluated (VLambda trimmedEnv formals body)
+   in evaluated (VLambda trimmedEnv formals body)
 cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
   let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
       trimmedEnv =
@@ -739,7 +557,7 @@ cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
             envParent = Nothing,
             envWithScopes = withScopesForCapture env
           }
-   in Evaluated (VLambda trimmedEnv formals body)
+   in evaluated (VLambda trimmedEnv formals body)
 cheapThunk env expr = mkThunk env expr
 
 -- | Allocate a fresh C arena thunk cell.
@@ -771,28 +589,24 @@ newSyntheticThunkPtr slotsKey expr env =
     cthunkNew (castStablePtrToPtr sp)
 
 -- | Wrap an already-computed value as a thunk.
+-- Scalars (int/float/bool/null) use inline C thunks (no StablePtr).
+-- Complex values use StablePtr-backed C thunks.
 evaluated :: NixValue -> Thunk
-evaluated = Evaluated
+evaluated (VInt n) = Thunk (newComputedIntPtr (fromIntegral n))
+evaluated (VFloat d) = Thunk (newComputedFloatPtr d)
+evaluated (VBool b) = Thunk (newComputedBoolPtr (if b then 1 else 0))
+evaluated VNull = Thunk newComputedNullPtr
+evaluated val = Thunk (newComputedThunkPtr val)
 
 -- | Check if two thunks share the same memoization cell (C pointer
 -- equality).  When true, both thunks will always produce the same value,
 -- so deep equality can short-circuit to 'True' without forcing.
--- Matching real Nix which uses pointer identity for same-thunk comparison.
 thunkSameRef :: Thunk -> Thunk -> Bool
-thunkSameRef (CThunkRef p1) (CThunkRef p2) = p1 == p2
-thunkSameRef _ _ = False
+thunkSameRef (Thunk p1) (Thunk p2) = p1 == p2
 
--- | Convert a 'Thunk' to a 'CThunkPtr' for storage in a C env slot array.
--- 'CThunkRef' thunks are already C pointers (zero-cost extraction).
--- 'Evaluated' scalars (int/float/bool/null) use inline C thunks (no StablePtr).
--- 'Evaluated' complex values use StablePtr-backed C thunks.
+-- | Extract the C pointer from a thunk (zero-cost, newtype unwrap).
 thunkToCPtr :: Thunk -> CThunkPtr
-thunkToCPtr (CThunkRef ptr) = ptr
-thunkToCPtr (Evaluated (VInt n)) = newComputedIntPtr (fromIntegral n)
-thunkToCPtr (Evaluated (VFloat d)) = newComputedFloatPtr d
-thunkToCPtr (Evaluated (VBool b)) = newComputedBoolPtr (if b then 1 else 0)
-thunkToCPtr (Evaluated VNull) = newComputedNullPtr
-thunkToCPtr (Evaluated val) = newComputedThunkPtr val
+thunkToCPtr (Thunk ptr) = ptr
 
 -- | Wrap an already-computed 'NixValue' in a C thunk (StablePtr path).
 -- Arena-allocated (O(1)).  Used for complex values (string, list, attrs, etc.).
@@ -969,8 +783,7 @@ instance MonadEval PureEval where
   copyPathToStore _ _ = throwEvalError "builtins.path: not available in pure evaluation"
   traceMessage _ = pure ()
   resolvePathLiteral = pure
-  forceThunk _ (Evaluated val) = pure val
-  forceThunk evalFn (CThunkRef ptr) =
+  forceThunk evalFn (Thunk ptr) =
     -- Read the C thunk via unsafePerformIO — safe because reads are
     -- idempotent and PureEval never writes back (no memoization).
     -- Does NOT mark blackholes — PureEval may re-force the same thunk.

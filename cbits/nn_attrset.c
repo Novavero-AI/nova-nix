@@ -19,6 +19,35 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* --- Global tracking for bulk cleanup --- */
+
+static nn_attrset_t **g_tracked = NULL;
+static uint32_t g_tracked_count = 0;
+static uint32_t g_tracked_cap   = 0;
+
+static void nn_attrset_track(nn_attrset_t *set)
+{
+    if (g_tracked_count >= g_tracked_cap) {
+        uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
+        g_tracked = (nn_attrset_t **)realloc(
+            g_tracked, (size_t)new_cap * sizeof(nn_attrset_t *));
+        g_tracked_cap = new_cap;
+    }
+    g_tracked[g_tracked_count++] = set;
+}
+
+void nn_attrset_free_all(void)
+{
+    uint32_t i;
+    for (i = 0; i < g_tracked_count; i++) {
+        nn_attrset_free(g_tracked[i]);
+    }
+    free(g_tracked);
+    g_tracked = NULL;
+    g_tracked_count = 0;
+    g_tracked_cap = 0;
+}
+
 /* --- Internal representation --- */
 
 struct nn_attrset {
@@ -94,6 +123,7 @@ nn_attrset_t *nn_attrset_new(uint32_t capacity)
         return NULL;
     }
 
+    nn_attrset_track(set);
     return set;
 }
 

@@ -267,8 +267,7 @@ instance MonadEval EvalIO where
       then pure (T.pack (baseDir </> raw))
       else pure path
 
-  forceThunk _ (Evaluated val) = pure val
-  forceThunk evalFn (CThunkRef ptr) = do
+  forceThunk evalFn (Thunk ptr) = do
     -- Force protocol: PENDING -> COMPUTED with memoization.
     -- Scalar values (int/float/bool/null) are stored inline in the
     -- thunk payload (no StablePtr), dispatched via val_tag.
