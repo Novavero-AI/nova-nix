@@ -1,6 +1,6 @@
 <div align="center">
 <h1>nova-nix</h1>
-<p><strong>Windows-Native Nix in Pure Haskell</strong></p>
+<p><strong>Windows-Native Nix — Haskell Logic, C99 Data</strong></p>
 <p>A from-scratch implementation of the Nix package manager — parser, lazy evaluator, content-addressed store, derivation builder, binary substituter — running natively on Windows, macOS, and Linux. No WSL. No Cygwin. No MSYS2.</p>
 <p><a href="#quick-start">Quick Start</a> · <a href="#cli">CLI</a> · <a href="#modules">Modules</a> · <a href="#architecture">Architecture</a> · <a href="#the-hard-problems">Hard Problems</a> · <a href="#roadmap">Roadmap</a> · <a href="#build--test">Build & Test</a></p>
 <p>
@@ -191,12 +191,24 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 | Module | Purpose |
 |--------|---------|
 | `Nix.Eval` | Lazy evaluator — all 18 AST constructors, thunk forcing, env operations, 108-builtin dispatch, `__functor` callable sets, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` |
-| `Nix.Eval.Types` | Shared types — `NixValue` (11 constructors), `Thunk` (IORef memo cell), `Env` (SmallArray positional slots + scope chain), `AttrSet` (lazy/eager), `StringContext` (store path tracking), `MonadEval` typeclass, `PureEval` runner |
+| `Nix.Eval.Types` | Shared types — `NixValue` (12 constructors), `Thunk` (C arena-allocated memoization cell), `Env` (C-allocated positional slots + scope chain), `AttrSet` (C-backed sorted arrays), `StringContext` (store path tracking), `MonadEval` typeclass, `PureEval` runner |
 | `Nix.Eval.Operator` | Binary/unary operators — arithmetic with float promotion, deep structural equality, division-by-zero checks |
 | `Nix.Eval.StringInterp` | String interpolation — value coercion with context propagation, indented string whitespace stripping |
 | `Nix.Eval.Context` | String context construction, queries, extraction — pure helpers for building and inspecting store path references |
-| `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache (with directory import), process execution, store writes, NIX_PATH parsing, per-thunk IORef memoization (matching real Nix in-place mutation) |
+| `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache (with directory import), process execution, store writes, NIX_PATH parsing, per-thunk C arena memoization with blackhole detection |
 | `Nix.Builtins` | Built-in function environment — 108 builtins, search path plumbing (`parseNixPath`), top-level builtin exposure |
+
+### C99 Data Layer
+
+| Module | Purpose |
+|--------|---------|
+| `Nix.Eval.Symbol` | Interned string symbols via `nn_symbol` — FNV-1a hash table, O(1) string comparison |
+| `Nix.Eval.CAttrSet` | C-backed sorted attribute arrays via `nn_attrset` — O(log n) binary search, merge-join operations |
+| `Nix.Eval.CThunk` | Arena-allocated 16-byte thunk cells via `nn_thunk` — 9 value tags for inline scalars and C-native types, blackhole detection |
+| `Nix.Eval.CEnv` | Page-based slot allocator via `nn_env` — bump allocation for lexical scope arrays |
+| `Nix.Eval.CList` | Contiguous thunk pointer arrays via `nn_list` — replaces Haskell cons cells |
+| `Nix.Eval.CCtxStr` | Context-bearing strings via `nn_ctxstr` — interned StorePath fields, flexible array of context entries |
+| `Nix.Eval.Arena` | Unified arena lifecycle — batch StablePtr collection, coordinated init/destroy of all C sub-arenas |
 
 ### Store + Builder
 
@@ -237,13 +249,20 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
   +-------------------------------------------------+
   |  Eval.IO   Store.DB   Store   Builder   Substituter|
   +-------------------------------------------------+
+                        |
+            C99 Data Layer (off GHC heap)
+  +-------------------------------------------------+
+  |  nn_symbol  nn_attrset  nn_thunk  nn_env        |
+  |  nn_list    nn_ctxstr   nn_arena                |
+  +-------------------------------------------------+
 ```
 
 **Evaluator design:**
 
 - **MonadEval typeclass** — The evaluator is `eval :: (MonadEval m) => Env -> Expr -> m NixValue`, polymorphic in its effect monad. `PureEval` (newtype over `Either Text`) runs all pure tests with no IO. `EvalIO` provides `readFileText`, `doesPathExist`, `listDirectory`, `getEnvVar`, `getCurrentTime`, `writeToStore`, `scopedImportFile`, `runProcess` for IO builtins.
-- **Thunk-based lazy evaluation with memoization** — List elements and attribute set values are stored as unevaluated thunks (`Thunk Expr Env`). Only forced when a value is demanded. `(x: 1) (throw "boom")` returns `1` because `x` is never referenced. In `EvalIO`, each thunk carries a per-thunk `IORef` memo cell — forced once, then cached in place (matching real Nix's in-place mutation). Dead thunks are reclaimed by GC naturally.
-- **Knot-tying via Haskell laziness** — Recursive `let` and `rec { }` create self-referential environments. The `Thunk` type has a lazy `Env` field so thunks can capture environments that include themselves. Haskell's own laziness resolves the recursion. Dynamic attribute keys are resolved monadi­cally *before* knot-tying — the two-phase design (`resolveBindingKeys` then `buildResolvedBindingsMap`) cleanly separates key evaluation from value thunk construction.
+- **Thunk-based lazy evaluation with memoization** — List elements and attribute set values are stored as unevaluated thunks. Only forced when a value is demanded. `(x: 1) (throw "boom")` returns `1` because `x` is never referenced. Thunks are 16-byte arena-allocated C cells with blackhole detection for infinite recursion. Inline scalar values (int, float, bool, null) are stored directly in the thunk payload with no Haskell heap allocation. Strings, paths, lists, and attribute sets use C-native storage (interned symbols, sorted arrays, contiguous pointer arrays).
+- **C99 data layer** — All bulk evaluation data lives in C arena-allocated structures invisible to the GHC garbage collector. Interned symbols replace string comparison with integer equality. Sorted C arrays replace Haskell `Data.Map`. Arena bump allocators replace per-object malloc. The result: 68% less memory residency and 63% higher GC productivity compared to the pure Haskell baseline.
+- **Knot-tying via Haskell laziness** — Recursive `let` and `rec { }` create self-referential environments. Thunks capture environments lazily so they can reference not-yet-filled slot arrays. Two-phase construction (allocate slots, create env, fill slots) ties the knot safely. Dynamic attribute keys are resolved monadically *before* knot-tying — the two-phase design (`resolveBindingKeys` then `buildResolvedBindingsMap`) cleanly separates key evaluation from value thunk construction.
 - **Search path desugaring** — `<nixpkgs>` is its own AST constructor (`ESearchPath`), desugared at eval time to `builtins.findFile builtins.nixPath "nixpkgs"` — exactly how real Nix handles it. `builtins.nixPath` is populated from `NIX_PATH` and `--nix-path` flags.
 - **With-scope chain** — `Env` has lexical bindings (always win) plus a stack of with-scopes walked innermost-first. `let a = 1; in with { a = 2; }; a` correctly returns `1` because lexical scope takes priority.
 - **Short-circuit operators** — `&&`, `||`, and `->` are handled directly in eval (not delegated to Operator) because they must not evaluate both operands.
@@ -259,8 +278,9 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 **Key numbers:**
 
-- **24 modules** — all implemented
-- **526 tests** — hand-rolled harness, no framework dependencies
+- **31 modules** (24 Haskell + 7 C) — all implemented
+- **559 tests** — hand-rolled harness, no framework dependencies
+- **7 C modules** — ~2,000 lines of C99, `-Wall -Wextra -pedantic -Werror` clean
 - **Zero partial functions** — total by construction, `T.uncons` over `T.head`/`T.tail`
 - **Strict by default** — bang patterns on all data fields (except Thunk's Env, which is lazy for knot-tying)
 
@@ -288,9 +308,19 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 
 ## Roadmap
 
+### C99 Data Layer ([#4](https://github.com/Novavero-AI/nova-nix/issues/4)) — Active
+
+Moving all evaluation data from the GHC heap to C99 arena-allocated structures. Haskell owns eval logic, C owns data layout. Target: 80%+ GC productivity, ~5 GB RSS for full nixpkgs eval.
+
+- [x] **M1: Value tags** — Inline scalars (int/float/bool/null) + C-native strings, paths, lists, attrs in thunk payloads. 68% less memory, 63% higher GC productivity.
+- [x] **M3: Context strings + blackhole** — Strings with store path context stored as C structs. Per-thunk blackhole detection for infinite recursion.
+- [ ] **M5: Full Env in C** — Replace Haskell `Env` record with C `nn_env_t` struct. Arena-allocated, all fields as C data.
+- [ ] **M6: Expr bytecode** — Compile 19-constructor AST to flat C bytecode array. Eliminates all pending thunk StablePtrs (~8M in nixpkgs).
+- [ ] **M4: VLambda in C** — Lambda closures as C structs (trivial after M5+M6).
+
 ### Next
 
-- [ ] **Full `import <nixpkgs> {}` performance** — nixpkgs lib layer evaluates correctly; stdenv bootstrap runs but needs further memory optimization for the full 80,000+ package set (de Bruijn indices + SmallArray slots eliminated 1.37 GB of Map.Bin overhead; testing on 16 GB Windows machine in progress)
+- [ ] **Full `import <nixpkgs> {}` performance** — nixpkgs lib layer evaluates correctly; C data layer enabling viable memory for the full 80,000+ package set
 - [ ] **`nova-nix shell`** — Enter a development shell (like `nix shell`)
 - [ ] **`nova-nix repl`** — Interactive evaluator
 
@@ -306,7 +336,7 @@ The biggest challenge isn't any single feature — it's **nixpkgs compatibility*
 
 ```bash
 cabal build                              # Build library + CLI
-cabal test                               # Run all 526 tests
+cabal test                               # Run all 559 tests
 cabal build --ghc-options="-Werror"      # Warnings as errors (CI default)
 cabal haddock                            # Generate API docs
 ```
