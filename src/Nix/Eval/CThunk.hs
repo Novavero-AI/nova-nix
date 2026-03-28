@@ -30,6 +30,7 @@ module Nix.Eval.CThunk
 
     -- * Allocation
     cthunkNew,
+    cthunkNewBc,
     cthunkNewComputed,
     cthunkNewComputedInt,
     cthunkNewComputedFloat,
@@ -45,6 +46,8 @@ module Nix.Eval.CThunk
     cthunkState,
     cthunkPayload,
     cthunkValueTag,
+    cthunkGetBcIdx,
+    cthunkSetPayload,
     cthunkGetInt,
     cthunkGetFloat,
     cthunkGetBool,
@@ -96,6 +99,15 @@ foreign import ccall unsafe "nn_thunk_destroy"
 
 foreign import ccall unsafe "nn_thunk_new"
   c_nn_thunk_new :: Ptr () -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_bc"
+  c_nn_thunk_new_bc :: Word32 -> Ptr () -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_get_bc_idx"
+  c_nn_thunk_get_bc_idx :: CThunkPtr -> IO Word32
+
+foreign import ccall unsafe "nn_thunk_set_payload"
+  c_nn_thunk_set_payload :: CThunkPtr -> Ptr () -> IO ()
 
 foreign import ccall unsafe "nn_thunk_new_computed"
   c_nn_thunk_new_computed :: Ptr () -> IO CThunkPtr
@@ -218,10 +230,23 @@ cthunkDestroy = c_nn_thunk_destroy
 -- Allocation
 -- ---------------------------------------------------------------------------
 
--- | Allocate a new PENDING thunk from the arena.  O(1) amortized.
+-- | Allocate a new PENDING thunk from the arena (legacy StablePtr path).
 -- The payload is an opaque pointer (StablePtr cast to Ptr ()).
 cthunkNew :: Ptr () -> IO CThunkPtr
 cthunkNew = c_nn_thunk_new
+
+-- | Allocate a new PENDING thunk with a bytecode index + C env pointer.
+-- No Haskell heap references — zero GC pressure for pending thunks.
+cthunkNewBc :: Word32 -> Ptr () -> IO CThunkPtr
+cthunkNewBc = c_nn_thunk_new_bc
+
+-- | Read the bytecode index from a PENDING thunk.
+cthunkGetBcIdx :: CThunkPtr -> IO Word32
+cthunkGetBcIdx = c_nn_thunk_get_bc_idx
+
+-- | Set the payload of a thunk (deferred env fixup for knot-tying).
+cthunkSetPayload :: CThunkPtr -> Ptr () -> IO ()
+cthunkSetPayload = c_nn_thunk_set_payload
 
 -- | Allocate a new pre-COMPUTED thunk with StablePtr payload (complex types).
 cthunkNewComputed :: Ptr () -> IO CThunkPtr

@@ -8,6 +8,7 @@ module Nix.Eval.StringInterp
   ( evalStringParts,
     evalIndStringParts,
     coerceToString,
+    stripIndentation,
   )
 where
 

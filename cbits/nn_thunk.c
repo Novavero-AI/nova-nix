@@ -126,8 +126,35 @@ nn_thunk_new(void *pending_data)
     if (!t) return NULL;
     t->state = NN_THUNK_PENDING;
     t->val_tag = 0;
+    t->_pad = 0;
+    t->bc_idx = 0;  /* legacy StablePtr thunk marker */
     t->payload = pending_data;
     return t;
+}
+
+nn_thunk_t *
+nn_thunk_new_bc(uint32_t bc_idx, void *env_ptr)
+{
+    nn_thunk_t *t = arena_alloc(g_arena);
+    if (!t) return NULL;
+    t->state = NN_THUNK_PENDING;
+    t->val_tag = 0;
+    t->_pad = 0;
+    t->bc_idx = bc_idx;
+    t->payload = env_ptr;
+    return t;
+}
+
+uint32_t
+nn_thunk_get_bc_idx(const nn_thunk_t *thunk)
+{
+    return thunk->bc_idx;
+}
+
+void
+nn_thunk_set_payload(nn_thunk_t *thunk, void *payload)
+{
+    thunk->payload = payload;
 }
 
 nn_thunk_t *
@@ -137,6 +164,8 @@ nn_thunk_new_computed(void *value)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_PTR;
+    t->_pad = 0;
+    t->bc_idx = 0;
     t->payload = value;
     return t;
 }
@@ -148,6 +177,8 @@ nn_thunk_new_computed_int(int64_t value)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_INT;
+    t->_pad = 0;
+    t->bc_idx = 0;
     t->payload = (void *)(intptr_t)value;
     return t;
 }
@@ -159,6 +190,8 @@ nn_thunk_new_computed_float(double value)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_FLOAT;
+    t->_pad = 0;
+    t->bc_idx = 0;
     memcpy(&t->payload, &value, sizeof(double));
     return t;
 }
@@ -170,6 +203,8 @@ nn_thunk_new_computed_bool(uint8_t value)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_BOOL;
+    t->_pad = 0;
+    t->bc_idx = 0;
     t->payload = (void *)(intptr_t)value;
     return t;
 }
@@ -181,6 +216,8 @@ nn_thunk_new_computed_null(void)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_NULL;
+    t->_pad = 0;
+    t->bc_idx = 0;
     t->payload = NULL;
     return t;
 }
@@ -192,6 +229,8 @@ nn_thunk_new_computed_str(uint32_t symbol)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_STR;
+    t->_pad = 0;
+    t->bc_idx = 0;
     t->payload = (void *)(intptr_t)symbol;
     return t;
 }
@@ -203,6 +242,8 @@ nn_thunk_new_computed_path(uint32_t symbol)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_PATH;
+    t->_pad = 0;
+    t->bc_idx = 0;
     t->payload = (void *)(intptr_t)symbol;
     return t;
 }
@@ -214,6 +255,8 @@ nn_thunk_new_computed_list(void *list)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_LIST;
+    t->_pad = 0;
+    t->bc_idx = 0;
     t->payload = list;
     return t;
 }
@@ -225,6 +268,8 @@ nn_thunk_new_computed_attrs(void *attrset)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_ATTRS;
+    t->_pad = 0;
+    t->bc_idx = 0;
     t->payload = attrset;
     return t;
 }
@@ -236,6 +281,8 @@ nn_thunk_new_computed_ctxstr(void *ctxstr)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_CTXSTR;
+    t->_pad = 0;
+    t->bc_idx = 0;
     t->payload = ctxstr;
     return t;
 }

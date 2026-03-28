@@ -52,10 +52,16 @@ module Nix.Eval.Types
     newCEnv,
     newMinimalEnv,
 
+    -- * Eval-time formals (re-exported from EvalFormals)
+    EvalFormals (..),
+    EvalFormal (..),
+
     -- * Thunk operations
     mkThunk,
     mkSyntheticThunk,
     cheapThunk,
+    cheapThunkBc,
+    mkThunkBc,
     evaluated,
     thunkSameRef,
     thunkToCPtr,
@@ -73,6 +79,7 @@ module Nix.Eval.Types
 where
 
 import Control.Monad (forM_)
+import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
@@ -80,18 +87,22 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
-import Data.Word (Word16, Word8)
+import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, newStablePtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
+import GHC.Float (castWord64ToDouble)
 import Nix.Derivation (Derivation)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcOpcode, cbcShortArg)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
 import Nix.Eval.CList (clistToThunkList, thunkListToCList)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNew, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
+import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
-import Nix.Expr.Types (CaptureInfo (..), Expr (..), Formals, NixAtom (..))
+import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
 import Nix.Store.Path (StorePath (..))
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Text.Regex.TDFA as RE
@@ -222,8 +233,8 @@ data NixValue
     VList ![Thunk]
   | -- | Attribute set: unified lazy/eager representation.
     VAttrs !AttrSet
-  | -- | Lambda closure: captures environment, formals, body.
-    VLambda !Env !Formals !Expr
+  | -- | Lambda closure: captures environment, formals, body bytecode index.
+    VLambda !Env !EvalFormals !Word32
   | -- | A realized derivation (build recipe).
     VDerivation !Derivation
   | -- | Built-in function, dispatched by name.
@@ -538,15 +549,15 @@ withScopesForCapture (Env envPtr) = unsafePerformIO $ do
 
 -- | Create an unevaluated thunk with a fresh C arena-allocated cell.
 --
--- Each thunk gets its own @nn_thunk_t@ in the C arena.  On first
--- force the cell transitions PENDING -> BLACKHOLE -> COMPUTED, dropping
--- the Expr and Env.  The cell is allocated via 'unsafePerformIO' —
--- safe because C allocation is a pure side effect, and the @NOINLINE@
--- + @seq@ pattern prevents GHC from floating the allocation to a
--- shared top-level CAF.
+-- Compiles the Expr to bytecode and stores (bc_idx, env_ptr) in the
+-- C thunk — no StablePtr, zero GHC heap pressure for pending thunks.
+-- The cell is allocated via 'unsafePerformIO' — safe because C
+-- allocation is a pure side effect, and the @NOINLINE@ + @seq@
+-- pattern prevents GHC from floating the allocation to a shared
+-- top-level CAF.
 mkThunk :: Env -> Expr -> Thunk
 mkThunk env thunkExpr =
-  Thunk (newThunkPtr thunkExpr env)
+  Thunk (newBcThunkPtr thunkExpr env)
 
 -- | Like 'mkThunk' but for synthetic thunks that reuse the same 'Expr'
 -- (e.g. @EApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in 'deferApply').
@@ -558,12 +569,12 @@ mkThunk env thunkExpr =
 -- recursive envs), since it forces the env pointer to WHNF.
 mkSyntheticThunk :: Env -> Expr -> Thunk
 mkSyntheticThunk env@(Env envPtr) thunkExpr =
-  Thunk (newSyntheticThunkPtr envPtr thunkExpr env)
+  Thunk (newSyntheticBcThunkPtr envPtr thunkExpr env)
 
 -- | Like 'mkThunk' but avoids C arena allocation for trivial expressions.
 -- Resolved variables reuse the existing thunk from the env (no wrapper).
 -- Literals use inline C scalars (no StablePtr).
--- Lambdas use pre-computed C thunks with StablePtr.
+-- Lambdas compile formals+body to bytecode and produce VLambda directly.
 -- Everything else falls back to 'mkThunk'.
 cheapThunk :: Env -> Expr -> Thunk
 cheapThunk env (EResolvedVar level idx) = envLookupResolved level idx env
@@ -571,45 +582,102 @@ cheapThunk _ (ELit (NixInt n)) = Thunk (newComputedIntPtr (fromIntegral n))
 cheapThunk _ (ELit (NixFloat n)) = Thunk (newComputedFloatPtr n)
 cheapThunk _ (ELit (NixBool b)) = Thunk (newComputedBoolPtr (if b then 1 else 0))
 cheapThunk _ (ELit NixNull) = Thunk newComputedNullPtr
-cheapThunk env (ELambda formals body NoCaptureInfo) = evaluated (VLambda env formals body)
+cheapThunk env (ELambda formals body NoCaptureInfo) =
+  let bodyBcIdx = unsafePerformIO (compileExpr body)
+      evalFormals = unsafePerformIO (compileFormalsToEval formals)
+   in evaluated (VLambda env evalFormals bodyBcIdx)
 cheapThunk env (ELambda formals body (Captures captureList)) =
   let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
       trimmedEnv = newMinimalEnv slotsPtr slotCount
-   in evaluated (VLambda trimmedEnv formals body)
+      bodyBcIdx = unsafePerformIO (compileExpr body)
+      evalFormals = unsafePerformIO (compileFormalsToEval formals)
+   in evaluated (VLambda trimmedEnv evalFormals bodyBcIdx)
 cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
   let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
       (withArr, withCount) = withScopesForCapture env
       trimmedEnv = newCEnv slotsPtr slotCount Nothing Nothing withArr withCount
-   in evaluated (VLambda trimmedEnv formals body)
+      bodyBcIdx = unsafePerformIO (compileExpr body)
+      evalFormals = unsafePerformIO (compileFormalsToEval formals)
+   in evaluated (VLambda trimmedEnv evalFormals bodyBcIdx)
 cheapThunk env expr = mkThunk env expr
 
--- | Allocate a fresh C arena thunk cell.
+-- | Create a pending thunk from a bytecode index (no compilation needed).
+-- Used inside 'evalBytecode' where the bc_idx is already known.
+-- The Env is captured LAZILY (for knot-tying in rec attrs / let / matchFormalSet).
+mkThunkBc :: Env -> Word32 -> Thunk
+mkThunkBc env bcIdx =
+  Thunk (newBcThunkPtrLazy bcIdx env)
+
+-- | Like 'cheapThunk' but for bytecode indices (used inside evalBytecode).
+-- Short-circuits for resolved vars and literals without creating a
+-- pending thunk.  Everything else falls back to 'mkThunkBc'.
+cheapThunkBc :: Env -> Word32 -> Thunk
+cheapThunkBc env bcIdx =
+  let opcode = unsafePerformIO (cbcOpcode bcIdx)
+   in case opcode of
+        10 {- RESOLVED_VAR -} ->
+          let level = fromIntegral (unsafePerformIO (cbcArg1 bcIdx))
+              idx = fromIntegral (unsafePerformIO (cbcArg2 bcIdx))
+           in envLookupResolved level idx env
+        0 {- LIT_INT -} ->
+          let lo = unsafePerformIO (cbcArg1 bcIdx)
+              hi = unsafePerformIO (cbcArg2 bcIdx)
+              w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
+           in Thunk (newComputedIntPtr (fromIntegral (fromIntegral w64 :: Int64)))
+        1 {- LIT_FLOAT -} ->
+          let lo = unsafePerformIO (cbcArg1 bcIdx)
+              hi = unsafePerformIO (cbcArg2 bcIdx)
+              w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
+           in Thunk (newComputedFloatPtr (castWord64ToDouble w64))
+        2 {- LIT_BOOL -} ->
+          let flag = unsafePerformIO (cbcShortArg bcIdx)
+           in Thunk (newComputedBoolPtr (if flag /= 0 then 1 else 0))
+        3 {- LIT_NULL -} -> Thunk newComputedNullPtr
+        _ -> mkThunkBc env bcIdx
+
+-- | Allocate a fresh C arena thunk cell with bytecode.
 --
 -- @NOINLINE@ prevents inlining so GHC can't see inside or CSE calls.
 -- @seq@ on the expr creates a data dependency that prevents float-out
 -- to a top-level CAF — without this, GHC would hoist the
 -- @unsafePerformIO@ and share ONE cell across ALL thunks.
 --
--- Creates a StablePtr to the (Expr, Env) pair.  The Expr is strict
--- (forced by seq), the Env is LAZY (for knot-tying in rec {}).
--- On force, the pending StablePtr is freed and replaced with a
--- computed StablePtr to the result NixValue.
-{-# NOINLINE newThunkPtr #-}
-newThunkPtr :: Expr -> Env -> CThunkPtr
-newThunkPtr expr env =
+-- Compiles the Expr to bytecode and stores (bc_idx, StablePtr Env)
+-- in the C thunk.  The Expr tree is eliminated from the GHC heap —
+-- only the StablePtr Env (~16 bytes) remains for knot-tying laziness.
+{-# NOINLINE newBcThunkPtr #-}
+newBcThunkPtr :: Expr -> Env -> CThunkPtr
+newBcThunkPtr expr env =
   unsafePerformIO $ expr `seq` do
-    sp <- newStablePtr (expr, env)
-    cthunkNew (castStablePtrToPtr sp)
+    bcIdx <- compileExpr expr
+    sp <- newStablePtr env
+    cthunkNewBc bcIdx (castStablePtrToPtr sp)
 
--- | Like 'newThunkPtr' but keyed on the env's C pointer instead
+-- | Like 'newBcThunkPtr' but keyed on the env's C pointer instead
 -- of the expression.  Used by 'mkSyntheticThunk' where multiple thunks
 -- share the same expression (e.g. 'deferApplyExpr').
-{-# NOINLINE newSyntheticThunkPtr #-}
-newSyntheticThunkPtr :: Ptr NnEnv -> Expr -> Env -> CThunkPtr
-newSyntheticThunkPtr envKey expr env =
+{-# NOINLINE newSyntheticBcThunkPtr #-}
+newSyntheticBcThunkPtr :: Ptr NnEnv -> Expr -> Env -> CThunkPtr
+newSyntheticBcThunkPtr envKey expr env =
   unsafePerformIO $ envKey `seq` do
-    sp <- newStablePtr (expr, env)
-    cthunkNew (castStablePtrToPtr sp)
+    bcIdx <- compileExpr expr
+    sp <- newStablePtr env
+    cthunkNewBc bcIdx (castStablePtrToPtr sp)
+
+-- | Allocate a fresh C arena thunk cell from a known bytecode index.
+-- No compilation needed — the bc_idx is already available.
+--
+-- Uses StablePtr for the Env so it stays lazy — essential for
+-- knot-tying in recursive attrs, let bindings, and matchFormalSet.
+-- The StablePtr points to an Env (newtype around Ptr NnEnv) — ~16
+-- bytes on the GHC heap, negligible compared to the Expr trees we
+-- eliminated.
+{-# NOINLINE newBcThunkPtrLazy #-}
+newBcThunkPtrLazy :: Word32 -> Env -> CThunkPtr
+newBcThunkPtrLazy bcIdx env =
+  unsafePerformIO $ bcIdx `seq` do
+    sp <- newStablePtr env
+    cthunkNewBc bcIdx (castStablePtrToPtr sp)
 
 -- | Wrap an already-computed value as a thunk.
 -- Scalars (int/float/bool/null) use inline C thunks (no StablePtr).
@@ -881,9 +949,9 @@ class (Monad m) => MonadEval m where
   -- | Force a thunk to a value, with memoization.
   -- IO evaluators should cache results (via per-thunk @IORef@).
   -- Pure evaluators re-evaluate each time.
-  -- The first argument is the evaluation function (to break the
-  -- Eval.Types → Eval circular dependency).
-  forceThunk :: (Env -> Expr -> m NixValue) -> Thunk -> m NixValue
+  -- The first argument is the bytecode evaluation function (to break
+  -- the Eval.Types → Eval circular dependency).
+  forceThunk :: (Env -> Word32 -> m NixValue) -> Thunk -> m NixValue
 
 -- | Pure evaluation monad — wraps 'Either Text'.
 -- IO builtins ('readFile', 'import') are unavailable;
@@ -943,6 +1011,7 @@ instance MonadEval PureEval where
                     val = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))
                  in pure val
       _ {- PENDING or BLACKHOLE -} ->
-        let payload = unsafePerformIO (cthunkPayload ptr)
-            (expr, env) = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))
-         in evalFn env expr
+        let bcIdx = unsafePerformIO (cthunkGetBcIdx ptr)
+            envSp = unsafePerformIO (cthunkPayload ptr)
+            env = unsafePerformIO (deRefStablePtr (castPtrToStablePtr envSp))
+         in evalFn env bcIdx

@@ -9,13 +9,22 @@
 -- Must be called after 'cbcInit' and 'symbolInit'.
 module Nix.Eval.Compile
   ( compileExpr,
+    compileFormalsToEval,
+    decodeBcFormals,
+    decodeBcCaptureInfo,
+    BcBinding (..),
+    BcAttrKey (..),
+    decodeBcBindings,
+    reassembleInt64,
+    reassembleDouble,
   )
 where
 
-import Data.Bits (shiftR, (.&.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
+import Data.Int (Int64)
 import Data.Text (Text)
 import Data.Word (Word16, Word32, Word64, Word8)
-import GHC.Float (castDoubleToWord64)
+import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 import Nix.Eval.CBytecode
   ( attrkeyDynamic,
     attrkeyStatic,
@@ -39,6 +48,7 @@ import Nix.Eval.CBytecode
     captureNone,
     captureSlots,
     captureWithScopes,
+    cbcData,
     cbcEmit,
     cbcEmitData,
     formalName,
@@ -73,7 +83,8 @@ import Nix.Eval.CBytecode
     unaryNegate,
     unaryNot,
   )
-import Nix.Eval.Symbol (Symbol (..), symbolIntern)
+import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
+import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Expr.Types
   ( AttrKey (..),
     BinaryOp (..),
@@ -260,10 +271,10 @@ compileExpr = go
           ++ formalWords
 
     compileFormalEntries :: [Formal] -> IO [Word32]
-    compileFormalEntries = fmap concat . mapM compileOneFormal
+    compileFormalEntries = fmap concat . mapM compileFormalEntry
 
-    compileOneFormal :: Formal -> IO [Word32]
-    compileOneFormal (Formal name defExpr) = do
+    compileFormalEntry :: Formal -> IO [Word32]
+    compileFormalEntry (Formal name defExpr) = do
       Symbol nameSym <- symbolIntern name
       case defExpr of
         Nothing -> pure [nameSym, 0, 0]
@@ -401,3 +412,173 @@ compileExpr = go
     -- \| @fromIntegral@ shorthand.
     fi :: (Integral a, Num b) => a -> b
     fi = fromIntegral
+
+-- ---------------------------------------------------------------------------
+-- Compile parser Formals to eval EvalFormals
+-- ---------------------------------------------------------------------------
+
+-- | Compile parser 'Formals' (with 'Maybe Expr' defaults) to eval-time
+-- 'EvalFormals' (with 'Maybe Word32' bc_idx defaults).
+compileFormalsToEval :: Formals -> IO EvalFormals
+compileFormalsToEval (FormalName name) = pure (EFName name)
+compileFormalsToEval (FormalSet formals ellipsis) =
+  EFSet <$> mapM compileOneFormal formals <*> pure ellipsis
+compileFormalsToEval (FormalNamedSet name formals ellipsis) =
+  EFNamedSet name <$> mapM compileOneFormal formals <*> pure ellipsis
+
+compileOneFormal :: Formal -> IO EvalFormal
+compileOneFormal (Formal name defExpr) = do
+  defBcIdx <- case defExpr of
+    Nothing -> pure Nothing
+    Just expr -> Just <$> compileExpr expr
+  pure (EvalFormal name defBcIdx)
+
+-- ---------------------------------------------------------------------------
+-- Bytecode decoding (eval-time: read from C data buffer)
+-- ---------------------------------------------------------------------------
+
+-- | Decode formals from the bytecode data buffer.
+-- @flags@ is the formal type (0=Name, 1=Set, 2=NamedSet).
+-- @dataOff@ is the offset into the data buffer.
+decodeBcFormals :: Word8 -> Word32 -> IO EvalFormals
+decodeBcFormals flags dataOff = case flags of
+  0 {- FormalName -} -> do
+    sym <- cbcData dataOff
+    pure (EFName (symbolText (Symbol sym)))
+  1 {- FormalSet -} -> do
+    count <- cbcData dataOff
+    ellipsis <- cbcData (dataOff + 1)
+    formals <- decodeFormalEntries (fromIntegral count) (dataOff + 2)
+    pure (EFSet formals (ellipsis /= 0))
+  2 {- FormalNamedSet -} -> do
+    nameSym <- cbcData dataOff
+    count <- cbcData (dataOff + 1)
+    ellipsis <- cbcData (dataOff + 2)
+    formals <- decodeFormalEntries (fromIntegral count) (dataOff + 3)
+    pure (EFNamedSet (symbolText (Symbol nameSym)) formals (ellipsis /= 0))
+  _ -> error "decodeBcFormals: invalid formal type flag"
+
+-- | Decode a list of formal entries from the data buffer.
+-- Each entry is 3 words: [name_sym, has_default, default_bc_idx].
+decodeFormalEntries :: Int -> Word32 -> IO [EvalFormal]
+decodeFormalEntries 0 _ = pure []
+decodeFormalEntries n off = do
+  nameSym <- cbcData off
+  hasDef <- cbcData (off + 1)
+  defBcIdx <- cbcData (off + 2)
+  let defMaybe = if hasDef /= 0 then Just defBcIdx else Nothing
+  rest <- decodeFormalEntries (n - 1) (off + 3)
+  pure (EvalFormal (symbolText (Symbol nameSym)) defMaybe : rest)
+
+-- | Decode capture info from the bytecode data buffer.
+decodeBcCaptureInfo :: Word32 -> IO CaptureInfo
+decodeBcCaptureInfo dataOff = do
+  tag <- cbcData dataOff
+  case tag of
+    0 {- NoCaptureInfo -} -> pure NoCaptureInfo
+    1 {- Captures -} -> do
+      count <- cbcData (dataOff + 1)
+      pairs <- decodePairs (fromIntegral count) (dataOff + 2)
+      pure (Captures pairs)
+    2 {- CapturesWithScopes -} -> do
+      count <- cbcData (dataOff + 1)
+      pairs <- decodePairs (fromIntegral count) (dataOff + 2)
+      pure (CapturesWithScopes pairs)
+    _ -> error "decodeBcCaptureInfo: invalid capture type tag"
+
+-- | Decode (level, idx) pairs from the data buffer.
+decodePairs :: Int -> Word32 -> IO [(Int, Int)]
+decodePairs 0 _ = pure []
+decodePairs n off = do
+  level <- cbcData off
+  idx <- cbcData (off + 1)
+  rest <- decodePairs (n - 1) (off + 2)
+  pure ((fromIntegral level, fromIntegral idx) : rest)
+
+-- ---------------------------------------------------------------------------
+-- Binding decoding (for evalBcAttrs / evalBcLet)
+-- ---------------------------------------------------------------------------
+
+-- | A decoded binding from the bytecode data buffer.
+data BcBinding
+  = -- | @path = expr@ with attr path keys and value bc_idx
+    BcNamed ![BcAttrKey] !Word32
+  | -- | @inherit names@ from surrounding scope (symbol ids)
+    BcInherit ![Word32]
+  | -- | @inherit (from) names@ with from-expr bc_idx and name symbols
+    BcInheritFrom !Word32 ![Word32]
+
+-- | An attribute key in a binding path.
+data BcAttrKey
+  = -- | Static key (interned symbol)
+    BcStaticKey !Word32
+  | -- | Dynamic key (bc_idx of expression to evaluate)
+    BcDynamicKey !Word32
+
+-- | Decode all bindings from the bytecode data buffer.
+-- @bindCount@ is the number of bindings, @dataOff@ is the start offset.
+decodeBcBindings :: Word16 -> Word32 -> IO [BcBinding]
+decodeBcBindings 0 _ = pure []
+decodeBcBindings count dataOff = do
+  (binding, nextOff) <- decodeOneBinding dataOff
+  rest <- decodeBcBindings (count - 1) nextOff
+  pure (binding : rest)
+
+-- | Decode a single binding, returning it and the offset past it.
+decodeOneBinding :: Word32 -> IO (BcBinding, Word32)
+decodeOneBinding off = do
+  tag <- cbcData off
+  case tag of
+    0 {- NamedBinding -} -> do
+      pathLen <- cbcData (off + 1)
+      let keyStart = off + 2
+          keyWords = fromIntegral pathLen * 2
+          valOff = keyStart + keyWords
+      keys <- decodeAttrKeys (fromIntegral pathLen) keyStart
+      valBcIdx <- cbcData valOff
+      pure (BcNamed keys valBcIdx, valOff + 1)
+    1 {- Inherit -} -> do
+      hasFrom <- cbcData (off + 1)
+      fromBcIdx <- cbcData (off + 2)
+      nameCount <- cbcData (off + 3)
+      syms <- decodeSymList (fromIntegral nameCount) (off + 4)
+      let nextOff = off + 4 + nameCount
+      if hasFrom /= 0
+        then pure (BcInheritFrom fromBcIdx syms, nextOff)
+        else pure (BcInherit syms, nextOff)
+    _ -> error "decodeOneBinding: invalid binding type tag"
+
+-- | Decode attr path keys: pairs of (is_expr, key_or_bc_idx).
+decodeAttrKeys :: Int -> Word32 -> IO [BcAttrKey]
+decodeAttrKeys 0 _ = pure []
+decodeAttrKeys n off = do
+  isExpr <- cbcData off
+  val <- cbcData (off + 1)
+  rest <- decodeAttrKeys (n - 1) (off + 2)
+  let key = if isExpr /= 0 then BcDynamicKey val else BcStaticKey val
+  pure (key : rest)
+
+-- | Decode a list of symbol IDs from the data buffer.
+decodeSymList :: Int -> Word32 -> IO [Word32]
+decodeSymList 0 _ = pure []
+decodeSymList n off = do
+  sym <- cbcData off
+  rest <- decodeSymList (n - 1) (off + 1)
+  pure (sym : rest)
+
+-- ---------------------------------------------------------------------------
+-- Numeric reassembly (from two uint32 halves)
+-- ---------------------------------------------------------------------------
+
+-- | Reassemble an Int64 from two uint32 halves (lo, hi).
+reassembleInt64 :: Word32 -> Word32 -> Integer
+reassembleInt64 lo hi =
+  let w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
+      signed = fromIntegral w64 :: Int64
+   in fromIntegral signed
+
+-- | Reassemble a Double from two uint32 halves (lo, hi).
+reassembleDouble :: Word32 -> Word32 -> Double
+reassembleDouble lo hi =
+  let w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
+   in castWord64ToDouble w64

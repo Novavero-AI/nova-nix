@@ -44,7 +44,7 @@ import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
 import Nix.Eval.CList (clistToThunkList, thunkListToCList)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Eval.Types (AttrSet (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalStringContext, thunkToCPtr, unmarshalStringContext)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
@@ -287,14 +287,19 @@ instance MonadEval EvalIO where
       2 {- BLACKHOLE -} ->
         throwEvalError "infinite recursion encountered"
       _ {- PENDING -} -> do
-        payloadPtr <- EvalIO (liftIO (cthunkPayload ptr))
-        let pendingSp = castPtrToStablePtr payloadPtr
-        (expr, env) <- EvalIO (liftIO (deRefStablePtr pendingSp))
+        -- Bytecode thunks: read bc_idx + StablePtr Env.
+        -- The Expr is gone (replaced by bc_idx in the struct).
+        -- The Env is still a StablePtr (for knot-tying laziness).
+        bcIdx <- EvalIO (liftIO (cthunkGetBcIdx ptr))
+        envSp <- EvalIO (liftIO (cthunkPayload ptr))
+        let pendingSp = castPtrToStablePtr envSp
+        env <- EvalIO (liftIO (deRefStablePtr pendingSp))
         -- Mark blackhole BEFORE evaluation — any re-entry hits the
         -- BLACKHOLE branch above.
         _ <- EvalIO (liftIO (cthunkMarkBlackhole ptr))
-        val <- evalFn env expr
+        val <- evalFn env bcIdx
         oldPayload <- EvalIO (liftIO (storeComputed ptr val))
+        -- Free the pending env StablePtr.
         when (oldPayload /= nullPtr) $
           EvalIO (liftIO (freeStablePtr (castPtrToStablePtr oldPayload)))
         pure val

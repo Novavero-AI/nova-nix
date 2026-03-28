@@ -46,6 +46,7 @@ module Nix.Eval
 
     -- * Evaluation
     eval,
+    evalBytecode,
     force,
 
     -- * Helpers (for Builtins)
@@ -63,7 +64,7 @@ module Nix.Eval
   )
 where
 
-import Control.Monad (when, (>=>))
+import Control.Monad (foldM, when, (>=>))
 import qualified Crypto.Hash as CH
 import qualified Data.Array as Array
 import Data.Bits (xor, (.&.), (.|.))
@@ -74,25 +75,30 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.List (find, foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, maybeToList)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Word (Word16)
+import Data.Word (Word16, Word32, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peekElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpcode, cbcShortArg)
+import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
-import Nix.Eval.StringInterp (coerceToString, evalIndStringParts, evalStringParts)
+import Nix.Eval.StringInterp (coerceToString, stripIndentation)
+import Nix.Eval.Symbol (Symbol (..), symbolText)
 import Nix.Eval.Types
   ( AttrSet (..),
     CAttrSet,
     CompiledRegex (..),
     Env (..),
+    EvalFormal (..),
+    EvalFormals (..),
     MonadEval (..),
     NixValue (..),
     PureEval (..),
@@ -114,7 +120,7 @@ import Nix.Eval.Types
     attrSetUnionWith,
     buildCAttrSetKeys,
     buildCSlots,
-    cheapThunk,
+    cheapThunkBc,
     emptyContext,
     emptyEnv,
     envFromSlots,
@@ -127,6 +133,7 @@ import Nix.Eval.Types
     mkStr,
     mkSyntheticThunk,
     mkThunk,
+    mkThunkBc,
     newCEnv,
     newMinimalEnv,
     pushWithScope,
@@ -136,15 +143,11 @@ import Nix.Eval.Types
   )
 import Nix.Expr.Types
   ( AttrKey (..),
-    AttrPath,
     BinaryOp (..),
-    Binding (..),
     CaptureInfo (..),
     Expr (..),
-    Formal (..),
-    Formals (..),
     NixAtom (..),
-    StringPart (..),
+    UnaryOp (..),
   )
 import Nix.Hash (byteToHex, sha256Hex, truncatedBase32)
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath)
@@ -156,36 +159,11 @@ import Text.Regex.TDFA (matchAllText)
 import qualified Text.Regex.TDFA as RE
 
 -- | Evaluate a Nix expression in an environment.
+-- Compiles the expression to bytecode and dispatches to 'evalBytecode'.
 eval :: (MonadEval m) => Env -> Expr -> m NixValue
-eval env expr = case expr of
-  ELit atom -> evalLit atom
-  EStr parts -> uncurry VStr <$> evalStringParts eval force applyValue env parts
-  EIndStr parts -> uncurry VStr <$> evalIndStringParts eval force applyValue env parts
-  EVar name -> evalVar env name
-  EWithVar name -> evalWithVar env name
-  EResolvedVar level idx -> force (envLookupResolved level idx env)
-  EAttrs isRec bindings captureInfo -> evalAttrs env isRec bindings captureInfo
-  EList exprs -> pure (VList (map (cheapThunk env) exprs))
-  ESelect target path defExpr -> evalSelect env target path defExpr
-  EHasAttr target path -> evalHasAttr env target path
-  EApp func arg -> evalApp env func arg
-  ELambda formals body captureInfo ->
-    pure (VLambda (buildCaptureEnv env captureInfo) formals body)
-  ELet bindings body captureInfo -> evalLet env bindings body captureInfo
-  EIf cond thenExpr elseExpr -> evalIf env cond thenExpr elseExpr
-  EWith scope body -> evalWith env scope body
-  EAssert cond body -> evalAssert env cond body
-  EUnary op operand -> do
-    val <- eval env operand
-    evalUnary op val
-  ESearchPath name -> evalSearchPath env name
-  EBinary OpAnd left right -> evalShortCircuitAnd env left right
-  EBinary OpOr left right -> evalShortCircuitOr env left right
-  EBinary OpImpl left right -> evalShortCircuitImpl env left right
-  EBinary op left right -> do
-    leftVal <- eval env left
-    rightVal <- eval env right
-    evalBinary force op leftVal rightVal
+eval env expr =
+  let bcIdx = unsafePerformIO (compileExpr expr)
+   in evalBytecode env bcIdx
 
 -- | Force a thunk to a value.
 --
@@ -193,20 +171,512 @@ eval env expr = case expr of
 -- allows IO evaluators to implement memoization (caching the result
 -- after the first force) while pure evaluators simply re-evaluate.
 force :: (MonadEval m) => Thunk -> m NixValue
-force = forceThunk eval
+force = forceThunk evalBytecode
+
+-- | Evaluate a bytecode instruction by index.
+-- This is the primary evaluator — reads opcodes from the C bytecode
+-- store and dispatches.  All recursive evaluation goes through this
+-- function, never through 'eval' directly.
+evalBytecode :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBytecode env bcIdx =
+  let opcode = unsafePerformIO (cbcOpcode bcIdx)
+   in case opcode of
+        0 {- LIT_INT -} ->
+          let lo = unsafePerformIO (cbcArg1 bcIdx)
+              hi = unsafePerformIO (cbcArg2 bcIdx)
+           in pure (VInt (reassembleInt64 lo hi))
+        1 {- LIT_FLOAT -} ->
+          let lo = unsafePerformIO (cbcArg1 bcIdx)
+              hi = unsafePerformIO (cbcArg2 bcIdx)
+           in pure (VFloat (reassembleDouble lo hi))
+        2 {- LIT_BOOL -} ->
+          let flag = unsafePerformIO (cbcShortArg bcIdx)
+           in pure (VBool (flag /= 0))
+        3 {- LIT_NULL -} -> pure VNull
+        4 {- LIT_URI -} ->
+          let sym = unsafePerformIO (cbcArg1 bcIdx)
+           in pure (mkStr (symbolText (Symbol sym)))
+        5 {- LIT_PATH -} ->
+          let sym = unsafePerformIO (cbcArg1 bcIdx)
+           in VPath <$> resolvePathLiteral (symbolText (Symbol sym))
+        6 {- STR -} -> evalBcStr env bcIdx
+        7 {- IND_STR -} -> evalBcIndStr env bcIdx
+        8 {- VAR -} ->
+          let sym = unsafePerformIO (cbcArg1 bcIdx)
+           in evalVar env (symbolText (Symbol sym))
+        9 {- WITH_VAR -} ->
+          let sym = unsafePerformIO (cbcArg1 bcIdx)
+           in evalWithVar env (symbolText (Symbol sym))
+        10 {- RESOLVED_VAR -} ->
+          let level = fromIntegral (unsafePerformIO (cbcArg1 bcIdx))
+              idx = fromIntegral (unsafePerformIO (cbcArg2 bcIdx))
+           in force (envLookupResolved level idx env)
+        11 {- ATTRS -} -> evalBcAttrs env bcIdx
+        12 {- LIST -} -> evalBcList env bcIdx
+        13 {- SELECT -} -> evalBcSelect env bcIdx
+        14 {- HAS_ATTR -} -> evalBcHasAttr env bcIdx
+        15 {- APP -} -> evalBcApp env bcIdx
+        16 {- LAMBDA -} -> evalBcLambda env bcIdx
+        17 {- LET -} -> evalBcLet env bcIdx
+        18 {- IF -} ->
+          let condIdx = unsafePerformIO (cbcArg1 bcIdx)
+              thenIdx = unsafePerformIO (cbcArg2 bcIdx)
+              elseIdx = unsafePerformIO (cbcArg3 bcIdx)
+           in do
+                condVal <- evalBytecode env condIdx
+                case condVal of
+                  VBool True -> evalBytecode env thenIdx
+                  VBool False -> evalBytecode env elseIdx
+                  _ -> throwEvalError ("'if' condition must be a Boolean, got " <> typeName condVal)
+        19 {- WITH -} ->
+          let scopeIdx = unsafePerformIO (cbcArg1 bcIdx)
+              bodyIdx = unsafePerformIO (cbcArg2 bcIdx)
+           in do
+                scopeVal <- evalBytecode env scopeIdx
+                case scopeVal of
+                  VAttrs attrs -> evalBytecode (pushWithScope attrs env) bodyIdx
+                  _ -> throwEvalError ("'with' requires a set, got " <> typeName scopeVal)
+        20 {- ASSERT -} ->
+          let condIdx = unsafePerformIO (cbcArg1 bcIdx)
+              bodyIdx = unsafePerformIO (cbcArg2 bcIdx)
+           in do
+                condVal <- evalBytecode env condIdx
+                case condVal of
+                  VBool True -> evalBytecode env bodyIdx
+                  VBool False -> throwEvalError "assertion failed"
+                  _ -> throwEvalError ("assertion condition must be a Boolean, got " <> typeName condVal)
+        21 {- UNARY -} ->
+          let flags_ = unsafePerformIO (cbcFlags bcIdx)
+              operandIdx = unsafePerformIO (cbcArg1 bcIdx)
+           in do
+                val <- evalBytecode env operandIdx
+                evalUnary (decodeUnaryOp flags_) val
+        22 {- BINARY -} -> evalBcBinary env bcIdx
+        23 {- SEARCH_PATH -} ->
+          let sym = unsafePerformIO (cbcArg1 bcIdx)
+           in evalSearchPath env (symbolText (Symbol sym))
+        _ -> throwEvalError "evalBytecode: unknown opcode"
 
 -- ---------------------------------------------------------------------------
--- Literal
+-- Bytecode helpers
 -- ---------------------------------------------------------------------------
 
-evalLit :: (MonadEval m) => NixAtom -> m NixValue
-evalLit atom = case atom of
-  NixInt n -> pure (VInt n)
-  NixFloat n -> pure (VFloat n)
-  NixBool b -> pure (VBool b)
-  NixNull -> pure VNull
-  NixUri u -> pure (mkStr u)
-  NixPath p -> VPath <$> resolvePathLiteral p
+-- | Decode a UnaryOp from bytecode flags.
+decodeUnaryOp :: Word8 -> UnaryOp
+decodeUnaryOp 0 = OpNot
+decodeUnaryOp _ = OpNegate
+
+-- | Decode a BinaryOp from bytecode flags.
+decodeBinaryOp :: Word8 -> BinaryOp
+decodeBinaryOp 0 = OpAdd
+decodeBinaryOp 1 = OpSub
+decodeBinaryOp 2 = OpMul
+decodeBinaryOp 3 = OpDiv
+decodeBinaryOp 4 = OpAnd
+decodeBinaryOp 5 = OpOr
+decodeBinaryOp 6 = OpImpl
+decodeBinaryOp 7 = OpEq
+decodeBinaryOp 8 = OpNeq
+decodeBinaryOp 9 = OpLt
+decodeBinaryOp 10 = OpLte
+decodeBinaryOp 11 = OpGt
+decodeBinaryOp 12 = OpGte
+decodeBinaryOp 13 = OpConcat
+decodeBinaryOp _ = OpUpdate
+
+-- | Evaluate a binary operation from bytecode, with short-circuit
+-- support for &&, ||, ->.
+evalBcBinary :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcBinary env bcIdx0 =
+  let flags_ = unsafePerformIO (cbcFlags bcIdx0)
+      leftIdx = unsafePerformIO (cbcArg1 bcIdx0)
+      rightIdx = unsafePerformIO (cbcArg2 bcIdx0)
+      op = decodeBinaryOp flags_
+   in case op of
+        OpAnd -> evalShortCircuitAnd env leftIdx rightIdx
+        OpOr -> evalShortCircuitOr env leftIdx rightIdx
+        OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
+        _ -> do
+          leftVal <- evalBytecode env leftIdx
+          rightVal <- evalBytecode env rightIdx
+          evalBinary force op leftVal rightVal
+
+-- | Bytecode short-circuit &&
+evalShortCircuitAnd :: (MonadEval m) => Env -> Word32 -> Word32 -> m NixValue
+evalShortCircuitAnd env leftIdx rightIdx = do
+  leftVal <- evalBytecode env leftIdx
+  case leftVal of
+    VBool False -> pure (VBool False)
+    VBool True -> do
+      rightVal <- evalBytecode env rightIdx
+      case rightVal of
+        VBool _ -> pure rightVal
+        _ -> throwEvalError ("second operand of && must be a Boolean, got " <> typeName rightVal)
+    _ -> throwEvalError ("first operand of && must be a Boolean, got " <> typeName leftVal)
+
+-- | Bytecode short-circuit ||
+evalShortCircuitOr :: (MonadEval m) => Env -> Word32 -> Word32 -> m NixValue
+evalShortCircuitOr env leftIdx rightIdx = do
+  leftVal <- evalBytecode env leftIdx
+  case leftVal of
+    VBool True -> pure (VBool True)
+    VBool False -> do
+      rightVal <- evalBytecode env rightIdx
+      case rightVal of
+        VBool _ -> pure rightVal
+        _ -> throwEvalError ("second operand of || must be a Boolean, got " <> typeName rightVal)
+    _ -> throwEvalError ("first operand of || must be a Boolean, got " <> typeName leftVal)
+
+-- | Bytecode short-circuit ->
+evalShortCircuitImpl :: (MonadEval m) => Env -> Word32 -> Word32 -> m NixValue
+evalShortCircuitImpl env leftIdx rightIdx = do
+  leftVal <- evalBytecode env leftIdx
+  case leftVal of
+    VBool False -> pure (VBool True)
+    VBool True -> do
+      rightVal <- evalBytecode env rightIdx
+      case rightVal of
+        VBool _ -> pure rightVal
+        _ -> throwEvalError ("second operand of -> must be a Boolean, got " <> typeName rightVal)
+    _ -> throwEvalError ("first operand of -> must be a Boolean, got " <> typeName leftVal)
+
+-- | Evaluate a string literal from bytecode data buffer.
+evalBcStr :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcStr env bcIdx0 = do
+  let count = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
+      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+  chunks <- evalBcStringParts env count dataOff
+  let (texts, ctxs) = unzip chunks
+  pure (VStr (T.concat texts) (mconcat ctxs))
+
+-- | Evaluate an indented string literal from bytecode data buffer.
+evalBcIndStr :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcIndStr env bcIdx0 = do
+  let count = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
+      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+  chunks <- evalBcStringParts env count dataOff
+  let (texts, ctxs) = unzip chunks
+      raw = T.concat texts
+  pure (VStr (stripIndentation raw) (mconcat ctxs))
+
+-- | Evaluate string parts from the bytecode data buffer.
+-- Each part is two words: (tag, value).
+-- tag=0 -> StrLit (value = symbol), tag=1 -> StrInterp (value = bc_idx).
+evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [(Text, StringContext)]
+evalBcStringParts _ 0 _ = pure []
+evalBcStringParts env n off = do
+  let tag = unsafePerformIO (cbcData off)
+      val = unsafePerformIO (cbcData (off + 1))
+  chunk <- case tag of
+    0 -> pure (symbolText (Symbol val), emptyContext)
+    _ -> do
+      v <- evalBytecode env val
+      coerceToString force applyValue v
+  rest <- evalBcStringParts env (n - 1) (off + 2)
+  pure (chunk : rest)
+
+-- | Evaluate a list from bytecode data buffer.
+evalBcList :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcList env bcIdx0 =
+  let count = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0)) :: Int
+      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+      readChildren 0 _ = []
+      readChildren n off =
+        let childIdx = unsafePerformIO (cbcData off)
+         in cheapThunkBc env childIdx : readChildren (n - 1) (off + 1)
+   in pure (VList (readChildren count dataOff))
+
+-- | Evaluate a function application from bytecode.
+evalBcApp :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcApp env bcIdx0 = do
+  let funcIdx = unsafePerformIO (cbcArg1 bcIdx0)
+      argIdx = unsafePerformIO (cbcArg2 bcIdx0)
+  funcVal <- evalBytecode env funcIdx
+  case funcVal of
+    VLambda closureEnv formals bodyBcIdx -> do
+      let argThunk = cheapThunkBc env argIdx
+      extEnv <- matchFormals closureEnv formals argThunk
+      evalBytecode extEnv bodyBcIdx
+    VBuiltin "tryEval" [] -> do
+      result <- catchEvalError (evalBytecode env argIdx)
+      case result of
+        Right val ->
+          pure
+            ( VAttrs
+                ( attrSetFromMap $
+                    Map.fromList
+                      [ ("success", evaluated (VBool True)),
+                        ("value", evaluated val)
+                      ]
+                )
+            )
+        Left _ ->
+          pure
+            ( VAttrs
+                ( attrSetFromMap $
+                    Map.fromList
+                      [ ("success", evaluated (VBool False)),
+                        ("value", evaluated (VBool False))
+                      ]
+                )
+            )
+    VBuiltin name accArgs -> do
+      argVal <- evalBytecode env argIdx
+      applyBuiltin name accArgs argVal
+    VAttrs attrs
+      | Just functorThunk <- attrSetLookup "__functor" attrs -> do
+          functor <- force functorThunk
+          partiallyApplied <- applyValue functor funcVal
+          argVal <- evalBytecode env argIdx
+          applyValue partiallyApplied argVal
+    _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
+
+-- | Evaluate a lambda literal from bytecode — returns VLambda.
+evalBcLambda :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcLambda env bcIdx0 =
+  let flags_ = unsafePerformIO (cbcFlags bcIdx0)
+      formalsOff = unsafePerformIO (cbcArg1 bcIdx0)
+      bodyBcIdx = unsafePerformIO (cbcArg2 bcIdx0)
+      captureOff = unsafePerformIO (cbcArg3 bcIdx0)
+      formals = unsafePerformIO (decodeBcFormals flags_ formalsOff)
+      captureInfo = unsafePerformIO (decodeBcCaptureInfo captureOff)
+   in pure (VLambda (buildCaptureEnv env captureInfo) formals bodyBcIdx)
+
+-- | Evaluate a select expression from bytecode.
+evalBcSelect :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcSelect env bcIdx0 = do
+  let hasDef = unsafePerformIO (cbcFlags bcIdx0) /= 0
+      pathLen = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
+      targetIdx = unsafePerformIO (cbcArg1 bcIdx0)
+      pathOff = unsafePerformIO (cbcArg2 bcIdx0)
+      defIdx = unsafePerformIO (cbcArg3 bcIdx0)
+  targetVal <- evalBytecode env targetIdx
+  result <- walkBcAttrPath env pathLen pathOff targetVal
+  case result of
+    Just val -> pure val
+    Nothing
+      | hasDef -> evalBytecode env defIdx
+      | otherwise -> throwEvalError ("attribute path not found in " <> typeName targetVal)
+
+-- | Evaluate a hasAttr expression from bytecode.
+evalBcHasAttr :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcHasAttr env bcIdx0 = do
+  let pathLen = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
+      targetIdx = unsafePerformIO (cbcArg1 bcIdx0)
+      pathOff = unsafePerformIO (cbcArg2 bcIdx0)
+  targetVal <- evalBytecode env targetIdx
+  result <- walkBcAttrPath env pathLen pathOff targetVal
+  pure (VBool (isJust result))
+
+-- | Walk an attribute path stored in the bytecode data buffer.
+-- Each element is two words: (is_expr, key_or_bc_idx).
+walkBcAttrPath :: (MonadEval m) => Env -> Int -> Word32 -> NixValue -> m (Maybe NixValue)
+walkBcAttrPath _ 0 _ val = pure (Just val)
+walkBcAttrPath env n off val = case val of
+  VAttrs attrs -> do
+    let isExpr = unsafePerformIO (cbcData off)
+        keyVal = unsafePerformIO (cbcData (off + 1))
+    resolved <-
+      if isExpr /= 0
+        then do
+          keyResult <- evalBytecode env keyVal
+          case keyResult of
+            VStr s _ -> pure (Just s)
+            VNull -> pure Nothing
+            _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName keyResult)
+        else pure (Just (symbolText (Symbol keyVal)))
+    case resolved >>= (`attrSetLookup` attrs) of
+      Just thunk -> do
+        inner <- force thunk
+        walkBcAttrPath env (n - 1) (off + 2) inner
+      Nothing -> pure Nothing
+  _ -> pure Nothing
+
+-- | Evaluate attribute set from bytecode.
+evalBcAttrs :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcAttrs env bcIdx0 = do
+  let isRec = unsafePerformIO (cbcFlags bcIdx0) /= 0
+      bindCount = unsafePerformIO (cbcShortArg bcIdx0)
+      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+      captureOff = unsafePerformIO (cbcArg2 bcIdx0)
+      bindings = unsafePerformIO (decodeBcBindings bindCount dataOff)
+  if isRec
+    then do
+      let captureInfo = unsafePerformIO (decodeBcCaptureInfo captureOff)
+      evalBcRecAttrs env bindings captureInfo
+    else evalBcNonRecAttrs env bindings
+
+-- | Evaluate a non-recursive attr set from bytecode bindings.
+evalBcNonRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> m NixValue
+evalBcNonRecAttrs env bindings = do
+  thunkMap <- buildBcThunkMap env bindings
+  pure (VAttrs (attrSetFromMap thunkMap))
+
+-- | Evaluate a recursive attr set from bytecode bindings.
+evalBcRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> CaptureInfo -> m NixValue
+evalBcRecAttrs env bindings captureInfo
+  | allBcPositional bindings =
+      -- Positional path: slots for variable lookup, CAttrSet for return.
+      let slotCount = bcBindingSlotCount bindings
+          slotsPtr = allocCSlots slotCount
+          parentEnv = buildCaptureEnv env captureInfo
+          (withArr, withCount) = case captureInfo of
+            NoCaptureInfo -> envWithScopesRaw env
+            Captures _ -> (nullPtr, 0)
+            CapturesWithScopes _ -> withScopesForCapture env
+          recEnv = newCEnv slotsPtr slotCount Nothing (Just parentEnv) withArr withCount
+          thunkList = buildBcSlotThunks recEnv env bindings
+          filled = fillCSlots slotsPtr thunkList
+          attrMap = buildBcAttrMapFromSlots bindings thunkList
+       in filled `seq` pure (VAttrs (attrSetFromMap attrMap))
+  | otherwise = do
+      -- Fallback: dynamic/nested keys — two-phase CAttrSet.
+      allKeys <- bcBindingAllKeys env bindings
+      let cset = buildCAttrSetKeys allKeys
+          attrSet = AttrSet cset
+          (withArr, withCount) = envWithScopesRaw env
+          recEnv = newCEnv nullPtr 0 (Just attrSet) (Just env) withArr withCount
+      thunkMap <- buildBcThunkMap recEnv bindings
+      let filled = fillCAttrSetValues cset thunkMap
+       in filled `seq` pure (VAttrs attrSet)
+
+-- | Evaluate a let expression from bytecode.
+evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcLet env bcIdx0 = do
+  let bindCount = unsafePerformIO (cbcShortArg bcIdx0)
+      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+      bodyIdx = unsafePerformIO (cbcArg2 bcIdx0)
+      captureOff = unsafePerformIO (cbcArg3 bcIdx0)
+      bindings = unsafePerformIO (decodeBcBindings bindCount dataOff)
+      captureInfo = unsafePerformIO (decodeBcCaptureInfo captureOff)
+  if allBcPositional bindings
+    then do
+      -- Positional path: slots for O(1) lookup.
+      let slotCount = bcBindingSlotCount bindings
+          slotsPtr = allocCSlots slotCount
+          parentEnv = buildCaptureEnv env captureInfo
+          (withArr, withCount) = case captureInfo of
+            NoCaptureInfo -> envWithScopesRaw env
+            Captures _ -> (nullPtr, 0)
+            CapturesWithScopes _ -> withScopesForCapture env
+          letEnv = newCEnv slotsPtr slotCount Nothing (Just parentEnv) withArr withCount
+          filled = fillCSlots slotsPtr (buildBcSlotThunks letEnv env bindings)
+       in filled `seq` evalBytecode letEnv bodyIdx
+    else do
+      -- Fallback: dynamic/nested keys — two-phase CAttrSet.
+      allKeys <- bcBindingAllKeys env bindings
+      let cset = buildCAttrSetKeys allKeys
+          (withArr, withCount) = envWithScopesRaw env
+          letEnv = newCEnv nullPtr 0 (Just (AttrSet cset)) (Just env) withArr withCount
+      thunkMap <- buildBcThunkMap letEnv bindings
+      let filled = fillCAttrSetValues cset thunkMap
+       in filled `seq` evalBytecode letEnv bodyIdx
+
+-- | Check if all bytecode bindings are single static keys (eligible for positional).
+allBcPositional :: [BcBinding] -> Bool
+allBcPositional = all isEligible
+  where
+    isEligible (BcNamed [BcStaticKey _] _) = True
+    isEligible (BcInherit _) = True
+    isEligible _ = False
+
+-- | Count positional slots for bytecode bindings.
+bcBindingSlotCount :: [BcBinding] -> Int
+bcBindingSlotCount = foldl' countOne 0
+  where
+    countOne !acc (BcNamed [BcStaticKey _] _) = acc + 1
+    countOne !acc (BcInherit syms) = acc + length syms
+    countOne !acc _ = acc
+
+-- | Build thunks for positional bytecode bindings in declaration order.
+buildBcSlotThunks :: Env -> Env -> [BcBinding] -> [Thunk]
+buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
+  where
+    slotThunk (BcNamed [BcStaticKey _] valBcIdx) =
+      [mkThunkBc recEnv valBcIdx]
+    slotThunk (BcInherit syms) =
+      map (inheritLookup outerEnv . symbolText . Symbol) syms
+    -- Unreachable: allBcPositional guards this path.
+    slotThunk _ = []
+
+-- | Build attr map from slots for positional bytecode bindings.
+buildBcAttrMapFromSlots :: [BcBinding] -> [Thunk] -> Map Text Thunk
+buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
+  where
+    go [] _ !acc = acc
+    go (BcNamed [BcStaticKey sym] _ : bs) (t : ts) !acc =
+      go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
+    go (BcInherit syms : bs) ts !acc =
+      let (used, rest) = splitAt (length syms) ts
+          accMerged = foldl' (\a (sym, t0) -> Map.insert (symbolText (Symbol sym)) t0 a) acc (zip syms used)
+       in go bs rest accMerged
+    -- Unreachable: allBcPositional guards this path.
+    go (_ : bs) ts !acc = go bs ts acc
+
+-- | Build thunk map for bytecode attrs (non-rec or fallback rec path).
+buildBcThunkMap :: (MonadEval m) => Env -> [BcBinding] -> m (Map Text Thunk)
+buildBcThunkMap thunkEnv = foldM addBinding Map.empty
+  where
+    addBinding acc (BcNamed keys valBcIdx) = do
+      resolvedKeys <- mapM (resolveBcKey thunkEnv) keys
+      case sequence resolvedKeys of
+        Nothing -> pure acc -- null key -> skip
+        Just [key] ->
+          pure (insertWithMerge acc key (mkThunkBc thunkEnv valBcIdx))
+        Just path ->
+          let nested = buildBcNestedAttr thunkEnv path valBcIdx
+           in pure (foldl' (\a (k, t0) -> insertWithMerge a k t0) acc (Map.toList nested))
+    addBinding acc (BcInherit syms) =
+      pure (foldl' (\a sym -> let name = symbolText (Symbol sym) in insertWithMerge a name (inheritLookup thunkEnv name)) acc syms)
+    addBinding acc (BcInheritFrom fromBcIdx syms) =
+      -- inherit (from) name -> select name from the from-expr.
+      -- Create a small env with the from value at slot 0, then a
+      -- synthetic expression that selects name from slot 0.
+      let addInheritFrom a sym =
+            let name = symbolText (Symbol sym)
+                selectExpr = ESelect (EResolvedVar 0 0) [StaticKey name] Nothing
+                (sp, sc) = buildCSlots [mkThunkBc thunkEnv fromBcIdx]
+                fromEnv = newMinimalEnv sp sc
+             in insertWithMerge a name (mkSyntheticThunk fromEnv selectExpr)
+       in pure (foldl' addInheritFrom acc syms)
+
+    insertWithMerge acc key thunk =
+      case Map.lookup key acc of
+        Nothing -> Map.insert key thunk acc
+        Just existing -> Map.insert key (mergeThunks existing thunk) acc
+
+-- | Resolve a bytecode attr key to text.
+resolveBcKey :: (MonadEval m) => Env -> BcAttrKey -> m (Maybe Text)
+resolveBcKey _env (BcStaticKey sym) = pure (Just (symbolText (Symbol sym)))
+resolveBcKey env (BcDynamicKey bcIdx0) = do
+  val <- evalBytecode env bcIdx0
+  case val of
+    VStr s _ -> pure (Just s)
+    VNull -> pure Nothing
+    _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName val)
+
+-- | Build a nested attribute structure from a resolved dotted path (bytecode).
+buildBcNestedAttr :: Env -> [Text] -> Word32 -> Map Text Thunk
+buildBcNestedAttr _thunkEnv [] _valBcIdx = Map.empty
+buildBcNestedAttr thunkEnv [key] valBcIdx =
+  Map.singleton key (mkThunkBc thunkEnv valBcIdx)
+buildBcNestedAttr thunkEnv (key : rest) valBcIdx =
+  Map.singleton key (evaluated (VAttrs (attrSetFromMap (buildBcNestedAttr thunkEnv rest valBcIdx))))
+
+-- | Extract all top-level keys from bytecode bindings, resolving
+-- dynamic keys as needed.  Used by the fallback path (two-phase
+-- CAttrSet construction) where all keys must be known before thunks.
+bcBindingAllKeys :: (MonadEval m) => Env -> [BcBinding] -> m [Text]
+bcBindingAllKeys env bindings = fmap concat (mapM oneBinding bindings)
+  where
+    oneBinding (BcNamed (key : _) _) = do
+      resolved <- resolveBcKey env key
+      pure (maybeToList resolved)
+    oneBinding (BcNamed [] _) = pure []
+    oneBinding (BcInherit syms) =
+      pure (map (symbolText . Symbol) syms)
+    oneBinding (BcInheritFrom _ syms) =
+      pure (map (symbolText . Symbol) syms)
 
 -- ---------------------------------------------------------------------------
 -- Search paths (<nixpkgs>, <nixpkgs/lib>)
@@ -266,348 +736,62 @@ lookupWithScopesRaw name withArr count = unsafePerformIO $ go 0
             Nothing -> go (i + 1)
 
 -- ---------------------------------------------------------------------------
--- Attribute sets
+-- Formals matching + env helpers (used by evalBcApp, applyValue, etc.)
 -- ---------------------------------------------------------------------------
 
-evalAttrs :: (MonadEval m) => Env -> Bool -> [Binding] -> CaptureInfo -> m NixValue
-evalAttrs env False bindings _captureInfo = evalNonRecAttrs env bindings
-evalAttrs env True bindings captureInfo = evalRecAttrs env bindings captureInfo
-
--- | Non-recursive attribute set: thunks capture the outer environment.
---
--- Eagerly builds all thunks and packs them into a C-backed CAttrSet.
--- With C arena thunks (~16 bytes, ~20ns allocation), eager construction
--- is cheaper than the former LazyBinding overhead and moves all data
--- off the GHC heap.  Dynamic keys are resolved eagerly (they may depend
--- on evaluation).
-evalNonRecAttrs :: (MonadEval m) => Env -> [Binding] -> m NixValue
-evalNonRecAttrs env bindings = do
-  resolvedBindings <- resolveBindingKeys env bindings
-  let thunkMap = buildThunkMap env resolvedBindings
-  pure (VAttrs (attrSetFromMap thunkMap))
-
--- | Recursive attribute set: thunks capture the completed environment
--- (Haskell's laziness ties the knot — Thunk's Env field is lazy).
--- Dynamic keys in recursive attrs evaluate against the outer env
--- (the rec env is not yet available during key resolution).
---
--- Positional path: when all bindings are single static keys, builds
--- 'envSlots' for variable lookup and a CAttrSet for the return value.
--- Both reference the SAME thunk objects (no duplication).
---
--- Fallback path: uses two-phase CAttrSet construction for knot-tying.
--- Allocates keys first (NULL values), creates env referencing the CAttrSet,
--- builds thunks capturing that env, then fills CAttrSet values.
-evalRecAttrs :: (MonadEval m) => Env -> [Binding] -> CaptureInfo -> m NixValue
-evalRecAttrs env bindings captureInfo
-  | allPositionalBindings bindings =
-      -- Positional path: slots for variable lookup, CAttrSet for return.
-      -- Two-phase knot-tying: allocate C slot array first so recEnv
-      -- can reference slotsPtr, then fill slots with thunks that
-      -- lazily capture recEnv.  fillCSlots is forced by seq before
-      -- the attr map is returned.
-      let slotCount = bindingSlotCount bindings
-          slotsPtr = allocCSlots slotCount
-          parentEnv = buildCaptureEnv env captureInfo
-          (withArr, withCount) = case captureInfo of
-            NoCaptureInfo -> envWithScopesRaw env
-            Captures _ -> (nullPtr, 0)
-            CapturesWithScopes _ -> withScopesForCapture env
-          recEnv = newCEnv slotsPtr slotCount Nothing (Just parentEnv) withArr withCount
-          thunkList = buildSlotThunks recEnv env bindings
-          filled = fillCSlots slotsPtr thunkList
-          attrMap = buildAttrMapFromSlots bindings thunkList
-       in filled `seq` pure (VAttrs (attrSetFromMap attrMap))
-  | otherwise = do
-      -- Fallback: dynamic/nested keys — two-phase CAttrSet.
-      resolvedBindings <- resolveBindingKeys env bindings
-      let allKeys = concatMap resolvedBindingTopKeys resolvedBindings
-          cset = buildCAttrSetKeys allKeys
-          attrSet = AttrSet cset
-          (withArr, withCount) = envWithScopesRaw env
-          recEnv = newCEnv nullPtr 0 (Just attrSet) (Just env) withArr withCount
-          thunkMap = buildThunkMap recEnv resolvedBindings
-          filled = fillCAttrSetValues cset thunkMap
-       in filled `seq` pure (VAttrs attrSet)
-
--- ---------------------------------------------------------------------------
--- Resolved bindings (for knot-tying in rec {} and let)
--- ---------------------------------------------------------------------------
-
--- | A binding with all attribute keys pre-resolved to text.
--- Used by 'evalRecAttrs' and 'evalLet' to separate key resolution
--- (monadic, may evaluate dynamic keys) from thunk construction
--- (pure, enables knot-tying).
-data ResolvedBinding
-  = -- | @path = expr@ with all keys resolved to text.
-    ResolvedNamed ![Text] !Expr
-  | -- | @inherit attrs@ from the surrounding scope.
-    ResolvedInherit ![Text]
-  | -- | @inherit (from) attrs@.
-    ResolvedInheritFrom !Expr ![Text]
-
--- | Resolve all attribute keys in a list of bindings, evaluating
--- dynamic keys against the given environment.
-resolveBindingKeys :: (MonadEval m) => Env -> [Binding] -> m [ResolvedBinding]
-resolveBindingKeys keyEnv = fmap catMaybes . mapM resolveOne
-  where
-    resolveOne (NamedBinding path bodyExpr) = do
-      resolvedPath <- mapM (resolveKey keyEnv) path
-      -- If any key segment is null, skip the entire binding
-      -- (matching real Nix; used by the module system for conditional attrs).
-      pure (fmap (`ResolvedNamed` bodyExpr) (sequence resolvedPath))
-    resolveOne (Inherit Nothing names) =
-      pure (Just (ResolvedInherit names))
-    resolveOne (Inherit (Just fromExpr) names) =
-      pure (Just (ResolvedInheritFrom fromExpr names))
-
--- | Extract top-level keys from a resolved binding (for two-phase CAttrSet).
--- Nested paths like @a.b.c = expr@ contribute the top-level key @a@.
-resolvedBindingTopKeys :: ResolvedBinding -> [Text]
-resolvedBindingTopKeys (ResolvedNamed (key : _) _) = [key]
-resolvedBindingTopKeys (ResolvedNamed [] _) = []
-resolvedBindingTopKeys (ResolvedInherit names) = names
-resolvedBindingTopKeys (ResolvedInheritFrom _ names) = names
-
--- | Build a 'Map Text Thunk' from resolved bindings.
--- Eagerly creates thunks for all bindings — with C arena thunks
--- (~16 bytes, ~20ns each), this is cheaper than the former LazyBinding
--- overhead.  Key collisions (e.g. @a.x = 1; a.y = 2@) are merged
--- recursively via 'mergeThunks'.
-buildThunkMap :: Env -> [ResolvedBinding] -> Map Text Thunk
-buildThunkMap thunkEnv = foldl' addBinding Map.empty
-  where
-    addBinding acc (ResolvedNamed [key] bodyExpr) =
-      case Map.lookup key acc of
-        Nothing -> Map.insert key (mkThunk thunkEnv bodyExpr) acc
-        Just existingThunk ->
-          let newThunk = mkThunk thunkEnv bodyExpr
-           in Map.insert key (mergeThunks existingThunk newThunk) acc
-    addBinding acc (ResolvedNamed path@(_ : _ : _) bodyExpr) =
-      -- Nested path: build eagerly (rare in large rec sets)
-      let nested = buildResolvedNestedAttr thunkEnv path bodyExpr
-       in foldl' (\a (k, t) -> insertWithMerge a k t) acc (Map.toList nested)
-    addBinding acc (ResolvedNamed [] _) = acc
-    addBinding acc (ResolvedInherit names) =
-      foldl' (\a n -> insertWithMerge a n (inheritLookup thunkEnv n)) acc names
-    addBinding acc (ResolvedInheritFrom fromExpr names) =
-      foldl' (\a n -> insertWithMerge a n (mkThunk thunkEnv (ESelect fromExpr [StaticKey n] Nothing))) acc names
-
-    insertWithMerge acc key thunk =
-      case Map.lookup key acc of
-        Nothing -> Map.insert key thunk acc
-        Just existing -> Map.insert key (mergeThunks existing thunk) acc
-
--- | Build a nested attribute structure from a resolved dotted path (pure).
-buildResolvedNestedAttr :: Env -> [Text] -> Expr -> Map Text Thunk
-buildResolvedNestedAttr _thunkEnv [] _bodyExpr = Map.empty
-buildResolvedNestedAttr thunkEnv [key] bodyExpr =
-  Map.singleton key (mkThunk thunkEnv bodyExpr)
-buildResolvedNestedAttr thunkEnv (key : rest) bodyExpr =
-  Map.singleton key (evaluated (VAttrs (attrSetFromMap (buildResolvedNestedAttr thunkEnv rest bodyExpr))))
-
--- | Look up a name for @inherit@.  If not found, create a thunk
--- that will error when forced (matching real Nix behaviour).
-inheritLookup :: Env -> Text -> Thunk
-inheritLookup env name =
-  case envLookup name env of
-    Just thunk -> thunk
-    Nothing ->
-      -- Deferred error: only triggers if this binding is actually demanded.
-      -- Constructs: builtins.throw "undefined variable '<name>'"
-      let errMsg = "undefined variable '" <> name <> "'"
-          throwExpr = EApp (EVar "throw") (EStr [StrLit errMsg])
-       in mkThunk env throwExpr
-
--- | Resolve an attribute key.  Static keys always return 'Just'.
--- Dynamic keys evaluate to a string or 'null'; null means "skip this binding"
--- (matching real Nix, used by the module system for conditional attributes).
-resolveKey :: (MonadEval m) => Env -> AttrKey -> m (Maybe Text)
-resolveKey _env (StaticKey name) = pure (Just name)
-resolveKey env (DynamicKey expr) = do
-  val <- eval env expr
-  case val of
-    VStr s _ -> pure (Just s)
-    VNull -> pure Nothing
-    _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName val)
-
--- | Merge two thunks at the same key.  If both are computed VAttrs,
--- merge their contents recursively.  Otherwise the right wins.
-mergeThunks :: Thunk -> Thunk -> Thunk
-mergeThunks a b =
-  case (readThunkValue a, readThunkValue b) of
-    (Just (VAttrs aa), Just (VAttrs bb)) ->
-      evaluated (VAttrs (attrSetUnionWith mergeThunks aa bb))
-    _ -> b
-
--- ---------------------------------------------------------------------------
--- Select / has-attr
--- ---------------------------------------------------------------------------
-
-evalSelect :: (MonadEval m) => Env -> Expr -> AttrPath -> Maybe Expr -> m NixValue
-evalSelect env target path defExpr = do
-  targetVal <- eval env target
-  result <- walkAttrPath env path targetVal
-  case result of
-    Just val -> pure val
-    Nothing -> case defExpr of
-      Just def -> eval env def
-      Nothing -> throwEvalError ("attribute path not found in " <> typeName targetVal)
-
--- | Walk an attribute path through nested attribute sets.
--- Returns @Just value@ if the full path resolves, @Nothing@ if any
--- key is missing or a non-set is encountered mid-path.
--- The @env@ is used only for resolving dynamic keys.
-walkAttrPath :: (MonadEval m) => Env -> AttrPath -> NixValue -> m (Maybe NixValue)
-walkAttrPath _env [] val = pure (Just val)
-walkAttrPath env (key : rest) val = case val of
-  VAttrs attrs -> do
-    resolved <- resolveKey env key
-    case resolved >>= (`attrSetLookup` attrs) of
-      Just thunk -> do
-        inner <- force thunk
-        walkAttrPath env rest inner
-      Nothing -> pure Nothing
-  _ -> pure Nothing
-
-evalHasAttr :: (MonadEval m) => Env -> Expr -> AttrPath -> m NixValue
-evalHasAttr env target path = do
-  targetVal <- eval env target
-  result <- walkAttrPath env path targetVal
-  case result of
-    Just _ -> pure (VBool True)
-    Nothing -> pure (VBool False)
-
--- ---------------------------------------------------------------------------
--- Application
--- ---------------------------------------------------------------------------
-
-evalApp :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
-evalApp env funcExpr argExpr = do
-  funcVal <- eval env funcExpr
-  case funcVal of
-    VLambda closureEnv formals body -> do
-      let argThunk = cheapThunk env argExpr
-      extEnv <- matchFormals closureEnv formals argThunk
-      eval extEnv body
-    VBuiltin "tryEval" [] -> do
-      result <- catchEvalError (eval env argExpr)
-      case result of
-        Right val ->
-          pure
-            ( VAttrs
-                ( attrSetFromMap $
-                    Map.fromList
-                      [ ("success", evaluated (VBool True)),
-                        ("value", evaluated val)
-                      ]
-                )
-            )
-        Left _ ->
-          pure
-            ( VAttrs
-                ( attrSetFromMap $
-                    Map.fromList
-                      [ ("success", evaluated (VBool False)),
-                        ("value", evaluated (VBool False))
-                      ]
-                )
-            )
-    VBuiltin name accArgs -> do
-      argVal <- eval env argExpr
-      applyBuiltin name accArgs argVal
-    -- __functor support: a set with __functor is callable.
-    -- Semantics: (attrs.__functor attrs) arg
-    VAttrs attrs
-      | Just functorThunk <- attrSetLookup "__functor" attrs -> do
-          functor <- force functorThunk
-          -- Apply __functor to the set itself, yielding a function
-          partiallyApplied <- applyValue functor funcVal
-          -- Apply the resulting function to the argument
-          argVal <- eval env argExpr
-          applyValue partiallyApplied argVal
-    _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
-
--- | Match function formals against an argument thunk.
---
--- Builds a positional slot list matching the indices assigned by
--- 'Nix.Expr.Resolve':
---
--- * @FormalName n@ → @[argThunk]@
--- * @FormalSet [a, b, c] _@ → @[aThunk, bThunk, cThunk]@
--- * @FormalNamedSet n [a, b, c] _@ → @[argThunk, aThunk, bThunk, cThunk]@
-matchFormals :: (MonadEval m) => Env -> Formals -> Thunk -> m Env
-matchFormals closureEnv (FormalName _) argThunk =
+-- | Match a lambda's formals against an argument thunk.
+matchFormals :: (MonadEval m) => Env -> EvalFormals -> Thunk -> m Env
+matchFormals closureEnv (EFName _) argThunk =
   let (sp, sc) = buildCSlots [argThunk]
    in pure (envFromSlots sp sc closureEnv)
-matchFormals closureEnv (FormalSet formals allowExtra) argThunk = do
+matchFormals closureEnv (EFSet formals allowExtra) argThunk = do
   argVal <- force argThunk
   matchFormalSet closureEnv formals allowExtra argVal Nothing
-matchFormals closureEnv (FormalNamedSet _ formals allowExtra) argThunk = do
+matchFormals closureEnv (EFNamedSet _ formals allowExtra) argThunk = do
   argVal <- force argThunk
-  -- Pass the @-pattern thunk so it goes into slot 0 of the combined env.
   matchFormalSet closureEnv formals allowExtra argVal (Just argThunk)
 
--- | Match a formal set pattern against a VAttrs argument.
---
--- All formals are batched into a SINGLE scope level (one slot list)
--- instead of creating a separate Map per formal.  This replaces
--- Map.Bin nodes (48 bytes each) with list cons cells (16 bytes each)
--- and eliminates Text key storage entirely.
---
--- Default expressions use formalEnv via knot-tying, so they can
--- reference other formals — matching real Nix semantics where all
--- formals are mutually visible (e.g. @{ a ? b, b ? 1 }: a@ yields 1).
-matchFormalSet :: (MonadEval m) => Env -> [Formal] -> Bool -> NixValue -> Maybe Thunk -> m Env
+-- | Match destructuring set pattern formals against an attrset value.
+matchFormalSet :: (MonadEval m) => Env -> [EvalFormal] -> Bool -> NixValue -> Maybe Thunk -> m Env
 matchFormalSet closureEnv formals allowExtra argVal atThunk =
   case argVal of
     VAttrs attrs -> do
       checkExtraKeys formals allowExtra attrs
-      -- Eagerly check required formals BEFORE building the scope,
-      -- so missing-attribute errors are immediate, not deferred.
       checkMissingFormals attrs formals
-      -- Batch all formal bindings into ONE scope level.
-      -- Knot-tying: formalEnv is used in mkThunk for defaults,
-      -- but mkThunk captures Env lazily (Pending !Expr Env).
       let formalEnv = envFromSlots formalSlotsPtr formalSlotCount closureEnv
           (formalSlotsPtr, formalSlotCount) = buildCSlots formalThunks
           formalThunks = case atThunk of
             Nothing -> map resolveOneFormal formals
             Just at -> at : map resolveOneFormal formals
-          resolveOneFormal (Formal name defExpr) =
+          resolveOneFormal (EvalFormal name defBcIdx) =
             case attrSetLookup name attrs of
               Just thunk -> thunk
-              Nothing -> case defExpr of
-                Just def -> mkThunk formalEnv def
-                -- Unreachable: checkMissingFormals verified all
-                -- required formals (those with no default) are present.
+              Nothing -> case defBcIdx of
+                Just bcIdx -> mkThunkBc formalEnv bcIdx
                 Nothing -> error "matchFormalSet: missing required formal (unreachable)"
       pure formalEnv
     _ -> throwEvalError ("function expects a set argument, got " <> typeName argVal)
 
--- | Verify that no unexpected keys are present (unless @...@ allows them).
-checkExtraKeys :: (MonadEval m) => [Formal] -> Bool -> AttrSet -> m ()
+checkExtraKeys :: (MonadEval m) => [EvalFormal] -> Bool -> AttrSet -> m ()
 checkExtraKeys _ True _ = pure ()
 checkExtraKeys formals False attrs =
-  let expected = map fName formals
+  let expected = map efName formals
       actual = attrSetKeys attrs
       extra = filter (`notElem` expected) actual
    in case extra of
         [] -> pure ()
         (k : _) -> throwEvalError ("unexpected attribute '" <> k <> "' in function argument")
 
--- | Check that all required formals (those without defaults) are present.
-checkMissingFormals :: (MonadEval m) => AttrSet -> [Formal] -> m ()
+checkMissingFormals :: (MonadEval m) => AttrSet -> [EvalFormal] -> m ()
 checkMissingFormals attrs formals =
-  case [fName f | f <- formals, isNothing (fDefault f), not (attrSetMember (fName f) attrs)] of
+  case [efName f | f <- formals, isNothing (efDefault f), not (attrSetMember (efName f) attrs)] of
     [] -> pure ()
     (name : _) -> throwEvalError ("missing required attribute '" <> name <> "'")
 
--- | Build a flat env from capture coordinates, extracting only the
--- referenced slots from the parent chain.  Returns the original env
--- unchanged when untrimmed.  Used by lambdas (as closure env), and
--- by let\/rec blocks (as trimmed parent env) to break the retention
--- chain to the full outer scope.
+-- | Build capture environment from capture info.
+-- NoCaptureInfo: no trimming, use env as-is.
+-- Captures: build minimal env from captured slots.
+-- CapturesWithScopes: build minimal env + copy with-scopes.
 buildCaptureEnv :: Env -> CaptureInfo -> Env
 buildCaptureEnv env NoCaptureInfo = env
 buildCaptureEnv env (Captures captureList) =
@@ -618,177 +802,23 @@ buildCaptureEnv env (CapturesWithScopes captureList) =
       (withArr, withCount) = withScopesForCapture env
    in newCEnv slotsPtr slotCount Nothing Nothing withArr withCount
 
--- ---------------------------------------------------------------------------
--- Let / if / with / assert
--- ---------------------------------------------------------------------------
+-- | Look up a name in the environment and return its thunk.
+-- Used by @inherit@ bindings (both bytecode and Expr paths).
+inheritLookup :: Env -> Text -> Thunk
+inheritLookup env name =
+  case envLookup name env of
+    Just thunk -> thunk
+    Nothing -> error ("inheritLookup: undefined variable '" <> T.unpack name <> "' (unreachable)")
 
--- | Check if all bindings have single static keys (eligible for
--- positional slot-based evaluation).  Mirrors 'allStaticSingleKey'
--- in 'Nix.Expr.Resolve'.
-allPositionalBindings :: [Binding] -> Bool
-allPositionalBindings = all isEligible
-  where
-    isEligible (NamedBinding [StaticKey _] _) = True
-    isEligible (Inherit _ _) = True
-    isEligible _ = False
-
--- | Count the number of positional slots needed for a list of bindings.
--- Each named binding contributes 1, each inherit contributes its name count.
--- Used by knot-tying sites where the count must be known before thunks
--- are materialized (to pre-allocate the C slot array).
-bindingSlotCount :: [Binding] -> Int
-bindingSlotCount = foldl' countOne 0
-  where
-    countOne !acc (NamedBinding [StaticKey _] _) = acc + 1
-    countOne !acc (Inherit _ names) = acc + length names
-    countOne !acc _ = acc
-
--- | Build thunks for positional let\/rec bindings in declaration order.
--- Returns a list of thunks matching the slot indices assigned by
--- 'lexicalScopeFromBindings' in the resolve pass.
---
--- Inherits are expanded in-place: @inherit x y@ produces thunks at
--- consecutive slots.  The @thunkEnv@ is the knot-tied let\/rec env;
--- @outerEnv@ is the parent env used for inherit lookups.
---
--- Uses 'mkThunk' (not 'cheapThunk') for body expressions because
--- @thunkEnv@ is knot-tied: its C slot array is pre-allocated but not
--- yet filled.  'cheapThunk' would try to peek into unfilled slots for
--- 'EResolvedVar' references.  'mkThunk' just stores @(expr, env)@
--- lazily, deferring slot access to force time (when all slots are filled).
-buildSlotThunks :: Env -> Env -> [Binding] -> [Thunk]
-buildSlotThunks thunkEnv outerEnv = concatMap slotThunk
-  where
-    slotThunk (NamedBinding [StaticKey _] bodyExpr) =
-      [mkThunk thunkEnv bodyExpr]
-    slotThunk (Inherit Nothing names) =
-      -- inherit x → look up x in the OUTER env (before the let scope).
-      map (inheritLookup outerEnv) names
-    slotThunk (Inherit (Just fromExpr) names) =
-      -- inherit (from) x → ESelect from.x, evaluated in the let env.
-      [mkThunk thunkEnv (ESelect fromExpr [StaticKey name] Nothing) | name <- names]
-    -- Unreachable: allPositionalBindings guards this path.
-    slotThunk _ = []
-
--- | Build a 'Map Text Thunk' from a binding list and corresponding
--- thunk list (in declaration order).  The thunks are shared (no copies).
--- Used by 'evalRecAttrs' to produce the 'EagerAttrs' return value
--- while C-backed slots serve for variable lookup.
-buildAttrMapFromSlots :: [Binding] -> [Thunk] -> Map Text Thunk
-buildAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
-  where
-    go [] _ !acc = acc
-    go (NamedBinding [StaticKey name] _ : bs) (t : ts) !acc =
-      go bs ts (Map.insert name t acc)
-    go (Inherit _ names : bs) ts !acc =
-      let (used, rest) = splitAt (length names) ts
-          acc' = foldl' (\a (name, t) -> Map.insert name t a) acc (zip names used)
-       in go bs rest acc'
-    -- Unreachable: allPositionalBindings guards this path.
-    go (_ : bs) ts !acc = go bs ts acc
-
--- | Let is recursive in Nix: all bindings are visible to each other.
--- Knot-tying via Haskell laziness (Thunk's Env field is lazy).
--- Dynamic keys in let evaluate against the outer env (the let env
--- is not yet available during key resolution).
---
--- Positional path: when all bindings are single static keys, builds
--- 'envSlots' for O(1) variable lookup and sets 'envLazyScope = Nothing'.
--- This enables closure trimming to fire on lambdas that reference
--- let-bound variables.
---
--- Fallback path: dynamic\/nested-key blocks use two-phase CAttrSet
--- construction with 'envLazyScope'.
-evalLet :: (MonadEval m) => Env -> [Binding] -> Expr -> CaptureInfo -> m NixValue
-evalLet env bindings body captureInfo
-  | allPositionalBindings bindings =
-      -- Positional path: slots for O(1) lookup, no envLazyScope.
-      -- Two-phase knot-tying: allocate C slot array first so letEnv
-      -- can reference slotsPtr, then fill slots with thunks that
-      -- lazily capture letEnv.  fillCSlots is forced by seq before eval.
-      let slotCount = bindingSlotCount bindings
-          slotsPtr = allocCSlots slotCount
-          parentEnv = buildCaptureEnv env captureInfo
-          (withArr, withCount) = case captureInfo of
-            NoCaptureInfo -> envWithScopesRaw env
-            Captures _ -> (nullPtr, 0)
-            CapturesWithScopes _ -> withScopesForCapture env
-          letEnv = newCEnv slotsPtr slotCount Nothing (Just parentEnv) withArr withCount
-          filled = fillCSlots slotsPtr (buildSlotThunks letEnv env bindings)
-       in filled `seq` eval letEnv body
-  | otherwise = do
-      -- Fallback: dynamic/nested keys — two-phase CAttrSet.
-      resolvedBindings <- resolveBindingKeys env bindings
-      let allKeys = concatMap resolvedBindingTopKeys resolvedBindings
-          cset = buildCAttrSetKeys allKeys
-          (withArr, withCount) = envWithScopesRaw env
-          letEnv = newCEnv nullPtr 0 (Just (AttrSet cset)) (Just env) withArr withCount
-          thunkMap = buildThunkMap letEnv resolvedBindings
-          filled = fillCAttrSetValues cset thunkMap
-       in filled `seq` eval letEnv body
-
-evalIf :: (MonadEval m) => Env -> Expr -> Expr -> Expr -> m NixValue
-evalIf env cond thenExpr elseExpr = do
-  condVal <- eval env cond
-  case condVal of
-    VBool True -> eval env thenExpr
-    VBool False -> eval env elseExpr
-    _ -> throwEvalError ("'if' condition must be a Boolean, got " <> typeName condVal)
-
-evalWith :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
-evalWith env scope body = do
-  scopeVal <- eval env scope
-  case scopeVal of
-    VAttrs attrs -> eval (pushWithScope attrs env) body
-    _ -> throwEvalError ("'with' requires a set, got " <> typeName scopeVal)
-
-evalAssert :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
-evalAssert env cond body = do
-  condVal <- eval env cond
-  case condVal of
-    VBool True -> eval env body
-    VBool False -> throwEvalError "assertion failed"
-    _ -> throwEvalError ("assertion condition must be a Boolean, got " <> typeName condVal)
-
--- ---------------------------------------------------------------------------
--- Short-circuit Boolean operators
--- ---------------------------------------------------------------------------
-
-evalShortCircuitAnd :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
-evalShortCircuitAnd env left right = do
-  leftVal <- eval env left
-  case leftVal of
-    VBool False -> pure (VBool False)
-    VBool True -> do
-      rightVal <- eval env right
-      case rightVal of
-        VBool _ -> pure rightVal
-        _ -> throwEvalError ("second operand of && must be a Boolean, got " <> typeName rightVal)
-    _ -> throwEvalError ("first operand of && must be a Boolean, got " <> typeName leftVal)
-
-evalShortCircuitOr :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
-evalShortCircuitOr env left right = do
-  leftVal <- eval env left
-  case leftVal of
-    VBool True -> pure (VBool True)
-    VBool False -> do
-      rightVal <- eval env right
-      case rightVal of
-        VBool _ -> pure rightVal
-        _ -> throwEvalError ("second operand of || must be a Boolean, got " <> typeName rightVal)
-    _ -> throwEvalError ("first operand of || must be a Boolean, got " <> typeName leftVal)
-
-evalShortCircuitImpl :: (MonadEval m) => Env -> Expr -> Expr -> m NixValue
-evalShortCircuitImpl env left right = do
-  leftVal <- eval env left
-  case leftVal of
-    VBool False -> pure (VBool True)
-    VBool True -> do
-      rightVal <- eval env right
-      case rightVal of
-        VBool _ -> pure rightVal
-        _ -> throwEvalError ("second operand of -> must be a Boolean, got " <> typeName rightVal)
-    _ -> throwEvalError ("first operand of -> must be a Boolean, got " <> typeName leftVal)
+-- | Merge two thunks for nested attribute update.
+-- If both are computed attrsets, recursively merge with attrSetUnionWith.
+-- Otherwise the new value wins.
+mergeThunks :: Thunk -> Thunk -> Thunk
+mergeThunks a b =
+  case (readThunkValue a, readThunkValue b) of
+    (Just (VAttrs aa), Just (VAttrs bb)) ->
+      evaluated (VAttrs (attrSetUnionWith mergeThunks aa bb))
+    _ -> b
 
 -- ---------------------------------------------------------------------------
 -- Builtin registry (single-definition-site for all builtins)
@@ -1023,9 +1053,9 @@ precompileArgs _ args = args
 -- | Apply a function value (lambda or builtin) to one argument.
 -- Used by higher-order builtins to invoke user-supplied functions.
 applyValue :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-applyValue (VLambda closureEnv formals body) arg = do
+applyValue (VLambda closureEnv formals bodyBcIdx) arg = do
   extEnv <- matchFormals closureEnv formals (evaluated arg)
-  eval extEnv body
+  evalBytecode extEnv bodyBcIdx
 applyValue (VBuiltin name accArgs) arg =
   applyBuiltin name accArgs arg
 applyValue other _ =
@@ -1990,17 +2020,17 @@ builtinFunctionArgs (VAttrs attrs)
 builtinFunctionArgs other =
   throwEvalError ("builtins.functionArgs: expected a function, got " <> typeName other)
 
-formalsToAttrs :: Formals -> NixValue
-formalsToAttrs (FormalName _) = VAttrs (attrSetFromMap Map.empty)
-formalsToAttrs (FormalSet formals _) = formalsListToAttrs formals
-formalsToAttrs (FormalNamedSet _ formals _) = formalsListToAttrs formals
+formalsToAttrs :: EvalFormals -> NixValue
+formalsToAttrs (EFName _) = VAttrs (attrSetFromMap Map.empty)
+formalsToAttrs (EFSet formals _) = formalsListToAttrs formals
+formalsToAttrs (EFNamedSet _ formals _) = formalsListToAttrs formals
 
-formalsListToAttrs :: [Formal] -> NixValue
+formalsListToAttrs :: [EvalFormal] -> NixValue
 formalsListToAttrs formals =
   VAttrs $
     attrSetFromMap $
       Map.fromList
-        [(fName f, evaluated (VBool (isJust (fDefault f)))) | f <- formals]
+        [(efName f, evaluated (VBool (isJust (efDefault f)))) | f <- formals]
 
 -- | @builtins.setFunctionArgs f args@ — wraps @f@ in a callable attrset
 -- with @__functor@ (so it remains callable) and @__functionArgs@ metadata.
@@ -2014,8 +2044,9 @@ builtinSetFunctionArgs func (VAttrs argSpec) =
   -- body is EResolvedVar 1 0: level 1 (past _self's slot), index 0.
   let (sp, sc) = buildCSlots [evaluated func]
       closureEnv = newMinimalEnv sp sc
+      bodyBcIdx = unsafePerformIO (compileExpr (EResolvedVar 1 0))
       -- __functor = self: __fn  (ignores self, returns the original function)
-      functorLambda = VLambda closureEnv (FormalName "_self") (EResolvedVar 1 0)
+      functorLambda = VLambda closureEnv (EFName "_self") bodyBcIdx
    in pure $
         VAttrs $
           attrSetFromMap $

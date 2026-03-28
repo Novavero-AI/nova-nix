@@ -3,17 +3,18 @@
  *
  * Iterates all thunks via nn_thunk_count/nn_thunk_get and identifies
  * payloads that are Haskell StablePtrs (as opposed to inline scalar
- * values).  Three cases have StablePtr payloads:
+ * values or C pointers).
  *
- *   1. PENDING thunks: payload = StablePtr (Expr, Env)
- *   2. BLACKHOLE thunks: payload = original PENDING StablePtr
- *      (mark_blackhole only changes state, not payload)
- *   3. COMPUTED thunks with val_tag == NN_VALUE_PTR:
- *      payload = StablePtr NixValue
+ * After M6 bytecode integration, PENDING thunks store (bc_idx,
+ * StablePtr Env) — the bc_idx replaces the Expr, but the Env stays
+ * as a StablePtr for knot-tying laziness.
  *
- * All other COMPUTED thunks (INT, FLOAT, BOOL, NULL, STR, PATH,
- * LIST, ATTRS, CTXSTR) have inline scalar or C-pointer payloads —
- * not StablePtrs, must NOT be freed.
+ * StablePtr sources:
+ *   1. PENDING/BLACKHOLE: payload = StablePtr Env (all pending thunks)
+ *   2. COMPUTED with val_tag == NN_VALUE_PTR: StablePtr NixValue
+ *
+ * All other COMPUTED payloads (inline scalars, C pointers) are NOT
+ * StablePtrs and must NOT be freed.
  */
 
 #include "nn_arena.h"

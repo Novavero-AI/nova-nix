@@ -2,10 +2,9 @@
  * nn_thunk.h — Arena-allocated thunk memoization cells for nova-nix.
  *
  * Thunks are the core memoization mechanism in Nix evaluation.  Each
- * thunk starts as PENDING (holding a reference to an unevaluated
- * expression + environment) and transitions to COMPUTED (holding the
- * result value) on first force.  A BLACKHOLE state detects infinite
- * recursion during evaluation.
+ * thunk starts as PENDING (holding a bytecode index + C environment
+ * pointer) and transitions to COMPUTED (holding the result value) on
+ * first force.  A BLACKHOLE state detects infinite recursion.
  *
  * Replaces Haskell's IORef ThunkCell (~56 bytes on GHC heap, all GC-
  * traced) with a 16-byte C struct in an arena (invisible to GHC GC).
@@ -15,10 +14,9 @@
  * the entire arena is destroyed at evaluation end.  Pointers into the
  * arena remain valid until nn_thunk_destroy().
  *
- * Payloads are opaque void* — Haskell passes StablePtr values.  The C
- * side never dereferences them.  Haskell is responsible for freeing
- * StablePtrs before arena destruction (via nn_thunk_count/nn_thunk_get
- * iteration).
+ * PENDING payloads are nn_env_t* pointers (C-native, no StablePtr).
+ * COMPUTED payloads are either inline scalars, C-native pointers, or
+ * StablePtrs (for complex Haskell values like VLambda/VBuiltin).
  *
  * Lifecycle: nn_thunk_init() before evaluation, nn_thunk_destroy()
  * after.  Not thread-safe — single-threaded evaluation only.
@@ -51,20 +49,23 @@
 /* --- Types --- */
 
 /* A thunk: mutable cell holding either a pending expression or a
- * computed value.  16 bytes: state(1) + val_tag(1) + padding(6) +
- * payload(8).  val_tag is valid only when state == COMPUTED.
+ * computed value.  16 bytes: state(1) + val_tag(1) + _pad(2) +
+ * bc_idx(4) + payload(8).  val_tag is valid only when state == COMPUTED.
  *
- * PENDING:   payload = StablePtr (Expr, Env)
+ * PENDING:   bc_idx = bytecode instruction index
+ *            payload = nn_env_t* (C environment pointer)
  * COMPUTED:  val_tag selects interpretation of payload:
  *            INT/BOOL: (intptr_t) cast of scalar
  *            FLOAT: memcpy'd double
  *            NULL: ignored
  *            PTR: StablePtr to Haskell NixValue (complex types)
- * BLACKHOLE: payload = stale (do not dereference) */
+ * BLACKHOLE: bc_idx/payload = stale from PENDING (do not dereference) */
 typedef struct nn_thunk {
-    uint8_t  state;
-    uint8_t  val_tag;
-    void    *payload;
+    uint8_t   state;
+    uint8_t   val_tag;
+    uint16_t  _pad;
+    uint32_t  bc_idx;    /* PENDING: bytecode index; COMPUTED: 0 */
+    void     *payload;
 } nn_thunk_t;
 
 /* --- Lifecycle --- */
@@ -82,10 +83,26 @@ void nn_thunk_destroy(void);
 
 /* --- Allocation --- */
 
-/* Allocate a new PENDING thunk from the arena.  O(1) amortized.
- * pending_data is an opaque pointer (StablePtr to Haskell (Expr, Env)).
+/* Allocate a new PENDING thunk from the arena (legacy StablePtr path).
+ * pending_data is an opaque pointer (StablePtr to Haskell value).
+ * Sets bc_idx = 0 to distinguish from bytecode thunks.
  * Returns a pointer into arena memory, valid until nn_thunk_destroy(). */
 nn_thunk_t *nn_thunk_new(void *pending_data);
+
+/* Allocate a new PENDING thunk with a bytecode index + C env pointer.
+ * bc_idx is the root instruction index in the bytecode store.
+ * env_ptr is a nn_env_t* (C environment, not a StablePtr).
+ * No Haskell heap references — zero GC pressure. */
+nn_thunk_t *nn_thunk_new_bc(uint32_t bc_idx, void *env_ptr);
+
+/* Read the bytecode index from a PENDING thunk. */
+uint32_t nn_thunk_get_bc_idx(const nn_thunk_t *thunk);
+
+/* Set the payload of a thunk.  Used for deferred env fixup in
+ * knot-tying (rec attrs, let, formal defaults): allocate the thunk
+ * with NULL payload first, then fill the env pointer once the
+ * knot-tied env is constructed. */
+void nn_thunk_set_payload(nn_thunk_t *thunk, void *payload);
 
 /* Allocate a new pre-COMPUTED thunk from the arena (StablePtr payload).
  * value is an opaque pointer (StablePtr to Haskell NixValue).

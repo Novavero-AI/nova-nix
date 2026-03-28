@@ -56,6 +56,7 @@ library
     Nix.Eval.CCtxStr
     Nix.Eval.CBytecode
     Nix.Eval.Compile
+    Nix.Eval.EvalFormals
     Nix.Eval.Arena
     Nix.Store
     Nix.Store.Path
