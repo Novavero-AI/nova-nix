@@ -185,6 +185,50 @@ nn_thunk_new_computed_null(void)
     return t;
 }
 
+nn_thunk_t *
+nn_thunk_new_computed_str(uint32_t symbol)
+{
+    nn_thunk_t *t = arena_alloc(g_arena);
+    if (!t) return NULL;
+    t->state = NN_THUNK_COMPUTED;
+    t->val_tag = NN_VALUE_STR;
+    t->payload = (void *)(intptr_t)symbol;
+    return t;
+}
+
+nn_thunk_t *
+nn_thunk_new_computed_path(uint32_t symbol)
+{
+    nn_thunk_t *t = arena_alloc(g_arena);
+    if (!t) return NULL;
+    t->state = NN_THUNK_COMPUTED;
+    t->val_tag = NN_VALUE_PATH;
+    t->payload = (void *)(intptr_t)symbol;
+    return t;
+}
+
+nn_thunk_t *
+nn_thunk_new_computed_list(void *list)
+{
+    nn_thunk_t *t = arena_alloc(g_arena);
+    if (!t) return NULL;
+    t->state = NN_THUNK_COMPUTED;
+    t->val_tag = NN_VALUE_LIST;
+    t->payload = list;
+    return t;
+}
+
+nn_thunk_t *
+nn_thunk_new_computed_attrs(void *attrset)
+{
+    nn_thunk_t *t = arena_alloc(g_arena);
+    if (!t) return NULL;
+    t->state = NN_THUNK_COMPUTED;
+    t->val_tag = NN_VALUE_ATTRS;
+    t->payload = attrset;
+    return t;
+}
+
 /* --- State queries --- */
 
 uint8_t
@@ -223,6 +267,30 @@ uint8_t
 nn_thunk_get_bool(const nn_thunk_t *thunk)
 {
     return (uint8_t)(intptr_t)thunk->payload;
+}
+
+uint32_t
+nn_thunk_get_str(const nn_thunk_t *thunk)
+{
+    return (uint32_t)(intptr_t)thunk->payload;
+}
+
+uint32_t
+nn_thunk_get_path(const nn_thunk_t *thunk)
+{
+    return (uint32_t)(intptr_t)thunk->payload;
+}
+
+void *
+nn_thunk_get_list(const nn_thunk_t *thunk)
+{
+    return thunk->payload;
+}
+
+void *
+nn_thunk_get_attrs(const nn_thunk_t *thunk)
+{
+    return thunk->payload;
 }
 
 /* --- State transitions --- */
@@ -287,6 +355,50 @@ nn_thunk_set_computed_null(nn_thunk_t *thunk)
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_NULL;
     thunk->payload = NULL;
+    return old;
+}
+
+void *
+nn_thunk_set_computed_str(nn_thunk_t *thunk, uint32_t symbol)
+{
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
+    void *old = thunk->payload;
+    thunk->state = NN_THUNK_COMPUTED;
+    thunk->val_tag = NN_VALUE_STR;
+    thunk->payload = (void *)(intptr_t)symbol;
+    return old;
+}
+
+void *
+nn_thunk_set_computed_path(nn_thunk_t *thunk, uint32_t symbol)
+{
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
+    void *old = thunk->payload;
+    thunk->state = NN_THUNK_COMPUTED;
+    thunk->val_tag = NN_VALUE_PATH;
+    thunk->payload = (void *)(intptr_t)symbol;
+    return old;
+}
+
+void *
+nn_thunk_set_computed_list(nn_thunk_t *thunk, void *list)
+{
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
+    void *old = thunk->payload;
+    thunk->state = NN_THUNK_COMPUTED;
+    thunk->val_tag = NN_VALUE_LIST;
+    thunk->payload = list;
+    return old;
+}
+
+void *
+nn_thunk_set_computed_attrs(nn_thunk_t *thunk, void *attrset)
+{
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
+    void *old = thunk->payload;
+    thunk->state = NN_THUNK_COMPUTED;
+    thunk->val_tag = NN_VALUE_ATTRS;
+    thunk->payload = attrset;
     return old;
 }
 

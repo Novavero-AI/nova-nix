@@ -74,14 +74,15 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import Data.Text (Text)
 import Data.Word (Word8)
-import Foreign.Ptr (Ptr, nullPtr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, newStablePtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CEnv (cenvAllocSlots)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkNew, cthunkNewComputed, cthunkNewComputedBool, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedNull, cthunkPayload, cthunkState, cthunkValueTag)
-import Nix.Eval.Symbol (symbolIntern, symbolText)
+import Nix.Eval.CList (clistToThunkList, thunkListToCList)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNew, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), Formals, NixAtom (..))
 import Nix.Store.Path (StorePath)
 import System.IO.Unsafe (unsafePerformIO)
@@ -181,6 +182,13 @@ readThunkValue (Thunk ptr) =
           1 {- FLOAT -} -> VFloat <$> cthunkGetFloat ptr
           2 {- BOOL -} -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
           3 {- NULL -} -> pure VNull
+          4 {- STR -} -> (\sym -> VStr (symbolText (Symbol sym)) emptyContext) <$> cthunkGetStr ptr
+          5 {- PATH -} -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
+          6 {- LIST -} -> do
+            listPtr <- cthunkGetList ptr
+            thunks <- clistToThunkList (castPtr listPtr)
+            pure (VList (map Thunk thunks))
+          7 {- ATTRS -} -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
           _ {- PTR -} -> do
             payload <- cthunkPayload ptr
             deRefStablePtr (castPtrToStablePtr payload)
@@ -590,12 +598,19 @@ newSyntheticThunkPtr slotsKey expr env =
 
 -- | Wrap an already-computed value as a thunk.
 -- Scalars (int/float/bool/null) use inline C thunks (no StablePtr).
--- Complex values use StablePtr-backed C thunks.
+-- Attrs, paths, and context-free strings use C-native tags (no StablePtr).
+-- Other complex values fall back to StablePtr-backed C thunks.
 evaluated :: NixValue -> Thunk
 evaluated (VInt n) = Thunk (newComputedIntPtr (fromIntegral n))
 evaluated (VFloat d) = Thunk (newComputedFloatPtr d)
 evaluated (VBool b) = Thunk (newComputedBoolPtr (if b then 1 else 0))
 evaluated VNull = Thunk newComputedNullPtr
+evaluated (VAttrs (AttrSet cset)) = Thunk (newComputedAttrsPtr cset)
+evaluated (VPath p) = Thunk (newComputedPathPtr p)
+evaluated (VStr t ctx)
+  | ctx == emptyContext = Thunk (newComputedStrPtr t)
+  | otherwise = Thunk (newComputedThunkPtr (VStr t ctx))
+evaluated (VList thunks) = Thunk (newComputedListPtr thunks)
 evaluated val = Thunk (newComputedThunkPtr val)
 
 -- | Check if two thunks share the same memoization cell (C pointer
@@ -636,6 +651,41 @@ newComputedBoolPtr b = unsafePerformIO (cthunkNewComputedBool b)
 {-# NOINLINE newComputedNullPtr #-}
 newComputedNullPtr :: CThunkPtr
 newComputedNullPtr = unsafePerformIO cthunkNewComputedNull
+
+-- | Wrap a context-free string in a pre-computed C thunk (interned symbol, no StablePtr).
+{-# NOINLINE newComputedStrPtr #-}
+newComputedStrPtr :: Text -> CThunkPtr
+newComputedStrPtr t =
+  unsafePerformIO $ t `seq` do
+    Symbol sym <- symbolIntern t
+    cthunkNewComputedStr sym
+
+-- | Wrap a path in a pre-computed C thunk (interned symbol, no StablePtr).
+{-# NOINLINE newComputedPathPtr #-}
+newComputedPathPtr :: Text -> CThunkPtr
+newComputedPathPtr p =
+  unsafePerformIO $ p `seq` do
+    Symbol sym <- symbolIntern p
+    cthunkNewComputedPath sym
+
+-- | Wrap a list of thunks in a pre-computed C thunk (C array, no StablePtr).
+-- Converts [Thunk] to a C nn_list_t, stores pointer as payload.
+{-# NOINLINE newComputedListPtr #-}
+newComputedListPtr :: [Thunk] -> CThunkPtr
+newComputedListPtr thunks =
+  unsafePerformIO $
+    thunks `seq` do
+      let ptrs = map thunkToCPtr thunks
+      clist <- thunkListToCList ptrs
+      cthunkNewComputedList (castPtr clist)
+
+-- | Wrap a CAttrSet in a pre-computed C thunk (pointer, no StablePtr).
+{-# NOINLINE newComputedAttrsPtr #-}
+newComputedAttrsPtr :: CAttrSet -> CThunkPtr
+newComputedAttrsPtr cset =
+  unsafePerformIO $
+    cset `seq`
+      cthunkNewComputedAttrs (castPtr cset)
 
 -- | Build a C-allocated slot array from a list of 'Thunk' values.
 -- Each thunk is converted to 'CThunkPtr' via 'thunkToCPtr'.
@@ -796,6 +846,19 @@ instance MonadEval PureEval where
               1 {- FLOAT -} -> pure (VFloat (unsafePerformIO (cthunkGetFloat ptr)))
               2 {- BOOL -} -> pure (VBool (unsafePerformIO (cthunkGetBool ptr) /= 0))
               3 {- NULL -} -> pure VNull
+              4 {- STR -} ->
+                let sym = unsafePerformIO (cthunkGetStr ptr)
+                 in pure (VStr (symbolText (Symbol sym)) emptyContext)
+              5 {- PATH -} ->
+                let sym = unsafePerformIO (cthunkGetPath ptr)
+                 in pure (VPath (symbolText (Symbol sym)))
+              6 {- LIST -} ->
+                let listPtr = unsafePerformIO (cthunkGetList ptr)
+                    thunks = unsafePerformIO (clistToThunkList (castPtr listPtr))
+                 in pure (VList (map Thunk thunks))
+              7 {- ATTRS -} ->
+                let p = unsafePerformIO (cthunkGetAttrs ptr)
+                 in pure (VAttrs (AttrSet (castPtr p)))
               _ {- PTR -} ->
                 let payload = unsafePerformIO (cthunkPayload ptr)
                     val = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))

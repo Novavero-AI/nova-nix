@@ -21,6 +21,7 @@ import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (Ptr)
 import Foreign.StablePtr (castPtrToStablePtr, freeStablePtr)
 import Nix.Eval.CEnv (cenvDestroy, cenvInit)
+import Nix.Eval.CList (clistFreeAll)
 import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
 import Nix.Eval.Symbol (symbolDestroy, symbolInit)
 
@@ -57,13 +58,15 @@ arenaInit = do
 --
 -- 1. Collects all StablePtr payloads from thunks (batch C call)
 -- 2. Frees each StablePtr from Haskell
--- 3. Frees all tracked CAttrSets (bulk cleanup)
--- 4. Destroys env slot pages
--- 5. Destroys thunk arena blocks
--- 6. Destroys symbol table + string arena
+-- 3. Frees all tracked CLists (bulk cleanup)
+-- 4. Frees all tracked CAttrSets (bulk cleanup)
+-- 5. Destroys env slot pages
+-- 6. Destroys thunk arena blocks
+-- 7. Destroys symbol table + string arena
 arenaDestroy :: IO ()
 arenaDestroy = do
   cleanupStablePtrs
+  clistFreeAll
   cattrsetFreeAll
   cenvDestroy
   cthunkDestroy

@@ -39,12 +39,14 @@ import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import qualified Data.Text.IO as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Foreign.Ptr (Ptr, nullPtr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkPayload, cthunkSetComputed, cthunkSetComputedBool, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
-import Nix.Eval.Types (MonadEval (..), NixValue (..), Thunk (..), attrSetSize)
+import Nix.Eval.CList (clistToThunkList, thunkListToCList)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
+import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
+import Nix.Eval.Types (AttrSet (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, thunkToCPtr)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix, readFileAutoEncoding)
@@ -303,6 +305,20 @@ storeComputed ptr val = case val of
   VFloat d -> cthunkSetComputedFloat ptr d
   VBool b -> cthunkSetComputedBool ptr (if b then 1 else 0)
   VNull -> cthunkSetComputedNull ptr
+  VAttrs (AttrSet cset) -> cthunkSetComputedAttrs ptr (castPtr cset)
+  VPath p -> do
+    Symbol sym <- symbolIntern p
+    cthunkSetComputedPath ptr sym
+  VStr t ctx
+    | ctx == emptyContext -> do
+        Symbol sym <- symbolIntern t
+        cthunkSetComputedStr ptr sym
+    | otherwise -> do
+        valSp <- newStablePtr val
+        cthunkSetComputed ptr (castStablePtrToPtr valSp)
+  VList thunks -> do
+    clist <- thunkListToCList (map thunkToCPtr thunks)
+    cthunkSetComputedList ptr (castPtr clist)
   _ -> do
     valSp <- newStablePtr val
     cthunkSetComputed ptr (castStablePtrToPtr valSp)
@@ -317,6 +333,15 @@ readComputed ptr = do
     1 {- FLOAT -} -> VFloat <$> cthunkGetFloat ptr
     2 {- BOOL -} -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
     3 {- NULL -} -> pure VNull
+    4 {- STR -} -> do
+      sym <- cthunkGetStr ptr
+      pure (VStr (symbolText (Symbol sym)) emptyContext)
+    5 {- PATH -} -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
+    6 {- LIST -} -> do
+      listPtr <- cthunkGetList ptr
+      thunks <- clistToThunkList (castPtr listPtr)
+      pure (VList (map Thunk thunks))
+    7 {- ATTRS -} -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
     _ {- PTR -} -> do
       payloadPtr <- cthunkPayload ptr
       deRefStablePtr (castPtrToStablePtr payloadPtr)

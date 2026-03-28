@@ -35,6 +35,10 @@ module Nix.Eval.CThunk
     cthunkNewComputedFloat,
     cthunkNewComputedBool,
     cthunkNewComputedNull,
+    cthunkNewComputedStr,
+    cthunkNewComputedPath,
+    cthunkNewComputedList,
+    cthunkNewComputedAttrs,
 
     -- * State queries
     cthunkState,
@@ -43,6 +47,10 @@ module Nix.Eval.CThunk
     cthunkGetInt,
     cthunkGetFloat,
     cthunkGetBool,
+    cthunkGetStr,
+    cthunkGetPath,
+    cthunkGetList,
+    cthunkGetAttrs,
 
     -- * State transitions
     cthunkMarkBlackhole,
@@ -51,6 +59,10 @@ module Nix.Eval.CThunk
     cthunkSetComputedFloat,
     cthunkSetComputedBool,
     cthunkSetComputedNull,
+    cthunkSetComputedStr,
+    cthunkSetComputedPath,
+    cthunkSetComputedList,
+    cthunkSetComputedAttrs,
 
     -- * Arena diagnostics / cleanup
     cthunkCount,
@@ -97,6 +109,18 @@ foreign import ccall unsafe "nn_thunk_new_computed_bool"
 foreign import ccall unsafe "nn_thunk_new_computed_null"
   c_nn_thunk_new_computed_null :: IO CThunkPtr
 
+foreign import ccall unsafe "nn_thunk_new_computed_str"
+  c_nn_thunk_new_computed_str :: Word32 -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_computed_path"
+  c_nn_thunk_new_computed_path :: Word32 -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_computed_list"
+  c_nn_thunk_new_computed_list :: Ptr () -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_computed_attrs"
+  c_nn_thunk_new_computed_attrs :: Ptr () -> IO CThunkPtr
+
 foreign import ccall unsafe "nn_thunk_state"
   c_nn_thunk_state :: CThunkPtr -> IO Word8
 
@@ -115,6 +139,18 @@ foreign import ccall unsafe "nn_thunk_get_float"
 foreign import ccall unsafe "nn_thunk_get_bool"
   c_nn_thunk_get_bool :: CThunkPtr -> IO Word8
 
+foreign import ccall unsafe "nn_thunk_get_str"
+  c_nn_thunk_get_str :: CThunkPtr -> IO Word32
+
+foreign import ccall unsafe "nn_thunk_get_path"
+  c_nn_thunk_get_path :: CThunkPtr -> IO Word32
+
+foreign import ccall unsafe "nn_thunk_get_list"
+  c_nn_thunk_get_list :: CThunkPtr -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_get_attrs"
+  c_nn_thunk_get_attrs :: CThunkPtr -> IO (Ptr ())
+
 foreign import ccall unsafe "nn_thunk_mark_blackhole"
   c_nn_thunk_mark_blackhole :: CThunkPtr -> IO Int
 
@@ -132,6 +168,18 @@ foreign import ccall unsafe "nn_thunk_set_computed_bool"
 
 foreign import ccall unsafe "nn_thunk_set_computed_null"
   c_nn_thunk_set_computed_null :: CThunkPtr -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_str"
+  c_nn_thunk_set_computed_str :: CThunkPtr -> Word32 -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_path"
+  c_nn_thunk_set_computed_path :: CThunkPtr -> Word32 -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_list"
+  c_nn_thunk_set_computed_list :: CThunkPtr -> Ptr () -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_attrs"
+  c_nn_thunk_set_computed_attrs :: CThunkPtr -> Ptr () -> IO (Ptr ())
 
 foreign import ccall unsafe "nn_thunk_count"
   c_nn_thunk_count :: IO Word32
@@ -183,6 +231,23 @@ cthunkNewComputedBool = c_nn_thunk_new_computed_bool
 cthunkNewComputedNull :: IO CThunkPtr
 cthunkNewComputedNull = c_nn_thunk_new_computed_null
 
+-- | Allocate a pre-COMPUTED thunk with an interned string symbol (no StablePtr).
+-- For context-free strings only (tag 4).
+cthunkNewComputedStr :: Word32 -> IO CThunkPtr
+cthunkNewComputedStr = c_nn_thunk_new_computed_str
+
+-- | Allocate a pre-COMPUTED thunk with an interned path symbol (no StablePtr).
+cthunkNewComputedPath :: Word32 -> IO CThunkPtr
+cthunkNewComputedPath = c_nn_thunk_new_computed_path
+
+-- | Allocate a pre-COMPUTED thunk with a CList pointer (no StablePtr).
+cthunkNewComputedList :: Ptr () -> IO CThunkPtr
+cthunkNewComputedList = c_nn_thunk_new_computed_list
+
+-- | Allocate a pre-COMPUTED thunk with a CAttrSet pointer (no StablePtr).
+cthunkNewComputedAttrs :: Ptr () -> IO CThunkPtr
+cthunkNewComputedAttrs = c_nn_thunk_new_computed_attrs
+
 -- ---------------------------------------------------------------------------
 -- State queries
 -- ---------------------------------------------------------------------------
@@ -216,6 +281,22 @@ cthunkGetFloat ptr = do
 cthunkGetBool :: CThunkPtr -> IO Word8
 cthunkGetBool = c_nn_thunk_get_bool
 
+-- | Read an interned string symbol from a COMPUTED thunk (val_tag == 4).
+cthunkGetStr :: CThunkPtr -> IO Word32
+cthunkGetStr = c_nn_thunk_get_str
+
+-- | Read an interned path symbol from a COMPUTED thunk (val_tag == 5).
+cthunkGetPath :: CThunkPtr -> IO Word32
+cthunkGetPath = c_nn_thunk_get_path
+
+-- | Read a CList pointer from a COMPUTED thunk (val_tag == 6).
+cthunkGetList :: CThunkPtr -> IO (Ptr ())
+cthunkGetList = c_nn_thunk_get_list
+
+-- | Read a CAttrSet pointer from a COMPUTED thunk (val_tag == 7).
+cthunkGetAttrs :: CThunkPtr -> IO (Ptr ())
+cthunkGetAttrs = c_nn_thunk_get_attrs
+
 -- ---------------------------------------------------------------------------
 -- State transitions
 -- ---------------------------------------------------------------------------
@@ -248,6 +329,22 @@ cthunkSetComputedBool = c_nn_thunk_set_computed_bool
 -- | Set a BLACKHOLE thunk to COMPUTED with null value (no StablePtr).
 cthunkSetComputedNull :: CThunkPtr -> IO (Ptr ())
 cthunkSetComputedNull = c_nn_thunk_set_computed_null
+
+-- | Set a non-COMPUTED thunk to COMPUTED with an interned string symbol.
+cthunkSetComputedStr :: CThunkPtr -> Word32 -> IO (Ptr ())
+cthunkSetComputedStr = c_nn_thunk_set_computed_str
+
+-- | Set a non-COMPUTED thunk to COMPUTED with an interned path symbol.
+cthunkSetComputedPath :: CThunkPtr -> Word32 -> IO (Ptr ())
+cthunkSetComputedPath = c_nn_thunk_set_computed_path
+
+-- | Set a non-COMPUTED thunk to COMPUTED with a CList pointer.
+cthunkSetComputedList :: CThunkPtr -> Ptr () -> IO (Ptr ())
+cthunkSetComputedList = c_nn_thunk_set_computed_list
+
+-- | Set a non-COMPUTED thunk to COMPUTED with a CAttrSet pointer.
+cthunkSetComputedAttrs :: CThunkPtr -> Ptr () -> IO (Ptr ())
+cthunkSetComputedAttrs = c_nn_thunk_set_computed_attrs
 
 -- ---------------------------------------------------------------------------
 -- Arena diagnostics / cleanup
