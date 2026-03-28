@@ -1,12 +1,9 @@
 /*
- * nn_env.c — Page-based bump allocator for environment slot arrays.
+ * nn_env.c — C-native evaluation environments.
  *
- * Pages are 256 KB each, allocated on demand as a linked list.
- * Each allocation bumps a pointer within the current page.  When
- * the current page is full, a new page is allocated.
- *
- * For oversized requests (> page capacity), a dedicated page is
- * allocated with exactly the needed capacity.
+ * Arena-allocated nn_env_t structs and backing arrays.  Pages are
+ * 256 KB each, allocated on demand as a linked list.  Each allocation
+ * bumps a pointer within the current page.
  *
  * All memory is freed in bulk via nn_env_destroy().
  */
@@ -19,7 +16,6 @@
 /* --- Constants --- */
 
 #define NN_ENV_PAGE_SIZE (256u * 1024u)  /* 256 KB per page */
-#define NN_ENV_PTR_SIZE  sizeof(void*)
 #define NN_ENV_ALIGN     8u              /* 8-byte alignment */
 
 /* --- Internal types --- */
@@ -37,6 +33,9 @@ struct nn_env_page {
 static struct nn_env_page *g_first_page = NULL;
 static struct nn_env_page *g_current_page = NULL;
 static uint64_t g_total_bytes = 0;
+
+/* Global empty env — initialized in nn_env_init, valid until destroy. */
+static nn_env_t g_empty_env;
 
 /* --- Internal helpers --- */
 
@@ -58,12 +57,37 @@ align_up(uint32_t n, uint32_t alignment)
     return (n + alignment - 1) & ~(alignment - 1);
 }
 
+/* Allocate raw bytes from the page-based bump allocator.
+ * Returns aligned, zero-initialized memory. */
+static void *
+nn_env_alloc_raw(uint32_t bytes)
+{
+    bytes = align_up(bytes, NN_ENV_ALIGN);
+
+    if (!g_current_page || g_current_page->used + bytes > g_current_page->capacity) {
+        uint32_t page_cap = bytes > NN_ENV_PAGE_SIZE ? bytes : NN_ENV_PAGE_SIZE;
+        struct nn_env_page *page = alloc_page(page_cap);
+        if (!page) return NULL;
+        if (g_current_page) {
+            g_current_page->next = page;
+        } else {
+            g_first_page = page;
+        }
+        g_current_page = page;
+    }
+
+    void *result = g_current_page->data + g_current_page->used;
+    memset(result, 0, bytes);
+    g_current_page->used += bytes;
+    g_total_bytes += bytes;
+    return result;
+}
+
 /* --- Lifecycle --- */
 
 void
 nn_env_init(void)
 {
-    /* Destroy existing allocator if re-initializing */
     if (g_first_page) {
         nn_env_destroy();
     }
@@ -71,6 +95,9 @@ nn_env_init(void)
     g_first_page = alloc_page(NN_ENV_PAGE_SIZE);
     g_current_page = g_first_page;
     g_total_bytes = 0;
+
+    /* Initialize global empty env */
+    memset(&g_empty_env, 0, sizeof(g_empty_env));
 }
 
 void
@@ -87,33 +114,160 @@ nn_env_destroy(void)
     g_total_bytes = 0;
 }
 
-/* --- Allocation --- */
+/* --- Slot allocation --- */
 
 void **
 nn_env_alloc_slots(uint32_t count)
 {
     if (count == 0) return NULL;
+    uint32_t bytes = count * (uint32_t)sizeof(void *);
+    return (void **)nn_env_alloc_raw(bytes);
+}
 
-    uint32_t bytes = align_up(count * (uint32_t)NN_ENV_PTR_SIZE, NN_ENV_ALIGN);
+/* --- Env constructors --- */
 
-    /* Current page full — allocate a new one */
-    if (!g_current_page || g_current_page->used + bytes > g_current_page->capacity) {
-        uint32_t page_cap = bytes > NN_ENV_PAGE_SIZE ? bytes : NN_ENV_PAGE_SIZE;
-        struct nn_env_page *page = alloc_page(page_cap);
-        if (!page) return NULL;
-        if (g_current_page) {
-            g_current_page->next = page;
-        } else {
-            g_first_page = page;
-        }
-        g_current_page = page;
+nn_env_t *
+nn_env_empty(void)
+{
+    return &g_empty_env;
+}
+
+nn_env_t *
+nn_env_new(void **slots, uint32_t slot_count,
+           void *lazy_scope, nn_env_t *parent,
+           void **with_scopes, uint16_t with_count)
+{
+    nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
+    if (!env) return NULL;
+    env->slots = slots;
+    env->slot_count = slot_count;
+    env->lazy_scope = lazy_scope;
+    env->parent = parent;
+    env->with_scopes = with_scopes;
+    env->with_count = with_count;
+    return env;
+}
+
+nn_env_t *
+nn_env_from_slots(void **slots, uint32_t slot_count,
+                  nn_env_t *parent)
+{
+    nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
+    if (!env) return NULL;
+    env->slots = slots;
+    env->slot_count = slot_count;
+    env->lazy_scope = NULL;
+    env->parent = parent;
+    env->with_scopes = parent ? parent->with_scopes : NULL;
+    env->with_count = parent ? parent->with_count : 0;
+    return env;
+}
+
+nn_env_t *
+nn_env_push_with(nn_env_t *base, void *scope)
+{
+    uint16_t new_count = base->with_count + 1;
+    void **new_withs = (void **)nn_env_alloc_raw(
+        (uint32_t)new_count * (uint32_t)sizeof(void *));
+    if (!new_withs) return NULL;
+
+    /* New scope at index 0 (innermost) */
+    new_withs[0] = scope;
+    /* Copy existing with-scopes after it */
+    if (base->with_count > 0 && base->with_scopes) {
+        memcpy(new_withs + 1, base->with_scopes,
+               (size_t)base->with_count * sizeof(void *));
     }
 
-    void **result = (void **)(g_current_page->data + g_current_page->used);
-    memset(result, 0, bytes);  /* zero-initialize (NULL pointers) */
-    g_current_page->used += bytes;
-    g_total_bytes += bytes;
-    return result;
+    nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
+    if (!env) return NULL;
+    env->slots = base->slots;
+    env->slot_count = base->slot_count;
+    env->lazy_scope = base->lazy_scope;
+    env->parent = base->parent;
+    env->with_scopes = new_withs;
+    env->with_count = new_count;
+    return env;
+}
+
+nn_env_t *
+nn_env_new_minimal(void **slots, uint32_t slot_count)
+{
+    nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
+    if (!env) return NULL;
+    env->slots = slots;
+    env->slot_count = slot_count;
+    /* lazy_scope, parent, with_scopes, with_count already zero from alloc_raw */
+    return env;
+}
+
+/* --- Accessors --- */
+
+void **
+nn_env_slots(const nn_env_t *env)
+{
+    return env->slots;
+}
+
+uint32_t
+nn_env_slot_count(const nn_env_t *env)
+{
+    return env->slot_count;
+}
+
+void *
+nn_env_lazy_scope(const nn_env_t *env)
+{
+    return env->lazy_scope;
+}
+
+nn_env_t *
+nn_env_parent(const nn_env_t *env)
+{
+    return env->parent;
+}
+
+void **
+nn_env_with_scopes(const nn_env_t *env)
+{
+    return env->with_scopes;
+}
+
+uint16_t
+nn_env_with_count(const nn_env_t *env)
+{
+    return env->with_count;
+}
+
+/* --- Lookup --- */
+
+void *
+nn_env_lookup_resolved(const nn_env_t *env, int level, int idx)
+{
+    while (level > 0) {
+        env = env->parent;
+        level--;
+    }
+    return env->slots[idx];
+}
+
+void *
+nn_env_root_scope(const nn_env_t *env)
+{
+    while (env->parent) {
+        env = env->parent;
+    }
+    return env->lazy_scope;
+}
+
+/* --- With-scopes array allocation --- */
+
+void **
+nn_env_alloc_with_scopes(uint16_t count)
+{
+    if (count == 0) return NULL;
+    uint32_t bytes = (uint32_t)count * (uint32_t)sizeof(void *);
+    return (void **)nn_env_alloc_raw(bytes);
 }
 
 /* --- Diagnostics --- */

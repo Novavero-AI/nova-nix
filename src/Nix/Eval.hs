@@ -81,7 +81,9 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Foreign.Ptr (nullPtr)
+import Data.Word (Word16)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Storable (peekElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm)
 import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
@@ -118,13 +120,15 @@ import Nix.Eval.Types
     envFromSlots,
     envLookup,
     envLookupResolved,
+    envWithScopesRaw,
     evaluated,
     fillCAttrSetValues,
     fillCSlots,
-    lookupWithScopes,
     mkStr,
     mkSyntheticThunk,
     mkThunk,
+    newCEnv,
+    newMinimalEnv,
     pushWithScope,
     readThunkValue,
     typeName,
@@ -242,9 +246,24 @@ evalVar env name =
 -- with-scope lookup finds builtins without needing a parent chain.
 evalWithVar :: (MonadEval m) => Env -> Text -> m NixValue
 evalWithVar env name =
-  case lookupWithScopes name (envWithScopes env) of
-    Just thunk -> force thunk
-    Nothing -> evalVar env name
+  let (withArr, withCount) = envWithScopesRaw env
+   in case lookupWithScopesRaw name withArr withCount of
+        Just thunk -> force thunk
+        Nothing -> evalVar env name
+
+-- | Walk with-scopes (C array) innermost to outermost.
+-- Uses 'attrSetLookup' (C binary search) per scope.
+lookupWithScopesRaw :: Text -> Ptr (Ptr ()) -> Word16 -> Maybe Thunk
+lookupWithScopesRaw _ _ 0 = Nothing
+lookupWithScopesRaw name withArr count = unsafePerformIO $ go 0
+  where
+    go i
+      | i >= fromIntegral count = pure Nothing
+      | otherwise = do
+          scopePtr <- peekElemOff withArr i
+          case attrSetLookup name (AttrSet (castPtr scopePtr)) of
+            Just val -> pure (Just val)
+            Nothing -> go (i + 1)
 
 -- ---------------------------------------------------------------------------
 -- Attribute sets
@@ -290,40 +309,23 @@ evalRecAttrs env bindings captureInfo
       let slotCount = bindingSlotCount bindings
           slotsPtr = allocCSlots slotCount
           parentEnv = buildCaptureEnv env captureInfo
-          recEnv =
-            Env
-              { envSlots = slotsPtr,
-                envSlotCount = slotCount,
-                envLazyScope = Nothing,
-                envParent = Just parentEnv,
-                envWithScopes = case captureInfo of
-                  NoCaptureInfo -> envWithScopes env
-                  Captures _ -> []
-                  CapturesWithScopes _ -> withScopesForCapture env
-              }
+          (withArr, withCount) = case captureInfo of
+            NoCaptureInfo -> envWithScopesRaw env
+            Captures _ -> (nullPtr, 0)
+            CapturesWithScopes _ -> withScopesForCapture env
+          recEnv = newCEnv slotsPtr slotCount Nothing (Just parentEnv) withArr withCount
           thunkList = buildSlotThunks recEnv env bindings
           filled = fillCSlots slotsPtr thunkList
           attrMap = buildAttrMapFromSlots bindings thunkList
        in filled `seq` pure (VAttrs (attrSetFromMap attrMap))
   | otherwise = do
       -- Fallback: dynamic/nested keys — two-phase CAttrSet.
-      -- 1. Extract keys from resolved bindings
-      -- 2. Build CAttrSet skeleton with keys only (NULL values)
-      -- 3. Create recEnv referencing the CAttrSet
-      -- 4. Build thunks capturing recEnv (PENDING — env is lazy)
-      -- 5. Fill CAttrSet values with thunk pointers
       resolvedBindings <- resolveBindingKeys env bindings
       let allKeys = concatMap resolvedBindingTopKeys resolvedBindings
           cset = buildCAttrSetKeys allKeys
           attrSet = AttrSet cset
-          recEnv =
-            Env
-              { envSlots = nullPtr,
-                envSlotCount = 0,
-                envLazyScope = Just attrSet,
-                envParent = Just env,
-                envWithScopes = envWithScopes env
-              }
+          (withArr, withCount) = envWithScopesRaw env
+          recEnv = newCEnv nullPtr 0 (Just attrSet) (Just env) withArr withCount
           thunkMap = buildThunkMap recEnv resolvedBindings
           filled = fillCAttrSetValues cset thunkMap
        in filled `seq` pure (VAttrs attrSet)
@@ -610,22 +612,11 @@ buildCaptureEnv :: Env -> CaptureInfo -> Env
 buildCaptureEnv env NoCaptureInfo = env
 buildCaptureEnv env (Captures captureList) =
   let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-   in Env
-        { envSlots = slotsPtr,
-          envSlotCount = slotCount,
-          envLazyScope = Nothing,
-          envParent = Nothing,
-          envWithScopes = []
-        }
+   in newMinimalEnv slotsPtr slotCount
 buildCaptureEnv env (CapturesWithScopes captureList) =
   let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-   in Env
-        { envSlots = slotsPtr,
-          envSlotCount = slotCount,
-          envLazyScope = Nothing,
-          envParent = Nothing,
-          envWithScopes = withScopesForCapture env
-        }
+      (withArr, withCount) = withScopesForCapture env
+   in newCEnv slotsPtr slotCount Nothing Nothing withArr withCount
 
 -- ---------------------------------------------------------------------------
 -- Let / if / with / assert
@@ -718,17 +709,11 @@ evalLet env bindings body captureInfo
       let slotCount = bindingSlotCount bindings
           slotsPtr = allocCSlots slotCount
           parentEnv = buildCaptureEnv env captureInfo
-          letEnv =
-            Env
-              { envSlots = slotsPtr,
-                envSlotCount = slotCount,
-                envLazyScope = Nothing,
-                envParent = Just parentEnv,
-                envWithScopes = case captureInfo of
-                  NoCaptureInfo -> envWithScopes env
-                  Captures _ -> []
-                  CapturesWithScopes _ -> withScopesForCapture env
-              }
+          (withArr, withCount) = case captureInfo of
+            NoCaptureInfo -> envWithScopesRaw env
+            Captures _ -> (nullPtr, 0)
+            CapturesWithScopes _ -> withScopesForCapture env
+          letEnv = newCEnv slotsPtr slotCount Nothing (Just parentEnv) withArr withCount
           filled = fillCSlots slotsPtr (buildSlotThunks letEnv env bindings)
        in filled `seq` eval letEnv body
   | otherwise = do
@@ -736,14 +721,8 @@ evalLet env bindings body captureInfo
       resolvedBindings <- resolveBindingKeys env bindings
       let allKeys = concatMap resolvedBindingTopKeys resolvedBindings
           cset = buildCAttrSetKeys allKeys
-          letEnv =
-            Env
-              { envSlots = nullPtr,
-                envSlotCount = 0,
-                envLazyScope = Just (AttrSet cset),
-                envParent = Just env,
-                envWithScopes = envWithScopes env
-              }
+          (withArr, withCount) = envWithScopesRaw env
+          letEnv = newCEnv nullPtr 0 (Just (AttrSet cset)) (Just env) withArr withCount
           thunkMap = buildThunkMap letEnv resolvedBindings
           filled = fillCAttrSetValues cset thunkMap
        in filled `seq` eval letEnv body
@@ -1449,7 +1428,7 @@ builtinGenList func (VInt n)
       -- Slot 0 = function.
       let fnThunk = evaluated func
           (sp, sc) = buildCSlots [fnThunk]
-          env = Env {envSlots = sp, envSlotCount = sc, envLazyScope = Nothing, envParent = Nothing, envWithScopes = []}
+          env = newMinimalEnv sp sc
           mkIndexThunk i = mkThunk env (EApp (EResolvedVar 0 0) (ELit (NixInt i)))
        in pure (VList (map mkIndexThunk [0 .. n - 1]))
 builtinGenList _ other =
@@ -1687,14 +1666,7 @@ builtinSubstring _ _ other =
 deferApply :: NixValue -> Thunk -> Thunk
 deferApply func argThunk =
   let (sp, sc) = buildCSlots [evaluated func, argThunk]
-      env =
-        Env
-          { envSlots = sp,
-            envSlotCount = sc,
-            envLazyScope = Nothing,
-            envParent = Nothing,
-            envWithScopes = []
-          }
+      env = newMinimalEnv sp sc
    in mkSyntheticThunk env deferApplyExpr
 
 -- | Shared expression for 'deferApply'.  Allocated once as a CAF.
@@ -1999,14 +1971,7 @@ builtinMapAttrs func (VAttrs attrs) =
   where
     deferAttr key valThunk =
       let (sp, sc) = buildCSlots [evaluated func, evaluated (mkStr key), valThunk]
-          env =
-            Env
-              { envSlots = sp,
-                envSlotCount = sc,
-                envLazyScope = Nothing,
-                envParent = Nothing,
-                envWithScopes = []
-              }
+          env = newMinimalEnv sp sc
        in mkSyntheticThunk env mapAttrsExpr
 builtinMapAttrs _ other =
   throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
@@ -2048,14 +2013,7 @@ builtinSetFunctionArgs func (VAttrs argSpec) =
   -- Closure env holds the function at slot 0.  The __functor lambda
   -- body is EResolvedVar 1 0: level 1 (past _self's slot), index 0.
   let (sp, sc) = buildCSlots [evaluated func]
-      closureEnv =
-        Env
-          { envSlots = sp,
-            envSlotCount = sc,
-            envLazyScope = Nothing,
-            envParent = Nothing,
-            envWithScopes = []
-          }
+      closureEnv = newMinimalEnv sp sc
       -- __functor = self: __fn  (ignores self, returns the original function)
       functorLambda = VLambda closureEnv (FormalName "_self") (EResolvedVar 1 0)
    in pure $

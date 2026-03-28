@@ -20,7 +20,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, builtinNames, currentSystemStr, evaluated)
-import Nix.Eval.Types (mkStr)
+import Nix.Eval.Types (mkStr, newCEnv)
 import Nix.Store.Path (platformStoreDirText)
 
 -- | The initial environment containing all builtins.
@@ -36,24 +36,18 @@ import Nix.Store.Path (platformStoreDirText)
 -- by 'parseNixPath'.  In tests, pass @[]@.
 builtinEnv :: Integer -> [Thunk] -> Env
 builtinEnv timestamp searchPaths =
-  Env
-    { envSlots = nullPtr,
-      envSlotCount = 0,
-      envLazyScope =
-        Just $
-          attrSetFromMap $
-            Map.fromList $
-              -- Values
-              [ ("true", evaluated (VBool True)),
-                ("false", evaluated (VBool False)),
-                ("null", evaluated VNull),
-                ("builtins", evaluated (builtinsAttrSet timestamp searchPaths))
-              ]
-                -- Top-level builtin functions (available without builtins. prefix)
-                ++ map topLevelBuiltin topLevelBuiltinNames,
-      envParent = Nothing,
-      envWithScopes = []
-    }
+  let scope =
+        attrSetFromMap $
+          Map.fromList $
+            -- Values
+            [ ("true", evaluated (VBool True)),
+              ("false", evaluated (VBool False)),
+              ("null", evaluated VNull),
+              ("builtins", evaluated (builtinsAttrSet timestamp searchPaths))
+            ]
+              -- Top-level builtin functions (available without builtins. prefix)
+              ++ map topLevelBuiltin topLevelBuiltinNames
+   in newCEnv nullPtr 0 (Just scope) Nothing nullPtr 0
 
 -- | Builtins exposed at the top level (without @builtins.@ prefix).
 -- This matches real Nix — nixpkgs uses these unqualified everywhere.
@@ -87,7 +81,7 @@ builtinEnvWithScope :: Integer -> [Thunk] -> [(Text, Thunk)] -> Env
 builtinEnvWithScope timestamp searchPaths scope =
   let base = builtinEnv timestamp searchPaths
       scopeMap = Map.fromList scope
-   in Env {envSlots = nullPtr, envSlotCount = 0, envLazyScope = Just (attrSetFromMap scopeMap), envParent = Just base, envWithScopes = []}
+   in newCEnv nullPtr 0 (Just (attrSetFromMap scopeMap)) (Just base) nullPtr 0
 
 -- | The @builtins@ attribute set, derived from the central registry.
 builtinsAttrSet :: Integer -> [Thunk] -> NixValue

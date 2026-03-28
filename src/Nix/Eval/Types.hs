@@ -40,6 +40,7 @@ module Nix.Eval.Types
 
     -- * Environment
     Env (..),
+    NnEnv,
     emptyEnv,
     envLookup,
     envLookupResolved,
@@ -47,6 +48,9 @@ module Nix.Eval.Types
     pushWithScope,
     lookupWithScopes,
     withScopesForCapture,
+    envWithScopesRaw,
+    newCEnv,
+    newMinimalEnv,
 
     -- * Thunk operations
     mkThunk,
@@ -83,7 +87,7 @@ import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
-import Nix.Eval.CEnv (cenvAllocSlots)
+import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
 import Nix.Eval.CList (clistToThunkList, thunkListToCList)
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNew, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
@@ -376,100 +380,110 @@ fillCAttrSetValues cset thunkMap = unsafePerformIO $
       Just idx -> cattrsetSetValue cset idx ptr
       Nothing -> pure ()
 
--- | Evaluation environment — scope chain with positional slots.
+-- | Evaluation environment — C-backed scope chain.
 --
--- Lambda formals are stored in positional 'envSlots' (de Bruijn-style),
--- eliminating Map.Bin overhead.  Let\/rec bindings and builtins use
--- name-based 'envLazyScope'.  Variable lookup has two paths:
+-- Arena-allocated @nn_env_t@ struct (40 bytes, zero GC overhead).
+-- All env data (slots, lazy scope, parent, with-scopes) lives in C.
+-- Haskell holds only the pointer.  Variable lookup has two paths:
 --
--- * 'envLookupResolved': O(1) array index for 'EResolvedVar'
--- * 'envLookup': name-based walk for 'EVar' (envLazyScope + with-scopes)
-data Env = Env
-  { -- | Positional bindings for lambda formals.
-    -- C-allocated array of nn_thunk_t* pointers (off GHC heap).
-    -- O(1) lookup via 'peekElemOff'.  'nullPtr' for empty envs.
-    envSlots :: {-# UNPACK #-} !(Ptr CThunkPtr),
-    -- | Number of positional slots.
-    envSlotCount :: {-# UNPACK #-} !Int,
-    -- | Name-based scope for variable lookup.
-    -- For rec {} and let, this points to the same CAttrSet that
-    -- backs the resulting attr set.
-    -- For builtins, holds the top-level bindings (true, false, etc.).
-    -- Variable lookup checks this for name-based 'EVar' lookups.
-    envLazyScope :: !(Maybe AttrSet),
-    -- | Parent scope (Nothing at the root).  LAZY for knot-tying
-    -- in rec {} where recEnv's parent is the outer env.
-    envParent :: !(Maybe Env),
-    -- | With-scopes, innermost first.  Inherited from parent on
-    -- env extension; only 'pushWithScope' adds new entries.
-    -- For trimmed envs ('CapturesWithScopes'), the root scope
-    -- (builtins) is appended as the outermost entry so that
-    -- 'EWithVar' can fall back to builtins without a parent chain.
-    envWithScopes :: ![AttrSet]
-  }
+-- * 'envLookupResolved': single C call for 'EResolvedVar'
+-- * 'envLookup': name-based walk for 'EVar' (lazy scope + with-scopes)
+newtype Env = Env (Ptr NnEnv)
 
--- | Shallow comparison: checks slot count and with-scopes only.
--- Ignores parent chain to avoid diverging on deep/recursive envs.
--- Only used in tests on non-recursive structures.
+-- | Pointer equality: two envs are equal iff they are the same C struct.
 instance Eq Env where
-  Env _ n1 _ _ w1 == Env _ n2 _ _ w2 =
-    n1 == n2 && w1 == w2
+  Env p1 == Env p2 = p1 == p2
 
--- | Compact show: just the size and structure, not the full contents.
+-- | Compact show via C accessors.
 instance Show Env where
-  show (Env _ slotCount lazyScope parent withs) =
-    "Env{"
-      ++ show slotCount
-      ++ " slots"
-      ++ maybe "" (const ", lazyScope") lazyScope
-      ++ maybe "" (const ", parent") parent
-      ++ ", "
-      ++ show (length withs)
-      ++ " withs}"
+  show (Env envPtr) =
+    let sc = unsafePerformIO (cenvSlotCount envPtr)
+        ls = unsafePerformIO (cenvLazyScope envPtr)
+        par = unsafePerformIO (cenvParent envPtr)
+        wc = unsafePerformIO (cenvWithCount envPtr)
+     in "Env{"
+          ++ show sc
+          ++ " slots"
+          ++ (if ls /= nullPtr then ", lazyScope" else "")
+          ++ (if par /= nullPtr then ", parent" else "")
+          ++ ", "
+          ++ show wc
+          ++ " withs}"
 
 -- | Empty environment (no variables in scope).
+-- Points to a static global C struct — valid until 'arenaDestroy'.
+{-# NOINLINE emptyEnv #-}
 emptyEnv :: Env
-emptyEnv = Env nullPtr 0 Nothing Nothing []
+emptyEnv = Env (unsafePerformIO cenvEmpty)
 
--- | Look up a resolved variable by level and index.  O(level) parent
--- hops, then O(1) read from the C slot array via 'peekElemOff'.
---
--- Returns 'Thunk' wrapping the nn_thunk_t* pointer from the slot.
--- Uses 'unsafePerformIO' for the C array read — safe because the
--- array is immutable after construction.
---
--- Unreachable branch: the resolution pass guarantees valid indices.
+-- | General C-backed env constructor.
+-- Takes Haskell-level types; converts Maybe to nullPtr internally.
+{-# NOINLINE newCEnv #-}
+newCEnv :: Ptr CThunkPtr -> Int -> Maybe AttrSet -> Maybe Env -> Ptr (Ptr ()) -> Word16 -> Env
+newCEnv slots slotCount lazyScope parent withs withCount =
+  Env
+    ( unsafePerformIO
+        ( cenvNew
+            slots
+            (fromIntegral slotCount)
+            (case lazyScope of Nothing -> nullPtr; Just (AttrSet cset) -> castPtr cset)
+            (case parent of Nothing -> nullPtr; Just (Env p) -> p)
+            withs
+            withCount
+        )
+    )
+
+-- | Minimal env: slots only, no parent, no with-scopes, no lazy scope.
+{-# NOINLINE newMinimalEnv #-}
+newMinimalEnv :: Ptr CThunkPtr -> Int -> Env
+newMinimalEnv slots n =
+  Env (unsafePerformIO (cenvNewMinimal slots (fromIntegral n)))
+
+-- | Look up a resolved variable by level and index.  Single C call:
+-- O(level) parent hops in C, then O(1) array read.
 envLookupResolved :: Int -> Int -> Env -> Thunk
-envLookupResolved 0 idx env =
-  Thunk (unsafePerformIO (peekElemOff (envSlots env) idx))
-envLookupResolved lvl idx env = case envParent env of
-  Just parent -> envLookupResolved (lvl - 1) idx parent
-  Nothing -> error "envLookupResolved: level exceeded (unreachable after resolution)"
+envLookupResolved level idx (Env envPtr) =
+  Thunk (unsafePerformIO (cenvLookupResolved envPtr level idx))
 
 -- | Name-based variable lookup: walk the parent chain checking
--- 'envLazyScope' at each level; fall back to with-scopes (from the
--- starting env) only after exhausting all lexical scopes.
+-- lazy scopes; fall back to with-scopes (from the starting env).
 --
--- 'envSlots' are positional (no names) and are NOT searched here.
--- Used for 'EVar' lookups (let\/rec bindings, builtins, with-scopes).
+-- Positional slots are NOT searched here — used only for
+-- 'EVar' lookups (let\/rec bindings, builtins, with-scopes).
 envLookup :: Text -> Env -> Maybe Thunk
-envLookup name env = lexicalLookup env
+envLookup name (Env envPtr) = lexicalLookup envPtr
   where
-    -- With-scopes from the STARTING env: these are the most recent
-    -- and subsume all ancestor with-scopes (children inherit them).
-    withs = envWithScopes env
-    lexicalLookup (Env _slots _slotCount lazyScope parent _) =
-      case lazyScope of
-        Just scope -> case attrSetLookup name scope of
-          Just val -> Just val
-          Nothing -> goParent parent
-        Nothing -> goParent parent
-    goParent (Just p) = lexicalLookup p
-    goParent Nothing = lookupWithScopes name withs
+    -- With-scopes from the STARTING env (C array)
+    startWiths = unsafePerformIO (cenvWithScopes envPtr)
+    startWithCount = unsafePerformIO (cenvWithCount envPtr)
+    lexicalLookup ep =
+      let ls = unsafePerformIO (cenvLazyScope ep)
+          scopeResult =
+            if ls /= nullPtr
+              then attrSetLookup name (AttrSet (castPtr ls))
+              else Nothing
+       in case scopeResult of
+            Just val -> Just val
+            Nothing ->
+              let par = unsafePerformIO (cenvParent ep)
+               in if par /= nullPtr
+                    then lexicalLookup par
+                    else lookupWithScopesC name startWiths startWithCount
 
--- | Walk with-scopes innermost to outermost.
--- Uses 'attrSetLookup' so that with-scopes only look up the
--- accessed key via C binary search, not the entire set.
+-- | Walk with-scopes (C array) innermost to outermost.
+lookupWithScopesC :: Text -> Ptr (Ptr ()) -> Word16 -> Maybe Thunk
+lookupWithScopesC _ _ 0 = Nothing
+lookupWithScopesC name withArr count = unsafePerformIO $ go 0
+  where
+    go i
+      | i >= fromIntegral count = pure Nothing
+      | otherwise = do
+          scopePtr <- peekElemOff withArr i
+          case attrSetLookup name (AttrSet (castPtr scopePtr)) of
+            Just val -> pure (Just val)
+            Nothing -> go (i + 1)
+
+-- | Walk with-scopes as a Haskell list (backward-compatible signature).
 lookupWithScopes :: Text -> [AttrSet] -> Maybe Thunk
 lookupWithScopes _ [] = Nothing
 lookupWithScopes name (scope : rest) =
@@ -478,42 +492,49 @@ lookupWithScopes name (scope : rest) =
     Nothing -> lookupWithScopes name rest
 
 -- | Create a child env with positional slots (for lambda formals).
--- Inherits with-scopes from the parent.  The C slot array and count
--- are pre-built by the caller via 'buildCSlots'.
+-- Inherits with-scopes from the parent.  Arena-allocated.
+{-# NOINLINE envFromSlots #-}
 envFromSlots :: Ptr CThunkPtr -> Int -> Env -> Env
-envFromSlots slotsPtr slotCount parent =
-  Env
-    { envSlots = slotsPtr,
-      envSlotCount = slotCount,
-      envLazyScope = Nothing,
-      envParent = Just parent,
-      envWithScopes = envWithScopes parent
-    }
+envFromSlots slotsPtr slotCount (Env parentPtr) =
+  Env (unsafePerformIO (cenvFromSlots slotsPtr (fromIntegral slotCount) parentPtr))
 
 -- | Push a with-scope onto the scope chain (innermost position).
--- Accepts 'AttrSet' directly for efficient with-scope lookup.
--- Does not create a new parent level — just modifies the with-scope list.
+-- Allocates a new C env struct with extended with-scopes array.
+{-# NOINLINE pushWithScope #-}
 pushWithScope :: AttrSet -> Env -> Env
-pushWithScope scope env =
-  env {envWithScopes = scope : envWithScopes env}
+pushWithScope (AttrSet cset) (Env envPtr) =
+  Env (unsafePerformIO (cenvPushWith envPtr (castPtr cset)))
 
--- | Find the root env's lazy scope (builtins) by walking the parent chain.
--- Returns the 'envLazyScope' of the bottommost env (the one with
--- @envParent = Nothing@).  This is the builtin env for standard evals.
-envRootScope :: Env -> Maybe AttrSet
-envRootScope env = case envParent env of
-  Nothing -> envLazyScope env
-  Just parent -> envRootScope parent
+-- | Read with-scopes array pointer and count from a C env.
+{-# NOINLINE envWithScopesRaw #-}
+envWithScopesRaw :: Env -> (Ptr (Ptr ()), Word16)
+envWithScopesRaw (Env envPtr) = unsafePerformIO $ do
+  withs <- cenvWithScopes envPtr
+  count <- cenvWithCount envPtr
+  pure (withs, count)
 
--- | Build the with-scopes list for a trimmed env that needs with-scope
--- access ('CapturesWithScopes').  Appends the root scope (builtins)
--- as the outermost entry so 'EWithVar' can fall back to builtins
--- without retaining the parent chain.
-withScopesForCapture :: Env -> [AttrSet]
-withScopesForCapture env =
-  case envRootScope env of
-    Just rootScope -> envWithScopes env ++ [rootScope]
-    Nothing -> envWithScopes env
+-- | Build with-scopes for a trimmed env that needs with-scope access
+-- ('CapturesWithScopes').  Appends the root scope (builtins) as the
+-- outermost entry so 'EWithVar' can fall back to builtins without
+-- retaining the parent chain.  Returns C array + count.
+{-# NOINLINE withScopesForCapture #-}
+withScopesForCapture :: Env -> (Ptr (Ptr ()), Word16)
+withScopesForCapture (Env envPtr) = unsafePerformIO $ do
+  rootPtr <- cenvRootScope envPtr
+  existingWiths <- cenvWithScopes envPtr
+  existingCount <- cenvWithCount envPtr
+  if rootPtr == nullPtr
+    then pure (existingWiths, existingCount)
+    else do
+      let newCount = existingCount + 1
+      arr <- cenvAllocWithScopes newCount
+      -- Copy existing with-scopes
+      forM_ [0 .. fromIntegral existingCount - 1] $ \i -> do
+        val <- peekElemOff existingWiths i
+        pokeElemOff arr i val
+      -- Append root scope at end (outermost)
+      pokeElemOff arr (fromIntegral existingCount) rootPtr
+      pure (arr, newCount)
 
 -- | Create an unevaluated thunk with a fresh C arena-allocated cell.
 --
@@ -529,15 +550,15 @@ mkThunk env thunkExpr =
 
 -- | Like 'mkThunk' but for synthetic thunks that reuse the same 'Expr'
 -- (e.g. @EApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in 'deferApply').
--- Uses the 'Env' slots list for cell uniqueness instead of the expression,
+-- Uses the env pointer for cell uniqueness instead of the expression,
 -- since GHC's full-laziness transform would otherwise float the shared
 -- expr to a CAF and all thunks would get the same cell.
 --
 -- Must only be called with freshly-constructed envs (not knot-tied
--- recursive envs), since it forces the slots list to WHNF.
+-- recursive envs), since it forces the env pointer to WHNF.
 mkSyntheticThunk :: Env -> Expr -> Thunk
-mkSyntheticThunk env thunkExpr =
-  Thunk (newSyntheticThunkPtr (envSlots env) thunkExpr env)
+mkSyntheticThunk env@(Env envPtr) thunkExpr =
+  Thunk (newSyntheticThunkPtr envPtr thunkExpr env)
 
 -- | Like 'mkThunk' but avoids C arena allocation for trivial expressions.
 -- Resolved variables reuse the existing thunk from the env (no wrapper).
@@ -553,25 +574,12 @@ cheapThunk _ (ELit NixNull) = Thunk newComputedNullPtr
 cheapThunk env (ELambda formals body NoCaptureInfo) = evaluated (VLambda env formals body)
 cheapThunk env (ELambda formals body (Captures captureList)) =
   let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-      trimmedEnv =
-        Env
-          { envSlots = slotsPtr,
-            envSlotCount = slotCount,
-            envLazyScope = Nothing,
-            envParent = Nothing,
-            envWithScopes = []
-          }
+      trimmedEnv = newMinimalEnv slotsPtr slotCount
    in evaluated (VLambda trimmedEnv formals body)
 cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
   let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-      trimmedEnv =
-        Env
-          { envSlots = slotsPtr,
-            envSlotCount = slotCount,
-            envLazyScope = Nothing,
-            envParent = Nothing,
-            envWithScopes = withScopesForCapture env
-          }
+      (withArr, withCount) = withScopesForCapture env
+      trimmedEnv = newCEnv slotsPtr slotCount Nothing Nothing withArr withCount
    in evaluated (VLambda trimmedEnv formals body)
 cheapThunk env expr = mkThunk env expr
 
@@ -593,13 +601,13 @@ newThunkPtr expr env =
     sp <- newStablePtr (expr, env)
     cthunkNew (castStablePtrToPtr sp)
 
--- | Like 'newThunkPtr' but keyed on the env's slot array pointer instead
+-- | Like 'newThunkPtr' but keyed on the env's C pointer instead
 -- of the expression.  Used by 'mkSyntheticThunk' where multiple thunks
 -- share the same expression (e.g. 'deferApplyExpr').
 {-# NOINLINE newSyntheticThunkPtr #-}
-newSyntheticThunkPtr :: Ptr CThunkPtr -> Expr -> Env -> CThunkPtr
-newSyntheticThunkPtr slotsKey expr env =
-  unsafePerformIO $ slotsKey `seq` do
+newSyntheticThunkPtr :: Ptr NnEnv -> Expr -> Env -> CThunkPtr
+newSyntheticThunkPtr envKey expr env =
+  unsafePerformIO $ envKey `seq` do
     sp <- newStablePtr (expr, env)
     cthunkNew (castStablePtrToPtr sp)
 

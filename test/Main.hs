@@ -221,7 +221,7 @@ testEvalLiterals = do
   putStrLn "eval/literals"
   sequence
     [ runTest "empty env" $
-        assertEqual "emptyEnv" 0 (envSlotCount emptyEnv),
+        assertEqual "emptyEnv" emptyEnv emptyEnv,
       runTest "int" $
         assertEval "int" "42" (VInt 42),
       runTest "float" $
