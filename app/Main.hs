@@ -26,6 +26,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..))
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
+import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (Store, closeStore, openStore, writeDrv)
 import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, platformStoreDir, storePathToFilePath)
@@ -246,9 +247,10 @@ finalize False = pure
 -- materialized tree.  Unlike 'deepForce' (which returns @()@), this
 -- rebuilds the value with all thunks replaced by computed C thunks.
 deepForceValue :: (MonadEval m) => NixValue -> m NixValue
-deepForceValue (VList thunks) = do
+deepForceValue (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   forced <- mapM (force >=> deepForceValue) thunks
-  pure (VList (map evaluated forced))
+  pure (VList (clistFromThunks (map (thunkToCPtr . evaluated) forced)))
 deepForceValue (VAttrs attrs) = do
   let m = attrSetToMap attrs
   forced <- mapM (force >=> deepForceValue) m
@@ -264,8 +266,8 @@ prettyValue (VBool False) = "false"
 prettyValue VNull = "null"
 prettyValue (VStr s _) = "\"" <> escapeNixString s <> "\""
 prettyValue (VPath p) = p
-prettyValue (VList thunks) =
-  "[ " <> T.intercalate " " (map prettyThunk thunks) <> " ]"
+prettyValue (VList cl) =
+  "[ " <> T.intercalate " " (map (prettyThunk . Thunk) (clistThunks cl)) <> " ]"
 prettyValue (VAttrs attrs) =
   let entries = attrSetToAscList attrs
       rendered = map (\(k, t) -> k <> " = " <> prettyThunk t <> ";") entries

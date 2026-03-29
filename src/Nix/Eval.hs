@@ -121,6 +121,9 @@ import Nix.Eval.Types
     buildCAttrSetKeys,
     buildCSlots,
     cheapThunkBc,
+    clistFromThunks,
+    clistLen,
+    clistThunks,
     emptyContext,
     emptyEnv,
     envFromSlots,
@@ -138,6 +141,7 @@ import Nix.Eval.Types
     newMinimalEnv,
     pushWithScope,
     readThunkValue,
+    thunkToCPtr,
     typeName,
     withScopesForCapture,
   )
@@ -384,7 +388,7 @@ evalBcList env bcIdx0 =
       readChildren n off =
         let childIdx = unsafePerformIO (cbcData off)
          in cheapThunkBc env childIdx : readChildren (n - 1) (off + 1)
-   in pure (VList (readChildren count dataOff))
+   in pure (VList (clistFromThunks (map thunkToCPtr (readChildren count dataOff))))
 
 -- | Evaluate a function application from bytecode.
 evalBcApp :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -1276,17 +1280,21 @@ isFunctionVal _ = False
 -- ---------------------------------------------------------------------------
 
 builtinLength :: (MonadEval m) => NixValue -> m NixValue
-builtinLength (VList xs) = pure (VInt (fromIntegral (length xs)))
+builtinLength (VList cl) = pure (VInt (fromIntegral (clistLen cl)))
 builtinLength other = throwEvalError ("builtins.length: expected a list, got " <> typeName other)
 
 builtinHead :: (MonadEval m) => NixValue -> m NixValue
-builtinHead (VList []) = throwEvalError "builtins.head: empty list"
-builtinHead (VList (x : _)) = force x
+builtinHead (VList cl)
+  | clistLen cl == 0 = throwEvalError "builtins.head: empty list"
+  | otherwise = case clistThunks cl of
+      (p : _) -> force (Thunk p)
+      [] -> throwEvalError "builtins.head: empty list" -- unreachable: clistLen > 0
 builtinHead other = throwEvalError ("builtins.head: expected a list, got " <> typeName other)
 
 builtinTail :: (MonadEval m) => NixValue -> m NixValue
-builtinTail (VList []) = throwEvalError "builtins.tail: empty list"
-builtinTail (VList (_ : xs)) = pure (VList xs)
+builtinTail (VList cl)
+  | clistLen cl == 0 = throwEvalError "builtins.tail: empty list"
+  | otherwise = pure (VList (clistFromThunks (drop 1 (clistThunks cl))))
 builtinTail other = throwEvalError ("builtins.tail: expected a list, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
@@ -1313,18 +1321,20 @@ builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <
 builtinAttrNames :: (MonadEval m) => NixValue -> m NixValue
 builtinAttrNames (VAttrs attrs) =
   -- Zero thunk allocation: attrSetKeys reads symbol names from C arrays.
-  pure (VList (map (evaluated . mkStr) (attrSetKeys attrs)))
+  let thunks = map (evaluated . mkStr) (attrSetKeys attrs)
+   in pure (VList (clistFromThunks (map thunkToCPtr thunks)))
 builtinAttrNames other =
   throwEvalError ("builtins.attrNames: expected a set, got " <> typeName other)
 
 builtinAttrValues :: (MonadEval m) => NixValue -> m NixValue
 builtinAttrValues (VAttrs attrs) =
-  pure (VList (attrSetElems attrs))
+  pure (VList (clistFromThunks (map thunkToCPtr (attrSetElems attrs))))
 builtinAttrValues other =
   throwEvalError ("builtins.attrValues: expected a set, got " <> typeName other)
 
 builtinListToAttrs :: (MonadEval m) => NixValue -> m NixValue
-builtinListToAttrs (VList thunks) = do
+builtinListToAttrs (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   pairs <- mapM listToAttrsPair thunks
   pure (VAttrs (attrSetFromMap (Map.fromList pairs)))
 builtinListToAttrs other =
@@ -1371,7 +1381,8 @@ builtinGetAttr other _ =
   throwEvalError ("builtins.getAttr: expected a string, got " <> typeName other)
 
 builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinRemoveAttrs (VAttrs attrs) (VList thunks) = do
+builtinRemoveAttrs (VAttrs attrs) (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   keys <- mapM forceToString thunks
   pure (VAttrs (attrSetRemoveKeys keys attrs))
   where
@@ -1399,9 +1410,10 @@ builtinIntersectAttrs other _ =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 
 builtinCatAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinCatAttrs (VStr key _) (VList thunks) = do
+builtinCatAttrs (VStr key _) (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   vals <- catAttrsCollect key thunks
-  pure (VList vals)
+  pure (VList (clistFromThunks (map thunkToCPtr vals)))
 builtinCatAttrs (VStr _ _) other =
   throwEvalError ("builtins.catAttrs: expected a list, got " <> typeName other)
 builtinCatAttrs other _ =
@@ -1427,16 +1439,18 @@ catAttrsCollect key = go []
 -- ---------------------------------------------------------------------------
 
 builtinMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMap func (VList thunks) =
+builtinMap func (VList cl) =
   -- Lazy: each element is a deferred application, forced only on demand.
-  pure (VList (map (deferApply func) thunks))
+  let thunks = map Thunk (clistThunks cl)
+   in pure (VList (clistFromThunks (map (thunkToCPtr . deferApply func) thunks)))
 builtinMap _ other =
   throwEvalError ("builtins.map: expected a list, got " <> typeName other)
 
 builtinFilter :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinFilter predFn (VList thunks) = do
+builtinFilter predFn (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   filtered <- filterThunks predFn thunks
-  pure (VList filtered)
+  pure (VList (clistFromThunks (map thunkToCPtr filtered)))
 builtinFilter _ other =
   throwEvalError ("builtins.filter: expected a list, got " <> typeName other)
 
@@ -1460,15 +1474,16 @@ builtinGenList func (VInt n)
           (sp, sc) = buildCSlots [fnThunk]
           env = newMinimalEnv sp sc
           mkIndexThunk i = mkThunk env (EApp (EResolvedVar 0 0) (ELit (NixInt i)))
-       in pure (VList (map mkIndexThunk [0 .. n - 1]))
+       in pure (VList (clistFromThunks (map (thunkToCPtr . mkIndexThunk) [0 .. n - 1])))
 builtinGenList _ other =
   throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
 
 builtinSort :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinSort comparator (VList thunks) = do
+builtinSort comparator (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   vals <- mapM force thunks
   sorted <- mergeSort comparator vals
-  pure (VList (map evaluated sorted))
+  pure (VList (clistFromThunks (map (thunkToCPtr . evaluated) sorted)))
 builtinSort _ other =
   throwEvalError ("builtins.sort: expected a list, got " <> typeName other)
 
@@ -1496,23 +1511,25 @@ mergeSorted cmp (x : xs) (y : ys) = do
     _ -> throwEvalError "builtins.sort: comparator must return a bool"
 
 builtinConcatMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinConcatMap func (VList thunks) = do
+builtinConcatMap func (VList cl) = do
   -- Semi-eager: must force each application to discover list structure for
   -- concatenation, but element thunks within those sub-lists stay lazy.
-  let deferredApps = map (deferApply func) thunks
+  let thunks = map Thunk (clistThunks cl)
+      deferredApps = map (deferApply func) thunks
   results <- mapM force deferredApps
   concatted <- mapM extractList results
-  pure (VList (concat concatted))
+  pure (VList (clistFromThunks (map thunkToCPtr (concat concatted))))
 builtinConcatMap _ other =
   throwEvalError ("builtins.concatMap: expected a list, got " <> typeName other)
 
 extractList :: (MonadEval m) => NixValue -> m [Thunk]
-extractList (VList xs) = pure xs
+extractList (VList cl) = pure (map Thunk (clistThunks cl))
 extractList other =
   throwEvalError ("builtins.concatMap: function must return a list, got " <> typeName other)
 
 builtinAny :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAny predFn (VList thunks) = do
+builtinAny predFn (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   result <- anyThunk predFn thunks
   pure (VBool result)
 builtinAny _ other =
@@ -1529,7 +1546,8 @@ anyThunk predFn (thunk : rest) = do
     _ -> throwEvalError "builtins.any: predicate must return a bool"
 
 builtinAll :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAll predFn (VList thunks) = do
+builtinAll predFn (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   result <- allThunk predFn thunks
   pure (VBool result)
 builtinAll _ other =
@@ -1546,7 +1564,8 @@ allThunk predFn (thunk : rest) = do
     _ -> throwEvalError "builtins.all: predicate must return a bool"
 
 builtinElem :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinElem needle (VList thunks) = do
+builtinElem needle (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   found <- elemCheck needle thunks
   pure (VBool found)
 builtinElem _ other =
@@ -1560,18 +1579,20 @@ elemCheck needle (thunk : rest) = do
   if eq then pure True else elemCheck needle rest
 
 builtinElemAt :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinElemAt (VList thunks) (VInt idx)
-  | idx < 0 = elemAtOOB idx thunks
-  | otherwise = case drop (fromIntegral idx) thunks of
-      (t : _) -> force t
-      [] -> elemAtOOB idx thunks
+builtinElemAt (VList cl) (VInt idx)
+  | idx < 0 = elemAtOOB idx cl
+  | otherwise =
+      let ptrs = clistThunks cl
+       in case drop (fromIntegral idx) ptrs of
+            (p : _) -> force (Thunk p)
+            [] -> elemAtOOB idx cl
   where
-    elemAtOOB i ts =
+    elemAtOOB i c =
       throwEvalError
         ( "builtins.elemAt: index "
             <> T.pack (show i)
             <> " out of bounds for list of length "
-            <> T.pack (show (length ts))
+            <> T.pack (show (clistLen c))
         )
 builtinElemAt (VList _) other =
   throwEvalError ("builtins.elemAt: expected an integer, got " <> typeName other)
@@ -1579,14 +1600,15 @@ builtinElemAt other _ =
   throwEvalError ("builtins.elemAt: expected a list, got " <> typeName other)
 
 builtinPartition :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinPartition predFn (VList thunks) = do
+builtinPartition predFn (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   (rightThunks, wrongThunks) <- partitionThunks predFn thunks
   pure
     ( VAttrs
         ( attrSetFromMap $
             Map.fromList
-              [ ("right", evaluated (VList rightThunks)),
-                ("wrong", evaluated (VList wrongThunks))
+              [ ("right", evaluated (VList (clistFromThunks (map thunkToCPtr rightThunks)))),
+                ("wrong", evaluated (VList (clistFromThunks (map thunkToCPtr wrongThunks))))
               ]
         )
     )
@@ -1607,9 +1629,10 @@ partitionThunks predFn = go [] []
         _ -> throwEvalError "builtins.partition: predicate must return a bool"
 
 builtinGroupBy :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinGroupBy func (VList thunks) = do
+builtinGroupBy func (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   groups <- groupByCollect func thunks Map.empty
-  pure (VAttrs (attrSetFromMap (Map.map (evaluated . VList . reverse) groups)))
+  pure (VAttrs (attrSetFromMap (Map.map (evaluated . VList . clistFromThunks . map thunkToCPtr . reverse) groups)))
 builtinGroupBy _ other =
   throwEvalError ("builtins.groupBy: expected a list, got " <> typeName other)
 
@@ -1633,7 +1656,8 @@ groupByCollect func (thunk : rest) acc = do
 -- ---------------------------------------------------------------------------
 
 builtinConcatStringsSep :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinConcatStringsSep (VStr sep sepCtx) (VList thunks) = do
+builtinConcatStringsSep (VStr sep sepCtx) (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   pairs <- mapM forceToStrCtx thunks
   let texts = map fst pairs
       mergedCtx = sepCtx <> mconcat (map snd pairs)
@@ -1654,8 +1678,8 @@ builtinConcatStringsSep other _ =
 -- ---------------------------------------------------------------------------
 
 builtinFoldl :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
-builtinFoldl op initial (VList thunks) =
-  foldlStrict op initial thunks
+builtinFoldl op initial (VList cl) =
+  foldlStrict op initial (map Thunk (clistThunks cl))
 builtinFoldl _ _ other =
   throwEvalError ("builtins.foldl': expected a list, got " <> typeName other)
 
@@ -1710,7 +1734,8 @@ deferApplyExpr = EApp (EResolvedVar 0 0) (EResolvedVar 0 1)
 -- recursively coerced and joined with spaces, matching real Nix semantics.
 -- @toString [1 2 3]@ gives @"1 2 3"@.
 coerceToStringPermissive :: (MonadEval m) => NixValue -> m (Text, StringContext)
-coerceToStringPermissive (VList thunks) = do
+coerceToStringPermissive (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   parts <- mapM coerceThunk thunks
   let texts = map fst parts
       ctx = mconcat (map snd parts)
@@ -1821,7 +1846,7 @@ contextEntryToAttrs entry =
   let fields =
         [("path", evaluated (VBool True)) | cePath entry]
           ++ [("allOutputs", evaluated (VBool True)) | ceAllOutputs entry]
-          ++ [("outputs", evaluated (VList [evaluated (mkStr o) | o <- ceOutputs entry])) | not (null (ceOutputs entry))]
+          ++ [("outputs", evaluated (VList (clistFromThunks [thunkToCPtr (evaluated (mkStr o)) | o <- ceOutputs entry]))) | not (null (ceOutputs entry))]
    in evaluated (VAttrs (attrSetFromMap (Map.fromList fields)))
 
 -- | Append context entries to a string from an attrset.
@@ -1874,7 +1899,7 @@ parseContextAttrs attrs = do
       Just thunk -> do
         val <- force thunk
         case val of
-          VList thunks -> mapM forceToOutputName thunks
+          VList cl -> mapM (forceToOutputName . Thunk) (clistThunks cl)
           _ -> pure []
 
     forceToOutputName thunk = do
@@ -1910,14 +1935,15 @@ dirComponent t =
         Just n -> T.take (T.length t - n - 1) t
 
 builtinConcatLists :: (MonadEval m) => NixValue -> m NixValue
-builtinConcatLists (VList thunks) = do
+builtinConcatLists (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   sublists <- mapM forceThenExtractList thunks
-  pure (VList (concat sublists))
+  pure (VList (clistFromThunks (concat sublists)))
   where
     forceThenExtractList thunk = do
       val <- force thunk
       case val of
-        VList xs -> pure xs
+        VList innerCl -> pure (clistThunks innerCl)
         _ -> throwEvalError "builtins.concatLists: element must be a list"
 builtinConcatLists other =
   throwEvalError ("builtins.concatLists: expected a list, got " <> typeName other)
@@ -2058,7 +2084,8 @@ builtinSetFunctionArgs func args =
   throwEvalError ("builtins.setFunctionArgs: expected a set as second argument, got " <> typeName args <> " (func: " <> typeName func <> ")")
 
 builtinZipAttrsWith :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinZipAttrsWith func (VList thunks) = do
+builtinZipAttrsWith func (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   attrSets <- mapM forceToAttrSet thunks
   let merged = mergeAllAttrs attrSets
   resultPairs <- mapM (applyZip func) (Map.toList merged)
@@ -2072,7 +2099,7 @@ builtinZipAttrsWith func (VList thunks) = do
     mergeAllAttrs = foldl' (\acc m -> Map.unionWith (++) acc (Map.map (: []) m)) Map.empty
     applyZip fn (key, thunkList) = do
       partial <- applyValue fn (mkStr key)
-      result <- applyValue partial (VList thunkList)
+      result <- applyValue partial (VList (clistFromThunks (map thunkToCPtr thunkList)))
       pure (key, evaluated result)
 builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
@@ -2083,7 +2110,9 @@ builtinZipAttrsWith _ other =
 
 builtinReplaceStrings ::
   (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
-builtinReplaceStrings (VList fromThunks) (VList toThunks) (VStr input inputCtx) = do
+builtinReplaceStrings (VList fromCl) (VList toCl) (VStr input inputCtx) = do
+  let fromThunks = map Thunk (clistThunks fromCl)
+      toThunks = map Thunk (clistThunks toCl)
   froms <- mapM forceStr fromThunks
   toStrs <- mapM forceStr toThunks
   when (length froms /= length toStrs) $
@@ -2201,7 +2230,7 @@ matchWithCompiled compiled str =
               -- Skip index 0 (full match) — return only capture groups.
               captureGroups = drop 1 groups
               toThunk (s, _) = evaluated (mkStr (T.pack s))
-           in pure (VList (map toThunk captureGroups))
+           in pure (VList (clistFromThunks (map (thunkToCPtr . toThunk) captureGroups)))
 
 -- | @builtins.split regex str@: split a string by a POSIX ERE.
 -- Returns an alternating list of non-matched strings and match-group lists.
@@ -2228,7 +2257,7 @@ splitWithCompiled compiled str =
   let allMatches = matchAllText compiled (T.unpack str)
       strText = T.unpack str
       result = buildSplitResult strText 0 allMatches
-   in pure (VList result)
+   in pure (VList (clistFromThunks (map thunkToCPtr result)))
 
 -- | Build the alternating list for builtins.split.
 buildSplitResult :: String -> Int -> [Array.Array Int (String, (Int, Int))] -> [Thunk]
@@ -2248,7 +2277,7 @@ buildSplitResult remaining pos (match : rest) =
       -- Continue after this match
       afterPos = matchStart + matchLen
    in evaluated (mkStr before)
-        : evaluated (VList groupThunks)
+        : evaluated (VList (clistFromThunks (map thunkToCPtr groupThunks)))
         : buildSplitResult remaining afterPos rest
 
 builtinCompareVersions :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -2304,7 +2333,7 @@ spanComponent t = case T.uncons t of
 
 builtinSplitVersion :: (MonadEval m) => NixValue -> m NixValue
 builtinSplitVersion (VStr s _) =
-  pure (VList (map (evaluated . mkStr) (splitVersionComponents s)))
+  pure (VList (clistFromThunks (map (thunkToCPtr . evaluated . mkStr) (splitVersionComponents s))))
 builtinSplitVersion other =
   throwEvalError ("builtins.splitVersion: expected a string, got " <> typeName other)
 
@@ -2368,7 +2397,8 @@ valueToJSON (VFloat f) =
       -- For simple cases just use show
       pure (T.pack s)
 valueToJSON (VStr s _) = pure (jsonEscapeString s)
-valueToJSON (VList thunks) = do
+valueToJSON (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
   vals <- mapM force thunks
   jsonVals <- mapM valueToJSON vals
   pure ("[" <> T.intercalate "," jsonVals <> "]")
@@ -2501,13 +2531,13 @@ parseJSONArray t = parseJSONArrayElements (T.stripStart t) []
 
 parseJSONArrayElements :: Text -> [Thunk] -> Maybe (NixValue, Text)
 parseJSONArrayElements t acc = case T.uncons (T.stripStart t) of
-  Just (']', rest) -> Just (VList (reverse acc), rest)
+  Just (']', rest) -> Just (VList (clistFromThunks (map thunkToCPtr (reverse acc))), rest)
   _ -> case parseJSON t of
     Just (val, rest) ->
       let stripped = T.stripStart rest
        in case T.uncons stripped of
             Just (',', rest2) -> parseJSONArrayElements rest2 (evaluated val : acc)
-            Just (']', rest2) -> Just (VList (reverse (evaluated val : acc)), rest2)
+            Just (']', rest2) -> Just (VList (clistFromThunks (map thunkToCPtr (reverse (evaluated val : acc)))), rest2)
             _ -> Nothing
     Nothing -> Nothing
 
@@ -2554,7 +2584,7 @@ builtinDeepSeq first second = do
   pure second
 
 deepForce :: (MonadEval m) => NixValue -> m ()
-deepForce (VList thunks) = mapM_ (force >=> deepForce) thunks
+deepForce (VList cl) = mapM_ ((force >=> deepForce) . Thunk) (clistThunks cl)
 deepForce (VAttrs attrs) = mapM_ (force >=> deepForce) (attrSetElems attrs)
 deepForce _ = pure ()
 
@@ -2595,9 +2625,10 @@ builtinGenericClosure (VAttrs attrs) = do
   startSetVal <- force startSetThunk
   operatorVal <- force operatorThunk
   case startSetVal of
-    VList items -> do
+    VList cl -> do
+      let items = map Thunk (clistThunks cl)
       result <- closureLoop operatorVal (Seq.fromList items) [] []
-      pure (VList (map evaluated result))
+      pure (VList (clistFromThunks (map (thunkToCPtr . evaluated) result)))
     _ -> throwEvalError "builtins.genericClosure: 'startSet' must be a list"
 builtinGenericClosure other =
   throwEvalError ("builtins.genericClosure: expected a set, got " <> typeName other)
@@ -2623,8 +2654,8 @@ closureLoop operator (thunk :<| rest) seenKeys acc = do
     else do
       newItems <- applyValue operator item
       case newItems of
-        VList newThunks ->
-          closureLoop operator (rest <> Seq.fromList newThunks) (key : seenKeys) (item : acc)
+        VList newCl ->
+          closureLoop operator (rest <> Seq.fromList (map Thunk (clistThunks newCl))) (key : seenKeys) (item : acc)
         _ -> throwEvalError "builtins.genericClosure: operator must return a list"
 
 extractKey :: (MonadEval m) => NixValue -> m NixValue
@@ -2725,7 +2756,8 @@ validateStorePath p
 -- ---------------------------------------------------------------------------
 
 builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinFindFile (VList searchPath) (VStr name _) = do
+builtinFindFile (VList cl) (VStr name _) = do
+  let searchPath = map Thunk (clistThunks cl)
   entries <- mapM forceSearchEntry searchPath
   findFirst entries name
 builtinFindFile (VList _) other =
@@ -2921,7 +2953,7 @@ builtinDerivation (VAttrs attrs) = do
     Just thunk -> do
       val <- force thunk
       case val of
-        VList thunks -> mapM forceToText thunks
+        VList cl -> mapM (forceToText . Thunk) (clistThunks cl)
         _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
 
   -- Extract optional args (default [])
@@ -2930,7 +2962,7 @@ builtinDerivation (VAttrs attrs) = do
     Just thunk -> do
       val <- force thunk
       case val of
-        VList thunks -> mapM forceToText thunks
+        VList cl -> mapM (forceToText . Thunk) (clistThunks cl)
         _ -> throwEvalError "derivation: 'args' must be a list of strings"
 
   -- Materialize once, reuse for both env collection and result merge
@@ -3256,7 +3288,7 @@ tomlToNix val = case val of
   TOMLInt n -> VInt n
   TOMLFloat d -> VFloat d
   TOMLBool b -> VBool b
-  TOMLArray xs -> VList (map (evaluated . tomlToNix) xs)
+  TOMLArray xs -> VList (clistFromThunks (map (thunkToCPtr . evaluated . tomlToNix) xs))
   TOMLTable m -> VAttrs (attrSetFromMap (Map.map (evaluated . tomlToNix) m))
 
 -- | Parse all lines of a TOML document into a table.
@@ -3669,7 +3701,8 @@ valueToXML depth val = case val of
     pure (indent depth <> "<null />\n")
   VPath p ->
     pure (indent depth <> "<path value=" <> xmlQuote p <> " />\n")
-  VList thunks -> do
+  VList cl -> do
+    let thunks = map Thunk (clistThunks cl)
     items <- mapM (force >=> valueToXML (depth + 1)) thunks
     pure (indent depth <> "<list>\n" <> T.concat items <> indent depth <> "</list>\n")
   VAttrs attrs -> do

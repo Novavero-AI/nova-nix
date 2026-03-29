@@ -13,11 +13,12 @@ where
 
 import Data.Text (Text)
 import Nix.Eval.CAttrSet (cattrsetUnion)
+import Nix.Eval.CList (clistFromThunks, clistLen, clistThunks)
 import Nix.Eval.Types
   ( AttrSet (..),
     MonadEval (..),
     NixValue (..),
-    Thunk,
+    Thunk (..),
     attrSetElems,
     attrSetKeys,
     thunkSameRef,
@@ -158,9 +159,9 @@ nixEqual _ VNull VNull = pure True
 -- String equality ignores context (matching real Nix).
 nixEqual _ (VStr a _) (VStr b _) = pure (a == b)
 nixEqual _ (VPath a) (VPath b) = pure (a == b)
-nixEqual forceFn (VList as) (VList bs)
-  | length as /= length bs = pure False
-  | otherwise = listEqual forceFn as bs
+nixEqual forceFn (VList clA) (VList clB)
+  | clistLen clA /= clistLen clB = pure False
+  | otherwise = listEqual forceFn (map Thunk (clistThunks clA)) (map Thunk (clistThunks clB))
 nixEqual forceFn (VAttrs as) (VAttrs bs)
   | attrSetKeys as /= attrSetKeys bs = pure False
   | otherwise = do
@@ -197,7 +198,8 @@ thunkPairEqual forceFn (a, b)
 
 -- | List concatenation (++).
 evalConcat :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-evalConcat (VList as) (VList bs) = pure (VList (as ++ bs))
+evalConcat (VList clA) (VList clB) =
+  pure (VList (clistFromThunks (clistThunks clA ++ clistThunks clB)))
 evalConcat left right =
   throwEvalError ("cannot concatenate " <> typeName left <> " and " <> typeName right)
 

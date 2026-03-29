@@ -12,6 +12,13 @@ module Nix.Eval.CList
     NnList,
     CListPtr,
 
+    -- * CList newtype
+    CList (..),
+    emptyCList,
+    clistFromThunks,
+    clistThunks,
+    clistLen,
+
     -- * Lifecycle
     clistNew,
     clistFreeAll,
@@ -30,6 +37,7 @@ where
 import Data.Word (Word32)
 import Foreign.Ptr (Ptr, nullPtr)
 import Nix.Eval.CThunk (CThunkPtr)
+import System.IO.Unsafe (unsafePerformIO)
 
 -- | Phantom type for C-side @nn_list_t@.
 data NnList
@@ -117,3 +125,45 @@ clistToThunkList cl
   | otherwise = do
       n <- clistCount cl
       mapM (clistGet cl) [0 .. n - 1]
+
+-- ---------------------------------------------------------------------------
+-- CList newtype (wraps CListPtr for use in NixValue ADT)
+-- ---------------------------------------------------------------------------
+
+-- | Opaque wrapper around a C-backed list.  Used as the payload of
+-- @VList@ in the 'NixValue' ADT.  The underlying @nn_list_t*@ is
+-- arena-allocated and valid until evaluation end.
+newtype CList = CList {unCList :: CListPtr}
+
+-- | Pointer equality — two CLists are the same if they point to the
+-- same C struct.  Deep equality is handled by the evaluator.
+instance Eq CList where
+  CList a == CList b = a == b
+
+instance Show CList where
+  show (CList p)
+    | p == nullPtr = "<list 0>"
+    | otherwise =
+        let n = unsafePerformIO (clistCount p)
+         in "<list " ++ show n ++ ">"
+
+-- | The empty CList (null pointer, zero elements).
+emptyCList :: CList
+emptyCList = CList nullPtr
+
+-- | Convert a Haskell list of 'CThunkPtr' to a 'CList'.
+-- Uses 'unsafePerformIO' — safe because allocation is idempotent
+-- per call (no shared mutable state beyond the tracking array).
+{-# NOINLINE clistFromThunks #-}
+clistFromThunks :: [CThunkPtr] -> CList
+clistFromThunks ptrs = CList (unsafePerformIO (thunkListToCList ptrs))
+
+-- | Convert a 'CList' back to a Haskell list of 'CThunkPtr'.
+clistThunks :: CList -> [CThunkPtr]
+clistThunks (CList p) = unsafePerformIO (clistToThunkList p)
+
+-- | Number of elements in the list.
+clistLen :: CList -> Int
+clistLen (CList p)
+  | p == nullPtr = 0
+  | otherwise = fromIntegral (unsafePerformIO (clistCount p))

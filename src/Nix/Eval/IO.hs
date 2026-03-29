@@ -43,10 +43,10 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
-import Nix.Eval.CList (clistToThunkList, thunkListToCList)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
+import Nix.Eval.CList (CList (..))
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
-import Nix.Eval.Types (AttrSet (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalStringContext, thunkToCPtr, unmarshalStringContext)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, unmarshalLambdaValue, unmarshalStringContext)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix, readFileAutoEncoding)
@@ -324,9 +324,10 @@ storeComputed ptr val = case val of
     | otherwise -> do
         csptr <- marshalStringContext t ctx
         cthunkSetComputedCtxStr ptr (castPtr csptr)
-  VList thunks -> do
-    clist <- thunkListToCList (map thunkToCPtr thunks)
-    cthunkSetComputedList ptr (castPtr clist)
+  VList (CList clistPtr) -> cthunkSetComputedList ptr (castPtr clistPtr)
+  VLambda (Env envPtr) formals bodyBcIdx -> do
+    lamPtr <- marshalLambda envPtr formals bodyBcIdx
+    cthunkSetComputedLambda ptr lamPtr
   _ -> do
     valSp <- newStablePtr val
     cthunkSetComputed ptr (castStablePtrToPtr valSp)
@@ -347,12 +348,14 @@ readComputed ptr = do
     5 {- PATH -} -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
     6 {- LIST -} -> do
       listPtr <- cthunkGetList ptr
-      thunks <- clistToThunkList (castPtr listPtr)
-      pure (VList (map Thunk thunks))
+      pure (VList (CList (castPtr listPtr)))
     7 {- ATTRS -} -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
     8 {- CTXSTR -} -> do
       csptr <- cthunkGetCtxStr ptr
       uncurry VStr <$> unmarshalStringContext (castPtr csptr)
+    9 {- LAMBDA -} -> do
+      lamPtr <- cthunkGetLambda ptr
+      unmarshalLambdaValue lamPtr
     _ {- PTR -} -> do
       payloadPtr <- cthunkPayload ptr
       deRefStablePtr (castPtrToStablePtr payloadPtr)

@@ -30,6 +30,13 @@ module Nix.Eval.Types
     buildCAttrSetKeys,
     fillCAttrSetValues,
 
+    -- * Lists (C-backed)
+    CList (..),
+    emptyCList,
+    clistFromThunks,
+    clistThunks,
+    clistLen,
+
     -- * String context
     StringContextElement (..),
     StringContext (..),
@@ -69,6 +76,10 @@ module Nix.Eval.Types
     allocCSlots,
     fillCSlots,
 
+    -- * Lambda marshalling
+    marshalLambda,
+    unmarshalLambdaValue,
+
     -- * Display
     typeName,
 
@@ -97,8 +108,9 @@ import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetV
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcOpcode, cbcShortArg)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
-import Nix.Eval.CList (clistToThunkList, thunkListToCList)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaNameSym, clambdaNew, clambdaSetEntry)
+import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
@@ -205,12 +217,14 @@ readThunkValue (Thunk ptr) =
           5 {- PATH -} -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
           6 {- LIST -} -> do
             listPtr <- cthunkGetList ptr
-            thunks <- clistToThunkList (castPtr listPtr)
-            pure (VList (map Thunk thunks))
+            pure (VList (CList (castPtr listPtr)))
           7 {- ATTRS -} -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
           8 {- CTXSTR -} -> do
             csptr <- cthunkGetCtxStr ptr
             uncurry VStr <$> unmarshalStringContext (castPtr csptr)
+          9 {- LAMBDA -} -> do
+            lamRaw <- cthunkPayload ptr
+            unmarshalLambdaValue (castPtr lamRaw)
           _ {- PTR -} -> do
             payload <- cthunkPayload ptr
             deRefStablePtr (castPtrToStablePtr payload)
@@ -229,8 +243,8 @@ data NixValue
     VStr !Text !StringContext
   | -- | Path.
     VPath !Text
-  | -- | List of thunks (lazy elements).
-    VList ![Thunk]
+  | -- | List of thunks (lazy elements), backed by C array.
+    VList !CList
   | -- | Attribute set: unified lazy/eager representation.
     VAttrs !AttrSet
   | -- | Lambda closure: captures environment, formals, body bytecode index.
@@ -693,7 +707,8 @@ evaluated (VPath p) = Thunk (newComputedPathPtr p)
 evaluated (VStr t ctx)
   | ctx == emptyContext = Thunk (newComputedStrPtr t)
   | otherwise = Thunk (newComputedCtxStrPtr t ctx)
-evaluated (VList thunks) = Thunk (newComputedListPtr thunks)
+evaluated (VList cl) = Thunk (newComputedListPtrC cl)
+evaluated (VLambda env formals bodyBcIdx) = Thunk (newComputedLambdaPtr env formals bodyBcIdx)
 evaluated val = Thunk (newComputedThunkPtr val)
 
 -- | Check if two thunks share the same memoization cell (C pointer
@@ -751,16 +766,13 @@ newComputedPathPtr p =
     Symbol sym <- symbolIntern p
     cthunkNewComputedPath sym
 
--- | Wrap a list of thunks in a pre-computed C thunk (C array, no StablePtr).
--- Converts [Thunk] to a C nn_list_t, stores pointer as payload.
-{-# NOINLINE newComputedListPtr #-}
-newComputedListPtr :: [Thunk] -> CThunkPtr
-newComputedListPtr thunks =
+-- | Wrap a CList in a pre-computed C thunk (no conversion needed).
+{-# NOINLINE newComputedListPtrC #-}
+newComputedListPtrC :: CList -> CThunkPtr
+newComputedListPtrC (CList clistPtr) =
   unsafePerformIO $
-    thunks `seq` do
-      let ptrs = map thunkToCPtr thunks
-      clist <- thunkListToCList ptrs
-      cthunkNewComputedList (castPtr clist)
+    clistPtr `seq`
+      cthunkNewComputedList (castPtr clistPtr)
 
 -- | Wrap a string with context in a pre-computed C thunk (no StablePtr).
 -- Interns the text and all StorePath fields as symbols, builds nn_ctxstr_t.
@@ -772,6 +784,79 @@ newComputedCtxStrPtr t ctx =
       ctx `seq` do
         ptr <- marshalStringContext t ctx
         cthunkNewComputedCtxStr (castPtr ptr)
+
+-- | Wrap a lambda closure in a pre-computed C thunk (no StablePtr).
+-- Marshals EvalFormals to nn_lambda_t, stores as tag 9.
+{-# NOINLINE newComputedLambdaPtr #-}
+newComputedLambdaPtr :: Env -> EvalFormals -> Word32 -> CThunkPtr
+newComputedLambdaPtr (Env envPtr) formals bodyBcIdx =
+  unsafePerformIO $
+    formals `seq` do
+      clam <- marshalLambda envPtr formals bodyBcIdx
+      cthunkNewComputedLambda clam
+
+-- | Marshal Env + EvalFormals + body bc_idx to a C nn_lambda_t.
+marshalLambda :: Ptr NnEnv -> EvalFormals -> Word32 -> IO (Ptr ())
+marshalLambda envPtr formals bodyBcIdx = case formals of
+  EFName name -> do
+    Symbol nameSym <- symbolIntern name
+    lam <- clambdaNew envPtr bodyBcIdx 0 nameSym 0 0
+    pure (castPtr lam)
+  EFSet entries allowExtra -> do
+    let count = fromIntegral (length entries) :: Word16
+        extraFlag = if allowExtra then 1 else 0 :: Word8
+    lam <- clambdaNew envPtr bodyBcIdx 1 0 extraFlag count
+    fillEntries lam 0 entries
+    pure (castPtr lam)
+  EFNamedSet name entries allowExtra -> do
+    Symbol nameSym <- symbolIntern name
+    let count = fromIntegral (length entries) :: Word16
+        extraFlag = if allowExtra then 1 else 0 :: Word8
+    lam <- clambdaNew envPtr bodyBcIdx 2 nameSym extraFlag count
+    fillEntries lam 0 entries
+    pure (castPtr lam)
+  where
+    fillEntries _ _ [] = pure ()
+    fillEntries lam !idx (EvalFormal name defBcIdx : rest) = do
+      Symbol nameSym <- symbolIntern name
+      let (hasDef, defIdx) = case defBcIdx of
+            Nothing -> (0, 0)
+            Just di -> (1, di)
+      clambdaSetEntry lam idx nameSym hasDef defIdx
+      fillEntries lam (idx + 1) rest
+
+-- | Read a C nn_lambda_t back into VLambda.
+-- Reconstructs Env (newtype wrap), EvalFormals (from symbol IDs), body bc_idx.
+unmarshalLambdaValue :: Ptr () -> IO NixValue
+unmarshalLambdaValue rawPtr = do
+  let lamPtr = castPtr rawPtr
+  envPtr <- clambdaEnv lamPtr
+  bodyIdx <- clambdaBody lamPtr
+  formalsType <- clambdaFormalsType lamPtr
+  formals <- case formalsType of
+    0 {- Name -} -> do
+      nameSym <- clambdaNameSym lamPtr
+      pure (EFName (symbolText (Symbol nameSym)))
+    1 {- Set -} -> do
+      count <- clambdaFormalCount lamPtr
+      extra <- clambdaAllowExtra lamPtr
+      entries <- readLambdaEntries lamPtr count
+      pure (EFSet entries (extra /= 0))
+    _ {- NamedSet -} -> do
+      nameSym <- clambdaNameSym lamPtr
+      count <- clambdaFormalCount lamPtr
+      extra <- clambdaAllowExtra lamPtr
+      entries <- readLambdaEntries lamPtr count
+      pure (EFNamedSet (symbolText (Symbol nameSym)) entries (extra /= 0))
+  pure (VLambda (Env envPtr) formals bodyIdx)
+  where
+    readLambdaEntries lamPtr count = mapM (readOneEntry lamPtr) [0 .. count - 1]
+    readOneEntry lamPtr idx = do
+      nameSym <- clambdaEntryName lamPtr idx
+      hasDef <- clambdaEntryHasDefault lamPtr idx
+      defIdx <- clambdaEntryDefault lamPtr idx
+      let defMaybe = if hasDef /= 0 then Just defIdx else Nothing
+      pure (EvalFormal (symbolText (Symbol nameSym)) defMaybe)
 
 -- | Marshal Text + StringContext to a C nn_ctxstr_t.
 marshalStringContext :: Text -> StringContext -> IO CCtxStrPtr
@@ -997,8 +1082,7 @@ instance MonadEval PureEval where
                  in pure (VPath (symbolText (Symbol sym)))
               6 {- LIST -} ->
                 let listPtr = unsafePerformIO (cthunkGetList ptr)
-                    thunks = unsafePerformIO (clistToThunkList (castPtr listPtr))
-                 in pure (VList (map Thunk thunks))
+                 in pure (VList (CList (castPtr listPtr)))
               7 {- ATTRS -} ->
                 let p = unsafePerformIO (cthunkGetAttrs ptr)
                  in pure (VAttrs (AttrSet (castPtr p)))
@@ -1006,6 +1090,10 @@ instance MonadEval PureEval where
                 let csptr = unsafePerformIO (cthunkGetCtxStr ptr)
                     (t, ctx) = unsafePerformIO (unmarshalStringContext (castPtr csptr))
                  in pure (VStr t ctx)
+              9 {- LAMBDA -} ->
+                let lamRaw = unsafePerformIO (cthunkPayload ptr)
+                    val = unsafePerformIO (unmarshalLambdaValue lamRaw)
+                 in pure val
               _ {- PTR -} ->
                 let payload = unsafePerformIO (cthunkPayload ptr)
                     val = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))

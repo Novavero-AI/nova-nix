@@ -12,21 +12,22 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import Foreign.Ptr (castPtr, nullPtr)
+import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
-import Nix.Eval (Env (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, evaluated, mkStr, readThunkValue, runPureEval)
+import Nix.Eval (NixValue (..), StringContext (..), StringContextElement (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
-import Nix.Eval.CAttrSet (cattrsetFree, cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
+import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, opApp, opAssert, opAttrs, opBinary, opHasAttr, opIf, opIndStr, opLambda, opLet, opList, opLitBool, opLitFloat, opLitInt, opLitNull, opLitPath, opLitUri, opResolvedVar, opSearchPath, opSelect, opStr, opUnary, opVar, opWith, opWithVar, strpartInterp, strpartLit, unaryNegate)
 import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
 import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
+import Nix.Eval.Types (emptyCList)
 import Nix.Expr.Types
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
@@ -561,7 +562,7 @@ testEvalHigherOrder = do
       runTest "map identity" $
         assertEval "map-id" "builtins.map (x: x) [ 1 2 ] == [ 1 2 ]" (VBool True),
       runTest "map empty" $
-        assertEval "map-empty" "builtins.map (x: x) [ ]" (VList []),
+        assertEval "map-empty" "builtins.map (x: x) [ ]" (VList emptyCList),
       runTest "map lazy" $
         assertEval "map-lazy" "let xs = builtins.map (x: x * 2) [ 1 (throw \"boom\") 3 ]; in builtins.elemAt xs 0" (VInt 2),
       -- filter
@@ -580,7 +581,7 @@ testEvalHigherOrder = do
       runTest "genList basic" $
         assertEval "genList" "builtins.genList (i: i * 2) 4 == [ 0 2 4 6 ]" (VBool True),
       runTest "genList zero" $
-        assertEval "genList-0" "builtins.genList (i: i) 0" (VList []),
+        assertEval "genList-0" "builtins.genList (i: i) 0" (VList emptyCList),
       runTest "genList lazy" $
         assertEval "genList-lazy" "let xs = builtins.genList (i: if i == 0 then 42 else throw \"boom\") 5; in builtins.elemAt xs 0" (VInt 42),
       -- sort
@@ -1150,7 +1151,7 @@ testBatch1 = do
       runTest "concatLists basic" $
         assertEval "concatLists" "builtins.concatLists [ [ 1 2 ] [ 3 ] [ 4 5 ] ] == [ 1 2 3 4 5 ]" (VBool True),
       runTest "concatLists empty" $
-        assertEval "concatLists-empty" "builtins.concatLists [ ]" (VList []),
+        assertEval "concatLists-empty" "builtins.concatLists [ ]" (VList emptyCList),
       runTest "concatLists type error" $
         assertEvalFail "concatLists-err" "builtins.concatLists [ 1 2 ]",
       -- lessThan
@@ -1168,7 +1169,7 @@ testBatch1 = do
       runTest "langVersion" $
         assertEval "langVersion" "builtins.langVersion" (VInt 6),
       runTest "nixPath" $
-        assertEval "nixPath" "builtins.nixPath" (VList [])
+        assertEval "nixPath" "builtins.nixPath" (VList emptyCList)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1336,7 +1337,7 @@ testBatch5 = do
       runTest "fromJSON object" $
         assertEval "fromJSON-obj" "(builtins.fromJSON \"{\\\"a\\\": 1}\").a" (VInt 1),
       runTest "fromJSON roundtrip" $
-        assertEval "fromJSON-rt" "builtins.fromJSON (builtins.toJSON { a = 1; b = [ 2 3 ]; })" (VAttrs (attrSetFromMap (Map.fromList [("a", evaluated (VInt 1)), ("b", evaluated (VList [evaluated (VInt 2), evaluated (VInt 3)]))]))),
+        assertEval "fromJSON-rt" "let x = builtins.fromJSON (builtins.toJSON { a = 1; b = [ 2 3 ]; }); in x.a == 1 && x.b == [ 2 3 ]" (VBool True),
       runTest "fromJSON invalid" $
         assertEvalFail "fromJSON-bad" "builtins.fromJSON \"not json\"",
       -- hashString
@@ -3376,7 +3377,7 @@ testCAttrSet = do
   -- Symbol table is initialized by arenaInit in main bracket.
   sequence
     [ runTestM "new/free" $ do
-        set <- cattrsetNew 16
+        _set <- cattrsetNew 16
         -- set freed by arenaDestroy via nn_attrset_free_all
         pure Pass,
       runTestM "insert + freeze + lookup" $ do
@@ -3716,7 +3717,7 @@ testBytecodeCompile = do
         idx <- compileExpr (EVar "hello")
         op <- cbcOpcode idx
         sym <- cbcArg1 idx
-        symText <- pure (symbolText (Symbol sym))
+        let symText = symbolText (Symbol sym)
         pure
           ( if op == opVar && symText == "hello"
               then Pass
@@ -3817,7 +3818,7 @@ testBytecodeCompile = do
         dataOff <- cbcArg1 idx
         -- 3 parts × 2 words each = 6 data words
         tag0 <- cbcData dataOff
-        val0 <- cbcData (dataOff + 1)
+        _val0 <- cbcData (dataOff + 1)
         tag1 <- cbcData (dataOff + 2)
         val1 <- cbcData (dataOff + 3)
         tag2 <- cbcData (dataOff + 4)

@@ -52,6 +52,7 @@ library
     Nix.Eval.CAttrSet
     Nix.Eval.CThunk
     Nix.Eval.CEnv
+    Nix.Eval.CLambda
     Nix.Eval.CList
     Nix.Eval.CCtxStr
     Nix.Eval.CBytecode
@@ -97,6 +98,7 @@ library
     cbits/nn_ctxstr.c
     cbits/nn_arena.c
     cbits/nn_bytecode.c
+    cbits/nn_lambda.c
   include-dirs:     cbits
   cc-options:       -std=c99 -Wall -Wextra -pedantic -Werror
   hs-source-dirs:   src

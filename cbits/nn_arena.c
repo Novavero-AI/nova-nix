@@ -39,7 +39,8 @@ nn_arena_stableptr_count(void)
             void *p = nn_thunk_payload(t);
             if (p) count++;
         } else if (state == NN_THUNK_COMPUTED) {
-            if (nn_thunk_value_tag(t) == NN_VALUE_PTR) {
+            uint8_t vtag = nn_thunk_value_tag(t);
+            if (vtag == NN_VALUE_PTR) {
                 void *p = nn_thunk_payload(t);
                 if (p) count++;
             }
@@ -64,7 +65,8 @@ nn_arena_collect_stableptrs(void **output, uint32_t max_count)
             void *p = nn_thunk_payload(t);
             if (p) output[written++] = p;
         } else if (state == NN_THUNK_COMPUTED) {
-            if (nn_thunk_value_tag(t) == NN_VALUE_PTR) {
+            uint8_t vtag = nn_thunk_value_tag(t);
+            if (vtag == NN_VALUE_PTR) {
                 void *p = nn_thunk_payload(t);
                 if (p) output[written++] = p;
             }

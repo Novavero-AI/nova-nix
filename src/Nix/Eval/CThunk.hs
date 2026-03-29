@@ -41,6 +41,7 @@ module Nix.Eval.CThunk
     cthunkNewComputedList,
     cthunkNewComputedAttrs,
     cthunkNewComputedCtxStr,
+    cthunkNewComputedLambda,
 
     -- * State queries
     cthunkState,
@@ -56,6 +57,7 @@ module Nix.Eval.CThunk
     cthunkGetList,
     cthunkGetAttrs,
     cthunkGetCtxStr,
+    cthunkGetLambda,
 
     -- * State transitions
     cthunkMarkBlackhole,
@@ -69,6 +71,7 @@ module Nix.Eval.CThunk
     cthunkSetComputedList,
     cthunkSetComputedAttrs,
     cthunkSetComputedCtxStr,
+    cthunkSetComputedLambda,
 
     -- * Arena diagnostics / cleanup
     cthunkCount,
@@ -139,6 +142,9 @@ foreign import ccall unsafe "nn_thunk_new_computed_attrs"
 foreign import ccall unsafe "nn_thunk_new_computed_ctxstr"
   c_nn_thunk_new_computed_ctxstr :: Ptr () -> IO CThunkPtr
 
+foreign import ccall unsafe "nn_thunk_new_computed_lambda"
+  c_nn_thunk_new_computed_lambda :: Ptr () -> IO CThunkPtr
+
 foreign import ccall unsafe "nn_thunk_state"
   c_nn_thunk_state :: CThunkPtr -> IO Word8
 
@@ -172,6 +178,9 @@ foreign import ccall unsafe "nn_thunk_get_attrs"
 foreign import ccall unsafe "nn_thunk_get_ctxstr"
   c_nn_thunk_get_ctxstr :: CThunkPtr -> IO (Ptr ())
 
+foreign import ccall unsafe "nn_thunk_get_lambda"
+  c_nn_thunk_get_lambda :: CThunkPtr -> IO (Ptr ())
+
 foreign import ccall unsafe "nn_thunk_mark_blackhole"
   c_nn_thunk_mark_blackhole :: CThunkPtr -> IO Int
 
@@ -204,6 +213,9 @@ foreign import ccall unsafe "nn_thunk_set_computed_attrs"
 
 foreign import ccall unsafe "nn_thunk_set_computed_ctxstr"
   c_nn_thunk_set_computed_ctxstr :: CThunkPtr -> Ptr () -> IO (Ptr ())
+
+foreign import ccall unsafe "nn_thunk_set_computed_lambda"
+  c_nn_thunk_set_computed_lambda :: CThunkPtr -> Ptr () -> IO (Ptr ())
 
 foreign import ccall unsafe "nn_thunk_count"
   c_nn_thunk_count :: IO Word32
@@ -290,6 +302,11 @@ cthunkNewComputedAttrs = c_nn_thunk_new_computed_attrs
 cthunkNewComputedCtxStr :: Ptr () -> IO CThunkPtr
 cthunkNewComputedCtxStr = c_nn_thunk_new_computed_ctxstr
 
+-- | Allocate a pre-COMPUTED thunk with a CLambda pointer (no StablePtr).
+-- For lambda closures (tag 9).
+cthunkNewComputedLambda :: Ptr () -> IO CThunkPtr
+cthunkNewComputedLambda = c_nn_thunk_new_computed_lambda
+
 -- ---------------------------------------------------------------------------
 -- State queries
 -- ---------------------------------------------------------------------------
@@ -343,6 +360,10 @@ cthunkGetAttrs = c_nn_thunk_get_attrs
 cthunkGetCtxStr :: CThunkPtr -> IO (Ptr ())
 cthunkGetCtxStr = c_nn_thunk_get_ctxstr
 
+-- | Read a CLambda pointer from a COMPUTED thunk (val_tag == 9).
+cthunkGetLambda :: CThunkPtr -> IO (Ptr ())
+cthunkGetLambda = c_nn_thunk_get_lambda
+
 -- ---------------------------------------------------------------------------
 -- State transitions
 -- ---------------------------------------------------------------------------
@@ -395,6 +416,10 @@ cthunkSetComputedAttrs = c_nn_thunk_set_computed_attrs
 -- | Set a non-COMPUTED thunk to COMPUTED with a CCtxStr pointer.
 cthunkSetComputedCtxStr :: CThunkPtr -> Ptr () -> IO (Ptr ())
 cthunkSetComputedCtxStr = c_nn_thunk_set_computed_ctxstr
+
+-- | Set a non-COMPUTED thunk to COMPUTED with a CLambda pointer.
+cthunkSetComputedLambda :: CThunkPtr -> Ptr () -> IO (Ptr ())
+cthunkSetComputedLambda = c_nn_thunk_set_computed_lambda
 
 -- ---------------------------------------------------------------------------
 -- Arena diagnostics / cleanup

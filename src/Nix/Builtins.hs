@@ -20,7 +20,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, builtinNames, currentSystemStr, evaluated)
-import Nix.Eval.Types (mkStr, newCEnv)
+import Nix.Eval.Types (clistFromThunks, mkStr, newCEnv, thunkToCPtr)
 import Nix.Store.Path (platformStoreDirText)
 
 -- | The initial environment containing all builtins.
@@ -100,7 +100,7 @@ standardEntries timestamp searchPaths =
       ("storeDir", evaluated (mkStr platformStoreDirText)),
       ("nixVersion", evaluated (mkStr "2.24.0")),
       ("langVersion", evaluated (VInt 6)),
-      ("nixPath", evaluated (VList searchPaths)),
+      ("nixPath", evaluated (VList (clistFromThunks (map thunkToCPtr searchPaths)))),
       ("currentTime", evaluated (VInt timestamp)),
       ("currentSystem", evaluated (mkStr currentSystemStr))
     ]

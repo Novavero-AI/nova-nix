@@ -44,6 +44,7 @@
 #define NN_VALUE_LIST    6   /* payload = nn_list_t* */
 #define NN_VALUE_ATTRS   7   /* payload = nn_attrset_t* */
 #define NN_VALUE_CTXSTR  8   /* payload = nn_ctxstr_t* (string with context) */
+#define NN_VALUE_LAMBDA  9   /* payload = nn_lambda_t* (lambda closure) */
 #define NN_VALUE_PTR     255 /* payload = StablePtr NixValue (complex types) */
 
 /* --- Types --- */
@@ -121,6 +122,7 @@ nn_thunk_t *nn_thunk_new_computed_path(uint32_t symbol);
 nn_thunk_t *nn_thunk_new_computed_list(void *list);
 nn_thunk_t *nn_thunk_new_computed_attrs(void *attrset);
 nn_thunk_t *nn_thunk_new_computed_ctxstr(void *ctxstr);
+nn_thunk_t *nn_thunk_new_computed_lambda(void *lambda);
 
 /* --- State queries --- */
 
@@ -144,6 +146,7 @@ uint32_t nn_thunk_get_path(const nn_thunk_t *thunk);
 void    *nn_thunk_get_list(const nn_thunk_t *thunk);
 void    *nn_thunk_get_attrs(const nn_thunk_t *thunk);
 void    *nn_thunk_get_ctxstr(const nn_thunk_t *thunk);
+void    *nn_thunk_get_lambda(const nn_thunk_t *thunk);
 
 /* --- State transitions --- */
 
@@ -174,6 +177,7 @@ void *nn_thunk_set_computed_path(nn_thunk_t *thunk, uint32_t symbol);
 void *nn_thunk_set_computed_list(nn_thunk_t *thunk, void *list);
 void *nn_thunk_set_computed_attrs(nn_thunk_t *thunk, void *attrset);
 void *nn_thunk_set_computed_ctxstr(nn_thunk_t *thunk, void *ctxstr);
+void *nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda);
 
 /* --- Arena diagnostics / cleanup iteration --- */
 

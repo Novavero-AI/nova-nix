@@ -287,6 +287,19 @@ nn_thunk_new_computed_ctxstr(void *ctxstr)
     return t;
 }
 
+nn_thunk_t *
+nn_thunk_new_computed_lambda(void *lambda)
+{
+    nn_thunk_t *t = arena_alloc(g_arena);
+    if (!t) return NULL;
+    t->state = NN_THUNK_COMPUTED;
+    t->val_tag = NN_VALUE_LAMBDA;
+    t->_pad = 0;
+    t->bc_idx = 0;
+    t->payload = lambda;
+    return t;
+}
+
 /* --- State queries --- */
 
 uint8_t
@@ -353,6 +366,12 @@ nn_thunk_get_attrs(const nn_thunk_t *thunk)
 
 void *
 nn_thunk_get_ctxstr(const nn_thunk_t *thunk)
+{
+    return thunk->payload;
+}
+
+void *
+nn_thunk_get_lambda(const nn_thunk_t *thunk)
 {
     return thunk->payload;
 }
@@ -474,6 +493,17 @@ nn_thunk_set_computed_ctxstr(nn_thunk_t *thunk, void *ctxstr)
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_CTXSTR;
     thunk->payload = ctxstr;
+    return old;
+}
+
+void *
+nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda)
+{
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
+    void *old = thunk->payload;
+    thunk->state = NN_THUNK_COMPUTED;
+    thunk->val_tag = NN_VALUE_LAMBDA;
+    thunk->payload = lambda;
     return old;
 }
 

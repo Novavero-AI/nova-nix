@@ -23,6 +23,7 @@ import Foreign.StablePtr (castPtrToStablePtr, freeStablePtr)
 import Nix.Eval.CBytecode (cbcDestroy, cbcInit)
 import Nix.Eval.CCtxStr (cctxstrFreeAll)
 import Nix.Eval.CEnv (cenvDestroy, cenvInit)
+import Nix.Eval.CLambda (clambdaFreeAll)
 import Nix.Eval.CList (clistFreeAll)
 import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
 import Nix.Eval.Symbol (symbolDestroy, symbolInit)
@@ -71,6 +72,7 @@ arenaDestroy :: IO ()
 arenaDestroy = do
   cleanupStablePtrs
   cctxstrFreeAll
+  clambdaFreeAll
   clistFreeAll
   cattrsetFreeAll
   cbcDestroy
