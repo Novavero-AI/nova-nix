@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Technical Audit + C Data Layer Polish
+
+- **Fix: Nix integer division semantics** — `builtins.div` and `builtins.mod` now use floored division (`div`/`mod`) instead of truncated (`quot`/`rem`). `-7 / 3` correctly returns `-3` (was `-2`). Affects `builtinDiv`, `builtinMod`, and `evalDiv`.
+- **Fix: `inherit (from)` in positional let/rec blocks** — The resolution pass treated `inherit (expr) x y;` as positional, but the bytecode evaluator did not handle `BcInheritFrom` in `allBcPositional`, `bcBindingSlotCount`, `buildBcSlotThunks`, or `buildBcAttrMapFromSlots`. This caused env slot count mismatches and `idx out of bounds` assertions on any nixpkgs expression using `inherit (from)` in a positional let block.
+- **C memory safety audit** — `nn_bytecode.c`: `ensure_op_space`/`ensure_data_space` now return error codes instead of failing silently; overflow guard on capacity doubling. `nn_lambda.c`: `NN_ASSERT` bounds checks on entry accessors prevent null dereference when `formal_count == 0`. `nn_attrset.c`: documented partial-realloc-failure behavior.
+- **Dead code removal** — Removed unused `cattrsetIntersect` Haskell wrapper, `nn_attrset_intersect`, and `nn_attrset_values_ptr` C functions.
+- **New: `nn_assert.h`** — Debug-mode bounds checking macro. Compiles to nothing under `NDEBUG`.
+- **Performance** — Stress test: 6.25 MB max residency, 56.3% GC productivity (down from 69.7 MB / 1.6% pre-C-data-layer).
+- 592 tests, `-Werror` clean, ormolu clean, hlint clean
+
 ## 0.1.8.0 — 2026-03-08
 
 ### Builder Correctness, Windows Store Paths, Hackage Fix

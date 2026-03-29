@@ -1,8 +1,8 @@
 <div align="center">
 <h1>nova-nix</h1>
-<p><strong>Windows-Native Nix — Haskell Logic, C99 Data</strong></p>
-<p>A from-scratch implementation of the Nix package manager — parser, lazy evaluator, content-addressed store, derivation builder, binary substituter — running natively on Windows, macOS, and Linux. No WSL. No Cygwin. No MSYS2.</p>
-<p><a href="#quick-start">Quick Start</a> · <a href="#cli">CLI</a> · <a href="#modules">Modules</a> · <a href="#architecture">Architecture</a> · <a href="#windows-native">Windows Native</a> · <a href="#roadmap">Roadmap</a> · <a href="#build--test">Build & Test</a></p>
+<p><strong>Windows-Native Nix</strong></p>
+<p>A from-scratch Nix implementation in Haskell + C99. Parser, lazy evaluator, content-addressed store, derivation builder, binary substituter. Runs natively on Windows, macOS, and Linux. No WSL. No Cygwin. No MSYS2.</p>
+<p><a href="#try-it">Try It</a> · <a href="#cli">CLI</a> · <a href="#architecture">Architecture</a> · <a href="#performance">Performance</a> · <a href="#modules">Modules</a> · <a href="#roadmap">Roadmap</a></p>
 <p>
 
 [![CI](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml)
@@ -17,20 +17,17 @@
 
 ## What is nova-nix?
 
-A pure Haskell implementation of Nix that treats Windows as a first-class target:
+| Layer | What it does |
+|-------|-------------|
+| **Parser** | Hand-rolled recursive descent. 14 precedence levels, 18 AST constructors, all Nix syntax including `<nixpkgs>`, `${expr}` keys, indented strings. |
+| **Evaluator** | Bytecode-compiled lazy evaluation. Thunk memoization with blackhole detection. Knot-tying for recursive `let`/`rec`. Polymorphic via `MonadEval`. |
+| **108 Builtins** | Arithmetic, strings, lists, attrsets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON, hashing, regex, version parsing, `tryEval`, `deepSeq`, `genericClosure`, string contexts, IO (`import`, `readFile`, `pathExists`, `derivation`, `fetchurl`, `fetchTarball`, `fetchGit`), and more. |
+| **C99 Data Layer** | 9 arena-allocated C modules for interned symbols, sorted attrsets, thunks, envs, lists, bytecode, lambdas. All eval data off the GHC heap. |
+| **Store** | Content-addressed `/nix/store` (or `C:\nix\store`). SQLite metadata, reference scanning, read-only enforcement. |
+| **Builder** | Dependency graph via Kahn's toposort. Binary cache substitution before local builds. Multi-output, reference scanning, store registration. |
+| **Substituter** | HTTP binary cache protocol. Narinfo parsing, Ed25519 verification, NAR download/unpack. Priority-ordered multi-cache. Built on [nova-cache](https://github.com/Novavero-AI/nova-cache). |
 
-- **Parser** — Hand-rolled recursive descent parser for the full Nix expression language. 13 precedence levels, 18 AST constructors, all syntax forms including search paths (`<nixpkgs>`) and dynamic attribute keys (`{ ${expr} = val; }`). Direct `Text` consumption for maximum throughput.
-- **Lazy Evaluator** — Thunk-based evaluation with environment closures, knot-tying for recursive bindings via Haskell laziness. All 18 AST constructors handled: literals, strings with interpolation, attribute sets (recursive and non-recursive), let bindings, lambdas with formal parameters, if/then/else, with, assert, unary/binary operators, function application, list construction, attribute selection, has-attribute checks, and search path resolution.
-- **108 Built-in Functions** — Type checks, arithmetic (`min`, `max`, `mod`), bitwise, strings, lists, attribute sets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON (`toJSON`/`fromJSON`), hashing (SHA-256/SHA-512/SHA-1/MD5), base64 (`encode`/`decode`), version parsing, `replaceStrings`, `tryEval`, `deepSeq`, `genericClosure`, `setFunctionArgs`/`functionArgs`, string context introspection (`hasContext`, `getContext`, `appendContext`), IO builtins (`import`, `readFile`, `pathExists`, `readDir`, `getEnv`, `toPath`, `toFile`, `findFile`, `scopedImport`, `fetchurl`, `fetchTarball`, `fetchGit`), `derivation`, `placeholder`, `storePath`, and more. 16 builtins available at top level without `builtins.` prefix (`toString`, `map`, `throw`, `import`, `derivation`, `abort`, `baseNameOf`, `dirOf`, `isNull`, `removeAttrs`, `placeholder`, `scopedImport`, `fetchTarball`, `fetchGit`, `fetchurl`, `toFile`) — matching the real Nix language spec.
-- **Search Path Resolution** — `<nixpkgs>` desugars to `builtins.findFile builtins.nixPath "nixpkgs"` — matching real Nix semantics. `NIX_PATH` environment variable is parsed at startup, and `--nix-path` CLI flags merge with it. Directory imports (`import ./dir`) resolve to `dir/default.nix` automatically.
-- **Dynamic Attribute Keys** — `{ ${expr} = val; }` fully supported in all contexts: non-recursive attrs, recursive attrs, let bindings, attribute selection, and has-attribute checks. Key resolution is cleanly separated from value thunk construction to preserve knot-tying in recursive bindings.
-- **String Context Tracking** — Every string carries invisible metadata tracking which store paths it references. Context propagates through interpolation, concatenation, `replaceStrings`, and all string operations. The `derivation` builtin collects contexts into `drvInputDrvs` and `drvInputSrcs` — matching real Nix semantics.
-- **Content-Addressed Store** — `/nix/store` on Unix, `C:\nix\store` on Windows, with real SQLite metadata tracking (ValidPaths + Refs tables, WAL mode)
-- **Derivation Builder** — Full build loop with recursive dependency resolution: topological sort via Kahn's algorithm, binary cache substitution before local builds, input validation, reference scanning, output registration
-- **Binary Substituter** — HTTP binary cache protocol: narinfo fetch + parse, Ed25519 signature verification, NAR download/decompress/unpack, store registration. Priority-ordered multi-cache support. Built on [nova-cache](https://github.com/Novavero-AI/nova-cache).
-- **ATerm Serialization** — Full round-trip `.drv` serialization and parsing with string escape handling
-
-Every module is pure by default. IO lives at the boundaries only.
+Every module is pure by default. IO at the boundaries only.
 
 ---
 
@@ -42,33 +39,22 @@ cd nova-nix
 cabal run nova-nix -- --strict eval test.nix
 ```
 
-Output:
-
 ```
 { count = 6; greeting = "Hello, nova-nix!"; items = [ 2 4 6 8 10 ]; nested = { a = 1; b = 2; c = 4; }; types = { attrs = "set"; int = "int"; list = "list"; string = "string"; }; }
 ```
 
-That's a Nix expression with `let` bindings, `rec` attrs, lambdas, `builtins.map`, `builtins.typeOf`, and arithmetic — parsed, lazily evaluated, and pretty-printed. On Windows, macOS, or Linux.
+That's `let` bindings, `rec` attrs, lambdas, `builtins.map`, `builtins.typeOf`, and arithmetic — parsed, lazily evaluated, and printed. On Windows, macOS, or Linux.
 
 ---
 
 ## CLI
 
 ```bash
-nova-nix eval FILE.nix                        # Evaluate a .nix file, print result
+nova-nix eval FILE.nix                        # Evaluate a .nix file
 nova-nix eval --expr 'EXPR'                   # Evaluate an inline expression
-nova-nix build FILE.nix                       # Build a derivation from a .nix file
+nova-nix build FILE.nix                       # Build a derivation
 nova-nix --nix-path nixpkgs=/path eval FILE   # Add search paths (repeatable)
 ```
-
-### Evaluate
-
-```bash
-$ nova-nix --strict eval test.nix
-{ count = 6; greeting = "Hello, nova-nix!"; items = [ 2 4 6 8 10 ]; nested = { a = 1; b = 2; c = 4; }; types = { attrs = "set"; int = "int"; list = "list"; string = "string"; }; }
-```
-
-Inline expressions:
 
 ```bash
 $ nova-nix eval --expr '1 + 2'
@@ -77,215 +63,75 @@ $ nova-nix eval --expr '1 + 2'
 $ nova-nix eval --expr 'builtins.map (x: x * x) [1 2 3 4 5]'
 [ 1 4 9 16 25 ]
 
-$ nova-nix eval --expr '{ x = 1; y = 2; }.x + { x = 1; y = 2; }.y'
-3
+$ NIX_PATH=nixpkgs=/path/to/nixpkgs nova-nix eval --expr '(import <nixpkgs/lib>).trivial.version'
+"24.11pre-git"
 ```
 
-Search paths:
-
 ```bash
-$ nova-nix --nix-path nixpkgs=/path/to/nixpkgs eval --expr 'import <nixpkgs> {}'
-
-$ NIX_PATH=nixpkgs=/path/to/nixpkgs nova-nix eval --expr 'import <nixpkgs> {}'
-```
-
-### Build
-
-```bash
-$ cat > hello.nix <<'EOF'
-derivation {
-  name = "hello";
-  system = builtins.currentSystem;
-  builder = "/bin/sh";
-  args = [ "-c" "mkdir -p $out && echo 'Hello from nova-nix!' > $out/greeting.txt" ];
-}
-EOF
-
 $ nova-nix build hello.nix
 /nix/store/abc...-hello
 ```
 
-The `build` command evaluates the `.nix` file, extracts the derivation, builds the full dependency graph, topologically sorts it, checks binary caches for substitutes, builds anything missing locally, and registers all outputs in the store DB.
-
----
-
-## Quick Start
-
-Add to your `.cabal` file:
-
-```cabal
-build-depends: nova-nix
-```
-
-### Parse a Nix Expression
-
-```haskell
-import Nix.Parser (parseNix)
-import Nix.Expr.Types
-
-main :: IO ()
-main = do
-  case parseNix "<stdin>" "let x = 1 + 2; in x" of
-    Left err   -> print err
-    Right expr -> print expr
-    -- ELet [NamedBinding [StaticKey "x"]
-    --        (EBinary OpAdd (ELit (NixInt 1)) (ELit (NixInt 2)))]
-    --      (EVar "x")
-```
-
-### Evaluate an Expression
-
-```haskell
-import Nix.Parser (parseNix)
-import Nix.Eval (eval, PureEval(..), NixValue(..))
-import Nix.Builtins (builtinEnv)
-
-main :: IO ()
-main = do
-  case parseNix "<stdin>" "let x = 5; y = x * 2; in y + 1" of
-    Left err -> print err
-    Right expr -> case runPureEval (eval (builtinEnv 0 []) expr) of
-      Left err  -> putStrLn ("Error: " ++ show err)
-      Right val -> print val  -- VInt 11
-```
-
-The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, while `EvalIO` can access the filesystem for `import`, `readFile`, etc.
-
-### Lazy Evaluation in Action
-
-```haskell
--- Nix is lazy: unused bindings are never evaluated
--- runPureEval (eval (builtinEnv 0 []) expr) where expr parses:
---   "let unused = builtins.throw \"boom\"; x = 42; in x"
--- Right (VInt 42)  —  "boom" is never triggered
-
--- Recursive attribute sets with self-reference
---   "rec { a = 1; b = a + 1; c = b * 2; }.c"
--- Right (VInt 4)
-
--- Lambda closures, set patterns with defaults
---   "({ name, greeting ? \"Hello\" }: \"${greeting}, ${name}!\") { name = \"Nix\"; }"
--- Right (VStr "Hello, Nix!")
-```
-
----
-
-## Modules
-
-### Parser
-
-| Module | Purpose |
-|--------|---------|
-| `Nix.Expr` | Re-exports from `Nix.Expr.Types` |
-| `Nix.Expr.Types` | Complete Nix AST — 18 expression constructors (including `ESearchPath`, `EResolvedVar`), atoms, formals, operators, string parts |
-| `Nix.Expr.Resolve` | De Bruijn-style variable resolution pass — replaces `EVar` with `EResolvedVar` for lambda-bound variables at parse time |
-| `Nix.Expr.ClosureTrim` | Closure trimming — statically determines free variables per lambda/with to minimize captured environment size |
-| `Nix.Parser` | Hand-rolled recursive descent parser + lexer. Direct `Text` consumption, source position tracking |
-| `Nix.Parser.Lexer` | Tokenizer — integers, floats, strings with interpolation, paths, URIs, search paths, all operators/keywords |
-| `Nix.Parser.Expr` | Expression parser — 13 precedence levels, left/right/non-associative operators, application, selection, dynamic keys |
-| `Nix.Parser.Internal` | Parser state and combinator internals |
-| `Nix.Parser.ParseError` | Structured parse errors with source positions |
-
-### Evaluator
-
-| Module | Purpose |
-|--------|---------|
-| `Nix.Eval` | Lazy evaluator — all 18 AST constructors, thunk forcing, env operations, 108-builtin dispatch, `__functor` callable sets, search path resolution, dynamic attribute keys. Polymorphic via `MonadEval` |
-| `Nix.Eval.Types` | Shared types — `NixValue` (12 constructors), `Thunk` (C arena-allocated memoization cell), `Env` (C-native `nn_env_t` struct — 40 bytes, arena-allocated), `AttrSet` (C-backed sorted arrays), `StringContext` (store path tracking), `MonadEval` typeclass, `PureEval` runner |
-| `Nix.Eval.Operator` | Binary/unary operators — arithmetic with float promotion, deep structural equality, division-by-zero checks |
-| `Nix.Eval.StringInterp` | String interpolation — value coercion with context propagation, indented string whitespace stripping |
-| `Nix.Eval.Context` | String context construction, queries, extraction — pure helpers for building and inspecting store path references |
-| `Nix.Eval.IO` | IO evaluation monad — real filesystem access, import cache (with directory import), process execution, store writes, NIX_PATH parsing, per-thunk C arena memoization with blackhole detection |
-| `Nix.Builtins` | Built-in function environment — 108 builtins, search path plumbing (`parseNixPath`), top-level builtin exposure |
-
-### C99 Data Layer
-
-| Module | Purpose |
-|--------|---------|
-| `Nix.Eval.Symbol` | Interned string symbols via `nn_symbol` — FNV-1a hash table, O(1) string comparison |
-| `Nix.Eval.CAttrSet` | C-backed sorted attribute arrays via `nn_attrset` — O(log n) binary search, merge-join operations |
-| `Nix.Eval.CThunk` | Arena-allocated 16-byte thunk cells via `nn_thunk` — 9 value tags for inline scalars and C-native types, blackhole detection |
-| `Nix.Eval.CEnv` | C-native environments via `nn_env` — 48-byte arena-allocated `nn_env_t` structs with slots, lazy scope, parent chain, with-scopes. Single-call resolved variable lookup |
-| `Nix.Eval.CList` | Contiguous thunk pointer arrays via `nn_list` — replaces Haskell cons cells |
-| `Nix.Eval.CCtxStr` | Context-bearing strings via `nn_ctxstr` — interned StorePath fields, flexible array of context entries |
-| `Nix.Eval.CBytecode` | Flat instruction array via `nn_bytecode` — 24 opcodes, 16-byte `nn_op_t` + data buffer, read accessors |
-| `Nix.Eval.CLambda` | Lambda closure structs via `nn_lambda` — env ptr, body bc_idx, formals (type/entries/ellipsis) |
-| `Nix.Eval.Arena` | Unified arena lifecycle — batch StablePtr collection, coordinated init/destroy of all C sub-arenas |
-
-### Store + Builder
-
-| Module | Purpose |
-|--------|---------|
-| `Nix.Derivation` | Derivation type, ATerm serialization + parsing (`toATerm`/`fromATerm`), platform detection |
-| `Nix.Hash` | Derivation hashing, store path computation, shared hex/base-32 utilities |
-| `Nix.Store.Path` | Store path types — `StoreDir`, `StorePath`, `parseStorePath`, Windows/Unix support |
-| `Nix.Store.DB` | SQLite store database — `ValidPaths` + `Refs` tables, WAL mode, path registration, reference/deriver queries |
-| `Nix.Store` | High-level store operations — `addToStore`, `scanReferences`, `setReadOnly`, `writeDrv` |
-| `Nix.Builder` | Derivation builder — dependency graph construction, topological sort, binary cache substitution, local build with output registration |
-| `Nix.DependencyGraph` | Dependency graph construction (BFS with `Seq` queue) and topological sort (Kahn's algorithm, O(V+E)), cycle detection |
-| `Nix.Substituter` | Binary cache substituter — HTTP narinfo fetch, signature verification, NAR download/decompress/unpack, store registration. Multi-cache with priority ordering |
+The `build` command evaluates, extracts the derivation, builds the dependency graph, checks binary caches, builds locally, and registers outputs.
 
 ---
 
 ## Architecture
 
 ```
-                     Pure Core (no IO)
-  +-------------------------------------------------+
-  |                                                 |
-  |  Parser --> Expr.Types --> Eval --> Builtins     |
-  |                 |           |                    |
-  |          Expr.Resolve    Eval.Types              |
-  |          Parser.Lexer    Eval.Operator           |
-  |          Parser.Expr     Eval.StringInterp       |
-  |          Parser.Internal Eval.Context            |
-  |          ParseError                              |
-  |                             |                    |
-  |                        Derivation --> Hash        |
-  |                             |                    |
-  |                    Store.Path  DependencyGraph    |
-  |                                                 |
-  +-------------------------------------------------+
-                        |
-               IO Boundary (thin)
-  +-------------------------------------------------+
-  |  Eval.IO   Store.DB   Store   Builder   Substituter|
-  +-------------------------------------------------+
-                        |
-            C99 Data Layer (off GHC heap)
-  +-------------------------------------------------+
-  |  nn_symbol  nn_attrset  nn_thunk  nn_env        |
-  |  nn_list    nn_ctxstr   nn_arena  nn_bytecode   |
-  |  nn_lambda                                      |
-  +-------------------------------------------------+
+                    Pure Core (no IO)
+  +------------------------------------------------+
+  |                                                |
+  |  Parser --> Expr.Types --> Eval --> Builtins    |
+  |                 |           |                   |
+  |          Expr.Resolve    Eval.Types             |
+  |          Expr.ClosureTrim Eval.Operator         |
+  |          Parser.Lexer    Eval.Compile           |
+  |          Parser.Expr     Eval.StringInterp      |
+  |                             |                   |
+  |                        Derivation --> Hash       |
+  |                             |                   |
+  |                    Store.Path  DependencyGraph   |
+  |                                                |
+  +------------------------------------------------+
+                       |
+              IO Boundary (thin)
+  +------------------------------------------------+
+  |  Eval.IO  Store.DB  Store  Builder  Substituter |
+  +------------------------------------------------+
+                       |
+           C99 Data Layer (off GHC heap)
+  +------------------------------------------------+
+  |  nn_symbol  nn_attrset  nn_thunk  nn_env       |
+  |  nn_list    nn_ctxstr   nn_bytecode nn_lambda  |
+  |  nn_arena                                      |
+  +------------------------------------------------+
 ```
 
-**Evaluator design:**
+**Key design decisions:**
 
-- **MonadEval typeclass** — The evaluator is `eval :: (MonadEval m) => Env -> Expr -> m NixValue`, polymorphic in its effect monad. `PureEval` (newtype over `Either Text`) runs all pure tests with no IO. `EvalIO` provides `readFileText`, `doesPathExist`, `listDirectory`, `getEnvVar`, `getCurrentTime`, `writeToStore`, `scopedImportFile`, `runProcess` for IO builtins.
-- **Thunk-based lazy evaluation with memoization** — List elements and attribute set values are stored as unevaluated thunks. Only forced when a value is demanded. `(x: 1) (throw "boom")` returns `1` because `x` is never referenced. Thunks are 16-byte arena-allocated C cells with blackhole detection for infinite recursion. Inline scalar values (int, float, bool, null) are stored directly in the thunk payload with no Haskell heap allocation. Strings, paths, lists, and attribute sets use C-native storage (interned symbols, sorted arrays, contiguous pointer arrays).
-- **C99 data layer** — All bulk evaluation data lives in C arena-allocated structures invisible to the GHC garbage collector. Interned symbols replace string comparison with integer equality. Sorted C arrays replace Haskell `Data.Map`. Arena bump allocators replace per-object malloc. Evaluation environments are 40-byte C structs with single-call resolved variable lookup. The result: 91% less memory residency compared to the pure Haskell baseline (69.7 MB → 6.25 MB), GC productivity from 1.6% to 56%.
-- **Knot-tying via Haskell laziness** — Recursive `let` and `rec { }` create self-referential environments. Thunks capture environments lazily so they can reference not-yet-filled slot arrays. Two-phase construction (allocate slots, create env, fill slots) ties the knot safely. Dynamic attribute keys are resolved monadically *before* knot-tying — the two-phase design (`resolveBindingKeys` then `buildResolvedBindingsMap`) cleanly separates key evaluation from value thunk construction.
-- **Search path desugaring** — `<nixpkgs>` is its own AST constructor (`ESearchPath`), desugared at eval time to `builtins.findFile builtins.nixPath "nixpkgs"` — exactly how real Nix handles it. `builtins.nixPath` is populated from `NIX_PATH` and `--nix-path` flags.
-- **With-scope chain** — `Env` has lexical bindings (always win) plus a stack of with-scopes walked innermost-first. `let a = 1; in with { a = 2; }; a` correctly returns `1` because lexical scope takes priority.
-- **Short-circuit operators** — `&&`, `||`, and `->` are handled directly in eval (not delegated to Operator) because they must not evaluate both operands.
-- **String context propagation** — Every `VStr` carries a `StringContext` tracking store path references (`SCPlain`, `SCDrvOutput`, `SCAllOutputs`). Context merges through interpolation, concatenation, and string builtins. The `derivation` builtin collects all context into `drvInputDrvs`/`drvInputSrcs`.
+- **Haskell owns eval logic, C99 owns data layout.** The evaluator stays in Haskell. Data structures (attr sets, thunks, envs, values) live in C. Haskell calls C to create, query, and mutate data. C never calls back into Haskell.
+- **Bytecode-compiled evaluation.** The 18-constructor Expr AST compiles to a flat 24-opcode bytecode array. The bytecode evaluator (`evalBytecode`) is the sole dispatch path. The AST is GC'd after compilation.
+- **MonadEval typeclass.** `PureEval` (newtype over `Either Text`) for deterministic testing. `EvalIO` for real filesystem access. Same `eval` function, different effects.
+- **Arena allocation.** Thunks, attr sets, envs, and lambdas are arena-allocated in C. Bulk free at eval end, zero per-object GC overhead. The GHC heap holds only control flow and `StablePtr` handles.
+- **Knot-tying via Haskell laziness.** Recursive `let` and `rec {}` use two-phase construction: allocate slots, create env, fill slots. Thunks capture environments lazily via `StablePtr` so they can reference not-yet-filled arrays.
+- **String context propagation.** Every `VStr` carries a `StringContext` tracking store path references. The `derivation` builtin collects all context into `drvInputDrvs`/`drvInputSrcs`.
 
-**Build pipeline:**
+---
 
-1. Evaluate `.nix` file to extract derivation
-2. Build dependency graph by reading `.drv` files from the store (BFS traversal)
-3. Topologically sort via Kahn's algorithm — leaves first, cycle detection
-4. For each dependency in build order: check store cache, try binary substitution, build locally
-5. Build execution: validate inputs, set up environment, run builder process, scan references, register outputs in SQLite DB
+## Performance
 
-**Key numbers:**
+The C99 data layer moves all evaluation data off the GHC heap:
 
-- **33 modules** (24 Haskell + 9 C) — all implemented
-- **592 tests** — hand-rolled harness, no framework dependencies
-- **9 C modules** — ~2,500 lines of C99, `-Wall -Wextra -pedantic -Werror` clean
-- **Zero partial functions** — total by construction, `T.uncons` over `T.head`/`T.tail`
-- **Strict by default** — bang patterns on all data fields (thunk/env knot-tying handled via C arena two-phase construction)
+| Metric | Pure Haskell | After C Data Layer | Change |
+|--------|-------------|-------------------|--------|
+| Max residency | 69.7 MB | 6.25 MB | **-91%** |
+| GC productivity | 1.6% | 56.3% | **+35x** |
+| Total memory | ~200 MB | 26 MB | **-87%** |
+
+Measured on a stress test with 100k attribute sets, recursive computations, list operations, and overlay patterns.
+
+**nixpkgs status:** `import <nixpkgs/lib>` evaluates correctly. `lib.fix`, `lib.extends`, `lib.makeExtensible`, and `lib.evalModules` all work. Full `import <nixpkgs> {}` evaluation is in progress.
 
 ---
 
@@ -301,35 +147,87 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 | Case-insensitive FS | Content-addressed hashes make collisions impossible |
 | 260-char path limit | `\\?\` extended-length prefix (32K chars) |
 | No bash | Ship `bash.exe` from MSYS2 (same as Git for Windows) |
-| No sandbox primitives | Unsandboxed initially; future: Win32 Job Objects + App Containers |
 | stdenv bootstrap | Cross-compile from Linux, or bootstrap from MSYS2 MinGW toolchain |
-| Cross-device moves | Recursive copy + remove fallback for `renameDirectory` |
+
+---
+
+## Modules
+
+### Parser
+
+| Module | Purpose |
+|--------|---------|
+| `Nix.Expr.Types` | Complete Nix AST — 18 expression constructors, atoms, formals, operators, string parts |
+| `Nix.Expr.Resolve` | De Bruijn-style variable resolution — replaces `EVar` with `EResolvedVar` at parse time |
+| `Nix.Expr.ClosureTrim` | Closure trimming — determines free variables per lambda/with to minimize captured env size |
+| `Nix.Parser` | Hand-rolled recursive descent parser + lexer, source position tracking |
+| `Nix.Parser.Lexer` | Tokenizer — integers, floats, strings with interpolation, paths, URIs, search paths, operators/keywords |
+| `Nix.Parser.Expr` | Expression parser — 14 precedence levels, left/right/non-associative operators |
+
+### Evaluator
+
+| Module | Purpose |
+|--------|---------|
+| `Nix.Eval` | Bytecode evaluator — 24-opcode dispatch, thunk forcing, env operations, 108-builtin dispatch. Polymorphic via `MonadEval` |
+| `Nix.Eval.Types` | `NixValue` (12 constructors), `Thunk` (C arena cell), `Env` (C-native struct), `AttrSet` (C sorted arrays), `MonadEval` typeclass |
+| `Nix.Eval.Compile` | Bytecode compiler — Expr AST to flat `nn_bytecode` instruction array |
+| `Nix.Eval.Operator` | Arithmetic with float promotion, deep structural equality, floored division |
+| `Nix.Eval.IO` | IO evaluation monad — filesystem access, import cache, process execution, per-thunk memoization with blackhole detection |
+| `Nix.Builtins` | 108 builtins, search path plumbing, top-level builtin exposure |
+
+### C99 Data Layer
+
+| Module | Purpose |
+|--------|---------|
+| `nn_symbol` | FNV-1a hash table for string interning — O(1) comparison |
+| `nn_attrset` | Sorted arrays with binary search — O(log n) lookup, merge-join union |
+| `nn_thunk` | 16-byte arena cells — 10 value tags for inline scalars and C-native types, blackhole detection |
+| `nn_env` | 40-byte arena structs — slots, lazy scope, parent chain, with-scopes, resolved variable lookup |
+| `nn_list` | Contiguous thunk pointer arrays |
+| `nn_ctxstr` | Context-bearing strings with interned StorePath fields |
+| `nn_bytecode` | Flat instruction array — 24 opcodes, 16-byte `nn_op_t` + data buffer |
+| `nn_lambda` | Lambda closures — env ptr, body bytecode index, formals |
+| `nn_arena` | Unified lifecycle — batch StablePtr cleanup, coordinated init/destroy |
+
+### Store + Builder
+
+| Module | Purpose |
+|--------|---------|
+| `Nix.Derivation` | Derivation type, ATerm serialization + parsing, platform detection |
+| `Nix.Store.Path` | Store path types — `StoreDir`, `StorePath`, Windows/Unix support |
+| `Nix.Store.DB` | SQLite store database — WAL mode, path registration, reference queries |
+| `Nix.Store` | `addToStore`, `scanReferences`, `setReadOnly`, `writeDrv` |
+| `Nix.Builder` | Dependency graph, topological sort, binary cache substitution, local build |
+| `Nix.DependencyGraph` | BFS graph construction, Kahn's toposort, cycle detection |
+| `Nix.Substituter` | HTTP binary cache — narinfo, Ed25519 verification, NAR download/unpack |
 
 ---
 
 ## Roadmap
 
-### C99 Data Layer ([#4](https://github.com/Novavero-AI/nova-nix/issues/4)) — Active
+### Done
 
-Moving all evaluation data from the GHC heap to C99 arena-allocated structures. Haskell owns eval logic, C owns data layout. Target: 80%+ GC productivity, ~5 GB RSS for full nixpkgs eval.
-
-- [x] **M1: Value tags** — Inline scalars (int/float/bool/null) + C-native strings, paths, lists, attrs in thunk payloads. 68% less memory, 63% higher GC productivity.
-- [x] **M3: Context strings + blackhole** — Strings with store path context stored as C structs. Per-thunk blackhole detection for infinite recursion.
-- [x] **M5: Full Env in C** — `newtype Env = Env (Ptr NnEnv)` — 48-byte arena-allocated C struct replaces Haskell record. Single-call resolved variable lookup. 22% further residency reduction.
-- [x] **M6: Expr bytecode** — Compile 19-constructor AST to flat C bytecode array (24 opcodes). Bytecode evaluator is the sole dispatch path.
-- [x] **M4+M2: VLambda + VList in C** — Lambda closures and lists as C structs. All 10 value tags stored natively in C.
+- [x] Full Nix parser (14 precedence levels, all syntax forms)
+- [x] Lazy bytecode evaluator (24 opcodes, thunk memoization, blackhole detection)
+- [x] 108 builtins (matching real Nix spec)
+- [x] C99 data layer (9 modules, all eval data off GHC heap)
+- [x] Content-addressed store with SQLite metadata
+- [x] Derivation builder with dependency resolution
+- [x] Binary cache substituter with Ed25519 verification
+- [x] String context tracking and propagation
+- [x] nixpkgs lib layer evaluation (`lib.fix`, `lib.extends`, `lib.evalModules`)
 
 ### Next
 
-- [ ] **Full `import <nixpkgs> {}` performance** — nixpkgs lib layer evaluates correctly; C data layer enabling viable memory for the full 80,000+ package set
-- [ ] **`nova-nix shell`** — Enter a development shell (like `nix shell`)
-- [ ] **`nova-nix repl`** — Interactive evaluator
+- [ ] Full `import <nixpkgs> {}` — NixOS module system fixpoint compatibility
+- [ ] `nova-nix shell` — enter a development shell
+- [ ] `nova-nix repl` — interactive evaluator
 
 ### Long-Term
 
-- [ ] **Nix daemon protocol compatibility**
-- [ ] **XZ decompression** — Enable nova-cache compression flag for real binary cache downloads
-- [ ] **Store bootstrap** — Ship prebuilt bash + coreutils for Windows builds
+- [ ] Nix daemon protocol compatibility
+- [ ] XZ decompression for binary cache downloads
+- [ ] Store bootstrap — ship prebuilt bash + coreutils for Windows builds
 
 ---
 
@@ -339,10 +237,29 @@ Moving all evaluation data from the GHC heap to C99 arena-allocated structures. 
 cabal build                              # Build library + CLI
 cabal test                               # Run all 592 tests
 cabal build --ghc-options="-Werror"      # Warnings as errors (CI default)
-cabal haddock                            # Generate API docs
 ```
 
-Requires GHC 9.8 and cabal-install 3.10+.
+Requires GHC 9.8+ and cabal-install 3.10+.
+
+---
+
+## Library Usage
+
+```haskell
+import Nix.Parser (parseNix)
+import Nix.Eval (eval, NixValue(..))
+import Nix.Builtins (builtinEnv)
+
+main :: IO ()
+main = do
+  case parseNix "<stdin>" "let x = 5; y = x * 2; in y + 1" of
+    Left err -> print err
+    Right expr -> case runPureEval (eval (builtinEnv 0 []) expr) of
+      Left err  -> putStrLn ("Error: " ++ show err)
+      Right val -> print val  -- VInt 11
+```
+
+The evaluator is polymorphic via `MonadEval` — `PureEval` for pure tests, `EvalIO` for filesystem access.
 
 ---
 
