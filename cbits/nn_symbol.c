@@ -13,6 +13,7 @@
 #include "nn_symbol.h"
 #include "nn_assert.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -80,7 +81,10 @@ static void arena_ensure(size_t needed)
         new_cap *= 2;
     }
     char *new_arena = (char *)realloc(g_sym.arena, new_cap);
-    if (!new_arena) return;
+    if (!new_arena) {
+        fprintf(stderr, "nn_symbol: arena realloc failed (requested %zu bytes)\n", new_cap);
+        abort();
+    }
     g_sym.arena = new_arena;
     g_sym.arena_cap = new_cap;
 }
@@ -107,7 +111,10 @@ static void entries_ensure(void)
     uint32_t new_cap = g_sym.entries_cap * 2;
     nn_symbol_entry_t *new_entries = (nn_symbol_entry_t *)realloc(
         g_sym.entries, (size_t)new_cap * sizeof(nn_symbol_entry_t));
-    if (!new_entries) return;
+    if (!new_entries) {
+        fprintf(stderr, "nn_symbol: entries realloc failed\n");
+        abort();
+    }
     g_sym.entries = new_entries;
     g_sym.entries_cap = new_cap;
 }
@@ -120,7 +127,10 @@ static void slots_grow(void)
     uint32_t new_cap = g_sym.slots_cap * 2;
     uint32_t new_mask = new_cap - 1;
     nn_slot_t *new_slots = (nn_slot_t *)calloc((size_t)new_cap, sizeof(nn_slot_t));
-    if (!new_slots) return;
+    if (!new_slots) {
+        fprintf(stderr, "nn_symbol: slots calloc failed\n");
+        abort();
+    }
 
     uint32_t i;
     for (i = 0; i < g_sym.slots_cap; i++) {
@@ -155,6 +165,7 @@ void nn_symbol_init(uint32_t initial_capacity)
     g_sym.entries_cap = cap;
     g_sym.entries = (nn_symbol_entry_t *)calloc(
         (size_t)cap, sizeof(nn_symbol_entry_t));
+    if (!g_sym.entries) { fprintf(stderr, "nn_symbol_init: entries alloc failed\n"); abort(); }
     g_sym.count = 0;
 
     /* Hash table at 2x entries for low load factor. */
@@ -162,10 +173,12 @@ void nn_symbol_init(uint32_t initial_capacity)
     g_sym.slots_mask = g_sym.slots_cap - 1;
     g_sym.slots = (nn_slot_t *)calloc(
         (size_t)g_sym.slots_cap, sizeof(nn_slot_t));
+    if (!g_sym.slots) { fprintf(stderr, "nn_symbol_init: slots alloc failed\n"); abort(); }
 
     /* String arena. */
     g_sym.arena_cap = NN_SYMBOL_ARENA_INITIAL;
     g_sym.arena = (char *)malloc(g_sym.arena_cap);
+    if (!g_sym.arena) { fprintf(stderr, "nn_symbol_init: arena alloc failed\n"); abort(); }
     g_sym.arena_used = 0;
 }
 
@@ -212,7 +225,7 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
     g_sym.slots[idx].id = new_id;
 
     /* Grow hash table if load exceeds threshold. */
-    if (g_sym.count * 100 >= g_sym.slots_cap * NN_SYMBOL_LOAD_PERCENT) {
+    if ((uint64_t)g_sym.count * 100 >= (uint64_t)g_sym.slots_cap * NN_SYMBOL_LOAD_PERCENT) {
         slots_grow();
     }
 

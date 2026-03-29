@@ -11,6 +11,7 @@
 #include "nn_env.h"
 #include "nn_assert.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -94,6 +95,7 @@ nn_env_init(void)
     }
 
     g_first_page = alloc_page(NN_ENV_PAGE_SIZE);
+    if (!g_first_page) { fprintf(stderr, "nn_env_init: page alloc failed\n"); abort(); }
     g_current_page = g_first_page;
     g_total_bytes = 0;
 

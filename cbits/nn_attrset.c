@@ -17,6 +17,7 @@
 #include "nn_attrset.h"
 #include "nn_assert.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -308,6 +309,7 @@ nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b)
     /* Merge-join: all keys from both, b wins on conflict. */
     uint32_t cap = a->count + b->count;
     nn_attrset_t *result = nn_attrset_new(cap);
+    if (!result) { fprintf(stderr, "nn_attrset_union: alloc failed\n"); abort(); }
     uint32_t ia = 0, ib = 0;
 
     while (ia < a->count && ib < b->count) {
@@ -343,6 +345,7 @@ nn_attrset_t *nn_attrset_remove_keys(
     uint32_t key_count)
 {
     nn_attrset_t *result = nn_attrset_new(set->count);
+    if (!result) { fprintf(stderr, "nn_attrset_remove_keys: alloc failed\n"); abort(); }
     uint32_t i;
 
     for (i = 0; i < set->count; i++) {

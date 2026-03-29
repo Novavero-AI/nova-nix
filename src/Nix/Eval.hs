@@ -1337,7 +1337,7 @@ builtinThrow (VStr msg _) = throwEvalError msg
 builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <> typeName other)
 
 builtinAbort :: (MonadEval m) => NixValue -> m NixValue
-builtinAbort (VStr msg _) = abortEvaluation ("evaluation aborted with the following error message: '" <> msg <> "'")
+builtinAbort (VStr msg _) = abortEvaluation msg
 builtinAbort other = abortEvaluation ("builtins.abort: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
@@ -1362,7 +1362,9 @@ builtinListToAttrs :: (MonadEval m) => NixValue -> m NixValue
 builtinListToAttrs (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   pairs <- mapM listToAttrsPair thunks
-  pure (VAttrs (attrSetFromMap (Map.fromList pairs)))
+  -- Nix listToAttrs uses first-wins: if duplicate name, first element wins.
+  let firstWins = Map.fromListWith (\_ kept -> kept) pairs
+  pure (VAttrs (attrSetFromMap firstWins))
 builtinListToAttrs other =
   throwEvalError ("builtins.listToAttrs: expected a list, got " <> typeName other)
 
@@ -1691,9 +1693,8 @@ builtinConcatStringsSep (VStr sep sepCtx) (VList cl) = do
   where
     forceToStrCtx thunk = do
       val <- force thunk
-      case val of
-        VStr s ctx -> pure (s, ctx)
-        _ -> throwEvalError "builtins.concatStringsSep: list elements must be strings"
+      -- Nix coerces list elements to strings (paths, derivations, etc.)
+      coerceToString force applyValue val
 builtinConcatStringsSep (VStr _ _) other =
   throwEvalError ("builtins.concatStringsSep: expected a list, got " <> typeName other)
 builtinConcatStringsSep other _ =
@@ -2145,8 +2146,10 @@ builtinReplaceStrings (VList fromCl) (VList toCl) (VStr input inputCtx) = do
     throwEvalError "builtins.replaceStrings: 'from' and 'to' must have the same length"
   let fromTexts = map fst froms
       toTexts = map fst toStrs
-      -- Merge contexts: input context + all 'to' string contexts + all 'from' string contexts
-      mergedCtx = inputCtx <> mconcat (map snd froms) <> mconcat (map snd toStrs)
+      -- Nix semantics: input context + 'to' string contexts (not 'from').
+      -- Ideally only 'to' contexts for patterns that matched, but including
+      -- all 'to' contexts is the common implementation.
+      mergedCtx = inputCtx <> mconcat (map snd toStrs)
       pairs = zip fromTexts toTexts
   pure (VStr (replaceAll pairs input) mergedCtx)
   where
@@ -2324,11 +2327,18 @@ compareComponent :: Text -> Text -> Int64
 compareComponent a b
   | a == b = 0
   | allDigits a && allDigits b = compare' (readInt a) (readInt b)
+  -- "pre" sorts before everything else (Nix pre-release convention)
+  | a == "pre" = -1
+  | b == "pre" = 1
   | a == "" = -1
   | b == "" = 1
+  -- Alphabetic components sort before numeric in Nix
+  | isAlphaComp a && allDigits b = -1
+  | allDigits a && isAlphaComp b = 1
   | otherwise = if a < b then -1 else 1
   where
     allDigits t = not (T.null t) && T.all isDigit t
+    isAlphaComp t = not (T.null t) && isAlpha (T.head t)
     readInt :: Text -> Int64
     readInt = T.foldl' (\acc c -> acc * 10 + fromIntegral (digitToInt c)) (0 :: Int64)
     compare' x y
@@ -2371,9 +2381,13 @@ splitVersionComponents t = case T.uncons t of
     | isDigit c ->
         let (digits, rest) = T.span isDigit t
          in digits : splitVersionComponents rest
-    | otherwise ->
+    | isAlpha c ->
         let (alpha, rest) = T.span isAlpha t
          in alpha : splitVersionComponents rest
+    | otherwise ->
+        -- Non-alphanumeric separator (e.g. '-', '_'): consume as single char
+        let (_, rest) = T.splitAt 1 t
+         in splitVersionComponents rest
 
 builtinParseDrvName :: (MonadEval m) => NixValue -> m NixValue
 builtinParseDrvName (VStr s _) =
@@ -2410,37 +2424,43 @@ findVersionDash t idx = case T.uncons (T.drop idx t) of
 -- ---------------------------------------------------------------------------
 
 builtinToJSON :: (MonadEval m) => NixValue -> m NixValue
-builtinToJSON val = mkStr <$> valueToJSON val
+builtinToJSON val = do
+  (json, ctx) <- valueToJSON val
+  pure (VStr json ctx)
 
-valueToJSON :: (MonadEval m) => NixValue -> m Text
-valueToJSON VNull = pure "null"
-valueToJSON (VBool True) = pure "true"
-valueToJSON (VBool False) = pure "false"
-valueToJSON (VInt n) = pure (T.pack (show n))
+valueToJSON :: (MonadEval m) => NixValue -> m (Text, StringContext)
+valueToJSON VNull = pure ("null", emptyContext)
+valueToJSON (VBool True) = pure ("true", emptyContext)
+valueToJSON (VBool False) = pure ("false", emptyContext)
+valueToJSON (VInt n) = pure (T.pack (show n), emptyContext)
 valueToJSON (VFloat f) =
   let s = show f
    in -- Nix outputs 1e+40 style, Haskell outputs 1.0e40 style
       -- For simple cases just use show
-      pure (T.pack s)
-valueToJSON (VStr s _) = pure (jsonEscapeString s)
+      pure (T.pack s, emptyContext)
+valueToJSON (VStr s ctx) = pure (jsonEscapeString s, ctx)
 valueToJSON (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   vals <- mapM force thunks
-  jsonVals <- mapM valueToJSON vals
-  pure ("[" <> T.intercalate "," jsonVals <> "]")
+  results <- mapM valueToJSON vals
+  let jsonVals = map fst results
+      ctx = mconcat (map snd results)
+  pure ("[" <> T.intercalate "," jsonVals <> "]", ctx)
 valueToJSON (VAttrs attrs) = do
   let m = attrSetToMap attrs
       sortedKeys = Map.keys m
-  pairs <- mapM (jsonPair m) sortedKeys
-  pure ("{" <> T.intercalate "," pairs <> "}")
+  results <- mapM (jsonPair m) sortedKeys
+  let pairs = map fst results
+      ctx = mconcat (map snd results)
+  pure ("{" <> T.intercalate "," pairs <> "}", ctx)
   where
     jsonPair attrMap key = case Map.lookup key attrMap of
-      Nothing -> pure ""
+      Nothing -> pure ("", emptyContext)
       Just thunk -> do
         val <- force thunk
-        jsonVal <- valueToJSON val
-        pure (jsonEscapeString key <> ":" <> jsonVal)
-valueToJSON (VPath p) = pure (jsonEscapeString p)
+        (jsonVal, ctx) <- valueToJSON val
+        pure (jsonEscapeString key <> ":" <> jsonVal, ctx)
+valueToJSON (VPath p) = pure (jsonEscapeString p, emptyContext)
 valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VDerivation _) = throwEvalError "builtins.toJSON: cannot convert a derivation to JSON"

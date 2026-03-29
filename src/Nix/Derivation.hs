@@ -65,6 +65,8 @@ module Nix.Derivation
   )
 where
 
+import Data.Function (on)
+import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -183,9 +185,11 @@ toATerm drv =
     <> ")"
 
 -- | Serialize outputs: @[(name,path,hashAlgo,hash)]@
+-- Sorted by output name for deterministic ATerm hashing.
 atermOutputs :: [DerivationOutput] -> Text
 atermOutputs outs =
-  "[" <> T.intercalate "," (map atermOutput outs) <> "]"
+  let sorted = sortBy (compare `on` doName) outs
+   in "[" <> T.intercalate "," (map atermOutput sorted) <> "]"
 
 atermOutput :: DerivationOutput -> Text
 atermOutput out =
@@ -215,9 +219,11 @@ atermInputDrv (sp, outs) =
     <> ")"
 
 -- | Serialize input sources: @[path1,path2,...]@
+-- Sorted for deterministic ATerm hashing.
 atermInputSrcs :: [StorePath] -> Text
 atermInputSrcs srcs =
-  "[" <> T.intercalate "," (map (atermString . SP.storePathToText SP.defaultStoreDir) srcs) <> "]"
+  let sorted = sortBy (compare `on` SP.storePathToText SP.defaultStoreDir) srcs
+   in "[" <> T.intercalate "," (map (atermString . SP.storePathToText SP.defaultStoreDir) sorted) <> "]"
 
 -- | Serialize a list of strings: @[s1,s2,...]@
 atermStringList :: [Text] -> Text

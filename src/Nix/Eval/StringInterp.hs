@@ -109,14 +109,17 @@ stripIndentation raw
 countIndent :: Text -> Int
 countIndent = T.length . T.takeWhile (\c -> c == ' ' || c == '\t')
 
--- | Find the minimum indentation across all non-empty lines.
+-- | Find the minimum indentation across all non-blank lines.
+-- Whitespace-only lines are treated as blank (infinite indent) per Nix semantics.
 minimumIndent :: [Text] -> Int
 minimumIndent lns =
-  let nonEmpty = filter (not . T.null) lns
-      indents = map countIndent nonEmpty
+  let nonBlank = filter (\t -> not (T.null t) && not (T.all isSpace t)) lns
+      indents = map countIndent nonBlank
    in case indents of
         [] -> 0
         xs -> minimum xs
+  where
+    isSpace c = c == ' ' || c == '\t'
 
 -- | Strip up to @n@ leading whitespace characters from a line.
 stripPrefix :: Int -> Text -> Text

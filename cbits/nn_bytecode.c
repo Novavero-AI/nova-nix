@@ -12,6 +12,7 @@
 #include "nn_bytecode.h"
 #include "nn_assert.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -40,10 +41,12 @@ void nn_bytecode_init(uint32_t op_capacity, uint32_t data_capacity)
     if (data_capacity == 0) data_capacity = NN_BC_DEFAULT_DATA_CAPACITY;
 
     g_ops         = (nn_op_t *)malloc((size_t)op_capacity * sizeof(nn_op_t));
+    if (!g_ops) { fprintf(stderr, "nn_bytecode_init: ops alloc failed\n"); abort(); }
     g_op_count    = 0;
     g_op_capacity = op_capacity;
 
     g_data          = (uint32_t *)malloc((size_t)data_capacity * sizeof(uint32_t));
+    if (!g_data) { fprintf(stderr, "nn_bytecode_init: data alloc failed\n"); abort(); }
     g_data_count    = 0;
     g_data_capacity = data_capacity;
 }

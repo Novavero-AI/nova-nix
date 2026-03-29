@@ -2746,8 +2746,8 @@ complexTestDrv :: Derivation
 complexTestDrv =
   Derivation
     { drvOutputs =
-        [ DerivationOutput "out" (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pkg-2.0") "" "",
-          DerivationOutput "dev" (StorePath "dddddddddddddddddddddddddddddddd" "pkg-2.0-dev") "" ""
+        [ DerivationOutput "dev" (StorePath "dddddddddddddddddddddddddddddddd" "pkg-2.0-dev") "" "",
+          DerivationOutput "out" (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pkg-2.0") "" ""
         ],
       drvInputDrvs =
         Map.fromList

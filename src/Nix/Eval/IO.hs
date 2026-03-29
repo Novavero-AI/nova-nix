@@ -27,7 +27,7 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, SomeException, displayException, fromException, throwIO, try)
+import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, fromException, throwIO, try)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
@@ -52,6 +52,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Th
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix, readFileAutoEncoding)
+import qualified Nix.Store.Path as SP
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
@@ -112,7 +113,7 @@ newEvalState baseDir = do
     EvalState
       { esImportCache = cache,
         esBaseDir = baseDir,
-        esStoreDir = "/nix/store",
+        esStoreDir = T.unpack SP.platformStoreDirText,
         esTimestamp = now,
         esSearchPaths = searchPaths
       }
@@ -416,24 +417,25 @@ wrapIO action = EvalIO $ liftIO $ do
   result <- try action
   case result of
     Right val -> pure val
-    Left (err :: SomeException) ->
-      case fromException err of
-        Just nixErr -> throwIO (nixErr :: NixEvalError)
-        Nothing -> throwIO (NixEvalError (T.pack (displayException err)))
+    Left (err :: SomeException)
+      | Just (_ :: SomeAsyncException) <- fromException err -> throwIO err
+      | Just nixErr <- fromException err -> throwIO (nixErr :: NixEvalError)
+      | otherwise -> throwIO (NixEvalError (T.pack (displayException err)))
 
 -- | Run an IO evaluation, returning @Left@ on error.
 --
--- Catches both 'NixEvalError' (throw) and 'NixAbortError' (abort).
+-- Catches 'NixEvalError' (throw) and 'NixAbortError' (abort).
 -- Async exceptions (@StackOverflow@, @ThreadKilled@, etc.) propagate uncaught.
 runEvalIO :: EvalState -> EvalIO a -> IO (Either Text a)
 runEvalIO st (EvalIO action) = do
   result <- try (runReaderT action st)
-  pure $ case result of
-    Right val -> Right val
+  case result of
+    Right val -> pure (Right val)
     Left (err :: SomeException)
-      | Just (NixEvalError msg) <- fromException err -> Left msg
-      | Just (NixAbortError msg) <- fromException err -> Left msg
-      | otherwise -> Left (T.pack (displayException err))
+      | Just (_ :: SomeAsyncException) <- fromException err -> throwIO err
+      | Just (NixEvalError msg) <- fromException err -> pure (Left msg)
+      | Just (NixAbortError msg) <- fromException err -> pure (Left msg)
+      | otherwise -> pure (Left (T.pack (displayException err)))
 
 -- | Look up an environment variable, returning Nothing if unset.
 lookupEnvText :: String -> IO (Maybe String)
