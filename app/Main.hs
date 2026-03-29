@@ -120,8 +120,9 @@ evalFile strict extraPaths dataDir filePath = do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st <- newEvalState (takeDirectory filePath)
-      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st)
+      st0 <- newEvalState (takeDirectory filePath)
+      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
+          st = st0 {esSearchPaths = searchPaths}
       result <-
         runEvalIO st $
           eval (builtinEnv (esTimestamp st) searchPaths) expr >>= finalize strict
@@ -140,8 +141,9 @@ evalExpr strict extraPaths dataDir source = do
       exitFailure
     Right expr -> do
       cwd <- getCurrentDirectory
-      st <- newEvalState cwd
-      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st)
+      st0 <- newEvalState cwd
+      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
+          st = st0 {esSearchPaths = searchPaths}
       result <-
         runEvalIO st $
           eval (builtinEnv (esTimestamp st) searchPaths) expr >>= finalize strict
@@ -160,8 +162,9 @@ buildFile extraPaths dataDir filePath = do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st <- newEvalState (takeDirectory filePath)
-      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st)
+      st0 <- newEvalState (takeDirectory filePath)
+      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
+          st = st0 {esSearchPaths = searchPaths}
       result <- runEvalIO st (eval (builtinEnv (esTimestamp st) searchPaths) expr)
       case result of
         Left err -> do

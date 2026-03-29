@@ -92,7 +92,18 @@ resolve stack expr = case expr of
     EAssert (resolve stack cond) (resolve stack body)
   EUnary op operand -> EUnary op (resolve stack operand)
   EBinary op l r -> EBinary op (resolve stack l) (resolve stack r)
-  ESearchPath _ -> expr
+  -- Desugar: <name> → __findFile __nixPath "name"
+  -- Matches C++ Nix's parser desugaring.  __findFile and __nixPath are
+  -- in the root scope (Builtins.hs), so they resolve via name-based
+  -- lookup at runtime.  This ensures closure trimming captures the
+  -- implicit builtins dependency.
+  ESearchPath name ->
+    resolve
+      stack
+      ( EApp
+          (EApp (EVar "__findFile") (EVar "__nixPath"))
+          (EStr [StrLit name])
+      )
 
 -- | Resolve a variable by walking the scope stack.
 --

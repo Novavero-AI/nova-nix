@@ -21,7 +21,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), cu
 import Nix.Eval (NixValue (..), StringContext (..), StringContextElement (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
-import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, opApp, opAssert, opAttrs, opBinary, opHasAttr, opIf, opIndStr, opLambda, opLet, opList, opLitBool, opLitFloat, opLitInt, opLitNull, opLitPath, opLitUri, opResolvedVar, opSearchPath, opSelect, opStr, opUnary, opVar, opWith, opWithVar, strpartInterp, strpartLit, unaryNegate)
+import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, opApp, opAssert, opAttrs, opBinary, opHasAttr, opIf, opIndStr, opLambda, opLet, opList, opLitBool, opLitFloat, opLitInt, opLitNull, opLitPath, opLitUri, opResolvedVar, opSelect, opStr, opUnary, opVar, opWith, opWithVar, strpartInterp, strpartLit, unaryNegate)
 import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
 import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
@@ -3256,11 +3256,11 @@ testPhase4 = do
                   (Just (VStr "" _), Just (VStr "/some/path" _)) -> Pass
                   _ -> Fail "wrong prefix/path for plain"
               _ -> Fail "expected one entry",
-      -- ESearchPath parser test
+      -- ESearchPath desugars to __findFile __nixPath "name" during resolution
       runTest "parse <nixpkgs>" $
-        assertParse "search path" "<nixpkgs>" (ESearchPath "nixpkgs"),
+        assertParse "search path" "<nixpkgs>" (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "nixpkgs"])),
       runTest "parse <nixpkgs/lib>" $
-        assertParse "search path with subpath" "<nixpkgs/lib>" (ESearchPath "nixpkgs/lib"),
+        assertParse "search path with subpath" "<nixpkgs/lib>" (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "nixpkgs/lib"])),
       -- ESearchPath eval (should fail in pure mode since no search paths)
       runTest "eval <nixpkgs> fails without path" $
         assertEvalFail "search path not found" "<nixpkgs>",
@@ -3301,7 +3301,7 @@ testPhase4IO = do
           st <- newEvalState testDir
           let nixPaths = parseNixPath ("mypkg=" <> T.pack subDir)
               env = builtinEnv (esTimestamp st) nixPaths
-          result <- runEvalIO st (eval env (ESearchPath "mypkg"))
+          result <- runEvalIO st (eval env (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
           pure $ case result of
             Right (VPath _) -> Pass
             Right other -> Fail ("expected VPath, got " <> T.pack (show other))
@@ -3991,14 +3991,15 @@ testBytecodeCompile = do
                       <> T.pack (show pathLen)
                   )
           ),
-      runTestM "compile ESearchPath" $ do
-        idx <- compileExpr (ESearchPath "nixpkgs")
+      -- ESearchPath is desugared by resolver to __findFile __nixPath "name",
+      -- so the compiler sees an EApp chain, not a raw ESearchPath.
+      runTestM "compile desugared search path" $ do
+        idx <- compileExpr (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "nixpkgs"]))
         op <- cbcOpcode idx
-        sym <- cbcArg1 idx
         pure
-          ( if op == opSearchPath && symbolText (Symbol sym) == "nixpkgs"
+          ( if op == opApp
               then Pass
-              else Fail ("op=" <> T.pack (show op))
+              else Fail ("expected opApp, got op=" <> T.pack (show op))
           ),
       runTestM "op_count grows after compilation" $ do
         before <- cbcOpCount

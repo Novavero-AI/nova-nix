@@ -2115,7 +2115,11 @@ builtinZipAttrsWith func (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   attrSets <- mapM forceToAttrSet thunks
   let merged = mergeAllAttrs attrSets
-  resultPairs <- mapM (applyZip func) (Map.toList merged)
+      -- Lazy: each result is a deferred f(name)(values) thunk, not eagerly
+      -- evaluated.  Critical for nixpkgs evalModules fixpoint — config is a
+      -- self-referencing lazy attrset that must be COMPUTED (holding the lazy
+      -- result) before any individual attribute thunks are forced.
+      resultPairs = map (deferZip func) (Map.toList merged)
   pure (VAttrs (attrSetFromMap (Map.fromList resultPairs)))
   where
     forceToAttrSet thunk = do
@@ -2124,10 +2128,12 @@ builtinZipAttrsWith func (VList cl) = do
         VAttrs attrs -> pure (attrSetToMap attrs)
         _ -> throwEvalError "builtins.zipAttrsWith: list element must be a set"
     mergeAllAttrs = foldl' (\acc m -> Map.unionWith (++) acc (Map.map (: []) m)) Map.empty
-    applyZip fn (key, thunkList) = do
-      partial <- applyValue fn (mkStr key)
-      result <- applyValue partial (VList (clistFromThunks (map thunkToCPtr thunkList)))
-      pure (key, evaluated result)
+    -- Slot 0 = function, slot 1 = name, slot 2 = values list.
+    deferZip fn (key, thunkList) =
+      let valueList = VList (clistFromThunks (map thunkToCPtr thunkList))
+          (slots, slotCount) = buildCSlots [evaluated fn, evaluated (mkStr key), evaluated valueList]
+          env = newMinimalEnv slots slotCount
+       in (key, mkSyntheticThunk env mapAttrsExpr)
 builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
 
