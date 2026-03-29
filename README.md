@@ -2,7 +2,7 @@
 <h1>nova-nix</h1>
 <p><strong>Windows-Native Nix — Haskell Logic, C99 Data</strong></p>
 <p>A from-scratch implementation of the Nix package manager — parser, lazy evaluator, content-addressed store, derivation builder, binary substituter — running natively on Windows, macOS, and Linux. No WSL. No Cygwin. No MSYS2.</p>
-<p><a href="#quick-start">Quick Start</a> · <a href="#cli">CLI</a> · <a href="#modules">Modules</a> · <a href="#architecture">Architecture</a> · <a href="#the-hard-problems">Hard Problems</a> · <a href="#roadmap">Roadmap</a> · <a href="#build--test">Build & Test</a></p>
+<p><a href="#quick-start">Quick Start</a> · <a href="#cli">CLI</a> · <a href="#modules">Modules</a> · <a href="#architecture">Architecture</a> · <a href="#windows-native">Windows Native</a> · <a href="#roadmap">Roadmap</a> · <a href="#build--test">Build & Test</a></p>
 <p>
 
 [![CI](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml)
@@ -264,7 +264,7 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 - **MonadEval typeclass** — The evaluator is `eval :: (MonadEval m) => Env -> Expr -> m NixValue`, polymorphic in its effect monad. `PureEval` (newtype over `Either Text`) runs all pure tests with no IO. `EvalIO` provides `readFileText`, `doesPathExist`, `listDirectory`, `getEnvVar`, `getCurrentTime`, `writeToStore`, `scopedImportFile`, `runProcess` for IO builtins.
 - **Thunk-based lazy evaluation with memoization** — List elements and attribute set values are stored as unevaluated thunks. Only forced when a value is demanded. `(x: 1) (throw "boom")` returns `1` because `x` is never referenced. Thunks are 16-byte arena-allocated C cells with blackhole detection for infinite recursion. Inline scalar values (int, float, bool, null) are stored directly in the thunk payload with no Haskell heap allocation. Strings, paths, lists, and attribute sets use C-native storage (interned symbols, sorted arrays, contiguous pointer arrays).
-- **C99 data layer** — All bulk evaluation data lives in C arena-allocated structures invisible to the GHC garbage collector. Interned symbols replace string comparison with integer equality. Sorted C arrays replace Haskell `Data.Map`. Arena bump allocators replace per-object malloc. Evaluation environments are 40-byte C structs with single-call resolved variable lookup. The result: 75% less memory residency compared to the pure Haskell baseline.
+- **C99 data layer** — All bulk evaluation data lives in C arena-allocated structures invisible to the GHC garbage collector. Interned symbols replace string comparison with integer equality. Sorted C arrays replace Haskell `Data.Map`. Arena bump allocators replace per-object malloc. Evaluation environments are 40-byte C structs with single-call resolved variable lookup. The result: 91% less memory residency compared to the pure Haskell baseline (69.7 MB → 6.25 MB), GC productivity from 1.6% to 56%.
 - **Knot-tying via Haskell laziness** — Recursive `let` and `rec { }` create self-referential environments. Thunks capture environments lazily so they can reference not-yet-filled slot arrays. Two-phase construction (allocate slots, create env, fill slots) ties the knot safely. Dynamic attribute keys are resolved monadically *before* knot-tying — the two-phase design (`resolveBindingKeys` then `buildResolvedBindingsMap`) cleanly separates key evaluation from value thunk construction.
 - **Search path desugaring** — `<nixpkgs>` is its own AST constructor (`ESearchPath`), desugared at eval time to `builtins.findFile builtins.nixPath "nixpkgs"` — exactly how real Nix handles it. `builtins.nixPath` is populated from `NIX_PATH` and `--nix-path` flags.
 - **With-scope chain** — `Env` has lexical bindings (always win) plus a stack of with-scopes walked innermost-first. `let a = 1; in with { a = 2; }; a` correctly returns `1` because lexical scope takes priority.
@@ -289,23 +289,21 @@ The evaluator is polymorphic via `MonadEval` — `PureEval` runs without IO, whi
 
 ---
 
-## The Hard Problems
+## Windows Native
 
-Building Nix on Windows means solving real platform differences:
+nova-nix runs natively on Windows — no compatibility layers, no translation.
 
-| Problem | Solution |
-|---------|----------|
-| **No `fork`/`exec`** | `System.Process.createProcess` maps to Win32 `CreateProcess` natively |
-| **No symlinks (sometimes)** | Developer Mode enables symlinks; fallback to junction points / copies |
-| **`/nix/store` doesn't exist** | `C:\nix\store` as `StoreDir` — all paths parameterized, never hardcoded |
-| **Case-insensitive filesystem** | Nix store paths are case-sensitive by content hash — collisions impossible |
-| **260-char path limit** | `\\?\` extended-length prefix (32K chars), already used by cargo/node |
-| **No bash** | Ship `bash.exe` from MSYS2 (same as Git for Windows) |
-| **Sandboxing** | Unsandboxed initially (macOS did this for years); future: Win32 Job Objects + App Containers |
-| **stdenv bootstrap** | Cross-compile from Linux, or bootstrap from MSYS2 MinGW toolchain |
-| **Cross-device moves** | `renameDirectory` can fail across devices; fallback to recursive copy + remove |
-
-The biggest challenge isn't any single feature — it's **nixpkgs compatibility**. nixpkgs is 80,000+ packages defined as one massive recursive attrset. It exercises every builtin, every edge case in string context tracking, and every lazy evaluation pattern. The evaluator must handle all of this correctly and fast enough (~2-5 seconds for full nixpkgs eval).
+| Platform Difference | How nova-nix Handles It |
+|---------------------|------------------------|
+| No `fork`/`exec` | Win32 `CreateProcess` via `System.Process` |
+| No symlinks by default | Developer Mode symlinks; junction point / copy fallback |
+| No `/nix/store` | `C:\nix\store` — all paths parameterized, never hardcoded |
+| Case-insensitive FS | Content-addressed hashes make collisions impossible |
+| 260-char path limit | `\\?\` extended-length prefix (32K chars) |
+| No bash | Ship `bash.exe` from MSYS2 (same as Git for Windows) |
+| No sandbox primitives | Unsandboxed initially; future: Win32 Job Objects + App Containers |
+| stdenv bootstrap | Cross-compile from Linux, or bootstrap from MSYS2 MinGW toolchain |
+| Cross-device moves | Recursive copy + remove fallback for `renameDirectory` |
 
 ---
 
