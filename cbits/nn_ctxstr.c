@@ -7,6 +7,7 @@
  */
 
 #include "nn_ctxstr.h"
+#include "nn_assert.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +70,7 @@ void
 nn_ctxstr_set_plain(nn_ctxstr_t *s, uint16_t idx,
                     uint32_t sp_hash, uint32_t sp_name)
 {
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_set_plain: idx out of bounds");
     s->ctx[idx].tag = NN_SCE_PLAIN;
     s->ctx[idx].sp_hash = sp_hash;
     s->ctx[idx].sp_name = sp_name;
@@ -80,6 +82,7 @@ nn_ctxstr_set_drv_output(nn_ctxstr_t *s, uint16_t idx,
                          uint32_t sp_hash, uint32_t sp_name,
                          uint32_t output)
 {
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_set_drv_output: idx out of bounds");
     s->ctx[idx].tag = NN_SCE_DRV_OUTPUT;
     s->ctx[idx].sp_hash = sp_hash;
     s->ctx[idx].sp_name = sp_name;
@@ -90,6 +93,7 @@ void
 nn_ctxstr_set_all_outputs(nn_ctxstr_t *s, uint16_t idx,
                           uint32_t sp_hash, uint32_t sp_name)
 {
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_set_all_outputs: idx out of bounds");
     s->ctx[idx].tag = NN_SCE_ALL_OUTPUTS;
     s->ctx[idx].sp_hash = sp_hash;
     s->ctx[idx].sp_name = sp_name;
@@ -113,23 +117,27 @@ nn_ctxstr_ctx_count(const nn_ctxstr_t *s)
 uint8_t
 nn_ctxstr_elem_tag(const nn_ctxstr_t *s, uint16_t idx)
 {
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_elem_tag: idx out of bounds");
     return s->ctx[idx].tag;
 }
 
 uint32_t
 nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint16_t idx)
 {
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_elem_hash: idx out of bounds");
     return s->ctx[idx].sp_hash;
 }
 
 uint32_t
 nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint16_t idx)
 {
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_elem_name: idx out of bounds");
     return s->ctx[idx].sp_name;
 }
 
 uint32_t
 nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint16_t idx)
 {
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_elem_output: idx out of bounds");
     return s->ctx[idx].output;
 }

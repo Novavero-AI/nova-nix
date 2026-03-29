@@ -209,7 +209,7 @@ readThunkValue (Thunk ptr) =
       else do
         tag <- cthunkValueTag ptr
         fmap Just $ case tag of
-          0 {- INT -} -> VInt . fromIntegral <$> cthunkGetInt ptr
+          0 {- INT -} -> VInt <$> cthunkGetInt ptr
           1 {- FLOAT -} -> VFloat <$> cthunkGetFloat ptr
           2 {- BOOL -} -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
           3 {- NULL -} -> pure VNull
@@ -231,8 +231,8 @@ readThunkValue (Thunk ptr) =
 
 -- | A Nix value — the result of evaluating an expression.
 data NixValue
-  = -- | Integer.
-    VInt !Integer
+  = -- | 64-bit signed integer (matching Nix semantics).
+    VInt !Int64
   | -- | Floating-point.
     VFloat !Double
   | -- | Boolean.
@@ -592,7 +592,7 @@ mkSyntheticThunk env@(Env envPtr) thunkExpr =
 -- Everything else falls back to 'mkThunk'.
 cheapThunk :: Env -> Expr -> Thunk
 cheapThunk env (EResolvedVar level idx) = envLookupResolved level idx env
-cheapThunk _ (ELit (NixInt n)) = Thunk (newComputedIntPtr (fromIntegral n))
+cheapThunk _ (ELit (NixInt n)) = Thunk (newComputedIntPtr n)
 cheapThunk _ (ELit (NixFloat n)) = Thunk (newComputedFloatPtr n)
 cheapThunk _ (ELit (NixBool b)) = Thunk (newComputedBoolPtr (if b then 1 else 0))
 cheapThunk _ (ELit NixNull) = Thunk newComputedNullPtr
@@ -637,7 +637,7 @@ cheapThunkBc env bcIdx =
           let lo = unsafePerformIO (cbcArg1 bcIdx)
               hi = unsafePerformIO (cbcArg2 bcIdx)
               w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
-           in Thunk (newComputedIntPtr (fromIntegral (fromIntegral w64 :: Int64)))
+           in Thunk (newComputedIntPtr (fromIntegral w64 :: Int64))
         1 {- LIT_FLOAT -} ->
           let lo = unsafePerformIO (cbcArg1 bcIdx)
               hi = unsafePerformIO (cbcArg2 bcIdx)
@@ -698,7 +698,7 @@ newBcThunkPtrLazy bcIdx env =
 -- Attrs, paths, and context-free strings use C-native tags (no StablePtr).
 -- Other complex values fall back to StablePtr-backed C thunks.
 evaluated :: NixValue -> Thunk
-evaluated (VInt n) = Thunk (newComputedIntPtr (fromIntegral n))
+evaluated (VInt n) = Thunk (newComputedIntPtr n)
 evaluated (VFloat d) = Thunk (newComputedFloatPtr d)
 evaluated (VBool b) = Thunk (newComputedBoolPtr (if b then 1 else 0))
 evaluated VNull = Thunk newComputedNullPtr
@@ -983,6 +983,10 @@ typeName val = case val of
 -- real file-system access (e.g. @import@, @readFile@).
 class (Monad m) => MonadEval m where
   throwEvalError :: Text -> m a
+
+  -- | Abort evaluation (uncatchable by tryEval, matching real Nix).
+  abortEvaluation :: Text -> m a
+
   catchEvalError :: m a -> m (Either Text a)
   readFileText :: Text -> m Text
   doesPathExist :: Text -> m Bool
@@ -998,7 +1002,7 @@ class (Monad m) => MonadEval m where
   getEnvVar :: Text -> m Text
 
   -- | Get the current epoch time (seconds since 1970-01-01).
-  getCurrentTime :: m Integer
+  getCurrentTime :: m Int64
 
   -- | Write a named file to the store, returning the store path.
   writeToStore :: Text -> Text -> m Text
@@ -1046,6 +1050,7 @@ newtype PureEval a = PureEval {runPureEval :: Either Text a}
 
 instance MonadEval PureEval where
   throwEvalError msg = PureEval (Left msg)
+  abortEvaluation msg = PureEval (Left ("evaluation aborted: " <> msg))
   catchEvalError (PureEval action) = PureEval (Right action)
   readFileText _ = throwEvalError "readFile: not available in pure evaluation"
   doesPathExist _ = pure False
@@ -1070,7 +1075,7 @@ instance MonadEval PureEval where
       1 {- COMPUTED -} ->
         let tag = unsafePerformIO (cthunkValueTag ptr)
          in case tag of
-              0 {- INT -} -> pure (VInt (fromIntegral (unsafePerformIO (cthunkGetInt ptr))))
+              0 {- INT -} -> pure (VInt (unsafePerformIO (cthunkGetInt ptr)))
               1 {- FLOAT -} -> pure (VFloat (unsafePerformIO (cthunkGetFloat ptr)))
               2 {- BOOL -} -> pure (VBool (unsafePerformIO (cthunkGetBool ptr) /= 0))
               3 {- NULL -} -> pure VNull
@@ -1098,7 +1103,9 @@ instance MonadEval PureEval where
                 let payload = unsafePerformIO (cthunkPayload ptr)
                     val = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))
                  in pure val
-      _ {- PENDING or BLACKHOLE -} ->
+      2 {- BLACKHOLE -} ->
+        throwEvalError "infinite recursion encountered"
+      _ {- PENDING -} ->
         let bcIdx = unsafePerformIO (cthunkGetBcIdx ptr)
             envSp = unsafePerformIO (cthunkPayload ptr)
             env = unsafePerformIO (deRefStablePtr (castPtrToStablePtr envSp))

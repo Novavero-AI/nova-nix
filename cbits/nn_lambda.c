@@ -7,6 +7,7 @@
  */
 
 #include "nn_lambda.h"
+#include "nn_assert.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +70,7 @@ nn_lambda_set_entry(nn_lambda_t *lam, uint16_t idx,
                     uint32_t name_sym, uint32_t has_default,
                     uint32_t default_bc_idx)
 {
+    NN_ASSERT(idx < lam->formal_count, "nn_lambda_set_entry: idx out of bounds");
     lam->entries[idx].name_sym       = name_sym;
     lam->entries[idx].has_default    = has_default;
     lam->entries[idx].default_bc_idx = default_bc_idx;
@@ -129,17 +131,23 @@ nn_lambda_formal_count(const nn_lambda_t *lam)
 uint32_t
 nn_lambda_entry_name(const nn_lambda_t *lam, uint16_t idx)
 {
+    NN_ASSERT(lam->entries != NULL && idx < lam->formal_count,
+              "nn_lambda_entry_name: idx out of bounds or no formals");
     return lam->entries[idx].name_sym;
 }
 
 uint32_t
 nn_lambda_entry_has_default(const nn_lambda_t *lam, uint16_t idx)
 {
+    NN_ASSERT(lam->entries != NULL && idx < lam->formal_count,
+              "nn_lambda_entry_has_default: idx out of bounds or no formals");
     return lam->entries[idx].has_default;
 }
 
 uint32_t
 nn_lambda_entry_default(const nn_lambda_t *lam, uint16_t idx)
 {
+    NN_ASSERT(lam->entries != NULL && idx < lam->formal_count,
+              "nn_lambda_entry_default: idx out of bounds or no formals");
     return lam->entries[idx].default_bc_idx;
 }

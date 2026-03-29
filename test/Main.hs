@@ -1494,8 +1494,8 @@ testImportIO = do
         runTestIOFail "import nonexistent -> error" testDir "import ./nonexistent.nix",
         runTestIO "import attrset + select" testDir "(import ./attrset.nix).x" (VInt 1),
         runTestIO "import let/lambda" testDir "import ./uses-arg.nix" (VInt 15),
-        -- import rejects strings (real Nix semantics)
-        runTestIOFail "import rejects string" testDir "import \"./literal.nix\"",
+        -- import accepts strings (real Nix coerces string to path)
+        runTestIO "import accepts string" testDir "import \"./literal.nix\"" (VInt 42),
         -- pathExists
         runTestIO
           "pathExists true"

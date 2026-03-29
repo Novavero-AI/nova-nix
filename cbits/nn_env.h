@@ -20,13 +20,16 @@
 
 /* --- Env struct --- */
 
+/* 48 bytes on 64-bit (with padding after slot_count and with_count).
+ * Could be reduced to 40 bytes by reordering fields, but the current
+ * layout groups related fields logically and matches access patterns. */
 typedef struct nn_env {
     void         **slots;        /* nn_thunk_t* array (or NULL for 0 slots) */
-    uint32_t       slot_count;
+    uint32_t       slot_count;   /* 4 bytes + 4 pad to align lazy_scope */
     void          *lazy_scope;   /* nn_attrset_t* or NULL */
     struct nn_env *parent;       /* nn_env_t* or NULL */
     void         **with_scopes;  /* array of nn_attrset_t* (or NULL) */
-    uint16_t       with_count;
+    uint16_t       with_count;   /* 2 bytes + 6 pad to struct alignment */
 } nn_env_t;
 
 /* --- Lifecycle --- */

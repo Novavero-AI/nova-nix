@@ -11,6 +11,7 @@
  */
 
 #include "nn_symbol.h"
+#include "nn_assert.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -78,7 +79,9 @@ static void arena_ensure(size_t needed)
     while (new_cap < g_sym.arena_used + needed) {
         new_cap *= 2;
     }
-    g_sym.arena = (char *)realloc(g_sym.arena, new_cap);
+    char *new_arena = (char *)realloc(g_sym.arena, new_cap);
+    if (!new_arena) return;
+    g_sym.arena = new_arena;
     g_sym.arena_cap = new_cap;
 }
 
@@ -102,8 +105,10 @@ static void entries_ensure(void)
     if (g_sym.count + 1 < g_sym.entries_cap) return;
 
     uint32_t new_cap = g_sym.entries_cap * 2;
-    g_sym.entries = (nn_symbol_entry_t *)realloc(
+    nn_symbol_entry_t *new_entries = (nn_symbol_entry_t *)realloc(
         g_sym.entries, (size_t)new_cap * sizeof(nn_symbol_entry_t));
+    if (!new_entries) return;
+    g_sym.entries = new_entries;
     g_sym.entries_cap = new_cap;
 }
 
@@ -115,6 +120,7 @@ static void slots_grow(void)
     uint32_t new_cap = g_sym.slots_cap * 2;
     uint32_t new_mask = new_cap - 1;
     nn_slot_t *new_slots = (nn_slot_t *)calloc((size_t)new_cap, sizeof(nn_slot_t));
+    if (!new_slots) return;
 
     uint32_t i;
     for (i = 0; i < g_sym.slots_cap; i++) {

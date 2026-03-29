@@ -1,12 +1,13 @@
 -- | Recursive descent expression parser for the Nix language.
 --
--- 13 precedence levels, lowest to highest:
+-- 14 precedence levels, lowest (top) to highest (deepest):
 --
 -- @
--- lambda / implication / || / && / == != / < > <= >= / //
--- ! / ++ / + - / * \\/ / negate / application / selection
+-- lambda / -> / || / && / == != / < > <= >= / //
+-- ! / + - / * \\/ / ++ / ? / negate / application / selection
 -- @
 --
+-- Matches the C++ Nix parser (parser.y) precedence exactly.
 -- Entirely pure. No IO, no Megaparsec, no Parsec.
 module Nix.Parser.Expr
   ( -- * Entry point
@@ -248,20 +249,9 @@ parseNot = do
     TokNot -> do
       _ <- advance
       EUnary OpNot <$> parseNot
-    _ -> parseConcat
+    _ -> parseAddSub
 
--- | Level 8: List concatenation (@++@, right-associative).
-parseConcat :: Parser Expr
-parseConcat = do
-  lhs <- parseAddSub
-  tok <- peekMaybe
-  case tok of
-    Just TokConcat -> do
-      _ <- advance
-      EBinary OpConcat lhs <$> parseConcat
-    _ -> pure lhs
-
--- | Level 9: Addition and subtraction (@+@, @-@, left-associative).
+-- | Level 8: Addition and subtraction (@+@, @-@, left-associative).
 parseAddSub :: Parser Expr
 parseAddSub = do
   lhs <- parseMulDiv
@@ -280,10 +270,10 @@ parseAddSub = do
           loopAddSub (EBinary OpSub lhs rhs)
         _ -> pure lhs
 
--- | Level 10: Multiplication and division (@*@, @/@, left-associative).
+-- | Level 9: Multiplication and division (@*@, @/@, left-associative).
 parseMulDiv :: Parser Expr
 parseMulDiv = do
-  lhs <- parseNegate
+  lhs <- parseConcat
   loopMulDiv lhs
   where
     loopMulDiv lhs = do
@@ -291,15 +281,38 @@ parseMulDiv = do
       case tok of
         Just TokStar -> do
           _ <- advance
-          rhs <- parseNegate
+          rhs <- parseConcat
           loopMulDiv (EBinary OpMul lhs rhs)
         Just TokSlash -> do
           _ <- advance
-          rhs <- parseNegate
+          rhs <- parseConcat
           loopMulDiv (EBinary OpDiv lhs rhs)
         _ -> pure lhs
 
--- | Level 11: Arithmetic negation (@-@, prefix).
+-- | Level 10: List concatenation (@++@, right-associative).
+parseConcat :: Parser Expr
+parseConcat = do
+  lhs <- parseHasAttr
+  tok <- peekMaybe
+  case tok of
+    Just TokConcat -> do
+      _ <- advance
+      EBinary OpConcat lhs <$> parseConcat
+    _ -> pure lhs
+
+-- | Level 11: Has-attribute (@?@, non-associative).
+-- Right operand is an attr path, not a full expression.
+parseHasAttr :: Parser Expr
+parseHasAttr = do
+  lhs <- parseNegate
+  tok <- peekMaybe
+  case tok of
+    Just TokQuestion -> do
+      _ <- advance
+      EHasAttr lhs <$> parseAttrPath
+    _ -> pure lhs
+
+-- | Level 12: Arithmetic negation (@-@, prefix).
 parseNegate :: Parser Expr
 parseNegate = do
   tok <- peek
@@ -309,7 +322,7 @@ parseNegate = do
       EUnary OpNegate <$> parseNegate
     _ -> parseApp
 
--- | Level 12: Function application (juxtaposition, left-associative).
+-- | Level 13: Function application (juxtaposition, left-associative).
 parseApp :: Parser Expr
 parseApp = do
   func <- parseSelect
@@ -323,8 +336,7 @@ parseApp = do
           loopApp (EApp func arg)
         _ -> pure func
 
--- | Level 13: Attribute selection (@e.a@, @e.a or default@) and
--- has-attribute (@e ? a@).
+-- | Level 14: Attribute selection (@e.a@, @e.a or default@).
 parseSelect :: Parser Expr
 parseSelect = do
   expr <- parseAtom
@@ -340,10 +352,6 @@ selectLoop expr = do
       -- Check for 'or' default
       orDefault <- tryParser parseOrDefault
       selectLoop (ESelect expr path orDefault)
-    Just TokQuestion -> do
-      _ <- advance
-      path <- parseAttrPath
-      selectLoop (EHasAttr expr path)
     _ -> pure expr
 
 -- | Parse the @or default@ part after @e.path@.
@@ -509,6 +517,10 @@ parseInheritNames = go []
         TokIdent name -> do
           _ <- advance
           go (name : acc)
+        -- Keywords are valid as inherit names: inherit if then else;
+        _ | Just name <- keywordToText tok -> do
+          _ <- advance
+          go (name : acc)
         -- Quoted strings for keywords used as attribute names: inherit "or";
         TokStringOpen -> do
           _ <- advance
@@ -541,8 +553,10 @@ parseAttrKey :: Parser AttrKey
 parseAttrKey = do
   tok <- peek
   case tok of
-    -- 'or' can be used as an attr key (handled by TokIdent since 'or' is not a keyword)
     TokIdent name -> advance >> pure (StaticKey name)
+    -- Keywords are valid as attribute names in Nix:
+    -- { if = 1; }, a.then, { else = 2; }, etc.
+    _ | Just name <- keywordToText tok -> advance >> pure (StaticKey name)
     TokStringOpen ->
       DynamicKey <$> parseString
     TokInterpOpen -> do
@@ -553,6 +567,23 @@ parseAttrKey = do
       expect TokRBrace
       pure (DynamicKey expr)
     _ -> parseError ("expected attribute key, got " <> showToken tok)
+
+-- | Convert keyword tokens to their text for use as attribute names.
+-- All Nix keywords are valid as attr keys in binding and select position.
+keywordToText :: Token -> Maybe Text
+keywordToText TokIf = Just "if"
+keywordToText TokThen = Just "then"
+keywordToText TokElse = Just "else"
+keywordToText TokLet = Just "let"
+keywordToText TokIn = Just "in"
+keywordToText TokWith = Just "with"
+keywordToText TokAssert = Just "assert"
+keywordToText TokRec = Just "rec"
+keywordToText TokInherit = Just "inherit"
+keywordToText TokTrue = Just "true"
+keywordToText TokFalse = Just "false"
+keywordToText TokNull = Just "null"
+keywordToText _ = Nothing
 
 parseLet :: Parser Expr
 parseLet = do

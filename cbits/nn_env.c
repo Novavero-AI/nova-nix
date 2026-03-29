@@ -9,6 +9,7 @@
  */
 
 #include "nn_env.h"
+#include "nn_assert.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -120,7 +121,9 @@ void **
 nn_env_alloc_slots(uint32_t count)
 {
     if (count == 0) return NULL;
-    uint32_t bytes = count * (uint32_t)sizeof(void *);
+    uint64_t bytes64 = (uint64_t)count * sizeof(void *);
+    if (bytes64 > UINT32_MAX) return NULL;
+    uint32_t bytes = (uint32_t)bytes64;
     return (void **)nn_env_alloc_raw(bytes);
 }
 
@@ -166,6 +169,7 @@ nn_env_from_slots(void **slots, uint32_t slot_count,
 nn_env_t *
 nn_env_push_with(nn_env_t *base, void *scope)
 {
+    if (base->with_count >= UINT16_MAX) return (nn_env_t *)base;
     uint16_t new_count = base->with_count + 1;
     void **new_withs = (void **)nn_env_alloc_raw(
         (uint32_t)new_count * (uint32_t)sizeof(void *));
@@ -244,10 +248,12 @@ nn_env_with_count(const nn_env_t *env)
 void *
 nn_env_lookup_resolved(const nn_env_t *env, int level, int idx)
 {
+    NN_ASSERT(env != NULL, "nn_env_lookup_resolved: NULL env");
     while (level > 0) {
         env = env->parent;
         level--;
     }
+    NN_ASSERT(idx >= 0 && (uint32_t)idx < env->slot_count, "nn_env_lookup_resolved: idx out of bounds");
     return env->slots[idx];
 }
 
@@ -266,7 +272,9 @@ void **
 nn_env_alloc_with_scopes(uint16_t count)
 {
     if (count == 0) return NULL;
-    uint32_t bytes = (uint32_t)count * (uint32_t)sizeof(void *);
+    uint64_t bytes64 = (uint64_t)count * sizeof(void *);
+    if (bytes64 > UINT32_MAX) return NULL;
+    uint32_t bytes = (uint32_t)bytes64;
     return (void **)nn_env_alloc_raw(bytes);
 }
 

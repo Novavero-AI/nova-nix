@@ -36,7 +36,6 @@ module Nix.Eval.CAttrSet
     cattrsetKeys,
 
     -- * Set operations
-    cattrsetIntersect,
     cattrsetUnion,
     cattrsetRemoveKeys,
   )
@@ -92,9 +91,6 @@ foreign import ccall unsafe "nn_attrset_size"
 
 foreign import ccall unsafe "nn_attrset_keys_ptr"
   c_nn_attrset_keys_ptr :: CAttrSet -> IO (Ptr Word32)
-
-foreign import ccall unsafe "nn_attrset_intersect"
-  c_nn_attrset_intersect :: CAttrSet -> CAttrSet -> IO CAttrSet
 
 foreign import ccall unsafe "nn_attrset_union"
   c_nn_attrset_union :: CAttrSet -> CAttrSet -> IO CAttrSet
@@ -184,10 +180,6 @@ cattrsetKeys set = do
 -- ---------------------------------------------------------------------------
 -- Set operations
 -- ---------------------------------------------------------------------------
-
--- | Intersection: keys in both, values from second.  Result is frozen.
-cattrsetIntersect :: CAttrSet -> CAttrSet -> IO CAttrSet
-cattrsetIntersect = c_nn_attrset_intersect
 
 -- | Right-biased union (// semantics).  Result is frozen.
 cattrsetUnion :: CAttrSet -> CAttrSet -> IO CAttrSet

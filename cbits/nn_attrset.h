@@ -84,10 +84,6 @@ uint32_t nn_attrset_size(const nn_attrset_t *set);
  * Valid until the set is freed. */
 const nn_symbol_t *nn_attrset_keys_ptr(const nn_attrset_t *set);
 
-/* Direct pointer to the values array (count elements).
- * Valid until the set is freed. */
-void *const *nn_attrset_values_ptr(const nn_attrset_t *set);
-
 /* --- Lifecycle: bulk cleanup --- */
 
 /* Free all tracked attribute sets at once (arena-style cleanup).
@@ -96,11 +92,6 @@ void *const *nn_attrset_values_ptr(const nn_attrset_t *set);
 void nn_attrset_free_all(void);
 
 /* --- Set operations --- */
-
-/* Create a new set containing only keys present in both `a` and `b`,
- * taking values from `b`.  Both inputs must be frozen.
- * The result is returned frozen.  Caller owns the result. */
-nn_attrset_t *nn_attrset_intersect(const nn_attrset_t *a, const nn_attrset_t *b);
 
 /* Create a new set that is the right-biased union of `a` and `b`
  * (keys in `b` override `a`).  Both inputs must be frozen.

@@ -23,6 +23,7 @@ module Nix.Eval.IO
 
     -- * Errors
     NixEvalError (..),
+    NixAbortError (..),
   )
 where
 
@@ -32,6 +33,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -61,11 +63,17 @@ import qualified System.Process as Proc
 -- Error type
 -- ---------------------------------------------------------------------------
 
--- | Evaluation error surfaced as an IO exception.
+-- | Evaluation error surfaced as an IO exception (catchable by tryEval).
 newtype NixEvalError = NixEvalError Text
   deriving (Show)
 
 instance Exception NixEvalError
+
+-- | Abort error — NOT catchable by tryEval (matches real Nix semantics).
+newtype NixAbortError = NixAbortError Text
+  deriving (Show)
+
+instance Exception NixAbortError
 
 -- ---------------------------------------------------------------------------
 -- State
@@ -86,7 +94,7 @@ data EvalState = EvalState
   { esImportCache :: !(IORef (Map FilePath NixValue)),
     esBaseDir :: !FilePath,
     esStoreDir :: !FilePath,
-    esTimestamp :: !Integer,
+    esTimestamp :: !Int64,
     esSearchPaths :: ![Thunk]
   }
 
@@ -95,7 +103,7 @@ data EvalState = EvalState
 newEvalState :: FilePath -> IO EvalState
 newEvalState baseDir = do
   cache <- newIORef Map.empty
-  now <- fmap floor getPOSIXTime :: IO Integer
+  now <- floor <$> getPOSIXTime :: IO Int64
   nixPathStr <- lookupEnvText "NIX_PATH"
   let searchPaths = case nixPathStr of
         Just val -> parseNixPath (T.pack val)
@@ -123,6 +131,7 @@ newtype EvalIO a = EvalIO {unEvalIO :: ReaderT EvalState IO a}
 
 instance MonadEval EvalIO where
   throwEvalError msg = EvalIO (liftIO (throwIO (NixEvalError msg)))
+  abortEvaluation msg = EvalIO (liftIO (throwIO (NixAbortError msg)))
 
   catchEvalError (EvalIO action) = EvalIO $ do
     st <- ask
@@ -309,7 +318,7 @@ instance MonadEval EvalIO where
 -- Complex values use StablePtr.  Returns old payload for cleanup.
 storeComputed :: CThunkPtr -> NixValue -> IO (Ptr ())
 storeComputed ptr val = case val of
-  VInt n -> cthunkSetComputedInt ptr (fromIntegral n)
+  VInt n -> cthunkSetComputedInt ptr n
   VFloat d -> cthunkSetComputedFloat ptr d
   VBool b -> cthunkSetComputedBool ptr (if b then 1 else 0)
   VNull -> cthunkSetComputedNull ptr
@@ -338,7 +347,7 @@ readComputed :: CThunkPtr -> IO NixValue
 readComputed ptr = do
   tag <- cthunkValueTag ptr
   case tag of
-    0 {- INT -} -> VInt . fromIntegral <$> cthunkGetInt ptr
+    0 {- INT -} -> VInt <$> cthunkGetInt ptr
     1 {- FLOAT -} -> VFloat <$> cthunkGetFloat ptr
     2 {- BOOL -} -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
     3 {- NULL -} -> pure VNull
@@ -414,12 +423,17 @@ wrapIO action = EvalIO $ liftIO $ do
 
 -- | Run an IO evaluation, returning @Left@ on error.
 --
--- Note: only catches 'NixEvalError'.  Async exceptions
--- (@StackOverflow@, @ThreadKilled@, etc.) propagate uncaught.
+-- Catches both 'NixEvalError' (throw) and 'NixAbortError' (abort).
+-- Async exceptions (@StackOverflow@, @ThreadKilled@, etc.) propagate uncaught.
 runEvalIO :: EvalState -> EvalIO a -> IO (Either Text a)
 runEvalIO st (EvalIO action) = do
   result <- try (runReaderT action st)
-  pure (case result of Left (NixEvalError msg) -> Left msg; Right val -> Right val)
+  pure $ case result of
+    Right val -> Right val
+    Left (err :: SomeException)
+      | Just (NixEvalError msg) <- fromException err -> Left msg
+      | Just (NixAbortError msg) <- fromException err -> Left msg
+      | otherwise -> Left (T.pack (displayException err))
 
 -- | Look up an environment variable, returning Nothing if unset.
 lookupEnvText :: String -> IO (Maybe String)

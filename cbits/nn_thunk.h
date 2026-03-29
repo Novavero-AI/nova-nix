@@ -14,9 +14,12 @@
  * the entire arena is destroyed at evaluation end.  Pointers into the
  * arena remain valid until nn_thunk_destroy().
  *
- * PENDING payloads are nn_env_t* pointers (C-native, no StablePtr).
- * COMPUTED payloads are either inline scalars, C-native pointers, or
- * StablePtrs (for complex Haskell values like VLambda/VBuiltin).
+ * PENDING payloads are StablePtr Env (~16 bytes on GHC heap).  The
+ * StablePtr is necessary for knot-tying: deferred env construction in
+ * recursive lets/attrs requires Haskell laziness.  Freed on force.
+ * COMPUTED payloads are either inline scalars (int/float/bool/null via
+ * val_tag 0-3), C-native pointers (str/path/list/attrs/ctxstr/lambda
+ * via val_tag 4-9), or StablePtrs (for VBuiltin/VDrv via tag 255).
  *
  * Lifecycle: nn_thunk_init() before evaluation, nn_thunk_destroy()
  * after.  Not thread-safe — single-threaded evaluation only.
@@ -54,7 +57,7 @@
  * bc_idx(4) + payload(8).  val_tag is valid only when state == COMPUTED.
  *
  * PENDING:   bc_idx = bytecode instruction index
- *            payload = nn_env_t* (C environment pointer)
+ *            payload = StablePtr Env (Haskell-side, for knot-tying)
  * COMPUTED:  val_tag selects interpretation of payload:
  *            INT/BOOL: (intptr_t) cast of scalar
  *            FLOAT: memcpy'd double
@@ -90,10 +93,10 @@ void nn_thunk_destroy(void);
  * Returns a pointer into arena memory, valid until nn_thunk_destroy(). */
 nn_thunk_t *nn_thunk_new(void *pending_data);
 
-/* Allocate a new PENDING thunk with a bytecode index + C env pointer.
+/* Allocate a new PENDING thunk with a bytecode index + env payload.
  * bc_idx is the root instruction index in the bytecode store.
- * env_ptr is a nn_env_t* (C environment, not a StablePtr).
- * No Haskell heap references — zero GC pressure. */
+ * env_ptr is a StablePtr Env from Haskell (required for knot-tying;
+ * raw Ptr would force the env at allocation time, breaking laziness). */
 nn_thunk_t *nn_thunk_new_bc(uint32_t bc_idx, void *env_ptr);
 
 /* Read the bytecode index from a PENDING thunk. */

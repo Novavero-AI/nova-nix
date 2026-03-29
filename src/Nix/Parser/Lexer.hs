@@ -13,6 +13,7 @@ module Nix.Parser.Lexer
 where
 
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
+import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
@@ -44,7 +45,7 @@ data Token
   | TokNull
   | -- Identifiers and literals
     TokIdent !Text
-  | TokInt !Integer
+  | TokInt !Int64
   | TokFloat !Double
   | TokUri !Text
   | TokPath !Text
@@ -469,7 +470,7 @@ lexNumber st acc =
                   newSt = advanceCol fullLen st {lsInput = after3}
                in lexNormalMode newSt (tok : acc)
         _ ->
-          let val = readInteger digits
+          let val = fromIntegral (readInteger digits) :: Int64
               tok = Located (lsLine st) (lsCol st) (TokInt val)
               newSt = advanceCol len st {lsInput = after}
            in lexNormalMode newSt (tok : acc)

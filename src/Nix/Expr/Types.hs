@@ -33,11 +33,12 @@ module Nix.Expr.Types
   )
 where
 
+import Data.Int (Int64)
 import Data.Text (Text)
 
 -- | Atomic (literal) values.
 data NixAtom
-  = NixInt !Integer
+  = NixInt !Int64
   | NixFloat !Double
   | NixBool !Bool
   | NixNull

@@ -15,6 +15,7 @@
  */
 
 #include "nn_attrset.h"
+#include "nn_assert.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -74,23 +75,27 @@ static int cmp_tagged(const void *a, const void *b);
 
 /* --- Helpers --- */
 
-/* Grow arrays to at least new_cap. */
-static void grow(nn_attrset_t *set, uint32_t new_cap)
+/* Grow arrays to at least new_cap.  Returns 0 on success, -1 on failure. */
+static int grow(nn_attrset_t *set, uint32_t new_cap)
 {
     nn_symbol_t *new_keys = (nn_symbol_t *)realloc(
         set->keys, (size_t)new_cap * sizeof(nn_symbol_t));
     void **new_values = (void **)realloc(
         set->values, (size_t)new_cap * sizeof(void *));
     if (!new_keys || !new_values) {
-        /* Realloc failure: keep old arrays, skip growth.
-         * If one succeeded, it's safe — realloc preserves old data. */
-        if (new_keys) set->keys = new_keys;
+        /* Partial realloc failure: one may have succeeded while the other
+         * failed.  realloc on success may have moved the buffer, so we
+         * must adopt whichever pointer succeeded (it already contains the
+         * old data).  We do NOT update capacity — both arrays must reach
+         * new_cap before capacity is bumped. */
+        if (new_keys)   set->keys   = new_keys;
         if (new_values) set->values = new_values;
-        return;
+        return -1;
     }
     set->keys = new_keys;
     set->values = new_values;
     set->capacity = new_cap;
+    return 0;
 }
 
 /* Binary search for a symbol in the sorted keys array.
@@ -151,7 +156,7 @@ void nn_attrset_free(nn_attrset_t *set)
 void nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value)
 {
     if (set->count >= set->capacity) {
-        grow(set, set->capacity * 2);
+        if (grow(set, set->capacity * 2) != 0) return;
     }
     set->keys[set->count] = key;
     set->values[set->count] = value;
@@ -198,7 +203,19 @@ void nn_attrset_freeze(nn_attrset_t *set)
         nn_tagged_entry_t *tagged = (nn_tagged_entry_t *)malloc(
             (size_t)set->count * sizeof(nn_tagged_entry_t));
         if (!tagged) {
-            /* Cannot sort — mark frozen with current insertion order. */
+            /* Fallback: in-place insertion sort for large sets when malloc fails. */
+            for (uint32_t i = 1; i < set->count; i++) {
+                nn_symbol_t key = set->keys[i];
+                void *val = set->values[i];
+                uint32_t j = i;
+                while (j > 0 && set->keys[j-1] > key) {
+                    set->keys[j] = set->keys[j-1];
+                    set->values[j] = set->values[j-1];
+                    j--;
+                }
+                set->keys[j] = key;
+                set->values[j] = val;
+            }
             set->frozen = 1;
             return;
         }
@@ -258,16 +275,19 @@ int32_t nn_attrset_index(const nn_attrset_t *set, nn_symbol_t key)
 
 void nn_attrset_set_value(nn_attrset_t *set, uint32_t idx, void *value)
 {
+    NN_ASSERT(idx < set->count, "nn_attrset_set_value: idx out of bounds");
     set->values[idx] = value;
 }
 
 void *nn_attrset_get_value(const nn_attrset_t *set, uint32_t idx)
 {
+    NN_ASSERT(idx < set->count, "nn_attrset_get_value: idx out of bounds");
     return set->values[idx];
 }
 
 nn_symbol_t nn_attrset_get_key(const nn_attrset_t *set, uint32_t idx)
 {
+    NN_ASSERT(idx < set->count, "nn_attrset_get_key: idx out of bounds");
     return set->keys[idx];
 }
 
@@ -281,36 +301,7 @@ const nn_symbol_t *nn_attrset_keys_ptr(const nn_attrset_t *set)
     return set->keys;
 }
 
-void *const *nn_attrset_values_ptr(const nn_attrset_t *set)
-{
-    return set->values;
-}
-
 /* --- Set operations --- */
-
-nn_attrset_t *nn_attrset_intersect(const nn_attrset_t *a, const nn_attrset_t *b)
-{
-    /* Merge-join on sorted keys. */
-    uint32_t cap = a->count < b->count ? a->count : b->count;
-    nn_attrset_t *result = nn_attrset_new(cap);
-    uint32_t ia = 0, ib = 0;
-
-    while (ia < a->count && ib < b->count) {
-        if (a->keys[ia] < b->keys[ib]) {
-            ia++;
-        } else if (a->keys[ia] > b->keys[ib]) {
-            ib++;
-        } else {
-            /* Key in both — take value from b. */
-            nn_attrset_insert(result, b->keys[ib], b->values[ib]);
-            ia++;
-            ib++;
-        }
-    }
-
-    result->frozen = 1;  /* Already sorted (merge preserves order). */
-    return result;
-}
 
 nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b)
 {

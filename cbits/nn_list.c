@@ -8,6 +8,7 @@
 
 #include "nn_list.h"
 #include "nn_env.h"
+#include "nn_assert.h"
 
 #include <stdlib.h>
 
@@ -79,11 +80,13 @@ nn_list_count(const nn_list_t *list)
 struct nn_thunk *
 nn_list_get(const nn_list_t *list, uint32_t index)
 {
+    NN_ASSERT(index < list->count, "nn_list_get: index out of bounds");
     return list->items[index];
 }
 
 void
 nn_list_set(nn_list_t *list, uint32_t index, struct nn_thunk *thunk)
 {
+    NN_ASSERT(index < list->count, "nn_list_set: index out of bounds");
     list->items[index] = thunk;
 }

@@ -376,7 +376,7 @@ compileExpr = go
     -- Numeric encoding
     -- -----------------------------------------------------------------
 
-    splitInt64 :: Integer -> (Word32, Word32)
+    splitInt64 :: Int64 -> (Word32, Word32)
     splitInt64 n =
       let w64 = fromIntegral n :: Word64
        in (fromIntegral (w64 .&. 0xFFFFFFFF), fromIntegral (shiftR w64 32))
@@ -571,11 +571,10 @@ decodeSymList n off = do
 -- ---------------------------------------------------------------------------
 
 -- | Reassemble an Int64 from two uint32 halves (lo, hi).
-reassembleInt64 :: Word32 -> Word32 -> Integer
+reassembleInt64 :: Word32 -> Word32 -> Int64
 reassembleInt64 lo hi =
   let w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
-      signed = fromIntegral w64 :: Int64
-   in fromIntegral signed
+   in fromIntegral w64
 
 -- | Reassemble a Double from two uint32 halves (lo, hi).
 reassembleDouble :: Word32 -> Word32 -> Double

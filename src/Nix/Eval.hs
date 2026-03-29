@@ -72,6 +72,7 @@ import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, isOctDigit, ord)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.Int (Int64)
 import Data.List (find, foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -268,7 +269,8 @@ evalBytecode env bcIdx =
 -- | Decode a UnaryOp from bytecode flags.
 decodeUnaryOp :: Word8 -> UnaryOp
 decodeUnaryOp 0 = OpNot
-decodeUnaryOp _ = OpNegate
+decodeUnaryOp 1 = OpNegate
+decodeUnaryOp n = error ("decodeUnaryOp: unknown tag " <> show n)
 
 -- | Decode a BinaryOp from bytecode flags.
 decodeBinaryOp :: Word8 -> BinaryOp
@@ -286,7 +288,8 @@ decodeBinaryOp 10 = OpLte
 decodeBinaryOp 11 = OpGt
 decodeBinaryOp 12 = OpGte
 decodeBinaryOp 13 = OpConcat
-decodeBinaryOp _ = OpUpdate
+decodeBinaryOp 14 = OpUpdate
+decodeBinaryOp n = error ("decodeBinaryOp: unknown tag " <> show n)
 
 -- | Evaluate a binary operation from bytecode, with short-circuit
 -- support for &&, ||, ->.
@@ -577,19 +580,23 @@ evalBcLet env bcIdx0 = do
        in filled `seq` evalBytecode letEnv bodyIdx
 
 -- | Check if all bytecode bindings are single static keys (eligible for positional).
+-- Must stay in sync with 'allStaticSingleKey' in 'Nix.Expr.Resolve'.
 allBcPositional :: [BcBinding] -> Bool
 allBcPositional = all isEligible
   where
     isEligible (BcNamed [BcStaticKey _] _) = True
     isEligible (BcInherit _) = True
+    isEligible (BcInheritFrom _ _) = True
     isEligible _ = False
 
 -- | Count positional slots for bytecode bindings.
+-- Must stay in sync with 'lexicalScopeFromBindings' in 'Nix.Expr.Resolve'.
 bcBindingSlotCount :: [BcBinding] -> Int
 bcBindingSlotCount = foldl' countOne 0
   where
     countOne !acc (BcNamed [BcStaticKey _] _) = acc + 1
     countOne !acc (BcInherit syms) = acc + length syms
+    countOne !acc (BcInheritFrom _ syms) = acc + length syms
     countOne !acc _ = acc
 
 -- | Build thunks for positional bytecode bindings in declaration order.
@@ -600,6 +607,17 @@ buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
       [mkThunkBc recEnv valBcIdx]
     slotThunk (BcInherit syms) =
       map (inheritLookup outerEnv . symbolText . Symbol) syms
+    slotThunk (BcInheritFrom fromBcIdx syms) =
+      -- inherit (from) x y z; → one thunk per name that selects from the from-expr.
+      -- Each thunk gets a minimal env with the from-value at slot 0.
+      let fromThunk = mkThunkBc recEnv fromBcIdx
+          mkInheritThunk sym =
+            let name = symbolText (Symbol sym)
+                selectExpr = ESelect (EResolvedVar 0 0) [StaticKey name] Nothing
+                (sp, sc) = buildCSlots [fromThunk]
+                fromEnv = newMinimalEnv sp sc
+             in mkSyntheticThunk fromEnv selectExpr
+       in map mkInheritThunk syms
     -- Unreachable: allBcPositional guards this path.
     slotThunk _ = []
 
@@ -611,6 +629,10 @@ buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
     go (BcNamed [BcStaticKey sym] _ : bs) (t : ts) !acc =
       go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
     go (BcInherit syms : bs) ts !acc =
+      let (used, rest) = splitAt (length syms) ts
+          accMerged = foldl' (\a (sym, t0) -> Map.insert (symbolText (Symbol sym)) t0 a) acc (zip syms used)
+       in go bs rest accMerged
+    go (BcInheritFrom _ syms : bs) ts !acc =
       let (used, rest) = splitAt (length syms) ts
           accMerged = foldl' (\a (sym, t0) -> Map.insert (symbolText (Symbol sym)) t0 a) acc (zip syms used)
        in go bs rest accMerged
@@ -893,7 +915,7 @@ builtinRegistry =
       builtin1 "stringLength" builtinStringLength,
       -- Control (arity 1)
       builtin1 "throw" builtinThrow,
-      builtin1 "abort" builtinThrow,
+      builtin1 "abort" builtinAbort,
       -- Attr set operations (arity 1)
       builtin1 "attrNames" builtinAttrNames,
       builtin1 "attrValues" builtinAttrValues,
@@ -1092,7 +1114,7 @@ executeBuiltin name args = case name of
   "stringLength" -> apply1 builtinStringLength
   -- Control (arity 1)
   "throw" -> apply1 builtinThrow
-  "abort" -> apply1 builtinThrow
+  "abort" -> apply1 builtinAbort
   -- Attr set operations (arity 1)
   "attrNames" -> apply1 builtinAttrNames
   "attrValues" -> apply1 builtinAttrValues
@@ -1313,6 +1335,10 @@ builtinStringLength other =
 builtinThrow :: (MonadEval m) => NixValue -> m NixValue
 builtinThrow (VStr msg _) = throwEvalError msg
 builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <> typeName other)
+
+builtinAbort :: (MonadEval m) => NixValue -> m NixValue
+builtinAbort (VStr msg _) = abortEvaluation ("evaluation aborted with the following error message: '" <> msg <> "'")
+builtinAbort other = abortEvaluation ("builtins.abort: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — attr set (arity 1)
@@ -1957,37 +1983,37 @@ builtinLessThan a b = VBool <$> nixCompare a b
 
 builtinAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinAdd (VInt a) (VInt b) = pure (VInt (a + b))
-builtinAdd (VInt a) (VFloat b) = pure (VFloat (fromInteger a + b))
-builtinAdd (VFloat a) (VInt b) = pure (VFloat (a + fromInteger b))
+builtinAdd (VInt a) (VFloat b) = pure (VFloat (fromIntegral a + b))
+builtinAdd (VFloat a) (VInt b) = pure (VFloat (a + fromIntegral b))
 builtinAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
 builtinAdd l r = throwEvalError ("builtins.add: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
 builtinSub :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSub (VInt a) (VInt b) = pure (VInt (a - b))
-builtinSub (VInt a) (VFloat b) = pure (VFloat (fromInteger a - b))
-builtinSub (VFloat a) (VInt b) = pure (VFloat (a - fromInteger b))
+builtinSub (VInt a) (VFloat b) = pure (VFloat (fromIntegral a - b))
+builtinSub (VFloat a) (VInt b) = pure (VFloat (a - fromIntegral b))
 builtinSub (VFloat a) (VFloat b) = pure (VFloat (a - b))
 builtinSub l r = throwEvalError ("builtins.sub: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
 builtinMul :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMul (VInt a) (VInt b) = pure (VInt (a * b))
-builtinMul (VInt a) (VFloat b) = pure (VFloat (fromInteger a * b))
-builtinMul (VFloat a) (VInt b) = pure (VFloat (a * fromInteger b))
+builtinMul (VInt a) (VFloat b) = pure (VFloat (fromIntegral a * b))
+builtinMul (VFloat a) (VInt b) = pure (VFloat (a * fromIntegral b))
 builtinMul (VFloat a) (VFloat b) = pure (VFloat (a * b))
 builtinMul l r = throwEvalError ("builtins.mul: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
 builtinDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
-builtinDiv (VInt a) (VInt b) = pure (VInt (quot a b))
+builtinDiv (VInt a) (VInt b) = pure (VInt (div a b))
 builtinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
-builtinDiv (VInt a) (VFloat b) = pure (VFloat (fromInteger a / b))
-builtinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromInteger b))
+builtinDiv (VInt a) (VFloat b) = pure (VFloat (fromIntegral a / b))
+builtinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromIntegral b))
 builtinDiv (VFloat a) (VFloat b) = pure (VFloat (a / b))
 builtinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
 builtinMod :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMod _ (VInt 0) = throwEvalError "builtins.mod: division by zero"
-builtinMod (VInt a) (VInt b) = pure (VInt (rem a b))
+builtinMod (VInt a) (VInt b) = pure (VInt (mod a b))
 builtinMod l r = throwEvalError ("builtins.mod: expected two integers, got " <> typeName l <> " and " <> typeName r)
 
 builtinMin :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -2285,7 +2311,7 @@ builtinCompareVersions (VStr a _) (VStr b _) =
   pure (VInt (compareVersionParts (splitVersionStr a) (splitVersionStr b)))
 builtinCompareVersions _ _ = throwEvalError "builtins.compareVersions: expected two strings"
 
-compareVersionParts :: [Text] -> [Text] -> Integer
+compareVersionParts :: [Text] -> [Text] -> Int64
 compareVersionParts [] [] = 0
 compareVersionParts [] (_ : _) = -1
 compareVersionParts (_ : _) [] = 1
@@ -2294,7 +2320,7 @@ compareVersionParts (a : as) (b : bs) =
     0 -> compareVersionParts as bs
     n -> n
 
-compareComponent :: Text -> Text -> Integer
+compareComponent :: Text -> Text -> Int64
 compareComponent a b
   | a == b = 0
   | allDigits a && allDigits b = compare' (readInt a) (readInt b)
@@ -2303,8 +2329,8 @@ compareComponent a b
   | otherwise = if a < b then -1 else 1
   where
     allDigits t = not (T.null t) && T.all isDigit t
-    readInt :: Text -> Integer
-    readInt = T.foldl' (\acc c -> acc * 10 + fromIntegral (digitToInt c)) (0 :: Integer)
+    readInt :: Text -> Int64
+    readInt = T.foldl' (\acc c -> acc * 10 + fromIntegral (digitToInt c)) (0 :: Int64)
     compare' x y
       | x < y = -1
       | x > y = 1
@@ -2522,7 +2548,7 @@ parseJSONNumber t =
             then case reads (T.unpack numStr) :: [(Double, String)] of
               [(d, "")] -> Just (VFloat d, rest)
               _ -> Nothing
-            else case reads (T.unpack numStr) :: [(Integer, String)] of
+            else case reads (T.unpack numStr) :: [(Int64, String)] of
               [(n, "")] -> Just (VInt n, rest)
               _ -> Nothing
 
@@ -2685,8 +2711,9 @@ coerceToPath name other =
 
 builtinImport :: (MonadEval m) => NixValue -> m NixValue
 builtinImport (VPath p) = importFile p
+builtinImport (VStr s _) = importFile s
 builtinImport other =
-  throwEvalError ("import: expected a path, got " <> typeName other)
+  throwEvalError ("import: expected a path or string, got " <> typeName other)
 
 builtinReadFile :: (MonadEval m) => NixValue -> m NixValue
 builtinReadFile val = do
@@ -3268,7 +3295,7 @@ builtinFromTOML other =
 -- | Intermediate TOML value before conversion to NixValue.
 data TOMLValue
   = TOMLStr !Text
-  | TOMLInt !Integer
+  | TOMLInt !Int64
   | TOMLFloat !Double
   | TOMLBool !Bool
   | TOMLArray ![TOMLValue]
@@ -3533,30 +3560,30 @@ parseFloat t =
         Nothing -> Left ("invalid float: " <> t)
 
 -- | Read a decimal integer from Text.
-readDecimal :: Text -> Maybe Integer
+readDecimal :: Text -> Maybe Int64
 readDecimal t
   | T.null t = Nothing
-  | T.all isDigit t = Just (T.foldl' (\acc c -> acc * 10 + toInteger (digitToInt c)) 0 t)
+  | T.all isDigit t = Just (T.foldl' (\acc c -> acc * 10 + fromIntegral (digitToInt c)) 0 t)
   | otherwise = Nothing
 
-readHexT :: Text -> Maybe Integer
+readHexT :: Text -> Maybe Int64
 readHexT t
   | T.null t = Nothing
-  | T.all isHexDigit t = Just (T.foldl' (\acc c -> acc * 16 + toInteger (digitToInt c)) 0 t)
+  | T.all isHexDigit t = Just (T.foldl' (\acc c -> acc * 16 + fromIntegral (digitToInt c)) 0 t)
   | otherwise = Nothing
 
-readOctT :: Text -> Maybe Integer
+readOctT :: Text -> Maybe Int64
 readOctT t
   | T.null t = Nothing
   | T.all isOctDigit t =
-      Just (T.foldl' (\acc c -> acc * 8 + toInteger (digitToInt c)) 0 t)
+      Just (T.foldl' (\acc c -> acc * 8 + fromIntegral (digitToInt c)) 0 t)
   | otherwise = Nothing
 
-readBinT :: Text -> Maybe Integer
+readBinT :: Text -> Maybe Int64
 readBinT t
   | T.null t = Nothing
   | T.all (\c -> c == '0' || c == '1') t =
-      Just (T.foldl' (\acc c -> acc * 2 + toInteger (digitToInt c)) 0 t)
+      Just (T.foldl' (\acc c -> acc * 2 + fromIntegral (digitToInt c)) 0 t)
   | otherwise = Nothing
 
 readDouble :: Text -> Maybe Double

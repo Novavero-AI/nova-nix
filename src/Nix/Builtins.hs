@@ -15,6 +15,7 @@ module Nix.Builtins
   )
 where
 
+import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -34,7 +35,7 @@ import Nix.Store.Path (platformStoreDirText)
 --
 -- @searchPaths@ populates @builtins.nixPath@.  Parsed from @NIX_PATH@
 -- by 'parseNixPath'.  In tests, pass @[]@.
-builtinEnv :: Integer -> [Thunk] -> Env
+builtinEnv :: Int64 -> [Thunk] -> Env
 builtinEnv timestamp searchPaths =
   let scope =
         attrSetFromMap $
@@ -77,21 +78,21 @@ topLevelBuiltin name = (name, evaluated (VBuiltin name []))
 
 -- | Like 'builtinEnv' but with additional scope bindings overlaid on
 -- the top-level environment.  Used by @scopedImport@.
-builtinEnvWithScope :: Integer -> [Thunk] -> [(Text, Thunk)] -> Env
+builtinEnvWithScope :: Int64 -> [Thunk] -> [(Text, Thunk)] -> Env
 builtinEnvWithScope timestamp searchPaths scope =
   let base = builtinEnv timestamp searchPaths
       scopeMap = Map.fromList scope
    in newCEnv nullPtr 0 (Just (attrSetFromMap scopeMap)) (Just base) nullPtr 0
 
 -- | The @builtins@ attribute set, derived from the central registry.
-builtinsAttrSet :: Integer -> [Thunk] -> NixValue
+builtinsAttrSet :: Int64 -> [Thunk] -> NixValue
 builtinsAttrSet timestamp searchPaths =
   VAttrs $ attrSetFromMap $ Map.union builtinEntries (standardEntries timestamp searchPaths)
   where
     builtinEntries =
       Map.fromList [(name, evaluated (VBuiltin name [])) | name <- builtinNames]
 
-standardEntries :: Integer -> [Thunk] -> Map.Map Text Thunk
+standardEntries :: Int64 -> [Thunk] -> Map.Map Text Thunk
 standardEntries timestamp searchPaths =
   Map.fromList
     [ ("true", evaluated (VBool True)),

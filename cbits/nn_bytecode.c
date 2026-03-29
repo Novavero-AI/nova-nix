@@ -10,6 +10,7 @@
  */
 
 #include "nn_bytecode.h"
+#include "nn_assert.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,8 @@ static uint32_t  g_data_capacity = 0;
 
 void nn_bytecode_init(uint32_t op_capacity, uint32_t data_capacity)
 {
+    if (g_ops) nn_bytecode_destroy();
+
     if (op_capacity == 0)   op_capacity   = NN_BC_DEFAULT_OP_CAPACITY;
     if (data_capacity == 0) data_capacity = NN_BC_DEFAULT_DATA_CAPACITY;
 
@@ -60,20 +63,28 @@ void nn_bytecode_destroy(void)
 
 /* --- Internal: grow arrays --- */
 
-static void ensure_op_space(void)
+static int ensure_op_space(void)
 {
-    if (g_op_count < g_op_capacity) return;
+    if (g_op_count < g_op_capacity) return 0;
     uint32_t new_cap = g_op_capacity * 2;
-    g_ops = (nn_op_t *)realloc(g_ops, (size_t)new_cap * sizeof(nn_op_t));
+    if (new_cap < g_op_capacity) return -1; /* overflow guard */
+    nn_op_t *new_ops = (nn_op_t *)realloc(g_ops, (size_t)new_cap * sizeof(nn_op_t));
+    if (!new_ops) return -1;
+    g_ops = new_ops;
     g_op_capacity = new_cap;
+    return 0;
 }
 
-static void ensure_data_space(void)
+static int ensure_data_space(void)
 {
-    if (g_data_count < g_data_capacity) return;
+    if (g_data_count < g_data_capacity) return 0;
     uint32_t new_cap = g_data_capacity * 2;
-    g_data = (uint32_t *)realloc(g_data, (size_t)new_cap * sizeof(uint32_t));
+    if (new_cap < g_data_capacity) return -1; /* overflow guard */
+    uint32_t *new_data = (uint32_t *)realloc(g_data, (size_t)new_cap * sizeof(uint32_t));
+    if (!new_data) return -1;
+    g_data = new_data;
     g_data_capacity = new_cap;
+    return 0;
 }
 
 /* --- Emit --- */
@@ -81,7 +92,7 @@ static void ensure_data_space(void)
 uint32_t nn_bc_emit(uint8_t opcode, uint8_t flags, uint16_t short_arg,
                     uint32_t arg1, uint32_t arg2, uint32_t arg3)
 {
-    ensure_op_space();
+    if (ensure_op_space() != 0) return UINT32_MAX;
     uint32_t idx = g_op_count++;
     nn_op_t *op  = &g_ops[idx];
     op->opcode    = opcode;
@@ -95,7 +106,7 @@ uint32_t nn_bc_emit(uint8_t opcode, uint8_t flags, uint16_t short_arg,
 
 uint32_t nn_bc_emit_data(uint32_t value)
 {
-    ensure_data_space();
+    if (ensure_data_space() != 0) return UINT32_MAX;
     uint32_t offset = g_data_count++;
     g_data[offset]  = value;
     return offset;
@@ -103,16 +114,16 @@ uint32_t nn_bc_emit_data(uint32_t value)
 
 /* --- Read instructions --- */
 
-uint8_t  nn_bc_opcode(uint32_t idx)    { return g_ops[idx].opcode;    }
-uint8_t  nn_bc_flags(uint32_t idx)     { return g_ops[idx].flags;     }
-uint16_t nn_bc_short_arg(uint32_t idx) { return g_ops[idx].short_arg; }
-uint32_t nn_bc_arg1(uint32_t idx)      { return g_ops[idx].arg1;      }
-uint32_t nn_bc_arg2(uint32_t idx)      { return g_ops[idx].arg2;      }
-uint32_t nn_bc_arg3(uint32_t idx)      { return g_ops[idx].arg3;      }
+uint8_t  nn_bc_opcode(uint32_t idx)    { NN_ASSERT(idx < g_op_count, "nn_bc_opcode: idx out of bounds"); return g_ops[idx].opcode;    }
+uint8_t  nn_bc_flags(uint32_t idx)     { NN_ASSERT(idx < g_op_count, "nn_bc_flags: idx out of bounds"); return g_ops[idx].flags;     }
+uint16_t nn_bc_short_arg(uint32_t idx) { NN_ASSERT(idx < g_op_count, "nn_bc_short_arg: idx out of bounds"); return g_ops[idx].short_arg; }
+uint32_t nn_bc_arg1(uint32_t idx)      { NN_ASSERT(idx < g_op_count, "nn_bc_arg1: idx out of bounds"); return g_ops[idx].arg1;      }
+uint32_t nn_bc_arg2(uint32_t idx)      { NN_ASSERT(idx < g_op_count, "nn_bc_arg2: idx out of bounds"); return g_ops[idx].arg2;      }
+uint32_t nn_bc_arg3(uint32_t idx)      { NN_ASSERT(idx < g_op_count, "nn_bc_arg3: idx out of bounds"); return g_ops[idx].arg3;      }
 
 /* --- Read data --- */
 
-uint32_t nn_bc_data(uint32_t offset)   { return g_data[offset]; }
+uint32_t nn_bc_data(uint32_t offset)   { NN_ASSERT(offset < g_data_count, "nn_bc_data: offset out of bounds"); return g_data[offset]; }
 
 /* --- Diagnostics --- */
 

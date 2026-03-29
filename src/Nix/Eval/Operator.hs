@@ -11,6 +11,7 @@ module Nix.Eval.Operator
   )
 where
 
+import Data.Int (Int64)
 import Data.Text (Text)
 import Nix.Eval.CAttrSet (cattrsetUnion)
 import Nix.Eval.CList (clistFromThunks, clistLen, clistThunks)
@@ -74,11 +75,13 @@ evalUnary OpNegate val = case val of
 -- | Addition: int/float arithmetic, string concatenation, path append.
 evalAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 evalAdd (VInt a) (VInt b) = pure (VInt (a + b))
-evalAdd (VInt a) (VFloat b) = pure (VFloat (fromInteger a + b))
-evalAdd (VFloat a) (VInt b) = pure (VFloat (a + fromInteger b))
+evalAdd (VInt a) (VFloat b) = pure (VFloat (fromIntegral a + b))
+evalAdd (VFloat a) (VInt b) = pure (VFloat (a + fromIntegral b))
 evalAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
 evalAdd (VStr a ctxA) (VStr b ctxB) = pure (VStr (a <> b) (ctxA <> ctxB))
 evalAdd (VPath a) (VStr b _) = pure (VPath (a <> b))
+evalAdd (VPath a) (VPath b) = pure (VPath (a <> b))
+evalAdd (VStr a ctxA) (VPath b) = pure (VStr (a <> b) ctxA)
 evalAdd left right =
   throwEvalError ("cannot add " <> typeName left <> " and " <> typeName right)
 
@@ -86,15 +89,15 @@ evalAdd left right =
 evalArith ::
   (MonadEval m) =>
   Text ->
-  (Integer -> Integer -> Integer) ->
+  (Int64 -> Int64 -> Int64) ->
   (Double -> Double -> Double) ->
   NixValue ->
   NixValue ->
   m NixValue
 evalArith name intOp floatOp left right = case (left, right) of
   (VInt a, VInt b) -> pure (VInt (intOp a b))
-  (VInt a, VFloat b) -> pure (VFloat (floatOp (fromInteger a) b))
-  (VFloat a, VInt b) -> pure (VFloat (floatOp a (fromInteger b)))
+  (VInt a, VFloat b) -> pure (VFloat (floatOp (fromIntegral a) b))
+  (VFloat a, VInt b) -> pure (VFloat (floatOp a (fromIntegral b)))
   (VFloat a, VFloat b) -> pure (VFloat (floatOp a b))
   _ ->
     throwEvalError
@@ -106,16 +109,17 @@ evalArith name intOp floatOp left right = case (left, right) of
           <> typeName right
       )
 
--- | Division with zero check.  Integer division uses 'quot'.
+-- | Division with zero check.  Integer division uses floored 'div'
+-- (matching Nix semantics: truncation toward negative infinity).
 evalDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 evalDiv left right = case (left, right) of
   (VInt _, VInt 0) -> throwEvalError "division by zero"
-  (VInt a, VInt b) -> pure (VInt (quot a b))
+  (VInt a, VInt b) -> pure (VInt (div a b))
   (VInt a, VFloat b)
     | b == 0 -> throwEvalError "division by zero"
-    | otherwise -> pure (VFloat (fromInteger a / b))
+    | otherwise -> pure (VFloat (fromIntegral a / b))
   (VFloat _, VInt 0) -> throwEvalError "division by zero"
-  (VFloat a, VInt b) -> pure (VFloat (a / fromInteger b))
+  (VFloat a, VInt b) -> pure (VFloat (a / fromIntegral b))
   (VFloat a, VFloat b)
     | b == 0 -> throwEvalError "division by zero"
     | otherwise -> pure (VFloat (a / b))
@@ -134,8 +138,8 @@ evalDiv left right = case (left, right) of
 -- | Ordering comparison for < (reused for >, <=, >= via argument swap).
 nixCompare :: (MonadEval m) => NixValue -> NixValue -> m Bool
 nixCompare (VInt a) (VInt b) = pure (a < b)
-nixCompare (VInt a) (VFloat b) = pure (fromInteger a < b)
-nixCompare (VFloat a) (VInt b) = pure (a < fromInteger b)
+nixCompare (VInt a) (VFloat b) = pure (fromIntegral a < b)
+nixCompare (VFloat a) (VInt b) = pure (a < fromIntegral b)
 nixCompare (VFloat a) (VFloat b) = pure (a < b)
 -- String comparison ignores context (matching real Nix).
 nixCompare (VStr a _) (VStr b _) = pure (a < b)
@@ -151,8 +155,8 @@ nixCompare left right =
 -- attribute sets as needed.
 nixEqual :: (MonadEval m) => Force m -> NixValue -> NixValue -> m Bool
 nixEqual _ (VInt a) (VInt b) = pure (a == b)
-nixEqual _ (VInt a) (VFloat b) = pure (fromInteger a == b)
-nixEqual _ (VFloat a) (VInt b) = pure (a == fromInteger b)
+nixEqual _ (VInt a) (VFloat b) = pure (fromIntegral a == b)
+nixEqual _ (VFloat a) (VInt b) = pure (a == fromIntegral b)
 nixEqual _ (VFloat a) (VFloat b) = pure (a == b)
 nixEqual _ (VBool a) (VBool b) = pure (a == b)
 nixEqual _ VNull VNull = pure True
