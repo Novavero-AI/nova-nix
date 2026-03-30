@@ -236,7 +236,13 @@ lexNormalMode st acc = case T.uncons (lsInput st) of
           [] -> False
     '$'
       | Just '{' <- safeHead rest ->
-          emit2 st TokInterpOpen acc
+          -- Increment brace depth so the closing } is TokRBrace, not
+          -- TokInterpClose.  Without this, ${name} inside a string
+          -- interpolation like "${env.${name}}" prematurely ends the
+          -- outer interpolation.
+          let tok = Located (lsLine st) (lsCol st) TokInterpOpen
+              newSt = advanceCol 2 st {lsInput = T.drop 1 rest, lsBraceDepth = lsBraceDepth st + 1}
+           in lexNormalMode newSt (tok : acc)
     '~'
       | Just '/' <- safeHead rest ->
           lexPath st acc

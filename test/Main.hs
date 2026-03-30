@@ -3274,7 +3274,11 @@ testPhase4 = do
       runTest "dynamic key in hasAttr" $
         assertEval "dynamic key hasAttr" "let s = { x = 10; }; in s ? ${\"x\"}" (VBool True),
       runTest "dynamic key hasAttr missing" $
-        assertEval "dynamic key hasAttr missing" "let s = { x = 10; }; in s ? ${\"y\"}" (VBool False)
+        assertEval "dynamic key hasAttr missing" "let s = { x = 10; }; in s ? ${\"y\"}" (VBool False),
+      -- Dynamic attr inside string interpolation (the ${name} must not
+      -- prematurely close the outer interpolation)
+      runTest "dynamic key in string interp" $
+        assertEval "dynamic key interp" "let s = { x = 10; }; in \"${toString s.${\"x\"}}\"" (VStr "10" mempty)
     ]
 
 testPhase4IO :: IO [Bool]

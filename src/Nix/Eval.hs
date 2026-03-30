@@ -67,7 +67,7 @@ where
 import Control.Monad (foldM, when, (>=>))
 import qualified Crypto.Hash as CH
 import qualified Data.Array as Array
-import Data.Bits (xor, (.&.), (.|.))
+import Data.Bits (complement, xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, isOctDigit, ord)
@@ -83,11 +83,13 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Word (Word16, Word32, Word8)
-import Foreign.Ptr (Ptr, castPtr, nullPtr)
-import Foreign.Storable (peekElemOff)
+import Data.Word (Word32, Word8)
+import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
+import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpcode, cbcShortArg)
+import Nix.Eval.CEnv (cenvPushWith)
+import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
@@ -140,7 +142,6 @@ import Nix.Eval.Types
     mkThunkBc,
     newCEnv,
     newMinimalEnv,
-    pushWithScope,
     readThunkValue,
     thunkToCPtr,
     typeName,
@@ -236,11 +237,12 @@ evalBytecode env bcIdx =
         19 {- WITH -} ->
           let scopeIdx = unsafePerformIO (cbcArg1 bcIdx)
               bodyIdx = unsafePerformIO (cbcArg2 bcIdx)
-           in do
-                scopeVal <- evalBytecode env scopeIdx
-                case scopeVal of
-                  VAttrs attrs -> evalBytecode (pushWithScope attrs env) bodyIdx
-                  _ -> throwEvalError ("'with' requires a set, got " <> typeName scopeVal)
+              -- Lazy with: defer forcing the scope until a WITH_VAR lookup
+              -- actually needs it.  This is critical for nixpkgs where
+              -- all-packages.nix uses `with pkgs;` inside a fixpoint —
+              -- eagerly forcing the scope would blackhole.
+              scopeThunk = cheapThunkBc env scopeIdx
+           in evalBytecode (pushLazyWithScope scopeThunk env) bodyIdx
         20 {- ASSERT -} ->
           let condIdx = unsafePerformIO (cbcArg1 bcIdx)
               bodyIdx = unsafePerformIO (cbcArg2 bcIdx)
@@ -463,7 +465,9 @@ evalBcSelect env bcIdx0 = do
     Just val -> pure val
     Nothing
       | hasDef -> evalBytecode env defIdx
-      | otherwise -> throwEvalError ("attribute path not found in " <> typeName targetVal)
+      | otherwise -> do
+          let pathName = collectBcAttrPathNames pathLen pathOff
+          throwEvalError ("attribute '" <> pathName <> "' not found in " <> typeName targetVal)
 
 -- | Evaluate a hasAttr expression from bytecode.
 evalBcHasAttr :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -474,6 +478,17 @@ evalBcHasAttr env bcIdx0 = do
   targetVal <- evalBytecode env targetIdx
   result <- walkBcAttrPath env pathLen pathOff targetVal
   pure (VBool (isJust result))
+
+-- | Collect static attribute path names for error reporting.
+collectBcAttrPathNames :: Int -> Word32 -> Text
+collectBcAttrPathNames pathLen pathOff = T.intercalate "." (go pathLen pathOff)
+  where
+    go 0 _ = []
+    go n off =
+      let isExpr = unsafePerformIO (cbcData off)
+          keyVal = unsafePerformIO (cbcData (off + 1))
+          name = if isExpr /= 0 then "<expr>" else symbolText (Symbol keyVal)
+       in name : go (n - 1) (off + 2)
 
 -- | Walk an attribute path stored in the bytecode data buffer.
 -- Each element is two words: (is_expr, key_or_bc_idx).
@@ -740,26 +755,69 @@ evalVar env name =
 -- (parent chain to builtins).  For trimmed envs ('CapturesWithScopes'),
 -- the root scope is already appended to 'envWithScopes' so the
 -- with-scope lookup finds builtins without needing a parent chain.
+-- Supports both resolved (CAttrSet*) and lazy (CThunk*, tagged with bit 0)
+-- with-scope entries.  Lazy entries are forced on first lookup and the
+-- pointer is updated in place so subsequent lookups hit the resolved
+-- attrset directly.
 evalWithVar :: (MonadEval m) => Env -> Text -> m NixValue
 evalWithVar env name =
   let (withArr, withCount) = envWithScopesRaw env
-   in case lookupWithScopesRaw name withArr withCount of
-        Just thunk -> force thunk
-        Nothing -> evalVar env name
+   in evalWithVarScopes env name withArr (fromIntegral withCount) 0
 
--- | Walk with-scopes (C array) innermost to outermost.
--- Uses 'attrSetLookup' (C binary search) per scope.
-lookupWithScopesRaw :: Text -> Ptr (Ptr ()) -> Word16 -> Maybe Thunk
-lookupWithScopesRaw _ _ 0 = Nothing
-lookupWithScopesRaw name withArr count = unsafePerformIO $ go 0
-  where
-    go i
-      | i >= fromIntegral count = pure Nothing
-      | otherwise = do
-          scopePtr <- peekElemOff withArr i
+evalWithVarScopes :: (MonadEval m) => Env -> Text -> Ptr (Ptr ()) -> Int -> Int -> m NixValue
+evalWithVarScopes env name withArr count idx
+  | idx >= count = evalVar env name
+  | otherwise = do
+      let scopePtr = unsafePerformIO (peekElemOff withArr idx)
+      if isLazyWithScope scopePtr
+        then do
+          -- Lazy with-scope: force the thunk to get the attrset
+          let thunkPtr = untagWithScope scopePtr
+          scopeVal <- force (Thunk thunkPtr)
+          case scopeVal of
+            VAttrs (AttrSet cset) -> do
+              -- Cache: replace the tagged thunk pointer with the resolved
+              -- attrset pointer so future lookups are fast.
+              let resolvedPtr = castPtr cset
+              seq (unsafePerformIO (pokeElemOff withArr idx resolvedPtr)) (pure ())
+              case attrSetLookup name (AttrSet cset) of
+                Just thunk -> force thunk
+                Nothing -> evalWithVarScopes env name withArr count (idx + 1)
+            _ -> throwEvalError ("'with' requires a set, got " <> typeName scopeVal)
+        else
+          -- Resolved attrset scope (normal path)
           case attrSetLookup name (AttrSet (castPtr scopePtr)) of
-            Just val -> pure (Just val)
-            Nothing -> go (i + 1)
+            Just thunk -> force thunk
+            Nothing -> evalWithVarScopes env name withArr count (idx + 1)
+
+-- | Check if a with-scope pointer is tagged as lazy (bit 0 set).
+isLazyWithScope :: Ptr () -> Bool
+isLazyWithScope ptr = ptrToWordPtr ptr .&. 1 /= 0
+
+-- | Remove the lazy tag from a with-scope pointer, returning a CThunkPtr.
+untagWithScope :: Ptr () -> CThunkPtr
+untagWithScope ptr =
+  let tagged = ptrToWordPtr ptr
+   in wordPtrToPtr (tagged .&. complement 1)
+
+-- | Tag a CThunkPtr as a lazy with-scope (set bit 0).
+tagLazyWithScope :: CThunkPtr -> Ptr ()
+tagLazyWithScope ptr =
+  let raw = ptrToWordPtr (castPtr ptr)
+   in wordPtrToPtr (raw .|. 1)
+
+-- | Push a lazy (thunk-based) with-scope onto the environment.
+-- The scope is NOT forced until a WITH_VAR lookup actually needs it.
+{-# NOINLINE pushLazyWithScope #-}
+pushLazyWithScope :: Thunk -> Env -> Env
+pushLazyWithScope (Thunk thunkPtr) =
+  pushWithScopeRaw (tagLazyWithScope thunkPtr)
+
+-- | Push a raw pointer as a with-scope.
+{-# NOINLINE pushWithScopeRaw #-}
+pushWithScopeRaw :: Ptr () -> Env -> Env
+pushWithScopeRaw ptr (Env envPtr) =
+  Env (unsafePerformIO (cenvPushWith envPtr ptr))
 
 -- ---------------------------------------------------------------------------
 -- Formals matching + env helpers (used by evalBcApp, applyValue, etc.)
@@ -2966,28 +3024,30 @@ fetchUrlSimple url _sha256 = do
       storePath <- writeToStore "fetchurl-result" stdout
       pure (VPath storePath)
 
--- | Force a required string attribute from an attrset.
+-- | Force a required string attribute from an attrset, using full Nix string
+-- coercion (VStr, VPath, VInt, VBool, VAttrs via __toString/outPath).
 forceAttrStr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
 forceAttrStr builtin key attrs =
   case attrSetLookup key attrs of
     Nothing -> throwEvalError (builtin <> ": missing required attribute '" <> key <> "'")
     Just thunk -> do
       val <- force thunk
-      case val of
-        VStr s _ -> pure s
-        VPath p -> pure p
-        _ -> throwEvalError (builtin <> ": '" <> key <> "' must be a string")
+      result <- catchEvalError (coerceToString force applyValue val)
+      case result of
+        Right (s, _ctx) -> pure s
+        Left _ -> throwEvalError (builtin <> ": '" <> key <> "' must be a string")
 
--- | Force an optional string attribute.
+-- | Force an optional string attribute via full Nix coercion.
 forceOptionalAttrStr :: (MonadEval m) => AttrSet -> Text -> m (Maybe Text)
 forceOptionalAttrStr attrs key =
   case attrSetLookup key attrs of
     Nothing -> pure Nothing
     Just thunk -> do
       val <- force thunk
-      case val of
-        VStr s _ -> pure (Just s)
-        _ -> pure Nothing
+      result <- catchEvalError (coerceToString force applyValue val)
+      case result of
+        Right (s, _ctx) -> pure (Just s)
+        Left _ -> pure Nothing
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — derivation construction
@@ -3116,17 +3176,17 @@ builtinDerivation (VAttrs attrs) = do
 builtinDerivation other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
--- | Force a thunk to a Text string.
+-- | Force a thunk to a Text string via full Nix coercion.
 forceToText :: (MonadEval m) => Thunk -> m Text
 forceToText thunk = do
   val <- force thunk
-  case val of
-    VStr s _ -> pure s
-    VPath p -> pure p
-    _ -> throwEvalError ("expected a string, got " <> typeName val)
+  (s, _ctx) <- coerceToString force applyValue val
+  pure s
 
 -- | Collect all string-coercible attributes for the derivation environment,
 -- along with the merged string context from all collected values.
+-- Uses 'coerceToStringPermissive' for full Nix coercion including
+-- __toString, outPath, and list-to-space-separated-string.
 collectDrvEnvWithContext :: (MonadEval m) => Map Text Thunk -> m ([(Text, Text)], StringContext)
 collectDrvEnvWithContext attrs = do
   let pairs = Map.toList attrs
@@ -3138,24 +3198,12 @@ collectDrvEnvWithContext attrs = do
     tryCoerce (key, thunk) = do
       val <- force thunk
       case val of
-        VStr s ctx -> pure (Just (key, s, ctx))
-        VPath p -> pure (Just (key, p, emptyContext))
-        VInt n -> pure (Just (key, T.pack (show n), emptyContext))
-        VBool True -> pure (Just (key, "1", emptyContext))
-        VBool False -> pure (Just (key, "", emptyContext))
         VNull -> pure Nothing
-        VList _ -> pure Nothing
-        VAttrs innerAttrs ->
-          -- Derivations in env get their outPath
-          case attrSetLookup "outPath" innerAttrs of
-            Just outThunk -> do
-              outVal <- force outThunk
-              case outVal of
-                VPath p -> pure (Just (key, p, emptyContext))
-                VStr s ctx -> pure (Just (key, s, ctx))
-                _ -> pure Nothing
-            Nothing -> pure Nothing
-        _ -> pure Nothing
+        _ -> do
+          result <- catchEvalError (coerceToStringPermissive val)
+          case result of
+            Right (s, ctx) -> pure (Just (key, s, ctx))
+            Left _ -> pure Nothing
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — hashFile, readFileType
