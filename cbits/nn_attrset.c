@@ -204,7 +204,8 @@ void nn_attrset_freeze(nn_attrset_t *set)
         nn_tagged_entry_t *tagged = (nn_tagged_entry_t *)malloc(
             (size_t)set->count * sizeof(nn_tagged_entry_t));
         if (!tagged) {
-            /* Fallback: in-place insertion sort for large sets when malloc fails. */
+            /* Fallback: in-place insertion sort for large sets when malloc
+             * fails.  Falls through to the dedup block below. */
             for (uint32_t i = 1; i < set->count; i++) {
                 nn_symbol_t key = set->keys[i];
                 void *val = set->values[i];
@@ -217,24 +218,23 @@ void nn_attrset_freeze(nn_attrset_t *set)
                 set->keys[j] = key;
                 set->values[j] = val;
             }
-            set->frozen = 1;
-            return;
-        }
-        uint32_t i;
-        for (i = 0; i < set->count; i++) {
-            tagged[i].key = set->keys[i];
-            tagged[i].idx = i;
-            tagged[i].value = set->values[i];
-        }
+        } else {
+            uint32_t i;
+            for (i = 0; i < set->count; i++) {
+                tagged[i].key = set->keys[i];
+                tagged[i].idx = i;
+                tagged[i].value = set->values[i];
+            }
 
-        /* Sort by key, break ties by insertion index (ascending). */
-        qsort(tagged, set->count, sizeof(nn_tagged_entry_t), cmp_tagged);
+            /* Sort by key, break ties by insertion index (ascending). */
+            qsort(tagged, set->count, sizeof(nn_tagged_entry_t), cmp_tagged);
 
-        for (i = 0; i < set->count; i++) {
-            set->keys[i] = tagged[i].key;
-            set->values[i] = tagged[i].value;
+            for (i = 0; i < set->count; i++) {
+                set->keys[i] = tagged[i].key;
+                set->values[i] = tagged[i].value;
+            }
+            free(tagged);
         }
-        free(tagged);
     }
 
     /* Dedup: keep last occurrence of each key (last-writer-wins).

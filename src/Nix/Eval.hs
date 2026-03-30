@@ -93,7 +93,7 @@ import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
-import Nix.Eval.StringInterp (coerceToString, stripIndentation)
+import Nix.Eval.StringInterp (coerceToString, formatNixFloat, stripIndentation)
 import Nix.Eval.Symbol (Symbol (..), symbolText)
 import Nix.Eval.Types
   ( AttrSet (..),
@@ -2497,11 +2497,7 @@ valueToJSON VNull = pure ("null", emptyContext)
 valueToJSON (VBool True) = pure ("true", emptyContext)
 valueToJSON (VBool False) = pure ("false", emptyContext)
 valueToJSON (VInt n) = pure (T.pack (show n), emptyContext)
-valueToJSON (VFloat f) =
-  let s = show f
-   in -- Nix outputs 1e+40 style, Haskell outputs 1.0e40 style
-      -- For simple cases just use show
-      pure (T.pack s, emptyContext)
+valueToJSON (VFloat f) = pure (formatNixFloat f, emptyContext)
 valueToJSON (VStr s ctx) = pure (jsonEscapeString s, ctx)
 valueToJSON (VList cl) = do
   let thunks = map Thunk (clistThunks cl)

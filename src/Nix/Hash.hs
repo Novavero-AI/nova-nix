@@ -46,8 +46,10 @@ module Nix.Hash
 where
 
 import qualified Crypto.Hash as CH
+import Data.Bits (xor)
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
+import Data.List (foldl')
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
@@ -80,12 +82,26 @@ sha256Hex bs =
       bytes = BA.unpack digest
    in T.pack (concatMap byteToHex bytes)
 
--- | Truncate a SHA-256 digest to 20 bytes and Nix base-32 encode.
+-- | Compress a SHA-256 digest to 20 bytes via XOR-folding and Nix base-32
+-- encode.  Matches C++ Nix @compressHash@: bytes beyond the target length
+-- are XOR'd back onto the prefix, preserving information from the full
+-- digest rather than simply truncating.
 truncatedBase32 :: BS.ByteString -> Text
 truncatedBase32 bs =
   let digest = CH.hash bs :: CH.Digest CH.SHA256
-      bytes20 = BS.pack (take 20 (BA.unpack digest :: [Word8]))
-   in encode bytes20
+      allBytes = BA.unpack digest :: [Word8]
+      compressed = compressHash 20 allBytes
+   in encode (BS.pack compressed)
+
+-- | XOR-fold a hash to @targetLen@ bytes, matching C++ Nix @compressHash@.
+-- Each source byte is XOR'd into position @i mod targetLen@.
+compressHash :: Int -> [Word8] -> [Word8]
+compressHash targetLen bytes =
+  let arr0 = replicate targetLen 0
+      fold_ acc (i, b) =
+        let pos = i `mod` targetLen
+         in zipWith (\j x -> if j == pos then xor x b else x) [0 :: Int ..] acc
+   in foldl' fold_ arr0 (zip [0 ..] bytes)
 
 -- | Format a single byte as two lowercase hex digits.
 byteToHex :: Word8 -> String

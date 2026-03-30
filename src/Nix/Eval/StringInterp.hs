@@ -8,6 +8,7 @@ module Nix.Eval.StringInterp
   ( evalStringParts,
     evalIndStringParts,
     coerceToString,
+    formatNixFloat,
     stripIndentation,
   )
 where
@@ -17,6 +18,7 @@ import qualified Data.Text as T
 import Nix.Eval.Context (concatStrings)
 import Nix.Eval.Types (Env, MonadEval (..), NixValue (..), StringContext, Thunk, attrSetLookup, emptyContext, typeName)
 import Nix.Expr.Types (Expr, StringPart (..))
+import Numeric (showFFloat)
 
 -- | The evaluator function, passed as a parameter to avoid cyclic imports.
 type Eval m = Env -> Expr -> m NixValue
@@ -60,7 +62,7 @@ evalOnePart evalFn forceFn applyFn env (StrInterp expr) = do
 coerceToString :: (MonadEval m) => Force m -> Apply m -> NixValue -> m (Text, StringContext)
 coerceToString _ _ (VStr s ctx) = pure (s, ctx)
 coerceToString _ _ (VInt n) = pure (T.pack (show n), emptyContext)
-coerceToString _ _ (VFloat n) = pure (T.pack (show n), emptyContext)
+coerceToString _ _ (VFloat n) = pure (formatNixFloat n, emptyContext)
 coerceToString _ _ (VPath p) = pure (p, emptyContext)
 coerceToString _ _ VNull = pure ("", emptyContext)
 coerceToString _ _ (VBool True) = pure ("1", emptyContext)
@@ -80,6 +82,20 @@ coerceToString forceFn applyFn (VAttrs attrs) =
         throwEvalError "cannot coerce a set to a string (missing __toString or outPath)"
 coerceToString _ _ other =
   throwEvalError ("cannot coerce " <> typeName other <> " to a string")
+
+-- | Format a float the way C++ Nix does: 6 fixed decimal places
+-- (@std::to_string@), then strip trailing zeros and unnecessary
+-- decimal point.  E.g. @1.0@ → @"1"@, @3.14@ → @"3.14"@.
+formatNixFloat :: Double -> Text
+formatNixFloat n =
+  let fixed = showFFloat (Just 6) n ""
+   in T.pack (stripZeros fixed)
+  where
+    stripZeros s
+      | '.' `elem` s = reverse (dropDot (dropWhile (== '0') (reverse s)))
+      | otherwise = s
+    dropDot ('.' : rest) = rest
+    dropDot xs = xs
 
 -- ---------------------------------------------------------------------------
 -- Indented string whitespace stripping

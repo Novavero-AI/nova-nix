@@ -252,6 +252,7 @@ nn_env_lookup_resolved(const nn_env_t *env, int level, int idx)
 {
     NN_ASSERT(env != NULL, "nn_env_lookup_resolved: NULL env");
     while (level > 0) {
+        NN_ASSERT(env->parent != NULL, "nn_env_lookup_resolved: parent chain too short for level");
         env = env->parent;
         level--;
     }

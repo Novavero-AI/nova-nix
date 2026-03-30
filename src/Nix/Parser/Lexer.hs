@@ -306,10 +306,10 @@ lexIndStringMode st acc
             Just ('\'', rest1) | Just ('\'', rest2) <- T.uncons rest1 ->
               -- Check for escape sequences: ''', ''$, ''\x, ''${
               case T.uncons rest2 of
-                Just ('\'', _) ->
-                  -- ''' → literal single quote
+                Just ('\'', rest3) ->
+                  -- ''' → literal single quote (consume all 3)
                   let litTok = Located (lsLine st) (lsCol st) (TokStringLit "'")
-                      newSt = advanceCol 3 st {lsInput = rest2}
+                      newSt = advanceCol 3 st {lsInput = rest3}
                    in lexIndStringMode newSt (litTok : acc)
                 Just ('$', rest3)
                   | Just ('{', rest4) <- T.uncons rest3 ->
@@ -317,6 +317,11 @@ lexIndStringMode st acc
                       let litTok = Located (lsLine st) (lsCol st) (TokStringLit "${")
                           newSt = advanceCol 4 st {lsInput = rest4}
                        in lexIndStringMode newSt (litTok : acc)
+                Just ('$', rest3) ->
+                  -- ''$ (without brace) → literal $
+                  let litTok = Located (lsLine st) (lsCol st) (TokStringLit "$")
+                      newSt = advanceCol 3 st {lsInput = rest3}
+                   in lexIndStringMode newSt (litTok : acc)
                 Just ('\\', rest3) ->
                   -- ''\x → escape sequence
                   case T.uncons rest3 of
