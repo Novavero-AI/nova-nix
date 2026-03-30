@@ -1,7 +1,7 @@
 <div align="center">
 <h1>nova-nix</h1>
 <p><strong>Windows-Native Nix</strong></p>
-<p>A from-scratch Nix implementation in Haskell + C99. Parser, lazy evaluator, content-addressed store, derivation builder, binary substituter. Runs natively on Windows, macOS, and Linux. No WSL. No Cygwin. No MSYS2.</p>
+<p>A from-scratch Nix implementation in Haskell + C99. Parser, lazy evaluator, content-addressed store, derivation builder, binary substituter. Runs natively on Windows, macOS, and Linux. No WSL. No Cygwin.</p>
 <p><a href="#try-it">Try It</a> · <a href="#cli">CLI</a> · <a href="#architecture">Architecture</a> · <a href="#performance">Performance</a> · <a href="#modules">Modules</a> · <a href="#roadmap">Roadmap</a></p>
 <p>
 
@@ -21,7 +21,7 @@
 |-------|-------------|
 | **Parser** | Hand-rolled recursive descent. 14 precedence levels, 18 AST constructors, all Nix syntax including `<nixpkgs>`, `${expr}` keys, indented strings. |
 | **Evaluator** | Bytecode-compiled lazy evaluation. Thunk memoization with blackhole detection. Knot-tying for recursive `let`/`rec`. Polymorphic via `MonadEval`. |
-| **108 Builtins** | Arithmetic, strings, lists, attrsets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON, hashing, regex, version parsing, `tryEval`, `deepSeq`, `genericClosure`, string contexts, IO (`import`, `readFile`, `pathExists`, `derivation`, `fetchurl`, `fetchTarball`, `fetchGit`), and more. |
+| **114 Builtins** | Arithmetic, strings, lists, attrsets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON, hashing, regex, version parsing, `tryEval`, `deepSeq`, `genericClosure`, string contexts, IO (`import`, `readFile`, `pathExists`, `derivation`, `fetchurl`, `fetchTarball`, `fetchGit`), and more. |
 | **C99 Data Layer** | 9 arena-allocated C modules for interned symbols, sorted attrsets, thunks, envs, lists, bytecode, lambdas. All eval data off the GHC heap. |
 | **Store** | Content-addressed `/nix/store` (or `C:\nix\store`). SQLite metadata, reference scanning, read-only enforcement. |
 | **Builder** | Dependency graph via Kahn's toposort. Binary cache substitution before local builds. Multi-output, reference scanning, store registration. |
@@ -131,7 +131,7 @@ The C99 data layer moves all evaluation data off the GHC heap:
 
 Measured on a stress test with 100k attribute sets, recursive computations, list operations, and overlay patterns.
 
-**nixpkgs status:** `import <nixpkgs/lib>` evaluates correctly. `lib.fix`, `lib.extends`, `lib.makeExtensible`, and `lib.evalModules` all work. Full `import <nixpkgs> {}` evaluation is in progress.
+**nixpkgs status:** `import <nixpkgs/lib>` evaluates correctly (450 attributes). `lib.fix`, `lib.extends`, `lib.makeExtensible`, `lib.evalModules`, and `lib.systems.elaborate` all work. The stdenv bootstrap stages compute successfully. Full `import <nixpkgs> {}` evaluation is in progress — currently past derivation construction and overlay composition.
 
 ---
 
@@ -146,8 +146,8 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 | No `/nix/store` | `C:\nix\store` — all paths parameterized, never hardcoded |
 | Case-insensitive FS | Content-addressed hashes make collisions impossible |
 | 260-char path limit | `\\?\` extended-length prefix (32K chars) |
-| No bash | Ship `bash.exe` from MSYS2 (same as Git for Windows) |
-| stdenv bootstrap | Cross-compile from Linux, or bootstrap from MSYS2 MinGW toolchain |
+| No bash | Builder ships `bash.exe` in the store (from MSYS2, same as Git for Windows) |
+| stdenv bootstrap | Windows stdenv with MinGW GCC + MSYS2 coreutils in `C:\nix\store` |
 
 ---
 
@@ -168,12 +168,12 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 
 | Module | Purpose |
 |--------|---------|
-| `Nix.Eval` | Bytecode evaluator — 24-opcode dispatch, thunk forcing, env operations, 108-builtin dispatch. Polymorphic via `MonadEval` |
+| `Nix.Eval` | Bytecode evaluator — 24-opcode dispatch, thunk forcing, env operations, 114-builtin dispatch. Polymorphic via `MonadEval` |
 | `Nix.Eval.Types` | `NixValue` (12 constructors), `Thunk` (C arena cell), `Env` (C-native struct), `AttrSet` (C sorted arrays), `MonadEval` typeclass |
 | `Nix.Eval.Compile` | Bytecode compiler — Expr AST to flat `nn_bytecode` instruction array |
 | `Nix.Eval.Operator` | Arithmetic with float promotion, deep structural equality, floored division |
 | `Nix.Eval.IO` | IO evaluation monad — filesystem access, import cache, process execution, per-thunk memoization with blackhole detection |
-| `Nix.Builtins` | 108 builtins, search path plumbing, top-level builtin exposure |
+| `Nix.Builtins` | 114 builtins, search path plumbing, top-level builtin exposure |
 
 ### C99 Data Layer
 
@@ -209,7 +209,7 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 
 - [x] Full Nix parser (14 precedence levels, all syntax forms)
 - [x] Lazy bytecode evaluator (24 opcodes, thunk memoization, blackhole detection)
-- [x] 108 builtins (matching real Nix spec)
+- [x] 114 builtins (matching real Nix spec)
 - [x] C99 data layer (9 modules, all eval data off GHC heap)
 - [x] Content-addressed store with SQLite metadata
 - [x] Derivation builder with dependency resolution
@@ -219,15 +219,16 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 
 ### Next
 
-- [ ] Full `import <nixpkgs> {}` — NixOS module system fixpoint compatibility
-- [ ] `nova-nix shell` — enter a development shell
-- [ ] `nova-nix repl` — interactive evaluator
+- [ ] Full `import <nixpkgs> {}` — remaining fixpoint laziness bug in overlay composition
+- [ ] `--system` flag — override `builtins.currentSystem` for cross-platform evaluation
+- [ ] Windows stdenv — MinGW GCC + MSYS2 coreutils bootstrap for native Windows builds
 
 ### Long-Term
 
+- [ ] `nova-nix shell` — enter a development shell
+- [ ] `nova-nix repl` — interactive evaluator
 - [ ] Nix daemon protocol compatibility
 - [ ] XZ decompression for binary cache downloads
-- [ ] Store bootstrap — ship prebuilt bash + coreutils for Windows builds
 
 ---
 
@@ -235,7 +236,7 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 
 ```bash
 cabal build                              # Build library + CLI
-cabal test                               # Run all 592 tests
+cabal test                               # Run all 593 tests
 cabal build --ghc-options="-Werror"      # Warnings as errors (CI default)
 ```
 

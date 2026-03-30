@@ -540,8 +540,8 @@ testEvalErrors :: IO [Bool]
 testEvalErrors = do
   putStrLn "eval/errors"
   sequence
-    [ runTest "type error in add" $
-        assertEvalFail "type-add" "1 + true",
+    [ runTest "type error in add (set + list)" $
+        assertEvalFail "type-add" "{} + []",
       runTest "call non-function" $
         assertEvalFail "call-non" "42 1",
       runTest "builtins.throw" $
@@ -1371,9 +1371,9 @@ testBatch6 = do
         assertEval "tryEval-throw" "(builtins.tryEval (builtins.throw \"boom\")).success" (VBool False),
       runTest "tryEval failure value" $
         assertEval "tryEval-fval" "(builtins.tryEval (builtins.throw \"boom\")).value" (VBool False),
-      -- tryEval catches type error
-      runTest "tryEval catches type error" $
-        assertEval "tryEval-tyerr" "(builtins.tryEval (1 + \"a\")).success" (VBool False),
+      -- tryEval catches coercion error (+ on attrset without outPath)
+      runTest "tryEval catches coercion error" $
+        assertEval "tryEval-tyerr" "(builtins.tryEval ({} + [])).success" (VBool False),
       -- deepSeq
       runTest "deepSeq returns second" $
         assertEval "deepSeq" "builtins.deepSeq [ 1 2 3 ] 42" (VInt 42),

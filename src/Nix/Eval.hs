@@ -305,10 +305,35 @@ evalBcBinary env bcIdx0 =
         OpAnd -> evalShortCircuitAnd env leftIdx rightIdx
         OpOr -> evalShortCircuitOr env leftIdx rightIdx
         OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
+        OpAdd -> do
+          leftVal <- evalBytecode env leftIdx
+          rightVal <- evalBytecode env rightIdx
+          evalAddWithCoercion leftVal rightVal
         _ -> do
           leftVal <- evalBytecode env leftIdx
           rightVal <- evalBytecode env rightIdx
           evalBinary force op leftVal rightVal
+
+-- | Addition with string coercion fallback, matching C++ Nix behavior.
+-- C++ Nix's ExprOpAdd falls through to concatStrings when operands
+-- are not both numeric and neither is a path.  concatStrings calls
+-- coerceToString on each part, which handles attrsets via outPath.
+evalAddWithCoercion :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+evalAddWithCoercion left right = case (left, right) of
+  -- Numeric: direct arithmetic (matches C++ Nix priority)
+  (VFloat _, _) -> evalBinary force OpAdd left right
+  (_, VFloat _) -> evalBinary force OpAdd left right
+  (VInt _, VInt _) -> evalBinary force OpAdd left right
+  -- Path: direct concat
+  (VPath _, _) -> evalBinary force OpAdd left right
+  -- String-like: direct concat when both are string/path
+  (VStr {}, VStr {}) -> evalBinary force OpAdd left right
+  (VStr {}, VPath _) -> evalBinary force OpAdd left right
+  -- Otherwise: coerce both to strings via concatStrings (matching C++ Nix)
+  _ -> do
+    (leftStr, leftCtx) <- coerceToString force applyValue left
+    (rightStr, rightCtx) <- coerceToString force applyValue right
+    pure (VStr (leftStr <> rightStr) (leftCtx <> rightCtx))
 
 -- | Bytecode short-circuit &&
 evalShortCircuitAnd :: (MonadEval m) => Env -> Word32 -> Word32 -> m NixValue
@@ -467,7 +492,10 @@ evalBcSelect env bcIdx0 = do
       | hasDef -> evalBytecode env defIdx
       | otherwise -> do
           let pathName = collectBcAttrPathNames pathLen pathOff
-          throwEvalError ("attribute '" <> pathName <> "' not found in " <> typeName targetVal)
+              targetKeys = case targetVal of
+                VAttrs attrs -> T.intercalate ", " (take 20 (attrSetKeys attrs))
+                _ -> ""
+          throwEvalError ("attribute '" <> pathName <> "' not found in " <> typeName targetVal <> " {" <> targetKeys <> "}")
 
 -- | Evaluate a hasAttr expression from bytecode.
 evalBcHasAttr :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -870,7 +898,12 @@ checkMissingFormals :: (MonadEval m) => AttrSet -> [EvalFormal] -> m ()
 checkMissingFormals attrs formals =
   case [efName f | f <- formals, isNothing (efDefault f), not (attrSetMember (efName f) attrs)] of
     [] -> pure ()
-    (name : _) -> throwEvalError ("missing required attribute '" <> name <> "'")
+    (name : _) ->
+      let allMissing = [efName f | f <- formals, isNothing (efDefault f), not (attrSetMember (efName f) attrs)]
+          provided = attrSetKeys attrs
+          provSnippet = T.intercalate ", " (take 20 provided)
+          missSnippet = T.intercalate ", " allMissing
+       in throwEvalError ("missing required attribute '" <> name <> "'; all missing: [" <> missSnippet <> "]; provided keys (" <> T.pack (show (length provided)) <> "): [" <> provSnippet <> "]")
 
 -- | Build capture environment from capture info.
 -- NoCaptureInfo: no trimming, use env as-is.
@@ -3153,6 +3186,17 @@ builtinDerivation (VAttrs attrs) = do
   let drvPathCtx = StringContext (Set.singleton (SCAllOutputs drvSP))
       outPathCtx outName = StringContext (Set.singleton (SCDrvOutput drvSP outName))
 
+  -- Build per-output attrsets matching Nix: drv.out = { outPath, drvPath, type }
+  let mkOutputAttrs outName outP =
+        let outCtx = outPathCtx outName
+            outputAttrMap =
+              Map.fromList
+                [ ("outPath", evaluated (VStr outP outCtx)),
+                  ("drvPath", evaluated (VStr drvPathText drvPathCtx)),
+                  ("type", evaluated (mkStr "derivation"))
+                ]
+         in evaluated (VAttrs (attrSetFromMap outputAttrMap))
+
   -- Build result attrset: original attrs + drvPath, outPath, type, per-output attrs
   let baseAttrs =
         Map.fromList $
@@ -3164,7 +3208,7 @@ builtinDerivation (VAttrs attrs) = do
             ("builder", evaluated (mkStr builder)),
             ("_derivation", evaluated (VDerivation completeDrv))
           ]
-            ++ [(outName, evaluated (VStr outP (outPathCtx outName))) | (outName, outP) <- outPaths]
+            ++ [(outName, mkOutputAttrs outName outP) | (outName, outP) <- outPaths]
       -- Merge original attrs underneath so computed attrs take priority
       resultAttrs = Map.union baseAttrs materialized
 

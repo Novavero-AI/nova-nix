@@ -295,7 +295,10 @@ instance MonadEval EvalIO where
       1 {- COMPUTED -} ->
         EvalIO (liftIO (readComputed ptr))
       2 {- BLACKHOLE -} ->
-        throwEvalError "infinite recursion encountered"
+        -- Infinite recursion is non-catchable (like abort), matching C++ Nix.
+        -- tryEval must NOT catch blackholes — using abortEvaluation ensures
+        -- the error propagates through tryEval/catchEvalError.
+        abortEvaluation "infinite recursion encountered"
       _ {- PENDING -} -> do
         -- Bytecode thunks: read bc_idx + StablePtr Env.
         -- The Expr is gone (replaced by bc_idx in the struct).

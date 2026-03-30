@@ -1104,7 +1104,8 @@ instance MonadEval PureEval where
                     val = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))
                  in pure val
       2 {- BLACKHOLE -} ->
-        throwEvalError "infinite recursion encountered"
+        -- Non-catchable: must escape tryEval like in C++ Nix
+        abortEvaluation "infinite recursion encountered"
       _ {- PENDING -} ->
         let bcIdx = unsafePerformIO (cthunkGetBcIdx ptr)
             envSp = unsafePerformIO (cthunkPayload ptr)
