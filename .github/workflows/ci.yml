@@ -41,9 +41,21 @@ jobs:
             app/**/*.hs
             test/**/*.hs
 
+  c99-lint:
+    name: C99 Strict
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compile C99 with strict warnings
+        run: |
+          for f in cbits/*.c; do
+            echo "Checking $f ..."
+            gcc -std=c99 -Wall -Wextra -pedantic -Werror -fsyntax-only -Icbits "$f"
+          done
+
   cabal-check:
     name: Cabal Check
-    needs: [hlint, ormolu]
+    needs: [hlint, ormolu, c99-lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
