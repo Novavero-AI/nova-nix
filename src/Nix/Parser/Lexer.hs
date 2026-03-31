@@ -331,7 +331,7 @@ lexIndStringMode st acc
                             't' -> "\t"
                             'r' -> "\r"
                             '\\' -> "\\"
-                            _ -> T.singleton ec
+                            _ -> "\\" <> T.singleton ec
                           litTok = Located (lsLine st) (lsCol st) (TokStringLit escaped)
                           newSt = advanceCol 4 st {lsInput = rest4}
                        in lexIndStringMode newSt (litTok : acc)

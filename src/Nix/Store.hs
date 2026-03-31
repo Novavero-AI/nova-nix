@@ -175,13 +175,20 @@ copyDirectoryRecursive src dest = do
 scanReferences :: StoreDir -> [StorePath] -> FilePath -> IO [StorePath]
 scanReferences storeDir candidates dir = do
   let candidateSet = Set.fromList [(spHash sp, sp) | sp <- candidates]
-      prefixBytes = TE.encodeUtf8 (T.pack (unStoreDir storeDir <> "/"))
+      storeDirStr = unStoreDir storeDir
+      -- Scan for both forward-slash and backslash store prefixes.
+      -- On Windows, binaries may contain either separator style.
+      prefixFwd = TE.encodeUtf8 (T.pack (storeDirStr <> "/"))
+      prefixBwd = TE.encodeUtf8 (T.pack (storeDirStr <> "\\"))
+      prefixBytes = prefixFwd
       prefixLen = BS.length prefixBytes
       hashLen = 32
   files <- collectRegularFiles dir
   foundHashes <- foldlIO Set.empty files $ \acc filePath -> do
     contents <- BS.readFile filePath
-    pure (scanBytes prefixBytes prefixLen hashLen contents acc)
+    -- Scan with forward-slash prefix, then backslash (for Windows)
+    let acc1 = scanBytes prefixFwd prefixLen hashLen contents acc
+    pure (scanBytes prefixBwd prefixLen hashLen contents acc1)
   pure [sp | (h, sp) <- Set.toList candidateSet, Set.member h foundHashes]
 
 -- | Collect all regular files under a path, recursively.

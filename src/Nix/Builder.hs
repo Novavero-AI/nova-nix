@@ -109,8 +109,14 @@ defaultBuildConfig :: StoreDir -> BuildConfig
 defaultBuildConfig dir =
   BuildConfig
     { bcStoreDir = dir,
-      bcTmpDir = "/tmp/nova-nix-build",
-      bcBashPath = "/bin/bash",
+      bcTmpDir =
+        if isWindows
+          then "C:\\Temp\\nova-nix-build"
+          else "/tmp/nova-nix-build",
+      bcBashPath =
+        if isWindows
+          then "bash" -- rely on PATH (MSYS2/Git Bash)
+          else "/bin/bash",
       bcSandbox = False,
       bcCaches = []
     }

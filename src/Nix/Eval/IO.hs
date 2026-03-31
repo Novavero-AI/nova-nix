@@ -205,6 +205,8 @@ instance MonadEval EvalIO where
     -- Validate name to prevent path traversal
     when (T.any (== '/') name) $
       throwEvalError ("writeToStore: name must not contain '/': " <> name)
+    when (T.any (== '\\') name) $
+      throwEvalError ("writeToStore: name must not contain '\\': " <> name)
     when (T.isInfixOf ".." name) $
       throwEvalError ("writeToStore: name must not contain '..': " <> name)
     when (T.any (== '\0') name) $
@@ -213,8 +215,11 @@ instance MonadEval EvalIO where
     let contentHash = sha256Hex (encodeUtf8 contents)
         inner = "nix-store:sha256:" <> contentHash <> ":" <> T.pack storeDir <> ":" <> name
         pathHash = truncatedBase32 (encodeUtf8 inner)
-        storePath = T.pack storeDir <> "/" <> pathHash <> "-" <> name
-        filePath = T.unpack storePath
+        basename = pathHash <> "-" <> name
+        -- File path uses platform separator for I/O
+        filePath = storeDir </> T.unpack basename
+        -- Store path text always uses forward slash (Nix convention)
+        storePath = T.pack storeDir <> "/" <> basename
     wrapIO $ do
       Dir.createDirectoryIfMissing True storeDir
       TIO.writeFile filePath contents
@@ -227,13 +232,17 @@ instance MonadEval EvalIO where
     let raw = T.unpack rawPath
         resolved = if isRelative raw then baseDir </> raw else raw
     canonical <- wrapIO (Dir.canonicalizePath resolved)
-    source <- wrapIO (readFileAutoEncoding canonical)
-    case parseNix (T.pack canonical) source of
+    -- Directory import: append /default.nix if target is a directory
+    target <- wrapIO $ do
+      isDir <- Dir.doesDirectoryExist canonical
+      pure (if isDir then canonical </> "default.nix" else canonical)
+    source <- wrapIO (readFileAutoEncoding target)
+    case parseNix (T.pack target) source of
       Left err ->
         throwEvalError
-          ("scopedImport " <> T.pack canonical <> ": " <> T.pack (show err))
+          ("scopedImport " <> T.pack target <> ": " <> T.pack (show err))
       Right rawExpr -> do
-        let fileDir = takeDirectory canonical
+        let fileDir = takeDirectory target
             expr = resolveRelativePaths fileDir rawExpr
         -- No import cache for scoped imports (different scopes = different results)
         let scopedEnv = builtinEnvWithScope timestamp searchPaths scope
@@ -262,12 +271,25 @@ instance MonadEval EvalIO where
     pure (code, T.pack stdoutStr, T.pack stderrStr)
 
   copyPathToStore srcPath name = do
+    -- Validate name to prevent path traversal (matches writeToStore)
+    when (T.any (== '/') name) $
+      throwEvalError ("copyPathToStore: name must not contain '/': " <> name)
+    when (T.any (== '\\') name) $
+      throwEvalError ("copyPathToStore: name must not contain '\\': " <> name)
+    when (T.isInfixOf ".." name) $
+      throwEvalError ("copyPathToStore: name must not contain '..': " <> name)
+    when (T.any (== '\0') name) $
+      throwEvalError ("copyPathToStore: name must not contain null bytes: " <> name)
     storeDir <- EvalIO (asks esStoreDir)
     let contentHash = sha256Hex (encodeUtf8 ("source:" <> srcPath <> ":" <> name))
         inner = "nix-store:sha256:" <> contentHash <> ":" <> T.pack storeDir <> ":" <> name
         pathHash = truncatedBase32 (encodeUtf8 inner)
-        destPath = T.pack storeDir <> "/" <> pathHash <> "-" <> name
-    wrapIO (copyToStoreIfMissing (T.unpack srcPath) (T.unpack destPath) storeDir)
+        basename = pathHash <> "-" <> name
+        -- File path uses platform separator for I/O
+        destFilePath = storeDir </> T.unpack basename
+        -- Store path text always uses forward slash (Nix convention)
+        destPath = T.pack storeDir <> "/" <> basename
+    wrapIO (copyToStoreIfMissing (T.unpack srcPath) destFilePath storeDir)
     pure destPath
 
   traceMessage msg = EvalIO (liftIO (hPutStrLn stderr (T.unpack msg)))
@@ -422,6 +444,7 @@ wrapIO action = EvalIO $ liftIO $ do
     Right val -> pure val
     Left (err :: SomeException)
       | Just (_ :: SomeAsyncException) <- fromException err -> throwIO err
+      | Just abortErr <- fromException err -> throwIO (abortErr :: NixAbortError)
       | Just nixErr <- fromException err -> throwIO (nixErr :: NixEvalError)
       | otherwise -> throwIO (NixEvalError (T.pack (displayException err)))
 

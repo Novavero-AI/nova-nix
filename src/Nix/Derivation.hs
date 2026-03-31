@@ -427,7 +427,7 @@ pDerivation = do
   pChar ','
   envPairs <- pList pEnvPair
   pChar ')'
-  let inputDrvs = Map.fromList inputDrvsList
+  let inputDrvs = Map.fromListWith (++) inputDrvsList
       env = Map.fromList envPairs
       platform = textToPlatform platformStr
   pure

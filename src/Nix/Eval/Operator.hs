@@ -109,12 +109,12 @@ evalArith name intOp floatOp left right = case (left, right) of
           <> typeName right
       )
 
--- | Division with zero check.  Integer division uses floored 'div'
--- (matching Nix semantics: truncation toward negative infinity).
+-- | Division with zero check.  Integer division uses 'quot'
+-- (truncation toward zero, matching C++ Nix semantics).
 evalDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 evalDiv left right = case (left, right) of
   (VInt _, VInt 0) -> throwEvalError "division by zero"
-  (VInt a, VInt b) -> pure (VInt (div a b))
+  (VInt a, VInt b) -> pure (VInt (quot a b))
   (VInt a, VFloat b)
     | b == 0 -> throwEvalError "division by zero"
     | otherwise -> pure (VFloat (fromIntegral a / b))

@@ -89,6 +89,7 @@ import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpcode, cbcShortArg)
 import Nix.Eval.CEnv (cenvPushWith)
+import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
@@ -212,7 +213,8 @@ evalBytecode env bcIdx =
            in evalVar env (symbolText (Symbol sym))
         9 {- WITH_VAR -} ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
-           in evalWithVar env (symbolText (Symbol sym))
+              name = symbolText (Symbol sym)
+           in evalWithVar env name
         10 {- RESOLVED_VAR -} ->
           let level = fromIntegral (unsafePerformIO (cbcArg1 bcIdx))
               idx = fromIntegral (unsafePerformIO (cbcArg2 bcIdx))
@@ -461,8 +463,16 @@ evalBcApp env bcIdx0 = do
       | Just functorThunk <- attrSetLookup "__functor" attrs -> do
           functor <- force functorThunk
           partiallyApplied <- applyValue functor funcVal
-          argVal <- evalBytecode env argIdx
-          applyValue partiallyApplied argVal
+          -- Maintain laziness: thunk the argument for lambdas, like
+          -- the normal VLambda path above.  Builtins force anyway.
+          case partiallyApplied of
+            VLambda closureEnv formals bodyBcIdx -> do
+              let argThunk = cheapThunkBc env argIdx
+              extEnv <- matchFormals closureEnv formals argThunk
+              evalBytecode extEnv bodyBcIdx
+            _ -> do
+              argVal <- evalBytecode env argIdx
+              applyValue partiallyApplied argVal
     _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
 
 -- | Evaluate a lambda literal from bytecode — returns VLambda.
@@ -540,7 +550,7 @@ walkBcAttrPath env n off val = case val of
         inner <- force thunk
         walkBcAttrPath env (n - 1) (off + 2) inner
       Nothing -> pure Nothing
-  _ -> pure Nothing
+  _ -> throwEvalError ("value is " <> typeName val <> " while a set was expected")
 
 -- | Evaluate attribute set from bytecode.
 evalBcAttrs :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -1699,12 +1709,11 @@ elemCheck needle (thunk : rest) = do
 
 builtinElemAt :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinElemAt (VList cl) (VInt idx)
-  | idx < 0 = elemAtOOB idx cl
+  | idx < 0 || fromIntegral idx >= clistLen cl = elemAtOOB idx cl
   | otherwise =
-      let ptrs = clistThunks cl
-       in case drop (fromIntegral idx) ptrs of
-            (p : _) -> force (Thunk p)
-            [] -> elemAtOOB idx cl
+      -- O(1) direct C array access instead of materializing the whole list
+      let ptr = unsafePerformIO (clistGet (unCList cl) (fromIntegral idx))
+       in force (Thunk ptr)
   where
     elemAtOOB i c =
       throwEvalError
@@ -2096,7 +2105,7 @@ builtinMul l r = throwEvalError ("builtins.mul: expected numbers, got " <> typeN
 
 builtinDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
-builtinDiv (VInt a) (VInt b) = pure (VInt (div a b))
+builtinDiv (VInt a) (VInt b) = pure (VInt (quot a b))
 builtinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
 builtinDiv (VInt a) (VFloat b) = pure (VFloat (fromIntegral a / b))
 builtinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromIntegral b))
@@ -2105,7 +2114,7 @@ builtinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeN
 
 builtinMod :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMod _ (VInt 0) = throwEvalError "builtins.mod: division by zero"
-builtinMod (VInt a) (VInt b) = pure (VInt (mod a b))
+builtinMod (VInt a) (VInt b) = pure (VInt (rem a b))
 builtinMod l r = throwEvalError ("builtins.mod: expected two integers, got " <> typeName l <> " and " <> typeName r)
 
 builtinMin :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -2539,13 +2548,21 @@ valueToJSON (VList cl) = do
   let jsonVals = map fst results
       ctx = mconcat (map snd results)
   pure ("[" <> T.intercalate "," jsonVals <> "]", ctx)
-valueToJSON (VAttrs attrs) = do
-  let m = attrSetToMap attrs
-      sortedKeys = Map.keys m
-  results <- mapM (jsonPair m) sortedKeys
-  let pairs = map fst results
-      ctx = mconcat (map snd results)
-  pure ("{" <> T.intercalate "," pairs <> "}", ctx)
+valueToJSON (VAttrs attrs) =
+  -- Derivation-like attrsets (with outPath) coerce to string in toJSON,
+  -- matching C++ Nix behavior.
+  case attrSetLookup "outPath" attrs of
+    Just outThunk -> do
+      outVal <- force outThunk
+      (s, ctx) <- coerceToString force applyValue outVal
+      pure (jsonEscapeString s, ctx)
+    Nothing -> do
+      let m = attrSetToMap attrs
+          sortedKeys = Map.keys m
+      results <- mapM (jsonPair m) sortedKeys
+      let pairs = map fst results
+          ctx = mconcat (map snd results)
+      pure ("{" <> T.intercalate "," pairs <> "}", ctx)
   where
     jsonPair attrMap key = case Map.lookup key attrMap of
       Nothing -> pure ("", emptyContext)
@@ -2633,6 +2650,17 @@ parseJSONStringContent = go []
         Just ('r', r) -> go ("\r" : chunks) r
         Just ('t', r) -> go ("\t" : chunks) r
         Just ('u', r) -> case parseHex4 r of
+          Just (hi, r2)
+            -- UTF-16 surrogate pair: high surrogate followed by \uXXXX low
+            | hi >= 0xD800 && hi <= 0xDBFF ->
+                case T.stripPrefix "\\u" r2 of
+                  Just r3 -> case parseHex4 r3 of
+                    Just (lo, r4)
+                      | lo >= 0xDC00 && lo <= 0xDFFF ->
+                          let combined = 0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)
+                           in go (T.singleton (chr combined) : chunks) r4
+                    _ -> go (T.singleton (chr hi) : chunks) r2
+                  Nothing -> go (T.singleton (chr hi) : chunks) r2
           Just (codepoint, r2) ->
             go (T.singleton (chr codepoint) : chunks) r2
           Nothing -> go ("u" : chunks) r
@@ -2736,7 +2764,7 @@ builtinTrace :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinTrace msgVal result = do
   msg <- case msgVal of
     VStr s _ -> pure s
-    other -> pure (typeName other)
+    other -> pure (showValueForTrace other)
   traceMessage ("trace: " <> msg)
   pure result
 
@@ -2745,9 +2773,19 @@ builtinWarn :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinWarn msgVal result = do
   msg <- case msgVal of
     VStr s _ -> pure s
-    other -> pure (typeName other)
+    other -> pure (showValueForTrace other)
   traceMessage ("warning: " <> msg)
   pure result
+
+-- | Pretty-print a value for trace/warn, matching C++ Nix's printValue.
+showValueForTrace :: NixValue -> Text
+showValueForTrace (VInt n) = T.pack (show n)
+showValueForTrace (VFloat f) = formatNixFloat f
+showValueForTrace (VBool True) = "true"
+showValueForTrace (VBool False) = "false"
+showValueForTrace VNull = "null"
+showValueForTrace (VPath p) = p
+showValueForTrace other = "<<" <> typeName other <> ">>"
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — graph traversal
@@ -2870,7 +2908,7 @@ builtinPlaceholder :: (MonadEval m) => NixValue -> m NixValue
 builtinPlaceholder (VStr outputName _) =
   let preimage = "nix-output:" <> outputName
       hashText = truncatedBase32 (TE.encodeUtf8 preimage)
-   in pure (VPath (storeDirPrefix <> hashText <> "-" <> outputName))
+   in pure (mkStr (storeDirPrefix <> hashText <> "-" <> outputName))
 builtinPlaceholder other =
   throwEvalError ("builtins.placeholder: expected a string, got " <> typeName other)
 

@@ -286,7 +286,11 @@ unpackNarEntry path entry = case entry of
     createDirectoryIfMissing True (takeDirectory path)
     -- On Windows, symlinks require elevated permissions.
     -- Fall back to writing the target as a text file.
-    Dir.createFileLink (T.unpack target) path
+    result <- try (Dir.createFileLink (T.unpack target) path)
+    case result of
+      Right () -> pure ()
+      Left (_ :: SomeException) ->
+        writeFile path (T.unpack target)
   NAR.NarDirectory entries -> do
     createDirectoryIfMissing True path
     mapM_ (\(name, child) -> unpackNarEntry (path </> T.unpack name) child) entries

@@ -171,7 +171,7 @@ nn_env_from_slots(void **slots, uint32_t slot_count,
 nn_env_t *
 nn_env_push_with(nn_env_t *base, void *scope)
 {
-    if (base->with_count >= UINT16_MAX) return (nn_env_t *)base;
+    if (base->with_count >= UINT16_MAX) return NULL;
     uint16_t new_count = base->with_count + 1;
     void **new_withs = (void **)nn_env_alloc_raw(
         (uint32_t)new_count * (uint32_t)sizeof(void *));

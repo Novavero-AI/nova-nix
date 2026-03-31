@@ -87,9 +87,12 @@ coerceToString _ _ other =
 -- (@std::to_string@), then strip trailing zeros and unnecessary
 -- decimal point.  E.g. @1.0@ → @"1"@, @3.14@ → @"3.14"@.
 formatNixFloat :: Double -> Text
-formatNixFloat n =
-  let fixed = showFFloat (Just 6) n ""
-   in T.pack (stripZeros fixed)
+formatNixFloat n
+  | isNaN n = "nan"
+  | isInfinite n = if n > 0 then "inf" else "-inf"
+  | otherwise =
+      let fixed = showFFloat (Just 6) n ""
+       in T.pack (stripZeros fixed)
   where
     stripZeros s
       | '.' `elem` s = reverse (dropDot (dropWhile (== '0') (reverse s)))

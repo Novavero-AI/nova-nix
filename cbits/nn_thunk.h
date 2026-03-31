@@ -72,6 +72,11 @@ typedef struct nn_thunk {
     void     *payload;
 } nn_thunk_t;
 
+/* Nix integers are int64_t, stored inline via (intptr_t) cast into payload.
+ * This requires pointers to be at least 64 bits.  32-bit targets would
+ * silently truncate large integers.  C99-compatible compile-time check: */
+typedef char nn_thunk_ptr_size_check_[(sizeof(void *) >= sizeof(int64_t)) ? 1 : -1];
+
 /* --- Lifecycle --- */
 
 /* Initialize the global thunk arena.  initial_capacity is the number

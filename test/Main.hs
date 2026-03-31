@@ -1607,8 +1607,8 @@ testBatchB = do
       runTest "placeholder out starts with /nix/store/" $
         assertRight "placeholder-prefix" (evalNix "builtins.placeholder \"out\"") $ \val ->
           case val of
-            VPath p -> if "/nix/store/" `T.isPrefixOf` p then Pass else Fail ("bad prefix: " <> p)
-            _ -> Fail ("expected VPath, got " <> T.pack (show val)),
+            VStr p _ -> if "/nix/store/" `T.isPrefixOf` p then Pass else Fail ("bad prefix: " <> p)
+            _ -> Fail ("expected VStr, got " <> T.pack (show val)),
       runTest "placeholder deterministic" $
         assertRight "placeholder-det" (evalNix "builtins.placeholder \"out\" == builtins.placeholder \"out\"") $ \val ->
           assertEqual "deterministic" (VBool True) val,

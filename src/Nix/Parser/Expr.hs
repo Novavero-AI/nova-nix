@@ -249,9 +249,20 @@ parseNot = do
     TokNot -> do
       _ <- advance
       EUnary OpNot <$> parseNot
-    _ -> parseAddSub
+    _ -> parseConcat
 
--- | Level 8: Addition and subtraction (@+@, @-@, left-associative).
+-- | Level 8: List concatenation (@++@, right-associative).
+parseConcat :: Parser Expr
+parseConcat = do
+  lhs <- parseAddSub
+  tok <- peekMaybe
+  case tok of
+    Just TokConcat -> do
+      _ <- advance
+      EBinary OpConcat lhs <$> parseConcat
+    _ -> pure lhs
+
+-- | Level 9: Addition and subtraction (@+@, @-@, left-associative).
 parseAddSub :: Parser Expr
 parseAddSub = do
   lhs <- parseMulDiv
@@ -270,10 +281,10 @@ parseAddSub = do
           loopAddSub (EBinary OpSub lhs rhs)
         _ -> pure lhs
 
--- | Level 9: Multiplication and division (@*@, @/@, left-associative).
+-- | Level 10: Multiplication and division (@*@, @/@, left-associative).
 parseMulDiv :: Parser Expr
 parseMulDiv = do
-  lhs <- parseConcat
+  lhs <- parseNegate
   loopMulDiv lhs
   where
     loopMulDiv lhs = do
@@ -281,38 +292,15 @@ parseMulDiv = do
       case tok of
         Just TokStar -> do
           _ <- advance
-          rhs <- parseConcat
+          rhs <- parseNegate
           loopMulDiv (EBinary OpMul lhs rhs)
         Just TokSlash -> do
           _ <- advance
-          rhs <- parseConcat
+          rhs <- parseNegate
           loopMulDiv (EBinary OpDiv lhs rhs)
         _ -> pure lhs
 
--- | Level 10: List concatenation (@++@, right-associative).
-parseConcat :: Parser Expr
-parseConcat = do
-  lhs <- parseHasAttr
-  tok <- peekMaybe
-  case tok of
-    Just TokConcat -> do
-      _ <- advance
-      EBinary OpConcat lhs <$> parseConcat
-    _ -> pure lhs
-
--- | Level 11: Has-attribute (@?@, non-associative).
--- Right operand is an attr path, not a full expression.
-parseHasAttr :: Parser Expr
-parseHasAttr = do
-  lhs <- parseNegate
-  tok <- peekMaybe
-  case tok of
-    Just TokQuestion -> do
-      _ <- advance
-      EHasAttr lhs <$> parseAttrPath
-    _ -> pure lhs
-
--- | Level 12: Arithmetic negation (@-@, prefix).
+-- | Level 11: Arithmetic negation (@-@, prefix).
 parseNegate :: Parser Expr
 parseNegate = do
   tok <- peek
@@ -320,7 +308,19 @@ parseNegate = do
     TokMinus -> do
       _ <- advance
       EUnary OpNegate <$> parseNegate
-    _ -> parseApp
+    _ -> parseHasAttr
+
+-- | Level 12: Has-attribute (@?@, non-associative).
+-- Right operand is an attr path, not a full expression.
+parseHasAttr :: Parser Expr
+parseHasAttr = do
+  lhs <- parseApp
+  tok <- peekMaybe
+  case tok of
+    Just TokQuestion -> do
+      _ <- advance
+      EHasAttr lhs <$> parseAttrPath
+    _ -> pure lhs
 
 -- | Level 13: Function application (juxtaposition, left-associative).
 parseApp :: Parser Expr

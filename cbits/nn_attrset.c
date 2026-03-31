@@ -157,7 +157,11 @@ void nn_attrset_free(nn_attrset_t *set)
 void nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value)
 {
     if (set->count >= set->capacity) {
-        if (grow(set, set->capacity * 2) != 0) return;
+        if (grow(set, set->capacity * 2) != 0) {
+            fprintf(stderr, "nn_attrset_insert: grow failed (capacity %u)\n",
+                    (unsigned)set->capacity);
+            abort();
+        }
     }
     set->keys[set->count] = key;
     set->values[set->count] = value;
