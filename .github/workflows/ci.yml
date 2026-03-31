@@ -55,7 +55,7 @@ jobs:
 
   cabal-check:
     name: Cabal Check
-    needs: [hlint, ormolu, c99-lint]
+    needs: [hlint, ormolu]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
