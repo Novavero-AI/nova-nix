@@ -594,8 +594,12 @@ evalBcRecAttrs env bindings captureInfo
       allKeys <- bcBindingAllKeys env bindings
       let cset = buildCAttrSetKeys allKeys
           attrSet = AttrSet cset
-          (withArr, withCount) = envWithScopesRaw env
-          recEnv = newCEnv nullPtr 0 (Just attrSet) (Just env) withArr withCount
+          parentEnv = buildCaptureEnv env captureInfo
+          (withArr, withCount) = case captureInfo of
+            NoCaptureInfo -> envWithScopesRaw env
+            Captures _ -> (nullPtr, 0)
+            CapturesWithScopes _ -> withScopesForCapture env
+          recEnv = newCEnv nullPtr 0 (Just attrSet) (Just parentEnv) withArr withCount
       thunkMap <- buildBcThunkMap recEnv bindings
       let filled = fillCAttrSetValues cset thunkMap
        in filled `seq` pure (VAttrs attrSet)
@@ -626,8 +630,12 @@ evalBcLet env bcIdx0 = do
       -- Fallback: dynamic/nested keys — two-phase CAttrSet.
       allKeys <- bcBindingAllKeys env bindings
       let cset = buildCAttrSetKeys allKeys
-          (withArr, withCount) = envWithScopesRaw env
-          letEnv = newCEnv nullPtr 0 (Just (AttrSet cset)) (Just env) withArr withCount
+          parentEnv = buildCaptureEnv env captureInfo
+          (withArr, withCount) = case captureInfo of
+            NoCaptureInfo -> envWithScopesRaw env
+            Captures _ -> (nullPtr, 0)
+            CapturesWithScopes _ -> withScopesForCapture env
+          letEnv = newCEnv nullPtr 0 (Just (AttrSet cset)) (Just parentEnv) withArr withCount
       thunkMap <- buildBcThunkMap letEnv bindings
       let filled = fillCAttrSetValues cset thunkMap
        in filled `seq` evalBytecode letEnv bodyIdx
@@ -2105,7 +2113,9 @@ builtinMul l r = throwEvalError ("builtins.mul: expected numbers, got " <> typeN
 
 builtinDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
-builtinDiv (VInt a) (VInt b) = pure (VInt (quot a b))
+builtinDiv (VInt a) (VInt b)
+  | a == minBound && b == -1 = pure (VInt minBound)
+  | otherwise = pure (VInt (quot a b))
 builtinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
 builtinDiv (VInt a) (VFloat b) = pure (VFloat (fromIntegral a / b))
 builtinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromIntegral b))
@@ -2114,7 +2124,9 @@ builtinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeN
 
 builtinMod :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMod _ (VInt 0) = throwEvalError "builtins.mod: division by zero"
-builtinMod (VInt a) (VInt b) = pure (VInt (rem a b))
+builtinMod (VInt a) (VInt b)
+  | a == minBound && b == -1 = pure (VInt 0)
+  | otherwise = pure (VInt (rem a b))
 builtinMod l r = throwEvalError ("builtins.mod: expected two integers, got " <> typeName l <> " and " <> typeName r)
 
 builtinMin :: (MonadEval m) => NixValue -> NixValue -> m NixValue

@@ -90,7 +90,7 @@ module Nix.Eval.Types
 where
 
 import Control.Monad (forM_)
-import Data.Bits (shiftL, (.|.))
+import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
@@ -99,7 +99,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word16, Word32, Word64, Word8)
-import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, newStablePtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Float (castWord64ToDouble)
@@ -496,6 +496,11 @@ envLookup name (Env envPtr) = lexicalLookup envPtr
                     else lookupWithScopesC name startWiths startWithCount
 
 -- | Walk with-scopes (C array) innermost to outermost.
+-- Skips tagged lazy entries (bit 0 set) — those are thunk pointers
+-- that can only be resolved by 'evalWithVarScopes' which has monadic
+-- 'force'.  This is a safety guard: currently unreachable because
+-- 'resolveVars' ensures EVar behind a with-scope always becomes
+-- EWithVar, but protects against future changes.
 lookupWithScopesC :: Text -> Ptr (Ptr ()) -> Word16 -> Maybe Thunk
 lookupWithScopesC _ _ 0 = Nothing
 lookupWithScopesC name withArr count = unsafePerformIO $ go 0
@@ -504,9 +509,11 @@ lookupWithScopesC name withArr count = unsafePerformIO $ go 0
       | i >= fromIntegral count = pure Nothing
       | otherwise = do
           scopePtr <- peekElemOff withArr i
-          case attrSetLookup name (AttrSet (castPtr scopePtr)) of
-            Just val -> pure (Just val)
-            Nothing -> go (i + 1)
+          if ptrToWordPtr scopePtr .&. 1 /= 0
+            then go (i + 1) -- skip tagged lazy with-scope
+            else case attrSetLookup name (AttrSet (castPtr scopePtr)) of
+              Just val -> pure (Just val)
+              Nothing -> go (i + 1)
 
 -- | Walk with-scopes as a Haskell list (backward-compatible signature).
 lookupWithScopes :: Text -> [AttrSet] -> Maybe Thunk

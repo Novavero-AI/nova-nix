@@ -19,9 +19,9 @@
 
 | Layer | What it does |
 |-------|-------------|
-| **Parser** | Hand-rolled recursive descent. 14 precedence levels, 18 AST constructors, all Nix syntax including `<nixpkgs>`, `${expr}` keys, indented strings. |
+| **Parser** | Hand-rolled recursive descent. 14 precedence levels, 19 AST constructors, all Nix syntax including `<nixpkgs>`, `${expr}` keys, indented strings. |
 | **Evaluator** | Bytecode-compiled lazy evaluation. Thunk memoization with blackhole detection. Knot-tying for recursive `let`/`rec`. Polymorphic via `MonadEval`. |
-| **114 Builtins** | Arithmetic, strings, lists, attrsets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON, hashing, regex, version parsing, `tryEval`, `deepSeq`, `genericClosure`, string contexts, IO (`import`, `readFile`, `pathExists`, `derivation`, `fetchurl`, `fetchTarball`, `fetchGit`), and more. |
+| **108 Builtins** | Arithmetic, strings, lists, attrsets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON, hashing, regex, version parsing, `tryEval`, `deepSeq`, `genericClosure`, string contexts, IO (`import`, `readFile`, `pathExists`, `derivation`, `fetchurl`, `fetchTarball`, `fetchGit`), and more. |
 | **C99 Data Layer** | 9 arena-allocated C modules for interned symbols, sorted attrsets, thunks, envs, lists, bytecode, lambdas. All eval data off the GHC heap. |
 | **Store** | Content-addressed `/nix/store` (or `C:\nix\store`). SQLite metadata, reference scanning, read-only enforcement. |
 | **Builder** | Dependency graph via Kahn's toposort. Binary cache substitution before local builds. Multi-output, reference scanning, store registration. |
@@ -111,7 +111,7 @@ The `build` command evaluates, extracts the derivation, builds the dependency gr
 **Key design decisions:**
 
 - **Haskell owns eval logic, C99 owns data layout.** The evaluator stays in Haskell. Data structures (attr sets, thunks, envs, values) live in C. Haskell calls C to create, query, and mutate data. C never calls back into Haskell.
-- **Bytecode-compiled evaluation.** The 18-constructor Expr AST compiles to a flat 24-opcode bytecode array. The bytecode evaluator (`evalBytecode`) is the sole dispatch path. The AST is GC'd after compilation.
+- **Bytecode-compiled evaluation.** The 19-constructor Expr AST compiles to a flat 24-opcode bytecode array. The bytecode evaluator (`evalBytecode`) is the sole dispatch path. The AST is GC'd after compilation.
 - **MonadEval typeclass.** `PureEval` (newtype over `Either Text`) for deterministic testing. `EvalIO` for real filesystem access. Same `eval` function, different effects.
 - **Arena allocation.** Thunks, attr sets, envs, and lambdas are arena-allocated in C. Bulk free at eval end, zero per-object GC overhead. The GHC heap holds only control flow and `StablePtr` handles.
 - **Knot-tying via Haskell laziness.** Recursive `let` and `rec {}` use two-phase construction: allocate slots, create env, fill slots. Thunks capture environments lazily via `StablePtr` so they can reference not-yet-filled arrays.
@@ -168,12 +168,14 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 
 | Module | Purpose |
 |--------|---------|
-| `Nix.Eval` | Bytecode evaluator — 24-opcode dispatch, thunk forcing, env operations, 114-builtin dispatch. Polymorphic via `MonadEval` |
+| `Nix.Eval` | Bytecode evaluator — 24-opcode dispatch, thunk forcing, env operations, 108-builtin dispatch. Polymorphic via `MonadEval` |
 | `Nix.Eval.Types` | `NixValue` (12 constructors), `Thunk` (C arena cell), `Env` (C-native struct), `AttrSet` (C sorted arrays), `MonadEval` typeclass |
 | `Nix.Eval.Compile` | Bytecode compiler — Expr AST to flat `nn_bytecode` instruction array |
 | `Nix.Eval.Operator` | Arithmetic with float promotion, deep structural equality, floored division |
+| `Nix.Eval.StringInterp` | String interpolation, `coerceToString`, indented string stripping, float formatting |
+| `Nix.Eval.Context` | String context construction, queries, and extraction for derivation building |
 | `Nix.Eval.IO` | IO evaluation monad — filesystem access, import cache, process execution, per-thunk memoization with blackhole detection |
-| `Nix.Builtins` | 114 builtins, search path plumbing, top-level builtin exposure |
+| `Nix.Builtins` | 108 builtins, search path plumbing, top-level builtin exposure |
 
 ### C99 Data Layer
 
@@ -199,6 +201,7 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 | `Nix.Store` | `addToStore`, `scanReferences`, `setReadOnly`, `writeDrv` |
 | `Nix.Builder` | Dependency graph, topological sort, binary cache substitution, local build |
 | `Nix.DependencyGraph` | BFS graph construction, Kahn's toposort, cycle detection |
+| `Nix.Hash` | Derivation hashing (`DrvHash`), SHA-256, truncated base-32, shared hash utilities |
 | `Nix.Substituter` | HTTP binary cache — narinfo, Ed25519 verification, NAR download/unpack |
 
 ---
@@ -209,7 +212,7 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 
 - [x] Full Nix parser (14 precedence levels, all syntax forms)
 - [x] Lazy bytecode evaluator (24 opcodes, thunk memoization, blackhole detection)
-- [x] 114 builtins (matching real Nix spec)
+- [x] 108 builtins (matching real Nix spec)
 - [x] C99 data layer (9 modules, all eval data off GHC heap)
 - [x] Content-addressed store with SQLite metadata
 - [x] Derivation builder with dependency resolution
@@ -248,7 +251,7 @@ Requires GHC 9.8+ and cabal-install 3.10+.
 
 ```haskell
 import Nix.Parser (parseNix)
-import Nix.Eval (eval, NixValue(..))
+import Nix.Eval (eval, NixValue(..), PureEval(..))
 import Nix.Builtins (builtinEnv)
 
 main :: IO ()

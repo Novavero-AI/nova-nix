@@ -114,7 +114,11 @@ evalArith name intOp floatOp left right = case (left, right) of
 evalDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 evalDiv left right = case (left, right) of
   (VInt _, VInt 0) -> throwEvalError "division by zero"
-  (VInt a, VInt b) -> pure (VInt (quot a b))
+  (VInt a, VInt b)
+    -- quot minBound (-1) throws arithmetic overflow in Haskell;
+    -- C++ Nix wraps silently (undefined behavior, wraps to minBound).
+    | a == minBound && b == -1 -> pure (VInt minBound)
+    | otherwise -> pure (VInt (quot a b))
   (VInt a, VFloat b)
     | b == 0 -> throwEvalError "division by zero"
     | otherwise -> pure (VFloat (fromIntegral a / b))

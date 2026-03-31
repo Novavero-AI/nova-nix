@@ -10,7 +10,7 @@
 - **Dead code removal** — Removed unused `cattrsetIntersect` Haskell wrapper, `nn_attrset_intersect`, and `nn_attrset_values_ptr` C functions.
 - **New: `nn_assert.h`** — Debug-mode bounds checking macro. Compiles to nothing under `NDEBUG`.
 - **Performance** — Stress test: 6.25 MB max residency, 56.3% GC productivity (down from 69.7 MB / 1.6% pre-C-data-layer).
-- 592 tests, `-Werror` clean, ormolu clean, hlint clean
+- 593 tests, `-Werror` clean, ormolu clean, hlint clean
 
 ## 0.1.8.0 — 2026-03-08
 
