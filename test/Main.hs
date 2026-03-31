@@ -2337,7 +2337,7 @@ testBuildOrchestrator = do
         pure $ case result of
           BuildFailure _ _ -> Pass
           BuildSuccess _ -> Fail "expected build failure for nonexistent builder",
-          -- buildWithDeps with cycle detection (mocked through malformed graph)
+      -- buildWithDeps with cycle detection (mocked through malformed graph)
       runTest "cycle detection returns failure" $
         let spA = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "a.drv"
             spB = StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "b.drv"
@@ -2370,7 +2370,7 @@ testBuildOrchestrator = do
                 DepGraph.TopoCycle _ -> Pass
                 DepGraph.TopoSorted order -> Fail ("expected cycle, got sorted: " <> T.pack (show order))
               Left err -> Fail ("expected graph to build, got: " <> err),
-              -- missing .drv -> failure in dep graph
+      -- missing .drv -> failure in dep graph
       runTest "missing drv in dep graph" $
         let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "missing.drv"
             drv =
