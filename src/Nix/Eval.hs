@@ -550,7 +550,10 @@ walkBcAttrPath env n off val = case val of
         inner <- force thunk
         walkBcAttrPath env (n - 1) (off + 2) inner
       Nothing -> pure Nothing
-  _ -> throwEvalError ("value is " <> typeName val <> " while a set was expected")
+  -- Non-attrset: attribute path cannot continue.  Return Nothing so
+  -- that callers with a default (``a.b or def'') or hasAttr (``a ? b'')
+  -- can handle it gracefully, matching C++ Nix behaviour.
+  _ -> pure Nothing
 
 -- | Evaluate attribute set from bytecode.
 evalBcAttrs :: (MonadEval m) => Env -> Word32 -> m NixValue
