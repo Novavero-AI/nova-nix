@@ -2336,7 +2336,7 @@ testBuildOrchestrator = do
         -- Builder will fail (nonexistent) but the graph should resolve correctly
         pure $ case result of
           BuildFailure _ _ -> Pass
-          BuildSuccess _ -> Pass, -- Would pass if builder somehow exists
+          BuildSuccess _ -> Fail "expected build failure for nonexistent builder",
           -- buildWithDeps with cycle detection (mocked through malformed graph)
       runTest "cycle detection returns failure" $
         let spA = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "a.drv"
@@ -2368,8 +2368,8 @@ testBuildOrchestrator = do
          in case DepGraph.buildDepGraph readFn drvACyc spA of
               Right graph -> case DepGraph.topoSort graph of
                 DepGraph.TopoCycle _ -> Pass
-                DepGraph.TopoSorted _ -> Pass -- Partial sort is also acceptable
-              Left _ -> Pass, -- Build graph failure also acceptable
+                DepGraph.TopoSorted order -> Fail ("expected cycle, got sorted: " <> T.pack (show order))
+              Left err -> Fail ("expected graph to build, got: " <> err),
               -- missing .drv -> failure in dep graph
       runTest "missing drv in dep graph" $
         let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "missing.drv"

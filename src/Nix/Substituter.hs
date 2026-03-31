@@ -293,4 +293,19 @@ unpackNarEntry path entry = case entry of
         writeFile path (T.unpack target)
   NAR.NarDirectory entries -> do
     createDirectoryIfMissing True path
-    mapM_ (\(name, child) -> unpackNarEntry (path </> T.unpack name) child) entries
+    mapM_
+      ( \(name, child) ->
+          if isSafeNarName name
+            then unpackNarEntry (path </> T.unpack name) child
+            else error ("unpackNarEntry: unsafe directory entry name: " <> T.unpack name)
+      )
+      entries
+
+-- | Validate that a NAR entry name is safe (no path traversal).
+isSafeNarName :: Text -> Bool
+isSafeNarName name =
+  not (T.null name)
+    && name /= ".."
+    && name /= "."
+    && not (T.isInfixOf "/" name)
+    && not (T.isInfixOf "\\" name)

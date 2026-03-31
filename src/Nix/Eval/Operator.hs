@@ -225,6 +225,12 @@ evalUpdate left right =
 -- | Merge two 'AttrSet's, right-biased (@//@).
 -- Delegates to C-side @nn_attrset_union@ which performs a linear merge
 -- of two sorted arrays — O(n+m) on contiguous, cache-friendly memory.
+--
+-- 'unsafePerformIO' safety: @nn_attrset_union@ is a pure C function
+-- that allocates a new result set from its two inputs without side
+-- effects, callbacks to Haskell, or dependency on mutable state
+-- beyond the C allocator.  The NOINLINE pragma prevents float-out
+-- from sharing results across distinct call sites.
 {-# NOINLINE mergeAttrSets #-}
 mergeAttrSets :: AttrSet -> AttrSet -> AttrSet
 mergeAttrSets (AttrSet a) (AttrSet b) =

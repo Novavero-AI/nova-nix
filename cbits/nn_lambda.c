@@ -9,6 +9,7 @@
 #include "nn_lambda.h"
 #include "nn_assert.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,7 +25,10 @@ static void nn_lambda_track(nn_lambda_t *lam)
         uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
         nn_lambda_t **new_arr = (nn_lambda_t **)realloc(
             g_tracked, (size_t)new_cap * sizeof(nn_lambda_t *));
-        if (!new_arr) return;
+        if (!new_arr) {
+            fprintf(stderr, "nn_lambda_track: realloc failed\n");
+            abort();
+        }
         g_tracked = new_arr;
         g_tracked_cap = new_cap;
     }

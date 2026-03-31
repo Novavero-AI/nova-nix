@@ -24,6 +24,7 @@ module Nix.Eval.Context
   )
 where
 
+import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -80,6 +81,6 @@ appendStrings t1 ctx1 t2 ctx2 = (t1 <> t2, ctx1 <> ctx2)
 
 -- | Concatenate multiple strings with contexts, merging all contexts.
 concatStrings :: [(Text, StringContext)] -> (Text, StringContext)
-concatStrings = foldl merge ("", mempty)
+concatStrings = foldl' merge ("", mempty)
   where
     merge (!accText, !accCtx) (t, ctx) = (accText <> t, accCtx <> ctx)

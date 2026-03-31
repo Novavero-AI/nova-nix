@@ -33,7 +33,10 @@ static void nn_attrset_track(nn_attrset_t *set)
         uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
         nn_attrset_t **new_arr = (nn_attrset_t **)realloc(
             g_tracked, (size_t)new_cap * sizeof(nn_attrset_t *));
-        if (!new_arr) return;
+        if (!new_arr) {
+            fprintf(stderr, "nn_attrset_track: realloc failed\n");
+            abort();
+        }
         g_tracked = new_arr;
         g_tracked_cap = new_cap;
     }
@@ -81,20 +84,14 @@ static int grow(nn_attrset_t *set, uint32_t new_cap)
 {
     nn_symbol_t *new_keys = (nn_symbol_t *)realloc(
         set->keys, (size_t)new_cap * sizeof(nn_symbol_t));
+    if (!new_keys) return -1;
+    set->keys = new_keys;
+
     void **new_values = (void **)realloc(
         set->values, (size_t)new_cap * sizeof(void *));
-    if (!new_keys || !new_values) {
-        /* Partial realloc failure: one may have succeeded while the other
-         * failed.  realloc on success may have moved the buffer, so we
-         * must adopt whichever pointer succeeded (it already contains the
-         * old data).  We do NOT update capacity — both arrays must reach
-         * new_cap before capacity is bumped. */
-        if (new_keys)   set->keys   = new_keys;
-        if (new_values) set->values = new_values;
-        return -1;
-    }
-    set->keys = new_keys;
+    if (!new_values) return -1;
     set->values = new_values;
+
     set->capacity = new_cap;
     return 0;
 }

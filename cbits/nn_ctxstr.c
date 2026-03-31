@@ -9,6 +9,7 @@
 #include "nn_ctxstr.h"
 #include "nn_assert.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,7 +30,10 @@ track(nn_ctxstr_t *s)
                                : g_tracked_capacity * 2;
         nn_ctxstr_t **new_arr = (nn_ctxstr_t **)realloc(
             g_tracked, (size_t)new_cap * sizeof(nn_ctxstr_t *));
-        if (!new_arr) return;
+        if (!new_arr) {
+            fprintf(stderr, "nn_ctxstr_track: realloc failed\n");
+            abort();
+        }
         g_tracked = new_arr;
         g_tracked_capacity = new_cap;
     }

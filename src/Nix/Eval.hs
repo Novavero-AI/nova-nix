@@ -917,14 +917,14 @@ checkExtraKeys formals False attrs =
 
 checkMissingFormals :: (MonadEval m) => AttrSet -> [EvalFormal] -> m ()
 checkMissingFormals attrs formals =
-  case [efName f | f <- formals, isNothing (efDefault f), not (attrSetMember (efName f) attrs)] of
-    [] -> pure ()
-    (name : _) ->
-      let allMissing = [efName f | f <- formals, isNothing (efDefault f), not (attrSetMember (efName f) attrs)]
-          provided = attrSetKeys attrs
-          provSnippet = T.intercalate ", " (take 20 provided)
-          missSnippet = T.intercalate ", " allMissing
-       in throwEvalError ("missing required attribute '" <> name <> "'; all missing: [" <> missSnippet <> "]; provided keys (" <> T.pack (show (length provided)) <> "): [" <> provSnippet <> "]")
+  let allMissing = [efName f | f <- formals, isNothing (efDefault f), not (attrSetMember (efName f) attrs)]
+   in case allMissing of
+        [] -> pure ()
+        (name : _) ->
+          let provided = attrSetKeys attrs
+              provSnippet = T.intercalate ", " (take 20 provided)
+              missSnippet = T.intercalate ", " allMissing
+           in throwEvalError ("missing required attribute '" <> name <> "'; all missing: [" <> missSnippet <> "]; provided keys (" <> T.pack (show (length provided)) <> "): [" <> provSnippet <> "]")
 
 -- | Build capture environment from capture info.
 -- NoCaptureInfo: no trimming, use env as-is.
@@ -2435,37 +2435,41 @@ builtinCompareVersions (VStr a _) (VStr b _) =
   pure (VInt (compareVersionParts (splitVersionStr a) (splitVersionStr b)))
 builtinCompareVersions _ _ = throwEvalError "builtins.compareVersions: expected two strings"
 
+-- | Convert 'Ordering' to the Nix compareVersions convention: -1, 0, 1.
+ordToNix :: Ordering -> Int64
+ordToNix LT = -1
+ordToNix EQ = 0
+ordToNix GT = 1
+
 compareVersionParts :: [Text] -> [Text] -> Int64
 compareVersionParts [] [] = 0
 compareVersionParts [] (_ : _) = -1
 compareVersionParts (_ : _) [] = 1
 compareVersionParts (a : as) (b : bs) =
   case compareComponent a b of
-    0 -> compareVersionParts as bs
-    n -> n
+    EQ -> compareVersionParts as bs
+    cmp -> ordToNix cmp
 
-compareComponent :: Text -> Text -> Int64
+compareComponent :: Text -> Text -> Ordering
 compareComponent a b
-  | a == b = 0
-  | allDigits a && allDigits b = compare' (readInt a) (readInt b)
+  | a == b = EQ
+  | allDigits a && allDigits b = compare (readInt a) (readInt b)
   -- "pre" sorts before everything else (Nix pre-release convention)
-  | a == "pre" = -1
-  | b == "pre" = 1
-  | a == "" = -1
-  | b == "" = 1
+  | a == "pre" = LT
+  | b == "pre" = GT
+  | a == "" = LT
+  | b == "" = GT
   -- Alphabetic components sort before numeric in Nix
-  | isAlphaComp a && allDigits b = -1
-  | allDigits a && isAlphaComp b = 1
-  | otherwise = if a < b then -1 else 1
+  | isAlphaComp a && allDigits b = LT
+  | allDigits a && isAlphaComp b = GT
+  | otherwise = compare a b
   where
     allDigits t = not (T.null t) && T.all isDigit t
-    isAlphaComp t = not (T.null t) && isAlpha (T.head t)
+    isAlphaComp t = case T.uncons t of
+      Just (c, _) -> isAlpha c
+      Nothing -> False
     readInt :: Text -> Int64
     readInt = T.foldl' (\acc c -> acc * 10 + fromIntegral (digitToInt c)) (0 :: Int64)
-    compare' x y
-      | x < y = -1
-      | x > y = 1
-      | otherwise = 0
 
 splitVersionStr :: Text -> [Text]
 splitVersionStr t

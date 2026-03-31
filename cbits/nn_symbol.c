@@ -93,6 +93,10 @@ static void arena_ensure(size_t needed)
 static uint32_t arena_push(const char *str, size_t len)
 {
     arena_ensure(len + 1);  /* +1 for null terminator */
+    if (g_sym.arena_used > (size_t)UINT32_MAX) {
+        fprintf(stderr, "nn_symbol: arena offset exceeds uint32_t range\n");
+        abort();
+    }
     uint32_t offset = (uint32_t)g_sym.arena_used;
     memcpy(g_sym.arena + offset, str, len);
     g_sym.arena[offset + len] = '\0';

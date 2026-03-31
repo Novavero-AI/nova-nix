@@ -10,6 +10,7 @@
 #include "nn_env.h"
 #include "nn_assert.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 /* --- Global tracking for bulk cleanup --- */
@@ -24,7 +25,10 @@ static void nn_list_track(nn_list_t *list)
         uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
         nn_list_t **new_arr = (nn_list_t **)realloc(
             g_tracked, (size_t)new_cap * sizeof(nn_list_t *));
-        if (!new_arr) return;
+        if (!new_arr) {
+            fprintf(stderr, "nn_list_track: realloc failed\n");
+            abort();
+        }
         g_tracked = new_arr;
         g_tracked_cap = new_cap;
     }
