@@ -221,9 +221,18 @@ resolveLetBinding _ innerStack (NamedBinding path bodyExpr) =
 resolveLetBinding _ innerStack (Inherit (Just fromExpr) names) =
   [Inherit (Just (resolve innerStack fromExpr)) names]
 resolveLetBinding outerStack _ (Inherit Nothing names) =
-  -- Desugar: inherit x y; → x = x; y = y;
-  -- RHS resolves against outer scope (before the let bindings).
-  [NamedBinding [StaticKey name] (resolve outerStack (EVar name)) | name <- names]
+  -- Desugar @inherit x y;@ → @x = x; y = y;@, resolving each RHS against the
+  -- outer scope so it names the enclosing binding, not the one defined here.
+  -- 'shiftInheritLevel' corrects for the inner env the resulting thunk runs in.
+  [NamedBinding [StaticKey name] (shiftInheritLevel (resolve outerStack (EVar name))) | name <- names]
+
+-- | A desugared positional @inherit@ RHS is resolved against the outer scope
+-- but evaluated in the inner (let\/rec) env — one extra parent-chain hop — so
+-- its de Bruijn level is one too shallow.  Bump it.  'EVar'\/'EWithVar' are
+-- name-based and need no adjustment.
+shiftInheritLevel :: Expr -> Expr
+shiftInheritLevel (EResolvedVar level idx) = EResolvedVar (level + 1) idx
+shiftInheritLevel other = other
 
 -- | Resolve variables inside formal default expressions.
 resolveFormalsDefaults :: [ScopeEntry] -> Formals -> Formals

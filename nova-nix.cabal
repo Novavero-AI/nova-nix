@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               nova-nix
-version:            0.1.9.0
+version:            0.2.0.0
 synopsis:           Windows-native Nix implementation in Haskell and C99
 description:
   A from-scratch implementation of the Nix package manager that runs
@@ -27,6 +27,12 @@ tested-with:        GHC == 9.8.4
 extra-doc-files:
     CHANGELOG.md
     README.md
+-- C data-layer headers.  These are #included by the cbits/*.c sources
+-- (via include-dirs: cbits) but are not auto-added to the sdist by the
+-- c-sources field, so they must be listed here or the Hackage build
+-- fails with "nn_*.h: No such file or directory".
+extra-source-files:
+    cbits/*.h
 data-files:
     nix/fetchurl.nix
 data-dir: data

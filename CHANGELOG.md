@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0.0 — 2026-06-05
+
+### Milestone: `import <nixpkgs> {}` Evaluates
+
+- **`import <nixpkgs> {}` now evaluates to WHNF** — the top-level package set resolves and enumerates ~23,000 attributes, and a package evaluates through the full stdenv bootstrap down to a derivation: `(import <nixpkgs> {}).hello.drvPath` yields a `/nix/store/…-hello-2.12.1.drv` path. (Derivation-hash parity with upstream Nix and on-Windows building are the next fronts — this milestone is evaluation, not yet building.)
+- **Fix: `inherit <name>;` de Bruijn level in positional let/rec blocks** — `inherit x;` (without `from`) in a positional `let`/`rec` block desugars to `x = x;` with the right-hand side resolved against the *outer* scope, so it refers to the enclosing `x` rather than the binding being defined. But the desugared thunk is evaluated at runtime in the *inner* (let/rec) env, which adds one parent-chain level the outer resolution did not count — so every resolved level was short by one. This produced `nn_env_lookup_resolved: idx out of bounds` whenever an outer *lexical* variable was inherited inside a positional block — first triggered by perl's `inherit version;` (argument-set slot 7) nested in a 4-binding `let`. Fixed by shifting the desugared `inherit` RHS up one de Bruijn level in `Nix.Expr.Resolve`. (`inherit (from) …` was already correct: its RHS resolves against the inner scope.)
+- **Fix: Hackage build — ship C headers in the sdist** — the `cbits/*.h` headers are `#include`d by the C sources (via `include-dirs: cbits`) but were never listed in the cabal file, so `cabal sdist` omitted them and the Hackage build failed with `nn_*.h: No such file or directory`. Added `extra-source-files: cbits/*.h`. A regression introduced in 0.1.9.0 (the first release to ship the C data layer); CI never caught it because CI builds the working tree, not the sdist. Verified by building from a freshly-extracted sdist tarball in isolation.
+- 593 tests, `-Werror` clean, ormolu clean, hlint clean
+
 ## 0.1.9.0 — 2026-06-05
 
 ### nixpkgs Evaluation: Lazy Derivations
