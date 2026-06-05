@@ -3,7 +3,7 @@
 module Main (main) where
 
 import Control.Exception (bracket_)
-import Control.Monad (filterM, when)
+import Control.Monad (filterM, void, when)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
@@ -18,7 +18,7 @@ import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWi
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
-import Nix.Eval (NixValue (..), StringContext (..), StringContextElement (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, mkStr, readThunkValue, runPureEval)
+import Nix.Eval (NixValue (..), StringContext (..), StringContextElement (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, opApp, opAssert, opAttrs, opBinary, opHasAttr, opIf, opIndStr, opLambda, opLet, opList, opLitBool, opLitFloat, opLitInt, opLitNull, opLitPath, opLitUri, opResolvedVar, opSelect, opStr, opUnary, opVar, opWith, opWithVar, strpartInterp, strpartLit, unaryNegate)
@@ -1871,12 +1871,14 @@ testBatchH = do
                 then Pass
                 else Fail ("bad outPath: " <> p)
             _ -> Fail ("expected VStr with context, got " <> T.pack (show val)),
+      -- 'derivation' is lazy (matches C++ Nix): the missing-required-attribute
+      -- error fires when a path is forced (.drvPath), not at construction.
       runTest "derivation missing name" $
-        assertEvalFail "drv-noname" "derivation { system = \"x86_64-linux\"; builder = \"/bin/sh\"; }",
+        assertEvalFail "drv-noname" "(derivation { system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).drvPath",
       runTest "derivation missing system" $
-        assertEvalFail "drv-nosys" "derivation { name = \"hello\"; builder = \"/bin/sh\"; }",
+        assertEvalFail "drv-nosys" "(derivation { name = \"hello\"; builder = \"/bin/sh\"; }).drvPath",
       runTest "derivation missing builder" $
-        assertEvalFail "drv-nobuilder" "derivation { name = \"hello\"; system = \"x86_64-linux\"; }",
+        assertEvalFail "drv-nobuilder" "(derivation { name = \"hello\"; system = \"x86_64-linux\"; }).drvPath",
       runTest "derivation type error" $
         assertEvalFail "drv-tyerr" "derivation 42",
       runTest "derivation deterministic" $
@@ -2395,17 +2397,15 @@ testBuildOrchestrator = do
               T.concat
                 [ "let dep = derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ",
                   "main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; src = dep.outPath; }; ",
-                  "in main"
+                  "in main._derivation"
                 ]
           )
         $ \case
-          VAttrs attrs -> case attrSetLookup "_derivation" attrs >>= readThunkValue of
-            Just (VDerivation drv) ->
-              if Map.null (drvInputDrvs drv)
-                then Fail "expected non-empty drvInputDrvs"
-                else Pass
-            _ -> Fail "missing _derivation"
-          _ -> Fail "expected VAttrs"
+          VDerivation drv ->
+            if Map.null (drvInputDrvs drv)
+              then Fail "expected non-empty drvInputDrvs"
+              else Pass
+          _ -> Fail "expected VDerivation"
     ]
 
 -- ---------------------------------------------------------------------------
@@ -3129,7 +3129,14 @@ evalAndBuild storeDir source = do
     Left err -> pure (Left ("parse error: " <> T.pack (show err)))
     Right expr -> do
       st <- newEvalState "."
-      evalResult <- runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
+      evalResult <- runEvalIO st $ do
+        val <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
+        -- 'derivation' is lazy now; force _derivation so the peek below sees it
+        -- (and so a missing required attr surfaces as an eval error).
+        case val of
+          VAttrs attrs -> maybe (pure ()) (void . force) (attrSetLookup "_derivation" attrs)
+          _ -> pure ()
+        pure val
       case evalResult of
         Left err -> pure (Left ("eval error: " <> err))
         Right val -> case val of

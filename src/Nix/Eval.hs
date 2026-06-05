@@ -1121,8 +1121,10 @@ builtinRegistry =
       builtin1 "fetchurl" builtinFetchurl,
       builtin1 "fetchTarball" builtinFetchTarball,
       builtin1 "fetchGit" builtinFetchGit,
-      -- Derivation construction
-      builtin1 "derivation" builtinDerivation,
+      -- Derivation construction: lazy 'derivation' wrapper over the eager
+      -- 'derivationStrict' primop (matches C++ Nix corepkgs/derivation.nix).
+      builtin1 "derivation" builtinDerivationLazy,
+      builtin1 "derivationStrict" builtinDerivationStrict,
       -- Error context (pass-through — context only matters on error)
       builtin2 "addErrorContext" (\_ val -> pure val),
       -- Attr position (return null — nixpkgs handles this gracefully)
@@ -1320,8 +1322,9 @@ executeBuiltin name args = case name of
   "fetchurl" -> apply1 builtinFetchurl
   "fetchTarball" -> apply1 builtinFetchTarball
   "fetchGit" -> apply1 builtinFetchGit
-  -- Derivation construction
-  "derivation" -> apply1 builtinDerivation
+  -- Derivation construction: lazy 'derivation' over eager 'derivationStrict'
+  "derivation" -> apply1 builtinDerivationLazy
+  "derivationStrict" -> apply1 builtinDerivationStrict
   -- Error context (pass-through — context only matters on error)
   "addErrorContext" -> apply2 (\_ val -> pure val)
   -- Attr position (return null — nixpkgs handles this gracefully)
@@ -3139,8 +3142,13 @@ forceOptionalAttrStr attrs key =
 -- Builtin implementations — derivation construction
 -- ---------------------------------------------------------------------------
 
-builtinDerivation :: (MonadEval m) => NixValue -> m NixValue
-builtinDerivation (VAttrs attrs) = do
+-- | Eager derivation computation — @builtins.derivationStrict@.  Forces all
+-- input attrs into env vars, content-hashes, and returns the full derivation
+-- attrset (drvPath, outPath, per-output, _derivation).  Called LAZILY by the
+-- @derivation@ wrapper ('builtinDerivationLazy'), so forcing a derivation to
+-- WHNF never forces this — matching C++ Nix's derivationStrict/derivation split.
+builtinDerivationStrict :: (MonadEval m) => NixValue -> m NixValue
+builtinDerivationStrict (VAttrs attrs) = do
   -- Extract required attributes
   drvName <- forceAttrStr "derivation" "name" attrs
   system <- forceAttrStr "derivation" "system" attrs
@@ -3270,7 +3278,53 @@ builtinDerivation (VAttrs attrs) = do
       resultAttrs = Map.union baseAttrs materialized
 
   pure (VAttrs (attrSetFromMap resultAttrs))
-builtinDerivation other =
+builtinDerivationStrict other =
+  throwEvalError ("derivation: expected a set, got " <> typeName other)
+
+-- | Lazy @derivation@ wrapper — mirrors C++ Nix's @corepkgs/derivation.nix@.
+-- Returns a WHNF attrset whose @drvPath@/@outPath@/output-path/@_derivation@
+-- attrs are LAZY thunks that defer to 'builtinDerivationStrict'.  Forcing a
+-- derivation to WHNF therefore does NOT force its input/env closure — which is
+-- essential for nixpkgs, where merely referencing a derivation (e.g.
+-- @drv != null@, @assert (libxcrypt != null)@) must not build its whole closure.
+--
+-- The lazy thunks are built with the same synthetic-select pattern used by
+-- @inherit (from)@: a single shared @strict@ thunk (so the eager computation
+-- runs at most once) selected from via fresh minimal envs.
+builtinDerivationLazy :: (MonadEval m) => NixValue -> m NixValue
+builtinDerivationLazy (VAttrs attrs) = do
+  -- Output names are cheap (matches @drvAttrs @ { outputs ? [ "out" ], ... }@).
+  outputNames <- case attrSetLookup "outputs" attrs of
+    Nothing -> pure ["out"]
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VList cl -> mapM (forceToText . Thunk) (clistThunks cl)
+        _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
+  -- One shared thunk computing @derivationStrict attrs@, forced only when an
+  -- output path / drvPath is actually read.
+  let drvAttrsThunk = evaluated (VAttrs attrs)
+      strictBuiltinThunk = evaluated (VBuiltin "derivationStrict" [])
+      strictThunk =
+        let (sp, sc) = buildCSlots [drvAttrsThunk, strictBuiltinThunk]
+            envDS = newMinimalEnv sp sc
+         in mkSyntheticThunk envDS (EApp (EResolvedVar 0 1) (EResolvedVar 0 0))
+      selectStrict field =
+        let (sp, sc) = buildCSlots [strictThunk]
+            envF = newMinimalEnv sp sc
+         in mkSyntheticThunk envF (ESelect (EResolvedVar 0 0) [StaticKey field] Nothing)
+  -- WHNF spine: input attrs (unforced) overlaid with the lazy computed attrs.
+  let computedAttrs =
+        Map.fromList $
+          [ ("type", evaluated (mkStr "derivation")),
+            ("drvPath", selectStrict "drvPath"),
+            ("outPath", selectStrict "outPath"),
+            ("_derivation", selectStrict "_derivation")
+          ]
+            ++ [(outName, selectStrict outName) | outName <- outputNames]
+      resultAttrs = Map.union computedAttrs (attrSetToMap attrs)
+  pure (VAttrs (attrSetFromMap resultAttrs))
+builtinDerivationLazy other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
 -- | Force a thunk to a Text string via full Nix coercion.

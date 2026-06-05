@@ -21,7 +21,7 @@
 |-------|-------------|
 | **Parser** | Hand-rolled recursive descent. 14 precedence levels, 19 AST constructors, all Nix syntax including `<nixpkgs>`, `${expr}` keys, indented strings. |
 | **Evaluator** | Bytecode-compiled lazy evaluation. Thunk memoization with blackhole detection. Knot-tying for recursive `let`/`rec`. Polymorphic via `MonadEval`. |
-| **108 Builtins** | Arithmetic, strings, lists, attrsets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON, hashing, regex, version parsing, `tryEval`, `deepSeq`, `genericClosure`, string contexts, IO (`import`, `readFile`, `pathExists`, `derivation`, `fetchurl`, `fetchTarball`, `fetchGit`), and more. |
+| **109 Builtins** | Arithmetic, strings, lists, attrsets, higher-order (`map`, `filter`, `foldl'`, `sort`, `genList`, `concatMap`, `mapAttrs`), JSON, hashing, regex, version parsing, `tryEval`, `deepSeq`, `genericClosure`, string contexts, IO (`import`, `readFile`, `pathExists`, `derivation`, `fetchurl`, `fetchTarball`, `fetchGit`), and more. |
 | **C99 Data Layer** | 9 arena-allocated C modules for interned symbols, sorted attrsets, thunks, envs, lists, bytecode, lambdas. All eval data off the GHC heap. |
 | **Store** | Content-addressed `/nix/store` (or `C:\nix\store`). SQLite metadata, reference scanning, read-only enforcement. |
 | **Builder** | Dependency graph via Kahn's toposort. Binary cache substitution before local builds. Multi-output, reference scanning, store registration. |
@@ -115,7 +115,8 @@ The `build` command evaluates, extracts the derivation, builds the dependency gr
 - **MonadEval typeclass.** `PureEval` (newtype over `Either Text`) for deterministic testing. `EvalIO` for real filesystem access. Same `eval` function, different effects.
 - **Arena allocation.** Thunks, attr sets, envs, and lambdas are arena-allocated in C. Bulk free at eval end, zero per-object GC overhead. The GHC heap holds only control flow and `StablePtr` handles.
 - **Knot-tying via Haskell laziness.** Recursive `let` and `rec {}` use two-phase construction: allocate slots, create env, fill slots. Thunks capture environments lazily via `StablePtr` so they can reference not-yet-filled arrays.
-- **String context propagation.** Every `VStr` carries a `StringContext` tracking store path references. The `derivation` builtin collects all context into `drvInputDrvs`/`drvInputSrcs`.
+- **Lazy derivations.** `derivation` is a lazy wrapper over the eager `derivationStrict` primop (mirroring Nix's `corepkgs/derivation.nix`). Forcing a derivation to WHNF yields its attribute spine without computing `drvPath`/`outPath` or forcing its input closure — so referencing a package (`pkg ? out`, `assert (dep != null)`) is free.
+- **String context propagation.** Every `VStr` carries a `StringContext` tracking store path references. The `derivationStrict` primop collects all context into `drvInputDrvs`/`drvInputSrcs`.
 
 ---
 
@@ -131,7 +132,7 @@ The C99 data layer moves all evaluation data off the GHC heap:
 
 Measured on a stress test with 100k attribute sets, recursive computations, list operations, and overlay patterns.
 
-**nixpkgs status:** `import <nixpkgs/lib>` evaluates correctly (450 attributes). `lib.fix`, `lib.extends`, `lib.makeExtensible`, `lib.evalModules`, and `lib.systems.elaborate` all work. The stdenv bootstrap stages compute successfully. Full `import <nixpkgs> {}` evaluation is in progress — currently past derivation construction and overlay composition.
+**nixpkgs status:** `import <nixpkgs/lib>` evaluates correctly (450 attributes). `lib.fix`, `lib.extends`, `lib.makeExtensible`, `lib.evalModules`, and `lib.systems.elaborate` all work. The full stdenv bootstrap and package construction — perl, libxcrypt, binutils — now evaluate: `derivation` is a lazy wrapper over the eager `derivationStrict` primop (matching C++ Nix), so referencing a derivation no longer forces its build closure. Full `import <nixpkgs> {}` is currently blocked on a variable-resolution bug in named-formal-set (`@`-pattern) argument slots.
 
 ---
 
@@ -168,14 +169,14 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 
 | Module | Purpose |
 |--------|---------|
-| `Nix.Eval` | Bytecode evaluator — 24-opcode dispatch, thunk forcing, env operations, 108-builtin dispatch. Polymorphic via `MonadEval` |
+| `Nix.Eval` | Bytecode evaluator — 24-opcode dispatch, thunk forcing, env operations, 109-builtin dispatch. Polymorphic via `MonadEval` |
 | `Nix.Eval.Types` | `NixValue` (12 constructors), `Thunk` (C arena cell), `Env` (C-native struct), `AttrSet` (C sorted arrays), `MonadEval` typeclass |
 | `Nix.Eval.Compile` | Bytecode compiler — Expr AST to flat `nn_bytecode` instruction array |
 | `Nix.Eval.Operator` | Arithmetic with float promotion, deep structural equality, floored division |
 | `Nix.Eval.StringInterp` | String interpolation, `coerceToString`, indented string stripping, float formatting |
 | `Nix.Eval.Context` | String context construction, queries, and extraction for derivation building |
 | `Nix.Eval.IO` | IO evaluation monad — filesystem access, import cache, process execution, per-thunk memoization with blackhole detection |
-| `Nix.Builtins` | 108 builtins, search path plumbing, top-level builtin exposure |
+| `Nix.Builtins` | 109 builtins, search path plumbing, top-level builtin exposure |
 
 ### C99 Data Layer
 
@@ -212,7 +213,7 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 
 - [x] Full Nix parser (14 precedence levels, all syntax forms)
 - [x] Lazy bytecode evaluator (24 opcodes, thunk memoization, blackhole detection)
-- [x] 108 builtins (matching real Nix spec)
+- [x] 109 builtins (matching real Nix spec)
 - [x] C99 data layer (9 modules, all eval data off GHC heap)
 - [x] Content-addressed store with SQLite metadata
 - [x] Derivation builder with dependency resolution
@@ -222,7 +223,7 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 
 ### Next
 
-- [ ] Full `import <nixpkgs> {}` — remaining fixpoint laziness bug in overlay composition
+- [ ] Full `import <nixpkgs> {}` — bootstrap + package construction evaluate (lazy `derivation`); blocked on a named-formal-set (`@`-pattern) variable-slot bug
 - [ ] `--system` flag — override `builtins.currentSystem` for cross-platform evaluation
 - [ ] Windows stdenv — MinGW GCC + MSYS2 coreutils bootstrap for native Windows builds
 

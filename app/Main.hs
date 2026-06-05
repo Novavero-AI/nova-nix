@@ -16,7 +16,7 @@
 -- @
 module Main (main) where
 
-import Control.Monad ((>=>))
+import Control.Monad (void, (>=>))
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -165,7 +165,17 @@ buildFile extraPaths dataDir filePath = do
       st0 <- newEvalState (takeDirectory filePath)
       let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
           st = st0 {esSearchPaths = searchPaths}
-      result <- runEvalIO st (eval (builtinEnv (esTimestamp st) searchPaths) expr)
+      result <- runEvalIO st $ do
+        val <- eval (builtinEnv (esTimestamp st) searchPaths) expr
+        -- 'derivation' is a lazy wrapper now; force the attrs extractDerivation
+        -- reads (a build legitimately needs the drvPath + closure).
+        case val of
+          VAttrs attrs ->
+            mapM_
+              (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
+              ["_derivation", "drvPath"]
+          _ -> pure ()
+        pure val
       case result of
         Left err -> do
           TIO.hPutStrLn stderr ("eval error: " <> err)

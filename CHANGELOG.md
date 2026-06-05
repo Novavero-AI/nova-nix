@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### nixpkgs Evaluation: Lazy Derivations
+
+- **Fix: `import <nixpkgs> {}` infinite recursion — lazy `derivation` over `derivationStrict`** — `builtins.derivation` was eager: forcing a derivation to WHNF forced its entire env/input closure. This turned nixpkgs' lazy `perl` ↔ `libxcrypt` dependency cycle into a blackhole — `perl`'s `assert (libxcrypt != null)` forced `libxcrypt`'s build, which forced `perl` mid-construction. Restored Nix's two-tier model: the eager `builtins.derivationStrict` primop (identical content-hashing, renamed from the old `builtins.derivation` body) plus a lazy `derivation` wrapper over it (mirroring `corepkgs/derivation.nix`). Forcing a derivation to WHNF now yields its attribute spine without computing `drvPath`/`outPath` or forcing its inputs, so referencing a package no longer builds its closure. No C changes; `drvPath`/`outPath` hashes unchanged. The full stdenv bootstrap and package construction (perl, libxcrypt, binutils) now evaluate.
+- 109 builtins, 593 tests, `-Werror` clean, ormolu clean, hlint clean
+
 ### Technical Audit + C Data Layer Polish
 
 - **Fix: Nix integer division semantics** — `builtins.div` and `builtins.mod` now use floored division (`div`/`mod`) instead of truncated (`quot`/`rem`). `-7 / 3` correctly returns `-3` (was `-2`). Affects `builtinDiv`, `builtinMod`, and `evalDiv`.
