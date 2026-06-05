@@ -1,0 +1,75 @@
+name: Parity
+
+# Proves the EVALUATOR is correct: nova-nix's computed hello.drvPath must
+# byte-match what upstream Nix (nix-instantiate) computes from the SAME
+# nixpkgs tree.  A derivation store-path hash transitively encodes the hash
+# of every input derivation, so one matching path validates the whole
+# build-time closure at once.
+#
+# Linux-only on purpose: it is the one place a real Nix exists to diff
+# against.  The "runs natively on Windows" claim is proven separately by the
+# Windows build job; this job proves the evaluation it does is correct.
+
+on:
+  workflow_dispatch:
+  # Promote to `push: { branches: [main] }` once green to make it a
+  # permanent regression guard.
+
+jobs:
+  parity:
+    name: drvPath vs upstream Nix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.8"
+          cabal-version: "latest"
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ~/.cabal/store
+          key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
+          restore-keys: cabal-Linux-
+
+      - name: Fetch nixpkgs (both evaluators read this same tree)
+        run: |
+          git clone --depth 1 --branch nixos-24.11 https://github.com/NixOS/nixpkgs nixpkgs-ref
+          echo "NIXPKGS=$PWD/nixpkgs-ref" >> "$GITHUB_ENV"
+          echo "nixpkgs rev: $(git -C nixpkgs-ref rev-parse HEAD)"
+
+      - name: Upstream Nix drvPath (the oracle)
+        run: |
+          REF=$(nix-instantiate \
+            -E '(import <nixpkgs> { system = "x86_64-linux"; config = {}; overlays = []; }).hello' \
+            -I nixpkgs="$NIXPKGS")
+          echo "upstream: $REF"
+          echo "REF=$REF" >> "$GITHUB_ENV"
+
+      - name: Build nova-nix
+        run: cabal build exe:nova-nix
+
+      - name: nova-nix drvPath
+        run: |
+          RAW=$(cabal run -v0 nova-nix -- eval \
+            --expr '(import <nixpkgs> { system = "x86_64-linux"; config = {}; overlays = []; }).hello.drvPath' \
+            --nix-path nixpkgs="$NIXPKGS" --nix-path nix="$PWD/data/nix")
+          NOVA=$(printf '%s' "$RAW" | tr -d '"' | tail -n1)
+          echo "nova-nix: $NOVA"
+          echo "NOVA=$NOVA" >> "$GITHUB_ENV"
+
+      - name: Compare
+        run: |
+          echo "upstream nix : $REF"
+          echo "nova-nix     : $NOVA"
+          if [ "$REF" = "$NOVA" ]; then
+            echo "::notice title=Parity OK::nova-nix hello.drvPath byte-matches upstream Nix"
+          else
+            echo "::error title=Parity mismatch::nova-nix and upstream Nix disagree on hello.drvPath"
+            exit 1
+          fi
