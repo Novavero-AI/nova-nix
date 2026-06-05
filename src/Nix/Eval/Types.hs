@@ -1049,6 +1049,16 @@ class (Monad m) => MonadEval m where
   -- the Eval.Types → Eval circular dependency).
   forceThunk :: (Env -> Word32 -> m NixValue) -> Thunk -> m NixValue
 
+  -- | Look up a cached derivation modulo-hash (hex) by its @.drv@ store
+  -- path.  Populated bottom-up as each derivation is computed; used by the
+  -- derivation-hash algorithm to substitute input derivations.  Pure
+  -- evaluators have no cache and always return 'Nothing'.
+  lookupDrvHash :: Text -> m (Maybe Text)
+
+  -- | Cache a derivation's modulo hash (hex) under its @.drv@ store path.
+  -- A no-op in pure evaluators (no memoization).
+  cacheDrvHash :: Text -> Text -> m ()
+
 -- | Pure evaluation monad — wraps 'Either Text'.
 -- IO builtins ('readFile', 'import') are unavailable;
 -- everything else evaluates identically to the IO version.
@@ -1072,6 +1082,8 @@ instance MonadEval PureEval where
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
   copyPathToStore _ _ = throwEvalError "builtins.path: not available in pure evaluation"
   traceMessage _ = pure ()
+  lookupDrvHash _ = pure Nothing
+  cacheDrvHash _ _ = pure ()
   resolvePathLiteral = pure
   forceThunk evalFn (Thunk ptr) =
     -- Read the C thunk via unsafePerformIO — safe because reads are

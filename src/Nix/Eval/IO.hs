@@ -93,6 +93,10 @@ instance Exception NixAbortError
 -- @builtins.nixPath@.
 data EvalState = EvalState
   { esImportCache :: !(IORef (Map FilePath NixValue)),
+    -- | Cache of derivation modulo-hashes (drv store path → hex), populated
+    -- bottom-up by 'builtinDerivationStrict' so input derivations can be
+    -- substituted by their content hashes when computing output paths.
+    esDrvModuloCache :: !(IORef (Map Text Text)),
     esBaseDir :: !FilePath,
     esStoreDir :: !FilePath,
     esTimestamp :: !Int64,
@@ -104,6 +108,7 @@ data EvalState = EvalState
 newEvalState :: FilePath -> IO EvalState
 newEvalState baseDir = do
   cache <- newIORef Map.empty
+  drvCache <- newIORef Map.empty
   now <- floor <$> getPOSIXTime :: IO Int64
   nixPathStr <- lookupEnvText "NIX_PATH"
   let searchPaths = case nixPathStr of
@@ -112,6 +117,7 @@ newEvalState baseDir = do
   pure
     EvalState
       { esImportCache = cache,
+        esDrvModuloCache = drvCache,
         esBaseDir = baseDir,
         esStoreDir = T.unpack SP.platformStoreDirText,
         esTimestamp = now,
@@ -198,6 +204,14 @@ instance MonadEval EvalIO where
   getEnvVar name = wrapIO $ do
     mval <- lookupEnvText (T.unpack name)
     pure (maybe "" T.pack mval)
+
+  lookupDrvHash key = EvalIO $ do
+    ref <- asks esDrvModuloCache
+    liftIO (Map.lookup key <$> readIORef ref)
+
+  cacheDrvHash key val = EvalIO $ do
+    ref <- asks esDrvModuloCache
+    liftIO (modifyIORef' ref (Map.insert key val))
 
   getCurrentTime = EvalIO (asks esTimestamp)
 

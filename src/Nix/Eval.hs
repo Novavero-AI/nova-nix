@@ -86,7 +86,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
-import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpcode, cbcShortArg)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList (..), clistGet)
@@ -156,8 +156,8 @@ import Nix.Expr.Types
     NixAtom (..),
     UnaryOp (..),
   )
-import Nix.Hash (byteToHex, sha256Hex, truncatedBase32)
-import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath)
+import Nix.Hash (byteToHex, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex, truncatedBase32)
+import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import System.IO.Unsafe (unsafePerformIO)
@@ -3151,8 +3151,8 @@ builtinDerivationStrict :: (MonadEval m) => NixValue -> m NixValue
 builtinDerivationStrict (VAttrs attrs) = do
   -- Extract required attributes
   drvName <- forceAttrStr "derivation" "name" attrs
-  system <- forceAttrStr "derivation" "system" attrs
-  builder <- forceAttrStr "derivation" "builder" attrs
+  system <- forceAttrStr ("derivation \"" <> drvName <> "\"") "system" attrs
+  builder <- forceAttrStr ("derivation \"" <> drvName <> "\"") "builder" attrs
 
   -- Extract optional outputs (default ["out"])
   outputNames <- case attrSetLookup "outputs" attrs of
@@ -3175,76 +3175,90 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- Materialize once, reuse for both env collection and result merge
   let materialized = attrSetToMap attrs
 
-  -- Collect all string-coercible attrs into env WITH their contexts
-  (drvEnvPairs, envContext) <- collectDrvEnvWithContext materialized
+  -- Collect string-coercible attrs into the build env, EXCLUDING "args"
+  -- (C++ Nix puts args in the Derive() args field, never the env).  The
+  -- per-output env vars ($out, …) are added below.  Carries merged context.
+  (drvEnvPairs, envContext) <- collectDrvEnvWithContext (Map.delete "args" materialized)
 
-  -- Extract input derivations and input sources from the merged context
   let inputDrvs = extractInputDrvs envContext
       inputSrcs = extractInputSrcs envContext
-
-  -- Build the platform
-  let platform = textToPlatform system
-
-  -- Build the derivation with populated inputs for hashing
-  let envMap = Map.fromList drvEnvPairs
-      drv =
+      platform = textToPlatform system
+      baseEnv = Map.fromList drvEnvPairs
+      drvRefs = inputSrcs ++ Map.keys inputDrvs
+      drvFileName = drvName <> ".drv"
+      -- Build a Derivation sharing this call's inputs/platform/builder/args.
+      mkDrv outs env =
         Derivation
-          { drvOutputs = [],
+          { drvOutputs = outs,
             drvInputDrvs = inputDrvs,
             drvInputSrcs = inputSrcs,
             drvPlatform = platform,
             drvBuilder = builder,
             drvArgs = builderArgs,
-            drvEnv = envMap
+            drvEnv = env
           }
+      -- Output carrying only its name; the path is masked at render time.
+      maskedOutput name = DerivationOutput name (StorePath "" "") "" ""
+      -- Resolve an input derivation's modulo hash (hex) from the cache,
+      -- populated bottom-up by earlier 'builtinDerivationStrict' calls.
+      resolveInputModulo (sp, outs) = do
+        let inputPathText = storePathToText defaultStoreDir sp
+        cached <- lookupDrvHash inputPathText
+        case cached of
+          Just hex -> pure (hex, outs)
+          Nothing -> do
+            -- Eval is bottom-up, so inputs evaluated this session are always
+            -- cached by the time a dependent hashes.  A miss means an input
+            -- referenced but not evaluated here (a pure-eval synthetic context,
+            -- or a pre-built store drv): fall back to its store hash so
+            -- evaluation still produces a value, and warn for visibility.
+            traceMessage
+              ("derivation: input modulo hash not cached, using store hash for " <> inputPathText)
+            pure (spHash sp, outs)
 
-  -- Serialize to ATerm and hash for drvPath
-  let aterm = toATerm drv
-      storeRef = ":" <> defaultStoreDirText <> ":"
-      drvPathHash = truncatedBase32 (TE.encodeUtf8 ("text:sha256:" <> sha256Hex (TE.encodeUtf8 aterm) <> storeRef <> drvName <> ".drv"))
-      drvPathText = storeDirPrefix <> drvPathHash <> "-" <> drvName <> ".drv"
+  -- Fixed-output derivations (fetchurl etc.) are content-addressed and hash
+  -- via the @fixed:out:@ scheme; input-addressed derivations recurse through
+  -- the modulo hashes of their inputs.
+  mFixed <- detectFixedOutput attrs
 
-  -- Parse drvPath as a StorePath for context
-  let drvSP = case parseStorePath defaultStoreDir drvPathText of
-        Just sp -> sp
-        Nothing -> StorePath (T.take 32 (T.drop (T.length storeDirPrefix) drvPathText)) (drvName <> ".drv")
+  (drvPathText, drvSP, outPaths, completeDrv) <- case mFixed of
+    Just (foAlgo, foMode, foDigest) -> do
+      let foPath = makeFixedOutputPath drvName foAlgo foMode foDigest
+          foPathText = storePathToText defaultStoreDir foPath
+          algoField = (if foMode == "recursive" then "r:" else "") <> foAlgo
+          foHashHex = bytesToHex foDigest
+          foModulo =
+            sha256Digest
+              (TE.encodeUtf8 ("fixed:out:" <> algoField <> ":" <> foHashHex <> ":" <> foPathText))
+          contents =
+            mkDrv
+              [DerivationOutput "out" foPath algoField foHashHex]
+              (Map.insert "out" foPathText baseEnv)
+          drvSp = makeTextPath drvFileName (sha256Digest (TE.encodeUtf8 (toATerm contents))) drvRefs
+          drvText = storePathToText defaultStoreDir drvSp
+      cacheDrvHash drvText (bytesToHex foModulo)
+      pure (drvText, drvSp, [("out", foPathText)], contents)
+    Nothing -> do
+      inputSubst <- mapM resolveInputModulo (Map.toList inputDrvs)
+      let maskedEnv = foldr (`Map.insert` "") baseEnv outputNames
+          maskedDrv = mkDrv (map maskedOutput outputNames) maskedEnv
+          -- Masked modulo hash → this derivation's own output paths.
+          moduloMasked = sha256Digest (TE.encodeUtf8 (toATermForHash True (Just inputSubst) maskedDrv))
+          outStorePaths = [(n, makeOutputPath n moduloMasked drvName) | n <- outputNames]
+          outPathTexts = [(n, storePathToText defaultStoreDir sp) | (n, sp) <- outStorePaths]
+          realEnv = foldr (\(n, t) e -> Map.insert n t e) baseEnv outPathTexts
+          contents = mkDrv [DerivationOutput n sp "" "" | (n, sp) <- outStorePaths] realEnv
+          -- Unmasked modulo hash (real outputs, inputs substituted) cached for
+          -- when this derivation is itself an input to another.
+          moduloUnmasked = sha256Digest (TE.encodeUtf8 (toATermForHash False (Just inputSubst) contents))
+          drvSp = makeTextPath drvFileName (sha256Digest (TE.encodeUtf8 (toATerm contents))) drvRefs
+          drvText = storePathToText defaultStoreDir drvSp
+      cacheDrvHash drvText (bytesToHex moduloUnmasked)
+      pure (drvText, drvSp, outPathTexts, contents)
 
-  -- Compute output paths
-  let computeOutPath outName =
-        let nameSuffix = if outName == "out" then "" else "-" <> outName
-            preimage = "output:" <> outName <> ":sha256:" <> sha256Hex (TE.encodeUtf8 aterm) <> storeRef <> drvName <> nameSuffix
-            outHash = truncatedBase32 (TE.encodeUtf8 preimage)
-         in storeDirPrefix <> outHash <> "-" <> drvName <> nameSuffix
-
-  let outPaths = [(outName, computeOutPath outName) | outName <- outputNames]
-      mainOutPath = case outPaths of
+  let mainOutPath = case outPaths of
         ((_, p) : _) -> p
         [] -> ""
-
-  -- Build DerivationOutput records for the Derivation value
-  let drvOutputsList =
-        [ DerivationOutput
-            { doName = outName,
-              doPath = case parseStorePath defaultStoreDir outP of
-                Just sp -> sp
-                -- Fallback: construct manually from the path string
-                Nothing -> StorePath (T.take 32 (T.drop (T.length storeDirPrefix) outP)) outName,
-              doHashAlgo = "",
-              doHash = ""
-            }
-        | (outName, outP) <- outPaths
-        ]
-
-  -- Build the complete Derivation with populated outputs and env.
-  -- The hash was computed from the pre-output drv (drvOutputs = []),
-  -- so adding output paths and drvPath to drvEnv here does not affect
-  -- the content address.  Real Nix .drv files include these in their
-  -- env section — builders read $out etc. from the environment.
-  let completeEnv =
-        Map.union
-          (Map.fromList (("drvPath", drvPathText) : outPaths))
-          envMap
-      completeDrv = drv {drvOutputs = drvOutputsList, drvEnv = completeEnv}
 
   -- Context for output paths: each output carries SCDrvOutput context
   -- Context for drvPath: carries SCAllOutputs context
@@ -3280,6 +3294,50 @@ builtinDerivationStrict (VAttrs attrs) = do
   pure (VAttrs (attrSetFromMap resultAttrs))
 builtinDerivationStrict other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
+
+-- | Detect a fixed-output derivation.  Returns @Just (algo, mode, rawDigest)@
+-- when @outputHash@ is present and non-empty (fetchurl, fetchgit, …), else
+-- 'Nothing' for an ordinary input-addressed derivation.  @mode@ is
+-- @\"flat\"@ or @\"recursive\"@; @algo@ is e.g. @\"sha256\"@.
+detectFixedOutput :: (MonadEval m) => AttrSet -> m (Maybe (Text, Text, BS.ByteString))
+detectFixedOutput attrs =
+  case attrSetLookup "outputHash" attrs of
+    Nothing -> pure Nothing
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VStr ohash _
+          | not (T.null ohash) -> do
+              ohAlgo <- optDrvStrAttr "outputHashAlgo" attrs
+              ohMode <- optDrvStrAttr "outputHashMode" attrs
+              (algo, digest) <- normalizeFixedHash ohash ohAlgo
+              let mode = if ohMode == "recursive" then "recursive" else "flat"
+              pure (Just (algo, mode, digest))
+        _ -> pure Nothing
+
+-- | Read an optional string attribute, defaulting to @\"\"@ when absent or
+-- not a string.
+optDrvStrAttr :: (MonadEval m) => Text -> AttrSet -> m Text
+optDrvStrAttr key attrs =
+  case attrSetLookup key attrs of
+    Nothing -> pure ""
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VStr s _ -> pure s
+        _ -> pure ""
+
+-- | Decode a fixed-output hash (SRI @algo-base64@, @algo:hash@, or a bare
+-- hash plus a separate algorithm) to its algorithm name and raw bytes.
+normalizeFixedHash :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
+normalizeFixedHash ohash ohAlgo
+  | Just (algo, b64) <- parseSRI ohash = do
+      bytes <- decodeBase64E "derivation" b64
+      pure (algo, bytes)
+  | Just (algo, rest) <- parseAlgoPrefix ohash = decodeWithAlgo algo rest
+  | not (T.null ohAlgo) = decodeWithAlgo ohAlgo ohash
+  | otherwise =
+      throwEvalError ("derivation: cannot determine outputHash algorithm for " <> ohash)
 
 -- | Lazy @derivation@ wrapper — mirrors C++ Nix's @corepkgs/derivation.nix@.
 -- Returns a WHNF attrset whose @drvPath@/@outPath@/output-path/@_derivation@
@@ -3490,9 +3548,16 @@ bytesToBase64 = B64.encode
 -- | Decode base64 text to bytes (pure).
 decodeBase64Pure :: Text -> Either Text BS.ByteString
 decodeBase64Pure t =
-  case B64.decode (T.filter (/= '=') (T.filter (/= '\n') (T.filter (/= '\r') t))) of
-    Right bytes -> Right bytes
-    Left _ -> Left "invalid base64"
+  -- Strip whitespace and any existing padding, then re-pad to a multiple of
+  -- 4.  base64-bytestring's 'decode' requires correct padding, so SRI hashes
+  -- (correctly-padded standard base64, e.g. @sha256-…NQ=@) would otherwise be
+  -- rejected once their trailing @=@ was removed.
+  let stripped = T.filter (\c -> c /= '\n' && c /= '\r' && c /= '=') t
+      padLen = (4 - (T.length stripped `mod` 4)) `mod` 4
+      padded = stripped <> T.replicate padLen "="
+   in case B64.decode padded of
+        Right bytes -> Right bytes
+        Left _ -> Left "invalid base64"
 
 -- | Decode base64 with error context for builtins.
 decodeBase64E :: (MonadEval m) => Text -> Text -> m BS.ByteString
