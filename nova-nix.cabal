@@ -3,15 +3,16 @@ name:               nova-nix
 version:            0.1.9.0
 synopsis:           Windows-native Nix implementation in Haskell and C99
 description:
-  A Windows-native implementation of the Nix package manager — Haskell for
-  evaluation logic, a C99 data layer for off-heap evaluation data.  Runs
-  natively on Windows, macOS, and Linux — no WSL, no MSYS2, no Cygwin
-  required.  Evaluates .nix files, builds derivations, manages a
-  content-addressed store, and substitutes pre-built binaries from remote
-  caches (nova-cache, cache.nixos.org).
+  A from-scratch implementation of the Nix package manager that runs
+  natively on Windows, macOS, and Linux — no WSL or Cygwin.  A
+  Haskell evaluator handles parsing and lazy evaluation, backed by a C99
+  data layer that keeps evaluation data off the GHC heap.  It evaluates
+  Nix expressions (including real nixpkgs @lib@), computes derivations and
+  content-addressed store paths, and includes a derivation builder and
+  binary-cache substituter.
 
-  Built on top of @nova-cache@ for NAR serialization, narinfo handling,
-  Ed25519 signing, and binary substitution.
+  Built on @nova-cache@ for NAR serialization, narinfo handling, and
+  Ed25519-signed binary substitution.
 
 license:            BSD-3-Clause
 license-file:       LICENSE

@@ -25,7 +25,7 @@
 | **C99 Data Layer** | 9 arena-allocated C modules for interned symbols, sorted attrsets, thunks, envs, lists, bytecode, lambdas. All eval data off the GHC heap. |
 | **Store** | Content-addressed `/nix/store` (or `C:\nix\store`). SQLite metadata, reference scanning, read-only enforcement. |
 | **Builder** | Dependency graph via Kahn's toposort. Binary cache substitution before local builds. Multi-output, reference scanning, store registration. |
-| **Substituter** | HTTP binary cache protocol. Narinfo parsing, Ed25519 verification, NAR download/unpack. Priority-ordered multi-cache. Built on [nova-cache](https://github.com/Novavero-AI/nova-cache). |
+| **Substituter** | HTTP binary cache protocol. Narinfo parsing, Ed25519 verification, NAR download/unpack (uncompressed; XZ decompression pending). Priority-ordered multi-cache. Built on [nova-cache](https://github.com/Novavero-AI/nova-cache). |
 
 Every module is pure by default. IO at the boundaries only.
 
@@ -132,7 +132,7 @@ The C99 data layer moves all evaluation data off the GHC heap:
 
 Measured on a stress test with 100k attribute sets, recursive computations, list operations, and overlay patterns.
 
-**nixpkgs status:** `import <nixpkgs/lib>` evaluates correctly (450 attributes). `lib.fix`, `lib.extends`, `lib.makeExtensible`, `lib.evalModules`, and `lib.systems.elaborate` all work. The full stdenv bootstrap and package construction — perl, libxcrypt, binutils — now evaluate: `derivation` is a lazy wrapper over the eager `derivationStrict` primop (matching C++ Nix), so referencing a derivation no longer forces its build closure. Full `import <nixpkgs> {}` is currently blocked on a variable-resolution bug in named-formal-set (`@`-pattern) argument slots.
+**nixpkgs status:** `import <nixpkgs/lib>` evaluates correctly (450 attributes). `lib.fix`, `lib.extends`, `lib.makeExtensible`, `lib.evalModules`, and `lib.systems.elaborate` all work. The stdenv bootstrap now progresses through derivation construction and overlay composition (previously an infinite loop): `derivation` is a lazy wrapper over the eager `derivationStrict` primop (matching C++ Nix), so referencing a derivation no longer forces its build closure. Full `import <nixpkgs> {}` is currently blocked on a variable-resolution bug in named-formal-set (`@`-pattern) argument slots, hit while evaluating perl.
 
 ---
 
@@ -203,7 +203,7 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 | `Nix.Builder` | Dependency graph, topological sort, binary cache substitution, local build |
 | `Nix.DependencyGraph` | BFS graph construction, Kahn's toposort, cycle detection |
 | `Nix.Hash` | Derivation hashing (`DrvHash`), SHA-256, truncated base-32, shared hash utilities |
-| `Nix.Substituter` | HTTP binary cache — narinfo, Ed25519 verification, NAR download/unpack |
+| `Nix.Substituter` | HTTP binary cache — narinfo, Ed25519 verification, NAR download/unpack (XZ decompression pending) |
 
 ---
 
@@ -217,7 +217,7 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 - [x] C99 data layer (9 modules, all eval data off GHC heap)
 - [x] Content-addressed store with SQLite metadata
 - [x] Derivation builder with dependency resolution
-- [x] Binary cache substituter with Ed25519 verification
+- [x] Binary cache substituter — narinfo, Ed25519 verification, NAR unpack (XZ decompression pending)
 - [x] String context tracking and propagation
 - [x] nixpkgs lib layer evaluation (`lib.fix`, `lib.extends`, `lib.evalModules`)
 
@@ -233,6 +233,8 @@ nova-nix runs natively on Windows — no compatibility layers, no translation.
 - [ ] `nova-nix repl` — interactive evaluator
 - [ ] Nix daemon protocol compatibility
 - [ ] XZ decompression for binary cache downloads
+- [ ] Wire nova-cache NAR hashing + size into store registration (currently placeholders)
+- [ ] Build sandboxing / filesystem isolation (builds currently run unsandboxed)
 
 ---
 
