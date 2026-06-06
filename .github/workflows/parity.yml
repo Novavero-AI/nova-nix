@@ -85,13 +85,15 @@ jobs:
             [ "$isroot" = 1 ] && echo "$dp" >> roots.txt
           done < nova.tsv
           sort -u roots.txt
-          echo "===== first root: nova vs upstream ATerm ====="
+          echo "===== first root: normalized diff (< nova | > upstream), store hashes masked ====="
           ROOT=$(sort -u roots.txt | head -1)
           NAME=$(printf '%s' "$ROOT" | sed -E 's#.*/[a-z0-9]{32}-##; s#\.drv$##')
           echo "root: $ROOT  (name: $NAME)"
-          echo "--- nova ---"; grep -F "$ROOT" nova.tsv | head -1 | cut -f2
+          NOVA_AT=$(awk -F'\t' -v r="$ROOT" '$1==r{print $2; exit}' nova.tsv)
           UPDRV=$(jq -r --arg n "$NAME" 'to_entries[]|select(.value.name==$n)|.key' up.json | head -1)
-          echo "--- upstream ($UPDRV) ---"; cat "$UPDRV" 2>/dev/null
+          UP_AT=$(cat "$UPDRV" 2>/dev/null)
+          norm() { printf '%s' "$1" | sed -E 's#/nix/store/[a-z0-9]{32}-#@#g; s#\),\(#),\n(#g'; }
+          diff <(norm "$NOVA_AT") <(norm "$UP_AT")
 
       - name: Compare
         run: |
