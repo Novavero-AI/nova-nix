@@ -63,6 +63,36 @@ jobs:
           echo "nova-nix: $NOVA"
           echo "NOVA=$NOVA" >> "$GITHUB_ENV"
 
+      - name: closure diff (debug)
+        run: |
+          set +e
+          E='(import <nixpkgs> { system = "x86_64-linux"; config = {}; overlays = []; })'
+          cabal run -v0 nova-nix -- eval --aterm --recursive --expr "$E.hello" --nix-path nixpkgs="$NIXPKGS" --nix-path nix="$PWD/data/nix" > nova.tsv 2>/dev/null
+          nix derivation show "$REF" -r > up.json
+          echo "nova drvs: $(wc -l < nova.tsv)  upstream drvs: $(jq 'length' up.json)"
+          cut -f1 nova.tsv | sort > nova_paths.txt
+          jq -r 'keys[]' up.json | sort > up_paths.txt
+          comm -23 nova_paths.txt up_paths.txt > divergent.txt
+          echo "matching: $(comm -12 nova_paths.txt up_paths.txt | wc -l)  divergent: $(wc -l < divergent.txt)"
+          echo "===== ROOTS (divergent, but all inputs match) ====="
+          : > roots.txt
+          while IFS=$'\t' read -r dp aterm; do
+            grep -qxF "$dp" divergent.txt || continue
+            isroot=1
+            for ip in $(printf '%s' "$aterm" | grep -oE '/nix/store/[a-z0-9]{32}-[^"]*\.drv'); do
+              grep -qxF "$ip" divergent.txt && { isroot=0; break; }
+            done
+            [ "$isroot" = 1 ] && echo "$dp" >> roots.txt
+          done < nova.tsv
+          sort -u roots.txt
+          echo "===== first root: nova vs upstream ATerm ====="
+          ROOT=$(sort -u roots.txt | head -1)
+          NAME=$(printf '%s' "$ROOT" | sed -E 's#.*/[a-z0-9]{32}-##; s#\.drv$##')
+          echo "root: $ROOT  (name: $NAME)"
+          echo "--- nova ---"; grep -F "$ROOT" nova.tsv | head -1 | cut -f2
+          UPDRV=$(jq -r --arg n "$NAME" 'to_entries[]|select(.value.name==$n)|.key' up.json | head -1)
+          echo "--- upstream ($UPDRV) ---"; cat "$UPDRV" 2>/dev/null
+
       - name: Compare
         run: |
           echo "upstream nix : $REF"
