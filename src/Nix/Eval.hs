@@ -73,7 +73,7 @@ import qualified Data.ByteString as BS
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, isOctDigit, ord)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
-import Data.List (find, foldl')
+import Data.List (find, foldl', sort)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, maybeToList)
@@ -1464,8 +1464,10 @@ builtinAbort other = abortEvaluation ("builtins.abort: expected a string, got " 
 
 builtinAttrNames :: (MonadEval m) => NixValue -> m NixValue
 builtinAttrNames (VAttrs attrs) =
-  -- Zero thunk allocation: attrSetKeys reads symbol names from C arrays.
-  let thunks = map (evaluated . mkStr) (attrSetKeys attrs)
+  -- Nix returns attribute names lexicographically sorted; the C array is in
+  -- interned-symbol order, so sort here (consistent with builtins.attrValues,
+  -- which sorts via attrSetElems).
+  let thunks = map (evaluated . mkStr) (sort (attrSetKeys attrs))
    in pure (VList (clistFromThunks (map thunkToCPtr thunks)))
 builtinAttrNames other =
   throwEvalError ("builtins.attrNames: expected a set, got " <> typeName other)
