@@ -409,7 +409,7 @@ evalBcStringParts env n off = do
     0 -> pure (True, symbolText (Symbol val), emptyContext)
     _ -> do
       v <- evalBytecode env val
-      (txt, ctx) <- coerceToString force applyValue v
+      (txt, ctx) <- coerceToStringInterp v
       pure (False, txt, ctx)
   rest <- evalBcStringParts env (n - 1) (off + 2)
   pure (chunk : rest)
@@ -1906,6 +1906,18 @@ coerceToStoreString (VList cl) = do
   parts <- mapM (force >=> coerceToStoreString) thunks
   pure (T.intercalate " " (map fst parts), mconcat (map snd parts))
 coerceToStoreString other = coerceToStringPermissive other
+
+-- | Coerce a value for string interpolation (@"${...}"@).  Like
+-- 'coerceToString', but a path literal is copied into the store and replaced by
+-- its source store path (with context) — matching C++ Nix, where interpolation
+-- uses @copyToStore = true@, unlike 'builtins.toString', which does not copy.
+coerceToStringInterp :: (MonadEval m) => NixValue -> m (Text, StringContext)
+coerceToStringInterp (VPath p) = do
+  spText <- storeSourcePath p
+  case parseStorePath defaultStoreDir spText of
+    Just sp -> pure (spText, StringContext (Set.singleton (SCPlain sp)))
+    Nothing -> pure (spText, mempty)
+coerceToStringInterp other = coerceToString force applyValue other
 
 -- | The current system platform string.
 currentSystemStr :: Text

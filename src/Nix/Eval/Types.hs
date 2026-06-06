@@ -1094,7 +1094,10 @@ instance MonadEval PureEval where
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()
-  storeSourcePath _ = throwEvalError "path coercion to store not available in pure evaluation"
+
+  -- Pure eval cannot read files: a path coerces to itself (no store copy);
+  -- the real copy-to-store happens only under 'EvalIO'.
+  storeSourcePath = pure
   recordDerivation _ _ = pure ()
   resolvePathLiteral = pure
   forceThunk evalFn (Thunk ptr) =
