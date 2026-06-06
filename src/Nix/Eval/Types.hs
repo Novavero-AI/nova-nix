@@ -1059,6 +1059,12 @@ class (Monad m) => MonadEval m where
   -- A no-op in pure evaluators (no memoization).
   cacheDrvHash :: Text -> Text -> m ()
 
+  -- | Compute the store path a source file/directory gets when copied into
+  -- the store (recursive NAR sha256 → @source@ fixed-output path), WITHOUT
+  -- performing the copy.  Used when a path literal is coerced in a derivation
+  -- argument or environment value.  Unavailable in pure evaluation.
+  storeSourcePath :: Text -> m Text
+
 -- | Pure evaluation monad — wraps 'Either Text'.
 -- IO builtins ('readFile', 'import') are unavailable;
 -- everything else evaluates identically to the IO version.
@@ -1084,6 +1090,7 @@ instance MonadEval PureEval where
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()
+  storeSourcePath _ = throwEvalError "path coercion to store not available in pure evaluation"
   resolvePathLiteral = pure
   forceThunk evalFn (Thunk ptr) =
     -- Read the C thunk via unsafePerformIO — safe because reads are

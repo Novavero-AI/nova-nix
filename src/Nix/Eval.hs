@@ -1887,6 +1887,23 @@ coerceToStringPermissive (VList cl) = do
       coerceToStringPermissive val
 coerceToStringPermissive other = coerceToString force applyValue other
 
+-- | Coerce a value to a string for a DERIVATION field (an env value or an
+-- arg).  Like 'coerceToStringPermissive', but a path literal is copied into
+-- the store: it becomes its source store path, with that path added to the
+-- string context so it lands in the derivation's @inputSrcs@ — matching C++
+-- Nix's copy-to-store coercion of paths in derivation arguments/environment.
+coerceToStoreString :: (MonadEval m) => NixValue -> m (Text, StringContext)
+coerceToStoreString (VPath p) = do
+  spText <- storeSourcePath p
+  case parseStorePath defaultStoreDir spText of
+    Just sp -> pure (spText, StringContext (Set.singleton (SCPlain sp)))
+    Nothing -> pure (spText, mempty)
+coerceToStoreString (VList cl) = do
+  let thunks = map Thunk (clistThunks cl)
+  parts <- mapM (force >=> coerceToStoreString) thunks
+  pure (T.intercalate " " (map fst parts), mconcat (map snd parts))
+coerceToStoreString other = coerceToStringPermissive other
+
 -- | The current system platform string.
 currentSystemStr :: Text
 currentSystemStr = case (System.Info.arch, System.Info.os) of
@@ -3163,13 +3180,17 @@ builtinDerivationStrict (VAttrs attrs) = do
         VList cl -> mapM (forceToText . Thunk) (clistThunks cl)
         _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
 
-  -- Extract optional args (default [])
-  builderArgs <- case attrSetLookup "args" attrs of
-    Nothing -> pure []
+  -- Extract optional args (default []).  Path literals in args (e.g. stdenv's
+  -- ./default-builder.sh) are copied into the store; their source paths flow
+  -- into inputSrcs via the returned context.
+  (builderArgs, argsContext) <- case attrSetLookup "args" attrs of
+    Nothing -> pure ([], mempty)
     Just thunk -> do
       val <- force thunk
       case val of
-        VList cl -> mapM (forceToText . Thunk) (clistThunks cl)
+        VList cl -> do
+          parts <- mapM (\t -> force (Thunk t) >>= coerceToStoreString) (clistThunks cl)
+          pure (map fst parts, mconcat (map snd parts))
         _ -> throwEvalError "derivation: 'args' must be a list of strings"
 
   -- Materialize once, reuse for both env collection and result merge
@@ -3180,8 +3201,9 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- per-output env vars ($out, …) are added below.  Carries merged context.
   (drvEnvPairs, envContext) <- collectDrvEnvWithContext (Map.delete "args" materialized)
 
-  let inputDrvs = extractInputDrvs envContext
-      inputSrcs = extractInputSrcs envContext
+  let fullContext = envContext <> argsContext
+      inputDrvs = extractInputDrvs fullContext
+      inputSrcs = extractInputSrcs fullContext
       platform = textToPlatform system
       baseEnv = Map.fromList drvEnvPairs
       drvRefs = inputSrcs ++ Map.keys inputDrvs
@@ -3409,7 +3431,7 @@ collectDrvEnvWithContext attrs = do
       case val of
         VNull -> pure Nothing
         _ -> do
-          result <- catchEvalError (coerceToStringPermissive val)
+          result <- catchEvalError (coerceToStoreString val)
           case result of
             Right (s, ctx) -> pure (Just (key, s, ctx))
             Left _ -> pure Nothing
