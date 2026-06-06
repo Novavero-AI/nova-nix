@@ -65,16 +65,16 @@ jobs:
 
       - name: ATerm diff (debug)
         run: |
-          echo "===== nova-nix ATerm ====="
-          cabal run -v0 nova-nix -- eval --aterm \
-            --expr '(import <nixpkgs> { system = "x86_64-linux"; config = {}; overlays = []; }).hello' \
-            --nix-path nixpkgs="$NIXPKGS" --nix-path nix="$PWD/data/nix"
-          echo
-          echo "===== upstream raw .drv ====="
-          cat "$REF"
-          echo
-          echo "===== upstream nix derivation show ====="
-          nix derivation show "$REF" || true
+          E='(import <nixpkgs> { system = "x86_64-linux"; config = {}; overlays = []; })'
+          for ATTR in hello stdenv bash; do
+            echo "===== NOVA $ATTR ====="
+            cabal run -v0 nova-nix -- eval --aterm --expr "$E.$ATTR" \
+              --nix-path nixpkgs="$NIXPKGS" --nix-path nix="$PWD/data/nix" || true
+            echo
+            echo "===== UPSTREAM $ATTR ====="
+            cat "$(nix-instantiate -E "$E.$ATTR" -I nixpkgs="$NIXPKGS")" || true
+            echo
+          done
 
       - name: Compare
         run: |
