@@ -112,7 +112,9 @@ formatNixFloat n
 --    the first line, which has no leading whitespace in double single-quoted).
 -- 3. Strip that many spaces/tabs from the front of each line.
 -- 4. Drop a single leading newline if present.
--- 5. Drop a single trailing newline if present.
+--
+-- The trailing newline is KEPT — matching C++ Nix, which drops only the
+-- leading newline of an indented string, not the trailing one.
 stripIndentation :: Text -> Text
 stripIndentation raw
   | T.null raw = raw
@@ -121,8 +123,7 @@ stripIndentation raw
           lns = T.splitOn "\n" withLeadingStripped
           minIndent = minimumIndent lns
           stripped = map (stripPrefix minIndent) lns
-          joined = T.intercalate "\n" stripped
-       in stripTrailingNewline joined
+       in T.intercalate "\n" stripped
 
 -- | Count leading spaces on a line (tabs count as one space).
 countIndent :: Text -> Int
@@ -152,10 +153,4 @@ stripPrefix n t = case T.uncons t of
 stripLeadingNewline :: Text -> Text
 stripLeadingNewline t = case T.uncons t of
   Just ('\n', rest) -> rest
-  _ -> t
-
--- | Drop a single trailing newline.
-stripTrailingNewline :: Text -> Text
-stripTrailingNewline t = case T.unsnoc t of
-  Just (prefix, '\n') -> prefix
   _ -> t

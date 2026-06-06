@@ -3199,7 +3199,7 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- Collect string-coercible attrs into the build env, EXCLUDING "args"
   -- (C++ Nix puts args in the Derive() args field, never the env).  The
   -- per-output env vars ($out, …) are added below.  Carries merged context.
-  (drvEnvPairs, envContext) <- collectDrvEnvWithContext (Map.delete "args" materialized)
+  (drvEnvPairs, envContext) <- collectDrvEnvWithContext (Map.delete "__ignoreNulls" (Map.delete "args" materialized))
 
   let fullContext = envContext <> argsContext
       inputDrvs = extractInputDrvs fullContext
