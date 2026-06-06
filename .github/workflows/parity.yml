@@ -63,23 +63,6 @@ jobs:
           echo "nova-nix: $NOVA"
           echo "NOVA=$NOVA" >> "$GITHUB_ENV"
 
-      - name: ATerm diff (debug)
-        run: |
-          set +e
-          echo "===== CI Nix fetchurl.nix candidates ====="
-          find /nix/store -name 'fetchurl.nix' 2>/dev/null | head -5
-          CIFU=$(find /nix/store -name 'fetchurl.nix' 2>/dev/null | grep -i corepkgs | head -1)
-          echo "chosen CI fetchurl.nix: ${CIFU:-<none>}"
-          if [ -n "$CIFU" ]; then
-            echo "--- diff (< bundled | > CI Nix) ---"
-            diff "$PWD/data/nix/fetchurl.nix" "$CIFU" && echo "(IDENTICAL)" || echo "(^ DIFFER)"
-          fi
-          echo
-          echo "===== executable fetchurl: upstream stderr + nova ====="
-          EXPR='import <nix/fetchurl.nix> { url = "https://x/y"; sha256 = "086vqwk2wl8zfs47sq2xpjc9k066ilmb8z6dn0q6ymwjzlm196cd"; name = "x"; executable = true; }'
-          echo "--- upstream ---"; nix-instantiate -E "$EXPR" 2>&1 | head -4
-          echo "--- nova ---"; cabal run -v0 nova-nix -- eval --aterm --expr "$EXPR" --nix-path nix="$PWD/data/nix" 2>&1 | tail -2
-
       - name: Compare
         run: |
           echo "upstream nix : $REF"
