@@ -1065,6 +1065,10 @@ class (Monad m) => MonadEval m where
   -- argument or environment value.  Unavailable in pure evaluation.
   storeSourcePath :: Text -> m Text
 
+  -- | Record a computed derivation's @.drv@ ATerm under its store path, for
+  -- the @--aterm --recursive@ closure dump.  A no-op in pure evaluation.
+  recordDerivation :: Text -> Text -> m ()
+
 -- | Pure evaluation monad — wraps 'Either Text'.
 -- IO builtins ('readFile', 'import') are unavailable;
 -- everything else evaluates identically to the IO version.
@@ -1091,6 +1095,7 @@ instance MonadEval PureEval where
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()
   storeSourcePath _ = throwEvalError "path coercion to store not available in pure evaluation"
+  recordDerivation _ _ = pure ()
   resolvePathLiteral = pure
   forceThunk evalFn (Thunk ptr) =
     -- Read the C thunk via unsafePerformIO — safe because reads are

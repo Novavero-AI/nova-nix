@@ -101,6 +101,9 @@ data EvalState = EvalState
     -- | Cache of source path → its store path (recursive NAR hash), so a path
     -- literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text Text)),
+    -- | Registry of every computed derivation (drv store path → @.drv@ ATerm),
+    -- populated as derivations evaluate; dumped by @--aterm --recursive@.
+    esDrvRegistry :: !(IORef (Map Text Text)),
     esBaseDir :: !FilePath,
     esStoreDir :: !FilePath,
     esTimestamp :: !Int64,
@@ -114,6 +117,7 @@ newEvalState baseDir = do
   cache <- newIORef Map.empty
   drvCache <- newIORef Map.empty
   srcCache <- newIORef Map.empty
+  drvRegistry <- newIORef Map.empty
   now <- floor <$> getPOSIXTime :: IO Int64
   nixPathStr <- lookupEnvText "NIX_PATH"
   let searchPaths = case nixPathStr of
@@ -124,6 +128,7 @@ newEvalState baseDir = do
       { esImportCache = cache,
         esDrvModuloCache = drvCache,
         esSourcePathCache = srcCache,
+        esDrvRegistry = drvRegistry,
         esBaseDir = baseDir,
         esStoreDir = T.unpack SP.platformStoreDirText,
         esTimestamp = now,
@@ -232,6 +237,10 @@ instance MonadEval EvalIO where
             spText = SP.storePathToText SP.defaultStoreDir sp
         EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath spText)))
         pure spText
+
+  recordDerivation key aterm = EvalIO $ do
+    ref <- asks esDrvRegistry
+    liftIO (modifyIORef' ref (Map.insert key aterm))
 
   getCurrentTime = EvalIO (asks esTimestamp)
 

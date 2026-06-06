@@ -17,6 +17,7 @@
 module Main (main) where
 
 import Control.Monad (void, (>=>))
+import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -46,6 +47,7 @@ data CliOpts = CliOpts
   { optNixPaths :: ![T.Text],
     optStrict :: !Bool,
     optAterm :: !Bool,
+    optRecursive :: !Bool,
     optCommand :: !Command
   }
 
@@ -56,7 +58,7 @@ data Command
   | CmdHelp
 
 parseArgs :: [String] -> CliOpts
-parseArgs = go (CliOpts [] False False CmdHelp)
+parseArgs = go (CliOpts [] False False False CmdHelp)
   where
     go opts [] = opts
     go opts ("--nix-path" : val : rest) =
@@ -65,6 +67,8 @@ parseArgs = go (CliOpts [] False False CmdHelp)
       go (opts {optStrict = True}) rest
     go opts ("--aterm" : rest) =
       go (opts {optAterm = True}) rest
+    go opts ("--recursive" : rest) =
+      go (opts {optRecursive = True}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : path : rest) =
       go (opts {optCommand = CmdBuild path}) rest
@@ -73,6 +77,7 @@ parseArgs = go (CliOpts [] False False CmdHelp)
     goEval opts [] = opts
     goEval opts ("--strict" : rest) = goEval (opts {optStrict = True}) rest
     goEval opts ("--aterm" : rest) = goEval (opts {optAterm = True}) rest
+    goEval opts ("--recursive" : rest) = goEval (opts {optRecursive = True}) rest
     goEval opts ("--nix-path" : val : rest) =
       goEval (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
     goEval opts ("--expr" : expr : rest) =
@@ -101,7 +106,7 @@ main = do
   case optCommand opts of
     CmdEvalFile filePath -> evalFile (optStrict opts) (optNixPaths opts) dataDir filePath
     CmdEvalExpr expr
-      | optAterm opts -> evalExprAterm (optNixPaths opts) dataDir expr
+      | optAterm opts -> evalExprAterm (optRecursive opts) (optNixPaths opts) dataDir expr
       | otherwise -> evalExpr (optStrict opts) (optNixPaths opts) dataDir expr
     CmdBuild filePath -> buildFile (optNixPaths opts) dataDir filePath
     CmdHelp -> do
@@ -162,8 +167,8 @@ evalExpr strict extraPaths dataDir source = do
 
 -- | Evaluate an inline expression to a derivation and print its ATerm (.drv
 -- contents), for diffing nova-nix's serialization against upstream Nix.
-evalExprAterm :: [T.Text] -> FilePath -> T.Text -> IO ()
-evalExprAterm extraPaths dataDir source =
+evalExprAterm :: Bool -> [T.Text] -> FilePath -> T.Text -> IO ()
+evalExprAterm recursive extraPaths dataDir source =
   case parseNix "<expr>" source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
@@ -186,9 +191,13 @@ evalExprAterm extraPaths dataDir source =
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
           exitFailure
-        Right val -> do
-          (drv, _) <- extractDerivation val
-          TIO.putStrLn (toATerm drv)
+        Right val
+          | recursive -> do
+              registry <- readIORef (esDrvRegistry st)
+              mapM_ (\(p, a) -> TIO.putStrLn (p <> "\t" <> a)) (Map.toList registry)
+          | otherwise -> do
+              (drv, _) <- extractDerivation val
+              TIO.putStrLn (toATerm drv)
 
 -- | Parse, evaluate, extract derivation, build, and print result.
 buildFile :: [T.Text] -> FilePath -> FilePath -> IO ()
