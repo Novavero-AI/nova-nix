@@ -65,21 +65,21 @@ jobs:
 
       - name: ATerm diff (debug)
         run: |
-          echo "===== fetchurl.nix: bundled vs CI Nix corepkgs ====="
-          CINIX=$(nix-instantiate --eval --expr 'builtins.toString <nix/fetchurl.nix>' 2>/dev/null | tr -d '"' || true)
-          echo "bundled: $PWD/data/nix/fetchurl.nix"
-          echo "CI nix : ${CINIX:-<unresolved>}"
-          if [ -f "$CINIX" ]; then
-            echo "--- diff (< bundled | > CI nix) ---"
-            diff "$PWD/data/nix/fetchurl.nix" "$CINIX" && echo "(IDENTICAL)" || echo "(^ DIFFER)"
-          else
-            echo "(CI fetchurl.nix is not a plain file)"
-          fi
-          echo
-          echo "===== builtin fetchurl drv: nova vs upstream ====="
-          FU='import <nix/fetchurl.nix> { url = "https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz"; sha256 = "086vqwk2wl8zfs47sq2xpjc9k066ilmb8z6dn0q6ymwjzlm196cd"; name = "hello-2.12.1.tar.gz"; }'
-          echo "--- nova ---"; cabal run -v0 nova-nix -- eval --aterm --expr "$FU" --nix-path nix="$PWD/data/nix" || true
-          echo "--- upstream ---"; cat "$(nix-instantiate -E "$FU" 2>/dev/null)" 2>/dev/null || echo "(upstream eval failed)"
+          test_fu() {
+            local desc="$1" expr="$2"
+            N=$(cabal run -v0 nova-nix -- eval --aterm --expr "$expr" --nix-path nix="$PWD/data/nix" 2>/dev/null | tail -1)
+            U=$(cat "$(nix-instantiate -E "$expr" 2>/dev/null)" 2>/dev/null)
+            if [ "$N" = "$U" ]; then
+              echo "[$desc] IDENTICAL"
+            else
+              echo "[$desc] DIFFER:"; echo "  nova: $N"; echo "  up  : $U"
+            fi
+          }
+          U='url = "https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz";'
+          H='sha256 = "086vqwk2wl8zfs47sq2xpjc9k066ilmb8z6dn0q6ymwjzlm196cd";'
+          test_fu flat        "import <nix/fetchurl.nix> { $U $H name = \"x\"; }"
+          test_fu executable  "import <nix/fetchurl.nix> { $U $H name = \"x\"; executable = true; }"
+          test_fu unpack      "import <nix/fetchurl.nix> { $U $H name = \"x\"; unpack = true; }"
 
       - name: Compare
         run: |
