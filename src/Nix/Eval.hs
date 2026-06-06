@@ -3295,6 +3295,11 @@ builtinDerivationStrict (VAttrs attrs) = do
   let mainOutPath = case outPaths of
         ((_, p) : _) -> p
         [] -> ""
+      -- The default output is the FIRST in @outputs@ (matching C++ Nix, which
+      -- returns @(head outputsList).value@) — not necessarily @out@.
+      mainOutName = case outPaths of
+        ((n, _) : _) -> n
+        [] -> "out"
 
   -- Context for output paths: each output carries SCDrvOutput context
   -- Context for drvPath: carries SCAllOutputs context
@@ -3317,7 +3322,7 @@ builtinDerivationStrict (VAttrs attrs) = do
         Map.fromList $
           [ ("type", evaluated (mkStr "derivation")),
             ("drvPath", evaluated (VStr drvPathText drvPathCtx)),
-            ("outPath", evaluated (VStr mainOutPath (outPathCtx "out"))),
+            ("outPath", evaluated (VStr mainOutPath (outPathCtx mainOutName))),
             ("name", evaluated (mkStr drvName)),
             ("system", evaluated (mkStr system)),
             ("builder", evaluated (mkStr builder)),
