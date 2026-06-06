@@ -65,16 +65,21 @@ jobs:
 
       - name: ATerm diff (debug)
         run: |
-          E='(import <nixpkgs> { system = "x86_64-linux"; config = {}; overlays = []; })'
-          for ATTR in hello stdenv bash; do
-            echo "===== NOVA $ATTR ====="
-            cabal run -v0 nova-nix -- eval --aterm --expr "$E.$ATTR" \
-              --nix-path nixpkgs="$NIXPKGS" --nix-path nix="$PWD/data/nix" || true
-            echo
-            echo "===== UPSTREAM $ATTR ====="
-            cat "$(nix-instantiate -E "$E.$ATTR" -I nixpkgs="$NIXPKGS")" || true
-            echo
-          done
+          echo "===== fetchurl.nix: bundled vs CI Nix corepkgs ====="
+          CINIX=$(nix-instantiate --eval --expr 'builtins.toString <nix/fetchurl.nix>' 2>/dev/null | tr -d '"' || true)
+          echo "bundled: $PWD/data/nix/fetchurl.nix"
+          echo "CI nix : ${CINIX:-<unresolved>}"
+          if [ -f "$CINIX" ]; then
+            echo "--- diff (< bundled | > CI nix) ---"
+            diff "$PWD/data/nix/fetchurl.nix" "$CINIX" && echo "(IDENTICAL)" || echo "(^ DIFFER)"
+          else
+            echo "(CI fetchurl.nix is not a plain file)"
+          fi
+          echo
+          echo "===== builtin fetchurl drv: nova vs upstream ====="
+          FU='import <nix/fetchurl.nix> { url = "https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz"; sha256 = "086vqwk2wl8zfs47sq2xpjc9k066ilmb8z6dn0q6ymwjzlm196cd"; name = "hello-2.12.1.tar.gz"; }'
+          echo "--- nova ---"; cabal run -v0 nova-nix -- eval --aterm --expr "$FU" --nix-path nix="$PWD/data/nix" || true
+          echo "--- upstream ---"; cat "$(nix-instantiate -E "$FU" 2>/dev/null)" 2>/dev/null || echo "(upstream eval failed)"
 
       - name: Compare
         run: |
