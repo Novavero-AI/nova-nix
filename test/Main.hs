@@ -1604,10 +1604,10 @@ testBatchB = do
   putStrLn "eval/builtins-batchB"
   sequence
     [ -- placeholder
-      runTest "placeholder out starts with /nix/store/" $
-        assertRight "placeholder-prefix" (evalNix "builtins.placeholder \"out\"") $ \val ->
+      runTest "placeholder out matches Nix hashPlaceholder" $
+        assertRight "placeholder-out" (evalNix "builtins.placeholder \"out\"") $ \val ->
           case val of
-            VStr p _ -> if "/nix/store/" `T.isPrefixOf` p then Pass else Fail ("bad prefix: " <> p)
+            VStr p _ -> assertEqual "placeholder out" "/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9" p
             _ -> Fail ("expected VStr, got " <> T.pack (show val)),
       runTest "placeholder deterministic" $
         assertRight "placeholder-det" (evalNix "builtins.placeholder \"out\" == builtins.placeholder \"out\"") $ \val ->

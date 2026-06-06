@@ -37,6 +37,7 @@ module Nix.Hash
     -- * Shared hashing utilities
     sha256Hex,
     truncatedBase32,
+    hashPlaceholder,
     byteToHex,
 
     -- * Store path construction (Nix @makeStorePath@ family)
@@ -104,6 +105,13 @@ truncatedBase32 bs =
       allBytes = BA.unpack digest :: [Word8]
       compressed = compressHash 20 allBytes
    in encode (BS.pack compressed)
+
+-- | Nix's output placeholder for @builtins.placeholder@: @\/@ followed by the
+-- full SHA-256 of @"nix-output:" <> name@ in Nix base-32 (no truncation, no
+-- store-dir prefix).  Matches C++ Nix @hashPlaceholder@.
+hashPlaceholder :: Text -> Text
+hashPlaceholder name =
+  "/" <> encode (sha256Digest (encodeUtf8 ("nix-output:" <> name)))
 
 -- | XOR-fold a hash to @targetLen@ bytes, matching C++ Nix @compressHash@.
 -- Each source byte is XOR'd into position @i mod targetLen@.

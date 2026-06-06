@@ -156,7 +156,7 @@ import Nix.Expr.Types
     NixAtom (..),
     UnaryOp (..),
   )
-import Nix.Hash (byteToHex, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex, truncatedBase32)
+import Nix.Hash (byteToHex, hashPlaceholder, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex)
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
@@ -2959,10 +2959,7 @@ builtinToPath other =
 -- ---------------------------------------------------------------------------
 
 builtinPlaceholder :: (MonadEval m) => NixValue -> m NixValue
-builtinPlaceholder (VStr outputName _) =
-  let preimage = "nix-output:" <> outputName
-      hashText = truncatedBase32 (TE.encodeUtf8 preimage)
-   in pure (mkStr (storeDirPrefix <> hashText <> "-" <> outputName))
+builtinPlaceholder (VStr outputName _) = pure (mkStr (hashPlaceholder outputName))
 builtinPlaceholder other =
   throwEvalError ("builtins.placeholder: expected a string, got " <> typeName other)
 
