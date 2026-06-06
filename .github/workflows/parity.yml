@@ -85,15 +85,24 @@ jobs:
             [ "$isroot" = 1 ] && echo "$dp" >> roots.txt
           done < nova.tsv
           sort -u roots.txt
-          echo "===== first root: normalized diff (< nova | > upstream), store hashes masked ====="
-          ROOT=$(sort -u roots.txt | head -1)
-          NAME=$(printf '%s' "$ROOT" | sed -E 's#.*/[a-z0-9]{32}-##; s#\.drv$##')
-          echo "root: $ROOT  (name: $NAME)"
-          NOVA_AT=$(awk -F'\t' -v r="$ROOT" '$1==r{print $2; exit}' nova.tsv)
-          UPDRV=$(jq -r --arg n "$NAME" 'to_entries[]|select(.value.name==$n)|.key' up.json | head -1)
-          UP_AT=$(cat "$UPDRV" 2>/dev/null)
-          norm() { printf '%s' "$1" | sed -E 's#/nix/store/[a-z0-9]{32}-#@#g; s#\),\(#),\n(#g'; }
-          diff <(norm "$NOVA_AT") <(norm "$UP_AT")
+          echo "===== ROOT NAMES ====="
+          sort -u roots.txt | sed -E 's#.*/[a-z0-9]{32}-##; s#\.drv$##'
+          canon() { sed -E 's#/nix/store/[a-z0-9]{32}-#@#g; s#\),\(#),\n(#g'; }
+          n=0
+          for ROOT in $(sort -u roots.txt); do
+            n=$((n+1)); [ "$n" -gt 5 ] && break
+            NAME=$(printf '%s' "$ROOT" | sed -E 's#.*/[a-z0-9]{32}-##; s#\.drv$##')
+            awk -F'\t' -v r="$ROOT" '$1==r{print $2; exit}' nova.tsv | canon > /tmp/nova_root.txt
+            best=""; bestn=999999
+            for up in $(jq -r --arg nm "$NAME" 'to_entries[]|select(.value.name==$nm)|.key' up.json); do
+              canon < "$up" > /tmp/up_cand.txt
+              d=$(diff /tmp/nova_root.txt /tmp/up_cand.txt | grep -cE '^[<>]' || true)
+              [ "$d" -lt "$bestn" ] && { bestn=$d; best="$up"; }
+            done
+            echo "===== root #$n: $NAME  (best upstream match: $bestn canonical diff lines) ====="
+            [ -n "$best" ] && { canon < "$best" > /tmp/up_root.txt; diff /tmp/nova_root.txt /tmp/up_root.txt | head -25; }
+          done
+          echo "closure diff complete"
 
       - name: Compare
         run: |
