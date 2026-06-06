@@ -94,7 +94,7 @@ import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
-import Nix.Eval.StringInterp (coerceToString, formatNixFloat, stripIndentation)
+import Nix.Eval.StringInterp (coerceToString, formatNixFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolText)
 import Nix.Eval.Types
   ( AttrSet (..),
@@ -382,32 +382,35 @@ evalBcStr env bcIdx0 = do
   let count = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
       dataOff = unsafePerformIO (cbcArg1 bcIdx0)
   chunks <- evalBcStringParts env count dataOff
-  let (texts, ctxs) = unzip chunks
-  pure (VStr (T.concat texts) (mconcat ctxs))
+  pure (VStr (T.concat [t | (_, t, _) <- chunks]) (mconcat [c | (_, _, c) <- chunks]))
 
--- | Evaluate an indented string literal from bytecode data buffer.
+-- | Evaluate an indented string literal from bytecode data buffer.  The common
+-- indentation is stripped from the LITERAL chunks before concatenation, so an
+-- interpolated multi-line value cannot drag the computed indent down — matching
+-- C++ Nix.
 evalBcIndStr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcIndStr env bcIdx0 = do
   let count = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
       dataOff = unsafePerformIO (cbcArg1 bcIdx0)
   chunks <- evalBcStringParts env count dataOff
-  let (texts, ctxs) = unzip chunks
-      raw = T.concat texts
-  pure (VStr (stripIndentation raw) (mconcat ctxs))
+  let (text, ctx) = stripIndentedChunks chunks
+  pure (VStr text ctx)
 
--- | Evaluate string parts from the bytecode data buffer.
--- Each part is two words: (tag, value).
--- tag=0 -> StrLit (value = symbol), tag=1 -> StrInterp (value = bc_idx).
-evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [(Text, StringContext)]
+-- | Evaluate string parts from the bytecode data buffer.  Each part is two
+-- words: (tag, value).  tag=0 -> literal (value = symbol), tag=1 ->
+-- interpolation (value = bc_idx).  The 'Bool' marks literal (@True@) vs
+-- interpolated (@False@) so indented strings strip only the literals.
+evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [(Bool, Text, StringContext)]
 evalBcStringParts _ 0 _ = pure []
 evalBcStringParts env n off = do
   let tag = unsafePerformIO (cbcData off)
       val = unsafePerformIO (cbcData (off + 1))
   chunk <- case tag of
-    0 -> pure (symbolText (Symbol val), emptyContext)
+    0 -> pure (True, symbolText (Symbol val), emptyContext)
     _ -> do
       v <- evalBytecode env val
-      coerceToString force applyValue v
+      (txt, ctx) <- coerceToString force applyValue v
+      pure (False, txt, ctx)
   rest <- evalBcStringParts env (n - 1) (off + 2)
   pure (chunk : rest)
 

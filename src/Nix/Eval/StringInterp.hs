@@ -7,12 +7,14 @@
 module Nix.Eval.StringInterp
   ( evalStringParts,
     evalIndStringParts,
+    stripIndentedChunks,
     coerceToString,
     formatNixFloat,
     stripIndentation,
   )
 where
 
+import Data.List (foldl')
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.Context (concatStrings)
@@ -38,36 +40,51 @@ evalStringParts evalFn forceFn applyFn env parts = do
 
 -- | Evaluate the parts of an indented string (double single-quoted).
 --
--- The common indentation is stripped from the LITERAL parts BEFORE
--- interpolation, matching C++ Nix.  Interpolations contribute content but not
--- whitespace, so a @${...}@ whose value starts at column 0 does not drag the
--- common indent to 0.  The single leading newline is dropped; the trailing
--- newline is kept.
+-- The common indentation is stripped from the LITERAL parts, computed BEFORE
+-- interpolation, matching C++ Nix.  Interpolated values are opaque content, so
+-- a @${...}@ whose value starts (or wraps onto a line) at column 0 does not
+-- drag the common indent to 0.  The single leading newline is dropped; the
+-- trailing newline is kept.
 evalIndStringParts :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> [StringPart] -> m (Text, StringContext)
-evalIndStringParts evalFn forceFn applyFn env parts =
-  evalStringParts evalFn forceFn applyFn env (stripPartsIndentation parts)
+evalIndStringParts evalFn forceFn applyFn env parts = do
+  chunks <- mapM (evalOnePartTagged evalFn forceFn applyFn env) parts
+  pure (stripIndentedChunks chunks)
 
--- | Strip the common indentation from an indented string's literal parts
--- (see 'evalIndStringParts'), then drop the single leading newline.
-stripPartsIndentation :: [StringPart] -> [StringPart]
-stripPartsIndentation parts =
-  dropLeadingNewlinePart (stripPartsBy (minPartsIndent parts) parts)
+-- | Evaluate one indented-string part, tagging it literal (@True@) or
+-- interpolated (@False@) so 'stripIndentedChunks' strips only the literals.
+evalOnePartTagged :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> StringPart -> m (Bool, Text, StringContext)
+evalOnePartTagged _ _ _ _ (StrLit t) = pure (True, t, emptyContext)
+evalOnePartTagged evalFn forceFn applyFn env (StrInterp expr) = do
+  val <- evalFn env expr
+  (txt, ctx) <- coerceToString forceFn applyFn val
+  pure (False, txt, ctx)
 
--- | Common indentation across the LITERAL parts of an indented string.  An
--- interpolation at line start fixes that line's indent at the preceding literal
--- whitespace and counts as content; whitespace-only lines do not contribute.
-minPartsIndent :: [StringPart] -> Int
-minPartsIndent = result . go True 0 Nothing
+-- | Strip the common indentation from already-evaluated indented-string chunks.
+-- Each chunk is @(isLiteral, text, context)@.  Indentation is computed and
+-- stripped from the LITERAL chunks only — interpolated chunks are opaque content
+-- — the single leading newline is dropped, and the trailing newline is kept.
+-- This matches C++ Nix, which strips at the string-part level (so a multi-line
+-- interpolated value cannot drag the common indent down).
+stripIndentedChunks :: [(Bool, Text, StringContext)] -> (Text, StringContext)
+stripIndentedChunks chunks =
+  let stripped = dropLeadingNL (chunksStrip (chunksMinIndent chunks) chunks)
+   in (T.concat (map snd stripped), mconcat [c | (_, _, c) <- chunks])
+  where
+    dropLeadingNL ((True, t) : rest) =
+      (True, case T.uncons t of { Just ('\n', r) -> r; _ -> t }) : rest
+    dropLeadingNL other = other
+
+-- | Common indentation across the LITERAL chunks.  An interpolation at line
+-- start fixes that line's indent at the preceding literal whitespace and counts
+-- as content; whitespace-only lines do not contribute.
+chunksMinIndent :: [(Bool, Text, StringContext)] -> Int
+chunksMinIndent = result . foldl' stepChunk (True, 0, Nothing)
   where
     result (_, _, Nothing) = 0
     result (_, _, Just m) = m
-    go atStart cur mi [] = (atStart, cur, mi)
-    go atStart cur mi (StrInterp _ : rest)
-      | atStart = go False cur (bump mi cur) rest
-      | otherwise = go False cur mi rest
-    go atStart cur mi (StrLit t : rest) =
-      let (atStart', cur', mi') = T.foldl' stepChar (atStart, cur, mi) t
-       in go atStart' cur' mi' rest
+    stepChunk (atStart, cur, mi) (isLit, t, _)
+      | not isLit = if atStart then (False, cur, bump mi cur) else (False, cur, mi)
+      | otherwise = T.foldl' stepChar (atStart, cur, mi) t
     stepChar (atStart, cur, mi) c
       | atStart && (c == ' ' || c == '\t') = (True, cur + 1, mi)
       | atStart && c == '\n' = (True, 0, mi)
@@ -77,16 +94,16 @@ minPartsIndent = result . go True 0 Nothing
     bump Nothing x = Just x
     bump (Just m) x = Just (min m x)
 
--- | Strip @n@ columns of leading indentation from each line in the literal
--- parts; interpolations are left untouched and reset the line position.
-stripPartsBy :: Int -> [StringPart] -> [StringPart]
-stripPartsBy n = goP True 0
+-- | Strip @n@ columns of leading indentation from each line of the literal
+-- chunks; interpolated chunks are emitted verbatim and reset the line position.
+chunksStrip :: Int -> [(Bool, Text, StringContext)] -> [(Bool, Text)]
+chunksStrip n = go True 0
   where
-    goP _ _ [] = []
-    goP _ _ (StrInterp e : rest) = StrInterp e : goP False 0 rest
-    goP atStart dropped (StrLit t : rest) =
+    go _ _ [] = []
+    go _ _ ((False, t, _) : rest) = (False, t) : go False 0 rest
+    go atStart dropped ((True, t, _) : rest) =
       let (acc, atStart', dropped') = T.foldl' stepC ([], atStart, dropped) t
-       in StrLit (T.pack (reverse acc)) : goP atStart' dropped' rest
+       in (True, T.pack (reverse acc)) : go atStart' dropped' rest
     stepC (acc, atStart, dropped) c
       | atStart && (c == ' ' || c == '\t') =
           if dropped < n then (acc, True, dropped + 1) else (c : acc, True, dropped + 1)
@@ -94,14 +111,6 @@ stripPartsBy n = goP True 0
       | atStart = (c : acc, False, dropped)
       | c == '\n' = ('\n' : acc, True, 0)
       | otherwise = (c : acc, False, dropped)
-
--- | Drop a single leading newline from the first literal part.
-dropLeadingNewlinePart :: [StringPart] -> [StringPart]
-dropLeadingNewlinePart (StrLit t : rest) =
-  case T.uncons t of
-    Just ('\n', r) -> StrLit r : rest
-    _ -> StrLit t : rest
-dropLeadingNewlinePart ps = ps
 
 -- | Evaluate a single string part, returning its text and context.
 evalOnePart :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> StringPart -> m (Text, StringContext)
