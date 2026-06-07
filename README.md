@@ -19,10 +19,10 @@ nova-nix evaluates real nixpkgs. `import <nixpkgs> {}` resolves the top-level pa
 ```console
 $ NIX_PATH=nixpkgs=/path/to/nixpkgs \
     nova-nix eval --expr '(import <nixpkgs> { system = "x86_64-linux"; }).hello.drvPath'
-"/nix/store/azg0gjls29w3sii2kjp4c1v85ka5alnp-hello-2.12.1.drv"
+"/nix/store/gciipqhqkdlqqn803zd4a389v86ran45-hello-2.12.1.drv"
 ```
 
-It targets the Nix 2.24 language. Evaluation is the milestone reached so far; confirming derivation-hash parity with upstream Nix, and *building* on Windows, are the work ahead.
+That `drvPath`, and the 253-derivation closure behind it, byte-matches upstream `nix-instantiate` — verified in CI on the same nixpkgs tree. It targets the Nix 2.24 language. Evaluation and derivation-hash parity are done; *building* on Windows is the work ahead.
 
 ## Quickstart
 
@@ -69,12 +69,12 @@ Two decisions shape the rest. **Haskell owns evaluation, C owns data layout** �
 
 ## Roadmap
 
-**Done** — parser, lazy bytecode evaluator, the Nix `builtins` set, the C99 data layer, content-addressed store, derivation builder, binary-cache substituter, and `import <nixpkgs> {}` evaluation through to `hello.drvPath`.
+**Done** — parser, lazy bytecode evaluator, the Nix `builtins` set, the C99 data layer, content-addressed store, derivation builder, binary-cache substituter, `import <nixpkgs> {}` evaluation, and derivation-hash parity with upstream Nix (`hello`'s 253-derivation closure byte-matches `nix-instantiate`).
 
 **Next**
 
-- Derivation-hash parity — confirm computed `drvPath`/`outPath` byte-match upstream Nix across nixpkgs.
 - Windows stdenv — MinGW GCC + MSYS2 coreutils bootstrap for native builds.
+- Parity across more of nixpkgs — extend the byte-match check beyond `hello`'s closure.
 - Substituter — XZ decompression and real NAR hashing (currently uncompressed-only, with a placeholder hash).
 
 ## Library usage

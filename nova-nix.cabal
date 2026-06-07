@@ -7,9 +7,9 @@ description:
   natively on Windows, macOS, and Linux — no WSL or Cygwin.  A
   Haskell evaluator handles parsing and lazy evaluation, backed by a C99
   data layer that keeps evaluation data off the GHC heap.  It evaluates
-  Nix expressions (including real nixpkgs @lib@), computes derivations and
-  content-addressed store paths, and includes a derivation builder and
-  binary-cache substituter.
+  real Nix expressions (including nixpkgs), computes derivations and
+  content-addressed store paths that byte-match upstream Nix, and includes
+  a derivation builder and binary-cache substituter.
 
   Built on @nova-cache@ for NAR serialization, narinfo handling, and
   Ed25519-signed binary substitution.

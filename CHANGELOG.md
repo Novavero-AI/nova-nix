@@ -4,14 +4,13 @@
 
 ### Milestone: Derivation-Hash Parity with Upstream Nix
 
-`(import <nixpkgs> {}).hello.drvPath`, and every one of the 253 derivations in its closure, now hash byte-for-byte identically to `nix-instantiate` — verified in CI against a pinned nixpkgs evaluated on the same tree by both implementations. A new `eval --aterm` mode dumps a derivation's ATerm for diffing against `nix derivation show`.
+`(import <nixpkgs> {}).hello.drvPath`, and all 253 derivations in its closure, now hash byte-for-byte identically to `nix-instantiate`, verified in CI on the same nixpkgs tree. A new `eval --aterm` mode dumps a derivation's ATerm for diffing against `nix derivation show`.
 
 - **Fix: indented-string indentation is stripped per literal string-part, before interpolation** — the common indentation was removed from the fully-interpolated string, so a multi-line interpolated value (e.g. `${commonPreHook}` in the stdenv `preHook`) could lower the computed minimum indent to zero and leave the literal lines indented. Indentation is now computed from the literal parts only — interpolated values are opaque content — matching C++ Nix.
 - **Fix: path literals interpolated into strings are copied to the store** — `"${./foo}"` left the raw source path in the result; it now copies the file to the store and yields its store path, with the path added to the string context so it lands in the derivation's `inputSrcs`. `builtins.toString` still does not copy, per Nix semantics.
 - **Fix: `builtins.placeholder`** — now returns `/` followed by the full SHA-256 of `nix-output:<name>` in Nix base-32, matching Nix's `hashPlaceholder`. It previously truncated the hash and wrapped it as a `/nix/store` path, so any derivation using `${placeholder "out"}` (e.g. perl's `configureFlags`) diverged.
 - **Fix: a derivation's default output is its first declared output** — a bare reference to a multi-output derivation now resolves to `outputs[0]` (both name and path), not a hardcoded `out`. This affected packages whose first output is not `out`, such as `xz` (first output `bin`).
 - **Fix: `builtins.attrNames` is sorted lexicographically** — names were returned in interned-symbol order rather than sorted by key, and inconsistently with `builtins.attrValues`. Surfaced in `fetchurl`'s `impureEnvVars` (the generated `NIX_MIRRORS_*` list).
-- 593 tests, `-Werror` clean, ormolu clean, hlint clean
 
 ## 0.2.0.0 — 2026-06-05
 
@@ -20,7 +19,6 @@
 - **`import <nixpkgs> {}` now evaluates to WHNF** — the top-level package set resolves and enumerates ~23,000 attributes, and a package evaluates through the full stdenv bootstrap down to a derivation: `(import <nixpkgs> {}).hello.drvPath` yields a `/nix/store/…-hello-2.12.1.drv` path. (Derivation-hash parity with upstream Nix and on-Windows building are the next fronts — this milestone is evaluation, not yet building.)
 - **Fix: `inherit <name>;` de Bruijn level in positional let/rec blocks** — `inherit x;` (without `from`) in a positional `let`/`rec` block desugars to `x = x;` with the right-hand side resolved against the *outer* scope, so it refers to the enclosing `x` rather than the binding being defined. But the desugared thunk is evaluated at runtime in the *inner* (let/rec) env, which adds one parent-chain level the outer resolution did not count — so every resolved level was short by one. This produced `nn_env_lookup_resolved: idx out of bounds` whenever an outer *lexical* variable was inherited inside a positional block — first triggered by perl's `inherit version;` (argument-set slot 7) nested in a 4-binding `let`. Fixed by shifting the desugared `inherit` RHS up one de Bruijn level in `Nix.Expr.Resolve`. (`inherit (from) …` was already correct: its RHS resolves against the inner scope.)
 - **Fix: Hackage build — ship C headers in the sdist** — the `cbits/*.h` headers are `#include`d by the C sources (via `include-dirs: cbits`) but were never listed in the cabal file, so `cabal sdist` omitted them and the Hackage build failed with `nn_*.h: No such file or directory`. Added `extra-source-files: cbits/*.h`. A regression introduced in 0.1.9.0 (the first release to ship the C data layer); CI never caught it because CI builds the working tree, not the sdist. Verified by building from a freshly-extracted sdist tarball in isolation.
-- 593 tests, `-Werror` clean, ormolu clean, hlint clean
 
 ## 0.1.9.0 — 2026-06-05
 
@@ -36,7 +34,6 @@
 - **Dead code removal** — Removed unused `cattrsetIntersect` Haskell wrapper, `nn_attrset_intersect`, and `nn_attrset_values_ptr` C functions.
 - **New: `nn_assert.h`** — Debug-mode bounds checking macro. Compiles to nothing under `NDEBUG`.
 - **Performance** — Stress test: 6.25 MB max residency, 56.3% GC productivity (down from 69.7 MB / 1.6% pre-C-data-layer).
-- 109 builtins, 593 tests, `-Werror` clean, ormolu clean, hlint clean
 
 ## 0.1.8.0 — 2026-03-08
 
@@ -46,7 +43,6 @@
 - **File outputs supported** — `$out` can now be a regular file, not just a directory. `registerSingleOutput`, `addToStore`, `scanReferences`, and `pathExists` all use `doesPathExist` instead of `doesDirectoryExist`. `moveOutput` (renamed from `moveDirectory`) handles both files and directories in cross-device fallback. `collectRegularFiles` accepts file paths directly for reference scanning.
 - **Fix #2: Windows store paths use native separators** — CLI now uses `platformStoreDir` (`C:\nix\store` on Windows, `/nix/store` on Unix) for filesystem operations and display. Evaluator internals keep canonical `/nix/store` for ATerm hash compatibility.
 - **Fix: `crypton < 1.1` in .cabal file** — Previous `crypton` pin was only in `cabal.project` (which Hackage ignores). Moved to `.cabal` so the Hackage solver respects it. `crypton >= 1.1` switched from `memory` to `ram` for `ByteArrayAccess`, breaking `http-client-tls`.
-- 108 builtins, 526 tests, -Werror clean, ormolu clean, hlint clean
 
 ## 0.1.7.1 — 2026-03-07
 
@@ -64,7 +60,6 @@
 - **Fix: UTF-16 auto-detection** — New `readFileAutoEncoding` detects UTF-16 LE/BE and UTF-8 BOM at the byte level before decoding. PowerShell's `>` operator writes UTF-16 LE by default — a Windows-first Nix implementation must handle this at the input boundary. Wired into all 5 file-read sites (Parser, Eval/IO, Main).
 - **nova-cache `>= 0.3.0`** — Bumped lower bound to track nova-cache 0.3.x series.
 - **`crypton < 1.1` pin** — `http-client-tls` still uses `memory`'s `ByteArrayAccess`; `crypton >= 1.1` switched to `ram`, causing instance mismatches. Pinned in `cabal.project` until `http-client-tls` migrates.
-- 108 builtins, 524 tests, -Werror clean, ormolu clean, hlint clean
 
 ## 0.1.6.0 — 2026-02-26
 
@@ -76,7 +71,6 @@
 - **Inherit desugaring** — `inherit x;` is desugared to `x = x;` in the resolution pass so inherited lambda formals resolve to `EResolvedVar` (lambda slots have no names at runtime).
 - **Heap savings** — Eliminates 29.9M Map.Bin nodes (1.37 GB) from lambda formals. Replaced by SmallArray (one heap object per env, O(1) index) + scope chain parent pointers.
 - `primitive` dependency added for `Data.Primitive.SmallArray`
-- 108 builtins, 511 tests, -Werror clean, ormolu clean, hlint clean
 
 ## 0.1.5.0 — 2026-02-26
 
@@ -90,7 +84,6 @@
 - **`fetchTarball` fix** — downloads and extracts via curl|tar pipeline (was returning raw .tar.gz)
 - **`MonadEval`** — added `traceMessage`, `copyPathToStore` methods
 - CI: switched to `haskell-actions/run-ormolu@v16` (matching all Novavero repos)
-- 108 builtins, 511 tests, -Werror clean, ormolu clean, hlint clean
 
 ## 0.1.4.0 — 2026-02-26
 
