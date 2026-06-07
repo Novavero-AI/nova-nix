@@ -54,6 +54,7 @@ import qualified Data.ByteString as BS
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Text.Encoding.Error (lenientDecode)
 import Nix.Expr.ClosureTrim (trimClosures)
 import Nix.Expr.Resolve (resolveVars)
 import Nix.Expr.Types (Expr)
@@ -110,15 +111,15 @@ decodeAutoEncoding bytes
   | BS.length bytes >= 2,
     BS.index bytes 0 == 0xFF,
     BS.index bytes 1 == 0xFE =
-      TE.decodeUtf16LE (BS.drop 2 bytes)
+      TE.decodeUtf16LEWith lenientDecode (BS.drop 2 bytes)
   | BS.length bytes >= 2,
     BS.index bytes 0 == 0xFE,
     BS.index bytes 1 == 0xFF =
-      TE.decodeUtf16BE (BS.drop 2 bytes)
+      TE.decodeUtf16BEWith lenientDecode (BS.drop 2 bytes)
   | BS.length bytes >= 3,
     BS.index bytes 0 == 0xEF,
     BS.index bytes 1 == 0xBB,
     BS.index bytes 2 == 0xBF =
-      TE.decodeUtf8 (BS.drop 3 bytes)
+      TE.decodeUtf8With lenientDecode (BS.drop 3 bytes)
   | otherwise =
-      TE.decodeUtf8 bytes
+      TE.decodeUtf8With lenientDecode bytes

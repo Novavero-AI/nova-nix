@@ -224,16 +224,12 @@ lexNormalMode st acc = case T.uncons (lsInput st) of
     '>' -> emit1 st TokGt acc
     '/' | Just '/' <- safeHead rest -> emit2 st TokUpdate acc
     '/'
-      -- After an expression token, / is always division
-      | prevCanEndExpr -> emit1 st TokSlash acc
-      -- Not after expression: / followed by path char starts an absolute path
-      | Just c2 <- safeHead rest, isPathChar c2 -> lexPath st acc
-      -- Otherwise, division
+      -- A '/' that begins a path segment (slash followed by a path char)
+      -- starts a path: /abs/path.  A bare '/' (followed by whitespace) is the
+      -- division operator: a / b.  Relative paths like a/b are caught by the
+      -- path guard further down, before the identifier/number cases.
+      | looksLikePath (lsInput st) -> lexPath st acc
       | otherwise -> emit1 st TokSlash acc
-      where
-        prevCanEndExpr = case acc of
-          (Located _ _ tok : _) -> canFollowWithDivision tok
-          [] -> False
     '$'
       | Just '{' <- safeHead rest ->
           -- Increment brace depth so the closing } is TokRBrace, not
@@ -246,6 +242,9 @@ lexNormalMode st acc = case T.uncons (lsInput st) of
     '~'
       | Just '/' <- safeHead rest ->
           lexPath st acc
+    -- A path-char run that contains a '/' segment is a path, not an
+    -- identifier or number: a/b and 6/2 lex as paths, matching Nix.
+    _ | looksLikePath (lsInput st) -> lexPath st acc
     _ | isDigit c -> lexNumber st acc
     _ | isIdentStart c -> lexIdentOrKeyword st acc
     _ ->
@@ -622,30 +621,23 @@ isIdentChar c = isAlphaNum c || c == '_' || c == '\'' || c == '-'
 isPathChar :: Char -> Bool
 isPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
 
+-- | Does the maximal path-char run at the start of the input contain a
+-- @/@-segment (a slash followed by a non-slash path char)?  If so it lexes
+-- as a path rather than an identifier, number, or division operator —
+-- matching Nix, where @a/b@ and @/abs/path@ are paths, @a / b@ (slash
+-- surrounded by whitespace) is division, and @a // b@ is the update operator.
+looksLikePath :: Text -> Bool
+looksLikePath input =
+  case T.break (== '/') (T.takeWhile isPathChar input) of
+    (_, slashAndRest) -> case T.uncons (T.drop 1 slashAndRest) of
+      Just (afterSlash, _) -> isPathChar afterSlash && afterSlash /= '/'
+      Nothing -> False
+
 isSearchPathChar :: Char -> Bool
 isSearchPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
 
 isUriChar :: Char -> Bool
 isUriChar c = isAlphaNum c || c `elem` ("%/?:@&=+$,#._~!-" :: [Char])
-
--- | Whether a token can be the last token of an expression.
--- Used to decide if @/@ is division or the start of an absolute path.
--- Real Nix uses the same context-dependent rule in its lexer.
-canFollowWithDivision :: Token -> Bool
-canFollowWithDivision (TokIdent _) = True
-canFollowWithDivision (TokInt _) = True
-canFollowWithDivision (TokFloat _) = True
-canFollowWithDivision (TokPath _) = True
-canFollowWithDivision TokRParen = True
-canFollowWithDivision TokRBracket = True
-canFollowWithDivision TokRBrace = True
-canFollowWithDivision TokInterpClose = True
-canFollowWithDivision TokStringClose = True
-canFollowWithDivision TokIndStringClose = True
-canFollowWithDivision TokTrue = True
-canFollowWithDivision TokFalse = True
-canFollowWithDivision TokNull = True
-canFollowWithDivision _ = False
 
 -- ---------------------------------------------------------------------------
 -- Emit helpers
