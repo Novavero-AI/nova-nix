@@ -331,11 +331,22 @@ evalAddWithCoercion left right = case (left, right) of
   -- String-like: direct concat when both are string/path
   (VStr {}, VStr {}) -> evalBinary force OpAdd left right
   (VStr {}, VPath _) -> evalBinary force OpAdd left right
-  -- Otherwise: coerce both to strings via concatStrings (matching C++ Nix)
+  -- Otherwise: string concatenation with STRICT coercion (Nix coerceMore=false)
+  -- — only strings and sets with __toString/outPath coerce; numbers, bools,
+  -- null, lists, and functions are type errors, matching C++ Nix's `+`.
   _ -> do
-    (leftStr, leftCtx) <- coerceToString force applyValue left
-    (rightStr, rightCtx) <- coerceToString force applyValue right
+    (leftStr, leftCtx) <- coerceAddOperand left
+    (rightStr, rightCtx) <- coerceAddOperand right
     pure (VStr (leftStr <> rightStr) (leftCtx <> rightCtx))
+
+-- | Strict string coercion for the @+@ operator (Nix @coerceMore = false@):
+-- strings, and sets with @__toString@/@outPath@, coerce; numbers, booleans,
+-- null, lists, and functions are type errors.
+coerceAddOperand :: (MonadEval m) => NixValue -> m (Text, StringContext)
+coerceAddOperand v@(VStr {}) = coerceToString force applyValue v
+coerceAddOperand v@(VAttrs {}) = coerceToString force applyValue v
+coerceAddOperand v =
+  throwEvalError ("cannot coerce " <> typeName v <> " to a string with the + operator")
 
 -- | Bytecode short-circuit &&
 evalShortCircuitAnd :: (MonadEval m) => Env -> Word32 -> Word32 -> m NixValue
@@ -2124,7 +2135,7 @@ builtinConcatLists other =
   throwEvalError ("builtins.concatLists: expected a list, got " <> typeName other)
 
 builtinLessThan :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinLessThan a b = VBool <$> nixCompare a b
+builtinLessThan a b = VBool <$> nixCompare force a b
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — arithmetic + bitwise
@@ -2171,12 +2182,12 @@ builtinMod l r = throwEvalError ("builtins.mod: expected two integers, got " <> 
 
 builtinMin :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMin a b = do
-  aIsLess <- nixCompare a b
+  aIsLess <- nixCompare force a b
   pure (if aIsLess then a else b)
 
 builtinMax :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMax a b = do
-  aIsLess <- nixCompare a b
+  aIsLess <- nixCompare force a b
   pure (if aIsLess then b else a)
 
 builtinBitAnd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -2480,8 +2491,17 @@ ordToNix GT = 1
 
 compareVersionParts :: [Text] -> [Text] -> Int64
 compareVersionParts [] [] = 0
-compareVersionParts [] (_ : _) = -1
-compareVersionParts (_ : _) [] = 1
+-- When one version runs out, Nix pads the shorter side with an empty
+-- component and keeps comparing — so "1.0" > "1.0pre" (empty sorts AFTER
+-- "pre"), not "<" as a naive length comparison would give.
+compareVersionParts [] (b : bs) =
+  case compareComponent "" b of
+    EQ -> compareVersionParts [] bs
+    cmp -> ordToNix cmp
+compareVersionParts (a : as) [] =
+  case compareComponent a "" of
+    EQ -> compareVersionParts as []
+    cmp -> ordToNix cmp
 compareVersionParts (a : as) (b : bs) =
   case compareComponent a b of
     EQ -> compareVersionParts as bs

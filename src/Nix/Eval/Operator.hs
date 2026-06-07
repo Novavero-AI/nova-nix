@@ -45,14 +45,14 @@ evalBinary forceFn op left right = case op of
   OpDiv -> evalDiv left right
   OpEq -> VBool <$> nixEqual forceFn left right
   OpNeq -> VBool . not <$> nixEqual forceFn left right
-  OpLt -> VBool <$> nixCompare left right
+  OpLt -> VBool <$> nixCompare forceFn left right
   OpLte -> do
-    lt <- nixCompare left right
+    lt <- nixCompare forceFn left right
     eq <- nixEqual forceFn left right
     pure (VBool (lt || eq))
-  OpGt -> VBool <$> nixCompare right left
+  OpGt -> VBool <$> nixCompare forceFn right left
   OpGte -> do
-    gt <- nixCompare right left
+    gt <- nixCompare forceFn right left
     eq <- nixEqual forceFn left right
     pure (VBool (gt || eq))
   OpConcat -> evalConcat left right
@@ -140,20 +140,44 @@ evalDiv left right = case (left, right) of
 -- ---------------------------------------------------------------------------
 
 -- | Ordering comparison for < (reused for >, <=, >= via argument swap).
-nixCompare :: (MonadEval m) => NixValue -> NixValue -> m Bool
-nixCompare (VInt a) (VInt b) = pure (a < b)
-nixCompare (VInt a) (VFloat b) = pure (fromIntegral a < b)
-nixCompare (VFloat a) (VInt b) = pure (a < fromIntegral b)
-nixCompare (VFloat a) (VFloat b) = pure (a < b)
+nixCompare :: (MonadEval m) => Force m -> NixValue -> NixValue -> m Bool
+nixCompare _ (VInt a) (VInt b) = pure (a < b)
+nixCompare _ (VInt a) (VFloat b) = pure (fromIntegral a < b)
+nixCompare _ (VFloat a) (VInt b) = pure (a < fromIntegral b)
+nixCompare _ (VFloat a) (VFloat b) = pure (a < b)
 -- String comparison ignores context (matching real Nix).
-nixCompare (VStr a _) (VStr b _) = pure (a < b)
-nixCompare left right =
+nixCompare _ (VStr a _) (VStr b _) = pure (a < b)
+-- Paths compare as their string representation (Nix semantics).
+nixCompare _ (VPath a) (VPath b) = pure (a < b)
+-- Lists compare lexicographically, element by element (Nix semantics).
+nixCompare forceFn (VList clA) (VList clB) =
+  listCompare forceFn (map Thunk (clistThunks clA)) (map Thunk (clistThunks clB))
+nixCompare _ left right =
   throwEvalError
     ( "cannot compare "
         <> typeName left
         <> " and "
         <> typeName right
     )
+
+-- | Lexicographic comparison of two thunk lists for the @<@ operator: the
+-- first differing element decides; a proper prefix is less than the longer
+-- list.  Mirrors 'listEqual'.
+listCompare :: (MonadEval m) => Force m -> [Thunk] -> [Thunk] -> m Bool
+listCompare _ [] [] = pure False
+listCompare _ [] (_ : _) = pure True
+listCompare _ (_ : _) [] = pure False
+listCompare forceFn (a : as) (b : bs)
+  | thunkSameRef a b = listCompare forceFn as bs
+  | otherwise = do
+      va <- forceFn a
+      vb <- forceFn b
+      ltAB <- nixCompare forceFn va vb
+      if ltAB
+        then pure True
+        else do
+          ltBA <- nixCompare forceFn vb va
+          if ltBA then pure False else listCompare forceFn as bs
 
 -- | Deep structural equality.  Forces thunks inside lists and
 -- attribute sets as needed.
