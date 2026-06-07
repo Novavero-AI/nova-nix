@@ -12,8 +12,23 @@ name: Parity
 
 on:
   workflow_dispatch:
-  # Promote to `push: { branches: [main] }` once green to make it a
-  # permanent regression guard.
+  # Regression guard: run on main pushes and PRs, but only when code that can
+  # affect the computed drvPath changes — doc-only changes skip it.
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "cbits/**"
+      - "data/**"
+      - "nova-nix.cabal"
+      - ".github/workflows/parity.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "cbits/**"
+      - "data/**"
+      - "nova-nix.cabal"
 
 jobs:
   parity:

@@ -16,3 +16,4 @@ result
 *.pdf
 profiling/results/
 CLAUDE.md
+.claude/
