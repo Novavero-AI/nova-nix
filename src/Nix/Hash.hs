@@ -27,7 +27,8 @@
 --
 -- nova-cache already handles output hashes and file hashes.  This module
 -- adds input hash (derivation hash) computation for the evaluator, plus
--- shared hashing utilities used by the evaluator and IO layer.
+-- the @makeStorePath@ family that constructs content-addressed store paths
+-- exactly as C++ Nix does.
 module Nix.Hash
   ( -- * Derivation hashing
     DrvHash (..),
@@ -36,7 +37,17 @@ module Nix.Hash
     -- * Shared hashing utilities
     sha256Hex,
     truncatedBase32,
+    hashPlaceholder,
     byteToHex,
+
+    -- * Store path construction (Nix @makeStorePath@ family)
+    makeStorePath,
+    makeTextPath,
+    makeFixedOutputPath,
+    makeOutputPath,
+    compressHash,
+    sha256Digest,
+    bytesToHexText,
 
     -- * Re-exports from nova-cache
     hashBytes,
@@ -50,10 +61,12 @@ import Data.Bits (xor)
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import Data.List (foldl')
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word8)
+import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, storePathToText)
 import NovaCache.Base32 (encode)
 import NovaCache.Hash (formatNixHash, hashBytes, parseNixHash)
 
@@ -93,6 +106,13 @@ truncatedBase32 bs =
       compressed = compressHash 20 allBytes
    in encode (BS.pack compressed)
 
+-- | Nix's output placeholder for @builtins.placeholder@: @\/@ followed by the
+-- full SHA-256 of @"nix-output:" <> name@ in Nix base-32 (no truncation, no
+-- store-dir prefix).  Matches C++ Nix @hashPlaceholder@.
+hashPlaceholder :: Text -> Text
+hashPlaceholder name =
+  "/" <> encode (sha256Digest (encodeUtf8 ("nix-output:" <> name)))
+
 -- | XOR-fold a hash to @targetLen@ bytes, matching C++ Nix @compressHash@.
 -- Each source byte is XOR'd into position @i mod targetLen@.
 compressHash :: Int -> [Word8] -> [Word8]
@@ -111,3 +131,86 @@ byteToHex w =
         | n < 10 = toEnum (fromEnum '0' + n)
         | otherwise = toEnum (fromEnum 'a' + n - 10)
    in [hexDigit hi, hexDigit lo]
+
+-- ---------------------------------------------------------------------------
+-- Store path construction — the Nix @makeStorePath@ family
+--
+-- These mirror C++ Nix exactly so nova-nix's computed store paths byte-match
+-- @nix-instantiate@.  All hashing is done against the canonical @\/nix\/store@
+-- directory ('defaultStoreDir') so paths are host-independent: the same
+-- derivation hashes identically on Windows, Linux, and macOS.
+-- ---------------------------------------------------------------------------
+
+-- | Length in bytes a store-path hash is compressed to (160 bits → 32 base-32
+-- characters).
+storePathHashBytes :: Int
+storePathHashBytes = 20
+
+-- | Raw 32-byte SHA-256 digest of a ByteString (not hex-encoded).
+sha256Digest :: BS.ByteString -> BS.ByteString
+sha256Digest bs = BA.convert (CH.hash bs :: CH.Digest CH.SHA256)
+
+-- | Lowercase base-16 of raw bytes (two hex characters per byte).
+bytesToHexText :: BS.ByteString -> Text
+bytesToHexText = T.pack . concatMap byteToHex . BS.unpack
+
+-- | The core store-path construction primitive.  Given a @type@ string, the
+-- inner content digest (raw SHA-256 bytes), and a name, produce the store
+-- path.  Mirrors C++ Nix @makeStorePath@:
+--
+-- @
+-- s = type ":sha256:" hex(innerDigest) ":" storeDir ":" name
+-- hash = compressHash(sha256(s), 20)
+-- path = storeDir "/" base32(hash) "-" name
+-- @
+--
+-- The @type@ string varies by caller: @\"text\"@ (+ references) for @.drv@
+-- and @toFile@ paths, @\"output:<id>\"@ for derivation outputs, @\"source\"@
+-- for recursive fixed-output paths.
+makeStorePath :: StoreDir -> Text -> BS.ByteString -> Text -> StorePath
+makeStorePath (StoreDir dir) typ innerDigest name =
+  let preimage =
+        typ
+          <> ":sha256:"
+          <> bytesToHexText innerDigest
+          <> ":"
+          <> T.pack dir
+          <> ":"
+          <> name
+      compressed = compressHash storePathHashBytes (BS.unpack (sha256Digest (encodeUtf8 preimage)))
+   in StorePath (encode (BS.pack compressed)) name
+
+-- | Construct a text store path (used for @.drv@ files and @builtins.toFile@).
+-- The references are embedded in the @type@ string — @\"text\"@ followed by
+-- each referenced store path — which is why a derivation's @.drv@ path depends
+-- on the paths of all its inputs.  @contentsDigest@ is the SHA-256 of the file
+-- contents (the ATerm, for a @.drv@).
+makeTextPath :: Text -> BS.ByteString -> [StorePath] -> StorePath
+makeTextPath name contentsDigest refs =
+  let sortedRefs = Set.toAscList (Set.fromList refs)
+      typ = "text" <> T.concat [":" <> storePathToText defaultStoreDir r | r <- sortedRefs]
+   in makeStorePath defaultStoreDir typ contentsDigest name
+
+-- | Construct a fixed-output store path.  @foHashDigest@ is the raw bytes of
+-- the EXPECTED output hash (e.g. a tarball's SHA-256).  @mode@ is @\"flat\"@
+-- or @\"recursive\"@.  Mirrors C++ Nix @makeFixedOutputPath@:
+--
+-- * @sha256@ + @recursive@ → @makeStorePath \"source\" foHash name@
+-- * otherwise → @makeStorePath \"output:out\" sha256(\"fixed:out:\" prefix algo \":\" hex \":\") name@
+makeFixedOutputPath :: Text -> Text -> Text -> BS.ByteString -> StorePath
+makeFixedOutputPath name algo mode foHashDigest
+  | algo == "sha256" && mode == "recursive" =
+      makeStorePath defaultStoreDir "source" foHashDigest name
+  | otherwise =
+      let prefix = if mode == "recursive" then "r:" else ""
+          inner = "fixed:out:" <> prefix <> algo <> ":" <> bytesToHexText foHashDigest <> ":"
+          innerDigest = sha256Digest (encodeUtf8 inner)
+       in makeStorePath defaultStoreDir "output:out" innerDigest name
+
+-- | Construct an input-addressed output store path.  @moduloDigest@ is the raw
+-- bytes of @hashDerivationModulo@ (masked).  Mirrors C++ Nix @makeOutputPath@:
+-- the path name gets an @-<output>@ suffix for non-@out@ outputs.
+makeOutputPath :: Text -> BS.ByteString -> Text -> StorePath
+makeOutputPath outName moduloDigest drvName =
+  let pathName = if outName == "out" then drvName else drvName <> "-" <> outName
+   in makeStorePath defaultStoreDir ("output:" <> outName) moduloDigest pathName

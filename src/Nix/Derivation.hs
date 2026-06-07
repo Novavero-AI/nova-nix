@@ -55,6 +55,7 @@ module Nix.Derivation
 
     -- * ATerm serialization
     toATerm,
+    toATermForHash,
     fromATerm,
 
     -- * Platform
@@ -69,6 +70,7 @@ import Data.Function (on)
 import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Store.Path (StorePath (..))
@@ -167,11 +169,27 @@ data Derivation = Derivation
 --
 -- Format: @Derive([outputs],[inputDrvs],[inputSrcs],platform,builder,[args],[env])@
 toATerm :: Derivation -> Text
-toATerm drv =
+toATerm = toATermForHash False Nothing
+
+-- | Serialize a derivation for HASHING, with the two knobs the Nix
+-- derivation-hash algorithm needs:
+--
+--   * @maskOutputs@: render every output path as the empty string.  Used
+--     when computing a derivation's own output paths (not yet known) via
+--     @hashDerivationModulo@.
+--   * @inputSubst@: when @Just subs@, render the input-derivations section
+--     from @subs@ — pairs of @(moduloHashHex, outputNames)@ — instead of
+--     from 'drvInputDrvs'.  Each input derivation's store path is replaced
+--     by its own modulo hash, so two derivations differing only in an
+--     input's path spelling (not its content) hash identically.
+--
+-- @toATermForHash False Nothing@ is exactly 'toATerm'.
+toATermForHash :: Bool -> Maybe [(Text, [Text])] -> Derivation -> Text
+toATermForHash maskOutputs inputSubst drv =
   "Derive("
-    <> atermOutputs (drvOutputs drv)
+    <> atermOutputsWith maskOutputs (drvOutputs drv)
     <> ","
-    <> atermInputDrvs (drvInputDrvs drv)
+    <> inputDrvsSection
     <> ","
     <> atermInputSrcs (drvInputSrcs drv)
     <> ","
@@ -183,25 +201,42 @@ toATerm drv =
     <> ","
     <> atermEnv (drvEnv drv)
     <> ")"
+  where
+    inputDrvsSection = case inputSubst of
+      Nothing -> atermInputDrvs (drvInputDrvs drv)
+      Just subs -> atermInputDrvsSubst subs
 
--- | Serialize outputs: @[(name,path,hashAlgo,hash)]@
--- Sorted by output name for deterministic ATerm hashing.
-atermOutputs :: [DerivationOutput] -> Text
-atermOutputs outs =
+-- | Serialize outputs: @[(name,path,hashAlgo,hash)]@, sorted by output name.
+-- When @maskOutputs@ is set, every path is rendered as @\"\"@ (used by the
+-- masked modulo hash, where output paths aren't known yet).
+atermOutputsWith :: Bool -> [DerivationOutput] -> Text
+atermOutputsWith maskOutputs outs =
   let sorted = sortBy (compare `on` doName) outs
-   in "[" <> T.intercalate "," (map atermOutput sorted) <> "]"
+   in "[" <> T.intercalate "," (map render sorted) <> "]"
+  where
+    render out =
+      "("
+        <> atermString (doName out)
+        <> ","
+        <> atermString (if maskOutputs then "" else SP.storePathToText SP.defaultStoreDir (doPath out))
+        <> ","
+        <> atermString (doHashAlgo out)
+        <> ","
+        <> atermString (doHash out)
+        <> ")"
 
-atermOutput :: DerivationOutput -> Text
-atermOutput out =
-  "("
-    <> atermString (doName out)
-    <> ","
-    <> atermString (SP.storePathToText SP.defaultStoreDir (doPath out))
-    <> ","
-    <> atermString (doHashAlgo out)
-    <> ","
-    <> atermString (doHash out)
-    <> ")"
+-- | Input-derivations serializer for the modulo substitution: keys are the
+-- modulo-hash hex strings (sorted), output-name lists sorted and deduplicated.
+atermInputDrvsSubst :: [(Text, [Text])] -> Text
+atermInputDrvsSubst subs =
+  let sorted = sortBy (compare `on` fst) subs
+   in "[" <> T.intercalate "," (map render sorted) <> "]"
+  where
+    render (key, outs) = "(" <> atermString key <> "," <> atermStringList (sortNubText outs) <> ")"
+
+-- | Sort and deduplicate output names (matches C++ @std::set<string>@).
+sortNubText :: [Text] -> [Text]
+sortNubText = Set.toAscList . Set.fromList
 
 -- | Serialize input derivations: @[(drvPath,[outName1,outName2])]@
 -- Sorted by store path for determinism.
@@ -215,7 +250,7 @@ atermInputDrv (sp, outs) =
   "("
     <> atermString (SP.storePathToText SP.defaultStoreDir sp)
     <> ","
-    <> atermStringList outs
+    <> atermStringList (sortNubText outs)
     <> ")"
 
 -- | Serialize input sources: @[path1,path2,...]@

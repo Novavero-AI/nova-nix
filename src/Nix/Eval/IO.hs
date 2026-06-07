@@ -50,13 +50,14 @@ import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, unmarshalLambdaValue, unmarshalStringContext)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
-import Nix.Hash (sha256Hex, truncatedBase32)
+import Nix.Hash (makeFixedOutputPath, sha256Digest, sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import qualified Nix.Store.Path as SP
+import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
-import System.FilePath (isRelative, takeDirectory, (</>))
+import System.FilePath (isRelative, takeDirectory, takeFileName, (</>))
 import System.IO (hPutStrLn, stderr)
 import qualified System.Process as Proc
 
@@ -93,6 +94,13 @@ instance Exception NixAbortError
 -- @builtins.nixPath@.
 data EvalState = EvalState
   { esImportCache :: !(IORef (Map FilePath NixValue)),
+    -- | Cache of derivation modulo-hashes (drv store path → hex), populated
+    -- bottom-up by 'builtinDerivationStrict' so input derivations can be
+    -- substituted by their content hashes when computing output paths.
+    esDrvModuloCache :: !(IORef (Map Text Text)),
+    -- | Cache of source path → its store path (recursive NAR hash), so a path
+    -- literal used across many derivations is hashed only once.
+    esSourcePathCache :: !(IORef (Map Text Text)),
     esBaseDir :: !FilePath,
     esStoreDir :: !FilePath,
     esTimestamp :: !Int64,
@@ -104,6 +112,8 @@ data EvalState = EvalState
 newEvalState :: FilePath -> IO EvalState
 newEvalState baseDir = do
   cache <- newIORef Map.empty
+  drvCache <- newIORef Map.empty
+  srcCache <- newIORef Map.empty
   now <- floor <$> getPOSIXTime :: IO Int64
   nixPathStr <- lookupEnvText "NIX_PATH"
   let searchPaths = case nixPathStr of
@@ -112,6 +122,8 @@ newEvalState baseDir = do
   pure
     EvalState
       { esImportCache = cache,
+        esDrvModuloCache = drvCache,
+        esSourcePathCache = srcCache,
         esBaseDir = baseDir,
         esStoreDir = T.unpack SP.platformStoreDirText,
         esTimestamp = now,
@@ -198,6 +210,28 @@ instance MonadEval EvalIO where
   getEnvVar name = wrapIO $ do
     mval <- lookupEnvText (T.unpack name)
     pure (maybe "" T.pack mval)
+
+  lookupDrvHash key = EvalIO $ do
+    ref <- asks esDrvModuloCache
+    liftIO (Map.lookup key <$> readIORef ref)
+
+  cacheDrvHash key val = EvalIO $ do
+    ref <- asks esDrvModuloCache
+    liftIO (modifyIORef' ref (Map.insert key val))
+
+  storeSourcePath rawPath = do
+    ref <- EvalIO (asks esSourcePathCache)
+    cached <- EvalIO (liftIO (Map.lookup rawPath <$> readIORef ref))
+    case cached of
+      Just hit -> pure hit
+      Nothing -> do
+        entry <- wrapIO (NAR.serialiseFromPath (T.unpack rawPath))
+        let narDigest = sha256Digest (NAR.serialise entry)
+            name = T.pack (takeFileName (T.unpack rawPath))
+            sp = makeFixedOutputPath name "sha256" "recursive" narDigest
+            spText = SP.storePathToText SP.defaultStoreDir sp
+        EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath spText)))
+        pure spText
 
   getCurrentTime = EvalIO (asks esTimestamp)
 

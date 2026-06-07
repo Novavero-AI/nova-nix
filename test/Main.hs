@@ -1604,10 +1604,10 @@ testBatchB = do
   putStrLn "eval/builtins-batchB"
   sequence
     [ -- placeholder
-      runTest "placeholder out starts with /nix/store/" $
-        assertRight "placeholder-prefix" (evalNix "builtins.placeholder \"out\"") $ \val ->
+      runTest "placeholder out matches Nix hashPlaceholder" $
+        assertRight "placeholder-out" (evalNix "builtins.placeholder \"out\"") $ \val ->
           case val of
-            VStr p _ -> if "/nix/store/" `T.isPrefixOf` p then Pass else Fail ("bad prefix: " <> p)
+            VStr p _ -> assertEqual "placeholder out" "/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9" p
             _ -> Fail ("expected VStr, got " <> T.pack (show val)),
       runTest "placeholder deterministic" $
         assertRight "placeholder-det" (evalNix "builtins.placeholder \"out\" == builtins.placeholder \"out\"") $ \val ->
@@ -2752,7 +2752,7 @@ complexTestDrv =
       drvInputDrvs =
         Map.fromList
           [ (StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "dep1.drv", ["out"]),
-            (StorePath "ffffffffffffffffffffffffffffffff" "dep2.drv", ["out", "lib"])
+            (StorePath "ffffffffffffffffffffffffffffffff" "dep2.drv", ["lib", "out"])
           ],
       drvInputSrcs = [StorePath "gggggggggggggggggggggggggggggggg" "source.tar.gz"],
       drvPlatform = Aarch64_Darwin,
@@ -2858,18 +2858,19 @@ testFromATerm = do
                   then Pass
                   else Fail ("output names: " <> T.pack (show names))
           _ -> Fail ("expected VDerivation, got " <> T.pack (show val)),
-      -- builtinDerivation populates drvEnv with drvPath and output paths
+      -- builtinDerivation populates drvEnv with the output paths ($out, …)
+      -- and the build attributes.  Note: the .drv env does NOT contain a
+      -- "drvPath" key — matching C++ Nix, which never writes one.
       runTest "builtinDerivation populates drvEnv"
         $ assertRight
           "drvEnv"
           (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d._derivation")
         $ \val -> case val of
           VDerivation drv
-            | Just dp <- Map.lookup "drvPath" (drvEnv drv),
-              "/nix/store/" `T.isPrefixOf` dp,
-              ".drv" `T.isSuffixOf` dp,
-              Just op <- Map.lookup "out" (drvEnv drv),
-              "/nix/store/" `T.isPrefixOf` op ->
+            | Just op <- Map.lookup "out" (drvEnv drv),
+              "/nix/store/" `T.isPrefixOf` op,
+              Just nm <- Map.lookup "name" (drvEnv drv),
+              nm == "test" ->
                 Pass
             | otherwise ->
                 Fail ("drvEnv keys: " <> T.pack (show (Map.toList (drvEnv drv))))

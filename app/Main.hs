@@ -22,7 +22,7 @@ import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
-import Nix.Derivation (Derivation (..), DerivationOutput (..))
+import Nix.Derivation (Derivation (..), DerivationOutput (..), toATerm)
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
@@ -45,6 +45,7 @@ import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
 data CliOpts = CliOpts
   { optNixPaths :: ![T.Text],
     optStrict :: !Bool,
+    optAterm :: !Bool,
     optCommand :: !Command
   }
 
@@ -55,13 +56,15 @@ data Command
   | CmdHelp
 
 parseArgs :: [String] -> CliOpts
-parseArgs = go (CliOpts [] False CmdHelp)
+parseArgs = go (CliOpts [] False False CmdHelp)
   where
     go opts [] = opts
     go opts ("--nix-path" : val : rest) =
       go (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
     go opts ("--strict" : rest) =
       go (opts {optStrict = True}) rest
+    go opts ("--aterm" : rest) =
+      go (opts {optAterm = True}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : path : rest) =
       go (opts {optCommand = CmdBuild path}) rest
@@ -69,6 +72,7 @@ parseArgs = go (CliOpts [] False CmdHelp)
     -- Sub-parser for eval: handles --strict and --expr interleaved with the file arg.
     goEval opts [] = opts
     goEval opts ("--strict" : rest) = goEval (opts {optStrict = True}) rest
+    goEval opts ("--aterm" : rest) = goEval (opts {optAterm = True}) rest
     goEval opts ("--nix-path" : val : rest) =
       goEval (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
     goEval opts ("--expr" : expr : rest) =
@@ -96,7 +100,9 @@ main = do
   let opts = parseArgs args
   case optCommand opts of
     CmdEvalFile filePath -> evalFile (optStrict opts) (optNixPaths opts) dataDir filePath
-    CmdEvalExpr expr -> evalExpr (optStrict opts) (optNixPaths opts) dataDir expr
+    CmdEvalExpr expr
+      | optAterm opts -> evalExprAterm (optNixPaths opts) dataDir expr
+      | otherwise -> evalExpr (optStrict opts) (optNixPaths opts) dataDir expr
     CmdBuild filePath -> buildFile (optNixPaths opts) dataDir filePath
     CmdHelp -> do
       hPutStrLn stderr "Usage: nova-nix [--nix-path NAME=PATH] <command>"
@@ -108,6 +114,7 @@ main = do
       hPutStrLn stderr ""
       hPutStrLn stderr "Flags:"
       hPutStrLn stderr "  --strict               Deep-force all thunks before printing (warning: OOM on large results)"
+      hPutStrLn stderr "  --aterm                With eval --expr, print the derivation's .drv ATerm"
       hPutStrLn stderr "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)"
       exitFailure
 
@@ -152,6 +159,36 @@ evalExpr strict extraPaths dataDir source = do
           TIO.hPutStrLn stderr ("error: " <> err)
           exitFailure
         Right forced -> TIO.putStrLn (prettyValue forced)
+
+-- | Evaluate an inline expression to a derivation and print its ATerm (.drv
+-- contents), for diffing nova-nix's serialization against upstream Nix.
+evalExprAterm :: [T.Text] -> FilePath -> T.Text -> IO ()
+evalExprAterm extraPaths dataDir source =
+  case parseNix "<expr>" source of
+    Left err -> do
+      hPutStrLn stderr ("parse error: " ++ show err)
+      exitFailure
+    Right expr -> do
+      cwd <- getCurrentDirectory
+      st0 <- newEvalState cwd
+      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
+          st = st0 {esSearchPaths = searchPaths}
+      result <- runEvalIO st $ do
+        val <- eval (builtinEnv (esTimestamp st) searchPaths) expr
+        case val of
+          VAttrs attrs ->
+            mapM_
+              (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
+              ["_derivation", "drvPath"]
+          _ -> pure ()
+        pure val
+      case result of
+        Left err -> do
+          TIO.hPutStrLn stderr ("error: " <> err)
+          exitFailure
+        Right val -> do
+          (drv, _) <- extractDerivation val
+          TIO.putStrLn (toATerm drv)
 
 -- | Parse, evaluate, extract derivation, build, and print result.
 buildFile :: [T.Text] -> FilePath -> FilePath -> IO ()

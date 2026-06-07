@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0.0 — 2026-06-06
+
+### Milestone: Derivation-Hash Parity with Upstream Nix
+
+`(import <nixpkgs> {}).hello.drvPath`, and every one of the 253 derivations in its closure, now hash byte-for-byte identically to `nix-instantiate` — verified in CI against a pinned nixpkgs evaluated on the same tree by both implementations. A new `eval --aterm` mode dumps a derivation's ATerm for diffing against `nix derivation show`.
+
+- **Fix: indented-string indentation is stripped per literal string-part, before interpolation** — the common indentation was removed from the fully-interpolated string, so a multi-line interpolated value (e.g. `${commonPreHook}` in the stdenv `preHook`) could lower the computed minimum indent to zero and leave the literal lines indented. Indentation is now computed from the literal parts only — interpolated values are opaque content — matching C++ Nix.
+- **Fix: path literals interpolated into strings are copied to the store** — `"${./foo}"` left the raw source path in the result; it now copies the file to the store and yields its store path, with the path added to the string context so it lands in the derivation's `inputSrcs`. `builtins.toString` still does not copy, per Nix semantics.
+- **Fix: `builtins.placeholder`** — now returns `/` followed by the full SHA-256 of `nix-output:<name>` in Nix base-32, matching Nix's `hashPlaceholder`. It previously truncated the hash and wrapped it as a `/nix/store` path, so any derivation using `${placeholder "out"}` (e.g. perl's `configureFlags`) diverged.
+- **Fix: a derivation's default output is its first declared output** — a bare reference to a multi-output derivation now resolves to `outputs[0]` (both name and path), not a hardcoded `out`. This affected packages whose first output is not `out`, such as `xz` (first output `bin`).
+- **Fix: `builtins.attrNames` is sorted lexicographically** — names were returned in interned-symbol order rather than sorted by key, and inconsistently with `builtins.attrValues`. Surfaced in `fetchurl`'s `impureEnvVars` (the generated `NIX_MIRRORS_*` list).
+- 593 tests, `-Werror` clean, ormolu clean, hlint clean
+
 ## 0.2.0.0 — 2026-06-05
 
 ### Milestone: `import <nixpkgs> {}` Evaluates
