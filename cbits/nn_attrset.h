@@ -16,7 +16,10 @@
  * Values are opaque void* — Haskell passes StablePtr Thunk.  The C
  * side never dereferences them.
  *
- * Lifecycle: caller owns the nn_attrset_t* and must call nn_attrset_free.
+ * Lifecycle: arena-managed.  Every set is tracked at creation and bulk-freed
+ * by nn_attrset_free_all at evaluation teardown; nn_attrset_free is that
+ * teardown's per-set primitive and must not be called on a tracked set (it
+ * would then be double-freed by nn_attrset_free_all).
  * Values (StablePtrs) are NOT freed by nn_attrset_free — Haskell owns them.
  */
 
