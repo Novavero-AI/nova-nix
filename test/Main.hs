@@ -276,7 +276,13 @@ testEvalArithmetic = do
       runTest "negate int" $
         assertEval "negate" "- 5" (VInt (-5)),
       runTest "division by zero" $
-        assertEvalFail "div0" "1 / 0"
+        assertEvalFail "div0" "1 / 0",
+      runTest "absolute path lexes as path, not division" $
+        assertEval "path-abs" "builtins.typeOf /abs/path" (mkStr "path"),
+      runTest "bareword relative path lexes as path" $
+        assertEval "path-rel" "builtins.typeOf foo/bar" (mkStr "path"),
+      runTest "function applied to an absolute path argument" $
+        assertEval "app-abs-path" "(p: builtins.typeOf p) /abs/path" (mkStr "path")
     ]
 
 -- ---------------------------------------------------------------------------

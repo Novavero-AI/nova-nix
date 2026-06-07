@@ -17,8 +17,6 @@ module Nix.Eval.CAttrSet
 
     -- * Lifecycle
     cattrsetNew,
-    cattrsetFree,
-    withCAttrSet,
 
     -- * Construction
     cattrsetInsert,
@@ -62,9 +60,6 @@ type CAttrSet = Ptr NnAttrSet
 foreign import ccall unsafe "nn_attrset_new"
   c_nn_attrset_new :: Word32 -> IO CAttrSet
 
-foreign import ccall unsafe "nn_attrset_free"
-  c_nn_attrset_free :: CAttrSet -> IO ()
-
 foreign import ccall unsafe "nn_attrset_insert"
   c_nn_attrset_insert :: CAttrSet -> Word32 -> Ptr () -> IO ()
 
@@ -105,18 +100,6 @@ foreign import ccall unsafe "nn_attrset_remove_keys"
 -- | Allocate a new empty attribute set with the given capacity hint.
 cattrsetNew :: Word32 -> IO CAttrSet
 cattrsetNew = c_nn_attrset_new
-
--- | Free a C-allocated attribute set.  Does NOT free thunk values.
-cattrsetFree :: CAttrSet -> IO ()
-cattrsetFree = c_nn_attrset_free
-
--- | Bracket pattern: allocate, use, free.
-withCAttrSet :: Word32 -> (CAttrSet -> IO a) -> IO a
-withCAttrSet cap action = do
-  set <- cattrsetNew cap
-  result <- action set
-  cattrsetFree set
-  pure result
 
 -- ---------------------------------------------------------------------------
 -- Construction

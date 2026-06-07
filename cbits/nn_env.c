@@ -251,12 +251,24 @@ void *
 nn_env_lookup_resolved(const nn_env_t *env, int level, int idx)
 {
     NN_ASSERT(env != NULL, "nn_env_lookup_resolved: NULL env");
+    if (env == NULL) {
+        return NULL;
+    }
     while (level > 0) {
         NN_ASSERT(env->parent != NULL, "nn_env_lookup_resolved: parent chain too short for level");
+        if (env->parent == NULL) {
+            return NULL;
+        }
         env = env->parent;
         level--;
     }
+    /* The resolver supplies these indices; guard the slot read in release
+       builds too (NDEBUG strips the assert) so a resolver bug surfaces as a
+       NULL rather than an out-of-bounds read past the slot array. */
     NN_ASSERT(idx >= 0 && (uint32_t)idx < env->slot_count, "nn_env_lookup_resolved: idx out of bounds");
+    if (idx < 0 || (uint32_t)idx >= env->slot_count) {
+        return NULL;
+    }
     return env->slots[idx];
 }
 
