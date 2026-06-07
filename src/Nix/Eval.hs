@@ -3273,7 +3273,6 @@ builtinDerivationStrict (VAttrs attrs) = do
           drvSp = makeTextPath drvFileName (sha256Digest (TE.encodeUtf8 (toATerm contents))) drvRefs
           drvText = storePathToText defaultStoreDir drvSp
       cacheDrvHash drvText (bytesToHex foModulo)
-      recordDerivation drvText (toATerm contents)
       pure (drvText, drvSp, [("out", foPathText)], contents)
     Nothing -> do
       inputSubst <- mapM resolveInputModulo (Map.toList inputDrvs)
@@ -3291,7 +3290,6 @@ builtinDerivationStrict (VAttrs attrs) = do
           drvSp = makeTextPath drvFileName (sha256Digest (TE.encodeUtf8 (toATerm contents))) drvRefs
           drvText = storePathToText defaultStoreDir drvSp
       cacheDrvHash drvText (bytesToHex moduloUnmasked)
-      recordDerivation drvText (toATerm contents)
       pure (drvText, drvSp, outPathTexts, contents)
 
   let mainOutPath = case outPaths of

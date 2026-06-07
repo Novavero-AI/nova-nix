@@ -4,7 +4,7 @@
 
 ### Milestone: Derivation-Hash Parity with Upstream Nix
 
-`(import <nixpkgs> {}).hello.drvPath`, and every one of the 253 derivations in its closure, now hash byte-for-byte identically to `nix-instantiate` — verified in CI against a pinned nixpkgs evaluated on the same tree by both implementations. A new `eval --aterm --recursive` mode dumps the full derivation closure for diffing against `nix derivation show -r`.
+`(import <nixpkgs> {}).hello.drvPath`, and every one of the 253 derivations in its closure, now hash byte-for-byte identically to `nix-instantiate` — verified in CI against a pinned nixpkgs evaluated on the same tree by both implementations. A new `eval --aterm` mode dumps a derivation's ATerm for diffing against `nix derivation show`.
 
 - **Fix: indented-string indentation is stripped per literal string-part, before interpolation** — the common indentation was removed from the fully-interpolated string, so a multi-line interpolated value (e.g. `${commonPreHook}` in the stdenv `preHook`) could lower the computed minimum indent to zero and leave the literal lines indented. Indentation is now computed from the literal parts only — interpolated values are opaque content — matching C++ Nix.
 - **Fix: path literals interpolated into strings are copied to the store** — `"${./foo}"` left the raw source path in the result; it now copies the file to the store and yields its store path, with the path added to the string context so it lands in the derivation's `inputSrcs`. `builtins.toString` still does not copy, per Nix semantics.

@@ -1065,10 +1065,6 @@ class (Monad m) => MonadEval m where
   -- argument or environment value.  Unavailable in pure evaluation.
   storeSourcePath :: Text -> m Text
 
-  -- | Record a computed derivation's @.drv@ ATerm under its store path, for
-  -- the @--aterm --recursive@ closure dump.  A no-op in pure evaluation.
-  recordDerivation :: Text -> Text -> m ()
-
 -- | Pure evaluation monad — wraps 'Either Text'.
 -- IO builtins ('readFile', 'import') are unavailable;
 -- everything else evaluates identically to the IO version.
@@ -1098,7 +1094,6 @@ instance MonadEval PureEval where
   -- Pure eval cannot read files: a path coerces to itself (no store copy);
   -- the real copy-to-store happens only under 'EvalIO'.
   storeSourcePath = pure
-  recordDerivation _ _ = pure ()
   resolvePathLiteral = pure
   forceThunk evalFn (Thunk ptr) =
     -- Read the C thunk via unsafePerformIO — safe because reads are

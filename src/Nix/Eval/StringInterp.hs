@@ -1,63 +1,27 @@
--- | String interpolation evaluation for Nix.
+-- | String coercion and indented-string whitespace stripping.
 --
--- Handles both regular strings (double-quoted) and indented strings
--- (double single-quoted).
--- Takes the evaluator as a parameter to break the import cycle with
--- @Nix.Eval@.
+-- Provides 'coerceToString' (string interpolation and @builtins.toString@) and
+-- 'stripIndentedChunks' (the indented-string indentation algorithm, applied by
+-- the bytecode evaluator).  Force/apply are passed in as parameters to break the
+-- import cycle with @Nix.Eval@.
 module Nix.Eval.StringInterp
-  ( evalStringParts,
-    evalIndStringParts,
-    stripIndentedChunks,
+  ( stripIndentedChunks,
     coerceToString,
     formatNixFloat,
-    stripIndentation,
   )
 where
 
 import Data.List (foldl')
 import Data.Text (Text)
 import qualified Data.Text as T
-import Nix.Eval.Context (concatStrings)
-import Nix.Eval.Types (Env, MonadEval (..), NixValue (..), StringContext, Thunk, attrSetLookup, emptyContext, typeName)
-import Nix.Expr.Types (Expr, StringPart (..))
+import Nix.Eval.Types (MonadEval (..), NixValue (..), StringContext, Thunk, attrSetLookup, emptyContext, typeName)
 import Numeric (showFFloat)
-
--- | The evaluator function, passed as a parameter to avoid cyclic imports.
-type Eval m = Env -> Expr -> m NixValue
 
 -- | Force a thunk to a value.
 type Force m = Thunk -> m NixValue
 
 -- | Apply a function value to an argument value.
 type Apply m = NixValue -> NixValue -> m NixValue
-
--- | Evaluate the parts of a regular string (double-quoted).
--- Returns the concatenated text and the merged context from all parts.
-evalStringParts :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> [StringPart] -> m (Text, StringContext)
-evalStringParts evalFn forceFn applyFn env parts = do
-  chunks <- mapM (evalOnePart evalFn forceFn applyFn env) parts
-  pure (concatStrings chunks)
-
--- | Evaluate the parts of an indented string (double single-quoted).
---
--- The common indentation is stripped from the LITERAL parts, computed BEFORE
--- interpolation, matching C++ Nix.  Interpolated values are opaque content, so
--- a @${...}@ whose value starts (or wraps onto a line) at column 0 does not
--- drag the common indent to 0.  The single leading newline is dropped; the
--- trailing newline is kept.
-evalIndStringParts :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> [StringPart] -> m (Text, StringContext)
-evalIndStringParts evalFn forceFn applyFn env parts = do
-  chunks <- mapM (evalOnePartTagged evalFn forceFn applyFn env) parts
-  pure (stripIndentedChunks chunks)
-
--- | Evaluate one indented-string part, tagging it literal (@True@) or
--- interpolated (@False@) so 'stripIndentedChunks' strips only the literals.
-evalOnePartTagged :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> StringPart -> m (Bool, Text, StringContext)
-evalOnePartTagged _ _ _ _ (StrLit t) = pure (True, t, emptyContext)
-evalOnePartTagged evalFn forceFn applyFn env (StrInterp expr) = do
-  val <- evalFn env expr
-  (txt, ctx) <- coerceToString forceFn applyFn val
-  pure (False, txt, ctx)
 
 -- | Strip the common indentation from already-evaluated indented-string chunks.
 -- Each chunk is @(isLiteral, text, context)@.  Indentation is computed and
@@ -112,13 +76,6 @@ chunksStrip n = go True 0
       | c == '\n' = ('\n' : acc, True, 0)
       | otherwise = (c : acc, False, dropped)
 
--- | Evaluate a single string part, returning its text and context.
-evalOnePart :: (MonadEval m) => Eval m -> Force m -> Apply m -> Env -> StringPart -> m (Text, StringContext)
-evalOnePart _ _ _ _ (StrLit txt) = pure (txt, emptyContext)
-evalOnePart evalFn forceFn applyFn env (StrInterp expr) = do
-  val <- evalFn env expr
-  coerceToString forceFn applyFn val
-
 -- | Coerce a Nix value to a string for interpolation.
 --
 -- Strict coercion: strings, ints, floats, paths, null, bools, and
@@ -165,58 +122,3 @@ formatNixFloat n
       | otherwise = s
     dropDot ('.' : rest) = rest
     dropDot xs = xs
-
--- ---------------------------------------------------------------------------
--- Indented string whitespace stripping
--- ---------------------------------------------------------------------------
-
--- | Strip the common leading whitespace from an indented string.
---
--- Algorithm (matching C++ Nix):
--- 1. Split into lines.
--- 2. Find the minimum indentation of all non-empty lines (excluding
---    the first line, which has no leading whitespace in double single-quoted).
--- 3. Strip that many spaces/tabs from the front of each line.
--- 4. Drop a single leading newline if present.
---
--- The trailing newline is KEPT — matching C++ Nix, which drops only the
--- leading newline of an indented string, not the trailing one.
-stripIndentation :: Text -> Text
-stripIndentation raw
-  | T.null raw = raw
-  | otherwise =
-      let withLeadingStripped = stripLeadingNewline raw
-          lns = T.splitOn "\n" withLeadingStripped
-          minIndent = minimumIndent lns
-          stripped = map (stripPrefix minIndent) lns
-       in T.intercalate "\n" stripped
-
--- | Count leading spaces on a line (tabs count as one space).
-countIndent :: Text -> Int
-countIndent = T.length . T.takeWhile (\c -> c == ' ' || c == '\t')
-
--- | Find the minimum indentation across all non-blank lines.
--- Whitespace-only lines are treated as blank (infinite indent) per Nix semantics.
-minimumIndent :: [Text] -> Int
-minimumIndent lns =
-  let nonBlank = filter (\t -> not (T.null t) && not (T.all isSpace t)) lns
-      indents = map countIndent nonBlank
-   in case indents of
-        [] -> 0
-        xs -> minimum xs
-  where
-    isSpace c = c == ' ' || c == '\t'
-
--- | Strip up to @n@ leading whitespace characters from a line.
-stripPrefix :: Int -> Text -> Text
-stripPrefix 0 t = t
-stripPrefix n t = case T.uncons t of
-  Just (c, rest)
-    | c == ' ' || c == '\t' -> stripPrefix (n - 1) rest
-  _ -> t
-
--- | Drop a single leading newline.
-stripLeadingNewline :: Text -> Text
-stripLeadingNewline t = case T.uncons t of
-  Just ('\n', rest) -> rest
-  _ -> t
