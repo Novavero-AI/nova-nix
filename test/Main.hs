@@ -2651,6 +2651,13 @@ testTrivialBuildIO = do
         let outFile = storePathToFilePath storeDir sp
         landed <- Dir.doesFileExist outFile
         content <- if landed then TIO.readFile outFile else pure ""
+        narInfo <- queryPathInfo (stDB store) sp
+        let realNarHash = case narInfo of
+              Just info ->
+                piNarSize info > 0
+                  && T.isPrefixOf "sha256:" (piNarHash info)
+                  && T.any (/= '0') (T.drop 7 (piNarHash info))
+              Nothing -> False
         sequence
           [ runTest "trivial build succeeds" Pass,
             runTest "trivial build output landed in store" $
@@ -2658,7 +2665,11 @@ testTrivialBuildIO = do
             runTest "trivial build actually ran the command" $
               if "hi" `T.isInfixOf` content
                 then Pass
-                else Fail ("unexpected output content: " <> T.pack (show content))
+                else Fail ("unexpected output content: " <> T.pack (show content)),
+            runTest "trivial build records a real NAR hash + size" $
+              if realNarHash
+                then Pass
+                else Fail ("NAR hash/size not real: " <> T.pack (show narInfo))
           ]
       BuildFailure msg code ->
         sequence

@@ -64,6 +64,8 @@ import qualified Data.Text.IO as TIO
 import Nix.Derivation (Derivation, toATerm)
 import Nix.Store.DB
 import Nix.Store.Path
+import qualified NovaCache.Hash as Hash
+import qualified NovaCache.NAR as NAR
 import System.Directory
   ( copyFile,
     createDirectoryIfMissing,
@@ -126,13 +128,20 @@ addToStore store srcPath sp deriver refs = do
   moveOutput srcPath destPath
   -- Set read-only permissions
   setReadOnly destPath
+  -- Compute the NAR hash and size of the final store contents.  The NAR
+  -- serialization is canonical (entries sorted, 8-byte padding), so this
+  -- is exactly the NarHash/NarSize a binary cache reports for the path.
+  narEntry <- NAR.serialiseFromPath destPath
+  let narBytes = NAR.serialise narEntry
+      narHashText = Hash.formatNixHash (Hash.hashBytes narBytes)
+      narSize = BS.length narBytes
   -- Register in database
   registerPath
     (stDB store)
     PathRegistration
       { prPath = sp,
-        prNarHash = "sha256:0000000000000000000000000000000000000000000000000000", -- NAR hashing deferred until nova-cache integration
-        prNarSize = 0, -- Computed size deferred until NAR serialization is wired in
+        prNarHash = narHashText,
+        prNarSize = narSize,
         prDeriver = deriver,
         prReferences = refs
       }
