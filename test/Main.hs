@@ -2609,6 +2609,63 @@ restoreWritable path = do
     perms <- getPermissions path
     Dir.setPermissions path (Dir.setOwnerWritable True perms)
 
+-- | Step 1 of the Windows-stdenv ladder: prove the Builder can run a
+-- trivial derivation end-to-end natively — a recipe that writes to @$out@,
+-- with the output landing in the store.  No stdenv, no dependencies: just
+-- the raw build path (process spawn -> output capture -> addToStore),
+-- exercised on the host platform (@cmd.exe@ on Windows, @\/bin\/sh@ elsewhere).
+testTrivialBuildIO :: IO [Bool]
+testTrivialBuildIO = do
+  putStrLn "builder/trivial-native-build"
+  withTempStore $ \store -> do
+    let storeDir = stDir store
+        outPath = StorePath (T.replicate 31 "0" <> "1") "trivial"
+        (builder, args)
+          | SI.os == "mingw32" = ("cmd.exe", ["/c", "echo hi>%out%"])
+          | otherwise = ("/bin/sh", ["-c", "echo hi > $out"])
+        drv =
+          Derivation
+            { drvOutputs =
+                [ DerivationOutput
+                    { doName = "out",
+                      doPath = outPath,
+                      doHashAlgo = "",
+                      doHash = ""
+                    }
+                ],
+              drvInputDrvs = Map.empty,
+              drvInputSrcs = [],
+              drvPlatform = currentPlatform,
+              drvBuilder = builder,
+              drvArgs = args,
+              drvEnv = Map.empty
+            }
+    buildTmp <- (</> "nova-nix-test-trivial-build-tmp") <$> getTemporaryDirectory
+    forceRemoveIfExists buildTmp
+    createDirectoryIfMissing True buildTmp
+    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+    result <- buildDerivation config store drv
+    forceRemoveIfExists buildTmp
+    case result of
+      BuildSuccess sp -> do
+        let outFile = storePathToFilePath storeDir sp
+        landed <- Dir.doesFileExist outFile
+        content <- if landed then TIO.readFile outFile else pure ""
+        sequence
+          [ runTest "trivial build succeeds" Pass,
+            runTest "trivial build output landed in store" $
+              if landed then Pass else Fail ("missing output file: " <> T.pack outFile),
+            runTest "trivial build actually ran the command" $
+              if "hi" `T.isInfixOf` content
+                then Pass
+                else Fail ("unexpected output content: " <> T.pack (show content))
+          ]
+      BuildFailure msg code ->
+        sequence
+          [ runTest "trivial build succeeds" $
+              Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+          ]
+
 testStoreOps :: IO [Bool]
 testStoreOps = do
   putStrLn "store/ops"
@@ -4180,6 +4237,7 @@ main = bracket_ arenaInit arenaDestroy $ do
         [ testExprTypes,
           testStorePaths,
           testDerivation,
+          testTrivialBuildIO,
           testEvalLiterals,
           testEvalVariables,
           testEvalArithmetic,
