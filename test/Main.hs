@@ -18,7 +18,7 @@ import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWi
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
-import Nix.Eval (NixValue (..), StringContext (..), StringContextElement (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
+import Nix.Eval (NixValue (..), StringContext (..), StringContextElement (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, opApp, opAssert, opAttrs, opBinary, opHasAttr, opIf, opIndStr, opLambda, opLet, opList, opLitBool, opLitFloat, opLitInt, opLitNull, opLitPath, opLitUri, opResolvedVar, opSelect, opStr, opUnary, opVar, opWith, opWithVar, strpartInterp, strpartLit, unaryNegate)
@@ -36,6 +36,8 @@ import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathEx
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
+import qualified NovaCache.Hash as CHash
+import qualified NovaCache.NarInfo as NarInfo
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
@@ -2293,8 +2295,51 @@ testSubstituter = do
         assertEqual "default-url" "https://cache.nixos.org" (Subst.ccUrl Subst.defaultCacheConfig),
       -- defaultCacheConfig has priority 40
       runTest "defaultCacheConfig priority" $
-        assertEqual "default-prio" 40 (Subst.ccPriority Subst.defaultCacheConfig)
+        assertEqual "default-prio" 40 (Subst.ccPriority Subst.defaultCacheConfig),
+      -- verifyNarHash: matching NAR hash accepted (HIGH#2 integrity gate)
+      runTest "verifyNarHash accepts matching hash" $
+        assertEqual "narhash-match" (Right ()) (Subst.verifyNarHash (sampleNarInfo sampleNarHash) sampleNarBytes),
+      -- verifyNarHash: mismatched NAR hash rejected
+      runTest "verifyNarHash rejects mismatched hash" $
+        case Subst.verifyNarHash (sampleNarInfo wrongNarHash) sampleNarBytes of
+          Left _ -> Pass
+          Right () -> Fail "expected mismatch rejection",
+      -- verifyNarHash: malformed NAR hash rejected
+      runTest "verifyNarHash rejects malformed hash" $
+        case Subst.verifyNarHash (sampleNarInfo "not-a-hash") sampleNarBytes of
+          Left _ -> Pass
+          Right () -> Fail "expected malformed-hash rejection",
+      -- narInfoMatchesPath: identity match accepted
+      runTest "narInfoMatchesPath accepts matching identity" $
+        if Subst.narInfoMatchesPath (StorePath sampleHash "hello") (sampleNarInfo sampleNarHash)
+          then Pass
+          else Fail "expected identity match",
+      -- narInfoMatchesPath: identity mismatch rejected
+      runTest "narInfoMatchesPath rejects mismatched identity" $
+        if Subst.narInfoMatchesPath (StorePath (T.replicate 32 "b") "hello") (sampleNarInfo sampleNarHash)
+          then Fail "expected identity mismatch"
+          else Pass
     ]
+  where
+    sampleNarBytes = "nova-nix nar sample bytes" :: BS.ByteString
+    sampleNarHash = CHash.formatNixHash (CHash.hashBytes sampleNarBytes)
+    wrongNarHash = CHash.formatNixHash (CHash.hashBytes ("different bytes" :: BS.ByteString))
+    sampleHash = T.replicate 32 "a"
+    sampleNarInfo narHash =
+      NarInfo.NarInfo
+        { NarInfo.niStorePath = "/nix/store/" <> sampleHash <> "-hello",
+          NarInfo.niUrl = "nar/sample.nar",
+          NarInfo.niCompression = "none",
+          NarInfo.niFileHash = sampleNarHash,
+          NarInfo.niFileSize = 0,
+          NarInfo.niNarHash = narHash,
+          NarInfo.niNarSize = fromIntegral (BS.length sampleNarBytes),
+          NarInfo.niReferences = [],
+          NarInfo.niDeriver = Nothing,
+          NarInfo.niSigs = [],
+          NarInfo.niCA = Nothing,
+          NarInfo.niSystem = Nothing
+        }
 
 -- ---------------------------------------------------------------------------
 -- Tests: Build orchestrator (Phase 3, Batch 7)
@@ -2677,6 +2722,140 @@ testTrivialBuildIO = do
           [ runTest "trivial build succeeds" $
               Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
+
+-- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
+-- derivation depends on a leaf; both @.drv@ files are pre-written to the store
+-- (as the build driver's closure-writing does), and 'buildWithDeps' must read
+-- the closure, topologically order it, build the leaf first, then the root —
+-- whose 'validateInputs' requires the leaf's realized output to be valid.
+--
+-- This is the regression guard for the input-@.drv@-closure fix: before it, no
+-- derivation with a non-empty @drvInputDrvs@ could be realized (the closure was
+-- never on disk, so the dependency graph could not be read).
+testDependentBuildIO :: IO [Bool]
+testDependentBuildIO = do
+  putStrLn "builder/dependent-native-build"
+  withTempStore $ \store -> do
+    let storeDir = stDir store
+        depOut = StorePath (T.replicate 31 "c" <> "0") "dep"
+        depDrvSP = StorePath (T.replicate 31 "c" <> "1") "dep.drv"
+        rootOut = StorePath (T.replicate 31 "a" <> "0") "root"
+        rootDrvSP = StorePath (T.replicate 31 "a" <> "1") "root.drv"
+        mkBuilder word
+          | SI.os == "mingw32" = ("cmd.exe", ["/c", "echo " <> word <> ">%out%"])
+          | otherwise = ("/bin/sh", ["-c", "echo " <> word <> " > $out"])
+        (depBuilder, depArgs) = mkBuilder "leaf"
+        (rootBuilder, rootArgs) = mkBuilder "root"
+        depDrv =
+          Derivation
+            { drvOutputs = [DerivationOutput {doName = "out", doPath = depOut, doHashAlgo = "", doHash = ""}],
+              drvInputDrvs = Map.empty,
+              drvInputSrcs = [],
+              drvPlatform = currentPlatform,
+              drvBuilder = depBuilder,
+              drvArgs = depArgs,
+              drvEnv = Map.singleton "name" "dep"
+            }
+        rootDrv =
+          Derivation
+            { drvOutputs = [DerivationOutput {doName = "out", doPath = rootOut, doHashAlgo = "", doHash = ""}],
+              drvInputDrvs = Map.singleton depDrvSP ["out"],
+              drvInputSrcs = [],
+              drvPlatform = currentPlatform,
+              drvBuilder = rootBuilder,
+              drvArgs = rootArgs,
+              drvEnv = Map.singleton "name" "root"
+            }
+    -- The build driver writes the full .drv closure before building; emulate
+    -- that here by writing both recipes to the store.
+    writeDrv store depDrv depDrvSP
+    writeDrv store rootDrv rootDrvSP
+    buildTmp <- (</> "nova-nix-test-dep-build-tmp") <$> getTemporaryDirectory
+    forceRemoveIfExists buildTmp
+    createDirectoryIfMissing True buildTmp
+    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+    result <- buildWithDeps config store rootDrv rootDrvSP
+    depValid <- isValid store depOut
+    rootValid <- isValid store rootOut
+    forceRemoveIfExists buildTmp
+    case result of
+      BuildSuccess sp ->
+        sequence
+          [ runTest "dependent build succeeds with root output" $
+              assertEqual "root output path" rootOut sp,
+            runTest "leaf dependency built and registered first" $
+              if depValid then Pass else Fail "leaf output not valid after build",
+            runTest "root output built and registered" $
+              if rootValid then Pass else Fail "root output not valid after build"
+          ]
+      BuildFailure msg code ->
+        sequence
+          [ runTest "dependent build succeeds with root output" $
+              Fail ("dependency-aware build failed (exit " <> T.pack (show code) <> "): " <> msg)
+          ]
+
+-- | Regression tests for the 2026-06-09 audit eval-fidelity fixes.  All are
+-- parity-safe — none affects a derivation or store-path hash.
+testEvalFidelity :: IO [Bool]
+testEvalFidelity = do
+  putStrLn "eval/audit-fidelity"
+  sequence
+    [ -- builtins.match: a non-participating capture group is null, not ""
+      runTest "match null capture group" $
+        assertEval "match-null" "builtins.isNull (builtins.elemAt (builtins.match \"(a)(b)?\" \"a\") 1)" (VBool True),
+      runTest "match participating group value" $
+        assertEval "match-val" "builtins.elemAt (builtins.match \"(a)(b)\" \"ab\") 1" (mkStr "b"),
+      -- builtins.split: a non-participating group is null too
+      runTest "split null capture group" $
+        assertEval "split-null" "builtins.isNull (builtins.elemAt (builtins.elemAt (builtins.split \"(a)|(b)\" \"a\") 1) 1)" (VBool True),
+      -- builtins.toJSON honors __toString, preferring it over outPath
+      runTest "toJSON __toString" $
+        assertEval "tojson-tostr" "builtins.toJSON { __toString = self: \"x\"; }" (mkStr "\"x\""),
+      runTest "toJSON __toString beats outPath" $
+        assertEval "tojson-tostr-out" "builtins.toJSON { __toString = self: \"a\"; outPath = \"/b\"; }" (mkStr "\"a\""),
+      runTest "toJSON outPath still works" $
+        assertEval "tojson-out" "builtins.toJSON { outPath = \"/b\"; }" (mkStr "\"/b\""),
+      -- String interpolation is strict (coerceMore = False): scalars error
+      runTest "interp rejects int" $
+        assertEvalFail "interp-int" "\"v${1}\"",
+      runTest "interp rejects bool" $
+        assertEvalFail "interp-bool" "\"${true}\"",
+      runTest "interp rejects null" $
+        assertEvalFail "interp-null" "\"${null}\"",
+      runTest "concatStringsSep rejects int" $
+        assertEvalFail "ccs-int" "builtins.concatStringsSep \",\" [ 1 2 ]",
+      -- builtins.toString stays permissive
+      runTest "toString still coerces int" $
+        assertEval "tostr-int" "builtins.toString 1" (mkStr "1"),
+      runTest "interp via toString works" $
+        assertEval "interp-tostr" "\"v${builtins.toString 1}\"" (mkStr "v1"),
+      -- builtins.substring rejects a negative start position
+      runTest "substring negative start errors" $
+        assertEvalFail "substr-neg" "builtins.substring (0 - 1) 3 \"hello\"",
+      -- an integer literal that overflows Int64 is a parse error, not a wrap
+      runTest "integer literal overflow errors" $
+        assertEvalFail "int-overflow" "99999999999999999999",
+      -- float exponents and leading-dot floats lex per the Nix grammar
+      runTest "float exponent lexes as float" $
+        assertEval "float-exp-type" "builtins.typeOf 6.022e23" (mkStr "float"),
+      runTest "float negative exponent lexes" $
+        assertEval "float-negexp-type" "builtins.typeOf 1.0e-3" (mkStr "float"),
+      runTest "float exponent value" $
+        assertEval "float-exp-val" "1.5e1 == 15.0" (VBool True),
+      runTest "leading-dot float lexes as float" $
+        assertEval "leading-dot-type" "builtins.typeOf .5" (mkStr "float"),
+      runTest "leading-dot float value" $
+        assertEval "leading-dot-val" ".5 == 0.5" (VBool True),
+      -- PureEval tryEval must NOT catch abort — it propagates (matches C++ Nix)
+      runTest "tryEval does not catch abort" $
+        assertEvalFail "tryeval-abort" "(builtins.tryEval (builtins.abort \"x\")).success",
+      -- every builtin in the registry (the source of builtinNames/builtinArity)
+      -- is actually exposed in the builtins set — guards against builtinRegistry
+      -- drifting from the exposed builtins
+      runTest "every registered builtin is exposed" $
+        let missing = [n | n <- builtinNames, evalNix ("builtins ? \"" <> n <> "\"") /= Right (VBool True)]
+         in if null missing then Pass else Fail ("not exposed: " <> T.intercalate ", " missing)
+    ]
 
 -- | Pure hash decode/digest helpers shared by eval (fixed-output paths) and
 -- the builder (builtin:fetchurl verification).
@@ -4272,6 +4451,8 @@ main = bracket_ arenaInit arenaDestroy $ do
           testStorePaths,
           testDerivation,
           testTrivialBuildIO,
+          testDependentBuildIO,
+          testEvalFidelity,
           testHashHelpers,
           testEvalLiterals,
           testEvalVariables,

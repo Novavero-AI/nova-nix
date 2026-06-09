@@ -47,8 +47,10 @@ import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Char (toLower)
+import Data.Either (fromRight)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -59,7 +61,7 @@ import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Hash (bytesToHexText, hexToBytes, rawHashWithAlgo)
-import Nix.Store (Store (..), addToStore, isValid, scanReferences)
+import Nix.Store (PathRegistration, Store (..), isValid, placeInStore, registerPaths, registrationFor, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive)
@@ -173,8 +175,8 @@ buildDerivation config store drv = do
 
 buildDerivationInner :: BuildConfig -> Store -> Derivation -> IO BuildResult
 buildDerivationInner config store drv = do
-  -- 1. Validate input sources exist
-  inputsOk <- validateInputs store drv
+  -- 1. Validate inputs (sources + input-derivation outputs) exist
+  inputsOk <- validateInputs config store drv
   case inputsOk of
     Left errMsg -> pure (BuildFailure errMsg 1)
     Right () -> do
@@ -222,22 +224,46 @@ buildDerivationInner config store drv = do
 -- Input validation
 -- ---------------------------------------------------------------------------
 
--- | Check that all input sources and input derivation outputs are valid.
-validateInputs :: Store -> Derivation -> IO (Either Text ())
-validateInputs store drv = do
+-- | Check that all inputs needed to build a derivation are present in the store.
+--
+-- Input sources must be valid.  For input derivations, the artifacts a build
+-- actually reads are their realized OUTPUT paths, not the @.drv@ recipe files,
+-- so we resolve each requested output (by reading the input @.drv@ the build
+-- driver materialized) and validate those outputs.  Dependencies are realized
+-- in topological order, so a dependency's outputs are present by the time a
+-- dependent is validated.
+validateInputs :: BuildConfig -> Store -> Derivation -> IO (Either Text ())
+validateInputs config store drv = do
   -- Check input sources
   srcResults <- mapM (isValid store) (drvInputSrcs drv)
   let missingSrcs = [sp | (sp, valid) <- zip (drvInputSrcs drv) srcResults, not valid]
   if not (null missingSrcs)
     then pure (Left ("missing input sources: " <> T.intercalate ", " (map formatSP missingSrcs)))
-    else do
-      -- Check input derivation outputs
-      let inputDrvPaths = Map.keys (drvInputDrvs drv)
-      drvResults <- mapM (isValid store) inputDrvPaths
-      let missingDrvs = [sp | (sp, valid) <- zip inputDrvPaths drvResults, not valid]
-      if not (null missingDrvs)
-        then pure (Left ("missing input derivations: " <> T.intercalate ", " (map formatSP missingDrvs)))
-        else pure (Right ())
+    else case resolveInputOutputs config drv of
+      Left err -> pure (Left err)
+      Right requiredOutputs -> do
+        outResults <- mapM (isValid store) requiredOutputs
+        let missingOutputs = [sp | (sp, valid) <- zip requiredOutputs outResults, not valid]
+        if not (null missingOutputs)
+          then pure (Left ("missing input derivation outputs: " <> T.intercalate ", " (map formatSP missingOutputs)))
+          else pure (Right ())
+
+-- | Resolve each input derivation's requested output names to their store
+-- paths by reading the input @.drv@ from the store.  @Left@ if an input @.drv@
+-- cannot be read or names an output the derivation does not define.
+resolveInputOutputs :: BuildConfig -> Derivation -> Either Text [StorePath]
+resolveInputOutputs config drv =
+  concat <$> traverse resolveOne (Map.toList (drvInputDrvs drv))
+  where
+    resolveOne (inputDrvPath, wantedOutputs) = do
+      inputDrv <- readDrvFromStore config inputDrvPath
+      let outputMap = Map.fromList [(doName o, doPath o) | o <- drvOutputs inputDrv]
+      traverse (lookupOutput inputDrvPath outputMap) wantedOutputs
+    lookupOutput inputDrvPath outputMap name =
+      case Map.lookup name outputMap of
+        Just sp -> Right sp
+        Nothing ->
+          Left ("input derivation " <> formatSP inputDrvPath <> " has no output '" <> name <> "'")
 
 -- | Format a StorePath for error messages.
 formatSP :: StorePath -> Text
@@ -490,7 +516,10 @@ verifyFetchHash url out body
 -- Output registration
 -- ---------------------------------------------------------------------------
 
--- | After a successful build, register each output in the store.
+-- | After a successful build, register every output in the store.
+--
+-- Outputs are placed first and registered together (one transaction) so
+-- intra-derivation cross-output references survive (see 'registerPaths').
 registerOutputs ::
   BuildConfig ->
   Store ->
@@ -499,47 +528,71 @@ registerOutputs ::
   [(Text, FilePath)] ->
   IO BuildResult
 registerOutputs config store drv _buildDir outputDirs = do
-  let allCandidates = collectAllCandidates drv
+  let -- Candidates for reference scanning: input sources, the input
+      -- derivations' realized OUTPUT paths, and this derivation's own outputs.
+      inputOutputs = fromRight [] (resolveInputOutputs config drv)
+      allCandidates = collectAllCandidates drv ++ inputOutputs
       -- Deriver path is not available from the Derivation type alone;
       -- the caller (buildWithDeps) would need to pass it through.
       -- Register with no deriver for now — queryDeriver will return Nothing.
       drvPathText = Nothing
-  -- Register each output
-  results <- mapM (registerSingleOutput config store allCandidates drvPathText) (zip (drvOutputs drv) outputDirs)
-  case sequence results of
+      -- (temp output dir, final store path) for every output, used to detect
+      -- self- and cross-output references that appear as build-temp paths.
+      tempPairs = [(outDir, doPath out) | (out, (_, outDir)) <- zip (drvOutputs drv) outputDirs]
+  -- Phase 1: scan references and move each output into the store, collecting a
+  -- PathRegistration (no DB writes yet).  Already-valid outputs are skipped.
+  prepared <- mapM (prepareOutput config store allCandidates tempPairs drvPathText) (zip (drvOutputs drv) outputDirs)
+  case sequence prepared of
     Left errMsg -> pure (BuildFailure errMsg 1)
-    Right _ ->
-      -- Return the first output's store path
+    Right regs -> do
+      -- Phase 2: register ALL outputs in one transaction.
+      registerPaths (stDB store) (catMaybes regs)
       case drvOutputs drv of
         (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
         [] -> pure (BuildFailure "no outputs defined" 1)
 
--- | Register a single output: scan references, move to store, register in DB.
-registerSingleOutput ::
+-- | Prepare a single output for registration: skip if already valid in the DB,
+-- otherwise scan references (input refs plus self/cross-output temp refs) and
+-- place it in the store, returning its 'PathRegistration'.  Returns @Nothing@
+-- for an output already registered as valid.
+prepareOutput ::
   BuildConfig ->
   Store ->
   [StorePath] ->
+  [(FilePath, StorePath)] ->
   Maybe Text ->
   (DerivationOutput, (Text, FilePath)) ->
-  IO (Either Text ())
-registerSingleOutput config store candidates drvPathText (output, (_outName, outDir)) = do
+  IO (Either Text (Maybe PathRegistration))
+prepareOutput config store candidates tempPairs drvPathText (output, (_outName, outDir)) = do
   let targetSP = doPath output
       targetPath = storePathToFilePath (bcStoreDir config) targetSP
-  -- Check if output exists (file or directory — builder creates it)
+  -- Check the build actually produced the output (file or directory).
   exists <- doesPathExist outDir
   if not exists
     then pure (Left ("output missing: " <> T.pack outDir))
     else do
-      -- Scan for references in the output
-      refs <- scanReferences (bcStoreDir config) candidates outDir
-      -- Check if already in store (e.g. from a previous build)
-      alreadyExists <- doesPathExist targetPath
-      if alreadyExists
-        then pure (Right ())
+      -- Validity is a DB fact, not mere disk presence: an output left on disk by
+      -- an interrupted build is NOT valid and must be (re-)registered.
+      valid <- isValid store targetSP
+      if valid
+        then pure (Right Nothing)
         else do
-          -- Move to store and register
-          addToStore store outDir targetSP drvPathText refs
-          pure (Right ())
+          onDisk <- doesPathExist targetPath
+          -- Scan whichever artifact we will register: a leftover store path if
+          -- present, otherwise the fresh build output.
+          let scanPath = if onDisk then targetPath else outDir
+          inputRefs <- scanReferences (bcStoreDir config) candidates scanPath
+          selfRefs <- scanTempReferences tempPairs scanPath
+          let refs = dedupStorePaths (inputRefs ++ selfRefs)
+          reg <-
+            if onDisk
+              then registrationFor store targetSP drvPathText refs
+              else placeInStore store outDir targetSP drvPathText refs
+          pure (Right (Just reg))
+
+-- | Deduplicate store paths by their (unique) hash.
+dedupStorePaths :: [StorePath] -> [StorePath]
+dedupStorePaths = Map.elems . Map.fromList . map (\sp -> (spHash sp, sp))
 
 -- | Collect all candidate store paths from the derivation's inputs.
 -- Used for reference scanning.

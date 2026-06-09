@@ -17,6 +17,7 @@
 module Main (main) where
 
 import Control.Monad (void, (>=>))
+import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -28,7 +29,7 @@ import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
-import Nix.Store (Store, closeStore, openStore, writeDrv)
+import Nix.Store (Store, closeStore, openStore, writeDrv, writeDrvAterm)
 import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, platformStoreDir, storePathToFilePath)
 import Paths_nova_nix (getDataDir)
 import System.Directory (getCurrentDirectory, getTemporaryDirectory)
@@ -219,8 +220,11 @@ buildFile extraPaths dataDir filePath = do
           exitFailure
         Right val -> do
           (drv, drvSP) <- extractDerivation val
+          -- The full .drv closure (root + every transitive input) recorded
+          -- during evaluation; written to the store before building.
+          drvClosure <- readIORef (esDrvClosure st)
           store <- openStore platformStoreDir
-          buildResult <- buildAndRegister store drv drvSP
+          buildResult <- buildAndRegister store drvClosure drv drvSP
           closeStore store
           case buildResult of
             BuildSuccess sp ->
@@ -266,9 +270,14 @@ extractDerivation _ = do
 -- | Write the .drv file to the store and build with dependency resolution.
 -- The drvPath is the store path of the .drv file itself, extracted from
 -- the evaluation result alongside the Derivation struct.
-buildAndRegister :: Store -> Derivation -> StorePath -> IO BuildResult
-buildAndRegister store drv drvSP = do
-  -- Write the .drv file to store at its content-addressed path
+buildAndRegister :: Store -> Map.Map T.Text T.Text -> Derivation -> StorePath -> IO BuildResult
+buildAndRegister store drvClosure drv drvSP = do
+  -- Materialize the full input-.drv closure (every transitive dependency's
+  -- recipe) to the store.  buildWithDeps reads these back to construct the
+  -- dependency graph; without them it cannot realize any non-leaf derivation.
+  writeDrvClosure store drvClosure
+  -- Write the root .drv too (idempotent — it is also in the closure) so a build
+  -- still works if the closure was not captured (e.g. a pre-built store drv).
   writeDrv store drv drvSP
   -- Build with dependency resolution
   tmpDir <- getTemporaryDirectory
@@ -277,6 +286,17 @@ buildAndRegister store drv drvSP = do
           { bcTmpDir = tmpDir
           }
   buildWithDeps config store drv drvSP
+
+-- | Write every recorded @.drv@ ATerm (keyed by its store-path text) to the
+-- store.  Keys come from evaluation via 'storePathToText' so they always parse;
+-- an unparseable key is skipped defensively.
+writeDrvClosure :: Store -> Map.Map T.Text T.Text -> IO ()
+writeDrvClosure store = mapM_ writeOne . Map.toList
+  where
+    writeOne (pathText, aterm) =
+      case parseStorePath defaultStoreDir pathText of
+        Just sp -> writeDrvAterm store sp aterm
+        Nothing -> pure ()
 
 -- ---------------------------------------------------------------------------
 -- Output formatting

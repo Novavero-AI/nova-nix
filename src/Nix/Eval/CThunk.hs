@@ -81,7 +81,7 @@ where
 
 import Data.Int (Int64)
 import Data.Word (Word32, Word8)
-import Foreign.C.Types (CDouble (..))
+import Foreign.C.Types (CDouble (..), CInt (..))
 import Foreign.Ptr (Ptr, nullPtr)
 
 -- | Phantom type for C-side @nn_thunk_t@.
@@ -182,7 +182,7 @@ foreign import ccall unsafe "nn_thunk_get_lambda"
   c_nn_thunk_get_lambda :: CThunkPtr -> IO (Ptr ())
 
 foreign import ccall unsafe "nn_thunk_mark_blackhole"
-  c_nn_thunk_mark_blackhole :: CThunkPtr -> IO Int
+  c_nn_thunk_mark_blackhole :: CThunkPtr -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed"
   c_nn_thunk_set_computed :: CThunkPtr -> Ptr () -> IO (Ptr ())

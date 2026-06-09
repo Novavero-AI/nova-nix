@@ -4,7 +4,7 @@
 -- hold slot arrays, lazy scopes, parent pointers, and with-scopes.
 -- All memory is freed in bulk via 'cenvDestroy' at evaluation end.
 --
--- This moves Env records off the GHC heap.  Each @nn_env_t@ is 40
+-- This moves Env records off the GHC heap.  Each @nn_env_t@ is 48
 -- bytes (arena-allocated, zero GC overhead), replacing the former
 -- Haskell record (~80-100 bytes with GHC info pointers, Maybe
 -- constructors, and list cons cells per env).
@@ -44,6 +44,7 @@ module Nix.Eval.CEnv
 where
 
 import Data.Word (Word16, Word32)
+import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr)
 import Nix.Eval.CThunk (CThunkPtr)
 
@@ -109,7 +110,7 @@ foreign import ccall unsafe "nn_env_with_count"
   c_nn_env_with_count :: Ptr NnEnv -> IO Word16
 
 foreign import ccall unsafe "nn_env_lookup_resolved"
-  c_nn_env_lookup_resolved :: Ptr NnEnv -> Int -> Int -> IO CThunkPtr
+  c_nn_env_lookup_resolved :: Ptr NnEnv -> CInt -> CInt -> IO CThunkPtr
 
 foreign import ccall unsafe "nn_env_root_scope"
   c_nn_env_root_scope :: Ptr NnEnv -> IO (Ptr ())
@@ -205,7 +206,9 @@ cenvWithCount = c_nn_env_with_count
 -- | Resolved variable lookup: walk @level@ parent hops, then read
 -- @slots[idx]@.  Single FFI call — O(level) in C.
 cenvLookupResolved :: Ptr NnEnv -> Int -> Int -> IO CThunkPtr
-cenvLookupResolved = c_nn_env_lookup_resolved
+cenvLookupResolved env level idx =
+  -- C @int@ params: convert at the boundary (CInt), not HsInt (64-bit).
+  c_nn_env_lookup_resolved env (fromIntegral level) (fromIntegral idx)
 
 -- | Walk parent chain to root, return root's lazy scope (NULL if none).
 cenvRootScope :: Ptr NnEnv -> IO (Ptr ())

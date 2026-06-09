@@ -42,7 +42,8 @@ module Nix.Eval
 
     -- * Evaluation monad (re-exported from Types)
     MonadEval (..),
-    PureEval (..),
+    PureEval,
+    runPureEval,
 
     -- * Evaluation
     eval,
@@ -105,7 +106,7 @@ import Nix.Eval.Types
     EvalFormals (..),
     MonadEval (..),
     NixValue (..),
-    PureEval (..),
+    PureEval,
     StringContext (..),
     StringContextElement (..),
     Thunk (..),
@@ -144,6 +145,7 @@ import Nix.Eval.Types
     newCEnv,
     newMinimalEnv,
     readThunkValue,
+    runPureEval,
     thunkToCPtr,
     typeName,
     withScopesForCapture,
@@ -156,7 +158,7 @@ import Nix.Expr.Types
     NixAtom (..),
     UnaryOp (..),
   )
-import Nix.Hash (byteToHex, hashPlaceholder, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex)
+import Nix.Hash (bytesToHexText, hashPlaceholder, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex)
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
@@ -274,6 +276,8 @@ evalBytecode env bcIdx =
 decodeUnaryOp :: Word8 -> UnaryOp
 decodeUnaryOp 0 = OpNot
 decodeUnaryOp 1 = OpNegate
+-- Unreachable: the tag is written by Nix.Eval.Compile's encodeUnaryOp, which
+-- only emits 0 or 1.
 decodeUnaryOp n = error ("decodeUnaryOp: unknown tag " <> show n)
 
 -- | Decode a BinaryOp from bytecode flags.
@@ -293,6 +297,8 @@ decodeBinaryOp 11 = OpGt
 decodeBinaryOp 12 = OpGte
 decodeBinaryOp 13 = OpConcat
 decodeBinaryOp 14 = OpUpdate
+-- Unreachable: the tag is written by Nix.Eval.Compile's encodeBinaryOp, which
+-- only emits 0..14.
 decodeBinaryOp n = error ("decodeBinaryOp: unknown tag " <> show n)
 
 -- | Evaluate a binary operation from bytecode, with short-circuit
@@ -343,8 +349,8 @@ evalAddWithCoercion left right = case (left, right) of
 -- strings, and sets with @__toString@/@outPath@, coerce; numbers, booleans,
 -- null, lists, and functions are type errors.
 coerceAddOperand :: (MonadEval m) => NixValue -> m (Text, StringContext)
-coerceAddOperand v@(VStr {}) = coerceToString force applyValue v
-coerceAddOperand v@(VAttrs {}) = coerceToString force applyValue v
+coerceAddOperand v@(VStr {}) = coerceToString False force applyValue v
+coerceAddOperand v@(VAttrs {}) = coerceToString False force applyValue v
 coerceAddOperand v =
   throwEvalError ("cannot coerce " <> typeName v <> " to a string with the + operator")
 
@@ -1823,8 +1829,9 @@ builtinConcatStringsSep (VStr sep sepCtx) (VList cl) = do
   where
     forceToStrCtx thunk = do
       val <- force thunk
-      -- Nix coerces list elements to strings (paths, derivations, etc.)
-      coerceToString force applyValue val
+      -- Nix coerces list elements to strings (paths, derivations, etc.).
+      -- concatStringsSep is strict (coerceMore=False): non-string scalars error.
+      coerceToString False force applyValue val
 builtinConcatStringsSep (VStr _ _) other =
   throwEvalError ("builtins.concatStringsSep: expected a list, got " <> typeName other)
 builtinConcatStringsSep other _ =
@@ -1851,16 +1858,18 @@ foldlStrict op acc (thunk : rest) = do
   foldlStrict op stepped rest
 
 builtinSubstring :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
-builtinSubstring (VInt start) (VInt len) (VStr s ctx) =
-  let clampedStart = max 0 (fromIntegral start)
-      -- Nix clamps len to available length (negative len means rest of string)
-      available = T.length s - clampedStart
-      clampedLen =
-        if len < 0
-          then available
-          else min (fromIntegral len) available
-   in -- Context is preserved through substring (matching real Nix).
-      pure (VStr (T.take clampedLen (T.drop clampedStart s)) ctx)
+builtinSubstring (VInt start) (VInt len) (VStr s ctx)
+  | start < 0 = throwEvalError "builtins.substring: negative start position"
+  | otherwise =
+      let startPos = fromIntegral start
+          -- Nix clamps len to available length (negative len means rest of string)
+          available = T.length s - startPos
+          clampedLen =
+            if len < 0
+              then available
+              else min (fromIntegral len) available
+       in -- Context is preserved through substring (matching real Nix).
+          pure (VStr (T.take clampedLen (T.drop startPos s)) ctx)
 builtinSubstring _ _ (VStr _ _) =
   throwEvalError "builtins.substring: start and length must be integers"
 builtinSubstring _ _ other =
@@ -1901,7 +1910,7 @@ coerceToStringPermissive (VList cl) = do
     coerceThunk thunk = do
       val <- force thunk
       coerceToStringPermissive val
-coerceToStringPermissive other = coerceToString force applyValue other
+coerceToStringPermissive other = coerceToString True force applyValue other
 
 -- | Coerce a value to a string for a DERIVATION field (an env value or an
 -- arg).  Like 'coerceToStringPermissive', but a path literal is copied into
@@ -1930,7 +1939,7 @@ coerceToStringInterp (VPath p) = do
   case parseStorePath defaultStoreDir spText of
     Just sp -> pure (spText, StringContext (Set.singleton (SCPlain sp)))
     Nothing -> pure (spText, mempty)
-coerceToStringInterp other = coerceToString force applyValue other
+coerceToStringInterp other = coerceToString False force applyValue other
 
 -- | The current system platform string.
 currentSystemStr :: Text
@@ -2427,7 +2436,10 @@ matchWithCompiled compiled str =
           let groups = Array.elems match
               -- Skip index 0 (full match) — return only capture groups.
               captureGroups = drop 1 groups
-              toThunk (s, _) = evaluated (mkStr (T.pack s))
+              -- A non-participating capture group has offset (-1); C++ Nix
+              -- yields null for it, not the empty string.
+              toThunk (s, (off, _)) =
+                if off < 0 then evaluated VNull else evaluated (mkStr (T.pack s))
            in pure (VList (clistFromThunks (map (thunkToCPtr . toThunk) captureGroups)))
 
 -- | @builtins.split regex str@: split a string by a POSIX ERE.
@@ -2471,7 +2483,9 @@ buildSplitResult remaining pos (match : rest) =
       before = T.pack (take (matchStart - pos) (drop pos remaining))
       -- Capture groups (indices 1..)
       groups = drop 1 (Array.elems match)
-      groupThunks = map (\(s, _) -> evaluated (mkStr (T.pack s))) groups
+      -- A non-participating capture group has offset (-1) → null (as 'match').
+      groupThunks =
+        map (\(s, (off, _)) -> if off < 0 then evaluated VNull else evaluated (mkStr (T.pack s))) groups
       -- Continue after this match
       afterPos = matchStart + matchLen
    in evaluated (mkStr before)
@@ -2625,20 +2639,19 @@ valueToJSON (VList cl) = do
       ctx = mconcat (map snd results)
   pure ("[" <> T.intercalate "," jsonVals <> "]", ctx)
 valueToJSON (VAttrs attrs) =
-  -- Derivation-like attrsets (with outPath) coerce to string in toJSON,
-  -- matching C++ Nix behavior.
-  case attrSetLookup "outPath" attrs of
-    Just outThunk -> do
-      outVal <- force outThunk
-      (s, ctx) <- coerceToString force applyValue outVal
-      pure (jsonEscapeString s, ctx)
-    Nothing -> do
+  -- C++ Nix serializes an attrset via __toString first, then outPath, and only
+  -- falls back to an object when neither is present.
+  case (attrSetLookup "__toString" attrs, attrSetLookup "outPath" attrs) of
+    (Nothing, Nothing) -> do
       let m = attrSetToMap attrs
           sortedKeys = Map.keys m
       results <- mapM (jsonPair m) sortedKeys
       let pairs = map fst results
           ctx = mconcat (map snd results)
       pure ("{" <> T.intercalate "," pairs <> "}", ctx)
+    _ -> do
+      (s, ctx) <- coerceToString True force applyValue (VAttrs attrs)
+      pure (jsonEscapeString s, ctx)
   where
     jsonPair attrMap key = case Map.lookup key attrMap of
       Nothing -> pure ("", emptyContext)
@@ -2813,9 +2826,7 @@ builtinHashString other _ =
   throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
 
 digestToHex :: (BA.ByteArrayAccess a) => a -> Text
-digestToHex digest =
-  let bytes = BA.unpack digest
-   in T.pack (concatMap byteToHex bytes)
+digestToHex = bytesToHexText . BA.convert
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations — deep evaluation
@@ -3172,7 +3183,7 @@ forceAttrStr builtin key attrs =
     Nothing -> throwEvalError (builtin <> ": missing required attribute '" <> key <> "'")
     Just thunk -> do
       val <- force thunk
-      result <- catchEvalError (coerceToString force applyValue val)
+      result <- catchEvalError (coerceToString True force applyValue val)
       case result of
         Right (s, _ctx) -> pure s
         Left _ -> throwEvalError (builtin <> ": '" <> key <> "' must be a string")
@@ -3184,7 +3195,7 @@ forceOptionalAttrStr attrs key =
     Nothing -> pure Nothing
     Just thunk -> do
       val <- force thunk
-      result <- catchEvalError (coerceToString force applyValue val)
+      result <- catchEvalError (coerceToString True force applyValue val)
       case result of
         Right (s, _ctx) -> pure (Just s)
         Left _ -> pure Nothing
@@ -3282,7 +3293,7 @@ builtinDerivationStrict (VAttrs attrs) = do
       let foPath = makeFixedOutputPath drvName foAlgo foMode foDigest
           foPathText = storePathToText defaultStoreDir foPath
           algoField = (if foMode == "recursive" then "r:" else "") <> foAlgo
-          foHashHex = bytesToHex foDigest
+          foHashHex = bytesToHexText foDigest
           foModulo =
             sha256Digest
               (TE.encodeUtf8 ("fixed:out:" <> algoField <> ":" <> foHashHex <> ":" <> foPathText))
@@ -3292,7 +3303,7 @@ builtinDerivationStrict (VAttrs attrs) = do
               (Map.insert "out" foPathText baseEnv)
           drvSp = makeTextPath drvFileName (sha256Digest (TE.encodeUtf8 (toATerm contents))) drvRefs
           drvText = storePathToText defaultStoreDir drvSp
-      cacheDrvHash drvText (bytesToHex foModulo)
+      cacheDrvHash drvText (bytesToHexText foModulo)
       pure (drvText, drvSp, [("out", foPathText)], contents)
     Nothing -> do
       inputSubst <- mapM resolveInputModulo (Map.toList inputDrvs)
@@ -3309,8 +3320,14 @@ builtinDerivationStrict (VAttrs attrs) = do
           moduloUnmasked = sha256Digest (TE.encodeUtf8 (toATermForHash False (Just inputSubst) contents))
           drvSp = makeTextPath drvFileName (sha256Digest (TE.encodeUtf8 (toATerm contents))) drvRefs
           drvText = storePathToText defaultStoreDir drvSp
-      cacheDrvHash drvText (bytesToHex moduloUnmasked)
+      cacheDrvHash drvText (bytesToHexText moduloUnmasked)
       pure (drvText, drvSp, outPathTexts, contents)
+
+  -- Record this derivation's full .drv ATerm (the exact bytes whose hash is its
+  -- store path) so the build driver can materialize the entire input-.drv
+  -- closure before building.  Bottom-up eval guarantees every transitive input
+  -- is recorded by the time a dependent is.
+  recordDrvAterm drvPathText (toATerm completeDrv)
 
   let mainOutPath = case outPaths of
         ((_, p) : _) -> p
@@ -3450,7 +3467,7 @@ builtinDerivationLazy other =
 forceToText :: (MonadEval m) => Thunk -> m Text
 forceToText thunk = do
   val <- force thunk
-  (s, _ctx) <- coerceToString force applyValue val
+  (s, _ctx) <- coerceToString True force applyValue val
   pure s
 
 -- | Collect all string-coercible attributes for the derivation environment,
@@ -3524,7 +3541,7 @@ builtinConvertHash (VAttrs attrs) = do
   (algo, rawBytes) <- decodeHashInput attrs hashVal
   -- Encode to target format
   case toFmt of
-    "base16" -> pure (mkStr (bytesToHex rawBytes))
+    "base16" -> pure (mkStr (bytesToHexText rawBytes))
     "nix32" -> pure (mkStr (Nix32.encode rawBytes))
     "base32" -> pure (mkStr (Nix32.encode rawBytes)) -- deprecated alias
     "base64" -> pure (mkStr (bytesToBase64 rawBytes))
@@ -3581,10 +3598,6 @@ requireStrAttr ctx key attrs = case attrSetLookup key attrs of
       VStr s _ -> pure s
       _ -> throwEvalError ("builtins." <> ctx <> ": " <> key <> " must be a string")
   Nothing -> throwEvalError ("builtins." <> ctx <> ": missing required attribute '" <> key <> "'")
-
--- | Encode bytes to base16 hex.
-bytesToHex :: BS.ByteString -> Text
-bytesToHex = T.pack . concatMap byteToHex . BS.unpack
 
 -- ---------------------------------------------------------------------------
 -- Base64 encode/decode — delegates to nova-cache (base64-bytestring under the hood)
