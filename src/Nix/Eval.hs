@@ -156,7 +156,7 @@ import Nix.Expr.Types
     NixAtom (..),
     UnaryOp (..),
   )
-import Nix.Hash (byteToHex, hashPlaceholder, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex)
+import Nix.Hash (byteToHex, hashPlaceholder, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex)
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
@@ -3585,18 +3585,6 @@ requireStrAttr ctx key attrs = case attrSetLookup key attrs of
 -- | Encode bytes to base16 hex.
 bytesToHex :: BS.ByteString -> Text
 bytesToHex = T.pack . concatMap byteToHex . BS.unpack
-
--- | Decode hex string to bytes.
-hexToBytes :: Text -> Maybe BS.ByteString
-hexToBytes t
-  | T.null t = Just BS.empty
-  | odd (T.length t) = Nothing
-  | T.all isHexDigit t = Just (BS.pack (go (T.unpack t)))
-  | otherwise = Nothing
-  where
-    go [] = []
-    go (hi : lo : rest) = fromIntegral (digitToInt hi * 16 + digitToInt lo) : go rest
-    go [_] = [] -- unreachable due to odd check
 
 -- ---------------------------------------------------------------------------
 -- Base64 encode/decode — delegates to nova-cache (base64-bytestring under the hood)

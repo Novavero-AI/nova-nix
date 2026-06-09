@@ -44,15 +44,21 @@ where
 
 import Control.Exception (SomeException, try)
 import Control.Monad (filterM, when)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as LBS
 import Data.Char (toLower)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import qualified Network.HTTP.Client as HTTP
+import qualified Network.HTTP.Client.TLS as HTTPS
+import qualified Network.HTTP.Types.Status as HTTP
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
+import Nix.Hash (bytesToHexText, hexToBytes, rawHashWithAlgo)
 import Nix.Store (Store (..), addToStore, isValid, scanReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
@@ -84,6 +90,21 @@ envNixStore = "NIX_STORE"
 -- | Environment variable for PATH.
 envPath :: Text
 envPath = "PATH"
+
+-- | The magic builder string for the built-in URL fetcher.  A derivation with
+-- this builder is not executed as a process — the Builder downloads its @url@
+-- and verifies it against @outputHash@ (see 'runBuiltinFetchurl').
+builtinFetchurlBuilder :: Text
+builtinFetchurlBuilder = "builtin:fetchurl"
+
+-- | Derivation environment keys read by @builtin:fetchurl@.
+envUrl, envOut :: Text
+envUrl = "url"
+envOut = "out"
+
+-- | HTTP success status code.
+httpStatusOk :: Int
+httpStatusOk = 200
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -171,7 +192,12 @@ buildDerivationInner config store drv = do
 
           -- 5. Run the builder
           builderArgs = map T.unpack (drvArgs drv)
-      exitResult <- runBuilder builderPath builderArgs environ buildDir
+      -- A "builtin:" builder (e.g. builtin:fetchurl) is handled in-process;
+      -- everything else is a normal subprocess.  The output validation and
+      -- registration below are shared by both paths.
+      exitResult <- case drvBuilder drv of
+        b | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
+        _ -> runBuilder builderPath builderArgs environ buildDir
       case exitResult of
         Left (exitCode, stderrText) -> do
           -- 6. Failure: clean up
@@ -372,6 +398,93 @@ extractCmdString _ = Nothing
 -- | Whether we are running on Windows (compile-time constant via 'System.Info').
 isWindows :: Bool
 isWindows = System.Info.os == "mingw32"
+
+-- ---------------------------------------------------------------------------
+-- Built-in fetcher (builtin:fetchurl)
+-- ---------------------------------------------------------------------------
+
+-- | Run a @builtin:fetchurl@ derivation: download its @url@ into @$out@ and
+-- verify the bytes against the derivation's @outputHash@.  Nix's bootstrap
+-- fetcher is baked into the binary because nothing can be fetched before a
+-- fetcher exists.  Returns the same @Either (exit, msg) ()@ shape as
+-- 'runBuilder', so the shared output-registration path is reused unchanged.
+runBuiltinFetchurl :: Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
+runBuiltinFetchurl drv outputDirs =
+  case (Map.lookup envUrl (drvEnv drv), lookup envOut outputDirs, fixedOutput) of
+    (Nothing, _, _) -> pure (Left (1, "builtin:fetchurl: derivation has no 'url'"))
+    (_, Nothing, _) -> pure (Left (1, "builtin:fetchurl: derivation defines no 'out' output"))
+    (_, _, Nothing) -> pure (Left (1, "builtin:fetchurl: 'out' output has no fixed-output hash"))
+    (Just url, Just outPath, Just out) -> do
+      downloaded <- downloadUrl url
+      case downloaded of
+        Left err -> pure (Left (1, "builtin:fetchurl: " <> err))
+        Right body -> do
+          BS.writeFile outPath body
+          pure (verifyFetchHash url out body)
+  where
+    -- builtin:fetchurl derivations are always fixed-output; the expected hash
+    -- lives in the canonical output spec (doHashAlgo + doHash), not the env.
+    fixedOutput = case drvOutputs drv of
+      (out : _) | not (T.null (doHashAlgo out)) -> Just out
+      _ -> Nothing
+
+-- | Download a URL to a strict 'BS.ByteString' using nova-nix's own linked
+-- HTTP client (the same 'Network.HTTP.Client' the substituter uses) — no
+-- external @curl@, which is what makes this a genuine builtin.  Any network
+-- exception is turned into a 'Left' so it becomes a clean build failure.
+downloadUrl :: Text -> IO (Either Text BS.ByteString)
+downloadUrl url = do
+  attempt <- try fetch
+  pure $ case attempt of
+    Left (e :: SomeException) -> Left ("download error: " <> T.pack (show e))
+    Right result -> result
+  where
+    fetch :: IO (Either Text BS.ByteString)
+    fetch = do
+      manager <- HTTP.newManager HTTPS.tlsManagerSettings
+      request <- HTTP.parseRequest (T.unpack url)
+      response <- HTTP.httpLbs request manager
+      pure (bodyOrError response)
+    bodyOrError response
+      | code == httpStatusOk = Right (LBS.toStrict (HTTP.responseBody response))
+      | otherwise = Left ("HTTP " <> T.pack (show code) <> " fetching " <> url)
+      where
+        code = HTTP.statusCode (HTTP.responseStatus response)
+
+-- | Verify the fetched bytes against the derivation's fixed-output hash, read
+-- from the canonical output spec.  @doHashAlgo@ is @sha256@/@sha512@/… (or
+-- @r:sha256@ for recursive); @doHash@ is the base-16 digest eval normalized the
+-- user's hash into.  Flat mode is fully supported across algorithms; recursive
+-- (unpack/executable) fetches are a separate feature — they require unpacking
+-- the download — and fail with a clear message rather than a wrong result.
+verifyFetchHash :: Text -> DerivationOutput -> BS.ByteString -> Either (Int, Text) ()
+verifyFetchHash url out body
+  | recursive =
+      Left (1, "builtin:fetchurl: recursive outputHashMode (unpack/executable) not yet supported; fetch flat and unpack in a build phase")
+  | otherwise = case (hexToBytes (doHash out), rawHashWithAlgo algo body) of
+      (Nothing, _) -> Left (1, "builtin:fetchurl: malformed expected hash for " <> url)
+      (_, Nothing) -> Left (1, "builtin:fetchurl: unsupported hash algorithm '" <> algo <> "'")
+      (Just expected, Just got)
+        | expected == got -> Right ()
+        | otherwise ->
+            Left
+              ( 1,
+                "builtin:fetchurl: hash mismatch for "
+                  <> url
+                  <> "\n  expected: "
+                  <> algoField
+                  <> ":"
+                  <> doHash out
+                  <> "\n  got:      "
+                  <> algoField
+                  <> ":"
+                  <> bytesToHexText got
+              )
+  where
+    algoField = doHashAlgo out
+    (recursive, algo) = case T.stripPrefix "r:" algoField of
+      Just rest -> (True, rest)
+      Nothing -> (False, algoField)
 
 -- ---------------------------------------------------------------------------
 -- Output registration

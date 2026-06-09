@@ -39,6 +39,8 @@ module Nix.Hash
     truncatedBase32,
     hashPlaceholder,
     byteToHex,
+    hexToBytes,
+    rawHashWithAlgo,
 
     -- * Store path construction (Nix @makeStorePath@ family)
     makeStorePath,
@@ -60,6 +62,7 @@ import qualified Crypto.Hash as CH
 import Data.Bits (xor)
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
+import Data.Char (digitToInt, isHexDigit)
 import Data.List (foldl')
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -153,6 +156,32 @@ sha256Digest bs = BA.convert (CH.hash bs :: CH.Digest CH.SHA256)
 -- | Lowercase base-16 of raw bytes (two hex characters per byte).
 bytesToHexText :: BS.ByteString -> Text
 bytesToHexText = T.pack . concatMap byteToHex . BS.unpack
+
+-- | Decode a lowercase/uppercase base-16 string to raw bytes.  Returns
+-- 'Nothing' for odd length or non-hex characters.  This is the canonical
+-- form a @.drv@ stores a fixed-output hash in, so the builder reads it back
+-- with this rather than re-parsing the user's original SRI/base32 string.
+hexToBytes :: Text -> Maybe BS.ByteString
+hexToBytes t
+  | T.null t = Just BS.empty
+  | odd (T.length t) = Nothing
+  | T.all isHexDigit t = Just (BS.pack (pairs (T.unpack t)))
+  | otherwise = Nothing
+  where
+    pairs [] = []
+    pairs (hi : lo : rest) = fromIntegral (digitToInt hi * 16 + digitToInt lo) : pairs rest
+    pairs [_] = [] -- unreachable: even length checked above
+
+-- | Raw digest of a 'BS.ByteString' under a named algorithm (@sha256@,
+-- @sha512@, @sha1@, @md5@).  Returns 'Nothing' for an unknown algorithm.
+-- Used to verify a fixed-output fetch against its declared @outputHashAlgo@.
+rawHashWithAlgo :: Text -> BS.ByteString -> Maybe BS.ByteString
+rawHashWithAlgo algo bytes = case algo of
+  "sha256" -> Just (BA.convert (CH.hash bytes :: CH.Digest CH.SHA256))
+  "sha512" -> Just (BA.convert (CH.hash bytes :: CH.Digest CH.SHA512))
+  "sha1" -> Just (BA.convert (CH.hash bytes :: CH.Digest CH.SHA1))
+  "md5" -> Just (BA.convert (CH.hash bytes :: CH.Digest CH.MD5))
+  _ -> Nothing
 
 -- | The core store-path construction primitive.  Given a @type@ string, the
 -- inner content digest (raw SHA-256 bytes), and a name, produce the store
