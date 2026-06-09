@@ -22,7 +22,7 @@
 -- @\/nix\/store\/.nova-nix\/db.sqlite@ (or @C:\\nix\\store\\.nova-nix\\db.sqlite@).
 module Nix.Store.DB
   ( -- * Database handle
-    StoreDB (..),
+    StoreDB,
 
     -- * Types
     PathRegistration (..),
@@ -34,6 +34,7 @@ module Nix.Store.DB
 
     -- * Registration
     registerPath,
+    registerPaths,
     isValidPath,
     queryReferences,
     queryDeriver,
@@ -159,26 +160,46 @@ closeStoreDB db = close (sdbConn db)
 -- Registration
 -- ---------------------------------------------------------------------------
 
--- | Register a store path as valid with its metadata and references.
--- Uses a transaction for atomicity.  Idempotent — re-registering an
--- existing path is a no-op (INSERT OR IGNORE).
+-- | Register a single store path as valid with its metadata and references.
+-- A convenience wrapper over 'registerPaths' for one path.
 registerPath :: StoreDB -> PathRegistration -> IO ()
-registerPath db reg = withTransaction (sdbConn db) $ do
+registerPath db reg = registerPaths db [reg]
+
+-- | Register several store paths as valid in one transaction.
+--
+-- ALL path rows are inserted BEFORE any reference edge, so references among the
+-- paths in this batch — e.g. intra-derivation cross-output references — are
+-- never dropped.  (Registering one path at a time loses an edge whenever a
+-- referrer is registered before its referent.)
+--
+-- Re-registering an existing path refreshes its metadata (NAR hash, size,
+-- deriver) via @ON CONFLICT DO UPDATE@, so a path first registered with a
+-- placeholder hash is corrected on a later real registration.
+registerPaths :: StoreDB -> [PathRegistration] -> IO ()
+registerPaths db regs = withTransaction (sdbConn db) $ do
+  mapM_ (insertPathRow db) regs
+  mapM_ (insertPathRefs db) regs
+
+-- | Insert (or refresh) a single ValidPaths row.
+insertPathRow :: StoreDB -> PathRegistration -> IO ()
+insertPathRow db reg = do
+  let pathText = T.pack (storePathToFilePath (sdbDir db) (prPath reg))
+  execute
+    (sdbConn db)
+    "INSERT INTO ValidPaths (path, hash, registrationTime, deriver, narSize) \
+    \VALUES (?, ?, strftime('%s','now'), ?, ?) \
+    \ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, narSize = excluded.narSize, deriver = excluded.deriver"
+    (pathText, prNarHash reg, prDeriver reg, prNarSize reg)
+
+-- | Insert the reference edges for a path whose row already exists.
+insertPathRefs :: StoreDB -> PathRegistration -> IO ()
+insertPathRefs db reg = do
   let conn = sdbConn db
       pathText = T.pack (storePathToFilePath (sdbDir db) (prPath reg))
-  -- Insert the path (skip if already present)
-  execute
-    conn
-    "INSERT OR IGNORE INTO ValidPaths (path, hash, registrationTime, deriver, narSize) \
-    \VALUES (?, ?, strftime('%s','now'), ?, ?)"
-    (pathText, prNarHash reg, prDeriver reg, prNarSize reg)
-  -- Lookup the referrer's id
   referrerRows <- query conn "SELECT id FROM ValidPaths WHERE path = ?" (Only pathText) :: IO [Only Int]
   case referrerRows of
-    (Only referrerId : _) -> do
-      -- Insert references
-      mapM_ (insertRef conn referrerId) (prReferences reg)
-    [] -> pure () -- Should not happen after INSERT OR IGNORE
+    (Only referrerId : _) -> mapM_ (insertRef conn referrerId) (prReferences reg)
+    [] -> pure () -- Should not happen: the row was just inserted above.
   where
     insertRef conn referrerId refPath = do
       let refPathText = T.pack (storePathToFilePath (sdbDir db) refPath)
@@ -186,7 +207,7 @@ registerPath db reg = withTransaction (sdbConn db) $ do
       case refRows of
         (Only refId : _) ->
           execute conn "INSERT OR IGNORE INTO Refs (referrer, reference) VALUES (?, ?)" (referrerId, refId)
-        [] -> pure () -- Reference not yet registered — skip
+        [] -> pure () -- Reference not in this batch or the store yet — skip.
 
 -- ---------------------------------------------------------------------------
 -- Queries

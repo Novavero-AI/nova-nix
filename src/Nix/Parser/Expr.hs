@@ -7,7 +7,11 @@
 -- ! / + - / * \\/ / ++ / ? / negate / application / selection
 -- @
 --
--- Matches the C++ Nix parser (parser.y) precedence exactly.
+-- Close to the C++ Nix parser (parser.y), with two inert deviations: here
+-- @++@ binds looser than multiplication\/addition (parser.y binds it tighter)
+-- and unary negate binds looser than @?@ (parser.y makes negate tightest).
+-- Both only affect mixed expressions that are type errors regardless, so no
+-- program that type-checks parses differently.
 -- Entirely pure. No IO, no Megaparsec, no Parsec.
 module Nix.Parser.Expr
   ( -- * Entry point

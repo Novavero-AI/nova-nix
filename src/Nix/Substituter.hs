@@ -42,6 +42,8 @@ module Nix.Substituter
     -- * Pure helpers (exported for testing)
     sortCaches,
     verifySigs,
+    verifyNarHash,
+    narInfoMatchesPath,
     decompressNar,
     unpackNarEntry,
     parseReferences,
@@ -62,7 +64,8 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Store (Store (..), setReadOnly)
 import Nix.Store.DB (PathRegistration (..), registerPath)
-import Nix.Store.Path (StoreDir, StorePath (..), parseStorePath, storePathToFilePath)
+import Nix.Store.Path (StoreDir, StorePath (..), parseStorePath, storePathHashLen, storePathToFilePath)
+import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
@@ -116,7 +119,9 @@ data SubstResult
 trySubstitute :: Store -> [CacheConfig] -> StorePath -> IO SubstResult
 trySubstitute _ [] _ = pure SubstNotFound
 trySubstitute store caches sp = do
-  manager <- HTTPS.newTlsManager
+  -- Reuse the process-global TLS manager (connection pooling / keep-alive)
+  -- rather than creating a fresh one per call and per output.
+  manager <- HTTPS.getGlobalManager
   tryCaches manager (sortCaches caches) sp
   where
     tryCaches _ [] _ = pure SubstNotFound
@@ -145,15 +150,28 @@ substituteFromCache mgr store cache sp = do
   narInfoResult <- fetchNarInfo mgr cache sp
   case narInfoResult of
     Left notFoundOrErr -> pure notFoundOrErr
-    Right narInfo -> do
-      -- 2–4. Verify, download, decompress (pure pipeline after fetch)
-      case verifyAndDecompress cache mgr narInfo of
-        Left err -> pure (SubstError err)
-        Right fetchDecompress -> do
-          narBytes <- fetchDecompress
-          case narBytes of
+    Right narInfo
+      -- 1b. The served narinfo must describe the requested path.  A
+      -- misconfigured or hostile cache could return a validly-signed narinfo
+      -- for a DIFFERENT path under this hash's URL.
+      | not (narInfoMatchesPath sp narInfo) ->
+          pure
+            ( SubstError
+                ( "narinfo identity mismatch: requested "
+                    <> spHash sp
+                    <> ", narinfo names "
+                    <> NarInfo.niStorePath narInfo
+                )
+            )
+      | otherwise ->
+          -- 2–4. Verify, download, decompress (pure pipeline after fetch)
+          case verifyAndDecompress cache mgr narInfo of
             Left err -> pure (SubstError err)
-            Right rawNar -> unpackAndRegister store sp narInfo rawNar
+            Right fetchDecompress -> do
+              narBytes <- fetchDecompress
+              case narBytes of
+                Left err -> pure (SubstError err)
+                Right rawNar -> unpackAndRegister store sp narInfo rawNar
 
 -- | Pure pipeline: verify signature, then produce an IO action
 -- that downloads and decompresses.
@@ -169,28 +187,72 @@ verifyAndDecompress cache mgr narInfo = do
     downloaded <- downloadNar mgr cache narInfo
     pure $ downloaded >>= decompressNar compression
 
--- | Deserialize a NAR, unpack to the store, set permissions, and register.
+-- | Verify the NAR hash, deserialize, unpack to the store, set permissions,
+-- and register.
 unpackAndRegister :: Store -> StorePath -> NarInfo.NarInfo -> BS.ByteString -> IO SubstResult
 unpackAndRegister store sp narInfo rawNar =
-  case NAR.deserialise rawNar of
-    Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
-    Right narEntry -> do
-      let destPath = storePathToFilePath (stDir store) sp
-      unpackResult <- try (unpackNarEntry destPath narEntry)
-      case (unpackResult :: Either SomeException ()) of
-        Left err -> pure (SubstError ("unpack failed: " <> T.pack (show err)))
-        Right () -> do
-          setReadOnly destPath
-          registerPath
-            (stDB store)
-            PathRegistration
-              { prPath = sp,
-                prNarHash = NarInfo.niNarHash narInfo,
-                prNarSize = fromInteger (NarInfo.niNarSize narInfo),
-                prDeriver = NarInfo.niDeriver narInfo,
-                prReferences = parseReferences (stDir store) (NarInfo.niReferences narInfo)
-              }
-          pure (SubstSuccess sp)
+  -- Verify the downloaded NAR's hash matches the (signed) narinfo BEFORE
+  -- trusting its bytes.  The NAR hash is the content-addressed integrity
+  -- contract; the signature only attests to the narinfo, not the body, so
+  -- network corruption or a compromised cache must be caught here.
+  case verifyNarHash narInfo rawNar of
+    Left err -> pure (SubstError err)
+    Right () -> case NAR.deserialise rawNar of
+      Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
+      Right narEntry -> do
+        let destPath = storePathToFilePath (stDir store) sp
+        unpackResult <- try (unpackNarEntry destPath narEntry)
+        case (unpackResult :: Either SomeException (Either Text ())) of
+          Left err -> pure (SubstError ("unpack failed: " <> T.pack (show err)))
+          Right (Left err) -> pure (SubstError ("unpack failed: " <> err))
+          Right (Right ()) -> do
+            setReadOnly destPath
+            registerPath
+              (stDB store)
+              PathRegistration
+                { prPath = sp,
+                  prNarHash = NarInfo.niNarHash narInfo,
+                  prNarSize = fromInteger (NarInfo.niNarSize narInfo),
+                  prDeriver = NarInfo.niDeriver narInfo,
+                  prReferences = parseReferences (stDir store) (NarInfo.niReferences narInfo)
+                }
+            pure (SubstSuccess sp)
+
+-- | Verify that the downloaded NAR bytes hash to the narinfo's declared
+-- NarHash.  Compares decoded hash bytes, so any valid encoding of the digest
+-- validates; @prNarHash@ stays sourced from the (now-verified) narinfo.
+verifyNarHash :: NarInfo.NarInfo -> BS.ByteString -> Either Text ()
+verifyNarHash narInfo rawNar =
+  case Hash.parseNixHash (NarInfo.niNarHash narInfo) of
+    Left err -> Left ("invalid narinfo NarHash: " <> T.pack err)
+    Right declared
+      | declared == actual -> Right ()
+      | otherwise ->
+          Left
+            ( "NAR hash mismatch: narinfo declares "
+                <> NarInfo.niNarHash narInfo
+                <> " but downloaded bytes hash to "
+                <> Hash.formatNixHash actual
+            )
+  where
+    actual = Hash.hashBytes rawNar
+
+-- | Whether a served narinfo describes the requested path: the hash component
+-- of its declared StorePath must equal the requested path's hash.  Only the
+-- hash is compared, since the cache may use a different store directory.
+narInfoMatchesPath :: StorePath -> NarInfo.NarInfo -> Bool
+narInfoMatchesPath sp narInfo =
+  storePathHashOf (NarInfo.niStorePath narInfo) == Just (spHash sp)
+
+-- | Extract the leading hash from a full store path's basename, if well-formed
+-- (@\<hash\>-\<name\>@ with a hash of the expected length).
+storePathHashOf :: Text -> Maybe Text
+storePathHashOf path =
+  let base = T.takeWhileEnd (\c -> c /= '/' && c /= '\\') path
+      (hashPart, rest) = T.splitAt storePathHashLen base
+   in if T.length hashPart == storePathHashLen && T.isPrefixOf "-" rest
+        then Just hashPart
+        else Nothing
 
 -- ---------------------------------------------------------------------------
 -- HTTP fetching
@@ -221,6 +283,10 @@ fetchNarInfo mgr cache sp = do
         else pure (Left (SubstError ("narinfo fetch failed: HTTP " <> T.pack (show code))))
 
 -- | Download the NAR file referenced by a narinfo.
+--
+-- The whole NAR is realized in memory (nova-cache's 'NAR.deserialise' consumes
+-- a strict 'BS.ByteString'), so a very large path briefly spikes RSS.  Streaming
+-- would need a streaming NAR parser that nova-cache does not yet provide.
 downloadNar :: HTTP.Manager -> CacheConfig -> NarInfo.NarInfo -> IO (Either Text BS.ByteString)
 downloadNar mgr cache narInfo = do
   let narUrl = T.unpack (ccUrl cache) <> "/" <> T.unpack (NarInfo.niUrl narInfo)
@@ -273,8 +339,10 @@ parseReferences storeDir refs =
 -- NAR unpacking
 -- ---------------------------------------------------------------------------
 
--- | Unpack a NarEntry tree to a filesystem destination.
-unpackNarEntry :: FilePath -> NAR.NarEntry -> IO ()
+-- | Unpack a NarEntry tree to a filesystem destination.  Returns @Left@ on an
+-- unsafe entry name (path traversal); these come from untrusted cache data, so
+-- a typed failure is used instead of a partial 'error'.
+unpackNarEntry :: FilePath -> NAR.NarEntry -> IO (Either Text ())
 unpackNarEntry path entry = case entry of
   NAR.NarRegular isExec contents -> do
     createDirectoryIfMissing True (takeDirectory path)
@@ -282,24 +350,33 @@ unpackNarEntry path entry = case entry of
     when isExec $ do
       perms <- Dir.getPermissions path
       setPermissions path (Dir.setOwnerExecutable True perms)
+    pure (Right ())
   NAR.NarSymlink target -> do
     createDirectoryIfMissing True (takeDirectory path)
     -- On Windows, symlinks require elevated permissions.
     -- Fall back to writing the target as a text file.
     result <- try (Dir.createFileLink (T.unpack target) path)
     case result of
-      Right () -> pure ()
-      Left (_ :: SomeException) ->
+      Right () -> pure (Right ())
+      Left (_ :: SomeException) -> do
         writeFile path (T.unpack target)
+        pure (Right ())
   NAR.NarDirectory entries -> do
     createDirectoryIfMissing True path
-    mapM_
-      ( \(name, child) ->
-          if isSafeNarName name
-            then unpackNarEntry (path </> T.unpack name) child
-            else error ("unpackNarEntry: unsafe directory entry name: " <> T.unpack name)
-      )
-      entries
+    unpackChildren path entries
+
+-- | Unpack directory children, short-circuiting with a typed failure on the
+-- first unsafe entry name rather than crashing on untrusted input.
+unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text ())
+unpackChildren _ [] = pure (Right ())
+unpackChildren path ((name, child) : rest)
+  | not (isSafeNarName name) =
+      pure (Left ("unsafe NAR directory entry name: " <> name))
+  | otherwise = do
+      result <- unpackNarEntry (path </> T.unpack name) child
+      case result of
+        Left err -> pure (Left err)
+        Right () -> unpackChildren path rest
 
 -- | Validate that a NAR entry name is safe (no path traversal).
 isSafeNarName :: Text -> Bool

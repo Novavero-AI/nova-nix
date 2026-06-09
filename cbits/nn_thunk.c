@@ -530,3 +530,45 @@ nn_thunk_get(uint32_t index)
     }
     return NULL;  /* unreachable if index < total */
 }
+
+/* --- Bulk StablePtr collection (single block-list pass, O(total)) --- */
+
+uint32_t
+nn_thunk_count_stableptrs(void)
+{
+    uint32_t count = 0;
+    struct nn_thunk_block *block;
+    uint32_t i;
+    if (!g_arena) return 0;
+    for (block = g_arena->head; block; block = block->next) {
+        for (i = 0; i < block->count; i++) {
+            const nn_thunk_t *t = &block->slots[i];
+            if (t->state == NN_THUNK_PENDING || t->state == NN_THUNK_BLACKHOLE) {
+                if (t->payload) count++;
+            } else if (t->state == NN_THUNK_COMPUTED && t->val_tag == NN_VALUE_PTR) {
+                if (t->payload) count++;
+            }
+        }
+    }
+    return count;
+}
+
+uint32_t
+nn_thunk_collect_stableptrs(void **output, uint32_t max_count)
+{
+    uint32_t written = 0;
+    struct nn_thunk_block *block;
+    uint32_t i;
+    if (!g_arena) return 0;
+    for (block = g_arena->head; block && written < max_count; block = block->next) {
+        for (i = 0; i < block->count && written < max_count; i++) {
+            const nn_thunk_t *t = &block->slots[i];
+            if (t->state == NN_THUNK_PENDING || t->state == NN_THUNK_BLACKHOLE) {
+                if (t->payload) output[written++] = t->payload;
+            } else if (t->state == NN_THUNK_COMPUTED && t->val_tag == NN_VALUE_PTR) {
+                if (t->payload) output[written++] = t->payload;
+            }
+        }
+    }
+    return written;
+}

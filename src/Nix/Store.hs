@@ -42,9 +42,13 @@ module Nix.Store
 
     -- * Store operations
     addToStore,
+    placeInStore,
+    registrationFor,
     scanReferences,
+    scanTempReferences,
     setReadOnly,
     writeDrv,
+    writeDrvAterm,
 
     -- * Re-exports
     module Nix.Store.Path,
@@ -123,25 +127,46 @@ addToStore ::
   [StorePath] ->
   IO ()
 addToStore store srcPath sp deriver refs = do
+  reg <- placeInStore store srcPath sp deriver refs
+  registerPath (stDB store) reg
+
+-- | Move a build output into the store (read-only) and compute its
+-- registration (NAR hash, size, references) WITHOUT writing to the database.
+--
+-- Splitting placement from registration lets a multi-output build place every
+-- output first and then register them together, so intra-derivation
+-- cross-output references are preserved (see 'registerPaths').
+placeInStore ::
+  Store ->
+  FilePath ->
+  StorePath ->
+  Maybe Text ->
+  [StorePath] ->
+  IO PathRegistration
+placeInStore store srcPath sp deriver refs = do
   let destPath = storePathToFilePath (stDir store) sp
   -- Move (or copy) source to store
   moveOutput srcPath destPath
   -- Set read-only permissions
   setReadOnly destPath
+  registrationFor store sp deriver refs
+
+-- | Compute the registration metadata for a store path already present on
+-- disk, without moving anything.  Used to (re-)register an output that an
+-- interrupted build left in place but never recorded in the database.
+registrationFor :: Store -> StorePath -> Maybe Text -> [StorePath] -> IO PathRegistration
+registrationFor store sp deriver refs = do
+  let destPath = storePathToFilePath (stDir store) sp
   -- Compute the NAR hash and size of the final store contents.  The NAR
-  -- serialization is canonical (entries sorted, 8-byte padding), so this
-  -- is exactly the NarHash/NarSize a binary cache reports for the path.
+  -- serialization is canonical (entries sorted, 8-byte padding), so this is
+  -- exactly the NarHash/NarSize a binary cache reports for the path.
   narEntry <- NAR.serialiseFromPath destPath
   let narBytes = NAR.serialise narEntry
-      narHashText = Hash.formatNixHash (Hash.hashBytes narBytes)
-      narSize = BS.length narBytes
-  -- Register in database
-  registerPath
-    (stDB store)
+  pure
     PathRegistration
       { prPath = sp,
-        prNarHash = narHashText,
-        prNarSize = narSize,
+        prNarHash = Hash.formatNixHash (Hash.hashBytes narBytes),
+        prNarSize = BS.length narBytes,
         prDeriver = deriver,
         prReferences = refs
       }
@@ -185,20 +210,38 @@ scanReferences :: StoreDir -> [StorePath] -> FilePath -> IO [StorePath]
 scanReferences storeDir candidates dir = do
   let candidateSet = Set.fromList [(spHash sp, sp) | sp <- candidates]
       storeDirStr = unStoreDir storeDir
-      -- Scan for both forward-slash and backslash store prefixes.
-      -- On Windows, binaries may contain either separator style.
+      -- Scan for both forward-slash and backslash store prefixes.  On Windows,
+      -- binaries may contain either separator style.  Both separators are a
+      -- single ASCII byte, so the two prefixes share a length.
       prefixFwd = TE.encodeUtf8 (T.pack (storeDirStr <> "/"))
       prefixBwd = TE.encodeUtf8 (T.pack (storeDirStr <> "\\"))
-      prefixBytes = prefixFwd
-      prefixLen = BS.length prefixBytes
-      hashLen = 32
+      prefixLen = BS.length prefixFwd
   files <- collectRegularFiles dir
   foundHashes <- foldlIO Set.empty files $ \acc filePath -> do
     contents <- BS.readFile filePath
     -- Scan with forward-slash prefix, then backslash (for Windows)
-    let acc1 = scanBytes prefixFwd prefixLen hashLen contents acc
-    pure (scanBytes prefixBwd prefixLen hashLen contents acc1)
+    let acc1 = scanBytes prefixFwd prefixLen storePathHashLen contents acc
+    pure (scanBytes prefixBwd prefixLen storePathHashLen contents acc1)
   pure [sp | (h, sp) <- Set.toList candidateSet, Set.member h foundHashes]
+
+-- | Scan an output for references to build-temp output locations.
+--
+-- The builder runs under a temp directory, so an output that embeds its own or
+-- a sibling output's path embeds the TEMP path — which 'scanReferences' (store
+-- prefix only) cannot see.  Given @(tempDir, storePath)@ for every output of
+-- the derivation, returns the store paths whose temp location is referenced
+-- from the scanned output, capturing self- and cross-output references.
+--
+-- This records the dependency edge; it does not rewrite the embedded bytes
+-- (self-reference hash rewriting is a separate, future concern).
+scanTempReferences :: [(FilePath, StorePath)] -> FilePath -> IO [StorePath]
+scanTempReferences tempPairs dir = do
+  let needles = [(TE.encodeUtf8 (T.pack tempDir), sp) | (tempDir, sp) <- tempPairs]
+  files <- collectRegularFiles dir
+  foundHashes <- foldlIO Set.empty files $ \acc filePath -> do
+    contents <- BS.readFile filePath
+    pure (Set.union acc (Set.fromList [spHash sp | (needle, sp) <- needles, needle `BS.isInfixOf` contents]))
+  pure [sp | (_, sp) <- tempPairs, Set.member (spHash sp) foundHashes]
 
 -- | Collect all regular files under a path, recursively.
 -- If the path is itself a regular file, returns it directly.
@@ -244,7 +287,13 @@ foldlIO z (x : xs) f = do
   acc <- f z x
   foldlIO acc xs f
 
--- | Recursively set a directory and all its contents to read-only.
+-- | Recursively mark a store path and its contents read-only after a build.
+--
+-- On Windows the directory read-only attribute does not prevent adding or
+-- removing entries — only the per-file read-only attribute protects a file.
+-- Immutability here is therefore enforced at FILE granularity (every file is
+-- made read-only); hardening the directory itself against entry changes would
+-- require ACLs and is deferred.
 setReadOnly :: FilePath -> IO ()
 setReadOnly path = do
   isDir <- doesDirectoryExist path
@@ -260,10 +309,16 @@ setReadOnly path = do
         perms <- Dir.getPermissions path
         setPermissions path (Dir.setOwnerWritable False perms)
 
--- | Serialize a derivation to ATerm and write it to the store at the given path.
-writeDrv :: Store -> Derivation -> StorePath -> IO ()
-writeDrv store drv sp = do
+-- | Write an already-serialized derivation ATerm to its store path.  Used to
+-- materialize the input @.drv@ closure (root plus every transitive input)
+-- before a dependency-aware build: evaluation computes these ATerms but does
+-- no store IO, so the build driver writes them here.
+writeDrvAterm :: Store -> StorePath -> Text -> IO ()
+writeDrvAterm store sp aterm = do
   let destPath = storePathToFilePath (stDir store) sp
-      aterm = toATerm drv
   createDirectoryIfMissing True (unStoreDir (stDir store))
   TIO.writeFile destPath aterm
+
+-- | Serialize a derivation to ATerm and write it to the store at the given path.
+writeDrv :: Store -> Derivation -> StorePath -> IO ()
+writeDrv store drv sp = writeDrvAterm store sp (toATerm drv)

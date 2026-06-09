@@ -76,34 +76,36 @@ chunksStrip n = go True 0
       | c == '\n' = ('\n' : acc, True, 0)
       | otherwise = (c : acc, False, dropped)
 
--- | Coerce a Nix value to a string for interpolation.
+-- | Coerce a Nix value to a string.
 --
--- Strict coercion: strings, ints, floats, paths, null, bools, and
--- attribute sets with @__toString@ or @outPath@.
--- Lists and functions without coercion metadata are errors.
--- Used by string interpolation (@"${...}"@) and @builtins.toString@.
-coerceToString :: (MonadEval m) => Force m -> Apply m -> NixValue -> m (Text, StringContext)
-coerceToString _ _ (VStr s ctx) = pure (s, ctx)
-coerceToString _ _ (VInt n) = pure (T.pack (show n), emptyContext)
-coerceToString _ _ (VFloat n) = pure (formatNixFloat n, emptyContext)
-coerceToString _ _ (VPath p) = pure (p, emptyContext)
-coerceToString _ _ VNull = pure ("", emptyContext)
-coerceToString _ _ (VBool True) = pure ("1", emptyContext)
-coerceToString _ _ (VBool False) = pure ("", emptyContext)
--- Attribute sets: try __toString first, then outPath
-coerceToString forceFn applyFn (VAttrs attrs) =
+-- The @coerceMore@ flag mirrors C++ Nix's @coerceToString@ argument: when
+-- 'True' (e.g. @builtins.toString@, derivation-env values) ints, floats, bools
+-- and null coerce permissively; when 'False' (string interpolation,
+-- @builtins.concatStringsSep@) those are type errors, matching C++ Nix.
+-- Strings, paths, and attribute sets with @__toString@/@outPath@ coerce in
+-- both modes; lists and bare functions are always errors.
+coerceToString :: (MonadEval m) => Bool -> Force m -> Apply m -> NixValue -> m (Text, StringContext)
+coerceToString _ _ _ (VStr s ctx) = pure (s, ctx)
+coerceToString _ _ _ (VPath p) = pure (p, emptyContext)
+coerceToString True _ _ (VInt n) = pure (T.pack (show n), emptyContext)
+coerceToString True _ _ (VFloat n) = pure (formatNixFloat n, emptyContext)
+coerceToString True _ _ VNull = pure ("", emptyContext)
+coerceToString True _ _ (VBool True) = pure ("1", emptyContext)
+coerceToString True _ _ (VBool False) = pure ("", emptyContext)
+-- Attribute sets: try __toString first, then outPath (both modes).
+coerceToString coerceMore forceFn applyFn (VAttrs attrs) =
   case attrSetLookup "__toString" attrs of
     Just toStrThunk -> do
       toStrFn <- forceFn toStrThunk
       result <- applyFn toStrFn (VAttrs attrs)
-      coerceToString forceFn applyFn result
+      coerceToString coerceMore forceFn applyFn result
     Nothing -> case attrSetLookup "outPath" attrs of
       Just outPathThunk -> do
         outPathVal <- forceFn outPathThunk
-        coerceToString forceFn applyFn outPathVal
+        coerceToString coerceMore forceFn applyFn outPathVal
       Nothing ->
         throwEvalError "cannot coerce a set to a string (missing __toString or outPath)"
-coerceToString _ _ other =
+coerceToString _ _ _ other =
   throwEvalError ("cannot coerce " <> typeName other <> " to a string")
 
 -- | Format a float the way C++ Nix does: 6 fixed decimal places

@@ -175,6 +175,9 @@ lexNormalMode st acc = case T.uncons (lsInput st) of
         Just c2 <- safeHead (T.drop 1 rest),
         c2 == '/' ->
           lexPath st acc
+      | Just d <- safeHead rest,
+        isDigit d ->
+          lexLeadingDotFloat st acc
     '.' -> emit1 st TokDot acc
     ',' -> emit1 st TokComma acc
     ';' -> emit1 st TokSemicolon acc
@@ -474,16 +477,28 @@ lexNumber st acc =
           | Just (d, _) <- T.uncons after2,
             isDigit d ->
               let (decimals, after3) = T.span isDigit after2
-                  fullLen = T.length digits + 1 + T.length decimals
-                  val = readDouble digits decimals
+                  (expVal, after4, expLen) = lexExponent after3
+                  fullLen = T.length digits + 1 + T.length decimals + expLen
+                  val = applyExponent (readDouble digits decimals) expVal
                   tok = Located (lsLine st) (lsCol st) (TokFloat val)
-                  newSt = advanceCol fullLen st {lsInput = after3}
+                  newSt = advanceCol fullLen st {lsInput = after4}
                in lexNormalMode newSt (tok : acc)
-        _ ->
-          let val = fromIntegral (readInteger digits) :: Int64
-              tok = Located (lsLine st) (lsCol st) (TokInt val)
-              newSt = advanceCol len st {lsInput = after}
-           in lexNormalMode newSt (tok : acc)
+        _
+          -- C++ Nix rejects out-of-range integer literals rather than
+          -- silently wrapping modulo 2^64.
+          | readInteger digits > toInteger (maxBound :: Int64) ->
+              Left
+                ParseError
+                  { peFile = lsFile st,
+                    peLine = lsLine st,
+                    peCol = lsCol st,
+                    peMessage = "integer literal out of range: " <> digits
+                  }
+          | otherwise ->
+              let val = fromIntegral (readInteger digits) :: Int64
+                  tok = Located (lsLine st) (lsCol st) (TokInt val)
+                  newSt = advanceCol len st {lsInput = after}
+               in lexNormalMode newSt (tok : acc)
 
 -- | Read an integer from text without using the partial 'read'.
 readInteger :: Text -> Integer
@@ -497,6 +512,42 @@ readDouble intPart decPart =
       fracDigits = T.length decPart
       frac = fromIntegral (readInteger decPart) / (decimalBase' ^ fracDigits)
    in whole + frac
+
+-- | Consume an optional exponent @[eE][+-]?[0-9]+@ after a float's digits.
+-- Returns the signed exponent, the remaining input, and the characters
+-- consumed.  An @e@ not followed by digits is not an exponent (consumes 0), so
+-- e.g. @1.5e@ lexes as the float @1.5@ followed by the identifier @e@.
+lexExponent :: Text -> (Integer, Text, Int)
+lexExponent input =
+  case T.uncons input of
+    Just (e, afterE)
+      | e == 'e' || e == 'E' ->
+          let (sign, afterSign, signLen) = case T.uncons afterE of
+                Just ('+', rest) -> (1, rest, 1)
+                Just ('-', rest) -> (-1, rest, 1)
+                _ -> (1, afterE, 0)
+              (expDigits, afterExp) = T.span isDigit afterSign
+           in if T.null expDigits
+                then (0, input, 0)
+                else (sign * readInteger expDigits, afterExp, 1 + signLen + T.length expDigits)
+    _ -> (0, input, 0)
+
+-- | Scale a float mantissa by @10 ^^ exp@ (exp may be negative).
+applyExponent :: Double -> Integer -> Double
+applyExponent mantissa expVal = mantissa * (10 ^^ expVal)
+
+-- | Lex a leading-dot float like @.5@ or @.5e3@ (Nix's @0?\\.[0-9]+@ form).
+-- The current input begins with the @.@.
+lexLeadingDotFloat :: LexState -> [Located] -> Either ParseError [Located]
+lexLeadingDotFloat st acc =
+  let afterDot = T.drop 1 (lsInput st)
+      (decimals, after3) = T.span isDigit afterDot
+      (expVal, after4, expLen) = lexExponent after3
+      fullLen = 1 + T.length decimals + expLen
+      val = applyExponent (readDouble "" decimals) expVal
+      tok = Located (lsLine st) (lsCol st) (TokFloat val)
+      newSt = advanceCol fullLen st {lsInput = after4}
+   in lexNormalMode newSt (tok : acc)
 
 -- | Base for decimal digit accumulation.
 decimalBase :: Integer

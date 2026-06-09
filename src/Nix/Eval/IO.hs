@@ -1,5 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | IO-based Nix evaluator.
@@ -48,7 +49,7 @@ import Nix.Eval (eval)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, unmarshalLambdaValue, unmarshalStringContext)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (makeFixedOutputPath, sha256Digest, sha256Hex, truncatedBase32)
 import Nix.Parser (parseNix, readFileAutoEncoding)
@@ -98,6 +99,10 @@ data EvalState = EvalState
     -- bottom-up by 'builtinDerivationStrict' so input derivations can be
     -- substituted by their content hashes when computing output paths.
     esDrvModuloCache :: !(IORef (Map Text Text)),
+    -- | Accumulated @.drv@ closure (drv store path text → its ATerm), recorded
+    -- bottom-up by 'builtinDerivationStrict'.  The build driver reads this after
+    -- evaluation to write every input @.drv@ to the store before building.
+    esDrvClosure :: !(IORef (Map Text Text)),
     -- | Cache of source path → its store path (recursive NAR hash), so a path
     -- literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text Text)),
@@ -113,6 +118,7 @@ newEvalState :: FilePath -> IO EvalState
 newEvalState baseDir = do
   cache <- newIORef Map.empty
   drvCache <- newIORef Map.empty
+  drvClosure <- newIORef Map.empty
   srcCache <- newIORef Map.empty
   now <- floor <$> getPOSIXTime :: IO Int64
   nixPathStr <- lookupEnvText "NIX_PATH"
@@ -123,6 +129,7 @@ newEvalState baseDir = do
     EvalState
       { esImportCache = cache,
         esDrvModuloCache = drvCache,
+        esDrvClosure = drvClosure,
         esSourcePathCache = srcCache,
         esBaseDir = baseDir,
         esStoreDir = T.unpack SP.platformStoreDirText,
@@ -219,6 +226,10 @@ instance MonadEval EvalIO where
     ref <- asks esDrvModuloCache
     liftIO (modifyIORef' ref (Map.insert key val))
 
+  recordDrvAterm key aterm = EvalIO $ do
+    ref <- asks esDrvClosure
+    liftIO (modifyIORef' ref (Map.insert key aterm))
+
   storeSourcePath rawPath = do
     ref <- EvalIO (asks esSourcePathCache)
     cached <- EvalIO (liftIO (Map.lookup rawPath <$> readIORef ref))
@@ -246,6 +257,11 @@ instance MonadEval EvalIO where
     when (T.any (== '\0') name) $
       throwEvalError ("writeToStore: name must not contain null bytes: " <> name)
     storeDir <- EvalIO (asks esStoreDir)
+    -- The preimage is built inline against the LIVE storeDir (esStoreDir), not
+    -- via Nix.Hash.makeStorePath which pins the canonical defaultStoreDir for
+    -- cross-platform .drv-hash parity.  toFile outputs are host-local, so they
+    -- must use the running store dir — keep this format in sync with
+    -- makeStorePath's preimage (type:sha256:hex:storeDir:name).
     let contentHash = sha256Hex (encodeUtf8 contents)
         inner = "nix-store:sha256:" <> contentHash <> ":" <> T.pack storeDir <> ":" <> name
         pathHash = truncatedBase32 (encodeUtf8 inner)
@@ -315,6 +331,8 @@ instance MonadEval EvalIO where
     when (T.any (== '\0') name) $
       throwEvalError ("copyPathToStore: name must not contain null bytes: " <> name)
     storeDir <- EvalIO (asks esStoreDir)
+    -- Inline host-local store-path preimage (see writeToStore's note): uses the
+    -- live esStoreDir, not makeStorePath's pinned defaultStoreDir.
     let contentHash = sha256Hex (encodeUtf8 ("source:" <> srcPath <> ":" <> name))
         inner = "nix-store:sha256:" <> contentHash <> ":" <> T.pack storeDir <> ":" <> name
         pathHash = truncatedBase32 (encodeUtf8 inner)
@@ -407,22 +425,22 @@ readComputed :: CThunkPtr -> IO NixValue
 readComputed ptr = do
   tag <- cthunkValueTag ptr
   case tag of
-    0 {- INT -} -> VInt <$> cthunkGetInt ptr
-    1 {- FLOAT -} -> VFloat <$> cthunkGetFloat ptr
-    2 {- BOOL -} -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
-    3 {- NULL -} -> pure VNull
-    4 {- STR -} -> do
+    ValueInt -> VInt <$> cthunkGetInt ptr
+    ValueFloat -> VFloat <$> cthunkGetFloat ptr
+    ValueBool -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
+    ValueNull -> pure VNull
+    ValueStr -> do
       sym <- cthunkGetStr ptr
       pure (VStr (symbolText (Symbol sym)) emptyContext)
-    5 {- PATH -} -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
-    6 {- LIST -} -> do
+    ValuePath -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
+    ValueList -> do
       listPtr <- cthunkGetList ptr
       pure (VList (CList (castPtr listPtr)))
-    7 {- ATTRS -} -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
-    8 {- CTXSTR -} -> do
+    ValueAttrs -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
+    ValueCtxStr -> do
       csptr <- cthunkGetCtxStr ptr
       uncurry VStr <$> unmarshalStringContext (castPtr csptr)
-    9 {- LAMBDA -} -> do
+    ValueLambda -> do
       lamPtr <- cthunkGetLambda ptr
       unmarshalLambdaValue lamPtr
     _ {- PTR -} -> do

@@ -98,11 +98,13 @@ void nn_attrset_free_all(void);
 
 /* Create a new set that is the right-biased union of `a` and `b`
  * (keys in `b` override `a`).  Both inputs must be frozen.
- * The result is returned frozen.  Caller owns the result. */
+ * The result is returned frozen and is arena-tracked (freed by
+ * nn_attrset_free_all) — do NOT pass it to nn_attrset_free. */
 nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b);
 
-/* Create a new set with the given keys removed.
- * Input must be frozen.  Result is returned frozen. */
+/* Create a new set with the given keys removed.  Input must be frozen.
+ * The result is returned frozen and is arena-tracked (freed by
+ * nn_attrset_free_all) — do NOT pass it to nn_attrset_free. */
 nn_attrset_t *nn_attrset_remove_keys(
     const nn_attrset_t *set,
     const nn_symbol_t *keys,

@@ -26,15 +26,10 @@
 --   network transfer integrity.
 --
 -- nova-cache already handles output hashes and file hashes.  This module
--- adds input hash (derivation hash) computation for the evaluator, plus
--- the @makeStorePath@ family that constructs content-addressed store paths
--- exactly as C++ Nix does.
+-- provides the shared hashing utilities and the @makeStorePath@ family that
+-- constructs content-addressed store paths exactly as C++ Nix does.
 module Nix.Hash
-  ( -- * Derivation hashing
-    DrvHash (..),
-    hashDerivation,
-
-    -- * Shared hashing utilities
+  ( -- * Shared hashing utilities
     sha256Hex,
     truncatedBase32,
     hashPlaceholder,
@@ -72,24 +67,6 @@ import Data.Word (Word8)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, storePathToText)
 import NovaCache.Base32 (encode)
 import NovaCache.Hash (formatNixHash, hashBytes, parseNixHash)
-
--- | A derivation hash — the input hash that determines the store path.
--- This is computed from the derivation's inputs, NOT from the build output.
--- Stored as the Nix-formatted hash string (e.g. "sha256:0abc...").
-newtype DrvHash = DrvHash {unDrvHash :: Text}
-  deriving (Eq, Show)
-
--- | Hash a serialized derivation (.drv file contents) to produce the
--- input hash used in store path computation.
---
--- The derivation is first converted to ATerm format, then SHA-256 hashed,
--- then truncated to 160 bits (20 bytes) and encoded in Nix base-32.
--- This produces the 32-character hash in the store path.
-hashDerivation :: Text -> DrvHash
-hashDerivation drvText =
-  let drvBytes = encodeUtf8 drvText
-      nixHash = hashBytes drvBytes
-   in DrvHash (formatNixHash nixHash)
 
 -- | SHA-256 hex digest of a ByteString.
 sha256Hex :: BS.ByteString -> Text

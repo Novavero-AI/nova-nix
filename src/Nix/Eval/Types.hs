@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | Shared types for the Nix evaluator.
 --
@@ -83,9 +84,25 @@ module Nix.Eval.Types
     -- * Display
     typeName,
 
+    -- * C thunk-state and value tags (mirror cbits/nn_thunk.h)
+    pattern ThunkPending,
+    pattern ThunkComputed,
+    pattern ThunkBlackhole,
+    pattern ValueInt,
+    pattern ValueFloat,
+    pattern ValueBool,
+    pattern ValueNull,
+    pattern ValueStr,
+    pattern ValuePath,
+    pattern ValueList,
+    pattern ValueAttrs,
+    pattern ValueCtxStr,
+    pattern ValueLambda,
+
     -- * Evaluation monad
     MonadEval (..),
-    PureEval (..),
+    PureEval,
+    runPureEval,
   )
 where
 
@@ -181,11 +198,11 @@ newtype Thunk = Thunk {unThunk :: CThunkPtr}
 instance Show Thunk where
   show (Thunk ptr) =
     case unsafePerformIO (cthunkState ptr) of
-      1 {- COMPUTED -} -> case readThunkValue (Thunk ptr) of
+      ThunkComputed -> case readThunkValue (Thunk ptr) of
         Just val -> "Thunk (" ++ show val ++ ")"
         Nothing -> "Thunk <computed?>"
-      0 -> "Thunk <pending>"
-      2 -> "Thunk <blackhole>"
+      ThunkPending -> "Thunk <pending>"
+      ThunkBlackhole -> "Thunk <blackhole>"
       _ -> "Thunk <unknown>"
 
 -- | Equality: pointer identity fast path, then value comparison for
@@ -197,6 +214,31 @@ instance Eq Thunk where
         (Just v1, Just v2) -> v1 == v2
         _ -> False
 
+-- | Named constants for the C thunk-state byte and value-tag byte, mirroring
+-- the @NN_THUNK_*@ / @NN_VALUE_*@ macros in @cbits\/nn_thunk.h@.  Bidirectional
+-- pattern synonyms over literals, so a @case@ on a tag keeps the jump-table
+-- compilation a bare-literal @case@ gets, while the three thunk-dispatch sites
+-- ('readThunkValue', @PureEval@'s 'forceThunk', and @Nix.Eval.IO@'s
+-- @readComputed@) share one source of truth instead of triplicating literals.
+-- These MUST stay in lockstep with @cbits\/nn_thunk.h@.  The remaining value
+-- tag (PTR, a StablePtr payload) is the wildcard at each dispatch site.
+pattern ThunkPending, ThunkComputed, ThunkBlackhole :: Word8
+pattern ThunkPending = 0
+pattern ThunkComputed = 1
+pattern ThunkBlackhole = 2
+
+pattern ValueInt, ValueFloat, ValueBool, ValueNull, ValueStr, ValuePath, ValueList, ValueAttrs, ValueCtxStr, ValueLambda :: Word8
+pattern ValueInt = 0
+pattern ValueFloat = 1
+pattern ValueBool = 2
+pattern ValueNull = 3
+pattern ValueStr = 4
+pattern ValuePath = 5
+pattern ValueList = 6
+pattern ValueAttrs = 7
+pattern ValueCtxStr = 8
+pattern ValueLambda = 9
+
 -- | Read a COMPUTED thunk's value without forcing.
 -- Returns 'Nothing' for PENDING or BLACKHOLE thunks.
 -- Uses 'unsafePerformIO' — safe because C reads are idempotent.
@@ -204,25 +246,25 @@ readThunkValue :: Thunk -> Maybe NixValue
 readThunkValue (Thunk ptr) =
   unsafePerformIO $ do
     state <- cthunkState ptr
-    if state /= 1
+    if state /= ThunkComputed
       then pure Nothing
       else do
         tag <- cthunkValueTag ptr
         fmap Just $ case tag of
-          0 {- INT -} -> VInt <$> cthunkGetInt ptr
-          1 {- FLOAT -} -> VFloat <$> cthunkGetFloat ptr
-          2 {- BOOL -} -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
-          3 {- NULL -} -> pure VNull
-          4 {- STR -} -> (\sym -> VStr (symbolText (Symbol sym)) emptyContext) <$> cthunkGetStr ptr
-          5 {- PATH -} -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
-          6 {- LIST -} -> do
+          ValueInt -> VInt <$> cthunkGetInt ptr
+          ValueFloat -> VFloat <$> cthunkGetFloat ptr
+          ValueBool -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
+          ValueNull -> pure VNull
+          ValueStr -> (\sym -> VStr (symbolText (Symbol sym)) emptyContext) <$> cthunkGetStr ptr
+          ValuePath -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
+          ValueList -> do
             listPtr <- cthunkGetList ptr
             pure (VList (CList (castPtr listPtr)))
-          7 {- ATTRS -} -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
-          8 {- CTXSTR -} -> do
+          ValueAttrs -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
+          ValueCtxStr -> do
             csptr <- cthunkGetCtxStr ptr
             uncurry VStr <$> unmarshalStringContext (castPtr csptr)
-          9 {- LAMBDA -} -> do
+          ValueLambda -> do
             lamRaw <- cthunkPayload ptr
             unmarshalLambdaValue (castPtr lamRaw)
           _ {- PTR -} -> do
@@ -407,7 +449,7 @@ fillCAttrSetValues cset thunkMap = unsafePerformIO $
 
 -- | Evaluation environment — C-backed scope chain.
 --
--- Arena-allocated @nn_env_t@ struct (40 bytes, zero GC overhead).
+-- Arena-allocated @nn_env_t@ struct (48 bytes, zero GC overhead).
 -- All env data (slots, lazy scope, parent, with-scopes) lives in C.
 -- Haskell holds only the pointer.  Variable lookup has two paths:
 --
@@ -1059,22 +1101,47 @@ class (Monad m) => MonadEval m where
   -- A no-op in pure evaluators (no memoization).
   cacheDrvHash :: Text -> Text -> m ()
 
+  -- | Record a derivation's serialized @.drv@ ATerm under its @.drv@ store
+  -- path, as each derivation is computed (bottom-up).  Unlike 'cacheDrvHash'
+  -- (which stores only the modulo hash), this retains the full ATerm so the
+  -- build driver can materialize the entire input-@.drv@ closure to the store
+  -- before a dependency-aware build.  A no-op in pure evaluators.
+  recordDrvAterm :: Text -> Text -> m ()
+
   -- | Compute the store path a source file/directory gets when copied into
   -- the store (recursive NAR sha256 → @source@ fixed-output path), WITHOUT
   -- performing the copy.  Used when a path literal is coerced in a derivation
   -- argument or environment value.  Unavailable in pure evaluation.
   storeSourcePath :: Text -> m Text
 
--- | Pure evaluation monad — wraps 'Either Text'.
+-- | Error raised during pure evaluation.  'PAbort' (from @abort@ and infinite
+-- recursion) must escape 'tryEval' exactly as in C++ Nix; 'PThrow' is catchable.
+data PureError = PThrow !Text | PAbort !Text
+
+-- | Pure evaluation monad — wraps @Either PureError@.
 -- IO builtins ('readFile', 'import') are unavailable;
 -- everything else evaluates identically to the IO version.
-newtype PureEval a = PureEval {runPureEval :: Either Text a}
+newtype PureEval a = PureEval (Either PureError a)
   deriving (Functor, Applicative, Monad)
 
+-- | Run a pure evaluation, flattening the internal error into 'Text'.  An abort
+-- is prefixed @\"evaluation aborted: \"@, matching 'EvalIO'.
+runPureEval :: PureEval a -> Either Text a
+runPureEval (PureEval (Right a)) = Right a
+runPureEval (PureEval (Left (PThrow t))) = Left t
+runPureEval (PureEval (Left (PAbort t))) = Left ("evaluation aborted: " <> t)
+
 instance MonadEval PureEval where
-  throwEvalError msg = PureEval (Left msg)
-  abortEvaluation msg = PureEval (Left ("evaluation aborted: " <> msg))
-  catchEvalError (PureEval action) = PureEval (Right action)
+  throwEvalError msg = PureEval (Left (PThrow msg))
+  abortEvaluation msg = PureEval (Left (PAbort msg))
+
+  -- Catch a throw (tryEval sees the error), but let an abort / infinite
+  -- recursion propagate past tryEval, matching EvalIO and C++ Nix.
+  catchEvalError (PureEval action) =
+    PureEval $ case action of
+      Left (PThrow t) -> Right (Left t)
+      Left (PAbort t) -> Left (PAbort t)
+      Right a -> Right (Right a)
   readFileText _ = throwEvalError "readFile: not available in pure evaluation"
   doesPathExist _ = pure False
   listDirectory _ = throwEvalError "builtins.readDir: not available in pure evaluation"
@@ -1090,6 +1157,7 @@ instance MonadEval PureEval where
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()
+  recordDrvAterm _ _ = pure ()
 
   -- Pure eval cannot read files: a path coerces to itself (no store copy);
   -- the real copy-to-store happens only under 'EvalIO'.
@@ -1101,30 +1169,30 @@ instance MonadEval PureEval where
     -- Does NOT mark blackholes — PureEval may re-force the same thunk.
     -- Dispatches on val_tag for computed scalars (no StablePtr deref).
     case unsafePerformIO (cthunkState ptr) of
-      1 {- COMPUTED -} ->
+      ThunkComputed ->
         let tag = unsafePerformIO (cthunkValueTag ptr)
          in case tag of
-              0 {- INT -} -> pure (VInt (unsafePerformIO (cthunkGetInt ptr)))
-              1 {- FLOAT -} -> pure (VFloat (unsafePerformIO (cthunkGetFloat ptr)))
-              2 {- BOOL -} -> pure (VBool (unsafePerformIO (cthunkGetBool ptr) /= 0))
-              3 {- NULL -} -> pure VNull
-              4 {- STR -} ->
+              ValueInt -> pure (VInt (unsafePerformIO (cthunkGetInt ptr)))
+              ValueFloat -> pure (VFloat (unsafePerformIO (cthunkGetFloat ptr)))
+              ValueBool -> pure (VBool (unsafePerformIO (cthunkGetBool ptr) /= 0))
+              ValueNull -> pure VNull
+              ValueStr ->
                 let sym = unsafePerformIO (cthunkGetStr ptr)
                  in pure (VStr (symbolText (Symbol sym)) emptyContext)
-              5 {- PATH -} ->
+              ValuePath ->
                 let sym = unsafePerformIO (cthunkGetPath ptr)
                  in pure (VPath (symbolText (Symbol sym)))
-              6 {- LIST -} ->
+              ValueList ->
                 let listPtr = unsafePerformIO (cthunkGetList ptr)
                  in pure (VList (CList (castPtr listPtr)))
-              7 {- ATTRS -} ->
+              ValueAttrs ->
                 let p = unsafePerformIO (cthunkGetAttrs ptr)
                  in pure (VAttrs (AttrSet (castPtr p)))
-              8 {- CTXSTR -} ->
+              ValueCtxStr ->
                 let csptr = unsafePerformIO (cthunkGetCtxStr ptr)
                     (t, ctx) = unsafePerformIO (unmarshalStringContext (castPtr csptr))
                  in pure (VStr t ctx)
-              9 {- LAMBDA -} ->
+              ValueLambda ->
                 let lamRaw = unsafePerformIO (cthunkPayload ptr)
                     val = unsafePerformIO (unmarshalLambdaValue lamRaw)
                  in pure val
@@ -1132,7 +1200,7 @@ instance MonadEval PureEval where
                 let payload = unsafePerformIO (cthunkPayload ptr)
                     val = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))
                  in pure val
-      2 {- BLACKHOLE -} ->
+      ThunkBlackhole ->
         -- Non-catchable: must escape tryEval like in C++ Nix
         abortEvaluation "infinite recursion encountered"
       _ {- PENDING -} ->

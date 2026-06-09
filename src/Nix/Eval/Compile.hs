@@ -456,6 +456,8 @@ decodeBcFormals flags dataOff = case flags of
     ellipsis <- cbcData (dataOff + 2)
     formals <- decodeFormalEntries (fromIntegral count) (dataOff + 3)
     pure (EFNamedSet (symbolText (Symbol nameSym)) formals (ellipsis /= 0))
+  -- Unreachable: the flag is written only by this module's formals compiler,
+  -- which emits 0, 1, or 2 — all matched above.
   _ -> error "decodeBcFormals: invalid formal type flag"
 
 -- | Decode a list of formal entries from the data buffer.
@@ -484,6 +486,8 @@ decodeBcCaptureInfo dataOff = do
       count <- cbcData (dataOff + 1)
       pairs <- decodePairs (fromIntegral count) (dataOff + 2)
       pure (CapturesWithScopes pairs)
+    -- Unreachable: the tag is written only by this module's capture compiler,
+    -- which emits 0, 1, or 2 — all matched above.
     _ -> error "decodeBcCaptureInfo: invalid capture type tag"
 
 -- | Decode (level, idx) pairs from the data buffer.
@@ -546,6 +550,8 @@ decodeOneBinding off = do
       if hasFrom /= 0
         then pure (BcInheritFrom fromBcIdx syms, nextOff)
         else pure (BcInherit syms, nextOff)
+    -- Unreachable: the tag is written only by this module's binding compiler,
+    -- which emits 0 or 1 — both matched above.
     _ -> error "decodeOneBinding: invalid binding type tag"
 
 -- | Decode attr path keys: pairs of (is_expr, key_or_bc_idx).

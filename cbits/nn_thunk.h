@@ -68,7 +68,7 @@ typedef struct nn_thunk {
     uint8_t   state;
     uint8_t   val_tag;
     uint16_t  _pad;
-    uint32_t  bc_idx;    /* PENDING: bytecode index; COMPUTED: 0 */
+    uint32_t  bc_idx;    /* PENDING: bytecode index; otherwise stale (never read) */
     void     *payload;
 } nn_thunk_t;
 
@@ -196,5 +196,14 @@ uint32_t nn_thunk_count(void);
  * Used for StablePtr cleanup iteration before nn_thunk_destroy().
  * Index must be < nn_thunk_count(). */
 nn_thunk_t *nn_thunk_get(uint32_t index);
+
+/* Single-pass (O(total)) collection of Haskell StablePtr payloads across the
+ * whole arena.  Walks the block list directly — nn_thunk_get is O(blocks) per
+ * call, so index-based iteration would be O(total * blocks).  StablePtr
+ * sources: PENDING/BLACKHOLE payload, and COMPUTED + NN_VALUE_PTR payload.
+ * nn_thunk_collect_stableptrs writes up to max_count pointers into `output`
+ * and returns the count written.  These back the nn_arena_* teardown helpers. */
+uint32_t nn_thunk_count_stableptrs(void);
+uint32_t nn_thunk_collect_stableptrs(void **output, uint32_t max_count);
 
 #endif /* NN_THUNK_H */

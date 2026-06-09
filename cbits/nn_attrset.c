@@ -307,6 +307,9 @@ const nn_symbol_t *nn_attrset_keys_ptr(const nn_attrset_t *set)
 
 nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b)
 {
+    /* The merge-join below assumes both inputs are sorted; every set this
+     * module produces is frozen (hence sorted), so guard it in debug. */
+    NN_ASSERT(a->frozen && b->frozen, "nn_attrset_union: inputs must be frozen");
     /* Merge-join: all keys from both, b wins on conflict. */
     uint32_t cap = a->count + b->count;
     nn_attrset_t *result = nn_attrset_new(cap);
@@ -345,6 +348,7 @@ nn_attrset_t *nn_attrset_remove_keys(
     const nn_symbol_t *keys,
     uint32_t key_count)
 {
+    NN_ASSERT(set->frozen, "nn_attrset_remove_keys: input must be frozen");
     nn_attrset_t *result = nn_attrset_new(set->count);
     if (!result) { fprintf(stderr, "nn_attrset_remove_keys: alloc failed\n"); abort(); }
     uint32_t i;
