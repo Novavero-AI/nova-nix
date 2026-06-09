@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module Main (main) where
 
@@ -21,7 +22,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), cu
 import Nix.Eval (NixValue (..), StringContext (..), StringContextElement (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
-import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, opApp, opAssert, opAttrs, opBinary, opHasAttr, opIf, opIndStr, opLambda, opLet, opList, opLitBool, opLitFloat, opLitInt, opLitNull, opLitPath, opLitUri, opResolvedVar, opSelect, opStr, opUnary, opVar, opWith, opWithVar, strpartInterp, strpartLit, unaryNegate)
+import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
 import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
@@ -3946,7 +3947,7 @@ testBytecodeCompile = do
         a1 <- cbcArg1 idx
         a2 <- cbcArg2 idx
         pure
-          ( if op == opLitInt && a1 == 42 && a2 == 0
+          ( if op == OpLitInt && a1 == 42 && a2 == 0
               then Pass
               else Fail ("op=" <> T.pack (show op) <> " a1=" <> T.pack (show a1))
           ),
@@ -3957,7 +3958,7 @@ testBytecodeCompile = do
         a2 <- cbcArg2 idx
         -- -1 as uint64 = 0xFFFFFFFFFFFFFFFF, lo=0xFFFFFFFF, hi=0xFFFFFFFF
         pure
-          ( if op == opLitInt && a1 == 0xFFFFFFFF && a2 == 0xFFFFFFFF
+          ( if op == OpLitInt && a1 == 0xFFFFFFFF && a2 == 0xFFFFFFFF
               then Pass
               else
                 Fail
@@ -3975,21 +3976,21 @@ testBytecodeCompile = do
         saT <- cbcShortArg idxT
         saF <- cbcShortArg idxF
         pure
-          ( if opT == opLitBool && saT == 1 && opF == opLitBool && saF == 0
+          ( if opT == OpLitBool && saT == 1 && opF == OpLitBool && saF == 0
               then Pass
               else Fail "bool encoding mismatch"
           ),
       runTestM "compile ELit NixNull" $ do
         idx <- compileExpr (ELit NixNull)
         op <- cbcOpcode idx
-        pure (assertEqual "opcode" opLitNull op),
+        pure (assertEqual "opcode" OpLitNull op),
       runTestM "compile EResolvedVar" $ do
         idx <- compileExpr (EResolvedVar 3 7)
         op <- cbcOpcode idx
         a1 <- cbcArg1 idx
         a2 <- cbcArg2 idx
         pure
-          ( if op == opResolvedVar && a1 == 3 && a2 == 7
+          ( if op == OpResolvedVar && a1 == 3 && a2 == 7
               then Pass
               else
                 Fail
@@ -4007,7 +4008,7 @@ testBytecodeCompile = do
         sym <- cbcArg1 idx
         let symText = symbolText (Symbol sym)
         pure
-          ( if op == opVar && symText == "hello"
+          ( if op == OpVar && symText == "hello"
               then Pass
               else Fail ("op=" <> T.pack (show op) <> " sym=" <> symText)
           ),
@@ -4019,7 +4020,7 @@ testBytecodeCompile = do
         funcOp <- cbcOpcode funcIdx
         argOp <- cbcOpcode argIdx
         pure
-          ( if op == opApp && funcOp == opVar && argOp == opLitInt
+          ( if op == OpApp && funcOp == OpVar && argOp == OpLitInt
               then Pass
               else
                 Fail
@@ -4043,7 +4044,7 @@ testBytecodeCompile = do
         thenA1 <- cbcArg1 thenIdx
         elseA1 <- cbcArg1 elseIdx
         pure
-          ( if op == opIf && condOp == opLitBool && thenA1 == 1 && elseA1 == 2
+          ( if op == OpIf && condOp == OpLitBool && thenA1 == 1 && elseA1 == 2
               then Pass
               else Fail "if structure mismatch"
           ),
@@ -4058,7 +4059,7 @@ testBytecodeCompile = do
         leftA1 <- cbcArg1 leftIdx
         rightA1 <- cbcArg1 rightIdx
         pure
-          ( if op == opBinary && fl == binaryAdd && leftA1 == 10 && rightA1 == 20
+          ( if op == OpBinary && fl == binaryAdd && leftA1 == 10 && rightA1 == 20
               then Pass
               else Fail "binary structure mismatch"
           ),
@@ -4069,7 +4070,7 @@ testBytecodeCompile = do
         operandIdx <- cbcArg1 idx
         operandA1 <- cbcArg1 operandIdx
         pure
-          ( if op == opUnary && fl == unaryNegate && operandA1 == 5
+          ( if op == OpUnary && fl == unaryNegate && operandA1 == 5
               then Pass
               else Fail "unary structure mismatch"
           ),
@@ -4087,7 +4088,7 @@ testBytecodeCompile = do
         c1a1 <- cbcArg1 c1
         c2a1 <- cbcArg1 c2
         pure
-          ( if op == opList && count == 3 && c0a1 == 1 && c1a1 == 2 && c2a1 == 3
+          ( if op == OpList && count == 3 && c0a1 == 1 && c1a1 == 2 && c2a1 == 3
               then Pass
               else
                 Fail
@@ -4113,12 +4114,12 @@ testBytecodeCompile = do
         -- tag0=0(lit), tag1=1(interp), tag2=0(lit)
         interpOp <- cbcOpcode val1
         pure
-          ( if op == opStr
+          ( if op == OpStr
               && count == 3
               && tag0 == strpartLit
               && tag1 == strpartInterp
               && tag2 == strpartLit
-              && interpOp == opVar
+              && interpOp == OpVar
               then Pass
               else
                 Fail
@@ -4140,7 +4141,7 @@ testBytecodeCompile = do
         scopeOp <- cbcOpcode scopeIdx
         bodyOp <- cbcOpcode bodyIdx
         pure
-          ( if op == opWith && scopeOp == opVar && bodyOp == opVar
+          ( if op == OpWith && scopeOp == OpVar && bodyOp == OpVar
               then Pass
               else Fail "with structure mismatch"
           ),
@@ -4152,7 +4153,7 @@ testBytecodeCompile = do
         condOp <- cbcOpcode condIdx
         bodyOp <- cbcOpcode bodyIdx
         pure
-          ( if op == opAssert && condOp == opLitBool && bodyOp == opLitInt
+          ( if op == OpAssert && condOp == OpLitBool && bodyOp == OpLitInt
               then Pass
               else Fail "assert structure mismatch"
           ),
@@ -4165,7 +4166,7 @@ testBytecodeCompile = do
         bodyIdx <- cbcArg2 idx
         bodyOp <- cbcOpcode bodyIdx
         pure
-          ( if op == opLambda && fl == formalName && bodyOp == opResolvedVar
+          ( if op == OpLambda && fl == formalName && bodyOp == OpResolvedVar
               then Pass
               else
                 Fail
@@ -4188,7 +4189,7 @@ testBytecodeCompile = do
         bodyIdx <- cbcArg2 idx
         bodyOp <- cbcOpcode bodyIdx
         pure
-          ( if op == opLet && count == 1 && bodyOp == opResolvedVar
+          ( if op == OpLet && count == 1 && bodyOp == OpResolvedVar
               then Pass
               else
                 Fail
@@ -4210,7 +4211,7 @@ testBytecodeCompile = do
         fl <- cbcFlags idx
         count <- cbcShortArg idx
         pure
-          ( if op == opAttrs && fl == 0 && count == 1
+          ( if op == OpAttrs && fl == 0 && count == 1
               then Pass
               else Fail "attrs structure mismatch"
           ),
@@ -4228,7 +4229,7 @@ testBytecodeCompile = do
         fl <- cbcFlags idx
         count <- cbcShortArg idx
         pure
-          ( if op == opAttrs && fl == 1 && count == 2
+          ( if op == OpAttrs && fl == 1 && count == 2
               then Pass
               else
                 Fail
@@ -4245,7 +4246,7 @@ testBytecodeCompile = do
         op <- cbcOpcode idx
         fl <- cbcFlags idx
         pure
-          ( if op == opSelect && fl == 0
+          ( if op == OpSelect && fl == 0
               then Pass
               else Fail ("flags=" <> T.pack (show fl))
           ),
@@ -4258,7 +4259,7 @@ testBytecodeCompile = do
         defIdx <- cbcArg3 idx
         defOp <- cbcOpcode defIdx
         pure
-          ( if op == opSelect && fl == 1 && defOp == opLitNull
+          ( if op == OpSelect && fl == 1 && defOp == OpLitNull
               then Pass
               else Fail ("flags=" <> T.pack (show fl))
           ),
@@ -4269,7 +4270,7 @@ testBytecodeCompile = do
         op <- cbcOpcode idx
         pathLen <- cbcShortArg idx
         pure
-          ( if op == opHasAttr && pathLen == 2
+          ( if op == OpHasAttr && pathLen == 2
               then Pass
               else
                 Fail
@@ -4285,9 +4286,9 @@ testBytecodeCompile = do
         idx <- compileExpr (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "nixpkgs"]))
         op <- cbcOpcode idx
         pure
-          ( if op == opApp
+          ( if op == OpApp
               then Pass
-              else Fail ("expected opApp, got op=" <> T.pack (show op))
+              else Fail ("expected OpApp, got op=" <> T.pack (show op))
           ),
       runTestM "op_count grows after compilation" $ do
         before <- cbcOpCount
@@ -4307,13 +4308,13 @@ testBytecodeCompile = do
       runTestM "compile ELit NixFloat" $ do
         idx <- compileExpr (ELit (NixFloat 3.14))
         op <- cbcOpcode idx
-        pure (assertEqual "opcode" opLitFloat op),
+        pure (assertEqual "opcode" OpLitFloat op),
       runTestM "compile ELit NixUri" $ do
         idx <- compileExpr (ELit (NixUri "https://example.com"))
         op <- cbcOpcode idx
         sym <- cbcArg1 idx
         pure
-          ( if op == opLitUri && symbolText (Symbol sym) == "https://example.com"
+          ( if op == OpLitUri && symbolText (Symbol sym) == "https://example.com"
               then Pass
               else Fail "uri mismatch"
           ),
@@ -4322,7 +4323,7 @@ testBytecodeCompile = do
         op <- cbcOpcode idx
         sym <- cbcArg1 idx
         pure
-          ( if op == opLitPath && symbolText (Symbol sym) == "/nix/store/foo"
+          ( if op == OpLitPath && symbolText (Symbol sym) == "/nix/store/foo"
               then Pass
               else Fail "path mismatch"
           ),
@@ -4337,7 +4338,7 @@ testBytecodeCompile = do
         op <- cbcOpcode idx
         count <- cbcShortArg idx
         pure
-          ( if op == opAttrs && count == 1
+          ( if op == OpAttrs && count == 1
               then Pass
               else Fail "inherit binding mismatch"
           ),
@@ -4352,7 +4353,7 @@ testBytecodeCompile = do
         op <- cbcOpcode idx
         fl <- cbcFlags idx
         pure
-          ( if op == opLambda && fl == formalSet
+          ( if op == OpLambda && fl == formalSet
               then Pass
               else Fail ("flags=" <> T.pack (show fl))
           ),
@@ -4367,7 +4368,7 @@ testBytecodeCompile = do
         op <- cbcOpcode idx
         fl <- cbcFlags idx
         pure
-          ( if op == opLambda && fl == formalNamedSet
+          ( if op == OpLambda && fl == formalNamedSet
               then Pass
               else Fail ("flags=" <> T.pack (show fl))
           ),
@@ -4388,7 +4389,7 @@ testBytecodeCompile = do
         capL1 <- cbcData (capOff + 4)
         capI1 <- cbcData (capOff + 5)
         pure
-          ( if op == opLambda
+          ( if op == OpLambda
               && capTag == captureSlots
               && capCount == 2
               && capL0 == 1
@@ -4420,7 +4421,7 @@ testBytecodeCompile = do
         op <- cbcOpcode idx
         sym <- cbcArg1 idx
         pure
-          ( if op == opWithVar && symbolText (Symbol sym) == "dynamic"
+          ( if op == OpWithVar && symbolText (Symbol sym) == "dynamic"
               then Pass
               else Fail "withvar mismatch"
           ),
@@ -4429,7 +4430,7 @@ testBytecodeCompile = do
         op <- cbcOpcode idx
         count <- cbcShortArg idx
         pure
-          ( if op == opIndStr && count == 1
+          ( if op == OpIndStr && count == 1
               then Pass
               else Fail "indstr mismatch"
           )

@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 -- | C-backed bytecode storage via FFI.
 --
 -- Wraps @cbits/nn_bytecode.c@ — two growable arrays storing flat Nix
@@ -6,7 +8,7 @@
 --
 -- @
 -- cbcInit 0 0
--- idx <- cbcEmit opLitInt 0 0 42 0 0
+-- idx <- cbcEmit OpLitInt 0 0 42 0 0
 -- cbcOpcode idx   -- NN_OP_LIT_INT (0)
 -- cbcArg1 idx     -- 42
 -- cbcDestroy
@@ -36,30 +38,30 @@ module Nix.Eval.CBytecode
     cbcDataCount,
 
     -- * Opcodes
-    opLitInt,
-    opLitFloat,
-    opLitBool,
-    opLitNull,
-    opLitUri,
-    opLitPath,
-    opStr,
-    opIndStr,
-    opVar,
-    opWithVar,
-    opResolvedVar,
-    opAttrs,
-    opList,
-    opSelect,
-    opHasAttr,
-    opApp,
-    opLambda,
-    opLet,
-    opIf,
-    opWith,
-    opAssert,
-    opUnary,
-    opBinary,
-    opSearchPath,
+    pattern OpLitInt,
+    pattern OpLitFloat,
+    pattern OpLitBool,
+    pattern OpLitNull,
+    pattern OpLitUri,
+    pattern OpLitPath,
+    pattern OpStr,
+    pattern OpIndStr,
+    pattern OpVar,
+    pattern OpWithVar,
+    pattern OpResolvedVar,
+    pattern OpAttrs,
+    pattern OpList,
+    pattern OpSelect,
+    pattern OpHasAttr,
+    pattern OpApp,
+    pattern OpLambda,
+    pattern OpLet,
+    pattern OpIf,
+    pattern OpWith,
+    pattern OpAssert,
+    pattern OpUnary,
+    pattern OpBinary,
+    pattern OpSearchPath,
 
     -- * UnaryOp flags
     unaryNot,
@@ -219,49 +221,49 @@ cbcDataCount = c_nn_bc_data_count
 -- Opcode constants
 -- ---------------------------------------------------------------------------
 
-opLitInt, opLitFloat, opLitBool, opLitNull :: Word8
-opLitInt = 0
-opLitFloat = 1
-opLitBool = 2
-opLitNull = 3
+pattern OpLitInt, OpLitFloat, OpLitBool, OpLitNull :: Word8
+pattern OpLitInt = 0
+pattern OpLitFloat = 1
+pattern OpLitBool = 2
+pattern OpLitNull = 3
 
-opLitUri, opLitPath :: Word8
-opLitUri = 4
-opLitPath = 5
+pattern OpLitUri, OpLitPath :: Word8
+pattern OpLitUri = 4
+pattern OpLitPath = 5
 
-opStr, opIndStr :: Word8
-opStr = 6
-opIndStr = 7
+pattern OpStr, OpIndStr :: Word8
+pattern OpStr = 6
+pattern OpIndStr = 7
 
-opVar, opWithVar, opResolvedVar :: Word8
-opVar = 8
-opWithVar = 9
-opResolvedVar = 10
+pattern OpVar, OpWithVar, OpResolvedVar :: Word8
+pattern OpVar = 8
+pattern OpWithVar = 9
+pattern OpResolvedVar = 10
 
-opAttrs, opList :: Word8
-opAttrs = 11
-opList = 12
+pattern OpAttrs, OpList :: Word8
+pattern OpAttrs = 11
+pattern OpList = 12
 
-opSelect, opHasAttr, opApp :: Word8
-opSelect = 13
-opHasAttr = 14
-opApp = 15
+pattern OpSelect, OpHasAttr, OpApp :: Word8
+pattern OpSelect = 13
+pattern OpHasAttr = 14
+pattern OpApp = 15
 
-opLambda, opLet :: Word8
-opLambda = 16
-opLet = 17
+pattern OpLambda, OpLet :: Word8
+pattern OpLambda = 16
+pattern OpLet = 17
 
-opIf, opWith, opAssert :: Word8
-opIf = 18
-opWith = 19
-opAssert = 20
+pattern OpIf, OpWith, OpAssert :: Word8
+pattern OpIf = 18
+pattern OpWith = 19
+pattern OpAssert = 20
 
-opUnary, opBinary :: Word8
-opUnary = 21
-opBinary = 22
+pattern OpUnary, OpBinary :: Word8
+pattern OpUnary = 21
+pattern OpBinary = 22
 
-opSearchPath :: Word8
-opSearchPath = 23
+pattern OpSearchPath :: Word8
+pattern OpSearchPath = 23
 
 -- ---------------------------------------------------------------------------
 -- Sub-type flags

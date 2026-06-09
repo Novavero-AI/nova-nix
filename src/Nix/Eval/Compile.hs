@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 -- | Compile Nix 'Expr' AST trees to flat C bytecode.
 --
 -- Post-order traversal: children are compiled before parents, so child
@@ -54,34 +56,34 @@ import Nix.Eval.CBytecode
     formalName,
     formalNamedSet,
     formalSet,
-    opApp,
-    opAssert,
-    opAttrs,
-    opBinary,
-    opHasAttr,
-    opIf,
-    opIndStr,
-    opLambda,
-    opLet,
-    opList,
-    opLitBool,
-    opLitFloat,
-    opLitInt,
-    opLitNull,
-    opLitPath,
-    opLitUri,
-    opResolvedVar,
-    opSearchPath,
-    opSelect,
-    opStr,
-    opUnary,
-    opVar,
-    opWith,
-    opWithVar,
     strpartInterp,
     strpartLit,
     unaryNegate,
     unaryNot,
+    pattern OpApp,
+    pattern OpAssert,
+    pattern OpAttrs,
+    pattern OpBinary,
+    pattern OpHasAttr,
+    pattern OpIf,
+    pattern OpIndStr,
+    pattern OpLambda,
+    pattern OpLet,
+    pattern OpList,
+    pattern OpLitBool,
+    pattern OpLitFloat,
+    pattern OpLitInt,
+    pattern OpLitNull,
+    pattern OpLitPath,
+    pattern OpLitUri,
+    pattern OpResolvedVar,
+    pattern OpSearchPath,
+    pattern OpSelect,
+    pattern OpStr,
+    pattern OpUnary,
+    pattern OpVar,
+    pattern OpWith,
+    pattern OpWithVar,
   )
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
@@ -105,12 +107,12 @@ compileExpr = go
   where
     go :: Expr -> IO Word32
     go (ELit atom) = compileLit atom
-    go (EStr parts) = compileStringParts opStr parts
-    go (EIndStr parts) = compileStringParts opIndStr parts
-    go (EVar name) = compileSymbolOp opVar name
-    go (EWithVar name) = compileSymbolOp opWithVar name
+    go (EStr parts) = compileStringParts OpStr parts
+    go (EIndStr parts) = compileStringParts OpIndStr parts
+    go (EVar name) = compileSymbolOp OpVar name
+    go (EWithVar name) = compileSymbolOp OpWithVar name
     go (EResolvedVar level idx) =
-      cbcEmit opResolvedVar 0 0 (fi level) (fi idx) 0
+      cbcEmit OpResolvedVar 0 0 (fi level) (fi idx) 0
     go (EAttrs isRec bindings captureInfo) =
       compileAttrs isRec bindings captureInfo
     go (EList exprs) = compileList exprs
@@ -120,7 +122,7 @@ compileExpr = go
     go (EApp func arg) = do
       funcIdx <- go func
       argIdx <- go arg
-      cbcEmit opApp 0 0 funcIdx argIdx 0
+      cbcEmit OpApp 0 0 funcIdx argIdx 0
     go (ELambda formals body captureInfo) =
       compileLambda formals body captureInfo
     go (ELet bindings body captureInfo) =
@@ -129,23 +131,23 @@ compileExpr = go
       condIdx <- go cond
       thenIdx <- go thenExpr
       elseIdx <- go elseExpr
-      cbcEmit opIf 0 0 condIdx thenIdx elseIdx
+      cbcEmit OpIf 0 0 condIdx thenIdx elseIdx
     go (EWith scope body) = do
       scopeIdx <- go scope
       bodyIdx <- go body
-      cbcEmit opWith 0 0 scopeIdx bodyIdx 0
+      cbcEmit OpWith 0 0 scopeIdx bodyIdx 0
     go (EAssert cond body) = do
       condIdx <- go cond
       bodyIdx <- go body
-      cbcEmit opAssert 0 0 condIdx bodyIdx 0
+      cbcEmit OpAssert 0 0 condIdx bodyIdx 0
     go (EUnary op operand) = do
       operandIdx <- go operand
-      cbcEmit opUnary (encodeUnaryOp op) 0 operandIdx 0 0
+      cbcEmit OpUnary (encodeUnaryOp op) 0 operandIdx 0 0
     go (EBinary op left right) = do
       leftIdx <- go left
       rightIdx <- go right
-      cbcEmit opBinary (encodeBinaryOp op) 0 leftIdx rightIdx 0
-    go (ESearchPath name) = compileSymbolOp opSearchPath name
+      cbcEmit OpBinary (encodeBinaryOp op) 0 leftIdx rightIdx 0
+    go (ESearchPath name) = compileSymbolOp OpSearchPath name
 
     -- -----------------------------------------------------------------
     -- Literals
@@ -154,16 +156,16 @@ compileExpr = go
     compileLit :: NixAtom -> IO Word32
     compileLit (NixInt n) =
       let (lo, hi) = splitInt64 n
-       in cbcEmit opLitInt 0 0 lo hi 0
+       in cbcEmit OpLitInt 0 0 lo hi 0
     compileLit (NixFloat d) =
       let (lo, hi) = splitDouble d
-       in cbcEmit opLitFloat 0 0 lo hi 0
+       in cbcEmit OpLitFloat 0 0 lo hi 0
     compileLit (NixBool b) =
-      cbcEmit opLitBool 0 (if b then 1 else 0) 0 0 0
+      cbcEmit OpLitBool 0 (if b then 1 else 0) 0 0 0
     compileLit NixNull =
-      cbcEmit opLitNull 0 0 0 0 0
-    compileLit (NixUri u) = compileSymbolOp opLitUri u
-    compileLit (NixPath p) = compileSymbolOp opLitPath p
+      cbcEmit OpLitNull 0 0 0 0 0
+    compileLit (NixUri u) = compileSymbolOp OpLitUri u
+    compileLit (NixPath p) = compileSymbolOp OpLitPath p
 
     -- \| Emit an instruction whose only operand is an interned symbol.
     compileSymbolOp :: Word8 -> Text -> IO Word32
@@ -197,7 +199,7 @@ compileExpr = go
     compileAttrs isRec bindings captureInfo = do
       dataOff <- compileBindings bindings
       capOff <- compileCaptureInfo captureInfo
-      cbcEmit opAttrs (if isRec then 1 else 0) (fi (length bindings)) dataOff capOff 0
+      cbcEmit OpAttrs (if isRec then 1 else 0) (fi (length bindings)) dataOff capOff 0
 
     -- -----------------------------------------------------------------
     -- Lists (EList)
@@ -207,7 +209,7 @@ compileExpr = go
     compileList exprs = do
       childIndices <- mapM go exprs
       dataOff <- emitWordList childIndices
-      cbcEmit opList 0 (fi (length exprs)) dataOff 0 0
+      cbcEmit OpList 0 (fi (length exprs)) dataOff 0 0
 
     -- -----------------------------------------------------------------
     -- Select / HasAttr
@@ -221,13 +223,13 @@ compileExpr = go
         Just d -> go d
       (pathOff, pathLen) <- compileAttrPath path
       let hasDef = case defExpr of Nothing -> 0; Just _ -> 1
-      cbcEmit opSelect hasDef pathLen targetIdx pathOff defIdx
+      cbcEmit OpSelect hasDef pathLen targetIdx pathOff defIdx
 
     compileHasAttr :: Expr -> [AttrKey] -> IO Word32
     compileHasAttr target path = do
       targetIdx <- go target
       (pathOff, pathLen) <- compileAttrPath path
-      cbcEmit opHasAttr 0 pathLen targetIdx pathOff 0
+      cbcEmit OpHasAttr 0 pathLen targetIdx pathOff 0
 
     compileAttrPath :: [AttrKey] -> IO (Word32, Word16)
     compileAttrPath path = do
@@ -252,7 +254,7 @@ compileExpr = go
       bodyIdx <- go body
       formalsOff <- compileFormals formals
       capOff <- compileCaptureInfo captureInfo
-      cbcEmit opLambda (encodeFormalType formals) 0 formalsOff bodyIdx capOff
+      cbcEmit OpLambda (encodeFormalType formals) 0 formalsOff bodyIdx capOff
 
     compileFormals :: Formals -> IO Word32
     compileFormals (FormalName name) = do
@@ -291,7 +293,7 @@ compileExpr = go
       bodyIdx <- go body
       dataOff <- compileBindings bindings
       capOff <- compileCaptureInfo captureInfo
-      cbcEmit opLet 0 (fi (length bindings)) dataOff bodyIdx capOff
+      cbcEmit OpLet 0 (fi (length bindings)) dataOff bodyIdx capOff
 
     -- -----------------------------------------------------------------
     -- Bindings (shared by EAttrs and ELet)
