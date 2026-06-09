@@ -58,10 +58,10 @@ import qualified Network.HTTP.Types.Status as HTTP
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
+import Nix.Hash (bytesToHexText, hexToBytes, rawHashWithAlgo)
 import Nix.Store (Store (..), addToStore, isValid, scanReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
-import qualified NovaCache.Hash as Hash
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
@@ -98,11 +98,9 @@ builtinFetchurlBuilder :: Text
 builtinFetchurlBuilder = "builtin:fetchurl"
 
 -- | Derivation environment keys read by @builtin:fetchurl@.
-envUrl, envOut, envOutputHash, envOutputHashMode :: Text
+envUrl, envOut :: Text
 envUrl = "url"
 envOut = "out"
-envOutputHash = "outputHash"
-envOutputHashMode = "outputHashMode"
 
 -- | HTTP success status code.
 httpStatusOk :: Int
@@ -412,16 +410,23 @@ isWindows = System.Info.os == "mingw32"
 -- 'runBuilder', so the shared output-registration path is reused unchanged.
 runBuiltinFetchurl :: Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
 runBuiltinFetchurl drv outputDirs =
-  case (Map.lookup envUrl (drvEnv drv), lookup envOut outputDirs) of
-    (Nothing, _) -> pure (Left (1, "builtin:fetchurl: derivation has no 'url'"))
-    (_, Nothing) -> pure (Left (1, "builtin:fetchurl: derivation defines no 'out' output"))
-    (Just url, Just outPath) -> do
+  case (Map.lookup envUrl (drvEnv drv), lookup envOut outputDirs, fixedOutput) of
+    (Nothing, _, _) -> pure (Left (1, "builtin:fetchurl: derivation has no 'url'"))
+    (_, Nothing, _) -> pure (Left (1, "builtin:fetchurl: derivation defines no 'out' output"))
+    (_, _, Nothing) -> pure (Left (1, "builtin:fetchurl: 'out' output has no fixed-output hash"))
+    (Just url, Just outPath, Just out) -> do
       downloaded <- downloadUrl url
       case downloaded of
         Left err -> pure (Left (1, "builtin:fetchurl: " <> err))
         Right body -> do
           BS.writeFile outPath body
-          pure (verifyFetchHash drv url body)
+          pure (verifyFetchHash url out body)
+  where
+    -- builtin:fetchurl derivations are always fixed-output; the expected hash
+    -- lives in the canonical output spec (doHashAlgo + doHash), not the env.
+    fixedOutput = case drvOutputs drv of
+      (out : _) | not (T.null (doHashAlgo out)) -> Just out
+      _ -> Nothing
 
 -- | Download a URL to a strict 'BS.ByteString' using nova-nix's own linked
 -- HTTP client (the same 'Network.HTTP.Client' the substituter uses) — no
@@ -446,35 +451,40 @@ downloadUrl url = do
       where
         code = HTTP.statusCode (HTTP.responseStatus response)
 
--- | Verify downloaded bytes against the derivation's @outputHash@.  Flat mode
--- (the sha256 of the raw bytes) only; @recursive@ (NAR hash) is not yet
--- supported.  An empty or absent hash skips verification.
-verifyFetchHash :: Derivation -> Text -> BS.ByteString -> Either (Int, Text) ()
-verifyFetchHash drv url body =
-  case Map.lookup envOutputHashMode (drvEnv drv) of
-    Just "recursive" ->
-      Left (1, "builtin:fetchurl: recursive outputHashMode not yet supported (flat only)")
-    _ -> case Map.lookup envOutputHash (drvEnv drv) of
-      Nothing -> Right ()
-      Just expected
-        | T.null expected -> Right ()
-        | otherwise -> case Hash.parseNixHash expected of
-            Left _ ->
-              Left (1, "builtin:fetchurl: unsupported outputHash format (want sha256:<base32>): " <> expected)
-            Right expectedHash
-              | computed == expectedHash -> Right ()
-              | otherwise ->
-                  Left
-                    ( 1,
-                      "builtin:fetchurl: hash mismatch for "
-                        <> url
-                        <> "\n  expected: "
-                        <> expected
-                        <> "\n  got:      "
-                        <> Hash.formatNixHash computed
-                    )
-              where
-                computed = Hash.hashBytes body
+-- | Verify the fetched bytes against the derivation's fixed-output hash, read
+-- from the canonical output spec.  @doHashAlgo@ is @sha256@/@sha512@/… (or
+-- @r:sha256@ for recursive); @doHash@ is the base-16 digest eval normalized the
+-- user's hash into.  Flat mode is fully supported across algorithms; recursive
+-- (unpack/executable) fetches are a separate feature — they require unpacking
+-- the download — and fail with a clear message rather than a wrong result.
+verifyFetchHash :: Text -> DerivationOutput -> BS.ByteString -> Either (Int, Text) ()
+verifyFetchHash url out body
+  | recursive =
+      Left (1, "builtin:fetchurl: recursive outputHashMode (unpack/executable) not yet supported; fetch flat and unpack in a build phase")
+  | otherwise = case (hexToBytes (doHash out), rawHashWithAlgo algo body) of
+      (Nothing, _) -> Left (1, "builtin:fetchurl: malformed expected hash for " <> url)
+      (_, Nothing) -> Left (1, "builtin:fetchurl: unsupported hash algorithm '" <> algo <> "'")
+      (Just expected, Just got)
+        | expected == got -> Right ()
+        | otherwise ->
+            Left
+              ( 1,
+                "builtin:fetchurl: hash mismatch for "
+                  <> url
+                  <> "\n  expected: "
+                  <> algoField
+                  <> ":"
+                  <> doHash out
+                  <> "\n  got:      "
+                  <> algoField
+                  <> ":"
+                  <> bytesToHexText got
+              )
+  where
+    algoField = doHashAlgo out
+    (recursive, algo) = case T.stripPrefix "r:" algoField of
+      Just rest -> (True, rest)
+      Nothing -> (False, algoField)
 
 -- ---------------------------------------------------------------------------
 -- Output registration

@@ -29,6 +29,7 @@ import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
 import Nix.Eval.Types (emptyCList)
 import Nix.Expr.Types
+import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathExists, scanReferences, setReadOnly, writeDrv)
@@ -2677,6 +2678,28 @@ testTrivialBuildIO = do
               Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
 
+-- | Pure hash decode/digest helpers shared by eval (fixed-output paths) and
+-- the builder (builtin:fetchurl verification).
+testHashHelpers :: IO [Bool]
+testHashHelpers = do
+  putStrLn "hash/decode-helpers"
+  sequence
+    [ runTest "hexToBytes empty" $ assertEqual "empty" (Just BS.empty) (Hash.hexToBytes ""),
+      runTest "hexToBytes deadbeef" $
+        assertEqual "deadbeef" (Just (BS.pack [0xde, 0xad, 0xbe, 0xef])) (Hash.hexToBytes "deadbeef"),
+      runTest "hexToBytes uppercase" $
+        assertEqual "DEADBEEF" (Just (BS.pack [0xde, 0xad, 0xbe, 0xef])) (Hash.hexToBytes "DEADBEEF"),
+      runTest "hexToBytes odd length rejected" $ assertEqual "odd" Nothing (Hash.hexToBytes "abc"),
+      runTest "hexToBytes non-hex rejected" $ assertEqual "nonhex" Nothing (Hash.hexToBytes "zz"),
+      runTest "rawHashWithAlgo sha256 empty == known vector" $
+        assertEqual
+          "sha256-empty"
+          (Hash.hexToBytes "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+          (Hash.rawHashWithAlgo "sha256" BS.empty),
+      runTest "rawHashWithAlgo unknown algo rejected" $
+        assertEqual "unknown" Nothing (Hash.rawHashWithAlgo "sha3-256" (BS.pack [1, 2, 3]))
+    ]
+
 testStoreOps :: IO [Bool]
 testStoreOps = do
   putStrLn "store/ops"
@@ -4249,6 +4272,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testStorePaths,
           testDerivation,
           testTrivialBuildIO,
+          testHashHelpers,
           testEvalLiterals,
           testEvalVariables,
           testEvalArithmetic,
