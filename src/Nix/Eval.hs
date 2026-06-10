@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | Nix expression evaluator.
 --
@@ -88,7 +89,7 @@ import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpcode, cbcShortArg)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpcode, cbcShortArg, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
@@ -190,45 +191,45 @@ evalBytecode :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBytecode env bcIdx =
   let opcode = unsafePerformIO (cbcOpcode bcIdx)
    in case opcode of
-        0 {- LIT_INT -} ->
+        OpLitInt ->
           let lo = unsafePerformIO (cbcArg1 bcIdx)
               hi = unsafePerformIO (cbcArg2 bcIdx)
            in pure (VInt (reassembleInt64 lo hi))
-        1 {- LIT_FLOAT -} ->
+        OpLitFloat ->
           let lo = unsafePerformIO (cbcArg1 bcIdx)
               hi = unsafePerformIO (cbcArg2 bcIdx)
            in pure (VFloat (reassembleDouble lo hi))
-        2 {- LIT_BOOL -} ->
+        OpLitBool ->
           let flag = unsafePerformIO (cbcShortArg bcIdx)
            in pure (VBool (flag /= 0))
-        3 {- LIT_NULL -} -> pure VNull
-        4 {- LIT_URI -} ->
+        OpLitNull -> pure VNull
+        OpLitUri ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
            in pure (mkStr (symbolText (Symbol sym)))
-        5 {- LIT_PATH -} ->
+        OpLitPath ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
            in VPath <$> resolvePathLiteral (symbolText (Symbol sym))
-        6 {- STR -} -> evalBcStr env bcIdx
-        7 {- IND_STR -} -> evalBcIndStr env bcIdx
-        8 {- VAR -} ->
+        OpStr -> evalBcStr env bcIdx
+        OpIndStr -> evalBcIndStr env bcIdx
+        OpVar ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
            in evalVar env (symbolText (Symbol sym))
-        9 {- WITH_VAR -} ->
+        OpWithVar ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
               name = symbolText (Symbol sym)
            in evalWithVar env name
-        10 {- RESOLVED_VAR -} ->
+        OpResolvedVar ->
           let level = fromIntegral (unsafePerformIO (cbcArg1 bcIdx))
               idx = fromIntegral (unsafePerformIO (cbcArg2 bcIdx))
            in force (envLookupResolved level idx env)
-        11 {- ATTRS -} -> evalBcAttrs env bcIdx
-        12 {- LIST -} -> evalBcList env bcIdx
-        13 {- SELECT -} -> evalBcSelect env bcIdx
-        14 {- HAS_ATTR -} -> evalBcHasAttr env bcIdx
-        15 {- APP -} -> evalBcApp env bcIdx
-        16 {- LAMBDA -} -> evalBcLambda env bcIdx
-        17 {- LET -} -> evalBcLet env bcIdx
-        18 {- IF -} ->
+        OpAttrs -> evalBcAttrs env bcIdx
+        OpList -> evalBcList env bcIdx
+        OpSelect -> evalBcSelect env bcIdx
+        OpHasAttr -> evalBcHasAttr env bcIdx
+        OpApp -> evalBcApp env bcIdx
+        OpLambda -> evalBcLambda env bcIdx
+        OpLet -> evalBcLet env bcIdx
+        OpIf ->
           let condIdx = unsafePerformIO (cbcArg1 bcIdx)
               thenIdx = unsafePerformIO (cbcArg2 bcIdx)
               elseIdx = unsafePerformIO (cbcArg3 bcIdx)
@@ -238,7 +239,7 @@ evalBytecode env bcIdx =
                   VBool True -> evalBytecode env thenIdx
                   VBool False -> evalBytecode env elseIdx
                   _ -> throwEvalError ("'if' condition must be a Boolean, got " <> typeName condVal)
-        19 {- WITH -} ->
+        OpWith ->
           let scopeIdx = unsafePerformIO (cbcArg1 bcIdx)
               bodyIdx = unsafePerformIO (cbcArg2 bcIdx)
               -- Lazy with: defer forcing the scope until a WITH_VAR lookup
@@ -247,7 +248,7 @@ evalBytecode env bcIdx =
               -- eagerly forcing the scope would blackhole.
               scopeThunk = cheapThunkBc env scopeIdx
            in evalBytecode (pushLazyWithScope scopeThunk env) bodyIdx
-        20 {- ASSERT -} ->
+        OpAssert ->
           let condIdx = unsafePerformIO (cbcArg1 bcIdx)
               bodyIdx = unsafePerformIO (cbcArg2 bcIdx)
            in do
@@ -256,14 +257,14 @@ evalBytecode env bcIdx =
                   VBool True -> evalBytecode env bodyIdx
                   VBool False -> throwEvalError "assertion failed"
                   _ -> throwEvalError ("assertion condition must be a Boolean, got " <> typeName condVal)
-        21 {- UNARY -} ->
+        OpUnary ->
           let flags_ = unsafePerformIO (cbcFlags bcIdx)
               operandIdx = unsafePerformIO (cbcArg1 bcIdx)
            in do
                 val <- evalBytecode env operandIdx
                 evalUnary (decodeUnaryOp flags_) val
-        22 {- BINARY -} -> evalBcBinary env bcIdx
-        23 {- SEARCH_PATH -} ->
+        OpBinary -> evalBcBinary env bcIdx
+        OpSearchPath ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
            in evalSearchPath env (symbolText (Symbol sym))
         _ -> throwEvalError "evalBytecode: unknown opcode"
