@@ -19,6 +19,7 @@ module Main (main) where
 import Control.Monad (void, (>=>))
 import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (catMaybes)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
@@ -29,13 +30,14 @@ import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
-import Nix.Store (Store, closeStore, openStore, writeDrv, writeDrvAterm)
+import Nix.Store (Store (..), closeStore, isValid, openStore, registerPaths, registrationFor, setReadOnly, writeDrv, writeDrvAterm)
 import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, platformStoreDir, storePathToFilePath)
 import Paths_nova_nix (getDataDir)
-import System.Directory (getCurrentDirectory, getTemporaryDirectory)
+import System.Directory (copyFile, createDirectoryIfMissing, doesDirectoryExist, getCurrentDirectory, getTemporaryDirectory, listDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
+import qualified System.FilePath as FP
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
 
 -- ---------------------------------------------------------------------------
@@ -223,7 +225,13 @@ buildFile extraPaths dataDir filePath = do
           -- The full .drv closure (root + every transitive input) recorded
           -- during evaluation; written to the store before building.
           drvClosure <- readIORef (esDrvClosure st)
+          sourceCache <- readIORef (esSourcePathCache st)
           store <- openStore platformStoreDir
+          -- Materialize eval-coerced source paths (src = ./file, path
+          -- interpolation): evaluation computes their store paths as text
+          -- only — the parity runner's store is not writable — so the build
+          -- driver performs the copy and registration.
+          materializeEvalSources store sourceCache
           buildResult <- buildAndRegister store drvClosure drv drvSP
           closeStore store
           case buildResult of
@@ -286,6 +294,40 @@ buildAndRegister store drvClosure drv drvSP = do
           { bcTmpDir = tmpDir
           }
   buildWithDeps config store drv drvSP
+
+-- | Copy eval-coerced source paths into the store and register them.  The
+-- evaluator's source-path cache maps each coerced filesystem path to its
+-- @source@ fixed-output store path (text only — eval performs no store
+-- writes).  Each entry not already valid is copied in, made read-only, and
+-- registered with its real NAR hash.  A copied source carries no references.
+materializeEvalSources :: Store -> Map.Map T.Text T.Text -> IO ()
+materializeEvalSources store sourceCache = do
+  regs <- catMaybes <$> mapM adopt (Map.toList sourceCache)
+  registerPaths (stDB store) regs
+  where
+    adopt (rawPath, spText) =
+      case parseStorePath defaultStoreDir spText of
+        Nothing -> pure Nothing
+        Just sp -> do
+          valid <- isValid store sp
+          if valid
+            then pure Nothing
+            else do
+              let dest = storePathToFilePath platformStoreDir sp
+              copyPathInto (T.unpack rawPath) dest
+              setReadOnly dest
+              Just <$> registrationFor store sp Nothing []
+
+-- | Recursively copy a file or directory tree to a destination path.
+copyPathInto :: FilePath -> FilePath -> IO ()
+copyPathInto src dest = do
+  isDir <- doesDirectoryExist src
+  if isDir
+    then do
+      createDirectoryIfMissing True dest
+      names <- listDirectory src
+      mapM_ (\name -> copyPathInto (src FP.</> name) (dest FP.</> name)) names
+    else copyFile src dest
 
 -- | Write every recorded @.drv@ ATerm (keyed by its store-path text) to the
 -- store.  Keys come from evaluation via 'storePathToText' so they always parse;
