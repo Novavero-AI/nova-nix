@@ -22,9 +22,9 @@ $ nova-nix build pkgs\windows\hello.nix
   ...      (17 fixed-output fetches, one per MSYS2 package)
   [build]  mingw-w64-seed
   [build]  hello
-C:\nix\store\4lv3zydln7y7wg0znf56dfmzf5s59h9g-hello
+C:\nix\store\zr07i99kqnv48q29n706qxar7h1gfins-hello
 
-$ C:\nix\store\4lv3zydln7y7wg0znf56dfmzf5s59h9g-hello\hello.exe
+$ C:\nix\store\zr07i99kqnv48q29n706qxar7h1gfins-hello\hello.exe
 Hello from the first native Windows Nix build.
 ```
 

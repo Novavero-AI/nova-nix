@@ -13,9 +13,13 @@ derivation {
   name = "hello";
   system = "x86_64-windows";
   builder = "cmd.exe";
+  # --no-insert-timestamp: ld writes link time into the PE header (two
+  # timestamps; 4 bytes total), the one source of nondeterminism between
+  # otherwise bit-identical cold builds.  Zeroing it makes the output
+  # byte-for-byte reproducible.
   args = [
     "/c"
-    "mkdir %out% && ${seed}/mingw64/bin/gcc.exe %src% -o %out%/hello.exe"
+    "mkdir %out% && ${seed}/mingw64/bin/gcc.exe %src% -Wl,--no-insert-timestamp -o %out%/hello.exe"
   ];
   src = ./hello.c;
   # Windows resolves a subprocess's DLLs via PATH (no RPATH): gcc.exe spawns
