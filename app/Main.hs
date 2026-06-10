@@ -33,7 +33,7 @@ import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (Store (..), closeStore, isValid, openStore, registerPaths, registrationFor, setReadOnly, writeDrv, writeDrvAterm)
 import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, platformStoreDir, storePathToFilePath)
 import Paths_nova_nix (getDataDir)
-import System.Directory (copyFile, createDirectoryIfMissing, doesDirectoryExist, getCurrentDirectory, getTemporaryDirectory, listDirectory)
+import System.Directory (canonicalizePath, copyFile, createDirectoryIfMissing, doesDirectoryExist, getCurrentDirectory, getTemporaryDirectory, listDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
@@ -122,8 +122,13 @@ main = do
       exitFailure
 
 -- | Evaluate a .nix file and print the result.
+--
+-- The file argument is canonicalized first: relative path literals inside the
+-- file resolve against the file's directory ('esBaseDir'), and a relative base
+-- dir would be re-prefixed on every resolution (doubling it).
 evalFile :: Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
-evalFile strict extraPaths dataDir filePath = do
+evalFile strict extraPaths dataDir rawFilePath = do
+  filePath <- canonicalizePath rawFilePath
   source <- readFileAutoEncoding filePath
   case parseNix (T.pack filePath) source of
     Left err -> do
@@ -194,8 +199,10 @@ evalExprAterm extraPaths dataDir source =
           TIO.putStrLn (toATerm drv)
 
 -- | Parse, evaluate, extract derivation, build, and print result.
+-- The file argument is canonicalized for the same reason as in 'evalFile'.
 buildFile :: [T.Text] -> FilePath -> FilePath -> IO ()
-buildFile extraPaths dataDir filePath = do
+buildFile extraPaths dataDir rawFilePath = do
+  filePath <- canonicalizePath rawFilePath
   source <- readFileAutoEncoding filePath
   case parseNix (T.pack filePath) source of
     Left err -> do
