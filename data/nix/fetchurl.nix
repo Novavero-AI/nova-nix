@@ -1,12 +1,19 @@
-# Nix built-in fetchurl — creates a fixed-output derivation that downloads a URL.
-# This file is normally shipped with the Nix daemon as <nix/fetchurl.nix>.
-# nova-nix bundles it so that nixpkgs bootstrap works without a system Nix install.
+# nova-nix's implementation of the <nix/fetchurl.nix> interface.
+#
+# Nix exposes a built-in fetcher expression under the search-path entry
+# <nix/fetchurl.nix>; nixpkgs' bootstrap imports it directly, so nova-nix
+# must provide one with the exact same interface and derivation output.
+# Every attribute below feeds the .drv ATerm, so the produced derivation
+# (and therefore its store path) byte-matches upstream Nix — this is
+# enforced by the parity CI job.  The argument names, default chains, and
+# derivation attributes are all fixed by that contract; only fetch one
+# thing at a time and let the fixed-output hash do the verifying.
 {
-  system ? "", # obsolete
+  system ? "", # ignored; kept for interface compatibility
   url,
   hash ? "", # an SRI hash
 
-  # Legacy hash specification
+  # Pre-SRI hash arguments, still accepted everywhere in nixpkgs.
   md5 ? "",
   sha1 ? "",
   sha256 ? "",
@@ -42,9 +49,13 @@
 
 derivation (
   {
+    # Handled in-process by the Builder, not spawned as a subprocess
+    # (see Nix.Builder.runBuiltinFetchurl).
     builder = "builtin:fetchurl";
 
-    # New-style output content requirements.
+    # An unpacked or executable output is a tree, so its fixed-output
+    # hash must be taken over the NAR serialisation rather than the
+    # flat file bytes.
     outputHashMode = if unpack || executable then "recursive" else "flat";
 
     inherit
@@ -56,9 +67,11 @@ derivation (
 
     system = "builtin";
 
-    # No need to double the amount of network traffic
+    # The fetch is cheaper than copying the result between machines.
     preferLocalBuild = true;
 
+    # Proxy configuration may legitimately vary between hosts without
+    # changing what gets fetched, so it is allowed through the env.
     impureEnvVars = [
       "http_proxy"
       "https_proxy"
@@ -67,7 +80,8 @@ derivation (
       "no_proxy"
     ];
 
-    # To make "nix-prefetch-url" work.
+    # Tooling that prefetches (nix-prefetch-url and friends) reads the
+    # candidate URLs from this attribute.
     urls = [ url ];
   }
   // (if impure then { __impure = true; } else { inherit outputHashAlgo outputHash; })
