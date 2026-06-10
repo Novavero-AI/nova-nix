@@ -14,7 +14,7 @@
 
 ## Status
 
-nova-nix builds natively on Windows. The toolchain is itself a store path — fetched, hash-verified, and unpacked through derivations — and the builder runs it directly:
+nova-nix builds natively on Windows. The toolchain is itself a store path (fetched, hash-verified, and unpacked through derivations), and the builder runs it directly:
 
 ```console
 $ nova-nix build pkgs\windows\hello.nix
@@ -65,7 +65,7 @@ $ nova-nix --nix-path nixpkgs=/path eval FILE.nix
 Six layers — Haskell for logic, C99 for data:
 
 1. **Parser** (`Nix.Parser`, `Nix.Expr`) — hand-rolled recursive descent; the full Nix grammar to a 19-constructor AST.
-2. **Evaluator** (`Nix.Eval`) — the AST compiles to a flat 24-opcode bytecode that a lazy, thunk-memoizing evaluator runs. Recursive `let`/`rec` are knot-tied; reference cycles are caught by blackhole detection. The evaluator is polymorphic over its effect via `MonadEval` — `PureEval` for tests, `EvalIO` for the real thing.
+2. **Evaluator** (`Nix.Eval`) — the AST compiles to a flat 24-opcode bytecode that a lazy, thunk-memoizing evaluator runs. Recursive `let`/`rec` are knot-tied; reference cycles are caught by blackhole detection. The evaluator is polymorphic over its effect via `MonadEval`: `PureEval` for tests, `EvalIO` for the real thing.
 3. **Data layer** (`cbits/nn_*.c`) — nine arena-allocated C99 modules (interned symbols, sorted attrsets, thunks, environments, lists, context strings, bytecode, lambdas) hold evaluation data off the GHC heap. Haskell calls C to create and query it; C never calls back.
 4. **Store** (`Nix.Store`) — content-addressed `/nix/store` (`C:\nix\store` on Windows) with SQLite metadata and reference scanning.
 5. **Builder** (`Nix.Builder`) — dependency graph, topological sort, and binary-cache substitution before local builds.
