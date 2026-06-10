@@ -109,6 +109,19 @@ envOut = "out"
 httpStatusOk :: Int
 httpStatusOk = 200
 
+-- | Environment variable for the reproducible-builds.org build timestamp.
+envSourceDateEpoch :: Text
+envSourceDateEpoch = "SOURCE_DATE_EPOCH"
+
+-- | The fixed build timestamp handed to every builder: 1980-01-01 UTC.
+-- Determinism-aware tools (binutils @ld@ writes it into the PE header
+-- instead of the wall clock; gcc uses it for @__DATE__@\/@__TIME__@)
+-- produce identical output across builds.  1980 rather than 0 because
+-- zip timestamps cannot represent dates before 1980 — the same value
+-- nixpkgs' stdenv uses.  A derivation env may override it.
+sourceDateEpochValue :: Text
+sourceDateEpochValue = "315532800"
+
 -- ---------------------------------------------------------------------------
 -- Configuration
 -- ---------------------------------------------------------------------------
@@ -323,7 +336,8 @@ buildEnvironment config drv builderPath buildDir outputDirs =
             (envTmpDir, T.pack buildDir),
             (homeEnvVar, T.pack buildDir),
             (envNixStore, T.pack (unStoreDir (bcStoreDir config))),
-            (envPath, buildPath builderPath)
+            (envPath, buildPath builderPath),
+            (envSourceDateEpoch, sourceDateEpochValue)
           ]
    in -- Priority: output paths > derivation env > standard env
       Map.unions [outputEnv, baseEnv, standardEnv]

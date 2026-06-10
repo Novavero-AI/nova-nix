@@ -129,7 +129,7 @@ assertEvalFail label source =
 -- at known Git for Windows locations first, then PATH.  Checks known
 -- paths first to avoid picking up the WSL launcher at
 -- @C:\\Windows\\System32\\bash.exe@ which exits 1 when WSL is not
--- configured.  Real Nix builders always use bash from the store —
+-- configured.  Real Nix builders always use bash from the store â€”
 -- this bridges the gap until nova-nix bootstraps its own bash
 -- derivation.
 findTestShell :: IO Text
@@ -225,7 +225,7 @@ testDerivation = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Literals
+-- Tests: Eval â€” Literals
 -- ---------------------------------------------------------------------------
 
 testEvalLiterals :: IO [Bool]
@@ -247,7 +247,7 @@ testEvalLiterals = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Variables
+-- Tests: Eval â€” Variables
 -- ---------------------------------------------------------------------------
 
 testEvalVariables :: IO [Bool]
@@ -263,7 +263,7 @@ testEvalVariables = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Arithmetic
+-- Tests: Eval â€” Arithmetic
 -- ---------------------------------------------------------------------------
 
 testEvalArithmetic :: IO [Bool]
@@ -295,7 +295,7 @@ testEvalArithmetic = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Comparison
+-- Tests: Eval â€” Comparison
 -- ---------------------------------------------------------------------------
 
 testEvalComparison :: IO [Bool]
@@ -315,7 +315,7 @@ testEvalComparison = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Logic
+-- Tests: Eval â€” Logic
 -- ---------------------------------------------------------------------------
 
 testEvalLogic :: IO [Bool]
@@ -339,7 +339,7 @@ testEvalLogic = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Strings
+-- Tests: Eval â€” Strings
 -- ---------------------------------------------------------------------------
 
 testEvalStrings :: IO [Bool]
@@ -357,7 +357,7 @@ testEvalStrings = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — If/Assert
+-- Tests: Eval â€” If/Assert
 -- ---------------------------------------------------------------------------
 
 testEvalIfAssert :: IO [Bool]
@@ -375,7 +375,7 @@ testEvalIfAssert = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Let
+-- Tests: Eval â€” Let
 -- ---------------------------------------------------------------------------
 
 testEvalLet :: IO [Bool]
@@ -391,7 +391,7 @@ testEvalLet = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Attribute sets
+-- Tests: Eval â€” Attribute sets
 -- ---------------------------------------------------------------------------
 
 testEvalAttrs :: IO [Bool]
@@ -413,7 +413,7 @@ testEvalAttrs = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Recursive attribute sets
+-- Tests: Eval â€” Recursive attribute sets
 -- ---------------------------------------------------------------------------
 
 testEvalRecAttrs :: IO [Bool]
@@ -427,7 +427,7 @@ testEvalRecAttrs = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Lists
+-- Tests: Eval â€” Lists
 -- ---------------------------------------------------------------------------
 
 testEvalLists :: IO [Bool]
@@ -443,7 +443,7 @@ testEvalLists = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Lambda
+-- Tests: Eval â€” Lambda
 -- ---------------------------------------------------------------------------
 
 testEvalLambda :: IO [Bool]
@@ -461,7 +461,7 @@ testEvalLambda = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — With
+-- Tests: Eval â€” With
 -- ---------------------------------------------------------------------------
 
 testEvalWith :: IO [Bool]
@@ -526,7 +526,7 @@ testEvalWith = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Builtins
+-- Tests: Eval â€” Builtins
 -- ---------------------------------------------------------------------------
 
 testEvalBuiltins :: IO [Bool]
@@ -548,7 +548,7 @@ testEvalBuiltins = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Errors
+-- Tests: Eval â€” Errors
 -- ---------------------------------------------------------------------------
 
 testEvalErrors :: IO [Bool]
@@ -564,7 +564,7 @@ testEvalErrors = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Eval — Higher-order builtins
+-- Tests: Eval â€” Higher-order builtins
 -- ---------------------------------------------------------------------------
 
 testEvalHigherOrder :: IO [Bool]
@@ -879,8 +879,8 @@ testParserExprs = do
           (EBinary OpUpdate (EVar "a") (EBinary OpUpdate (EVar "b") (EVar "c"))),
       -- Lambda
       -- After variable resolution, lambda-bound vars become EResolvedVar.
-      -- FormalName "x" → slot 0; FormalSet [a,b] → a=0, b=1;
-      -- FormalNamedSet "args" [a] → args=0, a=1.
+      -- FormalName "x" â†’ slot 0; FormalSet [a,b] â†’ a=0, b=1;
+      -- FormalNamedSet "args" [a] â†’ args=0, a=1.
       runTest "parse simple lambda" $
         assertParse "lambda" "x: x" (ELambda (FormalName "x") (EResolvedVar 0 0) NoCaptureInfo),
       runTest "parse set pattern lambda" $
@@ -1108,7 +1108,7 @@ testParserIntegration = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch 1 — Trivial pure builtins + constants
+-- Tests: Batch 1 â€” Trivial pure builtins + constants
 -- ---------------------------------------------------------------------------
 
 testBatch1 :: IO [Bool]
@@ -1188,7 +1188,7 @@ testBatch1 = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch 2 — Arithmetic + bitwise builtins
+-- Tests: Batch 2 â€” Arithmetic + bitwise builtins
 -- ---------------------------------------------------------------------------
 
 testBatch2 :: IO [Bool]
@@ -1233,7 +1233,7 @@ testBatch2 = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch 3 — Attrset higher-order builtins
+-- Tests: Batch 3 â€” Attrset higher-order builtins
 -- ---------------------------------------------------------------------------
 
 testBatch3 :: IO [Bool]
@@ -1272,7 +1272,7 @@ testBatch3 = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch 4 — String operations
+-- Tests: Batch 4 â€” String operations
 -- ---------------------------------------------------------------------------
 
 testBatch4 :: IO [Bool]
@@ -1316,7 +1316,7 @@ testBatch4 = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch 5 — Serialization + hashing
+-- Tests: Batch 5 â€” Serialization + hashing
 -- ---------------------------------------------------------------------------
 
 testBatch5 :: IO [Bool]
@@ -1369,7 +1369,7 @@ testBatch5 = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch 6 — tryEval + deepSeq
+-- Tests: Batch 6 â€” tryEval + deepSeq
 -- ---------------------------------------------------------------------------
 
 testBatch6 :: IO [Bool]
@@ -1399,7 +1399,7 @@ testBatch6 = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch 7 — genericClosure
+-- Tests: Batch 7 â€” genericClosure
 -- ---------------------------------------------------------------------------
 
 testBatch7 :: IO [Bool]
@@ -1459,7 +1459,7 @@ evalNixIO baseDir source = case parseNix "<test>" source of
     st <- newEvalState baseDir
     runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
 
--- | Run a named IO eval test — single label, no double-wrapping.
+-- | Run a named IO eval test â€” single label, no double-wrapping.
 runTestIO :: Text -> FilePath -> Text -> NixValue -> IO Bool
 runTestIO label baseDir source expected = do
   result <- evalNixIO baseDir source
@@ -1546,7 +1546,7 @@ testImportIO = do
       ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch A — getEnv, currentTime, toPath
+-- Tests: Batch A â€” getEnv, currentTime, toPath
 -- ---------------------------------------------------------------------------
 
 testBatchA :: IO [Bool]
@@ -1579,7 +1579,7 @@ testBatchA = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch A — IO tests (getEnv)
+-- Tests: Batch A â€” IO tests (getEnv)
 -- ---------------------------------------------------------------------------
 
 testBatchAIO :: IO [Bool]
@@ -1611,7 +1611,7 @@ testBatchAIO = do
       ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch B — placeholder, storePath
+-- Tests: Batch B â€” placeholder, storePath
 -- ---------------------------------------------------------------------------
 
 testBatchB :: IO [Bool]
@@ -1645,7 +1645,7 @@ testBatchB = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch C — findFile
+-- Tests: Batch C â€” findFile
 -- ---------------------------------------------------------------------------
 
 testBatchC :: IO [Bool]
@@ -1708,7 +1708,7 @@ testBlackhole = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch D — toFile
+-- Tests: Batch D â€” toFile
 -- ---------------------------------------------------------------------------
 
 testBatchD :: IO [Bool]
@@ -1724,7 +1724,7 @@ testBatchD = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch E — scopedImport
+-- Tests: Batch E â€” scopedImport
 -- ---------------------------------------------------------------------------
 
 testBatchE :: IO [Bool]
@@ -1762,7 +1762,7 @@ testBatchEIO = do
       ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch F — fetchurl, fetchTarball, fetchGit
+-- Tests: Batch F â€” fetchurl, fetchTarball, fetchGit
 -- ---------------------------------------------------------------------------
 
 testBatchF :: IO [Bool]
@@ -1784,7 +1784,7 @@ testBatchF = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch G — ATerm serialization
+-- Tests: Batch G â€” ATerm serialization
 -- ---------------------------------------------------------------------------
 
 testBatchG :: IO [Bool]
@@ -1858,7 +1858,7 @@ testBatchG = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Batch H — derivation
+-- Tests: Batch H â€” derivation
 -- ---------------------------------------------------------------------------
 
 testBatchH :: IO [Bool]
@@ -2662,7 +2662,7 @@ restoreWritable path = do
     Dir.setPermissions path (Dir.setOwnerWritable True perms)
 
 -- | Step 1 of the Windows-stdenv ladder: prove the Builder can run a
--- trivial derivation end-to-end natively — a recipe that writes to @$out@,
+-- trivial derivation end-to-end natively â€” a recipe that writes to @$out@,
 -- with the output landing in the store.  No stdenv, no dependencies: just
 -- the raw build path (process spawn -> output capture -> addToStore),
 -- exercised on the host platform (@cmd.exe@ on Windows, @\/bin\/sh@ elsewhere).
@@ -2727,6 +2727,57 @@ testTrivialBuildIO = do
         sequence
           [ runTest "trivial build succeeds" $
               Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+          ]
+
+-- | The builder hands every build a fixed SOURCE_DATE_EPOCH (1980-01-01),
+-- the reproducible-builds.org convention that determinism-aware tools
+-- (ld's PE timestamp, gcc's __DATE__) honor.  Proven behaviorally: a build
+-- that echoes the variable into $out must see the pinned value.
+testSourceDateEpochIO :: IO [Bool]
+testSourceDateEpochIO = do
+  putStrLn "builder/source-date-epoch"
+  withTempStore $ \store -> do
+    let storeDir = stDir store
+        outPath = StorePath (T.replicate 31 "0" <> "5") "sde-probe"
+        (builder, args)
+          | SI.os == "mingw32" = ("cmd.exe", ["/c", "echo %SOURCE_DATE_EPOCH%>%out%"])
+          | otherwise = ("/bin/sh", ["-c", "echo $SOURCE_DATE_EPOCH > $out"])
+        drv =
+          Derivation
+            { drvOutputs =
+                [ DerivationOutput
+                    { doName = "out",
+                      doPath = outPath,
+                      doHashAlgo = "",
+                      doHash = ""
+                    }
+                ],
+              drvInputDrvs = Map.empty,
+              drvInputSrcs = [],
+              drvPlatform = currentPlatform,
+              drvBuilder = builder,
+              drvArgs = args,
+              drvEnv = Map.empty
+            }
+    buildTmp <- (</> "nova-nix-test-sde-build-tmp") <$> getTemporaryDirectory
+    forceRemoveIfExists buildTmp
+    createDirectoryIfMissing True buildTmp
+    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+    result <- buildDerivation config store drv
+    forceRemoveIfExists buildTmp
+    case result of
+      BuildFailure msg code ->
+        sequence
+          [ runTest "SOURCE_DATE_EPOCH build succeeds" $
+              Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+          ]
+      BuildSuccess sp -> do
+        content <- TIO.readFile (storePathToFilePath storeDir sp)
+        sequence
+          [ runTest "builder pins SOURCE_DATE_EPOCH to 1980-01-01" $
+              if "315532800" `T.isInfixOf` content
+                then Pass
+                else Fail ("unexpected content: " <> T.pack (show content))
           ]
 
 -- | Zstd compression level for test archives (zstd's own default).
@@ -2904,7 +2955,7 @@ testUnpackBuildIO = do
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
 -- derivation depends on a leaf; both @.drv@ files are pre-written to the store
 -- (as the build driver's closure-writing does), and 'buildWithDeps' must read
--- the closure, topologically order it, build the leaf first, then the root —
+-- the closure, topologically order it, build the leaf first, then the root â€”
 -- whose 'validateInputs' requires the leaf's realized output to be valid.
 --
 -- This is the regression guard for the input-@.drv@-closure fix: before it, no
@@ -2973,7 +3024,7 @@ testDependentBuildIO = do
           ]
 
 -- | Regression tests for the 2026-06-09 audit eval-fidelity fixes.  All are
--- parity-safe — none affects a derivation or store-path hash.
+-- parity-safe â€” none affects a derivation or store-path hash.
 testEvalFidelity :: IO [Bool]
 testEvalFidelity = do
   putStrLn "eval/audit-fidelity"
@@ -3024,11 +3075,11 @@ testEvalFidelity = do
         assertEval "leading-dot-type" "builtins.typeOf .5" (mkStr "float"),
       runTest "leading-dot float value" $
         assertEval "leading-dot-val" ".5 == 0.5" (VBool True),
-      -- PureEval tryEval must NOT catch abort — it propagates (matches C++ Nix)
+      -- PureEval tryEval must NOT catch abort â€” it propagates (matches C++ Nix)
       runTest "tryEval does not catch abort" $
         assertEvalFail "tryeval-abort" "(builtins.tryEval (builtins.abort \"x\")).success",
       -- every builtin in the registry (the source of builtinNames/builtinArity)
-      -- is actually exposed in the builtins set — guards against builtinRegistry
+      -- is actually exposed in the builtins set â€” guards against builtinRegistry
       -- drifting from the exposed builtins
       runTest "every registered builtin is exposed" $
         let missing = [n | n <- builtinNames, evalNix ("builtins ? \"" <> n <> "\"") /= Right (VBool True)]
@@ -3098,7 +3149,7 @@ testStoreOps = do
           createDirectoryIfMissing True scanDir
           let candidate = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "dep1"
               prefix = unStoreDir sd
-              -- Only 20 chars of hash — should not match 32-char candidate
+              -- Only 20 chars of hash â€” should not match 32-char candidate
               partialRef = prefix <> "/aaaaaaaaaaaaaaaaaaaa"
           BS.writeFile (scanDir </> "output.txt") (TE.encodeUtf8 (T.pack partialRef))
           refs <- scanReferences sd [candidate] scanDir
@@ -3312,9 +3363,9 @@ testFromATerm = do
                   then Pass
                   else Fail ("output names: " <> T.pack (show names))
           _ -> Fail ("expected VDerivation, got " <> T.pack (show val)),
-      -- builtinDerivation populates drvEnv with the output paths ($out, …)
+      -- builtinDerivation populates drvEnv with the output paths ($out, â€¦)
       -- and the build attributes.  Note: the .drv env does NOT contain a
-      -- "drvPath" key — matching C++ Nix, which never writes one.
+      -- "drvPath" key â€” matching C++ Nix, which never writes one.
       runTest "builtinDerivation populates drvEnv"
         $ assertRight
           "drvEnv"
@@ -3337,7 +3388,7 @@ testFromATerm = do
 
 -- | Create a minimal Derivation for builder tests.
 -- The shell path is discovered once via 'findTestShell' and threaded through.
--- All scripts are POSIX shell — bash is used on every platform.
+-- All scripts are POSIX shell â€” bash is used on every platform.
 mkTestBuildDrv :: Text -> StorePath -> Text -> Derivation
 mkTestBuildDrv shell outSP script =
   Derivation
@@ -3690,7 +3741,7 @@ testE2E = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Phase 4 — search paths, dynamic keys, directory import
+-- Tests: Phase 4 â€” search paths, dynamic keys, directory import
 -- ---------------------------------------------------------------------------
 
 testPhase4 :: IO [Bool]
@@ -3829,7 +3880,7 @@ testSymbol = do
 -- ---------------------------------------------------------------------------
 
 -- | Cast a StablePtr to CThunkPtr for CAttrSet tests.
--- CAttrSet stores void* — we use StablePtrs as opaque values in tests.
+-- CAttrSet stores void* â€” we use StablePtrs as opaque values in tests.
 spToCPtr :: StablePtr a -> CThunkPtr
 spToCPtr = castPtr . castStablePtrToPtr
 
@@ -3988,7 +4039,7 @@ testCThunk :: IO [Bool]
 testCThunk = do
   putStrLn "cthunk"
   -- Arena is already initialized by main's bracket.
-  -- Each test uses the shared arena (thunks accumulate — that's fine).
+  -- Each test uses the shared arena (thunks accumulate â€” that's fine).
   sequence
     [ runTestM "new pending + state" $ do
         sp <- newStablePtr ("pending" :: Text)
@@ -4282,7 +4333,7 @@ testBytecodeCompile = do
         op <- cbcOpcode idx
         count <- cbcShortArg idx
         dataOff <- cbcArg1 idx
-        -- 3 parts × 2 words each = 6 data words
+        -- 3 parts Ã— 2 words each = 6 data words
         tag0 <- cbcData dataOff
         _val0 <- cbcData (dataOff + 1)
         tag1 <- cbcData (dataOff + 2)
@@ -4629,6 +4680,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testStorePaths,
           testDerivation,
           testTrivialBuildIO,
+          testSourceDateEpochIO,
           testUnpackBuildIO,
           testDependentBuildIO,
           testEvalFidelity,
