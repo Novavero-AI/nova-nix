@@ -3,11 +3,15 @@
 
 module Main (main) where
 
+import qualified Codec.Archive.Tar as Tar
+import qualified Codec.Archive.Tar.Entry as TarEntry
+import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Exception (bracket_)
 import Control.Monad (filterM, void, when)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -16,6 +20,7 @@ import qualified Data.Text.IO as TIO
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig)
+import Nix.Builder.Unpack (builtinUnpackBuilder, envSrcs)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
@@ -2724,6 +2729,178 @@ testTrivialBuildIO = do
               Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
 
+-- | Zstd compression level for test archives (zstd's own default).
+testZstdCompressionLevel :: Int
+testZstdCompressionLevel = 3
+
+-- | Build a @.tar.zst@ archive from tar entries, MSYS2-package style.
+compressArchive :: [TarEntry.Entry] -> BL.ByteString
+compressArchive = ZstdL.compress testZstdCompressionLevel . Tar.write
+
+-- | Test-setup helpers: the paths and link targets below are short literals,
+-- so encoding them cannot fail; 'error' marks setup bugs, not test failures.
+tarPathOrDie :: Bool -> FilePath -> TarEntry.TarPath
+tarPathOrDie isDir p =
+  either (error . ("test tar path: " ++)) id (TarEntry.toTarPath isDir p)
+
+linkOrDie :: FilePath -> TarEntry.LinkTarget
+linkOrDie t =
+  fromMaybe (error ("test link target: " ++ t)) (TarEntry.toLinkTarget t)
+
+tarDir :: FilePath -> TarEntry.Entry
+tarDir p = TarEntry.directoryEntry (tarPathOrDie True p)
+
+tarFile :: FilePath -> BL.ByteString -> TarEntry.Entry
+tarFile p = TarEntry.fileEntry (tarPathOrDie False p)
+
+tarExecFile :: FilePath -> BL.ByteString -> TarEntry.Entry
+tarExecFile p content = (tarFile p content) {TarEntry.entryPermissions = 0o755}
+
+tarHardLink :: FilePath -> FilePath -> TarEntry.Entry
+tarHardLink p target =
+  TarEntry.simpleEntry (tarPathOrDie False p) (Tar.HardLink (linkOrDie target))
+
+tarSymLink :: FilePath -> FilePath -> TarEntry.Entry
+tarSymLink p target =
+  TarEntry.simpleEntry (tarPathOrDie False p) (Tar.SymbolicLink (linkOrDie target))
+
+-- | Step 3 of the ladder: @builtin:unpack@, the stage-0 seed extractor.
+-- Two zstd-compressed tar archives sharing a top-level prefix (the MSYS2
+-- @mingw64\/@ shape) are extracted into ONE output: regular files, an
+-- executable, a hardlink and a relative symlink (both materialized as
+-- copies), with pacman metadata (@.PKGINFO@\/@.MTREE@) skipped.  A second
+-- build proves cross-archive file collisions fail loudly, and a third that
+-- path traversal is rejected.
+testUnpackBuildIO :: IO [Bool]
+testUnpackBuildIO = do
+  putStrLn "builder/unpack-seed-archives"
+  withTempStore $ \store -> do
+    let storeDir = stDir store
+    tmpBase <- getTemporaryDirectory
+    let workDir = tmpBase </> "nova-nix-test-unpack-src"
+    forceRemoveIfExists workDir
+    createDirectoryIfMissing True workDir
+    let archiveTools = workDir </> "pkg-tools.tar.zst"
+        archiveData = workDir </> "pkg-data.tar.zst"
+        archiveCollide = workDir </> "pkg-collide.tar.zst"
+        archiveEscape = workDir </> "pkg-escape.tar.zst"
+    BL.writeFile archiveTools $
+      compressArchive
+        [ tarDir "pkg",
+          tarDir "pkg/bin",
+          tarExecFile "pkg/bin/tool.exe" "tool-payload",
+          tarHardLink "pkg/bin/tool-link.exe" "pkg/bin/tool.exe",
+          tarSymLink "pkg/bin/sh.exe" "tool.exe",
+          tarFile ".PKGINFO" "pkgname = tools"
+        ]
+    BL.writeFile archiveData $
+      compressArchive
+        [ tarDir "pkg",
+          tarDir "pkg/share",
+          tarFile "pkg/share/data.txt" "shared-data",
+          tarFile ".MTREE" "mtree-bytes"
+        ]
+    BL.writeFile archiveCollide $
+      compressArchive [tarFile "pkg/bin/tool.exe" "conflicting"]
+    BL.writeFile archiveEscape $
+      compressArchive [tarFile "../evil.txt" "escape"]
+    let mkUnpackDrv outP srcFiles =
+          Derivation
+            { drvOutputs =
+                [ DerivationOutput
+                    { doName = "out",
+                      doPath = outP,
+                      doHashAlgo = "",
+                      doHash = ""
+                    }
+                ],
+              drvInputDrvs = Map.empty,
+              drvInputSrcs = [],
+              drvPlatform = currentPlatform,
+              drvBuilder = builtinUnpackBuilder,
+              drvArgs = [],
+              drvEnv =
+                Map.fromList
+                  [(envSrcs, T.intercalate " " (map T.pack srcFiles))]
+            }
+        seedOut = StorePath (T.replicate 31 "0" <> "2") "unpack-seed"
+        collideOut = StorePath (T.replicate 31 "0" <> "3") "unpack-collide"
+        escapeOut = StorePath (T.replicate 31 "0" <> "4") "unpack-escape"
+    buildTmp <- (</> "nova-nix-test-unpack-build-tmp") <$> getTemporaryDirectory
+    forceRemoveIfExists buildTmp
+    createDirectoryIfMissing True buildTmp
+    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+    seedResult <- buildDerivation config store (mkUnpackDrv seedOut [archiveTools, archiveData])
+    collideResult <- buildDerivation config store (mkUnpackDrv collideOut [archiveTools, archiveCollide])
+    escapeResult <- buildDerivation config store (mkUnpackDrv escapeOut [archiveEscape])
+    forceRemoveIfExists buildTmp
+    forceRemoveIfExists workDir
+    seedChecks <- case seedResult of
+      BuildFailure msg code ->
+        sequence
+          [ runTest "unpack seed build succeeds" $
+              Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+          ]
+      BuildSuccess sp -> do
+        let outRoot = storePathToFilePath storeDir sp
+            readOut rel = do
+              let path = outRoot </> rel
+              exists <- Dir.doesFileExist path
+              if exists then Just <$> TIO.readFile path else pure Nothing
+        tool <- readOut ("pkg" </> "bin" </> "tool.exe")
+        toolLink <- readOut ("pkg" </> "bin" </> "tool-link.exe")
+        shLink <- readOut ("pkg" </> "bin" </> "sh.exe")
+        dataFile <- readOut ("pkg" </> "share" </> "data.txt")
+        pkgInfo <- Dir.doesFileExist (outRoot </> ".PKGINFO")
+        mtree <- Dir.doesFileExist (outRoot </> ".MTREE")
+        execBitOk <-
+          if SI.os == "mingw32"
+            then pure True -- NTFS has no exec bit; PATHEXT decides
+            else Dir.executable <$> getPermissions (outRoot </> "pkg" </> "bin" </> "tool.exe")
+        narInfo <- queryPathInfo (stDB store) sp
+        let realNarHash = case narInfo of
+              Just info ->
+                piNarSize info > 0 && T.isPrefixOf "sha256:" (piNarHash info)
+              Nothing -> False
+        sequence
+          [ runTest "unpack seed build succeeds" Pass,
+            runTest "unpack: file extracted with content" $
+              assertEqual "tool.exe" (Just "tool-payload") tool,
+            runTest "unpack: hardlink materialized as copy" $
+              assertEqual "tool-link.exe" (Just "tool-payload") toolLink,
+            runTest "unpack: relative symlink materialized as copy" $
+              assertEqual "sh.exe" (Just "tool-payload") shLink,
+            runTest "unpack: second archive merged into shared prefix" $
+              assertEqual "data.txt" (Just "shared-data") dataFile,
+            runTest "unpack: pacman metadata skipped" $
+              if pkgInfo || mtree
+                then Fail ".PKGINFO/.MTREE leaked into the output"
+                else Pass,
+            runTest "unpack: executable bit materialized (unix)" $
+              if execBitOk then Pass else Fail "tool.exe not executable",
+            runTest "unpack: real NAR hash registered" $
+              if realNarHash then Pass else Fail (T.pack (show narInfo))
+          ]
+    collideChecks <-
+      sequence
+        [ runTest "unpack: cross-archive file collision fails loudly" $
+            case collideResult of
+              BuildFailure msg _
+                | "file collision" `T.isInfixOf` msg -> Pass
+                | otherwise -> Fail ("wrong failure: " <> msg)
+              BuildSuccess _ -> Fail "collision build unexpectedly succeeded"
+        ]
+    escapeChecks <-
+      sequence
+        [ runTest "unpack: path traversal rejected" $
+            case escapeResult of
+              BuildFailure msg _
+                | "escapes archive root" `T.isInfixOf` msg -> Pass
+                | otherwise -> Fail ("wrong failure: " <> msg)
+              BuildSuccess _ -> Fail "escape build unexpectedly succeeded"
+        ]
+    pure (seedChecks ++ collideChecks ++ escapeChecks)
+
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
 -- derivation depends on a leaf; both @.drv@ files are pre-written to the store
 -- (as the build driver's closure-writing does), and 'buildWithDeps' must read
@@ -4452,6 +4629,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testStorePaths,
           testDerivation,
           testTrivialBuildIO,
+          testUnpackBuildIO,
           testDependentBuildIO,
           testEvalFidelity,
           testHashHelpers,

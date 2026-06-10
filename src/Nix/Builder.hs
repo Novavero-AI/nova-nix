@@ -57,6 +57,7 @@ import qualified Data.Text.IO as TIO
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
+import Nix.Builder.Unpack (builtinUnpackBuilder, runBuiltinUnpack)
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
@@ -198,7 +199,9 @@ buildDerivationInner config store drv = do
       -- everything else is a normal subprocess.  The output validation and
       -- registration below are shared by both paths.
       exitResult <- case drvBuilder drv of
-        b | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
+        b
+          | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
+          | b == builtinUnpackBuilder -> runBuiltinUnpack drv outputDirs
         _ -> runBuilder builderPath builderArgs environ buildDir
       case exitResult of
         Left (exitCode, stderrText) -> do

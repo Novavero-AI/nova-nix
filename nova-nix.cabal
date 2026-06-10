@@ -74,6 +74,7 @@ library
     Nix.DependencyGraph
     Nix.Derivation
     Nix.Builder
+    Nix.Builder.Unpack
     Nix.Substituter
     Nix.Builtins
     Nix.Hash
@@ -95,8 +96,10 @@ library
     , process             >= 1.6 && < 1.7
     , regex-tdfa          >= 1.3 && < 1.4
     , sqlite-simple       >= 0.4 && < 0.5
+    , tar                 >= 0.7.1 && < 0.8
     , text                >= 2.0 && < 2.2
     , time                >= 1.9 && < 1.15
+    , zstd                >= 0.1 && < 0.2
 
   c-sources:
     cbits/nn_symbol.c
@@ -163,7 +166,9 @@ test-suite nova-nix-test
     , nova-cache          >= 0.3.0 && < 0.4
     , nova-nix
     , process             >= 1.6 && < 1.7
+    , tar                 >= 0.7.1 && < 0.8
     , text                >= 2.0 && < 2.2
+    , zstd                >= 0.1 && < 0.2
 
 source-repository head
   type:     git
