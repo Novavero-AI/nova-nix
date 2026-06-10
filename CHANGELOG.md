@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0.0 — 2026-06-10
+
+### Milestone: The First Native Windows Build
+
+`nova-nix build pkgs/windows/hello.nix` compiles and runs a C program through a Nix derivation, natively on Windows: evaluation records the derivation closure, the builder realizes 17 fixed-output fetches and a toolchain unpack in dependency order, and a compiler that is itself a store path produces `C:\nix\store\…-hello\hello.exe`. The first package built natively on Windows by a Nix implementation.
+
+- **New: `builtin:unpack`** — an in-process archive extractor, the counterpart to `builtin:fetchurl`: the unpacker is the thing being bootstrapped, so it cannot be a store tool, and ambient `tar` is unpinned. Extracts `.tar.zst`/`.tar` archives listed in `srcs` into the single `out` output, in order. MSYS2 packages share the `mingw64/` prefix, so a package set merges into one working toolchain root. Symlink and hardlink entries are materialized as copies (store outputs must not require Developer Mode), pacman per-package metadata is skipped, and cross-archive file collisions and path traversal fail the build loudly. MSYS2's zstd frames carry no pledged content size, so decompression is streaming. New dependencies: `tar >= 0.7.1`, `zstd`.
+- **New: `pkgs/windows/seed.nix`** — stage 0 of the native Windows stdenv: the 17-package runtime closure of `mingw-w64-x86_64-gcc`, sha256-pinned against `repo.msys2.org`, fetched and merged into a single toolchain root. `pkgs/windows/hello.nix` is the proof build; its recipe also documents the Windows DLL rule (a subprocess resolves DLLs via `PATH`, not RPATH, so dependencies' `bin` dirs go on the build `PATH`).
+- **Fix: the build driver materializes eval-coerced source paths** — `src = ./file` produced only the source store path *text* during evaluation (eval performs no store writes — the parity runner's store is not writable), so input validation failed on the missing path. The driver now copies each coerced source into the store, marks it read-only, and registers it with its real NAR hash before building.
+- **`data/nix/fetchurl.nix` documentation rewritten as original prose** — the functional content is fixed byte-for-byte by derivation-hash parity and is unchanged (CI-verified).
+
 ## 0.3.0.0 — 2026-06-06
 
 ### Milestone: Derivation-Hash Parity with Upstream Nix
