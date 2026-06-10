@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               nova-nix
-version:            0.3.0.0
+version:            0.4.0.0
 synopsis:           Windows-native Nix implementation in Haskell and C99
 description:
   A from-scratch implementation of the Nix package manager that runs
