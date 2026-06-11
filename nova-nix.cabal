@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               nova-nix
-version:            0.4.0.0
+version:            0.5.0.0
 synopsis:           Windows-native Nix implementation in Haskell and C99
 description:
   A from-scratch implementation of the Nix package manager that runs
@@ -9,8 +9,9 @@ description:
   data layer that keeps evaluation data off the GHC heap.  It evaluates
   real Nix expressions (including nixpkgs), computes derivations and
   content-addressed store paths that byte-match upstream Nix, and builds
-  packages natively on Windows from a store-pinned MinGW-w64 toolchain,
-  with a derivation builder and binary-cache substituter.
+  packages natively on Windows from a store-pinned MinGW-w64 toolchain.
+  Built outputs are content-addressed, substituted from a binary cache
+  before building, and pushed to one with @nova-nix push@.
 
   Built on @nova-cache@ for NAR serialization, narinfo handling, and
   Ed25519-signed binary substitution.

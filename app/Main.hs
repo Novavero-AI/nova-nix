@@ -33,7 +33,8 @@ import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
 import Nix.Store (Store (..), closeStore, isValid, openStore, queryAllValidPaths, registerPaths, registrationFor, setReadOnly, writeDrv, writeDrvAterm)
-import Nix.Store.Path (StorePath (..), defaultStoreDir, parseStorePath, platformStoreDir, storePathHashLen, storePathToFilePath)
+import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDir, storePathHashLen, storePathToFilePath)
+import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir)
 import System.Directory (canonicalizePath, copyFile, createDirectoryIfMissing, doesDirectoryExist, getCurrentDirectory, getTemporaryDirectory, listDirectory)
 import System.Environment (getArgs)
@@ -51,6 +52,12 @@ data CliOpts = CliOpts
   { optNixPaths :: ![T.Text],
     optStrict :: !Bool,
     optAterm :: !Bool,
+    -- | Store directory override (default: the platform store).
+    optStore :: !(Maybe FilePath),
+    -- | Binary cache URL to substitute from before building.
+    optSubstituter :: !(Maybe String),
+    -- | Trusted public key (@name:base64@) for the substituter.
+    optTrustedKey :: !(Maybe String),
     optCommand :: !Command
   }
 
@@ -74,7 +81,7 @@ emptyPushArgs :: PushArgs
 emptyPushArgs = PushArgs Nothing Nothing False []
 
 parseArgs :: [String] -> CliOpts
-parseArgs = go (CliOpts [] False False CmdHelp)
+parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
   where
     go opts [] = opts
     go opts ("--nix-path" : val : rest) =
@@ -83,6 +90,12 @@ parseArgs = go (CliOpts [] False False CmdHelp)
       go (opts {optStrict = True}) rest
     go opts ("--aterm" : rest) =
       go (opts {optAterm = True}) rest
+    go opts ("--store" : dir : rest) =
+      go (opts {optStore = Just dir}) rest
+    go opts ("--substituter" : url : rest) =
+      go (opts {optSubstituter = Just url}) rest
+    go opts ("--trusted-key" : key : rest) =
+      go (opts {optTrustedKey = Just key}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : path : rest) =
       go (opts {optCommand = CmdBuild path}) rest
@@ -100,6 +113,8 @@ parseArgs = go (CliOpts [] False False CmdHelp)
       go (opts {optCommand = CmdEvalFile path}) rest
     -- Sub-parser for push: flags and explicit store paths in any order.
     goPush opts pushArgs [] = opts {optCommand = CmdPush pushArgs}
+    goPush opts pushArgs ("--store" : dir : rest) =
+      goPush (opts {optStore = Just dir}) pushArgs rest
     goPush opts pushArgs ("--cache" : url : rest) =
       goPush opts (pushArgs {paCacheUrl = Just url}) rest
     goPush opts pushArgs ("--key-file" : path : rest) =
@@ -132,8 +147,8 @@ main = do
     CmdEvalExpr expr
       | optAterm opts -> evalExprAterm (optNixPaths opts) dataDir expr
       | otherwise -> evalExpr (optStrict opts) (optNixPaths opts) dataDir expr
-    CmdBuild filePath -> buildFile (optNixPaths opts) dataDir filePath
-    CmdPush pushArgs -> pushCommand pushArgs
+    CmdBuild filePath -> buildFile opts dataDir filePath
+    CmdPush pushArgs -> pushCommand opts pushArgs
     CmdHelp -> do
       hPutStrLn stderr "Usage: nova-nix [--nix-path NAME=PATH] <command>"
       hPutStrLn stderr ""
@@ -149,6 +164,9 @@ main = do
       hPutStrLn stderr "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)"
       hPutStrLn stderr "  --all                  With push: select every valid path in the store"
       hPutStrLn stderr "  --key-file PATH        With push: file holding the cache API key"
+      hPutStrLn stderr "  --store DIR            Use DIR as the store (default: the platform store)"
+      hPutStrLn stderr "  --substituter URL      Try this binary cache before building"
+      hPutStrLn stderr "  --trusted-key K        Public key (name:base64) for the substituter"
       exitFailure
 
 -- | Evaluate a .nix file and print the result.
@@ -230,8 +248,9 @@ evalExprAterm extraPaths dataDir source =
 
 -- | Parse, evaluate, extract derivation, build, and print result.
 -- The file argument is canonicalized for the same reason as in 'evalFile'.
-buildFile :: [T.Text] -> FilePath -> FilePath -> IO ()
-buildFile extraPaths dataDir rawFilePath = do
+buildFile :: CliOpts -> FilePath -> FilePath -> IO ()
+buildFile opts dataDir rawFilePath = do
+  caches <- either failWith pure (substituterConfig (optSubstituter opts) (optTrustedKey opts))
   filePath <- canonicalizePath rawFilePath
   source <- readFileAutoEncoding filePath
   case parseNix (T.pack filePath) source of
@@ -240,7 +259,7 @@ buildFile extraPaths dataDir rawFilePath = do
       exitFailure
     Right expr -> do
       st0 <- newEvalState (takeDirectory filePath)
-      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
+      let searchPaths = mergeSearchPaths (optNixPaths opts) dataDir (esSearchPaths st0)
           st = st0 {esSearchPaths = searchPaths}
       result <- runEvalIO st $ do
         val <- eval (builtinEnv (esTimestamp st) searchPaths) expr
@@ -263,17 +282,17 @@ buildFile extraPaths dataDir rawFilePath = do
           -- during evaluation; written to the store before building.
           drvClosure <- readIORef (esDrvClosure st)
           sourceCache <- readIORef (esSourcePathCache st)
-          store <- openStore platformStoreDir
+          store <- openStore (chosenStoreDir opts)
           -- Materialize eval-coerced source paths (src = ./file, path
           -- interpolation): evaluation computes their store paths as text
           -- only — the parity runner's store is not writable — so the build
           -- driver performs the copy and registration.
           materializeEvalSources store sourceCache
-          buildResult <- buildAndRegister store drvClosure drv drvSP
+          buildResult <- buildAndRegister store caches drvClosure drv drvSP
           closeStore store
           case buildResult of
             BuildSuccess sp ->
-              TIO.putStrLn (T.pack (storePathToFilePath platformStoreDir sp))
+              TIO.putStrLn (T.pack (storePathToFilePath (chosenStoreDir opts) sp))
             BuildFailure msg code -> do
               TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
               exitFailure
@@ -312,11 +331,35 @@ extractDerivation _ = do
   hPutStrLn stderr "error: result is not a derivation"
   exitFailure
 
+-- | The store directory selected by @--store@, or the platform default.
+chosenStoreDir :: CliOpts -> StoreDir
+chosenStoreDir opts = maybe platformStoreDir StoreDir (optStore opts)
+
+-- | Default priority for a CLI-configured substituter (cache.nixos.org is 40).
+substituterPriority :: Int
+substituterPriority = 50
+
+-- | Build the cache list from @--substituter@\/@--trusted-key@.  Both or
+-- neither: a substituter without a trusted key would skip signature
+-- verification, and a key without a substituter is a mistake.
+substituterConfig :: Maybe String -> Maybe String -> Either T.Text [CacheConfig]
+substituterConfig Nothing Nothing = Right []
+substituterConfig Nothing (Just _) = Left "--trusted-key requires --substituter"
+substituterConfig (Just _) Nothing = Left "--substituter requires --trusted-key (name:base64)"
+substituterConfig (Just url) (Just key) =
+  Right
+    [ CacheConfig
+        { ccUrl = T.dropWhileEnd (== '/') (T.pack url),
+          ccPublicKey = T.pack key,
+          ccPriority = substituterPriority
+        }
+    ]
+
 -- | Write the .drv file to the store and build with dependency resolution.
 -- The drvPath is the store path of the .drv file itself, extracted from
 -- the evaluation result alongside the Derivation struct.
-buildAndRegister :: Store -> Map.Map T.Text T.Text -> Derivation -> StorePath -> IO BuildResult
-buildAndRegister store drvClosure drv drvSP = do
+buildAndRegister :: Store -> [CacheConfig] -> Map.Map T.Text T.Text -> Derivation -> StorePath -> IO BuildResult
+buildAndRegister store caches drvClosure drv drvSP = do
   -- Materialize the full input-.drv closure (every transitive dependency's
   -- recipe) to the store.  buildWithDeps reads these back to construct the
   -- dependency graph; without them it cannot realize any non-leaf derivation.
@@ -327,8 +370,9 @@ buildAndRegister store drvClosure drv drvSP = do
   -- Build with dependency resolution
   tmpDir <- getTemporaryDirectory
   let config =
-        (defaultBuildConfig platformStoreDir)
-          { bcTmpDir = tmpDir
+        (defaultBuildConfig (stDir store))
+          { bcTmpDir = tmpDir,
+            bcCaches = caches
           }
   buildWithDeps config store drv drvSP
 
@@ -337,8 +381,8 @@ buildAndRegister store drvClosure drv drvSP = do
 -- ---------------------------------------------------------------------------
 
 -- | Push the closure of the selected store paths to a binary cache.
-pushCommand :: PushArgs -> IO ()
-pushCommand pushArgs = do
+pushCommand :: CliOpts -> PushArgs -> IO ()
+pushCommand opts pushArgs = do
   cacheUrl <- case paCacheUrl pushArgs of
     Just url -> pure (T.dropWhileEnd (== '/') (T.pack url))
     Nothing -> failWith "push: --cache URL is required"
@@ -351,7 +395,7 @@ pushCommand pushArgs = do
     Just path -> do
       loaded <- loadApiKeyFile path
       either failWith (pure . Just) loaded
-  store <- openStore platformStoreDir
+  store <- openStore (chosenStoreDir opts)
   rootsResult <- resolvePushRoots store pushArgs
   case rootsResult of
     Left err -> do
@@ -425,7 +469,7 @@ materializeEvalSources store sourceCache = do
           if valid
             then pure Nothing
             else do
-              let dest = storePathToFilePath platformStoreDir sp
+              let dest = storePathToFilePath (stDir store) sp
               copyPathInto (T.unpack rawPath) dest
               setReadOnly dest
               Just <$> registrationFor store sp Nothing []

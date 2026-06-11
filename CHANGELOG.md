@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0.0 — 2026-06-11
+
+### Milestone: Push and Pull Against a Binary Cache
+
+A native Windows build can now publish its outputs to a binary cache and substitute them back on another machine. The toolchain seed and the `hello` build push to `cache.novavero.ai` with `nova-nix push`, and a fresh store realizes them by signed download instead of rebuilding.
+
+- **New: `nova-nix push`** — uploads store paths and their full reference closure to a binary cache. Each path is NAR-serialized (via `nova-cache`), its NAR uploaded before its narinfo so a client never sees metadata pointing at absent data, and the server signs each narinfo on receipt. Already-cached paths are skipped via one `GET /narinfo-hashes` diff, the recorded NAR hash is cross-checked against the store database before upload, and a signed round-trip is verified at the end. Published narinfos use the canonical `/nix/store` path form. Usage: `nova-nix push --cache URL --key-file KEY (--all | <paths>)`.
+- **New: `build --substituter URL --trusted-key K`** — try a binary cache before building. The trusted key (`name:base64`) is required alongside the substituter, since substituting without signature verification would be unsafe; the build falls back to local compilation for any path the cache lacks.
+- **New: `--store DIR`** — run a command against an alternate store directory instead of the platform default, so a build or push can target a scratch store.
+- **Reproducible `hello`** — `hello.nix` links with `-Wl,--no-insert-timestamp`, and the builder pins `SOURCE_DATE_EPOCH` (1980-01-01) for every build, so determinism-aware tools write fixed timestamps. Two cold bootstraps produce a byte-identical `hello.exe`.
+- **Dependencies modernized** — builds against `nova-cache >= 0.4.2` (Ed25519 signing, `normalizeKeyText`), `crypton >= 1.1` with `ram` replacing the deprecated `memory`, and current upper bounds for `containers`, `http-client-tls`, and `time`. No source change beyond the dependency swap; derivation-hash parity is unaffected (CI-verified).
+
 ## 0.4.0.0 — 2026-06-10
 
 ### Milestone: The First Native Windows Build

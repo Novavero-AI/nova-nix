@@ -57,8 +57,25 @@ $ nova-nix eval --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
 
 $ nova-nix eval FILE.nix                       # evaluate a file
 $ nova-nix build FILE.nix                       # build a derivation
+$ nova-nix push --cache URL --key-file KEY --all # publish the store to a cache
 $ nova-nix --nix-path nixpkgs=/path eval FILE.nix
 ```
+
+## Binary cache
+
+Built outputs are content-addressed, so they can be served and substituted like any Nix store path. `nova-nix push` uploads a path and its closure to a cache (NAR before narinfo, skipping what the cache already has, signed server-side); `build --substituter` pulls from one before compiling.
+
+```console
+$ nova-nix build pkgs\windows\hello.nix \
+    --store C:\scratch\store \
+    --substituter https://cache.novavero.ai \
+    --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
+  [subst]  mingw-w64-x86_64-gcc-16.1.0-5-any.pkg.tar.zst
+  ...      (signed download instead of a rebuild)
+  [subst]  hello
+```
+
+A public instance runs at `cache.novavero.ai`, seeded with the MinGW-w64 toolchain and the `hello` build.
 
 ## How it works
 
@@ -85,13 +102,13 @@ Two decisions shape the rest. **Haskell owns evaluation, C owns data layout** �
 
 ## Roadmap
 
-**Done** — parser, lazy bytecode evaluator, the Nix `builtins` set, the C99 data layer, content-addressed store, derivation builder, binary-cache substituter, `import <nixpkgs> {}` evaluation, derivation-hash parity with upstream Nix (`hello`'s 253-derivation closure byte-matches `nix-instantiate`), and native Windows builds from a store-pinned MinGW-w64 toolchain (stage 0).
+**Done** — parser, lazy bytecode evaluator, the Nix `builtins` set, the C99 data layer, content-addressed store, derivation builder, binary-cache substituter and `push`, `import <nixpkgs> {}` evaluation, derivation-hash parity with upstream Nix (`hello`'s 253-derivation closure byte-matches `nix-instantiate`), and native Windows builds from a store-pinned MinGW-w64 toolchain (stage 0), published to and substituted from a binary cache.
 
 **Next**
 
 - Windows stdenv stage 1 — a setup script and compiler wrappers over the seed; rebuild coreutils and bash from source.
 - Parity across more of nixpkgs — extend the byte-match check beyond `hello`'s closure.
-- Substituter — XZ decompression.
+- Cache — serve large NARs from object storage, and compress them.
 
 ## Library usage
 
