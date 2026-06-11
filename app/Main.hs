@@ -6,6 +6,7 @@
 -- nova-nix eval  FILE.nix                  Evaluate a .nix file, print result
 -- nova-nix eval  --expr 'EXPR'             Evaluate an inline expression
 -- nova-nix build FILE.nix                  Build a derivation from a .nix file
+-- nova-nix push  --cache URL --all         Push store paths to a binary cache
 -- @
 --
 -- Flags:
@@ -30,8 +31,9 @@ import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
-import Nix.Store (Store (..), closeStore, isValid, openStore, registerPaths, registrationFor, setReadOnly, writeDrv, writeDrvAterm)
-import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, platformStoreDir, storePathToFilePath)
+import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
+import Nix.Store (Store (..), closeStore, isValid, openStore, queryAllValidPaths, registerPaths, registrationFor, setReadOnly, writeDrv, writeDrvAterm)
+import Nix.Store.Path (StorePath (..), defaultStoreDir, parseStorePath, platformStoreDir, storePathHashLen, storePathToFilePath)
 import Paths_nova_nix (getDataDir)
 import System.Directory (canonicalizePath, copyFile, createDirectoryIfMissing, doesDirectoryExist, getCurrentDirectory, getTemporaryDirectory, listDirectory)
 import System.Environment (getArgs)
@@ -56,7 +58,20 @@ data Command
   = CmdEvalFile !FilePath
   | CmdEvalExpr !T.Text
   | CmdBuild !FilePath
+  | CmdPush !PushArgs
   | CmdHelp
+
+-- | Arguments to the push command.
+data PushArgs = PushArgs
+  { paCacheUrl :: !(Maybe String),
+    paKeyFile :: !(Maybe FilePath),
+    paAll :: !Bool,
+    paPaths :: ![String]
+  }
+
+-- | Push arguments before any flag is parsed.
+emptyPushArgs :: PushArgs
+emptyPushArgs = PushArgs Nothing Nothing False []
 
 parseArgs :: [String] -> CliOpts
 parseArgs = go (CliOpts [] False False CmdHelp)
@@ -71,6 +86,7 @@ parseArgs = go (CliOpts [] False False CmdHelp)
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : path : rest) =
       go (opts {optCommand = CmdBuild path}) rest
+    go opts ("push" : rest) = goPush opts emptyPushArgs rest
     go opts _ = opts
     -- Sub-parser for eval: handles --strict and --expr interleaved with the file arg.
     goEval opts [] = opts
@@ -82,6 +98,16 @@ parseArgs = go (CliOpts [] False False CmdHelp)
       go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
     goEval opts (path : rest) =
       go (opts {optCommand = CmdEvalFile path}) rest
+    -- Sub-parser for push: flags and explicit store paths in any order.
+    goPush opts pushArgs [] = opts {optCommand = CmdPush pushArgs}
+    goPush opts pushArgs ("--cache" : url : rest) =
+      goPush opts (pushArgs {paCacheUrl = Just url}) rest
+    goPush opts pushArgs ("--key-file" : path : rest) =
+      goPush opts (pushArgs {paKeyFile = Just path}) rest
+    goPush opts pushArgs ("--all" : rest) =
+      goPush opts (pushArgs {paAll = True}) rest
+    goPush opts pushArgs (path : rest) =
+      goPush opts (pushArgs {paPaths = paPaths pushArgs ++ [path]}) rest
 
 -- | Merge --nix-path entries, bundled data dir, and NIX_PATH search paths.
 -- The data dir is appended last so user paths take priority.
@@ -107,6 +133,7 @@ main = do
       | optAterm opts -> evalExprAterm (optNixPaths opts) dataDir expr
       | otherwise -> evalExpr (optStrict opts) (optNixPaths opts) dataDir expr
     CmdBuild filePath -> buildFile (optNixPaths opts) dataDir filePath
+    CmdPush pushArgs -> pushCommand pushArgs
     CmdHelp -> do
       hPutStrLn stderr "Usage: nova-nix [--nix-path NAME=PATH] <command>"
       hPutStrLn stderr ""
@@ -114,11 +141,14 @@ main = do
       hPutStrLn stderr "  eval FILE.nix          Evaluate a .nix file, print result"
       hPutStrLn stderr "  eval --expr 'EXPR'     Evaluate an inline expression"
       hPutStrLn stderr "  build FILE.nix         Build a derivation from a .nix file"
+      hPutStrLn stderr "  push --cache URL       Push store paths (and their closures) to a binary cache"
       hPutStrLn stderr ""
       hPutStrLn stderr "Flags:"
       hPutStrLn stderr "  --strict               Deep-force all thunks before printing (warning: OOM on large results)"
       hPutStrLn stderr "  --aterm                With eval --expr, print the derivation's .drv ATerm"
       hPutStrLn stderr "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)"
+      hPutStrLn stderr "  --all                  With push: select every valid path in the store"
+      hPutStrLn stderr "  --key-file PATH        With push: file holding the cache API key"
       exitFailure
 
 -- | Evaluate a .nix file and print the result.
@@ -301,6 +331,81 @@ buildAndRegister store drvClosure drv drvSP = do
           { bcTmpDir = tmpDir
           }
   buildWithDeps config store drv drvSP
+
+-- ---------------------------------------------------------------------------
+-- Push command
+-- ---------------------------------------------------------------------------
+
+-- | Push the closure of the selected store paths to a binary cache.
+pushCommand :: PushArgs -> IO ()
+pushCommand pushArgs = do
+  cacheUrl <- case paCacheUrl pushArgs of
+    Just url -> pure (T.dropWhileEnd (== '/') (T.pack url))
+    Nothing -> failWith "push: --cache URL is required"
+  case (paAll pushArgs, paPaths pushArgs) of
+    (True, _ : _) -> failWith "push: --all and explicit paths are mutually exclusive"
+    (False, []) -> failWith "push: name store paths to push, or pass --all"
+    _ -> pure ()
+  apiKey <- case paKeyFile pushArgs of
+    Nothing -> pure Nothing
+    Just path -> do
+      loaded <- loadApiKeyFile path
+      either failWith (pure . Just) loaded
+  store <- openStore platformStoreDir
+  rootsResult <- resolvePushRoots store pushArgs
+  case rootsResult of
+    Left err -> do
+      closeStore store
+      failWith err
+    Right roots -> do
+      result <- pushPaths (PushConfig cacheUrl apiKey) store roots
+      closeStore store
+      case result of
+        Left err -> failWith ("push failed: " <> err)
+        Right summary ->
+          TIO.putStrLn
+            ( "pushed "
+                <> T.pack (show (psPushed summary))
+                <> " path(s), "
+                <> T.pack (show (psSkipped summary))
+                <> " already cached"
+            )
+
+-- | Resolve push roots: every valid path with @--all@, otherwise each named
+-- path.  Named paths may be full store paths in either store-dir form, or a
+-- bare @hash-name@ basename.
+resolvePushRoots :: Store -> PushArgs -> IO (Either T.Text [StorePath])
+resolvePushRoots store pushArgs
+  | paAll pushArgs = do
+      pathTexts <- queryAllValidPaths (stDB store)
+      pure (traverse parseDbPath pathTexts)
+  | otherwise = pure (traverse parseArgPath (paPaths pushArgs))
+  where
+    parseDbPath txt =
+      maybe (Left ("unparseable store DB path: " <> txt)) Right (parseStorePath platformStoreDir txt)
+    parseArgPath raw =
+      let txt = T.pack raw
+          attempts =
+            [ parseStorePath platformStoreDir txt,
+              parseStorePath defaultStoreDir txt,
+              parseBareBasename txt
+            ]
+       in case catMaybes attempts of
+            (sp : _) -> Right sp
+            [] -> Left ("not a store path: " <> txt)
+    parseBareBasename txt
+      | T.length txt >= storePathHashLen + 2,
+        (hashPart, rest) <- T.splitAt storePathHashLen txt,
+        Just ('-', name) <- T.uncons rest,
+        not (T.null name) =
+          Just (StorePath hashPart name)
+      | otherwise = Nothing
+
+-- | Print an error to stderr and exit.
+failWith :: T.Text -> IO a
+failWith msg = do
+  TIO.hPutStrLn stderr msg
+  exitFailure
 
 -- | Copy eval-coerced source paths into the store and register them.  The
 -- evaluator's source-path cache maps each coerced filesystem path to its

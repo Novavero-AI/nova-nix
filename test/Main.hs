@@ -38,8 +38,9 @@ import Nix.Expr.Types
 import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
+import Nix.Push (computeClosure, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
 import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathExists, scanReferences, setReadOnly, writeDrv)
-import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath)
+import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Hash as CHash
@@ -2343,8 +2344,7 @@ testSubstituter = do
           NarInfo.niReferences = [],
           NarInfo.niDeriver = Nothing,
           NarInfo.niSigs = [],
-          NarInfo.niCA = Nothing,
-          NarInfo.niSystem = Nothing
+          NarInfo.niCA = Nothing
         }
 
 -- ---------------------------------------------------------------------------
@@ -2625,6 +2625,87 @@ testParseStorePath = do
           (Just (StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "pkg"))
           (parseStorePath windowsStoreDir "C:\\nix\\store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg")
     ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Push (pure narinfo construction + closure computation)
+-- ---------------------------------------------------------------------------
+
+testPushPure :: IO [Bool]
+testPushPure = do
+  putStrLn "push/narinfo"
+  let hashA = T.replicate 32 "a"
+      hashB = T.replicate 32 "b"
+      spA = StorePath hashA "hello-1.0"
+      spB = StorePath hashB "dep-2.0"
+      narHash = "sha256:0123abcdef"
+      -- References deliberately unsorted; deriver present.
+      ni = mkNarInfo spA narHash 1234 [spB, spA] (Just spB)
+  sequence
+    [ runTest "narinfo StorePath is canonical /nix/store" $
+        assertEqual "StorePath" ("/nix/store/" <> hashA <> "-hello-1.0") (NarInfo.niStorePath ni),
+      runTest "narinfo URL is nar/<digest>.nar" $
+        assertEqual "URL" "nar/0123abcdef.nar" (NarInfo.niUrl ni),
+      runTest "compression none mirrors NAR fields into file fields" $
+        assertEqual
+          "file fields"
+          ("none", NarInfo.niNarHash ni, NarInfo.niNarSize ni)
+          (NarInfo.niCompression ni, NarInfo.niFileHash ni, NarInfo.niFileSize ni),
+      runTest "narinfo sizes carry through" $
+        assertEqual "NarSize" 1234 (NarInfo.niNarSize ni),
+      runTest "references are sorted basenames" $
+        assertEqual
+          "References"
+          [hashA <> "-hello-1.0", hashB <> "-dep-2.0"]
+          (NarInfo.niReferences ni),
+      runTest "deriver renders as a basename" $
+        assertEqual "Deriver" (Just (hashB <> "-dep-2.0")) (NarInfo.niDeriver ni),
+      runTest "no client-side signatures" $
+        assertEqual "Sigs" ([] :: [Text]) (NarInfo.niSigs ni),
+      runTest "planMissing keeps only uncached paths" $
+        assertEqual
+          "missing"
+          [hashB]
+          (map spHash (planMissing (Set.singleton hashA) [spA, spB])),
+      runTest "stripHashPrefix drops the algo tag" $
+        assertEqual "tagged" "deadbeef" (stripHashPrefix "sha256:deadbeef"),
+      runTest "stripHashPrefix tolerates a bare digest" $
+        assertEqual "bare" "deadbeef" (stripHashPrefix "deadbeef"),
+      runTest "storePathBasename joins hash and name" $
+        assertEqual "basename" (hashA <> "-hello-1.0") (storePathBasename spA),
+      runTest "narFileName appends .nar" $
+        assertEqual "file" "0123abcdef.nar" (narFileName narHash)
+    ]
+
+-- | Closure computation against a real (temp) store database.
+testPushClosureIO :: IO [Bool]
+testPushClosureIO = do
+  putStrLn "push/closure"
+  withTempStore $ \store -> do
+    let spTop = StorePath (T.replicate 32 "1") "top"
+        spMid = StorePath (T.replicate 32 "2") "mid"
+        spLeaf = StorePath (T.replicate 32 "3") "leaf"
+        regFor sp refs =
+          PathRegistration
+            { prPath = sp,
+              prNarHash = "sha256:" <> T.replicate 52 "0",
+              prNarSize = 1,
+              prDeriver = Nothing,
+              prReferences = refs
+            }
+    registerPaths (stDB store) [regFor spTop [spMid], regFor spMid [spLeaf], regFor spLeaf []]
+    fromTop <- computeClosure store [spTop]
+    fromBoth <- computeClosure store [spTop, spLeaf]
+    sequence
+      [ runTest "closure walks transitive references" $
+          assertRight "fromTop" fromTop $ \closure ->
+            assertEqual
+              "hashes"
+              (Set.fromList (map spHash [spTop, spMid, spLeaf]))
+              (Set.fromList (map spHash closure)),
+        runTest "closure deduplicates across roots" $
+          assertRight "fromBoth" fromBoth $ \closure ->
+            assertEqual "count" (3 :: Int) (length closure)
+      ]
 
 -- | Helper: create a fresh temp store for IO tests.
 withTempStore :: (Store -> IO [Bool]) -> IO [Bool]
@@ -4732,6 +4813,8 @@ main = bracket_ arenaInit arenaDestroy $ do
           testDrvContext,
           testDepGraph,
           testSubstituter,
+          testPushPure,
+          testPushClosureIO,
           testBuildOrchestrator,
           testStoreDB,
           testParseStorePath,

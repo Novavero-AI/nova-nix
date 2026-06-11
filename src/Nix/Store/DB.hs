@@ -39,6 +39,7 @@ module Nix.Store.DB
     queryReferences,
     queryDeriver,
     queryPathInfo,
+    queryAllValidPaths,
 
     -- * Constants
     metaDirName,
@@ -234,6 +235,13 @@ queryReferences db sp = do
       \WHERE vp1.path = ?"
       (Only pathText) ::
       IO [Only Text]
+  pure [p | Only p <- rows]
+
+-- | Query every registered valid path, as full path text in registration
+-- order of the table (sorted for determinism).
+queryAllValidPaths :: StoreDB -> IO [Text]
+queryAllValidPaths db = do
+  rows <- query (sdbConn db) "SELECT path FROM ValidPaths ORDER BY path" () :: IO [Only Text]
   pure [p | Only p <- rows]
 
 -- | Query the deriver of a registered store path.

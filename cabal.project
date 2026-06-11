@@ -1,6 +1,3 @@
 packages: .
 constraints:
-  nova-cache -compression,
-  -- http-client-tls uses memory's ByteArrayAccess; crypton >= 1.1 switched
-  -- to ram, causing instance mismatches.  Pin until http-client-tls migrates.
-  crypton < 1.1
+  nova-cache -compression
