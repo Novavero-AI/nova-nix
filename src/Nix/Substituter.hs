@@ -50,6 +50,7 @@ module Nix.Substituter
   )
 where
 
+import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
 import Control.Monad (when)
 import qualified Data.ByteString as BS
@@ -184,7 +185,7 @@ verifyAndDecompress cache mgr narInfo = do
   verifySigs cache narInfo
   let compression = NarInfo.niCompression narInfo
   pure $ do
-    downloaded <- downloadNar mgr cache narInfo
+    downloaded <- downloadNarWithRetry mgr cache narInfo
     pure $ downloaded >>= decompressNar compression
 
 -- | Verify the NAR hash, deserialize, unpack to the store, set permissions,
@@ -281,6 +282,40 @@ fetchNarInfo mgr cache sp = do
       if code == httpNotFound
         then pure (Left SubstNotFound)
         else pure (Left (SubstError ("narinfo fetch failed: HTTP " <> T.pack (show code))))
+
+-- | How many times to attempt a NAR download before giving up and letting the
+-- caller fall back to a local build.  Matches Nix's @download-attempts@ default.
+narDownloadAttempts :: Int
+narDownloadAttempts = 5
+
+-- | Base delay between NAR download attempts, in microseconds.  The delay grows
+-- linearly with each retry (0.5s, 1s, …).
+narRetryBaseDelayMicros :: Int
+narRetryBaseDelayMicros = 500000
+
+-- | Download a NAR, retrying transient failures.
+--
+-- By the time this runs the narinfo has already been fetched and signature-
+-- verified, so the cache claims to hold this path: a failed blob fetch (a
+-- transient HTTP error, a stale-negative at a CDN edge, or a dropped
+-- connection) is far more likely a hiccup than a real miss.  Retrying a few
+-- times is much cheaper than the local rebuild a hard failure forces.  A 404
+-- on the narinfo itself (a genuine cache miss) is handled earlier in
+-- 'fetchNarInfo' and never reaches here.
+downloadNarWithRetry :: HTTP.Manager -> CacheConfig -> NarInfo.NarInfo -> IO (Either Text BS.ByteString)
+downloadNarWithRetry mgr cache narInfo = attempt narDownloadAttempts
+  where
+    attempt remaining = do
+      outcome <- try (downloadNar mgr cache narInfo)
+      case outcome of
+        Right (Right bytes) -> pure (Right bytes)
+        Right (Left err) -> retryOr err remaining
+        Left (e :: SomeException) -> retryOr ("NAR download error: " <> T.pack (show e)) remaining
+    retryOr err remaining
+      | remaining <= 1 = pure (Left err)
+      | otherwise = do
+          threadDelay (narRetryBaseDelayMicros * (narDownloadAttempts - remaining + 1))
+          attempt (remaining - 1)
 
 -- | Download the NAR file referenced by a narinfo.
 --
