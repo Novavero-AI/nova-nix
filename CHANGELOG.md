@@ -1,8 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.6.0.0 — 2026-06-12
 
+### Milestone: A Stage-1 stdenv That Builds Real Software
+
+nova-nix now builds real third-party software from source on Windows through a small stage-1 stdenv. A package is `{ name; src; buildInputs; }`, and a `setup.sh` genericBuild drives unpack → configure → build → install → a fixup that makes outputs standalone — proven on GNU hello, GNU sed, and zlib plus a program that links it.
+
+- **New: a store-pinned MSYS2 userland seed and `mkDerivation`** — the seed bash runs `setup.sh`, which unpacks the source, runs `./configure && make && make install`, and builds through the mingw toolchain. GNU hello and GNU sed build from source with a two-line derivation.
+- **New: `buildInputs`** — a package depends on another package. Each input's `include/` goes on `CPPFLAGS`, `lib/` on `LDFLAGS`, and `bin/` on `PATH`, and its derivation builds first. Proven by libgreet (a library built from source) and greeter (a program that links it).
+- **New: a `cc-wrapper`** — a `gcc`/`cc` shim installed on the build `PATH` ahead of the real toolchain. It strips ambient header/library search paths from the environment (hermeticity), defaults to `-std=gnu17` so classic gnulib-bearing sources compile under gcc 15+'s C23 default, and adds `-Wl,--no-insert-timestamp` for reproducible PE headers. A package can override the standard with its own `-std`.
+- **New: a fixup phase** — Windows has no RPATH, so a distributable binary must carry its non-system DLLs beside it. fixup reads each output binary's PE import table and, for every imported DLL outside the guaranteed Windows ABI, finds it among the declared inputs and bundles it, recursing to a fixpoint. An undeclared non-system DLL fails the build rather than shipping silently broken.
+- **New: build-phase overrides** — optional `dontConfigure` / `buildPhase` / `installPhase` attrs let a package build differently from the autotools default (e.g. via a hand-written makefile) while the common case stays a two-line derivation.
+- **Real third-party library: zlib 1.3.2** — its `./configure` emits Unix `.so` naming under MSYS2, so zlib builds via its `win32/Makefile.gcc` for a proper `zlib1.dll` and `libz.dll.a` import lib. A demo links zlib (statically against `libz.a`, or dynamically against `zlib1.dll` with the DLL bundled) and round-trips data.
 - **Relicensed from BSD-3-Clause to Apache-2.0.** Apache adds an explicit patent grant and trademark terms, and a `NOTICE` file now carries the copyright (Novavero AI Inc.). Earlier releases on Hackage remain under BSD-3-Clause.
+- **Substituter: retry transient NAR download failures** before falling back to a local build, matching Nix's `download-attempts` (5 attempts, linear backoff), so a dropped connection or a stale CDN negative no longer forces a rebuild.
+- **`builtin:fetchurl` sends a User-Agent**, so hosts that reject empty-UA requests (some GNU mirrors) serve the fetch.
+- **Docs:** 100% Haddock coverage across all modules.
 
 ## 0.5.0.0 — 2026-06-11
 
