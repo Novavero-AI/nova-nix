@@ -109,6 +109,12 @@ envOut = "out"
 httpStatusOk :: Int
 httpStatusOk = 200
 
+-- | User-Agent sent by @builtin:fetchurl@.  Some upstream servers (e.g.
+-- ftp.gnu.org) reject requests with no User-Agent as bot traffic with a 403,
+-- so the fetcher identifies itself like any other download client.
+fetchUserAgent :: BS.ByteString
+fetchUserAgent = "nova-nix (+https://github.com/Novavero-AI/nova-nix)"
+
 -- | Environment variable for the reproducible-builds.org build timestamp.
 envSourceDateEpoch :: Text
 envSourceDateEpoch = "SOURCE_DATE_EPOCH"
@@ -485,7 +491,8 @@ downloadUrl url = do
     fetch :: IO (Either Text BS.ByteString)
     fetch = do
       manager <- HTTP.newManager HTTPS.tlsManagerSettings
-      request <- HTTP.parseRequest (T.unpack url)
+      request0 <- HTTP.parseRequest (T.unpack url)
+      let request = request0 {HTTP.requestHeaders = ("User-Agent", fetchUserAgent) : HTTP.requestHeaders request0}
       response <- HTTP.httpLbs request manager
       pure (bodyOrError response)
     bodyOrError response
