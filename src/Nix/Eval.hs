@@ -5,7 +5,7 @@
 --
 -- Nix evaluation is LAZY.  Attribute set members and list elements
 -- are stored as thunks and only forced when their value is demanded.
--- Function arguments are likewise thunked — @(x: 1) (throw "boom")@
+-- Function arguments are likewise thunked - @(x: 1) (throw "boom")@
 -- returns @1@ because @x@ is never referenced.
 --
 -- The evaluator maintains an environment ('Env') that maps variable
@@ -177,14 +177,14 @@ eval env expr =
 
 -- | Force a thunk to a value.
 --
--- Delegates to 'forceThunk' which is a 'MonadEval' method — this
+-- Delegates to 'forceThunk' which is a 'MonadEval' method - this
 -- allows IO evaluators to implement memoization (caching the result
 -- after the first force) while pure evaluators simply re-evaluate.
 force :: (MonadEval m) => Thunk -> m NixValue
 force = forceThunk evalBytecode
 
 -- | Evaluate a bytecode instruction by index.
--- This is the primary evaluator — reads opcodes from the C bytecode
+-- This is the primary evaluator - reads opcodes from the C bytecode
 -- store and dispatches.  All recursive evaluation goes through this
 -- function, never through 'eval' directly.
 evalBytecode :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -244,7 +244,7 @@ evalBytecode env bcIdx =
               bodyIdx = unsafePerformIO (cbcArg2 bcIdx)
               -- Lazy with: defer forcing the scope until a WITH_VAR lookup
               -- actually needs it.  This is critical for nixpkgs where
-              -- all-packages.nix uses `with pkgs;` inside a fixpoint —
+              -- all-packages.nix uses `with pkgs;` inside a fixpoint -
               -- eagerly forcing the scope would blackhole.
               scopeThunk = cheapThunkBc env scopeIdx
            in evalBytecode (pushLazyWithScope scopeThunk env) bodyIdx
@@ -339,7 +339,7 @@ evalAddWithCoercion left right = case (left, right) of
   (VStr {}, VStr {}) -> evalBinary force OpAdd left right
   (VStr {}, VPath _) -> evalBinary force OpAdd left right
   -- Otherwise: string concatenation with STRICT coercion (Nix coerceMore=false)
-  -- — only strings and sets with __toString/outPath coerce; numbers, bools,
+  -- - only strings and sets with __toString/outPath coerce; numbers, bools,
   -- null, lists, and functions are type errors, matching C++ Nix's `+`.
   _ -> do
     (leftStr, leftCtx) <- coerceAddOperand left
@@ -404,7 +404,7 @@ evalBcStr env bcIdx0 = do
 
 -- | Evaluate an indented string literal from bytecode data buffer.  The common
 -- indentation is stripped from the LITERAL chunks before concatenation, so an
--- interpolated multi-line value cannot drag the computed indent down — matching
+-- interpolated multi-line value cannot drag the computed indent down - matching
 -- C++ Nix.
 evalBcIndStr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcIndStr env bcIdx0 = do
@@ -415,7 +415,7 @@ evalBcIndStr env bcIdx0 = do
   pure (VStr text ctx)
 
 -- | Evaluate string parts from the bytecode data buffer.  Each part is two
--- words: (tag, value).  tag=0 -> literal (value = symbol), tag=1 ->
+-- words: (tag, value).  tag=0 means literal (value = symbol), tag=1 means
 -- interpolation (value = bc_idx).  The 'Bool' marks literal (@True@) vs
 -- interpolated (@False@) so indented strings strip only the literals.
 evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [(Bool, Text, StringContext)]
@@ -496,7 +496,7 @@ evalBcApp env bcIdx0 = do
               applyValue partiallyApplied argVal
     _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
 
--- | Evaluate a lambda literal from bytecode — returns VLambda.
+-- | Evaluate a lambda literal from bytecode - returns VLambda.
 evalBcLambda :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcLambda env bcIdx0 =
   let flags_ = unsafePerformIO (cbcFlags bcIdx0)
@@ -614,7 +614,7 @@ evalBcRecAttrs env bindings captureInfo
           attrMap = buildBcAttrMapFromSlots bindings thunkList
        in filled `seq` pure (VAttrs (attrSetFromMap attrMap))
   | otherwise = do
-      -- Fallback: dynamic/nested keys — two-phase CAttrSet.
+      -- Fallback: dynamic/nested keys - two-phase CAttrSet.
       allKeys <- bcBindingAllKeys env bindings
       let cset = buildCAttrSetKeys allKeys
           attrSet = AttrSet cset
@@ -651,7 +651,7 @@ evalBcLet env bcIdx0 = do
           filled = fillCSlots slotsPtr (buildBcSlotThunks letEnv env bindings)
        in filled `seq` evalBytecode letEnv bodyIdx
     else do
-      -- Fallback: dynamic/nested keys — two-phase CAttrSet.
+      -- Fallback: dynamic/nested keys - two-phase CAttrSet.
       allKeys <- bcBindingAllKeys env bindings
       let cset = buildCAttrSetKeys allKeys
           parentEnv = buildCaptureEnv env captureInfo
@@ -693,7 +693,7 @@ buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
     slotThunk (BcInherit syms) =
       map (inheritLookup outerEnv . symbolText . Symbol) syms
     slotThunk (BcInheritFrom fromBcIdx syms) =
-      -- inherit (from) x y z; → one thunk per name that selects from the from-expr.
+      -- inherit (from) x y z; becomes one thunk per name that selects from the from-expr.
       -- Each thunk gets a minimal env with the from-value at slot 0.
       let fromThunk = mkThunkBc recEnv fromBcIdx
           mkInheritThunk sym =
@@ -740,7 +740,7 @@ buildBcThunkMap thunkEnv = foldM addBinding Map.empty
     addBinding acc (BcInherit syms) =
       pure (foldl' (\a sym -> let name = symbolText (Symbol sym) in insertWithMerge a name (inheritLookup thunkEnv name)) acc syms)
     addBinding acc (BcInheritFrom fromBcIdx syms) =
-      -- inherit (from) name -> select name from the from-expr.
+      -- inherit (from) name selects name from the from-expr.
       -- Create a small env with the from value at slot 0, then a
       -- synthetic expression that selects name from slot 0.
       let addInheritFrom a sym =
@@ -794,7 +794,7 @@ bcBindingAllKeys env bindings = fmap concat (mapM oneBinding bindings)
 -- ---------------------------------------------------------------------------
 
 -- | Evaluate a search path expression.
--- Desugars to @builtins.findFile builtins.nixPath "name"@ — exactly how
+-- Desugars to @builtins.findFile builtins.nixPath "name"@ - exactly how
 -- real Nix handles @\<name\>@ expressions.
 evalSearchPath :: (MonadEval m) => Env -> Text -> m NixValue
 evalSearchPath env name = do
@@ -1025,7 +1025,7 @@ builtin3 name f =
   )
 
 -- | Central registry of all builtins.  Adding a new builtin is a single
--- entry here plus its implementation function — no other files need changes.
+-- entry here plus its implementation function - no other files need changes.
 builtinRegistry :: (MonadEval m) => Map Text (BuiltinDef m)
 builtinRegistry =
   Map.fromList
@@ -1146,9 +1146,9 @@ builtinRegistry =
       -- 'derivationStrict' primop (matches C++ Nix corepkgs/derivation.nix).
       builtin1 "derivation" builtinDerivationLazy,
       builtin1 "derivationStrict" builtinDerivationStrict,
-      -- Error context (pass-through — context only matters on error)
+      -- Error context (pass-through - context only matters on error)
       builtin2 "addErrorContext" (\_ val -> pure val),
-      -- Attr position (return null — nixpkgs handles this gracefully)
+      -- Attr position (return null - nixpkgs handles this gracefully)
       builtin2 "unsafeGetAttrPos" (\_ _ -> pure VNull),
       -- Debugging (traceVerbose: same as trace for now, --trace-verbose not yet gated)
       builtin2 "traceVerbose" builtinTrace,
@@ -1198,7 +1198,7 @@ applyBuiltin name accArgs arg =
 -- (the pattern string), compile it immediately and store the compiled
 -- RE.Regex in a VCompiledRegex, replacing the raw VStr.  The compiled
 -- form is carried in VBuiltin's accumulated args and reused on every
--- subsequent application — zero recompilation.
+-- subsequent application - zero recompilation.
 precompileArgs :: Text -> [NixValue] -> [NixValue]
 precompileArgs "match" [VStr pat _] =
   let anchored = "^" <> pat <> "$"
@@ -1226,7 +1226,7 @@ applyValue other _ =
 --
 -- Direct case dispatch avoids rebuilding the polymorphic 'builtinRegistry'
 -- Map on every call.  'builtinRegistry' is polymorphic in @m@ so GHC
--- cannot cache it as a CAF — it gets reconstructed on every use.
+-- cannot cache it as a CAF - it gets reconstructed on every use.
 -- Pattern matching on the name is zero-allocation.
 executeBuiltin :: (MonadEval m) => Text -> [NixValue] -> m NixValue
 executeBuiltin name args = case name of
@@ -1346,9 +1346,9 @@ executeBuiltin name args = case name of
   -- Derivation construction: lazy 'derivation' over eager 'derivationStrict'
   "derivation" -> apply1 builtinDerivationLazy
   "derivationStrict" -> apply1 builtinDerivationStrict
-  -- Error context (pass-through — context only matters on error)
+  -- Error context (pass-through - context only matters on error)
   "addErrorContext" -> apply2 (\_ val -> pure val)
-  -- Attr position (return null — nixpkgs handles this gracefully)
+  -- Attr position (return null - nixpkgs handles this gracefully)
   "unsafeGetAttrPos" -> apply2 (\_ _ -> pure VNull)
   -- Debugging (traceVerbose: same as trace for now)
   "traceVerbose" -> apply2 builtinTrace
@@ -1382,7 +1382,7 @@ executeBuiltin name args = case name of
       _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — type checking
+-- Builtin implementations - type checking
 -- ---------------------------------------------------------------------------
 
 typeOfValue :: NixValue -> Text
@@ -1434,7 +1434,7 @@ isFunctionVal (VBuiltin _ _) = True
 isFunctionVal _ = False
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — list (arity 1)
+-- Builtin implementations - list (arity 1)
 -- ---------------------------------------------------------------------------
 
 builtinLength :: (MonadEval m) => NixValue -> m NixValue
@@ -1456,7 +1456,7 @@ builtinTail (VList cl)
 builtinTail other = throwEvalError ("builtins.tail: expected a list, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — string (arity 1)
+-- Builtin implementations - string (arity 1)
 -- ---------------------------------------------------------------------------
 
 builtinStringLength :: (MonadEval m) => NixValue -> m NixValue
@@ -1465,7 +1465,7 @@ builtinStringLength other =
   throwEvalError ("builtins.stringLength: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — control
+-- Builtin implementations - control
 -- ---------------------------------------------------------------------------
 
 builtinThrow :: (MonadEval m) => NixValue -> m NixValue
@@ -1477,7 +1477,7 @@ builtinAbort (VStr msg _) = abortEvaluation msg
 builtinAbort other = abortEvaluation ("builtins.abort: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — attr set (arity 1)
+-- Builtin implementations - attr set (arity 1)
 -- ---------------------------------------------------------------------------
 
 builtinAttrNames :: (MonadEval m) => NixValue -> m NixValue
@@ -1525,7 +1525,7 @@ listToAttrsPair thunk = do
     _ -> throwEvalError "builtins.listToAttrs: element must be a set"
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — attr set (arity 2)
+-- Builtin implementations - attr set (arity 2)
 -- ---------------------------------------------------------------------------
 
 builtinHasAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -1601,7 +1601,7 @@ catAttrsCollect key = go []
         _ -> throwEvalError "builtins.catAttrs: list element must be a set"
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — list higher-order (arity 2)
+-- Builtin implementations - list higher-order (arity 2)
 -- ---------------------------------------------------------------------------
 
 builtinMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -1817,7 +1817,7 @@ groupByCollect func (thunk : rest) acc = do
     _ -> throwEvalError "builtins.groupBy: function must return a string"
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — string (arity 2)
+-- Builtin implementations - string (arity 2)
 -- ---------------------------------------------------------------------------
 
 builtinConcatStringsSep :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -1839,7 +1839,7 @@ builtinConcatStringsSep other _ =
   throwEvalError ("builtins.concatStringsSep: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — arity 3
+-- Builtin implementations - arity 3
 -- ---------------------------------------------------------------------------
 
 builtinFoldl :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
@@ -1880,7 +1880,7 @@ builtinSubstring _ _ other =
 -- Builtin helpers
 -- ---------------------------------------------------------------------------
 
--- | Build a thunk that defers @f arg@ — the application only happens when
+-- | Build a thunk that defers @f arg@ - the application only happens when
 -- the thunk is forced.  Reuses the existing eval machinery via a synthetic
 -- @EApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in a self-contained env.
 -- Slot 0 = function, slot 1 = argument.
@@ -1916,7 +1916,7 @@ coerceToStringPermissive other = coerceToString True force applyValue other
 -- | Coerce a value to a string for a DERIVATION field (an env value or an
 -- arg).  Like 'coerceToStringPermissive', but a path literal is copied into
 -- the store: it becomes its source store path, with that path added to the
--- string context so it lands in the derivation's @inputSrcs@ — matching C++
+-- string context so it lands in the derivation's @inputSrcs@ - matching C++
 -- Nix's copy-to-store coercion of paths in derivation arguments/environment.
 coerceToStoreString :: (MonadEval m) => NixValue -> m (Text, StringContext)
 coerceToStoreString (VPath p) = do
@@ -1932,7 +1932,7 @@ coerceToStoreString other = coerceToStringPermissive other
 
 -- | Coerce a value for string interpolation (@"${...}"@).  Like
 -- 'coerceToString', but a path literal is copied into the store and replaced by
--- its source store path (with context) — matching C++ Nix, where interpolation
+-- its source store path (with context) - matching C++ Nix, where interpolation
 -- uses @copyToStore = true@, unlike 'builtins.toString', which does not copy.
 coerceToStringInterp :: (MonadEval m) => NixValue -> m (Text, StringContext)
 coerceToStringInterp (VPath p) = do
@@ -1957,7 +1957,7 @@ storeDirPrefix :: Text
 storeDirPrefix = defaultStoreDirText <> "/"
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — numeric + context
+-- Builtin implementations - numeric + context
 -- ---------------------------------------------------------------------------
 
 isPathVal :: NixValue -> Bool
@@ -2148,7 +2148,7 @@ builtinLessThan :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinLessThan a b = VBool <$> nixCompare force a b
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — arithmetic + bitwise
+-- Builtin implementations - arithmetic + bitwise
 -- ---------------------------------------------------------------------------
 
 builtinAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -2213,13 +2213,13 @@ builtinBitXor (VInt a) (VInt b) = pure (VInt (xor a b))
 builtinBitXor _ _ = throwEvalError "builtins.bitXor: expected two integers"
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — attr set higher-order
+-- Builtin implementations - attr set higher-order
 -- ---------------------------------------------------------------------------
 
 builtinMapAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinMapAttrs func (VAttrs attrs) =
   -- Each attr value is a deferred @f key val@, forced only on demand.
-  -- Eagerly builds all thunks via attrSetMapWithKey — with C arena thunks
+  -- Eagerly builds all thunks via attrSetMapWithKey - with C arena thunks
   -- (~16 bytes each), this is cheaper than the former MappedAttrs overhead
   -- and keeps all data off the GHC heap.
   -- Slot 0 = function, slot 1 = key, slot 2 = value.
@@ -2258,11 +2258,11 @@ formalsListToAttrs formals =
       Map.fromList
         [(efName f, evaluated (VBool (isJust (efDefault f)))) | f <- formals]
 
--- | @builtins.setFunctionArgs f args@ — wraps @f@ in a callable attrset
+-- | @builtins.setFunctionArgs f args@ - wraps @f@ in a callable attrset
 -- with @__functor@ (so it remains callable) and @__functionArgs@ metadata.
 -- Used by nixpkgs @lib.mirrorFunctionArgs@ / @lib.makeOverridable@.
 --
--- @__functor@ is @self: f@ — a lambda that ignores @self@ and returns
+-- @__functor@ is @self: f@ - a lambda that ignores @self@ and returns
 -- the original function.  The function is captured in the closure env.
 builtinSetFunctionArgs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSetFunctionArgs func (VAttrs argSpec) =
@@ -2289,7 +2289,7 @@ builtinZipAttrsWith func (VList cl) = do
   attrSets <- mapM forceToAttrSet thunks
   let merged = mergeAllAttrs attrSets
       -- Lazy: each result is a deferred f(name)(values) thunk, not eagerly
-      -- evaluated.  Critical for nixpkgs evalModules fixpoint — config is a
+      -- evaluated.  Critical for nixpkgs evalModules fixpoint - config is a
       -- self-referencing lazy attrset that must be COMPUTED (holding the lazy
       -- result) before any individual attribute thunks are forced.
       resultPairs = map (deferZip func) (Map.toList merged)
@@ -2311,7 +2311,7 @@ builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — string manipulation
+-- Builtin implementations - string manipulation
 -- ---------------------------------------------------------------------------
 
 builtinReplaceStrings ::
@@ -2370,7 +2370,7 @@ replaceAll pairs input = T.concat (go input)
       | otherwise = findMatch rest txt
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — regex (POSIX ERE via regex-tdfa)
+-- Builtin implementations - regex (POSIX ERE via regex-tdfa)
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
@@ -2379,7 +2379,7 @@ replaceAll pairs input = T.concat (go input)
 
 -- | Global regex compilation cache.  Keyed by the raw pattern string
 -- (including anchoring for match).  Idempotent memoization via
--- unsafePerformIO — same rationale as thunk memoization.
+-- unsafePerformIO - same rationale as thunk memoization.
 {-# NOINLINE regexCacheRef #-}
 regexCacheRef :: IORef (Map Text RE.Regex)
 regexCacheRef = unsafePerformIO (newIORef Map.empty)
@@ -2435,7 +2435,7 @@ matchWithCompiled compiled str =
           -- match is an Array of (String, (offset, len)) pairs.
           -- Index 0 is the full match; indices 1.. are capture groups.
           let groups = Array.elems match
-              -- Skip index 0 (full match) — return only capture groups.
+              -- Skip index 0 (full match) - return only capture groups.
               captureGroups = drop 1 groups
               -- A non-participating capture group has offset (-1); C++ Nix
               -- yields null for it, not the empty string.
@@ -2445,7 +2445,7 @@ matchWithCompiled compiled str =
 
 -- | @builtins.split regex str@: split a string by a POSIX ERE.
 -- Returns an alternating list of non-matched strings and match-group lists.
--- Example: @split "(x)" "axbxc"@ → @["a" ["x"] "b" ["x"] "c"]@
+-- Example: @split "(x)" "axbxc"@ yields @["a" ["x"] "b" ["x"] "c"]@
 builtinSplit :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 -- Pre-compiled path: regex was compiled at partial-application time.
 builtinSplit (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
@@ -2473,7 +2473,7 @@ splitWithCompiled compiled str =
 -- | Build the alternating list for builtins.split.
 buildSplitResult :: String -> Int -> [Array.Array Int (String, (Int, Int))] -> [Thunk]
 buildSplitResult remaining pos [] =
-  -- No more matches — emit the rest of the string.
+  -- No more matches - emit the rest of the string.
   [evaluated (mkStr (T.pack (drop pos remaining)))]
 buildSplitResult remaining pos (match : rest) =
   let elems = Array.elems match
@@ -2484,7 +2484,7 @@ buildSplitResult remaining pos (match : rest) =
       before = T.pack (take (matchStart - pos) (drop pos remaining))
       -- Capture groups (indices 1..)
       groups = drop 1 (Array.elems match)
-      -- A non-participating capture group has offset (-1) → null (as 'match').
+      -- A non-participating capture group has offset (-1) becomes null (as 'match').
       groupThunks =
         map (\(s, (off, _)) -> if off < 0 then evaluated VNull else evaluated (mkStr (T.pack s))) groups
       -- Continue after this match
@@ -2507,7 +2507,7 @@ ordToNix GT = 1
 compareVersionParts :: [Text] -> [Text] -> Int64
 compareVersionParts [] [] = 0
 -- When one version runs out, Nix pads the shorter side with an empty
--- component and keeps comparing — so "1.0" > "1.0pre" (empty sorts AFTER
+-- component and keeps comparing - so "1.0" > "1.0pre" (empty sorts AFTER
 -- "pre"), not "<" as a naive length comparison would give.
 compareVersionParts [] (b : bs) =
   case compareComponent "" b of
@@ -2617,7 +2617,7 @@ findVersionDash t idx = case T.uncons (T.drop idx t) of
   Just _ -> findVersionDash t (idx + 1)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — serialization + hashing
+-- Builtin implementations - serialization + hashing
 -- ---------------------------------------------------------------------------
 
 builtinToJSON :: (MonadEval m) => NixValue -> m NixValue
@@ -2686,7 +2686,7 @@ jsonEscapeString s = "\"" <> T.concatMap escapeChar s <> "\""
           let (q, r) = quotRem v 16
            in go q (hexDigit r : acc)
 
--- | Safe hex digit lookup (total for 0–15).
+-- | Safe hex digit lookup (total for 0-15).
 hexDigit :: Int -> Char
 hexDigit n
   | n >= 0 && n <= 9 = chr (ord '0' + n)
@@ -2830,7 +2830,7 @@ digestToHex :: (BA.ByteArrayAccess a) => a -> Text
 digestToHex = bytesToHexText . BA.convert
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — deep evaluation
+-- Builtin implementations - deep evaluation
 -- ---------------------------------------------------------------------------
 
 builtinDeepSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -2843,11 +2843,11 @@ deepForce (VList cl) = mapM_ ((force >=> deepForce) . Thunk) (clistThunks cl)
 deepForce (VAttrs attrs) = mapM_ (force >=> deepForce) (attrSetElems attrs)
 deepForce _ = pure ()
 
--- | @builtins.seq a b@ — evaluate @a@ to WHNF, then return @b@.
+-- | @builtins.seq a b@ - evaluate @a@ to WHNF, then return @b@.
 builtinSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSeq !_first = pure
 
--- | @builtins.trace msg val@ — print @msg@ to stderr, return @val@.
+-- | @builtins.trace msg val@ - print @msg@ to stderr, return @val@.
 builtinTrace :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinTrace msgVal result = do
   msg <- case msgVal of
@@ -2856,7 +2856,7 @@ builtinTrace msgVal result = do
   traceMessage ("trace: " <> msg)
   pure result
 
--- | @builtins.warn msg val@ — print warning to stderr, return @val@.
+-- | @builtins.warn msg val@ - print warning to stderr, return @val@.
 builtinWarn :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinWarn msgVal result = do
   msg <- case msgVal of
@@ -2876,7 +2876,7 @@ showValueForTrace (VPath p) = p
 showValueForTrace other = "<<" <> typeName other <> ">>"
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — graph traversal
+-- Builtin implementations - graph traversal
 -- ---------------------------------------------------------------------------
 
 builtinGenericClosure :: (MonadEval m) => NixValue -> m NixValue
@@ -2900,7 +2900,7 @@ builtinGenericClosure other =
 
 -- | BFS loop for genericClosure.  Uses Data.Sequence for O(1) queue
 -- append (the old list-based version was O(n) per operator call).
--- seenKeys is still a linear scan — Nix value equality is monadic so
+-- seenKeys is still a linear scan - Nix value equality is monadic so
 -- Set/HashMap is not directly applicable without specialising on key type.
 closureLoop ::
   (MonadEval m) =>
@@ -2971,7 +2971,7 @@ builtinReadDir val = do
   pure (VAttrs (attrSetFromMap (Map.fromList [(name, evaluated (mkStr fileType)) | (name, fileType) <- entries])))
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — environment + paths
+-- Builtin implementations - environment + paths
 -- ---------------------------------------------------------------------------
 
 builtinGetEnv :: (MonadEval m) => NixValue -> m NixValue
@@ -2989,7 +2989,7 @@ builtinToPath other =
   throwEvalError ("builtins.toPath: expected a string or path, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — store path operations
+-- Builtin implementations - store path operations
 -- ---------------------------------------------------------------------------
 
 builtinPlaceholder :: (MonadEval m) => NixValue -> m NixValue
@@ -3015,7 +3015,7 @@ validateStorePath p
       throwEvalError ("builtins.storePath: not a valid store path: " <> p)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — Nix search path
+-- Builtin implementations - Nix search path
 -- ---------------------------------------------------------------------------
 
 builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -3075,7 +3075,7 @@ findFirst ((prefix, path) : rest) name
   | otherwise = findFirst rest name
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — store file creation
+-- Builtin implementations - store file creation
 -- ---------------------------------------------------------------------------
 
 builtinToFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -3088,7 +3088,7 @@ builtinToFile other _ =
   throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — scoped import
+-- Builtin implementations - scoped import
 -- ---------------------------------------------------------------------------
 
 builtinScopedImport :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -3100,7 +3100,7 @@ builtinScopedImport other _ =
   throwEvalError ("builtins.scopedImport: expected a set, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — network fetchers
+-- Builtin implementations - network fetchers
 -- ---------------------------------------------------------------------------
 
 builtinFetchurl :: (MonadEval m) => NixValue -> m NixValue
@@ -3202,14 +3202,14 @@ forceOptionalAttrStr attrs key =
         Left _ -> pure Nothing
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — derivation construction
+-- Builtin implementations - derivation construction
 -- ---------------------------------------------------------------------------
 
--- | Eager derivation computation — @builtins.derivationStrict@.  Forces all
+-- | Eager derivation computation - @builtins.derivationStrict@.  Forces all
 -- input attrs into env vars, content-hashes, and returns the full derivation
 -- attrset (drvPath, outPath, per-output, _derivation).  Called LAZILY by the
 -- @derivation@ wrapper ('builtinDerivationLazy'), so forcing a derivation to
--- WHNF never forces this — matching C++ Nix's derivationStrict/derivation split.
+-- WHNF never forces this - matching C++ Nix's derivationStrict/derivation split.
 builtinDerivationStrict :: (MonadEval m) => NixValue -> m NixValue
 builtinDerivationStrict (VAttrs attrs) = do
   -- Extract required attributes
@@ -3244,7 +3244,7 @@ builtinDerivationStrict (VAttrs attrs) = do
 
   -- Collect string-coercible attrs into the build env, EXCLUDING "args"
   -- (C++ Nix puts args in the Derive() args field, never the env).  The
-  -- per-output env vars ($out, …) are added below.  Carries merged context.
+  -- per-output env vars ($out, ...) are added below.  Carries merged context.
   (drvEnvPairs, envContext) <- collectDrvEnvWithContext (Map.delete "__ignoreNulls" (Map.delete "args" materialized))
 
   let fullContext = envContext <> argsContext
@@ -3310,7 +3310,7 @@ builtinDerivationStrict (VAttrs attrs) = do
       inputSubst <- mapM resolveInputModulo (Map.toList inputDrvs)
       let maskedEnv = foldr (`Map.insert` "") baseEnv outputNames
           maskedDrv = mkDrv (map maskedOutput outputNames) maskedEnv
-          -- Masked modulo hash → this derivation's own output paths.
+          -- Masked modulo hash yields this derivation's own output paths.
           moduloMasked = sha256Digest (TE.encodeUtf8 (toATermForHash True (Just inputSubst) maskedDrv))
           outStorePaths = [(n, makeOutputPath n moduloMasked drvName) | n <- outputNames]
           outPathTexts = [(n, storePathToText defaultStoreDir sp) | (n, sp) <- outStorePaths]
@@ -3334,7 +3334,7 @@ builtinDerivationStrict (VAttrs attrs) = do
         ((_, p) : _) -> p
         [] -> ""
       -- The default output is the FIRST in @outputs@ (matching C++ Nix, which
-      -- returns @(head outputsList).value@) — not necessarily @out@.
+      -- returns @(head outputsList).value@) - not necessarily @out@.
       mainOutName = case outPaths of
         ((n, _) : _) -> n
         [] -> "out"
@@ -3375,7 +3375,7 @@ builtinDerivationStrict other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
 -- | Detect a fixed-output derivation.  Returns @Just (algo, mode, rawDigest)@
--- when @outputHash@ is present and non-empty (fetchurl, fetchgit, …), else
+-- when @outputHash@ is present and non-empty (fetchurl, fetchgit, ...), else
 -- 'Nothing' for an ordinary input-addressed derivation.  @mode@ is
 -- @\"flat\"@ or @\"recursive\"@; @algo@ is e.g. @\"sha256\"@.
 detectFixedOutput :: (MonadEval m) => AttrSet -> m (Maybe (Text, Text, BS.ByteString))
@@ -3418,10 +3418,10 @@ normalizeFixedHash ohash ohAlgo
   | otherwise =
       throwEvalError ("derivation: cannot determine outputHash algorithm for " <> ohash)
 
--- | Lazy @derivation@ wrapper — mirrors C++ Nix's @corepkgs/derivation.nix@.
+-- | Lazy @derivation@ wrapper - mirrors C++ Nix's @corepkgs/derivation.nix@.
 -- Returns a WHNF attrset whose @drvPath@/@outPath@/output-path/@_derivation@
 -- attrs are LAZY thunks that defer to 'builtinDerivationStrict'.  Forcing a
--- derivation to WHNF therefore does NOT force its input/env closure — which is
+-- derivation to WHNF therefore does NOT force its input/env closure - which is
 -- essential for nixpkgs, where merely referencing a derivation (e.g.
 -- @drv != null@, @assert (libxcrypt != null)@) must not build its whole closure.
 --
@@ -3494,10 +3494,10 @@ collectDrvEnvWithContext attrs = do
             Left _ -> pure Nothing
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — hashFile, readFileType
+-- Builtin implementations - hashFile, readFileType
 -- ---------------------------------------------------------------------------
 
--- | @builtins.hashFile algo path@ — hash raw bytes of a file on disk.
+-- | @builtins.hashFile algo path@ - hash raw bytes of a file on disk.
 -- Returns base-16 hex string, matching @builtins.hashString@ output format.
 builtinHashFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHashFile (VStr algo _) (VPath path) = do
@@ -3520,7 +3520,7 @@ hashBytesWithAlgo ctx algo bytes = case algo of
   "md5" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.MD5)))
   _ -> throwEvalError ("builtins." <> ctx <> ": unknown hash algorithm '" <> algo <> "'")
 
--- | @builtins.readFileType path@ — classify a filesystem entry.
+-- | @builtins.readFileType path@ - classify a filesystem entry.
 -- Returns @"regular"@, @"directory"@, @"symlink"@, or @"unknown"@.
 builtinReadFileType :: (MonadEval m) => NixValue -> m NixValue
 builtinReadFileType (VPath path) = mkStr <$> getFileType path
@@ -3529,10 +3529,10 @@ builtinReadFileType other =
   throwEvalError ("builtins.readFileType: expected a path, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — convertHash
+-- Builtin implementations - convertHash
 -- ---------------------------------------------------------------------------
 
--- | @builtins.convertHash { hash, hashAlgo?, toHashFormat }@ — convert
+-- | @builtins.convertHash { hash, hashAlgo?, toHashFormat }@ - convert
 -- between hash representations.  Supports base16, nix32, base64, and sri.
 builtinConvertHash :: (MonadEval m) => NixValue -> m NixValue
 builtinConvertHash (VAttrs attrs) = do
@@ -3561,7 +3561,7 @@ decodeHashInput attrs hashStr
   -- Prefixed format: algo:hex or algo:nix32
   | Just (algo, rest) <- parseAlgoPrefix hashStr =
       decodeWithAlgo algo rest
-  -- Plain hash — need hashAlgo attribute
+  -- Plain hash - need hashAlgo attribute
   | otherwise = do
       algo <- requireStrAttr "convertHash" "hashAlgo" attrs
       decodeWithAlgo algo hashStr
@@ -3601,7 +3601,7 @@ requireStrAttr ctx key attrs = case attrSetLookup key attrs of
   Nothing -> throwEvalError ("builtins." <> ctx <> ": missing required attribute '" <> key <> "'")
 
 -- ---------------------------------------------------------------------------
--- Base64 encode/decode — delegates to nova-cache (base64-bytestring under the hood)
+-- Base64 encode/decode - delegates to nova-cache (base64-bytestring under the hood)
 -- ---------------------------------------------------------------------------
 
 -- | Encode bytes to base64.
@@ -3613,7 +3613,7 @@ decodeBase64Pure :: Text -> Either Text BS.ByteString
 decodeBase64Pure t =
   -- Strip whitespace and any existing padding, then re-pad to a multiple of
   -- 4.  base64-bytestring's 'decode' requires correct padding, so SRI hashes
-  -- (correctly-padded standard base64, e.g. @sha256-…NQ=@) would otherwise be
+  -- (correctly-padded standard base64, e.g. @sha256-...NQ=@) would otherwise be
   -- rejected once their trailing @=@ was removed.
   let stripped = T.filter (\c -> c /= '\n' && c /= '\r' && c /= '=') t
       padLen = (4 - (T.length stripped `mod` 4)) `mod` 4
@@ -3629,10 +3629,10 @@ decodeBase64E ctx t = case decodeBase64Pure t of
   Left _ -> throwEvalError ("builtins." <> ctx <> ": invalid base64 encoding")
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — fromTOML
+-- Builtin implementations - fromTOML
 -- ---------------------------------------------------------------------------
 
--- | @builtins.fromTOML str@ — parse a TOML document to a Nix value.
+-- | @builtins.fromTOML str@ - parse a TOML document to a Nix value.
 -- Hand-rolled parser covering the TOML v1.0 subset used by nixpkgs:
 -- bare/quoted keys, dotted keys, basic/literal strings (multiline),
 -- integers (dec/hex/oct/bin), floats (inc. inf/nan), booleans,
@@ -3863,7 +3863,7 @@ parseTOMLNumberOrDatetime s
   | T.isPrefixOf "0x" s || T.isPrefixOf "0X" s = parseHexInt (T.drop 2 s)
   | T.isPrefixOf "0o" s || T.isPrefixOf "0O" s = parseOctInt (T.drop 2 s)
   | T.isPrefixOf "0b" s || T.isPrefixOf "0B" s = parseBinInt (T.drop 2 s)
-  -- Contains date separators → treat as datetime string
+  -- Contains date separators, so treat as a datetime string
   | T.any (== 'T') s && T.any (== '-') s = Right (TOMLStr s)
   | T.count "-" s >= 2 && T.any isDigit s = Right (TOMLStr s)
   | T.any (== ':') s && T.any isDigit s = Right (TOMLStr s)
@@ -4054,10 +4054,10 @@ insertArrayTable (k : ks) m =
         _ -> Map.insert k (TOMLTable updated) m
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — toXML
+-- Builtin implementations - toXML
 -- ---------------------------------------------------------------------------
 
--- | @builtins.toXML val@ — convert a Nix value to its XML representation.
+-- | @builtins.toXML val@ - convert a Nix value to its XML representation.
 -- Matches the format defined by the Nix manual: strings, ints, floats,
 -- bools, nulls, lists, and attrsets map to their XML counterparts.
 builtinToXML :: (MonadEval m) => NixValue -> m NixValue
@@ -4116,7 +4116,7 @@ xmlQuote s = "\"" <> T.concatMap escapeChar s <> "\""
     escapeChar c = T.singleton c
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — builtins.path
+-- Builtin implementations - builtins.path
 -- ---------------------------------------------------------------------------
 
 -- | @builtins.path { path; name?; filter?; sha256?; recursive?; }@
@@ -4148,10 +4148,10 @@ extractBaseName path =
         (_, name) -> name
 
 -- ---------------------------------------------------------------------------
--- Builtin implementations — filterSource
+-- Builtin implementations - filterSource
 -- ---------------------------------------------------------------------------
 
--- | @builtins.filterSource filter path@ — copy a path to the store,
+-- | @builtins.filterSource filter path@ - copy a path to the store,
 -- filtering entries via a predicate.  The filter function receives
 -- @(path, type)@ where type is @"regular"@, @"directory"@, @"symlink"@,
 -- or @"unknown"@.
@@ -4164,7 +4164,7 @@ builtinFilterSource _ other =
   throwEvalError ("builtins.filterSource: expected a path, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
--- Builtin stubs — experimental features
+-- Builtin stubs - experimental features
 -- ---------------------------------------------------------------------------
 
 builtinOutputOf :: (MonadEval m) => NixValue -> NixValue -> m NixValue

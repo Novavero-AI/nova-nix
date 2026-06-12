@@ -4,7 +4,7 @@
 # <nix/fetchurl.nix>; nixpkgs' bootstrap imports it directly, so nova-nix
 # must provide one with the exact same interface and derivation output.
 # Every attribute below feeds the .drv ATerm, so the produced derivation
-# (and therefore its store path) byte-matches upstream Nix — this is
+# (and therefore its store path) byte-matches upstream Nix - this is
 # enforced by the parity CI job.  The argument names, default chains, and
 # derivation attributes are all fixed by that contract; only fetch one
 # thing at a time and let the fixed-output hash do the verifying.

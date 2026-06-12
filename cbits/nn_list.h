@@ -1,5 +1,5 @@
 /*
- * nn_list.h — Contiguous array of thunk pointers for nova-nix lists.
+ * nn_list.h - Contiguous array of thunk pointers for nova-nix lists.
  *
  * Replaces Haskell's [Thunk] (linked-list cons cells, ~48 bytes per
  * element on the GHC heap) with a flat C array of nn_thunk_t* pointers
@@ -13,7 +13,7 @@
  * fill via nn_list_set, then read with nn_list_get/nn_list_count.
  *
  * Lifecycle: constructed during evaluation, freed via nn_list_free_all()
- * at arena teardown.  Not thread-safe — single-threaded evaluation only.
+ * at arena teardown.  Not thread-safe - single-threaded evaluation only.
  */
 
 #ifndef NN_LIST_H
@@ -21,7 +21,7 @@
 
 #include <stdint.h>
 
-/* Forward declaration — nn_thunk_t is defined in nn_thunk.h */
+/* Forward declaration - nn_thunk_t is defined in nn_thunk.h */
 struct nn_thunk;
 
 /* --- Types --- */

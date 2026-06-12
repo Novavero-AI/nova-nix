@@ -1,5 +1,5 @@
 /*
- * nn_list.c — Contiguous array of thunk pointers for lists.
+ * nn_list.c - Contiguous array of thunk pointers for lists.
  *
  * Each nn_list_t is a small header (malloc'd, tracked) pointing to
  * a contiguous items array (page-allocated via nn_env_alloc_slots).

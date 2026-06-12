@@ -1,6 +1,6 @@
 -- | C-backed sorted attribute set via FFI.
 --
--- Wraps @cbits/nn_attrset.c@ — a contiguous sorted array of
+-- Wraps @cbits/nn_attrset.c@ - a contiguous sorted array of
 -- @(nn_symbol_t, void*)@ pairs.  Replaces Haskell's @Data.Map.Strict@
 -- for attribute sets, cutting per-entry overhead from ~48 bytes
 -- (Map.Bin node) to ~12 bytes (4-byte symbol + 8-byte pointer).
@@ -54,7 +54,7 @@ data NnAttrSet
 type CAttrSet = Ptr NnAttrSet
 
 -- ---------------------------------------------------------------------------
--- FFI imports (all unsafe — no callbacks, fast data access)
+-- FFI imports (all unsafe - no callbacks, fast data access)
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_attrset_new"
@@ -106,7 +106,7 @@ cattrsetNew = c_nn_attrset_new
 -- ---------------------------------------------------------------------------
 
 -- | Insert a key-value pair.  Call before freeze.
--- The value is a CThunkPtr cast to Ptr () — C never dereferences it.
+-- The value is a CThunkPtr cast to Ptr () - C never dereferences it.
 cattrsetInsert :: CAttrSet -> Symbol -> CThunkPtr -> IO ()
 cattrsetInsert set (Symbol sym) ptr =
   c_nn_attrset_insert set sym (castPtr ptr)
@@ -120,7 +120,7 @@ cattrsetFreeze = c_nn_attrset_freeze
 -- ---------------------------------------------------------------------------
 
 -- | Look up a key.  Returns 'Nothing' if not found.
--- The returned 'CThunkPtr' is borrowed — the thunk arena owns it.
+-- The returned 'CThunkPtr' is borrowed - the thunk arena owns it.
 cattrsetLookup :: CAttrSet -> Symbol -> IO (Maybe CThunkPtr)
 cattrsetLookup set (Symbol sym) = do
   ptr <- c_nn_attrset_lookup set sym

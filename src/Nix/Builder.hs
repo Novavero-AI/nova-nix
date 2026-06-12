@@ -1,6 +1,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | Derivation builder — executes build recipes.
+-- | Derivation builder - executes build recipes.
 --
 -- == The build process
 --
@@ -22,7 +22,7 @@
 --
 -- The key difference is process creation.  Linux uses @fork\/exec@ with
 -- namespace isolation.  We use 'System.Process.createProcess' which maps
--- to @CreateProcess@ on Windows — native, no POSIX layer.
+-- to @CreateProcess@ on Windows - native, no POSIX layer.
 --
 -- For now, builds run without sandboxing (same as Nix on macOS did for
 -- years).  Future work: Windows Job Objects for resource limits,
@@ -95,7 +95,7 @@ envPath :: Text
 envPath = "PATH"
 
 -- | The magic builder string for the built-in URL fetcher.  A derivation with
--- this builder is not executed as a process — the Builder downloads its @url@
+-- this builder is not executed as a process - the Builder downloads its @url@
 -- and verifies it against @outputHash@ (see 'runBuiltinFetchurl').
 builtinFetchurlBuilder :: Text
 builtinFetchurlBuilder = "builtin:fetchurl"
@@ -123,7 +123,7 @@ envSourceDateEpoch = "SOURCE_DATE_EPOCH"
 -- Determinism-aware tools (binutils @ld@ writes it into the PE header
 -- instead of the wall clock; gcc uses it for @__DATE__@\/@__TIME__@)
 -- produce identical output across builds.  1980 rather than 0 because
--- zip timestamps cannot represent dates before 1980 — the same value
+-- zip timestamps cannot represent dates before 1980 - the same value
 -- nixpkgs' stdenv uses.  A derivation env may override it.
 sourceDateEpochValue :: Text
 sourceDateEpochValue = "315532800"
@@ -204,7 +204,7 @@ buildDerivationInner config store drv = do
       let buildDir = computeBuildDir config drv
       createDirectoryIfMissing True buildDir
 
-      -- 3. Compute output paths (but do NOT pre-create them — the builder
+      -- 3. Compute output paths (but do NOT pre-create them - the builder
       --    is responsible for creating $out, $dev, etc.)
       let outputDirs = [(doName out, buildDir </> T.unpack (doName out)) | out <- drvOutputs drv]
 
@@ -229,7 +229,7 @@ buildDerivationInner config store drv = do
           pure (BuildFailure ("builder failed: " <> stderrText) exitCode)
         Right () -> do
           -- 7. Success: validate that the builder created all expected outputs.
-          --    Outputs may be files or directories — both are valid (real Nix
+          --    Outputs may be files or directories - both are valid (real Nix
           --    allows $out to be a single file, a directory tree, or a symlink).
           missing <- filterM (fmap not . doesPathExist . snd) outputDirs
           case missing of
@@ -318,7 +318,7 @@ cleanupBuildDir dir = do
 -- ---------------------------------------------------------------------------
 
 -- | Build the process environment from the derivation env + standard vars.
--- The builder path is used to derive PATH entries — the builder's own
+-- The builder path is used to derive PATH entries - the builder's own
 -- directory and its sibling @usr\/bin@ are included so that coreutils
 -- shipped alongside the builder (e.g. Git for Windows' MSYS2 tools)
 -- are available.  This mirrors real Nix where PATH contains only
@@ -383,7 +383,7 @@ homeEnvVar =
 -- The build environment is overlaid on top of the inherited system
 -- environment.  Build variables take priority, but system-critical
 -- variables (e.g. SYSTEMROOT on Windows) pass through.  This matches
--- unsandboxed build behavior — proper isolation comes with Phase 5.
+-- unsandboxed build behavior - proper isolation comes with Phase 5.
 runBuilder ::
   FilePath ->
   [String] ->
@@ -410,7 +410,7 @@ runBuilder builderPath builderArgs buildEnv workDir = do
 
 -- | Create the appropriate process spec for the builder.
 --
--- On Windows, cmd.exe uses its own command line parser — @\/c@ takes a
+-- On Windows, cmd.exe uses its own command line parser - @\/c@ takes a
 -- raw command string, not individually-quoted arguments.  GHC's 'Proc.proc'
 -- wraps each arg in double quotes for the @CommandLineToArgvW@ convention,
 -- but cmd.exe doesn't use that convention, so a derivation like:
@@ -419,7 +419,7 @@ runBuilder builderPath builderArgs buildEnv workDir = do
 -- derivation { builder = "cmd.exe"; args = [ "\/c" "echo Hello" ]; ... }
 -- @
 --
--- would fail because GHC quotes @echo Hello@ → @\"echo Hello\"@, and
+-- would fail because GHC quotes @echo Hello@ as @\"echo Hello\"@, and
 -- cmd.exe tries to find an executable literally named @\"echo Hello\"@.
 --
 -- Fix: when the builder is cmd.exe with @\/c@, use 'Proc.shell' which
@@ -478,7 +478,7 @@ runBuiltinFetchurl drv outputDirs =
       _ -> Nothing
 
 -- | Download a URL to a strict 'BS.ByteString' using nova-nix's own linked
--- HTTP client (the same 'Network.HTTP.Client' the substituter uses) — no
+-- HTTP client (the same 'Network.HTTP.Client' the substituter uses) - no
 -- external @curl@, which is what makes this a genuine builtin.  Any network
 -- exception is turned into a 'Left' so it becomes a clean build failure.
 downloadUrl :: Text -> IO (Either Text BS.ByteString)
@@ -502,11 +502,11 @@ downloadUrl url = do
         code = HTTP.statusCode (HTTP.responseStatus response)
 
 -- | Verify the fetched bytes against the derivation's fixed-output hash, read
--- from the canonical output spec.  @doHashAlgo@ is @sha256@/@sha512@/… (or
+-- from the canonical output spec.  @doHashAlgo@ is @sha256@/@sha512@/... (or
 -- @r:sha256@ for recursive); @doHash@ is the base-16 digest eval normalized the
 -- user's hash into.  Flat mode is fully supported across algorithms; recursive
--- (unpack/executable) fetches are a separate feature — they require unpacking
--- the download — and fail with a clear message rather than a wrong result.
+-- (unpack/executable) fetches are a separate feature - they require unpacking
+-- the download - and fail with a clear message rather than a wrong result.
 verifyFetchHash :: Text -> DerivationOutput -> BS.ByteString -> Either (Int, Text) ()
 verifyFetchHash url out body
   | recursive =
@@ -558,7 +558,7 @@ registerOutputs config store drv _buildDir outputDirs = do
       allCandidates = collectAllCandidates drv ++ inputOutputs
       -- Deriver path is not available from the Derivation type alone;
       -- the caller (buildWithDeps) would need to pass it through.
-      -- Register with no deriver for now — queryDeriver will return Nothing.
+      -- Register with no deriver for now - queryDeriver will return Nothing.
       drvPathText = Nothing
       -- (temp output dir, final store path) for every output, used to detect
       -- self- and cross-output references that appear as build-temp paths.
@@ -707,7 +707,7 @@ buildInOrder _ _ _ [] = pure (Right ())
 buildInOrder config store drvMap (sp : rest) =
   case Map.lookup sp drvMap of
     Nothing ->
-      -- Not a derivation we know about — might be a source path.  Skip.
+      -- Not a derivation we know about - might be a source path.  Skip.
       buildInOrder config store drvMap rest
     Just drv -> do
       status <- resolveDep config store drv

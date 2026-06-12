@@ -1,5 +1,5 @@
 /*
- * nn_env.c — C-native evaluation environments.
+ * nn_env.c - C-native evaluation environments.
  *
  * Arena-allocated nn_env_t structs and backing arrays.  Pages are
  * 256 KB each, allocated on demand as a linked list.  Each allocation
@@ -36,7 +36,7 @@ static struct nn_env_page *g_first_page = NULL;
 static struct nn_env_page *g_current_page = NULL;
 static uint64_t g_total_bytes = 0;
 
-/* Global empty env — initialized in nn_env_init, valid until destroy. */
+/* Global empty env - initialized in nn_env_init, valid until destroy. */
 static nn_env_t g_empty_env;
 
 /* --- Internal helpers --- */

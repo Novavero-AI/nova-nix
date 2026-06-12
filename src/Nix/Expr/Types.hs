@@ -1,7 +1,7 @@
 -- | Core AST types for the Nix expression language.
 --
 -- Every Nix source file parses into an 'Expr'. The AST is a direct
--- representation of the language grammar — no desugaring at parse time.
+-- representation of the language grammar - no desugaring at parse time.
 -- The evaluator ('Nix.Eval') reduces expressions to values.
 module Nix.Expr.Types
   ( -- * Expressions

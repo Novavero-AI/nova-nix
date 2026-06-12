@@ -17,7 +17,7 @@
 --
 -- * Atomic upgrades (install new version, switch symlink, done)
 -- * Rollbacks (old version still in store, just switch symlink back)
--- * Concurrent installs (no file conflicts — different hashes = different dirs)
+-- * Concurrent installs (no file conflicts - different hashes = different dirs)
 -- * Garbage collection (delete unreferenced paths, everything else stays)
 -- * Binary substitution (if hash matches, the build output is identical)
 --
@@ -27,7 +27,7 @@
 -- binary references its shared libraries, its interpreter, etc.  Nix
 -- scans the output for store path strings to discover these references
 -- automatically.  The reference graph is what the garbage collector
--- follows — anything reachable from a GC root is kept.
+-- follows - anything reachable from a GC root is kept.
 module Nix.Store.Path
   ( -- * Store directory
     StoreDir (..),

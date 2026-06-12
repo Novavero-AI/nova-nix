@@ -1,5 +1,5 @@
 /*
- * nn_lambda.c — Lambda closure structs for nova-nix.
+ * nn_lambda.c - Lambda closure structs for nova-nix.
  *
  * Each nn_lambda_t is a malloc'd struct holding the closure env,
  * body bytecode index, and formals specification.  Tracked in a

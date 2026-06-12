@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# profiling/parse-hp.sh — Parse .hp file and extract peak values per category
+# profiling/parse-hp.sh - Parse .hp file and extract peak values per category
 #
 # Usage: ./profiling/parse-hp.sh <file.hp> [top-N]
 #

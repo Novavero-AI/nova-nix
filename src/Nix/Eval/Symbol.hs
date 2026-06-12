@@ -36,14 +36,14 @@ import Foreign.C.Types (CChar, CSize (..))
 import Foreign.Ptr (Ptr, nullPtr)
 import System.IO.Unsafe (unsafePerformIO)
 
--- | An interned symbol — a 'Word32' index into the global symbol table.
+-- | An interned symbol - a 'Word32' index into the global symbol table.
 -- Two symbols are equal iff their indices are equal (O(1) comparison).
 -- 0 is the invalid sentinel.
 newtype Symbol = Symbol {unSymbol :: Word32}
   deriving (Eq, Ord, Show)
 
 -- ---------------------------------------------------------------------------
--- FFI imports (unsafe — these never call back to Haskell)
+-- FFI imports (unsafe - these never call back to Haskell)
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_symbol_init"
@@ -85,7 +85,7 @@ symbolDestroy = c_nn_symbol_destroy
 
 -- | Intern a 'Text' value, returning its 'Symbol'.
 -- If the string was already interned, returns the existing symbol.
--- This is the canonical entry point for Text → C conversion.
+-- This is the canonical entry point for Text to C conversion.
 symbolIntern :: Text -> IO Symbol
 symbolIntern txt =
   TF.withCStringLen txt $ \(ptr, len) -> do
@@ -93,7 +93,7 @@ symbolIntern txt =
     pure (Symbol sid)
 
 -- | Retrieve the text of an interned symbol.
--- Returns the original string.  The result is safe to use — it copies
+-- Returns the original string.  The result is safe to use - it copies
 -- from the C arena into a fresh 'Text'.
 symbolText :: Symbol -> Text
 symbolText (Symbol sid)

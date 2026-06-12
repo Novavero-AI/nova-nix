@@ -1,5 +1,5 @@
 /*
- * nn_lambda.h — Lambda closure structs for nova-nix.
+ * nn_lambda.h - Lambda closure structs for nova-nix.
  *
  * Stores lambda closures entirely in C: captured environment (nn_env_t*),
  * body bytecode index, and formal parameter specification.  Replaces
@@ -8,7 +8,7 @@
  *
  * Formals are stored as a type tag (Name/Set/NamedSet) plus an array
  * of (symbol, has_default, default_bc_idx) entries for set patterns.
- * Interned symbols avoid any string allocation — pointer equality
+ * Interned symbols avoid any string allocation - pointer equality
  * for name comparison.
  *
  * Lambda structs are malloc'd and tracked for bulk cleanup via

@@ -1,5 +1,5 @@
 /*
- * nn_ctxstr.h — Context-bearing strings for nova-nix.
+ * nn_ctxstr.h - Context-bearing strings for nova-nix.
  *
  * Nix strings carry a StringContext: a set of store path references
  * that track derivation dependencies.  Context-free strings use
@@ -7,9 +7,9 @@
  * tag 8 (nn_ctxstr_t pointer).
  *
  * Each context element is one of:
- *   SCPlain      — plain store path reference (inputSrcs)
- *   SCDrvOutput  — derivation output (.drv path + output name)
- *   SCAllOutputs — all outputs of a derivation (drvPath itself)
+ *   SCPlain      - plain store path reference (inputSrcs)
+ *   SCDrvOutput  - derivation output (.drv path + output name)
+ *   SCAllOutputs - all outputs of a derivation (drvPath itself)
  *
  * StorePaths are represented as two interned symbols (hash + name).
  *
@@ -58,7 +58,7 @@ typedef struct nn_ctxstr {
 /* --- Lifecycle --- */
 
 /* Allocate a new nn_ctxstr_t with space for ctx_count elements.
- * Elements are uninitialized — caller must fill via nn_ctxstr_set_*.
+ * Elements are uninitialized - caller must fill via nn_ctxstr_set_*.
  * Tracked globally for bulk cleanup. */
 nn_ctxstr_t *nn_ctxstr_new(uint32_t text, uint16_t ctx_count);
 

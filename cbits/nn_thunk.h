@@ -1,5 +1,5 @@
 /*
- * nn_thunk.h — Arena-allocated thunk memoization cells for nova-nix.
+ * nn_thunk.h - Arena-allocated thunk memoization cells for nova-nix.
  *
  * Thunks are the core memoization mechanism in Nix evaluation.  Each
  * thunk starts as PENDING (holding a bytecode index + C environment
@@ -10,7 +10,7 @@
  * traced) with a 16-byte C struct in an arena (invisible to GHC GC).
  * For 8M thunks: ~450 MB less GHC heap pressure.
  *
- * Arena: chunked bump allocator.  Thunks are never individually freed —
+ * Arena: chunked bump allocator.  Thunks are never individually freed -
  * the entire arena is destroyed at evaluation end.  Pointers into the
  * arena remain valid until nn_thunk_destroy().
  *
@@ -22,7 +22,7 @@
  * via val_tag 4-9), or StablePtrs (for VBuiltin/VDrv via tag 255).
  *
  * Lifecycle: nn_thunk_init() before evaluation, nn_thunk_destroy()
- * after.  Not thread-safe — single-threaded evaluation only.
+ * after.  Not thread-safe - single-threaded evaluation only.
  */
 
 #ifndef NN_THUNK_H
@@ -85,7 +85,7 @@ typedef char nn_thunk_ptr_size_check_[(sizeof(void *) >= sizeof(int64_t)) ? 1 : 
 void nn_thunk_init(uint32_t initial_capacity);
 
 /* Destroy the global thunk arena, freeing all block memory.
- * Does NOT free payload StablePtrs — caller must iterate and free
+ * Does NOT free payload StablePtrs - caller must iterate and free
  * them first (via nn_thunk_count/nn_thunk_get).
  * All nn_thunk_t pointers become invalid after this call. */
 void nn_thunk_destroy(void);
@@ -198,7 +198,7 @@ uint32_t nn_thunk_count(void);
 nn_thunk_t *nn_thunk_get(uint32_t index);
 
 /* Single-pass (O(total)) collection of Haskell StablePtr payloads across the
- * whole arena.  Walks the block list directly — nn_thunk_get is O(blocks) per
+ * whole arena.  Walks the block list directly - nn_thunk_get is O(blocks) per
  * call, so index-based iteration would be O(total * blocks).  StablePtr
  * sources: PENDING/BLACKHOLE payload, and COMPUTED + NN_VALUE_PTR payload.
  * nn_thunk_collect_stableptrs writes up to max_count pointers into `output`

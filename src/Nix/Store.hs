@@ -14,7 +14,7 @@
 --
 -- When Nix SUBSTITUTES (downloads from a binary cache):
 --
--- 1. Fetch @\<hash\>.narinfo@ from cache — contains NAR hash, size, refs
+-- 1. Fetch @\<hash\>.narinfo@ from cache - contains NAR hash, size, refs
 -- 2. Fetch the @.nar.xz@ file
 -- 3. Verify file hash matches narinfo
 -- 4. Decompress and unpack NAR into store path
@@ -29,7 +29,7 @@
 -- profile, per-user profiles, result symlinks from @nix-build@).
 -- GC walks all roots, follows references transitively, and deletes
 -- everything not reachable.  Since paths are immutable and reference
--- tracking is exact, GC is safe — it never deletes something in use.
+-- tracking is exact, GC is safe - it never deletes something in use.
 module Nix.Store
   ( -- * Store operations
     Store (..),
@@ -227,7 +227,7 @@ scanReferences storeDir candidates dir = do
 -- | Scan an output for references to build-temp output locations.
 --
 -- The builder runs under a temp directory, so an output that embeds its own or
--- a sibling output's path embeds the TEMP path — which 'scanReferences' (store
+-- a sibling output's path embeds the TEMP path - which 'scanReferences' (store
 -- prefix only) cannot see.  Given @(tempDir, storePath)@ for every output of
 -- the derivation, returns the store paths whose temp location is referenced
 -- from the scanned output, capturing self- and cross-output references.
@@ -290,7 +290,7 @@ foldlIO z (x : xs) f = do
 -- | Recursively mark a store path and its contents read-only after a build.
 --
 -- On Windows the directory read-only attribute does not prevent adding or
--- removing entries — only the per-file read-only attribute protects a file.
+-- removing entries - only the per-file read-only attribute protects a file.
 -- Immutability here is therefore enforced at FILE granularity (every file is
 -- made read-only); hardening the directory itself against entry changes would
 -- require ACLs and is deferred.

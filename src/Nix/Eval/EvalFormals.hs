@@ -24,10 +24,10 @@ data EvalFormal = EvalFormal
 -- | Formal parameter specification for a lambda.
 -- Mirrors 'Nix.Expr.Types.Formals' but with bytecode indices for defaults.
 data EvalFormals
-  = -- | @x: body@ — single named parameter
+  = -- | @x: body@ - single named parameter
     EFName !Text
-  | -- | @{ a, b, ... }: body@ — destructuring set pattern
+  | -- | @{ a, b, ... }: body@ - destructuring set pattern
     EFSet ![EvalFormal] !Bool
-  | -- | @args\@{ a, b, ... }: body@ — named set pattern
+  | -- | @args\@{ a, b, ... }: body@ - named set pattern
     EFNamedSet !Text ![EvalFormal] !Bool
   deriving (Eq, Show)

@@ -25,8 +25,8 @@ type Apply m = NixValue -> NixValue -> m NixValue
 
 -- | Strip the common indentation from already-evaluated indented-string chunks.
 -- Each chunk is @(isLiteral, text, context)@.  Indentation is computed and
--- stripped from the LITERAL chunks only — interpolated chunks are opaque content
--- — the single leading newline is dropped, and the trailing newline is kept.
+-- stripped from the LITERAL chunks only - interpolated chunks are opaque content
+-- - the single leading newline is dropped, and the trailing newline is kept.
 -- This matches C++ Nix, which strips at the string-part level (so a multi-line
 -- interpolated value cannot drag the common indent down).
 stripIndentedChunks :: [(Bool, Text, StringContext)] -> (Text, StringContext)
@@ -110,7 +110,7 @@ coerceToString _ _ _ other =
 
 -- | Format a float the way C++ Nix does: 6 fixed decimal places
 -- (@std::to_string@), then strip trailing zeros and unnecessary
--- decimal point.  E.g. @1.0@ → @"1"@, @3.14@ → @"3.14"@.
+-- decimal point.  E.g. @1.0@ becomes @"1"@, @3.14@ becomes @"3.14"@.
 formatNixFloat :: Double -> Text
 formatNixFloat n
   | isNaN n = "nan"

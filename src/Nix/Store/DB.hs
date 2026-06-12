@@ -6,7 +6,7 @@
 -- metadata about each path that isn't in the filesystem:
 --
 -- * __References__: which other store paths does this path depend on?
---   (Needed for garbage collection — can't delete a path that others
+--   (Needed for garbage collection - can't delete a path that others
 --   reference.)
 -- * __Registrant__: who put this path here? (Substituted from cache?
 --   Built locally?)
@@ -169,7 +169,7 @@ registerPath db reg = registerPaths db [reg]
 -- | Register several store paths as valid in one transaction.
 --
 -- ALL path rows are inserted BEFORE any reference edge, so references among the
--- paths in this batch — e.g. intra-derivation cross-output references — are
+-- paths in this batch - e.g. intra-derivation cross-output references - are
 -- never dropped.  (Registering one path at a time loses an edge whenever a
 -- referrer is registered before its referent.)
 --
@@ -208,7 +208,7 @@ insertPathRefs db reg = do
       case refRows of
         (Only refId : _) ->
           execute conn "INSERT OR IGNORE INTO Refs (referrer, reference) VALUES (?, ?)" (referrerId, refId)
-        [] -> pure () -- Reference not in this batch or the store yet — skip.
+        [] -> pure () -- Reference not in this batch or the store yet - skip.
 
 -- ---------------------------------------------------------------------------
 -- Queries

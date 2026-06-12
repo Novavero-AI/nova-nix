@@ -55,7 +55,7 @@ builtinEnv timestamp searchPaths =
    in newCEnv nullPtr 0 (Just scope) Nothing nullPtr 0
 
 -- | Builtins exposed at the top level (without @builtins.@ prefix).
--- This matches real Nix — nixpkgs uses these unqualified everywhere.
+-- This matches real Nix - nixpkgs uses these unqualified everywhere.
 topLevelBuiltinNames :: [Text]
 topLevelBuiltinNames =
   [ "abort",

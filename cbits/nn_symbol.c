@@ -1,5 +1,5 @@
 /*
- * nn_symbol.c — Interned string symbol table.
+ * nn_symbol.c - Interned string symbol table.
  *
  * Implementation: open-addressed hash table with linear probing.
  * String data is stored in a contiguous arena (bulk allocation,
@@ -7,7 +7,7 @@
  * values; 0 is the invalid sentinel.
  *
  * The table doubles when load exceeds 75%.  Deletion is not
- * supported — symbols live for the entire evaluation lifetime.
+ * supported - symbols live for the entire evaluation lifetime.
  */
 
 #include "nn_symbol.h"
@@ -32,7 +32,7 @@ typedef struct {
     uint32_t hash;      /* cached FNV-1a hash */
 } nn_symbol_entry_t;
 
-/* Hash table slot: maps hash → symbol ID.  Empty slots have id == 0. */
+/* Hash table slot: maps hash -> symbol ID.  Empty slots have id == 0. */
 typedef struct {
     uint32_t hash;
     uint32_t id;        /* 1-based symbol ID, 0 = empty */
@@ -202,7 +202,7 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
     /* Probe for existing entry. */
     for (;;) {
         uint32_t id = g_sym.slots[idx].id;
-        if (id == 0) break;  /* empty slot — not found */
+        if (id == 0) break;  /* empty slot - not found */
 
         if (g_sym.slots[idx].hash == hash) {
             nn_symbol_entry_t *e = &g_sym.entries[id];
@@ -214,7 +214,7 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
         idx = (idx + 1) & g_sym.slots_mask;
     }
 
-    /* Not found — insert new symbol. */
+    /* Not found - insert new symbol. */
     entries_ensure();
     g_sym.count++;
     uint32_t new_id = g_sym.count;  /* 1-based */

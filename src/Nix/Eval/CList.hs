@@ -1,6 +1,6 @@
 -- | C-backed contiguous list of thunk pointers via FFI.
 --
--- Wraps @cbits/nn_list.c@ — a flat array of @nn_thunk_t*@ pointers.
+-- Wraps @cbits/nn_list.c@ - a flat array of @nn_thunk_t*@ pointers.
 -- Replaces Haskell's @[Thunk]@ (linked-list cons cells, ~48 bytes per
 -- element) with a contiguous C array (8 bytes per element).
 --
@@ -46,7 +46,7 @@ data NnList
 type CListPtr = Ptr NnList
 
 -- ---------------------------------------------------------------------------
--- FFI imports (all unsafe — no callbacks, fast data access)
+-- FFI imports (all unsafe - no callbacks, fast data access)
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_list_new"
@@ -135,7 +135,7 @@ clistToThunkList cl
 -- arena-allocated and valid until evaluation end.
 newtype CList = CList {unCList :: CListPtr}
 
--- | Pointer equality — two CLists are the same if they point to the
+-- | Pointer equality - two CLists are the same if they point to the
 -- same C struct.  Deep equality is handled by the evaluator.
 instance Eq CList where
   CList a == CList b = a == b
@@ -152,7 +152,7 @@ emptyCList :: CList
 emptyCList = CList nullPtr
 
 -- | Convert a Haskell list of 'CThunkPtr' to a 'CList'.
--- Uses 'unsafePerformIO' — safe because allocation is idempotent
+-- Uses 'unsafePerformIO' - safe because allocation is idempotent
 -- per call (no shared mutable state beyond the tracking array).
 {-# NOINLINE clistFromThunks #-}
 clistFromThunks :: [CThunkPtr] -> CList

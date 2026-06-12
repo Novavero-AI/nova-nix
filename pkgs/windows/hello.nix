@@ -3,7 +3,7 @@
 # store path), the source is copied into the store, and the output lands in
 # the store with scanned references and a real NAR hash.
 #
-# cmd.exe is the one ambient tool here — the OS-guaranteed bootstrap shell,
+# cmd.exe is the one ambient tool here - the OS-guaranteed bootstrap shell,
 # used only until stage 1 rebuilds bash from source.  It expands %out% and
 # %src% from the build environment, the same role /bin/sh plays on Linux.
 let
@@ -25,6 +25,6 @@ derivation {
   # Windows resolves a subprocess's DLLs via PATH (no RPATH): gcc.exe spawns
   # cc1.exe from lib/gcc/, whose gmp/mpfr/isl/zstd DLLs live in the seed's
   # bin.  Dependencies' bin dirs on the build PATH is the Windows analogue of
-  # Linux stdenv's PATH setup — stage 1 will automate this.
+  # Linux stdenv's PATH setup - stage 1 will automate this.
   PATH = "${seed}/mingw64/bin";
 }

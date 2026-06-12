@@ -1,7 +1,7 @@
 -- | Lexer for the Nix language: 'Text' to @['Located']@.
 --
 -- Handles all Nix tokens including string interpolation via a mode stack.
--- Entirely pure — no IO.
+-- Entirely pure - no IO.
 module Nix.Parser.Lexer
   ( -- * Tokens
     Token (..),
@@ -309,23 +309,23 @@ lexIndStringMode st acc
               -- Check for escape sequences: ''', ''$, ''\x, ''${
               case T.uncons rest2 of
                 Just ('\'', rest3) ->
-                  -- ''' → literal single quote (consume all 3)
+                  -- ''' is a literal single quote (consume all 3)
                   let litTok = Located (lsLine st) (lsCol st) (TokStringLit "'")
                       newSt = advanceCol 3 st {lsInput = rest3}
                    in lexIndStringMode newSt (litTok : acc)
                 Just ('$', rest3)
                   | Just ('{', rest4) <- T.uncons rest3 ->
-                      -- ''${ → literal ${
+                      -- ''${ is a literal ${
                       let litTok = Located (lsLine st) (lsCol st) (TokStringLit "${")
                           newSt = advanceCol 4 st {lsInput = rest4}
                        in lexIndStringMode newSt (litTok : acc)
                 Just ('$', rest3) ->
-                  -- ''$ (without brace) → literal $
+                  -- ''$ (without brace) is a literal $
                   let litTok = Located (lsLine st) (lsCol st) (TokStringLit "$")
                       newSt = advanceCol 3 st {lsInput = rest3}
                    in lexIndStringMode newSt (litTok : acc)
                 Just ('\\', rest3) ->
-                  -- ''\x → escape sequence
+                  -- ''\x is an escape sequence
                   case T.uncons rest3 of
                     Just (ec, rest4) ->
                       let escaped = case ec of
@@ -346,13 +346,13 @@ lexIndStringMode st acc
                             peMessage = "unterminated escape in indented string"
                           }
                 _ ->
-                  -- '' followed by non-escape → close indented string
+                  -- '' followed by non-escape closes the indented string
                   let tok = Located (lsLine st) (lsCol st) TokIndStringClose
                       newSt = advanceCol 2 st {lsInput = rest2, lsModes = safeTail (lsModes st)}
                    in lexLoop newSt (tok : acc)
             Just ('$', rest1)
               | Just ('{', rest2) <- T.uncons rest1 ->
-                  -- \${ in indented string → interpolation
+                  -- \${ in indented string is interpolation
                   let tok = Located (lsLine st) (lsCol st) TokInterpOpen
                       newSt =
                         advanceCol
@@ -419,7 +419,7 @@ lexStringLiteral st0 acc = go st0 mempty
 
 -- | Lex a literal segment inside an indented string.
 -- No escape sequences here (those are handled by 'lexIndStringMode'),
--- so the chunk is identical to the source text — count chars, then slice
+-- so the chunk is identical to the source text - count chars, then slice
 -- once at the end.  This avoids O(n^2) 'T.snoc' allocation.
 lexIndStringLiteral :: LexState -> [Located] -> Either ParseError [Located]
 lexIndStringLiteral st0 acc = go st0 0
@@ -505,7 +505,7 @@ readInteger :: Text -> Integer
 readInteger = T.foldl' (\n c -> n * decimalBase + fromIntegral (fromEnum c - zeroOrd)) 0
 
 -- | Read a floating-point number from its integer and decimal parts.
--- Total — no 'read', no exceptions.
+-- Total - no 'read', no exceptions.
 readDouble :: Text -> Text -> Double
 readDouble intPart decPart =
   let whole = fromIntegral (readInteger intPart) :: Double
@@ -674,7 +674,7 @@ isPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
 
 -- | Does the maximal path-char run at the start of the input contain a
 -- @/@-segment (a slash followed by a non-slash path char)?  If so it lexes
--- as a path rather than an identifier, number, or division operator —
+-- as a path rather than an identifier, number, or division operator -
 -- matching Nix, where @a/b@ and @/abs/path@ are paths, @a / b@ (slash
 -- surrounded by whitespace) is division, and @a // b@ is the update operator.
 looksLikePath :: Text -> Bool

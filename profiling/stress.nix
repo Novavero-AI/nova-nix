@@ -11,12 +11,12 @@
 let
   # --- Layer 1: Function call chains (evalApp + matchFormals) ---
 
-  # Simple lambda: x: body — tests FormalName path
+  # Simple lambda: x: body - tests FormalName path
   apply1 = f: x: f x;
   apply2 = f: x: f (f x);
   compose = f: g: x: f (g x);
 
-  # Set-pattern lambda: { a, b, ... }: body — tests FormalSet path
+  # Set-pattern lambda: { a, b, ... }: body - tests FormalSet path
   addFields = { a, b, ... }: a + b;
   mergeWith = f: { a, b, ... }: f a b;
 

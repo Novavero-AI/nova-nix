@@ -1,6 +1,6 @@
 -- | C-backed thunk memoization cells via FFI.
 --
--- Wraps @cbits/nn_thunk.c@ — an arena-allocated mutable cell that
+-- Wraps @cbits/nn_thunk.c@ - an arena-allocated mutable cell that
 -- holds either a pending expression (StablePtr to (Expr, Env)) or a
 -- computed value (StablePtr to NixValue).  Replaces Haskell's
 -- @IORef ThunkCell@ (~56 bytes on GHC heap, all GC-traced) with a
@@ -91,7 +91,7 @@ data NnThunk
 type CThunkPtr = Ptr NnThunk
 
 -- ---------------------------------------------------------------------------
--- FFI imports (all unsafe — no callbacks, fast data access)
+-- FFI imports (all unsafe - no callbacks, fast data access)
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_thunk_init"
@@ -248,7 +248,7 @@ cthunkNew :: Ptr () -> IO CThunkPtr
 cthunkNew = c_nn_thunk_new
 
 -- | Allocate a new PENDING thunk with a bytecode index + C env pointer.
--- No Haskell heap references — zero GC pressure for pending thunks.
+-- No Haskell heap references - zero GC pressure for pending thunks.
 cthunkNewBc :: Word32 -> Ptr () -> IO CThunkPtr
 cthunkNewBc = c_nn_thunk_new_bc
 

@@ -1,6 +1,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | Binary substituter — download pre-built paths from remote caches.
+-- | Binary substituter - download pre-built paths from remote caches.
 --
 -- == How substitution works
 --
@@ -27,7 +27,7 @@
 -- @
 --
 -- Our nova-cache server implements this protocol.  The narinfo format,
--- NAR serialization, signature verification — all handled by the
+-- NAR serialization, signature verification - all handled by the
 -- @nova-cache@ library.  This module orchestrates the HTTP requests
 -- and store registration.
 module Nix.Substituter
@@ -100,7 +100,7 @@ defaultCacheConfig =
 
 -- | Result of a substitution attempt.
 data SubstResult
-  = -- | Successfully substituted — path is now in the store.
+  = -- | Successfully substituted - path is now in the store.
     SubstSuccess !StorePath
   | -- | Cache doesn't have this path.
     SubstNotFound
@@ -165,7 +165,7 @@ substituteFromCache mgr store cache sp = do
                 )
             )
       | otherwise ->
-          -- 2–4. Verify, download, decompress (pure pipeline after fetch)
+          -- 2-4. Verify, download, decompress (pure pipeline after fetch)
           case verifyAndDecompress cache mgr narInfo of
             Left err -> pure (SubstError err)
             Right fetchDecompress -> do
@@ -289,7 +289,7 @@ narDownloadAttempts :: Int
 narDownloadAttempts = 5
 
 -- | Base delay between NAR download attempts, in microseconds.  The delay grows
--- linearly with each retry (0.5s, 1s, …).
+-- linearly with each retry (0.5s, 1s, ...).
 narRetryBaseDelayMicros :: Int
 narRetryBaseDelayMicros = 500000
 

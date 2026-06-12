@@ -8,8 +8,8 @@
 --
 -- That @s66mzx...@ hash encodes ALL inputs that went into building the
 -- package: source code, compiler version, flags, dependencies (which are
--- themselves hashes).  Change any input → different hash → different path →
--- completely isolated from the original.
+-- themselves hashes).  Change any input and you get a different hash, a
+-- different path, completely isolated from the original.
 --
 -- This is why Nix can have multiple versions of the same package installed
 -- simultaneously without conflict. They live at different store paths
@@ -113,7 +113,7 @@ byteToHex w =
    in [hexDigit hi, hexDigit lo]
 
 -- ---------------------------------------------------------------------------
--- Store path construction — the Nix @makeStorePath@ family
+-- Store path construction - the Nix @makeStorePath@ family
 --
 -- These mirror C++ Nix exactly so nova-nix's computed store paths byte-match
 -- @nix-instantiate@.  All hashing is done against the canonical @\/nix\/store@
@@ -121,7 +121,7 @@ byteToHex w =
 -- derivation hashes identically on Windows, Linux, and macOS.
 -- ---------------------------------------------------------------------------
 
--- | Length in bytes a store-path hash is compressed to (160 bits → 32 base-32
+-- | Length in bytes a store-path hash is compressed to (160 bits down to 32 base-32
 -- characters).
 storePathHashBytes :: Int
 storePathHashBytes = 20
@@ -187,8 +187,8 @@ makeStorePath (StoreDir dir) typ innerDigest name =
    in StorePath (encode (BS.pack compressed)) name
 
 -- | Construct a text store path (used for @.drv@ files and @builtins.toFile@).
--- The references are embedded in the @type@ string — @\"text\"@ followed by
--- each referenced store path — which is why a derivation's @.drv@ path depends
+-- The references are embedded in the @type@ string - @\"text\"@ followed by
+-- each referenced store path - which is why a derivation's @.drv@ path depends
 -- on the paths of all its inputs.  @contentsDigest@ is the SHA-256 of the file
 -- contents (the ATerm, for a @.drv@).
 makeTextPath :: Text -> BS.ByteString -> [StorePath] -> StorePath
@@ -201,8 +201,8 @@ makeTextPath name contentsDigest refs =
 -- the EXPECTED output hash (e.g. a tarball's SHA-256).  @mode@ is @\"flat\"@
 -- or @\"recursive\"@.  Mirrors C++ Nix @makeFixedOutputPath@:
 --
--- * @sha256@ + @recursive@ → @makeStorePath \"source\" foHash name@
--- * otherwise → @makeStorePath \"output:out\" sha256(\"fixed:out:\" prefix algo \":\" hex \":\") name@
+-- * @sha256@ + @recursive@ yields @makeStorePath \"source\" foHash name@
+-- * otherwise, @makeStorePath \"output:out\" sha256(\"fixed:out:\" prefix algo \":\" hex \":\") name@
 makeFixedOutputPath :: Text -> Text -> Text -> BS.ByteString -> StorePath
 makeFixedOutputPath name algo mode foHashDigest
   | algo == "sha256" && mode == "recursive" =

@@ -13,7 +13,7 @@ name: Parity
 on:
   workflow_dispatch:
   # Regression guard: run on main pushes and PRs, but only when code that can
-  # affect the computed drvPath changes — doc-only changes skip it.
+  # affect the computed drvPath changes - doc-only changes skip it.
   push:
     branches: [main]
     paths:

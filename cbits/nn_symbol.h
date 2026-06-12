@@ -1,5 +1,5 @@
 /*
- * nn_symbol.h — Interned string symbols for nova-nix.
+ * nn_symbol.h - Interned string symbols for nova-nix.
  *
  * Attribute names are the most repeated data in Nix evaluation.
  * nixpkgs uses ~8k unique names across 30k+ packages, but each name
@@ -11,7 +11,7 @@
  * Lookup uses open-addressing with FNV-1a hashing.
  *
  * Lifecycle: nn_symbol_init() before evaluation, nn_symbol_destroy()
- * after.  Not thread-safe — single-threaded evaluation only.
+ * after.  Not thread-safe - single-threaded evaluation only.
  */
 
 #ifndef NN_SYMBOL_H
@@ -44,7 +44,7 @@ void nn_symbol_destroy(void);
 
 /* Intern a string, returning its symbol.  If the string was already
  * interned, returns the existing symbol (O(1) amortized).
- * The input string is copied — the caller may free it after this call.
+ * The input string is copied - the caller may free it after this call.
  * str must not be NULL.  len is the byte length (not null-terminated). */
 nn_symbol_t nn_symbol_intern(const char *str, size_t len);
 
@@ -59,7 +59,7 @@ size_t nn_symbol_len(nn_symbol_t sym);
 /* --- Comparison --- */
 
 /* Symbols are equal iff their uint32_t values are equal.
- * No function call needed — just use == directly.
+ * No function call needed - just use == directly.
  * This macro exists for documentation purposes. */
 #define nn_symbol_eq(a, b) ((a) == (b))
 

@@ -148,7 +148,7 @@ trimFormal (Formal name defExpr) =
   -- Default expressions are evaluated in the lambda's own scope,
   -- so they get fresh innerNames (just the formals themselves).
   -- But we already trimmed nested lambdas, and defaults are part
-  -- of the lambda's body — they'll be captured correctly.
+  -- of the lambda's body - they'll be captured correctly.
   Formal name (fmap (trimExpr Set.empty) defExpr)
 
 -- | Analyze a single lambda body and formals defaults, produce a capture
@@ -235,7 +235,7 @@ collectFreeVars depth expr = case expr of
   ELambda formals body_ captures ->
     -- Nested lambda creates a LexicalScope (depth + 1).
     -- If the inner lambda was already trimmed (has Captures), its capture
-    -- coordinates are outer references that we must propagate upward —
+    -- coordinates are outer references that we must propagate upward -
     -- otherwise an outer lambda won't know it needs those variables.
     let (vs1, h1, w1) = foldFormalsDefaults (depth + 1) formals
         (vs2, h2, w2) = collectFreeVars (depth + 1) body_

@@ -1,6 +1,6 @@
 -- | C-backed lambda closure structs via FFI.
 --
--- Wraps @cbits/nn_lambda.c@ — a malloc'd struct holding the closure
+-- Wraps @cbits/nn_lambda.c@ - a malloc'd struct holding the closure
 -- environment (nn_env_t*), body bytecode index, and formal parameter
 -- specification.  Replaces StablePtr NixValue for VLambda (~25% of
 -- remaining GHC heap after M6) with C-native tag 9 in the thunk system.
@@ -41,7 +41,7 @@ data NnLambda
 type CLambdaPtr = Ptr NnLambda
 
 -- ---------------------------------------------------------------------------
--- FFI imports (all unsafe — no callbacks, fast data access)
+-- FFI imports (all unsafe - no callbacks, fast data access)
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_lambda_new"

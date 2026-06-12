@@ -1,5 +1,5 @@
 /*
- * nn_attrset.c — Sorted symbol-keyed attribute set.
+ * nn_attrset.c - Sorted symbol-keyed attribute set.
  *
  * Two contiguous arrays: keys (nn_symbol_t) and values (void*),
  * sorted by symbol ID after freeze.  Binary search for lookup.
@@ -11,7 +11,7 @@
  * This replaces Haskell's Map.Bin tree:
  *   Map.Bin: ~48 bytes/node (constructor + key + value + size + left + right)
  *   nn_attrset: ~12 bytes/entry (4-byte key + 8-byte pointer)
- *   For 30k entries: 1.4 MB → 360 KB (4x reduction, plus cache-friendly)
+ *   For 30k entries: 1.4 MB down to 360 KB (4x reduction, plus cache-friendly)
  */
 
 #include "nn_attrset.h"
@@ -324,7 +324,7 @@ nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b)
             nn_attrset_insert(result, b->keys[ib], b->values[ib]);
             ib++;
         } else {
-            /* Same key — b wins (right-biased //). */
+            /* Same key - b wins (right-biased //). */
             nn_attrset_insert(result, b->keys[ib], b->values[ib]);
             ia++;
             ib++;
@@ -354,7 +354,7 @@ nn_attrset_t *nn_attrset_remove_keys(
     uint32_t i;
 
     for (i = 0; i < set->count; i++) {
-        /* Linear scan of removal keys — fine for small removal lists.
+        /* Linear scan of removal keys - fine for small removal lists.
          * For large removal lists, sort them and merge-scan instead. */
         uint32_t j;
         int skip = 0;

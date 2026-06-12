@@ -1,6 +1,6 @@
 -- | C-backed context-bearing strings via FFI.
 --
--- Wraps @cbits/nn_ctxstr.c@ — a string with its StringContext stored
+-- Wraps @cbits/nn_ctxstr.c@ - a string with its StringContext stored
 -- as a contiguous C struct.  Context-free strings continue to use
 -- thunk tag 4 (bare nn_symbol_t); this module handles tag 8 for
 -- strings with non-empty context.
@@ -42,7 +42,7 @@ data NnCtxStr
 type CCtxStrPtr = Ptr NnCtxStr
 
 -- ---------------------------------------------------------------------------
--- FFI imports (all unsafe — no callbacks, fast data access)
+-- FFI imports (all unsafe - no callbacks, fast data access)
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_ctxstr_new"
@@ -83,7 +83,7 @@ foreign import ccall unsafe "nn_ctxstr_elem_output"
 -- ---------------------------------------------------------------------------
 
 -- | Allocate a new context string with space for @ctxCount@ elements.
--- Elements are uninitialized — caller must fill via set functions.
+-- Elements are uninitialized - caller must fill via set functions.
 cctxstrNew :: Word32 -> Word16 -> IO CCtxStrPtr
 cctxstrNew = c_nn_ctxstr_new
 

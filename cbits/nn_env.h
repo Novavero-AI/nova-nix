@@ -1,16 +1,16 @@
 /*
- * nn_env.h — C-native evaluation environments.
+ * nn_env.h - C-native evaluation environments.
  *
  * Nix evaluation creates millions of environments, each with a
  * variable-size array of slot pointers, optional lazy scope (attr set),
  * optional parent pointer, and a with-scopes chain.
  *
  * All nn_env_t structs and their backing arrays are arena-allocated
- * from a page-based bump allocator.  Nothing is individually freed —
+ * from a page-based bump allocator.  Nothing is individually freed -
  * nn_env_destroy() tears down everything at eval end.
  *
  * Lifecycle: nn_env_init() before evaluation, nn_env_destroy() after.
- * Not thread-safe — single-threaded evaluation only.
+ * Not thread-safe - single-threaded evaluation only.
  */
 
 #ifndef NN_ENV_H

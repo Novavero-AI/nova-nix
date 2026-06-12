@@ -1,31 +1,31 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | __builtin:unpack__ — in-process archive extraction for the bootstrap seed.
+-- | __builtin:unpack__ - in-process archive extraction for the bootstrap seed.
 --
 -- == Why this is a builtin
 --
 -- The Windows stdenv bootstrap fetches pre-built toolchain tarballs (MSYS2
 -- @.pkg.tar.zst@ packages) into the store before any toolchain exists there.
--- Nothing in the store can unpack them — the unpacker is the thing being
--- bootstrapped — and ambient @tar.exe@ is unpinned and may lack zstd support.
+-- Nothing in the store can unpack them - the unpacker is the thing being
+-- bootstrapped - and ambient @tar.exe@ is unpinned and may lack zstd support.
 -- So, like 'Nix.Builder.runBuiltinFetchurl', extraction runs in-process:
 -- a derivation whose @builder@ is @builtin:unpack@ is handled by this module
 -- instead of being spawned as a subprocess.
 --
 -- == Derivation interface
 --
--- * @srcs@ — whitespace-separated archive store paths, extracted in order
+-- * @srcs@ - whitespace-separated archive store paths, extracted in order
 --   into the single @out@ output.  MSYS2 packages share a top-level
 --   @mingw64\/@ prefix, so extracting a package set into one output yields a
 --   working toolchain root directly (no separate union step).
--- * @out@ — the merged tree.
+-- * @out@ - the merged tree.
 --
 -- == Determinism
 --
 -- Extraction is a pure function of the archive bytes: entries are written in
 -- archive order, a file appearing in two archives is an error (pacman
 -- enforces the same no-conflict invariant), and pacman's per-package
--- metadata entries (@.PKGINFO@, @.MTREE@, …) are skipped — they are not part
+-- metadata entries (@.PKGINFO@, @.MTREE@, ...) are skipped - they are not part
 -- of the installed tree and would otherwise collide across packages.
 --
 -- Symlink and hardlink entries are materialized by __copying__ their target:
@@ -76,7 +76,7 @@ import qualified System.Info
 -- ---------------------------------------------------------------------------
 
 -- | The magic builder string for the built-in archive extractor.  A
--- derivation with this builder is not executed as a process — the Builder
+-- derivation with this builder is not executed as a process - the Builder
 -- extracts its @srcs@ archives into @$out@ (see 'runBuiltinUnpack').
 builtinUnpackBuilder :: Text
 builtinUnpackBuilder = "builtin:unpack"
@@ -178,7 +178,7 @@ unpackArchive outDir archivePath = do
 
 -- | Choose a decompressor from the archive file name.  @.tar.zst@ (MSYS2
 -- packages) and plain @.tar@ are supported.  MSYS2's zstd frames do not
--- pledge a content size, so the lazy (streaming) zstd decoder is required —
+-- pledge a content size, so the lazy (streaming) zstd decoder is required -
 -- the strict single-shot API rejects them.
 decoderFor :: FilePath -> Maybe (BL.ByteString -> BL.ByteString)
 decoderFor path
@@ -321,7 +321,7 @@ resolveLinkTarget parentComps target
 -- | pacman package metadata at the archive root (@.PKGINFO@, @.BUILDINFO@,
 -- @.MTREE@, @.INSTALL@): describes the package to pacman, is not part of the
 -- installed tree, and collides across packages when several archives merge
--- into one output — so root-level dotfile entries are skipped.
+-- into one output - so root-level dotfile entries are skipped.
 isPackageMetadata :: [FilePath] -> Bool
 isPackageMetadata comps = case comps of
   [name] -> "." `isPrefixOf` name

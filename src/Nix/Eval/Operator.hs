@@ -248,7 +248,7 @@ evalUpdate left right =
 
 -- | Merge two 'AttrSet's, right-biased (@//@).
 -- Delegates to C-side @nn_attrset_union@ which performs a linear merge
--- of two sorted arrays — O(n+m) on contiguous, cache-friendly memory.
+-- of two sorted arrays - O(n+m) on contiguous, cache-friendly memory.
 --
 -- 'unsafePerformIO' safety: @nn_attrset_union@ is a pure C function
 -- that allocates a new result set from its two inputs without side

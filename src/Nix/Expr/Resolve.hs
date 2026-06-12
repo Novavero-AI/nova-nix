@@ -22,7 +22,7 @@ import Nix.Expr.Types
 
 -- | Scope entry for static variable resolution.
 data ScopeEntry
-  = -- | Lambda formals: name → positional index.
+  = -- | Lambda formals: name -> positional index.
     LexicalScope !(Map Text Int)
   | -- | Let/rec binding names: blocks resolution (handled by name at runtime).
     NameBarrier !(Set Text)
@@ -54,7 +54,7 @@ resolve stack expr = case expr of
             innerStack = scope : stack
          in EAttrs True (concatMap (resolveLetBinding stack innerStack) bindings) NoCaptureInfo
     | otherwise ->
-        -- Fallback: dynamic keys or nested paths — use NameBarrier.
+        -- Fallback: dynamic keys or nested paths - use NameBarrier.
         let names = collectBindingNames bindings
             newStack = NameBarrier names : stack
          in EAttrs True (concatMap (resolveBinding newStack) bindings) NoCaptureInfo
@@ -78,7 +78,7 @@ resolve stack expr = case expr of
             innerStack = scope : stack
          in ELet (concatMap (resolveLetBinding stack innerStack) bindings) (resolve innerStack body) NoCaptureInfo
     | otherwise ->
-        -- Fallback: dynamic keys or nested paths — use NameBarrier.
+        -- Fallback: dynamic keys or nested paths - use NameBarrier.
         let names = collectBindingNames bindings
             newStack = NameBarrier names : stack
          in ELet (concatMap (resolveBinding newStack) bindings) (resolve newStack body) NoCaptureInfo
@@ -92,7 +92,7 @@ resolve stack expr = case expr of
     EAssert (resolve stack cond) (resolve stack body)
   EUnary op operand -> EUnary op (resolve stack operand)
   EBinary op l r -> EBinary op (resolve stack l) (resolve stack r)
-  -- Desugar: <name> → __findFile __nixPath "name"
+  -- Desugar: <name> becomes __findFile __nixPath "name"
   -- Matches C++ Nix's parser desugaring.  __findFile and __nixPath are
   -- in the root scope (Builtins.hs), so they resolve via name-based
   -- lookup at runtime.  This ensures closure trimming captures the
@@ -135,9 +135,9 @@ resolveVar (WithBarrier : rest) level name =
 --
 -- Index assignment:
 --
--- * @FormalName n@ → @[0: n]@
--- * @FormalSet [a, b, c] _@ → @[0: a, 1: b, 2: c]@ (declaration order)
--- * @FormalNamedSet n [a, b, c] _@ → @[0: n, 1: a, 2: b, 3: c]@ (\@ name first)
+-- * @FormalName n@ becomes @[0: n]@
+-- * @FormalSet [a, b, c] _@ becomes @[0: a, 1: b, 2: c]@ (declaration order)
+-- * @FormalNamedSet n [a, b, c] _@ becomes @[0: n, 1: a, 2: b, 3: c]@ (\@ name first)
 lexicalScopeFromFormals :: Formals -> ScopeEntry
 lexicalScopeFromFormals (FormalName name) =
   LexicalScope (Map.singleton name 0)
@@ -178,7 +178,7 @@ resolveBinding stack (NamedBinding path bodyExpr) =
 resolveBinding stack (Inherit (Just fromExpr) names) =
   [Inherit (Just (resolve stack fromExpr)) names]
 resolveBinding stack (Inherit Nothing names) =
-  -- Desugar: inherit x y; → x = x; y = y;
+  -- Desugar: inherit x y; becomes x = x; y = y;
   [NamedBinding [StaticKey name] (resolve stack (EVar name)) | name <- names]
 
 -- | Check if all bindings are eligible for positional resolution:
@@ -213,7 +213,7 @@ lexicalScopeFromBindings bindings =
 --
 -- Regular bindings resolve their RHS against @innerStack@ (recursive).
 -- @inherit x@ desugars to @x = x@ where the RHS resolves against
--- @outerStack@ — the inherited name must reference the enclosing scope,
+-- @outerStack@ - the inherited name must reference the enclosing scope,
 -- not the let scope being defined.
 resolveLetBinding :: [ScopeEntry] -> [ScopeEntry] -> Binding -> [Binding]
 resolveLetBinding _ innerStack (NamedBinding path bodyExpr) =
@@ -221,13 +221,13 @@ resolveLetBinding _ innerStack (NamedBinding path bodyExpr) =
 resolveLetBinding _ innerStack (Inherit (Just fromExpr) names) =
   [Inherit (Just (resolve innerStack fromExpr)) names]
 resolveLetBinding outerStack _ (Inherit Nothing names) =
-  -- Desugar @inherit x y;@ → @x = x; y = y;@, resolving each RHS against the
+  -- Desugar @inherit x y;@ becomes @x = x; y = y;@, resolving each RHS against the
   -- outer scope so it names the enclosing binding, not the one defined here.
   -- 'shiftInheritLevel' corrects for the inner env the resulting thunk runs in.
   [NamedBinding [StaticKey name] (shiftInheritLevel (resolve outerStack (EVar name))) | name <- names]
 
 -- | A desugared positional @inherit@ RHS is resolved against the outer scope
--- but evaluated in the inner (let\/rec) env — one extra parent-chain hop — so
+-- but evaluated in the inner (let\/rec) env - one extra parent-chain hop - so
 -- its de Bruijn level is one too shallow.  Bump it.  'EVar'\/'EWithVar' are
 -- name-based and need no adjustment.
 shiftInheritLevel :: Expr -> Expr

@@ -5,7 +5,7 @@
 -- == The push choreography
 --
 -- 1. Compute the full reference closure of the requested paths from the
---    store database — a cache must never hold a path without its
+--    store database - a cache must never hold a path without its
 --    dependencies, or substitution 404s on cold machines.
 -- 2. Fetch @\/narinfo-hashes@ from the cache and skip paths already there.
 -- 3. Upload every missing NAR, then every narinfo.  NARs go first
@@ -18,7 +18,7 @@
 --
 -- The store database and filesystem use the platform store dir
 -- (@C:\\nix\\store@ on Windows).  Published narinfos always use the
--- canonical store dir (@\/nix\/store@) with forward slashes — the form the
+-- canonical store dir (@\/nix\/store@) with forward slashes - the form the
 -- store-path hashes were computed against and the form cache servers
 -- validate.  'StorePath' itself is directory-agnostic, so translation is
 -- just a matter of which renderer runs at which boundary.
@@ -151,7 +151,7 @@ loadApiKeyFile path = do
 
 -- | Compute the full reference closure of the given paths from the store
 -- database (breadth-first over @Refs@).  Fails if a recorded reference does
--- not parse as a store path — that would mean a corrupt database, and
+-- not parse as a store path - that would mean a corrupt database, and
 -- pushing a closure with holes would poison the cache.
 computeClosure :: Store -> [StorePath] -> IO (Either Text [StorePath])
 computeClosure store roots = runExceptT (go Set.empty [] roots)
@@ -281,7 +281,7 @@ uploadNar manager cfg store sp = do
       narHash = Hash.formatNixHash (Hash.hashBytes narBytes)
       narSize = BS.length narBytes
   -- The database recorded this path's NAR hash at registration; a mismatch
-  -- now means the path changed on disk — refuse to publish corruption.
+  -- now means the path changed on disk - refuse to publish corruption.
   recorded <- liftIO (queryPathInfo (stDB store) sp)
   case recorded of
     Just info

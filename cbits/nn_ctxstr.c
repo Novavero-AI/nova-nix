@@ -1,5 +1,5 @@
 /*
- * nn_ctxstr.c — Context-bearing string allocation and tracking.
+ * nn_ctxstr.c - Context-bearing string allocation and tracking.
  *
  * Each nn_ctxstr_t is a single contiguous malloc (header + flexible
  * array of nn_sce_t elements).  Pointers are tracked in a global

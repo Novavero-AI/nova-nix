@@ -567,7 +567,7 @@ parseAttrKey = do
       _ <- advance
       expr <- parseExpr
       -- In expression context, the lexer doesn't track interpolation
-      -- mode — } is TokRBrace rather than TokInterpClose.
+      -- mode - } is TokRBrace rather than TokInterpClose.
       expect TokRBrace
       pure (DynamicKey expr)
     _ -> parseError ("expected attribute key, got " <> showToken tok)

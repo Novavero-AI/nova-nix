@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# profiling/bench.sh — Reproducible benchmark runner for nova-nix memory profiling
+# profiling/bench.sh - Reproducible benchmark runner for nova-nix memory profiling
 #
 # Usage:
 #   ./profiling/bench.sh <label> [rts-flags...] [--build] [--full]
@@ -22,14 +22,14 @@
 #
 # Output:
 #   profiling/results/<label>/
-#     rts-stats.txt    — full +RTS -s output (single-run mode)
-#     summary.txt      — parsed key metrics (single-run mode)
-#     heap-profile.hp  — .hp file (if heap profiling enabled)
-#     heap-top.txt     — top 20 heap categories (if .hp present)
-#     hT/              — type breakdown (--full mode)
-#     hc/              — cost centre heap + .prof (--full mode)
-#     hr/              — retainer profile (--full mode)
-#     report.txt       — combined report (--full mode)
+#     rts-stats.txt    - full +RTS -s output (single-run mode)
+#     summary.txt      - parsed key metrics (single-run mode)
+#     heap-profile.hp  - .hp file (if heap profiling enabled)
+#     heap-top.txt     - top 20 heap categories (if .hp present)
+#     hT/              - type breakdown (--full mode)
+#     hc/              - cost centre heap + .prof (--full mode)
+#     hr/              - retainer profile (--full mode)
+#     report.txt       - combined report (--full mode)
 #
 # The script always adds +RTS -s and the heap cap (-M4G default).
 
@@ -339,16 +339,16 @@ if [[ "$FLAG_FULL" == true ]]; then
   do_build standard
   run_one_profile "$RESULTS_DIR/hT" -hT
 
-  # Pass 2: -hc -p (profiling build — cost centres + time/alloc .prof)
+  # Pass 2: -hc -p (profiling build - cost centres + time/alloc .prof)
   echo ""
   echo "--- Pass 2/3: Cost Centres + Time Profile (-hc -p) ---"
   do_build profiling
   run_one_profile "$RESULTS_DIR/hc" -hc -p
 
-  # Pass 3: -hr (profiling build — retainers)
+  # Pass 3: -hr (profiling build - retainers)
   echo ""
   echo "--- Pass 3/3: Retainers (-hr) ---"
-  # No rebuild needed — already have profiling build
+  # No rebuild needed - already have profiling build
   run_one_profile "$RESULTS_DIR/hr" -hr
 
   # Generate combined report

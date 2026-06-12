@@ -72,7 +72,7 @@ newtype NixEvalError = NixEvalError Text
 
 instance Exception NixEvalError
 
--- | Abort error — NOT catchable by tryEval (matches real Nix semantics).
+-- | Abort error - NOT catchable by tryEval (matches real Nix semantics).
 newtype NixAbortError = NixAbortError Text
   deriving (Show)
 
@@ -85,25 +85,25 @@ instance Exception NixAbortError
 -- | Shared state for IO evaluation.
 --
 -- 'esImportCache' is a shared mutable cache (global across all frames).
--- Single-threaded only — switch to @MVar@ or @TVar@ if concurrent
+-- Single-threaded only - switch to @MVar@ or @TVar@ if concurrent
 -- evaluation is ever added.
 --
--- 'esBaseDir' is immutable per frame — @import@ uses 'local' to set it
+-- 'esBaseDir' is immutable per frame - @import@ uses 'local' to set it
 -- for nested evaluations, so it is exception-safe with no save\/restore.
 --
 -- 'esSearchPaths' holds parsed @NIX_PATH@ entries as thunks, populating
 -- @builtins.nixPath@.
 data EvalState = EvalState
   { esImportCache :: !(IORef (Map FilePath NixValue)),
-    -- | Cache of derivation modulo-hashes (drv store path → hex), populated
+    -- | Cache of derivation modulo-hashes (drv store path to hex), populated
     -- bottom-up by 'builtinDerivationStrict' so input derivations can be
     -- substituted by their content hashes when computing output paths.
     esDrvModuloCache :: !(IORef (Map Text Text)),
-    -- | Accumulated @.drv@ closure (drv store path text → its ATerm), recorded
+    -- | Accumulated @.drv@ closure (drv store path text to its ATerm), recorded
     -- bottom-up by 'builtinDerivationStrict'.  The build driver reads this after
     -- evaluation to write every input @.drv@ to the store before building.
     esDrvClosure :: !(IORef (Map Text Text)),
-    -- | Cache of source path → its store path (recursive NAR hash), so a path
+    -- | Cache of source path to its store path (recursive NAR hash), so a path
     -- literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text Text)),
     esBaseDir :: !FilePath,
@@ -195,7 +195,7 @@ instance MonadEval EvalIO where
             -- captured in closures remain valid after the import scope ends.
             let fileDir = takeDirectory target
                 expr = resolveRelativePaths fileDir rawExpr
-            -- local sets new base dir for nested imports — pure, exception-safe
+            -- local sets new base dir for nested imports - pure, exception-safe
             let nested =
                   EvalIO
                     ( local
@@ -260,7 +260,7 @@ instance MonadEval EvalIO where
     -- The preimage is built inline against the LIVE storeDir (esStoreDir), not
     -- via Nix.Hash.makeStorePath which pins the canonical defaultStoreDir for
     -- cross-platform .drv-hash parity.  toFile outputs are host-local, so they
-    -- must use the running store dir — keep this format in sync with
+    -- must use the running store dir - keep this format in sync with
     -- makeStorePath's preimage (type:sha256:hex:storeDir:name).
     let contentHash = sha256Hex (encodeUtf8 contents)
         inner = "nix-store:sha256:" <> contentHash <> ":" <> T.pack storeDir <> ":" <> name
@@ -354,7 +354,7 @@ instance MonadEval EvalIO where
       else pure path
 
   forceThunk evalFn (Thunk ptr) = do
-    -- Force protocol: PENDING -> BLACKHOLE -> COMPUTED with memoization.
+    -- Force protocol: PENDING to BLACKHOLE to COMPUTED with memoization.
     -- Scalar values (int/float/bool/null) are stored inline in the
     -- thunk payload (no StablePtr), dispatched via val_tag.
     --
@@ -362,7 +362,7 @@ instance MonadEval EvalIO where
     -- evaluation begins.  If evaluation re-enters the same thunk, it
     -- sees BLACKHOLE and reports infinite recursion.  This is safe with
     -- knot-tying (evalRecAttrs, evalLet, matchFormalSet) because those
-    -- patterns create distinct thunks sharing an env — no thunk ever
+    -- patterns create distinct thunks sharing an env - no thunk ever
     -- forces itself.
     state <- EvalIO (liftIO (cthunkState ptr))
     case state of
@@ -370,7 +370,7 @@ instance MonadEval EvalIO where
         EvalIO (liftIO (readComputed ptr))
       2 {- BLACKHOLE -} ->
         -- Infinite recursion is non-catchable (like abort), matching C++ Nix.
-        -- tryEval must NOT catch blackholes — using abortEvaluation ensures
+        -- tryEval must NOT catch blackholes - using abortEvaluation ensures
         -- the error propagates through tryEval/catchEvalError.
         abortEvaluation "infinite recursion encountered"
       _ {- PENDING -} -> do
@@ -381,7 +381,7 @@ instance MonadEval EvalIO where
         envSp <- EvalIO (liftIO (cthunkPayload ptr))
         let pendingSp = castPtrToStablePtr envSp
         env <- EvalIO (liftIO (deRefStablePtr pendingSp))
-        -- Mark blackhole BEFORE evaluation — any re-entry hits the
+        -- Mark blackhole BEFORE evaluation - any re-entry hits the
         -- BLACKHOLE branch above.
         _ <- EvalIO (liftIO (cthunkMarkBlackhole ptr))
         val <- evalFn env bcIdx
@@ -462,7 +462,7 @@ importCacheMaxAttrs = 1000
 -- ---------------------------------------------------------------------------
 
 -- | Classify a filesystem path as @"regular"@, @"directory"@, @"symlink"@,
--- or @"unknown"@ — matching Nix's @builtins.readDir@ / @readFileType@.
+-- or @"unknown"@ - matching Nix's @builtins.readDir@ / @readFileType@.
 classifyPath :: FilePath -> IO Text
 classifyPath fp =
   firstMatch

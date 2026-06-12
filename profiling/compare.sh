@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# profiling/compare.sh — Compare two benchmark runs side by side
+# profiling/compare.sh - Compare two benchmark runs side by side
 #
 # Usage: ./profiling/compare.sh <label-before> <label-after>
 #
@@ -31,7 +31,7 @@ for dir in "$BEFORE" "$AFTER"; do
   fi
 done
 
-echo "=== Comparison: $1 → $2 ==="
+echo "=== Comparison: $1 -> $2 ==="
 echo ""
 
 # --- Metadata ---
@@ -54,7 +54,7 @@ if [[ -f "$BEFORE/heap-top.txt" && -f "$AFTER/heap-top.txt" ]]; then
   printf "%-10s %-10s %-8s  %s\n" "------" "-----" "-----" "--------"
 
   # Build associative arrays from both files, then merge and display.
-  # parse-hp.sh output format: "%8.1f  %s" — $1 is MB, rest is category.
+  # parse-hp.sh output format: "%8.1f  %s" - $1 is MB, rest is category.
   # Use field-based parsing to handle category names with parens/spaces.
   awk '
     {

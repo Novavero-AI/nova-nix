@@ -1,6 +1,6 @@
 # Stage 0 of the native Windows stdenv: the MinGW-w64 toolchain seed.
 #
-# The bootstrap trust anchor — pre-built MSYS2 packages, pinned by sha256,
+# The bootstrap trust anchor - pre-built MSYS2 packages, pinned by sha256,
 # fetched with builtin:fetchurl and extracted with builtin:unpack into one
 # merged toolchain root (MSYS2 packages share the mingw64/ prefix).  This is
 # the Windows equivalent of nixpkgs' bootstrapTools tarball: everything past

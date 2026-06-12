@@ -46,7 +46,7 @@
 -- 7. __Environment__: environment variables for the build
 --
 -- The HASH of this .drv file (after ATerm serialization) determines the
--- output store path.  Change any input → different hash → different output
+-- output store path.  Change any input yields a different hash and a different output
 -- path.  This is how Nix achieves reproducibility.
 module Nix.Derivation
   ( -- * Derivation type
@@ -145,7 +145,7 @@ data DerivationOutput = DerivationOutput
   }
   deriving (Eq, Show)
 
--- | A complete derivation — everything needed to build a package.
+-- | A complete derivation - everything needed to build a package.
 data Derivation = Derivation
   { -- | What this derivation produces.
     drvOutputs :: ![DerivationOutput],
@@ -178,7 +178,7 @@ toATerm = toATermForHash False Nothing
 --     when computing a derivation's own output paths (not yet known) via
 --     @hashDerivationModulo@.
 --   * @inputSubst@: when @Just subs@, render the input-derivations section
---     from @subs@ — pairs of @(moduloHashHex, outputNames)@ — instead of
+--     from @subs@ - pairs of @(moduloHashHex, outputNames)@ - instead of
 --     from 'drvInputDrvs'.  Each input derivation's store path is replaced
 --     by its own modulo hash, so two derivations differing only in an
 --     input's path spelling (not its content) hash identically.

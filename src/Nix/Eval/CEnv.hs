@@ -1,6 +1,6 @@
 -- | C-backed evaluation environments.
 --
--- Wraps @cbits/nn_env.c@ — arena-allocated @nn_env_t@ structs that
+-- Wraps @cbits/nn_env.c@ - arena-allocated @nn_env_t@ structs that
 -- hold slot arrays, lazy scopes, parent pointers, and with-scopes.
 -- All memory is freed in bulk via 'cenvDestroy' at evaluation end.
 --
@@ -49,14 +49,14 @@ import Foreign.Ptr (Ptr)
 import Nix.Eval.CThunk (CThunkPtr)
 
 -- ---------------------------------------------------------------------------
--- Opaque C type (phantom — never constructed on the Haskell side)
+-- Opaque C type (phantom - never constructed on the Haskell side)
 -- ---------------------------------------------------------------------------
 
 -- | Phantom type representing the C @nn_env_t@ struct.
 data NnEnv
 
 -- ---------------------------------------------------------------------------
--- FFI imports (all unsafe — no callbacks, fast operations)
+-- FFI imports (all unsafe - no callbacks, fast operations)
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_env_init"
@@ -204,7 +204,7 @@ cenvWithCount = c_nn_env_with_count
 -- ---------------------------------------------------------------------------
 
 -- | Resolved variable lookup: walk @level@ parent hops, then read
--- @slots[idx]@.  Single FFI call — O(level) in C.
+-- @slots[idx]@.  Single FFI call - O(level) in C.
 cenvLookupResolved :: Ptr NnEnv -> Int -> Int -> IO CThunkPtr
 cenvLookupResolved env level idx =
   -- C @int@ params: convert at the boundary (CInt), not HsInt (64-bit).

@@ -1,5 +1,5 @@
 /*
- * nn_thunk.c — Arena-allocated thunk memoization cells.
+ * nn_thunk.c - Arena-allocated thunk memoization cells.
  *
  * Chunked bump allocator: linked list of blocks, each containing a
  * contiguous array of nn_thunk_t slots.  When the current block is
@@ -59,7 +59,7 @@ alloc_block(uint32_t capacity)
 static nn_thunk_t *
 arena_alloc(struct nn_thunk_arena *arena)
 {
-    /* Current block full — allocate a new one */
+    /* Current block full - allocate a new one */
     if (arena->current->count >= arena->current->capacity) {
         struct nn_thunk_block *block = alloc_block(arena->block_capacity);
         if (!block) return NULL;

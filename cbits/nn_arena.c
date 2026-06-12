@@ -1,10 +1,10 @@
 /*
- * nn_arena.c — Batch StablePtr collection from the thunk arena.
+ * nn_arena.c - Batch StablePtr collection from the thunk arena.
  *
  * The Haskell teardown (Nix.Eval.Arena) needs every Haskell StablePtr the C
  * arena holds so it can free them.  These two entry points delegate to the
  * single-pass block-list walk in nn_thunk.c (nn_thunk_{count,collect}_
- * stableptrs), which is O(total) — index-based iteration via nn_thunk_get
+ * stableptrs), which is O(total) - index-based iteration via nn_thunk_get
  * would be O(total * blocks), since each get re-walks the block list.
  *
  * StablePtr sources (see nn_thunk.c):

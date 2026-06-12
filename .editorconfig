@@ -1,0 +1,13 @@
+# https://editorconfig.org
+# Source is ASCII-only and UTF-8 encoded, with LF line endings.
+# Enforced in CI (see the "ASCII source" job): no smart quotes, em-dashes,
+# or other non-keyboard characters in the tree.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+
+[*.sh]
+end_of_line = lf

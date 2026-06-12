@@ -2,7 +2,7 @@
 
 -- | C-backed bytecode storage via FFI.
 --
--- Wraps @cbits/nn_bytecode.c@ — two growable arrays storing flat Nix
+-- Wraps @cbits/nn_bytecode.c@ - two growable arrays storing flat Nix
 -- expression bytecode: an @nn_op_t[]@ instruction array (16 bytes each)
 -- and a @uint32_t[]@ data buffer for variable-length operands.
 --
@@ -111,7 +111,7 @@ where
 import Data.Word (Word16, Word32, Word8)
 
 -- ---------------------------------------------------------------------------
--- FFI imports (all unsafe — no callbacks, fast data access)
+-- FFI imports (all unsafe - no callbacks, fast data access)
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_bytecode_init"
@@ -186,7 +186,7 @@ cbcEmitData = c_nn_bc_emit_data
 cbcOpcode :: Word32 -> IO Word8
 cbcOpcode = c_nn_bc_opcode
 
--- | The flags byte of instruction @i@ — the sub-type selector (e.g. which
+-- | The flags byte of instruction @i@ - the sub-type selector (e.g. which
 -- unary/binary operator), interpreted via the sub-type-flag constants below.
 cbcFlags :: Word32 -> IO Word8
 cbcFlags = c_nn_bc_flags

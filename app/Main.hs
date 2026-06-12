@@ -285,7 +285,7 @@ buildFile opts dataDir rawFilePath = do
           store <- openStore (chosenStoreDir opts)
           -- Materialize eval-coerced source paths (src = ./file, path
           -- interpolation): evaluation computes their store paths as text
-          -- only — the parity runner's store is not writable — so the build
+          -- only - the parity runner's store is not writable - so the build
           -- driver performs the copy and registration.
           materializeEvalSources store sourceCache
           buildResult <- buildAndRegister store caches drvClosure drv drvSP
@@ -315,7 +315,7 @@ extractDerivation (VAttrs attrs) = do
     _ -> do
       hPutStrLn stderr "error: derivation result missing _derivation field"
       exitFailure
-  -- Extract drvPath — this is the store path of the .drv file itself,
+  -- Extract drvPath - this is the store path of the .drv file itself,
   -- computed by hashing the ATerm serialization during evaluation.
   drvSP <- case attrSetLookup "drvPath" attrs of
     Just thunk | Just (VStr path _) <- readThunkValue thunk -> case parseStorePath defaultStoreDir path of
@@ -364,7 +364,7 @@ buildAndRegister store caches drvClosure drv drvSP = do
   -- recipe) to the store.  buildWithDeps reads these back to construct the
   -- dependency graph; without them it cannot realize any non-leaf derivation.
   writeDrvClosure store drvClosure
-  -- Write the root .drv too (idempotent — it is also in the closure) so a build
+  -- Write the root .drv too (idempotent - it is also in the closure) so a build
   -- still works if the closure was not captured (e.g. a pre-built store drv).
   writeDrv store drv drvSP
   -- Build with dependency resolution
@@ -453,7 +453,7 @@ failWith msg = do
 
 -- | Copy eval-coerced source paths into the store and register them.  The
 -- evaluator's source-path cache maps each coerced filesystem path to its
--- @source@ fixed-output store path (text only — eval performs no store
+-- @source@ fixed-output store path (text only - eval performs no store
 -- writes).  Each entry not already valid is copied in, made read-only, and
 -- registered with its real NAR hash.  A copied source carries no references.
 materializeEvalSources :: Store -> Map.Map T.Text T.Text -> IO ()
@@ -502,7 +502,7 @@ writeDrvClosure store = mapM_ writeOne . Map.toList
 
 -- | Optionally deep-force a value before printing.
 -- With @--strict@, all thunks are recursively materialized.
--- Without it, thunks display as @«thunk»@ — safe for large results.
+-- Without it, thunks display as @"thunk"@ - safe for large results.
 finalize :: (MonadEval m) => Bool -> NixValue -> m NixValue
 finalize True = deepForceValue
 finalize False = pure
@@ -540,18 +540,18 @@ prettyValue (VAttrs attrs) =
   let entries = attrSetToAscList attrs
       rendered = map (\(k, t) -> k <> " = " <> prettyThunk t <> ";") entries
    in "{ " <> T.intercalate " " rendered <> " }"
-prettyValue (VLambda {}) = "«lambda»"
-prettyValue (VBuiltin name _) = "«builtin " <> name <> "»"
-prettyValue (VCompiledRegex _) = "«compiled-regex»"
+prettyValue (VLambda {}) = "<lambda>"
+prettyValue (VBuiltin name _) = "<builtin " <> name <> ">"
+prettyValue (VCompiledRegex _) = "<compiled-regex>"
 prettyValue (VDerivation drv) =
   case drvOutputs drv of
-    (out : _) -> "«derivation " <> T.pack (storePathToFilePath platformStoreDir (doPath out)) <> "»"
-    [] -> "«derivation»"
+    (out : _) -> "<derivation " <> T.pack (storePathToFilePath platformStoreDir (doPath out)) <> ">"
+    [] -> "<derivation>"
 
 -- | Pretty-print a thunk.  After deep-forcing, all thunks should be
 -- computed thunks render their value; pending thunks render as a placeholder.
 prettyThunk :: Thunk -> T.Text
-prettyThunk thunk = maybe "«thunk»" prettyValue (readThunkValue thunk)
+prettyThunk thunk = maybe "<thunk>" prettyValue (readThunkValue thunk)
 
 -- | Escape a string for Nix-style output (quotes, backslashes, newlines, tabs, carriage returns).
 escapeNixString :: T.Text -> T.Text

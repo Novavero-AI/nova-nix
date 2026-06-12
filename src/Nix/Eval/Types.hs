@@ -186,9 +186,9 @@ mkStr t = VStr t emptyContext
 -- | A thunk: a C arena-allocated memoization cell.
 --
 -- Each thunk points to an @nn_thunk_t@ in the C arena.
--- On first force, the cell transitions PENDING -> BLACKHOLE -> COMPUTED,
+-- On first force, the cell transitions PENDING to BLACKHOLE to COMPUTED,
 -- which detects infinite recursion (BLACKHOLE) and drops the Expr/Env
--- references — matching real Nix which mutates thunks in-place.
+-- references - matching real Nix which mutates thunks in-place.
 --
 -- The C thunk is allocated via 'unsafePerformIO' in 'mkThunk' (same
 -- pattern as the former IORef-based approach) so that knot-tying works
@@ -243,7 +243,7 @@ pattern ValueLambda = 9
 
 -- | Read a COMPUTED thunk's value without forcing.
 -- Returns 'Nothing' for PENDING or BLACKHOLE thunks.
--- Uses 'unsafePerformIO' — safe because C reads are idempotent.
+-- Uses 'unsafePerformIO' - safe because C reads are idempotent.
 readThunkValue :: Thunk -> Maybe NixValue
 readThunkValue (Thunk ptr) =
   unsafePerformIO $ do
@@ -273,7 +273,7 @@ readThunkValue (Thunk ptr) =
             payload <- cthunkPayload ptr
             deRefStablePtr (castPtrToStablePtr payload)
 
--- | A Nix value — the result of evaluating an expression.
+-- | A Nix value - the result of evaluating an expression.
 data NixValue
   = -- | 64-bit signed integer (matching Nix semantics).
     VInt !Int64
@@ -299,7 +299,7 @@ data NixValue
     -- Accumulated args support curried partial application.
     VBuiltin !Text ![NixValue]
   | -- | Pre-compiled regex carried in a partially-applied builtin.
-    -- Internal only — never exposed to Nix code directly.
+    -- Internal only - never exposed to Nix code directly.
     VCompiledRegex !CompiledRegex
   deriving (Eq, Show)
 
@@ -312,7 +312,7 @@ data NixValue
 -- All keys are interned symbols; values are CThunkPtrs in a parallel
 -- array.  O(log n) binary search on contiguous memory for lookup.
 -- Replaces the former EagerAttrs\/LazyAttrs\/MappedAttrs\/CAttrs ADT
--- with a single C-backed representation — all attr set data lives off
+-- with a single C-backed representation - all attr set data lives off
 -- the GHC heap, dramatically reducing GC pressure for large evaluations.
 newtype AttrSet = AttrSet {unAttrSet :: CAttrSet}
 
@@ -325,7 +325,7 @@ instance Show AttrSet where
      in "<attrset " ++ show n ++ " entries>"
 
 -- | Look up a single key via symbol interning + C binary search.
--- Uses 'unsafePerformIO' — safe because symbolIntern and cattrsetLookup
+-- Uses 'unsafePerformIO' - safe because symbolIntern and cattrsetLookup
 -- are idempotent (same key always yields same symbol and same result).
 attrSetLookup :: Text -> AttrSet -> Maybe Thunk
 attrSetLookup key (AttrSet cset) =
@@ -359,7 +359,7 @@ attrSetSize (AttrSet cset) =
 
 -- | Full materialization: build a 'Map Text Thunk' from all entries.
 -- Iterates the C array and builds a Haskell Map.  Expensive on large
--- sets — avoid on the hot path.
+-- sets - avoid on the hot path.
 attrSetToMap :: AttrSet -> Map Text Thunk
 attrSetToMap (AttrSet cset) =
   unsafePerformIO $ do
@@ -406,7 +406,7 @@ attrSetUnionWith f a b = attrSetFromMap (Map.unionWith f (attrSetToMap a) (attrS
 -- inserts key-value pairs, freezes (sort + dedup).  The canonical entry
 -- point for all attribute set construction.
 --
--- Uses 'unsafePerformIO' with @NOINLINE@ — safe because C allocation
+-- Uses 'unsafePerformIO' with @NOINLINE@ - safe because C allocation
 -- is idempotent and the resulting CAttrSet is referentially transparent.
 {-# NOINLINE attrSetFromMap #-}
 attrSetFromMap :: Map Text Thunk -> AttrSet
@@ -449,7 +449,7 @@ fillCAttrSetValues cset thunkMap = unsafePerformIO $
       Just idx -> cattrsetSetValue cset idx ptr
       Nothing -> pure ()
 
--- | Evaluation environment — C-backed scope chain.
+-- | Evaluation environment - C-backed scope chain.
 --
 -- Arena-allocated @nn_env_t@ struct (48 bytes, zero GC overhead).
 -- All env data (slots, lazy scope, parent, with-scopes) lives in C.
@@ -480,7 +480,7 @@ instance Show Env where
           ++ " withs}"
 
 -- | Empty environment (no variables in scope).
--- Points to a static global C struct — valid until 'arenaDestroy'.
+-- Points to a static global C struct - valid until 'arenaDestroy'.
 {-# NOINLINE emptyEnv #-}
 emptyEnv :: Env
 emptyEnv = Env (unsafePerformIO cenvEmpty)
@@ -517,7 +517,7 @@ envLookupResolved level idx (Env envPtr) =
 -- | Name-based variable lookup: walk the parent chain checking
 -- lazy scopes; fall back to with-scopes (from the starting env).
 --
--- Positional slots are NOT searched here — used only for
+-- Positional slots are NOT searched here - used only for
 -- 'EVar' lookups (let\/rec bindings, builtins, with-scopes).
 envLookup :: Text -> Env -> Maybe Thunk
 envLookup name (Env envPtr) = lexicalLookup envPtr
@@ -540,7 +540,7 @@ envLookup name (Env envPtr) = lexicalLookup envPtr
                     else lookupWithScopesC name startWiths startWithCount
 
 -- | Walk with-scopes (C array) innermost to outermost.
--- Skips tagged lazy entries (bit 0 set) — those are thunk pointers
+-- Skips tagged lazy entries (bit 0 set) - those are thunk pointers
 -- that can only be resolved by 'evalWithVarScopes' which has monadic
 -- 'force'.  This is a safety guard: currently unreachable because
 -- 'resolveVars' ensures EVar behind a with-scope always becomes
@@ -615,8 +615,8 @@ withScopesForCapture (Env envPtr) = unsafePerformIO $ do
 -- | Create an unevaluated thunk with a fresh C arena-allocated cell.
 --
 -- Compiles the Expr to bytecode and stores (bc_idx, env_ptr) in the
--- C thunk — no StablePtr, zero GHC heap pressure for pending thunks.
--- The cell is allocated via 'unsafePerformIO' — safe because C
+-- C thunk - no StablePtr, zero GHC heap pressure for pending thunks.
+-- The cell is allocated via 'unsafePerformIO' - safe because C
 -- allocation is a pure side effect, and the @NOINLINE@ + @seq@
 -- pattern prevents GHC from floating the allocation to a shared
 -- top-level CAF.
@@ -704,11 +704,11 @@ cheapThunkBc env bcIdx =
 --
 -- @NOINLINE@ prevents inlining so GHC can't see inside or CSE calls.
 -- @seq@ on the expr creates a data dependency that prevents float-out
--- to a top-level CAF — without this, GHC would hoist the
+-- to a top-level CAF - without this, GHC would hoist the
 -- @unsafePerformIO@ and share ONE cell across ALL thunks.
 --
 -- Compiles the Expr to bytecode and stores (bc_idx, StablePtr Env)
--- in the C thunk.  The Expr tree is eliminated from the GHC heap —
+-- in the C thunk.  The Expr tree is eliminated from the GHC heap -
 -- only the StablePtr Env (~16 bytes) remains for knot-tying laziness.
 {-# NOINLINE newBcThunkPtr #-}
 newBcThunkPtr :: Expr -> Env -> CThunkPtr
@@ -730,11 +730,11 @@ newSyntheticBcThunkPtr envKey expr env =
     cthunkNewBc bcIdx (castStablePtrToPtr sp)
 
 -- | Allocate a fresh C arena thunk cell from a known bytecode index.
--- No compilation needed — the bc_idx is already available.
+-- No compilation needed - the bc_idx is already available.
 --
--- Uses StablePtr for the Env so it stays lazy — essential for
+-- Uses StablePtr for the Env so it stays lazy - essential for
 -- knot-tying in recursive attrs, let bindings, and matchFormalSet.
--- The StablePtr points to an Env (newtype around Ptr NnEnv) — ~16
+-- The StablePtr points to an Env (newtype around Ptr NnEnv) - ~16
 -- bytes on the GHC heap, negligible compared to the Expr trees we
 -- eliminated.
 {-# NOINLINE newBcThunkPtrLazy #-}
@@ -969,7 +969,7 @@ newComputedAttrsPtr cset =
 -- | Build a C-allocated slot array from a list of 'Thunk' values.
 -- Each thunk is converted to 'CThunkPtr' via 'thunkToCPtr'.
 -- Returns the C array pointer and the slot count.
--- Uses 'unsafePerformIO' — safe because allocation is idempotent.
+-- Uses 'unsafePerformIO' - safe because allocation is idempotent.
 {-# NOINLINE buildCSlots #-}
 buildCSlots :: [Thunk] -> (Ptr CThunkPtr, Int)
 buildCSlots thunks = unsafePerformIO $ do
@@ -1090,7 +1090,7 @@ class (Monad m) => MonadEval m where
   -- IO evaluators should cache results (via per-thunk @IORef@).
   -- Pure evaluators re-evaluate each time.
   -- The first argument is the bytecode evaluation function (to break
-  -- the Eval.Types → Eval circular dependency).
+  -- the Eval.Types to Eval circular dependency).
   forceThunk :: (Env -> Word32 -> m NixValue) -> Thunk -> m NixValue
 
   -- | Look up a cached derivation modulo-hash (hex) by its @.drv@ store
@@ -1111,7 +1111,7 @@ class (Monad m) => MonadEval m where
   recordDrvAterm :: Text -> Text -> m ()
 
   -- | Compute the store path a source file/directory gets when copied into
-  -- the store (recursive NAR sha256 → @source@ fixed-output path), WITHOUT
+  -- the store (recursive NAR sha256 to a @source@ fixed-output path), WITHOUT
   -- performing the copy.  Used when a path literal is coerced in a derivation
   -- argument or environment value.  Unavailable in pure evaluation.
   storeSourcePath :: Text -> m Text
@@ -1120,7 +1120,7 @@ class (Monad m) => MonadEval m where
 -- recursion) must escape 'tryEval' exactly as in C++ Nix; 'PThrow' is catchable.
 data PureError = PThrow !Text | PAbort !Text
 
--- | Pure evaluation monad — wraps @Either PureError@.
+-- | Pure evaluation monad - wraps @Either PureError@.
 -- IO builtins ('readFile', 'import') are unavailable;
 -- everything else evaluates identically to the IO version.
 newtype PureEval a = PureEval (Either PureError a)
@@ -1166,9 +1166,9 @@ instance MonadEval PureEval where
   storeSourcePath = pure
   resolvePathLiteral = pure
   forceThunk evalFn (Thunk ptr) =
-    -- Read the C thunk via unsafePerformIO — safe because reads are
+    -- Read the C thunk via unsafePerformIO - safe because reads are
     -- idempotent and PureEval never writes back (no memoization).
-    -- Does NOT mark blackholes — PureEval may re-force the same thunk.
+    -- Does NOT mark blackholes - PureEval may re-force the same thunk.
     -- Dispatches on val_tag for computed scalars (no StablePtr deref).
     case unsafePerformIO (cthunkState ptr) of
       ThunkComputed ->

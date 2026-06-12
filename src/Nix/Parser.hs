@@ -66,7 +66,7 @@ import Nix.Parser.ParseError (ParseError (..))
 -- | Parse a Nix expression from source text.
 --
 -- The input is the full file contents. The file name is used only for
--- error messages.  Strips a leading UTF-8 BOM if present — Windows
+-- error messages.  Strips a leading UTF-8 BOM if present - Windows
 -- editors (Notepad, PowerShell) commonly add one.
 parseNix :: Text -> Text -> Either ParseError Expr
 parseNix fileName source = do
@@ -98,10 +98,10 @@ parseNixFile path = do
 -- UTF-16 LE.  Nix files are normally UTF-8, but on a Windows-first
 -- implementation we handle all three BOM variants:
 --
--- * @FF FE@       → UTF-16 LE (PowerShell default)
--- * @FE FF@       → UTF-16 BE
--- * @EF BB BF@    → UTF-8 (BOM stripped)
--- * No BOM        → UTF-8
+-- * @FF FE@ is UTF-16 LE (PowerShell default)
+-- * @FE FF@ is UTF-16 BE
+-- * @EF BB BF@ is UTF-8 (BOM stripped)
+-- * No BOM is UTF-8
 readFileAutoEncoding :: FilePath -> IO Text
 readFileAutoEncoding path = decodeAutoEncoding <$> BS.readFile path
 

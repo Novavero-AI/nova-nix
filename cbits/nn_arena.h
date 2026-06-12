@@ -1,9 +1,9 @@
 /*
- * nn_arena.h — Unified arena lifecycle and StablePtr cleanup.
+ * nn_arena.h - Unified arena lifecycle and StablePtr cleanup.
  *
  * Provides batch collection of StablePtr payloads from the thunk arena
  * for efficient cleanup.  After M6 bytecode integration, PENDING thunks
- * hold (bc_idx, StablePtr Env) — the Expr is eliminated, replaced by
+ * hold (bc_idx, StablePtr Env) - the Expr is eliminated, replaced by
  * a bytecode index.  COMPUTED/NN_VALUE_PTR thunks hold StablePtr NixValue.
  *
  * Inline scalar/C-pointer payloads (INT, FLOAT, BOOL, NULL, STR,

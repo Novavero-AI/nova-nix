@@ -1,26 +1,26 @@
 /*
- * nn_attrset.h — Sorted symbol-keyed attribute set for nova-nix.
+ * nn_attrset.h - Sorted symbol-keyed attribute set for nova-nix.
  *
  * Replaces Haskell's Data.Map.Strict (48 bytes per Bin node, pointer-
  * chasing balanced tree) with a contiguous sorted array of (symbol, slot)
  * pairs.  Binary search for O(log n) lookup; linear scan for iteration.
  *
  * Construction is two-phase:
- *   1. nn_attrset_new(cap) + nn_attrset_insert() — append unsorted
- *   2. nn_attrset_freeze() — sort by symbol ID, enable binary search
+ *   1. nn_attrset_new(cap) + nn_attrset_insert() - append unsorted
+ *   2. nn_attrset_freeze() - sort by symbol ID, enable binary search
  *
  * After freeze, the set is immutable (values can be updated in-place
  * but keys cannot change).  This matches Nix semantics: attribute sets
  * are constructed once and never gain/lose keys.
  *
- * Values are opaque void* — Haskell passes StablePtr Thunk.  The C
+ * Values are opaque void* - Haskell passes StablePtr Thunk.  The C
  * side never dereferences them.
  *
  * Lifecycle: arena-managed.  Every set is tracked at creation and bulk-freed
  * by nn_attrset_free_all at evaluation teardown; nn_attrset_free is that
  * teardown's per-set primitive and must not be called on a tracked set (it
  * would then be double-freed by nn_attrset_free_all).
- * Values (StablePtrs) are NOT freed by nn_attrset_free — Haskell owns them.
+ * Values (StablePtrs) are NOT freed by nn_attrset_free - Haskell owns them.
  */
 
 #ifndef NN_ATTRSET_H
@@ -48,7 +48,7 @@ void nn_attrset_free(nn_attrset_t *set);
 /* --- Construction (before freeze) --- */
 
 /* Append a key-value pair.  Keys need not be sorted or unique at this
- * stage — duplicates are resolved at freeze time (last insert wins,
+ * stage - duplicates are resolved at freeze time (last insert wins,
  * matching Nix // merge semantics).
  * Grows the internal arrays if capacity is exceeded. */
 void nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value);
@@ -99,12 +99,12 @@ void nn_attrset_free_all(void);
 /* Create a new set that is the right-biased union of `a` and `b`
  * (keys in `b` override `a`).  Both inputs must be frozen.
  * The result is returned frozen and is arena-tracked (freed by
- * nn_attrset_free_all) — do NOT pass it to nn_attrset_free. */
+ * nn_attrset_free_all) - do NOT pass it to nn_attrset_free. */
 nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b);
 
 /* Create a new set with the given keys removed.  Input must be frozen.
  * The result is returned frozen and is arena-tracked (freed by
- * nn_attrset_free_all) — do NOT pass it to nn_attrset_free. */
+ * nn_attrset_free_all) - do NOT pass it to nn_attrset_free. */
 nn_attrset_t *nn_attrset_remove_keys(
     const nn_attrset_t *set,
     const nn_symbol_t *keys,
