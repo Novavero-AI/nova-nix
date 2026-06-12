@@ -30,6 +30,9 @@ on:
       - "data/**"
       - "nova-nix.cabal"
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   parity:
     name: drvPath vs upstream Nix

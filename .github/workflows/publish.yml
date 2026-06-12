@@ -1,0 +1,44 @@
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish to Hackage
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set version from tag
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          sed -i "s/^version:.*/version:            $TAG_VERSION/" nova-nix.cabal
+          echo "Set version to $TAG_VERSION"
+
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.8"
+          cabal-version: "latest"
+
+      - name: Build sdist
+        run: cabal sdist
+
+      - name: Upload to Hackage
+        env:
+          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
+        run: |
+          SDIST=$(ls dist-newstyle/sdist/nova-nix-*.tar.gz)
+          curl --fail --silent --show-error \
+            --header "Authorization: X-ApiKey ${HACKAGE_TOKEN}" \
+            --form "package=@${SDIST}" \
+            https://hackage.haskell.org/packages/

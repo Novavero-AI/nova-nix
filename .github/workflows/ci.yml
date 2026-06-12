@@ -3,9 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_call:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -48,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: haskell-actions/run-ormolu@v16
+      - uses: haskell-actions/run-ormolu@v17
         with:
           pattern: |
             src/**/*.hs
@@ -120,47 +123,3 @@ jobs:
 
       - name: Test
         run: cabal test
-
-  # ---------------------------------------------------------------------------
-  # Publish to Hackage (tag-triggered, after all builds pass)
-  # ---------------------------------------------------------------------------
-
-  publish:
-    name: Publish to Hackage
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set version from tag
-        run: |
-          TAG_VERSION=${GITHUB_REF#refs/tags/v}
-          sed -i "s/^version:.*/version:            $TAG_VERSION/" nova-nix.cabal
-          echo "Set version to $TAG_VERSION"
-
-      - uses: haskell-actions/setup@v2
-        id: setup
-        with:
-          ghc-version: "9.8"
-          cabal-version: "latest"
-
-      - name: Cache Cabal store
-        uses: actions/cache@v5
-        with:
-          path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
-          restore-keys: cabal-${{ runner.os }}-
-
-      - name: Build sdist
-        run: cabal sdist
-
-      - name: Upload to Hackage
-        env:
-          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
-        run: |
-          SDIST=$(ls dist-newstyle/sdist/nova-nix-*.tar.gz)
-          curl --fail --silent --show-error \
-            --header "Authorization: X-ApiKey ${HACKAGE_TOKEN}" \
-            --form "package=@${SDIST}" \
-            https://hackage.haskell.org/packages/
