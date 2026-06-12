@@ -1,10 +1,16 @@
 # nova-nix stage-1 stdenv: the Windows genericBuild.
 #
 # Run by the seed's bash as a derivation's builder.  mkDerivation (stdenv.nix)
-# passes the package via the environment: $src (source tarball or directory),
-# $out (install prefix), $ccPath (the mingw toolchain bin, already
-# drive-translated), $buildInputs (dependency store paths), and the optional
-# $configureFlags / $makeFlags.
+# passes the package via the environment:
+#   $src           source tarball or directory
+#   $out           install prefix (the output store path)
+#   $ccPath        the mingw toolchain bin, already drive-translated
+#   $ccWrapperSrc  the cc-wrapper script (a store path), installed onto PATH
+#   $buildInputs   dependency store paths
+# plus these optional knobs a package may set:
+#   $configureFlags / $makeFlags  extra flags for the default phases
+#   $dontConfigure                skip ./configure
+#   $buildPhase / $installPhase   replace the default build / install commands
 #
 # Windows path notes (see the MSYS2 path model): the seed tools are at /usr/bin
 # and /bin; an input store path is canonical /nix/store and must be mapped to
@@ -66,15 +72,29 @@ else
 fi
 
 # --- configure phase (autotools packages only) ---
-if [ -x ./configure ]; then
+# $dontConfigure skips this -- for packages with no ./configure, or that build
+# via a hand-written makefile.
+if [ -z "$dontConfigure" ] && [ -x ./configure ]; then
   ./configure --prefix="$prefix" $configureFlags
 fi
 
 # --- build phase ---
-make $makeFlags
+# $buildPhase overrides the default for packages that build differently (e.g.
+# `make -f win32/Makefile.gcc`).  It runs in the unpacked source dir, with
+# $prefix and the toolchain already in scope.
+if [ -n "$buildPhase" ]; then
+  eval "$buildPhase"
+else
+  make $makeFlags
+fi
 
 # --- install phase ---
-make install prefix="$prefix"
+# $installPhase overrides the default the same way.
+if [ -n "$installPhase" ]; then
+  eval "$installPhase"
+else
+  make install prefix="$prefix"
+fi
 
 # --- fixup phase: bundle non-system DLLs so outputs are self-contained ---
 # Windows has no RPATH: an executable finds its DLLs in its own directory first,
@@ -106,6 +126,7 @@ for dep in $buildInputs; do
 done
 
 isSystemDll() {
+  local dllLower
   dllLower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$dllLower" in
     api-ms-win-* | ext-ms-win-*) return 0 ;;
@@ -117,7 +138,7 @@ isSystemDll() {
 }
 
 bundleDlls() {
-  bindir="$1"
+  local bindir="$1" changed bin needed found dir
   [ -d "$bindir" ] || return 0
   changed=1
   while [ "$changed" = 1 ]; do

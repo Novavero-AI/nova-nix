@@ -6,8 +6,9 @@
 #
 # instead of a hand-written builder script.  It supplies the seed bash as the
 # builder, runs setup.sh (the genericBuild), and exposes the mingw toolchain via
-# $ccPath.  Extra attrs (configureFlags, makeFlags, ...) flow through to the
-# build environment.
+# $ccPath.  Package attrs (buildInputs, configureFlags, makeFlags, buildPhase,
+# ...) flow through to setup.sh as $-prefixed environment variables; see its
+# header for the full set it reads.
 let
   msysSeed = import ./msys-seed.nix;
   mingwSeed = import ./seed.nix;
