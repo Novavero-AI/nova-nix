@@ -182,21 +182,28 @@ cbcEmitData = c_nn_bc_emit_data
 -- Read instructions
 -- ---------------------------------------------------------------------------
 
+-- | The opcode byte of instruction @i@ (one of the @Op*@ constants).
 cbcOpcode :: Word32 -> IO Word8
 cbcOpcode = c_nn_bc_opcode
 
+-- | The flags byte of instruction @i@ — the sub-type selector (e.g. which
+-- unary/binary operator), interpreted via the sub-type-flag constants below.
 cbcFlags :: Word32 -> IO Word8
 cbcFlags = c_nn_bc_flags
 
+-- | The inline 16-bit argument of instruction @i@ (e.g. a de Bruijn slot).
 cbcShortArg :: Word32 -> IO Word16
 cbcShortArg = c_nn_bc_short_arg
 
+-- | The first 32-bit argument of instruction @i@.
 cbcArg1 :: Word32 -> IO Word32
 cbcArg1 = c_nn_bc_arg1
 
+-- | The second 32-bit argument of instruction @i@.
 cbcArg2 :: Word32 -> IO Word32
 cbcArg2 = c_nn_bc_arg2
 
+-- | The third 32-bit argument of instruction @i@.
 cbcArg3 :: Word32 -> IO Word32
 cbcArg3 = c_nn_bc_arg3
 
@@ -204,6 +211,7 @@ cbcArg3 = c_nn_bc_arg3
 -- Read data
 -- ---------------------------------------------------------------------------
 
+-- | Read entry @i@ of the bytecode data pool (interned literals, symbols).
 cbcData :: Word32 -> IO Word32
 cbcData = c_nn_bc_data
 
@@ -211,9 +219,11 @@ cbcData = c_nn_bc_data
 -- Diagnostics
 -- ---------------------------------------------------------------------------
 
+-- | Total number of compiled instructions.
 cbcOpCount :: IO Word32
 cbcOpCount = c_nn_bc_op_count
 
+-- | Total number of data-pool entries.
 cbcDataCount :: IO Word32
 cbcDataCount = c_nn_bc_data_count
 
@@ -221,47 +231,60 @@ cbcDataCount = c_nn_bc_data_count
 -- Opcode constants
 -- ---------------------------------------------------------------------------
 
+-- | Literal-constant opcodes: integer, float, boolean, and null.
 pattern OpLitInt, OpLitFloat, OpLitBool, OpLitNull :: Word8
 pattern OpLitInt = 0
 pattern OpLitFloat = 1
 pattern OpLitBool = 2
 pattern OpLitNull = 3
 
+-- | Literal URI and path opcodes.
 pattern OpLitUri, OpLitPath :: Word8
 pattern OpLitUri = 4
 pattern OpLitPath = 5
 
+-- | String opcodes: an ordinary @"..."@ string and an indented @''...''@ string.
 pattern OpStr, OpIndStr :: Word8
 pattern OpStr = 6
 pattern OpIndStr = 7
 
+-- | Variable-reference opcodes: a lexical variable, a @with@-scope lookup, and a
+-- resolved (de Bruijn) variable.
 pattern OpVar, OpWithVar, OpResolvedVar :: Word8
 pattern OpVar = 8
 pattern OpWithVar = 9
 pattern OpResolvedVar = 10
 
+-- | Collection-construction opcodes: attribute set and list.
 pattern OpAttrs, OpList :: Word8
 pattern OpAttrs = 11
 pattern OpList = 12
 
+-- | Attribute-select (@a.b@), has-attribute (@a ? b@), and function-application
+-- opcodes.
 pattern OpSelect, OpHasAttr, OpApp :: Word8
 pattern OpSelect = 13
 pattern OpHasAttr = 14
 pattern OpApp = 15
 
+-- | Binding-form opcodes: lambda and @let@.
 pattern OpLambda, OpLet :: Word8
 pattern OpLambda = 16
 pattern OpLet = 17
 
+-- | Control-form opcodes: @if@, @with@, and @assert@.
 pattern OpIf, OpWith, OpAssert :: Word8
 pattern OpIf = 18
 pattern OpWith = 19
 pattern OpAssert = 20
 
+-- | Operator opcodes: unary and binary (the specific operator is in the flags
+-- byte, decoded via the sub-type-flag constants below).
 pattern OpUnary, OpBinary :: Word8
 pattern OpUnary = 21
 pattern OpBinary = 22
 
+-- | Search-path opcode: an angle-bracket path lookup like @\<nixpkgs\>@.
 pattern OpSearchPath :: Word8
 pattern OpSearchPath = 23
 
@@ -269,53 +292,66 @@ pattern OpSearchPath = 23
 -- Sub-type flags
 -- ---------------------------------------------------------------------------
 
+-- | @OpUnary@ flag values: which unary operator to apply.
 unaryNot, unaryNegate :: Word8
 unaryNot = 0
 unaryNegate = 1
 
+-- | @OpBinary@ flag values, arithmetic: @+@ @-@ @*@ @/@.
 binaryAdd, binarySub, binaryMul, binaryDiv :: Word8
 binaryAdd = 0
 binarySub = 1
 binaryMul = 2
 binaryDiv = 3
 
+-- | @OpBinary@ flag values, logical: @&&@ @||@ @->@.
 binaryAnd, binaryOr, binaryImpl :: Word8
 binaryAnd = 4
 binaryOr = 5
 binaryImpl = 6
 
+-- | @OpBinary@ flag values, equality: @==@ @!=@.
 binaryEq, binaryNeq :: Word8
 binaryEq = 7
 binaryNeq = 8
 
+-- | @OpBinary@ flag values, ordering: @<@ @<=@ @>@ @>=@.
 binaryLt, binaryLte, binaryGt, binaryGte :: Word8
 binaryLt = 9
 binaryLte = 10
 binaryGt = 11
 binaryGte = 12
 
+-- | @OpBinary@ flag values: list concatenation (@++@) and attrset update (@//@).
 binaryConcat, binaryUpdate :: Word8
 binaryConcat = 13
 binaryUpdate = 14
 
+-- | Lambda formal kinds: a plain name, a @{ ... }@ pattern, or a named pattern
+-- (@args@@{ ... }@).
 formalName, formalSet, formalNamedSet :: Word8
 formalName = 0
 formalSet = 1
 formalNamedSet = 2
 
+-- | String-part kinds: a literal chunk or an interpolated @${...}@ expression.
 strpartLit, strpartInterp :: Word32
 strpartLit = 0
 strpartInterp = 1
 
+-- | Attribute-binding kinds: a @name = value@ binding or an @inherit@.
 bindNamed, bindInherit :: Word32
 bindNamed = 0
 bindInherit = 1
 
+-- | Closure capture kinds: capture nothing, capture specific slots, or capture
+-- slots plus the enclosing @with@ scopes.
 captureNone, captureSlots, captureWithScopes :: Word32
 captureNone = 0
 captureSlots = 1
 captureWithScopes = 2
 
+-- | Attribute-key kinds: a static (compile-time) key or a dynamic @${...}@ key.
 attrkeyStatic, attrkeyDynamic :: Word32
 attrkeyStatic = 0
 attrkeyDynamic = 1

@@ -227,6 +227,8 @@ pattern ThunkPending = 0
 pattern ThunkComputed = 1
 pattern ThunkBlackhole = 2
 
+-- | Value-kind tags for the C value layout, mirroring @cbits\/nn_thunk.h@.
+-- The tag selects which payload a computed (VALUE) thunk carries.
 pattern ValueInt, ValueFloat, ValueBool, ValueNull, ValueStr, ValuePath, ValueList, ValueAttrs, ValueCtxStr, ValueLambda :: Word8
 pattern ValueInt = 0
 pattern ValueFloat = 1

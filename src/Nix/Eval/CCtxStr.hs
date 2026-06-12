@@ -95,12 +95,18 @@ cctxstrFreeAll = c_nn_ctxstr_free_all
 -- Element setters
 -- ---------------------------------------------------------------------------
 
+-- | Set context element @i@ to a plain store-path reference (@SCPlain@),
+-- identified by its name and hash symbols.
 cctxstrSetPlain :: CCtxStrPtr -> Word16 -> Word32 -> Word32 -> IO ()
 cctxstrSetPlain = c_nn_ctxstr_set_plain
 
+-- | Set context element @i@ to a derivation-output reference (@SCDrvOutput@):
+-- name and hash symbols plus the output-name symbol.
 cctxstrSetDrvOutput :: CCtxStrPtr -> Word16 -> Word32 -> Word32 -> Word32 -> IO ()
 cctxstrSetDrvOutput = c_nn_ctxstr_set_drv_output
 
+-- | Set context element @i@ to an all-outputs reference (@SCAllOutputs@),
+-- identified by its name and hash symbols.
 cctxstrSetAllOutputs :: CCtxStrPtr -> Word16 -> Word32 -> Word32 -> IO ()
 cctxstrSetAllOutputs = c_nn_ctxstr_set_all_outputs
 
@@ -108,20 +114,26 @@ cctxstrSetAllOutputs = c_nn_ctxstr_set_all_outputs
 -- Accessors
 -- ---------------------------------------------------------------------------
 
+-- | The interned-symbol id of the context string's text.
 cctxstrText :: CCtxStrPtr -> IO Word32
 cctxstrText = c_nn_ctxstr_text
 
+-- | The number of context elements attached to the string.
 cctxstrCtxCount :: CCtxStrPtr -> IO Word16
 cctxstrCtxCount = c_nn_ctxstr_ctx_count
 
+-- | The tag of context element @i@ (plain / drv-output / all-outputs).
 cctxstrElemTag :: CCtxStrPtr -> Word16 -> IO Word8
 cctxstrElemTag = c_nn_ctxstr_elem_tag
 
+-- | The store-path-hash symbol of context element @i@.
 cctxstrElemHash :: CCtxStrPtr -> Word16 -> IO Word32
 cctxstrElemHash = c_nn_ctxstr_elem_hash
 
+-- | The store-path-name symbol of context element @i@.
 cctxstrElemName :: CCtxStrPtr -> Word16 -> IO Word32
 cctxstrElemName = c_nn_ctxstr_elem_name
 
+-- | The output-name symbol of context element @i@ (drv-output elements only).
 cctxstrElemOutput :: CCtxStrPtr -> Word16 -> IO Word32
 cctxstrElemOutput = c_nn_ctxstr_elem_output

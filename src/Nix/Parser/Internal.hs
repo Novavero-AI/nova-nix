@@ -181,6 +181,7 @@ makeEOF st =
       peMessage = "unexpected end of input"
     }
 
+-- | Render a token as the human-readable phrase used in parse-error messages.
 showToken :: Token -> Text
 showToken TokEOF = "end of input"
 showToken TokIf = "'if'"
