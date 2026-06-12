@@ -9,7 +9,8 @@ description:
   data layer that keeps evaluation data off the GHC heap.  It evaluates
   real Nix expressions (including nixpkgs), computes derivations and
   content-addressed store paths that byte-match upstream Nix, and builds
-  packages natively on Windows from a store-pinned MinGW-w64 toolchain.
+  real packages from source natively on Windows through a stage-1 stdenv
+  over a store-pinned MinGW-w64 toolchain.
   Built outputs are content-addressed, substituted from a binary cache
   before building, and pushed to one with @nova-nix push@.
 
