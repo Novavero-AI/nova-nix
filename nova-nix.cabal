@@ -16,8 +16,9 @@ description:
   Built on @nova-cache@ for NAR serialization, narinfo handling, and
   Ed25519-signed binary substitution.
 
-license:            BSD-3-Clause
+license:            Apache-2.0
 license-file:       LICENSE
+copyright:          2026 Novavero AI Inc.
 author:             Devon Tomlin
 maintainer:         devon.tomlin@novavero.ai
 homepage:           https://github.com/Novavero-AI/nova-nix

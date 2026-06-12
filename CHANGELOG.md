@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Relicensed from BSD-3-Clause to Apache-2.0.** Apache adds an explicit patent grant and trademark terms, and a `NOTICE` file now carries the copyright (Novavero AI Inc.). Earlier releases on Hackage remain under BSD-3-Clause.
+
 ## 0.5.0.0 — 2026-06-11
 
 ### Milestone: Push and Pull Against a Binary Cache
