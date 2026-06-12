@@ -104,11 +104,11 @@ Two decisions shape the rest. **Haskell owns evaluation, C owns data layout** �
 
 **Done** — parser, lazy bytecode evaluator, the Nix `builtins` set, the C99 data layer, content-addressed store, derivation builder, binary-cache substituter and `push`, `import <nixpkgs> {}` evaluation, derivation-hash parity with upstream Nix (`hello`'s 253-derivation closure byte-matches `nix-instantiate`), and native Windows builds from a store-pinned MinGW-w64 toolchain (stage 0), published to and substituted from a binary cache.
 
-**In progress** — an experimental stage-1 stdenv: a store-pinned MSYS2 userland seed plus a lean `setup.sh` and `mkDerivation`, so a package builds with just `{ name; src; }` (unpack, `./configure`, `make`, `make install`). Proven by building GNU hello and GNU sed from source.
+**In progress** — an experimental stage-1 stdenv: a store-pinned MSYS2 userland seed and a lean `setup.sh` + `mkDerivation`, so a package builds from just `{ name; src; }`. It wires inter-package dependencies (`buildInputs`), routes compilation through a `gcc` wrapper (hermetic flags, deterministic links), and bundles non-system DLLs so outputs run standalone. Proven by building GNU hello, GNU sed, and a small library plus a program that links it — all from source.
 
 **Next**
 
-- Finish the stdenv — compiler wrappers, DLL bundling for standalone binaries, package dependencies (`buildInputs`), and rebuilding the core tools from source toward self-hosting.
+- Grow the native package set — more real-world libraries and programs built from source through the stdenv.
 - Parity across more of nixpkgs — extend the byte-match check beyond `hello`'s closure.
 - Cache — serve large NARs from object storage, and compress them.
 

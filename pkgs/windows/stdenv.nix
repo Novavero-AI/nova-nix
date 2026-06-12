@@ -12,6 +12,7 @@ let
   msysSeed = import ./msys-seed.nix;
   mingwSeed = import ./seed.nix;
   setup = ./setup.sh;
+  ccWrapper = ./cc-wrapper.sh;
 in
 {
   inherit msysSeed mingwSeed;
@@ -28,6 +29,9 @@ in
         args = [ "/cygdrive/c${setup}" ];
         # The mingw toolchain bin, already translated for the build's bash PATH.
         ccPath = "/cygdrive/c${mingwSeed}/mingw64/bin";
+        # The cc-wrapper source (a store path); setup.sh installs it on PATH
+        # ahead of the toolchain so every compiler call flows through it.
+        ccWrapperSrc = ccWrapper;
       }
     );
 }
