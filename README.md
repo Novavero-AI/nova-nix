@@ -52,7 +52,7 @@ cabal build
 $ nova-nix eval --expr '1 + 2'
 3
 
-$ nova-nix eval --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
+$ nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
 [ 1 4 9 16 25 ]
 
 $ nova-nix eval FILE.nix                       # evaluate a file
