@@ -386,6 +386,18 @@ nn_thunk_mark_blackhole(nn_thunk_t *thunk)
     return 1;
 }
 
+/* Restore BLACKHOLE -> PENDING after a force threw and was caught upstream.
+ * mark_blackhole only flips the state byte, so payload + bc_idx are intact and
+ * the thunk is fully re-forceable; a later force re-evaluates rather than
+ * misreporting infinite recursion.  Returns 1 on success, 0 if not BLACKHOLE. */
+int
+nn_thunk_mark_pending(nn_thunk_t *thunk)
+{
+    if (thunk->state != NN_THUNK_BLACKHOLE) return 0;
+    thunk->state = NN_THUNK_PENDING;
+    return 1;
+}
+
 void *
 nn_thunk_set_computed(nn_thunk_t *thunk, void *value)
 {

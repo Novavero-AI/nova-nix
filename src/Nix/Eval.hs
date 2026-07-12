@@ -75,10 +75,10 @@ import qualified Data.ByteString as BS
 import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, isOctDigit, ord)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
-import Data.List (find, foldl', sort)
+import Data.List (find, foldl', partition, sort)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, maybeToList)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -596,6 +596,20 @@ evalBcNonRecAttrs env bindings = do
   thunkMap <- buildBcThunkMap env bindings
   pure (VAttrs (attrSetFromMap thunkMap))
 
+-- | Build a let\/rec frame env, sharing the parent-chain and with-scope
+-- plumbing otherwise repeated across the positional and dynamic paths.  The
+-- frame's own bindings are positional slots (@slots@\/@slotCount@) or a lazy
+-- name-table @scope@; the parent and with-scopes come from the enclosing @env@
+-- and @captureInfo@.
+newFrameEnv :: Env -> CaptureInfo -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> Env
+newFrameEnv env captureInfo slots slotCount scope =
+  newCEnv slots slotCount scope (Just (buildCaptureEnv env captureInfo)) withArr withCount
+  where
+    (withArr, withCount) = case captureInfo of
+      NoCaptureInfo -> envWithScopesRaw env
+      Captures _ -> (nullPtr, 0)
+      CapturesWithScopes _ -> withScopesForCapture env
+
 -- | Evaluate a recursive attr set from bytecode bindings.
 evalBcRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> CaptureInfo -> m NixValue
 evalBcRecAttrs env bindings captureInfo
@@ -603,30 +617,29 @@ evalBcRecAttrs env bindings captureInfo
       -- Positional path: slots for variable lookup, CAttrSet for return.
       let slotCount = bcBindingSlotCount bindings
           slotsPtr = allocCSlots slotCount
-          parentEnv = buildCaptureEnv env captureInfo
-          (withArr, withCount) = case captureInfo of
-            NoCaptureInfo -> envWithScopesRaw env
-            Captures _ -> (nullPtr, 0)
-            CapturesWithScopes _ -> withScopesForCapture env
-          recEnv = newCEnv slotsPtr slotCount Nothing (Just parentEnv) withArr withCount
+          recEnv = newFrameEnv env captureInfo slotsPtr slotCount Nothing
           thunkList = buildBcSlotThunks recEnv env bindings
           filled = fillCSlots slotsPtr thunkList
           attrMap = buildBcAttrMapFromSlots bindings thunkList
        in filled `seq` pure (VAttrs (attrSetFromMap attrMap))
   | otherwise = do
-      -- Fallback: dynamic/nested keys - two-phase CAttrSet.
-      allKeys <- bcBindingAllKeys env bindings
-      let cset = buildCAttrSetKeys allKeys
-          attrSet = AttrSet cset
-          parentEnv = buildCaptureEnv env captureInfo
-          (withArr, withCount) = case captureInfo of
-            NoCaptureInfo -> envWithScopesRaw env
-            Captures _ -> (nullPtr, 0)
-            CapturesWithScopes _ -> withScopesForCapture env
-          recEnv = newCEnv nullPtr 0 (Just attrSet) (Just parentEnv) withArr withCount
-      thunkMap <- buildBcThunkMap recEnv bindings
-      let filled = fillCAttrSetValues cset thunkMap
-       in filled `seq` pure (VAttrs attrSet)
+      -- Dynamic-key path: the set has a ${dynamic} key or a nested a.b path, so
+      -- names are not all known at compile time.  Not a corner-cutting fallback:
+      -- it follows C++ Nix's env2 semantics.  The rec env holds the
+      -- statically-named bindings as thunks, and the dynamic keys AND values are
+      -- evaluated against it - so they can see static siblings and enclosing
+      -- vars, but not another dynamic key.  The result is the static bindings
+      -- plus the dynamic (name -> value) pairs.
+      let scopeCset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
+          recEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet scopeCset))
+          (staticBs, dynBs) = partition bcBindingIsStatic bindings
+      staticThunks <- buildBcThunkMap recEnv staticBs
+      let scopeFilled = fillCAttrSetValues scopeCset staticThunks
+      dynThunks <- scopeFilled `seq` buildBcThunkMap recEnv dynBs
+      let allThunks = Map.unionWith mergeThunks dynThunks staticThunks
+          resultCset = buildCAttrSetKeys (Map.keys allThunks)
+          filled = fillCAttrSetValues resultCset allThunks
+       in filled `seq` pure (VAttrs (AttrSet resultCset))
 
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -642,24 +655,15 @@ evalBcLet env bcIdx0 = do
       -- Positional path: slots for O(1) lookup.
       let slotCount = bcBindingSlotCount bindings
           slotsPtr = allocCSlots slotCount
-          parentEnv = buildCaptureEnv env captureInfo
-          (withArr, withCount) = case captureInfo of
-            NoCaptureInfo -> envWithScopesRaw env
-            Captures _ -> (nullPtr, 0)
-            CapturesWithScopes _ -> withScopesForCapture env
-          letEnv = newCEnv slotsPtr slotCount Nothing (Just parentEnv) withArr withCount
+          letEnv = newFrameEnv env captureInfo slotsPtr slotCount Nothing
           filled = fillCSlots slotsPtr (buildBcSlotThunks letEnv env bindings)
        in filled `seq` evalBytecode letEnv bodyIdx
     else do
-      -- Fallback: dynamic/nested keys - two-phase CAttrSet.
-      allKeys <- bcBindingAllKeys env bindings
-      let cset = buildCAttrSetKeys allKeys
-          parentEnv = buildCaptureEnv env captureInfo
-          (withArr, withCount) = case captureInfo of
-            NoCaptureInfo -> envWithScopesRaw env
-            Captures _ -> (nullPtr, 0)
-            CapturesWithScopes _ -> withScopesForCapture env
-          letEnv = newCEnv nullPtr 0 (Just (AttrSet cset)) (Just parentEnv) withArr withCount
+      -- Dynamic path: a nested a.b binding (a dynamic top-level key is not valid
+      -- in a let).  Every top-level key is therefore static; sub-keys and values
+      -- resolve in the let env, which the body also sees.
+      let cset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
+          letEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet cset))
       thunkMap <- buildBcThunkMap letEnv bindings
       let filled = fillCAttrSetValues cset thunkMap
        in filled `seq` evalBytecode letEnv bodyIdx
@@ -774,20 +778,27 @@ buildBcNestedAttr thunkEnv [key] valBcIdx =
 buildBcNestedAttr thunkEnv (key : rest) valBcIdx =
   Map.singleton key (evaluated (VAttrs (attrSetFromMap (buildBcNestedAttr thunkEnv rest valBcIdx))))
 
--- | Extract all top-level keys from bytecode bindings, resolving
--- dynamic keys as needed.  Used by the fallback path (two-phase
--- CAttrSet construction) where all keys must be known before thunks.
-bcBindingAllKeys :: (MonadEval m) => Env -> [BcBinding] -> m [Text]
-bcBindingAllKeys env bindings = fmap concat (mapM oneBinding bindings)
+-- | Top-level keys knowable without evaluating any dynamic key: static keys
+-- and inherited names.  These populate the rec env's name table while the
+-- dynamic keys are evaluated, so a dynamic key can reference a static sibling
+-- or an enclosing variable (matching C++ Nix's env2), but not another dynamic
+-- key.
+bcBindingStaticKeys :: [BcBinding] -> [Text]
+bcBindingStaticKeys = concatMap oneBinding
   where
-    oneBinding (BcNamed (key : _) _) = do
-      resolved <- resolveBcKey env key
-      pure (maybeToList resolved)
-    oneBinding (BcNamed [] _) = pure []
-    oneBinding (BcInherit syms) =
-      pure (map (symbolText . Symbol) syms)
-    oneBinding (BcInheritFrom _ syms) =
-      pure (map (symbolText . Symbol) syms)
+    oneBinding (BcNamed (BcStaticKey sym : _) _) = [symbolText (Symbol sym)]
+    oneBinding (BcNamed _ _) = []
+    oneBinding (BcInherit syms) = map (symbolText . Symbol) syms
+    oneBinding (BcInheritFrom _ syms) = map (symbolText . Symbol) syms
+
+-- | True when a binding's top-level key is known statically (a static key or an
+-- inherit).  These bindings populate the rec env's name table (C++ Nix's env2);
+-- a binding with a dynamic top-level key does not - it is added to the value.
+bcBindingIsStatic :: BcBinding -> Bool
+bcBindingIsStatic (BcNamed (BcStaticKey _ : _) _) = True
+bcBindingIsStatic (BcNamed _ _) = False
+bcBindingIsStatic (BcInherit _) = True
+bcBindingIsStatic (BcInheritFrom _ _) = True
 
 -- ---------------------------------------------------------------------------
 -- Search paths (<nixpkgs>, <nixpkgs/lib>)
@@ -1669,11 +1680,16 @@ mergeSorted :: (MonadEval m) => NixValue -> [NixValue] -> [NixValue] -> m [NixVa
 mergeSorted _ [] ys = pure ys
 mergeSorted _ xs [] = pure xs
 mergeSorted cmp (x : xs) (y : ys) = do
-  partial <- applyValue cmp x
-  result <- applyValue partial y
+  -- Stable merge: take the right element only when it is STRICTLY less than the
+  -- left (@cmp y x@).  On a tie - neither strictly less - take the left element,
+  -- so comparator-equal elements keep their input order, matching C++ Nix's
+  -- std::stable_sort.  (Comparing @cmp x y@ instead would emit @y@ on a tie and
+  -- reverse equal runs.)
+  partial <- applyValue cmp y
+  result <- applyValue partial x
   case result of
-    VBool True -> (x :) <$> mergeSorted cmp xs (y : ys)
-    VBool False -> (y :) <$> mergeSorted cmp (x : xs) ys
+    VBool True -> (y :) <$> mergeSorted cmp (x : xs) ys
+    VBool False -> (x :) <$> mergeSorted cmp xs (y : ys)
     _ -> throwEvalError "builtins.sort: comparator must return a bool"
 
 builtinConcatMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -2125,10 +2141,12 @@ builtinDirOf other =
 
 dirComponent :: Text -> Text
 dirComponent t =
-  let idx = T.findIndex (== '/') (T.reverse t)
-   in case idx of
-        Nothing -> "."
-        Just n -> T.take (T.length t - n - 1) t
+  case T.findIndex (== '/') (T.reverse t) of
+    Nothing -> "."
+    Just n ->
+      let dir = T.take (T.length t - n - 1) t
+       in -- A leading or sole '/' leaves an empty prefix; Nix's dirOf yields "/".
+          if T.null dir then "/" else dir
 
 builtinConcatLists :: (MonadEval m) => NixValue -> m NixValue
 builtinConcatLists (VList cl) = do
@@ -2553,7 +2571,9 @@ splitVersionStr t
 splitVersionAfterComponent :: Text -> [Text]
 splitVersionAfterComponent t = case T.uncons t of
   Nothing -> []
-  Just ('.', rest) -> splitVersionStr rest
+  -- '.' and '-' are both component separators in Nix's version grammar, so a
+  -- '-' is skipped, not emitted as a one-character component.
+  Just (sep, rest) | sep == '.' || sep == '-' -> splitVersionStr rest
   Just _ -> splitVersionStr t
 
 spanComponent :: Text -> (Text, Text)
@@ -3168,13 +3188,53 @@ getTempDir = do
 
 -- | Fetch a URL and optionally verify its hash.
 fetchUrlSimple :: (MonadEval m) => Text -> Maybe Text -> m NixValue
-fetchUrlSimple url _sha256 = do
-  (code, stdout, stderr) <- runProcess "curl" ["-sSfL", "--", url] ""
+fetchUrlSimple url mSha256 = do
+  -- Download to a file, not through the text-mode stdout pipe (which mangles
+  -- binary), read the raw bytes, verify the pin if one was given, then store at
+  -- the canonical fixed-output path.
+  tmpDir <- getTempDir
+  let tmpFile = tmpDir <> "/nova-nix-fetchurl-" <> sha256Hex (TE.encodeUtf8 url)
+  (code, _, stderr) <- runProcess "curl" ["-sSfL", "-o", tmpFile, "--", url] ""
   if code /= 0
-    then throwEvalError ("fetch failed: " <> stderr)
+    then throwEvalError ("builtins.fetchurl: fetch failed: " <> stderr)
     else do
-      storePath <- writeToStore "fetchurl-result" stdout
+      bytes <- readFileBytes tmpFile
+      mapM_ (verifyFetchPin "builtins.fetchurl" url bytes) mSha256
+      storePath <- addFixedOutputFile (urlBaseName url) bytes
       pure (VPath storePath)
+
+-- | Store name for a fetched URL: its basename (minus query/fragment), matching
+-- C++ Nix's @baseNameOf url@ default so the fixed-output path agrees with it.
+urlBaseName :: Text -> Text
+urlBaseName url =
+  let stripped = T.takeWhile (\c -> c /= '?' && c /= '#') url
+      base = T.takeWhileEnd (/= '/') stripped
+   in if T.null base then "source" else base
+
+-- | Verify fetched bytes against a user-supplied sha256 pin, erroring on
+-- mismatch.  Accepts SRI, @sha256:@-prefixed, and bare digest forms.
+verifyFetchPin :: (MonadEval m) => Text -> Text -> BS.ByteString -> Text -> m ()
+verifyFetchPin ctx url bytes expectedStr = do
+  expected <- decodeSha256Pin ctx expectedStr
+  let got = sha256Digest bytes
+  when (expected /= got) $
+    throwEvalError
+      ( ctx
+          <> ": hash mismatch for "
+          <> url
+          <> "\n  expected: "
+          <> expectedStr
+          <> "\n  got:      sha256:"
+          <> bytesToHexText got
+      )
+
+-- | Decode a sha256 pin to raw bytes, reusing the convertHash decoders (SRI,
+-- @sha256:@-prefixed, or a bare hex/nix32/base64 digest).
+decodeSha256Pin :: (MonadEval m) => Text -> Text -> m BS.ByteString
+decodeSha256Pin ctx s
+  | Just (_, b64) <- parseSRI s = decodeBase64E ctx b64
+  | Just (algo, rest) <- parseAlgoPrefix s = snd <$> decodeWithAlgo algo rest
+  | otherwise = snd <$> decodeWithAlgo "sha256" s
 
 -- | Force a required string attribute from an attrset, using full Nix string
 -- coercion (VStr, VPath, VInt, VBool, VAttrs via __toString/outPath).

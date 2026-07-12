@@ -61,6 +61,7 @@ module Nix.Eval.CThunk
 
     -- * State transitions
     cthunkMarkBlackhole,
+    cthunkMarkPending,
     cthunkSetComputed,
     cthunkSetComputedInt,
     cthunkSetComputedFloat,
@@ -183,6 +184,9 @@ foreign import ccall unsafe "nn_thunk_get_lambda"
 
 foreign import ccall unsafe "nn_thunk_mark_blackhole"
   c_nn_thunk_mark_blackhole :: CThunkPtr -> IO CInt
+
+foreign import ccall unsafe "nn_thunk_mark_pending"
+  c_nn_thunk_mark_pending :: CThunkPtr -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed"
   c_nn_thunk_set_computed :: CThunkPtr -> Ptr () -> IO (Ptr ())
@@ -373,6 +377,14 @@ cthunkGetLambda = c_nn_thunk_get_lambda
 cthunkMarkBlackhole :: CThunkPtr -> IO Bool
 cthunkMarkBlackhole ptr = do
   result <- c_nn_thunk_mark_blackhole ptr
+  pure (result /= 0)
+
+-- | Restore a BLACKHOLE thunk to PENDING after a caught throw during its force,
+-- so a later force re-evaluates instead of misreporting infinite recursion.
+-- Returns 'True' on success, 'False' if the thunk was not BLACKHOLE.
+cthunkMarkPending :: CThunkPtr -> IO Bool
+cthunkMarkPending ptr = do
+  result <- c_nn_thunk_mark_pending ptr
   pure (result /= 0)
 
 -- | Set a BLACKHOLE thunk to COMPUTED with a StablePtr value (complex types).

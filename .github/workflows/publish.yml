@@ -7,6 +7,11 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Drop the default GITHUB_TOKEN to read-only; the Hackage upload uses its own
+# token (HACKAGE_TOKEN), not GITHUB_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   ci:
     name: CI

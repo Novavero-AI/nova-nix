@@ -901,7 +901,11 @@ unmarshalLambdaValue rawPtr = do
       pure (EFNamedSet (symbolText (Symbol nameSym)) entries (extra /= 0))
   pure (VLambda (Env envPtr) formals bodyIdx)
   where
-    readLambdaEntries lamPtr count = mapM (readOneEntry lamPtr) [0 .. count - 1]
+    -- Zero-formal set patterns ({}:, { ... }:) store count 0 and a NULL
+    -- entries array; count - 1 would underflow Word16 to 65535.
+    readLambdaEntries lamPtr count
+      | count == 0 = pure []
+      | otherwise = mapM (readOneEntry lamPtr) [0 .. count - 1]
     readOneEntry lamPtr idx = do
       nameSym <- clambdaEntryName lamPtr idx
       hasDef <- clambdaEntryHasDefault lamPtr idx
@@ -943,7 +947,12 @@ unmarshalStringContext ptr = do
   textSym <- cctxstrText ptr
   count <- cctxstrCtxCount ptr
   let textVal = symbolText (Symbol textSym)
-  elems <- mapM (readElem ptr) [0 .. count - 1]
+  -- count - 1 underflows Word16 at 0 (defensive: marshal sites store
+  -- only non-empty contexts today).
+  elems <-
+    if count == 0
+      then pure []
+      else mapM (readElem ptr) [0 .. count - 1]
   pure (textVal, StringContext (Set.fromList elems))
   where
     readElem cptr idx = do
@@ -1082,6 +1091,11 @@ class (Monad m) => MonadEval m where
   -- First argument is the source path, second is the store name.
   copyPathToStore :: Text -> Text -> m Text
 
+  -- | Write raw bytes to the store at a canonical flat fixed-output path
+  -- (@makeFixedOutputPath name "sha256" "flat"@), so a hash-pinned fetch lands
+  -- at the same store path C++ Nix computes - reproducible and cacheable.
+  addFixedOutputFile :: Text -> ByteString -> m Text
+
   -- | Print a trace/warning message.
   -- IO evaluators write to stderr; pure evaluators silently discard.
   traceMessage :: Text -> m ()
@@ -1156,6 +1170,7 @@ instance MonadEval PureEval where
   getFileType _ = throwEvalError "readFileType: not available in pure evaluation"
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
   copyPathToStore _ _ = throwEvalError "builtins.path: not available in pure evaluation"
+  addFixedOutputFile _ _ = throwEvalError "builtins.fetchurl: not available in pure evaluation"
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()

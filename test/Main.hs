@@ -424,7 +424,24 @@ testEvalRecAttrs = do
     [ runTest "rec self-reference" $
         assertEval "rec-self" "rec { a = 1; b = a + 1; }.b" (VInt 2),
       runTest "rec mutual reference" $
-        assertEval "rec-mutual" "rec { a = 1; b = a; }.b" (VInt 1)
+        assertEval "rec-mutual" "rec { a = 1; b = a; }.b" (VInt 1),
+      -- A plain inherit inside a fallback (nested-path) rec/let must reference
+      -- the OUTER binding, not self-reference into infinite recursion.
+      runTest "inherit in fallback rec set references outer" $
+        assertEval "inherit-fallback-rec" "let n = 7; in (rec { inherit n; a.b = 1; }).n" (VInt 7),
+      runTest "inherit in fallback let references outer" $
+        assertEval "inherit-fallback-let" "let x = 5; in let a.b = 1; inherit x; in x" (VInt 5),
+      -- Guard the fix: a genuine sibling reference in a fallback rec still resolves.
+      runTest "sibling reference survives in fallback rec" $
+        assertEval "sibling-fallback-rec" "(rec { a = 1; b = a + 10; c.d = 2; }).b" (VInt 11),
+      -- Dynamic rec-set keys evaluate in the rec env (C++ Nix env2): a key may
+      -- reference an enclosing var or a static sibling, and must not abort.
+      runTest "dynamic key references enclosing var" $
+        assertEval "dyn-key-enclosing" "let k = \"x\"; in (rec { p.q = 1; ${k} = 2; }).x" (VInt 2),
+      runTest "dynamic key resolves the correct enclosing slot" $
+        assertEval "dyn-key-slot" "let a = \"A\"; b = \"B\"; in let c = \"C\"; in (rec { p.q = 1; ${b} = 2; }).B" (VInt 2),
+      runTest "dynamic key references a static rec sibling" $
+        assertEval "dyn-key-sibling" "(rec { a = \"b\"; ${a} = 1; }).b" (VInt 1)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -458,7 +475,16 @@ testEvalLambda = do
       runTest "set pattern" $
         assertEval "set-pat" "({ a, b }: a + b) { a = 1; b = 2; }" (VInt 3),
       runTest "default param" $
-        assertEval "default" "({ a ? 10 }: a) { }" (VInt 10)
+        assertEval "default" "({ a ? 10 }: a) { }" (VInt 10),
+      -- Regression: zero-formal set patterns marshal count 0 / entries NULL;
+      -- the second force of the same lambda thunk re-reads the entries and
+      -- must not underflow the Word16 count (crashed pre-fix).
+      runTest "empty formals forced twice" $
+        assertEval "empty-formals" "let f = {}: 1; in f {} + f {}" (VInt 2),
+      runTest "ellipsis-only formals forced twice" $
+        assertEval "ellipsis-only" "let f = { ... }: 1; in f {} + f {}" (VInt 2),
+      runTest "named empty formals forced twice" $
+        assertEval "named-empty" "let f = args@{ ... }: 1; in f {} + f {}" (VInt 2)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -605,6 +631,17 @@ testEvalHigherOrder = do
         assertEval "sort" "builtins.sort (a: b: a < b) [ 3 1 2 ] == [ 1 2 3 ]" (VBool True),
       runTest "sort already sorted" $
         assertEval "sort-sorted" "builtins.sort (a: b: a < b) [ 1 2 3 ] == [ 1 2 3 ]" (VBool True),
+      -- Stable: comparator-equal elements keep their input order (std::stable_sort).
+      runTest "sort is stable across ties" $
+        assertEval
+          "sort-stable"
+          "builtins.sort (a: b: a.k < b.k) [ { k = 1; v = 1; } { k = 0; v = 2; } { k = 1; v = 3; } { k = 0; v = 4; } ] == [ { k = 0; v = 2; } { k = 0; v = 4; } { k = 1; v = 1; } { k = 1; v = 3; } ]"
+          (VBool True),
+      runTest "sort preserves order of all-equal elements" $
+        assertEval
+          "sort-stable-all"
+          "builtins.sort (a: b: a.k < b.k) [ { k = 0; v = 1; } { k = 0; v = 2; } { k = 0; v = 3; } ] == [ { k = 0; v = 1; } { k = 0; v = 2; } { k = 0; v = 3; } ]"
+          (VBool True),
       -- concatMap
       runTest "concatMap" $
         assertEval "concatMap" "builtins.concatMap (x: [ x (x * 2) ]) [ 1 2 ] == [ 1 2 2 4 ]" (VBool True),
@@ -1163,6 +1200,10 @@ testBatch1 = do
         assertEval "dirOf-str" "builtins.dirOf \"/foo/bar/baz\"" (mkStr "/foo/bar"),
       runTest "dirOf no slash" $
         assertEval "dirOf-flat" "builtins.dirOf \"filename\"" (mkStr "."),
+      runTest "dirOf root-level path" $
+        assertEval "dirOf-root" "builtins.dirOf \"/foo\"" (mkStr "/"),
+      runTest "dirOf root" $
+        assertEval "dirOf-slash" "builtins.dirOf \"/\"" (mkStr "/"),
       -- concatLists
       runTest "concatLists basic" $
         assertEval "concatLists" "builtins.concatLists [ [ 1 2 ] [ 3 ] [ 4 5 ] ] == [ 1 2 3 4 5 ]" (VBool True),
@@ -1298,6 +1339,8 @@ testBatch4 = do
         assertEval "cmpVer-gt" "builtins.compareVersions \"2.0\" \"1.9\"" (VInt 1),
       runTest "compareVersions type error" $
         assertEvalFail "cmpVer-err" "builtins.compareVersions 1 2",
+      runTest "compareVersions treats - as a separator" $
+        assertEval "cmpVer-dash" "builtins.compareVersions \"1.0-2\" \"1.0.2\"" (VInt 0),
       -- splitVersion
       runTest "splitVersion basic" $
         assertEval "splitVer" "builtins.splitVersion \"1.2.3\" == [ \"1\" \"2\" \"3\" ]" (VBool True),
@@ -1476,6 +1519,26 @@ runTestIOFail label baseDir source = do
 -- | Quoted path literal for embedding absolute paths in Nix source.
 nixQuotedPath :: FilePath -> Text
 nixQuotedPath p = T.pack (show p)
+
+-- | Regression: a thunk whose force throws a catchable error (builtins.throw,
+-- a type error) must be restored to PENDING, not left BLACKHOLE - otherwise a
+-- later force of the same shared thunk aborts with a bogus "infinite recursion"
+-- that escapes tryEval.  Genuine self-recursion must still escape tryEval.
+-- EvalIO-only: PureEval never blackholes.
+testBlackholeRecoveryIO :: IO [Bool]
+testBlackholeRecoveryIO = do
+  putStrLn "eval/blackhole-recovery-io"
+  sequence
+    [ runTestIO
+        "tryEval twice on a shared throwing thunk recovers (no bogus recursion)"
+        "."
+        "let x = builtins.throw \"boom\"; in (if (builtins.tryEval x).success then 1 else 0) + (if (builtins.tryEval x).success then 1 else 0)"
+        (VInt 0),
+      runTestIOFail
+        "genuine infinite recursion still escapes tryEval"
+        "."
+        "builtins.tryEval (let y = y; in y)"
+    ]
 
 testImportIO :: IO [Bool]
 testImportIO = do
@@ -2277,16 +2340,32 @@ testSubstituter = do
         case Subst.decompressNar "brotli" "data" of
           Left _ -> Pass
           Right _ -> Fail "expected error for unknown",
-      -- parseReferences: valid store paths
-      runTest "parseReferences valid" $
-        let refs = ["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello"]
-            parsed = Subst.parseReferences defaultStoreDir refs
-         in assertEqual "parse-refs" 1 (length parsed),
-      -- parseReferences: invalid paths filtered
-      runTest "parseReferences invalid filtered" $
-        let refs = ["not-a-store-path", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello"]
-            parsed = Subst.parseReferences defaultStoreDir refs
-         in assertEqual "parse-refs-filter" 1 (length parsed),
+      -- parseReferences: narinfo references are wire-format basenames
+      runTest "parseReferences basenames" $
+        let refs = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep-2.0"]
+            expected =
+              [ StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "hello",
+                StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "dep-2.0"
+              ]
+         in assertEqual "parse-refs" (Right expected) (Subst.parseReferences refs),
+      -- parseReferences: a malformed token is a loud error, never dropped
+      runTest "parseReferences malformed rejected" $
+        case Subst.parseReferences ["not-a-store-path"] of
+          Left _ -> Pass
+          Right refs -> Fail ("expected rejection, got: " <> T.pack (show refs)),
+      -- parseDeriver: basename becomes the DB's full path text
+      runTest "parseDeriver basename" $
+        let sp = StorePath "cccccccccccccccccccccccccccccccc" "hello.drv"
+            expected = Just (T.pack (storePathToFilePath defaultStoreDir sp))
+         in assertEqual "parse-deriver" (Right expected) (Subst.parseDeriver defaultStoreDir (Just "cccccccccccccccccccccccccccccccc-hello.drv")),
+      -- parseDeriver: upstream's unknown-deriver sentinel means no deriver
+      runTest "parseDeriver unknown sentinel" $
+        assertEqual "parse-deriver-unknown" (Right Nothing) (Subst.parseDeriver defaultStoreDir (Just "unknown-deriver")),
+      -- parseDeriver: absent stays absent, malformed is an error
+      runTest "parseDeriver absent and malformed" $
+        case (Subst.parseDeriver defaultStoreDir Nothing, Subst.parseDeriver defaultStoreDir (Just "bogus")) of
+          (Right Nothing, Left _) -> Pass
+          other -> Fail ("unexpected: " <> T.pack (show other)),
       -- trySubstitute: empty caches returns SubstNotFound
       runTestM "trySubstitute no caches" $ do
         tmpBase <- getTemporaryDirectory
@@ -2901,8 +2980,9 @@ tarSymLink p target =
 -- @mingw64\/@ shape) are extracted into ONE output: regular files, an
 -- executable, a hardlink and a relative symlink (both materialized as
 -- copies), with pacman metadata (@.PKGINFO@\/@.MTREE@) skipped.  A second
--- build proves cross-archive file collisions fail loudly, and a third that
--- path traversal is rejected.
+-- build proves cross-archive file collisions fail loudly, and further builds
+-- that a parent-climbing (..) entry and drive-rooted file, symlink, and
+-- hardlink paths are all rejected.
 testUnpackBuildIO :: IO [Bool]
 testUnpackBuildIO = do
   putStrLn "builder/unpack-seed-archives"
@@ -2916,6 +2996,9 @@ testUnpackBuildIO = do
         archiveData = workDir </> "pkg-data.tar.zst"
         archiveCollide = workDir </> "pkg-collide.tar.zst"
         archiveEscape = workDir </> "pkg-escape.tar.zst"
+        archiveRootFile = workDir </> "pkg-root-file.tar.zst"
+        archiveRootSymlink = workDir </> "pkg-root-symlink.tar.zst"
+        archiveRootHardlink = workDir </> "pkg-root-hardlink.tar.zst"
     BL.writeFile archiveTools $
       compressArchive
         [ tarDir "pkg",
@@ -2936,6 +3019,14 @@ testUnpackBuildIO = do
       compressArchive [tarFile "pkg/bin/tool.exe" "conflicting"]
     BL.writeFile archiveEscape $
       compressArchive [tarFile "../evil.txt" "escape"]
+    -- A leading '/' entry: rooted at the current drive.  tar stores paths with
+    -- '/', so this is the on-disk form even of a Windows-native "\..." name.
+    BL.writeFile archiveRootFile $
+      compressArchive [tarFile "/planted-abs.txt" "rooted-file"]
+    BL.writeFile archiveRootSymlink $
+      compressArchive [tarSymLink "sneaky-link.txt" "/planted-link-target.txt"]
+    BL.writeFile archiveRootHardlink $
+      compressArchive [tarHardLink "sneaky-hardlink.txt" "/planted-hardlink-target.txt"]
     let mkUnpackDrv outP srcFiles =
           Derivation
             { drvOutputs =
@@ -2958,6 +3049,9 @@ testUnpackBuildIO = do
         seedOut = StorePath (T.replicate 31 "0" <> "2") "unpack-seed"
         collideOut = StorePath (T.replicate 31 "0" <> "3") "unpack-collide"
         escapeOut = StorePath (T.replicate 31 "0" <> "4") "unpack-escape"
+        rootFileOut = StorePath (T.replicate 31 "0" <> "5") "unpack-root-file"
+        rootSymlinkOut = StorePath (T.replicate 31 "0" <> "6") "unpack-root-symlink"
+        rootHardlinkOut = StorePath (T.replicate 31 "0" <> "7") "unpack-root-hardlink"
     buildTmp <- (</> "nova-nix-test-unpack-build-tmp") <$> getTemporaryDirectory
     forceRemoveIfExists buildTmp
     createDirectoryIfMissing True buildTmp
@@ -2965,6 +3059,9 @@ testUnpackBuildIO = do
     seedResult <- buildDerivation config store (mkUnpackDrv seedOut [archiveTools, archiveData])
     collideResult <- buildDerivation config store (mkUnpackDrv collideOut [archiveTools, archiveCollide])
     escapeResult <- buildDerivation config store (mkUnpackDrv escapeOut [archiveEscape])
+    rootFileResult <- buildDerivation config store (mkUnpackDrv rootFileOut [archiveRootFile])
+    rootSymlinkResult <- buildDerivation config store (mkUnpackDrv rootSymlinkOut [archiveRootSymlink])
+    rootHardlinkResult <- buildDerivation config store (mkUnpackDrv rootHardlinkOut [archiveRootHardlink])
     forceRemoveIfExists buildTmp
     forceRemoveIfExists workDir
     seedChecks <- case seedResult of
@@ -3031,7 +3128,21 @@ testUnpackBuildIO = do
                 | otherwise -> Fail ("wrong failure: " <> msg)
               BuildSuccess _ -> Fail "escape build unexpectedly succeeded"
         ]
-    pure (seedChecks ++ collideChecks ++ escapeChecks)
+    let rejectedWith needle res = case res of
+          BuildFailure msg _
+            | needle `T.isInfixOf` msg -> Pass
+            | otherwise -> Fail ("wrong failure: " <> msg)
+          BuildSuccess _ -> Fail "rooted entry unexpectedly built"
+    rootChecks <-
+      sequence
+        [ runTest "unpack: rooted file entry rejected" $
+            rejectedWith "planted-abs.txt" rootFileResult,
+          runTest "unpack: rooted symlink target rejected" $
+            rejectedWith "planted-link-target.txt" rootSymlinkResult,
+          runTest "unpack: rooted hardlink target rejected" $
+            rejectedWith "planted-hardlink-target.txt" rootHardlinkResult
+        ]
+    pure (seedChecks ++ collideChecks ++ escapeChecks ++ rootChecks)
 
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
 -- derivation depends on a leaf; both @.drv@ files are pre-written to the store
@@ -3195,17 +3306,33 @@ testStoreOps = do
   withTempStore $ \store -> do
     let sd = stDir store
     sequence
-      [ -- scanReferences finds embedded store path
-        runTestM "scanReferences finds ref" $ do
+      [ -- scanReferences finds the canonical /nix/store text eval injects
+        -- into builder envs, independent of the platform store dir (the
+        -- bare hash is the needle, matching upstream Nix).
+        runTestM "scanReferences finds canonical ref" $ do
           tmpBase <- getTemporaryDirectory
           let scanDir = tmpBase </> "nova-nix-test-scan"
           removeIfExists scanDir
           createDirectoryIfMissing True scanDir
           let candidate = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "dep1"
-              prefix = unStoreDir sd
-              refString = prefix <> "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1"
+              refString = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1"
           BS.writeFile (scanDir </> "output.txt") (TE.encodeUtf8 (T.pack ("hello " <> refString <> " world")))
-          refs <- scanReferences sd [candidate] scanDir
+          refs <- scanReferences [candidate] scanDir
+          removeIfExists scanDir
+          pure $
+            if candidate `elem` refs
+              then Pass
+              else Fail ("expected to find ref, got: " <> T.pack (show refs)),
+        -- scanReferences finds a Windows-form embedding too
+        runTestM "scanReferences finds windows-form ref" $ do
+          tmpBase <- getTemporaryDirectory
+          let scanDir = tmpBase </> "nova-nix-test-scan-win"
+          removeIfExists scanDir
+          createDirectoryIfMissing True scanDir
+          let candidate = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "dep1"
+              refString = "C:\\nix\\store\\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1"
+          BS.writeFile (scanDir </> "output.txt") (TE.encodeUtf8 (T.pack ("exec " <> refString)))
+          refs <- scanReferences [candidate] scanDir
           removeIfExists scanDir
           pure $
             if candidate `elem` refs
@@ -3219,7 +3346,7 @@ testStoreOps = do
           createDirectoryIfMissing True scanDir
           let candidate = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "dep1"
           BS.writeFile (scanDir </> "output.txt") "no store paths here"
-          refs <- scanReferences sd [candidate] scanDir
+          refs <- scanReferences [candidate] scanDir
           removeIfExists scanDir
           pure (assertEqual "no refs" [] refs),
         -- scanReferences ignores partial match
@@ -3229,11 +3356,10 @@ testStoreOps = do
           removeIfExists scanDir
           createDirectoryIfMissing True scanDir
           let candidate = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "dep1"
-              prefix = unStoreDir sd
-              -- Only 20 chars of hash - should not match 32-char candidate
-              partialRef = prefix <> "/aaaaaaaaaaaaaaaaaaaa"
+              -- Only 20 chars of hash - should not match the 32-char needle
+              partialRef = "/nix/store/aaaaaaaaaaaaaaaaaaaa"
           BS.writeFile (scanDir </> "output.txt") (TE.encodeUtf8 (T.pack partialRef))
-          refs <- scanReferences sd [candidate] scanDir
+          refs <- scanReferences [candidate] scanDir
           removeIfExists scanDir
           pure (assertEqual "no partial refs" [] refs),
         -- addToStore moves dir + registers in DB
@@ -4795,6 +4921,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testBatch7,
           testImportPure,
           testImportIO,
+          testBlackholeRecoveryIO,
           testBatchA,
           testBatchAIO,
           testBatchB,

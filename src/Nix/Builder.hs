@@ -605,7 +605,7 @@ prepareOutput config store candidates tempPairs drvPathText (output, (_outName, 
           -- Scan whichever artifact we will register: a leftover store path if
           -- present, otherwise the fresh build output.
           let scanPath = if onDisk then targetPath else outDir
-          inputRefs <- scanReferences (bcStoreDir config) candidates scanPath
+          inputRefs <- scanReferences candidates scanPath
           selfRefs <- scanTempReferences tempPairs scanPath
           let refs = dedupStorePaths (inputRefs ++ selfRefs)
           reg <-
