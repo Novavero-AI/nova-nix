@@ -283,6 +283,12 @@ testEvalArithmetic = do
         assertEval "float-add" "1.5 + 2.5" (VFloat 4.0),
       runTest "int-float promotion" $
         assertEval "promote" "1 + 2.0" (VFloat 3.0),
+      runTest "trailing-dot float" $
+        assertEval "trailing-dot" "12. == 12.0" (VBool True),
+      runTest "trailing-dot float with exponent" $
+        assertEval "trailing-dot-exp" "12.e2 == 1200.0" (VBool True),
+      runTest "trailing-dot float typeOf" $
+        assertEval "trailing-dot-type" "builtins.typeOf 12." (mkStr "float"),
       runTest "negate int" $
         assertEval "negate" "- 5" (VInt (-5)),
       runTest "division by zero" $
@@ -570,6 +576,17 @@ testEvalBuiltins = do
         assertEval "isNull-f" "builtins.isNull 1" (VBool False),
       runTest "stringLength" $
         assertEval "strlen" "builtins.stringLength \"hello\"" (VInt 5),
+      -- Lexer divergences (audit): $${ is literal, ''' escapes to '', \q -> q.
+      runTest "$${ does not interpolate (double dollar is literal)" $
+        assertEval "dollar-dollar-str" "builtins.stringLength \"a$${b}c\"" (VInt 7),
+      runTest "$${ literal in indented string" $
+        assertEval "dollar-dollar-ind" "builtins.stringLength ''a$${b}c''" (VInt 7),
+      runTest "''' escapes two quotes in indented string" $
+        assertEval "triple-quote" "''a'''b'' == \"a''b\"" (VBool True),
+      runTest "unknown escape drops backslash (regular string)" $
+        assertEval "esc-drop-str" "\"a\\qb\" == \"aqb\"" (VBool True),
+      runTest "unknown escape drops backslash (indented string)" $
+        assertEval "esc-drop-ind" "''a''\\qb'' == \"aqb\"" (VBool True),
       runTest "toString int" $
         assertEval "toStr" "builtins.toString 42" (mkStr "42")
     ]
@@ -732,6 +749,12 @@ testLexer = do
       runTest "float" $
         assertRight "lex float" (tokenize "<test>" "3.14") $ \toks ->
           assertEqual "tokens" [TokFloat 3.14] (tokenTypes toks),
+      runTest "trailing-dot float lexes as one float token" $
+        assertRight "lex trailing-dot" (tokenize "<test>" "12.") $ \toks ->
+          assertEqual "tokens" [TokFloat 12.0] (tokenTypes toks),
+      runTest "trailing-dot float with exponent lexes as one float token" $
+        assertRight "lex trailing-dot-exp" (tokenize "<test>" "12.e2") $ \toks ->
+          assertEqual "tokens" [TokFloat 1200.0] (tokenTypes toks),
       runTest "true" $
         assertRight "lex true" (tokenize "<test>" "true") $ \toks ->
           assertEqual "tokens" [TokTrue] (tokenTypes toks),

@@ -309,8 +309,9 @@ lexIndStringMode st acc
               -- Check for escape sequences: ''', ''$, ''\x, ''${
               case T.uncons rest2 of
                 Just ('\'', rest3) ->
-                  -- ''' is a literal single quote (consume all 3)
-                  let litTok = Located (lsLine st) (lsCol st) (TokStringLit "'")
+                  -- ''' escapes a literal '' (two quotes) - Nix's escape for the
+                  -- indented-string terminator, not a single quote.
+                  let litTok = Located (lsLine st) (lsCol st) (TokStringLit "''")
                       newSt = advanceCol 3 st {lsInput = rest3}
                    in lexIndStringMode newSt (litTok : acc)
                 Just ('$', rest3)
@@ -333,7 +334,8 @@ lexIndStringMode st acc
                             't' -> "\t"
                             'r' -> "\r"
                             '\\' -> "\\"
-                            _ -> "\\" <> T.singleton ec
+                            -- Unknown escape: Nix drops the backslash (''\q -> q).
+                            _ -> T.singleton ec
                           litTok = Located (lsLine st) (lsCol st) (TokStringLit escaped)
                           newSt = advanceCol 4 st {lsInput = rest4}
                        in lexIndStringMode newSt (litTok : acc)
@@ -381,6 +383,11 @@ lexStringLiteral st0 acc = go st0 mempty
             }
       Just (c, rest) -> case c of
         '"' -> finishChunk st builder
+        -- \$$ is two literal dollars (maximal munch): the second $ cannot begin an
+        -- interpolation, so $${ does not interpolate (documented Nix behavior).
+        '$'
+          | Just '$' <- safeHead rest ->
+              go (advanceCol 2 st {lsInput = T.drop 1 rest}) (builder <> TB.singleton '$' <> TB.singleton '$')
         '$' | Just '{' <- safeHead rest -> finishChunk st builder
         '\\' -> case T.uncons rest of
           Just (ec, rest2) ->
@@ -391,7 +398,8 @@ lexStringLiteral st0 acc = go st0 mempty
                   '\\' -> TB.singleton '\\'
                   '"' -> TB.singleton '"'
                   '$' -> TB.singleton '$'
-                  _ -> TB.singleton '\\' <> TB.singleton ec
+                  -- Unknown escape: Nix drops the backslash (\q -> q).
+                  _ -> TB.singleton ec
                 newSt = advanceBy ec (advanceCol 1 st {lsInput = rest2})
              in go newSt (builder <> escaped)
           Nothing ->
@@ -441,6 +449,11 @@ lexIndStringLiteral st0 acc = go st0 0
                   | Just ('\'', _) <- T.uncons rest1 ->
                       finishChunk st consumed
                 Just ('$', rest1)
+                  | Just ('$', _) <- T.uncons rest1 ->
+                      -- \$$ is two literal dollars; the second cannot begin an
+                      -- interpolation (matches lexStringLiteral and Nix).
+                      go (advanceCol 2 st {lsInput = T.drop 1 rest1}) (consumed + 2)
+                Just ('$', rest1)
                   | Just ('{', _) <- T.uncons rest1 ->
                       finishChunk st consumed
                 Just ('\n', rest1) ->
@@ -473,16 +486,17 @@ lexNumber st acc =
   let (digits, after) = T.span isDigit (lsInput st)
       len = T.length digits
    in case T.uncons after of
-        Just ('.', after2)
-          | Just (d, _) <- T.uncons after2,
-            isDigit d ->
-              let (decimals, after3) = T.span isDigit after2
-                  (expVal, after4, expLen) = lexExponent after3
-                  fullLen = T.length digits + 1 + T.length decimals + expLen
-                  val = applyExponent (readDouble digits decimals) expVal
-                  tok = Located (lsLine st) (lsCol st) (TokFloat val)
-                  newSt = advanceCol fullLen st {lsInput = after4}
-               in lexNormalMode newSt (tok : acc)
+        -- A '.' after the integer part starts a float even with no fractional
+        -- digits or with only an exponent - Nix's grammar is [0-9]+\.[0-9]*(exp)?,
+        -- so 12. and 12.e5 are floats, not an integer followed by a dot.
+        Just ('.', after2) ->
+          let (decimals, after3) = T.span isDigit after2
+              (expVal, after4, expLen) = lexExponent after3
+              fullLen = T.length digits + 1 + T.length decimals + expLen
+              val = applyExponent (readDouble digits decimals) expVal
+              tok = Located (lsLine st) (lsCol st) (TokFloat val)
+              newSt = advanceCol fullLen st {lsInput = after4}
+           in lexNormalMode newSt (tok : acc)
         _
           -- C++ Nix rejects out-of-range integer literals rather than
           -- silently wrapping modulo 2^64.
