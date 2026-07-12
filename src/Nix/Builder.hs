@@ -39,6 +39,9 @@ module Nix.Builder
     -- * Build configuration
     BuildConfig (..),
     defaultBuildConfig,
+
+    -- * Pure pieces (exported for tests)
+    verifyFetchHash,
   )
 where
 

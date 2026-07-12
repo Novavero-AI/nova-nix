@@ -32,11 +32,11 @@ import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
-import Nix.Store (Store (..), closeStore, isValid, openStore, queryAllValidPaths, registerPaths, registrationFor, setReadOnly, writeDrv, writeDrvAterm)
+import Nix.Store (Store (..), closeStore, isValid, openStore, queryAllValidPaths, registerPath, registrationFor, setReadOnly, writeDrv, writeDrvAterm)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDir, storePathHashLen, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir)
-import System.Directory (canonicalizePath, copyFile, createDirectoryIfMissing, doesDirectoryExist, getCurrentDirectory, getTemporaryDirectory, listDirectory)
+import System.Directory (canonicalizePath, copyFile, createDirectoryIfMissing, createDirectoryLink, createFileLink, doesDirectoryExist, doesPathExist, getCurrentDirectory, getSymbolicLinkTarget, getTemporaryDirectory, listDirectory, pathIsSymbolicLink)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
@@ -80,10 +80,13 @@ data PushArgs = PushArgs
 emptyPushArgs :: PushArgs
 emptyPushArgs = PushArgs Nothing Nothing False []
 
-parseArgs :: [String] -> CliOpts
+-- | Parse the command line.  A malformed invocation is an error, never a
+-- silent drop: an unknown or typo'd flag once ended parsing and quietly
+-- discarded everything after it (e.g. a requested @--substituter@).
+parseArgs :: [String] -> Either String CliOpts
 parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
   where
-    go opts [] = opts
+    go opts [] = Right opts
     go opts ("--nix-path" : val : rest) =
       go (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
     go opts ("--strict" : rest) =
@@ -97,22 +100,28 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
     go opts ("--trusted-key" : key : rest) =
       go (opts {optTrustedKey = Just key}) rest
     go opts ("eval" : rest) = goEval opts rest
+    go _ ["build"] = Left "build requires a FILE.nix argument"
     go opts ("build" : path : rest) =
       go (opts {optCommand = CmdBuild path}) rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
-    go opts _ = opts
+    go _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    go _ (arg : _) = Left ("unknown argument: " ++ arg ++ " (run nova-nix with no arguments for usage)")
     -- Sub-parser for eval: handles --strict and --expr interleaved with the file arg.
-    goEval opts [] = opts
+    goEval opts [] = Right opts
     goEval opts ("--strict" : rest) = goEval (opts {optStrict = True}) rest
     goEval opts ("--aterm" : rest) = goEval (opts {optAterm = True}) rest
     goEval opts ("--nix-path" : val : rest) =
       goEval (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
     goEval opts ("--expr" : expr : rest) =
       go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
+    goEval _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goEval _ (arg@('-' : _) : _) = Left ("unknown eval flag: " ++ arg)
     goEval opts (path : rest) =
       go (opts {optCommand = CmdEvalFile path}) rest
     -- Sub-parser for push: flags and explicit store paths in any order.
-    goPush opts pushArgs [] = opts {optCommand = CmdPush pushArgs}
+    goPush opts pushArgs [] = Right opts {optCommand = CmdPush pushArgs}
     goPush opts pushArgs ("--store" : dir : rest) =
       goPush (opts {optStore = Just dir}) pushArgs rest
     goPush opts pushArgs ("--cache" : url : rest) =
@@ -121,8 +130,14 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
       goPush opts (pushArgs {paKeyFile = Just path}) rest
     goPush opts pushArgs ("--all" : rest) =
       goPush opts (pushArgs {paAll = True}) rest
+    goPush _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goPush _ _ (arg@('-' : _) : _) = Left ("unknown push flag: " ++ arg)
     goPush opts pushArgs (path : rest) =
       goPush opts (pushArgs {paPaths = paPaths pushArgs ++ [path]}) rest
+    -- Flags that consume the following argument as their value.
+    valueFlags =
+      ["--nix-path", "--store", "--substituter", "--trusted-key", "--expr", "--cache", "--key-file"]
 
 -- | Merge --nix-path entries, bundled data dir, and NIX_PATH search paths.
 -- The data dir is appended last so user paths take priority.
@@ -141,7 +156,7 @@ main = do
   arenaInit
   args <- getArgs
   dataDir <- getDataDir
-  let opts = parseArgs args
+  opts <- either (failWith . T.pack) pure (parseArgs args)
   case optCommand opts of
     CmdEvalFile filePath -> evalFile (optStrict opts) (optNixPaths opts) dataDir filePath
     CmdEvalExpr expr
@@ -425,12 +440,16 @@ resolvePushRoots store pushArgs
       pure (traverse parseDbPath pathTexts)
   | otherwise = pure (traverse parseArgPath (paPaths pushArgs))
   where
+    -- DB rows are rendered with the OPENED store's dir - parsing against
+    -- platformStoreDir made 'push --all --store DIR' fail on every row of
+    -- a non-default store.
     parseDbPath txt =
-      maybe (Left ("unparseable store DB path: " <> txt)) Right (parseStorePath platformStoreDir txt)
+      maybe (Left ("unparseable store DB path: " <> txt)) Right (parseStorePath (stDir store) txt)
     parseArgPath raw =
       let txt = T.pack raw
           attempts =
-            [ parseStorePath platformStoreDir txt,
+            [ parseStorePath (stDir store) txt,
+              parseStorePath platformStoreDir txt,
               parseStorePath defaultStoreDir txt,
               parseBareBasename txt
             ]
@@ -457,33 +476,57 @@ failWith msg = do
 -- writes).  Each entry not already valid is copied in, made read-only, and
 -- registered with its real NAR hash.  A copied source carries no references.
 materializeEvalSources :: Store -> Map.Map T.Text T.Text -> IO ()
-materializeEvalSources store sourceCache = do
-  regs <- catMaybes <$> mapM adopt (Map.toList sourceCache)
-  registerPaths (stDB store) regs
+materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
   where
+    -- Each source registers IMMEDIATELY after its copy (sources carry no
+    -- cross-references, so there is nothing to batch), and a source
+    -- already on disk is adopted without touching its files - re-copying
+    -- onto a read-only tree fails on Windows, so an interrupted earlier
+    -- run would otherwise wedge the store permanently.  Mirrors the
+    -- builder's own prepareOutput recovery.
     adopt (rawPath, spText) =
       case parseStorePath defaultStoreDir spText of
-        Nothing -> pure Nothing
+        Nothing -> pure ()
         Just sp -> do
           valid <- isValid store sp
           if valid
-            then pure Nothing
+            then pure ()
             else do
               let dest = storePathToFilePath (stDir store) sp
-              copyPathInto (T.unpack rawPath) dest
-              setReadOnly dest
-              Just <$> registrationFor store sp Nothing []
+              onDisk <- doesPathExist dest
+              if onDisk
+                then pure ()
+                else do
+                  copyPathInto (T.unpack rawPath) dest
+                  setReadOnly dest
+              reg <- registrationFor store sp Nothing []
+              registerPath (stDB store) reg
 
 -- | Recursively copy a file or directory tree to a destination path.
+-- A symlink is replicated as a symlink: the store path's name came from a
+-- NAR hash that ENCODES the link entry, so dereferencing it here would
+-- store content that no longer matches its own address (and a
+-- self-referential link would recurse forever).  On Windows without
+-- symlink privilege the link creation fails loudly rather than silently
+-- corrupting the content address.
 copyPathInto :: FilePath -> FilePath -> IO ()
 copyPathInto src dest = do
-  isDir <- doesDirectoryExist src
-  if isDir
+  isLink <- pathIsSymbolicLink src
+  if isLink
     then do
-      createDirectoryIfMissing True dest
-      names <- listDirectory src
-      mapM_ (\name -> copyPathInto (src FP.</> name) (dest FP.</> name)) names
-    else copyFile src dest
+      target <- getSymbolicLinkTarget src
+      linkedDir <- doesDirectoryExist src
+      if linkedDir
+        then createDirectoryLink target dest
+        else createFileLink target dest
+    else do
+      isDir <- doesDirectoryExist src
+      if isDir
+        then do
+          createDirectoryIfMissing True dest
+          names <- listDirectory src
+          mapM_ (\name -> copyPathInto (src FP.</> name) (dest FP.</> name)) names
+        else copyFile src dest
 
 -- | Write every recorded @.drv@ ATerm (keyed by its store-path text) to the
 -- store.  Keys come from evaluation via 'storePathToText' so they always parse;
