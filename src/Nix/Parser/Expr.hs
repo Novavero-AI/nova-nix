@@ -22,6 +22,10 @@ module Nix.Parser.Expr
   )
 where
 
+import Control.Monad (foldM)
+import Data.List (foldl')
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Nix.Expr.Types
 import Nix.Parser.Internal
@@ -472,7 +476,7 @@ parseAttrSet isRec =
   (\bs -> EAttrs isRec bs NoCaptureInfo) <$> parseBindings
 
 parseBindings :: Parser [Binding]
-parseBindings = go []
+parseBindings = go [] >>= normalizeBindings
   where
     go acc = do
       tok <- peek
@@ -486,6 +490,98 @@ parseBindings = go []
         _ -> do
           binding <- parseNamedBinding
           go (binding : acc)
+
+-- ---------------------------------------------------------------------------
+-- Binding normalization (upstream parser.y addAttr semantics)
+-- ---------------------------------------------------------------------------
+
+-- | Accumulated definition while normalizing one binding list.
+data NormEntry
+  = -- | @name = value@ - mergeable when the value is a plain attrset literal.
+    StaticEntry !Text !Expr
+  | -- | An @inherit@ - its names are never mergeable.
+    InheritEntry !Binding
+  | -- | A dynamic-key binding - collisions surface at eval time.
+    DynamicEntry !Binding
+
+-- | How a name was defined, for duplicate checking.
+data DefKind = DefStatic | DefInherit
+
+-- | Normalize a binding list the way upstream's parser (@addAttr@) does:
+--
+-- * a nested attrpath (@a.b.c = v@) hoists into nested attrset literals
+--   under its first key (@a = { b = { c = v; }; }@);
+-- * two definitions of one key merge recursively when BOTH values are
+--   attrset literals - so @a.b = 1; a.c = 2;@ and @a = { b = 1; }; a.c = 2;@
+--   both work, with inner duplicates checked recursively.  A @rec@ marker
+--   on the existing set governs the merged result; one on the new set is
+--   discarded, exactly as upstream;
+-- * any other duplicate definition is a parse error, as upstream
+--   (@a = 1; a = 2;@, an @inherit@ name reused, merging into a
+--   non-literal value).
+--
+-- After normalization every static top-level key appears exactly once -
+-- which also makes the positional (slot-based) eval path applicable to
+-- sets and lets that use nested attrpaths.
+normalizeBindings :: [Binding] -> Parser [Binding]
+normalizeBindings bindings =
+  case normalizeBindingList bindings of
+    Left err -> parseError err
+    Right normalized -> pure normalized
+
+-- | Pure core of 'normalizeBindings'; recurses into merged literals.
+normalizeBindingList :: [Binding] -> Either Text [Binding]
+normalizeBindingList bindings = do
+  (entriesRev, _defined) <- foldM step ([], Map.empty) (map canonicalBinding bindings)
+  pure (map renderEntry (reverse entriesRev))
+  where
+    step :: ([NormEntry], Map Text DefKind) -> Binding -> Either Text ([NormEntry], Map Text DefKind)
+    step (entries, defined) binding = case binding of
+      NamedBinding [StaticKey key] value ->
+        case Map.lookup key defined of
+          Nothing ->
+            Right (StaticEntry key value : entries, Map.insert key DefStatic defined)
+          Just DefStatic -> do
+            updated <- mergeIntoEntries key value entries
+            Right (updated, defined)
+          Just DefInherit -> Left (duplicateAttr key)
+      b@(NamedBinding _ _) -> Right (DynamicEntry b : entries, defined)
+      b@(Inherit _ names) -> do
+        mapM_ (\name -> if Map.member name defined then Left (duplicateAttr name) else Right ()) names
+        Right (InheritEntry b : entries, foldl' (\m name -> Map.insert name DefInherit m) defined names)
+
+    -- Replace the existing entry for @key@ with the merged value.
+    mergeIntoEntries key newValue entries = case entries of
+      [] -> Left (duplicateAttr key)
+      (StaticEntry existingKey existingValue : rest)
+        | existingKey == key -> do
+            merged <- mergeAttrValues key existingValue newValue
+            Right (StaticEntry existingKey merged : rest)
+      (entry : rest) -> (entry :) <$> mergeIntoEntries key newValue rest
+
+    -- Upstream's addAttr (parser-state.hh) merges ANY two attrset
+    -- literals without consulting ->recursive on either side: the
+    -- EXISTING set's rec marker governs the merged result and the new
+    -- set's marker is DISCARDED (upstream's own comment documents the
+    -- discard).  The merged binding list is re-normalized so inner
+    -- duplicates are caught.
+    mergeAttrValues _ (EAttrs existingRec existingBindings _) (EAttrs _ newBindings _) =
+      (\merged -> EAttrs existingRec merged NoCaptureInfo)
+        <$> normalizeBindingList (existingBindings ++ newBindings)
+    mergeAttrValues key _ _ = Left (duplicateAttr key)
+
+    renderEntry (StaticEntry key value) = NamedBinding [StaticKey key] value
+    renderEntry (InheritEntry b) = b
+    renderEntry (DynamicEntry b) = b
+
+    duplicateAttr key = "attribute '" <> key <> "' already defined"
+
+-- | Hoist a nested attrpath under its first key: @a.b.c = v@ becomes
+-- @a = { b = { c = v; }; }@, one literal per level.
+canonicalBinding :: Binding -> Binding
+canonicalBinding (NamedBinding (firstKey : rest@(_ : _)) value) =
+  NamedBinding [firstKey] (EAttrs False [canonicalBinding (NamedBinding rest value)] NoCaptureInfo)
+canonicalBinding b = b
 
 parseNamedBinding :: Parser Binding
 parseNamedBinding = do
@@ -561,8 +657,12 @@ parseAttrKey = do
     -- Keywords are valid as attribute names in Nix:
     -- { if = 1; }, a.then, { else = 2; }, etc.
     _ | Just name <- keywordToText tok -> advance >> pure (StaticKey name)
-    TokStringOpen ->
-      DynamicKey <$> parseString
+    TokStringOpen -> do
+      strExpr <- parseString
+      -- A string key with no interpolation is static, as in upstream Nix's
+      -- parser (the string becomes a symbol at parse time) - which is also
+      -- what makes @let "x" = 1; in x@ legal.
+      pure (maybe (DynamicKey strExpr) StaticKey (literalStringKey strExpr))
     TokInterpOpen -> do
       _ <- advance
       expr <- parseExpr
@@ -571,6 +671,16 @@ parseAttrKey = do
       expect TokRBrace
       pure (DynamicKey expr)
     _ -> parseError ("expected attribute key, got " <> showToken tok)
+
+-- | The literal text of a string expression that contains no interpolation.
+-- Escape handling can split a literal into several 'StrLit' chunks, so the
+-- parts are concatenated; any 'StrInterp' makes the key dynamic.
+literalStringKey :: Expr -> Maybe Text
+literalStringKey (EStr parts) = mconcat <$> traverse literalPart parts
+  where
+    literalPart (StrLit t) = Just t
+    literalPart (StrInterp _) = Nothing
+literalStringKey _ = Nothing
 
 -- | Convert keyword tokens to their text for use as attribute names.
 -- All Nix keywords are valid as attr keys in binding and select position.
@@ -597,7 +707,7 @@ parseLet = do
   (\body -> ELet bindings body NoCaptureInfo) <$> parseExpr
 
 parseLetBindings :: Parser [Binding]
-parseLetBindings = go []
+parseLetBindings = go [] >>= normalizeBindings
   where
     go acc = do
       tok <- peek
@@ -608,7 +718,13 @@ parseLetBindings = go []
           go (binding : acc)
         _ -> do
           binding <- parseNamedBinding
-          go (binding : acc)
+          -- Upstream rejects a dynamic TOP-LEVEL key in a let at parse time;
+          -- nested dynamic keys (let a.${k} = 1) live in a nested attrset
+          -- and are fine.
+          case binding of
+            NamedBinding (DynamicKey _ : _) _ ->
+              parseError "dynamic attributes not allowed in let"
+            _ -> go (binding : acc)
 
 parseIf :: Parser Expr
 parseIf = do

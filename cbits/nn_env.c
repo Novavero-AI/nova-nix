@@ -60,13 +60,20 @@ align_up(uint32_t n, uint32_t alignment)
 }
 
 /* Allocate raw bytes from the page-based bump allocator.
- * Returns aligned, zero-initialized memory. */
+ * Returns aligned, zero-initialized memory, or NULL on overflow/OOM. */
 static void *
 nn_env_alloc_raw(uint32_t bytes)
 {
+    /* align_up would wrap for sizes near UINT32_MAX; such a request can
+     * only be corrupt input, so fail it instead of wrapping small. */
+    if (bytes > UINT32_MAX - (NN_ENV_ALIGN - 1)) return NULL;
     bytes = align_up(bytes, NN_ENV_ALIGN);
 
-    if (!g_current_page || g_current_page->used + bytes > g_current_page->capacity) {
+    /* used <= capacity always holds, so capacity - used cannot underflow;
+     * the additive form (used + bytes > capacity) overflows uint32_t for
+     * near-4GB requests and would pass the check, then memset past the
+     * end of a 256 KB page. */
+    if (!g_current_page || bytes > g_current_page->capacity - g_current_page->used) {
         uint32_t page_cap = bytes > NN_ENV_PAGE_SIZE ? bytes : NN_ENV_PAGE_SIZE;
         struct nn_env_page *page = alloc_page(page_cap);
         if (!page) return NULL;

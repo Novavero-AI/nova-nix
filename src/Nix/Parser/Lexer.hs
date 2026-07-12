@@ -107,13 +107,21 @@ data LexMode
   deriving (Eq, Show)
 
 -- | Internal lexer state.
+--
+-- @lsBraceDepth@ counts unmatched @{@ in the CURRENT normal-mode context;
+-- a @}@ at depth 0 closes the current interpolation.  Entering @${@ from a
+-- string pushes the enclosing context's count onto @lsBraceStack@ and
+-- starts a fresh count; the matching interpolation close pops it back.
+-- Without the stack, a nested interpolated string inside braces zeroes the
+-- enclosing count and the outer attrset's @}@ mislexes as TokInterpClose.
 data LexState = LexState
   { lsInput :: !Text,
     lsFile :: !Text,
     lsLine :: !Int,
     lsCol :: !Int,
     lsModes :: ![LexMode],
-    lsBraceDepth :: !Int
+    lsBraceDepth :: !Int,
+    lsBraceStack :: ![Int]
   }
 
 -- ---------------------------------------------------------------------------
@@ -130,7 +138,8 @@ tokenize fileName source =
             lsLine = 1,
             lsCol = 1,
             lsModes = [ModeNormal],
-            lsBraceDepth = 0
+            lsBraceDepth = 0,
+            lsBraceStack = []
           }
    in lexLoop initialState []
 
@@ -169,12 +178,11 @@ lexNormalMode st acc = case T.uncons (lsInput st) of
         Just '.' <- safeHead (T.drop 1 rest) ->
           emit3 st TokEllipsis acc
     '.'
-      | Just '/' <- safeHead rest ->
-          lexPath st acc
-      | Just '.' <- safeHead rest,
-        Just c2 <- safeHead (T.drop 1 rest),
-        c2 == '/' ->
-          lexPath st acc
+      -- Maximal munch, as upstream's PATH regex: a dot-led path-char run
+      -- containing a /-segment is ONE path token (./x, ../x, .github/x,
+      -- even .5/x) - the path reading beats the float and TokDot readings.
+      -- A dot-run with no slash falls through: .5 is a float, x.y selects.
+      | looksLikePath (lsInput st) -> lexPath st acc
       | Just d <- safeHead rest,
         isDigit d ->
           lexLeadingDotFloat st acc
@@ -194,12 +202,24 @@ lexNormalMode st acc = case T.uncons (lsInput st) of
        in lexNormalMode newSt (tok : acc)
     '}' ->
       case lsModes st of
-        -- closing an interpolation: pop back to string/indstring mode
+        -- closing an interpolation: pop back to string/indstring mode and
+        -- restore the enclosing normal-mode context's brace count.
         (ModeNormal : outerMode : restModes)
           | lsBraceDepth st == 0,
             outerMode == ModeString || outerMode == ModeIndString ->
               let tok = Located (lsLine st) (lsCol st) TokInterpClose
-                  newSt = advanceCol 1 st {lsInput = rest, lsModes = outerMode : restModes}
+                  (restoredDepth, restoredStack) = case lsBraceStack st of
+                    (saved : outerSaved) -> (saved, outerSaved)
+                    [] -> (0, [])
+                  newSt =
+                    advanceCol
+                      1
+                      st
+                        { lsInput = rest,
+                          lsModes = outerMode : restModes,
+                          lsBraceDepth = restoredDepth,
+                          lsBraceStack = restoredStack
+                        }
                in lexLoop newSt (tok : acc)
         _ ->
           let depth = lsBraceDepth st
@@ -287,7 +307,11 @@ lexStringMode st acc = case T.uncons (lsInput st) of
                   st
                     { lsInput = T.drop 1 rest,
                       lsModes = ModeNormal : lsModes st,
-                      lsBraceDepth = 0
+                      -- Fresh count for the interpolation body; the
+                      -- enclosing context's count is restored at the
+                      -- matching TokInterpClose.
+                      lsBraceDepth = 0,
+                      lsBraceStack = lsBraceDepth st : lsBraceStack st
                     }
            in lexLoop newSt (tok : acc)
     _ -> lexStringLiteral st acc
@@ -362,7 +386,10 @@ lexIndStringMode st acc
                           st
                             { lsInput = rest2,
                               lsModes = ModeNormal : lsModes st,
-                              lsBraceDepth = 0
+                              -- Fresh count; enclosing context restored at
+                              -- the matching TokInterpClose.
+                              lsBraceDepth = 0,
+                              lsBraceStack = lsBraceDepth st : lsBraceStack st
                             }
                    in lexLoop newSt (tok : acc)
             _ -> lexIndStringLiteral st acc
@@ -413,6 +440,17 @@ lexStringLiteral st0 acc = go st0 mempty
         '\n' ->
           let newSt = st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
            in go newSt (builder <> TB.singleton '\n')
+        -- Raw CR and CRLF normalize to LF, matching upstream unescapeStr
+        -- (lexer.l).  Only double-quoted strings do this: indented-string
+        -- chunks bypass unescapeStr upstream and keep CR verbatim.  An
+        -- ESCAPED CR (backslash before it) stays literal via the escape
+        -- branch above, also matching upstream.
+        '\r' ->
+          let afterEol = case T.uncons rest of
+                Just ('\n', afterCrlf) -> afterCrlf
+                _ -> rest
+              newSt = st {lsInput = afterEol, lsLine = lsLine st + 1, lsCol = 1}
+           in go newSt (builder <> TB.singleton '\n')
         _ ->
           let newSt = advanceCol 1 st {lsInput = rest}
            in go newSt (builder <> TB.singleton c)
@@ -429,6 +467,11 @@ lexStringLiteral st0 acc = go st0 mempty
 -- No escape sequences here (those are handled by 'lexIndStringMode'),
 -- so the chunk is identical to the source text - count chars, then slice
 -- once at the end.  This avoids O(n^2) 'T.snoc' allocation.
+--
+-- Raw CR\/CRLF is deliberately NOT normalized here: upstream's indented
+-- string chunks bypass unescapeStr (lexer.l), and stripIndentation treats
+-- CR as ordinary content, so only double-quoted strings normalize line
+-- endings.
 lexIndStringLiteral :: LexState -> [Located] -> Either ParseError [Located]
 lexIndStringLiteral st0 acc = go st0 0
   where
@@ -581,21 +624,38 @@ zeroOrd = fromEnum '0'
 
 lexIdentOrKeyword :: LexState -> [Located] -> Either ParseError [Located]
 lexIdentOrKeyword st acc =
-  let (ident, after) = T.span isIdentChar (lsInput st)
-      len = T.length ident
-   in -- Check for URI: identifier followed by ://
-      case T.stripPrefix "://" after of
-        Just afterScheme ->
-          let (uriRest, afterUri) = T.span isUriChar afterScheme
-              full = ident <> "://" <> uriRest
-              fullLen = T.length full
-              tok = Located (lsLine st) (lsCol st) (TokUri full)
-              newSt = advanceCol fullLen st {lsInput = afterUri}
-           in lexNormalMode newSt (tok : acc)
-        Nothing ->
+  let input = lsInput st
+      (ident, after) = T.span isIdentChar input
+   in case uriSpan input of
+        -- Flex maximal munch: the URI rule beats identifiers AND keywords
+        -- whenever it matches more characters, so @x:y@ is the URI "x:y"
+        -- (the classic reason the identity function must be written
+        -- @x: x@) and @mailto:a\@b.com@ needs no @//@.
+        Just (uri, afterUri)
+          | T.length uri > T.length ident ->
+              let tok = Located (lsLine st) (lsCol st) (TokUri uri)
+                  newSt = advanceCol (T.length uri) st {lsInput = afterUri}
+               in lexNormalMode newSt (tok : acc)
+        _ ->
           let tok = Located (lsLine st) (lsCol st) (identToToken ident)
-              newSt = advanceCol len st {lsInput = after}
+              newSt = advanceCol (T.length ident) st {lsInput = after}
            in lexNormalMode newSt (tok : acc)
+
+-- | Match upstream's URI token at the start of the input:
+-- @[a-zA-Z][a-zA-Z0-9+.-]*:[uri-char]+@ (lexer.l).  The scheme starts
+-- with a letter (never @_@), and one URI char after the colon suffices -
+-- scheme-only URIs like @mailto:x@ count.  Returns the URI text and the
+-- remaining input.
+uriSpan :: Text -> Maybe (Text, Text)
+uriSpan input = case T.uncons input of
+  Just (schemeStart, _)
+    | isAlpha schemeStart,
+      (scheme, afterScheme) <- T.span isSchemeChar input,
+      Just afterColon <- T.stripPrefix ":" afterScheme,
+      (body, afterUri) <- T.span isUriChar afterColon,
+      not (T.null body) ->
+        Just (scheme <> ":" <> body, afterUri)
+  _ -> Nothing
 
 identToToken :: Text -> Token
 identToToken "if" = TokIf
@@ -701,8 +761,16 @@ looksLikePath input =
 isSearchPathChar :: Char -> Bool
 isSearchPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
 
+-- | Chars allowed in a URI scheme after the leading letter, per upstream
+-- lexer.l: @[a-zA-Z][a-zA-Z0-9+.-]*@.
+isSchemeChar :: Char -> Bool
+isSchemeChar c = isAlphaNum c || c `elem` ("+.-" :: [Char])
+
+-- | Chars allowed after the scheme colon, exactly upstream lexer.l's URI
+-- class @[a-zA-Z0-9%\/?:\@&=+$,-_.!~*']@.  Notably @#@ is NOT a URI char
+-- (it starts a comment mid-URI upstream), while @*@ and @'@ are.
 isUriChar :: Char -> Bool
-isUriChar c = isAlphaNum c || c `elem` ("%/?:@&=+$,#._~!-" :: [Char])
+isUriChar c = isAlphaNum c || c `elem` ("%/?:@&=+$,-_.!~*'" :: [Char])
 
 -- ---------------------------------------------------------------------------
 -- Emit helpers
