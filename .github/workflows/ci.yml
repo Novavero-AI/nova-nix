@@ -122,8 +122,11 @@ jobs:
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
           restore-keys: cabal-${{ runner.os }}-
 
+      # --enable-tests compiles the test suite under -Werror too (a bare
+      # `cabal build` skips test components entirely, so test-code warnings
+      # would never fail CI) and shares one solver plan with the test step.
       - name: Build
-        run: cabal build --ghc-options="-Werror"
+        run: cabal build --enable-tests --ghc-options="-Werror"
 
       - name: Test
         run: cabal test

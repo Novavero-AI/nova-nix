@@ -30,6 +30,7 @@ build-type:         Simple
 tested-with:        GHC == 9.8.4
 extra-doc-files:
     CHANGELOG.md
+    NOTICE
     README.md
 -- C data-layer headers.  These are #included by the cbits/*.c sources
 -- (via include-dirs: cbits) but are not auto-added to the sdist by the
@@ -117,7 +118,10 @@ library
     cbits/nn_bytecode.c
     cbits/nn_lambda.c
   include-dirs:     cbits
-  cc-options:       -std=c99 -Wall -Wextra -pedantic -Werror
+  -- -Werror deliberately NOT baked in: a future gcc/clang adding a new
+  -- -Wall diagnostic must not retroactively break installing published
+  -- releases.  CI enforces warnings-as-errors via its C99-strict job.
+  cc-options:       -std=c99 -Wall -Wextra -pedantic
   hs-source-dirs:   src
   default-language:  Haskell2010
   default-extensions:
