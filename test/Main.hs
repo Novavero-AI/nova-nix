@@ -20,7 +20,7 @@ import qualified Data.Text.IO as TIO
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig)
-import Nix.Builder.Unpack (builtinUnpackBuilder, envSrcs)
+import Nix.Builder.Unpack (builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
@@ -3020,8 +3020,8 @@ testUnpackBuildIO = do
         archiveCollide = workDir </> "pkg-collide.tar.zst"
         archiveEscape = workDir </> "pkg-escape.tar.zst"
         archiveRootFile = workDir </> "pkg-root-file.tar.zst"
-        archiveRootSymlink = workDir </> "pkg-root-symlink.tar.zst"
-        archiveRootHardlink = workDir </> "pkg-root-hardlink.tar.zst"
+        archiveEscapeSymlink = workDir </> "pkg-escape-symlink.tar.zst"
+        archiveEscapeHardlink = workDir </> "pkg-escape-hardlink.tar.zst"
     BL.writeFile archiveTools $
       compressArchive
         [ tarDir "pkg",
@@ -3046,10 +3046,13 @@ testUnpackBuildIO = do
     -- '/', so this is the on-disk form even of a Windows-native "\..." name.
     BL.writeFile archiveRootFile $
       compressArchive [tarFile "/planted-abs.txt" "rooted-file"]
-    BL.writeFile archiveRootSymlink $
-      compressArchive [tarSymLink "sneaky-link.txt" "/planted-link-target.txt"]
-    BL.writeFile archiveRootHardlink $
-      compressArchive [tarHardLink "sneaky-hardlink.txt" "/planted-hardlink-target.txt"]
+    -- Escaping link targets: '..' climbs above the archive root.  Unlike a
+    -- rooted ('/') target, this builds portably - tar's toLinkTarget accepts a
+    -- relative path on every host - so the real unpacker is exercised end to end.
+    BL.writeFile archiveEscapeSymlink $
+      compressArchive [tarSymLink "sneaky-link.txt" "../escape-link-target.txt"]
+    BL.writeFile archiveEscapeHardlink $
+      compressArchive [tarHardLink "sneaky-hardlink.txt" "../escape-hardlink-target.txt"]
     let mkUnpackDrv outP srcFiles =
           Derivation
             { drvOutputs =
@@ -3073,8 +3076,8 @@ testUnpackBuildIO = do
         collideOut = StorePath (T.replicate 31 "0" <> "3") "unpack-collide"
         escapeOut = StorePath (T.replicate 31 "0" <> "4") "unpack-escape"
         rootFileOut = StorePath (T.replicate 31 "0" <> "5") "unpack-root-file"
-        rootSymlinkOut = StorePath (T.replicate 31 "0" <> "6") "unpack-root-symlink"
-        rootHardlinkOut = StorePath (T.replicate 31 "0" <> "7") "unpack-root-hardlink"
+        escapeSymlinkOut = StorePath (T.replicate 31 "0" <> "6") "unpack-escape-symlink"
+        escapeHardlinkOut = StorePath (T.replicate 31 "0" <> "7") "unpack-escape-hardlink"
     buildTmp <- (</> "nova-nix-test-unpack-build-tmp") <$> getTemporaryDirectory
     forceRemoveIfExists buildTmp
     createDirectoryIfMissing True buildTmp
@@ -3083,8 +3086,8 @@ testUnpackBuildIO = do
     collideResult <- buildDerivation config store (mkUnpackDrv collideOut [archiveTools, archiveCollide])
     escapeResult <- buildDerivation config store (mkUnpackDrv escapeOut [archiveEscape])
     rootFileResult <- buildDerivation config store (mkUnpackDrv rootFileOut [archiveRootFile])
-    rootSymlinkResult <- buildDerivation config store (mkUnpackDrv rootSymlinkOut [archiveRootSymlink])
-    rootHardlinkResult <- buildDerivation config store (mkUnpackDrv rootHardlinkOut [archiveRootHardlink])
+    escapeSymlinkResult <- buildDerivation config store (mkUnpackDrv escapeSymlinkOut [archiveEscapeSymlink])
+    escapeHardlinkResult <- buildDerivation config store (mkUnpackDrv escapeHardlinkOut [archiveEscapeHardlink])
     forceRemoveIfExists buildTmp
     forceRemoveIfExists workDir
     seedChecks <- case seedResult of
@@ -3155,17 +3158,31 @@ testUnpackBuildIO = do
           BuildFailure msg _
             | needle `T.isInfixOf` msg -> Pass
             | otherwise -> Fail ("wrong failure: " <> msg)
-          BuildSuccess _ -> Fail "rooted entry unexpectedly built"
-    rootChecks <-
+          BuildSuccess _ -> Fail "malicious entry unexpectedly built"
+    -- Integration: the real unpacker rejects a rooted entry path and an
+    -- escaping ('..') symlink/hardlink target, end to end.
+    maliciousChecks <-
       sequence
         [ runTest "unpack: rooted file entry rejected" $
             rejectedWith "planted-abs.txt" rootFileResult,
-          runTest "unpack: rooted symlink target rejected" $
-            rejectedWith "planted-link-target.txt" rootSymlinkResult,
-          runTest "unpack: rooted hardlink target rejected" $
-            rejectedWith "planted-hardlink-target.txt" rootHardlinkResult
+          runTest "unpack: escaping symlink target rejected" $
+            rejectedWith "escape-link-target.txt" escapeSymlinkResult,
+          runTest "unpack: escaping hardlink target rejected" $
+            rejectedWith "escape-hardlink-target.txt" escapeHardlinkResult
         ]
-    pure (seedChecks ++ collideChecks ++ escapeChecks ++ rootChecks)
+    -- Unit: the rooted (drive-relative) case is the Blocker-4 Windows vuln.
+    -- tar's toLinkTarget refuses an absolute payload on POSIX, so exercise the
+    -- guard predicate directly - portable and exact on every host.
+    guardChecks <-
+      sequence
+        [ runTest "unpack guard: rooted entry path rejected" $
+            assertLeft "rooted entry" (entryComponents "/planted-abs.txt"),
+          runTest "unpack guard: rooted symlink target rejected" $
+            assertLeft "rooted symlink" (resolveLinkTarget [] "/planted-link-target.txt"),
+          runTest "unpack guard: rooted hardlink target rejected" $
+            assertLeft "rooted hardlink" (entryComponents "/planted-hardlink-target.txt")
+        ]
+    pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ guardChecks)
 
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
 -- derivation depends on a leaf; both @.drv@ files are pre-written to the store

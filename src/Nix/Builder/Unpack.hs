@@ -41,6 +41,10 @@ module Nix.Builder.Unpack
 
     -- * Running
     runBuiltinUnpack,
+
+    -- * Path validation (exposed for testing)
+    entryComponents,
+    resolveLinkTarget,
   )
 where
 
