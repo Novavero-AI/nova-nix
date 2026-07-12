@@ -28,7 +28,7 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, fromException, throwIO, try)
+import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, fromException, onException, throwIO, try)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
@@ -47,7 +47,7 @@ import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Eval (eval)
 import Nix.Eval.CList (CList (..))
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
@@ -344,6 +344,17 @@ instance MonadEval EvalIO where
     wrapIO (copyToStoreIfMissing (T.unpack srcPath) destFilePath storeDir)
     pure destPath
 
+  addFixedOutputFile name bytes = do
+    -- Canonical fixed-output path: a sha256-pinned fetch must land at the same
+    -- store path C++ Nix computes, so it stays reproducible and cache-compatible.
+    let sp = makeFixedOutputPath name "sha256" "flat" (sha256Digest bytes)
+        filePath = SP.storePathToFilePath SP.defaultStoreDir sp
+        storePath = SP.storePathToText SP.defaultStoreDir sp
+    wrapIO $ do
+      Dir.createDirectoryIfMissing True (takeDirectory filePath)
+      BS.writeFile filePath bytes
+    pure storePath
+
   traceMessage msg = EvalIO (liftIO (hPutStrLn stderr (T.unpack msg)))
 
   resolvePathLiteral path = do
@@ -384,7 +395,17 @@ instance MonadEval EvalIO where
         -- Mark blackhole BEFORE evaluation - any re-entry hits the
         -- BLACKHOLE branch above.
         _ <- EvalIO (liftIO (cthunkMarkBlackhole ptr))
-        val <- evalFn env bcIdx
+        -- If the force throws (a builtins.throw caught by an upstream tryEval,
+        -- a type error, a failed import), restore the thunk to PENDING and
+        -- rethrow, so a later force of this shared thunk re-evaluates instead of
+        -- taking the BLACKHOLE branch above and aborting with a bogus "infinite
+        -- recursion".  Mirrors C++ Nix forceValue: catch (...) { restore; throw }.
+        -- A genuine self-recursion still rethrows its NixAbortError, which
+        -- escapes tryEval exactly as before.
+        val <- EvalIO $ do
+          st <- ask
+          liftIO
+            (runReaderT (unEvalIO (evalFn env bcIdx)) st `onException` cthunkMarkPending ptr)
         oldPayload <- EvalIO (liftIO (storeComputed ptr val))
         -- Free the pending env StablePtr.
         when (oldPayload /= nullPtr) $

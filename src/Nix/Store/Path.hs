@@ -42,6 +42,7 @@ module Nix.Store.Path
     storePathToFilePath,
     storePathToText,
     parseStorePath,
+    parseStorePathBaseName,
 
     -- * Constants
     storePathHashLen,
@@ -117,17 +118,21 @@ storePathHashLen = 32
 parseStorePath :: StoreDir -> Text -> Maybe StorePath
 parseStorePath (StoreDir dir) path =
   let dirText = T.pack dir
-      tryWithSep sep = T.stripPrefix (dirText <> sep) path >>= parseRest
+      tryWithSep sep = T.stripPrefix (dirText <> sep) path >>= parseStorePathBaseName
    in case tryWithSep "/" of
         Just sp -> Just sp
         Nothing -> tryWithSep "\\"
-  where
-    parseRest rest
-      | T.length rest < storePathHashLen + 2 = Nothing
-      | otherwise =
-          let hashPart = T.take storePathHashLen rest
-              afterHash = T.drop storePathHashLen rest
-           in case T.uncons afterHash of
-                Just ('-', name)
-                  | not (T.null name) -> Just (StorePath hashPart name)
-                _ -> Nothing
+
+-- | Parse a store path basename like @abc...-name@ - the form narinfo
+-- @References@ and @Deriver@ fields carry on the wire - into a
+-- 'StorePath': 32-char hash, dash, non-empty name.
+parseStorePathBaseName :: Text -> Maybe StorePath
+parseStorePathBaseName basename
+  | T.length basename < storePathHashLen + 2 = Nothing
+  | otherwise =
+      let hashPart = T.take storePathHashLen basename
+          afterHash = T.drop storePathHashLen basename
+       in case T.uncons afterHash of
+            Just ('-', name)
+              | not (T.null name) -> Just (StorePath hashPart name)
+            _ -> Nothing

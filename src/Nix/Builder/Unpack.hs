@@ -41,6 +41,10 @@ module Nix.Builder.Unpack
 
     -- * Running
     runBuiltinUnpack,
+
+    -- * Path validation (exposed for testing)
+    entryComponents,
+    resolveLinkTarget,
   )
 where
 
@@ -68,7 +72,7 @@ import System.Directory
     setOwnerExecutable,
     setPermissions,
   )
-import System.FilePath (isAbsolute, joinPath, splitDirectories, takeDirectory, (</>))
+import System.FilePath (isAbsolute, isPathSeparator, joinPath, splitDirectories, takeDirectory, (</>))
 import qualified System.Info
 
 -- ---------------------------------------------------------------------------
@@ -294,6 +298,7 @@ extractContent outDir comps entry =
 entryComponents :: FilePath -> Either Text [FilePath]
 entryComponents raw
   | isAbsolute raw = Left ("absolute entry path: " <> T.pack raw)
+  | startsAtRoot comps = Left ("rooted entry path: " <> T.pack raw)
   | ".." `elem` comps = Left ("entry path escapes archive root: " <> T.pack raw)
   | any (elem ':') comps = Left ("entry path contains ':': " <> T.pack raw)
   | otherwise = Right comps
@@ -306,6 +311,7 @@ entryComponents raw
 resolveLinkTarget :: [FilePath] -> FilePath -> Either Text [FilePath]
 resolveLinkTarget parentComps target
   | isAbsolute target = Left ("absolute symlink target: " <> T.pack target)
+  | startsAtRoot targetComps = Left ("rooted symlink target: " <> T.pack target)
   | otherwise = walk (reverse parentComps) targetComps
   where
     targetComps = filter (/= ".") (splitDirectories target)
@@ -317,6 +323,19 @@ resolveLinkTarget parentComps target
       (_, comp : rest)
         | ':' `elem` comp -> Left ("symlink target contains ':': " <> T.pack target)
         | otherwise -> walk (comp : stack) rest
+
+-- | True when the first path component is a bare separator, i.e. a path rooted
+-- at the current drive rather than a named location (a leading @/@ or @\\@ with
+-- no drive letter).  On Windows 'isAbsolute' returns 'False' for such paths -
+-- it wants a drive letter or a UNC prefix - yet 'System.FilePath.combine' still
+-- discards the output directory when the right operand begins with a separator,
+-- so joining one onto @outDir@ drops @outDir@ and the write lands at the drive
+-- root.  'isPathSeparator' follows the host convention, so on POSIX a leading
+-- @\\@ is an ordinary filename character and correctly is not treated as rooted.
+startsAtRoot :: [FilePath] -> Bool
+startsAtRoot comps = case comps of
+  (comp : _) -> not (null comp) && all isPathSeparator comp
+  [] -> False
 
 -- | pacman package metadata at the archive root (@.PKGINFO@, @.BUILDINFO@,
 -- @.MTREE@, @.INSTALL@): describes the package to pacman, is not part of the

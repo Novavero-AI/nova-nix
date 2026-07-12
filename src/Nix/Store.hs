@@ -59,7 +59,6 @@ where
 import Control.Exception (IOException, catch)
 import Control.Monad (when)
 import qualified Data.ByteString as BS
-import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -202,33 +201,28 @@ copyDirectoryRecursive src dest = do
 
 -- | Byte-scan all files under a directory for store path references.
 --
--- Builds a 'Set' of candidate hash strings from the given store paths.
--- Walks all regular files, reads each as ByteString, searches for the
--- store dir prefix followed by a 32-character hash.  Returns matching
--- store paths from the candidate set.
-scanReferences :: StoreDir -> [StorePath] -> FilePath -> IO [StorePath]
-scanReferences storeDir candidates dir = do
+-- Searches file bytes for each candidate's bare 32-character hash - the
+-- same needle upstream Nix scans for.  Matching the hash rather than a
+-- store-dir-prefixed path keeps the scan independent of the spelling the
+-- builder embedded (canonical @\/nix\/store\/...@, @C:\\nix\\store\\...@,
+-- MSYS2 forms): eval injects canonical forward-slash text into builder
+-- environments, which a platform-store-dir prefix never matches on
+-- Windows.
+scanReferences :: [StorePath] -> FilePath -> IO [StorePath]
+scanReferences candidates dir = do
   let candidateSet = Set.fromList [(spHash sp, sp) | sp <- candidates]
-      storeDirStr = unStoreDir storeDir
-      -- Scan for both forward-slash and backslash store prefixes.  On Windows,
-      -- binaries may contain either separator style.  Both separators are a
-      -- single ASCII byte, so the two prefixes share a length.
-      prefixFwd = TE.encodeUtf8 (T.pack (storeDirStr <> "/"))
-      prefixBwd = TE.encodeUtf8 (T.pack (storeDirStr <> "\\"))
-      prefixLen = BS.length prefixFwd
+      needles = [(TE.encodeUtf8 h, h) | (h, _) <- Set.toList candidateSet]
   files <- collectRegularFiles dir
   foundHashes <- foldlIO Set.empty files $ \acc filePath -> do
     contents <- BS.readFile filePath
-    -- Scan with forward-slash prefix, then backslash (for Windows)
-    let acc1 = scanBytes prefixFwd prefixLen storePathHashLen contents acc
-    pure (scanBytes prefixBwd prefixLen storePathHashLen contents acc1)
+    pure (Set.union acc (Set.fromList [h | (needle, h) <- needles, needle `BS.isInfixOf` contents]))
   pure [sp | (h, sp) <- Set.toList candidateSet, Set.member h foundHashes]
 
 -- | Scan an output for references to build-temp output locations.
 --
 -- The builder runs under a temp directory, so an output that embeds its own or
--- a sibling output's path embeds the TEMP path - which 'scanReferences' (store
--- prefix only) cannot see.  Given @(tempDir, storePath)@ for every output of
+-- a sibling output's path embeds the TEMP path - which 'scanReferences' does
+-- not look for.  Given @(tempDir, storePath)@ for every output of
 -- the derivation, returns the store paths whose temp location is referenced
 -- from the scanned output, capturing self- and cross-output references.
 --
@@ -264,21 +258,6 @@ collectRegularFiles path = do
         else do
           isFile <- doesFileExist fullPath
           pure [fullPath | isFile]
-
--- | Scan a ByteString for store path prefix occurrences, extract hashes.
-scanBytes :: BS.ByteString -> Int -> Int -> BS.ByteString -> Set Text -> Set Text
-scanBytes prefix prefixLen hashLen bs =
-  go 0
-  where
-    bsLen = BS.length bs
-    go !idx !found
-      | idx + prefixLen + hashLen > bsLen = found
-      | BS.isPrefixOf prefix (BS.drop idx bs) =
-          let hashBytes = BS.take hashLen (BS.drop (idx + prefixLen) bs)
-           in case TE.decodeUtf8' hashBytes of
-                Right hashText -> go (idx + prefixLen + hashLen) (Set.insert hashText found)
-                Left _ -> go (idx + 1) found
-      | otherwise = go (idx + 1) found
 
 -- | Strict left fold over a list in IO.
 foldlIO :: a -> [b] -> (a -> b -> IO a) -> IO a

@@ -47,6 +47,7 @@ module Nix.Substituter
     decompressNar,
     unpackNarEntry,
     parseReferences,
+    parseDeriver,
   )
 where
 
@@ -65,7 +66,7 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Store (Store (..), setReadOnly)
 import Nix.Store.DB (PathRegistration (..), registerPath)
-import Nix.Store.Path (StoreDir, StorePath (..), parseStorePath, storePathHashLen, storePathToFilePath)
+import Nix.Store.Path (StoreDir, StorePath (..), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
@@ -196,9 +197,11 @@ unpackAndRegister store sp narInfo rawNar =
   -- trusting its bytes.  The NAR hash is the content-addressed integrity
   -- contract; the signature only attests to the narinfo, not the body, so
   -- network corruption or a compromised cache must be caught here.
-  case verifyNarHash narInfo rawNar of
+  -- Narinfo metadata is likewise parsed before any disk write: a malformed
+  -- narinfo must not leave an unpacked-but-unregistered path behind.
+  case verifyNarHash narInfo rawNar >> registrationMeta of
     Left err -> pure (SubstError err)
-    Right () -> case NAR.deserialise rawNar of
+    Right (refs, deriver) -> case NAR.deserialise rawNar of
       Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
       Right narEntry -> do
         let destPath = storePathToFilePath (stDir store) sp
@@ -214,10 +217,15 @@ unpackAndRegister store sp narInfo rawNar =
                 { prPath = sp,
                   prNarHash = NarInfo.niNarHash narInfo,
                   prNarSize = fromInteger (NarInfo.niNarSize narInfo),
-                  prDeriver = NarInfo.niDeriver narInfo,
-                  prReferences = parseReferences (stDir store) (NarInfo.niReferences narInfo)
+                  prDeriver = deriver,
+                  prReferences = refs
                 }
             pure (SubstSuccess sp)
+  where
+    registrationMeta = do
+      refs <- parseReferences (NarInfo.niReferences narInfo)
+      deriver <- parseDeriver (stDir store) (NarInfo.niDeriver narInfo)
+      pure (refs, deriver)
 
 -- | Verify that the downloaded NAR bytes hash to the narinfo's declared
 -- NarHash.  Compares decoded hash bytes, so any valid encoding of the digest
@@ -365,10 +373,31 @@ decompressNar compression narData
   | compression == "xz" = Left "xz decompression not yet available (enable nova-cache compression flag)"
   | otherwise = Left ("unsupported compression: " <> compression)
 
--- | Parse narinfo references (store path basenames) into StorePaths.
-parseReferences :: StoreDir -> [Text] -> [StorePath]
-parseReferences storeDir refs =
-  [sp | ref <- refs, Just sp <- [parseStorePath storeDir ref]]
+-- | Parse narinfo references (store path basenames, e.g.
+-- @abc...-glibc-2.40@) into StorePaths.  A malformed token is an error,
+-- not filtered: silently dropping a reference registers the path with a
+-- hole in its closure, which re-push then publishes as a signed narinfo
+-- missing runtime deps, and GC reads as permission to delete them.
+parseReferences :: [Text] -> Either Text [StorePath]
+parseReferences = traverse parseRef
+  where
+    parseRef ref =
+      maybe (Left ("malformed narinfo reference: " <> ref)) Right (parseStorePathBaseName ref)
+
+-- | The sentinel upstream caches emit for a path whose deriver is unknown.
+unknownDeriverSentinel :: Text
+unknownDeriverSentinel = "unknown-deriver"
+
+-- | Parse a narinfo Deriver - a store path basename on the wire, or the
+-- @unknown-deriver@ sentinel - into the full path text the store DB
+-- records (the form 'Nix.Push' parses back with 'parseStorePath').
+parseDeriver :: StoreDir -> Maybe Text -> Either Text (Maybe Text)
+parseDeriver _ Nothing = Right Nothing
+parseDeriver storeDir (Just txt)
+  | txt == unknownDeriverSentinel = Right Nothing
+  | otherwise = case parseStorePathBaseName txt of
+      Just sp -> Right (Just (T.pack (storePathToFilePath storeDir sp)))
+      Nothing -> Left ("malformed narinfo deriver: " <> txt)
 
 -- ---------------------------------------------------------------------------
 -- NAR unpacking

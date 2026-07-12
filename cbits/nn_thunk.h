@@ -163,6 +163,12 @@ void    *nn_thunk_get_lambda(const nn_thunk_t *thunk);
  * Returns 1 on success, 0 if thunk is not PENDING. */
 int nn_thunk_mark_blackhole(nn_thunk_t *thunk);
 
+/* Transition BLACKHOLE -> PENDING (a force threw and was caught upstream).
+ * Payload + bc_idx are preserved, so the thunk is re-forceable; matches C++
+ * Nix restoring a thunk after a caught exception during force.
+ * Returns 1 on success, 0 if thunk is not BLACKHOLE. */
+int nn_thunk_mark_pending(nn_thunk_t *thunk);
+
 /* Set a non-COMPUTED thunk to COMPUTED with a StablePtr value (NN_VALUE_PTR).
  * Accepts PENDING or BLACKHOLE state (skips blackhole for direct memoization).
  * Returns the old payload (pending StablePtr for caller to free).

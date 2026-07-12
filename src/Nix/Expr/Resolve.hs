@@ -54,10 +54,13 @@ resolve stack expr = case expr of
             innerStack = scope : stack
          in EAttrs True (concatMap (resolveLetBinding stack innerStack) bindings) NoCaptureInfo
     | otherwise ->
-        -- Fallback: dynamic keys or nested paths - use NameBarrier.
+        -- Fallback: dynamic keys or nested paths - use NameBarrier.  Bindings
+        -- resolve against newStack (siblings visible), but a plain @inherit x@
+        -- must reference the OUTER scope - resolveLetBinding handles that, so
+        -- the barrier does not turn @inherit x@ into a self-reference.
         let names = collectBindingNames bindings
             newStack = NameBarrier names : stack
-         in EAttrs True (concatMap (resolveBinding newStack) bindings) NoCaptureInfo
+         in EAttrs True (concatMap (resolveLetBinding stack newStack) bindings) NoCaptureInfo
   EAttrs False bindings _captureInfo ->
     -- Non-recursive: bindings use the outer scope.
     EAttrs False (concatMap (resolveBinding stack) bindings) NoCaptureInfo
@@ -78,10 +81,12 @@ resolve stack expr = case expr of
             innerStack = scope : stack
          in ELet (concatMap (resolveLetBinding stack innerStack) bindings) (resolve innerStack body) NoCaptureInfo
     | otherwise ->
-        -- Fallback: dynamic keys or nested paths - use NameBarrier.
+        -- Fallback: dynamic keys or nested paths - use NameBarrier.  As above,
+        -- resolveLetBinding resolves a plain @inherit x@ against the outer scope
+        -- so the barrier does not make @x@ self-referential.
         let names = collectBindingNames bindings
             newStack = NameBarrier names : stack
-         in ELet (concatMap (resolveBinding newStack) bindings) (resolve newStack body) NoCaptureInfo
+         in ELet (concatMap (resolveLetBinding stack newStack) bindings) (resolve newStack body) NoCaptureInfo
   EIf c t f -> EIf (resolve stack c) (resolve stack t) (resolve stack f)
   EWithVar _ -> expr
   EWith scope body ->
@@ -207,14 +212,16 @@ lexicalScopeFromBindings bindings =
     -- Unreachable: allStaticSingleKey guards this path.
     bindingNames _ = []
 
--- | Resolve bindings in a let\/rec block that uses positional resolution.
--- Takes two stacks: @outerStack@ (before the let scope) and @innerStack@
--- (with the let's 'LexicalScope' pushed).
+-- | Resolve bindings in a let\/rec block, for both the positional
+-- ('LexicalScope') and fallback ('NameBarrier') paths.  Takes two stacks:
+-- @outerStack@ (before the block) and @innerStack@ (with the block's scope
+-- entry pushed).
 --
 -- Regular bindings resolve their RHS against @innerStack@ (recursive).
--- @inherit x@ desugars to @x = x@ where the RHS resolves against
--- @outerStack@ - the inherited name must reference the enclosing scope,
--- not the let scope being defined.
+-- @inherit x@ desugars to @x = x@ where the RHS resolves against @outerStack@:
+-- the inherited name must reference the enclosing scope, not the block being
+-- defined - otherwise the pushed scope\/barrier makes @x@ a self-reference and
+-- forcing it recurses forever.
 resolveLetBinding :: [ScopeEntry] -> [ScopeEntry] -> Binding -> [Binding]
 resolveLetBinding _ innerStack (NamedBinding path bodyExpr) =
   [NamedBinding (map (resolveKey innerStack) path) (resolve innerStack bodyExpr)]
