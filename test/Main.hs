@@ -350,7 +350,22 @@ testEvalComparison = do
       runTest "int gte" $
         assertEval "gte" "3 >= 3" (VBool True),
       runTest "string compare" $
-        assertEval "str-lt" "\"abc\" < \"def\"" (VBool True)
+        assertEval "str-lt" "\"abc\" < \"def\"" (VBool True),
+      -- <= and >= are negated swapped <, so NaN compares as upstream:
+      -- nan <= x and nan >= x are true while nan < x and nan == nan are
+      -- false ((1.0e308 * 10) * 0.0 is inf * 0.0, i.e. nan).
+      runTest "nan lte is true" $
+        assertEval "nan-lte" "let nan = (1.0e308 * 10) * 0.0; in nan <= 1.0" (VBool True),
+      runTest "nan gte is true" $
+        assertEval "nan-gte" "let nan = (1.0e308 * 10) * 0.0; in nan >= 1.0" (VBool True),
+      runTest "nan lt is false" $
+        assertEval "nan-lt" "let nan = (1.0e308 * 10) * 0.0; in nan < 1.0" (VBool False),
+      runTest "nan self-equality is false" $
+        assertEval "nan-eq" "let nan = (1.0e308 * 10) * 0.0; in nan == nan" (VBool False),
+      runTest "lte on equal lists" $
+        assertEval "list-lte-eq" "[ 1 2 ] <= [ 1 2 ]" (VBool True),
+      runTest "lte incomparable types fails" $
+        assertEvalFail "lte-err" "1 <= \"a\""
     ]
 
 -- ---------------------------------------------------------------------------
@@ -644,6 +659,13 @@ testEvalBuiltins = do
         assertEval "esc-drop-str" "\"a\\qb\" == \"aqb\"" (VBool True),
       runTest "unknown escape drops backslash (indented string)" $
         assertEval "esc-drop-ind" "''a''\\qb'' == \"aqb\"" (VBool True),
+      -- Indented-string escapes are opaque to indentation stripping: an
+      -- escaped newline is content, not a line break, so text after it
+      -- is not at line start and the column scan does not reset.
+      runTest "escaped newline does not strip following text" $
+        assertEval "ind-esc-nl-strip" "''  a''\\n  b'' == \"a\\n  b\"" (VBool True),
+      runTest "escaped newline does not lower common indent" $
+        assertEval "ind-esc-nl-indent" "''\n    x''\\n y\n    z'' == \"x\\n y\\nz\"" (VBool True),
       runTest "toString int" $
         assertEval "toStr" "builtins.toString 42" (mkStr "42")
     ]
@@ -820,6 +842,16 @@ testLexer = do
       runTest "trailing-dot float with exponent lexes as one float token" $
         assertRight "lex trailing-dot-exp" (tokenize "<test>" "12.e2") $ \toks ->
           assertEqual "tokens" [TokFloat 1200.0] (tokenTypes toks),
+      -- Float literals convert with a single rounding (strtod semantics).
+      -- The exact value here sits between representable ..992 and ..994,
+      -- nearer ..994; rounding whole and fraction separately lands on ..992.
+      runTest "float literal rounds once at the 2^53 boundary" $
+        assertRight "lex float-tie" (tokenize "<test>" "9007199254740993.5") $ \toks ->
+          assertEqual "tokens" [TokFloat 9007199254740994.0] (tokenTypes toks),
+      -- A float 10 ^^ exponent overflows on subnormals and flushes to 0.
+      runTest "subnormal float literal survives" $
+        assertRight "lex float-subnormal" (tokenize "<test>" "1.0e-320") $ \toks ->
+          assertEqual "tokens" [TokFloat 1.0e-320] (tokenTypes toks),
       runTest "true" $
         assertRight "lex true" (tokenize "<test>" "true") $ \toks ->
           assertEqual "tokens" [TokTrue] (tokenTypes toks),
@@ -1442,6 +1474,21 @@ testBatch3 = do
         assertEval "funcArgs-simple" "builtins.functionArgs (x: x)" (VAttrs (attrSetFromMap Map.empty)),
       runTest "functionArgs type error" $
         assertEvalFail "funcArgs-err" "builtins.functionArgs 42",
+      -- The builtins set is observable (hasAttr/attrNames), so it must
+      -- match upstream's primop set exactly: no mod/min/max/
+      -- setFunctionArgs extensions (nixpkgs lib defines those in Nix),
+      -- and functionArgs never consults __functionArgs - a functor set
+      -- is an error, as upstream throws (lib.functionArgs unwraps
+      -- functor sets itself before reaching the builtin).
+      runTest "no invented arithmetic builtins" $
+        assertEval
+          "no-fake-builtins"
+          "!(builtins ? mod) && !(builtins ? min) && !(builtins ? max) && !(builtins ? setFunctionArgs)"
+          (VBool True),
+      runTest "functionArgs rejects functor sets" $
+        assertEvalFail
+          "funcArgs-functor-err"
+          "builtins.functionArgs { __functor = self: x: x; __functionArgs = { a = false; }; }",
       -- zipAttrsWith
       runTest "zipAttrsWith basic" $
         assertEval
@@ -2379,6 +2426,17 @@ testDrvContext = do
           "getCtx-drvPath"
           (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ctx = builtins.getContext d.drvPath; in builtins.length (builtins.attrNames ctx)")
         $ \val -> assertEqual "one-entry" (VInt 1) val,
+      -- getContext keys are identity: canonical /nix/store spelling on
+      -- every platform, never the platform file-path mapping.
+      runTest "getContext key is canonical store path"
+        $ assertRight
+          "getCtx-canonical"
+          (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in builtins.elemAt (builtins.attrNames (builtins.getContext d.drvPath)) 0")
+        $ \val -> case val of
+          VStr key _
+            | "/nix/store/" `T.isPrefixOf` key && not ("\\" `T.isInfixOf` key) -> Pass
+            | otherwise -> Fail ("expected a canonical /nix/store key, got " <> key)
+          _ -> Fail ("expected VStr, got " <> T.pack (show val)),
       -- appendContext: adds context to plain string
       runTest "appendContext adds context" $
         assertEval
@@ -4852,6 +4910,34 @@ testPhase4IO = do
   removeDirectoryRecursive testDir
   pure results
 
+-- | @builtins.toJSON@ of a path uses copy-to-store coercion (upstream
+-- value-to-json.cc serializes paths with @copyToStore = true@): the JSON
+-- text is the quoted source store path and the result carries its
+-- context.  EvalIO-only: PureEval has no store-path computation.
+testToJSONPathIO :: IO [Bool]
+testToJSONPathIO = do
+  putStrLn "eval/tojson-path-io"
+  tmpDir <- getTemporaryDirectory
+  let testDir = tmpDir </> "nova-nix-tojson-path-test"
+  createDirectoryIfMissing True testDir
+  TIO.writeFile (testDir </> "data.txt") "payload\n"
+  results <-
+    sequence
+      [ runTestM "toJSON of a path is its quoted store path with context" $ do
+          result <- evalNixIO testDir "builtins.toJSON ./data.txt"
+          pure $ case result of
+            Right (VStr json ctx) ->
+              if "\"/nix/store/" `T.isPrefixOf` json
+                && "-data.txt\"" `T.isSuffixOf` json
+                && ctx /= emptyContext
+                then Pass
+                else Fail ("expected a quoted store path with context, got " <> json)
+            Right other -> Fail ("expected VStr, got " <> T.pack (show other))
+            Left err -> Fail ("eval error: " <> err)
+      ]
+  removeDirectoryRecursive testDir
+  pure results
+
 -- ---------------------------------------------------------------------------
 -- Symbol interning (C FFI)
 -- ---------------------------------------------------------------------------
@@ -5869,6 +5955,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testE2E,
           testPhase4,
           testPhase4IO,
+          testToJSONPathIO,
           testSymbol,
           testCAttrSet,
           testCThunk,

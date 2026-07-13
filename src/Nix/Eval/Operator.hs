@@ -47,15 +47,13 @@ evalBinary forceFn op left right = case op of
   OpEq -> VBool <$> nixEqual forceFn left right
   OpNeq -> VBool . not <$> nixEqual forceFn left right
   OpLt -> VBool <$> nixCompare forceFn left right
-  OpLte -> do
-    lt <- nixCompare forceFn left right
-    eq <- nixEqual forceFn left right
-    pure (VBool (lt || eq))
+  -- <= and >= are negated swapped <, never (< or ==): upstream's parser
+  -- desugars them that way (parser.y: a <= b becomes !(b < a)), which
+  -- fixes NaN (nan <= x is true), matches the swapped operand order in
+  -- incomparable-type errors, and needs one comparison instead of two.
+  OpLte -> VBool . not <$> nixCompare forceFn right left
   OpGt -> VBool <$> nixCompare forceFn right left
-  OpGte -> do
-    gt <- nixCompare forceFn right left
-    eq <- nixEqual forceFn left right
-    pure (VBool (gt || eq))
+  OpGte -> VBool . not <$> nixCompare forceFn left right
   OpConcat -> evalConcat left right
   OpUpdate -> evalUpdate left right
   -- Short-circuit ops must be handled by the caller

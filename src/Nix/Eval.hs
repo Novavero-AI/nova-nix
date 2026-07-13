@@ -161,7 +161,7 @@ import Nix.Expr.Types
     UnaryOp (..),
   )
 import Nix.Hash (bytesToHexText, hashPlaceholder, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex)
-import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText)
+import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.NAR as NAR
@@ -1124,16 +1124,12 @@ builtinRegistry =
       builtin2 "sub" builtinSub,
       builtin2 "mul" builtinMul,
       builtin2 "div" builtinDiv,
-      builtin2 "mod" builtinMod,
       builtin2 "bitAnd" builtinBitAnd,
       builtin2 "bitOr" builtinBitOr,
       builtin2 "bitXor" builtinBitXor,
-      builtin2 "min" builtinMin,
-      builtin2 "max" builtinMax,
       -- Attr set higher-order
       builtin2 "mapAttrs" builtinMapAttrs,
       builtin1 "functionArgs" builtinFunctionArgs,
-      builtin2 "setFunctionArgs" builtinSetFunctionArgs,
       builtin2 "zipAttrsWith" builtinZipAttrsWith,
       -- String manipulation
       builtin2 "match" builtinMatch,
@@ -1343,16 +1339,12 @@ executeBuiltin name args = case name of
   "sub" -> apply2 builtinSub
   "mul" -> apply2 builtinMul
   "div" -> apply2 builtinDiv
-  "mod" -> apply2 builtinMod
   "bitAnd" -> apply2 builtinBitAnd
   "bitOr" -> apply2 builtinBitOr
   "bitXor" -> apply2 builtinBitXor
-  "min" -> apply2 builtinMin
-  "max" -> apply2 builtinMax
   -- Attr set higher-order
   "mapAttrs" -> apply2 builtinMapAttrs
   "functionArgs" -> apply1 builtinFunctionArgs
-  "setFunctionArgs" -> apply2 builtinSetFunctionArgs
   "zipAttrsWith" -> apply2 builtinZipAttrsWith
   -- String manipulation
   "match" -> apply2 builtinMatch
@@ -1963,11 +1955,7 @@ coerceToStringPermissive other = coerceToString True force applyValue other
 -- string context so it lands in the derivation's @inputSrcs@ - matching C++
 -- Nix's copy-to-store coercion of paths in derivation arguments/environment.
 coerceToStoreString :: (MonadEval m) => NixValue -> m (Text, StringContext)
-coerceToStoreString (VPath p) = do
-  spText <- storeSourcePath p
-  case parseStorePath defaultStoreDir spText of
-    Just sp -> pure (spText, StringContext (Set.singleton (SCPlain sp)))
-    Nothing -> pure (spText, mempty)
+coerceToStoreString (VPath p) = sourcePathWithContext p
 coerceToStoreString (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   parts <- mapM (force >=> coerceToStoreString) thunks
@@ -1979,12 +1967,18 @@ coerceToStoreString other = coerceToStringPermissive other
 -- its source store path (with context) - matching C++ Nix, where interpolation
 -- uses @copyToStore = true@, unlike 'builtins.toString', which does not copy.
 coerceToStringInterp :: (MonadEval m) => NixValue -> m (Text, StringContext)
-coerceToStringInterp (VPath p) = do
+coerceToStringInterp (VPath p) = sourcePathWithContext p
+coerceToStringInterp other = coerceToString False force applyValue other
+
+-- | The store path a source path literal coerces to, carrying its
+-- SCPlain context - the copy-to-store coercion shared by interpolation,
+-- derivation arguments/env values, and @builtins.toJSON@.
+sourcePathWithContext :: (MonadEval m) => Text -> m (Text, StringContext)
+sourcePathWithContext p = do
   spText <- storeSourcePath p
   case parseStorePath defaultStoreDir spText of
     Just sp -> pure (spText, StringContext (Set.singleton (SCPlain sp)))
     Nothing -> pure (spText, mempty)
-coerceToStringInterp other = coerceToString False force applyValue other
 
 -- | The current system platform string.
 currentSystemStr :: Text
@@ -2077,8 +2071,9 @@ groupContextByPath = foldl' addElement Map.empty
         (cePath new || cePath old)
         (ceAllOutputs new || ceAllOutputs old)
         (ceOutputs new ++ ceOutputs old)
-    spToText sp =
-      T.pack (storePathToFilePath defaultStoreDir sp)
+    -- Context keys are identity, not IO: always the canonical /nix/store
+    -- spelling, never the platform file-path mapping.
+    spToText = storePathToText defaultStoreDir
 
 -- | Convert a ContextEntry to an attrset thunk.
 contextEntryToAttrs :: ContextEntry -> Thunk
@@ -2229,23 +2224,6 @@ builtinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromIntegral b))
 builtinDiv (VFloat a) (VFloat b) = pure (VFloat (a / b))
 builtinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
-builtinMod :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMod _ (VInt 0) = throwEvalError "builtins.mod: division by zero"
-builtinMod (VInt a) (VInt b)
-  | a == minBound && b == -1 = pure (VInt 0)
-  | otherwise = pure (VInt (rem a b))
-builtinMod l r = throwEvalError ("builtins.mod: expected two integers, got " <> typeName l <> " and " <> typeName r)
-
-builtinMin :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMin a b = do
-  aIsLess <- nixCompare force a b
-  pure (if aIsLess then a else b)
-
-builtinMax :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMax a b = do
-  aIsLess <- nixCompare force a b
-  pure (if aIsLess then b else a)
-
 builtinBitAnd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinBitAnd (VInt a) (VInt b) = pure (VInt (a .&. b))
 builtinBitAnd _ _ = throwEvalError "builtins.bitAnd: expected two integers"
@@ -2283,12 +2261,12 @@ mapAttrsExpr :: Expr
 mapAttrsExpr = EApp (EApp (EResolvedVar 0 0) (EResolvedVar 0 1)) (EResolvedVar 0 2)
 {-# NOINLINE mapAttrsExpr #-}
 
+-- | Formals for lambdas, an empty set for builtins, an error otherwise -
+-- including functor sets: upstream's primop never consults
+-- @__functionArgs@ (nixpkgs lib.functionArgs handles that in Nix).
 builtinFunctionArgs :: (MonadEval m) => NixValue -> m NixValue
 builtinFunctionArgs (VLambda _ formals _) = pure (formalsToAttrs formals)
 builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs (attrSetFromMap Map.empty))
--- Callable sets with __functionArgs metadata (from setFunctionArgs).
-builtinFunctionArgs (VAttrs attrs)
-  | Just faThunk <- attrSetLookup "__functionArgs" attrs = force faThunk
 builtinFunctionArgs other =
   throwEvalError ("builtins.functionArgs: expected a function, got " <> typeName other)
 
@@ -2303,31 +2281,6 @@ formalsListToAttrs formals =
     attrSetFromMap $
       Map.fromList
         [(efName f, evaluated (VBool (isJust (efDefault f)))) | f <- formals]
-
--- | @builtins.setFunctionArgs f args@ - wraps @f@ in a callable attrset
--- with @__functor@ (so it remains callable) and @__functionArgs@ metadata.
--- Used by nixpkgs @lib.mirrorFunctionArgs@ / @lib.makeOverridable@.
---
--- @__functor@ is @self: f@ - a lambda that ignores @self@ and returns
--- the original function.  The function is captured in the closure env.
-builtinSetFunctionArgs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinSetFunctionArgs func (VAttrs argSpec) =
-  -- Closure env holds the function at slot 0.  The __functor lambda
-  -- body is EResolvedVar 1 0: level 1 (past _self's slot), index 0.
-  let (sp, sc) = buildCSlots [evaluated func]
-      closureEnv = newMinimalEnv sp sc
-      bodyBcIdx = unsafePerformIO (compileExpr (EResolvedVar 1 0))
-      -- __functor = self: __fn  (ignores self, returns the original function)
-      functorLambda = VLambda closureEnv (EFName "_self") bodyBcIdx
-   in pure $
-        VAttrs $
-          attrSetFromMap $
-            Map.fromList
-              [ ("__functor", evaluated functorLambda),
-                ("__functionArgs", evaluated (VAttrs argSpec))
-              ]
-builtinSetFunctionArgs func args =
-  throwEvalError ("builtins.setFunctionArgs: expected a set as second argument, got " <> typeName args <> " (func: " <> typeName func <> ")")
 
 builtinZipAttrsWith :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinZipAttrsWith func (VList cl) = do
@@ -2720,7 +2673,12 @@ valueToJSON (VAttrs attrs) =
         val <- force thunk
         (jsonVal, ctx) <- valueToJSON val
         pure (jsonEscapeString key <> ":" <> jsonVal, ctx)
-valueToJSON (VPath p) = pure (jsonEscapeString p, emptyContext)
+-- A path serializes as its source store path, with context - the same
+-- copy-to-store coercion as interpolation (upstream value-to-json.cc
+-- serializes paths with copyToStore = true).
+valueToJSON (VPath p) = do
+  (spText, ctx) <- sourcePathWithContext p
+  pure (jsonEscapeString spText, ctx)
 valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VDerivation _) = throwEvalError "builtins.toJSON: cannot convert a derivation to JSON"
