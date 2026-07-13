@@ -203,8 +203,8 @@ mkNarInfo sp narHash narSize refs deriver =
     { niStorePath = storePathToText defaultStoreDir sp,
       niUrl = narDirSegment <> "/" <> narFileName narHash,
       niCompression = compressionNone,
-      niFileHash = narHash,
-      niFileSize = fromIntegral narSize,
+      niFileHash = Just narHash,
+      niFileSize = Just (fromIntegral narSize),
       niNarHash = narHash,
       niNarSize = fromIntegral narSize,
       niReferences = sort (map storePathBasename refs),
@@ -261,11 +261,13 @@ newPushManager =
   HTTP.newManager
     HTTPS.tlsManagerSettings {HTTP.managerResponseTimeout = HTTP.responseTimeoutNone}
 
--- | Fetch the set of narinfo hashes the cache already stores.
+-- | Fetch the set of narinfo hashes the cache already stores.  The
+-- endpoint is push-tool plumbing and the server requires the write key
+-- for it (nova-cache 0.5), so the request authenticates like the PUTs.
 fetchRemoteHashes :: HTTP.Manager -> PushConfig -> ExceptT Text IO (Set Text)
 fetchRemoteHashes manager cfg = do
   let url = pcCacheUrl cfg <> "/" <> narinfoHashesEndpoint
-  response <- httpRequest manager "GET" url [] Nothing
+  response <- httpRequest manager "GET" url (authHeaders cfg) Nothing
   let code = HTTP.statusCode (HTTP.responseStatus response)
   unless (code == httpStatusOk) $
     throwError ("GET " <> narinfoHashesEndpoint <> " returned HTTP " <> T.pack (show code))

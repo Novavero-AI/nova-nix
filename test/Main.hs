@@ -2768,8 +2768,8 @@ testSubstituter = do
         { NarInfo.niStorePath = "/nix/store/" <> sampleHash <> "-hello",
           NarInfo.niUrl = "nar/sample.nar",
           NarInfo.niCompression = "none",
-          NarInfo.niFileHash = sampleNarHash,
-          NarInfo.niFileSize = 0,
+          NarInfo.niFileHash = Just sampleNarHash,
+          NarInfo.niFileSize = Just 0,
           NarInfo.niNarHash = narHash,
           NarInfo.niNarSize = fromIntegral (BS.length sampleNarBytes),
           NarInfo.niReferences = [],
@@ -3090,7 +3090,7 @@ testPushPure = do
       runTest "compression none mirrors NAR fields into file fields" $
         assertEqual
           "file fields"
-          ("none", NarInfo.niNarHash ni, NarInfo.niNarSize ni)
+          ("none", Just (NarInfo.niNarHash ni), Just (NarInfo.niNarSize ni))
           (NarInfo.niCompression ni, NarInfo.niFileHash ni, NarInfo.niFileSize ni),
       runTest "narinfo sizes carry through" $
         assertEqual "NarSize" 1234 (NarInfo.niNarSize ni),
@@ -5700,8 +5700,8 @@ sigTestNarInfo =
     { NarInfo.niStorePath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0",
       NarInfo.niUrl = "nar/aaaa.nar",
       NarInfo.niCompression = "none",
-      NarInfo.niFileHash = "sha256:" <> T.replicate 52 "0",
-      NarInfo.niFileSize = 1,
+      NarInfo.niFileHash = Just ("sha256:" <> T.replicate 52 "0"),
+      NarInfo.niFileSize = Just 1,
       NarInfo.niNarHash = "sha256:" <> T.replicate 52 "0",
       NarInfo.niNarSize = 1,
       NarInfo.niReferences = [],
