@@ -49,6 +49,7 @@ module Nix.Store.Path
   )
 where
 
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.FilePath ((</>))
@@ -125,7 +126,13 @@ parseStorePath (StoreDir dir) path =
 
 -- | Parse a store path basename like @abc...-name@ - the form narinfo
 -- @References@ and @Deriver@ fields carry on the wire - into a
--- 'StorePath': 32-char hash, dash, non-empty name.
+-- 'StorePath': 32 nix-base32 hash chars, dash, valid non-empty name.
+--
+-- Both components are charset-checked, as upstream does at its parse
+-- boundary: parsed text can come from a cache, and an unchecked
+-- component (separators, dots, drive colons in the hash or name slot)
+-- would later become a filesystem path via 'storePathToFilePath' that
+-- escapes the store root.
 parseStorePathBaseName :: Text -> Maybe StorePath
 parseStorePathBaseName basename
   | T.length basename < storePathHashLen + 2 = Nothing
@@ -134,5 +141,38 @@ parseStorePathBaseName basename
           afterHash = T.drop storePathHashLen basename
        in case T.uncons afterHash of
             Just ('-', name)
-              | not (T.null name) -> Just (StorePath hashPart name)
+              | T.all isNixBase32Char hashPart && validStorePathName name ->
+                  Just (StorePath hashPart name)
             _ -> Nothing
+
+-- | The nix-base32 alphabet: @0-9a-z@ without @e o u t@ (chosen upstream
+-- to avoid accidental words).  Hash components may contain nothing else.
+isNixBase32Char :: Char -> Bool
+isNixBase32Char c =
+  isDigit c
+    || (isAsciiLower c && c /= 'e' && c /= 'o' && c /= 'u' && c /= 't')
+
+-- | Upstream's store path name rules: 1-211 characters from
+-- @[A-Za-z0-9+._?=-]@, and not the directory-traversal names @.@ / @..@.
+validStorePathName :: Text -> Bool
+validStorePathName name =
+  not (T.null name)
+    && T.length name <= maxStorePathNameLen
+    && name /= "."
+    && name /= ".."
+    && T.all isStorePathNameChar name
+  where
+    isStorePathNameChar c =
+      isAsciiLower c
+        || isAsciiUpper c
+        || isDigit c
+        || c == '+'
+        || c == '.'
+        || c == '_'
+        || c == '?'
+        || c == '='
+        || c == '-'
+
+-- | Upstream's maximum store path name length.
+maxStorePathNameLen :: Int
+maxStorePathNameLen = 211

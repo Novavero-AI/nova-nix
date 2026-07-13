@@ -44,7 +44,9 @@ module Nix.Substituter
     tryCachesWith,
     verifySigs,
     verifyNarHash,
+    verifyNarSize,
     narInfoMatchesPath,
+    decompressorFor,
     decompressNar,
     unpackNarEntry,
     clearStaleDestination,
@@ -68,7 +70,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Store (Store (..), setReadOnly)
-import Nix.Store.DB (PathRegistration (..), registerPath)
+import Nix.Store.DB (PathRegistration (..))
 import Nix.Store.Path (StoreDir, StorePath (..), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
@@ -104,8 +106,11 @@ defaultCacheConfig =
 
 -- | Result of a substitution attempt.
 data SubstResult
-  = -- | Successfully substituted - path is now in the store.
-    SubstSuccess !StorePath
+  = -- | Verified and unpacked on disk, NOT yet registered: the carried
+    -- registration is recorded by the caller, which batches every output
+    -- of a derivation into one 'registerPaths' transaction so
+    -- cross-output reference edges are never dropped.
+    SubstSuccess !PathRegistration
   | -- | Cache doesn't have this path.
     SubstNotFound
   | -- | Download or verification failed.
@@ -121,6 +126,10 @@ data SubstResult
 -- Checks each cache in priority order.  Returns on first success; a
 -- failing cache falls through to the remaining ones.  Uses nova-cache
 -- library for narinfo parsing, NAR unpacking, and signature verification.
+--
+-- On success the path is unpacked and read-only on disk but NOT
+-- registered - the caller records the returned 'PathRegistration'
+-- (see 'SubstSuccess').
 trySubstitute :: Store -> [CacheConfig] -> StorePath -> IO SubstResult
 trySubstitute _ [] _ = pure SubstNotFound
 trySubstitute store caches sp = do
@@ -186,10 +195,13 @@ substituteFromCache mgr store cache sp = do
               narBytes <- fetchDecompress
               case narBytes of
                 Left err -> pure (SubstError err)
-                Right rawNar -> unpackAndRegister store sp narInfo rawNar
+                Right rawNar -> unpackAndVerify store sp narInfo rawNar
 
--- | Pure pipeline: verify signature, then produce an IO action
--- that downloads and decompresses.
+-- | Pure pipeline: verify signature and resolve the decompressor, then
+-- produce an IO action that downloads and decompresses.  Unsupported
+-- compression rejects HERE, before the action runs: the value is known
+-- from the narinfo, and a multi-hundred-MB download that can only fail
+-- in decompression is pure waste.
 verifyAndDecompress ::
   CacheConfig ->
   HTTP.Manager ->
@@ -197,22 +209,23 @@ verifyAndDecompress ::
   Either Text (IO (Either Text BS.ByteString))
 verifyAndDecompress cache mgr narInfo = do
   verifySigs cache narInfo
-  let compression = NarInfo.niCompression narInfo
+  decompress <- decompressorFor (NarInfo.niCompression narInfo)
   pure $ do
     downloaded <- downloadNarWithRetry mgr cache narInfo
-    pure $ downloaded >>= decompressNar compression
+    pure $ downloaded >>= decompress
 
--- | Verify the NAR hash, deserialize, unpack to the store, set permissions,
--- and register.
-unpackAndRegister :: Store -> StorePath -> NarInfo.NarInfo -> BS.ByteString -> IO SubstResult
-unpackAndRegister store sp narInfo rawNar =
+-- | Verify the NAR hash and size, deserialize, unpack to the store, and set
+-- permissions.  Returns the path's registration for the caller to record;
+-- no database write happens here (see 'SubstSuccess').
+unpackAndVerify :: Store -> StorePath -> NarInfo.NarInfo -> BS.ByteString -> IO SubstResult
+unpackAndVerify store sp narInfo rawNar =
   -- Verify the downloaded NAR's hash matches the (signed) narinfo BEFORE
   -- trusting its bytes.  The NAR hash is the content-addressed integrity
   -- contract; the signature only attests to the narinfo, not the body, so
   -- network corruption or a compromised cache must be caught here.
   -- Narinfo metadata is likewise parsed before any disk write: a malformed
   -- narinfo must not leave an unpacked-but-unregistered path behind.
-  case verifyNarHash narInfo rawNar >> registrationMeta of
+  case verifyNarHash narInfo rawNar >> verifyNarSize narInfo rawNar >> registrationMeta of
     Left err -> pure (SubstError err)
     Right (refs, deriver) -> case NAR.deserialise rawNar of
       Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
@@ -226,16 +239,18 @@ unpackAndRegister store sp narInfo rawNar =
           Right (Left err) -> pure (SubstError ("unpack failed: " <> err))
           Right (Right ()) -> do
             setReadOnly destPath
-            registerPath
-              (stDB store)
-              PathRegistration
-                { prPath = sp,
-                  prNarHash = NarInfo.niNarHash narInfo,
-                  prNarSize = fromInteger (NarInfo.niNarSize narInfo),
-                  prDeriver = deriver,
-                  prReferences = refs
-                }
-            pure (SubstSuccess sp)
+            pure $
+              SubstSuccess
+                PathRegistration
+                  { prPath = sp,
+                    prNarHash = NarInfo.niNarHash narInfo,
+                    -- The verified actual byte count (equal to the declared
+                    -- NarSize per 'verifyNarSize') - no Integer conversion
+                    -- that could wrap.
+                    prNarSize = BS.length rawNar,
+                    prDeriver = deriver,
+                    prReferences = refs
+                  }
   where
     registrationMeta = do
       refs <- parseReferences (NarInfo.niReferences narInfo)
@@ -260,6 +275,22 @@ verifyNarHash narInfo rawNar =
             )
   where
     actual = Hash.hashBytes rawNar
+
+-- | Verify that the downloaded NAR's byte count equals the narinfo's
+-- declared NarSize.  The hash check pins the content, but the size is a
+-- separate signed claim that flows into the store DB (and from there
+-- into re-pushed narinfos), so a wrong declaration must be rejected
+-- rather than recorded.
+verifyNarSize :: NarInfo.NarInfo -> BS.ByteString -> Either Text ()
+verifyNarSize narInfo rawNar
+  | toInteger (BS.length rawNar) == NarInfo.niNarSize narInfo = Right ()
+  | otherwise =
+      Left
+        ( "NAR size mismatch: narinfo declares "
+            <> T.pack (show (NarInfo.niNarSize narInfo))
+            <> " bytes but downloaded "
+            <> T.pack (show (BS.length rawNar))
+        )
 
 -- | Whether a served narinfo describes the requested path: the hash component
 -- of its declared StorePath must equal the requested path's hash.  Only the
@@ -297,8 +328,11 @@ fetchNarInfo mgr cache sp = do
   request <- HTTP.parseRequest url
   response <- HTTP.httpLbs request mgr
   let code = HTTP.statusCode (HTTP.responseStatus response)
+  -- Lenient decode: the body is cache-controlled bytes, and a stray
+  -- invalid UTF-8 sequence must surface as a narinfo parse error, not an
+  -- impure UnicodeException (the push side decodes the same way).
   if code == httpOk
-    then case NarInfo.parseNarInfo (TE.decodeUtf8 (LBS.toStrict (HTTP.responseBody response))) of
+    then case NarInfo.parseNarInfo (TE.decodeUtf8Lenient (LBS.toStrict (HTTP.responseBody response))) of
       Left err -> pure (Left (SubstError ("narinfo parse error: " <> T.pack err)))
       Right ni -> pure (Right ni)
     else
@@ -378,15 +412,20 @@ verifySigs cache narInfo =
                 then Right ()
                 else Left "no valid signature found"
 
--- | Decompress NAR data based on the compression type from narinfo.
---
--- Currently supports @\"none\"@ (raw NAR) and @\"\"@ (empty = no compression).
--- XZ decompression requires enabling the @compression@ flag in nova-cache.
-decompressNar :: Text -> BS.ByteString -> Either Text BS.ByteString
-decompressNar compression narData
-  | compression == "none" || T.null compression = Right narData
-  | compression == "xz" = Left "xz decompression not yet available (enable nova-cache compression flag)"
+-- | The decompressor for a narinfo @Compression@ value, decided from the
+-- value alone so unsupported compression rejects before any download.
+-- Currently @\"none\"@ and @\"\"@ (identity); xz returns with the
+-- foreign-cache substitution feature.
+decompressorFor :: Text -> Either Text (BS.ByteString -> Either Text BS.ByteString)
+decompressorFor compression
+  | compression == "none" || T.null compression = Right Right
+  | compression == "xz" = Left "xz decompression not yet available"
   | otherwise = Left ("unsupported compression: " <> compression)
+
+-- | Decompress NAR data based on the compression type from narinfo.
+-- Support is decided by 'decompressorFor'; this applies the result.
+decompressNar :: Text -> BS.ByteString -> Either Text BS.ByteString
+decompressNar compression narData = decompressorFor compression >>= ($ narData)
 
 -- | Parse narinfo references (store path basenames, e.g.
 -- @abc...-glibc-2.40@) into StorePaths.  A malformed token is an error,
@@ -419,11 +458,12 @@ parseDeriver storeDir (Just txt)
 -- ---------------------------------------------------------------------------
 
 -- | Remove a leftover destination tree before unpacking.  A crash (or a
--- failed registration) between 'setReadOnly' and 'registerPath' leaves a
--- read-only, unregistered tree; unpacking over it would then fail with
--- permission-denied on every retry, permanently wedging substitution of
--- that path.  'Dir.removePathForcibly' clears read-only marks and accepts
--- a missing path, so the fresh unpack always starts from a clean slate.
+-- failed registration) between 'setReadOnly' here and the caller's
+-- 'Nix.Store.DB.registerPaths' leaves a read-only, unregistered tree;
+-- unpacking over it would then fail with permission-denied on every
+-- retry, permanently wedging substitution of that path.
+-- 'Dir.removePathForcibly' clears read-only marks and accepts a missing
+-- path, so the fresh unpack always starts from a clean slate.
 clearStaleDestination :: FilePath -> IO ()
 clearStaleDestination = Dir.removePathForcibly
 

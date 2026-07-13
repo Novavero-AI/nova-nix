@@ -47,6 +47,7 @@ module Nix.Store.DB
   )
 where
 
+import Control.Exception (throwIO)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Database.SQLite.Simple
@@ -193,13 +194,26 @@ insertPathRow db reg = do
     (pathText, prNarHash reg, prDeriver reg, prNarSize reg)
 
 -- | Insert the reference edges for a path whose row already exists.
+--
+-- Re-registration REPLACES the edge set: the metadata-refresh contract
+-- (see 'registerPaths') applies to references too, and keeping the union
+-- of old and new edges would over-report - 'queryReferences' feeds pushed
+-- narinfos, which would advertise references the path no longer has.
+--
+-- A reference to an unregistered path is an error, not a skip: silently
+-- dropping the edge under-reports the same narinfos and hands a future GC
+-- permission to delete a live dependency.  Referents must be registered
+-- first or in the same 'registerPaths' batch (path rows are all inserted
+-- before any edge).
 insertPathRefs :: StoreDB -> PathRegistration -> IO ()
 insertPathRefs db reg = do
   let conn = sdbConn db
       pathText = T.pack (storePathToFilePath (sdbDir db) (prPath reg))
   referrerRows <- query conn "SELECT id FROM ValidPaths WHERE path = ?" (Only pathText) :: IO [Only Int]
   case referrerRows of
-    (Only referrerId : _) -> mapM_ (insertRef conn referrerId) (prReferences reg)
+    (Only referrerId : _) -> do
+      execute conn "DELETE FROM Refs WHERE referrer = ?" (Only referrerId)
+      mapM_ (insertRef conn referrerId) (prReferences reg)
     [] -> pure () -- Should not happen: the row was just inserted above.
   where
     insertRef conn referrerId refPath = do
@@ -208,7 +222,15 @@ insertPathRefs db reg = do
       case refRows of
         (Only refId : _) ->
           execute conn "INSERT OR IGNORE INTO Refs (referrer, reference) VALUES (?, ?)" (referrerId, refId)
-        [] -> pure () -- Reference not in this batch or the store yet - skip.
+        [] ->
+          throwIO
+            ( userError
+                ( "registerPaths: "
+                    <> storePathToFilePath (sdbDir db) (prPath reg)
+                    <> " references unregistered path "
+                    <> T.unpack refPathText
+                )
+            )
 
 -- ---------------------------------------------------------------------------
 -- Queries

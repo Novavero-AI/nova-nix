@@ -2616,6 +2616,27 @@ testSubstituter = do
       -- sortCaches: empty list
       runTest "sortCaches empty" $
         assertEqual "empty-sort" [] (Subst.sortCaches []),
+      -- decompressorFor decides support from the narinfo value alone,
+      -- so unsupported compression rejects before any NAR download.
+      runTest "decompressorFor rejects xz up front" $
+        case Subst.decompressorFor "xz" of
+          Left _ -> Pass
+          Right _ -> Fail "expected xz to be rejected before download",
+      runTest "decompressorFor none is identity" $
+        case Subst.decompressorFor "none" of
+          Right decompress -> assertEqual "identity" (Right "bytes") (decompress "bytes")
+          Left err -> Fail ("expected none to be supported, got: " <> err),
+      -- verifyNarSize: the declared NarSize is a signed claim that flows
+      -- into the store DB, so it must equal the downloaded byte count.
+      runTest "verifyNarSize accepts matching size" $
+        assertEqual
+          "narsize-match"
+          (Right ())
+          (Subst.verifyNarSize ((sampleNarInfo sampleNarHash) {NarInfo.niNarSize = toInteger (BS.length sampleNarBytes)}) sampleNarBytes),
+      runTest "verifyNarSize rejects mismatched size" $
+        case Subst.verifyNarSize ((sampleNarInfo sampleNarHash) {NarInfo.niNarSize = toInteger (BS.length sampleNarBytes) + 1}) sampleNarBytes of
+          Left err | "size mismatch" `T.isInfixOf` err -> Pass
+          other -> Fail ("expected size mismatch, got: " <> T.pack (show other)),
       -- decompressNar: "none" passes through
       runTest "decompressNar none" $
         let input = "fake nar data"
@@ -2703,7 +2724,7 @@ testSubstituter = do
       -- are never contacted)
       runTestM "tryCachesWith success stops scan" $ do
         calls <- newIORef (0 :: Int)
-        let hit = StorePath (T.replicate 32 "d") "hit"
+        let hit = PathRegistration (StorePath (T.replicate 32 "d") "hit") "sha256:d" 1 Nothing []
             attempt cache = do
               atomicModifyIORef' calls (\n -> (n + 1, ()))
               pure $
@@ -2719,7 +2740,7 @@ testSubstituter = do
       -- tryCachesWith: an erroring cache falls through to a later hit
       -- instead of aborting the chain
       runTestM "tryCachesWith error falls through to next cache" $ do
-        let hit = StorePath (T.replicate 32 "e") "hit"
+        let hit = PathRegistration (StorePath (T.replicate 32 "f") "hit") "sha256:f" 1 Nothing []
             attempt cache
               | Subst.ccUrl cache == "https://a" = pure (Subst.SubstError "transient 500")
               | otherwise = pure (Subst.SubstSuccess hit)
@@ -3023,10 +3044,45 @@ testStoreDB = do
             if hasRef1 && hasRef2
               then Pass
               else Fail ("expected refs to contain both deps, got: " <> T.pack (show refs)),
+        -- Re-registration replaces the edge set: the refresh contract
+        -- covers references too, and a union would over-report into
+        -- pushed narinfos.
+        runTestM "db re-register replaces refs" $ do
+          db <- openStoreDB storeDir
+          let refA = StorePath "gggggggggggggggggggggggggggggggg" "refresh-a"
+              refB = StorePath "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh" "refresh-b"
+              sp = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "refresh-main"
+          registerPaths
+            db
+            [ PathRegistration refA "sha256:ra" 10 Nothing [],
+              PathRegistration refB "sha256:rb" 11 Nothing [],
+              PathRegistration sp "sha256:rm" 12 Nothing [refA, refB]
+            ]
+          registerPath db (PathRegistration sp "sha256:rm" 12 Nothing [refA])
+          refs <- queryReferences db sp
+          closeStoreDB db
+          let refAPath = T.pack (storePathToFilePath storeDir refA)
+              refBPath = T.pack (storePathToFilePath storeDir refB)
+          pure $
+            if refAPath `elem` refs && refBPath `notElem` refs
+              then Pass
+              else Fail ("expected only refresh-a after re-register, got: " <> T.pack (show refs)),
+        -- A reference to an unregistered path is a loud error: a silently
+        -- dropped edge under-reports narinfos and hands a future GC
+        -- permission to delete a live dependency.
+        runTestM "db register with unregistered ref throws" $ do
+          db <- openStoreDB storeDir
+          let ghost = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "ghost"
+              sp = StorePath "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk" "orphan-edge"
+          outcome <- try (registerPath db (PathRegistration sp "sha256:oe" 13 Nothing [ghost]))
+          closeStoreDB db
+          pure $ case (outcome :: Either SomeException ()) of
+            Left _ -> Pass
+            Right () -> Fail "expected registration to throw on an unregistered reference",
         -- queryDeriver nothing
         runTestM "db queryDeriver nothing" $ do
           db <- openStoreDB storeDir
-          let sp = StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "noderiver"
+          let sp = StorePath "cccccccccccccccccccccccccccccccc" "noderiver"
           registerPath db (PathRegistration sp "sha256:nd" 80 Nothing [])
           result <- queryDeriver db sp
           closeStoreDB db
@@ -3123,7 +3179,26 @@ testParseStorePath = do
         assertEqual
           "windows-backslash"
           (Just (StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "pkg"))
-          (parseStorePath windowsStoreDir "C:\\nix\\store\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg")
+          (parseStorePath windowsStoreDir "C:\\nix\\store\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg"),
+      -- Charset gates (upstream's parse-boundary checks): the hash slot
+      -- accepts only nix-base32 (no e o u t), and the name only
+      -- [A-Za-z0-9+._?=-] - parsed text can come from a cache, and an
+      -- unchecked component would later become a filesystem path.
+      runTest "parse rejects non-base32 hash" $
+        assertEqual "e-hash" Nothing (parseStorePath sd ("/nix/store/" <> T.replicate 32 "e" <> "-hello")),
+      runTest "parse rejects traversal text in hash slot" $
+        assertEqual "traversal-hash" Nothing (parseStorePath sd ("/nix/store/" <> T.replicate 16 ".\\" <> "-x")),
+      runTest "parse rejects separator in name" $
+        assertEqual "sep-name" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-he/llo"),
+      runTest "parse rejects dot-dot name" $
+        assertEqual "dotdot-name" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.."),
+      runTest "parse rejects overlong name" $
+        assertEqual "overlong-name" Nothing (parseStorePath sd ("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-" <> T.replicate 212 "x")),
+      runTest "parse accepts the full name charset" $
+        assertEqual
+          "name-specials"
+          (Just (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "gcc-13.2.0_pre+x?="))
+          (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gcc-13.2.0_pre+x?=")
     ]
 
 -- ---------------------------------------------------------------------------
@@ -4156,7 +4231,23 @@ testStoreOps = do
   withTempStore $ \store -> do
     let sd = stDir store
     sequence
-      [ -- scanReferences finds the canonical /nix/store text eval injects
+      [ -- computeClosure emits references before referrers (deps-first):
+        -- phase-2 narinfo publication then never announces a path whose
+        -- references are not yet visible.  The dep is shared by both
+        -- roots and must precede both.
+        runTestM "computeClosure orders references first" $ do
+          let dep = StorePath "llllllllllllllllllllllllllllllll" "cl-dep"
+              p1 = StorePath "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm" "cl-p1"
+              p2 = StorePath "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn" "cl-p2"
+          registerPaths
+            (stDB store)
+            [ PathRegistration dep "sha256:cd" 1 Nothing [],
+              PathRegistration p1 "sha256:c1" 2 Nothing [dep],
+              PathRegistration p2 "sha256:c2" 3 Nothing [dep]
+            ]
+          result <- computeClosure store [p1, p2]
+          pure (assertEqual "closure order" (Right [dep, p1, p2]) result),
+        -- scanReferences finds the canonical /nix/store text eval injects
         -- into builder envs, independent of the platform store dir (the
         -- bare hash is the needle, matching upstream Nix).
         runTestM "scanReferences finds canonical ref" $ do
@@ -4338,7 +4429,10 @@ complexTestDrv =
         ],
       drvInputDrvs =
         Map.fromList
-          [ (StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "dep1.drv", ["out"]),
+          -- Hash fixtures stay inside the nix-base32 alphabet (no e o u t):
+          -- fromATerm parses these through parseStorePath, which now
+          -- charset-checks the hash component.
+          [ (StorePath "cccccccccccccccccccccccccccccccc" "dep1.drv", ["out"]),
             (StorePath "ffffffffffffffffffffffffffffffff" "dep2.drv", ["lib", "out"])
           ],
       drvInputSrcs = [StorePath "gggggggggggggggggggggggggggggggg" "source.tar.gz"],
@@ -4347,7 +4441,7 @@ complexTestDrv =
       drvArgs = ["-e", "build.sh"],
       drvEnv =
         Map.fromList
-          [ ("buildInputs", "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-dep1"),
+          [ ("buildInputs", "/nix/store/cccccccccccccccccccccccccccccccc-dep1"),
             ("name", "pkg-2.0"),
             ("out", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-pkg-2.0"),
             ("system", "aarch64-darwin")
@@ -4576,13 +4670,38 @@ testBuilder = do
         pure $ case result of
           BuildFailure _ code -> if code == 42 then Pass else Fail ("expected code 42, got " <> T.pack (show code))
           BuildSuccess _ -> Fail "expected failure",
+      -- A builder that THROWS (nonexistent executable) must not leak the
+      -- deterministic build dir: stale contents would fake an archive
+      -- collision on the next builtin:unpack run of the same drv.
+      runTestM "crashed build removes its build dir" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-leak"
+            tmpBuild = tmpBase </> "nova-nix-test-builder-leak-tmp"
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists tmpBuild
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "pppppppppppppppppppppppppppppppp" "leaktest"
+            drv = mkTestBuildDrv (T.pack (tmpBase </> "no-such-builder.exe")) outSP "unused"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBuild}
+        result <- buildDerivation config store drv
+        leftovers <- do
+          exists <- doesDirectoryExist tmpBuild
+          if exists then Dir.listDirectory tmpBuild else pure []
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists tmpBuild
+        pure $ case result of
+          BuildFailure _ _
+            | null leftovers -> Pass
+            | otherwise -> Fail ("build dir leaked: " <> T.pack (show leftovers))
+          BuildSuccess _ -> Fail "expected failure for a nonexistent builder",
       -- Output at expected path
       runTestM "output at expected store path" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder5"
         forceRemoveIfExists tmpStore
         store <- openStore (StoreDir tmpStore)
-        let outSP = StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "pathtest"
+        let outSP = StorePath "cccccccccccccccccccccccccccccccc" "pathtest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/marker"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder5-tmp"}
         result <- buildDerivation config store drv

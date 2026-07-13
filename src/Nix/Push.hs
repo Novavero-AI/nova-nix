@@ -50,7 +50,7 @@ module Nix.Push
 where
 
 import Control.Exception (SomeException, try)
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
@@ -158,20 +158,24 @@ loadApiKeyFile path = do
 -- ---------------------------------------------------------------------------
 
 -- | Compute the full reference closure of the given paths from the store
--- database (breadth-first over @Refs@).  Fails if a recorded reference does
--- not parse as a store path - that would mean a corrupt database, and
--- pushing a closure with holes would poison the cache.
+-- database, in reverse-topological order: every path's references precede
+-- it (postorder over @Refs@; a self-reference or already-visited path is
+-- skipped).  Publishing narinfos in this order never announces a path
+-- whose references are not yet visible.  Fails if a recorded reference
+-- does not parse as a store path - that would mean a corrupt database,
+-- and pushing a closure with holes would poison the cache.
 computeClosure :: Store -> [StorePath] -> IO (Either Text [StorePath])
-computeClosure store roots = runExceptT (go Set.empty [] roots)
+computeClosure store roots =
+  runExceptT (reverse . snd <$> foldM visit (Set.empty, []) roots)
   where
-    go :: Set Text -> [StorePath] -> [StorePath] -> ExceptT Text IO [StorePath]
-    go _ acc [] = pure (reverse acc)
-    go seen acc (sp : rest)
-      | spHash sp `Set.member` seen = go seen acc rest
+    visit :: (Set Text, [StorePath]) -> StorePath -> ExceptT Text IO (Set Text, [StorePath])
+    visit (seen, acc) sp
+      | spHash sp `Set.member` seen = pure (seen, acc)
       | otherwise = do
           refTexts <- liftIO (queryReferences (stDB store) sp)
           refs <- liftEither (traverse parseRef refTexts)
-          go (Set.insert (spHash sp) seen) (sp : acc) (refs ++ rest)
+          (seenAfterRefs, accAfterRefs) <- foldM visit (Set.insert (spHash sp) seen, acc) refs
+          pure (seenAfterRefs, sp : accAfterRefs)
     parseRef txt = case parseStorePath (stDir store) txt of
       Just sp -> Right sp
       Nothing -> Left ("unparseable reference in store DB: " <> txt)
@@ -250,7 +254,9 @@ pushPaths cfg store roots = do
       pairs <- forM missing $ \sp -> do
         narInfo <- uploadNar manager cfg store sp
         pure (sp, narInfo)
-      -- Phase 2: narinfos, only after every NAR is in place.
+      -- Phase 2: narinfos, only after every NAR is in place, in the
+      -- closure's deps-first order: a freshly announced path's references
+      -- are always already announced.
       forM_ pairs $ \(sp, narInfo) -> do
         uploadNarInfo manager cfg sp narInfo
         logLine ("[push]  " <> storePathBasename sp)
