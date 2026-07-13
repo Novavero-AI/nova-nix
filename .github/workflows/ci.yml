@@ -128,5 +128,14 @@ jobs:
       - name: Build
         run: cabal build --enable-tests --ghc-options="-Werror"
 
+      # Eval-time store writes materialize at /nix by design; the runner
+      # lacks it, so the store-writing eval tests would skip.  Provisioning
+      # it keeps that coverage real on Linux.  (macOS cannot: / is a sealed
+      # read-only volume, and the synthetic.conf dance is not worth it for
+      # a test fixture - those tests skip loudly there.)
+      - name: Provision the store root (Linux)
+        if: runner.os == 'Linux'
+        run: sudo mkdir -p /nix && sudo chown "$USER" /nix
+
       - name: Test
         run: cabal test

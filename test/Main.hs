@@ -1689,12 +1689,34 @@ testBlackholeRecoveryIO = do
         "builtins.tryEval (let y = y; in y)"
     ]
 
+-- | Whether this machine can materialize eval outputs at the platform
+-- store root (eval-time store writes resolve there by design).  Absent
+-- and uncreatable - macOS's sealed read-only /, a root-owned /nix on a
+-- Nix-installed Linux box - the store-writing eval tests skip loudly
+-- rather than fail on machines that cannot host a store.  Linux CI
+-- provisions /nix so coverage stays real there.
+storeRootAvailable :: IO Bool
+storeRootAvailable = do
+  outcome <- try (createDirectoryIfMissing True (T.unpack platformStoreDirText))
+  case outcome of
+    Left (_ :: SomeException) -> pure False
+    Right () -> writable <$> getPermissions (T.unpack platformStoreDirText)
+
 -- | builtins.path/filterSource with a filter: the tree is serialized with
 -- rejected entries removed (a rejected directory prunes its subtree),
 -- content-addressed over the FILTERED NAR, and materialized to the store.
 testPathFilterIO :: IO [Bool]
 testPathFilterIO = do
   putStrLn "eval/path-filter-io"
+  usableStore <- storeRootAvailable
+  if not usableStore
+    then do
+      putStrLn "  SKIP  platform store root unavailable; cannot materialize eval outputs here"
+      pure []
+    else testPathFilterBody
+
+testPathFilterBody :: IO [Bool]
+testPathFilterBody = do
   tmpBase <- getTemporaryDirectory
   let srcDir = tmpBase </> "nova-nix-test-path-filter"
   removeIfExists srcDir
