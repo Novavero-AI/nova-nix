@@ -89,6 +89,41 @@ jobs:
         run: cabal check
 
   # ---------------------------------------------------------------------------
+  # Build from the sdist, exactly as a Hackage user does (Linux-only).
+  # CI otherwise builds the git tree, where cabal.project and dev-only
+  # settings apply; the tarball is what users install, and divergence
+  # (files missing from the sdist, constraints that only exist in-repo)
+  # is invisible without this job.
+  # ---------------------------------------------------------------------------
+
+  sdist:
+    name: Build from sdist
+    needs: [cabal-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: "9.8"
+          cabal-version: "latest"
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-sdist-${{ hashFiles('nova-nix.cabal') }}
+          restore-keys: cabal-sdist-
+
+      - name: Build the tarball a Hackage user gets
+        run: |
+          cabal sdist -o "$RUNNER_TEMP/sdist"
+          tar -xzf "$RUNNER_TEMP"/sdist/nova-nix-*.tar.gz -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"/nova-nix-*/
+          cabal build --enable-tests
+
+  # ---------------------------------------------------------------------------
   # Build + Test (cross-platform matrix)
   # ---------------------------------------------------------------------------
 
