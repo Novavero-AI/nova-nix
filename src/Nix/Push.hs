@@ -45,6 +45,7 @@ module Nix.Push
     narFileName,
     stripHashPrefix,
     storePathBasename,
+    checkRecordedNarHash,
   )
 where
 
@@ -280,21 +281,8 @@ uploadNar manager cfg store sp = do
   let narBytes = NAR.serialise narEntry
       narHash = Hash.formatNixHash (Hash.hashBytes narBytes)
       narSize = BS.length narBytes
-  -- The database recorded this path's NAR hash at registration; a mismatch
-  -- now means the path changed on disk - refuse to publish corruption.
   recorded <- liftIO (queryPathInfo (stDB store) sp)
-  case recorded of
-    Just info
-      | DB.piNarHash info /= narHash ->
-          throwError
-            ( "store integrity: "
-                <> storePathBasename sp
-                <> " hashes to "
-                <> narHash
-                <> " but the DB recorded "
-                <> DB.piNarHash info
-            )
-    _ -> pure ()
+  liftEither (checkRecordedNarHash recorded narHash sp)
   refTexts <- liftIO (queryReferences (stDB store) sp)
   refs <- liftEither (traverse (parseRefText store) refTexts)
   deriverText <- liftIO (queryDeriver (stDB store) sp)
@@ -311,6 +299,32 @@ uploadNar manager cfg store sp = do
   response <- httpRequest manager "PUT" url (authHeaders cfg) (Just narBytes)
   expectOk ("PUT " <> niUrl narInfo) response
   pure narInfo
+
+-- | Pre-upload integrity gate.  The store DB recorded the path's NAR hash
+-- at registration; a mismatch now means the path changed on disk - refuse
+-- to publish corruption.  An on-disk path with NO registration (an
+-- interrupted build) is refused too: its references are unknown, so
+-- publishing would fabricate an empty-reference narinfo and serve a
+-- closure with holes.
+checkRecordedNarHash :: Maybe DB.PathInfo -> Text -> StorePath -> Either Text ()
+checkRecordedNarHash recorded narHash sp = case recorded of
+  Nothing ->
+    Left
+      ( "store integrity: "
+          <> storePathBasename sp
+          <> " is on disk but not registered as valid; refusing to publish it with unknown references"
+      )
+  Just info
+    | DB.piNarHash info /= narHash ->
+        Left
+          ( "store integrity: "
+              <> storePathBasename sp
+              <> " hashes to "
+              <> narHash
+              <> " but the DB recorded "
+              <> DB.piNarHash info
+          )
+    | otherwise -> Right ()
 
 -- | Upload a rendered narinfo (the server validates and signs it).
 uploadNarInfo :: HTTP.Manager -> PushConfig -> StorePath -> NarInfo -> ExceptT Text IO ()

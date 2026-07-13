@@ -57,6 +57,7 @@ module Nix.Eval.Types
     lookupWithScopes,
     withScopesForCapture,
     envWithScopesRaw,
+    checkedEnvPtr,
     newCEnv,
     newMinimalEnv,
 
@@ -485,28 +486,38 @@ instance Show Env where
 emptyEnv :: Env
 emptyEnv = Env (unsafePerformIO cenvEmpty)
 
+-- | Fail loudly when a C env constructor returns NULL (arena OOM or the
+-- with-scope count limit).  The C side signals failure deliberately;
+-- deferring the NULL to the next lookup would be undefined behavior in a
+-- release build, so convert it into a clean Haskell exception here.
+checkedEnvPtr :: String -> Ptr NnEnv -> Ptr NnEnv
+checkedEnvPtr site ptr
+  | ptr == nullPtr = error (site ++ ": C env allocation failed (arena OOM or with-scope limit)")
+  | otherwise = ptr
+
 -- | General C-backed env constructor.
 -- Takes Haskell-level types; converts Maybe to nullPtr internally.
 {-# NOINLINE newCEnv #-}
 newCEnv :: Ptr CThunkPtr -> Int -> Maybe AttrSet -> Maybe Env -> Ptr (Ptr ()) -> Word16 -> Env
 newCEnv slots slotCount lazyScope parent withs withCount =
   Env
-    ( unsafePerformIO
-        ( cenvNew
-            slots
-            (fromIntegral slotCount)
-            (case lazyScope of Nothing -> nullPtr; Just (AttrSet cset) -> castPtr cset)
-            (case parent of Nothing -> nullPtr; Just (Env p) -> p)
-            withs
-            withCount
-        )
+    ( checkedEnvPtr "newCEnv" $
+        unsafePerformIO
+          ( cenvNew
+              slots
+              (fromIntegral slotCount)
+              (case lazyScope of Nothing -> nullPtr; Just (AttrSet cset) -> castPtr cset)
+              (case parent of Nothing -> nullPtr; Just (Env p) -> p)
+              withs
+              withCount
+          )
     )
 
 -- | Minimal env: slots only, no parent, no with-scopes, no lazy scope.
 {-# NOINLINE newMinimalEnv #-}
 newMinimalEnv :: Ptr CThunkPtr -> Int -> Env
 newMinimalEnv slots n =
-  Env (unsafePerformIO (cenvNewMinimal slots (fromIntegral n)))
+  Env (checkedEnvPtr "newMinimalEnv" (unsafePerformIO (cenvNewMinimal slots (fromIntegral n))))
 
 -- | Look up a resolved variable by level and index.  Single C call:
 -- O(level) parent hops in C, then O(1) array read.
@@ -542,9 +553,10 @@ envLookup name (Env envPtr) = lexicalLookup envPtr
 -- | Walk with-scopes (C array) innermost to outermost.
 -- Skips tagged lazy entries (bit 0 set) - those are thunk pointers
 -- that can only be resolved by 'evalWithVarScopes' which has monadic
--- 'force'.  This is a safety guard: currently unreachable because
--- 'resolveVars' ensures EVar behind a with-scope always becomes
--- EWithVar, but protects against future changes.
+-- 'force'.  Defensive: an 'EVar' under a with is either a lexical
+-- (barrier) binding or a static global, both found on the parent chain
+-- before this fallback fires ('EVar' also blocks closure trimming, so
+-- the chain is always intact) - but keep it for safety.
 lookupWithScopesC :: Text -> Ptr (Ptr ()) -> Word16 -> Maybe Thunk
 lookupWithScopesC _ _ 0 = Nothing
 lookupWithScopesC name withArr count = unsafePerformIO $ go 0
@@ -572,14 +584,14 @@ lookupWithScopes name (scope : rest) =
 {-# NOINLINE envFromSlots #-}
 envFromSlots :: Ptr CThunkPtr -> Int -> Env -> Env
 envFromSlots slotsPtr slotCount (Env parentPtr) =
-  Env (unsafePerformIO (cenvFromSlots slotsPtr (fromIntegral slotCount) parentPtr))
+  Env (checkedEnvPtr "envFromSlots" (unsafePerformIO (cenvFromSlots slotsPtr (fromIntegral slotCount) parentPtr)))
 
 -- | Push a with-scope onto the scope chain (innermost position).
 -- Allocates a new C env struct with extended with-scopes array.
 {-# NOINLINE pushWithScope #-}
 pushWithScope :: AttrSet -> Env -> Env
 pushWithScope (AttrSet cset) (Env envPtr) =
-  Env (unsafePerformIO (cenvPushWith envPtr (castPtr cset)))
+  Env (checkedEnvPtr "pushWithScope" (unsafePerformIO (cenvPushWith envPtr (castPtr cset))))
 
 -- | Read with-scopes array pointer and count from a C env.
 {-# NOINLINE envWithScopesRaw #-}
@@ -1042,12 +1054,22 @@ typeName val = case val of
 -- so the same evaluator composes into 'PureEval' for tests or @IO@ for
 -- real file-system access (e.g. @import@, @readFile@).
 class (Monad m) => MonadEval m where
+  -- | Raise an evaluation error (type error, missing attribute, IO
+  -- failure).  NOT caught by @builtins.tryEval@: upstream Nix catches only
+  -- ThrownError\/AssertionError there, and every other EvalError escapes.
   throwEvalError :: Text -> m a
+
+  -- | Raise a catchable error - @builtins.throw@ and a failed @assert@.
+  -- These are the only errors 'catchEvalError' (tryEval) recovers from.
+  throwCatchableError :: Text -> m a
 
   -- | Abort evaluation (uncatchable by tryEval, matching real Nix).
   abortEvaluation :: Text -> m a
 
+  -- | tryEval semantics: recover from a 'throwCatchableError'
+  -- (throw\/assert); eval errors and aborts propagate.
   catchEvalError :: m a -> m (Either Text a)
+
   readFileText :: Text -> m Text
   doesPathExist :: Text -> m Bool
 
@@ -1064,8 +1086,12 @@ class (Monad m) => MonadEval m where
   -- | Get the current epoch time (seconds since 1970-01-01).
   getCurrentTime :: m Int64
 
-  -- | Write a named file to the store, returning the store path.
-  writeToStore :: Text -> Text -> m Text
+  -- | Write a named text file to the store at upstream's text-path
+  -- (@text:\<refs\>@ scheme, flat sha256 of the contents), returning the
+  -- canonical store path.  The refs are the contents' plain store-path
+  -- references; they participate in the path computation exactly as
+  -- upstream's addTextToStore.
+  writeToStore :: Text -> Text -> [StorePath] -> m Text
 
   -- | Import a file with a custom scope overlaid on builtins.
   scopedImportFile :: [(Text, Thunk)] -> Text -> m NixValue
@@ -1087,9 +1113,26 @@ class (Monad m) => MonadEval m where
   -- closures remain valid after the import scope ends.
   resolvePathLiteral :: Text -> m Text
 
-  -- | Copy a path (file or directory) to the store, returning the store path.
-  -- First argument is the source path, second is the store name.
-  copyPathToStore :: Text -> Text -> m Text
+  -- | Copy a path (file or directory) to the store, returning the store
+  -- path.  Content-addressed like upstream addToStore: recursive NAR
+  -- sha256 under the given name.  Arguments: source path, store name,
+  -- and an optional sha256 pin as (error subject, expected digest): a
+  -- digest mismatch fails the copy with the subject heading the message.
+  -- @builtins.path@ and @builtins.fetchTarball@ share this pin.
+  copyPathToStore :: Text -> Text -> Maybe (Text, ByteString) -> m Text
+
+  -- | Whether a regular file carries the executable bit (NAR encodes it).
+  isExecutableFile :: Text -> m Bool
+
+  -- | Read a symlink's target WITHOUT following it.
+  readSymlinkTarget :: Text -> m Text
+
+  -- | Unpack a serialized NAR into the store under the given name at its
+  -- canonical recursive fixed-output path (sha256 of the bytes),
+  -- returning the store path text.  Used by @builtins.path@ and
+  -- @builtins.filterSource@ with a filter, whose filtered tree exists
+  -- only as a NAR value and never on the source filesystem.
+  addSourceNar :: Text -> ByteString -> m Text
 
   -- | Write raw bytes to the store at a canonical flat fixed-output path
   -- (@makeFixedOutputPath name "sha256" "flat"@), so a hash-pinned fetch lands
@@ -1130,9 +1173,11 @@ class (Monad m) => MonadEval m where
   -- argument or environment value.  Unavailable in pure evaluation.
   storeSourcePath :: Text -> m Text
 
--- | Error raised during pure evaluation.  'PAbort' (from @abort@ and infinite
--- recursion) must escape 'tryEval' exactly as in C++ Nix; 'PThrow' is catchable.
-data PureError = PThrow !Text | PAbort !Text
+-- | Error raised during pure evaluation.  'PThrow' (@builtins.throw@, a
+-- failed @assert@) is the only kind 'tryEval' catches; 'PError' (type
+-- errors, missing attributes) and 'PAbort' (@abort@, infinite recursion)
+-- escape it, exactly as in C++ Nix.
+data PureError = PThrow !Text | PError !Text | PAbort !Text
 
 -- | Pure evaluation monad - wraps @Either PureError@.
 -- IO builtins ('readFile', 'import') are unavailable;
@@ -1145,18 +1190,20 @@ newtype PureEval a = PureEval (Either PureError a)
 runPureEval :: PureEval a -> Either Text a
 runPureEval (PureEval (Right a)) = Right a
 runPureEval (PureEval (Left (PThrow t))) = Left t
+runPureEval (PureEval (Left (PError t))) = Left t
 runPureEval (PureEval (Left (PAbort t))) = Left ("evaluation aborted: " <> t)
 
 instance MonadEval PureEval where
-  throwEvalError msg = PureEval (Left (PThrow msg))
+  throwEvalError msg = PureEval (Left (PError msg))
+  throwCatchableError msg = PureEval (Left (PThrow msg))
   abortEvaluation msg = PureEval (Left (PAbort msg))
 
-  -- Catch a throw (tryEval sees the error), but let an abort / infinite
-  -- recursion propagate past tryEval, matching EvalIO and C++ Nix.
+  -- Catch only a throw/assert (tryEval sees the error); eval errors,
+  -- aborts, and infinite recursion propagate, matching EvalIO and C++ Nix.
   catchEvalError (PureEval action) =
     PureEval $ case action of
       Left (PThrow t) -> Right (Left t)
-      Left (PAbort t) -> Left (PAbort t)
+      Left other -> Left other
       Right a -> Right (Right a)
   readFileText _ = throwEvalError "readFile: not available in pure evaluation"
   doesPathExist _ = pure False
@@ -1164,12 +1211,15 @@ instance MonadEval PureEval where
   importFile _ = throwEvalError "import: not available in pure evaluation"
   getEnvVar _ = pure ""
   getCurrentTime = pure 0
-  writeToStore _ _ = throwEvalError "toFile: not available in pure evaluation"
+  writeToStore _ _ _ = throwEvalError "toFile: not available in pure evaluation"
   scopedImportFile _ _ = throwEvalError "scopedImport: not available in pure evaluation"
   readFileBytes _ = throwEvalError "hashFile: not available in pure evaluation"
   getFileType _ = throwEvalError "readFileType: not available in pure evaluation"
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
-  copyPathToStore _ _ = throwEvalError "builtins.path: not available in pure evaluation"
+  copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in pure evaluation"
+  isExecutableFile _ = throwEvalError "builtins.path: not available in pure evaluation"
+  readSymlinkTarget _ = throwEvalError "builtins.path: not available in pure evaluation"
+  addSourceNar _ _ = throwEvalError "builtins.path: not available in pure evaluation"
   addFixedOutputFile _ _ = throwEvalError "builtins.fetchurl: not available in pure evaluation"
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing

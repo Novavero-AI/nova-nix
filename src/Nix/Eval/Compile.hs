@@ -181,7 +181,8 @@ compileExpr = go
     compileStringParts op parts = do
       compiled <- mapM compileOnePart parts
       dataOff <- emitPairs compiled
-      cbcEmit op 0 (fi (length parts)) dataOff 0 0
+      partCount <- countArg "string with parts" (length parts)
+      cbcEmit op 0 partCount dataOff 0 0
 
     compileOnePart :: StringPart -> IO (Word32, Word32)
     compileOnePart (StrLit t) = do
@@ -199,7 +200,8 @@ compileExpr = go
     compileAttrs isRec bindings captureInfo = do
       dataOff <- compileBindings bindings
       capOff <- compileCaptureInfo captureInfo
-      cbcEmit OpAttrs (if isRec then 1 else 0) (fi (length bindings)) dataOff capOff 0
+      bindingCount <- countArg "attribute set with bindings" (length bindings)
+      cbcEmit OpAttrs (if isRec then 1 else 0) bindingCount dataOff capOff 0
 
     -- -----------------------------------------------------------------
     -- Lists (EList)
@@ -209,7 +211,8 @@ compileExpr = go
     compileList exprs = do
       childIndices <- mapM go exprs
       dataOff <- emitWordList childIndices
-      cbcEmit OpList 0 (fi (length exprs)) dataOff 0 0
+      elemCount <- countArg "list with elements" (length exprs)
+      cbcEmit OpList 0 elemCount dataOff 0 0
 
     -- -----------------------------------------------------------------
     -- Select / HasAttr
@@ -235,7 +238,8 @@ compileExpr = go
     compileAttrPath path = do
       compiled <- mapM compileAttrKey path
       off <- emitPairs compiled
-      pure (off, fi (length path))
+      pathLen <- countArg "attribute path with segments" (length path)
+      pure (off, pathLen)
 
     compileAttrKey :: AttrKey -> IO (Word32, Word32)
     compileAttrKey (StaticKey name) = do
@@ -293,7 +297,8 @@ compileExpr = go
       bodyIdx <- go body
       dataOff <- compileBindings bindings
       capOff <- compileCaptureInfo captureInfo
-      cbcEmit OpLet 0 (fi (length bindings)) dataOff bodyIdx capOff
+      bindingCount <- countArg "let with bindings" (length bindings)
+      cbcEmit OpLet 0 bindingCount dataOff bodyIdx capOff
 
     -- -----------------------------------------------------------------
     -- Bindings (shared by EAttrs and ELet)
@@ -410,6 +415,15 @@ compileExpr = go
       off <- cbcEmitData x
       mapM_ cbcEmitData xs
       pure off
+
+    -- \| Convert an element count into the bytecode's 16-bit short_arg,
+    -- failing loudly on overflow: a silent Word16 truncation once made a
+    -- 70000-element list literal report length 4464.
+    countArg :: String -> Int -> IO Word16
+    countArg what n
+      | n > fromIntegral (maxBound :: Word16) =
+          ioError (userError ("compile: " <> what <> " exceeding the bytecode limit of 65535 (got " <> show n <> ")"))
+      | otherwise = pure (fromIntegral n)
 
     -- \| @fromIntegral@ shorthand.
     fi :: (Integral a, Num b) => a -> b

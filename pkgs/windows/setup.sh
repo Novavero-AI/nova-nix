@@ -37,6 +37,11 @@ toBash() {
 # For each buildInput, make its headers and libraries visible to the compiler.
 # The mingw gcc is a native tool, so -I/-L take C:/ "mixed" paths, while its bin
 # goes on PATH in the bash drive-mounted form.
+# Start from EMPTY flag sets: host-inherited CPPFLAGS/LDFLAGS would inject
+# ambient -I/-L directories ahead of the declared buildInputs, silently
+# leaking undeclared dependencies into every configure/make line.
+CPPFLAGS=""
+LDFLAGS=""
 for dep in $buildInputs; do
   depWin="$(cygpath -m "$(toBash "$dep")")"
   CPPFLAGS="$CPPFLAGS -I$depWin/include"
@@ -138,14 +143,25 @@ isSystemDll() {
 }
 
 bundleDlls() {
-  local bindir="$1" changed bin needed found dir
+  local bindir="$1" changed bin needed found dir imports
   [ -d "$bindir" ] || return 0
+  # A missing or broken objdump must FAIL the fixup, not read as "this
+  # binary has no imports" - that would silently register an output
+  # missing its bundled DLLs.
+  command -v objdump >/dev/null 2>&1 || {
+    echo "fixup: objdump not found; cannot scan DLL imports" >&2
+    exit 1
+  }
   changed=1
   while [ "$changed" = 1 ]; do
     changed=0
     for bin in "$bindir"/*.exe "$bindir"/*.dll; do
       [ -e "$bin" ] || continue
-      for needed in $(objdump -p "$bin" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p'); do
+      imports="$(objdump -p "$bin")" || {
+        echo "fixup: objdump failed on $bin" >&2
+        exit 1
+      }
+      for needed in $(printf '%s\n' "$imports" | sed -n 's/^[[:space:]]*DLL Name: //p'); do
         isSystemDll "$needed" && continue
         [ -e "$bindir/$needed" ] && continue
         found=0

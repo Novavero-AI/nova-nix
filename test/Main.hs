@@ -1,15 +1,18 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main (main) where
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
-import Control.Exception (bracket_)
+import Control.Exception (SomeException, bracket_, try)
 import Control.Monad (filterM, void, when)
+import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Set as Set
@@ -19,7 +22,7 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig)
+import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig, verifyFetchHash)
 import Nix.Builder.Unpack (builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
@@ -34,17 +37,21 @@ import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
 import Nix.Eval.Types (emptyCList)
+import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
 import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
-import Nix.Push (computeClosure, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathExists, scanReferences, setReadOnly, writeDrv)
+import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
+import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
+import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as CHash
+import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
+import qualified NovaCache.Signing as Signing
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
@@ -69,10 +76,15 @@ runTest name result = case result of
     pure False
 
 -- | Like 'runTest' but for tests that need IO to produce their result.
+-- An exception escaping the action becomes one FAIL line instead of
+-- aborting the whole suite (which would skip every later group and its
+-- cleanup).
 runTestM :: Text -> IO TestResult -> IO Bool
 runTestM name action = do
-  result <- action
-  runTest name result
+  outcome <- try action
+  runTest name $ case outcome of
+    Left (e :: SomeException) -> Fail ("uncaught exception: " <> T.pack (show e))
+    Right result -> result
 
 assertEqual :: (Eq a, Show a) => Text -> a -> a -> TestResult
 assertEqual label expected actual
@@ -104,11 +116,16 @@ assertParse label source expected =
 tokenTypes :: [Located] -> [Token]
 tokenTypes = filter (/= TokEOF) . map locToken
 
--- | Helper: parse Nix source and evaluate with builtinEnv.
+-- | Helper: parse Nix source and evaluate with builtinEnv.  Parse errors
+-- are tagged so failure assertions can tell them apart from eval errors.
 evalNix :: Text -> Either Text NixValue
 evalNix source = case parseNix "<test>" source of
-  Left err -> Left (T.pack (show err))
+  Left err -> Left (parseErrorTag <> T.pack (show err))
   Right expr -> runPureEval (eval (builtinEnv 0 []) expr)
+
+-- | Prefix marking a parse (not eval) failure in 'evalNix' results.
+parseErrorTag :: Text
+parseErrorTag = "parse error: "
 
 -- | Assert that a Nix expression evaluates to the expected value.
 assertEval :: Text -> Text -> NixValue -> TestResult
@@ -116,10 +133,25 @@ assertEval label source expected =
   assertRight label (evalNix source) $ \actual ->
     assertEqual label expected actual
 
--- | Assert that a Nix expression fails to evaluate.
+-- | Assert that a Nix expression parses but fails to EVALUATE.  A parse
+-- failure fails the assertion: a test documenting a runtime error must
+-- not keep passing after a regression stops the construct from parsing.
 assertEvalFail :: Text -> Text -> TestResult
-assertEvalFail label source =
-  assertLeft label (evalNix source)
+assertEvalFail label source = case evalNix source of
+  Left err
+    | parseErrorTag `T.isPrefixOf` err ->
+        Fail (label <> ": expected an eval error but the source did not parse: " <> err)
+    | otherwise -> Pass
+  Right val -> Fail (label <> ": expected eval failure but got: " <> T.pack (show val))
+
+-- | Assert that a Nix expression fails at PARSE time.
+assertParseFail :: Text -> Text -> TestResult
+assertParseFail label source = case evalNix source of
+  Left err
+    | parseErrorTag `T.isPrefixOf` err -> Pass
+    | otherwise ->
+        Fail (label <> ": expected a parse error but evaluation failed instead: " <> err)
+  Right val -> Fail (label <> ": expected parse failure but got: " <> T.pack (show val))
 
 -- ---------------------------------------------------------------------------
 -- Shell discovery for builder tests
@@ -523,6 +555,31 @@ testEvalWith = do
           "let-shadows-with"
           "with { a = 1; }; let a = 2; in a"
           (VInt 2),
+      -- A fallback (nested-path) let/rec binding shadows with too: the
+      -- NameBarrier must not be upgraded to a with-variable.
+      runTest "barrier let shadows with" $
+        assertEval
+          "barrier-shadows-with"
+          "let a.b = 1; x = 42; in with { x = 99; }; x"
+          (VInt 42),
+      runTest "barrier rec binding shadows with" $
+        assertEval
+          "barrier-rec-shadows-with"
+          "with { q = 99; }; (rec { c.d = 1; q = 5; b = q; }).b"
+          (VInt 5),
+      -- Static globals bind at parse time; with never shadows them.
+      runTest "with cannot shadow global map" $
+        assertEval
+          "with-global-map"
+          "builtins.typeOf (with { map = 42; }; map)"
+          (mkStr "lambda"),
+      -- fetchurl is NOT an upstream global: the with-scope must win, or
+      -- nixpkgs-style 'with pkgs; fetchurl' would bind the builtin.
+      runTest "with shadows non-global fetchurl" $
+        assertEval
+          "with-fetchurl"
+          "with { fetchurl = 42; }; fetchurl"
+          (VInt 42),
       -- Builtin fallback: builtins still accessible inside with
       runTest "with builtin fallback" $
         assertEval
@@ -752,6 +809,14 @@ testLexer = do
       runTest "trailing-dot float lexes as one float token" $
         assertRight "lex trailing-dot" (tokenize "<test>" "12.") $ \toks ->
           assertEqual "tokens" [TokFloat 12.0] (tokenTypes toks),
+      -- Maximal munch: a dot-led run with a /-segment is one PATH token
+      -- (upstream's PATH regex), while a slashless dot-run is not.
+      runTest "dot-relative path lexes as one token" $
+        assertRight "lex dot-path" (tokenize "<test>" ".github/x") $ \toks ->
+          assertEqual "tokens" [TokPath ".github/x"] (tokenTypes toks),
+      runTest "leading-dot float still lexes as float" $
+        assertRight "lex dot-float" (tokenize "<test>" ".5") $ \toks ->
+          assertEqual "tokens" [TokFloat 0.5] (tokenTypes toks),
       runTest "trailing-dot float with exponent lexes as one float token" $
         assertRight "lex trailing-dot-exp" (tokenize "<test>" "12.e2") $ \toks ->
           assertEqual "tokens" [TokFloat 1200.0] (tokenTypes toks),
@@ -782,6 +847,48 @@ testLexer = do
       runTest "URI" $
         assertRight "lex uri" (tokenize "<test>" "https://example.com") $ \toks ->
           assertEqual "tokens" [TokUri "https://example.com"] (tokenTypes toks),
+      -- Upstream URI = [a-zA-Z][a-zA-Z0-9+.-]*:[uri-char]+ with flex
+      -- maximal munch: no // required, and the URI beats identifiers,
+      -- keywords, and the lambda colon when it matches more characters.
+      runTest "scheme-only URI x:y" $
+        assertRight "lex uri x:y" (tokenize "<test>" "x:y") $ \toks ->
+          assertEqual "tokens" [TokUri "x:y"] (tokenTypes toks),
+      runTest "scheme-only URI mailto" $
+        assertRight "lex uri mailto" (tokenize "<test>" "mailto:foo@example.com") $ \toks ->
+          assertEqual "tokens" [TokUri "mailto:foo@example.com"] (tokenTypes toks),
+      runTest "URI scheme allows + . -" $
+        assertRight "lex uri scheme" (tokenize "<test>" "a+b.c:d") $ \toks ->
+          assertEqual "tokens" [TokUri "a+b.c:d"] (tokenTypes toks),
+      runTest "URI beats keyword by maximal munch" $
+        assertRight "lex uri keyword" (tokenize "<test>" "then:x") $ \toks ->
+          assertEqual "tokens" [TokUri "then:x"] (tokenTypes toks),
+      runTest "hash is not a URI char (starts a comment)" $
+        assertRight "lex uri hash" (tokenize "<test>" "http://a#frag") $ \toks ->
+          assertEqual "tokens" [TokUri "http://a"] (tokenTypes toks),
+      runTest "apostrophe and star are URI chars" $
+        assertRight "lex uri quote star" (tokenize "<test>" "http://e.com/a'b*c") $ \toks ->
+          assertEqual "tokens" [TokUri "http://e.com/a'b*c"] (tokenTypes toks),
+      runTest "lambda colon needs the space" $
+        assertRight "lex lambda colon" (tokenize "<test>" "x: y") $ \toks ->
+          assertEqual "tokens" [TokIdent "x", TokColon, TokIdent "y"] (tokenTypes toks),
+      runTest "underscore cannot start a URI scheme" $
+        assertRight "lex underscore colon" (tokenize "<test>" "_a:b") $ \toks ->
+          assertEqual "tokens" [TokIdent "_a", TokColon, TokIdent "b"] (tokenTypes toks),
+      -- Raw CR/CRLF normalizes to LF in double-quoted strings (upstream
+      -- unescapeStr); an escaped CR survives; indented strings keep CR
+      -- verbatim because upstream's IND_STRING chunks skip unescapeStr.
+      runTest "CRLF in double-quoted string normalizes to LF" $
+        assertRight "lex crlf string" (tokenize "<test>" "\"a\r\nb\"") $ \toks ->
+          assertEqual "tokens" [TokStringOpen, TokStringLit "a\nb", TokStringClose] (tokenTypes toks),
+      runTest "lone CR in double-quoted string normalizes to LF" $
+        assertRight "lex cr string" (tokenize "<test>" "\"a\rb\"") $ \toks ->
+          assertEqual "tokens" [TokStringOpen, TokStringLit "a\nb", TokStringClose] (tokenTypes toks),
+      runTest "escaped CR stays a literal CR" $
+        assertRight "lex escaped cr" (tokenize "<test>" "\"a\\\rb\"") $ \toks ->
+          assertEqual "tokens" [TokStringOpen, TokStringLit "a\rb", TokStringClose] (tokenTypes toks),
+      runTest "indented string keeps CRLF verbatim" $
+        assertRight "lex ind crlf" (tokenize "<test>" "''a\r\nb''") $ \toks ->
+          assertEqual "tokens" [TokIndStringOpen, TokStringLit "a\r\nb", TokIndStringClose] (tokenTypes toks),
       runTest "multi-char operators" $
         assertRight "lex ops" (tokenize "<test>" "++ // -> == != && || <= >=") $ \toks ->
           assertEqual
@@ -1130,12 +1237,24 @@ testParserIntegration = do
               NoCaptureInfo
           ),
       runTest "nested attr set" $
+        -- Normalization hoists a nested attrpath into nested literal sets
+        -- (upstream parser.y addAttr), so a.b.c = 1 parses like
+        -- a = { b = { c = 1; }; }.
         assertParse
           "nested attrs"
           "{ a.b.c = 1; d = { e = 2; }; }"
           ( EAttrs
               False
-              [ NamedBinding [StaticKey "a", StaticKey "b", StaticKey "c"] (ELit (NixInt 1)),
+              [ NamedBinding
+                  [StaticKey "a"]
+                  ( EAttrs
+                      False
+                      [ NamedBinding
+                          [StaticKey "b"]
+                          (EAttrs False [NamedBinding [StaticKey "c"] (ELit (NixInt 1))] NoCaptureInfo)
+                      ]
+                      NoCaptureInfo
+                  ),
                 NamedBinding [StaticKey "d"] (EAttrs False [NamedBinding [StaticKey "e"] (ELit (NixInt 2))] NoCaptureInfo)
               ]
               NoCaptureInfo
@@ -1453,9 +1572,16 @@ testBatch6 = do
         assertEval "tryEval-throw" "(builtins.tryEval (builtins.throw \"boom\")).success" (VBool False),
       runTest "tryEval failure value" $
         assertEval "tryEval-fval" "(builtins.tryEval (builtins.throw \"boom\")).value" (VBool False),
-      -- tryEval catches coercion error (+ on attrset without outPath)
-      runTest "tryEval catches coercion error" $
-        assertEval "tryEval-tyerr" "(builtins.tryEval ({} + [])).success" (VBool False),
+      -- tryEval catches ONLY throw/assert (upstream ThrownError/
+      -- AssertionError); type errors and missing attrs escape it.
+      runTest "tryEval catches failed assert" $
+        assertEval "tryEval-assert" "(builtins.tryEval (assert false; 1)).success" (VBool False),
+      runTest "tryEval does not catch a type error" $
+        assertEvalFail "tryEval-tyerr" "(builtins.tryEval ({} + [])).success",
+      runTest "tryEval does not catch a missing attribute" $
+        assertEvalFail "tryEval-noattr" "(builtins.tryEval ({ a = 1; }.b)).success",
+      runTest "tryEval catches a throw nested under forcing" $
+        assertEval "tryEval-deep-throw" "(builtins.tryEval (builtins.deepSeq [ (builtins.throw \"x\") ] 1)).success" (VBool False),
       -- deepSeq
       runTest "deepSeq returns second" $
         assertEval "deepSeq" "builtins.deepSeq [ 1 2 3 ] 42" (VInt 42),
@@ -1561,6 +1687,90 @@ testBlackholeRecoveryIO = do
         "genuine infinite recursion still escapes tryEval"
         "."
         "builtins.tryEval (let y = y; in y)"
+    ]
+
+-- | Whether this machine can materialize eval outputs at the platform
+-- store root (eval-time store writes resolve there by design).  Absent
+-- and uncreatable - macOS's sealed read-only /, a root-owned /nix on a
+-- Nix-installed Linux box - the store-writing eval tests skip loudly
+-- rather than fail on machines that cannot host a store.  Linux CI
+-- provisions /nix so coverage stays real there.
+storeRootAvailable :: IO Bool
+storeRootAvailable = do
+  outcome <- try (createDirectoryIfMissing True (T.unpack platformStoreDirText))
+  case outcome of
+    Left (_ :: SomeException) -> pure False
+    Right () -> writable <$> getPermissions (T.unpack platformStoreDirText)
+
+-- | builtins.path/filterSource with a filter: the tree is serialized with
+-- rejected entries removed (a rejected directory prunes its subtree),
+-- content-addressed over the FILTERED NAR, and materialized to the store.
+testPathFilterIO :: IO [Bool]
+testPathFilterIO = do
+  putStrLn "eval/path-filter-io"
+  usableStore <- storeRootAvailable
+  if not usableStore
+    then do
+      putStrLn "  SKIP  platform store root unavailable; cannot materialize eval outputs here"
+      pure []
+    else testPathFilterBody
+
+testPathFilterBody :: IO [Bool]
+testPathFilterBody = do
+  tmpBase <- getTemporaryDirectory
+  let srcDir = tmpBase </> "nova-nix-test-path-filter"
+  removeIfExists srcDir
+  createDirectoryIfMissing True (srcDir </> "sub")
+  createDirectoryIfMissing True (srcDir </> "dropdir")
+  BS.writeFile (srcDir </> "keep.txt") "keep"
+  BS.writeFile (srcDir </> "drop.log") "drop"
+  BS.writeFile (srcDir </> "sub" </> "inner.txt") "inner"
+  BS.writeFile (srcDir </> "dropdir" </> "x.txt") "gone"
+  let quoted = nixQuotedPath srcDir
+      filterExpr = "(p: t: builtins.match \".*[.]log\" p == null && baseNameOf p != \"dropdir\")"
+      filteredPath = "(builtins.path { path = " <> quoted <> "; name = \"src\"; filter = " <> filterExpr <> "; })"
+      unfilteredPath = "(builtins.path { path = " <> quoted <> "; name = \"src\"; })"
+  sequence
+    [ runTestIO
+        "kept file survives with its content"
+        "."
+        ("builtins.readFile (" <> filteredPath <> " + \"/keep.txt\")")
+        (mkStr "keep"),
+      runTestIO
+        "kept subtree survives"
+        "."
+        ("builtins.readFile (" <> filteredPath <> " + \"/sub/inner.txt\")")
+        (mkStr "inner"),
+      runTestIO
+        "rejected file is dropped"
+        "."
+        ("builtins.pathExists (" <> filteredPath <> " + \"/drop.log\")")
+        (VBool False),
+      runTestIO
+        "rejected directory prunes its subtree"
+        "."
+        ("builtins.pathExists (" <> filteredPath <> " + \"/dropdir\")")
+        (VBool False),
+      runTestIO
+        "filtered and unfiltered store paths differ"
+        "."
+        (filteredPath <> " == " <> unfilteredPath)
+        (VBool False),
+      runTestIO
+        "same filter yields the same store path"
+        "."
+        (filteredPath <> " == " <> filteredPath)
+        (VBool True),
+      runTestIO
+        "filterSource is path-with-filter under the source basename"
+        "."
+        ( "builtins.filterSource (p: t: true) "
+            <> quoted
+            <> " == builtins.path { path = "
+            <> quoted
+            <> "; filter = (p: t: true); }"
+        )
+        (VBool True)
     ]
 
 testImportIO :: IO [Bool]
@@ -2314,12 +2524,15 @@ testDepGraph = do
       -- buildDepGraph with mock for cycle detection
       -- (Cycle detection happens at topoSort level, not buildDepGraph)
       runTest "cycle detection" $ case DepGraph.buildDepGraph readCycle drvACycle spA of
-        Right graph ->
-          -- Graph builds but topo should detect the cycle or return partial
-          case DepGraph.topoSort graph of
-            DepGraph.TopoSorted _ -> Pass -- Kahn's returns what it can
-            DepGraph.TopoCycle _ -> Pass
-        Left _ -> Pass -- Also acceptable if buildDepGraph fails
+        Right graph -> case DepGraph.topoSort graph of
+          DepGraph.TopoCycle _ -> Pass
+          -- A "sorted" cyclic graph means Kahn's silently dropped the
+          -- cycle: buildWithDeps would then loop or build with unbuilt
+          -- inputs.
+          DepGraph.TopoSorted order ->
+            Fail ("cyclic graph topo-sorted as " <> T.pack (show (length order)) <> " nodes")
+        -- A loud rejection at graph-build time also counts as detection.
+        Left _ -> Pass
     ]
 
 -- ---------------------------------------------------------------------------
@@ -2427,9 +2640,125 @@ testSubstituter = do
       runTest "narInfoMatchesPath rejects mismatched identity" $
         if Subst.narInfoMatchesPath (StorePath (T.replicate 32 "b") "hello") (sampleNarInfo sampleNarHash)
           then Fail "expected identity mismatch"
-          else Pass
+          else Pass,
+      -- tryCachesWith: the first success stops the scan (later caches
+      -- are never contacted)
+      runTestM "tryCachesWith success stops scan" $ do
+        calls <- newIORef (0 :: Int)
+        let hit = StorePath (T.replicate 32 "d") "hit"
+            attempt cache = do
+              atomicModifyIORef' calls (\n -> (n + 1, ()))
+              pure $
+                if Subst.ccUrl cache == "https://b"
+                  then Subst.SubstSuccess hit
+                  else Subst.SubstNotFound
+        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b", chainCache "https://c"]
+        made <- readIORef calls
+        pure $
+          if result == Subst.SubstSuccess hit && made == 2
+            then Pass
+            else Fail ("got " <> T.pack (show result) <> " after " <> T.pack (show made) <> " attempts"),
+      -- tryCachesWith: an erroring cache falls through to a later hit
+      -- instead of aborting the chain
+      runTestM "tryCachesWith error falls through to next cache" $ do
+        let hit = StorePath (T.replicate 32 "e") "hit"
+            attempt cache
+              | Subst.ccUrl cache == "https://a" = pure (Subst.SubstError "transient 500")
+              | otherwise = pure (Subst.SubstSuccess hit)
+        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"]
+        pure (assertEqual "fallthrough" (Subst.SubstSuccess hit) result),
+      -- tryCachesWith: all misses stay SubstNotFound
+      runTestM "tryCachesWith all misses" $ do
+        result <- Subst.tryCachesWith (\_ -> pure Subst.SubstNotFound) [chainCache "https://a", chainCache "https://b"]
+        pure (assertEqual "misses" Subst.SubstNotFound result),
+      -- tryCachesWith: with no hit anywhere, the FIRST error is reported,
+      -- tagged with the URL of the cache that produced it
+      runTestM "tryCachesWith reports first error tagged with cache" $ do
+        let attempt cache
+              | Subst.ccUrl cache == "https://a" = pure Subst.SubstNotFound
+              | Subst.ccUrl cache == "https://b" = pure (Subst.SubstError "first")
+              | otherwise = pure (Subst.SubstError "second")
+        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b", chainCache "https://c"]
+        pure $ case result of
+          Subst.SubstError err
+            | "https://b" `T.isPrefixOf` err && "first" `T.isSuffixOf` err -> Pass
+          other -> Fail ("expected tagged first error, got " <> T.pack (show other)),
+      -- clearStaleDestination: removes a read-only leftover tree (the
+      -- crash-between-unpack-and-register wedge)
+      runTestM "clearStaleDestination removes read-only leftovers" $ do
+        tmpBase <- getTemporaryDirectory
+        let staleRoot = tmpBase </> "nova-nix-test-stale-dest"
+            staleFile = staleRoot </> "bin" </> "tool"
+        createDirectoryIfMissing True (staleRoot </> "bin")
+        writeFile staleFile "leftover"
+        perms <- getPermissions staleFile
+        Dir.setPermissions staleFile (Dir.setOwnerWritable False perms)
+        Subst.clearStaleDestination staleRoot
+        gone <- Dir.doesPathExist staleRoot
+        pure (if gone then Fail "stale tree survived" else Pass),
+      -- clearStaleDestination: a missing destination is a no-op
+      runTestM "clearStaleDestination missing path no-op" $ do
+        tmpBase <- getTemporaryDirectory
+        outcome <- try (Subst.clearStaleDestination (tmpBase </> "nova-nix-test-no-such-dir"))
+        pure $ case (outcome :: Either SomeException ()) of
+          Right () -> Pass
+          Left e -> Fail ("threw: " <> T.pack (show e)),
+      -- unpackNarEntry: traversal-shaped entry names from an untrusted
+      -- cache are rejected before anything is written
+      runTestM "unpackNarEntry rejects unsafe entry names" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-unsafe"
+            evil name = NAR.NarDirectory [(name, NAR.NarRegular False "x")]
+        results <- mapM (Subst.unpackNarEntry dest . evil) ["..", ".", "", "a/b", "a\\b"]
+        Subst.clearStaleDestination dest
+        pure $
+          if all (\case Left _ -> True; Right () -> False) results
+            then Pass
+            else Fail ("accepted an unsafe name: " <> T.pack (show results)),
+      -- unpackNarEntry: a NAR symlink materializes as a REAL link or fails
+      -- loudly - never as a regular file holding the target text, which
+      -- would silently diverge from the signed NAR hash
+      runTestM "unpackNarEntry symlink is real or loud" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-symlink"
+            tree =
+              NAR.NarDirectory
+                [ ("real", NAR.NarRegular False "contents"),
+                  ("link", NAR.NarSymlink "real")
+                ]
+        Subst.clearStaleDestination dest
+        result <- Subst.unpackNarEntry dest tree
+        outcome <- case result of
+          Right () -> do
+            isLink <- Dir.pathIsSymbolicLink (dest </> "link")
+            pure (if isLink then Pass else Fail "symlink materialized as a non-link")
+          Left _ -> do
+            leftBehind <- Dir.doesFileExist (dest </> "link")
+            pure (if leftBehind then Fail "failed loudly but left a regular file behind" else Pass)
+        Subst.clearStaleDestination dest
+        pure outcome,
+      -- unpackNarEntry: a directory-target symlink that sorts BEFORE its
+      -- target still gets the directory link flavor (second-pass typing)
+      runTestM "unpackNarEntry types forward dir symlink" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-dirlink"
+            tree =
+              NAR.NarDirectory
+                [ ("alink", NAR.NarSymlink "zdir"),
+                  ("zdir", NAR.NarDirectory [("f", NAR.NarRegular False "x")])
+                ]
+        Subst.clearStaleDestination dest
+        result <- Subst.unpackNarEntry dest tree
+        outcome <- case result of
+          Left _ -> pure Pass -- symlinks unavailable here; the loud failure is the contract
+          Right () -> do
+            throughLink <- doesDirectoryExist (dest </> "alink")
+            pure (if throughLink then Pass else Fail "dir symlink not traversable (wrong flavor)")
+        Subst.clearStaleDestination dest
+        pure outcome
     ]
   where
+    chainCache url = Subst.CacheConfig url "unused-key" 10
     sampleNarBytes = "nova-nix nar sample bytes" :: BS.ByteString
     sampleNarHash = CHash.formatNixHash (CHash.hashBytes sampleNarBytes)
     wrongNarHash = CHash.formatNixHash (CHash.hashBytes ("different bytes" :: BS.ByteString))
@@ -2495,9 +2824,13 @@ testBuildOrchestrator = do
         result <- buildWithDeps config store drv drvSP
         closeStore store
         forceRemoveIfExists tmpStore
-        -- Builder will fail (nonexistent) but the graph should resolve correctly
+        -- Builder will fail (nonexistent) but the graph should resolve
+        -- correctly: the failure must come from SPAWNING THE BUILDER, not
+        -- from graph resolution or drv reading upstream of it.
         pure $ case result of
-          BuildFailure _ _ -> Pass
+          BuildFailure msg _
+            | "nonexistent-builder" `T.isInfixOf` msg -> Pass
+            | otherwise -> Fail ("failed before reaching the builder: " <> msg)
           BuildSuccess _ -> Fail "expected build failure for nonexistent builder",
       -- buildWithDeps with cycle detection (mocked through malformed graph)
       runTest "cycle detection returns failure" $
@@ -2725,7 +3058,14 @@ testParseStorePath = do
         assertEqual
           "windows"
           (Just (StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "pkg"))
-          (parseStorePath windowsStoreDir "C:\\nix\\store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg")
+          (parseStorePath windowsStoreDir "C:\\nix\\store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg"),
+      -- The backslash separator is the form storePathToFilePath actually
+      -- produces on Windows (what %out% and DB rows look like there).
+      runTest "parse windows store path with backslash separator" $
+        assertEqual
+          "windows-backslash"
+          (Just (StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "pkg"))
+          (parseStorePath windowsStoreDir "C:\\nix\\store\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg")
     ]
 
 -- ---------------------------------------------------------------------------
@@ -2775,8 +3115,35 @@ testPushPure = do
       runTest "storePathBasename joins hash and name" $
         assertEqual "basename" (hashA <> "-hello-1.0") (storePathBasename spA),
       runTest "narFileName appends .nar" $
-        assertEqual "file" "0123abcdef.nar" (narFileName narHash)
+        assertEqual "file" "0123abcdef.nar" (narFileName narHash),
+      -- checkRecordedNarHash: the pre-upload integrity gate
+      runTest "push gate accepts a registered matching path" $
+        assertEqual
+          "gate ok"
+          (Right ())
+          (checkRecordedNarHash (Just (pathInfoFor narHash)) narHash spA),
+      runTest "push gate refuses an unregistered path" $
+        case checkRecordedNarHash Nothing narHash spA of
+          Left err
+            | "not registered" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("wrong error: " <> err)
+          Right () -> Fail "unregistered path must not be publishable",
+      runTest "push gate refuses a changed-on-disk path" $
+        case checkRecordedNarHash (Just (pathInfoFor "sha256:other")) narHash spA of
+          Left err
+            | "DB recorded" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("wrong error: " <> err)
+          Right () -> Fail "hash mismatch must not be publishable"
     ]
+  where
+    pathInfoFor recordedHash =
+      PathInfo
+        { piPath = "/nix/store/" <> T.replicate 32 "a" <> "-hello-1.0",
+          piNarHash = recordedHash,
+          piNarSize = 1234,
+          piDeriver = Nothing,
+          piRegTime = 0
+        }
 
 -- | Closure computation against a real (temp) store database.
 testPushClosureIO :: IO [Bool]
@@ -2806,7 +3173,32 @@ testPushClosureIO = do
               (Set.fromList (map spHash closure)),
         runTest "closure deduplicates across roots" $
           assertRight "fromBoth" fromBoth $ \closure ->
-            assertEqual "count" (3 :: Int) (length closure)
+            assertEqual "count" (3 :: Int) (length closure),
+        -- loadApiKeyFile: keys copied through Windows editors arrive with
+        -- a BOM and CRLF; skipping the normalization turns every push
+        -- into an auth rejection with no visible cause.
+        runTestM "loadApiKeyFile strips BOM and CRLF" $ do
+          tmpBase <- getTemporaryDirectory
+          let keyFile = tmpBase </> "nova-nix-test-api-key"
+          BS.writeFile keyFile (BS.pack [0xEF, 0xBB, 0xBF] <> "the-secret-key\r\n")
+          loaded <- loadApiKeyFile keyFile
+          Dir.removeFile keyFile
+          pure (assertEqual "normalized key" (Right "the-secret-key") loaded),
+        runTestM "loadApiKeyFile rejects an effectively-empty key file" $ do
+          tmpBase <- getTemporaryDirectory
+          let keyFile = tmpBase </> "nova-nix-test-api-key-empty"
+          BS.writeFile keyFile (BS.pack [0xEF, 0xBB, 0xBF] <> "  \r\n")
+          loaded <- loadApiKeyFile keyFile
+          Dir.removeFile keyFile
+          pure $ case loaded of
+            Left err | "empty" `T.isInfixOf` err -> Pass
+            other -> Fail ("expected empty-key rejection, got: " <> T.pack (show other)),
+        runTestM "loadApiKeyFile reports a missing file" $ do
+          tmpBase <- getTemporaryDirectory
+          loaded <- loadApiKeyFile (tmpBase </> "nova-nix-test-no-such-key-file")
+          pure $ case loaded of
+            Left err | "cannot read key file" `T.isInfixOf` err -> Pass
+            other -> Fail ("expected read error, got: " <> T.pack (show other))
       ]
 
 -- | Helper: create a fresh temp store for IO tests.
@@ -3009,180 +3401,188 @@ tarSymLink p target =
 testUnpackBuildIO :: IO [Bool]
 testUnpackBuildIO = do
   putStrLn "builder/unpack-seed-archives"
-  withTempStore $ \store -> do
-    let storeDir = stDir store
-    tmpBase <- getTemporaryDirectory
-    let workDir = tmpBase </> "nova-nix-test-unpack-src"
-    forceRemoveIfExists workDir
-    createDirectoryIfMissing True workDir
-    let archiveTools = workDir </> "pkg-tools.tar.zst"
-        archiveData = workDir </> "pkg-data.tar.zst"
-        archiveCollide = workDir </> "pkg-collide.tar.zst"
-        archiveEscape = workDir </> "pkg-escape.tar.zst"
-        archiveRootFile = workDir </> "pkg-root-file.tar.zst"
-        archiveEscapeSymlink = workDir </> "pkg-escape-symlink.tar.zst"
-        archiveEscapeHardlink = workDir </> "pkg-escape-hardlink.tar.zst"
-    BL.writeFile archiveTools $
-      compressArchive
-        [ tarDir "pkg",
-          tarDir "pkg/bin",
-          tarExecFile "pkg/bin/tool.exe" "tool-payload",
-          tarHardLink "pkg/bin/tool-link.exe" "pkg/bin/tool.exe",
-          tarSymLink "pkg/bin/sh.exe" "tool.exe",
-          tarFile ".PKGINFO" "pkgname = tools"
-        ]
-    BL.writeFile archiveData $
-      compressArchive
-        [ tarDir "pkg",
-          tarDir "pkg/share",
-          tarFile "pkg/share/data.txt" "shared-data",
-          tarFile ".MTREE" "mtree-bytes"
-        ]
-    BL.writeFile archiveCollide $
-      compressArchive [tarFile "pkg/bin/tool.exe" "conflicting"]
-    BL.writeFile archiveEscape $
-      compressArchive [tarFile "../evil.txt" "escape"]
-    -- A leading '/' entry: rooted at the current drive.  tar stores paths with
-    -- '/', so this is the on-disk form even of a Windows-native "\..." name.
-    BL.writeFile archiveRootFile $
-      compressArchive [tarFile "/planted-abs.txt" "rooted-file"]
-    -- Escaping link targets: '..' climbs above the archive root.  Unlike a
-    -- rooted ('/') target, this builds portably - tar's toLinkTarget accepts a
-    -- relative path on every host - so the real unpacker is exercised end to end.
-    BL.writeFile archiveEscapeSymlink $
-      compressArchive [tarSymLink "sneaky-link.txt" "../escape-link-target.txt"]
-    BL.writeFile archiveEscapeHardlink $
-      compressArchive [tarHardLink "sneaky-hardlink.txt" "../escape-hardlink-target.txt"]
-    let mkUnpackDrv outP srcFiles =
-          Derivation
-            { drvOutputs =
-                [ DerivationOutput
-                    { doName = "out",
-                      doPath = outP,
-                      doHashAlgo = "",
-                      doHash = ""
-                    }
-                ],
-              drvInputDrvs = Map.empty,
-              drvInputSrcs = [],
-              drvPlatform = currentPlatform,
-              drvBuilder = builtinUnpackBuilder,
-              drvArgs = [],
-              drvEnv =
-                Map.fromList
-                  [(envSrcs, T.intercalate " " (map T.pack srcFiles))]
-            }
-        seedOut = StorePath (T.replicate 31 "0" <> "2") "unpack-seed"
-        collideOut = StorePath (T.replicate 31 "0" <> "3") "unpack-collide"
-        escapeOut = StorePath (T.replicate 31 "0" <> "4") "unpack-escape"
-        rootFileOut = StorePath (T.replicate 31 "0" <> "5") "unpack-root-file"
-        escapeSymlinkOut = StorePath (T.replicate 31 "0" <> "6") "unpack-escape-symlink"
-        escapeHardlinkOut = StorePath (T.replicate 31 "0" <> "7") "unpack-escape-hardlink"
-    buildTmp <- (</> "nova-nix-test-unpack-build-tmp") <$> getTemporaryDirectory
-    forceRemoveIfExists buildTmp
-    createDirectoryIfMissing True buildTmp
-    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
-    seedResult <- buildDerivation config store (mkUnpackDrv seedOut [archiveTools, archiveData])
-    collideResult <- buildDerivation config store (mkUnpackDrv collideOut [archiveTools, archiveCollide])
-    escapeResult <- buildDerivation config store (mkUnpackDrv escapeOut [archiveEscape])
-    rootFileResult <- buildDerivation config store (mkUnpackDrv rootFileOut [archiveRootFile])
-    escapeSymlinkResult <- buildDerivation config store (mkUnpackDrv escapeSymlinkOut [archiveEscapeSymlink])
-    escapeHardlinkResult <- buildDerivation config store (mkUnpackDrv escapeHardlinkOut [archiveEscapeHardlink])
-    forceRemoveIfExists buildTmp
-    forceRemoveIfExists workDir
-    seedChecks <- case seedResult of
-      BuildFailure msg code ->
-        sequence
-          [ runTest "unpack seed build succeeds" $
-              Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+  tmpBase0 <- getTemporaryDirectory
+  if ' ' `elem` tmpBase0
+    then do
+      -- The srcs env is space-separated by the derivation contract (store
+      -- paths never contain spaces), but these test archives live under
+      -- TEMP: a spaced TEMP would fragment the paths and fail spuriously.
+      putStrLn "  SKIP  unpack archive tests need a space-free TEMP dir"
+      pure []
+    else withTempStore $ \store -> do
+      let storeDir = stDir store
+      tmpBase <- getTemporaryDirectory
+      let workDir = tmpBase </> "nova-nix-test-unpack-src"
+      forceRemoveIfExists workDir
+      createDirectoryIfMissing True workDir
+      let archiveTools = workDir </> "pkg-tools.tar.zst"
+          archiveData = workDir </> "pkg-data.tar.zst"
+          archiveCollide = workDir </> "pkg-collide.tar.zst"
+          archiveEscape = workDir </> "pkg-escape.tar.zst"
+          archiveRootFile = workDir </> "pkg-root-file.tar.zst"
+          archiveEscapeSymlink = workDir </> "pkg-escape-symlink.tar.zst"
+          archiveEscapeHardlink = workDir </> "pkg-escape-hardlink.tar.zst"
+      BL.writeFile archiveTools $
+        compressArchive
+          [ tarDir "pkg",
+            tarDir "pkg/bin",
+            tarExecFile "pkg/bin/tool.exe" "tool-payload",
+            tarHardLink "pkg/bin/tool-link.exe" "pkg/bin/tool.exe",
+            tarSymLink "pkg/bin/sh.exe" "tool.exe",
+            tarFile ".PKGINFO" "pkgname = tools"
           ]
-      BuildSuccess sp -> do
-        let outRoot = storePathToFilePath storeDir sp
-            readOut rel = do
-              let path = outRoot </> rel
-              exists <- Dir.doesFileExist path
-              if exists then Just <$> TIO.readFile path else pure Nothing
-        tool <- readOut ("pkg" </> "bin" </> "tool.exe")
-        toolLink <- readOut ("pkg" </> "bin" </> "tool-link.exe")
-        shLink <- readOut ("pkg" </> "bin" </> "sh.exe")
-        dataFile <- readOut ("pkg" </> "share" </> "data.txt")
-        pkgInfo <- Dir.doesFileExist (outRoot </> ".PKGINFO")
-        mtree <- Dir.doesFileExist (outRoot </> ".MTREE")
-        execBitOk <-
-          if SI.os == "mingw32"
-            then pure True -- NTFS has no exec bit; PATHEXT decides
-            else Dir.executable <$> getPermissions (outRoot </> "pkg" </> "bin" </> "tool.exe")
-        narInfo <- queryPathInfo (stDB store) sp
-        let realNarHash = case narInfo of
-              Just info ->
-                piNarSize info > 0 && T.isPrefixOf "sha256:" (piNarHash info)
-              Nothing -> False
-        sequence
-          [ runTest "unpack seed build succeeds" Pass,
-            runTest "unpack: file extracted with content" $
-              assertEqual "tool.exe" (Just "tool-payload") tool,
-            runTest "unpack: hardlink materialized as copy" $
-              assertEqual "tool-link.exe" (Just "tool-payload") toolLink,
-            runTest "unpack: relative symlink materialized as copy" $
-              assertEqual "sh.exe" (Just "tool-payload") shLink,
-            runTest "unpack: second archive merged into shared prefix" $
-              assertEqual "data.txt" (Just "shared-data") dataFile,
-            runTest "unpack: pacman metadata skipped" $
-              if pkgInfo || mtree
-                then Fail ".PKGINFO/.MTREE leaked into the output"
-                else Pass,
-            runTest "unpack: executable bit materialized (unix)" $
-              if execBitOk then Pass else Fail "tool.exe not executable",
-            runTest "unpack: real NAR hash registered" $
-              if realNarHash then Pass else Fail (T.pack (show narInfo))
+      BL.writeFile archiveData $
+        compressArchive
+          [ tarDir "pkg",
+            tarDir "pkg/share",
+            tarFile "pkg/share/data.txt" "shared-data",
+            tarFile ".MTREE" "mtree-bytes"
           ]
-    collideChecks <-
-      sequence
-        [ runTest "unpack: cross-archive file collision fails loudly" $
-            case collideResult of
-              BuildFailure msg _
-                | "file collision" `T.isInfixOf` msg -> Pass
-                | otherwise -> Fail ("wrong failure: " <> msg)
-              BuildSuccess _ -> Fail "collision build unexpectedly succeeded"
-        ]
-    escapeChecks <-
-      sequence
-        [ runTest "unpack: path traversal rejected" $
-            case escapeResult of
-              BuildFailure msg _
-                | "escapes archive root" `T.isInfixOf` msg -> Pass
-                | otherwise -> Fail ("wrong failure: " <> msg)
-              BuildSuccess _ -> Fail "escape build unexpectedly succeeded"
-        ]
-    let rejectedWith needle res = case res of
-          BuildFailure msg _
-            | needle `T.isInfixOf` msg -> Pass
-            | otherwise -> Fail ("wrong failure: " <> msg)
-          BuildSuccess _ -> Fail "malicious entry unexpectedly built"
-    -- Integration: the real unpacker rejects a rooted entry path and an
-    -- escaping ('..') symlink/hardlink target, end to end.
-    maliciousChecks <-
-      sequence
-        [ runTest "unpack: rooted file entry rejected" $
-            rejectedWith "planted-abs.txt" rootFileResult,
-          runTest "unpack: escaping symlink target rejected" $
-            rejectedWith "escape-link-target.txt" escapeSymlinkResult,
-          runTest "unpack: escaping hardlink target rejected" $
-            rejectedWith "escape-hardlink-target.txt" escapeHardlinkResult
-        ]
-    -- Unit: the rooted (drive-relative) case is the Blocker-4 Windows vuln.
-    -- tar's toLinkTarget refuses an absolute payload on POSIX, so exercise the
-    -- guard predicate directly - portable and exact on every host.
-    guardChecks <-
-      sequence
-        [ runTest "unpack guard: rooted entry path rejected" $
-            assertLeft "rooted entry" (entryComponents "/planted-abs.txt"),
-          runTest "unpack guard: rooted symlink target rejected" $
-            assertLeft "rooted symlink" (resolveLinkTarget [] "/planted-link-target.txt"),
-          runTest "unpack guard: rooted hardlink target rejected" $
-            assertLeft "rooted hardlink" (entryComponents "/planted-hardlink-target.txt")
-        ]
-    pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ guardChecks)
+      BL.writeFile archiveCollide $
+        compressArchive [tarFile "pkg/bin/tool.exe" "conflicting"]
+      BL.writeFile archiveEscape $
+        compressArchive [tarFile "../evil.txt" "escape"]
+      -- A leading '/' entry: rooted at the current drive.  tar stores paths with
+      -- '/', so this is the on-disk form even of a Windows-native "\..." name.
+      BL.writeFile archiveRootFile $
+        compressArchive [tarFile "/planted-abs.txt" "rooted-file"]
+      -- Escaping link targets: '..' climbs above the archive root.  Unlike a
+      -- rooted ('/') target, this builds portably - tar's toLinkTarget accepts a
+      -- relative path on every host - so the real unpacker is exercised end to end.
+      BL.writeFile archiveEscapeSymlink $
+        compressArchive [tarSymLink "sneaky-link.txt" "../escape-link-target.txt"]
+      BL.writeFile archiveEscapeHardlink $
+        compressArchive [tarHardLink "sneaky-hardlink.txt" "../escape-hardlink-target.txt"]
+      let mkUnpackDrv outP srcFiles =
+            Derivation
+              { drvOutputs =
+                  [ DerivationOutput
+                      { doName = "out",
+                        doPath = outP,
+                        doHashAlgo = "",
+                        doHash = ""
+                      }
+                  ],
+                drvInputDrvs = Map.empty,
+                drvInputSrcs = [],
+                drvPlatform = currentPlatform,
+                drvBuilder = builtinUnpackBuilder,
+                drvArgs = [],
+                drvEnv =
+                  Map.fromList
+                    [(envSrcs, T.intercalate " " (map T.pack srcFiles))]
+              }
+          seedOut = StorePath (T.replicate 31 "0" <> "2") "unpack-seed"
+          collideOut = StorePath (T.replicate 31 "0" <> "3") "unpack-collide"
+          escapeOut = StorePath (T.replicate 31 "0" <> "4") "unpack-escape"
+          rootFileOut = StorePath (T.replicate 31 "0" <> "5") "unpack-root-file"
+          escapeSymlinkOut = StorePath (T.replicate 31 "0" <> "6") "unpack-escape-symlink"
+          escapeHardlinkOut = StorePath (T.replicate 31 "0" <> "7") "unpack-escape-hardlink"
+      buildTmp <- (</> "nova-nix-test-unpack-build-tmp") <$> getTemporaryDirectory
+      forceRemoveIfExists buildTmp
+      createDirectoryIfMissing True buildTmp
+      let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+      seedResult <- buildDerivation config store (mkUnpackDrv seedOut [archiveTools, archiveData])
+      collideResult <- buildDerivation config store (mkUnpackDrv collideOut [archiveTools, archiveCollide])
+      escapeResult <- buildDerivation config store (mkUnpackDrv escapeOut [archiveEscape])
+      rootFileResult <- buildDerivation config store (mkUnpackDrv rootFileOut [archiveRootFile])
+      escapeSymlinkResult <- buildDerivation config store (mkUnpackDrv escapeSymlinkOut [archiveEscapeSymlink])
+      escapeHardlinkResult <- buildDerivation config store (mkUnpackDrv escapeHardlinkOut [archiveEscapeHardlink])
+      forceRemoveIfExists buildTmp
+      forceRemoveIfExists workDir
+      seedChecks <- case seedResult of
+        BuildFailure msg code ->
+          sequence
+            [ runTest "unpack seed build succeeds" $
+                Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+            ]
+        BuildSuccess sp -> do
+          let outRoot = storePathToFilePath storeDir sp
+              readOut rel = do
+                let path = outRoot </> rel
+                exists <- Dir.doesFileExist path
+                if exists then Just <$> TIO.readFile path else pure Nothing
+          tool <- readOut ("pkg" </> "bin" </> "tool.exe")
+          toolLink <- readOut ("pkg" </> "bin" </> "tool-link.exe")
+          shLink <- readOut ("pkg" </> "bin" </> "sh.exe")
+          dataFile <- readOut ("pkg" </> "share" </> "data.txt")
+          pkgInfo <- Dir.doesFileExist (outRoot </> ".PKGINFO")
+          mtree <- Dir.doesFileExist (outRoot </> ".MTREE")
+          execBitOk <-
+            if SI.os == "mingw32"
+              then pure True -- NTFS has no exec bit; PATHEXT decides
+              else Dir.executable <$> getPermissions (outRoot </> "pkg" </> "bin" </> "tool.exe")
+          narInfo <- queryPathInfo (stDB store) sp
+          let realNarHash = case narInfo of
+                Just info ->
+                  piNarSize info > 0 && T.isPrefixOf "sha256:" (piNarHash info)
+                Nothing -> False
+          sequence
+            [ runTest "unpack seed build succeeds" Pass,
+              runTest "unpack: file extracted with content" $
+                assertEqual "tool.exe" (Just "tool-payload") tool,
+              runTest "unpack: hardlink materialized as copy" $
+                assertEqual "tool-link.exe" (Just "tool-payload") toolLink,
+              runTest "unpack: relative symlink materialized as copy" $
+                assertEqual "sh.exe" (Just "tool-payload") shLink,
+              runTest "unpack: second archive merged into shared prefix" $
+                assertEqual "data.txt" (Just "shared-data") dataFile,
+              runTest "unpack: pacman metadata skipped" $
+                if pkgInfo || mtree
+                  then Fail ".PKGINFO/.MTREE leaked into the output"
+                  else Pass,
+              runTest "unpack: executable bit materialized (unix)" $
+                if execBitOk then Pass else Fail "tool.exe not executable",
+              runTest "unpack: real NAR hash registered" $
+                if realNarHash then Pass else Fail (T.pack (show narInfo))
+            ]
+      collideChecks <-
+        sequence
+          [ runTest "unpack: cross-archive file collision fails loudly" $
+              case collideResult of
+                BuildFailure msg _
+                  | "file collision" `T.isInfixOf` msg -> Pass
+                  | otherwise -> Fail ("wrong failure: " <> msg)
+                BuildSuccess _ -> Fail "collision build unexpectedly succeeded"
+          ]
+      escapeChecks <-
+        sequence
+          [ runTest "unpack: path traversal rejected" $
+              case escapeResult of
+                BuildFailure msg _
+                  | "escapes archive root" `T.isInfixOf` msg -> Pass
+                  | otherwise -> Fail ("wrong failure: " <> msg)
+                BuildSuccess _ -> Fail "escape build unexpectedly succeeded"
+          ]
+      let rejectedWith needle res = case res of
+            BuildFailure msg _
+              | needle `T.isInfixOf` msg -> Pass
+              | otherwise -> Fail ("wrong failure: " <> msg)
+            BuildSuccess _ -> Fail "malicious entry unexpectedly built"
+      -- Integration: the real unpacker rejects a rooted entry path and an
+      -- escaping ('..') symlink/hardlink target, end to end.
+      maliciousChecks <-
+        sequence
+          [ runTest "unpack: rooted file entry rejected" $
+              rejectedWith "planted-abs.txt" rootFileResult,
+            runTest "unpack: escaping symlink target rejected" $
+              rejectedWith "escape-link-target.txt" escapeSymlinkResult,
+            runTest "unpack: escaping hardlink target rejected" $
+              rejectedWith "escape-hardlink-target.txt" escapeHardlinkResult
+          ]
+      -- Unit: the rooted (drive-relative) case is the Blocker-4 Windows vuln.
+      -- tar's toLinkTarget refuses an absolute payload on POSIX, so exercise the
+      -- guard predicate directly - portable and exact on every host.
+      guardChecks <-
+        sequence
+          [ runTest "unpack guard: rooted entry path rejected" $
+              assertLeft "rooted entry" (entryComponents "/planted-abs.txt"),
+            runTest "unpack guard: rooted symlink target rejected" $
+              assertLeft "rooted symlink" (resolveLinkTarget [] "/planted-link-target.txt"),
+            runTest "unpack guard: rooted hardlink target rejected" $
+              assertLeft "rooted hardlink" (entryComponents "/planted-hardlink-target.txt")
+          ]
+      pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ guardChecks)
 
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
 -- derivation depends on a leaf; both @.drv@ files are pre-written to the store
@@ -3269,6 +3669,124 @@ testEvalFidelity = do
       -- builtins.split: a non-participating group is null too
       runTest "split null capture group" $
         assertEval "split-null" "builtins.isNull (builtins.elemAt (builtins.elemAt (builtins.split \"(a)|(b)\" \"a\") 1) 1)" (VBool True),
+      -- builtins.match is whole-string like regex_match: top-level
+      -- alternation must not decay into a prefix/suffix match.
+      runTest "match alternation is whole-string" $
+        assertEval "match-alt" "builtins.match \"a|b\" \"ab\"" VNull,
+      runTest "match alternation positive" $
+        assertEval "match-alt-pos" "builtins.match \"a|b\" \"a\" == [ ]" (VBool True),
+      -- No multiline mode: ^/$ anchor only at the string boundaries and
+      -- '.' matches a newline, as POSIX ERE whole-string matching does.
+      runTest "match does not anchor at inner newlines" $
+        assertEval "match-nl" "builtins.match \"foo\" \"bar\\nfoo\"" VNull,
+      runTest "match dot spans newline" $
+        assertEval "match-dot-nl" "builtins.match \"(.*)\" \"a\\nb\" == [ \"a\\nb\" ]" (VBool True),
+      runTest "split dot spans newline" $
+        assertEval "split-dot-nl" "builtins.split \"a.b\" \"xa\\nby\" == [ \"x\" [ ] \"y\" ]" (VBool True),
+      -- Derivations compare by outPath alone (C++ eqValues special case) -
+      -- even when the rest of the attrs (or the key sets) differ.
+      runTest "derivation eq by outPath" $
+        assertEval
+          "drv-eq"
+          "{ type = \"derivation\"; outPath = \"/nix/store/a\"; f = (x: x); } == { type = \"derivation\"; outPath = \"/nix/store/a\"; f = (y: y); extra = 1; }"
+          (VBool True),
+      runTest "derivation neq by outPath" $
+        assertEval
+          "drv-neq"
+          "{ type = \"derivation\"; outPath = \"/a\"; } == { type = \"derivation\"; outPath = \"/b\"; }"
+          (VBool False),
+      runTest "derivation-tagged sets without outPath deep-compare" $
+        assertEval
+          "drv-no-outpath"
+          "{ type = \"derivation\"; n = 1; } == { type = \"derivation\"; n = 1; }"
+          (VBool True),
+      -- A throwing derivation attr fails evaluation - never a silent drop
+      -- (a dropped attr once produced an empty no-input .drv that "built").
+      runTest "derivation attr throw propagates" $
+        assertEvalFail "drv-throw" "(derivation { name = \"x\"; system = \"s\"; builder = \"/b\"; src = throw \"boom\"; }).drvPath",
+      -- __ignoreNulls drops null attrs; without it null coerces to "".
+      runTest "derivation ignoreNulls drops null" $
+        assertEval "drv-ignore-nulls" "builtins.isString (derivation { name = \"x\"; system = \"s\"; builder = \"/b\"; src = null; __ignoreNulls = true; }).drvPath" (VBool True),
+      runTest "derivation null coerces without ignoreNulls" $
+        assertEval "drv-null-empty" "builtins.isString (derivation { name = \"x\"; system = \"s\"; builder = \"/b\"; foo = null; }).drvPath" (VBool True),
+      -- A literal string key is static, as in upstream's parser: legal in
+      -- let, referenceable as a rec sibling.
+      runTest "let with literal string key" $
+        assertEval "let-string-key" "let \"x\" = 1; in x" (VInt 1),
+      runTest "rec string key is a referenceable sibling" $
+        assertEval "rec-string-key" "(rec { \"a\" = 1; b = a; }).b" (VInt 1),
+      -- A dynamic TOP-LEVEL key in let is a parse error upstream; nested
+      -- dynamic keys live in a nested attrset and stay legal.
+      runTest "dynamic key in let rejected" $
+        assertParseFail "let-dyn-key" "let k = \"y\"; in let ${k} = 1; in y",
+      runTest "interpolated string key in let rejected" $
+        assertParseFail "let-interp-key" "let k = \"y\"; in let \"${k}\" = 1; in y",
+      runTest "nested dynamic key in let allowed" $
+        assertEval "let-nested-dyn" "let k = \"q\"; in let a.${k} = 1; in a.q" (VInt 1),
+      -- Nested interpolated strings inside braces: the lexer's brace-depth
+      -- stack must restore the enclosing count when an interpolation
+      -- closes, or the outer attrset's '}' mislexes as TokInterpClose.
+      runTest "nested interpolated string inside attrset braces" $
+        assertEval "nested-interp" "let y = \"v\"; in \"${ { a = \"${y}\"; }.a }\"" (mkStr "v"),
+      runTest "nested interpolation in indented string" $
+        assertEval "nested-interp-ind" "let y = \"w\"; in ''pre ${ { a = ''${y}''; }.a } post''" (mkStr "pre w post"),
+      runTest "doubly nested interpolated strings" $
+        assertEval "nested-interp-2" "let y = \"z\"; in \"${ { a = \"${ { b = \"${y}\"; }.b }\"; }.a }\"" (mkStr "z"),
+      -- Attrpath merging (upstream parser.y addAttr): a literal set and a
+      -- nested path under the same key merge; genuine duplicates error.
+      runTest "literal set merges with attrpath (kept attr)" $
+        assertEval "merge-keep" "{ a = { b = 1; }; a.c = 2; }.a.b" (VInt 1),
+      runTest "literal set merges with attrpath (added attr)" $
+        assertEval "merge-add" "{ a = { b = 1; }; a.c = 2; }.a.c" (VInt 2),
+      runTest "duplicate plain key is a parse error" $
+        assertParseFail "dup-key" "{ a = 1; a = 2; }",
+      runTest "duplicate inner key on merge is an error" $
+        assertParseFail "dup-inner" "{ a.b = 1; a = { b = 2; }; }",
+      runTest "inherit conflicting with a definition is an error" $
+        assertParseFail "dup-inherit" "let q = 1; in { inherit q; q = 2; }",
+      runTest "attrpath into a non-set is an error" $
+        assertParseFail "merge-non-set" "{ a = 1; a.b = 2; }",
+      -- rec markers in attrpath merging follow upstream's addAttr: the
+      -- existing set's marker governs the result; the new set's marker is
+      -- discarded.
+      runTest "merge into rec literal keeps rec (sibling visible)" $
+        assertEval "merge-rec-keep" "{ a = rec { b = 1; }; a.c = b; }.a.c" (VInt 1),
+      runTest "merged-in rec marker is discarded (outer binding wins)" $
+        assertEval "merge-rec-discard" "let d = 7; in { a = { x = 1; }; a = rec { c = d; }; }.a.c" (VInt 7),
+      -- Exactly upstream's unprefixed global surface: fetchurl and toFile
+      -- exist only under builtins.
+      runTest "bare fetchurl is not a global" $
+        assertEvalFail "no-bare-fetchurl" "fetchurl",
+      runTest "bare toFile is not a global" $
+        assertEvalFail "no-bare-tofile" "toFile",
+      -- Dynamic keys colliding with an existing attr are an eval error,
+      -- never a silent last-win merge.
+      runTest "dynamic key colliding with static errors" $
+        assertEvalFail "dyn-collide" "{ b = 1; ${\"b\"} = 2; }",
+      runTest "rec dynamic key colliding with static errors" $
+        assertEvalFail "dyn-collide-rec" "rec { b = 1; p.q = 1; ${\"b\"} = 2; }",
+      -- Higher-order list builtins pass elements as unforced thunks: an
+      -- element the function never inspects may throw without failing.
+      runTest "filter does not force elements" $
+        assertEval "filter-lazy" "builtins.length (builtins.filter (x: true) [ (builtins.throw \"never\") ])" (VInt 1),
+      runTest "any does not force undecided elements" $
+        assertEval "any-lazy" "builtins.any (x: x) [ true (builtins.throw \"never\") ]" (VBool True),
+      runTest "foldl' passes elements unforced" $
+        assertEval "foldl-lazy" "builtins.foldl' (a: b: a) 0 [ (builtins.throw \"never\") ]" (VInt 0),
+      -- Attrset equality stops at the first mismatch; later pairs are
+      -- never forced.
+      runTest "attrset eq short-circuits" $
+        assertEval "eq-short" "{ a = 1; b = builtins.throw \"never\"; } == { a = 2; b = builtins.throw \"never\"; }" (VBool False),
+      -- toString of a float is std::to_string's fixed 6 decimals; value
+      -- printing and toJSON keep the trimmed form.
+      runTest "toString float has fixed 6 decimals" $
+        assertEval "tostr-float" "builtins.toString 1.5" (mkStr "1.500000"),
+      runTest "toJSON float stays trimmed" $
+        assertEval "tojson-float" "builtins.toJSON 1.5" (mkStr "1.5"),
+      -- path + string-with-context is an error (a store-path reference
+      -- cannot survive inside a path value).
+      runTest "path plus string with context errors" $
+        assertEvalFail "path-ctx" "./x + (derivation { name = \"q\"; system = \"s\"; builder = \"/b\"; }).drvPath",
       -- builtins.toJSON honors __toString, preferring it over outPath
       runTest "toJSON __toString" $
         assertEval "tojson-tostr" "builtins.toJSON { __toString = self: \"x\"; }" (mkStr "\"x\""),
@@ -3295,7 +3813,7 @@ testEvalFidelity = do
         assertEvalFail "substr-neg" "builtins.substring (0 - 1) 3 \"hello\"",
       -- an integer literal that overflows Int64 is a parse error, not a wrap
       runTest "integer literal overflow errors" $
-        assertEvalFail "int-overflow" "99999999999999999999",
+        assertParseFail "int-overflow" "99999999999999999999",
       -- float exponents and leading-dot floats lex per the Nix grammar
       runTest "float exponent lexes as float" $
         assertEval "float-exp-type" "builtins.typeOf 6.022e23" (mkStr "float"),
@@ -3337,7 +3855,241 @@ testHashHelpers = do
           (Hash.hexToBytes "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
           (Hash.rawHashWithAlgo "sha256" BS.empty),
       runTest "rawHashWithAlgo unknown algo rejected" $
-        assertEqual "unknown" Nothing (Hash.rawHashWithAlgo "sha3-256" (BS.pack [1, 2, 3]))
+        assertEqual "unknown" Nothing (Hash.rawHashWithAlgo "sha3-256" (BS.pack [1, 2, 3])),
+      -- verifyFetchHash: the composed builtin:fetchurl integrity gate that
+      -- guards every fixed-output seed fetch
+      runTest "verifyFetchHash accepts a matching flat hash" $
+        assertEqual
+          "fetch-hash-ok"
+          (Right ())
+          (verifyFetchHash "https://x/f.tar.gz" (fetchOut "sha256" sha256Hello) "hello"),
+      runTest "verifyFetchHash rejects mismatched bytes" $
+        case verifyFetchHash "https://x/f.tar.gz" (fetchOut "sha256" sha256Hello) "world" of
+          Left (_, msg) | "hash mismatch" `T.isInfixOf` msg -> Pass
+          other -> Fail ("expected mismatch rejection, got: " <> T.pack (show other)),
+      runTest "verifyFetchHash rejects a malformed expected hash" $
+        case verifyFetchHash "https://x/f" (fetchOut "sha256" "zz-not-hex") "hello" of
+          Left (_, msg) | "malformed expected hash" `T.isInfixOf` msg -> Pass
+          other -> Fail ("expected malformed-hash rejection, got: " <> T.pack (show other)),
+      runTest "verifyFetchHash rejects an unsupported algorithm" $
+        case verifyFetchHash "https://x/f" (fetchOut "sha3-256" "00") "hello" of
+          Left (_, msg) | "unsupported hash algorithm" `T.isInfixOf` msg -> Pass
+          other -> Fail ("expected unsupported-algo rejection, got: " <> T.pack (show other)),
+      runTest "verifyFetchHash rejects recursive mode rather than comparing flat" $
+        case verifyFetchHash "https://x/f" (fetchOut "r:sha256" sha256Hello) "hello" of
+          Left (_, msg) | "recursive" `T.isInfixOf` msg -> Pass
+          other -> Fail ("expected recursive-mode rejection, got: " <> T.pack (show other))
+    ]
+  where
+    -- sha256 of the ASCII bytes "hello".
+    sha256Hello = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    fetchOut algo hash =
+      DerivationOutput
+        { doName = "out",
+          doPath = StorePath (T.replicate 32 "f") "fetched",
+          doHashAlgo = algo,
+          doHash = hash
+        }
+
+-- ---------------------------------------------------------------------------
+-- Tests: NAR and hash known-answer vectors
+-- ---------------------------------------------------------------------------
+
+-- | Encode one NAR string per the spec: little-endian u64 length, the
+-- bytes, zero-padding to the next 8-byte boundary.  Written here from the
+-- format definition, deliberately independent of nova-cache's encoder, so
+-- these vectors pin the wire layout rather than the library against
+-- itself.
+narSpecStr :: BS.ByteString -> BS.ByteString
+narSpecStr s = lenLE <> s <> padding
+  where
+    n = BS.length s
+    lenLE = BS.pack [fromIntegral ((n `shiftR` (8 * i)) .&. 0xff) | i <- [0 .. 7]]
+    padding = BS.replicate ((8 - n `mod` 8) `mod` 8) 0
+
+-- | Hand-encoded NAR of a directory holding an executable, a plain file,
+-- and a symlink - covering entry ordering, the executable marker, content
+-- padding, and all node kinds.
+narSpecVector :: BS.ByteString
+narSpecVector =
+  BS.concat $
+    map
+      narSpecStr
+      [ "nix-archive-1",
+        "(",
+        "type",
+        "directory",
+        "entry",
+        "(",
+        "name",
+        "bin",
+        "node",
+        "(",
+        "type",
+        "directory",
+        "entry",
+        "(",
+        "name",
+        "tool",
+        "node",
+        "(",
+        "type",
+        "regular",
+        "executable",
+        "",
+        "contents",
+        "#!x",
+        ")",
+        ")",
+        ")",
+        ")",
+        "entry",
+        "(",
+        "name",
+        "data.txt",
+        "node",
+        "(",
+        "type",
+        "regular",
+        "contents",
+        "hello\n",
+        ")",
+        ")",
+        "entry",
+        "(",
+        "name",
+        "link",
+        "node",
+        "(",
+        "type",
+        "symlink",
+        "target",
+        "data.txt",
+        ")",
+        ")",
+        ")"
+      ]
+
+-- | The in-memory tree 'narSpecVector' encodes.
+narSpecTree :: NAR.NarEntry
+narSpecTree =
+  NAR.NarDirectory
+    [ ("bin", NAR.NarDirectory [("tool", NAR.NarRegular True "#!x")]),
+      ("data.txt", NAR.NarRegular False "hello\n"),
+      ("link", NAR.NarSymlink "data.txt")
+    ]
+
+-- | Hand-encoded NAR of just @data.txt@, for the on-disk addToStore vector
+-- (no executable entry: Windows has no exec bit to round-trip from disk).
+narSpecFileVector :: BS.ByteString
+narSpecFileVector =
+  BS.concat $
+    map
+      narSpecStr
+      [ "nix-archive-1",
+        "(",
+        "type",
+        "directory",
+        "entry",
+        "(",
+        "name",
+        "data.txt",
+        "node",
+        "(",
+        "type",
+        "regular",
+        "contents",
+        "hello\n",
+        ")",
+        ")",
+        ")"
+      ]
+
+-- | fromTOML: multi-line values (the Cargo.lock shapes) and comment
+-- placement relative to strings.
+testFromTOML :: IO [Bool]
+testFromTOML = do
+  putStrLn "eval/fromTOML"
+  sequence
+    [ runTest "multi-line array" $
+        assertEval
+          "toml-ml-array"
+          "builtins.concatStringsSep \",\" (builtins.fromTOML \"deps = [\\n \\\"bar\\\",\\n \\\"baz\\\",\\n]\\n\").deps"
+          (mkStr "bar,baz"),
+      runTest "Cargo.lock package shape" $
+        assertEval
+          "toml-cargo-lock"
+          "(builtins.elemAt (builtins.fromTOML \"[[package]]\\nname = \\\"foo\\\"\\ndependencies = [\\n \\\"bar\\\",\\n]\\n\").package 0).name"
+          (mkStr "foo"),
+      runTest "multi-line basic string" $
+        assertEval
+          "toml-ml-string"
+          "(builtins.fromTOML \"s = \\\"\\\"\\\"\\nline1\\nline2\\\"\\\"\\\"\").s"
+          (mkStr "line1\nline2"),
+      runTest "multi-line literal string" $
+        assertEval
+          "toml-ml-literal"
+          "(builtins.fromTOML \"s = '''\\nkeep'''\").s"
+          (mkStr "keep"),
+      runTest "comment inside a multi-line array" $
+        assertEval
+          "toml-ml-comment"
+          "builtins.concatStringsSep \",\" (builtins.fromTOML \"deps = [ # opening\\n \\\"bar\\\", # trailing\\n]\").deps"
+          (mkStr "bar"),
+      runTest "hash inside a string is content" $
+        assertEval
+          "toml-hash-content"
+          "(builtins.fromTOML \"s = \\\"\\\"\\\"a#b\\\"\\\"\\\"\").s"
+          (mkStr "a#b"),
+      runTest "single-line values still parse" $
+        assertEval
+          "toml-single-line"
+          "(builtins.fromTOML \"x = 4\\ny = \\\"z\\\" # cmt\").y"
+          (mkStr "z")
+    ]
+
+testNarKnownAnswer :: IO [Bool]
+testNarKnownAnswer = do
+  putStrLn "nar/known-answer"
+  sequence
+    [ runTest "serialise matches the hand-written spec vector" $
+        if NAR.serialise narSpecTree == narSpecVector
+          then Pass
+          else Fail "NAR encoder no longer matches the spec byte layout",
+      runTest "deserialise reads the spec vector back" $
+        case NAR.deserialise narSpecVector of
+          Right entry
+            | NAR.serialise entry == narSpecVector -> Pass
+            | otherwise -> Fail "spec vector round-trips to different bytes"
+          Left err -> Fail ("spec vector rejected: " <> T.pack err),
+      -- The empty-input SHA-256 in nix-base32: pins digest, alphabet, and
+      -- bit order against the value real Nix computes.
+      runTest "sha256 empty formats to the known nix-base32 vector" $
+        assertEqual
+          "nix32-empty"
+          "sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73"
+          (CHash.formatNixHash (CHash.hashBytes BS.empty)),
+      -- addToStore must record exactly the hash of the spec bytes for the
+      -- same tree, or interop with every real cache silently breaks.
+      runTestM "addToStore records the externally-computed NAR hash" $ do
+        tmpBase <- getTemporaryDirectory
+        let srcDir = tmpBase </> "nova-nix-test-nar-vector-src"
+            tmpStore = tmpBase </> "nova-nix-test-nar-vector-store"
+        forceRemoveIfExists srcDir
+        forceRemoveIfExists tmpStore
+        createDirectoryIfMissing True srcDir
+        createDirectoryIfMissing True tmpStore
+        BS.writeFile (srcDir </> "data.txt") "hello\n"
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath (T.replicate 32 "e") "nar-vector"
+        addToStore store srcDir sp Nothing []
+        recorded <- queryPathInfo (stDB store) sp
+        closeStore store
+        forceRemoveIfExists tmpStore
+        let expected = CHash.formatNixHash (CHash.hashBytes narSpecFileVector)
+        pure $ case recorded of
+          Just info -> assertEqual "recorded NarHash" expected (piNarHash info)
+          Nothing -> Fail "path not registered"
     ]
 
 testStoreOps :: IO [Bool]
@@ -3402,6 +4154,31 @@ testStoreOps = do
           refs <- scanReferences [candidate] scanDir
           removeIfExists scanDir
           pure (assertEqual "no partial refs" [] refs),
+        -- scanTempReferences records the self/cross-output edges that the
+        -- store-prefix scan cannot see (outputs embedding their TEMP path)
+        runTestM "scanTempReferences finds temp-dir embedding" $ do
+          tmpBase <- getTemporaryDirectory
+          let scanDir = tmpBase </> "nova-nix-test-scan-temp"
+              fakeTempOut = tmpBase </> "nova-nix-build" </> "fake-out"
+          removeIfExists scanDir
+          createDirectoryIfMissing True scanDir
+          let selfSp = StorePath "cccccccccccccccccccccccccccccccc" "self"
+          BS.writeFile
+            (scanDir </> "wrapper.sh")
+            (TE.encodeUtf8 (T.pack ("exec " <> fakeTempOut <> "/bin/tool")))
+          found <- scanTempReferences [(fakeTempOut, selfSp)] scanDir
+          removeIfExists scanDir
+          pure (assertEqual "self-ref found" [selfSp] found),
+        runTestM "scanTempReferences negative" $ do
+          tmpBase <- getTemporaryDirectory
+          let scanDir = tmpBase </> "nova-nix-test-scan-temp-neg"
+          removeIfExists scanDir
+          createDirectoryIfMissing True scanDir
+          let selfSp = StorePath "cccccccccccccccccccccccccccccccc" "self"
+          BS.writeFile (scanDir </> "clean.txt") "no temp paths embedded here"
+          found <- scanTempReferences [(tmpBase </> "nova-nix-build" </> "fake-out", selfSp)] scanDir
+          removeIfExists scanDir
+          pure (assertEqual "no refs" [] found),
         -- addToStore moves dir + registers in DB
         runTestM "addToStore moves + registers" $ do
           tmpBase <- getTemporaryDirectory
@@ -4912,6 +5689,100 @@ testBytecodeCompile = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: substituter signature verification (the --trusted-key trust gate)
+-- ---------------------------------------------------------------------------
+
+-- | Minimal narinfo for signing tests; the fingerprint covers StorePath,
+-- NarHash, NarSize, and References.
+sigTestNarInfo :: NarInfo.NarInfo
+sigTestNarInfo =
+  NarInfo.NarInfo
+    { NarInfo.niStorePath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0",
+      NarInfo.niUrl = "nar/aaaa.nar",
+      NarInfo.niCompression = "none",
+      NarInfo.niFileHash = "sha256:" <> T.replicate 52 "0",
+      NarInfo.niFileSize = 1,
+      NarInfo.niNarHash = "sha256:" <> T.replicate 52 "0",
+      NarInfo.niNarSize = 1,
+      NarInfo.niReferences = [],
+      NarInfo.niDeriver = Nothing,
+      NarInfo.niSigs = [],
+      NarInfo.niCA = Nothing
+    }
+
+-- | A substituter cache trusting the given public key text.
+sigTestCache :: Text -> Subst.CacheConfig
+sigTestCache publicKeyText =
+  Subst.CacheConfig
+    { Subst.ccUrl = "http://localhost/test-cache",
+      Subst.ccPublicKey = publicKeyText,
+      Subst.ccPriority = 40
+    }
+
+-- | Deterministic Ed25519 test keys: a nix secret key file is
+-- seed(32) + public(32), and both signing and public-key derivation use
+-- only the seed, so the public half can be zeros here.  Both keys carry
+-- the SAME name so the wrong-key test exercises the cryptographic
+-- verification, not just the name comparison.
+sigTestKeyText, sigTestWrongKeyText :: Text
+sigTestKeyText = "test-key-1:" <> B64.encode (BS.pack ([1 .. 32] ++ replicate 32 0))
+sigTestWrongKeyText = "test-key-1:" <> B64.encode (BS.pack ([101 .. 132] ++ replicate 32 0))
+
+-- | Derive (trusted cache, signature by the trusted key, signature by an
+-- impostor key with the same name).  Left on any setup failure.
+sigTestSetup :: Either String (Subst.CacheConfig, Text, Text)
+sigTestSetup = do
+  secretKey <- Signing.parseSecretKey sigTestKeyText
+  impostorKey <- Signing.parseSecretKey sigTestWrongKeyText
+  publicKey <- Signing.toPublicKey secretKey
+  let publicKeyText = Signing.renderPublicKey publicKey
+  validSig <- Signing.sign secretKey sigTestNarInfo
+  impostorSig <- Signing.sign impostorKey sigTestNarInfo
+  pure (sigTestCache publicKeyText, validSig, impostorSig)
+
+-- | verifySigs is the security boundary behind @--trusted-key@: unsigned
+-- narinfos, wrong-key signatures, and malformed trusted keys must all be
+-- rejected; a valid signature must be accepted.
+testVerifySigs :: IO [Bool]
+testVerifySigs = do
+  putStrLn "substituter/verify-sigs"
+  case sigTestSetup of
+    Left err -> (: []) <$> runTest "verifySigs test setup" (Fail (T.pack err))
+    Right (cache, validSig, impostorSig) ->
+      sequence
+        [ runTest "valid signature accepted" $
+            assertEqual "verify ok" (Right ()) (Subst.verifySigs cache sigTestNarInfo {NarInfo.niSigs = [validSig]}),
+          runTest "unsigned narinfo rejected" $
+            assertLeft "no sigs" (Subst.verifySigs cache sigTestNarInfo),
+          runTest "same-name signature from a different key rejected" $
+            assertLeft "impostor sig" (Subst.verifySigs cache sigTestNarInfo {NarInfo.niSigs = [impostorSig]}),
+          runTest "valid signature among invalid ones accepted" $
+            assertEqual "any valid" (Right ()) (Subst.verifySigs cache sigTestNarInfo {NarInfo.niSigs = [impostorSig, validSig]}),
+          runTest "signature under a different key name rejected" $
+            assertLeft "name mismatch" (Subst.verifySigs cache sigTestNarInfo {NarInfo.niSigs = ["other-key:" <> T.drop (T.length "test-key-1:") validSig]}),
+          runTest "malformed trusted public key rejected" $
+            assertLeft "bad pubkey" (Subst.verifySigs (sigTestCache "not-a-key") sigTestNarInfo {NarInfo.niSigs = [validSig]})
+        ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: resolver static globals stay in sync with the root env
+-- ---------------------------------------------------------------------------
+
+-- | Every name the resolver treats as a static global must actually be
+-- bound in the root environment: 'Nix.Expr.Resolve.resolveVar' leaves such
+-- names as 'EVar' even under a @with@, so an unbound one would surface as
+-- an undefined variable.  Layering keeps Resolve from importing Builtins,
+-- so this test is the sync guarantee between the two lists.
+testStaticGlobalsSync :: IO [Bool]
+testStaticGlobalsSync = do
+  putStrLn "resolve/static-globals-sync"
+  mapM checkBound (Set.toList staticGlobalNames)
+  where
+    checkBound name =
+      runTest ("static global '" <> name <> "' is bound in the root env") $
+        assertEval ("global-" <> name) ("builtins.seq " <> name <> " true") (VBool True)
+
+-- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
 
@@ -4932,6 +5803,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testDependentBuildIO,
           testEvalFidelity,
           testHashHelpers,
+          testNarKnownAnswer,
           testEvalLiterals,
           testEvalVariables,
           testEvalArithmetic,
@@ -4946,12 +5818,14 @@ main = bracket_ arenaInit arenaDestroy $ do
           testEvalLambda,
           testEvalWith,
           testEvalBuiltins,
+          testFromTOML,
           testEvalErrors,
           testEvalHigherOrder,
           testLexer,
           testParserExprs,
           testParserErrors,
           testParserIntegration,
+          testStaticGlobalsSync,
           testBatch1,
           testBatch2,
           testBatch3,
@@ -4962,6 +5836,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testImportPure,
           testImportIO,
           testBlackholeRecoveryIO,
+          testPathFilterIO,
           testBatchA,
           testBatchAIO,
           testBatchB,
@@ -4980,6 +5855,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testDrvContext,
           testDepGraph,
           testSubstituter,
+          testVerifySigs,
           testPushPure,
           testPushClosureIO,
           testBuildOrchestrator,

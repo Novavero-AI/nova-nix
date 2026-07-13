@@ -23,6 +23,7 @@ module Nix.Eval.IO
     newEvalState,
 
     -- * Errors
+    EvalErrorKind (..),
     NixEvalError (..),
     NixAbortError (..),
   )
@@ -40,7 +41,6 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
-import qualified Data.Text.IO as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
@@ -51,7 +51,7 @@ import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
-import Nix.Hash (makeFixedOutputPath, sha256Digest, sha256Hex, truncatedBase32)
+import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
@@ -66,8 +66,16 @@ import qualified System.Process as Proc
 -- Error type
 -- ---------------------------------------------------------------------------
 
--- | Evaluation error surfaced as an IO exception (catchable by tryEval).
-newtype NixEvalError = NixEvalError Text
+-- | How an eval-time failure interacts with @builtins.tryEval@:
+-- 'ErrorThrown' (@builtins.throw@, a failed @assert@) is catchable,
+-- matching upstream's ThrownError\/AssertionError; 'ErrorUncatchable'
+-- (type errors, missing attributes, IO failures) escapes tryEval like
+-- every other upstream EvalError.
+data EvalErrorKind = ErrorThrown | ErrorUncatchable
+  deriving (Eq, Show)
+
+-- | Evaluation error surfaced as an IO exception.
+data NixEvalError = NixEvalError !EvalErrorKind !Text
   deriving (Show)
 
 instance Exception NixEvalError
@@ -107,7 +115,6 @@ data EvalState = EvalState
     -- literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text Text)),
     esBaseDir :: !FilePath,
-    esStoreDir :: !FilePath,
     esTimestamp :: !Int64,
     esSearchPaths :: ![Thunk]
   }
@@ -132,7 +139,6 @@ newEvalState baseDir = do
         esDrvClosure = drvClosure,
         esSourcePathCache = srcCache,
         esBaseDir = baseDir,
-        esStoreDir = T.unpack SP.platformStoreDirText,
         esTimestamp = now,
         esSearchPaths = searchPaths
       }
@@ -150,13 +156,20 @@ newtype EvalIO a = EvalIO {unEvalIO :: ReaderT EvalState IO a}
 -- ---------------------------------------------------------------------------
 
 instance MonadEval EvalIO where
-  throwEvalError msg = EvalIO (liftIO (throwIO (NixEvalError msg)))
+  throwEvalError msg = EvalIO (liftIO (throwIO (NixEvalError ErrorUncatchable msg)))
+  throwCatchableError msg = EvalIO (liftIO (throwIO (NixEvalError ErrorThrown msg)))
   abortEvaluation msg = EvalIO (liftIO (throwIO (NixAbortError msg)))
 
+  -- tryEval semantics: recover from a throw/assert only; an uncatchable
+  -- eval error is rethrown (aborts are a separate exception type and
+  -- never enter the 'try').
   catchEvalError (EvalIO action) = EvalIO $ do
     st <- ask
     result <- liftIO (try (runReaderT action st))
-    pure (case result of Left (NixEvalError msg) -> Left msg; Right val -> Right val)
+    case result of
+      Left (NixEvalError ErrorThrown msg) -> pure (Left msg)
+      Left err@(NixEvalError ErrorUncatchable _) -> liftIO (throwIO err)
+      Right val -> pure (Right val)
 
   readFileText path = wrapIO (readFileAutoEncoding (T.unpack path))
 
@@ -246,7 +259,7 @@ instance MonadEval EvalIO where
 
   getCurrentTime = EvalIO (asks esTimestamp)
 
-  writeToStore name contents = do
+  writeToStore name contents refs = do
     -- Validate name to prevent path traversal
     when (T.any (== '/') name) $
       throwEvalError ("writeToStore: name must not contain '/': " <> name)
@@ -256,23 +269,17 @@ instance MonadEval EvalIO where
       throwEvalError ("writeToStore: name must not contain '..': " <> name)
     when (T.any (== '\0') name) $
       throwEvalError ("writeToStore: name must not contain null bytes: " <> name)
-    storeDir <- EvalIO (asks esStoreDir)
-    -- The preimage is built inline against the LIVE storeDir (esStoreDir), not
-    -- via Nix.Hash.makeStorePath which pins the canonical defaultStoreDir for
-    -- cross-platform .drv-hash parity.  toFile outputs are host-local, so they
-    -- must use the running store dir - keep this format in sync with
-    -- makeStorePath's preimage (type:sha256:hex:storeDir:name).
-    let contentHash = sha256Hex (encodeUtf8 contents)
-        inner = "nix-store:sha256:" <> contentHash <> ":" <> T.pack storeDir <> ":" <> name
-        pathHash = truncatedBase32 (encodeUtf8 inner)
-        basename = pathHash <> "-" <> name
-        -- File path uses platform separator for I/O
-        filePath = storeDir </> T.unpack basename
-        -- Store path text always uses forward slash (Nix convention)
-        storePath = T.pack storeDir <> "/" <> basename
+    -- Upstream's text-path scheme via makeTextPath - the same scheme .drv
+    -- paths use, so it is parity-validated: type @text:<refs>@, flat
+    -- sha256 of the contents, canonical store dir.  Written as UTF-8
+    -- BYTES: text-mode IO would CRLF-translate on Windows and the stored
+    -- bytes would no longer match the hash that named the path.
+    let sp = makeTextPath name (sha256Digest (encodeUtf8 contents)) refs
+        filePath = SP.storePathToFilePath SP.defaultStoreDir sp
+        storePath = SP.storePathToText SP.defaultStoreDir sp
     wrapIO $ do
-      Dir.createDirectoryIfMissing True storeDir
-      TIO.writeFile filePath contents
+      Dir.createDirectoryIfMissing True (takeDirectory filePath)
+      BS.writeFile filePath (encodeUtf8 contents)
     pure storePath
 
   scopedImportFile scope rawPath = do
@@ -320,7 +327,7 @@ instance MonadEval EvalIO where
           ExitFailure n -> n
     pure (code, T.pack stdoutStr, T.pack stderrStr)
 
-  copyPathToStore srcPath name = do
+  copyPathToStore srcPath name expectedSha256 = do
     -- Validate name to prevent path traversal (matches writeToStore)
     when (T.any (== '/') name) $
       throwEvalError ("copyPathToStore: name must not contain '/': " <> name)
@@ -330,19 +337,50 @@ instance MonadEval EvalIO where
       throwEvalError ("copyPathToStore: name must not contain '..': " <> name)
     when (T.any (== '\0') name) $
       throwEvalError ("copyPathToStore: name must not contain null bytes: " <> name)
-    storeDir <- EvalIO (asks esStoreDir)
-    -- Inline host-local store-path preimage (see writeToStore's note): uses the
-    -- live esStoreDir, not makeStorePath's pinned defaultStoreDir.
-    let contentHash = sha256Hex (encodeUtf8 ("source:" <> srcPath <> ":" <> name))
-        inner = "nix-store:sha256:" <> contentHash <> ":" <> T.pack storeDir <> ":" <> name
-        pathHash = truncatedBase32 (encodeUtf8 inner)
-        basename = pathHash <> "-" <> name
-        -- File path uses platform separator for I/O
-        destFilePath = storeDir </> T.unpack basename
-        -- Store path text always uses forward slash (Nix convention)
-        destPath = T.pack storeDir <> "/" <> basename
-    wrapIO (copyToStoreIfMissing (T.unpack srcPath) destFilePath storeDir)
+    -- Content-addressed like upstream addToStore: recursive NAR sha256
+    -- under the caller's name.  Same content means same path, so the
+    -- existence check in copyToStoreIfMissing is sound - changed source
+    -- content can never serve stale bytes from an earlier copy (the old
+    -- scheme hashed the path STRING, so it did exactly that).
+    entry <- wrapIO (NAR.serialiseFromPath (T.unpack srcPath))
+    let narDigest = sha256Digest (NAR.serialise entry)
+    case expectedSha256 of
+      Just (subject, expected)
+        | expected /= narDigest ->
+            throwEvalError
+              ( subject
+                  <> ": hash mismatch: expected sha256:"
+                  <> bytesToHexText expected
+                  <> ", got sha256:"
+                  <> bytesToHexText narDigest
+              )
+      _ -> pure ()
+    let sp = makeFixedOutputPath name "sha256" "recursive" narDigest
+        destFilePath = SP.storePathToFilePath SP.defaultStoreDir sp
+        destPath = SP.storePathToText SP.defaultStoreDir sp
+    wrapIO (copyToStoreIfMissing (T.unpack srcPath) destFilePath (takeDirectory destFilePath))
     pure destPath
+
+  isExecutableFile path = wrapIO (Dir.executable <$> Dir.getPermissions (T.unpack path))
+
+  readSymlinkTarget path = wrapIO (T.pack <$> Dir.getSymbolicLinkTarget (T.unpack path))
+
+  addSourceNar name narBytes =
+    case NAR.deserialise narBytes of
+      -- Unreachable in practice: the bytes come from NAR.serialise of a
+      -- tree this process just built.  Kept total for the FFI-adjacent
+      -- boundary rather than trusting the round trip.
+      Left err -> throwEvalError ("builtins.path: internal NAR round-trip error: " <> T.pack err)
+      Right entry -> do
+        let sp = makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes)
+            destFilePath = SP.storePathToFilePath SP.defaultStoreDir sp
+            destPath = SP.storePathToText SP.defaultStoreDir sp
+        wrapIO $ do
+          alreadyThere <- Dir.doesPathExist destFilePath
+          unless alreadyThere $ do
+            Dir.createDirectoryIfMissing True (takeDirectory destFilePath)
+            materializeNarEntry destFilePath entry
+        pure destPath
 
   addFixedOutputFile name bytes = do
     -- Canonical fixed-output path: a sha256-pinned fetch must land at the same
@@ -519,7 +557,7 @@ wrapIO action = EvalIO $ liftIO $ do
       | Just (_ :: SomeAsyncException) <- fromException err -> throwIO err
       | Just abortErr <- fromException err -> throwIO (abortErr :: NixAbortError)
       | Just nixErr <- fromException err -> throwIO (nixErr :: NixEvalError)
-      | otherwise -> throwIO (NixEvalError (T.pack (displayException err)))
+      | otherwise -> throwIO (NixEvalError ErrorUncatchable (T.pack (displayException err)))
 
 -- | Run an IO evaluation, returning @Left@ on error.
 --
@@ -532,7 +570,7 @@ runEvalIO st (EvalIO action) = do
     Right val -> pure (Right val)
     Left (err :: SomeException)
       | Just (_ :: SomeAsyncException) <- fromException err -> throwIO err
-      | Just (NixEvalError msg) <- fromException err -> pure (Left msg)
+      | Just (NixEvalError _ msg) <- fromException err -> pure (Left msg)
       | Just (NixAbortError msg) <- fromException err -> pure (Left msg)
       | otherwise -> pure (Left (T.pack (displayException err)))
 
@@ -621,3 +659,22 @@ copyPath src dest = do
       entries <- Dir.listDirectory src
       mapM_ (\entry -> copyPath (src </> entry) (dest </> entry)) entries
     else Dir.copyFile src dest
+
+-- | Write a NAR entry tree to disk: files with their executable bit,
+-- directories recursively, symlinks as symlinks (directory links when the
+-- target resolves to a directory, matching how the tree was serialized).
+materializeNarEntry :: FilePath -> NAR.NarEntry -> IO ()
+materializeNarEntry dest (NAR.NarRegular isExec contents) = do
+  BS.writeFile dest contents
+  when isExec $ do
+    perms <- Dir.getPermissions dest
+    Dir.setPermissions dest (Dir.setOwnerExecutable True perms)
+materializeNarEntry dest (NAR.NarSymlink target) = do
+  let resolved = takeDirectory dest </> T.unpack target
+  targetIsDir <- Dir.doesDirectoryExist resolved
+  if targetIsDir
+    then Dir.createDirectoryLink (T.unpack target) dest
+    else Dir.createFileLink (T.unpack target) dest
+materializeNarEntry dest (NAR.NarDirectory entries) = do
+  Dir.createDirectoryIfMissing True dest
+  mapM_ (\(name, entry) -> materializeNarEntry (dest </> T.unpack name) entry) entries

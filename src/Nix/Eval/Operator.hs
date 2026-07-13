@@ -22,6 +22,7 @@ import Nix.Eval.Types
     Thunk (..),
     attrSetElems,
     attrSetKeys,
+    attrSetLookup,
     thunkSameRef,
     typeName,
   )
@@ -72,16 +73,16 @@ evalUnary OpNegate val = case val of
   VFloat n -> pure (VFloat (negate n))
   other -> throwEvalError ("cannot negate " <> typeName other)
 
--- | Addition: int/float arithmetic, string concatenation, path append.
+-- | Addition: int/float arithmetic and string concatenation.  Path
+-- operands never reach here - @Nix.Eval.evalAddWithCoercion@ handles them
+-- (store-copy coercion for @string + path@, context checks for
+-- @path + string@) before delegating.
 evalAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 evalAdd (VInt a) (VInt b) = pure (VInt (a + b))
 evalAdd (VInt a) (VFloat b) = pure (VFloat (fromIntegral a + b))
 evalAdd (VFloat a) (VInt b) = pure (VFloat (a + fromIntegral b))
 evalAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
 evalAdd (VStr a ctxA) (VStr b ctxB) = pure (VStr (a <> b) (ctxA <> ctxB))
-evalAdd (VPath a) (VStr b _) = pure (VPath (a <> b))
-evalAdd (VPath a) (VPath b) = pure (VPath (a <> b))
-evalAdd (VStr a ctxA) (VPath b) = pure (VStr (a <> b) ctxA)
 evalAdd left right =
   throwEvalError ("cannot add " <> typeName left <> " and " <> typeName right)
 
@@ -194,13 +195,57 @@ nixEqual _ (VPath a) (VPath b) = pure (a == b)
 nixEqual forceFn (VList clA) (VList clB)
   | clistLen clA /= clistLen clB = pure False
   | otherwise = listEqual forceFn (map Thunk (clistThunks clA)) (map Thunk (clistThunks clB))
-nixEqual forceFn (VAttrs as) (VAttrs bs)
-  | attrSetKeys as /= attrSetKeys bs = pure False
-  | otherwise = do
-      let pairs = zip (attrSetElems as) (attrSetElems bs)
-      results <- mapM (thunkPairEqual forceFn) pairs
-      pure (and results)
+nixEqual forceFn (VAttrs as) (VAttrs bs) = do
+  drvOutPaths <- derivationOutPathPair forceFn as bs
+  case drvOutPaths of
+    Just outPathPair -> thunkPairEqual forceFn outPathPair
+    Nothing
+      | attrSetKeys as /= attrSetKeys bs -> pure False
+      | otherwise ->
+          -- Short-circuit on the first mismatch: later pairs are never
+          -- forced, so errors past the deciding pair cannot surface
+          -- (upstream stops comparing there too).
+          allPairsEqual (zip (attrSetElems as) (attrSetElems bs))
+  where
+    allPairsEqual [] = pure True
+    allPairsEqual (pair : rest) = do
+      eq <- thunkPairEqual forceFn pair
+      if eq then allPairsEqual rest else pure False
 nixEqual _ _ _ = pure False
+
+-- | When both attr sets are derivations (a @type@ attr forcing to the string
+-- @"derivation"@) and both carry an @outPath@, the pair of outPath thunks.
+--
+-- C++ Nix's eqValues compares derivations by outPath ALONE, before any
+-- key-set comparison: two mkDerivation results with the same outPath are
+-- equal even though their lambda attrs (override, overrideAttrs) never are,
+-- and distinct self-referential finalAttrs packages would otherwise recurse
+-- forever.  If either set lacks an outPath, fall through to deep comparison,
+-- exactly as upstream does.
+derivationOutPathPair :: (MonadEval m) => Force m -> AttrSet -> AttrSet -> m (Maybe (Thunk, Thunk))
+derivationOutPathPair forceFn as bs = do
+  leftIsDrv <- isDerivationSet forceFn as
+  if not leftIsDrv
+    then pure Nothing
+    else do
+      rightIsDrv <- isDerivationSet forceFn bs
+      pure $
+        if rightIsDrv
+          then (,) <$> attrSetLookup "outPath" as <*> attrSetLookup "outPath" bs
+          else Nothing
+
+-- | Does the set carry @type = "derivation"@?  Forces only the @type@ attr
+-- (as upstream's isDerivation does); a non-string type is simply not a
+-- derivation, not an error.
+isDerivationSet :: (MonadEval m) => Force m -> AttrSet -> m Bool
+isDerivationSet forceFn attrs =
+  case attrSetLookup "type" attrs of
+    Nothing -> pure False
+    Just typeThunk -> do
+      typeVal <- forceFn typeThunk
+      case typeVal of
+        VStr tag _ -> pure (tag == "derivation")
+        _ -> pure False
 
 -- | Pairwise equality of two thunk lists (for list comparison).
 listEqual :: (MonadEval m) => Force m -> [Thunk] -> [Thunk] -> m Bool

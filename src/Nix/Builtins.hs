@@ -56,15 +56,20 @@ builtinEnv timestamp searchPaths =
 
 -- | Builtins exposed at the top level (without @builtins.@ prefix).
 -- This matches real Nix - nixpkgs uses these unqualified everywhere.
+-- Exactly upstream's unprefixed surface: fetchurl and toFile are
+-- deliberately NOT here (upstream exposes them only under @builtins.@,
+-- and nixpkgs relies on @with pkgs; fetchurl@ binding pkgs.fetchurl).
 topLevelBuiltinNames :: [Text]
 topLevelBuiltinNames =
   [ "abort",
     "baseNameOf",
+    "break",
     "derivation",
+    "derivationStrict",
     "dirOf",
     "fetchGit",
     "fetchTarball",
-    "fetchurl",
+    "fromTOML",
     "import",
     "isNull",
     "map",
@@ -72,7 +77,6 @@ topLevelBuiltinNames =
     "removeAttrs",
     "scopedImport",
     "throw",
-    "toFile",
     "toString"
   ]
 

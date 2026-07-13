@@ -41,19 +41,22 @@ module Nix.Substituter
 
     -- * Pure helpers (exported for testing)
     sortCaches,
+    tryCachesWith,
     verifySigs,
     verifyNarHash,
     narInfoMatchesPath,
     decompressNar,
     unpackNarEntry,
+    clearStaleDestination,
     parseReferences,
     parseDeriver,
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
-import Control.Monad (when)
+import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.List (sortBy)
@@ -115,23 +118,33 @@ data SubstResult
 
 -- | Try to substitute a store path from configured caches.
 --
--- Checks each cache in priority order.  Returns on first success.
--- Uses nova-cache library for narinfo parsing, NAR unpacking,
--- and signature verification.
+-- Checks each cache in priority order.  Returns on first success; a
+-- failing cache falls through to the remaining ones.  Uses nova-cache
+-- library for narinfo parsing, NAR unpacking, and signature verification.
 trySubstitute :: Store -> [CacheConfig] -> StorePath -> IO SubstResult
 trySubstitute _ [] _ = pure SubstNotFound
 trySubstitute store caches sp = do
   -- Reuse the process-global TLS manager (connection pooling / keep-alive)
   -- rather than creating a fresh one per call and per output.
   manager <- HTTPS.getGlobalManager
-  tryCaches manager (sortCaches caches) sp
+  tryCachesWith (\cache -> tryOneCache manager store cache sp) (sortCaches caches)
+
+-- | Fold per-cache attempts in priority order.  The first success wins and
+-- stops the scan.  An erroring cache falls through to the remaining ones -
+-- a transient failure (DNS, TLS, HTTP 500, unsupported compression) from a
+-- higher-priority cache must not mask a hit in the next - and the first
+-- error, tagged with its cache URL, is reported only when no cache has the
+-- path.
+tryCachesWith :: (Monad m) => (CacheConfig -> m SubstResult) -> [CacheConfig] -> m SubstResult
+tryCachesWith attempt = go Nothing
   where
-    tryCaches _ [] _ = pure SubstNotFound
-    tryCaches mgr (cache : rest) storePath = do
-      result <- tryOneCache mgr store cache storePath
+    go firstErr [] = pure (maybe SubstNotFound SubstError firstErr)
+    go firstErr (cache : rest) = do
+      result <- attempt cache
       case result of
-        SubstNotFound -> tryCaches mgr rest storePath
-        other -> pure other
+        SubstSuccess found -> pure (SubstSuccess found)
+        SubstNotFound -> go firstErr rest
+        SubstError err -> go (firstErr <|> Just (ccUrl cache <> ": " <> err)) rest
 
 -- | Attempt substitution from a single cache, catching all exceptions.
 tryOneCache :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> IO SubstResult
@@ -205,7 +218,9 @@ unpackAndRegister store sp narInfo rawNar =
       Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
       Right narEntry -> do
         let destPath = storePathToFilePath (stDir store) sp
-        unpackResult <- try (unpackNarEntry destPath narEntry)
+        unpackResult <- try $ do
+          clearStaleDestination destPath
+          unpackNarEntry destPath narEntry
         case (unpackResult :: Either SomeException (Either Text ())) of
           Left err -> pure (SubstError ("unpack failed: " <> T.pack (show err)))
           Right (Left err) -> pure (SubstError ("unpack failed: " <> err))
@@ -403,44 +418,119 @@ parseDeriver storeDir (Just txt)
 -- NAR unpacking
 -- ---------------------------------------------------------------------------
 
+-- | Remove a leftover destination tree before unpacking.  A crash (or a
+-- failed registration) between 'setReadOnly' and 'registerPath' leaves a
+-- read-only, unregistered tree; unpacking over it would then fail with
+-- permission-denied on every retry, permanently wedging substitution of
+-- that path.  'Dir.removePathForcibly' clears read-only marks and accepts
+-- a missing path, so the fresh unpack always starts from a clean slate.
+clearStaleDestination :: FilePath -> IO ()
+clearStaleDestination = Dir.removePathForcibly
+
 -- | Unpack a NarEntry tree to a filesystem destination.  Returns @Left@ on an
 -- unsafe entry name (path traversal); these come from untrusted cache data, so
 -- a typed failure is used instead of a partial 'error'.
+--
+-- Regular files and directories are written in one pass; symlinks are
+-- created in a second pass, after their targets are materialized.  Windows
+-- symlinks are typed (file vs directory) and the NAR format does not record
+-- the target's kind, so the only reliable way to pick the flavor is to look
+-- at the target on disk - which may sort after the link within the tree.
 unpackNarEntry :: FilePath -> NAR.NarEntry -> IO (Either Text ())
-unpackNarEntry path entry = case entry of
+unpackNarEntry path entry = do
+  walked <- unpackTree path entry
+  case walked of
+    Left err -> pure (Left err)
+    Right links -> createSymlinks links
+
+-- | First unpack pass: write regular files and directories, recording
+-- symlinks as (link path, target) for the second pass.
+unpackTree :: FilePath -> NAR.NarEntry -> IO (Either Text [(FilePath, Text)])
+unpackTree path entry = case entry of
   NAR.NarRegular isExec contents -> do
     createDirectoryIfMissing True (takeDirectory path)
     BS.writeFile path contents
     when isExec $ do
       perms <- Dir.getPermissions path
       setPermissions path (Dir.setOwnerExecutable True perms)
-    pure (Right ())
-  NAR.NarSymlink target -> do
-    createDirectoryIfMissing True (takeDirectory path)
-    -- On Windows, symlinks require elevated permissions.
-    -- Fall back to writing the target as a text file.
-    result <- try (Dir.createFileLink (T.unpack target) path)
-    case result of
-      Right () -> pure (Right ())
-      Left (_ :: SomeException) -> do
-        writeFile path (T.unpack target)
-        pure (Right ())
+    pure (Right [])
+  NAR.NarSymlink target -> pure (Right [(path, target)])
   NAR.NarDirectory entries -> do
     createDirectoryIfMissing True path
     unpackChildren path entries
 
 -- | Unpack directory children, short-circuiting with a typed failure on the
 -- first unsafe entry name rather than crashing on untrusted input.
-unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text ())
-unpackChildren _ [] = pure (Right ())
+unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
+unpackChildren _ [] = pure (Right [])
 unpackChildren path ((name, child) : rest)
   | not (isSafeNarName name) =
       pure (Left ("unsafe NAR directory entry name: " <> name))
   | otherwise = do
-      result <- unpackNarEntry (path </> T.unpack name) child
+      result <- unpackTree (path </> T.unpack name) child
       case result of
         Left err -> pure (Left err)
-        Right () -> unpackChildren path rest
+        Right links -> do
+          restResult <- unpackChildren path rest
+          case restResult of
+            Left err -> pure (Left err)
+            Right moreLinks -> pure (Right (links <> moreLinks))
+
+-- | Second unpack pass: create the recorded symlinks.  Links whose targets
+-- already exist are created first - possibly unblocking link-to-link
+-- chains - so the Windows link flavor (file vs directory) is read off the
+-- real target.  When no pending link's target exists, the remainder are
+-- dangling and their kind is unknowable: they default to file links.
+createSymlinks :: [(FilePath, Text)] -> IO (Either Text ())
+createSymlinks [] = pure (Right ())
+createSymlinks pending = do
+  ready <- filterM targetExists pending
+  case ready of
+    [] -> createAll pending
+    _ -> do
+      made <- createAll ready
+      case made of
+        Left err -> pure (Left err)
+        Right () -> createSymlinks (filter (`notElem` ready) pending)
+  where
+    targetExists (linkPath, target) =
+      Dir.doesPathExist (takeDirectory linkPath </> T.unpack target)
+    createAll [] = pure (Right ())
+    createAll (link : rest) = do
+      made <- uncurry createSymlink link
+      case made of
+        Left err -> pure (Left err)
+        Right () -> createAll rest
+
+-- | Create one symlink, choosing the Windows flavor from the target's kind.
+-- A creation failure is loud: the old fallback of writing the target text
+-- as a regular file registered a tree whose NAR hash differed from the
+-- signed narinfo's - silent store corruption that a later push refuses to
+-- publish.  Failing lets the caller fall back to a local build.
+createSymlink :: FilePath -> Text -> IO (Either Text ())
+createSymlink linkPath target = do
+  createDirectoryIfMissing True (takeDirectory linkPath)
+  let targetStr = T.unpack target
+  targetIsDir <- Dir.doesDirectoryExist (takeDirectory linkPath </> targetStr)
+  result <-
+    try $
+      if targetIsDir
+        then Dir.createDirectoryLink targetStr linkPath
+        else Dir.createFileLink targetStr linkPath
+  case result of
+    Right () -> pure (Right ())
+    Left (e :: SomeException) ->
+      pure
+        ( Left
+            ( "cannot create symlink "
+                <> T.pack linkPath
+                <> " -> "
+                <> target
+                <> ": "
+                <> T.pack (show e)
+                <> " (on Windows this needs Developer Mode or elevation)"
+            )
+        )
 
 -- | Validate that a NAR entry name is safe (no path traversal).
 isSafeNarName :: Text -> Bool

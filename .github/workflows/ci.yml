@@ -122,8 +122,20 @@ jobs:
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
           restore-keys: cabal-${{ runner.os }}-
 
+      # --enable-tests compiles the test suite under -Werror too (a bare
+      # `cabal build` skips test components entirely, so test-code warnings
+      # would never fail CI) and shares one solver plan with the test step.
       - name: Build
-        run: cabal build --ghc-options="-Werror"
+        run: cabal build --enable-tests --ghc-options="-Werror"
+
+      # Eval-time store writes materialize at /nix by design; the runner
+      # lacks it, so the store-writing eval tests would skip.  Provisioning
+      # it keeps that coverage real on Linux.  (macOS cannot: / is a sealed
+      # read-only volume, and the synthetic.conf dance is not worth it for
+      # a test fixture - those tests skip loudly there.)
+      - name: Provision the store root (Linux)
+        if: runner.os == 'Linux'
+        run: sudo mkdir -p /nix && sudo chown "$USER" /nix
 
       - name: Test
         run: cabal test

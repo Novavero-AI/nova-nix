@@ -15,6 +15,7 @@
 
 #include "nn_thunk.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -85,14 +86,19 @@ nn_thunk_init(uint32_t initial_capacity)
     uint32_t cap = initial_capacity > 0 ? initial_capacity
                                         : NN_THUNK_DEFAULT_BLOCK_CAPACITY;
 
+    /* An allocation failure here would leave g_arena NULL and the first
+     * thunk allocation would dereference it - fail loudly at startup
+     * instead (same policy as nn_env_init). */
     g_arena = (struct nn_thunk_arena *)malloc(sizeof(struct nn_thunk_arena));
-    if (!g_arena) return;
+    if (!g_arena) {
+        fprintf(stderr, "nn_thunk_init: arena alloc failed\n");
+        abort();
+    }
 
     struct nn_thunk_block *first = alloc_block(cap);
     if (!first) {
-        free(g_arena);
-        g_arena = NULL;
-        return;
+        fprintf(stderr, "nn_thunk_init: block alloc failed\n");
+        abort();
     }
 
     g_arena->head = first;

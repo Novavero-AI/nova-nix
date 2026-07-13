@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | Nix expression evaluator.
 --
@@ -123,10 +124,10 @@ import Nix.Eval.Types
     attrSetSize,
     attrSetToAscList,
     attrSetToMap,
-    attrSetUnionWith,
     buildCAttrSetKeys,
     buildCSlots,
     cheapThunkBc,
+    checkedEnvPtr,
     clistFromThunks,
     clistLen,
     clistThunks,
@@ -163,6 +164,7 @@ import Nix.Hash (bytesToHexText, hashPlaceholder, hexToBytes, makeFixedOutputPat
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
+import qualified NovaCache.NAR as NAR
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info
 import Text.Regex.TDFA (matchAllText)
@@ -255,7 +257,9 @@ evalBytecode env bcIdx =
                 condVal <- evalBytecode env condIdx
                 case condVal of
                   VBool True -> evalBytecode env bodyIdx
-                  VBool False -> throwEvalError "assertion failed"
+                  -- A failed assert is catchable by tryEval (upstream
+                  -- AssertionError); a non-bool condition is a type error.
+                  VBool False -> throwCatchableError "assertion failed"
                   _ -> throwEvalError ("assertion condition must be a Boolean, got " <> typeName condVal)
         OpUnary ->
           let flags_ = unsafePerformIO (cbcFlags bcIdx)
@@ -333,25 +337,38 @@ evalAddWithCoercion left right = case (left, right) of
   (VFloat _, _) -> evalBinary force OpAdd left right
   (_, VFloat _) -> evalBinary force OpAdd left right
   (VInt _, VInt _) -> evalBinary force OpAdd left right
-  -- Path: direct concat
-  (VPath _, _) -> evalBinary force OpAdd left right
-  -- String-like: direct concat when both are string/path
+  -- Path + path: raw concatenation, still a path.
+  (VPath a, VPath b) -> pure (VPath (a <> b))
+  -- Path + coercible: the result stays a path, the right side coerces
+  -- WITHOUT a store copy, and a right side carrying string context is an
+  -- error, as upstream (a store-path reference cannot survive inside a
+  -- path value).
+  (VPath a, _) -> do
+    (rightStr, rightCtx) <- coerceAddOperand right
+    if rightCtx == emptyContext
+      then pure (VPath (a <> rightStr))
+      else throwEvalError "cannot append a string with context (a store-path reference) to a path"
+  -- Strings: direct concat.
   (VStr {}, VStr {}) -> evalBinary force OpAdd left right
-  (VStr {}, VPath _) -> evalBinary force OpAdd left right
   -- Otherwise: string concatenation with STRICT coercion (Nix coerceMore=false)
-  -- - only strings and sets with __toString/outPath coerce; numbers, bools,
-  -- null, lists, and functions are type errors, matching C++ Nix's `+`.
+  -- - only strings, sets with __toString/outPath, and paths coerce; numbers,
+  -- bools, null, lists, and functions are type errors, matching C++ Nix's `+`.
+  -- A path on the right of a string is COPIED to the store (upstream
+  -- copyToStore=true), so "x" + ./src concatenates the source's store path
+  -- and carries it in the result's context.
   _ -> do
     (leftStr, leftCtx) <- coerceAddOperand left
     (rightStr, rightCtx) <- coerceAddOperand right
     pure (VStr (leftStr <> rightStr) (leftCtx <> rightCtx))
 
 -- | Strict string coercion for the @+@ operator (Nix @coerceMore = false@):
--- strings, and sets with @__toString@/@outPath@, coerce; numbers, booleans,
--- null, lists, and functions are type errors.
+-- strings, sets with @__toString@\/@outPath@, and paths (copied to the
+-- store, carrying context) coerce; numbers, booleans, null, lists, and
+-- functions are type errors.
 coerceAddOperand :: (MonadEval m) => NixValue -> m (Text, StringContext)
 coerceAddOperand v@(VStr {}) = coerceToString False force applyValue v
 coerceAddOperand v@(VAttrs {}) = coerceToString False force applyValue v
+coerceAddOperand v@(VPath _) = coerceToStoreString v
 coerceAddOperand v =
   throwEvalError ("cannot coerce " <> typeName v <> " to a string with the + operator")
 
@@ -636,10 +653,15 @@ evalBcRecAttrs env bindings captureInfo
       staticThunks <- buildBcThunkMap recEnv staticBs
       let scopeFilled = fillCAttrSetValues scopeCset staticThunks
       dynThunks <- scopeFilled `seq` buildBcThunkMap recEnv dynBs
-      let allThunks = Map.unionWith mergeThunks dynThunks staticThunks
-          resultCset = buildCAttrSetKeys (Map.keys allThunks)
-          filled = fillCAttrSetValues resultCset allThunks
-       in filled `seq` pure (VAttrs (AttrSet resultCset))
+      -- A dynamic key colliding with a static sibling is an eval error
+      -- upstream ("dynamic attribute already defined"), never a merge.
+      case Map.keys (Map.intersection dynThunks staticThunks) of
+        (dupKey : _) -> throwEvalError ("dynamic attribute '" <> dupKey <> "' already defined")
+        [] ->
+          let allThunks = Map.union dynThunks staticThunks
+              resultCset = buildCAttrSetKeys (Map.keys allThunks)
+              filled = fillCAttrSetValues resultCset allThunks
+           in filled `seq` pure (VAttrs (AttrSet resultCset))
 
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -737,12 +759,12 @@ buildBcThunkMap thunkEnv = foldM addBinding Map.empty
       case sequence resolvedKeys of
         Nothing -> pure acc -- null key -> skip
         Just [key] ->
-          pure (insertWithMerge acc key (mkThunkBc thunkEnv valBcIdx))
+          insertChecked acc key (mkThunkBc thunkEnv valBcIdx)
         Just path ->
           let nested = buildBcNestedAttr thunkEnv path valBcIdx
-           in pure (foldl' (\a (k, t0) -> insertWithMerge a k t0) acc (Map.toList nested))
+           in foldM (\a (k, t0) -> insertChecked a k t0) acc (Map.toList nested)
     addBinding acc (BcInherit syms) =
-      pure (foldl' (\a sym -> let name = symbolText (Symbol sym) in insertWithMerge a name (inheritLookup thunkEnv name)) acc syms)
+      foldM (\a sym -> let name = symbolText (Symbol sym) in insertChecked a name (inheritLookup thunkEnv name)) acc syms
     addBinding acc (BcInheritFrom fromBcIdx syms) =
       -- inherit (from) name selects name from the from-expr.
       -- Create a small env with the from value at slot 0, then a
@@ -752,13 +774,16 @@ buildBcThunkMap thunkEnv = foldM addBinding Map.empty
                 selectExpr = ESelect (EResolvedVar 0 0) [StaticKey name] Nothing
                 (sp, sc) = buildCSlots [mkThunkBc thunkEnv fromBcIdx]
                 fromEnv = newMinimalEnv sp sc
-             in insertWithMerge a name (mkSyntheticThunk fromEnv selectExpr)
-       in pure (foldl' addInheritFrom acc syms)
+             in insertChecked a name (mkSyntheticThunk fromEnv selectExpr)
+       in foldM addInheritFrom acc syms
 
-    insertWithMerge acc key thunk =
+    -- The parser normalizes static keys to appear exactly once, so a
+    -- collision here means an evaluated DYNAMIC key hit an existing
+    -- attr - an eval error upstream, never a silent merge.
+    insertChecked acc key thunk =
       case Map.lookup key acc of
-        Nothing -> Map.insert key thunk acc
-        Just existing -> Map.insert key (mergeThunks existing thunk) acc
+        Nothing -> pure (Map.insert key thunk acc)
+        Just _ -> throwEvalError ("dynamic attribute '" <> key <> "' already defined")
 
 -- | Resolve a bytecode attr key to text.
 resolveBcKey :: (MonadEval m) => Env -> BcAttrKey -> m (Maybe Text)
@@ -898,7 +923,7 @@ pushLazyWithScope (Thunk thunkPtr) =
 {-# NOINLINE pushWithScopeRaw #-}
 pushWithScopeRaw :: Ptr () -> Env -> Env
 pushWithScopeRaw ptr (Env envPtr) =
-  Env (unsafePerformIO (cenvPushWith envPtr ptr))
+  Env (checkedEnvPtr "pushWithScopeRaw" (unsafePerformIO (cenvPushWith envPtr ptr)))
 
 -- ---------------------------------------------------------------------------
 -- Formals matching + env helpers (used by evalBcApp, applyValue, etc.)
@@ -979,16 +1004,6 @@ inheritLookup env name =
   case envLookup name env of
     Just thunk -> thunk
     Nothing -> error ("inheritLookup: undefined variable '" <> T.unpack name <> "' (unreachable)")
-
--- | Merge two thunks for nested attribute update.
--- If both are computed attrsets, recursively merge with attrSetUnionWith.
--- Otherwise the new value wins.
-mergeThunks :: Thunk -> Thunk -> Thunk
-mergeThunks a b =
-  case (readThunkValue a, readThunkValue b) of
-    (Just (VAttrs aa), Just (VAttrs bb)) ->
-      evaluated (VAttrs (attrSetUnionWith mergeThunks aa bb))
-    _ -> b
 
 -- ---------------------------------------------------------------------------
 -- Builtin registry (single-definition-site for all builtins)
@@ -1209,18 +1224,21 @@ applyBuiltin name accArgs arg =
 -- (the pattern string), compile it immediately and store the compiled
 -- RE.Regex in a VCompiledRegex, replacing the raw VStr.  The compiled
 -- form is carried in VBuiltin's accumulated args and reused on every
--- subsequent application - zero recompilation.
+-- subsequent application - zero recompilation.  Both builtins compile
+-- the RAW pattern: match's whole-string requirement is a span check at
+-- match time, not textual @^...$@ anchoring, which would misparse a
+-- top-level alternation (@^a|b$@ is @(^a)|(b$)@).
 precompileArgs :: Text -> [NixValue] -> [NixValue]
-precompileArgs "match" [VStr pat _] =
-  let anchored = "^" <> pat <> "$"
-   in case cachedCompileRegex anchored of
-        Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
-        Nothing -> [VStr pat emptyContext] -- fail later at execute time
-precompileArgs "split" [VStr pat _] =
-  case cachedCompileRegex pat of
-    Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
-    Nothing -> [VStr pat emptyContext] -- fail later at execute time
+precompileArgs "match" [VStr pat _] = compiledRegexArg pat
+precompileArgs "split" [VStr pat _] = compiledRegexArg pat
 precompileArgs _ args = args
+
+-- | The single-element arg list for a regex builtin: the compiled pattern
+-- if valid, the raw string otherwise (the error surfaces at execute time).
+compiledRegexArg :: Text -> [NixValue]
+compiledRegexArg pat = case cachedCompileRegex pat of
+  Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
+  Nothing -> [VStr pat emptyContext]
 
 -- | Apply a function value (lambda or builtin) to one argument.
 -- Used by higher-order builtins to invoke user-supplied functions.
@@ -1232,6 +1250,21 @@ applyValue (VBuiltin name accArgs) arg =
   applyBuiltin name accArgs arg
 applyValue other _ =
   throwEvalError ("attempt to call " <> typeName other <> ", which is not a function")
+
+-- | Apply a function value to an UNFORCED thunk argument.  Upstream's
+-- higher-order list builtins (filter, any, all, partition, groupBy,
+-- foldl') pass elements as unforced values, so an element the function
+-- never inspects may contain a throw without failing the call.  A
+-- builtin callee still receives a forced value (builtins force their
+-- arguments regardless), and set-pattern formals force on destructuring
+-- exactly as upstream does.
+applyValueLazy :: (MonadEval m) => NixValue -> Thunk -> m NixValue
+applyValueLazy (VLambda closureEnv formals bodyBcIdx) argThunk = do
+  extEnv <- matchFormals closureEnv formals argThunk
+  evalBytecode extEnv bodyBcIdx
+applyValueLazy other argThunk = do
+  val <- force argThunk
+  applyValue other val
 
 -- | Execute a builtin once all arguments are collected.
 --
@@ -1480,7 +1513,7 @@ builtinStringLength other =
 -- ---------------------------------------------------------------------------
 
 builtinThrow :: (MonadEval m) => NixValue -> m NixValue
-builtinThrow (VStr msg _) = throwEvalError msg
+builtinThrow (VStr msg _) = throwCatchableError msg
 builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <> typeName other)
 
 builtinAbort :: (MonadEval m) => NixValue -> m NixValue
@@ -1634,8 +1667,7 @@ builtinFilter _ other =
 filterThunks :: (MonadEval m) => NixValue -> [Thunk] -> m [Thunk]
 filterThunks _ [] = pure []
 filterThunks predFn (thunk : rest) = do
-  val <- force thunk
-  result <- applyValue predFn val
+  result <- applyValueLazy predFn thunk
   case result of
     VBool True -> (thunk :) <$> filterThunks predFn rest
     VBool False -> filterThunks predFn rest
@@ -1720,8 +1752,7 @@ builtinAny _ other =
 anyThunk :: (MonadEval m) => NixValue -> [Thunk] -> m Bool
 anyThunk _ [] = pure False
 anyThunk predFn (thunk : rest) = do
-  val <- force thunk
-  result <- applyValue predFn val
+  result <- applyValueLazy predFn thunk
   case result of
     VBool True -> pure True
     VBool False -> anyThunk predFn rest
@@ -1738,8 +1769,7 @@ builtinAll _ other =
 allThunk :: (MonadEval m) => NixValue -> [Thunk] -> m Bool
 allThunk _ [] = pure True
 allThunk predFn (thunk : rest) = do
-  val <- force thunk
-  result <- applyValue predFn val
+  result <- applyValueLazy predFn thunk
   case result of
     VBool True -> allThunk predFn rest
     VBool False -> pure False
@@ -1802,8 +1832,7 @@ partitionThunks predFn = go [] []
   where
     go !rs !ws [] = pure (reverse rs, reverse ws)
     go !rs !ws (thunk : rest) = do
-      val <- force thunk
-      result <- applyValue predFn val
+      result <- applyValueLazy predFn thunk
       case result of
         VBool True -> go (thunk : rs) ws rest
         VBool False -> go rs (thunk : ws) rest
@@ -1825,8 +1854,7 @@ groupByCollect ::
   m (Map Text [Thunk])
 groupByCollect _ [] acc = pure acc
 groupByCollect func (thunk : rest) acc = do
-  val <- force thunk
-  result <- applyValue func val
+  result <- applyValueLazy func thunk
   case result of
     VStr key _ ->
       groupByCollect func rest (Map.insertWith (++) key [thunk] acc)
@@ -1864,14 +1892,14 @@ builtinFoldl op initial (VList cl) =
 builtinFoldl _ _ other =
   throwEvalError ("builtins.foldl': expected a list, got " <> typeName other)
 
--- | Strict left fold: apply @op acc elem@ for each element.
--- @op@ is curried so we call @applyValue op acc@ then @applyValue partial elem@.
+-- | Strict left fold: apply @op acc elem@ for each element.  The
+-- accumulator is forced each step (upstream foldl' strictness); the
+-- element is passed as an unforced thunk, as upstream does.
 foldlStrict :: (MonadEval m) => NixValue -> NixValue -> [Thunk] -> m NixValue
 foldlStrict _ acc [] = pure acc
 foldlStrict op acc (thunk : rest) = do
-  val <- force thunk
   partial <- applyValue op acc
-  stepped <- applyValue partial val
+  stepped <- applyValueLazy partial thunk
   foldlStrict op stepped rest
 
 builtinSubstring :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
@@ -2396,11 +2424,18 @@ replaceAll pairs input = T.concat (go input)
 -- ---------------------------------------------------------------------------
 
 -- | Global regex compilation cache.  Keyed by the raw pattern string
--- (including anchoring for match).  Idempotent memoization via
+-- (match and split share entries).  Idempotent memoization via
 -- unsafePerformIO - same rationale as thunk memoization.
 {-# NOINLINE regexCacheRef #-}
 regexCacheRef :: IORef (Map Text RE.Regex)
 regexCacheRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Compile options matching C++ Nix's POSIX ERE semantics: no multiline
+-- mode, so @^@\/@$@ anchor only at the string boundaries and @.@ (and a
+-- negated bracket class) match a newline.  regex-tdfa's default has
+-- multiline=True, which silently diverges on any subject containing @\n@.
+wholeStringCompOpt :: RE.CompOption
+wholeStringCompOpt = RE.defaultCompOpt {RE.multiline = False}
 
 -- | Compile a regex, using the global cache to avoid recompilation.
 -- Returns Nothing for invalid patterns.  NOINLINE prevents GHC from
@@ -2412,7 +2447,7 @@ cachedCompileRegex pat =
     cache <- atomicModifyIORef' regexCacheRef (\c -> (c, c))
     case Map.lookup pat cache of
       Just compiled -> pure (Just compiled)
-      Nothing -> case RE.makeRegexM (T.unpack pat) :: Maybe RE.Regex of
+      Nothing -> case RE.makeRegexOptsM wholeStringCompOpt RE.defaultExecOpt (T.unpack pat) :: Maybe RE.Regex of
         Nothing -> pure Nothing
         Just compiled -> do
           atomicModifyIORef' regexCacheRef (\c -> (Map.insert pat compiled c, ()))
@@ -2423,19 +2458,18 @@ cachedCompileRegex pat =
 -- ---------------------------------------------------------------------------
 
 -- | @builtins.match regex str@: match a POSIX ERE against a string.
--- The regex is implicitly anchored (must match the entire string).
+-- The regex must match the ENTIRE string (like C++ Nix's regex_match).
 -- Returns @null@ if no match, or a list of capture group strings
--- (empty string for unmatched optional groups).
+-- (@null@ for non-participating groups).
 builtinMatch :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 -- Pre-compiled path: regex was compiled at partial-application time.
 builtinMatch (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
   matchWithCompiled compiled str
 -- Direct 2-arg call: use global compilation cache.
 builtinMatch (VStr regex _) (VStr str _) =
-  let anchored = "^" <> regex <> "$"
-   in case cachedCompileRegex anchored of
-        Nothing -> throwEvalError ("builtins.match: invalid regex: " <> regex)
-        Just compiled -> matchWithCompiled compiled str
+  case cachedCompileRegex regex of
+    Nothing -> throwEvalError ("builtins.match: invalid regex: " <> regex)
+    Just compiled -> matchWithCompiled compiled str
 builtinMatch (VStr _ _) other =
   throwEvalError ("builtins.match: expected a string, got " <> typeName other)
 builtinMatch (VCompiledRegex _) other =
@@ -2444,22 +2478,28 @@ builtinMatch other _ =
   throwEvalError ("builtins.match: expected a string (regex), got " <> typeName other)
 
 -- | Shared match logic for pre-compiled and freshly-compiled regex paths.
+--
+-- Whole-string semantics via a span check on the leftmost-longest match:
+-- if any whole-string match exists it starts at 0, and POSIX picks the
+-- longest match at the leftmost start, so the reported match spans the
+-- whole subject exactly when a whole-string match exists.  This is what
+-- regex_match gives C++ Nix; textual @^...$@ anchoring is NOT equivalent
+-- (it misparses top-level alternation).
 matchWithCompiled :: (MonadEval m) => RE.Regex -> Text -> m NixValue
 matchWithCompiled compiled str =
-  let matches = matchAllText compiled (T.unpack str)
-   in case matches of
-        [] -> pure VNull
-        (match : _) ->
+  case RE.matchOnceText compiled (T.unpack str) of
+    Just (beforeMatch, match, afterMatch)
+      | null beforeMatch,
+        null afterMatch ->
           -- match is an Array of (String, (offset, len)) pairs.
           -- Index 0 is the full match; indices 1.. are capture groups.
-          let groups = Array.elems match
-              -- Skip index 0 (full match) - return only capture groups.
-              captureGroups = drop 1 groups
+          let captureGroups = drop 1 (Array.elems match)
               -- A non-participating capture group has offset (-1); C++ Nix
               -- yields null for it, not the empty string.
               toThunk (s, (off, _)) =
                 if off < 0 then evaluated VNull else evaluated (mkStr (T.pack s))
            in pure (VList (clistFromThunks (map (thunkToCPtr . toThunk) captureGroups)))
+    _ -> pure VNull
 
 -- | @builtins.split regex str@: split a string by a POSIX ERE.
 -- Returns an alternating list of non-matched strings and match-group lists.
@@ -3099,13 +3139,30 @@ findFirst ((prefix, path) : rest) name
 -- ---------------------------------------------------------------------------
 
 builtinToFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinToFile (VStr name _) (VStr contents _) = do
-  storePath <- writeToStore name contents
-  pure (VPath storePath)
+builtinToFile (VStr name _) (VStr contents ctx) = do
+  refs <- toFileRefs ctx
+  storePath <- writeToStore name contents refs
+  -- Upstream returns a STRING whose context is the new path itself; the
+  -- refs travel through the store path computation, not the eval context.
+  let selfContext = maybe emptyContext plainContext (parseStorePath defaultStoreDir storePath)
+  pure (VStr storePath selfContext)
 builtinToFile (VStr _ _) other =
   throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
 builtinToFile other _ =
   throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
+
+-- | The store-path references a toFile output may carry: the contents'
+-- plain-path context, in sorted order.  A derivation-output reference is
+-- an error, exactly as upstream ("files created by builtins.toFile may
+-- not reference derivations").
+toFileRefs :: (MonadEval m) => StringContext -> m [StorePath]
+toFileRefs (StringContext elems) = mapM refOf (Set.toAscList elems)
+  where
+    refOf (SCPlain sp) = pure sp
+    refOf (SCDrvOutput _ _) =
+      throwEvalError "builtins.toFile: files created by toFile may not reference derivations"
+    refOf (SCAllOutputs _) =
+      throwEvalError "builtins.toFile: files created by toFile may not reference derivations"
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - scoped import
@@ -3133,35 +3190,50 @@ builtinFetchurl other =
   throwEvalError ("builtins.fetchurl: expected a string or set, got " <> typeName other)
 
 builtinFetchTarball :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchTarball (VStr url _) = fetchAndExtractTarball url
+builtinFetchTarball (VStr url _) = fetchAndExtractTarball url Nothing tarballSourceName
 builtinFetchTarball (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchTarball" "url" attrs
-  fetchAndExtractTarball url
+  sha256 <- forceOptionalAttrStr attrs "sha256"
+  nameOverride <- forceOptionalAttrStr attrs "name"
+  fetchAndExtractTarball url sha256 (fromMaybe tarballSourceName nameOverride)
 builtinFetchTarball other =
   throwEvalError ("builtins.fetchTarball: expected a string or set, got " <> typeName other)
 
--- | Download a tarball, extract it, and return the path to the extracted
--- directory.  Uses a content-hashed temp directory.  Downloads and extracts
--- in a single shell pipeline to avoid binary-as-text encoding issues.
-fetchAndExtractTarball :: (MonadEval m) => Text -> m NixValue
-fetchAndExtractTarball url = do
+-- | Upstream's default store name for fetched source trees.
+tarballSourceName :: Text
+tarballSourceName = "source"
+
+-- | Download a tarball, extract it, verify the optional sha256 pin, and
+-- copy the tree to its content-addressed store path.  The pin is the
+-- recursive NAR hash of the EXTRACTED tree, as upstream.  Download and
+-- extraction share one shell pipeline to avoid binary-as-text encoding
+-- issues; the scratch dir is cleared first so an interrupted earlier
+-- extraction cannot leak stale files into this one.
+fetchAndExtractTarball :: (MonadEval m) => Text -> Maybe Text -> Text -> m NixValue
+fetchAndExtractTarball url mSha256 name = do
   sysTmp <- getTempDir
   let urlHash = sha256Hex (TE.encodeUtf8 url)
       extractDir = sysTmp <> "/nova-nix-tarball-" <> urlHash
-  -- Single pipeline: mkdir, download, extract with --strip-components=1
   -- The -- separator prevents argument injection from the URL.
   (code, _, errOut) <-
     runProcess
       "sh"
       [ "-c",
-        "mkdir -p \"$1\" && curl -sSfL -- \"$2\" | tar -xz -C \"$1\" --strip-components=1",
+        "rm -rf \"$1\" && mkdir -p \"$1\" && curl -sSfL -- \"$2\" | tar -xz -C \"$1\" --strip-components=1",
         "--",
         extractDir,
         url
       ]
       ""
   case code of
-    0 -> pure (VPath extractDir)
+    0 -> do
+      pin <- traverse (decodeSha256Pin "builtins.fetchTarball") mSha256
+      storePath <-
+        copyPathToStore
+          extractDir
+          name
+          (fmap ("builtins.fetchTarball: " <> url,) pin)
+      pure (VPath storePath)
     _ -> throwEvalError ("builtins.fetchTarball: " <> errOut)
 
 builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
@@ -3238,28 +3310,27 @@ decodeSha256Pin ctx s
 
 -- | Force a required string attribute from an attrset, using full Nix string
 -- coercion (VStr, VPath, VInt, VBool, VAttrs via __toString/outPath).
+-- A coercion failure (or a throwing attr value) propagates with its own
+-- message, as upstream - swallowing it here once masked user throws.
 forceAttrStr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
 forceAttrStr builtin key attrs =
   case attrSetLookup key attrs of
     Nothing -> throwEvalError (builtin <> ": missing required attribute '" <> key <> "'")
     Just thunk -> do
       val <- force thunk
-      result <- catchEvalError (coerceToString True force applyValue val)
-      case result of
-        Right (s, _ctx) -> pure s
-        Left _ -> throwEvalError (builtin <> ": '" <> key <> "' must be a string")
+      (s, _ctx) <- coerceToString True force applyValue val
+      pure s
 
--- | Force an optional string attribute via full Nix coercion.
+-- | Force an optional string attribute via full Nix coercion.  A present
+-- but uncoercible (or throwing) value is an error, not 'Nothing'.
 forceOptionalAttrStr :: (MonadEval m) => AttrSet -> Text -> m (Maybe Text)
 forceOptionalAttrStr attrs key =
   case attrSetLookup key attrs of
     Nothing -> pure Nothing
     Just thunk -> do
       val <- force thunk
-      result <- catchEvalError (coerceToString True force applyValue val)
-      case result of
-        Right (s, _ctx) -> pure (Just s)
-        Left _ -> pure Nothing
+      (s, _ctx) <- coerceToString True force applyValue val
+      pure (Just s)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - derivation construction
@@ -3277,6 +3348,17 @@ builtinDerivationStrict (VAttrs attrs) = do
   system <- forceAttrStr ("derivation \"" <> drvName <> "\"") "system" attrs
   builder <- forceAttrStr ("derivation \"" <> drvName <> "\"") "builder" attrs
 
+  -- __ignoreNulls: when true, null-valued attrs are dropped from the
+  -- derivation env (stdenv.mkDerivation sets it); when absent or false,
+  -- null coerces to "" like any other coerceMore value - C++ Nix semantics.
+  ignoreNulls <- case attrSetLookup "__ignoreNulls" attrs of
+    Nothing -> pure False
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VBool b -> pure b
+        other -> throwEvalError ("derivation: '__ignoreNulls' must be a boolean, got " <> typeName other)
+
   -- Extract optional outputs (default ["out"])
   outputNames <- case attrSetLookup "outputs" attrs of
     Nothing -> pure ["out"]
@@ -3284,6 +3366,9 @@ builtinDerivationStrict (VAttrs attrs) = do
       val <- force thunk
       case val of
         VList cl -> mapM (forceToText . Thunk) (clistThunks cl)
+        -- A null outputs attr is dropped by __ignoreNulls, falling back to
+        -- the default output set; without it, null is an error as upstream.
+        VNull | ignoreNulls -> pure ["out"]
         _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
 
   -- Extract optional args (default []).  Path literals in args (e.g. stdenv's
@@ -3297,6 +3382,7 @@ builtinDerivationStrict (VAttrs attrs) = do
         VList cl -> do
           parts <- mapM (\t -> force (Thunk t) >>= coerceToStoreString) (clistThunks cl)
           pure (map fst parts, mconcat (map snd parts))
+        VNull | ignoreNulls -> pure ([], mempty)
         _ -> throwEvalError "derivation: 'args' must be a list of strings"
 
   -- Materialize once, reuse for both env collection and result merge
@@ -3305,7 +3391,7 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- Collect string-coercible attrs into the build env, EXCLUDING "args"
   -- (C++ Nix puts args in the Derive() args field, never the env).  The
   -- per-output env vars ($out, ...) are added below.  Carries merged context.
-  (drvEnvPairs, envContext) <- collectDrvEnvWithContext (Map.delete "__ignoreNulls" (Map.delete "args" materialized))
+  (drvEnvPairs, envContext) <- collectDrvEnvWithContext ignoreNulls (Map.delete "__ignoreNulls" (Map.delete "args" materialized))
 
   let fullContext = envContext <> argsContext
       inputDrvs = extractInputDrvs fullContext
@@ -3531,27 +3617,31 @@ forceToText thunk = do
   (s, _ctx) <- coerceToString True force applyValue val
   pure s
 
--- | Collect all string-coercible attributes for the derivation environment,
--- along with the merged string context from all collected values.
--- Uses 'coerceToStringPermissive' for full Nix coercion including
--- __toString, outPath, and list-to-space-separated-string.
-collectDrvEnvWithContext :: (MonadEval m) => Map Text Thunk -> m ([(Text, Text)], StringContext)
-collectDrvEnvWithContext attrs = do
+-- | Collect all derivation attributes into env pairs via full Nix coercion
+-- (__toString, outPath, list-to-space-separated-string), along with the
+-- merged string context from all collected values.
+--
+-- A coercion failure (a thrown attr value, an uncoercible function, a failed
+-- import inside the value) fails the WHOLE derivation, as in C++ Nix.
+-- Swallowing it silently produces a wrong .drv - this exact bug once turned
+-- a seed derivation with 17 failed src attrs into an empty no-input drv that
+-- "built" successfully.  Null attrs are dropped only under __ignoreNulls;
+-- otherwise null coerces to @""@ like any other coerceMore value.
+collectDrvEnvWithContext :: (MonadEval m) => Bool -> Map Text Thunk -> m ([(Text, Text)], StringContext)
+collectDrvEnvWithContext ignoreNulls attrs = do
   let pairs = Map.toList attrs
-  results <- mapM tryCoerce pairs
+  results <- mapM coerceEnvAttr pairs
   let envPairs = catMaybes [fmap (\(k, v, _) -> (k, v)) r | r <- results]
       mergedCtx = mconcat [ctx | Just (_, _, ctx) <- results]
   pure (envPairs, mergedCtx)
   where
-    tryCoerce (key, thunk) = do
+    coerceEnvAttr (key, thunk) = do
       val <- force thunk
       case val of
-        VNull -> pure Nothing
+        VNull | ignoreNulls -> pure Nothing
         _ -> do
-          result <- catchEvalError (coerceToStoreString val)
-          case result of
-            Right (s, ctx) -> pure (Just (key, s, ctx))
-            Left _ -> pure Nothing
+          (s, ctx) <- coerceToStoreString val
+          pure (Just (key, s, ctx))
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - hashFile, readFileType
@@ -3751,13 +3841,94 @@ parseTOMLDoc lns = go lns [] Map.empty
               keys = parseDottedKey keyStr
            in go rest keys (ensureTable keys root)
       | otherwise =
-          -- Key = value pair
-          case parseKVLine stripped of
-            Right (keys, val) ->
-              go rest currentPath (insertNested (currentPath ++ keys) val root)
-            Left err -> Left err
+          -- Key = value pair.  The value may span physical lines (arrays
+          -- and multi-line strings - the Cargo.lock shapes), so join
+          -- until brackets and multi-line string delimiters balance.
+          let (logical, remaining) = joinLogicalLine stripped rest
+           in case parseKVLine logical of
+                Right (keys, val) ->
+                  go remaining currentPath (insertNested (currentPath ++ keys) val root)
+                Left err -> Left err
       where
         stripped = T.strip line
+
+-- | Which TOML string form a scan position is inside.
+data TomlStringState = TSNone | TSBasic | TSLiteral | TSMultiBasic | TSMultiLiteral
+  deriving (Eq)
+
+-- | Scanner state for joining physical lines into one logical
+-- key = value line: array-bracket depth outside strings, plus the
+-- string form currently open.
+data TomlScan = TomlScan
+  { tsBracketDepth :: !Int,
+    tsString :: !TomlStringState
+  }
+
+emptyTomlScan :: TomlScan
+emptyTomlScan = TomlScan 0 TSNone
+
+-- | Whether a logical value is still open at end of line: inside a
+-- multi-line string, or under an unclosed array bracket.  A single-line
+-- string left open is NOT continuable (TOML basic\/literal strings
+-- cannot span lines) - the value parser reports that case.
+tomlNeedsMoreLines :: TomlScan -> Bool
+tomlNeedsMoreLines st =
+  tsBracketDepth st > 0
+    || tsString st == TSMultiBasic
+    || tsString st == TSMultiLiteral
+
+-- | Scan one physical line, returning the state at end of line and the
+-- line's visible text: a comment outside strings is cut here, where the
+-- string context is still known ('#' inside any string form is content).
+scanTomlLine :: TomlScan -> Text -> (TomlScan, Text)
+scanTomlLine st0 line = go st0 line 0
+  where
+    go st t !seen = case T.uncons t of
+      Nothing -> (st, line)
+      Just (c, rest) ->
+        let one newSt = go newSt rest (seen + 1)
+            jump n newSt = go newSt (T.drop (n - 1) rest) (seen + n)
+         in case tsString st of
+              TSBasic
+                | c == '\\' -> jump 2 st
+                | c == '"' -> one st {tsString = TSNone}
+                | otherwise -> one st
+              TSLiteral
+                | c == '\'' -> one st {tsString = TSNone}
+                | otherwise -> one st
+              TSMultiBasic
+                | c == '\\' -> jump 2 st
+                | c == '"', Just _ <- T.stripPrefix "\"\"" rest -> jump 3 st {tsString = TSNone}
+                | otherwise -> one st
+              TSMultiLiteral
+                | c == '\'', Just _ <- T.stripPrefix "''" rest -> jump 3 st {tsString = TSNone}
+                | otherwise -> one st
+              TSNone
+                | c == '#' -> (st, T.take seen line)
+                | c == '"', Just _ <- T.stripPrefix "\"\"" rest -> jump 3 st {tsString = TSMultiBasic}
+                | c == '"' -> one st {tsString = TSBasic}
+                | c == '\'', Just _ <- T.stripPrefix "''" rest -> jump 3 st {tsString = TSMultiLiteral}
+                | c == '\'' -> one st {tsString = TSLiteral}
+                | c == '[' -> one st {tsBracketDepth = tsBracketDepth st + 1}
+                | c == ']' -> one st {tsBracketDepth = max 0 (tsBracketDepth st - 1)}
+                | otherwise -> one st
+
+-- | Join physical lines into one logical key = value line, returning it
+-- with the unconsumed lines.  An unterminated construct at end of input
+-- hands what accumulated to the value parser, which reports the specific
+-- failure.
+joinLogicalLine :: Text -> [Text] -> (Text, [Text])
+joinLogicalLine firstLine rest0 =
+  let (st0, visible0) = scanTomlLine emptyTomlScan firstLine
+   in go st0 visible0 rest0
+  where
+    go st acc remaining
+      | not (tomlNeedsMoreLines st) = (acc, remaining)
+      | otherwise = case remaining of
+          [] -> (acc, [])
+          (next : more) ->
+            let (advanced, visible) = scanTomlLine st next
+             in go advanced (acc <> "\n" <> visible) more
 
 -- | Parse a key = value line.
 parseKVLine :: Text -> Either Text ([Text], TOMLValue)
@@ -4069,11 +4240,14 @@ splitCommas = go (0 :: Int) []
 insertNested :: [Text] -> TOMLValue -> Map Text TOMLValue -> Map Text TOMLValue
 insertNested [] _ m = m
 insertNested [k] v m = Map.insert k v m
-insertNested (k : ks) v m =
-  let sub = case Map.lookup k m of
-        Just (TOMLTable inner) -> inner
-        _ -> Map.empty
-   in Map.insert k (TOMLTable (insertNested ks v sub)) m
+insertNested (k : ks) v m = case Map.lookup k m of
+  -- Under a [[table]] header the path crosses an array of tables: keys
+  -- belong to its LAST element, not to a table replacing the array.
+  Just (TOMLArray xs)
+    | (TOMLTable lastInner : prev) <- reverse xs ->
+        Map.insert k (TOMLArray (reverse prev ++ [TOMLTable (insertNested ks v lastInner)])) m
+  Just (TOMLTable inner) -> Map.insert k (TOMLTable (insertNested ks v inner)) m
+  _ -> Map.insert k (TOMLTable (insertNested ks v Map.empty)) m
 
 -- | Ensure a table path exists (for @[table]@ headers).
 ensureTable :: [Text] -> Map Text TOMLValue -> Map Text TOMLValue
@@ -4188,14 +4362,82 @@ builtinPath :: (MonadEval m) => NixValue -> m NixValue
 builtinPath (VAttrs attrs) = do
   pathStr <- forceAttrStr "builtins.path" "path" attrs
   nameOverride <- forceOptionalAttrStr attrs "name"
+  expectedDigest <- case attrSetLookup "sha256" attrs of
+    Nothing -> pure Nothing
+    Just thunk -> do
+      pinVal <- force thunk
+      case pinVal of
+        VStr pin _ -> Just <$> decodeSha256Pin "builtins.path" pin
+        other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
   let name = fromMaybe (extractBaseName pathStr) nameOverride
-  storePathText <- copyPathToStore pathStr name
-  -- Parse the store path to construct proper SCPlain context
-  case parseStorePath defaultStoreDir storePathText of
-    Just sp -> pure (VStr storePathText (plainContext sp))
-    Nothing -> pure (VStr storePathText emptyContext)
+      pinSubject = "builtins.path: " <> pathStr
+  storePathText <- case attrSetLookup "filter" attrs of
+    Nothing -> copyPathToStore pathStr name (fmap (pinSubject,) expectedDigest)
+    Just filterThunk -> do
+      filterFn <- force filterThunk
+      narBytes <- filteredSourceNar filterFn pathStr
+      -- The sha256 pin applies to the FILTERED tree, as upstream.
+      let filteredDigest = sha256Digest narBytes
+      case expectedDigest of
+        Just expected
+          | expected /= filteredDigest ->
+              throwEvalError
+                ( pinSubject
+                    <> ": hash mismatch: expected sha256:"
+                    <> bytesToHexText expected
+                    <> ", got sha256:"
+                    <> bytesToHexText filteredDigest
+                )
+        _ -> pure ()
+      addSourceNar name narBytes
+  pure (sourceResultString storePathText)
 builtinPath other =
   throwEvalError ("builtins.path: expected an attribute set, got " <> typeName other)
+
+-- | The result value both source importers return: the store path as a
+-- string carrying itself as context.
+sourceResultString :: Text -> NixValue
+sourceResultString storePathText =
+  case parseStorePath defaultStoreDir storePathText of
+    Just sp -> VStr storePathText (plainContext sp)
+    Nothing -> VStr storePathText emptyContext
+
+-- | Serialise a source tree to a NAR, keeping only entries the Nix filter
+-- function accepts - upstream's addToStore filtering: the filter receives
+-- @(path, type)@ for every entry BELOW the root (the root itself is never
+-- filtered), and rejecting a directory prunes its whole subtree.  Child
+-- paths hand the filter @parent/name@ with a forward slash; both path
+-- styles reach Nix code only through separator-agnostic helpers like
+-- @baseNameOf@.
+filteredSourceNar :: (MonadEval m) => NixValue -> Text -> m BS.ByteString
+filteredSourceNar filterFn rootPath = do
+  rootType <- getFileType rootPath
+  entry <- buildEntry rootPath rootType
+  pure (NAR.serialise entry)
+  where
+    buildEntry path fileType = case fileType of
+      "regular" -> do
+        executable <- isExecutableFile path
+        bytes <- readFileBytes path
+        pure (NAR.NarRegular executable bytes)
+      "symlink" -> NAR.NarSymlink <$> readSymlinkTarget path
+      "directory" -> do
+        children <- listDirectory path
+        kept <- mapM (keepChild path) children
+        pure (NAR.NarDirectory (catMaybes kept))
+      other -> throwEvalError ("builtins.path: unsupported file type '" <> other <> "' at " <> path)
+    keepChild parent (name, childType) = do
+      let childPath = parent <> "/" <> name
+      keep <- filterAccepts childPath childType
+      if keep
+        then Just . (,) name <$> buildEntry childPath childType
+        else pure Nothing
+    filterAccepts path fileType = do
+      partial <- applyValue filterFn (mkStr path)
+      result <- applyValue partial (mkStr fileType)
+      case result of
+        VBool b -> pure b
+        other -> throwEvalError ("builtins.path: the filter function must return a Boolean, got " <> typeName other)
 
 -- | Extract the last path component from a path string.
 extractBaseName :: Text -> Text
@@ -4214,14 +4456,19 @@ extractBaseName path =
 -- | @builtins.filterSource filter path@ - copy a path to the store,
 -- filtering entries via a predicate.  The filter function receives
 -- @(path, type)@ where type is @"regular"@, @"directory"@, @"symlink"@,
--- or @"unknown"@.
+-- or @"unknown"@.  Equivalent to @builtins.path@ with a filter and the
+-- source's basename as the store name.
 builtinFilterSource :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinFilterSource _filterFn (VPath _path) =
-  throwEvalError "builtins.filterSource: not yet implemented (requires store integration)"
-builtinFilterSource _filterFn (VStr _path _) =
-  throwEvalError "builtins.filterSource: not yet implemented (requires store integration)"
+builtinFilterSource filterFn (VPath path) = filterSourceInto filterFn path
+builtinFilterSource filterFn (VStr path _) = filterSourceInto filterFn path
 builtinFilterSource _ other =
   throwEvalError ("builtins.filterSource: expected a path, got " <> typeName other)
+
+filterSourceInto :: (MonadEval m) => NixValue -> Text -> m NixValue
+filterSourceInto filterFn path = do
+  narBytes <- filteredSourceNar filterFn path
+  storePathText <- addSourceNar (extractBaseName path) narBytes
+  pure (sourceResultString storePathText)
 
 -- ---------------------------------------------------------------------------
 -- Builtin stubs - experimental features

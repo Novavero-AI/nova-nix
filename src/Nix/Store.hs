@@ -63,7 +63,6 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import qualified Data.Text.IO as TIO
 import Nix.Derivation (Derivation, toATerm)
 import Nix.Store.DB
 import Nix.Store.Path
@@ -259,11 +258,14 @@ collectRegularFiles path = do
           isFile <- doesFileExist fullPath
           pure [fullPath | isFile]
 
--- | Strict left fold over a list in IO.
+-- | Strict left fold over a list in IO.  The accumulator is forced to
+-- WHNF each step - without it, the scan retains every scanned file's
+-- bytes in Set.union thunks until the end (peak memory ~ total tree
+-- size).  Set's spine-strict nodes make WHNF force the whole union.
 foldlIO :: a -> [b] -> (a -> b -> IO a) -> IO a
 foldlIO z [] _ = pure z
 foldlIO z (x : xs) f = do
-  acc <- f z x
+  !acc <- f z x
   foldlIO acc xs f
 
 -- | Recursively mark a store path and its contents read-only after a build.
@@ -296,7 +298,10 @@ writeDrvAterm :: Store -> StorePath -> Text -> IO ()
 writeDrvAterm store sp aterm = do
   let destPath = storePathToFilePath (stDir store) sp
   createDirectoryIfMissing True (unStoreDir (stDir store))
-  TIO.writeFile destPath aterm
+  -- UTF-8 bytes, not text-mode IO: the path was computed from the
+  -- UTF-8 serialization, and a locale-dependent or newline-translating
+  -- write would store bytes that no longer match their content address.
+  BS.writeFile destPath (TE.encodeUtf8 aterm)
 
 -- | Serialize a derivation to ATerm and write it to the store at the given path.
 writeDrv :: Store -> Derivation -> StorePath -> IO ()

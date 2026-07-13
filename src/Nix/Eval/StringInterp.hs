@@ -88,7 +88,7 @@ coerceToString :: (MonadEval m) => Bool -> Force m -> Apply m -> NixValue -> m (
 coerceToString _ _ _ (VStr s ctx) = pure (s, ctx)
 coerceToString _ _ _ (VPath p) = pure (p, emptyContext)
 coerceToString True _ _ (VInt n) = pure (T.pack (show n), emptyContext)
-coerceToString True _ _ (VFloat n) = pure (formatNixFloat n, emptyContext)
+coerceToString True _ _ (VFloat n) = pure (formatNixFloatFixed n, emptyContext)
 coerceToString True _ _ VNull = pure ("", emptyContext)
 coerceToString True _ _ (VBool True) = pure ("1", emptyContext)
 coerceToString True _ _ (VBool False) = pure ("", emptyContext)
@@ -108,9 +108,19 @@ coerceToString coerceMore forceFn applyFn (VAttrs attrs) =
 coerceToString _ _ _ other =
   throwEvalError ("cannot coerce " <> typeName other <> " to a string")
 
--- | Format a float the way C++ Nix does: 6 fixed decimal places
--- (@std::to_string@), then strip trailing zeros and unnecessary
--- decimal point.  E.g. @1.0@ becomes @"1"@, @3.14@ becomes @"3.14"@.
+-- | Format a float the way C++ Nix's coerceToString does -
+-- @std::to_string@, i.e. FIXED 6 decimal places with no trimming:
+-- @toString 1.5@ is @"1.500000"@.  Derivation env values and
+-- @builtins.toString@ both see this form, so it is hash-relevant.
+formatNixFloatFixed :: Double -> Text
+formatNixFloatFixed n
+  | isNaN n = "nan"
+  | isInfinite n = if n > 0 then "inf" else "-inf"
+  | otherwise = T.pack (showFFloat (Just 6) n "")
+
+-- | Format a float for value display and JSON: 6 fixed decimal places,
+-- then strip trailing zeros and an unnecessary decimal point.  E.g.
+-- @1.0@ becomes @"1"@, @3.14@ becomes @"3.14"@.
 formatNixFloat :: Double -> Text
 formatNixFloat n
   | isNaN n = "nan"

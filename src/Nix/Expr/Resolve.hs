@@ -9,6 +9,9 @@
 -- Called once at parse time ('Nix.Parser.parseNix').
 module Nix.Expr.Resolve
   ( resolveVars,
+
+    -- * Static global names (exported for the sync test)
+    staticGlobalNames,
   )
 where
 
@@ -28,8 +31,10 @@ data ScopeEntry
     NameBarrier !(Set Text)
   | -- | Marks a with-scope boundary on the stack.
     -- Does NOT increment the de Bruijn level (with doesn't create a
-    -- parent env level at runtime).  Variables not found in any lexical
-    -- scope below a WithBarrier are upgraded to 'EWithVar'.
+    -- parent env level at runtime).  Variables bound by no 'LexicalScope'
+    -- or 'NameBarrier' anywhere on the stack - and not static globals -
+    -- are upgraded to 'EWithVar' when at least one WithBarrier encloses
+    -- them; lexical bindings and globals always win over with-scopes.
     WithBarrier
 
 -- | Resolve variables in an expression.  Replaces 'EVar' with
@@ -113,28 +118,74 @@ resolve stack expr = case expr of
 -- | Resolve a variable by walking the scope stack.
 --
 -- @level@ counts how many scope entries we've crossed (each corresponds
--- to one parent hop at runtime).  If the name hits a 'LexicalScope',
--- we return 'EResolvedVar'.  If it hits a 'NameBarrier', we stop and
--- leave it as 'EVar' (name-based lookup at runtime).  If not found,
--- 'EVar' is returned unchanged (looked up via with-scopes or builtins).
+-- to one parent hop at runtime).  A 'LexicalScope' hit yields
+-- 'EResolvedVar'; a 'NameBarrier' hit yields 'EVar' (name-based lookup at
+-- runtime).  Both are LEXICAL bindings, so a hit ends the walk no matter
+-- how many 'WithBarrier's were crossed on the way out - in Nix a
+-- with-scope never shadows a binding introduced by other means.
+--
+-- Only a name bound by NEITHER becomes a with-variable, and then only if
+-- it is not a static global: like C++ Nix's staticBaseEnv, a global
+-- (@map@, @toString@, @builtins@, ...) binds at parse time, so
+-- @with { map = 42; }; map@ is the builtin upstream and here.
 resolveVar :: [ScopeEntry] -> Int -> Text -> Expr
-resolveVar [] _ name = EVar name
-resolveVar (LexicalScope scope : rest) level name =
-  case Map.lookup name scope of
-    Just idx -> EResolvedVar level idx
-    Nothing -> resolveVar rest (level + 1) name
-resolveVar (NameBarrier names : rest) level name =
-  if Set.member name names
-    then EVar name
-    else resolveVar rest (level + 1) name
-resolveVar (WithBarrier : rest) level name =
-  -- WithBarrier does NOT increment level (with doesn't create an env level).
-  -- Continue searching lexical scopes below.  If the name is found in a
-  -- lower LexicalScope, use that.  If it reaches the bottom as EVar
-  -- (not found lexically), upgrade to EWithVar.
-  case resolveVar rest level name of
-    EVar _ -> EWithVar name
-    resolved -> resolved
+resolveVar fullStack startLevel name = go fullStack startLevel False
+  where
+    go [] _ crossedWith
+      | crossedWith && not (Set.member name staticGlobalNames) = EWithVar name
+      | otherwise = EVar name
+    go (LexicalScope scope : rest) level crossedWith =
+      case Map.lookup name scope of
+        Just idx -> EResolvedVar level idx
+        Nothing -> go rest (level + 1) crossedWith
+    go (NameBarrier names : rest) level crossedWith
+      | Set.member name names = EVar name
+      | otherwise = go rest (level + 1) crossedWith
+    -- WithBarrier does NOT increment level (with doesn't create an env
+    -- level at runtime); it only records that an enclosing with exists.
+    go (WithBarrier : rest) level _ = go rest level True
+
+-- | Names statically bound in the root environment
+-- ('Nix.Builtins.builtinEnv'): the value constants, @builtins@, the
+-- search-path plumbing, and the top-level builtins that upstream Nix also
+-- exposes unprefixed (its staticBaseEnv).  A name in this set is never a
+-- with-variable - the global binds at parse time and an enclosing @with@
+-- cannot shadow it.
+--
+-- @fetchurl@ and @toFile@ are absent on purpose: upstream exposes them
+-- only under @builtins.@, and nixpkgs relies on @with pkgs; fetchurl@
+-- binding @pkgs.fetchurl@.  The root env matches (they are not bound
+-- there either).
+--
+-- Layering keeps this module from importing 'Nix.Builtins'; a test
+-- asserts this set stays in sync with the root env's actual bindings.
+staticGlobalNames :: Set Text
+staticGlobalNames =
+  Set.fromList
+    [ "true",
+      "false",
+      "null",
+      "builtins",
+      "__findFile",
+      "__nixPath",
+      "abort",
+      "baseNameOf",
+      "break",
+      "derivation",
+      "derivationStrict",
+      "dirOf",
+      "fetchGit",
+      "fetchTarball",
+      "fromTOML",
+      "import",
+      "isNull",
+      "map",
+      "placeholder",
+      "removeAttrs",
+      "scopedImport",
+      "throw",
+      "toString"
+    ]
 
 -- | Build a 'LexicalScope' from lambda formals.
 --
