@@ -25,33 +25,26 @@ import qualified Data.Map.Strict as Map
 import Data.Ord (comparing)
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Text (Text)
 import Nix.Expr.Types
 
 -- | Walk the AST and attach 'Captures' info to trimmable scopes
 -- (lambdas, let blocks, and recursive attr sets).
 trimClosures :: Expr -> Expr
-trimClosures = trimExpr Set.empty
+trimClosures = trimExpr
 
--- | Walk expression, tracking names bound in enclosing inner scopes
--- (let/rec/lambda formals) so we can tell if an 'EVar' escapes to
--- an outer scope.
---
--- @innerNames@ accumulates names from scopes INSIDE the current
--- lambda being analyzed.  It resets to empty when we enter a new
--- lambda (since that lambda's body is the new analysis target).
-trimExpr :: Set Text -> Expr -> Expr
-trimExpr innerNames expr = case expr of
+-- | Walk the expression tree, dispatching each trimmable scope to
+-- 'trimOneLambda' and friends.  Escape analysis happens per scope in
+-- those helpers; the walk itself carries no state.
+trimExpr :: Expr -> Expr
+trimExpr expr = case expr of
   ELit {} -> expr
-  EStr parts -> EStr (map (trimPart innerNames) parts)
-  EIndStr parts -> EIndStr (map (trimPart innerNames) parts)
+  EStr parts -> EStr (map trimPart parts)
+  EIndStr parts -> EIndStr (map trimPart parts)
   EVar {} -> expr
   EWithVar {} -> expr
   EResolvedVar {} -> expr
   EAttrs True bindings captureInfo ->
-    let names = collectBindingNames bindings
-        innerNamesRec = Set.union innerNames names
-        trimmedBindings = map (trimBinding innerNamesRec) bindings
+    let trimmedBindings = map trimBinding bindings
      in case captureInfo of
           Captures {} -> EAttrs True trimmedBindings captureInfo
           CapturesWithScopes {} -> EAttrs True trimmedBindings captureInfo
@@ -65,22 +58,20 @@ trimExpr innerNames expr = case expr of
                         else Captures captureList
                  in EAttrs True rewrittenBindings ci
   EAttrs False bindings _captureInfo ->
-    EAttrs False (map (trimBinding innerNames) bindings) NoCaptureInfo
-  EList elems -> EList (map (trimExpr innerNames) elems)
+    EAttrs False (map trimBinding bindings) NoCaptureInfo
+  EList elems -> EList (map trimExpr elems)
   ESelect target path defExpr ->
     ESelect
-      (trimExpr innerNames target)
-      (map (trimKey innerNames) path)
-      (fmap (trimExpr innerNames) defExpr)
+      (trimExpr target)
+      (map trimKey path)
+      (fmap trimExpr defExpr)
   EHasAttr target path ->
-    EHasAttr (trimExpr innerNames target) (map (trimKey innerNames) path)
-  EApp f x -> EApp (trimExpr innerNames f) (trimExpr innerNames x)
+    EHasAttr (trimExpr target) (map trimKey path)
+  EApp f x -> EApp (trimExpr f) (trimExpr x)
   ELambda formals body captures ->
     -- First, recursively trim nested lambdas in the body.
-    -- Reset innerNames since we're entering a new lambda scope.
-    let formalNames = formalsNames formals
-        trimmedFormals = trimFormals formals
-        trimmedBody = trimExpr formalNames body
+    let trimmedFormals = trimFormals formals
+        trimmedBody = trimExpr body
      in case captures of
           Captures {} -> ELambda trimmedFormals trimmedBody captures
           CapturesWithScopes {} -> ELambda trimmedFormals trimmedBody captures
@@ -94,10 +85,8 @@ trimExpr innerNames expr = case expr of
                         else Captures captureList
                  in ELambda rewrittenFormals rewrittenBody captureInfo
   ELet bindings body captureInfo ->
-    let names = collectBindingNames bindings
-        innerNamesLet = Set.union innerNames names
-        trimmedBindings = map (trimBinding innerNamesLet) bindings
-        trimmedBody = trimExpr innerNamesLet body
+    let trimmedBindings = map trimBinding bindings
+        trimmedBody = trimExpr body
      in case captureInfo of
           Captures {} -> ELet trimmedBindings trimmedBody captureInfo
           CapturesWithScopes {} -> ELet trimmedBindings trimmedBody captureInfo
@@ -112,29 +101,29 @@ trimExpr innerNames expr = case expr of
                         else Captures captureList
                  in ELet rewrittenBindings rewrittenBody ci
   EIf c t f ->
-    EIf (trimExpr innerNames c) (trimExpr innerNames t) (trimExpr innerNames f)
+    EIf (trimExpr c) (trimExpr t) (trimExpr f)
   EWith scope body ->
-    EWith (trimExpr innerNames scope) (trimExpr innerNames body)
+    EWith (trimExpr scope) (trimExpr body)
   EAssert cond body ->
-    EAssert (trimExpr innerNames cond) (trimExpr innerNames body)
-  EUnary op operand -> EUnary op (trimExpr innerNames operand)
-  EBinary op l r -> EBinary op (trimExpr innerNames l) (trimExpr innerNames r)
+    EAssert (trimExpr cond) (trimExpr body)
+  EUnary op operand -> EUnary op (trimExpr operand)
+  EBinary op l r -> EBinary op (trimExpr l) (trimExpr r)
   ESearchPath {} -> expr
 
-trimPart :: Set Text -> StringPart -> StringPart
-trimPart _ p@(StrLit _) = p
-trimPart innerNames (StrInterp e) = StrInterp (trimExpr innerNames e)
+trimPart :: StringPart -> StringPart
+trimPart p@(StrLit _) = p
+trimPart (StrInterp e) = StrInterp (trimExpr e)
 
-trimKey :: Set Text -> AttrKey -> AttrKey
-trimKey _ k@(StaticKey _) = k
-trimKey innerNames (DynamicKey e) = DynamicKey (trimExpr innerNames e)
+trimKey :: AttrKey -> AttrKey
+trimKey k@(StaticKey _) = k
+trimKey (DynamicKey e) = DynamicKey (trimExpr e)
 
-trimBinding :: Set Text -> Binding -> Binding
-trimBinding innerNames (NamedBinding path bodyExpr) =
-  NamedBinding (map (trimKey innerNames) path) (trimExpr innerNames bodyExpr)
-trimBinding innerNames (Inherit (Just fromExpr) names) =
-  Inherit (Just (trimExpr innerNames fromExpr)) names
-trimBinding _ b@(Inherit Nothing _) = b
+trimBinding :: Binding -> Binding
+trimBinding (NamedBinding path bodyExpr) =
+  NamedBinding (map trimKey path) (trimExpr bodyExpr)
+trimBinding (Inherit (Just fromExpr) names) =
+  Inherit (Just (trimExpr fromExpr)) names
+trimBinding b@(Inherit Nothing _) = b
 
 trimFormals :: Formals -> Formals
 trimFormals f@(FormalName _) = f
@@ -145,11 +134,9 @@ trimFormals (FormalNamedSet name formals ellipsis) =
 
 trimFormal :: Formal -> Formal
 trimFormal (Formal name defExpr) =
-  -- Default expressions are evaluated in the lambda's own scope,
-  -- so they get fresh innerNames (just the formals themselves).
-  -- But we already trimmed nested lambdas, and defaults are part
-  -- of the lambda's body - they'll be captured correctly.
-  Formal name (fmap (trimExpr Set.empty) defExpr)
+  -- Default expressions are part of the lambda's own body; nested
+  -- lambdas inside them were already trimmed by the walk.
+  Formal name (fmap trimExpr defExpr)
 
 -- | Analyze a single lambda body and formals defaults, produce a capture
 -- list + rewritten body + rewritten formals, or return the original
@@ -448,14 +435,6 @@ rewriteCaptures depth captureMap (CapturesWithScopes caps) =
                 Nothing -> (lvl, idx)
       | otherwise = (lvl, idx)
 
--- | Extract names introduced by lambda formals.
-formalsNames :: Formals -> Set Text
-formalsNames (FormalName name) = Set.singleton name
-formalsNames (FormalSet formals _) =
-  Set.fromList (map fName formals)
-formalsNames (FormalNamedSet name formals _) =
-  Set.insert name (Set.fromList (map fName formals))
-
 -- | Analyze a let block's binding bodies + body for parent references,
 -- produce a capture list + rewritten bindings + body, or return the
 -- originals unchanged if untrimable.
@@ -491,11 +470,3 @@ trimOneRecAttrs bindings =
               captureMap = Map.fromList (zip captureList [0 ..])
               rewrittenBindings = map (rewriteBinding 0 captureMap) bindings
            in Right (captureList, rewrittenBindings, bindingHasWithVar)
-
--- | Collect top-level binding names (mirrors 'Nix.Expr.Resolve.collectBindingNames').
-collectBindingNames :: [Binding] -> Set Text
-collectBindingNames = foldl' addNames Set.empty
-  where
-    addNames acc (NamedBinding (StaticKey name : _) _) = Set.insert name acc
-    addNames acc (NamedBinding _ _) = acc
-    addNames acc (Inherit _ names) = foldl' (flip Set.insert) acc names

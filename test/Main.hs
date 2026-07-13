@@ -5044,8 +5044,10 @@ testCAttrSet = do
         mapM_ (\sym -> cattrsetInsert set sym (spToCPtr sp)) syms
         cattrsetFreeze set
         n <- cattrsetSize set
-        -- Spot-check a few lookups
-        hit <- cattrsetLookup set (syms !! 5000)
+        -- Spot-check a lookup from the middle of the key range
+        hit <- case drop 5000 syms of
+          middleSym : _ -> cattrsetLookup set middleSym
+          [] -> pure Nothing
         -- set freed by arenaDestroy via nn_attrset_free_all
         freeStablePtr sp
         pure

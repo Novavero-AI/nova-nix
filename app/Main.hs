@@ -1,3 +1,5 @@
+{-# LANGUAGE ScopedTypeVariables #-}
+
 -- | nova-nix CLI entry point.
 --
 -- Commands:
@@ -17,6 +19,7 @@
 -- @
 module Main (main) where
 
+import Control.Exception (SomeException, displayException, try)
 import Control.Monad (void, (>=>))
 import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
@@ -41,7 +44,7 @@ import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
 import qualified System.FilePath as FP
-import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
+import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 
 -- ---------------------------------------------------------------------------
 -- Argument parsing
@@ -152,6 +155,12 @@ mergeSearchPaths extraPaths dataDir envPaths =
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
+  -- UTF-8 on both output handles regardless of the console code page:
+  -- locale encodings THROW on any character they cannot represent, so a
+  -- store path or eval result containing one would otherwise abort the
+  -- whole invocation mid-print on legacy Windows consoles.
+  hSetEncoding stdout utf8
+  hSetEncoding stderr utf8
   -- Initialize C data layer (symbol interning, thunk arena, env allocator)
   arenaInit
   args <- getArgs
@@ -184,15 +193,27 @@ main = do
       hPutStrLn stderr "  --trusted-key K        Public key (name:base64) for the substituter"
       exitFailure
 
+-- | Canonicalize and read a source file.  The canonicalization matters:
+-- relative path literals inside the file resolve against the file's
+-- directory ('esBaseDir'), and a relative base dir would be re-prefixed on
+-- every resolution (doubling it).  An unreadable argument (missing file,
+-- a directory, no permission) is a clean CLI error, never an uncaught
+-- exception.
+readSourceFile :: FilePath -> IO (FilePath, T.Text)
+readSourceFile rawPath = do
+  attempt <- try $ do
+    path <- canonicalizePath rawPath
+    source <- readFileAutoEncoding path
+    pure (path, source)
+  case attempt of
+    Left (e :: SomeException) ->
+      failWith ("cannot read " <> T.pack rawPath <> ": " <> T.pack (displayException e))
+    Right ok -> pure ok
+
 -- | Evaluate a .nix file and print the result.
---
--- The file argument is canonicalized first: relative path literals inside the
--- file resolve against the file's directory ('esBaseDir'), and a relative base
--- dir would be re-prefixed on every resolution (doubling it).
 evalFile :: Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
 evalFile strict extraPaths dataDir rawFilePath = do
-  filePath <- canonicalizePath rawFilePath
-  source <- readFileAutoEncoding filePath
+  (filePath, source) <- readSourceFile rawFilePath
   case parseNix (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
@@ -250,7 +271,7 @@ evalExprAterm extraPaths dataDir source =
           VAttrs attrs ->
             mapM_
               (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
-              ["_derivation", "drvPath"]
+              ["type", "_derivation", "drvPath"]
           _ -> pure ()
         pure val
       case result of
@@ -266,8 +287,7 @@ evalExprAterm extraPaths dataDir source =
 buildFile :: CliOpts -> FilePath -> FilePath -> IO ()
 buildFile opts dataDir rawFilePath = do
   caches <- either failWith pure (substituterConfig (optSubstituter opts) (optTrustedKey opts))
-  filePath <- canonicalizePath rawFilePath
-  source <- readFileAutoEncoding filePath
+  (filePath, source) <- readSourceFile rawFilePath
   case parseNix (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
@@ -284,7 +304,7 @@ buildFile opts dataDir rawFilePath = do
           VAttrs attrs ->
             mapM_
               (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
-              ["_derivation", "drvPath"]
+              ["type", "_derivation", "drvPath"]
           _ -> pure ()
         pure val
       case result of
