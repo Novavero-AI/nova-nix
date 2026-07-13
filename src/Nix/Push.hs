@@ -135,16 +135,23 @@ data PushSummary = PushSummary
 -- | Read an API key from a file, dropping byte-order marks and surrounding
 -- whitespace.  Key files written by Windows tooling are a known source of
 -- BOM contamination; 'normalizeKeyText' makes the transfer byte-clean.
+--
+-- The bytes are decoded as UTF-8 EXPLICITLY: locale text IO decodes by
+-- console code page, which turns the BOM bytes into codepage characters
+-- that no normalizer recognizes - on the very consoles the BOM handling
+-- exists for.
 loadApiKeyFile :: FilePath -> IO (Either Text Text)
 loadApiKeyFile path = do
-  attempt <- try (TIO.readFile path)
+  attempt <- try (BS.readFile path)
   pure $ case attempt of
     Left (e :: SomeException) -> Left ("cannot read key file: " <> T.pack (show e))
-    Right raw ->
-      let key = normalizeKeyText raw
-       in if T.null key
-            then Left ("key file is empty: " <> T.pack path)
-            else Right key
+    Right bytes -> case TE.decodeUtf8' bytes of
+      Left _ -> Left ("key file is not valid UTF-8: " <> T.pack path)
+      Right raw ->
+        let key = normalizeKeyText raw
+         in if T.null key
+              then Left ("key file is empty: " <> T.pack path)
+              else Right key
 
 -- ---------------------------------------------------------------------------
 -- Closure computation
@@ -203,8 +210,8 @@ mkNarInfo sp narHash narSize refs deriver =
     { niStorePath = storePathToText defaultStoreDir sp,
       niUrl = narDirSegment <> "/" <> narFileName narHash,
       niCompression = compressionNone,
-      niFileHash = narHash,
-      niFileSize = fromIntegral narSize,
+      niFileHash = Just narHash,
+      niFileSize = Just (fromIntegral narSize),
       niNarHash = narHash,
       niNarSize = fromIntegral narSize,
       niReferences = sort (map storePathBasename refs),
@@ -261,11 +268,13 @@ newPushManager =
   HTTP.newManager
     HTTPS.tlsManagerSettings {HTTP.managerResponseTimeout = HTTP.responseTimeoutNone}
 
--- | Fetch the set of narinfo hashes the cache already stores.
+-- | Fetch the set of narinfo hashes the cache already stores.  The
+-- endpoint is push-tool plumbing and the server requires the write key
+-- for it (nova-cache 0.5), so the request authenticates like the PUTs.
 fetchRemoteHashes :: HTTP.Manager -> PushConfig -> ExceptT Text IO (Set Text)
 fetchRemoteHashes manager cfg = do
   let url = pcCacheUrl cfg <> "/" <> narinfoHashesEndpoint
-  response <- httpRequest manager "GET" url [] Nothing
+  response <- httpRequest manager "GET" url (authHeaders cfg) Nothing
   let code = HTTP.statusCode (HTTP.responseStatus response)
   unless (code == httpStatusOk) $
     throwError ("GET " <> narinfoHashesEndpoint <> " returned HTTP " <> T.pack (show code))
