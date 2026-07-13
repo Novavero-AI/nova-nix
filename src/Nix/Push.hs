@@ -135,16 +135,23 @@ data PushSummary = PushSummary
 -- | Read an API key from a file, dropping byte-order marks and surrounding
 -- whitespace.  Key files written by Windows tooling are a known source of
 -- BOM contamination; 'normalizeKeyText' makes the transfer byte-clean.
+--
+-- The bytes are decoded as UTF-8 EXPLICITLY: locale text IO decodes by
+-- console code page, which turns the BOM bytes into codepage characters
+-- that no normalizer recognizes - on the very consoles the BOM handling
+-- exists for.
 loadApiKeyFile :: FilePath -> IO (Either Text Text)
 loadApiKeyFile path = do
-  attempt <- try (TIO.readFile path)
+  attempt <- try (BS.readFile path)
   pure $ case attempt of
     Left (e :: SomeException) -> Left ("cannot read key file: " <> T.pack (show e))
-    Right raw ->
-      let key = normalizeKeyText raw
-       in if T.null key
-            then Left ("key file is empty: " <> T.pack path)
-            else Right key
+    Right bytes -> case TE.decodeUtf8' bytes of
+      Left _ -> Left ("key file is not valid UTF-8: " <> T.pack path)
+      Right raw ->
+        let key = normalizeKeyText raw
+         in if T.null key
+              then Left ("key file is empty: " <> T.pack path)
+              else Right key
 
 -- ---------------------------------------------------------------------------
 -- Closure computation
