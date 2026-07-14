@@ -39,11 +39,12 @@ import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbo
 import Nix.Eval.Types (emptyCList)
 import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
+import Nix.Hash (makeFixedOutputPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
+import Nix.Store (Store (..), addToStore, closeStore, isValid, materializeEvalSources, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
@@ -4300,6 +4301,51 @@ testStoreOps = do
             ]
           result <- computeClosure store [p1, p2]
           pure (assertEqual "closure order" (Right [dep, p1, p2]) result),
+        -- materializeEvalSources adoption is verified: a partial tree left
+        -- at the destination by an interrupted copy must be cleared and
+        -- re-copied, never registered as-is.
+        runTestM "materializeEvalSources re-copies a mismatched tree" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-adopt-src"
+          removeIfExists srcDir
+          createDirectoryIfMissing True srcDir
+          TIO.writeFile (srcDir </> "data.txt") "real content"
+          entry <- NAR.serialiseFromPath srcDir
+          let sp = makeFixedOutputPath "nova-nix-test-adopt-src" "sha256" "recursive" (sha256Digest (NAR.serialise entry))
+              spText = storePathToText defaultStoreDir sp
+              dest = storePathToFilePath (stDir store) sp
+          -- Fake an interrupted earlier copy: wrong partial content.
+          removeIfExists dest
+          createDirectoryIfMissing True dest
+          TIO.writeFile (dest </> "data.txt") "partial garbage"
+          materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+          adopted <- TIO.readFile (dest </> "data.txt")
+          registered <- isValid store sp
+          removeIfExists srcDir
+          pure $
+            if adopted == "real content" && registered
+              then Pass
+              else Fail ("expected re-copied content, got: " <> adopted),
+        -- A tree that DOES reproduce its store path is adopted untouched.
+        -- The source is deleted before the call: adoption never reads it,
+        -- so a wrongful re-copy attempt throws and fails the test.
+        runTestM "materializeEvalSources adopts a matching tree untouched" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-adopt-ok"
+          removeIfExists srcDir
+          createDirectoryIfMissing True srcDir
+          TIO.writeFile (srcDir </> "data.txt") "same bytes"
+          entry <- NAR.serialiseFromPath srcDir
+          let sp = makeFixedOutputPath "nova-nix-test-adopt-ok" "sha256" "recursive" (sha256Digest (NAR.serialise entry))
+              spText = storePathToText defaultStoreDir sp
+              dest = storePathToFilePath (stDir store) sp
+          removeIfExists dest
+          createDirectoryIfMissing True dest
+          TIO.writeFile (dest </> "data.txt") "same bytes"
+          removeIfExists srcDir
+          materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+          registered <- isValid store sp
+          pure (if registered then Pass else Fail "matching tree was not adopted and registered"),
         -- scanReferences finds the canonical /nix/store text eval injects
         -- into builder envs, independent of the platform store dir (the
         -- bare hash is the needle, matching upstream Nix).

@@ -35,15 +35,14 @@ import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
-import Nix.Store (Store (..), closeStore, isValid, openStore, queryAllValidPaths, registerPath, registrationFor, setReadOnly, writeDrv, writeDrvAterm)
+import Nix.Store (Store (..), closeStore, materializeEvalSources, openStore, queryAllValidPaths, writeDrv, writeDrvAterm)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDir, storePathHashLen, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir)
-import System.Directory (canonicalizePath, copyFile, createDirectoryIfMissing, createDirectoryLink, createFileLink, doesDirectoryExist, doesPathExist, getCurrentDirectory, getSymbolicLinkTarget, getTemporaryDirectory, listDirectory, pathIsSymbolicLink)
+import System.Directory (canonicalizePath, getCurrentDirectory, getTemporaryDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
-import qualified System.FilePath as FP
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 
 -- ---------------------------------------------------------------------------
@@ -489,64 +488,6 @@ failWith :: T.Text -> IO a
 failWith msg = do
   TIO.hPutStrLn stderr msg
   exitFailure
-
--- | Copy eval-coerced source paths into the store and register them.  The
--- evaluator's source-path cache maps each coerced filesystem path to its
--- @source@ fixed-output store path (text only - eval performs no store
--- writes).  Each entry not already valid is copied in, made read-only, and
--- registered with its real NAR hash.  A copied source carries no references.
-materializeEvalSources :: Store -> Map.Map T.Text T.Text -> IO ()
-materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
-  where
-    -- Each source registers IMMEDIATELY after its copy (sources carry no
-    -- cross-references, so there is nothing to batch), and a source
-    -- already on disk is adopted without touching its files - re-copying
-    -- onto a read-only tree fails on Windows, so an interrupted earlier
-    -- run would otherwise wedge the store permanently.  Mirrors the
-    -- builder's own prepareOutput recovery.
-    adopt (rawPath, spText) =
-      case parseStorePath defaultStoreDir spText of
-        Nothing -> pure ()
-        Just sp -> do
-          valid <- isValid store sp
-          if valid
-            then pure ()
-            else do
-              let dest = storePathToFilePath (stDir store) sp
-              onDisk <- doesPathExist dest
-              if onDisk
-                then pure ()
-                else do
-                  copyPathInto (T.unpack rawPath) dest
-                  setReadOnly dest
-              reg <- registrationFor store sp Nothing []
-              registerPath (stDB store) reg
-
--- | Recursively copy a file or directory tree to a destination path.
--- A symlink is replicated as a symlink: the store path's name came from a
--- NAR hash that ENCODES the link entry, so dereferencing it here would
--- store content that no longer matches its own address (and a
--- self-referential link would recurse forever).  On Windows without
--- symlink privilege the link creation fails loudly rather than silently
--- corrupting the content address.
-copyPathInto :: FilePath -> FilePath -> IO ()
-copyPathInto src dest = do
-  isLink <- pathIsSymbolicLink src
-  if isLink
-    then do
-      target <- getSymbolicLinkTarget src
-      linkedDir <- doesDirectoryExist src
-      if linkedDir
-        then createDirectoryLink target dest
-        else createFileLink target dest
-    else do
-      isDir <- doesDirectoryExist src
-      if isDir
-        then do
-          createDirectoryIfMissing True dest
-          names <- listDirectory src
-          mapM_ (\name -> copyPathInto (src FP.</> name) (dest FP.</> name)) names
-        else copyFile src dest
 
 -- | Write every recorded @.drv@ ATerm (keyed by its store-path text) to the
 -- store.  Keys come from evaluation via 'storePathToText' so they always parse;

@@ -53,6 +53,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Th
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (parseNix, readFileAutoEncoding)
+import Nix.Store (unpackNarEntry)
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
@@ -379,7 +380,8 @@ instance MonadEval EvalIO where
           alreadyThere <- Dir.doesPathExist destFilePath
           unless alreadyThere $ do
             Dir.createDirectoryIfMissing True (takeDirectory destFilePath)
-            materializeNarEntry destFilePath entry
+            unpacked <- unpackNarEntry destFilePath entry
+            either (throwIO . userError . T.unpack) pure unpacked
         pure destPath
 
   addFixedOutputFile name bytes = do
@@ -659,22 +661,3 @@ copyPath src dest = do
       entries <- Dir.listDirectory src
       mapM_ (\entry -> copyPath (src </> entry) (dest </> entry)) entries
     else Dir.copyFile src dest
-
--- | Write a NAR entry tree to disk: files with their executable bit,
--- directories recursively, symlinks as symlinks (directory links when the
--- target resolves to a directory, matching how the tree was serialized).
-materializeNarEntry :: FilePath -> NAR.NarEntry -> IO ()
-materializeNarEntry dest (NAR.NarRegular isExec contents) = do
-  BS.writeFile dest contents
-  when isExec $ do
-    perms <- Dir.getPermissions dest
-    Dir.setPermissions dest (Dir.setOwnerExecutable True perms)
-materializeNarEntry dest (NAR.NarSymlink target) = do
-  let resolved = takeDirectory dest </> T.unpack target
-  targetIsDir <- Dir.doesDirectoryExist resolved
-  if targetIsDir
-    then Dir.createDirectoryLink (T.unpack target) dest
-    else Dir.createFileLink (T.unpack target) dest
-materializeNarEntry dest (NAR.NarDirectory entries) = do
-  Dir.createDirectoryIfMissing True dest
-  mapM_ (\(name, entry) -> materializeNarEntry (dest </> T.unpack name) entry) entries

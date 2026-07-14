@@ -58,7 +58,6 @@ where
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
-import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.List (sortBy)
@@ -69,16 +68,14 @@ import qualified Data.Text.Encoding as TE
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Store (Store (..), setReadOnly)
+import Nix.Store (Store (..), setReadOnly, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
 import Nix.Store.Path (StoreDir, StorePath (..), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
-import System.Directory (createDirectoryIfMissing, setPermissions)
 import qualified System.Directory as Dir
-import System.FilePath (takeDirectory, (</>))
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -467,116 +464,5 @@ parseDeriver storeDir (Just txt)
 clearStaleDestination :: FilePath -> IO ()
 clearStaleDestination = Dir.removePathForcibly
 
--- | Unpack a NarEntry tree to a filesystem destination.  Returns @Left@ on an
--- unsafe entry name (path traversal); these come from untrusted cache data, so
--- a typed failure is used instead of a partial 'error'.
---
--- Regular files and directories are written in one pass; symlinks are
--- created in a second pass, after their targets are materialized.  Windows
--- symlinks are typed (file vs directory) and the NAR format does not record
--- the target's kind, so the only reliable way to pick the flavor is to look
--- at the target on disk - which may sort after the link within the tree.
-unpackNarEntry :: FilePath -> NAR.NarEntry -> IO (Either Text ())
-unpackNarEntry path entry = do
-  walked <- unpackTree path entry
-  case walked of
-    Left err -> pure (Left err)
-    Right links -> createSymlinks links
-
--- | First unpack pass: write regular files and directories, recording
--- symlinks as (link path, target) for the second pass.
-unpackTree :: FilePath -> NAR.NarEntry -> IO (Either Text [(FilePath, Text)])
-unpackTree path entry = case entry of
-  NAR.NarRegular isExec contents -> do
-    createDirectoryIfMissing True (takeDirectory path)
-    BS.writeFile path contents
-    when isExec $ do
-      perms <- Dir.getPermissions path
-      setPermissions path (Dir.setOwnerExecutable True perms)
-    pure (Right [])
-  NAR.NarSymlink target -> pure (Right [(path, target)])
-  NAR.NarDirectory entries -> do
-    createDirectoryIfMissing True path
-    unpackChildren path entries
-
--- | Unpack directory children, short-circuiting with a typed failure on the
--- first unsafe entry name rather than crashing on untrusted input.
-unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
-unpackChildren _ [] = pure (Right [])
-unpackChildren path ((name, child) : rest)
-  | not (isSafeNarName name) =
-      pure (Left ("unsafe NAR directory entry name: " <> name))
-  | otherwise = do
-      result <- unpackTree (path </> T.unpack name) child
-      case result of
-        Left err -> pure (Left err)
-        Right links -> do
-          restResult <- unpackChildren path rest
-          case restResult of
-            Left err -> pure (Left err)
-            Right moreLinks -> pure (Right (links <> moreLinks))
-
--- | Second unpack pass: create the recorded symlinks.  Links whose targets
--- already exist are created first - possibly unblocking link-to-link
--- chains - so the Windows link flavor (file vs directory) is read off the
--- real target.  When no pending link's target exists, the remainder are
--- dangling and their kind is unknowable: they default to file links.
-createSymlinks :: [(FilePath, Text)] -> IO (Either Text ())
-createSymlinks [] = pure (Right ())
-createSymlinks pending = do
-  ready <- filterM targetExists pending
-  case ready of
-    [] -> createAll pending
-    _ -> do
-      made <- createAll ready
-      case made of
-        Left err -> pure (Left err)
-        Right () -> createSymlinks (filter (`notElem` ready) pending)
-  where
-    targetExists (linkPath, target) =
-      Dir.doesPathExist (takeDirectory linkPath </> T.unpack target)
-    createAll [] = pure (Right ())
-    createAll (link : rest) = do
-      made <- uncurry createSymlink link
-      case made of
-        Left err -> pure (Left err)
-        Right () -> createAll rest
-
--- | Create one symlink, choosing the Windows flavor from the target's kind.
--- A creation failure is loud: the old fallback of writing the target text
--- as a regular file registered a tree whose NAR hash differed from the
--- signed narinfo's - silent store corruption that a later push refuses to
--- publish.  Failing lets the caller fall back to a local build.
-createSymlink :: FilePath -> Text -> IO (Either Text ())
-createSymlink linkPath target = do
-  createDirectoryIfMissing True (takeDirectory linkPath)
-  let targetStr = T.unpack target
-  targetIsDir <- Dir.doesDirectoryExist (takeDirectory linkPath </> targetStr)
-  result <-
-    try $
-      if targetIsDir
-        then Dir.createDirectoryLink targetStr linkPath
-        else Dir.createFileLink targetStr linkPath
-  case result of
-    Right () -> pure (Right ())
-    Left (e :: SomeException) ->
-      pure
-        ( Left
-            ( "cannot create symlink "
-                <> T.pack linkPath
-                <> " -> "
-                <> target
-                <> ": "
-                <> T.pack (show e)
-                <> " (on Windows this needs Developer Mode or elevation)"
-            )
-        )
-
--- | Validate that a NAR entry name is safe (no path traversal).
-isSafeNarName :: Text -> Bool
-isSafeNarName name =
-  not (T.null name)
-    && name /= ".."
-    && name /= "."
-    && not (T.isInfixOf "/" name)
-    && not (T.isInfixOf "\\" name)
+-- unpackNarEntry lives in 'Nix.Store' (one tree-materializer for the
+-- codebase) and is re-exported here for its historical callers and tests.
