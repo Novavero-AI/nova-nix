@@ -28,8 +28,10 @@ in
         # The setup script is a store path (canonical /nix/store); bash reads it
         # via the drive-mounted form.
         args = [ "/cygdrive/c${setup}" ];
-        # The mingw toolchain bin, already translated for the build's bash PATH.
-        ccPath = "/cygdrive/c${mingwSeed}/mingw64/bin";
+        # The mingw toolchain bin as a canonical store path; setup.sh maps it
+        # to the build machine's drive-mounted form (the physical drive is a
+        # build-time fact, not derivation text).
+        ccPath = "${mingwSeed}/mingw64/bin";
         # The cc-wrapper source (a store path); setup.sh installs it on PATH
         # ahead of the toolchain so every compiler call flows through it.
         ccWrapperSrc = ccWrapper;
