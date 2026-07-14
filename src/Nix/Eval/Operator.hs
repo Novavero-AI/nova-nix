@@ -8,11 +8,15 @@ module Nix.Eval.Operator
     evalUnary,
     nixCompare,
     nixEqual,
+    checkedAdd,
+    checkedSub,
+    checkedMul,
   )
 where
 
 import Data.Int (Int64)
 import Data.Text (Text)
+import qualified Data.Text as T
 import Nix.Eval.CAttrSet (cattrsetUnion)
 import Nix.Eval.CList (clistFromThunks, clistLen, clistThunks)
 import Nix.Eval.Types
@@ -41,8 +45,8 @@ type Force m = Thunk -> m NixValue
 evalBinary :: (MonadEval m) => Force m -> BinaryOp -> NixValue -> NixValue -> m NixValue
 evalBinary forceFn op left right = case op of
   OpAdd -> evalAdd left right
-  OpSub -> evalArith "subtraction" (-) (-) left right
-  OpMul -> evalArith "multiplication" (*) (*) left right
+  OpSub -> evalArith "subtraction" checkedSub (-) left right
+  OpMul -> evalArith "multiplication" checkedMul (*) left right
   OpDiv -> evalDiv left right
   OpEq -> VBool <$> nixEqual forceFn left right
   OpNeq -> VBool . not <$> nixEqual forceFn left right
@@ -67,7 +71,9 @@ evalUnary OpNot val = case val of
   VBool b -> pure (VBool (not b))
   other -> throwEvalError ("cannot apply ! to " <> typeName other)
 evalUnary OpNegate val = case val of
-  VInt n -> pure (VInt (negate n))
+  -- negate minBound has no Int64 representation; upstream desugars unary
+  -- minus to 0 - n, so it reports the same checked-subtraction overflow.
+  VInt n -> either throwEvalError (pure . VInt) (checkedSub 0 n)
   VFloat n -> pure (VFloat (negate n))
   other -> throwEvalError ("cannot negate " <> typeName other)
 
@@ -76,7 +82,7 @@ evalUnary OpNegate val = case val of
 -- (store-copy coercion for @string + path@, context checks for
 -- @path + string@) before delegating.
 evalAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-evalAdd (VInt a) (VInt b) = pure (VInt (a + b))
+evalAdd (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedAdd a b)
 evalAdd (VInt a) (VFloat b) = pure (VFloat (fromIntegral a + b))
 evalAdd (VFloat a) (VInt b) = pure (VFloat (a + fromIntegral b))
 evalAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
@@ -84,17 +90,45 @@ evalAdd (VStr a ctxA) (VStr b ctxB) = pure (VStr (a <> b) (ctxA <> ctxB))
 evalAdd left right =
   throwEvalError ("cannot add " <> typeName left <> " and " <> typeName right)
 
--- | Generic arithmetic for subtraction and multiplication.
+-- | Checked Int64 arithmetic: integer overflow is an eval error (Nix
+-- 2.24 semantics), never a two's-complement wrap.  Computed in Integer
+-- and bounds-checked.
+checkedIntOp :: Text -> (Integer -> Integer -> Integer) -> Int64 -> Int64 -> Either Text Int64
+checkedIntOp verb op a b
+  | wide < toInteger (minBound :: Int64) || wide > toInteger (maxBound :: Int64) =
+      Left
+        ( "integer overflow in "
+            <> verb
+            <> " "
+            <> T.pack (show a)
+            <> " and "
+            <> T.pack (show b)
+        )
+  | otherwise = Right (fromInteger wide)
+  where
+    wide = op (toInteger a) (toInteger b)
+
+checkedAdd :: Int64 -> Int64 -> Either Text Int64
+checkedAdd = checkedIntOp "adding" (+)
+
+checkedSub :: Int64 -> Int64 -> Either Text Int64
+checkedSub = checkedIntOp "subtracting" (-)
+
+checkedMul :: Int64 -> Int64 -> Either Text Int64
+checkedMul = checkedIntOp "multiplying" (*)
+
+-- | Generic arithmetic for subtraction and multiplication.  The integer
+-- side is a checked op ('checkedSub' / 'checkedMul').
 evalArith ::
   (MonadEval m) =>
   Text ->
-  (Int64 -> Int64 -> Int64) ->
+  (Int64 -> Int64 -> Either Text Int64) ->
   (Double -> Double -> Double) ->
   NixValue ->
   NixValue ->
   m NixValue
-evalArith name intOp floatOp left right = case (left, right) of
-  (VInt a, VInt b) -> pure (VInt (intOp a b))
+evalArith name checkedOp floatOp left right = case (left, right) of
+  (VInt a, VInt b) -> either throwEvalError (pure . VInt) (checkedOp a b)
   (VInt a, VFloat b) -> pure (VFloat (floatOp (fromIntegral a) b))
   (VFloat a, VInt b) -> pure (VFloat (floatOp a (fromIntegral b)))
   (VFloat a, VFloat b) -> pure (VFloat (floatOp a b))
@@ -114,9 +148,10 @@ evalDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 evalDiv left right = case (left, right) of
   (VInt _, VInt 0) -> throwEvalError "division by zero"
   (VInt a, VInt b)
-    -- quot minBound (-1) throws arithmetic overflow in Haskell;
-    -- C++ Nix wraps silently (undefined behavior, wraps to minBound).
-    | a == minBound && b == -1 -> pure (VInt minBound)
+    -- The one overflowing division: |minBound| has no representation.
+    | a == minBound && b == -1 ->
+        throwEvalError
+          ("integer overflow in dividing " <> T.pack (show a) <> " and " <> T.pack (show b))
     | otherwise -> pure (VInt (quot a b))
   (VInt a, VFloat b)
     | b == 0 -> throwEvalError "division by zero"

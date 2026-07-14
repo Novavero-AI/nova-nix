@@ -313,6 +313,20 @@ testEvalArithmetic = do
         assertEval "div" "10 / 3" (VInt 3),
       runTest "float add" $
         assertEval "float-add" "1.5 + 2.5" (VFloat 4.0),
+      -- Integer overflow is an eval error (Nix 2.24 semantics), never a
+      -- two's-complement wrap; the boundary itself still computes.
+      runTest "add overflow fails" $
+        assertEvalFail "add-overflow" "9223372036854775807 + 1",
+      runTest "sub overflow fails" $
+        assertEvalFail "sub-overflow" "(-9223372036854775807) - 2",
+      runTest "mul overflow fails" $
+        assertEvalFail "mul-overflow" "builtins.mul 9223372036854775807 2",
+      runTest "div minBound by -1 overflows" $
+        assertEvalFail "div-overflow" "((-9223372036854775807) - 1) / (-1)",
+      runTest "negate minBound overflows" $
+        assertEvalFail "neg-overflow" "-((-9223372036854775807) - 1)",
+      runTest "add at the boundary still works" $
+        assertEval "add-boundary" "9223372036854775806 + 1 == 9223372036854775807" (VBool True),
       runTest "int-float promotion" $
         assertEval "promote" "1 + 2.0" (VFloat 3.0),
       runTest "trailing-dot float" $
@@ -1348,6 +1362,14 @@ testBatch1 = do
         assertEval "floor-int" "builtins.floor 5" (VInt 5),
       runTest "floor negative" $
         assertEval "floor-neg" "builtins.floor (- 1.2)" (VInt (-2)),
+      -- NaN, infinity, and out-of-range floats are eval errors (Nix 2.24),
+      -- not whatever Int64 Haskell's unchecked conversion produces.
+      runTest "ceil NaN fails" $
+        assertEvalFail "ceil-nan" "builtins.ceil ((1.0e308 * 10) * 0.0)",
+      runTest "floor infinity fails" $
+        assertEvalFail "floor-inf" "builtins.floor (1.0e308 * 10)",
+      runTest "ceil out of integer range fails" $
+        assertEvalFail "ceil-range" "builtins.ceil 1.0e300",
       -- seq
       runTest "seq returns second" $
         assertEval "seq" "builtins.seq 1 42" (VInt 42),
@@ -1629,6 +1651,37 @@ testBatch6 = do
         assertEvalFail "tryEval-noattr" "(builtins.tryEval ({ a = 1; }.b)).success",
       runTest "tryEval catches a throw nested under forcing" $
         assertEval "tryEval-deep-throw" "(builtins.tryEval (builtins.deepSeq [ (builtins.throw \"x\") ] 1)).success" (VBool False),
+      -- tryEval passed as a VALUE (comparator/element positions) instead
+      -- of applied syntactically: every application path must keep the
+      -- catch around the argument's evaluation, and none may leak the
+      -- old internal 'unreachable' dispatch error.
+      runTest "tryEval as sort comparator fails like upstream" $
+        case evalNix "builtins.sort builtins.tryEval [ 1 2 ]" of
+          Left err
+            | "unreachable" `T.isInfixOf` err -> Fail ("internal error leaked: " <> err)
+            | otherwise -> Pass
+          Right v -> Fail ("expected a boolean-coercion failure, got " <> T.pack (show v)),
+      runTest "tryEval via map catches a throwing element" $
+        assertEval
+          "tryEval-map"
+          "(builtins.elemAt (builtins.map builtins.tryEval [ (builtins.throw \"m\") ]) 0).success"
+          (VBool False),
+      runTest "tryEval via map success-wraps a clean element" $
+        assertEval
+          "tryEval-map-ok"
+          "(builtins.elemAt (builtins.map builtins.tryEval [ 7 ]) 0).value"
+          (VInt 7),
+      runTest "tryEval through filter catches the element throw" $
+        case evalNix "builtins.filter builtins.tryEval [ (builtins.throw \"leaked\") ]" of
+          Left err
+            | "leaked" `T.isInfixOf` err -> Fail ("throw escaped tryEval: " <> err)
+            | otherwise -> Pass
+          Right v -> Fail ("expected a boolean-coercion failure, got " <> T.pack (show v)),
+      runTest "functor returning tryEval keeps the catch" $
+        assertEval
+          "tryEval-functor"
+          "(({ __functor = self: builtins.tryEval; }) (builtins.throw \"f\")).success"
+          (VBool False),
       -- deepSeq
       runTest "deepSeq returns second" $
         assertEval "deepSeq" "builtins.deepSeq [ 1 2 3 ] 42" (VInt 42),

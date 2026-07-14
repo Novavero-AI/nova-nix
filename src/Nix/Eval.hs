@@ -96,7 +96,7 @@ import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
-import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
+import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, formatNixFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolText)
 import Nix.Eval.Types
@@ -471,29 +471,7 @@ evalBcApp env bcIdx0 = do
       let argThunk = cheapThunkBc env argIdx
       extEnv <- matchFormals closureEnv formals argThunk
       evalBytecode extEnv bodyBcIdx
-    VBuiltin "tryEval" [] -> do
-      result <- catchEvalError (evalBytecode env argIdx)
-      case result of
-        Right val ->
-          pure
-            ( VAttrs
-                ( attrSetFromMap $
-                    Map.fromList
-                      [ ("success", evaluated (VBool True)),
-                        ("value", evaluated val)
-                      ]
-                )
-            )
-        Left _ ->
-          pure
-            ( VAttrs
-                ( attrSetFromMap $
-                    Map.fromList
-                      [ ("success", evaluated (VBool False)),
-                        ("value", evaluated (VBool False))
-                      ]
-                )
-            )
+    VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
     VBuiltin name accArgs -> do
       argVal <- evalBytecode env argIdx
       applyBuiltin name accArgs argVal
@@ -508,10 +486,42 @@ evalBcApp env bcIdx0 = do
               let argThunk = cheapThunkBc env argIdx
               extEnv <- matchFormals closureEnv formals argThunk
               evalBytecode extEnv bodyBcIdx
+            -- A functor returning tryEval keeps the catch around the
+            -- argument's evaluation, like the direct arm above.
+            VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
             _ -> do
               argVal <- evalBytecode env argIdx
               applyValue partiallyApplied argVal
     _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
+
+-- | @builtins.tryEval@ over an argument's evaluation: @{ success, value }@
+-- with catchable errors (throw, failed assert - the only kinds
+-- 'catchEvalError' recovers) mapped to @success = false@.  The catch must
+-- wrap the ARGUMENT'S EVALUATION: an application path that forces the
+-- argument before dispatching here has already let the throw escape.
+-- Callers holding an already-forced value pass @pure val@ - nothing left
+-- to catch, so it success-wraps, exactly as upstream treats a value in
+-- WHNF.
+tryEvalAction :: (MonadEval m) => m NixValue -> m NixValue
+tryEvalAction act = do
+  result <- catchEvalError act
+  pure $ case result of
+    Right val ->
+      VAttrs
+        ( attrSetFromMap $
+            Map.fromList
+              [ ("success", evaluated (VBool True)),
+                ("value", evaluated val)
+              ]
+        )
+    Left _ ->
+      VAttrs
+        ( attrSetFromMap $
+            Map.fromList
+              [ ("success", evaluated (VBool False)),
+                ("value", evaluated (VBool False))
+              ]
+        )
 
 -- | Evaluate a lambda literal from bytecode - returns VLambda.
 evalBcLambda :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -1143,7 +1153,10 @@ builtinRegistry =
       builtin1 "fromJSON" builtinFromJSON,
       builtin2 "hashString" builtinHashString,
       -- Error handling + sequencing
-      builtin1 "tryEval" (\_ -> throwEvalError "unreachable: tryEval handled in evalApp"),
+      -- An argument reaching here is already forced (any throw happened
+      -- before tryEval saw it), so it success-wraps; the catching paths
+      -- are evalBcApp and applyValueLazy.
+      builtin1 "tryEval" (tryEvalAction . pure),
       builtin2 "deepSeq" builtinDeepSeq,
       -- Graph traversal
       builtin1 "genericClosure" builtinGenericClosure,
@@ -1258,6 +1271,10 @@ applyValueLazy :: (MonadEval m) => NixValue -> Thunk -> m NixValue
 applyValueLazy (VLambda closureEnv formals bodyBcIdx) argThunk = do
   extEnv <- matchFormals closureEnv formals argThunk
   evalBytecode extEnv bodyBcIdx
+-- tryEval's catch must wrap the argument's forcing (see 'tryEvalAction'):
+-- map/filter passing a throwing element to tryEval yields success = false,
+-- not an escaped error.
+applyValueLazy (VBuiltin "tryEval" []) argThunk = tryEvalAction (force argThunk)
 applyValueLazy other argThunk = do
   val <- force argThunk
   applyValue other val
@@ -1358,7 +1375,8 @@ executeBuiltin name args = case name of
   "fromJSON" -> apply1 builtinFromJSON
   "hashString" -> apply2 builtinHashString
   -- Error handling + sequencing
-  "tryEval" -> apply1 (\_ -> throwEvalError "unreachable: tryEval handled in evalApp")
+  -- Already-forced argument: success-wrap (see the registry entry).
+  "tryEval" -> apply1 (tryEvalAction . pure)
   "deepSeq" -> apply2 builtinDeepSeq
   -- Graph traversal
   "genericClosure" -> apply1 builtinGenericClosure
@@ -2003,14 +2021,27 @@ isPathVal (VPath _) = True
 isPathVal _ = False
 
 builtinCeil :: (MonadEval m) => NixValue -> m NixValue
-builtinCeil (VFloat f) = pure (VInt (ceiling f))
+builtinCeil (VFloat f) = intFromDouble "builtins.ceil" ceiling f
 builtinCeil (VInt n) = pure (VInt n)
 builtinCeil other = throwEvalError ("builtins.ceil: expected a number, got " <> typeName other)
 
 builtinFloor :: (MonadEval m) => NixValue -> m NixValue
-builtinFloor (VFloat f) = pure (VInt (floor f))
+builtinFloor (VFloat f) = intFromDouble "builtins.floor" floor f
 builtinFloor (VInt n) = pure (VInt n)
 builtinFloor other = throwEvalError ("builtins.floor: expected a number, got " <> typeName other)
+
+-- | Round a float to Int64 with the checks Nix 2.24 performs: NaN,
+-- infinity, and out-of-range values are eval errors, never a garbage
+-- Int64 out of Haskell's unchecked conversion.
+intFromDouble :: (MonadEval m) => Text -> (Double -> Integer) -> Double -> m NixValue
+intFromDouble ctx rounder f
+  | isNaN f = throwEvalError (ctx <> ": NaN cannot be converted to an integer")
+  | isInfinite f = throwEvalError (ctx <> ": infinity cannot be converted to an integer")
+  | rounded < toInteger (minBound :: Int64) || rounded > toInteger (maxBound :: Int64) =
+      throwEvalError (ctx <> ": " <> formatNixFloat f <> " is out of integer range")
+  | otherwise = pure (VInt (fromInteger rounded))
+  where
+    rounded = rounder f
 
 builtinDiscardContext :: (MonadEval m) => NixValue -> m NixValue
 builtinDiscardContext (VStr s _) = pure (mkStr s)
@@ -2193,21 +2224,21 @@ builtinLessThan a b = VBool <$> nixCompare force a b
 -- ---------------------------------------------------------------------------
 
 builtinAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAdd (VInt a) (VInt b) = pure (VInt (a + b))
+builtinAdd (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedAdd a b)
 builtinAdd (VInt a) (VFloat b) = pure (VFloat (fromIntegral a + b))
 builtinAdd (VFloat a) (VInt b) = pure (VFloat (a + fromIntegral b))
 builtinAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
 builtinAdd l r = throwEvalError ("builtins.add: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
 builtinSub :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinSub (VInt a) (VInt b) = pure (VInt (a - b))
+builtinSub (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedSub a b)
 builtinSub (VInt a) (VFloat b) = pure (VFloat (fromIntegral a - b))
 builtinSub (VFloat a) (VInt b) = pure (VFloat (a - fromIntegral b))
 builtinSub (VFloat a) (VFloat b) = pure (VFloat (a - b))
 builtinSub l r = throwEvalError ("builtins.sub: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
 builtinMul :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMul (VInt a) (VInt b) = pure (VInt (a * b))
+builtinMul (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedMul a b)
 builtinMul (VInt a) (VFloat b) = pure (VFloat (fromIntegral a * b))
 builtinMul (VFloat a) (VInt b) = pure (VFloat (a * fromIntegral b))
 builtinMul (VFloat a) (VFloat b) = pure (VFloat (a * b))
@@ -2216,7 +2247,10 @@ builtinMul l r = throwEvalError ("builtins.mul: expected numbers, got " <> typeN
 builtinDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
 builtinDiv (VInt a) (VInt b)
-  | a == minBound && b == -1 = pure (VInt minBound)
+  -- The one overflowing division: |minBound| has no representation.
+  | a == minBound && b == -1 =
+      throwEvalError
+        ("integer overflow in dividing " <> T.pack (show a) <> " and " <> T.pack (show b))
   | otherwise = pure (VInt (quot a b))
 builtinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
 builtinDiv (VInt a) (VFloat b) = pure (VFloat (fromIntegral a / b))

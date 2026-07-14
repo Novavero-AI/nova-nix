@@ -12,6 +12,9 @@ name: Parity
 
 on:
   workflow_dispatch:
+  # Reusable: the publish workflow runs this on the exact tagged commit,
+  # so nothing reaches Hackage without the drvPath oracle passing there.
+  workflow_call:
   # Regression guard: run on main pushes and PRs, but only when code that can
   # affect the computed drvPath changes - doc-only changes skip it.
   push:
