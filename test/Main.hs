@@ -3252,7 +3252,19 @@ testParseStorePath = do
         assertEqual
           "name-specials"
           (Just (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "gcc-13.2.0_pre+x?="))
-          (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gcc-13.2.0_pre+x?=")
+          (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gcc-13.2.0_pre+x?="),
+      -- The first dash-separated component of a name may not be . or ..
+      -- (upstream checkName): the traversal names' .- / ..- prefixed forms
+      -- are rejected while other dot-leading names stay valid.
+      runTest "parse rejects a .- first component" $
+        assertEqual "dot-dash" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.-cfg"),
+      runTest "parse rejects a ..- first component" $
+        assertEqual "dotdot-dash" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-..-cfg"),
+      runTest "parse accepts a dot-leading name" $
+        assertEqual
+          "dot-leading"
+          (Just (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ".config-1.0"))
+          (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.config-1.0")
     ]
 
 -- ---------------------------------------------------------------------------
@@ -4814,6 +4826,35 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
         pure ret,
+      -- A leftover tree at the output path that is NOT valid in the DB has
+      -- unknowable integrity (interrupted earlier run); the build replaces
+      -- it with the fresh output - upstream's delete-then-move - clearing
+      -- read-only marks rather than adopting stale bytes.
+      runTestM "stale leftover output is replaced by the fresh build" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-stale"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" "staletest"
+            drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo fresh > $out/data.txt"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-stale-tmp"}
+            targetPath = storePathToFilePath (stDir store) outSP
+        -- Fake the interrupted run: stale read-only content at the output's
+        -- store location, never registered.
+        createDirectoryIfMissing True targetPath
+        TIO.writeFile (targetPath </> "data.txt") "stale"
+        setReadOnly targetPath
+        result <- buildDerivation config store drv
+        content <- TIO.readFile (targetPath </> "data.txt")
+        registered <- isValid store outSP
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildSuccess _
+            | T.strip content == "fresh" && registered -> Pass
+            | otherwise -> Fail ("expected fresh registered content, got: " <> content)
+          BuildFailure msg code -> Fail ("build failed (" <> T.pack (show code) <> "): " <> msg),
       -- Path registered in DB after build
       runTestM "path registered in DB" $ do
         tmpBase <- getTemporaryDirectory

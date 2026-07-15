@@ -19,7 +19,7 @@
 -- @
 module Main (main) where
 
-import Control.Exception (SomeException, displayException, try)
+import Control.Exception (IOException, displayException, try)
 import Control.Monad (void, (>=>))
 import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
@@ -197,7 +197,8 @@ main = do
 -- directory ('esBaseDir'), and a relative base dir would be re-prefixed on
 -- every resolution (doubling it).  An unreadable argument (missing file,
 -- a directory, no permission) is a clean CLI error, never an uncaught
--- exception.
+-- exception.  Only 'IOException' is caught: an interrupt or any other
+-- async exception must abort the run, not print as a read failure.
 readSourceFile :: FilePath -> IO (FilePath, T.Text)
 readSourceFile rawPath = do
   attempt <- try $ do
@@ -205,7 +206,7 @@ readSourceFile rawPath = do
     source <- readFileAutoEncoding path
     pure (path, source)
   case attempt of
-    Left (e :: SomeException) ->
+    Left (e :: IOException) ->
       failWith ("cannot read " <> T.pack rawPath <> ": " <> T.pack (displayException e))
     Right ok -> pure ok
 

@@ -155,8 +155,8 @@ placeInStore store srcPath sp deriver refs = do
   registrationFor store sp deriver refs
 
 -- | Compute the registration metadata for a store path already present on
--- disk, without moving anything.  Used to (re-)register an output that an
--- interrupted build left in place but never recorded in the database.
+-- disk, without moving anything.  Used by 'placeInStore' after its move,
+-- and by 'materializeEvalSources' to register a verified adopted tree.
 registrationFor :: Store -> StorePath -> Maybe Text -> [StorePath] -> IO PathRegistration
 registrationFor store sp deriver refs = do
   let destPath = storePathToFilePath (stDir store) sp

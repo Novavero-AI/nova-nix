@@ -152,16 +152,20 @@ isNixBase32Char c =
   isDigit c
     || (isAsciiLower c && c /= 'e' && c /= 'o' && c /= 'u' && c /= 't')
 
--- | Upstream's store path name rules: 1-211 characters from
--- @[A-Za-z0-9+._?=-]@, and not the directory-traversal names @.@ / @..@.
+-- | Upstream's store path name rules (its checkName parse boundary):
+-- 1-211 characters from @[A-Za-z0-9+._?=-]@, and the first dash-separated
+-- component may not be @.@ or @..@.  One rule rejects the traversal names
+-- and their @.-@ / @..-@ prefixed forms alike, while other dot-leading
+-- names (@.config-1.0@) stay valid.
 validStorePathName :: Text -> Bool
 validStorePathName name =
   not (T.null name)
     && T.length name <= maxStorePathNameLen
-    && name /= "."
-    && name /= ".."
+    && firstDashComponent /= "."
+    && firstDashComponent /= ".."
     && T.all isStorePathNameChar name
   where
+    firstDashComponent = T.takeWhile (/= '-') name
     isStorePathNameChar c =
       isAsciiLower c
         || isAsciiUpper c

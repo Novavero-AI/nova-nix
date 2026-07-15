@@ -45,7 +45,7 @@ module Nix.Builder
   )
 where
 
-import Control.Exception (SomeException, finally, try)
+import Control.Exception (IOException, SomeException, displayException, finally, try)
 import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
@@ -65,7 +65,7 @@ import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Hash (bytesToHexText, hexToBytes, rawHashWithAlgo)
-import Nix.Store (PathRegistration, Store (..), isValid, placeInStore, registerPaths, registrationFor, scanReferences, scanTempReferences)
+import Nix.Store (PathRegistration, Store (..), isValid, placeInStore, registerPaths, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
@@ -598,23 +598,23 @@ prepareOutput config store candidates tempPairs drvPathText (output, (_outName, 
   if not exists
     then pure (Left ("output missing: " <> T.pack outDir))
     else do
-      -- Validity is a DB fact, not mere disk presence: an output left on disk by
-      -- an interrupted build is NOT valid and must be (re-)registered.
+      -- Validity is a DB fact, not mere disk presence: an output left on disk
+      -- by an interrupted run is NOT valid, and build outputs are not
+      -- content-addressed, so a leftover cannot be verified against its path.
+      -- Replace it with the freshly built output (upstream's delete-then-move
+      -- at output registration) rather than adopt unverifiable bytes;
+      -- 'removePathForcibly' clears read-only marks, so a tree an earlier run
+      -- already marked read-only cannot wedge the replacement.
       valid <- isValid store targetSP
       if valid
         then pure (Right Nothing)
         else do
           onDisk <- doesPathExist targetPath
-          -- Scan whichever artifact we will register: a leftover store path if
-          -- present, otherwise the fresh build output.
-          let scanPath = if onDisk then targetPath else outDir
-          inputRefs <- scanReferences candidates scanPath
-          selfRefs <- scanTempReferences tempPairs scanPath
+          when onDisk (removePathForcibly targetPath)
+          inputRefs <- scanReferences candidates outDir
+          selfRefs <- scanTempReferences tempPairs outDir
           let refs = dedupStorePaths (inputRefs ++ selfRefs)
-          reg <-
-            if onDisk
-              then registrationFor store targetSP drvPathText refs
-              else placeInStore store outDir targetSP drvPathText refs
+          reg <- placeInStore store outDir targetSP drvPathText refs
           pure (Right (Just reg))
 
 -- | Deduplicate store paths by their (unique) hash.
@@ -756,8 +756,13 @@ logDepStatus status drv =
 -- and unpacked first, then recorded in one 'registerPaths' transaction,
 -- so cross-output reference edges land after both endpoints' rows exist
 -- and a partial substitution registers nothing (the subsequent build
--- starts from unregistered outputs; leftover unpacked trees are cleared
--- by the build's own staleness handling).
+-- starts from unregistered outputs and 'prepareOutput' replaces the
+-- leftover unpacked trees).
+--
+-- A registration the database REFUSES - its unregistered-referent guard,
+-- reachable only through cache-declared references this store has never
+-- seen - is a substitution failure like any other: the transaction
+-- recorded nothing, so report it and fall back to building locally.
 trySubstituteOutputs :: BuildConfig -> Store -> Derivation -> IO Bool
 trySubstituteOutputs config store drv
   | null (bcCaches config) = pure False
@@ -765,8 +770,14 @@ trySubstituteOutputs config store drv
       results <- mapM (trySubstitute store (bcCaches config) . doPath) (drvOutputs drv)
       case traverse substRegistration results of
         Just regs -> do
-          registerPaths (stDB store) regs
-          pure True
+          registered <- try (registerPaths (stDB store) regs)
+          case registered of
+            Right () -> pure True
+            Left (e :: IOException) -> do
+              TIO.hPutStrLn
+                System.IO.stderr
+                ("  [subst] registration refused, building instead: " <> T.pack (displayException e))
+              pure False
         Nothing -> pure False
   where
     substRegistration (SubstSuccess reg) = Just reg
