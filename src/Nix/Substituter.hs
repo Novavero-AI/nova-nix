@@ -44,7 +44,9 @@ module Nix.Substituter
     tryCachesWith,
     verifySigs,
     verifyNarHash,
+    verifyNarSize,
     narInfoMatchesPath,
+    decompressorFor,
     decompressNar,
     unpackNarEntry,
     clearStaleDestination,
@@ -56,7 +58,6 @@ where
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
-import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.List (sortBy)
@@ -67,16 +68,14 @@ import qualified Data.Text.Encoding as TE
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Store (Store (..), setReadOnly)
-import Nix.Store.DB (PathRegistration (..), registerPath)
+import Nix.Store (Store (..), setReadOnly, unpackNarEntry)
+import Nix.Store.DB (PathRegistration (..))
 import Nix.Store.Path (StoreDir, StorePath (..), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
-import System.Directory (createDirectoryIfMissing, setPermissions)
 import qualified System.Directory as Dir
-import System.FilePath (takeDirectory, (</>))
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -104,8 +103,11 @@ defaultCacheConfig =
 
 -- | Result of a substitution attempt.
 data SubstResult
-  = -- | Successfully substituted - path is now in the store.
-    SubstSuccess !StorePath
+  = -- | Verified and unpacked on disk, NOT yet registered: the carried
+    -- registration is recorded by the caller, which batches every output
+    -- of a derivation into one 'registerPaths' transaction so
+    -- cross-output reference edges are never dropped.
+    SubstSuccess !PathRegistration
   | -- | Cache doesn't have this path.
     SubstNotFound
   | -- | Download or verification failed.
@@ -121,6 +123,10 @@ data SubstResult
 -- Checks each cache in priority order.  Returns on first success; a
 -- failing cache falls through to the remaining ones.  Uses nova-cache
 -- library for narinfo parsing, NAR unpacking, and signature verification.
+--
+-- On success the path is unpacked and read-only on disk but NOT
+-- registered - the caller records the returned 'PathRegistration'
+-- (see 'SubstSuccess').
 trySubstitute :: Store -> [CacheConfig] -> StorePath -> IO SubstResult
 trySubstitute _ [] _ = pure SubstNotFound
 trySubstitute store caches sp = do
@@ -186,10 +192,13 @@ substituteFromCache mgr store cache sp = do
               narBytes <- fetchDecompress
               case narBytes of
                 Left err -> pure (SubstError err)
-                Right rawNar -> unpackAndRegister store sp narInfo rawNar
+                Right rawNar -> unpackAndVerify store sp narInfo rawNar
 
--- | Pure pipeline: verify signature, then produce an IO action
--- that downloads and decompresses.
+-- | Pure pipeline: verify signature and resolve the decompressor, then
+-- produce an IO action that downloads and decompresses.  Unsupported
+-- compression rejects HERE, before the action runs: the value is known
+-- from the narinfo, and a multi-hundred-MB download that can only fail
+-- in decompression is pure waste.
 verifyAndDecompress ::
   CacheConfig ->
   HTTP.Manager ->
@@ -197,22 +206,23 @@ verifyAndDecompress ::
   Either Text (IO (Either Text BS.ByteString))
 verifyAndDecompress cache mgr narInfo = do
   verifySigs cache narInfo
-  let compression = NarInfo.niCompression narInfo
+  decompress <- decompressorFor (NarInfo.niCompression narInfo)
   pure $ do
     downloaded <- downloadNarWithRetry mgr cache narInfo
-    pure $ downloaded >>= decompressNar compression
+    pure $ downloaded >>= decompress
 
--- | Verify the NAR hash, deserialize, unpack to the store, set permissions,
--- and register.
-unpackAndRegister :: Store -> StorePath -> NarInfo.NarInfo -> BS.ByteString -> IO SubstResult
-unpackAndRegister store sp narInfo rawNar =
+-- | Verify the NAR hash and size, deserialize, unpack to the store, and set
+-- permissions.  Returns the path's registration for the caller to record;
+-- no database write happens here (see 'SubstSuccess').
+unpackAndVerify :: Store -> StorePath -> NarInfo.NarInfo -> BS.ByteString -> IO SubstResult
+unpackAndVerify store sp narInfo rawNar =
   -- Verify the downloaded NAR's hash matches the (signed) narinfo BEFORE
   -- trusting its bytes.  The NAR hash is the content-addressed integrity
   -- contract; the signature only attests to the narinfo, not the body, so
   -- network corruption or a compromised cache must be caught here.
   -- Narinfo metadata is likewise parsed before any disk write: a malformed
   -- narinfo must not leave an unpacked-but-unregistered path behind.
-  case verifyNarHash narInfo rawNar >> registrationMeta of
+  case verifyNarHash narInfo rawNar >> verifyNarSize narInfo rawNar >> registrationMeta of
     Left err -> pure (SubstError err)
     Right (refs, deriver) -> case NAR.deserialise rawNar of
       Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
@@ -226,16 +236,18 @@ unpackAndRegister store sp narInfo rawNar =
           Right (Left err) -> pure (SubstError ("unpack failed: " <> err))
           Right (Right ()) -> do
             setReadOnly destPath
-            registerPath
-              (stDB store)
-              PathRegistration
-                { prPath = sp,
-                  prNarHash = NarInfo.niNarHash narInfo,
-                  prNarSize = fromInteger (NarInfo.niNarSize narInfo),
-                  prDeriver = deriver,
-                  prReferences = refs
-                }
-            pure (SubstSuccess sp)
+            pure $
+              SubstSuccess
+                PathRegistration
+                  { prPath = sp,
+                    prNarHash = NarInfo.niNarHash narInfo,
+                    -- The verified actual byte count (equal to the declared
+                    -- NarSize per 'verifyNarSize') - no Integer conversion
+                    -- that could wrap.
+                    prNarSize = BS.length rawNar,
+                    prDeriver = deriver,
+                    prReferences = refs
+                  }
   where
     registrationMeta = do
       refs <- parseReferences (NarInfo.niReferences narInfo)
@@ -260,6 +272,22 @@ verifyNarHash narInfo rawNar =
             )
   where
     actual = Hash.hashBytes rawNar
+
+-- | Verify that the downloaded NAR's byte count equals the narinfo's
+-- declared NarSize.  The hash check pins the content, but the size is a
+-- separate signed claim that flows into the store DB (and from there
+-- into re-pushed narinfos), so a wrong declaration must be rejected
+-- rather than recorded.
+verifyNarSize :: NarInfo.NarInfo -> BS.ByteString -> Either Text ()
+verifyNarSize narInfo rawNar
+  | toInteger (BS.length rawNar) == NarInfo.niNarSize narInfo = Right ()
+  | otherwise =
+      Left
+        ( "NAR size mismatch: narinfo declares "
+            <> T.pack (show (NarInfo.niNarSize narInfo))
+            <> " bytes but downloaded "
+            <> T.pack (show (BS.length rawNar))
+        )
 
 -- | Whether a served narinfo describes the requested path: the hash component
 -- of its declared StorePath must equal the requested path's hash.  Only the
@@ -297,8 +325,11 @@ fetchNarInfo mgr cache sp = do
   request <- HTTP.parseRequest url
   response <- HTTP.httpLbs request mgr
   let code = HTTP.statusCode (HTTP.responseStatus response)
+  -- Lenient decode: the body is cache-controlled bytes, and a stray
+  -- invalid UTF-8 sequence must surface as a narinfo parse error, not an
+  -- impure UnicodeException (the push side decodes the same way).
   if code == httpOk
-    then case NarInfo.parseNarInfo (TE.decodeUtf8 (LBS.toStrict (HTTP.responseBody response))) of
+    then case NarInfo.parseNarInfo (TE.decodeUtf8Lenient (LBS.toStrict (HTTP.responseBody response))) of
       Left err -> pure (Left (SubstError ("narinfo parse error: " <> T.pack err)))
       Right ni -> pure (Right ni)
     else
@@ -378,15 +409,20 @@ verifySigs cache narInfo =
                 then Right ()
                 else Left "no valid signature found"
 
--- | Decompress NAR data based on the compression type from narinfo.
---
--- Currently supports @\"none\"@ (raw NAR) and @\"\"@ (empty = no compression).
--- XZ decompression requires enabling the @compression@ flag in nova-cache.
-decompressNar :: Text -> BS.ByteString -> Either Text BS.ByteString
-decompressNar compression narData
-  | compression == "none" || T.null compression = Right narData
-  | compression == "xz" = Left "xz decompression not yet available (enable nova-cache compression flag)"
+-- | The decompressor for a narinfo @Compression@ value, decided from the
+-- value alone so unsupported compression rejects before any download.
+-- Currently @\"none\"@ and @\"\"@ (identity); xz returns with the
+-- foreign-cache substitution feature.
+decompressorFor :: Text -> Either Text (BS.ByteString -> Either Text BS.ByteString)
+decompressorFor compression
+  | compression == "none" || T.null compression = Right Right
+  | compression == "xz" = Left "xz decompression not yet available"
   | otherwise = Left ("unsupported compression: " <> compression)
+
+-- | Decompress NAR data based on the compression type from narinfo.
+-- Support is decided by 'decompressorFor'; this applies the result.
+decompressNar :: Text -> BS.ByteString -> Either Text BS.ByteString
+decompressNar compression narData = decompressorFor compression >>= ($ narData)
 
 -- | Parse narinfo references (store path basenames, e.g.
 -- @abc...-glibc-2.40@) into StorePaths.  A malformed token is an error,
@@ -419,124 +455,14 @@ parseDeriver storeDir (Just txt)
 -- ---------------------------------------------------------------------------
 
 -- | Remove a leftover destination tree before unpacking.  A crash (or a
--- failed registration) between 'setReadOnly' and 'registerPath' leaves a
--- read-only, unregistered tree; unpacking over it would then fail with
--- permission-denied on every retry, permanently wedging substitution of
--- that path.  'Dir.removePathForcibly' clears read-only marks and accepts
--- a missing path, so the fresh unpack always starts from a clean slate.
+-- failed registration) between 'setReadOnly' here and the caller's
+-- 'Nix.Store.DB.registerPaths' leaves a read-only, unregistered tree;
+-- unpacking over it would then fail with permission-denied on every
+-- retry, permanently wedging substitution of that path.
+-- 'Dir.removePathForcibly' clears read-only marks and accepts a missing
+-- path, so the fresh unpack always starts from a clean slate.
 clearStaleDestination :: FilePath -> IO ()
 clearStaleDestination = Dir.removePathForcibly
 
--- | Unpack a NarEntry tree to a filesystem destination.  Returns @Left@ on an
--- unsafe entry name (path traversal); these come from untrusted cache data, so
--- a typed failure is used instead of a partial 'error'.
---
--- Regular files and directories are written in one pass; symlinks are
--- created in a second pass, after their targets are materialized.  Windows
--- symlinks are typed (file vs directory) and the NAR format does not record
--- the target's kind, so the only reliable way to pick the flavor is to look
--- at the target on disk - which may sort after the link within the tree.
-unpackNarEntry :: FilePath -> NAR.NarEntry -> IO (Either Text ())
-unpackNarEntry path entry = do
-  walked <- unpackTree path entry
-  case walked of
-    Left err -> pure (Left err)
-    Right links -> createSymlinks links
-
--- | First unpack pass: write regular files and directories, recording
--- symlinks as (link path, target) for the second pass.
-unpackTree :: FilePath -> NAR.NarEntry -> IO (Either Text [(FilePath, Text)])
-unpackTree path entry = case entry of
-  NAR.NarRegular isExec contents -> do
-    createDirectoryIfMissing True (takeDirectory path)
-    BS.writeFile path contents
-    when isExec $ do
-      perms <- Dir.getPermissions path
-      setPermissions path (Dir.setOwnerExecutable True perms)
-    pure (Right [])
-  NAR.NarSymlink target -> pure (Right [(path, target)])
-  NAR.NarDirectory entries -> do
-    createDirectoryIfMissing True path
-    unpackChildren path entries
-
--- | Unpack directory children, short-circuiting with a typed failure on the
--- first unsafe entry name rather than crashing on untrusted input.
-unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
-unpackChildren _ [] = pure (Right [])
-unpackChildren path ((name, child) : rest)
-  | not (isSafeNarName name) =
-      pure (Left ("unsafe NAR directory entry name: " <> name))
-  | otherwise = do
-      result <- unpackTree (path </> T.unpack name) child
-      case result of
-        Left err -> pure (Left err)
-        Right links -> do
-          restResult <- unpackChildren path rest
-          case restResult of
-            Left err -> pure (Left err)
-            Right moreLinks -> pure (Right (links <> moreLinks))
-
--- | Second unpack pass: create the recorded symlinks.  Links whose targets
--- already exist are created first - possibly unblocking link-to-link
--- chains - so the Windows link flavor (file vs directory) is read off the
--- real target.  When no pending link's target exists, the remainder are
--- dangling and their kind is unknowable: they default to file links.
-createSymlinks :: [(FilePath, Text)] -> IO (Either Text ())
-createSymlinks [] = pure (Right ())
-createSymlinks pending = do
-  ready <- filterM targetExists pending
-  case ready of
-    [] -> createAll pending
-    _ -> do
-      made <- createAll ready
-      case made of
-        Left err -> pure (Left err)
-        Right () -> createSymlinks (filter (`notElem` ready) pending)
-  where
-    targetExists (linkPath, target) =
-      Dir.doesPathExist (takeDirectory linkPath </> T.unpack target)
-    createAll [] = pure (Right ())
-    createAll (link : rest) = do
-      made <- uncurry createSymlink link
-      case made of
-        Left err -> pure (Left err)
-        Right () -> createAll rest
-
--- | Create one symlink, choosing the Windows flavor from the target's kind.
--- A creation failure is loud: the old fallback of writing the target text
--- as a regular file registered a tree whose NAR hash differed from the
--- signed narinfo's - silent store corruption that a later push refuses to
--- publish.  Failing lets the caller fall back to a local build.
-createSymlink :: FilePath -> Text -> IO (Either Text ())
-createSymlink linkPath target = do
-  createDirectoryIfMissing True (takeDirectory linkPath)
-  let targetStr = T.unpack target
-  targetIsDir <- Dir.doesDirectoryExist (takeDirectory linkPath </> targetStr)
-  result <-
-    try $
-      if targetIsDir
-        then Dir.createDirectoryLink targetStr linkPath
-        else Dir.createFileLink targetStr linkPath
-  case result of
-    Right () -> pure (Right ())
-    Left (e :: SomeException) ->
-      pure
-        ( Left
-            ( "cannot create symlink "
-                <> T.pack linkPath
-                <> " -> "
-                <> target
-                <> ": "
-                <> T.pack (show e)
-                <> " (on Windows this needs Developer Mode or elevation)"
-            )
-        )
-
--- | Validate that a NAR entry name is safe (no path traversal).
-isSafeNarName :: Text -> Bool
-isSafeNarName name =
-  not (T.null name)
-    && name /= ".."
-    && name /= "."
-    && not (T.isInfixOf "/" name)
-    && not (T.isInfixOf "\\" name)
+-- unpackNarEntry lives in 'Nix.Store' (one tree-materializer for the
+-- codebase) and is re-exported here for its historical callers and tests.

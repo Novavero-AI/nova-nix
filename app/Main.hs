@@ -1,3 +1,5 @@
+{-# LANGUAGE ScopedTypeVariables #-}
+
 -- | nova-nix CLI entry point.
 --
 -- Commands:
@@ -17,6 +19,7 @@
 -- @
 module Main (main) where
 
+import Control.Exception (IOException, displayException, try)
 import Control.Monad (void, (>=>))
 import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
@@ -32,16 +35,15 @@ import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
-import Nix.Store (Store (..), closeStore, isValid, openStore, queryAllValidPaths, registerPath, registrationFor, setReadOnly, writeDrv, writeDrvAterm)
+import Nix.Store (Store (..), closeStore, materializeEvalSources, openStore, queryAllValidPaths, writeDrv, writeDrvAterm)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDir, storePathHashLen, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir)
-import System.Directory (canonicalizePath, copyFile, createDirectoryIfMissing, createDirectoryLink, createFileLink, doesDirectoryExist, doesPathExist, getCurrentDirectory, getSymbolicLinkTarget, getTemporaryDirectory, listDirectory, pathIsSymbolicLink)
+import System.Directory (canonicalizePath, getCurrentDirectory, getTemporaryDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
-import qualified System.FilePath as FP
-import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
+import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 
 -- ---------------------------------------------------------------------------
 -- Argument parsing
@@ -152,6 +154,12 @@ mergeSearchPaths extraPaths dataDir envPaths =
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
+  -- UTF-8 on both output handles regardless of the console code page:
+  -- locale encodings THROW on any character they cannot represent, so a
+  -- store path or eval result containing one would otherwise abort the
+  -- whole invocation mid-print on legacy Windows consoles.
+  hSetEncoding stdout utf8
+  hSetEncoding stderr utf8
   -- Initialize C data layer (symbol interning, thunk arena, env allocator)
   arenaInit
   args <- getArgs
@@ -184,15 +192,28 @@ main = do
       hPutStrLn stderr "  --trusted-key K        Public key (name:base64) for the substituter"
       exitFailure
 
+-- | Canonicalize and read a source file.  The canonicalization matters:
+-- relative path literals inside the file resolve against the file's
+-- directory ('esBaseDir'), and a relative base dir would be re-prefixed on
+-- every resolution (doubling it).  An unreadable argument (missing file,
+-- a directory, no permission) is a clean CLI error, never an uncaught
+-- exception.  Only 'IOException' is caught: an interrupt or any other
+-- async exception must abort the run, not print as a read failure.
+readSourceFile :: FilePath -> IO (FilePath, T.Text)
+readSourceFile rawPath = do
+  attempt <- try $ do
+    path <- canonicalizePath rawPath
+    source <- readFileAutoEncoding path
+    pure (path, source)
+  case attempt of
+    Left (e :: IOException) ->
+      failWith ("cannot read " <> T.pack rawPath <> ": " <> T.pack (displayException e))
+    Right ok -> pure ok
+
 -- | Evaluate a .nix file and print the result.
---
--- The file argument is canonicalized first: relative path literals inside the
--- file resolve against the file's directory ('esBaseDir'), and a relative base
--- dir would be re-prefixed on every resolution (doubling it).
 evalFile :: Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
 evalFile strict extraPaths dataDir rawFilePath = do
-  filePath <- canonicalizePath rawFilePath
-  source <- readFileAutoEncoding filePath
+  (filePath, source) <- readSourceFile rawFilePath
   case parseNix (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
@@ -250,7 +271,7 @@ evalExprAterm extraPaths dataDir source =
           VAttrs attrs ->
             mapM_
               (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
-              ["_derivation", "drvPath"]
+              ["type", "_derivation", "drvPath"]
           _ -> pure ()
         pure val
       case result of
@@ -266,8 +287,7 @@ evalExprAterm extraPaths dataDir source =
 buildFile :: CliOpts -> FilePath -> FilePath -> IO ()
 buildFile opts dataDir rawFilePath = do
   caches <- either failWith pure (substituterConfig (optSubstituter opts) (optTrustedKey opts))
-  filePath <- canonicalizePath rawFilePath
-  source <- readFileAutoEncoding filePath
+  (filePath, source) <- readSourceFile rawFilePath
   case parseNix (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
@@ -284,7 +304,7 @@ buildFile opts dataDir rawFilePath = do
           VAttrs attrs ->
             mapM_
               (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
-              ["_derivation", "drvPath"]
+              ["type", "_derivation", "drvPath"]
           _ -> pure ()
         pure val
       case result of
@@ -469,64 +489,6 @@ failWith :: T.Text -> IO a
 failWith msg = do
   TIO.hPutStrLn stderr msg
   exitFailure
-
--- | Copy eval-coerced source paths into the store and register them.  The
--- evaluator's source-path cache maps each coerced filesystem path to its
--- @source@ fixed-output store path (text only - eval performs no store
--- writes).  Each entry not already valid is copied in, made read-only, and
--- registered with its real NAR hash.  A copied source carries no references.
-materializeEvalSources :: Store -> Map.Map T.Text T.Text -> IO ()
-materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
-  where
-    -- Each source registers IMMEDIATELY after its copy (sources carry no
-    -- cross-references, so there is nothing to batch), and a source
-    -- already on disk is adopted without touching its files - re-copying
-    -- onto a read-only tree fails on Windows, so an interrupted earlier
-    -- run would otherwise wedge the store permanently.  Mirrors the
-    -- builder's own prepareOutput recovery.
-    adopt (rawPath, spText) =
-      case parseStorePath defaultStoreDir spText of
-        Nothing -> pure ()
-        Just sp -> do
-          valid <- isValid store sp
-          if valid
-            then pure ()
-            else do
-              let dest = storePathToFilePath (stDir store) sp
-              onDisk <- doesPathExist dest
-              if onDisk
-                then pure ()
-                else do
-                  copyPathInto (T.unpack rawPath) dest
-                  setReadOnly dest
-              reg <- registrationFor store sp Nothing []
-              registerPath (stDB store) reg
-
--- | Recursively copy a file or directory tree to a destination path.
--- A symlink is replicated as a symlink: the store path's name came from a
--- NAR hash that ENCODES the link entry, so dereferencing it here would
--- store content that no longer matches its own address (and a
--- self-referential link would recurse forever).  On Windows without
--- symlink privilege the link creation fails loudly rather than silently
--- corrupting the content address.
-copyPathInto :: FilePath -> FilePath -> IO ()
-copyPathInto src dest = do
-  isLink <- pathIsSymbolicLink src
-  if isLink
-    then do
-      target <- getSymbolicLinkTarget src
-      linkedDir <- doesDirectoryExist src
-      if linkedDir
-        then createDirectoryLink target dest
-        else createFileLink target dest
-    else do
-      isDir <- doesDirectoryExist src
-      if isDir
-        then do
-          createDirectoryIfMissing True dest
-          names <- listDirectory src
-          mapM_ (\name -> copyPathInto (src FP.</> name) (dest FP.</> name)) names
-        else copyFile src dest
 
 -- | Write every recorded @.drv@ ATerm (keyed by its store-path text) to the
 -- store.  Keys come from evaluation via 'storePathToText' so they always parse;

@@ -56,6 +56,12 @@ data Token
   | TokIndStringOpen
   | TokIndStringClose
   | TokStringLit !Text
+  | -- | Resolved escape text inside an indented string (@'''@, @''$@,
+    -- @''${@, @''\x@).  Kept apart from 'TokStringLit' because escapes
+    -- are opaque to indentation stripping (upstream lexer.l emits them
+    -- without the hasIndentation mark): they end start-of-line
+    -- whitespace but are never scanned or stripped.
+    TokStringEsc !Text
   | TokInterpOpen
   | TokInterpClose
   | -- Operators
@@ -335,20 +341,20 @@ lexIndStringMode st acc
                 Just ('\'', rest3) ->
                   -- ''' escapes a literal '' (two quotes) - Nix's escape for the
                   -- indented-string terminator, not a single quote.
-                  let litTok = Located (lsLine st) (lsCol st) (TokStringLit "''")
+                  let escTok = Located (lsLine st) (lsCol st) (TokStringEsc "''")
                       newSt = advanceCol 3 st {lsInput = rest3}
-                   in lexIndStringMode newSt (litTok : acc)
+                   in lexIndStringMode newSt (escTok : acc)
                 Just ('$', rest3)
                   | Just ('{', rest4) <- T.uncons rest3 ->
                       -- ''${ is a literal ${
-                      let litTok = Located (lsLine st) (lsCol st) (TokStringLit "${")
+                      let escTok = Located (lsLine st) (lsCol st) (TokStringEsc "${")
                           newSt = advanceCol 4 st {lsInput = rest4}
-                       in lexIndStringMode newSt (litTok : acc)
+                       in lexIndStringMode newSt (escTok : acc)
                 Just ('$', rest3) ->
                   -- ''$ (without brace) is a literal $
-                  let litTok = Located (lsLine st) (lsCol st) (TokStringLit "$")
+                  let escTok = Located (lsLine st) (lsCol st) (TokStringEsc "$")
                       newSt = advanceCol 3 st {lsInput = rest3}
-                   in lexIndStringMode newSt (litTok : acc)
+                   in lexIndStringMode newSt (escTok : acc)
                 Just ('\\', rest3) ->
                   -- ''\x is an escape sequence
                   case T.uncons rest3 of
@@ -360,9 +366,9 @@ lexIndStringMode st acc
                             '\\' -> "\\"
                             -- Unknown escape: Nix drops the backslash (''\q -> q).
                             _ -> T.singleton ec
-                          litTok = Located (lsLine st) (lsCol st) (TokStringLit escaped)
+                          escTok = Located (lsLine st) (lsCol st) (TokStringEsc escaped)
                           newSt = advanceCol 4 st {lsInput = rest4}
-                       in lexIndStringMode newSt (litTok : acc)
+                       in lexIndStringMode newSt (escTok : acc)
                     Nothing ->
                       Left
                         ParseError
@@ -536,7 +542,7 @@ lexNumber st acc =
           let (decimals, after3) = T.span isDigit after2
               (expVal, after4, expLen) = lexExponent after3
               fullLen = T.length digits + 1 + T.length decimals + expLen
-              val = applyExponent (readDouble digits decimals) expVal
+              val = readDouble digits decimals expVal
               tok = Located (lsLine st) (lsCol st) (TokFloat val)
               newSt = advanceCol fullLen st {lsInput = after4}
            in lexNormalMode newSt (tok : acc)
@@ -561,14 +567,18 @@ lexNumber st acc =
 readInteger :: Text -> Integer
 readInteger = T.foldl' (\n c -> n * decimalBase + fromIntegral (fromEnum c - zeroOrd)) 0
 
--- | Read a floating-point number from its integer and decimal parts.
--- Total - no 'read', no exceptions.
-readDouble :: Text -> Text -> Double
-readDouble intPart decPart =
-  let whole = fromIntegral (readInteger intPart) :: Double
-      fracDigits = T.length decPart
-      frac = fromIntegral (readInteger decPart) / (decimalBase' ^ fracDigits)
-   in whole + frac
+-- | Read a floating-point literal from its integer, decimal, and exponent
+-- parts.  The digits form one exact 'Rational' scaled by the exponent, and
+-- 'fromRational' rounds once - the correctly-rounded conversion C++ Nix
+-- gets from strtod (lexer.l float rule).  Rounding the whole, fraction,
+-- and exponent steps separately drifts an ulp from upstream on long
+-- literals and flushes subnormals (e.g. 1.0e-320) to zero.  Total - no
+-- 'read', no exceptions.
+readDouble :: Text -> Text -> Integer -> Double
+readDouble intPart decPart expVal =
+  let mantissa = readInteger (intPart <> decPart)
+      scale = expVal - toInteger (T.length decPart)
+   in fromRational (toRational mantissa * fromInteger decimalBase ^^ scale)
 
 -- | Consume an optional exponent @[eE][+-]?[0-9]+@ after a float's digits.
 -- Returns the signed exponent, the remaining input, and the characters
@@ -589,10 +599,6 @@ lexExponent input =
                 else (sign * readInteger expDigits, afterExp, 1 + signLen + T.length expDigits)
     _ -> (0, input, 0)
 
--- | Scale a float mantissa by @10 ^^ exp@ (exp may be negative).
-applyExponent :: Double -> Integer -> Double
-applyExponent mantissa expVal = mantissa * (10 ^^ expVal)
-
 -- | Lex a leading-dot float like @.5@ or @.5e3@ (Nix's @0?\\.[0-9]+@ form).
 -- The current input begins with the @.@.
 lexLeadingDotFloat :: LexState -> [Located] -> Either ParseError [Located]
@@ -601,7 +607,7 @@ lexLeadingDotFloat st acc =
       (decimals, after3) = T.span isDigit afterDot
       (expVal, after4, expLen) = lexExponent after3
       fullLen = 1 + T.length decimals + expLen
-      val = applyExponent (readDouble "" decimals) expVal
+      val = readDouble "" decimals expVal
       tok = Located (lsLine st) (lsCol st) (TokFloat val)
       newSt = advanceCol fullLen st {lsInput = after4}
    in lexNormalMode newSt (tok : acc)
@@ -609,10 +615,6 @@ lexLeadingDotFloat st acc =
 -- | Base for decimal digit accumulation.
 decimalBase :: Integer
 decimalBase = 10
-
--- | Floating-point decimal base for fraction computation.
-decimalBase' :: Double
-decimalBase' = 10.0
 
 -- | Ordinal of ASCII @\'0\'@ for digit-to-int conversion.
 zeroOrd :: Int

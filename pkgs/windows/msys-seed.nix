@@ -19,6 +19,12 @@ let
     { file, sha256 }:
     fetchurl {
       url = "${mirror}/${file}";
+      # Store path names cannot carry '~' (parseStorePath enforces
+      # upstream's name charset, and upstream's own checkName rejects it
+      # the same way), but MSYS2 epoch-marked filenames contain one -
+      # grep's "1~3.0".  Sanitize the name; the URL keeps the real
+      # filename.
+      name = builtins.replaceStrings [ "~" ] [ "-" ] file;
       inherit sha256;
     };
 
@@ -94,7 +100,8 @@ let
     # grep links pcre *1* (msys-pcre-1.dll), not pcre2.  gawk needs mpfr, which
     # itself pulls libgcc_s from gcc-libs (msys-gcc_s-seh-1.dll) - a transitive
     # dep only the PE import table reveals.  (grep's 1~3.0 version has an epoch
-    # marker in the filename - a valid URL character.)
+    # marker in the filename - fine in a URL, invalid in a store path name;
+    # fetchMsys2 sanitizes it.)
     {
       file = "sed-4.9-1-x86_64.pkg.tar.zst";
       sha256 = "3748af28f69e946ec5a42e6670c9bbf6da7352dc93baaa537f69e99c5483b9fc";

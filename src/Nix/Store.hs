@@ -44,9 +44,11 @@ module Nix.Store
     addToStore,
     placeInStore,
     registrationFor,
+    materializeEvalSources,
     scanReferences,
     scanTempReferences,
     setReadOnly,
+    unpackNarEntry,
     writeDrv,
     writeDrvAterm,
 
@@ -56,14 +58,17 @@ module Nix.Store
   )
 where
 
-import Control.Exception (IOException, catch)
-import Control.Monad (when)
+import Control.Exception (IOException, SomeException, catch, try)
+import Control.Monad (filterM, unless, when)
 import qualified Data.ByteString as BS
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation, toATerm)
+import Nix.Hash (makeFixedOutputPath, sha256Digest)
 import Nix.Store.DB
 import Nix.Store.Path
 import qualified NovaCache.Hash as Hash
@@ -81,7 +86,7 @@ import System.Directory
     setPermissions,
   )
 import qualified System.Directory as Dir
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 
 -- | An open store with database and configuration.
 data Store = Store
@@ -150,8 +155,8 @@ placeInStore store srcPath sp deriver refs = do
   registrationFor store sp deriver refs
 
 -- | Compute the registration metadata for a store path already present on
--- disk, without moving anything.  Used to (re-)register an output that an
--- interrupted build left in place but never recorded in the database.
+-- disk, without moving anything.  Used by 'placeInStore' after its move,
+-- and by 'materializeEvalSources' to register a verified adopted tree.
 registrationFor :: Store -> StorePath -> Maybe Text -> [StorePath] -> IO PathRegistration
 registrationFor store sp deriver refs = do
   let destPath = storePathToFilePath (stDir store) sp
@@ -306,3 +311,195 @@ writeDrvAterm store sp aterm = do
 -- | Serialize a derivation to ATerm and write it to the store at the given path.
 writeDrv :: Store -> Derivation -> StorePath -> IO ()
 writeDrv store drv sp = writeDrvAterm store sp (toATerm drv)
+
+-- ---------------------------------------------------------------------------
+-- NAR unpacking
+-- ---------------------------------------------------------------------------
+
+-- | Unpack a NarEntry tree to a filesystem destination.  Returns @Left@ on an
+-- unsafe entry name (path traversal); these can come from untrusted cache
+-- data, so a typed failure is used instead of a partial 'error'.
+--
+-- Regular files and directories are written in one pass; symlinks are
+-- created in a second pass, after their targets are materialized.  Windows
+-- symlinks are typed (file vs directory) and the NAR format does not record
+-- the target's kind, so the only reliable way to pick the flavor is to look
+-- at the target on disk - which may sort after the link within the tree.
+unpackNarEntry :: FilePath -> NAR.NarEntry -> IO (Either Text ())
+unpackNarEntry path entry = do
+  walked <- unpackTree path entry
+  case walked of
+    Left err -> pure (Left err)
+    Right links -> createSymlinks links
+
+-- | First unpack pass: write regular files and directories, recording
+-- symlinks as (link path, target) for the second pass.
+unpackTree :: FilePath -> NAR.NarEntry -> IO (Either Text [(FilePath, Text)])
+unpackTree path entry = case entry of
+  NAR.NarRegular isExec contents -> do
+    createDirectoryIfMissing True (takeDirectory path)
+    BS.writeFile path contents
+    when isExec $ do
+      perms <- Dir.getPermissions path
+      setPermissions path (Dir.setOwnerExecutable True perms)
+    pure (Right [])
+  NAR.NarSymlink target -> pure (Right [(path, target)])
+  NAR.NarDirectory entries -> do
+    createDirectoryIfMissing True path
+    unpackChildren path entries
+
+-- | Unpack directory children, short-circuiting with a typed failure on the
+-- first unsafe entry name rather than crashing on untrusted input.
+unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
+unpackChildren _ [] = pure (Right [])
+unpackChildren path ((name, child) : rest)
+  | not (isSafeNarName name) =
+      pure (Left ("unsafe NAR directory entry name: " <> name))
+  | otherwise = do
+      result <- unpackTree (path </> T.unpack name) child
+      case result of
+        Left err -> pure (Left err)
+        Right links -> do
+          restResult <- unpackChildren path rest
+          case restResult of
+            Left err -> pure (Left err)
+            Right moreLinks -> pure (Right (links <> moreLinks))
+
+-- | Second unpack pass: create the recorded symlinks.  Links whose targets
+-- already exist are created first - possibly unblocking link-to-link
+-- chains - so the Windows link flavor (file vs directory) is read off the
+-- real target.  When no pending link's target exists, the remainder are
+-- dangling and their kind is unknowable: they default to file links.
+createSymlinks :: [(FilePath, Text)] -> IO (Either Text ())
+createSymlinks [] = pure (Right ())
+createSymlinks pending = do
+  ready <- filterM targetExists pending
+  case ready of
+    [] -> createAll pending
+    _ -> do
+      made <- createAll ready
+      case made of
+        Left err -> pure (Left err)
+        Right () -> createSymlinks (filter (`notElem` ready) pending)
+  where
+    targetExists (linkPath, target) =
+      Dir.doesPathExist (takeDirectory linkPath </> T.unpack target)
+    createAll [] = pure (Right ())
+    createAll (link : rest) = do
+      made <- uncurry createSymlink link
+      case made of
+        Left err -> pure (Left err)
+        Right () -> createAll rest
+
+-- | Create one symlink, choosing the Windows flavor from the target's kind.
+-- A creation failure is loud: the old fallback of writing the target text
+-- as a regular file registered a tree whose NAR hash differed from the
+-- signed narinfo's - silent store corruption that a later push refuses to
+-- publish.  Failing lets the caller fall back to a local build.
+createSymlink :: FilePath -> Text -> IO (Either Text ())
+createSymlink linkPath target = do
+  createDirectoryIfMissing True (takeDirectory linkPath)
+  let targetStr = T.unpack target
+  targetIsDir <- Dir.doesDirectoryExist (takeDirectory linkPath </> targetStr)
+  result <-
+    try $
+      if targetIsDir
+        then Dir.createDirectoryLink targetStr linkPath
+        else Dir.createFileLink targetStr linkPath
+  case result of
+    Right () -> pure (Right ())
+    Left (e :: SomeException) ->
+      pure
+        ( Left
+            ( "cannot create symlink "
+                <> T.pack linkPath
+                <> " -> "
+                <> target
+                <> ": "
+                <> T.pack (show e)
+                <> " (on Windows this needs Developer Mode or elevation)"
+            )
+        )
+
+-- | Validate that a NAR entry name is safe (no path traversal).
+isSafeNarName :: Text -> Bool
+isSafeNarName name =
+  not (T.null name)
+    && name /= ".."
+    && name /= "."
+    && not (T.isInfixOf "/" name)
+    && not (T.isInfixOf "\\" name)
+
+-- ---------------------------------------------------------------------------
+-- Eval source materialization
+-- ---------------------------------------------------------------------------
+
+-- | Copy eval-coerced source paths into the store and register them.  The
+-- evaluator's source-path cache maps each coerced filesystem path to its
+-- @source@ fixed-output store path (text only - eval performs no store
+-- writes).  Each entry not already valid is copied in, made read-only, and
+-- registered with its real NAR hash.  A copied source carries no references.
+materializeEvalSources :: Store -> Map Text Text -> IO ()
+materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
+  where
+    -- Each source registers IMMEDIATELY after its copy (sources carry no
+    -- cross-references, so there is nothing to batch).  A tree already on
+    -- disk is adopted only after verification: its NAR digest must
+    -- reproduce the store path being registered - an interrupted earlier
+    -- copy leaves a partial tree, and registering it as-is validates
+    -- content that does not match its address.  A verified adoption never
+    -- touches the files (re-copying onto a read-only tree fails on
+    -- Windows and would wedge the store permanently); a failed one clears
+    -- and re-copies.  Mirrors the builder's own prepareOutput recovery.
+    adopt (rawPath, spText) =
+      case parseStorePath defaultStoreDir spText of
+        Nothing -> pure ()
+        Just sp -> do
+          valid <- isValid store sp
+          unless valid $ do
+            let dest = storePathToFilePath (stDir store) sp
+            onDisk <- doesPathExist dest
+            adoptable <- if onDisk then adoptedTreeMatches dest sp else pure False
+            unless adoptable $ do
+              when onDisk (Dir.removePathForcibly dest)
+              copyPathInto (T.unpack rawPath) dest
+              setReadOnly dest
+            reg <- registrationFor store sp Nothing []
+            registerPath (stDB store) reg
+
+-- | Whether an on-disk tree reproduces the source store path it is about to
+-- be registered under: its recursive NAR digest and the path's own name must
+-- derive exactly this path.  An unreadable tree counts as a mismatch.
+adoptedTreeMatches :: FilePath -> StorePath -> IO Bool
+adoptedTreeMatches dest sp = do
+  result <- try (NAR.serialiseFromPath dest)
+  pure $ case result of
+    Left (_ :: SomeException) -> False
+    Right entry ->
+      makeFixedOutputPath (spName sp) "sha256" "recursive" (sha256Digest (NAR.serialise entry)) == sp
+
+-- | Recursively copy a file or directory tree to a destination path.
+-- A symlink is replicated as a symlink: the store path's name came from a
+-- NAR hash that ENCODES the link entry, so dereferencing it here would
+-- store content that no longer matches its own address (and a
+-- self-referential link would recurse forever).  On Windows without
+-- symlink privilege the link creation fails loudly rather than silently
+-- corrupting the content address.
+copyPathInto :: FilePath -> FilePath -> IO ()
+copyPathInto src dest = do
+  isLink <- Dir.pathIsSymbolicLink src
+  if isLink
+    then do
+      target <- Dir.getSymbolicLinkTarget src
+      linkedDir <- doesDirectoryExist src
+      if linkedDir
+        then Dir.createDirectoryLink target dest
+        else Dir.createFileLink target dest
+    else do
+      isDir <- doesDirectoryExist src
+      if isDir
+        then do
+          createDirectoryIfMissing True dest
+          names <- listDirectory src
+          mapM_ (\name -> copyPathInto (src </> name) (dest </> name)) names
+        else copyFile src dest

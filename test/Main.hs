@@ -39,11 +39,12 @@ import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbo
 import Nix.Eval.Types (emptyCList)
 import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
+import Nix.Hash (makeFixedOutputPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
+import Nix.Store (Store (..), addToStore, closeStore, isValid, materializeEvalSources, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
@@ -313,6 +314,20 @@ testEvalArithmetic = do
         assertEval "div" "10 / 3" (VInt 3),
       runTest "float add" $
         assertEval "float-add" "1.5 + 2.5" (VFloat 4.0),
+      -- Integer overflow is an eval error (Nix 2.24 semantics), never a
+      -- two's-complement wrap; the boundary itself still computes.
+      runTest "add overflow fails" $
+        assertEvalFail "add-overflow" "9223372036854775807 + 1",
+      runTest "sub overflow fails" $
+        assertEvalFail "sub-overflow" "(-9223372036854775807) - 2",
+      runTest "mul overflow fails" $
+        assertEvalFail "mul-overflow" "builtins.mul 9223372036854775807 2",
+      runTest "div minBound by -1 overflows" $
+        assertEvalFail "div-overflow" "((-9223372036854775807) - 1) / (-1)",
+      runTest "negate minBound overflows" $
+        assertEvalFail "neg-overflow" "-((-9223372036854775807) - 1)",
+      runTest "add at the boundary still works" $
+        assertEval "add-boundary" "9223372036854775806 + 1 == 9223372036854775807" (VBool True),
       runTest "int-float promotion" $
         assertEval "promote" "1 + 2.0" (VFloat 3.0),
       runTest "trailing-dot float" $
@@ -350,7 +365,22 @@ testEvalComparison = do
       runTest "int gte" $
         assertEval "gte" "3 >= 3" (VBool True),
       runTest "string compare" $
-        assertEval "str-lt" "\"abc\" < \"def\"" (VBool True)
+        assertEval "str-lt" "\"abc\" < \"def\"" (VBool True),
+      -- <= and >= are negated swapped <, so NaN compares as upstream:
+      -- nan <= x and nan >= x are true while nan < x and nan == nan are
+      -- false ((1.0e308 * 10) * 0.0 is inf * 0.0, i.e. nan).
+      runTest "nan lte is true" $
+        assertEval "nan-lte" "let nan = (1.0e308 * 10) * 0.0; in nan <= 1.0" (VBool True),
+      runTest "nan gte is true" $
+        assertEval "nan-gte" "let nan = (1.0e308 * 10) * 0.0; in nan >= 1.0" (VBool True),
+      runTest "nan lt is false" $
+        assertEval "nan-lt" "let nan = (1.0e308 * 10) * 0.0; in nan < 1.0" (VBool False),
+      runTest "nan self-equality is false" $
+        assertEval "nan-eq" "let nan = (1.0e308 * 10) * 0.0; in nan == nan" (VBool False),
+      runTest "lte on equal lists" $
+        assertEval "list-lte-eq" "[ 1 2 ] <= [ 1 2 ]" (VBool True),
+      runTest "lte incomparable types fails" $
+        assertEvalFail "lte-err" "1 <= \"a\""
     ]
 
 -- ---------------------------------------------------------------------------
@@ -644,6 +674,13 @@ testEvalBuiltins = do
         assertEval "esc-drop-str" "\"a\\qb\" == \"aqb\"" (VBool True),
       runTest "unknown escape drops backslash (indented string)" $
         assertEval "esc-drop-ind" "''a''\\qb'' == \"aqb\"" (VBool True),
+      -- Indented-string escapes are opaque to indentation stripping: an
+      -- escaped newline is content, not a line break, so text after it
+      -- is not at line start and the column scan does not reset.
+      runTest "escaped newline does not strip following text" $
+        assertEval "ind-esc-nl-strip" "''  a''\\n  b'' == \"a\\n  b\"" (VBool True),
+      runTest "escaped newline does not lower common indent" $
+        assertEval "ind-esc-nl-indent" "''\n    x''\\n y\n    z'' == \"x\\n y\\nz\"" (VBool True),
       runTest "toString int" $
         assertEval "toStr" "builtins.toString 42" (mkStr "42")
     ]
@@ -820,6 +857,16 @@ testLexer = do
       runTest "trailing-dot float with exponent lexes as one float token" $
         assertRight "lex trailing-dot-exp" (tokenize "<test>" "12.e2") $ \toks ->
           assertEqual "tokens" [TokFloat 1200.0] (tokenTypes toks),
+      -- Float literals convert with a single rounding (strtod semantics).
+      -- The exact value here sits between representable ..992 and ..994,
+      -- nearer ..994; rounding whole and fraction separately lands on ..992.
+      runTest "float literal rounds once at the 2^53 boundary" $
+        assertRight "lex float-tie" (tokenize "<test>" "9007199254740993.5") $ \toks ->
+          assertEqual "tokens" [TokFloat 9007199254740994.0] (tokenTypes toks),
+      -- A float 10 ^^ exponent overflows on subnormals and flushes to 0.
+      runTest "subnormal float literal survives" $
+        assertRight "lex float-subnormal" (tokenize "<test>" "1.0e-320") $ \toks ->
+          assertEqual "tokens" [TokFloat 1.0e-320] (tokenTypes toks),
       runTest "true" $
         assertRight "lex true" (tokenize "<test>" "true") $ \toks ->
           assertEqual "tokens" [TokTrue] (tokenTypes toks),
@@ -1316,6 +1363,14 @@ testBatch1 = do
         assertEval "floor-int" "builtins.floor 5" (VInt 5),
       runTest "floor negative" $
         assertEval "floor-neg" "builtins.floor (- 1.2)" (VInt (-2)),
+      -- NaN, infinity, and out-of-range floats are eval errors (Nix 2.24),
+      -- not whatever Int64 Haskell's unchecked conversion produces.
+      runTest "ceil NaN fails" $
+        assertEvalFail "ceil-nan" "builtins.ceil ((1.0e308 * 10) * 0.0)",
+      runTest "floor infinity fails" $
+        assertEvalFail "floor-inf" "builtins.floor (1.0e308 * 10)",
+      runTest "ceil out of integer range fails" $
+        assertEvalFail "ceil-range" "builtins.ceil 1.0e300",
       -- seq
       runTest "seq returns second" $
         assertEval "seq" "builtins.seq 1 42" (VInt 42),
@@ -1442,6 +1497,21 @@ testBatch3 = do
         assertEval "funcArgs-simple" "builtins.functionArgs (x: x)" (VAttrs (attrSetFromMap Map.empty)),
       runTest "functionArgs type error" $
         assertEvalFail "funcArgs-err" "builtins.functionArgs 42",
+      -- The builtins set is observable (hasAttr/attrNames), so it must
+      -- match upstream's primop set exactly: no mod/min/max/
+      -- setFunctionArgs extensions (nixpkgs lib defines those in Nix),
+      -- and functionArgs never consults __functionArgs - a functor set
+      -- is an error, as upstream throws (lib.functionArgs unwraps
+      -- functor sets itself before reaching the builtin).
+      runTest "no invented arithmetic builtins" $
+        assertEval
+          "no-fake-builtins"
+          "!(builtins ? mod) && !(builtins ? min) && !(builtins ? max) && !(builtins ? setFunctionArgs)"
+          (VBool True),
+      runTest "functionArgs rejects functor sets" $
+        assertEvalFail
+          "funcArgs-functor-err"
+          "builtins.functionArgs { __functor = self: x: x; __functionArgs = { a = false; }; }",
       -- zipAttrsWith
       runTest "zipAttrsWith basic" $
         assertEval
@@ -1582,6 +1652,37 @@ testBatch6 = do
         assertEvalFail "tryEval-noattr" "(builtins.tryEval ({ a = 1; }.b)).success",
       runTest "tryEval catches a throw nested under forcing" $
         assertEval "tryEval-deep-throw" "(builtins.tryEval (builtins.deepSeq [ (builtins.throw \"x\") ] 1)).success" (VBool False),
+      -- tryEval passed as a VALUE (comparator/element positions) instead
+      -- of applied syntactically: every application path must keep the
+      -- catch around the argument's evaluation, and none may leak the
+      -- old internal 'unreachable' dispatch error.
+      runTest "tryEval as sort comparator fails like upstream" $
+        case evalNix "builtins.sort builtins.tryEval [ 1 2 ]" of
+          Left err
+            | "unreachable" `T.isInfixOf` err -> Fail ("internal error leaked: " <> err)
+            | otherwise -> Pass
+          Right v -> Fail ("expected a boolean-coercion failure, got " <> T.pack (show v)),
+      runTest "tryEval via map catches a throwing element" $
+        assertEval
+          "tryEval-map"
+          "(builtins.elemAt (builtins.map builtins.tryEval [ (builtins.throw \"m\") ]) 0).success"
+          (VBool False),
+      runTest "tryEval via map success-wraps a clean element" $
+        assertEval
+          "tryEval-map-ok"
+          "(builtins.elemAt (builtins.map builtins.tryEval [ 7 ]) 0).value"
+          (VInt 7),
+      runTest "tryEval through filter catches the element throw" $
+        case evalNix "builtins.filter builtins.tryEval [ (builtins.throw \"leaked\") ]" of
+          Left err
+            | "leaked" `T.isInfixOf` err -> Fail ("throw escaped tryEval: " <> err)
+            | otherwise -> Pass
+          Right v -> Fail ("expected a boolean-coercion failure, got " <> T.pack (show v)),
+      runTest "functor returning tryEval keeps the catch" $
+        assertEval
+          "tryEval-functor"
+          "(({ __functor = self: builtins.tryEval; }) (builtins.throw \"f\")).success"
+          (VBool False),
       -- deepSeq
       runTest "deepSeq returns second" $
         assertEval "deepSeq" "builtins.deepSeq [ 1 2 3 ] 42" (VInt 42),
@@ -2379,6 +2480,17 @@ testDrvContext = do
           "getCtx-drvPath"
           (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ctx = builtins.getContext d.drvPath; in builtins.length (builtins.attrNames ctx)")
         $ \val -> assertEqual "one-entry" (VInt 1) val,
+      -- getContext keys are identity: canonical /nix/store spelling on
+      -- every platform, never the platform file-path mapping.
+      runTest "getContext key is canonical store path"
+        $ assertRight
+          "getCtx-canonical"
+          (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in builtins.elemAt (builtins.attrNames (builtins.getContext d.drvPath)) 0")
+        $ \val -> case val of
+          VStr key _
+            | "/nix/store/" `T.isPrefixOf` key && not ("\\" `T.isInfixOf` key) -> Pass
+            | otherwise -> Fail ("expected a canonical /nix/store key, got " <> key)
+          _ -> Fail ("expected VStr, got " <> T.pack (show val)),
       -- appendContext: adds context to plain string
       runTest "appendContext adds context" $
         assertEval
@@ -2558,6 +2670,27 @@ testSubstituter = do
       -- sortCaches: empty list
       runTest "sortCaches empty" $
         assertEqual "empty-sort" [] (Subst.sortCaches []),
+      -- decompressorFor decides support from the narinfo value alone,
+      -- so unsupported compression rejects before any NAR download.
+      runTest "decompressorFor rejects xz up front" $
+        case Subst.decompressorFor "xz" of
+          Left _ -> Pass
+          Right _ -> Fail "expected xz to be rejected before download",
+      runTest "decompressorFor none is identity" $
+        case Subst.decompressorFor "none" of
+          Right decompress -> assertEqual "identity" (Right "bytes") (decompress "bytes")
+          Left err -> Fail ("expected none to be supported, got: " <> err),
+      -- verifyNarSize: the declared NarSize is a signed claim that flows
+      -- into the store DB, so it must equal the downloaded byte count.
+      runTest "verifyNarSize accepts matching size" $
+        assertEqual
+          "narsize-match"
+          (Right ())
+          (Subst.verifyNarSize ((sampleNarInfo sampleNarHash) {NarInfo.niNarSize = toInteger (BS.length sampleNarBytes)}) sampleNarBytes),
+      runTest "verifyNarSize rejects mismatched size" $
+        case Subst.verifyNarSize ((sampleNarInfo sampleNarHash) {NarInfo.niNarSize = toInteger (BS.length sampleNarBytes) + 1}) sampleNarBytes of
+          Left err | "size mismatch" `T.isInfixOf` err -> Pass
+          other -> Fail ("expected size mismatch, got: " <> T.pack (show other)),
       -- decompressNar: "none" passes through
       runTest "decompressNar none" $
         let input = "fake nar data"
@@ -2645,7 +2778,7 @@ testSubstituter = do
       -- are never contacted)
       runTestM "tryCachesWith success stops scan" $ do
         calls <- newIORef (0 :: Int)
-        let hit = StorePath (T.replicate 32 "d") "hit"
+        let hit = PathRegistration (StorePath (T.replicate 32 "d") "hit") "sha256:d" 1 Nothing []
             attempt cache = do
               atomicModifyIORef' calls (\n -> (n + 1, ()))
               pure $
@@ -2661,7 +2794,7 @@ testSubstituter = do
       -- tryCachesWith: an erroring cache falls through to a later hit
       -- instead of aborting the chain
       runTestM "tryCachesWith error falls through to next cache" $ do
-        let hit = StorePath (T.replicate 32 "e") "hit"
+        let hit = PathRegistration (StorePath (T.replicate 32 "f") "hit") "sha256:f" 1 Nothing []
             attempt cache
               | Subst.ccUrl cache == "https://a" = pure (Subst.SubstError "transient 500")
               | otherwise = pure (Subst.SubstSuccess hit)
@@ -2965,10 +3098,45 @@ testStoreDB = do
             if hasRef1 && hasRef2
               then Pass
               else Fail ("expected refs to contain both deps, got: " <> T.pack (show refs)),
+        -- Re-registration replaces the edge set: the refresh contract
+        -- covers references too, and a union would over-report into
+        -- pushed narinfos.
+        runTestM "db re-register replaces refs" $ do
+          db <- openStoreDB storeDir
+          let refA = StorePath "gggggggggggggggggggggggggggggggg" "refresh-a"
+              refB = StorePath "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh" "refresh-b"
+              sp = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "refresh-main"
+          registerPaths
+            db
+            [ PathRegistration refA "sha256:ra" 10 Nothing [],
+              PathRegistration refB "sha256:rb" 11 Nothing [],
+              PathRegistration sp "sha256:rm" 12 Nothing [refA, refB]
+            ]
+          registerPath db (PathRegistration sp "sha256:rm" 12 Nothing [refA])
+          refs <- queryReferences db sp
+          closeStoreDB db
+          let refAPath = T.pack (storePathToFilePath storeDir refA)
+              refBPath = T.pack (storePathToFilePath storeDir refB)
+          pure $
+            if refAPath `elem` refs && refBPath `notElem` refs
+              then Pass
+              else Fail ("expected only refresh-a after re-register, got: " <> T.pack (show refs)),
+        -- A reference to an unregistered path is a loud error: a silently
+        -- dropped edge under-reports narinfos and hands a future GC
+        -- permission to delete a live dependency.
+        runTestM "db register with unregistered ref throws" $ do
+          db <- openStoreDB storeDir
+          let ghost = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "ghost"
+              sp = StorePath "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk" "orphan-edge"
+          outcome <- try (registerPath db (PathRegistration sp "sha256:oe" 13 Nothing [ghost]))
+          closeStoreDB db
+          pure $ case (outcome :: Either SomeException ()) of
+            Left _ -> Pass
+            Right () -> Fail "expected registration to throw on an unregistered reference",
         -- queryDeriver nothing
         runTestM "db queryDeriver nothing" $ do
           db <- openStoreDB storeDir
-          let sp = StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "noderiver"
+          let sp = StorePath "cccccccccccccccccccccccccccccccc" "noderiver"
           registerPath db (PathRegistration sp "sha256:nd" 80 Nothing [])
           result <- queryDeriver db sp
           closeStoreDB db
@@ -3065,7 +3233,38 @@ testParseStorePath = do
         assertEqual
           "windows-backslash"
           (Just (StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "pkg"))
-          (parseStorePath windowsStoreDir "C:\\nix\\store\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg")
+          (parseStorePath windowsStoreDir "C:\\nix\\store\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg"),
+      -- Charset gates (upstream's parse-boundary checks): the hash slot
+      -- accepts only nix-base32 (no e o u t), and the name only
+      -- [A-Za-z0-9+._?=-] - parsed text can come from a cache, and an
+      -- unchecked component would later become a filesystem path.
+      runTest "parse rejects non-base32 hash" $
+        assertEqual "e-hash" Nothing (parseStorePath sd ("/nix/store/" <> T.replicate 32 "e" <> "-hello")),
+      runTest "parse rejects traversal text in hash slot" $
+        assertEqual "traversal-hash" Nothing (parseStorePath sd ("/nix/store/" <> T.replicate 16 ".\\" <> "-x")),
+      runTest "parse rejects separator in name" $
+        assertEqual "sep-name" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-he/llo"),
+      runTest "parse rejects dot-dot name" $
+        assertEqual "dotdot-name" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.."),
+      runTest "parse rejects overlong name" $
+        assertEqual "overlong-name" Nothing (parseStorePath sd ("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-" <> T.replicate 212 "x")),
+      runTest "parse accepts the full name charset" $
+        assertEqual
+          "name-specials"
+          (Just (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "gcc-13.2.0_pre+x?="))
+          (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gcc-13.2.0_pre+x?="),
+      -- The first dash-separated component of a name may not be . or ..
+      -- (upstream checkName): the traversal names' .- / ..- prefixed forms
+      -- are rejected while other dot-leading names stay valid.
+      runTest "parse rejects a .- first component" $
+        assertEqual "dot-dash" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.-cfg"),
+      runTest "parse rejects a ..- first component" $
+        assertEqual "dotdot-dash" Nothing (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-..-cfg"),
+      runTest "parse accepts a dot-leading name" $
+        assertEqual
+          "dot-leading"
+          (Just (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ".config-1.0"))
+          (parseStorePath sd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.config-1.0")
     ]
 
 -- ---------------------------------------------------------------------------
@@ -4098,7 +4297,68 @@ testStoreOps = do
   withTempStore $ \store -> do
     let sd = stDir store
     sequence
-      [ -- scanReferences finds the canonical /nix/store text eval injects
+      [ -- computeClosure emits references before referrers (deps-first):
+        -- phase-2 narinfo publication then never announces a path whose
+        -- references are not yet visible.  The dep is shared by both
+        -- roots and must precede both.
+        runTestM "computeClosure orders references first" $ do
+          let dep = StorePath "llllllllllllllllllllllllllllllll" "cl-dep"
+              p1 = StorePath "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm" "cl-p1"
+              p2 = StorePath "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn" "cl-p2"
+          registerPaths
+            (stDB store)
+            [ PathRegistration dep "sha256:cd" 1 Nothing [],
+              PathRegistration p1 "sha256:c1" 2 Nothing [dep],
+              PathRegistration p2 "sha256:c2" 3 Nothing [dep]
+            ]
+          result <- computeClosure store [p1, p2]
+          pure (assertEqual "closure order" (Right [dep, p1, p2]) result),
+        -- materializeEvalSources adoption is verified: a partial tree left
+        -- at the destination by an interrupted copy must be cleared and
+        -- re-copied, never registered as-is.
+        runTestM "materializeEvalSources re-copies a mismatched tree" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-adopt-src"
+          removeIfExists srcDir
+          createDirectoryIfMissing True srcDir
+          TIO.writeFile (srcDir </> "data.txt") "real content"
+          entry <- NAR.serialiseFromPath srcDir
+          let sp = makeFixedOutputPath "nova-nix-test-adopt-src" "sha256" "recursive" (sha256Digest (NAR.serialise entry))
+              spText = storePathToText defaultStoreDir sp
+              dest = storePathToFilePath (stDir store) sp
+          -- Fake an interrupted earlier copy: wrong partial content.
+          removeIfExists dest
+          createDirectoryIfMissing True dest
+          TIO.writeFile (dest </> "data.txt") "partial garbage"
+          materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+          adopted <- TIO.readFile (dest </> "data.txt")
+          registered <- isValid store sp
+          removeIfExists srcDir
+          pure $
+            if adopted == "real content" && registered
+              then Pass
+              else Fail ("expected re-copied content, got: " <> adopted),
+        -- A tree that DOES reproduce its store path is adopted untouched.
+        -- The source is deleted before the call: adoption never reads it,
+        -- so a wrongful re-copy attempt throws and fails the test.
+        runTestM "materializeEvalSources adopts a matching tree untouched" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-adopt-ok"
+          removeIfExists srcDir
+          createDirectoryIfMissing True srcDir
+          TIO.writeFile (srcDir </> "data.txt") "same bytes"
+          entry <- NAR.serialiseFromPath srcDir
+          let sp = makeFixedOutputPath "nova-nix-test-adopt-ok" "sha256" "recursive" (sha256Digest (NAR.serialise entry))
+              spText = storePathToText defaultStoreDir sp
+              dest = storePathToFilePath (stDir store) sp
+          removeIfExists dest
+          createDirectoryIfMissing True dest
+          TIO.writeFile (dest </> "data.txt") "same bytes"
+          removeIfExists srcDir
+          materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+          registered <- isValid store sp
+          pure (if registered then Pass else Fail "matching tree was not adopted and registered"),
+        -- scanReferences finds the canonical /nix/store text eval injects
         -- into builder envs, independent of the platform store dir (the
         -- bare hash is the needle, matching upstream Nix).
         runTestM "scanReferences finds canonical ref" $ do
@@ -4280,7 +4540,10 @@ complexTestDrv =
         ],
       drvInputDrvs =
         Map.fromList
-          [ (StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "dep1.drv", ["out"]),
+          -- Hash fixtures stay inside the nix-base32 alphabet (no e o u t):
+          -- fromATerm parses these through parseStorePath, which now
+          -- charset-checks the hash component.
+          [ (StorePath "cccccccccccccccccccccccccccccccc" "dep1.drv", ["out"]),
             (StorePath "ffffffffffffffffffffffffffffffff" "dep2.drv", ["lib", "out"])
           ],
       drvInputSrcs = [StorePath "gggggggggggggggggggggggggggggggg" "source.tar.gz"],
@@ -4289,7 +4552,7 @@ complexTestDrv =
       drvArgs = ["-e", "build.sh"],
       drvEnv =
         Map.fromList
-          [ ("buildInputs", "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-dep1"),
+          [ ("buildInputs", "/nix/store/cccccccccccccccccccccccccccccccc-dep1"),
             ("name", "pkg-2.0"),
             ("out", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-pkg-2.0"),
             ("system", "aarch64-darwin")
@@ -4518,13 +4781,38 @@ testBuilder = do
         pure $ case result of
           BuildFailure _ code -> if code == 42 then Pass else Fail ("expected code 42, got " <> T.pack (show code))
           BuildSuccess _ -> Fail "expected failure",
+      -- A builder that THROWS (nonexistent executable) must not leak the
+      -- deterministic build dir: stale contents would fake an archive
+      -- collision on the next builtin:unpack run of the same drv.
+      runTestM "crashed build removes its build dir" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-leak"
+            tmpBuild = tmpBase </> "nova-nix-test-builder-leak-tmp"
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists tmpBuild
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "pppppppppppppppppppppppppppppppp" "leaktest"
+            drv = mkTestBuildDrv (T.pack (tmpBase </> "no-such-builder.exe")) outSP "unused"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBuild}
+        result <- buildDerivation config store drv
+        leftovers <- do
+          exists <- doesDirectoryExist tmpBuild
+          if exists then Dir.listDirectory tmpBuild else pure []
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists tmpBuild
+        pure $ case result of
+          BuildFailure _ _
+            | null leftovers -> Pass
+            | otherwise -> Fail ("build dir leaked: " <> T.pack (show leftovers))
+          BuildSuccess _ -> Fail "expected failure for a nonexistent builder",
       -- Output at expected path
       runTestM "output at expected store path" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder5"
         forceRemoveIfExists tmpStore
         store <- openStore (StoreDir tmpStore)
-        let outSP = StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "pathtest"
+        let outSP = StorePath "cccccccccccccccccccccccccccccccc" "pathtest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/marker"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder5-tmp"}
         result <- buildDerivation config store drv
@@ -4538,6 +4826,35 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
         pure ret,
+      -- A leftover tree at the output path that is NOT valid in the DB has
+      -- unknowable integrity (interrupted earlier run); the build replaces
+      -- it with the fresh output - upstream's delete-then-move - clearing
+      -- read-only marks rather than adopting stale bytes.
+      runTestM "stale leftover output is replaced by the fresh build" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-stale"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" "staletest"
+            drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo fresh > $out/data.txt"
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-stale-tmp"}
+            targetPath = storePathToFilePath (stDir store) outSP
+        -- Fake the interrupted run: stale read-only content at the output's
+        -- store location, never registered.
+        createDirectoryIfMissing True targetPath
+        TIO.writeFile (targetPath </> "data.txt") "stale"
+        setReadOnly targetPath
+        result <- buildDerivation config store drv
+        content <- TIO.readFile (targetPath </> "data.txt")
+        registered <- isValid store outSP
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildSuccess _
+            | T.strip content == "fresh" && registered -> Pass
+            | otherwise -> Fail ("expected fresh registered content, got: " <> content)
+          BuildFailure msg code -> Fail ("build failed (" <> T.pack (show code) <> "): " <> msg),
       -- Path registered in DB after build
       runTestM "path registered in DB" $ do
         tmpBase <- getTemporaryDirectory
@@ -4852,6 +5169,34 @@ testPhase4IO = do
   removeDirectoryRecursive testDir
   pure results
 
+-- | @builtins.toJSON@ of a path uses copy-to-store coercion (upstream
+-- value-to-json.cc serializes paths with @copyToStore = true@): the JSON
+-- text is the quoted source store path and the result carries its
+-- context.  EvalIO-only: PureEval has no store-path computation.
+testToJSONPathIO :: IO [Bool]
+testToJSONPathIO = do
+  putStrLn "eval/tojson-path-io"
+  tmpDir <- getTemporaryDirectory
+  let testDir = tmpDir </> "nova-nix-tojson-path-test"
+  createDirectoryIfMissing True testDir
+  TIO.writeFile (testDir </> "data.txt") "payload\n"
+  results <-
+    sequence
+      [ runTestM "toJSON of a path is its quoted store path with context" $ do
+          result <- evalNixIO testDir "builtins.toJSON ./data.txt"
+          pure $ case result of
+            Right (VStr json ctx) ->
+              if "\"/nix/store/" `T.isPrefixOf` json
+                && "-data.txt\"" `T.isSuffixOf` json
+                && ctx /= emptyContext
+                then Pass
+                else Fail ("expected a quoted store path with context, got " <> json)
+            Right other -> Fail ("expected VStr, got " <> T.pack (show other))
+            Left err -> Fail ("eval error: " <> err)
+      ]
+  removeDirectoryRecursive testDir
+  pure results
+
 -- ---------------------------------------------------------------------------
 -- Symbol interning (C FFI)
 -- ---------------------------------------------------------------------------
@@ -5044,8 +5389,10 @@ testCAttrSet = do
         mapM_ (\sym -> cattrsetInsert set sym (spToCPtr sp)) syms
         cattrsetFreeze set
         n <- cattrsetSize set
-        -- Spot-check a few lookups
-        hit <- cattrsetLookup set (syms !! 5000)
+        -- Spot-check a lookup from the middle of the key range
+        hit <- case drop 5000 syms of
+          middleSym : _ -> cattrsetLookup set middleSym
+          [] -> pure Nothing
         -- set freed by arenaDestroy via nn_attrset_free_all
         freeStablePtr sp
         pure
@@ -5867,6 +6214,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testE2E,
           testPhase4,
           testPhase4IO,
+          testToJSONPathIO,
           testSymbol,
           testCAttrSet,
           testCThunk,

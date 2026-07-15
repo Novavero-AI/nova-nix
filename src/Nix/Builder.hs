@@ -45,7 +45,7 @@ module Nix.Builder
   )
 where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (IOException, SomeException, displayException, finally, try)
 import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
@@ -65,10 +65,10 @@ import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Hash (bytesToHexText, hexToBytes, rawHashWithAlgo)
-import Nix.Store (PathRegistration, Store (..), isValid, placeInStore, registerPaths, registrationFor, scanReferences, scanTempReferences)
+import Nix.Store (PathRegistration, Store (..), isValid, placeInStore, registerPaths, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, takeFileName, (</>))
@@ -203,47 +203,47 @@ buildDerivationInner config store drv = do
   case inputsOk of
     Left errMsg -> pure (BuildFailure errMsg 1)
     Right () -> do
-      -- 2. Create temp build directory
+      -- 2. Create temp build directory.  The location is deterministic
+      --    (computeBuildDir), so a crashed earlier run may have left stale
+      --    contents that builtin:unpack would misread as an archive
+      --    collision - always start from an empty directory, and always
+      --    remove it on the way out (finally), builder exceptions included.
       let buildDir = computeBuildDir config drv
+      removePathForcibly buildDir
       createDirectoryIfMissing True buildDir
+      (`finally` cleanupBuildDir buildDir) $ do
+        -- 3. Compute output paths (but do NOT pre-create them - the builder
+        --    is responsible for creating $out, $dev, etc.)
+        let outputDirs = [(doName out, buildDir </> T.unpack (doName out)) | out <- drvOutputs drv]
 
-      -- 3. Compute output paths (but do NOT pre-create them - the builder
-      --    is responsible for creating $out, $dev, etc.)
-      let outputDirs = [(doName out, buildDir </> T.unpack (doName out)) | out <- drvOutputs drv]
+        -- 4. Set up environment
+        let builderPath = T.unpack (drvBuilder drv)
+            environ = buildEnvironment config drv builderPath buildDir outputDirs
 
-      -- 4. Set up environment
-      let builderPath = T.unpack (drvBuilder drv)
-          environ = buildEnvironment config drv builderPath buildDir outputDirs
-
-          -- 5. Run the builder
-          builderArgs = map T.unpack (drvArgs drv)
-      -- A "builtin:" builder (e.g. builtin:fetchurl) is handled in-process;
-      -- everything else is a normal subprocess.  The output validation and
-      -- registration below are shared by both paths.
-      exitResult <- case drvBuilder drv of
-        b
-          | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
-          | b == builtinUnpackBuilder -> runBuiltinUnpack drv outputDirs
-        _ -> runBuilder builderPath builderArgs environ buildDir
-      case exitResult of
-        Left (exitCode, stderrText) -> do
-          -- 6. Failure: clean up
-          cleanupBuildDir buildDir
-          pure (BuildFailure ("builder failed: " <> stderrText) exitCode)
-        Right () -> do
-          -- 7. Success: validate that the builder created all expected outputs.
-          --    Outputs may be files or directories - both are valid (real Nix
-          --    allows $out to be a single file, a directory tree, or a symlink).
-          missing <- filterM (fmap not . doesPathExist . snd) outputDirs
-          case missing of
-            [] -> do
-              registerResult <- registerOutputs config store drv buildDir outputDirs
-              cleanupBuildDir buildDir
-              pure registerResult
-            _ -> do
-              cleanupBuildDir buildDir
-              let names = T.intercalate ", " (map fst missing)
-              pure (BuildFailure ("builder succeeded but outputs missing: " <> names) 1)
+            -- 5. Run the builder
+            builderArgs = map T.unpack (drvArgs drv)
+        -- A "builtin:" builder (e.g. builtin:fetchurl) is handled in-process;
+        -- everything else is a normal subprocess.  The output validation and
+        -- registration below are shared by both paths.
+        exitResult <- case drvBuilder drv of
+          b
+            | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
+            | b == builtinUnpackBuilder -> runBuiltinUnpack drv outputDirs
+          _ -> runBuilder builderPath builderArgs environ buildDir
+        case exitResult of
+          Left (exitCode, stderrText) ->
+            pure (BuildFailure ("builder failed: " <> stderrText) exitCode)
+          Right () -> do
+            -- 6. Success: validate that the builder created all expected
+            --    outputs.  Outputs may be files or directories - both are
+            --    valid (real Nix allows $out to be a single file, a
+            --    directory tree, or a symlink).
+            missing <- filterM (fmap not . doesPathExist . snd) outputDirs
+            case missing of
+              [] -> registerOutputs config store drv buildDir outputDirs
+              _ -> do
+                let names = T.intercalate ", " (map fst missing)
+                pure (BuildFailure ("builder succeeded but outputs missing: " <> names) 1)
 
 -- ---------------------------------------------------------------------------
 -- Input validation
@@ -598,23 +598,23 @@ prepareOutput config store candidates tempPairs drvPathText (output, (_outName, 
   if not exists
     then pure (Left ("output missing: " <> T.pack outDir))
     else do
-      -- Validity is a DB fact, not mere disk presence: an output left on disk by
-      -- an interrupted build is NOT valid and must be (re-)registered.
+      -- Validity is a DB fact, not mere disk presence: an output left on disk
+      -- by an interrupted run is NOT valid, and build outputs are not
+      -- content-addressed, so a leftover cannot be verified against its path.
+      -- Replace it with the freshly built output (upstream's delete-then-move
+      -- at output registration) rather than adopt unverifiable bytes;
+      -- 'removePathForcibly' clears read-only marks, so a tree an earlier run
+      -- already marked read-only cannot wedge the replacement.
       valid <- isValid store targetSP
       if valid
         then pure (Right Nothing)
         else do
           onDisk <- doesPathExist targetPath
-          -- Scan whichever artifact we will register: a leftover store path if
-          -- present, otherwise the fresh build output.
-          let scanPath = if onDisk then targetPath else outDir
-          inputRefs <- scanReferences candidates scanPath
-          selfRefs <- scanTempReferences tempPairs scanPath
+          when onDisk (removePathForcibly targetPath)
+          inputRefs <- scanReferences candidates outDir
+          selfRefs <- scanTempReferences tempPairs outDir
           let refs = dedupStorePaths (inputRefs ++ selfRefs)
-          reg <-
-            if onDisk
-              then registrationFor store targetSP drvPathText refs
-              else placeInStore store outDir targetSP drvPathText refs
+          reg <- placeInStore store outDir targetSP drvPathText refs
           pure (Right (Just reg))
 
 -- | Deduplicate store paths by their (unique) hash.
@@ -751,15 +751,37 @@ logDepStatus status drv =
 
 -- | Try to substitute all outputs of a derivation from binary caches.
 -- Returns True if all outputs were successfully substituted.
+--
+-- Registration is all-or-nothing and batched: every output is verified
+-- and unpacked first, then recorded in one 'registerPaths' transaction,
+-- so cross-output reference edges land after both endpoints' rows exist
+-- and a partial substitution registers nothing (the subsequent build
+-- starts from unregistered outputs and 'prepareOutput' replaces the
+-- leftover unpacked trees).
+--
+-- A registration the database REFUSES - its unregistered-referent guard,
+-- reachable only through cache-declared references this store has never
+-- seen - is a substitution failure like any other: the transaction
+-- recorded nothing, so report it and fall back to building locally.
 trySubstituteOutputs :: BuildConfig -> Store -> Derivation -> IO Bool
 trySubstituteOutputs config store drv
   | null (bcCaches config) = pure False
   | otherwise = do
       results <- mapM (trySubstitute store (bcCaches config) . doPath) (drvOutputs drv)
-      pure (all isSubstSuccess results)
+      case traverse substRegistration results of
+        Just regs -> do
+          registered <- try (registerPaths (stDB store) regs)
+          case registered of
+            Right () -> pure True
+            Left (e :: IOException) -> do
+              TIO.hPutStrLn
+                System.IO.stderr
+                ("  [subst] registration refused, building instead: " <> T.pack (displayException e))
+              pure False
+        Nothing -> pure False
   where
-    isSubstSuccess (SubstSuccess _) = True
-    isSubstSuccess _ = False
+    substRegistration (SubstSuccess reg) = Just reg
+    substRegistration _ = Nothing
 
 -- | Format a derivation name for status output.
 formatDrvName :: Derivation -> Text

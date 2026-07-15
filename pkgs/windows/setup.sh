@@ -4,7 +4,7 @@
 # passes the package via the environment:
 #   $src           source tarball or directory
 #   $out           install prefix (the output store path)
-#   $ccPath        the mingw toolchain bin, already drive-translated
+#   $ccPath        the mingw toolchain bin (canonical store path; mapped here)
 #   $ccWrapperSrc  the cc-wrapper script (a store path), installed onto PATH
 #   $buildInputs   dependency store paths
 # plus these optional knobs a package may set:
@@ -19,19 +19,34 @@
 # `cygpath -u`.
 set -e
 
-export PATH="/usr/bin:/bin:$ccPath"
+# Seed tools first; the toolchain joins PATH below once its path is mapped.
+export PATH="/usr/bin:/bin"
+
+# Map a canonical /nix/store path to the MSYS2 drive-mounted form (for bash).
+# The drive letter comes from $NIX_STORE - the physical store root the
+# builder exports at spawn time (build-time only, never derivation text) -
+# so a store on any drive works.  Identity stays canonical /nix/store;
+# this mapping is the one host-specific step.  Pure parameter expansion:
+# nothing here may depend on PATH lookups beyond the seed itself.
+storeDrive="${NIX_STORE%%:*}"
+if [ "${#storeDrive}" != 1 ]; then storeDrive=c; fi
+storeDrive="${storeDrive,,}"
+toBash() {
+  case "$1" in
+    /nix/*) printf '/cygdrive/%s%s' "$storeDrive" "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# $ccPath arrives canonical (stdenv.nix passes the store path unmapped);
+# every use below - including the PATH entry, which gcc's own spawned
+# cc1/ld need to find the toolchain DLLs - wants the mapped form.
+ccPath="$(toBash "$ccPath")"
+export PATH="$PATH:$ccPath"
 
 builddir="$PWD"
 mkdir -p "$builddir/tmp"
 export TMPDIR="$builddir/tmp" TMP="$builddir/tmp" TEMP="$builddir/tmp"
-
-# Map a canonical /nix/store path to the MSYS2 drive-mounted form (for bash).
-toBash() {
-  case "$1" in
-    /nix/*) printf '/cygdrive/c%s' "$1" ;;
-    *) printf '%s' "$1" ;;
-  esac
-}
 
 # --- dependency flags ---
 # For each buildInput, make its headers and libraries visible to the compiler.
@@ -50,17 +65,19 @@ for dep in $buildInputs; do
 done
 export CPPFLAGS LDFLAGS PATH
 
-# --- cc-wrapper: route every compiler call through our flag-adding shim ---
-# Install cc-wrapper.sh (a store path, passed as $ccWrapperSrc) under the tool
-# names the build invokes, in a directory placed ahead of the toolchain on PATH,
-# and hand it the real gcc by absolute path.  See cc-wrapper.sh for the why.
+# --- cc-wrapper: route every toolchain call through our flag-adding shim ---
+# Install cc-wrapper.sh (a store path, passed as $ccWrapperSrc) under every
+# tool name the build may invoke, in a directory placed ahead of the toolchain
+# on PATH, and hand it the toolchain dir by absolute path.  A tool reachable
+# directly on PATH would bypass both the hermeticity unsets and the
+# deterministic-link flag.  See cc-wrapper.sh for the per-tool treatment.
 wrapperBin="$builddir/wrappers"
 mkdir -p "$wrapperBin"
-for tool in gcc cc; do
+for tool in gcc cc g++ c++ ld windres; do
   cp "$(toBash "$ccWrapperSrc")" "$wrapperBin/$tool"
   chmod +x "$wrapperBin/$tool"
 done
-export NN_REAL_CC="$ccPath/gcc.exe"
+export NN_TOOLCHAIN="$ccPath"
 export PATH="$wrapperBin:$PATH"
 
 prefix="$(cygpath -u "$out")"
@@ -73,7 +90,16 @@ if [ -d "$srcPath" ]; then
   cp -r "$srcPath"/. .
 else
   tar xf "$srcPath"
-  cd "$(ls -d */ | head -1)"
+  # cd into the single unpacked top-level directory.  Anything else is
+  # ambiguous - silently picking one would build the alphabetically-first
+  # entry of a multi-directory tarball - so fail loudly instead.
+  set -- */
+  if [ "$#" -eq 1 ] && [ -d "$1" ]; then
+    cd "$1"
+  else
+    echo "unpack: expected exactly one top-level directory in $src, got: $*" >&2
+    exit 1
+  fi
 fi
 
 # --- configure phase (autotools packages only) ---
@@ -122,7 +148,8 @@ systemDlls=" kernel32.dll kernelbase.dll ntdll.dll msvcrt.dll user32.dll \
  comctl32.dll comdlg32.dll winmm.dll version.dll crypt32.dll secur32.dll \
  bcrypt.dll ncrypt.dll userenv.dll iphlpapi.dll dnsapi.dll setupapi.dll \
  psapi.dll powrprof.dll dbghelp.dll imm32.dll netapi32.dll mpr.dll \
- uxtheme.dll dwmapi.dll ucrtbase.dll "
+ uxtheme.dll dwmapi.dll ucrtbase.dll winhttp.dll wininet.dll normaliz.dll \
+ shcore.dll msimg32.dll winspool.drv "
 
 # Where to look for a non-system DLL: the toolchain bin, then each input's bin.
 dllSearchDirs="$ccPath"

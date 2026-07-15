@@ -12,6 +12,9 @@ name: Parity
 
 on:
   workflow_dispatch:
+  # Reusable: the publish workflow runs this on the exact tagged commit,
+  # so nothing reaches Hackage without the drvPath oracle passing there.
+  workflow_call:
   # Regression guard: run on main pushes and PRs, but only when code that can
   # affect the computed drvPath changes - doc-only changes skip it.
   push:
@@ -48,6 +51,7 @@ jobs:
         uses: cachix/install-nix-action@v30
 
       - uses: haskell-actions/setup@v2
+        id: setup
         with:
           ghc-version: "9.8"
           cabal-version: "latest"
@@ -55,7 +59,7 @@ jobs:
       - name: Cache Cabal store
         uses: actions/cache@v5
         with:
-          path: ~/.cabal/store
+          path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
           restore-keys: cabal-Linux-
 

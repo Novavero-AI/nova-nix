@@ -17,18 +17,33 @@ jobs:
     name: CI
     uses: ./.github/workflows/ci.yml
 
+  parity:
+    name: Parity
+    uses: ./.github/workflows/parity.yml
+
   publish:
     name: Publish to Hackage
-    needs: ci
+    needs: [ci, parity]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set version from tag
+      # The tree is the source of truth: the tag must NAME the committed
+      # version, never rewrite it.  A mistyped or mistargeted tag fails
+      # here instead of publishing a mismatched (and immutable) sdist.
+      - name: Check the tag against the committed version and changelog
         run: |
           TAG_VERSION=${GITHUB_REF#refs/tags/v}
-          sed -i "s/^version:.*/version:            $TAG_VERSION/" nova-nix.cabal
-          echo "Set version to $TAG_VERSION"
+          ESCAPED=${TAG_VERSION//./\\.}
+          if ! grep -Eq "^version:[[:space:]]*${ESCAPED}[[:space:]]*$" nova-nix.cabal; then
+            echo "tag v${TAG_VERSION} does not match the committed version:" >&2
+            grep '^version:' nova-nix.cabal >&2
+            exit 1
+          fi
+          if ! grep -Eq "^## ${ESCAPED}( |$)" CHANGELOG.md; then
+            echo "CHANGELOG.md has no entry for ${TAG_VERSION}" >&2
+            exit 1
+          fi
 
       - uses: haskell-actions/setup@v2
         with:
@@ -38,12 +53,15 @@ jobs:
       - name: Build sdist
         run: cabal sdist
 
+      # The token travels via stdin into curl's config, never argv:
+      # command lines are readable process-wide for the upload's duration.
       - name: Upload to Hackage
         env:
           HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
         run: |
           SDIST=$(ls dist-newstyle/sdist/nova-nix-*.tar.gz)
           curl --fail --silent --show-error \
-            --header "Authorization: X-ApiKey ${HACKAGE_TOKEN}" \
+            --config - \
             --form "package=@${SDIST}" \
-            https://hackage.haskell.org/packages/
+            https://hackage.haskell.org/packages/ \
+            <<< "header = \"Authorization: X-ApiKey ${HACKAGE_TOKEN}\""

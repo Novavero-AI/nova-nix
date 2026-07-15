@@ -96,7 +96,7 @@ import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
-import Nix.Eval.Operator (evalBinary, evalUnary, nixCompare, nixEqual)
+import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, formatNixFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolText)
 import Nix.Eval.Types
@@ -161,7 +161,7 @@ import Nix.Expr.Types
     UnaryOp (..),
   )
 import Nix.Hash (bytesToHexText, hashPlaceholder, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex)
-import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText)
+import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.NAR as NAR
@@ -471,29 +471,7 @@ evalBcApp env bcIdx0 = do
       let argThunk = cheapThunkBc env argIdx
       extEnv <- matchFormals closureEnv formals argThunk
       evalBytecode extEnv bodyBcIdx
-    VBuiltin "tryEval" [] -> do
-      result <- catchEvalError (evalBytecode env argIdx)
-      case result of
-        Right val ->
-          pure
-            ( VAttrs
-                ( attrSetFromMap $
-                    Map.fromList
-                      [ ("success", evaluated (VBool True)),
-                        ("value", evaluated val)
-                      ]
-                )
-            )
-        Left _ ->
-          pure
-            ( VAttrs
-                ( attrSetFromMap $
-                    Map.fromList
-                      [ ("success", evaluated (VBool False)),
-                        ("value", evaluated (VBool False))
-                      ]
-                )
-            )
+    VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
     VBuiltin name accArgs -> do
       argVal <- evalBytecode env argIdx
       applyBuiltin name accArgs argVal
@@ -508,10 +486,42 @@ evalBcApp env bcIdx0 = do
               let argThunk = cheapThunkBc env argIdx
               extEnv <- matchFormals closureEnv formals argThunk
               evalBytecode extEnv bodyBcIdx
+            -- A functor returning tryEval keeps the catch around the
+            -- argument's evaluation, like the direct arm above.
+            VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
             _ -> do
               argVal <- evalBytecode env argIdx
               applyValue partiallyApplied argVal
     _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
+
+-- | @builtins.tryEval@ over an argument's evaluation: @{ success, value }@
+-- with catchable errors (throw, failed assert - the only kinds
+-- 'catchEvalError' recovers) mapped to @success = false@.  The catch must
+-- wrap the ARGUMENT'S EVALUATION: an application path that forces the
+-- argument before dispatching here has already let the throw escape.
+-- Callers holding an already-forced value pass @pure val@ - nothing left
+-- to catch, so it success-wraps, exactly as upstream treats a value in
+-- WHNF.
+tryEvalAction :: (MonadEval m) => m NixValue -> m NixValue
+tryEvalAction act = do
+  result <- catchEvalError act
+  pure $ case result of
+    Right val ->
+      VAttrs
+        ( attrSetFromMap $
+            Map.fromList
+              [ ("success", evaluated (VBool True)),
+                ("value", evaluated val)
+              ]
+        )
+    Left _ ->
+      VAttrs
+        ( attrSetFromMap $
+            Map.fromList
+              [ ("success", evaluated (VBool False)),
+                ("value", evaluated (VBool False))
+              ]
+        )
 
 -- | Evaluate a lambda literal from bytecode - returns VLambda.
 evalBcLambda :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -1124,16 +1134,12 @@ builtinRegistry =
       builtin2 "sub" builtinSub,
       builtin2 "mul" builtinMul,
       builtin2 "div" builtinDiv,
-      builtin2 "mod" builtinMod,
       builtin2 "bitAnd" builtinBitAnd,
       builtin2 "bitOr" builtinBitOr,
       builtin2 "bitXor" builtinBitXor,
-      builtin2 "min" builtinMin,
-      builtin2 "max" builtinMax,
       -- Attr set higher-order
       builtin2 "mapAttrs" builtinMapAttrs,
       builtin1 "functionArgs" builtinFunctionArgs,
-      builtin2 "setFunctionArgs" builtinSetFunctionArgs,
       builtin2 "zipAttrsWith" builtinZipAttrsWith,
       -- String manipulation
       builtin2 "match" builtinMatch,
@@ -1147,7 +1153,10 @@ builtinRegistry =
       builtin1 "fromJSON" builtinFromJSON,
       builtin2 "hashString" builtinHashString,
       -- Error handling + sequencing
-      builtin1 "tryEval" (\_ -> throwEvalError "unreachable: tryEval handled in evalApp"),
+      -- An argument reaching here is already forced (any throw happened
+      -- before tryEval saw it), so it success-wraps; the catching paths
+      -- are evalBcApp and applyValueLazy.
+      builtin1 "tryEval" (tryEvalAction . pure),
       builtin2 "deepSeq" builtinDeepSeq,
       -- Graph traversal
       builtin1 "genericClosure" builtinGenericClosure,
@@ -1262,6 +1271,10 @@ applyValueLazy :: (MonadEval m) => NixValue -> Thunk -> m NixValue
 applyValueLazy (VLambda closureEnv formals bodyBcIdx) argThunk = do
   extEnv <- matchFormals closureEnv formals argThunk
   evalBytecode extEnv bodyBcIdx
+-- tryEval's catch must wrap the argument's forcing (see 'tryEvalAction'):
+-- map/filter passing a throwing element to tryEval yields success = false,
+-- not an escaped error.
+applyValueLazy (VBuiltin "tryEval" []) argThunk = tryEvalAction (force argThunk)
 applyValueLazy other argThunk = do
   val <- force argThunk
   applyValue other val
@@ -1343,16 +1356,12 @@ executeBuiltin name args = case name of
   "sub" -> apply2 builtinSub
   "mul" -> apply2 builtinMul
   "div" -> apply2 builtinDiv
-  "mod" -> apply2 builtinMod
   "bitAnd" -> apply2 builtinBitAnd
   "bitOr" -> apply2 builtinBitOr
   "bitXor" -> apply2 builtinBitXor
-  "min" -> apply2 builtinMin
-  "max" -> apply2 builtinMax
   -- Attr set higher-order
   "mapAttrs" -> apply2 builtinMapAttrs
   "functionArgs" -> apply1 builtinFunctionArgs
-  "setFunctionArgs" -> apply2 builtinSetFunctionArgs
   "zipAttrsWith" -> apply2 builtinZipAttrsWith
   -- String manipulation
   "match" -> apply2 builtinMatch
@@ -1366,7 +1375,8 @@ executeBuiltin name args = case name of
   "fromJSON" -> apply1 builtinFromJSON
   "hashString" -> apply2 builtinHashString
   -- Error handling + sequencing
-  "tryEval" -> apply1 (\_ -> throwEvalError "unreachable: tryEval handled in evalApp")
+  -- Already-forced argument: success-wrap (see the registry entry).
+  "tryEval" -> apply1 (tryEvalAction . pure)
   "deepSeq" -> apply2 builtinDeepSeq
   -- Graph traversal
   "genericClosure" -> apply1 builtinGenericClosure
@@ -1963,11 +1973,7 @@ coerceToStringPermissive other = coerceToString True force applyValue other
 -- string context so it lands in the derivation's @inputSrcs@ - matching C++
 -- Nix's copy-to-store coercion of paths in derivation arguments/environment.
 coerceToStoreString :: (MonadEval m) => NixValue -> m (Text, StringContext)
-coerceToStoreString (VPath p) = do
-  spText <- storeSourcePath p
-  case parseStorePath defaultStoreDir spText of
-    Just sp -> pure (spText, StringContext (Set.singleton (SCPlain sp)))
-    Nothing -> pure (spText, mempty)
+coerceToStoreString (VPath p) = sourcePathWithContext p
 coerceToStoreString (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   parts <- mapM (force >=> coerceToStoreString) thunks
@@ -1979,12 +1985,18 @@ coerceToStoreString other = coerceToStringPermissive other
 -- its source store path (with context) - matching C++ Nix, where interpolation
 -- uses @copyToStore = true@, unlike 'builtins.toString', which does not copy.
 coerceToStringInterp :: (MonadEval m) => NixValue -> m (Text, StringContext)
-coerceToStringInterp (VPath p) = do
+coerceToStringInterp (VPath p) = sourcePathWithContext p
+coerceToStringInterp other = coerceToString False force applyValue other
+
+-- | The store path a source path literal coerces to, carrying its
+-- SCPlain context - the copy-to-store coercion shared by interpolation,
+-- derivation arguments/env values, and @builtins.toJSON@.
+sourcePathWithContext :: (MonadEval m) => Text -> m (Text, StringContext)
+sourcePathWithContext p = do
   spText <- storeSourcePath p
   case parseStorePath defaultStoreDir spText of
     Just sp -> pure (spText, StringContext (Set.singleton (SCPlain sp)))
     Nothing -> pure (spText, mempty)
-coerceToStringInterp other = coerceToString False force applyValue other
 
 -- | The current system platform string.
 currentSystemStr :: Text
@@ -2009,14 +2021,27 @@ isPathVal (VPath _) = True
 isPathVal _ = False
 
 builtinCeil :: (MonadEval m) => NixValue -> m NixValue
-builtinCeil (VFloat f) = pure (VInt (ceiling f))
+builtinCeil (VFloat f) = intFromDouble "builtins.ceil" ceiling f
 builtinCeil (VInt n) = pure (VInt n)
 builtinCeil other = throwEvalError ("builtins.ceil: expected a number, got " <> typeName other)
 
 builtinFloor :: (MonadEval m) => NixValue -> m NixValue
-builtinFloor (VFloat f) = pure (VInt (floor f))
+builtinFloor (VFloat f) = intFromDouble "builtins.floor" floor f
 builtinFloor (VInt n) = pure (VInt n)
 builtinFloor other = throwEvalError ("builtins.floor: expected a number, got " <> typeName other)
+
+-- | Round a float to Int64 with the checks Nix 2.24 performs: NaN,
+-- infinity, and out-of-range values are eval errors, never a garbage
+-- Int64 out of Haskell's unchecked conversion.
+intFromDouble :: (MonadEval m) => Text -> (Double -> Integer) -> Double -> m NixValue
+intFromDouble ctx rounder f
+  | isNaN f = throwEvalError (ctx <> ": NaN cannot be converted to an integer")
+  | isInfinite f = throwEvalError (ctx <> ": infinity cannot be converted to an integer")
+  | rounded < toInteger (minBound :: Int64) || rounded > toInteger (maxBound :: Int64) =
+      throwEvalError (ctx <> ": " <> formatNixFloat f <> " is out of integer range")
+  | otherwise = pure (VInt (fromInteger rounded))
+  where
+    rounded = rounder f
 
 builtinDiscardContext :: (MonadEval m) => NixValue -> m NixValue
 builtinDiscardContext (VStr s _) = pure (mkStr s)
@@ -2077,8 +2102,9 @@ groupContextByPath = foldl' addElement Map.empty
         (cePath new || cePath old)
         (ceAllOutputs new || ceAllOutputs old)
         (ceOutputs new ++ ceOutputs old)
-    spToText sp =
-      T.pack (storePathToFilePath defaultStoreDir sp)
+    -- Context keys are identity, not IO: always the canonical /nix/store
+    -- spelling, never the platform file-path mapping.
+    spToText = storePathToText defaultStoreDir
 
 -- | Convert a ContextEntry to an attrset thunk.
 contextEntryToAttrs :: ContextEntry -> Thunk
@@ -2198,21 +2224,21 @@ builtinLessThan a b = VBool <$> nixCompare force a b
 -- ---------------------------------------------------------------------------
 
 builtinAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAdd (VInt a) (VInt b) = pure (VInt (a + b))
+builtinAdd (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedAdd a b)
 builtinAdd (VInt a) (VFloat b) = pure (VFloat (fromIntegral a + b))
 builtinAdd (VFloat a) (VInt b) = pure (VFloat (a + fromIntegral b))
 builtinAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
 builtinAdd l r = throwEvalError ("builtins.add: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
 builtinSub :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinSub (VInt a) (VInt b) = pure (VInt (a - b))
+builtinSub (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedSub a b)
 builtinSub (VInt a) (VFloat b) = pure (VFloat (fromIntegral a - b))
 builtinSub (VFloat a) (VInt b) = pure (VFloat (a - fromIntegral b))
 builtinSub (VFloat a) (VFloat b) = pure (VFloat (a - b))
 builtinSub l r = throwEvalError ("builtins.sub: expected numbers, got " <> typeName l <> " and " <> typeName r)
 
 builtinMul :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMul (VInt a) (VInt b) = pure (VInt (a * b))
+builtinMul (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedMul a b)
 builtinMul (VInt a) (VFloat b) = pure (VFloat (fromIntegral a * b))
 builtinMul (VFloat a) (VInt b) = pure (VFloat (a * fromIntegral b))
 builtinMul (VFloat a) (VFloat b) = pure (VFloat (a * b))
@@ -2221,30 +2247,16 @@ builtinMul l r = throwEvalError ("builtins.mul: expected numbers, got " <> typeN
 builtinDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
 builtinDiv (VInt a) (VInt b)
-  | a == minBound && b == -1 = pure (VInt minBound)
+  -- The one overflowing division: |minBound| has no representation.
+  | a == minBound && b == -1 =
+      throwEvalError
+        ("integer overflow in dividing " <> T.pack (show a) <> " and " <> T.pack (show b))
   | otherwise = pure (VInt (quot a b))
 builtinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
 builtinDiv (VInt a) (VFloat b) = pure (VFloat (fromIntegral a / b))
 builtinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromIntegral b))
 builtinDiv (VFloat a) (VFloat b) = pure (VFloat (a / b))
 builtinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeName l <> " and " <> typeName r)
-
-builtinMod :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMod _ (VInt 0) = throwEvalError "builtins.mod: division by zero"
-builtinMod (VInt a) (VInt b)
-  | a == minBound && b == -1 = pure (VInt 0)
-  | otherwise = pure (VInt (rem a b))
-builtinMod l r = throwEvalError ("builtins.mod: expected two integers, got " <> typeName l <> " and " <> typeName r)
-
-builtinMin :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMin a b = do
-  aIsLess <- nixCompare force a b
-  pure (if aIsLess then a else b)
-
-builtinMax :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMax a b = do
-  aIsLess <- nixCompare force a b
-  pure (if aIsLess then b else a)
 
 builtinBitAnd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinBitAnd (VInt a) (VInt b) = pure (VInt (a .&. b))
@@ -2283,12 +2295,12 @@ mapAttrsExpr :: Expr
 mapAttrsExpr = EApp (EApp (EResolvedVar 0 0) (EResolvedVar 0 1)) (EResolvedVar 0 2)
 {-# NOINLINE mapAttrsExpr #-}
 
+-- | Formals for lambdas, an empty set for builtins, an error otherwise -
+-- including functor sets: upstream's primop never consults
+-- @__functionArgs@ (nixpkgs lib.functionArgs handles that in Nix).
 builtinFunctionArgs :: (MonadEval m) => NixValue -> m NixValue
 builtinFunctionArgs (VLambda _ formals _) = pure (formalsToAttrs formals)
 builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs (attrSetFromMap Map.empty))
--- Callable sets with __functionArgs metadata (from setFunctionArgs).
-builtinFunctionArgs (VAttrs attrs)
-  | Just faThunk <- attrSetLookup "__functionArgs" attrs = force faThunk
 builtinFunctionArgs other =
   throwEvalError ("builtins.functionArgs: expected a function, got " <> typeName other)
 
@@ -2303,31 +2315,6 @@ formalsListToAttrs formals =
     attrSetFromMap $
       Map.fromList
         [(efName f, evaluated (VBool (isJust (efDefault f)))) | f <- formals]
-
--- | @builtins.setFunctionArgs f args@ - wraps @f@ in a callable attrset
--- with @__functor@ (so it remains callable) and @__functionArgs@ metadata.
--- Used by nixpkgs @lib.mirrorFunctionArgs@ / @lib.makeOverridable@.
---
--- @__functor@ is @self: f@ - a lambda that ignores @self@ and returns
--- the original function.  The function is captured in the closure env.
-builtinSetFunctionArgs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinSetFunctionArgs func (VAttrs argSpec) =
-  -- Closure env holds the function at slot 0.  The __functor lambda
-  -- body is EResolvedVar 1 0: level 1 (past _self's slot), index 0.
-  let (sp, sc) = buildCSlots [evaluated func]
-      closureEnv = newMinimalEnv sp sc
-      bodyBcIdx = unsafePerformIO (compileExpr (EResolvedVar 1 0))
-      -- __functor = self: __fn  (ignores self, returns the original function)
-      functorLambda = VLambda closureEnv (EFName "_self") bodyBcIdx
-   in pure $
-        VAttrs $
-          attrSetFromMap $
-            Map.fromList
-              [ ("__functor", evaluated functorLambda),
-                ("__functionArgs", evaluated (VAttrs argSpec))
-              ]
-builtinSetFunctionArgs func args =
-  throwEvalError ("builtins.setFunctionArgs: expected a set as second argument, got " <> typeName args <> " (func: " <> typeName func <> ")")
 
 builtinZipAttrsWith :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinZipAttrsWith func (VList cl) = do
@@ -2720,7 +2707,12 @@ valueToJSON (VAttrs attrs) =
         val <- force thunk
         (jsonVal, ctx) <- valueToJSON val
         pure (jsonEscapeString key <> ":" <> jsonVal, ctx)
-valueToJSON (VPath p) = pure (jsonEscapeString p, emptyContext)
+-- A path serializes as its source store path, with context - the same
+-- copy-to-store coercion as interpolation (upstream value-to-json.cc
+-- serializes paths with copyToStore = true).
+valueToJSON (VPath p) = do
+  (spText, ctx) <- sourcePathWithContext p
+  pure (jsonEscapeString spText, ctx)
 valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VDerivation _) = throwEvalError "builtins.toJSON: cannot convert a derivation to JSON"
