@@ -663,7 +663,7 @@ testEvalBuiltins = do
         assertEval "isNull-f" "builtins.isNull 1" (VBool False),
       runTest "stringLength" $
         assertEval "strlen" "builtins.stringLength \"hello\"" (VInt 5),
-      -- Lexer divergences (audit): $${ is literal, ''' escapes to '', \q -> q.
+      -- Lexer edge cases pinned to upstream: $${ is literal, ''' escapes to '', \q -> q.
       runTest "$${ does not interpolate (double dollar is literal)" $
         assertEval "dollar-dollar-str" "builtins.stringLength \"a$${b}c\"" (VInt 7),
       runTest "$${ literal in indented string" $
@@ -3854,11 +3854,12 @@ testDependentBuildIO = do
               Fail ("dependency-aware build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
 
--- | Regression tests for the 2026-06-09 audit eval-fidelity fixes.  All are
--- parity-safe - none affects a derivation or store-path hash.
+-- | Eval-fidelity regression tests: each pins a semantic where the evaluator
+-- must match upstream Nix.  All are parity-safe - none affects a derivation
+-- or store-path hash.
 testEvalFidelity :: IO [Bool]
 testEvalFidelity = do
-  putStrLn "eval/audit-fidelity"
+  putStrLn "eval/fidelity"
   sequence
     [ -- builtins.match: a non-participating capture group is null, not ""
       runTest "match null capture group" $

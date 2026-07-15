@@ -417,7 +417,7 @@ compileExpr = go
       pure off
 
     -- \| Convert an element count into the bytecode's 16-bit short_arg,
-    -- failing loudly on overflow: a silent Word16 truncation once made a
+    -- failing loudly on overflow: a silent Word16 truncation would make a
     -- 70000-element list literal report length 4464.
     countArg :: String -> Int -> IO Word16
     countArg what n
