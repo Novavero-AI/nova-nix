@@ -551,9 +551,9 @@ testEvalLambda = do
         assertEval "set-pat" "({ a, b }: a + b) { a = 1; b = 2; }" (VInt 3),
       runTest "default param" $
         assertEval "default" "({ a ? 10 }: a) { }" (VInt 10),
-      -- Regression: zero-formal set patterns marshal count 0 / entries NULL;
-      -- the second force of the same lambda thunk re-reads the entries and
-      -- must not underflow the unsigned count (crashed pre-fix).
+      -- Zero-formal set patterns marshal count 0 / entries NULL; the
+      -- second force of the same lambda thunk re-reads the entries and
+      -- must not underflow the unsigned count.
       runTest "empty formals forced twice" $
         assertEval "empty-formals" "let f = {}: 1; in f {} + f {}" (VInt 2),
       runTest "ellipsis-only formals forced twice" $
@@ -6067,13 +6067,12 @@ testBytecodeCountSpill = do
           (VBool False)
     ]
 
--- | C value structs carry element counts as a full uint32: a lambda's
--- formal list and a string's context set marshal past the old uint16
--- ceiling intact.  A narrower count wraps at 65536 and sizes the C
--- array smaller than the fill loop that follows it.  Each case forces
--- the value twice - the first force writes the C struct (the marshal
--- side), the second reads it back off the computed thunk cell (the
--- unmarshal side).
+-- | C value structs carry element counts as a full uint32; a narrower
+-- count would wrap at 65536 and size the C array smaller than the fill
+-- loop that follows it.  Both cases marshal counts past that boundary
+-- and force the value twice - the first force writes the C struct (the
+-- marshal side), the second reads it back off the computed thunk cell
+-- (the unmarshal side).
 testValueCountWidths :: IO [Bool]
 testValueCountWidths = do
   putStrLn "value/count-widths"
