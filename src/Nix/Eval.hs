@@ -91,7 +91,7 @@ import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpcode, cbcShortArg, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
@@ -434,8 +434,8 @@ evalShortCircuitImpl env leftIdx rightIdx = do
 -- | Evaluate a string literal from bytecode data buffer.
 evalBcStr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcStr env bcIdx0 = do
-  let count = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
-      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+  let (count, dataOff) =
+        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
   chunks <- evalBcStringParts env count dataOff
   pure (VStr (BS.concat [t | (_, t, _) <- chunks]) (mconcat [c | (_, _, c) <- chunks]))
 
@@ -445,8 +445,8 @@ evalBcStr env bcIdx0 = do
 -- C++ Nix.
 evalBcIndStr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcIndStr env bcIdx0 = do
-  let count = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
-      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+  let (count, dataOff) =
+        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
   chunks <- evalBcStringParts env count dataOff
   let (text, ctx) = stripIndentedChunks chunks
   pure (VStr text ctx)
@@ -472,8 +472,8 @@ evalBcStringParts env n off = do
 -- | Evaluate a list from bytecode data buffer.
 evalBcList :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcList env bcIdx0 =
-  let count = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0)) :: Int
-      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+  let (count, dataOff) =
+        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
       readChildren 0 _ = []
       readChildren n off =
         let childIdx = unsafePerformIO (cbcData off)
@@ -558,9 +558,9 @@ evalBcLambda env bcIdx0 =
 evalBcSelect :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcSelect env bcIdx0 = do
   let hasDef = unsafePerformIO (cbcFlags bcIdx0) /= 0
-      pathLen = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
       targetIdx = unsafePerformIO (cbcArg1 bcIdx0)
-      pathOff = unsafePerformIO (cbcArg2 bcIdx0)
+      (pathLen, pathOff) =
+        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg2 bcIdx0)
       defIdx = unsafePerformIO (cbcArg3 bcIdx0)
   targetVal <- evalBytecode env targetIdx
   result <- walkBcAttrPath env pathLen pathOff targetVal
@@ -578,9 +578,9 @@ evalBcSelect env bcIdx0 = do
 -- | Evaluate a hasAttr expression from bytecode.
 evalBcHasAttr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcHasAttr env bcIdx0 = do
-  let pathLen = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
-      targetIdx = unsafePerformIO (cbcArg1 bcIdx0)
-      pathOff = unsafePerformIO (cbcArg2 bcIdx0)
+  let targetIdx = unsafePerformIO (cbcArg1 bcIdx0)
+      (pathLen, pathOff) =
+        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg2 bcIdx0)
   targetVal <- evalBytecode env targetIdx
   result <- walkBcAttrPath env pathLen pathOff targetVal
   pure (VBool (isJust result))
@@ -627,8 +627,8 @@ walkBcAttrPath env n off val = case val of
 evalBcAttrs :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcAttrs env bcIdx0 = do
   let isRec = unsafePerformIO (cbcFlags bcIdx0) /= 0
-      bindCount = unsafePerformIO (cbcShortArg bcIdx0)
-      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+      (bindCount, dataOff) =
+        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
       captureOff = unsafePerformIO (cbcArg2 bcIdx0)
       bindings = unsafePerformIO (decodeBcBindings bindCount dataOff)
   if isRec
@@ -696,8 +696,8 @@ evalBcRecAttrs env bindings captureInfo
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcLet env bcIdx0 = do
-  let bindCount = unsafePerformIO (cbcShortArg bcIdx0)
-      dataOff = unsafePerformIO (cbcArg1 bcIdx0)
+  let (bindCount, dataOff) =
+        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
       bodyIdx = unsafePerformIO (cbcArg2 bcIdx0)
       captureOff = unsafePerformIO (cbcArg3 bcIdx0)
       bindings = unsafePerformIO (decodeBcBindings bindCount dataOff)

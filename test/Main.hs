@@ -5797,6 +5797,54 @@ testCThunk = do
 -- Bytecode compilation tests
 -- ---------------------------------------------------------------------------
 
+-- | Bytecode short_arg spill: op-level payload counts at or above the
+-- 0xFFFF sentinel move to the first data word, so literals are no longer
+-- capped at 65535 elements.  The two exact-boundary list cases pin the
+-- inline maximum (65534) and the first spilled count (65535); the rest
+-- drive each counted-op kind (list, attrs, let, string parts, attr path)
+-- well past the old ceiling.
+testBytecodeCountSpill :: IO [Bool]
+testBytecodeCountSpill = do
+  putStrLn "bytecode/count-spill"
+  let listOf n = "builtins.length [ " <> T.unwords (replicate n "1") <> " ]"
+      bigAttrsBody = T.concat [T.pack ("a" <> show i <> " = " <> show i <> "; ") | i <- [0 :: Int .. 69999]]
+  sequence
+    [ runTest "list literal at the inline count maximum (65534)" $
+        assertEval "spill-list-inline-max" (listOf 65534) (VInt 65534),
+      runTest "list literal at the first spilled count (65535)" $
+        assertEval "spill-list-first-spill" (listOf 65535) (VInt 65535),
+      runTest "spilled list preserves element order" $
+        assertEval
+          "spill-list-order"
+          ("builtins.elemAt [ " <> T.unwords (map (T.pack . show) [0 :: Int .. 69999]) <> " ] 69999")
+          (VInt 69999),
+      runTest "spilled attrset literal binds every attribute" $
+        assertEval
+          "spill-attrs-count"
+          ("builtins.length (builtins.attrNames { " <> bigAttrsBody <> "})")
+          (VInt 70000),
+      runTest "spilled attrset lookup reads the right value" $
+        assertEval
+          "spill-attrs-lookup"
+          ("{ " <> bigAttrsBody <> "}.a69999")
+          (VInt 69999),
+      runTest "spilled let binds every name" $
+        assertEval
+          "spill-let"
+          ("let " <> T.concat [T.pack ("v" <> show i <> " = " <> show i <> "; ") | i <- [0 :: Int .. 69999]] <> "in v69999")
+          (VInt 69999),
+      runTest "spilled interpolated string keeps every part" $
+        assertEval
+          "spill-string-parts"
+          ("builtins.stringLength \"" <> T.concat (replicate 70000 "${\"x\"}") <> "\"")
+          (VInt 70000),
+      runTest "spilled attr path walks (set ? long.path)" $
+        assertEval
+          "spill-attrpath"
+          ("{ } ? " <> T.intercalate "." (map (\i -> T.pack ("p" <> show i)) [0 :: Int .. 69999]))
+          (VBool False)
+    ]
+
 testBytecodeCompile :: IO [Bool]
 testBytecodeCompile = do
   putStrLn "bytecode"
@@ -6632,7 +6680,8 @@ main = bracket_ arenaInit arenaDestroy $ do
           testSymbol,
           testCAttrSet,
           testCThunk,
-          testBytecodeCompile
+          testBytecodeCompile,
+          testBytecodeCountSpill
         ]
   let total = length results
       passed = length (filter id results)
