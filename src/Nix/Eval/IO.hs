@@ -40,14 +40,16 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf8', encodeUtf8)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
+import Nix.Derivation (fromATerm)
 import Nix.Eval (eval)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
+import Nix.Eval.CanonPath (canonBaseName, canonPath)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
@@ -59,7 +61,7 @@ import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
-import System.FilePath (isRelative, takeDirectory, takeFileName, (</>))
+import System.FilePath (isRelative, takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import qualified System.Process as Proc
 
@@ -244,15 +246,42 @@ instance MonadEval EvalIO where
     ref <- asks esDrvClosure
     liftIO (modifyIORef' ref (Map.insert key aterm))
 
+  -- Read a .drv from the store on a modulo-hash cache miss (a cross-session or
+  -- appendContext reference).  Mirrors the build side's readDrvFromStore: map
+  -- to the on-disk path, read the raw bytes, decode UTF-8, parse the ATerm.
+  -- Any failure - absent file, bad encoding, malformed ATerm - is 'Nothing',
+  -- which the caller turns into a loud modulo-hash error.
+  readStoreDerivation sp = EvalIO $ do
+    let filePath = SP.storePathToFilePath SP.defaultStoreDir sp
+    result <- liftIO (try (BS.readFile filePath) :: IO (Either SomeException BS.ByteString))
+    pure $ case result of
+      Left _ -> Nothing
+      Right bytes -> case decodeUtf8' bytes of
+        Left _ -> Nothing
+        Right text -> either (const Nothing) Just (fromATerm text)
+
+  -- Look up a derivation recorded earlier this session by its .drv path,
+  -- reusing the esDrvClosure ATerm map (populated bottom-up by recordDrvAterm).
+  -- This recovers an in-session all-outputs reference's output names without a
+  -- disk read - the .drv is not written to the store until after evaluation.
+  lookupSessionDrv drvPathText = EvalIO $ do
+    ref <- asks esDrvClosure
+    closure <- liftIO (readIORef ref)
+    pure (Map.lookup drvPathText closure >>= either (const Nothing) Just . fromATerm)
+
   storeSourcePath rawPath = do
     ref <- EvalIO (asks esSourcePathCache)
     cached <- EvalIO (liftIO (Map.lookup rawPath <$> readIORef ref))
     case cached of
       Just hit -> pure hit
       Nothing -> do
+        -- Upstream names the copy baseNameOf(canonicalized path); path
+        -- values arrive canonicalized, so the last segment is the name.
+        let name = canonBaseName rawPath
+        when (T.null name) $
+          throwEvalError ("cannot copy '" <> rawPath <> "' to the store: the path has no base name")
         entry <- wrapIO (NAR.serialiseFromPath (T.unpack rawPath))
         let narDigest = sha256Digest (NAR.serialise entry)
-            name = T.pack (takeFileName (T.unpack rawPath))
             sp = makeFixedOutputPath name "sha256" "recursive" narDigest
             spText = SP.storePathToText SP.defaultStoreDir sp
         EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath spText)))
@@ -399,10 +428,17 @@ instance MonadEval EvalIO where
 
   resolvePathLiteral path = do
     baseDir <- EvalIO (asks esBaseDir)
-    let raw = T.unpack path
-    if isRelative raw
-      then pure (T.pack (baseDir </> raw))
-      else pure path
+    -- ~/x resolves against the home directory (upstream lexes HPATH and
+    -- expands it at eval); everything else relative joins the base dir.
+    -- Both end in lexical canonicalization, so no dot segment, repeated
+    -- separator, or platform backslash survives into the path value.
+    expanded <- case T.stripPrefix "~/" path of
+      Just below -> do
+        home <- wrapIO Dir.getHomeDirectory
+        pure (home </> T.unpack below)
+      Nothing -> pure (T.unpack path)
+    let absolute = if isRelative expanded then baseDir </> expanded else expanded
+    pure (canonPath (T.pack absolute))
 
   forceThunk evalFn (Thunk ptr) = do
     -- Force protocol: PENDING to BLACKHOLE to COMPUTED with memoization.

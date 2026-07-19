@@ -86,7 +86,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Word (Word32, Word8)
+import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
@@ -94,10 +94,11 @@ import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpco
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
+import Nix.Eval.CanonPath (canonPath)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
-import Nix.Eval.Context (extractInputDrvs, extractInputSrcs, plainContext)
+import Nix.Eval.Context (extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, nixCompare, nixEqual)
-import Nix.Eval.StringInterp (coerceToString, formatNixFloat, stripIndentedChunks)
+import Nix.Eval.StringInterp (coerceToString, formatJsonFloat, formatNixFloat, formatXmlFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolText)
 import Nix.Eval.Types
   ( AttrSet (..),
@@ -160,7 +161,7 @@ import Nix.Expr.Types
     NixAtom (..),
     UnaryOp (..),
   )
-import Nix.Hash (bytesToHexText, hashPlaceholder, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, sha256Digest, sha256Hex)
+import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest, sha256Hex)
 import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
@@ -337,8 +338,10 @@ evalAddWithCoercion left right = case (left, right) of
   (VFloat _, _) -> evalBinary force OpAdd left right
   (_, VFloat _) -> evalBinary force OpAdd left right
   (VInt _, VInt _) -> evalBinary force OpAdd left right
-  -- Path + path: raw concatenation, still a path.
-  (VPath a, VPath b) -> pure (VPath (a <> b))
+  -- Path + path: text concatenation, canonicalized - the joined spelling
+  -- (dot segments, doubled separators) never survives into the value, as
+  -- upstream (CanonPath on the concatenated text).
+  (VPath a, VPath b) -> pure (VPath (canonPath (a <> b)))
   -- Path + coercible: the result stays a path, the right side coerces
   -- WITHOUT a store copy, and a right side carrying string context is an
   -- error, as upstream (a store-path reference cannot survive inside a
@@ -346,7 +349,7 @@ evalAddWithCoercion left right = case (left, right) of
   (VPath a, _) -> do
     (rightStr, rightCtx) <- coerceAddOperand right
     if rightCtx == emptyContext
-      then pure (VPath (a <> rightStr))
+      then pure (VPath (canonPath (a <> rightStr)))
       else throwEvalError "cannot append a string with context (a store-path reference) to a path"
   -- Strings: direct concat.
   (VStr {}, VStr {}) -> evalBinary force OpAdd left right
@@ -1121,6 +1124,7 @@ builtinRegistry =
       builtin2 "warn" builtinWarn,
       builtin1 "unsafeDiscardStringContext" builtinDiscardContext,
       builtin1 "unsafeDiscardOutputDependency" builtinDiscardOutputDep,
+      builtin1 "addDrvOutputDependencies" builtinAddDrvOutputDeps,
       -- String context introspection
       builtin1 "hasContext" builtinHasContext,
       builtin1 "getContext" builtinGetContext,
@@ -1343,6 +1347,7 @@ executeBuiltin name args = case name of
   "warn" -> apply2 builtinWarn
   "unsafeDiscardStringContext" -> apply1 builtinDiscardContext
   "unsafeDiscardOutputDependency" -> apply1 builtinDiscardOutputDep
+  "addDrvOutputDependencies" -> apply1 builtinAddDrvOutputDeps
   -- String context introspection
   "hasContext" -> apply1 builtinHasContext
   "getContext" -> apply1 builtinGetContext
@@ -1884,9 +1889,11 @@ builtinConcatStringsSep (VStr sep sepCtx) (VList cl) = do
   where
     forceToStrCtx thunk = do
       val <- force thunk
-      -- Nix coerces list elements to strings (paths, derivations, etc.).
-      -- concatStringsSep is strict (coerceMore=False): non-string scalars error.
-      coerceToString False force applyValue val
+      -- Nix 2.24's coerceToString defaults copyToStore=true and
+      -- concatStringsSep passes no override, so a path element is copied into
+      -- the store and the result carries its SCPlain context.  Non-string
+      -- scalars still error (coerceMore=False), matching interpolation.
+      coerceToStringInterp val
 builtinConcatStringsSep (VStr _ _) other =
   throwEvalError ("builtins.concatStringsSep: expected a list, got " <> typeName other)
 builtinConcatStringsSep other _ =
@@ -1992,11 +1999,17 @@ coerceToStringInterp other = coerceToString False force applyValue other
 -- SCPlain context - the copy-to-store coercion shared by interpolation,
 -- derivation arguments/env values, and @builtins.toJSON@.
 sourcePathWithContext :: (MonadEval m) => Text -> m (Text, StringContext)
-sourcePathWithContext p = do
-  spText <- storeSourcePath p
-  case parseStorePath defaultStoreDir spText of
-    Just sp -> pure (spText, StringContext (Set.singleton (SCPlain sp)))
-    Nothing -> pure (spText, mempty)
+sourcePathWithContext p
+  -- An already-in-store path coerces to itself with an SCPlain (Opaque)
+  -- reference - never re-copied.  This is the shared choke point for
+  -- interpolation, derivation args, concatStringsSep, and toJSON, so all of
+  -- them inherit the in-store short-circuit (and the Windows re-NAR fix).
+  | Just sp <- enclosingStorePath p = pure (p, plainContext sp)
+  | otherwise = do
+      spText <- storeSourcePath p
+      case parseStorePath defaultStoreDir spText of
+        Just sp -> pure (spText, plainContext sp)
+        Nothing -> pure (spText, mempty)
 
 -- | The current system platform string.
 currentSystemStr :: Text
@@ -2048,17 +2061,54 @@ builtinDiscardContext (VStr s _) = pure (mkStr s)
 builtinDiscardContext other =
   throwEvalError ("builtins.unsafeDiscardStringContext: expected a string, got " <> typeName other)
 
--- | Strip only derivation output dependencies (SCDrvOutput, SCAllOutputs),
--- keeping plain store path references (SCPlain).
+-- | @builtins.unsafeDiscardOutputDependency@ - downgrade all-outputs (DrvDeep)
+-- references to a plain (Opaque) reference on the same @.drv@ path, and KEEP
+-- derivation-output (Built) references unchanged, matching upstream.  It
+-- formerly dropped both kinds and kept only plain references, losing the
+-- @.drv@ reference the downgrade must preserve.  'Set.map' also folds a
+-- downgraded element into an existing plain reference on the same path.
 builtinDiscardOutputDep :: (MonadEval m) => NixValue -> m NixValue
 builtinDiscardOutputDep (VStr s (StringContext ctx)) =
-  let kept = Set.filter isPlain ctx
-   in pure (VStr s (StringContext kept))
+  pure (VStr s (StringContext (Set.map downgrade ctx)))
   where
-    isPlain (SCPlain _) = True
-    isPlain _ = False
+    downgrade (SCAllOutputs sp) = SCPlain sp
+    downgrade other = other
 builtinDiscardOutputDep other =
   throwEvalError ("builtins.unsafeDiscardOutputDependency: expected a string, got " <> typeName other)
+
+-- | @builtins.addDrvOutputDependencies@ - the inverse of the
+-- 'builtinDiscardOutputDep' downgrade for a single element: upgrade a plain
+-- (Opaque) reference to a @.drv@ path into an all-outputs (DrvDeep) reference.
+-- Upstream requires the string's context to have exactly one element and
+-- errors on a derivation-output (Built) element or a non-@.drv@ plain path.
+builtinAddDrvOutputDeps :: (MonadEval m) => NixValue -> m NixValue
+builtinAddDrvOutputDeps (VStr s (StringContext ctx)) =
+  case Set.toList ctx of
+    [only] -> VStr s . StringContext . Set.singleton <$> upgrade only
+    _ ->
+      throwEvalError
+        ( "builtins.addDrvOutputDependencies: the string must have exactly one "
+            <> "context element, but has "
+            <> T.pack (show (Set.size ctx))
+        )
+  where
+    upgrade (SCPlain sp)
+      | ".drv" `T.isSuffixOf` spName sp = pure (SCAllOutputs sp)
+      | otherwise =
+          throwEvalError
+            ( "builtins.addDrvOutputDependencies: path "
+                <> storePathToText defaultStoreDir sp
+                <> " is not a derivation"
+            )
+    upgrade (SCAllOutputs sp) = pure (SCAllOutputs sp)
+    upgrade (SCDrvOutput _ outName) =
+      throwEvalError
+        ( "builtins.addDrvOutputDependencies: can only act on derivations, not "
+            <> "on a derivation output such as "
+            <> outName
+        )
+builtinAddDrvOutputDeps other =
+  throwEvalError ("builtins.addDrvOutputDependencies: expected a string, got " <> typeName other)
 
 -- | Check whether a string has any context elements.
 builtinHasContext :: (MonadEval m) => NixValue -> m NixValue
@@ -2097,11 +2147,14 @@ groupContextByPath = foldl' addElement Map.empty
       Map.insertWith mergeEntry (spToText sp) (ContextEntry False False [outName]) acc
     addElement acc (SCAllOutputs sp) =
       Map.insertWith mergeEntry (spToText sp) (ContextEntry False True []) acc
+    -- 'Set.toList' feeds elements in ascending order and 'old' holds the
+    -- earlier (smaller) output names, so 'old ++ new' keeps the rendered
+    -- outputs list ascending, as upstream getContext produces it.
     mergeEntry new old =
       ContextEntry
         (cePath new || cePath old)
         (ceAllOutputs new || ceAllOutputs old)
-        (ceOutputs new ++ ceOutputs old)
+        (ceOutputs old ++ ceOutputs new)
     -- Context keys are identity, not IO: always the canonical /nix/store
     -- spelling, never the platform file-path mapping.
     spToText = storePathToText defaultStoreDir
@@ -2677,7 +2730,10 @@ valueToJSON VNull = pure ("null", emptyContext)
 valueToJSON (VBool True) = pure ("true", emptyContext)
 valueToJSON (VBool False) = pure ("false", emptyContext)
 valueToJSON (VInt n) = pure (T.pack (show n), emptyContext)
-valueToJSON (VFloat f) = pure (formatNixFloat f, emptyContext)
+valueToJSON (VFloat f)
+  -- upstream's serializer (nlohmann dump) writes a non-finite float as null
+  | isNaN f || isInfinite f = pure ("null", emptyContext)
+  | otherwise = pure (formatJsonFloat f, emptyContext)
 valueToJSON (VStr s ctx) = pure (jsonEscapeString s, ctx)
 valueToJSON (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
@@ -2831,9 +2887,19 @@ parseJSONNumber t =
             then case reads (T.unpack numStr) :: [(Double, String)] of
               [(d, "")] -> Just (VFloat d, rest)
               _ -> Nothing
-            else case reads (T.unpack numStr) :: [(Int64, String)] of
-              [(n, "")] -> Just (VInt n, rest)
+            else case reads (T.unpack numStr) :: [(Integer, String)] of
+              [(n, "")] -> Just (jsonInteger n, rest)
               _ -> Nothing
+
+-- | Nix value for a JSON integer literal, as upstream's nlohmann-based
+-- parser produces it: a value in int64 range is an int; a positive value
+-- that fits only uint64 still arrives as an int (nlohmann hands it over
+-- unsigned, upstream stores it into the signed NixInt, two's-complement);
+-- anything wider than 64 bits falls back to a float.
+jsonInteger :: Integer -> NixValue
+jsonInteger n
+  | n >= toInteger (minBound :: Int64) && n <= toInteger (maxBound :: Word64) = VInt (fromInteger n)
+  | otherwise = VFloat (fromInteger n)
 
 parseJSONArray :: Text -> Maybe (NixValue, Text)
 parseJSONArray t = parseJSONArrayElements (T.stripStart t) []
@@ -3035,7 +3101,8 @@ builtinToPath :: (MonadEval m) => NixValue -> m NixValue
 builtinToPath (VPath p) = pure (VPath p)
 builtinToPath (VStr s _) = case T.uncons s of
   Nothing -> throwEvalError "builtins.toPath: empty path"
-  Just ('/', _) -> pure (VPath s)
+  -- Canonicalized like every other path production site, as upstream.
+  Just ('/', _) -> pure (VPath (canonPath s))
   Just _ -> throwEvalError ("builtins.toPath: path must be absolute, got " <> s)
 builtinToPath other =
   throwEvalError ("builtins.toPath: expected a string or path, got " <> typeName other)
@@ -3055,16 +3122,32 @@ builtinStorePath (VStr s _) = validateStorePath s
 builtinStorePath other =
   throwEvalError ("builtins.storePath: expected a path or string, got " <> typeName other)
 
+-- | @builtins.storePath@ - mark an already-in-store path as such.  Upstream
+-- returns a STRING carrying an Opaque (SCPlain) context entry for the enclosing
+-- store path, NOT a bare path: the Opaque marker is what stops a later coercion
+-- from re-serialising (re-NARing) the already-present path into a new store
+-- path.  Returning a context-free path (the old behavior) re-copied the path on
+-- coercion - a wrong store path on Unix, and a file-not-found on Windows, where
+-- the canonical @/nix/store@ text is not the on-disk location.
 validateStorePath :: (MonadEval m) => Text -> m NixValue
-validateStorePath p
-  | storeDirPrefix `T.isPrefixOf` p,
-    T.length p > T.length storeDirPrefix,
-    let basename = T.drop (T.length storeDirPrefix) p,
-    T.length basename >= 33,
-    Just ('-', _) <- T.uncons (T.drop 32 basename) =
-      pure (VPath p)
-  | otherwise =
-      throwEvalError ("builtins.storePath: not a valid store path: " <> p)
+validateStorePath p = case enclosingStorePath p of
+  Just sp -> pure (VStr p (plainContext sp))
+  Nothing -> throwEvalError ("builtins.storePath: not a valid store path: " <> p)
+
+-- | The store path enclosing an absolute path under the store dir, or
+-- 'Nothing' if the path is not in the store.  Accepts a bare store path and a
+-- subpath (@\/nix\/store\/\<hash\>-\<name\>\/sub@ resolves to its
+-- @\<hash\>-\<name\>@ component), the way upstream marks the enclosing store
+-- path Opaque for either.
+enclosingStorePath :: Text -> Maybe StorePath
+enclosingStorePath p = do
+  rest <- T.stripPrefix storeDirPrefix p
+  let component = T.takeWhile (/= '/') rest
+      (hash, hyphenName) = T.splitAt 32 component
+  (hyphen, name) <- T.uncons hyphenName
+  if hyphen == '-' && not (T.null name) && T.length hash == 32
+    then Just (StorePath hash name)
+    else Nothing
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - Nix search path
@@ -3111,14 +3194,14 @@ findFirst [] name =
 findFirst ((prefix, path) : rest) name
   | prefix == name || (not (T.null prefix) && (prefix <> "/") `T.isPrefixOf` name) =
       let suffix = if prefix == name then "" else T.drop (T.length prefix + 1) name
-          candidate = if T.null suffix then path else path <> "/" <> suffix
+          candidate = canonPath (if T.null suffix then path else path <> "/" <> suffix)
        in do
             exists <- doesPathExist candidate
             if exists
               then pure (VPath candidate)
               else findFirst rest name
   | T.null prefix =
-      let candidate = path <> "/" <> name
+      let candidate = canonPath (path <> "/" <> name)
        in do
             exists <- doesPathExist candidate
             if exists
@@ -3328,6 +3411,84 @@ forceOptionalAttrStr attrs key =
 -- Builtin implementations - derivation construction
 -- ---------------------------------------------------------------------------
 
+-- | Resolve an input derivation's modulo hash (hex) for the ATerm substitution
+-- 'toATermForHash' performs.  The drv-hash cache is populated bottom-up as each
+-- derivation is evaluated, so an in-session input hits directly.  A miss - a
+-- cross-session reference, or a path fabricated by @builtins.appendContext@ -
+-- reads the input @.drv@ from the store and recurses, exactly as upstream
+-- @hashDerivationModulo@ does.  A miss whose @.drv@ cannot be read (pure
+-- evaluation, or a @.drv@ absent from the store) fails loudly: a divergent
+-- derivation hash is never emitted from a guessed input hash.  Reading the
+-- store is an effect, so hashing a dependent derivation is an IO-evaluator
+-- capability - pure evaluation, which cannot read the store, cannot do it.
+resolveInputModulo :: (MonadEval m) => (StorePath, [Text]) -> m (Text, [Text])
+resolveInputModulo (sp, outs) = do
+  let inputPathText = storePathToText defaultStoreDir sp
+  cached <- lookupDrvHash inputPathText
+  case cached of
+    Just hex -> pure (hex, outs)
+    Nothing -> do
+      mDrv <- readStoreDerivation sp
+      case mDrv of
+        Just inputDrv -> do
+          hex <- derivationModuloHex inputDrv
+          cacheDrvHash inputPathText hex
+          pure (hex, outs)
+        Nothing ->
+          throwEvalError
+            ( "derivation: cannot compute the input-derivation modulo hash for "
+                <> inputPathText
+                <> " - it was not evaluated in this session and its .drv is not "
+                <> "readable from the store (dependent-derivation hashing needs the IO evaluator)"
+            )
+
+-- | The derivation-modulo hash (hex) of a derivation, matching upstream
+-- @hashDerivationModulo@: a fixed-output derivation hashes the
+-- @fixed:out:\<algo\>:\<hash\>:\<path\>@ form; an input-addressed derivation
+-- substitutes each input's modulo hash into its ATerm and hashes that.  These
+-- are the same two rules 'builtinDerivationStrict' applies when it first
+-- computes a derivation's hash, so a store-read input yields the value it had
+-- in-session.
+derivationModuloHex :: (MonadEval m) => Derivation -> m Text
+derivationModuloHex drv = case drvOutputs drv of
+  [DerivationOutput "out" outPath algoField hashHex]
+    | not (T.null algoField) && not (T.null hashHex) ->
+        let outPathText = storePathToText defaultStoreDir outPath
+            fixedForm = "fixed:out:" <> algoField <> ":" <> hashHex <> ":" <> outPathText
+         in pure (bytesToHexText (sha256Digest (TE.encodeUtf8 fixedForm)))
+  _ -> do
+    inputSubst <- mapM resolveInputModulo (Map.toList (drvInputDrvs drv))
+    pure (bytesToHexText (sha256Digest (TE.encodeUtf8 (toATermForHash False (Just inputSubst) drv))))
+
+-- | The full output-name list of an all-outputs (upstream DrvDeep) reference:
+-- every output name of the referenced @.drv@, which upstream's derivationStrict
+-- inserts into the consuming derivation's inputDrvs.  Mirrors the
+-- 'resolveInputModulo' ladder - an in-session derivation from the recorded
+-- ATerm ('lookupSessionDrv'), else a cross-session @.drv@ read from the store
+-- ('readStoreDerivation'), else a loud error rather than a dropped reference
+-- (which would under-hash the dependent).  Pure evaluation can read neither
+-- source, so a dependent carrying an all-outputs reference errors there,
+-- consistent with dependent-derivation hashing being an IO-evaluator capability.
+resolveAllOutputNames :: (MonadEval m) => StorePath -> m [Text]
+resolveAllOutputNames sp = do
+  let drvPathText = storePathToText defaultStoreDir sp
+  session <- lookupSessionDrv drvPathText
+  case session of
+    Just drv -> pure (outputNamesOf drv)
+    Nothing -> do
+      onDisk <- readStoreDerivation sp
+      case onDisk of
+        Just drv -> pure (outputNamesOf drv)
+        Nothing ->
+          throwEvalError
+            ( "derivation: cannot resolve the output names of the all-outputs reference "
+                <> drvPathText
+                <> " - it was not evaluated in this session and its .drv is not "
+                <> "readable from the store (all-outputs references need the IO evaluator)"
+            )
+  where
+    outputNamesOf = map doName . drvOutputs
+
 -- | Eager derivation computation - @builtins.derivationStrict@.  Forces all
 -- input attrs into env vars, content-hashes, and returns the full derivation
 -- attrset (drvPath, outPath, per-output, _derivation).  Called LAZILY by the
@@ -3386,8 +3547,17 @@ builtinDerivationStrict (VAttrs attrs) = do
   (drvEnvPairs, envContext) <- collectDrvEnvWithContext ignoreNulls (Map.delete "__ignoreNulls" (Map.delete "args" materialized))
 
   let fullContext = envContext <> argsContext
-      inputDrvs = extractInputDrvs fullContext
+      builtInputDrvs = extractInputDrvs fullContext
       inputSrcs = extractInputSrcs fullContext
+      allOutputRefs = extractAllOutputRefs fullContext
+  -- All-outputs (DrvDeep) references - e.g. an embedded @dep.drvPath@ - add the
+  -- referenced .drv to inputDrvs with ALL its output names, as upstream's
+  -- derivationStrict does.  Merged in BEFORE drvRefs and the modulo
+  -- substitution so both the dependent's own .drv hash and its output paths
+  -- account for the reference.
+  deepInputDrvs <-
+    Map.fromList <$> mapM (\drvSp -> (,) drvSp <$> resolveAllOutputNames drvSp) allOutputRefs
+  let inputDrvs = Map.unionWith (++) builtInputDrvs deepInputDrvs
       platform = textToPlatform system
       baseEnv = Map.fromList drvEnvPairs
       drvRefs = inputSrcs ++ Map.keys inputDrvs
@@ -3405,22 +3575,6 @@ builtinDerivationStrict (VAttrs attrs) = do
           }
       -- Output carrying only its name; the path is masked at render time.
       maskedOutput name = DerivationOutput name (StorePath "" "") "" ""
-      -- Resolve an input derivation's modulo hash (hex) from the cache,
-      -- populated bottom-up by earlier 'builtinDerivationStrict' calls.
-      resolveInputModulo (sp, outs) = do
-        let inputPathText = storePathToText defaultStoreDir sp
-        cached <- lookupDrvHash inputPathText
-        case cached of
-          Just hex -> pure (hex, outs)
-          Nothing -> do
-            -- Eval is bottom-up, so inputs evaluated this session are always
-            -- cached by the time a dependent hashes.  A miss means an input
-            -- referenced but not evaluated here (a pure-eval synthetic context,
-            -- or a pre-built store drv): fall back to its store hash so
-            -- evaluation still produces a value, and warn for visibility.
-            traceMessage
-              ("derivation: input modulo hash not cached, using store hash for " <> inputPathText)
-            pure (spHash sp, outs)
 
   -- Fixed-output derivations (fetchurl etc.) are content-addressed and hash
   -- via the @fixed:out:@ scheme; input-addressed derivations recurse through
@@ -3708,13 +3862,27 @@ decodeHashInput attrs hashStr
       algo <- requireStrAttr "convertHash" "hashAlgo" attrs
       decodeWithAlgo algo hashStr
 
--- | Try to decode as hex, then nix32, then base64.
+-- | Decode a bare hash string for a known algorithm, keyed by length as
+-- upstream (@hash.cc@ @Hash@ parsing): an algorithm's base16, nix32, and
+-- base64 spellings have pairwise distinct lengths, so the input length
+-- selects the decoder and every other length is an error.  Trying decoders
+-- in sequence instead mis-reads edge inputs - an all-hex-digit string of
+-- nix32 length is a nix32 hash, and a truncated hash must be rejected, not
+-- decoded by whichever shorter format happens to accept it.
 decodeWithAlgo :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
-decodeWithAlgo algo s
-  | Just bytes <- hexToBytes s = pure (algo, bytes)
-  | Right bytes <- Nix32.decode s = pure (algo, bytes)
-  | Right bytes <- decodeBase64Pure s = pure (algo, bytes)
-  | otherwise = throwEvalError ("builtins.convertHash: cannot decode hash '" <> s <> "'")
+decodeWithAlgo algo s = case hashAlgoBytes algo of
+  Nothing -> throwEvalError ("unknown hash algorithm '" <> algo <> "'")
+  Just size
+    | T.length s == hexHashLen size -> accept size "base16" (hexToBytes s)
+    | T.length s == nix32HashLen size -> accept size "nix32" (rightToMaybe (Nix32.decode s))
+    | T.length s == base64HashLen size -> accept size "base64" (rightToMaybe (decodeBase64Pure s))
+    | otherwise ->
+        throwEvalError ("hash '" <> s <> "' has wrong length for hash algorithm '" <> algo <> "'")
+  where
+    accept size spelling decoded = case decoded of
+      Just bytes | BS.length bytes == size -> pure (algo, bytes)
+      _ -> throwEvalError ("hash '" <> s <> "' is not a valid " <> spelling <> " " <> algo <> " hash")
+    rightToMaybe = either (const Nothing) Just
 
 -- | Parse @sha256-base64...@ SRI format.
 parseSRI :: Text -> Maybe (Text, Text)
@@ -4100,33 +4268,42 @@ parseInt :: Text -> Either Text TOMLValue
 parseInt t =
   let cleaned = T.filter (/= '_') t
       (sign, digits) = case T.uncons cleaned of
-        Just ('+', rest) -> (1, rest)
+        Just ('+', rest) -> (1 :: Integer, rest)
         Just ('-', rest) -> (-1, rest)
         _ -> (1, cleaned)
    in case readDecimal digits of
-        Just n -> Right (TOMLInt (sign * n))
+        Just n -> tomlInt t (sign * n)
         Nothing -> Left ("invalid integer: " <> t)
 
 parseHexInt :: Text -> Either Text TOMLValue
 parseHexInt t =
   let cleaned = T.filter (/= '_') t
    in case readHexT cleaned of
-        Just n -> Right (TOMLInt n)
+        Just n -> tomlInt t n
         Nothing -> Left ("invalid hex integer: " <> t)
 
 parseOctInt :: Text -> Either Text TOMLValue
 parseOctInt t =
   let cleaned = T.filter (/= '_') t
    in case readOctT cleaned of
-        Just n -> Right (TOMLInt n)
+        Just n -> tomlInt t n
         Nothing -> Left ("invalid octal integer: " <> t)
 
 parseBinInt :: Text -> Either Text TOMLValue
 parseBinInt t =
   let cleaned = T.filter (/= '_') t
    in case readBinT cleaned of
-        Just n -> Right (TOMLInt n)
+        Just n -> tomlInt t n
         Nothing -> Left ("invalid binary integer: " <> t)
+
+-- | Finish a parsed TOML integer: a value outside the 64-bit signed range
+-- is a parse error, as upstream's TOML parser reports - silently wrapping
+-- would hand the evaluator a different number than the document wrote.
+tomlInt :: Text -> Integer -> Either Text TOMLValue
+tomlInt original n
+  | n < toInteger (minBound :: Int64) || n > toInteger (maxBound :: Int64) =
+      Left ("integer out of 64-bit range: " <> original)
+  | otherwise = Right (TOMLInt (fromInteger n))
 
 parseFloat :: Text -> Either Text TOMLValue
 parseFloat t =
@@ -4135,27 +4312,31 @@ parseFloat t =
         Just d -> Right (TOMLFloat d)
         Nothing -> Left ("invalid float: " <> t)
 
--- | Read a decimal integer from Text.
-readDecimal :: Text -> Maybe Int64
+-- Digit readers accumulate an unbounded 'Integer'; 'tomlInt' applies the
+-- 64-bit range gate after any sign, so the minimum int64 (whose magnitude
+-- alone exceeds the maximum) still parses.
+
+-- | Read an unbounded decimal integer from Text.
+readDecimal :: Text -> Maybe Integer
 readDecimal t
   | T.null t = Nothing
   | T.all isDigit t = Just (T.foldl' (\acc c -> acc * 10 + fromIntegral (digitToInt c)) 0 t)
   | otherwise = Nothing
 
-readHexT :: Text -> Maybe Int64
+readHexT :: Text -> Maybe Integer
 readHexT t
   | T.null t = Nothing
   | T.all isHexDigit t = Just (T.foldl' (\acc c -> acc * 16 + fromIntegral (digitToInt c)) 0 t)
   | otherwise = Nothing
 
-readOctT :: Text -> Maybe Int64
+readOctT :: Text -> Maybe Integer
 readOctT t
   | T.null t = Nothing
   | T.all isOctDigit t =
       Just (T.foldl' (\acc c -> acc * 8 + fromIntegral (digitToInt c)) 0 t)
   | otherwise = Nothing
 
-readBinT :: Text -> Maybe Int64
+readBinT :: Text -> Maybe Integer
 readBinT t
   | T.null t = Nothing
   | T.all (\c -> c == '0' || c == '1') t =
@@ -4298,7 +4479,7 @@ valueToXML depth val = case val of
   VInt n ->
     pure (indent depth <> "<int value=\"" <> T.pack (show n) <> "\" />\n")
   VFloat d ->
-    pure (indent depth <> "<float value=\"" <> T.pack (show d) <> "\" />\n")
+    pure (indent depth <> "<float value=\"" <> formatXmlFloat d <> "\" />\n")
   VBool True ->
     pure (indent depth <> "<bool value=\"true\" />\n")
   VBool False ->

@@ -8,6 +8,8 @@ module Nix.Eval.StringInterp
   ( stripIndentedChunks,
     coerceToString,
     formatNixFloat,
+    formatJsonFloat,
+    formatXmlFloat,
   )
 where
 
@@ -15,7 +17,7 @@ import Data.List (foldl')
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.Types (MonadEval (..), NixValue (..), StringContext, Thunk, attrSetLookup, emptyContext, typeName)
-import Numeric (showFFloat)
+import Numeric (floatToDigits, showFFloat)
 
 -- | Force a thunk to a value.
 type Force m = Thunk -> m NixValue
@@ -134,3 +136,127 @@ formatNixFloat n
       | otherwise = s
     dropDot ('.' : rest) = rest
     dropDot xs = xs
+
+-- | Format a finite float exactly as the JSON serializer upstream links
+-- (nlohmann @to_chars@): shortest round-trip digits, laid out as plain
+-- decimal only while the decimal point lands within positions
+-- 'jsonMinPointPos'..'jsonMaxPointPos', a @.0@ suffix on integral values,
+-- and otherwise @d.ddde+XX@ with a signed exponent of at least two digits.
+-- Zero is @0.0@ (sign preserved).  Digits come from 'floatToDigits', which
+-- is always shortest; nlohmann's grisu2 can emit a longer-than-shortest
+-- form for rare values, an accepted divergence.  Non-finite input is the
+-- caller's concern (JSON spells it @null@).
+formatJsonFloat :: Double -> Text
+formatJsonFloat d
+  | isNegativeZero d = "-0.0"
+  | d == 0 = "0.0"
+  | d < 0 = "-" <> formatJsonFloat (negate d)
+  | otherwise =
+      let (digitList, pointPos) = floatToDigits 10 d
+          digits = concatMap show digitList
+       in T.pack (jsonFloatLayout digits (length digits) pointPos)
+
+-- | Positional layout of shortest digits with the decimal point at
+-- @pointPos@, replicating nlohmann's @format_buffer@ branch by branch.
+jsonFloatLayout :: String -> Int -> Int -> String
+jsonFloatLayout digits digitCount pointPos
+  -- Integral value with the point in plain range: digits, zeros, ".0".
+  | digitCount <= pointPos && pointPos <= jsonMaxPointPos =
+      digits <> replicate (pointPos - digitCount) '0' <> ".0"
+  -- Point falls inside the digit run.
+  | 0 < pointPos && pointPos <= jsonMaxPointPos =
+      take pointPos digits <> "." <> drop pointPos digits
+  -- Small magnitude: leading "0." and padding zeros.
+  | jsonMinPointPos < pointPos && pointPos <= 0 =
+      "0." <> replicate (negate pointPos) '0' <> digits
+  -- Scientific notation.
+  | otherwise = mantissa <> "e" <> signedExponent (pointPos - 1)
+  where
+    mantissa = case digits of
+      [single] -> [single]
+      lead : rest -> lead : '.' : rest
+      [] -> "0" -- unreachable: a positive double yields at least one digit
+
+-- | nlohmann @format_buffer@ bounds (@kMaxExp@ = double's @digits10@,
+-- @kMinExp@): plain decimal only while the decimal point position is in
+-- (-4, 15]; everything else is scientific.
+jsonMaxPointPos :: Int
+jsonMaxPointPos = 15
+
+-- | Lower point-position bound, exclusive.  See 'jsonMaxPointPos'.
+jsonMinPointPos :: Int
+jsonMinPointPos = -4
+
+-- | Exponent suffix shared by the JSON and XML float layouts: sign always
+-- present, magnitude zero-padded to at least two digits (@+05@, @-21@).
+signedExponent :: Int -> String
+signedExponent e
+  | e < 0 = '-' : padded (negate e)
+  | otherwise = '+' : padded e
+  where
+    padded n
+      | n < 10 = '0' : show n
+      | otherwise = show n
+
+-- | Format a float as upstream @toXML@ renders one - C++ @operator<<@ on a
+-- default-format ostream: 6 significant digits, trailing zeros stripped,
+-- plain decimal only for decimal exponents in [-4, 5], otherwise
+-- @d.ddde+XX@ with a signed exponent of at least two digits.  Rounding is
+-- half-even on the exact binary value, matching a correctly-rounded printf.
+formatXmlFloat :: Double -> Text
+formatXmlFloat d
+  | isNaN d = "nan"
+  | isInfinite d = if d > 0 then "inf" else "-inf"
+  | d == 0 = if isNegativeZero d then "-0" else "0"
+  | d < 0 = "-" <> formatXmlFloat (negate d)
+  | otherwise = T.pack (xmlFloatPositive d)
+
+-- | 6-significant-digit @%g@ layout of a positive finite double.
+xmlFloatPositive :: Double -> String
+xmlFloatPositive d =
+  let exact = toRational d
+      roughExp = decimalExponentOf exact
+      rounded = round (exact * 10 ^^ (xmlSigDigits - 1 - roughExp)) :: Integer
+      -- Rounding can carry into a new leading digit (999999.9 -> 1000000).
+      (sigDigits, pointExp) =
+        if rounded >= 10 ^ xmlSigDigits
+          then (rounded `div` 10, roughExp + 1)
+          else (rounded, roughExp)
+      digits = show sigDigits
+   in if xmlMinFixedExp <= pointExp && pointExp < xmlSigDigits
+        then fixedForm digits pointExp
+        else sciForm digits pointExp
+  where
+    fixedForm digits pointExp
+      | pointExp >= 0 =
+          let (intPart, fracPart) = splitAt (pointExp + 1) digits
+           in joinFraction intPart (stripTrailingZeros fracPart)
+      | otherwise =
+          joinFraction "0" (stripTrailingZeros (replicate (negate pointExp - 1) '0' <> digits))
+    sciForm digits pointExp =
+      joinFraction (take 1 digits) (stripTrailingZeros (drop 1 digits))
+        <> "e"
+        <> signedExponent pointExp
+    joinFraction intPart fracPart
+      | null fracPart = intPart
+      | otherwise = intPart <> "." <> fracPart
+    stripTrailingZeros = reverse . dropWhile (== '0') . reverse
+
+-- | @%g@ default precision: 6 significant digits.
+xmlSigDigits :: Int
+xmlSigDigits = 6
+
+-- | @%g@ switches to scientific below a decimal exponent of -4.
+xmlMinFixedExp :: Int
+xmlMinFixedExp = -4
+
+-- | The decimal exponent @e@ of a positive rational: the unique @e@ with
+-- @10^e <= r < 10^(e+1)@.  A float log gives the estimate; the exact
+-- comparisons correct it, since the log is off by one near powers of ten.
+decimalExponentOf :: Rational -> Int
+decimalExponentOf r = correct (floor (logBase 10 (fromRational r :: Double)))
+  where
+    correct e
+      | 10 ^^ e > r = correct (e - 1)
+      | 10 ^^ (e + 1) <= r = correct (e + 1)
+      | otherwise = e

@@ -17,6 +17,7 @@ module Nix.Eval.Context
     -- * Extraction (for derivation building)
     extractInputSrcs,
     extractInputDrvs,
+    extractAllOutputRefs,
 
     -- * String operations with context
     appendStrings,
@@ -70,6 +71,14 @@ extractInputSrcs (StringContext s) =
 extractInputDrvs :: StringContext -> Map StorePath [Text]
 extractInputDrvs (StringContext s) =
   Map.fromListWith (++) [(sp, [outName]) | SCDrvOutput sp outName <- Set.toList s]
+
+-- | Extract all-outputs (upstream DrvDeep) derivation references - the @.drv@
+-- store paths only.  Unlike 'extractInputDrvs', the output names are not
+-- carried by the context element; the caller reads the referenced derivation
+-- to recover its full set of output names.
+extractAllOutputRefs :: StringContext -> [StorePath]
+extractAllOutputRefs (StringContext s) =
+  [sp | SCAllOutputs sp <- Set.toList s]
 
 -- ---------------------------------------------------------------------------
 -- String operations with context
