@@ -25,6 +25,7 @@ on:
       - "data/**"
       - "nova-nix.cabal"
       - ".github/workflows/parity.yml"
+      - ".github/parity/**"
   pull_request:
     branches: [main]
     paths:
@@ -32,6 +33,8 @@ on:
       - "cbits/**"
       - "data/**"
       - "nova-nix.cabal"
+      - ".github/workflows/parity.yml"
+      - ".github/parity/**"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -89,13 +92,43 @@ jobs:
           echo "nova-nix: $NOVA"
           echo "NOVA=$NOVA" >> "$GITHUB_ENV"
 
+      # A dependent derivation with a multi-output input: anchors the
+      # input-derivation-modulo substitution (and output-name sorting)
+      # against upstream, which run-to-run determinism alone cannot - a
+      # consistently wrong hash would also be deterministic.
+      - name: Upstream Nix dependent drvPath (the oracle)
+        run: |
+          DEPREF=$(nix-instantiate "$PWD/.github/parity/dependent.nix")
+          echo "upstream dependent: $DEPREF"
+          echo "DEPREF=$DEPREF" >> "$GITHUB_ENV"
+
+      - name: nova-nix dependent drvPath
+        run: |
+          RAW=$(cabal run -v0 nova-nix -- eval \
+            --expr "(import $PWD/.github/parity/dependent.nix).drvPath")
+          DEPNOVA=$(printf '%s' "$RAW" | tr -d '"' | tail -n1)
+          echo "nova-nix dependent: $DEPNOVA"
+          echo "DEPNOVA=$DEPNOVA" >> "$GITHUB_ENV"
+
       - name: Compare
         run: |
           echo "upstream nix : $REF"
           echo "nova-nix     : $NOVA"
+          echo "upstream dep : $DEPREF"
+          echo "nova-nix dep : $DEPNOVA"
+          FAIL=0
           if [ "$REF" = "$NOVA" ]; then
             echo "::notice title=Parity OK::nova-nix hello.drvPath byte-matches upstream Nix"
           else
             echo "::error title=Parity mismatch::nova-nix and upstream Nix disagree on hello.drvPath"
+            FAIL=1
+          fi
+          if [ "$DEPREF" = "$DEPNOVA" ]; then
+            echo "::notice title=Parity OK::dependent drvPath byte-matches upstream Nix"
+          else
+            echo "::error title=Parity mismatch::nova-nix and upstream Nix disagree on the dependent drvPath"
+            FAIL=1
+          fi
+          if [ "$FAIL" = "1" ]; then
             exit 1
           fi
