@@ -21,10 +21,13 @@ module Main (main) where
 
 import Control.Exception (IOException, displayException, try)
 import Control.Monad (void, (>=>))
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BC
 import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
@@ -32,7 +35,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), toATerm)
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
-import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
+import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
 import Nix.Store (Store (..), closeStore, materializeEvalSources, openStore, queryAllValidPaths, writeDrv, writeDrvAterm)
@@ -280,7 +283,9 @@ evalExprAterm extraPaths dataDir source =
           exitFailure
         Right val -> do
           (drv, _) <- extractDerivation val
-          TIO.putStrLn (toATerm drv)
+          -- Raw ATerm bytes (BC.putStrLn bypasses the handle encoding),
+          -- so the printed .drv diffs byte-exactly against upstream's.
+          BC.putStrLn (toATerm drv)
 
 -- | Parse, evaluate, extract derivation, build, and print result.
 -- The file argument is canonicalized for the same reason as in 'evalFile'.
@@ -352,12 +357,16 @@ extractDerivation (VAttrs attrs) = do
       exitFailure
   -- Extract drvPath - this is the store path of the .drv file itself,
   -- computed by hashing the ATerm serialization during evaluation.
+  -- Store paths are ASCII, so the byte payload decodes strictly.
   drvSP <- case attrSetLookup "drvPath" attrs of
-    Just thunk | Just (VStr path _) <- readThunkValue thunk -> case parseStorePath defaultStoreDir path of
-      Just sp -> pure sp
-      Nothing -> do
-        TIO.hPutStrLn stderr ("error: invalid drvPath: " <> path)
-        exitFailure
+    Just thunk
+      | Just (VStr pathBytes _) <- readThunkValue thunk,
+        Right path <- TE.decodeUtf8' pathBytes ->
+          case parseStorePath defaultStoreDir path of
+            Just sp -> pure sp
+            Nothing -> do
+              TIO.hPutStrLn stderr ("error: invalid drvPath: " <> path)
+              exitFailure
     _ -> do
       hPutStrLn stderr "error: derivation result missing drvPath"
       exitFailure
@@ -393,7 +402,7 @@ substituterConfig (Just url) (Just key) =
 -- | Write the .drv file to the store and build with dependency resolution.
 -- The drvPath is the store path of the .drv file itself, extracted from
 -- the evaluation result alongside the Derivation struct.
-buildAndRegister :: Store -> [CacheConfig] -> Map.Map T.Text T.Text -> Derivation -> StorePath -> IO BuildResult
+buildAndRegister :: Store -> [CacheConfig] -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
 buildAndRegister store caches drvClosure drv drvSP = do
   -- Materialize the full input-.drv closure (every transitive dependency's
   -- recipe) to the store.  buildWithDeps reads these back to construct the
@@ -493,7 +502,7 @@ failWith msg = do
 -- | Write every recorded @.drv@ ATerm (keyed by its store-path text) to the
 -- store.  Keys come from evaluation via 'storePathToText' so they always parse;
 -- an unparseable key is skipped defensively.
-writeDrvClosure :: Store -> Map.Map T.Text T.Text -> IO ()
+writeDrvClosure :: Store -> Map.Map T.Text BS.ByteString -> IO ()
 writeDrvClosure store = mapM_ writeOne . Map.toList
   where
     writeOne (pathText, aterm) =
@@ -537,7 +546,7 @@ prettyValue (VFloat f) = T.pack (show f)
 prettyValue (VBool True) = "true"
 prettyValue (VBool False) = "false"
 prettyValue VNull = "null"
-prettyValue (VStr s _) = "\"" <> escapeNixString s <> "\""
+prettyValue (VStr s _) = "\"" <> escapeNixString (bytesToTextLossy s) <> "\""
 prettyValue (VPath p) = p
 prettyValue (VList cl) =
   "[ " <> T.intercalate " " (map (prettyThunk . Thunk) (clistThunks cl)) <> " ]"

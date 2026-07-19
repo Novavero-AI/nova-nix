@@ -13,9 +13,13 @@ module Nix.Eval.StringInterp
   )
 where
 
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BC
 import Data.List (foldl')
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Nix.Eval.Types (MonadEval (..), NixValue (..), StringContext, Thunk, attrSetLookup, emptyContext, typeName)
 import Numeric (floatToDigits, showFFloat)
 
@@ -26,31 +30,34 @@ type Force m = Thunk -> m NixValue
 type Apply m = NixValue -> NixValue -> m NixValue
 
 -- | Strip the common indentation from already-evaluated indented-string chunks.
--- Each chunk is @(isLiteral, text, context)@.  Indentation is computed and
+-- Each chunk is @(isLiteral, bytes, context)@.  Indentation is computed and
 -- stripped from the LITERAL chunks only - interpolated chunks are opaque content
 -- - the single leading newline is dropped, and the trailing newline is kept.
 -- This matches C++ Nix, which strips at the string-part level (so a multi-line
--- interpolated value cannot drag the common indent down).
-stripIndentedChunks :: [(Bool, Text, StringContext)] -> (Text, StringContext)
+-- interpolated value cannot drag the common indent down).  The scan is
+-- byte-level via the Char8 view: it only ever compares against space, tab,
+-- and newline, which are single bytes in UTF-8 and never occur inside a
+-- multi-byte sequence, so multi-byte content passes through untouched.
+stripIndentedChunks :: [(Bool, ByteString, StringContext)] -> (ByteString, StringContext)
 stripIndentedChunks chunks =
   let stripped = dropLeadingNL (chunksStrip (chunksMinIndent chunks) chunks)
-   in (T.concat (map snd stripped), mconcat [c | (_, _, c) <- chunks])
+   in (BS.concat (map snd stripped), mconcat [c | (_, _, c) <- chunks])
   where
     dropLeadingNL ((True, t) : rest) =
-      (True, case T.uncons t of { Just ('\n', r) -> r; _ -> t }) : rest
+      (True, case BC.uncons t of { Just ('\n', r) -> r; _ -> t }) : rest
     dropLeadingNL other = other
 
 -- | Common indentation across the LITERAL chunks.  An interpolation at line
 -- start fixes that line's indent at the preceding literal whitespace and counts
 -- as content; whitespace-only lines do not contribute.
-chunksMinIndent :: [(Bool, Text, StringContext)] -> Int
+chunksMinIndent :: [(Bool, ByteString, StringContext)] -> Int
 chunksMinIndent = result . foldl' stepChunk (True, 0, Nothing)
   where
     result (_, _, Nothing) = 0
     result (_, _, Just m) = m
     stepChunk (atStart, cur, mi) (isLit, t, _)
       | not isLit = if atStart then (False, cur, bump mi cur) else (False, cur, mi)
-      | otherwise = T.foldl' stepChar (atStart, cur, mi) t
+      | otherwise = BC.foldl' stepChar (atStart, cur, mi) t
     stepChar (atStart, cur, mi) c
       | atStart && (c == ' ' || c == '\t') = (True, cur + 1, mi)
       | atStart && c == '\n' = (True, 0, mi)
@@ -62,14 +69,14 @@ chunksMinIndent = result . foldl' stepChunk (True, 0, Nothing)
 
 -- | Strip @n@ columns of leading indentation from each line of the literal
 -- chunks; interpolated chunks are emitted verbatim and reset the line position.
-chunksStrip :: Int -> [(Bool, Text, StringContext)] -> [(Bool, Text)]
+chunksStrip :: Int -> [(Bool, ByteString, StringContext)] -> [(Bool, ByteString)]
 chunksStrip n = go True 0
   where
     go _ _ [] = []
     go _ _ ((False, t, _) : rest) = (False, t) : go False 0 rest
     go atStart dropped ((True, t, _) : rest) =
-      let (acc, atStart', dropped') = T.foldl' stepC ([], atStart, dropped) t
-       in (True, T.pack (reverse acc)) : go atStart' dropped' rest
+      let (acc, advancedStart, advancedDrop) = BC.foldl' stepC ([], atStart, dropped) t
+       in (True, BC.pack (reverse acc)) : go advancedStart advancedDrop rest
     stepC (acc, atStart, dropped) c
       | atStart && (c == ' ' || c == '\t') =
           if dropped < n then (acc, True, dropped + 1) else (c : acc, True, dropped + 1)
@@ -78,7 +85,7 @@ chunksStrip n = go True 0
       | c == '\n' = ('\n' : acc, True, 0)
       | otherwise = (c : acc, False, dropped)
 
--- | Coerce a Nix value to a string.
+-- | Coerce a Nix value to a (byte) string.
 --
 -- The @coerceMore@ flag mirrors C++ Nix's @coerceToString@ argument: when
 -- 'True' (e.g. @builtins.toString@, derivation-env values) ints, floats, bools
@@ -86,11 +93,11 @@ chunksStrip n = go True 0
 -- @builtins.concatStringsSep@) those are type errors, matching C++ Nix.
 -- Strings, paths, and attribute sets with @__toString@/@outPath@ coerce in
 -- both modes; lists and bare functions are always errors.
-coerceToString :: (MonadEval m) => Bool -> Force m -> Apply m -> NixValue -> m (Text, StringContext)
+coerceToString :: (MonadEval m) => Bool -> Force m -> Apply m -> NixValue -> m (ByteString, StringContext)
 coerceToString _ _ _ (VStr s ctx) = pure (s, ctx)
-coerceToString _ _ _ (VPath p) = pure (p, emptyContext)
-coerceToString True _ _ (VInt n) = pure (T.pack (show n), emptyContext)
-coerceToString True _ _ (VFloat n) = pure (formatNixFloatFixed n, emptyContext)
+coerceToString _ _ _ (VPath p) = pure (TE.encodeUtf8 p, emptyContext)
+coerceToString True _ _ (VInt n) = pure (BC.pack (show n), emptyContext)
+coerceToString True _ _ (VFloat n) = pure (TE.encodeUtf8 (formatNixFloatFixed n), emptyContext)
 coerceToString True _ _ VNull = pure ("", emptyContext)
 coerceToString True _ _ (VBool True) = pure ("1", emptyContext)
 coerceToString True _ _ (VBool False) = pure ("", emptyContext)

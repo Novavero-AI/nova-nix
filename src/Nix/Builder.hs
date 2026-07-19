@@ -56,6 +56,8 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
@@ -100,7 +102,8 @@ envPath = "PATH"
 -- | The magic builder string for the built-in URL fetcher.  A derivation with
 -- this builder is not executed as a process - the Builder downloads its @url@
 -- and verifies it against @outputHash@ (see 'runBuiltinFetchurl').
-builtinFetchurlBuilder :: Text
+-- Bytes, matching the 'drvBuilder' field it is compared against.
+builtinFetchurlBuilder :: BS.ByteString
 builtinFetchurlBuilder = "builtin:fetchurl"
 
 -- | Derivation environment keys read by @builtin:fetchurl@.
@@ -216,20 +219,23 @@ buildDerivationInner config store drv = do
         --    is responsible for creating $out, $dev, etc.)
         let outputDirs = [(doName out, buildDir </> T.unpack (doName out)) | out <- drvOutputs drv]
 
-        -- 4. Set up environment
-        let builderPath = T.unpack (drvBuilder drv)
-            environ = buildEnvironment config drv builderPath buildDir outputDirs
-
-            -- 5. Run the builder
-            builderArgs = map T.unpack (drvArgs drv)
-        -- A "builtin:" builder (e.g. builtin:fetchurl) is handled in-process;
-        -- everything else is a normal subprocess.  The output validation and
-        -- registration below are shared by both paths.
+        -- 4. Decode builder/args/env for the spawn boundary.  Derivation
+        --    strings are BYTES (identity); spawning a process needs real
+        --    text, so invalid UTF-8 in any of them is a clean build
+        --    failure, never a mojibake spawn.  The builtin builders skip
+        --    this - they read the byte fields directly.
         exitResult <- case drvBuilder drv of
           b
             | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
             | b == builtinUnpackBuilder -> runBuiltinUnpack drv outputDirs
-          _ -> runBuilder builderPath builderArgs environ buildDir
+          _ -> case decodeBuilderStrings drv of
+            Left errMsg -> pure (Left (1, errMsg))
+            Right (builderText, argTexts, decodedEnv) ->
+              let builderPath = T.unpack builderText
+                  environ = buildEnvironment config decodedEnv builderPath buildDir outputDirs
+                  builderArgs = map T.unpack argTexts
+               in -- 5. Run the builder
+                  runBuilder builderPath builderArgs environ buildDir
         case exitResult of
           Left (exitCode, stderrText) ->
             pure (BuildFailure ("builder failed: " <> stderrText) exitCode)
@@ -244,6 +250,23 @@ buildDerivationInner config store drv = do
               _ -> do
                 let names = T.intercalate ", " (map fst missing)
                 pure (BuildFailure ("builder succeeded but outputs missing: " <> names) 1)
+
+-- | Decode a derivation's builder path, arguments, and env values from
+-- their identity bytes to the 'Text' the process-spawn boundary needs.
+-- @Left@ names the offending field.
+decodeBuilderStrings :: Derivation -> Either Text (Text, [Text], Map Text Text)
+decodeBuilderStrings drv = do
+  builderText <- decodeField "the builder path" (drvBuilder drv)
+  argTexts <- traverse (decodeField "a builder argument") (drvArgs drv)
+  envTexts <-
+    Map.traverseWithKey
+      (\key val -> decodeField ("environment variable '" <> key <> "'") val)
+      (drvEnv drv)
+  pure (builderText, argTexts, envTexts)
+  where
+    decodeField what bytes = case TE.decodeUtf8' bytes of
+      Right t -> Right t
+      Left _ -> Left ("cannot spawn builder: " <> what <> " contains invalid UTF-8")
 
 -- ---------------------------------------------------------------------------
 -- Input validation
@@ -328,14 +351,15 @@ cleanupBuildDir dir = do
 -- store paths from declared build dependencies.
 buildEnvironment ::
   BuildConfig ->
-  Derivation ->
+  Map Text Text ->
   FilePath ->
   FilePath ->
   [(Text, FilePath)] ->
   Map Text Text
-buildEnvironment config drv builderPath buildDir outputDirs =
-  let -- Start with derivation environment
-      baseEnv = drvEnv drv
+buildEnvironment config decodedEnv builderPath buildDir outputDirs =
+  let -- Start with the derivation environment (values decoded at the
+      -- spawn boundary by 'decodeBuilderStrings')
+      baseEnv = decodedEnv
       -- Add output paths: $out, $dev, etc.
       outputEnv = Map.fromList [(name, T.pack path) | (name, path) <- outputDirs]
       -- Standard build variables
@@ -466,13 +490,15 @@ runBuiltinFetchurl drv outputDirs =
     (Nothing, _, _) -> pure (Left (1, "builtin:fetchurl: derivation has no 'url'"))
     (_, Nothing, _) -> pure (Left (1, "builtin:fetchurl: derivation defines no 'out' output"))
     (_, _, Nothing) -> pure (Left (1, "builtin:fetchurl: 'out' output has no fixed-output hash"))
-    (Just url, Just outPath, Just out) -> do
-      downloaded <- downloadUrl url
-      case downloaded of
-        Left err -> pure (Left (1, "builtin:fetchurl: " <> err))
-        Right body -> do
-          BS.writeFile outPath body
-          pure (verifyFetchHash url out body)
+    (Just urlBytes, Just outPath, Just out) -> case TE.decodeUtf8' urlBytes of
+      Left _ -> pure (Left (1, "builtin:fetchurl: 'url' contains invalid UTF-8"))
+      Right url -> do
+        downloaded <- downloadUrl url
+        case downloaded of
+          Left err -> pure (Left (1, "builtin:fetchurl: " <> err))
+          Right body -> do
+            BS.writeFile outPath body
+            pure (verifyFetchHash url out body)
   where
     -- builtin:fetchurl derivations are always fixed-output; the expected hash
     -- lives in the canonical output spec (doHashAlgo + doHash), not the env.
@@ -682,11 +708,12 @@ readDrvFromStore config sp =
         Nothing -> Left ("cannot read .drv file: " <> T.pack drvFilePath)
         Just content -> fromATerm content
 
--- | Read a file as Text, returning Nothing on any error.
--- Used only for reading immutable .drv files from the store.
-unsafeReadFile :: FilePath -> Maybe Text
+-- | Read a file's raw bytes, returning Nothing on any error.  Used only
+-- for reading immutable .drv files from the store - byte IO, never
+-- text-mode (no locale decode, no newline translation).
+unsafeReadFile :: FilePath -> Maybe BS.ByteString
 unsafeReadFile path =
-  case System.IO.Unsafe.unsafePerformIO (try (TIO.readFile path)) of
+  case System.IO.Unsafe.unsafePerformIO (try (BS.readFile path)) of
     Left (_ :: SomeException) -> Nothing
     Right content -> Just content
 
@@ -783,11 +810,12 @@ trySubstituteOutputs config store drv
     substRegistration (SubstSuccess reg) = Just reg
     substRegistration _ = Nothing
 
--- | Format a derivation name for status output.
+-- | Format a derivation name for status output (display-only, so the
+-- byte-string env value decodes lossily).
 formatDrvName :: Derivation -> Text
 formatDrvName drv =
   case Map.lookup "name" (drvEnv drv) of
-    Just n -> n
+    Just n -> TE.decodeUtf8With lenientDecode n
     Nothing -> case drvOutputs drv of
       (out : _) -> spName (doPath out)
       [] -> "<unknown>"

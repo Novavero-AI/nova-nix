@@ -40,7 +40,6 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Text.Encoding (decodeUtf8', encodeUtf8)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
@@ -50,7 +49,7 @@ import Nix.Eval (eval)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
 import Nix.Eval.CanonPath (canonBaseName, canonPath)
-import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
+import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -110,10 +109,11 @@ data EvalState = EvalState
     -- bottom-up by 'builtinDerivationStrict' so input derivations can be
     -- substituted by their content hashes when computing output paths.
     esDrvModuloCache :: !(IORef (Map Text Text)),
-    -- | Accumulated @.drv@ closure (drv store path text to its ATerm), recorded
-    -- bottom-up by 'builtinDerivationStrict'.  The build driver reads this after
-    -- evaluation to write every input @.drv@ to the store before building.
-    esDrvClosure :: !(IORef (Map Text Text)),
+    -- | Accumulated @.drv@ closure (drv store path text to its ATerm bytes),
+    -- recorded bottom-up by 'builtinDerivationStrict'.  The build driver reads
+    -- this after evaluation to write every input @.drv@ to the store before
+    -- building.
+    esDrvClosure :: !(IORef (Map Text BS.ByteString)),
     -- | Cache of source path to its store path (recursive NAR hash), so a path
     -- literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text Text)),
@@ -173,8 +173,6 @@ instance MonadEval EvalIO where
       Left (NixEvalError ErrorThrown msg) -> pure (Left msg)
       Left err@(NixEvalError ErrorUncatchable _) -> liftIO (throwIO err)
       Right val -> pure (Right val)
-
-  readFileText path = wrapIO (readFileAutoEncoding (T.unpack path))
 
   doesPathExist path = wrapIO (Dir.doesPathExist (T.unpack path))
 
@@ -248,17 +246,15 @@ instance MonadEval EvalIO where
 
   -- Read a .drv from the store on a modulo-hash cache miss (a cross-session or
   -- appendContext reference).  Mirrors the build side's readDrvFromStore: map
-  -- to the on-disk path, read the raw bytes, decode UTF-8, parse the ATerm.
-  -- Any failure - absent file, bad encoding, malformed ATerm - is 'Nothing',
-  -- which the caller turns into a loud modulo-hash error.
+  -- to the on-disk path, read the raw bytes, parse the ATerm byte-level (env
+  -- values keep arbitrary bytes).  Any failure - absent file, malformed ATerm
+  -- - is 'Nothing', which the caller turns into a loud modulo-hash error.
   readStoreDerivation sp = EvalIO $ do
     let filePath = SP.storePathToFilePath SP.defaultStoreDir sp
     result <- liftIO (try (BS.readFile filePath) :: IO (Either SomeException BS.ByteString))
     pure $ case result of
       Left _ -> Nothing
-      Right bytes -> case decodeUtf8' bytes of
-        Left _ -> Nothing
-        Right text -> either (const Nothing) Just (fromATerm text)
+      Right bytes -> either (const Nothing) Just (fromATerm bytes)
 
   -- Look up a derivation recorded earlier this session by its .drv path,
   -- reusing the esDrvClosure ATerm map (populated bottom-up by recordDrvAterm).
@@ -301,15 +297,16 @@ instance MonadEval EvalIO where
       throwEvalError ("writeToStore: name must not contain null bytes: " <> name)
     -- Upstream's text-path scheme via makeTextPath - the same scheme .drv
     -- paths use, so it is parity-validated: type @text:<refs>@, flat
-    -- sha256 of the contents, canonical store dir.  Written as UTF-8
-    -- BYTES: text-mode IO would CRLF-translate on Windows and the stored
-    -- bytes would no longer match the hash that named the path.
-    let sp = makeTextPath name (sha256Digest (encodeUtf8 contents)) refs
+    -- sha256 of the contents, canonical store dir.  The contents are the
+    -- string's RAW BYTES, hashed and written as-is: no encoding step, and
+    -- no text-mode IO (which would CRLF-translate on Windows and store
+    -- bytes that no longer match the hash that named the path).
+    let sp = makeTextPath name (sha256Digest contents) refs
         filePath = SP.storePathToFilePath SP.defaultStoreDir sp
         storePath = SP.storePathToText SP.defaultStoreDir sp
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)
-      BS.writeFile filePath (encodeUtf8 contents)
+      BS.writeFile filePath contents
     pure storePath
 
   scopedImportFile scope rawPath = do
@@ -503,7 +500,7 @@ storeComputed ptr val = case val of
     cthunkSetComputedPath ptr sym
   VStr t ctx
     | ctx == emptyContext -> do
-        Symbol sym <- symbolIntern t
+        Symbol sym <- symbolInternBytes t
         cthunkSetComputedStr ptr sym
     | otherwise -> do
         csptr <- marshalStringContext t ctx
@@ -528,7 +525,7 @@ readComputed ptr = do
     ValueNull -> pure VNull
     ValueStr -> do
       sym <- cthunkGetStr ptr
-      pure (VStr (symbolText (Symbol sym)) emptyContext)
+      pure (VStr (symbolBytes (Symbol sym)) emptyContext)
     ValuePath -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
     ValueList -> do
       listPtr <- cthunkGetList ptr

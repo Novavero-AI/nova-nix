@@ -20,7 +20,9 @@ module Nix.Eval.Symbol
 
     -- * Core operations
     symbolIntern,
+    symbolInternBytes,
     symbolText,
+    symbolBytes,
     symbolLen,
 
     -- * Diagnostics
@@ -28,6 +30,9 @@ module Nix.Eval.Symbol
   )
 where
 
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BSU
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Foreign as TF
@@ -85,16 +90,32 @@ symbolDestroy = c_nn_symbol_destroy
 
 -- | Intern a 'Text' value, returning its 'Symbol'.
 -- If the string was already interned, returns the existing symbol.
--- This is the canonical entry point for Text to C conversion.
+-- This is the canonical entry point for Text to C conversion; the table
+-- stores the UTF-8 bytes, so a 'Text' and its 'Data.Text.Encoding.encodeUtf8'
+-- image intern to the SAME symbol.
 symbolIntern :: Text -> IO Symbol
 symbolIntern txt =
   TF.withCStringLen txt $ \(ptr, len) -> do
     sid <- c_nn_symbol_intern ptr (fromIntegral len)
     pure (Symbol sid)
 
+-- | Intern raw bytes, returning their 'Symbol'.  The C table is
+-- length-prefixed bytes with no encoding assumption, so arbitrary
+-- (even invalid-UTF-8) byte strings intern losslessly.  The canonical
+-- entry point for string VALUES, whose payload is a byte string.
+-- 'BSU.unsafeUseAsCStringLen' is safe here: @nn_symbol_intern@ copies
+-- the bytes into its own arena and never retains the pointer.
+symbolInternBytes :: ByteString -> IO Symbol
+symbolInternBytes bs =
+  BSU.unsafeUseAsCStringLen bs $ \(ptr, len) -> do
+    sid <- c_nn_symbol_intern ptr (fromIntegral len)
+    pure (Symbol sid)
+
 -- | Retrieve the text of an interned symbol.
 -- Returns the original string.  The result is safe to use - it copies
--- from the C arena into a fresh 'Text'.
+-- from the C arena into a fresh 'Text'.  Only valid for symbols interned
+-- from 'Text' (attr names, paths, output names); a symbol holding a raw
+-- byte-string payload must be read with 'symbolBytes' instead.
 symbolText :: Symbol -> Text
 symbolText (Symbol sid)
   | sid == 0 = T.empty
@@ -105,6 +126,19 @@ symbolText (Symbol sid)
         else do
           len <- c_nn_symbol_len sid
           TF.peekCStringLen (ptr, fromIntegral len)
+
+-- | Retrieve the raw bytes of an interned symbol - the exact bytes that
+-- were interned, with no decoding.  The read side of 'symbolInternBytes'.
+symbolBytes :: Symbol -> ByteString
+symbolBytes (Symbol sid)
+  | sid == 0 = BS.empty
+  | otherwise = unsafePerformIO $ do
+      ptr <- c_nn_symbol_text sid
+      if ptr == nullPtr
+        then pure BS.empty
+        else do
+          len <- c_nn_symbol_len sid
+          BS.packCStringLen (ptr, fromIntegral len)
 
 -- | Byte length of a symbol's string.
 symbolLen :: Symbol -> Int
