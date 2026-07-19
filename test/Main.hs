@@ -28,11 +28,12 @@ import Nix.Builder.Unpack (builtinUnpackBuilder, entryComponents, envSrcs, resol
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm, toATermForHash)
-import Nix.Eval (NixValue (..), StringContext (..), StringContextElement (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
+import Nix.Eval (MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
-import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
+import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
+import Nix.Eval.CanonPath (canonPath)
 import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
@@ -59,6 +60,7 @@ import qualified System.Directory as Dir
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
+import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
 import qualified System.Process as Proc
 
@@ -3104,22 +3106,30 @@ testBuildOrchestrator = do
             | otherwise -> Fail ("drvPath not deterministic: " <> bytesText a <> " vs " <> bytesText b)
           _ -> Fail "expected main.drvPath to evaluate to a string under IO eval",
       -- drv1: embedding another derivation's drvPath (an all-outputs ref) adds
-      -- it to inputDrvs; the IO evaluator recovers its output names in-session.
-      runTestM "derivation embedding a drvPath lists it in inputDrvs (IO eval)" $ do
+      -- it to inputDrvs carrying the referenced derivation's FULL
+      -- output-name set; the IO evaluator recovers the names in-session.
+      runTestM "derivation embedding a drvPath lists all its outputs in inputDrvs (IO eval)" $ do
         tmpBase <- getTemporaryDirectory
+        let depSrc = "derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ \"out\" \"dev\" ]; }"
+        depPathR <- evalNixIO tmpBase ("(" <> depSrc <> ").drvPath")
         result <-
           evalNixIO tmpBase $
             T.concat
-              [ "let dep = derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ",
-                "main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; ref = dep.drvPath; }; ",
+              [ "let dep = ",
+                depSrc,
+                "; main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; ref = dep.drvPath; }; ",
                 "in main._derivation"
               ]
-        pure $ assertRight "drv1-deep-io" result $ \case
-          VDerivation drv ->
-            if Map.null (drvInputDrvs drv)
-              then Fail "expected dep in inputDrvs via the deep drvPath ref"
-              else Pass
-          _ -> Fail "expected VDerivation"
+        pure $ case (depPathR, result) of
+          (Right (VStr depPathBytes _), Right (VDerivation drv)) ->
+            case parseStorePath defaultStoreDir (bytesText depPathBytes) of
+              Nothing -> Fail ("unparseable dep drvPath: " <> bytesText depPathBytes)
+              Just depSP -> case Map.lookup depSP (drvInputDrvs drv) of
+                Just outs
+                  | Set.fromList outs == Set.fromList ["dev", "out"] -> Pass
+                  | otherwise -> Fail ("expected the full output set [dev, out], got " <> T.pack (show outs))
+                Nothing -> Fail "dep .drv missing from inputDrvs despite the deep drvPath ref"
+          other -> Fail ("expected dep drvPath and main._derivation, got " <> T.pack (show other))
     ]
 
 -- ---------------------------------------------------------------------------
@@ -5797,6 +5807,218 @@ testCThunk = do
 -- Bytecode compilation tests
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Tests: Class I conformance follow-ups (issue #50)
+-- ---------------------------------------------------------------------------
+
+-- | Error kind for 'StubStoreEval', mirroring PureEval's split: only a
+-- throw/assert is tryEval-catchable.
+data StubErr = StubThrow !Text | StubOther !Text
+
+-- | Pure evaluator over a stubbed store: 'readStoreDerivation' serves
+-- derivations from a fixed map (keyed by canonical @.drv@ path text);
+-- everything else behaves like 'PureEval'.  Exercises the
+-- input-derivation-modulo STORE-READ arm hermetically - the real arm
+-- reads the platform store, which dev machines and CI runners must not
+-- depend on (the build matrix has no writable @/nix/store@).
+newtype StubStoreEval a = StubStoreEval (Map.Map Text Derivation -> Either StubErr a)
+
+runStubStoreEval :: Map.Map Text Derivation -> StubStoreEval a -> Either Text a
+runStubStoreEval drvs (StubStoreEval action) = case action drvs of
+  Left (StubThrow msg) -> Left msg
+  Left (StubOther msg) -> Left msg
+  Right val -> Right val
+
+instance Functor StubStoreEval where
+  fmap f (StubStoreEval g) = StubStoreEval (fmap f . g)
+
+instance Applicative StubStoreEval where
+  pure val = StubStoreEval (const (Right val))
+  StubStoreEval mf <*> StubStoreEval ma = StubStoreEval $ \drvs -> mf drvs <*> ma drvs
+
+instance Monad StubStoreEval where
+  StubStoreEval ma >>= f = StubStoreEval $ \drvs -> case ma drvs of
+    Left err -> Left err
+    Right val -> let StubStoreEval mb = f val in mb drvs
+
+instance MonadEval StubStoreEval where
+  throwEvalError msg = StubStoreEval (const (Left (StubOther msg)))
+  throwCatchableError msg = StubStoreEval (const (Left (StubThrow msg)))
+  abortEvaluation msg = StubStoreEval (const (Left (StubOther ("evaluation aborted: " <> msg))))
+  catchEvalError (StubStoreEval action) = StubStoreEval $ \drvs -> case action drvs of
+    Left (StubThrow msg) -> Right (Left msg)
+    Left other -> Left other
+    Right val -> Right (Right val)
+  doesPathExist _ = pure False
+  listDirectory _ = throwEvalError "readDir: not available in the stub evaluator"
+  importFile _ = throwEvalError "import: not available in the stub evaluator"
+  getEnvVar _ = pure ""
+  getCurrentTime = pure 0
+  writeToStore _ _ _ = throwEvalError "toFile: not available in the stub evaluator"
+  scopedImportFile _ _ = throwEvalError "scopedImport: not available in the stub evaluator"
+  readFileBytes _ = throwEvalError "readFile: not available in the stub evaluator"
+  getFileType _ = throwEvalError "readFileType: not available in the stub evaluator"
+  runProcess _ _ _ = throwEvalError "runProcess: not available in the stub evaluator"
+  copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
+  isExecutableFile _ = throwEvalError "builtins.path: not available in the stub evaluator"
+  readSymlinkTarget _ = throwEvalError "builtins.path: not available in the stub evaluator"
+  addSourceNar _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
+  addFixedOutputFile _ _ = throwEvalError "builtins.fetchurl: not available in the stub evaluator"
+  traceMessage _ = pure ()
+  lookupDrvHash _ = pure Nothing
+  cacheDrvHash _ _ = pure ()
+  recordDrvAterm _ _ = pure ()
+  readStoreDerivation sp =
+    StubStoreEval $ \drvs -> Right (Map.lookup (storePathToText defaultStoreDir sp) drvs)
+  lookupSessionDrv _ = pure Nothing
+  storeSourcePath = pure
+  resolvePathLiteral = pure . canonPath
+  forceThunk evalFn thunk@(Thunk ptr) = case readThunkValue thunk of
+    Just val -> pure val
+    Nothing -> case unsafePerformIO (cthunkState ptr) of
+      2 {- BLACKHOLE -} -> abortEvaluation "infinite recursion encountered"
+      _ {- PENDING -} ->
+        let bcIdx = unsafePerformIO (cthunkGetBcIdx ptr)
+            envSp = unsafePerformIO (cthunkPayload ptr)
+            env = unsafePerformIO (deRefStablePtr (castPtrToStablePtr envSp))
+         in evalFn env bcIdx
+
+-- | Parse and evaluate under the stubbed-store evaluator.
+evalNixStub :: Map.Map Text Derivation -> Text -> Either Text NixValue
+evalNixStub drvs source = case parseNix "<test>" source of
+  Left err -> Left (T.pack (show err))
+  Right expr -> runStubStoreEval drvs (eval (builtinEnv 0 []) expr)
+
+-- | Class I conformance follow-ups (issue #50): behaviors that landed
+-- with #37 but had no direct test.  Pure cases here; filesystem-touching
+-- cases in 'testClassIFollowupsIO'.
+testClassIFollowups :: IO [Bool]
+testClassIFollowups = do
+  putStrLn "eval/class-i-followups"
+  let storeA = "/nix/store/" <> T.replicate 32 "a"
+      enclosingCtx = StringContext (Set.singleton (SCPlain (StorePath (T.replicate 32 "a") "x")))
+  sequence
+    [ -- path + path concatenates the spellings and canonicalizes
+      runTest "path + path canonicalizes the joined spelling" $
+        assertEval "pp-canon" "builtins.toString (/a/b + /c/../d)" (mkStr "/a/b/d"),
+      -- concatStringsSep coerces a path element; an in-store path takes
+      -- the short-circuit (itself + enclosing context, no store copy)
+      runTest "concatStringsSep coerces an in-store path element" $
+        assertEval
+          "csep-path"
+          ("builtins.concatStringsSep \":\" [ " <> storeA <> "-x \"y\" ]")
+          (VStr (TE.encodeUtf8 (storeA <> "-x:y")) enclosingCtx),
+      -- the same in-store short-circuit for general interpolation, on a
+      -- SUBPATH: the text is the subpath, the context the enclosing path
+      runTest "interpolating an in-store subpath keeps text, contexts the enclosing path" $
+        assertEval
+          "interp-substore"
+          ("\"${" <> storeA <> "-x/sub}\"")
+          (VStr (TE.encodeUtf8 (storeA <> "-x/sub")) enclosingCtx),
+      -- storePath on a subpath: value text is the subpath itself
+      runTest "storePath on a subpath keeps text, contexts the enclosing path" $
+        assertEval
+          "storepath-sub"
+          ("builtins.storePath " <> storeA <> "-x/sub/file")
+          (VStr (TE.encodeUtf8 (storeA <> "-x/sub/file")) enclosingCtx),
+      -- fromJSON integers in the (int64 max, uint64 max] band arrive
+      -- two's-complement wrapped, as upstream's nlohmann handoff
+      runTest "fromJSON wraps int64 max + 1" $
+        assertEval "fromjson-wrap-min" "builtins.fromJSON \"9223372036854775808\"" (VInt minBound),
+      runTest "fromJSON wraps uint64 max" $
+        assertEval "fromjson-wrap-neg1" "builtins.fromJSON \"18446744073709551615\"" (VInt (-1)),
+      runTest "fromJSON falls to float past uint64" $
+        assertEval "fromjson-float" "builtins.fromJSON \"18446744073709551616\"" (VFloat 18446744073709551616.0),
+      -- the input-derivation-modulo STORE-READ arm: a dependent whose
+      -- input .drv was NOT evaluated in-session resolves by reading the
+      -- (stubbed) store, and lands on the same drvPath as the in-session
+      -- cache-hit arm computes for the identical derivation
+      runTestM "input modulo recurses through the store read (stub store)" $ do
+        let depSrc = "derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }"
+        depDrv <- case evalNix ("(" <> depSrc <> ")._derivation") of
+          Right (VDerivation d) -> pure d
+          other -> fail ("dep._derivation: " <> show other)
+        depPath <- case evalNix ("(" <> depSrc <> ").drvPath") of
+          Right (VStr p _) -> pure (bytesText p)
+          other -> fail ("dep.drvPath: " <> show other)
+        let stubResult =
+              evalNixStub (Map.singleton depPath depDrv) $
+                T.concat
+                  [ "(derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; ",
+                    "input = builtins.appendContext \"x\" { \"",
+                    depPath,
+                    "\" = { outputs = [\"out\"]; }; }; }).drvPath"
+                  ]
+        tmpBase <- getTemporaryDirectory
+        ioResult <-
+          evalNixIO tmpBase $
+            T.concat
+              [ "let dep = ",
+                depSrc,
+                "; in (derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; ",
+                "input = builtins.appendContext \"x\" { \"${dep.drvPath}\" = { outputs = [\"out\"]; }; }; }).drvPath"
+              ]
+        pure $ case (stubResult, ioResult) of
+          (Right (VStr a _), Right (VStr b _))
+            | a == b -> Pass
+            | otherwise ->
+                Fail ("store-read and in-session arms disagree: " <> bytesText a <> " vs " <> bytesText b)
+          other -> Fail ("expected two drvPaths, got: " <> T.pack (show other))
+    ]
+
+-- | Filesystem-touching Class I follow-ups (issue #50).
+testClassIFollowupsIO :: IO [Bool]
+testClassIFollowupsIO = do
+  putStrLn "eval/class-i-followups-io"
+  tmpDir <- getTemporaryDirectory
+  let testDir = tmpDir </> "nova-nix-classi-test"
+      testDirFwd = T.replace "\\" "/" (T.pack testDir)
+  bracket_
+    ( do
+        createDirectoryIfMissing True (testDir </> "sub")
+        TIO.writeFile (testDir </> "target.txt") "hit\n"
+        TIO.writeFile (testDir </> "thefile") "payload\n"
+    )
+    ( do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+    )
+    $ sequence
+      [ -- ~/ expands against the home directory at path resolution
+        runTestM "tilde path literal expands against the home directory" $ do
+          home <- Dir.getHomeDirectory
+          result <- evalNixIO testDir "builtins.toString ~/nova-tilde-probe"
+          let expected = canonPath (T.pack (home </> "nova-tilde-probe"))
+          pure $ assertRight "tilde" result $ \val ->
+            assertEqual "tilde-expanded" (mkStr expected) val,
+        -- a search-path match is returned CANONICALIZED
+        runTestM "findFile canonicalizes the matched candidate" $ do
+          result <-
+            evalNixIO testDir $
+              T.concat
+                ["builtins.findFile [ { prefix = \"\"; path = \"", testDirFwd, "/sub/..\"; } ] \"target.txt\""]
+          pure $ assertRight "findfile-canon" result $ \val ->
+            assertEqual "canonical" (VPath (testDirFwd <> "/target.txt")) val,
+        -- the store copy is named by canonBaseName (the path's last segment)
+        runTestM "source copy is named by canonBaseName" $ do
+          result <- evalNixIO testDir "\"${./thefile}\""
+          pure $ assertRight "canonbase" result $ \case
+            VStr s ctx ->
+              if "/nix/store/" `BS.isPrefixOf` s && "-thefile" `BS.isSuffixOf` s && ctx /= emptyContext
+                then Pass
+                else Fail ("expected a store path named -thefile with context, got " <> bytesText s)
+            other -> Fail ("expected VStr, got " <> T.pack (show other)),
+        -- canonBaseName's empty-name arm: the filesystem root has no
+        -- base name to copy under (toPath keeps the probe off the
+        -- platform filesystem - the error fires before any read)
+        runTestM "coercing the filesystem root errors (no base name)" $ do
+          result <- evalNixIO testDir "\"${builtins.toPath \"/\"}\""
+          pure $ case result of
+            Left err | "no base name" `T.isInfixOf` err -> Pass
+            Left err -> Fail ("expected a base-name error, got: " <> err)
+            Right val -> Fail ("expected failure, got " <> T.pack (show val))
+      ]
+
 -- | Bytecode short_arg spill: op-level payload counts at or above the
 -- 0xFFFF sentinel move to the first data word, so literals are no longer
 -- capped at 65535 elements.  The two exact-boundary list cases pin the
@@ -6681,7 +6903,9 @@ main = bracket_ arenaInit arenaDestroy $ do
           testCAttrSet,
           testCThunk,
           testBytecodeCompile,
-          testBytecodeCountSpill
+          testBytecodeCountSpill,
+          testClassIFollowups,
+          testClassIFollowupsIO
         ]
   let total = length results
       passed = length (filter id results)
