@@ -3479,9 +3479,20 @@ verifyFetchPin ctx url bytes expectedStr = do
 -- @sha256:@-prefixed, or a bare hex/nix32/base64 digest).
 decodeSha256Pin :: (MonadEval m) => Text -> Text -> m BS.ByteString
 decodeSha256Pin ctx s
-  | Just (_, b64) <- parseSRI s = decodeBase64E ctx b64
-  | Just (algo, rest) <- parseAlgoPrefix s = snd <$> decodeWithAlgo algo rest
+  | Just (algo, b64) <- parseSRI s = do
+      requireSha256 algo
+      decodeSRI ctx algo b64
+  | Just (algo, rest) <- parseAlgoPrefix s = do
+      requireSha256 algo
+      snd <$> decodeWithAlgo algo rest
   | otherwise = snd <$> decodeWithAlgo "sha256" s
+  where
+    -- The pin names a sha256 digest specifically, so a spelling carrying
+    -- its own algorithm tag must carry sha256 - a sha512 pin here is an
+    -- error at decode time, as upstream's typed Hash parse.
+    requireSha256 "sha256" = pure ()
+    requireSha256 algo =
+      throwEvalError (ctx <> ": hash '" <> s <> "' should have type 'sha256', not '" <> algo <> "'")
 
 -- | Force a required string attribute from an attrset, using full Nix string
 -- coercion (VStr, VPath, VInt, VBool, VAttrs via __toString/outPath).
@@ -3815,7 +3826,7 @@ optDrvStrAttr key attrs =
 normalizeFixedHash :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
 normalizeFixedHash ohash ohAlgo
   | Just (algo, b64) <- parseSRI ohash = do
-      bytes <- decodeBase64E "derivation" b64
+      bytes <- decodeSRI "derivation" algo b64
       pure (algo, bytes)
   | Just (algo, rest) <- parseAlgoPrefix ohash = decodeWithAlgo algo rest
   | not (T.null ohAlgo) = decodeWithAlgo ohAlgo ohash
@@ -3971,7 +3982,7 @@ decodeHashInput :: (MonadEval m) => AttrSet -> Text -> m (Text, BS.ByteString)
 decodeHashInput attrs hashStr
   -- SRI format: algo-base64
   | Just (algo, b64) <- parseSRI hashStr = do
-      bytes <- decodeBase64E "convertHash" b64
+      bytes <- decodeSRI "convertHash" algo b64
       pure (algo, bytes)
   -- Prefixed format: algo:hex or algo:nix32
   | Just (algo, rest) <- parseAlgoPrefix hashStr =
@@ -4002,6 +4013,23 @@ decodeWithAlgo algo s = case hashAlgoBytes algo of
       Just bytes | BS.length bytes == size -> pure (algo, bytes)
       _ -> throwEvalError ("hash '" <> s <> "' is not a valid " <> spelling <> " " <> algo <> " hash")
     rightToMaybe = either (const Nothing) Just
+
+-- | Decode an SRI digest (@algo-base64@) with the decoded-length check
+-- every spelling gets upstream (hash.cc checks SRI too): well-formed
+-- base64 of the wrong byte count is an invalid hash at eval time, not a
+-- short digest that defers failure to fetch or build time.  Shared by
+-- convertHash, the fetch pins, and fixed-output outputHash.
+decodeSRI :: (MonadEval m) => Text -> Text -> Text -> m BS.ByteString
+decodeSRI ctx algo b64 = case hashAlgoBytes algo of
+  -- Unreachable via parseSRI (it admits only known algorithm tags), but
+  -- this helper must not silently skip the check for an unknown one.
+  Nothing -> throwEvalError ("unknown hash algorithm '" <> algo <> "'")
+  Just size -> do
+    bytes <- decodeBase64E ctx b64
+    when (BS.length bytes /= size) $
+      throwEvalError
+        ("hash '" <> algo <> "-" <> b64 <> "' has wrong length for hash algorithm '" <> algo <> "'")
+    pure bytes
 
 -- | Parse @sha256-base64...@ SRI format.
 parseSRI :: Text -> Maybe (Text, Text)

@@ -3976,6 +3976,38 @@ testUpstreamConformance = do
         assertEvalFail
           "hash-bad-algo"
           "builtins.convertHash { hash = \"00\"; hashAlgo = \"sha3\"; toHashFormat = \"base16\"; }",
+      -- SRI digests get the same decoded-length check as every other
+      -- spelling (upstream checks SRI too), at all three decode sites:
+      -- convertHash, fixed-output outputHash, and the fetch/path pins.
+      runTest "valid SRI digest converts" $
+        assertEval
+          "hash-sri-valid"
+          "builtins.convertHash { hash = \"sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"; toHashFormat = \"base16\"; }"
+          (mkStr "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+      runTest "convertHash rejects a truncated SRI digest" $
+        case evalNix "builtins.convertHash { hash = \"sha256-YWJj\"; toHashFormat = \"base16\"; }" of
+          Left err
+            | "wrong length" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("expected an SRI length error, got: " <> err)
+          Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
+      runTest "fixed-output outputHash rejects a truncated SRI digest" $
+        case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"sha256-YWJj\"; }).drvPath" of
+          Left err
+            | "wrong length" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("expected an SRI length error, got: " <> err)
+          Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
+      runTest "builtins.path pin rejects a truncated SRI digest" $
+        case evalNix "builtins.path { path = ./x; sha256 = \"sha256-YWJj\"; }" of
+          Left err
+            | "wrong length" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("expected an SRI length error, got: " <> err)
+          Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
+      runTest "builtins.path pin rejects a non-sha256 SRI digest" $
+        case evalNix ("builtins.path { path = ./x; sha256 = \"sha512-" <> T.replicate 86 "A" <> "==\"; }") of
+          Left err
+            | "should have type 'sha256'" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("expected a hash-type error, got: " <> err)
+          Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
       -- toJSON floats: nlohmann's layout - shortest round-trip digits, .0
       -- kept on integral values, scientific outside point positions (-4, 15].
       runTest "toJSON float shortest digits" $
