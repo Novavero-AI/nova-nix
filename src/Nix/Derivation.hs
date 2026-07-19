@@ -66,6 +66,11 @@ module Nix.Derivation
   )
 where
 
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as B
+import qualified Data.ByteString.Char8 as BC
+import qualified Data.ByteString.Lazy as LBS
 import Data.Function (on)
 import Data.List (sortBy)
 import Data.Map.Strict (Map)
@@ -73,6 +78,8 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import Data.Text.Encoding.Error (lenientDecode)
 import Nix.Store.Path (StorePath (..))
 import qualified Nix.Store.Path as SP
 import qualified System.Info as SI
@@ -146,6 +153,13 @@ data DerivationOutput = DerivationOutput
   deriving (Eq, Show)
 
 -- | A complete derivation - everything needed to build a package.
+--
+-- The builder, args, and env VALUES are byte strings: they are coerced
+-- Nix strings, which carry arbitrary bytes, and they flow byte-exact
+-- into the ATerm (and therefore the @.drv@ hash and every output path).
+-- Env KEYS are attr names, which nova-nix constrains to valid UTF-8
+-- 'Text'; for valid UTF-8, Text ordering equals byte ordering, so the
+-- sorted env section matches upstream's bytewise @std::map@ order.
 data Derivation = Derivation
   { -- | What this derivation produces.
     drvOutputs :: ![DerivationOutput],
@@ -156,19 +170,21 @@ data Derivation = Derivation
     -- | Target platform: "x86_64-linux", "x86_64-windows", etc.
     drvPlatform :: !Platform,
     -- | The builder executable (store path to bash, or other).
-    drvBuilder :: !Text,
+    drvBuilder :: !ByteString,
     -- | Arguments to the builder.
-    drvArgs :: ![Text],
+    drvArgs :: ![ByteString],
     -- | Environment variables for the build.
-    drvEnv :: !(Map Text Text)
+    drvEnv :: !(Map Text ByteString)
   }
   deriving (Eq, Show)
 
 -- | Serialize a derivation to ATerm format (the .drv file format).
--- This serialization is what gets hashed to compute the store path.
+-- This serialization is what gets hashed to compute the store path,
+-- so the result is BYTES: env values, args, and the builder land in it
+-- exactly as coerced, with no encoding step in between.
 --
 -- Format: @Derive([outputs],[inputDrvs],[inputSrcs],platform,builder,[args],[env])@
-toATerm :: Derivation -> Text
+toATerm :: Derivation -> ByteString
 toATerm = toATermForHash False Nothing
 
 -- | Serialize a derivation for HASHING, with the two knobs the Nix
@@ -184,23 +200,25 @@ toATerm = toATermForHash False Nothing
 --     input's path spelling (not its content) hash identically.
 --
 -- @toATermForHash False Nothing@ is exactly 'toATerm'.
-toATermForHash :: Bool -> Maybe [(Text, [Text])] -> Derivation -> Text
+toATermForHash :: Bool -> Maybe [(Text, [Text])] -> Derivation -> ByteString
 toATermForHash maskOutputs inputSubst drv =
-  "Derive("
-    <> atermOutputsWith maskOutputs (drvOutputs drv)
-    <> ","
-    <> inputDrvsSection
-    <> ","
-    <> atermInputSrcs (drvInputSrcs drv)
-    <> ","
-    <> atermString (platformToText (drvPlatform drv))
-    <> ","
-    <> atermString (drvBuilder drv)
-    <> ","
-    <> atermStringList (drvArgs drv)
-    <> ","
-    <> atermEnv (drvEnv drv)
-    <> ")"
+  LBS.toStrict $
+    B.toLazyByteString $
+      "Derive("
+        <> atermOutputsWith maskOutputs (drvOutputs drv)
+        <> ","
+        <> inputDrvsSection
+        <> ","
+        <> atermInputSrcs (drvInputSrcs drv)
+        <> ","
+        <> atermStringT (platformToText (drvPlatform drv))
+        <> ","
+        <> atermString (drvBuilder drv)
+        <> ","
+        <> atermList (map atermString (drvArgs drv))
+        <> ","
+        <> atermEnv (drvEnv drv)
+        <> ")"
   where
     inputDrvsSection = case inputSubst of
       Nothing -> atermInputDrvs (drvInputDrvs drv)
@@ -209,20 +227,20 @@ toATermForHash maskOutputs inputSubst drv =
 -- | Serialize outputs: @[(name,path,hashAlgo,hash)]@, sorted by output name.
 -- When @maskOutputs@ is set, every path is rendered as @\"\"@ (used by the
 -- masked modulo hash, where output paths aren't known yet).
-atermOutputsWith :: Bool -> [DerivationOutput] -> Text
+atermOutputsWith :: Bool -> [DerivationOutput] -> B.Builder
 atermOutputsWith maskOutputs outs =
   let sorted = sortBy (compare `on` doName) outs
-   in "[" <> T.intercalate "," (map render sorted) <> "]"
+   in atermList (map render sorted)
   where
     render out =
       "("
-        <> atermString (doName out)
+        <> atermStringT (doName out)
         <> ","
-        <> atermString (if maskOutputs then "" else SP.storePathToText SP.defaultStoreDir (doPath out))
+        <> atermStringT (if maskOutputs then "" else SP.storePathToText SP.defaultStoreDir (doPath out))
         <> ","
-        <> atermString (doHashAlgo out)
+        <> atermStringT (doHashAlgo out)
         <> ","
-        <> atermString (doHash out)
+        <> atermStringT (doHash out)
         <> ")"
 
 -- | Input-derivations serializer for the modulo substitution: keys are the
@@ -234,12 +252,12 @@ atermOutputsWith maskOutputs outs =
 -- order-independent; 'Map.toAscList' and 'Set.toAscList' fix the ascending
 -- hex-key and output-name order (hex is lowercase, so this matches the bytewise
 -- order of upstream's @std::map<std::string>@).
-atermInputDrvsSubst :: [(Text, [Text])] -> Text
+atermInputDrvsSubst :: [(Text, [Text])] -> B.Builder
 atermInputDrvsSubst subs =
   let merged = Map.fromListWith Set.union [(key, Set.fromList outs) | (key, outs) <- subs]
-   in "[" <> T.intercalate "," (map render (Map.toAscList merged)) <> "]"
+   in atermList (map render (Map.toAscList merged))
   where
-    render (key, outs) = "(" <> atermString key <> "," <> atermStringList (Set.toAscList outs) <> ")"
+    render (key, outs) = "(" <> atermStringT key <> "," <> atermList (map atermStringT (Set.toAscList outs)) <> ")"
 
 -- | Sort and deduplicate output names (matches C++ @std::set<string>@).
 sortNubText :: [Text] -> [Text]
@@ -247,60 +265,84 @@ sortNubText = Set.toAscList . Set.fromList
 
 -- | Serialize input derivations: @[(drvPath,[outName1,outName2])]@
 -- Sorted by store path for determinism.
-atermInputDrvs :: Map StorePath [Text] -> Text
+atermInputDrvs :: Map StorePath [Text] -> B.Builder
 atermInputDrvs drvs =
   let sorted = Map.toAscList drvs
-   in "[" <> T.intercalate "," (map atermInputDrv sorted) <> "]"
+   in atermList (map atermInputDrv sorted)
 
-atermInputDrv :: (StorePath, [Text]) -> Text
+atermInputDrv :: (StorePath, [Text]) -> B.Builder
 atermInputDrv (sp, outs) =
   "("
-    <> atermString (SP.storePathToText SP.defaultStoreDir sp)
+    <> atermStringT (SP.storePathToText SP.defaultStoreDir sp)
     <> ","
-    <> atermStringList (sortNubText outs)
+    <> atermList (map atermStringT (sortNubText outs))
     <> ")"
 
 -- | Serialize input sources: @[path1,path2,...]@
 -- Sorted for deterministic ATerm hashing.
-atermInputSrcs :: [StorePath] -> Text
+atermInputSrcs :: [StorePath] -> B.Builder
 atermInputSrcs srcs =
   let sorted = sortBy (compare `on` SP.storePathToText SP.defaultStoreDir) srcs
-   in "[" <> T.intercalate "," (map (atermString . SP.storePathToText SP.defaultStoreDir) sorted) <> "]"
+   in atermList (map (atermStringT . SP.storePathToText SP.defaultStoreDir) sorted)
 
--- | Serialize a list of strings: @[s1,s2,...]@
-atermStringList :: [Text] -> Text
-atermStringList strs =
-  "[" <> T.intercalate "," (map atermString strs) <> "]"
+-- | Bracketed, comma-separated section.
+atermList :: [B.Builder] -> B.Builder
+atermList items = "[" <> mconcat (intersperseComma items) <> "]"
+  where
+    intersperseComma [] = []
+    intersperseComma [only] = [only]
+    intersperseComma (item : rest) = item : "," : intersperseComma rest
 
--- | Serialize environment: @[(key,value)]@ sorted by key.
-atermEnv :: Map Text Text -> Text
+-- | Serialize environment: @[(key,value)]@ sorted by key.  Keys are
+-- valid-UTF-8 Text, so 'Map.toAscList' order equals upstream's bytewise
+-- order; values are raw bytes.
+atermEnv :: Map Text ByteString -> B.Builder
 atermEnv env =
   let sorted = Map.toAscList env
-   in "[" <> T.intercalate "," (map atermEnvPair sorted) <> "]"
+   in atermList (map atermEnvPair sorted)
 
-atermEnvPair :: (Text, Text) -> Text
+atermEnvPair :: (Text, ByteString) -> B.Builder
 atermEnvPair (key, val) =
-  "(" <> atermString key <> "," <> atermString val <> ")"
+  "(" <> atermStringT key <> "," <> atermString val <> ")"
 
--- | ATerm string: double-quoted with standard escaping.
-atermString :: Text -> Text
-atermString s = "\"" <> T.concatMap escapeATerm s <> "\""
+-- | ATerm string: double-quoted with standard escaping, byte-level.
+-- Every escapable is a single ASCII byte, so escaping the byte stream is
+-- exactly upstream's per-char escaping over its byte strings.
+atermString :: ByteString -> B.Builder
+atermString s = "\"" <> escapeATermBytes s <> "\""
 
--- | Escape a character for ATerm format.
-escapeATerm :: Char -> Text
-escapeATerm '\\' = "\\\\"
-escapeATerm '"' = "\\\""
-escapeATerm '\n' = "\\n"
-escapeATerm '\r' = "\\r"
-escapeATerm '\t' = "\\t"
-escapeATerm c = T.singleton c
+-- | ATerm string from Text (names, store paths, hex keys): UTF-8 bytes,
+-- then the shared byte-level escaping.
+atermStringT :: Text -> B.Builder
+atermStringT = atermString . TE.encodeUtf8
+
+-- | Escape the five ATerm specials; all other bytes pass through verbatim.
+-- Scans for the next special with 'BC.break' so clean spans copy in bulk.
+escapeATermBytes :: ByteString -> B.Builder
+escapeATermBytes s =
+  let (plain, rest) = BC.break atermSpecial s
+   in case BC.uncons rest of
+        Nothing -> B.byteString plain
+        Just (c, remaining) ->
+          B.byteString plain <> escapeOne c <> escapeATermBytes remaining
+  where
+    atermSpecial c = c == '\\' || c == '"' || c == '\n' || c == '\r' || c == '\t'
+    escapeOne '\\' = "\\\\"
+    escapeOne '"' = "\\\""
+    escapeOne '\n' = "\\n"
+    escapeOne '\r' = "\\r"
+    escapeOne '\t' = "\\t"
+    -- Unreachable: 'BC.break atermSpecial' only stops at the five specials.
+    escapeOne c = B.charUtf8 c
 
 -- ---------------------------------------------------------------------------
 -- ATerm parser (hand-rolled recursive descent)
 -- ---------------------------------------------------------------------------
 
--- | Parser state: remaining input text.
-newtype Parser a = Parser {runParser :: Text -> Either Text (a, Text)}
+-- | Parser state: remaining input bytes.  The @.drv@ on disk is a byte
+-- string; only Text-shaped fields (names, paths, keys) decode, and only
+-- after unescaping.
+newtype Parser a = Parser {runParser :: ByteString -> Either Text (a, ByteString)}
 
 instance Functor Parser where
   fmap f (Parser p) = Parser $ \input -> case p input of
@@ -323,46 +365,65 @@ instance Monad Parser where
 parserFail :: Text -> Parser a
 parserFail msg = Parser $ \_ -> Left msg
 
+-- | Lossy decode for parse-error snippets only.
+snippet :: ByteString -> Text
+snippet = TE.decodeUtf8With lenientDecode
+
 -- | Consume a specific character.
 pChar :: Char -> Parser ()
 pChar expected = Parser $ \input ->
-  case T.uncons input of
+  case BC.uncons input of
     Just (c, rest) | c == expected -> Right ((), rest)
     Just (c, _) -> Left ("expected '" <> T.singleton expected <> "' but got '" <> T.singleton c <> "'")
     Nothing -> Left ("expected '" <> T.singleton expected <> "' but got end of input")
 
 -- | Consume a specific string prefix.
-pString :: Text -> Parser ()
+pString :: ByteString -> Parser ()
 pString prefix = Parser $ \input ->
-  case T.stripPrefix prefix input of
+  case BS.stripPrefix prefix input of
     Just rest -> Right ((), rest)
-    Nothing -> Left ("expected \"" <> prefix <> "\" at: " <> T.take 20 input)
+    Nothing -> Left ("expected \"" <> snippet prefix <> "\" at: " <> snippet (BS.take 20 input))
 
--- | Parse a quoted ATerm string with escape handling.
-pQuotedString :: Parser Text
+-- | Parse a quoted ATerm string with escape handling; the content is the
+-- raw unescaped bytes.
+pQuotedString :: Parser ByteString
 pQuotedString = do
   pChar '"'
   content <- pStringContent
   pChar '"'
   pure content
 
+-- | Like 'pQuotedString' for Text-shaped fields (names, store paths, env
+-- keys, platform): strict UTF-8 decode after unescaping, so invalid bytes
+-- in a field nova-nix represents as Text are a parse error, never mojibake.
+pQuotedText :: Parser Text
+pQuotedText = do
+  content <- pQuotedString
+  case TE.decodeUtf8' content of
+    Right t -> pure t
+    Left _ -> parserFail ("invalid UTF-8 in ATerm string: " <> snippet (BS.take 40 content))
+
 -- | Parse the contents of a quoted string (up to unescaped quote).
-pStringContent :: Parser Text
-pStringContent = Parser $ \input -> go input T.empty
+-- Scans to the next special byte with 'BC.break' so clean spans are
+-- copied in bulk, accumulating reversed chunks (O(n) total).
+pStringContent :: Parser ByteString
+pStringContent = Parser $ \input -> go input []
   where
     go remaining acc =
-      case T.uncons remaining of
-        Nothing -> Left "unterminated string"
-        Just ('"', _) -> Right (acc, remaining)
-        Just ('\\', rest) -> case T.uncons rest of
-          Nothing -> Left "unterminated escape"
-          Just ('\\', rest2) -> go rest2 (acc <> "\\")
-          Just ('"', rest2) -> go rest2 (acc <> "\"")
-          Just ('n', rest2) -> go rest2 (acc <> "\n")
-          Just ('r', rest2) -> go rest2 (acc <> "\r")
-          Just ('t', rest2) -> go rest2 (acc <> "\t")
-          Just (c, rest2) -> go rest2 (acc <> "\\" <> T.singleton c)
-        Just (c, rest) -> go rest (acc <> T.singleton c)
+      let (plain, rest) = BC.break (\c -> c == '"' || c == '\\') remaining
+       in case BC.uncons rest of
+            Nothing -> Left "unterminated string"
+            Just ('"', _) -> Right (BS.concat (reverse (plain : acc)), rest)
+            Just ('\\', afterSlash) -> case BC.uncons afterSlash of
+              Nothing -> Left "unterminated escape"
+              Just ('\\', rest2) -> go rest2 ("\\" : plain : acc)
+              Just ('"', rest2) -> go rest2 ("\"" : plain : acc)
+              Just ('n', rest2) -> go rest2 ("\n" : plain : acc)
+              Just ('r', rest2) -> go rest2 ("\r" : plain : acc)
+              Just ('t', rest2) -> go rest2 ("\t" : plain : acc)
+              Just (c, rest2) -> go rest2 (BC.pack ['\\', c] : plain : acc)
+            -- Unreachable: BC.break stops only at '"' or '\\'.
+            Just (c, _) -> Left ("pStringContent: impossible break byte '" <> T.singleton c <> "'")
 
 -- | Parse a comma-separated list enclosed in brackets: @[item,item,...]@
 pList :: Parser a -> Parser [a]
@@ -391,13 +452,13 @@ pSepBy pItem pSep = Parser $ \input ->
 pOutput :: Parser DerivationOutput
 pOutput = do
   pChar '('
-  name <- pQuotedString
+  name <- pQuotedText
   pChar ','
-  pathStr <- pQuotedString
+  pathStr <- pQuotedText
   pChar ','
-  hashAlgo <- pQuotedString
+  hashAlgo <- pQuotedText
   pChar ','
-  hashVal <- pQuotedString
+  hashVal <- pQuotedText
   pChar ')'
   case parseStorePathFromATerm pathStr of
     Just sp -> pure (DerivationOutput name sp hashAlgo hashVal)
@@ -415,9 +476,9 @@ parseStorePathFromATerm pathStr =
 pInputDrv :: Parser (StorePath, [Text])
 pInputDrv = do
   pChar '('
-  pathStr <- pQuotedString
+  pathStr <- pQuotedText
   pChar ','
-  outs <- pList pQuotedString
+  outs <- pList pQuotedText
   pChar ')'
   case parseStorePathFromATerm pathStr of
     Just sp -> pure (sp, outs)
@@ -426,31 +487,32 @@ pInputDrv = do
 -- | Parse an input source (quoted store path string).
 pInputSrc :: Parser StorePath
 pInputSrc = do
-  pathStr <- pQuotedString
+  pathStr <- pQuotedText
   case parseStorePathFromATerm pathStr of
     Just sp -> pure sp
     Nothing -> parserFail ("invalid input src store path: " <> pathStr)
 
--- | Parse an environment pair: @(key, value)@.
-pEnvPair :: Parser (Text, Text)
+-- | Parse an environment pair: @(key, value)@.  The key is an attr name
+-- (Text); the value keeps its raw bytes.
+pEnvPair :: Parser (Text, ByteString)
 pEnvPair = do
   pChar '('
-  key <- pQuotedString
+  key <- pQuotedText
   pChar ','
   val <- pQuotedString
   pChar ')'
   pure (key, val)
 
--- | Parse a full derivation from ATerm format.
+-- | Parse a full derivation from its ATerm bytes.
 -- Format: @Derive([outputs],[inputDrvs],[inputSrcs],platform,builder,[args],[env])@
 --
 -- Total function: returns @Left@ on any malformed input.
-fromATerm :: Text -> Either Text Derivation
+fromATerm :: ByteString -> Either Text Derivation
 fromATerm input = case runParser pDerivation input of
   Left err -> Left ("ATerm parse error: " <> err)
   Right (drv, remaining)
-    | T.null remaining -> Right drv
-    | otherwise -> Left ("ATerm parse error: unexpected trailing: " <> T.take 40 remaining)
+    | BS.null remaining -> Right drv
+    | otherwise -> Left ("ATerm parse error: unexpected trailing: " <> snippet (BS.take 40 remaining))
 
 pDerivation :: Parser Derivation
 pDerivation = do
@@ -461,7 +523,7 @@ pDerivation = do
   pChar ','
   inputSrcs <- pList pInputSrc
   pChar ','
-  platformStr <- pQuotedString
+  platformStr <- pQuotedText
   pChar ','
   builder <- pQuotedString
   pChar ','

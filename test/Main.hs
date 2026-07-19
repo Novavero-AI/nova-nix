@@ -19,6 +19,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
@@ -97,6 +98,10 @@ assertEqual label expected actual
           <> T.pack (show expected)
           <> " but got "
           <> T.pack (show actual)
+
+-- | Render string-value bytes in a failure message (display-only decode).
+bytesText :: BS.ByteString -> Text
+bytesText = TE.decodeUtf8With lenientDecode
 
 assertRight :: (Show e) => Text -> Either e a -> (a -> TestResult) -> TestResult
 assertRight label result check = case result of
@@ -1997,7 +2002,7 @@ testBatchAIO = do
           result <- evalNixIO testDir "builtins.getEnv \"PATH\""
           runTest "getEnv PATH non-empty (IO)" $ assertRight "getEnv-io" result $ \val ->
             case val of
-              VStr s _ -> if T.null s then Fail "PATH was empty" else Pass
+              VStr s _ -> if BS.null s then Fail "PATH was empty" else Pass
               _ -> Fail ("expected VStr, got " <> T.pack (show val)),
         -- currentTime in IO should be > 0
         do
@@ -2227,28 +2232,28 @@ testBatchG = do
   sequence
     [ runTest "ATerm minimal" $
         let aterm = toATerm minimalDrv
-         in if T.isPrefixOf "Derive(" aterm && T.isSuffixOf ")" aterm
+         in if BS.isPrefixOf "Derive(" aterm && BS.isSuffixOf ")" aterm
               then Pass
-              else Fail ("bad ATerm: " <> aterm),
+              else Fail ("bad ATerm: " <> bytesText aterm),
       runTest "ATerm has output" $
         let aterm = toATerm drvWithOutput
-         in if "\"out\"" `T.isInfixOf` aterm
+         in if "\"out\"" `BS.isInfixOf` aterm
               then Pass
-              else Fail ("missing output in ATerm: " <> aterm),
+              else Fail ("missing output in ATerm: " <> bytesText aterm),
       runTest "ATerm env sorted" $
         let aterm = toATerm drvWithEnv
          in -- "name" should come before "system" in sorted order
-            case (T.breakOn "\"name\"" aterm, T.breakOn "\"system\"" aterm) of
+            case (BS.breakSubstring "\"name\"" aterm, BS.breakSubstring "\"system\"" aterm) of
               ((before1, _), (before2, _)) ->
-                if T.length before1 < T.length before2
+                if BS.length before1 < BS.length before2
                   then Pass
-                  else Fail ("env not sorted in ATerm: " <> aterm),
+                  else Fail ("env not sorted in ATerm: " <> bytesText aterm),
       runTest "ATerm string escaping" $
         let drv = minimalDrv {drvEnv = Map.fromList [("msg", "hello\nworld")]}
             aterm = toATerm drv
-         in if "\\n" `T.isInfixOf` aterm
+         in if "\\n" `BS.isInfixOf` aterm
               then Pass
-              else Fail ("missing escaped newline: " <> aterm),
+              else Fail ("missing escaped newline: " <> bytesText aterm),
       runTest "ATerm deterministic" $
         assertEqual "deterministic" (toATerm minimalDrv) (toATerm minimalDrv),
       -- platformToText
@@ -2283,17 +2288,17 @@ testBatchH = do
         assertRight "drv-drvPath" (evalNix "let d = derivation { name = \"hello\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d.drvPath") $ \val ->
           case val of
             VStr p ctx ->
-              if "/nix/store/" `T.isPrefixOf` p && ".drv" `T.isSuffixOf` p && ctx /= emptyContext
+              if "/nix/store/" `BS.isPrefixOf` p && ".drv" `BS.isSuffixOf` p && ctx /= emptyContext
                 then Pass
-                else Fail ("bad drvPath: " <> p)
+                else Fail ("bad drvPath: " <> bytesText p)
             _ -> Fail ("expected VStr with context, got " <> T.pack (show val)),
       runTest "derivation has outPath" $
         assertRight "drv-outPath" (evalNix "let d = derivation { name = \"hello\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d.outPath") $ \val ->
           case val of
             VStr p ctx ->
-              if "/nix/store/" `T.isPrefixOf` p && ctx /= emptyContext
+              if "/nix/store/" `BS.isPrefixOf` p && ctx /= emptyContext
                 then Pass
-                else Fail ("bad outPath: " <> p)
+                else Fail ("bad outPath: " <> bytesText p)
             _ -> Fail ("expected VStr with context, got " <> T.pack (show val)),
       -- 'derivation' is lazy (matches C++ Nix): the missing-required-attribute
       -- error fires when a path is forced (.drvPath), not at construction.
@@ -2499,8 +2504,8 @@ testDrvContext = do
           (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in builtins.elemAt (builtins.attrNames (builtins.getContext d.drvPath)) 0")
         $ \val -> case val of
           VStr key _
-            | "/nix/store/" `T.isPrefixOf` key && not ("\\" `T.isInfixOf` key) -> Pass
-            | otherwise -> Fail ("expected a canonical /nix/store key, got " <> key)
+            | "/nix/store/" `BS.isPrefixOf` key && not ("\\" `BS.isInfixOf` key) -> Pass
+            | otherwise -> Fail ("expected a canonical /nix/store key, got " <> bytesText key)
           _ -> Fail ("expected VStr, got " <> T.pack (show val)),
       -- appendContext: adds context to plain string
       runTest "appendContext adds context" $
@@ -3096,7 +3101,7 @@ testBuildOrchestrator = do
         pure $ case (r1, r2) of
           (Right (VStr a _), Right (VStr b _))
             | a == b -> Pass
-            | otherwise -> Fail ("drvPath not deterministic: " <> a <> " vs " <> b)
+            | otherwise -> Fail ("drvPath not deterministic: " <> bytesText a <> " vs " <> bytesText b)
           _ -> Fail "expected main.drvPath to evaluate to a string under IO eval",
       -- drv1: embedding another derivation's drvPath (an all-outputs ref) adds
       -- it to inputDrvs; the IO evaluator recovers its output names in-session.
@@ -3752,7 +3757,7 @@ testUnpackBuildIO = do
                 drvArgs = [],
                 drvEnv =
                   Map.fromList
-                    [(envSrcs, T.intercalate " " (map T.pack srcFiles))]
+                    [(envSrcs, TE.encodeUtf8 (T.intercalate " " (map T.pack srcFiles)))]
               }
           seedOut = StorePath (T.replicate 31 "0" <> "2") "unpack-seed"
           collideOut = StorePath (T.replicate 31 "0" <> "3") "unpack-collide"
@@ -4845,7 +4850,7 @@ testFromATerm = do
         let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "test.drv"
             destFile = storePathToFilePath (stDir store) sp
         writeDrv store simpleTestDrv sp
-        contents <- TIO.readFile destFile
+        contents <- BS.readFile destFile
         closeStore store
         removeIfExists tmpStore
         pure (assertEqual "writeDrv content" (toATerm simpleTestDrv) contents),
@@ -4885,7 +4890,7 @@ testFromATerm = do
         $ \val -> case val of
           VDerivation drv
             | Just op <- Map.lookup "out" (drvEnv drv),
-              "/nix/store/" `T.isPrefixOf` op,
+              "/nix/store/" `BS.isPrefixOf` op,
               Just nm <- Map.lookup "name" (drvEnv drv),
               nm == "test" ->
                 Pass
@@ -4915,9 +4920,9 @@ mkTestBuildDrv shell outSP script =
       drvInputDrvs = Map.empty,
       drvInputSrcs = [],
       drvPlatform = currentPlatform,
-      drvBuilder = shell,
-      drvArgs = ["-c", script],
-      drvEnv = Map.fromList [("name", "test-build"), ("system", platformToText currentPlatform)]
+      drvBuilder = TE.encodeUtf8 shell,
+      drvArgs = ["-c", TE.encodeUtf8 script],
+      drvEnv = Map.fromList [("name", "test-build"), ("system", TE.encodeUtf8 (platformToText currentPlatform))]
     }
 
 testBuilder :: IO [Bool]
@@ -5116,7 +5121,7 @@ testBuilder = do
                   drvInputDrvs = Map.empty,
                   drvInputSrcs = [],
                   drvPlatform = currentPlatform,
-                  drvBuilder = shell,
+                  drvBuilder = TE.encodeUtf8 shell,
                   drvArgs = ["-c", "mkdir -p $out && echo lib > $out/lib.txt && mkdir -p $dev && echo headers > $dev/include.h"],
                   drvEnv = Map.fromList [("name", "multi")]
                 }
@@ -5411,11 +5416,11 @@ testToJSONPathIO = do
           result <- evalNixIO testDir "builtins.toJSON ./data.txt"
           pure $ case result of
             Right (VStr json ctx) ->
-              if "\"/nix/store/" `T.isPrefixOf` json
-                && "-data.txt\"" `T.isSuffixOf` json
+              if "\"/nix/store/" `BS.isPrefixOf` json
+                && "-data.txt\"" `BS.isSuffixOf` json
                 && ctx /= emptyContext
                 then Pass
-                else Fail ("expected a quoted store path with context, got " <> json)
+                else Fail ("expected a quoted store path with context, got " <> bytesText json)
             Right other -> Fail ("expected VStr, got " <> T.pack (show other))
             Left err -> Fail ("eval error: " <> err)
       ]
@@ -6358,6 +6363,155 @@ testStaticGlobalsSync = do
 -- Main
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Tests: byte-indexed string semantics (issue #34)
+-- ---------------------------------------------------------------------------
+
+-- | The pinned byte-semantics suite: a Nix string is a byte string, so
+-- lengths, slices, regexes, and replaceStrings all index BYTES, and the
+-- hash of a value is the hash of exactly its bytes.  Multibyte content
+-- enters through source literals here (the parser interns their UTF-8);
+-- arbitrary/invalid bytes enter via readFile in the IO group below.
+testByteStringSemantics :: IO [Bool]
+testByteStringSemantics = do
+  putStrLn "eval/byte-strings"
+  sequence
+    [ -- stringLength / substring index bytes
+      runTest "stringLength counts bytes" $
+        assertEval "len-bytes" "builtins.stringLength \"ä\"" (VInt 2),
+      runTest "substring slices at byte offsets" $
+        assertEval "substr-bytes" "builtins.stringLength (builtins.substring 0 1 \"ä\")" (VInt 1),
+      runTest "mid-codepoint slices reassemble byte-exactly" $
+        assertEval
+          "substr-reassemble"
+          "builtins.substring 0 1 \"ä\" + builtins.substring 1 1 \"ä\" == \"ä\""
+          (VBool True),
+      -- the hash sees exactly the value's bytes
+      runTest "hashString of a mid-codepoint slice is the raw byte's sha256" $
+        assertEval
+          "hash-midbyte"
+          "builtins.hashString \"sha256\" (builtins.substring 0 1 \"ä\")"
+          (mkStr (Hash.bytesToHexText (sha256Digest (BS.take 1 (TE.encodeUtf8 "ä"))))),
+      runTest "hashString of valid UTF-8 is unchanged by the byte layer" $
+        assertEval
+          "hash-utf8-stable"
+          "builtins.hashString \"sha256\" \"ä\""
+          (mkStr (Hash.bytesToHexText (sha256Digest (TE.encodeUtf8 "ä")))),
+      -- regexes run over bytes ('.' matches ONE byte)
+      runTest "match . does not match a 2-byte char" $
+        assertEval "match-one-byte" "builtins.match \".\" \"ä\"" VNull,
+      runTest "match .. matches a 2-byte char" $
+        assertEval "match-two-bytes" "builtins.match \"..\" \"ä\" == []" (VBool True),
+      runTest "a multibyte pattern matches its own bytes" $
+        assertEval "match-multibyte-pattern" "builtins.match \"ä\" \"ä\" == []" (VBool True),
+      -- replaceStrings with an empty 'from' steps one BYTE
+      runTest "replaceStrings empty-from inserts between bytes" $
+        assertEval
+          "replace-empty-from"
+          "builtins.stringLength (builtins.replaceStrings [\"\"] [\"-\"] \"ä\")"
+          (VInt 5),
+      runTest "replaceStrings empty-from result is byte-exact" $
+        assertEval
+          "replace-empty-from-bytes"
+          "builtins.replaceStrings [\"\"] [\"-\"] \"ä\" == \"-\" + builtins.substring 0 1 \"ä\" + \"-\" + builtins.substring 1 1 \"ä\" + \"-\""
+          (VBool True),
+      -- strict-decode boundaries reject bytes that are not UTF-8
+      runTest "toJSON rejects invalid UTF-8" $
+        assertEvalFail "tojson-invalid" "builtins.toJSON (builtins.substring 0 1 \"ä\")",
+      runTest "getAttr rejects an invalid-UTF-8 attr name" $
+        assertEvalFail "getattr-invalid" "builtins.getAttr (builtins.substring 0 1 \"ä\") {}",
+      -- toXML passes bytes through raw (upstream's serializer never validates)
+      runTest "toXML passes a mid-codepoint byte through" $
+        assertEval
+          "toxml-bytes"
+          "builtins.stringLength (builtins.toXML (builtins.substring 0 1 \"ä\")) == builtins.stringLength (builtins.toXML \"x\")"
+          (VBool True),
+      -- a search-path miss is a CATCHABLE error (upstream ThrownError;
+      -- nixpkgs' impure.nix relies on tryEval catching it)
+      runTest "search-path miss is tryEval-catchable" $
+        assertEval
+          "findFile-catchable"
+          "(builtins.tryEval (builtins.findFile builtins.nixPath \"nope-missing\")).success"
+          (VBool False)
+    ]
+
+-- | readFile returns the file's RAW BYTES: BOMs survive, UTF-16 is not
+-- transcoded, invalid UTF-8 is representable, and only NUL is rejected.
+-- The expected hashes are computed from the fixture bytes themselves, so
+-- the assertions pin "hash of the value = hash of the file's bytes".
+testByteStringSemanticsIO :: IO [Bool]
+testByteStringSemanticsIO = do
+  putStrLn "eval/readfile-bytes-io"
+  tmpDir <- getTemporaryDirectory
+  let testDir = tmpDir </> "nova-nix-bytefile-test"
+      bomBytes = BS.pack [0xEF, 0xBB, 0xBF] <> "hi"
+      -- UTF-16LE BOM + U+0101 (both payload bytes nonzero, so no NUL):
+      -- raw passthrough is observable as 4 bytes instead of a decoded char.
+      utf16Bytes = BS.pack [0xFF, 0xFE, 0x01, 0x01]
+      -- UTF-16LE ASCII interleaves NUL bytes - upstream readFile REJECTS it.
+      utf16AsciiBytes = BS.pack [0xFF, 0xFE, 0x68, 0x00, 0x69, 0x00]
+      invalidBytes = "a" <> BS.singleton 0xFF <> "b"
+      nulBytes = "a" <> BS.singleton 0x00 <> "b"
+  bracket_
+    ( do
+        createDirectoryIfMissing True testDir
+        BS.writeFile (testDir </> "bom.bin") bomBytes
+        BS.writeFile (testDir </> "utf16.bin") utf16Bytes
+        BS.writeFile (testDir </> "utf16-ascii.bin") utf16AsciiBytes
+        BS.writeFile (testDir </> "invalid.bin") invalidBytes
+        BS.writeFile (testDir </> "nul.bin") nulBytes
+        BS.writeFile (testDir </> "umlaut.bin") (TE.encodeUtf8 "ä")
+    )
+    ( do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+    )
+    $ sequence
+      [ runTestIO
+          "readFile keeps a BOM (raw bytes)"
+          testDir
+          "builtins.stringLength (builtins.readFile ./bom.bin)"
+          (VInt 5),
+        runTestIO
+          "readFile does not transcode UTF-16"
+          testDir
+          "builtins.stringLength (builtins.readFile ./utf16.bin)"
+          (VInt 4),
+        runTestIOFail
+          "readFile rejects UTF-16 ASCII (its NUL bytes)"
+          testDir
+          "builtins.readFile ./utf16-ascii.bin",
+        runTestIO
+          "readFile passes invalid UTF-8 through"
+          testDir
+          "builtins.stringLength (builtins.readFile ./invalid.bin)"
+          (VInt 3),
+        runTestIO
+          "readFile bytes hash as read (BOM file)"
+          testDir
+          "builtins.hashString \"sha256\" (builtins.readFile ./bom.bin)"
+          (mkStr (Hash.bytesToHexText (sha256Digest bomBytes))),
+        runTestIO
+          "readFile bytes hash as read (UTF-16 file)"
+          testDir
+          "builtins.hashString \"sha256\" (builtins.readFile ./utf16.bin)"
+          (mkStr (Hash.bytesToHexText (sha256Digest utf16Bytes))),
+        runTestIO
+          "readFile of invalid UTF-8 hashes its raw bytes"
+          testDir
+          "builtins.hashString \"sha256\" (builtins.readFile ./invalid.bin)"
+          (mkStr (Hash.bytesToHexText (sha256Digest invalidBytes))),
+        runTestIO
+          "readFile round-trips a multibyte literal"
+          testDir
+          "builtins.readFile ./umlaut.bin == \"ä\""
+          (VBool True),
+        runTestIOFail
+          "readFile rejects an embedded NUL"
+          testDir
+          "builtins.readFile ./nul.bin"
+      ]
+
 main :: IO ()
 main = bracket_ arenaInit arenaDestroy $ do
   hSetBuffering stdout LineBuffering
@@ -6441,6 +6595,8 @@ main = bracket_ arenaInit arenaDestroy $ do
           testPhase4,
           testPhase4IO,
           testToJSONPathIO,
+          testByteStringSemantics,
+          testByteStringSemanticsIO,
           testSymbol,
           testCAttrSet,
           testCThunk,

@@ -43,6 +43,8 @@ module Nix.Eval.Types
     StringContext (..),
     emptyContext,
     mkStr,
+    mkStrBytes,
+    bytesToTextLossy,
     marshalStringContext,
     unmarshalStringContext,
 
@@ -116,6 +118,8 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text.Encoding as TE
+import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, newStablePtr)
@@ -132,7 +136,7 @@ import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool
 import Nix.Eval.CanonPath (canonPath)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
-import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
+import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
 import Nix.Store.Path (StorePath (..))
 import System.IO.Unsafe (unsafePerformIO)
@@ -142,11 +146,13 @@ import qualified Text.Regex.TDFA as RE
 -- Compiled regex
 -- ---------------------------------------------------------------------------
 
--- | Compiled regex with Eq/Show based on source pattern text.
+-- | Compiled regex with Eq/Show based on the source pattern bytes.
 -- Carries the pre-compiled 'RE.Regex' alongside the original pattern
 -- so that partial application of @builtins.match@ / @builtins.split@
--- avoids recompiling the same pattern on every invocation.
-data CompiledRegex = CompiledRegex !Text RE.Regex
+-- avoids recompiling the same pattern on every invocation.  The pattern
+-- is the raw byte string the regex was compiled from: upstream regexes
+-- run over bytes, so byte-identical patterns are the sharing key.
+data CompiledRegex = CompiledRegex !ByteString RE.Regex
 
 instance Eq CompiledRegex where
   CompiledRegex a _ == CompiledRegex b _ = a == b
@@ -177,9 +183,23 @@ newtype StringContext = StringContext {unStringContext :: Set StringContextEleme
 emptyContext :: StringContext
 emptyContext = mempty
 
--- | Smart constructor for context-free strings.
+-- | Smart constructor for context-free strings from 'Text'.
+-- Encodes to the UTF-8 bytes that ARE the string's value: a Nix string
+-- is a byte string, and every Text-producing site goes through here.
 mkStr :: Text -> NixValue
-mkStr t = VStr t emptyContext
+mkStr t = VStr (TE.encodeUtf8 t) emptyContext
+
+-- | Smart constructor for context-free strings from raw bytes
+-- (@builtins.readFile@, substring slices - anything already byte-shaped).
+mkStrBytes :: ByteString -> NixValue
+mkStrBytes b = VStr b emptyContext
+
+-- | Decode string-value bytes for DISPLAY ONLY (trace output, error
+-- messages, value pretty-printing): invalid UTF-8 becomes U+FFFD.
+-- Never feed the result back into a value, a hash, or an attr name -
+-- identity-bearing boundaries decode strictly and error instead.
+bytesToTextLossy :: ByteString -> Text
+bytesToTextLossy = TE.decodeUtf8With lenientDecode
 
 -- ---------------------------------------------------------------------------
 -- Thunks
@@ -259,7 +279,7 @@ readThunkValue (Thunk ptr) =
           ValueFloat -> VFloat <$> cthunkGetFloat ptr
           ValueBool -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
           ValueNull -> pure VNull
-          ValueStr -> (\sym -> VStr (symbolText (Symbol sym)) emptyContext) <$> cthunkGetStr ptr
+          ValueStr -> (\sym -> VStr (symbolBytes (Symbol sym)) emptyContext) <$> cthunkGetStr ptr
           ValuePath -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
           ValueList -> do
             listPtr <- cthunkGetList ptr
@@ -285,8 +305,13 @@ data NixValue
     VBool !Bool
   | -- | The null value.
     VNull
-  | -- | String with dependency context.
-    VStr !Text !StringContext
+  | -- | String with dependency context.  The payload is a BYTE string,
+    -- as upstream: @stringLength@/@substring@ index bytes, regexes match
+    -- bytes, and @readFile@ carries raw file bytes (so invalid UTF-8 is
+    -- representable).  Text enters via 'mkStr' (UTF-8 encode) and leaves
+    -- through explicit decode at boundaries (attr names strictly, display
+    -- lossily via 'bytesToTextLossy').
+    VStr !ByteString !StringContext
   | -- | Path.
     VPath !Text
   | -- | List of thunks (lazy elements), backed by C array.
@@ -816,10 +841,10 @@ newComputedNullPtr = unsafePerformIO cthunkNewComputedNull
 
 -- | Wrap a context-free string in a pre-computed C thunk (interned symbol, no StablePtr).
 {-# NOINLINE newComputedStrPtr #-}
-newComputedStrPtr :: Text -> CThunkPtr
+newComputedStrPtr :: ByteString -> CThunkPtr
 newComputedStrPtr t =
   unsafePerformIO $ t `seq` do
-    Symbol sym <- symbolIntern t
+    Symbol sym <- symbolInternBytes t
     cthunkNewComputedStr sym
 
 -- | Wrap a path in a pre-computed C thunk (interned symbol, no StablePtr).
@@ -839,9 +864,9 @@ newComputedListPtrC (CList clistPtr) =
       cthunkNewComputedList (castPtr clistPtr)
 
 -- | Wrap a string with context in a pre-computed C thunk (no StablePtr).
--- Interns the text and all StorePath fields as symbols, builds nn_ctxstr_t.
+-- Interns the payload bytes and all StorePath fields as symbols, builds nn_ctxstr_t.
 {-# NOINLINE newComputedCtxStrPtr #-}
-newComputedCtxStrPtr :: Text -> StringContext -> CThunkPtr
+newComputedCtxStrPtr :: ByteString -> StringContext -> CThunkPtr
 newComputedCtxStrPtr t ctx =
   unsafePerformIO $
     t `seq`
@@ -926,10 +951,12 @@ unmarshalLambdaValue rawPtr = do
       let defMaybe = if hasDef /= 0 then Just defIdx else Nothing
       pure (EvalFormal (symbolText (Symbol nameSym)) defMaybe)
 
--- | Marshal Text + StringContext to a C nn_ctxstr_t.
-marshalStringContext :: Text -> StringContext -> IO CCtxStrPtr
+-- | Marshal payload bytes + StringContext to a C nn_ctxstr_t.  The
+-- payload interns byte-level ('symbolInternBytes'); the StorePath and
+-- output-name fields are Text and intern as UTF-8.
+marshalStringContext :: ByteString -> StringContext -> IO CCtxStrPtr
 marshalStringContext textVal (StringContext ctxSet) = do
-  Symbol textSym <- symbolIntern textVal
+  Symbol textSym <- symbolInternBytes textVal
   let elems = Set.toAscList ctxSet
       count = fromIntegral (length elems) :: Word16
   ptr <- cctxstrNew textSym count
@@ -954,12 +981,12 @@ marshalStringContext textVal (StringContext ctxSet) = do
       Symbol nameSym <- symbolIntern n
       cctxstrSetAllOutputs eptr eidx hashSym nameSym
 
--- | Unmarshal a C nn_ctxstr_t back to (Text, StringContext).
-unmarshalStringContext :: CCtxStrPtr -> IO (Text, StringContext)
+-- | Unmarshal a C nn_ctxstr_t back to (payload bytes, StringContext).
+unmarshalStringContext :: CCtxStrPtr -> IO (ByteString, StringContext)
 unmarshalStringContext ptr = do
   textSym <- cctxstrText ptr
   count <- cctxstrCtxCount ptr
-  let textVal = symbolText (Symbol textSym)
+  let textVal = symbolBytes (Symbol textSym)
   -- count - 1 underflows Word16 at 0 (defensive: marshal sites store
   -- only non-empty contexts today).
   elems <-
@@ -1071,7 +1098,6 @@ class (Monad m) => MonadEval m where
   -- (throw\/assert); eval errors and aborts propagate.
   catchEvalError :: m a -> m (Either Text a)
 
-  readFileText :: Text -> m Text
   doesPathExist :: Text -> m Bool
 
   -- | List a directory, returning @(name, fileType)@ pairs.
@@ -1087,12 +1113,13 @@ class (Monad m) => MonadEval m where
   -- | Get the current epoch time (seconds since 1970-01-01).
   getCurrentTime :: m Int64
 
-  -- | Write a named text file to the store at upstream's text-path
+  -- | Write a named file to the store at upstream's text-path
   -- (@text:\<refs\>@ scheme, flat sha256 of the contents), returning the
-  -- canonical store path.  The refs are the contents' plain store-path
-  -- references; they participate in the path computation exactly as
-  -- upstream's addTextToStore.
-  writeToStore :: Text -> Text -> [StorePath] -> m Text
+  -- canonical store path.  The contents are raw bytes (a Nix string's
+  -- payload) - hashed and stored exactly as given.  The refs are the
+  -- contents' plain store-path references; they participate in the path
+  -- computation exactly as upstream's addTextToStore.
+  writeToStore :: Text -> ByteString -> [StorePath] -> m Text
 
   -- | Import a file with a custom scope overlaid on builtins.
   scopedImportFile :: [(Text, Thunk)] -> Text -> m NixValue
@@ -1164,12 +1191,13 @@ class (Monad m) => MonadEval m where
   -- A no-op in pure evaluators (no memoization).
   cacheDrvHash :: Text -> Text -> m ()
 
-  -- | Record a derivation's serialized @.drv@ ATerm under its @.drv@ store
-  -- path, as each derivation is computed (bottom-up).  Unlike 'cacheDrvHash'
-  -- (which stores only the modulo hash), this retains the full ATerm so the
-  -- build driver can materialize the entire input-@.drv@ closure to the store
-  -- before a dependency-aware build.  A no-op in pure evaluators.
-  recordDrvAterm :: Text -> Text -> m ()
+  -- | Record a derivation's serialized @.drv@ ATerm (the exact bytes whose
+  -- hash is its store path) under its @.drv@ store path, as each derivation
+  -- is computed (bottom-up).  Unlike 'cacheDrvHash' (which stores only the
+  -- modulo hash), this retains the full ATerm so the build driver can
+  -- materialize the entire input-@.drv@ closure to the store before a
+  -- dependency-aware build.  A no-op in pure evaluators.
+  recordDrvAterm :: Text -> ByteString -> m ()
 
   -- | Read and parse a derivation from its @.drv@ in the store, or 'Nothing'
   -- if it is absent or unreadable.  Used to resolve an input derivation's
@@ -1226,7 +1254,6 @@ instance MonadEval PureEval where
       Left (PThrow t) -> Right (Left t)
       Left other -> Left other
       Right a -> Right (Right a)
-  readFileText _ = throwEvalError "readFile: not available in pure evaluation"
   doesPathExist _ = pure False
   listDirectory _ = throwEvalError "builtins.readDir: not available in pure evaluation"
   importFile _ = throwEvalError "import: not available in pure evaluation"
@@ -1234,7 +1261,7 @@ instance MonadEval PureEval where
   getCurrentTime = pure 0
   writeToStore _ _ _ = throwEvalError "toFile: not available in pure evaluation"
   scopedImportFile _ _ = throwEvalError "scopedImport: not available in pure evaluation"
-  readFileBytes _ = throwEvalError "hashFile: not available in pure evaluation"
+  readFileBytes _ = throwEvalError "readFile: not available in pure evaluation"
   getFileType _ = throwEvalError "readFileType: not available in pure evaluation"
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
   copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in pure evaluation"
@@ -1275,7 +1302,7 @@ instance MonadEval PureEval where
               ValueNull -> pure VNull
               ValueStr ->
                 let sym = unsafePerformIO (cthunkGetStr ptr)
-                 in pure (VStr (symbolText (Symbol sym)) emptyContext)
+                 in pure (VStr (symbolBytes (Symbol sym)) emptyContext)
               ValuePath ->
                 let sym = unsafePerformIO (cthunkGetPath ptr)
                  in pure (VPath (symbolText (Symbol sym)))

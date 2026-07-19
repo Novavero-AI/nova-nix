@@ -73,7 +73,8 @@ import qualified Data.Array as Array
 import Data.Bits (complement, xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
-import Data.Char (chr, digitToInt, isAlpha, isDigit, isHexDigit, isOctDigit, ord)
+import qualified Data.ByteString.Char8 as BC
+import Data.Char (chr, digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, isOctDigit, ord)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
 import Data.List (find, foldl', partition, sort)
@@ -99,7 +100,7 @@ import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBi
 import Nix.Eval.Context (extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, nixCompare, nixEqual)
 import Nix.Eval.StringInterp (coerceToString, formatJsonFloat, formatNixFloat, formatXmlFloat, stripIndentedChunks)
-import Nix.Eval.Symbol (Symbol (..), symbolText)
+import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
 import Nix.Eval.Types
   ( AttrSet (..),
     CAttrSet,
@@ -127,6 +128,7 @@ import Nix.Eval.Types
     attrSetToMap,
     buildCAttrSetKeys,
     buildCSlots,
+    bytesToTextLossy,
     cheapThunkBc,
     checkedEnvPtr,
     clistFromThunks,
@@ -142,6 +144,7 @@ import Nix.Eval.Types
     fillCAttrSetValues,
     fillCSlots,
     mkStr,
+    mkStrBytes,
     mkSyntheticThunk,
     mkThunk,
     mkThunkBc,
@@ -170,6 +173,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info
 import Text.Regex.TDFA (matchAllText)
 import qualified Text.Regex.TDFA as RE
+import Text.Regex.TDFA.ByteString ()
 
 -- | Evaluate a Nix expression in an environment.
 -- Compiles the expression to bytecode and dispatches to 'evalBytecode'.
@@ -185,6 +189,16 @@ eval env expr =
 -- after the first force) while pure evaluators simply re-evaluate.
 force :: (MonadEval m) => Thunk -> m NixValue
 force = forceThunk evalBytecode
+
+-- | Strict UTF-8 decode at a Text-typed boundary (attr names, filesystem
+-- paths, algorithm names, ...).  A Nix string is a byte string; where the
+-- implementation needs 'Text', invalid UTF-8 is a clean eval error - never
+-- a lossy replacement, which would smuggle a DIFFERENT string through an
+-- identity-bearing boundary.
+decodedText :: (MonadEval m) => Text -> BS.ByteString -> m Text
+decodedText what bytes = case TE.decodeUtf8' bytes of
+  Right t -> pure t
+  Left _ -> throwEvalError (what <> ": invalid UTF-8 in string")
 
 -- | Evaluate a bytecode instruction by index.
 -- This is the primary evaluator - reads opcodes from the C bytecode
@@ -208,7 +222,7 @@ evalBytecode env bcIdx =
         OpLitNull -> pure VNull
         OpLitUri ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
-           in pure (mkStr (symbolText (Symbol sym)))
+           in pure (mkStrBytes (symbolBytes (Symbol sym)))
         OpLitPath ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
            in VPath <$> resolvePathLiteral (symbolText (Symbol sym))
@@ -345,11 +359,14 @@ evalAddWithCoercion left right = case (left, right) of
   -- Path + coercible: the result stays a path, the right side coerces
   -- WITHOUT a store copy, and a right side carrying string context is an
   -- error, as upstream (a store-path reference cannot survive inside a
-  -- path value).
+  -- path value).  Paths are Text in nova, so the appended bytes must
+  -- decode; invalid UTF-8 cannot form a filesystem path here.
   (VPath a, _) -> do
     (rightStr, rightCtx) <- coerceAddOperand right
     if rightCtx == emptyContext
-      then pure (VPath (canonPath (a <> rightStr)))
+      then do
+        appended <- decodedText "path concatenation" rightStr
+        pure (VPath (canonPath (a <> appended)))
       else throwEvalError "cannot append a string with context (a store-path reference) to a path"
   -- Strings: direct concat.
   (VStr {}, VStr {}) -> evalBinary force OpAdd left right
@@ -368,7 +385,7 @@ evalAddWithCoercion left right = case (left, right) of
 -- strings, sets with @__toString@\/@outPath@, and paths (copied to the
 -- store, carrying context) coerce; numbers, booleans, null, lists, and
 -- functions are type errors.
-coerceAddOperand :: (MonadEval m) => NixValue -> m (Text, StringContext)
+coerceAddOperand :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
 coerceAddOperand v@(VStr {}) = coerceToString False force applyValue v
 coerceAddOperand v@(VAttrs {}) = coerceToString False force applyValue v
 coerceAddOperand v@(VPath _) = coerceToStoreString v
@@ -420,7 +437,7 @@ evalBcStr env bcIdx0 = do
   let count = fromIntegral (unsafePerformIO (cbcShortArg bcIdx0))
       dataOff = unsafePerformIO (cbcArg1 bcIdx0)
   chunks <- evalBcStringParts env count dataOff
-  pure (VStr (T.concat [t | (_, t, _) <- chunks]) (mconcat [c | (_, _, c) <- chunks]))
+  pure (VStr (BS.concat [t | (_, t, _) <- chunks]) (mconcat [c | (_, _, c) <- chunks]))
 
 -- | Evaluate an indented string literal from bytecode data buffer.  The common
 -- indentation is stripped from the LITERAL chunks before concatenation, so an
@@ -438,13 +455,13 @@ evalBcIndStr env bcIdx0 = do
 -- words: (tag, value).  tag=0 means literal (value = symbol), tag=1 means
 -- interpolation (value = bc_idx).  The 'Bool' marks literal (@True@) vs
 -- interpolated (@False@) so indented strings strip only the literals.
-evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [(Bool, Text, StringContext)]
+evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [(Bool, BS.ByteString, StringContext)]
 evalBcStringParts _ 0 _ = pure []
 evalBcStringParts env n off = do
   let tag = unsafePerformIO (cbcData off)
       val = unsafePerformIO (cbcData (off + 1))
   chunk <- case tag of
-    0 -> pure (True, symbolText (Symbol val), emptyContext)
+    0 -> pure (True, symbolBytes (Symbol val), emptyContext)
     _ -> do
       v <- evalBytecode env val
       (txt, ctx) <- coerceToStringInterp v
@@ -592,7 +609,7 @@ walkBcAttrPath env n off val = case val of
         then do
           keyResult <- evalBytecode env keyVal
           case keyResult of
-            VStr s _ -> pure (Just s)
+            VStr s _ -> Just <$> decodedText "dynamic attribute key" s
             VNull -> pure Nothing
             _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName keyResult)
         else pure (Just (symbolText (Symbol keyVal)))
@@ -804,7 +821,7 @@ resolveBcKey _env (BcStaticKey sym) = pure (Just (symbolText (Symbol sym)))
 resolveBcKey env (BcDynamicKey bcIdx0) = do
   val <- evalBytecode env bcIdx0
   case val of
-    VStr s _ -> pure (Just s)
+    VStr s _ -> Just <$> decodedText "dynamic attribute key" s
     VNull -> pure Nothing
     _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName val)
 
@@ -1248,7 +1265,7 @@ precompileArgs _ args = args
 
 -- | The single-element arg list for a regex builtin: the compiled pattern
 -- if valid, the raw string otherwise (the error surfaces at execute time).
-compiledRegexArg :: Text -> [NixValue]
+compiledRegexArg :: BS.ByteString -> [NixValue]
 compiledRegexArg pat = case cachedCompileRegex pat of
   Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
   Nothing -> [VStr pat emptyContext]
@@ -1518,8 +1535,9 @@ builtinTail other = throwEvalError ("builtins.tail: expected a list, got " <> ty
 -- Builtin implementations - string (arity 1)
 -- ---------------------------------------------------------------------------
 
+-- | Byte length, as upstream: @stringLength "ä"@ is 2, not 1.
 builtinStringLength :: (MonadEval m) => NixValue -> m NixValue
-builtinStringLength (VStr s _) = pure (VInt (fromIntegral (T.length s)))
+builtinStringLength (VStr s _) = pure (VInt (fromIntegral (BS.length s)))
 builtinStringLength other =
   throwEvalError ("builtins.stringLength: expected a string, got " <> typeName other)
 
@@ -1527,12 +1545,14 @@ builtinStringLength other =
 -- Builtin implementations - control
 -- ---------------------------------------------------------------------------
 
+-- | The error channel is Text and display-only (tryEval discards the
+-- message), so throw/abort messages decode lossily.
 builtinThrow :: (MonadEval m) => NixValue -> m NixValue
-builtinThrow (VStr msg _) = throwCatchableError msg
+builtinThrow (VStr msg _) = throwCatchableError (bytesToTextLossy msg)
 builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <> typeName other)
 
 builtinAbort :: (MonadEval m) => NixValue -> m NixValue
-builtinAbort (VStr msg _) = abortEvaluation msg
+builtinAbort (VStr msg _) = abortEvaluation (bytesToTextLossy msg)
 builtinAbort other = abortEvaluation ("builtins.abort: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
@@ -1578,7 +1598,9 @@ listToAttrsPair thunk = do
       case nameVal of
         VStr keyName _ ->
           case attrSetLookup "value" attrs of
-            Just valueThunk -> pure (keyName, valueThunk)
+            Just valueThunk -> do
+              key <- decodedText "builtins.listToAttrs: attribute name" keyName
+              pure (key, valueThunk)
             Nothing -> throwEvalError "builtins.listToAttrs: element missing 'value'"
         _ -> throwEvalError "builtins.listToAttrs: 'name' must be a string"
     _ -> throwEvalError "builtins.listToAttrs: element must be a set"
@@ -1588,18 +1610,20 @@ listToAttrsPair thunk = do
 -- ---------------------------------------------------------------------------
 
 builtinHasAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHasAttr (VStr key _) (VAttrs attrs) =
-  pure (VBool (attrSetMember key attrs))
+builtinHasAttr (VStr key _) (VAttrs attrs) = do
+  name <- decodedText "builtins.hasAttr" key
+  pure (VBool (attrSetMember name attrs))
 builtinHasAttr (VStr _ _) other =
   throwEvalError ("builtins.hasAttr: expected a set, got " <> typeName other)
 builtinHasAttr other _ =
   throwEvalError ("builtins.hasAttr: expected a string, got " <> typeName other)
 
 builtinGetAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinGetAttr (VStr key _) (VAttrs attrs) =
-  case attrSetLookup key attrs of
+builtinGetAttr (VStr key _) (VAttrs attrs) = do
+  name <- decodedText "builtins.getAttr" key
+  case attrSetLookup name attrs of
     Just thunk -> force thunk
-    Nothing -> throwEvalError ("builtins.getAttr: attribute '" <> key <> "' not found")
+    Nothing -> throwEvalError ("builtins.getAttr: attribute '" <> name <> "' not found")
 builtinGetAttr (VStr _ _) other =
   throwEvalError ("builtins.getAttr: expected a set, got " <> typeName other)
 builtinGetAttr other _ =
@@ -1614,7 +1638,7 @@ builtinRemoveAttrs (VAttrs attrs) (VList cl) = do
     forceToString thunk = do
       val <- force thunk
       case val of
-        VStr s _ -> pure s
+        VStr s _ -> decodedText "builtins.removeAttrs" s
         _ -> throwEvalError "builtins.removeAttrs: key list must contain strings"
 builtinRemoveAttrs (VAttrs _) other =
   throwEvalError ("builtins.removeAttrs: expected a list, got " <> typeName other)
@@ -1636,8 +1660,9 @@ builtinIntersectAttrs other _ =
 
 builtinCatAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinCatAttrs (VStr key _) (VList cl) = do
+  name <- decodedText "builtins.catAttrs" key
   let thunks = map Thunk (clistThunks cl)
-  vals <- catAttrsCollect key thunks
+  vals <- catAttrsCollect name thunks
   pure (VList (clistFromThunks (map thunkToCPtr vals)))
 builtinCatAttrs (VStr _ _) other =
   throwEvalError ("builtins.catAttrs: expected a list, got " <> typeName other)
@@ -1871,8 +1896,9 @@ groupByCollect _ [] acc = pure acc
 groupByCollect func (thunk : rest) acc = do
   result <- applyValueLazy func thunk
   case result of
-    VStr key _ ->
-      groupByCollect func rest (Map.insertWith (++) key [thunk] acc)
+    VStr key _ -> do
+      name <- decodedText "builtins.groupBy" key
+      groupByCollect func rest (Map.insertWith (++) name [thunk] acc)
     _ -> throwEvalError "builtins.groupBy: function must return a string"
 
 -- ---------------------------------------------------------------------------
@@ -1885,7 +1911,7 @@ builtinConcatStringsSep (VStr sep sepCtx) (VList cl) = do
   pairs <- mapM forceToStrCtx thunks
   let texts = map fst pairs
       mergedCtx = sepCtx <> mconcat (map snd pairs)
-  pure (VStr (T.intercalate sep texts) mergedCtx)
+  pure (VStr (BS.intercalate sep texts) mergedCtx)
   where
     forceToStrCtx thunk = do
       val <- force thunk
@@ -1919,19 +1945,21 @@ foldlStrict op acc (thunk : rest) = do
   stepped <- applyValueLazy partial thunk
   foldlStrict op stepped rest
 
+-- | Byte-indexed slicing, as upstream: offsets and lengths count bytes,
+-- and a slice may fall mid-codepoint (the resulting bytes are the value).
 builtinSubstring :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
 builtinSubstring (VInt start) (VInt len) (VStr s ctx)
   | start < 0 = throwEvalError "builtins.substring: negative start position"
   | otherwise =
       let startPos = fromIntegral start
           -- Nix clamps len to available length (negative len means rest of string)
-          available = T.length s - startPos
+          available = BS.length s - startPos
           clampedLen =
             if len < 0
               then available
               else min (fromIntegral len) available
        in -- Context is preserved through substring (matching real Nix).
-          pure (VStr (T.take clampedLen (T.drop startPos s)) ctx)
+          pure (VStr (BS.take clampedLen (BS.drop startPos s)) ctx)
 builtinSubstring _ _ (VStr _ _) =
   throwEvalError "builtins.substring: start and length must be integers"
 builtinSubstring _ _ other =
@@ -1961,13 +1989,13 @@ deferApplyExpr = EApp (EResolvedVar 0 0) (EResolvedVar 0 1)
 -- Like 'coerceToString' but additionally handles lists: elements are
 -- recursively coerced and joined with spaces, matching real Nix semantics.
 -- @toString [1 2 3]@ gives @"1 2 3"@.
-coerceToStringPermissive :: (MonadEval m) => NixValue -> m (Text, StringContext)
+coerceToStringPermissive :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
 coerceToStringPermissive (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   parts <- mapM coerceThunk thunks
   let texts = map fst parts
       ctx = mconcat (map snd parts)
-  pure (T.intercalate " " texts, ctx)
+  pure (BS.intercalate " " texts, ctx)
   where
     coerceThunk thunk = do
       val <- force thunk
@@ -1979,20 +2007,24 @@ coerceToStringPermissive other = coerceToString True force applyValue other
 -- the store: it becomes its source store path, with that path added to the
 -- string context so it lands in the derivation's @inputSrcs@ - matching C++
 -- Nix's copy-to-store coercion of paths in derivation arguments/environment.
-coerceToStoreString :: (MonadEval m) => NixValue -> m (Text, StringContext)
-coerceToStoreString (VPath p) = sourcePathWithContext p
+coerceToStoreString :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
+coerceToStoreString (VPath p) = do
+  (spText, ctx) <- sourcePathWithContext p
+  pure (TE.encodeUtf8 spText, ctx)
 coerceToStoreString (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   parts <- mapM (force >=> coerceToStoreString) thunks
-  pure (T.intercalate " " (map fst parts), mconcat (map snd parts))
+  pure (BS.intercalate " " (map fst parts), mconcat (map snd parts))
 coerceToStoreString other = coerceToStringPermissive other
 
 -- | Coerce a value for string interpolation (@"${...}"@).  Like
 -- 'coerceToString', but a path literal is copied into the store and replaced by
 -- its source store path (with context) - matching C++ Nix, where interpolation
 -- uses @copyToStore = true@, unlike 'builtins.toString', which does not copy.
-coerceToStringInterp :: (MonadEval m) => NixValue -> m (Text, StringContext)
-coerceToStringInterp (VPath p) = sourcePathWithContext p
+coerceToStringInterp :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
+coerceToStringInterp (VPath p) = do
+  (spText, ctx) <- sourcePathWithContext p
+  pure (TE.encodeUtf8 spText, ctx)
 coerceToStringInterp other = coerceToString False force applyValue other
 
 -- | The store path a source path literal coerces to, carrying its
@@ -2057,7 +2089,7 @@ intFromDouble ctx rounder f
     rounded = rounder f
 
 builtinDiscardContext :: (MonadEval m) => NixValue -> m NixValue
-builtinDiscardContext (VStr s _) = pure (mkStr s)
+builtinDiscardContext (VStr s _) = pure (mkStrBytes s)
 builtinDiscardContext other =
   throwEvalError ("builtins.unsafeDiscardStringContext: expected a string, got " <> typeName other)
 
@@ -2224,24 +2256,29 @@ parseContextAttrs attrs = do
     forceToOutputName thunk = do
       val <- force thunk
       case val of
-        VStr s _ -> pure s
+        VStr s _ -> decodedText "builtins.appendContext" s
         _ -> throwEvalError "builtins.appendContext: output name must be a string"
 
 builtinBaseNameOf :: (MonadEval m) => NixValue -> m NixValue
-builtinBaseNameOf (VStr s ctx) = pure (VStr (lastComponent s) ctx)
+builtinBaseNameOf (VStr s ctx) = pure (VStr (lastComponentBytes s) ctx)
 builtinBaseNameOf (VPath p) = pure (mkStr (lastComponent p))
 builtinBaseNameOf other =
   throwEvalError ("builtins.baseNameOf: expected a string or path, got " <> typeName other)
 
 lastComponent :: Text -> Text
-lastComponent t = case T.splitOn "/" t of
-  [] -> t
-  parts -> case reverse (filter (not . T.null) parts) of
-    [] -> ""
-    (final : _) -> final
+lastComponent t = case reverse (filter (not . T.null) (T.splitOn "/" t)) of
+  [] -> ""
+  (final : _) -> final
+
+-- | Byte-level 'lastComponent' for string operands ('/' is a single byte
+-- in UTF-8 and never occurs inside a multi-byte sequence).
+lastComponentBytes :: BS.ByteString -> BS.ByteString
+lastComponentBytes t = case reverse (filter (not . BS.null) (BC.split '/' t)) of
+  [] -> ""
+  (final : _) -> final
 
 builtinDirOf :: (MonadEval m) => NixValue -> m NixValue
-builtinDirOf (VStr s ctx) = pure (VStr (dirComponent s) ctx)
+builtinDirOf (VStr s ctx) = pure (VStr (dirComponentBytes s) ctx)
 builtinDirOf (VPath p) = pure (VPath (dirComponent p))
 builtinDirOf other =
   throwEvalError ("builtins.dirOf: expected a string or path, got " <> typeName other)
@@ -2254,6 +2291,16 @@ dirComponent t =
       let dir = T.take (T.length t - n - 1) t
        in -- A leading or sole '/' leaves an empty prefix; Nix's dirOf yields "/".
           if T.null dir then "/" else dir
+
+-- | Byte-level 'dirComponent' for string operands: everything before the
+-- last '/' byte, with the same "." / "/" edge results.
+dirComponentBytes :: BS.ByteString -> BS.ByteString
+dirComponentBytes t =
+  case BC.elemIndexEnd '/' t of
+    Nothing -> "."
+    Just idx ->
+      let dir = BS.take idx t
+       in if BS.null dir then "/" else dir
 
 builtinConcatLists :: (MonadEval m) => NixValue -> m NixValue
 builtinConcatLists (VList cl) = do
@@ -2428,31 +2475,34 @@ builtinReplaceStrings _ _ (VStr _ _) =
 builtinReplaceStrings _ _ other =
   throwEvalError ("builtins.replaceStrings: expected a string, got " <> typeName other)
 
--- | Replace all occurrences, O(n) via chunk list + T.concat.
-replaceAll :: [(Text, Text)] -> Text -> Text
-replaceAll pairs input = T.concat (go input)
+-- | Replace all occurrences, O(n) via chunk list + BS.concat.
+-- Matching and stepping are byte-level, as upstream: an empty @from@
+-- element inserts between BYTES, so a 2-byte character gets a
+-- replacement inside it.
+replaceAll :: [(BS.ByteString, BS.ByteString)] -> BS.ByteString -> BS.ByteString
+replaceAll pairs input = BS.concat (go input)
   where
     go remaining
-      | T.null remaining =
+      | BS.null remaining =
           -- At end of string, still check for empty-from match
           case findMatch pairs remaining of
             Just (replacement, _, _) -> [replacement]
             Nothing -> []
       | otherwise = case findMatch pairs remaining of
           Just (replacement, rest, matched) ->
-            if T.null matched
-              then case T.uncons remaining of
-                -- empty-from: insert replacement then advance 1 char
-                Just (ch, after) -> replacement : T.singleton ch : go after
+            if BS.null matched
+              then case BS.uncons remaining of
+                -- empty-from: insert replacement then advance ONE BYTE
+                Just (byte, after) -> replacement : BS.singleton byte : go after
                 Nothing -> [replacement]
               else replacement : go rest
-          Nothing -> case T.uncons remaining of
-            Just (ch, after) -> T.singleton ch : go after
+          Nothing -> case BS.uncons remaining of
+            Just (byte, after) -> BS.singleton byte : go after
             Nothing -> []
     findMatch [] _ = Nothing
     findMatch ((from, to) : rest) txt
-      | T.null from = Just (to, txt, from)
-      | Just suffix <- T.stripPrefix from txt = Just (to, suffix, from)
+      | BS.null from = Just (to, txt, from)
+      | Just suffix <- BS.stripPrefix from txt = Just (to, suffix, from)
       | otherwise = findMatch rest txt
 
 -- ---------------------------------------------------------------------------
@@ -2463,11 +2513,11 @@ replaceAll pairs input = T.concat (go input)
 -- Regex compilation cache
 -- ---------------------------------------------------------------------------
 
--- | Global regex compilation cache.  Keyed by the raw pattern string
+-- | Global regex compilation cache.  Keyed by the raw pattern bytes
 -- (match and split share entries).  Idempotent memoization via
 -- unsafePerformIO - same rationale as thunk memoization.
 {-# NOINLINE regexCacheRef #-}
-regexCacheRef :: IORef (Map Text RE.Regex)
+regexCacheRef :: IORef (Map BS.ByteString RE.Regex)
 regexCacheRef = unsafePerformIO (newIORef Map.empty)
 
 -- | Compile options matching C++ Nix's POSIX ERE semantics: no multiline
@@ -2477,17 +2527,20 @@ regexCacheRef = unsafePerformIO (newIORef Map.empty)
 wholeStringCompOpt :: RE.CompOption
 wholeStringCompOpt = RE.defaultCompOpt {RE.multiline = False}
 
--- | Compile a regex, using the global cache to avoid recompilation.
+-- | Compile a regex from its raw pattern bytes, using the global cache to
+-- avoid recompilation.  Compiling from bytes makes the PATTERN byte-level
+-- too, matching upstream: a multi-byte character in the pattern is a
+-- sequence of single-byte atoms, so it lines up with byte-level subjects.
 -- Returns Nothing for invalid patterns.  NOINLINE prevents GHC from
 -- inlining and floating the unsafePerformIO reads.
 {-# NOINLINE cachedCompileRegex #-}
-cachedCompileRegex :: Text -> Maybe RE.Regex
+cachedCompileRegex :: BS.ByteString -> Maybe RE.Regex
 cachedCompileRegex pat =
   unsafePerformIO $ do
     cache <- atomicModifyIORef' regexCacheRef (\c -> (c, c))
     case Map.lookup pat cache of
       Just compiled -> pure (Just compiled)
-      Nothing -> case RE.makeRegexOptsM wholeStringCompOpt RE.defaultExecOpt (T.unpack pat) :: Maybe RE.Regex of
+      Nothing -> case RE.makeRegexOptsM wholeStringCompOpt RE.defaultExecOpt pat :: Maybe RE.Regex of
         Nothing -> pure Nothing
         Just compiled -> do
           atomicModifyIORef' regexCacheRef (\c -> (Map.insert pat compiled c, ()))
@@ -2508,7 +2561,7 @@ builtinMatch (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
 -- Direct 2-arg call: use global compilation cache.
 builtinMatch (VStr regex _) (VStr str _) =
   case cachedCompileRegex regex of
-    Nothing -> throwEvalError ("builtins.match: invalid regex: " <> regex)
+    Nothing -> throwEvalError ("builtins.match: invalid regex: " <> bytesToTextLossy regex)
     Just compiled -> matchWithCompiled compiled str
 builtinMatch (VStr _ _) other =
   throwEvalError ("builtins.match: expected a string, got " <> typeName other)
@@ -2525,19 +2578,19 @@ builtinMatch other _ =
 -- whole subject exactly when a whole-string match exists.  This is what
 -- regex_match gives C++ Nix; textual @^...$@ anchoring is NOT equivalent
 -- (it misparses top-level alternation).
-matchWithCompiled :: (MonadEval m) => RE.Regex -> Text -> m NixValue
+matchWithCompiled :: (MonadEval m) => RE.Regex -> BS.ByteString -> m NixValue
 matchWithCompiled compiled str =
-  case RE.matchOnceText compiled (T.unpack str) of
+  case RE.matchOnceText compiled str of
     Just (beforeMatch, match, afterMatch)
-      | null beforeMatch,
-        null afterMatch ->
-          -- match is an Array of (String, (offset, len)) pairs.
+      | BS.null beforeMatch,
+        BS.null afterMatch ->
+          -- match is an Array of (bytes, (offset, len)) pairs.
           -- Index 0 is the full match; indices 1.. are capture groups.
           let captureGroups = drop 1 (Array.elems match)
               -- A non-participating capture group has offset (-1); C++ Nix
               -- yields null for it, not the empty string.
               toThunk (s, (off, _)) =
-                if off < 0 then evaluated VNull else evaluated (mkStr (T.pack s))
+                if off < 0 then evaluated VNull else evaluated (mkStrBytes s)
            in pure (VList (clistFromThunks (map (thunkToCPtr . toThunk) captureGroups)))
     _ -> pure VNull
 
@@ -2551,7 +2604,7 @@ builtinSplit (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
 -- Direct 2-arg call: use global compilation cache.
 builtinSplit (VStr regex _) (VStr str _) =
   case cachedCompileRegex regex of
-    Nothing -> throwEvalError ("builtins.split: invalid regex: " <> regex)
+    Nothing -> throwEvalError ("builtins.split: invalid regex: " <> bytesToTextLossy regex)
     Just compiled -> splitWithCompiled compiled str
 builtinSplit (VStr _ _) other =
   throwEvalError ("builtins.split: expected a string, got " <> typeName other)
@@ -2561,33 +2614,34 @@ builtinSplit other _ =
   throwEvalError ("builtins.split: expected a string (regex), got " <> typeName other)
 
 -- | Shared split logic for pre-compiled and freshly-compiled regex paths.
-splitWithCompiled :: (MonadEval m) => RE.Regex -> Text -> m NixValue
+splitWithCompiled :: (MonadEval m) => RE.Regex -> BS.ByteString -> m NixValue
 splitWithCompiled compiled str =
-  let allMatches = matchAllText compiled (T.unpack str)
-      strText = T.unpack str
-      result = buildSplitResult strText 0 allMatches
+  let allMatches = matchAllText compiled str
+      result = buildSplitResult str 0 allMatches
    in pure (VList (clistFromThunks (map thunkToCPtr result)))
 
--- | Build the alternating list for builtins.split.
-buildSplitResult :: String -> Int -> [Array.Array Int (String, (Int, Int))] -> [Thunk]
+-- | Build the alternating list for builtins.split.  Offsets from the
+-- ByteString regex instance are byte offsets, so slicing is O(1)
+-- 'BS.take'/'BS.drop'.
+buildSplitResult :: BS.ByteString -> Int -> [Array.Array Int (BS.ByteString, (Int, Int))] -> [Thunk]
 buildSplitResult remaining pos [] =
   -- No more matches - emit the rest of the string.
-  [evaluated (mkStr (T.pack (drop pos remaining)))]
+  [evaluated (mkStrBytes (BS.drop pos remaining))]
 buildSplitResult remaining pos (match : rest) =
   let elems = Array.elems match
       (_, (matchStart, matchLen)) = case elems of
         (full : _) -> full
         [] -> ("", (pos, 0)) -- defensive: should not happen from matchAllText
-        -- Text before this match
-      before = T.pack (take (matchStart - pos) (drop pos remaining))
+        -- Bytes before this match
+      before = BS.take (matchStart - pos) (BS.drop pos remaining)
       -- Capture groups (indices 1..)
-      groups = drop 1 (Array.elems match)
+      groups = drop 1 elems
       -- A non-participating capture group has offset (-1) becomes null (as 'match').
       groupThunks =
-        map (\(s, (off, _)) -> if off < 0 then evaluated VNull else evaluated (mkStr (T.pack s))) groups
+        map (\(s, (off, _)) -> if off < 0 then evaluated VNull else evaluated (mkStrBytes s)) groups
       -- Continue after this match
       afterPos = matchStart + matchLen
-   in evaluated (mkStr before)
+   in evaluated (mkStrBytes before)
         : evaluated (VList (clistFromThunks (map thunkToCPtr groupThunks)))
         : buildSplitResult remaining afterPos rest
 
@@ -2602,7 +2656,7 @@ ordToNix LT = -1
 ordToNix EQ = 0
 ordToNix GT = 1
 
-compareVersionParts :: [Text] -> [Text] -> Int64
+compareVersionParts :: [BS.ByteString] -> [BS.ByteString] -> Int64
 compareVersionParts [] [] = 0
 -- When one version runs out, Nix pads the shorter side with an empty
 -- component and keeps comparing - so "1.0" > "1.0pre" (empty sorts AFTER
@@ -2620,7 +2674,13 @@ compareVersionParts (a : as) (b : bs) =
     EQ -> compareVersionParts as bs
     cmp -> ordToNix cmp
 
-compareComponent :: Text -> Text -> Ordering
+-- | Byte-level alpha classification, as upstream (C @isalpha@ over
+-- bytes): a non-ASCII letter is a separator, never an alphabetic
+-- component.  Digits need no counterpart - 'isDigit' is @0-9@ only.
+isVersionAlpha :: Char -> Bool
+isVersionAlpha c = isAsciiLower c || isAsciiUpper c
+
+compareComponent :: BS.ByteString -> BS.ByteString -> Ordering
 compareComponent a b
   | a == b = EQ
   | allDigits a && allDigits b = compare (readInt a) (readInt b)
@@ -2634,57 +2694,56 @@ compareComponent a b
   | allDigits a && isAlphaComp b = GT
   | otherwise = compare a b
   where
-    allDigits t = not (T.null t) && T.all isDigit t
-    isAlphaComp t = case T.uncons t of
-      Just (c, _) -> isAlpha c
+    allDigits t = not (BS.null t) && BC.all isDigit t
+    isAlphaComp t = case BC.uncons t of
+      Just (c, _) -> isVersionAlpha c
       Nothing -> False
-    readInt :: Text -> Int64
-    readInt = T.foldl' (\acc c -> acc * 10 + fromIntegral (digitToInt c)) (0 :: Int64)
+    readInt :: BS.ByteString -> Int64
+    readInt = BC.foldl' (\acc c -> acc * 10 + fromIntegral (digitToInt c)) (0 :: Int64)
 
-splitVersionStr :: Text -> [Text]
+splitVersionStr :: BS.ByteString -> [BS.ByteString]
 splitVersionStr t
-  | T.null t = []
+  | BS.null t = []
   | otherwise =
       let (component, rest) = spanComponent t
        in component : splitVersionAfterComponent rest
 
-splitVersionAfterComponent :: Text -> [Text]
-splitVersionAfterComponent t = case T.uncons t of
+splitVersionAfterComponent :: BS.ByteString -> [BS.ByteString]
+splitVersionAfterComponent t = case BC.uncons t of
   Nothing -> []
   -- '.' and '-' are both component separators in Nix's version grammar, so a
   -- '-' is skipped, not emitted as a one-character component.
   Just (sep, rest) | sep == '.' || sep == '-' -> splitVersionStr rest
   Just _ -> splitVersionStr t
 
-spanComponent :: Text -> (Text, Text)
-spanComponent t = case T.uncons t of
+spanComponent :: BS.ByteString -> (BS.ByteString, BS.ByteString)
+spanComponent t = case BC.uncons t of
   Nothing -> ("", "")
   Just (c, rest)
-    | isDigit c -> T.span isDigit t
-    | isAlpha c -> T.span isAlpha t
-    | otherwise -> (T.singleton c, rest)
+    | isDigit c -> BC.span isDigit t
+    | isVersionAlpha c -> BC.span isVersionAlpha t
+    | otherwise -> (BS.take 1 t, rest)
 
 builtinSplitVersion :: (MonadEval m) => NixValue -> m NixValue
 builtinSplitVersion (VStr s _) =
-  pure (VList (clistFromThunks (map (thunkToCPtr . evaluated . mkStr) (splitVersionComponents s))))
+  pure (VList (clistFromThunks (map (thunkToCPtr . evaluated . mkStrBytes) (splitVersionComponents s))))
 builtinSplitVersion other =
   throwEvalError ("builtins.splitVersion: expected a string, got " <> typeName other)
 
-splitVersionComponents :: Text -> [Text]
-splitVersionComponents t = case T.uncons t of
+splitVersionComponents :: BS.ByteString -> [BS.ByteString]
+splitVersionComponents t = case BC.uncons t of
   Nothing -> []
   Just ('.', rest) -> splitVersionComponents rest
   Just (c, _)
     | isDigit c ->
-        let (digits, rest) = T.span isDigit t
+        let (digits, rest) = BC.span isDigit t
          in digits : splitVersionComponents rest
-    | isAlpha c ->
-        let (alpha, rest) = T.span isAlpha t
+    | isVersionAlpha c ->
+        let (alpha, rest) = BC.span isVersionAlpha t
          in alpha : splitVersionComponents rest
     | otherwise ->
-        -- Non-alphanumeric separator (e.g. '-', '_'): consume as single char
-        let (_, rest) = T.splitAt 1 t
-         in splitVersionComponents rest
+        -- Non-alphanumeric separator byte (e.g. '-', '_'): consume it
+        splitVersionComponents (BS.drop 1 t)
 
 builtinParseDrvName :: (MonadEval m) => NixValue -> m NixValue
 builtinParseDrvName (VStr s _) =
@@ -2693,25 +2752,25 @@ builtinParseDrvName (VStr s _) =
         ( VAttrs
             ( attrSetFromMap $
                 Map.fromList
-                  [ ("name", evaluated (mkStr name)),
-                    ("version", evaluated (mkStr version))
+                  [ ("name", evaluated (mkStrBytes name)),
+                    ("version", evaluated (mkStrBytes version))
                   ]
             )
         )
 builtinParseDrvName other =
   throwEvalError ("builtins.parseDrvName: expected a string, got " <> typeName other)
 
-parseName :: Text -> (Text, Text)
+parseName :: BS.ByteString -> (BS.ByteString, BS.ByteString)
 parseName t =
   case findVersionDash t 0 of
     Nothing -> (t, "")
-    Just idx -> (T.take idx t, T.drop (idx + 1) t)
+    Just idx -> (BS.take idx t, BS.drop (idx + 1) t)
 
-findVersionDash :: Text -> Int -> Maybe Int
-findVersionDash t idx = case T.uncons (T.drop idx t) of
+findVersionDash :: BS.ByteString -> Int -> Maybe Int
+findVersionDash t idx = case BC.uncons (BS.drop idx t) of
   Nothing -> Nothing
   Just ('-', after)
-    | Just (d, _) <- T.uncons after,
+    | Just (d, _) <- BC.uncons after,
       isDigit d ->
         Just idx
   Just _ -> findVersionDash t (idx + 1)
@@ -2723,8 +2782,11 @@ findVersionDash t idx = case T.uncons (T.drop idx t) of
 builtinToJSON :: (MonadEval m) => NixValue -> m NixValue
 builtinToJSON val = do
   (json, ctx) <- valueToJSON val
-  pure (VStr json ctx)
+  pure (VStr (TE.encodeUtf8 json) ctx)
 
+-- | JSON is built as 'Text' and encoded once at the top: upstream's
+-- serializer (nlohmann) REJECTS invalid UTF-8, so string payloads decode
+-- strictly here and invalid bytes are an eval error, matching upstream.
 valueToJSON :: (MonadEval m) => NixValue -> m (Text, StringContext)
 valueToJSON VNull = pure ("null", emptyContext)
 valueToJSON (VBool True) = pure ("true", emptyContext)
@@ -2734,7 +2796,9 @@ valueToJSON (VFloat f)
   -- upstream's serializer (nlohmann dump) writes a non-finite float as null
   | isNaN f || isInfinite f = pure ("null", emptyContext)
   | otherwise = pure (formatJsonFloat f, emptyContext)
-valueToJSON (VStr s ctx) = pure (jsonEscapeString s, ctx)
+valueToJSON (VStr s ctx) = do
+  decoded <- decodedText "builtins.toJSON" s
+  pure (jsonEscapeString decoded, ctx)
 valueToJSON (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   vals <- mapM force thunks
@@ -2755,7 +2819,8 @@ valueToJSON (VAttrs attrs) =
       pure ("{" <> T.intercalate "," pairs <> "}", ctx)
     _ -> do
       (s, ctx) <- coerceToString True force applyValue (VAttrs attrs)
-      pure (jsonEscapeString s, ctx)
+      decoded <- decodedText "builtins.toJSON" s
+      pure (jsonEscapeString decoded, ctx)
   where
     jsonPair attrMap key = case Map.lookup key attrMap of
       Nothing -> pure ("", emptyContext)
@@ -2802,11 +2867,14 @@ hexDigit n
   | otherwise = '?' -- unreachable for valid hex
 
 builtinFromJSON :: (MonadEval m) => NixValue -> m NixValue
-builtinFromJSON (VStr s _) = case parseJSON (T.strip s) of
-  Just (val, rest)
-    | T.null (T.strip rest) -> pure val
-    | otherwise -> throwEvalError "builtins.fromJSON: trailing content after JSON value"
-  Nothing -> throwEvalError "builtins.fromJSON: invalid JSON"
+builtinFromJSON (VStr s _) = do
+  -- JSON input must be valid UTF-8 (upstream's parser rejects it too).
+  decoded <- decodedText "builtins.fromJSON" s
+  case parseJSON (T.strip decoded) of
+    Just (val, rest)
+      | T.null (T.strip rest) -> pure val
+      | otherwise -> throwEvalError "builtins.fromJSON: trailing content after JSON value"
+    Nothing -> throwEvalError "builtins.fromJSON: invalid JSON"
 builtinFromJSON other =
   throwEvalError ("builtins.fromJSON: expected a string, got " <> typeName other)
 
@@ -2922,23 +2990,29 @@ parseJSONObject t = parseJSONObjectEntries (T.stripStart t) Map.empty
 parseJSONObjectEntries :: Text -> Map Text Thunk -> Maybe (NixValue, Text)
 parseJSONObjectEntries t acc = case T.uncons (T.stripStart t) of
   Just ('}', rest) -> Just (VAttrs (attrSetFromMap acc), rest)
-  _ -> case parseJSONString (T.stripStart t) of
-    Just (VStr key _, rest) -> case T.uncons (T.stripStart rest) of
-      Just (':', rest2) -> case parseJSON rest2 of
-        Just (val, rest3) ->
-          let stripped = T.stripStart rest3
-              updated = Map.insert key (evaluated val) acc
-           in case T.uncons stripped of
-                Just (',', rest4) -> parseJSONObjectEntries rest4 updated
-                Just ('}', rest4) -> Just (VAttrs (attrSetFromMap updated), rest4)
-                _ -> Nothing
-        Nothing -> Nothing
-      _ -> Nothing
-    _ -> Nothing
+  -- Keys read via 'parseJSONStringContent' directly: they become attr
+  -- names (Text), not string values.
+  Just ('"', afterQuote) ->
+    let (key, rest) = parseJSONStringContent afterQuote
+     in case T.uncons (T.stripStart rest) of
+          Just (':', rest2) -> case parseJSON rest2 of
+            Just (val, rest3) ->
+              let stripped = T.stripStart rest3
+                  updated = Map.insert key (evaluated val) acc
+               in case T.uncons stripped of
+                    Just (',', rest4) -> parseJSONObjectEntries rest4 updated
+                    Just ('}', rest4) -> Just (VAttrs (attrSetFromMap updated), rest4)
+                    _ -> Nothing
+            Nothing -> Nothing
+          _ -> Nothing
+  _ -> Nothing
 
 builtinHashString :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHashString (VStr algo _) (VStr input _) =
-  hashBytesWithAlgo "hashString" algo (TE.encodeUtf8 input)
+builtinHashString (VStr algo _) (VStr input _) = do
+  -- The payload IS the hashed bytes - no encode step, so a mid-codepoint
+  -- substring hashes to the sha256 of exactly those bytes, as upstream.
+  algoName <- decodedText "builtins.hashString" algo
+  hashBytesWithAlgo "hashString" algoName input
 builtinHashString (VStr _ _) other =
   throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
 builtinHashString other _ =
@@ -2969,7 +3043,7 @@ builtinSeq !_first = pure
 builtinTrace :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinTrace msgVal result = do
   msg <- case msgVal of
-    VStr s _ -> pure s
+    VStr s _ -> pure (bytesToTextLossy s)
     other -> pure (showValueForTrace other)
   traceMessage ("trace: " <> msg)
   pure result
@@ -2978,7 +3052,7 @@ builtinTrace msgVal result = do
 builtinWarn :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinWarn msgVal result = do
   msg <- case msgVal of
-    VStr s _ -> pure s
+    VStr s _ -> pure (bytesToTextLossy s)
     other -> pure (showValueForTrace other)
   traceMessage ("warning: " <> msg)
   pure result
@@ -3059,23 +3133,32 @@ keyInList key (seen : rest) = do
 -- ---------------------------------------------------------------------------
 
 -- | Coerce a value to a path 'Text'.  Accepts 'VPath' and 'VStr';
--- throws a type error for anything else.
+-- throws a type error for anything else.  A string operand is a byte
+-- string naming a filesystem path, so it decodes strictly.
 coerceToPath :: (MonadEval m) => Text -> NixValue -> m Text
 coerceToPath _ (VPath p) = pure p
-coerceToPath _ (VStr s _) = pure s
+coerceToPath name (VStr s _) = decodedText ("builtins." <> name) s
 coerceToPath name other =
   throwEvalError ("builtins." <> name <> ": expected a path or string, got " <> typeName other)
 
 builtinImport :: (MonadEval m) => NixValue -> m NixValue
 builtinImport (VPath p) = importFile p
-builtinImport (VStr s _) = importFile s
+builtinImport (VStr s _) = importFile =<< decodedText "import" s
 builtinImport other =
   throwEvalError ("import: expected a path or string, got " <> typeName other)
 
 builtinReadFile :: (MonadEval m) => NixValue -> m NixValue
 builtinReadFile val = do
   p <- coerceToPath "readFile" val
-  mkStr <$> readFileText p
+  bytes <- readFileBytes p
+  -- The value is the file's RAW BYTES, as upstream: no BOM stripping, no
+  -- UTF-16 transcoding, no replacement characters (the auto-decode stays
+  -- on the parser/import path only).  The only rejection is NUL, which a
+  -- Nix string cannot represent upstream.
+  when (BS.elem 0 bytes) $
+    throwEvalError
+      ("builtins.readFile: the contents of the file '" <> p <> "' cannot be represented as a Nix string")
+  pure (mkStrBytes bytes)
 
 builtinPathExists :: (MonadEval m) => NixValue -> m NixValue
 builtinPathExists val = do
@@ -3093,17 +3176,21 @@ builtinReadDir val = do
 -- ---------------------------------------------------------------------------
 
 builtinGetEnv :: (MonadEval m) => NixValue -> m NixValue
-builtinGetEnv (VStr name _) = mkStr <$> getEnvVar name
+builtinGetEnv (VStr name _) = do
+  varName <- decodedText "builtins.getEnv" name
+  mkStr <$> getEnvVar varName
 builtinGetEnv other =
   throwEvalError ("builtins.getEnv: expected a string, got " <> typeName other)
 
 builtinToPath :: (MonadEval m) => NixValue -> m NixValue
 builtinToPath (VPath p) = pure (VPath p)
-builtinToPath (VStr s _) = case T.uncons s of
-  Nothing -> throwEvalError "builtins.toPath: empty path"
-  -- Canonicalized like every other path production site, as upstream.
-  Just ('/', _) -> pure (VPath (canonPath s))
-  Just _ -> throwEvalError ("builtins.toPath: path must be absolute, got " <> s)
+builtinToPath (VStr rawBytes _) = do
+  s <- decodedText "builtins.toPath" rawBytes
+  case T.uncons s of
+    Nothing -> throwEvalError "builtins.toPath: empty path"
+    -- Canonicalized like every other path production site, as upstream.
+    Just ('/', _) -> pure (VPath (canonPath s))
+    Just _ -> throwEvalError ("builtins.toPath: path must be absolute, got " <> s)
 builtinToPath other =
   throwEvalError ("builtins.toPath: expected a string or path, got " <> typeName other)
 
@@ -3112,13 +3199,15 @@ builtinToPath other =
 -- ---------------------------------------------------------------------------
 
 builtinPlaceholder :: (MonadEval m) => NixValue -> m NixValue
-builtinPlaceholder (VStr outputName _) = pure (mkStr (hashPlaceholder outputName))
+builtinPlaceholder (VStr outputName _) = do
+  name <- decodedText "builtins.placeholder" outputName
+  pure (mkStr (hashPlaceholder name))
 builtinPlaceholder other =
   throwEvalError ("builtins.placeholder: expected a string, got " <> typeName other)
 
 builtinStorePath :: (MonadEval m) => NixValue -> m NixValue
 builtinStorePath (VPath p) = validateStorePath p
-builtinStorePath (VStr s _) = validateStorePath s
+builtinStorePath (VStr s _) = validateStorePath =<< decodedText "builtins.storePath" s
 builtinStorePath other =
   throwEvalError ("builtins.storePath: expected a path or string, got " <> typeName other)
 
@@ -3131,7 +3220,7 @@ builtinStorePath other =
 -- the canonical @/nix/store@ text is not the on-disk location.
 validateStorePath :: (MonadEval m) => Text -> m NixValue
 validateStorePath p = case enclosingStorePath p of
-  Just sp -> pure (VStr p (plainContext sp))
+  Just sp -> pure (VStr (TE.encodeUtf8 p) (plainContext sp))
   Nothing -> throwEvalError ("builtins.storePath: not a valid store path: " <> p)
 
 -- | The store path enclosing an absolute path under the store dir, or
@@ -3155,9 +3244,10 @@ enclosingStorePath p = do
 
 builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinFindFile (VList cl) (VStr name _) = do
+  fileName <- decodedText "builtins.findFile" name
   let searchPath = map Thunk (clistThunks cl)
   entries <- mapM forceSearchEntry searchPath
-  findFirst entries name
+  findFirst entries fileName
 builtinFindFile (VList _) other =
   throwEvalError ("builtins.findFile: expected a string, got " <> typeName other)
 builtinFindFile other _ =
@@ -3178,10 +3268,10 @@ forceSearchEntry thunk = do
       prefixVal <- force prefixThunk
       pathVal <- force pathThunk
       prefix <- case prefixVal of
-        VStr s _ -> pure s
+        VStr s _ -> decodedText "builtins.findFile" s
         _ -> throwEvalError "builtins.findFile: 'prefix' must be a string"
       path <- case pathVal of
-        VStr s _ -> pure s
+        VStr s _ -> decodedText "builtins.findFile" s
         VPath s -> pure s
         _ -> throwEvalError "builtins.findFile: 'path' must be a string or path"
       pure (prefix, path)
@@ -3218,12 +3308,14 @@ findFirst ((prefix, path) : rest) name
 
 builtinToFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinToFile (VStr name _) (VStr contents ctx) = do
+  fileName <- decodedText "builtins.toFile" name
   refs <- toFileRefs ctx
-  storePath <- writeToStore name contents refs
+  -- The contents are stored (and hashed) as their raw bytes.
+  storePath <- writeToStore fileName contents refs
   -- Upstream returns a STRING whose context is the new path itself; the
   -- refs travel through the store path computation, not the eval context.
   let selfContext = maybe emptyContext plainContext (parseStorePath defaultStoreDir storePath)
-  pure (VStr storePath selfContext)
+  pure (VStr (TE.encodeUtf8 storePath) selfContext)
 builtinToFile (VStr _ _) other =
   throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
 builtinToFile other _ =
@@ -3259,7 +3351,9 @@ builtinScopedImport other _ =
 -- ---------------------------------------------------------------------------
 
 builtinFetchurl :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchurl (VStr url _) = fetchUrlSimple url Nothing
+builtinFetchurl (VStr url _) = do
+  urlText <- decodedText "builtins.fetchurl" url
+  fetchUrlSimple urlText Nothing
 builtinFetchurl (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchurl" "url" attrs
   sha256 <- forceOptionalAttrStr attrs "sha256"
@@ -3268,7 +3362,9 @@ builtinFetchurl other =
   throwEvalError ("builtins.fetchurl: expected a string or set, got " <> typeName other)
 
 builtinFetchTarball :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchTarball (VStr url _) = fetchAndExtractTarball url Nothing tarballSourceName
+builtinFetchTarball (VStr url _) = do
+  urlText <- decodedText "builtins.fetchTarball" url
+  fetchAndExtractTarball urlText Nothing tarballSourceName
 builtinFetchTarball (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchTarball" "url" attrs
   sha256 <- forceOptionalAttrStr attrs "sha256"
@@ -3315,7 +3411,8 @@ fetchAndExtractTarball url mSha256 name = do
     _ -> throwEvalError ("builtins.fetchTarball: " <> errOut)
 
 builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchGit (VStr url _) = do
+builtinFetchGit (VStr rawUrl _) = do
+  url <- decodedText "builtins.fetchGit" rawUrl
   sysTmp <- getTempDir
   let urlHash = sha256Hex (TE.encodeUtf8 url)
       cloneDir = sysTmp <> "/nova-nix-fetchgit-" <> urlHash
@@ -3390,8 +3487,17 @@ decodeSha256Pin ctx s
 -- coercion (VStr, VPath, VInt, VBool, VAttrs via __toString/outPath).
 -- A coercion failure (or a throwing attr value) propagates with its own
 -- message, as upstream - swallowing it here once masked user throws.
+-- The Text result decodes strictly: callers use it as a name, URL, or
+-- platform string, none of which may carry invalid UTF-8 here.
 forceAttrStr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
-forceAttrStr builtin key attrs =
+forceAttrStr builtin key attrs = do
+  bytes <- forceAttrBytes builtin key attrs
+  decodedText builtin bytes
+
+-- | Like 'forceAttrStr' but returns the coerced RAW BYTES - for
+-- derivation fields (builder) that flow byte-exact into the ATerm.
+forceAttrBytes :: (MonadEval m) => Text -> Text -> AttrSet -> m BS.ByteString
+forceAttrBytes builtin key attrs =
   case attrSetLookup key attrs of
     Nothing -> throwEvalError (builtin <> ": missing required attribute '" <> key <> "'")
     Just thunk -> do
@@ -3408,7 +3514,7 @@ forceOptionalAttrStr attrs key =
     Just thunk -> do
       val <- force thunk
       (s, _ctx) <- coerceToString True force applyValue val
-      pure (Just s)
+      Just <$> decodedText "string attribute" s
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - derivation construction
@@ -3461,7 +3567,7 @@ derivationModuloHex drv = case drvOutputs drv of
          in pure (bytesToHexText (sha256Digest (TE.encodeUtf8 fixedForm)))
   _ -> do
     inputSubst <- mapM resolveInputModulo (Map.toList (drvInputDrvs drv))
-    pure (bytesToHexText (sha256Digest (TE.encodeUtf8 (toATermForHash False (Just inputSubst) drv))))
+    pure (bytesToHexText (sha256Digest (toATermForHash False (Just inputSubst) drv)))
 
 -- | The full output-name list of an all-outputs (upstream DrvDeep) reference:
 -- every output name of the referenced @.drv@, which upstream's derivationStrict
@@ -3499,10 +3605,12 @@ resolveAllOutputNames sp = do
 -- WHNF never forces this - matching C++ Nix's derivationStrict/derivation split.
 builtinDerivationStrict :: (MonadEval m) => NixValue -> m NixValue
 builtinDerivationStrict (VAttrs attrs) = do
-  -- Extract required attributes
+  -- Extract required attributes.  The name and system are Text (they feed
+  -- store-path and platform machinery); the builder stays raw bytes - it
+  -- lands byte-exact in the ATerm's builder field.
   drvName <- forceAttrStr "derivation" "name" attrs
   system <- forceAttrStr ("derivation \"" <> drvName <> "\"") "system" attrs
-  builder <- forceAttrStr ("derivation \"" <> drvName <> "\"") "builder" attrs
+  builder <- forceAttrBytes ("derivation \"" <> drvName <> "\"") "builder" attrs
 
   -- __ignoreNulls: when true, null-valued attrs are dropped from the
   -- derivation env (stdenv.mkDerivation sets it); when absent or false,
@@ -3596,8 +3704,8 @@ builtinDerivationStrict (VAttrs attrs) = do
           contents =
             mkDrv
               [DerivationOutput "out" foPath algoField foHashHex]
-              (Map.insert "out" foPathText baseEnv)
-          drvSp = makeTextPath drvFileName (sha256Digest (TE.encodeUtf8 (toATerm contents))) drvRefs
+              (Map.insert "out" (TE.encodeUtf8 foPathText) baseEnv)
+          drvSp = makeTextPath drvFileName (sha256Digest (toATerm contents)) drvRefs
           drvText = storePathToText defaultStoreDir drvSp
       cacheDrvHash drvText (bytesToHexText foModulo)
       pure (drvText, drvSp, [("out", foPathText)], contents)
@@ -3606,15 +3714,15 @@ builtinDerivationStrict (VAttrs attrs) = do
       let maskedEnv = foldr (`Map.insert` "") baseEnv outputNames
           maskedDrv = mkDrv (map maskedOutput outputNames) maskedEnv
           -- Masked modulo hash yields this derivation's own output paths.
-          moduloMasked = sha256Digest (TE.encodeUtf8 (toATermForHash True (Just inputSubst) maskedDrv))
+          moduloMasked = sha256Digest (toATermForHash True (Just inputSubst) maskedDrv)
           outStorePaths = [(n, makeOutputPath n moduloMasked drvName) | n <- outputNames]
           outPathTexts = [(n, storePathToText defaultStoreDir sp) | (n, sp) <- outStorePaths]
-          realEnv = foldr (\(n, t) e -> Map.insert n t e) baseEnv outPathTexts
+          realEnv = foldr (\(n, t) e -> Map.insert n (TE.encodeUtf8 t) e) baseEnv outPathTexts
           contents = mkDrv [DerivationOutput n sp "" "" | (n, sp) <- outStorePaths] realEnv
           -- Unmasked modulo hash (real outputs, inputs substituted) cached for
           -- when this derivation is itself an input to another.
-          moduloUnmasked = sha256Digest (TE.encodeUtf8 (toATermForHash False (Just inputSubst) contents))
-          drvSp = makeTextPath drvFileName (sha256Digest (TE.encodeUtf8 (toATerm contents))) drvRefs
+          moduloUnmasked = sha256Digest (toATermForHash False (Just inputSubst) contents)
+          drvSp = makeTextPath drvFileName (sha256Digest (toATerm contents)) drvRefs
           drvText = storePathToText defaultStoreDir drvSp
       cacheDrvHash drvText (bytesToHexText moduloUnmasked)
       pure (drvText, drvSp, outPathTexts, contents)
@@ -3644,8 +3752,8 @@ builtinDerivationStrict (VAttrs attrs) = do
         let outCtx = outPathCtx outName
             outputAttrMap =
               Map.fromList
-                [ ("outPath", evaluated (VStr outP outCtx)),
-                  ("drvPath", evaluated (VStr drvPathText drvPathCtx)),
+                [ ("outPath", evaluated (VStr (TE.encodeUtf8 outP) outCtx)),
+                  ("drvPath", evaluated (VStr (TE.encodeUtf8 drvPathText) drvPathCtx)),
                   ("type", evaluated (mkStr "derivation"))
                 ]
          in evaluated (VAttrs (attrSetFromMap outputAttrMap))
@@ -3654,11 +3762,11 @@ builtinDerivationStrict (VAttrs attrs) = do
   let baseAttrs =
         Map.fromList $
           [ ("type", evaluated (mkStr "derivation")),
-            ("drvPath", evaluated (VStr drvPathText drvPathCtx)),
-            ("outPath", evaluated (VStr mainOutPath (outPathCtx mainOutName))),
+            ("drvPath", evaluated (VStr (TE.encodeUtf8 drvPathText) drvPathCtx)),
+            ("outPath", evaluated (VStr (TE.encodeUtf8 mainOutPath) (outPathCtx mainOutName))),
             ("name", evaluated (mkStr drvName)),
             ("system", evaluated (mkStr system)),
-            ("builder", evaluated (mkStr builder)),
+            ("builder", evaluated (mkStrBytes builder)),
             ("_derivation", evaluated (VDerivation completeDrv))
           ]
             ++ [(outName, mkOutputAttrs outName outP) | (outName, outP) <- outPaths]
@@ -3680,8 +3788,9 @@ detectFixedOutput attrs =
     Just thunk -> do
       val <- force thunk
       case val of
-        VStr ohash _
-          | not (T.null ohash) -> do
+        VStr rawHash _
+          | not (BS.null rawHash) -> do
+              ohash <- decodedText "derivation: outputHash" rawHash
               ohAlgo <- optDrvStrAttr "outputHashAlgo" attrs
               ohMode <- optDrvStrAttr "outputHashMode" attrs
               (algo, digest) <- normalizeFixedHash ohash ohAlgo
@@ -3698,7 +3807,7 @@ optDrvStrAttr key attrs =
     Just thunk -> do
       val <- force thunk
       case val of
-        VStr s _ -> pure s
+        VStr s _ -> decodedText ("derivation: " <> key) s
         _ -> pure ""
 
 -- | Decode a fixed-output hash (SRI @algo-base64@, @algo:hash@, or a bare
@@ -3759,16 +3868,18 @@ builtinDerivationLazy (VAttrs attrs) = do
 builtinDerivationLazy other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
--- | Force a thunk to a Text string via full Nix coercion.
+-- | Force a thunk to a Text string via full Nix coercion (strict decode:
+-- used for output names, which are ASCII-shaped identity components).
 forceToText :: (MonadEval m) => Thunk -> m Text
 forceToText thunk = do
   val <- force thunk
   (s, _ctx) <- coerceToString True force applyValue val
-  pure s
+  decodedText "derivation" s
 
 -- | Collect all derivation attributes into env pairs via full Nix coercion
 -- (__toString, outPath, list-to-space-separated-string), along with the
--- merged string context from all collected values.
+-- merged string context from all collected values.  Values are RAW BYTES:
+-- they flow byte-exact into the ATerm env section (and its hash).
 --
 -- A coercion failure (a thrown attr value, an uncoercible function, a failed
 -- import inside the value) fails the WHOLE derivation, as in C++ Nix.
@@ -3776,7 +3887,7 @@ forceToText thunk = do
 -- a seed derivation with 17 failed src attrs into an empty no-input drv that
 -- "built" successfully.  Null attrs are dropped only under __ignoreNulls;
 -- otherwise null coerces to @""@ like any other coerceMore value.
-collectDrvEnvWithContext :: (MonadEval m) => Bool -> Map Text Thunk -> m ([(Text, Text)], StringContext)
+collectDrvEnvWithContext :: (MonadEval m) => Bool -> Map Text Thunk -> m ([(Text, BS.ByteString)], StringContext)
 collectDrvEnvWithContext ignoreNulls attrs = do
   let pairs = Map.toList attrs
   results <- mapM coerceEnvAttr pairs
@@ -3800,11 +3911,14 @@ collectDrvEnvWithContext ignoreNulls attrs = do
 -- Returns base-16 hex string, matching @builtins.hashString@ output format.
 builtinHashFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHashFile (VStr algo _) (VPath path) = do
+  algoName <- decodedText "builtins.hashFile" algo
   bytes <- readFileBytes path
-  hashBytesWithAlgo "hashFile" algo bytes
+  hashBytesWithAlgo "hashFile" algoName bytes
 builtinHashFile (VStr algo _) (VStr path _) = do
-  bytes <- readFileBytes path
-  hashBytesWithAlgo "hashFile" algo bytes
+  algoName <- decodedText "builtins.hashFile" algo
+  filePath <- decodedText "builtins.hashFile" path
+  bytes <- readFileBytes filePath
+  hashBytesWithAlgo "hashFile" algoName bytes
 builtinHashFile (VStr _ _) other =
   throwEvalError ("builtins.hashFile: expected a path, got " <> typeName other)
 builtinHashFile other _ =
@@ -3823,7 +3937,9 @@ hashBytesWithAlgo ctx algo bytes = case algo of
 -- Returns @"regular"@, @"directory"@, @"symlink"@, or @"unknown"@.
 builtinReadFileType :: (MonadEval m) => NixValue -> m NixValue
 builtinReadFileType (VPath path) = mkStr <$> getFileType path
-builtinReadFileType (VStr path _) = mkStr <$> getFileType path
+builtinReadFileType (VStr path _) = do
+  filePath <- decodedText "builtins.readFileType" path
+  mkStr <$> getFileType filePath
 builtinReadFileType other =
   throwEvalError ("builtins.readFileType: expected a path, got " <> typeName other)
 
@@ -3909,7 +4025,7 @@ requireStrAttr ctx key attrs = case attrSetLookup key attrs of
   Just thunk -> do
     val <- force thunk
     case val of
-      VStr s _ -> pure s
+      VStr s _ -> decodedText ("builtins." <> ctx) s
       _ -> throwEvalError ("builtins." <> ctx <> ": " <> key <> " must be a string")
   Nothing -> throwEvalError ("builtins." <> ctx <> ": missing required attribute '" <> key <> "'")
 
@@ -3952,9 +4068,12 @@ decodeBase64E ctx t = case decodeBase64Pure t of
 -- inline tables, arrays, array-of-tables, and standard tables.
 -- Datetimes are represented as strings (matching real Nix).
 builtinFromTOML :: (MonadEval m) => NixValue -> m NixValue
-builtinFromTOML (VStr s _) = case parseTOML s of
-  Right val -> pure val
-  Left err -> throwEvalError ("builtins.fromTOML: " <> err)
+builtinFromTOML (VStr s _) = do
+  -- TOML is UTF-8 by definition; upstream's parser rejects invalid bytes.
+  decoded <- decodedText "builtins.fromTOML" s
+  case parseTOML decoded of
+    Right val -> pure val
+    Left err -> throwEvalError ("builtins.fromTOML: " <> err)
 builtinFromTOML other =
   throwEvalError ("builtins.fromTOML: expected a string, got " <> typeName other)
 
@@ -4470,19 +4589,23 @@ insertArrayTable (k : ks) m =
 -- | @builtins.toXML val@ - convert a Nix value to its XML representation.
 -- Matches the format defined by the Nix manual: strings, ints, floats,
 -- bools, nulls, lists, and attrsets map to their XML counterparts.
+-- Built over BYTES: upstream's serializer copies string payloads into the
+-- output with only the four ASCII escapes, so invalid UTF-8 passes
+-- through raw rather than erroring (unlike toJSON, whose upstream
+-- serializer validates).
 builtinToXML :: (MonadEval m) => NixValue -> m NixValue
 builtinToXML val = do
   xml <- valueToXML 0 val
-  pure (mkStr ("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n" <> xml <> "</expr>\n"))
+  pure (mkStrBytes ("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n" <> xml <> "</expr>\n"))
 
-valueToXML :: (MonadEval m) => Int -> NixValue -> m Text
+valueToXML :: (MonadEval m) => Int -> NixValue -> m BS.ByteString
 valueToXML depth val = case val of
   VStr s _ ->
     pure (indent depth <> "<string value=" <> xmlQuote s <> " />\n")
   VInt n ->
-    pure (indent depth <> "<int value=\"" <> T.pack (show n) <> "\" />\n")
+    pure (indent depth <> "<int value=\"" <> BC.pack (show n) <> "\" />\n")
   VFloat d ->
-    pure (indent depth <> "<float value=\"" <> formatXmlFloat d <> "\" />\n")
+    pure (indent depth <> "<float value=\"" <> TE.encodeUtf8 (formatXmlFloat d) <> "\" />\n")
   VBool True ->
     pure (indent depth <> "<bool value=\"true\" />\n")
   VBool False ->
@@ -4490,15 +4613,15 @@ valueToXML depth val = case val of
   VNull ->
     pure (indent depth <> "<null />\n")
   VPath p ->
-    pure (indent depth <> "<path value=" <> xmlQuote p <> " />\n")
+    pure (indent depth <> "<path value=" <> xmlQuote (TE.encodeUtf8 p) <> " />\n")
   VList cl -> do
     let thunks = map Thunk (clistThunks cl)
     items <- mapM (force >=> valueToXML (depth + 1)) thunks
-    pure (indent depth <> "<list>\n" <> T.concat items <> indent depth <> "</list>\n")
+    pure (indent depth <> "<list>\n" <> BS.concat items <> indent depth <> "</list>\n")
   VAttrs attrs -> do
     let pairs = attrSetToAscList attrs
     items <- mapM (attrToXML (depth + 1)) pairs
-    pure (indent depth <> "<attrs>\n" <> T.concat items <> indent depth <> "</attrs>\n")
+    pure (indent depth <> "<attrs>\n" <> BS.concat items <> indent depth <> "</attrs>\n")
   VLambda {} ->
     pure (indent depth <> "<function />\n")
   VBuiltin _ _ ->
@@ -4511,19 +4634,19 @@ valueToXML depth val = case val of
     attrToXML d (name, thunk) = do
       v <- force thunk
       inner <- valueToXML d v
-      pure (indent d <> "<attr name=" <> xmlQuote name <> ">\n" <> inner <> indent d <> "</attr>\n")
+      pure (indent d <> "<attr name=" <> xmlQuote (TE.encodeUtf8 name) <> ">\n" <> inner <> indent d <> "</attr>\n")
 
-indent :: Int -> Text
-indent n = T.replicate (n * 2) " "
+indent :: Int -> BS.ByteString
+indent n = BC.replicate (n * 2) ' '
 
-xmlQuote :: Text -> Text
-xmlQuote s = "\"" <> T.concatMap escapeChar s <> "\""
+xmlQuote :: BS.ByteString -> BS.ByteString
+xmlQuote s = "\"" <> BC.concatMap escapeChar s <> "\""
   where
     escapeChar '<' = "&lt;"
     escapeChar '>' = "&gt;"
     escapeChar '&' = "&amp;"
     escapeChar '"' = "&quot;"
-    escapeChar c = T.singleton c
+    escapeChar c = BC.singleton c
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - builtins.path
@@ -4543,7 +4666,9 @@ builtinPath (VAttrs attrs) = do
     Just thunk -> do
       pinVal <- force thunk
       case pinVal of
-        VStr pin _ -> Just <$> decodeSha256Pin "builtins.path" pin
+        VStr pin _ -> do
+          pinText <- decodedText "builtins.path" pin
+          Just <$> decodeSha256Pin "builtins.path" pinText
         other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
   let name = fromMaybe (extractBaseName pathStr) nameOverride
       pinSubject = "builtins.path: " <> pathStr
@@ -4575,8 +4700,8 @@ builtinPath other =
 sourceResultString :: Text -> NixValue
 sourceResultString storePathText =
   case parseStorePath defaultStoreDir storePathText of
-    Just sp -> VStr storePathText (plainContext sp)
-    Nothing -> VStr storePathText emptyContext
+    Just sp -> VStr (TE.encodeUtf8 storePathText) (plainContext sp)
+    Nothing -> VStr (TE.encodeUtf8 storePathText) emptyContext
 
 -- | Serialise a source tree to a NAR, keeping only entries the Nix filter
 -- function accepts - upstream's addToStore filtering: the filter receives
@@ -4636,7 +4761,8 @@ extractBaseName path =
 -- source's basename as the store name.
 builtinFilterSource :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinFilterSource filterFn (VPath path) = filterSourceInto filterFn path
-builtinFilterSource filterFn (VStr path _) = filterSourceInto filterFn path
+builtinFilterSource filterFn (VStr path _) =
+  filterSourceInto filterFn =<< decodedText "builtins.filterSource" path
 builtinFilterSource _ other =
   throwEvalError ("builtins.filterSource: expected a path, got " <> typeName other)
 

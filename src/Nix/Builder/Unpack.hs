@@ -54,12 +54,14 @@ import qualified Codec.Compression.Zstd.Lazy as Zstd
 import Control.Exception (SomeException, try)
 import Control.Monad (when)
 import Data.Bits ((.&.))
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (toLower)
 import Data.List (isPrefixOf, isSuffixOf)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..))
 import System.Directory
   ( copyFile,
@@ -82,7 +84,8 @@ import qualified System.Info
 -- | The magic builder string for the built-in archive extractor.  A
 -- derivation with this builder is not executed as a process - the Builder
 -- extracts its @srcs@ archives into @$out@ (see 'runBuiltinUnpack').
-builtinUnpackBuilder :: Text
+-- Bytes, matching the 'drvBuilder' field it is compared against.
+builtinUnpackBuilder :: BS.ByteString
 builtinUnpackBuilder = "builtin:unpack"
 
 -- | Derivation environment key holding the whitespace-separated archive
@@ -140,15 +143,19 @@ runBuiltinUnpack :: Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) (
 runBuiltinUnpack drv outputDirs =
   case (Map.lookup envSrcs (drvEnv drv), lookup unpackOutputName outputDirs) of
     (Nothing, _) -> failure "derivation has no 'srcs'"
-    (Just srcs, _)
-      | null (sourcePaths srcs) -> failure "'srcs' is empty"
-    (_, Nothing) -> failure "derivation defines no 'out' output"
-    (Just srcs, Just outDir) -> do
-      createDirectoryIfMissing True outDir
-      result <- unpackAll outDir (sourcePaths srcs)
-      pure $ case result of
-        Left msg -> Left (1, "builtin:unpack: " <> msg)
-        Right () -> Right ()
+    (Just srcsBytes, mOutDir) -> case TE.decodeUtf8' srcsBytes of
+      -- Store paths are ASCII; a non-UTF-8 srcs value cannot name any.
+      Left _ -> failure "'srcs' contains invalid UTF-8"
+      Right srcs
+        | null (sourcePaths srcs) -> failure "'srcs' is empty"
+        | otherwise -> case mOutDir of
+            Nothing -> failure "derivation defines no 'out' output"
+            Just outDir -> do
+              createDirectoryIfMissing True outDir
+              result <- unpackAll outDir (sourcePaths srcs)
+              pure $ case result of
+                Left msg -> Left (1, "builtin:unpack: " <> msg)
+                Right () -> Right ()
   where
     failure msg = pure (Left (1, "builtin:unpack: " <> msg))
     sourcePaths = map T.unpack . T.words

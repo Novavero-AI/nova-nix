@@ -299,14 +299,14 @@ setReadOnly path = do
 -- materialize the input @.drv@ closure (root plus every transitive input)
 -- before a dependency-aware build: evaluation computes these ATerms but does
 -- no store IO, so the build driver writes them here.
-writeDrvAterm :: Store -> StorePath -> Text -> IO ()
+writeDrvAterm :: Store -> StorePath -> BS.ByteString -> IO ()
 writeDrvAterm store sp aterm = do
   let destPath = storePathToFilePath (stDir store) sp
   createDirectoryIfMissing True (unStoreDir (stDir store))
-  -- UTF-8 bytes, not text-mode IO: the path was computed from the
-  -- UTF-8 serialization, and a locale-dependent or newline-translating
-  -- write would store bytes that no longer match their content address.
-  BS.writeFile destPath (TE.encodeUtf8 aterm)
+  -- Raw bytes, not text-mode IO: the path was computed from exactly these
+  -- bytes, and a locale-dependent or newline-translating write would store
+  -- bytes that no longer match their content address.
+  BS.writeFile destPath aterm
 
 -- | Serialize a derivation to ATerm and write it to the store at the given path.
 writeDrv :: Store -> Derivation -> StorePath -> IO ()
