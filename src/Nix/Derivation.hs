@@ -226,13 +226,20 @@ atermOutputsWith maskOutputs outs =
         <> ")"
 
 -- | Input-derivations serializer for the modulo substitution: keys are the
--- modulo-hash hex strings (sorted), output-name lists sorted and deduplicated.
+-- modulo-hash hex strings.  Entries that share a key are merged, unioning
+-- their output-name sets, so the section carries one entry per distinct modulo
+-- hash - mirroring upstream @hashDerivationModulo@'s @std::map<Hash, StringSet>@,
+-- where two inputs that collapse to the same modulo hash (e.g. two fetches
+-- differing only in URL) become a single entry.  'Set.union' makes the merge
+-- order-independent; 'Map.toAscList' and 'Set.toAscList' fix the ascending
+-- hex-key and output-name order (hex is lowercase, so this matches the bytewise
+-- order of upstream's @std::map<std::string>@).
 atermInputDrvsSubst :: [(Text, [Text])] -> Text
 atermInputDrvsSubst subs =
-  let sorted = sortBy (compare `on` fst) subs
-   in "[" <> T.intercalate "," (map render sorted) <> "]"
+  let merged = Map.fromListWith Set.union [(key, Set.fromList outs) | (key, outs) <- subs]
+   in "[" <> T.intercalate "," (map render (Map.toAscList merged)) <> "]"
   where
-    render (key, outs) = "(" <> atermString key <> "," <> atermStringList (sortNubText outs) <> ")"
+    render (key, outs) = "(" <> atermString key <> "," <> atermStringList (Set.toAscList outs) <> ")"
 
 -- | Sort and deduplicate output names (matches C++ @std::set<string>@).
 sortNubText :: [Text] -> [Text]

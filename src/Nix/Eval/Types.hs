@@ -129,6 +129,7 @@ import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cen
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CanonPath (canonPath)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
@@ -1106,11 +1107,14 @@ class (Monad m) => MonadEval m where
   -- | Run an external process: @(command, args, stdin) -> (exitCode, stdout, stderr)@.
   runProcess :: Text -> [Text] -> Text -> m (Int, Text, Text)
 
-  -- | Resolve a path literal to an absolute path.
-  -- In IO evaluation, relative paths are resolved against the current
-  -- file's directory (@esBaseDir@).  In pure evaluation, paths are
-  -- returned unchanged.  This ensures that path values captured in
-  -- closures remain valid after the import scope ends.
+  -- | Resolve a path literal to a canonical path.
+  -- In IO evaluation, @~/@ resolves against the home directory and other
+  -- relative paths resolve against the current file's directory
+  -- (@esBaseDir@); this ensures that path values captured in closures
+  -- remain valid after the import scope ends.  In pure evaluation the
+  -- text is not absolutized.  Every implementation ends with lexical
+  -- canonicalization ('Nix.Eval.CanonPath.canonPath'), as upstream: no
+  -- dot segment or repeated separator survives into a path value.
   resolvePathLiteral :: Text -> m Text
 
   -- | Copy a path (file or directory) to the store, returning the store
@@ -1166,6 +1170,23 @@ class (Monad m) => MonadEval m where
   -- build driver can materialize the entire input-@.drv@ closure to the store
   -- before a dependency-aware build.  A no-op in pure evaluators.
   recordDrvAterm :: Text -> Text -> m ()
+
+  -- | Read and parse a derivation from its @.drv@ in the store, or 'Nothing'
+  -- if it is absent or unreadable.  Used to resolve an input derivation's
+  -- modulo hash on a cache miss - a cross-session reference, or a path
+  -- fabricated by @builtins.appendContext@ - where the referenced derivation
+  -- was not evaluated this session.  Reading the store is an effect, so this
+  -- is an IO-evaluator capability: pure evaluators return 'Nothing', which
+  -- makes hashing a dependent derivation something only the IO evaluator can do.
+  readStoreDerivation :: StorePath -> m (Maybe Derivation)
+
+  -- | Look up a derivation evaluated earlier THIS session by its @.drv@ store
+  -- path, or 'Nothing' if it was not.  The IO evaluator reads the ATerm it
+  -- recorded bottom-up ('recordDrvAterm'); pure evaluators return 'Nothing'.
+  -- Used to recover a referenced derivation's output names for an all-outputs
+  -- (DrvDeep) context reference without a disk read - the in-session @.drv@ is
+  -- not on disk during evaluation.
+  lookupSessionDrv :: Text -> m (Maybe Derivation)
 
   -- | Compute the store path a source file/directory gets when copied into
   -- the store (recursive NAR sha256 to a @source@ fixed-output path), WITHOUT
@@ -1226,10 +1247,19 @@ instance MonadEval PureEval where
   cacheDrvHash _ _ = pure ()
   recordDrvAterm _ _ = pure ()
 
+  -- Pure eval cannot read the store, so a dependent derivation's input hash
+  -- is never recoverable here; the caller turns this into a loud error rather
+  -- than a guessed hash.
+  readStoreDerivation _ = pure Nothing
+
+  -- Pure eval keeps no session drv closure, so an all-outputs reference's
+  -- output names are never recoverable here either.
+  lookupSessionDrv _ = pure Nothing
+
   -- Pure eval cannot read files: a path coerces to itself (no store copy);
   -- the real copy-to-store happens only under 'EvalIO'.
   storeSourcePath = pure
-  resolvePathLiteral = pure
+  resolvePathLiteral = pure . canonPath
   forceThunk evalFn (Thunk ptr) =
     -- Read the C thunk via unsafePerformIO - safe because reads are
     -- idempotent and PureEval never writes back (no memoization).

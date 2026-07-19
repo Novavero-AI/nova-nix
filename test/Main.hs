@@ -26,7 +26,7 @@ import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWi
 import Nix.Builder.Unpack (builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import qualified Nix.DependencyGraph as DepGraph
-import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm, toATermForHash)
 import Nix.Eval (NixValue (..), StringContext (..), StringContextElement (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
@@ -2030,12 +2030,23 @@ testBatchB = do
           assertEqual "different" (VBool False) val,
       runTest "placeholder type error" $
         assertEvalFail "placeholder-err" "builtins.placeholder 42",
-      -- storePath
-      runTest "storePath valid" $
+      -- storePath returns a STRING marked already-in-store (SCPlain context),
+      -- not a bare path - the marker is what stops a later coercion re-NARing it.
+      runTest "storePath returns an in-store string" $
         assertEval
-          "storePath-valid"
-          "builtins.storePath \"/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1\""
-          (VPath "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1"),
+          "storePath-isstring"
+          "builtins.isString (builtins.storePath \"/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1\")"
+          (VBool True),
+      runTest "storePath result carries a plain-path context" $
+        assertEval
+          "storePath-hasctx"
+          "(builtins.getContext (builtins.storePath \"/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1\")).\"/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1\".path"
+          (VBool True),
+      runTest "storePath preserves the path text" $
+        assertEval
+          "storePath-text"
+          "builtins.unsafeDiscardStringContext (builtins.storePath \"/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1\")"
+          (mkStr "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1"),
       runTest "storePath invalid" $
         assertEvalFail "storePath-bad" "builtins.storePath \"/tmp/not-a-store-path\"",
       runTest "storePath type error" $
@@ -2500,10 +2511,11 @@ testDrvContext = do
       -- appendContext: empty context is no-op
       runTest "appendContext empty is no-op" $
         assertEval "appendCtx-empty" "builtins.hasContext (builtins.appendContext \"hello\" {})" (VBool False),
-      -- unsafeDiscardOutputDependency: strips drv context, keeps plain
-      runTest "discardOutputDep strips drv context"
+      -- unsafeDiscardOutputDependency KEEPS a derivation-output (Built) ref
+      -- unchanged (upstream), rather than dropping it as it once did.
+      runTest "discardOutputDep keeps output-dependency context"
         $ assertRight
-          "discardOutDep"
+          "discardOutDep-keep"
           ( evalNix $
               T.concat
                 [ "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ",
@@ -2511,7 +2523,42 @@ testDrvContext = do
                   "in builtins.hasContext stripped"
                 ]
           )
-        $ \val -> assertEqual "no-ctx" (VBool False) val,
+        $ \val -> assertEqual "keep-ctx" (VBool True) val,
+      -- ctx3: an all-outputs (DrvDeep) reference on d.drvPath is DOWNGRADED to
+      -- a plain path reference, not dropped.
+      runTest "discardOutputDep downgrades drvPath to a plain ref" $
+        assertEval
+          "discardOutDep-downgrade"
+          "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ctx = builtins.getContext (builtins.unsafeDiscardOutputDependency d.drvPath); key = builtins.elemAt (builtins.attrNames ctx) 0; in ctx.${key} == { path = true; }"
+          (VBool True),
+      -- ctx4: getContext renders each path's output names ascending.
+      runTest "getContext output names are ascending" $
+        assertEval
+          "getctx-ascending"
+          "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ \"out\" \"dev\" \"lib\" ]; }; s = \"${d.out}${d.lib}${d.dev}\"; ctx = builtins.getContext s; key = builtins.elemAt (builtins.attrNames ctx) 0; in ctx.${key}.outputs == [ \"dev\" \"lib\" \"out\" ]"
+          (VBool True),
+      -- ctx5: addDrvOutputDependencies upgrades a plain .drv reference back to
+      -- an all-outputs reference (the inverse of the ctx3 downgrade).
+      runTest "addDrvOutputDependencies upgrades a plain drv ref" $
+        assertEval
+          "adddrvout-upgrade"
+          "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; plain = builtins.unsafeDiscardOutputDependency d.drvPath; ctx = builtins.getContext (builtins.addDrvOutputDependencies plain); key = builtins.elemAt (builtins.attrNames ctx) 0; in ctx.${key} == { allOutputs = true; }"
+          (VBool True),
+      runTest "addDrvOutputDependencies rejects a derivation output" $
+        assertEvalFail
+          "adddrvout-built"
+          "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in builtins.addDrvOutputDependencies d.outPath",
+      runTest "addDrvOutputDependencies rejects a multi-element context" $
+        assertEvalFail
+          "adddrvout-multi"
+          "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in builtins.addDrvOutputDependencies \"${d.drvPath}${d.outPath}\"",
+      -- drv1: a derivation embedding another's drvPath (an all-outputs ref)
+      -- needs the referenced .drv's output names, which only the IO evaluator
+      -- supplies; pure eval fails loudly rather than dropping the reference.
+      runTest "deep drvPath reference fails loudly in pure eval" $
+        assertEvalFail
+          "drv1-pure-miss"
+          "let dep = derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; ref = dep.drvPath; }; in main.drvPath",
       -- derivation outPath is a string (not path) with context
       runTest "drv outPath is VStr"
         $ assertRight
@@ -3015,21 +3062,57 @@ testBuildOrchestrator = do
          in case DepGraph.buildDepGraph readFn drv (StorePath "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr" "root.drv") of
               Left _ -> Pass
               Right _ -> Fail "expected failure for missing .drv",
-      -- derivation with context creates populated inputDrvs
-      runTest "derivation context populates inputDrvs"
-        $ assertRight
-          "drv-ctx-inputs"
-          ( evalNix $
-              T.concat
-                [ "let dep = derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ",
-                  "main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; src = dep.outPath; }; ",
-                  "in main._derivation"
-                ]
-          )
-        $ \case
+      -- derivation with context creates populated inputDrvs.  Hashing a
+      -- dependent derivation reads input modulo hashes from the drv-hash
+      -- cache, which only the IO evaluator maintains, so this runs under
+      -- evalNixIO (an in-session dependency hits the cache bottom-up).
+      runTestM "derivation context populates inputDrvs" $ do
+        tmpBase <- getTemporaryDirectory
+        result <-
+          evalNixIO tmpBase $
+            T.concat
+              [ "let dep = derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ",
+                "main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; src = dep.outPath; }; ",
+                "in main._derivation"
+              ]
+        pure $ assertRight "drv-ctx-inputs" result $ \case
           VDerivation drv ->
             if Map.null (drvInputDrvs drv)
               then Fail "expected non-empty drvInputDrvs"
+              else Pass
+          _ -> Fail "expected VDerivation",
+      -- drv3: a dependent derivation's drvPath is stable across evaluations
+      -- (the input modulo substitution is deterministic).
+      runTestM "dependent derivation drvPath is deterministic (IO eval)" $ do
+        tmpBase <- getTemporaryDirectory
+        let expr =
+              T.concat
+                [ "let dep = derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ",
+                  "main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; src = dep.outPath; }; ",
+                  "in main.drvPath"
+                ]
+        r1 <- evalNixIO tmpBase expr
+        r2 <- evalNixIO tmpBase expr
+        pure $ case (r1, r2) of
+          (Right (VStr a _), Right (VStr b _))
+            | a == b -> Pass
+            | otherwise -> Fail ("drvPath not deterministic: " <> a <> " vs " <> b)
+          _ -> Fail "expected main.drvPath to evaluate to a string under IO eval",
+      -- drv1: embedding another derivation's drvPath (an all-outputs ref) adds
+      -- it to inputDrvs; the IO evaluator recovers its output names in-session.
+      runTestM "derivation embedding a drvPath lists it in inputDrvs (IO eval)" $ do
+        tmpBase <- getTemporaryDirectory
+        result <-
+          evalNixIO tmpBase $
+            T.concat
+              [ "let dep = derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ",
+                "main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; ref = dep.drvPath; }; ",
+                "in main._derivation"
+              ]
+        pure $ assertRight "drv1-deep-io" result $ \case
+          VDerivation drv ->
+            if Map.null (drvInputDrvs drv)
+              then Fail "expected dep in inputDrvs via the deep drvPath ref"
               else Pass
           _ -> Fail "expected VDerivation"
     ]
@@ -3854,6 +3937,127 @@ testDependentBuildIO = do
               Fail ("dependency-aware build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
 
+-- | Upstream value-conformance tests: each pins exact output bytes (hash
+-- decode, number formatting) that must match what upstream Nix computes for
+-- the same input, because these values can reach names, derivations, and
+-- hashes.
+testUpstreamConformance :: IO [Bool]
+testUpstreamConformance = do
+  putStrLn "eval/conformance"
+  sequence
+    [ -- Hash decode is length-keyed per algorithm, never first-format-wins:
+      -- a 52-char all-hex-digit string is a nix32 sha256 hash (64 hex chars
+      -- after conversion), not a 26-byte hex string echoed back.
+      runTest "hash decode keys on nix32 length" $
+        assertEval
+          "hash-nix32-length"
+          "builtins.stringLength (builtins.convertHash { hash = \"0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"; hashAlgo = \"sha256\"; toHashFormat = \"base16\"; })"
+          (VInt 64),
+      runTest "hash hex to nix32 round-trips" $
+        assertEval
+          "hash-roundtrip"
+          "builtins.convertHash { hash = builtins.convertHash { hash = \"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"; toHashFormat = \"nix32\"; }; hashAlgo = \"sha256\"; toHashFormat = \"base16\"; }"
+          (mkStr "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+      runTest "hash base64 spelling decodes by length" $
+        assertEval
+          "hash-base64"
+          "builtins.convertHash { hash = \"sha256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"; toHashFormat = \"base16\"; }"
+          (mkStr "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+      runTest "truncated hash is rejected" $
+        assertEvalFail
+          "hash-truncated"
+          "builtins.convertHash { hash = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85\"; hashAlgo = \"sha256\"; toHashFormat = \"base16\"; }",
+      runTest "unknown hash algorithm is rejected" $
+        assertEvalFail
+          "hash-bad-algo"
+          "builtins.convertHash { hash = \"00\"; hashAlgo = \"sha3\"; toHashFormat = \"base16\"; }",
+      -- toJSON floats: nlohmann's layout - shortest round-trip digits, .0
+      -- kept on integral values, scientific outside point positions (-4, 15].
+      runTest "toJSON float shortest digits" $
+        assertEval "json-float-third" "builtins.toJSON (1.0 / 3.0)" (mkStr "0.3333333333333333"),
+      runTest "toJSON integral float keeps .0" $
+        assertEval "json-float-integral" "builtins.toJSON 100.0" (mkStr "100.0"),
+      runTest "toJSON float plain decimal" $
+        assertEval "json-float-tenth" "builtins.toJSON 0.1" (mkStr "0.1"),
+      runTest "toJSON float zero" $
+        assertEval "json-float-zero" "builtins.toJSON 0.0" (mkStr "0.0"),
+      runTest "toJSON float widest plain integral" $
+        assertEval "json-float-e14" "builtins.toJSON 1.0e14" (mkStr "100000000000000.0"),
+      runTest "toJSON float first scientific integral" $
+        assertEval "json-float-e15" "builtins.toJSON 1.0e15" (mkStr "1e+15"),
+      runTest "toJSON float large exponent" $
+        assertEval "json-float-e21" "builtins.toJSON 1.0e21" (mkStr "1e+21"),
+      runTest "toJSON float negative exponent" $
+        assertEval "json-float-e-5" "builtins.toJSON 1.0e-5" (mkStr "1e-05"),
+      runTest "toJSON float smallest plain" $
+        assertEval "json-float-e-4" "builtins.toJSON 1.0e-4" (mkStr "0.0001"),
+      runTest "toJSON non-finite float is null" $
+        assertEval "json-float-inf" "builtins.toJSON (1.0e308 * 10.0)" (mkStr "null"),
+      -- fromJSON integers: int64 range stays int, wider falls back to float.
+      runTest "fromJSON promotes past-64-bit integer to float" $
+        assertEval "json-bigint-type" "builtins.typeOf (builtins.fromJSON \"999999999999999999999\")" (mkStr "float"),
+      runTest "fromJSON past-64-bit integer value" $
+        assertEval "json-bigint-val" "builtins.fromJSON \"999999999999999999999\" == 999999999999999999999.0" (VBool True),
+      runTest "fromJSON int64 max stays an int" $
+        assertEval "json-int64-max" "builtins.fromJSON \"9223372036854775807\"" (VInt 9223372036854775807),
+      -- toXML floats: C++ default ostream formatting, 6 significant digits.
+      runTest "toXML float 6 significant digits" $
+        assertEval
+          "xml-float-third"
+          "builtins.toXML (1.0 / 3.0)"
+          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"0.333333\" />\n</expr>\n"),
+      runTest "toXML float plain decimal" $
+        assertEval
+          "xml-float-centi"
+          "builtins.toXML 0.01"
+          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"0.01\" />\n</expr>\n"),
+      runTest "toXML integral float drops the point" $
+        assertEval
+          "xml-float-integral"
+          "builtins.toXML 100.0"
+          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"100\" />\n</expr>\n"),
+      runTest "toXML float large exponent" $
+        assertEval
+          "xml-float-e21"
+          "builtins.toXML 1.0e21"
+          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"1e+21\" />\n</expr>\n"),
+      runTest "toXML float small exponent" $
+        assertEval
+          "xml-float-e-5"
+          "builtins.toXML 2.5e-5"
+          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"2.5e-05\" />\n</expr>\n"),
+      -- fromTOML integers: 64-bit signed range enforced, no silent wrap.
+      runTest "fromTOML rejects past-64-bit integer" $
+        assertEvalFail "toml-int-overflow" "builtins.fromTOML \"v = 99999999999999999999\"",
+      runTest "fromTOML rejects past-64-bit hex integer" $
+        assertEvalFail "toml-hex-overflow" "builtins.fromTOML \"v = 0xffffffffffffffff\"",
+      runTest "fromTOML int64 max parses" $
+        assertEval "toml-int64-max" "(builtins.fromTOML \"v = 9223372036854775807\").v" (VInt 9223372036854775807),
+      runTest "fromTOML int64 min parses" $
+        assertEval "toml-int64-min" "(builtins.fromTOML \"v = -9223372036854775808\").v == (0 - 9223372036854775807 - 1)" (VBool True),
+      -- drv3: pure eval cannot read the store, so hashing a dependent
+      -- derivation fails loudly rather than emitting a guessed input hash.
+      runTest "dependent derivation drvPath fails loudly in pure eval" $
+        assertEvalFail
+          "drv-modulo-pure-miss"
+          "let dep = derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; src = dep.outPath; }; in main.drvPath",
+      -- Path values canonicalize lexically (CanonPath): no dot segment or
+      -- doubled separator survives into a path value's text, so different
+      -- spellings of the same path compare equal.
+      runTest "path literal canonicalizes dot segments" $
+        assertEval "path-canon-dot" "builtins.toString ./. == builtins.toString ./x/.." (VBool True),
+      runTest "path literal collapses inner dot" $
+        assertEval "path-canon-inner" "builtins.toString ./a/./b == builtins.toString ./a/b" (VBool True),
+      runTest "path plus string canonicalizes" $
+        assertEval "path-canon-plus" "./a + \"/../b\" == ./b" (VBool True),
+      runTest "toPath canonicalizes" $
+        assertEval "path-canon-topath" "builtins.toString (builtins.toPath \"/a/../b\")" (mkStr "/b"),
+      runTest "toPath collapses inner dot" $
+        assertEval "path-canon-topath-dot" "builtins.toString (builtins.toPath \"/a/./b\")" (mkStr "/a/b"),
+      runTest "toPath preserves forward-slash root" $
+        assertEval "path-canon-topath-root" "builtins.toString (builtins.toPath \"//nix//store\")" (mkStr "/nix/store")
+    ]
+
 -- | Eval-fidelity regression tests: each pins a semantic where the evaluator
 -- must match upstream Nix.  All are parity-safe - none affects a derivation
 -- or store-path hash.
@@ -4570,6 +4774,26 @@ testFromATerm = do
       -- Round-trip: complex derivation
       runTest "fromATerm round-trip complex" $
         assertEqual "complex round-trip" (Right complexTestDrv) (fromATerm (toATerm complexTestDrv)),
+      -- drv4: the modulo-substitution section merges input-drv entries that
+      -- share a modulo-hash key, unioning their output-name sets, so it is
+      -- byte-identical to the already-merged form.  (Just subs replaces the
+      -- whole input-drv section, so simpleTestDrv's own inputs are irrelevant.)
+      runTest "inputDrvsSubst merges equal modulo keys" $
+        assertEqual
+          "subst-merge"
+          (toATermForHash False (Just [("00000000", ["dev", "out"])]) simpleTestDrv)
+          (toATermForHash False (Just [("00000000", ["out"]), ("00000000", ["dev"])]) simpleTestDrv),
+      runTest "inputDrvsSubst unions and dedups merged out-names" $
+        assertEqual
+          "subst-union"
+          (toATermForHash False (Just [("aabbccdd", ["dev", "out"])]) simpleTestDrv)
+          (toATermForHash False (Just [("aabbccdd", ["out"]), ("aabbccdd", ["out", "dev"])]) simpleTestDrv),
+      -- Distinct keys are untouched: still one entry each, ascending by key.
+      runTest "inputDrvsSubst preserves distinct keys in order" $
+        assertEqual
+          "subst-distinct"
+          (toATermForHash False (Just [("00000000", ["out"]), ("11111111", ["out"])]) simpleTestDrv)
+          (toATermForHash False (Just [("11111111", ["out"]), ("00000000", ["out"])]) simpleTestDrv),
       -- Round-trip: empty derivation (no outputs, no inputs, no args, no env)
       runTest "fromATerm round-trip empty" $
         let emptyDrv =
@@ -6150,6 +6374,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testUnpackBuildIO,
           testDependentBuildIO,
           testEvalFidelity,
+          testUpstreamConformance,
           testHashHelpers,
           testNarKnownAnswer,
           testEvalLiterals,

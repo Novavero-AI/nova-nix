@@ -36,6 +36,10 @@ module Nix.Hash
     byteToHex,
     hexToBytes,
     rawHashWithAlgo,
+    hashAlgoBytes,
+    hexHashLen,
+    nix32HashLen,
+    base64HashLen,
 
     -- * Store path construction (Nix @makeStorePath@ family)
     makeStorePath,
@@ -159,6 +163,33 @@ rawHashWithAlgo algo bytes = case algo of
   "sha1" -> Just (BA.convert (CH.hash bytes :: CH.Digest CH.SHA1))
   "md5" -> Just (BA.convert (CH.hash bytes :: CH.Digest CH.MD5))
   _ -> Nothing
+
+-- | Raw digest size in bytes of a supported hash algorithm.  'Nothing' for
+-- an unknown algorithm name.
+hashAlgoBytes :: Text -> Maybe Int
+hashAlgoBytes algo = case algo of
+  "md5" -> Just 16
+  "sha1" -> Just 20
+  "sha256" -> Just 32
+  "sha512" -> Just 64
+  _ -> Nothing
+
+-- The three spelling lengths of an @n@-byte digest, mirroring upstream
+-- (@hash.cc@ @base16Len@\/@base32Len@\/@base64Len@).  For every supported
+-- digest size the three lengths are pairwise distinct, which is what makes
+-- length-keyed hash-format detection sound.
+
+-- | Character length of an @n@-byte digest spelled in base-16.
+hexHashLen :: Int -> Int
+hexHashLen n = 2 * n
+
+-- | Character length of an @n@-byte digest spelled in nix-base32.
+nix32HashLen :: Int -> Int
+nix32HashLen n = (8 * n - 1) `div` 5 + 1
+
+-- | Character length of an @n@-byte digest spelled in padded base64.
+base64HashLen :: Int -> Int
+base64HashLen n = 4 * ((n + 2) `div` 3)
 
 -- | The core store-path construction primitive.  Given a @type@ string, the
 -- inner content digest (raw SHA-256 bytes), and a name, produce the store
