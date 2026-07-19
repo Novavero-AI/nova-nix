@@ -6410,53 +6410,53 @@ testByteStringSemantics = do
   sequence
     [ -- stringLength / substring index bytes
       runTest "stringLength counts bytes" $
-        assertEval "len-bytes" "builtins.stringLength \"ä\"" (VInt 2),
+        assertEval "len-bytes" "builtins.stringLength \"\228\"" (VInt 2),
       runTest "substring slices at byte offsets" $
-        assertEval "substr-bytes" "builtins.stringLength (builtins.substring 0 1 \"ä\")" (VInt 1),
+        assertEval "substr-bytes" "builtins.stringLength (builtins.substring 0 1 \"\228\")" (VInt 1),
       runTest "mid-codepoint slices reassemble byte-exactly" $
         assertEval
           "substr-reassemble"
-          "builtins.substring 0 1 \"ä\" + builtins.substring 1 1 \"ä\" == \"ä\""
+          "builtins.substring 0 1 \"\228\" + builtins.substring 1 1 \"\228\" == \"\228\""
           (VBool True),
       -- the hash sees exactly the value's bytes
       runTest "hashString of a mid-codepoint slice is the raw byte's sha256" $
         assertEval
           "hash-midbyte"
-          "builtins.hashString \"sha256\" (builtins.substring 0 1 \"ä\")"
-          (mkStr (Hash.bytesToHexText (sha256Digest (BS.take 1 (TE.encodeUtf8 "ä"))))),
+          "builtins.hashString \"sha256\" (builtins.substring 0 1 \"\228\")"
+          (mkStr (Hash.bytesToHexText (sha256Digest (BS.take 1 (TE.encodeUtf8 "\228"))))),
       runTest "hashString of valid UTF-8 is unchanged by the byte layer" $
         assertEval
           "hash-utf8-stable"
-          "builtins.hashString \"sha256\" \"ä\""
-          (mkStr (Hash.bytesToHexText (sha256Digest (TE.encodeUtf8 "ä")))),
+          "builtins.hashString \"sha256\" \"\228\""
+          (mkStr (Hash.bytesToHexText (sha256Digest (TE.encodeUtf8 "\228")))),
       -- regexes run over bytes ('.' matches ONE byte)
       runTest "match . does not match a 2-byte char" $
-        assertEval "match-one-byte" "builtins.match \".\" \"ä\"" VNull,
+        assertEval "match-one-byte" "builtins.match \".\" \"\228\"" VNull,
       runTest "match .. matches a 2-byte char" $
-        assertEval "match-two-bytes" "builtins.match \"..\" \"ä\" == []" (VBool True),
+        assertEval "match-two-bytes" "builtins.match \"..\" \"\228\" == []" (VBool True),
       runTest "a multibyte pattern matches its own bytes" $
-        assertEval "match-multibyte-pattern" "builtins.match \"ä\" \"ä\" == []" (VBool True),
+        assertEval "match-multibyte-pattern" "builtins.match \"\228\" \"\228\" == []" (VBool True),
       -- replaceStrings with an empty 'from' steps one BYTE
       runTest "replaceStrings empty-from inserts between bytes" $
         assertEval
           "replace-empty-from"
-          "builtins.stringLength (builtins.replaceStrings [\"\"] [\"-\"] \"ä\")"
+          "builtins.stringLength (builtins.replaceStrings [\"\"] [\"-\"] \"\228\")"
           (VInt 5),
       runTest "replaceStrings empty-from result is byte-exact" $
         assertEval
           "replace-empty-from-bytes"
-          "builtins.replaceStrings [\"\"] [\"-\"] \"ä\" == \"-\" + builtins.substring 0 1 \"ä\" + \"-\" + builtins.substring 1 1 \"ä\" + \"-\""
+          "builtins.replaceStrings [\"\"] [\"-\"] \"\228\" == \"-\" + builtins.substring 0 1 \"\228\" + \"-\" + builtins.substring 1 1 \"\228\" + \"-\""
           (VBool True),
       -- strict-decode boundaries reject bytes that are not UTF-8
       runTest "toJSON rejects invalid UTF-8" $
-        assertEvalFail "tojson-invalid" "builtins.toJSON (builtins.substring 0 1 \"ä\")",
+        assertEvalFail "tojson-invalid" "builtins.toJSON (builtins.substring 0 1 \"\228\")",
       runTest "getAttr rejects an invalid-UTF-8 attr name" $
-        assertEvalFail "getattr-invalid" "builtins.getAttr (builtins.substring 0 1 \"ä\") {}",
+        assertEvalFail "getattr-invalid" "builtins.getAttr (builtins.substring 0 1 \"\228\") {}",
       -- toXML passes bytes through raw (upstream's serializer never validates)
       runTest "toXML passes a mid-codepoint byte through" $
         assertEval
           "toxml-bytes"
-          "builtins.stringLength (builtins.toXML (builtins.substring 0 1 \"ä\")) == builtins.stringLength (builtins.toXML \"x\")"
+          "builtins.stringLength (builtins.toXML (builtins.substring 0 1 \"\228\")) == builtins.stringLength (builtins.toXML \"x\")"
           (VBool True),
       -- a search-path miss is a CATCHABLE error (upstream ThrownError;
       -- nixpkgs' impure.nix relies on tryEval catching it)
@@ -6492,7 +6492,7 @@ testByteStringSemanticsIO = do
         BS.writeFile (testDir </> "utf16-ascii.bin") utf16AsciiBytes
         BS.writeFile (testDir </> "invalid.bin") invalidBytes
         BS.writeFile (testDir </> "nul.bin") nulBytes
-        BS.writeFile (testDir </> "umlaut.bin") (TE.encodeUtf8 "ä")
+        BS.writeFile (testDir </> "umlaut.bin") (TE.encodeUtf8 "\228")
     )
     ( do
         exists <- doesDirectoryExist testDir
@@ -6536,7 +6536,7 @@ testByteStringSemanticsIO = do
         runTestIO
           "readFile round-trips a multibyte literal"
           testDir
-          "builtins.readFile ./umlaut.bin == \"ä\""
+          "builtins.readFile ./umlaut.bin == \"\228\""
           (VBool True),
         runTestIOFail
           "readFile rejects an embedded NUL"

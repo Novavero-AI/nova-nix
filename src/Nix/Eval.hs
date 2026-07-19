@@ -1535,7 +1535,7 @@ builtinTail other = throwEvalError ("builtins.tail: expected a list, got " <> ty
 -- Builtin implementations - string (arity 1)
 -- ---------------------------------------------------------------------------
 
--- | Byte length, as upstream: @stringLength "ä"@ is 2, not 1.
+-- | Byte length, as upstream: stringLength of a 2-byte character is 2, not 1.
 builtinStringLength :: (MonadEval m) => NixValue -> m NixValue
 builtinStringLength (VStr s _) = pure (VInt (fromIntegral (BS.length s)))
 builtinStringLength other =
