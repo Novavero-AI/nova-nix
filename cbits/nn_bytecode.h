@@ -104,7 +104,13 @@
 typedef struct nn_op {
     uint8_t  opcode;     /* Which Expr constructor */
     uint8_t  flags;      /* Sub-type: BinaryOp, UnaryOp, formal type, etc. */
-    uint16_t short_arg;  /* Small immediate: count, bool flag, etc. */
+    uint16_t short_arg;  /* Small immediate: count, bool flag, etc.
+                            Payload counts use a spill convention so the
+                            op stays 16 bytes: 0xFFFF here means the true
+                            count is the FIRST uint32 of the op's data
+                            region and the payload starts one word later
+                            (emit/decode live on the Haskell side:
+                            Nix.Eval.CBytecode.cbcCountedPayload). */
     uint32_t arg1;       /* Child index, symbol, data offset, lo32, etc. */
     uint32_t arg2;       /* Child index, symbol, hi32, etc. */
     uint32_t arg3;       /* Child index, data offset, etc. */

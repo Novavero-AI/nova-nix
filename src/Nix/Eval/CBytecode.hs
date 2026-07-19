@@ -33,6 +33,10 @@ module Nix.Eval.CBytecode
     -- * Read data
     cbcData,
 
+    -- * Counted payloads (short_arg spill)
+    spilledCountSentinel,
+    cbcCountedPayload,
+
     -- * Diagnostics
     cbcOpCount,
     cbcDataCount,
@@ -214,6 +218,32 @@ cbcArg3 = c_nn_bc_arg3
 -- | Read entry @i@ of the bytecode data pool (interned literals, symbols).
 cbcData :: Word32 -> IO Word32
 cbcData = c_nn_bc_data
+
+-- ---------------------------------------------------------------------------
+-- Counted payloads (short_arg spill)
+-- ---------------------------------------------------------------------------
+
+-- | @short_arg@ value marking a spilled payload count: the true count is
+-- the FIRST word of the op's data region and the payload begins one word
+-- later.  Counts below the sentinel travel inline, so @nn_op_t@ stays 16
+-- bytes (four ops per cache line) and only an oversized literal pays the
+-- extra data word.  Must stay in lockstep with the @short_arg@ doc in
+-- @cbits\/nn_bytecode.h@.
+spilledCountSentinel :: Word16
+spilledCountSentinel = 0xFFFF
+
+-- | Read an op's payload count and payload start offset, resolving the
+-- spill convention.  @dataOff@ is the raw offset stored in the op's arg
+-- word (arg1 for most counted ops, arg2 for select\/hasAttr paths).
+-- The inline case costs one compare.
+cbcCountedPayload :: Word32 -> Word32 -> IO (Int, Word32)
+cbcCountedPayload bcIdx dataOff = do
+  inline <- cbcShortArg bcIdx
+  if inline == spilledCountSentinel
+    then do
+      spilled <- cbcData dataOff
+      pure (fromIntegral spilled, dataOff + 1)
+    else pure (fromIntegral inline, dataOff)
 
 -- ---------------------------------------------------------------------------
 -- Diagnostics

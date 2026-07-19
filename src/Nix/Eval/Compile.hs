@@ -56,6 +56,7 @@ import Nix.Eval.CBytecode
     formalName,
     formalNamedSet,
     formalSet,
+    spilledCountSentinel,
     strpartInterp,
     strpartLit,
     unaryNegate,
@@ -180,8 +181,7 @@ compileExpr = go
     compileStringParts :: Word8 -> [StringPart] -> IO Word32
     compileStringParts op parts = do
       compiled <- mapM compileOnePart parts
-      dataOff <- emitPairs compiled
-      partCount <- countArg "string with parts" (length parts)
+      (partCount, dataOff) <- emitCounted "string with parts" (length parts) (pairWords compiled)
       cbcEmit op 0 partCount dataOff 0 0
 
     compileOnePart :: StringPart -> IO (Word32, Word32)
@@ -198,9 +198,9 @@ compileExpr = go
 
     compileAttrs :: Bool -> [Binding] -> CaptureInfo -> IO Word32
     compileAttrs isRec bindings captureInfo = do
-      dataOff <- compileBindings bindings
+      bindingWords <- compileBindingWords bindings
       capOff <- compileCaptureInfo captureInfo
-      bindingCount <- countArg "attribute set with bindings" (length bindings)
+      (bindingCount, dataOff) <- emitCounted "attribute set with bindings" (length bindings) bindingWords
       cbcEmit OpAttrs (if isRec then 1 else 0) bindingCount dataOff capOff 0
 
     -- -----------------------------------------------------------------
@@ -210,8 +210,7 @@ compileExpr = go
     compileList :: [Expr] -> IO Word32
     compileList exprs = do
       childIndices <- mapM go exprs
-      dataOff <- emitWordList childIndices
-      elemCount <- countArg "list with elements" (length exprs)
+      (elemCount, dataOff) <- emitCounted "list with elements" (length exprs) childIndices
       cbcEmit OpList 0 elemCount dataOff 0 0
 
     -- -----------------------------------------------------------------
@@ -237,8 +236,7 @@ compileExpr = go
     compileAttrPath :: [AttrKey] -> IO (Word32, Word16)
     compileAttrPath path = do
       compiled <- mapM compileAttrKey path
-      off <- emitPairs compiled
-      pathLen <- countArg "attribute path with segments" (length path)
+      (pathLen, off) <- emitCounted "attribute path with segments" (length path) (pairWords compiled)
       pure (off, pathLen)
 
     compileAttrKey :: AttrKey -> IO (Word32, Word32)
@@ -295,19 +293,20 @@ compileExpr = go
     compileLet :: [Binding] -> Expr -> CaptureInfo -> IO Word32
     compileLet bindings body captureInfo = do
       bodyIdx <- go body
-      dataOff <- compileBindings bindings
+      bindingWords <- compileBindingWords bindings
       capOff <- compileCaptureInfo captureInfo
-      bindingCount <- countArg "let with bindings" (length bindings)
+      (bindingCount, dataOff) <- emitCounted "let with bindings" (length bindings) bindingWords
       cbcEmit OpLet 0 bindingCount dataOff bodyIdx capOff
 
     -- -----------------------------------------------------------------
     -- Bindings (shared by EAttrs and ELet)
     -- -----------------------------------------------------------------
 
-    compileBindings :: [Binding] -> IO Word32
-    compileBindings bindings = do
-      allWords <- mapM compileOneBinding bindings
-      emitWordList (concat allWords)
+    -- \| The flat data words for a binding list; the caller emits them
+    -- (with the count, via emitCounted) so a spilled count can precede
+    -- them contiguously.
+    compileBindingWords :: [Binding] -> IO [Word32]
+    compileBindingWords bindings = concat <$> mapM compileOneBinding bindings
 
     compileOneBinding :: Binding -> IO [Word32]
     compileOneBinding (NamedBinding path expr) = do
@@ -397,15 +396,9 @@ compileExpr = go
     -- Data buffer helpers
     -- -----------------------------------------------------------------
 
-    -- \| Emit pairs of (tag, value) to the data buffer.
-    -- Returns the offset of the first emitted word, or 0 if empty.
-    emitPairs :: [(Word32, Word32)] -> IO Word32
-    emitPairs [] = pure 0
-    emitPairs ((tag, val) : rest) = do
-      off <- cbcEmitData tag
-      _ <- cbcEmitData val
-      mapM_ (\(t, v) -> cbcEmitData t >> cbcEmitData v) rest
-      pure off
+    -- \| Flatten (tag, value) pairs into data-buffer words.
+    pairWords :: [(Word32, Word32)] -> [Word32]
+    pairWords = concatMap (\(tag, val) -> [tag, val])
 
     -- \| Emit a list of uint32 values to the data buffer.
     -- Returns the offset of the first emitted word, or 0 if empty.
@@ -416,13 +409,29 @@ compileExpr = go
       mapM_ cbcEmitData xs
       pure off
 
-    -- \| Convert an element count into the bytecode's 16-bit short_arg,
-    -- failing loudly on overflow: a silent Word16 truncation would make a
-    -- 70000-element list literal report length 4464.
-    countArg :: String -> Int -> IO Word16
+    -- \| Emit an op's counted payload, returning the short_arg and data
+    -- offset to store in the op.  A count below 'spilledCountSentinel'
+    -- travels inline in short_arg; a larger one is written as the first
+    -- data word with the sentinel inline ('cbcCountedPayload' is the
+    -- decode side).  nn_op_t stays 16 bytes either way; only an
+    -- oversized literal pays the extra word.
+    emitCounted :: String -> Int -> [Word32] -> IO (Word16, Word32)
+    emitCounted what n payload
+      | n < fromIntegral spilledCountSentinel = do
+          off <- emitWordList payload
+          pure (fromIntegral n, off)
+      | otherwise = do
+          spilled <- countArg what n
+          off <- emitWordList (spilled : payload)
+          pure (spilledCountSentinel, off)
+
+    -- \| Convert a spilled element count into its 32-bit data word,
+    -- failing loudly at the (unreachable-in-practice) ceiling: a silent
+    -- truncation would make an oversized literal report a wrong length.
+    countArg :: String -> Int -> IO Word32
     countArg what n
-      | n > fromIntegral (maxBound :: Word16) =
-          ioError (userError ("compile: " <> what <> " exceeding the bytecode limit of 65535 (got " <> show n <> ")"))
+      | toInteger n > toInteger (maxBound :: Word32) =
+          ioError (userError ("compile: " <> what <> " exceeding the bytecode limit of 4294967295 (got " <> show n <> ")"))
       | otherwise = pure (fromIntegral n)
 
     -- \| @fromIntegral@ shorthand.
@@ -536,8 +545,9 @@ data BcAttrKey
     BcDynamicKey !Word32
 
 -- | Decode all bindings from the bytecode data buffer.
--- @bindCount@ is the number of bindings, @dataOff@ is the start offset.
-decodeBcBindings :: Word16 -> Word32 -> IO [BcBinding]
+-- @bindCount@ is the number of bindings (already resolved through the
+-- short_arg spill by the caller), @dataOff@ is the start offset.
+decodeBcBindings :: Int -> Word32 -> IO [BcBinding]
 decodeBcBindings 0 _ = pure []
 decodeBcBindings count dataOff = do
   (binding, nextOff) <- decodeOneBinding dataOff
