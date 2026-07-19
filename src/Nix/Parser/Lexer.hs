@@ -16,6 +16,7 @@ import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
 import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Text.Foreign (lengthWord8)
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.Builder as TB
 import Nix.Parser.ParseError (ParseError (..))
@@ -127,7 +128,20 @@ data LexState = LexState
     lsCol :: !Int,
     lsModes :: ![LexMode],
     lsBraceDepth :: !Int,
-    lsBraceStack :: ![Int]
+    lsBraceStack :: ![Int],
+    -- | Path-lookahead watermark: every position whose remaining input is
+    -- LONGER than this byte count lies inside an already-scanned
+    -- slash-free path-char run, so 'looksLikePathFrom' answers False
+    -- without rescanning.  Without it, a long dot-and-ident run
+    -- (@x ? p0.p1. ... .p69999@) rescans the rest of the run at every
+    -- token - a quadratic that took minutes at 70000 segments.  The
+    -- input only ever shrinks, so a recorded run end stays comparable.
+    lsNoSlashFloor :: !Int,
+    -- | The same watermark for the URI lookahead: positions inside an
+    -- already-scanned scheme-char run that ended at a NON-colon carry no
+    -- URI, so 'uriSpanFrom' answers Nothing without rescanning.  Dots
+    -- are scheme chars, so the same long dot-run is quadratic without it.
+    lsNoColonFloor :: !Int
   }
 
 -- ---------------------------------------------------------------------------
@@ -145,7 +159,10 @@ tokenize fileName source =
             lsCol = 1,
             lsModes = [ModeNormal],
             lsBraceDepth = 0,
-            lsBraceStack = []
+            lsBraceStack = [],
+            -- No runs scanned yet: nothing may shortcut.
+            lsNoSlashFloor = maxBound,
+            lsNoColonFloor = maxBound
           }
    in lexLoop initialState []
 
@@ -162,128 +179,140 @@ lexLoop st acc = case lsModes st of
 lexNormalMode :: LexState -> [Located] -> Either ParseError [Located]
 lexNormalMode st acc = case T.uncons (lsInput st) of
   Nothing -> Right (reverse (Located (lsLine st) (lsCol st) TokEOF : acc))
-  Just (c, rest) -> case c of
-    _ | isSpace c -> lexNormalMode (skipWhitespace st) acc
-    '#' -> lexNormalMode (skipLineComment st) acc
-    '/'
-      | Just '*' <- safeHead rest ->
-          case skipBlockComment (advanceCol 2 st {lsInput = T.drop 2 (lsInput st)}) of
-            Left err -> Left err
-            Right newSt -> lexNormalMode newSt acc
-    '"' ->
-      let tok = Located (lsLine st) (lsCol st) TokStringOpen
-          newSt = advanceCol 1 st {lsInput = rest, lsModes = ModeString : lsModes st}
-       in lexLoop newSt (tok : acc)
-    '\''
-      | Just '\'' <- safeHead rest ->
-          let tok = Located (lsLine st) (lsCol st) TokIndStringOpen
-              newSt = advanceCol 2 st {lsInput = T.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
-           in lexLoop newSt (tok : acc)
-    '.'
-      | Just '.' <- safeHead rest,
-        Just '.' <- safeHead (T.drop 1 rest) ->
-          emit3 st TokEllipsis acc
-    '.'
-      -- Maximal munch, as upstream's PATH regex: a dot-led path-char run
-      -- containing a /-segment is ONE path token (./x, ../x, .github/x,
-      -- even .5/x) - the path reading beats the float and TokDot readings.
-      -- A dot-run with no slash falls through: .5 is a float, x.y selects.
-      | looksLikePath (lsInput st) -> lexPath st acc
-      | Just d <- safeHead rest,
-        isDigit d ->
-          lexLeadingDotFloat st acc
-    '.' -> emit1 st TokDot acc
-    ',' -> emit1 st TokComma acc
-    ';' -> emit1 st TokSemicolon acc
-    ':' -> emit1 st TokColon acc
-    '@' -> emit1 st TokAt acc
-    '?' -> emit1 st TokQuestion acc
-    '(' -> emit1 st TokLParen acc
-    ')' -> emit1 st TokRParen acc
-    '[' -> emit1 st TokLBracket acc
-    ']' -> emit1 st TokRBracket acc
-    '{' ->
-      let tok = Located (lsLine st) (lsCol st) TokLBrace
-          newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = lsBraceDepth st + 1}
-       in lexNormalMode newSt (tok : acc)
-    '}' ->
-      case lsModes st of
-        -- closing an interpolation: pop back to string/indstring mode and
-        -- restore the enclosing normal-mode context's brace count.
-        (ModeNormal : outerMode : restModes)
-          | lsBraceDepth st == 0,
-            outerMode == ModeString || outerMode == ModeIndString ->
-              let tok = Located (lsLine st) (lsCol st) TokInterpClose
-                  (restoredDepth, restoredStack) = case lsBraceStack st of
-                    (saved : outerSaved) -> (saved, outerSaved)
-                    [] -> (0, [])
-                  newSt =
-                    advanceCol
-                      1
-                      st
-                        { lsInput = rest,
-                          lsModes = outerMode : restModes,
-                          lsBraceDepth = restoredDepth,
-                          lsBraceStack = restoredStack
-                        }
-               in lexLoop newSt (tok : acc)
-        _ ->
-          let depth = lsBraceDepth st
-              newDepth = if depth > 0 then depth - 1 else 0
-              tok = Located (lsLine st) (lsCol st) TokRBrace
-              newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = newDepth}
-           in lexNormalMode newSt (tok : acc)
-    '+' | Just '+' <- safeHead rest -> emit2 st TokConcat acc
-    '+' -> emit1 st TokPlus acc
-    '*' -> emit1 st TokStar acc
-    '-' | Just '>' <- safeHead rest -> emit2 st TokImpl acc
-    '-' -> emit1 st TokMinus acc
-    '!' | Just '=' <- safeHead rest -> emit2 st TokNeq acc
-    '!' -> emit1 st TokNot acc
-    '&' | Just '&' <- safeHead rest -> emit2 st TokAnd acc
-    '|' | Just '|' <- safeHead rest -> emit2 st TokOr acc
-    '=' | Just '=' <- safeHead rest -> emit2 st TokEq acc
-    '=' -> emit1 st TokAssign acc
-    '<' | Just '=' <- safeHead rest -> emit2 st TokLte acc
-    '<'
-      | maybe False (\ch -> isAlpha ch || ch == '_') (safeHead rest) ->
-          lexSearchPath st acc
-    '<' -> emit1 st TokLt acc
-    '>' | Just '=' <- safeHead rest -> emit2 st TokGte acc
-    '>' -> emit1 st TokGt acc
-    '/' | Just '/' <- safeHead rest -> emit2 st TokUpdate acc
-    '/'
-      -- A '/' that begins a path segment (slash followed by a path char)
-      -- starts a path: /abs/path.  A bare '/' (followed by whitespace) is the
-      -- division operator: a / b.  Relative paths like a/b are caught by the
-      -- path guard further down, before the identifier/number cases.
-      | looksLikePath (lsInput st) -> lexPath st acc
-      | otherwise -> emit1 st TokSlash acc
-    '$'
-      | Just '{' <- safeHead rest ->
-          -- Increment brace depth so the closing } is TokRBrace, not
-          -- TokInterpClose.  Without this, ${name} inside a string
-          -- interpolation like "${env.${name}}" prematurely ends the
-          -- outer interpolation.
-          let tok = Located (lsLine st) (lsCol st) TokInterpOpen
-              newSt = advanceCol 2 st {lsInput = T.drop 1 rest, lsBraceDepth = lsBraceDepth st + 1}
-           in lexNormalMode newSt (tok : acc)
-    '~'
-      | Just '/' <- safeHead rest ->
-          lexPath st acc
-    -- A path-char run that contains a '/' segment is a path, not an
-    -- identifier or number: a/b and 6/2 lex as paths, matching Nix.
-    _ | looksLikePath (lsInput st) -> lexPath st acc
-    _ | isDigit c -> lexNumber st acc
-    _ | isIdentStart c -> lexIdentOrKeyword st acc
-    _ ->
-      Left
-        ParseError
-          { peFile = lsFile st,
-            peLine = lsLine st,
-            peCol = lsCol st,
-            peMessage = "unexpected character: " <> T.singleton c
-          }
+  Just (c, rest) ->
+    -- Lazy: forced only by the three path guards below.  Branches taken
+    -- when the guard says "not a path" continue with 'flooredSt' so a
+    -- freshly recorded slash-free run is remembered, not rescanned.
+    let (startsPath, advancedFloor) = looksLikePathFrom (lsNoSlashFloor st) (lsInput st)
+        flooredSt = st {lsNoSlashFloor = advancedFloor}
+     in lexNormalModeAt st flooredSt startsPath c rest acc
+
+-- | The normal-mode dispatch, after the path lookahead has been prepared.
+-- @st@ is the incoming state; @flooredSt@ carries the advanced path
+-- watermark for the continuations that bypassed a path reading.
+lexNormalModeAt :: LexState -> LexState -> Bool -> Char -> Text -> [Located] -> Either ParseError [Located]
+lexNormalModeAt st flooredSt startsPath c rest acc = case c of
+  _ | isSpace c -> lexNormalMode (skipWhitespace st) acc
+  '#' -> lexNormalMode (skipLineComment st) acc
+  '/'
+    | Just '*' <- safeHead rest ->
+        case skipBlockComment (advanceCol 2 st {lsInput = T.drop 2 (lsInput st)}) of
+          Left err -> Left err
+          Right newSt -> lexNormalMode newSt acc
+  '"' ->
+    let tok = Located (lsLine st) (lsCol st) TokStringOpen
+        newSt = advanceCol 1 st {lsInput = rest, lsModes = ModeString : lsModes st}
+     in lexLoop newSt (tok : acc)
+  '\''
+    | Just '\'' <- safeHead rest ->
+        let tok = Located (lsLine st) (lsCol st) TokIndStringOpen
+            newSt = advanceCol 2 st {lsInput = T.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
+         in lexLoop newSt (tok : acc)
+  '.'
+    | Just '.' <- safeHead rest,
+      Just '.' <- safeHead (T.drop 1 rest) ->
+        emit3 st TokEllipsis acc
+  '.'
+    -- Maximal munch, as upstream's PATH regex: a dot-led path-char run
+    -- containing a /-segment is ONE path token (./x, ../x, .github/x,
+    -- even .5/x) - the path reading beats the float and TokDot readings.
+    -- A dot-run with no slash falls through: .5 is a float, x.y selects.
+    | startsPath -> lexPath st acc
+    | Just d <- safeHead rest,
+      isDigit d ->
+        lexLeadingDotFloat flooredSt acc
+  '.' -> emit1 flooredSt TokDot acc
+  ',' -> emit1 st TokComma acc
+  ';' -> emit1 st TokSemicolon acc
+  ':' -> emit1 st TokColon acc
+  '@' -> emit1 st TokAt acc
+  '?' -> emit1 st TokQuestion acc
+  '(' -> emit1 st TokLParen acc
+  ')' -> emit1 st TokRParen acc
+  '[' -> emit1 st TokLBracket acc
+  ']' -> emit1 st TokRBracket acc
+  '{' ->
+    let tok = Located (lsLine st) (lsCol st) TokLBrace
+        newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = lsBraceDepth st + 1}
+     in lexNormalMode newSt (tok : acc)
+  '}' ->
+    case lsModes st of
+      -- closing an interpolation: pop back to string/indstring mode and
+      -- restore the enclosing normal-mode context's brace count.
+      (ModeNormal : outerMode : restModes)
+        | lsBraceDepth st == 0,
+          outerMode == ModeString || outerMode == ModeIndString ->
+            let tok = Located (lsLine st) (lsCol st) TokInterpClose
+                (restoredDepth, restoredStack) = case lsBraceStack st of
+                  (saved : outerSaved) -> (saved, outerSaved)
+                  [] -> (0, [])
+                newSt =
+                  advanceCol
+                    1
+                    st
+                      { lsInput = rest,
+                        lsModes = outerMode : restModes,
+                        lsBraceDepth = restoredDepth,
+                        lsBraceStack = restoredStack
+                      }
+             in lexLoop newSt (tok : acc)
+      _ ->
+        let depth = lsBraceDepth st
+            newDepth = if depth > 0 then depth - 1 else 0
+            tok = Located (lsLine st) (lsCol st) TokRBrace
+            newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = newDepth}
+         in lexNormalMode newSt (tok : acc)
+  '+' | Just '+' <- safeHead rest -> emit2 st TokConcat acc
+  '+' -> emit1 st TokPlus acc
+  '*' -> emit1 st TokStar acc
+  '-' | Just '>' <- safeHead rest -> emit2 st TokImpl acc
+  '-' -> emit1 st TokMinus acc
+  '!' | Just '=' <- safeHead rest -> emit2 st TokNeq acc
+  '!' -> emit1 st TokNot acc
+  '&' | Just '&' <- safeHead rest -> emit2 st TokAnd acc
+  '|' | Just '|' <- safeHead rest -> emit2 st TokOr acc
+  '=' | Just '=' <- safeHead rest -> emit2 st TokEq acc
+  '=' -> emit1 st TokAssign acc
+  '<' | Just '=' <- safeHead rest -> emit2 st TokLte acc
+  '<'
+    | maybe False (\ch -> isAlpha ch || ch == '_') (safeHead rest) ->
+        lexSearchPath st acc
+  '<' -> emit1 st TokLt acc
+  '>' | Just '=' <- safeHead rest -> emit2 st TokGte acc
+  '>' -> emit1 st TokGt acc
+  '/' | Just '/' <- safeHead rest -> emit2 st TokUpdate acc
+  '/'
+    -- A '/' that begins a path segment (slash followed by a path char)
+    -- starts a path: /abs/path.  A bare '/' (followed by whitespace) is the
+    -- division operator: a / b.  Relative paths like a/b are caught by the
+    -- path guard further down, before the identifier/number cases.
+    | startsPath -> lexPath st acc
+    | otherwise -> emit1 flooredSt TokSlash acc
+  '$'
+    | Just '{' <- safeHead rest ->
+        -- Increment brace depth so the closing } is TokRBrace, not
+        -- TokInterpClose.  Without this, ${name} inside a string
+        -- interpolation like "${env.${name}}" prematurely ends the
+        -- outer interpolation.
+        let tok = Located (lsLine st) (lsCol st) TokInterpOpen
+            newSt = advanceCol 2 st {lsInput = T.drop 1 rest, lsBraceDepth = lsBraceDepth st + 1}
+         in lexNormalMode newSt (tok : acc)
+  '~'
+    | Just '/' <- safeHead rest ->
+        lexPath st acc
+  -- A path-char run that contains a '/' segment is a path, not an
+  -- identifier or number: a/b and 6/2 lex as paths, matching Nix.
+  _ | startsPath -> lexPath st acc
+  _ | isDigit c -> lexNumber flooredSt acc
+  _ | isIdentStart c -> lexIdentOrKeyword flooredSt acc
+  _ ->
+    Left
+      ParseError
+        { peFile = lsFile st,
+          peLine = lsLine st,
+          peCol = lsCol st,
+          peMessage = "unexpected character: " <> T.singleton c
+        }
 
 -- ---------------------------------------------------------------------------
 -- String modes
@@ -628,7 +657,8 @@ lexIdentOrKeyword :: LexState -> [Located] -> Either ParseError [Located]
 lexIdentOrKeyword st acc =
   let input = lsInput st
       (ident, after) = T.span isIdentChar input
-   in case uriSpan input of
+      (uriReading, advancedFloor) = uriSpanFrom (lsNoColonFloor st) input
+   in case uriReading of
         -- Flex maximal munch: the URI rule beats identifiers AND keywords
         -- whenever it matches more characters, so @x:y@ is the URI "x:y"
         -- (the classic reason the identity function must be written
@@ -640,7 +670,7 @@ lexIdentOrKeyword st acc =
                in lexNormalMode newSt (tok : acc)
         _ ->
           let tok = Located (lsLine st) (lsCol st) (identToToken ident)
-              newSt = advanceCol (T.length ident) st {lsInput = after}
+              newSt = advanceCol (T.length ident) st {lsInput = after, lsNoColonFloor = advancedFloor}
            in lexNormalMode newSt (tok : acc)
 
 -- | Match upstream's URI token at the start of the input:
@@ -648,16 +678,27 @@ lexIdentOrKeyword st acc =
 -- with a letter (never @_@), and one URI char after the colon suffices -
 -- scheme-only URIs like @mailto:x@ count.  Returns the URI text and the
 -- remaining input.
-uriSpan :: Text -> Maybe (Text, Text)
-uriSpan input = case T.uncons input of
-  Just (schemeStart, _)
-    | isAlpha schemeStart,
-      (scheme, afterScheme) <- T.span isSchemeChar input,
-      Just afterColon <- T.stripPrefix ":" afterScheme,
-      (body, afterUri) <- T.span isUriChar afterColon,
-      not (T.null body) ->
-        Just (scheme <> ":" <> body, afterUri)
-  _ -> Nothing
+--
+-- Threads the 'lsNoColonFloor' watermark: when the scheme-char run ends
+-- at a NON-colon, no position inside that run can start a URI (a suffix
+-- of the run spans to the same terminator), so the run's end is recorded
+-- and later positions inside it answer Nothing in O(1).  A run ending at
+-- @:@ records nothing - a shorter suffix of it may itself be a URI.
+uriSpanFrom :: Int -> Text -> (Maybe (Text, Text), Int)
+uriSpanFrom noColonFloor input
+  | lengthWord8 input > noColonFloor = (Nothing, noColonFloor)
+  | otherwise = case T.uncons input of
+      Just (schemeStart, _)
+        | isAlpha schemeStart ->
+            let (scheme, afterScheme) = T.span isSchemeChar input
+             in case T.stripPrefix ":" afterScheme of
+                  Just afterColon
+                    | (body, afterUri) <- T.span isUriChar afterColon,
+                      not (T.null body) ->
+                        (Just (scheme <> ":" <> body, afterUri), noColonFloor)
+                  Just _ -> (Nothing, noColonFloor)
+                  Nothing -> (Nothing, lengthWord8 input - lengthWord8 scheme)
+      _ -> (Nothing, noColonFloor)
 
 identToToken :: Text -> Token
 identToToken "if" = TokIf
@@ -753,12 +794,26 @@ isPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
 -- as a path rather than an identifier, number, or division operator -
 -- matching Nix, where @a/b@ and @/abs/path@ are paths, @a / b@ (slash
 -- surrounded by whitespace) is division, and @a // b@ is the update operator.
-looksLikePath :: Text -> Bool
-looksLikePath input =
-  case T.break (== '/') (T.takeWhile isPathChar input) of
-    (_, slashAndRest) -> case T.uncons (T.drop 1 slashAndRest) of
-      Just (afterSlash, _) -> isPathChar afterSlash && afterSlash /= '/'
-      Nothing -> False
+--
+-- Threads the 'lsNoSlashFloor' watermark: a position inside an
+-- already-scanned SLASH-FREE run answers False in O(1), and a freshly
+-- scanned slash-free run records its end (no position within it can start
+-- a path, since the run's characters and its terminator are the same
+-- bytes every later check would rescan).  A run that CONTAINS a slash
+-- records nothing: a later position inside it can legitimately answer
+-- differently (@a//b.c/d@ is update-then-path).  'lengthWord8' is the
+-- O(1) position measure; byte counts, so it is monotone under suffixing.
+looksLikePathFrom :: Int -> Text -> (Bool, Int)
+looksLikePathFrom noSlashFloor input
+  | lengthWord8 input > noSlashFloor = (False, noSlashFloor)
+  | otherwise =
+      let run = T.takeWhile isPathChar input
+          (_, slashAndRest) = T.break (== '/') run
+       in if T.null slashAndRest
+            then (False, lengthWord8 input - lengthWord8 run)
+            else case T.uncons (T.drop 1 slashAndRest) of
+              Just (afterSlash, _) -> (isPathChar afterSlash && afterSlash /= '/', noSlashFloor)
+              Nothing -> (False, noSlashFloor)
 
 isSearchPathChar :: Char -> Bool
 isSearchPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
