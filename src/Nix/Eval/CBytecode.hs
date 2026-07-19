@@ -176,11 +176,28 @@ cbcDestroy = c_nn_bytecode_destroy
 
 -- | Append one instruction.  Returns the instruction index.
 cbcEmit :: Word8 -> Word8 -> Word16 -> Word32 -> Word32 -> Word32 -> IO Word32
-cbcEmit = c_nn_bc_emit
+cbcEmit opcode flags shortArg arg1 arg2 arg3 =
+  checkedEmit "nn_bc_emit" =<< c_nn_bc_emit opcode flags shortArg arg1 arg2 arg3
 
 -- | Append one uint32 to the data buffer.  Returns the data offset.
 cbcEmitData :: Word32 -> IO Word32
-cbcEmitData = c_nn_bc_emit_data
+cbcEmitData value = checkedEmit "nn_bc_emit_data" =<< c_nn_bc_emit_data value
+
+-- | @UINT32_MAX@ from a C emit function signals a failed append (realloc
+-- exhaustion or the uint32 index ceiling), not a valid index.  Must stay
+-- in lockstep with the emit docs in @cbits\/nn_bytecode.h@.
+emitFailedSentinel :: Word32
+emitFailedSentinel = 0xFFFFFFFF
+
+-- | Reject the failure sentinel before it can flow onward as an index:
+-- the bytecode arrays are global C state, so a failed append leaves
+-- nothing to recover, and the read-side bounds on a sentinel index do
+-- not survive a release build.
+checkedEmit :: String -> Word32 -> IO Word32
+checkedEmit site idx
+  | idx == emitFailedSentinel =
+      ioError (userError (site <> ": bytecode append failed (allocation failure or index ceiling)"))
+  | otherwise = pure idx
 
 -- ---------------------------------------------------------------------------
 -- Read instructions

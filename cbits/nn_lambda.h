@@ -43,14 +43,16 @@ typedef struct nn_formal_entry {
 } nn_formal_entry_t;
 
 /* Lambda closure: env + body + formals specification.
- * Packed for minimal size (pointers first, then uint32s, then small fields).
- * 28 bytes on 64-bit (no padding). */
+ * Packed for minimal size: pointers first, then uint32s, then small
+ * fields - no internal padding.  formal_count is a full uint32_t
+ * because the formal list scales with the source expression (a
+ * narrower count would wrap and undersize the entries array). */
 typedef struct nn_lambda {
     struct nn_env         *env;          /* captured closure environment */
     nn_formal_entry_t     *entries;      /* formal entries (malloc'd, or NULL) */
     uint32_t               body_bc_idx;  /* bytecode index of lambda body */
     uint32_t               name_sym;     /* symbol for Name/NamedSet binding */
-    uint16_t               formal_count; /* number of formal entries */
+    uint32_t               formal_count; /* number of formal entries */
     uint8_t                formals_type; /* NN_FORMALS_NAME/SET/NAMED_SET */
     uint8_t                allow_extra;  /* 1 if ellipsis (...) present */
 } nn_lambda_t;
@@ -60,14 +62,17 @@ typedef struct nn_lambda {
 /* Allocate a new lambda closure.  The entries array is allocated
  * internally (formal_count entries).  Fill entries via
  * nn_lambda_set_entry() after construction.
- * Returns NULL on allocation failure. */
+ * Returns NULL on allocation failure or if the entries array size
+ * would overflow - the caller must check. */
 nn_lambda_t *nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
                            uint8_t formals_type, uint32_t name_sym,
-                           uint8_t allow_extra, uint16_t formal_count);
+                           uint8_t allow_extra, uint32_t formal_count);
 
 /* Set a formal entry at the given index (for construction).
- * Index must be < formal_count. */
-void nn_lambda_set_entry(nn_lambda_t *lam, uint16_t idx,
+ * idx must be < formal_count.  A NULL struct or out-of-range idx is
+ * dropped (asserts in debug builds) rather than writing out of
+ * bounds - the bound stays live under NDEBUG. */
+void nn_lambda_set_entry(nn_lambda_t *lam, uint32_t idx,
                          uint32_t name_sym, uint32_t has_default,
                          uint32_t default_bc_idx);
 
@@ -83,11 +88,13 @@ uint32_t       nn_lambda_body(const nn_lambda_t *lam);
 uint8_t        nn_lambda_formals_type(const nn_lambda_t *lam);
 uint32_t       nn_lambda_name_sym(const nn_lambda_t *lam);
 uint8_t        nn_lambda_allow_extra(const nn_lambda_t *lam);
-uint16_t       nn_lambda_formal_count(const nn_lambda_t *lam);
+uint32_t       nn_lambda_formal_count(const nn_lambda_t *lam);
 
-/* Read formal entry fields by index (must be < formal_count). */
-uint32_t nn_lambda_entry_name(const nn_lambda_t *lam, uint16_t idx);
-uint32_t nn_lambda_entry_has_default(const nn_lambda_t *lam, uint16_t idx);
-uint32_t nn_lambda_entry_default(const nn_lambda_t *lam, uint16_t idx);
+/* Read formal entry fields by index (must be < formal_count).
+ * Out-of-range reads return 0 (asserts in debug builds) rather than
+ * reading out of bounds. */
+uint32_t nn_lambda_entry_name(const nn_lambda_t *lam, uint32_t idx);
+uint32_t nn_lambda_entry_has_default(const nn_lambda_t *lam, uint32_t idx);
+uint32_t nn_lambda_entry_default(const nn_lambda_t *lam, uint32_t idx);
 
 #endif /* NN_LAMBDA_H */

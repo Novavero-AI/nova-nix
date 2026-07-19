@@ -44,14 +44,16 @@ typedef struct nn_sce {
 } nn_sce_t;
 
 /* A string with context.  text is an interned nn_symbol_t for the
- * string content.  ctx_count is the number of context elements.
+ * string content.  ctx_count is the number of context elements; it is
+ * a full uint32_t because context sets scale with the evaluated
+ * expression (a narrower count would wrap and undersize the array).
  * ctx[] is a C99 flexible array of context elements, sorted by
  * (tag, sp_hash, sp_name, output) for deterministic comparison.
  *
  * Single contiguous allocation: header + elements. */
 typedef struct nn_ctxstr {
     uint32_t    text;
-    uint16_t    ctx_count;
+    uint32_t    ctx_count;
     nn_sce_t    ctx[];
 } nn_ctxstr_t;
 
@@ -59,8 +61,10 @@ typedef struct nn_ctxstr {
 
 /* Allocate a new nn_ctxstr_t with space for ctx_count elements.
  * Elements are uninitialized - caller must fill via nn_ctxstr_set_*.
- * Tracked globally for bulk cleanup. */
-nn_ctxstr_t *nn_ctxstr_new(uint32_t text, uint16_t ctx_count);
+ * Tracked globally for bulk cleanup.  Returns NULL on allocation
+ * failure or if the element array size would overflow - the caller
+ * must check. */
+nn_ctxstr_t *nn_ctxstr_new(uint32_t text, uint32_t ctx_count);
 
 /* Free all tracked nn_ctxstr_t allocations.  Called during arena
  * teardown, after thunk iteration but before env/symbol cleanup. */
@@ -68,24 +72,30 @@ void nn_ctxstr_free_all(void);
 
 /* --- Element setters --- */
 
-void nn_ctxstr_set_plain(nn_ctxstr_t *s, uint16_t idx,
+/* idx must be < ctx_count.  A NULL struct or out-of-range idx is
+ * dropped (asserts in debug builds) rather than writing out of
+ * bounds - the bound stays live under NDEBUG. */
+
+void nn_ctxstr_set_plain(nn_ctxstr_t *s, uint32_t idx,
                          uint32_t sp_hash, uint32_t sp_name);
 
-void nn_ctxstr_set_drv_output(nn_ctxstr_t *s, uint16_t idx,
+void nn_ctxstr_set_drv_output(nn_ctxstr_t *s, uint32_t idx,
                               uint32_t sp_hash, uint32_t sp_name,
                               uint32_t output);
 
-void nn_ctxstr_set_all_outputs(nn_ctxstr_t *s, uint16_t idx,
+void nn_ctxstr_set_all_outputs(nn_ctxstr_t *s, uint32_t idx,
                                uint32_t sp_hash, uint32_t sp_name);
 
 /* --- Accessors --- */
 
 uint32_t nn_ctxstr_text(const nn_ctxstr_t *s);
-uint16_t nn_ctxstr_ctx_count(const nn_ctxstr_t *s);
+uint32_t nn_ctxstr_ctx_count(const nn_ctxstr_t *s);
 
-uint8_t  nn_ctxstr_elem_tag(const nn_ctxstr_t *s, uint16_t idx);
-uint32_t nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint16_t idx);
-uint32_t nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint16_t idx);
-uint32_t nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint16_t idx);
+/* Element reads with idx >= ctx_count return 0 (asserts in debug
+ * builds) rather than reading out of bounds. */
+uint8_t  nn_ctxstr_elem_tag(const nn_ctxstr_t *s, uint32_t idx);
+uint32_t nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint32_t idx);
+uint32_t nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint32_t idx);
+uint32_t nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint32_t idx);
 
 #endif /* NN_CTXSTR_H */

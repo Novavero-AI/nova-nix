@@ -147,7 +147,7 @@ nn_env_empty(void)
 nn_env_t *
 nn_env_new(void **slots, uint32_t slot_count,
            void *lazy_scope, nn_env_t *parent,
-           void **with_scopes, uint16_t with_count)
+           void **with_scopes, uint32_t with_count)
 {
     nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
     if (!env) return NULL;
@@ -178,10 +178,12 @@ nn_env_from_slots(void **slots, uint32_t slot_count,
 nn_env_t *
 nn_env_push_with(nn_env_t *base, void *scope)
 {
-    if (base->with_count >= UINT16_MAX) return NULL;
-    uint16_t new_count = base->with_count + 1;
-    void **new_withs = (void **)nn_env_alloc_raw(
-        (uint32_t)new_count * (uint32_t)sizeof(void *));
+    /* The increment must not wrap.  Counts anywhere near this bound
+     * cannot allocate anyway (the array alloc caps at UINT32_MAX
+     * bytes), so this is the formal guard, not a reachable limit. */
+    if (base->with_count == UINT32_MAX) return NULL;
+    uint32_t new_count = base->with_count + 1;
+    void **new_withs = nn_env_alloc_with_scopes(new_count);
     if (!new_withs) return NULL;
 
     /* New scope at index 0 (innermost) */
@@ -246,7 +248,7 @@ nn_env_with_scopes(const nn_env_t *env)
     return env->with_scopes;
 }
 
-uint16_t
+uint32_t
 nn_env_with_count(const nn_env_t *env)
 {
     return env->with_count;
@@ -291,7 +293,7 @@ nn_env_root_scope(const nn_env_t *env)
 /* --- With-scopes array allocation --- */
 
 void **
-nn_env_alloc_with_scopes(uint16_t count)
+nn_env_alloc_with_scopes(uint32_t count)
 {
     if (count == 0) return NULL;
     uint64_t bytes64 = (uint64_t)count * sizeof(void *);

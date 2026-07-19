@@ -130,7 +130,7 @@ import Nix.Eval.Types
     buildCSlots,
     bytesToTextLossy,
     cheapThunkBc,
-    checkedEnvPtr,
+    checkedCPtr,
     clistFromThunks,
     clistLen,
     clistThunks,
@@ -953,7 +953,7 @@ pushLazyWithScope (Thunk thunkPtr) =
 {-# NOINLINE pushWithScopeRaw #-}
 pushWithScopeRaw :: Ptr () -> Env -> Env
 pushWithScopeRaw ptr (Env envPtr) =
-  Env (checkedEnvPtr "pushWithScopeRaw" (unsafePerformIO (cenvPushWith envPtr ptr)))
+  Env (checkedCPtr "pushWithScopeRaw" (unsafePerformIO (cenvPushWith envPtr ptr)))
 
 -- ---------------------------------------------------------------------------
 -- Formals matching + env helpers (used by evalBcApp, applyValue, etc.)

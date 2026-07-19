@@ -553,7 +553,7 @@ testEvalLambda = do
         assertEval "default" "({ a ? 10 }: a) { }" (VInt 10),
       -- Regression: zero-formal set patterns marshal count 0 / entries NULL;
       -- the second force of the same lambda thunk re-reads the entries and
-      -- must not underflow the Word16 count (crashed pre-fix).
+      -- must not underflow the unsigned count (crashed pre-fix).
       runTest "empty formals forced twice" $
         assertEval "empty-formals" "let f = {}: 1; in f {} + f {}" (VInt 2),
       runTest "ellipsis-only formals forced twice" $
@@ -6067,6 +6067,37 @@ testBytecodeCountSpill = do
           (VBool False)
     ]
 
+-- | C value structs carry element counts as a full uint32: a lambda's
+-- formal list and a string's context set marshal past the old uint16
+-- ceiling intact.  A narrower count wraps at 65536 and sizes the C
+-- array smaller than the fill loop that follows it.  Each case forces
+-- the value twice - the first force writes the C struct (the marshal
+-- side), the second reads it back off the computed thunk cell (the
+-- unmarshal side).
+testValueCountWidths :: IO [Bool]
+testValueCountWidths = do
+  putStrLn "value/count-widths"
+  let formalsBody = T.intercalate ", " [T.pack ("a" <> show i) | i <- [0 :: Int .. 69999]]
+  sequence
+    [ runTest "lambda with 70000 formals round-trips through the C closure" $
+        assertEval
+          "width-lambda-formals"
+          ( "let f = { "
+              <> formalsBody
+              <> " }: 1; in builtins.seq (builtins.functionArgs f) (builtins.length (builtins.attrNames (builtins.functionArgs f)))"
+          )
+          (VInt 70000),
+      runTest "string context with 70000 elements round-trips through the C thunk" $
+        assertEval
+          "width-ctxstr-elems"
+          ( "let s = builtins.appendContext \"x\" (builtins.listToAttrs (builtins.genList (i: { "
+              <> "name = \"/nix/store/00000000000000000000000000000000-p\" + builtins.toString i; "
+              <> "value = { path = true; }; }) 70000)); "
+              <> "in builtins.seq s (builtins.length (builtins.attrNames (builtins.getContext s)))"
+          )
+          (VInt 70000)
+    ]
+
 testBytecodeCompile :: IO [Bool]
 testBytecodeCompile = do
   putStrLn "bytecode"
@@ -6904,6 +6935,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testCThunk,
           testBytecodeCompile,
           testBytecodeCountSpill,
+          testValueCountWidths,
           testClassIFollowups,
           testClassIFollowupsIO
         ]
