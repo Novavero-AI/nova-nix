@@ -128,11 +128,15 @@ void nn_bytecode_destroy(void);
 
 /* --- Emit --- */
 
-/* Append one instruction.  Returns the instruction index. */
+/* Append one instruction.  Returns the instruction index, or
+ * UINT32_MAX when the array cannot grow (allocation failure or the
+ * uint32 index ceiling) - the caller must check before using the
+ * result as an index. */
 uint32_t nn_bc_emit(uint8_t opcode, uint8_t flags, uint16_t short_arg,
                     uint32_t arg1, uint32_t arg2, uint32_t arg3);
 
-/* Append one uint32 to the data buffer.  Returns the data offset. */
+/* Append one uint32 to the data buffer.  Returns the data offset, or
+ * UINT32_MAX on failure (same contract as nn_bc_emit). */
 uint32_t nn_bc_emit_data(uint32_t value);
 
 /* --- Read instructions --- */

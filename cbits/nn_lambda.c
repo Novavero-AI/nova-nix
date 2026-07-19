@@ -40,8 +40,15 @@ static void nn_lambda_track(nn_lambda_t *lam)
 nn_lambda_t *
 nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
               uint8_t formals_type, uint32_t name_sym,
-              uint8_t allow_extra, uint16_t formal_count)
+              uint8_t allow_extra, uint32_t formal_count)
 {
+    /* The count is input-reachable (it scales with the source formal
+     * list); computing the entries size in uint64_t and capping it at
+     * the UINT32_MAX byte limit used across the C layer keeps the
+     * malloc argument from wrapping size_t on any platform. */
+    uint64_t entry_bytes64 = (uint64_t)formal_count * sizeof(nn_formal_entry_t);
+    if (entry_bytes64 > UINT32_MAX) return NULL;
+
     nn_lambda_t *lam = (nn_lambda_t *)malloc(sizeof(nn_lambda_t));
     if (!lam) return NULL;
 
@@ -53,14 +60,12 @@ nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
     lam->formal_count = formal_count;
 
     if (formal_count > 0) {
-        lam->entries = (nn_formal_entry_t *)malloc(
-            (size_t)formal_count * sizeof(nn_formal_entry_t));
+        lam->entries = (nn_formal_entry_t *)malloc((size_t)entry_bytes64);
         if (!lam->entries) {
             free(lam);
             return NULL;
         }
-        memset(lam->entries, 0,
-               (size_t)formal_count * sizeof(nn_formal_entry_t));
+        memset(lam->entries, 0, (size_t)entry_bytes64);
     } else {
         lam->entries = NULL;
     }
@@ -70,11 +75,16 @@ nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
 }
 
 void
-nn_lambda_set_entry(nn_lambda_t *lam, uint16_t idx,
+nn_lambda_set_entry(nn_lambda_t *lam, uint32_t idx,
                     uint32_t name_sym, uint32_t has_default,
                     uint32_t default_bc_idx)
 {
-    NN_ASSERT(idx < lam->formal_count, "nn_lambda_set_entry: idx out of bounds");
+    /* Bound stays live under NDEBUG: the fill index derives from
+     * input-sized data crossing the FFI, so a violated bound must drop
+     * the write, not run past the sized array. */
+    NN_ASSERT(lam != NULL && lam->entries != NULL && idx < lam->formal_count,
+              "nn_lambda_set_entry: idx out of bounds");
+    if (lam == NULL || lam->entries == NULL || idx >= lam->formal_count) return;
     lam->entries[idx].name_sym       = name_sym;
     lam->entries[idx].has_default    = has_default;
     lam->entries[idx].default_bc_idx = default_bc_idx;
@@ -126,32 +136,38 @@ nn_lambda_allow_extra(const nn_lambda_t *lam)
     return lam->allow_extra;
 }
 
-uint16_t
+uint32_t
 nn_lambda_formal_count(const nn_lambda_t *lam)
 {
     return lam->formal_count;
 }
 
+/* Entry reads keep their bound live under NDEBUG (see set_entry);
+ * a violated bound returns 0 rather than reading out of bounds. */
+
 uint32_t
-nn_lambda_entry_name(const nn_lambda_t *lam, uint16_t idx)
+nn_lambda_entry_name(const nn_lambda_t *lam, uint32_t idx)
 {
-    NN_ASSERT(lam->entries != NULL && idx < lam->formal_count,
+    NN_ASSERT(lam != NULL && lam->entries != NULL && idx < lam->formal_count,
               "nn_lambda_entry_name: idx out of bounds or no formals");
+    if (lam == NULL || lam->entries == NULL || idx >= lam->formal_count) return 0;
     return lam->entries[idx].name_sym;
 }
 
 uint32_t
-nn_lambda_entry_has_default(const nn_lambda_t *lam, uint16_t idx)
+nn_lambda_entry_has_default(const nn_lambda_t *lam, uint32_t idx)
 {
-    NN_ASSERT(lam->entries != NULL && idx < lam->formal_count,
+    NN_ASSERT(lam != NULL && lam->entries != NULL && idx < lam->formal_count,
               "nn_lambda_entry_has_default: idx out of bounds or no formals");
+    if (lam == NULL || lam->entries == NULL || idx >= lam->formal_count) return 0;
     return lam->entries[idx].has_default;
 }
 
 uint32_t
-nn_lambda_entry_default(const nn_lambda_t *lam, uint16_t idx)
+nn_lambda_entry_default(const nn_lambda_t *lam, uint32_t idx)
 {
-    NN_ASSERT(lam->entries != NULL && idx < lam->formal_count,
+    NN_ASSERT(lam != NULL && lam->entries != NULL && idx < lam->formal_count,
               "nn_lambda_entry_default: idx out of bounds or no formals");
+    if (lam == NULL || lam->entries == NULL || idx >= lam->formal_count) return 0;
     return lam->entries[idx].default_bc_idx;
 }

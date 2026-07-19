@@ -32,7 +32,7 @@ module Nix.Eval.CCtxStr
   )
 where
 
-import Data.Word (Word16, Word32, Word8)
+import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
 
 -- | Phantom type for C-side @nn_ctxstr_t@.
@@ -46,37 +46,37 @@ type CCtxStrPtr = Ptr NnCtxStr
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_ctxstr_new"
-  c_nn_ctxstr_new :: Word32 -> Word16 -> IO CCtxStrPtr
+  c_nn_ctxstr_new :: Word32 -> Word32 -> IO CCtxStrPtr
 
 foreign import ccall unsafe "nn_ctxstr_free_all"
   c_nn_ctxstr_free_all :: IO ()
 
 foreign import ccall unsafe "nn_ctxstr_set_plain"
-  c_nn_ctxstr_set_plain :: CCtxStrPtr -> Word16 -> Word32 -> Word32 -> IO ()
+  c_nn_ctxstr_set_plain :: CCtxStrPtr -> Word32 -> Word32 -> Word32 -> IO ()
 
 foreign import ccall unsafe "nn_ctxstr_set_drv_output"
-  c_nn_ctxstr_set_drv_output :: CCtxStrPtr -> Word16 -> Word32 -> Word32 -> Word32 -> IO ()
+  c_nn_ctxstr_set_drv_output :: CCtxStrPtr -> Word32 -> Word32 -> Word32 -> Word32 -> IO ()
 
 foreign import ccall unsafe "nn_ctxstr_set_all_outputs"
-  c_nn_ctxstr_set_all_outputs :: CCtxStrPtr -> Word16 -> Word32 -> Word32 -> IO ()
+  c_nn_ctxstr_set_all_outputs :: CCtxStrPtr -> Word32 -> Word32 -> Word32 -> IO ()
 
 foreign import ccall unsafe "nn_ctxstr_text"
   c_nn_ctxstr_text :: CCtxStrPtr -> IO Word32
 
 foreign import ccall unsafe "nn_ctxstr_ctx_count"
-  c_nn_ctxstr_ctx_count :: CCtxStrPtr -> IO Word16
+  c_nn_ctxstr_ctx_count :: CCtxStrPtr -> IO Word32
 
 foreign import ccall unsafe "nn_ctxstr_elem_tag"
-  c_nn_ctxstr_elem_tag :: CCtxStrPtr -> Word16 -> IO Word8
+  c_nn_ctxstr_elem_tag :: CCtxStrPtr -> Word32 -> IO Word8
 
 foreign import ccall unsafe "nn_ctxstr_elem_hash"
-  c_nn_ctxstr_elem_hash :: CCtxStrPtr -> Word16 -> IO Word32
+  c_nn_ctxstr_elem_hash :: CCtxStrPtr -> Word32 -> IO Word32
 
 foreign import ccall unsafe "nn_ctxstr_elem_name"
-  c_nn_ctxstr_elem_name :: CCtxStrPtr -> Word16 -> IO Word32
+  c_nn_ctxstr_elem_name :: CCtxStrPtr -> Word32 -> IO Word32
 
 foreign import ccall unsafe "nn_ctxstr_elem_output"
-  c_nn_ctxstr_elem_output :: CCtxStrPtr -> Word16 -> IO Word32
+  c_nn_ctxstr_elem_output :: CCtxStrPtr -> Word32 -> IO Word32
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
@@ -84,7 +84,9 @@ foreign import ccall unsafe "nn_ctxstr_elem_output"
 
 -- | Allocate a new context string with space for @ctxCount@ elements.
 -- Elements are uninitialized - caller must fill via set functions.
-cctxstrNew :: Word32 -> Word16 -> IO CCtxStrPtr
+-- Returns 'Foreign.Ptr.nullPtr' on allocation failure or if the
+-- element array size would overflow - the caller must check.
+cctxstrNew :: Word32 -> Word32 -> IO CCtxStrPtr
 cctxstrNew = c_nn_ctxstr_new
 
 -- | Free all tracked nn_ctxstr_t allocations (arena-style cleanup).
@@ -97,17 +99,17 @@ cctxstrFreeAll = c_nn_ctxstr_free_all
 
 -- | Set context element @i@ to a plain store-path reference (@SCPlain@),
 -- identified by its name and hash symbols.
-cctxstrSetPlain :: CCtxStrPtr -> Word16 -> Word32 -> Word32 -> IO ()
+cctxstrSetPlain :: CCtxStrPtr -> Word32 -> Word32 -> Word32 -> IO ()
 cctxstrSetPlain = c_nn_ctxstr_set_plain
 
 -- | Set context element @i@ to a derivation-output reference (@SCDrvOutput@):
 -- name and hash symbols plus the output-name symbol.
-cctxstrSetDrvOutput :: CCtxStrPtr -> Word16 -> Word32 -> Word32 -> Word32 -> IO ()
+cctxstrSetDrvOutput :: CCtxStrPtr -> Word32 -> Word32 -> Word32 -> Word32 -> IO ()
 cctxstrSetDrvOutput = c_nn_ctxstr_set_drv_output
 
 -- | Set context element @i@ to an all-outputs reference (@SCAllOutputs@),
 -- identified by its name and hash symbols.
-cctxstrSetAllOutputs :: CCtxStrPtr -> Word16 -> Word32 -> Word32 -> IO ()
+cctxstrSetAllOutputs :: CCtxStrPtr -> Word32 -> Word32 -> Word32 -> IO ()
 cctxstrSetAllOutputs = c_nn_ctxstr_set_all_outputs
 
 -- ---------------------------------------------------------------------------
@@ -119,21 +121,21 @@ cctxstrText :: CCtxStrPtr -> IO Word32
 cctxstrText = c_nn_ctxstr_text
 
 -- | The number of context elements attached to the string.
-cctxstrCtxCount :: CCtxStrPtr -> IO Word16
+cctxstrCtxCount :: CCtxStrPtr -> IO Word32
 cctxstrCtxCount = c_nn_ctxstr_ctx_count
 
 -- | The tag of context element @i@ (plain / drv-output / all-outputs).
-cctxstrElemTag :: CCtxStrPtr -> Word16 -> IO Word8
+cctxstrElemTag :: CCtxStrPtr -> Word32 -> IO Word8
 cctxstrElemTag = c_nn_ctxstr_elem_tag
 
 -- | The store-path-hash symbol of context element @i@.
-cctxstrElemHash :: CCtxStrPtr -> Word16 -> IO Word32
+cctxstrElemHash :: CCtxStrPtr -> Word32 -> IO Word32
 cctxstrElemHash = c_nn_ctxstr_elem_hash
 
 -- | The store-path-name symbol of context element @i@.
-cctxstrElemName :: CCtxStrPtr -> Word16 -> IO Word32
+cctxstrElemName :: CCtxStrPtr -> Word32 -> IO Word32
 cctxstrElemName = c_nn_ctxstr_elem_name
 
 -- | The output-name symbol of context element @i@ (drv-output elements only).
-cctxstrElemOutput :: CCtxStrPtr -> Word16 -> IO Word32
+cctxstrElemOutput :: CCtxStrPtr -> Word32 -> IO Word32
 cctxstrElemOutput = c_nn_ctxstr_elem_output

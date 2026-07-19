@@ -29,7 +29,7 @@ typedef struct nn_env {
     void          *lazy_scope;   /* nn_attrset_t* or NULL */
     struct nn_env *parent;       /* nn_env_t* or NULL */
     void         **with_scopes;  /* array of nn_attrset_t* (or NULL) */
-    uint16_t       with_count;   /* 2 bytes + 6 pad to struct alignment */
+    uint32_t       with_count;   /* 4 bytes + 4 pad to struct alignment */
 } nn_env_t;
 
 /* --- Lifecycle --- */
@@ -57,7 +57,7 @@ nn_env_t *nn_env_empty(void);
 /* Full constructor: set all fields explicitly. */
 nn_env_t *nn_env_new(void **slots, uint32_t slot_count,
                      void *lazy_scope, nn_env_t *parent,
-                     void **with_scopes, uint16_t with_count);
+                     void **with_scopes, uint32_t with_count);
 
 /* Child env with positional slots, inheriting parent's with-scopes.
  * lazy_scope = NULL. */
@@ -78,7 +78,7 @@ uint32_t     nn_env_slot_count(const nn_env_t *env);
 void        *nn_env_lazy_scope(const nn_env_t *env);
 nn_env_t    *nn_env_parent(const nn_env_t *env);
 void       **nn_env_with_scopes(const nn_env_t *env);
-uint16_t     nn_env_with_count(const nn_env_t *env);
+uint32_t     nn_env_with_count(const nn_env_t *env);
 
 /* --- Lookup --- */
 
@@ -95,8 +95,10 @@ void *nn_env_root_scope(const nn_env_t *env);
 /* --- With-scopes array allocation --- */
 
 /* Allocate an arena array of `count` void* pointers for with-scopes.
- * All entries initialized to NULL.  Returns NULL if count is 0. */
-void **nn_env_alloc_with_scopes(uint16_t count);
+ * All entries initialized to NULL.  Returns NULL if count is 0, if the
+ * array size would exceed the allocator's uint32 byte limit, or on
+ * OOM - the caller must check. */
+void **nn_env_alloc_with_scopes(uint32_t count);
 
 /* --- Diagnostics --- */
 

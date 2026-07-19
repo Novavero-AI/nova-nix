@@ -43,7 +43,7 @@ module Nix.Eval.CEnv
   )
 where
 
-import Data.Word (Word16, Word32)
+import Data.Word (Word32)
 import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr)
 import Nix.Eval.CThunk (CThunkPtr)
@@ -78,7 +78,7 @@ foreign import ccall unsafe "nn_env_new"
     Ptr () ->
     Ptr NnEnv ->
     Ptr (Ptr ()) ->
-    Word16 ->
+    Word32 ->
     IO (Ptr NnEnv)
 
 foreign import ccall unsafe "nn_env_from_slots"
@@ -107,7 +107,7 @@ foreign import ccall unsafe "nn_env_with_scopes"
   c_nn_env_with_scopes :: Ptr NnEnv -> IO (Ptr (Ptr ()))
 
 foreign import ccall unsafe "nn_env_with_count"
-  c_nn_env_with_count :: Ptr NnEnv -> IO Word16
+  c_nn_env_with_count :: Ptr NnEnv -> IO Word32
 
 foreign import ccall unsafe "nn_env_lookup_resolved"
   c_nn_env_lookup_resolved :: Ptr NnEnv -> CInt -> CInt -> IO CThunkPtr
@@ -116,7 +116,7 @@ foreign import ccall unsafe "nn_env_root_scope"
   c_nn_env_root_scope :: Ptr NnEnv -> IO (Ptr ())
 
 foreign import ccall unsafe "nn_env_alloc_with_scopes"
-  c_nn_env_alloc_with_scopes :: Word16 -> IO (Ptr (Ptr ()))
+  c_nn_env_alloc_with_scopes :: Word32 -> IO (Ptr (Ptr ()))
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
@@ -155,7 +155,7 @@ cenvNew ::
   Ptr () ->
   Ptr NnEnv ->
   Ptr (Ptr ()) ->
-  Word16 ->
+  Word32 ->
   IO (Ptr NnEnv)
 cenvNew = c_nn_env_new
 
@@ -196,7 +196,7 @@ cenvWithScopes :: Ptr NnEnv -> IO (Ptr (Ptr ()))
 cenvWithScopes = c_nn_env_with_scopes
 
 -- | Read the with-scope count from a C env.
-cenvWithCount :: Ptr NnEnv -> IO Word16
+cenvWithCount :: Ptr NnEnv -> IO Word32
 cenvWithCount = c_nn_env_with_count
 
 -- ---------------------------------------------------------------------------
@@ -219,5 +219,7 @@ cenvRootScope = c_nn_env_root_scope
 -- ---------------------------------------------------------------------------
 
 -- | Allocate an arena array for with-scopes.  Zero-initialized.
-cenvAllocWithScopes :: Word16 -> IO (Ptr (Ptr ()))
+-- Returns 'Foreign.Ptr.nullPtr' if the count is 0 or the allocation
+-- fails - the caller must check.
+cenvAllocWithScopes :: Word32 -> IO (Ptr (Ptr ()))
 cenvAllocWithScopes = c_nn_env_alloc_with_scopes
