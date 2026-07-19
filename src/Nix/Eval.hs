@@ -855,9 +855,9 @@ evalSearchPath env name = do
           nixPathVal <- force nixPathThunk
           builtinFindFile nixPathVal (mkStr name)
         Nothing ->
-          throwEvalError ("file '" <> name <> "' was not found in the Nix search path")
+          throwCatchableError ("file '" <> name <> "' was not found in the Nix search path")
     _ ->
-      throwEvalError ("file '" <> name <> "' was not found in the Nix search path")
+      throwCatchableError ("file '" <> name <> "' was not found in the Nix search path")
 
 -- ---------------------------------------------------------------------------
 -- Variables
@@ -3188,9 +3188,12 @@ forceSearchEntry thunk = do
     _ -> throwEvalError "builtins.findFile: search path entry must be a set"
 
 -- | Iterate search path entries, checking for a match.
+-- A miss is a CATCHABLE error (upstream raises ThrownError here):
+-- nixpkgs' impure.nix wraps @<nixpkgs-overlays>@ in @tryEval@ and
+-- relies on catching the miss.
 findFirst :: (MonadEval m) => [(Text, Text)] -> Text -> m NixValue
 findFirst [] name =
-  throwEvalError ("file '" <> name <> "' was not found in the Nix search path")
+  throwCatchableError ("file '" <> name <> "' was not found in the Nix search path")
 findFirst ((prefix, path) : rest) name
   | prefix == name || (not (T.null prefix) && (prefix <> "/") `T.isPrefixOf` name) =
       let suffix = if prefix == name then "" else T.drop (T.length prefix + 1) name
