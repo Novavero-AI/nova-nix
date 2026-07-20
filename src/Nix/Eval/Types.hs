@@ -106,6 +106,7 @@ module Nix.Eval.Types
     MonadEval (..),
     PureEval,
     runPureEval,
+    storePathOrThrow,
   )
 where
 
@@ -138,7 +139,7 @@ import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
-import Nix.Store.Path (StorePath (..))
+import Nix.Store.Path (StorePath (..), StorePathNameError, storePathNameErrorText)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Text.Regex.TDFA as RE
 
@@ -1224,6 +1225,16 @@ class (Monad m) => MonadEval m where
   -- performing the copy.  Used when a path literal is coerced in a derivation
   -- argument or environment value.  Unavailable in pure evaluation.
   storeSourcePath :: Text -> m Text
+
+-- | Unwrap a store-path construction result (the @makeStorePath@ family
+-- in "Nix.Hash"), converting a rejected name into an eval error under
+-- the given context prefix (e.g. @builtins.toFile@).  Every eval-side
+-- path construction goes through this or a bespoke equivalent, so a
+-- name rejection always surfaces as a clean eval error rather than an
+-- unchecked write path.
+storePathOrThrow :: (MonadEval m) => Text -> Either StorePathNameError StorePath -> m StorePath
+storePathOrThrow context =
+  either (throwEvalError . ((context <> ": ") <>) . storePathNameErrorText) pure
 
 -- | Error raised during pure evaluation.  'PThrow' (@builtins.throw@, a
 -- failed @assert@) is the only kind 'tryEval' catches; 'PError' (type

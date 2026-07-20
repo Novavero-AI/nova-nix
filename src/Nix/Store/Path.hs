@@ -44,6 +44,14 @@ module Nix.Store.Path
     parseStorePath,
     parseStorePathBaseName,
 
+    -- * Name validation
+    StorePathNameError (..),
+    StorePathNameReason (..),
+    checkStorePathName,
+    validStorePathName,
+    storePathNameErrorText,
+    storePathNameReasonText,
+
     -- * Constants
     storePathHashLen,
   )
@@ -152,19 +160,48 @@ isNixBase32Char c =
   isDigit c
     || (isAsciiLower c && c /= 'e' && c /= 'o' && c /= 'u' && c /= 't')
 
--- | Upstream's store path name rules (its checkName parse boundary):
+-- | A rejected store-path name: the name itself plus the first rule it
+-- broke, so every boundary reports the same diagnosis.
+data StorePathNameError = StorePathNameError
+  { -- | The rejected name.
+    spneName :: !Text,
+    -- | The rule it broke.
+    spneReason :: !StorePathNameReason
+  }
+  deriving (Eq, Show)
+
+-- | The store-path name rules, one constructor per rule.
+data StorePathNameReason
+  = -- | The name is empty.
+    NameEmpty
+  | -- | The name exceeds 'maxStorePathNameLen'; carries the actual length.
+    NameTooLong !Int
+  | -- | The name contains a character outside @[A-Za-z0-9+._?=-]@.
+    NameIllegalChar !Char
+  | -- | The first dash-separated component is the carried @.@ or @..@,
+    -- which would name a dot segment on disk.
+    NameDotSegment !Text
+  deriving (Eq, Show)
+
+-- | Upstream's store path name rules (its checkName boundary):
 -- 1-211 characters from @[A-Za-z0-9+._?=-]@, and the first dash-separated
 -- component may not be @.@ or @..@.  One rule rejects the traversal names
 -- and their @.-@ / @..-@ prefixed forms alike, while other dot-leading
 -- names (@.config-1.0@) stay valid.
-validStorePathName :: Text -> Bool
-validStorePathName name =
-  not (T.null name)
-    && T.length name <= maxStorePathNameLen
-    && firstDashComponent /= "."
-    && firstDashComponent /= ".."
-    && T.all isStorePathNameChar name
+--
+-- Enforced at BOTH boundaries: parse ('parseStorePathBaseName') and
+-- construction (the @makeStorePath@ family in "Nix.Hash"), so an unclean
+-- name cannot become a 'StorePath' from either side - in particular, no
+-- write sink can be handed a path that resolves outside the store root.
+checkStorePathName :: Text -> Either StorePathNameError ()
+checkStorePathName name
+  | T.null name = broke NameEmpty
+  | T.length name > maxStorePathNameLen = broke (NameTooLong (T.length name))
+  | firstDashComponent == "." || firstDashComponent == ".." = broke (NameDotSegment firstDashComponent)
+  | Just c <- T.find (not . isStorePathNameChar) name = broke (NameIllegalChar c)
+  | otherwise = Right ()
   where
+    broke = Left . StorePathNameError name
     firstDashComponent = T.takeWhile (/= '-') name
     isStorePathNameChar c =
       isAsciiLower c
@@ -176,6 +213,29 @@ validStorePathName name =
         || c == '?'
         || c == '='
         || c == '-'
+
+-- | Boolean form of 'checkStorePathName', for the parse boundary.
+validStorePathName :: Text -> Bool
+validStorePathName = either (const False) (const True) . checkStorePathName
+
+-- | Render a rejection as @invalid store path name '<name>': <rule>@.
+storePathNameErrorText :: StorePathNameError -> Text
+storePathNameErrorText (StorePathNameError name reason) =
+  "invalid store path name '" <> name <> "': " <> storePathNameReasonText reason
+
+-- | Render just the broken rule, for callers that frame the name
+-- themselves (e.g. @invalid derivation output name@).
+storePathNameReasonText :: StorePathNameReason -> Text
+storePathNameReasonText reason = case reason of
+  NameEmpty -> "the name is empty"
+  NameTooLong len ->
+    "the name is "
+      <> T.pack (show len)
+      <> " characters, above the "
+      <> T.pack (show maxStorePathNameLen)
+      <> " maximum"
+  NameIllegalChar c -> "contains the illegal character " <> T.pack (show c)
+  NameDotSegment seg -> "the first dash-separated component may not be '" <> seg <> "'"
 
 -- | Upstream's maximum store path name length.
 maxStorePathNameLen :: Int

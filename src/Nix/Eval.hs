@@ -67,7 +67,7 @@ module Nix.Eval
   )
 where
 
-import Control.Monad (foldM, when, (>=>))
+import Control.Monad (foldM, forM_, when, (>=>))
 import qualified Crypto.Hash as CH
 import qualified Data.Array as Array
 import Data.Bits (complement, xor, (.&.), (.|.))
@@ -152,6 +152,7 @@ import Nix.Eval.Types
     newMinimalEnv,
     readThunkValue,
     runPureEval,
+    storePathOrThrow,
     thunkToCPtr,
     typeName,
     withScopesForCapture,
@@ -165,7 +166,7 @@ import Nix.Expr.Types
     UnaryOp (..),
   )
 import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest, sha256Hex)
-import Nix.Store.Path (StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToText)
+import Nix.Store.Path (StorePath (..), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, storePathNameErrorText, storePathNameReasonText, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.NAR as NAR
@@ -3436,6 +3437,13 @@ getTempDir = do
 -- | Fetch a URL and optionally verify its hash.
 fetchUrlSimple :: (MonadEval m) => Text -> Maybe Text -> m NixValue
 fetchUrlSimple url mSha256 = do
+  -- The store name derives from the URL alone, so an unusable name fails
+  -- here, before the download side effect.  Upstream rejects the same
+  -- names when it adds the fetched file to the store.
+  let name = urlBaseName url
+  case checkStorePathName name of
+    Left err -> throwEvalError ("builtins.fetchurl: " <> storePathNameErrorText err)
+    Right () -> pure ()
   -- Download to a file, not through the text-mode stdout pipe (which mangles
   -- binary), read the raw bytes, verify the pin if one was given, then store at
   -- the canonical fixed-output path.
@@ -3447,7 +3455,7 @@ fetchUrlSimple url mSha256 = do
     else do
       bytes <- readFileBytes tmpFile
       mapM_ (verifyFetchPin "builtins.fetchurl" url bytes) mSha256
-      storePath <- addFixedOutputFile (urlBaseName url) bytes
+      storePath <- addFixedOutputFile name bytes
       pure (VPath storePath)
 
 -- | Store name for a fetched URL: its basename (minus query/fragment), matching
@@ -3620,6 +3628,15 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- store-path and platform machinery); the builder stays raw bytes - it
   -- lands byte-exact in the ATerm's builder field.
   drvName <- forceAttrStr "derivation" "name" attrs
+  -- The name becomes the store-path name of the .drv and of every output,
+  -- so it must satisfy the store-path name rules.  The path constructors
+  -- re-check what they build; this early check reports the offending
+  -- FIELD rather than a composed path name.
+  case checkStorePathName drvName of
+    Left err ->
+      throwEvalError
+        ("derivation: invalid derivation name '" <> drvName <> "': " <> storePathNameReasonText (spneReason err))
+    Right () -> pure ()
   system <- forceAttrStr ("derivation \"" <> drvName <> "\"") "system" attrs
   builder <- forceAttrBytes ("derivation \"" <> drvName <> "\"") "builder" attrs
 
@@ -3645,6 +3662,23 @@ builtinDerivationStrict (VAttrs attrs) = do
         -- the default output set; without it, null is an error as upstream.
         VNull | ignoreNulls -> pure ["out"]
         _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
+
+  -- Each output name composes into a store-path name (drvName-<output>)
+  -- and names the on-disk location the builder later clears and moves
+  -- onto, so it must satisfy the same store-path name rules (the
+  -- composed length is re-checked at construction).
+  forM_ outputNames $ \outName ->
+    case checkStorePathName outName of
+      Left err ->
+        throwEvalError
+          ( "derivation \""
+              <> drvName
+              <> "\": invalid derivation output name '"
+              <> outName
+              <> "': "
+              <> storePathNameReasonText (spneReason err)
+          )
+      Right () -> pure ()
 
   -- Extract optional args (default []).  Path literals in args (e.g. stdenv's
   -- ./default-builder.sh) are copied into the store; their source paths flow
@@ -3703,10 +3737,15 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- the modulo hashes of their inputs.
   mFixed <- detectFixedOutput attrs
 
+  -- Path construction returns Left on a name the store rules reject; the
+  -- early field checks above make that unreachable here except through
+  -- composition (drvName <> ".drv", drvName-output past the length cap),
+  -- which only the constructors see.
+  let drvContext = "derivation \"" <> drvName <> "\""
   (drvPathText, drvSP, outPaths, completeDrv) <- case mFixed of
     Just (foAlgo, foMode, foDigest) -> do
-      let foPath = makeFixedOutputPath drvName foAlgo foMode foDigest
-          foPathText = storePathToText defaultStoreDir foPath
+      foPath <- storePathOrThrow drvContext (makeFixedOutputPath drvName foAlgo foMode foDigest)
+      let foPathText = storePathToText defaultStoreDir foPath
           algoField = (if foMode == "recursive" then "r:" else "") <> foAlgo
           foHashHex = bytesToHexText foDigest
           foModulo =
@@ -3716,8 +3755,8 @@ builtinDerivationStrict (VAttrs attrs) = do
             mkDrv
               [DerivationOutput "out" foPath algoField foHashHex]
               (Map.insert "out" (TE.encodeUtf8 foPathText) baseEnv)
-          drvSp = makeTextPath drvFileName (sha256Digest (toATerm contents)) drvRefs
-          drvText = storePathToText defaultStoreDir drvSp
+      drvSp <- storePathOrThrow drvContext (makeTextPath drvFileName (sha256Digest (toATerm contents)) drvRefs)
+      let drvText = storePathToText defaultStoreDir drvSp
       cacheDrvHash drvText (bytesToHexText foModulo)
       pure (drvText, drvSp, [("out", foPathText)], contents)
     Nothing -> do
@@ -3726,15 +3765,18 @@ builtinDerivationStrict (VAttrs attrs) = do
           maskedDrv = mkDrv (map maskedOutput outputNames) maskedEnv
           -- Masked modulo hash yields this derivation's own output paths.
           moduloMasked = sha256Digest (toATermForHash True (Just inputSubst) maskedDrv)
-          outStorePaths = [(n, makeOutputPath n moduloMasked drvName) | n <- outputNames]
-          outPathTexts = [(n, storePathToText defaultStoreDir sp) | (n, sp) <- outStorePaths]
+      outStorePaths <-
+        mapM
+          (\n -> (,) n <$> storePathOrThrow drvContext (makeOutputPath n moduloMasked drvName))
+          outputNames
+      let outPathTexts = [(n, storePathToText defaultStoreDir sp) | (n, sp) <- outStorePaths]
           realEnv = foldr (\(n, t) e -> Map.insert n (TE.encodeUtf8 t) e) baseEnv outPathTexts
           contents = mkDrv [DerivationOutput n sp "" "" | (n, sp) <- outStorePaths] realEnv
           -- Unmasked modulo hash (real outputs, inputs substituted) cached for
           -- when this derivation is itself an input to another.
           moduloUnmasked = sha256Digest (toATermForHash False (Just inputSubst) contents)
-          drvSp = makeTextPath drvFileName (sha256Digest (toATerm contents)) drvRefs
-          drvText = storePathToText defaultStoreDir drvSp
+      drvSp <- storePathOrThrow drvContext (makeTextPath drvFileName (sha256Digest (toATerm contents)) drvRefs)
+      let drvText = storePathToText defaultStoreDir drvSp
       cacheDrvHash drvText (bytesToHexText moduloUnmasked)
       pure (drvText, drvSp, outPathTexts, contents)
 
