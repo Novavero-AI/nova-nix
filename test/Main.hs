@@ -46,7 +46,7 @@ import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isValid, materializeEvalSources, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
+import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
@@ -1938,43 +1938,49 @@ testPathSymlinkBody = do
         "builtins.path { path = " <> nixQuotedPath dir <> "; name = \"" <> name <> "\"; }"
       spFor name entry =
         makeFixedOutputPath name "sha256" "recursive" (sha256Digest (NAR.serialise entry))
-      linkSp = spFor "path-symlink-src" linkEntry
-      cycleSp = spFor "path-symlink-cycle" cycleEntry
+  results <- case (spFor "path-symlink-src" linkEntry, spFor "path-symlink-cycle" cycleEntry) of
+    (Right linkSp, Right cycleSp) -> do
       -- The same mapping the evaluator's copy uses for its destination.
-      linkDest = storePathToFilePath defaultStoreDir linkSp
-      cycleDest = storePathToFilePath defaultStoreDir cycleSp
-  -- A leftover materialization from an earlier (possibly pre-fix) run
-  -- would short-circuit the copy under test.
-  Dir.removePathForcibly linkDest
-  Dir.removePathForcibly cycleDest
-  linkEval <- evalNixIO "." (pathExprFor srcDir "path-symlink-src")
-  cycleEval <- timeout walkWatchdogMicros (evalNixIO "." (pathExprFor cycleDir "path-symlink-cycle"))
-  results <-
-    sequence
-      [ runTestM "unfiltered builtins.path replicates a symlink" $
-          case linkEval of
-            Left err -> pure (Fail ("eval failed: " <> err))
-            Right _ -> do
-              isLink <- Dir.pathIsSymbolicLink (linkDest </> "link")
-              if isLink
-                then do
-                  target <- Dir.getSymbolicLinkTarget (linkDest </> "link")
-                  pure (assertEqual "link target" "data.txt" target)
-                else pure (Fail "materialized 'link' is not a symlink"),
-        runTestM "materialized bytes reproduce the recorded content address" $
-          case linkEval of
-            Left err -> pure (Fail ("eval failed: " <> err))
-            Right _ -> do
-              onDisk <- NAR.serialiseFromPath linkDest
-              pure (assertEqual "recomputed path" linkSp (spFor "path-symlink-src" onDisk)),
-        runTestM "builtins.path terminates on a link cycle" $
-          case cycleEval of
-            Nothing -> pure (Fail "copy did not terminate on a link cycle")
-            Just (Left err) -> pure (Fail ("eval failed: " <> err))
-            Just (Right _) -> do
-              isLink <- Dir.pathIsSymbolicLink (cycleDest </> "loop")
-              pure (if isLink then Pass else Fail "cycle link not replicated as a link")
-      ]
+      let linkDest = storePathToFilePath defaultStoreDir linkSp
+          cycleDest = storePathToFilePath defaultStoreDir cycleSp
+      -- A leftover materialization from an earlier (possibly pre-fix) run
+      -- would short-circuit the copy under test.
+      Dir.removePathForcibly linkDest
+      Dir.removePathForcibly cycleDest
+      linkEval <- evalNixIO "." (pathExprFor srcDir "path-symlink-src")
+      cycleEval <- timeout walkWatchdogMicros (evalNixIO "." (pathExprFor cycleDir "path-symlink-cycle"))
+      sequence
+        [ runTestM "unfiltered builtins.path replicates a symlink" $
+            case linkEval of
+              Left err -> pure (Fail ("eval failed: " <> err))
+              Right _ -> do
+                isLink <- Dir.pathIsSymbolicLink (linkDest </> "link")
+                if isLink
+                  then do
+                    target <- Dir.getSymbolicLinkTarget (linkDest </> "link")
+                    pure (assertEqual "link target" "data.txt" target)
+                  else pure (Fail "materialized 'link' is not a symlink"),
+          runTestM "materialized bytes reproduce the recorded content address" $
+            case linkEval of
+              Left err -> pure (Fail ("eval failed: " <> err))
+              Right _ -> do
+                onDisk <- NAR.serialiseFromPath linkDest
+                pure $ case spFor "path-symlink-src" onDisk of
+                  Left err -> Fail ("on-disk tree's name rejected: " <> T.pack (show err))
+                  Right recomputed -> assertEqual "recomputed path" linkSp recomputed,
+          runTestM "builtins.path terminates on a link cycle" $
+            case cycleEval of
+              Nothing -> pure (Fail "copy did not terminate on a link cycle")
+              Just (Left err) -> pure (Fail ("eval failed: " <> err))
+              Just (Right _) -> do
+                isLink <- Dir.pathIsSymbolicLink (cycleDest </> "loop")
+                pure (if isLink then Pass else Fail "cycle link not replicated as a link")
+        ]
+    (badLink, badCycle) ->
+      sequence
+        [ runTest "path-symlink fixture store paths accepted" $
+            Fail ("test store path rejected: " <> T.pack (show (badLink, badCycle)))
+        ]
   Dir.removePathForcibly srcDir
   Dir.removePathForcibly cycleDir
   pure results
@@ -4740,21 +4746,23 @@ testStoreOps = do
           createDirectoryIfMissing True srcDir
           TIO.writeFile (srcDir </> "data.txt") "real content"
           entry <- NAR.serialiseFromPath srcDir
-          let sp = makeFixedOutputPath "nova-nix-test-adopt-src" "sha256" "recursive" (sha256Digest (NAR.serialise entry))
-              spText = storePathToText defaultStoreDir sp
-              dest = storePathToFilePath (stDir store) sp
-          -- Fake an interrupted earlier copy: wrong partial content.
-          removeIfExists dest
-          createDirectoryIfMissing True dest
-          TIO.writeFile (dest </> "data.txt") "partial garbage"
-          materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
-          adopted <- TIO.readFile (dest </> "data.txt")
-          registered <- isValid store sp
-          removeIfExists srcDir
-          pure $
-            if adopted == "real content" && registered
-              then Pass
-              else Fail ("expected re-copied content, got: " <> adopted),
+          case makeFixedOutputPath "nova-nix-test-adopt-src" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+            Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+            Right sp -> do
+              let spText = storePathToText defaultStoreDir sp
+                  dest = storePathToFilePath (stDir store) sp
+              -- Fake an interrupted earlier copy: wrong partial content.
+              removeIfExists dest
+              createDirectoryIfMissing True dest
+              TIO.writeFile (dest </> "data.txt") "partial garbage"
+              materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+              adopted <- TIO.readFile (dest </> "data.txt")
+              registered <- isValid store sp
+              removeIfExists srcDir
+              pure $
+                if adopted == "real content" && registered
+                  then Pass
+                  else Fail ("expected re-copied content, got: " <> adopted),
         -- A tree that DOES reproduce its store path is adopted untouched.
         -- The source is deleted before the call: adoption never reads it,
         -- so a wrongful re-copy attempt throws and fails the test.
@@ -4765,16 +4773,18 @@ testStoreOps = do
           createDirectoryIfMissing True srcDir
           TIO.writeFile (srcDir </> "data.txt") "same bytes"
           entry <- NAR.serialiseFromPath srcDir
-          let sp = makeFixedOutputPath "nova-nix-test-adopt-ok" "sha256" "recursive" (sha256Digest (NAR.serialise entry))
-              spText = storePathToText defaultStoreDir sp
-              dest = storePathToFilePath (stDir store) sp
-          removeIfExists dest
-          createDirectoryIfMissing True dest
-          TIO.writeFile (dest </> "data.txt") "same bytes"
-          removeIfExists srcDir
-          materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
-          registered <- isValid store sp
-          pure (if registered then Pass else Fail "matching tree was not adopted and registered"),
+          case makeFixedOutputPath "nova-nix-test-adopt-ok" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+            Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+            Right sp -> do
+              let spText = storePathToText defaultStoreDir sp
+                  dest = storePathToFilePath (stDir store) sp
+              removeIfExists dest
+              createDirectoryIfMissing True dest
+              TIO.writeFile (dest </> "data.txt") "same bytes"
+              removeIfExists srcDir
+              materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+              registered <- isValid store sp
+              pure (if registered then Pass else Fail "matching tree was not adopted and registered"),
         -- scanReferences finds the canonical /nix/store text eval injects
         -- into builder envs, independent of the platform store dir (the
         -- bare hash is the needle, matching upstream Nix).
@@ -6385,6 +6395,159 @@ testValueCountWidths = do
           (VInt 70000)
     ]
 
+-- ---------------------------------------------------------------------------
+-- Tests: Class B name validation at write sinks (issue #39)
+-- ---------------------------------------------------------------------------
+
+-- | Class B (issue #39): the store-path name rules hold at path
+-- CONSTRUCTION, not only at parse.  Derivation names, output names, and
+-- fetchurl basenames reject exactly what the parse boundary rejects,
+-- before any write path is built from them - and names the old ad hoc
+-- sink checks over-rejected (an interior @..@) are valid again.
+testStoreNameSinks :: IO [Bool]
+testStoreNameSinks = do
+  putStrLn "store/name-sinks"
+  let drvWith nameLit =
+        "(derivation { name = " <> nameLit <> "; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).drvPath"
+      drvOutPath nameLit =
+        "(derivation { name = " <> nameLit <> "; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).outPath"
+      drvWithOutputs outsLit =
+        "(derivation { name = \"p\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = " <> outsLit <> "; }).drvPath"
+      failsWith label source needle = case evalNix source of
+        Left err
+          | parseErrorTag `T.isPrefixOf` err -> Fail (label <> ": did not parse: " <> err)
+          | needle `T.isInfixOf` err -> Pass
+          | otherwise -> Fail (label <> ": wrong error: " <> err)
+        Right val -> Fail (label <> ": expected an eval error, got " <> T.pack (show val))
+      succeedsWithSuffix label source suffix = case evalNix source of
+        Left err -> Fail (label <> ": unexpected error: " <> err)
+        Right (VStr s _) ->
+          if TE.encodeUtf8 suffix `BS.isSuffixOf` s
+            then Pass
+            else Fail (label <> ": expected suffix " <> suffix <> ", got " <> bytesText s)
+        Right other -> Fail (label <> ": expected VStr, got " <> T.pack (show other))
+  sequence
+    [ runTest "derivation name with a space is rejected" $
+        failsWith "name-space" (drvWith "\"a b\"") "invalid derivation name",
+      runTest "derivation name with a slash is rejected" $
+        failsWith "name-slash" (drvWith "\"a/b\"") "invalid derivation name",
+      runTest "derivation name with a backslash is rejected" $
+        failsWith "name-backslash" (drvWith "\"a\\\\b\"") "invalid derivation name",
+      runTest "derivation name with a drive colon is rejected" $
+        failsWith "name-colon" (drvWith "\"C:x\"") "invalid derivation name",
+      runTest "empty derivation name is rejected" $
+        failsWith "name-empty" (drvWith "\"\"") "the name is empty",
+      runTest "212-character derivation name is rejected" $
+        failsWith "name-long" (drvWith ("\"" <> T.replicate 212 "a" <> "\"")) "above the 211 maximum",
+      runTest "derivation name '..' is rejected" $
+        failsWith "name-dotdot" (drvWith "\"..\"") "dash-separated component",
+      runTest "derivation name '.-x' is rejected" $
+        failsWith "name-dotdash" (drvWith "\".-x\"") "dash-separated component",
+      runTest "dotfile derivation name stays valid" $
+        succeedsWithSuffix "name-dotfile" (drvWith "\".foo-1.0\"") "-.foo-1.0.drv",
+      runTest "interior '..' in a derivation name stays valid" $
+        succeedsWithSuffix "name-interior-dots" (drvOutPath "\"x..y\"") "-x..y",
+      runTest "derivation output name with a traversal is rejected" $
+        failsWith "out-traversal" (drvWithOutputs "[ \"out\" \"../x\" ]") "invalid derivation output name",
+      runTest "derivation output name with a colon is rejected" $
+        failsWith "out-colon" (drvWithOutputs "[ \"a:b\" ]") "invalid derivation output name",
+      -- Both fields clean on their own, only the COMPOSED drvName-output
+      -- crosses the length cap: the construction-side check catches what
+      -- the field-level checks cannot.
+      runTest "composed name-output past the length cap is rejected" $
+        failsWith
+          "composed-long"
+          ( "(derivation { name = \""
+              <> T.replicate 208 "a"
+              <> "\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ \"dev\" ]; }).drvPath"
+          )
+          "invalid store path name",
+      -- fetchurl derives the store name from the URL alone, so a bad
+      -- basename fails BEFORE the download: under PureEval a reachable
+      -- download would surface as "runProcess: not available" instead.
+      runTest "fetchurl rejects a backslash basename before fetching" $
+        failsWith "fetchurl-backslash" "builtins.fetchurl \"http://e/a\\\\b\"" "invalid store path name",
+      runTest "fetchurl rejects a dot-segment basename before fetching" $
+        failsWith "fetchurl-dotdot" "builtins.fetchurl \"http://e/..\"" "invalid store path name"
+    ]
+
+-- | The NAR entry-name check: rejects what escapes the tree and what the
+-- Win32 path layer silently rewrites (stream colons, device stems,
+-- trailing dot or space); ordinary names pass, including ones Windows
+-- merely refuses loudly.
+testNarNameSafety :: IO [Bool]
+testNarNameSafety = do
+  putStrLn "store/nar-name-safety"
+  let rejects name = if isSafeNarName name then Fail ("expected rejection: " <> T.pack (show name)) else Pass
+      accepts name = if isSafeNarName name then Pass else Fail ("expected acceptance: " <> T.pack (show name))
+      allOf = foldr keepFirstFail Pass
+      keepFirstFail Pass acc = acc
+      keepFirstFail failure _ = failure
+  sequence
+    [ runTest "empty and dot names are rejected" $
+        allOf [rejects "", rejects ".", rejects ".."],
+      runTest "separators are rejected" $
+        allOf [rejects "a/b", rejects "a\\b"],
+      runTest "an embedded NUL is rejected" $
+        rejects "a\NULb",
+      runTest "colons are rejected (drive prefix and stream form)" $
+        allOf [rejects "C:evil", rejects "a:b", rejects ":"],
+      runTest "reserved device stems are rejected case-insensitively" $
+        allOf [rejects "NUL", rejects "nul.txt", rejects "CON", rejects "com3", rejects "COM0.log", rejects "lpt9"],
+      runTest "a space-padded device stem is rejected" $
+        rejects "Nul .txt",
+      runTest "a superscript-digit device stem is rejected" $
+        rejects "COM\185",
+      runTest "a trailing dot or space is rejected" $
+        allOf [rejects "x.", rejects "x "],
+      runTest "ordinary names pass" $
+        allOf [accepts "a", accepts ".hidden", accepts "a.b", accepts "a b", accepts " a"],
+      runTest "near-miss device names pass" $
+        allOf [accepts "com10", accepts "COM", accepts "NULx", accepts "xNUL.txt"],
+      runTest "a loud-refuse character stays allowed" $
+        accepts "a\"b"
+    ]
+
+-- | IO-evaluator write sinks reject an invalid name BEFORE any write:
+-- every case here errors out against a scratch dir with no store traffic.
+testStoreNameSinksIO :: IO [Bool]
+testStoreNameSinksIO = do
+  putStrLn "store/name-sinks-io"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-name-sinks"
+      needleTest label source needle = do
+        result <- evalNixIO testDir source
+        runTest label $ case result of
+          Left err
+            | needle `T.isInfixOf` err -> Pass
+            | otherwise -> Fail (label <> ": wrong error: " <> err)
+          Right val -> Fail (label <> ": expected an eval error, got " <> T.pack (show val))
+  bracket_
+    ( do
+        createDirectoryIfMissing True (testDir </> "tree")
+        TIO.writeFile (testDir </> "tree" </> "f.txt") "payload\n"
+    )
+    ( do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+    )
+    $ sequence
+      [ needleTest "toFile rejects a stream-colon name" "builtins.toFile \"a:b\" \"x\"" "invalid store path name",
+        needleTest "toFile rejects a dot-segment name" "builtins.toFile \"..\" \"x\"" "invalid store path name",
+        needleTest
+          "path rejects a traversal name override"
+          "builtins.path { path = ./tree; name = \"../../evil\"; }"
+          "invalid store path name",
+        needleTest
+          "path with a filter rejects a drive-prefixed name"
+          "builtins.path { path = ./tree; name = \"C:evil\"; filter = (_: _: true); }"
+          "invalid store path name",
+        needleTest
+          "source coercion rejects a basename outside the name rules"
+          "\"${./. + \"/sp ace\"}\""
+          "invalid store path name"
+      ]
+
 testBytecodeCompile :: IO [Bool]
 testBytecodeCompile = do
   putStrLn "bytecode"
@@ -7225,6 +7388,9 @@ main = bracket_ arenaInit arenaDestroy $ do
           testBytecodeCompile,
           testBytecodeCountSpill,
           testValueCountWidths,
+          testStoreNameSinks,
+          testNarNameSafety,
+          testStoreNameSinksIO,
           testClassIFollowups,
           testClassIFollowupsIO
         ]

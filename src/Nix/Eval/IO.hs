@@ -50,7 +50,7 @@ import Nix.Eval.CList (CList (..))
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
 import Nix.Eval.CanonPath (canonBaseName, canonPath)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (parseNix, readFileAutoEncoding)
@@ -273,36 +273,35 @@ instance MonadEval EvalIO where
       Nothing -> do
         -- Upstream names the copy baseNameOf(canonicalized path); path
         -- values arrive canonicalized, so the last segment is the name.
+        -- The name is checked before the tree read: it derives from the
+        -- path alone, and the tree behind it can be arbitrarily large.
         let name = canonBaseName rawPath
+            copyContext = "cannot copy '" <> rawPath <> "' to the store"
         when (T.null name) $
-          throwEvalError ("cannot copy '" <> rawPath <> "' to the store: the path has no base name")
+          throwEvalError (copyContext <> ": the path has no base name")
+        case SP.checkStorePathName name of
+          Left err -> throwEvalError (copyContext <> ": " <> SP.storePathNameErrorText err)
+          Right () -> pure ()
         entry <- wrapIO (NAR.serialiseFromPath (T.unpack rawPath))
         let narDigest = sha256Digest (NAR.serialise entry)
-            sp = makeFixedOutputPath name "sha256" "recursive" narDigest
-            spText = SP.storePathToText SP.defaultStoreDir sp
+        sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
+        let spText = SP.storePathToText SP.defaultStoreDir sp
         EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath spText)))
         pure spText
 
   getCurrentTime = EvalIO (asks esTimestamp)
 
   writeToStore name contents refs = do
-    -- Validate name to prevent path traversal
-    when (T.any (== '/') name) $
-      throwEvalError ("writeToStore: name must not contain '/': " <> name)
-    when (T.any (== '\\') name) $
-      throwEvalError ("writeToStore: name must not contain '\\': " <> name)
-    when (T.isInfixOf ".." name) $
-      throwEvalError ("writeToStore: name must not contain '..': " <> name)
-    when (T.any (== '\0') name) $
-      throwEvalError ("writeToStore: name must not contain null bytes: " <> name)
     -- Upstream's text-path scheme via makeTextPath - the same scheme .drv
     -- paths use, so it is parity-validated: type @text:<refs>@, flat
-    -- sha256 of the contents, canonical store dir.  The contents are the
-    -- string's RAW BYTES, hashed and written as-is: no encoding step, and
-    -- no text-mode IO (which would CRLF-translate on Windows and store
-    -- bytes that no longer match the hash that named the path).
-    let sp = makeTextPath name (sha256Digest contents) refs
-        filePath = SP.storePathToFilePath SP.defaultStoreDir sp
+    -- sha256 of the contents, canonical store dir.  Construction also
+    -- validates the name, so the write below never targets a path
+    -- outside the store root.  The contents are the string's RAW BYTES,
+    -- hashed and written as-is: no encoding step, and no text-mode IO
+    -- (which would CRLF-translate on Windows and store bytes that no
+    -- longer match the hash that named the path).
+    sp <- storePathOrThrow "builtins.toFile" (makeTextPath name (sha256Digest contents) refs)
+    let filePath = SP.storePathToFilePath SP.defaultStoreDir sp
         storePath = SP.storePathToText SP.defaultStoreDir sp
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)
@@ -355,15 +354,12 @@ instance MonadEval EvalIO where
     pure (code, T.pack stdoutStr, T.pack stderrStr)
 
   copyPathToStore srcPath name expectedSha256 = do
-    -- Validate name to prevent path traversal (matches writeToStore)
-    when (T.any (== '/') name) $
-      throwEvalError ("copyPathToStore: name must not contain '/': " <> name)
-    when (T.any (== '\\') name) $
-      throwEvalError ("copyPathToStore: name must not contain '\\': " <> name)
-    when (T.isInfixOf ".." name) $
-      throwEvalError ("copyPathToStore: name must not contain '..': " <> name)
-    when (T.any (== '\0') name) $
-      throwEvalError ("copyPathToStore: name must not contain null bytes: " <> name)
+    -- The name is checked before the tree read: it arrives independently
+    -- of the source, and the tree can be arbitrarily large.
+    let copyContext = "cannot copy '" <> srcPath <> "' to the store"
+    case SP.checkStorePathName name of
+      Left err -> throwEvalError (copyContext <> ": " <> SP.storePathNameErrorText err)
+      Right () -> pure ()
     -- Content-addressed like upstream addToStore: recursive NAR sha256
     -- under the caller's name.  Same content means same path, so the
     -- existence check in copyToStoreIfMissing is sound - changed source
@@ -382,8 +378,8 @@ instance MonadEval EvalIO where
                   <> bytesToHexText narDigest
               )
       _ -> pure ()
-    let sp = makeFixedOutputPath name "sha256" "recursive" narDigest
-        destFilePath = SP.storePathToFilePath SP.defaultStoreDir sp
+    sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
+    let destFilePath = SP.storePathToFilePath SP.defaultStoreDir sp
         destPath = SP.storePathToText SP.defaultStoreDir sp
     wrapIO (copyToStoreIfMissing (T.unpack srcPath) destFilePath (takeDirectory destFilePath))
     pure destPath
@@ -399,8 +395,8 @@ instance MonadEval EvalIO where
       -- boundary rather than trusting the round trip.
       Left err -> throwEvalError ("builtins.path: internal NAR round-trip error: " <> T.pack err)
       Right entry -> do
-        let sp = makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes)
-            destFilePath = SP.storePathToFilePath SP.defaultStoreDir sp
+        sp <- storePathOrThrow "builtins.path" (makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes))
+        let destFilePath = SP.storePathToFilePath SP.defaultStoreDir sp
             destPath = SP.storePathToText SP.defaultStoreDir sp
         wrapIO $ do
           alreadyThere <- Dir.doesPathExist destFilePath
@@ -413,8 +409,8 @@ instance MonadEval EvalIO where
   addFixedOutputFile name bytes = do
     -- Canonical fixed-output path: a sha256-pinned fetch must land at the same
     -- store path C++ Nix computes, so it stays reproducible and cache-compatible.
-    let sp = makeFixedOutputPath name "sha256" "flat" (sha256Digest bytes)
-        filePath = SP.storePathToFilePath SP.defaultStoreDir sp
+    sp <- storePathOrThrow "builtins.fetchurl" (makeFixedOutputPath name "sha256" "flat" (sha256Digest bytes))
+    let filePath = SP.storePathToFilePath SP.defaultStoreDir sp
         storePath = SP.storePathToText SP.defaultStoreDir sp
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)

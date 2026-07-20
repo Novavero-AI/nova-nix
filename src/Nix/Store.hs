@@ -53,6 +53,9 @@ module Nix.Store
     writeDrv,
     writeDrvAterm,
 
+    -- * NAR entry-name safety
+    isSafeNarName,
+
     -- * Re-exports
     module Nix.Store.Path,
     module Nix.Store.DB,
@@ -62,6 +65,7 @@ where
 import Control.Exception (IOException, SomeException, catch, try)
 import Control.Monad (filterM, unless, when)
 import qualified Data.ByteString as BS
+import Data.Char (isDigit)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -438,14 +442,56 @@ createSymlink linkPath target = do
             )
         )
 
--- | Validate that a NAR entry name is safe (no path traversal).
+-- | Whether a NAR directory entry name is safe to materialize on every
+-- platform the store targets.  Two rejection classes:
+--
+-- 1. Path escapes: empty, @.@, @..@, a separator, a NUL (truncates the
+--    name in any NUL-terminated API downstream), or a @:@ - a
+--    drive-prefixed name like @C:evil@ makes 'System.FilePath.</>'
+--    discard the store prefix entirely.
+--
+-- 2. Names the Win32 path layer silently REWRITES rather than refuses,
+--    landing the bytes somewhere other than the named entry so the
+--    on-disk tree no longer reproduces the NAR hash that named it: an
+--    alternate-data-stream @:@ diverts the contents into a stream of
+--    another file, a reserved device stem (CON, PRN, AUX, NUL,
+--    COM0-COM9, LPT0-LPT9, plus the superscript-digit forms) addresses
+--    the device instead of a file, and a trailing dot or space is
+--    stripped on create, folding distinct NAR names onto one on-disk
+--    name.
+--
+-- Characters Windows merely REFUSES (@\"@, @*@, @<@, @>@, @|@) stay
+-- allowed: the create call fails loudly and the unpack loop surfaces
+-- the failure, which cannot misplace or corrupt anything.
 isSafeNarName :: Text -> Bool
 isSafeNarName name =
   not (T.null name)
     && name /= ".."
     && name /= "."
-    && not (T.isInfixOf "/" name)
-    && not (T.isInfixOf "\\" name)
+    && not (T.any escapesTree name)
+    && not (trailingRewritten name)
+    && not (reservedDeviceStem name)
+  where
+    escapesTree c = c == '/' || c == '\\' || c == ':' || c == '\0'
+    trailingRewritten n = case T.unsnoc n of
+      Just (_, end) -> end == '.' || end == ' '
+      Nothing -> False
+    -- Win32 device parsing takes the name up to the first dot as the
+    -- stem and ignores trailing spaces there ("NUL .txt" still
+    -- addresses NUL), so the stem is space-trimmed before comparison.
+    reservedDeviceStem n =
+      let stem = T.toUpper (T.dropWhileEnd (== ' ') (T.takeWhile (/= '.') n))
+       in stem == "CON"
+            || stem == "PRN"
+            || stem == "AUX"
+            || stem == "NUL"
+            || numberedDeviceStem stem
+    numberedDeviceStem stem = case T.unpack stem of
+      [a, b, c, digit] -> ([a, b, c] == "COM" || [a, b, c] == "LPT") && deviceDigit digit
+      _ -> False
+    -- Digits 0-9 plus the superscript forms ('\185' '\178' '\179') the
+    -- platform also reserves.
+    deviceDigit c = isDigit c || c == '\185' || c == '\178' || c == '\179'
 
 -- ---------------------------------------------------------------------------
 -- Eval source materialization
@@ -493,7 +539,7 @@ adoptedTreeMatches dest sp = do
   pure $ case result of
     Left (_ :: SomeException) -> False
     Right entry ->
-      makeFixedOutputPath (spName sp) "sha256" "recursive" (sha256Digest (NAR.serialise entry)) == sp
+      makeFixedOutputPath (spName sp) "sha256" "recursive" (sha256Digest (NAR.serialise entry)) == Right sp
 
 -- | Recursively copy a file or directory tree to a destination path.
 -- A symlink is replicated as a symlink: the store path's name came from a
