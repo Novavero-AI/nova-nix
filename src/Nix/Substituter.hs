@@ -40,6 +40,8 @@ module Nix.Substituter
     defaultCacheConfig,
 
     -- * Pure helpers (exported for testing)
+    maxNarInfoBody,
+    readBodyCapped,
     sortCaches,
     tryCachesWith,
     verifySigs,
@@ -59,8 +61,8 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy as LBS
 import Data.List (sortBy)
+import Data.Maybe (fromMaybe)
 import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -317,25 +319,54 @@ httpOk = 200
 httpNotFound :: Int
 httpNotFound = 404
 
+-- | Cap on a narinfo response body, mirroring nova-cache's server-side
+-- @maxNarInfoBodySize@ - the server bounds what it reads, and the
+-- client bounds what any cache in its list can make it buffer.
+-- Narinfo is small key-value text; 4 MB is far beyond any real one.
+maxNarInfoBody :: Int
+maxNarInfoBody = 4 * 1024 * 1024
+
+-- | Read an HTTP response body in bounded chunks up to a byte cap -
+-- 'Nothing' once the cap is exceeded, so an over-large body aborts
+-- mid-stream instead of buffering without limit.  The client-side
+-- mirror of nova-cache's @readBodyLimited@.
+readBodyCapped :: Int -> HTTP.BodyReader -> IO (Maybe BS.ByteString)
+readBodyCapped cap reader = go [] 0
+  where
+    go chunks !total = do
+      chunk <- HTTP.brRead reader
+      if BS.null chunk
+        then pure (Just (BS.concat (reverse chunks)))
+        else
+          let newTotal = total + BS.length chunk
+           in if newTotal > cap
+                then pure Nothing
+                else go (chunk : chunks) newTotal
+
 -- | Fetch a narinfo from a cache.
 -- Returns @Left SubstNotFound@ on 404, @Left (SubstError msg)@ on other errors.
 fetchNarInfo :: HTTP.Manager -> CacheConfig -> StorePath -> IO (Either SubstResult NarInfo.NarInfo)
 fetchNarInfo mgr cache sp = do
   let url = T.unpack (ccUrl cache) <> "/" <> T.unpack (spHash sp) <> ".narinfo"
   request <- HTTP.parseRequest url
-  response <- HTTP.httpLbs request mgr
-  let code = HTTP.statusCode (HTTP.responseStatus response)
-  -- Lenient decode: the body is cache-controlled bytes, and a stray
-  -- invalid UTF-8 sequence must surface as a narinfo parse error, not an
-  -- impure UnicodeException (the push side decodes the same way).
-  if code == httpOk
-    then case NarInfo.parseNarInfo (TE.decodeUtf8Lenient (LBS.toStrict (HTTP.responseBody response))) of
-      Left err -> pure (Left (SubstError ("narinfo parse error: " <> T.pack err)))
-      Right ni -> pure (Right ni)
-    else
-      if code == httpNotFound
-        then pure (Left SubstNotFound)
-        else pure (Left (SubstError ("narinfo fetch failed: HTTP " <> T.pack (show code))))
+  HTTP.withResponse request mgr $ \response -> do
+    let code = HTTP.statusCode (HTTP.responseStatus response)
+    -- Lenient decode: the body is cache-controlled bytes, and a stray
+    -- invalid UTF-8 sequence must surface as a narinfo parse error, not an
+    -- impure UnicodeException (the push side decodes the same way).
+    if code == httpOk
+      then do
+        body <- readBodyCapped maxNarInfoBody (HTTP.responseBody response)
+        case body of
+          Nothing ->
+            pure (Left (SubstError ("narinfo body exceeds " <> T.pack (show maxNarInfoBody) <> " bytes")))
+          Just bytes -> case NarInfo.parseNarInfo (TE.decodeUtf8Lenient bytes) of
+            Left err -> pure (Left (SubstError ("narinfo parse error: " <> T.pack err)))
+            Right ni -> pure (Right ni)
+      else
+        if code == httpNotFound
+          then pure (Left SubstNotFound)
+          else pure (Left (SubstError ("narinfo fetch failed: HTTP " <> T.pack (show code))))
 
 -- | How many times to attempt a NAR download before giving up and letting the
 -- caller fall back to a local build.  Matches Nix's @download-attempts@ default.
@@ -374,17 +405,30 @@ downloadNarWithRetry mgr cache narInfo = attempt narDownloadAttempts
 -- | Download the NAR file referenced by a narinfo.
 --
 -- The whole NAR is realized in memory (nova-cache's 'NAR.deserialise' consumes
--- a strict 'BS.ByteString'), so a very large path briefly spikes RSS.  Streaming
--- would need a streaming NAR parser that nova-cache does not yet provide.
+-- a strict 'BS.ByteString'), but never more of it than the narinfo declares:
+-- the narinfo was signature-verified before this runs, so its FileSize /
+-- NarSize is the key-trusted bound, and a body that exceeds it aborts
+-- mid-stream instead of buffering without limit - the excess bytes could not
+-- hash-verify anyway.  Streaming the verify itself would need a streaming NAR
+-- parser that nova-cache does not yet provide.
 downloadNar :: HTTP.Manager -> CacheConfig -> NarInfo.NarInfo -> IO (Either Text BS.ByteString)
 downloadNar mgr cache narInfo = do
   let narUrl = T.unpack (ccUrl cache) <> "/" <> T.unpack (NarInfo.niUrl narInfo)
-  request <- HTTP.parseRequest narUrl
-  response <- HTTP.httpLbs request mgr
-  let code = HTTP.statusCode (HTTP.responseStatus response)
-  if code == httpOk
-    then pure (Right (LBS.toStrict (HTTP.responseBody response)))
-    else pure (Left ("NAR download failed: HTTP " <> T.pack (show code)))
+      declared = fromMaybe (NarInfo.niNarSize narInfo) (NarInfo.niFileSize narInfo)
+  if declared < 0 || declared > toInteger (maxBound :: Int)
+    then pure (Left ("narinfo declares an unusable NAR size: " <> T.pack (show declared)))
+    else do
+      request <- HTTP.parseRequest narUrl
+      HTTP.withResponse request mgr $ \response -> do
+        let code = HTTP.statusCode (HTTP.responseStatus response)
+        if code == httpOk
+          then do
+            body <- readBodyCapped (fromInteger declared) (HTTP.responseBody response)
+            case body of
+              Nothing ->
+                pure (Left ("NAR body exceeds the declared size (" <> T.pack (show declared) <> " bytes)"))
+              Just bytes -> pure (Right bytes)
+          else pure (Left ("NAR download failed: HTTP " <> T.pack (show code)))
 
 -- ---------------------------------------------------------------------------
 -- Pure helpers

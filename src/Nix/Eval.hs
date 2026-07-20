@@ -4272,15 +4272,17 @@ scanTomlLine st0 line = go st0 line 0
 joinLogicalLine :: Text -> [Text] -> (Text, [Text])
 joinLogicalLine firstLine rest0 =
   let (st0, visible0) = scanTomlLine emptyTomlScan firstLine
-   in go st0 visible0 rest0
+   in go st0 [visible0] rest0
   where
-    go st acc remaining
-      | not (tomlNeedsMoreLines st) = (acc, remaining)
+    -- Reversed line chunks, joined once - O(n) in the logical line's
+    -- length instead of the O(n^2) of appending per physical line.
+    go st !chunks remaining
+      | not (tomlNeedsMoreLines st) = (T.intercalate "\n" (reverse chunks), remaining)
       | otherwise = case remaining of
-          [] -> (acc, [])
+          [] -> (T.intercalate "\n" (reverse chunks), [])
           (next : more) ->
             let (advanced, visible) = scanTomlLine st next
-             in go advanced (acc <> "\n" <> visible) more
+             in go advanced (visible : chunks) more
 
 -- | Parse a key = value line.
 parseKVLine :: Text -> Either Text ([Text], TOMLValue)
@@ -4294,23 +4296,27 @@ parseKVLine line =
           Right (parseDottedKey (T.strip keyPart), parsed)
 
 -- | Split a line at the first unquoted '=' sign.
+-- O(n) via bulk spans into a chunk list instead of O(n^2) T.snoc.
 splitAtEquals :: Text -> (Text, Text)
-splitAtEquals = go T.empty
+splitAtEquals = go []
   where
-    go acc t = case T.uncons t of
-      Nothing -> (acc, T.empty)
-      Just ('=', rest) -> (acc, rest)
+    keyPart chunks = T.concat (reverse chunks)
+    go !chunks t = case T.uncons t of
+      Nothing -> (keyPart chunks, T.empty)
+      Just ('=', rest) -> (keyPart chunks, rest)
       Just ('"', rest) ->
         let (quoted, after) = T.break (== '"') rest
          in case T.uncons after of
-              Just ('"', r) -> go (acc <> "\"" <> quoted <> "\"") r
-              _ -> go (acc <> "\"" <> quoted) after
+              Just ('"', r) -> go ("\"" : quoted : "\"" : chunks) r
+              _ -> go (quoted : "\"" : chunks) after
       Just ('\'', rest) ->
         let (quoted, after) = T.break (== '\'') rest
          in case T.uncons after of
-              Just ('\'', r) -> go (acc <> "'" <> quoted <> "'") r
-              _ -> go (acc <> "'" <> quoted) after
-      Just (c, rest) -> go (T.snoc acc c) rest
+              Just ('\'', r) -> go ("'" : quoted : "'" : chunks) r
+              _ -> go (quoted : "'" : chunks) after
+      Just (_, _) ->
+        let (plain, after) = T.break (\c -> c == '=' || c == '"' || c == '\'') t
+         in go (plain : chunks) after
 
 -- | Parse dotted key like @foo.bar."baz qux"@ into @["foo", "bar", "baz qux"]@.
 parseDottedKey :: Text -> [Text]
@@ -4366,22 +4372,29 @@ parseTOMLValue t =
         _ -> parseTOMLNumberOrDatetime cleaned
 
 -- | Strip inline comment from a value (not inside quotes).
+-- O(n) via bulk spans into a chunk list instead of O(n^2)
+-- per-character T.cons (each cons copies the whole tail).
 stripInlineComment :: Text -> Text
-stripInlineComment = go (0 :: Int)
+stripInlineComment = go (0 :: Int) []
   where
-    go _ t | T.null t = T.empty
-    go depth t = case T.uncons t of
-      Nothing -> T.empty
-      Just ('#', _) | depth == (0 :: Int) -> T.empty
+    finish chunks = T.concat (reverse chunks)
+    go depth !chunks t = case T.uncons t of
+      Nothing -> finish chunks
+      Just ('#', _) | depth == 0 -> finish chunks
       Just ('"', rest)
         | depth == 0 ->
             let (str, after) = T.break (== '"') rest
-             in T.cons '"' (str <> T.take 1 after <> go depth (T.drop 1 after))
-      Just ('[', rest) -> T.cons '[' (go (depth + 1) rest)
-      Just ('{', rest) -> T.cons '{' (go (depth + 1) rest)
-      Just (']', rest) -> T.cons ']' (go (max 0 (depth - 1)) rest)
-      Just ('}', rest) -> T.cons '}' (go (max 0 (depth - 1)) rest)
-      Just (c, rest) -> T.cons c (go depth rest)
+             in go depth (T.take 1 after : str : "\"" : chunks) (T.drop 1 after)
+      Just ('[', rest) -> go (depth + 1) ("[" : chunks) rest
+      Just ('{', rest) -> go (depth + 1) ("{" : chunks) rest
+      Just (']', rest) -> go (max 0 (depth - 1)) ("]" : chunks) rest
+      Just ('}', rest) -> go (max 0 (depth - 1)) ("}" : chunks) rest
+      Just (c, rest) ->
+        -- c is plain (or a quote/hash inside brackets, kept as content);
+        -- take it plus the whole plain run after it in one span.
+        let (plain, after) = T.break scanBreak rest
+         in go depth (plain : T.singleton c : chunks) after
+    scanBreak c = c == '#' || c == '"' || c == '[' || c == '{' || c == ']' || c == '}'
 
 -- | Parse a basic (double-quoted) TOML string.
 -- O(n) via chunk list + T.concat instead of O(n^2) T.snoc.

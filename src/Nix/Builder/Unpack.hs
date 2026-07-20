@@ -39,6 +39,10 @@ module Nix.Builder.Unpack
     -- * Derivation environment keys
     envSrcs,
 
+    -- * Extraction budget
+    UnpackLimits (..),
+    defaultUnpackLimits,
+
     -- * Running
     runBuiltinUnpack,
 
@@ -57,6 +61,7 @@ import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (toLower)
+import Data.Int (Int64)
 import Data.List (isPrefixOf, isSuffixOf)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -69,6 +74,7 @@ import System.Directory
     doesDirectoryExist,
     doesFileExist,
     doesPathExist,
+    getFileSize,
     getPermissions,
     listDirectory,
     setOwnerExecutable,
@@ -97,6 +103,37 @@ envSrcs = "srcs"
 -- | Name of the output the merged tree is extracted into.
 unpackOutputName :: Text
 unpackOutputName = "out"
+
+-- | Extraction budget for one @builtin:unpack@ build, across every
+-- archive in @srcs@: total bytes materialized and total filesystem
+-- entries created.  Archive bytes decompress and expand with no
+-- relation to their compressed size, so extraction without a budget
+-- lets a small input produce an output with no upper bound.
+data UnpackLimits = UnpackLimits
+  { ulMaxBytes :: !Int64,
+    ulMaxEntries :: !Int
+  }
+  deriving (Eq, Show)
+
+-- | Default extraction budget: 4 GiB and one million entries.  The
+-- MSYS2 toolchain seed decompresses to well under half of either, and
+-- 4 GiB matches the largest NAR nova-cache's server accepts.
+defaultUnpackLimits :: UnpackLimits
+defaultUnpackLimits =
+  UnpackLimits
+    { ulMaxBytes = 4 * 1024 * 1024 * 1024,
+      ulMaxEntries = 1000000
+    }
+
+-- | Charge one created entry plus its bytes against the remaining
+-- budget; a breached budget is a loud extraction failure.
+chargeBudget :: Text -> Int64 -> UnpackLimits -> Either Text UnpackLimits
+chargeBudget label bytes (UnpackLimits remainingBytes remainingEntries)
+  | remainingEntries < 1 =
+      Left ("extraction exceeds the entry budget at: " <> label)
+  | bytes > remainingBytes =
+      Left ("extraction exceeds the size budget at: " <> label)
+  | otherwise = Right (UnpackLimits (remainingBytes - bytes) (remainingEntries - 1))
 
 -- | Owner-execute bit of a tar header's mode field (octal @0o100@).
 ownerExecuteMode :: TarEntry.Permissions
@@ -139,8 +176,8 @@ type DecodeError = Either Tar.FormatError Tar.DecodeLongNamesError
 -- @Either (exit, msg) ()@ shape as the process runner, so the shared
 -- output-validation and registration path in "Nix.Builder" is reused
 -- unchanged.
-runBuiltinUnpack :: Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
-runBuiltinUnpack drv outputDirs =
+runBuiltinUnpack :: UnpackLimits -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
+runBuiltinUnpack limits drv outputDirs =
   case (Map.lookup envSrcs (drvEnv drv), lookup unpackOutputName outputDirs) of
     (Nothing, _) -> failure "derivation has no 'srcs'"
     (Just srcsBytes, mOutDir) -> case TE.decodeUtf8' srcsBytes of
@@ -152,7 +189,7 @@ runBuiltinUnpack drv outputDirs =
             Nothing -> failure "derivation defines no 'out' output"
             Just outDir -> do
               createDirectoryIfMissing True outDir
-              result <- unpackAll outDir (sourcePaths srcs)
+              result <- unpackAll outDir limits (sourcePaths srcs)
               pure $ case result of
                 Left msg -> Left (1, "builtin:unpack: " <> msg)
                 Right () -> Right ()
@@ -160,21 +197,24 @@ runBuiltinUnpack drv outputDirs =
     failure msg = pure (Left (1, "builtin:unpack: " <> msg))
     sourcePaths = map T.unpack . T.words
 
--- | Extract archives in order, stopping at the first failure.
-unpackAll :: FilePath -> [FilePath] -> IO (Either Text ())
-unpackAll _ [] = pure (Right ())
-unpackAll outDir (archive : rest) = do
-  result <- unpackArchive outDir archive
+-- | Extract archives in order, stopping at the first failure.  One
+-- budget spans all of them: the caps bound the BUILD's output, not any
+-- single archive.
+unpackAll :: FilePath -> UnpackLimits -> [FilePath] -> IO (Either Text ())
+unpackAll _ _ [] = pure (Right ())
+unpackAll outDir budget (archive : rest) = do
+  result <- unpackArchive outDir budget archive
   case result of
     Left err -> pure (Left err)
-    Right () -> unpackAll outDir rest
+    Right remaining -> unpackAll outDir remaining rest
 
--- | Unpack one archive into @outDir@.  The decompressor is chosen by file
--- extension; the tar stream is decoded (GNU + pax long names) and extracted
--- entry by entry.  Decompression errors surface lazily mid-stream, so the
--- whole extraction is exception-wrapped into a clean failure.
-unpackArchive :: FilePath -> FilePath -> IO (Either Text ())
-unpackArchive outDir archivePath = do
+-- | Unpack one archive into @outDir@, returning the budget left for the
+-- archives after it.  The decompressor is chosen by file extension; the
+-- tar stream is decoded (GNU + pax long names) and extracted entry by
+-- entry.  Decompression errors surface lazily mid-stream, so the whole
+-- extraction is exception-wrapped into a clean failure.
+unpackArchive :: FilePath -> UnpackLimits -> FilePath -> IO (Either Text UnpackLimits)
+unpackArchive outDir budget archivePath = do
   attempt <- try run
   pure $ case attempt of
     Left (e :: SomeException) ->
@@ -185,7 +225,7 @@ unpackArchive outDir archivePath = do
       Nothing -> pure (Left ("unsupported archive format: " <> T.pack archivePath))
       Just decoder -> do
         raw <- BL.readFile archivePath
-        extractEntries outDir (Tar.decodeLongNames (Tar.read (decoder raw)))
+        extractEntries outDir budget (Tar.decodeLongNames (Tar.read (decoder raw)))
 
 -- | Choose a decompressor from the archive file name.  @.tar.zst@ (MSYS2
 -- packages) and plain @.tar@ are supported.  MSYS2's zstd frames do not
@@ -203,48 +243,58 @@ decoderFor path
 -- Entry extraction
 -- ---------------------------------------------------------------------------
 
--- | Walk the entry stream, extracting each entry under @outDir@.
-extractEntries :: FilePath -> DecodedEntries -> IO (Either Text ())
+-- | Walk the entry stream, extracting each entry under @outDir@ and
+-- threading the remaining extraction budget.
+extractEntries :: FilePath -> UnpackLimits -> DecodedEntries -> IO (Either Text UnpackLimits)
 extractEntries outDir = go
   where
-    go stream = case stream of
-      Tar.Done -> pure (Right ())
+    go budget stream = case stream of
+      Tar.Done -> pure (Right budget)
       Tar.Fail err -> pure (Left ("malformed archive: " <> T.pack (show err)))
       Tar.Next entry rest -> do
-        result <- extractEntry outDir entry
+        result <- extractEntry outDir budget entry
         case result of
           Left err -> pure (Left err)
-          Right () -> go rest
+          Right remaining -> go remaining rest
 
 -- | Extract a single entry, after validating its path stays inside the
 -- archive root and skipping pacman package metadata.
-extractEntry :: FilePath -> DecodedEntry -> IO (Either Text ())
-extractEntry outDir entry =
+extractEntry :: FilePath -> UnpackLimits -> DecodedEntry -> IO (Either Text UnpackLimits)
+extractEntry outDir budget entry =
   case entryComponents (TarEntry.entryTarPath entry) of
     Left err -> pure (Left err)
     -- The archive root itself (an entry for "." or "./").
-    Right [] -> pure (Right ())
+    Right [] -> pure (Right budget)
     Right comps
-      | isPackageMetadata comps -> pure (Right ())
-      | otherwise -> extractContent outDir comps entry
+      | isPackageMetadata comps -> pure (Right budget)
+      | otherwise -> extractContent outDir budget comps entry
 
--- | Extract a path-validated entry's content.  @comps@ is non-empty (the
+-- | Extract a path-validated entry's content, charging every created
+-- entry and its bytes against the budget.  @comps@ is non-empty (the
 -- empty case is consumed by 'extractEntry').
-extractContent :: FilePath -> [FilePath] -> DecodedEntry -> IO (Either Text ())
-extractContent outDir comps entry =
+extractContent :: FilePath -> UnpackLimits -> [FilePath] -> DecodedEntry -> IO (Either Text UnpackLimits)
+extractContent outDir budget comps entry =
   case TarEntry.entryContent entry of
-    Tar.Directory -> do
-      createDirectoryIfMissing True dest
-      pure (Right ())
-    Tar.NormalFile bytes _size -> do
-      fresh <- freshDestination dest
-      case fresh of
+    Tar.Directory ->
+      case chargeBudget pathText 0 budget of
         Left err -> pure (Left err)
-        Right () -> do
-          createDirectoryIfMissing True (takeDirectory dest)
-          BL.writeFile dest bytes
-          when (executableEntry entry && not isWindowsHost) (markExecutable dest)
-          pure (Right ())
+        Right remaining -> do
+          createDirectoryIfMissing True dest
+          pure (Right remaining)
+    Tar.NormalFile bytes size ->
+      -- The header size is charged before the lazy content is realized,
+      -- so a breach rejects the entry rather than materializing it.
+      case chargeBudget pathText size budget of
+        Left err -> pure (Left err)
+        Right remaining -> do
+          fresh <- freshDestination dest
+          case fresh of
+            Left err -> pure (Left err)
+            Right () -> do
+              createDirectoryIfMissing True (takeDirectory dest)
+              BL.writeFile dest bytes
+              when (executableEntry entry && not isWindowsHost) (markExecutable dest)
+              pure (Right remaining)
     -- A symlink target is relative to the link's own directory.
     Tar.SymbolicLink target ->
       copyLinkTarget "symlink" (resolveLinkTarget parentComps target)
@@ -252,7 +302,7 @@ extractContent outDir comps entry =
     Tar.HardLink target ->
       copyLinkTarget "hardlink" (entryComponents target)
     Tar.OtherEntryType code _ _
-      | code == paxPerFileCode || code == paxGlobalCode -> pure (Right ())
+      | code == paxPerFileCode || code == paxGlobalCode -> pure (Right budget)
       | otherwise ->
           pure (Left ("unsupported tar entry type '" <> T.singleton code <> "': " <> pathText))
     Tar.CharacterDevice _ _ -> unsupportedSpecial "character device"
@@ -277,9 +327,13 @@ extractContent outDir comps entry =
           case fresh of
             Left err -> pure (Left err)
             Right () -> do
-              createDirectoryIfMissing True (takeDirectory dest)
-              copyFile targetPath dest
-              pure (Right ())
+              size <- getFileSize targetPath
+              case chargeBudget pathText (fromIntegral size) budget of
+                Left err -> pure (Left err)
+                Right remaining -> do
+                  createDirectoryIfMissing True (takeDirectory dest)
+                  copyFile targetPath dest
+                  pure (Right remaining)
       | isDir = do
           -- The same collision guard as regular entries: without it a
           -- directory link copy silently merges into content another
@@ -287,9 +341,9 @@ extractContent outDir comps entry =
           fresh <- freshDestination dest
           case fresh of
             Left err -> pure (Left err)
-            Right () -> do
-              copyTree targetPath dest
-              pure (Right ())
+            Right () -> case chargeBudget pathText 0 budget of
+              Left err -> pure (Left err)
+              Right remaining -> copyTree remaining targetPath dest
       | otherwise =
           pure
             ( Left
@@ -386,17 +440,33 @@ markExecutable path = do
   setPermissions path (setOwnerExecutable True perms)
 
 -- | Recursively copy a directory tree (used to materialize directory
--- symlinks, which cannot be store-portable links on Windows).
-copyTree :: FilePath -> FilePath -> IO ()
-copyTree src dest = do
+-- symlinks, which cannot be store-portable links on Windows), charging
+-- every created entry and byte against the budget: each tree copy
+-- duplicates content already extracted and charged once, so uncharged
+-- copies would let K link entries multiply the output roughly 2^K-fold.
+copyTree :: UnpackLimits -> FilePath -> FilePath -> IO (Either Text UnpackLimits)
+copyTree budget0 src dest = do
   createDirectoryIfMissing True dest
   names <- listDirectory src
-  mapM_ copyOne names
+  go budget0 names
   where
-    copyOne name = do
+    go budget [] = pure (Right budget)
+    go budget (name : rest) = do
       let from = src </> name
           to = dest </> name
       isDir <- doesDirectoryExist from
-      if isDir
-        then copyTree from to
-        else copyFile from to
+      copied <-
+        if isDir
+          then case chargeBudget (T.pack to) 0 budget of
+            Left err -> pure (Left err)
+            Right remaining -> copyTree remaining from to
+          else do
+            size <- getFileSize from
+            case chargeBudget (T.pack to) (fromIntegral size) budget of
+              Left err -> pure (Left err)
+              Right remaining -> do
+                copyFile from to
+                pure (Right remaining)
+      case copied of
+        Left err -> pure (Left err)
+        Right remaining -> go remaining rest

@@ -12,6 +12,7 @@ module Nix.Builtins
 
     -- * NIX_PATH parsing
     parseNixPath,
+    splitNixPath,
   )
 where
 
@@ -150,14 +151,21 @@ parseNixPath raw
 -- drive letters.  A colon followed by @\\@ or @/@ (e.g. @C:\\@) is
 -- part of a path, not a separator.
 splitNixPath :: Text -> [Text]
-splitNixPath = go T.empty
+splitNixPath = go []
   where
-    go acc remaining = case T.uncons remaining of
-      Nothing -> [acc | not (T.null acc)]
-      Just (':', rest)
-        | isDriveSep rest -> go (acc <> ":" <> T.take 1 rest) (T.drop 1 rest)
-        | otherwise -> acc : go T.empty rest
-      Just (c, rest) -> go (T.snoc acc c) rest
+    -- Accumulates reversed chunks and concatenates once per entry, so a
+    -- long entry costs O(n) instead of the O(n^2) of per-character snoc.
+    go !chunks remaining =
+      let (chunk, rest) = T.break (== ':') remaining
+       in case T.uncons rest of
+            Nothing ->
+              let entry = T.concat (reverse (chunk : chunks))
+               in [entry | not (T.null entry)]
+            Just (_, afterColon)
+              | isDriveSep afterColon ->
+                  go (T.take 1 afterColon : ":" : chunk : chunks) (T.drop 1 afterColon)
+              | otherwise ->
+                  T.concat (reverse (chunk : chunks)) : go [] afterColon
     -- After a colon, if the next char is \ or /, it's a drive letter
     isDriveSep t = case T.uncons t of
       Just ('\\', _) -> True

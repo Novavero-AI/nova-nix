@@ -56,6 +56,9 @@ module Nix.Store
     -- * NAR entry-name safety
     isSafeNarName,
 
+    -- * Link ordering (exposed for testing)
+    orderLinks,
+
     -- * Re-exports
     module Nix.Store.Path,
     module Nix.Store.DB,
@@ -63,9 +66,10 @@ module Nix.Store
 where
 
 import Control.Exception (IOException, SomeException, catch, try)
-import Control.Monad (filterM, unless, when)
+import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import Data.Char (isDigit)
+import Data.List (foldl', inits)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -89,7 +93,7 @@ import System.Directory
     setPermissions,
   )
 import qualified System.Directory as Dir
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (splitDirectories, takeDirectory, (</>))
 
 -- | An open store with database and configuration.
 data Store = Store
@@ -386,31 +390,82 @@ unpackChildren path ((name, child) : rest)
             Left err -> pure (Left err)
             Right moreLinks -> pure (Right (links <> moreLinks))
 
--- | Second unpack pass: create the recorded symlinks.  Links whose targets
--- already exist are created first - possibly unblocking link-to-link
--- chains - so the Windows link flavor (file vs directory) is read off the
--- real target.  When no pending link's target exists, the remainder are
--- dangling and their kind is unknowable: they default to file links.
+-- | Second unpack pass: create the recorded symlinks in dependency
+-- order - each link is created after every pending link its target
+-- resolves at or through - so the Windows link flavor (file vs
+-- directory) is read off the real target with one probe per link.
+-- (The previous ready-set rounds re-stat'd every remaining link per
+-- round: quadratic filesystem stats on a link chain.)  Links on a
+-- dependency cycle have no knowable kind and default to file links,
+-- exactly as dangling links always have.
 createSymlinks :: [(FilePath, Text)] -> IO (Either Text ())
-createSymlinks [] = pure (Right ())
-createSymlinks pending = do
-  ready <- filterM targetExists pending
-  case ready of
-    [] -> createAll pending
-    _ -> do
-      made <- createAll ready
-      case made of
-        Left err -> pure (Left err)
-        Right () -> createSymlinks (filter (`notElem` ready) pending)
+createSymlinks pending = createAll (orderLinks pending)
   where
-    targetExists (linkPath, target) =
-      Dir.doesPathExist (takeDirectory linkPath </> T.unpack target)
     createAll [] = pure (Right ())
     createAll (link : rest) = do
       made <- uncurry createSymlink link
       case made of
         Left err -> pure (Left err)
         Right () -> createAll rest
+
+-- | Order pending links so each follows every pending link its target
+-- path resolves at or through: the target itself, or a link standing on
+-- one of the target's ancestor directories.  Purely textual over the
+-- same @takeDirectory linkPath \</\> target@ resolution 'createSymlink'
+-- probes - no filesystem access.  Kahn's ordering, deterministic:
+-- ready links leave in input order, and cycle members keep input order
+-- at the end.  Exported for testing (the ordering property is pure).
+orderLinks :: [(FilePath, Text)] -> [(FilePath, Text)]
+orderLinks pending =
+  let indexed = zip [0 :: Int ..] pending
+      linkByIndex = Map.fromList indexed
+      indexByKey =
+        Map.fromList [(normalisedComponents linkPath, i) | (i, (linkPath, _)) <- indexed]
+      -- The pending links this link's resolved target lands on or
+      -- passes through (every nonempty component prefix).
+      depsOf (linkPath, target) =
+        let resolved = normalisedComponents (takeDirectory linkPath </> T.unpack target)
+         in Set.fromList
+              [j | prefix <- drop 1 (inits resolved), Just j <- [Map.lookup prefix indexByKey]]
+      dependsOn = Map.fromList [(i, depsOf link) | (i, link) <- indexed]
+      dependents =
+        Map.fromListWith
+          (flip (++))
+          [(dep, [i]) | (i, deps) <- Map.toList dependsOn, dep <- Set.toList deps]
+      initialCounts = Map.map Set.size dependsOn
+      initialReady = [i | (i, count) <- Map.toList initialCounts, count == 0]
+      -- Kahn's ordering with a two-list queue (amortized O(1) pops).
+      run !emittedRev !counts front back = case front of
+        [] -> case back of
+          [] -> reverse emittedRev
+          _ -> run emittedRev counts (reverse back) []
+        (i : rest) ->
+          let (updatedCounts, readied) = release counts (Map.findWithDefault [] i dependents)
+           in run (i : emittedRev) updatedCounts rest (readied ++ back)
+      release !counts deps = case deps of
+        [] -> (counts, [])
+        (d : more) ->
+          let updated = Map.adjust (subtract 1) d counts
+              (finalCounts, readied) = release updated more
+           in (finalCounts, [d | Map.lookup d updated == Just 0] ++ readied)
+      emittedOrder = run [] initialCounts initialReady []
+      emittedSet = Set.fromList emittedOrder
+      cycleRemainder = [link | (i, link) <- indexed, not (Set.member i emittedSet)]
+   in [link | i <- emittedOrder, Just link <- [Map.lookup i linkByIndex]] ++ cycleRemainder
+
+-- | Path components with @.@ dropped and @..@ collapsed textually - the
+-- spelling-insensitive key that matches a link target against pending
+-- link paths ('splitDirectories' accepts both separator spellings).  A
+-- @..@ with nothing left to pop stays, matching no real path.
+normalisedComponents :: FilePath -> [FilePath]
+normalisedComponents path = reverse (foldl' step [] (splitDirectories path))
+  where
+    step stack comp
+      | comp == "." = stack
+      | comp == ".." = case stack of
+          (top : rest) | top /= ".." -> rest
+          _ -> comp : stack
+      | otherwise = comp : stack
 
 -- | Create one symlink, choosing the Windows flavor from the target's kind.
 -- A creation failure is loud: the old fallback of writing the target text
