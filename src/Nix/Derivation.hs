@@ -421,7 +421,9 @@ pStringContent = Parser $ \input -> go input []
               Just ('n', rest2) -> go rest2 ("\n" : plain : acc)
               Just ('r', rest2) -> go rest2 ("\r" : plain : acc)
               Just ('t', rest2) -> go rest2 ("\t" : plain : acc)
-              Just (c, rest2) -> go rest2 (BC.pack ['\\', c] : plain : acc)
+              -- A non-standard escape keeps the byte and drops the
+              -- backslash, as upstream's .drv string parser does.
+              Just (c, rest2) -> go rest2 (BC.singleton c : plain : acc)
             -- Unreachable: BC.break stops only at '"' or '\\'.
             Just (c, _) -> Left ("pStringContent: impossible break byte '" <> T.singleton c <> "'")
 

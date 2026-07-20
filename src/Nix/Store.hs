@@ -52,6 +52,7 @@ module Nix.Store
     unpackNarEntry,
     writeDrv,
     writeDrvAterm,
+    writeDrvClosure,
 
     -- * NAR entry-name safety
     isSafeNarName,
@@ -65,18 +66,19 @@ module Nix.Store
   )
 where
 
-import Control.Exception (IOException, SomeException, catch, try)
+import Control.Exception (IOException, SomeException, catch, throwIO, try)
 import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import Data.Char (isDigit)
 import Data.List (foldl', inits)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (catMaybes)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Nix.Derivation (Derivation, toATerm)
+import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (makeFixedOutputPath, sha256Digest)
 import Nix.Store.DB
 import Nix.Store.Path
@@ -333,9 +335,54 @@ writeDrvAterm store sp aterm = do
   -- bytes that no longer match their content address.
   BS.writeFile destPath aterm
 
--- | Serialize a derivation to ATerm and write it to the store at the given path.
+-- | Serialize a derivation to ATerm, write it to the store, and register
+-- it: a @.drv@ is a store object like any other, so it gets a ValidPaths
+-- row with its NAR hash and its references.  Reference scans may name a
+-- @.drv@ (an output that embeds an input drv hash), and an unregistered
+-- referent fails the whole registration batch.
 writeDrv :: Store -> Derivation -> StorePath -> IO ()
-writeDrv store drv sp = writeDrvAterm store sp (toATerm drv)
+writeDrv store drv sp = do
+  writeDrvAterm store sp (toATerm drv)
+  reg <- registrationFor store sp Nothing (drvReferences drv)
+  registerPath (stDB store) reg
+
+-- | A @.drv@'s references: its input sources and input @.drv@ paths -
+-- the same set upstream records when writing a derivation to the store.
+drvReferences :: Derivation -> [StorePath]
+drvReferences drv = drvInputSrcs drv ++ Map.keys (drvInputDrvs drv)
+
+-- | Write every recorded @.drv@ ATerm (keyed by its store-path text) to
+-- the store and register the whole closure in one batch: rows all land
+-- before edges ('registerPaths'), so references between the closure's
+-- own @.drv@ files resolve regardless of map order.  Input SOURCES must
+-- already be registered - the build driver runs 'materializeEvalSources'
+-- first.
+--
+-- Keys come from evaluation via 'storePathToText' so they always parse;
+-- an unparseable key is skipped defensively.  The ATerm bytes were
+-- rendered by evaluation, so a re-parse failure is an invariant break
+-- and throws rather than registering a recipe with dropped references.
+writeDrvClosure :: Store -> Map Text BS.ByteString -> IO ()
+writeDrvClosure store closure = do
+  regs <- mapM writeOne (Map.toList closure)
+  registerPaths (stDB store) (catMaybes regs)
+  where
+    writeOne (pathText, aterm) =
+      case parseStorePath defaultStoreDir pathText of
+        Nothing -> pure Nothing
+        Just sp -> do
+          writeDrvAterm store sp aterm
+          case fromATerm aterm of
+            Right drv -> Just <$> registrationFor store sp Nothing (drvReferences drv)
+            Left err ->
+              throwIO
+                ( userError
+                    ( "writeDrvClosure: recorded ATerm for "
+                        <> T.unpack pathText
+                        <> " does not re-parse: "
+                        <> T.unpack err
+                    )
+                )
 
 -- ---------------------------------------------------------------------------
 -- NAR unpacking

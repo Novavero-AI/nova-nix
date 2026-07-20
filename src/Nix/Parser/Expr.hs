@@ -22,7 +22,7 @@ module Nix.Parser.Expr
   )
 where
 
-import Control.Monad (foldM)
+import Control.Monad (foldM, when)
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -133,6 +133,9 @@ parseFormalsBody = do
 parseFormalsList :: [Formal] -> Parser ([Formal], Bool)
 parseFormalsList acc = do
   name <- expectIdent
+  -- Upstream rejects a repeated formal name at parse time.
+  when (any ((== name) . fName) acc) $
+    parseError ("duplicate formal function argument '" <> name <> "'")
   -- Check for default value
   hasDefault <- match TokQuestion
   defVal <-

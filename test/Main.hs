@@ -13,7 +13,7 @@ import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.List (foldl')
+import Data.List (foldl', sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import qualified Data.Set as Set
@@ -47,7 +47,7 @@ import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
+import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv, writeDrvClosure)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import qualified Nix.Substituter as Subst
@@ -1501,6 +1501,15 @@ testBatch1 = do
         assertEval "lt-f" "builtins.lessThan 2 1" (VBool False),
       runTest "lessThan strings" $
         assertEval "lt-str" "builtins.lessThan \"a\" \"b\"" (VBool True),
+      -- List < decides at the first UNEQUAL pair, as upstream: a pair
+      -- where < holds in neither direction (NaN) decides False rather
+      -- than being skipped as equal.
+      -- Distinct NaN values: a shared binding would be skipped as equal
+      -- via reference identity, which upstream's eqValues also does.
+      runTest "list compare decides at the first unequal pair" $
+        assertEval "lt-list-nan" "let inf = 1.0e308 * 10; in [ (inf - inf) 1 ] < [ (inf - inf) 2 ]" (VBool False),
+      runTest "list compare skips equal prefixes" $
+        assertEval "lt-list-prefix" "[ 1 2 ] < [ 1 3 ]" (VBool True),
       -- Constants
       runTest "storeDir" $
         assertEval "storeDir" "builtins.storeDir" (mkStr defaultStoreDirText),
@@ -1628,6 +1637,9 @@ testBatch4 = do
         assertEval "replace-empty" "builtins.replaceStrings [ \"\" ] [ \"x\" ] \"ab\"" (mkStr "xaxbx"),
       runTest "replaceStrings no match" $
         assertEval "replace-nomatch" "builtins.replaceStrings [ \"z\" ] [ \"Z\" ] \"abc\"" (mkStr "abc"),
+      -- Match-gated forcing: an unmatched replacement is never evaluated.
+      runTest "replaceStrings never forces an unmatched replacement" $
+        assertEval "replace-lazy" "builtins.replaceStrings [ \"z\" ] [ (builtins.throw \"unused\") ] \"abc\"" (mkStr "abc"),
       -- compareVersions
       runTest "compareVersions equal" $
         assertEval "cmpVer-eq" "builtins.compareVersions \"1.2.3\" \"1.2.3\"" (VInt 0),
@@ -4552,6 +4564,10 @@ testEvalFidelity = do
         assertEval "merge-add" "{ a = { b = 1; }; a.c = 2; }.a.c" (VInt 2),
       runTest "duplicate plain key is a parse error" $
         assertParseFail "dup-key" "{ a = 1; a = 2; }",
+      runTest "duplicate formal is rejected" $
+        assertParseFail "dup-formal" "{ a, a }: a",
+      runTest "duplicate formal with defaults is rejected" $
+        assertParseFail "dup-formal-default" "{ a ? 1, a ? 2 }: a",
       runTest "duplicate inner key on merge is an error" $
         assertParseFail "dup-inner" "{ a.b = 1; a = { b = 2; }; }",
       runTest "inherit conflicting with a definition is an error" $
@@ -5472,6 +5488,12 @@ testFromATerm = do
                   drvEnv = Map.fromList [("msg", "line1\nline2\ttab\\slash")]
                 }
          in assertEqual "escape round-trip" (Right escapeDrv) (fromATerm (toATerm escapeDrv)),
+      -- A non-standard escape keeps the byte and drops the backslash,
+      -- matching upstream's .drv string parser.
+      runTest "fromATerm drops the backslash on a non-standard escape" $
+        let aterm = "Derive([(\"out\",\"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x\",\"\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\",[],[(\"k\",\"a\\xb\")])"
+         in assertRight "nonstandard escape" (fromATerm aterm) $ \drv ->
+              assertEqual "escape dropped" (Just "axb") (Map.lookup "k" (drvEnv drv)),
       -- writeDrv writes correct ATerm
       runTestM "writeDrv writes correct ATerm" $ do
         tmpBase <- getTemporaryDirectory
@@ -5485,6 +5507,51 @@ testFromATerm = do
         closeStore store
         removeIfExists tmpStore
         pure (assertEqual "writeDrv content" (toATerm simpleTestDrv) contents),
+      -- The .drv closure registers as store objects: a row for every
+      -- recipe plus edges to its input sources and input .drvs, so an
+      -- output reference scan that names an input .drv resolves instead
+      -- of failing the registration batch.
+      runTestM "writeDrvClosure registers recipes with their references" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-drv-closure"
+            sd = StoreDir tmpStore
+        removeIfExists tmpStore
+        store <- openStore sd
+        let srcSp = StorePath "gggggggggggggggggggggggggggggggg" "source.tar.gz"
+            drvASp = StorePath "cccccccccccccccccccccccccccccccc" "dep1.drv"
+            drvBSp = StorePath "dddddddddddddddddddddddddddddddd" "top.drv"
+            drvB =
+              simpleTestDrv
+                { drvInputDrvs = Map.fromList [(drvASp, ["out"])],
+                  drvInputSrcs = [srcSp]
+                }
+        -- The source row registers first, as in the build driver, where
+        -- materializeEvalSources precedes the closure write.
+        registerPath (stDB store) (PathRegistration srcSp "sha256:0" 0 Nothing [])
+        writeDrvClosure
+          store
+          ( Map.fromList
+              [ (storePathToText defaultStoreDir drvASp, toATerm simpleTestDrv),
+                (storePathToText defaultStoreDir drvBSp, toATerm drvB)
+              ]
+          )
+        validA <- isValid store drvASp
+        validB <- isValid store drvBSp
+        refsB <- queryReferences (stDB store) drvBSp
+        closeStore store
+        removeIfExists tmpStore
+        let expectedRefs =
+              sort
+                [ T.pack (storePathToFilePath sd drvASp),
+                  T.pack (storePathToFilePath sd srcSp)
+                ]
+        pure $
+          if not validA
+            then Fail "input .drv not registered"
+            else
+              if not validB
+                then Fail "root .drv not registered"
+                else assertEqual "drv references" expectedRefs (sort refsB),
       -- builtinDerivation populates drvOutputs
       runTest "builtinDerivation populates drvOutputs"
         $ assertRight
@@ -6016,6 +6083,22 @@ testPhase4 = do
         assertEval "dynamic key hasAttr" "let s = { x = 10; }; in s ? ${\"x\"}" (VBool True),
       runTest "dynamic key hasAttr missing" $
         assertEval "dynamic key hasAttr missing" "let s = { x = 10; }; in s ? ${\"y\"}" (VBool False),
+      -- has-attr checks presence of the terminal attribute without
+      -- forcing its value, matching upstream laziness.
+      runTest "hasAttr does not force the final attribute" $
+        assertEval "hasattr-lazy" "{ a = builtins.throw \"boom\"; } ? a" (VBool True),
+      runTest "hasAttr path does not force the terminal attribute" $
+        assertEval "hasattr-path-lazy" "{ a = { b = builtins.throw \"boom\"; }; } ? a.b" (VBool True),
+      -- A null dynamic key in select or has-attr is a type error, as
+      -- upstream; it is not treated as an absent attribute.
+      runTest "null dynamic select key is a type error" $
+        assertEvalFail "sel-null-key" "({ x = 1; }).${null}",
+      runTest "null dynamic hasAttr key is a type error" $
+        assertEvalFail "has-null-key" "{ x = 1; } ? ${null}",
+      -- inherit inside a rec set with a dynamic key resolves against the
+      -- enclosing scope, never the rec set's own binding.
+      runTest "inherit in a dynamic-keyed rec set resolves outward" $
+        assertEval "dyn-rec-inherit" "let v = 42; in (rec { ${\"d\"} = 1; inherit v; }).v" (VInt 42),
       -- Dynamic attr inside string interpolation (the ${name} must not
       -- prematurely close the outer interpolation)
       runTest "dynamic key in string interp" $
