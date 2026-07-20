@@ -41,6 +41,8 @@ module Nix.Store.Path
     StorePath (..),
     storePathToFilePath,
     storePathToText,
+    isCanonicalStoreText,
+    storeTextToFilePath,
     parseStorePath,
     parseStorePathBaseName,
 
@@ -114,6 +116,29 @@ storePathToFilePath (StoreDir dir) sp =
 storePathToText :: StoreDir -> StorePath -> Text
 storePathToText (StoreDir dir) sp =
   T.pack dir <> "/" <> spHash sp <> "-" <> spName sp
+
+-- | Whether path text lies under the canonical store dir: exactly
+-- @\/nix\/store@, or @\/nix\/store@ followed by a separator of either
+-- spelling.  This is the spelling writers put into eval-visible values.
+isCanonicalStoreText :: Text -> Bool
+isCanonicalStoreText txt = case T.stripPrefix defaultStoreDirText txt of
+  Just rest -> case T.uncons rest of
+    Nothing -> True
+    Just (c, _) -> c == '/' || c == '\\'
+  Nothing -> False
+
+-- | Resolve path-value text to the filesystem location it names: text
+-- under the canonical store dir resolves into the platform store dir,
+-- and every other path is taken as written.  Writers emit the canonical
+-- spelling into eval values, so every reader that performs IO on a path
+-- value must resolve through this - on Windows the rooted @\/nix@ prefix
+-- would otherwise resolve against the working drive.  On Unix the two
+-- dirs coincide and this is 'T.unpack'.
+storeTextToFilePath :: Text -> FilePath
+storeTextToFilePath txt
+  | isCanonicalStoreText txt =
+      unStoreDir platformStoreDir <> T.unpack (T.drop (T.length defaultStoreDirText) txt)
+  | otherwise = T.unpack txt
 
 -- | Length of the Nix base-32 hash component in store paths (32 chars).
 storePathHashLen :: Int

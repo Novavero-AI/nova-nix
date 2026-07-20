@@ -174,10 +174,10 @@ instance MonadEval EvalIO where
       Left err@(NixEvalError ErrorUncatchable _) -> liftIO (throwIO err)
       Right val -> pure (Right val)
 
-  doesPathExist path = wrapIO (Dir.doesPathExist (T.unpack path))
+  doesPathExist path = wrapIO (Dir.doesPathExist (SP.storeTextToFilePath path))
 
   listDirectory path = wrapIO $ do
-    let dir = T.unpack path
+    let dir = SP.storeTextToFilePath path
     entries <- Dir.listDirectory dir
     mapM (classifyEntry dir) entries
 
@@ -185,20 +185,14 @@ instance MonadEval EvalIO where
     baseDir <- EvalIO (asks esBaseDir)
     timestamp <- EvalIO (asks esTimestamp)
     searchPaths <- EvalIO (asks esSearchPaths)
-    let raw = T.unpack rawPath
-        resolved = if isRelative raw then baseDir </> raw else raw
-    canonical <- wrapIO (Dir.canonicalizePath resolved)
-    -- Directory import: append /default.nix if target is a directory
-    target <- wrapIO $ do
-      isDir <- Dir.doesDirectoryExist canonical
-      pure (if isDir then canonical </> "default.nix" else canonical)
+    (target, ioTarget) <- resolveImportTarget baseDir rawPath
     -- Check import cache (readIORef cannot throw, no wrapIO needed)
     cacheRef <- EvalIO (asks esImportCache)
     cache <- EvalIO (liftIO (readIORef cacheRef))
     case Map.lookup target cache of
       Just cached -> pure cached
       Nothing -> do
-        source <- wrapIO (readFileAutoEncoding target)
+        source <- wrapIO (readFileAutoEncoding ioTarget)
         case parseNix (T.pack target) source of
           Left err ->
             throwEvalError
@@ -282,7 +276,7 @@ instance MonadEval EvalIO where
         case SP.checkStorePathName name of
           Left err -> throwEvalError (copyContext <> ": " <> SP.storePathNameErrorText err)
           Right () -> pure ()
-        entry <- wrapIO (NAR.serialiseFromPath (T.unpack rawPath))
+        entry <- wrapIO (NAR.serialiseFromPath (SP.storeTextToFilePath rawPath))
         let narDigest = sha256Digest (NAR.serialise entry)
         sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
         let spText = canonicalStorePathText sp
@@ -312,14 +306,8 @@ instance MonadEval EvalIO where
     baseDir <- EvalIO (asks esBaseDir)
     timestamp <- EvalIO (asks esTimestamp)
     searchPaths <- EvalIO (asks esSearchPaths)
-    let raw = T.unpack rawPath
-        resolved = if isRelative raw then baseDir </> raw else raw
-    canonical <- wrapIO (Dir.canonicalizePath resolved)
-    -- Directory import: append /default.nix if target is a directory
-    target <- wrapIO $ do
-      isDir <- Dir.doesDirectoryExist canonical
-      pure (if isDir then canonical </> "default.nix" else canonical)
-    source <- wrapIO (readFileAutoEncoding target)
+    (target, ioTarget) <- resolveImportTarget baseDir rawPath
+    source <- wrapIO (readFileAutoEncoding ioTarget)
     case parseNix (T.pack target) source of
       Left err ->
         throwEvalError
@@ -335,9 +323,9 @@ instance MonadEval EvalIO where
               (unEvalIO (eval scopedEnv expr))
           )
 
-  readFileBytes path = wrapIO (BS.readFile (T.unpack path))
+  readFileBytes path = wrapIO (BS.readFile (SP.storeTextToFilePath path))
 
-  getFileType path = wrapIO (classifyPath (T.unpack path))
+  getFileType path = wrapIO (classifyPath (SP.storeTextToFilePath path))
 
   runProcess cmd cmdArgs stdinText = wrapIO $ do
     let cp =
@@ -365,7 +353,7 @@ instance MonadEval EvalIO where
     -- existence check in copyToStoreIfMissing is sound - changed source
     -- content can never serve stale bytes from an earlier copy (the old
     -- scheme hashed the path STRING, so it did exactly that).
-    entry <- wrapIO (NAR.serialiseFromPath (T.unpack srcPath))
+    entry <- wrapIO (NAR.serialiseFromPath (SP.storeTextToFilePath srcPath))
     let narDigest = sha256Digest (NAR.serialise entry)
     case expectedSha256 of
       Just (subject, expected)
@@ -381,12 +369,12 @@ instance MonadEval EvalIO where
     sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
     let destFilePath = platformFilePath sp
         destPath = canonicalStorePathText sp
-    wrapIO (copyToStoreIfMissing (T.unpack srcPath) destFilePath (takeDirectory destFilePath))
+    wrapIO (copyToStoreIfMissing (SP.storeTextToFilePath srcPath) destFilePath (takeDirectory destFilePath))
     pure destPath
 
-  isExecutableFile path = wrapIO (Dir.executable <$> Dir.getPermissions (T.unpack path))
+  isExecutableFile path = wrapIO (Dir.executable <$> Dir.getPermissions (SP.storeTextToFilePath path))
 
-  readSymlinkTarget path = wrapIO (T.pack <$> Dir.getSymbolicLinkTarget (T.unpack path))
+  readSymlinkTarget path = wrapIO (T.pack <$> Dir.getSymbolicLinkTarget (SP.storeTextToFilePath path))
 
   addSourceNar name narBytes =
     case NAR.deserialise narBytes of
@@ -563,6 +551,34 @@ platformFilePath = SP.storePathToFilePath SP.platformStoreDir
 -- never names a location on disk.
 canonicalStorePathText :: SP.StorePath -> Text
 canonicalStorePathText = SP.storePathToText SP.defaultStoreDir
+
+-- | Resolve an import's raw path to the value-domain target (the import
+-- cache key, the parse name, and the base dir the file's relative path
+-- literals resolve against) and the filesystem location to read.
+--
+-- Store text stays canonical in the value domain: 'Dir.canonicalizePath'
+-- would attach the working drive to the rooted @/nix@ prefix on Windows,
+-- so store text gets lexical canonicalization ('canonPath') only, and
+-- its reads resolve through 'SP.storeTextToFilePath'.  Every other path
+-- resolves and canonicalizes as a platform path, where the two returned
+-- forms coincide.
+resolveImportTarget :: FilePath -> Text -> EvalIO (FilePath, FilePath)
+resolveImportTarget baseDir rawPath
+  | SP.isCanonicalStoreText rawPath = do
+      let valueBase = T.unpack (canonPath rawPath)
+      isDir <- wrapIO (Dir.doesDirectoryExist (SP.storeTextToFilePath (T.pack valueBase)))
+      -- The value-domain join stays "/" so the canonical spelling survives.
+      let valueTarget = if isDir then valueBase <> "/default.nix" else valueBase
+      pure (valueTarget, SP.storeTextToFilePath (T.pack valueTarget))
+  | otherwise = do
+      let raw = T.unpack rawPath
+          resolved = if isRelative raw then baseDir </> raw else raw
+      canonical <- wrapIO (Dir.canonicalizePath resolved)
+      -- Directory import: append /default.nix if target is a directory
+      target <- wrapIO $ do
+        isDir <- Dir.doesDirectoryExist canonical
+        pure (if isDir then canonical </> "default.nix" else canonical)
+      pure (target, target)
 
 -- | Classify a filesystem path as @"regular"@, @"directory"@, @"symlink"@,
 -- or @"unknown"@ - matching Nix's @builtins.readDir@ / @readFileType@.
