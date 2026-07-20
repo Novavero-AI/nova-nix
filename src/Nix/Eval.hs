@@ -80,7 +80,7 @@ import Data.Int (Int64)
 import Data.List (find, foldl', partition, sort)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -583,8 +583,7 @@ evalBcHasAttr env bcIdx0 = do
       (pathLen, pathOff) =
         unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg2 bcIdx0)
   targetVal <- evalBytecode env targetIdx
-  result <- walkBcAttrPath env pathLen pathOff targetVal
-  pure (VBool (isJust result))
+  VBool <$> hasBcAttrPath env pathLen pathOff targetVal
 
 -- | Collect static attribute path names for error reporting.
 collectBcAttrPathNames :: Int -> Word32 -> Text
@@ -597,32 +596,56 @@ collectBcAttrPathNames pathLen pathOff = T.intercalate "." (go pathLen pathOff)
           name = if isExpr /= 0 then "<expr>" else symbolText (Symbol keyVal)
        in name : go (n - 1) (off + 2)
 
+-- | Resolve one attr-path element (two words at @off@) to its key text.
+-- A dynamic key must produce a string - null included, as upstream's
+-- select and has-attr key coercion rejects null with a type error.
+resolveBcAttrKey :: (MonadEval m) => Env -> Word32 -> m Text
+resolveBcAttrKey env off = do
+  let isExpr = unsafePerformIO (cbcData off)
+      keyVal = unsafePerformIO (cbcData (off + 1))
+  if isExpr /= 0
+    then do
+      keyResult <- evalBytecode env keyVal
+      case keyResult of
+        VStr s _ -> decodedText "dynamic attribute key" s
+        _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName keyResult)
+    else pure (symbolText (Symbol keyVal))
+
 -- | Walk an attribute path stored in the bytecode data buffer.
--- Each element is two words: (is_expr, key_or_bc_idx).
+-- Each element is two words: (is_expr, key_or_bc_idx).  Every matched
+-- element is forced - select needs the terminal value, and the walk
+-- needs each intermediate to be a set.
 walkBcAttrPath :: (MonadEval m) => Env -> Int -> Word32 -> NixValue -> m (Maybe NixValue)
 walkBcAttrPath _ 0 _ val = pure (Just val)
 walkBcAttrPath env n off val = case val of
   VAttrs attrs -> do
-    let isExpr = unsafePerformIO (cbcData off)
-        keyVal = unsafePerformIO (cbcData (off + 1))
-    resolved <-
-      if isExpr /= 0
-        then do
-          keyResult <- evalBytecode env keyVal
-          case keyResult of
-            VStr s _ -> Just <$> decodedText "dynamic attribute key" s
-            VNull -> pure Nothing
-            _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName keyResult)
-        else pure (Just (symbolText (Symbol keyVal)))
-    case resolved >>= (`attrSetLookup` attrs) of
+    key <- resolveBcAttrKey env off
+    case attrSetLookup key attrs of
       Just thunk -> do
         inner <- force thunk
         walkBcAttrPath env (n - 1) (off + 2) inner
       Nothing -> pure Nothing
   -- Non-attrset: attribute path cannot continue.  Return Nothing so
-  -- that callers with a default (``a.b or def'') or hasAttr (``a ? b'')
-  -- can handle it gracefully, matching C++ Nix behaviour.
+  -- that callers with a default (``a.b or def'') can handle it
+  -- gracefully, matching C++ Nix behaviour.
   _ -> pure Nothing
+
+-- | Presence walk for has-attr: intermediates force (the walk must reach
+-- a set), but the terminal element is a membership check only - upstream
+-- ``a ? b.c`` never evaluates the final attribute's value.
+hasBcAttrPath :: (MonadEval m) => Env -> Int -> Word32 -> NixValue -> m Bool
+hasBcAttrPath _ 0 _ _ = pure True
+hasBcAttrPath env n off val = case val of
+  VAttrs attrs -> do
+    key <- resolveBcAttrKey env off
+    case attrSetLookup key attrs of
+      Just thunk
+        | n == 1 -> pure True
+        | otherwise -> do
+            inner <- force thunk
+            hasBcAttrPath env (n - 1) (off + 2) inner
+      Nothing -> pure False
+  _ -> pure False
 
 -- | Evaluate attribute set from bytecode.
 evalBcAttrs :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -2453,18 +2476,49 @@ builtinReplaceStrings ::
 builtinReplaceStrings (VList fromCl) (VList toCl) (VStr input inputCtx) = do
   let fromThunks = map Thunk (clistThunks fromCl)
       toThunks = map Thunk (clistThunks toCl)
-  froms <- mapM forceStr fromThunks
-  toStrs <- mapM forceStr toThunks
-  when (length froms /= length toStrs) $
+  when (length fromThunks /= length toThunks) $
     throwEvalError "builtins.replaceStrings: 'from' and 'to' must have the same length"
-  let fromTexts = map fst froms
-      toTexts = map fst toStrs
-      -- Nix semantics: input context + 'to' string contexts (not 'from').
-      -- Ideally only 'to' contexts for patterns that matched, but including
-      -- all 'to' contexts is the common implementation.
-      mergedCtx = inputCtx <> mconcat (map snd toStrs)
-      pairs = zip fromTexts toTexts
-  pure (VStr (replaceAll pairs input) mergedCtx)
+  froms <- mapM forceStr fromThunks
+  -- Match-gated replacement forcing, as upstream: a 'to' element is
+  -- forced - and its context joins the result - only the first time its
+  -- pattern matches, memoized per index.  An unmatched replacement is
+  -- never evaluated, so it may throw or diverge harmlessly.
+  --
+  -- Matching and stepping are byte-level, as upstream: an empty @from@
+  -- element inserts between BYTES, so a 2-byte character gets a
+  -- replacement inside it.  Chunks accumulate reversed, one BS.concat
+  -- at the end.
+  let rules = zip3 [0 :: Int ..] (map fst froms) toThunks
+      findRule txt =
+        listToMaybe [r | r@(_, from, _) <- rules, BS.null from || from `BS.isPrefixOf` txt]
+      forcedTo memo (i, _, toThunk) = case Map.lookup i memo of
+        Just hit -> pure (hit, memo)
+        Nothing -> do
+          forced <- forceStr toThunk
+          pure (forced, Map.insert i forced memo)
+      step remaining acc memo
+        | BS.null remaining = case findRule remaining of
+            -- At end of string, still check for an empty-from match.
+            Just rule -> do
+              ((to, _), advanced) <- forcedTo memo rule
+              pure (to : acc, advanced)
+            Nothing -> pure (acc, memo)
+        | otherwise = case findRule remaining of
+            Just rule@(_, from, _) -> do
+              ((to, _), advanced) <- forcedTo memo rule
+              if BS.null from
+                then case BS.uncons remaining of
+                  -- empty-from: insert replacement then advance ONE BYTE
+                  Just (byte, after) -> step after (BS.singleton byte : to : acc) advanced
+                  -- Unreachable: the null string is handled by the guard above.
+                  Nothing -> pure (to : acc, advanced)
+                else step (BS.drop (BS.length from) remaining) (to : acc) advanced
+            Nothing -> case BS.uncons remaining of
+              Just (byte, after) -> step after (BS.singleton byte : acc) memo
+              Nothing -> pure (acc, memo)
+  (revChunks, forcedTos) <- step input [] Map.empty
+  let mergedCtx = inputCtx <> mconcat (map snd (Map.elems forcedTos))
+  pure (VStr (BS.concat (reverse revChunks)) mergedCtx)
   where
     forceStr thunk = do
       val <- force thunk
@@ -2475,36 +2529,6 @@ builtinReplaceStrings _ _ (VStr _ _) =
   throwEvalError "builtins.replaceStrings: first two arguments must be lists"
 builtinReplaceStrings _ _ other =
   throwEvalError ("builtins.replaceStrings: expected a string, got " <> typeName other)
-
--- | Replace all occurrences, O(n) via chunk list + BS.concat.
--- Matching and stepping are byte-level, as upstream: an empty @from@
--- element inserts between BYTES, so a 2-byte character gets a
--- replacement inside it.
-replaceAll :: [(BS.ByteString, BS.ByteString)] -> BS.ByteString -> BS.ByteString
-replaceAll pairs input = BS.concat (go input)
-  where
-    go remaining
-      | BS.null remaining =
-          -- At end of string, still check for empty-from match
-          case findMatch pairs remaining of
-            Just (replacement, _, _) -> [replacement]
-            Nothing -> []
-      | otherwise = case findMatch pairs remaining of
-          Just (replacement, rest, matched) ->
-            if BS.null matched
-              then case BS.uncons remaining of
-                -- empty-from: insert replacement then advance ONE BYTE
-                Just (byte, after) -> replacement : BS.singleton byte : go after
-                Nothing -> [replacement]
-              else replacement : go rest
-          Nothing -> case BS.uncons remaining of
-            Just (byte, after) -> BS.singleton byte : go after
-            Nothing -> []
-    findMatch [] _ = Nothing
-    findMatch ((from, to) : rest) txt
-      | BS.null from = Just (to, txt, from)
-      | Just suffix <- BS.stripPrefix from txt = Just (to, suffix, from)
-      | otherwise = findMatch rest txt
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - regex (POSIX ERE via regex-tdfa)

@@ -194,9 +194,12 @@ nixCompare _ left right =
         <> typeName right
     )
 
--- | Lexicographic comparison of two thunk lists for the @<@ operator: the
--- first differing element decides; a proper prefix is less than the longer
--- list.  Mirrors 'listEqual'.
+-- | Lexicographic comparison of two thunk lists for the @<@ operator:
+-- the first NON-EQUAL element pair decides via @<@ on that pair, as
+-- upstream does (eqValues, then CompareValues on the first difference).
+-- An unequal pair where @<@ holds in neither direction (NaN) therefore
+-- decides False rather than being skipped as equal.  A proper prefix is
+-- less than the longer list.  Mirrors 'listEqual'.
 listCompare :: (MonadEval m) => Force m -> [Thunk] -> [Thunk] -> m Bool
 listCompare _ [] [] = pure False
 listCompare _ [] (_ : _) = pure True
@@ -206,12 +209,10 @@ listCompare forceFn (a : as) (b : bs)
   | otherwise = do
       va <- forceFn a
       vb <- forceFn b
-      ltAB <- nixCompare forceFn va vb
-      if ltAB
-        then pure True
-        else do
-          ltBA <- nixCompare forceFn vb va
-          if ltBA then pure False else listCompare forceFn as bs
+      equal <- nixEqual forceFn va vb
+      if equal
+        then listCompare forceFn as bs
+        else nixCompare forceFn va vb
 
 -- | Deep structural equality.  Forces thunks inside lists and
 -- attribute sets as needed.

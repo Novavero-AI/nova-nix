@@ -38,7 +38,7 @@ import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
-import Nix.Store (Store (..), closeStore, materializeEvalSources, openStore, queryAllValidPaths, writeDrv, writeDrvAterm)
+import Nix.Store (Store (..), closeStore, materializeEvalSources, openStore, queryAllValidPaths, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDir, storePathHashLen, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir)
@@ -498,17 +498,6 @@ failWith :: T.Text -> IO a
 failWith msg = do
   TIO.hPutStrLn stderr msg
   exitFailure
-
--- | Write every recorded @.drv@ ATerm (keyed by its store-path text) to the
--- store.  Keys come from evaluation via 'storePathToText' so they always parse;
--- an unparseable key is skipped defensively.
-writeDrvClosure :: Store -> Map.Map T.Text BS.ByteString -> IO ()
-writeDrvClosure store = mapM_ writeOne . Map.toList
-  where
-    writeOne (pathText, aterm) =
-      case parseStorePath defaultStoreDir pathText of
-        Just sp -> writeDrvAterm store sp aterm
-        Nothing -> pure ()
 
 -- ---------------------------------------------------------------------------
 -- Output formatting
