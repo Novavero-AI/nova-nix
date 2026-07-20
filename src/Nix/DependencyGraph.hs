@@ -180,16 +180,21 @@ decrementDependents dc = foldl' step (dc, [])
 
 -- | All transitive dependencies of a store path (not including itself).
 transitiveDeps :: DepGraph -> StorePath -> Set StorePath
-transitiveDeps (DepGraph graph) root = go Set.empty (Seq.singleton root)
+transitiveDeps (DepGraph graph) root =
+  Set.delete root (go (Set.singleton root) (Seq.singleton root))
   where
-    go visited queue = case Seq.viewl queue of
+    -- visited marks ENQUEUED nodes - the root is seeded, so a
+    -- self-dependent root is expanded once instead of recursing forever.
+    go !visited queue = case Seq.viewl queue of
       Seq.EmptyL -> visited
-      sp Seq.:< rest
-        | Set.member sp visited -> go visited rest
-        | otherwise ->
-            let deps = maybe [] dnDeps (Map.lookup sp graph)
-                visitedWithDep = if sp == root then visited else Set.insert sp visited
-             in go visitedWithDep (foldl' (|>) rest deps)
+      sp Seq.:< rest ->
+        enqueueFresh visited rest (maybe [] dnDeps (Map.lookup sp graph))
+    -- Mark and enqueue each dep not yet seen, then continue the walk.
+    enqueueFresh !visited !queue deps = case deps of
+      [] -> go visited queue
+      (dep : more)
+        | Set.member dep visited -> enqueueFresh visited queue more
+        | otherwise -> enqueueFresh (Set.insert dep visited) (queue |> dep) more
 
 -- | Direct dependencies of a store path.
 directDeps :: DepGraph -> StorePath -> [StorePath]

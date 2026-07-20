@@ -7,12 +7,13 @@ module Main (main) where
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
-import Control.Exception (SomeException, bracket_, try)
+import Control.Exception (SomeException, bracket_, evaluate, try)
 import Control.Monad (filterM, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.List (foldl')
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Set as Set
@@ -24,8 +25,8 @@ import qualified Data.Text.IO as TIO
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig, verifyFetchHash)
-import Nix.Builder.Unpack (builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
-import Nix.Builtins (builtinEnv, parseNixPath)
+import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
+import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm, toATermForHash)
 import Nix.Eval (MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
@@ -46,7 +47,7 @@ import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
+import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
@@ -875,6 +876,57 @@ testLexer = do
       runTest "subnormal float literal survives" $
         assertRight "lex float-subnormal" (tokenize "<test>" "1.0e-320") $ \toks ->
           assertEqual "tokens" [TokFloat 1.0e-320] (tokenTypes toks),
+      -- Bounded number lexing: a literal's cost must follow its length,
+      -- never its exponent's magnitude, and megadigit literals must
+      -- resolve promptly.  The watchdog turns a cost regression into a
+      -- FAIL instead of a stuck suite; the checks force full values.
+      runTestM "huge positive exponent saturates to Infinity" $ do
+        let saturated = case tokenize "<test>" "1.0e999999999" of
+              Right toks | [TokFloat f] <- tokenTypes toks -> isInfinite f && f > 0
+              _ -> False
+        outcome <- timeout walkWatchdogMicros (evaluate saturated)
+        pure $ case outcome of
+          Just True -> Pass
+          Just False -> Fail "wrong tokens for a huge positive exponent"
+          Nothing -> Fail "lexing did not return promptly",
+      runTestM "huge negative exponent saturates to zero" $ do
+        let flushed = case tokenize "<test>" "1.0e-999999999" of
+              Right toks -> tokenTypes toks == [TokFloat 0.0]
+              Left _ -> False
+        outcome <- timeout walkWatchdogMicros (evaluate flushed)
+        pure $ case outcome of
+          Just True -> Pass
+          Just False -> Fail "wrong tokens for a huge negative exponent"
+          Nothing -> Fail "lexing did not return promptly",
+      runTestM "zero mantissa ignores a huge exponent" $ do
+        let zeroed = case tokenize "<test>" "0.0e999999999" of
+              Right toks -> tokenTypes toks == [TokFloat 0.0]
+              Left _ -> False
+        outcome <- timeout walkWatchdogMicros (evaluate zeroed)
+        pure $ case outcome of
+          Just True -> Pass
+          Just False -> Fail "wrong tokens for a zero mantissa"
+          Nothing -> Fail "lexing did not return promptly",
+      runTestM "megadigit integer literal rejects promptly" $ do
+        let rejected = case tokenize "<test>" (T.replicate 1000000 "9") of
+              Left _ -> True
+              Right _ -> False
+        outcome <- timeout walkWatchdogMicros (evaluate rejected)
+        pure $ case outcome of
+          Just True -> Pass
+          Just False -> Fail "megadigit literal was not rejected"
+          Nothing -> Fail "range rejection did not return promptly",
+      runTestM "megadigit mantissa still rounds correctly" $ do
+        -- 1.999...9e5 sits within half an ulp of 200000.0; the kept-768
+        -- digits plus the sticky digit must round it there.
+        let rounded = case tokenize "<test>" ("1." <> T.replicate 1000000 "9" <> "e5") of
+              Right toks -> tokenTypes toks == [TokFloat 200000.0]
+              Left _ -> False
+        outcome <- timeout walkWatchdogMicros (evaluate rounded)
+        pure $ case outcome of
+          Just True -> Pass
+          Just False -> Fail "wrong rounding for a megadigit mantissa"
+          Nothing -> Fail "lexing did not return promptly",
       runTest "true" $
         assertRight "lex true" (tokenize "<test>" "true") $ \toks ->
           assertEqual "tokens" [TokTrue] (tokenTypes toks),
@@ -2744,6 +2796,11 @@ testDepGraph = do
         | sp == spB = Right drvBCycle
         | sp == spA = Right drvACycle
         | otherwise = Left ("unknown drv: " <> spName sp)
+      -- Self-loop: A depends on itself
+      drvSelf = baseDrv {drvInputDrvs = Map.singleton spA ["out"]}
+      readSelf sp
+        | sp == spA = Right drvSelf
+        | otherwise = Left ("unknown drv: " <> spName sp)
   sequence
     [ -- Single node
       runTest "single node graph" $ case DepGraph.buildDepGraph readSingle drvA spA of
@@ -2802,12 +2859,47 @@ testDepGraph = do
           DepGraph.TopoSorted order ->
             Fail ("cyclic graph topo-sorted as " <> T.pack (show (length order)) <> " nodes")
         -- A loud rejection at graph-build time also counts as detection.
-        Left _ -> Pass
+        Left _ -> Pass,
+      -- A root that depends on itself: the walk marks the root visited
+      -- on enqueue, so it terminates - and per contract the result
+      -- excludes the root, leaving nothing.
+      runTestM "transitiveDeps terminates on a self-loop" $ do
+        outcome <-
+          timeout walkWatchdogMicros $
+            evaluate $ case DepGraph.buildDepGraph readSelf drvSelf spA of
+              Left _ -> Nothing
+              Right graph -> Just $! DepGraph.transitiveDeps graph spA
+        pure $ case outcome of
+          Nothing -> Fail "did not terminate on a self-loop"
+          Just Nothing -> Fail "graph build failed"
+          Just (Just deps) -> assertEqual "self-loop deps" Set.empty deps,
+      -- A two-node cycle already terminated; pin that the root stays
+      -- excluded from its own transitive closure.
+      runTestM "transitiveDeps two-node cycle excludes the root" $ do
+        outcome <-
+          timeout walkWatchdogMicros $
+            evaluate $ case DepGraph.buildDepGraph readCycle drvACycle spA of
+              Left _ -> Nothing
+              Right graph -> Just $! DepGraph.transitiveDeps graph spA
+        pure $ case outcome of
+          Nothing -> Fail "did not terminate on a cycle"
+          Just Nothing -> Fail "graph build failed"
+          Just (Just deps) -> assertEqual "cycle deps" (Set.singleton spB) deps
     ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Substituter (Phase 3, Batch 6)
 -- ---------------------------------------------------------------------------
+
+-- | A fake HTTP body reader: yields the given chunks, then empty
+-- forever (an HTTP BodyReader is just an IO ByteString).
+chunkReader :: [BS.ByteString] -> IO (IO BS.ByteString)
+chunkReader chunks = do
+  ref <- newIORef chunks
+  pure $
+    atomicModifyIORef' ref $ \case
+      [] -> ([], BS.empty)
+      (c : cs) -> (cs, c)
 
 testSubstituter :: IO [Bool]
 testSubstituter = do
@@ -2828,6 +2920,21 @@ testSubstituter = do
       -- sortCaches: empty list
       runTest "sortCaches empty" $
         assertEqual "empty-sort" [] (Subst.sortCaches []),
+      -- readBodyCapped: the client-side body cap (mirror of the server's
+      -- readBodyLimited).  A body reader is just IO ByteString yielding
+      -- chunks then empty.
+      runTestM "readBodyCapped concatenates under the cap" $ do
+        reader <- chunkReader ["abc", "def", "g"]
+        body <- Subst.readBodyCapped 10 reader
+        pure (assertEqual "under cap" (Just "abcdefg") body),
+      runTestM "readBodyCapped allows exactly the cap" $ do
+        reader <- chunkReader ["abcde", "fghij"]
+        body <- Subst.readBodyCapped 10 reader
+        pure (assertEqual "at cap" (Just "abcdefghij") body),
+      runTestM "readBodyCapped aborts past the cap" $ do
+        reader <- chunkReader ["abcdef", "ghijkl"]
+        body <- Subst.readBodyCapped 10 reader
+        pure (assertEqual "over cap" Nothing body),
       -- decompressorFor decides support from the narinfo value alone,
       -- so unsupported compression rejects before any NAR download.
       runTest "decompressorFor rejects xz up front" $
@@ -3827,6 +3934,9 @@ testUnpackBuildIO = do
           archiveDirLinkBase = workDir </> "pkg-dirlink-base.tar.zst"
           archiveDirLinkCollide = workDir </> "pkg-dirlink-collide.tar.zst"
           archiveHardLinkCollide = workDir </> "pkg-hardlink-collide.tar.zst"
+          archiveManyEntries = workDir </> "pkg-many-entries.tar.zst"
+          archiveBigFile = workDir </> "pkg-big-file.tar.zst"
+          archiveAmplify = workDir </> "pkg-amplify.tar.zst"
       BL.writeFile archiveTools $
         compressArchive
           [ tarDir "pkg",
@@ -3885,6 +3995,20 @@ testUnpackBuildIO = do
             tarFile "smuggle/extra.txt" "smuggled",
             tarHardLink "pkg" "smuggle"
           ]
+      -- Budget probes, built against tiny caps injected via BuildConfig.
+      BL.writeFile archiveManyEntries $
+        compressArchive [tarFile ("e" <> show i <> ".txt") "x" | i <- [1 :: Int .. 6]]
+      BL.writeFile archiveBigFile $
+        compressArchive [tarFile "big.bin" (BL.replicate 100 55)]
+      -- Two directory symlinks each re-copy the 40-byte payload: the
+      -- copies must charge the budget like first-class content.
+      BL.writeFile archiveAmplify $
+        compressArchive
+          [ tarDir "base",
+            tarFile "base/blob.bin" (BL.replicate 40 55),
+            tarSymLink "dup1" "base",
+            tarSymLink "dup2" "base"
+          ]
       let mkUnpackDrv outP srcFiles =
             Derivation
               { drvOutputs =
@@ -3913,6 +4037,9 @@ testUnpackBuildIO = do
           dirLinkOut = StorePath (T.replicate 31 "0" <> "8") "unpack-dirlink"
           dirLinkCollideOut = StorePath (T.replicate 31 "0" <> "9") "unpack-dirlink-collide"
           hardLinkCollideOut = StorePath (T.replicate 30 "0" <> "10") "unpack-hardlink-collide"
+          manyEntriesOut = StorePath (T.replicate 30 "0" <> "11") "unpack-entry-budget"
+          bigFileOut = StorePath (T.replicate 30 "0" <> "12") "unpack-size-budget"
+          amplifyOut = StorePath (T.replicate 30 "0" <> "13") "unpack-amplify-budget"
       buildTmp <- (</> "nova-nix-test-unpack-build-tmp") <$> getTemporaryDirectory
       forceRemoveIfExists buildTmp
       createDirectoryIfMissing True buildTmp
@@ -3926,6 +4053,11 @@ testUnpackBuildIO = do
       dirLinkResult <- buildDerivation config store (mkUnpackDrv dirLinkOut [archiveDirLink])
       dirLinkCollideResult <- buildDerivation config store (mkUnpackDrv dirLinkCollideOut [archiveDirLinkBase, archiveDirLinkCollide])
       hardLinkCollideResult <- buildDerivation config store (mkUnpackDrv hardLinkCollideOut [archiveDirLinkBase, archiveHardLinkCollide])
+      let tinyBudget bytes entries =
+            config {bcUnpackLimits = UnpackLimits {ulMaxBytes = bytes, ulMaxEntries = entries}}
+      manyEntriesResult <- buildDerivation (tinyBudget 1000000 4) store (mkUnpackDrv manyEntriesOut [archiveManyEntries])
+      bigFileResult <- buildDerivation (tinyBudget 64 1000) store (mkUnpackDrv bigFileOut [archiveBigFile])
+      amplifyResult <- buildDerivation (tinyBudget 100 1000) store (mkUnpackDrv amplifyOut [archiveAmplify])
       forceRemoveIfExists buildTmp
       forceRemoveIfExists workDir
       seedChecks <- case seedResult of
@@ -4038,6 +4170,15 @@ testUnpackBuildIO = do
             runTest "unpack: directory hardlink onto existing content fails loudly" $
               rejectedWith "file collision" hardLinkCollideResult
           ]
+      budgetChecks <-
+        sequence
+          [ runTest "unpack: entry budget breach fails loudly" $
+              rejectedWith "entry budget" manyEntriesResult,
+            runTest "unpack: size budget breach fails loudly" $
+              rejectedWith "size budget" bigFileResult,
+            runTest "unpack: directory link copies charge the budget" $
+              rejectedWith "size budget" amplifyResult
+          ]
       -- Unit: the rooted (drive-relative) case is the Blocker-4 Windows vuln.
       -- tar's toLinkTarget refuses an absolute payload on POSIX, so exercise the
       -- guard predicate directly - portable and exact on every host.
@@ -4050,7 +4191,7 @@ testUnpackBuildIO = do
             runTest "unpack guard: rooted hardlink target rejected" $
               assertLeft "rooted hardlink" (entryComponents "/planted-hardlink-target.txt")
           ]
-      pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ dirLinkChecks ++ collisionGuardChecks ++ guardChecks)
+      pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ dirLinkChecks ++ collisionGuardChecks ++ budgetChecks ++ guardChecks)
 
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
 -- derivation depends on a leaf; both @.drv@ files are pre-written to the store
@@ -4464,7 +4605,22 @@ testHashHelpers :: IO [Bool]
 testHashHelpers = do
   putStrLn "hash/decode-helpers"
   sequence
-    [ runTest "hexToBytes empty" $ assertEqual "empty" (Just BS.empty) (Hash.hexToBytes ""),
+    [ -- The incremental digest is the streaming twin of the one-shot:
+      -- chunked input must produce identical bytes for every algorithm.
+      runTest "incremental digest matches one-shot across algorithms" $
+        let chunks = ["nova", "-", "nix", " streams", BS.replicate 1000 55]
+            agrees algo = case (Hash.hashInitWithAlgo algo, Hash.rawHashWithAlgo algo (BS.concat chunks)) of
+              (Just ctx0, Just expected) ->
+                Hash.hashFinalizeBytes (foldl' Hash.hashUpdateChunk ctx0 chunks) == expected
+              _ -> False
+         in if all agrees ["sha256", "sha512", "sha1", "md5"]
+              then Pass
+              else Fail "incremental and one-shot digests disagree",
+      runTest "incremental digest rejects an unknown algorithm" $
+        case Hash.hashInitWithAlgo "blake3" of
+          Nothing -> Pass
+          Just _ -> Fail "unknown algorithm accepted",
+      runTest "hexToBytes empty" $ assertEqual "empty" (Just BS.empty) (Hash.hexToBytes ""),
       runTest "hexToBytes deadbeef" $
         assertEqual "deadbeef" (Just (BS.pack [0xde, 0xad, 0xbe, 0xef])) (Hash.hexToBytes "deadbeef"),
       runTest "hexToBytes uppercase" $
@@ -4633,7 +4789,34 @@ testFromTOML :: IO [Bool]
 testFromTOML = do
   putStrLn "eval/fromTOML"
   sequence
-    [ runTest "multi-line array" $
+    [ -- Key splitting and logical-line joining accumulate in chunks, so
+      -- cost is linear in the input (per-character/per-line append was
+      -- quadratic).  The watchdog turns a cost regression into a FAIL
+      -- rather than a stuck suite.
+      runTestM "fromTOML long key parses in linear time" $ do
+        let source =
+              "builtins.length (builtins.attrNames (builtins.fromTOML \""
+                <> T.replicate 200000 "k"
+                <> " = 1\"))"
+            counted = evalNix source == Right (VInt 1)
+        outcome <- timeout walkWatchdogMicros (evaluate counted)
+        pure $ case outcome of
+          Just True -> Pass
+          Just False -> Fail "wrong parse for a long key"
+          Nothing -> Fail "long key did not parse promptly",
+      runTestM "fromTOML many continued lines join in linear time" $ do
+        -- 4000 physical lines of 50 elements each: one ~400KB logical
+        -- line, one 200000-element array.
+        let line = T.intercalate " " (replicate 50 "1,")
+            body = "x = [\n" <> T.intercalate "\n" (replicate 4000 line) <> "\n]"
+            source = "builtins.length (builtins.fromTOML \"" <> body <> "\").x"
+            counted = evalNix source == Right (VInt 200000)
+        outcome <- timeout walkWatchdogMicros (evaluate counted)
+        pure $ case outcome of
+          Just True -> Pass
+          Just False -> Fail "wrong parse for continued lines"
+          Nothing -> Fail "continued lines did not join promptly",
+      runTest "multi-line array" $
         assertEval
           "toml-ml-array"
           "builtins.concatStringsSep \",\" (builtins.fromTOML \"deps = [\\n \\\"bar\\\",\\n \\\"baz\\\",\\n]\\n\").deps"
@@ -5055,6 +5238,65 @@ testSymlinkWalksIO = do
                         <> T.pack (show relTarget)
                     )
         ]
+
+-- | Pure ordering for the store's symlink second pass: each link
+-- follows the pending links its target resolves at or through, and
+-- cycle members fall out at the end in input order.
+testLinkOrdering :: IO [Bool]
+testLinkOrdering = do
+  putStrLn "store/link-ordering"
+  let root = "out"
+  sequence
+    [ runTest "chain orders targets first" $
+        let pending = [(root </> "l1", "l2"), (root </> "l2", "l3"), (root </> "l3", "real")]
+         in assertEqual
+              "chain"
+              [root </> "l3", root </> "l2", root </> "l1"]
+              (map fst (orderLinks pending)),
+      runTest "already-ordered chain is stable" $
+        let pending = [(root </> "l3", "real"), (root </> "l2", "l3"), (root </> "l1", "l2")]
+         in assertEqual
+              "stable"
+              [root </> "l3", root </> "l2", root </> "l1"]
+              (map fst (orderLinks pending)),
+      runTest "link through a linked directory follows it" $
+        let pending = [(root </> "a", "dirlink/x"), (root </> "dirlink", "realdir")]
+         in assertEqual
+              "through-dir"
+              [root </> "dirlink", root </> "a"]
+              (map fst (orderLinks pending)),
+      runTest "parent-relative target orders after its link" $
+        let pending = [(root </> "sub" </> "l", "../other"), (root </> "other", "real")]
+         in assertEqual
+              "dotdot"
+              [root </> "other", root </> "sub" </> "l"]
+              (map fst (orderLinks pending)),
+      runTest "cycle members keep input order at the end" $
+        let pending = [(root </> "a", "b"), (root </> "b", "a"), (root </> "c", "real")]
+         in assertEqual
+              "cycle"
+              [root </> "c", root </> "a", root </> "b"]
+              (map fst (orderLinks pending)),
+      runTest "self-target link survives to the fallback" $
+        assertEqual
+          "self"
+          [root </> "x"]
+          (map fst (orderLinks [(root </> "x", "x")])),
+      runTestM "long chain orders in linear time" $ do
+        -- 20000 links each targeting the next: the ready-set rounds
+        -- this replaced were quadratic here.
+        let chain =
+              [ (root </> ("l" <> show i), T.pack ("l" <> show (i + 1)))
+              | i <- [1 :: Int .. 20000]
+              ]
+                ++ [(root </> "l20001", "real")]
+            complete = length (orderLinks chain) == length chain
+        outcome <- timeout walkWatchdogMicros (evaluate complete)
+        pure $ case outcome of
+          Just True -> Pass
+          Just False -> Fail "ordering dropped links"
+          Nothing -> Fail "ordering did not return promptly"
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: fromATerm + Derivation Output Population (Phase 2, Batch 3)
@@ -5672,6 +5914,23 @@ testPhase4 = do
               _ -> Fail ("expected one entry, got " <> T.pack (show (length result))),
       runTest "parseNixPath multiple" $
         assertEqual "count" 2 (length (parseNixPath "nixpkgs=/nix:custom=/opt")),
+      runTest "splitNixPath drive letters and separators" $
+        assertEqual
+          "split"
+          ["nixpkgs=C:\\nixpkgs", "custom=/opt/custom", "C:/x"]
+          (splitNixPath "nixpkgs=C:\\nixpkgs:custom=/opt/custom:C:/x"),
+      runTest "splitNixPath keeps interior empty entries" $
+        assertEqual "split-empty" ["a", "", "b"] (splitNixPath "a::b"),
+      runTest "splitNixPath drops a trailing empty entry" $
+        assertEqual "split-trail" ["a"] (splitNixPath "a:"),
+      runTestM "splitNixPath long entry splits in linear time" $ do
+        let entry = T.replicate 2000000 "p"
+            split = splitNixPath ("first:" <> entry) == ["first", entry]
+        outcome <- timeout walkWatchdogMicros (evaluate split)
+        pure $ case outcome of
+          Just True -> Pass
+          Just False -> Fail "wrong split for a long entry"
+          Nothing -> Fail "split did not return promptly",
       runTest "parseNixPath plain path" $
         let result = parseNixPath "/some/path"
          in case result of
@@ -7374,6 +7633,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testParseStorePath,
           testStoreOps,
           testSymlinkWalksIO,
+          testLinkOrdering,
           testFromATerm,
           testBuilder,
           testE2E,

@@ -577,8 +577,10 @@ lexNumber st acc =
            in lexNormalMode newSt (tok : acc)
         _
           -- C++ Nix rejects out-of-range integer literals rather than
-          -- silently wrapping modulo 2^64.
-          | readInteger digits > toInteger (maxBound :: Int64) ->
+          -- silently wrapping modulo 2^64.  Range is decided by digit
+          -- count first: 'readInteger' is quadratic in the digit count,
+          -- and the guard must not pay that on input it rejects.
+          | not (integerLiteralInRange digits) ->
               Left
                 ParseError
                   { peFile = lsFile st,
@@ -596,6 +598,20 @@ lexNumber st acc =
 readInteger :: Text -> Integer
 readInteger = T.foldl' (\n c -> n * decimalBase + fromIntegral (fromEnum c - zeroOrd)) 0
 
+-- | Digit count of @maxBound :: Int64@ (9223372036854775807).  A literal
+-- with more significant digits is out of range on count alone.
+int64MaxDigits :: Int
+int64MaxDigits = 19
+
+-- | Whether an all-digit literal fits 'Int64', decided by significant
+-- digit count before any bignum is built.
+integerLiteralInRange :: Text -> Bool
+integerLiteralInRange digits =
+  let significant = T.dropWhile (== '0') digits
+      count = T.length significant
+   in count < int64MaxDigits
+        || (count == int64MaxDigits && readInteger significant <= toInteger (maxBound :: Int64))
+
 -- | Read a floating-point literal from its integer, decimal, and exponent
 -- parts.  The digits form one exact 'Rational' scaled by the exponent, and
 -- 'fromRational' rounds once - the correctly-rounded conversion C++ Nix
@@ -603,11 +619,62 @@ readInteger = T.foldl' (\n c -> n * decimalBase + fromIntegral (fromEnum c - zer
 -- and exponent steps separately drifts an ulp from upstream on long
 -- literals and flushes subnormals (e.g. 1.0e-320) to zero.  Total - no
 -- 'read', no exceptions.
+--
+-- The exact path runs only within double's decimal range: @10 ^^ scale@
+-- materializes a bignum of |scale| digits, so the cost must follow the
+-- literal's length, never the exponent's magnitude (@1.0e999999999@
+-- would otherwise build a gigabyte of Rational).  A scale provably past
+-- the overflow bound saturates to Infinity and past the underflow bound
+-- to 0.0 - the values strtod rounds such literals to.  Mantissas keep
+-- 'mantissaDigitBound' significant digits, a dropped nonzero tail
+-- standing in as one sticky digit; past that bound the tail cannot
+-- change the correctly-rounded result.
 readDouble :: Text -> Text -> Integer -> Double
-readDouble intPart decPart expVal =
-  let mantissa = readInteger (intPart <> decPart)
-      scale = expVal - toInteger (T.length decPart)
-   in fromRational (toRational mantissa * fromInteger decimalBase ^^ scale)
+readDouble intPart decPart expVal
+  | T.null significantAll = 0.0
+  | overflows = positiveInfinity
+  | underflows = 0.0
+  | otherwise = fromRational (toRational mantissa * fromInteger decimalBase ^^ scale)
+  where
+    significantAll = T.dropWhile (== '0') (intPart <> decPart)
+    truncated = T.length significantAll > mantissaDigitBound
+    (keptDigits, droppedTail) = T.splitAt mantissaDigitBound significantAll
+    stickyDigit = if T.any (/= '0') droppedTail then "1" else "0"
+    mantissaText = if truncated then keptDigits <> stickyDigit else significantAll
+    mantissa = readInteger mantissaText
+    -- Each dropped tail digit shifts the represented value's scale up by
+    -- one; the appended sticky digit takes the place of the last one.
+    droppedCount = if truncated then T.length droppedTail - 1 else 0
+    scale = expVal - toInteger (T.length decPart) + toInteger droppedCount
+    -- mantissa has exactly digitCount digits (leading digit nonzero), so
+    -- the value lies in [10^(digitCount-1+scale), 10^(digitCount+scale)).
+    digitCount = toInteger (T.length mantissaText)
+    overflows = digitCount - 1 + scale >= doubleOverflowExp10
+    underflows = digitCount + scale <= doubleUnderflowExp10
+
+-- | Significant decimal digits kept of a float mantissa.  Correctly
+-- rounding binary64 never needs more than 767 significant digits (the
+-- longest exactly-representable double and every rounding midpoint fit
+-- in 767), so with one sticky digit for the dropped tail, 768 kept
+-- digits decide every rounding exactly as the full literal would.
+mantissaDigitBound :: Int
+mantissaDigitBound = 768
+
+-- | Any value at or above 10^309 exceeds double's maximum (~1.798e308)
+-- and rounds to Infinity.
+doubleOverflowExp10 :: Integer
+doubleOverflowExp10 = 309
+
+-- | Any value below 10^-324 is under half the smallest denormal
+-- (~4.94e-324) and rounds to 0.0.
+doubleUnderflowExp10 :: Integer
+doubleUnderflowExp10 = -324
+
+-- | IEEE positive infinity, strtod's overflow result.  Float literals
+-- are unsigned at the lexer (minus is an operator), so only the
+-- positive infinity is ever produced.
+positiveInfinity :: Double
+positiveInfinity = 1 / 0
 
 -- | Consume an optional exponent @[eE][+-]?[0-9]+@ after a float's digits.
 -- Returns the signed exponent, the remaining input, and the characters
@@ -625,8 +692,31 @@ lexExponent input =
               (expDigits, afterExp) = T.span isDigit afterSign
            in if T.null expDigits
                 then (0, input, 0)
-                else (sign * readInteger expDigits, afterExp, 1 + signLen + T.length expDigits)
+                else (sign * exponentMagnitude expDigits, afterExp, 1 + signLen + T.length expDigits)
     _ -> (0, input, 0)
+
+-- | The magnitude of an exponent's digit run.  Reading n digits builds
+-- an n-digit bignum quadratically, so runs past 'exponentDigitBound'
+-- saturate to a stand-in already so far outside double's range that
+-- 'readDouble' collapses it to the same Infinity or 0.0 the exact
+-- exponent would round to.
+exponentMagnitude :: Text -> Integer
+exponentMagnitude expDigits =
+  let significant = T.dropWhile (== '0') expDigits
+   in if T.length significant > exponentDigitBound
+        then saturatedExponent
+        else readInteger significant
+
+-- | Exponent digit runs past this bound saturate (see
+-- 'exponentMagnitude').
+exponentDigitBound :: Int
+exponentDigitBound = 18
+
+-- | Stand-in exponent magnitude past 'exponentDigitBound': any exponent
+-- with more significant digits is at least 10^18, and double's whole
+-- decimal range spans only around 10^+-324.
+saturatedExponent :: Integer
+saturatedExponent = 10 ^ (18 :: Int)
 
 -- | Lex a leading-dot float like @.5@ or @.5e3@ (Nix's @0?\\.[0-9]+@ form).
 -- The current input begins with the @.@.

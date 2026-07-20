@@ -48,7 +48,6 @@ where
 import Control.Exception (IOException, SomeException, displayException, finally, try)
 import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy as LBS
 import Data.Char (toLower)
 import Data.Either (fromRight)
 import Data.Map.Strict (Map)
@@ -62,11 +61,11 @@ import qualified Data.Text.IO as TIO
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder.Unpack (builtinUnpackBuilder, runBuiltinUnpack)
+import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
-import Nix.Hash (bytesToHexText, hexToBytes, rawHashWithAlgo)
+import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
 import Nix.Store (PathRegistration, Store (..), isValid, placeInStore, registerPaths, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
@@ -149,7 +148,9 @@ data BuildConfig = BuildConfig
     -- | Enable sandboxing (not yet implemented on Windows).
     bcSandbox :: !Bool,
     -- | Binary caches to try before building (checked in priority order).
-    bcCaches :: ![CacheConfig]
+    bcCaches :: ![CacheConfig],
+    -- | Extraction budget for @builtin:unpack@ builds.
+    bcUnpackLimits :: !UnpackLimits
   }
   deriving (Eq, Show)
 
@@ -167,7 +168,8 @@ defaultBuildConfig dir =
           then "bash" -- rely on PATH (MSYS2/Git Bash)
           else "/bin/bash",
       bcSandbox = False,
-      bcCaches = []
+      bcCaches = [],
+      bcUnpackLimits = defaultUnpackLimits
     }
 
 -- | Result of a build attempt.
@@ -227,7 +229,7 @@ buildDerivationInner config store drv = do
         exitResult <- case drvBuilder drv of
           b
             | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
-            | b == builtinUnpackBuilder -> runBuiltinUnpack drv outputDirs
+            | b == builtinUnpackBuilder -> runBuiltinUnpack (bcUnpackLimits config) drv outputDirs
           _ -> case decodeBuilderStrings drv of
             Left errMsg -> pure (Left (1, errMsg))
             Right (builderText, argTexts, decodedEnv) ->
@@ -492,13 +494,19 @@ runBuiltinFetchurl drv outputDirs =
     (_, _, Nothing) -> pure (Left (1, "builtin:fetchurl: 'out' output has no fixed-output hash"))
     (Just urlBytes, Just outPath, Just out) -> case TE.decodeUtf8' urlBytes of
       Left _ -> pure (Left (1, "builtin:fetchurl: 'url' contains invalid UTF-8"))
-      Right url -> do
-        downloaded <- downloadUrl url
-        case downloaded of
-          Left err -> pure (Left (1, "builtin:fetchurl: " <> err))
-          Right body -> do
-            BS.writeFile outPath body
-            pure (verifyFetchHash url out body)
+      Right url
+        -- Mode and algorithm reject before any network traffic.
+        | recursive -> pure (Left (1, recursiveUnsupportedMessage))
+        | otherwise -> case hashInitWithAlgo algo of
+            Nothing ->
+              pure (Left (1, "builtin:fetchurl: unsupported hash algorithm '" <> algo <> "'"))
+            Just ctx -> do
+              downloaded <- downloadUrlTo url outPath ctx
+              case downloaded of
+                Left err -> pure (Left (1, "builtin:fetchurl: " <> err))
+                Right digest -> pure (verifyFetchedDigest url out digest)
+        where
+          (recursive, algo) = splitHashMode (doHashAlgo out)
   where
     -- builtin:fetchurl derivations are always fixed-output; the expected hash
     -- lives in the canonical output spec (doHashAlgo + doHash), not the env.
@@ -506,12 +514,15 @@ runBuiltinFetchurl drv outputDirs =
       (out : _) | not (T.null (doHashAlgo out)) -> Just out
       _ -> Nothing
 
--- | Download a URL to a strict 'BS.ByteString' using nova-nix's own linked
--- HTTP client (the same 'Network.HTTP.Client' the substituter uses) - no
--- external @curl@, which is what makes this a genuine builtin.  Any network
--- exception is turned into a 'Left' so it becomes a clean build failure.
-downloadUrl :: Text -> IO (Either Text BS.ByteString)
-downloadUrl url = do
+-- | Download a URL to a file using nova-nix's own linked HTTP client
+-- (the same 'Network.HTTP.Client' the substituter uses) - no external
+-- @curl@, which is what makes this a genuine builtin.  The body streams
+-- to disk through the incremental hash chunk by chunk, so memory stays
+-- at chunk size no matter the download's size, and the returned digest
+-- is of exactly the written bytes.  Any network exception is turned
+-- into a 'Left' so it becomes a clean build failure.
+downloadUrlTo :: Text -> FilePath -> IncrementalHash -> IO (Either Text BS.ByteString)
+downloadUrlTo url outPath ctx0 = do
   attempt <- try fetch
   pure $ case attempt of
     Left (e :: SomeException) -> Left ("download error: " <> T.pack (show e))
@@ -522,13 +533,19 @@ downloadUrl url = do
       manager <- HTTP.newManager HTTPS.tlsManagerSettings
       request0 <- HTTP.parseRequest (T.unpack url)
       let request = request0 {HTTP.requestHeaders = ("User-Agent", fetchUserAgent) : HTTP.requestHeaders request0}
-      response <- HTTP.httpLbs request manager
-      pure (bodyOrError response)
-    bodyOrError response
-      | code == httpStatusOk = Right (LBS.toStrict (HTTP.responseBody response))
-      | otherwise = Left ("HTTP " <> T.pack (show code) <> " fetching " <> url)
-      where
-        code = HTTP.statusCode (HTTP.responseStatus response)
+      HTTP.withResponse request manager $ \response -> do
+        let code = HTTP.statusCode (HTTP.responseStatus response)
+        if code /= httpStatusOk
+          then pure (Left ("HTTP " <> T.pack (show code) <> " fetching " <> url))
+          else System.IO.withBinaryFile outPath System.IO.WriteMode $ \handle ->
+            let consume !ctx = do
+                  chunk <- HTTP.brRead (HTTP.responseBody response)
+                  if BS.null chunk
+                    then pure (Right (hashFinalizeBytes ctx))
+                    else do
+                      BS.hPut handle chunk
+                      consume (hashUpdateChunk ctx chunk)
+             in consume ctx0
 
 -- | Verify the fetched bytes against the derivation's fixed-output hash, read
 -- from the canonical output spec.  @doHashAlgo@ is @sha256@/@sha512@/... (or
@@ -538,32 +555,52 @@ downloadUrl url = do
 -- the download - and fail with a clear message rather than a wrong result.
 verifyFetchHash :: Text -> DerivationOutput -> BS.ByteString -> Either (Int, Text) ()
 verifyFetchHash url out body
-  | recursive =
-      Left (1, "builtin:fetchurl: recursive outputHashMode (unpack/executable) not yet supported; fetch flat and unpack in a build phase")
+  | recursive = Left (1, recursiveUnsupportedMessage)
   | otherwise = case (hexToBytes (doHash out), rawHashWithAlgo algo body) of
-      (Nothing, _) -> Left (1, "builtin:fetchurl: malformed expected hash for " <> url)
+      (Nothing, _) -> Left (1, malformedExpectedHash url)
       (_, Nothing) -> Left (1, "builtin:fetchurl: unsupported hash algorithm '" <> algo <> "'")
-      (Just expected, Just got)
-        | expected == got -> Right ()
-        | otherwise ->
-            Left
-              ( 1,
-                "builtin:fetchurl: hash mismatch for "
-                  <> url
-                  <> "\n  expected: "
-                  <> algoField
-                  <> ":"
-                  <> doHash out
-                  <> "\n  got:      "
-                  <> algoField
-                  <> ":"
-                  <> bytesToHexText got
-              )
+      (Just _, Just got) -> verifyFetchedDigest url out got
+  where
+    (recursive, algo) = splitHashMode (doHashAlgo out)
+
+-- | Compare an already-computed digest of the fetched bytes against the
+-- derivation's fixed-output hash - the streaming twin of
+-- 'verifyFetchHash', which hashes a buffered body.
+verifyFetchedDigest :: Text -> DerivationOutput -> BS.ByteString -> Either (Int, Text) ()
+verifyFetchedDigest url out got = case hexToBytes (doHash out) of
+  Nothing -> Left (1, malformedExpectedHash url)
+  Just expected
+    | expected == got -> Right ()
+    | otherwise ->
+        Left
+          ( 1,
+            "builtin:fetchurl: hash mismatch for "
+              <> url
+              <> "\n  expected: "
+              <> algoField
+              <> ":"
+              <> doHash out
+              <> "\n  got:      "
+              <> algoField
+              <> ":"
+              <> bytesToHexText got
+          )
   where
     algoField = doHashAlgo out
-    (recursive, algo) = case T.stripPrefix "r:" algoField of
-      Just rest -> (True, rest)
-      Nothing -> (False, algoField)
+
+-- | Split @outputHashAlgo@ into the recursive-mode marker and the bare
+-- algorithm name (@r:sha256@ is recursive @sha256@).
+splitHashMode :: Text -> (Bool, Text)
+splitHashMode algoField = case T.stripPrefix "r:" algoField of
+  Just rest -> (True, rest)
+  Nothing -> (False, algoField)
+
+recursiveUnsupportedMessage :: Text
+recursiveUnsupportedMessage =
+  "builtin:fetchurl: recursive outputHashMode (unpack/executable) not yet supported; fetch flat and unpack in a build phase"
+
+malformedExpectedHash :: Text -> Text
+malformedExpectedHash url = "builtin:fetchurl: malformed expected hash for " <> url
 
 -- ---------------------------------------------------------------------------
 -- Output registration

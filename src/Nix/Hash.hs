@@ -1,3 +1,5 @@
+{-# LANGUAGE ExistentialQuantification #-}
+
 -- | Cryptographic hashing for the Nix store.
 --
 -- == How Nix uses hashes
@@ -36,6 +38,10 @@ module Nix.Hash
     byteToHex,
     hexToBytes,
     rawHashWithAlgo,
+    IncrementalHash,
+    hashInitWithAlgo,
+    hashUpdateChunk,
+    hashFinalizeBytes,
     hashAlgoBytes,
     hexHashLen,
     nix32HashLen,
@@ -163,6 +169,30 @@ rawHashWithAlgo algo bytes = case algo of
   "sha1" -> Just (BA.convert (CH.hash bytes :: CH.Digest CH.SHA1))
   "md5" -> Just (BA.convert (CH.hash bytes :: CH.Digest CH.MD5))
   _ -> Nothing
+
+-- | An in-progress digest under a named algorithm - the incremental
+-- form of 'rawHashWithAlgo', for hashing a stream chunk by chunk
+-- without materializing the whole input.
+data IncrementalHash = forall a. (CH.HashAlgorithm a) => IncrementalHash !(CH.Context a)
+
+-- | Start an incremental digest.  'Nothing' for an unknown algorithm
+-- name (same names 'rawHashWithAlgo' accepts).
+hashInitWithAlgo :: Text -> Maybe IncrementalHash
+hashInitWithAlgo algo = case algo of
+  "sha256" -> Just (IncrementalHash (CH.hashInit :: CH.Context CH.SHA256))
+  "sha512" -> Just (IncrementalHash (CH.hashInit :: CH.Context CH.SHA512))
+  "sha1" -> Just (IncrementalHash (CH.hashInit :: CH.Context CH.SHA1))
+  "md5" -> Just (IncrementalHash (CH.hashInit :: CH.Context CH.MD5))
+  _ -> Nothing
+
+-- | Absorb one chunk.
+hashUpdateChunk :: IncrementalHash -> BS.ByteString -> IncrementalHash
+hashUpdateChunk (IncrementalHash ctx) chunk = IncrementalHash (CH.hashUpdate ctx chunk)
+
+-- | Finish, yielding the same raw digest bytes 'rawHashWithAlgo'
+-- produces for the concatenated chunks.
+hashFinalizeBytes :: IncrementalHash -> BS.ByteString
+hashFinalizeBytes (IncrementalHash ctx) = BA.convert (CH.hashFinalize ctx)
 
 -- | Raw digest size in bytes of a supported hash algorithm.  'Nothing' for
 -- an unknown algorithm name.
