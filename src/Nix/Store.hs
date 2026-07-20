@@ -42,6 +42,7 @@ module Nix.Store
 
     -- * Store operations
     addToStore,
+    copyPathInto,
     placeInStore,
     registrationFor,
     materializeEvalSources,
@@ -84,8 +85,6 @@ import System.Directory
     doesFileExist,
     doesPathExist,
     listDirectory,
-    removeDirectoryRecursive,
-    removeFile,
     renamePath,
     setPermissions,
   )
@@ -180,49 +179,33 @@ registrationFor store sp deriver refs = do
 
 -- | Cross-device safe move for files or directories.
 -- Tries 'renamePath' first; on IOException falls back to copy + remove.
+-- The fallback copies via 'copyPathInto', which preserves symlinks as
+-- symlinks: a dereferencing copy here would make the stored bytes - and
+-- so the NAR hash a cache signs - depend on whether the source and the
+-- store share a volume.
 moveOutput :: FilePath -> FilePath -> IO ()
 moveOutput src dest =
   renamePath src dest `catch` \(_ :: IOException) -> do
-    isDir <- doesDirectoryExist src
-    if isDir
-      then do
-        copyDirectoryRecursive src dest
-        removeDirectoryRecursive src
-      else do
-        copyFile src dest
-        removeFile src
+    copyPathInto src dest
+    Dir.removePathForcibly src
 
--- | Recursively copy a directory tree.
-copyDirectoryRecursive :: FilePath -> FilePath -> IO ()
-copyDirectoryRecursive src dest = do
-  createDirectoryIfMissing True dest
-  entries <- listDirectory src
-  mapM_ (copyEntry src dest) entries
-  where
-    copyEntry srcDir destDir name = do
-      let srcPath = srcDir </> name
-          destPath = destDir </> name
-      isDir <- doesDirectoryExist srcPath
-      if isDir
-        then copyDirectoryRecursive srcPath destPath
-        else copyFile srcPath destPath
-
--- | Byte-scan all files under a directory for store path references.
+-- | Byte-scan a tree for store path references.
 --
--- Searches file bytes for each candidate's bare 32-character hash - the
--- same needle upstream Nix scans for.  Matching the hash rather than a
--- store-dir-prefixed path keeps the scan independent of the spelling the
--- builder embedded (canonical @\/nix\/store\/...@, @C:\\nix\\store\\...@,
--- MSYS2 forms): eval injects canonical forward-slash text into builder
--- environments, which a platform-store-dir prefix never matches on
--- Windows.
+-- Searches each scan unit ('collectScanUnits': regular file bytes and
+-- symlink target strings) for each candidate's bare 32-character hash -
+-- the same needle upstream Nix scans for.  Matching the hash rather
+-- than a store-dir-prefixed path keeps the scan independent of the
+-- spelling the builder embedded (canonical @\/nix\/store\/...@,
+-- @C:\\nix\\store\\...@, MSYS2 forms): eval injects canonical
+-- forward-slash text into builder environments, which a
+-- platform-store-dir prefix never matches on Windows.
 scanReferences :: [StorePath] -> FilePath -> IO [StorePath]
 scanReferences candidates dir = do
   let candidateSet = Set.fromList [(spHash sp, sp) | sp <- candidates]
       needles = [(TE.encodeUtf8 h, h) | (h, _) <- Set.toList candidateSet]
-  files <- collectRegularFiles dir
-  foundHashes <- foldlIO Set.empty files $ \acc filePath -> do
-    contents <- BS.readFile filePath
+  units <- collectScanUnits dir
+  foundHashes <- foldlIO Set.empty units $ \acc unit -> do
+    contents <- scanUnitBytes unit
     pure (Set.union acc (Set.fromList [h | (needle, h) <- needles, needle `BS.isInfixOf` contents]))
   pure [sp | (h, sp) <- Set.toList candidateSet, Set.member h foundHashes]
 
@@ -239,33 +222,64 @@ scanReferences candidates dir = do
 scanTempReferences :: [(FilePath, StorePath)] -> FilePath -> IO [StorePath]
 scanTempReferences tempPairs dir = do
   let needles = [(TE.encodeUtf8 (T.pack tempDir), sp) | (tempDir, sp) <- tempPairs]
-  files <- collectRegularFiles dir
-  foundHashes <- foldlIO Set.empty files $ \acc filePath -> do
-    contents <- BS.readFile filePath
+  units <- collectScanUnits dir
+  foundHashes <- foldlIO Set.empty units $ \acc unit -> do
+    contents <- scanUnitBytes unit
     pure (Set.union acc (Set.fromList [spHash sp | (needle, sp) <- needles, needle `BS.isInfixOf` contents]))
   pure [sp | (_, sp) <- tempPairs, Set.member (spHash sp) foundHashes]
 
--- | Collect all regular files under a path, recursively.
--- If the path is itself a regular file, returns it directly.
-collectRegularFiles :: FilePath -> IO [FilePath]
-collectRegularFiles path = do
-  isDir <- doesDirectoryExist path
-  if isDir
-    then do
-      entries <- listDirectory path
-      concat <$> mapM (classifyAndCollect path) entries
+-- | A node kind for store walks, classified WITHOUT following symlinks:
+-- the link test runs first because 'doesDirectoryExist' and
+-- 'doesFileExist' follow links and would report a link as its target.
+-- A dangling link still classifies as 'WalkSymlink'; a probe failure
+-- classifies as 'WalkAbsent' rather than throwing mid-walk.
+data WalkNode = WalkSymlink | WalkDirectory | WalkRegular | WalkAbsent
+
+-- | Classify one path for a store walk.  The walks in this module
+-- dispatch on this (or, in 'copyPathInto', run the same link-first
+-- probe order) so no store walk follows a symlink: following one reads
+-- or mutates content outside the tree being walked, and does not
+-- terminate on a link cycle.
+classifyWalkNode :: FilePath -> IO WalkNode
+classifyWalkNode path = do
+  isLink <- Dir.pathIsSymbolicLink path `catch` \(_ :: IOException) -> pure False
+  if isLink
+    then pure WalkSymlink
     else do
-      isFile <- doesFileExist path
-      pure [path | isFile]
-  where
-    classifyAndCollect parent name = do
-      let fullPath = parent </> name
-      isDir <- doesDirectoryExist fullPath
+      isDir <- doesDirectoryExist path
       if isDir
-        then collectRegularFiles fullPath
+        then pure WalkDirectory
         else do
-          isFile <- doesFileExist fullPath
-          pure [fullPath | isFile]
+          isFile <- doesFileExist path
+          pure (if isFile then WalkRegular else WalkAbsent)
+
+-- | One scannable unit of a walked tree: a regular file's bytes read
+-- from disk, or a symlink's target string.  The NAR serialization
+-- carries both, so reference scanning covers both - a link into a
+-- dependency (@bin\/tool -> \/nix\/store\/\<hash\>-dep\/tool@)
+-- references the dependency even when no file byte does.
+data ScanUnit = ScanFile !FilePath | ScanLinkTarget !BS.ByteString
+
+-- | Collect the scannable units under a path: regular files and symlink
+-- targets, links never followed.  A path that is itself a regular file
+-- or link is its own single unit.
+collectScanUnits :: FilePath -> IO [ScanUnit]
+collectScanUnits path = do
+  node <- classifyWalkNode path
+  case node of
+    WalkSymlink -> do
+      target <- Dir.getSymbolicLinkTarget path
+      pure [ScanLinkTarget (TE.encodeUtf8 (T.pack target))]
+    WalkDirectory -> do
+      entries <- listDirectory path
+      concat <$> mapM (collectScanUnits . (path </>)) entries
+    WalkRegular -> pure [ScanFile path]
+    WalkAbsent -> pure []
+
+-- | The bytes a 'ScanUnit' contributes to the scan.
+scanUnitBytes :: ScanUnit -> IO BS.ByteString
+scanUnitBytes (ScanFile path) = BS.readFile path
+scanUnitBytes (ScanLinkTarget target) = pure target
 
 -- | Strict left fold over a list in IO.  The accumulator is forced to
 -- WHNF each step - without it, the scan retains every scanned file's
@@ -286,18 +300,21 @@ foldlIO z (x : xs) f = do
 -- require ACLs and is deferred.
 setReadOnly :: FilePath -> IO ()
 setReadOnly path = do
-  isDir <- doesDirectoryExist path
-  if isDir
-    then do
+  node <- classifyWalkNode path
+  case node of
+    -- A symlink is a leaf: descending would mark content outside the
+    -- tree (or loop on a link cycle), and a permission change applied
+    -- to the link resolves through to its target.
+    WalkSymlink -> pure ()
+    WalkDirectory -> do
       entries <- listDirectory path
       mapM_ (setReadOnly . (path </>)) entries
       perms <- Dir.getPermissions path
       Dir.setPermissions path (Dir.setOwnerWritable False perms)
-    else do
-      isFile <- doesFileExist path
-      when isFile $ do
-        perms <- Dir.getPermissions path
-        setPermissions path (Dir.setOwnerWritable False perms)
+    WalkRegular -> do
+      perms <- Dir.getPermissions path
+      setPermissions path (Dir.setOwnerWritable False perms)
+    WalkAbsent -> pure ()
 
 -- | Write an already-serialized derivation ATerm to its store path.  Used to
 -- materialize the input @.drv@ closure (root plus every transitive input)

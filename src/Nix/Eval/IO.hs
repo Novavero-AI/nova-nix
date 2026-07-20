@@ -54,7 +54,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Th
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (parseNix, readFileAutoEncoding)
-import Nix.Store (unpackNarEntry)
+import Nix.Store (copyPathInto, unpackNarEntry)
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
@@ -673,20 +673,14 @@ resolveRelativePaths dir = goExpr
 -- Store copy helpers
 -- ---------------------------------------------------------------------------
 
--- | Copy a source path (file or directory) to the store if not already present.
+-- | Copy a source path (file or directory) to the store if not already
+-- present.  The copy is 'copyPathInto', which replicates symlinks as
+-- symlinks: the destination's name came from a NAR hash computed by
+-- 'NovaCache.NAR.serialiseFromPath', which treats links as leaves, so a
+-- dereferencing copy would store bytes that do not match their own
+-- content address (and would not terminate on a link cycle).
 copyToStoreIfMissing :: FilePath -> FilePath -> FilePath -> IO ()
 copyToStoreIfMissing src dest storeDir = do
   Dir.createDirectoryIfMissing True storeDir
   alreadyExists <- Dir.doesPathExist dest
-  unless alreadyExists (copyPath src dest)
-
--- | Copy a file or directory tree to a destination.
-copyPath :: FilePath -> FilePath -> IO ()
-copyPath src dest = do
-  isDir <- Dir.doesDirectoryExist src
-  if isDir
-    then do
-      Dir.createDirectoryIfMissing True dest
-      entries <- Dir.listDirectory src
-      mapM_ (\entry -> copyPath (src </> entry) (dest </> entry)) entries
-    else Dir.copyFile src dest
+  unless alreadyExists (copyPathInto src dest)
