@@ -15,7 +15,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (foldl')
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -24,7 +24,7 @@ import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildWithDeps, defaultBuildConfig, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import qualified Nix.DependencyGraph as DepGraph
@@ -3213,6 +3213,29 @@ testBuildOrchestrator = do
     [ -- BuildConfig has caches field
       runTest "defaultBuildConfig has empty caches" $
         assertEqual "empty-caches" [] (bcCaches (defaultBuildConfig defaultStoreDir)),
+      -- The build PATH must never open with the build working directory:
+      -- a bare-name builder has no directory to derive.
+      runTest "bare-name builder derives no PATH entry" $
+        let entries = T.splitOn (if SI.os == "mingw32" then ";" else ":") (buildPath "bash")
+         in assertEqual "no-dot" False (any (\e -> e == "." || T.isPrefixOf "./" e || T.isPrefixOf ".\\" e) entries),
+      runTest "dot-relative builder derives no PATH entry" $
+        let entries = T.splitOn (if SI.os == "mingw32" then ";" else ":") (buildPath "./bash")
+         in assertEqual "no-dot-rel" False (any (\e -> e == "." || T.isPrefixOf "./" e || T.isPrefixOf ".\\" e) entries),
+      runTest "absolute builder opens PATH with its own directory" $
+        let path = buildPath ("/store/aaa-bootstrap/bin" </> "bash")
+         in assertEqual "builder-dir-first" (Just "/store/aaa-bootstrap/bin") (listToMaybe (T.splitOn (if SI.os == "mingw32" then ";" else ":") path)),
+      -- unionEnvs: earlier maps win; on Windows displacement is
+      -- case-insensitive and keeps the winner's spelling.
+      runTest "unionEnvs left map wins" $
+        assertEqual
+          "left-bias"
+          (Just "build")
+          (Map.lookup "A" (unionEnvs [Map.fromList [("A", "build")], Map.fromList [("A", "host")]])),
+      runTest "unionEnvs displaces a case variant on Windows" $
+        let merged = unionEnvs [Map.fromList [("PATH", "build")], Map.fromList [("Path", "host")]]
+         in if SI.os == "mingw32"
+              then assertEqual "displaced" (Map.fromList [("PATH", "build")]) merged
+              else assertEqual "distinct" (Map.fromList [("PATH", "build"), ("Path", "host")]) merged,
       -- BuildConfig with caches
       runTest "BuildConfig accepts caches" $
         let cache = Subst.CacheConfig "https://cache.example.com" "key" 10
