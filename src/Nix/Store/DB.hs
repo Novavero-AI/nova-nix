@@ -139,7 +139,8 @@ createRefsSQL =
 
 -- | Open (or create) the store database.
 -- Creates the store directory, metadata subdirectory, and database
--- tables if they don't exist.  Enables WAL mode for concurrency.
+-- tables if they don't exist.  Enables WAL mode for concurrency and
+-- foreign-key enforcement for referential integrity.
 openStoreDB :: StoreDir -> IO StoreDB
 openStoreDB dir = do
   let storeRoot = unStoreDir dir
@@ -148,6 +149,11 @@ openStoreDB dir = do
   createDirectoryIfMissing True metaDir
   conn <- open dbPath
   execute_ conn "PRAGMA journal_mode=WAL"
+  -- SQLite leaves foreign keys OFF per connection; without this the Refs
+  -- REFERENCES clauses are inert, and deleting a ValidPaths row (path
+  -- deletion, garbage collection) would leave dangling Refs edges that
+  -- closure JOINs silently under-report.
+  execute_ conn "PRAGMA foreign_keys=ON"
   execute_ conn (fromString createValidPathsSQL)
   execute_ conn (fromString createRefsSQL)
   pure StoreDB {sdbDir = dir, sdbConn = conn}
