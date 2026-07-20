@@ -41,6 +41,8 @@ module Nix.Builder
     defaultBuildConfig,
 
     -- * Pure pieces (exported for tests)
+    buildPath,
+    unionEnvs,
     verifyFetchHash,
   )
 where
@@ -48,7 +50,7 @@ where
 import Control.Exception (IOException, SomeException, displayException, finally, try)
 import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
-import Data.Char (toLower)
+import Data.Char (toLower, toUpper)
 import Data.Either (fromRight)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -375,19 +377,45 @@ buildEnvironment config decodedEnv builderPath buildDir outputDirs =
             (envSourceDateEpoch, sourceDateEpochValue)
           ]
    in -- Priority: output paths > derivation env > standard env
-      Map.unions [outputEnv, baseEnv, standardEnv]
+      unionEnvs [outputEnv, baseEnv, standardEnv]
+
+-- | Union environment maps left to right (an earlier map's variable wins).
+-- On Windows environment names are one case-insensitive namespace, so
+-- displacement folds names by per-character uppercase - matching the
+-- kernel's env-name comparison - and the winner keeps its own spelling:
+-- a build's @PATH@ must displace an inherited @Path@, or both would land
+-- in the child's environment block and which one the child sees would be
+-- runtime-dependent.  On Unix names are distinct by case and this is
+-- 'Map.unions'.
+unionEnvs :: [Map Text Text] -> Map Text Text
+unionEnvs envs
+  | isWindows =
+      let foldName = T.map toUpper
+          folded =
+            [ Map.fromList [(foldName name, (name, val)) | (name, val) <- Map.toList env]
+            | env <- envs
+            ]
+       in Map.fromList (Map.elems (Map.unions folded))
+  | otherwise = Map.unions envs
 
 -- | Construct the build PATH from the builder's location.
 -- Includes the builder's directory, its sibling @usr\/bin@ (for MSYS2
 -- coreutils bundled with Git for Windows), and system directories.
 -- On a bootstrapped store, the builder's dir IS a store path, so this
 -- naturally becomes a store-only PATH.
+--
+-- A bare-name or dot-relative builder has no directory to derive: @.@
+-- here would put the BUILD WORKING DIRECTORY first on PATH, so a file
+-- dropped into the build dir would resolve ahead of every tool.  Such
+-- builders get the system directories only.
 buildPath :: FilePath -> Text
 buildPath builderPath =
   let builderDir = takeDirectory builderPath
       parentDir = takeDirectory builderDir
       -- Builder's own dir + coreutils sibling (MSYS2 layout)
-      builderDirs = [builderDir, parentDir </> "usr" </> "bin"]
+      builderDirs
+        | builderDir == "." = []
+        | otherwise = [builderDir, parentDir </> "usr" </> "bin"]
       systemDirs =
         if System.Info.os == "mingw32"
           then ["C:\\Windows\\System32", "C:\\Windows"]
@@ -422,8 +450,8 @@ runBuilder ::
 runBuilder builderPath builderArgs buildEnv workDir = do
   systemEnv <- System.Environment.getEnvironment
   let systemMap = Map.fromList [(T.pack k, T.pack v) | (k, v) <- systemEnv]
-      -- Build env wins over system env
-      mergedEnv = Map.union buildEnv systemMap
+      -- Build env wins over system env, displacing case variants on Windows
+      mergedEnv = unionEnvs [buildEnv, systemMap]
       envList = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList mergedEnv]
       cp =
         (mkBuilderProcess builderPath builderArgs)
