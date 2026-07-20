@@ -454,10 +454,12 @@ firstNameCollision = go Map.empty
 -- The sibling list is checked for on-disk name collisions BEFORE any
 -- child is written: a folding filesystem lands two distinct NAR names
 -- on one file, and the silent merge would materialize a tree that no
--- longer matches the NAR hash it is about to be registered under.  A
--- tree this filesystem cannot represent is refused outright - the store
--- never holds an approximation of a tree (no name-mangling schemes),
--- so a registered path always reproduces its NAR byte-for-byte.
+-- longer matches the NAR hash it is about to be registered under.
+-- Refusal is the fail-closed backstop; upstream materializes such
+-- trees with its reversible case-hack suffix (applied at unpack,
+-- stripped at serialise), which follows here once the serialiser side
+-- ships in nova-cache - a registered path must always reproduce its
+-- NAR byte-for-byte, whichever branch handles the collision.
 unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
 unpackChildren path entries = case firstNameCollision (map fst entries) of
   Just (earlier, later) ->
