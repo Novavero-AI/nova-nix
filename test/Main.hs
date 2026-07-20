@@ -46,7 +46,7 @@ import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (Store (..), addToStore, closeStore, isValid, materializeEvalSources, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
+import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isValid, materializeEvalSources, openStore, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
@@ -63,6 +63,7 @@ import System.IO (BufferMode (..), hSetBuffering, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
 import qualified System.Process as Proc
+import System.Timeout (timeout)
 
 -- ---------------------------------------------------------------------------
 -- Test harness
@@ -1880,6 +1881,103 @@ testPathFilterBody = do
         )
         (VBool True)
     ]
+
+-- | Whether this host can create symlinks (Windows needs Developer Mode
+-- or elevation).  The symlink-walk fixtures cannot be built without it,
+-- so their groups skip loudly rather than fail.
+symlinksAvailable :: IO Bool
+symlinksAvailable = do
+  tmpBase <- getTemporaryDirectory
+  let probeDir = tmpBase </> "nova-nix-test-link-probe"
+  Dir.removePathForcibly probeDir
+  createDirectoryIfMissing True probeDir
+  BS.writeFile (probeDir </> "target.txt") "t"
+  outcome <- try (Dir.createFileLink "target.txt" (probeDir </> "link"))
+  Dir.removePathForcibly probeDir
+  pure $ case (outcome :: Either SomeException ()) of
+    Left _ -> False
+    Right () -> True
+
+-- | Watchdog for cycle-termination tests: with symlinks as leaves every
+-- walk returns promptly, while a regression to link-following recurses
+-- forever - and a hung suite is worse than a failed one.
+walkWatchdogMicros :: Int
+walkWatchdogMicros = 30 * 1000 * 1000
+
+-- | @builtins.path@ with no filter over a tree that contains a symlink.
+-- The store-path name comes from the NAR serialization, which records
+-- the link as a leaf entry - so the copy must replicate the link for
+-- the stored bytes to still match the recorded content address.
+testPathSymlinkIO :: IO [Bool]
+testPathSymlinkIO = do
+  putStrLn "eval/path-symlink-io"
+  usableStore <- storeRootAvailable
+  canLink <- symlinksAvailable
+  if not (usableStore && canLink)
+    then do
+      putStrLn "  SKIP  needs a writable platform store root and symlink privilege"
+      pure []
+    else testPathSymlinkBody
+
+testPathSymlinkBody :: IO [Bool]
+testPathSymlinkBody = do
+  tmpBase <- getTemporaryDirectory
+  let srcDir = tmpBase </> "nova-nix-test-path-symlink"
+      cycleDir = tmpBase </> "nova-nix-test-path-cycle"
+  Dir.removePathForcibly srcDir
+  Dir.removePathForcibly cycleDir
+  createDirectoryIfMissing True srcDir
+  BS.writeFile (srcDir </> "data.txt") "linked bytes"
+  Dir.createFileLink "data.txt" (srcDir </> "link")
+  createDirectoryIfMissing True cycleDir
+  BS.writeFile (cycleDir </> "f.txt") "f"
+  Dir.createDirectoryLink "." (cycleDir </> "loop")
+  linkEntry <- NAR.serialiseFromPath srcDir
+  cycleEntry <- NAR.serialiseFromPath cycleDir
+  let pathExprFor dir name =
+        "builtins.path { path = " <> nixQuotedPath dir <> "; name = \"" <> name <> "\"; }"
+      spFor name entry =
+        makeFixedOutputPath name "sha256" "recursive" (sha256Digest (NAR.serialise entry))
+      linkSp = spFor "path-symlink-src" linkEntry
+      cycleSp = spFor "path-symlink-cycle" cycleEntry
+      -- The same mapping the evaluator's copy uses for its destination.
+      linkDest = storePathToFilePath defaultStoreDir linkSp
+      cycleDest = storePathToFilePath defaultStoreDir cycleSp
+  -- A leftover materialization from an earlier (possibly pre-fix) run
+  -- would short-circuit the copy under test.
+  Dir.removePathForcibly linkDest
+  Dir.removePathForcibly cycleDest
+  linkEval <- evalNixIO "." (pathExprFor srcDir "path-symlink-src")
+  cycleEval <- timeout walkWatchdogMicros (evalNixIO "." (pathExprFor cycleDir "path-symlink-cycle"))
+  results <-
+    sequence
+      [ runTestM "unfiltered builtins.path replicates a symlink" $
+          case linkEval of
+            Left err -> pure (Fail ("eval failed: " <> err))
+            Right _ -> do
+              isLink <- Dir.pathIsSymbolicLink (linkDest </> "link")
+              if isLink
+                then do
+                  target <- Dir.getSymbolicLinkTarget (linkDest </> "link")
+                  pure (assertEqual "link target" "data.txt" target)
+                else pure (Fail "materialized 'link' is not a symlink"),
+        runTestM "materialized bytes reproduce the recorded content address" $
+          case linkEval of
+            Left err -> pure (Fail ("eval failed: " <> err))
+            Right _ -> do
+              onDisk <- NAR.serialiseFromPath linkDest
+              pure (assertEqual "recomputed path" linkSp (spFor "path-symlink-src" onDisk)),
+        runTestM "builtins.path terminates on a link cycle" $
+          case cycleEval of
+            Nothing -> pure (Fail "copy did not terminate on a link cycle")
+            Just (Left err) -> pure (Fail ("eval failed: " <> err))
+            Just (Right _) -> do
+              isLink <- Dir.pathIsSymbolicLink (cycleDest </> "loop")
+              pure (if isLink then Pass else Fail "cycle link not replicated as a link")
+      ]
+  Dir.removePathForcibly srcDir
+  Dir.removePathForcibly cycleDir
+  pure results
 
 testImportIO :: IO [Bool]
 testImportIO = do
@@ -3719,6 +3817,10 @@ testUnpackBuildIO = do
           archiveRootFile = workDir </> "pkg-root-file.tar.zst"
           archiveEscapeSymlink = workDir </> "pkg-escape-symlink.tar.zst"
           archiveEscapeHardlink = workDir </> "pkg-escape-hardlink.tar.zst"
+          archiveDirLink = workDir </> "pkg-dirlink.tar.zst"
+          archiveDirLinkBase = workDir </> "pkg-dirlink-base.tar.zst"
+          archiveDirLinkCollide = workDir </> "pkg-dirlink-collide.tar.zst"
+          archiveHardLinkCollide = workDir </> "pkg-hardlink-collide.tar.zst"
       BL.writeFile archiveTools $
         compressArchive
           [ tarDir "pkg",
@@ -3750,6 +3852,33 @@ testUnpackBuildIO = do
         compressArchive [tarSymLink "sneaky-link.txt" "../escape-link-target.txt"]
       BL.writeFile archiveEscapeHardlink $
         compressArchive [tarHardLink "sneaky-hardlink.txt" "../escape-hardlink-target.txt"]
+      -- A directory symlink entry with a fresh destination: materialized
+      -- by copying its target tree.
+      BL.writeFile archiveDirLink $
+        compressArchive
+          [ tarDir "realdir",
+            tarFile "realdir/g.txt" "dir-link-payload",
+            tarSymLink "dirlink" "realdir"
+          ]
+      -- Collisions: the first archive already provides pkg/, and a later
+      -- archive's directory symlink/hardlink also lands at pkg.  The
+      -- tree copy must hit the same collision guard as a regular entry,
+      -- not silently merge - the merged result would depend on entry
+      -- order.
+      BL.writeFile archiveDirLinkBase $
+        compressArchive [tarDir "pkg", tarFile "pkg/original.txt" "original"]
+      BL.writeFile archiveDirLinkCollide $
+        compressArchive
+          [ tarDir "smuggle",
+            tarFile "smuggle/extra.txt" "smuggled",
+            tarSymLink "pkg" "smuggle"
+          ]
+      BL.writeFile archiveHardLinkCollide $
+        compressArchive
+          [ tarDir "smuggle",
+            tarFile "smuggle/extra.txt" "smuggled",
+            tarHardLink "pkg" "smuggle"
+          ]
       let mkUnpackDrv outP srcFiles =
             Derivation
               { drvOutputs =
@@ -3775,6 +3904,9 @@ testUnpackBuildIO = do
           rootFileOut = StorePath (T.replicate 31 "0" <> "5") "unpack-root-file"
           escapeSymlinkOut = StorePath (T.replicate 31 "0" <> "6") "unpack-escape-symlink"
           escapeHardlinkOut = StorePath (T.replicate 31 "0" <> "7") "unpack-escape-hardlink"
+          dirLinkOut = StorePath (T.replicate 31 "0" <> "8") "unpack-dirlink"
+          dirLinkCollideOut = StorePath (T.replicate 31 "0" <> "9") "unpack-dirlink-collide"
+          hardLinkCollideOut = StorePath (T.replicate 30 "0" <> "10") "unpack-hardlink-collide"
       buildTmp <- (</> "nova-nix-test-unpack-build-tmp") <$> getTemporaryDirectory
       forceRemoveIfExists buildTmp
       createDirectoryIfMissing True buildTmp
@@ -3785,6 +3917,9 @@ testUnpackBuildIO = do
       rootFileResult <- buildDerivation config store (mkUnpackDrv rootFileOut [archiveRootFile])
       escapeSymlinkResult <- buildDerivation config store (mkUnpackDrv escapeSymlinkOut [archiveEscapeSymlink])
       escapeHardlinkResult <- buildDerivation config store (mkUnpackDrv escapeHardlinkOut [archiveEscapeHardlink])
+      dirLinkResult <- buildDerivation config store (mkUnpackDrv dirLinkOut [archiveDirLink])
+      dirLinkCollideResult <- buildDerivation config store (mkUnpackDrv dirLinkCollideOut [archiveDirLinkBase, archiveDirLinkCollide])
+      hardLinkCollideResult <- buildDerivation config store (mkUnpackDrv hardLinkCollideOut [archiveDirLinkBase, archiveHardLinkCollide])
       forceRemoveIfExists buildTmp
       forceRemoveIfExists workDir
       seedChecks <- case seedResult of
@@ -3867,6 +4002,36 @@ testUnpackBuildIO = do
             runTest "unpack: escaping hardlink target rejected" $
               rejectedWith "escape-hardlink-target.txt" escapeHardlinkResult
           ]
+      dirLinkChecks <- case dirLinkResult of
+        BuildFailure msg code ->
+          sequence
+            [ runTest "unpack: directory symlink materialized as copied tree" $
+                Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+            ]
+        BuildSuccess sp -> do
+          let outRoot = storePathToFilePath storeDir sp
+              linkedFile = outRoot </> "dirlink" </> "g.txt"
+          linkedExists <- Dir.doesFileExist linkedFile
+          outcome <-
+            if not linkedExists
+              then pure (Fail "dirlink/g.txt missing from the output")
+              else do
+                linked <- TIO.readFile linkedFile
+                -- The copy contract: a real directory, never a link (a
+                -- store link would need privilege and be machine-dependent).
+                isLink <- Dir.pathIsSymbolicLink (outRoot </> "dirlink")
+                pure $
+                  if linked == "dir-link-payload" && not isLink
+                    then Pass
+                    else Fail ("content=" <> linked <> " isLink=" <> T.pack (show isLink))
+          sequence [runTest "unpack: directory symlink materialized as copied tree" outcome]
+      collisionGuardChecks <-
+        sequence
+          [ runTest "unpack: directory symlink onto existing content fails loudly" $
+              rejectedWith "file collision" dirLinkCollideResult,
+            runTest "unpack: directory hardlink onto existing content fails loudly" $
+              rejectedWith "file collision" hardLinkCollideResult
+          ]
       -- Unit: the rooted (drive-relative) case is the Blocker-4 Windows vuln.
       -- tar's toLinkTarget refuses an absolute payload on POSIX, so exercise the
       -- guard predicate directly - portable and exact on every host.
@@ -3879,7 +4044,7 @@ testUnpackBuildIO = do
             runTest "unpack guard: rooted hardlink target rejected" $
               assertLeft "rooted hardlink" (entryComponents "/planted-hardlink-target.txt")
           ]
-      pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ guardChecks)
+      pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ dirLinkChecks ++ collisionGuardChecks ++ guardChecks)
 
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
 -- derivation depends on a leaf; both @.drv@ files are pre-written to the store
@@ -4757,6 +4922,129 @@ testStoreOps = do
           exists <- pathExists store sp
           pure (assertEqual "exists" True exists)
       ]
+
+-- | Store walks treat a symlink as a leaf.  Each fixture plants a link
+-- the walk must not follow - out of the tree or back into it (a cycle) -
+-- and asserts the walk neither reads nor mutates through the link, and
+-- still terminates.
+testSymlinkWalksIO :: IO [Bool]
+testSymlinkWalksIO = do
+  putStrLn "store/symlink-walks"
+  canLink <- symlinksAvailable
+  if not canLink
+    then do
+      putStrLn "  SKIP  cannot create symlinks here (Windows needs Developer Mode or elevation)"
+      pure []
+    else
+      sequence
+        [ -- A link out of the tree must not have the read-only bit
+          -- pushed through to its target.
+          runTestM "setReadOnly does not mark link targets outside the tree" $ do
+            tmpBase <- getTemporaryDirectory
+            let base = tmpBase </> "nova-nix-test-ro-links"
+                outside = base </> "outside"
+                tree = base </> "tree"
+            Dir.removePathForcibly base
+            createDirectoryIfMissing True outside
+            createDirectoryIfMissing True tree
+            BS.writeFile (outside </> "victim.txt") "victim"
+            BS.writeFile (tree </> "inside.txt") "inside"
+            Dir.createFileLink (outside </> "victim.txt") (tree </> "file-link")
+            Dir.createDirectoryLink outside (tree </> "dir-link")
+            setReadOnly tree
+            victimWritable <- writable <$> getPermissions (outside </> "victim.txt")
+            insideWritable <- writable <$> getPermissions (tree </> "inside.txt")
+            Dir.removePathForcibly base
+            pure $
+              if victimWritable && not insideWritable
+                then Pass
+                else
+                  Fail
+                    ( "victim writable="
+                        <> T.pack (show victimWritable)
+                        <> " inside writable="
+                        <> T.pack (show insideWritable)
+                    ),
+          -- A link cycle must not recurse the walk forever.
+          runTestM "setReadOnly terminates on a link cycle" $ do
+            tmpBase <- getTemporaryDirectory
+            let tree = tmpBase </> "nova-nix-test-ro-cycle"
+            Dir.removePathForcibly tree
+            createDirectoryIfMissing True (tree </> "sub")
+            BS.writeFile (tree </> "sub" </> "f.txt") "f"
+            Dir.createDirectoryLink tree (tree </> "sub" </> "loop")
+            outcome <- timeout walkWatchdogMicros (setReadOnly tree)
+            marked <- writable <$> getPermissions (tree </> "sub" </> "f.txt")
+            Dir.removePathForcibly tree
+            pure $ case outcome of
+              Nothing -> Fail "walk did not terminate on a link cycle"
+              Just ()
+                | marked -> Fail "regular file next to the cycle link was not marked read-only"
+                | otherwise -> Pass,
+          -- The reference scan reads a link's TARGET STRING (the NAR
+          -- carries it) and never the bytes behind the link.
+          runTestM "scanReferences scans link targets, not linked bytes" $ do
+            tmpBase <- getTemporaryDirectory
+            let base = tmpBase </> "nova-nix-test-scan-links"
+                outside = base </> "outside"
+                scanDir = base </> "tree"
+                inTargetHash = T.replicate 32 "a"
+                outsideHash = T.replicate 32 "b"
+                inTarget = StorePath inTargetHash "dep1"
+                outsideOnly = StorePath outsideHash "dep2"
+            Dir.removePathForcibly base
+            createDirectoryIfMissing True outside
+            createDirectoryIfMissing True scanDir
+            -- outsideOnly's hash exists only in file bytes OUTSIDE the
+            -- tree, reachable through a link; inTarget's exists only in
+            -- a link's target string.
+            BS.writeFile
+              (outside </> "secret.txt")
+              (TE.encodeUtf8 ("/nix/store/" <> outsideHash <> "-dep2"))
+            Dir.createFileLink (outside </> "secret.txt") (scanDir </> "spy-link")
+            Dir.createFileLink
+              ("/nix/store/" <> T.unpack inTargetHash <> "-dep1/bin/tool")
+              (scanDir </> "dep-link")
+            Dir.createDirectoryLink scanDir (scanDir </> "loop")
+            found <- timeout walkWatchdogMicros (scanReferences [inTarget, outsideOnly] scanDir)
+            Dir.removePathForcibly base
+            pure $ case found of
+              Nothing -> Fail "scan did not terminate on a link cycle"
+              Just refs -> assertEqual "scanned refs" [inTarget] refs,
+          -- copyPathInto replicates every link kind, so the NAR bytes -
+          -- and the hash a cache signs - are identical whether an output
+          -- was renamed or copied across volumes.
+          runTestM "copyPathInto replicates links and preserves NAR bytes" $ do
+            tmpBase <- getTemporaryDirectory
+            let base = tmpBase </> "nova-nix-test-copy-links"
+                src = base </> "src"
+                dest = base </> "dest"
+            Dir.removePathForcibly base
+            createDirectoryIfMissing True (src </> "subdir")
+            BS.writeFile (src </> "file.txt") "payload"
+            BS.writeFile (src </> "subdir" </> "inner.txt") "inner"
+            Dir.createFileLink "file.txt" (src </> "rel-link")
+            Dir.createDirectoryLink "subdir" (src </> "dir-link")
+            Dir.createFileLink "missing.txt" (src </> "dangling")
+            copyPathInto src dest
+            relIsLink <- Dir.pathIsSymbolicLink (dest </> "rel-link")
+            relTarget <- Dir.getSymbolicLinkTarget (dest </> "rel-link")
+            dirIsLink <- Dir.pathIsSymbolicLink (dest </> "dir-link")
+            danglingIsLink <- Dir.pathIsSymbolicLink (dest </> "dangling")
+            srcNarHash <- CHash.formatNixHash . CHash.hashBytes . NAR.serialise <$> NAR.serialiseFromPath src
+            destNarHash <- CHash.formatNixHash . CHash.hashBytes . NAR.serialise <$> NAR.serialiseFromPath dest
+            Dir.removePathForcibly base
+            pure $
+              if relIsLink && dirIsLink && danglingIsLink && relTarget == "file.txt"
+                then assertEqual "copied NAR hash" srcNarHash destNarHash
+                else
+                  Fail
+                    ( "rel-link/dir-link/dangling as links: "
+                        <> T.pack (show (relIsLink, dirIsLink, danglingIsLink))
+                        <> ", rel target: "
+                        <> T.pack (show relTarget)
+                    )
+        ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: fromATerm + Derivation Output Population (Phase 2, Batch 3)
@@ -6896,6 +7184,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testImportIO,
           testBlackholeRecoveryIO,
           testPathFilterIO,
+          testPathSymlinkIO,
           testBatchA,
           testBatchAIO,
           testBatchB,
@@ -6921,6 +7210,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testStoreDB,
           testParseStorePath,
           testStoreOps,
+          testSymlinkWalksIO,
           testFromATerm,
           testBuilder,
           testE2E,

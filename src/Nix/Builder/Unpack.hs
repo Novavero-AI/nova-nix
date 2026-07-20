@@ -281,8 +281,15 @@ extractContent outDir comps entry =
               copyFile targetPath dest
               pure (Right ())
       | isDir = do
-          copyTree targetPath dest
-          pure (Right ())
+          -- The same collision guard as regular entries: without it a
+          -- directory link copy silently merges into content another
+          -- archive extracted, making the result entry-order-dependent.
+          fresh <- freshDestination dest
+          case fresh of
+            Left err -> pure (Left err)
+            Right () -> do
+              copyTree targetPath dest
+              pure (Right ())
       | otherwise =
           pure
             ( Left
