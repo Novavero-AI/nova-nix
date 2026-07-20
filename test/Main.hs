@@ -49,7 +49,7 @@ import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
 import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
-import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as CHash
@@ -250,7 +250,33 @@ testStorePaths = do
           (T.unpack (storePathToText defaultStoreDir sp)),
       runTest "store path ordering" $
         let sp2 = StorePath {spHash = "zzz", spName = "later"}
-         in assertEqual "Ord" True (sp < sp2)
+         in assertEqual "Ord" True (sp < sp2),
+      -- The reader-side mapping: canonical store text resolves into the
+      -- platform store dir; everything else is the path as written.
+      runTest "store text maps into the platform store dir" $
+        assertEqual
+          "mapped"
+          (unStoreDir platformStoreDir <> "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x/sub/f")
+          (storeTextToFilePath "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x/sub/f"),
+      runTest "bare store dir text maps to the platform store root" $
+        assertEqual "mapped-root" (unStoreDir platformStoreDir) (storeTextToFilePath "/nix/store"),
+      runTest "store text with a backslash subpath maps" $
+        assertEqual
+          "mapped-backslash"
+          (unStoreDir platformStoreDir <> "\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y")
+          (storeTextToFilePath "/nix/store\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y"),
+      runTest "non-store text is the path as written" $
+        assertEqual "unmapped" "/etc/hosts" (storeTextToFilePath "/etc/hosts"),
+      runTest "a store-prefix-like name does not map" $
+        assertEqual "unmapped-like" "/nix/storefoo" (storeTextToFilePath "/nix/storefoo"),
+      runTest "isCanonicalStoreText accepts both separators and rejects lookalikes" $
+        assertEqual
+          "predicate"
+          [True, True, True, False, False]
+          ( map
+              isCanonicalStoreText
+              ["/nix/store", "/nix/store/x", "/nix/store\\x", "/nix/storefoo", "C:\\nix\\store\\x"]
+          )
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1477,7 +1503,7 @@ testBatch1 = do
         assertEval "lt-str" "builtins.lessThan \"a\" \"b\"" (VBool True),
       -- Constants
       runTest "storeDir" $
-        assertEval "storeDir" "builtins.storeDir" (mkStr platformStoreDirText),
+        assertEval "storeDir" "builtins.storeDir" (mkStr defaultStoreDirText),
       runTest "nixVersion" $
         assertEval "nixVersion" "builtins.nixVersion" (mkStr "2.24.0"),
       runTest "langVersion" $
@@ -1993,8 +2019,8 @@ testPathSymlinkBody = do
   results <- case (spFor "path-symlink-src" linkEntry, spFor "path-symlink-cycle" cycleEntry) of
     (Right linkSp, Right cycleSp) -> do
       -- The same mapping the evaluator's copy uses for its destination.
-      let linkDest = storePathToFilePath defaultStoreDir linkSp
-          cycleDest = storePathToFilePath defaultStoreDir cycleSp
+      let linkDest = storePathToFilePath platformStoreDir linkSp
+          cycleDest = storePathToFilePath platformStoreDir cycleSp
       -- A leftover materialization from an earlier (possibly pre-fix) run
       -- would short-circuit the copy under test.
       Dir.removePathForcibly linkDest
@@ -5919,6 +5945,15 @@ testPhase4 = do
           "split"
           ["nixpkgs=C:\\nixpkgs", "custom=/opt/custom", "C:/x"]
           (splitNixPath "nixpkgs=C:\\nixpkgs:custom=/opt/custom:C:/x"),
+      runTest "splitNixPath splits a Unix-style absolute path list" $
+        assertEqual "split-unix" ["/foo", "/bar"] (splitNixPath "/foo:/bar"),
+      runTest "splitNixPath splits a Unix entry after a drive entry" $
+        assertEqual "split-mixed" ["C:\\a", "/foo"] (splitNixPath "C:\\a:/foo"),
+      runTest "splitNixPath keeps a URL entry whole" $
+        assertEqual
+          "split-url"
+          ["nixpkgs=https://example.com/nixpkgs.tar.gz", "custom=/opt"]
+          (splitNixPath "nixpkgs=https://example.com/nixpkgs.tar.gz:custom=/opt"),
       runTest "splitNixPath keeps interior empty entries" $
         assertEqual "split-empty" ["a", "", "b"] (splitNixPath "a::b"),
       runTest "splitNixPath drops a trailing empty entry" $

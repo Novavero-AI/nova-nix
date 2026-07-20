@@ -16,6 +16,7 @@ module Nix.Builtins
   )
 where
 
+import Data.Char (isAsciiLower, isAsciiUpper)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -23,7 +24,7 @@ import qualified Data.Text as T
 import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, builtinNames, currentSystemStr, evaluated)
 import Nix.Eval.Types (clistFromThunks, mkStr, newCEnv, thunkToCPtr)
-import Nix.Store.Path (platformStoreDirText)
+import Nix.Store.Path (defaultStoreDirText)
 
 -- | The initial environment containing all builtins.
 --
@@ -107,7 +108,10 @@ standardEntries timestamp searchPaths =
     [ ("true", evaluated (VBool True)),
       ("false", evaluated (VBool False)),
       ("null", evaluated VNull),
-      ("storeDir", evaluated (mkStr platformStoreDirText)),
+      -- Canonical, not platform: eval-visible store paths carry the
+      -- /nix/store spelling on every platform, and storeDir must agree
+      -- with them (upstream returns the store dir its paths are under).
+      ("storeDir", evaluated (mkStr defaultStoreDirText)),
       ("nixVersion", evaluated (mkStr "2.24.0")),
       ("langVersion", evaluated (VInt 6)),
       ("nixPath", evaluated (VList (clistFromThunks (map thunkToCPtr searchPaths)))),
@@ -147,9 +151,19 @@ parseNixPath raw
                 )
             )
 
--- | Split a NIX_PATH string on colon separators, respecting Windows
--- drive letters.  A colon followed by @\\@ or @/@ (e.g. @C:\\@) is
--- part of a path, not a separator.
+-- | Split a NIX_PATH string on colon separators.  A colon stays part of
+-- its entry, rather than separating, in exactly two shapes:
+--
+-- * a URL colon - followed by @//@ - so an entry like
+--   @nixpkgs=https://example.com/nixpkgs.tar.gz@ stays whole (upstream's
+--   NIX_PATH parser keeps pseudo-URL entries whole);
+-- * a Windows drive colon - preceded by a single ASCII letter that opens
+--   the entry or follows @=@, and followed by @\\@ or @/@ - so @C:\\x@,
+--   @C:/x@, and @nixpkgs=C:\\x@ stay whole.
+--
+-- Every other colon separates, so a Unix-style list of absolute paths
+-- (@/foo:/bar@) splits at each colon: @/foo@ does not end in a drive
+-- letter, and a lone @/@ after the colon is not a URL.
 splitNixPath :: Text -> [Text]
 splitNixPath = go []
   where
@@ -162,12 +176,23 @@ splitNixPath = go []
               let entry = T.concat (reverse (chunk : chunks))
                in [entry | not (T.null entry)]
             Just (_, afterColon)
-              | isDriveSep afterColon ->
+              | keepsColon (null chunks) chunk afterColon ->
                   go (T.take 1 afterColon : ":" : chunk : chunks) (T.drop 1 afterColon)
               | otherwise ->
                   T.concat (reverse (chunk : chunks)) : go [] afterColon
-    -- After a colon, if the next char is \ or /, it's a drive letter
-    isDriveSep t = case T.uncons t of
-      Just ('\\', _) -> True
-      Just ('/', _) -> True
-      _ -> False
+    -- Whether the colon between chunk and afterColon is a URL or drive
+    -- colon (the two shapes above).  atEntryStart says chunk opens its
+    -- entry (nothing absorbed before it), so a lone letter can only be a
+    -- drive letter there.
+    keepsColon atEntryStart chunk afterColon
+      | T.isPrefixOf "//" afterColon = True
+      | startsWithPathSep afterColon = endsInDriveLetter atEntryStart chunk
+      | otherwise = False
+    startsWithPathSep t = case T.uncons t of
+      Just (c, _) -> c == '/' || c == '\\'
+      Nothing -> False
+    endsInDriveLetter atEntryStart chunk = case T.unsnoc chunk of
+      Just (beforeLetter, letter) ->
+        (isAsciiUpper letter || isAsciiLower letter)
+          && (T.isSuffixOf "=" beforeLetter || (atEntryStart && T.null beforeLetter))
+      Nothing -> False
