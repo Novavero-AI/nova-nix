@@ -57,6 +57,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: haskell-actions/run-ormolu@v19
         with:
+          # Pinned to the version the repo is formatted with: formatting
+          # is not stable across ormolu releases, and a floating version
+          # would fail CI on untouched code when upstream ships one.
+          # Upgrades bump this and the local binary together.
+          version: "0.7.7.0"
           pattern: |
             src/**/*.hs
             app/**/*.hs
