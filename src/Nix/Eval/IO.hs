@@ -250,7 +250,7 @@ instance MonadEval EvalIO where
   -- values keep arbitrary bytes).  Any failure - absent file, malformed ATerm
   -- - is 'Nothing', which the caller turns into a loud modulo-hash error.
   readStoreDerivation sp = EvalIO $ do
-    let filePath = SP.storePathToFilePath SP.defaultStoreDir sp
+    let filePath = platformFilePath sp
     result <- liftIO (try (BS.readFile filePath) :: IO (Either SomeException BS.ByteString))
     pure $ case result of
       Left _ -> Nothing
@@ -285,7 +285,7 @@ instance MonadEval EvalIO where
         entry <- wrapIO (NAR.serialiseFromPath (T.unpack rawPath))
         let narDigest = sha256Digest (NAR.serialise entry)
         sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
-        let spText = SP.storePathToText SP.defaultStoreDir sp
+        let spText = canonicalStorePathText sp
         EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath spText)))
         pure spText
 
@@ -301,8 +301,8 @@ instance MonadEval EvalIO where
     -- (which would CRLF-translate on Windows and store bytes that no
     -- longer match the hash that named the path).
     sp <- storePathOrThrow "builtins.toFile" (makeTextPath name (sha256Digest contents) refs)
-    let filePath = SP.storePathToFilePath SP.defaultStoreDir sp
-        storePath = SP.storePathToText SP.defaultStoreDir sp
+    let filePath = platformFilePath sp
+        storePath = canonicalStorePathText sp
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)
       BS.writeFile filePath contents
@@ -379,8 +379,8 @@ instance MonadEval EvalIO where
               )
       _ -> pure ()
     sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
-    let destFilePath = SP.storePathToFilePath SP.defaultStoreDir sp
-        destPath = SP.storePathToText SP.defaultStoreDir sp
+    let destFilePath = platformFilePath sp
+        destPath = canonicalStorePathText sp
     wrapIO (copyToStoreIfMissing (T.unpack srcPath) destFilePath (takeDirectory destFilePath))
     pure destPath
 
@@ -396,8 +396,8 @@ instance MonadEval EvalIO where
       Left err -> throwEvalError ("builtins.path: internal NAR round-trip error: " <> T.pack err)
       Right entry -> do
         sp <- storePathOrThrow "builtins.path" (makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes))
-        let destFilePath = SP.storePathToFilePath SP.defaultStoreDir sp
-            destPath = SP.storePathToText SP.defaultStoreDir sp
+        let destFilePath = platformFilePath sp
+            destPath = canonicalStorePathText sp
         wrapIO $ do
           alreadyThere <- Dir.doesPathExist destFilePath
           unless alreadyThere $ do
@@ -410,8 +410,8 @@ instance MonadEval EvalIO where
     -- Canonical fixed-output path: a sha256-pinned fetch must land at the same
     -- store path C++ Nix computes, so it stays reproducible and cache-compatible.
     sp <- storePathOrThrow "builtins.fetchurl" (makeFixedOutputPath name "sha256" "flat" (sha256Digest bytes))
-    let filePath = SP.storePathToFilePath SP.defaultStoreDir sp
-        storePath = SP.storePathToText SP.defaultStoreDir sp
+    let filePath = platformFilePath sp
+        storePath = canonicalStorePathText sp
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)
       BS.writeFile filePath bytes
@@ -550,6 +550,19 @@ importCacheMaxAttrs = 1000
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
+
+-- | Where a store path lives on this machine: the platform store dir
+-- mapped to a filesystem path.  Every eval-time read and write of a
+-- store object resolves through this, landing in the same store the
+-- builder and CLI operate on.
+platformFilePath :: SP.StorePath -> FilePath
+platformFilePath = SP.storePathToFilePath SP.platformStoreDir
+
+-- | A store path's identity: the canonical @/nix/store@ spelling every
+-- platform shares.  Hashes and eval-visible strings carry this form; it
+-- never names a location on disk.
+canonicalStorePathText :: SP.StorePath -> Text
+canonicalStorePathText = SP.storePathToText SP.defaultStoreDir
 
 -- | Classify a filesystem path as @"regular"@, @"directory"@, @"symlink"@,
 -- or @"unknown"@ - matching Nix's @builtins.readDir@ / @readFileType@.

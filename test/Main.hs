@@ -49,7 +49,7 @@ import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
 import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
-import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, defaultStoreDirText, parseStorePath, platformStoreDirText, storePathToFilePath, storePathToText, windowsStoreDir)
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as CHash
@@ -1477,7 +1477,7 @@ testBatch1 = do
         assertEval "lt-str" "builtins.lessThan \"a\" \"b\"" (VBool True),
       -- Constants
       runTest "storeDir" $
-        assertEval "storeDir" "builtins.storeDir" (mkStr platformStoreDirText),
+        assertEval "storeDir" "builtins.storeDir" (mkStr defaultStoreDirText),
       runTest "nixVersion" $
         assertEval "nixVersion" "builtins.nixVersion" (mkStr "2.24.0"),
       runTest "langVersion" $
@@ -5919,6 +5919,15 @@ testPhase4 = do
           "split"
           ["nixpkgs=C:\\nixpkgs", "custom=/opt/custom", "C:/x"]
           (splitNixPath "nixpkgs=C:\\nixpkgs:custom=/opt/custom:C:/x"),
+      runTest "splitNixPath splits a Unix-style absolute path list" $
+        assertEqual "split-unix" ["/foo", "/bar"] (splitNixPath "/foo:/bar"),
+      runTest "splitNixPath splits a Unix entry after a drive entry" $
+        assertEqual "split-mixed" ["C:\\a", "/foo"] (splitNixPath "C:\\a:/foo"),
+      runTest "splitNixPath keeps a URL entry whole" $
+        assertEqual
+          "split-url"
+          ["nixpkgs=https://example.com/nixpkgs.tar.gz", "custom=/opt"]
+          (splitNixPath "nixpkgs=https://example.com/nixpkgs.tar.gz:custom=/opt"),
       runTest "splitNixPath keeps interior empty entries" $
         assertEqual "split-empty" ["a", "", "b"] (splitNixPath "a::b"),
       runTest "splitNixPath drops a trailing empty entry" $

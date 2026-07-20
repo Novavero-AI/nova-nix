@@ -77,8 +77,9 @@ defaultStoreDirText = T.pack (unStoreDir defaultStoreDir)
 
 -- | Platform-appropriate store directory.
 -- Returns @C:\\nix\\store@ on Windows, @\/nix\/store@ on Unix.
--- Use this for filesystem operations and user-facing output.
--- Use 'defaultStoreDir' only for Nix-internal canonical paths (ATerm hashing).
+-- Use this for filesystem operations and operator-facing output.
+-- Use 'defaultStoreDir' for identity - hashing, ATerm text, and every
+-- eval-visible store-path string (including @builtins.storeDir@).
 platformStoreDir :: StoreDir
 platformStoreDir = case System.Info.os of
   "mingw32" -> windowsStoreDir
@@ -86,7 +87,6 @@ platformStoreDir = case System.Info.os of
 
 -- | Platform-appropriate store directory as 'Text'.
 -- Returns @C:\\nix\\store@ on Windows, @\/nix\/store@ on Unix.
--- Used for user-facing values like @builtins.storeDir@.
 platformStoreDirText :: Text
 platformStoreDirText = T.pack (unStoreDir platformStoreDir)
 
