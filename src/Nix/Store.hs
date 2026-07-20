@@ -69,7 +69,7 @@ where
 import Control.Exception (IOException, SomeException, catch, throwIO, try)
 import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
-import Data.Char (isDigit)
+import Data.Char (isDigit, toUpper)
 import Data.List (foldl', inits)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -96,6 +96,7 @@ import System.Directory
   )
 import qualified System.Directory as Dir
 import System.FilePath (splitDirectories, takeDirectory, (</>))
+import qualified System.Info
 
 -- | An open store with database and configuration.
 data Store = Store
@@ -420,22 +421,70 @@ unpackTree path entry = case entry of
     createDirectoryIfMissing True path
     unpackChildren path entries
 
+-- | The on-disk identity a NAR entry name occupies on this platform's
+-- store filesystem.  Windows (NTFS\/Win32) compares names
+-- case-insensitively and strips trailing dots and spaces; the default
+-- macOS APFS volume folds case; Linux preserves names byte-for-byte.
+-- Two sibling entries sharing a key land on ONE file, the second
+-- silently overwriting the first.  The fold is per-character uppercase:
+-- a corruption backstop for the collisions real trees carry
+-- (@Makefile@\/@makefile@), not a full model of filesystem Unicode
+-- folding.
+onDiskNameKey :: Text -> Text
+onDiskNameKey = case System.Info.os of
+  "mingw32" -> T.map toUpper . T.dropWhileEnd (\c -> c == '.' || c == ' ')
+  "darwin" -> T.map toUpper
+  _ -> id
+
+-- | The first pair of sibling names folding to the same on-disk file,
+-- if any: (earlier entry, colliding later entry).
+firstNameCollision :: [Text] -> Maybe (Text, Text)
+firstNameCollision = go Map.empty
+  where
+    go !_ [] = Nothing
+    go !seen (name : rest) =
+      let key = onDiskNameKey name
+       in case Map.lookup key seen of
+            Just earlier -> Just (earlier, name)
+            Nothing -> go (Map.insert key name seen) rest
+
 -- | Unpack directory children, short-circuiting with a typed failure on the
 -- first unsafe entry name rather than crashing on untrusted input.
+--
+-- The sibling list is checked for on-disk name collisions BEFORE any
+-- child is written: a folding filesystem lands two distinct NAR names
+-- on one file, and the silent merge would materialize a tree that no
+-- longer matches the NAR hash it is about to be registered under.
+-- (Upstream works around such trees with its case-hack name mangling;
+-- until that lands here, the collision is a loud failure, never a
+-- corrupt store path.)
 unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
-unpackChildren _ [] = pure (Right [])
-unpackChildren path ((name, child) : rest)
-  | not (isSafeNarName name) =
-      pure (Left ("unsafe NAR directory entry name: " <> name))
-  | otherwise = do
-      result <- unpackTree (path </> T.unpack name) child
-      case result of
-        Left err -> pure (Left err)
-        Right links -> do
-          restResult <- unpackChildren path rest
-          case restResult of
+unpackChildren path entries = case firstNameCollision (map fst entries) of
+  Just (earlier, later) ->
+    pure
+      ( Left
+          ( "NAR sibling entries '"
+              <> earlier
+              <> "' and '"
+              <> later
+              <> "' fold to the same on-disk name on this filesystem"
+          )
+      )
+  Nothing -> go entries
+  where
+    go [] = pure (Right [])
+    go ((name, child) : rest)
+      | not (isSafeNarName name) =
+          pure (Left ("unsafe NAR directory entry name: " <> name))
+      | otherwise = do
+          result <- unpackTree (path </> T.unpack name) child
+          case result of
             Left err -> pure (Left err)
-            Right moreLinks -> pure (Right (links <> moreLinks))
+            Right links -> do
+              restResult <- go rest
+              case restResult of
+                Left err -> pure (Left err)
+                Right moreLinks -> pure (Right (links <> moreLinks))
 
 -- | Second unpack pass: create the recorded symlinks in dependency
 -- order - each link is created after every pending link its target

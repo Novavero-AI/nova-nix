@@ -3191,7 +3191,74 @@ testSubstituter = do
             throughLink <- doesDirectoryExist (dest </> "alink")
             pure (if throughLink then Pass else Fail "dir symlink not traversable (wrong flavor)")
         Subst.clearStaleDestination dest
-        pure outcome
+        pure outcome,
+      -- Case-variant siblings fold onto ONE file on Windows and macOS;
+      -- the unpack rejects them loudly there instead of silently merging.
+      -- Linux preserves both names and must keep accepting them.
+      runTestM "unpackNarEntry rejects folding sibling names on a folding filesystem" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-fold"
+            tree =
+              NAR.NarDirectory
+                [ ("Foo", NAR.NarRegular False "upper"),
+                  ("foo", NAR.NarRegular False "lower")
+                ]
+        Subst.clearStaleDestination dest
+        result <- Subst.unpackNarEntry dest tree
+        outcome <-
+          if SI.os == "mingw32" || SI.os == "darwin"
+            then case result of
+              Left _ -> pure Pass
+              Right () -> pure (Fail "folding sibling names were silently merged")
+            else case result of
+              Right () -> do
+                upper <- BS.readFile (dest </> "Foo")
+                lower <- BS.readFile (dest </> "foo")
+                pure (assertEqual "distinct files" ("upper", "lower") (upper, lower))
+              Left err -> pure (Fail ("non-folding platform rejected: " <> err))
+        Subst.clearStaleDestination dest
+        pure outcome,
+      -- unpackAndVerify re-serialises the materialized tree and checks it
+      -- against the declared hash before returning a registration: a
+      -- faithful round-trip passes, and the registration carries the
+      -- declared hash.
+      runTestM "unpackAndVerify accepts a tree that reproduces its hash" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-unpack-verify"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath (T.replicate 32 "b") "roundtrip"
+            tree =
+              NAR.NarDirectory
+                [ ("data.txt", NAR.NarRegular False "verified bytes"),
+                  ("sub", NAR.NarDirectory [("inner", NAR.NarRegular False "nested")])
+                ]
+            rawNar = NAR.serialise tree
+            narHash = CHash.formatNixHash (CHash.hashBytes rawNar)
+            info =
+              NarInfo.NarInfo
+                { NarInfo.niStorePath = storePathToText defaultStoreDir sp,
+                  NarInfo.niUrl = "nar/roundtrip.nar",
+                  NarInfo.niCompression = "none",
+                  NarInfo.niFileHash = Nothing,
+                  NarInfo.niFileSize = Nothing,
+                  NarInfo.niNarHash = narHash,
+                  NarInfo.niNarSize = fromIntegral (BS.length rawNar),
+                  NarInfo.niReferences = [],
+                  NarInfo.niDeriver = Nothing,
+                  NarInfo.niSigs = [],
+                  NarInfo.niCA = Nothing
+                }
+        result <- Subst.unpackAndVerify store sp info rawNar
+        onDisk <- BS.readFile (storePathToFilePath (stDir store) sp </> "data.txt")
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure $ case result of
+          Subst.SubstSuccess reg ->
+            if prNarHash reg == narHash && onDisk == "verified bytes"
+              then Pass
+              else Fail "registration or on-disk bytes diverge from the declared hash"
+          other -> Fail ("unpackAndVerify failed: " <> T.pack (show other))
     ]
   where
     chainCache url = Subst.CacheConfig url "unused-key" 10
