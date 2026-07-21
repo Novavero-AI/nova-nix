@@ -129,6 +129,66 @@ jobs:
           cabal build --enable-tests
 
   # ---------------------------------------------------------------------------
+  # Exercise the C data layer under ASan/UBSan (Linux-only).  The C99-strict
+  # job only compiles; this one RUNS the full suite with instrumented cbits,
+  # so memory errors and UB in the manual-memory surface (arena, attrset,
+  # thunk, bytecode, ...) fail CI instead of lurking.  Linux is the host:
+  # sanitizer support under mingw is unreliable, and the eval C layer is
+  # platform-independent, so Linux execution is real coverage.  The
+  # Windows-only nn_winfs body stays compile-checked by the strict job.
+  # ---------------------------------------------------------------------------
+
+  sanitizers:
+    name: ASan/UBSan
+    needs: [cabal-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: "9.8"
+          cabal-version: "latest"
+
+      # Dependencies build unsanitized (the flags below are scoped to this
+      # package), so the plain Linux dependency cache applies as-is.
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
+          restore-keys: cabal-Linux-
+
+      # Scoped via cabal.project.local so only this package's cbits compile
+      # instrumented and only its executables link the sanitizer runtimes -
+      # a command-line --ghc-options would rebuild every dependency too.
+      # -fno-sanitize-recover makes every UBSan report fatal rather than a
+      # log line CI would scroll past.  No -Werror here: the warnings gate
+      # is the build matrix; this job's signal is runtime findings.
+      - name: Scope sanitizer flags to this package
+        run: |
+          {
+            echo "package nova-nix"
+            echo "  ghc-options: -optc-fsanitize=address,undefined -optc-fno-sanitize-recover=all -optl-fsanitize=address,undefined"
+          } > cabal.project.local
+
+      - name: Build with instrumented cbits
+        run: cabal build --enable-tests
+
+      - name: Provision the store root
+        run: sudo mkdir -p /nix && sudo chown "$USER" /nix
+
+      # detect_leaks=0: LeakSanitizer would report the GHC RTS's deliberate
+      # process-lifetime allocations, not cbits defects - the arena's
+      # bulk-free discipline is exercised by the suite itself.
+      - name: Test under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: cabal test
+
+  # ---------------------------------------------------------------------------
   # Build + Test (cross-platform matrix)
   # ---------------------------------------------------------------------------
 

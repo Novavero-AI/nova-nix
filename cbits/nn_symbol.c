@@ -196,6 +196,14 @@ void nn_symbol_destroy(void)
 
 nn_symbol_t nn_symbol_intern(const char *str, size_t len)
 {
+    /* An empty string arrives from Haskell's zero-copy marshalling as
+     * (NULL, 0).  memcpy/memcmp require valid pointers even for a zero
+     * length, so normalize at the boundary.  Empty symbols are reachable
+     * from evaluated input ({ "" = 1; }), so the branch survives release
+     * builds. */
+    if (len == 0) {
+        str = "";
+    }
     uint32_t hash = fnv1a(str, len);
     uint32_t idx = hash & g_sym.slots_mask;
 

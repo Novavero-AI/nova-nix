@@ -45,7 +45,8 @@ void nn_symbol_destroy(void);
 /* Intern a string, returning its symbol.  If the string was already
  * interned, returns the existing symbol (O(1) amortized).
  * The input string is copied - the caller may free it after this call.
- * str must not be NULL.  len is the byte length (not null-terminated). */
+ * len is the byte length (not null-terminated).  (NULL, 0) denotes the
+ * empty string; str must not be NULL when len > 0. */
 nn_symbol_t nn_symbol_intern(const char *str, size_t len);
 
 /* Return the string data for a symbol.  The pointer is valid until
