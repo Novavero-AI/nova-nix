@@ -10,7 +10,8 @@
 -- 1. Compute the output store path hash from the derivation
 -- 2. @GET https:\/\/cache.example.com\/\<hash\>.narinfo@
 -- 3. If 200: parse the narinfo (NAR hash, size, references, signature)
--- 4. Verify the signature against a trusted public key
+-- 4. Validate the narinfo's fields, then verify the signature against a
+--    trusted public key
 -- 5. @GET https:\/\/cache.example.com\/nar\/\<narhash\>.nar.xz@
 -- 6. Decompress, verify NAR hash, unpack into store path
 -- 7. Register in the store DB with references from narinfo
@@ -44,6 +45,8 @@ module Nix.Substituter
     readBodyCapped,
     sortCaches,
     tryCachesWith,
+    validateNarInfoFields,
+    verifyAndDecompress,
     verifySigs,
     verifyNarHash,
     verifyNarSize,
@@ -78,6 +81,7 @@ import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
+import qualified NovaCache.Validate as Validate
 import qualified System.Directory as Dir
 
 -- ---------------------------------------------------------------------------
@@ -197,8 +201,9 @@ substituteFromCache mgr store cache sp = do
                 Left err -> pure (SubstError err)
                 Right rawNar -> unpackAndVerify store sp narInfo rawNar
 
--- | Pure pipeline: verify signature and resolve the decompressor, then
--- produce an IO action that downloads and decompresses.  Unsupported
+-- | Pure pipeline: validate the narinfo's fields, verify the signature,
+-- and resolve the decompressor, then produce an IO action that downloads
+-- and decompresses.  Unsupported
 -- compression rejects HERE, before the action runs: the value is known
 -- from the narinfo, and a multi-hundred-MB download that can only fail
 -- in decompression is pure waste.
@@ -208,11 +213,47 @@ verifyAndDecompress ::
   NarInfo.NarInfo ->
   Either Text (IO (Either Text BS.ByteString))
 verifyAndDecompress cache mgr narInfo = do
+  validateNarInfoFields narInfo
   verifySigs cache narInfo
   decompress <- decompressorFor (NarInfo.niCompression narInfo)
   pure $ do
     downloaded <- downloadNarWithRetry mgr cache narInfo
     pure $ downloaded >>= decompress
+
+-- | Validate narinfo field syntax before anything consumes the fields -
+-- above all before 'verifySigs' builds the signed fingerprint from them.
+-- The fingerprint is delimited text (semicolons between fields, commas
+-- between references), so each field must have parsed as well-formed
+-- before it is spliced in; a malformed narinfo fails here as a plain
+-- parse error instead of flowing onward.  The checks are nova-cache's
+-- 'Validate.validateNarInfo': store path, references, hash spellings,
+-- sizes, and the no-@.drv@ rule.
+validateNarInfoFields :: NarInfo.NarInfo -> Either Text ()
+validateNarInfoFields narInfo = case Validate.validateNarInfo narInfo of
+  Right _ -> Right ()
+  Left errs ->
+    Left ("invalid narinfo: " <> T.intercalate "; " (map renderValidationError errs))
+
+-- | One 'Validate.ValidationError' in the register the other
+-- substitution errors use.
+renderValidationError :: Validate.ValidationError -> Text
+renderValidationError verr = case verr of
+  Validate.NegativeFileSize n -> "negative FileSize " <> T.pack (show n)
+  Validate.NegativeNarSize n -> "negative NarSize " <> T.pack (show n)
+  Validate.InvalidStorePath raw parseErr -> fieldError "StorePath" raw parseErr
+  Validate.InvalidFileHash raw parseErr -> fieldError "FileHash" raw parseErr
+  Validate.InvalidNarHash raw parseErr -> fieldError "NarHash" raw parseErr
+  Validate.InvalidReference raw parseErr -> fieldError "Reference" raw parseErr
+  Validate.NarHashMismatch expected actual ->
+    "NarHash mismatch: declared " <> expected <> ", computed " <> actual
+  Validate.FileHashMismatch expected actual ->
+    "FileHash mismatch: declared " <> expected <> ", computed " <> actual
+  Validate.SignatureInvalid sig -> "signature failed verification: " <> sig
+  Validate.NoSignatures -> "narinfo has no signatures"
+  Validate.DerivationStorePath path -> "StorePath names a derivation: " <> path
+  where
+    fieldError field raw parseErr =
+      field <> " '" <> raw <> "' does not parse: " <> T.pack parseErr
 
 -- | Verify the NAR hash and size, deserialize, unpack to the store, and set
 -- permissions.  Returns the path's registration for the caller to record;

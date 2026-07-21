@@ -3948,15 +3948,34 @@ optDrvStrAttr key attrs =
 
 -- | Decode a fixed-output hash (SRI @algo-base64@, @algo:hash@, or a bare
 -- hash plus a separate algorithm) to its algorithm name and raw bytes.
+-- A non-empty @outputHashAlgo@ must name a known algorithm and agree with
+-- the algorithm an SRI or prefixed spelling carries: the enforced
+-- algorithm must be the declared one, never a silent substitute.
 normalizeFixedHash :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
 normalizeFixedHash ohash ohAlgo
   | Just (algo, b64) <- parseSRI ohash = do
+      requireDeclaredAlgo algo
       bytes <- decodeSRI "derivation" algo b64
       pure (algo, bytes)
-  | Just (algo, rest) <- parseAlgoPrefix ohash = decodeWithAlgo algo rest
+  | Just (algo, rest) <- parseAlgoPrefix ohash = do
+      requireDeclaredAlgo algo
+      decodeWithAlgo algo rest
   | not (T.null ohAlgo) = decodeWithAlgo ohAlgo ohash
   | otherwise =
       throwEvalError ("derivation: cannot determine outputHash algorithm for " <> ohash)
+  where
+    -- 'decodeSha256Pin's requireSha256 with the expected type supplied by
+    -- @outputHashAlgo@ instead of fixed at sha256 (upstream's typed Hash
+    -- parse, hash.cc parseAny with an expected type).  An unknown declared
+    -- algorithm is an error even when the spelling carries its own tag.
+    requireDeclaredAlgo embedded
+      | T.null ohAlgo = pure ()
+      | Nothing <- hashAlgoBytes ohAlgo =
+          throwEvalError ("unknown hash algorithm '" <> ohAlgo <> "'")
+      | embedded == ohAlgo = pure ()
+      | otherwise =
+          throwEvalError
+            ("derivation: hash '" <> ohash <> "' should have type '" <> ohAlgo <> "', not '" <> embedded <> "'")
 
 -- | Lazy @derivation@ wrapper - mirrors C++ Nix's @corepkgs/derivation.nix@.
 -- Returns a WHNF attrset whose @drvPath@/@outPath@/output-path/@_derivation@
