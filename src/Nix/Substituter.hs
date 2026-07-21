@@ -51,6 +51,7 @@ module Nix.Substituter
     decompressorFor,
     decompressNar,
     unpackNarEntry,
+    unpackAndVerify,
     clearStaleDestination,
     parseReferences,
     parseDeriver,
@@ -238,18 +239,36 @@ unpackAndVerify store sp narInfo rawNar =
           Right (Left err) -> pure (SubstError ("unpack failed: " <> err))
           Right (Right ()) -> do
             setReadOnly destPath
-            pure $
-              SubstSuccess
-                PathRegistration
-                  { prPath = sp,
-                    prNarHash = NarInfo.niNarHash narInfo,
-                    -- The verified actual byte count (equal to the declared
-                    -- NarSize per 'verifyNarSize') - no Integer conversion
-                    -- that could wrap.
-                    prNarSize = BS.length rawNar,
-                    prDeriver = deriver,
-                    prReferences = refs
-                  }
+            -- A path registered valid must match its recorded hash ON
+            -- DISK, not merely in the downloaded bytes: any divergence
+            -- the filesystem introduced between the NAR and the
+            -- materialized tree (name folding, link replication) must
+            -- surface here, before the row exists.  A mismatching tree
+            -- is removed - left in place it would be adopted by
+            -- existence checks at this path.
+            onDisk <- NAR.serialiseFromPath destPath
+            case verifyNarHash narInfo (NAR.serialise onDisk) of
+              Left _ -> do
+                Dir.removePathForcibly destPath
+                pure
+                  ( SubstError
+                      ( "unpacked tree does not reproduce the declared NAR hash at "
+                          <> T.pack destPath
+                      )
+                  )
+              Right () ->
+                pure $
+                  SubstSuccess
+                    PathRegistration
+                      { prPath = sp,
+                        prNarHash = NarInfo.niNarHash narInfo,
+                        -- The verified actual byte count (equal to the declared
+                        -- NarSize per 'verifyNarSize') - no Integer conversion
+                        -- that could wrap.
+                        prNarSize = BS.length rawNar,
+                        prDeriver = deriver,
+                        prReferences = refs
+                      }
   where
     registrationMeta = do
       refs <- parseReferences (NarInfo.niReferences narInfo)
