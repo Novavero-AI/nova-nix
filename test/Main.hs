@@ -24,6 +24,7 @@ import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
+import qualified Network.HTTP.Client as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
@@ -4505,6 +4506,32 @@ testUpstreamConformance = do
             | "wrong length" `T.isInfixOf` err -> Pass
             | otherwise -> Fail ("expected an SRI length error, got: " <> err)
           Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
+      -- An SRI or prefixed outputHash carries its own algorithm tag; a
+      -- non-empty outputHashAlgo must agree with it (hash.cc parseAny
+      -- with an expected type), and an unknown declared algorithm is an
+      -- error even when the spelling carries a valid tag of its own.
+      runTest "fixed-output SRI algorithm must match outputHashAlgo" $
+        case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"sha1-2jmj7l5rSw0yVb/vlWAYkK/YBwk=\"; outputHashAlgo = \"sha256\"; }).drvPath" of
+          Left err
+            | "should have type 'sha256'" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("expected a hash-type error, got: " <> err)
+          Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
+      runTest "fixed-output prefixed algorithm must match outputHashAlgo" $
+        case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"md5:d41d8cd98f00b204e9800998ecf8427e\"; outputHashAlgo = \"sha256\"; }).drvPath" of
+          Left err
+            | "should have type 'sha256'" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("expected a hash-type error, got: " <> err)
+          Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
+      runTest "fixed-output SRI agreeing with outputHashAlgo accepted" $
+        case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"; outputHashAlgo = \"sha256\"; }).drvPath" of
+          Right _ -> Pass
+          Left err -> Fail ("expected success, got: " <> err),
+      runTest "fixed-output unknown outputHashAlgo rejected despite SRI tag" $
+        case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"; outputHashAlgo = \"sha3\"; }).drvPath" of
+          Left err
+            | "unknown hash algorithm" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("expected an unknown-algorithm error, got: " <> err)
+          Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
       runTest "builtins.path pin rejects a truncated SRI digest" $
         case evalNix "builtins.path { path = ./x; sha256 = \"sha256-YWJj\"; }" of
           Left err
@@ -7871,6 +7898,37 @@ testVerifySigs = do
             assertLeft "bad pubkey" (Subst.verifySigs (sigTestCache "not-a-key") sigTestNarInfo {NarInfo.niSigs = [validSig]})
         ]
 
+-- | Narinfo field validation gates the pipeline ahead of the signed
+-- fingerprint: a malformed field must fail as a parse error before its
+-- text can reach the fingerprint or anything downstream.
+testNarInfoValidation :: IO [Bool]
+testNarInfoValidation = do
+  putStrLn "substituter/narinfo-field-validation"
+  mgr <- HTTP.newManager HTTP.defaultManagerSettings
+  sequence
+    [ runTest "well-formed narinfo passes" $
+        assertEqual "valid" (Right ()) (Subst.validateNarInfoFields sigTestNarInfo),
+      runTest "malformed StorePath rejected" $
+        assertLeft "bad store path" (Subst.validateNarInfoFields sigTestNarInfo {NarInfo.niStorePath = "/nix/store/zzz"}),
+      runTest "derivation StorePath rejected" $
+        assertLeft "drv path" (Subst.validateNarInfoFields sigTestNarInfo {NarInfo.niStorePath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0.drv"}),
+      runTest "malformed reference rejected" $
+        assertLeft "bad reference" (Subst.validateNarInfoFields sigTestNarInfo {NarInfo.niReferences = ["../escape"]}),
+      runTest "malformed NarHash rejected" $
+        assertLeft "bad narhash" (Subst.validateNarInfoFields sigTestNarInfo {NarInfo.niNarHash = "sha256:nope"}),
+      runTest "negative NarSize rejected" $
+        assertLeft "negative narsize" (Subst.validateNarInfoFields sigTestNarInfo {NarInfo.niNarSize = -1}),
+      runTest "field validation reports ahead of signature verification" $
+        case sigTestSetup of
+          Left err -> Fail (T.pack err)
+          Right (cache, validSig, _) ->
+            case Subst.verifyAndDecompress cache mgr sigTestNarInfo {NarInfo.niStorePath = "/nix/store/zzz", NarInfo.niSigs = [validSig]} of
+              Left err
+                | "invalid narinfo" `T.isInfixOf` err -> Pass
+                | otherwise -> Fail ("expected the field-validation error, got: " <> err)
+              Right _ -> Fail "expected failure, got a download action"
+    ]
+
 -- ---------------------------------------------------------------------------
 -- Tests: resolver static globals stay in sync with the root env
 -- ---------------------------------------------------------------------------
@@ -8116,6 +8174,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testDepGraph,
           testSubstituter,
           testVerifySigs,
+          testNarInfoValidation,
           testPushPure,
           testPushClosureIO,
           testBuildOrchestrator,

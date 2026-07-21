@@ -176,6 +176,7 @@ test-suite nova-nix-test
     , containers          >= 0.6 && < 0.9
     , directory           >= 1.3 && < 1.4
     , filepath            >= 1.4 && < 1.6
+    , http-client         >= 0.7 && < 0.8
     , nova-cache          >= 0.6 && < 0.7
     , nova-nix
     , process             >= 1.6 && < 1.7
