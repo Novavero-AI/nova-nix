@@ -29,7 +29,6 @@ module Nix.Eval.CThunk
     cthunkDestroy,
 
     -- * Allocation
-    cthunkNew,
     cthunkNewBc,
     cthunkNewComputed,
     cthunkNewComputedInt,
@@ -100,9 +99,6 @@ foreign import ccall unsafe "nn_thunk_init"
 
 foreign import ccall unsafe "nn_thunk_destroy"
   c_nn_thunk_destroy :: IO ()
-
-foreign import ccall unsafe "nn_thunk_new"
-  c_nn_thunk_new :: Ptr () -> IO CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_new_bc"
   c_nn_thunk_new_bc :: Word32 -> Ptr () -> IO CThunkPtr
@@ -245,11 +241,6 @@ cthunkDestroy = c_nn_thunk_destroy
 -- ---------------------------------------------------------------------------
 -- Allocation
 -- ---------------------------------------------------------------------------
-
--- | Allocate a new PENDING thunk from the arena (legacy StablePtr path).
--- The payload is an opaque pointer (StablePtr cast to Ptr ()).
-cthunkNew :: Ptr () -> IO CThunkPtr
-cthunkNew = c_nn_thunk_new
 
 -- | Allocate a new PENDING thunk with a bytecode index + C env pointer.
 -- No Haskell heap references - zero GC pressure for pending thunks.
