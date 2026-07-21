@@ -47,7 +47,8 @@ import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (Store (..), addToStore, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv, writeDrvClosure)
+import Nix.Store (Store (..), addToStore, caseHackDiskNames, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv, writeDrvClosure)
+import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import qualified Nix.Substituter as Subst
@@ -3192,10 +3193,12 @@ testSubstituter = do
             pure (if throughLink then Pass else Fail "dir symlink not traversable (wrong flavor)")
         Subst.clearStaleDestination dest
         pure outcome,
-      -- Case-variant siblings fold onto ONE file on Windows and macOS;
-      -- the unpack rejects them loudly there instead of silently merging.
-      -- Linux preserves both names and must keep accepting them.
-      runTestM "unpackNarEntry rejects folding sibling names on a folding filesystem" $ do
+      -- Folding sibling names MATERIALIZE on every platform: true names
+      -- via the NTFS per-directory flag on Windows, upstream's case-hack
+      -- renaming on macOS, plain files on Linux.  The platform serialiser
+      -- reverses whichever branch ran, so the tree re-serialises to its
+      -- original NAR on all three.
+      runTestM "folding sibling names materialize and round-trip" $ do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-fold"
             tree =
@@ -3205,19 +3208,71 @@ testSubstituter = do
                 ]
         Subst.clearStaleDestination dest
         result <- Subst.unpackNarEntry dest tree
+        outcome <- case result of
+          Left err -> pure (Fail ("unpack failed: " <> err))
+          Right () -> do
+            onDisk <- NAR.serialiseFromPath dest
+            if onDisk /= tree
+              then pure (Fail "materialized tree does not re-serialise to its NAR")
+              else
+                if SI.os == "mingw32"
+                  then do
+                    -- The flag path, not the hack: both TRUE names hold
+                    -- distinct contents inside the case-sensitive dir.
+                    upper <- BS.readFile (dest </> "Foo")
+                    lower <- BS.readFile (dest </> "foo")
+                    pure (assertEqual "true names on NTFS" ("upper", "lower") (upper, lower))
+                  else pure Pass
+        Subst.clearStaleDestination dest
+        pure outcome,
+      -- The pure case-hack naming: later case variants gain the
+      -- reversible suffix with a per-name counter.  The fold key is
+      -- platform-derived, so Linux (no folding) keeps every name.
+      runTest "caseHackDiskNames renames later case variants" $
+        let resolved = caseHackDiskNames ["Foo", "foo", "fOO", "bar"]
+         in if SI.os == "mingw32" || SI.os == "darwin"
+              then
+                assertEqual
+                  "hack naming"
+                  [("Foo", "Foo"), ("foo", "foo~nix~case~hack~1"), ("fOO", "fOO~nix~case~hack~2"), ("bar", "bar")]
+                  resolved
+              else
+                assertEqual
+                  "identity naming"
+                  [("Foo", "Foo"), ("foo", "foo"), ("fOO", "fOO"), ("bar", "bar")]
+                  resolved,
+      -- Where the platform serialiser strips the suffix, an incoming
+      -- name carrying it must reject (it could not round-trip); on
+      -- Linux such a name is legitimate and materializes verbatim.
+      runTestM "incoming case-hack suffix names reject where the serialiser strips" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-suffix"
+            tree = NAR.NarDirectory [("x~nix~case~hack~1", NAR.NarRegular False "v")]
+        Subst.clearStaleDestination dest
+        result <- Subst.unpackNarEntry dest tree
         outcome <-
           if SI.os == "mingw32" || SI.os == "darwin"
             then case result of
               Left _ -> pure Pass
-              Right () -> pure (Fail "folding sibling names were silently merged")
+              Right () -> pure (Fail "suffix-bearing name accepted where the serialiser strips")
             else case result of
               Right () -> do
-                upper <- BS.readFile (dest </> "Foo")
-                lower <- BS.readFile (dest </> "foo")
-                pure (assertEqual "distinct files" ("upper", "lower") (upper, lower))
-              Left err -> pure (Fail ("non-folding platform rejected: " <> err))
+                kept <- BS.readFile (dest </> "x~nix~case~hack~1")
+                pure (assertEqual "verbatim on Linux" "v" kept)
+              Left err -> pure (Fail ("Linux rejected a legitimate name: " <> err))
         Subst.clearStaleDestination dest
         pure outcome,
+      -- The capability probe itself: NTFS grants the per-directory flag
+      -- (CI runners and the dev box run NTFS temp dirs); other
+      -- platforms report unsupported.
+      runTestM "trySetCaseSensitiveDir reflects platform support" $ do
+        tmpBase <- getTemporaryDirectory
+        let dir = tmpBase </> "nova-nix-test-csdir"
+        Subst.clearStaleDestination dir
+        createDirectoryIfMissing True dir
+        flagged <- trySetCaseSensitiveDir dir
+        Subst.clearStaleDestination dir
+        pure (assertEqual "flag support" (SI.os == "mingw32") flagged),
       -- unpackAndVerify re-serialises the materialized tree and checks it
       -- against the declared hash before returning a registration: a
       -- faithful round-trip passes, and the registration carries the
