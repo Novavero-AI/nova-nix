@@ -5075,7 +5075,7 @@ testFetchGitTransport = do
             Right "user@[::1]:repo",
             Right "/srv/repo",
             Right "./repo",
-            Right "C:\\Users\\devon\\repo"
+            Right "C:\\src\\repo"
           ]
           ( map
               checkGitUrl
@@ -5083,7 +5083,7 @@ testFetchGitTransport = do
                 "user@[::1]:repo",
                 "/srv/repo",
                 "./repo",
-                "C:\\Users\\devon\\repo"
+                "C:\\src\\repo"
               ]
           ),
       runTest "helper transports are rejected" $
