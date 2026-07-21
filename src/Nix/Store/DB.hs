@@ -41,6 +41,10 @@ module Nix.Store.DB
     queryPathInfo,
     queryAllValidPaths,
 
+    -- * Unregistration
+    UnregisterResult (..),
+    unregisterPathRow,
+
     -- * Constants
     metaDirName,
     dbFileName,
@@ -280,6 +284,54 @@ queryDeriver db sp = do
   case rows of
     (Only deriver : _) -> pure deriver
     [] -> pure Nothing
+
+-- ---------------------------------------------------------------------------
+-- Unregistration
+-- ---------------------------------------------------------------------------
+
+-- | Outcome of 'unregisterPathRow'.
+data UnregisterResult
+  = -- | The row and its outgoing reference edges were removed.
+    RowUnregistered
+  | -- | No row carries this path text.
+    RowAbsent
+  | -- | Other valid paths still reference this one (their path texts,
+    -- sorted); nothing was changed.
+    RowReferenced ![Text]
+  deriving (Eq, Show)
+
+-- | Remove a path's ValidPaths row and outgoing Refs edges, keyed by the
+-- EXACT stored path text.  Deliberately not keyed by 'StorePath': the
+-- rows this exists to clean up include ones whose names the current
+-- validator rejects, and those cannot round-trip through a parse.
+--
+-- Refuses while any OTHER valid path references this one; a
+-- self-reference does not block.  Lookup, referrer check, and deletion
+-- run in one transaction, so a registration cannot interleave between
+-- the check and the delete.
+unregisterPathRow :: StoreDB -> Text -> IO UnregisterResult
+unregisterPathRow db pathText = withTransaction conn $ do
+  idRows <- query conn "SELECT id FROM ValidPaths WHERE path = ?" (Only pathText) :: IO [Only Int]
+  case idRows of
+    [] -> pure RowAbsent
+    (Only pathId : _) -> do
+      referrerRows <-
+        query
+          conn
+          "SELECT vp.path FROM Refs r \
+          \JOIN ValidPaths vp ON r.referrer = vp.id \
+          \WHERE r.reference = ? AND r.referrer != ? \
+          \ORDER BY vp.path"
+          (pathId, pathId) ::
+          IO [Only Text]
+      case [p | Only p <- referrerRows] of
+        referrers@(_ : _) -> pure (RowReferenced referrers)
+        [] -> do
+          execute conn "DELETE FROM Refs WHERE referrer = ?" (Only pathId)
+          execute conn "DELETE FROM ValidPaths WHERE id = ?" (Only pathId)
+          pure RowUnregistered
+  where
+    conn = sdbConn db
 
 -- | Query full path info for a registered store path.
 queryPathInfo :: StoreDB -> StorePath -> IO (Maybe PathInfo)

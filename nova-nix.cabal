@@ -180,6 +180,7 @@ test-suite nova-nix-test
     , nova-cache          >= 0.6 && < 0.7
     , nova-nix
     , process             >= 1.6 && < 1.7
+    , sqlite-simple       >= 0.4 && < 0.5
     , tar                 >= 0.7.1 && < 0.8
     , text                >= 2.0 && < 2.2
     , zstd                >= 0.1 && < 0.2
