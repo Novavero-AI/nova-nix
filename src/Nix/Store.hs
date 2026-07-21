@@ -60,6 +60,9 @@ module Nix.Store
     -- * Link ordering (exposed for testing)
     orderLinks,
 
+    -- * Case-hack naming (exposed for testing)
+    caseHackDiskNames,
+
     -- * Re-exports
     module Nix.Store.Path,
     module Nix.Store.DB,
@@ -80,6 +83,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (makeFixedOutputPath, sha256Digest)
+import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB
 import Nix.Store.Path
 import qualified NovaCache.Hash as Hash
@@ -448,42 +452,70 @@ firstNameCollision = go Map.empty
             Just earlier -> Just (earlier, name)
             Nothing -> go (Map.insert key name seen) rest
 
+-- | Whether this platform's NAR serialiser strips the case-hack suffix
+-- ('NAR.defaultCaseHack').  Where it does, an INCOMING entry name
+-- carrying the suffix must be rejected: materialized verbatim it would
+-- re-serialise under a different name and fail its own hash recheck.
+-- Upstream rejects such names whenever its case-hack is active.
+platformStripsCaseHack :: Bool
+platformStripsCaseHack = NAR.defaultCaseHack == NAR.CaseHackEnabled
+
+-- | Disk names for a sibling list on a folding filesystem WITHOUT
+-- per-directory case sensitivity: upstream's case-hack.  The first
+-- occurrence of each folded name keeps its spelling; every later
+-- variant gains the reversible suffix and a per-name counter, which
+-- the platform serialiser strips on the way back out.  Order is
+-- preserved; result pairs are (NAR name, on-disk name).
+caseHackDiskNames :: [Text] -> [(Text, Text)]
+caseHackDiskNames = reverse . snd . foldl' step (Map.empty, [])
+  where
+    step (!seen, !acc) name =
+      let key = onDiskNameKey name
+       in case Map.lookup key seen of
+            Nothing -> (Map.insert key (0 :: Int) seen, (name, name) : acc)
+            Just occurrences ->
+              let next = occurrences + 1
+                  disk = name <> NAR.caseHackSuffix <> T.pack (show next)
+               in (Map.insert key next seen, (name, disk) : acc)
+
 -- | Unpack directory children, short-circuiting with a typed failure on the
 -- first unsafe entry name rather than crashing on untrusted input.
 --
--- The sibling list is checked for on-disk name collisions BEFORE any
--- child is written: a folding filesystem lands two distinct NAR names
--- on one file, and the silent merge would materialize a tree that no
--- longer matches the NAR hash it is about to be registered under.
--- Refusal is the fail-closed backstop; upstream materializes such
--- trees with its reversible case-hack suffix (applied at unpack,
--- stripped at serialise), which follows here once the serialiser side
--- ships in nova-cache - a registered path must always reproduce its
--- NAR byte-for-byte, whichever branch handles the collision.
+-- Sibling names folding to one on-disk name (NTFS, default APFS) take
+-- the TRUE-NAME path when the platform provides one: the just-created
+-- empty directory gains NTFS per-directory case sensitivity and the
+-- tree materializes under its real names.  Where the flag is
+-- unavailable (a non-NTFS store volume, macOS) the collision falls
+-- back to upstream's case-hack renaming, which the platform serialiser
+-- reverses.  Either way a registered path re-serialises to its NAR
+-- byte-for-byte - the substituter's on-disk recheck verifies it.
 unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
-unpackChildren path entries = case firstNameCollision (map fst entries) of
-  Just (earlier, later) ->
-    pure
-      ( Left
-          ( "NAR sibling entries '"
-              <> earlier
-              <> "' and '"
-              <> later
-              <> "' fold to the same on-disk name on this filesystem"
-          )
-      )
-  Nothing -> go entries
+unpackChildren path entries = do
+  diskNames <- resolveDiskNames
+  walkChildren (zip diskNames entries)
   where
-    go [] = pure (Right [])
-    go ((name, child) : rest)
+    names = map fst entries
+    resolveDiskNames = case firstNameCollision names of
+      Nothing -> pure names
+      Just _ -> do
+        trueNames <- trySetCaseSensitiveDir path
+        pure
+          ( if trueNames
+              then names
+              else map snd (caseHackDiskNames names)
+          )
+    walkChildren [] = pure (Right [])
+    walkChildren ((diskName, (name, child)) : rest)
       | not (isSafeNarName name) =
           pure (Left ("unsafe NAR directory entry name: " <> name))
+      | platformStripsCaseHack && NAR.caseHackSuffix `T.isInfixOf` name =
+          pure (Left ("NAR entry name contains the case-hack suffix: " <> name))
       | otherwise = do
-          result <- unpackTree (path </> T.unpack name) child
+          result <- unpackTree (path </> T.unpack diskName) child
           case result of
             Left err -> pure (Left err)
             Right links -> do
-              restResult <- go rest
+              restResult <- walkChildren rest
               case restResult of
                 Left err -> pure (Left err)
                 Right moreLinks -> pure (Right (links <> moreLinks))
