@@ -4,6 +4,10 @@
 # Usage:
 #   ./profiling/bench.sh <label> [rts-flags...] [--build] [--full]
 #
+# Requires NIXPKGS_PATH in the environment: the nixpkgs checkout that
+# <nixpkgs> in the eval expression resolves to, in the path spelling the
+# platform's executable expects.
+#
 # Examples:
 #   ./profiling/bench.sh baseline                        # Just -s stats, -M4G
 #   ./profiling/bench.sh iter6-trim -hT                  # Type-based heap profile
@@ -36,7 +40,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NIXPKGS_PATH="C:\\Users\\devon\\nixpkgs-nixos-24.11"
+NIXPKGS_PATH="${NIXPKGS_PATH:?set NIXPKGS_PATH to a nixpkgs checkout}"
 EVAL_EXPR='builtins.length (builtins.attrNames (import <nixpkgs> {}))'
 DEFAULT_HEAP_CAP="-M4G"
 HEAP_CAP="$DEFAULT_HEAP_CAP"
