@@ -38,7 +38,7 @@ import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
-import Nix.Store (Store (..), closeStore, materializeEvalSources, openStore, queryAllValidPaths, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw, materializeEvalSources, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDir, storePathHashLen, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir)
@@ -71,6 +71,7 @@ data Command
   | CmdEvalExpr !T.Text
   | CmdBuild !FilePath
   | CmdPush !PushArgs
+  | CmdStoreDelete ![String]
   | CmdHelp
 
 -- | Arguments to the push command.
@@ -109,6 +110,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
     go opts ("build" : path : rest) =
       go (opts {optCommand = CmdBuild path}) rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
+    go opts ("store" : rest) = goStore opts rest
     go _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     go _ (arg : _) = Left ("unknown argument: " ++ arg ++ " (run nova-nix with no arguments for usage)")
@@ -140,6 +142,20 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
     goPush _ _ (arg@('-' : _) : _) = Left ("unknown push flag: " ++ arg)
     goPush opts pushArgs (path : rest) =
       goPush opts (pushArgs {paPaths = paPaths pushArgs ++ [path]}) rest
+    -- Sub-parser for store maintenance verbs.
+    goStore _ [] = Left "store: expected a subcommand (delete)"
+    goStore opts ("delete" : rest) = goStoreDelete opts [] rest
+    goStore _ (sub : _) = Left ("unknown store subcommand: " ++ sub ++ " (expected: delete)")
+    goStoreDelete opts paths []
+      | null paths = Left "store delete: name at least one store path"
+      | otherwise = Right opts {optCommand = CmdStoreDelete paths}
+    goStoreDelete opts paths ("--store" : dir : rest) =
+      goStoreDelete (opts {optStore = Just dir}) paths rest
+    goStoreDelete _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goStoreDelete _ _ (arg@('-' : _) : _) = Left ("unknown store delete flag: " ++ arg)
+    goStoreDelete opts paths (path : rest) =
+      goStoreDelete opts (paths ++ [path]) rest
     -- Flags that consume the following argument as their value.
     valueFlags =
       ["--nix-path", "--store", "--substituter", "--trusted-key", "--expr", "--cache", "--key-file"]
@@ -175,6 +191,7 @@ main = do
       | otherwise -> evalExpr (optStrict opts) (optNixPaths opts) dataDir expr
     CmdBuild filePath -> buildFile opts dataDir filePath
     CmdPush pushArgs -> pushCommand opts pushArgs
+    CmdStoreDelete paths -> storeDeleteCommand opts paths
     CmdHelp -> do
       hPutStrLn stderr "Usage: nova-nix [--nix-path NAME=PATH] <command>"
       hPutStrLn stderr ""
@@ -183,6 +200,7 @@ main = do
       hPutStrLn stderr "  eval --expr 'EXPR'     Evaluate an inline expression"
       hPutStrLn stderr "  build FILE.nix         Build a derivation from a .nix file"
       hPutStrLn stderr "  push --cache URL       Push store paths (and their closures) to a binary cache"
+      hPutStrLn stderr "  store delete PATH...   Remove store paths, refused while other valid paths reference them"
       hPutStrLn stderr ""
       hPutStrLn stderr "Flags:"
       hPutStrLn stderr "  --strict               Deep-force all thunks before printing (warning: OOM on large results)"
@@ -458,6 +476,32 @@ pushCommand opts pushArgs = do
                 <> T.pack (show (psSkipped summary))
                 <> " already cached"
             )
+
+-- | Delete store paths: registration rows and on-disk trees.  Paths are
+-- processed in argument order and the first failure stops the run, so a
+-- reference chain deletes leaf-first in one invocation.
+storeDeleteCommand :: CliOpts -> [String] -> IO ()
+storeDeleteCommand opts rawPaths = do
+  store <- openStore (chosenStoreDir opts)
+  result <- deleteEach store rawPaths
+  closeStore store
+  either failWith pure result
+  where
+    deleteEach _ [] = pure (Right ())
+    deleteEach store (raw : rest) =
+      case resolveDeleteTarget (stDir store) (T.pack raw) of
+        Left err -> pure (Left ("store delete: " <> err))
+        Right basename -> do
+          outcome <- deleteStorePathRaw store basename
+          case outcome of
+            Left err -> pure (Left ("store delete: " <> err))
+            Right removed -> do
+              TIO.putStrLn ("deleted " <> basename <> describeOutcome removed)
+              deleteEach store rest
+    describeOutcome removed
+      | doRowRemoved removed && doTreeRemoved removed = ""
+      | doRowRemoved removed = " (no tree on disk)"
+      | otherwise = " (unregistered tree)"
 
 -- | Resolve push roots: every valid path with @--all@, otherwise each named
 -- path.  Named paths may be full store paths in either store-dir form, or a

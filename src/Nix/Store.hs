@@ -40,6 +40,11 @@ module Nix.Store
     isValid,
     pathExists,
 
+    -- * Deletion
+    DeleteOutcome (..),
+    deleteStorePathRaw,
+    resolveDeleteTarget,
+
     -- * Store operations
     addToStore,
     copyPathInto,
@@ -127,6 +132,85 @@ isValid = isValidPath . stDB
 -- | Check if a store path exists on disk (file or directory, regardless of DB).
 pathExists :: Store -> StorePath -> IO Bool
 pathExists store sp = doesPathExist (storePathToFilePath (stDir store) sp)
+
+-- ---------------------------------------------------------------------------
+-- Deletion
+-- ---------------------------------------------------------------------------
+
+-- | What 'deleteStorePathRaw' removed.
+data DeleteOutcome = DeleteOutcome
+  { -- | A ValidPaths row (with its outgoing reference edges) was removed.
+    doRowRemoved :: !Bool,
+    -- | An on-disk tree was removed.
+    doTreeRemoved :: !Bool
+  }
+  deriving (Eq, Show)
+
+-- | Resolve a @store delete@ argument to the basename it names: a bare
+-- @hash-name@ basename, or a full path spelled under the opened store's
+-- directory, the platform store, or the canonical store.  The basename is
+-- NOT validated as a store path - the entries deletion exists to remove
+-- are the ones current name rules reject - so only traversal shapes are
+-- refused: separators (excluded by construction), dot-leading names (the
+-- store's metadata directory lives at a dot name), and colons (an NTFS
+-- alternate-data-stream spelling).
+resolveDeleteTarget :: StoreDir -> Text -> Either Text Text
+resolveDeleteTarget storeDir raw
+  | T.null basename = Left (raw <> ": empty store path name")
+  | T.isPrefixOf "." basename =
+      Left (basename <> ": dot-leading names are not store paths")
+  | T.any (== ':') basename =
+      Left (basename <> ": ':' is not valid in a store path name")
+  | not dirOk = Left (raw <> ": not a path under this store")
+  | otherwise = Right basename
+  where
+    basename = T.takeWhileEnd (\c -> c /= '/' && c /= '\\') raw
+    dirPart =
+      normalizeSeps
+        (T.dropWhileEnd (\c -> c == '/' || c == '\\') (T.dropEnd (T.length basename) raw))
+    dirOk =
+      T.null dirPart
+        || dirPart
+          `elem` [ normalizeSeps (T.pack (unStoreDir storeDir)),
+                   normalizeSeps (T.pack (unStoreDir platformStoreDir)),
+                   normalizeSeps (T.pack (unStoreDir defaultStoreDir))
+                 ]
+    normalizeSeps = T.map (\c -> if c == '\\' then '/' else c)
+
+-- | Delete one store entry by basename: the registration row (refused
+-- while other valid paths reference it) and the on-disk tree.  Row first,
+-- tree second: an orphan tree left by a failed removal is inert debris,
+-- while a still-registered row whose tree is gone would be adopted as
+-- valid by existence checks.  A row without a tree and a tree without a
+-- row both delete (the repair cases); only a target with neither is an
+-- error.
+deleteStorePathRaw :: Store -> Text -> IO (Either Text DeleteOutcome)
+deleteStorePathRaw store basename = do
+  let target = unStoreDir (stDir store) </> T.unpack basename
+  rowResult <- unregisterPathRow (stDB store) (T.pack target)
+  case rowResult of
+    RowReferenced referrers ->
+      pure
+        ( Left
+            ( basename
+                <> " is referenced by:"
+                <> T.concat ["\n  " <> r | r <- referrers]
+            )
+        )
+    _ -> do
+      -- 'doesPathExist' follows links, so a dangling top-level symlink
+      -- would read as absent; links are leaves here (as in store walks),
+      -- and leftover link debris must still be removable.
+      treeExisted <- do
+        onDisk <- doesPathExist target
+        if onDisk
+          then pure True
+          else Dir.pathIsSymbolicLink target `catch` \(_ :: IOException) -> pure False
+      when treeExisted (Dir.removePathForcibly target)
+      let rowRemoved = rowResult == RowUnregistered
+      if rowRemoved || treeExisted
+        then pure (Right DeleteOutcome {doRowRemoved = rowRemoved, doTreeRemoved = treeExisted})
+        else pure (Left (basename <> ": not in this store (no registration row, no tree on disk)"))
 
 -- ---------------------------------------------------------------------------
 -- Store operations

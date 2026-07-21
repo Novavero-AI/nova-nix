@@ -22,6 +22,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
+import qualified Database.SQLite.Simple as SQL
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import qualified Network.HTTP.Client as HTTP
@@ -48,9 +49,9 @@ import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (Store (..), addToStore, caseHackDiskNames, closeStore, copyPathInto, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, scanReferences, scanTempReferences, setReadOnly, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), Store (..), addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
-import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, isValidPath, openStoreDB, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
+import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Base64 as B64
@@ -5212,6 +5213,136 @@ testNarKnownAnswer = do
           Nothing -> Fail "path not registered"
     ]
 
+-- | store delete: row-and-tree removal with referrer refusal.  The raw
+-- basename channel exists for rows the current name rules reject; the
+-- legacy-row case plants one over SQL exactly as a pre-name-rules store
+-- carries it.
+testStoreDelete :: IO [Bool]
+testStoreDelete = do
+  putStrLn "store/delete"
+  withTempStore $ \store -> do
+    let sd = stDir store
+        basenameOf sp = spHash sp <> "-" <> spName sp
+        dep = StorePath (T.replicate 32 "a") "del-dep"
+        user = StorePath (T.replicate 32 "b") "del-user"
+    sequence
+      [ runTestM "referenced path is refused with its referrers listed" $ do
+          registerPaths
+            (stDB store)
+            [ PathRegistration dep "sha256:d" 1 Nothing [],
+              PathRegistration user "sha256:u" 1 Nothing [dep]
+            ]
+          outcome <- deleteStorePathRaw store (basenameOf dep)
+          stillValid <- isValid store dep
+          pure $ case outcome of
+            Left err
+              | "referenced by" `T.isInfixOf` err,
+                T.pack (storePathToFilePath sd user) `T.isInfixOf` err,
+                stillValid ->
+                  Pass
+              | otherwise -> Fail ("wrong refusal: " <> err)
+            Right removed -> Fail ("deleted a referenced path: " <> T.pack (show removed)),
+        runTestM "a reference chain deletes leaf-first" $ do
+          userGone <- deleteStorePathRaw store (basenameOf user)
+          depGone <- deleteStorePathRaw store (basenameOf dep)
+          depValid <- isValid store dep
+          userValid <- isValid store user
+          pure $ case (userGone, depGone) of
+            (Right _, Right _)
+              | not depValid && not userValid -> Pass
+              | otherwise -> Fail "rows survived deletion"
+            other -> Fail ("chain deletion failed: " <> T.pack (show other)),
+        runTestM "a registered row without a tree deletes (repair case)" $ do
+          let ghost = StorePath (T.replicate 32 "c") "del-ghost"
+          registerPath (stDB store) (PathRegistration ghost "sha256:g" 1 Nothing [])
+          outcome <- deleteStorePathRaw store (basenameOf ghost)
+          pure $ case outcome of
+            Right removed
+              | doRowRemoved removed && not (doTreeRemoved removed) -> Pass
+              | otherwise -> Fail ("wrong outcome: " <> T.pack (show removed))
+            Left err -> Fail err,
+        runTestM "an unregistered tree deletes (repair case)" $ do
+          let strayBase = T.replicate 32 "d" <> "-del-stray"
+              treePath = unStoreDir sd </> T.unpack strayBase
+          createDirectoryIfMissing True treePath
+          TIO.writeFile (treePath </> "junk.txt") "stray"
+          outcome <- deleteStorePathRaw store strayBase
+          gone <- not <$> Dir.doesPathExist treePath
+          pure $ case outcome of
+            Right removed
+              | not (doRowRemoved removed), doTreeRemoved removed, gone -> Pass
+              | otherwise -> Fail ("wrong outcome: " <> T.pack (show removed))
+            Left err -> Fail err,
+        runTestM "a read-only registered tree deletes fully" $ do
+          let solid = StorePath (T.replicate 32 "e") "del-solid"
+              treePath = storePathToFilePath sd solid
+          registerPath (stDB store) (PathRegistration solid "sha256:s" 1 Nothing [])
+          createDirectoryIfMissing True treePath
+          TIO.writeFile (treePath </> "data.txt") "content"
+          setReadOnly treePath
+          outcome <- deleteStorePathRaw store (basenameOf solid)
+          gone <- not <$> Dir.doesPathExist treePath
+          stillValid <- isValid store solid
+          pure $ case outcome of
+            Right removed
+              | doRowRemoved removed, doTreeRemoved removed, gone, not stillValid -> Pass
+              | otherwise -> Fail ("wrong outcome: " <> T.pack (show removed))
+            Left err -> Fail err,
+        runTestM "a self-referencing path deletes" $ do
+          let selfp = StorePath (T.replicate 32 "f") "del-self"
+          registerPath (stDB store) (PathRegistration selfp "sha256:f" 1 Nothing [selfp])
+          outcome <- deleteStorePathRaw store (basenameOf selfp)
+          pure (assertEqual "self delete" (Right (DeleteOutcome True False)) outcome),
+        runTestM "a target with neither row nor tree is an error" $ do
+          outcome <- deleteStorePathRaw store (T.replicate 32 "9" <> "-del-nothing")
+          pure $ case outcome of
+            Left err | "not in this store" `T.isInfixOf` err -> Pass
+            other -> Fail ("expected not-in-store, got: " <> T.pack (show other)),
+        runTestM "a legacy row the validator rejects deletes by raw text" $ do
+          let legacyBase = T.replicate 32 "g" <> "-old~marker"
+              treePath = unStoreDir sd </> T.unpack legacyBase
+              legacyPathText = T.pack treePath
+          conn <- SQL.open (unStoreDir sd </> metaDirName </> dbFileName)
+          SQL.execute
+            conn
+            "INSERT INTO ValidPaths (path, hash, registrationTime, deriver, narSize) VALUES (?, ?, 0, NULL, 0)"
+            (legacyPathText, "sha256:legacy" :: T.Text)
+          SQL.close conn
+          createDirectoryIfMissing True treePath
+          TIO.writeFile (treePath </> "seed.txt") "epoch"
+          let resolved = resolveDeleteTarget sd legacyPathText
+          outcome <- either (pure . Left) (deleteStorePathRaw store) resolved
+          remaining <- queryAllValidPaths (stDB store)
+          gone <- not <$> Dir.doesPathExist treePath
+          pure $ case outcome of
+            Right removed
+              | doRowRemoved removed, doTreeRemoved removed, gone, legacyPathText `notElem` remaining -> Pass
+              | otherwise -> Fail ("wrong outcome: " <> T.pack (show removed))
+            Left err -> Fail err,
+        runTest "resolveDeleteTarget accepts bare, store-dir, platform, and canonical spellings" $
+          let nameBase = T.replicate 32 "h" <> "-name"
+              spellings =
+                [ nameBase,
+                  T.pack (unStoreDir sd </> T.unpack nameBase),
+                  T.pack (unStoreDir platformStoreDir) <> "\\" <> nameBase,
+                  defaultStoreDirText <> "/" <> nameBase
+                ]
+           in assertEqual "all resolve" (replicate 4 (Right nameBase)) (map (resolveDeleteTarget sd) spellings),
+        runTest "resolveDeleteTarget refuses traversal shapes" $
+          let refused =
+                [ ".nova-nix",
+                  "..",
+                  ".",
+                  "",
+                  T.pack (unStoreDir sd) <> "/",
+                  "/somewhere/else/" <> T.replicate 32 "h" <> "-name",
+                  T.replicate 32 "h" <> "-na:me"
+                ]
+           in case [t | t <- refused, either (const False) (const True) (resolveDeleteTarget sd t)] of
+                [] -> Pass
+                accepted -> Fail ("accepted: " <> T.pack (show accepted))
+      ]
+
 testStoreOps :: IO [Bool]
 testStoreOps = do
   putStrLn "store/ops"
@@ -8181,6 +8312,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testStoreDB,
           testParseStorePath,
           testStoreOps,
+          testStoreDelete,
           testSymlinkWalksIO,
           testLinkOrdering,
           testFromATerm,
