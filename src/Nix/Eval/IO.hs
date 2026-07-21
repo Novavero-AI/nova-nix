@@ -33,6 +33,7 @@ import Control.Exception (Exception, SomeAsyncException, SomeException, displayE
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
+import Crypto.Random (getRandomBytes)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
@@ -341,6 +342,19 @@ instance MonadEval EvalIO where
           ExitFailure n -> n
     pure (code, T.pack stdoutStr, T.pack stderrStr)
 
+  createScratchDir prefix = wrapIO $ do
+    tmpBase <- Dir.getTemporaryDirectory
+    suffix <- getRandomBytes scratchSuffixBytes
+    -- Forward-slash join: the scratch path feeds sh pipelines (tar -C)
+    -- and store copies, both of which accept '/' on every host.
+    let dir = tmpBase <> "/" <> T.unpack (prefix <> bytesToHexText suffix)
+    -- createDirectory is exclusive: an already-existing path fails the
+    -- fetch rather than being silently adopted.
+    Dir.createDirectory dir
+    pure (T.pack dir)
+
+  removeScratchDir dir = wrapIO (Dir.removePathForcibly (T.unpack dir))
+
   copyPathToStore srcPath name expectedSha256 = do
     -- The name is checked before the tree read: it arrives independently
     -- of the source, and the tree can be arbitrarily large.
@@ -534,6 +548,11 @@ readComputed ptr = do
 -- from retaining huge attr sets like nixpkgs' 30k-entry all-packages.nix.
 importCacheMaxAttrs :: Int
 importCacheMaxAttrs = 1000
+
+-- | Random bytes in a scratch-dir name suffix (hex-encoded).  128 bits:
+-- unguessable by another local process, collision-free in practice.
+scratchSuffixBytes :: Int
+scratchSuffixBytes = 16
 
 -- ---------------------------------------------------------------------------
 -- Helpers

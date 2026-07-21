@@ -57,6 +57,9 @@ module Nix.Eval
     evaluated,
     readThunkValue,
 
+    -- * Fetcher transport validation (pure, exported for tests)
+    checkGitUrl,
+
     -- * Builtin registry
     BuiltinDef (..),
     builtinRegistry,
@@ -3406,22 +3409,20 @@ tarballSourceName = "source"
 -- copy the tree to its content-addressed store path.  The pin is the
 -- recursive NAR hash of the EXTRACTED tree, as upstream.  Download and
 -- extraction share one shell pipeline to avoid binary-as-text encoding
--- issues; the scratch dir is cleared first so an interrupted earlier
--- extraction cannot leak stale files into this one.
+-- issues.  The scratch dir is exclusively created with an unpredictable
+-- name ('createScratchDir') and removed once the tree reaches the store.
 fetchAndExtractTarball :: (MonadEval m) => Text -> Maybe Text -> Text -> m NixValue
 fetchAndExtractTarball url mSha256 name = do
-  sysTmp <- getTempDir
-  let urlHash = sha256Hex (TE.encodeUtf8 url)
-      extractDir = sysTmp <> "/nova-nix-tarball-" <> urlHash
+  extractDir <- createScratchDir "nova-nix-tarball-"
   -- The -- separator prevents argument injection from the URL.
   (code, _, errOut) <-
     runProcess
       "sh"
       [ "-c",
-        "rm -rf \"$1\" && mkdir -p \"$1\" && curl -sSfL -- \"$2\" | tar -xz -C \"$1\" --strip-components=1",
+        "curl -sSfL -- \"$1\" | tar -xz -C \"$2\" --strip-components=1",
         "--",
-        extractDir,
-        url
+        url,
+        extractDir
       ]
       ""
   case code of
@@ -3432,19 +3433,77 @@ fetchAndExtractTarball url mSha256 name = do
           extractDir
           name
           (fmap ("builtins.fetchTarball: " <> url,) pin)
+      removeScratchDir extractDir
       pure (VPath storePath)
-    _ -> throwEvalError ("builtins.fetchTarball: " <> errOut)
+    _ -> do
+      removeScratchDir extractDir
+      throwEvalError ("builtins.fetchTarball: " <> errOut)
+
+-- | Transports 'builtinFetchGit' accepts.  Also spelled into the
+-- clone's @protocol.*.allow@ config, so git enforces the same set
+-- internally.
+allowedGitSchemes :: [Text]
+allowedGitSchemes = ["http", "https", "ssh", "git", "file"]
+
+-- | Validate a fetchGit URL's transport before anything spawns.  git's
+-- transport-helper syntax (@\<helper\>::\<address\>@) makes the helper
+-- name a command to run as the transport (@ext::@ runs a shell command,
+-- @fd::@ reads a descriptor), so evaluating an expression carrying such
+-- a URL would execute it.  Accepted: an allowlisted explicit scheme, an
+-- scp-like remote, or a local path.  Left carries the eval-error text.
+checkGitUrl :: Text -> Either Text Text
+checkGitUrl url
+  | T.null url = Left "builtins.fetchGit: empty url"
+  | not (T.null schemeRest),
+    schemeShaped scheme,
+    T.toLower scheme `elem` allowedGitSchemes =
+      Right url
+  | not (T.null schemeRest) = Left (disallowed scheme)
+  | Just helper <- helperPrefix = Left (disallowed helper)
+  | otherwise = Right url
+  where
+    (scheme, schemeRest) = T.breakOn "://" url
+    -- RFC 3986 scheme shape; anything else before :// is not a scheme.
+    schemeShaped s = case T.uncons s of
+      Just (leading, rest) -> asciiAlpha leading && T.all schemeChar rest
+      Nothing -> False
+    schemeChar c = asciiAlpha c || isDigit c || c == '+' || c == '-' || c == '.'
+    asciiAlpha c = isAsciiLower c || isAsciiUpper c
+    -- <helper>:: counts only when the prefix is shaped like a helper
+    -- name; "[::1]"-style scp hosts contain :: but are not helpers.
+    helperPrefix = case T.breakOn "::" url of
+      (prefix, rest)
+        | not (T.null rest),
+          T.null prefix || T.all helperChar prefix ->
+            Just prefix
+      _ -> Nothing
+    helperChar c = asciiAlpha c || isDigit c || c == '-' || c == '_'
+    disallowed t =
+      "builtins.fetchGit: transport '" <> t <> "' is not allowed in url: " <> url
+
+-- | @-c@ config pinning the clone to 'allowedGitSchemes': every
+-- transport defaults to never, each allowed scheme is re-enabled.  This
+-- enforces what URL validation cannot see up front - a helper reached
+-- indirectly, or a @remote-\<helper\>@ binary on PATH.
+gitTransportConfig :: [Text]
+gitTransportConfig =
+  ["-c", "protocol.allow=never"]
+    ++ concat [["-c", "protocol." <> scheme <> ".allow=always"] | scheme <- allowedGitSchemes]
 
 builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
 builtinFetchGit (VStr rawUrl _) = do
   url <- decodedText "builtins.fetchGit" rawUrl
-  sysTmp <- getTempDir
-  let urlHash = sha256Hex (TE.encodeUtf8 url)
-      cloneDir = sysTmp <> "/nova-nix-fetchgit-" <> urlHash
-  (code, _, errOut) <- runProcess "git" ["clone", "--depth", "1", "--", url, cloneDir] ""
-  case code of
-    0 -> pure (VPath cloneDir)
-    _ -> throwEvalError ("builtins.fetchGit: git clone failed: " <> errOut)
+  case checkGitUrl url of
+    Left err -> throwEvalError err
+    Right allowedUrl -> do
+      cloneDir <- createScratchDir "nova-nix-fetchgit-"
+      (code, _, errOut) <-
+        runProcess "git" (gitTransportConfig ++ ["clone", "--depth", "1", "--", allowedUrl, cloneDir]) ""
+      case code of
+        0 -> pure (VPath cloneDir)
+        _ -> do
+          removeScratchDir cloneDir
+          throwEvalError ("builtins.fetchGit: git clone failed: " <> errOut)
 builtinFetchGit (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchGit" "url" attrs
   builtinFetchGit (mkStr url)
