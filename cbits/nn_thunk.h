@@ -81,7 +81,8 @@ typedef char nn_thunk_ptr_size_check_[(sizeof(void *) >= sizeof(int64_t)) ? 1 : 
 
 /* Initialize the global thunk arena.  initial_capacity is the number
  * of thunks to pre-allocate per block (0 uses default: 65536 = 1 MB).
- * Must be called once before any nn_thunk_new() calls. */
+ * Must be called once before any thunk allocation (nn_thunk_new_bc or
+ * the computed-value constructors). */
 void nn_thunk_init(uint32_t initial_capacity);
 
 /* Destroy the global thunk arena, freeing all block memory.
@@ -92,13 +93,8 @@ void nn_thunk_destroy(void);
 
 /* --- Allocation --- */
 
-/* Allocate a new PENDING thunk from the arena (legacy StablePtr path).
- * pending_data is an opaque pointer (StablePtr to Haskell value).
- * Sets bc_idx = 0 to distinguish from bytecode thunks.
- * Returns a pointer into arena memory, valid until nn_thunk_destroy(). */
-nn_thunk_t *nn_thunk_new(void *pending_data);
-
 /* Allocate a new PENDING thunk with a bytecode index + env payload.
+ * Returns a pointer into arena memory, valid until nn_thunk_destroy().
  * bc_idx is the root instruction index in the bytecode store.
  * env_ptr is a StablePtr Env from Haskell (required for knot-tying;
  * raw Ptr would force the env at allocation time, breaking laziness). */

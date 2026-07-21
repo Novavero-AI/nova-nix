@@ -126,19 +126,6 @@ nn_thunk_destroy(void)
 /* --- Allocation --- */
 
 nn_thunk_t *
-nn_thunk_new(void *pending_data)
-{
-    nn_thunk_t *t = arena_alloc(g_arena);
-    if (!t) return NULL;
-    t->state = NN_THUNK_PENDING;
-    t->val_tag = 0;
-    t->_pad = 0;
-    t->bc_idx = 0;  /* legacy StablePtr thunk marker */
-    t->payload = pending_data;
-    return t;
-}
-
-nn_thunk_t *
 nn_thunk_new_bc(uint32_t bc_idx, void *env_ptr)
 {
     nn_thunk_t *t = arena_alloc(g_arena);

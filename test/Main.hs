@@ -33,7 +33,7 @@ import Nix.Eval (MonadEval (..), NixValue (..), StringContext (..), StringContex
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
-import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNew, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
+import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
 import Nix.Eval.CanonPath (canonPath)
 import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
@@ -6506,7 +6506,7 @@ testCThunk = do
   sequence
     [ runTestM "new pending + state" $ do
         sp <- newStablePtr ("pending" :: Text)
-        ptr <- cthunkNew (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
         state <- cthunkState ptr
         pure (assertEqual "state" 0 state),
       runTestM "new computed + state" $ do
@@ -6516,7 +6516,7 @@ testCThunk = do
         pure (assertEqual "state" 1 state),
       runTestM "payload round-trips (pending)" $ do
         sp <- newStablePtr ("hello" :: Text)
-        ptr <- cthunkNew (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
         payload <- cthunkPayload ptr
         val <- deRefStablePtr (castPtrToStablePtr payload) :: IO Text
         pure (assertEqual "payload" "hello" val),
@@ -6528,7 +6528,7 @@ testCThunk = do
         pure (assertEqual "payload" 42 val),
       runTestM "mark_blackhole succeeds on pending" $ do
         sp <- newStablePtr ("x" :: Text)
-        ptr <- cthunkNew (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
         ok <- cthunkMarkBlackhole ptr
         state <- cthunkState ptr
         pure
@@ -6543,13 +6543,13 @@ testCThunk = do
         pure (if not ok then Pass else Fail "should have failed"),
       runTestM "mark_blackhole fails on blackhole" $ do
         sp <- newStablePtr ("x" :: Text)
-        ptr <- cthunkNew (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
         _ <- cthunkMarkBlackhole ptr
         ok <- cthunkMarkBlackhole ptr
         pure (if not ok then Pass else Fail "should have failed"),
       runTestM "set_computed returns old payload" $ do
         pendingSp <- newStablePtr ("old" :: Text)
-        ptr <- cthunkNew (castStablePtrToPtr pendingSp)
+        ptr <- cthunkNewBc 0 (castStablePtrToPtr pendingSp)
         _ <- cthunkMarkBlackhole ptr
         computedSp <- newStablePtr ("new" :: Text)
         oldPayload <- cthunkSetComputed ptr (castStablePtrToPtr computedSp)
@@ -6573,7 +6573,7 @@ testCThunk = do
           ),
       runTestM "set_computed on pending returns old payload" $ do
         sp <- newStablePtr ("x" :: Text)
-        ptr <- cthunkNew (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
         valSp <- newStablePtr ("v" :: Text)
         oldPayload <- cthunkSetComputed ptr (castStablePtrToPtr valSp)
         -- set_computed accepts PENDING (direct memoization, no blackhole step)
@@ -6583,8 +6583,8 @@ testCThunk = do
       runTestM "count tracks allocations" $ do
         countBefore <- cthunkCount
         sp <- newStablePtr (0 :: Int)
-        _ <- cthunkNew (castStablePtrToPtr sp)
-        _ <- cthunkNew (castStablePtrToPtr sp)
+        _ <- cthunkNewBc 0 (castStablePtrToPtr sp)
+        _ <- cthunkNewBc 0 (castStablePtrToPtr sp)
         _ <- cthunkNewComputed (castStablePtrToPtr sp)
         countAfter <- cthunkCount
         let delta = countAfter - countBefore
@@ -6592,7 +6592,7 @@ testCThunk = do
       runTestM "get retrieves by index" $ do
         countBefore <- cthunkCount
         sp <- newStablePtr ("indexed" :: Text)
-        ptr <- cthunkNew (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
         retrieved <- cthunkGet countBefore
         stateOrig <- cthunkState ptr
         stateRetrieved <- cthunkState retrieved
@@ -6604,7 +6604,7 @@ testCThunk = do
       runTestM "stress: 100k thunks" $ do
         countBefore <- cthunkCount
         sp <- newStablePtr (0 :: Int)
-        mapM_ (\_ -> cthunkNew (castStablePtrToPtr sp)) [(1 :: Int) .. 100000]
+        mapM_ (\_ -> cthunkNewBc 0 (castStablePtrToPtr sp)) [(1 :: Int) .. 100000]
         countAfter <- cthunkCount
         let delta = countAfter - countBefore
         -- Spot-check: retrieve one from the middle
