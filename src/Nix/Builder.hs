@@ -71,6 +71,7 @@ import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWit
 import Nix.Store (PathRegistration, Store (..), isValid, placeInStore, registerPaths, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
+import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
@@ -706,7 +707,76 @@ prepareOutput config store candidates tempPairs drvPathText (output, (_outName, 
           selfRefs <- scanTempReferences tempPairs outDir
           let refs = dedupStorePaths (inputRefs ++ selfRefs)
           reg <- placeInStore store outDir targetSP drvPathText refs
-          pure (Right (Just reg))
+          fixedCheck <- verifyFixedOutput output targetPath
+          case fixedCheck of
+            Left err -> do
+              -- Wrong bytes for a declared content address: remove the
+              -- placed tree so a later run cannot meet it on disk.
+              removePathForcibly targetPath
+              pure (Left err)
+            Right () -> pure (Right (Just reg))
+
+-- | Re-check a placed fixed-output output against its declared hash.
+-- A fixed-output derivation declares both its store path and, via the
+-- output spec (@doHashAlgo@ + @doHash@), the exact content the path
+-- must carry - but the builder process writes the actual bytes, so the
+-- placed result must reproduce the declared digest before it may
+-- register as valid (upstream: the fixed-output check in its
+-- registerOutputs).  Flat mode hashes the output file's bytes;
+-- recursive (@r:@) mode hashes the canonical NAR of the placed tree.
+-- Non-fixed outputs (empty @doHashAlgo@) pass unchecked.
+verifyFixedOutput :: DerivationOutput -> FilePath -> IO (Either Text ())
+verifyFixedOutput out placedPath
+  | T.null (doHashAlgo out) = pure (Right ())
+  | recursive = do
+      -- Re-serialises the placed tree: the registration's NAR hash is
+      -- always sha256, while the declared algorithm may be any.
+      entry <- NAR.serialiseFromPath placedPath
+      pure (finish (rawHashWithAlgo algo (NAR.serialise entry)))
+  | otherwise = do
+      isDir <- doesDirectoryExist placedPath
+      if isDir
+        then pure (Left (subject <> ": flat outputHashMode, but the output is a directory"))
+        else finish <$> hashFileWithAlgo algo placedPath
+  where
+    (recursive, algo) = splitHashMode (doHashAlgo out)
+    subject = "fixed-output '" <> spName (doPath out) <> "'"
+    finish Nothing =
+      Left (subject <> ": unsupported hash algorithm '" <> algo <> "'")
+    finish (Just got) = case hexToBytes (doHash out) of
+      Nothing -> Left (subject <> ": malformed expected hash")
+      Just expected
+        | expected == got -> Right ()
+        | otherwise ->
+            Left
+              ( subject
+                  <> ": hash mismatch\n  expected: "
+                  <> doHashAlgo out
+                  <> ":"
+                  <> doHash out
+                  <> "\n  got:      "
+                  <> doHashAlgo out
+                  <> ":"
+                  <> bytesToHexText got
+              )
+
+-- | Stream a file through the incremental hash without materializing it
+-- (a fixed-output file is input-sized).  'Nothing' for an unsupported
+-- algorithm.
+hashFileWithAlgo :: Text -> FilePath -> IO (Maybe BS.ByteString)
+hashFileWithAlgo algo path = case hashInitWithAlgo algo of
+  Nothing -> pure Nothing
+  Just initialCtx -> System.IO.withBinaryFile path System.IO.ReadMode $ \handle ->
+    let consume !ctx = do
+          chunk <- BS.hGet handle fixedOutputHashChunk
+          if BS.null chunk
+            then pure (Just (hashFinalizeBytes ctx))
+            else consume (hashUpdateChunk ctx chunk)
+     in consume initialCtx
+
+-- | Read-chunk size for hashing a placed output file.
+fixedOutputHashChunk :: Int
+fixedOutputHashChunk = 65536
 
 -- | Deduplicate store paths by their (unique) hash.
 dedupStorePaths :: [StorePath] -> [StorePath]

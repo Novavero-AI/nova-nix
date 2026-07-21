@@ -29,7 +29,7 @@ import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryCompone
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm, toATermForHash)
-import Nix.Eval (MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
+import Nix.Eval (MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitUrl, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
@@ -5044,6 +5044,103 @@ testFromTOML = do
           (mkStr "z")
     ]
 
+testFetchGitTransport :: IO [Bool]
+testFetchGitTransport = do
+  putStrLn "eval/fetchgit-transport"
+  sequence
+    [ runTest "allowed schemes pass" $
+        assertEqual
+          "schemes"
+          [ Right "https://example.com/repo.git",
+            Right "http://example.com/repo.git",
+            Right "ssh://git@example.com/repo.git",
+            Right "git://example.com/repo.git",
+            Right "file:///srv/repo"
+          ]
+          ( map
+              checkGitUrl
+              [ "https://example.com/repo.git",
+                "http://example.com/repo.git",
+                "ssh://git@example.com/repo.git",
+                "git://example.com/repo.git",
+                "file:///srv/repo"
+              ]
+          ),
+      runTest "scheme match is case-insensitive" $
+        assertEqual "upper" (Right "HTTPS://example.com/r") (checkGitUrl "HTTPS://example.com/r"),
+      runTest "scp-like remotes and local paths pass" $
+        assertEqual
+          "plain"
+          [ Right "git@github.com:owner/repo.git",
+            Right "user@[::1]:repo",
+            Right "/srv/repo",
+            Right "./repo",
+            Right "C:\\Users\\devon\\repo"
+          ]
+          ( map
+              checkGitUrl
+              [ "git@github.com:owner/repo.git",
+                "user@[::1]:repo",
+                "/srv/repo",
+                "./repo",
+                "C:\\Users\\devon\\repo"
+              ]
+          ),
+      runTest "helper transports are rejected" $
+        let rejected = ["ext::sh -c 'printf x'", "fd::17", "my-helper_2::payload", "::payload"]
+         in case [url | url <- rejected, either (const False) (const True) (checkGitUrl url)] of
+              [] -> Pass
+              slipped -> Fail ("helper urls accepted: " <> T.pack (show slipped)),
+      runTest "an unknown explicit scheme is rejected" $
+        assertLeft "hg scheme" (checkGitUrl "hg://example.com/repo"),
+      runTest "the empty url is rejected" $
+        assertLeft "empty" (checkGitUrl ""),
+      runTestM "fetchGit refuses a helper transport at eval time" $ do
+        outcome <- evalNixIO "." "builtins.fetchGit { url = \"ext::printf x\"; }"
+        pure $ case outcome of
+          Left err
+            | "transport" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("wrong error: " <> err)
+          Right _ -> Fail "helper transport url evaluated"
+    ]
+
+testScratchDirs :: IO [Bool]
+testScratchDirs = do
+  putStrLn "eval/scratch-dirs"
+  st <- newEvalState "."
+  sequence
+    [ runTestM "scratch dirs are distinct, real, and removable" $ do
+        createdA <- runEvalIO st (createScratchDir "nova-nix-test-scratch-")
+        createdB <- runEvalIO st (createScratchDir "nova-nix-test-scratch-")
+        case (createdA, createdB) of
+          (Right dirA, Right dirB)
+            | dirA == dirB -> pure (Fail "two scratch dirs share a name")
+            | otherwise -> do
+                existedA <- Dir.doesDirectoryExist (T.unpack dirA)
+                existedB <- Dir.doesDirectoryExist (T.unpack dirB)
+                removed <- runEvalIO st (removeScratchDir dirA >> removeScratchDir dirB)
+                goneA <- not <$> Dir.doesDirectoryExist (T.unpack dirA)
+                goneB <- not <$> Dir.doesDirectoryExist (T.unpack dirB)
+                pure $ case removed of
+                  Left err -> Fail ("removeScratchDir failed: " <> err)
+                  Right ()
+                    | existedA && existedB && goneA && goneB -> Pass
+                    | otherwise -> Fail "scratch dir lifecycle out of order"
+          (Left err, _) -> pure (Fail ("createScratchDir failed: " <> err))
+          (_, Left err) -> pure (Fail ("createScratchDir failed: " <> err)),
+      runTestM "scratch names carry the requested prefix" $ do
+        created <- runEvalIO st (createScratchDir "nova-nix-test-scratch-")
+        case created of
+          Left err -> pure (Fail ("createScratchDir failed: " <> err))
+          Right dir -> do
+            removed <- runEvalIO st (removeScratchDir dir)
+            pure $ case removed of
+              Left err -> Fail ("removeScratchDir failed: " <> err)
+              Right ()
+                | "nova-nix-test-scratch-" `T.isInfixOf` dir -> Pass
+                | otherwise -> Fail ("prefix missing from: " <> dir)
+    ]
+
 testNarKnownAnswer :: IO [Bool]
 testNarKnownAnswer = do
   putStrLn "nar/known-answer"
@@ -5749,6 +5846,21 @@ mkTestBuildDrv shell outSP script =
       drvEnv = Map.fromList [("name", "test-build"), ("system", TE.encodeUtf8 (platformToText currentPlatform))]
     }
 
+-- | 'mkTestBuildDrv' with a fixed-output spec: registration must
+-- re-verify the placed bytes against the declared digest.
+mkFixedOutputDrv :: Text -> StorePath -> Text -> Text -> Text -> Derivation
+mkFixedOutputDrv shell outSP script algoField hexDigest =
+  (mkTestBuildDrv shell outSP script)
+    { drvOutputs =
+        [ DerivationOutput
+            { doName = "out",
+              doPath = outSP,
+              doHashAlgo = algoField,
+              doHash = hexDigest
+            }
+        ]
+    }
+
 testBuilder :: IO [Bool]
 testBuilder = do
   putStrLn "builder"
@@ -6016,7 +6128,114 @@ testBuilder = do
         closeStore store
         forceRemoveIfExists tmpStore
         forceRemoveIfExists tmpDir
-        pure $ if not buildDirExists then Pass else Fail "build dir not cleaned up after failure"
+        pure $ if not buildDirExists then Pass else Fail "build dir not cleaned up after failure",
+      -- Fixed-output: registration re-checks the placed bytes
+      runTestM "fixed-output flat output verifies and registers" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-fo1"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let payload = "fixed output payload\n"
+            digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" payload)
+            outSP = StorePath "ffffffffffffffffffffffffffffff01" "fo-flat-good"
+            drv = mkFixedOutputDrv shell outSP "printf 'fixed output payload\\n' > $out" "sha256" digest
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo1-tmp"}
+        result <- buildDerivation config store drv
+        registered <- isValid store outSP
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildSuccess _
+            | registered -> Pass
+            | otherwise -> Fail "built but not registered valid"
+          BuildFailure msg code -> Fail ("expected success (" <> T.pack (show code) <> "): " <> msg),
+      runTestM "fixed-output flat mismatch fails and removes the output" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-fo2"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "expected content\n")
+            outSP = StorePath "ffffffffffffffffffffffffffffff02" "fo-flat-bad"
+            drv = mkFixedOutputDrv shell outSP "printf 'tampered content\\n' > $out" "sha256" digest
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo2-tmp"}
+        result <- buildDerivation config store drv
+        registered <- isValid store outSP
+        onDisk <- Dir.doesPathExist (storePathToFilePath (stDir store) outSP)
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildFailure msg _
+            | "hash mismatch" `T.isInfixOf` msg && not registered && not onDisk -> Pass
+            | otherwise ->
+                Fail
+                  ( "wrong failure shape (valid="
+                      <> T.pack (show registered)
+                      <> ", onDisk="
+                      <> T.pack (show onDisk)
+                      <> "): "
+                      <> msg
+                  )
+          BuildSuccess _ -> Fail "mismatched fixed output registered",
+      runTestM "fixed-output recursive tree verifies against its NAR hash" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-fo3"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let tree = NAR.NarDirectory [("data.txt", NAR.NarRegular False "inner bytes\n")]
+            digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (NAR.serialise tree))
+            outSP = StorePath "ffffffffffffffffffffffffffffff03" "fo-rec-good"
+            drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'inner bytes\\n' > $out/data.txt" "r:sha256" digest
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo3-tmp"}
+        result <- buildDerivation config store drv
+        registered <- isValid store outSP
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildSuccess _
+            | registered -> Pass
+            | otherwise -> Fail "built but not registered valid"
+          BuildFailure msg code -> Fail ("expected success (" <> T.pack (show code) <> "): " <> msg),
+      runTestM "fixed-output recursive mismatch fails the build" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-fo4"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let tree = NAR.NarDirectory [("data.txt", NAR.NarRegular False "declared bytes\n")]
+            digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (NAR.serialise tree))
+            outSP = StorePath "ffffffffffffffffffffffffffffff04" "fo-rec-bad"
+            drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'other bytes\\n' > $out/data.txt" "r:sha256" digest
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo4-tmp"}
+        result <- buildDerivation config store drv
+        registered <- isValid store outSP
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildFailure msg _
+            | "hash mismatch" `T.isInfixOf` msg && not registered -> Pass
+            | otherwise -> Fail ("wrong failure shape: " <> msg)
+          BuildSuccess _ -> Fail "mismatched fixed output registered",
+      runTestM "fixed-output flat mode rejects a directory output" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-fo5"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "whatever\n")
+            outSP = StorePath "ffffffffffffffffffffffffffffff05" "fo-flat-dir"
+            drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'x' > $out/f" "sha256" digest
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo5-tmp"}
+        result <- buildDerivation config store drv
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildFailure msg _
+            | "directory" `T.isInfixOf` msg -> Pass
+            | otherwise -> Fail ("wrong failure: " <> msg)
+          BuildSuccess _ -> Fail "directory output passed a flat fixed-output check"
     ]
 
 -- ---------------------------------------------------------------------------
@@ -6683,6 +6902,8 @@ instance MonadEval StubStoreEval where
   readFileBytes _ = throwEvalError "readFile: not available in the stub evaluator"
   getFileType _ = throwEvalError "readFileType: not available in the stub evaluator"
   runProcess _ _ _ = throwEvalError "runProcess: not available in the stub evaluator"
+  createScratchDir _ = throwEvalError "createScratchDir: not available in the stub evaluator"
+  removeScratchDir _ = pure ()
   copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
   isExecutableFile _ = throwEvalError "builtins.path: not available in the stub evaluator"
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in the stub evaluator"
@@ -7840,6 +8061,8 @@ main = bracket_ arenaInit arenaDestroy $ do
           testUpstreamConformance,
           testHashHelpers,
           testNarKnownAnswer,
+          testFetchGitTransport,
+          testScratchDirs,
           testEvalLiterals,
           testEvalVariables,
           testEvalArithmetic,

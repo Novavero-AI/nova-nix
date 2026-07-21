@@ -1138,6 +1138,17 @@ class (Monad m) => MonadEval m where
   -- | Run an external process: @(command, args, stdin) -> (exitCode, stdout, stderr)@.
   runProcess :: Text -> [Text] -> Text -> m (Int, Text, Text)
 
+  -- | Create a fetcher scratch directory under the system temp dir: the
+  -- given name prefix plus an unpredictable suffix, exclusively created.
+  -- A fixed scratch name in the shared temp dir gives any other local
+  -- process a pre-place\/swap window between creation and the store
+  -- copy, so the name must be unguessable and creation must fail rather
+  -- than adopt an existing directory.
+  createScratchDir :: Text -> m Text
+
+  -- | Recursively remove a directory 'createScratchDir' created.
+  removeScratchDir :: Text -> m ()
+
   -- | Resolve a path literal to a canonical path.
   -- In IO evaluation, @~/@ resolves against the home directory and other
   -- relative paths resolve against the current file's directory
@@ -1278,6 +1289,8 @@ instance MonadEval PureEval where
   readFileBytes _ = throwEvalError "readFile: not available in pure evaluation"
   getFileType _ = throwEvalError "readFileType: not available in pure evaluation"
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
+  createScratchDir _ = throwEvalError "createScratchDir: not available in pure evaluation"
+  removeScratchDir _ = pure ()
   copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in pure evaluation"
   isExecutableFile _ = throwEvalError "builtins.path: not available in pure evaluation"
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in pure evaluation"
