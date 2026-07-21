@@ -1919,59 +1919,62 @@ testPathFilterBody :: IO [Bool]
 testPathFilterBody = do
   tmpBase <- getTemporaryDirectory
   let srcDir = tmpBase </> "nova-nix-test-path-filter"
-  removeIfExists srcDir
-  createDirectoryIfMissing True (srcDir </> "sub")
-  createDirectoryIfMissing True (srcDir </> "dropdir")
-  BS.writeFile (srcDir </> "keep.txt") "keep"
-  BS.writeFile (srcDir </> "drop.log") "drop"
-  BS.writeFile (srcDir </> "sub" </> "inner.txt") "inner"
-  BS.writeFile (srcDir </> "dropdir" </> "x.txt") "gone"
-  let quoted = nixQuotedPath srcDir
+      setup = do
+        removeIfExists srcDir
+        createDirectoryIfMissing True (srcDir </> "sub")
+        createDirectoryIfMissing True (srcDir </> "dropdir")
+        BS.writeFile (srcDir </> "keep.txt") "keep"
+        BS.writeFile (srcDir </> "drop.log") "drop"
+        BS.writeFile (srcDir </> "sub" </> "inner.txt") "inner"
+        BS.writeFile (srcDir </> "dropdir" </> "x.txt") "gone"
+      quoted = nixQuotedPath srcDir
       filterExpr = "(p: t: builtins.match \".*[.]log\" p == null && baseNameOf p != \"dropdir\")"
       filteredPath = "(builtins.path { path = " <> quoted <> "; name = \"src\"; filter = " <> filterExpr <> "; })"
       unfilteredPath = "(builtins.path { path = " <> quoted <> "; name = \"src\"; })"
-  sequence
-    [ runTestIO
-        "kept file survives with its content"
-        "."
-        ("builtins.readFile (" <> filteredPath <> " + \"/keep.txt\")")
-        (mkStr "keep"),
-      runTestIO
-        "kept subtree survives"
-        "."
-        ("builtins.readFile (" <> filteredPath <> " + \"/sub/inner.txt\")")
-        (mkStr "inner"),
-      runTestIO
-        "rejected file is dropped"
-        "."
-        ("builtins.pathExists (" <> filteredPath <> " + \"/drop.log\")")
-        (VBool False),
-      runTestIO
-        "rejected directory prunes its subtree"
-        "."
-        ("builtins.pathExists (" <> filteredPath <> " + \"/dropdir\")")
-        (VBool False),
-      runTestIO
-        "filtered and unfiltered store paths differ"
-        "."
-        (filteredPath <> " == " <> unfilteredPath)
-        (VBool False),
-      runTestIO
-        "same filter yields the same store path"
-        "."
-        (filteredPath <> " == " <> filteredPath)
-        (VBool True),
-      runTestIO
-        "filterSource is path-with-filter under the source basename"
-        "."
-        ( "builtins.filterSource (p: t: true) "
-            <> quoted
-            <> " == builtins.path { path = "
-            <> quoted
-            <> "; filter = (p: t: true); }"
-        )
-        (VBool True)
-    ]
+  -- bracket_: cleanup runs even if tests throw
+  bracket_ setup (removeIfExists srcDir) $
+    sequence
+      [ runTestIO
+          "kept file survives with its content"
+          "."
+          ("builtins.readFile (" <> filteredPath <> " + \"/keep.txt\")")
+          (mkStr "keep"),
+        runTestIO
+          "kept subtree survives"
+          "."
+          ("builtins.readFile (" <> filteredPath <> " + \"/sub/inner.txt\")")
+          (mkStr "inner"),
+        runTestIO
+          "rejected file is dropped"
+          "."
+          ("builtins.pathExists (" <> filteredPath <> " + \"/drop.log\")")
+          (VBool False),
+        runTestIO
+          "rejected directory prunes its subtree"
+          "."
+          ("builtins.pathExists (" <> filteredPath <> " + \"/dropdir\")")
+          (VBool False),
+        runTestIO
+          "filtered and unfiltered store paths differ"
+          "."
+          (filteredPath <> " == " <> unfilteredPath)
+          (VBool False),
+        runTestIO
+          "same filter yields the same store path"
+          "."
+          (filteredPath <> " == " <> filteredPath)
+          (VBool True),
+        runTestIO
+          "filterSource is path-with-filter under the source basename"
+          "."
+          ( "builtins.filterSource (p: t: true) "
+              <> quoted
+              <> " == builtins.path { path = "
+              <> quoted
+              <> "; filter = (p: t: true); }"
+          )
+          (VBool True)
+      ]
 
 -- | Whether this host can create symlinks (Windows needs Developer Mode
 -- or elevation).  The symlink-walk fixtures cannot be built without it,
@@ -3405,6 +3408,7 @@ testBuildOrchestrator = do
         result <- buildWithDeps config store drv drvSP
         closeStore store
         forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
         -- Builder will fail (nonexistent) but the graph should resolve
         -- correctly: the failure must come from SPAWNING THE BUILDER, not
         -- from graph resolution or drv reading upstream of it.
