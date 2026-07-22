@@ -49,7 +49,7 @@ import Nix.Derivation (fromATerm)
 import Nix.Eval (eval)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
-import Nix.Eval.CanonPath (canonBaseName, canonPath)
+import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
@@ -425,18 +425,17 @@ instance MonadEval EvalIO where
     baseDir <- EvalIO (asks esBaseDir)
     -- ~/x resolves against the home directory (upstream lexes HPATH and
     -- expands it at eval); everything else relative joins the base dir.
-    -- Both end in lexical canonicalization: no dot segment or repeated
-    -- separator survives into the path value.  Native separators are
-    -- PRESERVED (CanonPath's style rule), so a native base dir yields a
-    -- native-spelled value - path-value consumers split separator-aware
-    -- ('canonBaseName' \/ 'canonDirName'), never on '/' alone.
+    -- Both end at the producer gate ('canonPathValue'): the value is
+    -- absolute, lexically canonical, and slash-spelled regardless of
+    -- the base dir's native spelling - platform separators exist only
+    -- at the filesystem boundary.
     expanded <- case T.stripPrefix "~/" path of
       Just below -> do
         home <- wrapIO Dir.getHomeDirectory
         pure (home </> T.unpack below)
       Nothing -> pure (T.unpack path)
     let absolute = if isRelative expanded then baseDir </> expanded else expanded
-    pure (canonPath (T.pack absolute))
+    pure (canonPathValue (T.pack absolute))
 
   forceThunk evalFn (Thunk ptr) = do
     -- Force protocol: PENDING to BLACKHOLE to COMPUTED with memoization.

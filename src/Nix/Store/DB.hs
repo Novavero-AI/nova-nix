@@ -195,6 +195,12 @@ registerPaths db regs = withTransaction (sdbConn db) $ do
 -- | Insert (or refresh) a single ValidPaths row.
 insertPathRow :: StoreDB -> PathRegistration -> IO ()
 insertPathRow db reg = do
+  -- DB rows key store paths in PLATFORM spelling (storePathToFilePath):
+  -- the database is host-local state describing this host's store tree,
+  -- every writer and reader in this module uses the same spelling, and
+  -- the store dir itself is host configuration.  Identity artifacts
+  -- (drv ATerm, narinfo, eval-visible store-path strings) spell
+  -- canonically; the DB is deliberately not one of them.
   let pathText = T.pack (storePathToFilePath (sdbDir db) (prPath reg))
   execute
     (sdbConn db)
@@ -255,6 +261,13 @@ isValidPath db sp = do
 
 -- | Query the references of a registered store path.
 -- Returns the full path strings of referenced store paths.
+--
+-- Reads return the stored text without re-parsing: every row was
+-- written from a validated 'StorePath' inside this module's
+-- transactions, so this is trust-on-read of host-local state the
+-- module itself wrote (the delete path documents the same stance for
+-- its raw-basename key).  Callers that need a 'StorePath' back parse
+-- at their own boundary.
 queryReferences :: StoreDB -> StorePath -> IO [Text]
 queryReferences db sp = do
   let pathText = T.pack (storePathToFilePath (sdbDir db) sp)
