@@ -4906,7 +4906,7 @@ filteredSourceNar filterFn rootPath = do
         executable <- isExecutableFile path
         bytes <- readFileBytes path
         pure (NAR.NarRegular executable bytes)
-      "symlink" -> NAR.NarSymlink <$> readSymlinkTarget path
+      "symlink" -> NAR.NarSymlink . TE.encodeUtf8 <$> readSymlinkTarget path
       "directory" -> do
         children <- listDirectory path
         kept <- mapM (keepChild path) children
@@ -4916,7 +4916,7 @@ filteredSourceNar filterFn rootPath = do
       let childPath = parent <> "/" <> name
       keep <- filterAccepts childPath childType
       if keep
-        then Just . (,) name <$> buildEntry childPath childType
+        then Just . (,) (TE.encodeUtf8 name) <$> buildEntry childPath childType
         else pure Nothing
     filterAccepts path fileType = do
       partial <- applyValue filterFn (mkStr path)
