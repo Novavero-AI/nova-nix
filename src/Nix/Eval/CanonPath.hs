@@ -21,6 +21,7 @@
 module Nix.Eval.CanonPath
   ( canonPath,
     canonBaseName,
+    canonDirName,
   )
 where
 
@@ -88,3 +89,16 @@ splitOnSeparators = T.split isPathSeparator
 -- trailing separator, which the caller treats as "no base name".
 canonBaseName :: Text -> Text
 canonBaseName = T.takeWhileEnd (not . isPathSeparator)
+
+-- | Parent of a path VALUE - upstream @dirOf@ on paths.  Splits on the
+-- platform's separators like 'canonBaseName', because path values may
+-- be native-spelled; the textual '/'-only rule for STRING operands
+-- lives with its builtin.  A sole leading separator is its own parent
+-- (@dirOf \/foo@ is @\/@, and a drive root @C:\\foo@ keeps its rooted
+-- @C:\\@); a separatorless path has parent @.@.
+canonDirName :: Text -> Text
+canonDirName t = case T.dropWhileEnd (not . isPathSeparator) t of
+  "" -> "."
+  prefix ->
+    let dir = T.dropWhileEnd isPathSeparator prefix
+     in if T.null dir || fst (splitDriveLetter dir) == dir then prefix else dir

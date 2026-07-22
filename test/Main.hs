@@ -1488,6 +1488,55 @@ testBatch1 = do
         assertEval "dirOf-flat" "builtins.dirOf \"filename\"" (mkStr "."),
       runTest "dirOf root-level path" $
         assertEval "dirOf-root" "builtins.dirOf \"/foo\"" (mkStr "/"),
+      -- Path VALUES arrive native-spelled when eval's base dir is a
+      -- native path (the CLI case); the path-operand splits must be
+      -- separator-aware.  The forward-slash tests above use a '/'
+      -- base and cannot see this.
+      runTestM "baseNameOf on a native-based path value" $ do
+        cwd <- Dir.getCurrentDirectory
+        result <- evalNixIO cwd "builtins.baseNameOf ./regression-name.nix"
+        pure $ case result of
+          Right v
+            | v == mkStr "regression-name.nix" -> Pass
+            | otherwise -> Fail ("wrong basename: " <> T.pack (show v))
+          Left err -> Fail ("eval failed: " <> T.pack (show err)),
+      runTestM "dirOf on a native-based path value" $ do
+        cwd <- Dir.getCurrentDirectory
+        dirResult <- evalNixIO cwd "builtins.dirOf ./sub/regression-name.nix"
+        parentResult <- evalNixIO cwd "./sub"
+        pure $
+          if dirResult == parentResult
+            then Pass
+            else
+              Fail
+                ( "dirOf mismatch: "
+                    <> T.pack (show dirResult)
+                    <> " vs "
+                    <> T.pack (show parentResult)
+                ),
+      -- appendContext: a key that is not a store path must refuse, as
+      -- upstream does - a fabricated identity would flow into
+      -- derivation inputs.
+      runTest "appendContext rejects a non-store-path key" $
+        assertEvalFail
+          "appendContext-badkey"
+          "builtins.appendContext \"x\" { \"not-a-store-path\" = { path = true; }; }",
+      runTest "appendContext accepts a store-path key" $
+        assertEval
+          "appendContext-ok"
+          "if (builtins.appendContext \"x\" { \"/nix/store/00000000000000000000000000000000-y\" = { path = true; }; }) == \"x\" then \"ok\" else \"no\""
+          (mkStr "ok"),
+      -- storePath: the hash component is charset-validated like every
+      -- other store-path parse boundary ('E' is outside nix-base32).
+      runTest "storePath rejects a non-base32 hash" $
+        assertEvalFail
+          "storePath-badhash"
+          "builtins.storePath \"/nix/store/EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE-x\"",
+      runTest "storePath accepts a valid store path" $
+        assertEval
+          "storePath-ok"
+          "if (builtins.storePath \"/nix/store/00000000000000000000000000000000-x\") == \"/nix/store/00000000000000000000000000000000-x\" then \"ok\" else \"no\""
+          (mkStr "ok"),
       runTest "dirOf root" $
         assertEval "dirOf-slash" "builtins.dirOf \"/\"" (mkStr "/"),
       -- concatLists

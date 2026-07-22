@@ -425,8 +425,11 @@ instance MonadEval EvalIO where
     baseDir <- EvalIO (asks esBaseDir)
     -- ~/x resolves against the home directory (upstream lexes HPATH and
     -- expands it at eval); everything else relative joins the base dir.
-    -- Both end in lexical canonicalization, so no dot segment, repeated
-    -- separator, or platform backslash survives into the path value.
+    -- Both end in lexical canonicalization: no dot segment or repeated
+    -- separator survives into the path value.  Native separators are
+    -- PRESERVED (CanonPath's style rule), so a native base dir yields a
+    -- native-spelled value - path-value consumers split separator-aware
+    -- ('canonBaseName' \/ 'canonDirName'), never on '/' alone.
     expanded <- case T.stripPrefix "~/" path of
       Just below -> do
         home <- wrapIO Dir.getHomeDirectory

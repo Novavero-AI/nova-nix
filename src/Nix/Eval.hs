@@ -98,7 +98,7 @@ import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
-import Nix.Eval.CanonPath (canonPath)
+import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPath)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, nixCompare, nixEqual)
@@ -169,7 +169,7 @@ import Nix.Expr.Types
     UnaryOp (..),
   )
 import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest, sha256Hex)
-import Nix.Store.Path (StorePath (..), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, storePathNameErrorText, storePathNameReasonText, storePathToText)
+import Nix.Store.Path (StorePath (..), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathNameErrorText, storePathNameReasonText, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.NAR as NAR
@@ -2252,9 +2252,13 @@ parseContextAttrs attrs = do
       val <- force thunk
       case val of
         VAttrs inner -> do
-          let sp = case parseStorePath defaultStoreDir pathText of
-                Just parsed -> parsed
-                Nothing -> StorePath (T.take 32 (T.drop (T.length storeDirPrefix) pathText)) (T.drop 33 (T.drop (T.length storeDirPrefix) pathText))
+          -- The key must parse as a store path, as upstream requires; a
+          -- fabricated identity here would flow into derivation inputs.
+          sp <- case parseStorePath defaultStoreDir pathText of
+            Just parsed -> pure parsed
+            Nothing ->
+              throwEvalError
+                ("builtins.appendContext: context key is not a store path: " <> pathText)
           hasPath <- getBoolAttr "path" inner
           hasAllOuts <- getBoolAttr "allOutputs" inner
           outNames <- getOutputsList inner
@@ -2286,41 +2290,34 @@ parseContextAttrs attrs = do
         VStr s _ -> decodedText "builtins.appendContext" s
         _ -> throwEvalError "builtins.appendContext: output name must be a string"
 
+-- | For a STRING operand, upstream's rule is textual: everything after
+-- the final @/@.  For a PATH operand the value may be native-spelled
+-- (eval's base dir can be a native Windows path), so the split is
+-- separator-aware via 'canonBaseName'.
 builtinBaseNameOf :: (MonadEval m) => NixValue -> m NixValue
 builtinBaseNameOf (VStr s ctx) = pure (VStr (lastComponentBytes s) ctx)
-builtinBaseNameOf (VPath p) = pure (mkStr (lastComponent p))
+builtinBaseNameOf (VPath p) = pure (mkStr (canonBaseName p))
 builtinBaseNameOf other =
   throwEvalError ("builtins.baseNameOf: expected a string or path, got " <> typeName other)
 
-lastComponent :: Text -> Text
-lastComponent t = case reverse (filter (not . T.null) (T.splitOn "/" t)) of
-  [] -> ""
-  (final : _) -> final
-
--- | Byte-level 'lastComponent' for string operands ('/' is a single byte
+-- | Byte-level last component for string operands ('/' is a single byte
 -- in UTF-8 and never occurs inside a multi-byte sequence).
 lastComponentBytes :: BS.ByteString -> BS.ByteString
 lastComponentBytes t = case reverse (filter (not . BS.null) (BC.split '/' t)) of
   [] -> ""
   (final : _) -> final
 
+-- | String operands keep upstream's textual '/'-only rule
+-- ('dirComponentBytes'); path operands may be native-spelled and split
+-- separator-aware via 'canonDirName'.
 builtinDirOf :: (MonadEval m) => NixValue -> m NixValue
 builtinDirOf (VStr s ctx) = pure (VStr (dirComponentBytes s) ctx)
-builtinDirOf (VPath p) = pure (VPath (dirComponent p))
+builtinDirOf (VPath p) = pure (VPath (canonDirName p))
 builtinDirOf other =
   throwEvalError ("builtins.dirOf: expected a string or path, got " <> typeName other)
 
-dirComponent :: Text -> Text
-dirComponent t =
-  case T.findIndex (== '/') (T.reverse t) of
-    Nothing -> "."
-    Just n ->
-      let dir = T.take (T.length t - n - 1) t
-       in -- A leading or sole '/' leaves an empty prefix; Nix's dirOf yields "/".
-          if T.null dir then "/" else dir
-
--- | Byte-level 'dirComponent' for string operands: everything before the
--- last '/' byte, with the same "." / "/" edge results.
+-- | Byte-level dir component for string operands: everything before the
+-- last '/' byte, with upstream's "." / "/" edge results.
 dirComponentBytes :: BS.ByteString -> BS.ByteString
 dirComponentBytes t =
   case BC.elemIndexEnd '/' t of
@@ -3255,16 +3252,12 @@ validateStorePath p = case enclosingStorePath p of
 -- 'Nothing' if the path is not in the store.  Accepts a bare store path and a
 -- subpath (@\/nix\/store\/\<hash\>-\<name\>\/sub@ resolves to its
 -- @\<hash\>-\<name\>@ component), the way upstream marks the enclosing store
--- path Opaque for either.
+-- path Opaque for either.  The component passes the same charset
+-- validation as every other store-path parse boundary.
 enclosingStorePath :: Text -> Maybe StorePath
 enclosingStorePath p = do
   rest <- T.stripPrefix storeDirPrefix p
-  let component = T.takeWhile (/= '/') rest
-      (hash, hyphenName) = T.splitAt 32 component
-  (hyphen, name) <- T.uncons hyphenName
-  if hyphen == '-' && not (T.null name) && T.length hash == 32
-    then Just (StorePath hash name)
-    else Nothing
+  parseStorePathBaseName (T.takeWhile (/= '/') rest)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - Nix search path
