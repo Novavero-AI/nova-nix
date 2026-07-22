@@ -46,6 +46,7 @@ module Nix.Push
     stripHashPrefix,
     storePathBasename,
     checkRecordedNarHash,
+    narHashMatches,
   )
 where
 
@@ -66,7 +67,7 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types as HTTP
 import Nix.Store (Store (..), queryDeriver, queryPathInfo, queryReferences)
 import qualified Nix.Store.DB as DB
-import Nix.Store.Path (StorePath (..), defaultStoreDir, parseStorePath, storePathToFilePath, storePathToText)
+import Nix.Store.Path (StorePath (spHash, spName), defaultStoreDir, parseStorePath, storePathToFilePath, storePathToText)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
@@ -330,7 +331,7 @@ checkRecordedNarHash recorded narHash sp = case recorded of
           <> " is on disk but not registered as valid; refusing to publish it with unknown references"
       )
   Just info
-    | DB.piNarHash info /= narHash ->
+    | not (narHashMatches (DB.piNarHash info) narHash) ->
         Left
           ( "store integrity: "
               <> storePathBasename sp
@@ -340,6 +341,17 @@ checkRecordedNarHash recorded narHash sp = case recorded of
               <> DB.piNarHash info
           )
     | otherwise -> Right ()
+
+-- | Recorded and computed NAR hashes match when their decoded digests
+-- agree, so any valid spelling of one digest matches (a foreign cache
+-- may record base16 where local hashing renders nix-base32).  A
+-- recorded value no spelling parses falls back to exact text equality,
+-- keeping legacy rows comparable rather than un-checkable.
+narHashMatches :: Text -> Text -> Bool
+narHashMatches recorded computed =
+  case (Hash.parseNixHash recorded, Hash.parseNixHash computed) of
+    (Right a, Right b) -> a == b
+    _ -> recorded == computed
 
 -- | Upload a rendered narinfo (the server validates and signs it).
 uploadNarInfo :: HTTP.Manager -> PushConfig -> StorePath -> NarInfo -> ExceptT Text IO ()

@@ -39,7 +39,7 @@ import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCP
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
 import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw, materializeEvalSources, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
-import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, parseStorePath, platformStoreDir, storePathHashLen, storePathToFilePath)
+import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir)
 import System.Directory (canonicalizePath, getCurrentDirectory, getTemporaryDirectory)
@@ -524,18 +524,13 @@ resolvePushRoots store pushArgs
             [ parseStorePath (stDir store) txt,
               parseStorePath platformStoreDir txt,
               parseStorePath defaultStoreDir txt,
-              parseBareBasename txt
+              -- A bare basename passes the same charset gate as every
+              -- other spelling: push targets are real store paths.
+              parseStorePathBaseName txt
             ]
        in case catMaybes attempts of
             (sp : _) -> Right sp
             [] -> Left ("not a store path: " <> txt)
-    parseBareBasename txt
-      | T.length txt >= storePathHashLen + 2,
-        (hashPart, rest) <- T.splitAt storePathHashLen txt,
-        Just ('-', name) <- T.uncons rest,
-        not (T.null name) =
-          Just (StorePath hashPart name)
-      | otherwise = Nothing
 
 -- | Print an error to stderr and exit.
 failWith :: T.Text -> IO a

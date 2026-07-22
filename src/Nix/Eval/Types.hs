@@ -139,7 +139,8 @@ import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
-import Nix.Store.Path (StorePath (..), StorePathNameError, storePathNameErrorText)
+import Nix.Store.Path (StorePath, StorePathNameError, storePathNameErrorText)
+import Nix.Store.Path.Internal (StorePath (StorePath))
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Text.Regex.TDFA as RE
 
@@ -1003,6 +1004,10 @@ unmarshalStringContext ptr = do
       tag <- cctxstrElemTag cptr idx
       hashSym <- cctxstrElemHash cptr idx
       nameSym <- cctxstrElemName cptr idx
+      -- Raw construction (Nix.Store.Path.Internal): provenance-safe -
+      -- these symbols were interned from a validated StorePath's own
+      -- fields by marshalStringContext, so this is a round-trip, not a
+      -- parse boundary.
       let sp = StorePath (symbolText (Symbol hashSym)) (symbolText (Symbol nameSym))
       case tag of
         0 -> pure (SCPlain sp)

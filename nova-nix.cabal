@@ -76,6 +76,7 @@ library
     Nix.Eval.Arena
     Nix.Store
     Nix.Store.Path
+    Nix.Store.Path.Internal
     Nix.Store.DB
     Nix.Store.CaseSensitive
     Nix.DependencyGraph

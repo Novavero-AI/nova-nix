@@ -169,7 +169,8 @@ import Nix.Expr.Types
     UnaryOp (..),
   )
 import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest, sha256Hex)
-import Nix.Store.Path (StorePath (..), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathNameErrorText, storePathNameReasonText, storePathToText)
+import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathNameErrorText, storePathNameReasonText, storePathToText)
+import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.NAR as NAR
@@ -3806,7 +3807,7 @@ builtinDerivationStrict (VAttrs attrs) = do
             drvEnv = env
           }
       -- Output carrying only its name; the path is masked at render time.
-      maskedOutput name = DerivationOutput name (StorePath "" "") "" ""
+      maskedOutput name = DerivationOutput name maskedOutputPath "" ""
 
   -- Fixed-output derivations (fetchurl etc.) are content-addressed and hash
   -- via the @fixed:out:@ scheme; input-addressed derivations recurse through

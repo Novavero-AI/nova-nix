@@ -48,11 +48,12 @@ import Nix.Hash (makeFixedOutputPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
-import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, planMissing, storePathBasename, stripHashPrefix)
+import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, narHashMatches, planMissing, storePathBasename, stripHashPrefix)
 import Nix.Store (DeleteOutcome (..), Store (..), addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
-import Nix.Store.Path (StoreDir (..), StorePath (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
+import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as CHash
@@ -3109,19 +3110,24 @@ testSubstituter = do
       -- defaultCacheConfig has priority 40
       runTest "defaultCacheConfig priority" $
         assertEqual "default-prio" 40 (Subst.ccPriority Subst.defaultCacheConfig),
-      -- verifyNarHash: matching NAR hash accepted (HIGH#2 integrity gate)
+      -- verifyNarHash: matching NAR hash accepted (HIGH#2 integrity gate);
+      -- the returned digest is the declared hash, decoded.
       runTest "verifyNarHash accepts matching hash" $
-        assertEqual "narhash-match" (Right ()) (Subst.verifyNarHash (sampleNarInfo sampleNarHash) sampleNarBytes),
+        case Subst.verifyNarHash (sampleNarInfo sampleNarHash) sampleNarBytes of
+          Right declared
+            | CHash.formatNixHash declared == sampleNarHash -> Pass
+            | otherwise -> Fail "returned digest does not match the declared hash"
+          Left err -> Fail ("expected acceptance, got: " <> err),
       -- verifyNarHash: mismatched NAR hash rejected
       runTest "verifyNarHash rejects mismatched hash" $
         case Subst.verifyNarHash (sampleNarInfo wrongNarHash) sampleNarBytes of
           Left _ -> Pass
-          Right () -> Fail "expected mismatch rejection",
+          Right _ -> Fail "expected mismatch rejection",
       -- verifyNarHash: malformed NAR hash rejected
       runTest "verifyNarHash rejects malformed hash" $
         case Subst.verifyNarHash (sampleNarInfo "not-a-hash") sampleNarBytes of
           Left _ -> Pass
-          Right () -> Fail "expected malformed-hash rejection",
+          Right _ -> Fail "expected malformed-hash rejection",
       -- narInfoMatchesPath: identity match accepted
       runTest "narInfoMatchesPath accepts matching identity" $
         if Subst.narInfoMatchesPath (StorePath sampleHash "hello") (sampleNarInfo sampleNarHash)
@@ -3901,7 +3907,25 @@ testPushPure = do
           Left err
             | "DB recorded" `T.isInfixOf` err -> Pass
             | otherwise -> Fail ("wrong error: " <> err)
-          Right () -> Fail "hash mismatch must not be publishable"
+          Right () -> Fail "hash mismatch must not be publishable",
+      -- narHashMatches decodes both spellings before comparing.  Today
+      -- parseNixHash reads only the sha256:nix-base32 spelling, so a
+      -- base16-recorded digest (both literals spell the empty-string
+      -- sha256) falls back to text equality and refuses - the safe
+      -- direction.  When the parser learns more spellings (foreign
+      -- caches), this pin flips and the gate widens with it.
+      runTest "push gate pins the accepted hash spellings" $
+        if narHashMatches
+          "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          "sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73"
+          then Fail "base16 spelling unexpectedly matched - widen this pin"
+          else Pass,
+      runTest "push gate still refuses different digests" $
+        if narHashMatches
+          "sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73"
+          (Hash.formatNixHash (Hash.hashBytes "different"))
+          then Fail "distinct digests must not match"
+          else Pass
     ]
   where
     pathInfoFor recordedHash =
@@ -5878,6 +5902,18 @@ testFromATerm = do
       -- Round-trip: complex derivation
       runTest "fromATerm round-trip complex" $
         assertEqual "complex round-trip" (Right complexTestDrv) (fromATerm (toATerm complexTestDrv)),
+      -- A .drv read from disk is input: an output name that violates the
+      -- store-name rules (here a traversal shape that would later join
+      -- the build dir) must refuse at parse.
+      runTest "fromATerm rejects a traversal-shaped output name" $
+        let evil =
+              simpleTestDrv
+                { drvOutputs =
+                    [DerivationOutput "../evil" (StorePath (T.replicate 32 "a") "pkg") "" ""]
+                }
+         in case fromATerm (toATerm evil) of
+              Left _ -> Pass
+              Right _ -> Fail "parsed a drv with a traversal output name",
       -- drv4: the modulo-substitution section merges input-drv entries that
       -- share a modulo-hash key, unioning their output-name sets, so it is
       -- byte-identical to the already-merged form.  (Just subs replaces the

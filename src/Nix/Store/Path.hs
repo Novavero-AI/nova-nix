@@ -38,7 +38,7 @@ module Nix.Store.Path
     windowsStoreDir,
 
     -- * Store paths
-    StorePath (..),
+    StorePath (spHash, spName),
     storePathToFilePath,
     storePathToText,
     isCanonicalStoreText,
@@ -62,6 +62,7 @@ where
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Nix.Store.Path.Internal (StorePath (..))
 import System.FilePath ((</>))
 import qualified System.Info
 
@@ -95,15 +96,6 @@ platformStoreDirText = T.pack (unStoreDir platformStoreDir)
 -- | Default store directory on Windows: @C:\\nix\\store@.
 windowsStoreDir :: StoreDir
 windowsStoreDir = StoreDir "C:\\nix\\store"
-
--- | A parsed store path: the hash and name components.
-data StorePath = StorePath
-  { -- | The 32-character Nix base-32 hash.
-    spHash :: !Text,
-    -- | The human-readable name (e.g. @hello-2.12.1@).
-    spName :: !Text
-  }
-  deriving (Eq, Ord, Show)
 
 -- | Convert a 'StorePath' to a full filesystem path under a 'StoreDir'.
 storePathToFilePath :: StoreDir -> StorePath -> FilePath

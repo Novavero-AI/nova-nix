@@ -65,7 +65,7 @@ import Database.SQLite.Simple
     query,
     withTransaction,
   )
-import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
+import Nix.Store.Path (StoreDir (..), StorePath, storePathToFilePath)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 

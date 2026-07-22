@@ -69,7 +69,7 @@ import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
 import Nix.Store (PathRegistration, Store (..), isValid, placeInStore, registerPaths, scanReferences, scanTempReferences)
-import Nix.Store.Path (StoreDir (..), StorePath (..), storePathToFilePath)
+import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
