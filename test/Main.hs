@@ -36,7 +36,7 @@ import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
-import Nix.Eval.CanonPath (canonPath)
+import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
@@ -1501,6 +1501,24 @@ testBatch1 = do
             | v == mkStr "regression-name.nix" -> Pass
             | otherwise -> Fail ("wrong basename: " <> T.pack (show v))
           Left err -> Fail ("eval failed: " <> T.pack (show err)),
+      -- The path-value spec: absolute, lexically canonical, and
+      -- slash-spelled regardless of the base dir's native spelling.
+      runTestM "path values are slash-canonical from a native base" $ do
+        cwd <- Dir.getCurrentDirectory
+        result <- evalNixIO cwd "toString ./spec-name.nix"
+        let expected = mkStr (T.replace "\\" "/" (T.pack cwd) <> "/spec-name.nix")
+        pure $ case result of
+          Right v
+            | v == expected -> Pass
+            | otherwise -> Fail ("wrong spelling: " <> T.pack (show v))
+          Left err -> Fail ("eval failed: " <> T.pack (show err)),
+      runTest "canonPathValue folds platform separators only" $
+        let folded = canonPathValue "C:\\a\\.\\b"
+            expectedByPlatform =
+              if SI.os == "mingw32"
+                then "C:/a/b" -- '\\' is a separator here and folds
+                else "C:\\a\\.\\b" -- '\\' is a file-name character, preserved
+         in assertEqual "platform fold" expectedByPlatform folded,
       runTestM "dirOf on a native-based path value" $ do
         cwd <- Dir.getCurrentDirectory
         dirResult <- evalNixIO cwd "builtins.dirOf ./sub/regression-name.nix"
@@ -2349,7 +2367,7 @@ testBatchCIO = do
               <> nixQuotedPath nixpkgsDir
               <> "; } ] \"nixpkgs\""
           )
-          (VPath (T.pack nixpkgsDir)),
+          (VPath (canonPathValue (T.pack nixpkgsDir))),
         runTestIOFail
           "findFile no match"
           testDir
@@ -7298,7 +7316,7 @@ testClassIFollowupsIO = do
         runTestM "tilde path literal expands against the home directory" $ do
           home <- Dir.getHomeDirectory
           result <- evalNixIO testDir "builtins.toString ~/nova-tilde-probe"
-          let expected = canonPath (T.pack (home </> "nova-tilde-probe"))
+          let expected = canonPathValue (T.pack (home </> "nova-tilde-probe"))
           pure $ assertRight "tilde" result $ \val ->
             assertEqual "tilde-expanded" (mkStr expected) val,
         -- a search-path match is returned CANONICALIZED

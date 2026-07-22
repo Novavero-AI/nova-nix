@@ -98,7 +98,7 @@ import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
-import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPath)
+import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, nixCompare, nixEqual)
@@ -360,7 +360,7 @@ evalAddWithCoercion left right = case (left, right) of
   -- Path + path: text concatenation, canonicalized - the joined spelling
   -- (dot segments, doubled separators) never survives into the value, as
   -- upstream (CanonPath on the concatenated text).
-  (VPath a, VPath b) -> pure (VPath (canonPath (a <> b)))
+  (VPath a, VPath b) -> pure (VPath (canonPathValue (a <> b)))
   -- Path + coercible: the result stays a path, the right side coerces
   -- WITHOUT a store copy, and a right side carrying string context is an
   -- error, as upstream (a store-path reference cannot survive inside a
@@ -371,7 +371,7 @@ evalAddWithCoercion left right = case (left, right) of
     if rightCtx == emptyContext
       then do
         appended <- decodedText "path concatenation" rightStr
-        pure (VPath (canonPath (a <> appended)))
+        pure (VPath (canonPathValue (a <> appended)))
       else throwEvalError "cannot append a string with context (a store-path reference) to a path"
   -- Strings: direct concat.
   (VStr {}, VStr {}) -> evalBinary force OpAdd left right
@@ -3215,7 +3215,7 @@ builtinToPath (VStr rawBytes _) = do
   case T.uncons s of
     Nothing -> throwEvalError "builtins.toPath: empty path"
     -- Canonicalized like every other path production site, as upstream.
-    Just ('/', _) -> pure (VPath (canonPath s))
+    Just ('/', _) -> pure (VPath (canonPathValue s))
     Just _ -> throwEvalError ("builtins.toPath: path must be absolute, got " <> s)
 builtinToPath other =
   throwEvalError ("builtins.toPath: expected a string or path, got " <> typeName other)
@@ -3309,14 +3309,14 @@ findFirst [] name =
 findFirst ((prefix, path) : rest) name
   | prefix == name || (not (T.null prefix) && (prefix <> "/") `T.isPrefixOf` name) =
       let suffix = if prefix == name then "" else T.drop (T.length prefix + 1) name
-          candidate = canonPath (if T.null suffix then path else path <> "/" <> suffix)
+          candidate = canonPathValue (if T.null suffix then path else path <> "/" <> suffix)
        in do
             exists <- doesPathExist candidate
             if exists
               then pure (VPath candidate)
               else findFirst rest name
   | T.null prefix =
-      let candidate = canonPath (path <> "/" <> name)
+      let candidate = canonPathValue (path <> "/" <> name)
        in do
             exists <- doesPathExist candidate
             if exists
@@ -3494,7 +3494,7 @@ builtinFetchGit (VStr rawUrl _) = do
       (code, _, errOut) <-
         runProcess "git" (gitTransportConfig ++ ["clone", "--depth", "1", "--", allowedUrl, cloneDir]) ""
       case code of
-        0 -> pure (VPath cloneDir)
+        0 -> pure (VPath (canonPathValue cloneDir))
         _ -> do
           removeScratchDir cloneDir
           throwEvalError ("builtins.fetchGit: git clone failed: " <> errOut)
@@ -4849,7 +4849,7 @@ builtinPath (VAttrs attrs) = do
           pinText <- decodedText "builtins.path" pin
           Just <$> decodeSha256Pin "builtins.path" pinText
         other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
-  let name = fromMaybe (extractBaseName pathStr) nameOverride
+  let name = fromMaybe (canonBaseName pathStr) nameOverride
       pinSubject = "builtins.path: " <> pathStr
   storePathText <- case attrSetLookup "filter" attrs of
     Nothing -> copyPathToStore pathStr name (fmap (pinSubject,) expectedDigest)
@@ -4919,16 +4919,6 @@ filteredSourceNar filterFn rootPath = do
         VBool b -> pure b
         other -> throwEvalError ("builtins.path: the filter function must return a Boolean, got " <> typeName other)
 
--- | Extract the last path component from a path string.
-extractBaseName :: Text -> Text
-extractBaseName path =
-  let stripped = T.dropWhileEnd (\c -> c == '/' || c == '\\') path
-   in case T.breakOnEnd "/" stripped of
-        ("", _) -> case T.breakOnEnd "\\" stripped of
-          ("", _) -> stripped
-          (_, name) -> name
-        (_, name) -> name
-
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - filterSource
 -- ---------------------------------------------------------------------------
@@ -4948,7 +4938,7 @@ builtinFilterSource _ other =
 filterSourceInto :: (MonadEval m) => NixValue -> Text -> m NixValue
 filterSourceInto filterFn path = do
   narBytes <- filteredSourceNar filterFn path
-  storePathText <- addSourceNar (extractBaseName path) narBytes
+  storePathText <- addSourceNar (canonBaseName path) narBytes
   pure (sourceResultString storePathText)
 
 -- ---------------------------------------------------------------------------

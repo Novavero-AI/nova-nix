@@ -20,6 +20,7 @@
 -- and a fully-collapsed relative path is @.@.
 module Nix.Eval.CanonPath
   ( canonPath,
+    canonPathValue,
     canonBaseName,
     canonDirName,
   )
@@ -30,6 +31,28 @@ import Data.List (foldl')
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.FilePath (isPathSeparator, pathSeparator)
+
+-- | The producer gate for path VALUES: a path value's text is its
+-- absolute path spelled with forward slashes; on Windows a drive
+-- designator precedes the root.  Platform spelling exists only at the
+-- filesystem boundary.  (The same split git's object model makes: tree
+-- identity is slash-canonical, the working-tree boundary converts.)
+--
+-- Folding is by 'isPathSeparator', so it is platform-correct with no
+-- conditional: on POSIX a backslash is an ordinary file-name character
+-- and passes through untouched - upstream's semantics - while on
+-- Windows it is a separator and folds to @/@.  Every site that
+-- produces a 'VPath' from platform-tainted text (literal resolution,
+-- base-dir joins, fetcher scratch dirs, search-path entries) goes
+-- through this gate; store-path text is canonical by construction.
+canonPathValue :: Text -> Text
+canonPathValue t = canonPath (if T.any needsFold t then T.map foldSeparator t else t)
+  where
+    -- Copy only when a non-'/' separator is present: on POSIX
+    -- 'isPathSeparator' is '/' alone, so this is never, and the
+    -- common already-canonical path shares its text on Windows too.
+    needsFold c = isPathSeparator c && c /= '/'
+    foldSeparator c = if needsFold c then '/' else c
 
 -- | Canonicalize a path's text form.  See the module comment for the
 -- algorithm and the separator-preservation guarantee.
