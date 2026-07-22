@@ -74,7 +74,8 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word8)
-import Nix.Store.Path (StoreDir (..), StorePath (..), StorePathNameError, checkStorePathName, defaultStoreDir, storePathToText)
+import Nix.Store.Path (StoreDir (..), StorePath, StorePathNameError, checkStorePathName, defaultStoreDir, storePathToText)
+import Nix.Store.Path.Internal (StorePath (StorePath))
 import NovaCache.Base32 (encode)
 import NovaCache.Hash (formatNixHash, hashBytes, parseNixHash)
 

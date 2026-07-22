@@ -76,7 +76,7 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Store (Store (..), setReadOnly, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
-import Nix.Store.Path (StoreDir, StorePath (..), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
+import Nix.Store.Path (StoreDir, StorePath (spHash), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
@@ -266,9 +266,9 @@ unpackAndVerify store sp narInfo rawNar =
   -- network corruption or a compromised cache must be caught here.
   -- Narinfo metadata is likewise parsed before any disk write: a malformed
   -- narinfo must not leave an unpacked-but-unregistered path behind.
-  case verifyNarHash narInfo rawNar >> verifyNarSize narInfo rawNar >> registrationMeta of
+  case verifiedInputs of
     Left err -> pure (SubstError err)
-    Right (refs, deriver) -> case NAR.deserialise rawNar of
+    Right (declared, (refs, deriver)) -> case NAR.deserialise rawNar of
       Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
       Right narEntry -> do
         let destPath = storePathToFilePath (stDir store) sp
@@ -297,12 +297,15 @@ unpackAndVerify store sp narInfo rawNar =
                           <> T.pack destPath
                       )
                   )
-              Right () ->
+              Right _ ->
                 pure $
                   SubstSuccess
                     PathRegistration
                       { prPath = sp,
-                        prNarHash = NarInfo.niNarHash narInfo,
+                        -- The canonical spelling of the verified digest,
+                        -- so the DB converges on one hash spelling
+                        -- regardless of the cache's.
+                        prNarHash = Hash.formatNixHash declared,
                         -- The verified actual byte count (equal to the declared
                         -- NarSize per 'verifyNarSize') - no Integer conversion
                         -- that could wrap.
@@ -311,20 +314,26 @@ unpackAndVerify store sp narInfo rawNar =
                         prReferences = refs
                       }
   where
+    verifiedInputs = do
+      declared <- verifyNarHash narInfo rawNar
+      verifyNarSize narInfo rawNar
+      meta <- registrationMeta
+      pure (declared, meta)
     registrationMeta = do
       refs <- parseReferences (NarInfo.niReferences narInfo)
       deriver <- parseDeriver (stDir store) (NarInfo.niDeriver narInfo)
       pure (refs, deriver)
 
 -- | Verify that the downloaded NAR bytes hash to the narinfo's declared
--- NarHash.  Compares decoded hash bytes, so any valid encoding of the digest
--- validates; @prNarHash@ stays sourced from the (now-verified) narinfo.
-verifyNarHash :: NarInfo.NarInfo -> BS.ByteString -> Either Text ()
+-- NarHash, returning the decoded digest on success so registration can
+-- record its canonical spelling.  Compares decoded hash bytes, so any
+-- valid encoding of the digest validates.
+verifyNarHash :: NarInfo.NarInfo -> BS.ByteString -> Either Text Hash.NixHash
 verifyNarHash narInfo rawNar =
   case Hash.parseNixHash (NarInfo.niNarHash narInfo) of
     Left err -> Left ("invalid narinfo NarHash: " <> T.pack err)
     Right declared
-      | declared == actual -> Right ()
+      | declared == actual -> Right declared
       | otherwise ->
           Left
             ( "NAR hash mismatch: narinfo declares "

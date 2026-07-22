@@ -80,7 +80,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
-import Nix.Store.Path (StorePath (..))
+import Nix.Store.Path (StorePath)
 import qualified Nix.Store.Path as SP
 import qualified System.Info as SI
 
@@ -451,6 +451,10 @@ pSepBy pItem pSep = Parser $ \input ->
             Right (item, rest2) -> goMore rest2 (item : acc)
 
 -- | Parse a single output tuple: @(name, path, hashAlgo, hash)@.
+-- The output name is validated with the store-name rules at this parse
+-- boundary: it later becomes a filesystem component under the build
+-- dir and an environment variable name, and a @.drv@ read from disk
+-- is input, not trusted state.
 pOutput :: Parser DerivationOutput
 pOutput = do
   pChar '('
@@ -462,9 +466,11 @@ pOutput = do
   pChar ','
   hashVal <- pQuotedText
   pChar ')'
-  case parseStorePathFromATerm pathStr of
-    Just sp -> pure (DerivationOutput name sp hashAlgo hashVal)
-    Nothing -> parserFail ("invalid output store path: " <> pathStr)
+  case SP.checkStorePathName name of
+    Left err -> parserFail ("invalid output name: " <> SP.storePathNameErrorText err)
+    Right () -> case parseStorePathFromATerm pathStr of
+      Just sp -> pure (DerivationOutput name sp hashAlgo hashVal)
+      Nothing -> parserFail ("invalid output store path: " <> pathStr)
 
 -- | Parse a store path from an ATerm string.
 -- Tries defaultStoreDir first, then Windows store dir.
