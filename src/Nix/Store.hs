@@ -504,7 +504,9 @@ unpackTree path entry = case entry of
       perms <- Dir.getPermissions path
       setPermissions path (Dir.setOwnerExecutable True perms)
     pure (Right [])
-  NAR.NarSymlink target -> pure (Right [(path, target)])
+  NAR.NarSymlink target -> pure $ case decodeNarText "symlink target" target of
+    Left err -> Left err
+    Right decoded -> Right [(path, decoded)]
   NAR.NarDirectory entries -> do
     createDirectoryIfMissing True path
     unpackChildren path entries
@@ -544,6 +546,24 @@ firstNameCollision = go Map.empty
 platformStripsCaseHack :: Bool
 platformStripsCaseHack = NAR.defaultCaseHack == NAR.CaseHackEnabled
 
+-- | 'NAR.caseHackSuffix' as Text for the name machinery here, which
+-- runs on decoded names ('decodeNarText').  The suffix is ASCII, so
+-- the latin1 read is exact.
+caseHackSuffixText :: Text
+caseHackSuffixText = TE.decodeLatin1 NAR.caseHackSuffix
+
+-- | Decode a NAR-carried byte string that must become a filesystem
+-- name.  The NAR format carries entry names and symlink targets as
+-- raw bytes and the parser accepts them; the store's invariant is
+-- stricter - every materialized name exists identically on every
+-- platform the store targets, and NTFS names are UTF-16 - so bytes
+-- with no Unicode reading are refused at the write boundary rather
+-- than approximated.
+decodeNarText :: Text -> BS.ByteString -> Either Text Text
+decodeNarText what bytes = case TE.decodeUtf8' bytes of
+  Right decoded -> Right decoded
+  Left _ -> Left ("NAR " <> what <> " is not valid UTF-8: " <> T.pack (show bytes))
+
 -- | Disk names for a sibling list on a folding filesystem WITHOUT
 -- per-directory case sensitivity: upstream's case-hack.  The first
 -- occurrence of each folded name keeps its spelling; every later
@@ -559,11 +579,27 @@ caseHackDiskNames = reverse . snd . foldl' step (Map.empty, [])
             Nothing -> (Map.insert key (0 :: Int) seen, (name, name) : acc)
             Just occurrences ->
               let next = occurrences + 1
-                  disk = name <> NAR.caseHackSuffix <> T.pack (show next)
+                  disk = name <> caseHackSuffixText <> T.pack (show next)
                in (Map.insert key next seen, (name, disk) : acc)
 
--- | Unpack directory children, short-circuiting with a typed failure on the
--- first unsafe entry name rather than crashing on untrusted input.
+-- | Unpack directory children.  Entry names arrive as the raw bytes
+-- the NAR carries; the store's invariant is that every materialized
+-- name is valid Unicode - a name every platform the store targets can
+-- hold - so each name is decoded here at the write boundary, and a
+-- byte name with no Unicode reading refuses the unpack
+-- ('decodeNarText') rather than approximating a spelling.
+unpackChildren :: FilePath -> [(BS.ByteString, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
+unpackChildren path rawEntries = case traverse decodeChild rawEntries of
+  Left err -> pure (Left err)
+  Right entries -> unpackNamedChildren path entries
+  where
+    decodeChild (nameBytes, child) = do
+      name <- decodeNarText "directory entry name" nameBytes
+      Right (name, child)
+
+-- | Unpack decoded directory children, short-circuiting with a typed
+-- failure on the first unsafe entry name rather than crashing on
+-- untrusted input.
 --
 -- Sibling names folding to one on-disk name (NTFS, default APFS) take
 -- the TRUE-NAME path when the platform provides one: the just-created
@@ -573,8 +609,8 @@ caseHackDiskNames = reverse . snd . foldl' step (Map.empty, [])
 -- back to upstream's case-hack renaming, which the platform serialiser
 -- reverses.  Either way a registered path re-serialises to its NAR
 -- byte-for-byte - the substituter's on-disk recheck verifies it.
-unpackChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
-unpackChildren path entries = do
+unpackNamedChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
+unpackNamedChildren path entries = do
   diskNames <- resolveDiskNames
   walkChildren (zip diskNames entries)
   where
@@ -592,7 +628,7 @@ unpackChildren path entries = do
     walkChildren ((diskName, (name, child)) : rest)
       | not (isSafeNarName name) =
           pure (Left ("unsafe NAR directory entry name: " <> name))
-      | platformStripsCaseHack && NAR.caseHackSuffix `T.isInfixOf` name =
+      | platformStripsCaseHack && caseHackSuffixText `T.isInfixOf` name =
           pure (Left ("NAR entry name contains the case-hack suffix: " <> name))
       | otherwise = do
           result <- unpackTree (path </> T.unpack diskName) child

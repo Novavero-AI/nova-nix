@@ -3157,6 +3157,28 @@ testSubstituter = do
           if all (\case Left _ -> True; Right () -> False) results
             then Pass
             else Fail ("accepted an unsafe name: " <> T.pack (show results)),
+      -- unpackNarEntry: names and targets arrive as the raw bytes the
+      -- wire carries; the store materializes only valid-Unicode names,
+      -- so a byte name with no Unicode reading refuses the unpack
+      -- before anything is written
+      runTestM "unpackNarEntry refuses a non-UTF-8 entry name" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-rawname"
+            tree = NAR.NarDirectory [(BS.pack [0xFF], NAR.NarRegular False "x")]
+        result <- Subst.unpackNarEntry dest tree
+        Subst.clearStaleDestination dest
+        pure $ case result of
+          Left err -> if "not valid UTF-8" `T.isInfixOf` err then Pass else Fail ("wrong error: " <> err)
+          Right () -> Fail "accepted a non-UTF-8 entry name",
+      runTestM "unpackNarEntry refuses a non-UTF-8 symlink target" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-rawtarget"
+            tree = NAR.NarDirectory [("link", NAR.NarSymlink (BS.pack [0xFF]))]
+        result <- Subst.unpackNarEntry dest tree
+        Subst.clearStaleDestination dest
+        pure $ case result of
+          Left err -> if "not valid UTF-8" `T.isInfixOf` err then Pass else Fail ("wrong error: " <> err)
+          Right () -> Fail "accepted a non-UTF-8 symlink target",
       -- unpackNarEntry: a NAR symlink materializes as a REAL link or fails
       -- loudly - never as a regular file holding the target text, which
       -- would silently diverge from the signed NAR hash
