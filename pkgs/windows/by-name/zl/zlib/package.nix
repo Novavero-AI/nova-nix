@@ -6,10 +6,7 @@
 # the dynamic-link + real-library DLL-bundling pattern.  The
 # dontConfigure/buildPhase/installPhase attrs are the stdenv's build-style
 # overrides.
-let
-  stdenv = import ./stdenv.nix;
-  fetchurl = import <nix/fetchurl.nix>;
-in
+{ stdenv, fetchurl }:
 stdenv.mkDerivation {
   name = "zlib";
   src = fetchurl {

@@ -1,11 +1,10 @@
 # GNU hello, built through the stage-1 stdenv.  The whole recipe is now just a
-# name and a source -- setup.sh handles unpack/configure/build/install.  This is
-# the same build the hand-written hello-build.nix proved, factored into the
-# reusable mkDerivation.
-let
-  stdenv = import ./stdenv.nix;
-  fetchurl = import <nix/fetchurl.nix>;
-in
+# name and a source -- setup.sh handles unpack/configure/build/install.
+#
+# pkgs/windows/hello.nix points `nova-nix build` at this package: build takes
+# a derivation-valued expression, and this is a function (it takes
+# { stdenv, fetchurl }), so something has to call it.
+{ stdenv, fetchurl }:
 stdenv.mkDerivation {
   name = "hello";
   src = fetchurl {

@@ -1,6 +1,6 @@
 # nova-nix stage-1 stdenv: the Windows genericBuild.
 #
-# Run by the seed's bash as a derivation's builder.  mkDerivation (stdenv.nix)
+# Run by the seed's bash as a derivation's builder.  mkDerivation (stdenv/default.nix)
 # passes the package via the environment:
 #   $src           source tarball or directory
 #   $out           install prefix (the output store path)
@@ -38,7 +38,7 @@ toBash() {
   esac
 }
 
-# $ccPath arrives canonical (stdenv.nix passes the store path unmapped);
+# $ccPath arrives canonical (stdenv/default.nix passes the store path unmapped);
 # every use below - including the PATH entry, which gcc's own spawned
 # cc1/ld need to find the toolchain DLLs - wants the mapped form.
 ccPath="$(toBash "$ccPath")"

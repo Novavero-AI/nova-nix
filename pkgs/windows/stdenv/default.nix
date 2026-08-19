@@ -2,16 +2,18 @@
 #
 # Wraps the low-level `derivation` builtin so a Windows package builds with just
 #
-#   (import ./stdenv.nix).mkDerivation { name = "foo"; src = ...; }
+#   { stdenv }:
+#   stdenv.mkDerivation { name = "foo"; src = ...; }
 #
+# callPackage supplies that `stdenv` argument from the package set.
 # instead of a hand-written builder script.  It supplies the seed bash as the
 # builder, runs setup.sh (the genericBuild), and exposes the mingw toolchain via
 # $ccPath.  Package attrs (buildInputs, configureFlags, makeFlags, buildPhase,
 # ...) flow through to setup.sh as $-prefixed environment variables; see its
 # header for the full set it reads.
 let
-  msysSeed = import ./msys-seed.nix;
-  mingwSeed = import ./seed.nix;
+  msysSeed = import ../bootstrap/msys-seed.nix;
+  mingwSeed = import ../bootstrap/seed.nix;
   setup = ./setup.sh;
   ccWrapper = ./cc-wrapper.sh;
 in

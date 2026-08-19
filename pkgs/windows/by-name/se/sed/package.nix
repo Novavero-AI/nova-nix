@@ -2,10 +2,7 @@
 # different package (and a .tar.xz, exercising the seed's xz decompression),
 # built with the same two-line mkDerivation as hello.  If this works with no new
 # machinery, nova-nix has a real stdenv, not a hello special-case.
-let
-  stdenv = import ./stdenv.nix;
-  fetchurl = import <nix/fetchurl.nix>;
-in
+{ stdenv, fetchurl }:
 stdenv.mkDerivation {
   name = "sed";
   src = fetchurl {
