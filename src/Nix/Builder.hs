@@ -69,7 +69,7 @@ import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimi
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
-import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
+import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), defaultStoreDirText, storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), catchSync, trySubstitute)
@@ -293,7 +293,9 @@ buildUnderLock config store drv = do
           _ -> case decodeBuilderStrings drv of
             Left errMsg -> pure (Left (1, errMsg))
             Right (builderText, argTexts, decodedEnv) ->
-              let rewrite = onStore config
+              let -- onStore first, so nothing a placeholder expands to gets
+                  -- rewritten a second time.
+                  rewrite = rewritePlaceholders outputDirs . onStore config
                   builderPath = T.unpack (onStore config builderText)
                   environ = buildEnvironment config (Map.map rewrite decodedEnv) builderPath buildDir outputDirs
                   builderArgs = map (T.unpack . rewrite) argTexts
@@ -415,6 +417,15 @@ cleanupBuildDir dir = do
 -- ---------------------------------------------------------------------------
 -- Environment
 -- ---------------------------------------------------------------------------
+
+-- | Replace each output's @builtins.placeholder@ sentinel with its
+-- build-time path (the same value @$out@ carries).  Only args and
+-- environment values are rewritten; the builder path is left alone.
+rewritePlaceholders :: [(Text, FilePath)] -> Text -> Text
+rewritePlaceholders outputDirs value =
+  foldr substitute value outputDirs
+  where
+    substitute (name, path) = T.replace (hashPlaceholder name) (T.pack path)
 
 -- | Build the process environment from the derivation env + standard vars.
 -- The builder path is used to derive PATH entries - the builder's own
