@@ -386,6 +386,9 @@ instance MonadEval EvalIO where
     wrapIO (copyToStoreIfMissing (SP.storeTextToFilePath srcPath) destFilePath (takeDirectory destFilePath))
     pure destPath
 
+  narHashOfPath path =
+    wrapIO (sha256Digest . NAR.serialise <$> NAR.serialiseFromPath (SP.storeTextToFilePath path))
+
   isExecutableFile path = wrapIO (Dir.executable <$> Dir.getPermissions (SP.storeTextToFilePath path))
 
   readSymlinkTarget path = wrapIO (T.pack <$> Dir.getSymbolicLinkTarget (SP.storeTextToFilePath path))

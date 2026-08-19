@@ -1172,6 +1172,10 @@ class (Monad m) => MonadEval m where
   -- @builtins.path@ and @builtins.fetchTarball@ share this pin.
   copyPathToStore :: Text -> Text -> Maybe (Text, ByteString) -> m Text
 
+  -- | Recursive NAR sha256 digest of a path, without copying it anywhere.
+  -- Used by @builtins.fetchGit@ to report @narHash@.
+  narHashOfPath :: Text -> m ByteString
+
   -- | Whether a regular file carries the executable bit (NAR encodes it).
   isExecutableFile :: Text -> m Bool
 
@@ -1297,6 +1301,7 @@ instance MonadEval PureEval where
   createScratchDir _ = throwEvalError "createScratchDir: not available in pure evaluation"
   removeScratchDir _ = pure ()
   copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in pure evaluation"
+  narHashOfPath _ = throwEvalError "builtins.fetchGit: not available in pure evaluation"
   isExecutableFile _ = throwEvalError "builtins.path: not available in pure evaluation"
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in pure evaluation"
   addSourceNar _ _ = throwEvalError "builtins.path: not available in pure evaluation"
