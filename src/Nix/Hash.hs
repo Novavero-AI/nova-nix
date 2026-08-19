@@ -68,7 +68,6 @@ import Data.Bits (xor)
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import Data.Char (digitToInt, isHexDigit)
-import Data.List (foldl')
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T

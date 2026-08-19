@@ -15,7 +15,6 @@ module Nix.Expr.Resolve
   )
 where
 
-import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)

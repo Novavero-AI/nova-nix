@@ -27,7 +27,6 @@ module Nix.Eval.CanonPath
 where
 
 import Data.Char (isAlpha)
-import Data.List (foldl')
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.FilePath (isPathSeparator, pathSeparator)

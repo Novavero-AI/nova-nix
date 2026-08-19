@@ -19,7 +19,7 @@ module Nix.Expr.ClosureTrim
   )
 where
 
-import Data.List (foldl', sortBy)
+import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Ord (comparing)

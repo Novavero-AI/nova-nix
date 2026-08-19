@@ -27,7 +27,7 @@ bug-reports:        https://github.com/Novavero-AI/nova-nix/issues
 category:           Nix, Distribution, System
 stability:          experimental
 build-type:         Simple
-tested-with:        GHC == 9.8.4
+tested-with:        GHC == 9.14.1
 extra-doc-files:
     CHANGELOG.md
     NOTICE
@@ -89,7 +89,7 @@ library
     Nix.Hash
 
   build-depends:
-      base                >= 4.16 && < 5
+      base                >= 4.22 && < 5
     , array               >= 0.5 && < 0.6
     , bytestring          >= 0.11 && < 0.13
     , containers          >= 0.6 && < 0.9
@@ -136,6 +136,11 @@ library
     -Wcompat
     -Wincomplete-record-updates
     -Wincomplete-uni-patterns
+    -- GHC 9.14 deprecates the pattern namespace specifier in import and
+    -- export lists in favour of data, but hlint (through 3.10) cannot
+    -- parse the replacement.  The old spelling stays, warning muted,
+    -- until hlint learns it (then: pattern -> data, drop these flags).
+    -Wno-pattern-namespace-specifier
 
 -- ---------------------------------------------------------------------------
 -- CLI executable
@@ -151,7 +156,7 @@ executable nova-nix
   ghc-options:      -Wall -Wcompat -threaded -rtsopts
 
   build-depends:
-      base                >= 4.16 && < 5
+      base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
     , containers          >= 0.6 && < 0.9
     , directory           >= 1.3 && < 1.4
@@ -169,10 +174,10 @@ test-suite nova-nix-test
   default-language: Haskell2010
   default-extensions:
     OverloadedStrings
-  ghc-options:      -Wall -Wcompat
+  ghc-options:      -Wall -Wcompat -Wno-pattern-namespace-specifier
 
   build-depends:
-      base                >= 4.16 && < 5
+      base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
     , containers          >= 0.6 && < 0.9
     , directory           >= 1.3 && < 1.4
