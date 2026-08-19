@@ -118,6 +118,9 @@ data EvalState = EvalState
     -- | Cache of source path to its store path (recursive NAR hash), so a path
     -- literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text Text)),
+    -- | @builtins.toFile@ writes (store path to its references), for the
+    -- build driver to register before building - eval has no store DB handle.
+    esTextPathCache :: !(IORef (Map Text [SP.StorePath])),
     esBaseDir :: !FilePath,
     esTimestamp :: !Int64,
     esSearchPaths :: ![Thunk]
@@ -131,6 +134,7 @@ newEvalState baseDir = do
   drvCache <- newIORef Map.empty
   drvClosure <- newIORef Map.empty
   srcCache <- newIORef Map.empty
+  textCache <- newIORef Map.empty
   now <- floor <$> getPOSIXTime :: IO Int64
   nixPathStr <- lookupEnvText "NIX_PATH"
   let searchPaths = case nixPathStr of
@@ -142,6 +146,7 @@ newEvalState baseDir = do
         esDrvModuloCache = drvCache,
         esDrvClosure = drvClosure,
         esSourcePathCache = srcCache,
+        esTextPathCache = textCache,
         esBaseDir = baseDir,
         esTimestamp = now,
         esSearchPaths = searchPaths
@@ -299,8 +304,15 @@ instance MonadEval EvalIO where
     let filePath = platformFilePath sp
         storePath = canonicalStorePathText sp
     wrapIO $ do
-      Dir.createDirectoryIfMissing True (takeDirectory filePath)
-      BS.writeFile filePath contents
+      -- Idempotent: registration makes the path read-only, and rewriting it
+      -- fails outright on Windows.
+      alreadyThere <- Dir.doesPathExist filePath
+      unless alreadyThere $ do
+        Dir.createDirectoryIfMissing True (takeDirectory filePath)
+        BS.writeFile filePath contents
+    -- Recorded for the build driver to register - eval has no store DB.
+    textRef <- EvalIO (asks esTextPathCache)
+    EvalIO (liftIO (modifyIORef' textRef (Map.insert storePath refs)))
     pure storePath
 
   scopedImportFile scope rawPath = do

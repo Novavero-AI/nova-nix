@@ -38,7 +38,7 @@ import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), loadApiKeyFile, parsePushCompression, pushCompressionValues, pushPaths)
-import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw, materializeEvalSources, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw, materializeEvalSources, materializeEvalTextPaths, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir)
@@ -344,12 +344,16 @@ buildFile opts dataDir rawFilePath = do
           -- during evaluation; written to the store before building.
           drvClosure <- readIORef (esDrvClosure st)
           sourceCache <- readIORef (esSourcePathCache st)
+          textPaths <- readIORef (esTextPathCache st)
           store <- openStore (chosenStoreDir opts)
           -- Materialize eval-coerced source paths (src = ./file, path
           -- interpolation): evaluation computes their store paths as text
           -- only - the parity runner's store is not writable - so the build
           -- driver performs the copy and registration.
           materializeEvalSources store sourceCache
+          -- builtins.toFile wrote these during evaluation but could not
+          -- register them; a derivation naming one needs them valid first.
+          materializeEvalTextPaths store textPaths
           buildResult <- buildAndRegister store caches drvClosure drv drvSP
           closeStore store
           case buildResult of
