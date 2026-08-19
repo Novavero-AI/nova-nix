@@ -864,9 +864,9 @@ newComputedPathPtr p =
 {-# NOINLINE newComputedListPtrC #-}
 newComputedListPtrC :: CList -> CThunkPtr
 newComputedListPtrC (CList clistPtr) =
-  unsafePerformIO $
-    clistPtr `seq`
-      cthunkNewComputedList (castPtr clistPtr)
+  unsafePerformIO
+    $ clistPtr
+    `seq` cthunkNewComputedList (castPtr clistPtr)
 
 -- | Wrap a string with context in a pre-computed C thunk (no StablePtr).
 -- Interns the payload bytes and all StorePath fields as symbols, builds nn_ctxstr_t.
@@ -1020,9 +1020,9 @@ unmarshalStringContext ptr = do
 {-# NOINLINE newComputedAttrsPtr #-}
 newComputedAttrsPtr :: CAttrSet -> CThunkPtr
 newComputedAttrsPtr cset =
-  unsafePerformIO $
-    cset `seq`
-      cthunkNewComputedAttrs (castPtr cset)
+  unsafePerformIO
+    $ cset
+    `seq` cthunkNewComputedAttrs (castPtr cset)
 
 -- | Build a C-allocated slot array from a list of 'Thunk' values.
 -- Each thunk is converted to 'CThunkPtr' via 'thunkToCPtr'.

@@ -2436,10 +2436,10 @@ formalsToAttrs (EFNamedSet _ formals _) = formalsListToAttrs formals
 
 formalsListToAttrs :: [EvalFormal] -> NixValue
 formalsListToAttrs formals =
-  VAttrs $
-    attrSetFromMap $
-      Map.fromList
-        [(efName f, evaluated (VBool (isJust (efDefault f)))) | f <- formals]
+  VAttrs
+    $ attrSetFromMap
+    $ Map.fromList
+      [(efName f, evaluated (VBool (isJust (efDefault f)))) | f <- formals]
 
 builtinZipAttrsWith :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinZipAttrsWith func (VList cl) = do

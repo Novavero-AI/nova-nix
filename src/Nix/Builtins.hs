@@ -40,20 +40,21 @@ import Nix.Store.Path (defaultStoreDirText)
 builtinEnv :: Int64 -> [Thunk] -> Env
 builtinEnv timestamp searchPaths =
   let scope =
-        attrSetFromMap $
-          Map.fromList $
-            -- Values
-            [ ("true", evaluated (VBool True)),
-              ("false", evaluated (VBool False)),
-              ("null", evaluated VNull),
-              ("builtins", evaluated (builtinsAttrSet timestamp searchPaths)),
-              -- Search path support: <name> desugars to __findFile __nixPath "name"
-              -- (matching C++ Nix's parser desugaring).
-              ("__findFile", evaluated (VBuiltin "findFile" [])),
-              ("__nixPath", evaluated (VList (clistFromThunks (map thunkToCPtr searchPaths))))
-            ]
-              -- Top-level builtin functions (available without builtins. prefix)
-              ++ map topLevelBuiltin topLevelBuiltinNames
+        attrSetFromMap
+          $ Map.fromList
+          $
+          -- Values
+          [ ("true", evaluated (VBool True)),
+            ("false", evaluated (VBool False)),
+            ("null", evaluated VNull),
+            ("builtins", evaluated (builtinsAttrSet timestamp searchPaths)),
+            -- Search path support: <name> desugars to __findFile __nixPath "name"
+            -- (matching C++ Nix's parser desugaring).
+            ("__findFile", evaluated (VBuiltin "findFile" [])),
+            ("__nixPath", evaluated (VList (clistFromThunks (map thunkToCPtr searchPaths))))
+          ]
+            -- Top-level builtin functions (available without builtins. prefix)
+            ++ map topLevelBuiltin topLevelBuiltinNames
    in newCEnv nullPtr 0 (Just scope) Nothing nullPtr 0
 
 -- | Builtins exposed at the top level (without @builtins.@ prefix).

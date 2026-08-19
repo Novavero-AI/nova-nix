@@ -202,23 +202,23 @@ toATerm = toATermForHash False Nothing
 -- @toATermForHash False Nothing@ is exactly 'toATerm'.
 toATermForHash :: Bool -> Maybe [(Text, [Text])] -> Derivation -> ByteString
 toATermForHash maskOutputs inputSubst drv =
-  LBS.toStrict $
-    B.toLazyByteString $
-      "Derive("
-        <> atermOutputsWith maskOutputs (drvOutputs drv)
-        <> ","
-        <> inputDrvsSection
-        <> ","
-        <> atermInputSrcs (drvInputSrcs drv)
-        <> ","
-        <> atermStringT (platformToText (drvPlatform drv))
-        <> ","
-        <> atermString (drvBuilder drv)
-        <> ","
-        <> atermList (map atermString (drvArgs drv))
-        <> ","
-        <> atermEnv (drvEnv drv)
-        <> ")"
+  LBS.toStrict
+    $ B.toLazyByteString
+    $ "Derive("
+      <> atermOutputsWith maskOutputs (drvOutputs drv)
+      <> ","
+      <> inputDrvsSection
+      <> ","
+      <> atermInputSrcs (drvInputSrcs drv)
+      <> ","
+      <> atermStringT (platformToText (drvPlatform drv))
+      <> ","
+      <> atermString (drvBuilder drv)
+      <> ","
+      <> atermList (map atermString (drvArgs drv))
+      <> ","
+      <> atermEnv (drvEnv drv)
+      <> ")"
   where
     inputDrvsSection = case inputSubst of
       Nothing -> atermInputDrvs (drvInputDrvs drv)
