@@ -5,7 +5,7 @@
 
 [![CI](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-nix/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/nova-nix.svg)](https://hackage.haskell.org/package/nova-nix)
-![GHC](https://img.shields.io/badge/GHC-9.8-purple)
+![GHC](https://img.shields.io/badge/GHC-9.14-purple)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 </div>

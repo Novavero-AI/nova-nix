@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Toolchain: GHC 9.14.1 (the first GHC LTS release)** - CI, the release pipeline, and the README badge move from GHC 9.8.4 to 9.14.1. GHC 9.14 opens GHC's new LTS scheme (a minimum of two years of bugfix releases), and under that scheme every earlier series stops receiving fixes, so no version in between had a future. Dependency bounds already admitted the newer compiler and the full set resolves on it. A build-only Linux compat job keeps the package building on 9.8.4 (Stackage LTS 23) for users on the older series.
+
 ## 0.6.0.0 - 2026-06-12
 
 ### Milestone: A Stage-1 stdenv That Builds Real Software

@@ -27,7 +27,7 @@ bug-reports:        https://github.com/Novavero-AI/nova-nix/issues
 category:           Nix, Distribution, System
 stability:          experimental
 build-type:         Simple
-tested-with:        GHC == 9.8.4
+tested-with:        GHC == 9.8.4 || == 9.14.1
 extra-doc-files:
     CHANGELOG.md
     NOTICE
