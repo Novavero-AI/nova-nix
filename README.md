@@ -28,7 +28,7 @@ $ C:\nix\store\zr07i99kqnv48q29n706qxar7h1gfins-hello\hello.exe
 Hello from the first native Windows Nix build.
 ```
 
-The seed (`pkgs/windows/seed.nix`) is stage 0 of a native Windows stdenv: the sha256-pinned runtime closure of MinGW-w64 GCC, merged into one toolchain root by in-process fetch and unpack builtins.
+The seed (`pkgs/windows/bootstrap/seed.nix`) is stage 0 of a native Windows stdenv: the sha256-pinned runtime closure of MinGW-w64 GCC, merged into one toolchain root by in-process fetch and unpack builtins.
 
 It also evaluates real nixpkgs. `import <nixpkgs> {}` resolves the top-level package set (~23,000 attributes) to weak head normal form, and a package evaluates through the stdenv bootstrap down to a derivation:
 

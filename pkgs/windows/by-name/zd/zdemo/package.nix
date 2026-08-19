@@ -3,12 +3,9 @@
 # CPPFLAGS and lib/ on LDFLAGS, so the compiler finds zlib.h and the linker
 # resolves -lz against libz.a (static).  zdemo compresses and round-trips a
 # string and prints the linked zlib's version.
-let
-  stdenv = import ./stdenv.nix;
-  zlib = import ./zlib.nix;
-in
+{ stdenv, zlib }:
 stdenv.mkDerivation {
   name = "zdemo";
-  src = ./zdemo;
+  src = ./src;
   buildInputs = [ zlib ];
 }
