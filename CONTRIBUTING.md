@@ -1,6 +1,7 @@
 # Contributing to nova-nix
 
-Thanks for your interest. Issues and pull requests are welcome.
+nova-nix is a project of Novavero AI Inc. Thanks for your interest - issues
+and pull requests are welcome.
 
 ## Ground rules
 
@@ -12,8 +13,8 @@ Thanks for your interest. Issues and pull requests are welcome.
 
 nova-nix is licensed under Apache-2.0. Per Section 5 of the license, any
 contribution intentionally submitted for inclusion in this project is licensed
-under Apache-2.0, without additional terms or conditions, with Novavero AI Inc.
-as the project licensor. If you do not agree with this, do not submit the
-contribution. Submit only work you have the right to license.
+under Apache-2.0, without additional terms or conditions. You keep the
+copyright to your work. Submit only work you have the right to license.
 
-This keeps the project's licensing simple and its future flexible for everyone.
+This is the standard inbound=outbound arrangement: you contribute under the
+same terms you received the project under, nothing more.
