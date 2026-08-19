@@ -78,7 +78,7 @@ import Control.Exception (IOException, SomeException, catch, throwIO, try)
 import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import Data.Char (isDigit, toUpper)
-import Data.List (foldl', inits)
+import Data.List (inits)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)

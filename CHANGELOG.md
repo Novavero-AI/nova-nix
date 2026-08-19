@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Toolchain: GHC 9.14.1 (the first GHC LTS release)** - CI, the release pipeline, and the README badge move from GHC 9.8.4 to 9.14.1. GHC 9.14 opens GHC's new LTS scheme (a minimum of two years of bugfix releases), and under that scheme every earlier series stops receiving fixes, so no version in between had a future. Dependency bounds already admitted the newer compiler and the full set resolves on it. The project targets the LTS alone: base >= 4.22, and foldl' comes from the Prelude, so its eleven redundant Data.List imports are gone. The deprecated pattern namespace specifier stays for now - hlint cannot yet parse the data replacement GHC suggests - with its deprecation warning muted in the cabal file until hlint learns the new spelling.
+
 ## 0.6.0.0 - 2026-06-12
 
 ### Milestone: A Stage-1 stdenv That Builds Real Software

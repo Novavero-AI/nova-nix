@@ -22,7 +22,6 @@ module Nix.DependencyGraph
   )
 where
 
-import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
