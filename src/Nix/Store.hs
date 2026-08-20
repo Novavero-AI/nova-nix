@@ -59,6 +59,13 @@ module Nix.Store
     writeDrvAterm,
     writeDrvClosure,
 
+    -- * Streaming NAR unpacking
+    NarUnpackSink,
+    newNarUnpackSink,
+    sinkNarEvent,
+    finishNarUnpack,
+    abortNarUnpack,
+
     -- * NAR entry-name safety
     isSafeNarName,
 
@@ -78,6 +85,7 @@ import Control.Exception (IOException, SomeException, catch, throwIO, try)
 import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import Data.Char (isDigit, toUpper)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (inits)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -93,6 +101,7 @@ import Nix.Store.DB
 import Nix.Store.Path
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
+import qualified NovaCache.NAR.Stream as Stream
 import System.Directory
   ( copyFile,
     createDirectoryIfMissing,
@@ -105,6 +114,7 @@ import System.Directory
   )
 import qualified System.Directory as Dir
 import System.FilePath (splitDirectories, takeDirectory, (</>))
+import System.IO (Handle, IOMode (WriteMode), hClose, openBinaryFile)
 import qualified System.Info
 
 -- | An open store with database and configuration.
@@ -746,6 +756,148 @@ createSymlink linkPath target = do
                 <> " (on Windows this needs Developer Mode or elevation)"
             )
         )
+
+-- ---------------------------------------------------------------------------
+-- Streaming NAR unpacking
+-- ---------------------------------------------------------------------------
+
+-- | One open directory in the streaming unpack: its on-disk path and
+-- the sibling names materialized so far, keyed by their on-disk
+-- identity ('onDiskNameKey') for collision handling.
+data UnpackFrame = UnpackFrame
+  { ufPath :: !FilePath,
+    ufSeen :: !(Map Text Int)
+  }
+
+-- | Mutable state behind a 'NarUnpackSink' - the same deliberate IO
+-- boundary as the store's other materializers.  'nusTargets' is the
+-- stack of on-disk paths the NEXT node materializes at: the
+-- destination at the root, plus one pushed per open directory entry.
+data NarUnpackState = NarUnpackState
+  { nusFrames :: ![UnpackFrame],
+    nusTargets :: ![FilePath],
+    nusOpen :: !(Maybe (Handle, FilePath, Bool)),
+    nusLinks :: ![(FilePath, Text)]
+  }
+
+-- | A push sink materializing 'Stream.NarEvent's under a destination
+-- path as they arrive, so a substituted NAR unpacks in the same pass
+-- that downloads it.  Semantics mirror 'unpackNarEntry' - the same
+-- name decoding, safety checks, executable bit, and second-pass
+-- symlink creation - with one divergence: sibling names colliding on
+-- a folding filesystem always take upstream's case-hack renaming,
+-- never the NTFS true-name path, because per-directory case
+-- sensitivity can only be enabled on an EMPTY directory and a stream
+-- cannot know a directory's siblings before materializing the first.
+-- Upstream's own streaming restore behaves identically, and the
+-- substituter's on-disk recheck proves the tree re-serialises to its
+-- NAR either way.
+newtype NarUnpackSink = NarUnpackSink (IORef NarUnpackState)
+
+-- | A sink for one NAR unpack under the given destination path.
+newNarUnpackSink :: FilePath -> IO NarUnpackSink
+newNarUnpackSink destPath =
+  NarUnpackSink <$> newIORef (NarUnpackState [] [destPath] Nothing [])
+
+-- | Feed one event.  On 'Left' the partial tree stays for the caller
+-- to remove - 'abortNarUnpack' first, so no handle stays open on it.
+sinkNarEvent :: NarUnpackSink -> Stream.NarEvent -> IO (Either Text ())
+sinkNarEvent (NarUnpackSink ref) event = do
+  narState <- readIORef ref
+  outcome <- applyNarEvent narState event
+  case outcome of
+    Left err -> pure (Left err)
+    Right updated -> do
+      writeIORef ref updated
+      pure (Right ())
+
+-- | One event's filesystem effects plus the state that follows it.
+-- The stream machine already proved grammar well-formedness, so the
+-- mismatch arms guard sink-state desync, not archive syntax.
+applyNarEvent :: NarUnpackState -> Stream.NarEvent -> IO (Either Text NarUnpackState)
+applyNarEvent narState event = case event of
+  Stream.EventRegularBegin isExec _declaredSize -> withNodeTarget narState $ \path -> do
+    createDirectoryIfMissing True (takeDirectory path)
+    fileHandle <- openBinaryFile path WriteMode
+    pure (Right narState {nusOpen = Just (fileHandle, path, isExec)})
+  Stream.EventRegularChunk slice -> case nusOpen narState of
+    Nothing -> pure (Left "NAR stream sink: file contents outside an open file")
+    Just (fileHandle, _, _) -> do
+      BS.hPut fileHandle slice
+      pure (Right narState)
+  Stream.EventRegularEnd -> case nusOpen narState of
+    Nothing -> pure (Left "NAR stream sink: file close without an open file")
+    Just (fileHandle, path, isExec) -> do
+      hClose fileHandle
+      when isExec $ do
+        perms <- Dir.getPermissions path
+        setPermissions path (Dir.setOwnerExecutable True perms)
+      pure (Right narState {nusOpen = Nothing})
+  Stream.EventSymlink targetBytes -> withNodeTarget narState $ \path ->
+    pure $ case decodeNarText "symlink target" targetBytes of
+      Left err -> Left err
+      Right decoded -> Right narState {nusLinks = (path, decoded) : nusLinks narState}
+  Stream.EventDirectoryBegin -> withNodeTarget narState $ \path -> do
+    createDirectoryIfMissing True path
+    pure (Right narState {nusFrames = UnpackFrame path Map.empty : nusFrames narState})
+  Stream.EventEntryBegin nameBytes -> case nusFrames narState of
+    [] -> pure (Left "NAR stream sink: entry outside a directory")
+    (frame : outer) -> pure $ do
+      name <- decodeNarText "directory entry name" nameBytes
+      if not (isSafeNarName name)
+        then Left ("unsafe NAR directory entry name: " <> name)
+        else
+          if platformStripsCaseHack && caseHackSuffixText `T.isInfixOf` name
+            then Left ("NAR entry name contains the case-hack suffix: " <> name)
+            else
+              -- Sequential case-hack: the disk name of entry N depends
+              -- only on the siblings before it, the same sequence
+              -- 'caseHackDiskNames' folds over a whole list.
+              let key = onDiskNameKey name
+                  (diskName, occurrences) = case Map.lookup key (ufSeen frame) of
+                    Nothing -> (name, 0)
+                    Just seen -> (name <> caseHackSuffixText <> T.pack (show (seen + 1)), seen + 1)
+                  updatedFrame = frame {ufSeen = Map.insert key occurrences (ufSeen frame)}
+               in Right
+                    narState
+                      { nusFrames = updatedFrame : outer,
+                        nusTargets = (ufPath frame </> T.unpack diskName) : nusTargets narState
+                      }
+  Stream.EventEntryEnd -> case nusTargets narState of
+    -- The root destination never pops; only entry-pushed paths do.
+    (_ : rest@(_ : _)) -> pure (Right narState {nusTargets = rest})
+    _ -> pure (Left "NAR stream sink: entry close without an open entry")
+  Stream.EventDirectoryEnd -> case nusFrames narState of
+    [] -> pure (Left "NAR stream sink: directory close without an open directory")
+    (_ : outer) -> pure (Right narState {nusFrames = outer})
+
+-- | Run an action on the path the next node materializes at.
+withNodeTarget :: NarUnpackState -> (FilePath -> IO (Either Text NarUnpackState)) -> IO (Either Text NarUnpackState)
+withNodeTarget narState act = case nusTargets narState of
+  (path : _) -> act path
+  [] -> pure (Left "NAR stream sink: node with no destination")
+
+-- | Finish after 'Stream.NarDone': every node must be closed, then
+-- the recorded symlinks are created - the same dependency ordering
+-- and flavor probing as the strict path's second pass.
+finishNarUnpack :: NarUnpackSink -> IO (Either Text ())
+finishNarUnpack (NarUnpackSink ref) = do
+  narState <- readIORef ref
+  case (nusOpen narState, nusFrames narState) of
+    (Just _, _) -> pure (Left "NAR stream sink: stream ended inside a file")
+    (Nothing, _ : _) -> pure (Left "NAR stream sink: stream ended inside a directory")
+    (Nothing, []) -> createSymlinks (reverse (nusLinks narState))
+
+-- | Close any open handle so the caller can remove the partial tree;
+-- Windows will not delete a file a handle still holds open.
+abortNarUnpack :: NarUnpackSink -> IO ()
+abortNarUnpack (NarUnpackSink ref) = do
+  narState <- readIORef ref
+  case nusOpen narState of
+    Nothing -> pure ()
+    Just (fileHandle, _, _) ->
+      hClose fileHandle `catch` \(_ :: IOException) -> pure ()
+  writeIORef ref narState {nusOpen = Nothing}
 
 -- | Whether a NAR directory entry name is safe to materialize on every
 -- platform the store targets.  Two rejection classes:

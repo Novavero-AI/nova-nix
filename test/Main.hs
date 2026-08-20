@@ -25,7 +25,6 @@ import qualified Data.Text.IO as TIO
 import qualified Database.SQLite.Simple as SQL
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import qualified Network.HTTP.Client as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
@@ -3175,6 +3174,116 @@ testSubstituter = do
             case Subst.verifySigs Subst.defaultCacheConfig (ni {NarInfo.niNarSize = NarInfo.niNarSize ni + 1}) of
               Left _ -> Pass
               Right () -> Fail "signature verified over an altered NarSize",
+      -- Streaming pipeline: the chunk-fed download materializes,
+      -- hashes, and verifies without ever holding the NAR.  The tree
+      -- carries the interesting shapes: nesting, an executable, a
+      -- symlink, and a sibling pair colliding on folding filesystems -
+      -- the digest equality proves the materialized tree re-serialises
+      -- to its NAR on every platform strategy.
+      runTestM "streaming unpack materializes and verifies" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-unpack"
+        forceRemoveIfExists tmpDir
+        createDirectoryIfMissing True tmpDir
+        let dest = tmpDir </> "out"
+        source <- chunkReader (streamChunks 7 streamTestNar)
+        result <- Subst.consumeNarStream dest (streamTestNarInfo streamTestNar) streamTestDigest source
+        onDisk <- NAR.serialiseFromPath dest
+        forceRemoveIfExists tmpDir
+        pure $ case result of
+          Left err -> Fail ("streaming unpack failed: " <> err)
+          Right narByteCount ->
+            if narByteCount == BS.length streamTestNar
+              && CHash.hashBytes (NAR.serialise onDisk) == streamTestDigest
+              then Pass
+              else Fail "streamed tree diverges from its NAR",
+      -- A truncated stream is a loud parse failure, never a short tree.
+      runTestM "streaming unpack refuses a truncated stream" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-trunc"
+        forceRemoveIfExists tmpDir
+        createDirectoryIfMissing True tmpDir
+        source <- chunkReader (streamChunks 7 (BS.take (BS.length streamTestNar - 10) streamTestNar))
+        result <- Subst.consumeNarStream (tmpDir </> "out") (streamTestNarInfo streamTestNar) streamTestDigest source
+        forceRemoveIfExists tmpDir
+        pure $ case result of
+          Left _ -> Pass
+          Right _ -> Fail "truncated NAR stream was accepted",
+      -- A digest mismatch reports before the tree is trusted.
+      runTestM "streaming unpack refuses a digest mismatch" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-digest"
+        forceRemoveIfExists tmpDir
+        createDirectoryIfMissing True tmpDir
+        source <- chunkReader (streamChunks 7 streamTestNar)
+        result <- Subst.consumeNarStream (tmpDir </> "out") (streamTestNarInfo streamTestNar) (CHash.hashBytes "not the nar") source
+        forceRemoveIfExists tmpDir
+        pure $ case result of
+          Left err | "hash mismatch" `T.isInfixOf` err -> Pass
+          other -> Fail ("expected hash mismatch, got: " <> T.pack (show other)),
+      -- cappedBodySource: the streaming mirror of readBodyCapped -
+      -- a body past the key-trusted declared size aborts mid-stream.
+      runTestM "cappedBodySource aborts past the cap" $ do
+        reader <- chunkReader ["abcdef", "ghijkl"]
+        source <- Subst.cappedBodySource 10 reader
+        firstChunk <- source
+        overCap <- try source :: IO (Either SomeException BS.ByteString)
+        pure $ case (firstChunk, overCap) of
+          ("abcdef", Left _) -> Pass
+          other -> Fail ("expected abort past the cap, got: " <> T.pack (show other)),
+      -- withDecompressedSource: xz chunks decompress under the
+      -- declared bound; the support decision mirrors decompressorFor.
+      runTestM "withDecompressedSource xz chunked roundtrip" $
+        case B64.decode xzFixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            source <- chunkReader (streamChunks 7 compressed)
+            result <- Subst.withDecompressedSource xzFixtureSize "xz" source $ \pull ->
+              let go acc = do
+                    chunk <- pull
+                    if BS.null chunk
+                      then pure (Right (BS.concat (reverse acc)))
+                      else go (chunk : acc)
+               in go []
+            pure $ case result of
+              Right out | out == xzFixturePayload -> Pass
+              other -> Fail ("xz source roundtrip diverged: " <> T.pack (show (fmap BS.length other))),
+      runTest "streaming compression support matches the strict set" $
+        case (Subst.streamingDecompressionSupported "none", Subst.streamingDecompressionSupported "xz", Subst.streamingDecompressionSupported "zstd") of
+          (Right (), Right (), Left _) -> Pass
+          other -> Fail ("unexpected support set: " <> T.pack (show other)),
+      -- The support set is encoded twice - the strict decompressor and
+      -- the streaming decision - so their agreement is pinned across
+      -- the codecs either could plausibly grow, not left to comments.
+      runTest "strict and streaming support sets agree" $
+        let agrees compression =
+              case (Subst.decompressorFor 1 compression, Subst.streamingDecompressionSupported compression) of
+                (Right _, Right ()) -> True
+                (Left _, Left _) -> True
+                _ -> False
+         in if all agrees ["none", "", "xz", "zstd", "bzip2", "brotli"]
+              then Pass
+              else Fail "strict and streaming compression support drifted",
+      -- The strict path is the streaming path's differential oracle:
+      -- the same NAR materialized by both must produce the same tree.
+      runTestM "strict and streaming unpack agree" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-oracle"
+        forceRemoveIfExists tmpDir
+        createDirectoryIfMissing True tmpDir
+        strictOutcome <- case NAR.deserialise streamTestNar of
+          Left err -> pure (Left (T.pack err))
+          Right entry -> Subst.unpackNarEntry (tmpDir </> "strict") entry
+        source <- chunkReader (streamChunks 11 streamTestNar)
+        streamOutcome <- Subst.consumeNarStream (tmpDir </> "streamed") (streamTestNarInfo streamTestNar) streamTestDigest source
+        strictTree <- NAR.serialiseFromPath (tmpDir </> "strict")
+        streamedTree <- NAR.serialiseFromPath (tmpDir </> "streamed")
+        forceRemoveIfExists tmpDir
+        pure $ case (strictOutcome, streamOutcome) of
+          (Right (), Right _)
+            | NAR.serialise strictTree == NAR.serialise streamedTree -> Pass
+            | otherwise -> Fail "strict and streaming trees diverge"
+          other -> Fail ("oracle setup failed: " <> T.pack (show other)),
       -- trySubstitute: empty caches returns SubstNotFound
       runTestM "trySubstitute no caches" $ do
         tmpBase <- getTemporaryDirectory
@@ -3535,6 +3644,46 @@ testSubstituter = do
           "Deriver: 5knzybx32a3iq53jjw6xd6fn4awn2l3h-hello-1.0.0.2.drv",
           "Sig: cache.nixos.org-1:jUFHex7R7zPonZZqjVy/OOTguUZZE/sityC0zvu3sb35Az8zBTROeFhUC/J/UFx8Ui8UflA7uHyLJm5Z+Ca6Bw=="
         ]
+    -- A NAR with the shapes streaming unpack must materialize:
+    -- nesting, an executable, a symlink, and a sibling pair that
+    -- collides on folding filesystems.  Entries in NAR name order.
+    -- The executable bit only where the platform can round-trip it
+    -- from disk - Windows cannot, the same constraint the NAR spec
+    -- vectors note, until #35 gives it a real model.  The symlink
+    -- target nests only off Windows: separator-bearing targets do not
+    -- round-trip Windows disk serialisation (#112 tracks the fix, and
+    -- lifting this split is its undo).
+    streamTestExec = SI.os /= "mingw32"
+    streamTestLinkTarget
+      | SI.os == "mingw32" = "Makefile"
+      | otherwise = "bin/tool"
+    streamTestNar =
+      NAR.serialise
+        ( NAR.NarDirectory
+            [ ("Makefile", NAR.NarRegular False "all:\n"),
+              ("bin", NAR.NarDirectory [("tool", NAR.NarRegular streamTestExec "#!/bin/sh\n")]),
+              ("link", NAR.NarSymlink streamTestLinkTarget),
+              ("makefile", NAR.NarRegular False "lower\n")
+            ]
+        )
+    streamTestDigest = CHash.hashBytes streamTestNar
+    streamTestNarInfo rawNar =
+      NarInfo.NarInfo
+        { NarInfo.niStorePath = "/nix/store/" <> sampleHash <> "-stream",
+          NarInfo.niUrl = "nar/stream.nar",
+          NarInfo.niCompression = "none",
+          NarInfo.niFileHash = Nothing,
+          NarInfo.niFileSize = Nothing,
+          NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes rawNar),
+          NarInfo.niNarSize = fromIntegral (BS.length rawNar),
+          NarInfo.niReferences = [],
+          NarInfo.niDeriver = Nothing,
+          NarInfo.niSigs = [],
+          NarInfo.niCA = Nothing
+        }
+    streamChunks chunkLen bytes
+      | BS.null bytes = []
+      | otherwise = BS.take chunkLen bytes : streamChunks chunkLen (BS.drop chunkLen bytes)
 
 -- ---------------------------------------------------------------------------
 -- Tests: Build orchestrator (Phase 3, Batch 7)
@@ -8265,7 +8414,6 @@ testVerifySigs = do
 testNarInfoValidation :: IO [Bool]
 testNarInfoValidation = do
   putStrLn "substituter/narinfo-field-validation"
-  mgr <- HTTP.newManager HTTP.defaultManagerSettings
   sequence
     [ runTest "well-formed narinfo passes" $
         assertEqual "valid" (Right ()) (Subst.validateNarInfoFields sigTestNarInfo),
@@ -8283,11 +8431,11 @@ testNarInfoValidation = do
         case sigTestSetup of
           Left err -> Fail (T.pack err)
           Right (cache, validSig, _) ->
-            case Subst.verifyAndDecompress cache mgr sigTestNarInfo {NarInfo.niStorePath = "/nix/store/zzz", NarInfo.niSigs = [validSig]} of
+            case Subst.narInfoPreflight cache sigTestNarInfo {NarInfo.niStorePath = "/nix/store/zzz", NarInfo.niSigs = [validSig]} of
               Left err
                 | "invalid narinfo" `T.isInfixOf` err -> Pass
                 | otherwise -> Fail ("expected the field-validation error, got: " <> err)
-              Right _ -> Fail "expected failure, got a download action"
+              Right () -> Fail "expected failure, got a clean preflight"
     ]
 
 -- ---------------------------------------------------------------------------
