@@ -343,3 +343,79 @@ jobs:
               Get-ChildItem $d -ErrorAction SilentlyContinue | Select-Object -First 10 | ForEach-Object { Write-Host $_.Name }
             } else { Write-Host "(absent)" }
           }
+
+  # ---------------------------------------------------------------------------
+  # End-to-end (Linux): the full binary-cache loop against a real
+  # nova-cache-server - push --compression zstd from one scratch store,
+  # substitute into a second fresh store with signature verification on,
+  # and NAR-compare the two trees - plus the memory gate: a
+  # multi-hundred-MB path substitutes under a hard +RTS -M cap, so any
+  # reintroduced whole-archive retention aborts the job.  The unit suite
+  # never opens a socket, so this is the only coverage of the HTTP
+  # surface (chunked transfer, connection reuse, the signing handshake)
+  # and of the nova-nix/nova-cache two-repo interop.
+  # ---------------------------------------------------------------------------
+
+  e2e-loop:
+    name: E2E (substitute loop)
+    needs: [cabal-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      # Own key family, not the build matrix's: this job adds the server's
+      # dependencies (warp, wai-extra) to the store, and the server is
+      # installed unpinned, so the store can change without any hashed
+      # file changing - the run_id suffix makes every run save its store,
+      # and the restore-keys pick up the newest previous one.
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-e2e-loop-${{ hashFiles('nova-nix.cabal') }}-${{ github.run_id }}
+          restore-keys: |
+            cabal-e2e-loop-${{ hashFiles('nova-nix.cabal') }}-
+            cabal-e2e-loop-
+
+      # The loop drives the installed executable - the artifact a user
+      # gets - not a dist-newstyle build product.
+      - name: Install nova-nix
+        run: cabal install exe:nova-nix --install-method=copy --installdir="$RUNNER_TEMP/bin" --overwrite-policy=always
+
+      # Deliberately unpinned: half this job's value is cross-repo
+      # interop against the server as released, so a nova-cache release
+      # that breaks the loop fails here first, not in production.
+      - name: Install nova-cache-server from Hackage
+        run: cabal install nova-cache -f server --install-method=copy --installdir="$RUNNER_TEMP/bin" --overwrite-policy=always
+
+      # GNU time prints the substituting process's peak RSS - the
+      # observable behind the memory claim; the shell keyword of the same
+      # name cannot measure a child's RSS, and the runner image does not
+      # guarantee the binary.
+      - name: Provision /usr/bin/time
+        run: |
+          if ! [ -x /usr/bin/time ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq time
+          fi
+
+      - name: Push/substitute loop with memory gate
+        run: |
+          NOVA_NIX_BIN="$RUNNER_TEMP/bin/nova-nix" \
+          NOVA_CACHE_SERVER_BIN="$RUNNER_TEMP/bin/nova-cache-server" \
+          E2E_WORK_DIR="$RUNNER_TEMP/e2e-loop" \
+          .github/e2e-loop/loop.sh
+
+      - name: Dump loop logs on failure
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP"/e2e-loop/logs/*; do
+            echo "== $f =="
+            cat "$f" || true
+          done
