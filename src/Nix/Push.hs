@@ -25,13 +25,17 @@
 --
 -- == Compression
 --
--- Uploads use @Compression: none@: the substituter round-trips it on every
--- platform today (XZ support is gated behind nova-cache's @compression@
--- flag, which is off on Windows), and the dominant seed payloads are
--- already-compressed source tarballs.
+-- Uploads default to @Compression: none@ - the cache's existing
+-- content is uncompressed, and mixing artifact kinds is an operator
+-- decision, not a default flip.  'PushZstd' compresses each NAR with
+-- nova-cache's zstandard encoder before upload: the narinfo's file
+-- fields describe the compressed artifact, its object name carries
+-- the compressed file hash, and the substituter decompresses under
+-- the declared NarSize bound.
 module Nix.Push
   ( -- * Configuration
     PushConfig (..),
+    PushCompression (..),
     PushSummary (..),
 
     -- * Pushing
@@ -40,7 +44,11 @@ module Nix.Push
     loadApiKeyFile,
 
     -- * Pure pieces (exported for tests)
+    parsePushCompression,
+    pushCompressionValues,
     mkNarInfo,
+    mkPushArtifact,
+    PushArtifact (..),
     planMissing,
     narFileName,
     stripHashPrefix,
@@ -65,6 +73,7 @@ import qualified Data.Text.IO as TIO
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types as HTTP
+import Nix.Compression (compressionNameNone, compressionNameZstd)
 import Nix.Store (Store (..), queryDeriver, queryPathInfo, queryReferences)
 import qualified Nix.Store.DB as DB
 import Nix.Store.Path (StorePath (spHash, spName), defaultStoreDir, parseStorePath, storePathToFilePath, storePathToText)
@@ -72,6 +81,7 @@ import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
 import NovaCache.Signing (normalizeKeyText)
+import qualified NovaCache.Zstd as Zstd
 import System.IO (stderr)
 
 -- ---------------------------------------------------------------------------
@@ -94,9 +104,9 @@ narExtension = ".nar"
 narInfoExtension :: Text
 narInfoExtension = ".narinfo"
 
--- | The narinfo @Compression@ value used for uploads.
-compressionNone :: Text
-compressionNone = "none"
+-- | Extension for zstd-compressed NAR objects.
+narZstExtension :: Text
+narZstExtension = ".nar.zst"
 
 -- | Authorization scheme prefix for the API key.
 bearerPrefix :: BS.ByteString
@@ -110,13 +120,42 @@ httpStatusOk = 200
 -- Configuration and results
 -- ---------------------------------------------------------------------------
 
+-- | How each NAR is packaged for upload.  A property of the
+-- destination cache, as upstream models compression on binary cache
+-- stores - not a per-path whim.
+data PushCompression = PushNone | PushZstd
+  deriving (Eq, Show)
+
+-- | The accepted @--compression@ spellings, for parser errors and the
+-- CLI help line - one rendering of the register in 'Nix.Compression'.
+pushCompressionValues :: Text
+pushCompressionValues = compressionNameNone <> ", " <> compressionNameZstd
+
+-- | Parse the CLI spelling of a push compression.  The spellings are
+-- the narinfo @Compression@ names from 'Nix.Compression', so the CLI
+-- vocabulary and the wire vocabulary cannot drift.
+parsePushCompression :: Text -> Either Text PushCompression
+parsePushCompression name
+  | name == compressionNameNone = Right PushNone
+  | name == compressionNameZstd = Right PushZstd
+  | otherwise =
+      Left
+        ( "unknown --compression "
+            <> name
+            <> " (expected: "
+            <> pushCompressionValues
+            <> ")"
+        )
+
 -- | Where and how to push.
 data PushConfig = PushConfig
   { -- | Cache base URL, no trailing slash (e.g. @https:\/\/cache.example.com@).
     pcCacheUrl :: !Text,
     -- | Bearer token for authenticated writes.  'Nothing' sends no
     -- Authorization header (only useful against an open-writes server).
-    pcApiKey :: !(Maybe Text)
+    pcApiKey :: !(Maybe Text),
+    -- | Artifact packaging for this destination (see 'PushCompression').
+    pcCompression :: !PushCompression
   }
   deriving (Eq, Show)
 
@@ -204,21 +243,69 @@ stripHashPrefix h = case T.breakOn ":" h of
 narFileName :: Text -> Text
 narFileName narHash = stripHashPrefix narHash <> narExtension
 
--- | Construct the narinfo describing a store path.
---
--- With @Compression: none@ the file fields equal the NAR fields.  The
--- @StorePath@ uses the canonical @\/nix\/store@ form; references and the
--- deriver are basenames, matching the wire format.
-mkNarInfo :: StorePath -> Text -> Int -> [StorePath] -> Maybe StorePath -> NarInfo
-mkNarInfo sp narHash narSize refs deriver =
+-- | The uploadable artifact for one NAR under the configured
+-- compression: the bytes the cache stores, the file fields the
+-- narinfo declares, and the object name.  With 'PushNone' every field
+-- equals the NAR's own, byte-identical to what this module always
+-- pushed.
+data PushArtifact = PushArtifact
+  { paBytes :: !BS.ByteString,
+    paFileHash :: !Text,
+    paFileSize :: !Int,
+    paCompressionText :: !Text,
+    paObjectName :: !Text,
+    -- | The source NAR's hash and byte count, recorded at packaging
+    -- time: a narinfo built from this artifact can only ever describe
+    -- one byte stream, so the NAR fields and file fields cannot be
+    -- paired wrongly by a caller.
+    paNarHash :: !Text,
+    paNarSize :: !Int
+  }
+  deriving (Eq, Show)
+
+-- | Package one NAR for upload.  The zstd object is named by its own
+-- (compressed) file hash, the convention the public caches follow.
+mkPushArtifact :: PushCompression -> Text -> BS.ByteString -> PushArtifact
+mkPushArtifact compression narHash narBytes = case compression of
+  PushNone ->
+    PushArtifact
+      { paBytes = narBytes,
+        paFileHash = narHash,
+        paFileSize = BS.length narBytes,
+        paCompressionText = compressionNameNone,
+        paObjectName = narFileName narHash,
+        paNarHash = narHash,
+        paNarSize = BS.length narBytes
+      }
+  PushZstd ->
+    let compressed = Zstd.compress Zstd.defaultCompressionLevel narBytes
+        fileHash = Hash.formatNixHash (Hash.hashBytes compressed)
+     in PushArtifact
+          { paBytes = compressed,
+            paFileHash = fileHash,
+            paFileSize = BS.length compressed,
+            paCompressionText = compressionNameZstd,
+            paObjectName = stripHashPrefix fileHash <> narZstExtension,
+            paNarHash = narHash,
+            paNarSize = BS.length narBytes
+          }
+
+-- | Construct the narinfo describing a store path.  Every artifact
+-- and NAR field - file hash, file size, compression, object name, NAR
+-- hash, NAR size - comes from the one 'PushArtifact', so the narinfo
+-- is internally consistent by construction.  The @StorePath@ uses
+-- the canonical @\/nix\/store@ form; references and the deriver are
+-- basenames, matching the wire format.
+mkNarInfo :: PushArtifact -> StorePath -> [StorePath] -> Maybe StorePath -> NarInfo
+mkNarInfo artifact sp refs deriver =
   NarInfo
     { niStorePath = storePathToText defaultStoreDir sp,
-      niUrl = narDirSegment <> "/" <> narFileName narHash,
-      niCompression = compressionNone,
-      niFileHash = Just narHash,
-      niFileSize = Just (fromIntegral narSize),
-      niNarHash = narHash,
-      niNarSize = fromIntegral narSize,
+      niUrl = narDirSegment <> "/" <> paObjectName artifact,
+      niCompression = paCompressionText artifact,
+      niFileHash = Just (paFileHash artifact),
+      niFileSize = Just (fromIntegral (paFileSize artifact)),
+      niNarHash = paNarHash artifact,
+      niNarSize = fromIntegral (paNarSize artifact),
       niReferences = sort (map storePathBasename refs),
       niDeriver = storePathBasename <$> deriver,
       niSigs = [],
@@ -303,7 +390,8 @@ uploadNar manager cfg store sp = do
   refs <- liftEither (traverse (parseRefText store) refTexts)
   deriverText <- liftIO (queryDeriver (stDB store) sp)
   let deriver = deriverText >>= parseStorePath (stDir store)
-      narInfo = mkNarInfo sp narHash narSize refs deriver
+      artifact = mkPushArtifact (pcCompression cfg) narHash narBytes
+      narInfo = mkNarInfo artifact sp refs deriver
       url = pcCacheUrl cfg <> "/" <> niUrl narInfo
   logLine
     ( "[nar]   "
@@ -312,7 +400,7 @@ uploadNar manager cfg store sp = do
         <> T.pack (show narSize)
         <> " bytes)"
     )
-  response <- httpRequest manager "PUT" url (authHeaders cfg) (Just narBytes)
+  response <- httpRequest manager "PUT" url (authHeaders cfg) (Just (paBytes artifact))
   expectOk ("PUT " <> niUrl narInfo) response
   pure narInfo
 

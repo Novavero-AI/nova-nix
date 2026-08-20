@@ -102,6 +102,7 @@ import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Validate as Validate
 import qualified NovaCache.Xz as Xz
+import qualified NovaCache.Zstd as Zstd
 import qualified System.Directory as Dir
 
 -- ---------------------------------------------------------------------------
@@ -787,10 +788,11 @@ streamingDecompressionSupported :: Text -> Either Text ()
 streamingDecompressionSupported = void . parseNarCompression
 
 -- | Run a consumer over the decompressed view of a chunk source:
--- identity for 'CompressionNone', nova-cache's bounded decoder for
--- 'CompressionXz' (output capped at the declared NarSize; thrown
--- 'Xz.XzError's convert to the pipeline's error channel here, carrying
--- their retry class from 'xzFailure').
+-- identity for 'CompressionNone', nova-cache's bounded decoders for
+-- 'CompressionXz' and 'CompressionZstd' (output capped at the
+-- declared NarSize; thrown codec errors convert to the pipeline's
+-- error channel here, carrying their retry class from 'xzFailure' and
+-- 'zstdFailure').
 withDecompressedSource :: Integer -> Text -> IO BS.ByteString -> (IO BS.ByteString -> IO (Either AttemptFailure a)) -> IO (Either AttemptFailure a)
 withDecompressedSource declaredNarSize compression source consume =
   case parseNarCompression compression of
@@ -801,6 +803,11 @@ withDecompressedSource declaredNarSize compression source consume =
       Right limits ->
         Xz.withXzSource limits source consume
           `catch` \xzErr -> pure (Left (xzFailure xzErr))
+    Right CompressionZstd -> case zstdLimitsFor declaredNarSize of
+      Left err -> pure (Left (FatalFailure err))
+      Right limits ->
+        Zstd.withZstdSource limits source consume
+          `catch` \zstdErr -> pure (Left (zstdFailure zstdErr))
 
 -- | Classify a decoder failure: a stream error is how truncation and
 -- torn transfers surface, so it retries; output or memory past the
@@ -812,6 +819,14 @@ xzFailure xzErr = case xzErr of
   Xz.XzMemoryOverBound _ -> FatalFailure rendered
   where
     rendered = renderXzError xzErr
+
+-- | 'xzFailure''s zstd counterpart, under the same taxonomy.
+zstdFailure :: Zstd.ZstdError -> AttemptFailure
+zstdFailure zstdErr = case zstdErr of
+  Zstd.ZstdStreamError _ -> TransientFailure rendered
+  Zstd.ZstdOutputOverBound _ -> FatalFailure rendered
+  where
+    rendered = renderZstdError zstdErr
 
 -- ---------------------------------------------------------------------------
 -- Pure helpers
@@ -836,27 +851,37 @@ verifySigs cache narInfo =
                 then Right ()
                 else Left "no valid signature found"
 
--- | The decompressor for a narinfo @Compression@ value, decided from
--- the narinfo's declared values alone so unsupported compression
--- rejects before any download.  'CompressionNone' is identity;
--- 'CompressionXz' - cache.nixos.org's format - decompresses bounded
--- by the declared NarSize, a signed claim the caller validates before
--- resolving the decompressor.  Dispatches through
--- 'parseNarCompression' like the streaming path, so the support set
--- exists exactly once.
-decompressorFor :: Integer -> Text -> Either Text (BS.ByteString -> Either Text BS.ByteString)
+-- | The whole-buffer decompressor for a narinfo @Compression@ value,
+-- decided from the narinfo's declared values alone so unsupported
+-- compression rejects before any download.  'CompressionNone' is
+-- identity; 'CompressionXz' (cache.nixos.org's format) and
+-- 'CompressionZstd' (the modern caches') decompress bounded by the
+-- declared NarSize, a signed claim the caller validates before
+-- resolving the decompressor.  The resolved function runs in IO
+-- because the zstd binding's decoder is IO-native (see
+-- 'NovaCache.Zstd'); the strict shape follows its codecs.  Dispatches
+-- through 'parseNarCompression' like the streaming path, so the
+-- support set exists exactly once.
+decompressorFor :: Integer -> Text -> Either Text (BS.ByteString -> IO (Either Text BS.ByteString))
 decompressorFor declaredNarSize compression = do
   kind <- parseNarCompression compression
   case kind of
-    CompressionNone -> Right Right
-    CompressionXz -> xzDecompressor declaredNarSize
+    CompressionNone -> Right (pure . Right)
+    CompressionXz -> do
+      limits <- xzLimitsFor declaredNarSize
+      Right (pure . either (Left . renderXzError) Right . Xz.decompress limits)
+    CompressionZstd -> do
+      limits <- zstdLimitsFor declaredNarSize
+      Right (fmap (either (Left . renderZstdError) Right) . Zstd.decompress limits)
 
 -- | Decompress NAR data based on the compression type from narinfo,
 -- bounded by the declared NarSize.  Support is decided by
 -- 'decompressorFor'; this applies the result.
-decompressNar :: Integer -> Text -> BS.ByteString -> Either Text BS.ByteString
+decompressNar :: Integer -> Text -> BS.ByteString -> IO (Either Text BS.ByteString)
 decompressNar declaredNarSize compression narData =
-  decompressorFor declaredNarSize compression >>= ($ narData)
+  case decompressorFor declaredNarSize compression of
+    Left err -> pure (Left err)
+    Right decompress -> decompress narData
 
 -- | The bounds for one xz decode: output capped at the narinfo's
 -- declared NarSize, decoder memory at nova-cache's default, so a
@@ -876,14 +901,6 @@ xzLimitsFor declaredNarSize
             Xz.xzMaxDecoderMemoryBytes = Xz.defaultXzDecoderMemoryBytes
           }
 
--- | The whole-buffer bounded xz decompressor for a narinfo's declared
--- NarSize - the strict counterpart of 'withDecompressedSource''s
--- streaming path, sharing its bounds through 'xzLimitsFor'.
-xzDecompressor :: Integer -> Either Text (BS.ByteString -> Either Text BS.ByteString)
-xzDecompressor declaredNarSize = do
-  limits <- xzLimitsFor declaredNarSize
-  Right (either (Left . renderXzError) Right . Xz.decompress limits)
-
 -- | One 'Xz.XzError' in the register the other substitution errors use.
 renderXzError :: Xz.XzError -> Text
 renderXzError xzErr = case xzErr of
@@ -892,6 +909,24 @@ renderXzError xzErr = case xzErr of
     "xz output exceeds the declared NarSize (" <> T.pack (show bound) <> " bytes)"
   Xz.XzMemoryOverBound bound ->
     "xz decoder memory over its cap (" <> T.pack (show bound) <> " bytes)"
+
+-- | The bounds for one zstd decode: output capped at the narinfo's
+-- declared NarSize; decoder state rides libzstd's built-in window
+-- limit (see 'NovaCache.Zstd').  The same totality guard as
+-- 'xzLimitsFor'.
+zstdLimitsFor :: Integer -> Either Text Zstd.ZstdLimits
+zstdLimitsFor declaredNarSize
+  | declaredNarSize < 0 || declaredNarSize > toInteger (maxBound :: Word64) =
+      Left ("zstd decompression bound out of range: " <> T.pack (show declaredNarSize))
+  | otherwise = Right Zstd.ZstdLimits {Zstd.zstdMaxOutputBytes = fromInteger declaredNarSize}
+
+-- | One 'Zstd.ZstdError' in the register the other substitution
+-- errors use.
+renderZstdError :: Zstd.ZstdError -> Text
+renderZstdError zstdErr = case zstdErr of
+  Zstd.ZstdStreamError msg -> "zstd stream error: " <> T.pack msg
+  Zstd.ZstdOutputOverBound bound ->
+    "zstd output exceeds the declared NarSize (" <> T.pack (show bound) <> " bytes)"
 
 -- | Parse narinfo references (store path basenames, e.g.
 -- @abc...-glibc-2.40@) into StorePaths.  A malformed token is an error,
