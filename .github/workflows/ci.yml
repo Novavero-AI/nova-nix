@@ -55,17 +55,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: haskell-actions/run-ormolu@v21
+
+      # Pinned to the version the repo is formatted with: formatting is
+      # not stable across ormolu releases, and a floating version would
+      # fail CI on untouched code when upstream ships one.  Upgrades
+      # bump this and the local binary together.
+      #
+      # Built from Hackage, not fetched prebuilt: run-ormolu@v21
+      # downloads binaries from mrkkrp/ormolu, and that repository
+      # vanished from GitHub on 2026-08-20, taking every prebuilt
+      # ormolu with it (the action then misreports the 404 as
+      # "unformatted files").  The Hackage build depends on nothing but
+      # the package index; the cached binary makes warm runs seconds.
+      # Undo into the action if prebuilt assets return to a stable home
+      # a released run-ormolu points at.
+      - name: Cache formatter binary
+        id: formatter-cache
+        uses: actions/cache@v5
         with:
-          # Pinned to the version the repo is formatted with: formatting
-          # is not stable across ormolu releases, and a floating version
-          # would fail CI on untouched code when upstream ships one.
-          # Upgrades bump this and the local binary together.
-          version: "0.9.0.0"
-          pattern: |
-            src/**/*.hs
-            app/**/*.hs
-            test/**/*.hs
+          path: ~/.local/bin/ormolu
+          key: ormolu-0.9.0.0-${{ runner.os }}
+
+      - uses: haskell-actions/setup@v2
+        if: steps.formatter-cache.outputs.cache-hit != 'true'
+        with:
+          ghc-version: '9.14.1'
+          cabal-version: 'latest'
+
+      - name: Build ormolu 0.9.0.0 from Hackage
+        if: steps.formatter-cache.outputs.cache-hit != 'true'
+        run: cabal install ormolu-0.9.0.0 --install-method=copy --installdir="$HOME/.local/bin" --overwrite-policy=always
+
+      - name: Check formatting
+        run: git ls-files '*.hs' | xargs ormolu --mode check
 
   c99-lint:
     name: C99 Strict
