@@ -82,7 +82,7 @@ jobs:
 
   cabal-check:
     name: Cabal Check
-    needs: [hlint, ormolu]
+    needs: [hlint, ormolu, c99-lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -190,6 +190,14 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Build + Test (cross-platform matrix)
+  #
+  # The graph is two tiers by design: cheap textual gates run serially
+  # (ascii -> lints -> cabal-check), then every expensive job - the build
+  # matrix, sdist, sanitizers, e2e - runs in parallel off cabal-check.
+  # They are independent verdicts on the same commit, and serializing them
+  # would add their durations instead of taking their maximum: e2e alone
+  # is ~20 minutes, so putting the matrix before it would slow every green
+  # run by its full build time for no extra signal.
   # ---------------------------------------------------------------------------
 
   build:
@@ -239,3 +247,77 @@ jobs:
 
       - name: Test
         run: cabal test
+
+  # ---------------------------------------------------------------------------
+  # End-to-end (Windows-only): the executable this repo ships, driving a real
+  # build through the real stdenv - fetch the MinGW-w64 seed, compile hello.c
+  # with it, and run the produced hello.exe.  Deliberately no store cache: a
+  # warm store would let the builder skip the exact work this job exists to
+  # exercise.
+  # ---------------------------------------------------------------------------
+
+  e2e-windows:
+    name: E2E (Windows)
+    needs: [cabal-check]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
+          restore-keys: cabal-${{ runner.os }}-
+
+      # Installed rather than run from dist-newstyle: the bundled <nix/*>
+      # search-path entry is the cabal data dir, which only exists for an
+      # installed binary - and installing is how the README says to use it.
+      - name: Install nova-nix
+        run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Build hello.nix through the real stdenv
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\bin\nova-nix.exe"
+          $src = Join-Path $env:GITHUB_WORKSPACE "pkgs\windows\hello.nix"
+          # The logical store dir /nix/store resolves drive-relative on
+          # Windows, and this runner's workspace lives on D:.  Run from C:\
+          # so every resolution lands on the provisioned C:\nix\store.
+          Set-Location C:\
+          $out = (& $exe build $src) | Select-Object -Last 1
+          if ($LASTEXITCODE -ne 0) { Write-Error "nova-nix build failed"; exit 1 }
+          Write-Host "out path: $out"
+          $hello = Join-Path $out "hello.exe"
+          if (-not (Test-Path $hello)) {
+            $hello = (Get-ChildItem C:\nix\store\*-hello\hello.exe)[0].FullName
+            Write-Host "fallback glob: $hello"
+          }
+          $got = (& $hello) -join "`n"
+          Write-Host "output: $got"
+          if ($got -ne "Hello from the first native Windows Nix build.") {
+            Write-Error "unexpected hello output"
+            exit 1
+          }
+
+      - name: Diagnose store layout on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          foreach ($d in "C:\nix\store", "D:\nix\store") {
+            Write-Host "== $d =="
+            if (Test-Path $d) {
+              Get-ChildItem $d -ErrorAction SilentlyContinue | Select-Object -First 10 | ForEach-Object { Write-Host $_.Name }
+            } else { Write-Host "(absent)" }
+          }
