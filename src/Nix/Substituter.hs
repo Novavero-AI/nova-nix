@@ -21,6 +21,12 @@
 --
 -- If the cache doesn't have it (404), fall through to building locally.
 --
+-- The whole sequence runs under an exclusive per-path lock
+-- ('Nix.Store.Lock'), upstream's pathlocks protocol: taken before any
+-- deletion or download, validity re-checked under it (another process's
+-- finished path is adopted without touching disk), and held until the
+-- caller's registration transaction commits.
+--
 -- == Cache priority
 --
 -- Multiple caches can be configured, checked in priority order:
@@ -92,7 +98,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
-import Nix.Store (Store (..), abortNarUnpack, finishNarUnpack, newNarUnpackSink, setReadOnly, sinkNarEvent, unpackNarEntry)
+import Nix.Store (PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarEvent, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
 import Nix.Store.Path (StoreDir, StorePath (spHash), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
 import qualified NovaCache.Hash as Hash
@@ -134,8 +140,19 @@ data SubstResult
   = -- | Verified and unpacked on disk, NOT yet registered: the carried
     -- registration is recorded by the caller, which batches every output
     -- of a derivation into one 'registerPaths' transaction so
-    -- cross-output reference edges are never dropped.
-    SubstSuccess !PathRegistration
+    -- cross-output reference edges are never dropped.  The path's lock
+    -- rides along STILL HELD, because the exclusion must survive until
+    -- that transaction commits - released earlier, another process could
+    -- meet the unpacked-but-unregistered window and delete the tree the
+    -- row is about to describe.  The caller releases it after
+    -- registration, on every exit path ('Nix.Builder').
+    SubstSuccess !PathRegistration !PathLock
+  | -- | The path was already valid under its lock - another process
+    -- registered it while this one waited - so its work is adopted:
+    -- nothing was downloaded, nothing touched disk, and no registration
+    -- is needed.  The caller treats this as success.  No lock rides
+    -- along; it was released before returning.
+    SubstAlreadyValid
   | -- | Cache doesn't have this path.
     SubstNotFound
   | -- | Download or verification failed.
@@ -148,20 +165,41 @@ data SubstResult
 
 -- | Try to substitute a store path from configured caches.
 --
--- Checks each cache in priority order.  Returns on first success; a
--- failing cache falls through to the remaining ones.  Uses nova-cache
--- library for narinfo parsing, NAR unpacking, and signature verification.
+-- Upstream's per-path substitution protocol: take the path's exclusive
+-- lock FIRST, before any deletion or download, and re-check validity
+-- under it - another process may have registered the path while this
+-- one waited, and its finished work must be adopted
+-- ('SubstAlreadyValid') rather than deleted and redone.  The lock then
+-- holds across the delete, the download, materialization, and the
+-- on-disk recheck; a successful result carries it still held (see
+-- 'SubstSuccess'), and every other exit releases it here.
 --
--- On success the path is unpacked and read-only on disk but NOT
--- registered - the caller records the returned 'PathRegistration'
--- (see 'SubstSuccess').
+-- Caches are checked in priority order; the first success stops the
+-- scan and a failing cache falls through to the remaining ones.  On
+-- success the path is unpacked and read-only on disk but NOT
+-- registered - the caller records the returned 'PathRegistration'.
 trySubstitute :: Store -> [CacheConfig] -> StorePath -> IO SubstResult
 trySubstitute _ [] _ = pure SubstNotFound
 trySubstitute store caches sp = do
   -- Reuse the process-global TLS manager (connection pooling / keep-alive)
   -- rather than creating a fresh one per call and per output.
   manager <- HTTPS.getGlobalManager
-  tryCachesWith (\cache -> tryOneCache manager store cache sp) (sortCaches caches)
+  lock <- acquirePathLock (stDir store) sp
+  substituteLocked manager lock `onException` releasePathLock lock
+  where
+    substituteLocked manager lock = do
+      valid <- isValid store sp
+      if valid
+        then do
+          releasePathLock lock
+          pure SubstAlreadyValid
+        else do
+          result <- tryCachesWith (\cache -> tryOneCache manager store cache sp lock) (sortCaches caches)
+          case result of
+            SubstSuccess _ _ -> pure result
+            other -> do
+              releasePathLock lock
+              pure other
 
 -- | Fold per-cache attempts in priority order.  The first success wins and
 -- stops the scan.  An erroring cache falls through to the remaining ones -
@@ -176,14 +214,17 @@ tryCachesWith attempt = go Nothing
     go firstErr (cache : rest) = do
       result <- attempt cache
       case result of
-        SubstSuccess found -> pure (SubstSuccess found)
+        SubstSuccess reg lock -> pure (SubstSuccess reg lock)
+        -- A path found valid mid-scan is terminal like a success:
+        -- there is nothing left to fetch from any cache.
+        SubstAlreadyValid -> pure SubstAlreadyValid
         SubstNotFound -> go firstErr rest
         SubstError err -> go (firstErr <|> Just (ccUrl cache <> ": " <> err)) rest
 
 -- | Attempt substitution from a single cache, catching all exceptions.
-tryOneCache :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> IO SubstResult
-tryOneCache mgr store cache sp = do
-  result <- try (substituteFromCache mgr store cache sp)
+tryOneCache :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
+tryOneCache mgr store cache sp lock = do
+  result <- try (substituteFromCache mgr store cache sp lock)
   case result of
     Left (err :: SomeException) ->
       pure (SubstError ("substitution exception: " <> T.pack (show err)))
@@ -193,8 +234,8 @@ tryOneCache mgr store cache sp = do
 --
 -- Each step is a pure or IO action that produces @Either@ on failure.
 -- The pipeline short-circuits on the first error via early return.
-substituteFromCache :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> IO SubstResult
-substituteFromCache mgr store cache sp = do
+substituteFromCache :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
+substituteFromCache mgr store cache sp lock = do
   -- 1. Fetch narinfo
   narInfoResult <- fetchNarInfo mgr cache sp
   case narInfoResult of
@@ -218,7 +259,7 @@ substituteFromCache mgr store cache sp = do
           -- pass ('streamNarIntoStore').
           case narInfoPreflight cache narInfo of
             Left err -> pure (SubstError err)
-            Right () -> streamWithRetry mgr store cache sp narInfo
+            Right () -> streamWithRetry mgr store cache sp narInfo lock
 
 -- | The pure preflight the pipeline runs before any download is paid
 -- for, everything decided from the narinfo alone: field validation
@@ -274,7 +315,10 @@ renderValidationError verr = case verr of
 -- no database write happens here (see 'SubstSuccess').  The strict
 -- counterpart of the streaming pipeline, kept as its differential
 -- oracle: the suite materializes the same NAR through both and
--- requires identical trees.
+-- requires identical trees.  It follows the same per-path lock
+-- protocol as the live pipeline: the lock is taken before the stale
+-- destination is cleared, validity re-checks under it, and a success
+-- carries the lock still held.
 unpackAndVerify :: Store -> StorePath -> NarInfo.NarInfo -> BS.ByteString -> IO SubstResult
 unpackAndVerify store sp narInfo rawNar =
   -- Verify the downloaded NAR's hash matches the (signed) narinfo BEFORE
@@ -288,49 +332,62 @@ unpackAndVerify store sp narInfo rawNar =
     Right (declared, (refs, deriver)) -> case NAR.deserialise rawNar of
       Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
       Right narEntry -> do
-        let destPath = storePathToFilePath (stDir store) sp
-        unpackResult <- try $ do
-          clearStaleDestination destPath
-          unpackNarEntry destPath narEntry
-        case (unpackResult :: Either SomeException (Either Text ())) of
-          Left err -> pure (SubstError ("unpack failed: " <> T.pack (show err)))
-          Right (Left err) -> pure (SubstError ("unpack failed: " <> err))
-          Right (Right ()) -> do
-            setReadOnly destPath
-            -- A path registered valid must match its recorded hash ON
-            -- DISK, not merely in the downloaded bytes: any divergence
-            -- the filesystem introduced between the NAR and the
-            -- materialized tree (name folding, link replication) must
-            -- surface here, before the row exists.  A mismatching tree
-            -- is removed - left in place it would be adopted by
-            -- existence checks at this path.
-            onDisk <- NAR.serialiseFromPath destPath
-            case verifyNarHash narInfo (NAR.serialise onDisk) of
-              Left _ -> do
-                Dir.removePathForcibly destPath
-                pure
-                  ( SubstError
-                      ( "unpacked tree does not reproduce the declared NAR hash at "
-                          <> T.pack destPath
-                      )
-                  )
-              Right _ ->
-                pure $
-                  SubstSuccess
-                    PathRegistration
-                      { prPath = sp,
-                        -- The canonical spelling of the verified digest,
-                        -- so the DB converges on one hash spelling
-                        -- regardless of the cache's.
-                        prNarHash = Hash.formatNixHash declared,
-                        -- The verified actual byte count (equal to the declared
-                        -- NarSize per 'verifyNarSize') - no Integer conversion
-                        -- that could wrap.
-                        prNarSize = BS.length rawNar,
-                        prDeriver = deriver,
-                        prReferences = refs
-                      }
+        lock <- acquirePathLock (stDir store) sp
+        result <- unpackLocked declared refs deriver narEntry lock `onException` releasePathLock lock
+        case result of
+          SubstSuccess _ _ -> pure result
+          other -> do
+            releasePathLock lock
+            pure other
   where
+    unpackLocked declared refs deriver narEntry lock = do
+      alreadyValid <- isValid store sp
+      if alreadyValid
+        then pure SubstAlreadyValid
+        else do
+          let destPath = storePathToFilePath (stDir store) sp
+          unpackResult <- try $ do
+            clearStaleDestination destPath
+            unpackNarEntry destPath narEntry
+          case (unpackResult :: Either SomeException (Either Text ())) of
+            Left err -> pure (SubstError ("unpack failed: " <> T.pack (show err)))
+            Right (Left err) -> pure (SubstError ("unpack failed: " <> err))
+            Right (Right ()) -> do
+              setReadOnly destPath
+              -- A path registered valid must match its recorded hash ON
+              -- DISK, not merely in the downloaded bytes: any divergence
+              -- the filesystem introduced between the NAR and the
+              -- materialized tree (name folding, link replication) must
+              -- surface here, before the row exists.  A mismatching tree
+              -- is removed - left in place it would be adopted by
+              -- existence checks at this path.
+              onDisk <- NAR.serialiseFromPath destPath
+              case verifyNarHash narInfo (NAR.serialise onDisk) of
+                Left _ -> do
+                  Dir.removePathForcibly destPath
+                  pure
+                    ( SubstError
+                        ( "unpacked tree does not reproduce the declared NAR hash at "
+                            <> T.pack destPath
+                        )
+                    )
+                Right _ ->
+                  pure $
+                    SubstSuccess
+                      PathRegistration
+                        { prPath = sp,
+                          -- The canonical spelling of the verified digest,
+                          -- so the DB converges on one hash spelling
+                          -- regardless of the cache's.
+                          prNarHash = Hash.formatNixHash declared,
+                          -- The verified actual byte count (equal to the declared
+                          -- NarSize per 'verifyNarSize') - no Integer conversion
+                          -- that could wrap.
+                          prNarSize = BS.length rawNar,
+                          prDeriver = deriver,
+                          prReferences = refs
+                        }
+                      lock
     verifiedInputs = do
       declared <- verifyNarHash narInfo rawNar
       verifyNarSize narInfo rawNar
@@ -480,13 +537,13 @@ narRetryBaseDelayMicros = 500000
 -- failure path, exceptions included, removes what it wrote).  A 404
 -- on the narinfo itself (a genuine cache miss) is handled earlier in
 -- 'fetchNarInfo' and never reaches here.
-streamWithRetry :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> NarInfo.NarInfo -> IO SubstResult
-streamWithRetry mgr store cache sp narInfo = attempt narDownloadAttempts
+streamWithRetry :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> NarInfo.NarInfo -> PathLock -> IO SubstResult
+streamWithRetry mgr store cache sp narInfo lock = attempt narDownloadAttempts
   where
     attempt remaining = do
       outcome <- streamNarIntoStore mgr cache store sp narInfo
       case outcome of
-        Right registration -> pure (SubstSuccess registration)
+        Right registration -> pure (SubstSuccess registration lock)
         Left (FatalFailure err) -> pure (SubstError err)
         Left (TransientFailure err)
           | remaining <= 1 -> pure (SubstError err)
@@ -965,6 +1022,10 @@ parseDeriver storeDir (Just txt)
 -- retry, permanently wedging substitution of that path.
 -- 'Dir.removePathForcibly' clears read-only marks and accepts a missing
 -- path, so the fresh unpack always starts from a clean slate.
+-- Substitution callers reach this only holding the path's exclusive
+-- lock ('trySubstitute', 'unpackAndVerify'): unlocked, this deletion is
+-- exactly the race that lets one process remove a tree another just
+-- registered.
 clearStaleDestination :: FilePath -> IO ()
 clearStaleDestination = Dir.removePathForcibly
 

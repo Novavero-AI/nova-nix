@@ -7,6 +7,7 @@ module Main (main) where
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, bracket_, evaluate, try)
 import Control.Monad (filterM, void, when)
 import Data.Bits (shiftR, (.&.))
@@ -48,7 +49,7 @@ import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (DeleteOutcome (..), Store (..), addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
@@ -3591,28 +3592,43 @@ testSubstituter = do
       -- are never contacted)
       runTestM "tryCachesWith success stops scan" $ do
         calls <- newIORef (0 :: Int)
-        let hit = PathRegistration (StorePath (T.replicate 32 "d") "hit") "sha256:d" 1 Nothing []
-            attempt cache = do
+        withChainLock "nova-nix-test-chain-stop" $ \lock -> do
+          let hit = PathRegistration (StorePath (T.replicate 32 "d") "hit") "sha256:d" 1 Nothing []
+              attempt cache = do
+                atomicModifyIORef' calls (\n -> (n + 1, ()))
+                pure $
+                  if Subst.ccUrl cache == "https://b"
+                    then Subst.SubstSuccess hit lock
+                    else Subst.SubstNotFound
+          result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b", chainCache "https://c"]
+          made <- readIORef calls
+          pure $
+            if result == Subst.SubstSuccess hit lock && made == 2
+              then Pass
+              else Fail ("got " <> T.pack (show result) <> " after " <> T.pack (show made) <> " attempts"),
+      -- tryCachesWith: an already-valid path found mid-scan is terminal
+      -- like a success - later caches are never contacted
+      runTestM "tryCachesWith already-valid stops scan" $ do
+        calls <- newIORef (0 :: Int)
+        let attempt _ = do
               atomicModifyIORef' calls (\n -> (n + 1, ()))
-              pure $
-                if Subst.ccUrl cache == "https://b"
-                  then Subst.SubstSuccess hit
-                  else Subst.SubstNotFound
-        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b", chainCache "https://c"]
+              pure Subst.SubstAlreadyValid
+        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"]
         made <- readIORef calls
         pure $
-          if result == Subst.SubstSuccess hit && made == 2
+          if result == Subst.SubstAlreadyValid && made == 1
             then Pass
             else Fail ("got " <> T.pack (show result) <> " after " <> T.pack (show made) <> " attempts"),
       -- tryCachesWith: an erroring cache falls through to a later hit
       -- instead of aborting the chain
-      runTestM "tryCachesWith error falls through to next cache" $ do
-        let hit = PathRegistration (StorePath (T.replicate 32 "f") "hit") "sha256:f" 1 Nothing []
-            attempt cache
-              | Subst.ccUrl cache == "https://a" = pure (Subst.SubstError "transient 500")
-              | otherwise = pure (Subst.SubstSuccess hit)
-        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"]
-        pure (assertEqual "fallthrough" (Subst.SubstSuccess hit) result),
+      runTestM "tryCachesWith error falls through to next cache" $
+        withChainLock "nova-nix-test-chain-fallthrough" $ \lock -> do
+          let hit = PathRegistration (StorePath (T.replicate 32 "f") "hit") "sha256:f" 1 Nothing []
+              attempt cache
+                | Subst.ccUrl cache == "https://a" = pure (Subst.SubstError "transient 500")
+                | otherwise = pure (Subst.SubstSuccess hit lock)
+          result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"]
+          pure (assertEqual "fallthrough" (Subst.SubstSuccess hit lock) result),
       -- tryCachesWith: all misses stay SubstNotFound
       runTestM "tryCachesWith all misses" $ do
         result <- Subst.tryCachesWith (\_ -> pure Subst.SubstNotFound) [chainCache "https://a", chainCache "https://b"]
@@ -3837,10 +3853,16 @@ testSubstituter = do
                 }
         result <- Subst.unpackAndVerify store sp info rawNar
         onDisk <- BS.readFile (storePathToFilePath (stDir store) sp </> "data.txt")
+        -- A success carries the path lock still held; release it before
+        -- the store teardown (Windows cannot delete a file a handle
+        -- holds open).
+        case result of
+          Subst.SubstSuccess _ lock -> releasePathLock lock
+          _ -> pure ()
         closeStore store
         forceRemoveIfExists tmpStore
         pure $ case result of
-          Subst.SubstSuccess reg ->
+          Subst.SubstSuccess reg _ ->
             if prNarHash reg == narHash && onDisk == "verified bytes"
               then Pass
               else Fail "registration or on-disk bytes diverge from the declared hash"
@@ -3848,6 +3870,19 @@ testSubstituter = do
     ]
   where
     chainCache url = Subst.CacheConfig url "unused-key" 10
+    -- A real held lock for tests that construct 'SubstSuccess' by hand:
+    -- the constructor carries the path's lock, so a fabricated success
+    -- needs a genuine one, taken in a scratch directory.
+    withChainLock dirName act = do
+      tmpBase <- getTemporaryDirectory
+      let lockRoot = tmpBase </> (dirName :: FilePath)
+      forceRemoveIfExists lockRoot
+      createDirectoryIfMissing True lockRoot
+      lock <- acquirePathLock (StoreDir lockRoot) (StorePath (T.replicate 32 "d") "hit")
+      result <- act lock
+      releasePathLock lock
+      forceRemoveIfExists lockRoot
+      pure result
     sampleNarBytes = "nova-nix nar sample bytes" :: BS.ByteString
     sampleNarHash = CHash.formatNixHash (CHash.hashBytes sampleNarBytes)
     wrongNarHash = CHash.formatNixHash (CHash.hashBytes ("different bytes" :: BS.ByteString))
@@ -3949,6 +3984,161 @@ testSubstituter = do
     -- The xz fixture's payload, compressed by nova-cache:zstandard's
     -- own encoder - the exact pairing the push path ships.
     zstdFixtureCompressed = CZstd.compress CZstd.defaultCompressionLevel xzFixturePayload
+
+-- ---------------------------------------------------------------------------
+-- Tests: per-store-path locks (the substitution race)
+-- ---------------------------------------------------------------------------
+
+-- | Watchdog for the concurrent-substitution race: generous, because a
+-- lock-protocol regression shows up as a hang, never as a fast wrong
+-- answer.
+raceWatchdogMicros :: Int
+raceWatchdogMicros = 30 * 1000000
+
+testPathLocks :: IO [Bool]
+testPathLocks = do
+  putStrLn "store/path-locks"
+  sequence
+    [ -- Two independent handles on one path lock exclude each other -
+      -- the guarantee flock and LockFileEx share, and exactly the shape
+      -- of two processes contending for one store path.
+      runTestM "path lock excludes a second handle" $ do
+        tmpBase <- getTemporaryDirectory
+        let lockRoot = tmpBase </> "nova-nix-test-lock-excl"
+        forceRemoveIfExists lockRoot
+        createDirectoryIfMissing True lockRoot
+        let dir = StoreDir lockRoot
+            sp = StorePath (T.replicate 32 "a") "lockee"
+        held <- acquirePathLock dir sp
+        second <- tryAcquirePathLock dir sp
+        releasePathLock held
+        third <- tryAcquirePathLock dir sp
+        mapM_ releasePathLock second
+        mapM_ releasePathLock third
+        forceRemoveIfExists lockRoot
+        pure $ case (second, third) of
+          (Nothing, Just _) -> Pass
+          (Just _, _) -> Fail "a second handle acquired a held lock"
+          (Nothing, Nothing) -> Fail "release did not free the lock",
+      -- The already-valid short-circuit: a registered path substitutes
+      -- as SubstAlreadyValid with no network and no disk writes - the
+      -- configured cache is unreachable, so any contact would surface
+      -- as an error result.
+      runTestM "trySubstitute adopts an already-valid path untouched" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-lock-valid"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath (T.replicate 32 "c") "validpath"
+            destPath = storePathToFilePath (StoreDir tmpStore) sp
+        createDirectoryIfMissing True destPath
+        BS.writeFile (destPath </> "payload") "registered bytes"
+        reg <- registrationFor store sp Nothing []
+        registerPath (stDB store) reg
+        result <- Subst.trySubstitute store [unreachableCache] sp
+        survivor <- BS.readFile (destPath </> "payload")
+        -- The short-circuit released the lock, so the path must be
+        -- lockable again at once.
+        reLock <- tryAcquirePathLock (StoreDir tmpStore) sp
+        mapM_ releasePathLock reLock
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure $ case (result, reLock) of
+          (Subst.SubstAlreadyValid, Just _)
+            | survivor == "registered bytes" -> Pass
+            | otherwise -> Fail "tree touched during already-valid adoption"
+          (Subst.SubstAlreadyValid, Nothing) -> Fail "lock still held after already-valid return"
+          (other, _) -> Fail ("expected SubstAlreadyValid, got: " <> T.pack (show other)),
+      -- The strict pipeline honors the same short-circuit: fed a
+      -- DIFFERENT (self-consistent) NAR for an already-valid path, it
+      -- must adopt the registered tree rather than overwrite it.
+      runTestM "unpackAndVerify adopts an already-valid path untouched" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-lock-valid-strict"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath (T.replicate 32 "d") "strictvalid"
+            destPath = storePathToFilePath (StoreDir tmpStore) sp
+        createDirectoryIfMissing True destPath
+        BS.writeFile (destPath </> "payload") "registered bytes"
+        reg <- registrationFor store sp Nothing []
+        registerPath (stDB store) reg
+        let differentNar = NAR.serialise (NAR.NarDirectory [("other", NAR.NarRegular False "different bytes")])
+        result <- Subst.unpackAndVerify store sp (lockTestNarInfo sp differentNar) differentNar
+        survivor <- BS.readFile (destPath </> "payload")
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure $ case result of
+          Subst.SubstAlreadyValid
+            | survivor == "registered bytes" -> Pass
+            | otherwise -> Fail "tree touched during already-valid adoption"
+          other -> Fail ("expected SubstAlreadyValid, got: " <> T.pack (show other)),
+      -- The race the locks exist for: two concurrent substitutions of
+      -- one path, independent lock handles.  Exactly one materializes;
+      -- the other waits at the lock and adopts the winner's registered
+      -- path; the surviving tree is intact and registered once.
+      runTestM "concurrent substitutions: one materializes, one adopts" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-lock-race"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath (T.replicate 32 "e") "racepath"
+            destPath = storePathToFilePath (StoreDir tmpStore) sp
+            rawNar = NAR.serialise (NAR.NarDirectory [("data", NAR.NarRegular False "race payload")])
+            -- The caller's contract per attempt: register under the
+            -- still-held lock, then release it.
+            attempt = do
+              result <- Subst.unpackAndVerify store sp (lockTestNarInfo sp rawNar) rawNar
+              case result of
+                Subst.SubstSuccess winnerReg lock -> do
+                  registerPath (stDB store) winnerReg
+                  releasePathLock lock
+                _ -> pure ()
+              pure result
+        firstDone <- newEmptyMVar
+        secondDone <- newEmptyMVar
+        _ <- forkIO ((try attempt :: IO (Either SomeException Subst.SubstResult)) >>= putMVar firstDone)
+        _ <- forkIO ((try attempt :: IO (Either SomeException Subst.SubstResult)) >>= putMVar secondDone)
+        outcomeA <- timeout raceWatchdogMicros (takeMVar firstDone)
+        outcomeB <- timeout raceWatchdogMicros (takeMVar secondDone)
+        rowCount <- length <$> queryAllValidPaths (stDB store)
+        onDisk <- NAR.serialiseFromPath destPath
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure $ case (outcomeA, outcomeB) of
+          (Just (Right resultA), Just (Right resultB)) ->
+            let outcomes = [resultA, resultB]
+                materialized = length [() | Subst.SubstSuccess _ _ <- outcomes]
+                adopted = length [() | Subst.SubstAlreadyValid <- outcomes]
+             in if materialized == 1 && adopted == 1 && rowCount == 1 && NAR.serialise onDisk == rawNar
+                  then Pass
+                  else
+                    Fail
+                      ( "unexpected race outcome: "
+                          <> T.pack (show outcomes)
+                          <> ", registered rows: "
+                          <> T.pack (show rowCount)
+                      )
+          other -> Fail ("a race attempt hung or threw: " <> T.pack (show other))
+    ]
+  where
+    -- Never contacted when the already-valid short-circuit holds; a
+    -- regression that reaches for the network fails loudly here.
+    unreachableCache = Subst.CacheConfig "http://127.0.0.1:9" "unused-key" 10
+    lockTestNarInfo sp rawNar =
+      NarInfo.NarInfo
+        { NarInfo.niStorePath = storePathToText defaultStoreDir sp,
+          NarInfo.niUrl = "nar/lock-test.nar",
+          NarInfo.niCompression = "none",
+          NarInfo.niFileHash = Nothing,
+          NarInfo.niFileSize = Nothing,
+          NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes rawNar),
+          NarInfo.niNarSize = fromIntegral (BS.length rawNar),
+          NarInfo.niReferences = [],
+          NarInfo.niDeriver = Nothing,
+          NarInfo.niSigs = [],
+          NarInfo.niCA = Nothing
+        }
 
 -- ---------------------------------------------------------------------------
 -- Tests: Build orchestrator (Phase 3, Batch 7)
@@ -8999,6 +9189,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testDrvContext,
           testDepGraph,
           testSubstituter,
+          testPathLocks,
           testVerifySigs,
           testNarInfoValidation,
           testPushPure,
