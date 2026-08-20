@@ -4221,24 +4221,25 @@ testUnpackBuildIO = do
       pure []
     else withTempStore $ \store -> do
       let storeDir = stDir store
-      tmpBase <- getTemporaryDirectory
-      let workDir = tmpBase </> "nova-nix-test-unpack-src"
-      forceRemoveIfExists workDir
-      createDirectoryIfMissing True workDir
-      let archiveTools = workDir </> "pkg-tools.tar.zst"
-          archiveData = workDir </> "pkg-data.tar.zst"
-          archiveCollide = workDir </> "pkg-collide.tar.zst"
-          archiveEscape = workDir </> "pkg-escape.tar.zst"
-          archiveRootFile = workDir </> "pkg-root-file.tar.zst"
-          archiveEscapeSymlink = workDir </> "pkg-escape-symlink.tar.zst"
-          archiveEscapeHardlink = workDir </> "pkg-escape-hardlink.tar.zst"
-          archiveDirLink = workDir </> "pkg-dirlink.tar.zst"
-          archiveDirLinkBase = workDir </> "pkg-dirlink-base.tar.zst"
-          archiveDirLinkCollide = workDir </> "pkg-dirlink-collide.tar.zst"
-          archiveHardLinkCollide = workDir </> "pkg-hardlink-collide.tar.zst"
-          archiveManyEntries = workDir </> "pkg-many-entries.tar.zst"
-          archiveBigFile = workDir </> "pkg-big-file.tar.zst"
-          archiveAmplify = workDir </> "pkg-amplify.tar.zst"
+      -- Archives live in the temp store under store-path names: the srcs
+      -- env is store paths by contract, and runBuiltinUnpack insists on
+      -- that now (#101) - each entry is parsed and rendered through the
+      -- build's store dir, which for these builds is the temp store.
+      let archiveFile name = storePathToFilePath storeDir (StorePath (T.replicate 32 "0") name)
+          archiveTools = archiveFile "pkg-tools.tar.zst"
+          archiveData = archiveFile "pkg-data.tar.zst"
+          archiveCollide = archiveFile "pkg-collide.tar.zst"
+          archiveEscape = archiveFile "pkg-escape.tar.zst"
+          archiveRootFile = archiveFile "pkg-root-file.tar.zst"
+          archiveEscapeSymlink = archiveFile "pkg-escape-symlink.tar.zst"
+          archiveEscapeHardlink = archiveFile "pkg-escape-hardlink.tar.zst"
+          archiveDirLink = archiveFile "pkg-dirlink.tar.zst"
+          archiveDirLinkBase = archiveFile "pkg-dirlink-base.tar.zst"
+          archiveDirLinkCollide = archiveFile "pkg-dirlink-collide.tar.zst"
+          archiveHardLinkCollide = archiveFile "pkg-hardlink-collide.tar.zst"
+          archiveManyEntries = archiveFile "pkg-many-entries.tar.zst"
+          archiveBigFile = archiveFile "pkg-big-file.tar.zst"
+          archiveAmplify = archiveFile "pkg-amplify.tar.zst"
       BL.writeFile archiveTools $
         compressArchive
           [ tarDir "pkg",
@@ -4311,7 +4312,12 @@ testUnpackBuildIO = do
             tarSymLink "dup1" "base",
             tarSymLink "dup2" "base"
           ]
-      let mkUnpackDrv outP srcFiles =
+      let -- srcs carries the canonical /nix/store spelling, as eval writes
+          -- it; the physical archives live under the temp store dir.
+          canonicalSrc file = case parseStorePath storeDir (T.pack file) of
+            Just sp -> storePathToText defaultStoreDir sp
+            Nothing -> T.pack file
+          mkUnpackDrv outP srcFiles =
             Derivation
               { drvOutputs =
                   [ DerivationOutput
@@ -4328,7 +4334,7 @@ testUnpackBuildIO = do
                 drvArgs = [],
                 drvEnv =
                   Map.fromList
-                    [(envSrcs, TE.encodeUtf8 (T.intercalate " " (map T.pack srcFiles)))]
+                    [(envSrcs, TE.encodeUtf8 (T.intercalate " " (map canonicalSrc srcFiles)))]
               }
           seedOut = StorePath (T.replicate 31 "0" <> "2") "unpack-seed"
           collideOut = StorePath (T.replicate 31 "0" <> "3") "unpack-collide"
@@ -4361,7 +4367,6 @@ testUnpackBuildIO = do
       bigFileResult <- buildDerivation (tinyBudget 64 1000) store (mkUnpackDrv bigFileOut [archiveBigFile])
       amplifyResult <- buildDerivation (tinyBudget 100 1000) store (mkUnpackDrv amplifyOut [archiveAmplify])
       forceRemoveIfExists buildTmp
-      forceRemoveIfExists workDir
       seedChecks <- case seedResult of
         BuildFailure msg code ->
           sequence

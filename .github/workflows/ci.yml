@@ -291,12 +291,10 @@ jobs:
         shell: pwsh
         run: |
           $exe = "$env:RUNNER_TEMP\bin\nova-nix.exe"
-          $src = Join-Path $env:GITHUB_WORKSPACE "pkgs\windows\hello.nix"
-          # The logical store dir /nix/store resolves drive-relative on
-          # Windows, and this runner's workspace lives on D:.  Run from C:\
-          # so every resolution lands on the provisioned C:\nix\store.
-          Set-Location C:\
-          $out = (& $exe build $src) | Select-Object -Last 1
+          # The workspace lives on D: while the store is anchored on C: -
+          # building from here is deliberate: it exercises the #101 fix
+          # (canonical /nix/store text rendered through the store dir).
+          $out = (& $exe build pkgs\windows\hello.nix) | Select-Object -Last 1
           if ($LASTEXITCODE -ne 0) { Write-Error "nova-nix build failed"; exit 1 }
           Write-Host "out path: $out"
           $hello = Join-Path $out "hello.exe"

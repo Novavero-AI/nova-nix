@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **builtin:unpack resolves srcs through the store dir.** The srcs env value carries eval's canonical /nix/store spelling; unpack opened it verbatim, and on Windows a bare /-rooted path resolves against the current drive - the build worked only when the process happened to run from C:. Found by the e2e job's first flights (#100) on GitHub's D:-workspace runners. Each srcs entry now parses as a store path and renders through the configured store dir (the identity on Unix), a non-store-path entry fails loudly, and the e2e job no longer pins its working directory. (#101)
 - **Toolchain: GHC 9.14.1 (the first GHC LTS release)** - CI, the release pipeline, and the README badge move from GHC 9.8.4 to 9.14.1. GHC 9.14 opens GHC's new LTS scheme (a minimum of two years of bugfix releases), and under that scheme every earlier series stops receiving fixes, so no version in between had a future. Dependency bounds already admitted the newer compiler and the full set resolves on it. The project targets the LTS alone: base >= 4.22, and foldl' comes from the Prelude, so its eleven redundant Data.List imports are gone. The deprecated pattern namespace specifier stays for now - hlint cannot yet parse the data replacement GHC suggests - with its deprecation warning muted in the cabal file until hlint learns the new spelling.
 
 ## 0.6.0.0 - 2026-06-12
