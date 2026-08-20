@@ -100,6 +100,7 @@ import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (makeFixedOutputPath, sha256Digest)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB
+import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Lock
 import Nix.Store.Path
 import qualified NovaCache.Hash as Hash
@@ -318,7 +319,7 @@ registrationFor store sp deriver refs = do
   -- Compute the NAR hash and size of the final store contents.  The NAR
   -- serialization is canonical (entries sorted, 8-byte padding), so this is
   -- exactly the NarHash/NarSize a binary cache reports for the path.
-  narEntry <- NAR.serialiseFromPath destPath
+  narEntry <- ExecBit.serialiseFromPath destPath
   let narBytes = NAR.serialise narEntry
   pure
     PathRegistration
@@ -564,9 +565,7 @@ unpackTree path entry = case entry of
   NAR.NarRegular isExec contents -> do
     createDirectoryIfMissing True (takeDirectory path)
     BS.writeFile path contents
-    when isExec $ do
-      perms <- Dir.getPermissions path
-      setPermissions path (Dir.setOwnerExecutable True perms)
+    when isExec (ExecBit.markExecutable path)
     pure (Right [])
   NAR.NarSymlink target -> pure $ case decodeNarText "symlink target" target of
     Left err -> Left err
@@ -883,9 +882,7 @@ applyNarEvent narState event = case event of
     Nothing -> pure (Left "NAR stream sink: file close without an open file")
     Just (fileHandle, path, isExec) -> do
       hClose fileHandle
-      when isExec $ do
-        perms <- Dir.getPermissions path
-        setPermissions path (Dir.setOwnerExecutable True perms)
+      when isExec (ExecBit.markExecutable path)
       pure (Right narState {nusOpen = Nothing})
   Stream.EventSymlink targetBytes -> withNodeTarget narState $ \path ->
     pure $ case decodeNarText "symlink target" targetBytes of
@@ -1072,7 +1069,7 @@ materializeEvalStoreWrites store storeWrites = do
 -- derive exactly this path.  An unreadable tree counts as a mismatch.
 adoptedTreeMatches :: FilePath -> StorePath -> IO Bool
 adoptedTreeMatches dest sp = do
-  result <- try (NAR.serialiseFromPath dest)
+  result <- try (ExecBit.serialiseFromPath dest)
   pure $ case result of
     Left (_ :: SomeException) -> False
     Right entry ->
@@ -1102,4 +1099,8 @@ copyPathInto src dest = do
           createDirectoryIfMissing True dest
           names <- listDirectory src
           mapM_ (\name -> copyPathInto (src </> name) (dest </> name)) names
-        else copyFile src dest
+        else do
+          copyFile src dest
+          -- copyFile copies the unnamed stream only, so on Windows the
+          -- exec mark would not survive the copy.
+          ExecBit.copyExecMark src dest

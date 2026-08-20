@@ -53,6 +53,7 @@ import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, 
 import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
+import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
@@ -4214,6 +4215,127 @@ raceWatchdogMicros = 30 * 1000000
 deleteLockProbeMicros :: Int
 deleteLockProbeMicros = 500 * 1000
 
+-- | The executable bit's own representation, independent of any store.
+--
+-- Every assertion here is platform-agnostic on purpose: the module's whole
+-- point is that a caller asks 'ExecBit' rather than the filesystem, so the
+-- same questions must have the same answers on Windows and on Unix even
+-- though the bit is kept in different places.
+testExecBit :: IO [Bool]
+testExecBit = do
+  putStrLn "store/exec-bit"
+  sequence
+    [ -- The round-trip the representation exists for: what was marked
+      -- reads back marked, and an unmarked sibling stays unmarked.
+      runTestM "exec mark round-trips through isExecutable" $ do
+        dir <- freshExecBitDir "roundtrip"
+        let marked = dir </> "tool"
+            plain = dir </> "data"
+        BS.writeFile marked "#!x"
+        BS.writeFile plain "hello"
+        ExecBit.markExecutable marked
+        isMarked <- ExecBit.isExecutable marked
+        isPlain <- ExecBit.isExecutable plain
+        forceRemoveIfExists dir
+        pure $ case (isMarked, isPlain) of
+          (True, False) -> Pass
+          (False, _) -> Fail "a marked file did not read back executable"
+          (_, True) -> Fail "an unmarked file read back executable",
+      -- copyExecMark out of a sealed store path.  setReadOnly is what
+      -- placeInStore does, and on Windows copyFile propagates that
+      -- attribute to the copy, where a mark cannot be written until it is
+      -- cleared again.  The source must also survive read-only.
+      runTestM "exec mark survives a copy out of a read-only source" $ do
+        dir <- freshExecBitDir "copy"
+        let src = dir </> "tool"
+            dest = dir </> "tool-copy"
+        BS.writeFile src "#!x"
+        ExecBit.markExecutable src
+        setReadOnly src
+        Dir.copyFile src dest
+        ExecBit.copyExecMark src dest
+        copied <- ExecBit.isExecutable dest
+        srcStillExec <- ExecBit.isExecutable src
+        -- Unseal before cleanup: a read-only file resists removal on
+        -- Windows the same way it resists a stream write.
+        Dir.getPermissions src >>= Dir.setPermissions src . Dir.setOwnerWritable True
+        forceRemoveIfExists dir
+        pure $ case (copied, srcStillExec) of
+          (True, True) -> Pass
+          (False, _) -> Fail "the copy lost its exec mark"
+          (_, False) -> Fail "sealing the source dropped its exec mark",
+      -- The serialiser reads the mark, not the file's permissions: this is
+      -- the flag a NAR carries, and on Windows getPermissions would answer
+      -- from the extension instead.
+      runTestM "serialiseFromPath reports the marked flag" $ do
+        dir <- freshExecBitDir "serialise"
+        let marked = dir </> "tool"
+        BS.writeFile marked "#!x"
+        BS.writeFile (dir </> "data") "hello"
+        ExecBit.markExecutable marked
+        entry <- ExecBit.serialiseFromPath dir
+        forceRemoveIfExists dir
+        pure $ case entry of
+          NAR.NarDirectory entries ->
+            assertEqual
+              "flags of (data, tool)"
+              [("data", False), ("tool", True)]
+              [(n, e) | (n, NAR.NarRegular e _) <- entries]
+          other -> Fail ("expected a directory entry, got: " <> T.pack (show other)),
+      -- The sink and the verifier must read one source of truth.  A
+      -- substituted tree is written through markExecutable and its hash
+      -- rechecked on disk, so if narHashOfPath consulted the filesystem's
+      -- own idea of executability instead, every path holding a marked
+      -- file would be downloaded, rejected and deleted.
+      runTestM "narHashOfPath agrees with the serialiser it verifies" $ do
+        dir <- freshExecBitDir "hash"
+        let marked = dir </> "tool"
+        BS.writeFile marked "#!x"
+        BS.writeFile (dir </> "data") "hello"
+        ExecBit.markExecutable marked
+        streamed <- ExecBit.narHashOfPath dir
+        fromEntry <- NAR.narHash <$> ExecBit.serialiseFromPath dir
+        -- A control on the same axis: an unmarked tree must hash
+        -- differently, or agreement above would prove nothing.
+        unmarkedDir <- freshExecBitDir "hash-plain"
+        BS.writeFile (unmarkedDir </> "tool") "#!x"
+        BS.writeFile (unmarkedDir </> "data") "hello"
+        unmarked <- ExecBit.narHashOfPath unmarkedDir
+        forceRemoveIfExists dir
+        forceRemoveIfExists unmarkedDir
+        pure $
+          if streamed /= fromEntry
+            then Fail "the verifier's hash disagrees with the serialiser's"
+            else
+              if streamed == unmarked
+                then Fail "the exec mark did not reach the hash at all"
+                else Pass,
+      -- correct/ recurses by name, and a non-ASCII name must survive that
+      -- recursion: decoding it a byte at a time names a file that is not
+      -- there and the mark silently reads as absent.
+      runTestM "a non-ASCII directory name keeps its child's mark" $ do
+        dir <- freshExecBitDir "utf8"
+        let sub = dir </> "\955-dir"
+            marked = sub </> "\955-tool"
+        createDirectoryIfMissing True sub
+        BS.writeFile marked "#!x"
+        ExecBit.markExecutable marked
+        entry <- ExecBit.serialiseFromPath dir
+        forceRemoveIfExists dir
+        pure $ case entry of
+          NAR.NarDirectory [(_, NAR.NarDirectory [(_, NAR.NarRegular True _)])] -> Pass
+          other -> Fail ("expected one marked child, got: " <> T.pack (show other))
+    ]
+
+-- | An empty scratch directory for one 'testExecBit' case.
+freshExecBitDir :: String -> IO FilePath
+freshExecBitDir name = do
+  tmpBase <- getTemporaryDirectory
+  let dir = tmpBase </> ("nova-nix-test-execbit-" ++ name)
+  forceRemoveIfExists dir
+  createDirectoryIfMissing True dir
+  pure dir
+
 testPathLocks :: IO [Bool]
 testPathLocks = do
   putStrLn "store/path-locks"
@@ -6111,8 +6233,9 @@ narSpecTree =
       ("link", NAR.NarSymlink "data.txt")
     ]
 
--- | Hand-encoded NAR of just @data.txt@, for the on-disk addToStore vector
--- (no executable entry: Windows has no exec bit to round-trip from disk).
+-- | Hand-encoded NAR of just @data.txt@, for the on-disk addToStore vector.
+-- No executable entry, so the vector stays a fixture for addToStore rather
+-- than for the exec bit; 'testExecBit' covers that on both platforms.
 narSpecFileVector :: BS.ByteString
 narSpecFileVector =
   BS.concat $
@@ -8635,6 +8758,7 @@ instance MonadEval StubStoreEval where
   removeScratchDir _ = pure ()
   copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
   narHashOfPath _ = throwEvalError "builtins.fetchGit: not available in the stub evaluator"
+  setExecutableFile _ = throwEvalError "builtins.fetchGit: not available in the stub evaluator"
   isExecutableFile _ = throwEvalError "builtins.path: not available in the stub evaluator"
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in the stub evaluator"
   addSourceNar _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
@@ -9901,6 +10025,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testDepGraph,
           testSubstituter,
           testPathLocks,
+          testExecBit,
           testVerifySigs,
           testNarInfoValidation,
           testPushPure,

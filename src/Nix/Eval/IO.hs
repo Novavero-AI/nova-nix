@@ -55,6 +55,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Th
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (copyPathInto, unpackNarEntry)
+import qualified Nix.Store.ExecBit as ExecBit
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
@@ -287,7 +288,7 @@ instance MonadEval EvalIO where
           Left err -> throwEvalError (copyContext <> ": " <> SP.storePathNameErrorText err)
           Right () -> pure ()
         resolvedSource <- evalStoreTextPath rawPath
-        entry <- wrapIO (NAR.serialiseFromPath resolvedSource)
+        entry <- wrapIO (ExecBit.serialiseFromPath resolvedSource)
         let narDigest = sha256Digest (NAR.serialise entry)
         sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
         let spText = canonicalStorePathText sp
@@ -382,7 +383,7 @@ instance MonadEval EvalIO where
     -- content can never serve stale bytes from an earlier copy (the old
     -- scheme hashed the path STRING, so it did exactly that).
     resolvedSource <- evalStoreTextPath srcPath
-    entry <- wrapIO (NAR.serialiseFromPath resolvedSource)
+    entry <- wrapIO (ExecBit.serialiseFromPath resolvedSource)
     let narDigest = sha256Digest (NAR.serialise entry)
     case expectedSha256 of
       Just (subject, expected)
@@ -404,9 +405,11 @@ instance MonadEval EvalIO where
 
   narHashOfPath path = do
     resolved <- evalStoreTextPath path
-    wrapIO (sha256Digest . NAR.serialise <$> NAR.serialiseFromPath resolved)
+    wrapIO (sha256Digest . NAR.serialise <$> ExecBit.serialiseFromPath resolved)
 
-  isExecutableFile path = evalStoreTextPath path >>= \resolved -> wrapIO (Dir.executable <$> Dir.getPermissions resolved)
+  isExecutableFile path = evalStoreTextPath path >>= \resolved -> wrapIO (ExecBit.isExecutable resolved)
+
+  setExecutableFile path = evalStoreTextPath path >>= \resolved -> wrapIO (ExecBit.markExecutable resolved)
 
   readSymlinkTarget path = evalStoreTextPath path >>= \resolved -> wrapIO (T.pack <$> Dir.getSymbolicLinkTarget resolved)
 
