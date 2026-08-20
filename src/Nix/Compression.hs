@@ -14,6 +14,7 @@ module Nix.Compression
     parseNarCompression,
     compressionNameNone,
     compressionNameXz,
+    compressionNameZstd,
     defaultedCompressionName,
   )
 where
@@ -28,6 +29,7 @@ import qualified Data.Text as T
 data NarCompression
   = CompressionNone
   | CompressionXz
+  | CompressionZstd
   deriving (Eq, Show)
 
 -- | The wire spelling of the identity codec.
@@ -37,6 +39,11 @@ compressionNameNone = "none"
 -- | The wire spelling of the xz codec (cache.nixos.org's format).
 compressionNameXz :: Text
 compressionNameXz = "xz"
+
+-- | The wire spelling of the zstd codec (the modern caches' format,
+-- and the compression @nova-nix push@ can produce).
+compressionNameZstd :: Text
+compressionNameZstd = "zstd"
 
 -- | What upstream decodes when a narinfo omits the @Compression@ field.
 defaultedCompressionName :: Text
@@ -49,5 +56,6 @@ parseNarCompression :: Text -> Either Text NarCompression
 parseNarCompression name
   | name == compressionNameNone = Right CompressionNone
   | name == compressionNameXz = Right CompressionXz
+  | name == compressionNameZstd = Right CompressionZstd
   | T.null name = Left ("unsupported compression: " <> defaultedCompressionName)
   | otherwise = Left ("unsupported compression: " <> name)

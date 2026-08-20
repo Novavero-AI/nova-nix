@@ -37,7 +37,7 @@ import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
-import Nix.Push (PushConfig (..), PushSummary (..), loadApiKeyFile, pushPaths)
+import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), loadApiKeyFile, parsePushCompression, pushCompressionValues, pushPaths)
 import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw, materializeEvalSources, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
@@ -78,13 +78,14 @@ data Command
 data PushArgs = PushArgs
   { paCacheUrl :: !(Maybe String),
     paKeyFile :: !(Maybe FilePath),
+    paCompressionArg :: !(Maybe String),
     paAll :: !Bool,
     paPaths :: ![String]
   }
 
 -- | Push arguments before any flag is parsed.
 emptyPushArgs :: PushArgs
-emptyPushArgs = PushArgs Nothing Nothing False []
+emptyPushArgs = PushArgs Nothing Nothing Nothing False []
 
 -- | Parse the command line.  A malformed invocation is an error, never a
 -- silent drop: an unknown or typo'd flag once ended parsing and quietly
@@ -135,6 +136,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
       goPush opts (pushArgs {paCacheUrl = Just url}) rest
     goPush opts pushArgs ("--key-file" : path : rest) =
       goPush opts (pushArgs {paKeyFile = Just path}) rest
+    goPush opts pushArgs ("--compression" : value : rest) =
+      goPush opts (pushArgs {paCompressionArg = Just value}) rest
     goPush opts pushArgs ("--all" : rest) =
       goPush opts (pushArgs {paAll = True}) rest
     goPush _ _ [flag]
@@ -158,7 +161,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
       goStoreDelete opts (paths ++ [path]) rest
     -- Flags that consume the following argument as their value.
     valueFlags =
-      ["--nix-path", "--store", "--substituter", "--trusted-key", "--expr", "--cache", "--key-file"]
+      ["--nix-path", "--store", "--substituter", "--trusted-key", "--expr", "--cache", "--key-file", "--compression"]
 
 -- | Merge --nix-path entries, bundled data dir, and NIX_PATH search paths.
 -- The data dir is appended last so user paths take priority.
@@ -208,6 +211,7 @@ main = do
       hPutStrLn stderr "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)"
       hPutStrLn stderr "  --all                  With push: select every valid path in the store"
       hPutStrLn stderr "  --key-file PATH        With push: file holding the cache API key"
+      hPutStrLn stderr ("  --compression KIND     With push: artifact packaging (" <> T.unpack pushCompressionValues <> "; default none)")
       hPutStrLn stderr "  --store DIR            Use DIR as the store (default: the platform store)"
       hPutStrLn stderr "  --substituter URL      Try this binary cache before building"
       hPutStrLn stderr "  --trusted-key K        Public key (name:base64) for the substituter"
@@ -457,6 +461,9 @@ pushCommand opts pushArgs = do
     Just path -> do
       loaded <- loadApiKeyFile path
       either failWith (pure . Just) loaded
+  compression <- case paCompressionArg pushArgs of
+    Nothing -> pure PushNone
+    Just value -> either (failWith . ("push: " <>)) pure (parsePushCompression (T.pack value))
   store <- openStore (chosenStoreDir opts)
   rootsResult <- resolvePushRoots store pushArgs
   case rootsResult of
@@ -464,7 +471,7 @@ pushCommand opts pushArgs = do
       closeStore store
       failWith err
     Right roots -> do
-      result <- pushPaths (PushConfig cacheUrl apiKey) store roots
+      result <- pushPaths (PushConfig cacheUrl apiKey compression) store roots
       closeStore store
       case result of
         Left err -> failWith ("push failed: " <> err)

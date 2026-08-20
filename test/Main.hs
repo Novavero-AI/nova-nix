@@ -47,7 +47,7 @@ import Nix.Hash (makeFixedOutputPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
-import Nix.Push (checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, narFileName, narHashMatches, planMissing, storePathBasename, stripHashPrefix)
+import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
 import Nix.Store (DeleteOutcome (..), Store (..), addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
@@ -59,6 +59,7 @@ import qualified NovaCache.Hash as CHash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
+import qualified NovaCache.Zstd as CZstd
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
@@ -3064,10 +3065,10 @@ testSubstituter = do
         case Subst.decompressorFor 1024 "xz" of
           Right _ -> Pass
           Left err -> Fail ("xz rejected: " <> err),
-      runTest "decompressorFor none is identity" $
+      runTestM "decompressorFor none is identity" $
         case Subst.decompressorFor 5 "none" of
-          Right decompress -> assertEqual "identity" (Right "bytes") (decompress "bytes")
-          Left err -> Fail ("expected none to be supported, got: " <> err),
+          Right decompress -> assertEqual "identity" (Right "bytes") <$> decompress "bytes"
+          Left err -> pure (Fail ("expected none to be supported, got: " <> err)),
       -- verifyNarSize: the declared NarSize is a signed claim that flows
       -- into the store DB, so it must equal the downloaded byte count.
       runTest "verifyNarSize accepts matching size" $
@@ -3080,44 +3081,62 @@ testSubstituter = do
           Left err | "size mismatch" `T.isInfixOf` err -> Pass
           other -> Fail ("expected size mismatch, got: " <> T.pack (show other)),
       -- decompressNar: "none" passes through
-      runTest "decompressNar none" $
+      runTestM "decompressNar none" $
         let input = "fake nar data"
-         in assertEqual "decompress-none" (Right input) (Subst.decompressNar (toInteger (BS.length input)) "none" input),
+         in assertEqual "decompress-none" (Right input) <$> Subst.decompressNar (toInteger (BS.length input)) "none" input,
       -- decompressNar: an empty Compression field means bzip2 upstream
       -- (the field's historical default), never identity; the
       -- rejection names the codec upstream would decode.
-      runTest "decompressNar empty means bzip2" $
-        case Subst.decompressNar 4 "" "data" of
+      runTestM "decompressNar empty means bzip2" $ do
+        result <- Subst.decompressNar 4 "" "data"
+        pure $ case result of
           Left err | "bzip2" `T.isInfixOf` err -> Pass
           other -> Fail ("expected bzip2 rejection, got: " <> T.pack (show other)),
       -- decompressNar: xz decodes under the declared-NarSize bound
       -- (the fixture is a real 112-byte xz stream of 1792 payload
       -- bytes, embedded base64 to keep the source ASCII).
-      runTest "decompressNar xz bounded roundtrip" $
+      runTestM "decompressNar xz bounded roundtrip" $
         case B64.decode xzFixtureB64 of
-          Left err -> Fail ("fixture base64 does not decode: " <> T.pack err)
-          Right compressed ->
-            case Subst.decompressNar xzFixtureSize "xz" compressed of
-              Right out -> assertEqual "xz-roundtrip" xzFixturePayload out
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            out <- Subst.decompressNar xzFixtureSize "xz" compressed
+            pure $ case out of
+              Right decoded -> assertEqual "xz-roundtrip" xzFixturePayload decoded
               Left err -> Fail ("xz roundtrip failed: " <> err),
       -- The output bound is exact: one byte under the real size must
       -- refuse, naming the declared NarSize.
-      runTest "decompressNar xz over-bound rejects" $
+      runTestM "decompressNar xz over-bound rejects" $
         case B64.decode xzFixtureB64 of
-          Left err -> Fail ("fixture base64 does not decode: " <> T.pack err)
-          Right compressed ->
-            case Subst.decompressNar (xzFixtureSize - 1) "xz" compressed of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            out <- Subst.decompressNar (xzFixtureSize - 1) "xz" compressed
+            pure $ case out of
               Left err | "NarSize" `T.isInfixOf` err -> Pass
               other -> Fail ("expected over-bound rejection, got: " <> T.pack (show other)),
       -- decompressNar: bytes that are not an xz stream are an error,
       -- never silently passed through
-      runTest "decompressNar xz garbage rejects" $
-        case Subst.decompressNar 64 "xz" "not an xz stream" of
+      runTestM "decompressNar xz garbage rejects" $ do
+        out <- Subst.decompressNar 64 "xz" "not an xz stream"
+        pure $ case out of
           Left _ -> Pass
           Right _ -> Fail "garbage decoded as xz",
+      -- decompressNar: zstd decodes under the same declared-NarSize
+      -- bound; the fixture compresses with the sublibrary's own
+      -- encoder, the same pairing the push path ships.
+      runTestM "decompressNar zstd bounded roundtrip" $ do
+        out <- Subst.decompressNar xzFixtureSize "zstd" zstdFixtureCompressed
+        pure $ case out of
+          Right decoded -> assertEqual "zstd-roundtrip" xzFixturePayload decoded
+          Left err -> Fail ("zstd roundtrip failed: " <> err),
+      runTestM "decompressNar zstd over-bound rejects" $ do
+        out <- Subst.decompressNar (xzFixtureSize - 1) "zstd" zstdFixtureCompressed
+        pure $ case out of
+          Left err | "NarSize" `T.isInfixOf` err -> Pass
+          other -> Fail ("expected over-bound rejection, got: " <> T.pack (show other)),
       -- decompressNar: unknown compression
-      runTest "decompressNar unknown" $
-        case Subst.decompressNar 4 "brotli" "data" of
+      runTestM "decompressNar unknown" $ do
+        out <- Subst.decompressNar 4 "brotli" "data"
+        pure $ case out of
           Left _ -> Pass
           Right _ -> Fail "expected error for unknown",
       -- parseReferences: narinfo references are wire-format basenames
@@ -3307,6 +3326,18 @@ testSubstituter = do
             pure $ case result of
               Right out | out == xzFixturePayload -> Pass
               other -> Fail ("xz source roundtrip diverged: " <> T.pack (show (fmap BS.length other))),
+      runTestM "withDecompressedSource zstd chunked roundtrip" $ do
+        source <- chunkReader (streamChunks 7 zstdFixtureCompressed)
+        result <- Subst.withDecompressedSource xzFixtureSize "zstd" source $ \pull ->
+          let go acc = do
+                chunk <- pull
+                if BS.null chunk
+                  then pure (Right (BS.concat (reverse acc)))
+                  else go (chunk : acc)
+           in go []
+        pure $ case result of
+          Right out | out == xzFixturePayload -> Pass
+          other -> Fail ("zstd source roundtrip diverged: " <> T.pack (show (fmap BS.length other))),
       runTestM "withDecompressedSource xz single-byte chunks" $
         case B64.decode xzFixtureB64 of
           Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
@@ -3441,8 +3472,43 @@ testSubstituter = do
          in if smallCeiling == 10 + 64 * 1024 && largeCeiling == largeSize + largeSize `div` 64
               then Pass
               else Fail ("unexpected ceilings: " <> T.pack (show (smallCeiling, largeCeiling))),
+      -- The zstd mirror of the xz hostile trio: over-bound output is
+      -- deterministic, a corrupt frame retries.  Truncation is NOT an
+      -- error at this layer for zstd (truncated input yields truncated
+      -- output by design); the pipeline test below pins that the NAR
+      -- layer catches it.
+      runTestM "withDecompressedSource zstd over-bound is fatal" $ do
+        source <- chunkReader (streamChunks 7 zstdFixtureCompressed)
+        result <- Subst.withDecompressedSource (xzFixtureSize - 1) "zstd" source drainChunkSource
+        pure $ case result of
+          Left (Subst.FatalFailure err) | "NarSize" `T.isInfixOf` err -> Pass
+          other -> Fail ("expected fatal over-bound, got: " <> T.pack (show (void other))),
+      runTestM "withDecompressedSource zstd garbage is transient" $ do
+        source <- chunkReader ["not a zstd frame"]
+        result <- Subst.withDecompressedSource 64 "zstd" source drainChunkSource
+        pure $ case result of
+          Left (Subst.TransientFailure _) -> Pass
+          other -> Fail ("expected transient stream error, got: " <> T.pack (show (void other))),
+      -- A truncated zstd body decompresses to a truncated NAR, so the
+      -- completeness arbiter is the NAR grammar above the codec: the
+      -- pipeline must land it in the Left channel as retryable.
+      runTestM "zstd truncated body fails the pipeline as transient" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-zstd-trunc"
+            compressedNar = CZstd.compress CZstd.defaultCompressionLevel streamTestNar
+        forceRemoveIfExists tmpDir
+        createDirectoryIfMissing True tmpDir
+        source <- chunkReader (streamChunks 7 (BS.take (BS.length compressedNar - 8) compressedNar))
+        result <-
+          Subst.withDecompressedSource (toInteger (BS.length streamTestNar)) "zstd" source $
+            Subst.consumeNarStream (tmpDir </> "out") ((streamTestNarInfo streamTestNar) {NarInfo.niCompression = "zstd"}) streamTestDigest
+        forceRemoveIfExists tmpDir
+        pure $ case result of
+          Left (Subst.TransientFailure _) -> Pass
+          Left (Subst.FatalFailure err) -> Fail ("zstd truncation classified fatal: " <> err)
+          Right _ -> Fail "truncated zstd body was accepted",
       runTest "streaming compression support matches the strict set" $
-        case (Subst.streamingDecompressionSupported "none", Subst.streamingDecompressionSupported "xz", Subst.streamingDecompressionSupported "zstd") of
+        case (Subst.streamingDecompressionSupported "xz", Subst.streamingDecompressionSupported "zstd", Subst.streamingDecompressionSupported "bzip2") of
           (Right (), Right (), Left _) -> Pass
           other -> Fail ("unexpected support set: " <> T.pack (show other)),
       -- The support set is encoded twice - the strict decompressor and
@@ -3880,6 +3946,9 @@ testSubstituter = do
     streamChunks chunkLen bytes
       | BS.null bytes = []
       | otherwise = BS.take chunkLen bytes : streamChunks chunkLen (BS.drop chunkLen bytes)
+    -- The xz fixture's payload, compressed by nova-cache:zstandard's
+    -- own encoder - the exact pairing the push path ships.
+    zstdFixtureCompressed = CZstd.compress CZstd.defaultCompressionLevel xzFixturePayload
 
 -- ---------------------------------------------------------------------------
 -- Tests: Build orchestrator (Phase 3, Batch 7)
@@ -4317,8 +4386,12 @@ testPushPure = do
       spA = StorePath hashA "hello-1.0"
       spB = StorePath hashB "dep-2.0"
       narHash = "sha256:0123abcdef"
+      narBytes = BS.replicate 1234 0x6e
+      artifactNone = mkPushArtifact PushNone narHash narBytes
+      artifactZstd = mkPushArtifact PushZstd narHash narBytes
       -- References deliberately unsorted; deriver present.
-      ni = mkNarInfo spA narHash 1234 [spB, spA] (Just spB)
+      ni = mkNarInfo artifactNone spA [spB, spA] (Just spB)
+      niZstd = mkNarInfo artifactZstd spA [spB, spA] (Just spB)
   sequence
     [ runTest "narinfo StorePath is canonical /nix/store" $
         assertEqual "StorePath" ("/nix/store/" <> hashA <> "-hello-1.0") (NarInfo.niStorePath ni),
@@ -4331,6 +4404,54 @@ testPushPure = do
           (NarInfo.niCompression ni, NarInfo.niFileHash ni, NarInfo.niFileSize ni),
       runTest "narinfo sizes carry through" $
         assertEqual "NarSize" 1234 (NarInfo.niNarSize ni),
+      -- The zstd artifact: file fields describe the compressed object,
+      -- named by its own file hash, while the NAR fields stay the
+      -- archive's - and the substituter's strict decoder round-trips
+      -- the bytes under the declared NarSize bound.
+      runTest "zstd artifact declares the compressed object" $
+        assertEqual
+          "zstd fields"
+          ("zstd", Just (paFileHash artifactZstd), Just (fromIntegral (paFileSize artifactZstd)), 1234)
+          (NarInfo.niCompression niZstd, NarInfo.niFileHash niZstd, NarInfo.niFileSize niZstd, NarInfo.niNarSize niZstd),
+      -- Ground truth, not field copying: the file fields must equal
+      -- independent computation over the artifact's actual bytes, and
+      -- must NOT collapse into the NAR fields (the copy-paste hazard
+      -- for a compressible input like this one).
+      runTest "zstd file fields are computed from the compressed bytes" $
+        let independentHash = CHash.formatNixHash (CHash.hashBytes (paBytes artifactZstd))
+         in if paFileHash artifactZstd == independentHash
+              && paFileSize artifactZstd == BS.length (paBytes artifactZstd)
+              && paFileHash artifactZstd /= narHash
+              && paFileSize artifactZstd /= BS.length narBytes
+              then Pass
+              else Fail "zstd file fields do not match the compressed bytes",
+      runTest "none artifact IS the NAR" $
+        if paBytes artifactNone == narBytes
+          && paFileHash artifactNone == narHash
+          && paFileSize artifactNone == BS.length narBytes
+          then Pass
+          else Fail "none artifact diverges from its NAR",
+      runTest "zstd object is named by its independently computed file hash" $
+        assertEqual
+          "zstd URL"
+          ("nar/" <> stripHashPrefix (CHash.formatNixHash (CHash.hashBytes (paBytes artifactZstd))) <> ".nar.zst")
+          (NarInfo.niUrl niZstd),
+      -- mkNarInfo cannot be handed NAR fields that disagree with the
+      -- artifact: they now come from the artifact itself.
+      runTest "narinfo NAR fields come from the artifact" $
+        assertEqual
+          "NAR fields"
+          (narHash, toInteger (BS.length narBytes))
+          (NarInfo.niNarHash niZstd, NarInfo.niNarSize niZstd),
+      runTestM "zstd artifact round-trips through the substituter decoder" $ do
+        out <- Subst.decompressNar 1234 "zstd" (paBytes artifactZstd)
+        pure (assertEqual "push-substitute roundtrip" (Right narBytes) out),
+      -- The CLI vocabulary is the wire vocabulary, parsed in one place.
+      runTest "parsePushCompression accepts the register and rejects by name" $
+        case (parsePushCompression "none", parsePushCompression "zstd", parsePushCompression "brotli") of
+          (Right PushNone, Right PushZstd, Left err)
+            | "none, zstd" `T.isInfixOf` err -> Pass
+          other -> Fail ("unexpected parse outcomes: " <> T.pack (show other)),
       runTest "references are sorted basenames" $
         assertEqual
           "References"
