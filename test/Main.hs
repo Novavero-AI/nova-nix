@@ -3047,14 +3047,15 @@ testSubstituter = do
         reader <- chunkReader ["abcdef", "ghijkl"]
         body <- Subst.readBodyCapped 10 reader
         pure (assertEqual "over cap" Nothing body),
-      -- decompressorFor decides support from the narinfo value alone,
-      -- so unsupported compression rejects before any NAR download.
-      runTest "decompressorFor rejects xz up front" $
-        case Subst.decompressorFor "xz" of
-          Left _ -> Pass
-          Right _ -> Fail "expected xz to be rejected before download",
+      -- decompressorFor decides support from the narinfo's declared
+      -- values alone, so unsupported compression rejects before any
+      -- NAR download; xz resolves a bounded decompressor.
+      runTest "decompressorFor xz resolves" $
+        case Subst.decompressorFor 1024 "xz" of
+          Right _ -> Pass
+          Left err -> Fail ("xz rejected: " <> err),
       runTest "decompressorFor none is identity" $
-        case Subst.decompressorFor "none" of
+        case Subst.decompressorFor 5 "none" of
           Right decompress -> assertEqual "identity" (Right "bytes") (decompress "bytes")
           Left err -> Fail ("expected none to be supported, got: " <> err),
       -- verifyNarSize: the declared NarSize is a signed claim that flows
@@ -3071,19 +3072,39 @@ testSubstituter = do
       -- decompressNar: "none" passes through
       runTest "decompressNar none" $
         let input = "fake nar data"
-         in assertEqual "decompress-none" (Right input) (Subst.decompressNar "none" input),
+         in assertEqual "decompress-none" (Right input) (Subst.decompressNar (toInteger (BS.length input)) "none" input),
       -- decompressNar: empty compression passes through
       runTest "decompressNar empty" $
         let input = "fake nar data"
-         in assertEqual "decompress-empty" (Right input) (Subst.decompressNar "" input),
-      -- decompressNar: xz returns error
-      runTest "decompressNar xz unsupported" $
-        case Subst.decompressNar "xz" "data" of
+         in assertEqual "decompress-empty" (Right input) (Subst.decompressNar (toInteger (BS.length input)) "" input),
+      -- decompressNar: xz decodes under the declared-NarSize bound
+      -- (the fixture is a real 112-byte xz stream of 1792 payload
+      -- bytes, embedded base64 to keep the source ASCII).
+      runTest "decompressNar xz bounded roundtrip" $
+        case B64.decode xzFixtureB64 of
+          Left err -> Fail ("fixture base64 does not decode: " <> T.pack err)
+          Right compressed ->
+            case Subst.decompressNar xzFixtureSize "xz" compressed of
+              Right out -> assertEqual "xz-roundtrip" xzFixturePayload out
+              Left err -> Fail ("xz roundtrip failed: " <> err),
+      -- The output bound is exact: one byte under the real size must
+      -- refuse, naming the declared NarSize.
+      runTest "decompressNar xz over-bound rejects" $
+        case B64.decode xzFixtureB64 of
+          Left err -> Fail ("fixture base64 does not decode: " <> T.pack err)
+          Right compressed ->
+            case Subst.decompressNar (xzFixtureSize - 1) "xz" compressed of
+              Left err | "NarSize" `T.isInfixOf` err -> Pass
+              other -> Fail ("expected over-bound rejection, got: " <> T.pack (show other)),
+      -- decompressNar: bytes that are not an xz stream are an error,
+      -- never silently passed through
+      runTest "decompressNar xz garbage rejects" $
+        case Subst.decompressNar 64 "xz" "not an xz stream" of
           Left _ -> Pass
-          Right _ -> Fail "expected error for xz",
+          Right _ -> Fail "garbage decoded as xz",
       -- decompressNar: unknown compression
       runTest "decompressNar unknown" $
-        case Subst.decompressNar "brotli" "data" of
+        case Subst.decompressNar 4 "brotli" "data" of
           Left _ -> Pass
           Right _ -> Fail "expected error for unknown",
       -- parseReferences: narinfo references are wire-format basenames
@@ -3112,6 +3133,48 @@ testSubstituter = do
         case (Subst.parseDeriver defaultStoreDir Nothing, Subst.parseDeriver defaultStoreDir (Just "bogus")) of
           (Right Nothing, Left _) -> Pass
           other -> Fail ("unexpected: " <> T.pack (show other)),
+      -- Recorded production narinfos from cache.nixos.org (paths this
+      -- codebase did not produce): the parse -> validate -> signature
+      -- pipeline against real cache data, the production ed25519
+      -- signature verified offline with the shipped public key.
+      runTest "recorded cache.nixos.org narinfo verifies end to end" $
+        case NarInfo.parseNarInfo recordedHelloNarInfo of
+          Left err -> Fail ("parse failed: " <> T.pack err)
+          Right ni ->
+            case Subst.validateNarInfoFields ni >> Subst.verifySigs Subst.defaultCacheConfig ni of
+              Left err -> Fail ("validate/verify failed: " <> err)
+              Right () -> assertEqual "compression" "xz" (NarInfo.niCompression ni),
+      -- References of a path built by Hydra, including the self
+      -- reference, and its Deriver - both produced by upstream Nix.
+      runTest "recorded narinfo references and deriver parse" $
+        case NarInfo.parseNarInfo recordedHelloNarInfo of
+          Left err -> Fail ("parse failed: " <> T.pack err)
+          Right ni ->
+            case (Subst.parseReferences (NarInfo.niReferences ni), Subst.parseDeriver defaultStoreDir (NarInfo.niDeriver ni)) of
+              (Right refs, Right (Just _)) ->
+                assertEqual
+                  "reference hashes"
+                  ["dska0s3gxxd8azbsn85pwm6xcqhivldw", "jppkr0h8aap5z7m4xy4vg5yrwlly9h2v"]
+                  (map spHash refs)
+              other -> Fail ("references/deriver did not parse: " <> T.pack (show other)),
+      -- The empty References line ("References: " with a trailing
+      -- space) production caches emit for leaf paths.
+      runTest "recorded no-reference narinfo verifies" $
+        case NarInfo.parseNarInfo recordedHelloDocNarInfo of
+          Left err -> Fail ("parse failed: " <> T.pack err)
+          Right ni ->
+            case Subst.validateNarInfoFields ni >> Subst.verifySigs Subst.defaultCacheConfig ni >> Subst.parseReferences (NarInfo.niReferences ni) of
+              Right [] -> Pass
+              other -> Fail ("expected verified empty references, got: " <> T.pack (show other)),
+      -- The fingerprint covers NarSize: altering the signed claim must
+      -- break the production signature.
+      runTest "tampered recorded narinfo fails signature" $
+        case NarInfo.parseNarInfo recordedHelloNarInfo of
+          Left err -> Fail ("parse failed: " <> T.pack err)
+          Right ni ->
+            case Subst.verifySigs Subst.defaultCacheConfig (ni {NarInfo.niNarSize = NarInfo.niNarSize ni + 1}) of
+              Left _ -> Pass
+              Right () -> Fail "signature verified over an altered NarSize",
       -- trySubstitute: empty caches returns SubstNotFound
       runTestM "trySubstitute no caches" $ do
         tmpBase <- getTemporaryDirectory
@@ -3435,6 +3498,43 @@ testSubstituter = do
           NarInfo.niSigs = [],
           NarInfo.niCA = Nothing
         }
+    -- A real xz stream: "nova-nix xz fixture payload\n" 64 times
+    -- (1792 bytes) compressed with xz -9 to 112 bytes, embedded as
+    -- base64 so the test source stays ASCII.
+    xzFixturePayload = BS.concat (replicate 64 "nova-nix xz fixture payload\n")
+    xzFixtureSize = toInteger (BS.length xzFixturePayload)
+    xzFixtureB64 =
+      "/Td6WFoAAATm1rRGAgAhARwAAAAQz1jM4Ab/AC1dADcbyzKSinKbUBue2bMHcUt1zJQMzAec5W6XwPbK3dKJtL3q9K3rfg1KQ/ZOAAAAAAAWUPRD8XwohgABSYAOAAAA2Eg7urHEZ/sCAAAAAARZWg==" :: Text
+    -- cache.nixos.org narinfos recorded 2026-08-20 (nixos-25.05
+    -- channel), verbatim: GNU hello (references including itself,
+    -- deriver, production signature) and a doc output whose References
+    -- line is empty.
+    recordedHelloNarInfo =
+      T.unlines
+        [ "StorePath: /nix/store/jppkr0h8aap5z7m4xy4vg5yrwlly9h2v-hello-2.12.1",
+          "URL: nar/1m1sbal63vqhlvbcxzdj8yr6fhhld7dsyhxbxwip54dgvg56rjnc.nar.xz",
+          "Compression: xz",
+          "FileHash: sha256:1m1sbal63vqhlvbcxzdj8yr6fhhld7dsyhxbxwip54dgvg56rjnc",
+          "FileSize: 52056",
+          "NarHash: sha256:0s8wi24d3bc4zxyxq3hffj102zi7cjp3wqnpj6nhqrwgjsgqff81",
+          "NarSize: 249480",
+          "References: dska0s3gxxd8azbsn85pwm6xcqhivldw-glibc-2.40-66 jppkr0h8aap5z7m4xy4vg5yrwlly9h2v-hello-2.12.1",
+          "Deriver: a9y211d3lq3yf2mpfvb72f0qvsl0wi3s-hello-2.12.1.drv",
+          "Sig: cache.nixos.org-1:xV9xUvtPGHTSo6eeFWYYhaNFiH8MYSXKZzmxe0cf+acdDkIYxFPLC/MNc1CjlbsVoaUwGhcigUdr9eW2+W1UAw=="
+        ]
+    recordedHelloDocNarInfo =
+      T.unlines
+        [ "StorePath: /nix/store/4xrqj3kcd89bsg5crbpnx1ppg7nxw9xp-hello-1.0.0.2-doc",
+          "URL: nar/1r86zzj3g8jhzyvi17vchsj3frrqk5l329viq2i24iish53x922l.nar.xz",
+          "Compression: xz",
+          "FileHash: sha256:1r86zzj3g8jhzyvi17vchsj3frrqk5l329viq2i24iish53x922l",
+          "FileSize: 892",
+          "NarHash: sha256:0amizmj17fgj5sz1gvr743kncrzwvq747lml3zhd374f14hzgd7a",
+          "NarSize: 2072",
+          "References: ",
+          "Deriver: 5knzybx32a3iq53jjw6xd6fn4awn2l3h-hello-1.0.0.2.drv",
+          "Sig: cache.nixos.org-1:jUFHex7R7zPonZZqjVy/OOTguUZZE/sityC0zvu3sb35Az8zBTROeFhUC/J/UFx8Ui8UflA7uHyLJm5Z+Ca6Bw=="
+        ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Build orchestrator (Phase 3, Batch 7)

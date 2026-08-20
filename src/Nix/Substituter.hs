@@ -71,6 +71,7 @@ import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Word (Word64)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
@@ -82,6 +83,7 @@ import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Validate as Validate
+import qualified NovaCache.Xz as Xz
 import qualified System.Directory as Dir
 
 -- ---------------------------------------------------------------------------
@@ -215,7 +217,7 @@ verifyAndDecompress ::
 verifyAndDecompress cache mgr narInfo = do
   validateNarInfoFields narInfo
   verifySigs cache narInfo
-  decompress <- decompressorFor (NarInfo.niCompression narInfo)
+  decompress <- decompressorFor (NarInfo.niNarSize narInfo) (NarInfo.niCompression narInfo)
   pure $ do
     downloaded <- downloadNarWithRetry mgr cache narInfo
     pure $ downloaded >>= decompress
@@ -522,20 +524,52 @@ verifySigs cache narInfo =
                 then Right ()
                 else Left "no valid signature found"
 
--- | The decompressor for a narinfo @Compression@ value, decided from the
--- value alone so unsupported compression rejects before any download.
--- Currently @\"none\"@ and @\"\"@ (identity); xz returns with the
--- foreign-cache substitution feature.
-decompressorFor :: Text -> Either Text (BS.ByteString -> Either Text BS.ByteString)
-decompressorFor compression
+-- | The decompressor for a narinfo @Compression@ value, decided from
+-- the narinfo's declared values alone so unsupported compression
+-- rejects before any download.  @\"none\"@ and @\"\"@ are identity.
+-- @\"xz\"@ - cache.nixos.org's format - decompresses bounded by the
+-- declared NarSize, a signed claim the caller validates before
+-- resolving the decompressor.
+decompressorFor :: Integer -> Text -> Either Text (BS.ByteString -> Either Text BS.ByteString)
+decompressorFor declaredNarSize compression
   | compression == "none" || T.null compression = Right Right
-  | compression == "xz" = Left "xz decompression not yet available"
+  | compression == "xz" = xzDecompressor declaredNarSize
   | otherwise = Left ("unsupported compression: " <> compression)
 
--- | Decompress NAR data based on the compression type from narinfo.
--- Support is decided by 'decompressorFor'; this applies the result.
-decompressNar :: Text -> BS.ByteString -> Either Text BS.ByteString
-decompressNar compression narData = decompressorFor compression >>= ($ narData)
+-- | Decompress NAR data based on the compression type from narinfo,
+-- bounded by the declared NarSize.  Support is decided by
+-- 'decompressorFor'; this applies the result.
+decompressNar :: Integer -> Text -> BS.ByteString -> Either Text BS.ByteString
+decompressNar declaredNarSize compression narData =
+  decompressorFor declaredNarSize compression >>= ($ narData)
+
+-- | The bounded xz decompressor for a narinfo's declared NarSize,
+-- nova-cache's decoder underneath: output is capped at the declared
+-- size and decoder memory at nova-cache's default, so a hostile
+-- stream can expand to neither more output nor more decoder state
+-- than the narinfo promised.  Narinfo validation upstream already
+-- rejected a negative size; the guard keeps the function total for
+-- direct callers, and a size past Word64 cannot name a real NAR.
+xzDecompressor :: Integer -> Either Text (BS.ByteString -> Either Text BS.ByteString)
+xzDecompressor declaredNarSize
+  | declaredNarSize < 0 || declaredNarSize > toInteger (maxBound :: Word64) =
+      Left ("xz decompression bound out of range: " <> T.pack (show declaredNarSize))
+  | otherwise = Right (either (Left . renderXzError) Right . Xz.decompress limits)
+  where
+    limits =
+      Xz.XzLimits
+        { Xz.xzMaxOutputBytes = fromInteger declaredNarSize,
+          Xz.xzMaxDecoderMemoryBytes = Xz.defaultXzDecoderMemoryBytes
+        }
+
+-- | One 'Xz.XzError' in the register the other substitution errors use.
+renderXzError :: Xz.XzError -> Text
+renderXzError xzErr = case xzErr of
+  Xz.XzStreamError msg -> "xz stream error: " <> T.pack msg
+  Xz.XzOutputOverBound bound ->
+    "xz output exceeds the declared NarSize (" <> T.pack (show bound) <> " bytes)"
+  Xz.XzMemoryOverBound bound ->
+    "xz decoder memory over its cap (" <> T.pack (show bound) <> " bytes)"
 
 -- | Parse narinfo references (store path basenames, e.g.
 -- @abc...-glibc-2.40@) into StorePaths.  A malformed token is an error,
