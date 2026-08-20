@@ -15,7 +15,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, isJust, listToMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -3012,6 +3012,17 @@ chunkReader chunks = do
       [] -> ([], BS.empty)
       (c : cs) -> (cs, c)
 
+-- | Drain a chunk source to its byte count - the shape of a streaming
+-- consumer, for tests that only care whether the pipeline fails.
+drainChunkSource :: IO BS.ByteString -> IO (Either Subst.AttemptFailure Int)
+drainChunkSource pull = go 0
+  where
+    go n = do
+      chunk <- pull
+      if BS.null chunk
+        then pure (Right n)
+        else let total = n + BS.length chunk in total `seq` go total
+
 testSubstituter :: IO [Bool]
 testSubstituter = do
   putStrLn "substituter"
@@ -3072,10 +3083,13 @@ testSubstituter = do
       runTest "decompressNar none" $
         let input = "fake nar data"
          in assertEqual "decompress-none" (Right input) (Subst.decompressNar (toInteger (BS.length input)) "none" input),
-      -- decompressNar: empty compression passes through
-      runTest "decompressNar empty" $
-        let input = "fake nar data"
-         in assertEqual "decompress-empty" (Right input) (Subst.decompressNar (toInteger (BS.length input)) "" input),
+      -- decompressNar: an empty Compression field means bzip2 upstream
+      -- (the field's historical default), never identity; the
+      -- rejection names the codec upstream would decode.
+      runTest "decompressNar empty means bzip2" $
+        case Subst.decompressNar 4 "" "data" of
+          Left err | "bzip2" `T.isInfixOf` err -> Pass
+          other -> Fail ("expected bzip2 rejection, got: " <> T.pack (show other)),
       -- decompressNar: xz decodes under the declared-NarSize bound
       -- (the fixture is a real 112-byte xz stream of 1792 payload
       -- bytes, embedded base64 to keep the source ASCII).
@@ -3180,25 +3194,38 @@ testSubstituter = do
       -- symlink, and a sibling pair colliding on folding filesystems -
       -- the digest equality proves the materialized tree re-serialises
       -- to its NAR on every platform strategy.
-      runTestM "streaming unpack materializes and verifies" $ do
+      -- Every length word, tag, and padding run must survive splitting
+      -- across Await boundaries, so the whole materialization runs at
+      -- several chunk sizes including single-byte feeds.
+      runTestM "streaming unpack materializes and verifies across chunk sizes" $ do
         tmpBase <- getTemporaryDirectory
         let tmpDir = tmpBase </> "nova-nix-test-stream-unpack"
+            chunkSizes = [1, 7, 8, 11] :: [Int]
+            runAt n = do
+              let dest = tmpDir </> ("out-" <> show n)
+              source <- chunkReader (streamChunks n streamTestNar)
+              result <- Subst.consumeNarStream dest (streamTestNarInfo streamTestNar) streamTestDigest source
+              onDisk <- NAR.serialiseFromPath dest
+              pure $ case result of
+                Left err ->
+                  Just ("chunk size " <> T.pack (show n) <> ": " <> Subst.attemptFailureMessage err)
+                Right narByteCount
+                  | narByteCount == BS.length streamTestNar
+                      && CHash.hashBytes (NAR.serialise onDisk) == streamTestDigest ->
+                      Nothing
+                  | otherwise ->
+                      Just ("chunk size " <> T.pack (show n) <> ": streamed tree diverges from its NAR")
         forceRemoveIfExists tmpDir
         createDirectoryIfMissing True tmpDir
-        let dest = tmpDir </> "out"
-        source <- chunkReader (streamChunks 7 streamTestNar)
-        result <- Subst.consumeNarStream dest (streamTestNarInfo streamTestNar) streamTestDigest source
-        onDisk <- NAR.serialiseFromPath dest
+        outcomes <- mapM runAt chunkSizes
         forceRemoveIfExists tmpDir
-        pure $ case result of
-          Left err -> Fail ("streaming unpack failed: " <> err)
-          Right narByteCount ->
-            if narByteCount == BS.length streamTestNar
-              && CHash.hashBytes (NAR.serialise onDisk) == streamTestDigest
-              then Pass
-              else Fail "streamed tree diverges from its NAR",
-      -- A truncated stream is a loud parse failure, never a short tree.
-      runTestM "streaming unpack refuses a truncated stream" $ do
+        pure $ case catMaybes outcomes of
+          [] -> Pass
+          (msg : _) -> Fail msg,
+      -- A truncated stream is a loud parse failure, never a short
+      -- tree - and it retries: truncation and a torn transfer
+      -- parse-fail the same way.
+      runTestM "streaming unpack refuses a truncated stream as transient" $ do
         tmpBase <- getTemporaryDirectory
         let tmpDir = tmpBase </> "nova-nix-test-stream-trunc"
         forceRemoveIfExists tmpDir
@@ -3207,10 +3234,12 @@ testSubstituter = do
         result <- Subst.consumeNarStream (tmpDir </> "out") (streamTestNarInfo streamTestNar) streamTestDigest source
         forceRemoveIfExists tmpDir
         pure $ case result of
-          Left _ -> Pass
+          Left (Subst.TransientFailure _) -> Pass
+          Left (Subst.FatalFailure err) -> Fail ("truncation classified fatal: " <> err)
           Right _ -> Fail "truncated NAR stream was accepted",
-      -- A digest mismatch reports before the tree is trusted.
-      runTestM "streaming unpack refuses a digest mismatch" $ do
+      -- A digest mismatch reports before the tree is trusted, and it
+      -- is fatal: the size matched, so the transfer completed.
+      runTestM "streaming unpack refuses a digest mismatch as fatal" $ do
         tmpBase <- getTemporaryDirectory
         let tmpDir = tmpBase </> "nova-nix-test-stream-digest"
         forceRemoveIfExists tmpDir
@@ -3219,8 +3248,38 @@ testSubstituter = do
         result <- Subst.consumeNarStream (tmpDir </> "out") (streamTestNarInfo streamTestNar) (CHash.hashBytes "not the nar") source
         forceRemoveIfExists tmpDir
         pure $ case result of
-          Left err | "hash mismatch" `T.isInfixOf` err -> Pass
-          other -> Fail ("expected hash mismatch, got: " <> T.pack (show other)),
+          Left (Subst.FatalFailure err) | "hash mismatch" `T.isInfixOf` err -> Pass
+          Left other -> Fail ("expected fatal hash mismatch, got: " <> Subst.attemptFailureMessage other)
+          Right _ -> Fail "digest mismatch was accepted",
+      -- A narinfo lying about NarSize in either direction is refused
+      -- at NarDone - the grammar completed, so the mismatch is the
+      -- narinfo misdeclaring, and fatal.
+      runTestM "streaming unpack refuses an overdeclared NarSize" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-oversize"
+            lying = (streamTestNarInfo streamTestNar) {NarInfo.niNarSize = toInteger (BS.length streamTestNar) + 1}
+        forceRemoveIfExists tmpDir
+        createDirectoryIfMissing True tmpDir
+        source <- chunkReader (streamChunks 7 streamTestNar)
+        result <- Subst.consumeNarStream (tmpDir </> "out") lying streamTestDigest source
+        forceRemoveIfExists tmpDir
+        pure $ case result of
+          Left (Subst.FatalFailure err) | "size mismatch" `T.isInfixOf` err -> Pass
+          Left other -> Fail ("expected fatal size mismatch, got: " <> Subst.attemptFailureMessage other)
+          Right _ -> Fail "overdeclared NarSize was accepted",
+      runTestM "streaming unpack refuses an underdeclared NarSize" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-undersize"
+            lying = (streamTestNarInfo streamTestNar) {NarInfo.niNarSize = toInteger (BS.length streamTestNar) - 1}
+        forceRemoveIfExists tmpDir
+        createDirectoryIfMissing True tmpDir
+        source <- chunkReader (streamChunks 7 streamTestNar)
+        result <- Subst.consumeNarStream (tmpDir </> "out") lying streamTestDigest source
+        forceRemoveIfExists tmpDir
+        pure $ case result of
+          Left (Subst.FatalFailure err) | "size mismatch" `T.isInfixOf` err -> Pass
+          Left other -> Fail ("expected fatal size mismatch, got: " <> Subst.attemptFailureMessage other)
+          Right _ -> Fail "underdeclared NarSize was accepted",
       -- cappedBodySource: the streaming mirror of readBodyCapped -
       -- a body past the key-trusted declared size aborts mid-stream.
       runTestM "cappedBodySource aborts past the cap" $ do
@@ -3248,6 +3307,140 @@ testSubstituter = do
             pure $ case result of
               Right out | out == xzFixturePayload -> Pass
               other -> Fail ("xz source roundtrip diverged: " <> T.pack (show (fmap BS.length other))),
+      runTestM "withDecompressedSource xz single-byte chunks" $
+        case B64.decode xzFixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            source <- chunkReader (streamChunks 1 compressed)
+            result <- Subst.withDecompressedSource xzFixtureSize "xz" source $ \pull ->
+              let go acc = do
+                    chunk <- pull
+                    if BS.null chunk
+                      then pure (Right (BS.concat (reverse acc)))
+                      else go (chunk : acc)
+               in go []
+            pure $ case result of
+              Right out | out == xzFixturePayload -> Pass
+              other -> Fail ("xz 1-byte roundtrip diverged: " <> T.pack (show (fmap BS.length other))),
+      -- The LIVE pipeline's defenses, not the strict oracle's: hostile
+      -- compressed input through withDecompressedSource must land in
+      -- the Left channel with the right retry class, never escape as
+      -- an exception.
+      runTestM "withDecompressedSource xz over-bound is fatal" $
+        case B64.decode xzFixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            source <- chunkReader (streamChunks 7 compressed)
+            result <- Subst.withDecompressedSource (xzFixtureSize - 1) "xz" source drainChunkSource
+            pure $ case result of
+              Left (Subst.FatalFailure err) | "NarSize" `T.isInfixOf` err -> Pass
+              other -> Fail ("expected fatal over-bound, got: " <> T.pack (show (void other))),
+      runTestM "withDecompressedSource xz garbage is transient" $ do
+        source <- chunkReader ["not an xz stream"]
+        result <- Subst.withDecompressedSource 64 "xz" source drainChunkSource
+        pure $ case result of
+          Left (Subst.TransientFailure _) -> Pass
+          other -> Fail ("expected transient stream error, got: " <> T.pack (show (void other))),
+      runTestM "withDecompressedSource xz truncated is transient" $
+        case B64.decode xzFixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            source <- chunkReader (streamChunks 7 (BS.take 40 compressed))
+            result <- Subst.withDecompressedSource xzFixtureSize "xz" source drainChunkSource
+            pure $ case result of
+              Left (Subst.TransientFailure _) -> Pass
+              other -> Fail ("expected transient truncation, got: " <> T.pack (show (void other))),
+      -- The failure contract of the post-download pipeline: every
+      -- failing materialization removes the tree it wrote, and a
+      -- clean one registers the verified metadata.
+      runTestM "materialize registers a verified tree" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-materialize-ok"
+        forceRemoveIfExists tmpStore
+        createDirectoryIfMissing True tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath sampleHash "stream"
+            destPath = storePathToFilePath (StoreDir tmpStore) sp
+        source <- chunkReader (streamChunks 7 streamTestNar)
+        result <- Subst.materializeNarFromSource store sp (streamTestNarInfo streamTestNar) streamTestDigest [] Nothing source
+        survived <- doesDirectoryExist destPath
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure $ case result of
+          Left err -> Fail ("materialize failed: " <> Subst.attemptFailureMessage err)
+          Right reg
+            | not survived -> Fail "verified tree missing after materialize"
+            | prNarSize reg /= BS.length streamTestNar -> Fail "registration NarSize diverges"
+            | prNarHash reg /= CHash.formatNixHash streamTestDigest -> Fail "registration NarHash diverges"
+            | otherwise -> Pass,
+      runTestM "materialize removes the tree on a digest mismatch" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-materialize-digest"
+        forceRemoveIfExists tmpStore
+        createDirectoryIfMissing True tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath sampleHash "stream"
+            destPath = storePathToFilePath (StoreDir tmpStore) sp
+        source <- chunkReader (streamChunks 7 streamTestNar)
+        result <- Subst.materializeNarFromSource store sp (streamTestNarInfo streamTestNar) (CHash.hashBytes "not the nar") [] Nothing source
+        survived <- doesDirectoryExist destPath
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure $ case result of
+          Right _ -> Fail "digest mismatch was accepted"
+          Left (Subst.TransientFailure err) -> Fail ("mismatch classified transient: " <> err)
+          Left (Subst.FatalFailure err)
+            | not ("hash mismatch" `T.isInfixOf` err) -> Fail ("unexpected failure: " <> err)
+            | survived -> Fail "tree survived a digest mismatch"
+            | otherwise -> Pass,
+      runTestM "materialize removes the tree on a truncated stream" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-materialize-trunc"
+        forceRemoveIfExists tmpStore
+        createDirectoryIfMissing True tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath sampleHash "stream"
+            destPath = storePathToFilePath (StoreDir tmpStore) sp
+        source <- chunkReader (streamChunks 7 (BS.take (BS.length streamTestNar - 10) streamTestNar))
+        result <- Subst.materializeNarFromSource store sp (streamTestNarInfo streamTestNar) streamTestDigest [] Nothing source
+        survived <- doesDirectoryExist destPath
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure $ case result of
+          Right _ -> Fail "truncated stream was accepted"
+          Left (Subst.FatalFailure err) -> Fail ("truncation classified fatal: " <> err)
+          Left (Subst.TransientFailure _)
+            | survived -> Fail "tree survived a truncated stream"
+            | otherwise -> Pass,
+      -- Retry classification: server-side statuses retry, a 404 on an
+      -- object the narinfo just promised is deterministic.
+      runTest "httpStatusFailure classes" $
+        case (Subst.httpStatusFailure 404, Subst.httpStatusFailure 500, Subst.httpStatusFailure 429, Subst.httpStatusFailure 403) of
+          (Subst.FatalFailure _, Subst.TransientFailure _, Subst.TransientFailure _, Subst.FatalFailure _) -> Pass
+          other -> Fail ("unexpected status classes: " <> T.pack (show other)),
+      -- The download cap derives from the SIGNED NarSize; the unsigned
+      -- FileSize may only lower it, never raise it.
+      runTest "downloadCapFor lets FileSize lower but never raise the cap" $
+        let base = streamTestNarInfo streamTestNar
+            narSize = NarInfo.niNarSize base
+            ceilingCap = Subst.compressedBodyCeiling narSize
+            absent = Subst.downloadCapFor base {NarInfo.niFileSize = Nothing}
+            lowered = Subst.downloadCapFor base {NarInfo.niFileSize = Just 100}
+            inflated = Subst.downloadCapFor base {NarInfo.niFileSize = Just (ceilingCap * 1000)}
+         in case (absent, lowered, inflated) of
+              (Right capAbsent, Right capLowered, Right capInflated)
+                | toInteger capAbsent == ceilingCap
+                    && capLowered == 100
+                    && toInteger capInflated == ceilingCap ->
+                    Pass
+              other -> Fail ("unexpected caps: " <> T.pack (show other)),
+      runTest "compressedBodyCeiling floors small and scales large" $
+        let smallCeiling = Subst.compressedBodyCeiling 10
+            largeSize = 64 * 1024 * 1024
+            largeCeiling = Subst.compressedBodyCeiling largeSize
+         in if smallCeiling == 10 + 64 * 1024 && largeCeiling == largeSize + largeSize `div` 64
+              then Pass
+              else Fail ("unexpected ceilings: " <> T.pack (show (smallCeiling, largeCeiling))),
       runTest "streaming compression support matches the strict set" $
         case (Subst.streamingDecompressionSupported "none", Subst.streamingDecompressionSupported "xz", Subst.streamingDecompressionSupported "zstd") of
           (Right (), Right (), Left _) -> Pass
@@ -3645,8 +3838,9 @@ testSubstituter = do
           "Sig: cache.nixos.org-1:jUFHex7R7zPonZZqjVy/OOTguUZZE/sityC0zvu3sb35Az8zBTROeFhUC/J/UFx8Ui8UflA7uHyLJm5Z+Ca6Bw=="
         ]
     -- A NAR with the shapes streaming unpack must materialize:
-    -- nesting, an executable, a symlink, and a sibling pair that
-    -- collides on folding filesystems.  Entries in NAR name order.
+    -- nesting, an executable, a symlink, a zero-byte file, an empty
+    -- directory, and a sibling pair that collides on folding
+    -- filesystems.  Entries in NAR name order.
     -- The executable bit only where the platform can round-trip it
     -- from disk - Windows cannot, the same constraint the NAR spec
     -- vectors note, until #35 gives it a real model.  The symlink
@@ -3662,6 +3856,8 @@ testSubstituter = do
         ( NAR.NarDirectory
             [ ("Makefile", NAR.NarRegular False "all:\n"),
               ("bin", NAR.NarDirectory [("tool", NAR.NarRegular streamTestExec "#!/bin/sh\n")]),
+              ("empty", NAR.NarRegular False ""),
+              ("emptydir", NAR.NarDirectory []),
               ("link", NAR.NarSymlink streamTestLinkTarget),
               ("makefile", NAR.NarRegular False "lower\n")
             ]

@@ -43,6 +43,13 @@ module Nix.Substituter
     CacheConfig (..),
     defaultCacheConfig,
 
+    -- * Failure classification
+    AttemptFailure (..),
+    attemptFailureMessage,
+    httpStatusFailure,
+    compressedBodyCeiling,
+    downloadCapFor,
+
     -- * Pure helpers (exported for testing)
     maxNarInfoBody,
     readBodyCapped,
@@ -59,6 +66,7 @@ module Nix.Substituter
     streamingDecompressionSupported,
     withDecompressedSource,
     cappedBodySource,
+    materializeNarFromSource,
     consumeNarStream,
     unpackNarEntry,
     unpackAndVerify,
@@ -70,11 +78,11 @@ where
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
-import Control.Exception (Exception, SomeException, catch, onException, throwIO, try)
+import Control.Exception (Exception, SomeAsyncException (..), SomeException, catch, fromException, onException, throwIO, try)
+import Control.Monad (void)
 import qualified Data.ByteString as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (sortBy)
-import Data.Maybe (fromMaybe)
 import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -83,6 +91,7 @@ import Data.Word (Word64)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
+import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Store (Store (..), abortNarUnpack, finishNarUnpack, newNarUnpackSink, setReadOnly, sinkNarEvent, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
 import Nix.Store.Path (StoreDir, StorePath (spHash), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
@@ -454,19 +463,21 @@ narDownloadAttempts = 5
 narRetryBaseDelayMicros :: Int
 narRetryBaseDelayMicros = 500000
 
--- | Stream one substitution end to end, retrying failed attempts.
+-- | Stream one substitution end to end, retrying transient failures.
 --
 -- By the time this runs the narinfo has already been fetched and
--- signature-verified, so the cache claims to hold this path: a failed
--- attempt (a transient HTTP error, a stale-negative at a CDN edge, a
--- dropped connection mid-stream) is far more likely a hiccup than a
--- real miss, and retrying a few times is much cheaper than the local
--- rebuild a hard failure forces.  Every attempt starts from a clean
--- slate ('streamNarIntoStore' clears the destination first), so a
--- half-materialized tree never survives into the next try.  A
--- verification failure retries too: indistinguishable here from a
--- torn transfer, and bounded by the same attempt budget.  A 404 on
--- the narinfo itself (a genuine cache miss) is handled earlier in
+-- signature-verified, so the cache claims to hold this path.  Failures
+-- carry their own retry class: a 'TransientFailure' - transport
+-- errors, torn or truncated transfers, anything a fresh attempt could
+-- plausibly complete - consumes retry budget with linear backoff,
+-- while a 'FatalFailure' - a completed transfer that verifies wrong,
+-- a body past its signed ceiling, a 4xx - ends the attempt at once:
+-- retrying a deterministic failure only delays the local-build
+-- fallback, and upstream's transfer layer likewise retries only the
+-- transport class.  Every attempt starts from a clean slate
+-- ('streamNarIntoStore' clears the destination first, and every
+-- failure path, exceptions included, removes what it wrote).  A 404
+-- on the narinfo itself (a genuine cache miss) is handled earlier in
 -- 'fetchNarInfo' and never reaches here.
 streamWithRetry :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> NarInfo.NarInfo -> IO SubstResult
 streamWithRetry mgr store cache sp narInfo = attempt narDownloadAttempts
@@ -475,11 +486,27 @@ streamWithRetry mgr store cache sp narInfo = attempt narDownloadAttempts
       outcome <- streamNarIntoStore mgr cache store sp narInfo
       case outcome of
         Right registration -> pure (SubstSuccess registration)
-        Left err
+        Left (FatalFailure err) -> pure (SubstError err)
+        Left (TransientFailure err)
           | remaining <= 1 -> pure (SubstError err)
           | otherwise -> do
               threadDelay (narRetryBaseDelayMicros * (narDownloadAttempts - remaining + 1))
               attempt (remaining - 1)
+
+-- | How one streaming attempt failed, deciding whether the retry
+-- budget applies.  'TransientFailure' is a failure a fresh attempt
+-- could plausibly complete; 'FatalFailure' is deterministic - the
+-- same served object fails the same way every time.
+data AttemptFailure
+  = TransientFailure !Text
+  | FatalFailure !Text
+  deriving (Eq, Show)
+
+-- | The failure's message, independent of its retry class.
+attemptFailureMessage :: AttemptFailure -> Text
+attemptFailureMessage failure = case failure of
+  TransientFailure msg -> msg
+  FatalFailure msg -> msg
 
 -- | Thrown inside the streaming pipeline where a chunk convention has
 -- no error channel (the capped body source); converted back to the
@@ -489,65 +516,79 @@ newtype StreamAbort = StreamAbort Text
 
 instance Exception StreamAbort
 
+-- | Convert synchronous exceptions from one download attempt into the
+-- pipeline's failure channel, so the retry budget governs them and the
+-- caller's cleanup contract holds on every exit.  Asynchronous
+-- exceptions (cancellation) re-throw untouched: an interrupt must
+-- never be spent as retry budget.
+tryAttempt :: IO (Either AttemptFailure a) -> IO (Either AttemptFailure a)
+tryAttempt action = action `catch` handler
+  where
+    handler someErr
+      | Just (SomeAsyncException _) <- fromException someErr = throwIO someErr
+      | Just (StreamAbort msg) <- fromException someErr =
+          -- A body past its ceiling: the cap derives from the signed
+          -- NarSize, so a longer body is the server misdeclaring, not
+          -- a hiccup.
+          pure (Left (FatalFailure msg))
+      | Just (httpErr :: HTTP.HttpException) <- fromException someErr =
+          -- Dropped connections, resets, timeouts - the class the
+          -- retry budget exists for.
+          pure (Left (TransientFailure ("HTTP transport failure: " <> T.pack (show httpErr))))
+      | otherwise =
+          -- Local failures (a full disk, a permission error) do not
+          -- heal by re-downloading.
+          pure (Left (FatalFailure ("substitution attempt failed: " <> T.pack (show (someErr :: SomeException)))))
+
+-- | HTTP status codes whose failures a retry could plausibly outlive.
+httpRequestTimeout :: Int
+httpRequestTimeout = 408
+
+httpTooManyRequests :: Int
+httpTooManyRequests = 429
+
+httpServerErrorFloor :: Int
+httpServerErrorFloor = 500
+
+-- | Classify a non-200 NAR response: server-side and rate-limit
+-- statuses are transient, every other status (above all a 404 on an
+-- object the narinfo just promised) is deterministic.
+httpStatusFailure :: Int -> AttemptFailure
+httpStatusFailure code
+  | code == httpRequestTimeout || code == httpTooManyRequests || code >= httpServerErrorFloor =
+      TransientFailure message
+  | otherwise = FatalFailure message
+  where
+    message = "NAR download failed: HTTP " <> T.pack (show code)
+
 -- | One streaming substitution attempt: download, decompress, hash,
 -- parse, and materialize in a single bounded pass, then verify.
 -- Memory is bounded by the decoder's buffers and the parser's
 -- structural-string cap, never by archive or file size.
 --
 -- Disk writes begin before the NAR hash can be known - the price of
--- never holding the archive, and exactly upstream's ordering - so any
--- failure or verification mismatch removes the tree it wrote.  The
--- narinfo metadata registration needs (declared hash, references,
--- deriver) still parses BEFORE the first byte downloads: a malformed
--- narinfo must not leave an unpacked-but-unregistered path behind.
-streamNarIntoStore :: HTTP.Manager -> CacheConfig -> Store -> StorePath -> NarInfo.NarInfo -> IO (Either Text PathRegistration)
+-- never holding the archive, and exactly upstream's ordering - so
+-- every failure path, exceptions included, removes the tree it wrote
+-- ('materializeNarFromSource' owns that contract; 'tryAttempt'
+-- classifies what escapes it).  The narinfo metadata registration
+-- needs (declared hash, references, deriver) still parses BEFORE the
+-- first byte downloads: a malformed narinfo must not leave an
+-- unpacked-but-unregistered path behind.
+streamNarIntoStore :: HTTP.Manager -> CacheConfig -> Store -> StorePath -> NarInfo.NarInfo -> IO (Either AttemptFailure PathRegistration)
 streamNarIntoStore mgr cache store sp narInfo = case preflight of
-  Left err -> pure (Left err)
+  Left err -> pure (Left (FatalFailure err))
   Right (declaredDigest, refs, deriver, downloadCap) -> do
     let destPath = storePathToFilePath (stDir store) sp
         narUrl = T.unpack (ccUrl cache) <> "/" <> T.unpack (NarInfo.niUrl narInfo)
     clearStaleDestination destPath
     request <- HTTP.parseRequest narUrl
-    attempt <- try $ HTTP.withResponse request mgr $ \response -> do
+    tryAttempt $ HTTP.withResponse request mgr $ \response -> do
       let code = HTTP.statusCode (HTTP.responseStatus response)
       if code /= httpOk
-        then pure (Left ("NAR download failed: HTTP " <> T.pack (show code)))
+        then pure (Left (httpStatusFailure code))
         else do
           source <- cappedBodySource downloadCap (HTTP.responseBody response)
-          withDecompressedSource (NarInfo.niNarSize narInfo) (NarInfo.niCompression narInfo) source $
-            consumeNarStream destPath narInfo declaredDigest
-    let streamed = case attempt of
-          Left (StreamAbort msg) -> Left msg
-          Right outcome -> outcome
-    case streamed of
-      Left err -> do
-        Dir.removePathForcibly destPath
-        pure (Left err)
-      Right narByteCount -> do
-        setReadOnly destPath
-        -- A path registered valid must match its recorded hash ON
-        -- DISK, not merely in the streamed bytes: any divergence the
-        -- filesystem introduced between the NAR and the materialized
-        -- tree must surface here, before the row exists.  The recheck
-        -- streams too, so its memory no longer scales with the path.
-        onDiskDigest <- hashPathStreaming destPath
-        if onDiskDigest /= declaredDigest
-          then do
-            Dir.removePathForcibly destPath
-            pure (Left ("unpacked tree does not reproduce the declared NAR hash at " <> T.pack destPath))
-          else
-            pure $
-              Right
-                PathRegistration
-                  { prPath = sp,
-                    -- The canonical spelling of the verified digest,
-                    -- so the DB converges on one hash spelling
-                    -- regardless of the cache's.
-                    prNarHash = Hash.formatNixHash declaredDigest,
-                    prNarSize = narByteCount,
-                    prDeriver = deriver,
-                    prReferences = refs
-                  }
+          materializeNarFromSource store sp narInfo declaredDigest refs deriver source
   where
     preflight = do
       declaredDigest <- case Hash.parseNixHash (NarInfo.niNarHash narInfo) of
@@ -555,17 +596,97 @@ streamNarIntoStore mgr cache store sp narInfo = case preflight of
         Right digest -> Right digest
       refs <- parseReferences (NarInfo.niReferences narInfo)
       deriver <- parseDeriver (stDir store) (NarInfo.niDeriver narInfo)
-      let declaredDownload = fromMaybe (NarInfo.niNarSize narInfo) (NarInfo.niFileSize narInfo)
-      if declaredDownload < 0 || declaredDownload > toInteger (maxBound :: Int) || NarInfo.niNarSize narInfo > toInteger (maxBound :: Int)
-        then Left ("narinfo declares an unusable NAR size: " <> T.pack (show declaredDownload))
-        else Right (declaredDigest, refs, deriver, fromInteger declaredDownload)
+      downloadCap <- downloadCapFor narInfo
+      pure (declaredDigest, refs, deriver, downloadCap)
+
+-- | The byte cap on the compressed NAR body, derived from the SIGNED
+-- NarSize: the Ed25519 fingerprint covers StorePath, NarHash, NarSize,
+-- and references - not FileSize - so the unsigned FileSize may only
+-- LOWER the cap, never raise it.  A rewritten FileSize on an otherwise
+-- validly-signed narinfo must not buy an unbounded download.
+downloadCapFor :: NarInfo.NarInfo -> Either Text Int
+downloadCapFor narInfo
+  | narSize < 0 || narSize > toInteger (maxBound :: Int) =
+      Left ("narinfo declares an unusable NAR size: " <> T.pack (show narSize))
+  | otherwise =
+      let signedCeiling = compressedBodyCeiling narSize
+          capped = maybe signedCeiling (min signedCeiling . max 0) (NarInfo.niFileSize narInfo)
+       in Right (fromInteger (min capped (toInteger (maxBound :: Int))))
+  where
+    narSize = NarInfo.niNarSize narInfo
+
+-- | The most a compressed NAR body may legitimately exceed its NarSize
+-- by: xz and zstd expand incompressible input by well under one
+-- percent of framing overhead, so a 1/64 (~1.6%) margin plus a fixed
+-- floor for small NARs is generous for any real codec, while a
+-- hostile FileSize claiming orders of magnitude more is refused.
+compressedBodyCeiling :: Integer -> Integer
+compressedBodyCeiling narSize =
+  narSize + max compressionOverheadFloorBytes (narSize `div` compressionOverheadDivisor)
+
+-- | Fixed overhead floor for small NARs, where framing dominates.
+compressionOverheadFloorBytes :: Integer
+compressionOverheadFloorBytes = 64 * 1024
+
+-- | Proportional overhead margin: 1/64 of the NarSize.
+compressionOverheadDivisor :: Integer
+compressionOverheadDivisor = 64
+
+-- | Materialize a NAR from a compressed chunk source into the store
+-- path: decompress, hash, parse, and unpack in one pass, then verify
+-- the tree on disk and build its registration.  The post-download half
+-- of 'streamNarIntoStore', taking a plain chunk source so the failure
+-- contract is testable without HTTP.
+--
+-- The cleanup contract: every failing exit - the pipeline's 'Left',
+-- a verification mismatch, or an exception (asynchronous included) -
+-- removes the destination tree, so no partial or unverified tree ever
+-- survives at the store path.
+materializeNarFromSource :: Store -> StorePath -> NarInfo.NarInfo -> Hash.NixHash -> [StorePath] -> Maybe Text -> IO BS.ByteString -> IO (Either AttemptFailure PathRegistration)
+materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
+  materialize `onException` Dir.removePathForcibly destPath
+  where
+    destPath = storePathToFilePath (stDir store) sp
+    materialize = do
+      streamed <-
+        withDecompressedSource (NarInfo.niNarSize narInfo) (NarInfo.niCompression narInfo) source $
+          consumeNarStream destPath narInfo declaredDigest
+      case streamed of
+        Left err -> do
+          Dir.removePathForcibly destPath
+          pure (Left err)
+        Right narByteCount -> do
+          setReadOnly destPath
+          -- A path registered valid must match its recorded hash ON
+          -- DISK, not merely in the streamed bytes: any divergence the
+          -- filesystem introduced between the NAR and the materialized
+          -- tree must surface here, before the row exists.  The recheck
+          -- streams too, so its memory no longer scales with the path.
+          onDiskDigest <- hashPathStreaming destPath
+          if onDiskDigest /= declaredDigest
+            then do
+              Dir.removePathForcibly destPath
+              pure (Left (FatalFailure ("unpacked tree does not reproduce the declared NAR hash at " <> T.pack destPath)))
+            else
+              pure $
+                Right
+                  PathRegistration
+                    { prPath = sp,
+                      -- The canonical spelling of the verified digest,
+                      -- so the DB converges on one hash spelling
+                      -- regardless of the cache's.
+                      prNarHash = Hash.formatNixHash declaredDigest,
+                      prNarSize = narByteCount,
+                      prDeriver = deriver,
+                      prReferences = refs
+                    }
 
 -- | Drive the decompressed chunk source through incremental hashing,
 -- the streaming NAR parser, and the store's streaming unpack sink,
 -- returning the verified NAR byte count.  The hash context folds over
 -- exactly the bytes the parser consumes, so the digest is of the NAR
 -- the tree was built from.
-consumeNarStream :: FilePath -> NarInfo.NarInfo -> Hash.NixHash -> IO BS.ByteString -> IO (Either Text Int)
+consumeNarStream :: FilePath -> NarInfo.NarInfo -> Hash.NixHash -> IO BS.ByteString -> IO (Either AttemptFailure Int)
 consumeNarStream destPath narInfo declaredDigest narSource = do
   sink <- newNarUnpackSink destPath
   go sink Hash.hashInit 0 Stream.narStream `onException` abortNarUnpack sink
@@ -579,46 +700,59 @@ consumeNarStream destPath narInfo declaredDigest narSource = do
         case sunk of
           Left err -> do
             abortNarUnpack sink
-            pure (Left err)
+            -- A name or shape the store refuses is a property of the
+            -- archive, not of this transfer.
+            pure (Left (FatalFailure err))
           Right () -> go sink ctx narBytes next
       Stream.NarFail msg -> do
         abortNarUnpack sink
-        pure (Left ("NAR stream parse failed: " <> T.pack msg))
+        -- A truncated body and a torn transfer parse-fail the same
+        -- way, so the retry budget applies.
+        pure (Left (TransientFailure ("NAR stream parse failed: " <> T.pack msg)))
       Stream.NarDone -> do
         let digest = Hash.hashFinalize ctx
         if toInteger narBytes /= NarInfo.niNarSize narInfo
           then do
             abortNarUnpack sink
+            -- The grammar completed, so the transfer was whole: a
+            -- size that still disagrees is the narinfo misdeclaring.
             pure
               ( Left
-                  ( "NAR size mismatch: narinfo declares "
-                      <> T.pack (show (NarInfo.niNarSize narInfo))
-                      <> " bytes but the stream carried "
-                      <> T.pack (show narBytes)
+                  ( FatalFailure
+                      ( "NAR size mismatch: narinfo declares "
+                          <> T.pack (show (NarInfo.niNarSize narInfo))
+                          <> " bytes but the stream carried "
+                          <> T.pack (show narBytes)
+                      )
                   )
               )
           else
             if digest /= declaredDigest
               then do
                 abortNarUnpack sink
+                -- Size matched, so the transfer completed; wrong
+                -- bytes are deterministic corruption, not a hiccup.
                 pure
                   ( Left
-                      ( "NAR hash mismatch: narinfo declares "
-                          <> NarInfo.niNarHash narInfo
-                          <> " but downloaded bytes hash to "
-                          <> Hash.formatNixHash digest
+                      ( FatalFailure
+                          ( "NAR hash mismatch: narinfo declares "
+                              <> NarInfo.niNarHash narInfo
+                              <> " but downloaded bytes hash to "
+                              <> Hash.formatNixHash digest
+                          )
                       )
                   )
               else do
                 finished <- finishNarUnpack sink
                 case finished of
-                  Left err -> pure (Left err)
+                  Left err -> pure (Left (FatalFailure err))
                   Right () -> pure (Right narBytes)
 
--- | Stream an HTTP body as a chunk source bounded by the key-trusted
--- declared size - 'readBodyCapped''s discipline without the
--- buffering.  Exceeding the cap throws 'StreamAbort'; the attempt
--- boundary converts it back to the pipeline's error channel.
+-- | Stream an HTTP body as a chunk source bounded by the download cap
+-- 'downloadCapFor' derived from the signed NarSize -
+-- 'readBodyCapped''s discipline without the buffering.  Exceeding the
+-- cap throws 'StreamAbort'; the attempt boundary converts it back to
+-- the pipeline's error channel.
 cappedBodySource :: Int -> HTTP.BodyReader -> IO (IO BS.ByteString)
 cappedBodySource cap reader = do
   countRef <- newIORef 0
@@ -627,7 +761,7 @@ cappedBodySource cap reader = do
     consumed <- readIORef countRef
     let total = consumed + BS.length chunk
     if total > cap
-      then throwIO (StreamAbort ("NAR body exceeds the declared size (" <> T.pack (show cap) <> " bytes)"))
+      then throwIO (StreamAbort ("NAR body exceeds its download ceiling (" <> T.pack (show cap) <> " bytes)"))
       else do
         writeIORef countRef total
         pure chunk
@@ -645,30 +779,39 @@ hashPathStreaming path = NAR.withNarSource NAR.defaultCaseHack path $ \pull ->
    in go Hash.hashInit
 
 -- | Whether the streaming pipeline can decompress a narinfo
--- @Compression@ value, decided - like 'decompressorFor' - from the
--- value alone so unsupported compression rejects before any
--- download.  The suite pins agreement with the strict
--- 'decompressorFor', so the two encodings cannot drift silently.
+-- @Compression@ value, decided from the value alone so unsupported
+-- compression rejects before any download.  Both this and the strict
+-- 'decompressorFor' dispatch through 'parseNarCompression', so the
+-- support set exists exactly once.
 streamingDecompressionSupported :: Text -> Either Text ()
-streamingDecompressionSupported compression
-  | compression == "none" || T.null compression = Right ()
-  | compression == "xz" = Right ()
-  | otherwise = Left ("unsupported compression: " <> compression)
+streamingDecompressionSupported = void . parseNarCompression
 
 -- | Run a consumer over the decompressed view of a chunk source:
--- identity for @none@, nova-cache's bounded decoder for @xz@ (output
--- capped at the declared NarSize; thrown 'Xz.XzError's convert to the
--- pipeline's error channel here).  'streamingDecompressionSupported'
--- is the matching support decision.
-withDecompressedSource :: Integer -> Text -> IO BS.ByteString -> (IO BS.ByteString -> IO (Either Text a)) -> IO (Either Text a)
-withDecompressedSource declaredNarSize compression source consume
-  | compression == "none" || T.null compression = consume source
-  | compression == "xz" = case xzLimitsFor declaredNarSize of
-      Left err -> pure (Left err)
+-- identity for 'CompressionNone', nova-cache's bounded decoder for
+-- 'CompressionXz' (output capped at the declared NarSize; thrown
+-- 'Xz.XzError's convert to the pipeline's error channel here, carrying
+-- their retry class from 'xzFailure').
+withDecompressedSource :: Integer -> Text -> IO BS.ByteString -> (IO BS.ByteString -> IO (Either AttemptFailure a)) -> IO (Either AttemptFailure a)
+withDecompressedSource declaredNarSize compression source consume =
+  case parseNarCompression compression of
+    Left err -> pure (Left (FatalFailure err))
+    Right CompressionNone -> consume source
+    Right CompressionXz -> case xzLimitsFor declaredNarSize of
+      Left err -> pure (Left (FatalFailure err))
       Right limits ->
         Xz.withXzSource limits source consume
-          `catch` \xzErr -> pure (Left (renderXzError xzErr))
-  | otherwise = pure (Left ("unsupported compression: " <> compression))
+          `catch` \xzErr -> pure (Left (xzFailure xzErr))
+
+-- | Classify a decoder failure: a stream error is how truncation and
+-- torn transfers surface, so it retries; output or memory past the
+-- declared bounds is the served object misdeclaring - deterministic.
+xzFailure :: Xz.XzError -> AttemptFailure
+xzFailure xzErr = case xzErr of
+  Xz.XzStreamError _ -> TransientFailure rendered
+  Xz.XzOutputOverBound _ -> FatalFailure rendered
+  Xz.XzMemoryOverBound _ -> FatalFailure rendered
+  where
+    rendered = renderXzError xzErr
 
 -- ---------------------------------------------------------------------------
 -- Pure helpers
@@ -695,15 +838,18 @@ verifySigs cache narInfo =
 
 -- | The decompressor for a narinfo @Compression@ value, decided from
 -- the narinfo's declared values alone so unsupported compression
--- rejects before any download.  @\"none\"@ and @\"\"@ are identity.
--- @\"xz\"@ - cache.nixos.org's format - decompresses bounded by the
--- declared NarSize, a signed claim the caller validates before
--- resolving the decompressor.
+-- rejects before any download.  'CompressionNone' is identity;
+-- 'CompressionXz' - cache.nixos.org's format - decompresses bounded
+-- by the declared NarSize, a signed claim the caller validates before
+-- resolving the decompressor.  Dispatches through
+-- 'parseNarCompression' like the streaming path, so the support set
+-- exists exactly once.
 decompressorFor :: Integer -> Text -> Either Text (BS.ByteString -> Either Text BS.ByteString)
-decompressorFor declaredNarSize compression
-  | compression == "none" || T.null compression = Right Right
-  | compression == "xz" = xzDecompressor declaredNarSize
-  | otherwise = Left ("unsupported compression: " <> compression)
+decompressorFor declaredNarSize compression = do
+  kind <- parseNarCompression compression
+  case kind of
+    CompressionNone -> Right Right
+    CompressionXz -> xzDecompressor declaredNarSize
 
 -- | Decompress NAR data based on the compression type from narinfo,
 -- bounded by the declared NarSize.  Support is decided by
