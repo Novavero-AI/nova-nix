@@ -68,6 +68,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..))
+import Nix.Store.Path (StoreDir, defaultStoreDir, parseStorePath, storePathToFilePath)
 import System.Directory
   ( copyFile,
     createDirectoryIfMissing,
@@ -176,26 +177,36 @@ type DecodeError = Either Tar.FormatError Tar.DecodeLongNamesError
 -- @Either (exit, msg) ()@ shape as the process runner, so the shared
 -- output-validation and registration path in "Nix.Builder" is reused
 -- unchanged.
-runBuiltinUnpack :: UnpackLimits -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
-runBuiltinUnpack limits drv outputDirs =
+--
+-- @srcs@ carries eval's canonical @\/nix\/store@ spelling, and the physical
+-- root may live elsewhere - @C:\\nix\\store@ on Windows, where a bare
+-- \/-rooted path resolves against the current DRIVE - so each entry is
+-- parsed as a store path and rendered through the store dir rather than
+-- opened verbatim (#101).  On Unix the rendering is the identity.
+runBuiltinUnpack :: StoreDir -> UnpackLimits -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
+runBuiltinUnpack storeDir limits drv outputDirs =
   case (Map.lookup envSrcs (drvEnv drv), lookup unpackOutputName outputDirs) of
     (Nothing, _) -> failure "derivation has no 'srcs'"
     (Just srcsBytes, mOutDir) -> case TE.decodeUtf8' srcsBytes of
       -- Store paths are ASCII; a non-UTF-8 srcs value cannot name any.
       Left _ -> failure "'srcs' contains invalid UTF-8"
       Right srcs
-        | null (sourcePaths srcs) -> failure "'srcs' is empty"
-        | otherwise -> case mOutDir of
-            Nothing -> failure "derivation defines no 'out' output"
-            Just outDir -> do
-              createDirectoryIfMissing True outDir
-              result <- unpackAll outDir limits (sourcePaths srcs)
-              pure $ case result of
-                Left msg -> Left (1, "builtin:unpack: " <> msg)
-                Right () -> Right ()
+        | null (T.words srcs) -> failure "'srcs' is empty"
+        | otherwise -> case traverse resolveSrc (T.words srcs) of
+            Left bad -> failure ("'srcs' entry is not a store path: " <> bad)
+            Right archives -> case mOutDir of
+              Nothing -> failure "derivation defines no 'out' output"
+              Just outDir -> do
+                createDirectoryIfMissing True outDir
+                result <- unpackAll outDir limits archives
+                pure $ case result of
+                  Left msg -> Left (1, "builtin:unpack: " <> msg)
+                  Right () -> Right ()
   where
     failure msg = pure (Left (1, "builtin:unpack: " <> msg))
-    sourcePaths = map T.unpack . T.words
+    resolveSrc word = case parseStorePath defaultStoreDir word of
+      Just sp -> Right (storePathToFilePath storeDir sp)
+      Nothing -> Left word
 
 -- | Extract archives in order, stopping at the first failure.  One
 -- budget spans all of them: the caps bound the BUILD's output, not any

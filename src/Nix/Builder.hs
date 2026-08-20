@@ -232,7 +232,7 @@ buildDerivationInner config store drv = do
         exitResult <- case drvBuilder drv of
           b
             | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
-            | b == builtinUnpackBuilder -> runBuiltinUnpack (bcUnpackLimits config) drv outputDirs
+            | b == builtinUnpackBuilder -> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
           _ -> case decodeBuilderStrings drv of
             Left errMsg -> pure (Left (1, errMsg))
             Right (builderText, argTexts, decodedEnv) ->
