@@ -3601,6 +3601,7 @@ fetchGit rawUrl name mRef mRev submodules shallow =
       _ <- git ["checkout", "--quiet", checkoutTarget, "--"]
       when submodules $
         void (git ["submodule", "update", "--init", "--recursive"])
+      markExecutablesFromIndex ctx cloneDir
       rev <- git ["rev-parse", "HEAD"]
       revCountText <- git ["rev-list", "--count", "HEAD"]
       lastModifiedText <- git ["show", "-s", "--format=%ct", "HEAD"]
@@ -3627,6 +3628,22 @@ fetchGit rawUrl name mRef mRev submodules shallow =
                   ]
             )
         )
+
+-- | Mark every file git records as executable (mode 100755) in the
+-- checked-out tree.  A no-op on Unix; on Windows the mode has nowhere to
+-- live on disk, so it's read back from the index before @.git@ is stripped.
+markExecutablesFromIndex :: (MonadEval m) => Text -> Text -> m ()
+markExecutablesFromIndex ctx cloneDir = do
+  listing <- gitRun ctx cloneDir ["ls-files", "--recurse-submodules", "--stage", "-z"]
+  mapM_ markOne (T.split (== '\0') listing)
+  where
+    markOne row
+      | Just rest <- T.stripPrefix "100755 " row,
+        (_, tabbed) <- T.breakOn "\t" rest,
+        Just relPath <- T.stripPrefix "\t" tabbed,
+        not (T.null relPath) =
+          setExecutableFile (cloneDir <> "/" <> relPath)
+      | otherwise = pure ()
 
 -- | Run one git subcommand under the same transport allowlist as the URL
 -- check.  Returns trimmed stdout; a nonzero exit throws with git's stderr.

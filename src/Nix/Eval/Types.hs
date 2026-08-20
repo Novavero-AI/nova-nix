@@ -1241,6 +1241,10 @@ class (Monad m) => MonadEval m where
   -- | Whether a regular file carries the executable bit (NAR encodes it).
   isExecutableFile :: Text -> m Bool
 
+  -- | Mark a regular file executable (mode bit on Unix, an alternate data
+  -- stream on Windows). Run before the tree is copied to the store.
+  setExecutableFile :: Text -> m ()
+
   -- | Read a symlink's target WITHOUT following it.
   readSymlinkTarget :: Text -> m Text
 
@@ -1365,6 +1369,7 @@ instance MonadEval PureEval where
   copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in pure evaluation"
   narHashOfPath _ = throwEvalError "builtins.fetchGit: not available in pure evaluation"
   isExecutableFile _ = throwEvalError "builtins.path: not available in pure evaluation"
+  setExecutableFile _ = throwEvalError "builtins.fetchGit: not available in pure evaluation"
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in pure evaluation"
   addSourceNar _ _ = throwEvalError "builtins.path: not available in pure evaluation"
   addFixedOutputFile _ _ = throwEvalError "builtins.fetchurl: not available in pure evaluation"

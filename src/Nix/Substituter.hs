@@ -101,6 +101,7 @@ import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Store (PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarEvent, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
+import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
 import qualified NovaCache.Bzip2 as Bzip2
 import qualified NovaCache.Hash as Hash
@@ -369,7 +370,7 @@ unpackAndVerify store sp narInfo rawNar =
               -- surface here, before the row exists.  A mismatching tree
               -- is removed - left in place it would be adopted by
               -- existence checks at this path.
-              onDisk <- NAR.serialiseFromPath destPath
+              onDisk <- ExecBit.serialiseFromPath destPath
               case verifyNarHash narInfo (NAR.serialise onDisk) of
                 Left _ -> do
                   Dir.removePathForcibly destPath
@@ -740,7 +741,12 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
           -- filesystem introduced between the NAR and the materialized
           -- tree must surface here, before the row exists.  The recheck
           -- streams too, so its memory no longer scales with the path.
-          onDiskDigest <- hashPathStreaming destPath
+          -- Through 'ExecBit', not nova-cache's walk directly: on Windows
+          -- the sink writes the exec bit to a stream that walk cannot see,
+          -- and a verifier reading the flag back out of the file extension
+          -- would reject exactly the paths this representation exists for.
+          -- On Unix it is still the streaming hash.
+          onDiskDigest <- ExecBit.narHashOfPath destPath
           if onDiskDigest /= declaredDigest
             then do
               Dir.removePathForcibly destPath
@@ -843,18 +849,6 @@ cappedBodySource cap reader = do
       else do
         writeIORef countRef total
         pure chunk
-
--- | Hash a store path's NAR serialisation without materializing it:
--- 'NAR.withNarSource' streams the tree and the digest folds over the
--- chunks.
-hashPathStreaming :: FilePath -> IO Hash.NixHash
-hashPathStreaming path = NAR.withNarSource NAR.defaultCaseHack path $ \pull ->
-  let go !ctx = do
-        chunk <- pull
-        if BS.null chunk
-          then pure (Hash.hashFinalize ctx)
-          else go (Hash.hashUpdate ctx chunk)
-   in go Hash.hashInit
 
 -- | Whether the streaming pipeline can decompress a narinfo
 -- @Compression@ value, decided from the value alone so unsupported

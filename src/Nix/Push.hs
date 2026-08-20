@@ -76,6 +76,7 @@ import qualified Network.HTTP.Types as HTTP
 import Nix.Compression (compressionNameNone, compressionNameZstd)
 import Nix.Store (Store (..), queryDeriver, queryPathInfo, queryReferences)
 import qualified Nix.Store.DB as DB
+import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StorePath (spHash, spName), defaultStoreDir, parseStorePath, storePathToFilePath, storePathToText)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
@@ -380,7 +381,7 @@ fetchRemoteHashes manager cfg = do
 uploadNar :: HTTP.Manager -> PushConfig -> Store -> StorePath -> ExceptT Text IO NarInfo
 uploadNar manager cfg store sp = do
   let physicalPath = storePathToFilePath (stDir store) sp
-  narEntry <- liftIO (NAR.serialiseFromPath physicalPath)
+  narEntry <- liftIO (ExecBit.serialiseFromPath physicalPath)
   let narBytes = NAR.serialise narEntry
       narHash = Hash.formatNixHash (Hash.hashBytes narBytes)
       narSize = BS.length narBytes
