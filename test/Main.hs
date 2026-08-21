@@ -31,7 +31,7 @@ import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryCompone
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm, toATermForHash)
-import Nix.Eval (MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
+import Nix.Eval (FetchCache (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, fetchCacheKey, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.AttrPath (parseAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
@@ -6368,6 +6368,148 @@ testAttrPath = do
           (parseAttrPath "a.\"b")
     ]
 
+-- | The remembered-fetch record, on its own.  All three functions are pure,
+-- and every property that keeps a warm cache honest is decided here: what
+-- shares an entry, what round-trips, and what a torn file decodes to.
+testFetchCache :: IO [Bool]
+testFetchCache = do
+  putStrLn "eval/fetch-cache"
+  sequence
+    [ runTest "the key separates every input that decides the answer" $
+        let base = fetchCacheKey "https://example.com/r" "source" "abc" False False
+            variants =
+              [ fetchCacheKey "https://example.com/s" "source" "abc" False False,
+                fetchCacheKey "https://example.com/r" "other" "abc" False False,
+                fetchCacheKey "https://example.com/r" "source" "def" False False,
+                fetchCacheKey "https://example.com/r" "source" "abc" True False,
+                -- shallow decides revCount, so it cannot share an entry
+                -- with a full clone of the same revision.
+                fetchCacheKey "https://example.com/r" "source" "abc" False True
+              ]
+         in assertEqual "collisions with the base key" [] (filter (== base) variants),
+      runTest "the same fetch keys the same both times" $
+        assertEqual
+          "repeat"
+          (fetchCacheKey "https://example.com/r" "source" "abc" True True)
+          (fetchCacheKey "https://example.com/r" "source" "abc" True True),
+      runTest "an entry round-trips through encode and decode" $
+        assertEqual "decode . encode" (Just sampleFetchCache) (decodeFetchCache (encodeFetchCache sampleFetchCache)),
+      runTest "a torn entry decodes to nothing" $
+        let whole = encodeFetchCache sampleFetchCache
+            -- Every prefix, so the cut lands in each field in turn.  The
+            -- last field is the one that matters: a cut before it leaves
+            -- fewer than five lines and is rejected on shape alone, while
+            -- a cut inside narHash still leaves five.
+            torn = [T.take n whole | n <- [0 .. T.length whole - 1]]
+         in assertEqual "prefixes that decoded" [] (filter (isJust . decodeFetchCache) torn),
+      runTest "a non-decimal count is not an entry" $
+        assertEqual
+          "revCount"
+          Nothing
+          (decodeFetchCache (replaceCount (encodeFetchCache sampleFetchCache) "12x")),
+      -- The hit path itself, end to end through builtins.fetchGit.  Nothing
+      -- here can reach the network: the stub's createScratchDir throws, so
+      -- a Right at all proves the fetch was skipped, and every field comes
+      -- from the entry rather than from git.
+      runTest "a warm entry answers builtins.fetchGit without fetching" $
+        case evalWarmFetchGit sampleFetchCache (Set.singleton (fcStorePath sampleFetchCache)) of
+          Left err -> Fail ("a warm cache still tried to fetch: " <> err)
+          Right val ->
+            assertEqual
+              "fields"
+              [ ("outPath", VPath (fcStorePath sampleFetchCache)),
+                ("rev", mkStr (fcRev sampleFetchCache)),
+                ("revCount", VInt 1234),
+                ("narHash", mkStr ("sha256-" <> fcNarHash sampleFetchCache))
+              ]
+              (fetchGitFields val ["outPath", "rev", "revCount", "narHash"]),
+      -- The guard on the hit, on the axis that matters.  doesPathExist is
+      -- False throughout the stub and adoptStorePath is what decides, so a
+      -- hit that consulted mere existence would fail this and a hit that
+      -- adopts the path passes the case above.  Adoption is what records
+      -- the store write, and a hit that skipped it would hand back an
+      -- outPath no derivation naming it could be built against.
+      runTest "an entry whose path cannot be adopted refetches" $
+        case evalWarmFetchGit sampleFetchCache Set.empty of
+          Right _ -> Fail "an unadoptable entry was served from the cache"
+          Left err
+            | "createScratchDir" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("expected a refetch, got: " <> err),
+      runTest "a bare ref is never served from the cache" $
+        -- Whatever the cache holds, a ref means "wherever this branch
+        -- points now", so the entry must not be consulted at all.
+        case evalNixStubWith
+          (warmEnv sampleFetchCache (Set.singleton (fcStorePath sampleFetchCache)))
+          "builtins.fetchGit { url = \"https://example.com/r\"; ref = \"main\"; }" of
+          Right _ -> Fail "a bare ref was served from the cache"
+          Left err
+            | "createScratchDir" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("expected a fetch, got: " <> err),
+      runTest "a hash that is not base64 sha256 is not an entry" $
+        assertEqual
+          "narHash"
+          [Nothing, Nothing, Nothing]
+          ( map
+              (decodeFetchCache . encodeFetchCache)
+              [ sampleFetchCache {fcNarHash = T.take 43 (fcNarHash sampleFetchCache)},
+                sampleFetchCache {fcNarHash = T.replicate 44 "="},
+                sampleFetchCache {fcNarHash = T.take 43 (fcNarHash sampleFetchCache) <> "A"}
+              ]
+          )
+    ]
+  where
+    -- Swap the encoded revCount line, which encodeFetchCache cannot
+    -- produce: the field is an Integer on the way in.
+    replaceCount encoded replacement = case T.splitOn "\n" encoded of
+      [storePath, rev, _, lastModified, narHash] ->
+        T.intercalate "\n" [storePath, rev, replacement, lastModified, narHash]
+      _ -> encoded
+
+-- | A stub store whose cache is warm for 'warmFetchGitExpr'\'s fetch, and
+-- which will adopt exactly the given store paths.
+warmEnv :: FetchCache -> Set.Set Text -> StubEnv
+warmEnv fields adoptable =
+  (stubEnv Map.empty)
+    { seFetchCache =
+        Map.singleton
+          (fetchCacheKey "https://example.com/r" "source" warmFetchGitRev False False)
+          (encodeFetchCache fields),
+      seAdoptable = adoptable
+    }
+
+-- | The pinned revision 'warmFetchGitExpr' asks for.
+warmFetchGitRev :: Text
+warmFetchGitRev = T.replicate 40 "b"
+
+-- | Evaluate a pinned @builtins.fetchGit@ against a warm cache.
+evalWarmFetchGit :: FetchCache -> Set.Set Text -> Either Text NixValue
+evalWarmFetchGit fields adoptable =
+  evalNixStubWith
+    (warmEnv fields adoptable)
+    ("builtins.fetchGit { url = \"https://example.com/r\"; rev = \"" <> warmFetchGitRev <> "\"; }")
+
+-- | Read the named attributes off a @fetchGit@ result, in the order asked.
+fetchGitFields :: NixValue -> [Text] -> [(Text, NixValue)]
+fetchGitFields val names = case val of
+  VAttrs attrs ->
+    [ (name, value)
+    | name <- names,
+      Just thunk <- [attrSetLookup name attrs],
+      Just value <- [readThunkValue thunk]
+    ]
+  _ -> []
+
+-- | One recorded fetch, with a real 44-character base64 sha256.
+sampleFetchCache :: FetchCache
+sampleFetchCache =
+  FetchCache
+    { fcStorePath = "/nix/store/" <> T.replicate 32 "a" <> "-source",
+      fcRev = T.replicate 40 "b",
+      fcRevCount = 1234,
+      fcLastModified = 1700000000,
+      fcNarHash = T.replicate 43 "A" <> "="
+    }
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -8716,10 +8858,27 @@ data StubErr = StubThrow !Text | StubOther !Text
 -- input-derivation-modulo STORE-READ arm hermetically - the real arm
 -- reads the platform store, which dev machines and CI runners must not
 -- depend on (the build matrix has no writable @/nix/store@).
-newtype StubStoreEval a = StubStoreEval (Map.Map Text Derivation -> Either StubErr a)
+newtype StubStoreEval a = StubStoreEval (StubEnv -> Either StubErr a)
 
-runStubStoreEval :: Map.Map Text Derivation -> StubStoreEval a -> Either Text a
-runStubStoreEval drvs (StubStoreEval action) = case action drvs of
+-- | What the stubbed store answers from.
+data StubEnv = StubEnv
+  { -- | Derivations 'readStoreDerivation' serves, by canonical @.drv@ path.
+    seDrvs :: !(Map.Map Text Derivation),
+    -- | Recorded fetches 'lookupFetchCache' serves, by key.
+    seFetchCache :: !(Map.Map Text Text),
+    -- | Store paths 'adoptStorePath' accepts.  Deliberately NOT the same
+    -- answer as 'doesPathExist', which is 'False' throughout: on disk and
+    -- registered are different facts, and a test where the two coincide
+    -- cannot tell which one the code under test asked about.
+    seAdoptable :: !(Set.Set Text)
+  }
+
+-- | A stub store holding nothing but the given derivations.
+stubEnv :: Map.Map Text Derivation -> StubEnv
+stubEnv drvs = StubEnv {seDrvs = drvs, seFetchCache = Map.empty, seAdoptable = Set.empty}
+
+runStubStoreEvalWith :: StubEnv -> StubStoreEval a -> Either Text a
+runStubStoreEvalWith env (StubStoreEval action) = case action env of
   Left (StubThrow msg) -> Left msg
   Left (StubOther msg) -> Left msg
   Right val -> Right val
@@ -8729,18 +8888,18 @@ instance Functor StubStoreEval where
 
 instance Applicative StubStoreEval where
   pure val = StubStoreEval (const (Right val))
-  StubStoreEval mf <*> StubStoreEval ma = StubStoreEval $ \drvs -> mf drvs <*> ma drvs
+  StubStoreEval mf <*> StubStoreEval ma = StubStoreEval $ \env -> mf env <*> ma env
 
 instance Monad StubStoreEval where
-  StubStoreEval ma >>= f = StubStoreEval $ \drvs -> case ma drvs of
+  StubStoreEval ma >>= f = StubStoreEval $ \env -> case ma env of
     Left err -> Left err
-    Right val -> let StubStoreEval mb = f val in mb drvs
+    Right val -> let StubStoreEval mb = f val in mb env
 
 instance MonadEval StubStoreEval where
   throwEvalError msg = StubStoreEval (const (Left (StubOther msg)))
   throwCatchableError msg = StubStoreEval (const (Left (StubThrow msg)))
   abortEvaluation msg = StubStoreEval (const (Left (StubOther ("evaluation aborted: " <> msg))))
-  catchEvalError (StubStoreEval action) = StubStoreEval $ \drvs -> case action drvs of
+  catchEvalError (StubStoreEval action) = StubStoreEval $ \env -> case action env of
     Left (StubThrow msg) -> Right (Left msg)
     Left other -> Left other
     Right val -> Right (Right val)
@@ -8759,6 +8918,9 @@ instance MonadEval StubStoreEval where
   copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
   narHashOfPath _ = throwEvalError "builtins.fetchGit: not available in the stub evaluator"
   setExecutableFile _ = throwEvalError "builtins.fetchGit: not available in the stub evaluator"
+  lookupFetchCache key = StubStoreEval $ \env -> Right (Map.lookup key (seFetchCache env))
+  adoptStorePath path = StubStoreEval $ \env -> Right (Set.member path (seAdoptable env))
+  writeFetchCache _ _ = pure ()
   isExecutableFile _ = throwEvalError "builtins.path: not available in the stub evaluator"
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in the stub evaluator"
   addSourceNar _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
@@ -8768,7 +8930,7 @@ instance MonadEval StubStoreEval where
   cacheDrvHash _ _ = pure ()
   recordDrvAterm _ _ = pure ()
   readStoreDerivation sp =
-    StubStoreEval $ \drvs -> Right (Map.lookup (storePathToText defaultStoreDir sp) drvs)
+    StubStoreEval $ \env -> Right (Map.lookup (storePathToText defaultStoreDir sp) (seDrvs env))
   lookupSessionDrv _ = pure Nothing
   storeSourcePath = pure
   resolvePathLiteral = pure . canonPath
@@ -8784,9 +8946,13 @@ instance MonadEval StubStoreEval where
 
 -- | Parse and evaluate under the stubbed-store evaluator.
 evalNixStub :: Map.Map Text Derivation -> Text -> Either Text NixValue
-evalNixStub drvs source = case parseNix testBaseDir "<test>" source of
+evalNixStub = evalNixStubWith . stubEnv
+
+-- | 'evalNixStub' with the whole stub store spelled out.
+evalNixStubWith :: StubEnv -> Text -> Either Text NixValue
+evalNixStubWith env source = case parseNix testBaseDir "<test>" source of
   Left err -> Left (T.pack (show err))
-  Right expr -> runStubStoreEval drvs (eval (builtinEnv 0 []) expr)
+  Right expr -> runStubStoreEvalWith env (eval (builtinEnv 0 []) expr)
 
 -- | Class I conformance follow-ups (issue #50): behaviors that landed
 -- with #37 but had no direct test.  Pure cases here; filesystem-touching
@@ -9970,6 +10136,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testHashHelpers,
           testNarKnownAnswer,
           testFetchGitTransport,
+          testFetchCache,
           testAttrPath,
           testScratchDirs,
           testEvalLiterals,

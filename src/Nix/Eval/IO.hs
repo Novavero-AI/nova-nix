@@ -41,6 +41,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
@@ -411,6 +412,46 @@ instance MonadEval EvalIO where
 
   setExecutableFile path = evalStoreTextPath path >>= \resolved -> wrapIO (ExecBit.markExecutable resolved)
 
+  lookupFetchCache key = wrapIO $ do
+    file <- fetchCacheFile key
+    there <- Dir.doesFileExist file
+    if not there
+      then pure Nothing
+      else do
+        recorded <- try (BS.readFile file) :: IO (Either SomeException BS.ByteString)
+        pure $ case recorded of
+          Left _ -> Nothing
+          Right bytes -> either (const Nothing) Just (TE.decodeUtf8' bytes)
+
+  adoptStorePath path = do
+    resolved <- evalStoreTextPath path
+    there <- wrapIO (Dir.doesPathExist resolved)
+    -- Same recording the uncached fetch's copyPathToStore would have done.
+    -- materializeEvalStoreWrites skips a path that is already valid, so
+    -- re-recording one costs nothing and closes the case where the row is
+    -- missing.
+    when there (recordStoreWrite path [])
+    pure there
+
+  writeFetchCache key value = wrapIO $ do
+    file <- fetchCacheFile key
+    -- The cache is an optimisation: a machine that cannot write one still
+    -- has to be able to build.
+    _ <-
+      try
+        ( do
+            Dir.createDirectoryIfMissing True (takeDirectory file)
+            -- Written beside the entry and renamed onto it, so a reader
+            -- sees either the whole entry or none of it. A plain write can
+            -- be cut short and leave a torn file behind, and an entry is
+            -- trusted for as long as its store path survives.
+            let staging = file ++ ".tmp"
+            BS.writeFile staging (TE.encodeUtf8 value)
+            Dir.renameFile staging file
+        ) ::
+        IO (Either SomeException ())
+    pure ()
+
   readSymlinkTarget path = evalStoreTextPath path >>= \resolved -> wrapIO (T.pack <$> Dir.getSymbolicLinkTarget resolved)
 
   addSourceNar name narBytes =
@@ -584,6 +625,14 @@ scratchSuffixBytes = 16
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
+
+-- | Where a recorded fetch is kept: one file per key, under this user's
+-- cache directory, named by the key's own hash. Outside the store on
+-- purpose - it's a note about work already done, not a derivation input.
+fetchCacheFile :: Text -> IO FilePath
+fetchCacheFile key = do
+  dir <- Dir.getXdgDirectory Dir.XdgCache "nova-nix/fetch"
+  pure (dir </> T.unpack (bytesToHexText (sha256Digest (TE.encodeUtf8 key))))
 
 -- | Where a store path lives on this machine: this evaluation's store dir
 -- mapped to a filesystem path.  This is the 'SP.StorePath' direction;
