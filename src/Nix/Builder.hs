@@ -41,7 +41,10 @@ module Nix.Builder
     defaultBuildConfig,
 
     -- * Pure pieces (exported for tests)
+    BuilderSpawn (..),
     buildPath,
+    execWrapperConfig,
+    execWrapperFor,
     rewriteEnv,
     rewritePlaceholders,
     unionEnvs,
@@ -71,7 +74,7 @@ import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
-import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform, fromATerm, platformToText)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -159,7 +162,15 @@ data BuildConfig = BuildConfig
     -- | Binary caches to try before building (checked in priority order).
     bcCaches :: ![CacheConfig],
     -- | Extraction budget for @builtin:unpack@ builds.
-    bcUnpackLimits :: !UnpackLimits
+    bcUnpackLimits :: !UnpackLimits,
+    -- | Launchers for derivations whose @system@ this machine cannot execute
+    -- directly, keyed by that system string exactly as
+    -- 'Nix.Derivation.platformToText' spells it (@x86_64-windows@ -> a wine
+    -- binary). Prepended to the builder at the spawn boundary only, so the
+    -- derivation itself - and its store paths - stay identical to a native
+    -- build's. A foreign system with no entry here is refused rather than
+    -- spawned natively; see 'execWrapperFor'.
+    bcExecWrappers :: !(Map Text FilePath)
   }
   deriving (Eq, Show)
 
@@ -178,6 +189,7 @@ defaultBuildConfig dir =
           else "/bin/bash",
       bcSandbox = False,
       bcCaches = [],
+      bcExecWrappers = Map.empty,
       bcUnpackLimits = defaultUnpackLimits
     }
 
@@ -337,6 +349,58 @@ fallbackOutputPath sp =
     (BS.replicate 32 0)
     (spName sp)
 
+-- | Parse @--exec-wrapper SYSTEM=PATH@ specs into the map 'bcExecWrappers'
+-- wants.
+--
+-- @SYSTEM@ is a derivation's own @system@ string, spelled as
+-- 'Nix.Derivation.platformToText' spells it, because 'execWrapperFor'
+-- matches it by equality and nothing else.
+--
+-- A system named twice is an error rather than last-one-wins: two specs for
+-- one system is a mistake in the invocation either way, and silently
+-- picking one of them means a build runs through a launcher the operator
+-- did not think they had asked for.
+execWrapperConfig :: [String] -> Either Text (Map Text FilePath)
+execWrapperConfig = foldl' step (Right Map.empty)
+  where
+    step acc spec = do
+      wrappers <- acc
+      (system, path) <- one spec
+      if Map.member system wrappers
+        then Left ("--exec-wrapper names " <> system <> " twice")
+        else Right (Map.insert system path wrappers)
+    one spec = case break (== '=') spec of
+      (system, '=' : path)
+        | not (null system), not (null path) -> Right (T.pack system, path)
+      _ -> Left ("--exec-wrapper expects SYSTEM=PATH, got: " <> T.pack spec)
+
+-- | How this machine can spawn a derivation's builder.
+data BuilderSpawn
+  = -- | The derivation targets this machine's platform; spawn it directly.
+    SpawnNative
+  | -- | Spawn through this launcher, named for the derivation's system.
+    SpawnThrough !FilePath
+  | -- | Nothing here can execute this derivation's builder; the payload is
+    -- the system string that has no launcher.
+    SpawnUnsupported !Text
+  deriving (Eq, Show)
+
+-- | How to spawn this derivation's builder on this machine.
+--
+-- \"This is my platform\" and \"I have no launcher for this platform\" are
+-- different answers: collapsing them to \"spawn directly\" runs a foreign
+-- builder natively and reports whatever the loader says, after the whole
+-- closure has already been realized. A system this machine cannot execute
+-- and has not been told how to is refused instead.
+execWrapperFor :: BuildConfig -> Derivation -> BuilderSpawn
+execWrapperFor config drv
+  | drvPlatform drv == currentPlatform = SpawnNative
+  | otherwise = case Map.lookup system (bcExecWrappers config) of
+      Just launcher -> SpawnThrough launcher
+      Nothing -> SpawnUnsupported system
+  where
+    system = platformToText (drvPlatform drv)
+
 -- | The build, once every output knows where it is written and where it
 -- belongs.
 runPlannedBuild :: BuildConfig -> Store -> Derivation -> FilePath -> [OutputPlan] -> IO BuildResult
@@ -368,17 +432,33 @@ runPlannedBuild config store drv buildDir plans = do
         b
           | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
           | b == builtinUnpackBuilder -> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
-        _ -> case decodeBuilderStrings drv of
-          Left errMsg -> pure (Left (1, errMsg))
-          Right (builderText, argTexts, decodedEnv) ->
+        _ -> case (execWrapperFor config drv, decodeBuilderStrings drv) of
+          (SpawnUnsupported system, _) ->
+            pure
+              ( Left
+                  ( 1,
+                    "no way to run a "
+                      <> system
+                      <> " builder on this machine; pass --exec-wrapper "
+                      <> system
+                      <> "=PATH to name a launcher for it"
+                  )
+              )
+          (_, Left errMsg) -> pure (Left (1, errMsg))
+          (spawn, Right (builderText, argTexts, decodedEnv)) ->
             let -- onStore first, so nothing a placeholder expands to gets
                 -- rewritten a second time.
                 rewrite = rewritePlaceholders outputDirs . onStore config
                 builderPath = T.unpack (onStore config builderText)
                 environ = buildEnvironment config (rewriteEnv rewrite decodedEnv) builderPath buildDir outputDirs
                 builderArgs = map (T.unpack . rewrite) argTexts
+                -- Env still names the real builder - a launcher only
+                -- changes what's spawned, not what the derivation says.
+                (spawnPath, spawnArgs) = case spawn of
+                  SpawnThrough launcher -> (launcher, builderPath : builderArgs)
+                  _ -> (builderPath, builderArgs)
              in -- 5. Run the builder
-                runBuilder builderPath builderArgs environ buildDir
+                runBuilder spawnPath spawnArgs environ buildDir
       case exitResult of
         Left (exitCode, stderrText) -> do
           -- Whatever the builder wrote is in the store now, so failure has

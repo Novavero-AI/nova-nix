@@ -26,7 +26,7 @@ import qualified Data.Text.IO as TIO
 import qualified Database.SQLite.Simple as SQL
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, rewriteEnv, rewritePlaceholders, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, rewriteEnv, rewritePlaceholders, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import qualified Nix.DependencyGraph as DepGraph
@@ -6510,6 +6510,82 @@ sampleFetchCache =
       fcNarHash = T.replicate 43 "A" <> "="
     }
 
+-- | Which derivations this machine will spawn, and how.
+--
+-- The distinction that matters is between the two answers that used to be
+-- one: a derivation for this platform needs no launcher, and a derivation
+-- for another platform with no launcher configured is not the same thing.
+testExecWrapper :: IO [Bool]
+testExecWrapper = do
+  putStrLn "builder/exec-wrapper"
+  sequence
+    [ runTest "a derivation for this platform is spawned directly" $
+        assertEqual
+          "native"
+          SpawnNative
+          (execWrapperFor (wrapperConfig [(platformToText foreignPlatform, "/usr/bin/wine")]) (drvFor currentPlatform)),
+      runTest "a configured foreign system spawns through its launcher" $
+        assertEqual
+          "wrapped"
+          (SpawnThrough "/usr/bin/wine")
+          (execWrapperFor (wrapperConfig [(platformToText foreignPlatform, "/usr/bin/wine")]) (drvFor foreignPlatform)),
+      -- The finding this exists for: without a distinct answer here, a
+      -- foreign builder was spawned natively and failed in the loader,
+      -- after the whole closure had already been realized.
+      runTest "an unconfigured foreign system is refused, not spawned" $
+        assertEqual
+          "unsupported"
+          (SpawnUnsupported (platformToText foreignPlatform))
+          (execWrapperFor (wrapperConfig []) (drvFor foreignPlatform)),
+      -- The system string is the derivation's own spelling, matched
+      -- exactly.  The documentation once named a different one, which
+      -- parsed, stored, and then never matched anything.
+      runTest "SYSTEM=PATH splits at the first separator" $
+        assertEqual
+          "specs"
+          (Right (Map.fromList [("x86_64-windows", "/usr/bin/wine"), ("aarch64-linux", "/opt/qemu=static/qemu")]))
+          (execWrapperConfig ["x86_64-windows=/usr/bin/wine", "aarch64-linux=/opt/qemu=static/qemu"]),
+      runTest "no specs is an empty map, not an error" $
+        assertEqual "empty" (Right Map.empty) (execWrapperConfig []),
+      runTest "a spec missing either half is rejected" $
+        assertEqual
+          "malformed"
+          (replicate 4 True)
+          (map (either (const True) (const False) . execWrapperConfig . pure) ["wine", "=wine", "x86_64-windows=", ""]),
+      -- Last-one-wins would run a build through a launcher the operator
+      -- did not think they had asked for.
+      runTest "naming one system twice is rejected" $
+        assertEqual
+          "duplicate"
+          (Left "--exec-wrapper names x86_64-windows twice")
+          (execWrapperConfig ["x86_64-windows=/usr/bin/wine", "x86_64-windows=/usr/bin/wine64"]),
+      runTest "a launcher keyed on any other spelling does not match" $
+        assertEqual
+          "near-miss keys"
+          (replicate 3 (SpawnUnsupported (platformToText foreignPlatform)))
+          ( [ execWrapperFor (wrapperConfig [(key, "/usr/bin/wine")]) (drvFor foreignPlatform)
+            | key <- ["x86-windows", "windows", T.toUpper (platformToText foreignPlatform)]
+            ]
+          )
+    ]
+  where
+    -- Some platform this test is not running on, so "foreign" is foreign
+    -- whichever host runs the suite.
+    foreignPlatform =
+      if currentPlatform == X86_64_Windows then X86_64_Linux else X86_64_Windows
+    wrapperConfig entries =
+      (defaultBuildConfig (StoreDir "/nix/store")) {bcExecWrappers = Map.fromList entries}
+    drvFor platform =
+      Derivation
+        { drvOutputs = [DerivationOutput "out" (StorePath (T.replicate 32 "a") "spawn") "" ""],
+          drvInputDrvs = Map.empty,
+          drvInputSrcs = [],
+          drvPlatform = platform,
+          drvBuilder = "/bin/sh",
+          drvArgs = [],
+          drvEnv = Map.empty
+        }
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -10137,6 +10213,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchCache,
+          testExecWrapper,
           testAttrPath,
           testScratchDirs,
           testEvalLiterals,

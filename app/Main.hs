@@ -23,7 +23,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
-import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
+import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), toATerm)
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
@@ -37,10 +37,10 @@ import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
-import System.Directory (canonicalizePath, doesFileExist, getCurrentDirectory, getTemporaryDirectory)
+import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory)
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure)
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 
 -- ---------------------------------------------------------------------------
@@ -58,6 +58,9 @@ data CliOpts = CliOpts
     optSubstituter :: !(Maybe String),
     -- | Trusted public key (@name:base64@) for the substituter.
     optTrustedKey :: !(Maybe String),
+    -- | @SYSTEM=PATH@ launchers for derivations this machine cannot execute
+    -- directly, e.g. @x86_64-windows=/path/to/wine@.
+    optExecWrappers :: ![String],
     optCommand :: !Command
   }
 
@@ -110,7 +113,7 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing False []
 -- silent drop: an unknown or typo'd flag once ended parsing and quietly
 -- discarded everything after it (e.g. a requested @--substituter@).
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdUsage)
+parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
   where
     go opts [] = Right opts
     -- Answered before anything else is looked at, and the rest of the line
@@ -130,6 +133,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdUsage)
       go (opts {optSubstituter = Just url}) rest
     go opts ("--trusted-key" : key : rest) =
       go (opts {optTrustedKey = Just key}) rest
+    go opts ("--exec-wrapper" : spec : rest) =
+      go (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : rest) = goBuild opts emptyBuildArgs rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
@@ -219,7 +224,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdUsage)
       goStoreDelete opts (paths ++ [path]) rest
     -- Flags that consume the following argument as their value.
     valueFlags =
-      ["--nix-path", "--store", "--substituter", "--trusted-key", "--expr", "--cache", "--key-file", "--compression"]
+      ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--compression"]
         ++ attrFlags
     -- Attribute selection, under both of upstream's spellings.
     attrFlags = ["-A", "--attr"]
@@ -328,6 +333,8 @@ usageLines =
     "  --all                  With push: select every valid path in the store",
     "  --key-file PATH        With push: file holding the cache API key",
     "  --compression KIND     With push: artifact packaging (" <> T.unpack pushCompressionValues <> "; default none)",
+    "  --exec-wrapper S=PATH  Run system S's derivations through PATH (repeatable),",
+    "                         e.g. --exec-wrapper x86_64-windows=/usr/bin/wine",
     "  --store DIR            Use DIR as the store (default: the platform store)",
     "  --substituter URL      Try this binary cache before building",
     "  --trusted-key K        Public key (name:base64) for the substituter",
@@ -459,6 +466,7 @@ buildCommand :: CliOpts -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
 buildCommand opts dataDir target attrPath = do
   let storeDir = chosenStoreDir opts
   caches <- either failWith pure (substituterConfig (optSubstituter opts) (optTrustedKey opts))
+  wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
   (baseDir, sourceName, source) <- loadBuildSource target
   case parseNix baseDir sourceName source of
     Left err -> do
@@ -500,7 +508,7 @@ buildCommand opts dataDir target attrPath = do
           -- builtins.toFile wrote these during evaluation but could not
           -- register them; a derivation naming one needs them valid first.
           materializeEvalStoreWrites store storeWrites
-          buildResult <- buildAndRegister store caches drvClosure drv drvSP
+          buildResult <- buildAndRegister store caches wrappers drvClosure drv drvSP
           closeStore store
           case buildResult of
             BuildSuccess sp ->
@@ -571,11 +579,32 @@ substituterConfig (Just url) (Just key) =
         }
     ]
 
+-- | Resolve every launcher before any building starts, so a typo'd path is
+-- a configuration error now rather than a build failure after the whole
+-- closure has been realized.  A bare name resolves through @PATH@, the way
+-- a shell would; anything else has to be an executable file where it says.
+checkExecWrappers :: Map.Map T.Text FilePath -> IO (Map.Map T.Text FilePath)
+checkExecWrappers = Map.traverseWithKey check
+  where
+    check system path
+      | path == takeFileName path =
+          findExecutable path
+            >>= maybe (failWith ("--exec-wrapper " <> system <> ": " <> T.pack path <> " is not on PATH")) pure
+      | otherwise = do
+          there <- doesFileExist path
+          if not there
+            then failWith ("--exec-wrapper " <> system <> ": " <> T.pack path <> " does not exist")
+            else do
+              perms <- getPermissions path
+              if executable perms
+                then pure path
+                else failWith ("--exec-wrapper " <> system <> ": " <> T.pack path <> " is not executable")
+
 -- | Write the .drv file to the store and build with dependency resolution.
 -- The drvPath is the store path of the .drv file itself, extracted from
 -- the evaluation result alongside the Derivation struct.
-buildAndRegister :: Store -> [CacheConfig] -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
-buildAndRegister store caches drvClosure drv drvSP = do
+buildAndRegister :: Store -> [CacheConfig] -> Map.Map T.Text FilePath -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
+buildAndRegister store caches wrappers drvClosure drv drvSP = do
   -- Materialize the full input-.drv closure (every transitive dependency's
   -- recipe) to the store.  buildWithDeps reads these back to construct the
   -- dependency graph; without them it cannot realize any non-leaf derivation.
@@ -588,7 +617,8 @@ buildAndRegister store caches drvClosure drv drvSP = do
   let config =
         (defaultBuildConfig (stDir store))
           { bcTmpDir = tmpDir,
-            bcCaches = caches
+            bcCaches = caches,
+            bcExecWrappers = wrappers
           }
   buildWithDeps config store drv drvSP
 
