@@ -78,6 +78,7 @@ module Nix.Store
     -- * Re-exports
     module Nix.Store.Path,
     module Nix.Store.DB,
+    module Nix.Store.Lock,
   )
 where
 
@@ -98,6 +99,7 @@ import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (makeFixedOutputPath, sha256Digest)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB
+import Nix.Store.Lock
 import Nix.Store.Path
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR

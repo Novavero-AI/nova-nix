@@ -52,6 +52,7 @@ import Control.Monad (filterM, when)
 import qualified Data.ByteString as BS
 import Data.Char (toLower, toUpper)
 import Data.Either (fromRight)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
@@ -68,7 +69,7 @@ import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
-import Nix.Store (PathRegistration, Store (..), isValid, placeInStore, registerPaths, scanReferences, scanTempReferences)
+import Nix.Store (PathLock, PathRegistration, Store (..), isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
 import qualified NovaCache.NAR as NAR
@@ -912,7 +913,7 @@ logDepStatus status drv =
   TIO.hPutStrLn System.IO.stderr ("  " <> statusTag status <> " " <> formatDrvName drv)
 
 -- | Try to substitute all outputs of a derivation from binary caches.
--- Returns True if all outputs were successfully substituted.
+-- Returns True if every output was substituted or already valid.
 --
 -- Registration is all-or-nothing and batched: every output is verified
 -- and unpacked first, then recorded in one 'registerPaths' transaction,
@@ -920,6 +921,14 @@ logDepStatus status drv =
 -- and a partial substitution registers nothing (the subsequent build
 -- starts from unregistered outputs and 'prepareOutput' replaces the
 -- leftover unpacked trees).
+--
+-- Each substituted output arrives with its path lock STILL HELD (see
+-- 'Nix.Substituter.SubstSuccess'), and the exclusion must survive until
+-- the registration transaction commits - released earlier, another
+-- process could meet the unpacked-but-unregistered window and delete
+-- the tree the row is about to describe.  Every held lock is released
+-- here on every exit path (finally), including failures that never
+-- reach registration.
 --
 -- A registration the database REFUSES - its unregistered-referent guard,
 -- reachable only through cache-declared references this store has never
@@ -929,10 +938,17 @@ trySubstituteOutputs :: BuildConfig -> Store -> Derivation -> IO Bool
 trySubstituteOutputs config store drv
   | null (bcCaches config) = pure False
   | otherwise = do
-      results <- mapM (trySubstitute store (bcCaches config) . doPath) (drvOutputs drv)
-      case traverse substRegistration results of
-        Just regs -> do
-          registered <- try (registerPaths (stDB store) regs)
+      heldLocks <- newIORef []
+      registerSubstituted heldLocks
+        `finally` (readIORef heldLocks >>= mapM_ releasePathLock)
+  where
+    registerSubstituted :: IORef [PathLock] -> IO Bool
+    registerSubstituted heldLocks = do
+      results <- mapM (substituteOne heldLocks . doPath) (drvOutputs drv)
+      case traverse substOutcome results of
+        Nothing -> pure False
+        Just outcomes -> do
+          registered <- try (registerPaths (stDB store) (catMaybes outcomes))
           case registered of
             Right () -> pure True
             Left (e :: IOException) -> do
@@ -940,10 +956,21 @@ trySubstituteOutputs config store drv
                 System.IO.stderr
                 ("  [subst] registration refused, building instead: " <> T.pack (displayException e))
               pure False
-        Nothing -> pure False
-  where
-    substRegistration (SubstSuccess reg) = Just reg
-    substRegistration _ = Nothing
+    -- Record a returned lock the moment it exists, so the enclosing
+    -- finally owns it even when a later output's attempt fails or
+    -- throws.
+    substituteOne heldLocks sp = do
+      result <- trySubstitute store (bcCaches config) sp
+      case result of
+        SubstSuccess _ lock -> atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
+        _ -> pure ()
+      pure result
+    -- An already-valid output counts as substituted but contributes no
+    -- registration row (and holds no lock).
+    substOutcome (SubstSuccess reg _) = Just (Just reg)
+    substOutcome SubstAlreadyValid = Just Nothing
+    substOutcome SubstNotFound = Nothing
+    substOutcome (SubstError _) = Nothing
 
 -- | Format a derivation name for status output (display-only, so the
 -- byte-string env value decodes lossily).
