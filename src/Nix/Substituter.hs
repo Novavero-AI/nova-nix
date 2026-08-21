@@ -102,6 +102,7 @@ import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Store (PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarEvent, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
 import Nix.Store.Path (StoreDir, StorePath (spHash), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
+import qualified NovaCache.Bzip2 as Bzip2
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NAR.Stream as Stream
@@ -865,10 +866,10 @@ streamingDecompressionSupported = void . parseNarCompression
 
 -- | Run a consumer over the decompressed view of a chunk source:
 -- identity for 'CompressionNone', nova-cache's bounded decoders for
--- 'CompressionXz' and 'CompressionZstd' (output capped at the
--- declared NarSize; thrown codec errors convert to the pipeline's
--- error channel here, carrying their retry class from 'xzFailure' and
--- 'zstdFailure').
+-- 'CompressionXz', 'CompressionZstd', and 'CompressionBzip2' (output
+-- capped at the declared NarSize; thrown codec errors convert to the
+-- pipeline's error channel here, carrying their retry class from
+-- 'xzFailure', 'zstdFailure', and 'bzip2Failure').
 withDecompressedSource :: Integer -> Text -> IO BS.ByteString -> (IO BS.ByteString -> IO (Either AttemptFailure a)) -> IO (Either AttemptFailure a)
 withDecompressedSource declaredNarSize compression source consume =
   case parseNarCompression compression of
@@ -884,6 +885,11 @@ withDecompressedSource declaredNarSize compression source consume =
       Right limits ->
         Zstd.withZstdSource limits source consume
           `catch` \zstdErr -> pure (Left (zstdFailure zstdErr))
+    Right CompressionBzip2 -> case bzip2LimitsFor declaredNarSize of
+      Left err -> pure (Left (FatalFailure err))
+      Right limits ->
+        Bzip2.withBzip2Source limits source consume
+          `catch` \bzip2Err -> pure (Left (bzip2Failure bzip2Err))
 
 -- | Classify a decoder failure: a stream error is how truncation and
 -- torn transfers surface, so it retries; output or memory past the
@@ -903,6 +909,14 @@ zstdFailure zstdErr = case zstdErr of
   Zstd.ZstdOutputOverBound _ -> FatalFailure rendered
   where
     rendered = renderZstdError zstdErr
+
+-- | 'xzFailure''s bzip2 counterpart, under the same taxonomy.
+bzip2Failure :: Bzip2.Bzip2Error -> AttemptFailure
+bzip2Failure bzip2Err = case bzip2Err of
+  Bzip2.Bzip2StreamError _ -> TransientFailure rendered
+  Bzip2.Bzip2OutputOverBound _ -> FatalFailure rendered
+  where
+    rendered = renderBzip2Error bzip2Err
 
 -- ---------------------------------------------------------------------------
 -- Pure helpers
@@ -930,14 +944,15 @@ verifySigs cache narInfo =
 -- | The whole-buffer decompressor for a narinfo @Compression@ value,
 -- decided from the narinfo's declared values alone so unsupported
 -- compression rejects before any download.  'CompressionNone' is
--- identity; 'CompressionXz' (cache.nixos.org's format) and
--- 'CompressionZstd' (the modern caches') decompress bounded by the
--- declared NarSize, a signed claim the caller validates before
--- resolving the decompressor.  The resolved function runs in IO
--- because the zstd binding's decoder is IO-native (see
--- 'NovaCache.Zstd'); the strict shape follows its codecs.  Dispatches
--- through 'parseNarCompression' like the streaming path, so the
--- support set exists exactly once.
+-- identity; 'CompressionXz' (cache.nixos.org's format),
+-- 'CompressionZstd' (the modern caches'), and 'CompressionBzip2' (the
+-- historical caches', and what an absent field means) decompress
+-- bounded by the declared NarSize, a signed claim the caller validates
+-- before resolving the decompressor.  The resolved function runs in IO
+-- because the zstd and bzip2 decoders are IO-native (see
+-- 'NovaCache.Zstd' and 'NovaCache.Bzip2'); the strict shape follows its
+-- codecs.  Dispatches through 'parseNarCompression' like the streaming
+-- path, so the support set exists exactly once.
 decompressorFor :: Integer -> Text -> Either Text (BS.ByteString -> IO (Either Text BS.ByteString))
 decompressorFor declaredNarSize compression = do
   kind <- parseNarCompression compression
@@ -949,6 +964,9 @@ decompressorFor declaredNarSize compression = do
     CompressionZstd -> do
       limits <- zstdLimitsFor declaredNarSize
       Right (fmap (either (Left . renderZstdError) Right) . Zstd.decompress limits)
+    CompressionBzip2 -> do
+      limits <- bzip2LimitsFor declaredNarSize
+      Right (fmap (either (Left . renderBzip2Error) Right) . Bzip2.decompress limits)
 
 -- | Decompress NAR data based on the compression type from narinfo,
 -- bounded by the declared NarSize.  Support is decided by
@@ -1003,6 +1021,25 @@ renderZstdError zstdErr = case zstdErr of
   Zstd.ZstdStreamError msg -> "zstd stream error: " <> T.pack msg
   Zstd.ZstdOutputOverBound bound ->
     "zstd output exceeds the declared NarSize (" <> T.pack (show bound) <> " bytes)"
+
+-- | The bounds for one bzip2 decode: output capped at the narinfo's
+-- declared NarSize.  There is no decoder-memory knob to set - bzip2
+-- carries no attacker-chosen dictionary size, so decoder state is a
+-- small constant of the format (see 'NovaCache.Bzip2').  The same
+-- totality guard as 'xzLimitsFor'.
+bzip2LimitsFor :: Integer -> Either Text Bzip2.Bzip2Limits
+bzip2LimitsFor declaredNarSize
+  | declaredNarSize < 0 || declaredNarSize > toInteger (maxBound :: Word64) =
+      Left ("bzip2 decompression bound out of range: " <> T.pack (show declaredNarSize))
+  | otherwise = Right Bzip2.Bzip2Limits {Bzip2.bzip2MaxOutputBytes = fromInteger declaredNarSize}
+
+-- | One 'Bzip2.Bzip2Error' in the register the other substitution
+-- errors use.
+renderBzip2Error :: Bzip2.Bzip2Error -> Text
+renderBzip2Error bzip2Err = case bzip2Err of
+  Bzip2.Bzip2StreamError msg -> "bzip2 stream error: " <> T.pack msg
+  Bzip2.Bzip2OutputOverBound bound ->
+    "bzip2 output exceeds the declared NarSize (" <> T.pack (show bound) <> " bytes)"
 
 -- | Parse narinfo references (store path basenames, e.g.
 -- @abc...-glibc-2.40@) into StorePaths.  A malformed token is an error,

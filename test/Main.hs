@@ -3086,13 +3086,37 @@ testSubstituter = do
         let input = "fake nar data"
          in assertEqual "decompress-none" (Right input) <$> Subst.decompressNar (toInteger (BS.length input)) "none" input,
       -- decompressNar: an empty Compression field means bzip2 upstream
-      -- (the field's historical default), never identity; the
-      -- rejection names the codec upstream would decode.
-      runTestM "decompressNar empty means bzip2" $ do
-        result <- Subst.decompressNar 4 "" "data"
-        pure $ case result of
-          Left err | "bzip2" `T.isInfixOf` err -> Pass
-          other -> Fail ("expected bzip2 rejection, got: " <> T.pack (show other)),
+      -- (the field's historical default), never identity, so the empty
+      -- spelling must decode a real bzip2 body exactly as the named
+      -- one does.
+      runTestM "decompressNar empty means bzip2" $
+        case B64.decode bzip2FixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            out <- Subst.decompressNar xzFixtureSize "" compressed
+            pure $ case out of
+              Right decoded -> assertEqual "empty-is-bzip2" xzFixturePayload decoded
+              Left err -> Fail ("empty Compression failed to decode as bzip2: " <> err),
+      -- decompressNar: bzip2 decodes under the same declared-NarSize
+      -- bound as the other codecs; the fixture comes from the bzip2
+      -- CLI, so the decoder is checked against the format's own
+      -- reference encoder rather than its own library.
+      runTestM "decompressNar bzip2 bounded roundtrip" $
+        case B64.decode bzip2FixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            out <- Subst.decompressNar xzFixtureSize "bzip2" compressed
+            pure $ case out of
+              Right decoded -> assertEqual "bzip2-roundtrip" xzFixturePayload decoded
+              Left err -> Fail ("bzip2 roundtrip failed: " <> err),
+      runTestM "decompressNar bzip2 over-bound rejects" $
+        case B64.decode bzip2FixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            out <- Subst.decompressNar (xzFixtureSize - 1) "bzip2" compressed
+            pure $ case out of
+              Left err | "NarSize" `T.isInfixOf` err -> Pass
+              other -> Fail ("expected over-bound rejection, got: " <> T.pack (show other)),
       -- decompressNar: xz decodes under the declared-NarSize bound
       -- (the fixture is a real 112-byte xz stream of 1792 payload
       -- bytes, embedded base64 to keep the source ASCII).
@@ -3474,10 +3498,10 @@ testSubstituter = do
               then Pass
               else Fail ("unexpected ceilings: " <> T.pack (show (smallCeiling, largeCeiling))),
       -- The zstd mirror of the xz hostile trio: over-bound output is
-      -- deterministic, a corrupt frame retries.  Truncation is NOT an
-      -- error at this layer for zstd (truncated input yields truncated
-      -- output by design); the pipeline test below pins that the NAR
-      -- layer catches it.
+      -- deterministic, while a corrupt frame and a frame cut off
+      -- mid-way both retry - the codec judges end of input by
+      -- libzstd's own frame-boundary signal, so truncation refuses
+      -- here instead of yielding a short output.
       runTestM "withDecompressedSource zstd over-bound is fatal" $ do
         source <- chunkReader (streamChunks 7 zstdFixtureCompressed)
         result <- Subst.withDecompressedSource (xzFixtureSize - 1) "zstd" source drainChunkSource
@@ -3490,9 +3514,15 @@ testSubstituter = do
         pure $ case result of
           Left (Subst.TransientFailure _) -> Pass
           other -> Fail ("expected transient stream error, got: " <> T.pack (show (void other))),
-      -- A truncated zstd body decompresses to a truncated NAR, so the
-      -- completeness arbiter is the NAR grammar above the codec: the
-      -- pipeline must land it in the Left channel as retryable.
+      runTestM "withDecompressedSource zstd truncated is transient" $ do
+        source <- chunkReader (streamChunks 7 (BS.take (BS.length zstdFixtureCompressed - 8) zstdFixtureCompressed))
+        result <- Subst.withDecompressedSource xzFixtureSize "zstd" source drainChunkSource
+        pure $ case result of
+          Left (Subst.TransientFailure _) -> Pass
+          other -> Fail ("expected transient truncation, got: " <> T.pack (show (void other))),
+      -- The codec refuses a truncated frame, and the whole pipeline
+      -- must carry that refusal into the Left channel as retryable
+      -- rather than let a short NAR reach the store.
       runTestM "zstd truncated body fails the pipeline as transient" $ do
         tmpBase <- getTemporaryDirectory
         let tmpDir = tmpBase </> "nova-nix-test-zstd-trunc"
@@ -3508,9 +3538,78 @@ testSubstituter = do
           Left (Subst.TransientFailure _) -> Pass
           Left (Subst.FatalFailure err) -> Fail ("zstd truncation classified fatal: " <> err)
           Right _ -> Fail "truncated zstd body was accepted",
+      -- The bzip2 mirror of the xz hostile trio, over a fixture the
+      -- bzip2 CLI produced: over-bound output is deterministic, while
+      -- garbage and a truncated stream retry.
+      runTestM "withDecompressedSource bzip2 chunked roundtrip" $
+        case B64.decode bzip2FixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            source <- chunkReader (streamChunks 7 compressed)
+            result <- Subst.withDecompressedSource xzFixtureSize "bzip2" source $ \pull ->
+              let go acc = do
+                    chunk <- pull
+                    if BS.null chunk
+                      then pure (Right (BS.concat (reverse acc)))
+                      else go (chunk : acc)
+               in go []
+            pure $ case result of
+              Right out | out == xzFixturePayload -> Pass
+              other -> Fail ("bzip2 source roundtrip diverged: " <> T.pack (show (fmap BS.length other))),
+      runTestM "withDecompressedSource bzip2 over-bound is fatal" $
+        case B64.decode bzip2FixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            source <- chunkReader (streamChunks 7 compressed)
+            result <- Subst.withDecompressedSource (xzFixtureSize - 1) "bzip2" source drainChunkSource
+            pure $ case result of
+              Left (Subst.FatalFailure err) | "NarSize" `T.isInfixOf` err -> Pass
+              other -> Fail ("expected fatal over-bound, got: " <> T.pack (show (void other))),
+      runTestM "withDecompressedSource bzip2 garbage is transient" $ do
+        source <- chunkReader ["not a bzip2 stream"]
+        result <- Subst.withDecompressedSource 64 "bzip2" source drainChunkSource
+        pure $ case result of
+          Left (Subst.TransientFailure _) -> Pass
+          other -> Fail ("expected transient stream error, got: " <> T.pack (show (void other))),
+      runTestM "withDecompressedSource bzip2 truncated is transient" $
+        case B64.decode bzip2FixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            source <- chunkReader (streamChunks 7 (BS.take (BS.length compressed - 8) compressed))
+            result <- Subst.withDecompressedSource xzFixtureSize "bzip2" source drainChunkSource
+            pure $ case result of
+              Left (Subst.TransientFailure _) -> Pass
+              other -> Fail ("expected transient truncation, got: " <> T.pack (show (void other))),
+      -- A bzip2-compressed NAR through the whole post-download
+      -- pipeline: the format the historical caches serve decompresses,
+      -- hashes, parses, and materializes in one bounded pass.
+      runTestM "bzip2 NAR streams through the pipeline" $
+        case B64.decode bzip2NarFixtureB64 of
+          Left err -> pure (Fail ("fixture base64 does not decode: " <> T.pack err))
+          Right compressed -> do
+            tmpBase <- getTemporaryDirectory
+            let tmpDir = tmpBase </> "nova-nix-test-bzip2-pipeline"
+                destPath = tmpDir </> "out"
+            forceRemoveIfExists tmpDir
+            createDirectoryIfMissing True tmpDir
+            source <- chunkReader (streamChunks 7 compressed)
+            result <-
+              Subst.withDecompressedSource (toInteger (BS.length bzip2NarFixture)) "bzip2" source $
+                Subst.consumeNarStream
+                  destPath
+                  ((streamTestNarInfo bzip2NarFixture) {NarInfo.niCompression = "bzip2"})
+                  (CHash.hashBytes bzip2NarFixture)
+            materialized <- Dir.doesFileExist (destPath </> "greeting")
+            forceRemoveIfExists tmpDir
+            pure $ case result of
+              Left err -> Fail ("bzip2 pipeline failed: " <> Subst.attemptFailureMessage err)
+              Right narBytes
+                | narBytes /= BS.length bzip2NarFixture -> Fail "bzip2 pipeline counted the wrong NAR size"
+                | not materialized -> Fail "bzip2 pipeline left no tree at the destination"
+                | otherwise -> Pass,
       runTest "streaming compression support matches the strict set" $
-        case (Subst.streamingDecompressionSupported "xz", Subst.streamingDecompressionSupported "zstd", Subst.streamingDecompressionSupported "bzip2") of
-          (Right (), Right (), Left _) -> Pass
+        case (Subst.streamingDecompressionSupported "xz", Subst.streamingDecompressionSupported "zstd", Subst.streamingDecompressionSupported "bzip2", Subst.streamingDecompressionSupported "brotli") of
+          (Right (), Right (), Right (), Left _) -> Pass
           other -> Fail ("unexpected support set: " <> T.pack (show other)),
       -- The support set is encoded twice - the strict decompressor and
       -- the streaming decision - so their agreement is pinned across
@@ -4022,6 +4121,21 @@ testSubstituter = do
     -- The xz fixture's payload, compressed by nova-cache:zstandard's
     -- own encoder - the exact pairing the push path ships.
     zstdFixtureCompressed = CZstd.compress CZstd.defaultCompressionLevel xzFixturePayload
+    -- The same payload compressed by the bzip2 CLI (bzip2 -9),
+    -- embedded base64 so the test source stays ASCII.  The reference
+    -- encoder is deliberately the format's own tool and not the
+    -- decoder's library: nova-cache:bzip2 decodes only, so a
+    -- self-produced fixture could not catch the two disagreeing.
+    bzip2FixtureB64 =
+      "QlpoOTFBWSZTWTop7coAAf/RgAAQQAInJddwIACQKZMTIMjAqqBkDaJtTgCQKgZA5AyBAFwNwMAeAYAgCQLgXA+AoBUCQIAkCAJAUAgCgH4u5IpwoSB0U9uU" :: Text
+    -- A NAR every platform materializes identically (no executable
+    -- bit, no separator-bearing symlink target), and the bzip2 CLI's
+    -- compression of exactly these bytes.
+    bzip2NarFixture =
+      NAR.serialise
+        (NAR.NarDirectory [("greeting", NAR.NarRegular False "nova-nix bzip2 fixture\n")])
+    bzip2NarFixtureB64 =
+      "QlpoOTFBWSZTWa3VDM4AAFJ5gG7yAIBAYjAAP+ffcCAAlIaTJM1PUnqD1DJpoHo01BkkA9I0AAAAtARwcfWQAq1WLMjpmBpVKUAJM6EA8IDQEABOzcRgdDpvigJ6ZZa760fpxZtj+ts6GDiuqt/B6UuthWIrabWmZTkFlI46C8MmbMoVmMYwEYRUCYQW/F3JFOFCQrdUMzg=" :: Text
 
 -- ---------------------------------------------------------------------------
 -- Tests: per-store-path locks (the substitution race)
