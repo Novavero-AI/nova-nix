@@ -4033,6 +4033,13 @@ testSubstituter = do
 raceWatchdogMicros :: Int
 raceWatchdogMicros = 30 * 1000000
 
+-- | How long a delete gets to (wrongly) finish while the path lock is
+-- held elsewhere: long enough that an unlocked delete of one tiny tree
+-- always completes inside it, while a correctly blocked delete waits
+-- until the release that follows the probe.
+deleteLockProbeMicros :: Int
+deleteLockProbeMicros = 500 * 1000
+
 testPathLocks :: IO [Bool]
 testPathLocks = do
   putStrLn "store/path-locks"
@@ -6252,7 +6259,75 @@ testStoreDelete = do
                 ]
            in case [t | t <- refused, either (const False) (const True) (resolveDeleteTarget sd t)] of
                 [] -> Pass
-                accepted -> Fail ("accepted: " <> T.pack (show accepted))
+                accepted -> Fail ("accepted: " <> T.pack (show accepted)),
+        -- Lock files are never deleted (the Nix.Store.Lock design), but
+        -- names like flake.lock are legal store-path names, so only the
+        -- registration rows can tell a lock file from a store object:
+        -- an unregistered lock-shaped file refuses, a registered object
+        -- of the same shape deletes, and lock-shaped junk whose
+        -- stripped prefix is not a store basename deletes as junk.
+        runTestM "delete refuses an unregistered lock file by name" $ do
+          let guarded = StorePath (T.replicate 32 "j") "del-guard"
+              lockBase = basenameOf guarded <> ".lock"
+              lockPath = storePathToFilePath sd guarded <> ".lock"
+          TIO.writeFile lockPath ""
+          outcome <- deleteStorePathRaw store lockBase
+          survived <- Dir.doesPathExist lockPath
+          pure $ case outcome of
+            Left err
+              | "never deleted" `T.isInfixOf` err ->
+                  if survived then Pass else Fail "lock file removed despite refusal"
+              | otherwise -> Fail ("wrong refusal: " <> err)
+            Right _ -> Fail "unregistered lock file was deleted",
+        runTestM "delete removes a registered store object named like a lock file" $ do
+          let object = StorePath (T.replicate 32 "k") "flake.lock"
+              objectPath = storePathToFilePath sd object
+          registerPath (stDB store) (PathRegistration object "sha256:m" 1 Nothing [])
+          TIO.writeFile objectPath "pinned inputs"
+          outcome <- deleteStorePathRaw store (basenameOf object)
+          gone <- not <$> Dir.doesPathExist objectPath
+          pure $ case outcome of
+            Right removed
+              | doRowRemoved removed, doTreeRemoved removed, gone -> Pass
+              | otherwise -> Fail ("wrong outcome: " <> T.pack (show removed))
+            Left err -> Fail ("registered .lock-named object refused: " <> err),
+        runTestM "delete removes lock-shaped junk with no store-shaped prefix" $ do
+          let junkName = "not-a-store-path.lock"
+              junkPath = unStoreDir sd </> T.unpack junkName
+          TIO.writeFile junkPath "debris"
+          outcome <- deleteStorePathRaw store junkName
+          gone <- not <$> Dir.doesPathExist junkPath
+          pure $ case outcome of
+            Right removed
+              | doTreeRemoved removed, gone -> Pass
+              | otherwise -> Fail ("wrong outcome: " <> T.pack (show removed))
+            Left err -> Fail ("lock-shaped junk refused: " <> err),
+        -- Deletion and substitution contend on one per-path lock: a
+        -- delete must wait while another handle holds the path's lock -
+        -- otherwise it can tear a tree out between a substituter's
+        -- on-disk recheck and its registration commit - and proceed
+        -- once the holder releases.
+        runTestM "delete waits for a held path lock and proceeds on release" $ do
+          let guarded = StorePath (T.replicate 32 "i") "del-locked"
+              treePath = storePathToFilePath sd guarded
+          registerPath (stDB store) (PathRegistration guarded "sha256:l" 1 Nothing [])
+          createDirectoryIfMissing True treePath
+          TIO.writeFile (treePath </> "data.txt") "guarded"
+          holder <- acquirePathLock sd guarded
+          done <- newEmptyMVar
+          _ <- forkIO (deleteStorePathRaw store (basenameOf guarded) >>= putMVar done)
+          early <- timeout deleteLockProbeMicros (takeMVar done)
+          releasePathLock holder
+          outcome <- timeout raceWatchdogMicros (takeMVar done)
+          gone <- not <$> Dir.doesPathExist treePath
+          pure $ case (early, outcome) of
+            (Just finished, _) ->
+              Fail ("delete ignored the held lock: " <> T.pack (show finished))
+            (Nothing, Just (Right removed))
+              | doRowRemoved removed, doTreeRemoved removed, gone -> Pass
+              | otherwise -> Fail ("wrong outcome after release: " <> T.pack (show removed))
+            (Nothing, other) ->
+              Fail ("delete never completed after release: " <> T.pack (show other))
       ]
 
 testStoreOps :: IO [Bool]
