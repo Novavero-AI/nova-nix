@@ -188,10 +188,10 @@ main = do
   dataDir <- getDataDir
   opts <- either (failWith . T.pack) pure (parseArgs args)
   case optCommand opts of
-    CmdEvalFile filePath -> evalFile (optStrict opts) (optNixPaths opts) dataDir filePath
+    CmdEvalFile filePath -> evalFile (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir filePath
     CmdEvalExpr expr
-      | optAterm opts -> evalExprAterm (optNixPaths opts) dataDir expr
-      | otherwise -> evalExpr (optStrict opts) (optNixPaths opts) dataDir expr
+      | optAterm opts -> evalExprAterm (chosenStoreDir opts) (optNixPaths opts) dataDir expr
+      | otherwise -> evalExpr (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir expr
     CmdBuild filePath -> buildFile opts dataDir filePath
     CmdPush pushArgs -> pushCommand opts pushArgs
     CmdStoreDelete paths -> storeDeleteCommand opts paths
@@ -236,15 +236,15 @@ readSourceFile rawPath = do
     Right ok -> pure ok
 
 -- | Evaluate a .nix file and print the result.
-evalFile :: Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
-evalFile strict extraPaths dataDir rawFilePath = do
+evalFile :: StoreDir -> Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
+evalFile storeDir strict extraPaths dataDir rawFilePath = do
   (filePath, source) <- readSourceFile rawFilePath
   case parseNix (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st0 <- newEvalState (takeDirectory filePath)
+      st0 <- newEvalState storeDir (takeDirectory filePath)
       let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
           st = st0 {esSearchPaths = searchPaths}
       result <-
@@ -257,15 +257,15 @@ evalFile strict extraPaths dataDir rawFilePath = do
         Right forced -> TIO.putStrLn (prettyValue forced)
 
 -- | Evaluate an inline expression and print the result.
-evalExpr :: Bool -> [T.Text] -> FilePath -> T.Text -> IO ()
-evalExpr strict extraPaths dataDir source = do
+evalExpr :: StoreDir -> Bool -> [T.Text] -> FilePath -> T.Text -> IO ()
+evalExpr storeDir strict extraPaths dataDir source = do
   case parseNix "<expr>" source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
       cwd <- getCurrentDirectory
-      st0 <- newEvalState cwd
+      st0 <- newEvalState storeDir cwd
       let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
           st = st0 {esSearchPaths = searchPaths}
       result <-
@@ -279,15 +279,15 @@ evalExpr strict extraPaths dataDir source = do
 
 -- | Evaluate an inline expression to a derivation and print its ATerm (.drv
 -- contents), for diffing nova-nix's serialization against upstream Nix.
-evalExprAterm :: [T.Text] -> FilePath -> T.Text -> IO ()
-evalExprAterm extraPaths dataDir source =
+evalExprAterm :: StoreDir -> [T.Text] -> FilePath -> T.Text -> IO ()
+evalExprAterm storeDir extraPaths dataDir source =
   case parseNix "<expr>" source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
       cwd <- getCurrentDirectory
-      st0 <- newEvalState cwd
+      st0 <- newEvalState storeDir cwd
       let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
           st = st0 {esSearchPaths = searchPaths}
       result <- runEvalIO st $ do
@@ -313,6 +313,7 @@ evalExprAterm extraPaths dataDir source =
 -- The file argument is canonicalized for the same reason as in 'evalFile'.
 buildFile :: CliOpts -> FilePath -> FilePath -> IO ()
 buildFile opts dataDir rawFilePath = do
+  let storeDir = chosenStoreDir opts
   caches <- either failWith pure (substituterConfig (optSubstituter opts) (optTrustedKey opts))
   (filePath, source) <- readSourceFile rawFilePath
   case parseNix (T.pack filePath) source of
@@ -320,7 +321,7 @@ buildFile opts dataDir rawFilePath = do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st0 <- newEvalState (takeDirectory filePath)
+      st0 <- newEvalState storeDir (takeDirectory filePath)
       let searchPaths = mergeSearchPaths (optNixPaths opts) dataDir (esSearchPaths st0)
           st = st0 {esSearchPaths = searchPaths}
       result <- runEvalIO st $ do

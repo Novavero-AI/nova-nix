@@ -119,14 +119,18 @@ data EvalState = EvalState
     -- literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text Text)),
     esBaseDir :: !FilePath,
+    -- | Where store objects live on this machine, so eval's own reads and
+    -- writes honor @--store@ the same way the builder does.
+    esStoreDir :: !SP.StoreDir,
     esTimestamp :: !Int64,
     esSearchPaths :: ![Thunk]
   }
 
--- | Create a fresh evaluation state rooted at the given directory.
+-- | Create a fresh evaluation state rooted at the given directory, reading
+-- and writing store objects under the given store directory.
 -- Reads @NIX_PATH@ from the environment to populate search paths.
-newEvalState :: FilePath -> IO EvalState
-newEvalState baseDir = do
+newEvalState :: SP.StoreDir -> FilePath -> IO EvalState
+newEvalState storeDir baseDir = do
   cache <- newIORef Map.empty
   drvCache <- newIORef Map.empty
   drvClosure <- newIORef Map.empty
@@ -143,6 +147,7 @@ newEvalState baseDir = do
         esDrvClosure = drvClosure,
         esSourcePathCache = srcCache,
         esBaseDir = baseDir,
+        esStoreDir = storeDir,
         esTimestamp = now,
         esSearchPaths = searchPaths
       }
@@ -245,7 +250,7 @@ instance MonadEval EvalIO where
   -- values keep arbitrary bytes).  Any failure - absent file, malformed ATerm
   -- - is 'Nothing', which the caller turns into a loud modulo-hash error.
   readStoreDerivation sp = EvalIO $ do
-    let filePath = platformFilePath sp
+    filePath <- asks ((`storeFilePath` sp) . esStoreDir)
     result <- liftIO (try (BS.readFile filePath) :: IO (Either SomeException BS.ByteString))
     pure $ case result of
       Left _ -> Nothing
@@ -296,8 +301,8 @@ instance MonadEval EvalIO where
     -- (which would CRLF-translate on Windows and store bytes that no
     -- longer match the hash that named the path).
     sp <- storePathOrThrow "builtins.toFile" (makeTextPath name (sha256Digest contents) refs)
-    let filePath = platformFilePath sp
-        storePath = canonicalStorePathText sp
+    filePath <- evalFilePath sp
+    let storePath = canonicalStorePathText sp
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)
       BS.writeFile filePath contents
@@ -381,8 +386,8 @@ instance MonadEval EvalIO where
               )
       _ -> pure ()
     sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
-    let destFilePath = platformFilePath sp
-        destPath = canonicalStorePathText sp
+    destFilePath <- evalFilePath sp
+    let destPath = canonicalStorePathText sp
     wrapIO (copyToStoreIfMissing (SP.storeTextToFilePath srcPath) destFilePath (takeDirectory destFilePath))
     pure destPath
 
@@ -398,8 +403,8 @@ instance MonadEval EvalIO where
       Left err -> throwEvalError ("builtins.path: internal NAR round-trip error: " <> T.pack err)
       Right entry -> do
         sp <- storePathOrThrow "builtins.path" (makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes))
-        let destFilePath = platformFilePath sp
-            destPath = canonicalStorePathText sp
+        destFilePath <- evalFilePath sp
+        let destPath = canonicalStorePathText sp
         wrapIO $ do
           alreadyThere <- Dir.doesPathExist destFilePath
           unless alreadyThere $ do
@@ -412,8 +417,8 @@ instance MonadEval EvalIO where
     -- Canonical fixed-output path: a sha256-pinned fetch must land at the same
     -- store path C++ Nix computes, so it stays reproducible and cache-compatible.
     sp <- storePathOrThrow "builtins.fetchurl" (makeFixedOutputPath name "sha256" "flat" (sha256Digest bytes))
-    let filePath = platformFilePath sp
-        storePath = canonicalStorePathText sp
+    filePath <- evalFilePath sp
+    let storePath = canonicalStorePathText sp
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)
       BS.writeFile filePath bytes
@@ -560,12 +565,16 @@ scratchSuffixBytes = 16
 -- Helpers
 -- ---------------------------------------------------------------------------
 
--- | Where a store path lives on this machine: the platform store dir
+-- | Where a store path lives on this machine: this evaluation's store dir
 -- mapped to a filesystem path.  Every eval-time read and write of a
 -- store object resolves through this, landing in the same store the
 -- builder and CLI operate on.
-platformFilePath :: SP.StorePath -> FilePath
-platformFilePath = SP.storePathToFilePath SP.platformStoreDir
+storeFilePath :: SP.StoreDir -> SP.StorePath -> FilePath
+storeFilePath = SP.storePathToFilePath
+
+-- | 'storeFilePath' against the store this evaluation was given.
+evalFilePath :: SP.StorePath -> EvalIO FilePath
+evalFilePath sp = EvalIO (asks ((`storeFilePath` sp) . esStoreDir))
 
 -- | A store path's identity: the canonical @/nix/store@ spelling every
 -- platform shares.  Hashes and eval-visible strings carry this form; it
