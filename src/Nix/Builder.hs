@@ -70,7 +70,7 @@ import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
 import Nix.Store (PathLock, PathRegistration, Store (..), isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
-import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), storePathToFilePath)
+import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), defaultStoreDirText, storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), catchSync, trySubstitute)
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
@@ -236,9 +236,10 @@ buildDerivationInner config store drv = do
           _ -> case decodeBuilderStrings drv of
             Left errMsg -> pure (Left (1, errMsg))
             Right (builderText, argTexts, decodedEnv) ->
-              let builderPath = T.unpack builderText
-                  environ = buildEnvironment config decodedEnv builderPath buildDir outputDirs
-                  builderArgs = map T.unpack argTexts
+              let rewrite = onStore config
+                  builderPath = T.unpack (onStore config builderText)
+                  environ = buildEnvironment config (Map.map rewrite decodedEnv) builderPath buildDir outputDirs
+                  builderArgs = map (T.unpack . rewrite) argTexts
                in -- 5. Run the builder
                   runBuilder builderPath builderArgs environ buildDir
         case exitResult of
@@ -276,6 +277,16 @@ decodeBuilderStrings drv = do
 -- ---------------------------------------------------------------------------
 -- Input validation
 -- ---------------------------------------------------------------------------
+
+-- | Rewrite a derivation string's store paths from their identity (the
+-- canonical @\/nix\/store@ spelling) to where this machine actually keeps
+-- them, at the spawn boundary. A no-op when the two coincide.
+onStore :: BuildConfig -> Text -> Text
+onStore config
+  | storeDirText == defaultStoreDirText = id
+  | otherwise = T.replace (defaultStoreDirText <> "/") (storeDirText <> "/")
+  where
+    storeDirText = T.pack (unStoreDir (bcStoreDir config))
 
 -- | Check that all inputs needed to build a derivation are present in the store.
 --
