@@ -8,7 +8,7 @@ import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, bracket_, evaluate, try)
+import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket_, evaluate, fromException, throwIO, try)
 import Control.Monad (filterM, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
@@ -3645,6 +3645,44 @@ testSubstituter = do
           Subst.SubstError err
             | "https://b" `T.isPrefixOf` err && "first" `T.isSuffixOf` err -> Pass
           other -> Fail ("expected tagged first error, got " <> T.pack (show other)),
+      -- catchSync (the split every attempt wraps itself in): a
+      -- synchronous exception folds into SubstError and the scan falls
+      -- through to the next cache
+      runTestM "catchSync folds sync exception into SubstError" $ do
+        let attempt cache =
+              Subst.catchSync
+                ( if Subst.ccUrl cache == "https://a"
+                    then throwIO (ErrorCall "disk full")
+                    else pure Subst.SubstNotFound
+                )
+                (pure . Subst.SubstError . T.pack . show)
+        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"]
+        pure $ case result of
+          Subst.SubstError err
+            | "disk full" `T.isInfixOf` err -> Pass
+          other -> Fail ("expected SubstError from sync exception, got " <> T.pack (show other)),
+      -- catchSync: an asynchronous exception thrown mid-attempt
+      -- propagates out of the cache scan instead of folding into
+      -- SubstError - cancellation must abort substitution, never be
+      -- spent as fallthrough to the next cache or to a local build
+      runTestM "catchSync propagates async exception out of the scan" $ do
+        scanned <- newIORef (0 :: Int)
+        let attempt _ =
+              Subst.catchSync
+                ( do
+                    atomicModifyIORef' scanned (\n -> (n + 1, ()))
+                    throwIO (asyncExceptionToException (ErrorCall "cancelled"))
+                )
+                (pure . Subst.SubstError . T.pack . show)
+        outcome <- try (Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"])
+        made <- readIORef scanned
+        pure $ case (outcome :: Either SomeException Subst.SubstResult) of
+          Left escaped -> case fromException escaped of
+            Just (SomeAsyncException _)
+              | made == 1 -> Pass
+              | otherwise -> Fail ("scan continued past the interrupt: " <> T.pack (show made) <> " attempts")
+            Nothing -> Fail ("wrong exception escaped: " <> T.pack (show escaped))
+          Right result -> Fail ("async exception folded into " <> T.pack (show result)),
       -- clearStaleDestination: removes a read-only leftover tree (the
       -- crash-between-unpack-and-register wedge)
       runTestM "clearStaleDestination removes read-only leftovers" $ do

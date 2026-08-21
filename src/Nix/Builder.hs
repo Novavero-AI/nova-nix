@@ -71,7 +71,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
 import Nix.Store (PathLock, PathRegistration, Store (..), isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), storePathToFilePath)
-import Nix.Substituter (CacheConfig, SubstResult (..), trySubstitute)
+import Nix.Substituter (CacheConfig, SubstResult (..), catchSync, trySubstitute)
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
 import qualified System.Environment
@@ -196,14 +196,13 @@ data BuildResult
 -- 4. Run the builder process
 -- 5. On success: scan references, move outputs to store, register
 -- 6. On failure: clean up and report error
--- 7. Exception safety: wrap in try, convert to BuildFailure
+-- 7. Exception safety: synchronous exceptions convert to BuildFailure;
+--    asynchronous exceptions propagate ('catchSync') - an interrupt
+--    must abort the build, never be reported as a build failure.
 buildDerivation :: BuildConfig -> Store -> Derivation -> IO BuildResult
-buildDerivation config store drv = do
-  result <- try (buildDerivationInner config store drv)
-  case result of
-    Right buildResult -> pure buildResult
-    Left (err :: SomeException) ->
-      pure (BuildFailure ("build exception: " <> T.pack (show err)) 1)
+buildDerivation config store drv =
+  buildDerivationInner config store drv
+    `catchSync` \err -> pure (BuildFailure ("build exception: " <> T.pack (show err)) 1)
 
 buildDerivationInner :: BuildConfig -> Store -> Derivation -> IO BuildResult
 buildDerivationInner config store drv = do

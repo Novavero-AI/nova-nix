@@ -52,6 +52,7 @@ module Nix.Substituter
     -- * Failure classification
     AttemptFailure (..),
     attemptFailureMessage,
+    catchSync,
     httpStatusFailure,
     compressedBodyCeiling,
     downloadCapFor,
@@ -84,7 +85,7 @@ where
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
-import Control.Exception (Exception, SomeAsyncException (..), SomeException, catch, fromException, onException, throwIO, try)
+import Control.Exception (Exception, SomeAsyncException (..), SomeException, catch, fromException, onException, throwIO)
 import Control.Monad (void)
 import qualified Data.ByteString as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -221,14 +222,15 @@ tryCachesWith attempt = go Nothing
         SubstNotFound -> go firstErr rest
         SubstError err -> go (firstErr <|> Just (ccUrl cache <> ": " <> err)) rest
 
--- | Attempt substitution from a single cache, catching all exceptions.
+-- | Attempt substitution from a single cache.  Synchronous exceptions
+-- become 'SubstError', so the scan falls through to the remaining
+-- caches; asynchronous exceptions propagate ('catchSync') - an
+-- interrupt mid-download must abort the scan, never continue to the
+-- next cache and from there to a local build.
 tryOneCache :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
-tryOneCache mgr store cache sp lock = do
-  result <- try (substituteFromCache mgr store cache sp lock)
-  case result of
-    Left (err :: SomeException) ->
-      pure (SubstError ("substitution exception: " <> T.pack (show err)))
-    Right substResult -> pure substResult
+tryOneCache mgr store cache sp lock =
+  substituteFromCache mgr store cache sp lock
+    `catchSync` \err -> pure (SubstError ("substitution exception: " <> T.pack (show err)))
 
 -- | Substitution pipeline for a single cache.
 --
@@ -346,9 +348,14 @@ unpackAndVerify store sp narInfo rawNar =
         then pure SubstAlreadyValid
         else do
           let destPath = storePathToFilePath (stDir store) sp
-          unpackResult <- try $ do
-            clearStaleDestination destPath
-            unpackNarEntry destPath narEntry
+          unpackResult <-
+            fmap
+              Right
+              ( do
+                  clearStaleDestination destPath
+                  unpackNarEntry destPath narEntry
+              )
+              `catchSync` (pure . Left)
           case (unpackResult :: Either SomeException (Either Text ())) of
             Left err -> pure (SubstError ("unpack failed: " <> T.pack (show err)))
             Right (Left err) -> pure (SubstError ("unpack failed: " <> err))
@@ -574,16 +581,28 @@ newtype StreamAbort = StreamAbort Text
 
 instance Exception StreamAbort
 
+-- | Run an action, passing only synchronous exceptions to the handler.
+-- Asynchronous exceptions (a Ctrl-C, a timeout) re-throw untouched: an
+-- interrupt converted into a recoverable failure would be spent as
+-- retry budget, as fallthrough to the next cache, or as a local build
+-- instead of aborting.  Every catch-all on the substitution and build
+-- paths goes through this one split.
+catchSync :: IO a -> (SomeException -> IO a) -> IO a
+catchSync action handler = action `catch` classify
+  where
+    classify someErr
+      | Just (SomeAsyncException _) <- fromException someErr = throwIO someErr
+      | otherwise = handler someErr
+
 -- | Convert synchronous exceptions from one download attempt into the
 -- pipeline's failure channel, so the retry budget governs them and the
 -- caller's cleanup contract holds on every exit.  Asynchronous
--- exceptions (cancellation) re-throw untouched: an interrupt must
+-- exceptions re-throw untouched ('catchSync'): an interrupt must
 -- never be spent as retry budget.
 tryAttempt :: IO (Either AttemptFailure a) -> IO (Either AttemptFailure a)
-tryAttempt action = action `catch` handler
+tryAttempt action = action `catchSync` handler
   where
     handler someErr
-      | Just (SomeAsyncException _) <- fromException someErr = throwIO someErr
       | Just (StreamAbort msg) <- fromException someErr =
           -- A body past its ceiling: the cap derives from the signed
           -- NarSize, so a longer body is the server misdeclaring, not
