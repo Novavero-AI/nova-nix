@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # No base-branch filter on pull_request: a stacked PR bases on its
+  # predecessor, not main, and a [main] filter leaves it checkless -
+  # unmergeable under branch protection's required contexts.
   pull_request:
-    branches: [main]
   workflow_call:
 
 env:

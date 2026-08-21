@@ -26,8 +26,9 @@ on:
       - "nova-nix.cabal"
       - ".github/workflows/parity.yml"
       - ".github/parity/**"
+  # No base-branch filter: stacked PRs base on each other, and a filter
+  # keeps them checkless (see ci.yml).  The path filter still applies.
   pull_request:
-    branches: [main]
     paths:
       - "src/**"
       - "cbits/**"
