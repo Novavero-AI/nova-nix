@@ -62,6 +62,12 @@ module Nix.Eval
     checkGitRef,
     checkGitRev,
 
+    -- * Remembered fetches (pure, exported for tests)
+    FetchCache (..),
+    fetchCacheKey,
+    encodeFetchCache,
+    decodeFetchCache,
+
     -- * Builtin registry
     BuiltinDef (..),
     builtinRegistry,
@@ -3585,49 +3591,70 @@ fetchGit rawUrl name mRef mRev submodules shallow =
   case (,,) <$> checkGitUrl rawUrl <*> traverse checkGitRef mRef <*> traverse checkGitRev mRev of
     Left err -> throwEvalError err
     Right (url, checkedRef, checkedRev) -> do
-      cloneDir <- createScratchDir "nova-nix-fetchgit-"
-      let ctx = "builtins.fetchGit"
-          git = gitRun ctx cloneDir
-          depthArgs = if shallow then ["--depth", "1"] else []
-          refArg = fromMaybe defaultFetchRef checkedRef
-          checkoutTarget = fromMaybe fetchHeadRef checkedRev
-      _ <- git ["init", "--quiet", "."]
-      _ <- git ["remote", "add", "origin", "--", url]
-      -- @--@ before the remote: git keeps parsing options after it, so
-      -- without a separator a refspec is indistinguishable from a flag.
-      _ <- git (["fetch", "--quiet"] ++ depthArgs ++ ["--", "origin", refArg])
-      -- Trailing @--@, not leading: @git checkout -- X@ reads X as a
-      -- pathspec, the opposite of what a leading separator means elsewhere.
-      _ <- git ["checkout", "--quiet", checkoutTarget, "--"]
-      when submodules $
-        void (git ["submodule", "update", "--init", "--recursive"])
-      markExecutablesFromIndex ctx cloneDir
-      rev <- git ["rev-parse", "HEAD"]
-      revCountText <- git ["rev-list", "--count", "HEAD"]
-      lastModifiedText <- git ["show", "-s", "--format=%ct", "HEAD"]
-      removeGitMetadata ctx cloneDir
-      storePath <- copyPathToStore cloneDir name Nothing
-      narHash <- narHashOfPath cloneDir
-      removeScratchDir cloneDir
-      revCount <- decodeDecimal ctx revCountText
-      lastModified <- decodeDecimal ctx lastModifiedText
-      let lastModifiedDate =
-            T.pack (formatTime defaultTimeLocale "%Y%m%d%H%M%S" (posixSecondsToUTCTime (fromIntegral lastModified)))
-      pure
-        ( VAttrs
-            ( attrSetFromMap $
-                Map.fromList
-                  [ ("outPath", evaluated (VPath (canonPathValue storePath))),
-                    ("rev", evaluated (mkStr rev)),
-                    ("shortRev", evaluated (mkStr (T.take 7 rev))),
-                    ("revCount", evaluated (VInt (fromIntegral revCount))),
-                    ("submodules", evaluated (VBool submodules)),
-                    ("lastModified", evaluated (VInt (fromIntegral lastModified))),
-                    ("lastModifiedDate", evaluated (mkStr lastModifiedDate)),
-                    ("narHash", evaluated (mkStr ("sha256-" <> bytesToBase64 narHash)))
-                  ]
-            )
-        )
+      -- Only a pinned rev is cached: a bare ref means "whatever this branch
+      -- points at now", which a note taken earlier cannot answer.
+      cached <- case checkedRev of
+        Nothing -> pure Nothing
+        Just rev -> do
+          entry <- lookupFetchCache (fetchCacheKey url name rev submodules shallow)
+          case entry >>= decodeFetchCache of
+            Nothing -> pure Nothing
+            Just fields -> do
+              -- The note is only good while the tree it names is still
+              -- there, and a hit has to re-record the write the fetch it
+              -- stands in for would have recorded: on disk and registered
+              -- are different facts, and a derivation naming an
+              -- unregistered outPath fails to build.
+              adopted <- adoptStorePath (fcStorePath fields)
+              pure (if adopted then Just fields else Nothing)
+      case cached of
+        Just fields -> pure (fetchGitResult submodules fields)
+        Nothing -> fetchGitUncached url name checkedRef checkedRev submodules shallow
+
+-- | The fetch itself, when nothing is remembered about it.  @ref@ and @rev@
+-- have already passed 'checkGitRef'\/'checkGitRev'.
+fetchGitUncached :: (MonadEval m) => Text -> Text -> Maybe Text -> Maybe Text -> Bool -> Bool -> m NixValue
+fetchGitUncached url name checkedRef checkedRev submodules shallow =
+  do
+    cloneDir <- createScratchDir "nova-nix-fetchgit-"
+    let ctx = "builtins.fetchGit"
+        git = gitRun ctx cloneDir
+        depthArgs = if shallow then ["--depth", "1"] else []
+        refArg = fromMaybe defaultFetchRef checkedRef
+        checkoutTarget = fromMaybe fetchHeadRef checkedRev
+    _ <- git ["init", "--quiet", "."]
+    _ <- git ["remote", "add", "origin", "--", url]
+    -- @--@ before the remote: git keeps parsing options after it, so
+    -- without a separator a refspec is indistinguishable from a flag.
+    _ <- git (["fetch", "--quiet"] ++ depthArgs ++ ["--", "origin", refArg])
+    -- Trailing @--@, not leading: @git checkout -- X@ reads X as a
+    -- pathspec, the opposite of what a leading separator means elsewhere.
+    _ <- git ["checkout", "--quiet", checkoutTarget, "--"]
+    when submodules $
+      void (git ["submodule", "update", "--init", "--recursive"])
+    markExecutablesFromIndex ctx cloneDir
+    rev <- git ["rev-parse", "HEAD"]
+    revCountText <- git ["rev-list", "--count", "HEAD"]
+    lastModifiedText <- git ["show", "-s", "--format=%ct", "HEAD"]
+    removeGitMetadata ctx cloneDir
+    storePath <- copyPathToStore cloneDir name Nothing
+    narHash <- narHashOfPath cloneDir
+    removeScratchDir cloneDir
+    revCount <- decodeDecimal ctx revCountText
+    lastModified <- decodeDecimal ctx lastModifiedText
+    let fields =
+          FetchCache
+            { fcStorePath = storePath,
+              fcRev = rev,
+              fcRevCount = revCount,
+              fcLastModified = lastModified,
+              fcNarHash = bytesToBase64 narHash
+            }
+    -- Remembered only for a pinned revision; see fetchGit.
+    case checkedRev of
+      Nothing -> pure ()
+      Just pinned -> writeFetchCache (fetchCacheKey url name pinned submodules shallow) (encodeFetchCache fields)
+    pure (fetchGitResult submodules fields)
 
 -- | Mark every file git records as executable (mode 100755) in the
 -- checked-out tree.  A no-op on Unix; on Windows the mode has nowhere to
@@ -3644,6 +3671,112 @@ markExecutablesFromIndex ctx cloneDir = do
         not (T.null relPath) =
           setExecutableFile (cloneDir <> "/" <> relPath)
       | otherwise = pure ()
+
+-- | What @builtins.fetchGit@ hands back, from the few facts about a fetch
+-- that are worth keeping.  Shared by the fetch and by the cache, so the two
+-- cannot describe the same tree differently.
+data FetchCache = FetchCache
+  { fcStorePath :: !Text,
+    fcRev :: !Text,
+    fcRevCount :: !Integer,
+    fcLastModified :: !Integer,
+    fcNarHash :: !Text
+  }
+  deriving (Eq, Show)
+
+fetchGitResult :: Bool -> FetchCache -> NixValue
+fetchGitResult submodules fields =
+  let lastModifiedDate =
+        T.pack
+          ( formatTime
+              defaultTimeLocale
+              "%Y%m%d%H%M%S"
+              (posixSecondsToUTCTime (fromIntegral (fcLastModified fields)))
+          )
+   in VAttrs
+        ( attrSetFromMap $
+            Map.fromList
+              [ ("outPath", evaluated (VPath (canonPathValue (fcStorePath fields)))),
+                ("rev", evaluated (mkStr (fcRev fields))),
+                ("shortRev", evaluated (mkStr (T.take 7 (fcRev fields)))),
+                ("revCount", evaluated (VInt (fromIntegral (fcRevCount fields)))),
+                ("submodules", evaluated (VBool submodules)),
+                ("lastModified", evaluated (VInt (fromIntegral (fcLastModified fields)))),
+                ("lastModifiedDate", evaluated (mkStr lastModifiedDate)),
+                ("narHash", evaluated (mkStr ("sha256-" <> fcNarHash fields)))
+              ]
+        )
+
+-- | What a remembered fetch is filed under.  Everything that decides what
+-- comes back is in the key, so a hit cannot describe a different fetch: the
+-- URL, the store name, the revision, whether submodules were taken, and
+-- whether the clone was shallow.
+--
+-- @shallow@ is in the key even though it cannot change the tree, because it
+-- decides @revCount@: a depth-1 clone counts 1 where a full clone of the
+-- same rev counts the real depth.  Sharing an entry between the two would
+-- let whichever ran first decide what the other sees, and @revCount@ can
+-- reach a derivation's environment, so that is a reproducibility problem
+-- rather than a stale-data one.
+--
+-- The leading version tag invalidates every entry written before a change
+-- in what the fields mean.  It last moved for the Windows executable bit,
+-- which changes the @narHash@ of any tree holding an executable file.
+fetchCacheKey :: Text -> Text -> Text -> Bool -> Bool -> Text
+fetchCacheKey url name rev submodules shallow =
+  T.intercalate
+    "\n"
+    [ "fetchGit-2",
+      url,
+      name,
+      rev,
+      if submodules then "submodules" else "no-submodules",
+      if shallow then "shallow" else "full"
+    ]
+
+-- | One field per line, in a fixed order.  Anything that does not read back
+-- as exactly five lines is treated as no entry at all.
+encodeFetchCache :: FetchCache -> Text
+encodeFetchCache fields =
+  T.intercalate
+    "\n"
+    [ fcStorePath fields,
+      fcRev fields,
+      T.pack (show (fcRevCount fields)),
+      T.pack (show (fcLastModified fields)),
+      fcNarHash fields
+    ]
+
+decodeFetchCache :: Text -> Maybe FetchCache
+decodeFetchCache raw = case T.splitOn "\n" raw of
+  [storePath, rev, revCount, lastModified, narHash] -> do
+    count <- readDecimalMaybe revCount
+    modified <- readDecimalMaybe lastModified
+    -- Every field is checked, the last one included.  Truncation before
+    -- the last field yields fewer than five and is rejected above, but a
+    -- write cut inside narHash still yields five and would otherwise
+    -- decode as valid with a short hash - and an entry is trusted for as
+    -- long as its store path survives.
+    validBase64Sha256 narHash
+    pure
+      FetchCache
+        { fcStorePath = storePath,
+          fcRev = rev,
+          fcRevCount = count,
+          fcLastModified = modified,
+          fcNarHash = narHash
+        }
+  _ -> Nothing
+  where
+    readDecimalMaybe t = case TR.decimal t of
+      Right (value, rest) | T.null rest -> Just value
+      _ -> Nothing
+    -- Base64 of 32 bytes: 44 characters, the last one the single pad.
+    validBase64Sha256 t =
+      if T.length t == 44 && T.all isBase64Char (T.init t) && T.last t == '='
+        then Just ()
+        else Nothing
+    isBase64Char c = isAsciiUpper c || isAsciiLower c || isDigit c || c == '+' || c == '/'
 
 -- | Run one git subcommand under the same transport allowlist as the URL
 -- check.  Returns trimmed stdout; a nonzero exit throws with git's stderr.

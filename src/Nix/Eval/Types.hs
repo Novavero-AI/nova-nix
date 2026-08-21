@@ -1245,6 +1245,22 @@ class (Monad m) => MonadEval m where
   -- stream on Windows). Run before the tree is copied to the store.
   setExecutableFile :: Text -> m ()
 
+  -- | Look up a previously recorded fetch by a key naming exactly what was
+  -- fetched. 'Nothing' when nothing was recorded, or the record no longer
+  -- describes anything on disk.
+  lookupFetchCache :: Text -> m (Maybe Text)
+
+  -- | Take over a store path an earlier evaluation wrote: 'True' when it is
+  -- still on disk, and recorded as this evaluation's own store write in
+  -- that case. Reusing a path instead of rewriting it must still leave the
+  -- registration behind, or the build driver never registers it and a
+  -- derivation naming it fails with \"references unregistered path\".
+  adoptStorePath :: Text -> m Bool
+
+  -- | Record a fetch under that key. Failing to record is not an error -
+  -- the cache is an optimisation.
+  writeFetchCache :: Text -> Text -> m ()
+
   -- | Read a symlink's target WITHOUT following it.
   readSymlinkTarget :: Text -> m Text
 
@@ -1370,6 +1386,9 @@ instance MonadEval PureEval where
   narHashOfPath _ = throwEvalError "builtins.fetchGit: not available in pure evaluation"
   isExecutableFile _ = throwEvalError "builtins.path: not available in pure evaluation"
   setExecutableFile _ = throwEvalError "builtins.fetchGit: not available in pure evaluation"
+  lookupFetchCache _ = pure Nothing
+  adoptStorePath _ = pure False
+  writeFetchCache _ _ = pure ()
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in pure evaluation"
   addSourceNar _ _ = throwEvalError "builtins.path: not available in pure evaluation"
   addFixedOutputFile _ _ = throwEvalError "builtins.fetchurl: not available in pure evaluation"
