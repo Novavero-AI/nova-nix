@@ -336,10 +336,17 @@ registrationFor store sp deriver refs = do
 -- so the NAR hash a cache signs - depend on whether the source and the
 -- store share a volume.
 moveOutput :: FilePath -> FilePath -> IO ()
-moveOutput src dest =
-  renamePath src dest `catch` \(_ :: IOException) -> do
-    copyPathInto src dest
-    Dir.removePathForcibly src
+moveOutput src dest
+  -- A build writes into its own output path, so the usual case is a move
+  -- onto itself.  POSIX rename(a,a) is a benign no-op, but MoveFileEx is
+  -- documented as unusable when either name is a directory, and the
+  -- IOException fallback below would then copy a tree into itself and
+  -- delete the result.  Answering here settles both platforms.
+  | src == dest = pure ()
+  | otherwise =
+      renamePath src dest `catch` \(_ :: IOException) -> do
+        copyPathInto src dest
+        Dir.removePathForcibly src
 
 -- | Byte-scan a tree for store path references.
 --

@@ -7480,6 +7480,141 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
         pure ret,
+      runTestM "partial rebuild failure preserves a valid sibling output" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-partial-valid"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "ggggggggggggggggggggggggggggggg3" "partial-main"
+            devSP = StorePath "ggggggggggggggggggggggggggggggg4" "partial-dev"
+            mkDrv script =
+              Derivation
+                { drvOutputs =
+                    [ DerivationOutput "out" outSP "" "",
+                      DerivationOutput "dev" devSP "" ""
+                    ],
+                  drvInputDrvs = Map.empty,
+                  drvInputSrcs = [],
+                  drvPlatform = currentPlatform,
+                  drvBuilder = TE.encodeUtf8 shell,
+                  drvArgs = ["-c", script],
+                  drvEnv = Map.fromList [("name", "partial-valid")]
+                }
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-partial-valid-tmp"}
+            devPath = storePathToFilePath (stDir store) devSP
+        initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo main > $out/value && echo keep > $dev/value")
+        deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
+        rebuilt <- buildDerivation config store (mkDrv "mkdir -p $out && echo partial > $out/value && exit 1")
+        devOnDisk <- Dir.doesPathExist devPath
+        devValid <- isValid store devSP
+        devContents <- if devOnDisk then T.strip <$> TIO.readFile (devPath </> "value") else pure ""
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        let deletedFirst = either (const False) (\outcome -> doRowRemoved outcome && doTreeRemoved outcome) deleted
+        pure $ case (initial, rebuilt) of
+          (BuildSuccess _, BuildFailure _ _)
+            | deletedFirst && devOnDisk && devValid && devContents == "keep" -> Pass
+            | otherwise -> Fail "failed partial rebuild removed or changed its valid sibling output"
+          _ -> Fail "partial rebuild test setup did not reach the expected states",
+      -- The shape the reviewer's blocker had: a package with a dev output
+      -- has ONE builder writing both, so a partial rebuild hands that
+      -- builder a $dev that is valid, registered and sealed read-only.
+      -- Writing there has to work and must not disturb what is registered.
+      runTestM "partial rebuild writes both outputs and leaves the valid one alone" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-partial-both"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "ggggggggggggggggggggggggggggggg5" "both-main"
+            devSP = StorePath "ggggggggggggggggggggggggggggggg6" "both-dev"
+            mkDrv script =
+              Derivation
+                { drvOutputs =
+                    [ DerivationOutput "out" outSP "" "",
+                      DerivationOutput "dev" devSP "" ""
+                    ],
+                  drvInputDrvs = Map.empty,
+                  drvInputSrcs = [],
+                  drvPlatform = currentPlatform,
+                  drvBuilder = TE.encodeUtf8 shell,
+                  drvArgs = ["-c", script],
+                  drvEnv = Map.fromList [("name", "partial-both")]
+                }
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-partial-both-tmp"}
+            devPath = storePathToFilePath (stDir store) devSP
+            outPath = storePathToFilePath (stDir store) outSP
+            -- Both outputs, every time, as a real multi-output builder does.
+            writeBoth v = "mkdir -p $out $dev && echo " <> v <> " > $out/value && echo " <> v <> " > $dev/value"
+        initial <- buildDerivation config store (mkDrv (writeBoth "first"))
+        deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
+        rebuilt <- buildDerivation config store (mkDrv (writeBoth "second"))
+        outContents <- T.strip <$> TIO.readFile (outPath </> "value")
+        devContents <- T.strip <$> TIO.readFile (devPath </> "value")
+        devValid <- isValid store devSP
+        outValid <- isValid store outSP
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        let deletedFirst = either (const False) (\outcome -> doRowRemoved outcome && doTreeRemoved outcome) deleted
+        pure $ case (initial, rebuilt) of
+          (BuildSuccess _, BuildSuccess _)
+            | not deletedFirst -> Fail "partial rebuild setup did not delete the first output"
+            -- The valid sibling keeps the bytes its NarHash describes: the
+            -- builder wrote to a scratch path, not to it.
+            | devContents /= "first" -> Fail ("valid sibling was overwritten: " <> devContents)
+            | outContents /= "second" -> Fail ("rebuilt output has the wrong contents: " <> outContents)
+            | not (outValid && devValid) -> Fail "both outputs should be valid after the rebuild"
+            | otherwise -> Pass
+          (_, BuildFailure msg _) -> Fail ("a builder writing both outputs failed the rebuild: " <> msg)
+          _ -> Fail "partial rebuild test setup did not reach the expected states",
+      -- The scratch path is discarded after the build, so an output that
+      -- records it would be registered with a reference to nothing.  We do
+      -- not rewrite the contents the way upstream does; we refuse.
+      runTestM "an output recording a valid sibling's scratch path fails the build" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-scratch-leak"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "ggggggggggggggggggggggggggggggg7" "leak-main"
+            devSP = StorePath "ggggggggggggggggggggggggggggggg8" "leak-dev"
+            mkDrv script =
+              Derivation
+                { drvOutputs =
+                    [ DerivationOutput "out" outSP "" "",
+                      DerivationOutput "dev" devSP "" ""
+                    ],
+                  drvInputDrvs = Map.empty,
+                  drvInputSrcs = [],
+                  drvPlatform = currentPlatform,
+                  drvBuilder = TE.encodeUtf8 shell,
+                  drvArgs = ["-c", script],
+                  drvEnv = Map.fromList [("name", "scratch-leak")]
+                }
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-scratch-leak-tmp"}
+            devPath = storePathToFilePath (stDir store) devSP
+        initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo first > $out/value && echo first > $dev/value")
+        deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
+        -- \$dev now names a scratch path, and the builder bakes it into $out
+        -- the way a compiler driver or a libtool archive would.
+        rebuilt <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo $dev > $out/recorded && echo first > $dev/value")
+        devContents <- T.strip <$> TIO.readFile (devPath </> "value")
+        devValid <- isValid store devSP
+        outValid <- isValid store outSP
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        let deletedFirst = either (const False) (\outcome -> doRowRemoved outcome && doTreeRemoved outcome) deleted
+        pure $ case (initial, rebuilt) of
+          (BuildSuccess _, BuildFailure msg _)
+            | not deletedFirst -> Fail "scratch-leak setup did not delete the first output"
+            | not ("scratch path" `T.isInfixOf` msg) -> Fail ("expected a scratch-path refusal, got: " <> msg)
+            -- The refusal must not cost the sibling that was already valid.
+            | not devValid || devContents /= "first" -> Fail "the refusal disturbed the valid sibling"
+            | outValid -> Fail "the refused output registered anyway"
+            | otherwise -> Pass
+          (_, BuildSuccess _) -> Fail "an output naming a discarded scratch path was accepted"
+          _ -> Fail "scratch-leak test setup did not reach the expected states",
       -- Builder succeeds but doesn't create $out, so the build fails
       runTestM "missing output fails build" $ do
         tmpBase <- getTemporaryDirectory
@@ -7499,6 +7634,42 @@ testBuilder = do
               then Pass
               else Fail ("expected 'outputs missing' error, got: " <> msg)
           BuildSuccess _ -> Fail "expected failure when builder doesn't create $out",
+      runTestM "missing sibling output cleans produced orphan" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-partial-missing"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiii1" "partial-output"
+            devSP = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiii2" "missing-output"
+            drv =
+              Derivation
+                { drvOutputs =
+                    [ DerivationOutput "out" outSP "" "",
+                      DerivationOutput "dev" devSP "" ""
+                    ],
+                  drvInputDrvs = Map.empty,
+                  drvInputSrcs = [],
+                  drvPlatform = currentPlatform,
+                  drvBuilder = TE.encodeUtf8 shell,
+                  drvArgs = ["-c", "mkdir -p $out && echo orphan > $out/value"],
+                  drvEnv = Map.fromList [("name", "partial-missing")]
+                }
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-partial-missing-tmp"}
+            outPath = storePathToFilePath (stDir store) outSP
+            devPath = storePathToFilePath (stDir store) devSP
+        result <- buildDerivation config store drv
+        outOnDisk <- Dir.doesPathExist outPath
+        devOnDisk <- Dir.doesPathExist devPath
+        outValid <- isValid store outSP
+        devValid <- isValid store devSP
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildFailure msg _
+            | "outputs missing" `T.isInfixOf` msg && not outOnDisk && not devOnDisk && not outValid && not devValid -> Pass
+            | otherwise -> Fail ("missing-output failure left store state behind: " <> msg)
+          BuildSuccess _ -> Fail "partial-output builder unexpectedly succeeded",
       -- File output (not directory) should succeed
       runTestM "file output succeeds" $ do
         tmpBase <- getTemporaryDirectory
