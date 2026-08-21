@@ -49,16 +49,17 @@ module Nix.Builder
   )
 where
 
-import Control.Exception (IOException, SomeException, displayException, finally, try)
-import Control.Monad (filterM, when)
+import Control.Exception (IOException, SomeException, displayException, finally, onException, try)
+import Control.Monad (filterM, unless, when)
 import qualified Data.ByteString as BS
 import Data.Char (toLower, toUpper)
 import Data.Either (fromRight)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.Foldable (for_)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -71,9 +72,9 @@ import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimi
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
-import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
+import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
-import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), defaultStoreDirText, storePathToFilePath)
+import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, storePathToFilePath, unStoreDir)
 import Nix.Substituter (CacheConfig, SubstResult (..), catchSync, trySubstitute)
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
@@ -252,9 +253,10 @@ withOutputLocks config store drv act = do
 -- | The derivation's first output path when EVERY output is already
 -- registered, otherwise 'Nothing'.
 --
--- Distinct from 'isOutputCached', which answers about the first output
--- alone: a partially valid multi-output derivation still has to build,
--- and treating it as finished would leave the missing outputs missing.
+-- Every output, never just the first: a partially valid multi-output
+-- derivation still has to build, and treating it as finished would leave
+-- the missing outputs missing.  Both the lock-held re-check and the gate
+-- in 'resolveDep' ask this one question, so the two cannot disagree.
 allOutputsValid :: Store -> Derivation -> IO (Maybe StorePath)
 allOutputsValid store drv = case map doPath (drvOutputs drv) of
   [] -> pure Nothing
@@ -280,43 +282,136 @@ buildUnderLock config store drv = do
       createDirectoryIfMissing True buildDir
       (`finally` cleanupBuildDir buildDir) $ do
         -- 3. Compute output paths (but do NOT pre-create them - the builder
-        --    is responsible for creating $out, $dev, etc.)
-        let outputDirs = [(doName out, buildDir </> T.unpack (doName out)) | out <- drvOutputs drv]
+        --    is responsible for creating $out, $dev, etc.).
+        --
+        --    $out is the FINAL store path now, as upstream's is: a temp
+        --    path recorded by the build (a compiler driver, a libtool
+        --    archive) would otherwise outlive the temp dir it named.
+        outputValidity <- mapM (isValid store . doPath) (drvOutputs drv)
+        case traverse outputPlan (zip (drvOutputs drv) outputValidity) of
+          Left nameErr -> pure (BuildFailure ("output name is not a store path name: " <> T.pack (show nameErr)) 1)
+          Right plans -> runPlannedBuild config store drv buildDir plans
 
-        -- 4. Decode builder/args/env for the spawn boundary.  Derivation
-        --    strings are BYTES (identity); spawning a process needs real
-        --    text, so invalid UTF-8 in any of them is a clean build
-        --    failure, never a mojibake spawn.  The builtin builders skip
-        --    this - they read the byte fields directly.
-        exitResult <- case drvBuilder drv of
-          b
-            | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
-            | b == builtinUnpackBuilder -> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
-          _ -> case decodeBuilderStrings drv of
-            Left errMsg -> pure (Left (1, errMsg))
-            Right (builderText, argTexts, decodedEnv) ->
-              let -- onStore first, so nothing a placeholder expands to gets
-                  -- rewritten a second time.
-                  rewrite = rewritePlaceholders outputDirs . onStore config
-                  builderPath = T.unpack (onStore config builderText)
-                  environ = buildEnvironment config (rewriteEnv rewrite decodedEnv) builderPath buildDir outputDirs
-                  builderArgs = map (T.unpack . rewrite) argTexts
-               in -- 5. Run the builder
-                  runBuilder builderPath builderArgs environ buildDir
-        case exitResult of
-          Left (exitCode, stderrText) ->
-            pure (BuildFailure ("builder failed: " <> stderrText) exitCode)
-          Right () -> do
-            -- 6. Success: validate that the builder created all expected
-            --    outputs.  Outputs may be files or directories - both are
-            --    valid (real Nix allows $out to be a single file, a
-            --    directory tree, or a symlink).
-            missing <- filterM (fmap not . doesPathExist . snd) outputDirs
-            case missing of
-              [] -> registerOutputs config store drv buildDir outputDirs
-              _ -> do
-                let names = T.intercalate ", " (map fst missing)
-                pure (BuildFailure ("builder succeeded but outputs missing: " <> names) 1)
+-- | Where the builder writes each output, and where that has to end up.
+--
+-- The two coincide for an output being built: writing into the final store
+-- path is what this whole arrangement is for.  They differ for an output
+-- that is already valid, which the builder is still handed (a package with
+-- a @dev@ output has one builder writing both) but which must not be
+-- touched: it is registered, its @NarHash@ describes its current bytes,
+-- and 'placeInStore' has already sealed it read-only.
+data OutputPlan = OutputPlan
+  { -- | The derivation output's name, as it reaches the environment.
+    opName :: !Text,
+    -- | Where the output has to be when the build is done.
+    opFinal :: !StorePath,
+    -- | Where the builder is told to write.
+    opScratch :: !StorePath,
+    -- | Whether 'opFinal' is already registered, and so must survive.
+    opValid :: !Bool
+  }
+
+-- | Plan one output, given whether its final path is already valid.
+outputPlan :: (DerivationOutput, Bool) -> Either StorePathNameError OutputPlan
+outputPlan (out, valid)
+  | not valid = Right (OutputPlan (doName out) (doPath out) (doPath out) False)
+  | otherwise = do
+      fallback <- fallbackOutputPath (doPath out)
+      pure (OutputPlan (doName out) (doPath out) fallback True)
+
+-- | A scratch store path for an output that must not be written to, built
+-- so it cannot collide with any real store path.
+--
+-- Upstream's @makeFallbackPath@ (@derivation-builder.cc@, the @StorePath@
+-- overload) with the same shape: a bogus @rewrite:@ path type and an
+-- all-zeroes inner hash, keyed on the output path it stands in for.
+-- Upstream also keys on the @.drv@ path; that is not reachable here, and
+-- the output path already names one output of one derivation, so the
+-- result is just as unique.
+fallbackOutputPath :: StorePath -> Either StorePathNameError StorePath
+fallbackOutputPath sp =
+  makeStorePath
+    defaultStoreDir
+    ("rewrite:" <> spHash sp <> "-" <> spName sp)
+    (BS.replicate 32 0)
+    (spName sp)
+
+-- | The build, once every output knows where it is written and where it
+-- belongs.
+runPlannedBuild :: BuildConfig -> Store -> Derivation -> FilePath -> [OutputPlan] -> IO BuildResult
+runPlannedBuild config store drv buildDir plans = do
+  let scratchDir p = storePathToFilePath (bcStoreDir config) (opScratch p)
+      outputDirs = [(opName p, scratchDir p) | p <- plans]
+      -- Every scratch path is the build's to use: the ones that are final
+      -- paths may hold a tree an interrupted run left behind, and the
+      -- fallbacks may hold one an interrupted run failed to discard.
+      clearScratch = for_ plans (removePathForcibly . scratchDir)
+  clearScratch
+  createDirectoryIfMissing True (unStoreDir (bcStoreDir config))
+  -- The cleanup contract: the build directory is not where outputs live
+  -- any more, so an interrupt or a throw between the builder starting and
+  -- registration committing would otherwise strand an unregistered tree at
+  -- a real store path.  Once the registrations are committed there is
+  -- nothing left to take back, and the flag says so.
+  committed <- newIORef False
+  let cleanupUnlessCommitted = do
+        done <- readIORef committed
+        unless done clearScratch
+  ( do
+      -- 4. Decode builder/args/env for the spawn boundary.  Derivation
+      --    strings are BYTES (identity); spawning a process needs real
+      --    text, so invalid UTF-8 in any of them is a clean build
+      --    failure, never a mojibake spawn.  The builtin builders skip
+      --    this - they read the byte fields directly.
+      exitResult <- case drvBuilder drv of
+        b
+          | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
+          | b == builtinUnpackBuilder -> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
+        _ -> case decodeBuilderStrings drv of
+          Left errMsg -> pure (Left (1, errMsg))
+          Right (builderText, argTexts, decodedEnv) ->
+            let -- onStore first, so nothing a placeholder expands to gets
+                -- rewritten a second time.
+                rewrite = rewritePlaceholders outputDirs . onStore config
+                builderPath = T.unpack (onStore config builderText)
+                environ = buildEnvironment config (rewriteEnv rewrite decodedEnv) builderPath buildDir outputDirs
+                builderArgs = map (T.unpack . rewrite) argTexts
+             in -- 5. Run the builder
+                runBuilder builderPath builderArgs environ buildDir
+      case exitResult of
+        Left (exitCode, stderrText) -> do
+          -- Whatever the builder wrote is in the store now, so failure has
+          -- to take it back out: an unregistered tree there is invisible to
+          -- the database and would only confuse the next run.
+          clearScratch
+          pure (BuildFailure ("builder failed: " <> stderrText) exitCode)
+        Right () -> do
+          -- 6. Success: validate that the builder created all expected
+          --    outputs.  Outputs may be files or directories - both are
+          --    valid (real Nix allows $out to be a single file, a
+          --    directory tree, or a symlink).
+          missing <- filterM (fmap not . doesPathExist . snd) outputDirs
+          case missing of
+            _ : _ -> do
+              let names = T.intercalate ", " (map fst missing)
+              -- The builder may have produced some outputs before omitting
+              -- another.  None were registered, so take those orphaned
+              -- trees back out of the store.
+              clearScratch
+              pure (BuildFailure ("builder succeeded but outputs missing: " <> names) 1)
+            [] -> do
+              result <- registerOutputs config store drv buildDir plans
+              case result of
+                BuildSuccess _ -> do
+                  writeIORef committed True
+                  -- Upstream discards a valid output's redirected copy
+                  -- rather than reading it; only the fallbacks go, the
+                  -- registered trees stay.
+                  for_ [p | p <- plans, opValid p] (removePathForcibly . scratchDir)
+                _ -> clearScratch
+              pure result
+    )
+    `onException` cleanupUnlessCommitted
 
 -- | Decode a derivation's builder path, arguments, and env values from
 -- their identity bytes to the 'Text' the process-spawn boundary needs.
@@ -737,9 +832,9 @@ registerOutputs ::
   Store ->
   Derivation ->
   FilePath ->
-  [(Text, FilePath)] ->
+  [OutputPlan] ->
   IO BuildResult
-registerOutputs config store drv _buildDir outputDirs = do
+registerOutputs config store drv _buildDir plans = do
   let -- Candidates for reference scanning: input sources, the input
       -- derivations' realized OUTPUT paths, and this derivation's own outputs.
       inputOutputs = fromRight [] (resolveInputOutputs config drv)
@@ -748,12 +843,19 @@ registerOutputs config store drv _buildDir outputDirs = do
       -- the caller (buildWithDeps) would need to pass it through.
       -- Register with no deriver for now - queryDeriver will return Nothing.
       drvPathText = Nothing
-      -- (temp output dir, final store path) for every output, used to detect
-      -- self- and cross-output references that appear as build-temp paths.
-      tempPairs = [(outDir, doPath out) | (out, (_, outDir)) <- zip (drvOutputs drv) outputDirs]
+      -- (fallback dir, the output it stood in for) for every already-valid
+      -- output.  Nothing may reference one: the tree is discarded after the
+      -- build, so a reference to it is a dangling edge, and upstream avoids
+      -- the same thing by rewriting the hashes back out of the contents.
+      -- Scanning for it and failing is louder and needs no rewriting.
+      fallbackPairs =
+        [ (storePathToFilePath (bcStoreDir config) (opScratch p), opFinal p)
+        | p <- plans,
+          opValid p
+        ]
   -- Phase 1: scan references and move each output into the store, collecting a
   -- PathRegistration (no DB writes yet).  Already-valid outputs are skipped.
-  prepared <- mapM (prepareOutput config store allCandidates tempPairs drvPathText) (zip (drvOutputs drv) outputDirs)
+  prepared <- mapM (prepareOutput config store allCandidates fallbackPairs drvPathText) (zip (drvOutputs drv) plans)
   case sequence prepared of
     Left errMsg -> pure (BuildFailure errMsg 1)
     Right regs -> do
@@ -773,11 +875,12 @@ prepareOutput ::
   [StorePath] ->
   [(FilePath, StorePath)] ->
   Maybe Text ->
-  (DerivationOutput, (Text, FilePath)) ->
+  (DerivationOutput, OutputPlan) ->
   IO (Either Text (Maybe PathRegistration))
-prepareOutput config store candidates tempPairs drvPathText (output, (_outName, outDir)) = do
+prepareOutput config store candidates fallbackPairs drvPathText (output, plan) = do
   let targetSP = doPath output
       targetPath = storePathToFilePath (bcStoreDir config) targetSP
+      outDir = storePathToFilePath (bcStoreDir config) (opScratch plan)
   -- Check the build actually produced the output (file or directory).
   exists <- doesPathExist outDir
   if not exists
@@ -794,20 +897,41 @@ prepareOutput config store candidates tempPairs drvPathText (output, (_outName, 
       if valid
         then pure (Right Nothing)
         else do
-          onDisk <- doesPathExist targetPath
-          when onDisk (removePathForcibly targetPath)
-          inputRefs <- scanReferences candidates outDir
-          selfRefs <- scanTempReferences tempPairs outDir
-          let refs = dedupStorePaths (inputRefs ++ selfRefs)
-          reg <- placeInStore store outDir targetSP drvPathText refs
-          fixedCheck <- verifyFixedOutput output targetPath
-          case fixedCheck of
-            Left err -> do
-              -- Wrong bytes for a declared content address: remove the
-              -- placed tree so a later run cannot meet it on disk.
-              removePathForcibly targetPath
-              pure (Left err)
-            Right () -> pure (Right (Just reg))
+          -- The builder wrote straight into the store path, so there is
+          -- nothing to clear: outDir IS targetPath.  A stale tree from an
+          -- interrupted run was removed before the build, not here.
+          --
+          -- One scan, not two: 'candidates' already carries this
+          -- derivation's own outputs, and outDir is the final path, so a
+          -- self- or cross-output reference is an ordinary hit.
+          leaked <- scanTempReferences fallbackPairs outDir
+          case leaked of
+            _ : _ -> do
+              -- A fallback path is about to stop existing, so a produced
+              -- output naming one would be registered with a dangling
+              -- reference.  Fail loudly instead, and take the tree back
+              -- out so no later run meets it.
+              removePathForcibly outDir
+              pure
+                ( Left
+                    ( "output "
+                        <> doName output
+                        <> " refers to the scratch path of an already-valid output ("
+                        <> T.intercalate ", " [spName sp <> "@" <> spHash sp | sp <- leaked]
+                        <> "); rebuild every output of this derivation instead"
+                    )
+                )
+            [] -> do
+              refs <- dedupStorePaths <$> scanReferences candidates outDir
+              reg <- placeInStore store outDir targetSP drvPathText refs
+              fixedCheck <- verifyFixedOutput output targetPath
+              case fixedCheck of
+                Left err -> do
+                  -- Wrong bytes for a declared content address: remove the
+                  -- placed tree so a later run cannot meet it on disk.
+                  removePathForcibly targetPath
+                  pure (Left err)
+                Right () -> pure (Right (Just reg))
 
 -- | Re-check a placed fixed-output output against its declared hash.
 -- A fixed-output derivation declares both its store path and, via the
@@ -979,7 +1103,11 @@ buildInOrder config store drvMap (sp : rest) =
 -- | Resolve a single dependency: check cache, try substitution, or build.
 resolveDep :: BuildConfig -> Store -> Derivation -> IO (Either Text DepStatus)
 resolveDep config store drv = do
-  cached <- isOutputCached store drv
+  -- Every output, not just the first: a derivation whose first output is
+  -- valid and whose second was deleted would otherwise be logged cached
+  -- and skipped, and the missing output would stay missing.  Upstream
+  -- skips a build only when all of them are valid.
+  cached <- isJust <$> allOutputsValid store drv
   if cached
     then pure (Right Cached)
     else do
@@ -992,12 +1120,6 @@ resolveDep config store drv = do
             BuildSuccess _ -> pure (Right Building)
             BuildFailure msg code ->
               pure (Left ("exit " <> T.pack (show code) <> ": " <> msg))
-
--- | Check whether the first output of a derivation is already in the store.
-isOutputCached :: Store -> Derivation -> IO Bool
-isOutputCached store drv = case drvOutputs drv of
-  (out : _) -> isValid store (doPath out)
-  [] -> pure False
 
 -- | Log dependency resolution status to stderr.
 logDepStatus :: DepStatus -> Derivation -> IO ()
