@@ -4,18 +4,21 @@
 -- cannot drift between encodings.
 --
 -- Upstream note: C++ Nix decodes an absent or empty @Compression@
--- field as @bzip2@ (the field's historical default), and nova-cache's
--- parser matches that coercion, so the empty string never reaches this
--- register from a parsed narinfo.  It is still mapped to the name
--- upstream would decode, so a hand-built narinfo rejects with the true
--- diagnosis instead of an empty-looking message.
+-- field as @bzip2@ (the field's historical default).  nova-cache's
+-- parser defaults only the ABSENT key; a present-but-empty
+-- @Compression:@ line parses to the empty string and arrives here
+-- verbatim, so this register handles that spelling itself - the
+-- 'T.null' branch is reached by ordinary narinfos off the wire and is
+-- not dead code.  Both spellings decode to 'CompressionBzip2', so
+-- such a narinfo substitutes exactly as upstream would rather than
+-- failing over a field that looks like nothing at all.
 module Nix.Compression
   ( NarCompression (..),
     parseNarCompression,
     compressionNameNone,
     compressionNameXz,
     compressionNameZstd,
-    defaultedCompressionName,
+    compressionNameBzip2,
   )
 where
 
@@ -30,6 +33,7 @@ data NarCompression
   = CompressionNone
   | CompressionXz
   | CompressionZstd
+  | CompressionBzip2
   deriving (Eq, Show)
 
 -- | The wire spelling of the identity codec.
@@ -45,17 +49,18 @@ compressionNameXz = "xz"
 compressionNameZstd :: Text
 compressionNameZstd = "zstd"
 
--- | What upstream decodes when a narinfo omits the @Compression@ field.
-defaultedCompressionName :: Text
-defaultedCompressionName = "bzip2"
+-- | The wire spelling of the bzip2 codec (the historical caches'
+-- format, and what upstream decodes an absent field as).
+compressionNameBzip2 :: Text
+compressionNameBzip2 = "bzip2"
 
 -- | Parse a narinfo @Compression@ value.  Unsupported codecs reject by
--- name; the empty string rejects as the codec upstream would default
--- it to (see the module header).
+-- name; the empty string decodes as the codec upstream defaults it to
+-- (see the module header).
 parseNarCompression :: Text -> Either Text NarCompression
 parseNarCompression name
   | name == compressionNameNone = Right CompressionNone
   | name == compressionNameXz = Right CompressionXz
   | name == compressionNameZstd = Right CompressionZstd
-  | T.null name = Left ("unsupported compression: " <> defaultedCompressionName)
+  | name == compressionNameBzip2 || T.null name = Right CompressionBzip2
   | otherwise = Left ("unsupported compression: " <> name)
