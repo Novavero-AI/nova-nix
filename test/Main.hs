@@ -1920,7 +1920,7 @@ evalNixIO :: FilePath -> Text -> IO (Either Text NixValue)
 evalNixIO baseDir source = case parseNix "<test>" source of
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
-    st <- newEvalState baseDir
+    st <- newEvalState platformStoreDir baseDir
     runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
 
 -- | Run a named IO eval test - single label, no double-wrapping.
@@ -6168,7 +6168,7 @@ testFetchGitTransport = do
 testScratchDirs :: IO [Bool]
 testScratchDirs = do
   putStrLn "eval/scratch-dirs"
-  st <- newEvalState "."
+  st <- newEvalState platformStoreDir "."
   sequence
     [ runTestM "scratch dirs are distinct, real, and removable" $ do
         createdA <- runEvalIO st (createScratchDir "nova-nix-test-scratch-")
@@ -7519,7 +7519,7 @@ evalAndBuild storeDir source = do
   case parseNix "<test>" source of
     Left err -> pure (Left ("parse error: " <> T.pack (show err)))
     Right expr -> do
-      st <- newEvalState "."
+      st <- newEvalState platformStoreDir "."
       evalResult <- runEvalIO st $ do
         val <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
         -- 'derivation' is lazy now; force _derivation so the peek below sees it
@@ -7742,7 +7742,7 @@ testPhase4IO = do
             Left err -> Fail ("eval error: " <> err),
         -- Search path with --nix-path equivalent (populated nixPath)
         runTestM "search path with populated nixPath" $ do
-          st <- newEvalState testDir
+          st <- newEvalState platformStoreDir testDir
           let nixPaths = parseNixPath ("mypkg=" <> T.pack subDir)
               env = builtinEnv (esTimestamp st) nixPaths
           result <- runEvalIO st (eval env (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
