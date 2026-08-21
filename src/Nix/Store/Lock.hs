@@ -52,6 +52,7 @@ module Nix.Store.Lock
     tryAcquirePathLock,
     releasePathLock,
     withPathLock,
+    withLockFile,
 
     -- * Naming
     pathLockFilePath,
@@ -95,8 +96,15 @@ pathLockFilePath dir sp = storePathToFilePath dir sp <> lockFileSuffix
 -- contended case announces itself before the wait begins; the lock
 -- file is created if absent, atomically at the open.
 acquirePathLock :: StoreDir -> StorePath -> IO PathLock
-acquirePathLock dir sp = do
-  let lockPath = pathLockFilePath dir sp
+acquirePathLock dir sp = acquireLockFile (pathLockFilePath dir sp)
+
+-- | Take the exclusive lock on a lock file named directly, blocking
+-- until granted.  The raw form exists for the delete path: deletion
+-- accepts basenames the current store-path name rules reject, so their
+-- lock files cannot be named through 'StorePath' - yet they must be the
+-- very files substituters of the same path contend on.
+acquireLockFile :: FilePath -> IO PathLock
+acquireLockFile lockPath = do
   probe <- tryLockFile lockPath Exclusive
   held <- case probe of
     Just granted -> pure granted
@@ -137,3 +145,8 @@ releasePathLock (PathLock _ heldRef) = modifyMVar_ heldRef surrender
 -- | Run an action holding a path's lock, released on every exit.
 withPathLock :: StoreDir -> StorePath -> (PathLock -> IO a) -> IO a
 withPathLock dir sp = bracket (acquirePathLock dir sp) releasePathLock
+
+-- | Run an action holding a directly named lock file's lock, released
+-- on every exit.  See 'acquireLockFile' for why the raw form exists.
+withLockFile :: FilePath -> (PathLock -> IO a) -> IO a
+withLockFile lockPath = bracket (acquireLockFile lockPath) releasePathLock

@@ -165,7 +165,10 @@ data DeleteOutcome = DeleteOutcome
 -- are the ones current name rules reject - so only traversal shapes are
 -- refused: separators (excluded by construction), dot-leading names (the
 -- store's metadata directory lives at a dot name), and colons (an NTFS
--- alternate-data-stream spelling).
+-- alternate-data-stream spelling).  Lock files are refused too, but not
+-- here: names like @flake.lock@ are legal store-path names, so telling a
+-- lock file from a store object needs the registration rows, and that
+-- decision lives in 'deleteStorePathRaw'.
 resolveDeleteTarget :: StoreDir -> Text -> Either Text Text
 resolveDeleteTarget storeDir raw
   | T.null basename = Left (raw <> ": empty store path name")
@@ -195,34 +198,75 @@ resolveDeleteTarget storeDir raw
 -- while a still-registered row whose tree is gone would be adopted as
 -- valid by existence checks.  A row without a tree and a tree without a
 -- row both delete (the repair cases); only a target with neither is an
--- error.
+-- error.  The whole sequence holds the target's per-path lock - the same
+-- file a substituter of the path locks, as upstream's deletePath does -
+-- so a concurrent substitution's delete-materialize-register cannot be
+-- torn apart by this delete landing between its on-disk recheck and its
+-- registration commit.
 deleteStorePathRaw :: Store -> Text -> IO (Either Text DeleteOutcome)
-deleteStorePathRaw store basename = do
-  let target = unStoreDir (stDir store) </> T.unpack basename
-  rowResult <- unregisterPathRow (stDB store) (T.pack target)
-  case rowResult of
-    RowReferenced referrers ->
-      pure
-        ( Left
-            ( basename
-                <> " is referenced by:"
-                <> T.concat ["\n  " <> r | r <- referrers]
+deleteStorePathRaw store basename =
+  withLockFile (target <> lockFileSuffix) $ \_ -> do
+    -- Lock files are never deleted (the 'Nix.Store.Lock' header).  A
+    -- target is one when stripping the suffix leaves a well-formed
+    -- store basename AND no registration row bears the full name:
+    -- names like @flake.lock@ are legal store-path names, so a
+    -- registered object of this exact name deletes normally, and only
+    -- the rows can tell the two apart.  The check precedes the row
+    -- removal below, which is destructive.
+    registered <- case parseStorePathBaseName basename of
+      Just sp -> isValidPath (stDB store) sp
+      Nothing -> pure False
+    case (registered, lockedPathOf basename) of
+      (False, Just guardedPath) ->
+        pure
+          ( Left
+              ( basename
+                  <> ": names the lock file of "
+                  <> guardedPath
+                  <> "; lock files coordinate concurrent store access"
+                  <> " and are never deleted (an unregistered store"
+                  <> " object of this exact name must be removed outside"
+                  <> " the store tool)"
+              )
+          )
+      _ -> deleteRowAndTree
+  where
+    target = unStoreDir (stDir store) </> T.unpack basename
+    deleteRowAndTree = do
+      rowResult <- unregisterPathRow (stDB store) (T.pack target)
+      case rowResult of
+        RowReferenced referrers ->
+          pure
+            ( Left
+                ( basename
+                    <> " is referenced by:"
+                    <> T.concat ["\n  " <> r | r <- referrers]
+                )
             )
-        )
-    _ -> do
-      -- 'doesPathExist' follows links, so a dangling top-level symlink
-      -- would read as absent; links are leaves here (as in store walks),
-      -- and leftover link debris must still be removable.
-      treeExisted <- do
-        onDisk <- doesPathExist target
-        if onDisk
-          then pure True
-          else Dir.pathIsSymbolicLink target `catch` \(_ :: IOException) -> pure False
-      when treeExisted (Dir.removePathForcibly target)
-      let rowRemoved = rowResult == RowUnregistered
-      if rowRemoved || treeExisted
-        then pure (Right DeleteOutcome {doRowRemoved = rowRemoved, doTreeRemoved = treeExisted})
-        else pure (Left (basename <> ": not in this store (no registration row, no tree on disk)"))
+        _ -> do
+          -- 'doesPathExist' follows links, so a dangling top-level symlink
+          -- would read as absent; links are leaves here (as in store walks),
+          -- and leftover link debris must still be removable.
+          treeExisted <- do
+            onDisk <- doesPathExist target
+            if onDisk
+              then pure True
+              else Dir.pathIsSymbolicLink target `catch` \(_ :: IOException) -> pure False
+          when treeExisted (Dir.removePathForcibly target)
+          let rowRemoved = rowResult == RowUnregistered
+          if rowRemoved || treeExisted
+            then pure (Right DeleteOutcome {doRowRemoved = rowRemoved, doTreeRemoved = treeExisted})
+            else pure (Left (basename <> ": not in this store (no registration row, no tree on disk)"))
+
+-- | The store path a lock-shaped name would guard: the basename with
+-- 'lockFileSuffix' stripped, provided the remainder is a well-formed
+-- store basename.  Whether the file actually IS a lock file still
+-- depends on the registration rows (see 'deleteStorePathRaw').
+lockedPathOf :: Text -> Maybe Text
+lockedPathOf basename = do
+  stripped <- T.stripSuffix (T.pack lockFileSuffix) basename
+  _ <- parseStorePathBaseName stripped
+  pure stripped
 
 -- ---------------------------------------------------------------------------
 -- Store operations
