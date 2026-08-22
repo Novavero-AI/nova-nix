@@ -312,15 +312,26 @@ jobs:
       # failure can be reproduced on a real machine without installing a
       # toolchain there.  Staged after the tests so a binary that failed
       # them is never published.
+      # bin/ beside share/ rather than a bare executable: the <nix/*> search
+      # path resolves relative to the binary's own location, so an artifact
+      # without share/ can evaluate but cannot build, which is most of what
+      # someone downloads it to try.  Same layout a release archive ships.
       - name: Stage the executable
-        run: cabal install exe:nova-nix --install-method=copy --installdir=staged --overwrite-policy=always
+        shell: bash
+        run: |
+          set -euo pipefail
+          cabal install exe:nova-nix --install-method=copy --installdir=staged/bin --overwrite-policy=always
+          mkdir -p staged/share/nova-nix/nix
+          cp data/nix/fetchurl.nix staged/share/nova-nix/nix/
 
       - name: Upload the executable
         uses: actions/upload-artifact@v7
         with:
-          name: nova-nix-${{ matrix.name }}
-          path: staged/nova-nix*
+          name: nova-nix-${{ matrix.name }}-${{ runner.arch }}
+          path: staged/
           if-no-files-found: error
+          overwrite: true
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # End-to-end (Windows-only): the executable this repo ships, driving a real
