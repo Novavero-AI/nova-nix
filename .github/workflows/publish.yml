@@ -7,8 +7,14 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Drop the default GITHUB_TOKEN to read-only; the Hackage upload uses its own
-# token (HACKAGE_TOKEN), not GITHUB_TOKEN.
+# Never cancel a publish: a Hackage upload is irreversible and a half-uploaded
+# release is worse than a slow one.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+# Drop the default GITHUB_TOKEN to read-only by default; only the release job
+# widens it, and the Hackage upload uses its own token (HACKAGE_TOKEN).
 permissions:
   contents: read
 
@@ -21,17 +27,19 @@ jobs:
     name: Parity
     uses: ./.github/workflows/parity.yml
 
-  publish:
-    name: Publish to Hackage
-    needs: [ci, parity]
+  # The tree is the source of truth: the tag must NAME the committed version,
+  # never rewrite it.  Its own job because two consumers depend on it now, and
+  # a mistyped tag must fail before either an immutable Hackage sdist or a
+  # public release exists.
+  check-tag:
+    name: Check the tag
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
     steps:
       - uses: actions/checkout@v6
-
-      # The tree is the source of truth: the tag must NAME the committed
-      # version, never rewrite it.  A mistyped or mistargeted tag fails
-      # here instead of publishing a mismatched (and immutable) sdist.
       - name: Check the tag against the committed version and changelog
+        id: tag
         run: |
           TAG_VERSION=${GITHUB_REF#refs/tags/v}
           ESCAPED=${TAG_VERSION//./\\.}
@@ -44,6 +52,150 @@ jobs:
             echo "CHANGELOG.md has no entry for ${TAG_VERSION}" >&2
             exit 1
           fi
+          echo "version=${TAG_VERSION}" >> "$GITHUB_OUTPUT"
+
+  # Per-platform release archives.  Built here rather than reused from the CI
+  # matrix: a release asset is not a bare executable, it carries the data dir
+  # the <nix/*> search path resolves through, so a downloaded nova-nix can
+  # build rather than only evaluate.
+  package:
+    name: Package (${{ matrix.name }})
+    needs: [check-tag, ci, parity]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+            ext: tar.gz
+          - os: macos-latest
+            name: macos
+            ext: tar.gz
+          - os: windows-latest
+            name: windows
+            ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Build the executable
+        run: cabal install exe:nova-nix --install-method=copy --installdir=staged --overwrite-policy=always
+
+      # bin/ beside share/ is the layout resolveDataDir looks for, so the
+      # archive works unpacked anywhere with nothing set.
+      - name: Assemble the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
+          stem="nova-nix-${{ matrix.name }}-${arch}"
+          mkdir -p "$stem/bin" "$stem/share/nova-nix/nix"
+          cp staged/nova-nix* "$stem/bin/"
+          cp data/nix/fetchurl.nix "$stem/share/nova-nix/nix/"
+          cp LICENSE NOTICE README.md "$stem/"
+          echo "stem=$stem" >> "$GITHUB_ENV"
+
+      # The asset has to work before it is published, not after someone
+      # reports that it does not.  nova_nix_datadir is pointed at nothing so
+      # a pass can only come from the archive's own share/ directory.
+      - name: Smoke-test the assembled archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="$stem/bin/nova-nix"
+          [ -x "$exe" ] || exe="$stem/bin/nova-nix.exe"
+          got=$(nova_nix_datadir=/nonexistent "$exe" eval --expr 'builtins.typeOf (import <nix/fetchurl.nix>)')
+          [ "$got" = '"lambda"' ] || { echo "archive cannot resolve <nix/*>: $got" >&2; exit 1; }
+
+      - name: Create the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.ext }}" = "zip" ]; then
+            7z a -tzip "$stem.zip" "$stem" >/dev/null
+          else
+            tar czf "$stem.tar.gz" "$stem"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: nova-nix-*.${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Separate from the Hackage upload on purpose: a rejected Hackage POST is
+  # permanent (versions are immutable), so a combined job could never be
+  # re-run, while a release can be recreated freely.
+  release:
+    name: GitHub release
+    needs: [check-tag, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: assets
+
+      # Generated after the download, so every line hashes the exact bytes
+      # that get uploaded.
+      - name: Checksums
+        working-directory: assets
+        run: sha256sum nova-nix-* > SHA256SUMS
+
+      # Draft first: releases/latest/download is the installer's URL, and a
+      # published release with no assets attached yet 404s for every consumer
+      # that hits it in the window.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/CHANGELOG.md)
+          for what changed in this release.
+
+          Each archive unpacks to \`bin/\` beside \`share/\`. Run \`bin/nova-nix\`
+          from anywhere: no toolchain, and nothing to configure. Verify the
+          download with \`sha256sum -c SHA256SUMS\`.
+          EOF
+          gh release create "v${VERSION}" \
+            --draft \
+            --title "nova-nix ${VERSION}" \
+            --notes-file notes.md \
+            assets/*
+
+      - name: Assert every asset attached, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          count=$(gh release view "v${VERSION}" --json assets --jq '.assets | length')
+          if [ "$count" -ne 4 ]; then
+            echo "expected 4 assets (3 archives + SHA256SUMS), found ${count}" >&2
+            gh release view "v${VERSION}" --json assets --jq '.assets[].name' >&2
+            exit 1
+          fi
+          gh release edit "v${VERSION}" --draft=false
+
+  publish:
+    name: Publish to Hackage
+    needs: [check-tag, ci, parity]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
 
       - uses: haskell-actions/setup@v2
         with:
