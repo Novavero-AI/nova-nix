@@ -70,7 +70,7 @@ module Nix.Eval
   )
 where
 
-import Control.Monad (foldM, forM_, when, (>=>))
+import Control.Monad (foldM, forM_, void, when, (>=>))
 import qualified Crypto.Hash as CH
 import qualified Data.Array as Array
 import Data.Bits (complement, xor, (.&.), (.|.))
@@ -90,6 +90,9 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.Read as TR
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
@@ -3481,28 +3484,112 @@ checkGitUrl url
 -- indirectly, or a @remote-\<helper\>@ binary on PATH.
 gitTransportConfig :: [Text]
 gitTransportConfig =
-  ["-c", "protocol.allow=never"]
+  [ "-c",
+    "protocol.allow=never",
+    -- Keep checkout bytes platform-independent: no CRLF rewriting.
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "core.eol=lf",
+    -- Fail loudly rather than hash a symlink as a plain file (Git for
+    -- Windows' fallback when it can't create real symlinks).
+    "-c",
+    "core.symlinks=true"
+  ]
     ++ concat [["-c", "protocol." <> scheme <> ".allow=always"] | scheme <- allowedGitSchemes]
 
 builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
 builtinFetchGit (VStr rawUrl _) = do
   url <- decodedText "builtins.fetchGit" rawUrl
-  case checkGitUrl url of
-    Left err -> throwEvalError err
-    Right allowedUrl -> do
-      cloneDir <- createScratchDir "nova-nix-fetchgit-"
-      (code, _, errOut) <-
-        runProcess "git" (gitTransportConfig ++ ["clone", "--depth", "1", "--", allowedUrl, cloneDir]) ""
-      case code of
-        0 -> pure (VPath (canonPathValue cloneDir))
-        _ -> do
-          removeScratchDir cloneDir
-          throwEvalError ("builtins.fetchGit: git clone failed: " <> errOut)
+  fetchGit url "source" Nothing Nothing False False
 builtinFetchGit (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchGit" "url" attrs
-  builtinFetchGit (mkStr url)
+  name <- fromMaybe "source" <$> forceOptionalAttrStr attrs "name"
+  ref <- forceOptionalAttrStr attrs "ref"
+  rev <- forceOptionalAttrStr attrs "rev"
+  submodules <- forceOptionalAttrBool "builtins.fetchGit" attrs "submodules" False
+  shallow <- forceOptionalAttrBool "builtins.fetchGit" attrs "shallow" False
+  fetchGit url name ref rev submodules shallow
 builtinFetchGit other =
   throwEvalError ("builtins.fetchGit: expected a string or set, got " <> typeName other)
+
+-- | Fetch one revision into the store; returns upstream's @fetchGit@
+-- attrset (@outPath@, @rev@, @shortRev@, @revCount@, @submodules@,
+-- @lastModified@, @lastModifiedDate@, @narHash@).  @ref@/@rev@ pass straight
+-- to @git fetch@\/@checkout@, no @--branch@ normalization needed.
+fetchGit :: (MonadEval m) => Text -> Text -> Maybe Text -> Maybe Text -> Bool -> Bool -> m NixValue
+fetchGit rawUrl name mRef mRev submodules shallow =
+  case checkGitUrl rawUrl of
+    Left err -> throwEvalError err
+    Right url -> do
+      cloneDir <- createScratchDir "nova-nix-fetchgit-"
+      let ctx = "builtins.fetchGit"
+          git = gitRun ctx cloneDir
+          depthArgs = if shallow then ["--depth", "1"] else []
+          refArg = fromMaybe "HEAD" mRef
+          checkoutTarget = fromMaybe "FETCH_HEAD" mRev
+      _ <- git ["init", "--quiet", "."]
+      _ <- git ["remote", "add", "origin", url]
+      _ <- git (["fetch", "--quiet"] ++ depthArgs ++ ["origin", refArg])
+      _ <- git ["checkout", "--quiet", checkoutTarget]
+      when submodules $
+        void (git ["submodule", "update", "--init", "--recursive"])
+      rev <- git ["rev-parse", "HEAD"]
+      revCountText <- git ["rev-list", "--count", "HEAD"]
+      lastModifiedText <- git ["show", "-s", "--format=%ct", "HEAD"]
+      removeGitMetadata ctx cloneDir
+      storePath <- copyPathToStore cloneDir name Nothing
+      narHash <- narHashOfPath cloneDir
+      removeScratchDir cloneDir
+      revCount <- decodeDecimal ctx revCountText
+      lastModified <- decodeDecimal ctx lastModifiedText
+      let lastModifiedDate =
+            T.pack (formatTime defaultTimeLocale "%Y%m%d%H%M%S" (posixSecondsToUTCTime (fromIntegral lastModified)))
+      pure
+        ( VAttrs
+            ( attrSetFromMap $
+                Map.fromList
+                  [ ("outPath", evaluated (VPath (canonPathValue storePath))),
+                    ("rev", evaluated (mkStr rev)),
+                    ("shortRev", evaluated (mkStr (T.take 7 rev))),
+                    ("revCount", evaluated (VInt (fromIntegral revCount))),
+                    ("submodules", evaluated (VBool submodules)),
+                    ("lastModified", evaluated (VInt (fromIntegral lastModified))),
+                    ("lastModifiedDate", evaluated (mkStr lastModifiedDate)),
+                    ("narHash", evaluated (mkStr ("sha256-" <> bytesToBase64 narHash)))
+                  ]
+            )
+        )
+
+-- | Run one git subcommand under the same transport allowlist as the URL
+-- check.  Returns trimmed stdout; a nonzero exit throws with git's stderr.
+gitRun :: (MonadEval m) => Text -> Text -> [Text] -> m Text
+gitRun ctx cloneDir args = do
+  (code, out, err) <- runProcess "git" (gitTransportConfig ++ ["-C", cloneDir] ++ args) ""
+  if code == 0
+    then pure (T.strip out)
+    else throwEvalError (ctx <> ": git " <> T.unwords args <> " failed: " <> err)
+
+-- | Strip every @.git@ entry (clone's own, and each submodule's) before the
+-- tree is copied to the store.  Walked directly, not shelled out to
+-- @find@\/@rm@: no @sh@ on a bare Windows install.
+removeGitMetadata :: (MonadEval m) => Text -> Text -> m ()
+removeGitMetadata _ctx = go
+  where
+    go dir = do
+      entries <- listDirectory dir
+      forM_ entries $ \(name, fileType) ->
+        let path = dir <> "/" <> name
+         in if name == ".git"
+              then removeScratchDir path
+              else when (fileType == "directory") $ go path
+
+-- | Parse a decimal from trusted git stdout (@rev-list --count@, @show
+-- --format=%ct@); a failure means git itself misbehaved.
+decodeDecimal :: (MonadEval m) => Text -> Text -> m Integer
+decodeDecimal ctx t = case TR.decimal t of
+  Right (n, rest) | T.null rest -> pure n
+  _ -> throwEvalError (ctx <> ": expected a decimal integer from git, got " <> t)
 
 -- | Resolve the system temp directory.  Checks @TMPDIR@ (Unix), then
 -- @TEMP@ (Windows), falls back to @\/tmp@.
@@ -3611,6 +3698,18 @@ forceOptionalAttrStr attrs key =
       val <- force thunk
       (s, _ctx) <- coerceToString True force applyValue val
       Just <$> decodedText "string attribute" s
+
+-- | Force an optional boolean attribute; present but non-boolean is an error,
+-- not a silent coercion.
+forceOptionalAttrBool :: (MonadEval m) => Text -> AttrSet -> Text -> Bool -> m Bool
+forceOptionalAttrBool builtin attrs key def =
+  case attrSetLookup key attrs of
+    Nothing -> pure def
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VBool b -> pure b
+        other -> throwEvalError (builtin <> ": attribute '" <> key <> "' should be a bool, but is " <> typeName other)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - derivation construction
