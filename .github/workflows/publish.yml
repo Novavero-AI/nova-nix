@@ -241,6 +241,13 @@ jobs:
   publish:
     name: Publish to Hackage
     needs: [check-tag, package]
+    # A Hackage version is immutable, so this is the one step of a release
+    # that no amount of re-running can take back.  The `hackage` environment
+    # requires a reviewer, which holds the job in `waiting` until a human
+    # approves it: a tag publishes the binaries immediately and asks before
+    # spending the version number.  Nothing else in the workflow references
+    # the environment, so the GitHub release is unaffected.
+    environment: hackage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
