@@ -1,0 +1,100 @@
+name: Hackage
+
+# A Hackage version is immutable: uploading spends the number whether or not
+# the release turns out to be good.  That makes it a different decision from
+# cutting a release, taken at a different time, so it gets its own trigger
+# rather than riding along on a tag.
+#
+# Dispatched by hand, against a tag that already exists.  The alternative
+# considered was gating the job inside publish.yml behind an environment with
+# a required reviewer.  It works, but the approval expires after 30 days and
+# cancels the run with it, so deciding later means re-running a whole release
+# workflow whose GitHub-release job would then fail on a release that already
+# exists.  Deciding later is the normal case here, so the trigger models it.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to upload, without a leading v (for example 0.7.0.0)"
+        required: true
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+
+# Never cancel an upload in flight: a half-finished POST to Hackage is worse
+# than a slow one.
+concurrency:
+  group: hackage-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    name: Upload ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      # The tag, not the default branch: what gets uploaded has to be the tree
+      # that was released, not whatever main has moved on to since.
+      - uses: actions/checkout@v6
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: The tag names the committed version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ESCAPED=${VERSION//./\\.}
+          if ! grep -Eq "^version:[[:space:]]*${ESCAPED}[[:space:]]*$" nova-nix.cabal; then
+            echo "tag v${VERSION} does not name the committed version:" >&2
+            grep '^version:' nova-nix.cabal >&2
+            exit 1
+          fi
+
+      # The coupling publish.yml used to get from `needs: [package]`, restated
+      # here because this workflow runs on its own: the reversible half of a
+      # release goes first, so a version whose binaries never built cannot be
+      # spent on Hackage.
+      - name: Its release exists, with every asset attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "v${VERSION}" --json isDraft --jq '.isDraft' > draft.txt; then
+            echo "no published release v${VERSION}: cut the release before uploading to Hackage" >&2
+            exit 1
+          fi
+          if [ "$(cat draft.txt)" = "true" ]; then
+            echo "release v${VERSION} is still a draft" >&2
+            exit 1
+          fi
+          count=$(gh release view "v${VERSION}" --json assets --jq '.assets | length')
+          if [ "$count" -ne 4 ]; then
+            echo "expected 4 assets on v${VERSION} (3 archives + SHA256SUMS), found ${count}" >&2
+            exit 1
+          fi
+
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Build sdist
+        run: cabal sdist
+
+      # The token travels via stdin into curl's config, never argv:
+      # command lines are readable process-wide for the upload's duration.
+      - name: Upload to Hackage
+        env:
+          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
+        run: |
+          SDIST=$(ls dist-newstyle/sdist/nova-nix-*.tar.gz)
+          curl --fail --silent --show-error \
+            --config - \
+            --form "package=@${SDIST}" \
+            https://hackage.haskell.org/packages/ \
+            <<< "header = \"Authorization: X-ApiKey ${HACKAGE_TOKEN}\""
