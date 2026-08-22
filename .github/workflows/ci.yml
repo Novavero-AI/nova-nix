@@ -41,6 +41,29 @@ jobs:
             exit 1
           fi
 
+  # Fragments are pasted into CHANGELOG.md verbatim at release, so a malformed
+  # one is only noticed while cutting the release, which is the worst time.
+  changelog:
+    name: Changelog fragments
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fragments are well-formed
+        run: |
+          status=0
+          for fragment in changelog.d/*.md; do
+            [ -e "$fragment" ] || continue
+            if ! head -n1 "$fragment" | grep -q '^- \*\*'; then
+              echo "$fragment: must open with a bold lead, '- **...**'" >&2
+              status=1
+            fi
+            if [ ! -s "$fragment" ]; then
+              echo "$fragment: is empty" >&2
+              status=1
+            fi
+          done
+          exit $status
+
   hlint:
     name: HLint
     needs: [ascii]
