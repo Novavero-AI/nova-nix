@@ -31,7 +31,7 @@ import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryCompone
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm, toATermForHash)
-import Nix.Eval (MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitUrl, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
+import Nix.Eval (MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
@@ -6162,7 +6162,53 @@ testFetchGitTransport = do
           Left err
             | "transport" `T.isInfixOf` err -> Pass
             | otherwise -> Fail ("wrong error: " <> err)
-          Right _ -> Fail "helper transport url evaluated"
+          Right _ -> Fail "helper transport url evaluated",
+      -- A ref reaching git as an option is command execution: git parses
+      -- options after the remote name, and --upload-pack names the
+      -- transport command.  The leading-character class is what stops it.
+      runTest "a ref that git would read as an option is rejected" $
+        let rejected =
+              [ "--upload-pack=touch /tmp/pwned",
+                "-o",
+                "--exec=sh",
+                "",
+                "branch with spaces",
+                "semi;colon",
+                "back\\slash"
+              ]
+         in case [ref | ref <- rejected, either (const False) (const True) (checkGitRef ref)] of
+              [] -> Pass
+              slipped -> Fail ("refs accepted: " <> T.pack (show slipped)),
+      runTest "ordinary ref names are accepted" $
+        let accepted = ["main", "HEAD", "release/1.0", "v2.3.4", "user/topic-1", "@", "a+b"]
+         in case [ref | ref <- accepted, either (const True) (const False) (checkGitRef ref)] of
+              [] -> Pass
+              refused -> Fail ("refs refused: " <> T.pack (show refused)),
+      runTest "a rev must be a full SHA-1" $
+        let rejected =
+              [ "--upload-pack=touch /tmp/pwned",
+                "dcb93b58",
+                "v1.0",
+                "main",
+                "",
+                T.replicate 40 "g",
+                T.replicate 41 "a"
+              ]
+         in case [rev | rev <- rejected, either (const False) (const True) (checkGitRev rev)] of
+              [] -> Pass
+              slipped -> Fail ("revs accepted: " <> T.pack (show slipped)),
+      runTest "a full SHA-1 is accepted in either case" $
+        let accepted = [T.replicate 40 "a", T.replicate 40 "F", "dcb93b58bd982ab64323bac2a8c11b138d6b55e5"]
+         in case [rev | rev <- accepted, either (const True) (const False) (checkGitRev rev)] of
+              [] -> Pass
+              refused -> Fail ("revs refused: " <> T.pack (show refused)),
+      runTestM "fetchGit refuses an option-shaped ref at eval time" $ do
+        outcome <- evalNixIO "." "builtins.fetchGit { url = \"/srv/repo\"; ref = \"--upload-pack=id\"; }"
+        pure $ case outcome of
+          Left err
+            | "ref is not a valid git ref name" `T.isInfixOf` err -> Pass
+            | otherwise -> Fail ("wrong error: " <> err)
+          Right _ -> Fail "option-shaped ref evaluated"
     ]
 
 testScratchDirs :: IO [Bool]
