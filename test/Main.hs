@@ -49,7 +49,7 @@ import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
@@ -7606,6 +7606,14 @@ evalAndBuild storeDir source = do
               store <- openStore storeDir
               tmpBase <- getTemporaryDirectory
               let config = (defaultBuildConfig storeDir) {bcTmpDir = tmpBase </> "nova-nix-e2e-tmp"}
+              -- What the CLI driver does before building, in the same
+              -- order: eval has no store DB handle, so anything it wrote
+              -- is registered here or not at all.  Skipping it made this
+              -- harness unable to see a whole class of driver bug.
+              sourceCache <- readIORef (esSourcePathCache st)
+              storeWrites <- readIORef (esStoreWriteCache st)
+              materializeEvalSources store sourceCache
+              materializeEvalStoreWrites store storeWrites
               result <- buildDerivation config store drv
               pure (Right (result, store))
             _ -> pure (Left "no _derivation in result attrs")
@@ -7642,6 +7650,63 @@ testE2E = do
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (tmpBase </> "nova-nix-e2e-tmp")
         pure ret,
+      -- Every eval-time store writer must register, not only toFile: an
+      -- unrecorded write reaches drvInputSrcs and the build dies with
+      -- "references unregistered path".
+      runTestM "e2e eval-time store writes register as derivation inputs" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-e2e-inputs"
+            srcDir = tmpBase </> "nova-nix-test-e2e-inputs-src"
+            nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+            drvWith srcExpr =
+              T.concat
+                [ "derivation { name = \"inputs-test\"; system = builtins.currentSystem; ",
+                  "builder = \"" <> nixEscape shell <> "\"; ",
+                  "args = [\"-c\" \"echo ok > $out\"]; ",
+                  "src = " <> srcExpr <> "; }"
+                ]
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists srcDir
+        Dir.createDirectoryIfMissing True srcDir
+        writeFile (srcDir </> "f.txt") "content\n"
+        let cases =
+              [ ("toFile", "builtins.toFile \"note\" \"text\""),
+                -- A path LITERAL, not a string, so it must be spelled the
+                -- way the evaluator spells path values: the lexer rejects a
+                -- backslash, and a native Windows temp dir is full of them.
+                -- Through 'canonPathValue' rather than a separator replace,
+                -- because a backslash is an ordinary file-name character on
+                -- POSIX and only a separator on Windows.
+                ("path", "builtins.path { path = " <> canonPathValue (T.pack srcDir) <> "; name = \"sd\"; }")
+              ]
+        outcomes <-
+          mapM
+            ( \(label, expr) -> do
+                result <- evalAndBuild (StoreDir tmpStore) (drvWith expr)
+                pure (label, result)
+            )
+            cases
+        let failures =
+              [ label <> ": " <> reason
+              | (label, result) <- outcomes,
+                Just reason <-
+                  [ case result of
+                      Left err -> Just err
+                      Right (BuildFailure msg _, _) -> Just msg
+                      Right (BuildSuccess _, _) -> Nothing
+                  ]
+              ]
+        mapM_
+          ( \(_, result) -> case result of
+              Right (_, store) -> closeStore store
+              Left _ -> pure ()
+          )
+          outcomes
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists srcDir
+        pure $ case failures of
+          [] -> Pass
+          errs -> Fail (T.intercalate "; " errs),
       -- Parse error produces Left
       runTestM "e2e parse error" $ do
         tmpBase <- getTemporaryDirectory

@@ -51,7 +51,7 @@ module Nix.Store
     placeInStore,
     registrationFor,
     materializeEvalSources,
-    materializeEvalTextPaths,
+    materializeEvalStoreWrites,
     scanReferences,
     scanTempReferences,
     setReadOnly,
@@ -1034,12 +1034,13 @@ materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
             reg <- registrationFor store sp Nothing []
             registerPath (stDB store) reg
 
--- | Register the text paths @builtins.toFile@ wrote during evaluation:
--- makes each read-only and records it in the DB.  Batched so a text path
--- referring to another resolves.
-materializeEvalTextPaths :: Store -> Map Text [StorePath] -> IO ()
-materializeEvalTextPaths store textPaths = do
-  regs <- catMaybes <$> mapM prepare (Map.toList textPaths)
+-- | Register the store objects evaluation wrote: makes each read-only
+-- and records it in the DB.  Batched so a write referring to another
+-- resolves.  Covers every eval-time writer, not only @builtins.toFile@:
+-- an unregistered write reaches @drvInputSrcs@ and fails the build.
+materializeEvalStoreWrites :: Store -> Map Text [StorePath] -> IO ()
+materializeEvalStoreWrites store storeWrites = do
+  regs <- catMaybes <$> mapM prepare (Map.toList storeWrites)
   unless (null regs) (registerPaths (stDB store) regs)
   where
     prepare (spText, refs) =
