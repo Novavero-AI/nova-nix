@@ -87,7 +87,11 @@ jobs:
         run: cabal install exe:nova-nix --install-method=copy --installdir=staged --overwrite-policy=always
 
       # bin/ beside share/ is the layout resolveDataDir looks for, so the
-      # archive works unpacked anywhere with nothing set.
+      # archive works unpacked anywhere with nothing set.  pkgs/ rides along
+      # because it is what there is to build: every path in it is either
+      # relative to itself or the <nix/*> entry share/ already provides, so
+      # the README's own first command runs against the unpacked copy
+      # instead of needing the repository cloned beside it.
       - name: Assemble the archive
         shell: bash
         run: |
@@ -97,12 +101,16 @@ jobs:
           mkdir -p "$stem/bin" "$stem/share/nova-nix/nix"
           cp staged/nova-nix* "$stem/bin/"
           cp data/nix/fetchurl.nix "$stem/share/nova-nix/nix/"
+          cp -R pkgs "$stem/"
           cp LICENSE NOTICE README.md "$stem/"
           echo "stem=$stem" >> "$GITHUB_ENV"
 
       # The asset has to work before it is published, not after someone
       # reports that it does not.  nova_nix_datadir is pointed at nothing so
-      # a pass can only come from the archive's own share/ directory.
+      # a pass can only come from the archive's own share/ directory.  The
+      # recipes are asserted present rather than built: what they do when
+      # built is the Windows E2E job's verdict on every commit, while a
+      # copy that silently landed them nowhere is only visible here.
       - name: Smoke-test the assembled archive
         shell: bash
         run: |
@@ -111,6 +119,33 @@ jobs:
           [ -x "$exe" ] || exe="$stem/bin/nova-nix.exe"
           got=$(nova_nix_datadir=/nonexistent "$exe" eval --expr 'builtins.typeOf (import <nix/fetchurl.nix>)')
           [ "$got" = '"lambda"' ] || { echo "archive cannot resolve <nix/*>: $got" >&2; exit 1; }
+          for recipe in pkgs/windows/hello.nix pkgs/windows/stdenv.nix pkgs/windows/setup.sh; do
+            [ -f "$stem/$recipe" ] || { echo "archive is missing $recipe" >&2; exit 1; }
+          done
+
+      # The step above runs on the machine that built the binary, where a
+      # full GHC toolchain sits on PATH, so it cannot tell a self-contained
+      # executable from one quietly finding its DLLs next door.  PATH cut to
+      # the system directories is the download's actual situation: a
+      # dependency that starts linking zlib, zstd or libgcc dynamically
+      # fails here rather than on the first person to unpack the zip.
+      # Windows only, because it is the only platform whose loader consults
+      # PATH at all.
+      - name: The archive runs with no toolchain on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:SystemRoot\system32;$env:SystemRoot"
+          $env:nova_nix_datadir = "/nonexistent"
+          $got = & "$env:stem\bin\nova-nix.exe" eval --expr 'builtins.typeOf (import <nix/fetchurl.nix>)'
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "the archive's binary does not start without the build machine's PATH"
+            exit 1
+          }
+          if ($got -ne '"lambda"') {
+            Write-Error "archive cannot resolve <nix/*> on a bare PATH: $got"
+            exit 1
+          }
 
       - name: Create the archive
         shell: bash
@@ -166,9 +201,15 @@ jobs:
           See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/CHANGELOG.md)
           for what changed in this release.
 
-          Each archive unpacks to \`bin/\` beside \`share/\`. Run \`bin/nova-nix\`
-          from anywhere: no toolchain, and nothing to configure. Verify the
-          download with \`sha256sum -c SHA256SUMS\`.
+          Each archive unpacks to \`bin/\` beside \`share/\` and \`pkgs/\`. Run
+          \`bin/nova-nix\` from anywhere: no toolchain, and nothing to configure.
+          The bundled recipes build as they stand, so on Windows:
+
+          \`\`\`console
+          > bin\\nova-nix.exe build pkgs\\windows\\hello.nix
+          \`\`\`
+
+          Verify the download with \`sha256sum -c SHA256SUMS\`.
           EOF
           gh release create "v${VERSION}" \
             --draft \
@@ -190,9 +231,16 @@ jobs:
           fi
           gh release edit "v${VERSION}" --draft=false
 
+  # Waits on package, not merely on the checks: a Hackage version is
+  # immutable, so an upload is the one step of a release that cannot be taken
+  # back, and it must not happen for a tag whose binaries do not build.  It
+  # does not wait on the release job as well, though the ordering reads
+  # naturally: that job is re-runnable and this one is not, so a failed
+  # `gh release create` would strand the upload behind a job that refuses to
+  # repeat once the release exists.
   publish:
     name: Publish to Hackage
-    needs: [check-tag, ci, parity]
+    needs: [check-tag, package]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
