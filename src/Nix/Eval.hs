@@ -671,9 +671,16 @@ evalBcAttrs env bcIdx0 = do
     else evalBcNonRecAttrs env bindings
 
 -- | Evaluate a non-recursive attr set from bytecode bindings.
+--
+-- Values go through 'cheapThunkBc', so a constant or a variable already in
+-- scope becomes the value rather than a thunk over it, which is what
+-- upstream's non-recursive @ExprAttrs::eval@ does through @maybeThunk@.  The
+-- env here is the enclosing one and is fully built, so reading a variable
+-- out of it now is safe; the recursive and @let@ paths knot-tie their own
+-- frame and cannot make the same shortcut.
 evalBcNonRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> m NixValue
 evalBcNonRecAttrs env bindings = do
-  thunkMap <- buildBcThunkMap env bindings
+  thunkMap <- buildBcThunkMap cheapThunkBc env bindings
   pure (VAttrs (attrSetFromMap thunkMap))
 
 -- | Build a let\/rec frame env, sharing the parent-chain and with-scope
@@ -713,9 +720,9 @@ evalBcRecAttrs env bindings captureInfo
       let scopeCset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
           recEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet scopeCset))
           (staticBs, dynBs) = partition bcBindingIsStatic bindings
-      staticThunks <- buildBcThunkMap recEnv staticBs
+      staticThunks <- buildBcThunkMap mkThunkBc recEnv staticBs
       let scopeFilled = fillCAttrSetValues scopeCset staticThunks
-      dynThunks <- scopeFilled `seq` buildBcThunkMap recEnv dynBs
+      dynThunks <- scopeFilled `seq` buildBcThunkMap mkThunkBc recEnv dynBs
       -- A dynamic key colliding with a static sibling is an eval error
       -- upstream ("dynamic attribute already defined"), never a merge.
       case Map.keys (Map.intersection dynThunks staticThunks) of
@@ -749,7 +756,7 @@ evalBcLet env bcIdx0 = do
       -- resolve in the let env, which the body also sees.
       let cset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
           letEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet cset))
-      thunkMap <- buildBcThunkMap letEnv bindings
+      thunkMap <- buildBcThunkMap mkThunkBc letEnv bindings
       let filled = fillCAttrSetValues cset thunkMap
        in filled `seq` evalBytecode letEnv bodyIdx
 
@@ -814,15 +821,21 @@ buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
     go (_ : bs) ts !acc = go bs ts acc
 
 -- | Build thunk map for bytecode attrs (non-rec or fallback rec path).
-buildBcThunkMap :: (MonadEval m) => Env -> [BcBinding] -> m (Map Text Thunk)
-buildBcThunkMap thunkEnv = foldM addBinding Map.empty
+-- | Build the name-to-thunk map for a set of bindings.
+--
+-- How a value becomes a thunk is the caller's decision: a non-recursive
+-- attr set can resolve constants and in-scope variables immediately, while a
+-- frame that is still being tied has to defer everything, since the slots
+-- the variables point at are not filled yet.
+buildBcThunkMap :: (MonadEval m) => (Env -> Word32 -> Thunk) -> Env -> [BcBinding] -> m (Map Text Thunk)
+buildBcThunkMap mkValueThunk thunkEnv = foldM addBinding Map.empty
   where
     addBinding acc (BcNamed keys valBcIdx) = do
       resolvedKeys <- mapM (resolveBcKey thunkEnv) keys
       case sequence resolvedKeys of
         Nothing -> pure acc -- null key -> skip
         Just [key] ->
-          insertChecked acc key (mkThunkBc thunkEnv valBcIdx)
+          insertChecked acc key (mkValueThunk thunkEnv valBcIdx)
         Just path ->
           let nested = buildBcNestedAttr thunkEnv path valBcIdx
            in foldM (\a (k, t0) -> insertChecked a k t0) acc (Map.toList nested)

@@ -113,12 +113,14 @@ where
 import Control.Monad (forM_)
 import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word32, Word64, Word8)
@@ -128,7 +130,7 @@ import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Float (castWord64ToDouble)
 import Nix.Derivation (Derivation)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcOpcode, cbcShortArg)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaNameSym, clambdaNew, clambdaSetEntry)
@@ -721,27 +723,87 @@ mkThunkBc env bcIdx =
 -- pending thunk.  Everything else falls back to 'mkThunkBc'.
 cheapThunkBc :: Env -> Word32 -> Thunk
 cheapThunkBc env bcIdx =
-  let opcode = unsafePerformIO (cbcOpcode bcIdx)
-   in case opcode of
-        10 {- RESOLVED_VAR -} ->
-          let level = fromIntegral (unsafePerformIO (cbcArg1 bcIdx))
-              idx = fromIntegral (unsafePerformIO (cbcArg2 bcIdx))
-           in envLookupResolved level idx env
-        0 {- LIT_INT -} ->
-          let lo = unsafePerformIO (cbcArg1 bcIdx)
-              hi = unsafePerformIO (cbcArg2 bcIdx)
-              w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
-           in Thunk (newComputedIntPtr (fromIntegral w64 :: Int64))
-        1 {- LIT_FLOAT -} ->
-          let lo = unsafePerformIO (cbcArg1 bcIdx)
-              hi = unsafePerformIO (cbcArg2 bcIdx)
-              w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
-           in Thunk (newComputedFloatPtr (castWord64ToDouble w64))
-        2 {- LIT_BOOL -} ->
-          let flag = unsafePerformIO (cbcShortArg bcIdx)
-           in Thunk (newComputedBoolPtr (if flag /= 0 then 1 else 0))
-        3 {- LIT_NULL -} -> Thunk newComputedNullPtr
-        _ -> mkThunkBc env bcIdx
+  case unsafePerformIO (cbcOpcode bcIdx) of
+    OpResolvedVar ->
+      let level = fromIntegral (unsafePerformIO (cbcArg1 bcIdx))
+          idx = fromIntegral (unsafePerformIO (cbcArg2 bcIdx))
+       in envLookupResolved level idx env
+    OpLitInt ->
+      let lo = unsafePerformIO (cbcArg1 bcIdx)
+          hi = unsafePerformIO (cbcArg2 bcIdx)
+          w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
+       in Thunk (newComputedIntPtr (fromIntegral w64 :: Int64))
+    OpLitFloat ->
+      let lo = unsafePerformIO (cbcArg1 bcIdx)
+          hi = unsafePerformIO (cbcArg2 bcIdx)
+          w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
+       in Thunk (newComputedFloatPtr (castWord64ToDouble w64))
+    OpLitBool ->
+      let flag = unsafePerformIO (cbcShortArg bcIdx)
+       in Thunk (newComputedBoolPtr (if flag /= 0 then 1 else 0))
+    OpLitNull -> Thunk newComputedNullPtr
+    OpLitUri ->
+      let sym = unsafePerformIO (cbcArg1 bcIdx)
+       in Thunk (newComputedStrPtr (symbolBytes (Symbol sym)))
+    OpStr
+      | Just bytes <- literalStrBytes bcIdx -> Thunk (newComputedStrPtr bytes)
+    OpLitPath
+      | Just resolved <- constantPathValue bcIdx -> Thunk (newComputedPathPtr resolved)
+    OpList
+      | emptyBcList bcIdx -> Thunk (newComputedThunkPtr (VList emptyCList))
+    _ -> mkThunkBc env bcIdx
+
+-- | The value of a path literal, when producing it is not work.
+--
+-- Parsing resolves every relative path literal against the file's directory
+-- ('Nix.Expr.Resolve.resolveRelativePaths'), so what reaches here is already
+-- absolute and only wants the lexical canonicalisation every path value
+-- carries.  The exception is a home-relative literal, which parsing leaves
+-- alone: expanding it reads @HOME@, and that is an effect this cannot run.
+constantPathValue :: Word32 -> Maybe Text
+constantPathValue bcIdx
+  | T.isPrefixOf "~/" text = Nothing
+  | otherwise = Just (canonPathValue text)
+  where
+    text = symbolText (Symbol (unsafePerformIO (cbcArg1 bcIdx)))
+
+-- | Whether a list expression has no elements, and so is the same empty list
+-- however many times it is written.  Upstream hands back one shared
+-- @vEmptyList@ for this rather than a thunk.
+emptyBcList :: Word32 -> Bool
+emptyBcList bcIdx =
+  let (count, _) = unsafePerformIO (cbcCountedPayload bcIdx =<< cbcArg1 bcIdx)
+   in count == 0
+
+-- | @NN_STRPART_LIT@ from @cbits/nn_bytecode.h@: a string part that is
+-- literal text rather than an interpolation.
+strPartLiteral :: Word32
+strPartLiteral = 0
+
+-- | The bytes of a string expression every part of which is literal, or
+-- 'Nothing' when one is an interpolation and producing the value is work.
+--
+-- Upstream draws this line in the parser: a fully literal string folds into
+-- an @ExprString@ carrying a ready-made value, and only a string with
+-- interpolation survives as @ExprConcatStrings@.  The split is made here
+-- instead by reading the parts back, because this compiler emits one opcode
+-- for both shapes.
+--
+-- Deliberately not extended to @OpIndStr@, whose common indentation is
+-- stripped during evaluation rather than in the parser, so its value is not
+-- yet a constant at this point.  Upstream can treat one as a constant
+-- because its parser has already done that stripping.
+literalStrBytes :: Word32 -> Maybe ByteString
+literalStrBytes bcIdx =
+  let (count, dataOff) = unsafePerformIO (cbcCountedPayload bcIdx =<< cbcArg1 bcIdx)
+   in BS.concat <$> partBytes count dataOff
+  where
+    partBytes 0 _ = Just []
+    partBytes n off
+      | unsafePerformIO (cbcData off) /= strPartLiteral = Nothing
+      | otherwise =
+          let sym = unsafePerformIO (cbcData (off + 1))
+           in (symbolBytes (Symbol sym) :) <$> partBytes (n - 1 :: Int) (off + 2)
 
 -- | Allocate a fresh C arena thunk cell with bytecode.
 --
