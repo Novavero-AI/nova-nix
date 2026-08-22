@@ -53,6 +53,7 @@ import qualified Data.ByteString as BS
 import Data.Char (toLower, toUpper)
 import Data.Either (fromRight)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.List (sort)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
@@ -69,7 +70,7 @@ import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
-import Nix.Store (PathLock, PathRegistration, Store (..), isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
+import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), defaultStoreDirText, storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), catchSync, trySubstitute)
 import qualified NovaCache.NAR as NAR
@@ -204,8 +205,64 @@ buildDerivation config store drv =
   buildDerivationInner config store drv
     `catchSync` \err -> pure (BuildFailure ("build exception: " <> T.pack (show err)) 1)
 
+-- | Build under the outputs' path locks.  A derivation another process
+-- finished while we waited for them is adopted rather than redone:
+-- rebuilding would delete a registered path out from under whoever is
+-- already using it, which is why substitution adopts a finished path too.
 buildDerivationInner :: BuildConfig -> Store -> Derivation -> IO BuildResult
-buildDerivationInner config store drv = do
+buildDerivationInner config store drv =
+  withOutputLocks config store drv (maybe (buildUnderLock config store drv) (pure . BuildSuccess))
+
+-- | Hold every output's path lock for the whole build, and report
+-- whether the derivation was already finished by the time they were
+-- granted.
+--
+-- #119 and #121 made delete, materialize and register one critical
+-- section under @\<store-path\>.lock@.  The build path never joined it,
+-- so two concurrent builds of one derivation shared a build directory
+-- ('computeBuildDir' is deterministic), interleaved their writes into a
+-- single tree, and each registered it as valid.  Nothing failed; the
+-- registered output was simply not what either build produced.
+--
+-- Outputs are locked in 'StorePath' order so two processes racing the
+-- same multi-output derivation request them in the same sequence.  A
+-- build holds locks for its own outputs only - dependencies are
+-- resolved before 'buildDerivation' is called, never underneath it - so
+-- no process holds one lock while waiting on another, and there is no
+-- cycle to deadlock on.
+--
+-- The validity re-check happens under the locks, not before them:
+-- checked earlier it would answer about a moment that has already
+-- passed by the time the build starts.
+withOutputLocks :: BuildConfig -> Store -> Derivation -> (Maybe StorePath -> IO a) -> IO a
+withOutputLocks config store drv act = do
+  heldLocks <- newIORef []
+  let takeLock sp = do
+        lock <- acquirePathLock (bcStoreDir config) sp
+        atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
+  ( do
+      mapM_ takeLock (sort (map doPath (drvOutputs drv)))
+      finishedElsewhere <- allOutputsValid store drv
+      act finishedElsewhere
+    )
+    `finally` (readIORef heldLocks >>= mapM_ releasePathLock)
+
+-- | The derivation's first output path when EVERY output is already
+-- registered, otherwise 'Nothing'.
+--
+-- Distinct from 'isOutputCached', which answers about the first output
+-- alone: a partially valid multi-output derivation still has to build,
+-- and treating it as finished would leave the missing outputs missing.
+allOutputsValid :: Store -> Derivation -> IO (Maybe StorePath)
+allOutputsValid store drv = case map doPath (drvOutputs drv) of
+  [] -> pure Nothing
+  outputPaths@(firstOutput : _) -> do
+    validity <- mapM (isValid store) outputPaths
+    pure (if and validity then Just firstOutput else Nothing)
+
+-- | The build itself, with every output's lock already held.
+buildUnderLock :: BuildConfig -> Store -> Derivation -> IO BuildResult
+buildUnderLock config store drv = do
   -- 1. Validate inputs (sources + input-derivation outputs) exist
   inputsOk <- validateInputs config store drv
   case inputsOk of
