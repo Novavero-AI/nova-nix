@@ -42,10 +42,10 @@ import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir)
-import System.Directory (canonicalizePath, getCurrentDirectory, getTemporaryDirectory)
-import System.Environment (getArgs)
+import System.Directory (canonicalizePath, doesFileExist, getCurrentDirectory, getTemporaryDirectory)
+import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure)
-import System.FilePath (takeDirectory)
+import System.FilePath (takeDirectory, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 
 -- ---------------------------------------------------------------------------
@@ -163,6 +163,45 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
     valueFlags =
       ["--nix-path", "--store", "--substituter", "--trusted-key", "--expr", "--cache", "--key-file", "--compression"]
 
+-- | Upstream C++ Nix's name for this directory, so an operator who knows
+-- one knows the other.
+nixDataDirVar :: String
+nixDataDirVar = "NIX_DATA_DIR"
+
+-- | Where a release archive keeps the bundled expressions, relative to the
+-- directory holding @bin@.
+bundledDataSubdir :: FilePath
+bundledDataSubdir = "share" </> "nova-nix"
+
+-- | The one file a data dir must contain, used to tell a real one from a
+-- directory that merely exists.
+dataDirMarker :: FilePath
+dataDirMarker = "nix" </> "fetchurl.nix"
+
+-- | Locate the bundled @\<nix/*\>@ expressions.
+--
+-- Cabal bakes an absolute @datadir@ into the binary at configure time.  That
+-- is right for a @cabal install@ on this machine and wrong for every copied
+-- or downloaded one, because the path names the machine that did the build:
+-- a released binary would resolve @\<nix/fetchurl.nix\>@ to a directory that
+-- does not exist on the host running it.
+--
+-- @NIX_DATA_DIR@ wins when set, since an operator setting upstream's own
+-- variable means it.  Otherwise a release layout (@bin/@ beside @share/@)
+-- answers from the executable's own location, which needs no configuration
+-- at all.  The Cabal path remains the fallback, so a local install is
+-- unaffected.
+resolveDataDir :: IO FilePath
+resolveDataDir = do
+  fromEnv <- lookupEnv nixDataDirVar
+  case fromEnv of
+    Just dir | not (null dir) -> pure dir
+    _ -> do
+      exeDir <- takeDirectory <$> getExecutablePath
+      let bundled = takeDirectory exeDir </> bundledDataSubdir
+      bundledUsable <- doesFileExist (bundled </> dataDirMarker)
+      if bundledUsable then pure bundled else getDataDir
+
 -- | Merge --nix-path entries, bundled data dir, and NIX_PATH search paths.
 -- The data dir is appended last so user paths take priority.
 mergeSearchPaths :: [T.Text] -> FilePath -> [Thunk] -> [Thunk]
@@ -185,7 +224,7 @@ main = do
   -- Initialize C data layer (symbol interning, thunk arena, env allocator)
   arenaInit
   args <- getArgs
-  dataDir <- getDataDir
+  dataDir <- resolveDataDir
   opts <- either (failWith . T.pack) pure (parseArgs args)
   case optCommand opts of
     CmdEvalFile filePath -> evalFile (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir filePath

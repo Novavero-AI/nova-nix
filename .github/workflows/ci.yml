@@ -276,6 +276,37 @@ jobs:
       - name: Test
         run: cabal test
 
+      # A released binary is a copied binary, and Cabal's datadir is baked in
+      # at configure time, naming the machine that built it.  Both fallbacks
+      # are checked with nova_nix_datadir pointed at nothing, so a pass can
+      # only come from the path under test and never from the Cabal default.
+      - name: The data dir survives relocation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cabal install exe:nova-nix --install-method=copy --installdir=reloc-src --overwrite-policy=always
+          root=$(mktemp -d)/nova-nix
+          mkdir -p "$root/bin" "$root/share/nova-nix/nix"
+          cp reloc-src/nova-nix* "$root/bin/"
+          cp data/nix/fetchurl.nix "$root/share/nova-nix/nix/"
+          exe="$root/bin/nova-nix"
+          [ -x "$exe" ] || exe="$root/bin/nova-nix.exe"
+
+          echo "== exe-relative share/ =="
+          got=$(nova_nix_datadir=/nonexistent "$exe" eval --expr 'builtins.typeOf (import <nix/fetchurl.nix>)')
+          [ "$got" = '"lambda"' ] || { echo "expected \"lambda\", got $got" >&2; exit 1; }
+
+          echo "== NIX_DATA_DIR overrides it =="
+          got=$(NIX_DATA_DIR="$PWD/data" nova_nix_datadir=/nonexistent "$exe" eval --expr 'builtins.typeOf (import <nix/fetchurl.nix>)')
+          [ "$got" = '"lambda"' ] || { echo "expected \"lambda\", got $got" >&2; exit 1; }
+
+          echo "== neither present is still a clean error, not a crash =="
+          rm -rf "$root/share"
+          if nova_nix_datadir=/nonexistent "$exe" eval --expr 'import <nix/fetchurl.nix>' 2>err.txt; then
+            echo "expected a failure with no data dir" >&2; exit 1
+          fi
+          grep -q "was not found in the Nix search path" err.txt
+
   # ---------------------------------------------------------------------------
   # End-to-end (Windows-only): the executable this repo ships, driving a real
   # build through the real stdenv - fetch the MinGW-w64 seed, compile hello.c
