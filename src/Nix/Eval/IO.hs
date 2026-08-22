@@ -118,9 +118,12 @@ data EvalState = EvalState
     -- | Cache of source path to its store path (recursive NAR hash), so a path
     -- literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text Text)),
-    -- | @builtins.toFile@ writes (store path to its references), for the
-    -- build driver to register before building - eval has no store DB handle.
-    esTextPathCache :: !(IORef (Map Text [SP.StorePath])),
+    -- | Every store object evaluation wrote (store path to its
+    -- references), for the build driver to register before building -
+    -- eval has no store DB handle.  All of them, not only
+    -- @builtins.toFile@: an unrecorded write reaches @drvInputSrcs@ as
+    -- an unregistered path and fails the build that names it.
+    esStoreWriteCache :: !(IORef (Map Text [SP.StorePath])),
     esBaseDir :: !FilePath,
     -- | Where store objects live on this machine, so eval's own reads and
     -- writes honor @--store@ the same way the builder does.
@@ -138,7 +141,7 @@ newEvalState storeDir baseDir = do
   drvCache <- newIORef Map.empty
   drvClosure <- newIORef Map.empty
   srcCache <- newIORef Map.empty
-  textCache <- newIORef Map.empty
+  storeWriteCache <- newIORef Map.empty
   now <- floor <$> getPOSIXTime :: IO Int64
   nixPathStr <- lookupEnvText "NIX_PATH"
   let searchPaths = case nixPathStr of
@@ -150,7 +153,7 @@ newEvalState storeDir baseDir = do
         esDrvModuloCache = drvCache,
         esDrvClosure = drvClosure,
         esSourcePathCache = srcCache,
-        esTextPathCache = textCache,
+        esStoreWriteCache = storeWriteCache,
         esBaseDir = baseDir,
         esStoreDir = storeDir,
         esTimestamp = now,
@@ -317,9 +320,7 @@ instance MonadEval EvalIO where
       unless alreadyThere $ do
         Dir.createDirectoryIfMissing True (takeDirectory filePath)
         BS.writeFile filePath contents
-    -- Recorded for the build driver to register - eval has no store DB.
-    textRef <- EvalIO (asks esTextPathCache)
-    EvalIO (liftIO (modifyIORef' textRef (Map.insert storePath refs)))
+    recordStoreWrite storePath refs
     pure storePath
 
   scopedImportFile scope rawPath = do
@@ -404,6 +405,7 @@ instance MonadEval EvalIO where
     destFilePath <- evalFilePath sp
     let destPath = canonicalStorePathText sp
     wrapIO (copyToStoreIfMissing resolvedSource destFilePath (takeDirectory destFilePath))
+    recordStoreWrite destPath []
     pure destPath
 
   narHashOfPath path = do
@@ -430,6 +432,7 @@ instance MonadEval EvalIO where
             Dir.createDirectoryIfMissing True (takeDirectory destFilePath)
             unpacked <- unpackNarEntry destFilePath entry
             either (throwIO . userError . T.unpack) pure unpacked
+        recordStoreWrite destPath []
         pure destPath
 
   addFixedOutputFile name bytes = do
@@ -441,6 +444,7 @@ instance MonadEval EvalIO where
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)
       BS.writeFile filePath bytes
+    recordStoreWrite storePath []
     pure storePath
 
   traceMessage msg = EvalIO (liftIO (hPutStrLn stderr (T.unpack msg)))
@@ -591,6 +595,16 @@ scratchSuffixBytes = 16
 -- writes to one directory and reads from another.
 storeFilePath :: SP.StoreDir -> SP.StorePath -> FilePath
 storeFilePath = SP.storePathToFilePath
+
+-- | Record a store object evaluation just wrote, so the build driver
+-- registers it before a derivation naming it is built.  Every eval-time
+-- writer goes through this: a write that skips it lands in
+-- @drvInputSrcs@ with no registration row and fails the build with
+-- \"references unregistered path\".
+recordStoreWrite :: Text -> [SP.StorePath] -> EvalIO ()
+recordStoreWrite storePath refs = do
+  cacheRef <- EvalIO (asks esStoreWriteCache)
+  EvalIO (liftIO (modifyIORef' cacheRef (Map.insert storePath refs)))
 
 -- | 'storeFilePath' against the store this evaluation was given.
 evalFilePath :: SP.StorePath -> EvalIO FilePath
