@@ -120,7 +120,8 @@ import Nix.Eval (PureEval (..), eval)
 import Nix.Builtins (builtinEnv)
 
 main :: IO ()
-main = case parseNix "<expr>" "let x = 5; in x * 2 + 1" of
+-- The first argument is what relative path literals resolve against.
+main = case parseNix "/tmp" "<expr>" "let x = 5; in x * 2 + 1" of
   Left err   -> print err
   Right expr -> print (runPureEval (eval (builtinEnv 0 []) expr))  -- Right (VInt 11)
 ```

@@ -121,10 +121,17 @@ assertLeft :: (Show a) => Text -> Either e a -> TestResult
 assertLeft _ (Left _) = Pass
 assertLeft label (Right val) = Fail (label <> ": expected error but got: " <> T.pack (show val))
 
+-- | What a test expression's relative path literals resolve against.
+-- Absolute, because that is the invariant the parser now establishes: no
+-- relative path literal survives parsing, so nothing downstream has to know
+-- what one would have meant.
+testBaseDir :: FilePath
+testBaseDir = "/nova-nix-test"
+
 -- | Helper: parse and check result.
 assertParse :: Text -> Text -> Expr -> TestResult
 assertParse label source expected =
-  assertRight label (parseNix "<test>" source) $ \actual ->
+  assertRight label (parseNix testBaseDir "<test>" source) $ \actual ->
     assertEqual label expected actual
 
 -- | Helper: extract just token types from Located list (drop positions and EOF).
@@ -134,7 +141,7 @@ tokenTypes = filter (/= TokEOF) . map locToken
 -- | Helper: parse Nix source and evaluate with builtinEnv.  Parse errors
 -- are tagged so failure assertions can tell them apart from eval errors.
 evalNix :: Text -> Either Text NixValue
-evalNix source = case parseNix "<test>" source of
+evalNix source = case parseNix testBaseDir "<test>" source of
   Left err -> Left (parseErrorTag <> T.pack (show err))
   Right expr -> runPureEval (eval (builtinEnv 0 []) expr)
 
@@ -691,17 +698,17 @@ testEvalWith = do
           (VInt 3),
       -- AST test: parse "with a; b" produces EWithVar
       runTest "parse with produces EWithVar" $
-        assertRight "with-ast" (parseNix "<test>" "with a; b") $ \case
+        assertRight "with-ast" (parseNix testBaseDir "<test>" "with a; b") $ \case
           EWith (EVar "a") (EWithVar "b") -> Pass
           other -> Fail ("expected EWith (EVar a) (EWithVar b), got: " <> T.pack (show other)),
       -- AST test: formal wins over with
       runTest "parse lambda formal wins over with" $
-        assertRight "formal-wins" (parseNix "<test>" "x: with a; x") $ \case
+        assertRight "formal-wins" (parseNix testBaseDir "<test>" "x: with a; x") $ \case
           ELambda _ (EWith _ (EResolvedVar 0 0)) _ -> Pass
           other -> Fail ("expected formal to win, got: " <> T.pack (show other)),
       -- Trimming test: lambda inside with gets CapturesWithScopes
       runTest "with lambda trimmed with CapturesWithScopes" $
-        assertRight "with-trim" (parseNix "<test>" "with a; x: b + x") $ \case
+        assertRight "with-trim" (parseNix testBaseDir "<test>" "with a; x: b + x") $ \case
           EWith _ (ELambda _ _ (CapturesWithScopes _)) -> Pass
           other -> Fail ("expected CapturesWithScopes, got: " <> T.pack (show other))
     ]
@@ -1357,19 +1364,19 @@ testParserErrors = do
   putStrLn "parser/errors"
   sequence
     [ runTest "empty input" $
-        assertLeft "empty" (parseNix "<test>" ""),
+        assertLeft "empty" (parseNix testBaseDir "<test>" ""),
       runTest "unclosed paren" $
-        assertLeft "unclosed paren" (parseNix "<test>" "(1"),
+        assertLeft "unclosed paren" (parseNix testBaseDir "<test>" "(1"),
       runTest "unclosed string" $
-        assertLeft "unclosed string" (parseNix "<test>" "\"hello"),
+        assertLeft "unclosed string" (parseNix testBaseDir "<test>" "\"hello"),
       runTest "unclosed brace" $
-        assertLeft "unclosed brace" (parseNix "<test>" "{ a = 1;"),
+        assertLeft "unclosed brace" (parseNix testBaseDir "<test>" "{ a = 1;"),
       runTest "missing semicolon" $
-        assertLeft "missing semi" (parseNix "<test>" "{ a = 1 }"),
+        assertLeft "missing semi" (parseNix testBaseDir "<test>" "{ a = 1 }"),
       runTest "unclosed bracket" $
-        assertLeft "unclosed bracket" (parseNix "<test>" "[ 1 2"),
+        assertLeft "unclosed bracket" (parseNix testBaseDir "<test>" "[ 1 2"),
       runTest "unexpected token" $
-        assertLeft "unexpected" (parseNix "<test>" ")")
+        assertLeft "unexpected" (parseNix testBaseDir "<test>" ")")
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1381,7 +1388,7 @@ testParserIntegration = do
   putStrLn "parser/integration"
   sequence
     [ runTest "shell.nix pattern" $
-        assertRight "shell.nix" (parseNix "<test>" "{ pkgs ? import <nixpkgs> {} }: pkgs.mkShell { buildInputs = [ pkgs.ghc ]; }") $ \case
+        assertRight "shell.nix" (parseNix testBaseDir "<test>" "{ pkgs ? import <nixpkgs> {} }: pkgs.mkShell { buildInputs = [ pkgs.ghc ]; }") $ \case
           ELambda {} -> Pass
           other -> Fail ("expected ELambda, got: " <> T.pack (show other)),
       runTest "let with multiple bindings" $
@@ -1419,12 +1426,12 @@ testParserIntegration = do
               NoCaptureInfo
           ),
       runTest "indented string" $
-        assertRight "ind string" (parseNix "<test>" "''hello''") $ \case
+        assertRight "ind string" (parseNix testBaseDir "<test>" "''hello''") $ \case
           EIndStr _ -> Pass
           other -> Fail ("expected EIndStr, got: " <> T.pack (show other)),
       -- Positional let/rec resolution tests
       runTest "let inherit from outer lambda" $
-        assertRight "let-inherit-lambda" (parseNix "<test>" "x: let inherit x; in x") $ \case
+        assertRight "let-inherit-lambda" (parseNix testBaseDir "<test>" "x: let inherit x; in x") $ \case
           -- x: let inherit x; in x
           -- The lambda formal x is at level 0, index 0.
           -- The let scope is level 0 (for the let body).
@@ -1938,7 +1945,7 @@ testImportPure = do
 
 -- | Parse and evaluate Nix source using the IO evaluator.
 evalNixIO :: FilePath -> Text -> IO (Either Text NixValue)
-evalNixIO baseDir source = case parseNix "<test>" source of
+evalNixIO baseDir source = case parseNix baseDir "<test>" source of
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
     st <- newEvalState platformStoreDir baseDir
@@ -7583,7 +7590,7 @@ testBuilder = do
 -- | End-to-end: eval .nix source, extract derivation, build, verify output.
 evalAndBuild :: StoreDir -> Text -> IO (Either Text (BuildResult, Store))
 evalAndBuild storeDir source = do
-  case parseNix "<test>" source of
+  case parseNix testBaseDir "<test>" source of
     Left err -> pure (Left ("parse error: " <> T.pack (show err)))
     Right expr -> do
       -- The SAME store the build below is given.  Evaluating against the
@@ -8370,7 +8377,7 @@ instance MonadEval StubStoreEval where
 
 -- | Parse and evaluate under the stubbed-store evaluator.
 evalNixStub :: Map.Map Text Derivation -> Text -> Either Text NixValue
-evalNixStub drvs source = case parseNix "<test>" source of
+evalNixStub drvs source = case parseNix testBaseDir "<test>" source of
   Left err -> Left (T.pack (show err))
   Right expr -> runStubStoreEval drvs (eval (builtinEnv 0 []) expr)
 
@@ -8463,6 +8470,11 @@ testClassIFollowupsIO = do
         createDirectoryIfMissing True (testDir </> "sub")
         TIO.writeFile (testDir </> "target.txt") "hit\n"
         TIO.writeFile (testDir </> "thefile") "payload\n"
+        -- Imported files for the two path-resolution tests below.  Each is
+        -- a directory deeper than the expression that names it, so a
+        -- literal resolved against the wrong one is visibly wrong.
+        TIO.writeFile (testDir </> "sub" </> "useq.nix") "q\n"
+        TIO.writeFile (testDir </> "sub" </> "tilde.nix") "~/nova-tilde-probe\n"
     )
     ( do
         exists <- doesDirectoryExist testDir
@@ -8476,6 +8488,25 @@ testClassIFollowupsIO = do
           let expected = canonPathValue (T.pack (home </> "nova-tilde-probe"))
           pure $ assertRight "tilde" result $ \val ->
             assertEqual "tilde-expanded" (mkStr expected) val,
+        -- The same literal inside an imported file.  Path resolution runs
+        -- over every parsed file now, and joining ~/x to the importing
+        -- directory would bury the tilde where nothing expands it.
+        runTestM "tilde path literal expands the same inside an imported file" $ do
+          home <- Dir.getHomeDirectory
+          result <- evalNixIO testDir "builtins.toString (import ./sub/tilde.nix)"
+          let expected = canonPathValue (T.pack (home </> "nova-tilde-probe"))
+          pure $ assertRight "tilde-import" result $ \val ->
+            assertEqual "tilde-expanded-in-import" (mkStr expected) val,
+        -- A path literal names a location relative to the file it is
+        -- written in.  This one is written here and forced during the
+        -- evaluation of sub/useq.nix, where the base directory is sub/:
+        -- resolving on force rather than on parse gave sub/target.txt.
+        runTestM "a path literal resolves where it is written, not where it is forced" $ do
+          let expr = "builtins.toString (builtins.scopedImport { q = ./target.txt; } ./sub/useq.nix)"
+          result <- evalNixIO testDir expr
+          let expected = canonPathValue (T.pack (testDir </> "target.txt"))
+          pure $ assertRight "scoped-import-path" result $ \val ->
+            assertEqual "resolved-against-writing-file" (mkStr expected) val,
         -- a search-path match is returned CANONICALIZED
         runTestM "findFile canonicalizes the matched candidate" $ do
           result <-

@@ -52,7 +52,6 @@ import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
-import Nix.Expr.Types (AttrKey (..), Binding (..), Expr (..), Formal (..), Formals (..), NixAtom (..), StringPart (..))
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (copyPathInto, unpackNarEntry)
@@ -208,16 +207,12 @@ instance MonadEval EvalIO where
       Just cached -> pure cached
       Nothing -> do
         source <- wrapIO (readFileAutoEncoding ioTarget)
-        case parseNix (T.pack target) source of
+        let fileDir = takeDirectory target
+        case parseNix fileDir (T.pack target) source of
           Left err ->
             throwEvalError
               ("import " <> T.pack target <> ": " <> T.pack (show err))
-          Right rawExpr -> do
-            -- Resolve relative paths in the AST to absolute, matching
-            -- real Nix (which resolves at parse time).  This ensures paths
-            -- captured in closures remain valid after the import scope ends.
-            let fileDir = takeDirectory target
-                expr = resolveRelativePaths fileDir rawExpr
+          Right expr -> do
             -- local sets new base dir for nested imports - pure, exception-safe
             let nested =
                   EvalIO
@@ -329,13 +324,12 @@ instance MonadEval EvalIO where
     searchPaths <- EvalIO (asks esSearchPaths)
     (target, ioTarget) <- resolveImportTarget baseDir rawPath
     source <- wrapIO (readFileAutoEncoding ioTarget)
-    case parseNix (T.pack target) source of
+    let fileDir = takeDirectory target
+    case parseNix fileDir (T.pack target) source of
       Left err ->
         throwEvalError
           ("scopedImport " <> T.pack target <> ": " <> T.pack (show err))
-      Right rawExpr -> do
-        let fileDir = takeDirectory target
-            expr = resolveRelativePaths fileDir rawExpr
+      Right expr -> do
         -- No import cache for scoped imports (different scopes = different results)
         let scopedEnv = builtinEnvWithScope timestamp searchPaths scope
         EvalIO
@@ -714,62 +708,6 @@ lookupEnvText name = do
   case (result :: Either SomeException (Maybe String)) of
     Left _ -> pure Nothing
     Right mval -> pure mval
-
--- ---------------------------------------------------------------------------
--- Path resolution (matching real Nix: resolve at parse time)
--- ---------------------------------------------------------------------------
-
--- | Resolve all relative 'NixPath' literals in an expression to absolute
--- paths relative to the given directory.  Real Nix resolves path literals
--- at parse time based on the source file location.  We do the same right
--- after parsing in 'importFile' so that paths captured in closures remain
--- valid after the import scope ends.
-resolveRelativePaths :: FilePath -> Expr -> Expr
-resolveRelativePaths dir = goExpr
-  where
-    goExpr expr = case expr of
-      ELit (NixPath p)
-        | isRelative (T.unpack p) ->
-            ELit (NixPath (T.pack (dir </> T.unpack p)))
-      ELit _ -> expr
-      EStr parts -> EStr (map goPart parts)
-      EIndStr parts -> EIndStr (map goPart parts)
-      EVar _ -> expr
-      EWithVar _ -> expr
-      EResolvedVar _ _ -> expr
-      EAttrs isRec bindings captureInfo -> EAttrs isRec (map goBinding bindings) captureInfo
-      EList elems -> EList (map goExpr elems)
-      ESelect target path mDef ->
-        ESelect (goExpr target) (map goKey path) (fmap goExpr mDef)
-      EHasAttr target path -> EHasAttr (goExpr target) (map goKey path)
-      EApp f x -> EApp (goExpr f) (goExpr x)
-      ELambda formals body captures -> ELambda (goFormals formals) (goExpr body) captures
-      ELet bindings body captureInfo -> ELet (map goBinding bindings) (goExpr body) captureInfo
-      EIf c t f -> EIf (goExpr c) (goExpr t) (goExpr f)
-      EWith scope body -> EWith (goExpr scope) (goExpr body)
-      EAssert cond body -> EAssert (goExpr cond) (goExpr body)
-      EUnary op e -> EUnary op (goExpr e)
-      EBinary op l r -> EBinary op (goExpr l) (goExpr r)
-      ESearchPath _ -> expr
-
-    goPart part = case part of
-      StrLit _ -> part
-      StrInterp e -> StrInterp (goExpr e)
-
-    goBinding binding = case binding of
-      NamedBinding path e -> NamedBinding (map goKey path) (goExpr e)
-      Inherit from names -> Inherit (fmap goExpr from) names
-
-    goKey key = case key of
-      StaticKey _ -> key
-      DynamicKey e -> DynamicKey (goExpr e)
-
-    goFormals formals = case formals of
-      FormalName _ -> formals
-      FormalSet fs ellipsis -> FormalSet (map goFormal fs) ellipsis
-      FormalNamedSet n fs ellipsis -> FormalNamedSet n (map goFormal fs) ellipsis
-
-    goFormal (Formal n mDef) = Formal n (fmap goExpr mDef)
 
 -- ---------------------------------------------------------------------------
 -- Store copy helpers
