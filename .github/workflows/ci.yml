@@ -337,6 +337,28 @@ jobs:
             exit 1
           }
 
+      # hello.nix drives cmd.exe directly, so it never loads stdenv.nix or
+      # setup.sh.  That is why a hardcoded /cygdrive/c in the stdenv's args
+      # went unnoticed: nothing in CI had ever run a mkDerivation package.
+      # GNU hello through the real stdenv is the smallest thing that does.
+      - name: Build hello through the stage-1 stdenv
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\bin\nova-nix.exe"
+          $out = (& $exe build pkgs\windows\hello-stdenv.nix) | Select-Object -Last 1
+          if ($LASTEXITCODE -ne 0) { Write-Error "stdenv build failed"; exit 1 }
+          Write-Host "out path: $out"
+          # setup.sh installs with `make install prefix=`, so autotools lands
+          # the binary under bin/, not at the output root.
+          $hello = Join-Path $out "bin\hello.exe"
+          if (-not (Test-Path $hello)) { Write-Error "no bin\hello.exe in $out"; exit 1 }
+          $got = (& $hello) -join "`n"
+          Write-Host "output: $got"
+          if ($got -ne "Hello, world!") {
+            Write-Error "unexpected hello output: $got"
+            exit 1
+          }
+
       - name: Diagnose store layout on failure
         if: failure()
         shell: pwsh

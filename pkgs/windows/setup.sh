@@ -13,34 +13,42 @@
 #   $buildPhase / $installPhase   replace the default build / install commands
 #
 # Windows path notes (see the MSYS2 path model): the seed tools are at /usr/bin
-# and /bin; an input store path is canonical /nix/store and must be mapped to
-# /cygdrive/c for bash, or to a C:/ "mixed" path (via `cygpath -m`) for the
-# native mingw compiler; the native $out is converted to a unix prefix with
-# `cygpath -u`.
+# and /bin.  Every store path arrives NATIVE (C:\nix\store\... or
+# C:/nix/store/...): the builder renders the canonical /nix/store spelling to
+# the machine's real store directory at the spawn boundary, so identity stays
+# canonical in derivation text and nothing host-specific is baked into it.
+# Two consumers want two spellings from there: MSYS2 bash wants
+# /cygdrive/<drive>/..., the native mingw compiler wants a mixed C:/... path.
 set -e
 
 # Seed tools first; the toolchain joins PATH below once its path is mapped.
 export PATH="/usr/bin:/bin"
 
-# Map a canonical /nix/store path to the MSYS2 drive-mounted form (for bash).
-# The drive letter comes from $NIX_STORE - the physical store root the
-# builder exports at spawn time (build-time only, never derivation text) -
-# so a store on any drive works.  Identity stays canonical /nix/store;
-# this mapping is the one host-specific step.  Pure parameter expansion:
-# nothing here may depend on PATH lookups beyond the seed itself.
-storeDrive="${NIX_STORE%%:*}"
-if [ "${#storeDrive}" != 1 ]; then storeDrive=c; fi
-storeDrive="${storeDrive,,}"
+# Native -> MSYS2 drive-mounted form, for anything bash itself opens.  A path
+# already in unix form passes through, so this is safe to apply twice.
+# Pure parameter expansion, deliberately: a path is needed before anything is
+# on PATH, and the seed's package set does not name a cygpath provider, so
+# nothing here may shell out to one.
 toBash() {
+  local drive rest
   case "$1" in
-    /nix/*) printf '/cygdrive/%s%s' "$storeDrive" "$1" ;;
-    *) printf '%s' "$1" ;;
+    ?:[/\\]*)
+      drive="${1%%:*}"
+      rest="${1#?:}"
+      printf '/cygdrive/%s%s' "${drive,,}" "${rest//\\//}"
+      ;;
+    *) printf '%s' "${1//\\//}" ;;
   esac
 }
 
-# $ccPath arrives canonical (stdenv.nix passes the store path unmapped);
-# every use below - including the PATH entry, which gcc's own spawned
-# cc1/ld need to find the toolchain DLLs - wants the mapped form.
+# Native -> the mixed C:/ form the native mingw tools take in -I/-L.  Same
+# bytes, forward slashes: a native tool cannot read /cygdrive.
+toWin() {
+  printf '%s' "${1//\\//}"
+}
+
+# Every use of $ccPath below - including the PATH entry, which gcc's own
+# spawned cc1/ld need to find the toolchain DLLs - wants the bash form.
 ccPath="$(toBash "$ccPath")"
 export PATH="$PATH:$ccPath"
 
@@ -58,7 +66,7 @@ export TMPDIR="$builddir/tmp" TMP="$builddir/tmp" TEMP="$builddir/tmp"
 CPPFLAGS=""
 LDFLAGS=""
 for dep in $buildInputs; do
-  depWin="$(cygpath -m "$(toBash "$dep")")"
+  depWin="$(toWin "$dep")"
   CPPFLAGS="$CPPFLAGS -I$depWin/include"
   LDFLAGS="$LDFLAGS -L$depWin/lib"
   PATH="$PATH:$(toBash "$dep")/bin"
@@ -80,7 +88,7 @@ done
 export NN_TOOLCHAIN="$ccPath"
 export PATH="$wrapperBin:$PATH"
 
-prefix="$(cygpath -u "$out")"
+prefix="$(toBash "$out")"
 
 # --- unpack phase ---
 mkdir -p "$builddir/src"
