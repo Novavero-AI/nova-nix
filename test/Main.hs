@@ -7707,6 +7707,39 @@ testE2E = do
         pure $ case failures of
           [] -> Pass
           errs -> Fail (T.intercalate "; " errs),
+      -- The build path joins the per-path lock protocol (#119, #121) that
+      -- delete, materialize and register already used.  Lock files persist
+      -- by design, so the one guarding the output is the observable
+      -- evidence the build took it; without it two concurrent builds share
+      -- a build directory and interleave into one tree.
+      runTestM "e2e a build takes its output's path lock" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-e2e-lock"
+            nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+            lockSource =
+              T.concat
+                [ "derivation { name = \"lock-test\"; system = builtins.currentSystem; ",
+                  "builder = \"" <> nixEscape shell <> "\"; ",
+                  "args = [\"-c\" \"echo locked > $out\"]; }"
+                ]
+        forceRemoveIfExists tmpStore
+        result <- evalAndBuild (StoreDir tmpStore) lockSource
+        ret <- case result of
+          Left err -> pure (Fail err)
+          Right (BuildFailure msg code, store) -> do
+            closeStore store
+            pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+          Right (BuildSuccess sp, store) -> do
+            closeStore store
+            let outPath = storePathToFilePath (StoreDir tmpStore) sp
+            locked <- Dir.doesFileExist (outPath <> ".lock")
+            pure $
+              if locked
+                then Pass
+                else Fail "no lock file beside the built output"
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (tmpBase </> "nova-nix-e2e-tmp")
+        pure ret,
       -- Parse error produces Left
       runTestM "e2e parse error" $ do
         tmpBase <- getTemporaryDirectory
