@@ -41,6 +41,28 @@ jobs:
             exit 1
           fi
 
+  # The workflows lint everything but themselves: Haskell, C and source
+  # encoding are all covered, while a .github/workflows change is validated
+  # only by GitHub agreeing to parse it after the push.  actionlint checks
+  # `uses:` refs, ${{ }} expressions, matrix references, job dependencies,
+  # and runs shellcheck over every `run:` block.  Pinned rather than
+  # floating: a lint that changes under you turns an unrelated PR red.
+  actionlint:
+    name: Actionlint
+    needs: [ascii]
+    runs-on: ubuntu-latest
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Lint the workflows
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar xz actionlint
+          ./actionlint -color
+
   # Fragments are pasted into CHANGELOG.md verbatim at release, so a malformed
   # one is only noticed while cutting the release, which is the worst time.
   changelog:
