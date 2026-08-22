@@ -7,14 +7,14 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Never cancel a publish: a Hackage upload is irreversible and a half-uploaded
-# release is worse than a slow one.
+# Never cancel a publish: assets are uploaded one at a time and a release that
+# is half-populated is worse than a slow one.
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 # Drop the default GITHUB_TOKEN to read-only by default; only the release job
-# widens it, and the Hackage upload uses its own token (HACKAGE_TOKEN).
+# widens it.
 permissions:
   contents: read
 
@@ -28,9 +28,8 @@ jobs:
     uses: ./.github/workflows/parity.yml
 
   # The tree is the source of truth: the tag must NAME the committed version,
-  # never rewrite it.  Its own job because two consumers depend on it now, and
-  # a mistyped tag must fail before either an immutable Hackage sdist or a
-  # public release exists.
+  # never rewrite it.  Its own job because two consumers depend on it, and a
+  # mistyped tag must fail before a public release exists to be found by it.
   check-tag:
     name: Check the tag
     runs-on: ubuntu-latest
@@ -172,9 +171,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Separate from the Hackage upload on purpose: a rejected Hackage POST is
-  # permanent (versions are immutable), so a combined job could never be
-  # re-run, while a release can be recreated freely.
+  # Hackage is not published from here.  A release can be deleted and cut
+  # again; a Hackage version cannot, so spending one is a separate decision
+  # taken at a separate time, and hackage.yml is dispatched by hand once a
+  # release has proved itself.
   release:
     name: GitHub release
     needs: [check-tag, package]
@@ -238,45 +238,3 @@ jobs:
             exit 1
           fi
           gh release edit "v${VERSION}" --draft=false
-
-  # Waits on package, not merely on the checks: a Hackage version is
-  # immutable, so an upload is the one step of a release that cannot be taken
-  # back, and it must not happen for a tag whose binaries do not build.  It
-  # does not wait on the release job as well, though the ordering reads
-  # naturally: that job is re-runnable and this one is not, so a failed
-  # `gh release create` would strand the upload behind a job that refuses to
-  # repeat once the release exists.
-  publish:
-    name: Publish to Hackage
-    needs: [check-tag, package]
-    # A Hackage version is immutable, so this is the one step of a release
-    # that no amount of re-running can take back.  The `hackage` environment
-    # requires a reviewer, which holds the job in `waiting` until a human
-    # approves it: a tag publishes the binaries immediately and asks before
-    # spending the version number.  Nothing else in the workflow references
-    # the environment, so the GitHub release is unaffected.
-    environment: hackage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: haskell-actions/setup@v2
-        with:
-          ghc-version: "9.14.1"
-          cabal-version: "latest"
-
-      - name: Build sdist
-        run: cabal sdist
-
-      # The token travels via stdin into curl's config, never argv:
-      # command lines are readable process-wide for the upload's duration.
-      - name: Upload to Hackage
-        env:
-          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
-        run: |
-          SDIST=$(ls dist-newstyle/sdist/nova-nix-*.tar.gz)
-          curl --fail --silent --show-error \
-            --config - \
-            --form "package=@${SDIST}" \
-            https://hackage.haskell.org/packages/ \
-            <<< "header = \"Authorization: X-ApiKey ${HACKAGE_TOKEN}\""
