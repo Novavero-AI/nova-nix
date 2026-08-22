@@ -663,11 +663,11 @@ prettyValue VNull = "null"
 prettyValue (VStr s _) = "\"" <> escapeNixString (bytesToTextLossy s) <> "\""
 prettyValue (VPath p) = p
 prettyValue (VList cl) =
-  "[ " <> T.intercalate " " (map (prettyThunk . Thunk) (clistThunks cl)) <> " ]"
+  wrapNixSeq "[" "]" (map (prettyThunk . Thunk) (clistThunks cl))
 prettyValue (VAttrs attrs) =
   let entries = attrSetToAscList attrs
       rendered = map (\(k, t) -> k <> " = " <> prettyThunk t <> ";") entries
-   in "{ " <> T.intercalate " " rendered <> " }"
+   in wrapNixSeq "{" "}" rendered
 prettyValue (VLambda {}) = "<lambda>"
 prettyValue (VBuiltin name _) = "<builtin " <> name <> ">"
 prettyValue (VCompiledRegex _) = "<compiled-regex>"
@@ -675,6 +675,14 @@ prettyValue (VDerivation drv) =
   case drvOutputs drv of
     (out : _) -> "<derivation " <> T.pack (storePathToFilePath platformStoreDir (doPath out)) <> ">"
     [] -> "<derivation>"
+
+-- | Render a bracketed sequence the way upstream prints one: the brackets are
+-- separated from the contents by a space, and an empty sequence is @[ ]@ or
+-- @{ }@ rather than the two spaces that a bare join of no elements leaves
+-- between them.
+wrapNixSeq :: T.Text -> T.Text -> [T.Text] -> T.Text
+wrapNixSeq open close [] = open <> " " <> close
+wrapNixSeq open close parts = open <> " " <> T.intercalate " " parts <> " " <> close
 
 -- | Pretty-print a thunk.  After deep-forcing, all thunks should be
 -- computed thunks render their value; pending thunks render as a placeholder.

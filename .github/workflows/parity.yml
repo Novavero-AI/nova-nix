@@ -133,3 +133,13 @@ jobs:
           if [ "$FAIL" = "1" ]; then
             exit 1
           fi
+
+      # The drvPath oracle above agrees or it does not; what it cannot do is
+      # say WHERE a disagreement lives, and it only exercises whatever
+      # nixpkgs' hello happens to reach.  This runs a case set through both
+      # evaluators and names the expressions that differ, so the next
+      # divergence arrives as the expression that demonstrates it rather
+      # than as a hash that is off by everything.
+      - name: Evaluation case set vs upstream Nix
+        run: |
+          NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/eval-cases.sh
