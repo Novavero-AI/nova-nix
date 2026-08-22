@@ -18,13 +18,22 @@ and pull requests are welcome.
 
 ## Changelog
 
-User-visible changes get a bullet under `## Unreleased` in `CHANGELOG.md`: a
-bold lead sentence, then the why - the upstream behavior matched, the hazard
-closed, the reason the obvious approach does not work - in full sentences.
+User-visible changes get a bullet in a new file under `changelog.d/`, named
+after the change (`changelog.d/fetchgit-pinned-rev.md`): a bold lead sentence,
+then the why - the upstream behavior matched, the hazard closed, the reason the
+obvious approach does not work - in full sentences.
 
 The bold lead is what someone scanning a release reads. Everything after it is
 for whoever needs the reasoning, and it is worth the space. Match the entries
-already in the file; they are the specification.
+already in `CHANGELOG.md`; they are the specification.
+
+One file per entry rather than one shared section, because every branch
+appending to the same section collides there and nowhere else. Two branches
+adding entries touch two different files, so they cannot conflict.
+
+`CHANGELOG.md` stays the record of what shipped. At release the fragments are
+assembled under the new version heading with `scripts/assemble-changelog.sh`
+and removed, so nothing is written twice.
 
 ## Licensing of contributions
 
