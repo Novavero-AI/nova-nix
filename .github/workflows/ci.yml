@@ -307,6 +307,21 @@ jobs:
           fi
           grep -q "was not found in the Nix search path" err.txt
 
+      # CI is the only place that compiles for all three platforms, and it
+      # discarded every result.  Keeping them means a Windows or macOS
+      # failure can be reproduced on a real machine without installing a
+      # toolchain there.  Staged after the tests so a binary that failed
+      # them is never published.
+      - name: Stage the executable
+        run: cabal install exe:nova-nix --install-method=copy --installdir=staged --overwrite-policy=always
+
+      - name: Upload the executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: nova-nix-${{ matrix.name }}
+          path: staged/nova-nix*
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------------
   # End-to-end (Windows-only): the executable this repo ships, driving a real
   # build through the real stdenv - fetch the MinGW-w64 seed, compile hello.c
