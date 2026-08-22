@@ -4,8 +4,6 @@ on:
   push:
     tags: ['v*']
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # Never cancel a publish: assets are uploaded one at a time and a release that
 # is half-populated is worse than a slow one.

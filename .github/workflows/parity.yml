@@ -37,8 +37,6 @@ on:
       - ".github/workflows/parity.yml"
       - ".github/parity/**"
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
 permissions:
