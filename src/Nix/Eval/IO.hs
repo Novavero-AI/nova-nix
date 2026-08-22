@@ -185,12 +185,13 @@ instance MonadEval EvalIO where
       Left err@(NixEvalError ErrorUncatchable _) -> liftIO (throwIO err)
       Right val -> pure (Right val)
 
-  doesPathExist path = wrapIO (Dir.doesPathExist (SP.storeTextToFilePath path))
+  doesPathExist path = evalStoreTextPath path >>= \resolved -> wrapIO (Dir.doesPathExist resolved)
 
-  listDirectory path = wrapIO $ do
-    let dir = SP.storeTextToFilePath path
-    entries <- Dir.listDirectory dir
-    mapM (classifyEntry dir) entries
+  listDirectory path = do
+    dir <- evalStoreTextPath path
+    wrapIO $ do
+      entries <- Dir.listDirectory dir
+      mapM (classifyEntry dir) entries
 
   importFile rawPath = do
     baseDir <- EvalIO (asks esBaseDir)
@@ -287,7 +288,8 @@ instance MonadEval EvalIO where
         case SP.checkStorePathName name of
           Left err -> throwEvalError (copyContext <> ": " <> SP.storePathNameErrorText err)
           Right () -> pure ()
-        entry <- wrapIO (NAR.serialiseFromPath (SP.storeTextToFilePath rawPath))
+        resolvedSource <- evalStoreTextPath rawPath
+        entry <- wrapIO (NAR.serialiseFromPath resolvedSource)
         let narDigest = sha256Digest (NAR.serialise entry)
         sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
         let spText = canonicalStorePathText sp
@@ -341,9 +343,9 @@ instance MonadEval EvalIO where
               (unEvalIO (eval scopedEnv expr))
           )
 
-  readFileBytes path = wrapIO (BS.readFile (SP.storeTextToFilePath path))
+  readFileBytes path = evalStoreTextPath path >>= \resolved -> wrapIO (BS.readFile resolved)
 
-  getFileType path = wrapIO (classifyPath (SP.storeTextToFilePath path))
+  getFileType path = evalStoreTextPath path >>= \resolved -> wrapIO (classifyPath resolved)
 
   runProcess cmd cmdArgs stdinText = wrapIO $ do
     let cp =
@@ -384,7 +386,8 @@ instance MonadEval EvalIO where
     -- existence check in copyToStoreIfMissing is sound - changed source
     -- content can never serve stale bytes from an earlier copy (the old
     -- scheme hashed the path STRING, so it did exactly that).
-    entry <- wrapIO (NAR.serialiseFromPath (SP.storeTextToFilePath srcPath))
+    resolvedSource <- evalStoreTextPath srcPath
+    entry <- wrapIO (NAR.serialiseFromPath resolvedSource)
     let narDigest = sha256Digest (NAR.serialise entry)
     case expectedSha256 of
       Just (subject, expected)
@@ -400,15 +403,16 @@ instance MonadEval EvalIO where
     sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
     destFilePath <- evalFilePath sp
     let destPath = canonicalStorePathText sp
-    wrapIO (copyToStoreIfMissing (SP.storeTextToFilePath srcPath) destFilePath (takeDirectory destFilePath))
+    wrapIO (copyToStoreIfMissing resolvedSource destFilePath (takeDirectory destFilePath))
     pure destPath
 
-  narHashOfPath path =
-    wrapIO (sha256Digest . NAR.serialise <$> NAR.serialiseFromPath (SP.storeTextToFilePath path))
+  narHashOfPath path = do
+    resolved <- evalStoreTextPath path
+    wrapIO (sha256Digest . NAR.serialise <$> NAR.serialiseFromPath resolved)
 
-  isExecutableFile path = wrapIO (Dir.executable <$> Dir.getPermissions (SP.storeTextToFilePath path))
+  isExecutableFile path = evalStoreTextPath path >>= \resolved -> wrapIO (Dir.executable <$> Dir.getPermissions resolved)
 
-  readSymlinkTarget path = wrapIO (T.pack <$> Dir.getSymbolicLinkTarget (SP.storeTextToFilePath path))
+  readSymlinkTarget path = evalStoreTextPath path >>= \resolved -> wrapIO (T.pack <$> Dir.getSymbolicLinkTarget resolved)
 
   addSourceNar name narBytes =
     case NAR.deserialise narBytes of
@@ -581,15 +585,23 @@ scratchSuffixBytes = 16
 -- ---------------------------------------------------------------------------
 
 -- | Where a store path lives on this machine: this evaluation's store dir
--- mapped to a filesystem path.  Every eval-time read and write of a
--- store object resolves through this, landing in the same store the
--- builder and CLI operate on.
+-- mapped to a filesystem path.  This is the 'SP.StorePath' direction;
+-- path-value text goes through 'evalStoreTextPath'.  Both must read the
+-- same store dir, since a store honored on one side and not the other
+-- writes to one directory and reads from another.
 storeFilePath :: SP.StoreDir -> SP.StorePath -> FilePath
 storeFilePath = SP.storePathToFilePath
 
 -- | 'storeFilePath' against the store this evaluation was given.
 evalFilePath :: SP.StorePath -> EvalIO FilePath
 evalFilePath sp = EvalIO (asks ((`storeFilePath` sp) . esStoreDir))
+
+-- | Resolve path-value text to a filesystem location against the store
+-- this evaluation was given.  The read counterpart of 'evalFilePath':
+-- both sides of every eval-time store access must agree on the store
+-- dir, or a redirected store is written to and read from two places.
+evalStoreTextPath :: Text -> EvalIO FilePath
+evalStoreTextPath txt = EvalIO (asks ((`SP.storeTextToFilePath` txt) . esStoreDir))
 
 -- | A store path's identity: the canonical @/nix/store@ spelling every
 -- platform shares.  Hashes and eval-visible strings carry this form; it
@@ -604,17 +616,19 @@ canonicalStorePathText = SP.storePathToText SP.defaultStoreDir
 -- Store text stays canonical in the value domain: 'Dir.canonicalizePath'
 -- would attach the working drive to the rooted @/nix@ prefix on Windows,
 -- so store text gets lexical canonicalization ('canonPath') only, and
--- its reads resolve through 'SP.storeTextToFilePath'.  Every other path
+-- its reads resolve through 'evalStoreTextPath'.  Every other path
 -- resolves and canonicalizes as a platform path, where the two returned
 -- forms coincide.
 resolveImportTarget :: FilePath -> Text -> EvalIO (FilePath, FilePath)
 resolveImportTarget baseDir rawPath
   | SP.isCanonicalStoreText rawPath = do
       let valueBase = T.unpack (canonPath rawPath)
-      isDir <- wrapIO (Dir.doesDirectoryExist (SP.storeTextToFilePath (T.pack valueBase)))
+      resolvedBase <- evalStoreTextPath (T.pack valueBase)
+      isDir <- wrapIO (Dir.doesDirectoryExist resolvedBase)
       -- The value-domain join stays "/" so the canonical spelling survives.
       let valueTarget = if isDir then valueBase <> "/default.nix" else valueBase
-      pure (valueTarget, SP.storeTextToFilePath (T.pack valueTarget))
+      resolvedTarget <- evalStoreTextPath (T.pack valueTarget)
+      pure (valueTarget, resolvedTarget)
   | otherwise = do
       let raw = T.unpack rawPath
           resolved = if isRelative raw then baseDir </> raw else raw

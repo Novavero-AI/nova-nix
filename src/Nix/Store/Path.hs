@@ -120,16 +120,20 @@ isCanonicalStoreText txt = case T.stripPrefix defaultStoreDirText txt of
   Nothing -> False
 
 -- | Resolve path-value text to the filesystem location it names: text
--- under the canonical store dir resolves into the platform store dir,
--- and every other path is taken as written.  Writers emit the canonical
+-- under the canonical store dir resolves into the given store dir, and
+-- every other path is taken as written.  Writers emit the canonical
 -- spelling into eval values, so every reader that performs IO on a path
 -- value must resolve through this - on Windows the rooted @\/nix@ prefix
--- would otherwise resolve against the working drive.  On Unix the two
--- dirs coincide and this is 'T.unpack'.
-storeTextToFilePath :: Text -> FilePath
-storeTextToFilePath txt
+-- would otherwise resolve against the working drive.
+--
+-- The store dir is a parameter rather than 'platformStoreDir' because a
+-- caller may have been given one: resolving reads against the platform
+-- default while writes went elsewhere is how @--store@ came to write to
+-- one directory and read from another.
+storeTextToFilePath :: StoreDir -> Text -> FilePath
+storeTextToFilePath storeDir txt
   | isCanonicalStoreText txt =
-      unStoreDir platformStoreDir <> T.unpack (T.drop (T.length defaultStoreDirText) txt)
+      unStoreDir storeDir <> T.unpack (T.drop (T.length defaultStoreDirText) txt)
   | otherwise = T.unpack txt
 
 -- | Length of the Nix base-32 hash component in store paths (32 chars).
