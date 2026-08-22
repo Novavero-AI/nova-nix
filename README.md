@@ -42,10 +42,26 @@ That `drvPath`, and the 253-derivation closure behind it, byte-matches upstream 
 
 ## Quickstart
 
-```bash
-git clone https://github.com/Novavero-AI/nova-nix.git
-cd nova-nix
-cabal build
+Download an archive, unpack it, run `bin/nova-nix`. No toolchain, nothing to
+configure.
+
+| Platform | Archive |
+| --- | --- |
+| Linux | [`nova-nix-linux-x64.tar.gz`](https://github.com/Novavero-AI/nova-nix/releases/latest/download/nova-nix-linux-x64.tar.gz) |
+| macOS | [`nova-nix-macos-arm64.tar.gz`](https://github.com/Novavero-AI/nova-nix/releases/latest/download/nova-nix-macos-arm64.tar.gz) |
+| Windows | [`nova-nix-windows-x64.zip`](https://github.com/Novavero-AI/nova-nix/releases/latest/download/nova-nix-windows-x64.zip) |
+
+Each unpacks to `bin/` beside `share/` and `pkgs/`. `share/` is how the
+`<nix/*>` search path resolves with nothing set, and `pkgs/` carries the
+recipes, so the build below runs from the unpacked directory rather than
+needing this repository beside it. Check the download against the
+`SHA256SUMS` published with it.
+
+In a GitHub Actions workflow:
+
+```yaml
+- uses: Novavero-AI/install-nova-nix@v1
+- run: nova-nix eval --expr '1 + 2'
 ```
 
 ```console
@@ -128,14 +144,17 @@ main = case parseNix "/tmp" "<expr>" "let x = 5; in x * 2 + 1" of
 
 The evaluator is polymorphic over `MonadEval`: `PureEval` for deterministic tests, `EvalIO` for filesystem access.
 
-## Build & test
+## Build from source
+
+Requires GHC 9.14+ and cabal-install 3.10+. Not needed to use a release; this
+is the path for working on nova-nix itself.
 
 ```bash
+git clone https://github.com/Novavero-AI/nova-nix.git
+cd nova-nix
 cabal build
 cabal test
 ```
-
-Requires GHC 9.14+ and cabal-install 3.10+.
 
 ---
 
