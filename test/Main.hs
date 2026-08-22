@@ -14,7 +14,7 @@ import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.List (sort)
+import Data.List (isPrefixOf, sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe)
 import qualified Data.Set as Set
@@ -257,23 +257,44 @@ testStorePaths = do
         let sp2 = StorePath {spHash = "zzz", spName = "later"}
          in assertEqual "Ord" True (sp < sp2),
       -- The reader-side mapping: canonical store text resolves into the
-      -- platform store dir; everything else is the path as written.
+      -- store dir it is given; everything else is the path as written.
       runTest "store text maps into the platform store dir" $
         assertEqual
           "mapped"
           (unStoreDir platformStoreDir <> "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x/sub/f")
-          (storeTextToFilePath "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x/sub/f"),
+          (storeTextToFilePath platformStoreDir "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x/sub/f"),
       runTest "bare store dir text maps to the platform store root" $
-        assertEqual "mapped-root" (unStoreDir platformStoreDir) (storeTextToFilePath "/nix/store"),
+        assertEqual "mapped-root" (unStoreDir platformStoreDir) (storeTextToFilePath platformStoreDir "/nix/store"),
       runTest "store text with a backslash subpath maps" $
         assertEqual
           "mapped-backslash"
           (unStoreDir platformStoreDir <> "\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y")
-          (storeTextToFilePath "/nix/store\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y"),
+          (storeTextToFilePath platformStoreDir "/nix/store\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y"),
       runTest "non-store text is the path as written" $
-        assertEqual "unmapped" "/etc/hosts" (storeTextToFilePath "/etc/hosts"),
+        assertEqual "unmapped" "/etc/hosts" (storeTextToFilePath platformStoreDir "/etc/hosts"),
       runTest "a store-prefix-like name does not map" $
-        assertEqual "unmapped-like" "/nix/storefoo" (storeTextToFilePath "/nix/storefoo"),
+        assertEqual "unmapped-like" "/nix/storefoo" (storeTextToFilePath platformStoreDir "/nix/storefoo"),
+      -- The reason this takes a store dir at all: a caller given one must
+      -- read from it, not from the platform default.
+      runTest "store text maps into a redirected store dir" $
+        assertEqual
+          "redirected"
+          "/tmp/scratch-store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"
+          (storeTextToFilePath (StoreDir "/tmp/scratch-store") "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"),
+      -- Both sides must land in the SAME store dir.  Not the same string:
+      -- storePathToFilePath joins with the native separator while
+      -- storeTextToFilePath passes the canonical text's tail through, so
+      -- the two spellings differ on Windows and open the same file.
+      runTest "a redirected read lands in the same store as the write" $
+        let redirected = StoreDir "/tmp/scratch-store"
+            redirectedPath = StorePath {spHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", spName = "x"}
+            readSide = storeTextToFilePath redirected (storePathToText defaultStoreDir redirectedPath)
+            writeSide = storePathToFilePath redirected redirectedPath
+            underRedirected p = unStoreDir redirected `isPrefixOf` p
+         in assertEqual
+              "both under the redirected store"
+              (True, True, False)
+              (underRedirected readSide, underRedirected writeSide, unStoreDir platformStoreDir `isPrefixOf` readSide),
       runTest "isCanonicalStoreText accepts both separators and rejects lookalikes" $
         assertEqual
           "predicate"
@@ -7565,7 +7586,10 @@ evalAndBuild storeDir source = do
   case parseNix "<test>" source of
     Left err -> pure (Left ("parse error: " <> T.pack (show err)))
     Right expr -> do
-      st <- newEvalState platformStoreDir "."
+      -- The SAME store the build below is given.  Evaluating against the
+      -- platform default while building elsewhere is what let a store dir
+      -- honored on writes but not on reads pass the whole suite.
+      st <- newEvalState storeDir "."
       evalResult <- runEvalIO st $ do
         val <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
         -- 'derivation' is lazy now; force _derivation so the peek below sees it
