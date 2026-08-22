@@ -8,6 +8,10 @@ on:
   # unmergeable under branch protection's required contexts.
   pull_request:
   workflow_call:
+  # Run the suite against any branch without opening a pull request:
+  # verifying a fix on a branch otherwise meant a throwaway PR, since
+  # pull_request was the only trigger that reached a non-main ref.
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
