@@ -25,9 +25,11 @@ in
       // {
         system = "x86_64-windows";
         builder = "${msysSeed}/usr/bin/bash.exe";
-        # The setup script is a store path (canonical /nix/store); bash reads it
-        # via the drive-mounted form.
-        args = [ "/cygdrive/c${setup}" ];
+        # Canonical /nix/store, like every other store path in derivation
+        # text: the builder renders it to the machine's real store at the
+        # spawn boundary.  A drive letter written here would be baked into
+        # the derivation's hash, and it would be wrong on any other store.
+        args = [ "${setup}" ];
         # The mingw toolchain bin as a canonical store path; setup.sh maps it
         # to the build machine's drive-mounted form (the physical drive is a
         # build-time fact, not derivation text).
