@@ -59,6 +59,8 @@ module Nix.Eval
 
     -- * Fetcher transport validation (pure, exported for tests)
     checkGitUrl,
+    checkGitRef,
+    checkGitRev,
 
     -- * Builtin registry
     BuiltinDef (..),
@@ -3478,6 +3480,53 @@ checkGitUrl url
     disallowed t =
       "builtins.fetchGit: transport '" <> t <> "' is not allowed in url: " <> url
 
+-- | What @git fetch@ asks for when the caller pinned no @ref@: the
+-- remote's default branch.
+defaultFetchRef :: Text
+defaultFetchRef = "HEAD"
+
+-- | What @git checkout@ resolves when the caller pinned no @rev@: the
+-- tip of whatever the fetch just brought down.
+fetchHeadRef :: Text
+fetchHeadRef = "FETCH_HEAD"
+
+-- | Characters upstream's @refRegexS@ allows after the first one.
+gitRefTrailingPunctuation :: [Char]
+gitRefTrailingPunctuation = "_./@+-"
+
+-- | Validate a @ref@ against upstream's @refRegexS@
+-- (@[a-zA-Z0-9\@][a-zA-Z0-9_.\/\@+-]*@).  The leading class excludes
+-- @-@, and that is the load-bearing part: git parses options after the
+-- remote name, so a @ref@ of @--upload-pack=\<cmd\>@ names the command
+-- git runs as the transport.  Left carries the eval-error text.
+checkGitRef :: Text -> Either Text Text
+checkGitRef ref = case T.uncons ref of
+  Just (leading, rest)
+    | refLeadChar leading,
+      T.all refChar rest ->
+        Right ref
+  _ -> Left ("builtins.fetchGit: ref is not a valid git ref name: " <> ref)
+  where
+    refLeadChar c = asciiAlphaNum c || c == '@'
+    refChar c = asciiAlphaNum c || c `elem` gitRefTrailingPunctuation
+    asciiAlphaNum c = isAsciiLower c || isAsciiUpper c || isDigit c
+
+-- | Hex characters in a full SHA-1.
+gitRevHexLength :: Int
+gitRevHexLength = 40
+
+-- | Validate a @rev@ against upstream's @revRegexS@ (@[0-9a-fA-F]{40}@).
+-- Upstream parses it as a SHA-1 @Hash@ before it reaches git, which
+-- rejects a tag or an abbreviated prefix as well as a leading @-@: a
+-- \"pinned\" fetch that still resolves through git's DWIM rules is not
+-- pinned.  Left carries the eval-error text.
+checkGitRev :: Text -> Either Text Text
+checkGitRev rev
+  | T.length rev == gitRevHexLength,
+    T.all isHexDigit rev =
+      Right rev
+  | otherwise = Left ("builtins.fetchGit: rev is not a full SHA-1: " <> rev)
+
 -- | @-c@ config pinning the clone to 'allowedGitSchemes': every
 -- transport defaults to never, each allowed scheme is re-enabled.  This
 -- enforces what URL validation cannot see up front - a helper reached
@@ -3515,23 +3564,28 @@ builtinFetchGit other =
 
 -- | Fetch one revision into the store; returns upstream's @fetchGit@
 -- attrset (@outPath@, @rev@, @shortRev@, @revCount@, @submodules@,
--- @lastModified@, @lastModifiedDate@, @narHash@).  @ref@/@rev@ pass straight
--- to @git fetch@\/@checkout@, no @--branch@ normalization needed.
+-- @lastModified@, @lastModifiedDate@, @narHash@).  @ref@ and @rev@ are
+-- validated to upstream's shapes before they reach git (see
+-- 'checkGitRef' and 'checkGitRev'); neither may lead with @-@.
 fetchGit :: (MonadEval m) => Text -> Text -> Maybe Text -> Maybe Text -> Bool -> Bool -> m NixValue
 fetchGit rawUrl name mRef mRev submodules shallow =
-  case checkGitUrl rawUrl of
+  case (,,) <$> checkGitUrl rawUrl <*> traverse checkGitRef mRef <*> traverse checkGitRev mRev of
     Left err -> throwEvalError err
-    Right url -> do
+    Right (url, checkedRef, checkedRev) -> do
       cloneDir <- createScratchDir "nova-nix-fetchgit-"
       let ctx = "builtins.fetchGit"
           git = gitRun ctx cloneDir
           depthArgs = if shallow then ["--depth", "1"] else []
-          refArg = fromMaybe "HEAD" mRef
-          checkoutTarget = fromMaybe "FETCH_HEAD" mRev
+          refArg = fromMaybe defaultFetchRef checkedRef
+          checkoutTarget = fromMaybe fetchHeadRef checkedRev
       _ <- git ["init", "--quiet", "."]
-      _ <- git ["remote", "add", "origin", url]
-      _ <- git (["fetch", "--quiet"] ++ depthArgs ++ ["origin", refArg])
-      _ <- git ["checkout", "--quiet", checkoutTarget]
+      _ <- git ["remote", "add", "origin", "--", url]
+      -- @--@ before the remote: git keeps parsing options after it, so
+      -- without a separator a refspec is indistinguishable from a flag.
+      _ <- git (["fetch", "--quiet"] ++ depthArgs ++ ["--", "origin", refArg])
+      -- Trailing @--@, not leading: @git checkout -- X@ reads X as a
+      -- pathspec, the opposite of what a leading separator means elsewhere.
+      _ <- git ["checkout", "--quiet", checkoutTarget, "--"]
       when submodules $
         void (git ["submodule", "update", "--init", "--recursive"])
       rev <- git ["rev-parse", "HEAD"]
