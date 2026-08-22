@@ -16,6 +16,8 @@
 -- @
 -- --nix-path NAME=PATH   Add a search path entry (repeatable, merged with NIX_PATH)
 -- --expr EXPR            Evaluate an inline expression instead of a file
+-- --help                 Print usage on stdout and exit zero
+-- --version              Print the version and exit zero
 -- @
 module Main (main) where
 
@@ -29,6 +31,7 @@ import Data.Maybe (catMaybes)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
+import Data.Version (showVersion)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), toATerm)
@@ -41,7 +44,7 @@ import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), loadAp
 import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
-import Paths_nova_nix (getDataDir)
+import Paths_nova_nix (getDataDir, version)
 import System.Directory (canonicalizePath, doesFileExist, getCurrentDirectory, getTemporaryDirectory)
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure)
@@ -72,7 +75,13 @@ data Command
   | CmdBuild !FilePath
   | CmdPush !PushArgs
   | CmdStoreDelete ![String]
-  | CmdHelp
+  | -- | No command given.  Usage on stderr, non-zero: a bare invocation is
+    -- a usage error, and a caller testing the exit status must see one.
+    CmdUsage
+  | -- | @--help@.  The same text on stdout, zero: it is a request that
+    -- succeeded, and pipeable without redirecting stderr.
+    CmdHelp
+  | CmdVersion
 
 -- | Arguments to the push command.
 data PushArgs = PushArgs
@@ -91,9 +100,14 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing False []
 -- silent drop: an unknown or typo'd flag once ended parsing and quietly
 -- discarded everything after it (e.g. a requested @--substituter@).
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
+parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdUsage)
   where
     go opts [] = Right opts
+    -- Answered before anything else is looked at, and the rest of the line
+    -- is not parsed: --version must report the build even when the command
+    -- after it is one this build does not have.
+    go opts ("--version" : _) = Right opts {optCommand = CmdVersion}
+    go opts ("--help" : _) = Right opts {optCommand = CmdHelp}
     go opts ("--nix-path" : val : rest) =
       go (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
     go opts ("--strict" : rest) =
@@ -114,7 +128,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdHelp)
     go opts ("store" : rest) = goStore opts rest
     go _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
-    go _ (arg : _) = Left ("unknown argument: " ++ arg ++ " (run nova-nix with no arguments for usage)")
+    go _ (arg : _) = Left ("unknown argument: " ++ arg ++ " (run nova-nix --help for usage)")
     -- Sub-parser for eval: handles --strict and --expr interleaved with the file arg.
     goEval opts [] = Right opts
     goEval opts ("--strict" : rest) = goEval (opts {optStrict = True}) rest
@@ -234,27 +248,43 @@ main = do
     CmdBuild filePath -> buildFile opts dataDir filePath
     CmdPush pushArgs -> pushCommand opts pushArgs
     CmdStoreDelete paths -> storeDeleteCommand opts paths
-    CmdHelp -> do
-      hPutStrLn stderr "Usage: nova-nix [--nix-path NAME=PATH] <command>"
-      hPutStrLn stderr ""
-      hPutStrLn stderr "Commands:"
-      hPutStrLn stderr "  eval FILE.nix          Evaluate a .nix file, print result"
-      hPutStrLn stderr "  eval --expr 'EXPR'     Evaluate an inline expression"
-      hPutStrLn stderr "  build FILE.nix         Build a derivation from a .nix file"
-      hPutStrLn stderr "  push --cache URL       Push store paths (and their closures) to a binary cache"
-      hPutStrLn stderr "  store delete PATH...   Remove store paths, refused while other valid paths reference them"
-      hPutStrLn stderr ""
-      hPutStrLn stderr "Flags:"
-      hPutStrLn stderr "  --strict               Deep-force all thunks before printing (warning: OOM on large results)"
-      hPutStrLn stderr "  --aterm                With eval --expr, print the derivation's .drv ATerm"
-      hPutStrLn stderr "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)"
-      hPutStrLn stderr "  --all                  With push: select every valid path in the store"
-      hPutStrLn stderr "  --key-file PATH        With push: file holding the cache API key"
-      hPutStrLn stderr ("  --compression KIND     With push: artifact packaging (" <> T.unpack pushCompressionValues <> "; default none)")
-      hPutStrLn stderr "  --store DIR            Use DIR as the store (default: the platform store)"
-      hPutStrLn stderr "  --substituter URL      Try this binary cache before building"
-      hPutStrLn stderr "  --trusted-key K        Public key (name:base64) for the substituter"
-      exitFailure
+    CmdUsage -> mapM_ (hPutStrLn stderr) usageLines >> exitFailure
+    CmdHelp -> mapM_ putStrLn usageLines
+    CmdVersion -> putStrLn versionLine
+
+-- | What @--version@ reports.  Cabal's version, which is the one the publish
+-- workflow's tag guard checks a tag against, so a downloaded binary names
+-- exactly the release it came from and a bug report can say which build.
+versionLine :: String
+versionLine = "nova-nix " <> showVersion version
+
+-- | The usage text, returned rather than printed: a bare invocation is a
+-- usage error (stderr, non-zero) while @--help@ is a request that succeeded
+-- (stdout, zero), and the words are the same either way.
+usageLines :: [String]
+usageLines =
+  [ "Usage: nova-nix [--nix-path NAME=PATH] <command>",
+    "",
+    "Commands:",
+    "  eval FILE.nix          Evaluate a .nix file, print result",
+    "  eval --expr 'EXPR'     Evaluate an inline expression",
+    "  build FILE.nix         Build a derivation from a .nix file",
+    "  push --cache URL       Push store paths (and their closures) to a binary cache",
+    "  store delete PATH...   Remove store paths, refused while other valid paths reference them",
+    "",
+    "Flags:",
+    "  --strict               Deep-force all thunks before printing (warning: OOM on large results)",
+    "  --aterm                With eval --expr, print the derivation's .drv ATerm",
+    "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)",
+    "  --all                  With push: select every valid path in the store",
+    "  --key-file PATH        With push: file holding the cache API key",
+    "  --compression KIND     With push: artifact packaging (" <> T.unpack pushCompressionValues <> "; default none)",
+    "  --store DIR            Use DIR as the store (default: the platform store)",
+    "  --substituter URL      Try this binary cache before building",
+    "  --trusted-key K        Public key (name:base64) for the substituter",
+    "  --help                 Print this text and exit",
+    "  --version              Print the version and exit"
+  ]
 
 -- | Canonicalize and read a source file.  The canonicalization matters:
 -- relative path literals inside the file resolve against the file's

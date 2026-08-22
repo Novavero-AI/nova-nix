@@ -113,12 +113,20 @@ jobs:
       # copy that silently landed them nowhere is only visible here.
       - name: Smoke-test the assembled archive
         shell: bash
+        env:
+          VERSION: ${{ needs.check-tag.outputs.version }}
         run: |
           set -euo pipefail
           exe="$stem/bin/nova-nix"
           [ -x "$exe" ] || exe="$stem/bin/nova-nix.exe"
           got=$(nova_nix_datadir=/nonexistent "$exe" eval --expr 'builtins.typeOf (import <nix/fetchurl.nix>)')
           [ "$got" = '"lambda"' ] || { echo "archive cannot resolve <nix/*>: $got" >&2; exit 1; }
+          # check-tag proves the tag names the committed version.  This proves
+          # the binary in the archive was built from it, which is the half
+          # that reads a source tree nobody has confirmed the build used.
+          got=$("$exe" --version)
+          [ "$got" = "nova-nix ${VERSION}" ] \
+            || { echo "archive reports ${got}, tag says nova-nix ${VERSION}" >&2; exit 1; }
           for recipe in pkgs/windows/hello.nix pkgs/windows/stdenv.nix pkgs/windows/setup.sh; do
             [ -f "$stem/$recipe" ] || { echo "archive is missing $recipe" >&2; exit 1; }
           done
