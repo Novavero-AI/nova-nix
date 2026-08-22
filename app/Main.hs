@@ -304,11 +304,16 @@ readSourceFile rawPath = do
       failWith ("cannot read " <> T.pack rawPath <> ": " <> T.pack (displayException e))
     Right ok -> pure ok
 
+-- | What a parse error names when the source came from @--expr@ and there is
+-- no file to point at.
+exprSourceName :: T.Text
+exprSourceName = "<expr>"
+
 -- | Evaluate a .nix file and print the result.
 evalFile :: StoreDir -> Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
 evalFile storeDir strict extraPaths dataDir rawFilePath = do
   (filePath, source) <- readSourceFile rawFilePath
-  case parseNix (T.pack filePath) source of
+  case parseNix (takeDirectory filePath) (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
@@ -328,12 +333,12 @@ evalFile storeDir strict extraPaths dataDir rawFilePath = do
 -- | Evaluate an inline expression and print the result.
 evalExpr :: StoreDir -> Bool -> [T.Text] -> FilePath -> T.Text -> IO ()
 evalExpr storeDir strict extraPaths dataDir source = do
-  case parseNix "<expr>" source of
+  cwd <- getCurrentDirectory
+  case parseNix cwd exprSourceName source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      cwd <- getCurrentDirectory
       st0 <- newEvalState storeDir cwd
       let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
           st = st0 {esSearchPaths = searchPaths}
@@ -349,13 +354,13 @@ evalExpr storeDir strict extraPaths dataDir source = do
 -- | Evaluate an inline expression to a derivation and print its ATerm (.drv
 -- contents), for diffing nova-nix's serialization against upstream Nix.
 evalExprAterm :: StoreDir -> [T.Text] -> FilePath -> T.Text -> IO ()
-evalExprAterm storeDir extraPaths dataDir source =
-  case parseNix "<expr>" source of
+evalExprAterm storeDir extraPaths dataDir source = do
+  cwd <- getCurrentDirectory
+  case parseNix cwd exprSourceName source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      cwd <- getCurrentDirectory
       st0 <- newEvalState storeDir cwd
       let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
           st = st0 {esSearchPaths = searchPaths}
@@ -385,7 +390,7 @@ buildFile opts dataDir rawFilePath = do
   let storeDir = chosenStoreDir opts
   caches <- either failWith pure (substituterConfig (optSubstituter opts) (optTrustedKey opts))
   (filePath, source) <- readSourceFile rawFilePath
-  case parseNix (T.pack filePath) source of
+  case parseNix (takeDirectory filePath) (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure

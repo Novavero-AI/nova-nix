@@ -1,4 +1,8 @@
--- | Variable resolution pass: replaces 'EVar' with 'EResolvedVar'
+-- | The resolution passes run over a parsed expression before it is
+-- evaluated: variables to positional slots, and relative path literals to
+-- absolute ones.
+--
+-- Variable resolution replaces 'EVar' with 'EResolvedVar'
 -- for variables bound by lambda formals and let\/rec bindings.
 --
 -- Lambda formals and eligible let\/rec bindings get positional
@@ -6,9 +10,13 @@
 -- dynamic keys or nested paths fall back to 'NameBarrier' (name-based
 -- lookup at runtime).  With-scopes and builtins remain name-based.
 --
--- Called once at parse time ('Nix.Parser.parseNix').
+-- Path resolution rewrites a relative path literal to an absolute one, so
+-- what it names is fixed by the file it was written in.
+--
+-- Both are called once at parse time ('Nix.Parser.parseNix').
 module Nix.Expr.Resolve
   ( resolveVars,
+    resolveRelativePaths,
 
     -- * Static global names (exported for the sync test)
     staticGlobalNames,
@@ -20,7 +28,9 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text as T
 import Nix.Expr.Types
+import System.FilePath (isRelative, (</>))
 
 -- | Scope entry for static variable resolution.
 data ScopeEntry
@@ -303,3 +313,81 @@ resolveFormalsDefaults stack (FormalNamedSet name formals ellipsis) =
 resolveFormal :: [ScopeEntry] -> Formal -> Formal
 resolveFormal stack (Formal name defExpr) =
   Formal name (fmap (resolve stack) defExpr)
+
+-- ---------------------------------------------------------------------------
+-- Path resolution
+-- ---------------------------------------------------------------------------
+
+-- | Rewrite every relative path literal to an absolute one, against the
+-- directory of the file the expression was parsed from.
+--
+-- This is where upstream does it too, and it has to be: a path literal names
+-- a location relative to the file it is written in, and nothing downstream
+-- of the parser knows which file that was.  Resolving later means resolving
+-- against whatever directory happens to be current when the value is forced,
+-- which for a literal captured in a closure and forced inside an @import@ is
+-- a different file's directory.
+--
+-- Upstream 2.24 spells it @absPath(path, state->basePath.path.abs())@ in the
+-- @PATH@ production and 2.35 spells it @CanonPath(literal,
+-- state->basePath.path).abs()@; the two are the same operation.
+--
+-- A @~\/@ literal is not handled here: it reaches the evaluator, which
+-- expands it against the home directory.  Upstream expands it in the parser
+-- and has to guard that with a pure-eval check, because reading @HOME@ while
+-- parsing is an impurity.
+resolveRelativePaths :: FilePath -> Expr -> Expr
+resolveRelativePaths dir = goExpr
+  where
+    goExpr expr = case expr of
+      ELit (NixPath p)
+        -- A ~/ literal names a location under the home directory, not one
+        -- relative to this file.  Joining it to the base would bury the
+        -- tilde mid-path, where nothing expands it and the result names
+        -- a directory literally called "~".  The evaluator resolves it
+        -- against HOME instead; upstream does it in the parser and has to
+        -- guard that with a pure-eval check for reading the environment.
+        | homeRelative p -> expr
+        | isRelative (T.unpack p) ->
+            ELit (NixPath (T.pack (dir </> T.unpack p)))
+      ELit _ -> expr
+      EStr parts -> EStr (map goPart parts)
+      EIndStr parts -> EIndStr (map goPart parts)
+      EVar _ -> expr
+      EWithVar _ -> expr
+      EResolvedVar _ _ -> expr
+      EAttrs isRec bindings captureInfo -> EAttrs isRec (map goBinding bindings) captureInfo
+      EList elems -> EList (map goExpr elems)
+      ESelect target path mDef ->
+        ESelect (goExpr target) (map goKey path) (fmap goExpr mDef)
+      EHasAttr target path -> EHasAttr (goExpr target) (map goKey path)
+      EApp f x -> EApp (goExpr f) (goExpr x)
+      ELambda formals body captures -> ELambda (goFormals formals) (goExpr body) captures
+      ELet bindings body captureInfo -> ELet (map goBinding bindings) (goExpr body) captureInfo
+      EIf c t f -> EIf (goExpr c) (goExpr t) (goExpr f)
+      EWith scope body -> EWith (goExpr scope) (goExpr body)
+      EAssert cond body -> EAssert (goExpr cond) (goExpr body)
+      EUnary op e -> EUnary op (goExpr e)
+      EBinary op l r -> EBinary op (goExpr l) (goExpr r)
+      ESearchPath _ -> expr
+
+    goPart part = case part of
+      StrLit _ -> part
+      StrInterp e -> StrInterp (goExpr e)
+
+    goBinding binding = case binding of
+      NamedBinding path e -> NamedBinding (map goKey path) (goExpr e)
+      Inherit from names -> Inherit (fmap goExpr from) names
+
+    goKey key = case key of
+      StaticKey _ -> key
+      DynamicKey e -> DynamicKey (goExpr e)
+
+    goFormals formals = case formals of
+      FormalName _ -> formals
+      FormalSet fs ellipsis -> FormalSet (map goFormal fs) ellipsis
+      FormalNamedSet n fs ellipsis -> FormalNamedSet n (map goFormal fs) ellipsis
+
+    goFormal (Formal n mDef) = Formal n (fmap goExpr mDef)
+
+    homeRelative = T.isPrefixOf "~/"

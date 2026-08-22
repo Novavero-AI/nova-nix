@@ -56,24 +56,35 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Nix.Expr.ClosureTrim (trimClosures)
-import Nix.Expr.Resolve (resolveVars)
+import Nix.Expr.Resolve (resolveRelativePaths, resolveVars)
 import Nix.Expr.Types (Expr)
 import Nix.Parser.Expr (parseTopLevel)
 import Nix.Parser.Internal (ParseState (..), runParser)
 import Nix.Parser.Lexer (tokenize)
 import Nix.Parser.ParseError (ParseError (..))
+import System.FilePath (takeDirectory)
 
 -- | Parse a Nix expression from source text.
 --
 -- The input is the full file contents. The file name is used only for
 -- error messages.  Strips a leading UTF-8 BOM if present - Windows
 -- editors (Notepad, PowerShell) commonly add one.
-parseNix :: Text -> Text -> Either ParseError Expr
-parseNix fileName source = do
+--
+-- The base directory is what relative path literals resolve against, and it
+-- is an argument here rather than something the evaluator supplies later
+-- because a path literal names a location relative to the file it was
+-- written in.  By the time a value is forced the evaluator can be evaluating
+-- a different file, and a literal that resolved against that one would name
+-- a file its author never wrote.  Upstream resolves in its parser for the
+-- same reason.  Pass the directory holding the file; for source with no file
+-- behind it (@--expr@) pass the working directory, which is what upstream
+-- parses against.
+parseNix :: FilePath -> Text -> Text -> Either ParseError Expr
+parseNix baseDir fileName source = do
   tokens <- tokenize fileName (stripBOM source)
   let st = ParseState {psTokens = tokens, psFile = fileName}
   (expr, _remaining) <- runParser parseTopLevel st
-  pure (trimClosures (resolveVars expr))
+  pure (resolveRelativePaths baseDir (trimClosures (resolveVars expr)))
 
 -- | Strip a leading UTF-8 byte order mark (U+FEFF) if present.
 stripBOM :: Text -> Text
@@ -86,7 +97,7 @@ stripBOM t = case T.uncons t of
 parseNixFile :: FilePath -> IO (Either ParseError Expr)
 parseNixFile path = do
   source <- readFileAutoEncoding path
-  pure $ parseNix (T.pack path) source
+  pure $ parseNix (takeDirectory path) (T.pack path) source
 
 -- ---------------------------------------------------------------------------
 -- Encoding detection
