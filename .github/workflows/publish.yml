@@ -124,7 +124,7 @@ jobs:
           got=$("$exe" --version)
           [ "$got" = "nova-nix ${VERSION}" ] \
             || { echo "archive reports ${got}, tag says nova-nix ${VERSION}" >&2; exit 1; }
-          for recipe in pkgs/windows/hello.nix pkgs/windows/stdenv.nix pkgs/windows/setup.sh; do
+          for recipe in pkgs/windows/hello.nix pkgs/windows/stdenv/default.nix pkgs/windows/stdenv/setup.sh; do
             [ -f "$stem/$recipe" ] || { echo "archive is missing $recipe" >&2; exit 1; }
           done
 
