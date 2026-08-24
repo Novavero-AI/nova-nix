@@ -378,10 +378,10 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # End-to-end (Windows-only): the executable this repo ships, driving a real
-  # build through the real stdenv - fetch the MinGW-w64 seed, compile hello.c
-  # with it, and run the produced hello.exe.  Deliberately no store cache: a
-  # warm store would let the builder skip the exact work this job exists to
-  # exercise.
+  # build through the real stdenv - fetch the MinGW-w64 seed, build GNU hello
+  # with it via genericBuild, and run the produced hello.exe.  Deliberately no
+  # store cache: a warm store would let the builder skip the exact work this
+  # job exists to exercise.
   # ---------------------------------------------------------------------------
 
   e2e-windows:
@@ -415,38 +415,18 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
+      # pkgs/windows/hello.nix points at the by-name hello package, which
+      # builds through the real stdenv (genericBuild, setup.sh) rather than
+      # driving cmd.exe directly - the smallest thing that exercises a real
+      # mkDerivation package.  The workspace lives on D: while the store is
+      # anchored on C: - building from here is deliberate: it exercises the
+      # #101 fix (canonical /nix/store text rendered through the store dir).
       - name: Build hello.nix through the real stdenv
         shell: pwsh
         run: |
           $exe = "$env:RUNNER_TEMP\bin\nova-nix.exe"
-          # The workspace lives on D: while the store is anchored on C: -
-          # building from here is deliberate: it exercises the #101 fix
-          # (canonical /nix/store text rendered through the store dir).
           $out = (& $exe build pkgs\windows\hello.nix) | Select-Object -Last 1
           if ($LASTEXITCODE -ne 0) { Write-Error "nova-nix build failed"; exit 1 }
-          Write-Host "out path: $out"
-          $hello = Join-Path $out "hello.exe"
-          if (-not (Test-Path $hello)) {
-            $hello = (Get-ChildItem C:\nix\store\*-hello\hello.exe)[0].FullName
-            Write-Host "fallback glob: $hello"
-          }
-          $got = (& $hello) -join "`n"
-          Write-Host "output: $got"
-          if ($got -ne "Hello from the first native Windows Nix build.") {
-            Write-Error "unexpected hello output"
-            exit 1
-          }
-
-      # hello.nix drives cmd.exe directly, so it never loads stdenv.nix or
-      # setup.sh.  That is why a hardcoded /cygdrive/c in the stdenv's args
-      # went unnoticed: nothing in CI had ever run a mkDerivation package.
-      # GNU hello through the real stdenv is the smallest thing that does.
-      - name: Build hello through the stage-1 stdenv
-        shell: pwsh
-        run: |
-          $exe = "$env:RUNNER_TEMP\bin\nova-nix.exe"
-          $out = (& $exe build pkgs\windows\hello-stdenv.nix) | Select-Object -Last 1
-          if ($LASTEXITCODE -ne 0) { Write-Error "stdenv build failed"; exit 1 }
           Write-Host "out path: $out"
           # setup.sh installs with `make install prefix=`, so autotools lands
           # the binary under bin/, not at the output root.
