@@ -26,13 +26,14 @@ import qualified Data.Text.IO as TIO
 import qualified Database.SQLite.Simple as SQL
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, rewriteEnv, rewritePlaceholders, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm, toATermForHash)
 import Nix.Eval (MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, emptyContext, emptyEnv, eval, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
+import Nix.Eval.AttrPath (parseAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
@@ -44,7 +45,7 @@ import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbo
 import Nix.Eval.Types (emptyCList)
 import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
-import Nix.Hash (makeFixedOutputPath, sha256Digest)
+import Nix.Hash (hashPlaceholder, makeFixedOutputPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
@@ -4361,6 +4362,26 @@ testBuildOrchestrator = do
          in if SI.os == "mingw32"
               then assertEqual "displaced" (Map.fromList [("PATH", "build")]) merged
               else assertEqual "distinct" (Map.fromList [("PATH", "build"), ("Path", "host")]) merged,
+      -- Build-time placeholder substitution.  Upstream rewrites the whole
+      -- @name=value@ string (local-derivation-goal.cc:2004), so a sentinel in
+      -- a dynamic attribute name is substituted along with the values.
+      runTest "rewritePlaceholders substitutes an output sentinel" $
+        assertEqual
+          "substituted"
+          "/store/aaa-p/lib"
+          (rewritePlaceholders [("out", "/store/aaa-p")] (hashPlaceholder "out" <> "/lib")),
+      runTest "rewritePlaceholders leaves a foreign output's sentinel alone" $
+        assertEqual
+          "untouched"
+          (hashPlaceholder "dev")
+          (rewritePlaceholders [("out", "/store/aaa-p")] (hashPlaceholder "dev")),
+      runTest "rewriteEnv rewrites names as well as values" $
+        let rewrite = rewritePlaceholders [("out", "/store/aaa-p")]
+            env = Map.fromList [(hashPlaceholder "out" <> "-flag", hashPlaceholder "out" <> "/lib")]
+         in assertEqual
+              "name-and-value"
+              (Map.fromList [("/store/aaa-p-flag", "/store/aaa-p/lib")])
+              (rewriteEnv rewrite env),
       -- BuildConfig with caches
       runTest "BuildConfig accepts caches" $
         let cache = Subst.CacheConfig "https://cache.example.com" "key" 10
@@ -6131,6 +6152,44 @@ testFromTOML = do
           "toml-single-line"
           "(builtins.fromTOML \"x = 4\\ny = \\\"z\\\" # cmt\").y"
           (mkStr "z")
+    ]
+
+testAttrPath :: IO [Bool]
+testAttrPath = do
+  putStrLn "\n-- Attribute paths (build -A) --"
+  sequence
+    [ runTest "a bare name is one component" $
+        assertEqual "single" (Right ["hello"]) (parseAttrPath "hello"),
+      runTest "dots separate components" $
+        assertEqual "dotted" (Right ["a", "b", "c"]) (parseAttrPath "a.b.c"),
+      runTest "a quoted component carries a dot" $
+        assertEqual "quoted" (Right ["a", "b.c", "d"]) (parseAttrPath "a.\"b.c\".d"),
+      -- Upstream's quotes concatenate rather than delimit, so a quoted run
+      -- glues onto whatever sits beside it instead of standing alone.
+      runTest "quotes concatenate onto the surrounding name" $
+        assertEqual
+          "glued"
+          [Right ["foobar"], Right ["foobar"]]
+          [parseAttrPath "\"foo\"bar", parseAttrPath "foo\"bar\""],
+      -- The last component is kept only when non-empty, so these three
+      -- select nothing at all rather than naming an empty attribute.
+      runTest "an empty path selects nothing" $
+        assertEqual
+          "nothing"
+          [Right [], Right [], Right ["a"]]
+          [parseAttrPath "", parseAttrPath "\"\"", parseAttrPath "a."],
+      -- An interior empty component survives tokenizing; selection rejects
+      -- it, and only after checking the type of what it would index.
+      runTest "an interior empty component survives tokenizing" $
+        assertEqual
+          "interior"
+          [Right ["", "a"], Right ["a", "", "b"]]
+          [parseAttrPath ".a", parseAttrPath "a..b"],
+      runTest "an unclosed quote is an error" $
+        assertEqual
+          "unclosed"
+          (Left "missing closing quote in selection path \'a.\"b\'")
+          (parseAttrPath "a.\"b")
     ]
 
 testFetchGitTransport :: IO [Bool]
@@ -9563,6 +9622,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testHashHelpers,
           testNarKnownAnswer,
           testFetchGitTransport,
+          testAttrPath,
           testScratchDirs,
           testEvalLiterals,
           testEvalVariables,

@@ -42,6 +42,8 @@ module Nix.Builder
 
     -- * Pure pieces (exported for tests)
     buildPath,
+    rewriteEnv,
+    rewritePlaceholders,
     unionEnvs,
     verifyFetchHash,
   )
@@ -69,7 +71,7 @@ import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimi
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
-import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
+import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, rawHashWithAlgo)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), defaultStoreDirText, storePathToFilePath)
 import Nix.Substituter (CacheConfig, SubstResult (..), catchSync, trySubstitute)
@@ -293,9 +295,11 @@ buildUnderLock config store drv = do
           _ -> case decodeBuilderStrings drv of
             Left errMsg -> pure (Left (1, errMsg))
             Right (builderText, argTexts, decodedEnv) ->
-              let rewrite = onStore config
+              let -- onStore first, so nothing a placeholder expands to gets
+                  -- rewritten a second time.
+                  rewrite = rewritePlaceholders outputDirs . onStore config
                   builderPath = T.unpack (onStore config builderText)
-                  environ = buildEnvironment config (Map.map rewrite decodedEnv) builderPath buildDir outputDirs
+                  environ = buildEnvironment config (rewriteEnv rewrite decodedEnv) builderPath buildDir outputDirs
                   builderArgs = map (T.unpack . rewrite) argTexts
                in -- 5. Run the builder
                   runBuilder builderPath builderArgs environ buildDir
@@ -415,6 +419,27 @@ cleanupBuildDir dir = do
 -- ---------------------------------------------------------------------------
 -- Environment
 -- ---------------------------------------------------------------------------
+
+-- | Replace each output's @builtins.placeholder@ sentinel with its
+-- build-time path (the same value @$out@ carries).  Only the args and the
+-- environment are rewritten; the builder path is left alone, matching
+-- upstream, which assigns @builder = drv->builder@ unrewritten and rewrites
+-- only @drv->args@ (local-derivation-goal.cc:2170,2176).
+rewritePlaceholders :: [(Text, FilePath)] -> Text -> Text
+rewritePlaceholders outputDirs value =
+  foldr substitute value outputDirs
+  where
+    substitute (name, path) = T.replace (hashPlaceholder name) (T.pack path)
+
+-- | Apply a build-time rewrite to an environment's names as well as its
+-- values.  Upstream rewrites the whole @name=value@ string
+-- (local-derivation-goal.cc:2004), so a placeholder in a dynamic attribute
+-- name is substituted too; rewriting only the values would hand the builder
+-- a variable whose name still held the sentinel.
+rewriteEnv :: (Text -> Text) -> Map Text Text -> Map Text Text
+rewriteEnv rewrite = Map.fromList . map rewritePair . Map.toList
+  where
+    rewritePair (name, value) = (rewrite name, rewrite value)
 
 -- | Build the process environment from the derivation env + standard vars.
 -- The builder path is used to derive PATH entries - the builder's own
