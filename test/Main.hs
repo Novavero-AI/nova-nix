@@ -26,7 +26,7 @@ import qualified Data.Text.IO as TIO
 import qualified Database.SQLite.Simple as SQL
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, rewriteEnv, rewritePlaceholders, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import qualified Nix.DependencyGraph as DepGraph
@@ -44,7 +44,7 @@ import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbo
 import Nix.Eval.Types (emptyCList)
 import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
-import Nix.Hash (makeFixedOutputPath, sha256Digest)
+import Nix.Hash (hashPlaceholder, makeFixedOutputPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
@@ -4361,6 +4361,26 @@ testBuildOrchestrator = do
          in if SI.os == "mingw32"
               then assertEqual "displaced" (Map.fromList [("PATH", "build")]) merged
               else assertEqual "distinct" (Map.fromList [("PATH", "build"), ("Path", "host")]) merged,
+      -- Build-time placeholder substitution.  Upstream rewrites the whole
+      -- @name=value@ string (local-derivation-goal.cc:2004), so a sentinel in
+      -- a dynamic attribute name is substituted along with the values.
+      runTest "rewritePlaceholders substitutes an output sentinel" $
+        assertEqual
+          "substituted"
+          "/store/aaa-p/lib"
+          (rewritePlaceholders [("out", "/store/aaa-p")] (hashPlaceholder "out" <> "/lib")),
+      runTest "rewritePlaceholders leaves a foreign output's sentinel alone" $
+        assertEqual
+          "untouched"
+          (hashPlaceholder "dev")
+          (rewritePlaceholders [("out", "/store/aaa-p")] (hashPlaceholder "dev")),
+      runTest "rewriteEnv rewrites names as well as values" $
+        let rewrite = rewritePlaceholders [("out", "/store/aaa-p")]
+            env = Map.fromList [(hashPlaceholder "out" <> "-flag", hashPlaceholder "out" <> "/lib")]
+         in assertEqual
+              "name-and-value"
+              (Map.fromList [("/store/aaa-p-flag", "/store/aaa-p/lib")])
+              (rewriteEnv rewrite env),
       -- BuildConfig with caches
       runTest "BuildConfig accepts caches" $
         let cache = Subst.CacheConfig "https://cache.example.com" "key" 10
