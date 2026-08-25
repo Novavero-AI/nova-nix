@@ -22,10 +22,10 @@ $ nova-nix build pkgs\windows\hello.nix
   ...      (17 fixed-output fetches, one per MSYS2 package)
   [build]  mingw-w64-seed
   [build]  hello
-C:\nix\store\zr07i99kqnv48q29n706qxar7h1gfins-hello
+C:\nix\store\78n2mrxhg3xgjganf7nfkaznh2j03z68-hello
 
-$ C:\nix\store\zr07i99kqnv48q29n706qxar7h1gfins-hello\hello.exe
-Hello from the first native Windows Nix build.
+$ C:\nix\store\78n2mrxhg3xgjganf7nfkaznh2j03z68-hello\bin\hello.exe
+Hello, world!
 ```
 
 The seed (`pkgs/windows/bootstrap/seed.nix`) is stage 0 of a native Windows stdenv: the sha256-pinned runtime closure of MinGW-w64 GCC, merged into one toolchain root by in-process fetch and unpack builtins.

@@ -1,7 +1,5 @@
 # Changelog
 
-## Unreleased
-
 ## 0.7.0.0 - 2026-08-22
 
 - **A copied nova-nix finds its own bundled expressions.** The `<nix/*>` search path came from Cabal's `getDataDir`, which bakes an absolute path in at configure time naming the machine that did the build. That is right for a local `cabal install` and wrong for every copied or downloaded binary: `import <nix/fetchurl.nix>` resolved to a directory that does not exist on the host running it, and the Windows package recipes all open with that line. The data dir now comes from `NIX_DATA_DIR` when set (upstream's own variable name), otherwise from `share/nova-nix` beside the executable's own `bin` directory, which is the layout a release archive ships and needs nothing configured, and otherwise from Cabal as before, so a local install is unchanged. The build matrix now checks both fallbacks against a relocated copy with Cabal's own override pointed at nothing, so a pass cannot come from the baked path.
