@@ -74,6 +74,7 @@ library
     Nix.Eval.Compile
     Nix.Eval.EvalFormals
     Nix.Eval.Arena
+    Nix.Eval.AttrPath
     Nix.Store
     Nix.Store.Path
     Nix.Store.Path.Internal
