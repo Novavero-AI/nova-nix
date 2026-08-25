@@ -179,6 +179,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
       goBuild (opts {optTrustedKey = Just key}) buildArgs rest
     goBuild opts buildArgs ("--nix-path" : val : rest) =
       goBuild (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) buildArgs rest
+    goBuild opts buildArgs ("--exec-wrapper" : spec : rest) =
+      goBuild (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) buildArgs rest
     goBuild opts buildArgs ("--expr" : expr : rest) =
       withTarget opts buildArgs (TargetExpr (T.pack expr)) rest
     goBuild opts buildArgs (flag : path : rest)
