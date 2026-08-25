@@ -14,6 +14,10 @@ result
 *.eventlog
 *.ps
 *.pdf
+
+# Finder sidecars: the by-name walk in pkgs/windows treats a stray file as a
+# shard, and the dev machines are Macs.
+.DS_Store
 profiling/results/
 CLAUDE.md
 .claude/

@@ -24,14 +24,26 @@ let
   byName =
     let
       root = ./by-name;
+      # readDir answers name -> type, and every entry at both levels is a
+      # directory by construction.  Reading the type it already returned is
+      # what keeps a stray file from being taken for a shard or a package:
+      # unfiltered, an editor swapfile or a .DS_Store is opened as a directory
+      # and takes the whole set down with "inappropriate type", rather than
+      # being passed over.
+      subdirectories =
+        dir:
+        let
+          entries = builtins.readDir dir;
+        in
+        builtins.filter (name: entries.${name} == "directory") (builtins.attrNames entries);
       inShard =
         shard:
         map (pname: {
           name = pname;
           value = callPackage (root + "/${shard}/${pname}/package.nix") { };
-        }) (builtins.attrNames (builtins.readDir (root + "/${shard}")));
+        }) (subdirectories (root + "/${shard}"));
     in
-    builtins.listToAttrs (builtins.concatMap inShard (builtins.attrNames (builtins.readDir root)));
+    builtins.listToAttrs (builtins.concatMap inShard (subdirectories root));
 
   self = byName // {
     inherit lib;

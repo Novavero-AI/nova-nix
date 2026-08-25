@@ -1,24 +1,15 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | nova-nix CLI entry point.
+-- | nova-nix CLI entry point: parse the argument vector, dispatch one
+-- command, map its outcome to an exit code.
 --
--- Commands:
---
--- @
--- nova-nix eval  FILE.nix                  Evaluate a .nix file, print result
--- nova-nix eval  --expr 'EXPR'             Evaluate an inline expression
--- nova-nix build FILE.nix                  Build a derivation from a .nix file
--- nova-nix push  --cache URL --all         Push store paths to a binary cache
--- @
---
--- Flags:
---
--- @
--- --nix-path NAME=PATH   Add a search path entry (repeatable, merged with NIX_PATH)
--- --expr EXPR            Evaluate an inline expression instead of a file
--- --help                 Print usage on stdout and exit zero
--- --version              Print the version and exit zero
--- @
+-- The command and flag tables are deliberately not repeated here.
+-- 'usageLines' is the one place they live, and both @--help@ and the
+-- usage-error path print it, so the flag that adds itself to the parser
+-- documents itself in the same edit.  A second copy in this header went
+-- nine flags and two commands stale before anyone noticed, because
+-- nothing renders it: Haddock builds library targets by default, and
+-- this module is in the executable stanza.
 module Main (main) where
 
 import Control.Exception (IOException, displayException, try)
