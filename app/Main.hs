@@ -37,6 +37,7 @@ import Nix.Builtins (builtinEnv, parseNixPath)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), toATerm)
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
+import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
@@ -72,7 +73,7 @@ data CliOpts = CliOpts
 data Command
   = CmdEvalFile !FilePath
   | CmdEvalExpr !T.Text
-  | CmdBuild !FilePath
+  | CmdBuild !BuildTarget !(Maybe T.Text)
   | CmdPush !PushArgs
   | CmdStoreDelete ![String]
   | -- | No command given.  Usage on stderr, non-zero: a bare invocation is
@@ -82,6 +83,24 @@ data Command
     -- succeeded, and pipeable without redirecting stderr.
     CmdHelp
   | CmdVersion
+
+-- | Where a build's expression comes from.
+data BuildTarget
+  = -- | A @.nix@ file.  Relative paths inside it resolve beside the file.
+    TargetFile !FilePath
+  | -- | An inline expression.  Relative paths inside it resolve against the
+    -- working directory, since there is no file to sit beside.
+    TargetExpr !T.Text
+
+-- | Arguments to the build command, while the target is still unknown.
+data BuildArgs = BuildArgs
+  { baTarget :: !(Maybe BuildTarget),
+    baAttrPath :: !(Maybe T.Text)
+  }
+
+-- | Build arguments before any flag is parsed.
+emptyBuildArgs :: BuildArgs
+emptyBuildArgs = BuildArgs Nothing Nothing
 
 -- | Arguments to the push command.
 data PushArgs = PushArgs
@@ -121,9 +140,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdUsage)
     go opts ("--trusted-key" : key : rest) =
       go (opts {optTrustedKey = Just key}) rest
     go opts ("eval" : rest) = goEval opts rest
-    go _ ["build"] = Left "build requires a FILE.nix argument"
-    go opts ("build" : path : rest) =
-      go (opts {optCommand = CmdBuild path}) rest
+    go opts ("build" : rest) = goBuild opts emptyBuildArgs rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
     go opts ("store" : rest) = goStore opts rest
     go _ [flag]
@@ -142,6 +159,42 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdUsage)
     goEval _ (arg@('-' : _) : _) = Left ("unknown eval flag: " ++ arg)
     goEval opts (path : rest) =
       go (opts {optCommand = CmdEvalFile path}) rest
+    -- Sub-parser for build: the target, -A, and the shared flags in any
+    -- order.  The shared flags are handled here rather than deferred back to
+    -- 'go' so that one can follow the file argument, which is where a caller
+    -- reaches for it, and so that -A is still recognised after it.
+    goBuild opts buildArgs [] = finishBuild opts buildArgs
+    -- Answered here as well as at the top level: a sub-parser that rejected
+    -- them would make 'build --help' a usage error rather than a request.
+    goBuild opts _ ("--help" : _) = Right opts {optCommand = CmdHelp}
+    goBuild opts _ ("--version" : _) = Right opts {optCommand = CmdVersion}
+    goBuild opts buildArgs ("--store" : dir : rest) =
+      goBuild (opts {optStore = Just dir}) buildArgs rest
+    goBuild opts buildArgs ("--substituter" : url : rest) =
+      goBuild (opts {optSubstituter = Just url}) buildArgs rest
+    goBuild opts buildArgs ("--trusted-key" : key : rest) =
+      goBuild (opts {optTrustedKey = Just key}) buildArgs rest
+    goBuild opts buildArgs ("--nix-path" : val : rest) =
+      goBuild (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) buildArgs rest
+    goBuild opts buildArgs ("--expr" : expr : rest) =
+      withTarget opts buildArgs (TargetExpr (T.pack expr)) rest
+    goBuild opts buildArgs (flag : path : rest)
+      | flag `elem` attrFlags = case baAttrPath buildArgs of
+          Just _ -> Left "build accepts one attribute path"
+          Nothing -> goBuild opts (buildArgs {baAttrPath = Just (T.pack path)}) rest
+    goBuild _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goBuild _ _ (arg@('-' : _) : _) = Left ("unknown build flag: " ++ arg)
+    goBuild opts buildArgs (path : rest) =
+      withTarget opts buildArgs (TargetFile path) rest
+    -- A build evaluates one expression, so a second target is a mistake
+    -- worth naming rather than a silent last-one-wins.
+    withTarget opts buildArgs target rest = case baTarget buildArgs of
+      Just _ -> Left "build takes one FILE.nix or one --expr, not both"
+      Nothing -> goBuild opts (buildArgs {baTarget = Just target}) rest
+    finishBuild opts buildArgs = case baTarget buildArgs of
+      Nothing -> Left "build requires a FILE.nix argument or --expr EXPR"
+      Just target -> Right opts {optCommand = CmdBuild target (baAttrPath buildArgs)}
     -- Sub-parser for push: flags and explicit store paths in any order.
     goPush opts pushArgs [] = Right opts {optCommand = CmdPush pushArgs}
     goPush opts pushArgs ("--store" : dir : rest) =
@@ -176,6 +229,9 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing CmdUsage)
     -- Flags that consume the following argument as their value.
     valueFlags =
       ["--nix-path", "--store", "--substituter", "--trusted-key", "--expr", "--cache", "--key-file", "--compression"]
+        ++ attrFlags
+    -- Attribute selection, under both of upstream's spellings.
+    attrFlags = ["-A", "--attr"]
 
 -- | Upstream C++ Nix's name for this directory, so an operator who knows
 -- one knows the other.
@@ -245,7 +301,7 @@ main = do
     CmdEvalExpr expr
       | optAterm opts -> evalExprAterm (chosenStoreDir opts) (optNixPaths opts) dataDir expr
       | otherwise -> evalExpr (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir expr
-    CmdBuild filePath -> buildFile opts dataDir filePath
+    CmdBuild target attrPath -> buildCommand opts dataDir target attrPath
     CmdPush pushArgs -> pushCommand opts pushArgs
     CmdStoreDelete paths -> storeDeleteCommand opts paths
     CmdUsage -> mapM_ (hPutStrLn stderr) usageLines >> exitFailure
@@ -269,12 +325,14 @@ usageLines =
     "  eval FILE.nix          Evaluate a .nix file, print result",
     "  eval --expr 'EXPR'     Evaluate an inline expression",
     "  build FILE.nix         Build a derivation from a .nix file",
+    "  build --expr 'EXPR'    Build a derivation from an inline expression",
     "  push --cache URL       Push store paths (and their closures) to a binary cache",
     "  store delete PATH...   Remove store paths, refused while other valid paths reference them",
     "",
     "Flags:",
     "  --strict               Deep-force all thunks before printing (warning: OOM on large results)",
     "  --aterm                With eval --expr, print the derivation's .drv ATerm",
+    "  -A, --attr ATTRPATH    With build: select a dotted attribute path (a.b.c)",
     "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)",
     "  --all                  With push: select every valid path in the store",
     "  --key-file PATH        With push: file holding the cache API key",
@@ -366,12 +424,7 @@ evalExprAterm storeDir extraPaths dataDir source = do
           st = st0 {esSearchPaths = searchPaths}
       result <- runEvalIO st $ do
         val <- eval (builtinEnv (esTimestamp st) searchPaths) expr
-        case val of
-          VAttrs attrs ->
-            mapM_
-              (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
-              ["type", "_derivation", "drvPath"]
-          _ -> pure ()
+        forceDerivationAttrs val
         pure val
       case result of
         Left err -> do
@@ -385,35 +438,62 @@ evalExprAterm storeDir extraPaths dataDir source = do
 
 -- | Parse, evaluate, extract derivation, build, and print result.
 -- The file argument is canonicalized for the same reason as in 'evalFile'.
-buildFile :: CliOpts -> FilePath -> FilePath -> IO ()
-buildFile opts dataDir rawFilePath = do
+-- | Where a build reads its expression, and the directory relative paths
+-- inside it resolve against.
+loadBuildSource :: BuildTarget -> IO (FilePath, T.Text, T.Text)
+loadBuildSource (TargetFile rawFilePath) = do
+  (filePath, source) <- readSourceFile rawFilePath
+  pure (takeDirectory filePath, T.pack filePath, source)
+loadBuildSource (TargetExpr source) = do
+  cwd <- getCurrentDirectory
+  pure (cwd, exprSourceName, source)
+
+-- | Force the attributes 'extractDerivation' goes on to read.  @derivation@
+-- is a lazy wrapper, and 'readThunkValue' answers 'Nothing' for a thunk that
+-- was never forced, so skipping this reports a real derivation as not one.
+forceDerivationAttrs :: (MonadEval m) => NixValue -> m ()
+forceDerivationAttrs val = case val of
+  VAttrs attrs ->
+    mapM_
+      (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
+      derivationAttrKeys
+  _ -> pure ()
+
+-- | What a build needs forced: the marker, the wrapper, and the path whose
+-- closure the build driver writes.
+derivationAttrKeys :: [T.Text]
+derivationAttrKeys = ["type", "_derivation", "drvPath"]
+
+buildCommand :: CliOpts -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
+buildCommand opts dataDir target attrPath = do
   let storeDir = chosenStoreDir opts
   caches <- either failWith pure (substituterConfig (optSubstituter opts) (optTrustedKey opts))
-  (filePath, source) <- readSourceFile rawFilePath
-  case parseNix (takeDirectory filePath) (T.pack filePath) source of
+  (baseDir, sourceName, source) <- loadBuildSource target
+  case parseNix baseDir sourceName source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st0 <- newEvalState storeDir (takeDirectory filePath)
+      st0 <- newEvalState storeDir baseDir
       let searchPaths = mergeSearchPaths (optNixPaths opts) dataDir (esSearchPaths st0)
           st = st0 {esSearchPaths = searchPaths}
       result <- runEvalIO st $ do
-        val <- eval (builtinEnv (esTimestamp st) searchPaths) expr
-        -- 'derivation' is a lazy wrapper now; force the attrs extractDerivation
-        -- reads (a build legitimately needs the drvPath + closure).
-        case val of
-          VAttrs attrs ->
-            mapM_
-              (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
-              ["type", "_derivation", "drvPath"]
-          _ -> pure ()
-        pure val
+        root <- eval (builtinEnv (esTimestamp st) searchPaths) expr
+        selected <- case attrPath of
+          Nothing -> pure (Right root)
+          Just path -> selectAttrPath path root
+        -- Forced after selection, not before: forcing the root leaves the
+        -- selected value's own attributes unforced, and extractDerivation
+        -- then reports a real derivation as not being one.
+        either (pure . Left) (\val -> Right val <$ forceDerivationAttrs val) selected
       case result of
         Left err -> do
           TIO.hPutStrLn stderr ("eval error: " <> err)
           exitFailure
-        Right val -> do
+        Right (Left selectionErr) -> do
+          TIO.hPutStrLn stderr ("error: " <> selectionErr)
+          exitFailure
+        Right (Right val) -> do
           (drv, drvSP) <- extractDerivation val
           -- The full .drv closure (root + every transitive input) recorded
           -- during evaluation; written to the store before building.
