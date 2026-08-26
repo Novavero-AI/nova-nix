@@ -47,6 +47,7 @@ module Nix.Builder
     execWrapperFor,
     rewriteEnv,
     rewritePlaceholders,
+    scrubAmbient,
     unionEnvs,
     verifyFetchHash,
   )
@@ -98,13 +99,48 @@ import qualified System.Process as Proc
 envNixBuildTop :: Text
 envNixBuildTop = "NIX_BUILD_TOP"
 
--- | Environment variable for the temp directory.
-envTmpDir :: Text
+-- | The four temp-directory names, every one pointed at the build
+-- directory, matching upstream's single assignment of all four.  Tools
+-- disagree about which one they read (POSIX tools take @TMPDIR@, msys
+-- reads @TMPDIR@ and @TMP@, native Windows tools take @TMP@ then
+-- @TEMP@), and a scrubbed environment that repoints only one leaves
+-- the others to fall back to a directory the build cannot own - on
+-- Windows, GetTempPath bottoms out at the Windows directory itself.
+envTmpDir, envTempDir, envTmp, envTemp :: Text
 envTmpDir = "TMPDIR"
+envTempDir = "TEMPDIR"
+envTmp = "TMP"
+envTemp = "TEMP"
 
 -- | Environment variable for the Nix store path.
 envNixStore :: Text
 envNixStore = "NIX_STORE"
+
+-- | Ambient variables a Windows builder may inherit, by uppercase-folded
+-- name.  SystemRoot is a hard execution requirement - the CLR's crypto
+-- provider fails to load without it (verified live on a clean Windows 11
+-- box), while plain Win32 binaries merely tolerate its absence - and
+-- SystemDrive and windir are the aliases some tools consult instead of it.
+windowsAmbientAllowlist :: [Text]
+windowsAmbientAllowlist = [systemRootKey, "SYSTEMDRIVE", "WINDIR"]
+
+-- | The folded name 'scrubAmbient' derives COMSPEC from.
+systemRootKey :: Text
+systemRootKey = "SYSTEMROOT"
+
+-- | The command interpreter variable, synthesized from SystemRoot rather
+-- than inherited: programs shelling out through the C runtime's
+-- @system()@ read it from the block.
+envComspec :: Text
+envComspec = "COMSPEC"
+
+-- | Executable-extension resolution, pinned instead of inherited so name
+-- resolution does not drift with host configuration.  cmd.exe's own
+-- built-in default when the variable is absent adds @.VBS;.JS;.WS;.MSC@;
+-- a build has no business resolving those implicitly.
+envPathext, pathextValue :: Text
+envPathext = "PATHEXT"
+pathextValue = ".COM;.EXE;.BAT;.CMD"
 
 -- | Environment variable for PATH.
 envPath :: Text
@@ -641,6 +677,9 @@ buildEnvironment config decodedEnv builderPath buildDir outputDirs =
         Map.fromList
           [ (envNixBuildTop, T.pack buildDir),
             (envTmpDir, T.pack buildDir),
+            (envTempDir, T.pack buildDir),
+            (envTmp, T.pack buildDir),
+            (envTemp, T.pack buildDir),
             (homeEnvVar, T.pack buildDir),
             (envNixStore, T.pack (unStoreDir (bcStoreDir config))),
             (envPath, buildPath builderPath),
@@ -667,6 +706,34 @@ unionEnvs envs
             ]
        in Map.fromList (Map.elems (Map.unions folded))
   | otherwise = Map.unions envs
+
+-- | The ambient environment a builder is allowed to see.  Everything
+-- else is scrubbed: upstream builds in a cleared environment (its
+-- initEnv begins with @env.clear()@ and the child is exec'd with
+-- exactly that block), so an undeclared ambient variable reaching a
+-- build embeds machine-specific data in its output - undermining the
+-- reproducibility SOURCE_DATE_EPOCH exists to pin.
+--
+-- On Unix the allowance is empty.  A Windows process block cannot be:
+-- 'windowsAmbientAllowlist' names what passes through, COMSPEC is
+-- synthesized from the allowed SystemRoot, and PATHEXT is pinned to
+-- 'pathextValue'.  Names compare case-insensitively on Windows, so the
+-- allowlist matches by folded name and a passed variable keeps its
+-- ambient spelling.
+scrubAmbient :: Map Text Text -> Map Text Text
+scrubAmbient ambient
+  | not isWindows = Map.empty
+  | otherwise =
+      let foldName = T.map toUpper
+          folded = Map.fromList [(foldName name, (name, val)) | (name, val) <- Map.toList ambient]
+          allowed = Map.fromList [pair | key <- windowsAmbientAllowlist, Just pair <- [Map.lookup key folded]]
+          synthesized =
+            Map.fromList $
+              (envPathext, pathextValue)
+                : [ (envComspec, root <> "\\System32\\cmd.exe")
+                  | Just (_, root) <- [Map.lookup systemRootKey folded]
+                  ]
+       in unionEnvs [allowed, synthesized]
 
 -- | Construct the build PATH from the builder's location.
 -- Includes the builder's directory, its sibling @usr\/bin@ (for MSYS2
@@ -707,10 +774,10 @@ homeEnvVar =
 -- | Run the builder process, returning either (exitCode, stderr) on failure
 -- or () on success.
 --
--- The build environment is overlaid on top of the inherited system
--- environment.  Build variables take priority, but system-critical
--- variables (e.g. SYSTEMROOT on Windows) pass through.  This matches
--- unsandboxed build behavior - proper isolation comes with Phase 5.
+-- The child's environment is exactly the build environment plus
+-- 'scrubAmbient''s allowance - the ambient environment does not flow
+-- through.  Filesystem and process isolation remain future work; the
+-- environment no longer waits on them.
 runBuilder ::
   FilePath ->
   [String] ->
@@ -720,8 +787,8 @@ runBuilder ::
 runBuilder builderPath builderArgs buildEnv workDir = do
   systemEnv <- System.Environment.getEnvironment
   let systemMap = Map.fromList [(T.pack k, T.pack v) | (k, v) <- systemEnv]
-      -- Build env wins over system env, displacing case variants on Windows
-      mergedEnv = unionEnvs [buildEnv, systemMap]
+      -- Build env wins collisions, displacing case variants on Windows
+      mergedEnv = unionEnvs [buildEnv, scrubAmbient systemMap]
       envList = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList mergedEnv]
       cp =
         (mkBuilderProcess builderPath builderArgs)

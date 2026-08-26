@@ -26,7 +26,7 @@ import qualified Data.Text.IO as TIO
 import qualified Database.SQLite.Simple as SQL
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, rewriteEnv, rewritePlaceholders, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, rewriteEnv, rewritePlaceholders, scrubAmbient, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import qualified Nix.DependencyGraph as DepGraph
@@ -4516,6 +4516,35 @@ testBuildOrchestrator = do
          in if SI.os == "mingw32"
               then assertEqual "displaced" (Map.fromList [("PATH", "build")]) merged
               else assertEqual "distinct" (Map.fromList [("PATH", "build"), ("Path", "host")]) merged,
+      -- scrubAmbient: nothing ambient survives on Unix; on Windows only
+      -- the allowlist passes (keeping its ambient spelling), COMSPEC is
+      -- synthesized from SystemRoot, and PATHEXT is pinned.
+      runTest "scrubAmbient drops undeclared ambient variables" $
+        let ambient =
+              Map.fromList
+                [ ("SystemRoot", "C:\\WINDOWS"),
+                  ("APPDATA", "C:\\Users\\host\\AppData\\Roaming"),
+                  ("LANG", "en_US.UTF-8"),
+                  ("Path", "C:\\host\\bin")
+                ]
+            scrubbed = scrubAmbient ambient
+         in if SI.os == "mingw32"
+              then
+                assertEqual
+                  "allowlist-only"
+                  ( Map.fromList
+                      [ ("SystemRoot", "C:\\WINDOWS"),
+                        ("COMSPEC", "C:\\WINDOWS\\System32\\cmd.exe"),
+                        ("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+                      ]
+                  )
+                  scrubbed
+              else assertEqual "empty" Map.empty scrubbed,
+      runTest "scrubAmbient pins PATHEXT even without SystemRoot" $
+        let scrubbed = scrubAmbient Map.empty
+         in if SI.os == "mingw32"
+              then assertEqual "pinned" (Map.fromList [("PATHEXT", ".COM;.EXE;.BAT;.CMD")]) scrubbed
+              else assertEqual "empty" Map.empty scrubbed,
       -- Build-time placeholder substitution.  Upstream rewrites the whole
       -- @name=value@ string (local-derivation-goal.cc:2004), so a sentinel in
       -- a dynamic attribute name is substituted along with the values.
@@ -5304,6 +5333,72 @@ testSourceDateEpochIO = do
                 then Pass
                 else Fail ("unexpected content: " <> T.pack (show content))
           ]
+
+-- | The child's environment is the build environment plus the ambient
+-- allowlist, nothing else.  Proven behaviorally at both ends: an ambient
+-- canary set in the test process must not reach a build, and the four
+-- temp-directory names must all point at the same build-owned directory.
+testScrubbedBuildEnvIO :: IO [Bool]
+testScrubbedBuildEnvIO = do
+  putStrLn "builder/scrubbed-env"
+  withTempStore $ \store -> do
+    let storeDir = stDir store
+        probeDrv name suffix (builder, args) =
+          Derivation
+            { drvOutputs =
+                [ DerivationOutput
+                    { doName = "out",
+                      doPath = StorePath (T.replicate 31 "0" <> suffix) name,
+                      doHashAlgo = "",
+                      doHash = ""
+                    }
+                ],
+              drvInputDrvs = Map.empty,
+              drvInputSrcs = [],
+              drvPlatform = currentPlatform,
+              drvBuilder = builder,
+              drvArgs = args,
+              drvEnv = Map.empty
+            }
+        canaryDrv =
+          probeDrv "env-canary" "6" $
+            if SI.os == "mingw32"
+              then ("cmd.exe", ["/c", "echo %NOVA_NIX_TEST_CANARY%>%out%"])
+              else ("/bin/sh", ["-c", "echo \"${NOVA_NIX_TEST_CANARY-scrubbed}\" > $out"])
+        quartetDrv =
+          probeDrv "temp-quartet" "7" $
+            if SI.os == "mingw32"
+              then ("cmd.exe", ["/c", "if \"%TMPDIR%\"==\"%TEMPDIR%\" if \"%TMPDIR%\"==\"%TMP%\" if \"%TMPDIR%\"==\"%TEMP%\" if not \"%TMPDIR%\"==\"\" echo quartet-ok>%out%"])
+              else ("/bin/sh", ["-c", "[ -n \"$TMPDIR\" ] && [ \"$TMPDIR\" = \"$TEMPDIR\" ] && [ \"$TMPDIR\" = \"$TMP\" ] && [ \"$TMPDIR\" = \"$TEMP\" ] && echo quartet-ok > $out"])
+    buildTmp <- (</> "nova-nix-test-scrub-build-tmp") <$> getTemporaryDirectory
+    forceRemoveIfExists buildTmp
+    createDirectoryIfMissing True buildTmp
+    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+    setEnv "NOVA_NIX_TEST_CANARY" "ambient-leak"
+    canaryResult <- buildDerivation config store canaryDrv
+    unsetEnv "NOVA_NIX_TEST_CANARY"
+    quartetResult <- buildDerivation config store quartetDrv
+    forceRemoveIfExists buildTmp
+    sequence
+      [ runTestM "an undeclared ambient variable does not reach a build" $
+          case canaryResult of
+            BuildFailure msg code -> pure (Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg))
+            BuildSuccess sp -> do
+              content <- TIO.readFile (storePathToFilePath storeDir sp)
+              pure $
+                if "ambient-leak" `T.isInfixOf` content
+                  then Fail ("ambient canary leaked into the build: " <> T.pack (show content))
+                  else Pass,
+        runTestM "all four temp names point at the build directory" $
+          case quartetResult of
+            BuildFailure msg code -> pure (Fail ("quartet disagreed or build failed (exit " <> T.pack (show code) <> "): " <> msg))
+            BuildSuccess sp -> do
+              content <- TIO.readFile (storePathToFilePath storeDir sp)
+              pure $
+                if "quartet-ok" `T.isInfixOf` content
+                  then Pass
+                  else Fail ("unexpected content: " <> T.pack (show content))
+      ]
 
 -- | Zstd compression level for test archives (zstd's own default).
 testZstdCompressionLevel :: Int
@@ -10445,6 +10540,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testDerivation,
           testTrivialBuildIO,
           testSourceDateEpochIO,
+          testScrubbedBuildEnvIO,
           testUnpackBuildIO,
           testDependentBuildIO,
           testEvalFidelity,
