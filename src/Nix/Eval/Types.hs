@@ -1169,6 +1169,15 @@ class (Monad m) => MonadEval m where
   -- (throw\/assert); eval errors and aborts propagate.
   catchEvalError :: m a -> m (Either Text a)
 
+  -- | Run the action; when it fails with ANY evaluation failure
+  -- (catchable throw, eval error, or abort), run the cleanup and let
+  -- the failure propagate unchanged.  The error half of a bracket -
+  -- success runs no cleanup - for builtins that hold external state
+  -- (a scratch directory) across throwing calls.  'catchEvalError'
+  -- cannot express this: it recovers only catchable throws, and a
+  -- failed fetch is an eval error.
+  onEvalError :: m a -> m () -> m a
+
   doesPathExist :: Text -> m Bool
 
   -- | List a directory, returning @(name, fileType)@ pairs.
@@ -1370,6 +1379,10 @@ instance MonadEval PureEval where
       Left (PThrow t) -> Right (Left t)
       Left other -> Left other
       Right a -> Right (Right a)
+
+  -- Pure evaluation has no external state, so there is nothing to
+  -- clean up; the failure passes through unchanged.
+  onEvalError (PureEval action) _ = PureEval action
   doesPathExist _ = pure False
   listDirectory _ = throwEvalError "builtins.readDir: not available in pure evaluation"
   importFile _ = throwEvalError "import: not available in pure evaluation"
