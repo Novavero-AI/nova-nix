@@ -6908,6 +6908,103 @@ testFetchGitShallow = do
   forceRemoveIfExists cacheHome
   pure results
 
+-- | A path reached through an attrset's @outPath@ (or a @__toString@
+-- result) coerces exactly as the same path written directly: copied to
+-- the store, with the store path in the string context.  The broken
+-- shape rendered the raw filesystem path with no copy and no context,
+-- so @src = builtins.fetchGit { ... }@ produced empty inputSrcs and a
+-- drvPath diverging from upstream, while the @.outPath@ spelling
+-- worked.  Verified against nix-instantiate 2.33.2: the attrset form's
+-- drvPath now matches upstream byte for byte.
+testOutPathCoercion :: IO [Bool]
+testOutPathCoercion = do
+  tmpBase <- getTemporaryDirectory
+  let tmpStore = tmpBase </> "nova-nix-test-outpath-store"
+      srcDir = tmpBase </> "nova-nix-test-outpath-src"
+      cacheHome = tmpBase </> "nova-nix-test-outpath-cache"
+      repoDir = tmpBase </> "nova-nix-test-outpath-repo"
+      -- A RELATIVE path literal resolved against the eval's base dir: an
+      -- absolute Windows path (C:/...) is not a path literal at all - it
+      -- matches the URI rule (scheme:rest) and lexes as a string, which
+      -- correctly never copies.  Relative spelling lexes as a path on
+      -- every platform.
+      srcLiteral = "./nova-nix-test-outpath-src" :: Text
+      drvPathWith srcExpr =
+        "(derivation { name = \"ctx-probe\"; system = \"x86_64-linux\"; "
+          <> "builder = \"/bin/sh\"; args = [\"-c\" \"echo ok > $out\"]; "
+          <> "src = "
+          <> srcExpr
+          <> "; }).drvPath"
+      evalHere = evalNixIOStore (StoreDir tmpStore) tmpBase
+      storeStr result = case result of
+        Right (VStr s _) -> Just (TE.decodeUtf8Lenient s)
+        _ -> Nothing
+  forceRemoveIfExists tmpStore
+  forceRemoveIfExists srcDir
+  forceRemoveIfExists cacheHome
+  forceRemoveIfExists repoDir
+  Dir.createDirectoryIfMissing True srcDir
+  BS.writeFile (srcDir </> "f.txt") (TE.encodeUtf8 "content\n")
+  savedCacheHome <- lookupEnv "XDG_CACHE_HOME"
+  setEnv "XDG_CACHE_HOME" cacheHome
+  gitShas <- makeGitFixture repoDir [("g.txt", "tracked\n")]
+  results <-
+    sequence
+      [ runTestM "an outPath attrset src derives the same drv as its path" $ do
+          attrForm <- evalHere (drvPathWith ("{ outPath = " <> srcLiteral <> "; }"))
+          pathForm <- evalHere (drvPathWith srcLiteral)
+          pure $ case (attrForm, pathForm) of
+            (Right a, Right b)
+              | a == b -> Pass
+              | otherwise -> Fail (T.pack (show (a, b)))
+            other -> Fail (T.pack (show other)),
+        runTestM "a fetchGit src derives the same drv as its outPath" $ case gitShas of
+          (sha : _) -> do
+            let fetch = "builtins.fetchGit { url = \"" <> T.concatMap (\c -> if c == '\\' then "\\\\" else T.singleton c) (T.pack repoDir) <> "\"; rev = \"" <> sha <> "\"; }"
+            attrForm <- evalHere (drvPathWith fetch)
+            outPathForm <- evalHere (drvPathWith ("(" <> fetch <> ").outPath"))
+            pure $ case (attrForm, outPathForm) of
+              (Right a, Right b)
+                | a == b -> Pass
+                | otherwise -> Fail (T.pack (show (a, b)))
+              other -> Fail (T.pack (show other))
+          [] -> pure (Fail "fixture returned no commits"),
+        -- Text-only assertions here and below: a source copy is
+        -- materialized by the build driver, not by a bare eval, so the
+        -- observable at eval time is the store-path spelling.  The two
+        -- drvPath tests above cover the context end (an uncontexted src
+        -- would derive a different drv).
+        runTestM "interpolating an outPath attrset coerces to its store path" $ do
+          outcome <- evalHere ("\"${ { outPath = " <> srcLiteral <> "; } }\"")
+          pure $ case storeStr outcome of
+            Just text | isCanonicalStoreText text -> Pass
+            _ -> Fail (T.pack (show outcome)),
+        runTestM "a __toString path result coerces to its store path" $ do
+          outcome <- evalHere ("\"${ { __toString = self: " <> srcLiteral <> "; } }\"")
+          pure $ case storeStr outcome of
+            Just text | isCanonicalStoreText text -> Pass
+            _ -> Fail (T.pack (show outcome)),
+        runTestM "adding an outPath attrset to a string coerces to its store path" $ do
+          outcome <- evalHere ("\"src: \" + { outPath = " <> srcLiteral <> "; }")
+          pure $ case storeStr outcome of
+            Just text | Just rest <- T.stripPrefix "src: " text, isCanonicalStoreText rest -> Pass
+            _ -> Fail (T.pack (show outcome)),
+        runTestM "toJSON of an outPath attrset is its store path" $ do
+          outcome <- evalHere ("builtins.toJSON { outPath = " <> srcLiteral <> "; }")
+          pure $ case storeStr outcome of
+            Just text
+              | Just inner <- T.stripPrefix "\"" text >>= T.stripSuffix "\"",
+                isCanonicalStoreText inner ->
+                  Pass
+            _ -> Fail (T.pack (show outcome))
+      ]
+  maybe (unsetEnv "XDG_CACHE_HOME") (setEnv "XDG_CACHE_HOME") savedCacheHome
+  forceRemoveIfExists tmpStore
+  forceRemoveIfExists srcDir
+  forceRemoveIfExists cacheHome
+  forceRemoveIfExists repoDir
+  pure results
+
 testScratchDirs :: IO [Bool]
 testScratchDirs = do
   putStrLn "eval/scratch-dirs"
@@ -10549,6 +10646,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,
+          testOutPathCoercion,
           testFetchCache,
           testExecWrapper,
           testAttrPath,

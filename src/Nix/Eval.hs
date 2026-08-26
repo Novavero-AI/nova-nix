@@ -402,8 +402,8 @@ evalAddWithCoercion left right = case (left, right) of
 -- store, carrying context) coerce; numbers, booleans, null, lists, and
 -- functions are type errors.
 coerceAddOperand :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
-coerceAddOperand v@(VStr {}) = coerceToString False force applyValue v
-coerceAddOperand v@(VAttrs {}) = coerceToString False force applyValue v
+coerceAddOperand v@(VStr {}) = coerceToString False force applyValue coercePathToStore v
+coerceAddOperand v@(VAttrs {}) = coerceToString False force applyValue coercePathToStore v
 coerceAddOperand v@(VPath _) = coerceToStoreString v
 coerceAddOperand v =
   throwEvalError ("cannot coerce " <> typeName v <> " to a string with the + operator")
@@ -2041,6 +2041,22 @@ deferApplyExpr = EApp (EResolvedVar 0 0) (EResolvedVar 0 1)
 -- Like 'coerceToString' but additionally handles lists: elements are
 -- recursively coerced and joined with spaces, matching real Nix semantics.
 -- @toString [1 2 3]@ gives @"1 2 3"@.
+-- | The non-copying path coercion: the path text verbatim, no context -
+-- upstream's @coerceToString@ with @copyToStore = false@.
+coercePathVerbatim :: (MonadEval m) => Text -> m (BS.ByteString, StringContext)
+coercePathVerbatim p = pure (TE.encodeUtf8 p, emptyContext)
+
+-- | The copy-to-store path coercion: the path becomes its source store
+-- path, carried in the context - upstream's @copyToStore = true@.  Passed
+-- into 'coerceToString' so a path reached through an attrset's @outPath@
+-- (or a @__toString@ result) coerces exactly as the same path written
+-- directly would; a fixed path case in the engine dropped both the copy
+-- and the context for every such value.
+coercePathToStore :: (MonadEval m) => Text -> m (BS.ByteString, StringContext)
+coercePathToStore p = do
+  (spText, ctx) <- sourcePathWithContext p
+  pure (TE.encodeUtf8 spText, ctx)
+
 coerceToStringPermissive :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
 coerceToStringPermissive (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
@@ -2052,7 +2068,7 @@ coerceToStringPermissive (VList cl) = do
     coerceThunk thunk = do
       val <- force thunk
       coerceToStringPermissive val
-coerceToStringPermissive other = coerceToString True force applyValue other
+coerceToStringPermissive other = coerceToString True force applyValue coercePathVerbatim other
 
 -- | Coerce a value to a string for a DERIVATION field (an env value or an
 -- arg).  Like 'coerceToStringPermissive', but a path literal is copied into
@@ -2060,24 +2076,18 @@ coerceToStringPermissive other = coerceToString True force applyValue other
 -- string context so it lands in the derivation's @inputSrcs@ - matching C++
 -- Nix's copy-to-store coercion of paths in derivation arguments/environment.
 coerceToStoreString :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
-coerceToStoreString (VPath p) = do
-  (spText, ctx) <- sourcePathWithContext p
-  pure (TE.encodeUtf8 spText, ctx)
 coerceToStoreString (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   parts <- mapM (force >=> coerceToStoreString) thunks
   pure (BS.intercalate " " (map fst parts), mconcat (map snd parts))
-coerceToStoreString other = coerceToStringPermissive other
+coerceToStoreString other = coerceToString True force applyValue coercePathToStore other
 
 -- | Coerce a value for string interpolation (@"${...}"@).  Like
 -- 'coerceToString', but a path literal is copied into the store and replaced by
 -- its source store path (with context) - matching C++ Nix, where interpolation
 -- uses @copyToStore = true@, unlike 'builtins.toString', which does not copy.
 coerceToStringInterp :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
-coerceToStringInterp (VPath p) = do
-  (spText, ctx) <- sourcePathWithContext p
-  pure (TE.encodeUtf8 spText, ctx)
-coerceToStringInterp other = coerceToString False force applyValue other
+coerceToStringInterp = coerceToString False force applyValue coercePathToStore
 
 -- | The store path a source path literal coerces to, carrying its
 -- SCPlain context - the copy-to-store coercion shared by interpolation,
@@ -2868,7 +2878,7 @@ valueToJSON (VAttrs attrs) =
           ctx = mconcat (map snd results)
       pure ("{" <> T.intercalate "," pairs <> "}", ctx)
     _ -> do
-      (s, ctx) <- coerceToString True force applyValue (VAttrs attrs)
+      (s, ctx) <- coerceToString True force applyValue coercePathToStore (VAttrs attrs)
       decoded <- decodedText "builtins.toJSON" s
       pure (jsonEscapeString decoded, ctx)
   where
@@ -3918,7 +3928,7 @@ forceAttrBytes builtin key attrs =
     Nothing -> throwEvalError (builtin <> ": missing required attribute '" <> key <> "'")
     Just thunk -> do
       val <- force thunk
-      (s, _ctx) <- coerceToString True force applyValue val
+      (s, _ctx) <- coerceToString True force applyValue coercePathVerbatim val
       pure s
 
 -- | Force an optional string attribute via full Nix coercion.  A present
@@ -3929,7 +3939,7 @@ forceOptionalAttrStr attrs key =
     Nothing -> pure Nothing
     Just thunk -> do
       val <- force thunk
-      (s, _ctx) <- coerceToString True force applyValue val
+      (s, _ctx) <- coerceToString True force applyValue coercePathVerbatim val
       Just <$> decodedText "string attribute" s
 
 -- | Force an optional boolean attribute; present but non-boolean is an error,
@@ -4354,7 +4364,7 @@ builtinDerivationLazy other =
 forceToText :: (MonadEval m) => Thunk -> m Text
 forceToText thunk = do
   val <- force thunk
-  (s, _ctx) <- coerceToString True force applyValue val
+  (s, _ctx) <- coerceToString True force applyValue coercePathVerbatim val
   decodedText "derivation" s
 
 -- | Collect all derivation attributes into env pairs via full Nix coercion
