@@ -172,6 +172,11 @@ fetchUserAgent = "nova-nix (+https://github.com/Novavero-AI/nova-nix)"
 envSourceDateEpoch :: Text
 envSourceDateEpoch = "SOURCE_DATE_EPOCH"
 
+-- | The derivation attribute naming ambient variables a fixed-output
+-- build may read, upstream's carve-out for fetchers that need proxies.
+envImpureEnvVars :: Text
+envImpureEnvVars = "impureEnvVars"
+
 -- | The fixed build timestamp handed to every builder: 1980-01-01 UTC.
 -- Determinism-aware tools (binutils @ld@ writes it into the PE header
 -- instead of the wall clock; gcc uses it for @__DATE__@\/@__TIME__@)
@@ -493,8 +498,17 @@ runPlannedBuild config store drv buildDir plans = do
                 (spawnPath, spawnArgs) = case spawn of
                   SpawnThrough launcher -> (launcher, builderPath : builderArgs)
                   _ -> (builderPath, builderArgs)
+                -- Only a fixed-output derivation's impureEnvVars reach
+                -- the spawn: upstream gates the carve-out on the
+                -- derivation type being non-sandboxed, which for us is
+                -- exactly the fixed-output case.
+                carriesHash out = not (T.null (doHashAlgo out))
+                impureVars
+                  | any carriesHash (drvOutputs drv) =
+                      T.words (Map.findWithDefault "" envImpureEnvVars decodedEnv)
+                  | otherwise = []
              in -- 5. Run the builder
-                runBuilder spawnPath spawnArgs environ buildDir
+                runBuilder spawnPath spawnArgs environ impureVars buildDir
       case exitResult of
         Left (exitCode, stderrText) -> do
           -- Whatever the builder wrote is in the store now, so failure has
@@ -778,17 +792,28 @@ homeEnvVar =
 -- 'scrubAmbient''s allowance - the ambient environment does not flow
 -- through.  Filesystem and process isolation remain future work; the
 -- environment no longer waits on them.
+--
+-- @impureVars@ is the impureEnvVars carve-out: the caller passes the
+-- names a fixed-output derivation listed (empty otherwise), and each
+-- is copied from the ambient environment - the EMPTY STRING when
+-- absent, not omitted, matching upstream's @getEnv(i).value_or("")@.
+-- Upstream writes these last in initEnv, so they win even over the
+-- derivation's own values.  Names match exactly, as upstream's do.
 runBuilder ::
   FilePath ->
   [String] ->
   Map Text Text ->
+  [Text] ->
   FilePath ->
   IO (Either (Int, Text) ())
-runBuilder builderPath builderArgs buildEnv workDir = do
+runBuilder builderPath builderArgs buildEnv impureVars workDir = do
   systemEnv <- System.Environment.getEnvironment
   let systemMap = Map.fromList [(T.pack k, T.pack v) | (k, v) <- systemEnv]
-      -- Build env wins collisions, displacing case variants on Windows
-      mergedEnv = unionEnvs [buildEnv, scrubAmbient systemMap]
+      impureAllowance =
+        Map.fromList [(var, Map.findWithDefault "" var systemMap) | var <- impureVars]
+      -- Impure carve-out wins, then build env, displacing case variants
+      -- on Windows; the scrubbed ambient allowance fills underneath.
+      mergedEnv = unionEnvs [impureAllowance, buildEnv, scrubAmbient systemMap]
       envList = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList mergedEnv]
       cp =
         (mkBuilderProcess builderPath builderArgs)

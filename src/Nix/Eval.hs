@@ -3758,7 +3758,7 @@ fetchGitInClone args checkedRef checkedRev cloneDir = do
       -- never hits this).  The refusal protects a checked-out branch
       -- from moving under the worktree; the explicit checkout below
       -- replaces the worktree state anyway, so allowing it is safe.
-      updateHeadArgs = if fgaAllRefs args then ["--update-head-ok"] else []
+      updateHeadArgs = ["--update-head-ok" | fgaAllRefs args]
       -- Upstream's refspec ternary, in its order.  @allRefs@ fetches
       -- everything.  Otherwise a pinned rev is itself the refspec: a
       -- depth-1 fetch of a branch tip cannot contain any other revision,
