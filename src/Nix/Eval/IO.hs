@@ -189,6 +189,12 @@ instance MonadEval EvalIO where
       Left err@(NixEvalError ErrorUncatchable _) -> liftIO (throwIO err)
       Right val -> pure (Right val)
 
+  -- Over IO exceptions, so eval errors, aborts, and IO failures
+  -- crossing 'wrapIO' all trigger the cleanup before propagating.
+  onEvalError (EvalIO action) (EvalIO cleanup) = EvalIO $ do
+    st <- ask
+    liftIO (runReaderT action st `onException` runReaderT cleanup st)
+
   doesPathExist path = evalStoreTextPath path >>= \resolved -> wrapIO (Dir.doesPathExist resolved)
 
   listDirectory path = do

@@ -78,7 +78,7 @@ module Nix.Eval
   )
 where
 
-import Control.Monad (foldM, forM_, void, when, (>=>))
+import Control.Monad (foldM, forM_, unless, void, when, (>=>))
 import qualified Crypto.Hash as CH
 import qualified Data.Array as Array
 import Data.Bits (complement, xor, (.&.), (.|.))
@@ -3576,18 +3576,66 @@ gitTransportConfig =
   ]
     ++ concat [["-c", "protocol." <> scheme <> ".allow=always"] | scheme <- allowedGitSchemes]
 
+-- | The parsed arguments of a @builtins.fetchGit@ call.  A record
+-- rather than positional threading: eight independent knobs invite
+-- transposition, and the names keep every site readable.
+data FetchGitArgs = FetchGitArgs
+  { fgaUrl :: !Text,
+    fgaName :: !Text,
+    fgaRef :: !(Maybe Text),
+    fgaRev :: !(Maybe Text),
+    fgaSubmodules :: !Bool,
+    fgaShallow :: !Bool,
+    fgaAllRefs :: !Bool,
+    fgaNarHash :: !(Maybe Text)
+  }
+
+-- | The attributes @builtins.fetchGit@ accepts.  Anything outside the
+-- set is an error rather than a silent drop - an ignored attribute is
+-- exactly how an unhonored pin stays invisible.  Upstream refuses the
+-- same way ("input attribute '...' not supported by scheme 'git'",
+-- observed from nix-instantiate 2.33.2).
+fetchGitSupportedAttrs :: [Text]
+fetchGitSupportedAttrs = ["url", "name", "ref", "rev", "submodules", "shallow", "allRefs", "narHash"]
+
 builtinFetchGit :: (MonadEval m) => NixValue -> m NixValue
 builtinFetchGit (VStr rawUrl _) = do
   url <- decodedText "builtins.fetchGit" rawUrl
-  fetchGit url "source" Nothing Nothing False False
+  fetchGit
+    FetchGitArgs
+      { fgaUrl = url,
+        fgaName = "source",
+        fgaRef = Nothing,
+        fgaRev = Nothing,
+        fgaSubmodules = False,
+        fgaShallow = False,
+        fgaAllRefs = False,
+        fgaNarHash = Nothing
+      }
 builtinFetchGit (VAttrs attrs) = do
+  case filter (`notElem` fetchGitSupportedAttrs) (Map.keys (attrSetToMap attrs)) of
+    (unsupported : _) ->
+      throwEvalError ("builtins.fetchGit: attribute '" <> unsupported <> "' not supported")
+    [] -> pure ()
   url <- forceAttrStr "builtins.fetchGit" "url" attrs
   name <- fromMaybe "source" <$> forceOptionalAttrStr attrs "name"
   ref <- forceOptionalAttrStr attrs "ref"
   rev <- forceOptionalAttrStr attrs "rev"
   submodules <- forceOptionalAttrBool "builtins.fetchGit" attrs "submodules" False
   shallow <- forceOptionalAttrBool "builtins.fetchGit" attrs "shallow" False
-  fetchGit url name ref rev submodules shallow
+  allRefs <- forceOptionalAttrBool "builtins.fetchGit" attrs "allRefs" False
+  narHash <- forceOptionalAttrStr attrs "narHash"
+  fetchGit
+    FetchGitArgs
+      { fgaUrl = url,
+        fgaName = name,
+        fgaRef = ref,
+        fgaRev = rev,
+        fgaSubmodules = submodules,
+        fgaShallow = shallow,
+        fgaAllRefs = allRefs,
+        fgaNarHash = narHash
+      }
 builtinFetchGit other =
   throwEvalError ("builtins.fetchGit: expected a string or set, got " <> typeName other)
 
@@ -3596,11 +3644,14 @@ builtinFetchGit other =
 -- @lastModified@, @lastModifiedDate@, @narHash@).  @ref@ and @rev@ are
 -- validated to upstream's shapes before they reach git (see
 -- 'checkGitRef' and 'checkGitRev'); neither may lead with @-@.
-fetchGit :: (MonadEval m) => Text -> Text -> Maybe Text -> Maybe Text -> Bool -> Bool -> m NixValue
-fetchGit rawUrl name mRef mRev submodules shallow =
-  case (,,) <$> checkGitUrl rawUrl <*> traverse checkGitRef mRef <*> traverse checkGitRev mRev of
+fetchGit :: (MonadEval m) => FetchGitArgs -> m NixValue
+fetchGit args =
+  case (,,) <$> checkGitUrl (fgaUrl args) <*> traverse checkGitRef (fgaRef args) <*> traverse checkGitRev (fgaRev args) of
     Left err -> throwEvalError err
     Right (url, checkedRef, checkedRev) -> do
+      let name = fgaName args
+          submodules = fgaSubmodules args
+          shallow = fgaShallow args
       -- Only a pinned rev is cached: a bare ref means "whatever this branch
       -- points at now", which a note taken earlier cannot answer.
       cached <- case checkedRev of
@@ -3617,70 +3668,121 @@ fetchGit rawUrl name mRef mRev submodules shallow =
               -- unregistered outPath fails to build.
               adopted <- adoptStorePath (fcStorePath fields)
               pure (if adopted then Just fields else Nothing)
-      case cached of
-        Just fields -> pure (fetchGitResult submodules fields)
-        Nothing -> fetchGitUncached url name checkedRef checkedRev submodules shallow
+      fields <- case cached of
+        Just hit -> pure hit
+        Nothing -> fetchGitUncached args {fgaUrl = url} checkedRef checkedRev
+      -- A declared narHash pins the tree; a mismatch is an error on the
+      -- hit and fresh paths alike, never a silent recompute.  Upstream's
+      -- orientation: "expected" is what the fetch produced, "got" is the
+      -- declared pin (observed from nix-instantiate 2.33.2).
+      case fgaNarHash args of
+        Nothing -> pure ()
+        Just declared ->
+          let computed = "sha256-" <> fcNarHash fields
+           in unless (declared == computed) $
+                throwEvalError
+                  ("builtins.fetchGit: NAR hash mismatch in '" <> url <> "', expected '" <> computed <> "' but got '" <> declared <> "'")
+      pure (fetchGitResult submodules fields)
 
--- | The fetch itself, when nothing is remembered about it.  @ref@ and @rev@
--- have already passed 'checkGitRef'\/'checkGitRev'.
-fetchGitUncached :: (MonadEval m) => Text -> Text -> Maybe Text -> Maybe Text -> Bool -> Bool -> m NixValue
-fetchGitUncached url name checkedRef checkedRev submodules shallow =
-  do
-    cloneDir <- createScratchDir "nova-nix-fetchgit-"
-    let ctx = "builtins.fetchGit"
-        git = gitRun ctx cloneDir
-        depthArgs = if shallow then ["--depth", "1"] else []
-        -- A pinned rev is itself the refspec, upstream's construction: a
-        -- depth-1 fetch of a branch tip cannot contain any other revision,
-        -- so asking the remote for the SHA is what lets @shallow@ and
-        -- @rev@ compose (and what finds a rev not on the fetched ref).  A
-        -- server may refuse a SHA it does not advertise; that surfaces as
-        -- git's own fetch error, the same surface upstream has.
-        fetchTarget = case checkedRev of
-          Just pinned -> pinned
-          Nothing -> fromMaybe defaultFetchRef checkedRef
-        checkoutTarget = fromMaybe fetchHeadRef checkedRev
-    _ <- git ["init", "--quiet", "."]
-    _ <- git ["remote", "add", "origin", "--", url]
-    -- @--@ before the remote: git keeps parsing options after it, so
-    -- without a separator a refspec is indistinguishable from a flag.
-    _ <- git (["fetch", "--quiet"] ++ depthArgs ++ ["--", "origin", fetchTarget])
-    -- Trailing @--@, not leading: @git checkout -- X@ reads X as a
-    -- pathspec, the opposite of what a leading separator means elsewhere.
-    _ <- git ["checkout", "--quiet", checkoutTarget, "--"]
-    when submodules $
-      void (git ["submodule", "update", "--init", "--recursive"])
-    markExecutablesFromIndex ctx cloneDir
-    rev <- git ["rev-parse", "HEAD"]
-    -- Truncated history cannot answer rev-list: the count would be the
-    -- fetch depth, not the revision's depth, and @revCount@ can reach a
-    -- derivation's environment.  Upstream reports 0 under @shallow@ (its
-    -- fetcher skips computing the attribute and eval fills the default;
-    -- observed from nix-instantiate 2.33.2), so 0 is recorded here and
-    -- cache hits replay it.
-    revCount <-
-      if shallow
-        then pure 0
-        else decodeDecimal ctx =<< git ["rev-list", "--count", "HEAD"]
-    lastModifiedText <- git ["show", "-s", "--format=%ct", "HEAD"]
-    removeGitMetadata ctx cloneDir
-    storePath <- copyPathToStore cloneDir name Nothing
-    narHash <- narHashOfPath cloneDir
-    removeScratchDir cloneDir
-    lastModified <- decodeDecimal ctx lastModifiedText
-    let fields =
-          FetchCache
-            { fcStorePath = storePath,
-              fcRev = rev,
-              fcRevCount = revCount,
-              fcLastModified = lastModified,
-              fcNarHash = bytesToBase64 narHash
-            }
-    -- Remembered only for a pinned revision; see fetchGit.
-    case checkedRev of
-      Nothing -> pure ()
-      Just pinned -> writeFetchCache (fetchCacheKey url name pinned submodules shallow) (encodeFetchCache fields)
-    pure (fetchGitResult submodules fields)
+-- | The fetch-everything refspec @allRefs@ selects, upstream's exact
+-- spelling: every remote ref lands under the same local name, so a
+-- pinned rev reachable from ANY ref becomes fetchable even when the
+-- remote refuses a direct SHA want.
+allRefsFetchSpec :: Text
+allRefsFetchSpec = "refs/*:refs/*"
+
+-- | The fetch itself, when nothing is remembered about it.  @checkedRef@
+-- and @checkedRev@ have already passed 'checkGitRef'\/'checkGitRev'.
+-- The scratch clone is removed on success once the tree is copied out,
+-- and by 'onEvalError' when any step throws: a failing fetch must not
+-- leave the clone behind.
+fetchGitUncached :: (MonadEval m) => FetchGitArgs -> Maybe Text -> Maybe Text -> m FetchCache
+fetchGitUncached args checkedRef checkedRev = do
+  cloneDir <- createScratchDir "nova-nix-fetchgit-"
+  fetchGitInClone args checkedRef checkedRev cloneDir
+    `onEvalError` removeScratchDir cloneDir
+
+-- | Every step of an uncached fetch that can throw, run under
+-- 'fetchGitUncached''s scratch-dir cleanup.
+fetchGitInClone :: (MonadEval m) => FetchGitArgs -> Maybe Text -> Maybe Text -> Text -> m FetchCache
+fetchGitInClone args checkedRef checkedRev cloneDir = do
+  let ctx = "builtins.fetchGit"
+      git = gitRun ctx cloneDir
+      url = fgaUrl args
+      name = fgaName args
+      submodules = fgaSubmodules args
+      shallow = fgaShallow args
+      depthArgs = if shallow then ["--depth", "1"] else []
+      -- An allRefs fetch writes every remote ref, including the one the
+      -- scratch clone's unborn HEAD names, which git refuses in a repo
+      -- with a worktree (upstream fetches into a BARE cache repo and
+      -- never hits this).  The refusal protects a checked-out branch
+      -- from moving under the worktree; the explicit checkout below
+      -- replaces the worktree state anyway, so allowing it is safe.
+      updateHeadArgs = if fgaAllRefs args then ["--update-head-ok"] else []
+      -- Upstream's refspec ternary, in its order.  @allRefs@ fetches
+      -- everything.  Otherwise a pinned rev is itself the refspec: a
+      -- depth-1 fetch of a branch tip cannot contain any other revision,
+      -- so asking the remote for the SHA is what lets @shallow@ and
+      -- @rev@ compose (and what finds a rev not on the fetched ref).  A
+      -- server may refuse a SHA it does not advertise; that surfaces as
+      -- git's own fetch error, the same surface upstream has, and
+      -- @allRefs = true@ is the caller's way around it.
+      fetchTarget
+        | fgaAllRefs args = allRefsFetchSpec
+        | Just pinned <- checkedRev = pinned
+        | otherwise = fromMaybe defaultFetchRef checkedRef
+      -- The pinned rev when there is one; under an allRefs fetch with
+      -- only a ref, that ref (FETCH_HEAD after a refs/* fetch is
+      -- whichever ref arrived last, not the named one); otherwise
+      -- whatever the fetch brought down.
+      checkoutTarget = case (checkedRev, fgaAllRefs args, checkedRef) of
+        (Just pinned, _, _) -> pinned
+        (Nothing, True, Just ref) -> ref
+        _ -> fetchHeadRef
+  _ <- git ["init", "--quiet", "."]
+  _ <- git ["remote", "add", "origin", "--", url]
+  -- @--@ before the remote: git keeps parsing options after it, so
+  -- without a separator a refspec is indistinguishable from a flag.
+  _ <- git (["fetch", "--quiet"] ++ depthArgs ++ updateHeadArgs ++ ["--", "origin", fetchTarget])
+  -- Trailing @--@, not leading: @git checkout -- X@ reads X as a
+  -- pathspec, the opposite of what a leading separator means elsewhere.
+  _ <- git ["checkout", "--quiet", checkoutTarget, "--"]
+  when submodules $
+    void (git ["submodule", "update", "--init", "--recursive"])
+  markExecutablesFromIndex ctx cloneDir
+  rev <- git ["rev-parse", "HEAD"]
+  -- Truncated history cannot answer rev-list: the count would be the
+  -- fetch depth, not the revision's depth, and @revCount@ can reach a
+  -- derivation's environment.  Upstream reports 0 under @shallow@ (its
+  -- fetcher skips computing the attribute and eval fills the default;
+  -- observed from nix-instantiate 2.33.2), so 0 is recorded here and
+  -- cache hits replay it.
+  revCount <-
+    if shallow
+      then pure 0
+      else decodeDecimal ctx =<< git ["rev-list", "--count", "HEAD"]
+  lastModifiedText <- git ["show", "-s", "--format=%ct", "HEAD"]
+  removeGitMetadata ctx cloneDir
+  storePath <- copyPathToStore cloneDir name Nothing
+  narHash <- narHashOfPath cloneDir
+  removeScratchDir cloneDir
+  lastModified <- decodeDecimal ctx lastModifiedText
+  let fields =
+        FetchCache
+          { fcStorePath = storePath,
+            fcRev = rev,
+            fcRevCount = revCount,
+            fcLastModified = lastModified,
+            fcNarHash = bytesToBase64 narHash
+          }
+  -- Remembered only for a pinned revision; see fetchGit.  @allRefs@ is
+  -- deliberately not in the key: it changes only whether a fetch can
+  -- succeed, never what a given revision's entry holds.
+  case checkedRev of
+    Nothing -> pure ()
+    Just pinned -> writeFetchCache (fetchCacheKey url name pinned submodules shallow) (encodeFetchCache fields)
+  pure fields
 
 -- | Mark every file git records as executable (mode 100755) in the
 -- checked-out tree.  A no-op on Unix; on Windows the mode has nowhere to

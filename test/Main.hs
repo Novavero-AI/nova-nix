@@ -6908,6 +6908,89 @@ testFetchGitShallow = do
   forceRemoveIfExists cacheHome
   pure results
 
+-- | The fetchGit completeness remainder (#77): unsupported attributes
+-- refuse, a declared narHash pins the tree on hit and fresh paths
+-- alike, allRefs widens the fetch, and a failing fetch leaves no
+-- scratch clone behind.
+testFetchGitPins :: IO [Bool]
+testFetchGitPins = do
+  tmpBase <- getTemporaryDirectory
+  let tmpStore = tmpBase </> "nova-nix-test-pins-store"
+      repoDir = tmpBase </> "nova-nix-test-pins-repo"
+      cacheHome = tmpBase </> "nova-nix-test-pins-cache"
+      urlText = T.concatMap (\c -> if c == '\\' then "\\\\" else T.singleton c) (T.pack repoDir)
+      evalHere = evalNixIOStore (StoreDir tmpStore) "."
+      fetchWith extra = evalHere ("builtins.fetchGit { url = \"" <> urlText <> "\"; " <> extra <> "}")
+  forceRemoveIfExists tmpStore
+  forceRemoveIfExists repoDir
+  forceRemoveIfExists cacheHome
+  savedCacheHome <- lookupEnv "XDG_CACHE_HOME"
+  setEnv "XDG_CACHE_HOME" cacheHome
+  shas <- makeGitFixture repoDir [("a.txt", "one\n")]
+  baseBranch <- fixtureGit repoDir ["rev-parse", "--abbrev-ref", "HEAD"]
+  _ <- fixtureGit repoDir ["checkout", "-q", "-b", "side"]
+  BS.writeFile (repoDir </> "side.txt") (TE.encodeUtf8 "side\n")
+  _ <- fixtureGit repoDir ["add", "-A"]
+  _ <- fixtureGit repoDir ["commit", "--quiet", "-m", "side"]
+  sideSha <- fixtureGit repoDir ["rev-parse", "HEAD"]
+  _ <- fixtureGit repoDir ["checkout", "-q", T.unpack baseBranch]
+  results <-
+    sequence
+      [ runTestM "an unsupported fetchGit attribute is refused" $ do
+          outcome <- fetchWith "bogus = 1; "
+          pure $ case outcome of
+            Left err
+              | "attribute 'bogus' not supported" `T.isInfixOf` err -> Pass
+              | otherwise -> Fail ("wrong error: " <> err)
+            Right _ -> Fail "an unsupported attribute was silently dropped",
+        runTestM "a mismatched narHash pin is an error" $ case shas of
+          (sha : _) -> do
+            outcome <- fetchWith ("rev = \"" <> sha <> "\"; narHash = \"sha256-" <> T.replicate 43 "A" <> "=\"; ")
+            pure $ case outcome of
+              Left err
+                | "NAR hash mismatch" `T.isInfixOf` err -> Pass
+                | otherwise -> Fail ("wrong error: " <> err)
+              Right _ -> Fail "a bogus narHash pin was silently ignored"
+          [] -> pure (Fail "fixture returned no commits"),
+        -- The second fetch of the same rev is a cache hit, so a matching
+        -- pin passing here proves the check runs on the hit path too.
+        runTestM "a matching narHash pin passes, including on a cache hit" $ case shas of
+          (sha : _) -> do
+            first <- fetchWith ("rev = \"" <> sha <> "\"; ")
+            case first of
+              Left err -> pure (Fail err)
+              Right val -> case fetchGitFields val ["narHash"] of
+                [("narHash", VStr hashBytes _)] -> do
+                  let hash = TE.decodeUtf8Lenient hashBytes
+                  second <- fetchWith ("rev = \"" <> sha <> "\"; narHash = \"" <> hash <> "\"; ")
+                  pure $ case second of
+                    Right _ -> Pass
+                    Left err -> Fail ("a correct pin was refused: " <> err)
+                other -> pure (Fail (T.pack (show other)))
+          [] -> pure (Fail "fixture returned no commits"),
+        runTestM "allRefs finds a rev on an unfetched branch" $ do
+          outcome <- fetchWith ("rev = \"" <> sideSha <> "\"; allRefs = true; ")
+          pure $ case outcome of
+            Left err -> Fail err
+            Right val -> case fetchGitFields val ["rev"] of
+              [("rev", revVal)] | revVal == mkStr sideSha -> Pass
+              other -> Fail (T.pack (show other)),
+        runTestM "a failing fetch leaves no scratch clone behind" $ do
+          before <- filter ("nova-nix-fetchgit-" `T.isPrefixOf`) . map T.pack <$> Dir.listDirectory tmpBase
+          outcome <- evalHere ("builtins.fetchGit { url = \"" <> urlText <> "-no-such-repo\"; }")
+          after <- filter ("nova-nix-fetchgit-" `T.isPrefixOf`) . map T.pack <$> Dir.listDirectory tmpBase
+          pure $ case outcome of
+            Right _ -> Fail "a fetch of a missing repo succeeded"
+            Left _
+              | length after == length before -> Pass
+              | otherwise -> Fail ("scratch clones leaked: " <> T.pack (show (length after - length before)))
+      ]
+  maybe (unsetEnv "XDG_CACHE_HOME") (setEnv "XDG_CACHE_HOME") savedCacheHome
+  forceRemoveIfExists tmpStore
+  forceRemoveIfExists repoDir
+  forceRemoveIfExists cacheHome
+  pure results
+
 -- | A path reached through an attrset's @outPath@ (or a @__toString@
 -- result) coerces exactly as the same path written directly: copied to
 -- the store, with the store path in the string context.  The broken
@@ -9411,6 +9494,7 @@ instance MonadEval StubStoreEval where
     Left (StubThrow msg) -> Right (Left msg)
     Left other -> Left other
     Right val -> Right (Right val)
+  onEvalError (StubStoreEval action) _ = StubStoreEval action
   doesPathExist _ = pure False
   listDirectory _ = throwEvalError "readDir: not available in the stub evaluator"
   importFile _ = throwEvalError "import: not available in the stub evaluator"
@@ -10646,6 +10730,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,
+          testFetchGitPins,
           testOutPathCoercion,
           testFetchCache,
           testExecWrapper,
