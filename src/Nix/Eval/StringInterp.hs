@@ -6,6 +6,7 @@
 -- import cycle with @Nix.Eval@.
 module Nix.Eval.StringInterp
   ( stripIndentedChunks,
+    CoercePath,
     coerceToString,
     formatNixFloat,
     formatJsonFloat,
@@ -27,6 +28,16 @@ type Force m = Thunk -> m NixValue
 
 -- | Apply a function value to an argument value.
 type Apply m = NixValue -> NixValue -> m NixValue
+
+-- | What the caller does with a coerced path: the verbatim text for
+-- non-copying coercions (@builtins.toString@), the source store path
+-- with context for copy-to-store coercions (interpolation, derivation
+-- fields, @builtins.toJSON@).  A parameter for the same reason
+-- 'Force' and 'Apply' are: the store copy lives above this module,
+-- and the attrset case's recursion must carry the caller's choice -
+-- an @outPath@ reached through an attrset coerces exactly as the same
+-- path written directly would.
+type CoercePath m = Text -> m (ByteString, StringContext)
 
 -- | Strip the common indentation from already-evaluated indented-string chunks.
 -- Each chunk is @(isLiteral, bytes, context)@.  Indentation is computed and
@@ -92,28 +103,30 @@ chunksStrip n = go True 0
 -- @builtins.concatStringsSep@) those are type errors, matching C++ Nix.
 -- Strings, paths, and attribute sets with @__toString@/@outPath@ coerce in
 -- both modes; lists and bare functions are always errors.
-coerceToString :: (MonadEval m) => Bool -> Force m -> Apply m -> NixValue -> m (ByteString, StringContext)
-coerceToString _ _ _ (VStr s ctx) = pure (s, ctx)
-coerceToString _ _ _ (VPath p) = pure (TE.encodeUtf8 p, emptyContext)
-coerceToString True _ _ (VInt n) = pure (BC.pack (show n), emptyContext)
-coerceToString True _ _ (VFloat n) = pure (TE.encodeUtf8 (formatNixFloatFixed n), emptyContext)
-coerceToString True _ _ VNull = pure ("", emptyContext)
-coerceToString True _ _ (VBool True) = pure ("1", emptyContext)
-coerceToString True _ _ (VBool False) = pure ("", emptyContext)
+coerceToString :: (MonadEval m) => Bool -> Force m -> Apply m -> CoercePath m -> NixValue -> m (ByteString, StringContext)
+coerceToString _ _ _ _ (VStr s ctx) = pure (s, ctx)
+coerceToString _ _ _ coercePathFn (VPath p) = coercePathFn p
+coerceToString True _ _ _ (VInt n) = pure (BC.pack (show n), emptyContext)
+coerceToString True _ _ _ (VFloat n) = pure (TE.encodeUtf8 (formatNixFloatFixed n), emptyContext)
+coerceToString True _ _ _ VNull = pure ("", emptyContext)
+coerceToString True _ _ _ (VBool True) = pure ("1", emptyContext)
+coerceToString True _ _ _ (VBool False) = pure ("", emptyContext)
 -- Attribute sets: try __toString first, then outPath (both modes).
-coerceToString coerceMore forceFn applyFn (VAttrs attrs) =
+-- The recursion carries the caller's path coercion, so a path-valued
+-- @outPath@ lands on the caller's path case, not a fixed one.
+coerceToString coerceMore forceFn applyFn coercePathFn (VAttrs attrs) =
   case attrSetLookup "__toString" attrs of
     Just toStrThunk -> do
       toStrFn <- forceFn toStrThunk
       result <- applyFn toStrFn (VAttrs attrs)
-      coerceToString coerceMore forceFn applyFn result
+      coerceToString coerceMore forceFn applyFn coercePathFn result
     Nothing -> case attrSetLookup "outPath" attrs of
       Just outPathThunk -> do
         outPathVal <- forceFn outPathThunk
-        coerceToString coerceMore forceFn applyFn outPathVal
+        coerceToString coerceMore forceFn applyFn coercePathFn outPathVal
       Nothing ->
         throwEvalError "cannot coerce a set to a string (missing __toString or outPath)"
-coerceToString _ _ _ other =
+coerceToString _ _ _ _ other =
   throwEvalError ("cannot coerce " <> typeName other <> " to a string")
 
 -- | Format a float the way C++ Nix's coerceToString does -
