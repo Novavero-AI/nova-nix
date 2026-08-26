@@ -65,6 +65,7 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Zstd as CZstd
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
+import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
@@ -6692,6 +6693,126 @@ testFetchGitTransport = do
           Right _ -> Fail "option-shaped ref evaluated"
     ]
 
+-- ---------------------------------------------------------------------------
+-- builtins.fetchGit against a real repository
+-- ---------------------------------------------------------------------------
+
+-- | One git command against a fixture repository, identity and signing
+-- pinned so no host configuration participates.  Nonzero exit throws
+-- with git's stderr, failing the calling test loudly.
+fixtureGit :: FilePath -> [String] -> IO Text
+fixtureGit dir args = do
+  (code, out, errOut) <-
+    Proc.readCreateProcessWithExitCode
+      (Proc.proc "git" (["-C", dir, "-c", "user.name=nova-nix-test", "-c", "user.email=test@nova-nix.invalid", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"] ++ args))
+      ""
+  case code of
+    ExitSuccess -> pure (T.strip (T.pack out))
+    ExitFailure n -> fail ("fixture git " ++ unwords args ++ " exited " ++ show n ++ ": " ++ errOut)
+
+-- | A repository whose history is one commit per given file, oldest
+-- first; returns the commit SHAs in that order.  SHA wants are enabled
+-- up front: a pinned rev that is no branch tip is only fetchable when
+-- the serving side allows it, the same opt-in real servers use.
+makeGitFixture :: FilePath -> [(FilePath, Text)] -> IO [Text]
+makeGitFixture dir files = do
+  Dir.createDirectoryIfMissing True dir
+  _ <- fixtureGit dir ["init", "--quiet"]
+  _ <- fixtureGit dir ["config", "uploadpack.allowAnySHA1InWant", "true"]
+  mapM commitOne files
+  where
+    commitOne (name, contents) = do
+      BS.writeFile (dir </> name) (TE.encodeUtf8 contents)
+      _ <- fixtureGit dir ["add", "-A"]
+      _ <- fixtureGit dir ["commit", "--quiet", "-m", name]
+      fixtureGit dir ["rev-parse", "HEAD"]
+
+-- | 'evalNixIO' against an explicit store directory, for expressions
+-- whose evaluation writes store objects.
+evalNixIOStore :: StoreDir -> FilePath -> Text -> IO (Either Text NixValue)
+evalNixIOStore storeDir baseDir source = case parseNix baseDir "<test>" source of
+  Left err -> pure (Left (T.pack (show err)))
+  Right expr -> do
+    st <- newEvalState storeDir baseDir
+    runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
+
+testFetchGitShallow :: IO [Bool]
+testFetchGitShallow = do
+  tmpBase <- getTemporaryDirectory
+  let repoDir = tmpBase </> "nova-nix-test-fetchgit-repo"
+      tmpStore = tmpBase </> "nova-nix-test-fetchgit-store"
+      cacheHome = tmpBase </> "nova-nix-test-fetchgit-cache"
+      nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+      urlAttr = "url = \"" <> nixEscape (T.pack repoDir) <> "\"; "
+      evalFetch extra = evalNixIOStore (StoreDir tmpStore) "." ("builtins.fetchGit { " <> urlAttr <> extra <> "}")
+  forceRemoveIfExists repoDir
+  forceRemoveIfExists tmpStore
+  forceRemoveIfExists cacheHome
+  -- The fetch cache writes under XdgCache; point it at the scratch area
+  -- for the duration so the suite never touches the developer's cache.
+  savedCacheHome <- lookupEnv "XDG_CACHE_HOME"
+  setEnv "XDG_CACHE_HOME" cacheHome
+  shas <- makeGitFixture repoDir [("first.txt", "one\n"), ("second.txt", "two\n"), ("third.txt", "three\n")]
+  results <-
+    sequence
+      [ -- Upstream reports revCount 0 under shallow, not an absent
+        -- attribute and not the fetch depth: observed from
+        -- nix-instantiate 2.33.2, where '.revCount or "ABSENT"' is 0.
+        -- The tree itself is depth-independent, so both fetches must
+        -- agree on narHash and outPath.
+        runTestM "a shallow fetch reports revCount 0 for the same tree" $ do
+          fullOutcome <- evalFetch ""
+          shallowOutcome <- evalFetch "shallow = true; "
+          pure $ case (fullOutcome, shallowOutcome) of
+            (Left err, _) -> Fail ("full fetch failed: " <> err)
+            (_, Left err) -> Fail ("shallow fetch failed: " <> err)
+            (Right fullVal, Right shallowVal) ->
+              let fullFields = fetchGitFields fullVal ["revCount", "narHash", "outPath"]
+                  shallowFields = fetchGitFields shallowVal ["revCount", "narHash", "outPath"]
+               in case (fullFields, shallowFields) of
+                    ([("revCount", VInt 3), ("narHash", fullHash), ("outPath", fullPath)], [("revCount", VInt 0), ("narHash", shallowHash), ("outPath", shallowPath)])
+                      | fullHash == shallowHash && fullPath == shallowPath -> Pass
+                      | otherwise -> Fail "shallow and full fetches disagree about the tree"
+                    _ -> Fail (T.pack (show (fullFields, shallowFields))),
+        -- The rev itself is the refspec, so a depth-1 fetch of a rev
+        -- that is not the branch tip still lands on exactly that rev.
+        runTestM "a shallow fetch of a pinned rev checks out that rev" $ case shas of
+          (firstSha : _) -> do
+            outcome <- evalFetch ("shallow = true; rev = \"" <> firstSha <> "\"; ")
+            case outcome of
+              Left err -> pure (Fail err)
+              Right val -> case fetchGitFields val ["rev", "revCount", "outPath"] of
+                [("rev", revVal), ("revCount", VInt 0), ("outPath", VPath outText)]
+                  | revVal == mkStr firstSha -> do
+                      let outDir = storeTextToFilePath (StoreDir tmpStore) outText
+                      firstThere <- Dir.doesFileExist (outDir </> "first.txt")
+                      thirdThere <- Dir.doesFileExist (outDir </> "third.txt")
+                      pure $
+                        if firstThere && not thirdThere
+                          then Pass
+                          else Fail "outPath does not hold the pinned rev's tree"
+                fields -> pure (Fail (T.pack (show fields)))
+          [] -> pure (Fail "fixture returned no commits"),
+        -- Pinned and unpinned differ in where counting starts: from the
+        -- rev, the root commit counts 1 (upstream 2.33.2 agrees), not
+        -- the branch's 3.
+        runTestM "a pinned rev fetch counts from the rev" $ case shas of
+          (firstSha : _) -> do
+            outcome <- evalFetch ("rev = \"" <> firstSha <> "\"; ")
+            pure $ case outcome of
+              Left err -> Fail err
+              Right val -> case fetchGitFields val ["rev", "revCount"] of
+                [("rev", revVal), ("revCount", VInt 1)]
+                  | revVal == mkStr firstSha -> Pass
+                fields -> Fail (T.pack (show fields))
+          [] -> pure (Fail "fixture returned no commits")
+      ]
+  maybe (unsetEnv "XDG_CACHE_HOME") (setEnv "XDG_CACHE_HOME") savedCacheHome
+  forceRemoveIfExists repoDir
+  forceRemoveIfExists tmpStore
+  forceRemoveIfExists cacheHome
+  pure results
+
 testScratchDirs :: IO [Bool]
 testScratchDirs = do
   putStrLn "eval/scratch-dirs"
@@ -10331,6 +10452,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testHashHelpers,
           testNarKnownAnswer,
           testFetchGitTransport,
+          testFetchGitShallow,
           testFetchCache,
           testExecWrapper,
           testAttrPath,
