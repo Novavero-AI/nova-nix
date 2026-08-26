@@ -3620,13 +3620,21 @@ fetchGitUncached url name checkedRef checkedRev submodules shallow =
     let ctx = "builtins.fetchGit"
         git = gitRun ctx cloneDir
         depthArgs = if shallow then ["--depth", "1"] else []
-        refArg = fromMaybe defaultFetchRef checkedRef
+        -- A pinned rev is itself the refspec, upstream's construction: a
+        -- depth-1 fetch of a branch tip cannot contain any other revision,
+        -- so asking the remote for the SHA is what lets @shallow@ and
+        -- @rev@ compose (and what finds a rev not on the fetched ref).  A
+        -- server may refuse a SHA it does not advertise; that surfaces as
+        -- git's own fetch error, the same surface upstream has.
+        fetchTarget = case checkedRev of
+          Just pinned -> pinned
+          Nothing -> fromMaybe defaultFetchRef checkedRef
         checkoutTarget = fromMaybe fetchHeadRef checkedRev
     _ <- git ["init", "--quiet", "."]
     _ <- git ["remote", "add", "origin", "--", url]
     -- @--@ before the remote: git keeps parsing options after it, so
     -- without a separator a refspec is indistinguishable from a flag.
-    _ <- git (["fetch", "--quiet"] ++ depthArgs ++ ["--", "origin", refArg])
+    _ <- git (["fetch", "--quiet"] ++ depthArgs ++ ["--", "origin", fetchTarget])
     -- Trailing @--@, not leading: @git checkout -- X@ reads X as a
     -- pathspec, the opposite of what a leading separator means elsewhere.
     _ <- git ["checkout", "--quiet", checkoutTarget, "--"]
@@ -3634,13 +3642,21 @@ fetchGitUncached url name checkedRef checkedRev submodules shallow =
       void (git ["submodule", "update", "--init", "--recursive"])
     markExecutablesFromIndex ctx cloneDir
     rev <- git ["rev-parse", "HEAD"]
-    revCountText <- git ["rev-list", "--count", "HEAD"]
+    -- Truncated history cannot answer rev-list: the count would be the
+    -- fetch depth, not the revision's depth, and @revCount@ can reach a
+    -- derivation's environment.  Upstream reports 0 under @shallow@ (its
+    -- fetcher skips computing the attribute and eval fills the default;
+    -- observed from nix-instantiate 2.33.2), so 0 is recorded here and
+    -- cache hits replay it.
+    revCount <-
+      if shallow
+        then pure 0
+        else decodeDecimal ctx =<< git ["rev-list", "--count", "HEAD"]
     lastModifiedText <- git ["show", "-s", "--format=%ct", "HEAD"]
     removeGitMetadata ctx cloneDir
     storePath <- copyPathToStore cloneDir name Nothing
     narHash <- narHashOfPath cloneDir
     removeScratchDir cloneDir
-    revCount <- decodeDecimal ctx revCountText
     lastModified <- decodeDecimal ctx lastModifiedText
     let fields =
           FetchCache
@@ -3713,7 +3729,7 @@ fetchGitResult submodules fields =
 -- whether the clone was shallow.
 --
 -- @shallow@ is in the key even though it cannot change the tree, because it
--- decides @revCount@: a depth-1 clone counts 1 where a full clone of the
+-- decides @revCount@: a shallow fetch reports 0 where a full clone of the
 -- same rev counts the real depth.  Sharing an entry between the two would
 -- let whichever ran first decide what the other sees, and @revCount@ can
 -- reach a derivation's environment, so that is a reproducibility problem
