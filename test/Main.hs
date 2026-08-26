@@ -45,7 +45,7 @@ import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbo
 import Nix.Eval.Types (emptyCList)
 import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
-import Nix.Hash (hashPlaceholder, makeFixedOutputPath, sha256Digest)
+import Nix.Hash (hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Parser (ParseError (..), parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
@@ -54,7 +54,7 @@ import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, c
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Base64 as B64
@@ -66,7 +66,7 @@ import qualified NovaCache.Zstd as CZstd
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
@@ -7020,6 +7020,39 @@ testStoreOps = do
                 if adopted == "real content" && registered
                   then Pass
                   else Fail ("expected re-copied content, got: " <> adopted),
+        -- The registrar's half of the eval-write pair: content that does
+        -- not re-derive its store path under the recorded scheme must be
+        -- refused loudly, never registered valid under a hash its bytes
+        -- do not have and then sealed read-only.
+        runTestM "materializeEvalStoreWrites refuses content that does not reproduce its path" $ do
+          let goodBytes = TE.encodeUtf8 "the full flat content"
+          case makeFixedOutputPath "flat-verify" "sha256" "flat" (sha256Digest goodBytes) of
+            Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+            Right sp -> do
+              let spText = storePathToText defaultStoreDir sp
+                  dest = storePathToFilePath (stDir store) sp
+              removeIfExists dest
+              BS.writeFile dest (TE.encodeUtf8 "the full")
+              outcome <- try (materializeEvalStoreWrites store (Map.fromList [(spText, ([], WriteFlat))]))
+              stillInvalid <- not <$> isValid store sp
+              removeIfExists dest
+              pure $ case (outcome :: Either SomeException ()) of
+                Left _ | stillInvalid -> Pass
+                Left _ -> Fail "refused but registered anyway"
+                Right () -> Fail "registered a truncated write as valid",
+        runTestM "materializeEvalStoreWrites registers content that reproduces its path" $ do
+          let goodBytes = TE.encodeUtf8 "registered text content"
+              refs = []
+          case makeTextPath "text-verify" (sha256Digest goodBytes) refs of
+            Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+            Right sp -> do
+              let spText = storePathToText defaultStoreDir sp
+                  dest = storePathToFilePath (stDir store) sp
+              removeIfExists dest
+              BS.writeFile dest goodBytes
+              materializeEvalStoreWrites store (Map.fromList [(spText, (refs, WriteText))])
+              registered <- isValid store sp
+              pure (assertEqual "registered" True registered),
         -- A tree that DOES reproduce its store path is adopted untouched.
         -- The source is deleted before the call: adoption never reads it,
         -- so a wrongful re-copy attempt throws and fails the test.
@@ -8338,6 +8371,92 @@ testE2E = do
         pure $ case failures of
           [] -> Pass
           errs -> Fail (T.intercalate "; " errs),
+      -- The writer half of the eval-write pair: an interrupted earlier
+      -- run's truncated file at a toFile path must be rewritten, not
+      -- adopted on bare existence (the source audit registered exactly
+      -- such a file valid under the full content's hash, then sealed
+      -- it read-only, then a build consumed it).
+      runTestM "a truncated pre-existing toFile write is rewritten, not adopted" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-tofile-verify"
+            nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+            goodText = "the full intended content" :: Text
+            goodBytes = TE.encodeUtf8 goodText
+        forceRemoveIfExists tmpStore
+        case makeTextPath "note" (sha256Digest goodBytes) [] of
+          Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+          Right sp -> do
+            let dest = storePathToFilePath (StoreDir tmpStore) sp
+            Dir.createDirectoryIfMissing True (takeDirectory dest)
+            BS.writeFile dest (TE.encodeUtf8 "the full")
+            let expr =
+                  "derivation { name = \"tofile-verify\"; system = builtins.currentSystem; "
+                    <> "builder = \""
+                    <> nixEscape shell
+                    <> "\"; "
+                    <> "args = [\"-c\" \"echo ok > $out\"]; "
+                    <> "src = builtins.toFile \"note\" \""
+                    <> goodText
+                    <> "\"; }"
+            result <- evalAndBuild (StoreDir tmpStore) expr
+            rewritten <- BS.readFile dest
+            outcome <- case result of
+              Left err -> pure (Fail err)
+              Right (BuildFailure msg _, store) -> closeStore store >> pure (Fail msg)
+              Right (BuildSuccess _, store) -> do
+                registered <- isValid store sp
+                closeStore store
+                pure $
+                  if rewritten == goodBytes && registered
+                    then Pass
+                    else Fail "adopted the truncated file instead of rewriting it"
+            forceRemoveIfExists tmpStore
+            pure outcome,
+      -- Same guarantee for the tree writer behind builtins.path: a
+      -- corrupted partial tree at the computed path is cleared and
+      -- re-unpacked, never adopted.
+      runTestM "a corrupted pre-existing builtins.path tree is re-copied, not adopted" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-path-verify"
+            srcDir = tmpBase </> "nova-nix-test-path-verify-src"
+            nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists srcDir
+        Dir.createDirectoryIfMissing True srcDir
+        BS.writeFile (srcDir </> "f.txt") (TE.encodeUtf8 "real content\n")
+        entry <- NAR.serialiseFromPath srcDir
+        case makeFixedOutputPath "sd" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+          Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+          Right sp -> do
+            let dest = storePathToFilePath (StoreDir tmpStore) sp
+            Dir.createDirectoryIfMissing True dest
+            BS.writeFile (dest </> "f.txt") (TE.encodeUtf8 "partial garbage")
+            let expr =
+                  "derivation { name = \"path-verify\"; system = builtins.currentSystem; "
+                    <> "builder = \""
+                    <> nixEscape shell
+                    <> "\"; "
+                    <> "args = [\"-c\" \"echo ok > $out\"]; "
+                    <> "src = builtins.path { path = "
+                    <> canonPathValue (T.pack srcDir)
+                    <> "; name = \"sd\"; }; }"
+            result <- evalAndBuild (StoreDir tmpStore) expr
+            outcome <- case result of
+              Left err -> pure (Fail err)
+              Right (BuildFailure msg _, store) -> closeStore store >> pure (Fail msg)
+              Right (BuildSuccess _, store) -> do
+                -- Strict bytes: a lazy read here holds the file open past
+                -- the cleanup below, and Windows refuses to delete it.
+                adopted <- BS.readFile (dest </> "f.txt")
+                registered <- isValid store sp
+                closeStore store
+                pure $
+                  if adopted == TE.encodeUtf8 "real content\n" && registered
+                    then Pass
+                    else Fail ("adopted the corrupted tree: " <> T.pack (show adopted))
+            forceRemoveIfExists tmpStore
+            forceRemoveIfExists srcDir
+            pure outcome,
       -- The build path joins the per-path lock protocol (#119, #121) that
       -- delete, materialize and register already used.  Lock files persist
       -- by design, so the one guarding the output is the observable
