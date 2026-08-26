@@ -39,6 +39,7 @@ module Nix.Store.Path
 
     -- * Store paths
     StorePath (spHash, spName),
+    StoreWriteMode (..),
     storePathToFilePath,
     storePathToText,
     isCanonicalStoreText,
@@ -189,6 +190,16 @@ data StorePathNameError = StorePathNameError
     -- | The rule it broke.
     spneReason :: !StorePathNameReason
   }
+  deriving (Eq, Show)
+
+-- | Which path-construction scheme named an eval-time store write:
+-- upstream's text-path scheme (@builtins.toFile@), a recursive
+-- fixed-output path (source copies, @builtins.path@), or a flat
+-- fixed-output path (@builtins.fetchurl@).  Materialization re-derives
+-- the path from on-disk content under the same scheme before
+-- registering, so a tree that does not reproduce its path is refused
+-- instead of registered valid under a hash its bytes do not have.
+data StoreWriteMode = WriteText | WriteRecursive | WriteFlat
   deriving (Eq, Show)
 
 -- | The store-path name rules, one constructor per rule.

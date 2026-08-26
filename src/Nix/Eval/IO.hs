@@ -29,7 +29,7 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, fromException, onException, throwIO, try)
+import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, displayException, fromException, onException, throwIO, try)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
@@ -124,7 +124,7 @@ data EvalState = EvalState
     -- eval has no store DB handle.  All of them, not only
     -- @builtins.toFile@: an unrecorded write reaches @drvInputSrcs@ as
     -- an unregistered path and fails the build that names it.
-    esStoreWriteCache :: !(IORef (Map Text [SP.StorePath])),
+    esStoreWriteCache :: !(IORef (Map Text ([SP.StorePath], SP.StoreWriteMode))),
     esBaseDir :: !FilePath,
     -- | Where store objects live on this machine, so eval's own reads and
     -- writes honor @--store@ the same way the builder does.
@@ -311,13 +311,17 @@ instance MonadEval EvalIO where
     filePath <- evalFilePath sp
     let storePath = canonicalStorePathText sp
     wrapIO $ do
-      -- Idempotent: registration makes the path read-only, and rewriting it
-      -- fails outright on Windows.
-      alreadyThere <- Dir.doesPathExist filePath
-      unless alreadyThere $ do
-        Dir.createDirectoryIfMissing True (takeDirectory filePath)
+      Dir.createDirectoryIfMissing True (takeDirectory filePath)
+      -- Adopt an existing file only when its bytes are these bytes: an
+      -- interrupted earlier run can leave a truncated file here, and
+      -- skipping on bare existence adopted it under this path's hash.
+      -- 'Dir.removePathForcibly' clears read-only marks and accepts a
+      -- missing path, so a sealed or squatting leftover rewrites too.
+      existing <- readBytesIfPresent filePath
+      unless (existing == Just contents) $ do
+        Dir.removePathForcibly filePath
         BS.writeFile filePath contents
-    recordStoreWrite storePath refs
+    recordStoreWrite storePath refs SP.WriteText
     pure storePath
 
   scopedImportFile scope rawPath = do
@@ -400,8 +404,8 @@ instance MonadEval EvalIO where
     sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
     destFilePath <- evalFilePath sp
     let destPath = canonicalStorePathText sp
-    wrapIO (copyToStoreIfMissing resolvedSource destFilePath (takeDirectory destFilePath))
-    recordStoreWrite destPath []
+    wrapIO (copyToStoreVerified resolvedSource destFilePath (takeDirectory destFilePath) narDigest)
+    recordStoreWrite destPath [] SP.WriteRecursive
     pure destPath
 
   narHashOfPath path = do
@@ -430,7 +434,7 @@ instance MonadEval EvalIO where
     -- materializeEvalStoreWrites skips a path that is already valid, so
     -- re-recording one costs nothing and closes the case where the row is
     -- missing.
-    when there (recordStoreWrite path [])
+    when there (recordStoreWrite path [] SP.WriteRecursive)
     pure there
 
   writeFetchCache key value = wrapIO $ do
@@ -465,12 +469,16 @@ instance MonadEval EvalIO where
         destFilePath <- evalFilePath sp
         let destPath = canonicalStorePathText sp
         wrapIO $ do
-          alreadyThere <- Dir.doesPathExist destFilePath
-          unless alreadyThere $ do
-            Dir.createDirectoryIfMissing True (takeDirectory destFilePath)
+          Dir.createDirectoryIfMissing True (takeDirectory destFilePath)
+          -- Adopt an existing tree only when it serialises to exactly
+          -- these NAR bytes; an interrupted earlier unpack is cleared
+          -- and unpacked afresh.
+          onDiskNar <- narBytesIfPresent destFilePath
+          unless (onDiskNar == Just narBytes) $ do
+            Dir.removePathForcibly destFilePath
             unpacked <- unpackNarEntry destFilePath entry
             either (throwIO . userError . T.unpack) pure unpacked
-        recordStoreWrite destPath []
+        recordStoreWrite destPath [] SP.WriteRecursive
         pure destPath
 
   addFixedOutputFile name bytes = do
@@ -481,8 +489,14 @@ instance MonadEval EvalIO where
     let storePath = canonicalStorePathText sp
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)
-      BS.writeFile filePath bytes
-    recordStoreWrite storePath []
+      -- Same verified adoption as the other writers: this one used to
+      -- write unconditionally, which both adopted nothing (fine) and
+      -- crashed on a sealed leftover (the write hits read-only).
+      existing <- readBytesIfPresent filePath
+      unless (existing == Just bytes) $ do
+        Dir.removePathForcibly filePath
+        BS.writeFile filePath bytes
+    recordStoreWrite storePath [] SP.WriteFlat
     pure storePath
 
   traceMessage msg = EvalIO (liftIO (hPutStrLn stderr (T.unpack msg)))
@@ -646,11 +660,35 @@ storeFilePath = SP.storePathToFilePath
 -- registers it before a derivation naming it is built.  Every eval-time
 -- writer goes through this: a write that skips it lands in
 -- @drvInputSrcs@ with no registration row and fails the build with
--- \"references unregistered path\".
-recordStoreWrite :: Text -> [SP.StorePath] -> EvalIO ()
-recordStoreWrite storePath refs = do
+-- \"references unregistered path\".  The mode names the scheme that
+-- constructed the path, so materialization can verify the on-disk
+-- content reproduces it before registering.
+recordStoreWrite :: Text -> [SP.StorePath] -> SP.StoreWriteMode -> EvalIO ()
+recordStoreWrite storePath refs mode = do
   cacheRef <- EvalIO (asks esStoreWriteCache)
-  EvalIO (liftIO (modifyIORef' cacheRef (Map.insert storePath refs)))
+  EvalIO (liftIO (modifyIORef' cacheRef (Map.insert storePath (refs, mode))))
+
+-- | The file's bytes, 'Nothing' when nothing readable is there: absent,
+-- or something unreadable squatting on the name; either way the writer
+-- must replace rather than adopt.
+readBytesIfPresent :: FilePath -> IO (Maybe BS.ByteString)
+readBytesIfPresent path = do
+  result <- try (BS.readFile path) :: IO (Either IOException BS.ByteString)
+  pure (either (const Nothing) Just result)
+
+-- | The NAR serialisation of what is on disk, 'Nothing' when nothing
+-- serialisable is there.  Through 'ExecBit.serialiseFromPath', the
+-- same walk every producer and verifier uses, so the comparison sees
+-- the executable flags the store's model records, not the platform's
+-- permission guesses.
+narBytesIfPresent :: FilePath -> IO (Maybe BS.ByteString)
+narBytesIfPresent path = do
+  onDisk <- Dir.doesPathExist path
+  if not onDisk
+    then pure Nothing
+    else do
+      result <- try (ExecBit.serialiseFromPath path) :: IO (Either IOException NAR.NarEntry)
+      pure (either (const Nothing) (Just . NAR.serialise) result)
 
 -- | 'storeFilePath' against the store this evaluation was given.
 evalFilePath :: SP.StorePath -> EvalIO FilePath
@@ -771,8 +809,15 @@ lookupEnvText name = do
 -- 'NovaCache.NAR.serialiseFromPath', which treats links as leaves, so a
 -- dereferencing copy would store bytes that do not match their own
 -- content address (and would not terminate on a link cycle).
-copyToStoreIfMissing :: FilePath -> FilePath -> FilePath -> IO ()
-copyToStoreIfMissing src dest storeDir = do
+-- | Copy a tree to its content-addressed destination.  An existing
+-- destination is adopted only when its recursive NAR digest matches
+-- the expected one - same content means same path, so a matching tree
+-- is byte-identical by construction; anything else (an interrupted
+-- earlier copy, a squatter) is cleared and re-copied.
+copyToStoreVerified :: FilePath -> FilePath -> FilePath -> BS.ByteString -> IO ()
+copyToStoreVerified src dest storeDir expectedDigest = do
   Dir.createDirectoryIfMissing True storeDir
-  alreadyExists <- Dir.doesPathExist dest
-  unless alreadyExists (copyPathInto src dest)
+  onDiskNar <- narBytesIfPresent dest
+  unless ((sha256Digest <$> onDiskNar) == Just expectedDigest) $ do
+    Dir.removePathForcibly dest
+    copyPathInto src dest

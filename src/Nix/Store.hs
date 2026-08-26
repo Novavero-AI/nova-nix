@@ -97,7 +97,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), fromATerm, toATerm)
-import Nix.Hash (makeFixedOutputPath, sha256Digest)
+import Nix.Hash (makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB
 import qualified Nix.Store.ExecBit as ExecBit
@@ -1042,12 +1042,12 @@ materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
 -- and records it in the DB.  Batched so a write referring to another
 -- resolves.  Covers every eval-time writer, not only @builtins.toFile@:
 -- an unregistered write reaches @drvInputSrcs@ and fails the build.
-materializeEvalStoreWrites :: Store -> Map Text [StorePath] -> IO ()
+materializeEvalStoreWrites :: Store -> Map Text ([StorePath], StoreWriteMode) -> IO ()
 materializeEvalStoreWrites store storeWrites = do
   regs <- catMaybes <$> mapM prepare (Map.toList storeWrites)
   unless (null regs) (registerPaths (stDB store) regs)
   where
-    prepare (spText, refs) =
+    prepare (spText, (refs, mode)) =
       case parseStorePath defaultStoreDir spText of
         Nothing -> pure Nothing
         Just sp -> do
@@ -1061,8 +1061,38 @@ materializeEvalStoreWrites store storeWrites = do
               if not onDisk
                 then pure Nothing
                 else do
+                  -- The writers verified (or rewrote) this content at
+                  -- write time; a mismatch here means the tree changed
+                  -- between evaluation and registration, and registering
+                  -- it would record a hash its bytes do not have, then
+                  -- seal the lie read-only.  Refuse loudly instead.
+                  reproduces <- writeReproducesPath dest sp refs mode
+                  unless reproduces $
+                    throwIO
+                      ( userError
+                          ( "refusing to register "
+                              <> T.unpack spText
+                              <> ": the on-disk content does not reproduce its store path; "
+                              <> "delete the path and re-evaluate"
+                          )
+                      )
                   setReadOnly dest
                   Just <$> registrationFor store sp Nothing refs
+
+-- | Whether on-disk content re-derives exactly the store path it is
+-- about to be registered under, under the scheme that named the write.
+-- An unreadable destination counts as a mismatch.
+writeReproducesPath :: FilePath -> StorePath -> [StorePath] -> StoreWriteMode -> IO Bool
+writeReproducesPath dest sp refs mode = case mode of
+  WriteRecursive -> adoptedTreeMatches dest sp
+  WriteFlat ->
+    withFileBytes (\bytes -> makeFixedOutputPath (spName sp) "sha256" "flat" (sha256Digest bytes) == Right sp)
+  WriteText ->
+    withFileBytes (\bytes -> makeTextPath (spName sp) (sha256Digest bytes) refs == Right sp)
+  where
+    withFileBytes check = do
+      result <- try (BS.readFile dest) :: IO (Either IOException BS.ByteString)
+      pure (either (const False) check result)
 
 -- | Whether an on-disk tree reproduces the source store path it is about to
 -- be registered under: its recursive NAR digest and the path's own name must
