@@ -66,6 +66,7 @@ module Nix.Eval.CBytecode
     pattern OpUnary,
     pattern OpBinary,
     pattern OpSearchPath,
+    pattern OpPathStr,
 
     -- * UnaryOp flags
     unaryNot,
@@ -334,6 +335,9 @@ pattern OpBinary = 22
 -- | Search-path opcode: an angle-bracket path lookup like @\<nixpkgs\>@.
 pattern OpSearchPath :: Word8
 pattern OpSearchPath = 23
+
+pattern OpPathStr :: Word8
+pattern OpPathStr = 24
 
 -- ---------------------------------------------------------------------------
 -- Sub-type flags

@@ -416,6 +416,10 @@ parseAtom = do
     TokNull -> advance >> pure (ELit NixNull)
     TokUri u -> advance >> pure (ELit (NixUri u))
     TokPath p -> advance >> pure (ELit (NixPath p))
+    TokPathInterpStart headPiece -> do
+      _ <- advance
+      parts <- parsePathParts
+      pure (EPathStr (StrLit headPiece : parts))
     TokSearchPath p -> advance >> pure (ESearchPath p)
     TokIdent name -> advance >> pure (EVar name)
     TokStringOpen -> parseString
@@ -476,6 +480,30 @@ parseStringParts closer = go []
           expect TokInterpClose
           go (StrInterp expr : acc)
         _ -> parseError ("unexpected " <> showToken tok <> " in string")
+
+-- | The pieces of an interpolated path literal, after the opening head
+-- piece: literal chunks and interpolations until the lexer's
+-- synthesized 'TokPathEnd'.  The lexer emits nothing else between the
+-- opener and the end, so the trailing case is a defect signal, not a
+-- user-facing grammar error.
+parsePathParts :: Parser [StringPart]
+parsePathParts = go []
+  where
+    go acc = do
+      tok <- peek
+      case tok of
+        TokPathEnd -> do
+          _ <- advance
+          pure (reverse acc)
+        TokPathLit txt -> do
+          _ <- advance
+          go (StrLit txt : acc)
+        TokInterpOpen -> do
+          _ <- advance
+          expr <- parseExpr
+          expect TokInterpClose
+          go (StrInterp expr : acc)
+        _ -> parseError ("unexpected " <> showToken tok <> " in path")
 
 -- ---------------------------------------------------------------------------
 -- Compound expressions
@@ -799,6 +827,7 @@ canStartAtom TokFalse = True
 canStartAtom TokNull = True
 canStartAtom (TokUri _) = True
 canStartAtom (TokPath _) = True
+canStartAtom (TokPathInterpStart _) = True
 canStartAtom (TokSearchPath _) = True
 canStartAtom TokStringOpen = True
 canStartAtom TokIndStringOpen = True

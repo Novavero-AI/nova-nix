@@ -77,6 +77,7 @@ import Nix.Eval.CBytecode
     pattern OpLitNull,
     pattern OpLitPath,
     pattern OpLitUri,
+    pattern OpPathStr,
     pattern OpResolvedVar,
     pattern OpSearchPath,
     pattern OpSelect,
@@ -110,6 +111,7 @@ compileExpr = go
     go (ELit atom) = compileLit atom
     go (EStr parts) = compileStringParts OpStr parts
     go (EIndStr parts) = compileStringParts OpIndStr parts
+    go (EPathStr parts) = compileStringParts OpPathStr parts
     go (EVar name) = compileSymbolOp OpVar name
     go (EWithVar name) = compileSymbolOp OpWithVar name
     go (EResolvedVar level idx) =

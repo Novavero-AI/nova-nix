@@ -105,7 +105,7 @@ import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
@@ -244,6 +244,7 @@ evalBytecode env bcIdx =
            in VPath <$> resolvePathLiteral (symbolText (Symbol sym))
         OpStr -> evalBcStr env bcIdx
         OpIndStr -> evalBcIndStr env bcIdx
+        OpPathStr -> evalBcPathStr env bcIdx
         OpVar ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
            in evalVar env (symbolText (Symbol sym))
@@ -466,6 +467,44 @@ evalBcIndStr env bcIdx0 = do
   chunks <- evalBcStringParts env count dataOff
   let (text, ctx) = stripIndentedChunks chunks
   pure (VStr text ctx)
+
+-- | Evaluate an interpolated path literal from the bytecode data
+-- buffer.  The pieces concatenate with no separator, each interpolated
+-- value coerced as a path segment, and the whole resolves like a plain
+-- path literal - absolutized if still relative, @~\/@ expanded, and
+-- canonicalized, so a @..@ or a slash arriving at runtime collapses
+-- textually, matching upstream (verified against nix-instantiate
+-- 2.33.2: @let v = "a\/.."; in .\/${v}@ is the base directory itself).
+evalBcPathStr :: (MonadEval m) => Env -> Word32 -> m NixValue
+evalBcPathStr env bcIdx0 = do
+  let (count, dataOff) =
+        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
+  chunks <- evalBcPathParts env count dataOff
+  text <- decodedText "path literal" (BS.concat chunks)
+  VPath <$> resolvePathLiteral text
+
+-- | The path-segment walk under 'evalBcPathStr': literal pieces pass
+-- through; an interpolated value coerces with upstream's path-segment
+-- rules - a context-free string passes, a path contributes its text
+-- WITHOUT a store copy (unlike string interpolation, which copies),
+-- and a string carrying store-path context is refused, since a path
+-- value has nowhere to keep the context that holds a store reference
+-- alive.  All three observed from nix-instantiate 2.33.2.
+evalBcPathParts :: (MonadEval m) => Env -> Int -> Word32 -> m [BS.ByteString]
+evalBcPathParts _ 0 _ = pure []
+evalBcPathParts env n off = do
+  let tag = unsafePerformIO (cbcData off)
+      val = unsafePerformIO (cbcData (off + 1))
+  chunk <- case tag of
+    0 -> pure (symbolBytes (Symbol val))
+    _ -> do
+      v <- evalBytecode env val
+      (txt, ctx) <- coerceToString False force applyValue coercePathVerbatim v
+      unless (ctx == emptyContext) $
+        throwEvalError "a string that refers to a store path cannot be appended to a path"
+      pure txt
+  rest <- evalBcPathParts env (n - 1) (off + 2)
+  pure (chunk : rest)
 
 -- | Evaluate string parts from the bytecode data buffer.  Each part is two
 -- words: (tag, value).  tag=0 means literal (value = symbol), tag=1 means

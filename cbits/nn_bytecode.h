@@ -48,6 +48,7 @@
 #define NN_OP_UNARY         21
 #define NN_OP_BINARY        22
 #define NN_OP_SEARCH_PATH   23
+#define NN_OP_PATH_STR      24
 
 /* --- UnaryOp flags (NN_OP_UNARY) --- */
 

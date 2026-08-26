@@ -143,6 +143,14 @@ data Expr
     EStr ![StringPart]
   | -- | Indented string (double single-quoted).
     EIndStr ![StringPart]
+  | -- | Path literal with interpolations (@.\/${v}\/x@).  The first
+    -- part is always the literal head piece.  Evaluates to a path:
+    -- the pieces concatenate with no separator, each interpolation
+    -- coerced as a path segment (a path contributes its text without
+    -- a store copy; a string carrying store-path context is refused),
+    -- and the whole is canonicalized - the same semantics as the
+    -- @+@ chain @head + s1 + s2@, which upstream desugars it to.
+    EPathStr ![StringPart]
   | -- | Variable reference.
     EVar !Text
   | -- | Attribute set: @{ bindings }@ or @rec { bindings }@.

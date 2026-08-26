@@ -6991,6 +6991,98 @@ testFetchGitPins = do
   forceRemoveIfExists cacheHome
   pure results
 
+-- | String interpolation inside path literals (#178), the construct
+-- nixpkgs uses 89 times on modern trees.  Every rule here is pinned to
+-- nix-instantiate 2.33.2's observed behavior: the result is a path,
+-- pieces concatenate with no separator and canonicalize textually, a
+-- path segment coerces without a store copy, context is refused, and
+-- a trailing slash is a parse error.
+testPathInterp :: IO [Bool]
+testPathInterp = do
+  tmpBase <- getTemporaryDirectory
+  let fixtureDir = tmpBase </> "nova-nix-test-path-interp"
+      tmpStore = tmpBase </> "nova-nix-test-path-interp-store"
+  forceRemoveIfExists fixtureDir
+  forceRemoveIfExists tmpStore
+  Dir.createDirectoryIfMissing True (fixtureDir </> "sub")
+  BS.writeFile (fixtureDir </> "sub" </> "f.nix") (TE.encodeUtf8 "42")
+  let evalHere = evalNixIO fixtureDir
+      baseText = canonPathValue (T.pack fixtureDir)
+  results <-
+    sequence
+      [ runTestM "an interpolated path literal is a path" $ do
+          outcome <- evalHere "let v = \"sub\"; in builtins.typeOf ./${v}"
+          pure (assertRightValue outcome (mkStr "path")),
+        runTestM "a runtime dot-dot canonicalizes textually" $ do
+          outcome <- evalHere "let v = \"sub/..\"; in toString ./${v}"
+          pure (assertRightValue outcome (mkStr baseText)),
+        runTestM "pieces concatenate with no separator, mid-segment included" $ do
+          outcome <- evalHere "let v = \"a\"; in toString ./pre${v}${v}post"
+          pure (assertRightValue outcome (mkStr (baseText <> "/preaapost"))),
+        runTestM "an empty segment after the root is the root" $ do
+          outcome <- evalHere "toString /${\"\"}"
+          pure (assertRightValue outcome (mkStr "/")),
+        runTestM "a dotless relative literal interpolates" $ do
+          outcome <- evalHere "let v = \"f.nix\"; in toString sub/${v}"
+          pure (assertRightValue outcome (mkStr (baseText <> "/sub/f.nix"))),
+        runTestM "a path segment must coerce to a string" $ do
+          outcome <- evalHere "./${1}"
+          pure $ case outcome of
+            Left err
+              | "cannot coerce an integer to a string" `T.isInfixOf` err -> Pass
+              | otherwise -> Fail ("wrong error: " <> err)
+            Right _ -> Fail "an integer segment was accepted",
+        -- A path INSIDE a path interpolation appends its absolute text
+        -- with no store copy (string interpolation would copy) -
+        -- upstream's exact, odd, observable behavior.  The expected text
+        -- goes through the canonicalizer because the separator between
+        -- the two halves is platform-shaped: on POSIX the inner path's
+        -- own leading slash serves, on Windows (C:...) the head's slash
+        -- survives instead.
+        runTestM "a path segment appends textually without a store copy" $ do
+          outcome <- evalHere "toString ./${./sub}"
+          pure (assertRightValue outcome (mkStr (canonPathValue (baseText <> "/" <> baseText <> "/sub")))),
+        runTestM "a context-carrying segment is refused" $ do
+          outcome <- evalNixIOStore (StoreDir tmpStore) fixtureDir "./${builtins.toFile \"n\" \"x\"}"
+          pure $ case outcome of
+            Left err
+              | "cannot be appended to a path" `T.isInfixOf` err -> Pass
+              | otherwise -> Fail ("wrong error: " <> err)
+            Right _ -> Fail "a store-path segment was accepted",
+        runTestM "a trailing slash is a parse error" $ do
+          outcome <- evalHere "let v = \"a\"; in ./sub/${v}/"
+          pure $ case outcome of
+            Left err
+              | "path has a trailing slash" `T.isInfixOf` err -> Pass
+              | otherwise -> Fail ("wrong error: " <> err)
+            Right _ -> Fail "a trailing slash parsed",
+        runTestM "a plain trailing-slash literal is a parse error" $ do
+          outcome <- evalHere "./sub/"
+          pure $ case outcome of
+            Left err
+              | "path has a trailing slash" `T.isInfixOf` err -> Pass
+              | otherwise -> Fail ("wrong error: " <> err)
+            Right _ -> Fail "a trailing slash parsed",
+        runTestM "import resolves an interpolated dot-dot path" $ do
+          outcome <- evalHere "let v = \"sub\"; in import ./${v}/../sub/f.nix"
+          pure (assertRightValue outcome (VInt 42)),
+        -- An spath followed by /${...} is NOT one literal: it parses as
+        -- application of the search path to a path, which fails at
+        -- eval - upstream's exact shape.
+        runTestM "a search path does not absorb an interpolation" $ do
+          outcome <- evalHere "let v = \"a\"; in <nixpkgs>/${v}"
+          pure $ case outcome of
+            Left _ -> Pass
+            Right val -> Fail ("spath absorbed the interpolation: " <> T.pack (show val))
+      ]
+  forceRemoveIfExists fixtureDir
+  forceRemoveIfExists tmpStore
+  pure results
+  where
+    assertRightValue outcome expected = case outcome of
+      Right val | val == expected -> Pass
+      other -> Fail (T.pack (show other))
+
 -- | A path reached through an attrset's @outPath@ (or a @__toString@
 -- result) coerces exactly as the same path written directly: copied to
 -- the store, with the store path in the string context.  The broken
@@ -10731,6 +10823,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testFetchGitTransport,
           testFetchGitShallow,
           testFetchGitPins,
+          testPathInterp,
           testOutPathCoercion,
           testFetchCache,
           testExecWrapper,
