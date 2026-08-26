@@ -3,4 +3,12 @@ packages: .
 -- Pin the dependency universe: local, CI, and contributor builds resolve
 -- identical versions regardless of when they last ran cabal update.  Bump
 -- deliberately - a fresh timestamp - when adopting new releases.
-index-state: 2026-08-21T18:24:54Z
+index-state: 2026-08-26T02:37:20Z
+
+-- nova-cache 0.11.1.0 pulls the xz package (lzma-static's successor),
+-- which links a pkg-config-found system liblzma by default and falls
+-- back to its bundled sources.  Pin the bundled path so every build
+-- links the same C regardless of the host, the same line nova-cache's
+-- own cabal.project carries (a dependency's flag cannot be set from a
+-- .cabal file).
+constraints: xz -system-xz
