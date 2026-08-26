@@ -1022,10 +1022,15 @@ materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
     -- touches the files (re-copying onto a read-only tree fails on
     -- Windows and would wedge the store permanently); a failed one clears
     -- and re-copies.  Mirrors the builder's own prepareOutput recovery.
+    -- The whole check-then-act runs under the path's cross-process
+    -- lock, validity re-checked once held: without it, two processes
+    -- materializing the same source raced isValid, and the loser's
+    -- removePathForcibly deleted the tree the winner had just
+    -- registered.  Same protocol as the builder's withOutputLocks.
     adopt (rawPath, spText) =
       case parseStorePath defaultStoreDir spText of
         Nothing -> pure ()
-        Just sp -> do
+        Just sp -> withPathLock (stDir store) sp $ \_ -> do
           valid <- isValid store sp
           unless valid $ do
             let dest = storePathToFilePath (stDir store) sp
@@ -1047,10 +1052,16 @@ materializeEvalStoreWrites store storeWrites = do
   regs <- catMaybes <$> mapM prepare (Map.toList storeWrites)
   unless (null regs) (registerPaths (stDB store) regs)
   where
+    -- Checked and sealed under the path's lock, validity re-checked
+    -- once held, so a peer mid-producing the same path is waited out
+    -- rather than torn-read (and refused).  The lock releases before
+    -- the batched registration: registration is an upsert over content
+    -- both holders verified reproduces the same path, so the winner
+    -- and loser record the same row.
     prepare (spText, (refs, mode)) =
       case parseStorePath defaultStoreDir spText of
         Nothing -> pure Nothing
-        Just sp -> do
+        Just sp -> withPathLock (stDir store) sp $ \_ -> do
           valid <- isValid store sp
           if valid
             then pure Nothing
