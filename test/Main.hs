@@ -7456,7 +7456,33 @@ testStoreDelete = do
               | doRowRemoved removed, doTreeRemoved removed, gone -> Pass
               | otherwise -> Fail ("wrong outcome after release: " <> T.pack (show removed))
             (Nothing, other) ->
-              Fail ("delete never completed after release: " <> T.pack (show other))
+              Fail ("delete never completed after release: " <> T.pack (show other)),
+        -- The eval-side materializer joins the same protocol (#21): its
+        -- check-then-act must wait while another handle holds the
+        -- path's lock - unlocked, the loser's removePathForcibly could
+        -- delete the tree the winner had just registered - and proceed
+        -- once the holder releases.
+        runTestM "materializeEvalSources waits for a held path lock" $ do
+          srcDir <- (</> "nova-nix-test-mat-lock-src") <$> getTemporaryDirectory
+          forceRemoveIfExists srcDir
+          createDirectoryIfMissing True srcDir
+          TIO.writeFile (srcDir </> "f.txt") "locked source"
+          let guarded = StorePath (T.replicate 32 "j") "mat-locked"
+              spText = storePathToText defaultStoreDir guarded
+          holder <- acquirePathLock sd guarded
+          done <- newEmptyMVar
+          _ <- forkIO (materializeEvalSources store (Map.singleton (T.pack srcDir) spText) >>= putMVar done)
+          early <- timeout deleteLockProbeMicros (takeMVar done)
+          releasePathLock holder
+          outcome <- timeout raceWatchdogMicros (takeMVar done)
+          registered <- isValid store guarded
+          forceRemoveIfExists srcDir
+          pure $ case (early, outcome) of
+            (Just _, _) -> Fail "materialize ignored the held lock"
+            (Nothing, Just ())
+              | registered -> Pass
+              | otherwise -> Fail "proceeded after release but never registered"
+            (Nothing, Nothing) -> Fail "materialize never completed after release"
       ]
 
 testStoreOps :: IO [Bool]
