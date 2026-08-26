@@ -21,13 +21,9 @@ import Control.Exception (bracket_)
 import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
-import qualified Data.Map.Strict as Map
-import qualified Data.Text as T
-import Data.Text.Encoding (decodeUtf8Lenient)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
-import System.FilePath ((</>))
 import qualified System.Info
 
 -- | The alternate data stream whose presence marks a file executable.
@@ -88,62 +84,36 @@ copyExecMark from to = do
   exec <- isExecutable from
   when exec (markExecutable to)
 
--- | 'NovaCache.NAR.serialiseFromPath', with every regular file's executable
--- flag taken from 'isExecutable' rather than from the file's permissions.
---
--- The walk is nova-cache's own -- name safety, case-hack folding and entry
--- ordering are subtle and belong there -- and this only rewrites the flags
--- it produced.  On Unix those flags are already right, so the tree is
--- returned untouched.
+-- | nova-cache serialise options wiring 'isExecutable' in as the
+-- exec-bit source of truth: the walk asks the resolver per regular
+-- file, with the on-disk (case-hack-suffixed) name, which is exactly
+-- the file 'isExecutable' stats.  On Unix 'isExecutable' reads the
+-- owner-execute permission, the same answer the default resolver
+-- gives, so one options value serves both platforms.
+streamOptions :: NAR.SerialiseOptions
+streamOptions = NAR.defaultSerialiseOptions {NAR.soExecBit = isExecutable}
+
+-- | 'NovaCache.NAR.serialiseFromPath', with every regular file's
+-- executable flag taken from 'isExecutable' rather than from the
+-- file's permissions.  The walk is nova-cache's own -- name safety,
+-- case-hack folding and entry ordering are subtle and belong there --
+-- and the resolver hook (nova-cache 0.11.1) answers the flag during
+-- the walk, replacing the post-hoc rewrite this module used to do.
 serialiseFromPath :: FilePath -> IO NAR.NarEntry
-serialiseFromPath path = do
-  entry <- NAR.serialiseFromPath path
-  if usesStream then correct path entry else pure entry
-  where
-    correct p (NAR.NarRegular _ contents) = do
-      exec <- isExecutable p
-      pure (NAR.NarRegular exec contents)
-    correct p (NAR.NarDirectory entries) = do
-      -- An entry's name is not always the name on disk.  nova-cache strips
-      -- upstream's case-hack suffix from a folded sibling, so the entry
-      -- reads @foo@ while the directory holds @foo~nix~case~hack~1@, and
-      -- this walk runs only where that stripping is enabled.  The
-      -- directory is listed once and each entry name resolved back through
-      -- the same stripping, so the stat lands on the file that exists.
-      diskNames <- Dir.listDirectory p
-      let onDisk = Map.fromList [(stripCaseHack (T.pack n), n) | n <- diskNames]
-          -- Decoded as UTF-8 (not BS8.unpack, which truncates each byte to
-          -- a Char and mangles multi-byte names) since that is what a store
-          -- path name always is.
-          childName n =
-            let entryName = decodeUtf8Lenient n
-             in Map.findWithDefault (T.unpack entryName) entryName onDisk
-      NAR.NarDirectory <$> mapM (\(n, e) -> (,) n <$> correct (p </> childName n) e) entries
-    correct _ e@(NAR.NarSymlink _) = pure e
+serialiseFromPath = NAR.serialiseFromPathOpts streamOptions
 
--- | The name a case-hacked on-disk name serialises under: everything
--- before nova-cache's @caseHackSuffix@, or the name itself when the
--- suffix is absent.  Mirrors @unhackedDirNames@'s @resolve@.
-stripCaseHack :: T.Text -> T.Text
-stripCaseHack = fst . T.breakOn (decodeUtf8Lenient NAR.caseHackSuffix)
-
--- | The NAR hash of a path, read through the same exec-bit source of truth
--- 'serialiseFromPath' writes.
---
--- On Unix the flags nova-cache's own walk reads are already right, so the
--- hash streams: 'NAR.withNarSource' pulls the archive in chunks and the
--- digest folds over them, and no file's contents are ever held.  On Windows
--- the bit lives in a stream that walk cannot see, so the tree goes through
--- 'serialiseFromPath' instead -- the same trade-off that function already
--- makes, and the only way a sink writing the mark and a verifier reading it
--- back agree about the same file.
+-- | The NAR hash of a path, read through the same exec-bit source of
+-- truth 'serialiseFromPath' writes.  Streams on every platform:
+-- 'NAR.withNarSourceOpts' pulls the archive in chunks with the ADS
+-- resolver answering the flags, and the digest folds over them, so no
+-- file's contents are ever held whole.  Before the resolver hook,
+-- Windows had to materialize the tree in memory to rewrite the flags.
 narHashOfPath :: FilePath -> IO Hash.NixHash
-narHashOfPath path
-  | usesStream = NAR.narHash <$> serialiseFromPath path
-  | otherwise = NAR.withNarSource NAR.defaultCaseHack path $ \pull ->
-      let go !ctx = do
-            chunk <- pull
-            if BS.null chunk
-              then pure (Hash.hashFinalize ctx)
-              else go (Hash.hashUpdate ctx chunk)
-       in go Hash.hashInit
+narHashOfPath path =
+  NAR.withNarSourceOpts streamOptions path $ \pull ->
+    let go !ctx = do
+          chunk <- pull
+          if BS.null chunk
+            then pure (Hash.hashFinalize ctx)
+            else go (Hash.hashUpdate ctx chunk)
+     in go Hash.hashInit
