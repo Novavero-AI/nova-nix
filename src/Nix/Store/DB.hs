@@ -153,6 +153,12 @@ openStoreDB dir = do
   createDirectoryIfMissing True metaDir
   conn <- open dbPath
   execute_ conn "PRAGMA journal_mode=WAL"
+  -- SQLite's default busy timeout is zero, so a second process hitting
+  -- a peer's write transaction died on an uncaught ErrorBusy SQLError
+  -- instead of waiting its turn.  Upstream waits an hour
+  -- (sqlite3_busy_timeout(db, 60 * 60 * 1000), sqlite.cc:78 at
+  -- 2.28.7); the pragma reaches the same API.
+  execute_ conn "PRAGMA busy_timeout=3600000"
   -- SQLite leaves foreign keys OFF per connection; without this the Refs
   -- REFERENCES clauses are inert, and deleting a ValidPaths row (path
   -- deletion, garbage collection) would leave dangling Refs edges that

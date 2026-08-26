@@ -7,7 +7,7 @@ module Main (main) where
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
-import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket_, evaluate, fromException, throwIO, try)
 import Control.Monad (filterM, void, when)
 import Data.Bits (shiftR, (.&.))
@@ -4584,6 +4584,28 @@ testStoreDB = do
           result <- isValidPath db sp
           closeStoreDB db
           pure (assertEqual "registered" True result),
+        -- A peer's held write transaction must be waited out, not died
+        -- on: SQLite's default busy timeout is zero, and registration
+        -- used to crash with an uncaught ErrorBusy SQLError while a
+        -- second process was mid-commit.  Upstream waits
+        -- (sqlite3_busy_timeout, one hour); this pins that we do too.
+        runTestM "db registration waits out a busy peer" $ do
+          db <- openStoreDB storeDir
+          let dbPath = unStoreDir storeDir </> metaDirName </> dbFileName
+          peer <- SQL.open dbPath
+          SQL.execute_ peer "BEGIN IMMEDIATE"
+          released <- newEmptyMVar
+          _ <- forkIO $ do
+            threadDelay 300000
+            SQL.execute_ peer "COMMIT"
+            SQL.close peer
+            putMVar released ()
+          let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3" "busywait"
+          registerPath db (PathRegistration sp "sha256:busy" 10 Nothing [])
+          takeMVar released
+          result <- isValidPath db sp
+          closeStoreDB db
+          pure (assertEqual "registered after the peer released" True result),
         -- register with refs + query
         runTestM "db register with refs + query" $ do
           db <- openStoreDB storeDir
