@@ -47,7 +47,7 @@ import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
 import Nix.Hash (hashPlaceholder, makeFixedOutputPath, sha256Digest)
 import qualified Nix.Hash as Hash
-import Nix.Parser (parseNix)
+import Nix.Parser (ParseError (..), parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
 import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, writeDrv, writeDrvClosure)
@@ -1378,7 +1378,38 @@ testParserErrors = do
       runTest "unclosed bracket" $
         assertLeft "unclosed bracket" (parseNix testBaseDir "<test>" "[ 1 2"),
       runTest "unexpected token" $
-        assertLeft "unexpected" (parseNix testBaseDir "<test>" ")")
+        assertLeft "unexpected" (parseNix testBaseDir "<test>" ")"),
+      -- A failure deep in a lambda body is reported where it happened:
+      -- a parsed lambda header commits, instead of backtracking into
+      -- the attr-set reading and reporting its early stumble (a real
+      -- error at line 410 of a nixpkgs file used to surface at line 2).
+      runTest "deep formals-lambda body error reports its own line" $
+        case parseNix testBaseDir "<test>" "{ a, b }:\n{\n  x = 1;\n  y = (;\n}" of
+          Left err -> assertEqual "error line" 4 (peLine err)
+          Right _ -> Fail "parsed unexpectedly",
+      runTest "simple-lambda body error reports its own line" $
+        case parseNix testBaseDir "<test>" "x:\n(;" of
+          Left err -> assertEqual "error line" 2 (peLine err)
+          Right _ -> Fail "parsed unexpectedly",
+      -- The empty attr set is a successful PREFIX parse of "{ }: body",
+      -- so without commitment the outer parser complained at the colon.
+      runTest "empty-formals lambda body error reports its own line" $
+        case parseNix testBaseDir "<test>" "{ }:\n(;" of
+          Left err -> assertEqual "error line" 2 (peLine err)
+          Right _ -> Fail "parsed unexpectedly",
+      -- When neither reading parses, the deeper failure wins: the
+      -- malformed formal at column 7, not the attr-set branch's
+      -- stumble over the first comma at column 4.
+      runTest "a malformed formal beats the attr-set branch's earlier error" $
+        case parseNix testBaseDir "<test>" "{ a, b.c }: x" of
+          Left err -> assertEqual "deeper than the attr-set stumble" True ((peLine err, peCol err) > (1, 4))
+          Right _ -> Fail "parsed unexpectedly",
+      -- End-of-input failures carry no position and must rank as the
+      -- furthest a branch can get.
+      runTest "truncated lambda reports end of input" $
+        case parseNix testBaseDir "<test>" "{ a, b }:" of
+          Left err -> assertEqual "end of input" True ("end of input" `T.isInfixOf` peMessage err)
+          Right _ -> Fail "parsed unexpectedly"
     ]
 
 -- ---------------------------------------------------------------------------

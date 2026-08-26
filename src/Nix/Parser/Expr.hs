@@ -63,42 +63,69 @@ parseExpr = do
 -- ---------------------------------------------------------------------------
 
 -- | Identifier at start: could be @x: body@ or @name\@{...}: body@ or just expr.
+-- A lambda header (@ident :@, or @ident \@ { formals } :@) is
+-- grammatically unambiguous, so once one parses we are committed and a
+-- failure in the body propagates from where it happened; it must not
+-- backtrack into the expression reading, whose partial success would
+-- otherwise leave the outer parser complaining at the stray colon.
+-- When no reading parses, the deepest failure is the one reported.
 parseLambdaOrIdent :: Parser Expr
 parseLambdaOrIdent = do
-  result <- tryParser trySimpleLambda
-  case result of
-    Just lam -> pure lam
-    Nothing -> do
-      result2 <- tryParser tryNamedSetLambda
-      maybe parseImplication pure result2
+  simple <- tryParserKeepError trySimpleLambdaHeader
+  case simple of
+    Right body -> body
+    Left simpleErr -> do
+      named <- tryParserKeepError tryNamedSetLambdaHeader
+      case named of
+        Right body -> body
+        Left namedErr -> do
+          plain <- tryParserKeepError parseImplication
+          case plain of
+            Right e -> pure e
+            Left plainErr ->
+              failWithError (deeperError simpleErr (deeperError namedErr plainErr))
 
--- | Try @x: body@
-trySimpleLambda :: Parser Expr
-trySimpleLambda = do
+-- | The header of @x: body@; on success, returns the committed body parse.
+trySimpleLambdaHeader :: Parser (Parser Expr)
+trySimpleLambdaHeader = do
   name <- expectIdent
   expect TokColon
-  (\body -> ELambda (FormalName name) body NoCaptureInfo) <$> parseExpr
+  pure ((\body -> ELambda (FormalName name) body NoCaptureInfo) <$> parseExpr)
 
--- | Try @name\@{ formals }: body@
-tryNamedSetLambda :: Parser Expr
-tryNamedSetLambda = do
+-- | The header of @name\@{ formals }: body@; on success, returns the
+-- committed body parse.
+tryNamedSetLambdaHeader :: Parser (Parser Expr)
+tryNamedSetLambdaHeader = do
   name <- expectIdent
   expect TokAt
   expect TokLBrace
   (formals, hasEllipsis) <- parseFormalsBody
   expect TokColon
-  (\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr
+  pure ((\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr)
 
 -- | Brace at start: could be @{ formals }: body@, @{ formals }\@name: body@, or attr set.
--- Falls back to parsing as attr set (via implication) if lambda parse fails.
+-- Same commitment rule as 'parseLambdaOrIdent': @... } :@ and
+-- @... } \@ name :@ never follow an attr set, so a parsed lambda
+-- header commits, and a body failure is reported from its own
+-- position (a real error at line 410 of a formals-lambda file used to
+-- surface as an attr-set complaint at line 2).  When both readings
+-- fail, the deeper failure wins, so a malformed formal beats the
+-- attr-set branch's earlier stumble over the first comma.
 parseLambdaOrAttrSet :: Parser Expr
 parseLambdaOrAttrSet = do
-  result <- tryParser trySetLambda
-  maybe parseImplication pure result
+  headed <- tryParserKeepError trySetLambdaHeader
+  case headed of
+    Right body -> body
+    Left lambdaErr -> do
+      alt <- tryParserKeepError parseImplication
+      case alt of
+        Right e -> pure e
+        Left attrErr -> failWithError (deeperError lambdaErr attrErr)
 
--- | Try @{ a, b ? default, ... }: body@ or @{ a, b }\@name: body@
-trySetLambda :: Parser Expr
-trySetLambda = do
+-- | The header of @{ a, b ? default, ... }: body@ or
+-- @{ a, b }\@name: body@; on success, returns the committed body parse.
+trySetLambdaHeader :: Parser (Parser Expr)
+trySetLambdaHeader = do
   expect TokLBrace
   (formals, hasEllipsis) <- parseFormalsBody
   -- Check for @name after the closing brace
@@ -106,12 +133,12 @@ trySetLambda = do
   case tok of
     TokColon -> do
       _ <- advance
-      (\body -> ELambda (FormalSet formals hasEllipsis) body NoCaptureInfo) <$> parseExpr
+      pure ((\body -> ELambda (FormalSet formals hasEllipsis) body NoCaptureInfo) <$> parseExpr)
     TokAt -> do
       _ <- advance
       name <- expectIdent
       expect TokColon
-      (\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr
+      pure ((\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr)
     _ -> parseError ("expected ':' or '@' after formals, got " <> showToken tok)
 
 -- | Parse the inside of @{ ... }@ formals (comma-separated, optional defaults,
