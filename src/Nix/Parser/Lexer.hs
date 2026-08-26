@@ -51,6 +51,14 @@ data Token
   | TokUri !Text
   | TokPath !Text
   | TokSearchPath !Text
+  | -- | Interpolated path literal: the head piece opens (its text
+    -- carried), 'TokPathLit' chunks and 'TokInterpOpen'/'TokInterpClose'
+    -- pairs follow, and 'TokPathEnd' closes.  A path has no closing
+    -- delimiter of its own, so the lexer synthesizes the end token at
+    -- the first non-path character, the way upstream emits PATH_END.
+    TokPathInterpStart !Text
+  | TokPathLit !Text
+  | TokPathEnd
   | -- Strings
     TokStringOpen
   | TokStringClose
@@ -106,11 +114,12 @@ data Token
 -- Lexer state
 -- ---------------------------------------------------------------------------
 
--- | Which mode the lexer is in (for string interpolation).
+-- | Which mode the lexer is in (for string and path interpolation).
 data LexMode
   = ModeNormal
   | ModeString
   | ModeIndString
+  | ModePath
   deriving (Eq, Show)
 
 -- | Internal lexer state.
@@ -174,6 +183,7 @@ lexLoop :: LexState -> [Located] -> Either ParseError [Located]
 lexLoop st acc = case lsModes st of
   (ModeString : _) -> lexStringMode st acc
   (ModeIndString : _) -> lexIndStringMode st acc
+  (ModePath : _) -> lexPathMode st acc
   _ -> lexNormalMode st acc
 
 lexNormalMode :: LexState -> [Located] -> Either ParseError [Located]
@@ -241,7 +251,7 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
       -- restore the enclosing normal-mode context's brace count.
       (ModeNormal : outerMode : restModes)
         | lsBraceDepth st == 0,
-          outerMode == ModeString || outerMode == ModeIndString ->
+          outerMode == ModeString || outerMode == ModeIndString || outerMode == ModePath ->
             let tok = Located (lsLine st) (lsCol st) TokInterpClose
                 (restoredDepth, restoredStack) = case lsBraceStack st of
                   (saved : outerSaved) -> (saved, outerSaved)
@@ -813,9 +823,77 @@ lexPath :: LexState -> [Located] -> Either ParseError [Located]
 lexPath st acc =
   let (pathText, after) = T.span isPathChar (lsInput st)
       len = T.length pathText
-      tok = Located (lsLine st) (lsCol st) (TokPath pathText)
       newSt = advanceCol len st {lsInput = after}
-   in lexNormalMode newSt (tok : acc)
+   in if "${" `T.isPrefixOf` after
+        then
+          -- The literal continues through an interpolation: the head
+          -- piece opens and 'lexPathMode' carries on, upstream's
+          -- INPATH machinery.
+          let tok = Located (lsLine st) (lsCol st) (TokPathInterpStart pathText)
+           in lexPathMode (newSt {lsModes = ModePath : lsModes newSt}) (tok : acc)
+        else
+          if T.isSuffixOf "/" pathText
+            then pathTrailingSlashError st
+            else
+              let tok = Located (lsLine st) (lsCol st) (TokPath pathText)
+               in lexNormalMode newSt (tok : acc)
+
+-- | Inside an interpolated path literal, after the head piece: literal
+-- chunks, @${@ interpolations, and the synthesized end.  Mirrors the
+-- string modes, with two path-specific rules from upstream's lexer: any
+-- non-path character ends the literal (there is no closing delimiter),
+-- and ending while the last piece ends in @/@ is the "path has a
+-- trailing slash" parse error.
+lexPathMode :: LexState -> [Located] -> Either ParseError [Located]
+lexPathMode st acc
+  | "${" `T.isPrefixOf` lsInput st =
+      let tok = Located (lsLine st) (lsCol st) TokInterpOpen
+          newSt =
+            advanceCol
+              2
+              st
+                { lsInput = T.drop 2 (lsInput st),
+                  lsModes = ModeNormal : lsModes st,
+                  -- Fresh count for the interpolation body; the
+                  -- enclosing context's count is restored at the
+                  -- matching TokInterpClose.
+                  lsBraceDepth = 0,
+                  lsBraceStack = lsBraceDepth st : lsBraceStack st
+                }
+       in lexLoop newSt (tok : acc)
+  | otherwise =
+      let (chunk, after) = T.span isPathChar (lsInput st)
+          len = T.length chunk
+          newSt = advanceCol len st {lsInput = after}
+          endTok = Located (lsLine newSt) (lsCol newSt) TokPathEnd
+          popped = newSt {lsModes = safeTail (lsModes newSt)}
+       in if T.null chunk
+            then -- The character after an interpolation is not a path
+            -- character: the literal ends right there.
+              lexNormalMode popped (endTok : acc)
+            else
+              if "${" `T.isPrefixOf` after
+                then
+                  let tok = Located (lsLine st) (lsCol st) (TokPathLit chunk)
+                   in lexPathMode newSt (tok : acc)
+                else
+                  if T.isSuffixOf "/" chunk
+                    then pathTrailingSlashError st
+                    else
+                      let tok = Located (lsLine st) (lsCol st) (TokPathLit chunk)
+                       in lexNormalMode popped (endTok : tok : acc)
+
+-- | Upstream's INPATH_SLASH error, verbatim: a path literal may not end
+-- with @/@, whether plain or after an interpolation.
+pathTrailingSlashError :: LexState -> Either ParseError [Located]
+pathTrailingSlashError st =
+  Left
+    ParseError
+      { peFile = lsFile st,
+        peLine = lsLine st,
+        peCol = lsCol st,
+        peMessage = "path has a trailing slash"
+      }
 
 lexSearchPath :: LexState -> [Located] -> Either ParseError [Located]
 lexSearchPath st acc =
@@ -899,11 +977,19 @@ looksLikePathFrom noSlashFloor input
   | otherwise =
       let run = T.takeWhile isPathChar input
           (_, slashAndRest) = T.break (== '/') run
+          -- Upstream's PATH_SEG rule: a run ending in @/@ immediately
+          -- followed by @${@ opens an interpolated path (@./${v}@,
+          -- @/${v}@, @a/${v}@), even though the slash has no segment
+          -- after it yet - the segment arrives at eval.  Such runs
+          -- contain a slash, so the slash-free watermark is untouched.
+          interpFollows =
+            T.isSuffixOf "/" run
+              && "${" `T.isPrefixOf` T.drop (T.length run) input
        in if T.null slashAndRest
             then (False, lengthWord8 input - lengthWord8 run)
             else case T.uncons (T.drop 1 slashAndRest) of
-              Just (afterSlash, _) -> (isPathChar afterSlash && afterSlash /= '/', noSlashFloor)
-              Nothing -> (False, noSlashFloor)
+              Just (afterSlash, _) -> (interpFollows || (isPathChar afterSlash && afterSlash /= '/'), noSlashFloor)
+              Nothing -> (interpFollows, noSlashFloor)
 
 isSearchPathChar :: Char -> Bool
 isSearchPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])

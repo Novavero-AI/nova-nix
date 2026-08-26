@@ -59,6 +59,7 @@ resolve stack expr = case expr of
   ELit _ -> expr
   EStr parts -> EStr (map (resolvePart stack) parts)
   EIndStr parts -> EIndStr (map (resolvePart stack) parts)
+  EPathStr parts -> EPathStr (map (resolvePart stack) parts)
   EVar name -> resolveVar stack 0 name
   EResolvedVar _ _ -> expr
   EAttrs True bindings _captureInfo
@@ -353,6 +354,14 @@ resolveRelativePaths dir = goExpr
       ELit _ -> expr
       EStr parts -> EStr (map goPart parts)
       EIndStr parts -> EIndStr (map goPart parts)
+      -- The head piece of an interpolated path is static text and gets
+      -- the same absolutization as a plain literal, for the same
+      -- closure-capture reason; the interpolated pieces only recurse.
+      EPathStr (StrLit headPiece : rest)
+        | not (homeRelative headPiece),
+          isRelative (T.unpack headPiece) ->
+            EPathStr (StrLit (T.pack (dir </> T.unpack headPiece)) : map goPart rest)
+      EPathStr parts -> EPathStr (map goPart parts)
       EVar _ -> expr
       EWithVar _ -> expr
       EResolvedVar _ _ -> expr
