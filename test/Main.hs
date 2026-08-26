@@ -8640,6 +8640,51 @@ testBuilder = do
             | registered -> Pass
             | otherwise -> Fail "built but not registered valid"
           BuildFailure msg code -> Fail ("expected success (" <> T.pack (show code) <> "): " <> msg),
+      -- The impureEnvVars carve-out (#185): a fixed-output derivation's
+      -- listed ambient variables reach the scrubbed build, an absent
+      -- listed name arrives as the EMPTY STRING (present, not omitted,
+      -- upstream's value_or("")), and everything else stays scrubbed.
+      runTestM "impureEnvVars reach a fixed-output build, absent names as empty" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-impure1"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        setEnv "NOVA_TEST_IMPURE" "proxy-ok"
+        unsetEnv "NOVA_TEST_ABSENT"
+        let payload = "fixed output payload\n"
+            digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" payload)
+            outSP = StorePath "ffffffffffffffffffffffffffffff03" "fo-impure-env"
+            script = "[ \"$NOVA_TEST_IMPURE\" = \"proxy-ok\" ] && [ \"${NOVA_TEST_ABSENT+set}\" = \"set\" ] && [ -z \"$NOVA_TEST_ABSENT\" ] && printf 'fixed output payload\\n' > $out"
+            baseDrv = mkFixedOutputDrv shell outSP script "sha256" digest
+            drv = baseDrv {drvEnv = Map.insert "impureEnvVars" "NOVA_TEST_IMPURE NOVA_TEST_ABSENT" (drvEnv baseDrv)}
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-impure1-tmp"}
+        result <- buildDerivation config store drv
+        unsetEnv "NOVA_TEST_IMPURE"
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildSuccess _ -> Pass
+          BuildFailure msg code -> Fail ("carve-out did not reach the build (" <> T.pack (show code) <> "): " <> msg),
+      runTestM "impureEnvVars are ignored for a non-fixed-output build" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-impure2"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        setEnv "NOVA_TEST_IMPURE" "must-not-leak"
+        let outSP = StorePath "ffffffffffffffffffffffffffffff04" "impure-scrubbed"
+            script = "[ -z \"${NOVA_TEST_IMPURE-}\" ] && echo ok > $out"
+            baseDrv = mkTestBuildDrv shell outSP script
+            drv = baseDrv {drvEnv = Map.insert "impureEnvVars" "NOVA_TEST_IMPURE" (drvEnv baseDrv)}
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-impure2-tmp"}
+        result <- buildDerivation config store drv
+        unsetEnv "NOVA_TEST_IMPURE"
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure $ case result of
+          BuildSuccess _ -> Pass
+          BuildFailure msg code -> Fail ("ambient leaked into a non-fixed-output build (" <> T.pack (show code) <> "): " <> msg),
       runTestM "fixed-output flat mismatch fails and removes the output" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-fo2"
