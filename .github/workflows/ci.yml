@@ -7,6 +7,15 @@ on:
   # predecessor, not main, and a [main] filter leaves it checkless -
   # unmergeable under branch protection's required contexts.
   pull_request:
+  # The merge queue tests each entry against a temporary
+  # gh-readonly-queue/main branch, so every required check must also
+  # report there or the queue times the context out to a failure and
+  # ejects the pull request.  Same jobs, matched by check name; every
+  # required context comes from this one workflow, so the single
+  # trigger reaches all of them.  checks_requested is the only activity
+  # type the event has.
+  merge_group:
+    types: [checks_requested]
   workflow_call:
   # Run the suite against any branch without opening a pull request:
   # verifying a fix on a branch otherwise meant a throwaway PR, since
