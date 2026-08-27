@@ -256,9 +256,6 @@ jobs:
       - name: Build with instrumented cbits
         run: cabal build --enable-tests
 
-      - name: Provision the store root
-        run: sudo mkdir -p /nix && sudo chown "$USER" /nix
-
       # detect_leaks=0: LeakSanitizer would report the GHC RTS's deliberate
       # process-lifetime allocations, not cbits defects - the arena's
       # bulk-free discipline is exercised by the suite itself.
@@ -315,15 +312,6 @@ jobs:
       # would never fail CI) and shares one solver plan with the test step.
       - name: Build
         run: cabal build --enable-tests --ghc-options="-Werror"
-
-      # Eval-time store writes materialize at /nix by design; the runner
-      # lacks it, so the store-writing eval tests would skip.  Provisioning
-      # it keeps that coverage real on Linux.  (macOS cannot: / is a sealed
-      # read-only volume, and the synthetic.conf dance is not worth it for
-      # a test fixture - those tests skip loudly there.)
-      - name: Provision the store root (Linux)
-        if: runner.os == 'Linux'
-        run: sudo mkdir -p /nix && sudo chown "$USER" /nix
 
       - name: Test
         run: cabal test

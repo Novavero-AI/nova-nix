@@ -148,6 +148,11 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
     goEval opts ("--aterm" : rest) = goEval (opts {optAterm = True}) rest
     goEval opts ("--nix-path" : val : rest) =
       goEval (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
+    -- Accepted here as well as at the top level, like build and push:
+    -- eval-side reads follow the selected store, so the flag means as
+    -- much after the subcommand as before it.
+    goEval opts ("--store" : dir : rest) =
+      goEval (opts {optStore = Just dir}) rest
     goEval opts ("--expr" : expr : rest) =
       go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
     goEval _ [flag]
