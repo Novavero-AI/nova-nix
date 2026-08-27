@@ -54,7 +54,7 @@ import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, c
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, platformStoreDirText, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Base64 as B64
@@ -1978,12 +1978,20 @@ testImportPure = do
 -- ---------------------------------------------------------------------------
 
 -- | Parse and evaluate Nix source using the IO evaluator.
+-- | The per-suite temp store 'evalNixIO' evaluates against, exposed so
+-- a test inspecting materialized trees resolves the same directory.
+evalNixIOStoreDir :: IO StoreDir
+evalNixIOStoreDir = do
+  tmpBase <- getTemporaryDirectory
+  pure (StoreDir (tmpBase </> "nova-nix-test-eval-store"))
+
+-- | IO eval against a per-suite temp store, so no test needs a real,
+-- writable platform store root: eval-time store writes land under the
+-- temp directory, and the suite runs everywhere without provisioning.
 evalNixIO :: FilePath -> Text -> IO (Either Text NixValue)
-evalNixIO baseDir source = case parseNix baseDir "<test>" source of
-  Left err -> pure (Left (T.pack (show err)))
-  Right expr -> do
-    st <- newEvalState platformStoreDir baseDir
-    runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
+evalNixIO baseDir source = do
+  storeDir <- evalNixIOStoreDir
+  evalNixIOStore storeDir baseDir source
 
 -- | Run a named IO eval test - single label, no double-wrapping.
 runTestIO :: Text -> FilePath -> Text -> NixValue -> IO Bool
@@ -2022,31 +2030,13 @@ testBlackholeRecoveryIO = do
         "builtins.tryEval (let y = y; in y)"
     ]
 
--- | Whether this machine can materialize eval outputs at the platform
--- store root (eval-time store writes resolve there by design).  Absent
--- and uncreatable - macOS's sealed read-only /, a root-owned /nix on a
--- Nix-installed Linux box - the store-writing eval tests skip loudly
--- rather than fail on machines that cannot host a store.  Linux CI
--- provisions /nix so coverage stays real there.
-storeRootAvailable :: IO Bool
-storeRootAvailable = do
-  outcome <- try (createDirectoryIfMissing True (T.unpack platformStoreDirText))
-  case outcome of
-    Left (_ :: SomeException) -> pure False
-    Right () -> writable <$> getPermissions (T.unpack platformStoreDirText)
-
 -- | builtins.path/filterSource with a filter: the tree is serialized with
 -- rejected entries removed (a rejected directory prunes its subtree),
 -- content-addressed over the FILTERED NAR, and materialized to the store.
 testPathFilterIO :: IO [Bool]
 testPathFilterIO = do
   putStrLn "eval/path-filter-io"
-  usableStore <- storeRootAvailable
-  if not usableStore
-    then do
-      putStrLn "  SKIP  platform store root unavailable; cannot materialize eval outputs here"
-      pure []
-    else testPathFilterBody
+  testPathFilterBody
 
 testPathFilterBody :: IO [Bool]
 testPathFilterBody = do
@@ -2138,11 +2128,10 @@ walkWatchdogMicros = 30 * 1000 * 1000
 testPathSymlinkIO :: IO [Bool]
 testPathSymlinkIO = do
   putStrLn "eval/path-symlink-io"
-  usableStore <- storeRootAvailable
   canLink <- symlinksAvailable
-  if not (usableStore && canLink)
+  if not canLink
     then do
-      putStrLn "  SKIP  needs a writable platform store root and symlink privilege"
+      putStrLn "  SKIP  needs symlink privilege"
       pure []
     else testPathSymlinkBody
 
@@ -2168,8 +2157,9 @@ testPathSymlinkBody = do
   results <- case (spFor "path-symlink-src" linkEntry, spFor "path-symlink-cycle" cycleEntry) of
     (Right linkSp, Right cycleSp) -> do
       -- The same mapping the evaluator's copy uses for its destination.
-      let linkDest = storePathToFilePath platformStoreDir linkSp
-          cycleDest = storePathToFilePath platformStoreDir cycleSp
+      evalStore <- evalNixIOStoreDir
+      let linkDest = storePathToFilePath evalStore linkSp
+          cycleDest = storePathToFilePath evalStore cycleSp
       -- A leftover materialization from an earlier (possibly pre-fix) run
       -- would short-circuit the copy under test.
       Dir.removePathForcibly linkDest
