@@ -25,6 +25,8 @@ import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig)
 import Nix.Builtins (builtinEnv, parseNixPath)
+import Nix.Config (NixConfig (..))
+import qualified Nix.Config as Config
 import Nix.Derivation (Derivation (..), DerivationOutput (..), toATerm)
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
@@ -37,7 +39,7 @@ import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
-import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory)
+import System.Directory (Permissions (executable), XdgDirectory (XdgConfig), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, getXdgDirectory)
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory, takeFileName, (</>))
@@ -239,6 +241,11 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
 nixDataDirVar :: String
 nixDataDirVar = "NIX_DATA_DIR"
 
+-- | The environment variable carrying inline nix.conf settings, above the
+-- config files and below the command line in precedence.
+nixConfigVar :: String
+nixConfigVar = "NIX_CONFIG"
+
 -- | Where a release archive keeps the bundled expressions, relative to the
 -- directory holding @bin@.
 bundledDataSubdir :: FilePath
@@ -343,6 +350,11 @@ usageLines =
     "  --store DIR            Use DIR as the store (default: the platform store)",
     "  --substituter URL      Try this binary cache before building",
     "  --trusted-key K        Public key (name:base64) for the substituter",
+    "",
+    "  substituters and trusted-public-keys also read from",
+    "  $XDG_CONFIG_HOME/nix/nix.conf and $NIX_CONFIG; the flags above",
+    "  add to whatever those configure.",
+    "",
     "  --help                 Print this text and exit",
     "  --version              Print the version and exit"
   ]
@@ -470,7 +482,8 @@ derivationAttrKeys = ["type", "_derivation", "drvPath"]
 buildCommand :: CliOpts -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
 buildCommand opts dataDir target attrPath = do
   let storeDir = chosenStoreDir opts
-  caches <- either failWith pure (substituterConfig (optSubstituter opts) (optTrustedKey opts))
+  configSources <- loadConfigSources
+  caches <- either failWith pure (resolveCaches configSources (optSubstituter opts) (optTrustedKey opts))
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
   (baseDir, sourceName, source) <- loadBuildSource target
   case parseNix baseDir sourceName source of
@@ -564,25 +577,64 @@ extractDerivation _ = do
 chosenStoreDir :: CliOpts -> StoreDir
 chosenStoreDir opts = maybe platformStoreDir StoreDir (optStore opts)
 
--- | Default priority for a CLI-configured substituter (cache.nixos.org is 40).
+-- | Default priority for a config- or CLI-configured substituter
+-- (cache.nixos.org is 40).
 substituterPriority :: Int
 substituterPriority = 50
 
--- | Build the cache list from @--substituter@\/@--trusted-key@.  Both or
--- neither: a substituter without a trusted key would skip signature
--- verification, and a key without a substituter is a mistake.
-substituterConfig :: Maybe String -> Maybe String -> Either T.Text [CacheConfig]
-substituterConfig Nothing Nothing = Right []
-substituterConfig Nothing (Just _) = Left "--trusted-key requires --substituter"
-substituterConfig (Just _) Nothing = Left "--substituter requires --trusted-key (name:base64)"
-substituterConfig (Just url) (Just key) =
-  Right
-    [ CacheConfig
-        { ccUrl = T.dropWhileEnd (== '/') (T.pack url),
-          ccPublicKey = T.pack key,
-          ccPriority = substituterPriority
-        }
-    ]
+-- | Turn resolved settings into the cache list.  One 'CacheConfig' per
+-- substituter, each carrying the whole trusted-key set: upstream's keys
+-- are not bound to a substituter, so a narinfo from any cache is accepted
+-- by any trusted key.  A substituter with no trusted key anywhere is not
+-- refused here (it simply accepts nothing at the signature gate), matching
+-- upstream, where @substituters@ and @trusted-public-keys@ are independent.
+configToCaches :: NixConfig -> [CacheConfig]
+configToCaches config =
+  [ CacheConfig
+      { ccUrl = T.dropWhileEnd (== '/') url,
+        ccPublicKeys = ncTrustedPublicKeys config,
+        ccPriority = substituterPriority
+      }
+  | url <- ncSubstituters config
+  ]
+
+-- | Resolve the caches from the config sources plus the CLI flags.  The
+-- sources are ordered weakest first (user file, then @NIX_CONFIG@); the
+-- CLI @--substituter@ and @--trusted-key@ append on top, the highest
+-- precedence, so a flag adds to the configured set rather than being
+-- overridden by it.
+resolveCaches :: [T.Text] -> Maybe String -> Maybe String -> Either T.Text [CacheConfig]
+resolveCaches sources mUrl mKey = do
+  base <- Config.resolveConfig sources
+  let withCli =
+        base
+          { ncSubstituters = ncSubstituters base ++ maybe [] (\url -> [T.pack url]) mUrl,
+            ncTrustedPublicKeys = ncTrustedPublicKeys base ++ maybe [] (\key -> [T.pack key]) mKey
+          }
+  pure (configToCaches withCli)
+
+-- | The nix.conf sources, weakest first: the user file, then @NIX_CONFIG@.
+-- Reading is best effort - a missing or unreadable file is simply absent -
+-- but a file that IS read and does not parse is a hard error downstream,
+-- so a malformed security-relevant setting cannot pass for no setting.
+loadConfigSources :: IO [T.Text]
+loadConfigSources = do
+  userFile <- readUserConfigFile
+  nixConfigEnv <- lookupEnv nixConfigVar
+  pure (catMaybes [userFile, T.pack <$> nixConfigEnv])
+
+-- | Read @$XDG_CONFIG_HOME\/nix\/nix.conf@ (the user config file), or
+-- 'Nothing' when it is absent or unreadable.
+readUserConfigFile :: IO (Maybe T.Text)
+readUserConfigFile = do
+  dir <- getXdgDirectory XdgConfig "nix"
+  let path = dir </> "nix.conf"
+  present <- doesFileExist path
+  if not present
+    then pure Nothing
+    else do
+      result <- try (BS.readFile path) :: IO (Either IOException BS.ByteString)
+      pure (either (const Nothing) (Just . TE.decodeUtf8Lenient) result)
 
 -- | Resolve every launcher before any building starts, so a typo'd path is
 -- a configuration error now rather than a build failure after the whole

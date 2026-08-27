@@ -29,6 +29,8 @@ import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deR
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, rewriteEnv, rewritePlaceholders, scrubAmbient, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
+import Nix.Config (NixConfig (..))
+import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm, toATermForHash)
 import Nix.Eval (FetchCache (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, fetchCacheKey, force, mkStr, readThunkValue, runPureEval)
@@ -3083,9 +3085,9 @@ testSubstituter = do
   sequence
     [ -- sortCaches: priority ordering
       runTest "sortCaches priority ordering" $
-        let c1 = Subst.CacheConfig "https://a.example.com" "key-a" 40
-            c2 = Subst.CacheConfig "https://b.example.com" "key-b" 10
-            c3 = Subst.CacheConfig "https://c.example.com" "key-c" 30
+        let c1 = Subst.CacheConfig "https://a.example.com" ["key-a"] 40
+            c2 = Subst.CacheConfig "https://b.example.com" ["key-b"] 10
+            c3 = Subst.CacheConfig "https://c.example.com" ["key-c"] 30
             sorted = Subst.sortCaches [c1, c2, c3]
          in case sorted of
               [s1, s2, s3] ->
@@ -4058,7 +4060,7 @@ testSubstituter = do
           other -> Fail ("unpackAndVerify failed: " <> T.pack (show other))
     ]
   where
-    chainCache url = Subst.CacheConfig url "unused-key" 10
+    chainCache url = Subst.CacheConfig url ["unused-key"] 10
     -- A real held lock for tests that construct 'SubstSuccess' by hand:
     -- the constructor carries the path's lock, so a fabricated success
     -- needs a genuine one, taken in a scratch directory.
@@ -4455,7 +4457,7 @@ testPathLocks = do
   where
     -- Never contacted when the already-valid short-circuit holds; a
     -- regression that reaches for the network fails loudly here.
-    unreachableCache = Subst.CacheConfig "http://127.0.0.1:9" "unused-key" 10
+    unreachableCache = Subst.CacheConfig "http://127.0.0.1:9" ["unused-key"] 10
     lockTestNarInfo sp rawNar =
       NarInfo.NarInfo
         { NarInfo.niStorePath = storePathToText defaultStoreDir sp,
@@ -4556,7 +4558,7 @@ testBuildOrchestrator = do
               (rewriteEnv rewrite env),
       -- BuildConfig with caches
       runTest "BuildConfig accepts caches" $
-        let cache = Subst.CacheConfig "https://cache.example.com" "key" 10
+        let cache = Subst.CacheConfig "https://cache.example.com" ["key"] 10
             config = (defaultBuildConfig defaultStoreDir) {bcCaches = [cache]}
          in assertEqual "one-cache" 1 (length (bcCaches config)),
       -- buildWithDeps on a simple derivation (no deps, builder fails but graph resolves)
@@ -10610,7 +10612,7 @@ sigTestCache :: Text -> Subst.CacheConfig
 sigTestCache publicKeyText =
   Subst.CacheConfig
     { Subst.ccUrl = "http://localhost/test-cache",
-      Subst.ccPublicKey = publicKeyText,
+      Subst.ccPublicKeys = [publicKeyText],
       Subst.ccPriority = 40
     }
 
@@ -10656,8 +10658,63 @@ testVerifySigs = do
           runTest "signature under a different key name rejected" $
             assertLeft "name mismatch" (Subst.verifySigs cache sigTestNarInfo {NarInfo.niSigs = ["other-key:" <> T.drop (T.length "test-key-1:") validSig]}),
           runTest "malformed trusted public key rejected" $
-            assertLeft "bad pubkey" (Subst.verifySigs (sigTestCache "not-a-key") sigTestNarInfo {NarInfo.niSigs = [validSig]})
+            assertLeft "bad pubkey" (Subst.verifySigs (sigTestCache "not-a-key") sigTestNarInfo {NarInfo.niSigs = [validSig]}),
+          -- The flat trusted-key set: a signature valid under ANY of
+          -- several trusted keys is accepted, even when the matching key
+          -- is not first.
+          runTest "a signature valid under any of several trusted keys is accepted" $
+            let multiKey = cache {Subst.ccPublicKeys = Subst.ccPublicKeys Subst.defaultCacheConfig ++ Subst.ccPublicKeys cache}
+             in assertEqual "any-of" (Right ()) (Subst.verifySigs multiKey sigTestNarInfo {NarInfo.niSigs = [validSig]}),
+          runTest "a signature matching none of several trusted keys is rejected" $
+            let multiKey = cache {Subst.ccPublicKeys = ["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=", "other.cache-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="]}
+             in assertLeft "none-of" (Subst.verifySigs multiKey sigTestNarInfo {NarInfo.niSigs = [validSig]}),
+          -- A malformed key anywhere in the set is an error, not a
+          -- silently skipped key: a typo must not quietly narrow the
+          -- trusted set to the keys that happened to parse.
+          runTest "a malformed key among valid ones is an error, not skipped" $
+            let multiKey = cache {Subst.ccPublicKeys = "not-a-key" : Subst.ccPublicKeys cache}
+             in assertLeft "typo not skipped" (Subst.verifySigs multiKey sigTestNarInfo {NarInfo.niSigs = [validSig]})
         ]
+
+-- | The nix.conf / NIX_CONFIG resolver: parsing, aliases, the extra-
+-- append rule, and the precedence fold.  The trusted-key cases are the
+-- security-relevant ones, a plain assignment in a higher source replaces
+-- the trusted set, an extra- widens it.
+testNixConfig :: IO [Bool]
+testNixConfig = do
+  putStrLn "config/nix-conf"
+  let subs = fmap ncSubstituters . Config.resolveConfig
+      keys = fmap ncTrustedPublicKeys . Config.resolveConfig
+  sequence
+    [ runTest "parses a whitespace-split substituters list" $
+        assertEqual "subs" (Right ["https://a", "https://b"]) (subs ["substituters = https://a https://b"]),
+      runTest "a comment truncates the line" $
+        assertEqual "comment" (Right ["https://a"]) (subs ["substituters = https://a # not https://b"]),
+      runTest "a plain assignment replaces across sources" $
+        assertEqual "replace" (Right ["https://b"]) (subs ["substituters = https://a", "substituters = https://b"]),
+      runTest "extra- appends within a source set" $
+        assertEqual "append" (Right ["https://a", "https://b"]) (subs ["substituters = https://a", "extra-substituters = https://b"]),
+      runTest "binary-caches aliases substituters" $
+        assertEqual "alias" (Right ["https://a"]) (subs ["binary-caches = https://a"]),
+      runTest "extra- composes with an alias" $
+        assertEqual "extra-alias" (Right ["https://a", "https://b"]) (subs ["substituters = https://a", "extra-binary-caches = https://b"]),
+      runTest "binary-cache-public-keys aliases trusted-public-keys" $
+        assertEqual "key-alias" (Right ["k1"]) (keys ["binary-cache-public-keys = k1"]),
+      runTest "a higher source plainly replaces the trusted set" $
+        assertEqual "trust-replace" (Right ["k2"]) (keys ["trusted-public-keys = k1", "trusted-public-keys = k2"]),
+      runTest "a higher source with extra- widens the trusted set" $
+        assertEqual "trust-widen" (Right ["k1", "k2"]) (keys ["trusted-public-keys = k1", "extra-trusted-public-keys = k2"]),
+      runTest "an unknown setting is ignored, not an error" $
+        assertEqual "unknown" (Right ["https://a"]) (subs ["cores = 4\nsubstituters = https://a"]),
+      runTest "blank and comment-only lines are skipped" $
+        assertEqual "blanks" (Right ["https://a"]) (subs ["# a comment\n\nsubstituters = https://a\n"]),
+      runTest "a line missing = is a syntax error" $
+        assertLeft "syntax" (Config.resolveConfig ["substituters https://a"]),
+      runTest "an include directive is refused" $
+        assertLeft "include" (Config.resolveConfig ["include /etc/nix/other.conf"]),
+      runTest "the default config is empty" $
+        assertEqual "default" (Right []) (subs [])
+    ]
 
 -- | Narinfo field validation gates the pipeline ahead of the signed
 -- fingerprint: a malformed field must fail as a parse error before its
@@ -10945,6 +11002,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testExecBit,
           testVerifySigs,
           testNarInfoValidation,
+          testNixConfig,
           testPushPure,
           testPushClosureIO,
           testBuildOrchestrator,

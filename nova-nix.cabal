@@ -87,6 +87,7 @@ library
     Nix.Builder
     Nix.Builder.Unpack
     Nix.Compression
+    Nix.Config
     Nix.Push
     Nix.Substituter
     Nix.Builtins
