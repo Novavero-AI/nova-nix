@@ -4134,13 +4134,12 @@ testSubstituter = do
     -- The executable bit only where the platform can round-trip it
     -- from disk - Windows cannot, the same constraint the NAR spec
     -- vectors note, until #35 gives it a real model.  The symlink
-    -- target nests only off Windows: separator-bearing targets do not
-    -- round-trip Windows disk serialisation (#112 tracks the fix, and
-    -- lifting this split is its undo).
+    -- target is nested on every platform now: nova-cache 0.11.1.1
+    -- normalises a Windows reparse point's separators back to the
+    -- POSIX spelling at the NAR boundary (#112), so bin/tool round-trips
+    -- disk serialisation on Windows too.
     streamTestExec = SI.os /= "mingw32"
-    streamTestLinkTarget
-      | SI.os == "mingw32" = "Makefile"
-      | otherwise = "bin/tool"
+    streamTestLinkTarget = "bin/tool"
     streamTestNar =
       NAR.serialise
         ( NAR.NarDirectory
