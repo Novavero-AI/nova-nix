@@ -122,8 +122,11 @@ import qualified System.Directory as Dir
 data CacheConfig = CacheConfig
   { -- | Base URL of the cache (e.g. @https:\/\/cache.novavero.ai@).
     ccUrl :: !Text,
-    -- | Trusted public key for signature verification (@name:base64key@).
-    ccPublicKey :: !Text,
+    -- | Trusted public keys (@name:base64key@).  A narinfo is accepted
+    -- when ANY of them verifies a signature, matching upstream's flat
+    -- @trusted-public-keys@ set: the keys are not bound to a particular
+    -- substituter, and one signed by any trusted key is enough.
+    ccPublicKeys :: ![Text],
     -- | Priority (lower = checked first). cache.nixos.org is 40.
     ccPriority :: !Int
   }
@@ -134,7 +137,7 @@ defaultCacheConfig :: CacheConfig
 defaultCacheConfig =
   CacheConfig
     { ccUrl = "https://cache.nixos.org",
-      ccPublicKey = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+      ccPublicKeys = ["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="],
       ccPriority = 40
     }
 
@@ -920,20 +923,24 @@ bzip2Failure bzip2Err = case bzip2Err of
 sortCaches :: [CacheConfig] -> [CacheConfig]
 sortCaches = sortBy (comparing ccPriority)
 
--- | Verify narinfo signatures against the cache's trusted public key.
--- At least one signature must match.
+-- | Verify narinfo signatures against the cache's trusted public keys.
+-- Accepts when at least one signature verifies under at least one key,
+-- upstream's any-trusted-key rule.  A malformed key is an error rather
+-- than a silently skipped one: upstream rejects the configuration, so a
+-- typo cannot quietly narrow the trusted set to the keys that parsed.
 verifySigs :: CacheConfig -> NarInfo.NarInfo -> Either Text ()
 verifySigs cache narInfo =
-  case Signing.parsePublicKey (ccPublicKey cache) of
-    Left err -> Left ("invalid public key: " <> T.pack err)
-    Right pubKey ->
-      let sigs = NarInfo.niSigs narInfo
-       in if null sigs
-            then Left "narinfo has no signatures"
-            else
-              if any (Signing.verify pubKey narInfo) sigs
-                then Right ()
-                else Left "no valid signature found"
+  case NarInfo.niSigs narInfo of
+    [] -> Left "narinfo has no signatures"
+    sigs -> do
+      keys <- traverse parseKey (ccPublicKeys cache)
+      if any (\key -> any (Signing.verify key narInfo) sigs) keys
+        then Right ()
+        else Left "no valid signature found"
+  where
+    parseKey raw = case Signing.parsePublicKey raw of
+      Left err -> Left ("invalid public key: " <> T.pack err)
+      Right pubKey -> Right pubKey
 
 -- | The whole-buffer decompressor for a narinfo @Compression@ value,
 -- decided from the narinfo's declared values alone so unsupported
