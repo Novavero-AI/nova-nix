@@ -24,9 +24,11 @@
 -- namespace isolation.  We use 'System.Process.createProcess' which maps
 -- to @CreateProcess@ on Windows - native, no POSIX layer.
 --
--- For now, builds run without sandboxing (same as Nix on macOS did for
--- years).  Future work: Windows Job Objects for resource limits,
--- App Containers for filesystem isolation.
+-- The builder's process tree runs inside a Win32 job object with
+-- kill-on-job-close ('Proc.use_process_jobs'), so an interrupt or a
+-- builder exit reaps grandchildren instead of orphaning them.  Filesystem
+-- and privilege isolation are still future work: a restricted token with a
+-- store-granting ACL (the security boundary), then AppContainer for more.
 --
 -- We ship @bash.exe@ (from MSYS2) as the default builder on Windows.
 -- Same approach as Git for Windows.
@@ -820,7 +822,19 @@ runBuilder builderPath builderArgs buildEnv impureVars workDir = do
           { Proc.cwd = Just workDir,
             Proc.env = Just envList,
             Proc.std_out = Proc.CreatePipe,
-            Proc.std_err = Proc.CreatePipe
+            Proc.std_err = Proc.CreatePipe,
+            -- Wrap the builder's whole process tree in a Win32 job with
+            -- kill-on-job-close.  Without it, a builder's grandchildren
+            -- (bash -> make -> cc, or anything cmd.exe spawns) outlive an
+            -- interrupt: terminateProcess reaches only the direct child,
+            -- so the tree is orphaned and keeps running.  With the job,
+            -- terminateProcess becomes TerminateJobObject and reaps the
+            -- tree, and waitForProcess waits for all of it.  Ignored on
+            -- POSIX, where a process group already scopes the children.
+            -- A deliberately daemonizing grandchild changes from leaking
+            -- to blocking the build until it exits; that is the correct
+            -- trade for a build, which owns everything it spawned.
+            Proc.use_process_jobs = True
           }
   (exitCode, _stdout, stderrText) <- Proc.readCreateProcessWithExitCode cp ""
   case exitCode of
