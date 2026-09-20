@@ -17,7 +17,7 @@ in
   order = assert (fetchurl { inherit urls sha256; }).urls == urls; true;
   invalidUrls = assert builtins.all
     (invalid: rejects { inherit sha256; urls = invalid; })
-    [ [ ] url [ "" ] [ url 1 ] [ "https://example.org/has space" ] [ "https://example.org/has\nnewline" ] ];
+    [ [ ] url [ "" ] [ url 1 ] [ "https://example.org/has space" ] [ "https://example.org/has\nnewline" ] [ "https://example.org/one\ntwo\nthree" ] [ "https://example.org/one\r\ntwo" ] ];
     true;
   invalidHashes = assert builtins.all rejects [
     { inherit urls; }
@@ -32,4 +32,11 @@ in
     url = "https://example.org/has%20space";
     inherit sha256;
   }).outPath; true;
+  unicodeUrl =
+    let
+      unicode = builtins.fromJSON "\"https://example.org/has\\u00a0space\"";
+      expected = upstream { name = "unicode-url"; url = unicode; inherit sha256; };
+    in
+    assert (fetchurl { name = "unicode-url"; urls = [ unicode ]; inherit sha256; }).outPath == expected.outPath;
+    true;
 }

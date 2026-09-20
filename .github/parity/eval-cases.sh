@@ -95,7 +95,7 @@ check "map over a list" 'builtins.map (x: x * x) [ 1 2 3 ]'
 echo
 
 echo "== Nova's mirror interface preserves fixed-output identity =="
-for caseName in legacy sha256 sri order invalidUrls invalidHashes escapedUrl; do
+for caseName in legacy sha256 sri order invalidUrls invalidHashes escapedUrl unicodeUrl; do
   check "fetchurl $caseName" "(import ./fetchurl-cases.nix).$caseName"
 done
 echo

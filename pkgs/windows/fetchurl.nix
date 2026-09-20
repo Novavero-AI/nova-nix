@@ -15,9 +15,9 @@ else
     if
       !(builtins.isList urls)
       || urls == [ ]
-      || !(builtins.all (url: builtins.isString url && url != "" && builtins.match ".*[[:space:]].*" url == null) urls)
+      || !(builtins.all (url: builtins.isString url && builtins.match "[^[:space:]]+" url != null) urls)
     then
-      throw "fetchurl: urls must be a non-empty list of non-empty strings without whitespace"
+      throw "fetchurl: urls must be a non-empty list of non-empty strings without ASCII whitespace"
     else if (sha256 == "") == (hash == "") then
       throw "fetchurl: provide exactly one of sha256 or hash"
     else
