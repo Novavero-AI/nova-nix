@@ -6690,6 +6690,12 @@ testFetchMirrors = do
           "urls"
           (Right ("https://a" :| ["https://b"]))
           (fetchUrlsFromEnv (Map.fromList [("url", "https://ignored"), ("urls", "  https://a\t https://b\n")])),
+      runTest "fetch URLs preserve non-ASCII whitespace within a URL" $
+        let url = "https://a/has\xA0space"
+         in assertEqual
+              "non-ASCII URL"
+              (Right (url :| ["https://b"]))
+              (fetchUrlsFromEnv (Map.singleton "urls" (TE.encodeUtf8 (url <> " https://b")))),
       runTest "fetch URLs reject missing, empty and invalid UTF-8 inputs" $
         assertEqual
           "invalid"

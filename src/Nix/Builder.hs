@@ -61,7 +61,7 @@ import Control.Exception (IOException, SomeException, displayException, finally,
 import Control.Monad (filterM, unless, when)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
-import Data.Char (toLower, toUpper)
+import Data.Char (isAscii, isSpace, toLower, toUpper)
 import Data.Either (fromRight)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -929,20 +929,23 @@ runBuiltinFetchurl drv outputDirs =
         Left err -> Left ("builtin:fetchurl: " <> err)
         Right digest -> first snd (verifyFetchedDigest url out digest)
 
--- | Nova's mirror extension uses the whitespace-separated @urls@ field.
+-- | Nova's mirror extension uses the ASCII-whitespace-separated @urls@ field.
 -- An absent field preserves the legacy single @url@ interface. An explicit
 -- empty or malformed list is an error, rather than a silent fallback.
 fetchUrlsFromEnv :: Map Text BS.ByteString -> Either Text (NonEmpty Text)
 fetchUrlsFromEnv env = case Map.lookup envUrls env of
   Just bytes -> do
     text <- decode envUrls bytes
-    maybe (Left "'urls' is empty") Right (NE.nonEmpty (T.words text))
+    maybe (Left "'urls' is empty") Right (NE.nonEmpty (filter (not . T.null) (T.split separator text)))
   Nothing -> case Map.lookup envUrl env of
     Nothing -> Left "derivation has no 'url' or 'urls'"
     Just bytes -> do
       url <- decode envUrl bytes
       if T.null url then Left "'url' is empty" else Right (url :| [])
   where
+    -- Match the fetcher expression's POSIX space class, preserving non-ASCII
+    -- URL characters that 'T.words' would otherwise split into new candidates.
+    separator char = isAscii char && isSpace char
     decode field = first (const ("'" <> field <> "' contains invalid UTF-8")) . TE.decodeUtf8'
 
 -- | Ordered fallback policy, independent of HTTP and files. Only the first
