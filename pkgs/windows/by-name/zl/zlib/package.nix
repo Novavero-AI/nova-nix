@@ -10,7 +10,10 @@
 stdenv.mkDerivation {
   name = "zlib";
   src = fetchurl {
-    url = "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz";
+    urls = [
+      "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz"
+      "https://zlib.net/fossils/zlib-1.3.2.tar.gz"
+    ];
     sha256 = "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16";
   };
   dontConfigure = true;

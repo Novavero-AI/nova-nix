@@ -52,17 +52,22 @@ module Nix.Builder
     scrubAmbient,
     unionEnvs,
     verifyFetchHash,
+    fetchUrlsFromEnv,
+    tryFetchUrlsWith,
   )
 where
 
 import Control.Exception (IOException, SomeException, displayException, finally, onException, try)
 import Control.Monad (filterM, unless, when)
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Data.Char (toLower, toUpper)
 import Data.Either (fromRight)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
+import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, isJust)
@@ -156,8 +161,9 @@ builtinFetchurlBuilder :: BS.ByteString
 builtinFetchurlBuilder = "builtin:fetchurl"
 
 -- | Derivation environment keys read by @builtin:fetchurl@.
-envUrl, envOut :: Text
+envUrl, envUrls, envOut :: Text
 envUrl = "url"
+envUrls = "urls"
 envOut = "out"
 
 -- | HTTP success status code.
@@ -885,56 +891,89 @@ isWindows = System.Info.os == "mingw32"
 -- Built-in fetcher (builtin:fetchurl)
 -- ---------------------------------------------------------------------------
 
--- | Run a @builtin:fetchurl@ derivation: download its @url@ into @$out@ and
--- verify the bytes against the derivation's @outputHash@.  Nix's bootstrap
+-- | Run a @builtin:fetchurl@ derivation: try URLs in order and verify the
+-- written bytes against the derivation's @outputHash@. Nix's bootstrap
 -- fetcher is baked into the binary because nothing can be fetched before a
 -- fetcher exists.  Returns the same @Either (exit, msg) ()@ shape as
 -- 'runBuilder', so the shared output-registration path is reused unchanged.
 runBuiltinFetchurl :: Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
 runBuiltinFetchurl drv outputDirs =
-  case (Map.lookup envUrl (drvEnv drv), lookup envOut outputDirs, fixedOutput) of
-    (Nothing, _, _) -> pure (Left (1, "builtin:fetchurl: derivation has no 'url'"))
+  case (fetchUrlsFromEnv (drvEnv drv), lookup envOut outputDirs, fixedOutput) of
+    (Left err, _, _) -> pure (Left (1, "builtin:fetchurl: " <> err))
     (_, Nothing, _) -> pure (Left (1, "builtin:fetchurl: derivation defines no 'out' output"))
     (_, _, Nothing) -> pure (Left (1, "builtin:fetchurl: 'out' output has no fixed-output hash"))
-    (Just urlBytes, Just outPath, Just out) -> case TE.decodeUtf8' urlBytes of
-      Left _ -> pure (Left (1, "builtin:fetchurl: 'url' contains invalid UTF-8"))
-      Right url
-        -- Mode and algorithm reject before any network traffic.
-        | recursive -> pure (Left (1, recursiveUnsupportedMessage))
-        | otherwise -> case hashInitWithAlgo algo of
-            Nothing ->
-              pure (Left (1, "builtin:fetchurl: unsupported hash algorithm '" <> algo <> "'"))
-            Just ctx -> do
-              downloaded <- downloadUrlTo url outPath ctx
-              case downloaded of
-                Left err -> pure (Left (1, "builtin:fetchurl: " <> err))
-                Right digest -> pure (verifyFetchedDigest url out digest)
-        where
-          (recursive, algo) = splitHashMode (doHashAlgo out)
+    (Right urls@(firstUrl :| _), Just outPath, Just out)
+      -- Invalid specifications reject before any network traffic.
+      | recursive -> pure (Left (1, recursiveUnsupportedMessage))
+      | Nothing <- hexToBytes (doHash out) ->
+          pure (Left (1, malformedExpectedHash firstUrl))
+      | otherwise -> case hashInitWithAlgo algo of
+          Nothing ->
+            pure (Left (1, "builtin:fetchurl: unsupported hash algorithm '" <> algo <> "'"))
+          Just ctx -> do
+            result <- tryFetchUrlsWith (fetchAndVerify outPath out ctx) urls
+            pure $ case result of
+              Left err -> Left (1, err)
+              Right value -> Right value
+      where
+        (recursive, algo) = splitHashMode (doHashAlgo out)
   where
     -- builtin:fetchurl derivations are always fixed-output; the expected hash
     -- lives in the canonical output spec (doHashAlgo + doHash), not the env.
     fixedOutput = case drvOutputs drv of
       (out : _) | not (T.null (doHashAlgo out)) -> Just out
       _ -> Nothing
+    fetchAndVerify outPath out ctx url = do
+      downloaded <- downloadUrlTo url outPath ctx
+      pure $ case downloaded of
+        Left err -> Left ("builtin:fetchurl: " <> err)
+        Right digest -> first snd (verifyFetchedDigest url out digest)
+
+-- | Nova's mirror extension uses the whitespace-separated @urls@ field.
+-- An absent field preserves the legacy single @url@ interface. An explicit
+-- empty or malformed list is an error, rather than a silent fallback.
+fetchUrlsFromEnv :: Map Text BS.ByteString -> Either Text (NonEmpty Text)
+fetchUrlsFromEnv env = case Map.lookup envUrls env of
+  Just bytes -> do
+    text <- decode envUrls bytes
+    maybe (Left "'urls' is empty") Right (NE.nonEmpty (T.words text))
+  Nothing -> case Map.lookup envUrl env of
+    Nothing -> Left "derivation has no 'url' or 'urls'"
+    Just bytes -> do
+      url <- decode envUrl bytes
+      if T.null url then Left "'url' is empty" else Right (url :| [])
+  where
+    decode field = first (const ("'" <> field <> "' contains invalid UTF-8")) . TE.decodeUtf8'
+
+-- | Ordered fallback policy, independent of HTTP and files. Only the first
+-- successful /verified/ attempt wins; report every failure if none wins.
+-- Exceptions propagate, so cancellation cannot start another download.
+tryFetchUrlsWith :: (Monad m) => (Text -> m (Either Text a)) -> NonEmpty Text -> m (Either Text a)
+tryFetchUrlsWith attempt = go []
+  where
+    go !failures (url :| rest) = do
+      result <- attempt url
+      case result of
+        Right value -> pure (Right value)
+        Left err -> case NE.nonEmpty rest of
+          Nothing -> pure (Left (T.intercalate "\n" (reverse (err : failures))))
+          Just urls -> go (err : failures) urls
 
 -- | Download a URL to a file using nova-nix's own linked HTTP client
 -- (the same 'Network.HTTP.Client' the substituter uses) - no external
 -- @curl@, which is what makes this a genuine builtin.  The body streams
 -- to disk through the incremental hash chunk by chunk, so memory stays
 -- at chunk size no matter the download's size, and the returned digest
--- is of exactly the written bytes.  Any network exception is turned
--- into a 'Left' so it becomes a clean build failure.
+-- is of exactly the written bytes. Synchronous exceptions become a 'Left';
+-- cancellation propagates through the shared build cleanup. Every attempt
+-- opens the output in WriteMode and starts from the original hash context.
 downloadUrlTo :: Text -> FilePath -> IncrementalHash -> IO (Either Text BS.ByteString)
-downloadUrlTo url outPath ctx0 = do
-  attempt <- try fetch
-  pure $ case attempt of
-    Left (e :: SomeException) -> Left ("download error: " <> T.pack (show e))
-    Right result -> result
+downloadUrlTo url outPath ctx0 =
+  fetch `catchSync` \err -> pure (Left ("download error: " <> T.pack (show err)))
   where
     fetch :: IO (Either Text BS.ByteString)
     fetch = do
-      manager <- HTTP.newManager HTTPS.tlsManagerSettings
+      manager <- HTTPS.getGlobalManager
       request0 <- HTTP.parseRequest (T.unpack url)
       let request = request0 {HTTP.requestHeaders = ("User-Agent", fetchUserAgent) : HTTP.requestHeaders request0}
       HTTP.withResponse request manager $ \response -> do

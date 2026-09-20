@@ -453,10 +453,10 @@ jobs:
   # substitute into a second fresh store with signature verification on,
   # and NAR-compare the two trees - plus the memory gate: a
   # multi-hundred-MB path substitutes under a hard +RTS -M cap, so any
-  # reintroduced whole-archive retention aborts the job.  The unit suite
-  # never opens a socket, so this is the only coverage of the HTTP
-  # surface (chunked transfer, connection reuse, the signing handshake)
-  # and of the nova-nix/nova-cache two-repo interop.
+  # reintroduced whole-archive retention aborts the job. The unit suite's
+  # loopback fixtures cover fetch integrity; this exercises a real cache's
+  # HTTP surface (chunked transfer, connection reuse, signing handshake)
+  # and the nova-nix/nova-cache two-repo interop.
   # ---------------------------------------------------------------------------
 
   e2e-loop:

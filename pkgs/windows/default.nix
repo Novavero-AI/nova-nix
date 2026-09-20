@@ -49,7 +49,7 @@ let
     inherit lib;
 
     stdenv = import ./stdenv;
-    fetchurl = import <nix/fetchurl.nix>;
+    fetchurl = import ./fetchurl.nix;
   };
 in
 self
