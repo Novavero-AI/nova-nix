@@ -314,6 +314,7 @@ jobs:
         run: cabal build --enable-tests --ghc-options="-Werror"
 
       - name: Test
+        timeout-minutes: 15
         run: cabal test
 
       # A released binary is a copied binary, and Cabal's datadir is baked in
