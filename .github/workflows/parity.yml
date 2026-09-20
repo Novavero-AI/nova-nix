@@ -15,32 +15,24 @@ on:
   # Reusable: the publish workflow runs this on the exact tagged commit,
   # so nothing reaches Hackage without the drvPath oracle passing there.
   workflow_call:
-  # Regression guard: run on main pushes and PRs, but only when code that can
-  # affect the computed drvPath changes - doc-only changes skip it.
+  # Always report, including documentation-only PRs and the merge queue.
+  # The oracle inputs below are fixed, so upstream churn cannot change the
+  # meaning of this gate between two runs of the same commit.
   push:
     branches: [main]
-    paths:
-      - "src/**"
-      - "cbits/**"
-      - "data/**"
-      - "nova-nix.cabal"
-      - ".github/workflows/parity.yml"
-      - ".github/parity/**"
-  # No base-branch filter: stacked PRs base on each other, and a filter
-  # keeps them checkless (see ci.yml).  The path filter still applies.
   pull_request:
-    paths:
-      - "src/**"
-      - "cbits/**"
-      - "data/**"
-      - "nova-nix.cabal"
-      - ".github/workflows/parity.yml"
-      - ".github/parity/**"
-
+  merge_group:
+    types: [checks_requested]
 
 # Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
 permissions:
   contents: read
+
+# Preserve the oracle from the last passing main run (33095182332).
+# Bump these deliberately, independently of changes to the evaluator.
+env:
+  NIX_VERSION: "2.24.9"
+  NIXPKGS_REV: "50ab793786d9de88ee30ec4e4c24fb4236fc2674"
 
 jobs:
   parity:
@@ -51,6 +43,16 @@ jobs:
 
       - name: Install Nix
         uses: cachix/install-nix-action@v30
+        with:
+          install_url: https://releases.nixos.org/nix/nix-${{ env.NIX_VERSION }}/install
+
+      - name: Verify the oracle version
+        run: |
+          set -euo pipefail
+          actual=$(nix-instantiate --version)
+          expected="nix-instantiate (Nix) $NIX_VERSION"
+          echo "$actual"
+          [ "$actual" = "$expected" ] || { echo "expected $expected" >&2; exit 1; }
 
       - uses: haskell-actions/setup@v2
         id: setup
@@ -65,11 +67,34 @@ jobs:
           key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
           restore-keys: cabal-Linux-
 
-      - name: Fetch nixpkgs (both evaluators read this same tree)
+      - name: Cache the pinned nixpkgs tree
+        id: nixpkgs-cache
+        uses: actions/cache@v5
+        with:
+          path: nixpkgs-ref
+          key: parity-nixpkgs-${{ runner.os }}-${{ env.NIXPKGS_REV }}
+
+      - name: Fetch the pinned nixpkgs tree
+        if: steps.nixpkgs-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch nixos-24.11 https://github.com/NixOS/nixpkgs nixpkgs-ref
+          set -euo pipefail
+          git init nixpkgs-ref
+          git -C nixpkgs-ref remote add origin https://github.com/NixOS/nixpkgs
+          git -C nixpkgs-ref fetch --depth 1 origin "$NIXPKGS_REV"
+          git -C nixpkgs-ref checkout --detach FETCH_HEAD
+
+      # Validate cache hits too; neither evaluator may silently use another
+      # revision or a modified tracked file from a restored tree.
+      - name: Verify nixpkgs (both evaluators read this same tree)
+        run: |
+          set -euo pipefail
+          actual=$(git -C nixpkgs-ref rev-parse HEAD)
+          echo "nixpkgs rev: $actual"
+          [ "$actual" = "$NIXPKGS_REV" ] || { echo "unexpected nixpkgs revision" >&2; exit 1; }
+          git -C nixpkgs-ref diff --exit-code HEAD --
+          [ -z "$(git -C nixpkgs-ref ls-files --others --exclude-standard)" ] \
+            || { echo "unexpected untracked files in nixpkgs" >&2; exit 1; }
           echo "NIXPKGS=$PWD/nixpkgs-ref" >> "$GITHUB_ENV"
-          echo "nixpkgs rev: $(git -C nixpkgs-ref rev-parse HEAD)"
 
       - name: Upstream Nix drvPath (the oracle)
         run: |
