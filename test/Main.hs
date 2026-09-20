@@ -6734,7 +6734,7 @@ testFetchMirrors = do
       runTestM "cancelling a download releases its lock and does not try another mirror" $
         withFetchurlServer $ \base requests requested ->
           withStore "cancel" $ \store config sp -> do
-            let drv = fixtureDrv sp (Map.singleton "urls" (TE.encodeUtf8 (base <> "/stall " <> base <> "/good")))
+            let drv = fixtureDrv sp (Map.singleton "urls" (TE.encodeUtf8 (base <> "/slow " <> base <> "/good")))
             outcome <- timeout 10000000 $
               withAsync (buildDerivation config store drv) $ \worker -> do
                 requested
@@ -6746,7 +6746,7 @@ testFetchMirrors = do
             lock <- tryAcquirePathLock (stDir store) sp
             mapM_ releasePathLock lock
             pure $ case outcome of
-              Just (Left _) | seen == ["/stall"] && not valid && not present && isJust lock -> Pass
+              Just (Left _) | seen == ["/slow"] && not valid && not present && isJust lock -> Pass
               _ -> Fail ("cancellation failed: " <> T.pack (show (outcome, seen, valid, present, isJust lock)))
     ]
   where
