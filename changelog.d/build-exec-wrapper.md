@@ -1,0 +1,1 @@
+- **`build` accepts `--exec-wrapper` before or after its target.** The launcher option previously worked only before the `build` subcommand; after it, the CLI rejected the option as an unknown build flag. Repeated options accumulate across both positions and retain the existing duplicate-system and launcher validation.
