@@ -67,7 +67,7 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Zstd as CZstd
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
-import System.Environment (lookupEnv, setEnv, unsetEnv)
+import System.Environment (getEnvironment, lookupEnv, setEnv, unsetEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
@@ -9093,6 +9093,70 @@ testE2E = do
             Fail ("nova-nix eval failed (" <> T.pack (show code) <> "): stderr=" <> T.pack stderrStr)
     ]
 
+-- | Exercise the real CLI: testing 'execWrapperConfig' alone cannot catch
+-- a sub-parser that never passes the option to it. The foreign builder is
+-- deliberately "-c", so only launching it through the shell can succeed.
+testExecWrapperCLI :: IO [Bool]
+testExecWrapperCLI = do
+  putStrLn "cli/exec-wrapper"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-wrapper"
+      system = platformToText (if currentPlatform == X86_64_Windows then X86_64_Linux else X86_64_Windows)
+      wrapper = ["--exec-wrapper", T.unpack (system <> "=" <> shell)]
+      otherWrapper = ["--exec-wrapper", T.unpack (platformToText currentPlatform <> "=" <> shell)]
+      source =
+        "derivation { name = \"cli-wrapper\"; system = \""
+          <> T.unpack system
+          <> "\"; builder = \"-c\"; args = [\"printf wrapped > \\\"$out\\\"\"]; }"
+      target = ["--expr", source]
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+      runCLI args =
+        Proc.readCreateProcessWithExitCode
+          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ""
+      buildCases =
+        [ ("before build", wrapper ++ ["build"] ++ target),
+          ("before target", ["build"] ++ wrapper ++ target),
+          ("after target", ["build"] ++ target ++ wrapper),
+          ("repeated across build", otherWrapper ++ ["build"] ++ target ++ wrapper)
+        ]
+      errorCases =
+        [ ("missing value", ["build"] ++ target ++ ["--exec-wrapper"], "--exec-wrapper requires a value"),
+          ("malformed spec", ["build"] ++ target ++ ["--exec-wrapper", "invalid"], "--exec-wrapper expects SYSTEM=PATH, got: invalid"),
+          ("duplicate system", wrapper ++ ["build"] ++ target ++ wrapper, "--exec-wrapper names " <> system <> " twice"),
+          ("missing launcher", ["build"] ++ target ++ ["--exec-wrapper", T.unpack system ++ "=" ++ (root </> "missing-launcher")], "does not exist")
+        ]
+  bracket_
+    (forceRemoveIfExists root >> createDirectoryIfMissing True root)
+    (forceRemoveIfExists root)
+    ( do
+        builds <-
+          mapM
+            ( \(label, args) -> runTestM ("CLI wrapper " <> label) $ do
+                (code, out, err) <- runCLI (args ++ ["--store", root </> T.unpack label])
+                case (code, reverse (filter (not . null) (lines out))) of
+                  (ExitSuccess, path : _) -> assertEqual "wrapped output" "wrapped" <$> BS.readFile path
+                  _ -> pure (Fail ("CLI failed: " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err))
+            )
+            buildCases
+        errors <-
+          mapM
+            ( \(label, args, expected) -> runTestM ("CLI wrapper " <> label) $ do
+                (code, _, err) <- runCLI args
+                pure $
+                  if code /= ExitSuccess && expected `T.isInfixOf` T.pack err
+                    then Pass
+                    else Fail ("expected failure containing " <> expected <> ", got " <> T.pack (show (code, err)))
+            )
+            errorCases
+        pure (builds ++ errors)
+    )
+
 -- ---------------------------------------------------------------------------
 -- Tests: Phase 4 - search paths, dynamic keys, directory import
 -- ---------------------------------------------------------------------------
@@ -11015,6 +11079,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testFromATerm,
           testBuilder,
           testE2E,
+          testExecWrapperCLI,
           testPhase4,
           testPhase4IO,
           testToJSONPathIO,
