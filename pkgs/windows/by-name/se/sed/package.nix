@@ -6,7 +6,11 @@
 stdenv.mkDerivation {
   name = "sed";
   src = fetchurl {
-    url = "https://mirrors.kernel.org/gnu/sed/sed-4.10.tar.xz";
+    urls = [
+      "https://mirrors.kernel.org/gnu/sed/sed-4.10.tar.xz"
+      "https://ftp.gnu.org/gnu/sed/sed-4.10.tar.xz"
+      "https://ftpmirror.gnu.org/sed/sed-4.10.tar.xz"
+    ];
     sha256 = "b8e72182b2ec96a3574e2998c47b7aaa64cc20ce000d8e9ac313cc07cecf28c7";
   };
 }

@@ -8,13 +8,15 @@ import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
-import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket_, evaluate, fromException, throwIO, try)
+import Control.Concurrent.Async (cancel, waitCatch, withAsync)
+import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, evaluate, fromException, throwIO, try)
 import Control.Monad (filterM, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (isPrefixOf, sort)
+import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe)
 import qualified Data.Set as Set
@@ -24,9 +26,10 @@ import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
 import qualified Database.SQLite.Simple as SQL
+import FetchurlFixture (withFetchurlServer)
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, rewriteEnv, rewritePlaceholders, scrubAmbient, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import Nix.Config (NixConfig (..))
@@ -6673,6 +6676,110 @@ testExecWrapper = do
           drvEnv = Map.empty
         }
 
+testFetchMirrors :: IO [Bool]
+testFetchMirrors = do
+  putStrLn "builder/fetch-mirrors"
+  sequence
+    [ runTest "fetch URLs preserve the legacy single URL" $
+        assertEqual
+          "url"
+          (Right ("https://a/file%20name" :| []))
+          (fetchUrlsFromEnv (Map.singleton "url" "https://a/file%20name")),
+      runTest "fetch URLs prefer the explicit ordered list" $
+        assertEqual
+          "urls"
+          (Right ("https://a" :| ["https://b"]))
+          (fetchUrlsFromEnv (Map.fromList [("url", "https://ignored"), ("urls", "  https://a\t https://b\n")])),
+      runTest "fetch URLs reject missing, empty and invalid UTF-8 inputs" $
+        assertEqual
+          "invalid"
+          (replicate 5 True)
+          ( map
+              (either (const True) (const False) . fetchUrlsFromEnv)
+              [Map.empty, Map.singleton "url" "", Map.fromList [("urls", " "), ("url", "https://ignored")], Map.singleton "url" (BS.pack [255]), Map.singleton "urls" (BS.pack [255])]
+          ),
+      runTestM "mirror policy retries timeout and hash failures in order" $ do
+        calls <- newIORef []
+        let attempt url = do
+              atomicModifyIORef' calls (\seen -> (seen ++ [url], ()))
+              pure $ case url of
+                "slow" -> Left "download timeout"
+                "corrupt" -> Left "hash mismatch"
+                _ -> Right ("verified" :: Text)
+        result <- tryFetchUrlsWith attempt ("slow" :| ["corrupt", "good", "unused"])
+        seen <- readIORef calls
+        pure (assertEqual "ordered attempts" (Right "verified", ["slow", "corrupt", "good"]) (result, seen)),
+      runTestM "mirror policy returns every failure in order" $ do
+        result <- tryFetchUrlsWith (pure . Left) ("first failure" :| ["second failure"])
+        pure (assertEqual "failures" (Left "first failure\nsecond failure" :: Either Text ()) result),
+      runTestM "mirror policy does not evaluate candidates after success" $ do
+        let attempt "good" = pure (Right "good")
+            attempt _ = fail "unused mirror attempted"
+        result <- tryFetchUrlsWith attempt ("good" :| ["unused"])
+        pure (assertEqual "first success" (Right "good" :: Either Text Text) result),
+      runTestM "HTTP mirrors verify hashes, truncate retries and stop on success" $
+        httpCase "fallback" False ["/missing", "/bad", "/partial", "/good", "/unused"] True ["/missing", "/bad", "/partial", "/good"],
+      runTestM "HTTP fetch retains single-url compatibility" $
+        httpCase "legacy" True ["/good"] True ["/good"],
+      runTestM "HTTP failure leaves no output or registration" $
+        httpCase "errors" False ["/error", "/missing"] False ["/error", "/missing"],
+      runTestM "hash failure leaves no corrupt output or registration" $
+        httpCase "corrupt" False ["/bad", "/partial"] False ["/bad", "/partial"],
+      runTestM "cancelling a download releases its lock and does not try another mirror" $
+        withFetchurlServer $ \base requests requested ->
+          withStore "cancel" $ \store config sp -> do
+            let drv = fixtureDrv sp (Map.singleton "urls" (TE.encodeUtf8 (base <> "/stall " <> base <> "/good")))
+            outcome <- timeout 10000000 $
+              withAsync (buildDerivation config store drv) $ \worker -> do
+                requested
+                cancel worker
+                waitCatch worker
+            seen <- requests
+            valid <- isValid store sp
+            present <- Dir.doesPathExist (storePathToFilePath (stDir store) sp)
+            lock <- tryAcquirePathLock (stDir store) sp
+            mapM_ releasePathLock lock
+            pure $ case outcome of
+              Just (Left _) | seen == ["/stall"] && not valid && not present && isJust lock -> Pass
+              _ -> Fail ("cancellation failed: " <> T.pack (show (outcome, seen, valid, present, isJust lock)))
+    ]
+  where
+    hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    withStore label action = do
+      tmpBase <- getTemporaryDirectory
+      let root = tmpBase </> ("nova-nix-test-mirrors-" ++ label)
+          dir = StoreDir (root </> "store")
+          config = (defaultBuildConfig dir) {bcTmpDir = root </> "build"}
+      sp <- either (fail . show) pure (makeFixedOutputPath "mirrors" "sha256" "flat" (sha256Digest "hello"))
+      bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
+        bracket (openStore dir) closeStore $
+          \store -> action store config sp
+    fixtureDrv sp env =
+      Derivation
+        { drvOutputs = [DerivationOutput "out" sp "sha256" hash],
+          drvInputDrvs = Map.empty,
+          drvInputSrcs = [],
+          drvPlatform = currentPlatform,
+          drvBuilder = "builtin:fetchurl",
+          drvArgs = [],
+          drvEnv = env
+        }
+    httpCase label legacy paths succeeds expectedRequests =
+      withFetchurlServer $ \base requests _ ->
+        withStore label $ \store config sp -> do
+          let urls = T.unwords (map (base <>) paths)
+              env = Map.singleton (if legacy then "url" else "urls") (TE.encodeUtf8 urls)
+          result <- buildDerivation config store (fixtureDrv sp env)
+          seen <- requests
+          valid <- isValid store sp
+          present <- Dir.doesPathExist (storePathToFilePath (stDir store) sp)
+          case result of
+            BuildSuccess _
+              | succeeds && valid && present && seen == expectedRequests ->
+                  assertEqual "verified output" "hello" <$> BS.readFile (storePathToFilePath (stDir store) sp)
+            BuildFailure msg _ | not succeeds && not valid && not present && seen == expectedRequests && not (T.null msg) -> pure Pass
+            _ -> pure (Fail (T.pack (show (result, seen, valid, present))))
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -11000,6 +11107,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testEvalFidelity,
           testUpstreamConformance,
           testHashHelpers,
+          testFetchMirrors,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,

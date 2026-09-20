@@ -177,6 +177,7 @@ test-suite nova-nix-test
   type:             exitcode-stdio-1.0
   main-is:          Main.hs
   hs-source-dirs:   test
+  other-modules:    FetchurlFixture
   default-language: Haskell2010
   default-extensions:
     OverloadedStrings
@@ -187,11 +188,13 @@ test-suite nova-nix-test
 
   build-depends:
       base                >= 4.22 && < 5
+    , async               >= 2.2 && < 2.3
     , bytestring          >= 0.11 && < 0.13
     , containers          >= 0.6 && < 0.9
     , directory           >= 1.3 && < 1.4
     , filepath            >= 1.4 && < 1.6
     , http-client         >= 0.7 && < 0.8
+    , network             >= 3.2 && < 3.3
     , nova-cache:{nova-cache, zstandard} >= 0.11.1.1 && < 0.12
     , nova-nix
     , process             >= 1.6 && < 1.7

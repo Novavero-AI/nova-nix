@@ -8,7 +8,11 @@
 stdenv.mkDerivation {
   name = "hello";
   src = fetchurl {
-    url = "https://mirrors.kernel.org/gnu/hello/hello-2.12.3.tar.gz";
+    urls = [
+      "https://mirrors.kernel.org/gnu/hello/hello-2.12.3.tar.gz"
+      "https://ftp.gnu.org/gnu/hello/hello-2.12.3.tar.gz"
+      "https://ftpmirror.gnu.org/hello/hello-2.12.3.tar.gz"
+    ];
     sha256 = "0d5f60154382fee10b114a1c34e785d8b1f492073ae2d3a6f7b147687b366aa0";
   };
 }

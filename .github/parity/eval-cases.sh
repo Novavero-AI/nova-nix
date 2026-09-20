@@ -16,6 +16,7 @@
 set -uo pipefail
 
 novaBin=${NOVA_NIX_BIN:?set NOVA_NIX_BIN to the nova-nix executable}
+repoRoot=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 if ! command -v nix-instantiate >/dev/null 2>&1; then
   echo "nix-instantiate is not on PATH; this script needs a real Nix to diff against" >&2
   exit 1
@@ -34,6 +35,8 @@ printf './data.txt\n' >"$fixture/sub/inner.nix"
 printf '{ p = ./data.txt; }\n' >"$fixture/sub/attrs.nix"
 printf 'p: p\n' >"$fixture/sub/id.nix"
 printf 'builtins.readFile q\n' >"$fixture/sub/readq.nix"
+cp "$repoRoot/pkgs/windows/fetchurl.nix" "$fixture/fetchurl.nix"
+cp "$repoRoot/.github/parity/fetchurl-cases.nix" "$fixture/fetchurl-cases.nix"
 
 # Upstream spells an unforced thunk <CODE>, and newer releases spell it with
 # guillemets; this evaluator spells it <thunk>.  The spelling is not what is
@@ -51,16 +54,18 @@ check() {
   label=$1
   expr=$2
   checked=$((checked + 1))
-  upstream=$(cd "$fixture" && nix-instantiate --eval -E "$expr" 2>&1 | normalise)
-  nova=$(cd "$fixture" && "$novaBin" eval --expr "$expr" 2>&1 | normalise)
-  if [ "$upstream" = "$nova" ]; then
+  upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1 | normalise)
+  upstreamStatus=$?
+  nova=$(cd "$fixture" && "$novaBin" eval --nix-path "nix=$repoRoot/data/nix" --expr "$expr" 2>&1 | normalise)
+  novaStatus=$?
+  if [ "$upstreamStatus" -eq 0 ] && [ "$novaStatus" -eq 0 ] && [ "$upstream" = "$nova" ]; then
     printf '  ok    %s\n' "$label"
   else
     failures=$((failures + 1))
     printf '  DIFF  %s\n' "$label"
     printf '          expression  %s\n' "$expr"
-    printf '          upstream    %s\n' "$upstream"
-    printf '          nova-nix    %s\n' "$nova"
+    printf '          upstream    (exit %s) %s\n' "$upstreamStatus" "$upstream"
+    printf '          nova-nix    (exit %s) %s\n' "$novaStatus" "$nova"
   fi
 }
 
@@ -87,6 +92,12 @@ check "a nested list" '[ [ 1 2 ] ]'
 check "an empty list as an element" '[ [ ] ]'
 check "attrset values" '{ a = 1; b = "s"; }'
 check "map over a list" 'builtins.map (x: x * x) [ 1 2 3 ]'
+echo
+
+echo "== Nova's mirror interface preserves fixed-output identity =="
+for caseName in legacy sha256 sri order invalidUrls invalidHashes escapedUrl; do
+  check "fetchurl $caseName" "(import ./fetchurl-cases.nix).$caseName"
+done
 echo
 
 printf '%d checked, %d differing\n' "$checked" "$failures"
