@@ -4138,20 +4138,17 @@ testSubstituter = do
     -- nesting, an executable, a symlink, a zero-byte file, an empty
     -- directory, and a sibling pair that collides on folding
     -- filesystems.  Entries in NAR name order.
-    -- The executable bit only where the platform can round-trip it
-    -- from disk - Windows cannot, the same constraint the NAR spec
-    -- vectors note, until #35 gives it a real model.  The symlink
-    -- target is nested on every platform now: nova-cache 0.11.1.1
-    -- normalises a Windows reparse point's separators back to the
-    -- POSIX spelling at the NAR boundary (#112), so bin/tool round-trips
-    -- disk serialisation on Windows too.
-    streamTestExec = SI.os /= "mingw32"
+    -- Both survive a round trip through disk on every platform.  The
+    -- executable bit does on Windows because the store keeps it in an
+    -- alternate data stream (#35); the nested symlink target does because
+    -- nova-cache 0.11.1.1 normalises a Windows reparse point's separators
+    -- back to the POSIX spelling at the NAR boundary (#112).
     streamTestLinkTarget = "bin/tool"
     streamTestNar =
       NAR.serialise
         ( NAR.NarDirectory
             [ ("Makefile", NAR.NarRegular False "all:\n"),
-              ("bin", NAR.NarDirectory [("tool", NAR.NarRegular streamTestExec "#!/bin/sh\n")]),
+              ("bin", NAR.NarDirectory [("tool", NAR.NarRegular True "#!/bin/sh\n")]),
               ("empty", NAR.NarRegular False ""),
               ("emptydir", NAR.NarDirectory []),
               ("link", NAR.NarSymlink streamTestLinkTarget),
