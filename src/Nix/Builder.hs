@@ -205,10 +205,6 @@ data BuildConfig = BuildConfig
     bcStoreDir :: !StoreDir,
     -- | Temp directory for builds (cleaned after each build).
     bcTmpDir :: !FilePath,
-    -- | Path to bash executable (shipped with nova-nix on Windows).
-    bcBashPath :: !FilePath,
-    -- | Enable sandboxing (not yet implemented on Windows).
-    bcSandbox :: !Bool,
     -- | Binary caches to try before building (checked in priority order).
     bcCaches :: ![CacheConfig],
     -- | Extraction budget for @builtin:unpack@ builds.
@@ -233,11 +229,6 @@ defaultBuildConfig dir =
         if isWindows
           then "C:\\Temp\\nova-nix-build"
           else "/tmp/nova-nix-build",
-      bcBashPath =
-        if isWindows
-          then "bash" -- rely on PATH (MSYS2/Git Bash)
-          else "/bin/bash",
-      bcSandbox = False,
       bcCaches = [],
       bcExecWrappers = Map.empty,
       bcUnpackLimits = defaultUnpackLimits
