@@ -20,9 +20,10 @@
 --
 -- == On Windows
 --
--- The key difference is process creation.  Linux uses @fork\/exec@ with
--- namespace isolation.  We use 'System.Process.createProcess' which maps
--- to @CreateProcess@ on Windows - native, no POSIX layer.
+-- The key difference is process creation.  Upstream on Linux uses
+-- @fork\/exec@ with namespace isolation.  nova-nix spawns builders through
+-- "System.Process", which reaches @CreateProcess@ on Windows with no POSIX
+-- layer, and does not sandbox them yet (#25).
 --
 -- The builder's process tree runs inside a Win32 job object with
 -- kill-on-job-close ('Proc.use_process_jobs'), so an interrupt or a
@@ -384,9 +385,10 @@ outputPlan (out, valid)
 -- | A scratch store path for an output that must not be written to, built
 -- so it cannot collide with any real store path.
 --
--- Upstream's @makeFallbackPath@ (@derivation-builder.cc@, the @StorePath@
--- overload) with the same shape: a bogus @rewrite:@ path type and an
--- all-zeroes inner hash, keyed on the output path it stands in for.
+-- Upstream's @makeFallbackPath@ (the @StorePath@ overload, in
+-- @src/libstore/unix/build/local-derivation-goal.cc@ at 2.24.9) with the
+-- same shape: a bogus @rewrite:@ path type and an all-zeroes inner hash,
+-- keyed on the output path it stands in for.
 -- Upstream also keys on the @.drv@ path; that is not reachable here, and
 -- the output path already names one output of one derivation, so the
 -- result is just as unique.

@@ -196,7 +196,7 @@ data Expr
   | -- | De Bruijn-style resolved variable: @(level, index)@.
     -- Produced by 'Nix.Expr.Resolve.resolveVars' for variables
     -- bound by lambda formals.  @level@ counts parent-chain hops;
-    -- @index@ is the positional slot within that env's 'envSlots'.
+    -- @index@ is the positional slot within that env's slot array.
     EResolvedVar !Int !Int
   | -- | Variable resolved via with-scopes (not lexical).
     -- Produced by 'Nix.Expr.Resolve.resolveVars' for names inside
