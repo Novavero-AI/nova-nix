@@ -235,7 +235,7 @@ resolveKey stack (DynamicKey e) = DynamicKey (resolve stack e)
 -- 'Inherit Nothing' is desugared into 'NamedBinding' entries so that
 -- each inherited name goes through normal variable resolution.  This
 -- is necessary because @inherit x@ does a name-based lookup at runtime,
--- but lambda formals are stored in positional 'envSlots' (no names).
+-- but lambda formals are stored in positional env slots (no names).
 -- Desugaring @inherit x@ to @x = x;@ lets the RHS 'EVar' resolve to
 -- 'EResolvedVar' when @x@ is a lambda formal.
 resolveBinding :: [ScopeEntry] -> Binding -> [Binding]

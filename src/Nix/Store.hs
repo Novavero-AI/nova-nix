@@ -304,9 +304,7 @@ placeInStore ::
   IO PathRegistration
 placeInStore store srcPath sp deriver refs = do
   let destPath = storePathToFilePath (stDir store) sp
-  -- Move (or copy) source to store
   moveOutput srcPath destPath
-  -- Set read-only permissions
   setReadOnly destPath
   registrationFor store sp deriver refs
 

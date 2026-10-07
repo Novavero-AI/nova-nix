@@ -1290,7 +1290,8 @@ builtinRegistry =
       builtin1 "fetchTarball" builtinFetchTarball,
       builtin1 "fetchGit" builtinFetchGit,
       -- Derivation construction: lazy 'derivation' wrapper over the eager
-      -- 'derivationStrict' primop (matches C++ Nix corepkgs/derivation.nix).
+      -- 'derivationStrict' primop, as upstream's
+      -- src/libexpr/primops/derivation.nix does.
       builtin1 "derivation" builtinDerivationLazy,
       builtin1 "derivationStrict" builtinDerivationStrict,
       -- Error context (pass-through - context only matters on error)
@@ -4454,7 +4455,8 @@ normalizeFixedHash ohash ohAlgo
           throwEvalError
             ("derivation: hash '" <> ohash <> "' should have type '" <> ohAlgo <> "', not '" <> embedded <> "'")
 
--- | Lazy @derivation@ wrapper - mirrors C++ Nix's @corepkgs/derivation.nix@.
+-- | Lazy @derivation@ wrapper, mirroring upstream's
+-- @src/libexpr/primops/derivation.nix@.
 -- Returns a WHNF attrset whose @drvPath@/@outPath@/output-path/@_derivation@
 -- attrs are LAZY thunks that defer to 'builtinDerivationStrict'.  Forcing a
 -- derivation to WHNF therefore does NOT force its input/env closure - which is

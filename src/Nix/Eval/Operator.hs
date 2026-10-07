@@ -316,10 +316,6 @@ evalConcat left right =
 
 -- | Attribute set merge (//).  Right-biased: keys in the right
 -- operand shadow keys in the left.
---
--- When one side is a 'LazyAttrs', avoid full materialization by
--- merging binding recipes directly.  This is critical for nixpkgs
--- where the overlay system does @big_set // small_set@.
 evalUpdate :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 evalUpdate (VAttrs as) (VAttrs bs) = pure (VAttrs (mergeAttrSets as bs))
 evalUpdate left right =

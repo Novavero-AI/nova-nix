@@ -549,7 +549,6 @@ extractDerivation (VAttrs attrs) = do
     _ -> do
       hPutStrLn stderr "error: result is not a derivation (no type = \"derivation\")"
       exitFailure
-  -- Extract the Derivation struct from _derivation
   drv <- case attrSetLookup "_derivation" attrs of
     Just thunk | Just (VDerivation d) <- readThunkValue thunk -> pure d
     _ -> do

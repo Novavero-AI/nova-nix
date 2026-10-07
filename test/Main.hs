@@ -2,6 +2,8 @@
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+-- | The nova-nix test suite.  One executable runs every group, prints each
+-- failing case, and exits non-zero unless every case passes.
 module Main (main) where
 
 import qualified Codec.Archive.Tar as Tar
@@ -6555,7 +6557,7 @@ testFetchCache = do
         T.intercalate "\n" [storePath, rev, replacement, lastModified, narHash]
       _ -> encoded
 
--- | A stub store whose cache is warm for 'warmFetchGitExpr'\'s fetch, and
+-- | A stub store whose cache is warm for 'evalWarmFetchGit'\'s fetch, and
 -- which will adopt exactly the given store paths.
 warmEnv :: FetchCache -> Set.Set Text -> StubEnv
 warmEnv fields adoptable =
@@ -6567,7 +6569,7 @@ warmEnv fields adoptable =
       seAdoptable = adoptable
     }
 
--- | The pinned revision 'warmFetchGitExpr' asks for.
+-- | The pinned revision 'evalWarmFetchGit' asks for.
 warmFetchGitRev :: Text
 warmFetchGitRev = T.replicate 40 "b"
 
@@ -9036,9 +9038,9 @@ testE2E = do
           errs -> Fail (T.intercalate "; " errs),
       -- The writer half of the eval-write pair: an interrupted earlier
       -- run's truncated file at a toFile path must be rewritten, not
-      -- adopted on bare existence (the source audit registered exactly
-      -- such a file valid under the full content's hash, then sealed
-      -- it read-only, then a build consumed it).
+      -- adopted on bare existence (adopting it used to register such a file
+      -- valid under the full content's hash, seal it read-only, and let a
+      -- build consume it).
       runTestM "a truncated pre-existing toFile write is rewritten, not adopted" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-tofile-verify"
@@ -9767,7 +9769,7 @@ testCThunk = do
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
--- Tests: Class I conformance follow-ups (issue #50)
+-- Tests: upstream conformance follow-ups (#50)
 -- ---------------------------------------------------------------------------
 
 -- | Error kind for 'StubStoreEval', mirroring PureEval's split: only a
@@ -9877,7 +9879,7 @@ evalNixStubWith env source = case parseNix testBaseDir "<test>" source of
   Left err -> Left (T.pack (show err))
   Right expr -> runStubStoreEvalWith env (eval (builtinEnv 0 []) expr)
 
--- | Class I conformance follow-ups (issue #50): behaviors that landed
+-- | Upstream conformance follow-ups (#50): behaviors that landed
 -- with #37 but had no direct test.  Pure cases here; filesystem-touching
 -- cases in 'testClassIFollowupsIO'.
 testClassIFollowups :: IO [Bool]
@@ -9954,7 +9956,7 @@ testClassIFollowups = do
           other -> Fail ("expected two drvPaths, got: " <> T.pack (show other))
     ]
 
--- | Filesystem-touching Class I follow-ups (issue #50).
+-- | Filesystem-touching conformance follow-ups (#50).
 testClassIFollowupsIO :: IO [Bool]
 testClassIFollowupsIO = do
   putStrLn "eval/class-i-followups-io"
@@ -10110,11 +10112,11 @@ testValueCountWidths = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: Class B name validation at write sinks (issue #39)
+-- Tests: store-path name validation at write sinks (#39)
 -- ---------------------------------------------------------------------------
 
--- | Class B (issue #39): the store-path name rules hold at path
--- CONSTRUCTION, not only at parse.  Derivation names, output names, and
+-- | Name validation at write sinks (#39): the store-path name rules hold
+-- at path CONSTRUCTION, not only at parse.  Derivation names, output names, and
 -- fetchurl basenames reject exactly what the parse boundary rejects,
 -- before any write path is built from them - and names the old ad hoc
 -- sink checks over-rejected (an interior @..@) are valid again.

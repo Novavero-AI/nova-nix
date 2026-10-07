@@ -649,11 +649,10 @@ withScopesForCapture (Env envPtr) = unsafePerformIO $ do
       -- allocation at UINT32_MAX bytes), so the increment cannot wrap.
       let newCount = existingCount + 1
       arr <- checkedCPtr "withScopesForCapture" <$> cenvAllocWithScopes newCount
-      -- Copy existing with-scopes
       forM_ [0 .. fromIntegral existingCount - 1] $ \i -> do
         val <- peekElemOff existingWiths i
         pokeElemOff arr i val
-      -- Append root scope at end (outermost)
+      -- The root scope goes last: it is the outermost.
       pokeElemOff arr (fromIntegral existingCount) rootPtr
       pure (arr, newCount)
 
