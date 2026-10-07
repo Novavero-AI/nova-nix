@@ -3306,7 +3306,7 @@ testSubstituter = do
               let dest = tmpDir </> ("out-" <> show n)
               source <- chunkReader (streamChunks n streamTestNar)
               result <- Subst.consumeNarStream dest (streamTestNarInfo streamTestNar) streamTestDigest source
-              onDisk <- NAR.serialiseFromPath dest
+              onDisk <- ExecBit.serialiseFromPath dest
               pure $ case result of
                 Left err ->
                   Just ("chunk size " <> T.pack (show n) <> ": " <> Subst.attemptFailureMessage err)
