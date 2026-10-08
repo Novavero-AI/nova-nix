@@ -11,6 +11,12 @@ name: Hackage
 # cancels the run with it, so deciding later means re-running a whole release
 # workflow whose GitHub-release job would then fail on a release that already
 # exists.  Deciding later is the normal case here, so the trigger models it.
+#
+# The documentation is uploaded here too, built on the pinned toolchain.
+# Hackage's own documentation builder runs a GHC older than the base floor
+# this package declares, so it cannot plan the build: left to Hackage, the
+# package page shows a failed build report and no documentation.  The sdist
+# can be skipped for a version that is already on Hackage without docs.
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +24,11 @@ on:
         description: "Version to upload, without a leading v (for example 0.7.0.0)"
         required: true
         type: string
+      docs_only:
+        description: "Upload only the documentation, for a version whose sdist is already on Hackage"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -76,16 +87,26 @@ jobs:
           fi
 
       - uses: haskell-actions/setup@v2
+        id: setup
         with:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-hackage-${{ hashFiles('nova-nix.cabal', 'cabal.project') }}
+          restore-keys: cabal-hackage-
+
       - name: Build sdist
+        if: ${{ !inputs.docs_only }}
         run: cabal sdist
 
       # The token travels via stdin into curl's config, never argv:
       # command lines are readable process-wide for the upload's duration.
       - name: Upload to Hackage
+        if: ${{ !inputs.docs_only }}
         env:
           HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
         run: |
@@ -95,3 +116,42 @@ jobs:
             --form "package=@${SDIST}" \
             https://hackage.haskell.org/packages/ \
             <<< "header = \"Authorization: X-ApiKey ${HACKAGE_TOKEN}\""
+
+      # The library only: the executable and the test suite have no public
+      # API.  cabal writes the tarball Hackage expects, rooted at
+      # nova-nix-VERSION-docs/, so it is checked rather than repacked.
+      - name: Build documentation
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cabal haddock nova-nix:lib:nova-nix --haddock-for-hackage
+          DOCS="dist-newstyle/nova-nix-${VERSION}-docs.tar.gz"
+          [ -f "$DOCS" ] || { echo "cabal produced no ${DOCS}" >&2; exit 1; }
+          LISTING=$(tar -tzf "$DOCS")
+          ROOTS=$(echo "$LISTING" | cut -d/ -f1 | sort -u)
+          [ "$ROOTS" = "nova-nix-${VERSION}-docs" ] \
+            || { echo "unexpected tarball roots: ${ROOTS}" >&2; exit 1; }
+          echo "$LISTING" | grep -q "^nova-nix-${VERSION}-docs/Nix-Eval\.html$" \
+            || { echo "no module pages in ${DOCS}" >&2; exit 1; }
+
+      # Not --fail: on rejection Hackage's response body names the offending
+      # entry, and that is the only diagnostic there is.
+      - name: Upload documentation to Hackage
+        env:
+          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -uo pipefail
+          STATUS=$(curl --request PUT --silent --show-error \
+            --output response.txt --write-out "%{http_code}" \
+            --config - \
+            --header "Content-Type: application/x-tar" \
+            --header "Content-Encoding: gzip" \
+            --data-binary "@dist-newstyle/nova-nix-${VERSION}-docs.tar.gz" \
+            "https://hackage.haskell.org/package/nova-nix-${VERSION}/docs" \
+            <<< "header = \"Authorization: X-ApiKey ${HACKAGE_TOKEN}\"")
+          cat response.txt
+          echo
+          echo "documentation upload: HTTP ${STATUS}"
+          case "$STATUS" in 2??) ;; *) exit 1 ;; esac
