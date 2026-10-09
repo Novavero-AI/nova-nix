@@ -1,6 +1,8 @@
 /* Platform filesystem capabilities the store layer probes at runtime.
- * Windows-only functionality; other platforms compile the constant-failure
- * stubs so callers fall back without conditional compilation. */
+ * Windows-only functionality.  Every other platform compiles the constant
+ * 0 stub because the cabal c-sources entry is unconditional and the C99
+ * strict job lints every C file under cbits on Linux; the Haskell side
+ * picks the platform's answer at compile time and never calls the stub. */
 #ifndef NN_WINFS_H
 #define NN_WINFS_H
 

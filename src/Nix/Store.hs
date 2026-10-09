@@ -74,12 +74,14 @@ module Nix.Store
     orderLinks,
 
     -- * Case-hack naming (exposed for testing)
+    onDiskNameKey,
     caseHackDiskNames,
 
     -- * Re-exports
     module Nix.Store.Path,
     module Nix.Store.DB,
     module Nix.Store.Lock,
+    module Nix.Store.CaseSensitive,
   )
 where
 
@@ -98,7 +100,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (makeFixedOutputPath, makeTextPath, sha256Digest)
-import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
+import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir)
 import Nix.Store.DB
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Lock
@@ -124,7 +126,11 @@ import qualified System.Info
 -- | An open store with database and configuration.
 data Store = Store
   { stDir :: !StoreDir,
-    stDB :: !StoreDB
+    stDB :: !StoreDB,
+    -- | How the volume holding the store compares sibling names, probed
+    -- at open ('probeCaseSensitivity') and consulted by every NAR
+    -- materialization into the store.
+    stCaseSensitivity :: !CaseSensitivity
   }
 
 -- | Open a Nix store at the given directory.
@@ -133,7 +139,10 @@ openStore :: StoreDir -> IO Store
 openStore dir = do
   createDirectoryIfMissing True (unStoreDir dir)
   db <- openStoreDB dir
-  pure Store {stDir = dir, stDB = db}
+  -- After the directory exists: the probe answers for a path on disk,
+  -- and a fresh store's directory sits on the volume it will live on.
+  sensitivity <- probeCaseSensitivity (unStoreDir dir)
+  pure Store {stDir = dir, stDB = db, stCaseSensitivity = sensitivity}
 
 -- | Close the store (flushes the database).
 closeStore :: Store -> IO ()
@@ -544,22 +553,26 @@ writeDrvClosure store closure = do
 -- unsafe entry name (path traversal); these can come from untrusted cache
 -- data, so a typed failure is used instead of a partial 'error'.
 --
+-- The sensitivity is the destination volume's ('stCaseSensitivity' for
+-- a store path) and decides whether case-variant siblings need the
+-- case-hack ('onDiskNameKey').
+--
 -- Regular files and directories are written in one pass; symlinks are
 -- created in a second pass, after their targets are materialized.  Windows
 -- symlinks are typed (file vs directory) and the NAR format does not record
 -- the target's kind, so the only reliable way to pick the flavor is to look
 -- at the target on disk - which may sort after the link within the tree.
-unpackNarEntry :: FilePath -> NAR.NarEntry -> IO (Either Text ())
-unpackNarEntry path entry = do
-  walked <- unpackTree path entry
+unpackNarEntry :: CaseSensitivity -> FilePath -> NAR.NarEntry -> IO (Either Text ())
+unpackNarEntry sensitivity path entry = do
+  walked <- unpackTree sensitivity path entry
   case walked of
     Left err -> pure (Left err)
     Right links -> createSymlinks links
 
 -- | First unpack pass: write regular files and directories, recording
 -- symlinks as (link path, target) for the second pass.
-unpackTree :: FilePath -> NAR.NarEntry -> IO (Either Text [(FilePath, Text)])
-unpackTree path entry = case entry of
+unpackTree :: CaseSensitivity -> FilePath -> NAR.NarEntry -> IO (Either Text [(FilePath, Text)])
+unpackTree sensitivity path entry = case entry of
   NAR.NarRegular isExec contents -> do
     createDirectoryIfMissing True (takeDirectory path)
     BS.writeFile path contents
@@ -570,40 +583,73 @@ unpackTree path entry = case entry of
     Right decoded -> Right [(path, decoded)]
   NAR.NarDirectory entries -> do
     createDirectoryIfMissing True path
-    unpackChildren path entries
+    unpackChildren sensitivity path entries
 
--- | The on-disk identity a NAR entry name occupies on this platform's
--- store filesystem.  Windows (NTFS\/Win32) compares names
--- case-insensitively and strips trailing dots and spaces; the default
--- macOS APFS volume folds case; Linux preserves names byte-for-byte.
--- Two sibling entries sharing a key land on ONE file, the second
--- silently overwriting the first.  The fold is per-character uppercase:
--- a corruption backstop for the collisions real trees carry
--- (@Makefile@\/@makefile@), not a full model of filesystem Unicode
--- folding.
-onDiskNameKey :: Text -> Text
-onDiskNameKey = case System.Info.os of
-  "mingw32" -> T.map toUpper . T.dropWhileEnd (\c -> c == '.' || c == ' ')
-  "darwin" -> T.map toUpper
-  _ -> id
+-- | The on-disk identity a NAR entry name occupies on a volume of the
+-- given case sensitivity.  Two sibling entries sharing a key land on
+-- ONE file, the second silently overwriting the first.  A folding
+-- volume (the default APFS format, NTFS through Win32) keys a name by
+-- its uppercase; a sensitive one (Linux, a case-sensitive APFS volume)
+-- keys it byte-for-byte.  The fold is per-character uppercase, which
+-- keeps apart the collisions real trees carry (@Makefile@\/@makefile@)
+-- but not every pair the volume folds: APFS reads U+00DF and U+1E9E as
+-- one name while 'toUpper' leaves U+00DF unchanged, so that pair takes
+-- two keys, lands on one file, and is caught by the registration
+-- recheck rather than at the write (#234).  The reverse miss (U+0131
+-- uppercases to @I@, which APFS keeps distinct) only spells a name
+-- with a suffix it did not need.  Independently of case, the Win32
+-- path layer strips a name's trailing dots and spaces on create
+-- (inside a case-sensitive directory as much as a folding one), so
+-- the key strips them there.
+--
+-- Upstream decides this per process, not per volume: its
+-- @use-case-hack@ setting defaults to on for Darwin and off elsewhere
+-- (archive.cc at 2.24.9), so a case-sensitive macOS volume still has
+-- @makefile@ restored as @makefile~nix~case~hack~1@ (observed from
+-- @nix-store --restore@ 2.33.2).  The hack exists to work around
+-- folding, and a volume that does not fold needs none, so nova-nix
+-- keys by the probed answer and materializes true names there.  The
+-- divergence is in on-disk spelling only: either tree re-serialises
+-- to the same NAR.
+onDiskNameKey :: CaseSensitivity -> Text -> Text
+onDiskNameKey sensitivity = foldCase . stripWin32Trailing
+  where
+    foldCase = case sensitivity of
+      CaseSensitive -> id
+      CaseInsensitive -> T.map toUpper
+    stripWin32Trailing
+      | win32PathLayer = T.dropWhileEnd (\c -> c == '.' || c == ' ')
+      | otherwise = id
+
+-- | Whether the Win32 path layer stands between the store and its
+-- filesystem.  A property of the running platform rather than of the
+-- volume, so a compile-time constant beside the probed sensitivity; a
+-- plain comparison rather than CPP so both branches type-check on
+-- every platform.
+win32PathLayer :: Bool
+win32PathLayer = System.Info.os == "mingw32"
 
 -- | The first pair of sibling names folding to the same on-disk file,
 -- if any: (earlier entry, colliding later entry).
-firstNameCollision :: [Text] -> Maybe (Text, Text)
-firstNameCollision = go Map.empty
+firstNameCollision :: CaseSensitivity -> [Text] -> Maybe (Text, Text)
+firstNameCollision sensitivity = go Map.empty
   where
     go !_ [] = Nothing
     go !seen (name : rest) =
-      let key = onDiskNameKey name
+      let key = onDiskNameKey sensitivity name
        in case Map.lookup key seen of
             Just earlier -> Just (earlier, name)
             Nothing -> go (Map.insert key name seen) rest
 
 -- | Whether this platform's NAR serialiser strips the case-hack suffix
--- ('NAR.defaultCaseHack').  Where it does, an INCOMING entry name
--- carrying the suffix must be rejected: materialized verbatim it would
--- re-serialise under a different name and fail its own hash recheck.
--- Upstream rejects such names whenever its case-hack is active.
+-- ('NAR.defaultCaseHack': upstream's per-OS default, not the probed
+-- volume).  Where it does, an INCOMING entry name carrying the suffix
+-- must be rejected: materialized verbatim it would re-serialise under
+-- a different name and fail its own hash recheck.  Upstream's restore
+-- accepts such a name and its dump then strips the suffix (archive.cc
+-- at 2.24.9), so the tree fails there as well, only later; refusing at
+-- the write boundary surfaces the same failure before anything is
+-- materialized.
 platformStripsCaseHack :: Bool
 platformStripsCaseHack = NAR.defaultCaseHack == NAR.CaseHackEnabled
 
@@ -625,17 +671,18 @@ decodeNarText what bytes = case TE.decodeUtf8' bytes of
   Right decoded -> Right decoded
   Left _ -> Left ("NAR " <> what <> " is not valid UTF-8: " <> T.pack (show bytes))
 
--- | Disk names for a sibling list on a folding filesystem WITHOUT
--- per-directory case sensitivity: upstream's case-hack.  The first
--- occurrence of each folded name keeps its spelling; every later
--- variant gains the reversible suffix and a per-name counter, which
--- the platform serialiser strips on the way back out.  Order is
--- preserved; result pairs are (NAR name, on-disk name).
-caseHackDiskNames :: [Text] -> [(Text, Text)]
-caseHackDiskNames = reverse . snd . foldl' step (Map.empty, [])
+-- | Disk names for a sibling list on a volume of the given case
+-- sensitivity, WITHOUT per-directory case sensitivity: upstream's
+-- case-hack where names fold, every name as spelled where they do not.
+-- The first occurrence of each key keeps its spelling; every later
+-- name with the same key gains the reversible suffix and a per-name
+-- counter, which the platform serialiser strips on the way back out.
+-- Order is preserved; result pairs are (NAR name, on-disk name).
+caseHackDiskNames :: CaseSensitivity -> [Text] -> [(Text, Text)]
+caseHackDiskNames sensitivity = reverse . snd . foldl' step (Map.empty, [])
   where
     step (!seen, !acc) name =
-      let key = onDiskNameKey name
+      let key = onDiskNameKey sensitivity name
        in case Map.lookup key seen of
             Nothing -> (Map.insert key (0 :: Int) seen, (name, name) : acc)
             Just occurrences ->
@@ -649,10 +696,10 @@ caseHackDiskNames = reverse . snd . foldl' step (Map.empty, [])
 -- hold - so each name is decoded here at the write boundary, and a
 -- byte name with no Unicode reading refuses the unpack
 -- ('decodeNarText') rather than approximating a spelling.
-unpackChildren :: FilePath -> [(BS.ByteString, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
-unpackChildren path rawEntries = case traverse decodeChild rawEntries of
+unpackChildren :: CaseSensitivity -> FilePath -> [(BS.ByteString, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
+unpackChildren sensitivity path rawEntries = case traverse decodeChild rawEntries of
   Left err -> pure (Left err)
-  Right entries -> unpackNamedChildren path entries
+  Right entries -> unpackNamedChildren sensitivity path entries
   where
     decodeChild (nameBytes, child) = do
       name <- decodeNarText "directory entry name" nameBytes
@@ -662,28 +709,31 @@ unpackChildren path rawEntries = case traverse decodeChild rawEntries of
 -- failure on the first unsafe entry name rather than crashing on
 -- untrusted input.
 --
--- Sibling names folding to one on-disk name (NTFS, default APFS) take
--- the TRUE-NAME path when the platform provides one: the just-created
--- empty directory gains NTFS per-directory case sensitivity and the
--- tree materializes under its real names.  Where the flag is
--- unavailable (a non-NTFS store volume, macOS) the collision falls
--- back to upstream's case-hack renaming, which the platform serialiser
--- reverses.  Either way a registered path re-serialises to its NAR
--- byte-for-byte - the substituter's on-disk recheck verifies it.
-unpackNamedChildren :: FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
-unpackNamedChildren path entries = do
+-- On a volume the probe reports sensitive (Linux, case-sensitive APFS)
+-- no two sibling names share an on-disk identity and every entry
+-- materializes as spelled.  Sibling names folding to one on-disk name
+-- (NTFS, default APFS) take the TRUE-NAME path when the platform
+-- provides one: the just-created empty directory gains NTFS
+-- per-directory case sensitivity and the tree materializes under its
+-- real names.  Where the flag is unavailable (a non-NTFS store volume,
+-- a folding APFS volume) the collision falls back to upstream's
+-- case-hack renaming, which the platform serialiser reverses.  Either
+-- way a registered path re-serialises to its NAR byte-for-byte - the
+-- substituter's on-disk recheck verifies it.
+unpackNamedChildren :: CaseSensitivity -> FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
+unpackNamedChildren sensitivity path entries = do
   diskNames <- resolveDiskNames
   walkChildren (zip diskNames entries)
   where
     names = map fst entries
-    resolveDiskNames = case firstNameCollision names of
+    resolveDiskNames = case firstNameCollision sensitivity names of
       Nothing -> pure names
       Just _ -> do
         trueNames <- trySetCaseSensitiveDir path
         pure
           ( if trueNames
               then names
-              else map snd (caseHackDiskNames names)
+              else map snd (caseHackDiskNames sensitivity names)
           )
     walkChildren [] = pure (Right [])
     walkChildren ((diskName, (name, child)) : rest)
@@ -692,7 +742,7 @@ unpackNamedChildren path entries = do
       | platformStripsCaseHack && caseHackSuffixText `T.isInfixOf` name =
           pure (Left ("NAR entry name contains the case-hack suffix: " <> name))
       | otherwise = do
-          result <- unpackTree (path </> T.unpack diskName) child
+          result <- unpackTree sensitivity (path </> T.unpack diskName) child
           case result of
             Left err -> pure (Left err)
             Right links -> do
@@ -825,7 +875,10 @@ data UnpackFrame = UnpackFrame
 -- stack of on-disk paths the NEXT node materializes at: the
 -- destination at the root, plus one pushed per open directory entry.
 data NarUnpackState = NarUnpackState
-  { nusFrames :: ![UnpackFrame],
+  { -- | The destination volume's case sensitivity, keying sibling
+    -- names exactly as the strict path does.
+    nusCaseSensitivity :: !CaseSensitivity,
+    nusFrames :: ![UnpackFrame],
     nusTargets :: ![FilePath],
     nusOpen :: !(Maybe (Handle, FilePath, Bool)),
     nusLinks :: ![(FilePath, Text)]
@@ -836,19 +889,21 @@ data NarUnpackState = NarUnpackState
 -- that downloads it.  Semantics mirror 'unpackNarEntry' - the same
 -- name decoding, safety checks, executable bit, and second-pass
 -- symlink creation - with one divergence: sibling names colliding on
--- a folding filesystem always take upstream's case-hack renaming,
--- never the NTFS true-name path, because per-directory case
--- sensitivity can only be enabled on an EMPTY directory and a stream
--- cannot know a directory's siblings before materializing the first.
+-- a folding volume always take upstream's case-hack renaming, never
+-- the NTFS true-name path, because per-directory case sensitivity can
+-- only be enabled on an EMPTY directory and a stream cannot know a
+-- directory's siblings before materializing the first.  On a volume
+-- the probe reports sensitive nothing collides, as in the strict path.
 -- Upstream's own streaming restore behaves identically, and the
 -- substituter's on-disk recheck proves the tree re-serialises to its
 -- NAR either way.
 newtype NarUnpackSink = NarUnpackSink (IORef NarUnpackState)
 
--- | A sink for one NAR unpack under the given destination path.
-newNarUnpackSink :: FilePath -> IO NarUnpackSink
-newNarUnpackSink destPath =
-  NarUnpackSink <$> newIORef (NarUnpackState [] [destPath] Nothing [])
+-- | A sink for one NAR unpack under the given destination path, on a
+-- volume of the given case sensitivity.
+newNarUnpackSink :: CaseSensitivity -> FilePath -> IO NarUnpackSink
+newNarUnpackSink sensitivity destPath =
+  NarUnpackSink <$> newIORef (NarUnpackState sensitivity [] [destPath] Nothing [])
 
 -- | Feed one event.  On 'Left' the partial tree stays for the caller
 -- to remove - 'abortNarUnpack' first, so no handle stays open on it.
@@ -902,7 +957,7 @@ applyNarEvent narState event = case event of
               -- Sequential case-hack: the disk name of entry N depends
               -- only on the siblings before it, the same sequence
               -- 'caseHackDiskNames' folds over a whole list.
-              let key = onDiskNameKey name
+              let key = onDiskNameKey (nusCaseSensitivity narState) name
                   (diskName, occurrences) = case Map.lookup key (ufSeen frame) of
                     Nothing -> (name, 0)
                     Just seen -> (name <> caseHackSuffixText <> T.pack (show (seen + 1)), seen + 1)

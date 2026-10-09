@@ -105,7 +105,7 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Http (withUserAgent)
-import Nix.Store (PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarEvent, unpackNarEntry)
+import Nix.Store (CaseSensitivity, PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarEvent, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
@@ -410,7 +410,7 @@ unpackVerifiedNar store sp verified refs deriver =
               Right
               ( do
                   clearStaleDestination destPath
-                  unpackNarEntry destPath narEntry
+                  unpackNarEntry (stCaseSensitivity store) destPath narEntry
               )
               `catchSync` (pure . Left)
           case (unpackResult :: Either SomeException (Either Text ())) of
@@ -775,7 +775,7 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
     materialize = do
       streamed <-
         withDecompressedSource (NarInfo.niNarSize narInfo) (NarInfo.niCompression narInfo) source $
-          consumeNarStream destPath narInfo declaredDigest
+          consumeNarStream (stCaseSensitivity store) destPath narInfo declaredDigest
       case streamed of
         Left err -> do
           Dir.removePathForcibly destPath
@@ -815,10 +815,11 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
 -- the streaming NAR parser, and the store's streaming unpack sink,
 -- returning the verified NAR byte count.  The hash context folds over
 -- exactly the bytes the parser consumes, so the digest is of the NAR
--- the tree was built from.
-consumeNarStream :: FilePath -> NarInfo.NarInfo -> Hash.NixHash -> IO BS.ByteString -> IO (Either AttemptFailure Int)
-consumeNarStream destPath narInfo declaredDigest narSource = do
-  sink <- newNarUnpackSink destPath
+-- the tree was built from.  The sensitivity is the destination
+-- volume's, 'stCaseSensitivity' when the destination is a store path.
+consumeNarStream :: CaseSensitivity -> FilePath -> NarInfo.NarInfo -> Hash.NixHash -> IO BS.ByteString -> IO (Either AttemptFailure Int)
+consumeNarStream sensitivity destPath narInfo declaredDigest narSource = do
+  sink <- newNarUnpackSink sensitivity destPath
   go sink Hash.hashInit 0 Stream.narStream `onException` abortNarUnpack sink
   where
     go sink !ctx !narBytes step = case step of
