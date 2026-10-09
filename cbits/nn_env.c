@@ -69,19 +69,20 @@ nn_env_alloc_raw(uint32_t bytes)
     if (bytes > UINT32_MAX - (NN_ENV_ALIGN - 1)) return NULL;
     bytes = align_up(bytes, NN_ENV_ALIGN);
 
+    /* No pages before nn_env_init or after nn_env_destroy.  Opening a
+     * first page here instead would hand out memory the next
+     * nn_env_init frees, under every pointer built from it. */
+    if (!g_current_page) return NULL;
+
     /* used <= capacity always holds, so capacity - used cannot underflow;
      * the additive form (used + bytes > capacity) overflows uint32_t for
      * near-4GB requests and would pass the check, then memset past the
      * end of a 256 KB page. */
-    if (!g_current_page || bytes > g_current_page->capacity - g_current_page->used) {
+    if (bytes > g_current_page->capacity - g_current_page->used) {
         uint32_t page_cap = bytes > NN_ENV_PAGE_SIZE ? bytes : NN_ENV_PAGE_SIZE;
         struct nn_env_page *page = alloc_page(page_cap);
         if (!page) return NULL;
-        if (g_current_page) {
-            g_current_page->next = page;
-        } else {
-            g_first_page = page;
-        }
+        g_current_page->next = page;
         g_current_page = page;
     }
 
@@ -108,6 +109,12 @@ nn_env_init(void)
 
     /* Initialize global empty env */
     memset(&g_empty_env, 0, sizeof(g_empty_env));
+}
+
+int
+nn_env_live(void)
+{
+    return g_first_page != NULL;
 }
 
 void

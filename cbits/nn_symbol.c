@@ -186,6 +186,11 @@ void nn_symbol_init(uint32_t initial_capacity)
     g_sym.arena_used = 0;
 }
 
+int nn_symbol_live(void)
+{
+    return g_sym.slots != NULL;
+}
+
 void nn_symbol_destroy(void)
 {
     free(g_sym.entries);
@@ -196,6 +201,11 @@ void nn_symbol_destroy(void)
 
 nn_symbol_t nn_symbol_intern(const char *str, size_t len)
 {
+    /* No table before nn_symbol_init or after nn_symbol_destroy: the
+     * probe below would dereference a NULL slot array.  The invalid
+     * sentinel is the one value the Haskell boundary refuses to wrap. */
+    if (!g_sym.slots) return NN_SYMBOL_INVALID;
+
     /* An empty string arrives from Haskell's zero-copy marshalling as
      * (NULL, 0).  memcpy/memcmp require valid pointers even for a zero
      * length, so normalize at the boundary.  Empty symbols are reachable

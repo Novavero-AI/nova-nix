@@ -60,6 +60,12 @@ alloc_block(uint32_t capacity)
 static nn_thunk_t *
 arena_alloc(struct nn_thunk_arena *arena)
 {
+    /* No arena before nn_thunk_init or after nn_thunk_destroy.  Report
+     * it through the NULL the callers already check for rather than
+     * dereferencing it; nn_arena_live is how the Haskell boundary tells
+     * this apart from exhaustion. */
+    if (!arena) return NULL;
+
     /* Current block full - allocate a new one */
     if (arena->current->count >= arena->current->capacity) {
         struct nn_thunk_block *block = alloc_block(arena->block_capacity);
@@ -105,6 +111,12 @@ nn_thunk_init(uint32_t initial_capacity)
     g_arena->current = first;
     g_arena->total = 0;
     g_arena->block_capacity = cap;
+}
+
+int
+nn_thunk_live(void)
+{
+    return g_arena != NULL;
 }
 
 void

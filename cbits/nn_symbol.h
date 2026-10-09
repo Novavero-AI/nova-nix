@@ -32,9 +32,14 @@ typedef uint32_t nn_symbol_t;
 /* --- Lifecycle --- */
 
 /* Initialize the global symbol table.  Must be called once before
- * any nn_symbol_intern() calls.  initial_capacity is the expected
- * number of unique symbols (hint for pre-allocation; 0 uses default). */
+ * any nn_symbol_intern() calls; outside the init .. destroy window
+ * nn_symbol_intern() returns NN_SYMBOL_INVALID.  initial_capacity is
+ * the expected number of unique symbols (hint for pre-allocation; 0
+ * uses default). */
 void nn_symbol_init(uint32_t initial_capacity);
+
+/* Nonzero between nn_symbol_init and nn_symbol_destroy. */
+int nn_symbol_live(void);
 
 /* Destroy the global symbol table, freeing all memory.
  * All nn_symbol_t values become invalid after this call. */

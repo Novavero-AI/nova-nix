@@ -37,6 +37,12 @@
 -- f x           (left)     function application
 -- e.a           (left)     attribute selection
 -- @
+--
+-- == Lifecycle
+--
+-- Parsing is pure and touches none of the C data layer, so it runs with
+-- or without 'Nix.Eval.Arena.arenaInit'.  Evaluating the resulting
+-- 'Expr' does need the arena; see "Nix.Eval.Arena".
 module Nix.Parser
   ( -- * Parsing
     parseNix,

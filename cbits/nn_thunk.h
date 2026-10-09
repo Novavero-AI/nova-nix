@@ -82,8 +82,12 @@ typedef char nn_thunk_ptr_size_check_[(sizeof(void *) >= sizeof(int64_t)) ? 1 : 
 /* Initialize the global thunk arena.  initial_capacity is the number
  * of thunks to pre-allocate per block (0 uses default: 65536 = 1 MB).
  * Must be called once before any thunk allocation (nn_thunk_new_bc or
- * the computed-value constructors). */
+ * the computed-value constructors); outside the init .. destroy window
+ * every allocator returns NULL. */
 void nn_thunk_init(uint32_t initial_capacity);
+
+/* Nonzero between nn_thunk_init and nn_thunk_destroy. */
+int nn_thunk_live(void);
 
 /* Destroy the global thunk arena, freeing all block memory.
  * Does NOT free payload StablePtrs - caller must iterate and free

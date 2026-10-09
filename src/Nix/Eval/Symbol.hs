@@ -39,6 +39,7 @@ import qualified Data.Text.Foreign as TF
 import Data.Word (Word32)
 import Foreign.C.Types (CChar, CSize (..))
 import Foreign.Ptr (Ptr, nullPtr)
+import Nix.Eval.CStatus (cStatusFailure)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- | An interned symbol - a 'Word32' index into the global symbol table.
@@ -46,6 +47,11 @@ import System.IO.Unsafe (unsafePerformIO)
 -- 0 is the invalid sentinel.
 newtype Symbol = Symbol {unSymbol :: Word32}
   deriving (Eq, Ord, Show)
+
+-- | @NN_SYMBOL_INVALID@: the interner's failure sentinel, and the index
+-- no symbol ever has.  Must stay in lockstep with @cbits\/nn_symbol.h@.
+invalidSymbolId :: Word32
+invalidSymbolId = 0
 
 -- ---------------------------------------------------------------------------
 -- FFI imports (unsafe - these never call back to Haskell)
@@ -95,9 +101,8 @@ symbolDestroy = c_nn_symbol_destroy
 -- image intern to the SAME symbol.
 symbolIntern :: Text -> IO Symbol
 symbolIntern txt =
-  TF.withCStringLen txt $ \(ptr, len) -> do
-    sid <- c_nn_symbol_intern ptr (fromIntegral len)
-    pure (Symbol sid)
+  TF.withCStringLen txt $ \(ptr, len) ->
+    checkedSymbol =<< c_nn_symbol_intern ptr (fromIntegral len)
 
 -- | Intern raw bytes, returning their 'Symbol'.  The C table is
 -- length-prefixed bytes with no encoding assumption, so arbitrary
@@ -107,9 +112,16 @@ symbolIntern txt =
 -- the bytes into its own arena and never retains the pointer.
 symbolInternBytes :: ByteString -> IO Symbol
 symbolInternBytes bs =
-  BSU.unsafeUseAsCStringLen bs $ \(ptr, len) -> do
-    sid <- c_nn_symbol_intern ptr (fromIntegral len)
-    pure (Symbol sid)
+  BSU.unsafeUseAsCStringLen bs $ \(ptr, len) ->
+    checkedSymbol =<< c_nn_symbol_intern ptr (fromIntegral len)
+
+-- | Reject the interner's failure sentinel before it can become a
+-- 'Symbol': the table only answers it outside its init .. destroy
+-- window, and wrapped it would read back as the empty string.
+checkedSymbol :: Word32 -> IO Symbol
+checkedSymbol sid
+  | sid == invalidSymbolId = cStatusFailure "nn_symbol_intern" "interning failed"
+  | otherwise = pure (Symbol sid)
 
 -- | Retrieve the text of an interned symbol.
 -- Returns the original string.  The result is safe to use - it copies
@@ -118,7 +130,7 @@ symbolInternBytes bs =
 -- byte-string payload must be read with 'symbolBytes' instead.
 symbolText :: Symbol -> Text
 symbolText (Symbol sid)
-  | sid == 0 = T.empty
+  | sid == invalidSymbolId = T.empty
   | otherwise = unsafePerformIO $ do
       ptr <- c_nn_symbol_text sid
       if ptr == nullPtr
@@ -131,7 +143,7 @@ symbolText (Symbol sid)
 -- were interned, with no decoding.  The read side of 'symbolInternBytes'.
 symbolBytes :: Symbol -> ByteString
 symbolBytes (Symbol sid)
-  | sid == 0 = BS.empty
+  | sid == invalidSymbolId = BS.empty
   | otherwise = unsafePerformIO $ do
       ptr <- c_nn_symbol_text sid
       if ptr == nullPtr

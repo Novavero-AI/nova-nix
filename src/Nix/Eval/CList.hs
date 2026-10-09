@@ -36,6 +36,7 @@ where
 
 import Data.Word (Word32)
 import Foreign.Ptr (Ptr, nullPtr)
+import Nix.Eval.CStatus (checkedCPtr)
 import Nix.Eval.CThunk (CThunkPtr)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -100,17 +101,15 @@ clistSet = c_nn_list_set
 
 -- | Convert a Haskell list of 'CThunkPtr' to a C list.
 -- Allocates a new nn_list_t and fills it with the thunk pointers.
--- Returns 'nullPtr' for empty lists.
+-- Returns 'nullPtr' for empty lists; for a non-empty one a NULL from
+-- @nn_list_new@ is an allocation failure, not an empty list.
 thunkListToCList :: [CThunkPtr] -> IO CListPtr
 thunkListToCList [] = pure nullPtr
 thunkListToCList ptrs = do
   let n = fromIntegral (length ptrs)
-  clist <- clistNew n
-  if clist == nullPtr
-    then pure nullPtr
-    else do
-      fillList clist 0 ptrs
-      pure clist
+  clist <- checkedCPtr "nn_list_new" =<< clistNew n
+  fillList clist 0 ptrs
+  pure clist
   where
     fillList _ _ [] = pure ()
     fillList cl !i (p : ps) = do

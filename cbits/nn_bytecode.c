@@ -51,6 +51,11 @@ void nn_bytecode_init(uint32_t op_capacity, uint32_t data_capacity)
     g_data_capacity = data_capacity;
 }
 
+int nn_bytecode_live(void)
+{
+    return g_ops != NULL;
+}
+
 void nn_bytecode_destroy(void)
 {
     free(g_ops);
@@ -68,6 +73,10 @@ void nn_bytecode_destroy(void)
 
 static int ensure_op_space(void)
 {
+    /* No store before nn_bytecode_init or after nn_bytecode_destroy.
+     * Doubling a zero capacity would realloc to zero bytes and the
+     * emit would then write past it. */
+    if (!g_ops) return -1;
     if (g_op_count < g_op_capacity) return 0;
     uint32_t new_cap = g_op_capacity * 2;
     if (new_cap < g_op_capacity) return -1; /* overflow guard */
@@ -80,6 +89,7 @@ static int ensure_op_space(void)
 
 static int ensure_data_space(void)
 {
+    if (!g_data) return -1;
     if (g_data_count < g_data_capacity) return 0;
     uint32_t new_cap = g_data_capacity * 2;
     if (new_cap < g_data_capacity) return -1; /* overflow guard */

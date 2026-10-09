@@ -83,6 +83,7 @@ import Data.Int (Int64)
 import Data.Word (Word32, Word8)
 import Foreign.C.Types (CDouble (..), CInt (..))
 import Foreign.Ptr (Ptr, nullPtr)
+import Nix.Eval.CStatus (checkedCPtr)
 
 -- | Phantom type for C-side @nn_thunk_t@.
 data NnThunk
@@ -242,10 +243,15 @@ cthunkDestroy = c_nn_thunk_destroy
 -- Allocation
 -- ---------------------------------------------------------------------------
 
+-- Every allocator below rejects the C side's NULL through 'checkedCPtr':
+-- outside the 'cthunkInit' .. 'cthunkDestroy' window that is the only
+-- answer the arena gives, and a NULL that flowed on would fault at the
+-- next state read instead of raising 'Nix.Eval.CStatus.ArenaNotInitialized'.
+
 -- | Allocate a new PENDING thunk with a bytecode index + C env pointer.
 -- No Haskell heap references - zero GC pressure for pending thunks.
 cthunkNewBc :: Word32 -> Ptr () -> IO CThunkPtr
-cthunkNewBc = c_nn_thunk_new_bc
+cthunkNewBc bcIdx envPtr = checkedCPtr "nn_thunk_new_bc" =<< c_nn_thunk_new_bc bcIdx envPtr
 
 -- | Read the bytecode index from a PENDING thunk.
 cthunkGetBcIdx :: CThunkPtr -> IO Word32
@@ -257,50 +263,50 @@ cthunkSetPayload = c_nn_thunk_set_payload
 
 -- | Allocate a new pre-COMPUTED thunk with StablePtr payload (complex types).
 cthunkNewComputed :: Ptr () -> IO CThunkPtr
-cthunkNewComputed = c_nn_thunk_new_computed
+cthunkNewComputed value = checkedCPtr "nn_thunk_new_computed" =<< c_nn_thunk_new_computed value
 
 -- | Allocate a pre-COMPUTED thunk with an inline int64 (no StablePtr).
 cthunkNewComputedInt :: Int64 -> IO CThunkPtr
-cthunkNewComputedInt = c_nn_thunk_new_computed_int
+cthunkNewComputedInt n = checkedCPtr "nn_thunk_new_computed_int" =<< c_nn_thunk_new_computed_int n
 
 -- | Allocate a pre-COMPUTED thunk with an inline double (no StablePtr).
 cthunkNewComputedFloat :: Double -> IO CThunkPtr
-cthunkNewComputedFloat d = c_nn_thunk_new_computed_float (CDouble d)
+cthunkNewComputedFloat d = checkedCPtr "nn_thunk_new_computed_float" =<< c_nn_thunk_new_computed_float (CDouble d)
 
 -- | Allocate a pre-COMPUTED thunk with an inline bool (no StablePtr).
 cthunkNewComputedBool :: Word8 -> IO CThunkPtr
-cthunkNewComputedBool = c_nn_thunk_new_computed_bool
+cthunkNewComputedBool b = checkedCPtr "nn_thunk_new_computed_bool" =<< c_nn_thunk_new_computed_bool b
 
 -- | Allocate a pre-COMPUTED thunk with null value (no StablePtr).
 cthunkNewComputedNull :: IO CThunkPtr
-cthunkNewComputedNull = c_nn_thunk_new_computed_null
+cthunkNewComputedNull = checkedCPtr "nn_thunk_new_computed_null" =<< c_nn_thunk_new_computed_null
 
 -- | Allocate a pre-COMPUTED thunk with an interned string symbol (no StablePtr).
 -- For context-free strings only (tag 4).
 cthunkNewComputedStr :: Word32 -> IO CThunkPtr
-cthunkNewComputedStr = c_nn_thunk_new_computed_str
+cthunkNewComputedStr sym = checkedCPtr "nn_thunk_new_computed_str" =<< c_nn_thunk_new_computed_str sym
 
 -- | Allocate a pre-COMPUTED thunk with an interned path symbol (no StablePtr).
 cthunkNewComputedPath :: Word32 -> IO CThunkPtr
-cthunkNewComputedPath = c_nn_thunk_new_computed_path
+cthunkNewComputedPath sym = checkedCPtr "nn_thunk_new_computed_path" =<< c_nn_thunk_new_computed_path sym
 
 -- | Allocate a pre-COMPUTED thunk with a CList pointer (no StablePtr).
 cthunkNewComputedList :: Ptr () -> IO CThunkPtr
-cthunkNewComputedList = c_nn_thunk_new_computed_list
+cthunkNewComputedList list = checkedCPtr "nn_thunk_new_computed_list" =<< c_nn_thunk_new_computed_list list
 
 -- | Allocate a pre-COMPUTED thunk with a CAttrSet pointer (no StablePtr).
 cthunkNewComputedAttrs :: Ptr () -> IO CThunkPtr
-cthunkNewComputedAttrs = c_nn_thunk_new_computed_attrs
+cthunkNewComputedAttrs attrs = checkedCPtr "nn_thunk_new_computed_attrs" =<< c_nn_thunk_new_computed_attrs attrs
 
 -- | Allocate a pre-COMPUTED thunk with a CCtxStr pointer (no StablePtr).
 -- For strings with non-empty context (tag 8).
 cthunkNewComputedCtxStr :: Ptr () -> IO CThunkPtr
-cthunkNewComputedCtxStr = c_nn_thunk_new_computed_ctxstr
+cthunkNewComputedCtxStr ctxstr = checkedCPtr "nn_thunk_new_computed_ctxstr" =<< c_nn_thunk_new_computed_ctxstr ctxstr
 
 -- | Allocate a pre-COMPUTED thunk with a CLambda pointer (no StablePtr).
 -- For lambda closures (tag 9).
 cthunkNewComputedLambda :: Ptr () -> IO CThunkPtr
-cthunkNewComputedLambda = c_nn_thunk_new_computed_lambda
+cthunkNewComputedLambda lambda = checkedCPtr "nn_thunk_new_computed_lambda" =<< c_nn_thunk_new_computed_lambda lambda
 
 -- ---------------------------------------------------------------------------
 -- State queries

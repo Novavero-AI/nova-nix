@@ -119,6 +119,7 @@ module Nix.Eval.CBytecode
 where
 
 import Data.Word (Word16, Word32, Word8)
+import Nix.Eval.CStatus (cStatusFailure)
 
 -- ---------------------------------------------------------------------------
 -- FFI imports (all unsafe - no callbacks, fast data access)
@@ -201,8 +202,7 @@ emitFailedSentinel = 0xFFFFFFFF
 -- not survive a release build.
 checkedEmit :: String -> Word32 -> IO Word32
 checkedEmit site idx
-  | idx == emitFailedSentinel =
-      ioError (userError (site <> ": bytecode append failed (allocation failure or index ceiling)"))
+  | idx == emitFailedSentinel = cStatusFailure site "bytecode append failed (allocation failure or index ceiling)"
   | otherwise = pure idx
 
 -- ---------------------------------------------------------------------------
