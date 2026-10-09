@@ -4,10 +4,13 @@
 [![Hackage](https://img.shields.io/hackage/v/nova-nix.svg)](https://hackage.haskell.org/package/nova-nix)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-nova-nix is an implementation of [Nix](https://nixos.org) for Windows, written
-in Haskell with a C99 data layer. It also builds and runs on macOS and Linux.
-It has its own parser, evaluator, store, builder and binary-cache substituter,
-and does not need an existing Nix installation.
+nova-nix exists to make [Nix](https://nixos.org) work natively on Windows:
+the same language, the same store paths and the same binary caches as
+upstream Nix, without WSL or an existing Nix installation.
+
+It is an implementation of Nix in Haskell with a C99 data layer, and it has
+its own parser, evaluator, store, builder and binary-cache substituter. It
+also builds and runs on macOS and Linux.
 
 nova-nix is experimental. Read [Limitations](#limitations) before relying on
 it.
@@ -28,8 +31,15 @@ it.
   with a toolchain built from source is tracked in [#26].
 - **Binary caches work in both directions.** `nova-nix push` uploads a
   closure, and `build --substituter` downloads signed NARs instead of
-  building. CI checks the round trip on Linux against a local nova-cache
-  server.
+  building. CI checks this two ways. On Linux, two fixtures are pushed to a
+  local nova-cache server and substituted into a second empty store with
+  signature verification on: a small tree whose two copies must serialize
+  to the same NAR, and a 320 MiB tree that must substitute under a 128 MiB
+  heap cap. On every push to main, the Windows job publishes the Hello
+  closure it just built and ran to the public cache at
+  [cache.novavero.ai](https://cache.novavero.ai), and a second Windows job
+  builds the same closure into an empty store with that cache as its only
+  substituter, fails if any path is built locally, and runs the result.
 
 ### Limitations
 
@@ -82,7 +92,7 @@ $ nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
 $ nova-nix eval FILE.nix                          # evaluate a file
 $ nova-nix build FILE.nix -A ATTR                 # build an attribute of it
 $ nova-nix build FILE.nix --substituter URL --trusted-key KEY  # try a cache first
-$ nova-nix push --cache URL --key-file KEY --all  # upload the store to a cache
+$ nova-nix push --cache URL --key-file KEY --all  # upload every path except derivations
 $ nova-nix --help
 ```
 
@@ -105,7 +115,14 @@ Hello, world!
 ```
 
 The first build fetches 40 pinned archives (the 39 toolchain packages and the
-Hello source), then builds the MSYS2 seed, the MinGW-w64 seed and Hello.
+Hello source), then builds the MSYS2 seed, the MinGW-w64 seed and Hello. The
+[public cache](https://cache.novavero.ai) holds this closure as CI last built
+it from main, so a build that names the cache downloads what it holds and
+builds only what it lacks:
+
+```console
+> bin\nova-nix build pkgs\windows\hello.nix --substituter https://cache.novavero.ai --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
+```
 
 ## How it works
 
