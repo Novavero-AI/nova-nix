@@ -97,6 +97,7 @@ module Nix.Eval.CBytecode
     -- * String part tags
     strpartLit,
     strpartInterp,
+    strpartEsc,
 
     -- * Binding type tags
     bindNamed,
@@ -385,10 +386,13 @@ formalName = 0
 formalSet = 1
 formalNamedSet = 2
 
--- | String-part kinds: a literal chunk or an interpolated @${...}@ expression.
-strpartLit, strpartInterp :: Word32
+-- | String-part kinds: a literal chunk, an interpolated @${...}@
+-- expression, or an indented-string escape (literal text the indentation
+-- scan must not measure).
+strpartLit, strpartInterp, strpartEsc :: Word32
 strpartLit = 0
 strpartInterp = 1
+strpartEsc = 2
 
 -- | Attribute-binding kinds: a @name = value@ binding or an @inherit@.
 bindNamed, bindInherit :: Word32

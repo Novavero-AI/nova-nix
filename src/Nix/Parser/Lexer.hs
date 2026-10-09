@@ -66,10 +66,11 @@ data Token
   | TokIndStringClose
   | TokStringLit !Text
   | -- | Resolved escape text inside an indented string (@'''@, @''$@,
-    -- @''${@, @''\x@).  Kept apart from 'TokStringLit' because escapes
-    -- are opaque to indentation stripping (upstream lexer.l emits them
-    -- without the hasIndentation mark): they end start-of-line
-    -- whitespace but are never scanned or stripped.
+    -- @''${@, @''\x@).  Kept apart from 'TokStringLit' because upstream's
+    -- lexer.l emits an escape without the hasIndentation mark: the
+    -- indentation scan skips it (it ends a line's leading whitespace
+    -- without being measured) while the strip runs over it as over any
+    -- literal.
     TokStringEsc !Text
   | TokInterpOpen
   | TokInterpClose
@@ -216,8 +217,8 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
   '\''
     | Just '\'' <- safeHead rest ->
         let tok = Located (lsLine st) (lsCol st) TokIndStringOpen
-            newSt = advanceCol 2 st {lsInput = T.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
-         in lexLoop newSt (tok : acc)
+            opened = advanceCol 2 st {lsInput = T.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
+         in lexLoop (skipIndStringOpenerLine opened) (tok : acc)
   '.'
     | Just '.' <- safeHead rest,
       Just '.' <- safeHead (T.drop 1 rest) ->
@@ -360,6 +361,18 @@ lexStringMode st acc = case T.uncons (lsInput st) of
                     }
            in lexLoop newSt (tok : acc)
     _ -> lexStringLiteral st acc
+
+-- | The rest of an indented string's opening line.  Upstream's opener is
+-- @''@ with an optional run of spaces and one newline (lexer.l:
+-- @\'\'(\ *\n)?@), so content starts on the next line and the opening
+-- line's trailing spaces never reach the indentation scan.  Only spaces
+-- qualify: a tab after @''@ is content, as are spaces not followed by a
+-- newline.
+skipIndStringOpenerLine :: LexState -> LexState
+skipIndStringOpenerLine st =
+  case T.uncons (T.dropWhile (== ' ') (lsInput st)) of
+    Just ('\n', rest) -> st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
+    _ -> st
 
 lexIndStringMode :: LexState -> [Located] -> Either ParseError [Located]
 lexIndStringMode st acc

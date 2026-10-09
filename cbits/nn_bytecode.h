@@ -83,6 +83,7 @@
 
 #define NN_STRPART_LIT    0
 #define NN_STRPART_INTERP 1
+#define NN_STRPART_ESC    2
 
 /* --- Binding type tags (data buffer) --- */
 

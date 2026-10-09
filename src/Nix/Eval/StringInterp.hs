@@ -1,11 +1,14 @@
 -- | String coercion and indented-string whitespace stripping.
 --
--- Provides 'coerceToString' (string interpolation and @builtins.toString@) and
--- 'stripIndentedChunks' (the indented-string indentation algorithm, applied by
--- the bytecode evaluator).  Force/apply are passed in as parameters to break the
--- import cycle with @Nix.Eval@.
+-- Provides 'coerceToString' (string interpolation and @builtins.toString@),
+-- 'concatChunks' (a double-quoted string's parts joined) and
+-- 'stripIndentedChunks' (the indented-string indentation algorithm, applied
+-- by the bytecode evaluator).  Force/apply are passed in as parameters to
+-- break the import cycle with @Nix.Eval@.
 module Nix.Eval.StringInterp
-  ( stripIndentedChunks,
+  ( StringChunk (..),
+    concatChunks,
+    stripIndentedChunks,
     CoercePath,
     coerceToString,
     formatNixFloat,
@@ -39,61 +42,137 @@ type Apply m = NixValue -> NixValue -> m NixValue
 -- path written directly would.
 type CoercePath m = Text -> m (ByteString, StringContext)
 
--- | Strip the common indentation from already-evaluated indented-string chunks.
--- Each chunk is @(isLiteral, bytes, context)@.  Indentation is computed and
--- stripped from the LITERAL chunks only - interpolated chunks are opaque content
--- - the single leading newline is dropped, and the trailing newline is kept.
--- This matches C++ Nix, which strips at the string-part level (so a multi-line
--- interpolated value cannot drag the common indent down).  The scan is
--- byte-level via the Char8 view: it only ever compares against space, tab,
--- and newline, which are single bytes in UTF-8 and never occur inside a
--- multi-byte sequence, so multi-byte content passes through untouched.
-stripIndentedChunks :: [(Bool, ByteString, StringContext)] -> (ByteString, StringContext)
+-- | One evaluated part of a string, with the three-way distinction
+-- upstream's @stripIndentation@ sees: a literal is measured by the
+-- indentation scan and stripped; an escape (@'''@, @''\n@, ...) is
+-- stripped but never measured, since upstream's lexer emits it without
+-- the hasIndentation mark; an interpolated value is opaque to both and
+-- carries the context it was coerced with.
+data StringChunk
+  = ChunkLit !ByteString
+  | ChunkEsc !ByteString
+  | ChunkInterp !ByteString !StringContext
+  deriving (Eq, Show)
+
+-- | The bytes a chunk contributes, whatever its kind.
+chunkBytes :: StringChunk -> ByteString
+chunkBytes (ChunkLit t) = t
+chunkBytes (ChunkEsc t) = t
+chunkBytes (ChunkInterp t _) = t
+
+-- | The combined context of the interpolated chunks.
+chunksContext :: [StringChunk] -> StringContext
+chunksContext chunks = mconcat [c | ChunkInterp _ c <- chunks]
+
+-- | Join evaluated chunks as a double-quoted string does: bytes in order,
+-- nothing stripped.
+concatChunks :: [StringChunk] -> (ByteString, StringContext)
+concatChunks chunks = (BS.concat (map chunkBytes chunks), chunksContext chunks)
+
+-- | Strip the common indentation from the evaluated parts of an indented
+-- string, as upstream's @ParserState::stripIndentation@ (parser-state.hh
+-- at 2.24.9, the same through 2.33.2) does at parse time.  Three of its
+-- rules are not the obvious ones:
+--
+-- * The minimum indent starts at 'indentSentinel', and only a character
+--   that is neither a space nor a newline lowers it, an escape or an
+--   interpolation at line start counting as one.  A string with no such
+--   line loses every leading space on every line.
+--
+-- * Only a space is indentation.  A tab fixes the minimum at its column
+--   and stays in the output.
+--
+-- * Once the last part is stripped, a final line holding only spaces is
+--   removed from it, so the closing @''@'s own indentation never reaches
+--   the value.  The rule runs on that part's text alone: a string ending
+--   in an interpolation keeps whatever follows it.
+--
+-- Escapes are stripped like literals and skipped by the scan, so an
+-- escaped newline starts a line whose spaces are stripped but were never
+-- measured; interpolated values are opaque to both passes and leave the
+-- line mid-way.  The scan is byte-level via the Char8 view: it only ever
+-- compares against space and newline, single bytes in UTF-8 that never
+-- occur inside a multi-byte sequence, so multi-byte content passes
+-- through untouched.
+stripIndentedChunks :: [StringChunk] -> (ByteString, StringContext)
 stripIndentedChunks chunks =
-  let stripped = dropLeadingNL (chunksStrip (chunksMinIndent chunks) chunks)
-   in (BS.concat (map snd stripped), mconcat [c | (_, _, c) <- chunks])
-  where
-    dropLeadingNL ((True, t) : rest) =
-      (True, case BC.uncons t of { Just ('\n', r) -> r; _ -> t }) : rest
-    dropLeadingNL other = other
+  (BS.concat (chunksStrip (chunksMinIndent chunks) chunks), chunksContext chunks)
 
--- | Common indentation across the LITERAL chunks.  An interpolation at line
--- start fixes that line's indent at the preceding literal whitespace and counts
--- as content; whitespace-only lines do not contribute.
-chunksMinIndent :: [(Bool, ByteString, StringContext)] -> Int
-chunksMinIndent = result . foldl' stepChunk (True, 0, Nothing)
-  where
-    result (_, _, Nothing) = 0
-    result (_, _, Just m) = m
-    stepChunk (atStart, cur, mi) (isLit, t, _)
-      | not isLit = if atStart then (False, cur, bump mi cur) else (False, cur, mi)
-      | otherwise = BC.foldl' stepChar (atStart, cur, mi) t
-    stepChar (atStart, cur, mi) c
-      | atStart && (c == ' ' || c == '\t') = (True, cur + 1, mi)
-      | atStart && c == '\n' = (True, 0, mi)
-      | atStart = (False, cur, bump mi cur)
-      | c == '\n' = (True, 0, mi)
-      | otherwise = (False, cur, mi)
-    bump Nothing x = Just x
-    bump (Just m) x = Just (min m x)
+-- | Upstream's starting minimum (@size_t minIndent = 1000000@): until a
+-- line is measured, every leading space is indentation.
+indentSentinel :: Int
+indentSentinel = 1000000
 
--- | Strip @n@ columns of leading indentation from each line of the literal
--- chunks; interpolated chunks are emitted verbatim and reset the line position.
-chunksStrip :: Int -> [(Bool, ByteString, StringContext)] -> [(Bool, ByteString)]
-chunksStrip n = go True 0
+-- | Scan state: whether the current line has held only spaces so far,
+-- how many, and the minimum measured.
+data ScanState = ScanState !Bool !Int !Int
+
+-- | The common indentation of the literal chunks.
+chunksMinIndent :: [StringChunk] -> Int
+chunksMinIndent chunks =
+  let ScanState _ _ measured = foldl' scanChunk (ScanState True 0 indentSentinel) chunks
+   in measured
   where
-    go _ _ [] = []
-    go _ _ ((False, t, _) : rest) = (False, t) : go False 0 rest
-    go atStart dropped ((True, t, _) : rest) =
-      let (acc, advancedStart, advancedDrop) = BC.foldl' stepC ([], atStart, dropped) t
-       in (True, BC.pack (reverse acc)) : go advancedStart advancedDrop rest
-    stepC (acc, atStart, dropped) c
-      | atStart && (c == ' ' || c == '\t') =
-          if dropped < n then (acc, True, dropped + 1) else (c : acc, True, dropped + 1)
-      | atStart && c == '\n' = ('\n' : acc, True, 0)
-      | atStart = (c : acc, False, dropped)
-      | c == '\n' = ('\n' : acc, True, 0)
-      | otherwise = (c : acc, False, dropped)
+    scanChunk st (ChunkLit t) = BC.foldl' scanChar st t
+    scanChunk st _ = endLeadingSpace st
+    scanChar (ScanState True cur minIndent) ' ' = ScanState True (cur + 1) minIndent
+    scanChar (ScanState _ _ minIndent) '\n' = ScanState True 0 minIndent
+    scanChar st@(ScanState True _ _) _ = endLeadingSpace st
+    scanChar st _ = st
+    endLeadingSpace (ScanState True cur minIndent) = ScanState False cur (min minIndent cur)
+    endLeadingSpace st = st
+
+-- | Strip state carried across parts: whether the current line has held
+-- only spaces so far, and how many of them have been seen.
+data StripState = StripState !Bool !Int
+
+-- | Strip @minIndent@ leading spaces from every line of the literal and
+-- escape chunks; an interpolated chunk is emitted verbatim.
+chunksStrip :: Int -> [StringChunk] -> [ByteString]
+chunksStrip minIndent = go (StripState True 0)
+  where
+    go _ [] = []
+    go _ (ChunkInterp t _ : rest) = t : go (StripState False 0) rest
+    go st (ChunkLit t : rest) = stripText st t rest
+    go st (ChunkEsc t : rest) = stripText st t rest
+    stripText st t rest =
+      let (stripped, next) = stripLines minIndent st t
+       in finishPart rest stripped : go next rest
+    -- Upstream's @n == 1@: only the last part sheds a final line of spaces.
+    finishPart [] = dropSpaceOnlyLastLine
+    finishPart _ = id
+
+-- | Strip one part line by line.  At line start a space is dropped while
+-- fewer than @minIndent@ of the line's spaces have been seen (upstream's
+-- @curDropped++ >= minIndent@ keeps the rest); a line that is still only
+-- spaces at the end of the part hands its count to the next part.
+stripLines :: Int -> StripState -> ByteString -> (ByteString, StripState)
+stripLines minIndent = go []
+  where
+    go acc st t
+      | BS.null t = (BS.concat (reverse acc), st)
+      | otherwise =
+          let (line, afterLine) = BC.break (== '\n') t
+              (kept, lineEnd) = stripLine st line
+           in case BC.uncons afterLine of
+                Just (_, remaining) -> go ("\n" : kept : acc) (StripState True 0) remaining
+                Nothing -> (BS.concat (reverse (kept : acc)), lineEnd)
+    stripLine st@(StripState False _) line = (line, st)
+    stripLine (StripState True seen) line
+      | BS.null content = (BS.drop dropped spaces, StripState True (seen + spaceCount))
+      | otherwise = (BS.drop dropped line, StripState False 0)
+      where
+        (spaces, content) = BC.span (== ' ') line
+        spaceCount = BS.length spaces
+        dropped = max 0 (min spaceCount (minIndent - seen))
+
+-- | Remove a final line that holds only spaces, keeping the newline before
+-- it (upstream: @find_last_of('\n')@, then nothing but spaces past it).
+-- A part with no newline is left alone.
+dropSpaceOnlyLastLine :: ByteString -> ByteString
+dropSpaceOnlyLastLine s = case BC.elemIndexEnd '\n' s of
+  Just p | BC.all (== ' ') (BS.drop (p + 1) s) -> BS.take (p + 1) s
+  _ -> s
 
 -- | Coerce a Nix value to a (byte) string.
 --

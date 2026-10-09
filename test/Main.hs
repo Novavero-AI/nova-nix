@@ -754,13 +754,47 @@ testEvalBuiltins = do
         assertEval "esc-drop-str" "\"a\\qb\" == \"aqb\"" (VBool True),
       runTest "unknown escape drops backslash (indented string)" $
         assertEval "esc-drop-ind" "''a''\\qb'' == \"aqb\"" (VBool True),
-      -- Indented-string escapes are opaque to indentation stripping: an
-      -- escaped newline is content, not a line break, so text after it
-      -- is not at line start and the column scan does not reset.
-      runTest "escaped newline does not strip following text" $
-        assertEval "ind-esc-nl-strip" "''  a''\\n  b'' == \"a\\n  b\"" (VBool True),
-      runTest "escaped newline does not lower common indent" $
-        assertEval "ind-esc-nl-indent" "''\n    x''\\n y\n    z'' == \"x\\n y\\nz\"" (VBool True),
+      -- Indentation stripping is upstream's stripIndentation rule for
+      -- rule (parser-state.hh at 2.24.9), every case checked against
+      -- nix-instantiate 2.33.2.  The scan skips an escape, so the spaces
+      -- after an escaped newline are never measured; the strip runs over
+      -- escapes like any literal, so those spaces are stripped by the
+      -- minimum measured elsewhere.  An interpolation is opaque to both.
+      runTest "escaped newline: following spaces are stripped, not measured" $
+        assertEval "ind-esc-nl-strip" "''  a''\\n  b''" (mkStr "a\nb"),
+      runTest "escaped newline: a shallower line after it is not the minimum" $
+        assertEval "ind-esc-nl-indent" "''\n    x''\\n y\n    z''" (mkStr "x\ny\nz"),
+      runTest "escaped newline at line start keeps the next line stripped" $
+        assertEval "ind-esc-nl-start" "''\n  ''\\n  b''" (mkStr "\nb"),
+      runTest "interpolated newline leaves the next chunk mid-line" $
+        assertEval "ind-interp-nl" "''\n  ${\"\\n\"}  b''" (mkStr "\n  b"),
+      -- The minimum starts at a sentinel, so a string with no measured
+      -- line loses every leading space (#220).
+      runTest "blank line then a spaces-only line strips to the newline" $
+        assertEval "ind-blank-spaces" "''\n\n        ''" (mkStr "\n"),
+      runTest "spaces-only line strips to nothing" $
+        assertEval "ind-spaces-only" "''\n   ''" (mkStr ""),
+      runTest "spaces between opener and closer strip to nothing" $
+        assertEval "ind-spaces-same-line" "''   ''" (mkStr ""),
+      -- Only a space is indentation: a tab fixes the minimum at its
+      -- column and survives.
+      runTest "tabs are content, not indentation" $
+        assertEval "ind-tabs" "''\n\t\ta\n\t\tb\n''" (mkStr "\t\ta\n\t\tb\n"),
+      runTest "a tab after the opener is content" $
+        assertEval "ind-opener-tab" "''\t\n  a\n''" (mkStr "\t\n  a\n"),
+      -- The last part sheds a final line of spaces after stripping; the
+      -- rule runs on that part alone.
+      runTest "closing indentation after a blank line is dropped" $
+        assertEval "ind-closer-spaces" "''\n  a\n\n    ''" (mkStr "a\n\n"),
+      runTest "closing indentation after an interpolation is dropped" $
+        assertEval "ind-closer-after-interp" "''\n  ${\"v\"}\n   ''" (mkStr "v\n"),
+      runTest "spaces after an interpolation on the last line survive" $
+        assertEval "ind-interp-last-line" "''\n  ${\"v\"}   ''" (mkStr "v   "),
+      -- The opener consumes its own line's trailing spaces and newline.
+      runTest "spaces before the opener's newline are not a line" $
+        assertEval "ind-opener-spaces" "''   \n  a\n''" (mkStr "a\n"),
+      runTest "an opener line of spaces then the closer is empty" $
+        assertEval "ind-opener-only" "''  \n''" (mkStr ""),
       runTest "toString int" $
         assertEval "toStr" "builtins.toString 42" (mkStr "42")
     ]
@@ -1067,6 +1101,14 @@ testLexer = do
       runTest "indented string keeps CRLF verbatim" $
         assertRight "lex ind crlf" (tokenize "<test>" "''a\r\nb''") $ \toks ->
           assertEqual "tokens" [TokIndStringOpen, TokStringLit "a\r\nb", TokIndStringClose] (tokenTypes toks),
+      -- The opener is '' with an optional run of spaces and one newline
+      -- (upstream lexer.l); a tab is not part of it.
+      runTest "indented string opener consumes trailing spaces and newline" $
+        assertRight "lex ind opener" (tokenize "<test>" "''  \n  a''") $ \toks ->
+          assertEqual "tokens" [TokIndStringOpen, TokStringLit "  a", TokIndStringClose] (tokenTypes toks),
+      runTest "indented string opener stops at a tab" $
+        assertRight "lex ind opener tab" (tokenize "<test>" "''\t\na''") $ \toks ->
+          assertEqual "tokens" [TokIndStringOpen, TokStringLit "\t\na", TokIndStringClose] (tokenTypes toks),
       runTest "multi-char operators" $
         assertRight "lex ops" (tokenize "<test>" "++ // -> == != && || <= >=") $ \toks ->
           assertEqual
@@ -1472,6 +1514,10 @@ testParserIntegration = do
         assertRight "ind string" (parseNix testBaseDir "<test>" "''hello''") $ \case
           EIndStr _ -> Pass
           other -> Fail ("expected EIndStr, got: " <> T.pack (show other)),
+      runTest "indented string escape is its own part" $
+        assertRight "ind string esc" (parseNix testBaseDir "<test>" "''a'''b''") $ \case
+          EIndStr [StrLit "a", StrEsc "''", StrLit "b"] -> Pass
+          other -> Fail ("expected literal, escape, literal, got: " <> T.pack (show other)),
       -- Positional let/rec resolution tests
       runTest "let inherit from outer lambda" $
         assertRight "let-inherit-lambda" (parseNix testBaseDir "<test>" "x: let inherit x; in x") $ \case

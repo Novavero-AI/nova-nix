@@ -223,6 +223,7 @@ collectBindingNames = foldl' addNames Set.empty
 -- | Resolve variables inside string parts.
 resolvePart :: [ScopeEntry] -> StringPart -> StringPart
 resolvePart _ p@(StrLit _) = p
+resolvePart _ p@(StrEsc _) = p
 resolvePart stack (StrInterp e) = StrInterp (resolve stack e)
 
 -- | Resolve variables inside attribute keys.
@@ -382,6 +383,7 @@ resolveRelativePaths dir = goExpr
 
     goPart part = case part of
       StrLit _ -> part
+      StrEsc _ -> part
       StrInterp e -> StrInterp (goExpr e)
 
     goBinding binding = case binding of

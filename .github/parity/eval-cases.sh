@@ -35,6 +35,15 @@ printf './data.txt\n' >"$fixture/sub/inner.nix"
 printf '{ p = ./data.txt; }\n' >"$fixture/sub/attrs.nix"
 printf 'p: p\n' >"$fixture/sub/id.nix"
 printf 'builtins.readFile q\n' >"$fixture/sub/readq.nix"
+# Indented strings whose whitespace upstream strips (#220).  Tabs and
+# newlines are printf escapes so each fixture's exact bytes are visible.
+printf "''\n\n        ''\n" >"$fixture/ind-blank-then-spaces.nix"
+printf "''\n   ''\n" >"$fixture/ind-spaces-only.nix"
+printf "''   ''\n" >"$fixture/ind-spaces-same-line.nix"
+printf "''\n  a\n\n    ''\n" >"$fixture/ind-closer-spaces.nix"
+printf "''\n  \${\"v\"}\n   ''\n" >"$fixture/ind-closer-after-interp.nix"
+printf "''\n\t\ta\n\t\tb\n''\n" >"$fixture/ind-tabs.nix"
+printf "''   \n  a\n''\n" >"$fixture/ind-opener-spaces.nix"
 cp "$repoRoot/pkgs/windows/fetchurl.nix" "$fixture/fetchurl.nix"
 cp "$repoRoot/.github/parity/fetchurl-cases.nix" "$fixture/fetchurl-cases.nix"
 
@@ -92,6 +101,16 @@ check "a nested list" '[ [ 1 2 ] ]'
 check "an empty list as an element" '[ [ ] ]'
 check "attrset values" '{ a = 1; b = "s"; }'
 check "map over a list" 'builtins.map (x: x * x) [ 1 2 3 ]'
+echo
+
+echo "== whitespace an indented string strips =="
+check "blank line then a spaces-only line" 'import ./ind-blank-then-spaces.nix'
+check "spaces-only line" 'import ./ind-spaces-only.nix'
+check "spaces between opener and closer" 'import ./ind-spaces-same-line.nix'
+check "closing indentation after a blank line" 'import ./ind-closer-spaces.nix'
+check "closing indentation after an interpolation" 'import ./ind-closer-after-interp.nix'
+check "tabs are content" 'import ./ind-tabs.nix'
+check "spaces before the opener's newline" 'import ./ind-opener-spaces.nix'
 echo
 
 echo "== Nova's mirror interface preserves fixed-output identity =="
