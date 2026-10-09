@@ -51,6 +51,9 @@ module Nix.Eval
 
     -- * Evaluation monad (re-exported from Types)
     MonadEval (..),
+    EvalPolicy (..),
+    PathExistence (..),
+    unrestrictedPolicy,
     PureEval,
     runPureEval,
 
@@ -66,9 +69,11 @@ module Nix.Eval
     deferApply,
 
     -- * Fetcher transport validation (pure, exported for tests)
+    FetchGitArgs (..),
     checkGitUrl,
     checkGitRef,
     checkGitRev,
+    gitInputUrl,
 
     -- * Remembered fetches (pure, exported for tests)
     FetchCache (..),
@@ -93,10 +98,10 @@ import Data.Bits (complement, xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Char (chr, digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, isOctDigit, ord)
+import Data.Char (chr, digitToInt, intToDigit, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, isOctDigit, ord, toUpper)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
-import Data.List (find, partition, sort)
+import Data.List (partition, sort)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
@@ -106,6 +111,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.Read as TR
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
@@ -121,6 +127,7 @@ import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, nixCompare, nixEqual)
+import Nix.Eval.Policy (isAbsolutePath)
 import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatJsonFloat, formatNixFloat, formatXmlFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
 import Nix.Eval.Types
@@ -130,8 +137,10 @@ import Nix.Eval.Types
     Env (..),
     EvalFormal (..),
     EvalFormals (..),
+    EvalPolicy (..),
     MonadEval (..),
     NixValue (..),
+    PathExistence (..),
     PureEval,
     StringContext (..),
     StringContextElement (..),
@@ -177,6 +186,7 @@ import Nix.Eval.Types
     storePathOrThrow,
     thunkToCPtr,
     typeName,
+    unrestrictedPolicy,
     withScopesForCapture,
   )
 import Nix.Expr.Types
@@ -187,7 +197,7 @@ import Nix.Expr.Types
     NixAtom (..),
     UnaryOp (..),
   )
-import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest, sha256Hex)
+import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathNameErrorText, storePathNameReasonText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
@@ -1010,10 +1020,21 @@ evalSearchPath env name = do
         Just nixPathThunk -> do
           nixPathVal <- force nixPathThunk
           builtinFindFile nixPathVal (mkStr name)
-        Nothing ->
-          throwCatchableError ("file '" <> name <> "' was not found in the Nix search path")
-    _ ->
-      throwCatchableError ("file '" <> name <> "' was not found in the Nix search path")
+        Nothing -> searchPathMiss name
+    _ -> searchPathMiss name
+
+-- | A lookup that matched no entry.  A CATCHABLE error (upstream raises
+-- ThrownError here): nixpkgs' impure.nix wraps @<nixpkgs-overlays>@ in
+-- @tryEval@ and relies on catching the miss.  The wording is upstream's
+-- @findFile@: under @pure-eval@ the search path is empty by construction,
+-- and the message says so instead of pointing at @NIX_PATH@.
+searchPathMiss :: (MonadEval m) => Text -> m a
+searchPathMiss name = do
+  policy <- evalPolicy
+  throwCatchableError $
+    if epPureEval policy
+      then "cannot look up '<" <> name <> ">' in pure evaluation mode (use '--impure' to override)"
+      else "file '" <> name <> "' was not found in the Nix search path (add it using $NIX_PATH or -I)"
 
 -- ---------------------------------------------------------------------------
 -- Variables
@@ -3301,13 +3322,26 @@ keyInList key (seen : rest) = do
 -- string naming a filesystem path, so it decodes strictly.
 coerceToPath :: (MonadEval m) => Text -> NixValue -> m Text
 coerceToPath _ (VPath p) = pure p
-coerceToPath name (VStr s _) = decodedText ("builtins." <> name) s
+coerceToPath name (VStr s _) = absolutePathString =<< decodedText ("builtins." <> name) s
 coerceToPath name other =
   throwEvalError ("builtins." <> name <> ": expected a path or string, got " <> typeName other)
 
+-- | Upstream @coerceToPath@'s rule for a string operand: it must spell an
+-- absolute path, which is then canonicalized like any path value
+-- (@rootPath(CanonPath(path))@).  A relative string is refused with
+-- upstream's wording rather than read against the working directory,
+-- which is also what keeps the access policy sound: the path checked is
+-- the path opened.
+absolutePathString :: (MonadEval m) => Text -> m Text
+absolutePathString s
+  | isAbsolutePath canonical = pure canonical
+  | otherwise = throwEvalError ("string '" <> s <> "' doesn't represent an absolute path")
+  where
+    canonical = canonPathValue s
+
 builtinImport :: (MonadEval m) => NixValue -> m NixValue
 builtinImport (VPath p) = importFile p
-builtinImport (VStr s _) = importFile =<< decodedText "import" s
+builtinImport (VStr s _) = importFile =<< absolutePathString =<< decodedText "import" s
 builtinImport other =
   throwEvalError ("import: expected a path or string, got " <> typeName other)
 
@@ -3324,10 +3358,18 @@ builtinReadFile val = do
       ("builtins.readFile: the contents of the file '" <> p <> "' cannot be represented as a Nix string")
   pure (mkStrBytes bytes)
 
+-- | @builtins.pathExists@.  Whether a directory is demanded is read off
+-- the argument's spelling before coercion, as upstream's
+-- @prim_pathExists@ reads it: a string ending in @/@ or @/.@, which
+-- canonicalization would otherwise erase.
 builtinPathExists :: (MonadEval m) => NixValue -> m NixValue
 builtinPathExists val = do
   p <- coerceToPath "pathExists" val
-  VBool <$> doesPathExist p
+  VBool <$> doesPathExist (existenceQuery val) p
+  where
+    existenceQuery (VStr s _)
+      | BS.isSuffixOf "/" s || BS.isSuffixOf "/." s = ExistsAsDirectory
+    existenceQuery _ = ExistsAsEntry
 
 builtinReadDir :: (MonadEval m) => NixValue -> m NixValue
 builtinReadDir val = do
@@ -3369,11 +3411,18 @@ builtinPlaceholder (VStr outputName _) = do
 builtinPlaceholder other =
   throwEvalError ("builtins.placeholder: expected a string, got " <> typeName other)
 
+-- | Refused outright under @pure-eval@, before the argument is looked at,
+-- as upstream's @prim_storePath@ is: a dependency on a store path that
+-- merely exists is ambient state.
 builtinStorePath :: (MonadEval m) => NixValue -> m NixValue
-builtinStorePath (VPath p) = validateStorePath p
-builtinStorePath (VStr s _) = validateStorePath =<< decodedText "builtins.storePath" s
-builtinStorePath other =
-  throwEvalError ("builtins.storePath: expected a path or string, got " <> typeName other)
+builtinStorePath val = do
+  policy <- evalPolicy
+  if epPureEval policy
+    then throwEvalError "'builtins.storePath' is not allowed in pure evaluation mode"
+    else case val of
+      VPath p -> validateStorePath p
+      VStr s _ -> validateStorePath =<< absolutePathString =<< decodedText "builtins.storePath" s
+      other -> throwEvalError ("builtins.storePath: expected a path or string, got " <> typeName other)
 
 -- | @builtins.storePath@ - mark an already-in-store path as such.  Upstream
 -- returns a STRING carrying an Opaque (SCPlain) context entry for the enclosing
@@ -3437,26 +3486,27 @@ forceSearchEntry thunk = do
       pure (prefix, path)
     _ -> throwEvalError "builtins.findFile: search path entry must be a set"
 
--- | Iterate search path entries, checking for a match.
--- A miss is a CATCHABLE error (upstream raises ThrownError here):
--- nixpkgs' impure.nix wraps @<nixpkgs-overlays>@ in @tryEval@ and
--- relies on catching the miss.
+-- | Iterate search path entries, checking for a match.  A miss is
+-- 'searchPathMiss'.  The existence probe is the policy-gated one: a
+-- candidate the policy refuses counts as absent, which is stricter than
+-- the oracle (2.24.9 probes outside its accessor and would hand the path
+-- back) and quieter than 2.33.2 (which refuses from here), and which
+-- gives no caller an existence oracle over paths it may not read.
 findFirst :: (MonadEval m) => [(Text, Text)] -> Text -> m NixValue
-findFirst [] name =
-  throwCatchableError ("file '" <> name <> "' was not found in the Nix search path")
+findFirst [] name = searchPathMiss name
 findFirst ((prefix, path) : rest) name
   | prefix == name || (not (T.null prefix) && (prefix <> "/") `T.isPrefixOf` name) =
       let suffix = if prefix == name then "" else T.drop (T.length prefix + 1) name
           candidate = canonPathValue (if T.null suffix then path else path <> "/" <> suffix)
        in do
-            exists <- doesPathExist candidate
+            exists <- doesPathExist ExistsAsEntry candidate
             if exists
               then pure (VPath candidate)
               else findFirst rest name
   | T.null prefix =
       let candidate = canonPathValue (path <> "/" <> name)
        in do
-            exists <- doesPathExist candidate
+            exists <- doesPathExist ExistsAsEntry candidate
             if exists
               then pure (VPath candidate)
               else findFirst rest name
@@ -3545,6 +3595,8 @@ tarballSourceName = "source"
 -- name ('createScratchDir') and removed once the tree reaches the store.
 fetchAndExtractTarball :: (MonadEval m) => Text -> Maybe Text -> Text -> m NixValue
 fetchAndExtractTarball url mSha256 name = do
+  checkUri url
+  requireFetchPin "fetchTarball" mSha256
   extractDir <- createScratchDir "nova-nix-tarball-"
   -- The -- separator prevents argument injection from the URL.
   (code, _, errOut) <-
@@ -3756,6 +3808,14 @@ fetchGit args =
       let name = fgaName args
           submodules = fgaSubmodules args
           shallow = fgaShallow args
+          inputUrl = gitInputUrl args {fgaUrl = url, fgaRef = checkedRef, fgaRev = checkedRev}
+      -- Upstream's order (fetchTree.cc): the pure-mode lock check, then
+      -- the URI gate, before anything is fetched or remembered.  A rev
+      -- is what locks a git input at 2.24.9 (GitInputScheme::isLocked).
+      policy <- evalPolicy
+      when (epPureEval policy && isNothing checkedRev) $
+        throwEvalError ("in pure evaluation mode, 'fetchGit' will not fetch unlocked input '" <> inputUrl <> "'")
+      checkUri inputUrl
       -- Only a pinned rev is cached: a bare ref means "whatever this branch
       -- points at now", which a note taken earlier cannot answer.
       cached <- case checkedRev of
@@ -3787,6 +3847,127 @@ fetchGit args =
                 throwEvalError
                   ("builtins.fetchGit: NAR hash mismatch in '" <> url <> "', expected '" <> computed <> "' but got '" <> declared <> "'")
       pure (fetchGitResult submodules fields)
+
+-- | The URL upstream renders a @fetchGit@ input as
+-- (@fetchers::Input::toURLString@ at 2.24.9): the url after @fixGitURL@
+-- (an scp-like @user\@host:path@ becomes @ssh://user\@host/path@, a bare
+-- path becomes @file://@ plus the path), its scheme prefixed @git+@ unless
+-- it is @git@ already, and the query carrying the input's attributes in
+-- key order as @ParsedURL::to_string@ sorts them: @exportIgnore=1@ (which
+-- @fetchGit@ sets unless submodules are on), @ref@, @rev@, @shallow=1@,
+-- @submodules=1@.  This is the string @checkURI@ matches @allowed-uris@
+-- against and the one the pure-mode refusal names, so an operator's
+-- prefix has to be written for this form (@git+https://...@), as it does
+-- upstream.
+gitInputUrl :: FetchGitArgs -> Text
+gitInputUrl args =
+  let fixed = fixGitUrl (fgaUrl args)
+      (scheme, afterScheme) = T.breakOn ":" fixed
+      (authority, afterAuthority) = case T.stripPrefix "://" afterScheme of
+        Just rest -> let (host, more) = T.break (\c -> c == '/' || c == '?' || c == '#') rest in (Just host, more)
+        Nothing -> (Nothing, T.drop 1 afterScheme)
+      (pathPart, afterPath) = T.break (\c -> c == '?' || c == '#') afterAuthority
+      (queryPart, fragmentPart) = case T.uncons afterPath of
+        Just ('?', rest) -> T.break (== '#') rest
+        _ -> ("", afterPath)
+      urlQuery = Map.fromList (map queryPair (filter (not . T.null) (T.splitOn "&" queryPart)))
+      queryPair pair =
+        let (k, v) = T.breakOn "=" pair
+         in (percentDecode k, percentDecode (T.drop 1 v))
+      pins =
+        catMaybes
+          [ ("rev",) . T.toLower <$> fgaRev args,
+            ("ref",) <$> fgaRef args,
+            ("shallow", "1") <$ guardFlag (fgaShallow args),
+            ("submodules", "1") <$ guardFlag (fgaSubmodules args),
+            ("exportIgnore", "1") <$ guardFlag (not (fgaSubmodules args))
+          ]
+      query = Map.union (Map.fromList pins) urlQuery
+      renderedScheme = if scheme == gitScheme then scheme else "git+" <> scheme
+      renderedQuery
+        | Map.null query = ""
+        | otherwise = "?" <> T.intercalate "&" [percentEncode queryKeep k <> "=" <> percentEncode queryKeep v | (k, v) <- Map.toAscList query]
+      renderedFragment = case T.stripPrefix "#" fragmentPart of
+        Just fragment | not (T.null fragment) -> "#" <> percentEncode "" (percentDecode fragment)
+        _ -> ""
+   in renderedScheme
+        <> ":"
+        <> maybe "" ("//" <>) authority
+        <> percentEncode pathKeep (percentDecode pathPart)
+        <> renderedQuery
+        <> renderedFragment
+  where
+    guardFlag flag = if flag then Just () else Nothing
+
+-- | The one scheme upstream leaves without a @git+@ prefix.
+gitScheme :: Text
+gitScheme = "git"
+
+-- | Characters @ParsedURL::to_string@ leaves unencoded in a path and in a
+-- query (@allowedInPath@ and @allowedInQuery@ in url.cc).
+pathKeep, queryKeep :: Text
+pathKeep = ":@/"
+queryKeep = ":@/?"
+
+-- | Upstream @fixGitURL@ (url.cc at 2.24.9): an scp-like remote not
+-- starting with @/@ (@([^\/]*)\@(.*):(.*)@, the first group as long as a
+-- match allows, the second greedy) is rewritten to @ssh://@; a @file:@ URL
+-- and anything with @://@ pass through; a bare path becomes a @file://@
+-- URL.
+fixGitUrl :: Text -> Text
+fixGitUrl url
+  | not (T.isPrefixOf "/" url),
+    Just (user, hostAndPath) <- scpSplit url =
+      let (host, path) = T.breakOnEnd ":" hostAndPath
+       in "ssh://" <> user <> "@" <> T.dropEnd 1 host <> "/" <> path
+  | T.isPrefixOf "file:" url = url
+  | not (T.isInfixOf "://" url) = "file://" <> url
+  | otherwise = url
+  where
+    -- The longest slash-free prefix ending at an '@' whose remainder still
+    -- carries a ':' is what the regex's backtracking selects.
+    scpSplit u =
+      let slashFree = T.takeWhile (/= '/') u
+          candidates = [i | (i, c) <- zip [0 ..] (T.unpack slashFree), c == '@']
+          viable i = T.any (== ':') (T.drop (i + 1) u)
+       in case reverse (filter viable candidates) of
+            (i : _) -> Just (T.take i u, T.drop (i + 1) u)
+            [] -> Nothing
+
+-- | @percentEncode@ from url.cc: unreserved characters and the kept set
+-- pass, every other byte of the UTF-8 form becomes @%XX@.
+percentEncode :: Text -> Text -> Text
+percentEncode keep = T.concat . map encodeByte . BS.unpack . TE.encodeUtf8
+  where
+    encodeByte byte
+      | unreserved byte || T.any (== chr (fromIntegral byte)) keep = T.singleton (chr (fromIntegral byte))
+      | otherwise = T.pack ('%' : hexPair byte)
+    unreserved byte =
+      let c = chr (fromIntegral byte)
+       in isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` unreservedPunctuation
+    hexPair byte = map (toUpper . intToDigit) [fromIntegral byte `div` hexBase, fromIntegral byte `mod` hexBase]
+
+-- | The unreserved punctuation of RFC 3986, kept as is.
+unreservedPunctuation :: [Char]
+unreservedPunctuation = "-._~"
+
+hexBase :: Int
+hexBase = 16
+
+-- | @percentDecode@ from url.cc, over the UTF-8 bytes.  A malformed escape
+-- is kept literally; upstream throws BadURL there, which this renderer
+-- has no reason to reproduce for an error message's sake.
+percentDecode :: Text -> Text
+percentDecode = TE.decodeUtf8With lenientDecode . BS.pack . go . BS.unpack . TE.encodeUtf8
+  where
+    go (percent : hi : lo : rest)
+      | percent == percentByte,
+        isHexDigit (chr (fromIntegral hi)),
+        isHexDigit (chr (fromIntegral lo)) =
+          fromIntegral (digitToInt (chr (fromIntegral hi)) * hexBase + digitToInt (chr (fromIntegral lo))) : go rest
+    go (byte : rest) = byte : go rest
+    go [] = []
+    percentByte = fromIntegral (ord '%')
 
 -- | The fetch-everything refspec @allRefs@ selects, upstream's exact
 -- spelling: every remote ref lands under the same local name, so a
@@ -4040,16 +4221,12 @@ decodeDecimal ctx t = case TR.decimal t of
   Right (n, rest) | T.null rest -> pure n
   _ -> throwEvalError (ctx <> ": expected a decimal integer from git, got " <> t)
 
--- | Resolve the system temp directory.  Checks @TMPDIR@ (Unix), then
--- @TEMP@ (Windows), falls back to @\/tmp@.
-getTempDir :: (MonadEval m) => m Text
-getTempDir = do
-  candidates <- mapM getEnvVar ["TMPDIR", "TEMP"]
-  pure (fromMaybe "/tmp" (find (not . T.null) candidates))
-
 -- | Fetch a URL and optionally verify its hash.
 fetchUrlSimple :: (MonadEval m) => Text -> Maybe Text -> m NixValue
 fetchUrlSimple url mSha256 = do
+  -- Upstream's order (fetchTree.cc, fetch()): the URI gate, then the
+  -- name, then pure mode's hash requirement, all before the download.
+  checkUri url
   -- The store name derives from the URL alone, so an unusable name fails
   -- here, before the download side effect.  Upstream rejects the same
   -- names when it adds the fetched file to the store.
@@ -4057,19 +4234,39 @@ fetchUrlSimple url mSha256 = do
   case checkStorePathName name of
     Left err -> throwEvalError ("builtins.fetchurl: " <> storePathNameErrorText err)
     Right () -> pure ()
+  requireFetchPin "fetchurl" mSha256
   -- Download to a file, not through the text-mode stdout pipe (which mangles
   -- binary), read the raw bytes, verify the pin if one was given, then store at
-  -- the canonical fixed-output path.
-  tmpDir <- getTempDir
-  let tmpFile = tmpDir <> "/nova-nix-fetchurl-" <> sha256Hex (TE.encodeUtf8 url)
+  -- the canonical fixed-output path.  The file lives in an exclusively
+  -- created scratch directory ('createScratchDir'), removed once read.
+  scratch <- createScratchDir "nova-nix-fetchurl-"
+  bytes <- downloadInto scratch url `onEvalError` removeScratchDir scratch
+  removeScratchDir scratch
+  mapM_ (verifyFetchPin "builtins.fetchurl" url bytes) mSha256
+  storePath <- addFixedOutputFile name bytes
+  pure (VPath storePath)
+
+-- | Fetch a URL into the scratch directory and hand back its bytes.
+downloadInto :: (MonadEval m) => Text -> Text -> m BS.ByteString
+downloadInto scratch url = do
+  let tmpFile = scratch <> "/" <> downloadFileName
   (code, _, stderr) <- runProcess "curl" ["-sSfL", "-o", tmpFile, "--", url] ""
   if code /= 0
     then throwEvalError ("builtins.fetchurl: fetch failed: " <> stderr)
-    else do
-      bytes <- readFileBytes tmpFile
-      mapM_ (verifyFetchPin "builtins.fetchurl" url bytes) mSha256
-      storePath <- addFixedOutputFile name bytes
-      pure (VPath storePath)
+    else readFileBytes tmpFile
+
+-- | The downloaded file's name inside its scratch directory.
+downloadFileName :: Text
+downloadFileName = "download"
+
+-- | Upstream's pure-mode rule for @fetchurl@ and @fetchTarball@
+-- (fetchTree.cc): without a @sha256@ the fetch is refused, since its
+-- result would be whatever the network answers today.
+requireFetchPin :: (MonadEval m) => Text -> Maybe Text -> m ()
+requireFetchPin who pin = do
+  policy <- evalPolicy
+  when (epPureEval policy && isNothing pin) $
+    throwEvalError ("in pure evaluation mode, '" <> who <> "' requires a 'sha256' argument")
 
 -- | Store name for a fetched URL: its basename (minus query/fragment), matching
 -- C++ Nix's @baseNameOf url@ default so the fixed-output path agrees with it.
@@ -4548,7 +4745,7 @@ builtinHashFile (VStr algo _) (VPath path) = do
   hashBytesWithAlgo "hashFile" algoName bytes
 builtinHashFile (VStr algo _) (VStr path _) = do
   algoName <- decodedText "builtins.hashFile" algo
-  filePath <- decodedText "builtins.hashFile" path
+  filePath <- absolutePathString =<< decodedText "builtins.hashFile" path
   bytes <- readFileBytes filePath
   hashBytesWithAlgo "hashFile" algoName bytes
 builtinHashFile (VStr _ _) other =
@@ -4570,7 +4767,7 @@ hashBytesWithAlgo ctx algo bytes = case algo of
 builtinReadFileType :: (MonadEval m) => NixValue -> m NixValue
 builtinReadFileType (VPath path) = mkStr <$> getFileType path
 builtinReadFileType (VStr path _) = do
-  filePath <- decodedText "builtins.readFileType" path
+  filePath <- absolutePathString =<< decodedText "builtins.readFileType" path
   mkStr <$> getFileType filePath
 builtinReadFileType other =
   throwEvalError ("builtins.readFileType: expected a path, got " <> typeName other)
@@ -5371,7 +5568,12 @@ sourceResultString storePathText =
 -- styles reach Nix code only through separator-agnostic helpers like
 -- @baseNameOf@.
 filteredSourceNar :: (MonadEval m) => NixValue -> Text -> m BS.ByteString
-filteredSourceNar filterFn rootPath = do
+filteredSourceNar filterFn rawRoot = do
+  -- The root is resolved through its symlinks before the walk, as
+  -- upstream's addPath and filterSource resolve theirs: a root that is a
+  -- symlink stores what it points at, and no entry below has a symlink
+  -- above it for the lstats to refuse.
+  rootPath <- resolveSymlinks rawRoot
   rootType <- getFileType rootPath
   entry <- buildEntry rootPath rootType
   pure (NAR.serialise entry)
@@ -5412,7 +5614,7 @@ filteredSourceNar filterFn rootPath = do
 builtinFilterSource :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinFilterSource filterFn (VPath path) = filterSourceInto filterFn path
 builtinFilterSource filterFn (VStr path _) =
-  filterSourceInto filterFn =<< decodedText "builtins.filterSource" path
+  filterSourceInto filterFn =<< absolutePathString =<< decodedText "builtins.filterSource" path
 builtinFilterSource _ other =
   throwEvalError ("builtins.filterSource: expected a path, got " <> typeName other)
 

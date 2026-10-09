@@ -38,12 +38,12 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), FetchRetryPolicy (..), RetryEffects (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, defaultFetchRetryPolicy, execWrapperConfig, execWrapperFor, fetchExceptionFailure, fetchStatusFailure, fetchUrlsFromEnv, retryDelayMs, retryTransient, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
-import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
+import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, splitNixPath)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
-import Nix.Eval (FetchCache (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, mkStr, readThunkValue, runPureEval, typeName)
+import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
@@ -53,7 +53,8 @@ import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
-import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
+import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
+import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
 import Nix.Eval.Types (allocCSlots, buildCSlots, emptyCList)
 import Nix.Expr.Resolve (staticGlobalNames)
@@ -81,7 +82,7 @@ import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermis
 import qualified System.Directory as Dir
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv, setEnv, unsetEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
-import System.FilePath (dropDrive, joinPath, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
+import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
@@ -160,7 +161,7 @@ tokenTypes = filter (/= TokEOF) . map locToken
 evalNix :: Text -> Either Text NixValue
 evalNix source = case parseNix testBaseDir "<test>" source of
   Left err -> Left (parseErrorTag <> T.pack (show err))
-  Right expr -> runPureEval (eval (builtinEnv 0 []) expr)
+  Right expr -> runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 
 -- | Prefix marking a parse (not eval) failure in 'evalNix' results.
 parseErrorTag :: Text
@@ -2064,7 +2065,7 @@ evalDerivationIO baseDir source = case parseNix baseDir "<test>" ("(" <> source 
     storeDir <- evalNixIOStoreDir
     st <- newEvalState storeDir baseDir
     runEvalIO st $ do
-      pathVal <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
+      pathVal <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
       case pathVal of
         VStr pathBytes _ -> do
           recorded <- lookupSessionDrv (bytesText pathBytes)
@@ -2313,8 +2314,9 @@ testImportIO = do
         runTestIOFail "import nonexistent -> error" testDir "import ./nonexistent.nix",
         runTestIO "import attrset + select" testDir "(import ./attrset.nix).x" (VInt 1),
         runTestIO "import let/lambda" testDir "import ./uses-arg.nix" (VInt 15),
-        -- import accepts strings (real Nix coerces string to path)
-        runTestIO "import accepts string" testDir "import \"./literal.nix\"" (VInt 42),
+        -- A string is coerced to a path only when it spells an absolute
+        -- one; upstream refuses a relative string outright.
+        runTestIOFail "import refuses a relative string" testDir "import \"./literal.nix\"",
         -- pathExists
         runTestIO
           "pathExists true"
@@ -2555,7 +2557,7 @@ evalAtCeiling limit source = case parseNix "." "<test>" source of
     storeDir <- evalNixIOStoreDir
     st0 <- newEvalState storeDir "."
     let st = st0 {esCallDepth = topLevelCallDepth limit}
-    runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
+    runEvalIO st (eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr)
 
 -- | The function-call nesting ceiling, upstream's max-call-depth (10000).
 -- Every boundary here was read off nix-instantiate 2.33.2 and the 2.24.9
@@ -7571,7 +7573,7 @@ evalNixIOStore storeDir baseDir source = case parseNix baseDir "<test>" source o
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
     st <- newEvalState storeDir baseDir
-    runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
+    runEvalIO st (eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr)
 
 testFetchGitShallow :: IO [Bool]
 testFetchGitShallow = do
@@ -9935,7 +9937,7 @@ evalAndBuild storeDir source = do
       -- honored on writes but not on reads pass the whole suite.
       st <- newEvalState storeDir "."
       evalResult <- runEvalIO st $ do
-        val <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
+        val <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
         -- What the CLI driver does: force drvPath, which runs
         -- derivationStrict (so a missing required attr surfaces as an eval
         -- error) and records the .drv the build reads back by that path.
@@ -10364,6 +10366,13 @@ testPhase4 = do
         assertEqual "split-one-run" ["channel:channel", "x"] (splitNixPath "channel:channel:x"),
       runTest "splitNixPath keeps a bare channel colon" $
         assertEqual "split-channel-bare" ["channel:", "foo"] (splitNixPath "channel::foo"),
+      runTest "isNixPathPseudoUrl: channel, flake and the listed schemes are fetched" $
+        assertEqual
+          "pseudo"
+          [True, True, True, True, True]
+          (map isNixPathPseudoUrl ["channel:nixos-24.11", "channel:", "flake:nixpkgs", "https://example.com/x.tar.gz", "file:///c"]),
+      runTest "isNixPathPseudoUrl: a path, an unlisted scheme, a drive and a bare word are not" $
+        assertEqual "not-pseudo" [False, False, False, False] (map isNixPathPseudoUrl ["/foo", "foo://x", "C:/x", "channel"]),
       runTest "splitNixPath drops a trailing empty entry" $
         assertEqual "split-trail" ["a"] (splitNixPath "a:"),
       runTestM "splitNixPath long entry splits in linear time" $ do
@@ -10446,7 +10455,7 @@ testPhase4IO = do
         runTestM "search path with populated nixPath" $ do
           st <- newEvalState platformStoreDir testDir
           let nixPaths = parseNixPath ("mypkg=" <> T.pack subDir)
-              env = builtinEnv (esTimestamp st) nixPaths
+              env = builtinEnv unrestrictedPolicy (esTimestamp st) nixPaths
           result <- runEvalIO st (eval env (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
           pure $ case result of
             Right (VPath _) -> Pass
@@ -10538,7 +10547,7 @@ arenaGuardPaths =
     -- The program from #206, forced to its result.
     evalIssueProgram = case parseNix "/tmp" "<expr>" "let x = 5; in x * 2 + 1" of
       Left err -> throwIO (ErrorCall (show err))
-      Right expr -> void (evaluate (runPureEval (eval (builtinEnv 0 []) expr)))
+      Right expr -> void (evaluate (runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)))
     -- Force the shared null thunk with no arena, then again under a
     -- live one.  Anything but the guard on the first force, or a dead
     -- arena on the second, is a broken precondition rather than the
@@ -11007,7 +11016,7 @@ instance MonadEval StubStoreEval where
   -- The stub keeps no call depth: it exists to answer store questions,
   -- and the ceiling is tested on the evaluators that enforce it.
   withCallFrame (StubStoreEval action) = StubStoreEval action
-  doesPathExist _ = pure False
+  doesPathExist _ _ = pure False
   listDirectory _ = throwEvalError "readDir: not available in the stub evaluator"
   importFile _ = throwEvalError "import: not available in the stub evaluator"
   getEnvVar _ = pure ""
@@ -11027,6 +11036,7 @@ instance MonadEval StubStoreEval where
   writeFetchCache _ _ = pure ()
   isExecutableFile _ = throwEvalError "builtins.path: not available in the stub evaluator"
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in the stub evaluator"
+  resolveSymlinks = pure
   addSourceNar _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
   addFixedOutputFile _ _ = throwEvalError "builtins.fetchurl: not available in the stub evaluator"
   traceMessage _ = pure ()
@@ -11037,6 +11047,8 @@ instance MonadEval StubStoreEval where
     StubStoreEval $ \env -> Right (Map.lookup (storePathToText defaultStoreDir sp) (seDrvs env))
   lookupSessionDrv _ = pure Nothing
   storeSourcePath = pure
+  evalPolicy = pure unrestrictedPolicy
+  checkUri _ = pure ()
   resolvePathLiteral = pure . canonPath
   forceThunk evalFn thunk@(Thunk ptr) = case readThunkValue thunk of
     Just val -> pure val
@@ -11056,7 +11068,7 @@ evalNixStub = evalNixStubWith . stubEnv
 evalNixStubWith :: StubEnv -> Text -> Either Text NixValue
 evalNixStubWith env source = case parseNix testBaseDir "<test>" source of
   Left err -> Left (T.pack (show err))
-  Right expr -> runStubStoreEvalWith env (eval (builtinEnv 0 []) expr)
+  Right expr -> runStubStoreEvalWith env (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 
 -- | Upstream conformance follow-ups (#50): behaviors that landed
 -- with #37 but had no direct test.  Pure cases here; filesystem-touching
@@ -12578,7 +12590,11 @@ runSuite = do
           testNarNameSafety,
           testStoreNameSinksIO,
           testClassIFollowups,
-          testClassIFollowupsIO
+          testClassIFollowupsIO,
+          testAbsolutePathStrings,
+          testEvalPolicyRules,
+          testEvalPolicyIO,
+          testEvalPolicyCLI
         ]
   let total = length results
       passed = length (filter id results)
@@ -12591,3 +12607,423 @@ runSuite = do
     else do
       putStrLn "All tests passed."
       exitSuccess
+
+-- ---------------------------------------------------------------------------
+-- Tests: evaluation policy - restricted and pure modes (#75)
+-- ---------------------------------------------------------------------------
+
+-- | A string naming a relative path is refused wherever a path is coerced
+-- from a string, as upstream's coerceToPath refuses it ("string '%s'
+-- doesn't represent an absolute path", observed from nix-instantiate
+-- 2.33.2 in every mode).  Load bearing for the access policy: a relative
+-- string would be checked against one location and opened at another.
+testAbsolutePathStrings :: IO [Bool]
+testAbsolutePathStrings = do
+  putStrLn "eval/absolute-path-strings"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-abs-strings"
+      relativeRefused label source =
+        runTestM label $ do
+          result <- evalNixIO testDir source
+          pure $ case result of
+            Left err
+              | "string 'foo' doesn't represent an absolute path" `T.isInfixOf` err -> Pass
+              | otherwise -> Fail ("expected the absolute-path refusal, got: " <> err)
+            Right val -> Fail ("expected a refusal, got: " <> T.pack (show val))
+  bracket_
+    (createDirectoryIfMissing True testDir >> BS.writeFile (testDir </> "foo") "1\n")
+    (forceRemoveIfExists testDir)
+    $ sequence
+      [ relativeRefused "readFile of a relative string" "builtins.readFile \"foo\"",
+        relativeRefused "import of a relative string" "import \"foo\"",
+        relativeRefused "pathExists of a relative string is an error, not false" "builtins.pathExists \"foo\"",
+        relativeRefused "readDir of a relative string" "builtins.readDir \"foo\"",
+        relativeRefused "readFileType of a relative string" "builtins.readFileType \"foo\"",
+        relativeRefused "hashFile of a relative string" "builtins.hashFile \"sha256\" \"foo\"",
+        relativeRefused "scopedImport of a relative string" "builtins.scopedImport { } \"foo\"",
+        -- The search-path miss carries upstream's hint, byte for byte.
+        runTest "a search path miss names the hint" $
+          assertEqual
+            "miss"
+            (Left "file 'nope' was not found in the Nix search path (add it using $NIX_PATH or -I)")
+            (evalNix "<nope>")
+      ]
+
+-- | The policies under test.
+restrictedPolicy, purePolicy :: EvalPolicy
+restrictedPolicy = unrestrictedPolicy {epRestrictEval = True}
+purePolicy = unrestrictedPolicy {epPureEval = True}
+
+-- | Parse and evaluate in 'PureEval' with the given policy's builtins
+-- table, for the constants the table itself decides.
+evalNixWith :: EvalPolicy -> Text -> Either Text NixValue
+evalNixWith policy source = case parseNix testBaseDir "<test>" source of
+  Left err -> Left (parseErrorTag <> T.pack (show err))
+  Right expr -> runPureEval (eval (builtinEnv policy 0 []) expr)
+
+-- | The pure rules behind the modes, each pinned to upstream's code at
+-- 2.24.9: CanonPath::isAllowed over the allow list, isAllowedURI and
+-- checkURI over allowed-uris, the git input's URL form, the nix.conf
+-- settings, and the builtins table under pure-eval.
+testEvalPolicyRules :: IO [Bool]
+testEvalPolicyRules = do
+  putStrLn "eval/policy-rules"
+  let oneRoot = allowPathIn "/a/b" noAllowedPaths
+      twoRoots = allowPathIn "/x" oneRoot
+      driveRoot = allowPathIn "C:/a/b" noAllowedPaths
+      github = ["https://github.com/NixOS"]
+      -- Successive nix.conf texts, weakest first, served to the expander
+      -- as files.
+      config texts =
+        let paths = ["/policy/" ++ show index ++ ".conf" | index <- [1 .. length texts]]
+            files = Map.fromList (zip paths texts)
+            readFrom path = Identity (maybe (Left Config.ConfigFileMissing) Right (Map.lookup path files))
+         in runIdentity (Config.loadConfig readFrom paths Nothing)
+      cfgPure = fmap ncPureEval . config
+      cfgRestrict = fmap ncRestrictEval . config
+      cfgUris = fmap ncAllowedUris . config
+  sequence
+    [ -- CanonPath::isAllowed
+      runTest "an allowed prefix admits itself" $
+        assertEqual "self" True (isAllowedPath oneRoot "/a/b"),
+      runTest "an allowed prefix admits what lies within it" $
+        assertEqual "within" True (isAllowedPath oneRoot "/a/b/c/d"),
+      runTest "an allowed prefix admits its ancestors" $
+        assertEqual "ancestor" True (isAllowedPath oneRoot "/a") `andThen` assertEqual "root" True (isAllowedPath oneRoot "/"),
+      runTest "a sibling sharing a text prefix is not within" $
+        assertEqual "sibling" False (isAllowedPath oneRoot "/a/bc"),
+      runTest "a path beside the prefix is refused" $
+        assertEqual "beside" False (isAllowedPath oneRoot "/a/c") `andThen` assertEqual "elsewhere" False (isAllowedPath twoRoots "/y"),
+      runTest "nothing allowed admits nothing, the root included" $
+        assertEqual "empty" False (isAllowedPath noAllowedPaths "/") `andThen` assertEqual "empty-etc" False (isAllowedPath noAllowedPaths "/etc"),
+      runTest "the spelling of an allowed prefix is canonicalized" $
+        assertEqual "canon" True (isAllowedPath (allowPathIn "/a//b/./" noAllowedPaths) "/a/b/c"),
+      -- The rules are platform-independent, so a Windows path value
+      -- (C:/..., the drive designator its first component) is decided
+      -- the same on every host.
+      runTest "a drive designator is the first component" $
+        assertEqual "within" True (isAllowedPath driveRoot "C:/a/b/c")
+          `andThen` assertEqual "self" True (isAllowedPath driveRoot "C:/a/b")
+          `andThen` assertEqual "drive-root" True (isAllowedPath driveRoot "C:/")
+          `andThen` assertEqual "beside" False (isAllowedPath driveRoot "C:/a/c")
+          `andThen` assertEqual "sibling" False (isAllowedPath driveRoot "C:/a/bc")
+          `andThen` assertEqual "other-drive" False (isAllowedPath driveRoot "D:/a/b/c")
+          `andThen` assertEqual "rootless" False (isAllowedPath driveRoot "/a/b/c")
+          `andThen` assertEqual "first" "C:/" (joinComponents (take 1 (pathComponents "C:/a/b")))
+          `andThen` assertEqual "first-posix" "/a" (joinComponents (take 1 (pathComponents "/a/b"))),
+      -- isAllowedURI
+      runTest "a URI equal to a prefix is allowed" $
+        assertEqual "equal" True (isAllowedUri github "https://github.com/NixOS"),
+      runTest "a URI under a prefix at a slash boundary is allowed" $
+        assertEqual "subpath" True (isAllowedUri github "https://github.com/NixOS/patchelf.git"),
+      runTest "a prefix does not admit a longer name" $
+        assertEqual "github.co" False (isAllowedUri ["https://github.co"] "https://github.com")
+          `andThen` assertEqual "NixOSx" False (isAllowedUri github "https://github.com/NixOSx"),
+      runTest "a prefix ending in a slash admits below it but not itself" $
+        assertEqual "below" True (isAllowedUri ["https://a/dir/"] "https://a/dir/x")
+          `andThen` assertEqual "itself" False (isAllowedUri ["https://a/dir/"] "https://a/dir"),
+      runTest "a bare scheme prefix admits its whole scheme" $
+        assertEqual "https:" True (isAllowedUri ["https:"] "https://anything/at/all")
+          `andThen` assertEqual "git+file:" True (isAllowedUri ["git+file:"] "git+file:///repo?exportIgnore=1")
+          `andThen` assertEqual "http:" False (isAllowedUri ["https:"] "http://x"),
+      -- checkURI
+      runTest "nothing is checked unless restrict-eval is on" $
+        assertEqual "off" (Right ()) (uriAccess purePolicy noAllowedPaths "https://x"),
+      runTest "a URI outside the list is refused with upstream's wording" $
+        assertEqual "refused" (Left "access to URI 'https://x/y' is forbidden in restricted mode") (uriAccess restrictedPolicy noAllowedPaths "https://x/y"),
+      runTest "a path URI is checked against the allowed paths" $
+        assertEqual "allowed" (Right ()) (uriAccess restrictedPolicy oneRoot "/a/b/f")
+          `andThen` assertEqual "refused" (Left "access to absolute path '/etc/passwd' is forbidden in restricted mode") (uriAccess restrictedPolicy oneRoot "/etc/passwd"),
+      runTest "a file URL is checked as its path, rooted" $
+        assertEqual "allowed" (Right ()) (uriAccess restrictedPolicy oneRoot "file:///a/b/f")
+          `andThen` assertEqual "rooted" (Left "access to absolute path '/etc/passwd' is forbidden in restricted mode") (uriAccess restrictedPolicy oneRoot "file://etc/passwd"),
+      runTest "a file URL with a drive is checked as that drive's path" $
+        assertEqual "allowed" (Right ()) (uriAccess restrictedPolicy driveRoot "file://C:/a/b/f")
+          `andThen` assertEqual "refused" (Left "access to absolute path 'C:/a/c' is forbidden in restricted mode") (uriAccess restrictedPolicy driveRoot "file://C:/a/c"),
+      runTest "the path refusal names pure mode when it is on" $
+        assertEqual "pure" "access to absolute path '/etc' is forbidden in pure evaluation mode (use '--impure' to override)" (forbiddenPathMessage purePolicy "/etc")
+          `andThen` assertEqual "both" "access to absolute path '/etc' is forbidden in pure evaluation mode (use '--impure' to override)" (forbiddenPathMessage purePolicy {epRestrictEval = True} "/etc"),
+      -- Input::toURLString for a git input (strings observed from
+      -- nix-instantiate 2.33.2, whose renderer is 2.24.9's)
+      runTest "an https url renders with git+ and exportIgnore" $
+        assertEqual "https" "git+https://github.com/NixOS/patchelf.git?exportIgnore=1" (gitInputUrl (gitInput "https://github.com/NixOS/patchelf.git")),
+      runTest "a ref follows exportIgnore in key order" $
+        assertEqual "ref" "git+https://github.com/NixOS/patchelf.git?exportIgnore=1&ref=master" (gitInputUrl (gitInput "https://github.com/NixOS/patchelf.git") {fgaRef = Just "master"}),
+      runTest "a rev renders lowercase after ref" $
+        assertEqual "rev" "git+https://h/r?exportIgnore=1&ref=main&rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" (gitInputUrl (gitInput "https://h/r") {fgaRef = Just "main", fgaRev = Just "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}),
+      runTest "shallow renders as a flag" $
+        assertEqual "shallow" "git+ssh://git@github.com/NixOS/patchelf.git?exportIgnore=1&shallow=1" (gitInputUrl (gitInput "ssh://git@github.com/NixOS/patchelf.git") {fgaShallow = True}),
+      runTest "submodules replaces exportIgnore" $
+        assertEqual "submodules" "git+https://h/r?submodules=1" (gitInputUrl (gitInput "https://h/r") {fgaSubmodules = True}),
+      runTest "a bare path becomes a file URL" $
+        assertEqual "path" "git+file:///p/repo?exportIgnore=1" (gitInputUrl (gitInput "/p/repo")),
+      runTest "an scp-like remote becomes ssh" $
+        assertEqual "scp" "git+ssh://git@github.com/NixOS/patchelf.git?exportIgnore=1" (gitInputUrl (gitInput "git@github.com:NixOS/patchelf.git")),
+      runTest "the git scheme keeps its name" $
+        assertEqual "git" "git://h/r?exportIgnore=1" (gitInputUrl (gitInput "git://h/r")),
+      runTest "a path is percent-encoded as upstream encodes it" $
+        assertEqual "space" "git+file:///p/my%20repo?exportIgnore=1" (gitInputUrl (gitInput "/p/my repo")),
+      -- nix.conf
+      runTest "pure-eval and restrict-eval parse upstream's Boolean spellings" $
+        assertEqual "true" (Right True) (cfgPure ["pure-eval = true"])
+          `andThen` assertEqual "yes" (Right True) (cfgPure ["pure-eval = yes"])
+          `andThen` assertEqual "1" (Right True) (cfgRestrict ["restrict-eval = 1"])
+          `andThen` assertEqual "false" (Right False) (cfgPure ["pure-eval = true", "pure-eval = false"])
+          `andThen` assertEqual "no" (Right False) (cfgRestrict ["restrict-eval = no"])
+          `andThen` assertEqual "0" (Right False) (cfgRestrict ["restrict-eval = 0"]),
+      runTest "a misspelled Boolean is an error with upstream's wording" $
+        assertEqual "typo" (Left "Boolean setting 'pure-eval' has invalid value 'ture'") (cfgPure ["pure-eval = ture"]),
+      runTest "allowed-uris is a list and extra- appends to it" $
+        assertEqual "uris" (Right ["https://a", "https://b", "https://c"]) (cfgUris ["allowed-uris = https://a https://b", "extra-allowed-uris = https://c"]),
+      runTest "extra- on a Boolean names no setting and is ignored" $
+        assertEqual "extra-bool" (Right False) (cfgPure ["extra-pure-eval = true"]),
+      runTest "the default config has both modes off" $
+        assertEqual "defaults" (Right (False, False, [])) ((\c -> (ncRestrictEval c, ncPureEval c, ncAllowedUris c)) <$> config []),
+      -- the builtins table
+      runTest "currentTime and currentSystem are absent under pure-eval" $
+        assertEqual "time" (Right (VBool False)) (evalNixWith purePolicy "builtins ? currentTime")
+          `andThen` assertEqual "system" (Right (VBool False)) (evalNixWith purePolicy "builtins ? currentSystem")
+          `andThen` assertEqual "time-restricted" (Right (VBool True)) (evalNixWith restrictedPolicy "builtins ? currentTime")
+          `andThen` assertEqual "time-default" (Right (VBool True)) (evalNixWith unrestrictedPolicy "builtins ? currentSystem")
+    ]
+  where
+    gitInput url =
+      FetchGitArgs
+        { fgaUrl = url,
+          fgaName = "source",
+          fgaRef = Nothing,
+          fgaRev = Nothing,
+          fgaSubmodules = False,
+          fgaShallow = False,
+          fgaAllRefs = False,
+          fgaNarHash = Nothing
+        }
+    andThen a b = case a of
+      Pass -> b
+      failed -> failed
+
+-- | 'evalNixIO' under a policy: the roots are allowed first, and the
+-- search path is what the caller passes, as the CLI would pass it.
+evalPolicyIO :: EvalPolicy -> [Text] -> [Thunk] -> FilePath -> Text -> IO (Either Text NixValue)
+evalPolicyIO policy roots searchPaths baseDir source = do
+  storeDir <- evalNixIOStoreDir
+  case parseNix baseDir "<test>" source of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> do
+      st0 <- newEvalState storeDir baseDir
+      let st = st0 {esPolicy = policy, esSearchPaths = searchPaths}
+      mapM_ (allowEvalPath st) roots
+      runEvalIO st (eval (builtinEnv policy (esTimestamp st) searchPaths) expr)
+
+-- | The battery the modes were pinned against, run through EvalIO: every
+-- expression here was run through nix-instantiate under restrict-eval and
+-- pure-eval, and the expected text is what upstream printed, except where
+-- the oracle version (2.24.9) differs from the installed 2.33.2 and the
+-- oracle's source wins (which prefix a refusal names, the fetchGit
+-- wording).  The fixture lives at a symlink-free root: a root behind a
+-- symlinked directory is refused by upstream too, since its allow list
+-- holds the spelling given and the walk resolves the link.
+testEvalPolicyIO :: IO [Bool]
+testEvalPolicyIO = do
+  putStrLn "eval/policy-io"
+  tmpBase <- getTemporaryDirectory >>= Dir.canonicalizePath
+  links <- symlinksAvailable
+  let root = tmpBase </> "nova-nix-test-policy"
+      allowed = root </> "allowed"
+      outside = root </> "outside"
+      repo = allowed </> "repo"
+      pathText = canonPathValue . T.pack
+      forbidden policy p = "access to absolute path '" <> pathText p <> "' is forbidden " <> modeText policy
+      modeText policy
+        | epPureEval policy = "in pure evaluation mode (use '--impure' to override)"
+        | otherwise = "in restricted mode"
+      -- The first prefix the walk pushes: /tmp on Linux, /private on
+      -- macOS, the drive root C:/ on Windows.
+      firstComponent = joinComponents (take 1 (pathComponents (pathText allowed)))
+      -- A fixture path as a path literal, relative to the base directory
+      -- (allowed): the one spelling that lexes as a path on every
+      -- platform, since a drive-letter path (C:/...) is a URI token to
+      -- upstream's lexer and to this one.
+      lit p = "../" <> pathText (makeRelative root p)
+      quoted p = "\"" <> pathText p <> "\""
+      run policy roots = evalPolicyIO policy roots [] allowed
+      restricted = run restrictedPolicy [pathText allowed]
+      pureRun = run purePolicy [pathText allowed]
+      withUris uris = run restrictedPolicy {epAllowedUris = uris} [pathText allowed]
+      expectLeft label expected action =
+        runTestM label $ do
+          result <- action
+          pure $ case result of
+            Left err -> assertEqual label expected err
+            Right val -> Fail (label <> ": expected a refusal, got " <> T.pack (show val))
+      expectRight label expected action =
+        runTestM label $ assertRight label <$> action <*> pure (assertEqual label expected)
+      expectRightWith label check action =
+        runTestM label $ (\r -> assertRight label r check) <$> action
+      repoUrl = "git+file://" <> pathText repo <> "?exportIgnore=1"
+      unrestricted = run unrestrictedPolicy []
+      symlinkMessage p = "path '" <> pathText p <> "' is a symlink"
+      -- A case that needs a symlink on disk, or the record of why it did
+      -- not run.
+      linked label mk = if links then mk label else runTest (label <> " (skipped: no symlinks here)") Pass
+  bracket_
+    ( do
+        forceRemoveIfExists root
+        createDirectoryIfMissing True (allowed </> "sub")
+        createDirectoryIfMissing True outside
+        BS.writeFile (allowed </> "data.txt") "hello\n"
+        BS.writeFile (allowed </> "sub" </> "data.txt") "inner\n"
+        BS.writeFile (allowed </> "y.nix") "7\n"
+        BS.writeFile (outside </> "x.nix") "42\n"
+        BS.writeFile (outside </> "secret.txt") "secret\n"
+        when links $ do
+          Dir.createFileLink (outside </> "secret.txt") (allowed </> "link")
+          Dir.createDirectoryLink outside (allowed </> "dirlink")
+          Dir.createFileLink "nowhere" (allowed </> "dangling")
+          createDirectoryIfMissing True (allowed </> "dir")
+          Dir.createFileLink (outside </> "x.nix") (allowed </> "dir" </> "default.nix")
+        createDirectoryIfMissing True repo
+        _ <- fixtureGit repo ["init", "--quiet"]
+        BS.writeFile (repo </> "f.txt") "in repo\n"
+        _ <- fixtureGit repo ["add", "-A"]
+        _ <- fixtureGit repo ["commit", "--quiet", "-m", "init"]
+        pure ()
+    )
+    (forceRemoveIfExists root)
+    $ do
+      rev <- T.strip <$> fixtureGit repo ["rev-parse", "HEAD"]
+      -- The fetch cache writes under XdgCache; point it at the fixture for
+      -- the duration so the suite never touches the developer's cache.
+      savedCacheHome <- lookupEnv "XDG_CACHE_HOME"
+      setEnv "XDG_CACHE_HOME" (root </> "cache")
+      results <-
+        sequence
+          [ -- restricted: the allow list
+            expectRight "a file under an allowed root reads" (mkStr "hello\n") (restricted ("builtins.readFile " <> lit (allowed </> "data.txt"))),
+            expectRight "a file deeper under an allowed root reads" (mkStr "inner\n") (restricted ("builtins.readFile " <> lit (allowed </> "sub" </> "data.txt"))),
+            expectLeft "a file beside the allowed root is refused, naming the first prefix outside the list" (forbidden restrictedPolicy outside) (restricted ("builtins.readFile " <> lit (outside </> "secret.txt"))),
+            expectLeft "with nothing allowed the refusal names the first component" (forbidden restrictedPolicy (T.unpack firstComponent)) (run restrictedPolicy [] ("builtins.readFile " <> lit (allowed </> "data.txt"))),
+            expectLeft "a string spelling the path is refused the same way" (forbidden restrictedPolicy outside) (restricted ("builtins.readFile " <> quoted (outside </> "secret.txt"))),
+            expectRight "import under the root works" (VInt 7) (restricted ("import " <> lit (allowed </> "y.nix"))),
+            expectLeft "import beside the root is refused" (forbidden restrictedPolicy outside) (restricted ("import " <> lit (outside </> "x.nix"))),
+            expectRight "pathExists is true under the root" (VBool True) (restricted ("builtins.pathExists " <> lit (allowed </> "data.txt"))),
+            expectRight "pathExists is false beside it, not an error" (VBool False) (restricted ("builtins.pathExists " <> lit (outside </> "secret.txt"))),
+            expectRightWith "readDir under the root lists" (\case VAttrs attrs -> assertEqual "entries" True (attrSetSize attrs == 1); other -> Fail (T.pack (show other))) (restricted ("builtins.readDir " <> lit (allowed </> "sub"))),
+            expectLeft "readDir beside the root is refused" (forbidden restrictedPolicy outside) (restricted ("builtins.readDir " <> lit outside)),
+            expectLeft "readFileType names the path asked for, no walk" (forbidden restrictedPolicy (outside </> "secret.txt")) (restricted ("builtins.readFileType " <> lit (outside </> "secret.txt"))),
+            expectLeft "hashFile walks like readFile" (forbidden restrictedPolicy outside) (restricted ("builtins.hashFile \"sha256\" " <> lit (outside </> "secret.txt"))),
+            expectRight "getEnv answers empty" (mkStr "") (restricted "builtins.getEnv \"PATH\""),
+            expectRight "a toFile result is readable afterwards" (mkStr "y") (restricted "builtins.readFile (builtins.toFile \"x\" \"y\")"),
+            expectRightWith "a source copy under the root is allowed" (\case VStr s _ -> assertEqual "store" True (BS.isPrefixOf "/nix/store/" s); other -> Fail (T.pack (show other))) (restricted "\"${./data.txt}\""),
+            expectLeft "a source copy beside the root is refused" (forbidden restrictedPolicy outside) (restricted ("\"${" <> lit (outside </> "secret.txt") <> "}\"")),
+            expectLeft "builtins.path beside the root is refused" (forbidden restrictedPolicy outside) (restricted ("builtins.path { path = " <> lit (outside </> "secret.txt") <> "; }")),
+            expectLeft "filterSource beside the root is refused" (forbidden restrictedPolicy outside) (restricted ("builtins.filterSource (p: t: true) " <> lit outside)),
+            expectLeft "tryEval does not catch a refusal" (forbidden restrictedPolicy outside) (restricted ("builtins.tryEval (builtins.readFile " <> lit (outside </> "secret.txt") <> ")")),
+            linked "a symlink under the root pointing outside is refused at its target" (\label -> expectLeft label (forbidden restrictedPolicy outside) (restricted ("builtins.readFile " <> lit (allowed </> "link")))),
+            linked "a directory import whose default.nix is a symlink outside the root is refused at the link's target" (\label -> expectLeft label (forbidden restrictedPolicy outside) (restricted ("import " <> lit (allowed </> "dir")))),
+            linked "scopedImport of that directory is refused the same way" (\label -> expectLeft label (forbidden restrictedPolicy outside) (restricted ("builtins.scopedImport {} " <> lit (allowed </> "dir")))),
+            linked "pathExists checks a symlink to a forbidden file in place: true" (\label -> expectRight label (VBool True) (restricted ("builtins.pathExists " <> lit (allowed </> "link")))),
+            linked "pathExists checks a symlink to a forbidden directory in place: true" (\label -> expectRight label (VBool True) (restricted ("builtins.pathExists " <> lit (allowed </> "dirlink")))),
+            linked "pathExists of a dangling symlink is true" (\label -> expectRight label (VBool True) (restricted ("builtins.pathExists " <> lit (allowed </> "dangling")))),
+            linked "pathExists through a symlinked directory follows the ancestor, which is refused: false" (\label -> expectRight label (VBool False) (restricted ("builtins.pathExists " <> lit (allowed </> "dirlink" </> "secret.txt")))),
+            linked "pathExists with a trailing slash follows the final link, which is refused: false" (\label -> expectRight label (VBool False) (restricted ("builtins.pathExists \"" <> pathText (allowed </> "dirlink") <> "/\""))),
+            linked "readFileType through a symlinked directory is refused at the symlink" (\label -> expectLeft label (symlinkMessage (allowed </> "dirlink")) (restricted ("builtins.readFileType " <> lit (allowed </> "dirlink" </> "secret.txt")))),
+            linked "readFileType through a symlinked directory is refused in the default mode too" (\label -> expectLeft label (symlinkMessage (allowed </> "dirlink")) (unrestricted ("builtins.readFileType " <> lit (allowed </> "dirlink" </> "secret.txt")))),
+            linked "pathExists of a dangling symlink is true in the default mode too" (\label -> expectRight label (VBool True) (unrestricted ("builtins.pathExists " <> lit (allowed </> "dangling")))),
+            linked "builtins.path resolves a symlink root and stores its target" (\label -> expectRight label (mkStr "directory") (unrestricted ("builtins.readFileType (builtins.path { path = " <> lit (allowed </> "dirlink") <> "; })"))),
+            linked "filterSource resolves a symlink root and stores its target" (\label -> expectRight label (mkStr "directory") (unrestricted ("builtins.readFileType (builtins.filterSource (p: t: true) " <> lit (allowed </> "dirlink") <> ")"))),
+            expectRight "pathExists with a trailing slash on a file is false" (VBool False) (unrestricted ("builtins.pathExists \"" <> pathText (allowed </> "data.txt") <> "/\"")),
+            expectRight "pathExists with a trailing slash on a directory is true" (VBool True) (unrestricted ("builtins.pathExists \"" <> pathText (allowed </> "sub") <> "/\"")),
+            expectRight "pathExists with a trailing slash and dot on a directory is true" (VBool True) (unrestricted ("builtins.pathExists \"" <> pathText (allowed </> "sub") <> "/.\"")),
+            -- restricted: URIs
+            expectLeft "a fetch of an unlisted URI is refused before any download" "access to URI 'https://example.invalid/x' is forbidden in restricted mode" (restricted "builtins.fetchurl \"https://example.invalid/x\""),
+            expectLeft "a file URL beside the root is refused as its path" (forbidden restrictedPolicy (outside </> "secret.txt")) (restricted ("builtins.fetchurl \"file://" <> pathText (outside </> "secret.txt") <> "\"")),
+            expectRightWith "a file URL under the root fetches" (\case VPath p -> assertEqual "store" True (T.isPrefixOf "/nix/store/" p); other -> Fail (T.pack (show other))) (restricted ("builtins.fetchurl { url = \"file://" <> pathText (allowed </> "data.txt") <> "\"; sha256 = \"5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03\"; }")),
+            expectLeft "fetchTarball of an unlisted URI is refused" "access to URI 'https://example.invalid/x.tar.gz' is forbidden in restricted mode" (restricted "builtins.fetchTarball \"https://example.invalid/x.tar.gz\""),
+            expectLeft "an allowed-uris prefix admits only its subpaths" "access to URI 'https://example.invalid/dir2/x' is forbidden in restricted mode" (withUris ["https://example.invalid/dir"] "builtins.fetchurl { url = \"https://example.invalid/dir2/x\"; sha256 = \"5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03\"; }"),
+            runTestM "an allowed-uris prefix lets the fetch proceed to the network" $ do
+              result <- withUris ["https://example.invalid/dir"] "builtins.fetchurl { url = \"https://example.invalid/dir/x\"; sha256 = \"5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03\"; }"
+              pure $ case result of
+                Left err | "is forbidden" `T.isInfixOf` err -> Fail ("the gate refused an allowed URI: " <> err)
+                _ -> Pass,
+            expectLeft "fetchGit of an allowed path is still a URI, checked in its git+file form" ("access to URI '" <> repoUrl <> "' is forbidden in restricted mode") (restricted ("builtins.fetchGit " <> quoted repo)),
+            expectRight "an allowed git+file prefix admits the fetch and its tree is readable afterwards" (mkStr "in repo\n") (withUris ["git+file://" <> pathText allowed] ("builtins.readFile ((builtins.fetchGit " <> quoted repo <> ").outPath + \"/f.txt\")")),
+            -- restricted: the search path
+            expectRight "a search path root is where <name> resolves and reads" (VInt 7) (evalPolicyIO restrictedPolicy [pathText allowed] (parseNixPath ("allowed=" <> pathText allowed)) allowed "import <allowed/y.nix>"),
+            expectLeft "a search path miss carries the NIX_PATH hint and is catchable" "file 'nope' was not found in the Nix search path (add it using $NIX_PATH or -I)" (restricted "<nope>"),
+            expectRight "tryEval catches the miss" (VBool False) (restricted "(builtins.tryEval <nope>).success"),
+            -- pure
+            expectLeft "pure mode refuses with its own clause" (forbidden purePolicy outside) (pureRun ("builtins.readFile " <> lit (outside </> "secret.txt"))),
+            expectRight "pure mode still reads under an allowed root" (mkStr "hello\n") (pureRun ("builtins.readFile " <> lit (allowed </> "data.txt"))),
+            expectRight "pure mode has no currentTime" (VBool False) (pureRun "builtins ? currentTime"),
+            expectLeft "pure mode words the search path miss differently" "cannot look up '<nope>' in pure evaluation mode (use '--impure' to override)" (pureRun "<nope>"),
+            expectRight "the pure miss is catchable too" (VBool False) (pureRun "(builtins.tryEval <nope>).success"),
+            expectLeft "storePath is refused in pure mode before its argument is read" "'builtins.storePath' is not allowed in pure evaluation mode" (pureRun "builtins.storePath 42"),
+            expectLeft "fetchurl needs a hash in pure mode, checked before any download" "in pure evaluation mode, 'fetchurl' requires a 'sha256' argument" (pureRun "builtins.fetchurl \"https://example.invalid/x\""),
+            expectLeft "fetchTarball needs a hash in pure mode" "in pure evaluation mode, 'fetchTarball' requires a 'sha256' argument" (pureRun "builtins.fetchTarball \"https://example.invalid/x.tar.gz\""),
+            expectLeft "fetchGit without a rev is unlocked in pure mode" ("in pure evaluation mode, 'fetchGit' will not fetch unlocked input '" <> repoUrl <> "'") (pureRun ("builtins.fetchGit " <> quoted repo)),
+            expectRight "fetchGit with a rev is locked and fetches in pure mode" (mkStr "in repo\n") (pureRun ("builtins.readFile ((builtins.fetchGit { url = " <> quoted repo <> "; rev = \"" <> rev <> "\"; }).outPath + \"/f.txt\")")),
+            expectLeft "a home-relative literal cannot resolve in pure mode" "the path '~/x' can not be resolved in pure mode" (pureRun "~/x"),
+            expectRight "pure mode's getEnv answers empty" (mkStr "") (pureRun "builtins.getEnv \"PATH\""),
+            expectRight "a path literal is a value, read or not" (mkStr (pathText (outside </> "secret.txt"))) (pureRun ("builtins.toString " <> lit (outside </> "secret.txt"))),
+            -- unrestricted stays unrestricted
+            expectRight "the default policy reads anywhere" (mkStr "secret\n") (run unrestrictedPolicy [] ("builtins.readFile " <> lit (outside </> "secret.txt")))
+          ]
+      maybe (unsetEnv "XDG_CACHE_HOME") (setEnv "XDG_CACHE_HOME") savedCacheHome
+      pure results
+
+-- | The flags and settings through the binary: the modes select
+-- themselves from the command line and from NIX_CONFIG, and a refusal
+-- surfaces as the eval error it is.
+testEvalPolicyCLI :: IO [Bool]
+testEvalPolicyCLI = do
+  putStrLn "cli/eval-policy"
+  tmpBase <- getTemporaryDirectory >>= Dir.canonicalizePath
+  ambient <- getEnvironment
+  cwd <- Dir.getCurrentDirectory
+  let root = tmpBase </> "nova-nix-test-cli-policy"
+      -- Where a channel: entry would land if it were taken for a path.
+      cwdChannelEntry = T.unpack (canonPathValue (T.pack (cwd </> "channel:nova-probe")))
+      allowed = root </> "allowed"
+      -- A string, since a drive-letter path (C:/...) is a URI token and
+      -- a native spelling (C:\...) is no token at all; an absolute
+      -- string is coerced to a path on every platform.
+      outsideFile = T.unpack (canonPathValue (T.pack (root </> "outside.txt")))
+      isolate extraConfig =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> extraConfig)
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "NIX_PATH"]) ambient
+      runCLI extraConfig args =
+        Proc.readCreateProcessWithExitCode
+          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just (isolate extraConfig)})
+          ""
+      expectOut label extraConfig args expected =
+        runTestM ("CLI " <> label) $ do
+          (code, out, err) <- runCLI extraConfig args
+          pure $ case (code, lines out) of
+            (ExitSuccess, line : _) -> assertEqual label expected line
+            _ -> Fail ("CLI: " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err)
+      expectErr label extraConfig args needle =
+        runTestM ("CLI " <> label) $ do
+          (code, _, err) <- runCLI extraConfig args
+          pure $
+            if code /= ExitSuccess && needle `T.isInfixOf` T.pack err
+              then Pass
+              else Fail ("expected a failure mentioning " <> needle <> ", got " <> T.pack (show (code, err)))
+  bracket_
+    ( do
+        forceRemoveIfExists root
+        createDirectoryIfMissing True allowed
+        BS.writeFile (allowed </> "data.txt") "hello\n"
+        BS.writeFile (root </> "outside.txt") "no\n"
+    )
+    (forceRemoveIfExists root)
+    $ sequence
+      [ expectOut "--pure-eval hides currentTime" "" ["eval", "--pure-eval", "--expr", "builtins ? currentTime"] "false",
+        expectOut "--restrict-eval empties getEnv" "" ["eval", "--restrict-eval", "--expr", "builtins.getEnv \"HOME\""] "\"\"",
+        expectOut "pure-eval from NIX_CONFIG" "pure-eval = true\n" ["eval", "--expr", "builtins ? currentSystem"] "false",
+        expectOut "a --nix-path root is readable under --restrict-eval" "" ["eval", "--restrict-eval", "--nix-path", "allowed=" ++ allowed, "--expr", "builtins.readFile <allowed/data.txt>"] "\"hello\\n\"",
+        expectErr "a read outside the roots fails the command" "" ["eval", "--restrict-eval", "--expr", "builtins.readFile \"" ++ outsideFile ++ "\""] "is forbidden in restricted mode",
+        expectErr "a channel: search path entry allows nothing" "" ["eval", "--restrict-eval", "--nix-path", "nixpkgs=channel:nova-probe", "--expr", "builtins.readFile \"" ++ cwdChannelEntry ++ "\""] "is forbidden in restricted mode",
+        expectOut "build accepts the flag before its target" "" ["build", "--pure-eval", "--help"] "Usage: nova-nix [--nix-path NAME=PATH] <command>"
+      ]

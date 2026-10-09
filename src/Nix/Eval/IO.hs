@@ -11,7 +11,7 @@
 --
 -- @
 -- st <- newEvalState "/path/to/project"
--- result <- runEvalIO st (eval (builtinEnv 0 []) expr)
+-- result <- runEvalIO st (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 -- @
 module Nix.Eval.IO
   ( -- * Evaluator
@@ -21,6 +21,7 @@ module Nix.Eval.IO
     -- * State
     EvalState (..),
     newEvalState,
+    allowEvalPath,
 
     -- * Errors
     EvalErrorKind (..),
@@ -35,10 +36,12 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
 import Crypto.Random (getRandomBytes)
 import qualified Data.ByteString as BS
+import Data.Either (fromRight, isRight)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -52,8 +55,9 @@ import Nix.Eval.CList (CList (..))
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
+import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (copyPathInto, unpackNarEntry)
@@ -64,7 +68,7 @@ import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
-import System.FilePath (isRelative, takeDirectory, (</>))
+import System.FilePath (isAbsolute, isPathSeparator, isRelative, takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import qualified System.Process as Proc
 
@@ -138,7 +142,18 @@ data EvalState = EvalState
     -- 'withCallFrame' scopes it with 'local', so a failure unwinding
     -- through a frame leaves the count it found, upstream's RAII guard
     -- with nothing to restore.
-    esCallDepth :: !CallDepth
+    esCallDepth :: !CallDepth,
+    -- | What this evaluation may reach: upstream's @restrict-eval@ and
+    -- @pure-eval@ settings and the @allowed-uris@ list.  Unrestricted
+    -- unless the caller says otherwise, as upstream's defaults are.
+    esPolicy :: !EvalPolicy,
+    -- | The allowed path prefixes under a restricting policy: the search
+    -- path roots the caller seeded with 'allowEvalPath', plus every store
+    -- object this evaluation copies, fetches or writes (upstream's
+    -- @allowPath@ after each such step), plus the fetchers' scratch
+    -- directories.  Mutable because it grows as evaluation proceeds, like
+    -- the import cache.
+    esAllowedPaths :: !(IORef AllowedPaths)
   }
 
 -- | Create a fresh evaluation state rooted at the given directory, reading
@@ -146,6 +161,10 @@ data EvalState = EvalState
 -- Reads @NIX_PATH@ from the environment to populate search paths.  The
 -- call-depth ceiling starts at upstream's default; a caller with a
 -- configured one replaces 'esCallDepth'.
+--
+-- The state is unrestricted.  A restricting policy is set on 'esPolicy',
+-- and the roots it should admit are seeded with 'allowEvalPath' before
+-- evaluation starts, as upstream's constructor allows its lookup path.
 newEvalState :: SP.StoreDir -> FilePath -> IO EvalState
 newEvalState storeDir baseDir = do
   cache <- newIORef Map.empty
@@ -153,6 +172,7 @@ newEvalState storeDir baseDir = do
   drvClosure <- newIORef Map.empty
   srcCache <- newIORef Map.empty
   storeWriteCache <- newIORef Map.empty
+  allowedPaths <- newIORef noAllowedPaths
   now <- floor <$> getPOSIXTime :: IO Int64
   nixPathStr <- lookupEnvText "NIX_PATH"
   let searchPaths = case nixPathStr of
@@ -169,8 +189,20 @@ newEvalState storeDir baseDir = do
         esStoreDir = storeDir,
         esTimestamp = now,
         esSearchPaths = searchPaths,
-        esCallDepth = topLevelCallDepth defaultMaxCallDepth
+        esCallDepth = topLevelCallDepth defaultMaxCallDepth,
+        esPolicy = unrestrictedPolicy,
+        esAllowedPaths = allowedPaths
       }
+
+-- | Grant access to a path prefix (upstream @EvalState::allowPath@): the
+-- caller seeds the search path roots before evaluation, and the instance
+-- adds every store object the evaluation produces.  Like upstream's, this
+-- is a no-op when nothing restricts access, so an unrestricted evaluation
+-- does not accumulate a set it never consults.
+allowEvalPath :: EvalState -> Text -> IO ()
+allowEvalPath st path =
+  when (pathsRestricted (esPolicy st)) $
+    modifyIORef' (esAllowedPaths st) (allowPathIn path)
 
 -- ---------------------------------------------------------------------------
 -- EvalIO newtype
@@ -213,9 +245,20 @@ instance MonadEval EvalIO where
       (\deeper -> local (\s -> s {esCallDepth = deeper}) action)
       (enterCallFrame depth)
 
-  doesPathExist path = evalStoreTextPath path >>= \resolved -> wrapIO (Dir.doesPathExist resolved)
+  -- A refused path reads as absent, as upstream's pathExists turns a
+  -- RestrictedPathError into false.  The query decides the walk and the
+  -- stat as prim_pathExists does: a plain path is resolved through its
+  -- ancestors only and lstat'ed in place, so a symlink exists whatever
+  -- it points at; a path that must be a directory is resolved fully and
+  -- must stat as one.
+  doesPathExist query path = do
+    allowed <- pathAllowed (existenceResolution query) path
+    if allowed
+      then evalStoreTextPath path >>= \resolved -> wrapIO (existsAs query resolved)
+      else pure False
 
   listDirectory path = do
+    accessPath path
     dir <- evalStoreTextPath path
     wrapIO $ do
       entries <- Dir.listDirectory dir
@@ -225,6 +268,10 @@ instance MonadEval EvalIO where
     baseDir <- EvalIO (asks esBaseDir)
     timestamp <- EvalIO (asks esTimestamp)
     searchPaths <- EvalIO (asks esSearchPaths)
+    policy <- EvalIO (asks esPolicy)
+    -- Resolved, and so checked, before the cache is consulted, as
+    -- upstream resolves the file before its fileEvalCache lookup: a
+    -- cached import is no more readable than a fresh one.
     (target, ioTarget) <- resolveImportTarget baseDir rawPath
     -- Check import cache (readIORef cannot throw, no wrapIO needed)
     cacheRef <- EvalIO (asks esImportCache)
@@ -244,7 +291,7 @@ instance MonadEval EvalIO where
                   EvalIO
                     ( local
                         (\s -> s {esBaseDir = fileDir})
-                        (unEvalIO (eval (builtinEnv timestamp searchPaths) expr))
+                        (unEvalIO (eval (builtinEnv policy timestamp searchPaths) expr))
                     )
             result <- nested
             -- Skip caching very large attr sets (e.g. all-packages.nix
@@ -258,9 +305,15 @@ instance MonadEval EvalIO where
               wrapIO (modifyIORef' cacheRef (Map.insert target result))
             pure result
 
-  getEnvVar name = wrapIO $ do
-    mval <- lookupEnvText (T.unpack name)
-    pure (maybe "" T.pack mval)
+  -- Upstream's getEnv answers empty under either setting
+  -- (@prim_getEnv@: @restrictEval || pureEval ? "" : getEnv(name)@).
+  getEnvVar name = do
+    policy <- EvalIO (asks esPolicy)
+    if pathsRestricted policy
+      then pure ""
+      else wrapIO $ do
+        mval <- lookupEnvText (T.unpack name)
+        pure (maybe "" T.pack mval)
 
   lookupDrvHash key = EvalIO $ do
     ref <- asks esDrvModuloCache
@@ -312,12 +365,16 @@ instance MonadEval EvalIO where
         case SP.checkStorePathName name of
           Left err -> throwEvalError (copyContext <> ": " <> SP.storePathNameErrorText err)
           Right () -> pure ()
+        accessPath rawPath
         resolvedSource <- evalStoreTextPath rawPath
         entry <- wrapIO (ExecBit.serialiseFromPath resolvedSource)
         let narDigest = sha256Digest (NAR.serialise entry)
         sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
         let spText = canonicalStorePathText sp
         EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath spText)))
+        -- The copy is readable afterwards, as upstream's copyPathToStore
+        -- allows its destination.
+        allowPath spText
         pure spText
 
   getCurrentTime = EvalIO (asks esTimestamp)
@@ -346,12 +403,15 @@ instance MonadEval EvalIO where
         Dir.removePathForcibly filePath
         BS.writeFile filePath contents
     recordStoreWrite storePath refs SP.WriteText
+    -- Upstream's toFile returns the path through allowAndSetStorePathString.
+    allowPath storePath
     pure storePath
 
   scopedImportFile scope rawPath = do
     baseDir <- EvalIO (asks esBaseDir)
     timestamp <- EvalIO (asks esTimestamp)
     searchPaths <- EvalIO (asks esSearchPaths)
+    policy <- EvalIO (asks esPolicy)
     (target, ioTarget) <- resolveImportTarget baseDir rawPath
     source <- wrapIO (readFileAutoEncoding ioTarget)
     let fileDir = takeDirectory target
@@ -361,16 +421,27 @@ instance MonadEval EvalIO where
           ("scopedImport " <> T.pack target <> ": " <> T.pack (show err))
       Right expr -> do
         -- No import cache for scoped imports (different scopes = different results)
-        let scopedEnv = builtinEnvWithScope timestamp searchPaths scope
+        let scopedEnv = builtinEnvWithScope policy timestamp searchPaths scope
         EvalIO
           ( local
               (\s -> s {esBaseDir = fileDir})
               (unEvalIO (eval scopedEnv expr))
           )
 
-  readFileBytes path = evalStoreTextPath path >>= \resolved -> wrapIO (BS.readFile resolved)
+  readFileBytes path = do
+    accessPath path
+    evalStoreTextPath path >>= \resolved -> wrapIO (BS.readFile resolved)
 
-  getFileType path = evalStoreTextPath path >>= \resolved -> wrapIO (classifyPath resolved)
+  -- An lstat of the path itself, no symlink walk: upstream's readFileType
+  -- realises its argument without resolution, the allow list checks the
+  -- path it is handed (so a refusal names the path asked for), and the
+  -- posix accessor beneath refuses a symlink anywhere above it, in every
+  -- mode, so the type of a path reached through a symlinked directory is
+  -- never revealed.
+  getFileType path = do
+    accessPathDirect path
+    refuseSymlinkedAncestor path
+    evalStoreTextPath path >>= \resolved -> wrapIO (classifyPath resolved)
 
   runProcess cmd cmdArgs stdinText = wrapIO $ do
     let cp =
@@ -386,16 +457,27 @@ instance MonadEval EvalIO where
           ExitFailure n -> n
     pure (code, T.pack stdoutStr, T.pack stderrStr)
 
-  createScratchDir prefix = wrapIO $ do
-    tmpBase <- Dir.getTemporaryDirectory
-    suffix <- getRandomBytes scratchSuffixBytes
-    -- Forward-slash join: the scratch path feeds sh pipelines (tar -C)
-    -- and store copies, both of which accept '/' on every host.
-    let dir = tmpBase <> "/" <> T.unpack (prefix <> bytesToHexText suffix)
-    -- createDirectory is exclusive: an already-existing path fails the
-    -- fetch rather than being silently adopted.
-    Dir.createDirectory dir
-    pure (T.pack dir)
+  createScratchDir prefix = do
+    dir <- wrapIO $ do
+      tmpBase <- Dir.getTemporaryDirectory
+      suffix <- getRandomBytes scratchSuffixBytes
+      -- Forward-slash join: the scratch path feeds sh pipelines (tar -C)
+      -- and store copies, both of which accept '/' on every host.
+      let dir = tmpBase <> "/" <> T.unpack (prefix <> bytesToHexText suffix)
+      -- createDirectory is exclusive: an already-existing path fails the
+      -- fetch rather than being silently adopted.
+      Dir.createDirectory dir
+      pure (T.pack dir)
+    -- The evaluator's own scratch area, not ambient filesystem: what a
+    -- fetch lands there is read back under the same rule that makes a
+    -- fetched store path readable afterwards.  Allowed under its resolved
+    -- spelling too, because the walk follows symlinks and a temp dir can
+    -- sit behind one (macOS's /var is /private/var), and under the given
+    -- spelling so the walk may traverse the link's own ancestors.
+    resolved <- wrapIO (Dir.canonicalizePath (T.unpack dir))
+    allowPath dir
+    allowPath (T.pack resolved)
+    pure dir
 
   removeScratchDir dir = wrapIO (Dir.removePathForcibly (T.unpack dir))
 
@@ -411,7 +493,10 @@ instance MonadEval EvalIO where
     -- existence check in copyToStoreIfMissing is sound - changed source
     -- content can never serve stale bytes from an earlier copy (the old
     -- scheme hashed the path STRING, so it did exactly that).
-    resolvedSource <- evalStoreTextPath srcPath
+    -- The tree behind the root's symlinks, under the root's own name, as
+    -- upstream's copyPathToStore and addPath store path.resolveSymlinks()
+    -- under path.baseName(); the walk checks the policy on the way.
+    resolvedSource <- resolveSymlinks srcPath >>= evalStoreTextPath
     entry <- wrapIO (ExecBit.serialiseFromPath resolvedSource)
     let narDigest = sha256Digest (NAR.serialise entry)
     case expectedSha256 of
@@ -430,15 +515,21 @@ instance MonadEval EvalIO where
     let destPath = canonicalStorePathText sp
     wrapIO (copyToStoreVerified resolvedSource destFilePath (takeDirectory destFilePath) narDigest)
     recordStoreWrite destPath [] SP.WriteRecursive
+    allowPath destPath
     pure destPath
 
   narHashOfPath path = do
+    accessPath path
     resolved <- evalStoreTextPath path
     wrapIO (sha256Digest . NAR.serialise <$> ExecBit.serialiseFromPath resolved)
 
-  isExecutableFile path = evalStoreTextPath path >>= \resolved -> wrapIO (ExecBit.isExecutable resolved)
+  isExecutableFile path = do
+    accessPath path
+    evalStoreTextPath path >>= \resolved -> wrapIO (ExecBit.isExecutable resolved)
 
-  setExecutableFile path = evalStoreTextPath path >>= \resolved -> wrapIO (ExecBit.markExecutable resolved)
+  setExecutableFile path = do
+    accessPath path
+    evalStoreTextPath path >>= \resolved -> wrapIO (ExecBit.markExecutable resolved)
 
   lookupFetchCache key = wrapIO $ do
     file <- fetchCacheFile key
@@ -458,7 +549,11 @@ instance MonadEval EvalIO where
     -- materializeEvalStoreWrites skips a path that is already valid, so
     -- re-recording one costs nothing and closes the case where the row is
     -- missing.
-    when there (recordStoreWrite path [] SP.WriteRecursive)
+    when there $ do
+      recordStoreWrite path [] SP.WriteRecursive
+      -- A fetch result, whether fetched now or remembered: upstream
+      -- allows the store path every fetcher returns.
+      allowPath path
     pure there
 
   writeFetchCache key value = wrapIO $ do
@@ -480,7 +575,12 @@ instance MonadEval EvalIO where
         IO (Either SomeException ())
     pure ()
 
-  readSymlinkTarget path = evalStoreTextPath path >>= \resolved -> wrapIO (T.pack <$> Dir.getSymbolicLinkTarget resolved)
+  -- The two checks of getFileType: upstream's readLink asserts no
+  -- symlink above the path it is handed as well.
+  readSymlinkTarget path = do
+    accessPathDirect path
+    refuseSymlinkedAncestor path
+    evalStoreTextPath path >>= \resolved -> wrapIO (T.pack <$> Dir.getSymbolicLinkTarget resolved)
 
   addSourceNar name narBytes =
     case NAR.deserialise narBytes of
@@ -508,6 +608,7 @@ instance MonadEval EvalIO where
             unpacked <- unpackNarEntry sensitivity destFilePath entry
             either (throwIO . userError . T.unpack) pure unpacked
         recordStoreWrite destPath [] SP.WriteRecursive
+        allowPath destPath
         pure destPath
 
   addFixedOutputFile name bytes = do
@@ -526,22 +627,47 @@ instance MonadEval EvalIO where
         Dir.removePathForcibly filePath
         BS.writeFile filePath bytes
     recordStoreWrite storePath [] SP.WriteFlat
+    allowPath storePath
     pure storePath
 
   traceMessage msg = EvalIO (liftIO (hPutStrLn stderr (T.unpack msg)))
 
+  evalPolicy = EvalIO (asks esPolicy)
+
+  checkUri uri = do
+    st <- EvalIO ask
+    allowed <- EvalIO (liftIO (readIORef (esAllowedPaths st)))
+    either throwEvalError pure (uriAccess (esPolicy st) allowed uri)
+
+  -- Store text stays canonical in the value domain, as it does for an
+  -- import target ('resolveImportTarget' says why); every other path
+  -- resolves as a platform path, the policy walk having followed the
+  -- same links first.
+  resolveSymlinks path = do
+    accessPath path
+    if SP.isCanonicalStoreText path
+      then pure (canonPath path)
+      else wrapIO (canonPathValue . T.pack <$> Dir.canonicalizePath (T.unpack path))
+
   resolvePathLiteral path = do
     baseDir <- EvalIO (asks esBaseDir)
+    policy <- EvalIO (asks esPolicy)
     -- ~/x resolves against the home directory (upstream lexes HPATH and
     -- expands it at eval); everything else relative joins the base dir.
     -- Both end at the producer gate ('canonPathValue'): the value is
     -- absolute, lexically canonical, and slash-spelled regardless of
     -- the base dir's native spelling - platform separators exist only
-    -- at the filesystem boundary.
+    -- at the filesystem boundary.  Under pure-eval the home directory is
+    -- ambient state, and upstream's parser refuses the literal outright
+    -- (parser.y, the HPATH rule); the same refusal lands here, where the
+    -- expansion is.
     expanded <- case T.stripPrefix "~/" path of
-      Just below -> do
-        home <- wrapIO Dir.getHomeDirectory
-        pure (home </> T.unpack below)
+      Just below
+        | epPureEval policy ->
+            throwEvalError ("the path '" <> path <> "' can not be resolved in pure mode")
+        | otherwise -> do
+            home <- wrapIO Dir.getHomeDirectory
+            pure (home </> T.unpack below)
       Nothing -> pure (T.unpack path)
     let absolute = if isRelative expanded then baseDir </> expanded else expanded
     pure (canonPathValue (T.pack absolute))
@@ -669,6 +795,173 @@ scratchSuffixBytes = 16
 -- Helpers
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Access policy
+-- ---------------------------------------------------------------------------
+
+-- | Admit a store object this evaluation produced (upstream's @allowPath@
+-- after a copy, fetch or write).
+allowPath :: Text -> EvalIO ()
+allowPath path = do
+  st <- EvalIO ask
+  EvalIO (liftIO (allowEvalPath st path))
+
+-- | Refuse a read unless the whole path, symlinks resolved, lies in the
+-- allowed prefixes.  Upstream's accessor checks every prefix as its
+-- symlink walk pushes it (@SourceAccessor::resolveSymlinks@ through
+-- @FilteringSourceAccessor::maybeLstat@, which throws at 2.24.9), so the
+-- refusal names the first prefix outside the allow list - @/etc@ for
+-- @/etc/passwd@ when nothing under @/etc@ is allowed - and a symlink's
+-- target is checked where the walk follows it.  A no-op when nothing
+-- restricts access.
+accessPath :: Text -> EvalIO ()
+accessPath path = do
+  st <- EvalIO ask
+  when (pathsRestricted (esPolicy st)) $ do
+    allowed <- EvalIO (liftIO (readIORef (esAllowedPaths st)))
+    walkAllowed ResolveFull st allowed path >>= either throwEvalError pure
+
+-- | Refuse a read unless the path itself is allowed, no symlink walk: the
+-- check upstream's accessor makes on an lstat or readlink of the path it
+-- is handed.  The refusal names the path asked for.
+accessPathDirect :: Text -> EvalIO ()
+accessPathDirect path = do
+  st <- EvalIO ask
+  when (pathsRestricted (esPolicy st)) $ do
+    allowed <- EvalIO (liftIO (readIORef (esAllowedPaths st)))
+    let canonical = canonPathValue path
+    unless (isAbsolutePath canonical) $ throwEvalError (relativePathMessage path)
+    unless (isAllowedPath allowed canonical) $
+      throwEvalError (forbiddenPathMessage (esPolicy st) canonical)
+
+-- | Whether the walk would admit the path, for the one reader that
+-- answers a Boolean instead of refusing.
+pathAllowed :: SymlinkResolution -> Text -> EvalIO Bool
+pathAllowed mode path = do
+  st <- EvalIO ask
+  if pathsRestricted (esPolicy st)
+    then do
+      allowed <- EvalIO (liftIO (readIORef (esAllowedPaths st)))
+      isRight <$> walkAllowed mode st allowed path
+    else pure True
+
+-- | Refuse a path with a symlink anywhere above it, naming the deepest
+-- one: upstream's posix accessor asserts this on an lstat or readlink of
+-- the path it is handed (@PosixSourceAccessor::assertNoSymlinks@ over
+-- the parent, at 2.24.9), in every mode, and names the first symlink it
+-- meets walking up from the parent.
+refuseSymlinkedAncestor :: Text -> EvalIO ()
+refuseSymlinkedAncestor path = do
+  st <- EvalIO ask
+  mapM_ (check st) (strictAncestors (canonPathValue path))
+  where
+    check st ancestor = do
+      target <- EvalIO (liftIO (symlinkTargetAt st ancestor))
+      when (isJust target) $
+        throwEvalError ("path '" <> ancestor <> "' is a symlink")
+
+-- | A canonical path's ancestors below the root, deepest first.
+strictAncestors :: Text -> [Text]
+strictAncestors path =
+  [joinComponents (take n components) | n <- [length components - 1, length components - 2 .. 1]]
+  where
+    components = pathComponents path
+
+-- | How a 'PathExistence' query walks the path: a directory is demanded
+-- through the final symlink, an entry is found in place.
+existenceResolution :: PathExistence -> SymlinkResolution
+existenceResolution ExistsAsDirectory = ResolveFull
+existenceResolution ExistsAsEntry = ResolveAncestors
+
+-- | The stat a 'PathExistence' query ends in: a directory through every
+-- symlink, or an entry of any kind in place.
+existsAs :: PathExistence -> FilePath -> IO Bool
+existsAs ExistsAsDirectory = Dir.doesDirectoryExist
+existsAs ExistsAsEntry = lstatExists
+
+-- | Whether an entry is at the path, a dangling symlink included: an
+-- lstat, as upstream's @maybeLstat@ is.  'Dir.pathIsSymbolicLink' is the
+-- lstat the directory package exposes, and it throws for a missing path,
+-- so any failure is absence, as it is for 'Dir.doesPathExist'.
+lstatExists :: FilePath -> IO Bool
+lstatExists fp = do
+  outcome <- try (Dir.pathIsSymbolicLink fp) :: IO (Either IOException Bool)
+  pure (isRight outcome)
+
+-- | Upstream's @coerceToPath@ refusal of a relative string.  The builtins
+-- refuse one before it gets here; the gate repeats the refusal because
+-- its soundness depends on it.
+relativePathMessage :: Text -> Text
+relativePathMessage path = "string '" <> path <> "' doesn't represent an absolute path"
+
+-- | Which symlinks a walk follows, upstream's @SymlinkResolution@: every
+-- one, or every one but the last component's, which is then checked in
+-- place.
+data SymlinkResolution = ResolveFull | ResolveAncestors
+  deriving (Eq, Show)
+
+-- | The symlink-resolving prefix walk of upstream's
+-- @SourceAccessor::resolveSymlinks@ at 2.24.9, with the allow list
+-- consulted where its @maybeLstat@ would be: each component is pushed,
+-- the prefix so far must be allowed, and a symlink at that prefix has
+-- its target spliced in front of what remains (an absolute target
+-- restarts at the root).  'Left' carries the refusal for the first
+-- prefix outside the allow list.  Under 'ResolveAncestors' the last
+-- component's own symlink is left alone, as upstream consults
+-- @maybeLstat@ only while something remains to resolve.
+walkAllowed :: SymlinkResolution -> EvalState -> AllowedPaths -> Text -> EvalIO (Either Text ())
+walkAllowed mode st allowed path
+  | not (isAbsolutePath canonical) = pure (Left (relativePathMessage path))
+  | otherwise = go symlinkFollowLimit [] (pathComponents canonical)
+  where
+    canonical = canonPathValue path
+    policy = esPolicy st
+    go _ _ [] = pure (Right ())
+    go linksLeft done (component : rest)
+      | component == "." = go linksLeft done rest
+      | component == ".." = go linksLeft (drop 1 done) rest
+      | not (isAllowedPrefix allowed prefix) = pure (Left (forbiddenPathMessage policy prefixText))
+      | otherwise = do
+          target <- if followsLinkAt rest then EvalIO (liftIO (symlinkTargetAt st prefixText)) else pure Nothing
+          case target of
+            Nothing -> go linksLeft prefixReversed rest
+            Just _
+              | linksLeft == 0 ->
+                  throwEvalError ("infinite symlink recursion in path '" <> canonical <> "'")
+            Just link ->
+              let linkComponents = filter (not . T.null) (T.split isPathSeparator link)
+                  -- Spliced in front of the remainder; the walk resumes from
+                  -- the root for an absolute target and from the link's own
+                  -- directory otherwise.
+                  resumeFrom = if isAbsoluteTarget link then [] else done
+               in go (linksLeft - 1) resumeFrom (linkComponents ++ rest)
+      where
+        prefixReversed = component : done
+        prefix = reverse prefixReversed
+        prefixText = joinComponents prefix
+    followsLinkAt rest = mode == ResolveFull || not (null rest)
+    isAbsoluteTarget link = T.isPrefixOf "/" link || isAbsolute (T.unpack link)
+
+-- | The target of the symlink at a path value, read through the store
+-- mapping, or 'Nothing' when there is no symlink there.  A path that
+-- does not exist is simply not a symlink; the read that follows reports
+-- it missing.
+symlinkTargetAt :: EvalState -> Text -> IO (Maybe Text)
+symlinkTargetAt st pathText = do
+  let fsPath = SP.storeTextToFilePath (esStoreDir st) pathText
+  outcome <-
+    try
+      ( do
+          isLink <- Dir.pathIsSymbolicLink fsPath
+          if isLink then Just . T.pack <$> Dir.getSymbolicLinkTarget fsPath else pure Nothing
+      ) ::
+      IO (Either IOException (Maybe Text))
+  pure (fromRight Nothing outcome)
+
+-- | Upstream's bound on symlinks followed while resolving one path.
+symlinkFollowLimit :: Int
+symlinkFollowLimit = 1024
+
 -- | Where a recorded fetch is kept: one file per key, under this user's
 -- cache directory, named by the key's own hash. Outside the store on
 -- purpose - it's a note about work already done, not a derivation input.
@@ -738,7 +1031,12 @@ canonicalStorePathText = SP.storePathToText SP.defaultStoreDir
 
 -- | Resolve an import's raw path to the value-domain target (the import
 -- cache key, the parse name, and the base dir the file's relative path
--- literals resolve against) and the filesystem location to read.
+-- literals resolve against) and the filesystem location to read, with
+-- both the path named and the file resolved checked against the policy:
+-- upstream's @resolveExprPath@ walks the path it is handed, and
+-- @parseExprFromFile@ walks the file it reads after @default.nix@ has
+-- been appended, so a directory whose @default.nix@ is a symlink is
+-- refused at the link's target.
 --
 -- Store text stays canonical in the value domain: 'Dir.canonicalizePath'
 -- would attach the working drive to the rooted @/nix@ prefix on Windows,
@@ -747,24 +1045,30 @@ canonicalStorePathText = SP.storePathToText SP.defaultStoreDir
 -- resolves and canonicalizes as a platform path, where the two returned
 -- forms coincide.
 resolveImportTarget :: FilePath -> Text -> EvalIO (FilePath, FilePath)
-resolveImportTarget baseDir rawPath
-  | SP.isCanonicalStoreText rawPath = do
-      let valueBase = T.unpack (canonPath rawPath)
-      resolvedBase <- evalStoreTextPath (T.pack valueBase)
-      isDir <- wrapIO (Dir.doesDirectoryExist resolvedBase)
-      -- The value-domain join stays "/" so the canonical spelling survives.
-      let valueTarget = if isDir then valueBase <> "/default.nix" else valueBase
-      resolvedTarget <- evalStoreTextPath (T.pack valueTarget)
-      pure (valueTarget, resolvedTarget)
-  | otherwise = do
-      let raw = T.unpack rawPath
-          resolved = if isRelative raw then baseDir </> raw else raw
-      canonical <- wrapIO (Dir.canonicalizePath resolved)
-      -- Directory import: append /default.nix if target is a directory
-      target <- wrapIO $ do
-        isDir <- Dir.doesDirectoryExist canonical
-        pure (if isDir then canonical </> "default.nix" else canonical)
-      pure (target, target)
+resolveImportTarget baseDir rawPath = do
+  accessPath rawPath
+  (target, ioTarget) <- locate
+  accessPath (T.pack target)
+  pure (target, ioTarget)
+  where
+    locate
+      | SP.isCanonicalStoreText rawPath = do
+          let valueBase = T.unpack (canonPath rawPath)
+          resolvedBase <- evalStoreTextPath (T.pack valueBase)
+          isDir <- wrapIO (Dir.doesDirectoryExist resolvedBase)
+          -- The value-domain join stays "/" so the canonical spelling survives.
+          let valueTarget = if isDir then valueBase <> "/default.nix" else valueBase
+          resolvedTarget <- evalStoreTextPath (T.pack valueTarget)
+          pure (valueTarget, resolvedTarget)
+      | otherwise = do
+          let raw = T.unpack rawPath
+              resolved = if isRelative raw then baseDir </> raw else raw
+          canonical <- wrapIO (Dir.canonicalizePath resolved)
+          -- Directory import: append /default.nix if target is a directory
+          target <- wrapIO $ do
+            isDir <- Dir.doesDirectoryExist canonical
+            pure (if isDir then canonical </> "default.nix" else canonical)
+          pure (target, target)
 
 -- | Classify a filesystem path as @"regular"@, @"directory"@, @"symlink"@,
 -- or @"unknown"@ - matching Nix's @builtins.readDir@ / @readFileType@.
