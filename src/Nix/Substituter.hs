@@ -99,6 +99,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
+import Nix.Http (withUserAgent)
 import Nix.Store (PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarEvent, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
@@ -503,7 +504,7 @@ readBodyCapped cap reader = go [] 0
 fetchNarInfo :: HTTP.Manager -> CacheConfig -> StorePath -> IO (Either SubstResult NarInfo.NarInfo)
 fetchNarInfo mgr cache sp = do
   let url = T.unpack (ccUrl cache) <> "/" <> T.unpack (spHash sp) <> ".narinfo"
-  request <- HTTP.parseRequest url
+  request <- withUserAgent <$> HTTP.parseRequest url
   HTTP.withResponse request mgr $ \response -> do
     let code = HTTP.statusCode (HTTP.responseStatus response)
     -- Lenient decode: the body is cache-controlled bytes, and a stray
@@ -663,7 +664,7 @@ streamNarIntoStore mgr cache store sp narInfo = case preflight of
     let destPath = storePathToFilePath (stDir store) sp
         narUrl = T.unpack (ccUrl cache) <> "/" <> T.unpack (NarInfo.niUrl narInfo)
     clearStaleDestination destPath
-    request <- HTTP.parseRequest narUrl
+    request <- withUserAgent <$> HTTP.parseRequest narUrl
     tryAttempt $ HTTP.withResponse request mgr $ \response -> do
       let code = HTTP.statusCode (HTTP.responseStatus response)
       if code /= httpOk

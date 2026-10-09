@@ -74,6 +74,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types as HTTP
 import Nix.Compression (compressionNameNone, compressionNameZstd)
+import Nix.Http (withUserAgent)
 import Nix.Store (Store (..), queryDeriver, queryPathInfo, queryReferences)
 import qualified Nix.Store.DB as DB
 import qualified Nix.Store.ExecBit as ExecBit
@@ -481,11 +482,12 @@ httpRequest manager method url headers body = ExceptT $ do
   attempt <- try $ do
     request0 <- HTTP.parseRequest (T.unpack url)
     let request =
-          request0
-            { HTTP.method = method,
-              HTTP.requestHeaders = headers,
-              HTTP.requestBody = maybe (HTTP.requestBody request0) HTTP.RequestBodyBS body
-            }
+          withUserAgent
+            request0
+              { HTTP.method = method,
+                HTTP.requestHeaders = headers,
+                HTTP.requestBody = maybe (HTTP.requestBody request0) HTTP.RequestBodyBS body
+              }
     response <- HTTP.httpLbs request manager
     pure (BS.toStrict <$> response)
   pure $ case attempt of
