@@ -437,6 +437,31 @@ jobs:
             exit 1
           }
 
+      # Publish what this job just built and ran, so the public cache carries
+      # the current closure rather than whatever was pushed by hand last.
+      # Main pushes only: a pull request must not write to the cache, and
+      # the token is not offered to it.  --all is every valid path in the
+      # store this job filled from empty, which is exactly the closure.
+      # Pushing after the run check means a Hello that does not print is
+      # never published.  The token belongs in an environment restricted to
+      # main rather than an org secret; that move needs the key pasted in by
+      # hand and is tracked in #207.
+      - name: Publish the closure to the public cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: |
+          set -euo pipefail
+          keyfile="$RUNNER_TEMP/cache-key"
+          (umask 077; printf '%s' "$NOVA_CACHE_API_KEY" > "$keyfile")
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache https://cache.novavero.ai --key-file "$keyfile" \
+            --compression zstd --all 2> "$RUNNER_TEMP/push.log" \
+            || { rm -f "$keyfile"; cat "$RUNNER_TEMP/push.log" >&2; exit 1; }
+          rm -f "$keyfile"
+          echo "pushed: $(grep -c '^\[push\]' "$RUNNER_TEMP/push.log" || true), already present: $(grep -c '^\[skip\]' "$RUNNER_TEMP/push.log" || true)"
+
       - name: Diagnose store layout on failure
         if: failure()
         shell: pwsh
@@ -447,6 +472,72 @@ jobs:
               Get-ChildItem $d -ErrorAction SilentlyContinue | Select-Object -First 10 | ForEach-Object { Write-Host $_.Name }
             } else { Write-Host "(absent)" }
           }
+
+  # ---------------------------------------------------------------------------
+  # End-to-end (public cache): the loop the Linux job proves against a
+  # throwaway server, run on Windows against the cache users are given.
+  # A fresh store, the public cache as the only substituter, and the build
+  # must come entirely from it: a single [build] line means the cache is
+  # missing part of the current closure and the job turns red, instead of
+  # a silent local rebuild hiding the gap (#207).  Main pushes only, after
+  # the publish step above has refreshed the cache from this same tree.
+  # ---------------------------------------------------------------------------
+  e2e-public-cache:
+    name: E2E (public cache)
+    needs: [e2e-windows]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
+          restore-keys: cabal-${{ runner.os }}-
+
+      - name: Install nova-nix
+        run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
+
+      # The store root wants pre-creating on the runner, as the Windows job
+      # found; cygpath keeps the separators Windows-native so the store dir
+      # the binary renders paths through has one spelling.
+      - name: Substitute the whole closure from the public cache
+        shell: bash
+        env:
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          store=$(cygpath -w "$RUNNER_TEMP/public-store")
+          mkdir -p "$RUNNER_TEMP/public-store"
+          log="$RUNNER_TEMP/substitute.log"
+          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix \
+            --store "$store" \
+            --substituter https://cache.novavero.ai \
+            --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ= \
+            2> "$log" | tail -n 1)
+          echo "out path: $out"
+          grep -F '[subst]' "$log" || { echo "nothing was substituted from the public cache" >&2; cat "$log" >&2; exit 1; }
+          if grep -F '[build]' "$log"; then
+            echo "the public cache is missing part of the current closure: the lines above were built locally" >&2
+            exit 1
+          fi
+          got=$("$(cygpath -u "$out")/bin/hello.exe")
+          echo "output: $got"
+          [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
+
+      - name: Dump the substitution log on failure
+        if: failure()
+        shell: bash
+        run: cat "$RUNNER_TEMP/substitute.log" || true
 
   # ---------------------------------------------------------------------------
   # End-to-end (Linux): the full binary-cache loop against a real
