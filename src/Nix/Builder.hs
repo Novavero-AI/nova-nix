@@ -48,6 +48,7 @@ module Nix.Builder
     buildPath,
     execWrapperConfig,
     execWrapperFor,
+    spawnFor,
     rewriteEnv,
     rewritePlaceholders,
     scrubAmbient,
@@ -83,7 +84,7 @@ import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
-import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform, fromATerm, platformToText)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fromATerm, platformToText)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -435,13 +436,22 @@ data BuilderSpawn
 -- closure has already been realized. A system this machine cannot execute
 -- and has not been told how to is refused instead.
 execWrapperFor :: BuildConfig -> Derivation -> BuilderSpawn
-execWrapperFor config drv
-  | drvPlatform drv == currentPlatform = SpawnNative
+execWrapperFor = spawnFor currentPlatform
+
+-- | 'execWrapperFor' with the host named, so the rule can be checked for
+-- every host on whichever one runs the suite.  A derivation for the host's
+-- own system, or for one the host executes through its compatibility layer
+-- ('extraPlatforms'), spawns directly whatever launchers are configured:
+-- upstream runs its extra platforms natively and has no launcher notion.
+spawnFor :: Platform -> BuildConfig -> Derivation -> BuilderSpawn
+spawnFor host config drv
+  | platform == host || platform `elem` extraPlatforms host = SpawnNative
   | otherwise = case Map.lookup system (bcExecWrappers config) of
       Just launcher -> SpawnThrough launcher
       Nothing -> SpawnUnsupported system
   where
-    system = platformToText (drvPlatform drv)
+    platform = drvPlatform drv
+    system = platformToText platform
 
 -- | The build, once every output knows where it is written and where it
 -- belongs.

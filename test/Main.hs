@@ -31,13 +31,13 @@ import qualified Database.SQLite.Simple as SQL
 import FetchurlFixture (withFetchurlServer)
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
-import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, fromATerm, platformToText, toATerm, toATermForHash)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Eval (FetchCache (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, fetchCacheKey, force, mkStr, readThunkValue, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.AttrPath (parseAttrPath)
@@ -2597,9 +2597,27 @@ testBatchG = do
         assertEqual "windows" "x86_64-windows" (platformToText X86_64_Windows),
       runTest "platformToText aarch64-linux" $
         assertEqual "aarch64-linux" "aarch64-linux" (platformToText Aarch64_Linux),
+      runTest "platformToText i686" $
+        assertEqual "i686" ["i686-linux", "i686-windows"] (map platformToText [I686_Linux, I686_Windows]),
       runTest "platformToText other" $
-        assertEqual "other" "riscv64-freebsd" (platformToText (OtherPlatform "riscv64-freebsd"))
+        assertEqual "other" "riscv64-freebsd" (platformToText (OtherPlatform "riscv64-freebsd")),
+      -- The i686 spellings parse to their own constructors, not to
+      -- OtherPlatform, or extraPlatforms could never name them.
+      runTest "textToPlatform round-trips every named platform" $
+        assertEqual
+          "round-trip"
+          namedPlatforms
+          (map (textToPlatform . platformToText) namedPlatforms),
+      -- Upstream's default extra-platforms, and nothing more: the x86_64
+      -- hosts run their i686 counterpart, every other host runs only itself.
+      runTest "extraPlatforms is the i686 counterpart on x86_64 hosts only" $
+        assertEqual
+          "extra"
+          [[I686_Linux], [I686_Windows], [], [], [], [], []]
+          (map extraPlatforms [X86_64_Linux, X86_64_Windows, X86_64_Darwin, Aarch64_Darwin, Aarch64_Linux, I686_Linux, I686_Windows])
     ]
+  where
+    namedPlatforms = [X86_64_Linux, X86_64_Darwin, Aarch64_Darwin, X86_64_Windows, Aarch64_Linux, I686_Linux, I686_Windows]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch H - derivation
@@ -6626,6 +6644,26 @@ testExecWrapper = do
           "unsupported"
           (SpawnUnsupported (platformToText foreignPlatform))
           (execWrapperFor (wrapperConfig []) (drvFor foreignPlatform)),
+      -- A 32-bit derivation on a 64-bit host of the same OS is native, as
+      -- upstream's extra-platforms makes it, launcher or no launcher; on
+      -- any other host it is as foreign as anything else.
+      runTest "an i686 derivation spawns natively on its x86_64 host, whatever is configured" $
+        assertEqual
+          "wow64"
+          [SpawnNative, SpawnNative, SpawnNative, SpawnNative]
+          [ spawnFor X86_64_Windows (wrapperConfig []) (drvFor I686_Windows),
+            spawnFor X86_64_Windows (wrapperConfig [("i686-windows", "/usr/bin/wine")]) (drvFor I686_Windows),
+            spawnFor X86_64_Linux (wrapperConfig []) (drvFor I686_Linux),
+            spawnFor X86_64_Linux (wrapperConfig [("i686-linux", "/opt/qemu")]) (drvFor I686_Linux)
+          ],
+      runTest "an i686 derivation elsewhere is refused or launched like any foreign system" $
+        assertEqual
+          "elsewhere"
+          [SpawnUnsupported "i686-windows", SpawnThrough "/usr/bin/wine", SpawnUnsupported "i686-linux"]
+          [ spawnFor X86_64_Linux (wrapperConfig []) (drvFor I686_Windows),
+            spawnFor X86_64_Linux (wrapperConfig [("i686-windows", "/usr/bin/wine")]) (drvFor I686_Windows),
+            spawnFor Aarch64_Darwin (wrapperConfig []) (drvFor I686_Linux)
+          ],
       -- The system string is the derivation's own spelling, matched
       -- exactly.  The documentation once named a different one, which
       -- parsed, stored, and then never matched anything.

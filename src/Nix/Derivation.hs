@@ -61,6 +61,7 @@ module Nix.Derivation
     -- * Platform
     Platform (..),
     currentPlatform,
+    extraPlatforms,
     platformToText,
     textToPlatform,
   )
@@ -91,6 +92,8 @@ data Platform
   | Aarch64_Darwin
   | X86_64_Windows
   | Aarch64_Linux
+  | I686_Linux
+  | I686_Windows
   | OtherPlatform !Text
   deriving (Eq, Ord, Show)
 
@@ -104,7 +107,22 @@ currentPlatform = case (SI.arch, SI.os) of
   ("aarch64", "darwin") -> Aarch64_Darwin
   ("aarch64", "linux") -> Aarch64_Linux
   ("x86_64", "linux") -> X86_64_Linux
+  ("i386", "linux") -> I686_Linux
+  ("i386", "mingw32") -> I686_Windows
   (arch, os) -> OtherPlatform (packPlatform arch os)
+
+-- | The systems a host executes besides its own, as upstream's default
+-- @extra-platforms@ lists them: an x86_64 Linux kernel runs i686 binaries,
+-- so upstream adds @i686-linux@ on @x86_64-linux@ (outside WSL1, which
+-- cannot), and 64-bit Windows runs i686 binaries through WoW64, the same
+-- rule for the platform upstream has no entry for yet.  Upstream also adds
+-- @x86_64-darwin@ on @aarch64-darwin@ when Rosetta is installed; that is a
+-- filesystem probe, not a property of the platform, and is not modelled
+-- here, so such a build needs a launcher named on the command line.
+extraPlatforms :: Platform -> [Platform]
+extraPlatforms X86_64_Linux = [I686_Linux]
+extraPlatforms X86_64_Windows = [I686_Windows]
+extraPlatforms _ = []
 
 -- | Format an arch-os pair as a Nix platform string.
 packPlatform :: String -> String -> Text
@@ -127,6 +145,8 @@ platformToText X86_64_Darwin = "x86_64-darwin"
 platformToText Aarch64_Darwin = "aarch64-darwin"
 platformToText X86_64_Windows = "x86_64-windows"
 platformToText Aarch64_Linux = "aarch64-linux"
+platformToText I686_Linux = "i686-linux"
+platformToText I686_Windows = "i686-windows"
 platformToText (OtherPlatform t) = t
 
 -- | Parse a Nix platform string into a 'Platform'.
@@ -137,6 +157,8 @@ textToPlatform t = case t of
   "aarch64-darwin" -> Aarch64_Darwin
   "x86_64-windows" -> X86_64_Windows
   "aarch64-linux" -> Aarch64_Linux
+  "i686-linux" -> I686_Linux
+  "i686-windows" -> I686_Windows
   other -> OtherPlatform other
 
 -- | A single output of a derivation.
