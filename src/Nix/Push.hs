@@ -50,6 +50,8 @@ module Nix.Push
     mkPushArtifact,
     PushArtifact (..),
     planMissing,
+    isDerivationPath,
+    outputPathsOnly,
     narFileName,
     stripHashPrefix,
     storePathBasename,
@@ -229,6 +231,22 @@ computeClosure store roots =
 -- | Paths whose narinfo hash the cache does not already have.
 planMissing :: Set Text -> [StorePath] -> [StorePath]
 planMissing remote = filter (\sp -> not (spHash sp `Set.member` remote))
+
+-- | Whether a store path is a derivation: a recipe, not an output.
+isDerivationPath :: StorePath -> Bool
+isDerivationPath sp = derivationExtension `T.isSuffixOf` spName sp
+
+-- | The output paths among a store's valid paths.  A store registers its
+-- derivations as valid paths like anything else, but a binary cache serves
+-- build outputs only: nova-cache refuses a narinfo for a @.drv@ outright,
+-- and no substituter asks a cache for a recipe it can rebuild from the
+-- expression.  @push --all@ therefore means every valid output.
+outputPathsOnly :: [StorePath] -> [StorePath]
+outputPathsOnly = filter (not . isDerivationPath)
+
+-- | The suffix that marks a derivation's store path.
+derivationExtension :: Text
+derivationExtension = ".drv"
 
 -- | The basename form used in narinfo @References@ and @Deriver@ fields:
 -- @\<hash\>-\<name\>@ with no store dir.

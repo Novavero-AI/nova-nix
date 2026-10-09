@@ -34,7 +34,7 @@ import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
-import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), loadApiKeyFile, parsePushCompression, pushCompressionValues, pushPaths)
+import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
 import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath)
 import Nix.Substituter (CacheConfig (..))
@@ -344,7 +344,7 @@ usageLines =
     "  --aterm                With eval --expr, print the derivation's .drv ATerm",
     "  -A, --attr ATTRPATH    With build: select a dotted attribute path (a.b.c)",
     "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)",
-    "  --all                  With push: select every valid path in the store",
+    "  --all                  With push: select every valid output path in the store",
     "  --key-file PATH        With push: file holding the cache API key",
     "  --compression KIND     With push: artifact packaging (" <> T.unpack pushCompressionValues <> "; default none)",
     "  --exec-wrapper S=PATH  Run system S's derivations through PATH (repeatable),",
@@ -748,16 +748,21 @@ storeDeleteCommand opts rawPaths = do
       | doRowRemoved removed = " (no tree on disk)"
       | otherwise = " (unregistered tree)"
 
--- | Resolve push roots: every valid path with @--all@, otherwise each named
--- path.  Named paths may be full store paths in either store-dir form, or a
--- bare @hash-name@ basename.
+-- | Resolve push roots: every valid output path with @--all@, otherwise
+-- each named path.  Named paths may be full store paths in either store-dir
+-- form, or a bare @hash-name@ basename.  A named derivation is refused
+-- here, with the rule, rather than by the cache's 400 after its NAR has
+-- already been uploaded.
 resolvePushRoots :: Store -> PushArgs -> IO (Either T.Text [StorePath])
 resolvePushRoots store pushArgs
   | paAll pushArgs = do
       pathTexts <- queryAllValidPaths (stDB store)
-      pure (traverse parseDbPath pathTexts)
-  | otherwise = pure (traverse parseArgPath (paPaths pushArgs))
+      pure (outputPathsOnly <$> traverse parseDbPath pathTexts)
+  | otherwise = pure (traverse parseArgPath (paPaths pushArgs) >>= refuseDerivations)
   where
+    refuseDerivations roots = case filter isDerivationPath roots of
+      [] -> Right roots
+      drv : _ -> Left ("push: " <> storePathBasename drv <> " is a derivation; a binary cache serves build outputs, not recipes")
     -- DB rows are rendered with the OPENED store's dir - parsing against
     -- platformStoreDir made 'push --all --store DIR' fail on every row of
     -- a non-default store.
