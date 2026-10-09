@@ -1,6 +1,7 @@
--- | Nix configuration: the @nix.conf@ / @NIX_CONFIG@ settings this
--- implementation reads: which binary caches a machine substitutes from,
--- which public keys it trusts, and how deep function calls may nest.
+-- | Nix configuration: the @nix.conf@ / @NIX_CONFIG@ settings that decide
+-- which binary caches a machine substitutes from, which public keys it
+-- trusts, how deep function calls may nest, and how far an evaluation
+-- may reach (@restrict-eval@, @pure-eval@, @allowed-uris@).
 --
 -- == The format
 --
@@ -11,10 +12,12 @@
 -- forms differ only in that @!include@ goes on without a file that cannot
 -- be read.  These are the rules upstream's @parseConfigFiles@ applies
 -- (@config.cc@ at 2.24.9: comment truncation, no line continuation,
--- whitespace tokenizing, inline include expansion), matched here.  An
--- integer value is upstream's too ('parseUnsignedSetting'): decimal
--- digits, an optional leading @+@, and an optional binary unit suffix
--- (@K@, @M@, @G@, @T@).
+-- whitespace tokenizing, inline include expansion), matched here.  A
+-- Boolean value is one of @true@, @yes@, @1@, @false@, @no@, @0@
+-- (upstream's @BaseSetting\<bool\>::parse@), and any other spelling is
+-- an error.  An integer value is upstream's too ('parseUnsignedSetting'):
+-- decimal digits, an optional leading @+@, and an optional binary unit
+-- suffix (@K@, @M@, @G@, @T@).
 --
 -- == Where the files are
 --
@@ -35,11 +38,12 @@
 --
 -- Sources are folded weakest first, so a later source overrides an earlier
 -- one.  A plain assignment REPLACES the accumulated value; an @extra-@
--- prefixed assignment APPENDS to it, for a list setting (upstream accepts
--- @extra-@ on an appendable setting only, so @extra-max-call-depth@ is an
--- unknown name).  The caller supplies the sources in order (built-in
--- default, then files, then @NIX_CONFIG@, then the command line), so the
--- command line wins, exactly as upstream orders them.
+-- prefixed assignment APPENDS to a list.  An @extra-@ on a Boolean or a
+-- scalar names no setting (upstream appends only to an appendable
+-- setting, so @extra-max-call-depth@ is an unknown name) and is ignored
+-- like any unknown name.  The caller supplies the sources in order
+-- (built-in default, then files, then @NIX_CONFIG@, then the command
+-- line), so the command line wins, exactly as upstream orders them.
 --
 -- == Security
 --
@@ -111,33 +115,42 @@ import System.FilePath (isAbsolute, isPathSeparator, searchPathSeparator, splitD
 -- Settings
 -- ---------------------------------------------------------------------------
 
--- | The subset of Nix settings that this layer resolves: the binary caches
--- to try, the public keys their signatures are trusted under, and the
--- function-call nesting ceiling.  The first two are ordered lists
--- (upstream's @substituters@ is a @Strings@, and @trusted-public-keys@ is
--- too); order is preserved on write, though it does not affect key
--- acceptance (any trusted key is enough).
+-- | The subset of Nix settings that this layer resolves.  The lists are
+-- ordered (upstream's @substituters@, @trusted-public-keys@ and
+-- @allowed-uris@ are each a @Strings@); order is preserved on write, though
+-- it does not affect key acceptance (any trusted key is enough) or URI
+-- admission (any prefix is enough).
 data NixConfig = NixConfig
   { ncSubstituters :: ![Text],
     ncTrustedPublicKeys :: ![Text],
     -- | Upstream's @max-call-depth@: how many function calls may be
     -- active around a new one before evaluation refuses it.
-    ncMaxCallDepth :: !Word32
+    ncMaxCallDepth :: !Word32,
+    -- | URI prefixes a fetch may reach under @restrict-eval@.
+    ncAllowedUris :: ![Text],
+    -- | Upstream @restrict-eval@.
+    ncRestrictEval :: !Bool,
+    -- | Upstream @pure-eval@.
+    ncPureEval :: !Bool
   }
   deriving (Eq, Show)
 
 -- | The baseline the fold starts from: no substituters, no trusted keys,
--- and upstream's call-depth ceiling.  The empty lists are nova-nix's
--- existing default (nothing is substituted unless configured), a
--- deliberate divergence from upstream's cache.nixos.org default: turning a
--- cache on for every machine is the operator's decision to make in a
--- config file, not a built-in.
+-- upstream's call-depth ceiling, no allowed URIs, and both evaluation
+-- modes off.  The empty substituter list is nova-nix's existing default
+-- (nothing is substituted unless configured), a deliberate divergence
+-- from upstream's cache.nixos.org default: turning a cache on for every
+-- machine is the operator's decision to make in a config file, not a
+-- built-in.  The other defaults are upstream's own.
 defaultNixConfig :: NixConfig
 defaultNixConfig =
   NixConfig
     { ncSubstituters = [],
       ncTrustedPublicKeys = [],
-      ncMaxCallDepth = defaultMaxCallDepth
+      ncMaxCallDepth = defaultMaxCallDepth,
+      ncAllowedUris = [],
+      ncRestrictEval = False,
+      ncPureEval = False
     }
 
 -- ---------------------------------------------------------------------------
@@ -428,51 +441,58 @@ unitBase = 1024
 -- outside the known set is ignored, not an error: upstream warns and
 -- continues, and refusing every unknown key would reject a config that
 -- also carries settings this layer does not model yet.  A value that does
--- not parse for its setting is an error, as upstream's @UsageError@ is.
+-- not parse for its setting is an error, as upstream's @UsageError@ is:
+-- @pure-eval = ture@ must not pass for off.
 applyAssignment :: NixConfig -> ConfigAssignment -> Either Text NixConfig
 applyAssignment config (ConfigAssignment name value) =
   case resolveName name of
     Nothing -> Right config
-    Just (ListSetting field mode) ->
+    Just (ListSetting field, mode) ->
       Right (setList field (combine mode (getList field config) (T.words value)) config)
-    Just (ScalarSetting MaxCallDepthField) ->
+    Just (BoolSetting field, _) ->
+      (\flag -> setBool field flag config) <$> parseBool name value
+    Just (ScalarSetting MaxCallDepthField, _) ->
       (\limit -> config {ncMaxCallDepth = limit}) <$> parseUnsignedSetting name value
   where
     combine ReplaceMode _ new = new
     combine AppendMode old new = old ++ new
 
 -- | Which setting a name targets, once the @extra-@ prefix and the aliases
--- are resolved: a list, with whether it replaces or appends, or a scalar,
--- which only ever replaces.
-data ConfigSetting
-  = ListSetting !ListField !ApplyMode
-  | ScalarSetting !ScalarField
+-- are resolved, and whether it replaces or appends.  @extra-@ composes
+-- with a list only: upstream looks the base name up and appends when the
+-- setting is appendable, and a Boolean or a scalar is not.
+resolveName :: Text -> Maybe (Setting, ApplyMode)
+resolveName name =
+  case T.stripPrefix extraPrefix name of
+    Just base -> case baseSetting base of
+      Just setting@(ListSetting _) -> Just (setting, AppendMode)
+      _ -> Nothing
+    Nothing -> case baseSetting name of
+      Just setting -> Just (setting, ReplaceMode)
+      Nothing -> Nothing
+  where
+    baseSetting n
+      | n == substitutersKey || n == substitutersAlias = Just (ListSetting SubstitutersField)
+      | n == trustedKeysKey || n == trustedKeysAlias = Just (ListSetting TrustedKeysField)
+      | n == allowedUrisKey = Just (ListSetting AllowedUrisField)
+      | n == restrictEvalKey = Just (BoolSetting RestrictEvalField)
+      | n == pureEvalKey = Just (BoolSetting PureEvalField)
+      | n == maxCallDepthKey = Just (ScalarSetting MaxCallDepthField)
+      | otherwise = Nothing
+
+-- | A setting this layer resolves, by the shape of its value.
+data Setting = ListSetting !ListField | BoolSetting !BoolField | ScalarSetting !ScalarField
   deriving (Eq, Show)
 
-resolveName :: Text -> Maybe ConfigSetting
-resolveName name = case T.stripPrefix extraPrefix name of
-  Just base -> (`ListSetting` AppendMode) <$> listField base
-  Nothing
-    | Just field <- listField name -> Just (ListSetting field ReplaceMode)
-    | Just field <- scalarField name -> Just (ScalarSetting field)
-    | otherwise -> Nothing
-
-listField :: Text -> Maybe ListField
-listField name
-  | name == substitutersKey || name == substitutersAlias = Just SubstitutersField
-  | name == trustedKeysKey || name == trustedKeysAlias = Just TrustedKeysField
-  | otherwise = Nothing
-
-scalarField :: Text -> Maybe ScalarField
-scalarField name
-  | name == maxCallDepthKey = Just MaxCallDepthField
-  | otherwise = Nothing
-
--- | The list settings this layer resolves.
-data ListField = SubstitutersField | TrustedKeysField
+-- | The list settings.
+data ListField = SubstitutersField | TrustedKeysField | AllowedUrisField
   deriving (Eq, Show)
 
--- | The scalar settings this layer resolves.
+-- | The Boolean settings.
+data BoolField = RestrictEvalField | PureEvalField
+  deriving (Eq, Show)
+
+-- | The scalar settings, which only ever replace.
 data ScalarField = MaxCallDepthField
   deriving (Eq, Show)
 
@@ -483,10 +503,29 @@ data ApplyMode = ReplaceMode | AppendMode
 getList :: ListField -> NixConfig -> [Text]
 getList SubstitutersField = ncSubstituters
 getList TrustedKeysField = ncTrustedPublicKeys
+getList AllowedUrisField = ncAllowedUris
 
 setList :: ListField -> [Text] -> NixConfig -> NixConfig
 setList SubstitutersField v config = config {ncSubstituters = v}
 setList TrustedKeysField v config = config {ncTrustedPublicKeys = v}
+setList AllowedUrisField v config = config {ncAllowedUris = v}
+
+setBool :: BoolField -> Bool -> NixConfig -> NixConfig
+setBool RestrictEvalField v config = config {ncRestrictEval = v}
+setBool PureEvalField v config = config {ncPureEval = v}
+
+-- | Upstream's Boolean spellings (@BaseSetting\<bool\>::parse@): anything
+-- else is an error with upstream's wording, which names the setting alone,
+-- as 'parseUnsignedSetting' does.
+parseBool :: Text -> Text -> Either Text Bool
+parseBool name value
+  | value `elem` trueSpellings = Right True
+  | value `elem` falseSpellings = Right False
+  | otherwise = Left ("Boolean setting '" <> name <> "' has invalid value '" <> value <> "'")
+
+trueSpellings, falseSpellings :: [Text]
+trueSpellings = ["true", "yes", "1"]
+falseSpellings = ["false", "no", "0"]
 
 -- | Fold expanded assignments onto the default config, weakest first.
 -- The caller orders them so the strongest source's assignments are last
@@ -507,8 +546,11 @@ trustedKeysKey, trustedKeysAlias :: Text
 trustedKeysKey = "trusted-public-keys"
 trustedKeysAlias = "binary-cache-public-keys"
 
-maxCallDepthKey :: Text
+allowedUrisKey, maxCallDepthKey, pureEvalKey, restrictEvalKey :: Text
+allowedUrisKey = "allowed-uris"
 maxCallDepthKey = "max-call-depth"
+pureEvalKey = "pure-eval"
+restrictEvalKey = "restrict-eval"
 
 extraPrefix :: Text
 extraPrefix = "extra-"

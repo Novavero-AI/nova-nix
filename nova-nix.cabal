@@ -66,6 +66,7 @@ library
     Nix.Eval.Context
     Nix.Eval.Types
     Nix.Eval.IO
+    Nix.Eval.Policy
     Nix.Eval.Operator
     Nix.Eval.StringInterp
     Nix.Eval.Symbol

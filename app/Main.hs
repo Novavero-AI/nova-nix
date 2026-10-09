@@ -25,15 +25,16 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig)
-import Nix.Builtins (builtinEnv, parseNixPath)
+import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, searchPathRoots)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
-import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
+import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CallDepth (topLevelCallDepth)
-import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
+import Nix.Eval.CanonPath (canonPathValue)
+import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
 import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
@@ -41,7 +42,7 @@ import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLi
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
-import System.Directory (Permissions (executable), XdgDirectory (XdgConfig), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, getXdgDirectory)
+import System.Directory (Permissions (executable), XdgDirectory (XdgConfig), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, getXdgDirectory, makeAbsolute)
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure)
 import System.FilePath (isAbsolute, splitSearchPath, takeDirectory, takeFileName, (</>))
@@ -67,6 +68,10 @@ data CliOpts = CliOpts
     -- | @SYSTEM=PATH@ launchers for derivations this machine cannot execute
     -- directly, e.g. @x86_64-windows=/path/to/wine@.
     optExecWrappers :: ![String],
+    -- | @--restrict-eval@: upstream's restrict-eval, turned on for this run.
+    optRestrictEval :: !Bool,
+    -- | @--pure-eval@: upstream's pure-eval, turned on for this run.
+    optPureEval :: !Bool,
     optCommand :: !Command
   }
 
@@ -123,7 +128,7 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing False []
 -- silent drop: an unknown or typo'd flag once ended parsing and quietly
 -- discarded everything after it (e.g. a requested @--substituter@).
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
+parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False CmdUsage)
   where
     go opts [] = Right opts
     -- Answered before anything else is looked at, and the rest of the line
@@ -145,6 +150,10 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
       go (opts {optTrustedKey = Just key}) rest
     go opts ("--exec-wrapper" : spec : rest) =
       go (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) rest
+    go opts ("--restrict-eval" : rest) =
+      go (opts {optRestrictEval = True}) rest
+    go opts ("--pure-eval" : rest) =
+      go (opts {optPureEval = True}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : rest) = goBuild opts emptyBuildArgs rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
@@ -163,6 +172,10 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
     -- much after the subcommand as before it.
     goEval opts ("--store" : dir : rest) =
       goEval (opts {optStore = Just dir}) rest
+    goEval opts ("--restrict-eval" : rest) =
+      goEval (opts {optRestrictEval = True}) rest
+    goEval opts ("--pure-eval" : rest) =
+      goEval (opts {optPureEval = True}) rest
     goEval opts ("--expr" : expr : rest) =
       go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
     goEval _ [flag]
@@ -189,6 +202,10 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
       goBuild (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) buildArgs rest
     goBuild opts buildArgs ("--exec-wrapper" : spec : rest) =
       goBuild (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) buildArgs rest
+    goBuild opts buildArgs ("--restrict-eval" : rest) =
+      goBuild (opts {optRestrictEval = True}) buildArgs rest
+    goBuild opts buildArgs ("--pure-eval" : rest) =
+      goBuild (opts {optPureEval = True}) buildArgs rest
     goBuild opts buildArgs ("--expr" : expr : rest) =
       withTarget opts buildArgs (TargetExpr (T.pack expr)) rest
     goBuild opts buildArgs (flag : path : rest)
@@ -358,10 +375,10 @@ main = do
   config <- loadNixConfig
   storeDir <- chosenStoreDir opts
   case optCommand opts of
-    CmdEvalFile filePath -> evalFile config storeDir (optStrict opts) (optNixPaths opts) dataDir filePath
+    CmdEvalFile filePath -> evalFile config opts storeDir dataDir filePath
     CmdEvalExpr expr
-      | optAterm opts -> evalExprAterm config storeDir (optNixPaths opts) dataDir expr
-      | otherwise -> evalExpr config storeDir (optStrict opts) (optNixPaths opts) dataDir expr
+      | optAterm opts -> evalExprAterm config opts storeDir dataDir expr
+      | otherwise -> evalExpr config opts storeDir dataDir expr
     CmdBuild target attrPath outLink -> buildCommand config opts storeDir dataDir target attrPath outLink
     CmdPush pushArgs -> pushCommand storeDir pushArgs
     CmdStoreDelete paths -> storeDeleteCommand storeDir paths
@@ -407,11 +424,18 @@ usageLines =
     "  --store DIR            Use DIR as the store (default: the platform store)",
     "  --substituter URL      Try this binary cache before building",
     "  --trusted-key K        Public key (name:base64) for the substituter",
+    "  --restrict-eval        Confine reads to the search path roots and what the",
+    "                         evaluation itself writes; fetch only allowed-uris",
+    "  --pure-eval            Confine reads as --restrict-eval does, with no search",
+    "                         path, no currentTime, currentSystem or storePath, and",
+    "                         pinned fetches only (allowed-uris applies only under",
+    "                         --restrict-eval)",
     "",
-    "  substituters, trusted-public-keys and max-call-depth also read from",
-    "  nix.conf, in upstream's order: $NIX_CONF_DIR (default " <> systemConfDirName <> "),",
-    "  the XDG nix/nix.conf files or $NIX_USER_CONF_FILES, then $NIX_CONFIG;",
-    "  the flags above add to whatever those configure.",
+    "  substituters, trusted-public-keys, max-call-depth, restrict-eval,",
+    "  pure-eval and allowed-uris also read from nix.conf, in upstream's",
+    "  order: $NIX_CONF_DIR (default " <> systemConfDirName <> "), the XDG",
+    "  nix/nix.conf files or $NIX_USER_CONF_FILES, then $NIX_CONFIG; the",
+    "  flags above add to whatever those configure.",
     "",
     "  --help                 Print this text and exit",
     "  --version              Print the version and exit"
@@ -440,19 +464,74 @@ readSourceFile rawPath = do
 exprSourceName :: T.Text
 exprSourceName = "<expr>"
 
+-- | The evaluation policy for this run: the config cascade's settings,
+-- with either flag turning its mode on.  A flag only turns a mode on, so
+-- a machine configured for pure evaluation stays that way whatever the
+-- command line says, which is the direction a confinement should fail in.
+evalPolicyFor :: CliOpts -> NixConfig -> EvalPolicy
+evalPolicyFor opts config =
+  EvalPolicy
+    { epRestrictEval = optRestrictEval opts || ncRestrictEval config,
+      epPureEval = optPureEval opts || ncPureEval config,
+      epAllowedUris = ncAllowedUris config
+    }
+
+-- | The evaluation state and root environment for one command.  Upstream's
+-- constructor decides the same things in the same order (eval.cc at
+-- 2.24.9): under pure-eval the lookup path is empty, so neither
+-- @--nix-path@ nor @NIX_PATH@ contributes, and only the bundled @<nix/*>@
+-- directory remains, which upstream serves from an in-memory corepkgs
+-- filesystem and this binary serves from its data directory (so it stays
+-- visible in @builtins.nixPath@, where upstream shows nothing); under
+-- either mode every search path root is allowed, as @resolveLookupPathPath@
+-- allows the lookup path, so @-I nixpkgs=...@ is what makes a nixpkgs
+-- tree readable.
+--
+-- Each root is allowed under its given spelling and under its resolved
+-- one.  The access walk follows symlinks, so a root reached through a
+-- symlinked directory (macOS's @/tmp@ is @/private/tmp@) is checked under
+-- the resolved spelling; upstream allows only the given one and refuses
+-- the read, which is a mismatch between its own allow list and walk, not
+-- a rule worth keeping.
+setUpEval :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> IO (EvalState, Env)
+setUpEval opts config storeDir dataDir baseDir = do
+  let policy = evalPolicyFor opts config
+  st0 <- newEvalState storeDir baseDir
+  let searchPaths
+        | epPureEval policy = parseNixPath (T.pack dataDir)
+        | otherwise = mergeSearchPaths (optNixPaths opts) dataDir (esSearchPaths st0)
+      st =
+        st0
+          { esSearchPaths = searchPaths,
+            esPolicy = policy,
+            esCallDepth = topLevelCallDepth (ncMaxCallDepth config)
+          }
+  -- A relative root resolves against the working directory, as upstream's
+  -- absPath does.  A pseudo-URL entry (channel:, flake:, a listed scheme)
+  -- names a download this evaluator never performs and allows nothing:
+  -- upstream allows such an entry's working-directory spelling only by
+  -- falling through after a failed download (resolveLookupPathPath), and
+  -- a run that cannot fetch should not widen what it may read.
+  roots <- mapM rootSpellings (filter (not . isNixPathPseudoUrl) (searchPathRoots searchPaths))
+  mapM_ (allowEvalPath st) (concat roots)
+  pure (st, builtinEnv policy (esTimestamp st) searchPaths)
+  where
+    rootSpellings root = do
+      given <- makeAbsolute (T.unpack root)
+      resolved <- canonicalizePath given
+      pure (map (canonPathValue . T.pack) [given, resolved])
+
 -- | Evaluate a .nix file and print the result.
-evalFile :: NixConfig -> StoreDir -> Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
-evalFile config storeDir strict extraPaths dataDir rawFilePath = do
+evalFile :: NixConfig -> CliOpts -> StoreDir -> FilePath -> FilePath -> IO ()
+evalFile config opts storeDir dataDir rawFilePath = do
   (filePath, source) <- readSourceFile rawFilePath
   case parseNix (takeDirectory filePath) (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st <- configuredEvalState config storeDir extraPaths dataDir (takeDirectory filePath)
-      result <-
-        runEvalIO st $
-          eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr >>= finalize strict
+      (st, env) <- setUpEval opts config storeDir dataDir (takeDirectory filePath)
+      result <- runEvalIO st (eval env expr >>= finalize (optStrict opts))
       case result of
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
@@ -460,18 +539,16 @@ evalFile config storeDir strict extraPaths dataDir rawFilePath = do
         Right forced -> TIO.putStrLn (prettyValue forced)
 
 -- | Evaluate an inline expression and print the result.
-evalExpr :: NixConfig -> StoreDir -> Bool -> [T.Text] -> FilePath -> T.Text -> IO ()
-evalExpr config storeDir strict extraPaths dataDir source = do
+evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
+evalExpr config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
   case parseNix cwd exprSourceName source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st <- configuredEvalState config storeDir extraPaths dataDir cwd
-      result <-
-        runEvalIO st $
-          eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr >>= finalize strict
+      (st, env) <- setUpEval opts config storeDir dataDir cwd
+      result <- runEvalIO st (eval env expr >>= finalize (optStrict opts))
       case result of
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
@@ -480,17 +557,17 @@ evalExpr config storeDir strict extraPaths dataDir source = do
 
 -- | Evaluate an inline expression to a derivation and print its ATerm (.drv
 -- contents), for diffing nova-nix's serialization against upstream Nix.
-evalExprAterm :: NixConfig -> StoreDir -> [T.Text] -> FilePath -> T.Text -> IO ()
-evalExprAterm config storeDir extraPaths dataDir source = do
+evalExprAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
+evalExprAterm config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
   case parseNix cwd exprSourceName source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st <- configuredEvalState config storeDir extraPaths dataDir cwd
+      (st, env) <- setUpEval opts config storeDir dataDir cwd
       result <- runEvalIO st $ do
-        val <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
+        val <- eval env expr
         forceDerivationAttrs val
         pure val
       case result of
@@ -546,9 +623,9 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st <- configuredEvalState config storeDir (optNixPaths opts) dataDir baseDir
+      (st, env) <- setUpEval opts config storeDir dataDir baseDir
       result <- runEvalIO st $ do
-        root <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
+        root <- eval env expr
         selected <- case attrPath of
           Nothing -> pure (Right root)
           Just path -> selectAttrPath path root
@@ -696,19 +773,6 @@ resolveCaches base mUrl mKey =
     base
       { ncSubstituters = ncSubstituters base ++ maybe [] (\url -> [T.pack url]) mUrl,
         ncTrustedPublicKeys = ncTrustedPublicKeys base ++ maybe [] (\key -> [T.pack key]) mKey
-      }
-
--- | The state a command evaluates under: the store, the directory relative
--- paths resolve against, the search path merged from the flags, the data
--- directory and @NIX_PATH@, and the call-depth ceiling the config cascade
--- resolved.
-configuredEvalState :: NixConfig -> StoreDir -> [T.Text] -> FilePath -> FilePath -> IO EvalState
-configuredEvalState config storeDir extraPaths dataDir baseDir = do
-  st0 <- newEvalState storeDir baseDir
-  pure
-    st0
-      { esSearchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0),
-        esCallDepth = topLevelCallDepth (ncMaxCallDepth config)
       }
 
 -- | Resolve nix.conf from the system file, the user-file cascade and

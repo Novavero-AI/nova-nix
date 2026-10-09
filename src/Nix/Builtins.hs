@@ -6,6 +6,10 @@
 -- (@true@, @false@, @null@, @storeDir@, @currentTime@,
 -- @currentSystem@, etc.), among them @derivation@: upstream's wrapper
 -- lambda around the @derivationStrict@ primop, evaluated from its source.
+-- The impure constants follow the evaluation policy: under @pure-eval@
+-- upstream installs neither @currentTime@ nor @currentSystem@
+-- (@addConstant@ skips an @impureOnly@ constant), so neither exists here
+-- then.
 --
 -- The environment is allocated in the C data layer, so 'builtinEnv' must
 -- be forced between 'Nix.Eval.Arena.arenaInit' and
@@ -19,17 +23,20 @@ module Nix.Builtins
     -- * NIX_PATH parsing
     parseNixPath,
     splitNixPath,
+    searchPathRoots,
+    isNixPathPseudoUrl,
   )
 where
 
 import Data.Char (isAsciiLower, isAsciiUpper)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Foreign.Ptr (nullPtr)
-import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, builtinNames, currentSystemStr, deferApply, evaluated)
-import Nix.Eval.Types (cheapThunk, clistFromThunks, mkStr, newCEnv, thunkToCPtr)
+import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, builtinNames, currentSystemStr, deferApply, evaluated, readThunkValue)
+import Nix.Eval.Types (EvalPolicy (..), bytesToTextLossy, cheapThunk, clistFromThunks, mkStr, newCEnv, thunkToCPtr)
 import Nix.Parser (parseNix)
 import Nix.Store.Path (defaultStoreDirText)
 
@@ -44,8 +51,10 @@ import Nix.Store.Path (defaultStoreDirText)
 --
 -- @searchPaths@ populates @builtins.nixPath@.  Parsed from @NIX_PATH@
 -- by 'parseNixPath'.  In tests, pass @[]@.
-builtinEnv :: Int64 -> [Thunk] -> Env
-builtinEnv timestamp searchPaths =
+--
+-- The policy decides which constants exist: see 'standardEntries'.
+builtinEnv :: EvalPolicy -> Int64 -> [Thunk] -> Env
+builtinEnv policy timestamp searchPaths =
   let scope =
         attrSetFromMap
           $ Map.fromList
@@ -54,7 +63,7 @@ builtinEnv timestamp searchPaths =
           [ ("true", evaluated (VBool True)),
             ("false", evaluated (VBool False)),
             ("null", evaluated VNull),
-            ("builtins", evaluated (builtinsAttrSet timestamp searchPaths)),
+            ("builtins", evaluated (builtinsAttrSet policy timestamp searchPaths)),
             ("derivation", derivationWrapper),
             -- Search path support: <name> desugars to __findFile __nixPath "name"
             -- (matching C++ Nix's parser desugaring).
@@ -98,23 +107,29 @@ topLevelBuiltin name = (name, evaluated (VBuiltin name []))
 
 -- | Like 'builtinEnv' but with additional scope bindings overlaid on
 -- the top-level environment.  Used by @scopedImport@.
-builtinEnvWithScope :: Int64 -> [Thunk] -> [(Text, Thunk)] -> Env
-builtinEnvWithScope timestamp searchPaths scope =
-  let base = builtinEnv timestamp searchPaths
+builtinEnvWithScope :: EvalPolicy -> Int64 -> [Thunk] -> [(Text, Thunk)] -> Env
+builtinEnvWithScope policy timestamp searchPaths scope =
+  let base = builtinEnv policy timestamp searchPaths
       scopeMap = Map.fromList scope
    in newCEnv nullPtr 0 (Just (attrSetFromMap scopeMap)) (Just base) nullPtr 0
 
 -- | The @builtins@ attribute set, derived from the central registry.
-builtinsAttrSet :: Int64 -> [Thunk] -> NixValue
-builtinsAttrSet timestamp searchPaths =
-  VAttrs $ attrSetFromMap $ Map.union builtinEntries (standardEntries timestamp searchPaths)
+builtinsAttrSet :: EvalPolicy -> Int64 -> [Thunk] -> NixValue
+builtinsAttrSet policy timestamp searchPaths =
+  VAttrs $ attrSetFromMap $ Map.union builtinEntries (standardEntries policy timestamp searchPaths)
   where
     builtinEntries =
       Map.fromList [(name, evaluated (VBuiltin name [])) | name <- builtinNames]
 
-standardEntries :: Int64 -> [Thunk] -> Map.Map Text Thunk
-standardEntries timestamp searchPaths =
-  Map.fromList
+-- | The constants beside the registry.  @currentTime@ and @currentSystem@
+-- are upstream's @impureOnly@ constants and are absent under @pure-eval@
+-- (@builtins ? currentTime@ is @false@ there, observed from
+-- nix-instantiate 2.33.2); @nixPath@ stays, holding whatever search path
+-- the caller passed, which under @pure-eval@ is what upstream leaves of
+-- it.
+standardEntries :: EvalPolicy -> Int64 -> [Thunk] -> Map.Map Text Thunk
+standardEntries policy timestamp searchPaths =
+  Map.fromList $
     [ ("true", evaluated (VBool True)),
       ("false", evaluated (VBool False)),
       ("null", evaluated VNull),
@@ -125,10 +140,10 @@ standardEntries timestamp searchPaths =
       ("nixVersion", evaluated (mkStr "2.24.0")),
       ("langVersion", evaluated (VInt 6)),
       ("nixPath", evaluated (VList (clistFromThunks (map thunkToCPtr searchPaths)))),
-      ("currentTime", evaluated (VInt timestamp)),
-      ("currentSystem", evaluated (mkStr currentSystemStr)),
       ("derivation", derivationWrapper)
     ]
+      ++ [("currentTime", evaluated (VInt timestamp)) | not (epPureEval policy)]
+      ++ [("currentSystem", evaluated (mkStr currentSystemStr)) | not (epPureEval policy)]
 
 -- ---------------------------------------------------------------------------
 -- The derivation constant
@@ -242,6 +257,24 @@ parseNixPath raw
                 )
             )
 
+-- | The @path@ of every search path entry 'parseNixPath' produced, for the
+-- restricted-mode allow list: upstream allows every lookup path root
+-- (@resolveLookupPathPath@ with @initAccessControl@), so the roots are
+-- read back from the very list the evaluator will search.  An entry that
+-- is not an attribute set with a string or path @path@ contributes
+-- nothing.
+searchPathRoots :: [Thunk] -> [Text]
+searchPathRoots = mapMaybe entryRoot
+  where
+    entryRoot thunk = do
+      VAttrs attrs <- readThunkValue thunk
+      pathThunk <- attrSetLookup "path" attrs
+      pathVal <- readThunkValue pathThunk
+      case pathVal of
+        VStr bytes _ -> Just (bytesToTextLossy bytes)
+        VPath p -> Just p
+        _ -> Nothing
+
 -- | URL schemes that keep a @NIX_PATH@ entry whole when @://@ follows
 -- them: the allowlist in @EvalSettings::isPseudoUrl@,
 -- src/libexpr/eval-settings.cc at Nix 2.24.9.
@@ -253,6 +286,18 @@ nixPathUrlSchemes = ["http", "https", "file", "channel", "git", "s3", "ssh"]
 -- test, both in src/libexpr/eval-settings.cc at Nix 2.24.9.
 nixPathBareSchemes :: [Text]
 nixPathBareSchemes = ["channel", "flake"]
+
+-- | Whether a search path entry's path names something fetched rather
+-- than a place on this filesystem: upstream's @EvalSettings::isPseudoUrl@
+-- (a @channel:@ prefix, or one of 'nixPathUrlSchemes' before @://@),
+-- plus the @flake:@ entries a lookup path hook resolves
+-- (@resolveLookupPathPath@ in src/libexpr/eval.cc at Nix 2.24.9).
+isNixPathPseudoUrl :: Text -> Bool
+isNixPathPseudoUrl path =
+  any (\bare -> (bare <> ":") `T.isPrefixOf` path) nixPathBareSchemes
+    || (not (T.null afterScheme) && scheme `elem` nixPathUrlSchemes)
+  where
+    (scheme, afterScheme) = T.breakOn "://" path
 
 -- | Split a @NIX_PATH@ string into entries the way upstream's
 -- @EvalSettings::parseNixPath@ does (src/libexpr/eval-settings.cc at

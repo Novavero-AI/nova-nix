@@ -104,6 +104,9 @@ module Nix.Eval.Types
 
     -- * Evaluation monad
     MonadEval (..),
+    PathExistence (..),
+    EvalPolicy (..),
+    unrestrictedPolicy,
     PureEval,
     runPureEval,
     storePathOrThrow,
@@ -142,6 +145,7 @@ import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLe
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
+import Nix.Eval.Policy (EvalPolicy (..), unrestrictedPolicy)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
 import Nix.Store.Path (StorePath, StorePathNameError, storePathNameErrorText)
@@ -1138,6 +1142,20 @@ typeName val = case val of
 -- Evaluation monad
 -- ---------------------------------------------------------------------------
 
+-- | What @builtins.pathExists@ asks of a path, decided from the
+-- argument's spelling as upstream's @prim_pathExists@ decides it
+-- (primops.cc at 2.24.9).
+data PathExistence
+  = -- | Whether an entry is there: the ancestors are resolved and the
+    -- final component is checked in place, so a symlink exists whatever
+    -- it points at (upstream's @SymlinkResolution::Ancestors@).
+    ExistsAsEntry
+  | -- | Whether a directory is there, asked by a string ending in @/@ or
+    -- @/.@: every symlink is followed, the final one included
+    -- (@SymlinkResolution::Full@), and a file answers false.
+    ExistsAsDirectory
+  deriving (Eq, Show)
+
 -- | Effect class for Nix evaluation.  Core logic is polymorphic in @m@
 -- so the same evaluator composes into 'PureEval' for tests or @IO@ for
 -- real file-system access (e.g. @import@, @readFile@).
@@ -1176,7 +1194,10 @@ class (Monad m) => MonadEval m where
   -- leaves the count that tryEval was entered at.
   withCallFrame :: m a -> m a
 
-  doesPathExist :: Text -> m Bool
+  -- | Whether something is at the path, as @builtins.pathExists@ asks
+  -- it; the query says how the final component is read.  A path the
+  -- policy refuses is absent.
+  doesPathExist :: PathExistence -> Text -> m Bool
 
   -- | List a directory, returning @(name, fileType)@ pairs.
   -- @fileType@ is one of @"regular"@, @"directory"@, or @"symlink"@
@@ -1206,8 +1227,18 @@ class (Monad m) => MonadEval m where
   readFileBytes :: Text -> m ByteString
 
   -- | Classify a single filesystem path as @"regular"@, @"directory"@,
-  -- @"symlink"@, or @"unknown"@.  Used by @builtins.readFileType@.
+  -- @"symlink"@, or @"unknown"@: an lstat of the path itself, refused
+  -- when a symlink sits anywhere above it, as upstream's accessor
+  -- refuses one.  Used by @builtins.readFileType@ and, on a resolved
+  -- root, by the source tree walk.
   getFileType :: Text -> m Text
+
+  -- | Follow every symlink in a path, as upstream's
+  -- @SourcePath::resolveSymlinks@ does before a tree is read
+  -- (@addPath@, @prim_filterSource@): no component of the result is a
+  -- symlink, so the lstats of the walk that follows never meet one
+  -- above the entry they classify.
+  resolveSymlinks :: Text -> m Text
 
   -- | Run an external process: @(command, args, stdin) -> (exitCode, stdout, stderr)@.
   runProcess :: Text -> [Text] -> Text -> m (Int, Text, Text)
@@ -1335,6 +1366,19 @@ class (Monad m) => MonadEval m where
   -- argument or environment value.  Unavailable in pure evaluation.
   storeSourcePath :: Text -> m Text
 
+  -- | The policy this evaluation runs under.  The builtins whose behaviour
+  -- upstream changes by setting consult it: @storePath@ is refused and the
+  -- fetchers demand a hash or revision under @pure-eval@, and a search path
+  -- miss is worded for the mode.  The filesystem and URI gates are not
+  -- decided here; they live in the instance, where the allowed set is.
+  evalPolicy :: m EvalPolicy
+
+  -- | Upstream @checkURI@: refuse a fetch of this URI under @restrict-eval@
+  -- unless @allowed-uris@ admits it (a path or @file://@ URI is checked
+  -- against the allowed paths instead).  A no-op under any other policy.
+  -- Every fetcher calls it before anything is spawned or downloaded.
+  checkUri :: Text -> m ()
+
 -- | Unwrap a store-path construction result (the @makeStorePath@ family
 -- in "Nix.Hash"), converting a rejected name into an eval error under
 -- the given context prefix (e.g. @builtins.toFile@).  Every eval-side
@@ -1354,7 +1398,10 @@ data PureError = PThrow !Text | PError !Text | PAbort !Text
 -- | Pure evaluation monad - @Either PureError@ under a reader carrying
 -- the call depth.  IO builtins ('readFile', 'import') are unavailable;
 -- everything else evaluates identically to the IO version, the
--- @max-call-depth@ ceiling included, at its upstream default.
+-- @max-call-depth@ ceiling included, at its upstream default.  It carries
+-- no filesystem policy: there is no filesystem, environment or network
+-- behind it to gate, so it reports 'unrestrictedPolicy' and every URI
+-- check passes.
 newtype PureEval a = PureEval (ReaderT CallDepth (Either PureError) a)
   deriving (Functor, Applicative, Monad)
 
@@ -1393,7 +1440,7 @@ instance MonadEval PureEval where
   -- follows it sees the depth it started from, failure or not.
   withCallFrame (PureEval action) =
     PureEval $ ReaderT $ \depth -> either (Left . PError) (runReaderT action) (enterCallFrame depth)
-  doesPathExist _ = pure False
+  doesPathExist _ _ = pure False
   listDirectory _ = throwEvalError "builtins.readDir: not available in pure evaluation"
   importFile _ = throwEvalError "import: not available in pure evaluation"
   getEnvVar _ = pure ""
@@ -1402,6 +1449,9 @@ instance MonadEval PureEval where
   scopedImportFile _ _ = throwEvalError "scopedImport: not available in pure evaluation"
   readFileBytes _ = throwEvalError "readFile: not available in pure evaluation"
   getFileType _ = throwEvalError "readFileType: not available in pure evaluation"
+
+  -- No filesystem, so no symlinks: a path resolves to itself.
+  resolveSymlinks = pure
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
   createScratchDir _ = throwEvalError "createScratchDir: not available in pure evaluation"
   removeScratchDir _ = pure ()
@@ -1432,6 +1482,8 @@ instance MonadEval PureEval where
   -- Pure eval cannot read files: a path coerces to itself (no store copy);
   -- the real copy-to-store happens only under 'EvalIO'.
   storeSourcePath = pure
+  evalPolicy = pure unrestrictedPolicy
+  checkUri _ = pure ()
   resolvePathLiteral = pure . canonPathValue
   forceThunk evalFn (Thunk ptr) =
     -- Read the C thunk via unsafePerformIO - safe because reads are

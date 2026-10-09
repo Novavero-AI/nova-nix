@@ -50,6 +50,12 @@ it.
   and `keep-outputs` are not implemented, so an unrooted `.drv` is collected.
   `build` creates no result link unless `--out-link` is given, where
   `nix-build` defaults to `./result`.
+- `--restrict-eval` and `--pure-eval` exist (and `restrict-eval`, `pure-eval`
+  and `allowed-uris` in nix.conf), gating reads, the environment and fetches
+  the way upstream's modes do. The closure of a search path root that is a
+  store path is not allowed along with it, and the bundled `<nix/*>` directory
+  stays listed in `builtins.nixPath` under `--pure-eval`, where upstream
+  shows an empty list.
 - On Windows a build's process tree runs in a job object, so stopping a build
   stops everything it started. There is no filesystem or network isolation
   yet ([#25]).
