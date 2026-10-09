@@ -324,8 +324,6 @@ data NixValue
     VAttrs !AttrSet
   | -- | Lambda closure: captures environment, formals, body bytecode index.
     VLambda !Env !EvalFormals !Word32
-  | -- | A realized derivation (build recipe).
-    VDerivation !Derivation
   | -- | Built-in function, dispatched by name.
     -- Accumulated args support curried partial application.
     VBuiltin !Text ![NixValue]
@@ -1140,7 +1138,6 @@ typeName val = case val of
   VList _ -> "a list"
   VAttrs _ -> "a set"
   VLambda {} -> "a function"
-  VDerivation _ -> "a derivation"
   VBuiltin _ _ -> "a built-in function"
   VCompiledRegex _ -> "a built-in function"
 

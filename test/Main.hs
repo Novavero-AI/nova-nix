@@ -39,7 +39,7 @@ import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
-import Nix.Eval (FetchCache (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, fetchCacheKey, force, mkStr, readThunkValue, runPureEval)
+import Nix.Eval (FetchCache (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, fetchCacheKey, force, mkStr, readThunkValue, runPureEval, typeName)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.AttrPath (parseAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
@@ -2048,6 +2048,24 @@ evalNixIO baseDir source = do
   storeDir <- evalNixIOStoreDir
   evalNixIOStore storeDir baseDir source
 
+-- | IO eval of a derivation expression to the 'Derivation' the session
+-- recorded for it: forcing the expression's @drvPath@ runs derivationStrict,
+-- which records the @.drv@ under that path, and the recipe is read back the
+-- way the build driver reads it.  Only the IO evaluator keeps the record.
+evalDerivationIO :: FilePath -> Text -> IO (Either Text Derivation)
+evalDerivationIO baseDir source = case parseNix baseDir "<test>" ("(" <> source <> ").drvPath") of
+  Left err -> pure (Left (T.pack (show err)))
+  Right expr -> do
+    storeDir <- evalNixIOStoreDir
+    st <- newEvalState storeDir baseDir
+    runEvalIO st $ do
+      pathVal <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
+      case pathVal of
+        VStr pathBytes _ -> do
+          recorded <- lookupSessionDrv (bytesText pathBytes)
+          maybe (throwEvalError ("no .drv was recorded for " <> bytesText pathBytes)) pure recorded
+        other -> throwEvalError ("expected a drvPath string, got " <> typeName other)
+
 -- | Run a named IO eval test - single label, no double-wrapping.
 runTestIO :: Text -> FilePath -> Text -> NixValue -> IO Bool
 runTestIO label baseDir source expected = do
@@ -2674,6 +2692,8 @@ testBatchG = do
 testBatchH :: IO [Bool]
 testBatchH = do
   putStrLn "eval/builtins-batchH"
+  let withTwoOutputs expr =
+        "let D = derivation { name = \"x\"; system = \"s\"; builder = \"b\"; outputs = [ \"out\" \"dev\" ]; }; in " <> expr
   sequence
     [ runTest "derivation has type" $
         assertEval
@@ -2708,7 +2728,48 @@ testBatchH = do
         assertEvalFail "drv-tyerr" "derivation 42",
       runTest "derivation deterministic" $
         assertRight "drv-det" (evalNix "let d1 = derivation { name = \"a\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; d2 = derivation { name = \"a\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d1.drvPath == d2.drvPath") $ \val ->
-          assertEqual "deterministic" (VBool True) val
+          assertEqual "deterministic" (VBool True) val,
+      -- The result is upstream's derivation.nix wrapper evaluated as the
+      -- builtin, so its shape is the wrapper's: every row below was read
+      -- from nix-instantiate 2.33.2 (#217).
+      runTest "derivation result carries exactly upstream's attributes" $
+        assertEval
+          "drv-attrnames"
+          (withTwoOutputs "builtins.attrNames D == [ \"all\" \"builder\" \"dev\" \"drvAttrs\" \"drvPath\" \"name\" \"out\" \"outPath\" \"outputName\" \"outputs\" \"system\" \"type\" ]")
+          (VBool True),
+      runTest "derivation outputName is the first output" $
+        assertEval "drv-outputname" (withTwoOutputs "D.outputName") (mkStr "out"),
+      runTest "derivation default output is the first listed, not out" $
+        assertEval
+          "drv-first-output"
+          "(derivation { name = \"x\"; system = \"s\"; builder = \"b\"; outputs = [ \"dev\" \"out\" ]; }).outputName"
+          (mkStr "dev"),
+      runTest "every output attribute is a complete derivation set" $
+        assertEval "drv-output-set" (withTwoOutputs "builtins.attrNames D.dev == builtins.attrNames D") (VBool True),
+      runTest "an output set names its own output" $
+        assertEval "drv-output-name" (withTwoOutputs "D.dev.outputName") (mkStr "dev"),
+      runTest "output sets refer back to each other" $
+        assertEval "drv-output-cycle" (withTwoOutputs "D.dev.out.outPath == D.outPath && D.dev.dev.out.dev.outputName == \"dev\"") (VBool True),
+      runTest "derivation all lists every output set in order" $
+        assertEval "drv-all" (withTwoOutputs "map (o: o.outputName) D.all == [ \"out\" \"dev\" ]") (VBool True),
+      runTest "derivation drvAttrs is the argument set" $
+        assertEval "drv-drvattrs" (withTwoOutputs "builtins.attrNames D.drvAttrs == [ \"builder\" \"name\" \"outputs\" \"system\" ]") (VBool True),
+      runTest "derivation leaks no internal attribute" $
+        assertEval "drv-no-internal" (withTwoOutputs "D ? _derivation") (VBool False),
+      -- derivationStrict is reached only through outPath and drvPath, so a
+      -- derivation forced to WHNF forces none of its inputs.
+      runTest "forcing a derivation to WHNF forces no input" $
+        assertEval
+          "drv-whnf"
+          "builtins.seq (derivation { name = \"x\"; system = \"s\"; builder = throw \"forced\"; }) \"whnf-ok\""
+          (mkStr "whnf-ok"),
+      runTest "derivationStrict returns drvPath and one path per output" $
+        assertEval
+          "drvstrict-shape"
+          "builtins.attrNames (derivationStrict { name = \"x\"; system = \"s\"; builder = \"b\"; outputs = [ \"out\" \"dev\" ]; }) == [ \"dev\" \"drvPath\" \"out\" ]"
+          (VBool True),
+      runTest "derivation is a lambda with upstream's formals" $
+        assertEval "drv-functionargs" "builtins.functionArgs derivation == { outputs = true; }" (VBool True)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -4733,18 +4794,16 @@ testBuildOrchestrator = do
       runTestM "derivation context populates inputDrvs" $ do
         tmpBase <- getTemporaryDirectory
         result <-
-          evalNixIO tmpBase $
+          evalDerivationIO tmpBase $
             T.concat
               [ "let dep = derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; ",
                 "main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; src = dep.outPath; }; ",
-                "in main._derivation"
+                "in main"
               ]
-        pure $ assertRight "drv-ctx-inputs" result $ \case
-          VDerivation drv ->
-            if Map.null (drvInputDrvs drv)
-              then Fail "expected non-empty drvInputDrvs"
-              else Pass
-          _ -> Fail "expected VDerivation",
+        pure $ assertRight "drv-ctx-inputs" result $ \drv ->
+          if Map.null (drvInputDrvs drv)
+            then Fail "expected non-empty drvInputDrvs"
+            else Pass,
       -- drv3: a dependent derivation's drvPath is stable across evaluations
       -- (the input modulo substitution is deterministic).
       runTestM "dependent derivation drvPath is deterministic (IO eval)" $ do
@@ -4770,15 +4829,15 @@ testBuildOrchestrator = do
         let depSrc = "derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ \"out\" \"dev\" ]; }"
         depPathR <- evalNixIO tmpBase ("(" <> depSrc <> ").drvPath")
         result <-
-          evalNixIO tmpBase $
+          evalDerivationIO tmpBase $
             T.concat
               [ "let dep = ",
                 depSrc,
                 "; main = derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; ref = dep.drvPath; }; ",
-                "in main._derivation"
+                "in main"
               ]
         pure $ case (depPathR, result) of
-          (Right (VStr depPathBytes _), Right (VDerivation drv)) ->
+          (Right (VStr depPathBytes _), Right drv) ->
             case parseStorePath defaultStoreDir (bytesText depPathBytes) of
               Nothing -> Fail ("unparseable dep drvPath: " <> bytesText depPathBytes)
               Just depSP -> case Map.lookup depSP (drvInputDrvs drv) of
@@ -4786,7 +4845,7 @@ testBuildOrchestrator = do
                   | Set.fromList outs == Set.fromList ["dev", "out"] -> Pass
                   | otherwise -> Fail ("expected the full output set [dev, out], got " <> T.pack (show outs))
                 Nothing -> Fail "dep .drv missing from inputDrvs despite the deep drvPath ref"
-          other -> Fail ("expected dep drvPath and main._derivation, got " <> T.pack (show other))
+          other -> Fail ("expected dep drvPath and main's derivation, got " <> T.pack (show other))
     ]
 
 -- ---------------------------------------------------------------------------
@@ -8327,49 +8386,39 @@ testFromATerm = do
               if not validB
                 then Fail "root .drv not registered"
                 else assertEqual "drv references" expectedRefs (sort refsB),
-      -- builtinDerivation populates drvOutputs
-      runTest "builtinDerivation populates drvOutputs"
-        $ assertRight
-          "drvOutputs"
-          (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d._derivation")
-        $ \val -> case val of
-          VDerivation drv ->
-            case drvOutputs drv of
-              [] -> Fail "drvOutputs is empty"
-              (firstOut : _) ->
-                if doName firstOut == "out"
-                  then Pass
-                  else Fail ("first output name: " <> doName firstOut)
-          _ -> Fail ("expected VDerivation, got " <> T.pack (show val)),
-      -- builtinDerivation multi-output populates drvOutputs
-      runTest "builtinDerivation multi-output"
-        $ assertRight
-          "multi-output"
-          (evalNix "let d = derivation { name = \"multi\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [\"out\" \"dev\"]; }; in d._derivation")
-        $ \val -> case val of
-          VDerivation drv ->
-            let names = map doName (drvOutputs drv)
-             in if names == ["out", "dev"]
-                  then Pass
-                  else Fail ("output names: " <> T.pack (show names))
-          _ -> Fail ("expected VDerivation, got " <> T.pack (show val)),
-      -- builtinDerivation populates drvEnv with the output paths ($out, ...)
-      -- and the build attributes.  Note: the .drv env does NOT contain a
-      -- "drvPath" key - matching C++ Nix, which never writes one.
-      runTest "builtinDerivation populates drvEnv"
-        $ assertRight
-          "drvEnv"
-          (evalNix "let d = derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d._derivation")
-        $ \val -> case val of
-          VDerivation drv
-            | Just op <- Map.lookup "out" (drvEnv drv),
-              "/nix/store/" `BS.isPrefixOf` op,
-              Just nm <- Map.lookup "name" (drvEnv drv),
-              nm == "test" ->
-                Pass
-            | otherwise ->
-                Fail ("drvEnv keys: " <> T.pack (show (Map.toList (drvEnv drv))))
-          _ -> Fail ("expected VDerivation, got " <> T.pack (show val))
+      -- The recorded derivation populates drvOutputs.  These three read the
+      -- Derivation the session records, which only the IO evaluator keeps.
+      runTestM "derivationStrict populates drvOutputs" $ do
+        tmpBase <- getTemporaryDirectory
+        result <- evalDerivationIO tmpBase "derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }"
+        pure $ assertRight "drvOutputs" result $ \drv ->
+          case drvOutputs drv of
+            [] -> Fail "drvOutputs is empty"
+            (firstOut : _) ->
+              if doName firstOut == "out"
+                then Pass
+                else Fail ("first output name: " <> doName firstOut),
+      -- The .drv lists outputs sorted by name, as upstream writes them; the
+      -- declared order lives in the value's outputs and all.
+      runTestM "derivationStrict multi-output" $ do
+        tmpBase <- getTemporaryDirectory
+        result <- evalDerivationIO tmpBase "derivation { name = \"multi\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [\"out\" \"dev\"]; }"
+        pure $ assertRight "multi-output" result $ \drv ->
+          let names = map doName (drvOutputs drv)
+           in if names == ["dev", "out"]
+                then Pass
+                else Fail ("output names: " <> T.pack (show names)),
+      -- The .drv env carries the output paths ($out, ...) and the build
+      -- attributes, and no "drvPath" key - matching C++ Nix, which never
+      -- writes one.
+      runTestM "derivationStrict populates drvEnv" $ do
+        tmpBase <- getTemporaryDirectory
+        result <- evalDerivationIO tmpBase "derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }"
+        pure $ assertRight "drvEnv" result $ \drv ->
+          case (Map.lookup "out" (drvEnv drv), Map.lookup "name" (drvEnv drv)) of
+            (Just op, Just "test")
+              | "/nix/store/" `BS.isPrefixOf` op -> Pass
+            _ -> Fail ("drvEnv keys: " <> T.pack (show (Map.toList (drvEnv drv))))
     ]
 
 -- ---------------------------------------------------------------------------
@@ -9022,32 +9071,33 @@ evalAndBuild storeDir source = do
       st <- newEvalState storeDir "."
       evalResult <- runEvalIO st $ do
         val <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
-        -- 'derivation' is lazy now; force _derivation so the peek below sees it
-        -- (and so a missing required attr surfaces as an eval error).
+        -- What the CLI driver does: force drvPath, which runs
+        -- derivationStrict (so a missing required attr surfaces as an eval
+        -- error) and records the .drv the build reads back by that path.
         case val of
-          VAttrs attrs -> maybe (pure ()) (void . force) (attrSetLookup "_derivation" attrs)
-          _ -> pure ()
-        pure val
+          VAttrs attrs | Just thunk <- attrSetLookup "drvPath" attrs -> do
+            pathVal <- force thunk
+            case pathVal of
+              VStr pathBytes _ -> lookupSessionDrv (bytesText pathBytes)
+              _ -> pure Nothing
+          _ -> pure Nothing
       case evalResult of
         Left err -> pure (Left ("eval error: " <> err))
-        Right val -> case val of
-          VAttrs attrs -> case attrSetLookup "_derivation" attrs >>= readThunkValue of
-            Just (VDerivation drv) -> do
-              store <- openStore storeDir
-              tmpBase <- getTemporaryDirectory
-              let config = (defaultBuildConfig storeDir) {bcTmpDir = tmpBase </> "nova-nix-e2e-tmp"}
-              -- What the CLI driver does before building, in the same
-              -- order: eval has no store DB handle, so anything it wrote
-              -- is registered here or not at all.  Skipping it made this
-              -- harness unable to see a whole class of driver bug.
-              sourceCache <- readIORef (esSourcePathCache st)
-              storeWrites <- readIORef (esStoreWriteCache st)
-              materializeEvalSources store sourceCache
-              materializeEvalStoreWrites store storeWrites
-              result <- buildDerivation config store drv
-              pure (Right (result, store))
-            _ -> pure (Left "no _derivation in result attrs")
-          _ -> pure (Left "result is not an attrset")
+        Right Nothing -> pure (Left "result is not a derivation")
+        Right (Just drv) -> do
+          store <- openStore storeDir
+          tmpBase <- getTemporaryDirectory
+          let config = (defaultBuildConfig storeDir) {bcTmpDir = tmpBase </> "nova-nix-e2e-tmp"}
+          -- What the CLI driver does before building, in the same
+          -- order: eval has no store DB handle, so anything it wrote
+          -- is registered here or not at all.  Skipping it made this
+          -- harness unable to see a whole class of driver bug.
+          sourceCache <- readIORef (esSourcePathCache st)
+          storeWrites <- readIORef (esStoreWriteCache st)
+          materializeEvalSources store sourceCache
+          materializeEvalStoreWrites store storeWrites
+          result <- buildDerivation config store drv
+          pure (Right (result, store))
 
 testE2E :: IO [Bool]
 testE2E = do
@@ -10026,9 +10076,8 @@ testClassIFollowups = do
       -- cache-hit arm computes for the identical derivation
       runTestM "input modulo recurses through the store read (stub store)" $ do
         let depSrc = "derivation { name = \"dep\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }"
-        depDrv <- case evalNix ("(" <> depSrc <> ")._derivation") of
-          Right (VDerivation d) -> pure d
-          other -> fail ("dep._derivation: " <> show other)
+        tmpBase <- getTemporaryDirectory
+        depDrv <- evalDerivationIO tmpBase depSrc >>= either (fail . ("dep: " <>) . T.unpack) pure
         depPath <- case evalNix ("(" <> depSrc <> ").drvPath") of
           Right (VStr p _) -> pure (bytesText p)
           other -> fail ("dep.drvPath: " <> show other)
@@ -10040,7 +10089,6 @@ testClassIFollowups = do
                     depPath,
                     "\" = { outputs = [\"out\"]; }; }; }).drvPath"
                   ]
-        tmpBase <- getTemporaryDirectory
         ioResult <-
           evalNixIO tmpBase $
             T.concat
@@ -10268,6 +10316,21 @@ testStoreNameSinks = do
         failsWith "out-traversal" (drvWithOutputs "[ \"out\" \"../x\" ]") "invalid derivation output name",
       runTest "derivation output name with a colon is rejected" $
         failsWith "out-colon" (drvWithOutputs "[ \"a:b\" ]") "invalid derivation output name",
+      -- Upstream's derivationStrict refuses these in its outputs loop: the
+      -- result set already has a drvPath attribute, and a repeat would
+      -- collide there too.
+      runTest "derivation output named drvPath is rejected" $
+        failsWith "out-drvpath" (drvWithOutputs "[ \"drvPath\" ]") "invalid derivation output name 'drvPath'",
+      runTest "repeated derivation output name is rejected" $
+        failsWith "out-duplicate" (drvWithOutputs "[ \"out\" \"out\" ]") "duplicate derivation output 'out'",
+      -- The wrapper never calls derivationStrict with an empty list (its
+      -- builtins.head fails on the empty outputsList first), so the primop
+      -- is called directly.
+      runTest "empty derivation output list is rejected" $
+        failsWith
+          "out-empty"
+          "derivationStrict { name = \"p\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ ]; }"
+          "derivation cannot have an empty set of outputs",
       -- Both fields clean on their own, only the COMPOSED drvName-output
       -- crosses the length cap: the construction-side check catches what
       -- the field-level checks cannot.

@@ -60,6 +60,14 @@ arenaInit = do
 
 -- | Destroy all C arenas, properly freeing StablePtrs first.
 --
+-- This ends the process's use of the evaluator; a second 'arenaInit' does
+-- not restore one.  Thunks the library allocates once for the process,
+-- explicitly (@derivationWrapper@ in "Nix.Builtins") or as a
+-- parameter-free entry of 'Nix.Builtins.builtinEnv' that GHC shares
+-- across its calls (@storeDir@, @map@), keep pointing into the memory
+-- freed here, and only an entry built per call (@currentTime@) survives
+-- a second cycle.
+--
 -- 1. Collects all StablePtr payloads from thunks (batch C call)
 -- 2. Frees each StablePtr from Haskell
 -- 3. Frees all tracked CLists (bulk cleanup)

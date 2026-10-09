@@ -4,7 +4,8 @@
 -- ~100 functions.  This module assembles the initial 'Env' from the
 -- central registry in "Nix.Eval" and adds standard constants
 -- (@true@, @false@, @null@, @storeDir@, @currentTime@,
--- @currentSystem@, etc.).
+-- @currentSystem@, etc.), among them @derivation@: upstream's wrapper
+-- lambda around the @derivationStrict@ primop, evaluated from its source.
 module Nix.Builtins
   ( -- * Builtin registration
     builtinEnv,
@@ -22,8 +23,9 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import Foreign.Ptr (nullPtr)
-import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, builtinNames, currentSystemStr, evaluated)
-import Nix.Eval.Types (clistFromThunks, mkStr, newCEnv, thunkToCPtr)
+import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, builtinNames, currentSystemStr, deferApply, evaluated)
+import Nix.Eval.Types (cheapThunk, clistFromThunks, mkStr, newCEnv, thunkToCPtr)
+import Nix.Parser (parseNix)
 import Nix.Store.Path (defaultStoreDirText)
 
 -- | The initial environment containing all builtins.
@@ -48,6 +50,7 @@ builtinEnv timestamp searchPaths =
             ("false", evaluated (VBool False)),
             ("null", evaluated VNull),
             ("builtins", evaluated (builtinsAttrSet timestamp searchPaths)),
+            ("derivation", derivationWrapper),
             -- Search path support: <name> desugars to __findFile __nixPath "name"
             -- (matching C++ Nix's parser desugaring).
             ("__findFile", evaluated (VBuiltin "findFile" [])),
@@ -62,12 +65,13 @@ builtinEnv timestamp searchPaths =
 -- Exactly upstream's unprefixed surface: fetchurl and toFile are
 -- deliberately NOT here (upstream exposes them only under @builtins.@,
 -- and nixpkgs relies on @with pkgs; fetchurl@ binding pkgs.fetchurl).
+-- @derivation@ is unprefixed too, but it is a constant ('derivationWrapper'),
+-- not a registry entry.
 topLevelBuiltinNames :: [Text]
 topLevelBuiltinNames =
   [ "abort",
     "baseNameOf",
     "break",
-    "derivation",
     "derivationStrict",
     "dirOf",
     "fetchGit",
@@ -117,8 +121,89 @@ standardEntries timestamp searchPaths =
       ("langVersion", evaluated (VInt 6)),
       ("nixPath", evaluated (VList (clistFromThunks (map thunkToCPtr searchPaths)))),
       ("currentTime", evaluated (VInt timestamp)),
-      ("currentSystem", evaluated (mkStr currentSystemStr))
+      ("currentSystem", evaluated (mkStr currentSystemStr)),
+      ("derivation", derivationWrapper)
     ]
+
+-- ---------------------------------------------------------------------------
+-- The derivation constant
+-- ---------------------------------------------------------------------------
+
+-- | Upstream's @src\/libexpr\/primops\/derivation.nix@ at 2.24.9, without its
+-- documentation comment.  @derivation@ is this lambda, not a primop, so the
+-- result set has upstream's shape by construction: every output attribute
+-- is the complete derivation set for that output, @all@ lists them,
+-- @drvAttrs@ is the argument set, and @derivationStrict@ is reached only
+-- through @outPath@ and @drvPath@, which is what keeps forcing a derivation
+-- to WHNF from forcing any of its inputs.
+derivationWrapperSource :: Text
+derivationWrapperSource =
+  T.unlines
+    [ "drvAttrs @ { outputs ? [ \"out\" ], ... }:",
+      "",
+      "let",
+      "",
+      "  strict = derivationStrict drvAttrs;",
+      "",
+      "  commonAttrs = drvAttrs // (builtins.listToAttrs outputsList) //",
+      "    { all = map (x: x.value) outputsList;",
+      "      inherit drvAttrs;",
+      "    };",
+      "",
+      "  outputToAttrListElement = outputName:",
+      "    { name = outputName;",
+      "      value = commonAttrs // {",
+      "        outPath = builtins.getAttr outputName strict;",
+      "        drvPath = strict.drvPath;",
+      "        type = \"derivation\";",
+      "        inherit outputName;",
+      "      };",
+      "    };",
+      "",
+      "  outputsList = map outputToAttrListElement outputs;",
+      "",
+      "in (builtins.head outputsList).value"
+    ]
+
+-- | The name upstream gives the wrapper's source in error positions.
+derivationWrapperName :: Text
+derivationWrapperName = "derivation-internal.nix"
+
+-- | The bindings the wrapper's free variables resolve to.  Upstream evaluates
+-- the file in its base environment; this is the slice of that environment
+-- the wrapper reads, so the constant needs no knot through 'builtinEnv'.
+derivationWrapperEnv :: Env
+derivationWrapperEnv =
+  let builtinsUsed = ["getAttr", "head", "listToAttrs"]
+      scope =
+        attrSetFromMap $
+          Map.fromList
+            [ ("derivationStrict", evaluated (VBuiltin "derivationStrict" [])),
+              ("map", evaluated (VBuiltin "map" [])),
+              ("builtins", evaluated (VAttrs (attrSetFromMap (Map.fromList (map topLevelBuiltin builtinsUsed)))))
+            ]
+   in newCEnv nullPtr 0 (Just scope) Nothing nullPtr 0
+{-# NOINLINE derivationWrapperEnv #-}
+
+-- | The @derivation@ constant: the wrapper lambda closed over
+-- 'derivationWrapperEnv'.  One value bound in both the root scope and
+-- @builtins@, as upstream's @addConstant@ binds it.  It is compiled once
+-- for the process rather than once per environment: 'builtinEnv' runs for
+-- every imported file, and the arena the lambda lives in is the process's
+-- ("Nix.Eval.Arena").  The source is a constant, so a parse failure is a
+-- defect in this module; it surfaces as an abort at the first use of
+-- @derivation@ rather than as a crash while the environment is assembled.
+derivationWrapper :: Thunk
+derivationWrapper =
+  case parseNix "/" derivationWrapperName derivationWrapperSource of
+    Right expr -> cheapThunk derivationWrapperEnv expr
+    Left err -> abortingThunk ("the derivation wrapper does not parse: " <> T.pack (show err))
+{-# NOINLINE derivationWrapper #-}
+
+-- | A thunk that aborts evaluation with the message when forced: @abort@
+-- applied to it, deferred the way "Nix.Eval" defers any application.
+abortingThunk :: Text -> Thunk
+abortingThunk message = deferApply (VBuiltin "abort" []) (evaluated (mkStr message))
 
 -- ---------------------------------------------------------------------------
 -- NIX_PATH parsing
