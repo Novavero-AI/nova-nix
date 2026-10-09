@@ -13,7 +13,7 @@
 module Main (main) where
 
 import Control.Exception (IOException, displayException, try)
-import Control.Monad (mfilter, void, (>=>))
+import Control.Monad (join, mfilter, void, (>=>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (readIORef)
@@ -37,7 +37,7 @@ import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
-import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
@@ -73,9 +73,11 @@ data CliOpts = CliOpts
 data Command
   = CmdEvalFile !FilePath
   | CmdEvalExpr !T.Text
-  | CmdBuild !BuildTarget !(Maybe T.Text)
+  | CmdBuild !BuildTarget !(Maybe T.Text) !(Maybe FilePath)
   | CmdPush !PushArgs
   | CmdStoreDelete ![String]
+  | -- | @store gc@: collect, or with the flag only list the roots.
+    CmdStoreGc !Bool
   | -- | No command given.  Usage on stderr, non-zero: a bare invocation is
     -- a usage error, and a caller testing the exit status must see one.
     CmdUsage
@@ -95,12 +97,14 @@ data BuildTarget
 -- | Arguments to the build command, while the target is still unknown.
 data BuildArgs = BuildArgs
   { baTarget :: !(Maybe BuildTarget),
-    baAttrPath :: !(Maybe T.Text)
+    baAttrPath :: !(Maybe T.Text),
+    -- | Where to create the result symlink, registered as a GC root.
+    baOutLink :: !(Maybe FilePath)
   }
 
 -- | Build arguments before any flag is parsed.
 emptyBuildArgs :: BuildArgs
-emptyBuildArgs = BuildArgs Nothing Nothing
+emptyBuildArgs = BuildArgs Nothing Nothing Nothing
 
 -- | Arguments to the push command.
 data PushArgs = PushArgs
@@ -191,6 +195,9 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
       | flag `elem` attrFlags = case baAttrPath buildArgs of
           Just _ -> Left "build accepts one attribute path"
           Nothing -> goBuild opts (buildArgs {baAttrPath = Just (T.pack path)}) rest
+      | flag `elem` outLinkFlags = case baOutLink buildArgs of
+          Just _ -> Left "build accepts one --out-link"
+          Nothing -> goBuild opts (buildArgs {baOutLink = Just path}) rest
     goBuild _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goBuild _ _ (arg@('-' : _) : _) = Left ("unknown build flag: " ++ arg)
@@ -203,7 +210,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
       Nothing -> goBuild opts (buildArgs {baTarget = Just target}) rest
     finishBuild opts buildArgs = case baTarget buildArgs of
       Nothing -> Left "build requires a FILE.nix argument or --expr EXPR"
-      Just target -> Right opts {optCommand = CmdBuild target (baAttrPath buildArgs)}
+      Just target -> Right opts {optCommand = CmdBuild target (baAttrPath buildArgs) (baOutLink buildArgs)}
     -- Sub-parser for push: flags and explicit store paths in any order.
     goPush opts pushArgs [] = Right opts {optCommand = CmdPush pushArgs}
     goPush opts pushArgs ("--store" : dir : rest) =
@@ -222,9 +229,10 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
     goPush opts pushArgs (path : rest) =
       goPush opts (pushArgs {paPaths = paPaths pushArgs ++ [path]}) rest
     -- Sub-parser for store maintenance verbs.
-    goStore _ [] = Left "store: expected a subcommand (delete)"
+    goStore _ [] = Left "store: expected a subcommand (delete, gc)"
     goStore opts ("delete" : rest) = goStoreDelete opts [] rest
-    goStore _ (sub : _) = Left ("unknown store subcommand: " ++ sub ++ " (expected: delete)")
+    goStore opts ("gc" : rest) = goStoreGc opts False rest
+    goStore _ (sub : _) = Left ("unknown store subcommand: " ++ sub ++ " (expected: delete, gc)")
     goStoreDelete opts paths []
       | null paths = Left "store delete: name at least one store path"
       | otherwise = Right opts {optCommand = CmdStoreDelete paths}
@@ -235,12 +243,22 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] CmdUsage)
     goStoreDelete _ _ (arg@('-' : _) : _) = Left ("unknown store delete flag: " ++ arg)
     goStoreDelete opts paths (path : rest) =
       goStoreDelete opts (paths ++ [path]) rest
+    goStoreGc opts printRoots [] = Right opts {optCommand = CmdStoreGc printRoots}
+    goStoreGc opts printRoots ("--store" : dir : rest) =
+      goStoreGc (opts {optStore = Just dir}) printRoots rest
+    goStoreGc opts _ ("--print-roots" : rest) = goStoreGc opts True rest
+    goStoreGc _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goStoreGc _ _ (arg : _) = Left ("unknown store gc argument: " ++ arg)
     -- Flags that consume the following argument as their value.
     valueFlags =
       ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--compression"]
         ++ attrFlags
+        ++ outLinkFlags
     -- Attribute selection, under both of upstream's spellings.
     attrFlags = ["-A", "--attr"]
+    -- The result link, under both of nix-build's spellings.
+    outLinkFlags = ["-o", "--out-link"]
 
 -- | Upstream C++ Nix's name for this directory, so an operator who knows
 -- one knows the other.
@@ -338,14 +356,16 @@ main = do
   dataDir <- resolveDataDir
   opts <- either (failWith . T.pack) pure (parseArgs args)
   config <- loadNixConfig
+  storeDir <- chosenStoreDir opts
   case optCommand opts of
-    CmdEvalFile filePath -> evalFile config (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir filePath
+    CmdEvalFile filePath -> evalFile config storeDir (optStrict opts) (optNixPaths opts) dataDir filePath
     CmdEvalExpr expr
-      | optAterm opts -> evalExprAterm config (chosenStoreDir opts) (optNixPaths opts) dataDir expr
-      | otherwise -> evalExpr config (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir expr
-    CmdBuild target attrPath -> buildCommand config opts dataDir target attrPath
-    CmdPush pushArgs -> pushCommand opts pushArgs
-    CmdStoreDelete paths -> storeDeleteCommand opts paths
+      | optAterm opts -> evalExprAterm config storeDir (optNixPaths opts) dataDir expr
+      | otherwise -> evalExpr config storeDir (optStrict opts) (optNixPaths opts) dataDir expr
+    CmdBuild target attrPath outLink -> buildCommand config opts storeDir dataDir target attrPath outLink
+    CmdPush pushArgs -> pushCommand storeDir pushArgs
+    CmdStoreDelete paths -> storeDeleteCommand storeDir paths
+    CmdStoreGc printRoots -> storeGcCommand storeDir printRoots
     CmdUsage -> mapM_ (hPutStrLn stderr) usageLines >> exitFailure
     CmdHelp -> mapM_ putStrLn usageLines
     CmdVersion -> putStrLn versionLine
@@ -369,12 +389,15 @@ usageLines =
     "  build FILE.nix         Build a derivation from a .nix file",
     "  build --expr 'EXPR'    Build a derivation from an inline expression",
     "  push --cache URL       Push store paths (and their closures) to a binary cache",
-    "  store delete PATH...   Remove store paths, refused while other valid paths reference them",
+    "  store delete PATH...   Remove store paths, refused while a root or another valid path keeps them",
+    "  store gc               Remove every store path not reachable from a root",
     "",
     "Flags:",
     "  --strict               Deep-force all thunks before printing (warning: OOM on large results)",
     "  --aterm                With eval --expr, print the derivation's .drv ATerm",
     "  -A, --attr ATTRPATH    With build: select a dotted attribute path (a.b.c)",
+    "  -o, --out-link PATH    With build: create PATH as a symlink to the result and register it as a GC root",
+    "  --print-roots          With store gc: list the roots as LINK -> PATH and delete nothing",
     "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)",
     "  --all                  With push: select every valid path except derivations",
     "  --key-file PATH        With push: file holding the cache API key",
@@ -513,10 +536,9 @@ forceDerivationAttrs val = case val of
 derivationAttrKeys :: [T.Text]
 derivationAttrKeys = ["type", "drvPath", "outputName"]
 
-buildCommand :: NixConfig -> CliOpts -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
-buildCommand config opts dataDir target attrPath = do
-  let storeDir = chosenStoreDir opts
-      caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
+buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> Maybe FilePath -> IO ()
+buildCommand config opts storeDir dataDir target attrPath outLink = do
+  let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
   (baseDir, sourceName, source) <- loadBuildSource target
   case parseNix baseDir sourceName source of
@@ -555,7 +577,7 @@ buildCommand config opts dataDir target attrPath = do
           outputPath <- namedOutputPath drv outputName
           sourceCache <- readIORef (esSourcePathCache st)
           storeWrites <- readIORef (esStoreWriteCache st)
-          store <- openStore (chosenStoreDir opts)
+          store <- openStore storeDir
           -- Materialize eval-coerced source paths (src = ./file, path
           -- interpolation): evaluation computes their store paths as text
           -- only - the parity runner's store is not writable - so the build
@@ -565,13 +587,22 @@ buildCommand config opts dataDir target attrPath = do
           -- register them; a derivation naming one needs them valid first.
           materializeEvalStoreWrites store storeWrites
           buildResult <- buildAndRegister store caches wrappers drvClosure drv drvSP
+          -- The root is registered before the handle closes: the handle's
+          -- lease is what keeps a concurrent collection from running
+          -- between the build's end and the link's creation.  The path
+          -- prints after the link exists, as nix-build prints it, so a
+          -- failed link prints nothing a script would take for success.
+          rooted <- case buildResult of
+            BuildSuccess _ -> traverse (\link -> addOutLinkRoot store link outputPath) outLink
+            BuildFailure _ _ -> pure Nothing
           closeStore store
-          case buildResult of
-            BuildSuccess _ ->
-              TIO.putStrLn (T.pack (storePathToFilePath (chosenStoreDir opts) outputPath))
-            BuildFailure msg code -> do
+          case (buildResult, rooted) of
+            (BuildFailure msg code, _) -> do
               TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
               exitFailure
+            (BuildSuccess _, Just (Left err)) -> failWith ("build: " <> err)
+            (BuildSuccess _, _) ->
+              TIO.putStrLn (T.pack (storePathToFilePath (stDir store) outputPath))
 
 -- | The @.drv@ store path of an evaluated derivation value: a set with
 -- @type = "derivation"@ whose @drvPath@ has been forced
@@ -627,9 +658,12 @@ recordedDerivation drvClosure drvSP = do
   aterm <- recordedAterm drvClosure drvSP
   either (failWith . (("error: the recorded .drv for " <> storePathToText defaultStoreDir drvSP <> " does not parse: ") <>)) pure (fromATerm aterm)
 
--- | The store directory selected by @--store@, or the platform default.
-chosenStoreDir :: CliOpts -> StoreDir
-chosenStoreDir opts = maybe platformStoreDir StoreDir (optStore opts)
+-- | The store directory selected by @--store@, or the platform default,
+-- under the canonical spelling 'openStore' keys the store by, so what
+-- evaluation and every command print is the spelling the database
+-- holds.
+chosenStoreDir :: CliOpts -> IO StoreDir
+chosenStoreDir opts = canonicalStoreDir (maybe platformStoreDir StoreDir (optStore opts))
 
 -- | Default priority for a config- or CLI-configured substituter
 -- (cache.nixos.org is 40).
@@ -823,8 +857,8 @@ buildAndRegister store caches wrappers drvClosure drv drvSP = do
 -- ---------------------------------------------------------------------------
 
 -- | Push the closure of the selected store paths to a binary cache.
-pushCommand :: CliOpts -> PushArgs -> IO ()
-pushCommand opts pushArgs = do
+pushCommand :: StoreDir -> PushArgs -> IO ()
+pushCommand storeDir pushArgs = do
   cacheUrl <- case paCacheUrl pushArgs of
     Just url -> pure (T.dropWhileEnd (== '/') (T.pack url))
     Nothing -> failWith "push: --cache URL is required"
@@ -840,7 +874,7 @@ pushCommand opts pushArgs = do
   compression <- case paCompressionArg pushArgs of
     Nothing -> pure PushNone
     Just value -> either (failWith . ("push: " <>)) pure (parsePushCompression (T.pack value))
-  store <- openStore (chosenStoreDir opts)
+  store <- openStore storeDir
   rootsResult <- resolvePushRoots store pushArgs
   case rootsResult of
     Left err -> do
@@ -860,31 +894,53 @@ pushCommand opts pushArgs = do
                 <> " already cached"
             )
 
--- | Delete store paths: registration rows and on-disk trees.  Paths are
--- processed in argument order and the first failure stops the run, so a
+-- | Delete store paths: registration rows and on-disk trees.  Every
+-- argument is resolved before anything is touched; the paths are then
+-- deleted in argument order under one collector lock and one live set,
+-- with upstream's roots line printed once per invocation as its
+-- @--delete@ prints it, and the first failure stops the run, so a
 -- reference chain deletes leaf-first in one invocation.
-storeDeleteCommand :: CliOpts -> [String] -> IO ()
-storeDeleteCommand opts rawPaths = do
-  store <- openStore (chosenStoreDir opts)
-  result <- deleteEach store rawPaths
+storeDeleteCommand :: StoreDir -> [String] -> IO ()
+storeDeleteCommand storeDir rawPaths = do
+  targets <- either (failWith . prefixed) pure (traverse (resolveDeleteTarget storeDir . T.pack) rawPaths)
+  store <- openStore storeDir
+  result <- withLiveSet store (\live -> deleteEach store live targets)
   closeStore store
-  either failWith pure result
+  either (failWith . prefixed) pure (join result)
   where
-    deleteEach _ [] = pure (Right ())
-    deleteEach store (raw : rest) =
-      case resolveDeleteTarget (stDir store) (T.pack raw) of
-        Left err -> pure (Left ("store delete: " <> err))
-        Right basename -> do
-          outcome <- deleteStorePathRaw store basename
-          case outcome of
-            Left err -> pure (Left ("store delete: " <> err))
-            Right removed -> do
-              TIO.putStrLn ("deleted " <> basename <> describeOutcome removed)
-              deleteEach store rest
+    prefixed err = "store delete: " <> err
+    deleteEach :: Store -> LiveSet -> [T.Text] -> IO (Either T.Text ())
+    deleteEach _ _ [] = pure (Right ())
+    deleteEach store live (basename : rest) = do
+      outcome <- deleteStorePathChecked store live basename
+      case outcome of
+        Left err -> pure (Left err)
+        Right removed -> do
+          TIO.putStrLn ("deleted " <> basename <> describeOutcome removed)
+          deleteEach store live rest
     describeOutcome removed
       | doRowRemoved removed && doTreeRemoved removed = ""
       | doRowRemoved removed = " (no tree on disk)"
       | otherwise = " (unregistered tree)"
+
+-- | Collect garbage, or list the roots.  The summary line is upstream's
+-- (@PrintFreed@), on stdout; the progress lines come from the library on
+-- stderr.  @--print-roots@ lists @LINK -> PATH@ sorted, each once, as
+-- @nix-store --gc --print-roots@ does, and deletes nothing; it runs
+-- under the handle's own lease, as upstream's listing takes no
+-- collector lock, so it does not wait behind a running build.
+storeGcCommand :: StoreDir -> Bool -> IO ()
+storeGcCommand storeDir printRoots = do
+  store <- openStore storeDir
+  if printRoots
+    then do
+      roots <- findRoots store
+      closeStore store
+      mapM_ (\root -> TIO.putStrLn (T.pack (grLink root) <> " -> " <> grPath root)) roots
+    else do
+      results <- collectGarbage store
+      closeStore store
+      either (failWith . ("store gc: " <>)) (TIO.putStrLn . gcSummaryLine) results
 
 -- | Resolve push roots: every valid non-derivation path with @--all@, otherwise
 -- each named path.  Named paths may be full store paths in either store-dir

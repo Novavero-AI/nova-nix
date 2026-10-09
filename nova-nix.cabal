@@ -85,7 +85,10 @@ library
     Nix.Store.Path
     Nix.Store.Path.Internal
     Nix.Store.DB
+    Nix.Store.GC
+    Nix.Store.Handle
     Nix.Store.Lock
+    Nix.Store.Symlink
     Nix.Store.CaseSensitive
     Nix.Store.ExecBit
     Nix.DependencyGraph

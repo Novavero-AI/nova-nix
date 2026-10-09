@@ -25,24 +25,23 @@
 --
 -- == Garbage collection
 --
--- A GC root is an explicit "keep this" marker (e.g. the current system
--- profile, per-user profiles, result symlinks from @nix-build@).
--- GC walks all roots, follows references transitively, and deletes
--- everything not reachable.  Since paths are immutable and reference
--- tracking is exact, GC is safe - it never deletes something in use.
+-- A GC root is an explicit "keep this" marker: the out-link
+-- @build --out-link@ creates, or a file the operator drops under the
+-- store's @gcroots@ directory.  The collector walks every root, follows
+-- references transitively, and deletes everything not reachable; a
+-- single-path delete refuses a path that walk reaches.  "Nix.Store.GC"
+-- holds the roots model, the walk, the sweep, and the lock that keeps a
+-- collection and a concurrent writer apart; "Nix.Store.Handle" holds the
+-- open handle and its lease on that lock.
 module Nix.Store
-  ( -- * Store operations
-    Store (..),
-    openStore,
-    closeStore,
-
-    -- * Queries
+  ( -- * Queries
     isValid,
     pathExists,
 
     -- * Deletion
     DeleteOutcome (..),
     deleteStorePathRaw,
+    deleteStorePathChecked,
     resolveDeleteTarget,
 
     -- * Store operations
@@ -82,11 +81,13 @@ module Nix.Store
     module Nix.Store.DB,
     module Nix.Store.Lock,
     module Nix.Store.CaseSensitive,
+    module Nix.Store.Handle,
+    module Nix.Store.GC,
   )
 where
 
 import Control.Exception (IOException, SomeException, catch, throwIO, try)
-import Control.Monad (unless, when)
+import Control.Monad (join, unless, when)
 import qualified Data.ByteString as BS
 import Data.Char (isDigit, toUpper)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -100,11 +101,14 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (makeFixedOutputPath, makeTextPath, sha256Digest)
-import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir)
+import Nix.Store.CaseSensitive (CaseSensitivity (..), trySetCaseSensitiveDir)
 import Nix.Store.DB
 import qualified Nix.Store.ExecBit as ExecBit
+import Nix.Store.GC
+import Nix.Store.Handle
 import Nix.Store.Lock
 import Nix.Store.Path
+import Nix.Store.Symlink (WalkNode (..), classifyWalkNode, createSymlinkOfKind)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NAR.Stream as Stream
@@ -112,7 +116,6 @@ import System.Directory
   ( copyFile,
     createDirectoryIfMissing,
     doesDirectoryExist,
-    doesFileExist,
     doesPathExist,
     listDirectory,
     renamePath,
@@ -122,31 +125,6 @@ import qualified System.Directory as Dir
 import System.FilePath (splitDirectories, takeDirectory, (</>))
 import System.IO (Handle, IOMode (WriteMode), hClose, openBinaryFile)
 import qualified System.Info
-
--- | An open store with database and configuration.
-data Store = Store
-  { stDir :: !StoreDir,
-    stDB :: !StoreDB,
-    -- | How the volume holding the store compares sibling names, probed
-    -- at open ('probeCaseSensitivity') and consulted by every NAR
-    -- materialization into the store.
-    stCaseSensitivity :: !CaseSensitivity
-  }
-
--- | Open a Nix store at the given directory.
--- Creates the store directory and database if they don't exist.
-openStore :: StoreDir -> IO Store
-openStore dir = do
-  createDirectoryIfMissing True (unStoreDir dir)
-  db <- openStoreDB dir
-  -- After the directory exists: the probe answers for a path on disk,
-  -- and a fresh store's directory sits on the volume it will live on.
-  sensitivity <- probeCaseSensitivity (unStoreDir dir)
-  pure Store {stDir = dir, stDB = db, stCaseSensitivity = sensitivity}
-
--- | Close the store (flushes the database).
-closeStore :: Store -> IO ()
-closeStore = closeStoreDB . stDB
 
 -- | Check if a store path is registered as valid in the database.
 isValid :: Store -> StorePath -> IO Bool
@@ -204,45 +182,69 @@ resolveDeleteTarget storeDir raw
     normalizeSeps = T.map (\c -> if c == '\\' then '/' else c)
 
 -- | Delete one store entry by basename: the registration row (refused
--- while other valid paths reference it) and the on-disk tree.  Row first,
--- tree second: an orphan tree left by a failed removal is inert debris,
--- while a still-registered row whose tree is gone would be adopted as
--- valid by existence checks.  A row without a tree and a tree without a
--- row both delete (the repair cases); only a target with neither is an
--- error.  The whole sequence holds the target's per-path lock - the same
--- file a substituter of the path locks, as upstream's deletePath does -
--- so a concurrent substitution's delete-materialize-register cannot be
--- torn apart by this delete landing between its on-disk recheck and its
--- registration commit.
+-- while a root keeps it alive, or while other valid paths reference it)
+-- and the on-disk tree.  One checked delete under its own collector
+-- lock and live set; a batch shares both through 'withLiveSet' and
+-- 'deleteStorePathChecked'.
 deleteStorePathRaw :: Store -> Text -> IO (Either Text DeleteOutcome)
 deleteStorePathRaw store basename =
-  withLockFile (target <> lockFileSuffix) $ \_ -> do
-    -- Lock files are never deleted (the 'Nix.Store.Lock' header).  A
-    -- target is one when stripping the suffix leaves a well-formed
-    -- store basename AND no registration row bears the full name:
-    -- names like @flake.lock@ are legal store-path names, so a
-    -- registered object of this exact name deletes normally, and only
-    -- the rows can tell the two apart.  The check precedes the row
-    -- removal below, which is destructive.
-    registered <- case parseStorePathBaseName basename of
-      Just sp -> isValidPath (stDB store) sp
-      Nothing -> pure False
-    case (registered, lockedPathOf basename) of
-      (False, Just guardedPath) ->
-        pure
-          ( Left
-              ( basename
-                  <> ": names the lock file of "
-                  <> guardedPath
-                  <> "; lock files coordinate concurrent store access"
-                  <> " and are never deleted (an unregistered store"
-                  <> " object of this exact name must be removed outside"
-                  <> " the store tool)"
-              )
-          )
-      _ -> deleteRowAndTree
+  join <$> withLiveSet store (\live -> deleteStorePathChecked store live basename)
+
+-- | The checked delete of one entry, given the live set, which also
+-- stands for the collector lock being held.  Row first, tree second: an
+-- orphan tree left by a failed removal is inert debris, while a
+-- still-registered row whose tree is gone would be adopted as valid by
+-- existence checks.  A row without a tree and a tree without a row both
+-- delete (the repair cases); only a target with neither is an error.
+--
+-- Liveness is upstream's rule for a specific delete: a path reachable
+-- from a root is refused with its words.  The referrer refusal that
+-- follows is this tool's own in wording and in shape.  Upstream refuses
+-- a path with an unrooted referrer with the same still-alive line
+-- unless that referrer is named in the same invocation (its
+-- @pathsToDelete@ set in 2.24.9's @deleteReferrersClosure@), in which
+-- case the named set deletes referrer-first; this delete removes
+-- exactly the path named and lists the referrers that stand in the way,
+-- so a chain deletes leaf-first in argument order.  Inside the collector
+-- lock the sequence also holds the target's per-path lock - the same
+-- file a substituter of the path locks, as upstream's deletePath does -
+-- so a holder that is not a store handle (nothing in this tool, but
+-- nothing forbids one) still cannot have its delete-materialize-register
+-- torn apart by this delete.
+deleteStorePathChecked :: Store -> LiveSet -> Text -> IO (Either Text DeleteOutcome)
+deleteStorePathChecked store live basename
+  | isLive live (T.pack target) = pure (Left (stillAliveMessage (T.pack target)))
+  | otherwise = deleteUnderPathLock
   where
     target = unStoreDir (stDir store) </> T.unpack basename
+    deleteUnderPathLock = withLockFile (target <> lockFileSuffix) $ \_ -> do
+      -- A holder never deletes a lock file (the 'Nix.Store.Lock'
+      -- header), and neither does this delete.  A target is one when
+      -- stripping the suffix leaves a well-formed store basename AND no
+      -- registration row bears the full name: names like @flake.lock@
+      -- are legal store-path names, so a registered object of this
+      -- exact name deletes normally, and only the rows can tell the two
+      -- apart.  The check precedes the row removal below, which is
+      -- destructive.
+      registered <- case parseStorePathBaseName basename of
+        Just sp -> isValidPath (stDB store) sp
+        Nothing -> pure False
+      case (registered, lockedPathOf basename) of
+        (False, Just guardedPath) ->
+          pure
+            ( Left
+                ( basename
+                    <> ": names the lock file of "
+                    <> guardedPath
+                    <> "; lock files coordinate concurrent store access"
+                    <> " and are never deleted here (store gc removes it,"
+                    <> " and any unregistered store object of this exact"
+                    <> " name, once "
+                    <> guardedPath
+                    <> " is not live)"
+                )
+            )
+        _ -> deleteRowAndTree
     deleteRowAndTree = do
       rowResult <- unregisterPathRow (stDB store) (T.pack target)
       case rowResult of
@@ -268,16 +270,6 @@ deleteStorePathRaw store basename =
           if rowRemoved || treeExisted
             then pure (Right DeleteOutcome {doRowRemoved = rowRemoved, doTreeRemoved = treeExisted})
             else pure (Left (basename <> ": not in this store (no registration row, no tree on disk)"))
-
--- | The store path a lock-shaped name would guard: the basename with
--- 'lockFileSuffix' stripped, provided the remainder is a well-formed
--- store basename.  Whether the file actually IS a lock file still
--- depends on the registration rows (see 'deleteStorePathRaw').
-lockedPathOf :: Text -> Maybe Text
-lockedPathOf basename = do
-  stripped <- T.stripSuffix (T.pack lockFileSuffix) basename
-  _ <- parseStorePathBaseName stripped
-  pure stripped
 
 -- ---------------------------------------------------------------------------
 -- Store operations
@@ -394,31 +386,6 @@ scanTempReferences tempPairs dir = do
     contents <- scanUnitBytes unit
     pure (Set.union acc (Set.fromList [spHash sp | (needle, sp) <- needles, needle `BS.isInfixOf` contents]))
   pure [sp | (_, sp) <- tempPairs, Set.member (spHash sp) foundHashes]
-
--- | A node kind for store walks, classified WITHOUT following symlinks:
--- the link test runs first because 'doesDirectoryExist' and
--- 'doesFileExist' follow links and would report a link as its target.
--- A dangling link still classifies as 'WalkSymlink'; a probe failure
--- classifies as 'WalkAbsent' rather than throwing mid-walk.
-data WalkNode = WalkSymlink | WalkDirectory | WalkRegular | WalkAbsent
-
--- | Classify one path for a store walk.  The walks in this module
--- dispatch on this (or, in 'copyPathInto', run the same link-first
--- probe order) so no store walk follows a symlink: following one reads
--- or mutates content outside the tree being walked, and does not
--- terminate on a link cycle.
-classifyWalkNode :: FilePath -> IO WalkNode
-classifyWalkNode path = do
-  isLink <- Dir.pathIsSymbolicLink path `catch` \(_ :: IOException) -> pure False
-  if isLink
-    then pure WalkSymlink
-    else do
-      isDir <- doesDirectoryExist path
-      if isDir
-        then pure WalkDirectory
-        else do
-          isFile <- doesFileExist path
-          pure (if isFile then WalkRegular else WalkAbsent)
 
 -- | One scannable unit of a walked tree: a regular file's bytes read
 -- from disk, or a symlink's target string.  The NAR serialization
@@ -828,35 +795,13 @@ normalisedComponents path = reverse (foldl' step [] (splitDirectories path))
           _ -> comp : stack
       | otherwise = comp : stack
 
--- | Create one symlink, choosing the Windows flavor from the target's kind.
--- A creation failure is loud: the old fallback of writing the target text
--- as a regular file registered a tree whose NAR hash differed from the
--- signed narinfo's - silent store corruption that a later push refuses to
--- publish.  Failing lets the caller fall back to a local build.
+-- | Create one unpacked symlink, parents first, with the Windows flavor
+-- read off the target ('createSymlinkOfKind').  A creation failure is
+-- loud, and failing lets the caller fall back to a local build.
 createSymlink :: FilePath -> Text -> IO (Either Text ())
 createSymlink linkPath target = do
   createDirectoryIfMissing True (takeDirectory linkPath)
-  let targetStr = T.unpack target
-  targetIsDir <- Dir.doesDirectoryExist (takeDirectory linkPath </> targetStr)
-  result <-
-    try $
-      if targetIsDir
-        then Dir.createDirectoryLink targetStr linkPath
-        else Dir.createFileLink targetStr linkPath
-  case result of
-    Right () -> pure (Right ())
-    Left (e :: SomeException) ->
-      pure
-        ( Left
-            ( "cannot create symlink "
-                <> T.pack linkPath
-                <> " -> "
-                <> target
-                <> ": "
-                <> T.pack (show e)
-                <> " (on Windows this needs Developer Mode or elevation)"
-            )
-        )
+  createSymlinkOfKind linkPath (T.unpack target)
 
 -- ---------------------------------------------------------------------------
 -- Streaming NAR unpacking

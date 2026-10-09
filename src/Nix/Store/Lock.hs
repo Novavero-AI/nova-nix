@@ -37,14 +37,20 @@
 -- deleted-lock-file hazard: a waiter blocked on the old file can acquire
 -- it just after deletion and then hold a lock no later process can see;
 -- upstream closes the hazard by writing a marker byte before deleting
--- and having every acquirer re-check the file it locked.  Here lock
--- files are never deleted: the file a waiter blocked on is always the
--- file the next holder locks, the marker dance disappears, and Windows -
--- where deleting a file another process holds open fails anyway - needs
--- no separate path.  The cost is one empty @\<store-path\>.lock@ per
--- substituted path left beside it in the store directory; the files are
--- inert debris, invisible to path queries (only exact store-path
--- basenames resolve).
+-- and having every acquirer re-check the file it locked.  Here a holder
+-- never deletes its lock file: the file a waiter blocked on is always
+-- the file the next holder locks, the marker dance disappears, and
+-- Windows - where deleting a file another process holds open fails
+-- anyway - needs no separate path.  The cost is one empty
+-- @\<store-path\>.lock@ per substituted or built path left beside it in
+-- the store directory; the files are inert debris, invisible to path
+-- queries (only exact store-path basenames resolve).  The one deleter
+-- is the collector ("Nix.Store.GC"), which removes a lock file once the
+-- path it guards is no longer live, and may: it runs under the
+-- exclusive store-wide lock, when no process has the store open, and
+-- every per-path lock in this tool is taken by a process holding a
+-- store handle, so no holder or waiter exists for the deleted file to
+-- strand.
 module Nix.Store.Lock
   ( -- * Held locks
     PathLock,
@@ -54,16 +60,25 @@ module Nix.Store.Lock
     withPathLock,
     withLockFile,
 
+    -- * Directly named lock files
+    LockMode (..),
+    acquireLockFileWith,
+    withLockFileWith,
+    waitingForLockMessage,
+
     -- * Naming
     pathLockFilePath,
     lockFileSuffix,
+    lockedPathOf,
   )
 where
 
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar)
 import Control.Exception (bracket)
-import Nix.Store.Path (StoreDir, StorePath, storePathToFilePath)
-import System.FileLock (FileLock, SharedExclusive (Exclusive), lockFile, tryLockFile, unlockFile)
+import Data.Text (Text)
+import qualified Data.Text as T
+import Nix.Store.Path (StoreDir, StorePath, parseStorePathBaseName, storePathToFilePath)
+import System.FileLock (FileLock, SharedExclusive (..), lockFile, tryLockFile, unlockFile)
 import System.IO (hPutStrLn, stderr)
 
 -- | An exclusive lock held on one store path: the lock file's path and
@@ -89,6 +104,17 @@ lockFileSuffix = ".lock"
 pathLockFilePath :: StoreDir -> StorePath -> FilePath
 pathLockFilePath dir sp = storePathToFilePath dir sp <> lockFileSuffix
 
+-- | The store path basename a lock-shaped name would guard: the name
+-- with 'lockFileSuffix' stripped, provided the remainder is a
+-- well-formed store basename.  Whether the file actually IS a lock file
+-- still depends on the registration rows, since @flake.lock@ is a legal
+-- store-path name; the delete and the collector make that call.
+lockedPathOf :: Text -> Maybe Text
+lockedPathOf basename = do
+  stripped <- T.stripSuffix (T.pack lockFileSuffix) basename
+  _ <- parseStorePathBaseName stripped
+  pure stripped
+
 -- | Take the exclusive lock on a store path, blocking until granted.
 -- Blocking is upstream's behavior on a busy path lock, announced the
 -- same way ('waitingForLockMessage') so a stalled substitution names
@@ -104,15 +130,35 @@ acquirePathLock dir sp = acquireLockFile (pathLockFilePath dir sp)
 -- lock files cannot be named through 'StorePath' - yet they must be the
 -- very files substituters of the same path contend on.
 acquireLockFile :: FilePath -> IO PathLock
-acquireLockFile lockPath = do
-  probe <- tryLockFile lockPath Exclusive
+acquireLockFile lockPath = acquireLockFileWith LockExclusive (waitingForLockMessage lockPath) lockPath
+
+-- | How a lock file is held.  Every per-path lock is exclusive; the
+-- store-wide garbage-collector lock is the one shared holder, taken
+-- 'LockShared' by every open store handle and 'LockExclusive' by a
+-- collector (see "Nix.Store.GC").
+data LockMode = LockShared | LockExclusive
+  deriving (Eq, Show)
+
+-- | Take a directly named lock file in the given mode, blocking until
+-- granted.  The message is printed once, to stderr, when the lock is
+-- busy and the wait begins: the collector announces itself in
+-- upstream's words and a path lock in its own, so the caller supplies
+-- the line.
+acquireLockFileWith :: LockMode -> String -> FilePath -> IO PathLock
+acquireLockFileWith mode busyMessage lockPath = do
+  probe <- tryLockFile lockPath (toSharedExclusive mode)
   held <- case probe of
     Just granted -> pure granted
     Nothing -> do
-      hPutStrLn stderr (waitingForLockMessage lockPath)
-      lockFile lockPath Exclusive
+      hPutStrLn stderr busyMessage
+      lockFile lockPath (toSharedExclusive mode)
   heldRef <- newMVar (Just held)
   pure (PathLock lockPath heldRef)
+
+-- | The filelock spelling of a 'LockMode'.
+toSharedExclusive :: LockMode -> SharedExclusive
+toSharedExclusive LockShared = Shared
+toSharedExclusive LockExclusive = Exclusive
 
 -- | Upstream's log line for a busy path lock.
 waitingForLockMessage :: FilePath -> String
@@ -150,3 +196,8 @@ withPathLock dir sp = bracket (acquirePathLock dir sp) releasePathLock
 -- on every exit.  See 'acquireLockFile' for why the raw form exists.
 withLockFile :: FilePath -> (PathLock -> IO a) -> IO a
 withLockFile lockPath = bracket (acquireLockFile lockPath) releasePathLock
+
+-- | 'withLockFile' in a chosen mode with a chosen busy message.
+withLockFileWith :: LockMode -> String -> FilePath -> (PathLock -> IO a) -> IO a
+withLockFileWith mode busyMessage lockPath =
+  bracket (acquireLockFileWith mode busyMessage lockPath) releasePathLock
