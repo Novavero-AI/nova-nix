@@ -236,11 +236,12 @@ planMissing remote = filter (\sp -> not (spHash sp `Set.member` remote))
 isDerivationPath :: StorePath -> Bool
 isDerivationPath sp = derivationExtension `T.isSuffixOf` spName sp
 
--- | The output paths among a store's valid paths.  A store registers its
--- derivations as valid paths like anything else, but a binary cache serves
--- build outputs only: nova-cache refuses a narinfo for a @.drv@ outright,
--- and no substituter asks a cache for a recipe it can rebuild from the
--- expression.  @push --all@ therefore means every valid output.
+-- | Every valid path that is not a derivation: outputs and sources alike.
+-- A store registers its derivations as valid paths like anything else, but
+-- a binary cache serves build outputs only: nova-cache refuses a narinfo
+-- for a @.drv@ outright, and no substituter asks a cache for a recipe it
+-- can rebuild from the expression.  @push --all@ therefore means every
+-- valid path except derivations.
 outputPathsOnly :: [StorePath] -> [StorePath]
 outputPathsOnly = filter (not . isDerivationPath)
 

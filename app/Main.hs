@@ -345,7 +345,7 @@ usageLines =
     "  --aterm                With eval --expr, print the derivation's .drv ATerm",
     "  -A, --attr ATTRPATH    With build: select a dotted attribute path (a.b.c)",
     "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)",
-    "  --all                  With push: select every valid output path in the store",
+    "  --all                  With push: select every valid path except derivations",
     "  --key-file PATH        With push: file holding the cache API key",
     "  --compression KIND     With push: artifact packaging (" <> T.unpack pushCompressionValues <> "; default none)",
     "  --exec-wrapper S=PATH  Run system S's derivations through PATH (repeatable),",
@@ -778,7 +778,7 @@ storeDeleteCommand opts rawPaths = do
       | doRowRemoved removed = " (no tree on disk)"
       | otherwise = " (unregistered tree)"
 
--- | Resolve push roots: every valid output path with @--all@, otherwise
+-- | Resolve push roots: every valid non-derivation path with @--all@, otherwise
 -- each named path.  Named paths may be full store paths in either store-dir
 -- form, or a bare @hash-name@ basename.  A named derivation is refused
 -- here, with the rule, rather than by the cache's 400 after its NAR has

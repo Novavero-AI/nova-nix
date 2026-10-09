@@ -532,7 +532,7 @@ jobs:
           echo "output: $got"
           [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
 
-      # --all is every valid output in a store this job filled from empty,
+      # --all is every valid path but the derivations in a store this job filled from empty,
       # which is exactly the closure; push skips what the cache already
       # serves and prints both counts itself.  An absent secret arrives as
       # an empty key file, which push refuses.
