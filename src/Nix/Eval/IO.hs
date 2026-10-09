@@ -56,6 +56,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Th
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (copyPathInto, unpackNarEntry)
+import Nix.Store.CaseSensitive (probeCaseSensitivity)
 import qualified Nix.Store.ExecBit as ExecBit
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
@@ -482,7 +483,12 @@ instance MonadEval EvalIO where
           onDiskNar <- narBytesIfPresent destFilePath
           unless (onDiskNar == Just narBytes) $ do
             Dir.removePathForcibly destFilePath
-            unpacked <- unpackNarEntry destFilePath entry
+            -- Probed per write rather than carried in 'EvalState': the
+            -- store directory need not exist when evaluation starts, and
+            -- the probe answers for a path on disk.  It was created just
+            -- above, and the cost is one pathconf call per tree.
+            sensitivity <- probeCaseSensitivity (takeDirectory destFilePath)
+            unpacked <- unpackNarEntry sensitivity destFilePath entry
             either (throwIO . userError . T.unpack) pure unpacked
         recordStoreWrite destPath [] SP.WriteRecursive
         pure destPath

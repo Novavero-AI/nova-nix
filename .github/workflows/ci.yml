@@ -325,6 +325,22 @@ jobs:
       - name: Build
         run: cabal build --enable-tests --ghc-options="-Werror"
 
+      # The store probes its volume's case sensitivity, and the one
+      # answer the runners cannot give on their own is the sensitive
+      # one on macOS: the runner's disk is default APFS, which folds, so
+      # the suite's store/case-sensitive-volume group would skip there
+      # and a broken probe would pass.  A case-sensitive APFS image
+      # attached for the test step makes the group run against the real
+      # pathconf answer.  Linux needs none (its temp directory already
+      # qualifies) and Windows answers by construction.  The runner is
+      # discarded with the job, so nothing detaches it.
+      - name: Attach a case-sensitive volume
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil create -size 64m -fs "Case-sensitive APFS" -volname nova-cs "$RUNNER_TEMP/nova-cs.dmg"
+          hdiutil attach "$RUNNER_TEMP/nova-cs.dmg" -mountpoint "$RUNNER_TEMP/nova-cs" -nobrowse
+          echo "NOVA_NIX_TEST_CASE_SENSITIVE_DIR=$RUNNER_TEMP/nova-cs" >> "$GITHUB_ENV"
+
       - name: Test
         timeout-minutes: 15
         run: cabal test

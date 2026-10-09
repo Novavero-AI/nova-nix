@@ -59,8 +59,8 @@ import Nix.Http (userAgent, withUserAgent)
 import Nix.Parser (ParseError (..), parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, unpackNarEntry, writeDrv, writeDrvClosure)
-import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
+import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, unpackNarEntry, writeDrv, writeDrvClosure)
+import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
@@ -3214,6 +3214,9 @@ drainChunkSource pull = go 0
 testSubstituter :: IO [Bool]
 testSubstituter = do
   putStrLn "substituter"
+  -- Every tree this group materializes under the temp directory keys
+  -- sibling names the way a store on that volume would.
+  tmpSensitivity <- tempCaseSensitivity
   sequence
     [ -- sortCaches: priority ordering
       runTest "sortCaches priority ordering" $
@@ -3434,7 +3437,7 @@ testSubstituter = do
             runAt n = do
               let dest = tmpDir </> ("out-" <> show n)
               source <- chunkReader (streamChunks n streamTestNar)
-              result <- Subst.consumeNarStream dest (streamTestNarInfo streamTestNar) streamTestDigest source
+              result <- Subst.consumeNarStream tmpSensitivity dest (streamTestNarInfo streamTestNar) streamTestDigest source
               onDisk <- ExecBit.serialiseFromPath dest
               pure $ case result of
                 Left err ->
@@ -3461,7 +3464,7 @@ testSubstituter = do
         forceRemoveIfExists tmpDir
         createDirectoryIfMissing True tmpDir
         source <- chunkReader (streamChunks 7 (BS.take (BS.length streamTestNar - 10) streamTestNar))
-        result <- Subst.consumeNarStream (tmpDir </> "out") (streamTestNarInfo streamTestNar) streamTestDigest source
+        result <- Subst.consumeNarStream tmpSensitivity (tmpDir </> "out") (streamTestNarInfo streamTestNar) streamTestDigest source
         forceRemoveIfExists tmpDir
         pure $ case result of
           Left (Subst.TransientFailure _) -> Pass
@@ -3475,7 +3478,7 @@ testSubstituter = do
         forceRemoveIfExists tmpDir
         createDirectoryIfMissing True tmpDir
         source <- chunkReader (streamChunks 7 streamTestNar)
-        result <- Subst.consumeNarStream (tmpDir </> "out") (streamTestNarInfo streamTestNar) (CHash.hashBytes "not the nar") source
+        result <- Subst.consumeNarStream tmpSensitivity (tmpDir </> "out") (streamTestNarInfo streamTestNar) (CHash.hashBytes "not the nar") source
         forceRemoveIfExists tmpDir
         pure $ case result of
           Left (Subst.FatalFailure err) | "hash mismatch" `T.isInfixOf` err -> Pass
@@ -3491,7 +3494,7 @@ testSubstituter = do
         forceRemoveIfExists tmpDir
         createDirectoryIfMissing True tmpDir
         source <- chunkReader (streamChunks 7 streamTestNar)
-        result <- Subst.consumeNarStream (tmpDir </> "out") lying streamTestDigest source
+        result <- Subst.consumeNarStream tmpSensitivity (tmpDir </> "out") lying streamTestDigest source
         forceRemoveIfExists tmpDir
         pure $ case result of
           Left (Subst.FatalFailure err) | "size mismatch" `T.isInfixOf` err -> Pass
@@ -3504,7 +3507,7 @@ testSubstituter = do
         forceRemoveIfExists tmpDir
         createDirectoryIfMissing True tmpDir
         source <- chunkReader (streamChunks 7 streamTestNar)
-        result <- Subst.consumeNarStream (tmpDir </> "out") lying streamTestDigest source
+        result <- Subst.consumeNarStream tmpSensitivity (tmpDir </> "out") lying streamTestDigest source
         forceRemoveIfExists tmpDir
         pure $ case result of
           Left (Subst.FatalFailure err) | "size mismatch" `T.isInfixOf` err -> Pass
@@ -3718,7 +3721,7 @@ testSubstituter = do
         source <- chunkReader (streamChunks 7 (BS.take (BS.length compressedNar - 8) compressedNar))
         result <-
           Subst.withDecompressedSource (toInteger (BS.length streamTestNar)) "zstd" source $
-            Subst.consumeNarStream (tmpDir </> "out") ((streamTestNarInfo streamTestNar) {NarInfo.niCompression = "zstd"}) streamTestDigest
+            Subst.consumeNarStream tmpSensitivity (tmpDir </> "out") ((streamTestNarInfo streamTestNar) {NarInfo.niCompression = "zstd"}) streamTestDigest
         forceRemoveIfExists tmpDir
         pure $ case result of
           Left (Subst.TransientFailure _) -> Pass
@@ -3782,6 +3785,7 @@ testSubstituter = do
             result <-
               Subst.withDecompressedSource (toInteger (BS.length bzip2NarFixture)) "bzip2" source $
                 Subst.consumeNarStream
+                  tmpSensitivity
                   destPath
                   ((streamTestNarInfo bzip2NarFixture) {NarInfo.niCompression = "bzip2"})
                   (CHash.hashBytes bzip2NarFixture)
@@ -3818,9 +3822,9 @@ testSubstituter = do
         createDirectoryIfMissing True tmpDir
         strictOutcome <- case NAR.deserialise streamTestNar of
           Left err -> pure (Left (T.pack err))
-          Right entry -> unpackNarEntry (tmpDir </> "strict") entry
+          Right entry -> unpackNarEntry tmpSensitivity (tmpDir </> "strict") entry
         source <- chunkReader (streamChunks 11 streamTestNar)
-        streamOutcome <- Subst.consumeNarStream (tmpDir </> "streamed") (streamTestNarInfo streamTestNar) streamTestDigest source
+        streamOutcome <- Subst.consumeNarStream tmpSensitivity (tmpDir </> "streamed") (streamTestNarInfo streamTestNar) streamTestDigest source
         strictTree <- NAR.serialiseFromPath (tmpDir </> "strict")
         streamedTree <- NAR.serialiseFromPath (tmpDir </> "streamed")
         forceRemoveIfExists tmpDir
@@ -4011,7 +4015,7 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-unsafe"
             evil name = NAR.NarDirectory [(name, NAR.NarRegular False "x")]
-        results <- mapM (unpackNarEntry dest . evil) ["..", ".", "", "a/b", "a\\b"]
+        results <- mapM (unpackNarEntry tmpSensitivity dest . evil) ["..", ".", "", "a/b", "a\\b"]
         Subst.clearStaleDestination dest
         pure $
           if all (\case Left _ -> True; Right () -> False) results
@@ -4025,7 +4029,7 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-rawname"
             tree = NAR.NarDirectory [(BS.pack [0xFF], NAR.NarRegular False "x")]
-        result <- unpackNarEntry dest tree
+        result <- unpackNarEntry tmpSensitivity dest tree
         Subst.clearStaleDestination dest
         pure $ case result of
           Left err -> if "not valid UTF-8" `T.isInfixOf` err then Pass else Fail ("wrong error: " <> err)
@@ -4034,7 +4038,7 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-rawtarget"
             tree = NAR.NarDirectory [("link", NAR.NarSymlink (BS.pack [0xFF]))]
-        result <- unpackNarEntry dest tree
+        result <- unpackNarEntry tmpSensitivity dest tree
         Subst.clearStaleDestination dest
         pure $ case result of
           Left err -> if "not valid UTF-8" `T.isInfixOf` err then Pass else Fail ("wrong error: " <> err)
@@ -4051,7 +4055,7 @@ testSubstituter = do
                   ("link", NAR.NarSymlink "real")
                 ]
         Subst.clearStaleDestination dest
-        result <- unpackNarEntry dest tree
+        result <- unpackNarEntry tmpSensitivity dest tree
         outcome <- case result of
           Right () -> do
             isLink <- Dir.pathIsSymbolicLink (dest </> "link")
@@ -4072,7 +4076,7 @@ testSubstituter = do
                   ("zdir", NAR.NarDirectory [("f", NAR.NarRegular False "x")])
                 ]
         Subst.clearStaleDestination dest
-        result <- unpackNarEntry dest tree
+        result <- unpackNarEntry tmpSensitivity dest tree
         outcome <- case result of
           Left _ -> pure Pass -- symlinks unavailable here; the loud failure is the contract
           Right () -> do
@@ -4081,10 +4085,11 @@ testSubstituter = do
         Subst.clearStaleDestination dest
         pure outcome,
       -- Folding sibling names MATERIALIZE on every platform: true names
-      -- via the NTFS per-directory flag on Windows, upstream's case-hack
-      -- renaming on macOS, plain files on Linux.  The platform serialiser
+      -- via the NTFS per-directory flag on Windows and on any volume the
+      -- probe reports sensitive (Linux, case-sensitive APFS), upstream's
+      -- case-hack renaming on a folding volume.  The platform serialiser
       -- reverses whichever branch ran, so the tree re-serialises to its
-      -- original NAR on all three.
+      -- original NAR either way.
       runTestM "folding sibling names materialize and round-trip" $ do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-fold"
@@ -4094,7 +4099,7 @@ testSubstituter = do
                   ("foo", NAR.NarRegular False "lower")
                 ]
         Subst.clearStaleDestination dest
-        result <- unpackNarEntry dest tree
+        result <- unpackNarEntry tmpSensitivity dest tree
         outcome <- case result of
           Left err -> pure (Fail ("unpack failed: " <> err))
           Right () -> do
@@ -4102,32 +4107,63 @@ testSubstituter = do
             if onDisk /= tree
               then pure (Fail "materialized tree does not re-serialise to its NAR")
               else
-                if SI.os == "mingw32"
+                if SI.os == "mingw32" || tmpSensitivity == CaseSensitive
                   then do
-                    -- The flag path, not the hack: both TRUE names hold
-                    -- distinct contents inside the case-sensitive dir.
+                    -- True names, not the hack: both spellings hold
+                    -- distinct contents.
                     upper <- BS.readFile (dest </> "Foo")
                     lower <- BS.readFile (dest </> "foo")
-                    pure (assertEqual "true names on NTFS" ("upper", "lower") (upper, lower))
-                  else pure Pass
+                    pure (assertEqual "true names" ("upper", "lower") (upper, lower))
+                  else do
+                    -- The hack: the later variant carries the suffix.
+                    lower <- BS.readFile (dest </> "foo~nix~case~hack~1")
+                    pure (assertEqual "case-hacked name" "lower" lower)
         Subst.clearStaleDestination dest
         pure outcome,
-      -- The pure case-hack naming: later case variants gain the
-      -- reversible suffix with a per-name counter.  The fold key is
-      -- platform-derived, so Linux (no folding) keeps every name.
-      runTest "caseHackDiskNames renames later case variants" $
-        let resolved = caseHackDiskNames ["Foo", "foo", "fOO", "bar"]
-         in if SI.os == "mingw32" || SI.os == "darwin"
-              then
-                assertEqual
-                  "hack naming"
-                  [("Foo", "Foo"), ("foo", "foo~nix~case~hack~1"), ("fOO", "fOO~nix~case~hack~2"), ("bar", "bar")]
-                  resolved
-              else
-                assertEqual
-                  "identity naming"
-                  [("Foo", "Foo"), ("foo", "foo"), ("fOO", "fOO"), ("bar", "bar")]
-                  resolved,
+      -- The pure case-hack naming is a function of the probed
+      -- sensitivity, not of the platform: on a folding volume later
+      -- case variants gain the reversible suffix with a per-name
+      -- counter, on a sensitive one every name keeps its spelling.
+      runTest "caseHackDiskNames renames later case variants on a folding volume" $
+        assertEqual
+          "hack naming"
+          [("Foo", "Foo"), ("foo", "foo~nix~case~hack~1"), ("fOO", "fOO~nix~case~hack~2"), ("bar", "bar")]
+          (caseHackDiskNames CaseInsensitive ["Foo", "foo", "fOO", "bar"]),
+      runTest "caseHackDiskNames keeps every name on a sensitive volume" $
+        assertEqual
+          "identity naming"
+          [("Foo", "Foo"), ("foo", "foo"), ("fOO", "fOO"), ("bar", "bar")]
+          (caseHackDiskNames CaseSensitive ["Foo", "foo", "fOO", "bar"]),
+      -- The key behind both: case variants share it exactly on a
+      -- folding volume.
+      runTest "onDiskNameKey folds case only on a folding volume" $
+        if onDiskNameKey CaseSensitive "Makefile" /= onDiskNameKey CaseSensitive "makefile"
+          && onDiskNameKey CaseInsensitive "Makefile" == onDiskNameKey CaseInsensitive "makefile"
+          then Pass
+          else Fail "the key does not follow the probed sensitivity",
+      -- The Win32 path layer strips trailing dots and spaces on create
+      -- whatever a directory's case sensitivity, so names differing
+      -- only there share a key behind it and nowhere else.
+      runTest "onDiskNameKey strips trailing dots and spaces only behind Win32" $
+        assertEqual
+          "trailing rule"
+          (SI.os == "mingw32")
+          (onDiskNameKey CaseSensitive "x" == onDiskNameKey CaseSensitive "x. "),
+      -- The probe against the filesystem's own answer: two sibling
+      -- names differing only by case are two entries on a sensitive
+      -- volume and one on a folding one.
+      runTestM "probeCaseSensitivity agrees with the filesystem" $ do
+        tmpBase <- getTemporaryDirectory
+        let dir = tmpBase </> "nova-nix-test-case-probe"
+        Subst.clearStaleDestination dir
+        createDirectoryIfMissing True dir
+        BS.writeFile (dir </> "Probe") "upper"
+        BS.writeFile (dir </> "probe") "lower"
+        entries <- Dir.listDirectory dir
+        probed <- probeCaseSensitivity dir
+        Subst.clearStaleDestination dir
+        let observed = if length entries == 2 then CaseSensitive else CaseInsensitive
+        pure (assertEqual "probe against the filesystem" observed probed),
       -- Where the platform serialiser strips the suffix, an incoming
       -- name carrying it must reject (it could not round-trip); on
       -- Linux such a name is legitimate and materializes verbatim.
@@ -4136,7 +4172,7 @@ testSubstituter = do
         let dest = tmpBase </> "nova-nix-test-unpack-suffix"
             tree = NAR.NarDirectory [("x~nix~case~hack~1", NAR.NarRegular False "v")]
         Subst.clearStaleDestination dest
-        result <- unpackNarEntry dest tree
+        result <- unpackNarEntry tmpSensitivity dest tree
         outcome <-
           if SI.os == "mingw32" || SI.os == "darwin"
             then case result of
@@ -4928,6 +4964,114 @@ removeIfExists path = do
   exists <- doesDirectoryExist path
   when exists (removeDirectoryRecursive path)
 
+-- | Names a directory on a case-sensitive volume for
+-- 'testCaseSensitiveVolumeIO'.  A Linux temp directory qualifies on
+-- its own; on macOS a "Case-sensitive APFS" image attached with
+-- hdiutil does, and the default volume does not.
+caseSensitiveDirVar :: String
+caseSensitiveDirVar = "NOVA_NIX_TEST_CASE_SENSITIVE_DIR"
+
+-- | True-name materialization on a volume that does not fold: a store
+-- opened there probes sensitive, and a NAR carrying @Makefile@ and
+-- @makefile@ unpacks to two files under their own names through the
+-- strict and the streaming substituter paths alike.  A directory named
+-- by 'caseSensitiveDirVar' is held to the claim: one that is missing
+-- or probes folding FAILS, since the variable is how a run asserts a
+-- volume (macOS CI attaches an image for it) and a typo must not read
+-- as "no volume available".  With the variable unset the temp
+-- directory is tried, and skips where it folds.
+testCaseSensitiveVolumeIO :: IO [Bool]
+testCaseSensitiveVolumeIO = do
+  putStrLn "store/case-sensitive-volume"
+  named <- lookupEnv caseSensitiveDirVar
+  case named of
+    Just base -> do
+      verdict <- namedDirVerdict base
+      case verdict of
+        Right () -> testCaseSensitiveVolumeBody base
+        Left reason ->
+          (: []) <$> runTest (T.pack caseSensitiveDirVar <> " names a case-sensitive directory") (Fail reason)
+    Nothing -> do
+      tmpBase <- getTemporaryDirectory
+      sensitivity <- probeCaseSensitivity tmpBase
+      case sensitivity of
+        CaseInsensitive -> do
+          putStrLn ("  SKIP  needs a case-sensitive volume (" ++ caseSensitiveDirVar ++ " names a directory on one)")
+          pure []
+        CaseSensitive -> testCaseSensitiveVolumeBody tmpBase
+  where
+    namedDirVerdict base = do
+      present <- doesDirectoryExist base
+      if not present
+        then pure (Left (T.pack base <> " does not exist"))
+        else do
+          sensitivity <- probeCaseSensitivity base
+          pure $ case sensitivity of
+            CaseSensitive -> Right ()
+            CaseInsensitive -> Left (T.pack base <> " probes " <> T.pack (show CaseInsensitive))
+
+testCaseSensitiveVolumeBody :: FilePath -> IO [Bool]
+testCaseSensitiveVolumeBody base = do
+  let storeRoot = base </> "nova-nix-test-cs-store"
+      storeDir = StoreDir storeRoot
+      tree =
+        NAR.NarDirectory
+          [ ("Makefile", NAR.NarRegular False "upper"),
+            ("makefile", NAR.NarRegular False "lower")
+          ]
+      rawNar = NAR.serialise tree
+      digest = CHash.hashBytes rawNar
+      narInfoFor sp =
+        NarInfo.NarInfo
+          { NarInfo.niStorePath = storePathToText defaultStoreDir sp,
+            NarInfo.niUrl = "nar/case.nar",
+            NarInfo.niCompression = "none",
+            NarInfo.niFileHash = Nothing,
+            NarInfo.niFileSize = Nothing,
+            NarInfo.niNarHash = CHash.formatNixHash digest,
+            NarInfo.niNarSize = fromIntegral (BS.length rawNar),
+            NarInfo.niReferences = [],
+            NarInfo.niDeriver = Nothing,
+            NarInfo.niSigs = [],
+            NarInfo.niCA = Nothing
+          }
+      -- Both spellings present with their own contents, and nothing
+      -- carrying the case-hack suffix.
+      trueNames sp = do
+        let dest = storePathToFilePath storeDir sp
+        names <- Dir.listDirectory dest
+        upper <- BS.readFile (dest </> "Makefile")
+        lower <- BS.readFile (dest </> "makefile")
+        pure $
+          if sort names == ["Makefile", "makefile"] && upper == "upper" && lower == "lower"
+            then Pass
+            else Fail ("on disk: " <> T.pack (show names))
+  forceRemoveIfExists storeRoot
+  store <- openStore storeDir
+  results <-
+    sequence
+      [ runTest "the store probes its volume as case-sensitive" $
+          assertEqual "stCaseSensitivity" CaseSensitive (stCaseSensitivity store),
+        runTestM "strict substitution materializes true names" $ do
+          let sp = StorePath (T.replicate 32 "c") "case-strict"
+          result <- Subst.unpackAndVerify store sp (narInfoFor sp) rawNar
+          case result of
+            Subst.SubstSuccess _ lock -> do
+              releasePathLock lock
+              trueNames sp
+            other -> pure (Fail ("substitution failed: " <> T.pack (show other))),
+        runTestM "streaming substitution materializes true names" $ do
+          let sp = StorePath (T.replicate 32 "d") "case-stream"
+          source <- chunkReader [rawNar]
+          result <- Subst.materializeNarFromSource store sp (narInfoFor sp) digest [] Nothing source
+          case result of
+            Right _ -> trueNames sp
+            Left err -> pure (Fail ("streaming substitution failed: " <> Subst.attemptFailureMessage err))
+      ]
+  closeStore store
+  forceRemoveIfExists storeRoot
+  pure results
+
 testStoreDB :: IO [Bool]
 testStoreDB = do
   putStrLn "store/db"
@@ -5375,6 +5519,12 @@ testPushClosureIO = do
             Left err | "cannot read key file" `T.isInfixOf` err -> Pass
             other -> Fail ("expected read error, got: " <> T.pack (show other))
       ]
+
+-- | The case sensitivity of the suite's temp directory, so a test
+-- materializing a NAR there keys sibling names the way a store on that
+-- volume would.
+tempCaseSensitivity :: IO CaseSensitivity
+tempCaseSensitivity = getTemporaryDirectory >>= probeCaseSensitivity
 
 -- | Helper: create a fresh temp store for IO tests.
 withTempStore :: (Store -> IO [Bool]) -> IO [Bool]
@@ -11441,6 +11591,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testDrvContext,
           testDepGraph,
           testSubstituter,
+          testCaseSensitiveVolumeIO,
           testPathLocks,
           testExecBit,
           testVerifySigs,

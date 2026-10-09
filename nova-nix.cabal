@@ -135,6 +135,7 @@ library
     cbits/nn_bytecode.c
     cbits/nn_lambda.c
     cbits/nn_winfs.c
+    cbits/nn_darwinfs.c
   include-dirs:     cbits
   -- -Werror deliberately NOT baked in: a future gcc/clang adding a new
   -- -Wall diagnostic must not retroactively break installing published
