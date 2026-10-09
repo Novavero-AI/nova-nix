@@ -36,6 +36,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# The public cache's address and signing key, spelled once: the publish job
+# pushes to it and E2E (public cache) substitutes from it, and the two must
+# agree.  A cache move or a key rotation is one edit here.
+env:
+  CACHE_URL: https://cache.novavero.ai
+  CACHE_PUBLIC_KEY: cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
+
 # ---------------------------------------------------------------------------
 # Lint jobs (fast, Linux-only)
 # ---------------------------------------------------------------------------
@@ -442,31 +449,6 @@ jobs:
             exit 1
           }
 
-      # Publish what this job just built and ran, so the public cache carries
-      # the current closure rather than whatever was pushed by hand last.
-      # Main pushes only: a pull request must not write to the cache, and
-      # the token is not offered to it.  --all is every valid path in the
-      # store this job filled from empty, which is exactly the closure.
-      # Pushing after the run check means a Hello that does not print is
-      # never published.  The token belongs in an environment restricted to
-      # main rather than an org secret; that move needs the key pasted in by
-      # hand and is tracked in #207.
-      - name: Publish the closure to the public cache
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: bash
-        env:
-          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
-        run: |
-          set -euo pipefail
-          keyfile="$RUNNER_TEMP/cache-key"
-          (umask 077; printf '%s' "$NOVA_CACHE_API_KEY" > "$keyfile")
-          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
-            --cache https://cache.novavero.ai --key-file "$keyfile" \
-            --compression zstd --all 2> "$RUNNER_TEMP/push.log" \
-            || { rm -f "$keyfile"; cat "$RUNNER_TEMP/push.log" >&2; exit 1; }
-          rm -f "$keyfile"
-          echo "pushed: $(grep -c '^\[push\]' "$RUNNER_TEMP/push.log" || true), already present: $(grep -c '^\[skip\]' "$RUNNER_TEMP/push.log" || true)"
-
       - name: Diagnose store layout on failure
         if: failure()
         shell: pwsh
@@ -479,17 +461,106 @@ jobs:
           }
 
   # ---------------------------------------------------------------------------
+  # Publish (public cache): refresh the public cache with the closure main
+  # builds, so it serves the current one rather than whatever was pushed by
+  # hand last.  A job of its own rather than a step of e2e-windows: the
+  # token is a secret of the `cache` environment, whose deployment branch
+  # rule admits main alone, and GitHub refuses a job that references the
+  # environment from any other ref.  On e2e-windows that refusal would hit
+  # E2E (Windows), a required check on every pull request.  The gate is a
+  # repository setting only an admin changes, where an `if:` lives in the
+  # file any push can edit; the `if:` kept here makes other refs skip the
+  # job instead of failing it.
+  #
+  # The closure is built again here, with the public cache as a substituter:
+  # after the first publish, everything a push left alone substitutes and
+  # only the delta builds, and --all then finds the rest already cached.  A
+  # toolchain bump is the cold case, a second full build.  What e2e-windows
+  # ran stays on its own runner; the bytes pushed are this job's, so this
+  # job runs its own Hello first and one that does not print is never
+  # published.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish (public cache)
+    needs: [e2e-windows]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    environment:
+      name: cache
+      url: ${{ env.CACHE_URL }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
+          restore-keys: cabal-${{ runner.os }}-
+
+      - name: Install nova-nix
+        run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # build prints the out path as its last stdout line; the [subst] and
+      # [build] lines go to stderr and stay in the job log.  LC_ALL pinned
+      # as E2E (public cache) pins it: the greeting is compared literally,
+      # and hello configures NLS in when it finds libintl, which the seed
+      # ships.  The build never sees it: the builder scrubs the ambient
+      # environment down to SystemRoot, SystemDrive and windir.
+      - name: Build hello.nix, substituting what the cache already has, and run it
+        shell: bash
+        env:
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix \
+            --substituter "$CACHE_URL" \
+            --trusted-key "$CACHE_PUBLIC_KEY" | tail -n 1)
+          echo "out path: $out"
+          got=$("$(cygpath -u "$out")/bin/hello.exe")
+          echo "output: $got"
+          [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
+
+      # --all is every valid output in a store this job filled from empty,
+      # which is exactly the closure; push skips what the cache already
+      # serves and prints both counts itself.  An absent secret arrives as
+      # an empty key file, which push refuses.
+      - name: Publish the closure to the public cache
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: |
+          set -euo pipefail
+          keyfile="$RUNNER_TEMP/cache-key"
+          trap 'rm -f "$keyfile"' EXIT
+          (umask 077; printf '%s' "$NOVA_CACHE_API_KEY" > "$keyfile")
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$CACHE_URL" --key-file "$keyfile" \
+            --compression zstd --all
+
+  # ---------------------------------------------------------------------------
   # End-to-end (public cache): the loop the Linux job proves against a
   # throwaway server, run on Windows against the cache users are given.
   # A fresh store, the public cache as the only substituter, and the build
   # must come entirely from it: a single [build] line means the cache is
   # missing part of the current closure and the job turns red, instead of
   # a silent local rebuild hiding the gap (#207).  Main pushes only, after
-  # the publish step above has refreshed the cache from this same tree.
+  # the publish job above has refreshed the cache from this same tree.
   # ---------------------------------------------------------------------------
   e2e-public-cache:
     name: E2E (public cache)
-    needs: [e2e-windows]
+    needs: [publish]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
     timeout-minutes: 30
@@ -526,8 +597,8 @@ jobs:
           log="$RUNNER_TEMP/substitute.log"
           out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix \
             --store "$store" \
-            --substituter https://cache.novavero.ai \
-            --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ= \
+            --substituter "$CACHE_URL" \
+            --trusted-key "$CACHE_PUBLIC_KEY" \
             2> "$log" | tail -n 1)
           echo "out path: $out"
           grep -F '[subst]' "$log" || { echo "nothing was substituted from the public cache" >&2; cat "$log" >&2; exit 1; }
