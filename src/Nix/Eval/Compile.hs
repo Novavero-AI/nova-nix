@@ -57,6 +57,7 @@ import Nix.Eval.CBytecode
     formalNamedSet,
     formalSet,
     spilledCountSentinel,
+    strpartEsc,
     strpartInterp,
     strpartLit,
     unaryNegate,
@@ -190,6 +191,9 @@ compileExpr = go
     compileOnePart (StrLit t) = do
       Symbol sym <- symbolIntern t
       pure (strpartLit, sym)
+    compileOnePart (StrEsc t) = do
+      Symbol sym <- symbolIntern t
+      pure (strpartEsc, sym)
     compileOnePart (StrInterp expr) = do
       idx <- go expr
       pure (strpartInterp, idx)

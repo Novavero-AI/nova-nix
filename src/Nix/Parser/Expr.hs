@@ -467,13 +467,9 @@ parseStringParts closer = go []
         TokStringLit txt -> do
           _ <- advance
           go (StrLit txt : acc)
-        -- Indented-string escapes are opaque to indentation stripping
-        -- (upstream marks them hasIndentation = false and strips only
-        -- marked chunks): a constant-string interpolation part gets
-        -- exactly that treatment from the evaluator.
         TokStringEsc txt -> do
           _ <- advance
-          go (StrInterp (EStr [StrLit txt]) : acc)
+          go (StrEsc txt : acc)
         TokInterpOpen -> do
           _ <- advance
           expr <- parseExpr
@@ -743,6 +739,7 @@ literalStringKey :: Expr -> Maybe Text
 literalStringKey (EStr parts) = mconcat <$> traverse literalPart parts
   where
     literalPart (StrLit t) = Just t
+    literalPart (StrEsc t) = Just t
     literalPart (StrInterp _) = Nothing
 literalStringKey _ = Nothing
 

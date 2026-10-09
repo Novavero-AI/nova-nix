@@ -113,6 +113,7 @@ trimExpr expr = case expr of
 
 trimPart :: StringPart -> StringPart
 trimPart p@(StrLit _) = p
+trimPart p@(StrEsc _) = p
 trimPart (StrInterp e) = StrInterp (trimExpr e)
 
 trimKey :: AttrKey -> AttrKey
@@ -278,6 +279,7 @@ foldParts :: Int -> [StringPart] -> (Set (Int, Int), Bool, Bool)
 foldParts depth = foldl' combine (Set.empty, False, False)
   where
     combine (!acc, !h, !w) (StrLit _) = (acc, h, w)
+    combine (!acc, !h, !w) (StrEsc _) = (acc, h, w)
     combine (!acc, !h, !w) (StrInterp e) =
       let (vs, hv, wv) = collectFreeVars depth e
        in (Set.union acc vs, h || hv, w || wv)
@@ -380,6 +382,7 @@ rewriteBody depth captureMap expr = case expr of
 
 rewritePart :: Int -> Map (Int, Int) Int -> StringPart -> StringPart
 rewritePart _ _ p@(StrLit _) = p
+rewritePart _ _ p@(StrEsc _) = p
 rewritePart depth captureMap (StrInterp e) =
   StrInterp (rewriteBody depth captureMap e)
 

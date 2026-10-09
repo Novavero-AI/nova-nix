@@ -50,6 +50,13 @@ data NixAtom
 data StringPart
   = -- | Literal text.
     StrLit !Text
+  | -- | Resolved escape text inside an indented string (@'''@, @''$@,
+    -- @''${@, @''\x@).  Kept apart from 'StrLit' because upstream's lexer
+    -- emits an escape without the hasIndentation mark: the indentation
+    -- scan skips it (it only ends a line's leading whitespace) while the
+    -- strip runs over it as over any literal, so an escaped newline
+    -- starts a line whose spaces are stripped but were never measured.
+    StrEsc !Text
   | -- | Interpolated expression (@${expr}@).
     StrInterp !Expr
   deriving (Eq, Show)

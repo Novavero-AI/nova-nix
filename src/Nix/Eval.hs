@@ -105,7 +105,7 @@ import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
@@ -113,7 +113,7 @@ import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, nixCompare, nixEqual)
-import Nix.Eval.StringInterp (coerceToString, formatJsonFloat, formatNixFloat, formatXmlFloat, stripIndentedChunks)
+import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatJsonFloat, formatNixFloat, formatXmlFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
 import Nix.Eval.Types
   ( AttrSet (..),
@@ -454,12 +454,13 @@ evalBcStr env bcIdx0 = do
   let (count, dataOff) =
         unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
   chunks <- evalBcStringParts env count dataOff
-  pure (VStr (BS.concat [t | (_, t, _) <- chunks]) (mconcat [c | (_, _, c) <- chunks]))
+  let (text, ctx) = concatChunks chunks
+  pure (VStr text ctx)
 
--- | Evaluate an indented string literal from bytecode data buffer.  The common
--- indentation is stripped from the LITERAL chunks before concatenation, so an
--- interpolated multi-line value cannot drag the computed indent down - matching
--- C++ Nix.
+-- | Evaluate an indented string literal from bytecode data buffer.  The
+-- common indentation is stripped before concatenation, part by part as
+-- upstream strips it, so an interpolated multi-line value cannot drag the
+-- computed indent down.
 evalBcIndStr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcIndStr env bcIdx0 = do
   let (count, dataOff) =
@@ -507,22 +508,26 @@ evalBcPathParts env n off = do
   pure (chunk : rest)
 
 -- | Evaluate string parts from the bytecode data buffer.  Each part is two
--- words: (tag, value).  tag=0 means literal (value = symbol), tag=1 means
--- interpolation (value = bc_idx).  The 'Bool' marks literal (@True@) vs
--- interpolated (@False@) so indented strings strip only the literals.
-evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [(Bool, BS.ByteString, StringContext)]
+-- words: (tag, value), a symbol under 'strpartLit' or 'strpartEsc' and a
+-- bytecode index under 'strpartInterp'.  The kind survives into the chunk
+-- because an indented string strips an escape and an interpolation
+-- differently.
+evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [StringChunk]
 evalBcStringParts _ 0 _ = pure []
 evalBcStringParts env n off = do
   let tag = unsafePerformIO (cbcData off)
       val = unsafePerformIO (cbcData (off + 1))
-  chunk <- case tag of
-    0 -> pure (True, symbolBytes (Symbol val), emptyContext)
-    _ -> do
-      v <- evalBytecode env val
-      (txt, ctx) <- coerceToStringInterp v
-      pure (False, txt, ctx)
+  chunk <- decodeChunk tag val
   rest <- evalBcStringParts env (n - 1) (off + 2)
   pure (chunk : rest)
+  where
+    decodeChunk tag val
+      | tag == strpartLit = pure (ChunkLit (symbolBytes (Symbol val)))
+      | tag == strpartEsc = pure (ChunkEsc (symbolBytes (Symbol val)))
+      | otherwise = do
+          v <- evalBytecode env val
+          (txt, ctx) <- coerceToStringInterp v
+          pure (ChunkInterp txt ctx)
 
 -- | Evaluate a list from bytecode data buffer.
 evalBcList :: (MonadEval m) => Env -> Word32 -> m NixValue
