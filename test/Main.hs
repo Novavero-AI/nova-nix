@@ -9348,6 +9348,14 @@ testPhase4 = do
               _ -> Fail ("expected one entry, got " <> T.pack (show (length result))),
       runTest "parseNixPath multiple" $
         assertEqual "count" 2 (length (parseNixPath "nixpkgs=/nix:custom=/opt")),
+      runTest "parseNixPath channel entry" $
+        let result = parseNixPath "nixpkgs=channel:nixos-24.11"
+         in case result of
+              [thunk] | Just (VAttrs m) <- readThunkValue thunk ->
+                case (attrSetLookup "prefix" m >>= readThunkValue, attrSetLookup "path" m >>= readThunkValue) of
+                  (Just (VStr "nixpkgs" _), Just (VStr "channel:nixos-24.11" _)) -> Pass
+                  _ -> Fail "wrong prefix/path for channel"
+              _ -> Fail ("expected one entry, got " <> T.pack (show (length result))),
       runTest "splitNixPath drive letters and separators" $
         assertEqual
           "split"
@@ -9362,8 +9370,39 @@ testPhase4 = do
           "split-url"
           ["nixpkgs=https://example.com/nixpkgs.tar.gz", "custom=/opt"]
           (splitNixPath "nixpkgs=https://example.com/nixpkgs.tar.gz:custom=/opt"),
-      runTest "splitNixPath keeps interior empty entries" $
-        assertEqual "split-empty" ["a", "", "b"] (splitNixPath "a::b"),
+      runTest "splitNixPath keeps a channel entry whole" $
+        assertEqual
+          "split-channel"
+          ["channel:nixos-24.11", "/foo"]
+          (splitNixPath "channel:nixos-24.11:/foo"),
+      runTest "splitNixPath keeps a prefixed channel entry whole" $
+        assertEqual
+          "split-channel-prefixed"
+          ["nixpkgs=channel:nixos-24.11", "/foo"]
+          (splitNixPath "nixpkgs=channel:nixos-24.11:/foo"),
+      runTest "splitNixPath keeps a flake entry whole" $
+        assertEqual "split-flake" ["flake:nixpkgs", "/foo"] (splitNixPath "flake:nixpkgs:/foo"),
+      runTest "splitNixPath keeps every listed scheme whole" $
+        assertEqual
+          "split-schemes"
+          ["http://h/a", "https://h/b", "file:///c", "channel://d", "git://h/e", "s3://b/f", "ssh://h/g"]
+          (splitNixPath "http://h/a:https://h/b:file:///c:channel://d:git://h/e:s3://b/f:ssh://h/g"),
+      runTest "splitNixPath splits an unlisted scheme at its colon" $
+        assertEqual "split-unlisted" ["foo", "//x", "/bar"] (splitNixPath "foo://x:/bar"),
+      runTest "splitNixPath drops empty entries" $
+        assertEqual "split-empties" ["a", "b"] (splitNixPath "a::b:"),
+      runTest "splitNixPath drops leading empty entries" $
+        assertEqual "split-leading-empties" ["x"] (splitNixPath "::x"),
+      runTest "splitNixPath matches a scheme case-sensitively" $
+        assertEqual "split-scheme-case" ["HTTP", "//x", "/y"] (splitNixPath "HTTP://x:/y"),
+      runTest "splitNixPath judges the scheme after the last = of the entry" $
+        assertEqual "split-last-equals" ["a=b=https://x", "/y"] (splitNixPath "a=b=https://x:/y"),
+      runTest "splitNixPath splits a URL port after the host" $
+        assertEqual "split-port" ["https://example.com", "8080/x"] (splitNixPath "https://example.com:8080/x"),
+      runTest "splitNixPath absorbs one run after a channel entry" $
+        assertEqual "split-one-run" ["channel:channel", "x"] (splitNixPath "channel:channel:x"),
+      runTest "splitNixPath keeps a bare channel colon" $
+        assertEqual "split-channel-bare" ["channel:", "foo"] (splitNixPath "channel::foo"),
       runTest "splitNixPath drops a trailing empty entry" $
         assertEqual "split-trail" ["a"] (splitNixPath "a:"),
       runTestM "splitNixPath long entry splits in linear time" $ do
