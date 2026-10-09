@@ -27,9 +27,14 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes the run in flight, so that one
+# is cancelled.  A run on main is never cancelled: it publishes the closure
+# it built to the public cache, and a cancelled publish leaves the cache
+# one run behind until the next push happens to complete.  Merge-group
+# runs are the queue's own evidence and are left alone for the same reason.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # ---------------------------------------------------------------------------
 # Lint jobs (fast, Linux-only)
