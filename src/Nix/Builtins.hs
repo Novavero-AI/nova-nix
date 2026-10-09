@@ -152,48 +152,68 @@ parseNixPath raw
                 )
             )
 
--- | Split a NIX_PATH string on colon separators.  A colon stays part of
--- its entry, rather than separating, in exactly two shapes:
+-- | URL schemes that keep a @NIX_PATH@ entry whole when @://@ follows
+-- them: the allowlist in @EvalSettings::isPseudoUrl@,
+-- src/libexpr/eval-settings.cc at Nix 2.24.9.
+nixPathUrlSchemes :: [Text]
+nixPathUrlSchemes = ["http", "https", "file", "channel", "git", "s3", "ssh"]
+
+-- | Schemes that keep a @NIX_PATH@ entry whole whatever follows their
+-- colon: @isPseudoUrl@'s @channel:@ test and @parseNixPath@'s @flake:@
+-- test, both in src/libexpr/eval-settings.cc at Nix 2.24.9.
+nixPathBareSchemes :: [Text]
+nixPathBareSchemes = ["channel", "flake"]
+
+-- | Split a @NIX_PATH@ string into entries the way upstream's
+-- @EvalSettings::parseNixPath@ does (src/libexpr/eval-settings.cc at
+-- Nix 2.24.9).  An entry runs to the first colon.  That colon stays in
+-- the entry, which then extends through exactly one more colon-free
+-- run, when the text between the last @=@ before the colon (or the
+-- entry's start) and the colon is:
 --
--- * a URL colon - followed by @//@ - so an entry like
---   @nixpkgs=https://example.com/nixpkgs.tar.gz@ stays whole (upstream's
---   NIX_PATH parser keeps pseudo-URL entries whole);
--- * a Windows drive colon - preceded by a single ASCII letter that opens
---   the entry or follows @=@, and followed by @\\@ or @/@ - so @C:\\x@,
---   @C:/x@, and @nixpkgs=C:\\x@ stay whole.
+-- * one of 'nixPathBareSchemes', whatever follows the colon, so
+--   @channel:nixos-24.11@ and @nixpkgs=channel:nixos-24.11@ stay whole;
+-- * one of 'nixPathUrlSchemes' with @//@ after the colon, so
+--   @nixpkgs=https://example.com/nixpkgs.tar.gz@ stays whole while an
+--   unlisted @foo://x@ splits into @foo@ and @//x@, as it does upstream;
+-- * a single ASCII letter with @/@ or @\\@ after the colon: a Windows
+--   drive colon, so @C:\\x@, @C:/x@ and @nixpkgs=C:\\x@ stay whole.
+--   Upstream has no such rule and splits every drive path at its letter
+--   (nix-instantiate 2.33.2 reports @C:\\a@ as the entries @C@ and @\\a@).
+--   The rule also keeps a one-letter scheme such as @C://x@ whole, which
+--   upstream splits into @C@ and @//x@.
 --
--- Every other colon separates, so a Unix-style list of absolute paths
--- (@/foo:/bar@) splits at each colon: @/foo@ does not end in a drive
--- letter, and a lone @/@ after the colon is not a URL.
+-- Only one further run is absorbed, so @https://example.com:8080/x@
+-- splits after the host exactly as it does upstream.  Every other colon
+-- separates: @/foo:/bar@ is two entries.  An empty entry is dropped:
+-- @a::b@ is @a@ and @b@, @::x@ is @x@, @a:@ is @a@.  Upstream's parser
+-- emits a leading or interior empty entry (never a trailing one), but
+-- the entries are then round-tripped through a whitespace-separated
+-- setting (initGC in src/libexpr/eval-gc.cc) that drops it, so
+-- @builtins.nixPath@ never shows one.  That round trip also splits an
+-- entry at a space, which is not reproduced here: a Windows path may
+-- contain one, the same reason the drive rule above diverges.
 splitNixPath :: Text -> [Text]
-splitNixPath = go []
+splitNixPath = filter (not . T.null) . go
   where
-    -- Accumulates reversed chunks and concatenates once per entry, so a
-    -- long entry costs O(n) instead of the O(n^2) of per-character snoc.
-    go !chunks remaining =
-      let (chunk, rest) = T.break (== ':') remaining
-       in case T.uncons rest of
-            Nothing ->
-              let entry = T.concat (reverse (chunk : chunks))
-               in [entry | not (T.null entry)]
-            Just (_, afterColon)
-              | keepsColon (null chunks) chunk afterColon ->
-                  go (T.take 1 afterColon : ":" : chunk : chunks) (T.drop 1 afterColon)
-              | otherwise ->
-                  T.concat (reverse (chunk : chunks)) : go [] afterColon
-    -- Whether the colon between chunk and afterColon is a URL or drive
-    -- colon (the two shapes above).  atEntryStart says chunk opens its
-    -- entry (nothing absorbed before it), so a lone letter can only be a
-    -- drive letter there.
-    keepsColon atEntryStart chunk afterColon
-      | T.isPrefixOf "//" afterColon = True
-      | startsWithPathSep afterColon = endsInDriveLetter atEntryStart chunk
-      | otherwise = False
+    go remaining
+      | T.null remaining = []
+      | otherwise =
+          let (segment, rest) = T.break (== ':') remaining
+           in case T.uncons rest of
+                Nothing -> [segment]
+                Just (_, afterColon)
+                  | keepsColon (T.takeWhileEnd (/= '=') segment) afterColon ->
+                      let (absorbed, afterEntry) = T.break (== ':') afterColon
+                       in T.concat [segment, ":", absorbed] : go (T.drop 1 afterEntry)
+                  | otherwise -> segment : go afterColon
+    keepsColon scheme afterColon
+      | scheme `elem` nixPathBareSchemes = True
+      | scheme `elem` nixPathUrlSchemes = T.isPrefixOf "//" afterColon
+      | otherwise = isDriveLetter scheme && startsWithPathSep afterColon
+    isDriveLetter scheme = case T.uncons scheme of
+      Just (letter, afterLetter) -> T.null afterLetter && (isAsciiUpper letter || isAsciiLower letter)
+      Nothing -> False
     startsWithPathSep t = case T.uncons t of
       Just (c, _) -> c == '/' || c == '\\'
-      Nothing -> False
-    endsInDriveLetter atEntryStart chunk = case T.unsnoc chunk of
-      Just (beforeLetter, letter) ->
-        (isAsciiUpper letter || isAsciiLower letter)
-          && (T.isSuffixOf "=" beforeLetter || (atEntryStart && T.null beforeLetter))
       Nothing -> False
