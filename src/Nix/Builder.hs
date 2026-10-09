@@ -86,6 +86,7 @@ import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fromATerm, platformToText)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
+import Nix.Http (withUserAgent)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, storePathToFilePath, unStoreDir)
@@ -171,12 +172,6 @@ envOut = "out"
 -- | HTTP success status code.
 httpStatusOk :: Int
 httpStatusOk = 200
-
--- | User-Agent sent by @builtin:fetchurl@.  Some upstream servers (e.g.
--- ftp.gnu.org) reject requests with no User-Agent as bot traffic with a 403,
--- so the fetcher identifies itself like any other download client.
-fetchUserAgent :: BS.ByteString
-fetchUserAgent = "nova-nix (+https://github.com/Novavero-AI/nova-nix)"
 
 -- | Environment variable for the reproducible-builds.org build timestamp.
 envSourceDateEpoch :: Text
@@ -981,7 +976,7 @@ downloadUrlTo url outPath ctx0 =
     fetch = do
       manager <- HTTPS.getGlobalManager
       request0 <- HTTP.parseRequest (T.unpack url)
-      let request = request0 {HTTP.requestHeaders = ("User-Agent", fetchUserAgent) : HTTP.requestHeaders request0}
+      let request = withUserAgent request0
       HTTP.withResponse request manager $ \response -> do
         let code = HTTP.statusCode (HTTP.responseStatus response)
         if code /= httpStatusOk

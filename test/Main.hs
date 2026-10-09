@@ -31,6 +31,7 @@ import qualified Database.SQLite.Simple as SQL
 import FetchurlFixture (withFetchurlServer)
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
+import qualified Network.HTTP.Client as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
@@ -54,6 +55,7 @@ import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
 import Nix.Hash (hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
+import Nix.Http (userAgent, withUserAgent)
 import Nix.Parser (ParseError (..), parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
@@ -4504,6 +4506,14 @@ testBuildOrchestrator = do
     [ -- BuildConfig has caches field
       runTest "defaultBuildConfig has empty caches" $
         assertEqual "empty-caches" [] (bcCaches (defaultBuildConfig defaultStoreDir)),
+      -- Upstream's shape is a product token with the version; the comment
+      -- after it is ours.  What bot mitigation keys on is that there is one.
+      runTest "the User-Agent is a nova-nix product token with a version" $
+        assertEqual "ua" True ("nova-nix/" `BS.isPrefixOf` userAgent && BS.length userAgent > BS.length "nova-nix/ (+https://github.com/Novavero-AI/nova-nix)"),
+      runTestM "withUserAgent sets exactly one User-Agent, replacing any present" $ do
+        request0 <- HTTP.parseRequest "http://127.0.0.1/narinfo-hashes"
+        let stale = request0 {HTTP.requestHeaders = [("User-Agent", "curl/0"), ("Accept", "*/*")]}
+        pure (assertEqual "headers" [("User-Agent", userAgent), ("Accept", "*/*")] (HTTP.requestHeaders (withUserAgent stale))),
       -- The build PATH must never open with the build working directory:
       -- a bare-name builder has no directory to derive.
       runTest "bare-name builder derives no PATH entry" $

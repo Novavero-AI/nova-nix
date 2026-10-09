@@ -96,6 +96,10 @@ library
     Nix.Substituter
     Nix.Builtins
     Nix.Hash
+    Nix.Http
+
+  autogen-modules:  Paths_nova_nix
+  other-modules:    Paths_nova_nix
 
   build-depends:
       base                >= 4.22 && < 5
