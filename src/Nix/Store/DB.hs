@@ -37,6 +37,7 @@ module Nix.Store.DB
     registerPaths,
     isValidPath,
     queryReferences,
+    queryAllReferences,
     queryDeriver,
     queryPathInfo,
     queryAllValidPaths,
@@ -44,6 +45,7 @@ module Nix.Store.DB
     -- * Unregistration
     UnregisterResult (..),
     unregisterPathRow,
+    unregisterPathRows,
 
     -- * Constants
     metaDirName,
@@ -60,6 +62,7 @@ import Database.SQLite.Simple
     Query (..),
     close,
     execute,
+    executeMany,
     execute_,
     open,
     query,
@@ -295,6 +298,19 @@ queryAllValidPaths db = do
   rows <- query (sdbConn db) "SELECT path FROM ValidPaths ORDER BY path" () :: IO [Only Text]
   pure [p | Only p <- rows]
 
+-- | Every reference edge in the store as @(referrer, reference)@ path
+-- text, in one query: the collector's reachability walk is over the
+-- whole graph, and one round trip beats one per valid path.
+queryAllReferences :: StoreDB -> IO [(Text, Text)]
+queryAllReferences db =
+  query
+    (sdbConn db)
+    "SELECT vp1.path, vp2.path FROM Refs r \
+    \JOIN ValidPaths vp1 ON r.referrer = vp1.id \
+    \JOIN ValidPaths vp2 ON r.reference = vp2.id \
+    \ORDER BY vp1.path, vp2.path"
+    ()
+
 -- | Query the deriver of a registered store path.
 queryDeriver :: StoreDB -> StorePath -> IO (Maybe Text)
 queryDeriver db sp = do
@@ -349,6 +365,52 @@ unregisterPathRow db pathText = withTransaction conn $ do
           execute conn "DELETE FROM Refs WHERE referrer = ?" (Only pathId)
           execute conn "DELETE FROM ValidPaths WHERE id = ?" (Only pathId)
           pure RowUnregistered
+  where
+    conn = sdbConn db
+
+-- | Remove a SET of rows and every edge leaving them, in one
+-- transaction, keyed by exact stored path text like 'unregisterPathRow'.
+-- Exists for the collector: dead paths reference each other freely
+-- (cross-output references run both ways between the outputs of one
+-- derivation), and no order of one-row deletes gets through a cycle,
+-- while deleting every dead referrer's edges before any dead row makes
+-- the order irrelevant.
+--
+-- Refuses, changing nothing, when a path OUTSIDE the set still
+-- references a path inside it: by construction a dead path's referrers
+-- are all dead, so an outside referrer means the set is not the dead set
+-- of this database, and dropping its edge would under-report that
+-- referrer's references.  The outside referrers are returned as
+-- 'RowReferenced'; 'RowAbsent' is never returned, since an absent row in
+-- the set simply has nothing to remove.
+--
+-- The set goes through a temporary table rather than an @IN (?, ?, ...)@
+-- list: SQLite caps bound variables per statement, and a dead set at
+-- nixpkgs scale is larger than that cap.
+unregisterPathRows :: StoreDB -> [Text] -> IO UnregisterResult
+unregisterPathRows db paths = withTransaction conn $ do
+  execute_ conn "CREATE TEMP TABLE IF NOT EXISTS DeadPaths (path TEXT PRIMARY KEY)"
+  execute_ conn "DELETE FROM DeadPaths"
+  executeMany conn "INSERT OR IGNORE INTO DeadPaths (path) VALUES (?)" (map Only paths)
+  outsideReferrers <-
+    query
+      conn
+      "SELECT DISTINCT vp1.path FROM Refs r \
+      \JOIN ValidPaths vp1 ON r.referrer = vp1.id \
+      \JOIN ValidPaths vp2 ON r.reference = vp2.id \
+      \WHERE vp2.path IN (SELECT path FROM DeadPaths) \
+      \AND vp1.path NOT IN (SELECT path FROM DeadPaths) \
+      \ORDER BY vp1.path"
+      () ::
+      IO [Only Text]
+  result <- case [p | Only p <- outsideReferrers] of
+    referrers@(_ : _) -> pure (RowReferenced referrers)
+    [] -> do
+      execute_ conn "DELETE FROM Refs WHERE referrer IN (SELECT id FROM ValidPaths WHERE path IN (SELECT path FROM DeadPaths))"
+      execute_ conn "DELETE FROM ValidPaths WHERE path IN (SELECT path FROM DeadPaths)"
+      pure RowUnregistered
+  execute_ conn "DELETE FROM DeadPaths"
+  pure result
   where
     conn = sdbConn db
 

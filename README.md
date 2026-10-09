@@ -44,8 +44,12 @@ it.
 ### Limitations
 
 - No flakes, no `nix-shell` or `nix develop`, and no daemon or multi-user mode.
-- No garbage collection yet ([#24]). `nova-nix store delete` removes
-  individual paths.
+- Garbage collection has no runtime roots: `nova-nix store gc` keeps what
+  `build --out-link` registered and what the operator roots under the store's
+  `.nova-nix/gcroots`, not what a running program has open. `keep-derivations`
+  and `keep-outputs` are not implemented, so an unrooted `.drv` is collected.
+  `build` creates no result link unless `--out-link` is given, where
+  `nix-build` defaults to `./result`.
 - On Windows a build's process tree runs in a job object, so stopping a build
   stops everything it started. There is no filesystem or network isolation
   yet ([#25]).
@@ -92,6 +96,8 @@ $ nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
 $ nova-nix eval FILE.nix                          # evaluate a file
 $ nova-nix build FILE.nix -A ATTR                 # build an attribute of it
 $ nova-nix build FILE.nix --substituter URL --trusted-key KEY  # try a cache first
+$ nova-nix build FILE.nix --out-link result       # link the result and root it
+$ nova-nix store gc                               # delete everything unrooted
 $ nova-nix push --cache URL --key-file KEY --all  # upload every path except derivations
 $ nova-nix --help
 ```
@@ -201,7 +207,6 @@ rather than in a public issue.
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-[#24]: https://github.com/Novavero-AI/nova-nix/issues/24
 [#25]: https://github.com/Novavero-AI/nova-nix/issues/25
 [#26]: https://github.com/Novavero-AI/nova-nix/issues/26
 [#29]: https://github.com/Novavero-AI/nova-nix/issues/29

@@ -11,7 +11,7 @@ import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (cancel, waitCatch, withAsync)
-import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, displayException, evaluate, fromException, throwIO, toException, try)
+import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, displayException, evaluate, finally, fromException, throwIO, toException, try)
 import Control.Monad (filterM, unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
@@ -64,11 +64,11 @@ import Nix.Http (userAgent, withUserAgent)
 import Nix.Parser (ParseError (..), parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, unpackNarEntry, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, platformStoreDir, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathPrefix, platformStoreDir, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Base64 as B64
@@ -81,7 +81,7 @@ import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermis
 import qualified System.Directory as Dir
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv, setEnv, unsetEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
-import System.FilePath (searchPathSeparator, takeDirectory, (</>))
+import System.FilePath (dropDrive, joinPath, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
@@ -8227,6 +8227,395 @@ testStoreDelete = do
             (Nothing, Nothing) -> Fail "materialize never completed after release"
       ]
 
+-- | The collector's pure core: the reachability walk over the references
+-- map, and the sweep plan over the valid set, the live set, and the store
+-- directory's entries.  No store is opened.
+testGcPure :: IO [Bool]
+testGcPure = do
+  putStrLn "store/gc-pure"
+  let sd = StoreDir "/s"
+      at name = T.pack (unStoreDir sd </> name)
+      refs = referencesMap [(at "a", at "b"), (at "b", at "c"), (at "d", at "c"), (at "e", at "e")]
+      hashOf c = T.unpack (T.replicate 32 c)
+      liveName = hashOf "a" <> "-gc-live"
+      deadOnDisk = hashOf "b" <> "-gc-dead"
+      deadNoTree = hashOf "c" <> "-gc-ghost"
+      stale = hashOf "d" <> "-gc-stale"
+      nix32Alphabet = "0123456789abcdfghijklmnpqrsvwxyz" :: String
+  sequence
+    [ runTest "reachableFrom closes over references transitively" $
+        assertEqual "closure" (Set.fromList [at "a", at "b", at "c"]) (reachableFrom refs [at "a"]),
+      runTest "reachableFrom leaves paths the roots do not reach out" $
+        assertEqual "d alone" (Set.fromList [at "c", at "d"]) (reachableFrom refs [at "d"]),
+      runTest "reachableFrom terminates on a cycle and a self-reference" $
+        assertEqual
+          "cycle, self"
+          (Set.fromList [at "x", at "y"], Set.singleton (at "e"))
+          (reachableFrom (referencesMap [(at "x", at "y"), (at "y", at "x")]) [at "x"], reachableFrom refs [at "e"]),
+      runTest "reachableFrom keeps a root the map does not know as a dead end" $
+        assertEqual "unknown root" (Set.singleton (at "z")) (reachableFrom refs [at "z"]),
+      runTest "reachableFrom of no roots is empty" $
+        assertEqual "no roots" Set.empty (reachableFrom refs []),
+      -- Dead rows go whether or not a tree exists; every directory entry
+      -- that is not live goes too (a dead tree, a stale build, junk, a
+      -- dead path's lock file), while the live path, its lock file and
+      -- the metadata directory stay.
+      runTest "sweepPlan unregisters dead rows and removes every entry that is not live, keeping a live path's lock file" $
+        let valid = Set.fromList [at liveName, at deadOnDisk, at deadNoTree]
+            live = Set.fromList [at liveName]
+            entries = map T.pack [liveName, liveName <> ".lock", deadOnDisk, deadOnDisk <> ".lock", metaDirName, stale, stale <> ".lock", "junk-file"]
+         in assertEqual
+              "plan"
+              SweepPlan
+                { spDeadRows = sort [at deadOnDisk, at deadNoTree],
+                  spTrees = sort [at deadOnDisk, at (deadOnDisk <> ".lock"), at stale, at (stale <> ".lock"), at "junk-file"]
+                }
+              (sweepPlan sd valid live entries),
+      runTest "sweepPlan removes a dead registered object named like a live path's lock file" $
+        let lockNamed = liveName <> ".lock"
+            valid = Set.fromList [at liveName, at lockNamed]
+            live = Set.fromList [at liveName]
+         in assertEqual
+              "plan"
+              SweepPlan {spDeadRows = [at lockNamed], spTrees = [at lockNamed]}
+              (sweepPlan sd valid live (map T.pack [liveName, lockNamed])),
+      runTest "parseStorePathPrefix names the path for itself, a trailing separator and anything beneath, and nothing outside" $
+        let sp = StorePath (T.replicate 32 "a") "gc-live"
+            dirText = T.pack (unStoreDir sd)
+            named = map (parseStorePathPrefix sd) [at liveName, at liveName <> "/", at liveName <> "/bin/tool", at liveName <> "\\bin"]
+            unnamed = map (parseStorePathPrefix sd) [dirText, dirText <> "/", "/elsewhere/" <> T.pack liveName, dirText <> "/not-a-store-path"]
+         in assertEqual "prefixes" (replicate 4 (Just sp), replicate 4 Nothing) (named, unnamed),
+      runTest "showFreedBytes renders upstream's two-place MiB" $
+        assertEqual "MiB" ["0.00 MiB", "1.00 MiB", "1.50 MiB"] (map showFreedBytes [0, 1048576, 1572864]),
+      runTest "gcSummaryLine is upstream's PrintFreed line" $
+        assertEqual "summary" "2 store paths deleted, 1.00 MiB freed" (gcSummaryLine (GcResults [at "a", at "b"] 1048576)),
+      runTest "indirectRootRecordName is a nix-base32 digest keyed by the link path" $
+        let name = indirectRootRecordName "/home/u/result"
+         in if length name == 52 && all (`elem` nix32Alphabet) name && name /= indirectRootRecordName "/home/u/result-2"
+              then Pass
+              else Fail ("unexpected record name: " <> T.pack name)
+    ]
+
+-- | Garbage collection end to end against a temp store: a rooted closure
+-- survives and the orphan goes, the rooted path and what it reaches
+-- cannot be deleted, one directory keys one store however it is
+-- spelled while a foreign spelling is refused, a removed root lets the
+-- closure go, a dead cycle sweeps, a dead path's lock file goes with it,
+-- a second open handle holds the collector off, a failed lease renewal
+-- leaves a closable handle, and an out-link root behaves as nix-build's
+-- result link does.
+testStoreGC :: IO [Bool]
+testStoreGC = do
+  putStrLn "store/gc"
+  canLink <- symlinksAvailable
+  tmpBase <- getTemporaryDirectory
+  let linkDir = tmpBase </> "nova-nix-test-gc-links"
+      outLink = linkDir </> "result"
+  Dir.removePathForcibly linkDir
+  createDirectoryIfMissing True linkDir
+  withTempStore $ \store -> do
+    let sd = stDir store
+        basenameOf sp = spHash sp <> "-" <> spName sp
+        pathText sp = T.pack (storePathToFilePath sd sp)
+        lockOf sp = storePathToFilePath sd sp <> ".lock"
+        plant sp bytes = do
+          let tree = storePathToFilePath sd sp
+          createDirectoryIfMissing True tree
+          BS.writeFile (tree </> "data") bytes
+        dep = StorePath (T.replicate 32 "a") "gc-dep"
+        top = StorePath (T.replicate 32 "b") "gc-top"
+        orphan = StorePath (T.replicate 32 "c") "gc-orphan"
+        rootFile = gcRootsDir sd </> T.unpack (basenameOf top)
+        registerTrio = do
+          mapM_ (uncurry plant) [(dep, "dep"), (top, "top!"), (orphan, "orphan bytes")]
+          registerPaths
+            (stDB store)
+            [ PathRegistration dep "sha256:d" 1 Nothing [],
+              PathRegistration top "sha256:t" 1 Nothing [dep],
+              PathRegistration orphan "sha256:o" 1 Nothing []
+            ]
+        -- A refused collection is a failure of the test, not a result.
+        collect = collectGarbage store >>= either (throwIO . userError . T.unpack) pure
+    permanent <-
+      sequence
+        [ -- A regular file named like the path, under gcroots: upstream's
+          -- own permanent-root form, the one that needs no symlink.
+          runTestM "a permanent root keeps its closure and the orphan is swept" $ do
+            registerTrio
+            createDirectoryIfMissing True (gcRootsDir sd)
+            BS.writeFile rootFile ""
+            results <- collect
+            validity <- mapM (isValid store) [dep, top, orphan]
+            orphanGone <- not <$> Dir.doesPathExist (storePathToFilePath sd orphan)
+            topKept <- Dir.doesPathExist (storePathToFilePath sd top </> "data")
+            pure $
+              if results == GcResults [pathText orphan] 12 && validity == [True, True, False] && orphanGone && topKept
+                then Pass
+                else Fail ("wrong sweep: " <> T.pack (show (results, validity, orphanGone, topKept))),
+          runTestM "delete refuses the rooted path with upstream's words" $ do
+            outcome <- deleteStorePathRaw store (basenameOf top)
+            stillValid <- isValid store top
+            pure $ case outcome of
+              Left err
+                | "since it is still alive" `T.isInfixOf` err, pathText top `T.isInfixOf` err, stillValid -> Pass
+                | otherwise -> Fail ("wrong refusal: " <> err)
+              Right removed -> Fail ("deleted a rooted path: " <> T.pack (show removed)),
+          runTestM "delete refuses a path the root reaches through references" $ do
+            outcome <- deleteStorePathRaw store (basenameOf dep)
+            pure $ case outcome of
+              Left err | "since it is still alive" `T.isInfixOf` err -> Pass
+              other -> Fail ("expected the liveness refusal, got: " <> T.pack (show other)),
+          runTestM "findRoots reports the permanent root under its own path" $ do
+            roots <- findRoots store
+            pure (assertEqual "roots" [GcRoot rootFile (pathText top)] roots),
+          -- One directory keys one set of rows however it is spelled: the
+          -- handle canonicalises the spelling at open, so a second handle
+          -- opened through '.', '..' and a trailing separator (and, when
+          -- the temp store shares the working directory's drive, through
+          -- a relative path) is the same store with the same root.
+          runTestM "openStore keys the store by one spelling of its directory" $ do
+            cwd <- Dir.getCurrentDirectory
+            let dotted = unStoreDir sd </> "." </> "zig" </> ".." <> [pathSeparator]
+                relative =
+                  [ joinPath (replicate (length (splitDirectories cwd) - 1) "..") </> dropDrive (unStoreDir sd)
+                  | takeDrive cwd == takeDrive (unStoreDir sd)
+                  ]
+                spellings = dotted : relative
+                inspect spelling = do
+                  other <- openStore (StoreDir spelling)
+                  roots <- findRoots other
+                  closeStore other
+                  pure (stDir other, roots)
+            outcomes <- mapM inspect spellings
+            pure (assertEqual "spellings" (map (const (sd, [GcRoot rootFile (pathText top)])) spellings) outcomes),
+          -- A row keyed under another spelling of the directory would
+          -- compare as dead; the collector and the checked delete refuse
+          -- instead of sweeping, and nothing changes.
+          runTestM "a collection and a checked delete refuse a database keyed under another spelling" $ do
+            let foreignRow = "/elsewhere/" <> T.replicate 32 "z" <> "-gc-foreign"
+            conn <- SQL.open (unStoreDir sd </> metaDirName </> dbFileName)
+            SQL.execute
+              conn
+              "INSERT INTO ValidPaths (path, hash, registrationTime, deriver, narSize) VALUES (?, ?, 0, NULL, 0)"
+              (foreignRow, "sha256:z" :: T.Text)
+            collected <- collectGarbage store
+            deleted <- deleteStorePathRaw store (basenameOf dep)
+            SQL.execute conn "DELETE FROM ValidPaths WHERE path = ?" (SQL.Only foreignRow)
+            SQL.close conn
+            validity <- mapM (isValid store) [dep, top, orphan]
+            topKept <- Dir.doesPathExist (storePathToFilePath sd top </> "data")
+            pure $ case (collected, deleted) of
+              (Left gcErr, Left delErr)
+                | "another spelling" `T.isInfixOf` gcErr,
+                  "another spelling" `T.isInfixOf` delErr,
+                  validity == [True, True, False],
+                  topKept ->
+                    Pass
+              other -> Fail ("expected both refusals, got: " <> T.pack (show (other, validity, topKept))),
+          -- Upstream reports an entry it cannot read and carries on; a
+          -- directory with no permissions is the reproducible case, and
+          -- one that lists anyway (root, or Windows, where permissions
+          -- do not forbid a listing) proves nothing and is skipped.
+          runTestM "an unreadable entry under gcroots is reported and skipped" $ do
+            let locked = gcRootsDir sd </> "locked"
+                unlock = do
+                  Dir.setPermissions locked (Dir.setOwnerReadable True (Dir.setOwnerSearchable True (Dir.setOwnerWritable True Dir.emptyPermissions)))
+                  Dir.removePathForcibly locked
+            createDirectoryIfMissing True locked
+            Dir.setPermissions locked Dir.emptyPermissions
+            readable <- try (Dir.listDirectory locked) :: IO (Either SomeException [FilePath])
+            -- Restored on every exit: a walk that throws here would
+            -- otherwise leave the directory unreadable for every later
+            -- root walk in the group.
+            roots <- findRoots store `finally` unlock
+            case readable of
+              Right _ -> Pass <$ putStrLn "  SKIP  an empty-permission directory is readable here"
+              Left _ -> pure (assertEqual "roots" [GcRoot rootFile (pathText top)] roots),
+          runTestM "removing the root lets the closure go in one sweep" $ do
+            Dir.removeFile rootFile
+            results <- collect
+            remaining <- queryAllValidPaths (stDB store)
+            depGone <- not <$> Dir.doesPathExist (storePathToFilePath sd dep)
+            pure $
+              if gcrDeleted results == [pathText dep, pathText top] && null remaining && depGone
+                then Pass
+                else Fail ("closure survived: " <> T.pack (show (results, remaining, depGone))),
+          -- Cross-output references run both ways between the outputs of
+          -- one derivation, and no order of one-row deletes gets through
+          -- that; the batch delete does.
+          runTestM "a dead reference cycle is swept" $ do
+            let out = StorePath (T.replicate 32 "d") "gc-cycle-out"
+                dev = StorePath (T.replicate 32 "e") "gc-cycle-dev"
+            mapM_ (uncurry plant) [(out, "o"), (dev, "d")]
+            registerPaths
+              (stDB store)
+              [ PathRegistration out "sha256:x" 1 Nothing [dev],
+                PathRegistration dev "sha256:y" 1 Nothing [out]
+              ]
+            results <- collect
+            remaining <- queryAllValidPaths (stDB store)
+            pure (assertEqual "swept" ([pathText out, pathText dev], []) (gcrDeleted results, remaining)),
+          -- Every entry that is not live goes, a dead path's lock file
+          -- with it; a live path's lock file is the one lock file the
+          -- protocol keeps, and it goes once the path does.
+          runTestM "a dead path's lock file is swept with it and a live path's stays until the path goes" $ do
+            registerTrio
+            BS.writeFile rootFile ""
+            let stale = StorePath (T.replicate 32 "f") "gc-stale"
+            plant stale "stale"
+            BS.writeFile (lockOf stale) ""
+            BS.writeFile (lockOf top) ""
+            first <- collect
+            staleGone <- not <$> Dir.doesPathExist (storePathToFilePath sd stale)
+            staleLockGone <- not <$> Dir.doesPathExist (lockOf stale)
+            topLockKept <- Dir.doesPathExist (lockOf top)
+            Dir.removeFile rootFile
+            second <- collect
+            topLockGone <- not <$> Dir.doesPathExist (lockOf top)
+            remaining <- queryAllValidPaths (stDB store)
+            pure $
+              if gcrDeleted first == sort [pathText orphan, pathText stale, T.pack (lockOf stale)]
+                && staleGone
+                && staleLockGone
+                && topLockKept
+                && gcrDeleted second == sort [pathText dep, pathText top, T.pack (lockOf top)]
+                && topLockGone
+                && null remaining
+                then Pass
+                else Fail ("wrong sweep: " <> T.pack (show (first, staleGone, staleLockGone, topLockKept, second, topLockGone, remaining))),
+          -- Every open handle holds the collector lock shared; the
+          -- collector needs it exclusive, so it waits for the other
+          -- handle to close and runs the moment it does.
+          runTestM "collectGarbage waits for another open handle to close" $ do
+            other <- openStore sd
+            done <- newEmptyMVar
+            _ <- forkIO (collect >>= putMVar done)
+            early <- timeout deleteLockProbeMicros (takeMVar done)
+            closeStore other
+            outcome <- timeout raceWatchdogMicros (takeMVar done)
+            pure $ case (early, outcome) of
+              (Just _, _) -> Fail "collector ignored the other handle's lease"
+              (Nothing, Just _) -> Pass
+              (Nothing, Nothing) -> Fail "collector never ran after the other handle closed",
+          -- A renewal that fails must not leave the handle without a
+          -- lease slot, or closeStore waits forever.  The lock file is
+          -- replaced by a directory while the exclusive lock is held, so
+          -- the shared re-acquire cannot open it; Windows forbids
+          -- replacing a held file, so the case is POSIX-only.
+          runTestM "withCollectorLock leaves a closable handle when the lease cannot be renewed" $
+            if SI.os == "mingw32"
+              then Pass <$ putStrLn "  SKIP  a held lock file cannot be replaced on Windows"
+              else do
+                let renewalStore = tmpBase </> "nova-nix-test-gc-renewal"
+                Dir.removePathForcibly renewalStore
+                other <- openStore (StoreDir renewalStore)
+                let lockPath = gcLockFilePath (stDir other)
+                swapped <- try (withCollectorLock other (Dir.removeFile lockPath >> Dir.createDirectory lockPath))
+                closed <- timeout raceWatchdogMicros (closeStore other)
+                Dir.removePathForcibly renewalStore
+                pure $ case (swapped :: Either SomeException (), closed) of
+                  (Left _, Just ()) -> Pass
+                  (Right (), _) -> Fail "renewal succeeded against a directory"
+                  (Left _, Nothing) -> Fail "closeStore hung after a failed renewal"
+        ]
+    linked <-
+      if not canLink
+        then do
+          putStrLn "  SKIP  out-link roots need symlink privilege"
+          pure []
+        else
+          sequence
+            [ runTestM "an out-link root keeps the closure until the link is removed" $ do
+                registerTrio
+                rooted <- addOutLinkRoot store outLink top
+                case rooted of
+                  Left err -> pure (Fail err)
+                  Right link -> do
+                    let record = autoRootsDir sd </> indirectRootRecordName link
+                    recordThere <- Dir.doesFileExist record
+                    roots <- findRoots store
+                    first <- collect
+                    Dir.removePathForcibly link
+                    second <- collect
+                    recordGone <- not <$> Dir.doesFileExist record
+                    remaining <- queryAllValidPaths (stDB store)
+                    pure $
+                      if roots == [GcRoot link (pathText top)]
+                        && recordThere
+                        && gcrDeleted first == [pathText orphan]
+                        && gcrDeleted second == [pathText dep, pathText top]
+                        && recordGone
+                        && null remaining
+                        then Pass
+                        else Fail ("out-link root misbehaved: " <> T.pack (show (roots, recordThere, first, second, recordGone, remaining))),
+              -- upstream's findRoots takes toStorePath of the target, so a
+              -- link into a store path's subtree, or to the path with a
+              -- trailing separator, roots the path.
+              runTestM "a symlink root into a store path's subtree or with a trailing separator roots the path" $ do
+                plant top "top"
+                registerPath (stDB store) (PathRegistration top "sha256:t" 1 Nothing [])
+                let subLink = gcRootsDir sd </> "sub"
+                    slashLink = gcRootsDir sd </> "slash"
+                Dir.createFileLink (storePathToFilePath sd top </> "data") subLink
+                Dir.createDirectoryLink (storePathToFilePath sd top <> [pathSeparator]) slashLink
+                roots <- findRoots store
+                mapM_ Dir.removePathForcibly [subLink, slashLink]
+                pure (assertEqual "roots" [GcRoot slashLink (pathText top), GcRoot subLink (pathText top)] roots),
+              -- upstream dedups through a set keyed by (link, path); an
+              -- operator's symlink to the out-link and the out-link's own
+              -- record name the same root.
+              runTestM "findRoots lists one link once when two records name it" $ do
+                rooted <- addOutLinkRoot store outLink top
+                case rooted of
+                  Left err -> pure (Fail err)
+                  Right link -> do
+                    let mine = gcRootsDir sd </> "mine"
+                    Dir.createFileLink link mine
+                    roots <- findRoots store
+                    mapM_ Dir.removePathForcibly [mine, link]
+                    pure (assertEqual "roots" [GcRoot link (pathText top)] roots),
+              -- upstream's addPermRoot canonPaths the link and makeSymlink
+              -- creates its parents; a '..' that lands inside the store is
+              -- refused as inside.
+              runTestM "addOutLinkRoot collapses .. and creates missing parents, and .. cannot spell a link into the store" $ do
+                let expectedLink = T.unpack (canonPath (T.pack (linkDir </> "deep" </> "result")))
+                    dotted = linkDir </> "deep" </> "down" </> ".." </> "result"
+                    insideViaDotDot = takeDirectory (unStoreDir sd) </> takeFileName linkDir </> ".." </> takeFileName (unStoreDir sd) </> "result"
+                collapsed <- addOutLinkRoot store dotted top
+                target <- Dir.getSymbolicLinkTarget expectedLink
+                recorded <- BS.readFile (autoRootsDir sd </> indirectRootRecordName expectedLink)
+                inside <- addOutLinkRoot store insideViaDotDot top
+                pure $ case (collapsed, inside) of
+                  (Right link, Left insideErr)
+                    | link == expectedLink,
+                      target == storePathToFilePath sd top,
+                      recorded == TE.encodeUtf8 (T.pack link),
+                      "in the Nix store is forbidden" `T.isInfixOf` insideErr ->
+                        Pass
+                  other -> Fail ("wrong outcomes: " <> T.pack (show (other, target, recorded))),
+              -- upstream's addPermRoot: an existing store link is replaced,
+              -- anything else at the name is refused, and a link inside
+              -- the store is refused.
+              runTestM "addOutLinkRoot replaces a store link and refuses a file or a link inside the store" $ do
+                let replaceLink = linkDir </> "replace"
+                    plainFile = linkDir </> "plain"
+                Dir.createFileLink (storePathToFilePath sd orphan) replaceLink
+                replaced <- addOutLinkRoot store replaceLink top
+                target <- Dir.getSymbolicLinkTarget replaceLink
+                BS.writeFile plainFile "not a link"
+                clobber <- addOutLinkRoot store plainFile top
+                inside <- addOutLinkRoot store (unStoreDir sd </> "result") top
+                pure $ case (replaced, clobber, inside) of
+                  (Right _, Left clobberErr, Left insideErr)
+                    | target == storePathToFilePath sd top,
+                      "already exists" `T.isInfixOf` clobberErr,
+                      "in the Nix store is forbidden" `T.isInfixOf` insideErr ->
+                        Pass
+                  other -> Fail ("wrong outcomes: " <> T.pack (show (other, target)))
+            ]
+    Dir.removePathForcibly linkDir
+    pure (permanent ++ linked)
+
 testStoreOps :: IO [Bool]
 testStoreOps = do
   putStrLn "store/ops"
@@ -12165,6 +12554,8 @@ runSuite = do
           testParseStorePath,
           testStoreOps,
           testStoreDelete,
+          testGcPure,
+          testStoreGC,
           testSymlinkWalksIO,
           testLinkOrdering,
           testFromATerm,

@@ -45,6 +45,7 @@ module Nix.Store.Path
     isCanonicalStoreText,
     storeTextToFilePath,
     parseStorePath,
+    parseStorePathPrefix,
     parseStorePathBaseName,
 
     -- * Name validation
@@ -153,6 +154,18 @@ parseStorePath (StoreDir dir) path =
    in case tryWithSep "/" of
         Just sp -> Just sp
         Nothing -> tryWithSep "\\"
+
+-- | The store path a path inside the store belongs to: upstream's
+-- @toStorePath@, which cuts at the first separator after the store
+-- directory.  The path itself, a trailing-separator spelling of it, and
+-- anything beneath it all name it; a path outside the store, or the
+-- store directory itself, names nothing.  Both separators are accepted
+-- after the store directory, as 'parseStorePath' accepts them.
+parseStorePathPrefix :: StoreDir -> Text -> Maybe StorePath
+parseStorePathPrefix (StoreDir dir) path =
+  case [rest | sep <- ["/", "\\"], Just rest <- [T.stripPrefix (T.pack dir <> sep) path]] of
+    (rest : _) -> parseStorePathBaseName (T.takeWhile (\c -> c /= '/' && c /= '\\') rest)
+    [] -> Nothing
 
 -- | Parse a store path basename like @abc...-name@ - the form narinfo
 -- @References@ and @Deriver@ fields carry on the wire - into a
