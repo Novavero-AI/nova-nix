@@ -11,7 +11,7 @@ import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (cancel, waitCatch, withAsync)
-import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, evaluate, fromException, throwIO, try)
+import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, evaluate, fromException, throwIO, toException, try)
 import Control.Monad (filterM, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
@@ -32,7 +32,8 @@ import FetchurlFixture (withFetchurlServer)
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import qualified Network.HTTP.Client as HTTP
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import qualified Network.HTTP.Types.Status as HTTP
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), FetchRetryPolicy (..), RetryEffects (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, defaultFetchRetryPolicy, execWrapperConfig, execWrapperFor, fetchExceptionFailure, fetchStatusFailure, fetchUrlsFromEnv, retryDelayMs, retryTransient, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, parseNixPath, splitNixPath)
 import Nix.Config (NixConfig (..))
@@ -6886,14 +6887,103 @@ testFetchMirrors = do
             attempt _ = fail "unused mirror attempted"
         result <- tryFetchUrlsWith attempt ("good" :| ["unused"])
         pure (assertEqual "first success" (Right "good" :: Either Text Text) result),
-      runTestM "HTTP mirrors verify hashes, truncate retries and stop on success" $
-        httpCase "fallback" False ["/missing", "/bad", "/partial", "/good", "/unused"] True ["/missing", "/bad", "/partial", "/good"],
+      -- The per-URL retry policy, with its effects injected: upstream's five
+      -- attempts and doubling delay from 250 ms, spent on transient failures
+      -- only.
+      runTest "retry delay is upstream's 250 ms doubling, with jitter on the exponent" $
+        assertEqual
+          "delays"
+          ([250, 500, 1000, 2000], 353, 2828)
+          ( map (\retry -> retryDelayMs defaultFetchRetryPolicy retry 0) [1 .. 4],
+            retryDelayMs defaultFetchRetryPolicy 1 0.5,
+            retryDelayMs defaultFetchRetryPolicy 4 0.5
+          ),
+      runTestM "retry policy retries a transient failure with backoff until it succeeds" $ do
+        calls <- newIORef (0 :: Int)
+        sleeps <- newIORef []
+        warnings <- newIORef []
+        let effects =
+              RetryEffects
+                { reSleepMs = \ms -> atomicModifyIORef' sleeps (\seen -> (seen ++ [ms], ())),
+                  reJitter = pure 0,
+                  reWarn = \msg -> atomicModifyIORef' warnings (\seen -> (seen ++ [msg], ()))
+                }
+            attempt = do
+              n <- atomicModifyIORef' calls (\c -> (c + 1, c + 1))
+              pure (if n < 3 then Left (Subst.TransientFailure "HTTP 503 fetching u") else Right ("verified" :: Text))
+        result <- retryTransient defaultFetchRetryPolicy effects attempt
+        seenSleeps <- readIORef sleeps
+        seenWarnings <- readIORef warnings
+        pure
+          ( assertEqual
+              "two retries"
+              (Right "verified", [250, 500], ["HTTP 503 fetching u; retrying in 250 ms", "HTTP 503 fetching u; retrying in 500 ms"])
+              (result, seenSleeps, seenWarnings)
+          ),
+      runTestM "retry policy gives up after five attempts" $ do
+        calls <- newIORef (0 :: Int)
+        sleeps <- newIORef []
+        let effects = RetryEffects {reSleepMs = \ms -> atomicModifyIORef' sleeps (\seen -> (seen ++ [ms], ())), reJitter = pure 0, reWarn = \_ -> pure ()}
+            attempt = atomicModifyIORef' calls (\c -> (c + 1, ())) >> pure (Left (Subst.TransientFailure "timeout") :: Either Subst.AttemptFailure ())
+        result <- retryTransient defaultFetchRetryPolicy effects attempt
+        seenCalls <- readIORef calls
+        seenSleeps <- readIORef sleeps
+        pure (assertEqual "spent" (Left (Subst.TransientFailure "timeout"), 5, [250, 500, 1000, 2000]) (result, seenCalls, seenSleeps)),
+      runTestM "retry policy does not retry a fatal failure" $ do
+        calls <- newIORef (0 :: Int)
+        let effects = RetryEffects {reSleepMs = \_ -> fail "slept on a fatal failure", reJitter = pure 0, reWarn = \_ -> fail "warned on a fatal failure"}
+            attempt = atomicModifyIORef' calls (\c -> (c + 1, ())) >> pure (Left (Subst.FatalFailure "HTTP 404") :: Either Subst.AttemptFailure ())
+        result <- retryTransient defaultFetchRetryPolicy effects attempt
+        seenCalls <- readIORef calls
+        pure (assertEqual "once" (Left (Subst.FatalFailure "HTTP 404"), 1) (result, seenCalls)),
+      -- The classification tables, against upstream's (filetransfer.cc at
+      -- 2.24.9): which statuses and which client failures a retry can outlive.
+      runTest "status classification matches upstream's transfer layer" $
+        let transient status = case fetchStatusFailure "u" status of
+              Subst.TransientFailure _ -> True
+              Subst.FatalFailure _ -> False
+         in assertEqual
+              "classes"
+              (replicate 6 True, replicate 10 False)
+              ( map transient [HTTP.status408, HTTP.status429, HTTP.status500, HTTP.status502, HTTP.status503, HTTP.status504],
+                map transient [HTTP.status404, HTTP.status410, HTTP.status401, HTTP.status403, HTTP.status407, HTTP.status400, HTTP.status418, HTTP.status501, HTTP.status505, HTTP.status511]
+              ),
+      runTest "exception classification retries transport failures only" $
+        let transient err = case fetchExceptionFailure "u" err of
+              Subst.TransientFailure _ -> True
+              Subst.FatalFailure _ -> False
+            request = HTTP.defaultRequest
+         in assertEqual
+              "classes"
+              (replicate 3 True, replicate 5 False)
+              ( map
+                  transient
+                  [ toException (HTTP.HttpExceptionRequest request HTTP.ConnectionTimeout),
+                    toException (HTTP.HttpExceptionRequest request (HTTP.ResponseBodyTooShort 100 5)),
+                    toException (HTTP.HttpExceptionRequest request HTTP.ResponseTimeout)
+                  ],
+                map
+                  transient
+                  [ toException (HTTP.InvalidUrlException "ftp://x" "Invalid scheme"),
+                    toException (HTTP.HttpExceptionRequest request (HTTP.InvalidDestinationHost "")),
+                    toException (HTTP.HttpExceptionRequest request HTTP.TlsNotSupported),
+                    toException (HTTP.HttpExceptionRequest request (HTTP.TooManyRedirects [])),
+                    toException (userError "disk full")
+                  ]
+              ),
+      -- End to end against the loopback fixture, under a policy with a 1 ms
+      -- base delay: a torn transfer and a server error spend all five
+      -- attempts before the next mirror; a 404 and a hash mismatch spend one.
+      runTestM "HTTP mirrors retry a torn transfer, skip a missing or corrupt one, and stop on success" $
+        httpCase "fallback" False ["/missing", "/bad", "/partial", "/good", "/unused"] True (["/missing", "/bad"] ++ replicate 5 "/partial" ++ ["/good"]),
       runTestM "HTTP fetch retains single-url compatibility" $
         httpCase "legacy" True ["/good"] True ["/good"],
+      runTestM "a server error is retried five times before the next mirror" $
+        httpCase "retried" False ["/error", "/good"] True (replicate 5 "/error" ++ ["/good"]),
       runTestM "HTTP failure leaves no output or registration" $
-        httpCase "errors" False ["/error", "/missing"] False ["/error", "/missing"],
+        httpCase "errors" False ["/error", "/missing"] False (replicate 5 "/error" ++ ["/missing"]),
       runTestM "hash failure leaves no corrupt output or registration" $
-        httpCase "corrupt" False ["/bad", "/partial"] False ["/bad", "/partial"],
+        httpCase "corrupt" False ["/bad", "/partial"] False ("/bad" : replicate 5 "/partial"),
       runTestM "cancelling a download releases its lock and does not try another mirror" $
         withFetchurlServer $ \base requests requested ->
           withStore "cancel" $ \store config sp -> do
@@ -6918,7 +7008,7 @@ testFetchMirrors = do
       tmpBase <- getTemporaryDirectory
       let root = tmpBase </> ("nova-nix-test-mirrors-" ++ label)
           dir = StoreDir (root </> "store")
-          config = (defaultBuildConfig dir) {bcTmpDir = root </> "build"}
+          config = (defaultBuildConfig dir) {bcTmpDir = root </> "build", bcFetchRetry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}}
       sp <- either (fail . show) pure (makeFixedOutputPath "mirrors" "sha256" "flat" (sha256Digest "hello"))
       bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
         bracket (openStore dir) closeStore $
@@ -6948,6 +7038,52 @@ testFetchMirrors = do
                   assertEqual "verified output" "hello" <$> BS.readFile (storePathToFilePath (stDir store) sp)
             BuildFailure msg _ | not succeeds && not valid && not present && seen == expectedRequests && not (T.null msg) -> pure Pass
             _ -> pure (Fail (T.pack (show (result, seen, valid, present))))
+
+-- | @pkgs/windows/fetchurl.nix@ evaluated from the checkout.  The
+-- @mirror://@ expansion is what a source derivation records, so a
+-- mirrors.nix refresh or a regex edit moves every drvPath built on it;
+-- these pin the list against nixpkgs' order and the eval-time errors.
+testPkgsFetchurl :: IO [Bool]
+testPkgsFetchurl = do
+  putStrLn "pkgs/fetchurl"
+  cwd <- Dir.getCurrentDirectory
+  let fetchurl = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows" </> "fetchurl.nix") <> ")"
+      urlsOf source = "builtins.concatStringsSep \"\\n\" (" <> fetchurl <> " { " <> source <> " sha256 = \"" <> hash <> "\"; }).urls"
+      failsWith expected result = case result of
+        Left err
+          | expected `T.isInfixOf` err -> Pass
+          | otherwise -> Fail ("expected an error naming " <> expected <> ", got: " <> err)
+        Right val -> Fail ("expected an eval error, got: " <> T.pack (show val))
+  sequence
+    [ runTestIO
+        "mirror://gnu expands to the https hosts of mirrors.nix, in nixpkgs' order"
+        cwd
+        (urlsOf "url = \"mirror://gnu/hello/hello-2.12.3.tar.gz\";")
+        (mkStr (T.intercalate "\n" (map (<> "hello/hello-2.12.3.tar.gz") gnuHosts))),
+      runTestIO
+        "a plain URL in urls passes through beside an expanded one"
+        cwd
+        (urlsOf "urls = [ \"https://example.invalid/sed-4.10.tar.xz\" \"mirror://gnu/sed/sed-4.10.tar.xz\" ];")
+        (mkStr (T.intercalate "\n" ("https://example.invalid/sed-4.10.tar.xz" : map (<> "sed/sed-4.10.tar.xz") gnuHosts))),
+      runTestM "an unknown mirror site is an eval error naming the recipe's URL" $
+        failsWith "fetchurl: unknown mirror site 'nope' in 'mirror://nope/x'" <$> evalNixIO cwd (urlsOf "url = \"mirror://nope/x\";"),
+      runTestM "a mirror URL with no path is an eval error" $
+        failsWith "fetchurl: malformed mirror URL 'mirror://gnu'" <$> evalNixIO cwd (urlsOf "url = \"mirror://gnu\";")
+    ]
+  where
+    hash :: Text
+    hash = "0d5f60154382fee10b114a1c34e785d8b1f492073ae2d3a6f7b147687b366aa0"
+    -- The gnu set of pkgs/windows/mirrors.nix without its ftp:// host.
+    gnuHosts :: [Text]
+    gnuHosts =
+      [ "https://ftpmirror.gnu.org/",
+        "https://ftp.nluug.nl/pub/gnu/",
+        "https://mirrors.kernel.org/gnu/",
+        "https://mirror.ibcp.fr/pub/gnu/",
+        "https://mirror.dogado.de/gnu/",
+        "https://mirror.tochlab.net/pub/gnu/",
+        "https://ftp.gnu.org/pub/gnu/"
+      ]
 
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
@@ -11316,6 +11452,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testUpstreamConformance,
           testHashHelpers,
           testFetchMirrors,
+          testPkgsFetchurl,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,

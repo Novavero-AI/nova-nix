@@ -56,10 +56,20 @@ module Nix.Builder
     verifyFetchHash,
     fetchUrlsFromEnv,
     tryFetchUrlsWith,
+
+    -- * Fetch retry policy
+    FetchRetryPolicy (..),
+    defaultFetchRetryPolicy,
+    RetryEffects (..),
+    retryTransient,
+    retryDelayMs,
+    fetchStatusFailure,
+    fetchExceptionFailure,
   )
 where
 
-import Control.Exception (IOException, SomeException, displayException, finally, onException, try)
+import Control.Concurrent (threadDelay)
+import Control.Exception (IOException, SomeException, displayException, finally, fromException, onException, try)
 import Control.Monad (filterM, unless, when)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
@@ -90,7 +100,7 @@ import Nix.Http (withUserAgent)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, storePathToFilePath, unStoreDir)
-import Nix.Substituter (CacheConfig, SubstResult (..), catchSync, trySubstitute)
+import Nix.Substituter (AttemptFailure (..), CacheConfig, SubstResult (..), attemptFailureMessage, catchSync, trySubstitute)
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
 import qualified System.Environment
@@ -100,6 +110,7 @@ import qualified System.IO
 import qualified System.IO.Unsafe
 import qualified System.Info
 import qualified System.Process as Proc
+import System.Random (randomRIO)
 
 -- ---------------------------------------------------------------------------
 -- Named constants
@@ -173,6 +184,27 @@ envOut = "out"
 httpStatusOk :: Int
 httpStatusOk = 200
 
+-- | How many times one URL is tried before the fetcher moves on to the
+-- next: upstream's @download-attempts@ default (@libstore/filetransfer.hh@
+-- at 2.24.9, @Setting<unsigned int> tries{this, 5, "download-attempts", ...}@).
+downloadAttempts :: Int
+downloadAttempts = 5
+
+-- | The delay before the first retry, in milliseconds; every later retry
+-- doubles it (@FileTransferRequest::baseRetryTimeMs = 250@ in the same
+-- header).
+retryBaseDelayMs :: Int
+retryBaseDelayMs = 250
+
+-- | The spread upstream adds to the backoff exponent so that clients
+-- which failed together do not retry together: a uniform draw from
+-- @[0, 0.5)@ (@filetransfer.cc@ at 2.24.9, line 500).
+retryJitterCeiling :: Double
+retryJitterCeiling = 0.5
+
+microsPerMilli :: Int
+microsPerMilli = 1000
+
 -- | Environment variable for the reproducible-builds.org build timestamp.
 envSourceDateEpoch :: Text
 envSourceDateEpoch = "SOURCE_DATE_EPOCH"
@@ -205,6 +237,8 @@ data BuildConfig = BuildConfig
     bcCaches :: ![CacheConfig],
     -- | Extraction budget for @builtin:unpack@ builds.
     bcUnpackLimits :: !UnpackLimits,
+    -- | How @builtin:fetchurl@ retries one URL before trying the next.
+    bcFetchRetry :: !FetchRetryPolicy,
     -- | Launchers for derivations whose @system@ this machine cannot execute
     -- directly, keyed by that system string exactly as
     -- 'Nix.Derivation.platformToText' spells it (@x86_64-windows@ -> a wine
@@ -227,7 +261,8 @@ defaultBuildConfig dir =
           else "/tmp/nova-nix-build",
       bcCaches = [],
       bcExecWrappers = Map.empty,
-      bcUnpackLimits = defaultUnpackLimits
+      bcUnpackLimits = defaultUnpackLimits,
+      bcFetchRetry = defaultFetchRetryPolicy
     }
 
 -- | Result of a build attempt.
@@ -477,7 +512,7 @@ runPlannedBuild config store drv buildDir plans = do
       --    this - they read the byte fields directly.
       exitResult <- case drvBuilder drv of
         b
-          | b == builtinFetchurlBuilder -> runBuiltinFetchurl drv outputDirs
+          | b == builtinFetchurlBuilder -> runBuiltinFetchurl (bcFetchRetry config) drv outputDirs
           | b == builtinUnpackBuilder -> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
         _ -> case (execWrapperFor config drv, decodeBuilderStrings drv) of
           (SpawnUnsupported system, _) ->
@@ -889,13 +924,14 @@ isWindows = System.Info.os == "mingw32"
 -- Built-in fetcher (builtin:fetchurl)
 -- ---------------------------------------------------------------------------
 
--- | Run a @builtin:fetchurl@ derivation: try URLs in order and verify the
--- written bytes against the derivation's @outputHash@. Nix's bootstrap
--- fetcher is baked into the binary because nothing can be fetched before a
--- fetcher exists.  Returns the same @Either (exit, msg) ()@ shape as
--- 'runBuilder', so the shared output-registration path is reused unchanged.
-runBuiltinFetchurl :: Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
-runBuiltinFetchurl drv outputDirs =
+-- | Run a @builtin:fetchurl@ derivation: try URLs in order, each under the
+-- retry policy, and verify the written bytes against the derivation's
+-- @outputHash@. Nix's bootstrap fetcher is baked into the binary because
+-- nothing can be fetched before a fetcher exists.  Returns the same
+-- @Either (exit, msg) ()@ shape as 'runBuilder', so the shared
+-- output-registration path is reused unchanged.
+runBuiltinFetchurl :: FetchRetryPolicy -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
+runBuiltinFetchurl policy drv outputDirs =
   case (fetchUrlsFromEnv (drvEnv drv), lookup envOut outputDirs, fixedOutput) of
     (Left err, _, _) -> pure (Left (1, "builtin:fetchurl: " <> err))
     (_, Nothing, _) -> pure (Left (1, "builtin:fetchurl: derivation defines no 'out' output"))
@@ -909,7 +945,7 @@ runBuiltinFetchurl drv outputDirs =
           Nothing ->
             pure (Left (1, "builtin:fetchurl: unsupported hash algorithm '" <> algo <> "'"))
           Just ctx -> do
-            result <- tryFetchUrlsWith (fetchAndVerify outPath out ctx) urls
+            result <- tryFetchUrlsWith (fetchWithRetry outPath out ctx) urls
             pure $ case result of
               Left err -> Left (1, err)
               Right value -> Right value
@@ -921,11 +957,19 @@ runBuiltinFetchurl drv outputDirs =
     fixedOutput = case drvOutputs drv of
       (out : _) | not (T.null (doHashAlgo out)) -> Just out
       _ -> Nothing
+    fetchWithRetry outPath out ctx url =
+      first attemptFailureMessage <$> retryTransient policy ioRetryEffects (fetchAndVerify outPath out ctx url)
+    -- A download that completed and verifies wrong is the server's bytes,
+    -- not a hiccup: upstream checks the hash after the transfer layer has
+    -- given up retrying, so a mismatch is never retried.
     fetchAndVerify outPath out ctx url = do
       downloaded <- downloadUrlTo url outPath ctx
       pure $ case downloaded of
-        Left err -> Left ("builtin:fetchurl: " <> err)
-        Right digest -> first snd (verifyFetchedDigest url out digest)
+        Left failure -> Left (prefixFailure failure)
+        Right digest -> first (FatalFailure . snd) (verifyFetchedDigest url out digest)
+    prefixFailure failure = case failure of
+      TransientFailure msg -> TransientFailure ("builtin:fetchurl: " <> msg)
+      FatalFailure msg -> FatalFailure ("builtin:fetchurl: " <> msg)
 
 -- | Nova's mirror extension uses the ASCII-whitespace-separated @urls@ field.
 -- An absent field preserves the legacy single @url@ interface. An explicit
@@ -960,27 +1004,139 @@ tryFetchUrlsWith attempt = go []
           Nothing -> pure (Left (T.intercalate "\n" (reverse (err : failures))))
           Just urls -> go (err : failures) urls
 
+-- ---------------------------------------------------------------------------
+-- Retry policy
+-- ---------------------------------------------------------------------------
+
+-- | How often one URL is tried and how long the fetcher waits between
+-- tries.  'defaultFetchRetryPolicy' is upstream's; tests shrink the delay.
+data FetchRetryPolicy = FetchRetryPolicy
+  { frpAttempts :: !Int,
+    frpBaseDelayMs :: !Int
+  }
+  deriving (Eq, Show)
+
+-- | Upstream's policy: five attempts, 250 ms before the first retry.
+defaultFetchRetryPolicy :: FetchRetryPolicy
+defaultFetchRetryPolicy = FetchRetryPolicy {frpAttempts = downloadAttempts, frpBaseDelayMs = retryBaseDelayMs}
+
+-- | The delay before retry number @retry@ (counting from one), given the
+-- jitter drawn for it: upstream's @baseRetryTimeMs * 2 ^ (attempt - 1 +
+-- jitter)@ (@filetransfer.cc@ at 2.24.9, line 500), truncated to whole
+-- milliseconds as its assignment to an @int@ truncates.
+retryDelayMs :: FetchRetryPolicy -> Int -> Double -> Int
+retryDelayMs policy retry jitter =
+  truncate (fromIntegral (frpBaseDelayMs policy) * 2 ** (fromIntegral (retry - 1) + jitter) :: Double)
+
+-- | What the retry loop needs from the outside world, injected so the
+-- policy is testable with no clock, no entropy and no network.
+data RetryEffects m = RetryEffects
+  { reSleepMs :: !(Int -> m ()),
+    reJitter :: !(m Double),
+    reWarn :: !(Text -> m ())
+  }
+
+-- | The real effects: a sleep, a uniform jitter, and a warning on stderr
+-- in the shape of upstream's @warn("%s; retrying in %d ms", ...)@.
+ioRetryEffects :: RetryEffects IO
+ioRetryEffects =
+  RetryEffects
+    { reSleepMs = threadDelay . (* microsPerMilli),
+      reJitter = randomRIO (0, retryJitterCeiling),
+      reWarn = TIO.hPutStrLn System.IO.stderr . ("warning: " <>)
+    }
+
+-- | Run one URL's attempt under the retry policy: a 'TransientFailure'
+-- is tried again after the backoff until the attempts are spent, while a
+-- 'FatalFailure' or a success ends the loop at once.  Exceptions
+-- propagate, so a cancellation is never spent as retry budget.
+retryTransient :: (Monad m) => FetchRetryPolicy -> RetryEffects m -> m (Either AttemptFailure a) -> m (Either AttemptFailure a)
+retryTransient policy effects action = go 1
+  where
+    go !attempt = do
+      result <- action
+      case result of
+        Left (TransientFailure err)
+          | attempt < frpAttempts policy -> do
+              jitter <- reJitter effects
+              let delay = retryDelayMs policy attempt jitter
+              reWarn effects (err <> "; retrying in " <> T.pack (show delay) <> " ms")
+              reSleepMs effects delay
+              go (attempt + 1)
+        _ -> pure result
+
+-- | Classify a response status the way upstream's transfer layer does
+-- (@filetransfer.cc@ at 2.24.9, lines 425-441).  Never retried: 404 and
+-- 410 (the file is not there), 401, 403 and 407 (refused), every other
+-- 4xx except 408 and 429 (the server timed out waiting for the request,
+-- or asked for a slower pace), and 501, 505 and 511 (the server cannot
+-- speak this protocol, or a captive portal is in the way).  Everything
+-- else is transient, the remaining 5xx included.
+fetchStatusFailure :: Text -> HTTP.Status -> AttemptFailure
+fetchStatusFailure url status
+  | status `elem` neverRetried = FatalFailure message
+  | HTTP.statusIsClientError status && status `notElem` retriedClientErrors = FatalFailure message
+  | otherwise = TransientFailure message
+  where
+    neverRetried =
+      [HTTP.status404, HTTP.status410, HTTP.status401, HTTP.status403, HTTP.status407, HTTP.status501, HTTP.status505, HTTP.status511]
+    retriedClientErrors = [HTTP.status408, HTTP.status429]
+    message = "HTTP " <> T.pack (show (HTTP.statusCode status)) <> " fetching " <> url
+
+-- | Classify what a download attempt threw, by upstream's list of curl
+-- results that are not retried (@filetransfer.cc@ at 2.24.9, lines
+-- 443-465).  A URL the client cannot parse (@CURLE_URL_MALFORMAT@) is an
+-- 'HTTP.InvalidUrlException' from the parser, except for an empty host,
+-- which the parser accepts and the connection lookup rejects as
+-- 'HTTP.InvalidDestinationHost' on every attempt.  A scheme the client
+-- does not speak (@CURLE_UNSUPPORTED_PROTOCOL@) is an
+-- 'HTTP.InvalidUrlException' too, or 'HTTP.TlsNotSupported' when the
+-- manager has no TLS.  A redirect loop (@CURLE_TOO_MANY_REDIRECTS@) and a
+-- failure writing the output (@CURLE_WRITE_ERROR@; here, any exception
+-- that is not the HTTP client's) complete the deterministic set.  Every
+-- other transport failure is transient, name resolution and TLS included,
+-- as upstream has it.  The message names the URL and the failure only:
+-- the client's own rendering prints the whole request record over a
+-- dozen lines, and a retry would repeat it.
+fetchExceptionFailure :: Text -> SomeException -> AttemptFailure
+fetchExceptionFailure url err = case fromException err of
+  Just (HTTP.InvalidUrlException _ reason) -> FatalFailure (describe reason)
+  Just (HTTP.HttpExceptionRequest _ (HTTP.InvalidDestinationHost _)) -> FatalFailure (describe "empty host")
+  Just (HTTP.HttpExceptionRequest _ HTTP.TlsNotSupported) -> FatalFailure (describe "TLS is not supported")
+  Just (HTTP.HttpExceptionRequest _ (HTTP.TooManyRedirects _)) -> FatalFailure (describe "too many redirects")
+  Just (HTTP.HttpExceptionRequest _ content) -> TransientFailure (describe (show content))
+  Nothing -> FatalFailure (describe (displayException err))
+  where
+    describe detail = "download error fetching " <> url <> ": " <> T.pack detail
+
+-- ---------------------------------------------------------------------------
+-- Download
+-- ---------------------------------------------------------------------------
+
 -- | Download a URL to a file using nova-nix's own linked HTTP client
 -- (the same 'Network.HTTP.Client' the substituter uses) - no external
 -- @curl@, which is what makes this a genuine builtin.  The body streams
 -- to disk through the incremental hash chunk by chunk, so memory stays
 -- at chunk size no matter the download's size, and the returned digest
--- is of exactly the written bytes. Synchronous exceptions become a 'Left';
--- cancellation propagates through the shared build cleanup. Every attempt
--- opens the output in WriteMode and starts from the original hash context.
-downloadUrlTo :: Text -> FilePath -> IncrementalHash -> IO (Either Text BS.ByteString)
+-- is of exactly the written bytes. Synchronous exceptions become a 'Left'
+-- carrying their retry class; cancellation propagates through the shared
+-- build cleanup. Every attempt opens the output in WriteMode and starts
+-- from the original hash context, so a retry never resumes a torn
+-- transfer: upstream resumes from the written offset when the server
+-- accepts ranges and otherwise gives up, which this restart subsumes.
+downloadUrlTo :: Text -> FilePath -> IncrementalHash -> IO (Either AttemptFailure BS.ByteString)
 downloadUrlTo url outPath ctx0 =
-  fetch `catchSync` \err -> pure (Left ("download error: " <> T.pack (show err)))
+  fetch `catchSync` (pure . Left . fetchExceptionFailure url)
   where
-    fetch :: IO (Either Text BS.ByteString)
+    fetch :: IO (Either AttemptFailure BS.ByteString)
     fetch = do
       manager <- HTTPS.getGlobalManager
       request0 <- HTTP.parseRequest (T.unpack url)
       let request = withUserAgent request0
       HTTP.withResponse request manager $ \response -> do
-        let code = HTTP.statusCode (HTTP.responseStatus response)
-        if code /= httpStatusOk
-          then pure (Left ("HTTP " <> T.pack (show code) <> " fetching " <> url))
+        let status = HTTP.responseStatus response
+        if HTTP.statusCode status /= httpStatusOk
+          then pure (Left (fetchStatusFailure url status))
           else System.IO.withBinaryFile outPath System.IO.WriteMode $ \handle ->
             let consume !ctx = do
                   chunk <- HTTP.brRead (HTTP.responseBody response)
