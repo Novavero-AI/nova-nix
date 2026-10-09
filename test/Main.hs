@@ -27,6 +27,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
+import Data.Word (Word32)
 import qualified Database.SQLite.Simple as SQL
 import FetchurlFixture (withFetchurlServer)
 import Foreign.Ptr (castPtr)
@@ -43,8 +44,9 @@ import Nix.Eval (FetchCache (..), MonadEval (..), NixValue (..), StringContext (
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.AttrPath (parseAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
-import Nix.Eval.CBytecode (binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (appDeferred, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
+import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
@@ -2498,6 +2500,132 @@ testBlackhole = do
       runTestIO "rec { a = 1; b = a; }.b" tmpBase "rec { a = 1; b = a; }.b" (VInt 1),
       runTestIO "let a = 1; b = a + 1; in b" tmpBase "let a = 1; b = a + 1; in b" (VInt 2)
     ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval - Call depth (max-call-depth)
+-- ---------------------------------------------------------------------------
+
+-- | The issue's counter recursion to a given depth.
+counterRecursion :: Int -> Text
+counterRecursion n = "let f = n: if n == 0 then 0 else 1 + f (n - 1); in f " <> T.pack (show n)
+
+-- | The identity applied to itself syntactically @n@ deep: a chain of pure
+-- lambda frames with nothing else counted.
+lambdaNesting :: Int -> Text
+lambdaNesting n = "let f = x: x; in " <> T.replicate n "f (" <> "0" <> T.replicate n ")"
+
+-- | Upstream's message, which the CLI prints after its own "error: ".
+maxCallDepthMessage :: Text
+maxCallDepthMessage = "stack overflow; max-call-depth exceeded"
+
+-- | A result that must be the max-call-depth error, word for word.
+expectMaxCallDepth :: Text -> Either Text NixValue -> TestResult
+expectMaxCallDepth label result = case result of
+  Left err
+    | err == maxCallDepthMessage -> Pass
+    | otherwise -> Fail (label <> ": wrong error: " <> err)
+  Right val -> Fail (label <> ": expected the max-call-depth error but got: " <> T.pack (show val))
+
+-- | IO evaluation under an explicit call-depth ceiling.
+evalAtCeiling :: Word32 -> Text -> IO (Either Text NixValue)
+evalAtCeiling limit source = case parseNix "." "<test>" source of
+  Left err -> pure (Left (T.pack (show err)))
+  Right expr -> do
+    storeDir <- evalNixIOStoreDir
+    st0 <- newEvalState storeDir "."
+    let st = st0 {esCallDepth = topLevelCallDepth limit}
+    runEvalIO st (eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr)
+
+-- | The function-call nesting ceiling, upstream's max-call-depth (10000).
+-- Every boundary here was read off nix-instantiate 2.33.2 and the 2.24.9
+-- source: the count is the frames already active, checked on entry, so
+-- 10001 nested lambda calls pass and 10002 fail, and the counter
+-- recursion passes at 9999 and fails at 10000, its deepest frame being
+-- the @n - 1@ forced inside @f 0@, a builtin call upstream's parser
+-- desugars @-@ into.  The cases under a ceiling of 10 pin what costs a
+-- frame and what does not, each boundary taken from the same upstream.
+testCallDepth :: IO [Bool]
+testCallDepth = do
+  putStrLn "eval/call-depth"
+  sequence
+    [ failsIO "the issue expression is refused with upstream's words" (counterRecursion 100000),
+      runTestIO "the counter recursion one under the ceiling evaluates" "." (counterRecursion 9999) (VInt 9999),
+      failsIO "the counter recursion at the ceiling is refused" (counterRecursion 10000),
+      runTest "pure evaluation enforces the ceiling too" $
+        assertEval "pure-under" (lambdaNesting 10001) (VInt 0),
+      runTest "pure evaluation refuses past the ceiling with upstream's words" $
+        expectMaxCallDepth "pure-over" (evalNix (lambdaNesting 10002)),
+      -- Under a ceiling of n, n + 1 nested lambda calls pass and n + 2 fail.
+      passesAt 10 "lambda nesting one past the ceiling passes" (lambdaNesting 11) (VInt 0),
+      failsAt 10 "lambda nesting two past the ceiling fails" (lambdaNesting 12),
+      -- The operators upstream desugars into builtin calls cost a frame
+      -- while their operands are forced; its native operators cost none.
+      passesAt 10 "a subtraction at the ceiling passes" (wrapped 10 "1 - 1") (VInt 0),
+      failsAt 10 "a subtraction one past the ceiling fails" (wrapped 11 "1 - 1"),
+      failsAt 10 "a multiplication one past the ceiling fails" (wrapped 11 "2 * 1"),
+      failsAt 10 "a division one past the ceiling fails" (wrapped 11 "2 / 1"),
+      failsAt 10 "a less-than one past the ceiling fails" (wrapped 11 "1 < 2"),
+      failsAt 10 "a less-or-equal one past the ceiling fails" (wrapped 11 "1 <= 2"),
+      failsAt 10 "a greater-than one past the ceiling fails" (wrapped 11 "2 > 1"),
+      failsAt 10 "a greater-or-equal one past the ceiling fails" (wrapped 11 "2 >= 1"),
+      failsAt 10 "a negation one past the ceiling fails" (wrapped 11 "-1"),
+      passesAt 10 "an equality one past the ceiling passes" (wrapped 11 "1 == 1") (VBool True),
+      passesAt 10 "an inequality one past the ceiling passes" (wrapped 11 "1 != 2") (VBool True),
+      passesAt 10 "a not one past the ceiling passes" (wrapped 11 "!true") (VBool False),
+      passesAt 10 "an addition one past the ceiling passes" (wrapped 11 "1 + 1") (VInt 2),
+      passesAt 10 "a list concatenation one past the ceiling passes" (wrapped 11 "([1] ++ [2]) == [1 2]") (VBool True),
+      passesAt 10 "an attrset update one past the ceiling passes" (wrapped 11 "({ a = 1; } // { b = 2; }) == { a = 1; b = 2; }") (VBool True),
+      -- A builtin costs a frame even when partially applied.
+      failsAt 10 "a partially applied builtin one past the ceiling fails" (wrapped 11 "builtins.add 0"),
+      failsAt 10 "a builtin application one past the ceiling fails" (wrapped 11 "builtins.add 0 0"),
+      -- A functor costs two frames: its inner call is a callFunction of its own.
+      passesAt 10 "functor nesting of five passes" (functorNesting 5) (VInt 0),
+      failsAt 10 "functor nesting of six fails" (functorNesting 6),
+      -- A __toString coercion is a callFunction.
+      passesAt 10 "a __toString coercion at the ceiling passes" (wrapped 10 "\"${s}\"") (mkStr "a"),
+      failsAt 10 "a __toString coercion one past the ceiling fails" (wrapped 11 "\"${s}\""),
+      -- A higher-order builtin's callback is applied where its result is
+      -- forced, not inside the builtin's frame: upstream's prim_map returns
+      -- app values.  Forced by ==, which opens no frame, the callback at
+      -- the ceiling passes; forced by elemAt, a frame deeper, it is
+      -- elemAt's own call that fails.
+      passesAt 10 "a map callback forced at the ceiling passes" (wrapped 10 "(builtins.map f [ 0 ]) == [ 0 ]") (VBool True),
+      failsAt 10 "a map callback forced one past the ceiling fails" (wrapped 11 "(builtins.map f [ 0 ]) == [ 0 ]"),
+      passesAt 10 "an elemAt over map under the ceiling passes" (wrapped 9 "builtins.elemAt (builtins.map f [ 0 ]) 0") (VInt 0),
+      failsAt 10 "an elemAt over map at the ceiling fails" (wrapped 10 "builtins.elemAt (builtins.map f [ 0 ]) 0"),
+      -- mapAttrs and zipAttrsWith apply @f name@ a frame below the value
+      -- application: upstream builds two nested app values.
+      passesAt 10 "a mapAttrs callback under the ceiling passes" (wrapped 9 "(builtins.mapAttrs (n: v: v) { a = 0; }).a") (VInt 0),
+      failsAt 10 "a mapAttrs callback at the ceiling fails" (wrapped 10 "(builtins.mapAttrs (n: v: v) { a = 0; }).a"),
+      passesAt 10 "a zipAttrsWith callback under the ceiling passes" (wrapped 9 "(builtins.zipAttrsWith (n: vs: 0) [ { a = 1; } ]).a") (VInt 0),
+      failsAt 10 "a zipAttrsWith callback at the ceiling fails" (wrapped 10 "(builtins.zipAttrsWith (n: vs: 0) [ { a = 1; } ]).a"),
+      -- A sort by builtins.lessThan itself opens no frame per comparison
+      -- (upstream's prim_sort bypass); a lambda comparator costs its call
+      -- and the < inside it.
+      passesAt 10 "a sort by lessThan at the ceiling passes" (wrapped 10 "builtins.sort builtins.lessThan [ 2 1 ] == [ 1 2 ]") (VBool True),
+      failsAt 10 "a sort by lessThan one past the ceiling fails" (wrapped 11 "builtins.sort builtins.lessThan [ 2 1 ] == [ 1 2 ]"),
+      passesAt 10 "a sort by a lambda two under the ceiling passes" (wrapped 8 "builtins.sort (a: b: a < b) [ 2 1 ] == [ 1 2 ]") (VBool True),
+      failsAt 10 "a sort by a lambda one under the ceiling fails" (wrapped 9 "builtins.sort (a: b: a < b) [ 2 1 ] == [ 1 2 ]"),
+      passesAt 10 "the counter recursion to 9 passes under a ceiling of 10" (counterRecursion 9) (VInt 9),
+      failsAt 10 "the counter recursion to 10 fails under a ceiling of 10" (counterRecursion 10),
+      -- An eval error, not a throw: tryEval does not catch it.
+      failsAt 10 "tryEval does not catch the ceiling" ("(builtins.tryEval (" <> lambdaNesting 12 <> ")).success"),
+      -- A ceiling of 0 still admits one frame: the check is against the
+      -- frames already active when the call is entered.
+      passesAt 0 "one call passes under a ceiling of 0" "(x: x) 1" (VInt 1),
+      failsAt 0 "a nested call fails under a ceiling of 0" "(x: x) ((x: x) 1)",
+      passesAt 0 "a bare subtraction passes under a ceiling of 0" "1 - 1" (VInt 0),
+      failsAt 0 "a subtraction inside a call fails under a ceiling of 0" "(x: x - 1) 1"
+    ]
+  where
+    failsIO label source = evalNixIO "." source >>= runTest label . expectMaxCallDepth label
+    passesAt limit label source expected = do
+      result <- evalAtCeiling limit source
+      runTest label $ assertRight label result $ assertEqual label expected
+    failsAt limit label source = evalAtCeiling limit source >>= runTest label . expectMaxCallDepth label
+    wrapped n inner = scope <> T.replicate n "f (" <> inner <> T.replicate n ")"
+    functorNesting n = scope <> T.replicate n "g (" <> "0" <> T.replicate n ")"
+    scope = "let f = x: x; g = { __functor = self: x: x; }; s = { __toString = self: \"a\"; }; in "
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch D - toFile
@@ -10028,6 +10156,10 @@ instance MonadEval StubStoreEval where
     Left other -> Left other
     Right val -> Right (Right val)
   onEvalError (StubStoreEval action) _ = StubStoreEval action
+
+  -- The stub keeps no call depth: it exists to answer store questions,
+  -- and the ceiling is tested on the evaluators that enforce it.
+  withCallFrame (StubStoreEval action) = StubStoreEval action
   doesPathExist _ = pure False
   listDirectory _ = throwEvalError "readDir: not available in the stub evaluator"
   importFile _ = throwEvalError "import: not available in the stub evaluator"
@@ -10818,6 +10950,15 @@ testBytecodeCompile = do
               then Pass
               else Fail ("expected OpApp, got op=" <> T.pack (show op))
           ),
+      runTestM "compile EDeferredApp flags the OpApp as deferred" $ do
+        idx <- compileExpr (EDeferredApp (EVar "f") (ELit (NixInt 1)))
+        op <- cbcOpcode idx
+        flags <- cbcFlags idx
+        pure
+          ( if op == OpApp && flags == appDeferred
+              then Pass
+              else Fail ("expected a deferred OpApp, got op=" <> T.pack (show op) <> " flags=" <> T.pack (show flags))
+          ),
       runTestM "op_count grows after compilation" $ do
         before <- cbcOpCount
         _ <- compileExpr (EApp (EVar "f") (ELit (NixInt 1)))
@@ -11064,6 +11205,9 @@ testNixConfig = do
   putStrLn "config/nix-conf"
   let subs = fmap ncSubstituters . Config.resolveConfig
       keys = fmap ncTrustedPublicKeys . Config.resolveConfig
+      depth = fmap ncMaxCallDepth . Config.resolveConfig
+      depthOf value = depth ["max-call-depth = " <> value]
+      refused = either (const True) (const False) . depthOf
   sequence
     [ runTest "parses a whitespace-split substituters list" $
         assertEqual "subs" (Right ["https://a", "https://b"]) (subs ["substituters = https://a https://b"]),
@@ -11092,8 +11236,31 @@ testNixConfig = do
       runTest "an include directive is refused" $
         assertLeft "include" (Config.resolveConfig ["include /etc/nix/other.conf"]),
       runTest "the default config is empty" $
-        assertEqual "default" (Right []) (subs [])
+        assertEqual "default" (Right []) (subs []),
+      -- max-call-depth: a scalar under upstream's unsigned-integer grammar.
+      runTest "max-call-depth defaults to upstream's 10000" $
+        assertEqual "depth-default" (Right 10000) (depth []),
+      runTest "max-call-depth parses a decimal" $
+        assertEqual "depth-decimal" (Right 5) (depthOf "5"),
+      runTest "a higher source replaces max-call-depth" $
+        assertEqual "depth-replace" (Right 7) (depth ["max-call-depth = 5", "max-call-depth = 7"]),
+      runTest "max-call-depth takes a binary unit suffix in either case" $
+        assertEqual "depth-unit" (Right [10240, 5120, 1048576]) (traverse depthOf ["10K", "5k", "1M"]),
+      runTest "max-call-depth takes a leading plus and leading zeros" $
+        assertEqual "depth-plus" (Right [5, 7]) (traverse depthOf ["+5", "007"]),
+      runTest "max-call-depth accepts the top of unsigned int" $
+        assertEqual "depth-top" (Right 4294967295) (depthOf "4294967295"),
+      runTest "an invalid max-call-depth is refused with upstream's words" $
+        assertEqual "depth-invalid" (Left "setting 'max-call-depth' has invalid value 'abc'") (depthOf "abc"),
+      runTest "max-call-depth refuses a sign, a fraction, hex, an unknown unit, an empty value and a second token" $
+        assertEqual "depth-refused" (True, 6) (all refused rejects, length rejects),
+      runTest "max-call-depth refuses a value past unsigned int, a unit product included" $
+        assertEqual "depth-range" True (refused "4294967296" && refused "5G"),
+      runTest "extra-max-call-depth is an unknown name, not an append" $
+        assertEqual "depth-extra" (Right 10000) (depth ["extra-max-call-depth = 5"])
     ]
+  where
+    rejects = ["-1", "1.5", "0x10", "5X", "", "5 6"]
 
 -- | Narinfo field validation gates the pipeline ahead of the signed
 -- fingerprint: a malformed field must fail as a parse error before its
@@ -11366,6 +11533,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testBatchC,
           testBatchCIO,
           testBlackhole,
+          testCallDepth,
           testBatchD,
           testBatchE,
           testBatchEIO,

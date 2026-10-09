@@ -105,7 +105,7 @@ import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList (..), clistGet)
 import Nix.Eval.CThunk (CThunkPtr)
@@ -296,9 +296,13 @@ evalBytecode env bcIdx =
         OpUnary ->
           let flags_ = unsafePerformIO (cbcFlags bcIdx)
               operandIdx = unsafePerformIO (cbcArg1 bcIdx)
-           in do
-                val <- evalBytecode env operandIdx
-                evalUnary (decodeUnaryOp flags_) val
+              unop = decodeUnaryOp flags_
+              operate = evalBytecode env operandIdx >>= evalUnary unop
+           in case unop of
+                -- Upstream's parser turns @-e@ into @__sub 0 e@, a call
+                -- frame around the operand's forcing.
+                OpNegate -> withCallFrame operate
+                OpNot -> operate
         OpBinary -> evalBcBinary env bcIdx
         OpSearchPath ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
@@ -338,26 +342,51 @@ decodeBinaryOp 14 = OpUpdate
 -- only emits 0..14.
 decodeBinaryOp n = error ("decodeBinaryOp: unknown tag " <> show n)
 
+-- | Whether upstream's parser desugars the operator into a builtin call
+-- (@__sub@, @__mul@, @__div@ or @__lessThan@; parser.y at 2.24.9), which
+-- then costs a call frame while its operands are forced.  The others are
+-- @Expr@ nodes of their own there and cost nothing.
+desugaredToCall :: BinaryOp -> Bool
+desugaredToCall op = case op of
+  OpSub -> True
+  OpMul -> True
+  OpDiv -> True
+  OpLt -> True
+  OpLte -> True
+  OpGt -> True
+  OpGte -> True
+  OpAdd -> False
+  OpAnd -> False
+  OpOr -> False
+  OpImpl -> False
+  OpEq -> False
+  OpNeq -> False
+  OpConcat -> False
+  OpUpdate -> False
+
 -- | Evaluate a binary operation from bytecode, with short-circuit
 -- support for &&, ||, ->.
 evalBcBinary :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcBinary env bcIdx0 =
-  let flags_ = unsafePerformIO (cbcFlags bcIdx0)
-      leftIdx = unsafePerformIO (cbcArg1 bcIdx0)
-      rightIdx = unsafePerformIO (cbcArg2 bcIdx0)
-      op = decodeBinaryOp flags_
-   in case op of
-        OpAnd -> evalShortCircuitAnd env leftIdx rightIdx
-        OpOr -> evalShortCircuitOr env leftIdx rightIdx
-        OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
-        OpAdd -> do
-          leftVal <- evalBytecode env leftIdx
-          rightVal <- evalBytecode env rightIdx
-          evalAddWithCoercion leftVal rightVal
-        _ -> do
-          leftVal <- evalBytecode env leftIdx
-          rightVal <- evalBytecode env rightIdx
-          evalBinary force op leftVal rightVal
+evalBcBinary env bcIdx0 = case op of
+  OpAnd -> evalShortCircuitAnd env leftIdx rightIdx
+  OpOr -> evalShortCircuitOr env leftIdx rightIdx
+  OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
+  OpAdd -> do
+    leftVal <- evalBytecode env leftIdx
+    rightVal <- evalBytecode env rightIdx
+    evalAddWithCoercion leftVal rightVal
+  _
+    | desugaredToCall op -> withCallFrame operate
+    | otherwise -> operate
+  where
+    flags_ = unsafePerformIO (cbcFlags bcIdx0)
+    leftIdx = unsafePerformIO (cbcArg1 bcIdx0)
+    rightIdx = unsafePerformIO (cbcArg2 bcIdx0)
+    op = decodeBinaryOp flags_
+    operate = do
+      leftVal <- evalBytecode env leftIdx
+      rightVal <- evalBytecode env rightIdx
+      evalBinary force op leftVal rightVal
 
 -- | Addition with string coercion fallback, matching C++ Nix behavior.
 -- C++ Nix's ExprOpAdd falls through to concatStrings when operands
@@ -540,39 +569,45 @@ evalBcList env bcIdx0 =
          in cheapThunkBc env childIdx : readChildren (n - 1) (off + 1)
    in pure (VList (clistFromThunks (map thunkToCPtr (readChildren count dataOff))))
 
--- | Evaluate a function application from bytecode.
+-- | Evaluate a function application from bytecode.  A source application
+-- ('EApp') evaluates the function position outside the call frame and
+-- everything after it inside, as upstream's @ExprCall::eval@ evaluates
+-- @fun@ before @callFunction@ opens the frame.  A builtin's deferred
+-- application ('EDeferredApp') opens the frame first and forces the
+-- function inside it, as upstream's @forceValue@ on an app value is a
+-- @callFunction@ that forces the function after the depth check.
 evalBcApp :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcApp env bcIdx0 = do
-  let funcIdx = unsafePerformIO (cbcArg1 bcIdx0)
-      argIdx = unsafePerformIO (cbcArg2 bcIdx0)
-  funcVal <- evalBytecode env funcIdx
-  case funcVal of
-    VLambda closureEnv formals bodyBcIdx -> do
-      let argThunk = cheapThunkBc env argIdx
-      extEnv <- matchFormals closureEnv formals argThunk
-      evalBytecode extEnv bodyBcIdx
-    VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
-    VBuiltin name accArgs -> do
-      argVal <- evalBytecode env argIdx
-      applyBuiltin name accArgs argVal
-    VAttrs attrs
-      | Just functorThunk <- attrSetLookup "__functor" attrs -> do
-          functor <- force functorThunk
-          partiallyApplied <- applyValue functor funcVal
-          -- Maintain laziness: thunk the argument for lambdas, like
-          -- the normal VLambda path above.  Builtins force anyway.
-          case partiallyApplied of
-            VLambda closureEnv formals bodyBcIdx -> do
-              let argThunk = cheapThunkBc env argIdx
-              extEnv <- matchFormals closureEnv formals argThunk
-              evalBytecode extEnv bodyBcIdx
-            -- A functor returning tryEval keeps the catch around the
-            -- argument's evaluation, like the direct arm above.
-            VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
-            _ -> do
-              argVal <- evalBytecode env argIdx
-              applyValue partiallyApplied argVal
-    _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
+evalBcApp env bcIdx0
+  | flags_ == appDeferred = withCallFrame (evalBytecode env funcIdx >>= callBc env argIdx)
+  | otherwise = evalBytecode env funcIdx >>= withCallFrame . callBc env argIdx
+  where
+    flags_ = unsafePerformIO (cbcFlags bcIdx0)
+    funcIdx = unsafePerformIO (cbcArg1 bcIdx0)
+    argIdx = unsafePerformIO (cbcArg2 bcIdx0)
+
+-- | Apply an evaluated function to the argument at a bytecode index,
+-- inside the caller's frame.  The argument stays a thunk for a lambda
+-- (the normal laziness) and is forced for a builtin, which forces anyway.
+callBc :: (MonadEval m) => Env -> Word32 -> NixValue -> m NixValue
+callBc env argIdx funcVal = case funcVal of
+  VLambda closureEnv formals bodyBcIdx -> do
+    let argThunk = cheapThunkBc env argIdx
+    extEnv <- matchFormals closureEnv formals argThunk
+    evalBytecode extEnv bodyBcIdx
+  VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
+  VBuiltin name accArgs -> do
+    argVal <- evalBytecode env argIdx
+    applyBuiltin name accArgs argVal
+  VAttrs attrs
+    | Just functorThunk <- attrSetLookup "__functor" attrs -> do
+        functor <- force functorThunk
+        -- Upstream applies the functor to itself and to the argument in
+        -- one nested callFunction, so both bodies run a frame below this
+        -- one: 'applyValue' opens that frame for the self application,
+        -- and the recursion opens it again for the argument.
+        partiallyApplied <- applyValue functor funcVal
+        withCallFrame (callBc env argIdx partiallyApplied)
+  _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
 
 -- | @builtins.tryEval@ over an argument's evaluation: @{ success, value }@
 -- with catchable errors (throw, failed assert - the only kinds
@@ -1367,15 +1402,20 @@ compiledRegexArg pat = case cachedCompileRegex pat of
   Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
   Nothing -> [VStr pat emptyContext]
 
--- | Apply a function value (lambda or builtin) to one argument.
--- Used by higher-order builtins to invoke user-supplied functions.
+-- | Apply a function value (lambda or builtin) to one argument, in a call
+-- frame of its own.  Used by higher-order builtins to invoke
+-- user-supplied functions.
 applyValue :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-applyValue (VLambda closureEnv formals bodyBcIdx) arg = do
+applyValue fun arg = withCallFrame (applyForced fun arg)
+
+-- | 'applyValue' inside the caller's frame.
+applyForced :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+applyForced (VLambda closureEnv formals bodyBcIdx) arg = do
   extEnv <- matchFormals closureEnv formals (evaluated arg)
   evalBytecode extEnv bodyBcIdx
-applyValue (VBuiltin name accArgs) arg =
+applyForced (VBuiltin name accArgs) arg =
   applyBuiltin name accArgs arg
-applyValue other _ =
+applyForced other _ =
   throwEvalError ("attempt to call " <> typeName other <> ", which is not a function")
 
 -- | Apply a function value to an UNFORCED thunk argument.  Upstream's
@@ -1386,16 +1426,20 @@ applyValue other _ =
 -- arguments regardless), and set-pattern formals force on destructuring
 -- exactly as upstream does.
 applyValueLazy :: (MonadEval m) => NixValue -> Thunk -> m NixValue
-applyValueLazy (VLambda closureEnv formals bodyBcIdx) argThunk = do
+applyValueLazy fun argThunk = withCallFrame (applyUnforced fun argThunk)
+
+-- | 'applyValueLazy' inside the caller's frame.
+applyUnforced :: (MonadEval m) => NixValue -> Thunk -> m NixValue
+applyUnforced (VLambda closureEnv formals bodyBcIdx) argThunk = do
   extEnv <- matchFormals closureEnv formals argThunk
   evalBytecode extEnv bodyBcIdx
 -- tryEval's catch must wrap the argument's forcing (see 'tryEvalAction'):
 -- map/filter passing a throwing element to tryEval yields success = false,
 -- not an escaped error.
-applyValueLazy (VBuiltin "tryEval" []) argThunk = tryEvalAction (force argThunk)
-applyValueLazy other argThunk = do
+applyUnforced (VBuiltin "tryEval" []) argThunk = tryEvalAction (force argThunk)
+applyUnforced other argThunk = do
   val <- force argThunk
-  applyValue other val
+  applyForced other val
 
 -- | Execute a builtin once all arguments are collected.
 --
@@ -1819,7 +1863,7 @@ builtinGenList func (VInt n)
       let fnThunk = evaluated func
           (sp, sc) = buildCSlots [fnThunk]
           env = newMinimalEnv sp sc
-          mkIndexThunk i = mkThunk env (EApp (EResolvedVar 0 0) (ELit (NixInt i)))
+          mkIndexThunk i = mkThunk env (EDeferredApp (EResolvedVar 0 0) (ELit (NixInt i)))
        in pure (VList (clistFromThunks (map (thunkToCPtr . mkIndexThunk) [0 .. n - 1])))
 builtinGenList _ other =
   throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
@@ -1828,37 +1872,45 @@ builtinSort :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSort comparator (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   vals <- mapM force thunks
-  sorted <- mergeSort comparator vals
+  sorted <- mergeSort (sortComparison comparator) vals
   pure (VList (clistFromThunks (map (thunkToCPtr . evaluated) sorted)))
 builtinSort _ other =
   throwEvalError ("builtins.sort: expected a list, got " <> typeName other)
 
--- | Stable O(n log n) merge sort using a user-supplied comparator.
--- The comparator takes two args (curried) and returns bool.
-mergeSort :: (MonadEval m) => NixValue -> [NixValue] -> m [NixValue]
+-- | The comparison a sort runs between two elements.  A bare
+-- @builtins.lessThan@ compares directly, as upstream's @prim_sort@
+-- bypasses @callFunction@ for it (primops.cc at 2.24.9) and so opens no
+-- call frame; any other comparator is applied as a function, one frame
+-- per application.
+sortComparison :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
+sortComparison (VBuiltin "lessThan" []) a b = builtinLessThan a b
+sortComparison cmp a b = applyValue cmp a >>= (`applyValue` b)
+
+-- | Stable O(n log n) merge sort under a comparison answering whether its
+-- first argument is strictly less than its second.
+mergeSort :: (MonadEval m) => (NixValue -> NixValue -> m NixValue) -> [NixValue] -> m [NixValue]
 mergeSort _ [] = pure []
 mergeSort _ [x] = pure [x]
-mergeSort cmp xs = do
+mergeSort isLess xs = do
   let half = length xs `div` 2
       (left, right) = splitAt half xs
-  sortedLeft <- mergeSort cmp left
-  sortedRight <- mergeSort cmp right
-  mergeSorted cmp sortedLeft sortedRight
+  sortedLeft <- mergeSort isLess left
+  sortedRight <- mergeSort isLess right
+  mergeSorted isLess sortedLeft sortedRight
 
-mergeSorted :: (MonadEval m) => NixValue -> [NixValue] -> [NixValue] -> m [NixValue]
+mergeSorted :: (MonadEval m) => (NixValue -> NixValue -> m NixValue) -> [NixValue] -> [NixValue] -> m [NixValue]
 mergeSorted _ [] ys = pure ys
 mergeSorted _ xs [] = pure xs
-mergeSorted cmp (x : xs) (y : ys) = do
+mergeSorted isLess (x : xs) (y : ys) = do
   -- Stable merge: take the right element only when it is STRICTLY less than the
-  -- left (@cmp y x@).  On a tie - neither strictly less - take the left element,
-  -- so comparator-equal elements keep their input order, matching C++ Nix's
-  -- std::stable_sort.  (Comparing @cmp x y@ instead would emit @y@ on a tie and
-  -- reverse equal runs.)
-  partial <- applyValue cmp y
-  result <- applyValue partial x
+  -- left (@isLess y x@).  On a tie - neither strictly less - take the left
+  -- element, so comparator-equal elements keep their input order, matching C++
+  -- Nix's std::stable_sort.  (Comparing @isLess x y@ instead would emit @y@ on
+  -- a tie and reverse equal runs.)
+  result <- isLess y x
   case result of
-    VBool True -> (y :) <$> mergeSorted cmp (x : xs) ys
-    VBool False -> (x :) <$> mergeSorted cmp xs (y : ys)
+    VBool True -> (y :) <$> mergeSorted isLess (x : xs) ys
+    VBool False -> (x :) <$> mergeSorted isLess xs (y : ys)
     _ -> throwEvalError "builtins.sort: comparator must return a bool"
 
 builtinConcatMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
@@ -2068,8 +2120,8 @@ builtinSubstring _ _ other =
 
 -- | Build a thunk that defers @f arg@ - the application only happens when
 -- the thunk is forced.  Reuses the existing eval machinery via a synthetic
--- @EApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in a self-contained env.
--- Slot 0 = function, slot 1 = argument.
+-- @EDeferredApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in a self-contained
+-- env, upstream's @mkApp@.  Slot 0 = function, slot 1 = argument.
 deferApply :: NixValue -> Thunk -> Thunk
 deferApply func argThunk =
   let (sp, sc) = buildCSlots [evaluated func, argThunk]
@@ -2078,7 +2130,7 @@ deferApply func argThunk =
 
 -- | Shared expression for 'deferApply'.  Allocated once as a CAF.
 deferApplyExpr :: Expr
-deferApplyExpr = EApp (EResolvedVar 0 0) (EResolvedVar 0 1)
+deferApplyExpr = EDeferredApp (EResolvedVar 0 0) (EResolvedVar 0 1)
 {-# NOINLINE deferApplyExpr #-}
 
 -- | Permissive coercion used by @builtins.toString@.
@@ -2494,9 +2546,12 @@ builtinMapAttrs func (VAttrs attrs) =
 builtinMapAttrs _ other =
   throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
 
--- | Shared expression for 'builtinMapAttrs'.  Allocated once as a CAF.
+-- | Shared expression for 'builtinMapAttrs' and 'builtinZipAttrsWith'.
+-- Allocated once as a CAF.  Two nested deferred applications, as upstream
+-- builds @f name value@ from two nested @mkApp@s, so the name application
+-- runs a frame below the value application's.
 mapAttrsExpr :: Expr
-mapAttrsExpr = EApp (EApp (EResolvedVar 0 0) (EResolvedVar 0 1)) (EResolvedVar 0 2)
+mapAttrsExpr = EDeferredApp (EDeferredApp (EResolvedVar 0 0) (EResolvedVar 0 1)) (EResolvedVar 0 2)
 {-# NOINLINE mapAttrsExpr #-}
 
 -- | Formals for lambdas, an empty set for builtins, an error otherwise -

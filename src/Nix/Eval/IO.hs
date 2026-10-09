@@ -50,6 +50,7 @@ import Nix.Derivation (fromATerm)
 import Nix.Eval (eval)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
+import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
@@ -130,12 +131,20 @@ data EvalState = EvalState
     -- writes honor @--store@ the same way the builder does.
     esStoreDir :: !SP.StoreDir,
     esTimestamp :: !Int64,
-    esSearchPaths :: ![Thunk]
+    esSearchPaths :: ![Thunk],
+    -- | The call frames active around the current evaluation and the
+    -- @max-call-depth@ ceiling.  Per frame like 'esBaseDir':
+    -- 'withCallFrame' scopes it with 'local', so a failure unwinding
+    -- through a frame leaves the count it found, upstream's RAII guard
+    -- with nothing to restore.
+    esCallDepth :: !CallDepth
   }
 
 -- | Create a fresh evaluation state rooted at the given directory, reading
 -- and writing store objects under the given store directory.
--- Reads @NIX_PATH@ from the environment to populate search paths.
+-- Reads @NIX_PATH@ from the environment to populate search paths.  The
+-- call-depth ceiling starts at upstream's default; a caller with a
+-- configured one replaces 'esCallDepth'.
 newEvalState :: SP.StoreDir -> FilePath -> IO EvalState
 newEvalState storeDir baseDir = do
   cache <- newIORef Map.empty
@@ -158,7 +167,8 @@ newEvalState storeDir baseDir = do
         esBaseDir = baseDir,
         esStoreDir = storeDir,
         esTimestamp = now,
-        esSearchPaths = searchPaths
+        esSearchPaths = searchPaths,
+        esCallDepth = topLevelCallDepth defaultMaxCallDepth
       }
 
 -- ---------------------------------------------------------------------------
@@ -194,6 +204,13 @@ instance MonadEval EvalIO where
   onEvalError (EvalIO action) (EvalIO cleanup) = EvalIO $ do
     st <- ask
     liftIO (runReaderT action st `onException` runReaderT cleanup st)
+
+  withCallFrame (EvalIO action) = EvalIO $ do
+    depth <- asks esCallDepth
+    either
+      (unEvalIO . throwEvalError)
+      (\deeper -> local (\s -> s {esCallDepth = deeper}) action)
+      (enterCallFrame depth)
 
   doesPathExist path = evalStoreTextPath path >>= \resolved -> wrapIO (Dir.doesPathExist resolved)
 

@@ -111,6 +111,7 @@ module Nix.Eval.Types
 where
 
 import Control.Monad (forM_)
+import Control.Monad.Reader (ReaderT (..), lift)
 import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -136,6 +137,7 @@ import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cen
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
@@ -1177,6 +1179,15 @@ class (Monad m) => MonadEval m where
   -- failed fetch is an eval error.
   onEvalError :: m a -> m () -> m a
 
+  -- | Run an application one call frame deeper, or refuse it with
+  -- upstream's "stack overflow; max-call-depth exceeded" when the frames
+  -- already active exceed the ceiling ('Nix.Eval.CallDepth.enterCallFrame'
+  -- is the rule).  An eval error, not a throw: upstream raises an
+  -- EvalError, which its tryEval does not catch.  The frame ends with the
+  -- action, on failure too, so an error unwinding through a tryEval
+  -- leaves the count that tryEval was entered at.
+  withCallFrame :: m a -> m a
+
   doesPathExist :: Text -> m Bool
 
   -- | List a directory, returning @(name, fileType)@ pairs.
@@ -1352,29 +1363,36 @@ storePathOrThrow context =
 -- escape it, exactly as in C++ Nix.
 data PureError = PThrow !Text | PError !Text | PAbort !Text
 
--- | Pure evaluation monad - wraps @Either PureError@.
--- IO builtins ('readFile', 'import') are unavailable;
--- everything else evaluates identically to the IO version.
-newtype PureEval a = PureEval (Either PureError a)
+-- | Pure evaluation monad - @Either PureError@ under a reader carrying
+-- the call depth.  IO builtins ('readFile', 'import') are unavailable;
+-- everything else evaluates identically to the IO version, the
+-- @max-call-depth@ ceiling included, at its upstream default.
+newtype PureEval a = PureEval (ReaderT CallDepth (Either PureError) a)
   deriving (Functor, Applicative, Monad)
+
+-- | Fail a pure evaluation.
+pureFailure :: PureError -> PureEval a
+pureFailure = PureEval . lift . Left
 
 -- | Run a pure evaluation, flattening the internal error into 'Text'.  An abort
 -- is prefixed @\"evaluation aborted: \"@, matching 'EvalIO'.
 runPureEval :: PureEval a -> Either Text a
-runPureEval (PureEval (Right a)) = Right a
-runPureEval (PureEval (Left (PThrow t))) = Left t
-runPureEval (PureEval (Left (PError t))) = Left t
-runPureEval (PureEval (Left (PAbort t))) = Left ("evaluation aborted: " <> t)
+runPureEval (PureEval action) =
+  case runReaderT action (topLevelCallDepth defaultMaxCallDepth) of
+    Right a -> Right a
+    Left (PThrow t) -> Left t
+    Left (PError t) -> Left t
+    Left (PAbort t) -> Left ("evaluation aborted: " <> t)
 
 instance MonadEval PureEval where
-  throwEvalError msg = PureEval (Left (PError msg))
-  throwCatchableError msg = PureEval (Left (PThrow msg))
-  abortEvaluation msg = PureEval (Left (PAbort msg))
+  throwEvalError = pureFailure . PError
+  throwCatchableError = pureFailure . PThrow
+  abortEvaluation = pureFailure . PAbort
 
   -- Catch only a throw/assert (tryEval sees the error); eval errors,
   -- aborts, and infinite recursion propagate, matching EvalIO and C++ Nix.
   catchEvalError (PureEval action) =
-    PureEval $ case action of
+    PureEval $ ReaderT $ \depth -> case runReaderT action depth of
       Left (PThrow t) -> Right (Left t)
       Left other -> Left other
       Right a -> Right (Right a)
@@ -1382,6 +1400,11 @@ instance MonadEval PureEval where
   -- Pure evaluation has no external state, so there is nothing to
   -- clean up; the failure passes through unchanged.
   onEvalError (PureEval action) _ = PureEval action
+
+  -- The reader scopes the frame: the action runs one deeper, and whatever
+  -- follows it sees the depth it started from, failure or not.
+  withCallFrame (PureEval action) =
+    PureEval $ ReaderT $ \depth -> either (Left . PError) (runReaderT action) (enterCallFrame depth)
   doesPathExist _ = pure False
   listDirectory _ = throwEvalError "builtins.readDir: not available in pure evaluation"
   importFile _ = throwEvalError "import: not available in pure evaluation"

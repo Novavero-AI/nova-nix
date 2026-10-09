@@ -61,6 +61,7 @@ library
     Nix.Parser.Lexer
     Nix.Parser.ParseError
     Nix.Eval
+    Nix.Eval.CallDepth
     Nix.Eval.CanonPath
     Nix.Eval.Context
     Nix.Eval.Types

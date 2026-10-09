@@ -69,6 +69,7 @@ trimExpr expr = case expr of
   EHasAttr target path ->
     EHasAttr (trimExpr target) (map trimKey path)
   EApp f x -> EApp (trimExpr f) (trimExpr x)
+  EDeferredApp f x -> EDeferredApp (trimExpr f) (trimExpr x)
   ELambda formals body captures ->
     -- First, recursively trim nested lambdas in the body.
     let trimmedFormals = trimFormals formals
@@ -218,10 +219,8 @@ collectFreeVars depth expr = case expr of
     let (vs1, h1, w1) = collectFreeVars depth target
         (vs2, h2, w2) = foldKeys depth path
      in (Set.union vs1 vs2, h1 || h2, w1 || w2)
-  EApp f x ->
-    let (vs1, h1, w1) = collectFreeVars depth f
-        (vs2, h2, w2) = collectFreeVars depth x
-     in (Set.union vs1 vs2, h1 || h2, w1 || w2)
+  EApp f x -> foldExprs depth [f, x]
+  EDeferredApp f x -> foldExprs depth [f, x]
   ELambda formals body_ captures ->
     -- Nested lambda creates a LexicalScope (depth + 1).
     -- If the inner lambda was already trimmed (has Captures), its capture
@@ -356,6 +355,8 @@ rewriteBody depth captureMap expr = case expr of
       (map (rewriteKey depth captureMap) path)
   EApp f x ->
     EApp (rewriteBody depth captureMap f) (rewriteBody depth captureMap x)
+  EDeferredApp f x ->
+    EDeferredApp (rewriteBody depth captureMap f) (rewriteBody depth captureMap x)
   ELambda formals body_ captures ->
     ELambda
       (rewriteFormals (depth + 1) captureMap formals)
