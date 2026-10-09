@@ -18,6 +18,10 @@
 -- Windows, where 'System.FilePath.splitDrive' would not see a bare @\/@ as
 -- rooted.  A relative input stays relative: leading @..@ segments are kept,
 -- and a fully-collapsed relative path is @.@.
+--
+-- "Nix.Config" reuses 'canonPath' for the native paths its includes and
+-- @NIX_CONF_DIR@ name, splitting the drive off first, since a native
+-- path has one where a path value does not.
 module Nix.Eval.CanonPath
   ( canonPath,
     canonPathValue,

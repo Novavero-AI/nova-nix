@@ -5,11 +5,31 @@
 -- == The format
 --
 -- One @name = value@ assignment per line.  A @#@ truncates the rest of the
--- line (a comment).  A list value is whitespace separated.  These are the
--- rules upstream's @parseConfigFiles@ applies (comment truncation, no line
--- continuation, whitespace tokenizing), matched here.  An integer value is
--- upstream's too ('parseUnsignedSetting'): decimal digits, an optional
--- leading @+@, and an optional binary unit suffix (@K@, @M@, @G@, @T@).
+-- line (a comment).  A list value is whitespace separated.  An @include@
+-- or @!include@ line splices another file in at that position: the path
+-- is resolved against the directory of the file being parsed, and the two
+-- forms differ only in that @!include@ goes on without a file that cannot
+-- be read.  These are the rules upstream's @parseConfigFiles@ applies
+-- (@config.cc@ at 2.24.9: comment truncation, no line continuation,
+-- whitespace tokenizing, inline include expansion), matched here.  An
+-- integer value is upstream's too ('parseUnsignedSetting'): decimal
+-- digits, an optional leading @+@, and an optional binary unit suffix
+-- (@K@, @M@, @G@, @T@).
+--
+-- == Where the files are
+--
+-- Upstream's @loadConfFile@ (@globals.cc@) reads, weakest first: the system
+-- file @$NIX_CONF_DIR\/nix.conf@, by default under the platform's
+-- machine-wide config directory (@\/etc\/nix@ where upstream runs), the
+-- directory having to be absolute and being collapsed lexically as the
+-- @Settings@ constructor runs it through @canonPath@; the user files,
+-- which are @$NIX_USER_CONF_FILES@ when that is set and otherwise
+-- @nix\/nix.conf@ under the XDG config home and then under each
+-- @XDG_CONFIG_DIRS@ entry, applied back to front so the first listed wins;
+-- then @NIX_CONFIG@.  'configFilePaths' computes that order from the
+-- environment and the platform's directories, which the caller looks up
+-- (this module holds no platform literal), and 'loadConfig' reads and
+-- folds it.
 --
 -- == Precedence
 --
@@ -27,35 +47,65 @@
 -- accepted under.  The precedence is therefore load bearing: a source that
 -- REPLACES the trusted set where it should APPEND, or an @extra-@ that is
 -- mishandled, silently widens what the machine trusts.  The fold here is
--- pure and total so the whole rule set can be tested directly.
+-- pure and total so the whole rule set can be tested directly, and the
+-- include expander is written over a file-reading effect
+-- ('ReadConfigFile') for the same reason.
 --
--- Not yet modelled (tracked separately): @include@ \/ @!include@
--- directives, the @\/etc\/nix@ system file and the @XDG_CONFIG_DIRS@
--- cascade.  A line opening with @include@ is refused loudly rather than
--- silently skipped, so a config that depends on one fails visibly.
+-- One deliberate divergence: upstream silently drops an @include@ whose
+-- file exists but cannot be read (its own TODO questions that).  Here a
+-- required include that cannot be read is an error, because the only
+-- thing @include@ promises over @!include@ is to fail when the file is
+-- unusable, and an include is where a site narrows the substituter or
+-- trusted-key set; dropping it leaves the wider set in force.  The reader
+-- therefore reports which of the two happened ('ConfigReadFailure'), so a
+-- missing include is reported in upstream's words and an unreadable one
+-- in its own.
 module Nix.Config
   ( -- * Resolved settings
     NixConfig (..),
     defaultNixConfig,
 
+    -- * Where the files are
+    ConfigLocations (..),
+    configFilePaths,
+    nixConfFileName,
+    nixConfDirName,
+
+    -- * Sources and includes
+    ConfigSource (..),
+    nixConfigSourceName,
+    ConfigReadFailure (..),
+    ReadConfigFile,
+    loadConfig,
+    expandConfigSource,
+
     -- * Parsing and folding
+    ConfigLine (..),
+    IncludeMode (..),
     ConfigAssignment (..),
-    parseConfigText,
+    parseConfigLines,
     parseUnsignedSetting,
     applyAssignment,
-    applyConfigText,
     resolveConfig,
   )
 where
 
-import Control.Monad (foldM)
+import Control.Applicative ((<|>))
+import Control.Monad (foldM, mfilter, when)
+import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError)
+import Control.Monad.Trans (lift)
 import Data.Char (toUpper)
-import Data.Maybe (fromMaybe)
+import Data.Either (rights)
+import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.List.NonEmpty as NE
+import Data.Maybe (fromMaybe, maybeToList)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Read as TR
 import Data.Word (Word32)
 import Nix.Eval.CallDepth (defaultMaxCallDepth)
+import Nix.Eval.CanonPath (canonPath)
+import System.FilePath (isAbsolute, isPathSeparator, searchPathSeparator, splitDrive, takeDirectory, (</>))
 
 -- ---------------------------------------------------------------------------
 -- Settings
@@ -91,8 +141,205 @@ defaultNixConfig =
     }
 
 -- ---------------------------------------------------------------------------
+-- Where the files are
+-- ---------------------------------------------------------------------------
+
+-- | The environment that decides which files are read.  The two variables
+-- are carried raw, as 'System.Environment.lookupEnv' returns them,
+-- because upstream reads them differently: an empty @NIX_CONF_DIR@ is
+-- unset (@getEnvNonEmpty@), while an empty @NIX_USER_CONF_FILES@ is set
+-- and names no files at all.  The directories arrive resolved, since the
+-- platform defaults behind them (where the machine-wide config directory
+-- is, what the XDG config home and dirs fall back to) are the caller's to
+-- look up.
+data ConfigLocations = ConfigLocations
+  { -- | @NIX_CONF_DIR@.
+    clConfDir :: !(Maybe String),
+    -- | The platform's machine-wide config directory, where the system
+    -- file is unless @NIX_CONF_DIR@ moves it; 'Nothing' on a platform
+    -- that names none, and then there is no system file to read.
+    clSystemConfDir :: !(Maybe FilePath),
+    -- | @NIX_USER_CONF_FILES@.
+    clUserConfFiles :: !(Maybe String),
+    -- | The XDG config home.
+    clConfigHome :: !FilePath,
+    -- | The XDG config dirs, first entry strongest.
+    clConfigDirs :: ![FilePath]
+  }
+  deriving (Eq, Show)
+
+-- | The config files to read, weakest first: the system file, under
+-- @NIX_CONF_DIR@ when that is set and non-empty and otherwise under the
+-- platform's machine-wide directory (no file at all when the platform has
+-- none); then the user files in reverse of the order upstream lists them,
+-- since @loadConfFile@ walks @nixUserConfFiles@ back to front
+-- (globals.cc:139) so that the first listed, the config home, wins.
+-- The system directory goes through 'canonicalAbsolutePath', as upstream's
+-- @Settings@ constructor runs it through @canonPath@ (globals.cc:65): a
+-- relative one is refused, and @.@ and @..@ in it collapse, so the file
+-- is named canonically wherever it is reported and its includes resolve
+-- against the collapsed directory.  The user files are read as named;
+-- upstream canonicalizes none of them.
+-- @NIX_USER_CONF_FILES@ replaces the XDG list outright, in its own order.
+-- It is split on the platform's list separator with empty entries dropped
+-- as upstream's tokenizer drops them; upstream splits on @:@ on every
+-- platform, which cannot carry a Windows drive letter, so @;@ is honoured
+-- there as it is for @PATH@ and @XDG_CONFIG_DIRS@.
+configFilePaths :: ConfigLocations -> Either Text [FilePath]
+configFilePaths locations = do
+  systemDir <- traverse canonicalAbsolutePath (mfilter (not . null) (clConfDir locations) <|> clSystemConfDir locations)
+  pure (maybeToList ((</> nixConfFileName) <$> systemDir) ++ reverse userFiles)
+  where
+    userFiles = case clUserConfFiles locations of
+      Just listed -> splitListVar listed
+      Nothing -> map underXdgDir (clConfigHome locations : clConfigDirs locations)
+    underXdgDir dir = dir </> nixConfDirName </> nixConfFileName
+
+-- | Split a path-list variable on the platform's list separator, dropping
+-- empty entries.
+splitListVar :: String -> [FilePath]
+splitListVar = filter (not . null) . splitOn
+  where
+    splitOn text = case break (== searchPathSeparator) text of
+      (item, []) -> [item]
+      (item, _ : rest) -> item : splitOn rest
+
+-- | The file name every source directory is read under.
+nixConfFileName :: FilePath
+nixConfFileName = "nix.conf"
+
+-- | The directory @nix.conf@ sits in beneath a config directory: @nix@
+-- under each XDG directory (@getUserConfigFiles@) and under @sysconfdir@
+-- for the system file (libstore's meson.build at 2.24.9).
+nixConfDirName :: FilePath
+nixConfDirName = "nix"
+
+-- ---------------------------------------------------------------------------
+-- Sources and includes
+-- ---------------------------------------------------------------------------
+
+-- | One source of config text and the name it is reported under: a file's
+-- path, or 'nixConfigSourceName' for the environment variable.  The name
+-- also anchors relative includes, so a source that is not a file cannot
+-- include relatively; upstream passes the literal @NIX_CONFIG@ as the
+-- path and its @canonPath@ refuses the @.\/x@ that results.
+data ConfigSource = ConfigSource
+  { csName :: !FilePath,
+    csText :: !Text
+  }
+  deriving (Eq, Show)
+
+-- | The name upstream applies the @NIX_CONFIG@ text under.
+nixConfigSourceName :: FilePath
+nixConfigSourceName = "NIX_CONFIG"
+
+-- | Why a file could not be read: there is nothing at the path, or there
+-- is and it cannot be read (a directory, a permission refusal).  Upstream
+-- tells the two apart with @pathExists@ before @readFile@; here the
+-- distinction decides only how a failed @include@ is reported.
+data ConfigReadFailure = ConfigFileMissing | ConfigFileUnreadable
+  deriving (Eq, Show)
+
+-- | How the expander reads a file: its text, or why it could not be read.
+-- A function so the expander runs over an in-memory map in tests and over
+-- the filesystem in the CLI.
+type ReadConfigFile m = FilePath -> m (Either ConfigReadFailure Text)
+
+-- | Read, expand and fold the whole configuration: the files at the given
+-- paths, weakest first (one that cannot be read is simply absent, as
+-- upstream's @applyConfigFile@ treats a @SystemError@), then the
+-- @NIX_CONFIG@ text when the variable is set.  A file that is read and
+-- does not expand is an error, never treated as absent.
+loadConfig :: (Monad m) => ReadConfigFile m -> [FilePath] -> Maybe Text -> m (Either Text NixConfig)
+loadConfig readConfigFile paths nixConfigText = runExceptT $ do
+  fileSources <- lift (rights <$> traverse readSource paths)
+  let sources = fileSources ++ maybeToList (ConfigSource nixConfigSourceName <$> nixConfigText)
+  assignments <- traverse (ExceptT . expandConfigSource readConfigFile) sources
+  liftEither (resolveConfig (concat assignments))
+  where
+    readSource path = fmap (ConfigSource path) <$> readConfigFile path
+
+-- | Expand one source into its assignments, every include spliced in at
+-- its line, as upstream's @parseConfigFiles@ pushes an included file's
+-- pairs into the same list.  An include whose resolved path is already
+-- being expanded is refused: upstream recurses until the stack overflows,
+-- and no cycle can mean anything.
+expandConfigSource :: (Monad m) => ReadConfigFile m -> ConfigSource -> m (Either Text [ConfigAssignment])
+expandConfigSource readConfigFile = runExceptT . expandWithin readConfigFile []
+
+-- | Expand one source beneath the names of the files including it.
+expandWithin :: (Monad m) => ReadConfigFile m -> [FilePath] -> ConfigSource -> ExceptT Text m [ConfigAssignment]
+expandWithin readConfigFile ancestors (ConfigSource name text) = do
+  parsed <- liftEither (parseConfigLines name text)
+  concat <$> traverse (expandLine readConfigFile (name :| ancestors)) parsed
+
+-- | Expand one line of the file at the chain's head: an assignment is
+-- itself; an include is the included file, expanded beneath the chain.
+expandLine :: (Monad m) => ReadConfigFile m -> NonEmpty FilePath -> ConfigLine -> ExceptT Text m [ConfigAssignment]
+expandLine _ _ (LineAssignment assignment) = pure [assignment]
+expandLine readConfigFile chain@(from :| _) (LineInclude mode target) = do
+  path <- liftEither (resolveIncludePath from target)
+  when (path `elem` chain) (throwError (includeCycle path from))
+  contents <- lift (readConfigFile path)
+  case (contents, mode) of
+    (Right text, _) -> expandWithin readConfigFile (NE.toList chain) (ConfigSource path text)
+    (Left _, IncludeOptional) -> pure []
+    (Left failure, IncludeRequired) -> throwError (includeFailed failure path from)
+
+-- | Where an include points: the target joined under the including
+-- file's directory (an absolute target stands alone), then collapsed
+-- through 'canonicalAbsolutePath', as upstream's @absPath@ then
+-- @canonPath@ do.  A result that is still relative is refused: the
+-- including source has no directory, which is the case for @NIX_CONFIG@
+-- and for a user file named relatively.
+resolveIncludePath :: FilePath -> FilePath -> Either Text FilePath
+resolveIncludePath from target = canonicalAbsolutePath (takeDirectory from </> target)
+
+-- | An absolute native path collapsed lexically, or upstream's own
+-- complaint (@canonPath@, file-system.cc at 2.24.9) for a relative one.
+-- The drive 'splitDrive' finds (the POSIX root, a Windows drive letter or
+-- UNC server) is kept as spelled, and the path beneath it collapses as
+-- upstream's @canonPath@ collapses: @.@ drops, @..@ pops and drops at the
+-- root, repeated separators fold to one.  'canonPath' does that collapse
+-- for eval path values, which are rooted in the @\/nix\/store@ sense on
+-- every platform and so see no drive; a native path is split here first
+-- so a UNC root survives rather than folding to the current drive.
+canonicalAbsolutePath :: FilePath -> Either Text FilePath
+canonicalAbsolutePath path
+  | isAbsolute path = Right (T.unpack (root <> canonPath (T.takeEnd 1 rootSeparators <> T.pack below)))
+  | otherwise = Left (configErrorPrefix <> "not an absolute path: '" <> T.pack path <> "'")
+  where
+    (drive, below) = splitDrive path
+    (root, rootSeparators) = (T.dropWhileEnd isPathSeparator driveText, T.takeWhileEnd isPathSeparator driveText)
+    driveText = T.pack drive
+
+includeFailed :: ConfigReadFailure -> FilePath -> FilePath -> Text
+includeFailed failure path from =
+  configErrorPrefix <> "file '" <> T.pack path <> "' included from '" <> T.pack from <> "' " <> reason
+  where
+    reason = case failure of
+      ConfigFileMissing -> "not found"
+      ConfigFileUnreadable -> "cannot be read"
+
+includeCycle :: FilePath -> FilePath -> Text
+includeCycle path from =
+  configErrorPrefix <> "file '" <> T.pack path <> "' included from '" <> T.pack from <> "' is already being included (include cycle)"
+
+-- ---------------------------------------------------------------------------
 -- Parsing
 -- ---------------------------------------------------------------------------
+
+-- | One line of a config source after comment truncation: an assignment,
+-- or an include directive and the path it names.
+data ConfigLine
+  = LineAssignment !ConfigAssignment
+  | LineInclude !IncludeMode !FilePath
+  deriving (Eq, Show)
+
+-- | @include@ fails when its file cannot be read; @!include@ goes on
+-- without it.  That is the only difference between the two directives.
+data IncludeMode = IncludeRequired | IncludeOptional
+  deriving (Eq, Show)
 
 -- | One parsed @name = value@ assignment, before its name is resolved
 -- against the known settings and aliases.
@@ -102,24 +349,29 @@ data ConfigAssignment = ConfigAssignment
   }
   deriving (Eq, Show)
 
--- | Parse config text into ordered assignments.  Comments and blank lines
--- drop out; a malformed line (fewer than @name = value@, or a missing
--- @=@) is a loud error rather than a silent skip, matching upstream's
--- @UsageError@ - a typo in a security-relevant file must not pass for an
--- empty setting.  An @include@ \/ @!include@ line is refused as not yet
--- supported.
-parseConfigText :: Text -> Either Text [ConfigAssignment]
-parseConfigText = traverse parseLine . filter (not . isBlank) . map stripComment . T.lines
+-- | Parse one source's text into its lines.  Comments and blank lines
+-- drop out; a malformed line (fewer than @name = value@, a missing @=@,
+-- or an include with other than exactly one path) is a loud error rather
+-- than a silent skip, matching upstream's @UsageError@ - a typo in a
+-- security-relevant file must not pass for an empty setting.  The error
+-- quotes the line as upstream does, comment-truncated and otherwise
+-- verbatim, leading whitespace included.
+parseConfigLines :: FilePath -> Text -> Either Text [ConfigLine]
+parseConfigLines name = traverse parseLine . filter (not . isBlank) . map stripComment . T.lines
   where
     isBlank line = null (T.words line)
     stripComment = T.takeWhile (/= '#')
     parseLine line = case T.words line of
+      [directive, target]
+        | directive == includeDirective -> Right (LineInclude IncludeRequired (T.unpack target))
+        | directive == bangIncludeDirective -> Right (LineInclude IncludeOptional (T.unpack target))
       (directive : _)
-        | directive == includeDirective || directive == bangIncludeDirective ->
-            Left (configErrorPrefix <> "'" <> directive <> "' is not supported yet")
-      (name : eq : valueTokens)
-        | eq == assignEq -> Right (ConfigAssignment name (T.unwords valueTokens))
-      _ -> Left (configErrorPrefix <> "syntax error in line '" <> T.strip line <> "'")
+        | directive == includeDirective || directive == bangIncludeDirective -> syntaxError line
+      (key : eq : valueTokens)
+        | eq == assignEq -> Right (LineAssignment (ConfigAssignment key (T.unwords valueTokens)))
+      _ -> syntaxError line
+    syntaxError line =
+      Left (configErrorPrefix <> "syntax error in configuration line '" <> line <> "' in '" <> T.pack name <> "'")
 
 -- | Parse an unsigned integer setting the way upstream's
 -- @BaseSetting\<unsigned int\>@ does (@string2IntWithUnitPrefix@ over
@@ -236,16 +488,12 @@ setList :: ListField -> [Text] -> NixConfig -> NixConfig
 setList SubstitutersField v config = config {ncSubstituters = v}
 setList TrustedKeysField v config = config {ncTrustedPublicKeys = v}
 
--- | Parse and apply one source's text onto the accumulated config.
-applyConfigText :: NixConfig -> Text -> Either Text NixConfig
-applyConfigText config text = parseConfigText text >>= foldM applyAssignment config
-
--- | Fold a list of sources onto the default config, weakest first.  The
--- caller orders the list so the command line is last (and so wins); a
--- parse error in any source aborts, since a security-relevant file that
--- does not parse must not be treated as absent.
-resolveConfig :: [Text] -> Either Text NixConfig
-resolveConfig = foldM applyConfigText defaultNixConfig
+-- | Fold expanded assignments onto the default config, weakest first.
+-- The caller orders them so the strongest source's assignments are last
+-- (and so win).  A value a setting cannot take aborts the fold, as
+-- upstream's @UsageError@ does.
+resolveConfig :: [ConfigAssignment] -> Either Text NixConfig
+resolveConfig = foldM applyAssignment defaultNixConfig
 
 -- ---------------------------------------------------------------------------
 -- Setting names
@@ -275,8 +523,8 @@ includeDirective, bangIncludeDirective :: Text
 includeDirective = "include"
 bangIncludeDirective = "!include"
 
--- | What a syntax error this module reports opens with: the format's
--- name, since the parser is not told which source a line came from.  A
--- setting's value error carries none, as upstream's does not.
+-- | What every error about the files themselves opens with (a syntax
+-- error, a failed include, a path that is not absolute): the format's
+-- name.  A setting's value error carries none, as upstream's does not.
 configErrorPrefix :: Text
 configErrorPrefix = "nix.conf: "

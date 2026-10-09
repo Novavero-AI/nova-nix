@@ -16,8 +16,9 @@ import Control.Monad (filterM, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
+import Data.Functor.Identity (Identity (..))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.List (isPrefixOf, sort)
+import Data.List (intercalate, isPrefixOf, sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe)
@@ -79,7 +80,7 @@ import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermis
 import qualified System.Directory as Dir
 import System.Environment (getEnvironment, lookupEnv, setEnv, unsetEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (searchPathSeparator, takeDirectory, (</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
@@ -11546,15 +11547,53 @@ testVerifySigs = do
         ]
 
 -- | The nix.conf / NIX_CONFIG resolver: parsing, aliases, the extra-
--- append rule, and the precedence fold.  The trusted-key cases are the
+-- append rule, the precedence fold, include expansion over an in-memory
+-- file map, and the file cascade.  The trusted-key cases are the
 -- security-relevant ones, a plain assignment in a higher source replaces
 -- the trusted set, an extra- widens it.
 testNixConfig :: IO [Bool]
 testNixConfig = do
   putStrLn "config/nix-conf"
-  let subs = fmap ncSubstituters . Config.resolveConfig
-      keys = fmap ncTrustedPublicKeys . Config.resolveConfig
-      depth = fmap ncMaxCallDepth . Config.resolveConfig
+  let -- A root the platform agrees is absolute: "/" is not one on
+      -- Windows, for System.FilePath and for upstream's canonPath alike.
+      root = if SI.os == "mingw32" then "C:\\" else "/"
+      etcNix = root </> "etc" </> "nix"
+      etcXdg = root </> "etc" </> "xdg"
+      etcXdgLocal = root </> "etc" </> "xdg-local"
+      configHome = root </> "home" </> "u" </> ".config"
+      systemConf = etcNix </> "nix.conf"
+      xdgConf dir = dir </> "nix" </> "nix.conf"
+      -- The expander's one effect, served from an in-memory map: a path
+      -- is in it or there is nothing there.
+      readFrom files path = Identity (maybe (Left Config.ConfigFileMissing) Right (Map.lookup path files))
+      resolveWith files paths env = runIdentity (Config.loadConfig (readFrom files) paths env)
+      substitutersOf files paths env = ncSubstituters <$> resolveWith files paths env
+      -- The same, over the cascade a 'ConfigLocations' computes.
+      substitutersAt files locations env = Config.configFilePaths locations >>= \paths -> substitutersOf files paths env
+      firstPathOf locations = listToMaybe <$> Config.configFilePaths locations
+      -- Successive texts as successive files, weakest first.
+      resolveTexts texts =
+        let paths = [root </> "src" </> (show index ++ ".conf") | index <- [1 .. length texts]]
+         in resolveWith (Map.fromList (zip paths texts)) paths Nothing
+      subs = fmap ncSubstituters . resolveTexts
+      keys = fmap ncTrustedPublicKeys . resolveTexts
+      cascade =
+        Config.ConfigLocations
+          { Config.clConfDir = Nothing,
+            Config.clSystemConfDir = Just etcNix,
+            Config.clUserConfFiles = Nothing,
+            Config.clConfigHome = configHome,
+            Config.clConfigDirs = [etcXdg, etcXdgLocal]
+          }
+      cascadeFiles =
+        Map.fromList
+          [ (systemConf, "substituters = https://system"),
+            (xdgConf etcXdgLocal, "substituters = https://xdg-local"),
+            (xdgConf etcXdg, "substituters = https://xdg"),
+            (xdgConf configHome, "substituters = https://home")
+          ]
+      listVar = intercalate [searchPathSeparator]
+      depth = fmap ncMaxCallDepth . resolveTexts
       depthOf value = depth ["max-call-depth = " <> value]
       refused = either (const True) (const False) . depthOf
   sequence
@@ -11580,10 +11619,9 @@ testNixConfig = do
         assertEqual "unknown" (Right ["https://a"]) (subs ["cores = 4\nsubstituters = https://a"]),
       runTest "blank and comment-only lines are skipped" $
         assertEqual "blanks" (Right ["https://a"]) (subs ["# a comment\n\nsubstituters = https://a\n"]),
-      runTest "a line missing = is a syntax error" $
-        assertLeft "syntax" (Config.resolveConfig ["substituters https://a"]),
-      runTest "an include directive is refused" $
-        assertLeft "include" (Config.resolveConfig ["include /etc/nix/other.conf"]),
+      runTest "a line missing = is a syntax error quoting the line as truncated, untrimmed" $
+        let expected = "nix.conf: syntax error in configuration line '   substituters https://a ' in '" <> T.pack (root </> "src" </> "1.conf") <> "'"
+         in assertEqual "syntax" (Left expected) (resolveTexts ["   substituters https://a # comment"]),
       runTest "the default config is empty" $
         assertEqual "default" (Right []) (subs []),
       -- max-call-depth: a scalar under upstream's unsigned-integer grammar.
@@ -11606,7 +11644,97 @@ testNixConfig = do
       runTest "max-call-depth refuses a value past unsigned int, a unit product included" $
         assertEqual "depth-range" True (refused "4294967296" && refused "5G"),
       runTest "extra-max-call-depth is an unknown name, not an append" $
-        assertEqual "depth-extra" (Right 10000) (depth ["extra-max-call-depth = 5"])
+        assertEqual "depth-extra" (Right 10000) (depth ["extra-max-call-depth = 5"]),
+      -- Includes.
+      runTest "an include is spliced in at its line, resolved against the including file's directory" $
+        let files =
+              Map.fromList
+                [ (systemConf, "substituters = https://a\ninclude site.conf\nextra-substituters = https://c"),
+                  (etcNix </> "site.conf", "extra-substituters = https://b")
+                ]
+         in assertEqual "inline" (Right ["https://a", "https://b", "https://c"]) (substitutersOf files [systemConf] Nothing),
+      runTest "a nested include resolves against the nested file, with .. collapsed" $
+        let files =
+              Map.fromList
+                [ (systemConf, "include sub/one.conf"),
+                  (etcNix </> "sub" </> "one.conf", "include ../two.conf"),
+                  (etcNix </> "two.conf", "substituters = https://two")
+                ]
+         in assertEqual "nested" (Right ["https://two"]) (substitutersOf files [systemConf] Nothing),
+      runTest "!include of a file that cannot be read is skipped" $
+        let files = Map.fromList [(systemConf, "substituters = https://a\n!include missing.conf\nextra-substituters = https://b")]
+         in assertEqual "optional" (Right ["https://a", "https://b"]) (substitutersOf files [systemConf] Nothing),
+      runTest "include of a missing file is an error in upstream's words, naming both files" $
+        let files = Map.fromList [(systemConf, "include missing.conf")]
+            expected = "nix.conf: file '" <> T.pack (etcNix </> "missing.conf") <> "' included from '" <> T.pack systemConf <> "' not found"
+         in assertEqual "required" (Left expected) (substitutersOf files [systemConf] Nothing),
+      -- A file that exists but will not open: upstream drops it, here a
+      -- required include of it is an error in its own words.
+      runTest "include of a file that exists but cannot be read is an error, not a silent drop" $
+        let locked = etcNix </> "locked.conf"
+            readLocked path = Identity (if path == locked then Left Config.ConfigFileUnreadable else Right "include locked.conf")
+            expected = "nix.conf: file '" <> T.pack locked <> "' included from '" <> T.pack systemConf <> "' cannot be read"
+         in assertEqual "unreadable" (Left expected) (ncSubstituters <$> runIdentity (Config.loadConfig readLocked [systemConf] Nothing)),
+      runTest "!include of a file that exists but cannot be read is skipped" $
+        let locked = etcNix </> "locked.conf"
+            readLocked path = Identity (if path == locked then Left Config.ConfigFileUnreadable else Right "!include locked.conf\nsubstituters = https://a")
+         in assertEqual "unreadable-optional" (Right ["https://a"]) (ncSubstituters <$> runIdentity (Config.loadConfig readLocked [systemConf] Nothing)),
+      runTest "an include cycle is refused rather than followed" $
+        let files = Map.fromList [(systemConf, "include site.conf"), (etcNix </> "site.conf", "include nix.conf")]
+         in assertLeft "cycle" (substitutersOf files [systemConf] Nothing),
+      runTest "an include with no path or two paths is a syntax error" $
+        assertEqual "arity" [True, True, True] (map (either (const True) (const False) . resolveTexts . pure) ["include", "include a b", "!include"]),
+      runTest "a relative include from NIX_CONFIG is refused as not absolute" $
+        let expected = "nix.conf: not an absolute path: '" <> T.pack ("." </> "rel.conf") <> "'"
+         in assertEqual "env-relative" (Left expected) (substitutersOf Map.empty [] (Just "include rel.conf")),
+      runTest "an absolute include from NIX_CONFIG is expanded" $
+        let files = Map.fromList [(etcNix </> "x.conf", "substituters = https://x")]
+         in assertEqual "env-absolute" (Right ["https://x"]) (substitutersOf files [] (Just ("include " <> T.pack (etcNix </> "x.conf")))),
+      -- The cascade: which files, in which order, and who wins.
+      runTest "the cascade is the system file, XDG_CONFIG_DIRS back to front, then the config home" $
+        assertEqual "order" (Right [systemConf, xdgConf etcXdgLocal, xdgConf etcXdg, xdgConf configHome]) (Config.configFilePaths cascade),
+      runTest "the config home beats XDG_CONFIG_DIRS beats the system file" $
+        assertEqual "home-wins" (Right ["https://home"]) (substitutersAt cascadeFiles cascade Nothing),
+      runTest "the first XDG_CONFIG_DIRS entry beats the later ones" $
+        assertEqual "xdg-first" (Right ["https://xdg"]) (substitutersAt (Map.delete (xdgConf configHome) cascadeFiles) cascade Nothing),
+      runTest "a listed file that cannot be read is absent, not an error" $
+        assertEqual "absent" (Right ["https://system"]) (substitutersAt (Map.filterWithKey (\path _ -> path == systemConf) cascadeFiles) cascade Nothing),
+      runTest "extra- in a stronger file widens what a weaker file set" $
+        let files = Map.fromList [(systemConf, "trusted-public-keys = k1"), (xdgConf configHome, "extra-trusted-public-keys = k2")]
+         in assertEqual "widen-across-files" (Right ["k1", "k2"]) (fmap ncTrustedPublicKeys (Config.configFilePaths cascade >>= \paths -> resolveWith files paths Nothing)),
+      runTest "NIX_CONFIG beats every file" $
+        assertEqual "env-wins" (Right ["https://env"]) (substitutersAt cascadeFiles cascade (Just "substituters = https://env")),
+      runTest "NIX_USER_CONF_FILES replaces the XDG files, first listed strongest" $
+        let listed = cascade {Config.clUserConfFiles = Just (listVar [etcNix </> "a.conf", etcNix </> "b.conf"])}
+         in assertEqual "listed" (Right [systemConf, etcNix </> "b.conf", etcNix </> "a.conf"]) (Config.configFilePaths listed),
+      runTest "an empty NIX_USER_CONF_FILES names no user files" $
+        assertEqual "none" (Right [systemConf]) (Config.configFilePaths cascade {Config.clUserConfFiles = Just ""}),
+      runTest "empty NIX_USER_CONF_FILES entries are dropped" $
+        assertEqual "empties" (Right [systemConf, etcNix </> "a.conf"]) (Config.configFilePaths cascade {Config.clUserConfFiles = Just (listVar ["", etcNix </> "a.conf", ""])}),
+      runTest "NIX_CONF_DIR moves the system file" $
+        assertEqual "conf-dir" (Right (Just (etcXdg </> "nix.conf"))) (firstPathOf cascade {Config.clConfDir = Just etcXdg}),
+      runTest "an empty NIX_CONF_DIR is unset" $
+        assertEqual "conf-dir-empty" (Right (Just systemConf)) (firstPathOf cascade {Config.clConfDir = Just ""}),
+      runTest "a relative NIX_CONF_DIR is refused with upstream's complaint" $
+        assertEqual "conf-dir-relative" (Left "nix.conf: not an absolute path: 'rel'") (firstPathOf cascade {Config.clConfDir = Just "rel"}),
+      runTest "dot and dot-dot in NIX_CONF_DIR collapse, so the system file is named canonically" $
+        assertEqual "conf-dir-canonical" (Right (Just systemConf)) (firstPathOf cascade {Config.clConfDir = Just (root </> "etc" </> "x" </> ".." </> "." </> "nix")}),
+      -- A UNC directory keeps its server on Windows, where System.FilePath
+      -- and std::filesystem both read it as the drive; a doubled POSIX
+      -- root is one root, as upstream's canonPath folds it.
+      runTest "a UNC NIX_CONF_DIR keeps its root, and its include resolves beneath it" $
+        let (dir, expected) =
+              if SI.os == "mingw32"
+                then ("\\\\server\\share", "\\\\server\\share\\nix.conf")
+                else ("//server/share", "/server/share/nix.conf")
+            uncConf = takeDirectory expected </> "site.conf"
+            files = Map.fromList [(expected, "include site.conf"), (uncConf, "substituters = https://unc")]
+            unc = cascade {Config.clConfDir = Just dir, Config.clUserConfFiles = Just ""}
+         in assertEqual "unc" (Right (Just expected), Right ["https://unc"]) (firstPathOf unc, substitutersAt files unc Nothing),
+      runTest "a platform with no machine-wide directory has no system file" $
+        assertEqual "no-system-dir" (Right [xdgConf etcXdgLocal, xdgConf etcXdg, xdgConf configHome]) (Config.configFilePaths cascade {Config.clSystemConfDir = Nothing}),
+      runTest "NIX_CONF_DIR names a system file even where the platform has no directory for one" $
+        assertEqual "conf-dir-no-default" (Right (Just (etcXdg </> "nix.conf"))) (firstPathOf cascade {Config.clSystemConfDir = Nothing, Config.clConfDir = Just etcXdg})
     ]
   where
     rejects = ["-1", "1.5", "0x10", "5X", "", "5 6"]

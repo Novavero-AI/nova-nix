@@ -13,7 +13,7 @@
 module Main (main) where
 
 import Control.Exception (IOException, displayException, try)
-import Control.Monad (void, (>=>))
+import Control.Monad (mfilter, void, (>=>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (readIORef)
@@ -44,8 +44,10 @@ import Paths_nova_nix (getDataDir, version)
 import System.Directory (Permissions (executable), XdgDirectory (XdgConfig), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, getXdgDirectory)
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure)
-import System.FilePath (takeDirectory, takeFileName, (</>))
+import System.FilePath (isAbsolute, splitSearchPath, takeDirectory, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
+import System.IO.Error (isDoesNotExistError)
+import qualified System.Info as SI
 
 -- ---------------------------------------------------------------------------
 -- Argument parsing
@@ -250,6 +252,33 @@ nixDataDirVar = "NIX_DATA_DIR"
 nixConfigVar :: String
 nixConfigVar = "NIX_CONFIG"
 
+-- | The directory holding the system nix.conf, in place of @/etc/nix@.
+nixConfDirVar :: String
+nixConfDirVar = "NIX_CONF_DIR"
+
+-- | The user config files, first strongest, in place of the XDG cascade.
+nixUserConfFilesVar :: String
+nixUserConfFilesVar = "NIX_USER_CONF_FILES"
+
+-- | The XDG config dirs, searched for @nix\/nix.conf@ after the config home.
+xdgConfigDirsVar :: String
+xdgConfigDirsVar = "XDG_CONFIG_DIRS"
+
+-- | Windows' all-users application data directory, the machine-wide
+-- config directory there.
+programDataVar :: String
+programDataVar = "ProgramData"
+
+-- | Upstream's @sysconfdir@ on Unix, which libstore's meson.build forces
+-- absolute, so @\/etc\/nix@ is the compiled-in system directory.
+posixSysconfDir :: FilePath
+posixSysconfDir = "/etc"
+
+-- | The XDG base directory spec's default for @XDG_CONFIG_DIRS@, the
+-- literal upstream's @getConfigDirs@ falls back to.
+posixXdgConfigDirs :: [FilePath]
+posixXdgConfigDirs = ["/etc/xdg"]
+
 -- | Where a release archive keeps the bundled expressions, relative to the
 -- directory holding @bin@.
 bundledDataSubdir :: FilePath
@@ -308,7 +337,7 @@ main = do
   args <- getArgs
   dataDir <- resolveDataDir
   opts <- either (failWith . T.pack) pure (parseArgs args)
-  config <- loadConfigSources >>= either (failWith . ("error: " <>)) pure . Config.resolveConfig
+  config <- loadNixConfig
   case optCommand opts of
     CmdEvalFile filePath -> evalFile config (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir filePath
     CmdEvalExpr expr
@@ -356,9 +385,10 @@ usageLines =
     "  --substituter URL      Try this binary cache before building",
     "  --trusted-key K        Public key (name:base64) for the substituter",
     "",
-    "  substituters, trusted-public-keys and max-call-depth also read",
-    "  from $XDG_CONFIG_HOME/nix/nix.conf and $NIX_CONFIG; the flags",
-    "  above add to whatever those configure.",
+    "  substituters, trusted-public-keys and max-call-depth also read from",
+    "  nix.conf, in upstream's order: $NIX_CONF_DIR (default " <> systemConfDirName <> "),",
+    "  the XDG nix/nix.conf files or $NIX_USER_CONF_FILES, then $NIX_CONFIG;",
+    "  the flags above add to whatever those configure.",
     "",
     "  --help                 Print this text and exit",
     "  --version              Print the version and exit"
@@ -622,11 +652,10 @@ configToCaches config =
   | url <- ncSubstituters config
   ]
 
--- | Resolve the caches from the resolved config plus the CLI flags.  The
--- config sources are ordered weakest first (user file, then
--- @NIX_CONFIG@); the CLI @--substituter@ and @--trusted-key@ append on
--- top, the highest precedence, so a flag adds to the configured set
--- rather than being overridden by it.
+-- | The caches from the resolved config plus the CLI flags.  The CLI
+-- @--substituter@ and @--trusted-key@ append on top, the highest
+-- precedence, so a flag adds to the configured set rather than being
+-- overridden by it.
 resolveCaches :: NixConfig -> Maybe String -> Maybe String -> [CacheConfig]
 resolveCaches base mUrl mKey =
   configToCaches
@@ -648,28 +677,103 @@ configuredEvalState config storeDir extraPaths dataDir baseDir = do
         esCallDepth = topLevelCallDepth (ncMaxCallDepth config)
       }
 
--- | The nix.conf sources, weakest first: the user file, then @NIX_CONFIG@.
--- Reading is best effort - a missing or unreadable file is simply absent -
--- but a file that IS read and does not parse is a hard error downstream,
--- so a malformed security-relevant setting cannot pass for no setting.
-loadConfigSources :: IO [T.Text]
-loadConfigSources = do
-  userFile <- readUserConfigFile
+-- | Resolve nix.conf from the system file, the user-file cascade and
+-- @NIX_CONFIG@, the file locations coming from the environment and the
+-- platform's XDG defaults.  A file that cannot be read is absent, but one
+-- that is read and does not parse is a hard error, so a malformed
+-- security-relevant setting cannot pass for no setting.
+loadNixConfig :: IO NixConfig
+loadNixConfig = do
+  locations <- configLocations
   nixConfigEnv <- lookupEnv nixConfigVar
-  pure (catMaybes [userFile, T.pack <$> nixConfigEnv])
+  paths <- either configError pure (Config.configFilePaths locations)
+  Config.loadConfig readConfigFile paths (T.pack <$> nixConfigEnv)
+    >>= either configError pure
+  where
+    configError = failWith . ("error: " <>)
 
--- | Read @$XDG_CONFIG_HOME\/nix\/nix.conf@ (the user config file), or
--- 'Nothing' when it is absent or unreadable.
-readUserConfigFile :: IO (Maybe T.Text)
-readUserConfigFile = do
-  dir <- getXdgDirectory XdgConfig "nix"
-  let path = dir </> "nix.conf"
-  present <- doesFileExist path
-  if not present
-    then pure Nothing
-    else do
-      result <- try (BS.readFile path) :: IO (Either IOException BS.ByteString)
-      pure (either (const Nothing) (Just . TE.decodeUtf8Lenient) result)
+-- | Where the config files are on this machine.  @NIX_CONF_DIR@ and
+-- @XDG_CONFIG_DIRS@ are honoured on every platform; the defaults behind
+-- them are the platform's.  Upstream compiles @\/etc\/nix@ in as the
+-- system directory and falls back to @\/etc\/xdg@ for the dirs on every
+-- platform, Windows included, where neither names anything (a path with
+-- no drive resolves against the current drive).  The Windows analogues
+-- are chosen here the way the user file's was (@%APPDATA%@ for the XDG
+-- config home, the @directory@ package's own mapping): the system file is
+-- @%ProgramData%\\nix\\nix.conf@, the all-users application data directory
+-- being where Windows keeps machine-wide application configuration (it is
+-- also where @directory@ maps the system-wide XDG dirs), and there is no
+-- system file when @%ProgramData%@ is unset; the dirs default to none,
+-- because the one Windows directory that answers to them is already the
+-- system file, and a file read twice applies its @extra-@ settings twice.
+-- The config home comes from @directory@ (@~\/.config@ on Unix,
+-- @%APPDATA%@ on Windows, @XDG_CONFIG_HOME@ only when it is absolute); the
+-- dirs list is filtered the same way, since 'splitSearchPath' turns an
+-- empty POSIX entry into @.@, where upstream's tokenizer drops it, and the
+-- XDG spec says a relative entry is ignored.
+configLocations :: IO Config.ConfigLocations
+configLocations = do
+  confDir <- lookupEnv nixConfDirVar
+  systemConfDir <- platformSystemConfDir
+  userFiles <- lookupEnv nixUserConfFilesVar
+  home <- getXdgDirectory XdgConfig ""
+  configDirs <- lookupEnv xdgConfigDirsVar
+  pure
+    Config.ConfigLocations
+      { Config.clConfDir = confDir,
+        Config.clSystemConfDir = systemConfDir,
+        Config.clUserConfFiles = userFiles,
+        Config.clConfigHome = home,
+        Config.clConfigDirs = maybe platformConfigDirs (filter isAbsolute . splitSearchPath) configDirs
+      }
+
+-- | Where the platform's machine-wide config directory comes from, with
+-- @nix@ beneath it either way: a fixed path (upstream's @sysconfdir@ on
+-- Unix) or an environment variable naming it (@%ProgramData%@ on
+-- Windows).  One value serves both the lookup and the help text, so the
+-- two cannot disagree.
+data SystemConfDirSource = FixedConfDir !FilePath | EnvConfDir !String
+
+platformSystemConfDirSource :: SystemConfDirSource
+platformSystemConfDirSource = case SI.os of
+  "mingw32" -> EnvConfDir programDataVar
+  _ -> FixedConfDir posixSysconfDir
+
+-- | The machine-wide config directory the system file is read from unless
+-- @NIX_CONF_DIR@ moves it: upstream's @sysconfdir\/nix@ on Unix;
+-- @%ProgramData%\\nix@ on Windows, or none when that variable is unset or
+-- empty.
+platformSystemConfDir :: IO (Maybe FilePath)
+platformSystemConfDir = case platformSystemConfDirSource of
+  FixedConfDir dir -> pure (Just (dir </> Config.nixConfDirName))
+  EnvConfDir var -> fmap (</> Config.nixConfDirName) . mfilter (not . null) <$> lookupEnv var
+
+-- | 'platformSystemConfDir' as the help text names it: the path on Unix,
+-- the variable on Windows.
+systemConfDirName :: String
+systemConfDirName = case platformSystemConfDirSource of
+  FixedConfDir dir -> dir </> Config.nixConfDirName
+  EnvConfDir var -> "%" <> var <> "%" </> Config.nixConfDirName
+
+-- | What @XDG_CONFIG_DIRS@ names when it is unset: the spec's default on
+-- Unix, nothing on Windows (see 'configLocations').
+platformConfigDirs :: [FilePath]
+platformConfigDirs = case SI.os of
+  "mingw32" -> []
+  _ -> posixXdgConfigDirs
+
+-- | A config file's text, or why it could not be read: nothing at the
+-- path, or something that will not open (a directory, a permission
+-- refusal).  Only 'IOException' is caught: an interrupt must abort the
+-- run, not read as an absent file.
+readConfigFile :: FilePath -> IO (Either Config.ConfigReadFailure T.Text)
+readConfigFile path = do
+  result <- try (BS.readFile path) :: IO (Either IOException BS.ByteString)
+  pure (either (Left . classify) (Right . TE.decodeUtf8Lenient) result)
+  where
+    classify err
+      | isDoesNotExistError err = Config.ConfigFileMissing
+      | otherwise = Config.ConfigFileUnreadable
 
 -- | Resolve every launcher before any building starts, so a typo'd path is
 -- a configuration error now rather than a build failure after the whole
