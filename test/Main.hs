@@ -11,8 +11,8 @@ import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (cancel, waitCatch, withAsync)
-import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, evaluate, fromException, throwIO, toException, try)
-import Control.Monad (filterM, void, when)
+import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, displayException, evaluate, fromException, throwIO, toException, try)
+import Control.Monad (filterM, unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
@@ -31,8 +31,9 @@ import qualified Data.Text.IO as TIO
 import Data.Word (Word32)
 import qualified Database.SQLite.Simple as SQL
 import FetchurlFixture (withFetchurlServer)
-import Foreign.Ptr (castPtr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
+import Foreign.Storable (sizeOf)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), FetchRetryPolicy (..), RetryEffects (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, defaultFetchRetryPolicy, execWrapperConfig, execWrapperFor, fetchExceptionFailure, fetchStatusFailure, fetchUrlsFromEnv, retryDelayMs, retryTransient, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
@@ -42,8 +43,8 @@ import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
-import Nix.Eval (FetchCache (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, fetchCacheKey, force, mkStr, readThunkValue, runPureEval, typeName)
-import Nix.Eval.Arena (arenaDestroy, arenaInit)
+import Nix.Eval (FetchCache (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, mkStr, readThunkValue, runPureEval, typeName)
+import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
@@ -54,7 +55,7 @@ import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (emptyCList)
+import Nix.Eval.Types (allocCSlots, buildCSlots, emptyCList)
 import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
 import Nix.Hash (hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -78,10 +79,10 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Zstd as CZstd
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
-import System.Environment (getEnvironment, lookupEnv, setEnv, unsetEnv)
-import System.Exit (ExitCode (..), exitFailure, exitSuccess)
+import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv, setEnv, unsetEnv)
+import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (searchPathSeparator, takeDirectory, (</>))
-import System.IO (BufferMode (..), hSetBuffering, stdout)
+import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
 import qualified System.Process as Proc
@@ -10096,6 +10097,126 @@ testToJSONPathIO = do
   pure results
 
 -- ---------------------------------------------------------------------------
+-- Arena lifecycle guard (C FFI)
+-- ---------------------------------------------------------------------------
+
+-- | The argument that turns this executable into the child of
+-- 'testArenaGuard'.  The child reaches the C layer with no 'arenaInit',
+-- which the suite cannot do in its own process: 'main' brackets every
+-- group, and a destroy-then-reinit cycle would invalidate the arena
+-- pointers that process-lifetime CAFs already hold (#19).
+arenaGuardChildFlag :: String
+arenaGuardChildFlag = "--arena-guard-child"
+
+-- | One way a library user reaches the C layer, with the entry point
+-- expected to refuse it.
+data ArenaGuardPath = ArenaGuardPath
+  { -- | The child's argument.
+    guardName :: !String,
+    -- | The suite's name for the case.
+    guardClaim :: !Text,
+    -- | The C entry point the message must name.
+    guardSite :: !Text,
+    -- | The child's body, run with no 'arenaInit' of its own.
+    guardAction :: !(IO ())
+  }
+
+-- | The paths a library user reaches the C layer by.  The first C call
+-- of each of the first four lands in a different sub-arena, and the
+-- fifth runs a full init .. destroy cycle first, so both ends of the
+-- window are covered.  The last shows what a touch before the window
+-- costs: GHC updates a thunk whose evaluation raised with that
+-- exception, so the shared null thunk keeps raising
+-- 'ArenaNotInitialized' inside a later, live arena.  It pins the hazard
+-- the "Nix.Eval.Arena" Haddock states, and flips when #19 removes the
+-- process-lifetime constants.
+arenaGuardPaths :: [ArenaGuardPath]
+arenaGuardPaths =
+  [ noArena "compile" "nn_bc_emit" evalIssueProgram,
+    noArena "thunk" "nn_thunk_new_computed_int" (void (evaluate (unThunk (evaluated (VInt 1))))),
+    noArena "symbol" "nn_symbol_intern" (void (evaluate (unThunk (evaluated (mkStr "a"))))),
+    noArena "env" "nn_env_alloc_slots" (void (evaluate (fst (buildCSlots [evaluated (VInt 1)])))),
+    noArena "after-destroy" "nn_bc_emit" (bracket_ arenaInit arenaDestroy (pure ()) >> evalIssueProgram),
+    ArenaGuardPath
+      { guardName = "poisoned-constant",
+        guardClaim = "a constant forced before arenaInit re-raises inside a later, live arena (#19)",
+        guardSite = "nn_thunk_new_computed_null",
+        guardAction = poisonedConstant
+      }
+  ]
+  where
+    noArena name site = ArenaGuardPath name ("no arena: " <> T.pack name <> " raises ArenaNotInitialized at " <> site) site
+    -- The program from #206, forced to its result.
+    evalIssueProgram = case parseNix "/tmp" "<expr>" "let x = 5; in x * 2 + 1" of
+      Left err -> throwIO (ErrorCall (show err))
+      Right expr -> void (evaluate (runPureEval (eval (builtinEnv 0 []) expr)))
+    -- Force the shared null thunk with no arena, then again under a
+    -- live one.  Anything but the guard on the first force, or a dead
+    -- arena on the second, is a broken precondition rather than the
+    -- outcome under test, so it leaves the child by another exception.
+    poisonedConstant = do
+      first <- try (evaluate (unThunk (evaluated VNull)))
+      case first of
+        Left (_ :: CStatusError) -> pure ()
+        Right _ -> throwIO (ErrorCall "the force outside the window raised nothing")
+      bracket_ arenaInit arenaDestroy $ do
+        live <- arenaLive
+        unless live (throwIO (ErrorCall "arenaLive is False inside the bracket"))
+        void (evaluate (unThunk (evaluated VNull)))
+
+-- | Child body: run one path with no arena and report what it raised.
+-- Exit 0 with the message on stdout when the guard fired, 3 when nothing
+-- was raised.  A segfault or any other exception type surfaces as the
+-- process's own exit code instead.
+arenaGuardChild :: String -> IO ()
+arenaGuardChild name = case [guardAction path | path <- arenaGuardPaths, guardName path == name] of
+  [action] -> do
+    outcome <- try action
+    case outcome of
+      Left (err :: CStatusError) -> putStrLn (displayException err)
+      Right () -> putStrLn "no exception raised" >> exitWith (ExitFailure 3)
+  _ -> hPutStrLn stderr ("unknown arena guard path: " ++ name) >> exitWith (ExitFailure 2)
+
+-- | The smallest slot count whose byte size exceeds @UINT32_MAX@.
+-- @nn_env_alloc_slots@ refuses it before touching a page, so inside a
+-- live arena it fails without exhausting anything.
+slotCountPastUInt32 :: Int
+slotCountPastUInt32 = fromIntegral (maxBound :: Word32) `div` sizeOf (nullPtr :: Ptr ()) + 1
+
+-- | Reaching the C layer outside the 'arenaInit' .. 'arenaDestroy'
+-- window raises 'ArenaNotInitialized' naming the entry point, where
+-- #206 reported a SIGSEGV.  Each such path runs in a child process.
+-- The live side of the same check runs in this process, under the
+-- suite's bracket: a refusal with the arena up is 'CAllocationFailed'.
+testArenaGuard :: IO [Bool]
+testArenaGuard = do
+  putStrLn "arena/guard"
+  self <- getExecutablePath
+  children <-
+    mapM
+      ( \path -> runTestM (guardClaim path) $ do
+          (code, out, err) <- Proc.readCreateProcessWithExitCode (Proc.proc self [arenaGuardChildFlag, guardName path]) ""
+          let message = T.pack out
+              site = guardSite path
+          pure $ case code of
+            ExitSuccess
+              | "arenaInit" `T.isInfixOf` message && site `T.isInfixOf` message -> Pass
+              | otherwise -> Fail ("message does not name arenaInit and " <> site <> ": " <> message)
+            ExitFailure n -> Fail ("child exited " <> T.pack (show n) <> " (negative is a signal): " <> T.pack err)
+      )
+      arenaGuardPaths
+  liveArena <-
+    runTestM "live arena: a slot array past UINT32_MAX bytes raises CAllocationFailed at nn_env_alloc_slots" $ do
+      live <- arenaLive
+      outcome <- try (evaluate (allocCSlots slotCountPastUInt32))
+      pure $ case (live, outcome) of
+        (True, Left (CAllocationFailed "nn_env_alloc_slots" "C allocation failed")) -> Pass
+        (True, Left err) -> Fail ("expected CAllocationFailed at nn_env_alloc_slots, got " <> T.pack (show err))
+        (True, Right _) -> Fail "no exception raised"
+        (False, _) -> Fail "arenaLive is False inside the suite's bracket"
+  pure (children ++ [liveArena])
+
+-- ---------------------------------------------------------------------------
 -- Symbol interning (C FFI)
 -- ---------------------------------------------------------------------------
 
@@ -11941,7 +12062,14 @@ testByteStringSemanticsIO = do
       ]
 
 main :: IO ()
-main = bracket_ arenaInit arenaDestroy $ do
+main =
+  getArgs >>= \case
+    [flag, name] | flag == arenaGuardChildFlag -> arenaGuardChild name
+    _ -> bracket_ arenaInit arenaDestroy runSuite
+
+-- | Every group, under the one arena bracket.
+runSuite :: IO ()
+runSuite = do
   hSetBuffering stdout LineBuffering
   putStrLn "nova-nix test suite"
   putStrLn "==================="
@@ -12051,6 +12179,7 @@ main = bracket_ arenaInit arenaDestroy $ do
           testSymbol,
           testCAttrSet,
           testCThunk,
+          testArenaGuard,
           testBytecodeCompile,
           testBytecodeCountSpill,
           testValueCountWidths,

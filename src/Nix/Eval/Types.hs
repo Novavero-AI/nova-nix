@@ -136,6 +136,7 @@ import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrEl
 import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
+import Nix.Eval.CStatus (checkedCPtr)
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
@@ -516,39 +517,29 @@ instance Show Env where
 emptyEnv :: Env
 emptyEnv = Env (unsafePerformIO cenvEmpty)
 
--- | Fail loudly when a C allocator returns NULL (arena or malloc
--- exhaustion, or a rejected over-large size).  The C side signals
--- failure deliberately; deferring the NULL to the next dereference
--- would be undefined behavior in a release build, so convert it into
--- a clean Haskell exception here.
-checkedCPtr :: String -> Ptr a -> Ptr a
-checkedCPtr site ptr
-  | ptr == nullPtr = error (site ++ ": C allocation failed")
-  | otherwise = ptr
-
 -- | General C-backed env constructor.
 -- Takes Haskell-level types; converts Maybe to nullPtr internally.
 {-# NOINLINE newCEnv #-}
 newCEnv :: Ptr CThunkPtr -> Int -> Maybe AttrSet -> Maybe Env -> Ptr (Ptr ()) -> Word32 -> Env
 newCEnv slots slotCount lazyScope parent withs withCount =
   Env
-    ( checkedCPtr "newCEnv" $
-        unsafePerformIO
-          ( cenvNew
+    ( unsafePerformIO
+        ( checkedCPtr "nn_env_new"
+            =<< cenvNew
               slots
               (fromIntegral slotCount)
               (case lazyScope of Nothing -> nullPtr; Just (AttrSet cset) -> castPtr cset)
               (case parent of Nothing -> nullPtr; Just (Env p) -> p)
               withs
               withCount
-          )
+        )
     )
 
 -- | Minimal env: slots only, no parent, no with-scopes, no lazy scope.
 {-# NOINLINE newMinimalEnv #-}
 newMinimalEnv :: Ptr CThunkPtr -> Int -> Env
 newMinimalEnv slots n =
-  Env (checkedCPtr "newMinimalEnv" (unsafePerformIO (cenvNewMinimal slots (fromIntegral n))))
+  Env (unsafePerformIO (checkedCPtr "nn_env_new_minimal" =<< cenvNewMinimal slots (fromIntegral n)))
 
 -- | Look up a resolved variable by level and index.  Single C call:
 -- O(level) parent hops in C, then O(1) array read.
@@ -615,14 +606,14 @@ lookupWithScopes name (scope : rest) =
 {-# NOINLINE envFromSlots #-}
 envFromSlots :: Ptr CThunkPtr -> Int -> Env -> Env
 envFromSlots slotsPtr slotCount (Env parentPtr) =
-  Env (checkedCPtr "envFromSlots" (unsafePerformIO (cenvFromSlots slotsPtr (fromIntegral slotCount) parentPtr)))
+  Env (unsafePerformIO (checkedCPtr "nn_env_from_slots" =<< cenvFromSlots slotsPtr (fromIntegral slotCount) parentPtr))
 
 -- | Push a with-scope onto the scope chain (innermost position).
 -- Allocates a new C env struct with extended with-scopes array.
 {-# NOINLINE pushWithScope #-}
 pushWithScope :: AttrSet -> Env -> Env
 pushWithScope (AttrSet cset) (Env envPtr) =
-  Env (checkedCPtr "pushWithScope" (unsafePerformIO (cenvPushWith envPtr (castPtr cset))))
+  Env (unsafePerformIO (checkedCPtr "nn_env_push_with" =<< cenvPushWith envPtr (castPtr cset)))
 
 -- | Read with-scopes array pointer and count from a C env.
 {-# NOINLINE envWithScopesRaw #-}
@@ -648,7 +639,7 @@ withScopesForCapture (Env envPtr) = unsafePerformIO $ do
       -- existingCount sits far below 2^32 (the C side caps the array
       -- allocation at UINT32_MAX bytes), so the increment cannot wrap.
       let newCount = existingCount + 1
-      arr <- checkedCPtr "withScopesForCapture" <$> cenvAllocWithScopes newCount
+      arr <- checkedCPtr "nn_env_alloc_with_scopes" =<< cenvAllocWithScopes newCount
       forM_ [0 .. fromIntegral existingCount - 1] $ \i -> do
         val <- peekElemOff existingWiths i
         pokeElemOff arr i val
@@ -955,19 +946,19 @@ marshalLambda :: Ptr NnEnv -> EvalFormals -> Word32 -> IO (Ptr ())
 marshalLambda envPtr formals bodyBcIdx = case formals of
   EFName name -> do
     Symbol nameSym <- symbolIntern name
-    lam <- checkedCPtr "marshalLambda" <$> clambdaNew envPtr bodyBcIdx 0 nameSym 0 0
+    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 0 nameSym 0 0
     pure (castPtr lam)
   EFSet entries allowExtra -> do
     let count = fromIntegral (length entries) :: Word32
         extraFlag = if allowExtra then 1 else 0 :: Word8
-    lam <- checkedCPtr "marshalLambda" <$> clambdaNew envPtr bodyBcIdx 1 0 extraFlag count
+    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 1 0 extraFlag count
     fillEntries lam 0 entries
     pure (castPtr lam)
   EFNamedSet name entries allowExtra -> do
     Symbol nameSym <- symbolIntern name
     let count = fromIntegral (length entries) :: Word32
         extraFlag = if allowExtra then 1 else 0 :: Word8
-    lam <- checkedCPtr "marshalLambda" <$> clambdaNew envPtr bodyBcIdx 2 nameSym extraFlag count
+    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 2 nameSym extraFlag count
     fillEntries lam 0 entries
     pure (castPtr lam)
   where
@@ -1025,7 +1016,7 @@ marshalStringContext textVal (StringContext ctxSet) = do
   Symbol textSym <- symbolInternBytes textVal
   let elems = Set.toAscList ctxSet
       count = fromIntegral (length elems) :: Word32
-  ptr <- checkedCPtr "marshalStringContext" <$> cctxstrNew textSym count
+  ptr <- checkedCPtr "nn_ctxstr_new" =<< cctxstrNew textSym count
   fillElems ptr 0 elems
   pure ptr
   where
@@ -1096,7 +1087,7 @@ buildCSlots thunks = unsafePerformIO $ do
   if n == 0
     then pure (nullPtr, 0)
     else do
-      arr <- cenvAllocSlots (fromIntegral n)
+      arr <- checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots (fromIntegral n)
       pokeSlots arr 0 thunks
       pure (arr, n)
   where
@@ -1113,7 +1104,7 @@ buildCSlots thunks = unsafePerformIO $ do
 {-# NOINLINE allocCSlots #-}
 allocCSlots :: Int -> Ptr CThunkPtr
 allocCSlots 0 = nullPtr
-allocCSlots n = unsafePerformIO (cenvAllocSlots (fromIntegral n))
+allocCSlots n = unsafePerformIO (checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots (fromIntegral n))
 
 -- | Fill a pre-allocated C slot array with thunks.  Each thunk is
 -- converted to 'CThunkPtr' via 'thunkToCPtr' and poked at its index.

@@ -35,8 +35,13 @@ typedef struct nn_env {
 /* --- Lifecycle --- */
 
 /* Initialize the global env allocator.  Must be called once before
- * any nn_env_* calls (except nn_env_destroy). */
+ * any nn_env_* calls (except nn_env_destroy, nn_env_live and
+ * nn_env_empty); outside the init .. destroy window every allocating
+ * call returns NULL. */
 void nn_env_init(void);
+
+/* Nonzero between nn_env_init and nn_env_destroy. */
+int nn_env_live(void);
 
 /* Destroy the global env allocator, freeing all page memory.
  * All pointers returned by any nn_env_* function become invalid. */

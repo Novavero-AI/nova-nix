@@ -122,8 +122,12 @@ typedef struct nn_op {
 
 /* Initialize the global bytecode store.  op_capacity is initial
  * instruction slots (0 = default 65536).  data_capacity is initial
- * data buffer slots (0 = default 131072).  Both grow automatically. */
+ * data buffer slots (0 = default 131072).  Both grow automatically.
+ * Outside the init .. destroy window both emitters return UINT32_MAX. */
 void nn_bytecode_init(uint32_t op_capacity, uint32_t data_capacity);
+
+/* Nonzero between nn_bytecode_init and nn_bytecode_destroy. */
+int nn_bytecode_live(void);
 
 /* Destroy the global bytecode store, freeing all memory. */
 void nn_bytecode_destroy(void);

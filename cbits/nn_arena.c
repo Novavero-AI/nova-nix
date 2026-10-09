@@ -14,7 +14,17 @@
  */
 
 #include "nn_arena.h"
+#include "nn_bytecode.h"
+#include "nn_env.h"
+#include "nn_symbol.h"
 #include "nn_thunk.h"
+
+int
+nn_arena_live(void)
+{
+    return nn_symbol_live() && nn_thunk_live() && nn_env_live()
+        && nn_bytecode_live();
+}
 
 uint32_t
 nn_arena_stableptr_count(void)

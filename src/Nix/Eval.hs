@@ -12,6 +12,13 @@
 -- The evaluator maintains an environment ('Env') that maps variable
 -- names to thunks.  @let@, @with@, function application, and
 -- recursive attribute sets all extend the environment.
+--
+-- Thunks, environments and values live in the C data layer, so
+-- everything here that builds or forces one runs between
+-- 'Nix.Eval.Arena.arenaInit' and 'Nix.Eval.Arena.arenaDestroy'
+-- (@bracket_ arenaInit arenaDestroy@).  Outside that window the first
+-- C call raises 'Nix.Eval.CStatus.ArenaNotInitialized' instead of
+-- faulting.
 module Nix.Eval
   ( -- * Values (re-exported from Types)
     NixValue (..),
@@ -1085,7 +1092,7 @@ pushLazyWithScope (Thunk thunkPtr) =
 {-# NOINLINE pushWithScopeRaw #-}
 pushWithScopeRaw :: Ptr () -> Env -> Env
 pushWithScopeRaw ptr (Env envPtr) =
-  Env (checkedCPtr "pushWithScopeRaw" (unsafePerformIO (cenvPushWith envPtr ptr)))
+  Env (unsafePerformIO (checkedCPtr "nn_env_push_with" =<< cenvPushWith envPtr ptr))
 
 -- ---------------------------------------------------------------------------
 -- Formals matching + env helpers (used by evalBcApp, applyValue, etc.)

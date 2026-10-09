@@ -1,18 +1,40 @@
 -- | Unified arena lifecycle for the C data layer.
 --
 -- Initializes and destroys all C sub-arenas (symbol table, thunk arena,
--- env slot allocator) with a single pair of calls.  Handles StablePtr
--- cleanup on destruction: iterates all thunks, identifies payloads that
--- are Haskell StablePtrs (PENDING + COMPUTED\/PTR), and frees them
--- before tearing down the C memory.
+-- env slot allocator, bytecode store) with a single pair of calls.
+-- Handles StablePtr cleanup on destruction: iterates all thunks,
+-- identifies payloads that are Haskell StablePtrs (PENDING +
+-- COMPUTED\/PTR), and frees them before tearing down the C memory.
+--
+-- Everything that evaluates runs between the two calls:
 --
 -- @
 -- bracket_ arenaInit arenaDestroy $ do
 --   ... evaluation ...
 -- @
+--
+-- Outside that window the C layer has no memory to hand out, and every
+-- path into it ('Nix.Builtins.builtinEnv', 'Nix.Eval.eval',
+-- 'Nix.Eval.force', the value constructors) raises
+-- 'ArenaNotInitialized' naming the C entry point that refused, rather
+-- than dereferencing state that does not exist.  Parsing ("Nix.Parser")
+-- is pure and needs no arena.
+--
+-- 'ArenaNotInitialized' is a setup diagnosis: add the bracket and start
+-- the process again.  It is not an error to catch and retry in the same
+-- process, because GHC updates a thunk whose evaluation raised with that
+-- exception: a library constant that reached C before the window (the
+-- shared null thunk, the @true@ and @false@ slots of
+-- 'Nix.Builtins.builtinEnv') re-raises it inside a later, live arena.
+-- Removing those process-lifetime constants is #19.
 module Nix.Eval.Arena
-  ( arenaInit,
+  ( -- * Lifecycle
+    arenaInit,
     arenaDestroy,
+    arenaLive,
+
+    -- * Errors
+    CStatusError (..),
   )
 where
 
@@ -25,6 +47,7 @@ import Nix.Eval.CCtxStr (cctxstrFreeAll)
 import Nix.Eval.CEnv (cenvDestroy, cenvInit)
 import Nix.Eval.CLambda (clambdaFreeAll)
 import Nix.Eval.CList (clistFreeAll)
+import Nix.Eval.CStatus (CStatusError (..), arenaLive)
 import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
 import Nix.Eval.Symbol (symbolDestroy, symbolInit)
 

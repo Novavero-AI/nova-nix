@@ -6,6 +6,11 @@
 -- (@true@, @false@, @null@, @storeDir@, @currentTime@,
 -- @currentSystem@, etc.), among them @derivation@: upstream's wrapper
 -- lambda around the @derivationStrict@ primop, evaluated from its source.
+--
+-- The environment is allocated in the C data layer, so 'builtinEnv' must
+-- be forced between 'Nix.Eval.Arena.arenaInit' and
+-- 'Nix.Eval.Arena.arenaDestroy'; outside that window forcing it raises
+-- 'Nix.Eval.CStatus.ArenaNotInitialized'.
 module Nix.Builtins
   ( -- * Builtin registration
     builtinEnv,
