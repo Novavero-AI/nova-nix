@@ -174,6 +174,15 @@ data Expr
     EHasAttr !Expr !AttrPath
   | -- | Function application: @f x@.
     EApp !Expr !Expr
+  | -- | A deferred application built by a builtin: upstream's app value
+    -- (@mkApp@), where 'EApp' is its @ExprCall@.  Forcing one opens the
+    -- call frame and forces the function inside it; an 'EApp' evaluates
+    -- the function first and opens the frame around the call alone.
+    -- That is the only difference, and it shows only when the function
+    -- is itself a deferred application, as in @builtins.mapAttrs@, whose
+    -- @f name value@ upstream builds as two nested app values.  The
+    -- parser never produces one.
+    EDeferredApp !Expr !Expr
   | -- | Lambda: @formals: body@.
     --
     -- The 'CaptureInfo' field is populated by 'Nix.Expr.ClosureTrim.trimClosures'

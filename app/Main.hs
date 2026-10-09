@@ -32,6 +32,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
+import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.IO (EvalState (..), newEvalState, runEvalIO)
 import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
@@ -307,12 +308,13 @@ main = do
   args <- getArgs
   dataDir <- resolveDataDir
   opts <- either (failWith . T.pack) pure (parseArgs args)
+  config <- loadConfigSources >>= either (failWith . ("error: " <>)) pure . Config.resolveConfig
   case optCommand opts of
-    CmdEvalFile filePath -> evalFile (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir filePath
+    CmdEvalFile filePath -> evalFile config (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir filePath
     CmdEvalExpr expr
-      | optAterm opts -> evalExprAterm (chosenStoreDir opts) (optNixPaths opts) dataDir expr
-      | otherwise -> evalExpr (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir expr
-    CmdBuild target attrPath -> buildCommand opts dataDir target attrPath
+      | optAterm opts -> evalExprAterm config (chosenStoreDir opts) (optNixPaths opts) dataDir expr
+      | otherwise -> evalExpr config (chosenStoreDir opts) (optStrict opts) (optNixPaths opts) dataDir expr
+    CmdBuild target attrPath -> buildCommand config opts dataDir target attrPath
     CmdPush pushArgs -> pushCommand opts pushArgs
     CmdStoreDelete paths -> storeDeleteCommand opts paths
     CmdUsage -> mapM_ (hPutStrLn stderr) usageLines >> exitFailure
@@ -354,9 +356,9 @@ usageLines =
     "  --substituter URL      Try this binary cache before building",
     "  --trusted-key K        Public key (name:base64) for the substituter",
     "",
-    "  substituters and trusted-public-keys also read from",
-    "  $XDG_CONFIG_HOME/nix/nix.conf and $NIX_CONFIG; the flags above",
-    "  add to whatever those configure.",
+    "  substituters, trusted-public-keys and max-call-depth also read",
+    "  from $XDG_CONFIG_HOME/nix/nix.conf and $NIX_CONFIG; the flags",
+    "  above add to whatever those configure.",
     "",
     "  --help                 Print this text and exit",
     "  --version              Print the version and exit"
@@ -386,20 +388,18 @@ exprSourceName :: T.Text
 exprSourceName = "<expr>"
 
 -- | Evaluate a .nix file and print the result.
-evalFile :: StoreDir -> Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
-evalFile storeDir strict extraPaths dataDir rawFilePath = do
+evalFile :: NixConfig -> StoreDir -> Bool -> [T.Text] -> FilePath -> FilePath -> IO ()
+evalFile config storeDir strict extraPaths dataDir rawFilePath = do
   (filePath, source) <- readSourceFile rawFilePath
   case parseNix (takeDirectory filePath) (T.pack filePath) source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st0 <- newEvalState storeDir (takeDirectory filePath)
-      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
-          st = st0 {esSearchPaths = searchPaths}
+      st <- configuredEvalState config storeDir extraPaths dataDir (takeDirectory filePath)
       result <-
         runEvalIO st $
-          eval (builtinEnv (esTimestamp st) searchPaths) expr >>= finalize strict
+          eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr >>= finalize strict
       case result of
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
@@ -407,20 +407,18 @@ evalFile storeDir strict extraPaths dataDir rawFilePath = do
         Right forced -> TIO.putStrLn (prettyValue forced)
 
 -- | Evaluate an inline expression and print the result.
-evalExpr :: StoreDir -> Bool -> [T.Text] -> FilePath -> T.Text -> IO ()
-evalExpr storeDir strict extraPaths dataDir source = do
+evalExpr :: NixConfig -> StoreDir -> Bool -> [T.Text] -> FilePath -> T.Text -> IO ()
+evalExpr config storeDir strict extraPaths dataDir source = do
   cwd <- getCurrentDirectory
   case parseNix cwd exprSourceName source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st0 <- newEvalState storeDir cwd
-      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
-          st = st0 {esSearchPaths = searchPaths}
+      st <- configuredEvalState config storeDir extraPaths dataDir cwd
       result <-
         runEvalIO st $
-          eval (builtinEnv (esTimestamp st) searchPaths) expr >>= finalize strict
+          eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr >>= finalize strict
       case result of
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
@@ -429,19 +427,17 @@ evalExpr storeDir strict extraPaths dataDir source = do
 
 -- | Evaluate an inline expression to a derivation and print its ATerm (.drv
 -- contents), for diffing nova-nix's serialization against upstream Nix.
-evalExprAterm :: StoreDir -> [T.Text] -> FilePath -> T.Text -> IO ()
-evalExprAterm storeDir extraPaths dataDir source = do
+evalExprAterm :: NixConfig -> StoreDir -> [T.Text] -> FilePath -> T.Text -> IO ()
+evalExprAterm config storeDir extraPaths dataDir source = do
   cwd <- getCurrentDirectory
   case parseNix cwd exprSourceName source of
     Left err -> do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st0 <- newEvalState storeDir cwd
-      let searchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0)
-          st = st0 {esSearchPaths = searchPaths}
+      st <- configuredEvalState config storeDir extraPaths dataDir cwd
       result <- runEvalIO st $ do
-        val <- eval (builtinEnv (esTimestamp st) searchPaths) expr
+        val <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
         forceDerivationAttrs val
         pure val
       case result of
@@ -487,11 +483,10 @@ forceDerivationAttrs val = case val of
 derivationAttrKeys :: [T.Text]
 derivationAttrKeys = ["type", "drvPath", "outputName"]
 
-buildCommand :: CliOpts -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
-buildCommand opts dataDir target attrPath = do
+buildCommand :: NixConfig -> CliOpts -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
+buildCommand config opts dataDir target attrPath = do
   let storeDir = chosenStoreDir opts
-  configSources <- loadConfigSources
-  caches <- either failWith pure (resolveCaches configSources (optSubstituter opts) (optTrustedKey opts))
+      caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
   (baseDir, sourceName, source) <- loadBuildSource target
   case parseNix baseDir sourceName source of
@@ -499,11 +494,9 @@ buildCommand opts dataDir target attrPath = do
       hPutStrLn stderr ("parse error: " ++ show err)
       exitFailure
     Right expr -> do
-      st0 <- newEvalState storeDir baseDir
-      let searchPaths = mergeSearchPaths (optNixPaths opts) dataDir (esSearchPaths st0)
-          st = st0 {esSearchPaths = searchPaths}
+      st <- configuredEvalState config storeDir (optNixPaths opts) dataDir baseDir
       result <- runEvalIO st $ do
-        root <- eval (builtinEnv (esTimestamp st) searchPaths) expr
+        root <- eval (builtinEnv (esTimestamp st) (esSearchPaths st)) expr
         selected <- case attrPath of
           Nothing -> pure (Right root)
           Just path -> selectAttrPath path root
@@ -629,20 +622,31 @@ configToCaches config =
   | url <- ncSubstituters config
   ]
 
--- | Resolve the caches from the config sources plus the CLI flags.  The
--- sources are ordered weakest first (user file, then @NIX_CONFIG@); the
--- CLI @--substituter@ and @--trusted-key@ append on top, the highest
--- precedence, so a flag adds to the configured set rather than being
--- overridden by it.
-resolveCaches :: [T.Text] -> Maybe String -> Maybe String -> Either T.Text [CacheConfig]
-resolveCaches sources mUrl mKey = do
-  base <- Config.resolveConfig sources
-  let withCli =
-        base
-          { ncSubstituters = ncSubstituters base ++ maybe [] (\url -> [T.pack url]) mUrl,
-            ncTrustedPublicKeys = ncTrustedPublicKeys base ++ maybe [] (\key -> [T.pack key]) mKey
-          }
-  pure (configToCaches withCli)
+-- | Resolve the caches from the resolved config plus the CLI flags.  The
+-- config sources are ordered weakest first (user file, then
+-- @NIX_CONFIG@); the CLI @--substituter@ and @--trusted-key@ append on
+-- top, the highest precedence, so a flag adds to the configured set
+-- rather than being overridden by it.
+resolveCaches :: NixConfig -> Maybe String -> Maybe String -> [CacheConfig]
+resolveCaches base mUrl mKey =
+  configToCaches
+    base
+      { ncSubstituters = ncSubstituters base ++ maybe [] (\url -> [T.pack url]) mUrl,
+        ncTrustedPublicKeys = ncTrustedPublicKeys base ++ maybe [] (\key -> [T.pack key]) mKey
+      }
+
+-- | The state a command evaluates under: the store, the directory relative
+-- paths resolve against, the search path merged from the flags, the data
+-- directory and @NIX_PATH@, and the call-depth ceiling the config cascade
+-- resolved.
+configuredEvalState :: NixConfig -> StoreDir -> [T.Text] -> FilePath -> FilePath -> IO EvalState
+configuredEvalState config storeDir extraPaths dataDir baseDir = do
+  st0 <- newEvalState storeDir baseDir
+  pure
+    st0
+      { esSearchPaths = mergeSearchPaths extraPaths dataDir (esSearchPaths st0),
+        esCallDepth = topLevelCallDepth (ncMaxCallDepth config)
+      }
 
 -- | The nix.conf sources, weakest first: the user file, then @NIX_CONFIG@.
 -- Reading is best effort - a missing or unreadable file is simply absent -

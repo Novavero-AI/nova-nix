@@ -68,6 +68,10 @@ module Nix.Eval.CBytecode
     pattern OpSearchPath,
     pattern OpPathStr,
 
+    -- * App flags
+    appDirect,
+    appDeferred,
+
     -- * UnaryOp flags
     unaryNot,
     unaryNegate,
@@ -343,6 +347,13 @@ pattern OpPathStr = 24
 -- ---------------------------------------------------------------------------
 -- Sub-type flags
 -- ---------------------------------------------------------------------------
+
+-- | @OpApp@ flag values: a source application ('Nix.Expr.Types.EApp')
+-- evaluates its function before the call frame opens; a deferred one
+-- ('Nix.Expr.Types.EDeferredApp') forces it inside the frame.
+appDirect, appDeferred :: Word8
+appDirect = 0
+appDeferred = 1
 
 -- | @OpUnary@ flag values: which unary operator to apply.
 unaryNot, unaryNegate :: Word8
