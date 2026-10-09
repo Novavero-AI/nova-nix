@@ -58,7 +58,7 @@ import qualified Nix.Hash as Hash
 import Nix.Http (userAgent, withUserAgent)
 import Nix.Parser (ParseError (..), parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
-import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
+import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
 import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
@@ -5085,6 +5085,16 @@ testPushPure = do
         assertEqual "Deriver" (Just (hashB <> "-dep-2.0")) (NarInfo.niDeriver ni),
       runTest "no client-side signatures" $
         assertEqual "Sigs" ([] :: [Text]) (NarInfo.niSigs ni),
+      -- The first main run of the cache job pushed a store's first valid
+      -- path alphabetically, a .drv, and the cache refused its narinfo:
+      -- a store registers recipes as valid paths, a cache serves outputs.
+      runTest "outputPathsOnly drops derivations and keeps everything else" $
+        assertEqual
+          "outputs"
+          ["hello", "hello.drv.tar", "src"]
+          (map spName (outputPathsOnly [StorePath (T.replicate 32 "a") "hello", StorePath (T.replicate 32 "b") "hello.drv", StorePath (T.replicate 32 "c") "hello.drv.tar", StorePath (T.replicate 32 "d") "src"])),
+      runTest "isDerivationPath is the .drv suffix on the name, not the hash" $
+        assertEqual "drv" [True, False, False] (map isDerivationPath [StorePath (T.replicate 32 "a") "x.drv", StorePath (T.replicate 32 "b") "x", StorePath (T.replicate 32 "c") "drv"]),
       runTest "planMissing keeps only uncached paths" $
         assertEqual
           "missing"
