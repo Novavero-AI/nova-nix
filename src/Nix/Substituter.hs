@@ -57,6 +57,12 @@ module Nix.Substituter
     compressedBodyCeiling,
     downloadCapFor,
 
+    -- * Verified NAR bytes
+    VerifiedNar,
+    verifyNar,
+    verifiedNarBytes,
+    verifiedNarDigest,
+
     -- * Pure helpers (exported for testing)
     maxNarInfoBody,
     readBodyCapped,
@@ -75,7 +81,6 @@ module Nix.Substituter
     cappedBodySource,
     materializeNarFromSource,
     consumeNarStream,
-    unpackNarEntry,
     unpackAndVerify,
     clearStaleDestination,
     parseReferences,
@@ -318,42 +323,88 @@ renderValidationError verr = case verr of
     fieldError field raw parseErr =
       field <> " '" <> raw <> "' does not parse: " <> T.pack parseErr
 
--- | Verify the NAR hash and size, deserialize, unpack to the store, and set
--- permissions.  Returns the path's registration for the caller to record;
--- no database write happens here (see 'SubstSuccess').  The strict
--- counterpart of the streaming pipeline, kept as its differential
--- oracle: the suite materializes the same NAR through both and
--- requires identical trees.  It follows the same per-path lock
--- protocol as the live pipeline: the lock is taken before the stale
--- destination is cleared, validity re-checks under it, and a success
--- carries the lock still held.
+-- | NAR bytes that passed 'verifyNar': they hash to the narinfo's
+-- signed NarHash and count its signed NarSize.  The constructor is not
+-- exported, so 'verifyNar' is the only way to obtain one and
+-- 'unpackVerifiedNar', the strict pipeline's unpack sink, cannot be
+-- reached with bytes that skipped the check: verify-then-unpack is a
+-- type, not a statement order.  The decoded digest rides along because
+-- registration records its canonical spelling and the on-disk recheck
+-- compares against it, so neither re-parses the narinfo's NarHash.
+-- Only the strict pipeline can carry this: the streaming pipeline
+-- writes to disk before the hash can be known (upstream's ordering)
+-- and relies on its cleanup contract instead
+-- ('materializeNarFromSource').
+data VerifiedNar = VerifiedNar !BS.ByteString !Hash.NixHash
+  deriving (Eq, Show)
+
+-- | The verified bytes.
+verifiedNarBytes :: VerifiedNar -> BS.ByteString
+verifiedNarBytes (VerifiedNar bytes _) = bytes
+
+-- | The digest the verified bytes hash to, decoded from the narinfo's
+-- NarHash.
+verifiedNarDigest :: VerifiedNar -> Hash.NixHash
+verifiedNarDigest (VerifiedNar _ digest) = digest
+
+-- | The only constructor of a 'VerifiedNar': the hash check, then the
+-- size check, with the decoded declared digest carried out.  The NAR
+-- hash is the content-addressed integrity contract; the signature only
+-- attests to the narinfo, not the body, so network corruption or a
+-- compromised cache is caught here, before the bytes are trusted.
+verifyNar :: NarInfo.NarInfo -> BS.ByteString -> Either Text VerifiedNar
+verifyNar narInfo rawNar = do
+  declared <- verifyNarHash narInfo rawNar
+  verifyNarSize narInfo rawNar
+  pure (VerifiedNar rawNar declared)
+
+-- | Verify the NAR hash and size, deserialize, unpack to the store, and
+-- set permissions: 'verifyNar', then 'unpackVerifiedNar'.  Returns the
+-- path's registration for the caller to record; no database write
+-- happens here (see 'SubstSuccess').  The strict counterpart of the
+-- streaming pipeline, kept as its differential oracle: the suite
+-- materializes the same NAR through both and requires identical trees.
 unpackAndVerify :: Store -> StorePath -> NarInfo.NarInfo -> BS.ByteString -> IO SubstResult
 unpackAndVerify store sp narInfo rawNar =
-  -- Verify the downloaded NAR's hash matches the (signed) narinfo BEFORE
-  -- trusting its bytes.  The NAR hash is the content-addressed integrity
-  -- contract; the signature only attests to the narinfo, not the body, so
-  -- network corruption or a compromised cache must be caught here.
-  -- Narinfo metadata is likewise parsed before any disk write: a malformed
+  -- Narinfo metadata is parsed before any disk write: a malformed
   -- narinfo must not leave an unpacked-but-unregistered path behind.
   case verifiedInputs of
     Left err -> pure (SubstError err)
-    Right (declared, (refs, deriver)) -> case NAR.deserialise rawNar of
-      Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
-      Right narEntry -> do
-        lock <- acquirePathLock (stDir store) sp
-        result <- unpackLocked declared refs deriver narEntry lock `onException` releasePathLock lock
-        case result of
-          SubstSuccess _ _ -> pure result
-          other -> do
-            releasePathLock lock
-            pure other
+    Right (verified, refs, deriver) -> unpackVerifiedNar store sp verified refs deriver
   where
-    unpackLocked declared refs deriver narEntry lock = do
+    verifiedInputs = do
+      verified <- verifyNar narInfo rawNar
+      refs <- parseReferences (NarInfo.niReferences narInfo)
+      deriver <- parseDeriver (stDir store) (NarInfo.niDeriver narInfo)
+      pure (verified, refs, deriver)
+
+-- | The strict pipeline's unpack sink: deserialize a 'VerifiedNar',
+-- materialize it at the store path, seal it read-only, and recheck the
+-- tree on disk against the carried digest before building its
+-- registration from the references and deriver.  Follows the same
+-- per-path lock protocol as the live pipeline: the lock is taken
+-- before the stale destination is cleared, validity re-checks under
+-- it, and a success carries the lock still held.
+unpackVerifiedNar :: Store -> StorePath -> VerifiedNar -> [StorePath] -> Maybe Text -> IO SubstResult
+unpackVerifiedNar store sp verified refs deriver =
+  case NAR.deserialise (verifiedNarBytes verified) of
+    Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
+    Right narEntry -> do
+      lock <- acquirePathLock (stDir store) sp
+      result <- unpackLocked narEntry lock `onException` releasePathLock lock
+      case result of
+        SubstSuccess _ _ -> pure result
+        other -> do
+          releasePathLock lock
+          pure other
+  where
+    digest = verifiedNarDigest verified
+    destPath = storePathToFilePath (stDir store) sp
+    unpackLocked narEntry lock = do
       alreadyValid <- isValid store sp
       if alreadyValid
         then pure SubstAlreadyValid
         else do
-          let destPath = storePathToFilePath (stDir store) sp
           unpackResult <-
             fmap
               Right
@@ -368,15 +419,15 @@ unpackAndVerify store sp narInfo rawNar =
             Right (Right ()) -> do
               setReadOnly destPath
               -- A path registered valid must match its recorded hash ON
-              -- DISK, not merely in the downloaded bytes: any divergence
+              -- DISK, not merely in the verified bytes: any divergence
               -- the filesystem introduced between the NAR and the
               -- materialized tree (name folding, link replication) must
               -- surface here, before the row exists.  A mismatching tree
               -- is removed - left in place it would be adopted by
               -- existence checks at this path.
               onDisk <- ExecBit.serialiseFromPath destPath
-              case verifyNarHash narInfo (NAR.serialise onDisk) of
-                Left _ -> do
+              if Hash.hashBytes (NAR.serialise onDisk) /= digest
+                then do
                   Dir.removePathForcibly destPath
                   pure
                     ( SubstError
@@ -384,7 +435,7 @@ unpackAndVerify store sp narInfo rawNar =
                             <> T.pack destPath
                         )
                     )
-                Right _ ->
+                else
                   pure $
                     SubstSuccess
                       PathRegistration
@@ -392,24 +443,15 @@ unpackAndVerify store sp narInfo rawNar =
                           -- The canonical spelling of the verified digest,
                           -- so the DB converges on one hash spelling
                           -- regardless of the cache's.
-                          prNarHash = Hash.formatNixHash declared,
-                          -- The verified actual byte count (equal to the declared
-                          -- NarSize per 'verifyNarSize') - no Integer conversion
-                          -- that could wrap.
-                          prNarSize = BS.length rawNar,
+                          prNarHash = Hash.formatNixHash digest,
+                          -- The verified actual byte count (equal to the
+                          -- declared NarSize per 'verifyNarSize') - no
+                          -- Integer conversion that could wrap.
+                          prNarSize = BS.length (verifiedNarBytes verified),
                           prDeriver = deriver,
                           prReferences = refs
                         }
                       lock
-    verifiedInputs = do
-      declared <- verifyNarHash narInfo rawNar
-      verifyNarSize narInfo rawNar
-      meta <- registrationMeta
-      pure (declared, meta)
-    registrationMeta = do
-      refs <- parseReferences (NarInfo.niReferences narInfo)
-      deriver <- parseDeriver (stDir store) (NarInfo.niDeriver narInfo)
-      pure (refs, deriver)
 
 -- | Verify that the downloaded NAR bytes hash to the narinfo's declared
 -- NarHash, returning the decoded digest on success so registration can
@@ -1081,11 +1123,8 @@ parseDeriver storeDir (Just txt)
 -- 'Dir.removePathForcibly' clears read-only marks and accepts a missing
 -- path, so the fresh unpack always starts from a clean slate.
 -- Substitution callers reach this only holding the path's exclusive
--- lock ('trySubstitute', 'unpackAndVerify'): unlocked, this deletion is
+-- lock ('trySubstitute', 'unpackVerifiedNar'): unlocked, this deletion is
 -- exactly the race that lets one process remove a tree another just
 -- registered.
 clearStaleDestination :: FilePath -> IO ()
 clearStaleDestination = Dir.removePathForcibly
-
--- unpackNarEntry lives in 'Nix.Store' (one tree-materializer for the
--- codebase) and is re-exported here for its historical callers and tests.

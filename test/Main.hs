@@ -59,7 +59,7 @@ import Nix.Http (userAgent, withUserAgent)
 import Nix.Parser (ParseError (..), parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, caseHackDiskNames, closeStore, copyPathInto, deleteStorePathRaw, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, tryAcquirePathLock, unpackNarEntry, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -3711,7 +3711,7 @@ testSubstituter = do
         createDirectoryIfMissing True tmpDir
         strictOutcome <- case NAR.deserialise streamTestNar of
           Left err -> pure (Left (T.pack err))
-          Right entry -> Subst.unpackNarEntry (tmpDir </> "strict") entry
+          Right entry -> unpackNarEntry (tmpDir </> "strict") entry
         source <- chunkReader (streamChunks 11 streamTestNar)
         streamOutcome <- Subst.consumeNarStream (tmpDir </> "streamed") (streamTestNarInfo streamTestNar) streamTestDigest source
         strictTree <- NAR.serialiseFromPath (tmpDir </> "strict")
@@ -3756,6 +3756,23 @@ testSubstituter = do
         case Subst.verifyNarHash (sampleNarInfo "not-a-hash") sampleNarBytes of
           Left _ -> Pass
           Right _ -> Fail "expected malformed-hash rejection",
+      -- verifyNar: the only constructor of VerifiedNar carries the bytes
+      -- unchanged and the declared digest decoded, so the unpack sink
+      -- and the registration read both from the witness.
+      runTest "verifyNar carries the bytes and the declared digest" $
+        case Subst.verifyNar (sampleNarInfo sampleNarHash) sampleNarBytes of
+          Right verified
+            | Subst.verifiedNarBytes verified /= sampleNarBytes -> Fail "verified bytes differ from the input"
+            | CHash.formatNixHash (Subst.verifiedNarDigest verified) /= sampleNarHash -> Fail "carried digest is not the declared hash"
+            | otherwise -> Pass
+          Left err -> Fail ("expected acceptance, got: " <> err),
+      -- verifyNar: either signed claim failing yields no witness at all.
+      runTest "verifyNar rejects a hash or size mismatch" $
+        let wrongHash = Subst.verifyNar (sampleNarInfo wrongNarHash) sampleNarBytes
+            wrongSize = Subst.verifyNar ((sampleNarInfo sampleNarHash) {NarInfo.niNarSize = toInteger (BS.length sampleNarBytes) + 1}) sampleNarBytes
+         in case (wrongHash, wrongSize) of
+              (Left _, Left _) -> Pass
+              other -> Fail ("expected both rejections, got: " <> T.pack (show other)),
       -- narInfoMatchesPath: identity match accepted
       runTest "narInfoMatchesPath accepts matching identity" $
         if Subst.narInfoMatchesPath (StorePath sampleHash "hello") (sampleNarInfo sampleNarHash)
@@ -3887,7 +3904,7 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-unsafe"
             evil name = NAR.NarDirectory [(name, NAR.NarRegular False "x")]
-        results <- mapM (Subst.unpackNarEntry dest . evil) ["..", ".", "", "a/b", "a\\b"]
+        results <- mapM (unpackNarEntry dest . evil) ["..", ".", "", "a/b", "a\\b"]
         Subst.clearStaleDestination dest
         pure $
           if all (\case Left _ -> True; Right () -> False) results
@@ -3901,7 +3918,7 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-rawname"
             tree = NAR.NarDirectory [(BS.pack [0xFF], NAR.NarRegular False "x")]
-        result <- Subst.unpackNarEntry dest tree
+        result <- unpackNarEntry dest tree
         Subst.clearStaleDestination dest
         pure $ case result of
           Left err -> if "not valid UTF-8" `T.isInfixOf` err then Pass else Fail ("wrong error: " <> err)
@@ -3910,7 +3927,7 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-rawtarget"
             tree = NAR.NarDirectory [("link", NAR.NarSymlink (BS.pack [0xFF]))]
-        result <- Subst.unpackNarEntry dest tree
+        result <- unpackNarEntry dest tree
         Subst.clearStaleDestination dest
         pure $ case result of
           Left err -> if "not valid UTF-8" `T.isInfixOf` err then Pass else Fail ("wrong error: " <> err)
@@ -3927,7 +3944,7 @@ testSubstituter = do
                   ("link", NAR.NarSymlink "real")
                 ]
         Subst.clearStaleDestination dest
-        result <- Subst.unpackNarEntry dest tree
+        result <- unpackNarEntry dest tree
         outcome <- case result of
           Right () -> do
             isLink <- Dir.pathIsSymbolicLink (dest </> "link")
@@ -3948,7 +3965,7 @@ testSubstituter = do
                   ("zdir", NAR.NarDirectory [("f", NAR.NarRegular False "x")])
                 ]
         Subst.clearStaleDestination dest
-        result <- Subst.unpackNarEntry dest tree
+        result <- unpackNarEntry dest tree
         outcome <- case result of
           Left _ -> pure Pass -- symlinks unavailable here; the loud failure is the contract
           Right () -> do
@@ -3970,7 +3987,7 @@ testSubstituter = do
                   ("foo", NAR.NarRegular False "lower")
                 ]
         Subst.clearStaleDestination dest
-        result <- Subst.unpackNarEntry dest tree
+        result <- unpackNarEntry dest tree
         outcome <- case result of
           Left err -> pure (Fail ("unpack failed: " <> err))
           Right () -> do
@@ -4012,7 +4029,7 @@ testSubstituter = do
         let dest = tmpBase </> "nova-nix-test-unpack-suffix"
             tree = NAR.NarDirectory [("x~nix~case~hack~1", NAR.NarRegular False "v")]
         Subst.clearStaleDestination dest
-        result <- Subst.unpackNarEntry dest tree
+        result <- unpackNarEntry dest tree
         outcome <-
           if SI.os == "mingw32" || SI.os == "darwin"
             then case result of
@@ -4082,7 +4099,50 @@ testSubstituter = do
             if prNarHash reg == narHash && onDisk == "verified bytes"
               then Pass
               else Fail "registration or on-disk bytes diverge from the declared hash"
-          other -> Fail ("unpackAndVerify failed: " <> T.pack (show other))
+          other -> Fail ("unpackAndVerify failed: " <> T.pack (show other)),
+      -- The verify-fails branch of the strict pipeline: bytes that do
+      -- not match the narinfo's signed NarHash or NarSize never reach
+      -- the unpack sink, so nothing is written at the store path and
+      -- the lock is free afterwards.
+      runTestM "unpackAndVerify writes nothing for a NAR that fails verification" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-unpack-unverified"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath (T.replicate 32 "f") "unverified"
+            rawNar = NAR.serialise (NAR.NarDirectory [("data.txt", NAR.NarRegular False "untrusted bytes")])
+            consistent =
+              NarInfo.NarInfo
+                { NarInfo.niStorePath = storePathToText defaultStoreDir sp,
+                  NarInfo.niUrl = "nar/unverified.nar",
+                  NarInfo.niCompression = "none",
+                  NarInfo.niFileHash = Nothing,
+                  NarInfo.niFileSize = Nothing,
+                  NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes rawNar),
+                  NarInfo.niNarSize = toInteger (BS.length rawNar),
+                  NarInfo.niReferences = [],
+                  NarInfo.niDeriver = Nothing,
+                  NarInfo.niSigs = [],
+                  NarInfo.niCA = Nothing
+                }
+            wrongHash = consistent {NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes "not the nar")}
+            wrongSize = consistent {NarInfo.niNarSize = toInteger (BS.length rawNar) + 1}
+            destPath = storePathToFilePath (stDir store) sp
+        hashResult <- Subst.unpackAndVerify store sp wrongHash rawNar
+        sizeResult <- Subst.unpackAndVerify store sp wrongSize rawNar
+        written <- Dir.doesPathExist destPath
+        reLock <- tryAcquirePathLock (StoreDir tmpStore) sp
+        mapM_ releasePathLock reLock
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure $ case (hashResult, sizeResult, reLock) of
+          (Subst.SubstError hashErr, Subst.SubstError sizeErr, Just _)
+            | written -> Fail "an unverified NAR reached the store path"
+            | not ("NAR hash mismatch" `T.isInfixOf` hashErr) -> Fail ("wrong hash error: " <> hashErr)
+            | not ("NAR size mismatch" `T.isInfixOf` sizeErr) -> Fail ("wrong size error: " <> sizeErr)
+            | otherwise -> Pass
+          (_, _, Nothing) -> Fail "lock still held after a refused NAR"
+          other -> Fail ("expected two SubstError results, got: " <> T.pack (show other))
     ]
   where
     chainCache url = Subst.CacheConfig url ["unused-key"] 10
