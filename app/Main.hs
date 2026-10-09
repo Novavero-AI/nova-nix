@@ -17,6 +17,7 @@ import Control.Monad (void, (>=>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (readIORef)
+import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
 import qualified Data.Text as T
@@ -27,7 +28,7 @@ import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBu
 import Nix.Builtins (builtinEnv, parseNixPath)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
-import Nix.Derivation (Derivation (..), DerivationOutput (..), toATerm)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Eval (MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
@@ -36,7 +37,7 @@ import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCP
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
 import Nix.Store (DeleteOutcome (..), Store (..), closeStore, deleteStorePathRaw, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
-import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath)
+import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
 import System.Directory (Permissions (executable), XdgDirectory (XdgConfig), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, getXdgDirectory)
@@ -448,10 +449,13 @@ evalExprAterm storeDir extraPaths dataDir source = do
           TIO.hPutStrLn stderr ("error: " <> err)
           exitFailure
         Right val -> do
-          (drv, _) <- extractDerivation val
-          -- Raw ATerm bytes (BC.putStrLn bypasses the handle encoding),
-          -- so the printed .drv diffs byte-exactly against upstream's.
-          BC.putStrLn (toATerm drv)
+          drvSP <- derivationPath val
+          drvClosure <- readIORef (esDrvClosure st)
+          aterm <- recordedAterm drvClosure drvSP
+          -- The recorded bytes, not a re-serialization: these are what the
+          -- path hashes.  BC.putStrLn bypasses the handle encoding, so the
+          -- printed .drv diffs byte-exactly against upstream's.
+          BC.putStrLn aterm
 
 -- | Parse, evaluate, extract derivation, build, and print result.
 -- The file argument is canonicalized for the same reason as in 'evalFile'.
@@ -465,9 +469,11 @@ loadBuildSource (TargetExpr source) = do
   cwd <- getCurrentDirectory
   pure (cwd, exprSourceName, source)
 
--- | Force the attributes 'extractDerivation' goes on to read.  @derivation@
+-- | Force the attributes 'derivationPath' goes on to read.  @derivation@
 -- is a lazy wrapper, and 'readThunkValue' answers 'Nothing' for a thunk that
 -- was never forced, so skipping this reports a real derivation as not one.
+-- Forcing @drvPath@ is also what computes the derivation and records its
+-- @.drv@ in the session closure ('recordedAterm').
 forceDerivationAttrs :: (MonadEval m) => NixValue -> m ()
 forceDerivationAttrs val = case val of
   VAttrs attrs ->
@@ -476,10 +482,10 @@ forceDerivationAttrs val = case val of
       derivationAttrKeys
   _ -> pure ()
 
--- | What a build needs forced: the marker, the wrapper, and the path whose
--- closure the build driver writes.
+-- | What a build needs forced: the marker, the path whose closure the
+-- build driver writes, and the output it realizes.
 derivationAttrKeys :: [T.Text]
-derivationAttrKeys = ["type", "_derivation", "drvPath"]
+derivationAttrKeys = ["type", "drvPath", "outputName"]
 
 buildCommand :: CliOpts -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
 buildCommand opts dataDir target attrPath = do
@@ -502,7 +508,7 @@ buildCommand opts dataDir target attrPath = do
           Nothing -> pure (Right root)
           Just path -> selectAttrPath path root
         -- Forced after selection, not before: forcing the root leaves the
-        -- selected value's own attributes unforced, and extractDerivation
+        -- selected value's own attributes unforced, and derivationPath
         -- then reports a real derivation as not being one.
         either (pure . Left) (\val -> Right val <$ forceDerivationAttrs val) selected
       case result of
@@ -513,10 +519,17 @@ buildCommand opts dataDir target attrPath = do
           TIO.hPutStrLn stderr ("error: " <> selectionErr)
           exitFailure
         Right (Right val) -> do
-          (drv, drvSP) <- extractDerivation val
+          drvSP <- derivationPath val
+          outputName <- defaultOutputName drvSP val
           -- The full .drv closure (root + every transitive input) recorded
-          -- during evaluation; written to the store before building.
+          -- during evaluation; written to the store before building.  The
+          -- root's own recipe is read from the same map, so what is built
+          -- is what its path hashes.
           drvClosure <- readIORef (esDrvClosure st)
+          drv <- recordedDerivation drvClosure drvSP
+          -- Resolved before the build, as nix-build resolves the output it
+          -- realizes before building anything.
+          outputPath <- namedOutputPath drv outputName
           sourceCache <- readIORef (esSourcePathCache st)
           storeWrites <- readIORef (esStoreWriteCache st)
           store <- openStore (chosenStoreDir opts)
@@ -531,48 +544,65 @@ buildCommand opts dataDir target attrPath = do
           buildResult <- buildAndRegister store caches wrappers drvClosure drv drvSP
           closeStore store
           case buildResult of
-            BuildSuccess sp ->
-              TIO.putStrLn (T.pack (storePathToFilePath (chosenStoreDir opts) sp))
+            BuildSuccess _ ->
+              TIO.putStrLn (T.pack (storePathToFilePath (chosenStoreDir opts) outputPath))
             BuildFailure msg code -> do
               TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
               exitFailure
 
--- | Extract a Derivation and its store path from an evaluated value.
--- The value must be a VAttrs with type = "derivation", a _derivation key
--- holding the Derivation struct, and a drvPath key holding the .drv store path.
--- Both are computed by builtinDerivation during evaluation.
-extractDerivation :: NixValue -> IO (Derivation, StorePath)
-extractDerivation (VAttrs attrs) = do
-  -- Check type = "derivation"
+-- | The @.drv@ store path of an evaluated derivation value: a set with
+-- @type = "derivation"@ whose @drvPath@ has been forced
+-- ('forceDerivationAttrs').  Store paths are ASCII, so the byte payload
+-- decodes strictly.
+derivationPath :: NixValue -> IO StorePath
+derivationPath (VAttrs attrs) = do
   case attrSetLookup "type" attrs of
     Just thunk | Just (VStr "derivation" _) <- readThunkValue thunk -> pure ()
-    _ -> do
-      hPutStrLn stderr "error: result is not a derivation (no type = \"derivation\")"
-      exitFailure
-  drv <- case attrSetLookup "_derivation" attrs of
-    Just thunk | Just (VDerivation d) <- readThunkValue thunk -> pure d
-    _ -> do
-      hPutStrLn stderr "error: derivation result missing _derivation field"
-      exitFailure
-  -- Extract drvPath - this is the store path of the .drv file itself,
-  -- computed by hashing the ATerm serialization during evaluation.
-  -- Store paths are ASCII, so the byte payload decodes strictly.
-  drvSP <- case attrSetLookup "drvPath" attrs of
+    _ -> failWith "error: result is not a derivation (no type = \"derivation\")"
+  case attrSetLookup "drvPath" attrs of
     Just thunk
       | Just (VStr pathBytes _) <- readThunkValue thunk,
         Right path <- TE.decodeUtf8' pathBytes ->
-          case parseStorePath defaultStoreDir path of
-            Just sp -> pure sp
-            Nothing -> do
-              TIO.hPutStrLn stderr ("error: invalid drvPath: " <> path)
-              exitFailure
-    _ -> do
-      hPutStrLn stderr "error: derivation result missing drvPath"
-      exitFailure
-  pure (drv, drvSP)
-extractDerivation _ = do
-  hPutStrLn stderr "error: result is not a derivation"
-  exitFailure
+          maybe (failWith ("error: invalid drvPath: " <> path)) pure (parseStorePath defaultStoreDir path)
+    _ -> failWith "error: derivation result missing drvPath"
+derivationPath _ = failWith "error: result is not a derivation"
+
+-- | The output a build realizes and prints: the value's @outputName@, the
+-- first of its @outputs@, which is what upstream's nix-build builds and
+-- prints for a derivation (nix-build.cc, @queryOutputName@), with its
+-- message for a set that lacks the attribute.
+defaultOutputName :: StorePath -> NixValue -> IO T.Text
+defaultOutputName drvSP val = case val of
+  VAttrs attrs
+    | Just thunk <- attrSetLookup "outputName" attrs,
+      Just (VStr nameBytes _) <- readThunkValue thunk,
+      Right name <- TE.decodeUtf8' nameBytes ->
+        pure name
+  _ -> failWith ("error: derivation '" <> storePathToText defaultStoreDir drvSP <> "' lacks an 'outputName' attribute")
+
+-- | The path of a named output.  A @.drv@ lists its outputs by name, so
+-- the default output is found here by name, never by position.
+namedOutputPath :: Derivation -> T.Text -> IO StorePath
+namedOutputPath drv outputName =
+  case find ((== outputName) . doName) (drvOutputs drv) of
+    Just out -> pure (doPath out)
+    Nothing -> failWith ("error: derivation has no output named '" <> outputName <> "'")
+
+-- | The @.drv@ ATerm evaluation recorded under a derivation path: the exact
+-- bytes whose hash is the path.  Every derivation computed in a session is
+-- recorded when its @drvPath@ is forced ('esDrvClosure'), so an absent entry
+-- means the path was never computed by this evaluation.
+recordedAterm :: Map.Map T.Text BS.ByteString -> StorePath -> IO BS.ByteString
+recordedAterm drvClosure drvSP =
+  case Map.lookup (storePathToText defaultStoreDir drvSP) drvClosure of
+    Just aterm -> pure aterm
+    Nothing -> failWith ("error: no .drv was recorded for " <> storePathToText defaultStoreDir drvSP)
+
+-- | The 'Derivation' a recorded ATerm describes ('recordedAterm').
+recordedDerivation :: Map.Map T.Text BS.ByteString -> StorePath -> IO Derivation
+recordedDerivation drvClosure drvSP = do
+  aterm <- recordedAterm drvClosure drvSP
+  either (failWith . (("error: the recorded .drv for " <> storePathToText defaultStoreDir drvSP <> " does not parse: ") <>)) pure (fromATerm aterm)
 
 -- | The store directory selected by @--store@, or the platform default.
 chosenStoreDir :: CliOpts -> StoreDir
@@ -835,10 +865,6 @@ prettyValue (VAttrs attrs) =
 prettyValue (VLambda {}) = "<lambda>"
 prettyValue (VBuiltin name _) = "<builtin " <> name <> ">"
 prettyValue (VCompiledRegex _) = "<compiled-regex>"
-prettyValue (VDerivation drv) =
-  case drvOutputs drv of
-    (out : _) -> "<derivation " <> T.pack (storePathToFilePath platformStoreDir (doPath out)) <> ">"
-    [] -> "<derivation>"
 
 -- | Render a bracketed sequence the way upstream prints one: the brackets are
 -- separated from the contents by a space, and an empty sequence is @[ ]@ or

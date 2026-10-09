@@ -118,7 +118,6 @@ describe val = case val of
   VPath _ -> "a path"
   VList _ -> "a list"
   VAttrs _ -> "a set"
-  VDerivation _ -> "a set"
   VLambda {} -> "a function"
   VBuiltin _ _ -> "a function"
   VCompiledRegex _ -> "a function"

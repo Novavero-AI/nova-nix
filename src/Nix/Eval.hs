@@ -56,6 +56,7 @@ module Nix.Eval
     typeName,
     evaluated,
     readThunkValue,
+    deferApply,
 
     -- * Fetcher transport validation (pure, exported for tests)
     checkGitUrl,
@@ -78,7 +79,7 @@ module Nix.Eval
   )
 where
 
-import Control.Monad (foldM, forM_, unless, void, when, (>=>))
+import Control.Monad (foldM, foldM_, forM_, unless, void, when, (>=>))
 import qualified Crypto.Hash as CH
 import qualified Data.Array as Array
 import Data.Bits (complement, xor, (.&.), (.|.))
@@ -1294,10 +1295,9 @@ builtinRegistry =
       builtin1 "fetchurl" builtinFetchurl,
       builtin1 "fetchTarball" builtinFetchTarball,
       builtin1 "fetchGit" builtinFetchGit,
-      -- Derivation construction: lazy 'derivation' wrapper over the eager
-      -- 'derivationStrict' primop, as upstream's
-      -- src/libexpr/primops/derivation.nix does.
-      builtin1 "derivation" builtinDerivationLazy,
+      -- Derivation construction.  The lazy 'derivation' wrapper is not a
+      -- primop: it is upstream's derivation.nix, bound as a constant by
+      -- "Nix.Builtins".
       builtin1 "derivationStrict" builtinDerivationStrict,
       -- Error context (pass-through - context only matters on error)
       builtin2 "addErrorContext" (\_ val -> pure val),
@@ -1516,8 +1516,7 @@ executeBuiltin name args = case name of
   "fetchurl" -> apply1 builtinFetchurl
   "fetchTarball" -> apply1 builtinFetchTarball
   "fetchGit" -> apply1 builtinFetchGit
-  -- Derivation construction: lazy 'derivation' over eager 'derivationStrict'
-  "derivation" -> apply1 builtinDerivationLazy
+  -- Derivation construction
   "derivationStrict" -> apply1 builtinDerivationStrict
   -- Error context (pass-through - context only matters on error)
   "addErrorContext" -> apply2 (\_ val -> pure val)
@@ -1570,7 +1569,6 @@ typeOfValue val = case val of
   VAttrs _ -> "set"
   VLambda {} -> "lambda"
   VBuiltin _ _ -> "lambda"
-  VDerivation _ -> "set"
   VCompiledRegex _ -> "lambda"
 
 isNullVal :: NixValue -> Bool
@@ -2941,7 +2939,6 @@ valueToJSON (VPath p) = do
   pure (jsonEscapeString spText, ctx)
 valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
-valueToJSON (VDerivation _) = throwEvalError "builtins.toJSON: cannot convert a derivation to JSON"
 valueToJSON (VCompiledRegex _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 
 jsonEscapeString :: Text -> Text
@@ -4184,10 +4181,11 @@ resolveAllOutputNames sp = do
     outputNamesOf = map doName . drvOutputs
 
 -- | Eager derivation computation - @builtins.derivationStrict@.  Forces all
--- input attrs into env vars, content-hashes, and returns the full derivation
--- attrset (drvPath, outPath, per-output, _derivation).  Called LAZILY by the
--- @derivation@ wrapper ('builtinDerivationLazy'), so forcing a derivation to
--- WHNF never forces this - matching C++ Nix's derivationStrict/derivation split.
+-- input attrs into env vars, content-hashes, and returns upstream's result
+-- set: @drvPath@ and one attribute per output holding that output's path,
+-- each carrying its store context (primops.cc, @prim_derivationStrict@).
+-- The @derivation@ wrapper ("Nix.Builtins") reaches this only through
+-- @outPath@ and @drvPath@, so forcing a derivation to WHNF never runs it.
 builtinDerivationStrict :: (MonadEval m) => NixValue -> m NixValue
 builtinDerivationStrict (VAttrs attrs) = do
   -- Extract required attributes.  The name and system are Text (they feed
@@ -4245,6 +4243,17 @@ builtinDerivationStrict (VAttrs attrs) = do
               <> storePathNameReasonText (spneReason err)
           )
       Right () -> pure ()
+
+  -- Upstream's derivationStrict walks the output names in order and refuses
+  -- a repeated name and the name drvPath, which its result set already
+  -- carries, then refuses an empty list (primops.cc, handleOutputs in
+  -- derivationStrictInternal).
+  let checkOutputName seen outName
+        | Set.member outName seen = throwEvalError ("duplicate derivation output '" <> outName <> "'")
+        | outName == "drvPath" = throwEvalError "invalid derivation output name 'drvPath'"
+        | otherwise = pure (Set.insert outName seen)
+  foldM_ checkOutputName Set.empty outputNames
+  when (null outputNames) (throwEvalError "derivation cannot have an empty set of outputs")
 
   -- Extract optional args (default []).  Path literals in args (e.g. stdenv's
   -- ./default-builder.sh) are copied into the store; their source paths flow
@@ -4352,45 +4361,14 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- is recorded by the time a dependent is.
   recordDrvAterm drvPathText (toATerm completeDrv)
 
-  let mainOutPath = case outPaths of
-        ((_, p) : _) -> p
-        [] -> ""
-      -- The default output is the FIRST in @outputs@ (matching C++ Nix, which
-      -- returns @(head outputsList).value@) - not necessarily @out@.
-      mainOutName = case outPaths of
-        ((n, _) : _) -> n
-        [] -> "out"
-
-  -- Context for output paths: each output carries SCDrvOutput context
-  -- Context for drvPath: carries SCAllOutputs context
+  -- drvPath carries the whole derivation (upstream's DrvDeep); an output
+  -- path carries that one output of it.
   let drvPathCtx = StringContext (Set.singleton (SCAllOutputs drvSP))
       outPathCtx outName = StringContext (Set.singleton (SCDrvOutput drvSP outName))
-
-  -- Build per-output attrsets matching Nix: drv.out = { outPath, drvPath, type }
-  let mkOutputAttrs outName outP =
-        let outCtx = outPathCtx outName
-            outputAttrMap =
-              Map.fromList
-                [ ("outPath", evaluated (VStr (TE.encodeUtf8 outP) outCtx)),
-                  ("drvPath", evaluated (VStr (TE.encodeUtf8 drvPathText) drvPathCtx)),
-                  ("type", evaluated (mkStr "derivation"))
-                ]
-         in evaluated (VAttrs (attrSetFromMap outputAttrMap))
-
-  -- Build result attrset: original attrs + drvPath, outPath, type, per-output attrs
-  let baseAttrs =
-        Map.fromList $
-          [ ("type", evaluated (mkStr "derivation")),
-            ("drvPath", evaluated (VStr (TE.encodeUtf8 drvPathText) drvPathCtx)),
-            ("outPath", evaluated (VStr (TE.encodeUtf8 mainOutPath) (outPathCtx mainOutName))),
-            ("name", evaluated (mkStr drvName)),
-            ("system", evaluated (mkStr system)),
-            ("builder", evaluated (mkStrBytes builder)),
-            ("_derivation", evaluated (VDerivation completeDrv))
-          ]
-            ++ [(outName, mkOutputAttrs outName outP) | (outName, outP) <- outPaths]
-      -- Merge original attrs underneath so computed attrs take priority
-      resultAttrs = Map.union baseAttrs materialized
+      outputEntry (outName, outP) = (outName, evaluated (VStr (TE.encodeUtf8 outP) (outPathCtx outName)))
+      resultAttrs =
+        Map.fromList
+          (("drvPath", evaluated (VStr (TE.encodeUtf8 drvPathText) drvPathCtx)) : map outputEntry outPaths)
 
   pure (VAttrs (attrSetFromMap resultAttrs))
 builtinDerivationStrict other =
@@ -4459,53 +4437,6 @@ normalizeFixedHash ohash ohAlgo
       | otherwise =
           throwEvalError
             ("derivation: hash '" <> ohash <> "' should have type '" <> ohAlgo <> "', not '" <> embedded <> "'")
-
--- | Lazy @derivation@ wrapper, mirroring upstream's
--- @src/libexpr/primops/derivation.nix@.
--- Returns a WHNF attrset whose @drvPath@/@outPath@/output-path/@_derivation@
--- attrs are LAZY thunks that defer to 'builtinDerivationStrict'.  Forcing a
--- derivation to WHNF therefore does NOT force its input/env closure - which is
--- essential for nixpkgs, where merely referencing a derivation (e.g.
--- @drv != null@, @assert (libxcrypt != null)@) must not build its whole closure.
---
--- The lazy thunks are built with the same synthetic-select pattern used by
--- @inherit (from)@: a single shared @strict@ thunk (so the eager computation
--- runs at most once) selected from via fresh minimal envs.
-builtinDerivationLazy :: (MonadEval m) => NixValue -> m NixValue
-builtinDerivationLazy (VAttrs attrs) = do
-  -- Output names are cheap (matches @drvAttrs @ { outputs ? [ "out" ], ... }@).
-  outputNames <- case attrSetLookup "outputs" attrs of
-    Nothing -> pure ["out"]
-    Just thunk -> do
-      val <- force thunk
-      case val of
-        VList cl -> mapM (forceToText . Thunk) (clistThunks cl)
-        _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
-  -- One shared thunk computing @derivationStrict attrs@, forced only when an
-  -- output path / drvPath is actually read.
-  let drvAttrsThunk = evaluated (VAttrs attrs)
-      strictBuiltinThunk = evaluated (VBuiltin "derivationStrict" [])
-      strictThunk =
-        let (sp, sc) = buildCSlots [drvAttrsThunk, strictBuiltinThunk]
-            envDS = newMinimalEnv sp sc
-         in mkSyntheticThunk envDS (EApp (EResolvedVar 0 1) (EResolvedVar 0 0))
-      selectStrict field =
-        let (sp, sc) = buildCSlots [strictThunk]
-            envF = newMinimalEnv sp sc
-         in mkSyntheticThunk envF (ESelect (EResolvedVar 0 0) [StaticKey field] Nothing)
-  -- WHNF spine: input attrs (unforced) overlaid with the lazy computed attrs.
-  let computedAttrs =
-        Map.fromList $
-          [ ("type", evaluated (mkStr "derivation")),
-            ("drvPath", selectStrict "drvPath"),
-            ("outPath", selectStrict "outPath"),
-            ("_derivation", selectStrict "_derivation")
-          ]
-            ++ [(outName, selectStrict outName) | outName <- outputNames]
-      resultAttrs = Map.union computedAttrs (attrSetToMap attrs)
-  pure (VAttrs (attrSetFromMap resultAttrs))
-builtinDerivationLazy other =
-  throwEvalError ("derivation: expected a set, got " <> typeName other)
 
 -- | Force a thunk to a Text string via full Nix coercion (strict decode:
 -- used for output names, which are ASCII-shaped identity components).
@@ -5295,8 +5226,6 @@ valueToXML depth val = case val of
     pure (indent depth <> "<function />\n")
   VBuiltin _ _ ->
     pure (indent depth <> "<function />\n")
-  VDerivation _ ->
-    pure (indent depth <> "<derivation />\n")
   VCompiledRegex _ ->
     pure (indent depth <> "<function />\n")
   where
