@@ -129,7 +129,7 @@ import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
-import Nix.Eval.Operator (addToFloat, addToInteger, checkedAdd, checkedMul, checkedSub, divisionOverflowMessage, evalBinary, evalUnary, evalUpdate, nixCompare, nixEqual)
+import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printValue)
 import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, stripIndentedChunks)
@@ -189,6 +189,7 @@ import Nix.Eval.Types
     storePathOrThrow,
     thunkToCPtr,
     typeName,
+    typeOfValue,
     unrestrictedPolicy,
     withScopesForCapture,
   )
@@ -1300,13 +1301,13 @@ builtinRegistry =
       builtin1 "concatLists" builtinConcatLists,
       builtin2 "lessThan" builtinLessThan,
       -- Arithmetic + bitwise
-      builtin2 "add" builtinAdd,
-      builtin2 "sub" builtinSub,
-      builtin2 "mul" builtinMul,
-      builtin2 "div" builtinDiv,
-      builtin2 "bitAnd" builtinBitAnd,
-      builtin2 "bitOr" builtinBitOr,
-      builtin2 "bitXor" builtinBitXor,
+      builtin2 "add" primAdd,
+      builtin2 "sub" primSub,
+      builtin2 "mul" primMul,
+      builtin2 "div" primDiv,
+      builtin2 "bitAnd" (bitwise (.&.)),
+      builtin2 "bitOr" (bitwise (.|.)),
+      builtin2 "bitXor" (bitwise xor),
       -- Attr set higher-order
       builtin2 "mapAttrs" builtinMapAttrs,
       builtin1 "functionArgs" builtinFunctionArgs,
@@ -1532,13 +1533,13 @@ executeBuiltin name args = case name of
   "concatLists" -> apply1 builtinConcatLists
   "lessThan" -> apply2 builtinLessThan
   -- Arithmetic + bitwise
-  "add" -> apply2 builtinAdd
-  "sub" -> apply2 builtinSub
-  "mul" -> apply2 builtinMul
-  "div" -> apply2 builtinDiv
-  "bitAnd" -> apply2 builtinBitAnd
-  "bitOr" -> apply2 builtinBitOr
-  "bitXor" -> apply2 builtinBitXor
+  "add" -> apply2 primAdd
+  "sub" -> apply2 primSub
+  "mul" -> apply2 primMul
+  "div" -> apply2 primDiv
+  "bitAnd" -> apply2 (bitwise (.&.))
+  "bitOr" -> apply2 (bitwise (.|.))
+  "bitXor" -> apply2 (bitwise xor)
   -- Attr set higher-order
   "mapAttrs" -> apply2 builtinMapAttrs
   "functionArgs" -> apply1 builtinFunctionArgs
@@ -1617,20 +1618,6 @@ executeBuiltin name args = case name of
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - type checking
 -- ---------------------------------------------------------------------------
-
-typeOfValue :: NixValue -> Text
-typeOfValue val = case val of
-  VInt _ -> "int"
-  VFloat _ -> "float"
-  VBool _ -> "bool"
-  VNull -> "null"
-  VStr _ _ -> "string"
-  VPath _ -> "path"
-  VList _ -> "list"
-  VAttrs _ -> "set"
-  VLambda {} -> "lambda"
-  VBuiltin _ _ -> "lambda"
-  VCompiledRegex _ -> "lambda"
 
 isNullVal :: NixValue -> Bool
 isNullVal VNull = True
@@ -2503,51 +2490,10 @@ builtinLessThan a b = VBool <$> nixCompare force a b
 -- Builtin implementations - arithmetic + bitwise
 -- ---------------------------------------------------------------------------
 
-builtinAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAdd (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedAdd a b)
-builtinAdd (VInt a) (VFloat b) = pure (VFloat (fromIntegral a + b))
-builtinAdd (VFloat a) (VInt b) = pure (VFloat (a + fromIntegral b))
-builtinAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
-builtinAdd l r = throwEvalError ("builtins.add: expected numbers, got " <> typeName l <> " and " <> typeName r)
-
-builtinSub :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinSub (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedSub a b)
-builtinSub (VInt a) (VFloat b) = pure (VFloat (fromIntegral a - b))
-builtinSub (VFloat a) (VInt b) = pure (VFloat (a - fromIntegral b))
-builtinSub (VFloat a) (VFloat b) = pure (VFloat (a - b))
-builtinSub l r = throwEvalError ("builtins.sub: expected numbers, got " <> typeName l <> " and " <> typeName r)
-
-builtinMul :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMul (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedMul a b)
-builtinMul (VInt a) (VFloat b) = pure (VFloat (fromIntegral a * b))
-builtinMul (VFloat a) (VInt b) = pure (VFloat (a * fromIntegral b))
-builtinMul (VFloat a) (VFloat b) = pure (VFloat (a * b))
-builtinMul l r = throwEvalError ("builtins.mul: expected numbers, got " <> typeName l <> " and " <> typeName r)
-
-builtinDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
-builtinDiv (VInt a) (VInt b)
-  -- The one overflowing division: |minBound| has no representation.
-  | a == minBound && b == -1 =
-      throwEvalError divisionOverflowMessage
-  | otherwise = pure (VInt (quot a b))
-builtinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
-builtinDiv (VInt a) (VFloat b) = pure (VFloat (fromIntegral a / b))
-builtinDiv (VFloat a) (VInt b) = pure (VFloat (a / fromIntegral b))
-builtinDiv (VFloat a) (VFloat b) = pure (VFloat (a / b))
-builtinDiv l r = throwEvalError ("builtins.div: expected numbers, got " <> typeName l <> " and " <> typeName r)
-
-builtinBitAnd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinBitAnd (VInt a) (VInt b) = pure (VInt (a .&. b))
-builtinBitAnd _ _ = throwEvalError "builtins.bitAnd: expected two integers"
-
-builtinBitOr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinBitOr (VInt a) (VInt b) = pure (VInt (a .|. b))
-builtinBitOr _ _ = throwEvalError "builtins.bitOr: expected two integers"
-
-builtinBitXor :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinBitXor (VInt a) (VInt b) = pure (VInt (xor a b))
-builtinBitXor _ _ = throwEvalError "builtins.bitXor: expected two integers"
+-- | @prim_bitAnd@ and its kin (primops.cc at 2.24.9): both operands go
+-- through @forceInt@, the left first.
+bitwise :: (MonadEval m) => (Int64 -> Int64 -> Int64) -> NixValue -> NixValue -> m NixValue
+bitwise op a b = VInt <$> (op <$> expectInt a <*> expectInt b)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - attr set higher-order

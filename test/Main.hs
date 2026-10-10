@@ -507,6 +507,45 @@ testEvalArithmetic = do
         assertEval "neg-zero" "builtins.toJSON [ (-(0.0)) (-(-0.0)) ]" (mkStr "[0.0,0.0]"),
       runTest "negating a non-number fails as builtins.sub does" $
         assertEvalError "neg-set" "-{ }" "expected an integer but found a set: { }",
+      -- -, *, / and the arithmetic builtins are upstream's prim_sub,
+      -- prim_mul, prim_div and prim_add (primops.cc at 2.24.9): forceInt
+      -- on both operands, or forceFloat on both once either is a float.
+      runTest "subtracting a set from an integer fails its forceInt" $
+        assertEvalError "sub-set" "1 - {}" "expected an integer but found a set: { }",
+      runTest "subtracting from a set fails on the left operand" $
+        assertEvalError "set-sub" "{} - 1" "expected an integer but found a set: { }",
+      runTest "subtracting a set from a float fails its forceFloat" $
+        assertEvalError "float-sub-set" "1.0 - {}" "expected a float but found a set: { }",
+      runTest "two non-numbers fail on the left one" $
+        assertEvalError "set-sub-str" "{} - \"a\"" "expected an integer but found a set: { }",
+      runTest "multiplying a float by a string fails its forceFloat" $
+        assertEvalError "float-mul-str" "2.5 * \"a\"" "expected a float but found a string: \"a\"",
+      runTest "dividing by a set fails the divisor's forceFloat" $
+        assertEvalError "div-set" "1 / {}" "expected a float but found a set: { }",
+      runTest "dividing a set by an integer fails its forceInt" $
+        assertEvalError "set-div" "{} / 1" "expected an integer but found a set: { }",
+      runTest "a zero divisor is refused before the dividend is checked" $
+        assertEvalError "set-div-zero" "{} / 0" "division by zero",
+      runTest "a non-number divisor is refused before the dividend" $
+        assertEvalError "set-div-str" "{} / \"a\"" "expected a float but found a string: \"a\"",
+      runTest "dividing by negative zero is a division by zero" $
+        assertEvalError "div-neg-zero" "1 / (-0.0)" "division by zero",
+      runTest "builtins.div by zero says only division by zero" $
+        assertEvalError "builtin-div-zero" "builtins.div 1 0" "division by zero",
+      runTest "builtins.add refuses a string through forceInt" $
+        assertEvalError "builtin-add-str" "builtins.add \"a\" 1" "expected an integer but found a string: \"a\"",
+      runTest "builtins.add with a float refuses a string through forceFloat" $
+        assertEvalError "builtin-add-float-str" "builtins.add 1.5 \"a\"" "expected a float but found a string: \"a\"",
+      runTest "builtins.sub refuses a set" $
+        assertEvalError "builtin-sub-set" "builtins.sub 1 {}" "expected an integer but found a set: { }",
+      runTest "builtins.bitXor refuses a float" $
+        assertEvalError "bitxor-float" "builtins.bitXor 1 1.0" "expected an integer but found a float: 1",
+      runTest "builtins.bitAnd fails on its left operand first" $
+        assertEvalError "bitand-set-str" "builtins.bitAnd {} \"a\"" "expected an integer but found a set: { }",
+      runTest "builtins.bitOr refuses a set" $
+        assertEvalError "bitor-set" "builtins.bitOr {} 1" "expected an integer but found a set: { }",
+      runTest "float division still divides" $
+        assertEval "float-div" "1 / 4.0" (VFloat 0.25),
       runTest "add at the boundary still works" $
         assertEval "add-boundary" "9223372036854775806 + 1 == 9223372036854775807" (VBool True),
       runTest "int-float promotion" $
@@ -561,7 +600,27 @@ testEvalComparison = do
       runTest "lte on equal lists" $
         assertEval "list-lte-eq" "[ 1 2 ] <= [ 1 2 ]" (VBool True),
       runTest "lte incomparable types fails" $
-        assertEvalFail "lte-err" "1 <= \"a\""
+        assertEvalFail "lte-err" "1 <= \"a\"",
+      -- Upstream's CompareValues (primops.cc at 2.24.9); > and <= swap
+      -- the operands as the parser's desugaring to __lessThan does.
+      runTest "comparing different types names both" $
+        assertEvalError "lt-int-set" "1 < {}" "cannot compare an integer with a set",
+      runTest "gt compares the swapped operands" $
+        assertEvalError "gt-int-set" "1 > {}" "cannot compare a set with an integer",
+      runTest "lte compares the swapped operands" $
+        assertEvalError "lte-int-set" "1 <= {}" "cannot compare a set with an integer",
+      runTest "gte compares the operands in order" $
+        assertEvalError "gte-int-set" "1 >= {}" "cannot compare an integer with a set",
+      runTest "Booleans are incomparable" $
+        assertEvalError "lt-bool" "true < false" "cannot compare a Boolean with a Boolean; values of that type are incomparable",
+      runTest "a lambda and a primop are both functions, so incomparable" $
+        assertEvalError "lt-fn" "(x: x) < builtins.map" "cannot compare a function with the built-in function 'map'; values of that type are incomparable",
+      runTest "builtins.lessThan on nulls is incomparable" $
+        assertEvalError "lessthan-null" "builtins.lessThan null null" "cannot compare null with null; values of that type are incomparable",
+      runTest "list comparison reports the first unequal pair" $
+        assertEvalError "lt-list" "[ 1 ] < [ \"a\" ]" "cannot compare an integer with a string",
+      runTest "equal incomparable elements do not stop a list comparison" $
+        assertEval "lt-list-sets" "[ {} ] < [ {} ]" (VBool False)
     ]
 
 -- ---------------------------------------------------------------------------
