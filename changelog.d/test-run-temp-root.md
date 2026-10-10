@@ -1,0 +1,1 @@
+- **The test suite requires `process` 1.6.12 or later**, for `getCurrentPid`, which names the temporary root each run now keeps to itself, so two suites running at once on one machine no longer delete each other's fixtures. (#254)

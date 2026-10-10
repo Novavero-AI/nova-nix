@@ -15617,7 +15617,25 @@ main =
   getArgs >>= \case
     [flag, name] | flag == arenaGuardChildFlag -> arenaGuardChild name
     [flag, source] | flag == evalChildFlag -> bracket_ arenaInit arenaDestroy (evalChild source)
-    _ -> bracket_ arenaInit arenaDestroy runSuite
+    _ -> withRunTempRoot (bracket_ arenaInit arenaDestroy runSuite)
+
+-- | Give the run a temporary root of its own and point the process's
+-- temporary directory at it, so every fixture the suite derives from
+-- 'getTemporaryDirectory' (each under a fixed name) is this run's alone
+-- and two suites running at once cannot delete each other's (#254).
+-- @TMPDIR@ is what POSIX reads, @TMP@ and @TEMP@ what Windows'
+-- @GetTempPath@ reads; a child process inherits them.  The root is named
+-- for this process, so no live run shares it, and one a crashed run left
+-- under the same PID is cleared first.
+withRunTempRoot :: IO a -> IO a
+withRunTempRoot action = do
+  base <- getTemporaryDirectory
+  pid <- Proc.getCurrentPid
+  let root = base </> ("nova-nix-test-" <> show pid)
+  Dir.removePathForcibly root
+  Dir.createDirectory root
+  mapM_ (`setEnv` root) ["TMPDIR", "TMP", "TEMP"]
+  action `finally` Dir.removePathForcibly root
 
 -- | Every group, under the one arena bracket.
 runSuite :: IO ()
