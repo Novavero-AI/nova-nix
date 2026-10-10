@@ -10,6 +10,7 @@
 module Nix.Store.ExecBit
   ( isExecutable,
     markExecutable,
+    markExecutableOsPath,
     copyExecMark,
     serialiseFromPath,
     narHashOfPath,
@@ -24,7 +25,9 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
+import qualified System.Directory.OsPath as OsDir
 import qualified System.Info
+import System.OsPath (OsPath, decodeFS, encodeFS)
 
 -- | The alternate data stream whose presence marks a file executable.
 -- Named for this project so it cannot collide with @Zone.Identifier@ or
@@ -64,17 +67,25 @@ isExecutable path
 -- already-writable file exactly as it was, and every caller gets this
 -- rather than each remembering the order.
 markExecutable :: FilePath -> IO ()
-markExecutable path
+markExecutable path = markExecutableOsPath =<< encodeFS path
+
+-- | 'markExecutable' on a platform-native path, for a writer holding a
+-- name as bytes: on POSIX the mode is set on exactly those bytes.
+markExecutableOsPath :: OsPath -> IO ()
+markExecutableOsPath path
   | usesStream = do
-      perms <- Dir.getPermissions path
+      perms <- OsDir.getPermissions path
       let writable = Dir.writable perms
+      -- The stream is reached by name through the 'FilePath' file API;
+      -- a Windows path is UTF-16, so decoding it is exact.
+      streamPath <- execStreamPath <$> decodeFS path
       bracket_
-        (unless writable (Dir.setPermissions path (Dir.setOwnerWritable True perms)))
-        (unless writable (Dir.setPermissions path perms))
-        (BS8.writeFile (execStreamPath path) (BS8.pack "1"))
+        (unless writable (OsDir.setPermissions path (Dir.setOwnerWritable True perms)))
+        (unless writable (OsDir.setPermissions path perms))
+        (BS8.writeFile streamPath (BS8.pack "1"))
   | otherwise = do
-      perms <- Dir.getPermissions path
-      Dir.setPermissions path (Dir.setOwnerExecutable True perms)
+      perms <- OsDir.getPermissions path
+      OsDir.setPermissions path (Dir.setOwnerExecutable True perms)
 
 -- | Carry a file's exec mark from one path to another.  'Dir.copyFile'
 -- copies the unnamed stream only, so without this a copy silently

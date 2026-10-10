@@ -66,9 +66,6 @@ module Nix.Store
     finishNarUnpack,
     abortNarUnpack,
 
-    -- * NAR entry-name safety
-    isSafeNarName,
-
     -- * Link ordering (exposed for testing)
     orderLinks,
 
@@ -90,7 +87,8 @@ import Control.Exception (IOException, SomeException, bracket, catch, throwIO, t
 import Control.Monad (guard, join, unless, when)
 import Data.Bool (bool)
 import qualified Data.ByteString as BS
-import Data.Char (isDigit, toUpper)
+import qualified Data.ByteString.Char8 as BS8
+import Data.Char (toUpper)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (inits)
@@ -105,6 +103,7 @@ import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), trySetCaseSensitiveDir)
 import Nix.Store.DB
+import Nix.Store.EntryName (checkEntryName, entryNamePath, hostNameRules, linkTargetPath, shownBytes)
 import Nix.Store.Exclusive (Occupant (..), directoryTakenMessage, fileTakenMessage, openNewBinaryFile, symlinkTakenMessage)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.GC
@@ -124,10 +123,12 @@ import System.Directory
     setPermissions,
   )
 import qualified System.Directory as Dir
-import System.FilePath (splitDirectories, takeDirectory, (</>))
+import qualified System.Directory.OsPath as OsDir
+import System.FilePath ((</>))
 import System.IO (Handle, IOMode (ReadMode), hClose, withBinaryFile)
 import System.IO.Error (isAlreadyExistsError)
-import qualified System.Info
+import System.OsPath (OsPath)
+import qualified System.OsPath as OP
 
 -- | Check if a store path is registered as valid in the database.
 isValid :: Store -> StorePath -> IO Bool
@@ -543,34 +544,40 @@ refuseTaken describe create = do
 
 -- | Create a regular file of a materialized tree exclusively and write
 -- it through the handle, closed on the way out.
-withNewTreeFile :: FilePath -> (Handle -> IO a) -> IO (Either Text a)
+withNewTreeFile :: OsPath -> (Handle -> IO a) -> IO (Either Text a)
 withNewTreeFile path write =
   bracket (openNewTreeFile path) (traverse_ hClose) (traverse write)
 
 -- | Open a regular file of a materialized tree, created exclusively.
-openNewTreeFile :: FilePath -> IO (Either Text Handle)
-openNewTreeFile path = refuseTaken (pure (fileTakenMessage path)) (openNewBinaryFile path)
+openNewTreeFile :: OsPath -> IO (Either Text Handle)
+openNewTreeFile path = refuseTaken (fileTakenMessage <$> OP.decodeFS path) (openNewBinaryFile path)
 
 -- | Create a directory of a materialized tree exclusively.  Its parent
 -- is created first if missing, which only the root can need.  A
 -- refusal asks what holds the name, as @create_directory@ does before
 -- it chooses between returning false and throwing.
-createTreeDirectory :: FilePath -> IO (Either Text ())
+createTreeDirectory :: OsPath -> IO (Either Text ())
 createTreeDirectory path = do
-  createDirectoryIfMissing True (takeDirectory path)
-  refuseTaken describe (Dir.createDirectory path)
+  OsDir.createDirectoryIfMissing True (OP.takeDirectory path)
+  refuseTaken describe (OsDir.createDirectory path)
   where
     describe = do
-      occupant <- bool OccupiedByOther OccupiedByDirectory <$> doesDirectoryExist path
-      pure (directoryTakenMessage occupant path)
+      occupant <- bool OccupiedByOther OccupiedByDirectory <$> OsDir.doesDirectoryExist path
+      directoryTakenMessage occupant <$> OP.decodeFS path
 
 -- ---------------------------------------------------------------------------
 -- NAR unpacking
 -- ---------------------------------------------------------------------------
 
--- | Unpack a NarEntry tree to a filesystem destination.  Returns @Left@ on an
--- unsafe entry name (path traversal); these can come from untrusted cache
--- data, so a typed failure is used instead of a partial 'error'.
+-- | Unpack a NarEntry tree to a filesystem destination.  Returns @Left@
+-- on an entry name or link target the host cannot hold
+-- ("Nix.Store.EntryName"); these can come from untrusted cache data, so
+-- a typed failure is used instead of a partial 'error'.
+--
+-- Names and targets reach the filesystem as the bytes the NAR carries,
+-- as upstream's restore writes them on POSIX: the tree is walked in
+-- 'OsPath's, a POSIX path being bytes.  Only the destination enters as
+-- a 'FilePath', spelled as every 'FilePath' API spells it.
 --
 -- The sensitivity is the destination volume's ('stCaseSensitivity' for
 -- a store path) and decides whether case-variant siblings need the
@@ -583,26 +590,25 @@ createTreeDirectory path = do
 -- at the target on disk - which may sort after the link within the tree.
 unpackNarEntry :: CaseSensitivity -> FilePath -> NAR.NarEntry -> IO (Either Text ())
 unpackNarEntry sensitivity path entry = do
-  walked <- unpackTree sensitivity path entry
+  root <- OP.encodeFS path
+  walked <- unpackTree sensitivity root entry
   case walked of
     Left err -> pure (Left err)
     Right links -> createSymlinks links
 
 -- | First unpack pass: write regular files and directories, recording
 -- symlinks as (link path, target) for the second pass.
-unpackTree :: CaseSensitivity -> FilePath -> NAR.NarEntry -> IO (Either Text [(FilePath, Text)])
+unpackTree :: CaseSensitivity -> OsPath -> NAR.NarEntry -> IO (Either Text [(OsPath, OsPath)])
 unpackTree sensitivity path entry = case entry of
   NAR.NarRegular isExec contents -> do
-    createDirectoryIfMissing True (takeDirectory path)
+    OsDir.createDirectoryIfMissing True (OP.takeDirectory path)
     written <- withNewTreeFile path (`BS.hPut` contents)
     case written of
       Left err -> pure (Left err)
       Right () -> do
-        when isExec (ExecBit.markExecutable path)
+        when isExec (ExecBit.markExecutableOsPath path)
         pure (Right [])
-  NAR.NarSymlink target -> pure $ case decodeNarText "symlink target" target of
-    Left err -> Left err
-    Right decoded -> Right [(path, decoded)]
+  NAR.NarSymlink target -> fmap (\targetPath -> [(path, targetPath)]) <$> linkTargetPath target
   NAR.NarDirectory entries -> do
     created <- createTreeDirectory path
     case created of
@@ -622,9 +628,12 @@ unpackTree sensitivity path entry = case entry of
 -- the exclusive create refuses the second at the write (#234), as
 -- upstream's restore does.  The reverse miss (U+0131 uppercases to
 -- @I@, which APFS keeps distinct) only spells a name with a suffix it
--- did not need.  Independently of case, the Win32 path layer strips a
--- name's trailing dots and spaces on create (inside a case-sensitive
--- directory as much as a folding one), so the key strips them there.
+-- did not need.  A name that is not UTF-8 has no characters to fold
+-- and keys as its bytes; no host whose volumes fold admits one
+-- ("Nix.Store.EntryName"), and the create would catch what the key
+-- missed.  Win32 strips a trailing dot or space on create, which would
+-- merge names this key keeps apart, but Windows refuses such names
+-- before any is keyed.
 --
 -- Upstream decides this per process, not per volume: its
 -- @use-case-hack@ setting defaults to on for Darwin and off elsewhere
@@ -635,27 +644,14 @@ unpackTree sensitivity path entry = case entry of
 -- keys by the probed answer and materializes true names there.  The
 -- divergence is in on-disk spelling only: either tree re-serialises
 -- to the same NAR.
-onDiskNameKey :: CaseSensitivity -> Text -> Text
-onDiskNameKey sensitivity = foldCase . stripWin32Trailing
-  where
-    foldCase = case sensitivity of
-      CaseSensitive -> id
-      CaseInsensitive -> T.map toUpper
-    stripWin32Trailing
-      | win32PathLayer = T.dropWhileEnd (\c -> c == '.' || c == ' ')
-      | otherwise = id
-
--- | Whether the Win32 path layer stands between the store and its
--- filesystem.  A property of the running platform rather than of the
--- volume, so a compile-time constant beside the probed sensitivity; a
--- plain comparison rather than CPP so both branches type-check on
--- every platform.
-win32PathLayer :: Bool
-win32PathLayer = System.Info.os == "mingw32"
+onDiskNameKey :: CaseSensitivity -> BS.ByteString -> BS.ByteString
+onDiskNameKey sensitivity name = case sensitivity of
+  CaseSensitive -> name
+  CaseInsensitive -> either (const name) (TE.encodeUtf8 . T.map toUpper) (TE.decodeUtf8' name)
 
 -- | The first pair of sibling names folding to the same on-disk file,
 -- if any: (earlier entry, colliding later entry).
-firstNameCollision :: CaseSensitivity -> [Text] -> Maybe (Text, Text)
+firstNameCollision :: CaseSensitivity -> [BS.ByteString] -> Maybe (BS.ByteString, BS.ByteString)
 firstNameCollision sensitivity = go Map.empty
   where
     go !_ [] = Nothing
@@ -677,23 +673,18 @@ firstNameCollision sensitivity = go Map.empty
 platformStripsCaseHack :: Bool
 platformStripsCaseHack = NAR.defaultCaseHack == NAR.CaseHackEnabled
 
--- | 'NAR.caseHackSuffix' as Text for the name machinery here, which
--- runs on decoded names ('decodeNarText').  The suffix is ASCII, so
--- the latin1 read is exact.
-caseHackSuffixText :: Text
-caseHackSuffixText = TE.decodeLatin1 NAR.caseHackSuffix
+-- | Refuse an entry name before any sibling is written: one the host
+-- cannot hold ('checkEntryName'), or one carrying the case-hack suffix
+-- where the serialiser would strip it.
+admitEntryName :: BS.ByteString -> Either Text ()
+admitEntryName name = do
+  checkEntryName hostNameRules name
+  when (platformStripsCaseHack && NAR.caseHackSuffix `BS.isInfixOf` name) $
+    Left ("NAR entry name contains the case-hack suffix: " <> shownBytes name)
 
--- | Decode a NAR-carried byte string that must become a filesystem
--- name.  The NAR format carries entry names and symlink targets as
--- raw bytes and the parser accepts them; the store's invariant is
--- stricter - every materialized name exists identically on every
--- platform the store targets, and NTFS names are UTF-16 - so bytes
--- with no Unicode reading are refused at the write boundary rather
--- than approximated.
-decodeNarText :: Text -> BS.ByteString -> Either Text Text
-decodeNarText what bytes = case TE.decodeUtf8' bytes of
-  Right decoded -> Right decoded
-  Left _ -> Left ("NAR " <> what <> " is not valid UTF-8: " <> T.pack (show bytes))
+-- | The case-hacked disk name for the given occurrence of a key.
+caseHackName :: BS.ByteString -> Int -> BS.ByteString
+caseHackName name occurrence = name <> NAR.caseHackSuffix <> BS8.pack (show occurrence)
 
 -- | Disk names for a sibling list on a volume of the given case
 -- sensitivity, WITHOUT per-directory case sensitivity: upstream's
@@ -702,7 +693,7 @@ decodeNarText what bytes = case TE.decodeUtf8' bytes of
 -- name with the same key gains the reversible suffix and a per-name
 -- counter, which the platform serialiser strips on the way back out.
 -- Order is preserved; result pairs are (NAR name, on-disk name).
-caseHackDiskNames :: CaseSensitivity -> [Text] -> [(Text, Text)]
+caseHackDiskNames :: CaseSensitivity -> [BS.ByteString] -> [(BS.ByteString, BS.ByteString)]
 caseHackDiskNames sensitivity = reverse . snd . foldl' step (Map.empty, [])
   where
     step (!seen, !acc) name =
@@ -711,27 +702,18 @@ caseHackDiskNames sensitivity = reverse . snd . foldl' step (Map.empty, [])
             Nothing -> (Map.insert key (0 :: Int) seen, (name, name) : acc)
             Just occurrences ->
               let next = occurrences + 1
-                  disk = name <> caseHackSuffixText <> T.pack (show next)
-               in (Map.insert key next seen, (name, disk) : acc)
+               in (Map.insert key next seen, (name, caseHackName name next) : acc)
 
 -- | Unpack directory children.  Entry names arrive as the raw bytes
--- the NAR carries; the store's invariant is that every materialized
--- name is valid Unicode - a name every platform the store targets can
--- hold - so each name is decoded here at the write boundary, and a
--- byte name with no Unicode reading refuses the unpack
--- ('decodeNarText') rather than approximating a spelling.
-unpackChildren :: CaseSensitivity -> FilePath -> [(BS.ByteString, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
-unpackChildren sensitivity path rawEntries = case traverse decodeChild rawEntries of
+-- the NAR carries, and every sibling's name is admitted
+-- ('admitEntryName') before the first is written, so a name the host
+-- cannot hold leaves no partial directory behind it.
+unpackChildren :: CaseSensitivity -> OsPath -> [(BS.ByteString, NAR.NarEntry)] -> IO (Either Text [(OsPath, OsPath)])
+unpackChildren sensitivity path entries = case traverse_ (admitEntryName . fst) entries of
   Left err -> pure (Left err)
-  Right entries -> unpackNamedChildren sensitivity path entries
-  where
-    decodeChild (nameBytes, child) = do
-      name <- decodeNarText "directory entry name" nameBytes
-      Right (name, child)
+  Right () -> unpackNamedChildren sensitivity path entries
 
--- | Unpack decoded directory children, short-circuiting with a typed
--- failure on the first unsafe entry name rather than crashing on
--- untrusted input.
+-- | Unpack admitted directory children.
 --
 -- On a volume the probe reports sensitive (Linux, case-sensitive APFS)
 -- no two sibling names share an on-disk identity and every entry
@@ -743,30 +725,30 @@ unpackChildren sensitivity path rawEntries = case traverse decodeChild rawEntrie
 -- a folding APFS volume) the collision falls back to upstream's
 -- case-hack renaming, which the platform serialiser reverses.  Either
 -- way a registered path re-serialises to its NAR byte-for-byte - the
--- substituter's on-disk recheck verifies it.
-unpackNamedChildren :: CaseSensitivity -> FilePath -> [(Text, NAR.NarEntry)] -> IO (Either Text [(FilePath, Text)])
+-- substituter's on-disk recheck verifies it.  The name spelled on disk
+-- is the one the host is asked to hold, suffix included.
+unpackNamedChildren :: CaseSensitivity -> OsPath -> [(BS.ByteString, NAR.NarEntry)] -> IO (Either Text [(OsPath, OsPath)])
 unpackNamedChildren sensitivity path entries = do
   diskNames <- resolveDiskNames
-  walkChildren (zip diskNames entries)
+  walkChildren (zip diskNames (map snd entries))
   where
     names = map fst entries
     resolveDiskNames = case firstNameCollision sensitivity names of
       Nothing -> pure names
       Just _ -> do
-        trueNames <- trySetCaseSensitiveDir path
+        trueNames <- trySetCaseSensitiveDir =<< OP.decodeFS path
         pure
           ( if trueNames
               then names
               else map snd (caseHackDiskNames sensitivity names)
           )
     walkChildren [] = pure (Right [])
-    walkChildren ((diskName, (name, child)) : rest)
-      | not (isSafeNarName name) =
-          pure (Left ("unsafe NAR directory entry name: " <> name))
-      | platformStripsCaseHack && caseHackSuffixText `T.isInfixOf` name =
-          pure (Left ("NAR entry name contains the case-hack suffix: " <> name))
-      | otherwise = do
-          result <- unpackTree sensitivity (path </> T.unpack diskName) child
+    walkChildren ((diskName, child) : rest) = do
+      spelled <- entryNamePath diskName
+      case spelled of
+        Left err -> pure (Left err)
+        Right component -> do
+          result <- unpackTree sensitivity (path OP.</> component) child
           case result of
             Left err -> pure (Left err)
             Right links -> do
@@ -783,7 +765,7 @@ unpackNamedChildren sensitivity path entries = do
 -- round: quadratic filesystem stats on a link chain.)  Links on a
 -- dependency cycle have no knowable kind and default to file links,
 -- exactly as dangling links always have.
-createSymlinks :: [(FilePath, Text)] -> IO (Either Text ())
+createSymlinks :: [(OsPath, OsPath)] -> IO (Either Text ())
 createSymlinks pending = createAll (orderLinks pending)
   where
     createAll [] = pure (Right ())
@@ -800,7 +782,7 @@ createSymlinks pending = createAll (orderLinks pending)
 -- probes - no filesystem access.  Kahn's ordering, deterministic:
 -- ready links leave in input order, and cycle members keep input order
 -- at the end.  Exported for testing (the ordering property is pure).
-orderLinks :: [(FilePath, Text)] -> [(FilePath, Text)]
+orderLinks :: [(OsPath, OsPath)] -> [(OsPath, OsPath)]
 orderLinks pending =
   let indexed = zip [0 :: Int ..] pending
       linkByIndex = Map.fromList indexed
@@ -809,7 +791,7 @@ orderLinks pending =
       -- The pending links this link's resolved target lands on or
       -- passes through (every nonempty component prefix).
       depsOf (linkPath, target) =
-        let resolved = normalisedComponents (takeDirectory linkPath </> T.unpack target)
+        let resolved = normalisedComponents (OP.takeDirectory linkPath OP.</> target)
          in Set.fromList
               [j | prefix <- drop 1 (inits resolved), Just j <- [Map.lookup prefix indexByKey]]
       dependsOn = Map.fromList [(i, depsOf link) | (i, link) <- indexed]
@@ -840,25 +822,29 @@ orderLinks pending =
 
 -- | Path components with @.@ dropped and @..@ collapsed textually - the
 -- spelling-insensitive key that matches a link target against pending
--- link paths ('splitDirectories' accepts both separator spellings).  A
--- @..@ with nothing left to pop stays, matching no real path.
-normalisedComponents :: FilePath -> [FilePath]
-normalisedComponents path = reverse (foldl' step [] (splitDirectories path))
+-- link paths ('OP.splitDirectories' accepts both separator spellings
+-- on Windows).  A @..@ with nothing left to pop stays, matching no real
+-- path.
+normalisedComponents :: OsPath -> [OsPath]
+normalisedComponents path = reverse (foldl' step [] (OP.splitDirectories path))
   where
     step stack comp
-      | comp == "." = stack
-      | comp == ".." = case stack of
-          (top : rest) | top /= ".." -> rest
+      | comp == currentDirectory = stack
+      | comp == parentDirectory = case stack of
+          (top : rest) | top /= parentDirectory -> rest
           _ -> comp : stack
       | otherwise = comp : stack
+    currentDirectory = OP.pack [dot]
+    parentDirectory = OP.pack [dot, dot]
+    dot = OP.unsafeFromChar '.'
 
 -- | Create one unpacked symlink, parents first, with the Windows flavor
 -- read off the target ('createSymlinkOfKind').  A creation failure is
 -- loud, and failing lets the caller fall back to a local build.
-createSymlink :: FilePath -> Text -> IO (Either Text ())
+createSymlink :: OsPath -> OsPath -> IO (Either Text ())
 createSymlink linkPath target = do
-  createDirectoryIfMissing True (takeDirectory linkPath)
-  createSymlinkOfKind linkPath (T.unpack target)
+  OsDir.createDirectoryIfMissing True (OP.takeDirectory linkPath)
+  createSymlinkOfKind linkPath target
 
 -- ---------------------------------------------------------------------------
 -- Streaming NAR unpacking
@@ -868,8 +854,8 @@ createSymlink linkPath target = do
 -- the sibling names materialized so far, keyed by their on-disk
 -- identity ('onDiskNameKey') for collision handling.
 data UnpackFrame = UnpackFrame
-  { ufPath :: !FilePath,
-    ufSeen :: !(Map Text Int)
+  { ufPath :: !OsPath,
+    ufSeen :: !(Map BS.ByteString Int)
   }
 
 -- | Mutable state behind a 'NarUnpackSink' - the same deliberate IO
@@ -881,15 +867,15 @@ data NarUnpackState = NarUnpackState
     -- names exactly as the strict path does.
     nusCaseSensitivity :: !CaseSensitivity,
     nusFrames :: ![UnpackFrame],
-    nusTargets :: ![FilePath],
-    nusOpen :: !(Maybe (Handle, FilePath, Bool)),
-    nusLinks :: ![(FilePath, Text)]
+    nusTargets :: ![OsPath],
+    nusOpen :: !(Maybe (Handle, OsPath, Bool)),
+    nusLinks :: ![(OsPath, OsPath)]
   }
 
 -- | A push sink materializing 'Stream.NarEvent's under a destination
 -- path as they arrive, so a substituted NAR unpacks in the same pass
 -- that downloads it.  Semantics mirror 'unpackNarEntry' - the same
--- name decoding, safety checks, executable bit, and second-pass
+-- name bytes and host checks, executable bit, and second-pass
 -- symlink creation - with one divergence: sibling names colliding on
 -- a folding volume always take upstream's case-hack renaming, never
 -- the NTFS true-name path, because per-directory case sensitivity can
@@ -904,8 +890,9 @@ newtype NarUnpackSink = NarUnpackSink (IORef NarUnpackState)
 -- | A sink for one NAR unpack under the given destination path, on a
 -- volume of the given case sensitivity.
 newNarUnpackSink :: CaseSensitivity -> FilePath -> IO NarUnpackSink
-newNarUnpackSink sensitivity destPath =
-  NarUnpackSink <$> newIORef (NarUnpackState sensitivity [] [destPath] Nothing [])
+newNarUnpackSink sensitivity destPath = do
+  root <- OP.encodeFS destPath
+  NarUnpackSink <$> newIORef (NarUnpackState sensitivity [] [root] Nothing [])
 
 -- | Feed one event.  On 'Left' the partial tree stays for the caller
 -- to remove - 'abortNarUnpack' first, so no handle stays open on it.
@@ -925,7 +912,7 @@ sinkNarEvent (NarUnpackSink ref) event = do
 applyNarEvent :: NarUnpackState -> Stream.NarEvent -> IO (Either Text NarUnpackState)
 applyNarEvent narState event = case event of
   Stream.EventRegularBegin isExec _declaredSize -> withNodeTarget narState $ \path -> do
-    createDirectoryIfMissing True (takeDirectory path)
+    OsDir.createDirectoryIfMissing True (OP.takeDirectory path)
     opened <- openNewTreeFile path
     pure (fmap (\fileHandle -> narState {nusOpen = Just (fileHandle, path, isExec)}) opened)
   Stream.EventRegularChunk slice -> case nusOpen narState of
@@ -937,38 +924,37 @@ applyNarEvent narState event = case event of
     Nothing -> pure (Left "NAR stream sink: file close without an open file")
     Just (fileHandle, path, isExec) -> do
       hClose fileHandle
-      when isExec (ExecBit.markExecutable path)
+      when isExec (ExecBit.markExecutableOsPath path)
       pure (Right narState {nusOpen = Nothing})
   Stream.EventSymlink targetBytes -> withNodeTarget narState $ \path ->
-    pure $ case decodeNarText "symlink target" targetBytes of
-      Left err -> Left err
-      Right decoded -> Right narState {nusLinks = (path, decoded) : nusLinks narState}
+    fmap (\target -> narState {nusLinks = (path, target) : nusLinks narState})
+      <$> linkTargetPath targetBytes
   Stream.EventDirectoryBegin -> withNodeTarget narState $ \path -> do
     created <- createTreeDirectory path
     pure (narState {nusFrames = UnpackFrame path Map.empty : nusFrames narState} <$ created)
-  Stream.EventEntryBegin nameBytes -> case nusFrames narState of
+  Stream.EventEntryBegin name -> case nusFrames narState of
     [] -> pure (Left "NAR stream sink: entry outside a directory")
-    (frame : outer) -> pure $ do
-      name <- decodeNarText "directory entry name" nameBytes
-      if not (isSafeNarName name)
-        then Left ("unsafe NAR directory entry name: " <> name)
-        else
-          if platformStripsCaseHack && caseHackSuffixText `T.isInfixOf` name
-            then Left ("NAR entry name contains the case-hack suffix: " <> name)
-            else
-              -- Sequential case-hack: the disk name of entry N depends
-              -- only on the siblings before it, the same sequence
-              -- 'caseHackDiskNames' folds over a whole list.
-              let key = onDiskNameKey (nusCaseSensitivity narState) name
-                  (diskName, occurrences) = case Map.lookup key (ufSeen frame) of
-                    Nothing -> (name, 0)
-                    Just seen -> (name <> caseHackSuffixText <> T.pack (show (seen + 1)), seen + 1)
-                  updatedFrame = frame {ufSeen = Map.insert key occurrences (ufSeen frame)}
-               in Right
-                    narState
-                      { nusFrames = updatedFrame : outer,
-                        nusTargets = (ufPath frame </> T.unpack diskName) : nusTargets narState
-                      }
+    (frame : outer) -> case admitEntryName name of
+      Left err -> pure (Left err)
+      Right () -> do
+        -- Sequential case-hack: the disk name of entry N depends only
+        -- on the siblings before it, the same sequence
+        -- 'caseHackDiskNames' folds over a whole list.
+        let key = onDiskNameKey (nusCaseSensitivity narState) name
+            (diskName, occurrences) = case Map.lookup key (ufSeen frame) of
+              Nothing -> (name, 0)
+              Just seen -> (caseHackName name (seen + 1), seen + 1)
+            updatedFrame = frame {ufSeen = Map.insert key occurrences (ufSeen frame)}
+        spelled <- entryNamePath diskName
+        pure $
+          fmap
+            ( \component ->
+                narState
+                  { nusFrames = updatedFrame : outer,
+                    nusTargets = (ufPath frame OP.</> component) : nusTargets narState
+                  }
+            )
+            spelled
   Stream.EventEntryEnd -> case nusTargets narState of
     -- The root destination never pops; only entry-pushed paths do.
     (_ : rest@(_ : _)) -> pure (Right narState {nusTargets = rest})
@@ -978,7 +964,7 @@ applyNarEvent narState event = case event of
     (_ : outer) -> pure (Right narState {nusFrames = outer})
 
 -- | Run an action on the path the next node materializes at.
-withNodeTarget :: NarUnpackState -> (FilePath -> IO (Either Text NarUnpackState)) -> IO (Either Text NarUnpackState)
+withNodeTarget :: NarUnpackState -> (OsPath -> IO (Either Text NarUnpackState)) -> IO (Either Text NarUnpackState)
 withNodeTarget narState act = case nusTargets narState of
   (path : _) -> act path
   [] -> pure (Left "NAR stream sink: node with no destination")
@@ -1004,57 +990,6 @@ abortNarUnpack (NarUnpackSink ref) = do
     Just (fileHandle, _, _) ->
       hClose fileHandle `catch` \(_ :: IOException) -> pure ()
   writeIORef ref narState {nusOpen = Nothing}
-
--- | Whether a NAR directory entry name is safe to materialize on every
--- platform the store targets.  Two rejection classes:
---
--- 1. Path escapes: empty, @.@, @..@, a separator, a NUL (truncates the
---    name in any NUL-terminated API downstream), or a @:@ - a
---    drive-prefixed name like @C:evil@ makes 'System.FilePath.</>'
---    discard the store prefix entirely.
---
--- 2. Names the Win32 path layer silently REWRITES rather than refuses,
---    landing the bytes somewhere other than the named entry so the
---    on-disk tree no longer reproduces the NAR hash that named it: an
---    alternate-data-stream @:@ diverts the contents into a stream of
---    another file, a reserved device stem (CON, PRN, AUX, NUL,
---    COM0-COM9, LPT0-LPT9, plus the superscript-digit forms) addresses
---    the device instead of a file, and a trailing dot or space is
---    stripped on create, folding distinct NAR names onto one on-disk
---    name.
---
--- Characters Windows merely REFUSES (@\"@, @*@, @<@, @>@, @|@) stay
--- allowed: the create call fails loudly and the unpack loop surfaces
--- the failure, which cannot misplace or corrupt anything.
-isSafeNarName :: Text -> Bool
-isSafeNarName name =
-  not (T.null name)
-    && name /= ".."
-    && name /= "."
-    && not (T.any escapesTree name)
-    && not (trailingRewritten name)
-    && not (reservedDeviceStem name)
-  where
-    escapesTree c = c == '/' || c == '\\' || c == ':' || c == '\0'
-    trailingRewritten n = case T.unsnoc n of
-      Just (_, end) -> end == '.' || end == ' '
-      Nothing -> False
-    -- Win32 device parsing takes the name up to the first dot as the
-    -- stem and ignores trailing spaces there ("NUL .txt" still
-    -- addresses NUL), so the stem is space-trimmed before comparison.
-    reservedDeviceStem n =
-      let stem = T.toUpper (T.dropWhileEnd (== ' ') (T.takeWhile (/= '.') n))
-       in stem == "CON"
-            || stem == "PRN"
-            || stem == "AUX"
-            || stem == "NUL"
-            || numberedDeviceStem stem
-    numberedDeviceStem stem = case T.unpack stem of
-      [a, b, c, digit] -> ([a, b, c] == "COM" || [a, b, c] == "LPT") && deviceDigit digit
-      _ -> False
-    -- Digits 0-9 plus the superscript forms ('\185' '\178' '\179') the
-    -- platform also reserves.
-    deviceDigit c = isDigit c || c == '\185' || c == '\178' || c == '\179'
 
 -- ---------------------------------------------------------------------------
 -- Eval source materialization
@@ -1194,13 +1129,14 @@ copyPathInto src dest = do
       refuseTaken (pure (symlinkTakenMessage dest target)) (createLink target dest) >>= raiseRefusal
     else do
       isDir <- doesDirectoryExist src
+      destPath <- OP.encodeFS dest
       if isDir
         then do
-          createTreeDirectory dest >>= raiseRefusal
+          createTreeDirectory destPath >>= raiseRefusal
           names <- listDirectory src
           mapM_ (\name -> copyPathInto (src </> name) (dest </> name)) names
         else do
-          copied <- withNewTreeFile dest (\to -> withBinaryFile src ReadMode (`copyHandleBytes` to))
+          copied <- withNewTreeFile destPath (\to -> withBinaryFile src ReadMode (`copyHandleBytes` to))
           raiseRefusal copied
           -- Best effort: of the permissions, the NAR records only the
           -- exec mark, which is carried on its own below (the unnamed

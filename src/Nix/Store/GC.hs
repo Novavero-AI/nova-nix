@@ -164,6 +164,7 @@ import System.Directory (createDirectoryIfMissing, getFileSize, getSymbolicLinkT
 import System.FilePath (normalise, splitDirectories, takeDirectory, takeFileName, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorType, isDoesNotExistError, isPermissionError)
+import System.OsPath (encodeFS)
 import Text.Printf (printf)
 
 -- ---------------------------------------------------------------------------
@@ -418,7 +419,9 @@ addOutLinkRoot store rawLink sp = do
         else do
           when (node == WalkSymlink) (removePathForcibly link)
           createDirectoryIfMissing True (takeDirectory link)
-          created <- createSymlinkOfKind link (storePathToFilePath (stDir store) sp)
+          linkPath <- encodeFS link
+          target <- encodeFS (storePathToFilePath (stDir store) sp)
+          created <- createSymlinkOfKind linkPath target
           case created of
             Left err -> pure (Left err)
             Right () -> do

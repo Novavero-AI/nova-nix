@@ -23,8 +23,9 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Store.Exclusive (symlinkTakenMessage)
 import qualified System.Directory as Dir
-import System.FilePath (takeDirectory, (</>))
+import qualified System.Directory.OsPath as OsDir
 import System.IO.Error (isAlreadyExistsError)
+import System.OsPath (OsPath, decodeFS, takeDirectory, (</>))
 
 -- | A node kind for store walks, classified WITHOUT following symlinks:
 -- the link test runs first because 'Dir.doesDirectoryExist' and
@@ -60,26 +61,29 @@ classifyWalkNode path = do
 -- publish.  A name already taken is refused in upstream's words, as a
 -- folded sibling or a raced root meets it.
 -- The parent directory is not created here; a caller that wants that
--- does it first.
-createSymlinkOfKind :: FilePath -> FilePath -> IO (Either Text ())
+-- does it first.  Both paths are 'OsPath's, so on POSIX the link and
+-- its target are the bytes they were spelled from.
+createSymlinkOfKind :: OsPath -> OsPath -> IO (Either Text ())
 createSymlinkOfKind linkPath target = do
-  targetIsDir <- Dir.doesDirectoryExist (takeDirectory linkPath </> target)
+  targetIsDir <- OsDir.doesDirectoryExist (takeDirectory linkPath </> target)
   result <-
     try $
       if targetIsDir
-        then Dir.createDirectoryLink target linkPath
-        else Dir.createFileLink target linkPath
-  pure $ case result of
-    Right () -> Right ()
-    Left (e :: IOException)
-      | isAlreadyExistsError e -> Left (symlinkTakenMessage linkPath target)
-      | otherwise ->
-          Left
-            ( "cannot create symlink "
-                <> T.pack linkPath
-                <> " -> "
-                <> T.pack target
-                <> ": "
-                <> T.pack (show e)
-                <> " (on Windows this needs Developer Mode or elevation)"
-            )
+        then OsDir.createDirectoryLink target linkPath
+        else OsDir.createFileLink target linkPath
+  case result of
+    Right () -> pure (Right ())
+    Left (e :: IOException) -> do
+      shownLink <- decodeFS linkPath
+      shownTarget <- decodeFS target
+      pure . Left $
+        if isAlreadyExistsError e
+          then symlinkTakenMessage shownLink shownTarget
+          else
+            "cannot create symlink "
+              <> T.pack shownLink
+              <> " -> "
+              <> T.pack shownTarget
+              <> ": "
+              <> T.pack (show e)
+              <> " (on Windows this needs Developer Mode or elevation)"
