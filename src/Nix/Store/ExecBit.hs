@@ -96,14 +96,15 @@ copyExecMark from to = do
   exec <- isExecutable from
   when exec (markExecutable to)
 
--- | nova-cache serialise options wiring 'isExecutable' in as the
--- exec-bit source of truth: the walk asks the resolver per regular
--- file, with the on-disk (case-hack-suffixed) name, which is exactly
--- the file 'isExecutable' stats.  On Unix 'isExecutable' reads the
--- owner-execute permission, the same answer the default resolver
--- gives, so one options value serves both platforms.
-streamOptions :: NAR.SerialiseOptions
-streamOptions = NAR.defaultSerialiseOptions {NAR.soExecBit = isExecutable}
+-- | nova-cache serialise options under a case-hack mode, wiring
+-- 'isExecutable' in as the exec-bit source of truth: the walk asks the
+-- resolver per regular file, with the on-disk (case-hack-suffixed)
+-- name, which is exactly the file 'isExecutable' stats.  On Unix
+-- 'isExecutable' reads the owner-execute permission, the same answer
+-- the default resolver gives, so one options value serves both
+-- platforms.
+serialiseOptions :: NAR.CaseHack -> NAR.SerialiseOptions
+serialiseOptions mode = NAR.defaultSerialiseOptions {NAR.soCaseHack = mode, NAR.soExecBit = isExecutable}
 
 -- | 'NovaCache.NAR.serialiseFromPath', with every regular file's
 -- executable flag taken from 'isExecutable' rather than from the
@@ -111,23 +112,26 @@ streamOptions = NAR.defaultSerialiseOptions {NAR.soExecBit = isExecutable}
 -- case-hack folding and entry ordering are subtle and belong there --
 -- and the resolver hook (nova-cache 0.11.1) answers the flag during
 -- the walk, replacing the post-hoc rewrite this module used to do.
-serialiseFromPath :: FilePath -> IO NAR.NarEntry
-serialiseFromPath = NAR.serialiseFromPathOpts streamOptions
+-- The case-hack mode is the reader's: a store path's volume decides
+-- it ('Nix.Store.CaseSensitive.volumeCaseHack'), and the process does
+-- for a source ('Nix.Store.CaseSensitive.processCaseHack').
+serialiseFromPath :: NAR.CaseHack -> FilePath -> IO NAR.NarEntry
+serialiseFromPath = NAR.serialiseFromPathOpts . serialiseOptions
 
 -- | 'NovaCache.NAR.withNarSource' through the same exec-bit source of
 -- truth: the path's NAR as a pull source of chunks, no file's contents
 -- held whole.
-withNarSource :: FilePath -> (IO BS.ByteString -> IO a) -> IO a
-withNarSource = NAR.withNarSourceOpts streamOptions
+withNarSource :: NAR.CaseHack -> FilePath -> (IO BS.ByteString -> IO a) -> IO a
+withNarSource = NAR.withNarSourceOpts . serialiseOptions
 
 -- | The NAR hash of a path, read through the same exec-bit source of
 -- truth 'serialiseFromPath' writes.  Streams on every platform: the
 -- archive is pulled in chunks with the ADS resolver answering the
 -- flags, and the digest folds over them.  Before the resolver hook,
 -- Windows had to materialize the tree in memory to rewrite the flags.
-narHashOfPath :: FilePath -> IO Hash.NixHash
-narHashOfPath path =
-  withNarSource path $ \pull ->
+narHashOfPath :: NAR.CaseHack -> FilePath -> IO Hash.NixHash
+narHashOfPath mode path =
+  withNarSource mode path $ \pull ->
     let go !ctx = do
           chunk <- pull
           if BS.null chunk

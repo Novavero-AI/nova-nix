@@ -1,8 +1,9 @@
 {-# LANGUAGE CPP #-}
 
 -- | Case sensitivity of the store filesystem: the runtime probe behind
--- the store's sibling-name handling, and the per-directory capability
--- behind true-name NAR materialization on NTFS.
+-- the store's sibling-name handling and the case-hack mode its trees
+-- are read back under, and the per-directory capability behind
+-- true-name NAR materialization on NTFS.
 --
 -- A folding filesystem lands two sibling names differing only by case
 -- on one file, so an unpacker there has to keep them apart on disk
@@ -16,8 +17,14 @@ module Nix.Store.CaseSensitive
   ( CaseSensitivity (..),
     probeCaseSensitivity,
     trySetCaseSensitiveDir,
+
+    -- * Reading a tree back
+    volumeCaseHack,
+    processCaseHack,
   )
 where
+
+import qualified NovaCache.NAR as NAR
 
 #if defined(darwin_HOST_OS)
 
@@ -39,6 +46,27 @@ data CaseSensitivity
   | -- | Names differing only by case resolve to one entry.
     CaseInsensitive
   deriving (Eq, Show)
+
+-- | The case-hack mode a tree on a volume of the given sensitivity is
+-- read back under.  A folding volume holds a case-variant sibling
+-- under upstream's reversible suffix, so the serialiser strips it; a
+-- volume that keeps names apart never needs the suffix, so its names
+-- are read as spelled, a literal suffix included.  Upstream ties this
+-- to the process instead (@use-case-hack@ governs dump and restore
+-- alike, archive.cc at 2.24.9), which on a case-sensitive macOS volume
+-- strips a suffix nothing put there.
+volumeCaseHack :: CaseSensitivity -> NAR.CaseHack
+volumeCaseHack sensitivity = case sensitivity of
+  CaseSensitive -> NAR.CaseHackDisabled
+  CaseInsensitive -> NAR.CaseHackEnabled
+
+-- | The case-hack mode of a path read outside any store: a source that
+-- evaluation hashes.  That is the process's setting, as upstream's
+-- @use-case-hack@ is (archive.cc at 2.24.9, on for Darwin):
+-- nova-cache's per-OS default, which turns it on for Windows as well,
+-- where nova-nix's stores fold.
+processCaseHack :: NAR.CaseHack
+processCaseHack = NAR.defaultCaseHack
 
 #if defined(darwin_HOST_OS)
 

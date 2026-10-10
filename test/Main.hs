@@ -75,7 +75,7 @@ import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScop
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
-import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir)
+import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -4041,7 +4041,7 @@ testSubstituter = do
               let dest = tmpDir </> ("out-" <> show n)
               source <- chunkReader (streamChunks n streamTestNar)
               result <- Subst.consumeNarStream tmpSensitivity dest (streamTestNarInfo streamTestNar) streamTestDigest source
-              onDisk <- ExecBit.serialiseFromPath dest
+              onDisk <- ExecBit.serialiseFromPath (volumeCaseHack tmpSensitivity) dest
               pure $ case result of
                 Left err ->
                   Just ("chunk size " <> T.pack (show n) <> ": " <> Subst.attemptFailureMessage err)
@@ -4923,25 +4923,23 @@ testSubstituter = do
         Subst.clearStaleDestination dir
         let observed = if length entries == 2 then CaseSensitive else CaseInsensitive
         pure (assertEqual "probe against the filesystem" observed probed),
-      -- Where the platform serialiser strips the suffix, an incoming
-      -- name carrying it must reject (it could not round-trip); on
-      -- Linux such a name is legitimate and materializes verbatim.
+      -- Where the volume's serialiser strips the suffix (a folding
+      -- volume), an incoming name carrying it must reject (it could
+      -- not round-trip); on a volume that keeps names apart such a
+      -- name is legitimate and materializes verbatim.
       runTestM "incoming case-hack suffix names reject where the serialiser strips" $ do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-suffix"
             tree = NAR.NarDirectory [("x~nix~case~hack~1", NAR.NarRegular False "v")]
         Subst.clearStaleDestination dest
         result <- unpackNarEntry tmpSensitivity dest tree
-        outcome <-
-          if SI.os == "mingw32" || SI.os == "darwin"
-            then case result of
-              Left _ -> pure Pass
-              Right () -> pure (Fail "suffix-bearing name accepted where the serialiser strips")
-            else case result of
-              Right () -> do
-                kept <- BS.readFile (dest </> "x~nix~case~hack~1")
-                pure (assertEqual "verbatim on Linux" "v" kept)
-              Left err -> pure (Fail ("Linux rejected a legitimate name: " <> err))
+        outcome <- case (tmpSensitivity, result) of
+          (CaseInsensitive, Left _) -> pure Pass
+          (CaseInsensitive, Right ()) -> pure (Fail "suffix-bearing name accepted where the serialiser strips")
+          (CaseSensitive, Right ()) -> do
+            kept <- BS.readFile (dest </> "x~nix~case~hack~1")
+            pure (assertEqual "verbatim where names stay apart" "v" kept)
+          (CaseSensitive, Left err) -> pure (Fail ("a volume keeping names apart rejected a legitimate name: " <> err))
         Subst.clearStaleDestination dest
         pure outcome,
       -- The capability probe itself: NTFS grants the per-directory flag
@@ -5268,7 +5266,7 @@ testExecBit = do
         BS.writeFile marked "#!x"
         BS.writeFile (dir </> "data") "hello"
         ExecBit.markExecutable marked
-        entry <- ExecBit.serialiseFromPath dir
+        entry <- ExecBit.serialiseFromPath processCaseHack dir
         forceRemoveIfExists dir
         pure $ case entry of
           NAR.NarDirectory entries ->
@@ -5288,14 +5286,14 @@ testExecBit = do
         BS.writeFile marked "#!x"
         BS.writeFile (dir </> "data") "hello"
         ExecBit.markExecutable marked
-        streamed <- ExecBit.narHashOfPath dir
-        fromEntry <- NAR.narHash <$> ExecBit.serialiseFromPath dir
+        streamed <- ExecBit.narHashOfPath processCaseHack dir
+        fromEntry <- NAR.narHash <$> ExecBit.serialiseFromPath processCaseHack dir
         -- A control on the same axis: an unmarked tree must hash
         -- differently, or agreement above would prove nothing.
         unmarkedDir <- freshExecBitDir "hash-plain"
         BS.writeFile (unmarkedDir </> "tool") "#!x"
         BS.writeFile (unmarkedDir </> "data") "hello"
-        unmarked <- ExecBit.narHashOfPath unmarkedDir
+        unmarked <- ExecBit.narHashOfPath processCaseHack unmarkedDir
         forceRemoveIfExists dir
         forceRemoveIfExists unmarkedDir
         pure $
@@ -5315,7 +5313,7 @@ testExecBit = do
         createDirectoryIfMissing True sub
         BS.writeFile marked "#!x"
         ExecBit.markExecutable marked
-        entry <- ExecBit.serialiseFromPath dir
+        entry <- ExecBit.serialiseFromPath processCaseHack dir
         forceRemoveIfExists dir
         pure $ case entry of
           NAR.NarDirectory [(_, NAR.NarDirectory [(_, NAR.NarRegular True _)])] -> Pass
@@ -5799,20 +5797,32 @@ testCaseSensitiveVolumeBody base = do
           ]
       rawNar = NAR.serialise tree
       digest = CHash.hashBytes rawNar
-      narInfoFor sp =
+      narInfoOf nar sp =
         NarInfo.NarInfo
           { NarInfo.niStorePath = storePathToText defaultStoreDir sp,
             NarInfo.niUrl = "nar/case.nar",
             NarInfo.niCompression = "none",
             NarInfo.niFileHash = Nothing,
             NarInfo.niFileSize = Nothing,
-            NarInfo.niNarHash = CHash.formatNixHash digest,
-            NarInfo.niNarSize = fromIntegral (BS.length rawNar),
+            NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes nar),
+            NarInfo.niNarSize = fromIntegral (BS.length nar),
             NarInfo.niReferences = [],
             NarInfo.niDeriver = Nothing,
             NarInfo.niSigs = [],
             NarInfo.niCA = Nothing
           }
+      narInfoFor = narInfoOf rawNar
+      -- A name carrying the case-hack suffix beside the name it would
+      -- strip to: read with the suffix stripped, the two collide.
+      suffixTree =
+        NAR.NarDirectory
+          [ ("Makefile", NAR.NarRegular False "upper"),
+            ("Makefile~nix~case~hack~1", NAR.NarRegular False "literal")
+          ]
+      suffixNar = NAR.serialise suffixTree
+      suffixNames sp = do
+        names <- sort <$> Dir.listDirectory (storePathToFilePath storeDir sp)
+        pure (assertEqual "on-disk names" ["Makefile", "Makefile~nix~case~hack~1"] names)
       -- Both spellings present with their own contents, and nothing
       -- carrying the case-hack suffix.
       trueNames sp = do
@@ -5845,6 +5855,63 @@ testCaseSensitiveVolumeBody base = do
           case result of
             Right _ -> trueNames sp
             Left err -> pure (Fail ("streaming substitution failed: " <> Subst.attemptFailureMessage err)),
+        -- Nothing on a volume that keeps names apart is ever hacked, so
+        -- a name carrying the suffix is a name like any other: both
+        -- pipelines accept it, and their on-disk rechecks read it back
+        -- as spelled (#236).
+        runTestM "a name carrying the case-hack suffix substitutes verbatim, strict" $ do
+          let sp = StorePath (T.replicate 32 "e") "suffix-strict"
+          result <- Subst.unpackAndVerify store sp (narInfoOf suffixNar sp) suffixNar
+          case result of
+            Subst.SubstSuccess _ lock -> do
+              releasePathLock lock
+              suffixNames sp
+            other -> pure (Fail ("substitution failed: " <> T.pack (show other))),
+        runTestM "a name carrying the case-hack suffix substitutes verbatim, streaming" $ do
+          let sp = StorePath (T.replicate 32 "f") "suffix-stream"
+          source <- chunkReader [suffixNar]
+          result <- Subst.materializeNarFromSource store sp (narInfoOf suffixNar sp) (CHash.hashBytes suffixNar) [] Nothing source
+          case result of
+            Right _ -> suffixNames sp
+            Left err -> pure (Fail ("streaming substitution failed: " <> Subst.attemptFailureMessage err)),
+        -- A store path already on this volume is read back as spelled
+        -- too: an evaluation write holding the name reproduces its
+        -- address and registers the NAR upstream dumps for it with
+        -- use-case-hack off ('suffixPairNarHash').
+        runTestM "a store path naming a file with the case-hack suffix registers under that name" $
+          case makeFixedOutputPath "suffix-write" "sha256" "recursive" (sha256Digest suffixNar) of
+            Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+            Right sp -> do
+              let dest = storePathToFilePath storeDir sp
+              createDirectoryIfMissing True dest
+              BS.writeFile (dest </> "Makefile") "upper"
+              BS.writeFile (dest </> "Makefile~nix~case~hack~1") "literal"
+              materializeEvalStoreWrites store (Map.singleton (storePathToText defaultStoreDir sp) ([], WriteRecursive))
+              info <- queryPathInfo (stDB store) sp
+              pure $ case info of
+                Just row -> assertEqual "registered NAR hash" suffixPairNarHash (piNarHash row)
+                Nothing -> Fail "not registered",
+        -- Evaluation reads a store path as the store does: copying one
+        -- holding the name hashes it as spelled, where a source read
+        -- would follow the process and, on macOS, strip it.
+        runTestM "builtins.path reads a store path under its volume's case-hack mode" $ do
+          let held = StorePath (T.replicate 32 "g") "suffix-read"
+              heldPath = storePathToFilePath storeDir held
+          createDirectoryIfMissing True heldPath
+          BS.writeFile (heldPath </> "Makefile") "upper"
+          BS.writeFile (heldPath </> "Makefile~nix~case~hack~1") "literal"
+          copied <-
+            evalNixIOStore
+              storeDir
+              "."
+              ("builtins.path { path = " <> storePathToText defaultStoreDir held <> "; name = \"suffix-copy\"; }")
+          let expected = storePathToText defaultStoreDir <$> makeFixedOutputPath "suffix-copy" "sha256" "recursive" (sha256Digest suffixNar)
+          case (copied, expected) of
+            (Right (VStr pathBytes _), Right expectedPath)
+              | bytesText pathBytes /= expectedPath -> pure (Fail ("copied to " <> bytesText pathBytes <> ", expected " <> expectedPath))
+              | otherwise -> maybe (pure (Fail "unparseable store path")) suffixNames (parseStorePath defaultStoreDir expectedPath)
+            (Left err, _) -> pure (Fail ("eval failed: " <> err))
+            other -> pure (Fail ("unexpected result: " <> T.pack (show other))),
         -- A source tree copied off this volume into one that folds the
         -- sharp-s pair: the two names are distinct here and one name
         -- there, so the copy refuses the second at the write rather
@@ -5958,6 +6025,14 @@ caseOnlyPairBuild base srcExpr = do
       forceRemoveIfExists srcRoot
       forceRemoveIfExists tmpStore
       pure verdict
+
+-- | The NAR hash of a directory holding @Makefile@ (@upper@) and
+-- @Makefile~nix~case~hack~1@ (@literal@): @nix-store --option
+-- use-case-hack false --dump@ 2.33.2 piped to @nix-hash --flat@.  With
+-- the setting at its macOS default the dump strips the suffix and
+-- fails on the collision.
+suffixPairNarHash :: Text
+suffixPairNarHash = "sha256:1x31cqjvkihkh3wbzq00z8xplwbf7i0bpk3g9vqs403lh3f5b4gs"
 
 -- | A path as upstream's formatter streams a @std::filesystem::path@:
 -- through @std::quoted@, in double quotes with a double quote or a
