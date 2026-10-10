@@ -11,6 +11,7 @@ module Nix.Eval.StringInterp
     stripIndentedChunks,
     CoercePath,
     coerceToString,
+    joinCoercedList,
     formatNixFloat,
   )
 where
@@ -21,8 +22,9 @@ import qualified Data.ByteString.Char8 as BC
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Nix.Eval.CList (clistLen, clistThunks)
 import Nix.Eval.Print (PrintOptions (..), printValue)
-import Nix.Eval.Types (MonadEval (..), NixValue (..), StringContext, Thunk, attrSetLookup, emptyContext, typeName)
+import Nix.Eval.Types (MonadEval (..), NixValue (..), StringContext, Thunk (..), attrSetLookup, emptyContext, typeName)
 import Numeric (showFFloat)
 
 -- | Force a thunk to a value.
@@ -180,7 +182,8 @@ dropSpaceOnlyLastLine s = case BC.elemIndexEnd '\n' s of
 -- and null coerce permissively; when 'False' (string interpolation,
 -- @builtins.concatStringsSep@) those are type errors, matching C++ Nix.
 -- Strings, paths, and attribute sets with @__toString@/@outPath@ coerce in
--- both modes; lists and bare functions are always errors.
+-- both modes, a list in the permissive one ('joinCoercedList'), and a
+-- function never.
 coerceToString :: (MonadEval m) => Bool -> Force m -> Apply m -> CoercePath m -> NixValue -> m (ByteString, StringContext)
 coerceToString _ _ _ _ (VStr s ctx) = pure (s, ctx)
 coerceToString _ _ _ coercePathFn (VPath p) = coercePathFn p
@@ -189,6 +192,16 @@ coerceToString True _ _ _ (VFloat n) = pure (TE.encodeUtf8 (formatNixFloatFixed 
 coerceToString True _ _ _ VNull = pure ("", emptyContext)
 coerceToString True _ _ _ (VBool True) = pure ("1", emptyContext)
 coerceToString True _ _ _ (VBool False) = pure ("", emptyContext)
+coerceToString True forceFn applyFn coercePathFn (VList cl) = do
+  parts <- mapM element (clistThunks cl)
+  pure (joinCoercedList [(bytes, isEmptyList) | (bytes, _, isEmptyList) <- parts], mconcat [ctx | (_, ctx, _) <- parts])
+  where
+    element thunk = do
+      val <- forceFn (Thunk thunk)
+      (bytes, ctx) <- coerceToString True forceFn applyFn coercePathFn val
+      pure (bytes, ctx, emptyList val)
+    emptyList (VList inner) = clistLen inner == 0
+    emptyList _ = False
 -- Attribute sets: try __toString first, then outPath (both modes).
 -- The recursion carries the caller's path coercion, so a path-valued
 -- @outPath@ lands on the caller's path case, not a fixed one.
@@ -204,6 +217,19 @@ coerceToString coerceMore forceFn applyFn coercePathFn (VAttrs attrs) =
         coerceToString coerceMore forceFn applyFn coercePathFn outPathVal
       Nothing -> uncoercible (VAttrs attrs)
 coerceToString _ _ _ _ other = uncoercible other
+
+-- | The coerced elements of a list joined as upstream's @coerceToString@
+-- joins them (eval.cc at 2.24.9): a space after each but the last, except
+-- after one that is itself an empty list, which upstream's own comment
+-- calls "not quite correct".  Each element comes with whether it was one.
+joinCoercedList :: [(ByteString, Bool)] -> ByteString
+joinCoercedList = BS.concat . pieces
+  where
+    pieces ((bytes, isEmptyList) : rest@(_ : _))
+      | isEmptyList = bytes : pieces rest
+      | otherwise = bytes : " " : pieces rest
+    pieces [(bytes, _)] = [bytes]
+    pieces [] = []
 
 -- | Upstream's refusal of a value no coercion takes (@coerceToString@,
 -- eval.cc at 2.24.9): its type, then the value as an error prints it.
