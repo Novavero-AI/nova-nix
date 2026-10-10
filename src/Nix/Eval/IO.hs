@@ -33,8 +33,8 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, Handler (..), IOException, SomeAsyncException, SomeException, catches, displayException, fromException, onException, throwIO, try)
-import Control.Monad (unless, when)
+import Control.Exception (Exception, Handler (..), IOException, SomeAsyncException, SomeException, catch, catches, displayException, fromException, onException, throwIO, try)
+import Control.Monad (unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
 import Crypto.Random (getRandomBytes)
@@ -62,6 +62,7 @@ import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
+import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
@@ -316,7 +317,7 @@ instance MonadEval EvalIO where
   listDirectory path = do
     accessPath path
     dir <- evalStoreTextPath path
-    wrapIO $ do
+    sourceIOWith ReadDirectory (resolvedForMessage path) $ do
       entries <- Dir.listDirectory dir
       mapM (classifyEntry dir) entries
 
@@ -335,7 +336,7 @@ instance MonadEval EvalIO where
     case Map.lookup target cache of
       Just cached -> pure cached
       Nothing -> do
-        source <- wrapIO (readFileAutoEncoding ioTarget)
+        source <- sourceIO ReadFile (T.pack target) (readFileAutoEncoding ioTarget)
         let fileDir = takeDirectory target
         case parseNixWithScope (rootScopeNames policy) fileDir (T.pack target) source of
           Left err -> rejectSource "import" target err
@@ -434,7 +435,7 @@ instance MonadEval EvalIO where
         -- A path already in the store never reaches here (it coerces to
         -- itself), so this is a source, read as the build driver's
         -- restore reads it again.
-        entry <- wrapIO (ExecBit.serialiseFromPath processCaseHack resolvedSource)
+        entry <- serialiseSource resolvedText processCaseHack resolvedSource
         let narDigest = sha256Digest (NAR.serialise entry)
         sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
         let spText = canonicalStorePathText sp
@@ -480,7 +481,7 @@ instance MonadEval EvalIO where
     searchPaths <- EvalIO (asks esSearchPaths)
     policy <- EvalIO (asks esPolicy)
     (target, ioTarget) <- resolveImportTarget baseDir rawPath
-    source <- wrapIO (readFileAutoEncoding ioTarget)
+    source <- sourceIO ReadFile (T.pack target) (readFileAutoEncoding ioTarget)
     let fileDir = takeDirectory target
     case parseNixWithScope (Set.union (Set.fromList (map fst scope)) (rootScopeNames policy)) fileDir (T.pack target) source of
       Left err -> rejectSource "scopedImport" target err
@@ -495,7 +496,7 @@ instance MonadEval EvalIO where
 
   readFileBytes path = do
     accessPath path
-    evalStoreTextPath path >>= \resolved -> wrapIO (BS.readFile resolved)
+    evalStoreTextPath path >>= \resolved -> sourceIOWith ReadFile (resolvedForMessage path) (BS.readFile resolved)
 
   -- An lstat of the path itself, no symlink walk: upstream's readFileType
   -- realises its argument without resolution, the allow list checks the
@@ -506,7 +507,7 @@ instance MonadEval EvalIO where
   getFileType path = do
     accessPathDirect path
     refuseSymlinkedAncestor path
-    evalStoreTextPath path >>= \resolved -> wrapIO (classifyPath resolved)
+    evalStoreTextPath path >>= \resolved -> sourceIO StatPath path (classifyPath resolved)
 
   runProcess cmd cmdArgs stdinText = wrapIO $ do
     let cp =
@@ -564,7 +565,7 @@ instance MonadEval EvalIO where
     resolvedText <- resolveSymlinks srcPath
     caseHack <- readCaseHack resolvedText
     resolvedSource <- evalStoreTextPath resolvedText
-    entry <- wrapIO (ExecBit.serialiseFromPath caseHack resolvedSource)
+    entry <- serialiseSource resolvedText caseHack resolvedSource
     let narDigest = sha256Digest (NAR.serialise entry)
     case expectedSha256 of
       Just (subject, expected)
@@ -1157,7 +1158,7 @@ resolveImportTarget baseDir rawPath = do
       | SP.isCanonicalStoreText rawPath = do
           let valueBase = T.unpack (canonPath rawPath)
           resolvedBase <- evalStoreTextPath (T.pack valueBase)
-          isDir <- wrapIO (Dir.doesDirectoryExist resolvedBase)
+          isDir <- sourceIO StatPath (T.pack valueBase) (statSource resolvedBase >> Dir.doesDirectoryExist resolvedBase)
           -- The value-domain join stays "/" so the canonical spelling survives.
           let valueTarget = if isDir then valueBase <> "/default.nix" else valueBase
           resolvedTarget <- evalStoreTextPath (T.pack valueTarget)
@@ -1166,10 +1167,11 @@ resolveImportTarget baseDir rawPath = do
           let raw = T.unpack rawPath
               resolved = if isRelative raw then baseDir </> raw else raw
           canonical <- wrapIO (Dir.canonicalizePath resolved)
-          -- Directory import: append /default.nix if target is a directory
-          target <- wrapIO $ do
-            isDir <- Dir.doesDirectoryExist canonical
-            pure (if isDir then canonical </> "default.nix" else canonical)
+          -- Directory import: append /default.nix if target is a
+          -- directory, which upstream's resolveExprPath learns from an
+          -- lstat, so an absent target is a stat failure.
+          isDir <- sourceIO StatPath (T.pack canonical) (statSource canonical >> Dir.doesDirectoryExist canonical)
+          let target = if isDir then canonical </> "default.nix" else canonical
           pure (target, target)
 
 -- | Classify a filesystem path as @"regular"@, @"directory"@, @"symlink"@,
@@ -1210,6 +1212,48 @@ wrapIO action = EvalIO $ liftIO $ do
       | Just abortErr <- fromException err -> throwIO (abortErr :: NixAbortError)
       | Just nixErr <- fromException err -> throwIO (nixErr :: NixEvalError)
       | otherwise -> throwIO (NixEvalError ErrorUncatchable (untracedFailure (T.pack (displayException err))))
+
+-- | 'wrapIO' for an access to a source path: an 'IOException' becomes
+-- the message upstream gives that access ('sourceErrorMessage'), naming
+-- the path as given.
+sourceIO :: SourceAccess -> Text -> IO a -> EvalIO a
+sourceIO access path = sourceIOWith access (pure path)
+
+-- | 'sourceIO' with the path to name computed once the access has failed,
+-- so a successful read pays nothing for it.
+sourceIOWith :: SourceAccess -> IO Text -> IO a -> EvalIO a
+sourceIOWith access shownPath action =
+  wrapIO $
+    action `catch` \(err :: IOException) -> do
+      shown <- shownPath
+      throwIO (NixEvalError ErrorUncatchable (untracedFailure (sourceErrorMessage access shown err)))
+
+-- | A path with its symlinks resolved, as upstream names one it reached
+-- through realisePath (readFile, hashFile and readDir resolve fully).
+-- A path the resolution itself cannot walk keeps the spelling given.
+resolvedForMessage :: Text -> IO Text
+resolvedForMessage path
+  | SP.isCanonicalStoreText path = pure (canonPath path)
+  | otherwise =
+      (canonPathValue . T.pack <$> Dir.canonicalizePath (T.unpack path))
+        `catch` \(_ :: IOException) -> pure path
+
+-- | An lstat that raises for an absent path: 'Dir.pathIsSymbolicLink' is
+-- the portable lstat, as 'lstatExists' says.
+statSource :: FilePath -> IO ()
+statSource = void . Dir.pathIsSymbolicLink
+
+-- | A source path's NAR, its root lstat'ed first as upstream's dumpPath
+-- begins.  A regular file's only access in the walk is its read, so a
+-- failure there is the read's.  A failure below a directory keeps GHC's
+-- text until nova-cache's walk names the access that failed
+-- (Novavero-AI/nova-cache#80).
+serialiseSource :: Text -> NAR.CaseHack -> FilePath -> EvalIO NAR.NarEntry
+serialiseSource path caseHack resolved = do
+  isLink <- sourceIO StatPath path (Dir.pathIsSymbolicLink resolved)
+  isFile <- wrapIO (Dir.doesFileExist resolved)
+  let walk = ExecBit.serialiseFromPath caseHack resolved
+  if not isLink && isFile then sourceIO ReadFile path walk else wrapIO walk
 
 -- | Run an IO evaluation, returning @Left@ with the failure's message on
 -- error.

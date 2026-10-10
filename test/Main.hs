@@ -35,6 +35,7 @@ import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
 import Data.Word (Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
+import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
 import Foreign.C.Types (CChar)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
@@ -42,6 +43,7 @@ import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deR
 import Foreign.Storable (poke, sizeOf)
 import qualified GHC.Foreign as GHCForeign
 import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEncoding)
+import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
@@ -68,6 +70,7 @@ import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIO, runEvalIOTraced)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printValue)
+import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternBytes, symbolLen, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), allocCSlots, attrSetKeys, buildCSlots, emptyCList, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
@@ -3084,6 +3087,82 @@ testInterpolatedSymlinkBody = do
     sequence
       [ copies "filelink" fileEntry,
         copies "dirlink" dirEntry
+      ]
+  Dir.removePathForcibly dir
+  pure results
+
+-- | A failed source-path access reworded as upstream's PosixSourceAccessor
+-- words it (2.24.9), from IOExceptions shaped as GHC raises them.
+testSourceErrorMessage :: IO [Bool]
+testSourceErrorMessage = do
+  putStrLn "eval/source-error-message"
+  let errnoFailure kind (Errno code) description =
+        IOError Nothing kind "test" description (Just code) (Just "/d/x")
+      absent = errnoFailure NoSuchThing eNOENT "No such file or directory"
+      notDirectory = errnoFailure InappropriateType eNOTDIR "Not a directory"
+      denied = errnoFailure PermissionDenied eACCES "Permission denied"
+      isDirectory = errnoFailure InappropriateType eISDIR "Is a directory"
+      -- GHC's openFile refuses a directory itself, with no errno.
+      ghcDirectory = IOError Nothing InappropriateType "openFile" "is a directory" Nothing (Just "/d/dir")
+      says label access path err expected =
+        runTest label (assertEqual label expected (sourceErrorMessage access path err))
+  sequence
+    [ says "a stat of an absent path" StatPath "/d/nope" absent "path '/d/nope' does not exist",
+      says "a stat through a file is absent too" StatPath "/d/file/x" notDirectory "path '/d/file/x' does not exist",
+      says "a stat refused otherwise names the stat" StatPath "/d/x" denied "getting status of '/d/x': Permission denied",
+      says "opening an absent file" ReadFile "/d/nope" absent "opening file '/d/nope': No such file or directory",
+      says "opening a file refused" ReadFile "/d/x" denied "opening file '/d/x': Permission denied",
+      says "reading a directory as a file" ReadFile "/d/dir" isDirectory "reading from file '/d/dir': Is a directory",
+      says "GHC's own directory refusal reads as upstream's" ReadFile "/d/dir" ghcDirectory "reading from file '/d/dir': Is a directory",
+      says "listing a file" ReadDirectory "/d/file" notDirectory "reading directory /d/file: Not a directory"
+    ]
+
+-- | The same failures through the IO evaluator, against a real tree.
+-- POSIX only: Windows reports its own error text, and a path there is
+-- spelled with a drive.
+testSourceReadErrorsIO :: IO [Bool]
+testSourceReadErrorsIO = do
+  putStrLn "eval/source-read-errors-io"
+  if SI.os == "mingw32"
+    then do
+      putStrLn "  SKIP  POSIX error text"
+      pure []
+    else testSourceReadErrorsBody
+
+testSourceReadErrorsBody :: IO [Bool]
+testSourceReadErrorsBody = do
+  -- The temporary directory's own symlinks resolved (macOS keeps it under
+  -- /var, a link), so the only link in play is the one made below.
+  tmpBase <- Dir.canonicalizePath =<< getTemporaryDirectory
+  let dir = tmpBase </> "nova-nix-test-source-read-errors"
+  Dir.removePathForcibly dir
+  createDirectoryIfMissing True (dir </> "sub")
+  createDirectoryIfMissing True (dir </> "real")
+  BS.writeFile (dir </> "file") "f"
+  Dir.createDirectoryLink "real" (dir </> "link")
+  let resolved = T.pack dir
+      given = T.pack dir
+      at name = "/. + " <> nixQuotedPath (dir </> name)
+      fails label source expected = runTestM label (assertEvalErrorIO dir label source expected)
+  results <-
+    sequence
+      [ fails "readFile of an absent file" ("builtins.readFile (" <> at "nope" <> ")") ("opening file '" <> resolved <> "/nope': No such file or directory"),
+        fails "hashFile of an absent file" ("builtins.hashFile \"sha256\" (" <> at "nope" <> ")") ("opening file '" <> resolved <> "/nope': No such file or directory"),
+        fails "readFile through a file" ("builtins.readFile (" <> at "file/x" <> ")") ("opening file '" <> resolved <> "/file/x': Not a directory"),
+        fails "readFile of a directory" ("builtins.readFile (" <> at "sub" <> ")") ("reading from file '" <> resolved <> "/sub': Is a directory"),
+        fails "readDir of an absent directory" ("builtins.readDir (" <> at "nope" <> ")") ("reading directory " <> resolved <> "/nope: No such file or directory"),
+        fails "readDir of a file" ("builtins.readDir (" <> at "file" <> ")") ("reading directory " <> resolved <> "/file: Not a directory"),
+        fails "readFileType of an absent path" ("builtins.readFileType (" <> at "nope" <> ")") ("path '" <> given <> "/nope' does not exist"),
+        fails "interpolating an absent path" ("\"${" <> at "nope" <> "}\"") ("path '" <> resolved <> "/nope' does not exist"),
+        fails "builtins.path of an absent path" ("builtins.path { path = " <> at "nope" <> "; }") ("path '" <> resolved <> "/nope' does not exist"),
+        fails "importing an absent path" ("import (" <> at "nope" <> ")") ("path '" <> resolved <> "/nope' does not exist"),
+        fails "importing a directory without default.nix" ("import (" <> at "sub" <> ")") ("opening file '" <> resolved <> "/sub/default.nix': No such file or directory"),
+        -- Through a symlinked directory a read names the resolved path, as
+        -- realisePath resolves it, and readFileType refuses the link.
+        fails "readFile through a link names the resolved path" ("builtins.readFile (" <> at "link/nope" <> ")") ("opening file '" <> resolved <> "/real/nope': No such file or directory"),
+        fails "readDir through a link names the resolved path" ("builtins.readDir (" <> at "link/nope" <> ")") ("reading directory " <> resolved <> "/real/nope: No such file or directory"),
+        fails "import through a link names the resolved path" ("import (" <> at "link/nope" <> ")") ("path '" <> resolved <> "/real/nope' does not exist"),
+        fails "readFileType through a link refuses the link" ("builtins.readFileType (" <> at "link/nope" <> ")") ("path '" <> given <> "/link' is a symlink")
       ]
   Dir.removePathForcibly dir
   pure results
@@ -15428,6 +15507,8 @@ runSuite = do
           testPathFilterIO,
           testPathSymlinkIO,
           testInterpolatedSymlinkIO,
+          testSourceErrorMessage,
+          testSourceReadErrorsIO,
           testBatchA,
           testBatchAIO,
           testEnvironmentBytes,
