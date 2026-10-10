@@ -34,6 +34,8 @@ import qualified Database.SQLite.Simple as SQL
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Foreign.Storable (sizeOf)
+import qualified GHC.Foreign as GHCForeign
+import GHC.IO.Encoding (getFileSystemEncoding)
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
@@ -83,6 +85,7 @@ import qualified NovaCache.Zstd as CZstd
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv, setEnv, unsetEnv)
+import qualified System.Environment.Blank as Blank
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
@@ -2632,6 +2635,136 @@ testBatchAIO = do
               VInt n -> if n > 0 then Pass else Fail ("expected > 0, got " <> T.pack (show n))
               _ -> Fail ("expected VInt, got " <> T.pack (show val))
       ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: environment values as bytes
+-- ---------------------------------------------------------------------------
+
+-- | An environment value reaches the evaluator as its bytes, through
+-- @builtins.getEnv@ and through @NIX_PATH@, as upstream's @getenv@ reads
+-- it; each case's outcome was read off nix-instantiate 2.33.2 under the
+-- same environment.  A POSIX environment is bytes and a Windows one is
+-- UTF-16, so each platform runs the cases its environment can express.
+testEnvironmentBytes :: IO [Bool]
+testEnvironmentBytes = do
+  putStrLn "eval/environment-bytes"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-env-bytes"
+      pkgDir = testDir </> "mypkg"
+  bracket_
+    ( do
+        createDirectoryIfMissing True pkgDir
+        BS.writeFile (pkgDir </> "default.nix") "42"
+        BS.writeFile (testDir </> "name.bin") nonUtf8EnvName
+    )
+    (Dir.removePathForcibly testDir)
+    $ do
+      getEnvResults <- mapM (getEnvCase testDir) envByteCases
+      nixPathResults <- mapM (nixPathCase testDir) envByteCases
+      rest <-
+        sequence
+          [ withEnvBytes "a lookup passes a NIX_PATH entry whose prefix has no UTF-8 reading" (TE.encodeUtf8 nixPathVarName) ("\xFC=/nonexistent:mypkg=" <> TE.encodeUtf8 (T.pack pkgDir)) $
+              assertEqual "lookup" (Right (VInt 42)) <$> evalNixIO testDir "import <mypkg>",
+            withEnvBytes "getEnv looks a name up by its bytes" nonUtf8EnvName "hello" $
+              expectBytes "name" "hello" <$> evalNixIO testDir "builtins.getEnv (builtins.readFile ./name.bin)",
+            unpairedSurrogateGetEnv testDir,
+            unpairedSurrogateNixPath testDir
+          ]
+      pure (getEnvResults ++ nixPathResults ++ rest)
+  where
+    getEnvCase dir (label, bytes) =
+      withEnvBytes ("getEnv carries " <> label) (TE.encodeUtf8 testEnvVarName) bytes $
+        expectBytes "getEnv" bytes <$> evalNixIO dir ("builtins.getEnv \"" <> testEnvVarName <> "\"")
+    nixPathCase dir (label, bytes) =
+      withEnvBytes ("NIX_PATH carries " <> label <> " into prefix and path") (TE.encodeUtf8 nixPathVarName) (bytes <> "=/x" <> bytes) $
+        expectBytes "nixPath" (bytes <> "|/x" <> bytes) <$> evalNixIO dir "let e = builtins.head builtins.nixPath; in e.prefix + \"|\" + e.path"
+    expectBytes label expected = \case
+      Right (VStr actual _) -> assertEqual label expected actual
+      other -> Fail (label <> ": expected a string, got " <> T.pack (show other))
+
+-- | The values the environment cases carry: a byte with no UTF-8 reading,
+-- a multibyte UTF-8 character, and nothing at all.
+envByteCases :: [(Text, BS.ByteString)]
+envByteCases =
+  [ ("a byte with no UTF-8 reading", "\xFC"),
+    ("a multibyte UTF-8 value", "caf\xC3\xA9"),
+    ("an empty value", "")
+  ]
+
+testEnvVarName :: Text
+testEnvVarName = "NOVA_NIX_TEST_ENV_BYTES"
+
+nixPathVarName :: Text
+nixPathVarName = "NIX_PATH"
+
+-- | A variable name holding a byte with no UTF-8 reading.
+nonUtf8EnvName :: BS.ByteString
+nonUtf8EnvName = "NOVA_NIX_TEST_ENV_\xFC"
+
+-- | Run one case with a variable set to the given bytes, restoring it
+-- afterwards.  A Windows environment is UTF-16 and cannot hold a byte
+-- with no UTF-8 reading, so such a case skips there.
+withEnvBytes :: Text -> BS.ByteString -> BS.ByteString -> IO TestResult -> IO Bool
+withEnvBytes label name value check = do
+  spelledName <- envSpelling name
+  spelledValue <- envSpelling value
+  case (,) <$> spelledName <*> spelledValue of
+    Nothing -> True <$ putStrLn ("  SKIP  " <> T.unpack label <> ": a Windows environment cannot hold a byte with no UTF-8 reading")
+    Just (nameSpelling, valueSpelling) -> runTestM label (withEnvVar nameSpelling valueSpelling check)
+
+-- | The 'String' that base's environment setters write as the given
+-- bytes: on POSIX they encode with the file-system encoding, whose
+-- round-trip escape restores every byte its decoding escaped, and on
+-- Windows they write UTF-16.
+envSpelling :: BS.ByteString -> IO (Maybe String)
+envSpelling bytes
+  | SI.os == "mingw32" = pure (either (const Nothing) (Just . T.unpack) (TE.decodeUtf8' bytes))
+  | otherwise = do
+      encoding <- getFileSystemEncoding
+      Just <$> BS.useAsCStringLen bytes (GHCForeign.peekCStringLen encoding)
+
+-- | Run an action with a variable set (to an empty value too, which
+-- 'setEnv' would unset), restoring what the variable held afterwards.
+withEnvVar :: String -> String -> IO a -> IO a
+withEnvVar name value action =
+  bracket (lookupEnv name) restore (const (Blank.setEnv name value True >> action))
+  where
+    restore = maybe (unsetEnv name) (\saved -> Blank.setEnv name saved True)
+
+-- | A Windows value holding an unpaired UTF-16 surrogate has no UTF-8
+-- form, so getEnv refuses it rather than substituting U+FFFD.
+unpairedSurrogateGetEnv :: FilePath -> IO Bool
+unpairedSurrogateGetEnv dir
+  | SI.os /= "mingw32" = True <$ putStrLn unpairedSurrogateSkip
+  | otherwise =
+      runTestM "getEnv refuses a value holding an unpaired surrogate" $
+        withEnvVar (T.unpack testEnvVarName) "a\xD800" $ do
+          result <- evalNixIO dir ("builtins.getEnv \"" <> testEnvVarName <> "\"")
+          pure $ case result of
+            Left err | unpairedSurrogateWords `T.isInfixOf` err -> Pass
+            other -> Fail ("expected the unpaired-surrogate refusal, got " <> T.pack (show other))
+
+-- | The same refusal for @NIX_PATH@, raised as the evaluation state is
+-- created.
+unpairedSurrogateNixPath :: FilePath -> IO Bool
+unpairedSurrogateNixPath dir
+  | SI.os /= "mingw32" = True <$ putStrLn unpairedSurrogateSkip
+  | otherwise =
+      runTestM "NIX_PATH holding an unpaired surrogate is refused" $
+        withEnvVar (T.unpack nixPathVarName) "a=\xD800" $ do
+          storeDir <- evalNixIOStoreDir
+          outcome <- try (newEvalState storeDir dir)
+          pure $ case outcome of
+            Left (err :: IOException)
+              | unpairedSurrogateWords `T.isInfixOf` T.pack (displayException err) -> Pass
+              | otherwise -> Fail ("wrong error: " <> T.pack (displayException err))
+            Right _ -> Fail "NIX_PATH was accepted"
+
+unpairedSurrogateWords :: Text
+unpairedSurrogateWords = "unpaired UTF-16 surrogate"
+
+unpairedSurrogateSkip :: String
+unpairedSurrogateSkip = "  SKIP  an unpaired UTF-16 surrogate exists only in a Windows environment"
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch B - placeholder, storePath
@@ -11023,7 +11156,7 @@ testPhase4 = do
       runTest "splitNixPath drops a trailing empty entry" $
         assertEqual "split-trail" ["a"] (splitNixPath "a:"),
       runTestM "splitNixPath long entry splits in linear time" $ do
-        let entry = T.replicate 2000000 "p"
+        let entry = TE.encodeUtf8 (T.replicate 2000000 "p")
             split = splitNixPath ("first:" <> entry) == ["first", entry]
         outcome <- timeout walkWatchdogMicros (evaluate split)
         pure $ case outcome of
@@ -11101,7 +11234,7 @@ testPhase4IO = do
         -- Search path with --nix-path equivalent (populated nixPath)
         runTestM "search path with populated nixPath" $ do
           st <- newEvalState platformStoreDir testDir
-          let nixPaths = parseNixPath ("mypkg=" <> T.pack subDir)
+          let nixPaths = parseNixPath (TE.encodeUtf8 ("mypkg=" <> T.pack subDir))
               env = builtinEnv unrestrictedPolicy (esTimestamp st) nixPaths
           result <- runEvalIO st (eval env (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
           pure $ case result of
@@ -13186,6 +13319,7 @@ runSuite = do
           testPathSymlinkIO,
           testBatchA,
           testBatchAIO,
+          testEnvironmentBytes,
           testBatchB,
           testBatchC,
           testBatchCIO,
@@ -13601,7 +13735,7 @@ testEvalPolicyIO = do
             expectLeft "fetchGit of an allowed path is still a URI, checked in its git+file form" ("access to URI '" <> repoUrl <> "' is forbidden in restricted mode") (restricted ("builtins.fetchGit " <> quoted repo)),
             expectRight "an allowed git+file prefix admits the fetch and its tree is readable afterwards" (mkStr "in repo\n") (withUris ["git+file://" <> pathText allowed] ("builtins.readFile ((builtins.fetchGit " <> quoted repo <> ").outPath + \"/f.txt\")")),
             -- restricted: the search path
-            expectRight "a search path root is where <name> resolves and reads" (VInt 7) (evalPolicyIO restrictedPolicy [pathText allowed] (parseNixPath ("allowed=" <> pathText allowed)) allowed "import <allowed/y.nix>"),
+            expectRight "a search path root is where <name> resolves and reads" (VInt 7) (evalPolicyIO restrictedPolicy [pathText allowed] (parseNixPath (TE.encodeUtf8 ("allowed=" <> pathText allowed))) allowed "import <allowed/y.nix>"),
             expectLeft "a search path miss carries the NIX_PATH hint and is catchable" "file 'nope' was not found in the Nix search path (add it using $NIX_PATH or -I)" (restricted "<nope>"),
             expectRight "tryEval catches the miss" (VBool False) (restricted "(builtins.tryEval <nope>).success"),
             -- pure

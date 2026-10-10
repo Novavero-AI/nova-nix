@@ -1206,8 +1206,9 @@ class (Monad m) => MonadEval m where
 
   importFile :: Text -> m NixValue
 
-  -- | Look up an environment variable.  Returns @""@ if unset.
-  getEnvVar :: Text -> m Text
+  -- | Look up an environment variable by the bytes of its name, answering
+  -- the bytes of its value, or @""@ if unset.
+  getEnvVar :: ByteString -> m ByteString
 
   -- | Get the current epoch time (seconds since 1970-01-01).
   getCurrentTime :: m Int64

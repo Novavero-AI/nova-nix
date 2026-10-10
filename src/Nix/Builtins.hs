@@ -28,15 +28,19 @@ module Nix.Builtins
   )
 where
 
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BC
 import Data.Char (isAsciiLower, isAsciiUpper)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, builtinNames, currentSystemStr, deferApply, evaluated, readThunkValue)
-import Nix.Eval.Types (EvalPolicy (..), bytesToTextLossy, cheapThunk, clistFromThunks, mkStr, newCEnv, thunkToCPtr)
+import Nix.Eval.Types (EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newCEnv, thunkToCPtr)
 import Nix.Parser (parseNix)
 import Nix.Store.Path (defaultStoreDirText)
 
@@ -232,27 +236,30 @@ abortingThunk message = deferApply (VBuiltin "abort" []) (evaluated (mkStr messa
 -- | Parse a @NIX_PATH@-formatted string into a list of search path entry
 -- thunks.  Each entry becomes a @{ prefix, path }@ attrset.
 --
--- Format: colon-separated entries, each either @name=path@ or plain @path@.
--- A plain path gets an empty prefix (matching real Nix behaviour).
+-- Format: colon-separated entries, each either @name=path@ or plain @path@,
+-- split at the first @=@.  A plain path gets an empty prefix (matching
+-- real Nix behaviour).  The prefix and path keep the entry's bytes, as
+-- upstream's @LookupPath::Elem::parse@ keeps them
+-- (src/libexpr/search-path.cc at Nix 2.24.9).
 --
 -- >>> parseNixPath "nixpkgs=/home/user/nixpkgs:custom=/opt/custom"
 -- [Evaluated (VAttrs {"prefix": "nixpkgs", "path": "/home/user/nixpkgs"}), ...]
-parseNixPath :: Text -> [Thunk]
+parseNixPath :: ByteString -> [Thunk]
 parseNixPath raw
-  | T.null raw = []
+  | BS.null raw = []
   | otherwise = map parseEntry (splitNixPath raw)
   where
     parseEntry entry =
-      let (prefix, path) = case T.breakOn "=" entry of
+      let (prefix, path) = case BC.break (== '=') entry of
             (before, after)
-              | T.null after -> ("", before)
-              | otherwise -> (before, T.drop 1 after)
+              | BS.null after -> ("", before)
+              | otherwise -> (before, BS.drop 1 after)
        in evaluated
             ( VAttrs
                 ( attrSetFromMap $
                     Map.fromList
-                      [ ("prefix", evaluated (mkStr prefix)),
-                        ("path", evaluated (mkStr path))
+                      [ ("prefix", evaluated (mkStrBytes prefix)),
+                        ("path", evaluated (mkStrBytes path))
                       ]
                 )
             )
@@ -260,10 +267,10 @@ parseNixPath raw
 -- | The @path@ of every search path entry 'parseNixPath' produced, for the
 -- restricted-mode allow list: upstream allows every lookup path root
 -- (@resolveLookupPathPath@ with @initAccessControl@), so the roots are
--- read back from the very list the evaluator will search.  An entry that
--- is not an attribute set with a string or path @path@ contributes
--- nothing.
-searchPathRoots :: [Thunk] -> [Text]
+-- read back from the very list the evaluator will search.  A root is the
+-- bytes the entry holds.  An entry that is not an attribute set with a
+-- string or path @path@ contributes nothing.
+searchPathRoots :: [Thunk] -> [ByteString]
 searchPathRoots = mapMaybe entryRoot
   where
     entryRoot thunk = do
@@ -271,20 +278,20 @@ searchPathRoots = mapMaybe entryRoot
       pathThunk <- attrSetLookup "path" attrs
       pathVal <- readThunkValue pathThunk
       case pathVal of
-        VStr bytes _ -> Just (bytesToTextLossy bytes)
-        VPath p -> Just p
+        VStr bytes _ -> Just bytes
+        VPath p -> Just (TE.encodeUtf8 p)
         _ -> Nothing
 
 -- | URL schemes that keep a @NIX_PATH@ entry whole when @://@ follows
 -- them: the allowlist in @EvalSettings::isPseudoUrl@,
 -- src/libexpr/eval-settings.cc at Nix 2.24.9.
-nixPathUrlSchemes :: [Text]
+nixPathUrlSchemes :: [ByteString]
 nixPathUrlSchemes = ["http", "https", "file", "channel", "git", "s3", "ssh"]
 
 -- | Schemes that keep a @NIX_PATH@ entry whole whatever follows their
 -- colon: @isPseudoUrl@'s @channel:@ test and @parseNixPath@'s @flake:@
 -- test, both in src/libexpr/eval-settings.cc at Nix 2.24.9.
-nixPathBareSchemes :: [Text]
+nixPathBareSchemes :: [ByteString]
 nixPathBareSchemes = ["channel", "flake"]
 
 -- | Whether a search path entry's path names something fetched rather
@@ -292,12 +299,12 @@ nixPathBareSchemes = ["channel", "flake"]
 -- (a @channel:@ prefix, or one of 'nixPathUrlSchemes' before @://@),
 -- plus the @flake:@ entries a lookup path hook resolves
 -- (@resolveLookupPathPath@ in src/libexpr/eval.cc at Nix 2.24.9).
-isNixPathPseudoUrl :: Text -> Bool
+isNixPathPseudoUrl :: ByteString -> Bool
 isNixPathPseudoUrl path =
-  any (\bare -> (bare <> ":") `T.isPrefixOf` path) nixPathBareSchemes
-    || (not (T.null afterScheme) && scheme `elem` nixPathUrlSchemes)
+  any (\bare -> (bare <> ":") `BS.isPrefixOf` path) nixPathBareSchemes
+    || (not (BS.null afterScheme) && scheme `elem` nixPathUrlSchemes)
   where
-    (scheme, afterScheme) = T.breakOn "://" path
+    (scheme, afterScheme) = BS.breakSubstring "://" path
 
 -- | Split a @NIX_PATH@ string into entries the way upstream's
 -- @EvalSettings::parseNixPath@ does (src/libexpr/eval-settings.cc at
@@ -328,27 +335,32 @@ isNixPathPseudoUrl path =
 -- @builtins.nixPath@ never shows one.  That round trip also splits an
 -- entry at a space, which is not reproduced here: a Windows path may
 -- contain one, the same reason the drive rule above diverges.
-splitNixPath :: Text -> [Text]
-splitNixPath = filter (not . T.null) . go
+--
+-- The split works on bytes, as upstream's does.  Every delimiter is
+-- ASCII, and no byte of a multibyte UTF-8 sequence is, so a UTF-8 entry
+-- splits exactly where its text would and any other byte passes through
+-- unchanged.
+splitNixPath :: ByteString -> [ByteString]
+splitNixPath = filter (not . BS.null) . go
   where
     go remaining
-      | T.null remaining = []
+      | BS.null remaining = []
       | otherwise =
-          let (segment, rest) = T.break (== ':') remaining
-           in case T.uncons rest of
+          let (segment, rest) = BC.break (== ':') remaining
+           in case BC.uncons rest of
                 Nothing -> [segment]
                 Just (_, afterColon)
-                  | keepsColon (T.takeWhileEnd (/= '=') segment) afterColon ->
-                      let (absorbed, afterEntry) = T.break (== ':') afterColon
-                       in T.concat [segment, ":", absorbed] : go (T.drop 1 afterEntry)
+                  | keepsColon (BC.takeWhileEnd (/= '=') segment) afterColon ->
+                      let (absorbed, afterEntry) = BC.break (== ':') afterColon
+                       in BS.concat [segment, ":", absorbed] : go (BS.drop 1 afterEntry)
                   | otherwise -> segment : go afterColon
     keepsColon scheme afterColon
       | scheme `elem` nixPathBareSchemes = True
-      | scheme `elem` nixPathUrlSchemes = T.isPrefixOf "//" afterColon
+      | scheme `elem` nixPathUrlSchemes = BS.isPrefixOf "//" afterColon
       | otherwise = isDriveLetter scheme && startsWithPathSep afterColon
-    isDriveLetter scheme = case T.uncons scheme of
-      Just (letter, afterLetter) -> T.null afterLetter && (isAsciiUpper letter || isAsciiLower letter)
+    isDriveLetter scheme = case BC.uncons scheme of
+      Just (letter, afterLetter) -> BS.null afterLetter && (isAsciiUpper letter || isAsciiLower letter)
       Nothing -> False
-    startsWithPathSep t = case T.uncons t of
+    startsWithPathSep t = case BC.uncons t of
       Just (c, _) -> c == '/' || c == '\\'
       Nothing -> False
