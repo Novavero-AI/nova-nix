@@ -65,6 +65,8 @@ module Nix.Store
     sinkNarEvent,
     finishNarUnpack,
     abortNarUnpack,
+    NarStreamFailure (..),
+    sinkNarStream,
 
     -- * Link ordering (exposed for testing)
     orderLinks,
@@ -83,7 +85,7 @@ module Nix.Store
   )
 where
 
-import Control.Exception (IOException, SomeException, bracket, catch, throwIO, try, tryJust)
+import Control.Exception (IOException, SomeException, bracket, catch, onException, throwIO, try, tryJust)
 import Control.Monad (guard, join, unless, when)
 import Data.Bool (bool)
 import qualified Data.ByteString as BS
@@ -991,27 +993,58 @@ abortNarUnpack (NarUnpackSink ref) = do
       hClose fileHandle `catch` \(_ :: IOException) -> pure ()
   writeIORef ref narState {nusOpen = Nothing}
 
+-- | Why a streamed archive stopped short of its end.
+data NarStreamFailure
+  = -- | The store refused what the archive holds (a name, a taken
+    -- path): a property of the archive, not of how it arrived.
+    NarStreamRefused !Text
+  | -- | The bytes do not parse as a NAR.  A truncated or torn transfer
+    -- reads the same as a malformed archive.
+    NarStreamMalformed !Text
+  deriving (Eq, Show)
+
+-- | Feed a chunk source through the streaming NAR parser into a sink,
+-- hashing and counting exactly the bytes the parser consumes, and
+-- return the archive's SHA-256 and size once its root node closes.
+-- The recorded symlinks are not created yet ('finishNarUnpack'), so a
+-- caller checks the digest before any link exists.  On a failure the
+-- sink is already aborted.
+sinkNarStream :: NarUnpackSink -> IO BS.ByteString -> IO (Either NarStreamFailure (Hash.NixHash, Int))
+sinkNarStream sink source = go Hash.hashInit 0 Stream.narStream `onException` abortNarUnpack sink
+  where
+    go !ctx !count step = case step of
+      Stream.NarAwait continue -> do
+        chunk <- source
+        go (Hash.hashUpdate ctx chunk) (count + BS.length chunk) (continue chunk)
+      Stream.NarYield event next -> do
+        sunk <- sinkNarEvent sink event
+        either (stopWith . NarStreamRefused) (const (go ctx count next)) sunk
+      Stream.NarFail msg -> stopWith (NarStreamMalformed (T.pack msg))
+      Stream.NarDone -> pure (Right (Hash.hashFinalize ctx, count))
+    stopWith failure = Left failure <$ abortNarUnpack sink
+
 -- ---------------------------------------------------------------------------
 -- Eval source materialization
 -- ---------------------------------------------------------------------------
 
--- | Copy eval-coerced source paths into the store and register them.  The
--- evaluator's source-path cache maps each coerced filesystem path to its
--- @source@ fixed-output store path (text only - eval performs no store
--- writes).  Each entry not already valid is copied in, made read-only, and
--- registered with its real NAR hash.  A copied source carries no references.
+-- | Restore eval-coerced source paths into the store and register them.
+-- The evaluator's source-path cache maps each coerced filesystem path to
+-- its @source@ fixed-output store path (text only - eval performs no
+-- store writes).  Each entry not already valid is restored from a dump
+-- of its source ('restoreSource'), made read-only, and registered.  A
+-- source carries no references.
 materializeEvalSources :: Store -> Map Text Text -> IO ()
 materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
   where
-    -- Each source registers IMMEDIATELY after its copy (sources carry no
-    -- cross-references, so there is nothing to batch).  A tree already on
-    -- disk is adopted only after verification: its NAR digest must
+    -- Each source registers IMMEDIATELY after its restore (sources carry
+    -- no cross-references, so there is nothing to batch).  A tree already
+    -- on disk is adopted only after verification: its NAR digest must
     -- reproduce the store path being registered - an interrupted earlier
-    -- copy leaves a partial tree, and registering it as-is validates
+    -- restore leaves a partial tree, and registering it as-is validates
     -- content that does not match its address.  A verified adoption never
-    -- touches the files (re-copying onto a read-only tree fails on
-    -- Windows and would wedge the store permanently); a failed one clears
-    -- and re-copies.  Mirrors the builder's own prepareOutput recovery.
+    -- touches the files (rewriting a read-only tree fails on Windows and
+    -- would wedge the store permanently); a failed one clears and
+    -- restores.  Mirrors the builder's own prepareOutput recovery.
     -- The whole check-then-act runs under the path's cross-process
     -- lock, validity re-checked once held: without it, two processes
     -- materializing the same source raced isValid, and the loser's
@@ -1026,12 +1059,71 @@ materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
             let dest = storePathToFilePath (stDir store) sp
             onDisk <- doesPathExist dest
             adoptable <- if onDisk then adoptedTreeMatches dest sp else pure False
-            unless adoptable $ do
-              when onDisk (Dir.removePathForcibly dest)
-              copyPathInto (T.unpack rawPath) dest
-              setReadOnly dest
-            reg <- registrationFor store sp Nothing []
+            reg <-
+              if adoptable
+                then registrationFor store sp Nothing []
+                else do
+                  when onDisk (Dir.removePathForcibly dest)
+                  restoreSource store (T.unpack rawPath) sp >>= either (refuse spText) pure
             registerPath (stDB store) reg
+    refuse spText reason =
+      throwIO (userError (T.unpack ("refusing to register " <> spText <> ": " <> reason)))
+
+-- | Restore a source tree at the store path evaluation named it by,
+-- from a dump of the source, as upstream's @addToStoreFromDump@
+-- restores the dump it hashed (@restorePath@, local-store.cc at
+-- 2.24.9) rather than copying files: the source's NAR streams out of
+-- the walk, through the hash and into an unpack sink in one pass, so a
+-- sibling pair the store's volume folds takes the case-hack on the way
+-- in, and no file's contents are ever held whole.  The source is read
+-- as evaluation read it to name the path.
+--
+-- Evaluation hashed the source earlier, so the dump is held to that
+-- address before any link is created: a source that changed in between
+-- is refused, never registered under a hash its bytes no longer have.
+-- The restored tree is then rechecked on disk, as the substituter
+-- rechecks an unpacked one, since the volume decides the final
+-- spelling of every name.  Any failure removes the tree.
+restoreSource :: Store -> FilePath -> StorePath -> IO (Either Text PathRegistration)
+restoreSource store src sp = do
+  outcome <- restore `onException` Dir.removePathForcibly dest
+  either (\reason -> Left reason <$ Dir.removePathForcibly dest) (pure . Right) outcome
+  where
+    dest = storePathToFilePath (stDir store) sp
+    restore = do
+      sink <- newNarUnpackSink (stCaseSensitivity store) dest
+      streamed <- ExecBit.withNarSource src (sinkNarStream sink)
+      case streamed of
+        Left (NarStreamRefused reason) -> pure (Left reason)
+        Left (NarStreamMalformed reason) -> pure (Left ("the dump of " <> T.pack src <> " does not parse: " <> reason))
+        Right (digest, size)
+          | not (recursiveDigestNames sp digest) -> do
+              abortNarUnpack sink
+              pure (Left (T.pack src <> " changed after evaluation hashed it, so it no longer reproduces its store path; re-evaluate"))
+          | otherwise -> do
+              finished <- finishNarUnpack sink
+              either (pure . Left) (const (sealAndRecheck digest size)) finished
+    sealAndRecheck digest size = do
+      setReadOnly dest
+      onDisk <- ExecBit.narHashOfPath dest
+      pure $
+        if onDisk /= digest
+          then Left "the restored tree does not reproduce its store path on disk"
+          else
+            Right
+              PathRegistration
+                { prPath = sp,
+                  prNarHash = Hash.formatNixHash digest,
+                  prNarSize = size,
+                  prDeriver = Nothing,
+                  prReferences = []
+                }
+
+-- | Whether a recursive NAR digest and a store path's own name derive
+-- exactly that path, as a @source@ path's address is derived.
+recursiveDigestNames :: StorePath -> Hash.NixHash -> Bool
+recursiveDigestNames sp (Hash.NixHash digest) =
+  makeFixedOutputPath (spName sp) "sha256" "recursive" digest == Right sp
 
 -- | Register the store objects evaluation wrote: makes each read-only
 -- and records it in the DB.  Batched so a write referring to another
@@ -1103,8 +1195,7 @@ adoptedTreeMatches dest sp = do
   result <- try (ExecBit.serialiseFromPath dest)
   pure $ case result of
     Left (_ :: SomeException) -> False
-    Right entry ->
-      makeFixedOutputPath (spName sp) "sha256" "recursive" (sha256Digest (NAR.serialise entry)) == Right sp
+    Right entry -> recursiveDigestNames sp (NAR.narHash entry)
 
 -- | Recursively copy a file or directory tree to a destination path.
 -- A symlink is replicated as a symlink: the store path's name came from a

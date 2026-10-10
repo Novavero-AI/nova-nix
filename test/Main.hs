@@ -5872,11 +5872,88 @@ testCaseSensitiveVolumeBody base = do
                       Fail ("the earlier entry was overwritten: " <> T.pack (show landed))
                   | otherwise -> Pass
                 (_, Right ()) -> Fail ("the copy succeeded; on disk: " <> T.pack (show landed))
-                other -> Fail ("unexpected listing or outcome: " <> T.pack (show other))
+                other -> Fail ("unexpected listing or outcome: " <> T.pack (show other)),
+        -- A source holding a case-only pair, built against a store
+        -- whose volume folds: evaluation names the two-file tree, and
+        -- the store holds it as upstream's restore does, the later
+        -- name case-hacked, registered under that address (#235).
+        runTestM "a coerced source's case-only pair is stored case-hacked on a folding store" $
+          caseOnlyPairBuild base canonPathValue,
+        runTestM "builtins.path stores a case-only pair case-hacked on a folding store" $
+          caseOnlyPairBuild base (\srcPath -> "builtins.path { path = " <> canonPathValue srcPath <> "; }")
       ]
   closeStore store
   forceRemoveIfExists storeRoot
   pure results
+
+-- | What upstream records for 'caseOnlyPairBuild''s source on a
+-- folding volume: nix-instantiate 2.33.2 with
+-- @--store 'local?root=...'@ adds it at this path, @nix-store
+-- --query --hash@ and @--size@ report this NAR hash and size, and the
+-- tree holds @Makefile@ and @makefile~nix~case~hack~1@.
+caseOnlyPairPath :: StorePath
+caseOnlyPairPath = StorePath "1rn1vqr2y9f65qg5vflbfr5gkwllmp22" "src"
+
+caseOnlyPairNarHash :: Text
+caseOnlyPairNarHash = "sha256:04z1mpa501269w2aqjr3kq5k4y85hjzbisvfc3jgmw3dnd7va9hl"
+
+caseOnlyPairNarSize :: Int
+caseOnlyPairNarSize = 480
+
+-- | Build a derivation whose @src@ is the given expression over a
+-- source directory named @src@ holding @Makefile@ and @makefile@, on a
+-- case-sensitive base, against a store in the temp directory, and
+-- hold the result to what upstream stores ('caseOnlyPairPath').  Skips
+-- where the temp directory's volume does not fold.
+caseOnlyPairBuild :: FilePath -> (Text -> Text) -> IO TestResult
+caseOnlyPairBuild base srcExpr = do
+  tmpBase <- getTemporaryDirectory
+  sensitivity <- probeCaseSensitivity tmpBase
+  case sensitivity of
+    CaseSensitive -> Pass <$ putStrLn "  SKIP  the temp directory's volume does not fold case"
+    CaseInsensitive -> do
+      shell <- findTestShell
+      let srcRoot = base </> "nova-nix-test-cs-pair"
+          srcDir = srcRoot </> "src"
+          tmpStore = tmpBase </> "nova-nix-test-cs-pair-store"
+          nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+          source =
+            T.concat
+              [ "derivation { name = \"pair\"; system = builtins.currentSystem; ",
+                "builder = \"" <> nixEscape shell <> "\"; ",
+                "args = [\"-c\" \"cd $src && for f in *; do echo \\\"$f\\\"; done > $out\"]; ",
+                "src = " <> srcExpr (T.pack srcDir) <> "; }"
+              ]
+      forceRemoveIfExists srcRoot
+      forceRemoveIfExists tmpStore
+      createDirectoryIfMissing True srcDir
+      BS.writeFile (srcDir </> "Makefile") "upper\n"
+      BS.writeFile (srcDir </> "makefile") "lower\n"
+      built <- evalAndBuild (StoreDir tmpStore) source
+      verdict <- case built of
+        Left err -> pure (Fail err)
+        Right (BuildFailure msg _, store) -> Fail msg <$ closeStore store
+        Right (BuildSuccess outSP, store) -> do
+          let stored = storePathToFilePath (stDir store) caseOnlyPairPath
+          names <- sort <$> Dir.listDirectory stored
+          contents <- traverse (BS.readFile . (stored </>)) names
+          info <- queryPathInfo (stDB store) caseOnlyPairPath
+          seen <- BS.readFile (storePathToFilePath (stDir store) outSP)
+          closeStore store
+          let hacked = ["Makefile", "makefile~nix~case~hack~1"]
+          pure $ case info of
+            Nothing -> Fail "the source path is not registered"
+            Just row
+              | names /= hacked || contents /= ["upper\n", "lower\n"] ->
+                  Fail ("stored as " <> T.pack (show (zip names contents)))
+              | piNarHash row /= caseOnlyPairNarHash || piNarSize row /= caseOnlyPairNarSize ->
+                  Fail ("registered " <> piNarHash row <> " / " <> T.pack (show (piNarSize row)))
+              | seen /= "Makefile\nmakefile~nix~case~hack~1\n" ->
+                  Fail ("the builder saw " <> T.pack (show seen))
+              | otherwise -> Pass
+      forceRemoveIfExists srcRoot
+      forceRemoveIfExists tmpStore
+      pure verdict
 
 -- | A path as upstream's formatter streams a @std::filesystem::path@:
 -- through @std::quoted@, in double quotes with a double quote or a
@@ -9196,22 +9273,27 @@ testStoreDelete = do
           forceRemoveIfExists srcDir
           createDirectoryIfMissing True srcDir
           TIO.writeFile (srcDir </> "f.txt") "locked source"
-          let guarded = StorePath (T.replicate 32 "j") "mat-locked"
-              spText = storePathToText defaultStoreDir guarded
-          holder <- acquirePathLock sd guarded
-          done <- newEmptyMVar
-          _ <- forkIO (materializeEvalSources store (Map.singleton (T.pack srcDir) spText) >>= putMVar done)
-          early <- timeout deleteLockProbeMicros (takeMVar done)
-          releasePathLock holder
-          outcome <- timeout raceWatchdogMicros (takeMVar done)
-          registered <- isValid store guarded
-          forceRemoveIfExists srcDir
-          pure $ case (early, outcome) of
-            (Just _, _) -> Fail "materialize ignored the held lock"
-            (Nothing, Just ())
-              | registered -> Pass
-              | otherwise -> Fail "proceeded after release but never registered"
-            (Nothing, Nothing) -> Fail "materialize never completed after release"
+          -- The address the source's content derives, as evaluation
+          -- would name it: a restore refuses any other.
+          entry <- NAR.serialiseFromPath srcDir
+          case makeFixedOutputPath "mat-locked" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+            Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+            Right guarded -> do
+              let spText = storePathToText defaultStoreDir guarded
+              holder <- acquirePathLock sd guarded
+              done <- newEmptyMVar
+              _ <- forkIO (materializeEvalSources store (Map.singleton (T.pack srcDir) spText) >>= putMVar done)
+              early <- timeout deleteLockProbeMicros (takeMVar done)
+              releasePathLock holder
+              outcome <- timeout raceWatchdogMicros (takeMVar done)
+              registered <- isValid store guarded
+              forceRemoveIfExists srcDir
+              pure $ case (early, outcome) of
+                (Just _, _) -> Fail "materialize ignored the held lock"
+                (Nothing, Just ())
+                  | registered -> Pass
+                  | otherwise -> Fail "proceeded after release but never registered"
+                (Nothing, Nothing) -> Fail "materialize never completed after release"
       ]
 
 -- | The collector's pure core: the reachability walk over the references
@@ -9626,9 +9708,9 @@ testStoreOps = do
           result <- computeClosure store [p1, p2]
           pure (assertEqual "closure order" (Right [dep, p1, p2]) result),
         -- materializeEvalSources adoption is verified: a partial tree left
-        -- at the destination by an interrupted copy must be cleared and
-        -- re-copied, never registered as-is.
-        runTestM "materializeEvalSources re-copies a mismatched tree" $ do
+        -- at the destination by an interrupted restore must be cleared
+        -- and restored again, never registered as-is.
+        runTestM "materializeEvalSources restores over a mismatched tree" $ do
           tmpBase <- getTemporaryDirectory
           let srcDir = tmpBase </> "nova-nix-test-adopt-src"
           removeIfExists srcDir
@@ -9652,6 +9734,37 @@ testStoreOps = do
                 if adopted == "real content" && registered
                   then Pass
                   else Fail ("expected re-copied content, got: " <> adopted),
+        -- Evaluation hashes a source well before the build driver
+        -- restores it.  A source edited in between no longer reproduces
+        -- the address evaluation gave it, so it is refused and nothing
+        -- is left at the path, rather than its new bytes being sealed
+        -- and registered under the old address (#235).
+        runTestM "materializeEvalSources refuses a source changed since evaluation" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-changed-src"
+          removeIfExists srcDir
+          createDirectoryIfMissing True srcDir
+          TIO.writeFile (srcDir </> "data.txt") "evaluated content"
+          entry <- NAR.serialiseFromPath srcDir
+          case makeFixedOutputPath "nova-nix-test-changed-src" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+            Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+            Right sp -> do
+              let spText = storePathToText defaultStoreDir sp
+                  dest = storePathToFilePath (stDir store) sp
+              forceRemoveIfExists dest
+              TIO.writeFile (srcDir </> "data.txt") "edited after evaluation"
+              outcome <- try (materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)]))
+              registered <- isValid store sp
+              leftBehind <- Dir.doesPathExist dest
+              removeIfExists srcDir
+              pure $ case outcome of
+                Right () -> Fail "registered a source that changed after evaluation"
+                Left (e :: IOException)
+                  | not ("changed after evaluation hashed it" `T.isInfixOf` T.pack (ioeGetErrorString e)) ->
+                      Fail ("unexpected refusal: " <> T.pack (show e))
+                  | registered || leftBehind ->
+                      Fail ("refused, but registered " <> T.pack (show registered) <> ", tree left " <> T.pack (show leftBehind))
+                  | otherwise -> Pass,
         -- The registrar's half of the eval-write pair: content that does
         -- not re-derive its store path under the recorded scheme must be
         -- refused loudly, never registered valid under a hash its bytes
@@ -10916,6 +11029,23 @@ testBuilder = do
 -- Tests: CLI Integration (Phase 2, Batch 5)
 -- ---------------------------------------------------------------------------
 
+-- | A tree holding a reserved device stem, a colon and a trailing dot,
+-- names POSIX holds and Windows does not, in the order a sorted listing
+-- gives them.  The colon follows more than one letter: bsdtar, which
+-- fetchTarball's extraction runs on macOS, drops a one-letter prefix
+-- such as @a:@ as a drive letter once @--strip-components@ has exposed
+-- it.
+reservedNameFiles :: [(FilePath, BS.ByteString)]
+reservedNameFiles = [("aux.c", "device\n"), ("dot.", "dot\n"), ("key:value", "colon\n")]
+
+-- | Where upstream stores 'reservedNameFiles' as a coerced source
+-- directory named @src@ (nix-instantiate 2.33.2, @"${./src}"@) and as
+-- the tree of a fetchTarball (with @--store 'local?root=...'@, which
+-- holds it under exactly these names).
+reservedNameSourcePath, reservedNameTarballPath :: StorePath
+reservedNameSourcePath = StorePath "42hs0hrpla9b23iz9p3nj0px0np0jv6f" "src"
+reservedNameTarballPath = StorePath "rlwykawmqrmdiq4xmcr4rf2zxf6y9k09" "source"
+
 -- | End-to-end: eval .nix source, extract derivation, build, verify output.
 evalAndBuild :: StoreDir -> Text -> IO (Either Text (BuildResult, Store))
 evalAndBuild storeDir source = do
@@ -11044,6 +11174,73 @@ testE2E = do
         pure $ case failures of
           [] -> Pass
           errs -> Fail (T.intercalate "; " errs),
+      -- POSIX holds names Windows reserves, and upstream stores them as
+      -- their bytes there (#84).  A coerced source and a fetchTarball
+      -- tree holding a device stem, a colon and a trailing dot restore
+      -- with exactly those names, under the paths upstream computes
+      -- for them ('reservedNameSourcePath'), as the raw copy they
+      -- replace stored them (#235).
+      runTestM "e2e sources holding names Windows reserves restore with their names" $
+        if SI.os == "mingw32"
+          then Pass <$ putStrLn "  SKIP  a Windows volume cannot hold these names"
+          else do
+            tmpBase <- getTemporaryDirectory
+            environment <- getEnvironment
+            let root = tmpBase </> "nova-nix-test-e2e-names"
+                srcDir = root </> "src"
+                stage = root </> "stage"
+                tarball = root </> "names.tar.gz"
+                tmpStore = tmpBase </> "nova-nix-test-e2e-names-store"
+                nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+                source =
+                  T.concat
+                    [ "derivation { name = \"names\"; system = builtins.currentSystem; ",
+                      "builder = \"" <> nixEscape shell <> "\"; ",
+                      "args = [\"-c\" \"echo ok > $out\"]; ",
+                      "srcs = [ " <> canonPathValue (T.pack srcDir) <> " ",
+                      "(builtins.fetchTarball \"file://" <> nixEscape (T.pack tarball) <> "\") ]; }"
+                    ]
+                -- bsdtar would otherwise add AppleDouble entries for
+                -- any extended attributes the files carry.
+                tarProcess =
+                  (Proc.proc "tar" ["-czf", tarball, "-C", stage, "top"])
+                    { Proc.env = Just (("COPYFILE_DISABLE", "1") : environment)
+                    }
+                writeTree dir = do
+                  createDirectoryIfMissing True dir
+                  mapM_ (\(name, bytes) -> BS.writeFile (dir </> name) bytes) reservedNameFiles
+                storedAs store sp = do
+                  let dest = storePathToFilePath (stDir store) sp
+                  present <- doesDirectoryExist dest
+                  if not present
+                    then pure (Just (spName sp <> ": no tree at " <> T.pack dest))
+                    else do
+                      names <- sort <$> Dir.listDirectory dest
+                      contents <- traverse (BS.readFile . (dest </>)) names
+                      valid <- isValid store sp
+                      pure $
+                        if valid && zip names contents == reservedNameFiles
+                          then Nothing
+                          else Just (spName sp <> " valid " <> T.pack (show valid) <> ", stored as " <> T.pack (show (zip names contents)))
+            forceRemoveIfExists root
+            forceRemoveIfExists tmpStore
+            writeTree srcDir
+            writeTree (stage </> "top")
+            (tarCode, _, tarErr) <- Proc.readCreateProcessWithExitCode tarProcess ""
+            verdict <- case tarCode of
+              ExitFailure n -> pure (Fail ("tar exited " <> T.pack (show n) <> ": " <> T.pack tarErr))
+              ExitSuccess -> do
+                built <- evalAndBuild (StoreDir tmpStore) source
+                case built of
+                  Left err -> pure (Fail err)
+                  Right (BuildFailure msg _, store) -> Fail msg <$ closeStore store
+                  Right (BuildSuccess _, store) -> do
+                    problems <- catMaybes <$> traverse (storedAs store) [reservedNameSourcePath, reservedNameTarballPath]
+                    closeStore store
+                    pure (if null problems then Pass else Fail (T.intercalate "; " problems))
+            forceRemoveIfExists root
+            forceRemoveIfExists tmpStore
+            pure verdict,
       -- The writer half of the eval-write pair: an interrupted earlier
       -- run's truncated file at a toFile path must be rewritten, not
       -- adopted on bare existence (adopting it used to register such a file

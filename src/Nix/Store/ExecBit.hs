@@ -13,6 +13,7 @@ module Nix.Store.ExecBit
     markExecutableOsPath,
     copyExecMark,
     serialiseFromPath,
+    withNarSource,
     narHashOfPath,
     execStreamName,
   )
@@ -113,15 +114,20 @@ streamOptions = NAR.defaultSerialiseOptions {NAR.soExecBit = isExecutable}
 serialiseFromPath :: FilePath -> IO NAR.NarEntry
 serialiseFromPath = NAR.serialiseFromPathOpts streamOptions
 
+-- | 'NovaCache.NAR.withNarSource' through the same exec-bit source of
+-- truth: the path's NAR as a pull source of chunks, no file's contents
+-- held whole.
+withNarSource :: FilePath -> (IO BS.ByteString -> IO a) -> IO a
+withNarSource = NAR.withNarSourceOpts streamOptions
+
 -- | The NAR hash of a path, read through the same exec-bit source of
--- truth 'serialiseFromPath' writes.  Streams on every platform:
--- 'NAR.withNarSourceOpts' pulls the archive in chunks with the ADS
--- resolver answering the flags, and the digest folds over them, so no
--- file's contents are ever held whole.  Before the resolver hook,
+-- truth 'serialiseFromPath' writes.  Streams on every platform: the
+-- archive is pulled in chunks with the ADS resolver answering the
+-- flags, and the digest folds over them.  Before the resolver hook,
 -- Windows had to materialize the tree in memory to rewrite the flags.
 narHashOfPath :: FilePath -> IO Hash.NixHash
 narHashOfPath path =
-  NAR.withNarSourceOpts streamOptions path $ \pull ->
+  withNarSource path $ \pull ->
     let go !ctx = do
           chunk <- pull
           if BS.null chunk
