@@ -86,10 +86,12 @@ module Nix.Store
   )
 where
 
-import Control.Exception (IOException, SomeException, catch, throwIO, try)
-import Control.Monad (join, unless, when)
+import Control.Exception (IOException, SomeException, bracket, catch, throwIO, try, tryJust)
+import Control.Monad (guard, join, unless, when)
+import Data.Bool (bool)
 import qualified Data.ByteString as BS
 import Data.Char (isDigit, toUpper)
+import Data.Foldable (traverse_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (inits)
 import Data.Map.Strict (Map)
@@ -103,6 +105,7 @@ import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), trySetCaseSensitiveDir)
 import Nix.Store.DB
+import Nix.Store.Exclusive (Occupant (..), directoryTakenMessage, fileTakenMessage, openNewBinaryFile, symlinkTakenMessage)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.GC
 import Nix.Store.Handle
@@ -113,8 +116,7 @@ import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NAR.Stream as Stream
 import System.Directory
-  ( copyFile,
-    createDirectoryIfMissing,
+  ( createDirectoryIfMissing,
     doesDirectoryExist,
     doesPathExist,
     listDirectory,
@@ -123,7 +125,8 @@ import System.Directory
   )
 import qualified System.Directory as Dir
 import System.FilePath (splitDirectories, takeDirectory, (</>))
-import System.IO (Handle, IOMode (WriteMode), hClose, openBinaryFile)
+import System.IO (Handle, IOMode (ReadMode), hClose, withBinaryFile)
+import System.IO.Error (isAlreadyExistsError)
 import qualified System.Info
 
 -- | Check if a store path is registered as valid in the database.
@@ -513,6 +516,55 @@ writeDrvClosure store closure = do
                 )
 
 -- ---------------------------------------------------------------------------
+-- Exclusive creation
+-- ---------------------------------------------------------------------------
+
+-- Every regular file and directory a tree materializes is created
+-- exclusively: a name already taken refuses the write instead of
+-- landing on the earlier entry.  'onDiskNameKey' predicts which
+-- siblings a folding volume merges, but only the volume knows its own
+-- fold table, so the create is what catches a pair the key misses.
+-- Upstream's restore creates the same way (@RestoreSink@ in
+-- fs-sink.cc at 2.24.9: @O_CREAT | O_EXCL@ for a regular file, a
+-- refused @create_directory@ for a directory), and the refusals carry
+-- its words ("Nix.Store.Exclusive").  Symlinks need nothing extra:
+-- @symlink(2)@ and CreateSymbolicLinkW never replace an existing name,
+-- and 'createSymlinkOfKind' words that refusal as upstream does.
+
+-- | Run a create that must find its name free, its refusal becoming the
+-- failure the given action describes.  Only the refusal becomes a
+-- value: it is a property of the tree being written, where any other
+-- I\/O failure (permissions, a full disk) is one of the machine and
+-- stays an exception.
+refuseTaken :: IO Text -> IO a -> IO (Either Text a)
+refuseTaken describe create = do
+  attempt <- tryJust (guard . isAlreadyExistsError) create
+  either (const (Left <$> describe)) (pure . Right) attempt
+
+-- | Create a regular file of a materialized tree exclusively and write
+-- it through the handle, closed on the way out.
+withNewTreeFile :: FilePath -> (Handle -> IO a) -> IO (Either Text a)
+withNewTreeFile path write =
+  bracket (openNewTreeFile path) (traverse_ hClose) (traverse write)
+
+-- | Open a regular file of a materialized tree, created exclusively.
+openNewTreeFile :: FilePath -> IO (Either Text Handle)
+openNewTreeFile path = refuseTaken (pure (fileTakenMessage path)) (openNewBinaryFile path)
+
+-- | Create a directory of a materialized tree exclusively.  Its parent
+-- is created first if missing, which only the root can need.  A
+-- refusal asks what holds the name, as @create_directory@ does before
+-- it chooses between returning false and throwing.
+createTreeDirectory :: FilePath -> IO (Either Text ())
+createTreeDirectory path = do
+  createDirectoryIfMissing True (takeDirectory path)
+  refuseTaken describe (Dir.createDirectory path)
+  where
+    describe = do
+      occupant <- bool OccupiedByOther OccupiedByDirectory <$> doesDirectoryExist path
+      pure (directoryTakenMessage occupant path)
+
+-- ---------------------------------------------------------------------------
 -- NAR unpacking
 -- ---------------------------------------------------------------------------
 
@@ -542,32 +594,37 @@ unpackTree :: CaseSensitivity -> FilePath -> NAR.NarEntry -> IO (Either Text [(F
 unpackTree sensitivity path entry = case entry of
   NAR.NarRegular isExec contents -> do
     createDirectoryIfMissing True (takeDirectory path)
-    BS.writeFile path contents
-    when isExec (ExecBit.markExecutable path)
-    pure (Right [])
+    written <- withNewTreeFile path (`BS.hPut` contents)
+    case written of
+      Left err -> pure (Left err)
+      Right () -> do
+        when isExec (ExecBit.markExecutable path)
+        pure (Right [])
   NAR.NarSymlink target -> pure $ case decodeNarText "symlink target" target of
     Left err -> Left err
     Right decoded -> Right [(path, decoded)]
   NAR.NarDirectory entries -> do
-    createDirectoryIfMissing True path
-    unpackChildren sensitivity path entries
+    created <- createTreeDirectory path
+    case created of
+      Left err -> pure (Left err)
+      Right () -> unpackChildren sensitivity path entries
 
 -- | The on-disk identity a NAR entry name occupies on a volume of the
--- given case sensitivity.  Two sibling entries sharing a key land on
--- ONE file, the second silently overwriting the first.  A folding
--- volume (the default APFS format, NTFS through Win32) keys a name by
--- its uppercase; a sensitive one (Linux, a case-sensitive APFS volume)
--- keys it byte-for-byte.  The fold is per-character uppercase, which
--- keeps apart the collisions real trees carry (@Makefile@\/@makefile@)
--- but not every pair the volume folds: APFS reads U+00DF and U+1E9E as
--- one name while 'toUpper' leaves U+00DF unchanged, so that pair takes
--- two keys, lands on one file, and is caught by the registration
--- recheck rather than at the write (#234).  The reverse miss (U+0131
--- uppercases to @I@, which APFS keeps distinct) only spells a name
--- with a suffix it did not need.  Independently of case, the Win32
--- path layer strips a name's trailing dots and spaces on create
--- (inside a case-sensitive directory as much as a folding one), so
--- the key strips them there.
+-- given case sensitivity.  Two sibling entries sharing a key name ONE
+-- file on that volume, so the unpack keeps them apart
+-- (@unpackNamedChildren@).  A folding volume (the default APFS format,
+-- NTFS through Win32) keys a name by its uppercase; a sensitive one
+-- (Linux, a case-sensitive APFS volume) keys it byte-for-byte.  The
+-- fold is per-character uppercase, which keeps apart the collisions
+-- real trees carry (@Makefile@\/@makefile@) but not every pair the
+-- volume folds: APFS reads U+00DF and U+1E9E as one name while
+-- 'toUpper' leaves U+00DF unchanged, so that pair takes two keys and
+-- the exclusive create refuses the second at the write (#234), as
+-- upstream's restore does.  The reverse miss (U+0131 uppercases to
+-- @I@, which APFS keeps distinct) only spells a name with a suffix it
+-- did not need.  Independently of case, the Win32 path layer strips a
+-- name's trailing dots and spaces on create (inside a case-sensitive
+-- directory as much as a folding one), so the key strips them there.
 --
 -- Upstream decides this per process, not per volume: its
 -- @use-case-hack@ setting defaults to on for Darwin and off elsewhere
@@ -869,8 +926,8 @@ applyNarEvent :: NarUnpackState -> Stream.NarEvent -> IO (Either Text NarUnpackS
 applyNarEvent narState event = case event of
   Stream.EventRegularBegin isExec _declaredSize -> withNodeTarget narState $ \path -> do
     createDirectoryIfMissing True (takeDirectory path)
-    fileHandle <- openBinaryFile path WriteMode
-    pure (Right narState {nusOpen = Just (fileHandle, path, isExec)})
+    opened <- openNewTreeFile path
+    pure (fmap (\fileHandle -> narState {nusOpen = Just (fileHandle, path, isExec)}) opened)
   Stream.EventRegularChunk slice -> case nusOpen narState of
     Nothing -> pure (Left "NAR stream sink: file contents outside an open file")
     Just (fileHandle, _, _) -> do
@@ -887,8 +944,8 @@ applyNarEvent narState event = case event of
       Left err -> Left err
       Right decoded -> Right narState {nusLinks = (path, decoded) : nusLinks narState}
   Stream.EventDirectoryBegin -> withNodeTarget narState $ \path -> do
-    createDirectoryIfMissing True path
-    pure (Right narState {nusFrames = UnpackFrame path Map.empty : nusFrames narState})
+    created <- createTreeDirectory path
+    pure (narState {nusFrames = UnpackFrame path Map.empty : nusFrames narState} <$ created)
   Stream.EventEntryBegin nameBytes -> case nusFrames narState of
     [] -> pure (Left "NAR stream sink: entry outside a directory")
     (frame : outer) -> pure $ do
@@ -1121,6 +1178,11 @@ adoptedTreeMatches dest sp = do
 -- self-referential link would recurse forever).  On Windows without
 -- symlink privilege the link creation fails loudly rather than silently
 -- corrupting the content address.
+--
+-- Every entry is created exclusively, like an unpacked tree's:
+-- siblings distinct on the source volume can fold together on the
+-- destination's, and the copy refuses the second rather than landing
+-- it on the first, raising the refusal in upstream's wording.
 copyPathInto :: FilePath -> FilePath -> IO ()
 copyPathInto src dest = do
   isLink <- Dir.pathIsSymbolicLink src
@@ -1128,18 +1190,38 @@ copyPathInto src dest = do
     then do
       target <- Dir.getSymbolicLinkTarget src
       linkedDir <- doesDirectoryExist src
-      if linkedDir
-        then Dir.createDirectoryLink target dest
-        else Dir.createFileLink target dest
+      let createLink = if linkedDir then Dir.createDirectoryLink else Dir.createFileLink
+      refuseTaken (pure (symlinkTakenMessage dest target)) (createLink target dest) >>= raiseRefusal
     else do
       isDir <- doesDirectoryExist src
       if isDir
         then do
-          createDirectoryIfMissing True dest
+          createTreeDirectory dest >>= raiseRefusal
           names <- listDirectory src
           mapM_ (\name -> copyPathInto (src </> name) (dest </> name)) names
         else do
-          copyFile src dest
-          -- copyFile copies the unnamed stream only, so on Windows the
-          -- exec mark would not survive the copy.
+          copied <- withNewTreeFile dest (\to -> withBinaryFile src ReadMode (`copyHandleBytes` to))
+          raiseRefusal copied
+          -- Best effort: of the permissions, the NAR records only the
+          -- exec mark, which is carried on its own below (the unnamed
+          -- stream alone does not hold it on Windows).
+          Dir.copyPermissions src dest `catch` \(_ :: IOException) -> pure ()
           ExecBit.copyExecMark src dest
+  where
+    raiseRefusal = either (throwIO . userError . T.unpack) pure
+
+-- | Copy a readable handle's remaining bytes into a writable one, a
+-- bounded chunk at a time.
+copyHandleBytes :: Handle -> Handle -> IO ()
+copyHandleBytes from to = go
+  where
+    go = do
+      chunk <- BS.hGetSome from copyChunkBytes
+      unless (BS.null chunk) $ do
+        BS.hPut to chunk
+        go
+
+-- | The read size of 'copyHandleBytes': the block @directory@'s own
+-- file copy reads, which is coreutils' @cp@ size.
+copyChunkBytes :: Int
+copyChunkBytes = 128 * 1024

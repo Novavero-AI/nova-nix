@@ -592,21 +592,25 @@ instance MonadEval EvalIO where
         sp <- storePathOrThrow "builtins.path" (makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes))
         destFilePath <- evalFilePath sp
         let destPath = canonicalStorePathText sp
-        wrapIO $ do
+        unpacked <- wrapIO $ do
           Dir.createDirectoryIfMissing True (takeDirectory destFilePath)
           -- Adopt an existing tree only when it serialises to exactly
           -- these NAR bytes; an interrupted earlier unpack is cleared
           -- and unpacked afresh.
           onDiskNar <- narBytesIfPresent destFilePath
-          unless (onDiskNar == Just narBytes) $ do
-            Dir.removePathForcibly destFilePath
-            -- Probed per write rather than carried in 'EvalState': the
-            -- store directory need not exist when evaluation starts, and
-            -- the probe answers for a path on disk.  It was created just
-            -- above, and the cost is one pathconf call per tree.
-            sensitivity <- probeCaseSensitivity (takeDirectory destFilePath)
-            unpacked <- unpackNarEntry sensitivity destFilePath entry
-            either (throwIO . userError . T.unpack) pure unpacked
+          if onDiskNar == Just narBytes
+            then pure (Right ())
+            else do
+              Dir.removePathForcibly destFilePath
+              -- Probed per write rather than carried in 'EvalState': the
+              -- store directory need not exist when evaluation starts, and
+              -- the probe answers for a path on disk.  It was created just
+              -- above, and the cost is one pathconf call per tree.
+              sensitivity <- probeCaseSensitivity (takeDirectory destFilePath)
+              unpackNarEntry sensitivity destFilePath entry
+        -- Raised here rather than inside 'wrapIO', which would render
+        -- the refusal through an exception's own text ("user error (...)").
+        either throwEvalError pure unpacked
         recordStoreWrite destPath [] SP.WriteRecursive
         allowPath destPath
         pure destPath
