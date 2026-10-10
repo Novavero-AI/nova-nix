@@ -2993,6 +2993,49 @@ symlinksAvailable = do
     Left _ -> False
     Right () -> True
 
+-- | Interpolating a path that is a symlink copies what it points to,
+-- under the link's own name: upstream's copyPathToStore stores
+-- path.resolveSymlinks() under path.baseName() (eval.cc at 2.24.9).
+testInterpolatedSymlinkIO :: IO [Bool]
+testInterpolatedSymlinkIO = do
+  putStrLn "eval/interpolated-symlink-io"
+  canLink <- symlinksAvailable
+  if not canLink
+    then do
+      putStrLn "  SKIP  needs symlink privilege"
+      pure []
+    else testInterpolatedSymlinkBody
+
+testInterpolatedSymlinkBody :: IO [Bool]
+testInterpolatedSymlinkBody = do
+  tmpBase <- getTemporaryDirectory
+  let dir = tmpBase </> "nova-nix-test-interpolated-symlink"
+  Dir.removePathForcibly dir
+  createDirectoryIfMissing True (dir </> "sub")
+  BS.writeFile (dir </> "data.txt") "linked bytes"
+  BS.writeFile (dir </> "sub" </> "inner.txt") "inner"
+  Dir.createFileLink "data.txt" (dir </> "filelink")
+  Dir.createDirectoryLink "sub" (dir </> "dirlink")
+  fileEntry <- NAR.serialiseFromPath (dir </> "data.txt")
+  dirEntry <- NAR.serialiseFromPath (dir </> "sub")
+  let interpolated name = evalNixIO "." ("\"${/. + " <> nixQuotedPath (dir </> name) <> "}\"")
+      copiedAs name entry =
+        either (const Nothing) (Just . storePathToText defaultStoreDir) (makeFixedOutputPath (T.pack name) "sha256" "recursive" (sha256Digest (NAR.serialise entry)))
+      copies name entry = runTestM ("interpolating " <> T.pack name <> " copies its target") $ do
+        result <- interpolated name
+        pure $ case (result, copiedAs name entry) of
+          (_, Nothing) -> Fail "fixture store path rejected"
+          (Right (VStr got _), Just expected) -> assertEqual (T.pack name) (TE.encodeUtf8 expected) got
+          (Right other, _) -> Fail ("expected a string, got " <> T.pack (show other))
+          (Left err, _) -> Fail ("eval failed: " <> err)
+  results <-
+    sequence
+      [ copies "filelink" fileEntry,
+        copies "dirlink" dirEntry
+      ]
+  Dir.removePathForcibly dir
+  pure results
+
 -- | Watchdog for cycle-termination tests: with symlinks as leaves every
 -- walk returns promptly, while a regression to link-following recurses
 -- forever - and a hung suite is worse than a failed one.
@@ -15330,6 +15373,7 @@ runSuite = do
           testDerivationTraceIO,
           testPathFilterIO,
           testPathSymlinkIO,
+          testInterpolatedSymlinkIO,
           testBatchA,
           testBatchAIO,
           testEnvironmentBytes,
