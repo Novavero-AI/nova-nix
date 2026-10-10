@@ -19,9 +19,9 @@
 -- rooted.  A relative input stays relative: leading @..@ segments are kept,
 -- and a fully-collapsed relative path is @.@.
 --
--- "Nix.Config" reuses 'canonPath' for the native paths its includes and
--- @NIX_CONF_DIR@ name, splitting the drive off first, since a native
--- path has one where a path value does not.
+-- "Nix.Config" applies the same collapse to the native paths its includes
+-- and @NIX_CONF_DIR@ name, over 'System.OsPath.OsPath' units rather than
+-- text, since a native path there is bytes that text cannot hold.
 module Nix.Eval.CanonPath
   ( canonPath,
     canonPathValue,

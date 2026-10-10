@@ -19,6 +19,23 @@
 -- decimal digits, an optional leading @+@, and an optional binary unit
 -- suffix (@K@, @M@, @G@, @T@).
 --
+-- == Bytes
+--
+-- A source is bytes until a setting takes a value from it, as upstream's
+-- @std::string@ is.  A line splits into tokens on upstream's separators
+-- alone (space, tab, CR, LF), not on every Unicode space; a comment, and
+-- the value of a setting this layer does not model, are never decoded;
+-- and an include target reaches the open as the bytes the line holds
+-- ("Nix.HostPath"), so a target with no UTF-8 reading names the file it
+-- names on disk.  A Boolean or integer setting compares the value's bytes
+-- with what it accepts, so a byte with no UTF-8 reading there is
+-- upstream's own invalid-value error.  A list setting's tokens are
+-- decoded strictly where upstream keeps them as bytes, because everything
+-- downstream holds them as text (a substituter's URL, a key matched
+-- against a narinfo's signatures, a URI prefix matched against the
+-- evaluator's URIs).  A token that is not UTF-8 is refused rather than
+-- spelled with U+FFFD, which would name a different cache, key or URI.
+--
 -- == Where the files are
 --
 -- Upstream's @loadConfFile@ (@globals.cc@) reads, weakest first: the system
@@ -98,18 +115,22 @@ import Control.Applicative ((<|>))
 import Control.Monad (foldM, mfilter, when)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError)
 import Control.Monad.Trans (lift)
-import Data.Char (toUpper)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
+import Data.Char (isDigit, ord, toUpper)
 import Data.Either (rights)
+import Data.List (dropWhileEnd, intercalate)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
-import Data.Maybe (fromMaybe, maybeToList)
+import Data.Maybe (catMaybes, fromMaybe, maybeToList)
 import Data.Text (Text)
-import qualified Data.Text as T
-import qualified Data.Text.Read as TR
+import qualified Data.Text.Encoding as TE
 import Data.Word (Word32)
 import Nix.Eval.CallDepth (defaultMaxCallDepth)
-import Nix.Eval.CanonPath (canonPath)
-import System.FilePath (isAbsolute, isPathSeparator, searchPathSeparator, splitDrive, takeDirectory, (</>))
+import Nix.HostPath (hostPathFromBytes, hostPathText)
+import System.OsPath (OsChar, OsPath, OsString, (</>))
+import qualified System.OsPath as OP
 
 -- ---------------------------------------------------------------------------
 -- Settings
@@ -158,7 +179,7 @@ defaultNixConfig =
 -- ---------------------------------------------------------------------------
 
 -- | The environment that decides which files are read.  The two variables
--- are carried raw, as 'System.Environment.lookupEnv' returns them,
+-- are carried raw, as the bytes 'Nix.Environment.lookupEnvBytes' returns,
 -- because upstream reads them differently: an empty @NIX_CONF_DIR@ is
 -- unset (@getEnvNonEmpty@), while an empty @NIX_USER_CONF_FILES@ is set
 -- and names no files at all.  The directories arrive resolved, since the
@@ -167,17 +188,17 @@ defaultNixConfig =
 -- look up.
 data ConfigLocations = ConfigLocations
   { -- | @NIX_CONF_DIR@.
-    clConfDir :: !(Maybe String),
+    clConfDir :: !(Maybe ByteString),
     -- | The platform's machine-wide config directory, where the system
     -- file is unless @NIX_CONF_DIR@ moves it; 'Nothing' on a platform
     -- that names none, and then there is no system file to read.
-    clSystemConfDir :: !(Maybe FilePath),
+    clSystemConfDir :: !(Maybe OsPath),
     -- | @NIX_USER_CONF_FILES@.
-    clUserConfFiles :: !(Maybe String),
+    clUserConfFiles :: !(Maybe ByteString),
     -- | The XDG config home.
-    clConfigHome :: !FilePath,
+    clConfigHome :: !OsPath,
     -- | The XDG config dirs, first entry strongest.
-    clConfigDirs :: ![FilePath]
+    clConfigDirs :: ![OsPath]
   }
   deriving (Eq, Show)
 
@@ -198,34 +219,42 @@ data ConfigLocations = ConfigLocations
 -- as upstream's tokenizer drops them; upstream splits on @:@ on every
 -- platform, which cannot carry a Windows drive letter, so @;@ is honoured
 -- there as it is for @PATH@ and @XDG_CONFIG_DIRS@.
-configFilePaths :: ConfigLocations -> Either Text [FilePath]
+configFilePaths :: ConfigLocations -> Either Text [OsPath]
 configFilePaths locations = do
-  systemDir <- traverse canonicalAbsolutePath (mfilter (not . null) (clConfDir locations) <|> clSystemConfDir locations)
+  confDir <- traverse variablePath (mfilter (not . BS.null) (clConfDir locations))
+  systemDir <- traverse canonicalAbsolutePath (confDir <|> clSystemConfDir locations)
+  userFiles <- case clUserConfFiles locations of
+    Just listed -> splitListVar <$> variablePath listed
+    Nothing -> pure (map underXdgDir (clConfigHome locations : clConfigDirs locations))
   pure (maybeToList ((</> nixConfFileName) <$> systemDir) ++ reverse userFiles)
   where
-    userFiles = case clUserConfFiles locations of
-      Just listed -> splitListVar listed
-      Nothing -> map underXdgDir (clConfigHome locations : clConfigDirs locations)
     underXdgDir dir = dir </> nixConfDirName </> nixConfFileName
+    variablePath bytes = maybe (Left (noHostSpelling bytes)) Right (hostPathFromBytes bytes)
 
 -- | Split a path-list variable on the platform's list separator, dropping
 -- empty entries.
-splitListVar :: String -> [FilePath]
-splitListVar = filter (not . null) . splitOn
+splitListVar :: OsString -> [OsPath]
+splitListVar = map OP.pack . filter (not . null) . splitOn . OP.unpack
   where
-    splitOn text = case break (== searchPathSeparator) text of
+    splitOn units = case break (== OP.searchPathSeparator) units of
       (item, []) -> [item]
       (item, _ : rest) -> item : splitOn rest
 
 -- | The file name every source directory is read under.
-nixConfFileName :: FilePath
-nixConfFileName = "nix.conf"
+nixConfFileName :: OsPath
+nixConfFileName = asciiPath "nix.conf"
 
 -- | The directory @nix.conf@ sits in beneath a config directory: @nix@
 -- under each XDG directory (@getUserConfigFiles@) and under @sysconfdir@
 -- for the system file (libstore's meson.build at 2.24.9).
-nixConfDirName :: FilePath
-nixConfDirName = "nix"
+nixConfDirName :: OsPath
+nixConfDirName = asciiPath "nix"
+
+-- | A path this module spells itself.  'OP.unsafeFromChar' narrows a
+-- character to the platform's path unit (a byte, or a UTF-16 unit), which
+-- is exact for ASCII on both.
+asciiPath :: String -> OsPath
+asciiPath = OP.pack . map OP.unsafeFromChar
 
 -- ---------------------------------------------------------------------------
 -- Sources and includes
@@ -237,14 +266,14 @@ nixConfDirName = "nix"
 -- include relatively; upstream passes the literal @NIX_CONFIG@ as the
 -- path and its @canonPath@ refuses the @.\/x@ that results.
 data ConfigSource = ConfigSource
-  { csName :: !FilePath,
-    csText :: !Text
+  { csName :: !OsPath,
+    csText :: !ByteString
   }
   deriving (Eq, Show)
 
 -- | The name upstream applies the @NIX_CONFIG@ text under.
-nixConfigSourceName :: FilePath
-nixConfigSourceName = "NIX_CONFIG"
+nixConfigSourceName :: OsPath
+nixConfigSourceName = asciiPath "NIX_CONFIG"
 
 -- | Why a file could not be read: there is nothing at the path, or there
 -- is and it cannot be read (a directory, a permission refusal).  Upstream
@@ -253,17 +282,17 @@ nixConfigSourceName = "NIX_CONFIG"
 data ConfigReadFailure = ConfigFileMissing | ConfigFileUnreadable
   deriving (Eq, Show)
 
--- | How the expander reads a file: its text, or why it could not be read.
--- A function so the expander runs over an in-memory map in tests and over
--- the filesystem in the CLI.
-type ReadConfigFile m = FilePath -> m (Either ConfigReadFailure Text)
+-- | How the expander reads a file: its bytes, or why it could not be
+-- read.  A function so the expander runs over an in-memory map in tests
+-- and over the filesystem in the CLI.
+type ReadConfigFile m = OsPath -> m (Either ConfigReadFailure ByteString)
 
 -- | Read, expand and fold the whole configuration: the files at the given
 -- paths, weakest first (one that cannot be read is simply absent, as
 -- upstream's @applyConfigFile@ treats a @SystemError@), then the
--- @NIX_CONFIG@ text when the variable is set.  A file that is read and
+-- @NIX_CONFIG@ bytes when the variable is set.  A file that is read and
 -- does not expand is an error, never treated as absent.
-loadConfig :: (Monad m) => ReadConfigFile m -> [FilePath] -> Maybe Text -> m (Either Text NixConfig)
+loadConfig :: (Monad m) => ReadConfigFile m -> [OsPath] -> Maybe ByteString -> m (Either Text NixConfig)
 loadConfig readConfigFile paths nixConfigText = runExceptT $ do
   fileSources <- lift (rights <$> traverse readSource paths)
   let sources = fileSources ++ maybeToList (ConfigSource nixConfigSourceName <$> nixConfigText)
@@ -281,23 +310,30 @@ expandConfigSource :: (Monad m) => ReadConfigFile m -> ConfigSource -> m (Either
 expandConfigSource readConfigFile = runExceptT . expandWithin readConfigFile []
 
 -- | Expand one source beneath the names of the files including it.
-expandWithin :: (Monad m) => ReadConfigFile m -> [FilePath] -> ConfigSource -> ExceptT Text m [ConfigAssignment]
+expandWithin :: (Monad m) => ReadConfigFile m -> [OsPath] -> ConfigSource -> ExceptT Text m [ConfigAssignment]
 expandWithin readConfigFile ancestors (ConfigSource name text) = do
   parsed <- liftEither (parseConfigLines name text)
   concat <$> traverse (expandLine readConfigFile (name :| ancestors)) parsed
 
 -- | Expand one line of the file at the chain's head: an assignment is
 -- itself; an include is the included file, expanded beneath the chain.
-expandLine :: (Monad m) => ReadConfigFile m -> NonEmpty FilePath -> ConfigLine -> ExceptT Text m [ConfigAssignment]
+-- A target with no host spelling (bytes that are not UTF-8, on Windows)
+-- names no file that can exist, so @!include@ goes on without it as it
+-- does without a missing file.
+expandLine :: (Monad m) => ReadConfigFile m -> NonEmpty OsPath -> ConfigLine -> ExceptT Text m [ConfigAssignment]
 expandLine _ _ (LineAssignment assignment) = pure [assignment]
-expandLine readConfigFile chain@(from :| _) (LineInclude mode target) = do
-  path <- liftEither (resolveIncludePath from target)
-  when (path `elem` chain) (throwError (includeCycle path from))
-  contents <- lift (readConfigFile path)
-  case (contents, mode) of
-    (Right text, _) -> expandWithin readConfigFile (NE.toList chain) (ConfigSource path text)
-    (Left _, IncludeOptional) -> pure []
-    (Left failure, IncludeRequired) -> throwError (includeFailed failure path from)
+expandLine readConfigFile chain@(from :| _) (LineInclude mode target) =
+  case (hostPathFromBytes target, mode) of
+    (Nothing, IncludeOptional) -> pure []
+    (Nothing, IncludeRequired) -> throwError (includeUnspellable target from)
+    (Just targetPath, _) -> do
+      path <- liftEither (resolveIncludePath from targetPath)
+      when (path `elem` chain) (throwError (includeCycle path from))
+      contents <- lift (readConfigFile path)
+      case (contents, mode) of
+        (Right text, _) -> expandWithin readConfigFile (NE.toList chain) (ConfigSource path text)
+        (Left _, IncludeOptional) -> pure []
+        (Left failure, IncludeRequired) -> throwError (includeFailed failure path from)
 
 -- | Where an include points: the target joined under the including
 -- file's directory (an absolute target stands alone), then collapsed
@@ -305,48 +341,102 @@ expandLine readConfigFile chain@(from :| _) (LineInclude mode target) = do
 -- @canonPath@ do.  A result that is still relative is refused: the
 -- including source has no directory, which is the case for @NIX_CONFIG@
 -- and for a user file named relatively.
-resolveIncludePath :: FilePath -> FilePath -> Either Text FilePath
-resolveIncludePath from target = canonicalAbsolutePath (takeDirectory from </> target)
+resolveIncludePath :: OsPath -> OsPath -> Either Text OsPath
+resolveIncludePath from target = canonicalAbsolutePath (OP.takeDirectory from </> target)
 
 -- | An absolute native path collapsed lexically, or upstream's own
 -- complaint (@canonPath@, file-system.cc at 2.24.9) for a relative one.
--- The drive 'splitDrive' finds (the POSIX root, a Windows drive letter or
--- UNC server) is kept as spelled, and the path beneath it collapses as
--- upstream's @canonPath@ collapses: @.@ drops, @..@ pops and drops at the
--- root, repeated separators fold to one.  'canonPath' does that collapse
--- for eval path values, which are rooted in the @\/nix\/store@ sense on
--- every platform and so see no drive; a native path is split here first
--- so a UNC root survives rather than folding to the current drive.
-canonicalAbsolutePath :: FilePath -> Either Text FilePath
+-- The drive 'OP.splitDrive' finds (the POSIX root, a Windows drive letter
+-- or UNC server) is kept as spelled, and the path beneath it collapses as
+-- upstream's @canonPath@ collapses ('collapseUnits'), from the drive's
+-- last separator on, so a UNC root survives rather than folding to the
+-- current drive.
+canonicalAbsolutePath :: OsPath -> Either Text OsPath
 canonicalAbsolutePath path
-  | isAbsolute path = Right (T.unpack (root <> canonPath (T.takeEnd 1 rootSeparators <> T.pack below)))
-  | otherwise = Left (configErrorPrefix <> "not an absolute path: '" <> T.pack path <> "'")
+  | OP.isAbsolute path = Right (OP.pack (root ++ collapseUnits (lastSeparator ++ OP.unpack below)))
+  | otherwise = Left (configErrorPrefix <> "not an absolute path: '" <> hostPathText path <> "'")
   where
-    (drive, below) = splitDrive path
-    (root, rootSeparators) = (T.dropWhileEnd isPathSeparator driveText, T.takeWhileEnd isPathSeparator driveText)
-    driveText = T.pack drive
+    (drive, below) = OP.splitDrive path
+    driveUnits = OP.unpack drive
+    root = dropWhileEnd OP.isPathSeparator driveUnits
+    lastSeparator = take 1 (takeWhile OP.isPathSeparator (reverse driveUnits))
 
-includeFailed :: ConfigReadFailure -> FilePath -> FilePath -> Text
+-- | Upstream's lexical collapse, over a native path's units: @.@ drops,
+-- @..@ pops a real predecessor (at a root it drops, in a relative path it
+-- stays), repeated separators fold to one, and an empty result is @.@.
+-- The same rule 'Nix.Eval.CanonPath.canonPath' applies to path values,
+-- which are text; a native path here is bytes, which text cannot hold.
+-- The separator is the platform's when the path spells one with it and
+-- @/@ otherwise, as there.
+collapseUnits :: [OsChar] -> [OsChar]
+collapseUnits units
+  | rooted = separator : joined
+  | null resolved = [dotUnit]
+  | otherwise = joined
+  where
+    rooted = any OP.isPathSeparator (take 1 units)
+    segments = filter (not . null) (splitOnSeparators units)
+    resolved = reverse (foldl' (collapseStep rooted) [] segments)
+    separator = if OP.pathSeparator `elem` units then OP.pathSeparator else slashUnit
+    joined = intercalate [separator] resolved
+
+-- | One segment of the collapse fold; the accumulator holds resolved
+-- segments in reverse.
+collapseStep :: Bool -> [[OsChar]] -> [OsChar] -> [[OsChar]]
+collapseStep rooted acc segment
+  | segment == [dotUnit] = acc
+  | segment == parent = case acc of
+      [] -> [parent | not rooted]
+      (top : rest)
+        | top == parent -> parent : acc
+        | otherwise -> rest
+  | otherwise = segment : acc
+  where
+    parent = [dotUnit, dotUnit]
+
+splitOnSeparators :: [OsChar] -> [[OsChar]]
+splitOnSeparators units = case break OP.isPathSeparator units of
+  (segment, []) -> [segment]
+  (segment, _ : rest) -> segment : splitOnSeparators rest
+
+dotUnit, slashUnit :: OsChar
+dotUnit = OP.unsafeFromChar '.'
+slashUnit = OP.unsafeFromChar '/'
+
+includeFailed :: ConfigReadFailure -> OsPath -> OsPath -> Text
 includeFailed failure path from =
-  configErrorPrefix <> "file '" <> T.pack path <> "' included from '" <> T.pack from <> "' " <> reason
+  configErrorPrefix <> "file '" <> hostPathText path <> "' included from '" <> hostPathText from <> "' " <> reason
   where
     reason = case failure of
       ConfigFileMissing -> "not found"
       ConfigFileUnreadable -> "cannot be read"
 
-includeCycle :: FilePath -> FilePath -> Text
+includeCycle :: OsPath -> OsPath -> Text
 includeCycle path from =
-  configErrorPrefix <> "file '" <> T.pack path <> "' included from '" <> T.pack from <> "' is already being included (include cycle)"
+  configErrorPrefix <> "file '" <> hostPathText path <> "' included from '" <> hostPathText from <> "' is already being included (include cycle)"
+
+includeUnspellable :: ByteString -> OsPath -> Text
+includeUnspellable target from =
+  configErrorPrefix <> "file '" <> shownBytes target <> "' included from '" <> hostPathText from <> "' " <> noWindowsSpelling
+
+-- | The refusal of a path variable with no host spelling.  Unreachable
+-- while the environment reaches this module as "Nix.Environment" reads
+-- it, which spells a Windows value as UTF-8.
+noHostSpelling :: ByteString -> Text
+noHostSpelling bytes = configErrorPrefix <> "path '" <> shownBytes bytes <> "' " <> noWindowsSpelling
+
+noWindowsSpelling :: Text
+noWindowsSpelling = "is not valid UTF-8, so it names no Windows file"
 
 -- ---------------------------------------------------------------------------
 -- Parsing
 -- ---------------------------------------------------------------------------
 
 -- | One line of a config source after comment truncation: an assignment,
--- or an include directive and the path it names.
+-- or an include directive and the bytes of the path it names.
 data ConfigLine
   = LineAssignment !ConfigAssignment
-  | LineInclude !IncludeMode !FilePath
+  | LineInclude !IncludeMode !ByteString
   deriving (Eq, Show)
 
 -- | @include@ fails when its file cannot be read; @!include@ goes on
@@ -355,36 +445,41 @@ data IncludeMode = IncludeRequired | IncludeOptional
   deriving (Eq, Show)
 
 -- | One parsed @name = value@ assignment, before its name is resolved
--- against the known settings and aliases.
+-- against the known settings and aliases.  The value is its tokens
+-- joined by single spaces, as upstream joins them.
 data ConfigAssignment = ConfigAssignment
-  { caName :: !Text,
-    caValue :: !Text
+  { caName :: !ByteString,
+    caValue :: !ByteString
   }
   deriving (Eq, Show)
 
--- | Parse one source's text into its lines.  Comments and blank lines
+-- | Parse one source's bytes into its lines.  Comments and blank lines
 -- drop out; a malformed line (fewer than @name = value@, a missing @=@,
 -- or an include with other than exactly one path) is a loud error rather
 -- than a silent skip, matching upstream's @UsageError@ - a typo in a
 -- security-relevant file must not pass for an empty setting.  The error
 -- quotes the line as upstream does, comment-truncated and otherwise
 -- verbatim, leading whitespace included.
-parseConfigLines :: FilePath -> Text -> Either Text [ConfigLine]
-parseConfigLines name = traverse parseLine . filter (not . isBlank) . map stripComment . T.lines
+parseConfigLines :: OsPath -> ByteString -> Either Text [ConfigLine]
+parseConfigLines name = fmap catMaybes . traverse (parseLine . BS8.takeWhile (/= commentChar)) . BS8.lines
   where
-    isBlank line = null (T.words line)
-    stripComment = T.takeWhile (/= '#')
-    parseLine line = case T.words line of
+    parseLine line = case configTokens line of
+      [] -> Right Nothing
       [directive, target]
-        | directive == includeDirective -> Right (LineInclude IncludeRequired (T.unpack target))
-        | directive == bangIncludeDirective -> Right (LineInclude IncludeOptional (T.unpack target))
+        | directive == includeDirective -> Right (Just (LineInclude IncludeRequired target))
+        | directive == bangIncludeDirective -> Right (Just (LineInclude IncludeOptional target))
       (directive : _)
         | directive == includeDirective || directive == bangIncludeDirective -> syntaxError line
       (key : eq : valueTokens)
-        | eq == assignEq -> Right (LineAssignment (ConfigAssignment key (T.unwords valueTokens)))
+        | eq == assignEq -> Right (Just (LineAssignment (ConfigAssignment key (BS.intercalate valueSeparator valueTokens))))
       _ -> syntaxError line
     syntaxError line =
-      Left (configErrorPrefix <> "syntax error in configuration line '" <> line <> "' in '" <> T.pack name <> "'")
+      Left (configErrorPrefix <> "syntax error in configuration line '" <> shownBytes line <> "' in '" <> hostPathText name <> "'")
+
+-- | Upstream's @tokenizeString@ under its default separators (util.hh at
+-- 2.24.9): the maximal runs of bytes other than space, tab, CR and LF.
+configTokens :: ByteString -> [ByteString]
+configTokens = filter (not . BS.null) . BS8.splitWith (`BS8.elem` tokenSeparators)
 
 -- | Parse an unsigned integer setting the way upstream's
 -- @BaseSetting\<unsigned int\>@ does (@string2IntWithUnitPrefix@ over
@@ -399,24 +494,26 @@ parseConfigLines name = traverse parseLine . filter (not . isBlank) . map stripC
 -- narrows it silently, so @5G@ is accepted there as 1073741824; here it
 -- is refused like any other value outside the range, since a ceiling
 -- that cannot mean what it says must not quietly become another number.
-parseUnsignedSetting :: Text -> Text -> Either Text Word32
+parseUnsignedSetting :: ByteString -> ByteString -> Either Text Word32
 parseUnsignedSetting name value = maybe (Left invalid) Right (unitValue >>= inRange)
   where
-    invalid = "setting '" <> name <> "' has invalid value '" <> value <> "'"
-    unsigned = fromMaybe value (T.stripPrefix plusSign value)
-    unitValue = case T.unsnoc unsigned of
+    invalid = "setting '" <> shownBytes name <> "' has invalid value '" <> shownBytes value <> "'"
+    unsigned = fromMaybe value (BS.stripPrefix plusSign value)
+    unitValue = case BS8.unsnoc unsigned of
       Just (digits, unit) | Just multiplier <- unitMultiplier unit -> (* multiplier) <$> decimalInteger digits
       _ -> decimalInteger unsigned
     inRange n
       | n <= toInteger (maxBound :: Word32) = Just (fromInteger n)
       | otherwise = Nothing
 
--- | A whole run of decimal digits as an 'Integer'; anything else, the empty
--- text included, is 'Nothing'.
-decimalInteger :: Text -> Maybe Integer
-decimalInteger digits = case TR.decimal digits of
-  Right (n, rest) | T.null rest -> Just n
-  _ -> Nothing
+-- | A whole run of decimal digits as an 'Integer'; anything else, the
+-- empty run included, is 'Nothing'.
+decimalInteger :: ByteString -> Maybe Integer
+decimalInteger digits
+  | not (BS.null digits) && BS8.all isDigit digits = Just (BS8.foldl' step 0 digits)
+  | otherwise = Nothing
+  where
+    step acc digit = acc * 10 + toInteger (ord digit - ord '0')
 
 -- | Upstream's binary unit letters.
 unitMultiplier :: Char -> Maybe Integer
@@ -448,7 +545,7 @@ applyAssignment config (ConfigAssignment name value) =
   case resolveName name of
     Nothing -> Right config
     Just (ListSetting field, mode) ->
-      Right (setList field (combine mode (getList field config) (T.words value)) config)
+      (\items -> setList field (combine mode (getList field config) items) config) <$> listItems field value
     Just (BoolSetting field, _) ->
       (\flag -> setBool field flag config) <$> parseBool name value
     Just (ScalarSetting MaxCallDepthField, _) ->
@@ -457,13 +554,24 @@ applyAssignment config (ConfigAssignment name value) =
     combine ReplaceMode _ new = new
     combine AppendMode old new = old ++ new
 
+-- | A list value's tokens as text, split as upstream's @Strings@ setting
+-- splits it, or the refusal of a token that is not UTF-8 (see the module
+-- header's Bytes section).  The refusal names the setting as upstream's
+-- value errors do, by its own name rather than an alias or an @extra-@
+-- spelling.
+listItems :: ListField -> ByteString -> Either Text [Text]
+listItems field value = maybe (Left refusal) Right (traverse decoded (configTokens value))
+  where
+    decoded = either (const Nothing) Just . TE.decodeUtf8'
+    refusal = "setting '" <> shownBytes (listFieldKey field) <> "' has invalid value '" <> shownBytes value <> "': not valid UTF-8"
+
 -- | Which setting a name targets, once the @extra-@ prefix and the aliases
 -- are resolved, and whether it replaces or appends.  @extra-@ composes
 -- with a list only: upstream looks the base name up and appends when the
 -- setting is appendable, and a Boolean or a scalar is not.
-resolveName :: Text -> Maybe (Setting, ApplyMode)
+resolveName :: ByteString -> Maybe (Setting, ApplyMode)
 resolveName name =
-  case T.stripPrefix extraPrefix name of
+  case BS.stripPrefix extraPrefix name of
     Just base -> case baseSetting base of
       Just setting@(ListSetting _) -> Just (setting, AppendMode)
       _ -> Nothing
@@ -510,6 +618,11 @@ setList SubstitutersField v config = config {ncSubstituters = v}
 setList TrustedKeysField v config = config {ncTrustedPublicKeys = v}
 setList AllowedUrisField v config = config {ncAllowedUris = v}
 
+listFieldKey :: ListField -> ByteString
+listFieldKey SubstitutersField = substitutersKey
+listFieldKey TrustedKeysField = trustedKeysKey
+listFieldKey AllowedUrisField = allowedUrisKey
+
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool RestrictEvalField v config = config {ncRestrictEval = v}
 setBool PureEvalField v config = config {ncPureEval = v}
@@ -517,13 +630,13 @@ setBool PureEvalField v config = config {ncPureEval = v}
 -- | Upstream's Boolean spellings (@BaseSetting\<bool\>::parse@): anything
 -- else is an error with upstream's wording, which names the setting alone,
 -- as 'parseUnsignedSetting' does.
-parseBool :: Text -> Text -> Either Text Bool
+parseBool :: ByteString -> ByteString -> Either Text Bool
 parseBool name value
   | value `elem` trueSpellings = Right True
   | value `elem` falseSpellings = Right False
-  | otherwise = Left ("Boolean setting '" <> name <> "' has invalid value '" <> value <> "'")
+  | otherwise = Left ("Boolean setting '" <> shownBytes name <> "' has invalid value '" <> shownBytes value <> "'")
 
-trueSpellings, falseSpellings :: [Text]
+trueSpellings, falseSpellings :: [ByteString]
 trueSpellings = ["true", "yes", "1"]
 falseSpellings = ["false", "no", "0"]
 
@@ -535,38 +648,59 @@ resolveConfig :: [ConfigAssignment] -> Either Text NixConfig
 resolveConfig = foldM applyAssignment defaultNixConfig
 
 -- ---------------------------------------------------------------------------
--- Setting names
+-- Messages
 -- ---------------------------------------------------------------------------
 
-substitutersKey, substitutersAlias :: Text
-substitutersKey = "substituters"
-substitutersAlias = "binary-caches"
-
-trustedKeysKey, trustedKeysAlias :: Text
-trustedKeysKey = "trusted-public-keys"
-trustedKeysAlias = "binary-cache-public-keys"
-
-allowedUrisKey, maxCallDepthKey, pureEvalKey, restrictEvalKey :: Text
-allowedUrisKey = "allowed-uris"
-maxCallDepthKey = "max-call-depth"
-pureEvalKey = "pure-eval"
-restrictEvalKey = "restrict-eval"
-
-extraPrefix :: Text
-extraPrefix = "extra-"
-
-assignEq :: Text
-assignEq = "="
-
-plusSign :: Text
-plusSign = "+"
-
-includeDirective, bangIncludeDirective :: Text
-includeDirective = "include"
-bangIncludeDirective = "!include"
+-- | Bytes from a source as a message quotes them, for display only: their
+-- UTF-8 reading, with U+FFFD where it fails.  Upstream writes the bytes
+-- themselves; a message here is text.
+shownBytes :: ByteString -> Text
+shownBytes = TE.decodeUtf8Lenient
 
 -- | What every error about the files themselves opens with (a syntax
 -- error, a failed include, a path that is not absolute): the format's
 -- name.  A setting's value error carries none, as upstream's does not.
 configErrorPrefix :: Text
 configErrorPrefix = "nix.conf: "
+
+-- ---------------------------------------------------------------------------
+-- Setting names and syntax
+-- ---------------------------------------------------------------------------
+
+substitutersKey, substitutersAlias :: ByteString
+substitutersKey = "substituters"
+substitutersAlias = "binary-caches"
+
+trustedKeysKey, trustedKeysAlias :: ByteString
+trustedKeysKey = "trusted-public-keys"
+trustedKeysAlias = "binary-cache-public-keys"
+
+allowedUrisKey, maxCallDepthKey, pureEvalKey, restrictEvalKey :: ByteString
+allowedUrisKey = "allowed-uris"
+maxCallDepthKey = "max-call-depth"
+pureEvalKey = "pure-eval"
+restrictEvalKey = "restrict-eval"
+
+extraPrefix :: ByteString
+extraPrefix = "extra-"
+
+assignEq :: ByteString
+assignEq = "="
+
+plusSign :: ByteString
+plusSign = "+"
+
+includeDirective, bangIncludeDirective :: ByteString
+includeDirective = "include"
+bangIncludeDirective = "!include"
+
+commentChar :: Char
+commentChar = '#'
+
+tokenSeparators :: ByteString
+tokenSeparators = " \t\n\r"
+
+-- | What a value's tokens are joined with, as upstream's
+-- @concatStringsSep(" ", ...)@ joins them.
+valueSeparator :: ByteString
+valueSeparator = " "
