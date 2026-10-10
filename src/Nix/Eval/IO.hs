@@ -341,11 +341,11 @@ instance MonadEval EvalIO where
   -- Read a .drv from the store on a modulo-hash cache miss (a cross-session or
   -- appendContext reference).  Mirrors the build side's readDrvFromStore: map
   -- to the on-disk path, read the raw bytes, parse the ATerm byte-level (env
-  -- values keep arbitrary bytes).  Any failure - absent file, malformed ATerm
-  -- - is 'Nothing', which the caller turns into a loud modulo-hash error.
+  -- values keep arbitrary bytes).  A file that cannot be read or does not
+  -- parse is 'Nothing', which the caller turns into a loud modulo-hash error.
   readStoreDerivation sp = EvalIO $ do
     filePath <- asks ((`storeFilePath` sp) . esStoreDir)
-    result <- liftIO (try (BS.readFile filePath) :: IO (Either SomeException BS.ByteString))
+    result <- liftIO (try (BS.readFile filePath) :: IO (Either IOException BS.ByteString))
     pure $ case result of
       Left _ -> Nothing
       Right bytes -> either (const Nothing) Just (fromATerm bytes)
@@ -555,7 +555,7 @@ instance MonadEval EvalIO where
     if not there
       then pure Nothing
       else do
-        recorded <- try (BS.readFile file) :: IO (Either SomeException BS.ByteString)
+        recorded <- try (BS.readFile file) :: IO (Either IOException BS.ByteString)
         pure $ case recorded of
           Left _ -> Nothing
           Right bytes -> either (const Nothing) Just (TE.decodeUtf8' bytes)
@@ -590,7 +590,7 @@ instance MonadEval EvalIO where
             BS.writeFile staging (TE.encodeUtf8 value)
             Dir.renameFile staging file
         ) ::
-        IO (Either SomeException ())
+        IO (Either IOException ())
     pure ()
 
   -- The two checks of getFileType: upstream's readLink asserts no

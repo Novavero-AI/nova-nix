@@ -59,8 +59,9 @@ module Nix.Builder
   )
 where
 
-import Control.Exception (IOException, SomeException, catches, displayException, finally, onException, try)
+import Control.Exception (IOException, catch, catches, displayException, finally, onException, try)
 import Control.Monad (filterM, unless, when)
+import Control.Monad.Except (ExceptT (..), liftEither, runExceptT)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Data.Char (isAscii, isSpace, toLower, toUpper)
@@ -98,7 +99,6 @@ import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import qualified System.IO
-import qualified System.IO.Unsafe
 import qualified System.Info
 import qualified System.Process as Proc
 
@@ -618,26 +618,28 @@ validateInputs config store drv = do
   let missingSrcs = [sp | (sp, valid) <- zip (drvInputSrcs drv) srcResults, not valid]
   if not (null missingSrcs)
     then pure (Left ("missing input sources: " <> T.intercalate ", " (map formatSP missingSrcs)))
-    else case resolveInputOutputs config drv of
-      Left err -> pure (Left err)
-      Right requiredOutputs -> do
-        outResults <- mapM (isValid store) requiredOutputs
-        let missingOutputs = [sp | (sp, valid) <- zip requiredOutputs outResults, not valid]
-        if not (null missingOutputs)
-          then pure (Left ("missing input derivation outputs: " <> T.intercalate ", " (map formatSP missingOutputs)))
-          else pure (Right ())
+    else do
+      resolved <- resolveInputOutputs config drv
+      case resolved of
+        Left err -> pure (Left err)
+        Right requiredOutputs -> do
+          outResults <- mapM (isValid store) requiredOutputs
+          let missingOutputs = [sp | (sp, valid) <- zip requiredOutputs outResults, not valid]
+          if not (null missingOutputs)
+            then pure (Left ("missing input derivation outputs: " <> T.intercalate ", " (map formatSP missingOutputs)))
+            else pure (Right ())
 
 -- | Resolve each input derivation's requested output names to their store
 -- paths by reading the input @.drv@ from the store.  @Left@ if an input @.drv@
 -- cannot be read or names an output the derivation does not define.
-resolveInputOutputs :: BuildConfig -> Derivation -> Either Text [StorePath]
+resolveInputOutputs :: BuildConfig -> Derivation -> IO (Either Text [StorePath])
 resolveInputOutputs config drv =
-  concat <$> traverse resolveOne (Map.toList (drvInputDrvs drv))
+  runExceptT (concat <$> traverse resolveOne (Map.toList (drvInputDrvs drv)))
   where
     resolveOne (inputDrvPath, wantedOutputs) = do
-      inputDrv <- readDrvFromStore config inputDrvPath
+      inputDrv <- ExceptT (readDrvFromStore config inputDrvPath)
       let outputMap = Map.fromList [(doName o, doPath o) | o <- drvOutputs inputDrv]
-      traverse (lookupOutput inputDrvPath outputMap) wantedOutputs
+      liftEither (traverse (lookupOutput inputDrvPath outputMap) wantedOutputs)
     lookupOutput inputDrvPath outputMap name =
       case Map.lookup name outputMap of
         Just sp -> Right sp
@@ -660,15 +662,14 @@ computeBuildDir config drv =
         [] -> "no-output"
    in bcTmpDir config </> uniqueSuffix
 
--- | Remove the build directory, ignoring errors.
+-- | Remove the build directory, ignoring a filesystem failure to remove
+-- it.  It runs as the build's 'finally', where a directory that will not
+-- go away must not replace the build's own outcome.
 cleanupBuildDir :: FilePath -> IO ()
 cleanupBuildDir dir = do
   exists <- doesDirectoryExist dir
-  when exists $ do
-    result <- try (removeDirectoryRecursive dir)
-    case (result :: Either SomeException ()) of
-      Right () -> pure ()
-      Left _ -> pure () -- Best effort cleanup
+  when exists $
+    removeDirectoryRecursive dir `catch` \(_ :: IOException) -> pure ()
 
 -- ---------------------------------------------------------------------------
 -- Environment
@@ -1144,10 +1145,10 @@ registerOutputs ::
   [OutputPlan] ->
   IO BuildResult
 registerOutputs config store drv _buildDir plans = do
-  let -- Candidates for reference scanning: input sources, the input
-      -- derivations' realized OUTPUT paths, and this derivation's own outputs.
-      inputOutputs = fromRight [] (resolveInputOutputs config drv)
-      allCandidates = collectAllCandidates drv ++ inputOutputs
+  -- Candidates for reference scanning: input sources, the input
+  -- derivations' realized OUTPUT paths, and this derivation's own outputs.
+  inputOutputs <- fromRight [] <$> resolveInputOutputs config drv
+  let allCandidates = collectAllCandidates drv ++ inputOutputs
       -- Deriver path is not available from the Derivation type alone;
       -- the caller (buildWithDeps) would need to pass it through.
       -- Register with no deriver for now - queryDeriver will return Nothing.
@@ -1335,8 +1336,9 @@ collectAllCandidates drv =
 -- Returns 'BuildSuccess' with the root output path on success, or
 -- 'BuildFailure' if any dependency fails to build or substitute.
 buildWithDeps :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
-buildWithDeps config store rootDrv rootDrvPath =
-  case buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath of
+buildWithDeps config store rootDrv rootDrvPath = do
+  graph <- buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
+  case graph of
     Left err -> pure (BuildFailure ("dependency graph error: " <> err) 1)
     Right depGraph ->
       case topoSort depGraph of
@@ -1357,27 +1359,15 @@ lookupDrv :: DepGraph -> StorePath -> Maybe Derivation
 lookupDrv (Nix.DependencyGraph.DepGraph g) sp =
   Nix.DependencyGraph.dnDerivation <$> Map.lookup sp g
 
--- | Read and parse a .drv file from the store.
---
--- Since 'buildDepGraph' is pure but needs to read immutable .drv files,
--- we use 'System.IO.Unsafe.unsafePerformIO'.  This is safe because .drv
--- files are write-once: their content is determined by their hash, so
--- repeated reads always yield the same result.
-readDrvFromStore :: BuildConfig -> StorePath -> Either Text Derivation
-readDrvFromStore config sp =
+-- | Read and parse a .drv file from the store, as bytes (no locale
+-- decode, no newline translation).
+readDrvFromStore :: BuildConfig -> StorePath -> IO (Either Text Derivation)
+readDrvFromStore config sp = do
   let drvFilePath = storePathToFilePath (bcStoreDir config) sp
-   in case unsafeReadFile drvFilePath of
-        Nothing -> Left ("cannot read .drv file: " <> T.pack drvFilePath)
-        Just content -> fromATerm content
-
--- | Read a file's raw bytes, returning Nothing on any error.  Used only
--- for reading immutable .drv files from the store - byte IO, never
--- text-mode (no locale decode, no newline translation).
-unsafeReadFile :: FilePath -> Maybe BS.ByteString
-unsafeReadFile path =
-  case System.IO.Unsafe.unsafePerformIO (try (BS.readFile path)) of
-    Left (_ :: SomeException) -> Nothing
-    Right content -> Just content
+  content <- try (BS.readFile drvFilePath)
+  pure $ case content of
+    Left (_ :: IOException) -> Left ("cannot read .drv file: " <> T.pack drvFilePath)
+    Right bytes -> fromATerm bytes
 
 -- ---------------------------------------------------------------------------
 -- Build in topological order

@@ -60,7 +60,7 @@ module Nix.Push
   )
 where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (IOException, try)
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError)
 import Control.Monad.IO.Class (liftIO)
@@ -76,7 +76,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types as HTTP
 import Nix.Compression (compressionNameNone, compressionNameZstd)
-import Nix.Http (withUserAgent)
+import Nix.Http (catchSync, withTransfer, withUserAgent)
 import Nix.Store (Store (..), queryDeriver, queryPathInfo, queryReferences, volumeCaseHack)
 import qualified Nix.Store.DB as DB
 import qualified Nix.Store.ExecBit as ExecBit
@@ -188,7 +188,7 @@ loadApiKeyFile :: FilePath -> IO (Either Text Text)
 loadApiKeyFile path = do
   attempt <- try (BS.readFile path)
   pure $ case attempt of
-    Left (e :: SomeException) -> Left ("cannot read key file: " <> T.pack (show e))
+    Left (e :: IOException) -> Left ("cannot read key file: " <> T.pack (show e))
     Right bytes -> case TE.decodeUtf8' bytes of
       Left _ -> Left ("key file is not valid UTF-8: " <> T.pack path)
       Right raw ->
@@ -342,13 +342,14 @@ mkNarInfo artifact sp refs deriver =
 -- Serializes one NAR at a time (bounded memory), uploads all NARs before
 -- any narinfo, and finishes with a signed round-trip check.  Any failure
 -- aborts with an error; a partial push leaves only orphaned NARs behind,
--- which are invisible to clients.
+-- which are invisible to clients.  An interrupt is not a failure: it
+-- stops the push and propagates.
 pushPaths :: PushConfig -> Store -> [StorePath] -> IO (Either Text PushSummary)
-pushPaths cfg store roots = do
-  attempt <- try (runExceptT run)
-  pure $ case attempt of
-    Left (e :: SomeException) -> Left ("push failed: " <> T.pack (show e))
-    Right r -> r
+pushPaths cfg store roots =
+  -- Every synchronous exception: the push raises sqlite-simple's from the
+  -- database and IO errors from the serialiser and the log, and each is a
+  -- failed push to report.
+  runExceptT run `catchSync` \e -> pure (Left ("push failed: " <> T.pack (show e)))
   where
     run :: ExceptT Text IO PushSummary
     run = do
@@ -488,8 +489,10 @@ verifySignedRoundTrip manager cfg sp = do
 -- HTTP plumbing
 -- ---------------------------------------------------------------------------
 
--- | Issue an HTTP request with optional body, converting any exception
--- into a push error.
+-- | Issue an HTTP request with optional body, converting a failure of the
+-- request into a push error.  The body is read through 'withTransfer', so
+-- a connection lost mid-body is an 'HTTP.HttpException' like every other
+-- failure of the request, and that is the one exception caught.
 httpRequest ::
   HTTP.Manager ->
   BS.ByteString ->
@@ -507,10 +510,11 @@ httpRequest manager method url headers body = ExceptT $ do
                 HTTP.requestHeaders = headers,
                 HTTP.requestBody = maybe (HTTP.requestBody request0) HTTP.RequestBodyBS body
               }
-    response <- HTTP.httpLbs request manager
-    pure (BS.toStrict <$> response)
+    withTransfer request manager $ \response -> do
+      chunks <- HTTP.brConsume (HTTP.responseBody response)
+      pure (BS.concat chunks <$ response)
   pure $ case attempt of
-    Left (e :: SomeException) -> Left ("HTTP error for " <> url <> ": " <> T.pack (show e))
+    Left (e :: HTTP.HttpException) -> Left ("HTTP error for " <> url <> ": " <> T.pack (show e))
     Right response -> Right response
 
 -- | Authorization headers for authenticated writes.

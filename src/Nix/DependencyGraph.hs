@@ -22,6 +22,7 @@ module Nix.DependencyGraph
   )
 where
 
+import Control.Monad.Except (ExceptT (..), runExceptT)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
@@ -62,23 +63,26 @@ data TopoResult
 
 -- | Build the full dependency graph starting from a root derivation.
 --
--- The @readDrv@ function reads a .drv file from the store and parses it.
--- Returns @Left@ if any .drv file cannot be read.
+-- The @readDrv@ function reads a .drv file from the store and parses it,
+-- in the caller's monad: 'IO' for the build driver,
+-- 'Data.Functor.Identity.Identity' over a pure lookup.  Returns @Left@
+-- for the first .drv file that cannot be read.
 --
 -- Uses a 'Seq' work-queue for O(1) enqueue\/dequeue instead of list append.
 buildDepGraph ::
-  (StorePath -> Either Text Derivation) ->
+  (Monad m) =>
+  (StorePath -> m (Either Text Derivation)) ->
   Derivation ->
   StorePath ->
-  Either Text DepGraph
+  m (Either Text DepGraph)
 buildDepGraph readDrv rootDrv rootPath =
-  go Map.empty (Seq.singleton (rootPath, rootDrv))
+  runExceptT (go Map.empty (Seq.singleton (rootPath, rootDrv)))
   where
     go visited queue = case Seq.viewl queue of
-      Seq.EmptyL -> Right (DepGraph visited)
+      Seq.EmptyL -> pure (DepGraph visited)
       (sp, drv) Seq.:< rest
         | Map.member sp visited -> go visited rest
-        | otherwise ->
+        | otherwise -> do
             let deps = Map.keys (drvInputDrvs drv)
                 node =
                   DepNode
@@ -87,22 +91,20 @@ buildDepGraph readDrv rootDrv rootPath =
                       dnDeps = deps
                     }
                 visitedWithNode = Map.insert sp node visited
-             in case resolveNewDeps readDrv visitedWithNode deps of
-                  Left err -> Left err
-                  Right newItems -> go visitedWithNode (foldl' (|>) rest newItems)
+            newItems <- resolveNewDeps readDrv visitedWithNode deps
+            go visitedWithNode (foldl' (|>) rest newItems)
 
 -- | Resolve unvisited dependencies by reading their .drv files.
 resolveNewDeps ::
-  (StorePath -> Either Text Derivation) ->
+  (Monad m) =>
+  (StorePath -> m (Either Text Derivation)) ->
   Map StorePath DepNode ->
   [StorePath] ->
-  Either Text [(StorePath, Derivation)]
+  ExceptT Text m [(StorePath, Derivation)]
 resolveNewDeps readDrv visited = traverse resolve . filter unvisited
   where
     unvisited dep = not (Map.member dep visited)
-    resolve dep = case readDrv dep of
-      Left err -> Left err
-      Right drv -> Right (dep, drv)
+    resolve dep = (,) dep <$> ExceptT (readDrv dep)
 
 -- ---------------------------------------------------------------------------
 -- Topological sort (Kahn's algorithm)

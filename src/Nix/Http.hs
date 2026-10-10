@@ -103,9 +103,10 @@ attemptFailureMessage failure = case failure of
 -- | Run an action, passing only synchronous exceptions to the handler.
 -- Asynchronous exceptions (a Ctrl-C, a timeout) re-throw untouched: an
 -- interrupt converted into a recoverable failure would be spent as
--- retry budget, as fallthrough to the next cache, or as a local build
--- instead of aborting.  Every catch-all on the download, substitution
--- and build paths goes through this one split.
+-- retry budget, as fallthrough to the next cache, as a local build, or
+-- as a failed push instead of aborting.  Every catch-all on the
+-- download, substitution, build and push paths goes through this one
+-- split.
 catchSync :: IO a -> (SomeException -> IO a) -> IO a
 catchSync action handler = action `catch` classify
   where

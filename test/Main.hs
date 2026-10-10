@@ -10,8 +10,8 @@ import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
-import Control.Concurrent.Async (cancel, waitCatch, withAsync)
-import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throwIO, toException, try)
+import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
+import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
 import Control.Monad (filterM, unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
@@ -43,7 +43,7 @@ import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
-import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
+import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
@@ -76,7 +76,7 @@ import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), d
 import Nix.Json (Json (..), parseJson, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
-import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
+import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, pushPaths, storePathBasename, stripHashPrefix)
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
@@ -97,7 +97,7 @@ import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv
 import qualified System.Environment.Blank as Blank
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
-import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
+import System.IO (BufferMode (..), IOMode (..), hPutStrLn, hSetBuffering, stderr, stdout, withBinaryFile)
 import System.IO.Error (ioeGetErrorString, mkIOError, resourceVanishedErrorType)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
@@ -3890,6 +3890,10 @@ testDrvContext = do
 -- Tests: DependencyGraph (Phase 3, Batch 5)
 -- ---------------------------------------------------------------------------
 
+-- | 'DepGraph.buildDepGraph' over a pure .drv lookup.
+pureDepGraph :: (StorePath -> Either Text Derivation) -> Derivation -> StorePath -> Either Text DepGraph.DepGraph
+pureDepGraph readDrv rootDrv rootPath = runIdentity (DepGraph.buildDepGraph (Identity . readDrv) rootDrv rootPath)
+
 testDepGraph :: IO [Bool]
 testDepGraph = do
   putStrLn "dep-graph"
@@ -3938,11 +3942,11 @@ testDepGraph = do
         | otherwise = Left ("unknown drv: " <> spName sp)
   sequence
     [ -- Single node
-      runTest "single node graph" $ case DepGraph.buildDepGraph readSingle drvA spA of
+      runTest "single node graph" $ case pureDepGraph readSingle drvA spA of
         Right (DepGraph.DepGraph g) -> assertEqual "single-size" 1 (Map.size g)
         Left err -> Fail ("unexpected error: " <> err),
       -- Linear chain A to C: topoSort should give [C, A]
-      runTest "linear chain topo" $ case DepGraph.buildDepGraph readChain drvB spB of
+      runTest "linear chain topo" $ case pureDepGraph readChain drvB spB of
         Right graph -> case DepGraph.topoSort graph of
           DepGraph.TopoSorted order ->
             case order of
@@ -3951,7 +3955,7 @@ testDepGraph = do
           DepGraph.TopoCycle cyc -> Fail ("unexpected cycle: " <> T.pack (show cyc))
         Left err -> Fail ("graph build failed: " <> err),
       -- Diamond D to B,C; B to C: topoSort should have C first, D last
-      runTest "diamond topo" $ case DepGraph.buildDepGraph readDiamond drvD spD of
+      runTest "diamond topo" $ case pureDepGraph readDiamond drvD spD of
         Right graph -> case DepGraph.topoSort graph of
           DepGraph.TopoSorted order ->
             case order of
@@ -3960,7 +3964,7 @@ testDepGraph = do
           DepGraph.TopoCycle cyc -> Fail ("unexpected cycle: " <> T.pack (show cyc))
         Left err -> Fail ("graph build failed: " <> err),
       -- transitiveDeps
-      runTest "transitiveDeps diamond" $ case DepGraph.buildDepGraph readDiamond drvD spD of
+      runTest "transitiveDeps diamond" $ case pureDepGraph readDiamond drvD spD of
         Right graph ->
           let deps = DepGraph.transitiveDeps graph spD
            in if Set.size deps == 2 && Set.member spB deps && Set.member spC deps
@@ -3968,24 +3972,24 @@ testDepGraph = do
                 else Fail ("bad transitive deps: " <> T.pack (show deps))
         Left err -> Fail ("graph build failed: " <> err),
       -- directDeps
-      runTest "directDeps diamond" $ case DepGraph.buildDepGraph readDiamond drvD spD of
+      runTest "directDeps diamond" $ case pureDepGraph readDiamond drvD spD of
         Right graph ->
           let deps = DepGraph.directDeps graph spD
            in assertEqual "direct-count" 2 (length deps)
         Left err -> Fail ("graph build failed: " <> err),
       -- Missing .drv causes failure
-      runTest "missing drv fails" $ case DepGraph.buildDepGraph readSingle drvB spB of
+      runTest "missing drv fails" $ case pureDepGraph readSingle drvB spB of
         Left _ -> Pass
         Right _ -> Fail "expected failure for missing drv",
       -- Single node topoSort
-      runTest "single node topoSort" $ case DepGraph.buildDepGraph readSingle drvA spA of
+      runTest "single node topoSort" $ case pureDepGraph readSingle drvA spA of
         Right graph -> case DepGraph.topoSort graph of
           DepGraph.TopoSorted [x] -> assertEqual "single-topo" spA x
           other -> Fail ("unexpected topo result: " <> T.pack (show other))
         Left err -> Fail ("graph build failed: " <> err),
       -- buildDepGraph with mock for cycle detection
       -- (Cycle detection happens at topoSort level, not buildDepGraph)
-      runTest "cycle detection" $ case DepGraph.buildDepGraph readCycle drvACycle spA of
+      runTest "cycle detection" $ case pureDepGraph readCycle drvACycle spA of
         Right graph -> case DepGraph.topoSort graph of
           DepGraph.TopoCycle _ -> Pass
           -- A "sorted" cyclic graph means Kahn's silently dropped the
@@ -4001,7 +4005,7 @@ testDepGraph = do
       runTestM "transitiveDeps terminates on a self-loop" $ do
         outcome <-
           timeout walkWatchdogMicros $
-            evaluate $ case DepGraph.buildDepGraph readSelf drvSelf spA of
+            evaluate $ case pureDepGraph readSelf drvSelf spA of
               Left _ -> Nothing
               Right graph -> Just $! DepGraph.transitiveDeps graph spA
         pure $ case outcome of
@@ -4013,7 +4017,7 @@ testDepGraph = do
       runTestM "transitiveDeps two-node cycle excludes the root" $ do
         outcome <-
           timeout walkWatchdogMicros $
-            evaluate $ case DepGraph.buildDepGraph readCycle drvACycle spA of
+            evaluate $ case pureDepGraph readCycle drvACycle spA of
               Left _ -> Nothing
               Right graph -> Just $! DepGraph.transitiveDeps graph spA
         pure $ case outcome of
@@ -5870,7 +5874,7 @@ testBuildOrchestrator = do
               | sp == spB = Right drvBCyc
               | sp == spA = Right drvACyc
               | otherwise = Left "unknown"
-         in case DepGraph.buildDepGraph readFn drvACyc spA of
+         in case pureDepGraph readFn drvACyc spA of
               Right graph -> case DepGraph.topoSort graph of
                 DepGraph.TopoCycle _ -> Pass
                 DepGraph.TopoSorted order -> Fail ("expected cycle, got sorted: " <> T.pack (show order))
@@ -5889,7 +5893,7 @@ testBuildOrchestrator = do
                   drvEnv = Map.empty
                 }
             readFn _ = Left "not found"
-         in case DepGraph.buildDepGraph readFn drv (StorePath "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr" "root.drv") of
+         in case pureDepGraph readFn drv (StorePath "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr" "root.drv") of
               Left _ -> Pass
               Right _ -> Fail "expected failure for missing .drv",
       -- derivation with context creates populated inputDrvs.  Hashing a
@@ -14683,7 +14687,8 @@ runSuite = do
           testEvalPolicyIO,
           testEvalPolicyCLI,
           testResultPrinterCLI,
-          testConfigBytesCLI
+          testConfigBytesCLI,
+          testInterruptsPropagate
         ]
   let total = length results
       passed = length (filter id results)
@@ -15265,3 +15270,150 @@ testConfigBytesCLI = do
           "pure-eval = true\xC2\xA0\n"
           (`expectRefusal` "Boolean setting 'pure-eval' has invalid value")
       ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: an interrupt stops the operation it reaches (#251)
+-- ---------------------------------------------------------------------------
+
+-- | How long 'interruptedAfterStall' lets an action run before
+-- interrupting it: far longer than any of these actions takes to reach
+-- the read it stalls in.
+stallMicros :: Int
+stallMicros = 200000
+
+-- | Run an action in a thread of its own, deliver a user interrupt to it
+-- once it has had time to stall, and report how it ended: @Left@ the
+-- exception that stopped it, or @Right@ the value it returned instead.
+interruptedAfterStall :: IO a -> IO (Either SomeException a)
+interruptedAfterStall action =
+  withAsync action $ \running -> do
+    threadDelay stallMicros
+    throwTo (asyncThreadId running) UserInterrupt
+    waitCatch running
+
+-- | Pass when the interrupt is what stopped the action.
+interruptPropagated :: (Show a) => Either SomeException a -> TestResult
+interruptPropagated outcome = case outcome of
+  Left err
+    | fromException err == Just UserInterrupt -> Pass
+    | otherwise -> Fail ("stopped by another exception: " <> T.pack (show err))
+  Right value -> Fail ("the interrupt became a value: " <> T.pack (show value))
+
+-- | Run an action while a FIFO sits at the path with a writer that never
+-- writes, so a read of the path blocks until something interrupts the
+-- reader.  A FIFO with no writer at all reads as empty at once, because
+-- GHC opens a file non-blocking.
+withStalledFifo :: FilePath -> IO a -> IO a
+withStalledFifo path action =
+  bracket_ (Proc.callProcess "mkfifo" [path]) (Dir.removePathForcibly path) $
+    withBinaryFile path ReadWriteMode (const action)
+
+-- | Each of these operations caught every exception and turned an
+-- interrupt into its fallback value: an unreadable file, a cache miss, a
+-- failed push.  An interrupt now stops it.  A file read is made to stall
+-- on a FIFO ('withStalledFifo') and interrupted there from another
+-- thread, so those cases need POSIX; the request a push makes stalls on
+-- the loopback fixture on every platform.  A fetch cache write never
+-- blocks, so its interrupt is raised from inside the write.  The removal
+-- behind a build's cleanup neither blocks nor forces anything the caller
+-- supplies, so no case reaches it.
+testInterruptsPropagate :: IO [Bool]
+testInterruptsPropagate = do
+  putStrLn "exceptions/interrupts-propagate"
+  tmpBase <- getTemporaryDirectory
+  let root = tmpBase </> "nova-nix-test-interrupts"
+      storeDir = StoreDir (root </> "store")
+      cacheHome = root </> "cache"
+      inStore = storePathToFilePath storeDir
+      pushTo base = PushConfig {pcCacheUrl = base, pcApiKey = Nothing, pcCompression = PushNone}
+      plainDrv =
+        Derivation
+          { drvOutputs = [],
+            drvInputDrvs = Map.empty,
+            drvInputSrcs = [],
+            drvPlatform = currentPlatform,
+            drvBuilder = builtinUnpackBuilder,
+            drvArgs = [],
+            drvEnv = Map.empty
+          }
+      unpacking archive = plainDrv {drvEnv = Map.singleton envSrcs (TE.encodeUtf8 (storePathToText defaultStoreDir archive))}
+      withCacheHome =
+        bracket
+          (lookupEnv "XDG_CACHE_HOME" <* setEnv "XDG_CACHE_HOME" cacheHome)
+          (maybe (unsetEnv "XDG_CACHE_HOME") (setEnv "XDG_CACHE_HOME"))
+          . const
+      fifoCase name test
+        | SI.os == "mingw32" = True <$ putStrLn ("  SKIP  " ++ T.unpack name ++ ": needs a FIFO")
+        | otherwise = runTestM name test
+  forceRemoveIfExists root
+  createDirectoryIfMissing True (unStoreDir storeDir)
+  results <- bracket (openStore storeDir) closeStore $ \store ->
+    sequence
+      [ runTestM "an interrupt during a push request stops the push" $
+          withHttpServer (\_ _ -> Trickle) $ \base _ requested -> do
+            outcome <- withAsync (pushPaths (pushTo base) store [StorePath (T.replicate 32 "a") "pushed"]) $ \pushing -> do
+              requested
+              throwTo (asyncThreadId pushing) UserInterrupt
+              waitCatch pushing
+            pure (interruptPropagated outcome),
+        fifoCase "an interrupt serialising a path for a push stops the push" $
+          withHttpServer (\_ _ -> Send (httpResponse "200 OK" "")) $ \base _ _ -> do
+            let sp = StorePath (T.replicate 32 "b") "stalled-output"
+            outcome <- withStalledFifo (inStore sp) (interruptedAfterStall (pushPaths (pushTo base) store [sp]))
+            pure (interruptPropagated outcome),
+        fifoCase "an interrupt reading the API key file is not an unreadable key" $ do
+          let keyFile = root </> "stalled-key"
+          outcome <- withStalledFifo keyFile (interruptedAfterStall (loadApiKeyFile keyFile))
+          pure (interruptPropagated outcome),
+        fifoCase "an interrupt verifying a source tree on disk is not a mismatch" $ do
+          let sp = StorePath (T.replicate 32 "c") "stalled-source"
+              sources = Map.singleton (T.pack (root </> "absent-source")) (storePathToText defaultStoreDir sp)
+          outcome <- withStalledFifo (inStore sp) (interruptedAfterStall (materializeEvalSources store sources))
+          pure (interruptPropagated outcome),
+        fifoCase "an interrupt reading a store derivation is not a missing one" $ do
+          st <- newEvalState storeDir root
+          let sp = StorePath (T.replicate 32 "d") "stalled.drv"
+          outcome <- withStalledFifo (inStore sp) (interruptedAfterStall (runEvalIO st (readStoreDerivation sp)))
+          pure (interruptPropagated outcome),
+        -- The entry's path is the cache's layout: one file per key, named
+        -- by the key's SHA-256 (fetchCacheFile).
+        fifoCase "an interrupt reading the fetch cache is not a cache miss" $
+          withCacheHome $ do
+            st <- newEvalState storeDir root
+            let key = "stalled-entry"
+                entry = cacheHome </> "nova-nix" </> "fetch" </> T.unpack (Hash.bytesToHexText (sha256Digest (TE.encodeUtf8 key)))
+            createDirectoryIfMissing True (takeDirectory entry)
+            outcome <- withStalledFifo entry (interruptedAfterStall (runEvalIO st (lookupFetchCache key)))
+            pure (interruptPropagated outcome),
+        -- The entry's text is the interrupt, raised when the write forces it.
+        runTestM "an interrupt writing the fetch cache is not an unwritable cache" $
+          withCacheHome $ do
+            st <- newEvalState storeDir root
+            outcome <- try (runEvalIO st (writeFetchCache "interrupted-entry" (throw UserInterrupt)))
+            pure (interruptPropagated outcome),
+        fifoCase "an interrupt unpacking an archive is not a failed unpack" $ do
+          let archive = StorePath (T.replicate 32 "f") "stalled.tar"
+          outcome <- withStalledFifo (inStore archive) (interruptedAfterStall (runBuiltinUnpack storeDir defaultUnpackLimits (unpacking archive) [("out", root </> "stalled-out")]))
+          pure (interruptPropagated outcome),
+        fifoCase "an interrupt reading an input derivation is not an unreadable one" $ do
+          let input = StorePath (T.replicate 32 "g") "stalled-input.drv"
+              rootDrv = plainDrv {drvInputDrvs = Map.singleton input ["out"]}
+              config = (defaultBuildConfig storeDir) {bcTmpDir = root </> "build"}
+          outcome <- withStalledFifo (inStore input) (interruptedAfterStall (buildWithDeps config store rootDrv (StorePath (T.replicate 32 "h") "root.drv")))
+          pure (interruptPropagated outcome),
+        -- The failures the unpacker does catch: the zstd decoder reports a
+        -- corrupt frame with 'error', and a missing archive is an
+        -- IOException.  Each is the archive's failure, not an escape.
+        runTestM "a corrupt zstd archive and a missing one fail the unpack" $ do
+          let corrupt = StorePath (T.replicate 32 "i") "corrupt.tar.zst"
+              missing = StorePath (T.replicate 32 "j") "missing.tar"
+          BS.writeFile (inStore corrupt) "not a zstd frame"
+          corruptOutcome <- runBuiltinUnpack storeDir defaultUnpackLimits (unpacking corrupt) [("out", root </> "corrupt-out")]
+          missingOutcome <- runBuiltinUnpack storeDir defaultUnpackLimits (unpacking missing) [("out", root </> "missing-out")]
+          pure $ case (corruptOutcome, missingOutcome) of
+            (Left (1, corruptMsg), Left (1, missingMsg))
+              | "corrupt.tar.zst" `T.isInfixOf` corruptMsg && "missing.tar" `T.isInfixOf` missingMsg -> Pass
+            other -> Fail ("expected both unpacks to fail: " <> T.pack (show other))
+      ]
+  forceRemoveIfExists root
+  pure results

@@ -55,7 +55,7 @@ where
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as Zstd
-import Control.Exception (SomeException, try)
+import Control.Exception (ErrorCall, Handler (..), IOException, catches)
 import Control.Monad (when)
 import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
@@ -214,16 +214,20 @@ unpackAll outDir budget (archive : rest) = do
 -- | Unpack one archive into @outDir@, returning the budget left for the
 -- archives after it.  The decompressor is chosen by file extension; the
 -- tar stream is decoded (GNU + pax long names) and extracted entry by
--- entry.  Decompression errors surface lazily mid-stream, so the whole
--- extraction is exception-wrapped into a clean failure.
+-- entry.  The archive is read lazily and decoded as the entries are
+-- forced, so a failure surfaces mid-extraction as one of two exceptions,
+-- and the whole extraction is wrapped to turn either into a clean
+-- failure: an 'IOException' reading the archive or writing the tree, or
+-- the 'ErrorCall' the zstd decoder raises for a corrupt frame (its lazy
+-- API reports every decoding error with 'error').
 unpackArchive :: FilePath -> UnpackLimits -> FilePath -> IO (Either Text UnpackLimits)
-unpackArchive outDir budget archivePath = do
-  attempt <- try run
-  pure $ case attempt of
-    Left (e :: SomeException) ->
-      Left (T.pack archivePath <> ": " <> T.pack (show e))
-    Right result -> result
+unpackArchive outDir budget archivePath =
+  run
+    `catches` [ Handler (\(e :: IOException) -> failed e),
+                Handler (\(e :: ErrorCall) -> failed e)
+              ]
   where
+    failed e = pure (Left (T.pack archivePath <> ": " <> T.pack (show e)))
     run = case decoderFor archivePath of
       Nothing -> pure (Left ("unsupported archive format: " <> T.pack archivePath))
       Just decoder -> do

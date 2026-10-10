@@ -85,7 +85,7 @@ module Nix.Store
   )
 where
 
-import Control.Exception (IOException, SomeException, bracket, catch, onException, throwIO, try, tryJust)
+import Control.Exception (IOException, bracket, catch, onException, throwIO, try, tryJust)
 import Control.Monad (guard, join, unless, when)
 import Data.Bool (bool)
 import qualified Data.ByteString as BS
@@ -1200,7 +1200,7 @@ adoptedTreeMatches :: CaseSensitivity -> FilePath -> StorePath -> IO Bool
 adoptedTreeMatches sensitivity dest sp = do
   result <- try (ExecBit.serialiseFromPath (volumeCaseHack sensitivity) dest)
   pure $ case result of
-    Left (_ :: SomeException) -> False
+    Left (_ :: IOException) -> False
     Right entry -> recursiveDigestNames sp (NAR.narHash entry)
 
 -- | Recursively copy a file or directory tree to a destination path.
