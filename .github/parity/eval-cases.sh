@@ -126,6 +126,11 @@ check "division by a float, and integer division truncating toward zero" '[ (1 /
 check "a list comparison passes over equal elements of an unordered type" '[ ([ { } ] < [ { } ]) ([ { } 1 ] < [ { } 2 ]) ]'
 echo
 
+echo "== what fromJSON reads =="
+check "every escape JSON defines" 'builtins.toJSON (builtins.fromJSON "\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u00e9\\ud83d\\ude00\"")'
+check "numbers at nlohmann's integer bounds" 'builtins.fromJSON "[ -0, 1E2, -9223372036854775808, 18446744073709551615, 18446744073709551616, 1.5e-3 ]"'
+echo
+
 echo "== whitespace an indented string strips =="
 check "blank line then a spaces-only line" 'import ./ind-blank-then-spaces.nix'
 check "spaces-only line" 'import ./ind-spaces-only.nix'

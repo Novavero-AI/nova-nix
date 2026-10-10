@@ -201,7 +201,7 @@ import Nix.Expr.Types
     UnaryOp (..),
   )
 import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
-import Nix.Json (Json (..), renderJson)
+import Nix.Json (Json (..), parseJson, renderJson)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathNameErrorText, storePathNameReasonText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
@@ -2954,72 +2954,17 @@ valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a fun
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VCompiledRegex _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 
+-- | Upstream reads the string with nlohmann's parser (json-to-value.cc at
+-- 2.24.9), which is what 'parseJson' implements for the builder's
+-- @__json@: strict RFC 8259, so a trailing comma, a raw control
+-- character or a lone surrogate is refused.
 builtinFromJSON :: (MonadEval m) => NixValue -> m NixValue
 builtinFromJSON (VStr s _) = do
   -- JSON input must be valid UTF-8 (upstream's parser rejects it too).
   decoded <- decodedText "builtins.fromJSON" s
-  case parseJSON (T.strip decoded) of
-    Just (val, rest)
-      | T.null (T.strip rest) -> pure val
-      | otherwise -> throwEvalError "builtins.fromJSON: trailing content after JSON value"
-    Nothing -> throwEvalError "builtins.fromJSON: invalid JSON"
+  either throwEvalError (pure . jsonToValue) (parseJson decoded)
 builtinFromJSON other =
   throwEvalError ("builtins.fromJSON: expected a string, got " <> typeName other)
-
-parseJSON :: Text -> Maybe (NixValue, Text)
-parseJSON t = case T.uncons (T.stripStart t) of
-  Nothing -> Nothing
-  Just ('n', rest)
-    | Just suffix <- T.stripPrefix "ull" rest -> Just (VNull, suffix)
-  Just ('t', rest)
-    | Just suffix <- T.stripPrefix "rue" rest -> Just (VBool True, suffix)
-  Just ('f', rest)
-    | Just suffix <- T.stripPrefix "alse" rest -> Just (VBool False, suffix)
-  Just ('"', _) -> parseJSONString (T.stripStart t)
-  Just ('[', rest) -> parseJSONArray rest
-  Just ('{', rest) -> parseJSONObject rest
-  Just (c, _)
-    | c == '-' || isDigit c -> parseJSONNumber (T.stripStart t)
-  _ -> Nothing
-
-parseJSONString :: Text -> Maybe (NixValue, Text)
-parseJSONString t = case T.uncons t of
-  Just ('"', rest) ->
-    let (strVal, remaining) = parseJSONStringContent rest
-     in Just (mkStr strVal, remaining)
-  _ -> Nothing
-
--- | Parse JSON string content, O(n) via chunk list + T.concat.
-parseJSONStringContent :: Text -> (Text, Text)
-parseJSONStringContent = go []
-  where
-    go !chunks t = case T.uncons t of
-      Nothing -> (T.concat (reverse chunks), "")
-      Just ('"', rest) -> (T.concat (reverse chunks), rest)
-      Just ('\\', rest) -> case T.uncons rest of
-        Just ('"', r) -> go ("\"" : chunks) r
-        Just ('\\', r) -> go ("\\" : chunks) r
-        Just ('/', r) -> go ("/" : chunks) r
-        Just ('n', r) -> go ("\n" : chunks) r
-        Just ('r', r) -> go ("\r" : chunks) r
-        Just ('t', r) -> go ("\t" : chunks) r
-        Just ('u', r) -> case parseHex4 r of
-          Just (hi, r2)
-            -- UTF-16 surrogate pair: high surrogate followed by \uXXXX low
-            | hi >= 0xD800 && hi <= 0xDBFF ->
-                case T.stripPrefix "\\u" r2 of
-                  Just r3 -> case parseHex4 r3 of
-                    Just (lo, r4)
-                      | lo >= 0xDC00 && lo <= 0xDFFF ->
-                          let combined = 0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)
-                           in go (T.singleton (chr combined) : chunks) r4
-                    _ -> go (T.singleton (chr hi) : chunks) r2
-                  Nothing -> go (T.singleton (chr hi) : chunks) r2
-          Just (codepoint, r2) ->
-            go (T.singleton (chr codepoint) : chunks) r2
-          Nothing -> go ("u" : chunks) r
-        _ -> (T.concat (reverse chunks), rest)
-      Just (c, rest) -> go (T.singleton c : chunks) rest
 
 parseHex4 :: Text -> Maybe (Int, Text)
 parseHex4 t
@@ -3033,20 +2978,6 @@ parseHex4 t
 readHex4 :: Text -> Int
 readHex4 = T.foldl' (\acc c -> acc * 16 + digitToInt c) 0
 
-parseJSONNumber :: Text -> Maybe (NixValue, Text)
-parseJSONNumber t =
-  let (numStr, rest) = T.span (\c -> isDigit c || c == '.' || c == '-' || c == 'e' || c == 'E' || c == '+') t
-   in if T.null numStr
-        then Nothing
-        else
-          if T.any (\c -> c == '.' || c == 'e' || c == 'E') numStr
-            then case reads (T.unpack numStr) :: [(Double, String)] of
-              [(d, "")] -> Just (VFloat d, rest)
-              _ -> Nothing
-            else case reads (T.unpack numStr) :: [(Integer, String)] of
-              [(n, "")] -> Just (jsonInteger n, rest)
-              _ -> Nothing
-
 -- | Nix value for a JSON integer literal, as upstream's nlohmann-based
 -- parser produces it: a value in int64 range is an int; a positive value
 -- that fits only uint64 still arrives as an int (nlohmann hands it over
@@ -3057,43 +2988,15 @@ jsonInteger n
   | n >= toInteger (minBound :: Int64) && n <= toInteger (maxBound :: Word64) = VInt (fromInteger n)
   | otherwise = VFloat (fromInteger n)
 
-parseJSONArray :: Text -> Maybe (NixValue, Text)
-parseJSONArray t = parseJSONArrayElements (T.stripStart t) []
-
-parseJSONArrayElements :: Text -> [Thunk] -> Maybe (NixValue, Text)
-parseJSONArrayElements t acc = case T.uncons (T.stripStart t) of
-  Just (']', rest) -> Just (VList (clistFromThunks (map thunkToCPtr (reverse acc))), rest)
-  _ -> case parseJSON t of
-    Just (val, rest) ->
-      let stripped = T.stripStart rest
-       in case T.uncons stripped of
-            Just (',', rest2) -> parseJSONArrayElements rest2 (evaluated val : acc)
-            Just (']', rest2) -> Just (VList (clistFromThunks (map thunkToCPtr (reverse (evaluated val : acc)))), rest2)
-            _ -> Nothing
-    Nothing -> Nothing
-
-parseJSONObject :: Text -> Maybe (NixValue, Text)
-parseJSONObject t = parseJSONObjectEntries (T.stripStart t) Map.empty
-
-parseJSONObjectEntries :: Text -> Map Text Thunk -> Maybe (NixValue, Text)
-parseJSONObjectEntries t acc = case T.uncons (T.stripStart t) of
-  Just ('}', rest) -> Just (VAttrs (attrSetFromMap acc), rest)
-  -- Keys read via 'parseJSONStringContent' directly: they become attr
-  -- names (Text), not string values.
-  Just ('"', afterQuote) ->
-    let (key, rest) = parseJSONStringContent afterQuote
-     in case T.uncons (T.stripStart rest) of
-          Just (':', rest2) -> case parseJSON rest2 of
-            Just (val, rest3) ->
-              let stripped = T.stripStart rest3
-                  updated = Map.insert key (evaluated val) acc
-               in case T.uncons stripped of
-                    Just (',', rest4) -> parseJSONObjectEntries rest4 updated
-                    Just ('}', rest4) -> Just (VAttrs (attrSetFromMap updated), rest4)
-                    _ -> Nothing
-            Nothing -> Nothing
-          _ -> Nothing
-  _ -> Nothing
+jsonToValue :: Json -> NixValue
+jsonToValue json = case json of
+  JsonNull -> VNull
+  JsonBool b -> VBool b
+  JsonInt n -> jsonInteger n
+  JsonFloat d -> VFloat d
+  JsonString str -> mkStr str
+  JsonArray items -> VList (clistFromThunks (map (thunkToCPtr . evaluated . jsonToValue) items))
+  JsonObject members -> VAttrs (attrSetFromMap (Map.map (evaluated . jsonToValue) members))
 
 builtinHashString :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHashString (VStr algo _) (VStr input _) = do
