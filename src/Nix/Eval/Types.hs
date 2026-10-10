@@ -663,17 +663,20 @@ mkThunk :: Env -> Expr -> Thunk
 mkThunk env thunkExpr =
   Thunk (newBcThunkPtr thunkExpr env)
 
--- | Like 'mkThunk' but for synthetic thunks that reuse the same 'Expr'
--- (e.g. @EApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in 'deferApply').
--- Uses the env pointer for cell uniqueness instead of the expression,
--- since GHC's full-laziness transform would otherwise float the shared
--- expr to a CAF and all thunks would get the same cell.
+-- | A pending thunk running code that many thunks share, each in an env
+-- of its own, such as 'Nix.Eval.CBytecode.reservedApply1' for
+-- 'Nix.Eval.deferApply'.  It takes the index rather than an 'Expr'
+-- because compiling per thunk adds a copy of the same code to a store
+-- that only grows until 'Nix.Eval.Arena.arenaDestroy'.  Uses the env
+-- pointer for cell uniqueness instead of the index, which every such
+-- thunk shares: keyed on a shared value, GHC's full-laziness transform
+-- could float the allocation to a CAF and give every thunk one cell.
 --
 -- Must only be called with freshly-constructed envs (not knot-tied
 -- recursive envs), since it forces the env pointer to WHNF.
-mkSyntheticThunk :: Env -> Expr -> Thunk
-mkSyntheticThunk env@(Env envPtr) thunkExpr =
-  Thunk (newSyntheticBcThunkPtr envPtr thunkExpr env)
+mkSyntheticThunk :: Env -> Word32 -> Thunk
+mkSyntheticThunk env@(Env envPtr) bcIdx =
+  Thunk (newSyntheticBcThunkPtr envPtr bcIdx env)
 
 -- | Like 'mkThunk' but avoids C arena allocation for trivial expressions.
 -- Resolved variables reuse the existing thunk from the env (no wrapper).
@@ -817,14 +820,12 @@ newBcThunkPtr expr env =
     sp <- newStablePtr env
     cthunkNewBc bcIdx (castStablePtrToPtr sp)
 
--- | Like 'newBcThunkPtr' but keyed on the env's C pointer instead
--- of the expression.  Used by 'mkSyntheticThunk' where multiple thunks
--- share the same expression (e.g. 'deferApplyExpr').
+-- | Like 'newBcThunkPtrLazy' but forces the env's C pointer first, for
+-- 'mkSyntheticThunk'.
 {-# NOINLINE newSyntheticBcThunkPtr #-}
-newSyntheticBcThunkPtr :: Ptr NnEnv -> Expr -> Env -> CThunkPtr
-newSyntheticBcThunkPtr envKey expr env =
+newSyntheticBcThunkPtr :: Ptr NnEnv -> Word32 -> Env -> CThunkPtr
+newSyntheticBcThunkPtr envKey bcIdx env =
   unsafePerformIO $ envKey `seq` do
-    bcIdx <- compileExpr expr
     sp <- newStablePtr env
     cthunkNewBc bcIdx (castStablePtrToPtr sp)
 

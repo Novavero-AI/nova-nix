@@ -120,12 +120,12 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
-import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, reservedApply1, reservedApply2, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
-import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
+import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, evalUpdate, nixCompare, nixEqual)
 import Nix.Eval.Policy (isAbsolutePath)
@@ -179,7 +179,6 @@ import Nix.Eval.Types
     mkStr,
     mkStrBytes,
     mkSyntheticThunk,
-    mkThunk,
     mkThunkBc,
     newCEnv,
     newMinimalEnv,
@@ -193,11 +192,9 @@ import Nix.Eval.Types
   )
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types
-  ( AttrKey (..),
-    BinaryOp (..),
+  ( BinaryOp (..),
     CaptureInfo (..),
     Expr (..),
-    NixAtom (..),
     UnaryOp (..),
   )
 import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
@@ -887,7 +884,7 @@ bcBindingSlotCount = foldl' countOne 0
   where
     countOne !acc (BcNamed [BcStaticKey _] _) = acc + 1
     countOne !acc (BcInherit _ _) = acc + 1
-    countOne !acc (BcInheritFrom _ syms) = acc + length syms
+    countOne !acc (BcInheritFrom _ names) = acc + length names
     countOne !acc _ = acc
 
 -- | Build thunks for positional bytecode bindings in declaration order.
@@ -902,17 +899,15 @@ buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
       [mkThunkBc recEnv valBcIdx]
     slotThunk (BcInherit _ valBcIdx) =
       [cheapThunkBc outerEnv valBcIdx]
-    slotThunk (BcInheritFrom fromBcIdx syms) =
+    slotThunk (BcInheritFrom fromBcIdx names) =
       -- inherit (from) x y z; becomes one thunk per name that selects from the from-expr.
       -- Each thunk gets a minimal env with the from-value at slot 0.
       let fromThunk = mkThunkBc recEnv fromBcIdx
-          mkInheritThunk sym =
-            let name = symbolText (Symbol sym)
-                selectExpr = ESelect (EResolvedVar 0 0) [StaticKey name] Nothing
-                (sp, sc) = buildCSlots [fromThunk]
+          mkInheritThunk (BcInheritedName _ selectBcIdx) =
+            let (sp, sc) = buildCSlots [fromThunk]
                 fromEnv = newMinimalEnv sp sc
-             in mkSyntheticThunk fromEnv selectExpr
-       in map mkInheritThunk syms
+             in mkSyntheticThunk fromEnv selectBcIdx
+       in map mkInheritThunk names
     -- Unreachable: allBcPositional guards this path.
     slotThunk _ = []
 
@@ -925,9 +920,9 @@ buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
       go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
     go (BcInherit sym _ : bs) (t : ts) !acc =
       go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
-    go (BcInheritFrom _ syms : bs) ts !acc =
-      let (used, rest) = splitAt (length syms) ts
-          accMerged = foldl' (\a (sym, t0) -> Map.insert (symbolText (Symbol sym)) t0 a) acc (zip syms used)
+    go (BcInheritFrom _ names : bs) ts !acc =
+      let (used, rest) = splitAt (length names) ts
+          accMerged = foldl' (\a (name, t0) -> Map.insert (inheritedNameText name) t0 a) acc (zip names used)
        in go bs rest accMerged
     -- Unreachable: allBcPositional guards this path.
     go (_ : bs) ts !acc = go bs ts acc
@@ -955,17 +950,15 @@ buildBcThunkMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
            in foldM (\a (k, t0) -> insertChecked a k t0) acc (Map.toList nested)
     addBinding acc (BcInherit sym valBcIdx) =
       insertChecked acc (symbolText (Symbol sym)) (cheapThunkBc outerEnv valBcIdx)
-    addBinding acc (BcInheritFrom fromBcIdx syms) =
+    addBinding acc (BcInheritFrom fromBcIdx names) =
       -- inherit (from) name selects name from the from-expr.
-      -- Create a small env with the from value at slot 0, then a
-      -- synthetic expression that selects name from slot 0.
-      let addInheritFrom a sym =
-            let name = symbolText (Symbol sym)
-                selectExpr = ESelect (EResolvedVar 0 0) [StaticKey name] Nothing
-                (sp, sc) = buildCSlots [mkThunkBc thunkEnv fromBcIdx]
+      -- Create a small env with the from value at slot 0, then run the
+      -- select the compiler made for name against it.
+      let addInheritFrom a inherited@(BcInheritedName _ selectBcIdx) =
+            let (sp, sc) = buildCSlots [mkThunkBc thunkEnv fromBcIdx]
                 fromEnv = newMinimalEnv sp sc
-             in insertChecked a name (mkSyntheticThunk fromEnv selectExpr)
-       in foldM addInheritFrom acc syms
+             in insertChecked a (inheritedNameText inherited) (mkSyntheticThunk fromEnv selectBcIdx)
+       in foldM addInheritFrom acc names
 
     -- The parser normalizes static keys to appear exactly once, so a
     -- collision here means an evaluated DYNAMIC key hit an existing
@@ -1004,7 +997,11 @@ bcBindingStaticKeys = concatMap oneBinding
     oneBinding (BcNamed (BcStaticKey sym : _) _) = [symbolText (Symbol sym)]
     oneBinding (BcNamed _ _) = []
     oneBinding (BcInherit sym _) = [symbolText (Symbol sym)]
-    oneBinding (BcInheritFrom _ syms) = map (symbolText . Symbol) syms
+    oneBinding (BcInheritFrom _ names) = map inheritedNameText names
+
+-- | The attribute name an @inherit (from)@ binds.
+inheritedNameText :: BcInheritedName -> Text
+inheritedNameText (BcInheritedName sym _) = symbolText (Symbol sym)
 
 -- | True when a binding's top-level key is known statically (a static key or an
 -- inherit).  These bindings populate the rec env's name table (C++ Nix's env2);
@@ -1908,12 +1905,12 @@ builtinGenList func (VInt n)
   | n < 0 = throwEvalError "builtins.genList: length must be non-negative"
   | otherwise =
       -- Lazy: each element is a deferred @f i@, forced only on demand.
-      -- Slot 0 = function.
+      -- The index is an argument value, as upstream's @prim_genList@
+      -- allocates an int and an app per element, so every element runs
+      -- the same code.
       let fnThunk = evaluated func
-          (sp, sc) = buildCSlots [fnThunk]
-          env = newMinimalEnv sp sc
-          mkIndexThunk i = mkThunk env (EDeferredApp (EResolvedVar 0 0) (ELit (NixInt i)))
-       in pure (VList (clistFromThunks (map (thunkToCPtr . mkIndexThunk) [0 .. n - 1])))
+          mkIndexThunk = thunkToCPtr . deferApplyThunk fnThunk . evaluated . VInt
+       in pure (VList (clistFromThunks (map mkIndexThunk [0 .. n - 1])))
 builtinGenList _ other =
   throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
 
@@ -2156,19 +2153,20 @@ builtinSubstring _ _ other =
 -- ---------------------------------------------------------------------------
 
 -- | Build a thunk that defers @f arg@ - the application only happens when
--- the thunk is forced.  Reuses the existing eval machinery via a synthetic
--- @EDeferredApp (EResolvedVar 0 0) (EResolvedVar 0 1)@ in a self-contained
--- env, upstream's @mkApp@.  Slot 0 = function, slot 1 = argument.
+-- the thunk is forced.  Runs the reserved 'reservedApply1' in a
+-- self-contained env, upstream's @mkApp@.  Slot 0 = function, slot 1 =
+-- argument.
 deferApply :: NixValue -> Thunk -> Thunk
-deferApply func argThunk =
-  let (sp, sc) = buildCSlots [evaluated func, argThunk]
-      env = newMinimalEnv sp sc
-   in mkSyntheticThunk env deferApplyExpr
+deferApply func = deferApplyThunk (evaluated func)
 
--- | Shared expression for 'deferApply'.  Allocated once as a CAF.
-deferApplyExpr :: Expr
-deferApplyExpr = EDeferredApp (EResolvedVar 0 0) (EResolvedVar 0 1)
-{-# NOINLINE deferApplyExpr #-}
+-- | 'deferApply' with the function already a thunk, so a builtin that
+-- makes one application per element shares one function thunk across
+-- them, as upstream's primops share @args[0]@.
+deferApplyThunk :: Thunk -> Thunk -> Thunk
+deferApplyThunk fnThunk argThunk =
+  let (sp, sc) = buildCSlots [fnThunk, argThunk]
+      env = newMinimalEnv sp sc
+   in mkSyntheticThunk env reservedApply1
 
 -- | Permissive coercion used by @builtins.toString@.
 --
@@ -2576,20 +2574,13 @@ builtinMapAttrs func (VAttrs attrs) =
   -- Slot 0 = function, slot 1 = key, slot 2 = value.
   pure (VAttrs (attrSetMapWithKey deferAttr attrs))
   where
+    fnThunk = evaluated func
     deferAttr key valThunk =
-      let (sp, sc) = buildCSlots [evaluated func, evaluated (mkStr key), valThunk]
+      let (sp, sc) = buildCSlots [fnThunk, evaluated (mkStr key), valThunk]
           env = newMinimalEnv sp sc
-       in mkSyntheticThunk env mapAttrsExpr
+       in mkSyntheticThunk env reservedApply2
 builtinMapAttrs _ other =
   throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
-
--- | Shared expression for 'builtinMapAttrs' and 'builtinZipAttrsWith'.
--- Allocated once as a CAF.  Two nested deferred applications, as upstream
--- builds @f name value@ from two nested @mkApp@s, so the name application
--- runs a frame below the value application's.
-mapAttrsExpr :: Expr
-mapAttrsExpr = EDeferredApp (EDeferredApp (EResolvedVar 0 0) (EResolvedVar 0 1)) (EResolvedVar 0 2)
-{-# NOINLINE mapAttrsExpr #-}
 
 -- | Formals for lambdas, an empty set for builtins, an error otherwise -
 -- including functor sets: upstream's primop never consults
@@ -2620,7 +2611,7 @@ builtinZipAttrsWith func (VList cl) = do
       -- evaluated.  Critical for nixpkgs evalModules fixpoint - config is a
       -- self-referencing lazy attrset that must be COMPUTED (holding the lazy
       -- result) before any individual attribute thunks are forced.
-      resultPairs = map (deferZip func) (Map.toList merged)
+      resultPairs = map (deferZip (evaluated func)) (Map.toList merged)
   pure (VAttrs (attrSetFromMap (Map.fromList resultPairs)))
   where
     forceToAttrSet thunk = do
@@ -2630,11 +2621,11 @@ builtinZipAttrsWith func (VList cl) = do
         _ -> throwEvalError "builtins.zipAttrsWith: list element must be a set"
     mergeAllAttrs = foldl' (\acc m -> Map.unionWith (++) acc (Map.map (: []) m)) Map.empty
     -- Slot 0 = function, slot 1 = name, slot 2 = values list.
-    deferZip fn (key, thunkList) =
+    deferZip fnThunk (key, thunkList) =
       let valueList = VList (clistFromThunks (map thunkToCPtr thunkList))
-          (slots, slotCount) = buildCSlots [evaluated fn, evaluated (mkStr key), evaluated valueList]
+          (slots, slotCount) = buildCSlots [fnThunk, evaluated (mkStr key), evaluated valueList]
           env = newMinimalEnv slots slotCount
-       in (key, mkSyntheticThunk env mapAttrsExpr)
+       in (key, mkSyntheticThunk env reservedApply2)
 builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
 
