@@ -425,7 +425,12 @@ instance MonadEval EvalIO where
           Left err -> throwEvalError (copyContext <> ": " <> SP.storePathNameErrorText err)
           Right () -> pure ()
         accessPath rawPath
-        resolvedSource <- evalStoreTextPath rawPath
+        -- The tree behind the path's symlinks, under the path's own name:
+        -- upstream's copyPathToStore stores path.resolveSymlinks() under
+        -- path.baseName() (eval.cc:2393 at 2.24.9), so a path that is a
+        -- link copies what it points to, not the link.
+        resolvedText <- resolveSymlinks rawPath
+        resolvedSource <- evalStoreTextPath resolvedText
         -- A path already in the store never reaches here (it coerces to
         -- itself), so this is a source, read as the build driver's
         -- restore reads it again.
