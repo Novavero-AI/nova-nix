@@ -11,7 +11,7 @@ import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (cancel, waitCatch, withAsync)
-import Control.Exception (ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, displayException, evaluate, finally, fromException, throwIO, toException, try)
+import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throwIO, toException, try)
 import Control.Monad (filterM, unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
@@ -30,13 +30,13 @@ import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
 import Data.Word (Word32)
 import qualified Database.SQLite.Simple as SQL
-import FetchurlFixture (withFetchurlServer)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Foreign.Storable (sizeOf)
+import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), FetchRetryPolicy (..), RetryEffects (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, defaultFetchRetryPolicy, execWrapperConfig, execWrapperFor, fetchExceptionFailure, fetchStatusFailure, fetchUrlsFromEnv, retryDelayMs, retryTransient, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, splitNixPath)
 import Nix.Config (NixConfig (..))
@@ -62,7 +62,7 @@ import Nix.Expr.Resolve (staticGlobalNames)
 import Nix.Expr.Types
 import Nix.Hash (hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
-import Nix.Http (userAgent, withUserAgent)
+import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
 import Nix.Parser (ParseError (..), parseNix)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
@@ -85,7 +85,7 @@ import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
-import System.IO.Error (ioeGetErrorString)
+import System.IO.Error (ioeGetErrorString, mkIOError, resourceVanishedErrorType)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
 import qualified System.Process as Proc
@@ -3900,12 +3900,6 @@ testSubstituter = do
           Left (Subst.TransientFailure _)
             | survived -> Fail "tree survived a truncated stream"
             | otherwise -> Pass,
-      -- Retry classification: server-side statuses retry, a 404 on an
-      -- object the narinfo just promised is deterministic.
-      runTest "httpStatusFailure classes" $
-        case (Subst.httpStatusFailure 404, Subst.httpStatusFailure 500, Subst.httpStatusFailure 429, Subst.httpStatusFailure 403) of
-          (Subst.FatalFailure _, Subst.TransientFailure _, Subst.TransientFailure _, Subst.FatalFailure _) -> Pass
-          other -> Fail ("unexpected status classes: " <> T.pack (show other)),
       -- The download cap derives from the SIGNED NarSize; the unsigned
       -- FileSize may only lower it, never raise it.
       runTest "downloadCapFor lets FileSize lower but never raise the cap" $
@@ -7647,6 +7641,30 @@ testFetchMirrors = do
               ( map transient [HTTP.status408, HTTP.status429, HTTP.status500, HTTP.status502, HTTP.status503, HTTP.status504],
                 map transient [HTTP.status404, HTTP.status410, HTTP.status401, HTTP.status403, HTTP.status407, HTTP.status400, HTTP.status418, HTTP.status501, HTTP.status505, HTTP.status511]
               ),
+      runTest "status verdicts follow upstream's FileTransfer::Error, in its order" $
+        assertEqual
+          "verdicts"
+          (replicate 2 NotFound ++ replicate 3 Forbidden ++ replicate 5 Misc ++ replicate 6 Transient)
+          ( map
+              statusError
+              [ HTTP.status404,
+                HTTP.status410,
+                HTTP.status401,
+                HTTP.status403,
+                HTTP.status407,
+                HTTP.status400,
+                HTTP.status418,
+                HTTP.status501,
+                HTTP.status505,
+                HTTP.status511,
+                HTTP.status408,
+                HTTP.status429,
+                HTTP.status500,
+                HTTP.status502,
+                HTTP.status503,
+                HTTP.status504
+              ]
+          ),
       runTest "exception classification retries transport failures only" $
         let transient err = case fetchExceptionFailure "u" err of
               Subst.TransientFailure _ -> True
@@ -7654,22 +7672,53 @@ testFetchMirrors = do
             request = HTTP.defaultRequest
          in assertEqual
               "classes"
-              (replicate 3 True, replicate 5 False)
+              (replicate 4 True, replicate 4 False)
               ( map
                   transient
-                  [ toException (HTTP.HttpExceptionRequest request HTTP.ConnectionTimeout),
-                    toException (HTTP.HttpExceptionRequest request (HTTP.ResponseBodyTooShort 100 5)),
-                    toException (HTTP.HttpExceptionRequest request HTTP.ResponseTimeout)
+                  [ HTTP.HttpExceptionRequest request HTTP.ConnectionTimeout,
+                    HTTP.HttpExceptionRequest request (HTTP.ResponseBodyTooShort 100 5),
+                    HTTP.HttpExceptionRequest request HTTP.ResponseTimeout,
+                    HTTP.HttpExceptionRequest request (HTTP.InternalException (toException connectionReset))
                   ],
                 map
                   transient
-                  [ toException (HTTP.InvalidUrlException "ftp://x" "Invalid scheme"),
-                    toException (HTTP.HttpExceptionRequest request (HTTP.InvalidDestinationHost "")),
-                    toException (HTTP.HttpExceptionRequest request HTTP.TlsNotSupported),
-                    toException (HTTP.HttpExceptionRequest request (HTTP.TooManyRedirects [])),
-                    toException (userError "disk full")
+                  [ HTTP.InvalidUrlException "ftp://x" "Invalid scheme",
+                    HTTP.HttpExceptionRequest request (HTTP.InvalidDestinationHost ""),
+                    HTTP.HttpExceptionRequest request HTTP.TlsNotSupported,
+                    HTTP.HttpExceptionRequest request (HTTP.TooManyRedirects [])
                   ]
               ),
+      -- The attempt boundary: an IOException there is a failure writing
+      -- the output, and an asynchronous exception is never caught.
+      runTestM "a failure writing the download is fatal" $ do
+        outcome <- throwIO (userError "disk full") `catches` transferFailureHandlers "u" :: IO (Either Subst.AttemptFailure ())
+        pure $ case outcome of
+          Left (Subst.FatalFailure _) -> Pass
+          other -> Fail ("expected a fatal failure, got: " <> T.pack (show other)),
+      runTestM "an interrupt passes through the attempt boundary untouched" $ do
+        outcome <- try (throwIO ThreadKilled `catches` transferFailureHandlers "u" :: IO (Either Subst.AttemptFailure ()))
+        pure $ case outcome of
+          Left err | fromException err == Just ThreadKilled -> Pass
+          other -> Fail ("expected ThreadKilled to propagate, got: " <> T.pack (show other)),
+      -- The body reader: the HTTP client wraps a failure opening the
+      -- response but not one reading its body, where a reset mid-body
+      -- arrives as a bare IOException.  Read through transferBodyReader it
+      -- is a transport failure, retried like any other.
+      runTestM "a connection reset mid-body is a transport failure, not a failed write" $ do
+        let reader = transferBodyReader HTTP.defaultRequest (throwIO connectionReset)
+        outcome <- (Right <$> reader) `catches` transferFailureHandlers "u"
+        pure $ case outcome of
+          Left (Subst.TransientFailure _) -> Pass
+          other -> Fail ("expected a transient failure, got: " <> T.pack (show other)),
+      runTestM "the body reader passes the client's own failures and an interrupt through unchanged" $ do
+        let tooShort = HTTP.HttpExceptionRequest HTTP.defaultRequest (HTTP.ResponseBodyTooShort 100 5)
+        clientFailure <- try (transferBodyReader HTTP.defaultRequest (throwIO tooShort))
+        interrupt <- try (transferBodyReader HTTP.defaultRequest (throwIO ThreadKilled))
+        chunk <- transferBodyReader HTTP.defaultRequest (pure "bytes")
+        pure $ case (clientFailure, interrupt) of
+          (Left (HTTP.HttpExceptionRequest _ (HTTP.ResponseBodyTooShort 100 5)), Left ThreadKilled)
+            | chunk == "bytes" -> Pass
+          other -> Fail ("unexpected body reader outcomes: " <> T.pack (show (other, chunk))),
       -- End to end against the loopback fixture, under a policy with a 1 ms
       -- base delay: a torn transfer and a server error spend all five
       -- attempts before the next mirror; a 404 and a hash mismatch spend one.
@@ -7703,6 +7752,9 @@ testFetchMirrors = do
     ]
   where
     hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    -- What http-client 0.7's body reader raises when the server resets
+    -- the connection mid-body.
+    connectionReset = mkIOError resourceVanishedErrorType "Network.Socket.recvBuf" Nothing Nothing
     withStore label action = do
       tmpBase <- getTemporaryDirectory
       let root = tmpBase </> ("nova-nix-test-mirrors-" ++ label)
@@ -7737,6 +7789,136 @@ testFetchMirrors = do
                   assertEqual "verified output" "hello" <$> BS.readFile (storePathToFilePath (stDir store) sp)
             BuildFailure msg _ | not succeeds && not valid && not present && seen == expectedRequests && not (T.null msg) -> pure Pass
             _ -> pure (Fail (T.pack (show (result, seen, valid, present))))
+
+-- | The substituter's narinfo and NAR requests under the transfer
+-- layer's retry policy, against a loopback cache.  The policy's effects
+-- are recorded rather than slept, so each case states the requests the
+-- cache saw and the backoff the policy chose.
+testSubstituterRetry :: IO [Bool]
+testSubstituterRetry = do
+  putStrLn "substituter/retry"
+  case signedNarInfo of
+    Left err -> (: []) <$> runTest "substituter retry setup" (Fail (T.pack err))
+    Right (publicKey, narInfoText) ->
+      let narInfoOk = Send (httpResponse "200 OK" (TE.encodeUtf8 narInfoText))
+          narOk = Send (httpResponse "200 OK" nar)
+          unavailable = Send (httpResponse "503 Service Unavailable" "")
+          substitute label narInfoReply narReply =
+            withHttpServer (route narInfoReply narReply) $ \base requests _ -> do
+              tmpBase <- getTemporaryDirectory
+              sleeps <- newIORef []
+              warnings <- newIORef []
+              let root = tmpBase </> ("nova-nix-test-subst-retry-" ++ label)
+                  cache = Subst.CacheConfig base [publicKey] 40
+                  effects =
+                    RetryEffects
+                      { reSleepMs = \ms -> atomicModifyIORef' sleeps (\seen -> (seen ++ [ms], ())),
+                        reJitter = pure 0,
+                        reWarn = \msg -> atomicModifyIORef' warnings (\seen -> (seen ++ [msg], ()))
+                      }
+              bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
+                bracket (openStore (StoreDir root)) closeStore $ \store -> do
+                  result <- Subst.trySubstituteWith defaultFetchRetryPolicy effects store [cache] sp
+                  outcome <- case result of
+                    Subst.SubstSuccess _ lock -> do
+                      releasePathLock lock
+                      Right <$> BS.readFile (storePathToFilePath (stDir store) sp </> "data")
+                    other -> pure (Left other)
+                  (,,,,) base outcome <$> requests <*> readIORef sleeps <*> readIORef warnings
+       in sequence $
+            [ runTestM "a narinfo that fails once with a 503 is fetched on the retry" $ do
+                (base, outcome, seen, sleeps, warnings) <-
+                  substitute "narinfo-503" (\earlier -> if earlier == 0 then unavailable else narInfoOk) (const narOk)
+                pure
+                  ( assertEqual
+                      "substituted after one retry"
+                      (Right payload, [narInfoPath, narInfoPath, narPath], [250], ["HTTP 503 fetching " <> base <> "/" <> hash <> ".narinfo; retrying in 250 ms"])
+                      (outcome, seen, sleeps, warnings)
+                  ),
+              runTestM "a narinfo that keeps failing spends upstream's five attempts and doubling delay" $ do
+                (_, outcome, seen, sleeps, _) <- substitute "narinfo-down" (const unavailable) (const narOk)
+                pure $ case outcome of
+                  Left (Subst.SubstError _) -> assertEqual "attempts" (replicate 5 narInfoPath, [250, 500, 1000, 2000]) (seen, sleeps)
+                  other -> Fail ("expected a substitution error, got: " <> T.pack (show other)),
+              runTestM "a NAR download answering 501 stops after one request" $ do
+                (_, outcome, seen, sleeps, _) <-
+                  substitute "nar-501" (const narInfoOk) (const (Send (httpResponse "501 Not Implemented" "")))
+                pure $ case outcome of
+                  Left (Subst.SubstError err)
+                    | "HTTP 501" `T.isInfixOf` err -> assertEqual "one request" ([narInfoPath, narPath], []) (seen, sleeps)
+                  other -> Fail ("expected an HTTP 501 substitution error, got: " <> T.pack (show other)),
+              -- One attempt follows the client's redirect limit, then stops.
+              runTestM "a NAR redirect loop stops after one attempt" $ do
+                (_, outcome, seen, sleeps, _) <-
+                  substitute "nar-redirect" (const narInfoOk) (const (Send "HTTP/1.1 302 Found\r\nLocation: /nar/retry.nar\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+                pure $ case outcome of
+                  Left (Subst.SubstError err)
+                    | "too many redirects" `T.isInfixOf` err ->
+                        assertEqual "one attempt" (narInfoPath : replicate (HTTP.redirectCount HTTP.defaultRequest + 1) narPath, []) (seen, sleeps)
+                  other -> Fail ("expected a redirect-loop substitution error, got: " <> T.pack (show other)),
+              runTestM "a torn NAR transfer is retried from its first byte" $ do
+                let torn = "HTTP/1.1 200 OK\r\nContent-Length: " <> TE.encodeUtf8 (T.pack (show (BS.length nar))) <> "\r\nConnection: close\r\n\r\n" <> BS.take 10 nar
+                (base, outcome, seen, sleeps, warnings) <-
+                  substitute "nar-torn" (const narInfoOk) (\earlier -> if earlier == 0 then Send torn else narOk)
+                let warnedTorn = case warnings of
+                      [warning] -> ("download error fetching " <> base <> "/nar/retry.nar: ResponseBodyTooShort") `T.isPrefixOf` warning
+                      _ -> False
+                pure $
+                  if warnedTorn
+                    then assertEqual "substituted after one retry" (Right payload, [narInfoPath, narPath, narPath], [250]) (outcome, seen, sleeps)
+                    else Fail ("unexpected warnings: " <> T.pack (show warnings))
+            ]
+              -- Upstream's NotFound and Forbidden: a binary cache store
+              -- reads both as the file not being in that cache.
+              ++ [ runTestM ("a narinfo answered " <> status <> " is a miss, not retried") $ do
+                     (_, outcome, seen, sleeps, _) <-
+                       substitute ("narinfo-" ++ statusCode status) (const (Send (httpResponse (TE.encodeUtf8 status) ""))) (const narOk)
+                     pure (assertEqual "miss" (Left Subst.SubstNotFound, [narInfoPath], []) (outcome, seen, sleeps))
+                 | status <- notInCache
+                 ]
+              -- A NAR the narinfo named and the cache no longer holds is
+              -- upstream's SubstituteGone: one request, never retried.
+              ++ [ runTestM ("a NAR answered " <> status <> " stops after one request") $ do
+                     (_, outcome, seen, sleeps, _) <-
+                       substitute ("nar-" ++ statusCode status) (const narInfoOk) (const (Send (httpResponse (TE.encodeUtf8 status) "")))
+                     pure $ case outcome of
+                       Left (Subst.SubstError _) -> assertEqual "one request" ([narInfoPath, narPath], []) (seen, sleeps)
+                       other -> Fail ("expected a substitution error, got: " <> T.pack (show other))
+                 | status <- notInCache
+                 ]
+  where
+    notInCache :: [Text]
+    notInCache = ["404 Not Found", "410 Gone", "401 Unauthorized", "403 Forbidden", "407 Proxy Authentication Required"]
+    statusCode = T.unpack . T.take 3
+    hash = T.replicate 32 "b"
+    sp = StorePath hash "retry"
+    narInfoPath = "/" <> TE.encodeUtf8 hash <> ".narinfo"
+    narPath = "/nar/retry.nar"
+    payload = "retried payload\n"
+    nar = NAR.serialise (NAR.NarDirectory [("data", NAR.NarRegular False payload)])
+    unsigned =
+      NarInfo.NarInfo
+        { NarInfo.niStorePath = "/nix/store/" <> hash <> "-retry",
+          NarInfo.niUrl = "nar/retry.nar",
+          NarInfo.niCompression = "none",
+          NarInfo.niFileHash = Nothing,
+          NarInfo.niFileSize = Nothing,
+          NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes nar),
+          NarInfo.niNarSize = fromIntegral (BS.length nar),
+          NarInfo.niReferences = [],
+          NarInfo.niDeriver = Nothing,
+          NarInfo.niSigs = [],
+          NarInfo.niCA = Nothing
+        }
+    signedNarInfo = do
+      secretKey <- Signing.parseSecretKey sigTestKeyText
+      publicKey <- Signing.toPublicKey secretKey
+      sig <- Signing.sign secretKey unsigned
+      pure (Signing.renderPublicKey publicKey, NarInfo.renderNarInfo unsigned {NarInfo.niSigs = [sig]})
+    route narInfoReply narReply path earlier
+      | path == narInfoPath = narInfoReply earlier
+      | path == narPath = narReply earlier
+      | otherwise = Send (httpResponse "500 Internal Server Error" "unexpected request")
 
 -- | @pkgs/windows/fetchurl.nix@ evaluated from the checkout.  The
 -- @mirror://@ expansion is what a source derivation records, so a
@@ -12847,6 +13029,7 @@ runSuite = do
           testUpstreamConformance,
           testHashHelpers,
           testFetchMirrors,
+          testSubstituterRetry,
           testPkgsFetchurl,
           testNarKnownAnswer,
           testFetchGitTransport,

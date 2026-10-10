@@ -1,5 +1,3 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-
 -- | Binary substituter - download pre-built paths from remote caches.
 --
 -- == How substitution works
@@ -19,7 +17,8 @@
 --    then re-verify the materialized tree from disk
 -- 7. Register in the store DB with references from narinfo
 --
--- If the cache doesn't have it (404), fall through to building locally.
+-- If the cache doesn't have it (404, or another status upstream reads
+-- as the file not being there), fall through to building locally.
 --
 -- The whole sequence runs under an exclusive per-path lock
 -- ('Nix.Store.Lock'), upstream's pathlocks protocol: taken before any
@@ -44,6 +43,7 @@ module Nix.Substituter
   ( -- * Substitution
     SubstResult (..),
     trySubstitute,
+    trySubstituteWith,
 
     -- * Cache configuration
     CacheConfig (..),
@@ -53,7 +53,6 @@ module Nix.Substituter
     AttemptFailure (..),
     attemptFailureMessage,
     catchSync,
-    httpStatusFailure,
     compressedBodyCeiling,
     downloadCapFor,
 
@@ -89,8 +88,7 @@ module Nix.Substituter
 where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent (threadDelay)
-import Control.Exception (Exception, SomeAsyncException (..), SomeException, catch, fromException, onException, throwIO)
+import Control.Exception (Exception, Handler (..), SomeException, catch, catches, onException, throwIO)
 import Control.Monad (void)
 import qualified Data.ByteString as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -104,7 +102,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
-import Nix.Http (withUserAgent)
+import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Store (CaseSensitivity, PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarEvent, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
@@ -190,9 +188,18 @@ data SubstResult
 -- scan and a failing cache falls through to the remaining ones.  On
 -- success the path is unpacked and read-only on disk but NOT
 -- registered - the caller records the returned 'PathRegistration'.
+-- Every narinfo and NAR request runs under upstream's retry policy,
+-- 'defaultFetchRetryPolicy'.
 trySubstitute :: Store -> [CacheConfig] -> StorePath -> IO SubstResult
-trySubstitute _ [] _ = pure SubstNotFound
-trySubstitute store caches sp = do
+trySubstitute = trySubstituteWith defaultFetchRetryPolicy ioRetryEffects
+
+-- | 'trySubstitute' under a given retry policy and effects: a build
+-- passes the policy its @builtin:fetchurl@ downloads run under
+-- ('Nix.Builder'), and a test passes effects that record rather than
+-- sleep.
+trySubstituteWith :: FetchRetryPolicy -> RetryEffects IO -> Store -> [CacheConfig] -> StorePath -> IO SubstResult
+trySubstituteWith _ _ _ [] _ = pure SubstNotFound
+trySubstituteWith policy effects store caches sp = do
   -- Reuse the process-global TLS manager (connection pooling / keep-alive)
   -- rather than creating a fresh one per call and per output.
   manager <- HTTPS.getGlobalManager
@@ -206,7 +213,7 @@ trySubstitute store caches sp = do
           releasePathLock lock
           pure SubstAlreadyValid
         else do
-          result <- tryCachesWith (\cache -> tryOneCache manager store cache sp lock) (sortCaches caches)
+          result <- tryCachesWith (\cache -> tryOneCache (Retrying policy effects) manager store cache sp lock) (sortCaches caches)
           case result of
             SubstSuccess _ _ -> pure result
             other -> do
@@ -233,24 +240,32 @@ tryCachesWith attempt = go Nothing
         SubstNotFound -> go firstErr rest
         SubstError err -> go (firstErr <|> Just (ccUrl cache <> ": " <> err)) rest
 
+-- | The retry policy and its effects, carried to every request one
+-- substitution makes.
+data Retrying = Retrying !FetchRetryPolicy !(RetryEffects IO)
+
+-- | Run one request's attempt under the carried policy.
+retrying :: Retrying -> IO (Either AttemptFailure a) -> IO (Either AttemptFailure a)
+retrying (Retrying policy effects) = retryTransient policy effects
+
 -- | Attempt substitution from a single cache.  Synchronous exceptions
 -- become 'SubstError', so the scan falls through to the remaining
 -- caches; asynchronous exceptions propagate ('catchSync') - an
 -- interrupt mid-download must abort the scan, never continue to the
 -- next cache and from there to a local build.
-tryOneCache :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
-tryOneCache mgr store cache sp lock =
-  substituteFromCache mgr store cache sp lock
+tryOneCache :: Retrying -> HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
+tryOneCache retry mgr store cache sp lock =
+  substituteFromCache retry mgr store cache sp lock
     `catchSync` \err -> pure (SubstError ("substitution exception: " <> T.pack (show err)))
 
 -- | Substitution pipeline for a single cache.
 --
 -- Each step is a pure or IO action that produces @Either@ on failure.
 -- The pipeline short-circuits on the first error via early return.
-substituteFromCache :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
-substituteFromCache mgr store cache sp lock = do
+substituteFromCache :: Retrying -> HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
+substituteFromCache retry mgr store cache sp lock = do
   -- 1. Fetch narinfo
-  narInfoResult <- fetchNarInfo mgr cache sp
+  narInfoResult <- fetchNarInfo retry mgr cache sp
   case narInfoResult of
     Left notFoundOrErr -> pure notFoundOrErr
     Right narInfo
@@ -272,7 +287,7 @@ substituteFromCache mgr store cache sp lock = do
           -- pass ('streamNarIntoStore').
           case narInfoPreflight cache narInfo of
             Left err -> pure (SubstError err)
-            Right () -> streamWithRetry mgr store cache sp narInfo lock
+            Right () -> streamWithRetry retry mgr store cache sp narInfo lock
 
 -- | The pure preflight the pipeline runs before any download is paid
 -- for, everything decided from the narinfo alone: field validation
@@ -510,13 +525,6 @@ storePathHashOf path =
 -- HTTP fetching
 -- ---------------------------------------------------------------------------
 
--- | HTTP status code constants.
-httpOk :: Int
-httpOk = 200
-
-httpNotFound :: Int
-httpNotFound = 404
-
 -- | Cap on a narinfo response body, mirroring nova-cache's server-side
 -- @maxNarInfoBodySize@ - the server bounds what it reads, and the
 -- client bounds what any cache in its list can make it buffer.
@@ -541,85 +549,84 @@ readBodyCapped cap reader = go [] 0
                 then pure Nothing
                 else go (chunk : chunks) newTotal
 
--- | Fetch a narinfo from a cache.
--- Returns @Left SubstNotFound@ on 404, @Left (SubstError msg)@ on other errors.
-fetchNarInfo :: HTTP.Manager -> CacheConfig -> StorePath -> IO (Either SubstResult NarInfo.NarInfo)
-fetchNarInfo mgr cache sp = do
-  let url = T.unpack (ccUrl cache) <> "/" <> T.unpack (spHash sp) <> ".narinfo"
-  request <- withUserAgent <$> HTTP.parseRequest url
-  HTTP.withResponse request mgr $ \response -> do
-    let code = HTTP.statusCode (HTTP.responseStatus response)
-    -- Lenient decode: the body is cache-controlled bytes, and a stray
-    -- invalid UTF-8 sequence must surface as a narinfo parse error, not an
-    -- impure UnicodeException (the push side decodes the same way).
-    if code == httpOk
-      then do
-        body <- readBodyCapped maxNarInfoBody (HTTP.responseBody response)
-        case body of
-          Nothing ->
-            pure (Left (SubstError ("narinfo body exceeds " <> T.pack (show maxNarInfoBody) <> " bytes")))
-          Just bytes -> case NarInfo.parseNarInfo (TE.decodeUtf8Lenient bytes) of
-            Left err -> pure (Left (SubstError ("narinfo parse error: " <> T.pack err)))
-            Right ni -> pure (Right ni)
-      else
-        if code == httpNotFound
-          then pure (Left SubstNotFound)
-          else pure (Left (SubstError ("narinfo fetch failed: HTTP " <> T.pack (show code))))
+-- | Fetch a narinfo from a cache, each request under the substitution's
+-- retry policy ('trySubstituteWith').  Returns @Left SubstNotFound@ when
+-- the cache does not hold it, @Left (SubstError msg)@ on any other
+-- failure, a transient one once the policy has spent its attempts.
+fetchNarInfo :: Retrying -> HTTP.Manager -> CacheConfig -> StorePath -> IO (Either SubstResult NarInfo.NarInfo)
+fetchNarInfo retry mgr cache sp = do
+  fetched <- retrying retry (fetchNarInfoOnce mgr url)
+  pure $ case fetched of
+    Left failure -> Left (SubstError (attemptFailureMessage failure))
+    Right Nothing -> Left SubstNotFound
+    Right (Just narInfo) -> Right narInfo
+  where
+    url = ccUrl cache <> "/" <> spHash sp <> ".narinfo"
 
--- | How many times to attempt a NAR download before giving up and letting the
--- caller fall back to a local build.  Matches Nix's @download-attempts@ default.
-narDownloadAttempts :: Int
-narDownloadAttempts = 5
+-- | One narinfo request: @Right Nothing@ when the cache does not hold
+-- it.  A 'NotFound' or 'Forbidden' answer (404, 410, 401, 403, 407) is
+-- the cache saying so, not a failure to retry: upstream's transfer layer
+-- retries neither, and its binary cache store reads both as a missing
+-- narinfo, so the path is not valid there (@HttpBinaryCacheStore::getFile@
+-- at 2.24.9).  A narinfo that arrived whole and does not parse, or
+-- overruns 'maxNarInfoBody', is the cache's bytes and fails at once.
+fetchNarInfoOnce :: HTTP.Manager -> Text -> IO (Either AttemptFailure (Maybe NarInfo.NarInfo))
+fetchNarInfoOnce mgr url = fetch `catches` transferFailureHandlers url
+  where
+    fetch = do
+      request <- withUserAgent <$> HTTP.parseRequest (T.unpack url)
+      withTransfer request mgr $ \response ->
+        answer (HTTP.responseStatus response) (HTTP.responseBody response)
+    answer status body
+      | status /= HTTP.status200 = pure $ case statusError status of
+          NotFound -> Right Nothing
+          Forbidden -> Right Nothing
+          Misc -> Left (fetchStatusFailure url status)
+          Transient -> Left (fetchStatusFailure url status)
+      | otherwise = do
+          capped <- readBodyCapped maxNarInfoBody body
+          pure $ case capped of
+            Nothing ->
+              Left (FatalFailure ("narinfo body exceeds " <> T.pack (show maxNarInfoBody) <> " bytes"))
+            -- Lenient decode: the body is cache-controlled bytes, and a
+            -- stray invalid UTF-8 sequence must surface as a narinfo parse
+            -- error, not an impure UnicodeException (the push side decodes
+            -- the same way).
+            Just bytes -> case NarInfo.parseNarInfo (TE.decodeUtf8Lenient bytes) of
+              Left err -> Left (FatalFailure ("narinfo parse error: " <> T.pack err))
+              Right narInfo -> Right (Just narInfo)
 
--- | Base delay between NAR download attempts, in microseconds.  The delay grows
--- linearly with each retry (0.5s, 1s, ...).
-narRetryBaseDelayMicros :: Int
-narRetryBaseDelayMicros = 500000
-
--- | Stream one substitution end to end, retrying transient failures.
+-- | Stream one substitution end to end, each attempt under the
+-- substitution's retry policy ('trySubstituteWith').
 --
 -- By the time this runs the narinfo has already been fetched and
 -- signature-verified, so the cache claims to hold this path.  Failures
 -- carry their own retry class: a 'TransientFailure' - transport
--- errors, torn or truncated transfers, anything a fresh attempt could
--- plausibly complete - consumes retry budget with linear backoff,
--- while a 'FatalFailure' - a completed transfer that verifies wrong,
--- a body past its signed ceiling, a 4xx - ends the attempt at once:
--- retrying a deterministic failure only delays the local-build
--- fallback, and upstream's transfer layer likewise retries only the
--- transport class.  Every attempt starts from a clean slate
+-- errors, torn or truncated transfers, a status upstream retries,
+-- anything a fresh attempt could plausibly complete - consumes retry
+-- budget with upstream's backoff, while a 'FatalFailure' - a completed
+-- transfer that verifies wrong, a body past its signed ceiling, a
+-- status upstream never retries, a write the disk refused - ends the
+-- attempt at once: retrying a deterministic failure only delays the
+-- local-build fallback.  Every attempt starts from a clean slate
 -- ('streamNarIntoStore' clears the destination first, and every
--- failure path, exceptions included, removes what it wrote).  A 404
--- on the narinfo itself (a genuine cache miss) is handled earlier in
--- 'fetchNarInfo' and never reaches here.
-streamWithRetry :: HTTP.Manager -> Store -> CacheConfig -> StorePath -> NarInfo.NarInfo -> PathLock -> IO SubstResult
-streamWithRetry mgr store cache sp narInfo lock = attempt narDownloadAttempts
-  where
-    attempt remaining = do
-      outcome <- streamNarIntoStore mgr cache store sp narInfo
-      case outcome of
-        Right registration -> pure (SubstSuccess registration lock)
-        Left (FatalFailure err) -> pure (SubstError err)
-        Left (TransientFailure err)
-          | remaining <= 1 -> pure (SubstError err)
-          | otherwise -> do
-              threadDelay (narRetryBaseDelayMicros * (narDownloadAttempts - remaining + 1))
-              attempt (remaining - 1)
-
--- | How one streaming attempt failed, deciding whether the retry
--- budget applies.  'TransientFailure' is a failure a fresh attempt
--- could plausibly complete; 'FatalFailure' is deterministic - the
--- same served object fails the same way every time.
-data AttemptFailure
-  = TransientFailure !Text
-  | FatalFailure !Text
-  deriving (Eq, Show)
-
--- | The failure's message, independent of its retry class.
-attemptFailureMessage :: AttemptFailure -> Text
-attemptFailureMessage failure = case failure of
-  TransientFailure msg -> msg
-  FatalFailure msg -> msg
+-- failure path, exceptions included, removes what it wrote), so a retry
+-- restarts the NAR from its first byte, where upstream resumes from the
+-- written offset when the server accepts ranges and otherwise retries
+-- only a transfer that wrote nothing yet.  A NAR the narinfo named and
+-- the cache answers 'NotFound' or 'Forbidden' for is gone: one request,
+-- as upstream's @SubstituteGone@ (@BinaryCacheStore::narFromPath@ at
+-- 2.24.9), and an error the cache scan falls through to the next cache
+-- and then to a local build, as upstream's substitution goal treats a
+-- gone substitute like one that never existed.  A narinfo the cache does
+-- not hold is a miss handled earlier in 'fetchNarInfo' and never reaches
+-- here.
+streamWithRetry :: Retrying -> HTTP.Manager -> Store -> CacheConfig -> StorePath -> NarInfo.NarInfo -> PathLock -> IO SubstResult
+streamWithRetry retry mgr store cache sp narInfo lock = do
+  outcome <- retrying retry (streamNarIntoStore mgr cache store sp narInfo)
+  pure $ case outcome of
+    Right registration -> SubstSuccess registration lock
+    Left failure -> SubstError (attemptFailureMessage failure)
 
 -- | Thrown inside the streaming pipeline where a chunk convention has
 -- no error channel (the capped body source); converted back to the
@@ -629,62 +636,19 @@ newtype StreamAbort = StreamAbort Text
 
 instance Exception StreamAbort
 
--- | Run an action, passing only synchronous exceptions to the handler.
--- Asynchronous exceptions (a Ctrl-C, a timeout) re-throw untouched: an
--- interrupt converted into a recoverable failure would be spent as
--- retry budget, as fallthrough to the next cache, or as a local build
--- instead of aborting.  Every catch-all on the substitution and build
--- paths goes through this one split.
-catchSync :: IO a -> (SomeException -> IO a) -> IO a
-catchSync action handler = action `catch` classify
+-- | Convert what one download attempt throws into the pipeline's
+-- failure channel, so the retry budget governs it and the caller's
+-- cleanup contract holds on every exit: the transfer layer's
+-- classification ('transferFailureHandlers'), and a 'StreamAbort'.
+-- Nothing else is caught, so an interrupt is never spent as retry
+-- budget.
+tryAttempt :: Text -> IO (Either AttemptFailure a) -> IO (Either AttemptFailure a)
+tryAttempt url action =
+  action `catches` (Handler streamAborted : transferFailureHandlers url)
   where
-    classify someErr
-      | Just (SomeAsyncException _) <- fromException someErr = throwIO someErr
-      | otherwise = handler someErr
-
--- | Convert synchronous exceptions from one download attempt into the
--- pipeline's failure channel, so the retry budget governs them and the
--- caller's cleanup contract holds on every exit.  Asynchronous
--- exceptions re-throw untouched ('catchSync'): an interrupt must
--- never be spent as retry budget.
-tryAttempt :: IO (Either AttemptFailure a) -> IO (Either AttemptFailure a)
-tryAttempt action = action `catchSync` handler
-  where
-    handler someErr
-      | Just (StreamAbort msg) <- fromException someErr =
-          -- A body past its ceiling: the cap derives from the signed
-          -- NarSize, so a longer body is the server misdeclaring, not
-          -- a hiccup.
-          pure (Left (FatalFailure msg))
-      | Just (httpErr :: HTTP.HttpException) <- fromException someErr =
-          -- Dropped connections, resets, timeouts - the class the
-          -- retry budget exists for.
-          pure (Left (TransientFailure ("HTTP transport failure: " <> T.pack (show httpErr))))
-      | otherwise =
-          -- Local failures (a full disk, a permission error) do not
-          -- heal by re-downloading.
-          pure (Left (FatalFailure ("substitution attempt failed: " <> T.pack (show (someErr :: SomeException)))))
-
--- | HTTP status codes whose failures a retry could plausibly outlive.
-httpRequestTimeout :: Int
-httpRequestTimeout = 408
-
-httpTooManyRequests :: Int
-httpTooManyRequests = 429
-
-httpServerErrorFloor :: Int
-httpServerErrorFloor = 500
-
--- | Classify a non-200 NAR response: server-side and rate-limit
--- statuses are transient, every other status (above all a 404 on an
--- object the narinfo just promised) is deterministic.
-httpStatusFailure :: Int -> AttemptFailure
-httpStatusFailure code
-  | code == httpRequestTimeout || code == httpTooManyRequests || code >= httpServerErrorFloor =
-      TransientFailure message
-  | otherwise = FatalFailure message
-  where
-    message = "NAR download failed: HTTP " <> T.pack (show code)
+    -- A body past its ceiling: the cap derives from the signed NarSize,
+    -- so a longer body is the server misdeclaring, not a hiccup.
+    streamAborted (StreamAbort msg) = pure (Left (FatalFailure msg))
 
 -- | One streaming substitution attempt: download, decompress, hash,
 -- parse, and materialize in a single bounded pass, then verify.
@@ -704,16 +668,17 @@ streamNarIntoStore mgr cache store sp narInfo = case preflight of
   Left err -> pure (Left (FatalFailure err))
   Right (declaredDigest, refs, deriver, downloadCap) -> do
     let destPath = storePathToFilePath (stDir store) sp
-        narUrl = T.unpack (ccUrl cache) <> "/" <> T.unpack (NarInfo.niUrl narInfo)
+        narUrl = ccUrl cache <> "/" <> NarInfo.niUrl narInfo
     clearStaleDestination destPath
-    request <- withUserAgent <$> HTTP.parseRequest narUrl
-    tryAttempt $ HTTP.withResponse request mgr $ \response -> do
-      let code = HTTP.statusCode (HTTP.responseStatus response)
-      if code /= httpOk
-        then pure (Left (httpStatusFailure code))
-        else do
-          source <- cappedBodySource downloadCap (HTTP.responseBody response)
-          materializeNarFromSource store sp narInfo declaredDigest refs deriver source
+    tryAttempt narUrl $ do
+      request <- withUserAgent <$> HTTP.parseRequest (T.unpack narUrl)
+      withTransfer request mgr $ \response -> do
+        let status = HTTP.responseStatus response
+        if status /= HTTP.status200
+          then pure (Left (fetchStatusFailure narUrl status))
+          else do
+            source <- cappedBodySource downloadCap (HTTP.responseBody response)
+            materializeNarFromSource store sp narInfo declaredDigest refs deriver source
   where
     preflight = do
       declaredDigest <- case Hash.parseNixHash (NarInfo.niNarHash narInfo) of
