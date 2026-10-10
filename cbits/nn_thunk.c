@@ -156,10 +156,12 @@ nn_thunk_get_bc_idx(const nn_thunk_t *thunk)
     return thunk->bc_idx;
 }
 
-void
+int
 nn_thunk_set_payload(nn_thunk_t *thunk, void *payload)
 {
+    if (thunk->state != NN_THUNK_PENDING) return 0;
     thunk->payload = payload;
+    return 1;
 }
 
 nn_thunk_t *
@@ -198,32 +200,6 @@ nn_thunk_new_computed_float(double value)
     t->_pad = 0;
     t->bc_idx = 0;
     memcpy(&t->payload, &value, sizeof(double));
-    return t;
-}
-
-nn_thunk_t *
-nn_thunk_new_computed_bool(uint8_t value)
-{
-    nn_thunk_t *t = arena_alloc(g_arena);
-    if (!t) return NULL;
-    t->state = NN_THUNK_COMPUTED;
-    t->val_tag = NN_VALUE_BOOL;
-    t->_pad = 0;
-    t->bc_idx = 0;
-    t->payload = (void *)(intptr_t)value;
-    return t;
-}
-
-nn_thunk_t *
-nn_thunk_new_computed_null(void)
-{
-    nn_thunk_t *t = arena_alloc(g_arena);
-    if (!t) return NULL;
-    t->state = NN_THUNK_COMPUTED;
-    t->val_tag = NN_VALUE_NULL;
-    t->_pad = 0;
-    t->bc_idx = 0;
-    t->payload = NULL;
     return t;
 }
 
@@ -303,6 +279,24 @@ nn_thunk_new_computed_lambda(void *lambda)
     t->bc_idx = 0;
     t->payload = lambda;
     return t;
+}
+
+/* --- Shared constants --- */
+
+static nn_thunk_t g_null_cell  = { NN_THUNK_COMPUTED, NN_VALUE_NULL, 0, 0, NULL };
+static nn_thunk_t g_true_cell  = { NN_THUNK_COMPUTED, NN_VALUE_BOOL, 0, 0, (void *)(intptr_t)1 };
+static nn_thunk_t g_false_cell = { NN_THUNK_COMPUTED, NN_VALUE_BOOL, 0, 0, NULL };
+
+nn_thunk_t *
+nn_thunk_null(void)
+{
+    return &g_null_cell;
+}
+
+nn_thunk_t *
+nn_thunk_bool(uint8_t value)
+{
+    return value ? &g_true_cell : &g_false_cell;
 }
 
 /* --- State queries --- */
@@ -403,125 +397,114 @@ nn_thunk_mark_pending(nn_thunk_t *thunk)
     return 1;
 }
 
-void *
+int
 nn_thunk_set_computed(nn_thunk_t *thunk, void *value)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_PTR;
     thunk->payload = value;
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_INT;
     thunk->payload = (void *)(intptr_t)value;
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_float(nn_thunk_t *thunk, double value)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_FLOAT;
     memcpy(&thunk->payload, &value, sizeof(double));
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_bool(nn_thunk_t *thunk, uint8_t value)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_BOOL;
     thunk->payload = (void *)(intptr_t)value;
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_null(nn_thunk_t *thunk)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_NULL;
     thunk->payload = NULL;
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_str(nn_thunk_t *thunk, uint32_t symbol)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_STR;
     thunk->payload = (void *)(intptr_t)symbol;
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_path(nn_thunk_t *thunk, uint32_t symbol)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_PATH;
     thunk->payload = (void *)(intptr_t)symbol;
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_list(nn_thunk_t *thunk, void *list)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_LIST;
     thunk->payload = list;
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_attrs(nn_thunk_t *thunk, void *attrset)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_ATTRS;
     thunk->payload = attrset;
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_ctxstr(nn_thunk_t *thunk, void *ctxstr)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_CTXSTR;
     thunk->payload = ctxstr;
-    return old;
+    return 1;
 }
 
-void *
+int
 nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda)
 {
-    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
-    void *old = thunk->payload;
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_LAMBDA;
     thunk->payload = lambda;
-    return old;
+    return 1;
 }
 
 /* --- Arena diagnostics / cleanup iteration --- */

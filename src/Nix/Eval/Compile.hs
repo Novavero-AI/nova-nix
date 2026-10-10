@@ -327,13 +327,10 @@ compileExpr = go
     compileBindingWords bindings = concat <$> mapM compileOneBinding bindings
 
     compileOneBinding :: Binding -> IO [Word32]
-    compileOneBinding (NamedBinding path expr) = do
-      compiledKeys <- mapM compileAttrKey path
+    compileOneBinding (NamedBinding key expr) = do
+      (keyKind, keyWord) <- compileAttrKey key
       valIdx <- go expr
-      pure $
-        [bindNamed, fi (length path)]
-          ++ concatMap (\(t, v) -> [t, v]) compiledKeys
-          ++ [valIdx]
+      pure [bindNamed, keyKind, keyWord, valIdx]
     compileOneBinding (Inherit name var) = do
       sym <- internName name
       valIdx <- go var
@@ -559,8 +556,8 @@ decodePairs n off = do
 
 -- | A decoded binding from the bytecode data buffer.
 data BcBinding
-  = -- | @path = expr@ with attr path keys and value bc_idx
-    BcNamed ![BcAttrKey] !Word32
+  = -- | @key = expr@: the key and the value's bc_idx
+    BcNamed !BcAttrKey !Word32
   | -- | One name of @inherit x@: its symbol and the bc_idx of the variable
     -- it copies, which is evaluated in the env around the binding set
     BcInherit !Word32 !Word32
@@ -572,7 +569,7 @@ data BcBinding
 -- from-value.
 data BcInheritedName = BcInheritedName !Word32 !Word32
 
--- | An attribute key in a binding path.
+-- | A binding's attribute key.
 data BcAttrKey
   = -- | Static key (interned symbol)
     BcStaticKey !Word32
@@ -595,13 +592,9 @@ decodeOneBinding off = do
   tag <- cbcData off
   case tag of
     0 {- NamedBinding -} -> do
-      pathLen <- cbcData (off + 1)
-      let keyStart = off + 2
-          keyWords = fromIntegral pathLen * 2
-          valOff = keyStart + keyWords
-      keys <- decodeAttrKeys (fromIntegral pathLen) keyStart
-      valBcIdx <- cbcData valOff
-      pure (BcNamed keys valBcIdx, valOff + 1)
+      key <- decodeAttrKey (off + 1)
+      valBcIdx <- cbcData (off + 3)
+      pure (BcNamed key valBcIdx, off + 4)
     1 {- Inherit -} -> do
       sym <- cbcData (off + 1)
       valBcIdx <- cbcData (off + 2)
@@ -615,15 +608,12 @@ decodeOneBinding off = do
     -- which emits 0, 1 or 2 - all matched above.
     _ -> error "decodeOneBinding: invalid binding type tag"
 
--- | Decode attr path keys: pairs of (is_expr, key_or_bc_idx).
-decodeAttrKeys :: Int -> Word32 -> IO [BcAttrKey]
-decodeAttrKeys 0 _ = pure []
-decodeAttrKeys n off = do
+-- | Decode a binding's key: the pair (is_expr, key_or_bc_idx).
+decodeAttrKey :: Word32 -> IO BcAttrKey
+decodeAttrKey off = do
   isExpr <- cbcData off
   val <- cbcData (off + 1)
-  rest <- decodeAttrKeys (n - 1) (off + 2)
-  let key = if isExpr /= 0 then BcDynamicKey val else BcStaticKey val
-  pure (key : rest)
+  pure (if isExpr /= 0 then BcDynamicKey val else BcStaticKey val)
 
 -- | Decode inherited names: pairs of (name_sym, select_bc_idx).
 decodeInheritedNames :: Int -> Word32 -> IO [BcInheritedName]

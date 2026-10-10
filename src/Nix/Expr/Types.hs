@@ -74,8 +74,11 @@ type AttrPath = [AttrKey]
 
 -- | A binding in an attribute set or let expression.
 data Binding
-  = -- | @path = expr;@
-    NamedBinding !AttrPath !Expr
+  = -- | @key = expr;@.  One key, as upstream's @ExprAttrs@ holds one name
+    -- per definition (nixexpr.hh at 2.24.9): the parser hoists a dotted
+    -- @a.b.c = v;@ into @a = { b = { c = v; }; };@ the way upstream's
+    -- @addAttr@ does (parser-state.hh), so no binding carries a path.
+    NamedBinding !AttrKey !Expr
   | -- | One name of @inherit x y;@: the attribute and the variable it
     -- copies, which is bound and evaluated in the scope around the binding
     -- set rather than in the set itself, so @rec { inherit x; }@ does not

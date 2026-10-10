@@ -9,7 +9,6 @@
 #include "nn_lambda.h"
 #include "nn_assert.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,20 +18,20 @@ static nn_lambda_t **g_tracked = NULL;
 static uint32_t g_tracked_count = 0;
 static uint32_t g_tracked_cap   = 0;
 
-static void nn_lambda_track(nn_lambda_t *lam)
+/* Returns 0, or -1 when the tracking array cannot grow. */
+static int nn_lambda_track(nn_lambda_t *lam)
 {
     if (g_tracked_count >= g_tracked_cap) {
+        if (g_tracked_cap > UINT32_MAX / 2) return -1;
         uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
         nn_lambda_t **new_arr = (nn_lambda_t **)realloc(
             g_tracked, (size_t)new_cap * sizeof(nn_lambda_t *));
-        if (!new_arr) {
-            fprintf(stderr, "nn_lambda_track: realloc failed\n");
-            abort();
-        }
+        if (!new_arr) return -1;
         g_tracked = new_arr;
         g_tracked_cap = new_cap;
     }
     g_tracked[g_tracked_count++] = lam;
+    return 0;
 }
 
 /* --- Lifecycle --- */
@@ -70,7 +69,11 @@ nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
         lam->entries = NULL;
     }
 
-    nn_lambda_track(lam);
+    if (nn_lambda_track(lam) != 0) {
+        free(lam->entries);
+        free(lam);
+        return NULL;
+    }
     return lam;
 }
 

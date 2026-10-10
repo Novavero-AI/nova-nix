@@ -107,11 +107,12 @@ nn_thunk_t *nn_thunk_new_bc(uint32_t bc_idx, void *env_ptr);
 /* Read the bytecode index from a PENDING thunk. */
 uint32_t nn_thunk_get_bc_idx(const nn_thunk_t *thunk);
 
-/* Set the payload of a thunk.  Used for deferred env fixup in
+/* Set the payload of a PENDING thunk.  Used for deferred env fixup in
  * knot-tying (rec attrs, let, formal defaults): allocate the thunk
  * with NULL payload first, then fill the env pointer once the
- * knot-tied env is constructed. */
-void nn_thunk_set_payload(nn_thunk_t *thunk, void *payload);
+ * knot-tied env is constructed.  Returns 1, or 0 with the thunk
+ * unchanged if it is not PENDING. */
+int nn_thunk_set_payload(nn_thunk_t *thunk, void *payload);
 
 /* Allocate a new pre-COMPUTED thunk from the arena (StablePtr payload).
  * value is an opaque pointer (StablePtr to Haskell NixValue).
@@ -121,8 +122,6 @@ nn_thunk_t *nn_thunk_new_computed(void *value);
 /* Allocate pre-COMPUTED thunks with inline scalar values (no StablePtr). */
 nn_thunk_t *nn_thunk_new_computed_int(int64_t value);
 nn_thunk_t *nn_thunk_new_computed_float(double value);
-nn_thunk_t *nn_thunk_new_computed_bool(uint8_t value);
-nn_thunk_t *nn_thunk_new_computed_null(void);
 
 /* Allocate pre-COMPUTED thunks with C-native complex values (no StablePtr). */
 nn_thunk_t *nn_thunk_new_computed_str(uint32_t symbol);
@@ -131,6 +130,18 @@ nn_thunk_t *nn_thunk_new_computed_list(void *list);
 nn_thunk_t *nn_thunk_new_computed_attrs(void *attrset);
 nn_thunk_t *nn_thunk_new_computed_ctxstr(void *ctxstr);
 nn_thunk_t *nn_thunk_new_computed_lambda(void *lambda);
+
+/* --- Shared constants --- */
+
+/* The COMPUTED null, true and false cells, as upstream shares one vNull,
+ * vTrue and vFalse per EvalState.  They are file-scope statics, not
+ * arena memory, so each has one address in every init .. destroy window
+ * and outside all of them: a constant built from one before
+ * nn_thunk_init, or kept across nn_thunk_destroy, still reads correctly.
+ * Every state transition refuses a COMPUTED thunk, so nothing writes
+ * them.  nn_thunk_bool answers the true cell for any nonzero value. */
+nn_thunk_t *nn_thunk_null(void);
+nn_thunk_t *nn_thunk_bool(uint8_t value);
 
 /* --- State queries --- */
 
@@ -169,29 +180,25 @@ int nn_thunk_mark_blackhole(nn_thunk_t *thunk);
  * Returns 1 on success, 0 if thunk is not BLACKHOLE. */
 int nn_thunk_mark_pending(nn_thunk_t *thunk);
 
-/* Set a non-COMPUTED thunk to COMPUTED with a StablePtr value (NN_VALUE_PTR).
- * Accepts PENDING or BLACKHOLE state (skips blackhole for direct memoization).
- * Returns the old payload (pending StablePtr for caller to free).
- * Returns NULL if thunk is already COMPUTED. */
-void *nn_thunk_set_computed(nn_thunk_t *thunk, void *value);
-
-/* Set a non-COMPUTED thunk to COMPUTED with inline scalar values.
- * Returns the old payload (pending StablePtr for caller to free).
- * Returns NULL if thunk is already COMPUTED. */
-void *nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value);
-void *nn_thunk_set_computed_float(nn_thunk_t *thunk, double value);
-void *nn_thunk_set_computed_bool(nn_thunk_t *thunk, uint8_t value);
-void *nn_thunk_set_computed_null(nn_thunk_t *thunk);
-
-/* Set a non-COMPUTED thunk to COMPUTED with C-native complex values.
- * Returns the old payload (pending StablePtr for caller to free).
- * Returns NULL if thunk is already COMPUTED. */
-void *nn_thunk_set_computed_str(nn_thunk_t *thunk, uint32_t symbol);
-void *nn_thunk_set_computed_path(nn_thunk_t *thunk, uint32_t symbol);
-void *nn_thunk_set_computed_list(nn_thunk_t *thunk, void *list);
-void *nn_thunk_set_computed_attrs(nn_thunk_t *thunk, void *attrset);
-void *nn_thunk_set_computed_ctxstr(nn_thunk_t *thunk, void *ctxstr);
-void *nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda);
+/* Set a non-COMPUTED thunk to COMPUTED, the setter naming the value
+ * kind: a StablePtr NixValue (NN_VALUE_PTR), an inline scalar, or a
+ * C-native complex value.  Accepts PENDING or BLACKHOLE state (skips
+ * blackhole for direct memoization).  The pending payload is overwritten,
+ * not handed back: a NULL return could not tell a refusal from a NULL
+ * payload, and the caller already read the payload to evaluate the
+ * thunk, so it frees the StablePtr itself.  Returns 1, or 0 with the
+ * thunk unchanged if it is already COMPUTED. */
+int nn_thunk_set_computed(nn_thunk_t *thunk, void *value);
+int nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value);
+int nn_thunk_set_computed_float(nn_thunk_t *thunk, double value);
+int nn_thunk_set_computed_bool(nn_thunk_t *thunk, uint8_t value);
+int nn_thunk_set_computed_null(nn_thunk_t *thunk);
+int nn_thunk_set_computed_str(nn_thunk_t *thunk, uint32_t symbol);
+int nn_thunk_set_computed_path(nn_thunk_t *thunk, uint32_t symbol);
+int nn_thunk_set_computed_list(nn_thunk_t *thunk, void *list);
+int nn_thunk_set_computed_attrs(nn_thunk_t *thunk, void *attrset);
+int nn_thunk_set_computed_ctxstr(nn_thunk_t *thunk, void *ctxstr);
+int nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda);
 
 /* --- Arena diagnostics / cleanup iteration --- */
 

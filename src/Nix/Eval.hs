@@ -817,8 +817,8 @@ evalBcRecAttrs env bindings captureInfo
           attrMap = buildBcAttrMapFromSlots bindings thunkList
        in filled `seq` pure (VAttrs (attrSetFromMap attrMap))
   | otherwise = do
-      -- Dynamic-key path: the set has a ${dynamic} key or a nested a.b path, so
-      -- names are not all known at compile time.  Not a corner-cutting fallback:
+      -- Dynamic-key path: the set has a ${dynamic} key, so names are not all
+      -- known at compile time.  Not a corner-cutting fallback:
       -- it follows C++ Nix's env2 semantics.  The rec env holds the
       -- statically-named bindings as thunks, and the dynamic keys AND values are
       -- evaluated against it - so they can see static siblings and enclosing
@@ -858,21 +858,22 @@ evalBcLet env bcIdx0 = do
           filled = fillCSlots slotsPtr (buildBcSlotThunks letEnv env bindings)
        in filled `seq` evalBytecode letEnv bodyIdx
     else do
-      -- Dynamic path: a nested a.b binding (a dynamic top-level key is not valid
-      -- in a let).  Every top-level key is therefore static; sub-keys and values
-      -- resolve in the let env, which the body also sees.
+      -- Dynamic path: a dynamic key, which the parser refuses in a let as
+      -- upstream's parser.y does, so only an AST built outside the parser
+      -- reaches here.  Keys and values resolve in the let env, which
+      -- the body also sees.
       let cset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
           letEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet cset))
       thunkMap <- buildBcThunkMap mkThunkBc letEnv env bindings
       let filled = fillCAttrSetValues cset thunkMap
        in filled `seq` evalBytecode letEnv bodyIdx
 
--- | Check if all bytecode bindings are single static keys (eligible for positional).
+-- | Check if all bytecode bindings are static keys (eligible for positional).
 -- Must stay in sync with 'allStaticSingleKey' in 'Nix.Expr.Resolve'.
 allBcPositional :: [BcBinding] -> Bool
 allBcPositional = all isEligible
   where
-    isEligible (BcNamed [BcStaticKey _] _) = True
+    isEligible (BcNamed (BcStaticKey _) _) = True
     isEligible (BcInherit _ _) = True
     isEligible (BcInheritFrom _ _) = True
     isEligible _ = False
@@ -882,7 +883,7 @@ allBcPositional = all isEligible
 bcBindingSlotCount :: [BcBinding] -> Int
 bcBindingSlotCount = foldl' countOne 0
   where
-    countOne !acc (BcNamed [BcStaticKey _] _) = acc + 1
+    countOne !acc (BcNamed (BcStaticKey _) _) = acc + 1
     countOne !acc (BcInherit _ _) = acc + 1
     countOne !acc (BcInheritFrom _ names) = acc + length names
     countOne !acc _ = acc
@@ -895,7 +896,7 @@ bcBindingSlotCount = foldl' countOne 0
 buildBcSlotThunks :: Env -> Env -> [BcBinding] -> [Thunk]
 buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
   where
-    slotThunk (BcNamed [BcStaticKey _] valBcIdx) =
+    slotThunk (BcNamed (BcStaticKey _) valBcIdx) =
       [mkThunkBc recEnv valBcIdx]
     slotThunk (BcInherit _ valBcIdx) =
       [cheapThunkBc outerEnv valBcIdx]
@@ -916,7 +917,7 @@ buildBcAttrMapFromSlots :: [BcBinding] -> [Thunk] -> Map Text Thunk
 buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
   where
     go [] _ !acc = acc
-    go (BcNamed [BcStaticKey sym] _ : bs) (t : ts) !acc =
+    go (BcNamed (BcStaticKey sym) _ : bs) (t : ts) !acc =
       go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
     go (BcInherit sym _ : bs) (t : ts) !acc =
       go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
@@ -939,15 +940,11 @@ buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
 buildBcThunkMap :: (MonadEval m) => (Env -> Word32 -> Thunk) -> Env -> Env -> [BcBinding] -> m (Map Text Thunk)
 buildBcThunkMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
   where
-    addBinding acc (BcNamed keys valBcIdx) = do
-      resolvedKeys <- mapM (resolveBcKey thunkEnv) keys
-      case sequence resolvedKeys of
+    addBinding acc (BcNamed bcKey valBcIdx) = do
+      resolved <- resolveBcKey thunkEnv bcKey
+      case resolved of
         Nothing -> pure acc -- null key -> skip
-        Just [key] ->
-          insertChecked acc key (mkValueThunk thunkEnv valBcIdx)
-        Just path ->
-          let nested = buildBcNestedAttr thunkEnv path valBcIdx
-           in foldM (\a (k, t0) -> insertChecked a k t0) acc (Map.toList nested)
+        Just key -> insertChecked acc key (mkValueThunk thunkEnv valBcIdx)
     addBinding acc (BcInherit sym valBcIdx) =
       insertChecked acc (symbolText (Symbol sym)) (cheapThunkBc outerEnv valBcIdx)
     addBinding acc (BcInheritFrom fromBcIdx names) =
@@ -978,14 +975,6 @@ resolveBcKey env (BcDynamicKey bcIdx0) = do
     VNull -> pure Nothing
     _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName val)
 
--- | Build a nested attribute structure from a resolved dotted path (bytecode).
-buildBcNestedAttr :: Env -> [Text] -> Word32 -> Map Text Thunk
-buildBcNestedAttr _thunkEnv [] _valBcIdx = Map.empty
-buildBcNestedAttr thunkEnv [key] valBcIdx =
-  Map.singleton key (mkThunkBc thunkEnv valBcIdx)
-buildBcNestedAttr thunkEnv (key : rest) valBcIdx =
-  Map.singleton key (evaluated (VAttrs (attrSetFromMap (buildBcNestedAttr thunkEnv rest valBcIdx))))
-
 -- | Top-level keys knowable without evaluating any dynamic key: static keys
 -- and inherited names.  These populate the rec env's name table while the
 -- dynamic keys are evaluated, so a dynamic key can reference a static sibling
@@ -994,7 +983,7 @@ buildBcNestedAttr thunkEnv (key : rest) valBcIdx =
 bcBindingStaticKeys :: [BcBinding] -> [Text]
 bcBindingStaticKeys = concatMap oneBinding
   where
-    oneBinding (BcNamed (BcStaticKey sym : _) _) = [symbolText (Symbol sym)]
+    oneBinding (BcNamed (BcStaticKey sym) _) = [symbolText (Symbol sym)]
     oneBinding (BcNamed _ _) = []
     oneBinding (BcInherit sym _) = [symbolText (Symbol sym)]
     oneBinding (BcInheritFrom _ names) = map inheritedNameText names
@@ -1007,7 +996,7 @@ inheritedNameText (BcInheritedName sym _) = symbolText (Symbol sym)
 -- inherit).  These bindings populate the rec env's name table (C++ Nix's env2);
 -- a binding with a dynamic top-level key does not - it is added to the value.
 bcBindingIsStatic :: BcBinding -> Bool
-bcBindingIsStatic (BcNamed (BcStaticKey _ : _) _) = True
+bcBindingIsStatic (BcNamed (BcStaticKey _) _) = True
 bcBindingIsStatic (BcNamed _ _) = False
 bcBindingIsStatic (BcInherit _ _) = True
 bcBindingIsStatic (BcInheritFrom _ _) = True

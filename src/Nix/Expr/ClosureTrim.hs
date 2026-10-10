@@ -122,8 +122,8 @@ trimKey k@(StaticKey _) = k
 trimKey (DynamicKey e) = DynamicKey (trimExpr e)
 
 trimBinding :: Binding -> Binding
-trimBinding (NamedBinding path bodyExpr) =
-  NamedBinding (map trimKey path) (trimExpr bodyExpr)
+trimBinding (NamedBinding key bodyExpr) =
+  NamedBinding (trimKey key) (trimExpr bodyExpr)
 trimBinding (Inherit name var) = Inherit name (trimExpr var)
 trimBinding (InheritFrom fromExpr names) =
   InheritFrom (trimExpr fromExpr) names
@@ -299,8 +299,8 @@ foldKeys depth = foldl' combine (Set.empty, False, False)
 foldBindings :: Int -> Maybe Int -> [Binding] -> (Set (Int, Int), Bool, Bool)
 foldBindings depth outerDepth = foldl' combine (Set.empty, False, False)
   where
-    combine (!acc, !h, !w) (NamedBinding path bodyExpr) =
-      let (vs1, h1, w1) = foldKeys depth path
+    combine (!acc, !h, !w) (NamedBinding key bodyExpr) =
+      let (vs1, h1, w1) = foldKeys depth [key]
           (vs2, h2, w2) = collectFreeVars depth bodyExpr
        in (Set.unions [acc, vs1, vs2], h || h1 || h2, w || w1 || w2)
     combine (!acc, !h, !w) (Inherit _ var) = case outerDepth of
@@ -404,9 +404,9 @@ rewriteKey depth captureMap (DynamicKey e) =
 -- | Rewrite a binding's references, at the depths 'foldBindings' reads
 -- them at; an inherited variable outside the analysis is left as it is.
 rewriteBinding :: Int -> Maybe Int -> Map (Int, Int) Int -> Binding -> Binding
-rewriteBinding depth _ captureMap (NamedBinding path bodyExpr) =
+rewriteBinding depth _ captureMap (NamedBinding key bodyExpr) =
   NamedBinding
-    (map (rewriteKey depth captureMap) path)
+    (rewriteKey depth captureMap key)
     (rewriteBody depth captureMap bodyExpr)
 rewriteBinding _ outerDepth captureMap (Inherit name var) =
   Inherit name (maybe var (\outer -> rewriteBody outer captureMap var) outerDepth)

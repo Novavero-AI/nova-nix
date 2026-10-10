@@ -20,6 +20,7 @@
 /* --- Configuration --- */
 
 #define NN_SYMBOL_DEFAULT_CAPACITY   4096
+#define NN_SYMBOL_MAX_INITIAL        (UINT32_C(1) << 30)  /* slot table is twice this */
 #define NN_SYMBOL_LOAD_PERCENT         75
 #define NN_SYMBOL_ARENA_INITIAL  (256 * 1024)  /* 256 KB */
 
@@ -52,7 +53,7 @@ static struct {
 
     /* Contiguous string arena. */
     char              *arena;
-    size_t             arena_used;
+    size_t             arena_used;  /* never above NN_SYMBOL_ARENA_LIMIT */
     size_t             arena_cap;
 } g_sym;
 
@@ -69,72 +70,58 @@ static uint32_t fnv1a(const char *data, size_t len)
     return h;
 }
 
-/* --- Arena --- */
+/* --- Growth --- */
 
-/* Ensure the arena has room for `needed` more bytes. */
-static void arena_ensure(size_t needed)
+/* Each reserve step returns 0, or -1 when the table cannot grow, and
+ * changes no symbol, so nn_symbol_intern can refuse after any of them. */
+
+/* Room for `needed` more arena bytes; the caller has kept the total
+ * within NN_SYMBOL_ARENA_LIMIT, which fits size_t on every 64-bit
+ * target. */
+static int arena_reserve(size_t needed)
 {
-    if (g_sym.arena_used + needed <= g_sym.arena_cap) return;
-
+    size_t want = g_sym.arena_used + needed;
     size_t new_cap = g_sym.arena_cap;
-    while (new_cap < g_sym.arena_used + needed) {
-        new_cap *= 2;
+    if (want <= new_cap) return 0;
+
+    while (new_cap < want) {
+        new_cap = new_cap > SIZE_MAX / 2 ? want : new_cap * 2;
     }
-    char *new_arena = (char *)realloc(g_sym.arena, new_cap);
-    if (!new_arena) {
-        fprintf(stderr, "nn_symbol: arena realloc failed (requested %zu bytes)\n", new_cap);
-        abort();
-    }
-    g_sym.arena = new_arena;
+    char *grown = (char *)realloc(g_sym.arena, new_cap);
+    if (!grown) return -1;
+    g_sym.arena = grown;
     g_sym.arena_cap = new_cap;
+    return 0;
 }
 
-/* Copy `len` bytes into the arena, returning the start offset. */
-static uint32_t arena_push(const char *str, size_t len)
+/* Room for one more entry.  Entries are 1-indexed, so count + 1 must
+ * stay below the capacity. */
+static int entries_reserve(void)
 {
-    arena_ensure(len + 1);  /* +1 for null terminator */
-    if (g_sym.arena_used > (size_t)UINT32_MAX) {
-        fprintf(stderr, "nn_symbol: arena offset exceeds uint32_t range\n");
-        abort();
-    }
-    uint32_t offset = (uint32_t)g_sym.arena_used;
-    memcpy(g_sym.arena + offset, str, len);
-    g_sym.arena[offset + len] = '\0';
-    g_sym.arena_used += len + 1;
-    return offset;
-}
-
-/* --- Entry array --- */
-
-/* Ensure the entry array has room for one more symbol. */
-static void entries_ensure(void)
-{
-    /* count is 0-based count, entries are 1-indexed, so we need count+1 < cap */
-    if (g_sym.count + 1 < g_sym.entries_cap) return;
+    if (g_sym.count + 1 < g_sym.entries_cap) return 0;
+    if (g_sym.entries_cap > UINT32_MAX / 2) return -1;
 
     uint32_t new_cap = g_sym.entries_cap * 2;
-    nn_symbol_entry_t *new_entries = (nn_symbol_entry_t *)realloc(
+    nn_symbol_entry_t *grown = (nn_symbol_entry_t *)realloc(
         g_sym.entries, (size_t)new_cap * sizeof(nn_symbol_entry_t));
-    if (!new_entries) {
-        fprintf(stderr, "nn_symbol: entries realloc failed\n");
-        abort();
-    }
-    g_sym.entries = new_entries;
+    if (!grown) return -1;
+    g_sym.entries = grown;
     g_sym.entries_cap = new_cap;
+    return 0;
 }
 
-/* --- Hash table --- */
-
-/* Rebuild the hash table at double capacity. */
-static void slots_grow(void)
+/* Rebuild the hash table at double capacity.  The slot capacity is a
+ * uint32_t power of two, so it stops at 2^31; with the load kept under
+ * NN_SYMBOL_LOAD_PERCENT that bounds the symbol count well below
+ * UINT32_MAX, which is why no separate ID ceiling is checked. */
+static int slots_grow(void)
 {
+    if (g_sym.slots_cap > UINT32_MAX / 2) return -1;
+
     uint32_t new_cap = g_sym.slots_cap * 2;
     uint32_t new_mask = new_cap - 1;
     nn_slot_t *new_slots = (nn_slot_t *)calloc((size_t)new_cap, sizeof(nn_slot_t));
-    if (!new_slots) {
-        fprintf(stderr, "nn_symbol: slots calloc failed\n");
-        abort();
-    }
+    if (!new_slots) return -1;
 
     uint32_t i;
     for (i = 0; i < g_sym.slots_cap; i++) {
@@ -150,17 +137,22 @@ static void slots_grow(void)
     g_sym.slots = new_slots;
     g_sym.slots_cap = new_cap;
     g_sym.slots_mask = new_mask;
+    return 0;
 }
 
 /* --- Public API --- */
 
 void nn_symbol_init(uint32_t initial_capacity)
 {
+    if (g_sym.slots) nn_symbol_destroy();
+
     uint32_t cap = NN_SYMBOL_DEFAULT_CAPACITY;
     if (initial_capacity > cap) {
-        /* Round up to power of two. */
-        cap = 1;
-        while (cap < initial_capacity) cap *= 2;
+        /* Round up to a power of two.  The hint is clamped so that the
+         * rounding and the slot table's doubling cannot wrap uint32_t. */
+        uint32_t want = initial_capacity < NN_SYMBOL_MAX_INITIAL
+                            ? initial_capacity : NN_SYMBOL_MAX_INITIAL;
+        while (cap < want) cap *= 2;
     }
 
     memset(&g_sym, 0, sizeof(g_sym));
@@ -206,6 +198,11 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
      * sentinel is the one value the Haskell boundary refuses to wrap. */
     if (!g_sym.slots) return NN_SYMBOL_INVALID;
 
+    /* A length past uint32_t can be neither stored nor already present;
+     * truncated into the entry it would read back as a shorter string.
+     * Refused here, before a byte of str is read. */
+    if ((uint64_t)len > UINT32_MAX) return NN_SYMBOL_INVALID;
+
     /* An empty string arrives from Haskell's zero-copy marshalling as
      * (NULL, 0).  memcpy/memcmp require valid pointers even for a zero
      * length, so normalize at the boundary.  Empty symbols are reachable
@@ -224,7 +221,7 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
 
         if (g_sym.slots[idx].hash == hash) {
             nn_symbol_entry_t *e = &g_sym.entries[id];
-            if (e->len == (uint32_t)len &&
+            if (e->len == len &&
                 memcmp(g_sym.arena + e->offset, str, len) == 0) {
                 return (nn_symbol_t)id;
             }
@@ -232,12 +229,29 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
         idx = (idx + 1) & g_sym.slots_mask;
     }
 
-    /* Not found - insert new symbol. */
-    entries_ensure();
+    /* Not found - insert.  Everything the insert needs is reserved before
+     * any of it is committed, so a refusal leaves the table as it was.
+     * The slot table grows ahead of the insert that would reach the load
+     * limit, which keeps an empty slot for every later probe to stop at. */
+    if ((uint64_t)len >= NN_SYMBOL_ARENA_LIMIT - (uint64_t)g_sym.arena_used)
+        return NN_SYMBOL_INVALID;
+    if (arena_reserve(len + 1) != 0) return NN_SYMBOL_INVALID;
+    if (entries_reserve() != 0) return NN_SYMBOL_INVALID;
+    if ((uint64_t)(g_sym.count + 1) * 100 >= (uint64_t)g_sym.slots_cap * NN_SYMBOL_LOAD_PERCENT) {
+        if (slots_grow() != 0) return NN_SYMBOL_INVALID;
+        idx = hash & g_sym.slots_mask;
+        while (g_sym.slots[idx].id != 0) {
+            idx = (idx + 1) & g_sym.slots_mask;
+        }
+    }
+
     g_sym.count++;
     uint32_t new_id = g_sym.count;  /* 1-based */
+    uint32_t offset = (uint32_t)g_sym.arena_used;
 
-    uint32_t offset = arena_push(str, len);
+    memcpy(g_sym.arena + offset, str, len);
+    g_sym.arena[offset + len] = '\0';
+    g_sym.arena_used += len + 1;
 
     g_sym.entries[new_id].offset = offset;
     g_sym.entries[new_id].len = (uint32_t)len;
@@ -245,11 +259,6 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
 
     g_sym.slots[idx].hash = hash;
     g_sym.slots[idx].id = new_id;
-
-    /* Grow hash table if load exceeds threshold. */
-    if ((uint64_t)g_sym.count * 100 >= (uint64_t)g_sym.slots_cap * NN_SYMBOL_LOAD_PERCENT) {
-        slots_grow();
-    }
 
     return (nn_symbol_t)new_id;
 }

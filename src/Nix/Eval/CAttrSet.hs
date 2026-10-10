@@ -11,6 +11,12 @@
 -- Values are opaque @CThunkPtr@ handles stored as @void*@ on the C side.
 -- The C side never dereferences them.  Thunk lifetimes are managed by
 -- the thunk arena; attribute set cleanup only frees the key\/value arrays.
+--
+-- A set holds at most 'maxBound' :: 'Word32' entries, upstream's own
+-- ceiling (its @Bindings@ counts in @uint32_t@).  Every constructor and
+-- insert checks its C result, so a set the C side cannot build raises
+-- 'Nix.Eval.CStatus.CStatusError' instead of leaving a NULL or a short
+-- set behind.
 module Nix.Eval.CAttrSet
   ( -- * Opaque handle
     CAttrSet,
@@ -39,10 +45,12 @@ module Nix.Eval.CAttrSet
   )
 where
 
+import Control.Monad (unless)
 import Data.Word (Word32)
 import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Array (peekArray, withArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Nix.Eval.CStatus (cStatusFailure, checkedCPtr)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.Symbol (Symbol (..))
 
@@ -61,7 +69,7 @@ foreign import ccall unsafe "nn_attrset_new"
   c_nn_attrset_new :: Word32 -> IO CAttrSet
 
 foreign import ccall unsafe "nn_attrset_insert"
-  c_nn_attrset_insert :: CAttrSet -> Word32 -> Ptr () -> IO ()
+  c_nn_attrset_insert :: CAttrSet -> Word32 -> Ptr () -> IO CInt
 
 foreign import ccall unsafe "nn_attrset_freeze"
   c_nn_attrset_freeze :: CAttrSet -> IO ()
@@ -70,7 +78,7 @@ foreign import ccall unsafe "nn_attrset_lookup"
   c_nn_attrset_lookup :: CAttrSet -> Word32 -> IO (Ptr ())
 
 foreign import ccall unsafe "nn_attrset_index"
-  c_nn_attrset_index :: CAttrSet -> Word32 -> IO CInt
+  c_nn_attrset_index :: CAttrSet -> Word32 -> IO Word32
 
 foreign import ccall unsafe "nn_attrset_set_value"
   c_nn_attrset_set_value :: CAttrSet -> Word32 -> Ptr () -> IO ()
@@ -93,13 +101,23 @@ foreign import ccall unsafe "nn_attrset_union"
 foreign import ccall unsafe "nn_attrset_remove_keys"
   c_nn_attrset_remove_keys :: CAttrSet -> Ptr Word32 -> Word32 -> IO CAttrSet
 
+-- | @NN_ATTRSET_NOT_FOUND@, the index answer for an absent key.  Must
+-- stay in lockstep with @cbits\/nn_attrset.h@.
+indexNotFound :: Word32
+indexNotFound = maxBound
+
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
--- | Allocate a new empty attribute set with the given capacity hint.
-cattrsetNew :: Word32 -> IO CAttrSet
-cattrsetNew = c_nn_attrset_new
+-- | Allocate a new empty attribute set sized for the expected number of
+-- entries.  The count only sizes the first allocation, so one past the
+-- ceiling is clamped to it: the inserts are what enforce the ceiling.
+cattrsetNew :: Int -> IO CAttrSet
+cattrsetNew expected = checkedCPtr "nn_attrset_new" =<< c_nn_attrset_new capacity
+  where
+    capacity = fromIntegral (max 0 (min expected entryCeiling))
+    entryCeiling = fromIntegral (maxBound :: Word32)
 
 -- ---------------------------------------------------------------------------
 -- Construction
@@ -108,8 +126,10 @@ cattrsetNew = c_nn_attrset_new
 -- | Insert a key-value pair.  Call before freeze.
 -- The value is a CThunkPtr cast to Ptr () - C never dereferences it.
 cattrsetInsert :: CAttrSet -> Symbol -> CThunkPtr -> IO ()
-cattrsetInsert set (Symbol sym) ptr =
-  c_nn_attrset_insert set sym (castPtr ptr)
+cattrsetInsert set (Symbol sym) ptr = do
+  status <- c_nn_attrset_insert set sym (castPtr ptr)
+  unless (status == 0) $
+    cStatusFailure "nn_attrset_insert" "the attribute set cannot grow (allocation failure or its 4294967295-entry ceiling)"
 
 -- | Sort and deduplicate.  Must be called once before any queries.
 cattrsetFreeze :: CAttrSet -> IO ()
@@ -130,7 +150,7 @@ cattrsetLookup set (Symbol sym) = do
 cattrsetIndex :: CAttrSet -> Symbol -> IO (Maybe Word32)
 cattrsetIndex set (Symbol sym) = do
   idx <- c_nn_attrset_index set sym
-  pure (if idx < 0 then Nothing else Just (fromIntegral idx))
+  pure (if idx == indexNotFound then Nothing else Just idx)
 
 -- | Get the value at a known index.
 cattrsetGetValue :: CAttrSet -> Word32 -> IO CThunkPtr
@@ -166,7 +186,7 @@ cattrsetKeys set = do
 
 -- | Right-biased union (// semantics).  Result is frozen.
 cattrsetUnion :: CAttrSet -> CAttrSet -> IO CAttrSet
-cattrsetUnion = c_nn_attrset_union
+cattrsetUnion a b = checkedCPtr "nn_attrset_union" =<< c_nn_attrset_union a b
 
 -- | Remove a list of keys.  Result is frozen.
 cattrsetRemoveKeys :: CAttrSet -> [Symbol] -> IO CAttrSet
@@ -174,4 +194,4 @@ cattrsetRemoveKeys set syms = do
   let raw = map unSymbol syms
       n = fromIntegral (length raw)
   withArray raw $ \ptr ->
-    c_nn_attrset_remove_keys set ptr n
+    checkedCPtr "nn_attrset_remove_keys" =<< c_nn_attrset_remove_keys set ptr n

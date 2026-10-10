@@ -14,6 +14,9 @@
  * nn_list_drop builds a suffix over its source's items array, which
  * that immutability makes safe to share.
  *
+ * NULL is the empty list, so a constructor cannot also use it to report
+ * failure: each returns 0 or -1 and hands the list back through `out`.
+ *
  * Lifecycle: constructed during evaluation, freed via nn_list_free_all()
  * at arena teardown.  Not thread-safe - single-threaded evaluation only.
  */
@@ -39,15 +42,17 @@ typedef struct nn_list {
 /* Allocate a new list with space for `count` thunk pointers.
  * The items array is allocated via the env page allocator (O(1)).
  * The header is malloc'd and tracked for bulk cleanup.
- * Returns NULL on allocation failure or if count is 0. */
-nn_list_t *nn_list_new(uint32_t count);
+ * Returns 0 with *out the new list, or NULL when count is 0; returns -1
+ * with *out NULL when an allocation fails. */
+int nn_list_new(nn_list_t **out, uint32_t count);
 
 /* The elements of `list` from index `n` on, as a new tracked header over
  * the same items array: O(1) whatever the length, where a copy would
  * add count - n slots to pages nothing frees before evaluation end.
- * Returns NULL if no element remains (n >= count) or on allocation
- * failure. */
-nn_list_t *nn_list_drop(const nn_list_t *list, uint32_t n);
+ * Returns 0 with *out the suffix, or NULL when no element remains
+ * (`list` empty or n >= count); returns -1 with *out NULL when the
+ * header cannot be allocated. */
+int nn_list_drop(nn_list_t **out, const nn_list_t *list, uint32_t n);
 
 /* Free all tracked list headers at once (arena-style cleanup).
  * Items arrays are freed by nn_env_destroy (page allocator).

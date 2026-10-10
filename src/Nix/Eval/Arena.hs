@@ -23,10 +23,10 @@
 -- 'ArenaNotInitialized' is a setup diagnosis: add the bracket and start
 -- the process again.  It is not an error to catch and retry in the same
 -- process, because GHC updates a thunk whose evaluation raised with that
--- exception: a library constant that reached C before the window (the
--- shared null thunk, the @true@ and @false@ slots of
--- 'Nix.Builtins.builtinEnv') re-raises it inside a later, live arena.
--- Removing those process-lifetime constants is #19.
+-- exception: any shared value whose evaluation reached C before the
+-- window re-raises it inside a later, live arena.  The @null@, @true@
+-- and @false@ thunks are C statics outside every arena, so forcing one
+-- needs no window and survives every cycle.
 module Nix.Eval.Arena
   ( -- * Lifecycle
     arenaInit,
@@ -88,8 +88,8 @@ arenaInit = do
 -- explicitly (@derivationWrapper@ in "Nix.Builtins") or as a
 -- parameter-free entry of 'Nix.Builtins.builtinEnv' that GHC shares
 -- across its calls (@storeDir@, @map@), keep pointing into the memory
--- freed here, and only an entry built per call (@currentTime@) survives
--- a second cycle.
+-- freed here, and only an entry built per call (@currentTime@) or one of
+-- the static @null@, @true@ and @false@ thunks survives a second cycle.
 --
 -- 1. Collects all StablePtr payloads from thunks (batch C call)
 -- 2. Frees each StablePtr from Haskell

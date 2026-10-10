@@ -140,7 +140,7 @@ import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cen
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CStatus (checkedCPtr)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedBool, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedNull, cthunkNewComputedPath, cthunkNewComputedStr, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
@@ -448,8 +448,7 @@ attrSetUnionWith f a b = attrSetFromMap (Map.unionWith f (attrSetToMap a) (attrS
 attrSetFromMap :: Map Text Thunk -> AttrSet
 attrSetFromMap m = m `seq` unsafePerformIO $ do
   let pairs = Map.toList m
-      n = fromIntegral (length pairs)
-  cset <- cattrsetNew n
+  cset <- cattrsetNew (length pairs)
   forM_ pairs $ \(key, Thunk ptr) -> do
     sym <- symbolIntern key
     cattrsetInsert cset sym ptr
@@ -463,8 +462,7 @@ attrSetFromMap m = m `seq` unsafePerformIO $ do
 {-# NOINLINE buildCAttrSetKeys #-}
 buildCAttrSetKeys :: [Text] -> CAttrSet
 buildCAttrSetKeys keys = unsafePerformIO $ do
-  let n = fromIntegral (length keys)
-  cset <- cattrsetNew n
+  cset <- cattrsetNew (length keys)
   forM_ keys $ \key -> do
     sym <- symbolIntern key
     cattrsetInsert cset sym nullPtr
@@ -687,8 +685,8 @@ cheapThunk :: Env -> Expr -> Thunk
 cheapThunk env (EResolvedVar level idx) = envLookupResolved level idx env
 cheapThunk _ (ELit (NixInt n)) = Thunk (newComputedIntPtr n)
 cheapThunk _ (ELit (NixFloat n)) = Thunk (newComputedFloatPtr n)
-cheapThunk _ (ELit (NixBool b)) = Thunk (newComputedBoolPtr (if b then 1 else 0))
-cheapThunk _ (ELit NixNull) = Thunk newComputedNullPtr
+cheapThunk _ (ELit (NixBool b)) = Thunk (cthunkBool b)
+cheapThunk _ (ELit NixNull) = Thunk cthunkNull
 cheapThunk env (ELambda formals body NoCaptureInfo) =
   let bodyBcIdx = unsafePerformIO (compileExpr body)
       evalFormals = unsafePerformIO (compileFormalsToEval formals)
@@ -737,8 +735,8 @@ cheapThunkBc env bcIdx =
        in Thunk (newComputedFloatPtr (castWord64ToDouble w64))
     OpLitBool ->
       let flag = unsafePerformIO (cbcShortArg bcIdx)
-       in Thunk (newComputedBoolPtr (if flag /= 0 then 1 else 0))
-    OpLitNull -> Thunk newComputedNullPtr
+       in Thunk (cthunkBool (flag /= 0))
+    OpLitNull -> Thunk cthunkNull
     OpLitUri ->
       let sym = unsafePerformIO (cbcArg1 bcIdx)
        in Thunk (newComputedStrPtr (symbolBytes (Symbol sym)))
@@ -845,14 +843,16 @@ newBcThunkPtrLazy bcIdx env =
     cthunkNewBc bcIdx (castStablePtrToPtr sp)
 
 -- | Wrap an already-computed value as a thunk.
--- Scalars (int/float/bool/null) use inline C thunks (no StablePtr).
+-- Ints and floats use inline C thunks (no StablePtr); booleans and null
+-- are the shared static cells, as upstream hands out one @vTrue@,
+-- @vFalse@ and @vNull@ (eval.cc at 2.24.9, @EvalState::getBool@).
 -- Attrs, paths, and context-free strings use C-native tags (no StablePtr).
 -- Other complex values fall back to StablePtr-backed C thunks.
 evaluated :: NixValue -> Thunk
 evaluated (VInt n) = Thunk (newComputedIntPtr n)
 evaluated (VFloat d) = Thunk (newComputedFloatPtr d)
-evaluated (VBool b) = Thunk (newComputedBoolPtr (if b then 1 else 0))
-evaluated VNull = Thunk newComputedNullPtr
+evaluated (VBool b) = Thunk (cthunkBool b)
+evaluated VNull = Thunk cthunkNull
 evaluated (VAttrs (AttrSet cset)) = Thunk (newComputedAttrsPtr cset)
 evaluated (VPath p) = Thunk (newComputedPathPtr p)
 evaluated (VStr t ctx)
@@ -890,16 +890,6 @@ newComputedIntPtr n = unsafePerformIO (cthunkNewComputedInt n)
 {-# NOINLINE newComputedFloatPtr #-}
 newComputedFloatPtr :: Double -> CThunkPtr
 newComputedFloatPtr d = unsafePerformIO (cthunkNewComputedFloat d)
-
--- | Wrap a bool in a pre-computed C thunk (inline, no StablePtr).
-{-# NOINLINE newComputedBoolPtr #-}
-newComputedBoolPtr :: Word8 -> CThunkPtr
-newComputedBoolPtr b = unsafePerformIO (cthunkNewComputedBool b)
-
--- | Wrap null in a pre-computed C thunk (inline, no StablePtr).
-{-# NOINLINE newComputedNullPtr #-}
-newComputedNullPtr :: CThunkPtr
-newComputedNullPtr = unsafePerformIO cthunkNewComputedNull
 
 -- | Wrap a context-free string in a pre-computed C thunk (interned symbol, no StablePtr).
 {-# NOINLINE newComputedStrPtr #-}

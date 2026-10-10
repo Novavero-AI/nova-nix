@@ -17,7 +17,6 @@
 #include "nn_attrset.h"
 #include "nn_assert.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,20 +26,20 @@ static nn_attrset_t **g_tracked = NULL;
 static uint32_t g_tracked_count = 0;
 static uint32_t g_tracked_cap   = 0;
 
-static void nn_attrset_track(nn_attrset_t *set)
+/* Returns 0, or -1 when the tracking array cannot grow. */
+static int nn_attrset_track(nn_attrset_t *set)
 {
     if (g_tracked_count >= g_tracked_cap) {
+        if (g_tracked_cap > UINT32_MAX / 2) return -1;
         uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
         nn_attrset_t **new_arr = (nn_attrset_t **)realloc(
             g_tracked, (size_t)new_cap * sizeof(nn_attrset_t *));
-        if (!new_arr) {
-            fprintf(stderr, "nn_attrset_track: realloc failed\n");
-            abort();
-        }
+        if (!new_arr) return -1;
         g_tracked = new_arr;
         g_tracked_cap = new_cap;
     }
     g_tracked[g_tracked_count++] = set;
+    return 0;
 }
 
 void nn_attrset_free_all(void)
@@ -79,9 +78,17 @@ static int cmp_tagged(const void *a, const void *b);
 
 /* --- Helpers --- */
 
-/* Grow arrays to at least new_cap.  Returns 0 on success, -1 on failure. */
-static int grow(nn_attrset_t *set, uint32_t new_cap)
+/* Double the capacity, stopping at NN_ATTRSET_MAX_ENTRIES; the doubling
+ * is computed in uint64_t so it cannot wrap.  Returns 0, or -1 with the
+ * capacity unchanged when the set is at the ceiling or an allocation
+ * fails (an array that did grow is kept, only larger). */
+static int grow(nn_attrset_t *set)
 {
+    if (set->capacity >= NN_ATTRSET_MAX_ENTRIES) return -1;
+    uint64_t doubled = (uint64_t)set->capacity * 2;
+    uint32_t new_cap = doubled > NN_ATTRSET_MAX_ENTRIES
+                           ? NN_ATTRSET_MAX_ENTRIES : (uint32_t)doubled;
+
     nn_symbol_t *new_keys = (nn_symbol_t *)realloc(
         set->keys, (size_t)new_cap * sizeof(nn_symbol_t));
     if (!new_keys) return -1;
@@ -97,8 +104,8 @@ static int grow(nn_attrset_t *set, uint32_t new_cap)
 }
 
 /* Binary search for a symbol in the sorted keys array.
- * Returns the index if found, or -1. */
-static int32_t bsearch_key(const nn_symbol_t *keys, uint32_t count, nn_symbol_t key)
+ * Returns the index if found, or NN_ATTRSET_NOT_FOUND. */
+static uint32_t bsearch_key(const nn_symbol_t *keys, uint32_t count, nn_symbol_t key)
 {
     uint32_t lo = 0;
     uint32_t hi = count;
@@ -109,10 +116,10 @@ static int32_t bsearch_key(const nn_symbol_t *keys, uint32_t count, nn_symbol_t 
         } else if (keys[mid] > key) {
             hi = mid;
         } else {
-            return (int32_t)mid;
+            return mid;
         }
     }
-    return -1;
+    return NN_ATTRSET_NOT_FOUND;
 }
 
 /* --- Lifecycle --- */
@@ -130,14 +137,12 @@ nn_attrset_t *nn_attrset_new(uint32_t capacity)
     set->capacity = capacity;
     set->frozen = 0;
 
-    if (!set->keys || !set->values) {
+    if (!set->keys || !set->values || nn_attrset_track(set) != 0) {
         free(set->keys);
         free(set->values);
         free(set);
         return NULL;
     }
-
-    nn_attrset_track(set);
     return set;
 }
 
@@ -151,18 +156,13 @@ void nn_attrset_free(nn_attrset_t *set)
 
 /* --- Construction --- */
 
-void nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value)
+int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value)
 {
-    if (set->count >= set->capacity) {
-        if (grow(set, set->capacity * 2) != 0) {
-            fprintf(stderr, "nn_attrset_insert: grow failed (capacity %u)\n",
-                    (unsigned)set->capacity);
-            abort();
-        }
-    }
+    if (set->count >= set->capacity && grow(set) != 0) return -1;
     set->keys[set->count] = key;
     set->values[set->count] = value;
     set->count++;
+    return 0;
 }
 
 void nn_attrset_freeze(nn_attrset_t *set)
@@ -265,12 +265,12 @@ void nn_attrset_freeze(nn_attrset_t *set)
 
 void *nn_attrset_lookup(const nn_attrset_t *set, nn_symbol_t key)
 {
-    int32_t idx = bsearch_key(set->keys, set->count, key);
-    if (idx < 0) return NULL;
+    uint32_t idx = bsearch_key(set->keys, set->count, key);
+    if (idx == NN_ATTRSET_NOT_FOUND) return NULL;
     return set->values[idx];
 }
 
-int32_t nn_attrset_index(const nn_attrset_t *set, nn_symbol_t key)
+uint32_t nn_attrset_index(const nn_attrset_t *set, nn_symbol_t key)
 {
     return bsearch_key(set->keys, set->count, key);
 }
@@ -310,32 +310,40 @@ nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b)
     /* The merge-join below assumes both inputs are sorted; every set this
      * module produces is frozen (hence sorted), so guard it in debug. */
     NN_ASSERT(a->frozen && b->frozen, "nn_attrset_union: inputs must be frozen");
-    /* Merge-join: all keys from both, b wins on conflict. */
-    uint32_t cap = a->count + b->count;
+    /* Merge-join: all keys from both, b wins on conflict.  The sum of two
+     * uint32_t counts needs 33 bits; sized at the ceiling instead, the
+     * result still holds any union with enough shared keys to fit, and
+     * an insert refuses the one that does not. */
+    uint64_t total = (uint64_t)a->count + b->count;
+    uint32_t cap = total > NN_ATTRSET_MAX_ENTRIES
+                       ? NN_ATTRSET_MAX_ENTRIES : (uint32_t)total;
     nn_attrset_t *result = nn_attrset_new(cap);
-    if (!result) { fprintf(stderr, "nn_attrset_union: alloc failed\n"); abort(); }
+    if (!result) return NULL;
     uint32_t ia = 0, ib = 0;
 
+    /* A refused result stays tracked, so teardown frees it. */
     while (ia < a->count && ib < b->count) {
+        int status;
         if (a->keys[ia] < b->keys[ib]) {
-            nn_attrset_insert(result, a->keys[ia], a->values[ia]);
+            status = nn_attrset_insert(result, a->keys[ia], a->values[ia]);
             ia++;
         } else if (a->keys[ia] > b->keys[ib]) {
-            nn_attrset_insert(result, b->keys[ib], b->values[ib]);
+            status = nn_attrset_insert(result, b->keys[ib], b->values[ib]);
             ib++;
         } else {
             /* Same key - b wins (right-biased //). */
-            nn_attrset_insert(result, b->keys[ib], b->values[ib]);
+            status = nn_attrset_insert(result, b->keys[ib], b->values[ib]);
             ia++;
             ib++;
         }
+        if (status != 0) return NULL;
     }
     while (ia < a->count) {
-        nn_attrset_insert(result, a->keys[ia], a->values[ia]);
+        if (nn_attrset_insert(result, a->keys[ia], a->values[ia]) != 0) return NULL;
         ia++;
     }
     while (ib < b->count) {
-        nn_attrset_insert(result, b->keys[ib], b->values[ib]);
+        if (nn_attrset_insert(result, b->keys[ib], b->values[ib]) != 0) return NULL;
         ib++;
     }
 
@@ -350,7 +358,7 @@ nn_attrset_t *nn_attrset_remove_keys(
 {
     NN_ASSERT(set->frozen, "nn_attrset_remove_keys: input must be frozen");
     nn_attrset_t *result = nn_attrset_new(set->count);
-    if (!result) { fprintf(stderr, "nn_attrset_remove_keys: alloc failed\n"); abort(); }
+    if (!result) return NULL;
     uint32_t i;
 
     for (i = 0; i < set->count; i++) {
@@ -364,8 +372,8 @@ nn_attrset_t *nn_attrset_remove_keys(
                 break;
             }
         }
-        if (!skip) {
-            nn_attrset_insert(result, set->keys[i], set->values[i]);
+        if (!skip && nn_attrset_insert(result, set->keys[i], set->values[i]) != 0) {
+            return NULL;
         }
     }
 
