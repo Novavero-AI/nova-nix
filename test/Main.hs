@@ -12749,6 +12749,37 @@ arenaGuardChild name = case [guardAction path | path <- arenaGuardPaths, guardNa
       Right () -> servedLine
   _ -> hPutStrLn stderr ("unknown arena guard path: " ++ name) >> exitWith (ExitFailure 2)
 
+-- | Run as a child, evaluate one expression under the IO evaluator, which
+-- writes traces and warnings to stderr as it goes, then write its failure
+-- to the same stream, so the parent reads them in the order they came.
+evalChildFlag :: String
+evalChildFlag = "--eval-child"
+
+evalChild :: String -> IO ()
+evalChild source = do
+  result <- evalNixIO "." (T.pack source)
+  either (\err -> hPutStrLn stderr ("error: " <> T.unpack err)) (const (pure ())) result
+
+-- | @deepSeq@, @trace@ and @warn@ finish with their first argument before
+-- they force their second (primops.cc at 2.24.9), however the second
+-- arrives.  Each expected stream is nix-instantiate 2.24.9's: its trace
+-- and warning lines, then the final error line.
+testFirstArgumentOrderIO :: IO [Bool]
+testFirstArgumentOrderIO = do
+  putStrLn "eval/first-argument-order-io"
+  self <- getExecutablePath
+  let emits label source expected = runTestM label $ do
+        (_, _, err) <- Proc.readCreateProcessWithExitCode (Proc.proc self [evalChildFlag, T.unpack source]) ""
+        pure (assertEqual label expected (T.lines (T.pack err)))
+  sequence
+    [ emits "trace prints before its second argument fails" "builtins.trace \"hi\" (throw \"b\")" ["trace: hi", "error: b"],
+      emits "warn warns before its second argument fails" "builtins.warn \"w\" (throw \"b\")" ["evaluation warning: w", "error: b"],
+      emits "deepSeq forces its first argument deeply before its second" "builtins.deepSeq { a = throw \"a\"; } (throw \"b\")" ["error: a"],
+      emits "deepSeq applied to one argument first forces it on the second" "let f = builtins.deepSeq { a = throw \"a\"; }; in f (throw \"b\")" ["error: a"],
+      emits "deepSeq mapped over a list forces its first argument first" "builtins.elemAt (map (builtins.deepSeq { a = throw \"a\"; }) [ (throw \"b\") ]) 0" ["error: a"],
+      emits "trace inside deepSeq sees the forced value" "let x = { a = 1 + 1; }; in builtins.deepSeq x (builtins.trace x 1)" ["trace: { a = 2; }"]
+    ]
+
 -- | The smallest slot count whose byte size exceeds @UINT32_MAX@.
 -- @nn_env_alloc_slots@ refuses it before touching a page, so inside a
 -- live arena it fails without exhausting anything.
@@ -15350,6 +15381,7 @@ main :: IO ()
 main =
   getArgs >>= \case
     [flag, name] | flag == arenaGuardChildFlag -> arenaGuardChild name
+    [flag, source] | flag == evalChildFlag -> bracket_ arenaInit arenaDestroy (evalChild source)
     _ -> bracket_ arenaInit arenaDestroy runSuite
 
 -- | Every group, under the one arena bracket.
@@ -15423,6 +15455,7 @@ runSuite = do
           testImportIO,
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
+          testFirstArgumentOrderIO,
           testDerivationFields,
           testDerivationPathFieldsIO,
           testPathFilterIO,

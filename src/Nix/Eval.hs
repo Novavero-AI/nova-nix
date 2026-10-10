@@ -611,6 +611,8 @@ callBc env argIdx funcVal = case funcVal of
     extEnv <- matchFormals closureEnv formals argThunk
     evalBytecode extEnv bodyBcIdx
   VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
+  VBuiltin name [first]
+    | Just finishFirst <- beforeSecondArgument name first -> finishFirst >> evalBytecode env argIdx
   VBuiltin name accArgs -> do
     argVal <- evalBytecode env argIdx
     applyBuiltin name accArgs argVal
@@ -1455,6 +1457,8 @@ applyUnforced (VLambda closureEnv formals bodyBcIdx) argThunk = do
 -- map/filter passing a throwing element to tryEval yields success = false,
 -- not an escaped error.
 applyUnforced (VBuiltin "tryEval" []) argThunk = tryEvalAction (force argThunk)
+applyUnforced (VBuiltin name [first]) argThunk
+  | Just finishFirst <- beforeSecondArgument name first = finishFirst >> force argThunk
 applyUnforced other argThunk = do
   val <- force argThunk
   applyForced other val
@@ -3017,9 +3021,20 @@ digestToHex = bytesToHexText . BA.convert
 -- ---------------------------------------------------------------------------
 
 builtinDeepSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinDeepSeq first second = do
-  deepForce first
-  pure second
+builtinDeepSeq first second = deepForce first >> pure second
+
+-- | What a builtin returning its second argument does with its first
+-- before it forces that second: @prim_deepSeq@ forces the first deeply,
+-- @prim_trace@ prints it and @prim_warn@ warns with it, and only then does
+-- each force the second (primops.cc at 2.24.9).  A builtin's arguments
+-- are forced before it runs, so an application that has the second still
+-- unforced does this first.
+beforeSecondArgument :: (MonadEval m) => Text -> NixValue -> Maybe (m ())
+beforeSecondArgument name first = case name of
+  "deepSeq" -> Just (deepForce first)
+  "trace" -> Just (emitTrace first)
+  "warn" -> Just (emitWarning first)
+  _ -> Nothing
 
 deepForce :: (MonadEval m) => NixValue -> m ()
 deepForce (VList cl) = mapM_ ((force >=> deepForce) . Thunk) (clistThunks cl)
@@ -3032,12 +3047,12 @@ builtinSeq !_first = pure
 
 -- | @builtins.trace msg val@ - print @msg@ to stderr, return @val@.
 builtinTrace :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinTrace msgVal result = do
-  msg <- case msgVal of
-    VStr s _ -> pure (bytesToTextLossy s)
-    other -> pure (printValue PrintInFull other)
-  traceMessage ("trace: " <> msg)
-  pure result
+builtinTrace msgVal result = emitTrace msgVal >> pure result
+
+emitTrace :: (MonadEval m) => NixValue -> m ()
+emitTrace msgVal = traceMessage . ("trace: " <>) $ case msgVal of
+  VStr s _ -> bytesToTextLossy s
+  other -> printValue PrintInFull other
 
 -- | @builtins.warn msg val@ - print warning to stderr, return @val@.
 --
@@ -3045,10 +3060,13 @@ builtinTrace msgVal result = do
 -- @forceString@ (primops.cc at 2.24.9), leaving room to extend the
 -- argument later, where @builtins.trace@ prints any value.
 builtinWarn :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinWarn msgVal result = case msgVal of
-  VStr s _ -> do
-    traceMessage ("warning: " <> bytesToTextLossy s)
-    pure result
+builtinWarn msgVal result = emitWarning msgVal >> pure result
+
+-- | Upstream logs the message as a warning from an expression, which its
+-- logger prefixes @evaluation warning:@.
+emitWarning :: (MonadEval m) => NixValue -> m ()
+emitWarning msgVal = case msgVal of
+  VStr s _ -> traceMessage ("evaluation warning: " <> bytesToTextLossy s)
   other ->
     throwEvalError ("expected a string but found " <> typeName other <> ": " <> printValue PrintForError other)
 
