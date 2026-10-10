@@ -128,7 +128,7 @@ import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
-import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
+import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printValue)
@@ -202,7 +202,7 @@ import Nix.Expr.Types
   )
 import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
 import Nix.Json (Json (..), parseJson, renderJson)
-import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathNameErrorText, storePathNameReasonText, storePathToText)
+import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
@@ -4127,8 +4127,7 @@ forceAttrStr builtin key attrs = do
   bytes <- forceAttrBytes builtin key attrs
   decodedText builtin bytes
 
--- | Like 'forceAttrStr' but returns the coerced RAW BYTES - for
--- derivation fields (builder) that flow byte-exact into the ATerm.
+-- | Like 'forceAttrStr' but returns the coerced RAW BYTES.
 forceAttrBytes :: (MonadEval m) => Text -> Text -> AttrSet -> m BS.ByteString
 forceAttrBytes builtin key attrs =
   case attrSetLookup key attrs of
@@ -4259,7 +4258,12 @@ builtinDerivationStrict (VAttrs attrs) = do
   let nameTrace =
         traceIfPresent attrs "name" "while evaluating the derivation attribute 'name'"
           . traceIfPresent attrs "name" "while evaluating the `name` attribute passed to builtins.derivationStrict"
-  drvName <- nameTrace (forceAttrStr "derivation" "name" attrs)
+  -- Read with forceStringNoCtx (primops.cc:1130 at 2.24.9): a string with
+  -- no context, never a value coerced to one.  An absent name is getAttr's
+  -- error.
+  drvName <- nameTrace $ case attrSetLookup "name" attrs of
+    Nothing -> throwEvalError "attribute 'name' missing"
+    Just thunk -> decodedText "derivation" =<< structuredStringValue RefuseContext =<< force thunk
   -- Upstream processes every other attribute inside a catch that names it
   -- (derivationStrictInternal); an absent one has nothing to name.
   let traceAttr key = traceIfPresent attrs key (derivationAttrTrace drvName key)
@@ -4269,24 +4273,40 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- FIELD rather than a composed path name.
   case checkStorePathName drvName of
     Left err ->
-      throwEvalError
-        ("derivation: invalid derivation name '" <> drvName <> "': " <> storePathNameReasonText (spneReason err))
+      throwEvalError ("invalid derivation name: " <> storePathNameUpstreamText err <> ". Please pass a different 'name'.")
     Right () -> pure ()
   passing <-
     addErrorTrace "while evaluating the `__structuredAttrs` attribute passed to builtins.derivationStrict" $
       attrPassingOf attrs
   let fieldContext = "derivation \"" <> drvName <> "\""
+      optionalCoerced key =
+        traverse (\thunk -> fst <$> (coerceToString True force applyValue coercePathToStore =<< force thunk)) (attrSetLookup key attrs)
+      optionalString rule key = traverse (force >=> structuredStringValue rule) (attrSetLookup key attrs)
+      -- Upstream checks both once its attribute loop is done, the builder
+      -- first, and an empty one counts as absent (primops.cc:1403).
+      requiredFields (systemValue, builderValue) = do
+        builderBytes <- required "builder" builderValue
+        systemBytes <- required "system" systemValue
+        systemText <- decodedText fieldContext systemBytes
+        pure (systemText, builderBytes)
+      required key value = case value of
+        Just bytes | not (BS.null bytes) -> pure bytes
+        _ -> throwEvalError ("required attribute '" <> key <> "' missing")
   -- A structured derivation's builder and system are read as strings
   -- (upstream's forceString and forceStringNoCtx) rather than coerced.
+  -- Otherwise they are the strings their environment entries coerce to,
+  -- a path copied to the store (primops.cc:1347 at 2.24.9).
   (system, builder) <- case passing of
     PassAsEnvironment ->
-      (,)
-        <$> traceAttr "system" (forceAttrStr fieldContext "system" attrs)
-        <*> traceAttr "builder" (forceAttrBytes fieldContext "builder" attrs)
+      requiredFields
+        =<< (,)
+          <$> traceAttr "system" (optionalCoerced "system")
+          <*> traceAttr "builder" (optionalCoerced "builder")
     PassAsStructuredAttrs ->
-      (,)
-        <$> traceAttr "system" (decodedText fieldContext =<< structuredString RefuseContext fieldContext "system" attrs)
-        <*> traceAttr "builder" (structuredString AllowContext fieldContext "builder" attrs)
+      requiredFields
+        =<< (,)
+          <$> traceAttr "system" (optionalString RefuseContext "system")
+          <*> traceAttr "builder" (optionalString AllowContext "builder")
 
   -- __ignoreNulls: when true, null-valued attrs are dropped from the
   -- derivation env (stdenv.mkDerivation sets it); when absent or false,
@@ -4593,9 +4613,9 @@ attrPassingOf attrs = case attrSetLookup structuredAttrsFlag attrs of
     structured <- force thunk >>= expectDerivationBool
     pure (if structured then PassAsStructuredAttrs else PassAsEnvironment)
 
--- | Whether a structured derivation's string field may carry context:
--- the builder may (upstream's forceString), the fields upstream reads with
--- forceStringNoCtx may not.
+-- | Whether a string field read without coercion may carry context: a
+-- structured derivation's builder may (upstream's forceString), the name
+-- and the fields upstream reads with forceStringNoCtx may not.
 data StringContextRule = AllowContext | RefuseContext
 
 -- | A string field of a structured derivation, as upstream reads it:
@@ -4609,8 +4629,8 @@ structuredString rule fieldContext key attrs = case attrSetLookup key attrs of
 structuredStringValue :: (MonadEval m) => StringContextRule -> NixValue -> m BS.ByteString
 structuredStringValue rule val = case (val, rule) of
   (VStr s ctx, RefuseContext)
-    | not (contextIsEmpty ctx) ->
-        throwEvalError ("the string '" <> bytesToTextLossy s <> "' is not allowed to refer to a store path")
+    | Just shown <- firstContextEncoded ctx ->
+        throwEvalError ("the string '" <> bytesToTextLossy s <> "' is not allowed to refer to a store path (such as '" <> shown <> "')")
   (VStr s _, _) -> pure s
   (other, _) ->
     throwEvalError ("expected a string but found " <> typeName other <> ": " <> printValue PrintForError other)
