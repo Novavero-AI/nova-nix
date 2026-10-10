@@ -2853,6 +2853,62 @@ testDerivationPathFieldsIO = do
   Dir.removePathForcibly dir
   pure results
 
+-- | A builtin taking a path coerces its argument as upstream's
+-- coerceToPath does (eval.cc at 2.24.9), and baseNameOf and dirOf as
+-- their coerceToString does.  Each expected value or message is
+-- nix-instantiate 2.24.9's.
+testPathArguments :: IO [Bool]
+testPathArguments = do
+  putStrLn "eval/path-arguments"
+  let refuses label source = runTest label (assertEvalError label source "cannot coerce an integer to a string: 1")
+      fails label source expected = runTest label (assertEvalError label source expected)
+      gives label source expected = runTest label (assertEval label source expected)
+  sequence
+    [ refuses "readFile coerces its argument" "builtins.readFile 1",
+      refuses "readDir coerces its argument" "builtins.readDir 1",
+      refuses "pathExists coerces its argument" "builtins.pathExists 1",
+      refuses "hashFile coerces its path" "builtins.hashFile \"sha256\" 1",
+      refuses "readFileType coerces its argument" "builtins.readFileType 1",
+      refuses "import coerces its argument" "import 1",
+      refuses "scopedImport coerces its path" "builtins.scopedImport { } 1",
+      refuses "builtins.path coerces its path" "builtins.path { path = 1; }",
+      refuses "filterSource coerces its path" "builtins.filterSource (p: t: true) 1",
+      refuses "toPath coerces its argument" "builtins.toPath 1",
+      fails "a coerced path must be absolute" "builtins.toPath \"a\"" "string 'a' doesn't represent an absolute path",
+      fails "builtins.path needs a path" "builtins.path { name = \"x\"; }" "missing required 'path' attribute in the first argument to builtins.path",
+      fails "baseNameOf refuses null as coerceToString does" "builtins.baseNameOf null" "cannot coerce null to a string: null",
+      fails "dirOf refuses a Boolean as coerceToString does" "builtins.dirOf true" "cannot coerce a Boolean to a string: true",
+      gives "toPath gives a string" "builtins.typeOf (builtins.toPath \"/a/b\")" (mkStr "string"),
+      gives "toPath canonicalizes an outPath" "builtins.toPath { outPath = \"/a//b/\"; }" (mkStr "/a/b"),
+      gives "toPath keeps the context it coerced" "let d = derivation { name = \"d\"; system = \"x\"; builder = \"/bin/sh\"; }; in builtins.concatStringsSep \",\" (builtins.attrNames (builtins.getContext (builtins.toPath \"${d}/bin\")))" (mkStr "/nix/store/wwk71dy0w17kn5spjd8hbsrk6520xs11-d.drv"),
+      gives "baseNameOf takes a __toString" "builtins.baseNameOf { __toString = s: \"/a/b\"; }" (mkStr "b"),
+      gives "dirOf takes an outPath, giving a string" "builtins.dirOf { outPath = /a/b; }" (mkStr "/a"),
+      gives "dirOf of a path stays a path" "builtins.typeOf (builtins.dirOf /a/b)" (mkStr "path")
+    ]
+
+-- | The same coercion reaching the filesystem: an outPath or a __toString
+-- names the file read.
+testPathArgumentsIO :: IO [Bool]
+testPathArgumentsIO = do
+  putStrLn "eval/path-arguments-io"
+  -- readFileType refuses a symlink above its path, as upstream's does, and
+  -- macOS keeps the temporary directory under /var, a link.
+  tmpBase <- Dir.canonicalizePath =<< getTemporaryDirectory
+  let dir = tmpBase </> "nova-nix-test-path-arguments"
+      file = nixQuotedPath (dir </> "f")
+  Dir.removePathForcibly dir
+  createDirectoryIfMissing True dir
+  BS.writeFile (dir </> "f") "contents"
+  results <-
+    sequence
+      [ runTestIO "readFile reads an outPath" dir ("builtins.readFile { outPath = " <> file <> "; }") (mkStr "contents"),
+        runTestIO "pathExists follows an outPath" dir ("builtins.pathExists { outPath = " <> file <> "; }") (VBool True),
+        runTestIO "readFileType follows a __toString" dir ("builtins.readFileType { __toString = s: " <> file <> "; }") (mkStr "regular"),
+        runTestIO "hashFile hashes an outPath" dir ("builtins.hashFile \"sha256\" { outPath = " <> file <> "; }") (mkStr "d1b2a59fbea7e20077af9f91b27e95e865061b270be03ff539ab3b73587882e8")
+      ]
+  Dir.removePathForcibly dir
+  pure results
+
 -- | The lines of context a failure gathers on its way out of
 -- derivationStrict, and how the CLI reports them (#221).  Only the IO
 -- evaluator keeps them.
@@ -3339,11 +3395,11 @@ testBatchA = do
         assertEvalFail "getEnv-err" "builtins.getEnv 42",
       -- toPath
       runTest "toPath absolute" $
-        assertEval "toPath-abs" "builtins.toPath \"/foo/bar\"" (VPath "/foo/bar"),
+        assertEval "toPath-abs" "builtins.toPath \"/foo/bar\"" (mkStr "/foo/bar"),
       runTest "toPath rejects relative" $
         assertEvalFail "toPath-rel" "builtins.toPath \"foo/bar\"",
-      runTest "toPath passthrough VPath" $
-        assertEval "toPath-vpath" "builtins.toPath (builtins.toPath \"/foo/bar\")" (VPath "/foo/bar"),
+      runTest "toPath of a path gives its string" $
+        assertEval "toPath-vpath" "builtins.toPath /foo/bar" (mkStr "/foo/bar"),
       runTest "toPath type error" $
         assertEvalFail "toPath-err" "builtins.toPath 42",
       runTest "toPath rejects empty" $
@@ -13539,14 +13595,16 @@ testClassIFollowupsIO = do
                 else Fail ("expected a store path named -thefile with context, got " <> bytesText s)
             other -> Fail ("expected VStr, got " <> T.pack (show other)),
         -- canonBaseName's empty-name arm: the filesystem root has no
-        -- base name to copy under (toPath keeps the probe off the
-        -- platform filesystem - the error fires before any read)
-        runTestM "coercing the filesystem root errors (no base name)" $ do
-          result <- evalNixIO testDir "\"${builtins.toPath \"/\"}\""
-          pure $ case result of
-            Left err | "no base name" `T.isInfixOf` err -> Pass
-            Left err -> Fail ("expected a base-name error, got: " <> err)
-            Right val -> Fail ("expected failure, got " <> T.pack (show val))
+        -- base name to copy under, refused before any read.  POSIX only:
+        -- a root path literal on Windows names a drive.
+        if SI.os == "mingw32"
+          then True <$ putStrLn "  SKIP  coercing the filesystem root errors (no base name): the root is a drive"
+          else runTestM "coercing the filesystem root errors (no base name)" $ do
+            result <- evalNixIO testDir "\"${/.}\""
+            pure $ case result of
+              Left err | "no base name" `T.isInfixOf` err -> Pass
+              Left err -> Fail ("expected a base-name error, got: " <> err)
+              Right val -> Fail ("expected failure, got " <> T.pack (show val))
       ]
 
 -- | Bytecode short_arg spill: op-level payload counts at or above the
@@ -15504,6 +15562,8 @@ runSuite = do
           testDerivationTraceIO,
           testDerivationFields,
           testDerivationPathFieldsIO,
+          testPathArguments,
+          testPathArgumentsIO,
           testPathFilterIO,
           testPathSymlinkIO,
           testInterpolatedSymlinkIO,
