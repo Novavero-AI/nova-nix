@@ -1186,6 +1186,13 @@ class (Monad m) => MonadEval m where
   -- failed fetch is an eval error.
   onEvalError :: m a -> m () -> m a
 
+  -- | Run the action; a failure escaping it (a throw, an eval error or an
+  -- abort) gains the given line of context outside the lines it already
+  -- carries, as upstream's @Error::addTrace@ adds one where a @catch@
+  -- rethrows.  Nothing else about the failure changes: its message stays
+  -- the same, and a throw stays catchable by @builtins.tryEval@.
+  addErrorTrace :: Text -> m a -> m a
+
   -- | Run an application one call frame deeper, or refuse it with
   -- upstream's "stack overflow; max-call-depth exceeded" when the frames
   -- already active exceed the ceiling ('Nix.Eval.CallDepth.enterCallFrame'
@@ -1437,6 +1444,10 @@ instance MonadEval PureEval where
   -- Pure evaluation has no external state, so there is nothing to
   -- clean up; the failure passes through unchanged.
   onEvalError (PureEval action) _ = PureEval action
+
+  -- 'runPureEval' reports a failure's message alone, so a line of context
+  -- has nowhere to go.
+  addErrorTrace _ action = action
 
   -- The reader scopes the frame: the action runs one deeper, and whatever
   -- follows it sees the depth it started from, failure or not.

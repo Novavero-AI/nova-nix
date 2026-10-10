@@ -62,7 +62,7 @@ import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings)
 import qualified Nix.Eval.Context as Context
-import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
+import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIO, runEvalIOTraced)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printValue)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
@@ -2396,6 +2396,15 @@ evalNixIO baseDir source = do
   storeDir <- evalNixIOStoreDir
   evalNixIOStore storeDir baseDir source
 
+-- | 'evalNixIO' keeping a failure whole, its lines of context included.
+evalNixIOTraced :: FilePath -> Text -> IO (Either EvalFailure NixValue)
+evalNixIOTraced baseDir source = case parseNix baseDir "<test>" source of
+  Left err -> pure (Left (EvalFailure [] (T.pack (show err))))
+  Right expr -> do
+    storeDir <- evalNixIOStoreDir
+    st <- newEvalState storeDir baseDir
+    runEvalIOTraced st (eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr)
+
 -- | IO eval of a derivation expression to the 'Derivation' the session
 -- recorded for it: forcing the expression's @drvPath@ runs derivationStrict,
 -- which records the @.drv@ under that path, and the recipe is read back the
@@ -2430,6 +2439,96 @@ runTestIOFail label baseDir source = do
 -- | Quoted path literal for embedding absolute paths in Nix source.
 nixQuotedPath :: FilePath -> Text
 nixQuotedPath p = T.pack (show p)
+
+-- | The lines of context a failure gathers on its way out of
+-- derivationStrict, and how the CLI reports them (#221).  Only the IO
+-- evaluator keeps them.
+testDerivationTraceIO :: IO [Bool]
+testDerivationTraceIO = do
+  putStrLn "eval/derivation-trace"
+  let derivationFailure attrs expected = do
+        tmpBase <- getTemporaryDirectory
+        result <- evalNixIOTraced tmpBase ("(derivation { builder = \"b\"; " <> attrs <> " }).drvPath")
+        pure $ case result of
+          Left failure -> assertEqual "derivation-failure" expected failure
+          Right val -> Fail ("expected a failure, got " <> T.pack (show val))
+  sequence
+    [ -- A failure processing one attribute carries upstream's line naming
+      -- it and its derivation (derivationStrictInternal, primops.cc at
+      -- 2.24.9); the message itself is unchanged.
+      runTestM
+        "a failing derivation attribute is named in the failure's trace"
+        ( derivationFailure
+            "system = \"s\"; name = \"x\"; foo = { };"
+            (EvalFailure ["while evaluating attribute 'foo' of derivation 'x'"] "cannot coerce a set to a string (missing __toString or outPath)")
+        ),
+      runTestM
+        "a structured attribute with no JSON form is named in the failure's trace"
+        ( derivationFailure
+            "system = \"s\"; name = \"x\"; __structuredAttrs = true; foo = x: x;"
+            (EvalFailure ["while evaluating attribute 'foo' of derivation 'x'"] "builtins.toJSON: cannot convert a function to JSON")
+        ),
+      -- prim_derivationStrict adds its own line outside forceStringNoCtx's.
+      runTestM
+        "a failing name carries both of upstream's lines"
+        ( derivationFailure
+            "system = \"s\"; name = throw \"n\";"
+            ( EvalFailure
+                [ "while evaluating the derivation attribute 'name'",
+                  "while evaluating the `name` attribute passed to builtins.derivationStrict"
+                ]
+                "n"
+            )
+        ),
+      runTestM
+        "a switch that is not a Boolean is named in the failure's trace"
+        ( derivationFailure
+            "system = \"s\"; name = \"x\"; __ignoreNulls = 1;"
+            (EvalFailure ["while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict"] "expected a Boolean but found an integer: 1")
+        ),
+      runTestM
+        "a structured-attributes switch that is not a Boolean is named in the failure's trace"
+        ( derivationFailure
+            "system = \"s\"; name = \"x\"; __structuredAttrs = 1;"
+            (EvalFailure ["while evaluating the `__structuredAttrs` attribute passed to builtins.derivationStrict"] "expected a Boolean but found an integer: 1")
+        ),
+      runTestM
+        "a structured string field that is not a string is named in the failure's trace"
+        ( derivationFailure
+            "system = \"s\"; name = \"x\"; __structuredAttrs = true; outputHash = 1;"
+            (EvalFailure ["while evaluating attribute 'outputHash' of derivation 'x'"] "expected a string but found an integer: 1")
+        ),
+      runTestM
+        "a missing attribute is refused without a line naming it"
+        (derivationFailure "name = \"x\";" (EvalFailure [] "derivation \"x\": missing required attribute 'system'")),
+      runTestM "a failure in a dependency is traced through each derivation, outermost first" $ do
+        tmpBase <- getTemporaryDirectory
+        result <-
+          evalNixIOTraced tmpBase $
+            "let inner = derivation { name = \"inner\"; system = \"s\"; builder = \"b\"; bad = { }; };"
+              <> " in (derivation { name = \"outer\"; system = \"s\"; builder = \"b\"; dep = inner; }).drvPath"
+        pure $ case result of
+          Left failure ->
+            assertEqual
+              "nested-trace"
+              ["while evaluating attribute 'dep' of derivation 'outer'", "while evaluating attribute 'bad' of derivation 'inner'"]
+              (failureTrace failure)
+          Right val -> Fail ("expected a failure, got " <> T.pack (show val)),
+      runTestM "a throw in a derivation attribute stays catchable" $ do
+        tmpBase <- getTemporaryDirectory
+        result <- evalNixIO tmpBase "(builtins.tryEval (derivation { name = \"x\"; system = \"s\"; builder = \"b\"; foo = throw \"t\"; }).drvPath).success"
+        pure $ assertRight "trace-catchable" result (assertEqual "trace-catchable" (VBool False)),
+      -- upstream's showErrorInfo and indent (error.cc at 2.24.9), checked
+      -- against nix-instantiate 2.24.9's report for the same failure with
+      -- its positioned lines left out.
+      runTest "a failure renders as upstream reports it" $
+        assertEqual
+          "render-traced"
+          "error:\n       \x2026 while evaluating attribute 'foo' of derivation 'x'\n\n       error: a\n       b"
+          (renderEvalFailure (EvalFailure ["while evaluating attribute 'foo' of derivation 'x'"] "a\nb")),
+      runTest "a failure with no trace renders on the error line" $
+        assertEqual "render-untraced" "error: a\n       b" (renderEvalFailure (EvalFailure [] "a\nb"))
+    ]
 
 -- | Regression: a thunk whose force throws a catchable error (builtins.throw,
 -- a type error) must be restored to PENDING, not left BLACKHOLE - otherwise a
@@ -12618,6 +12717,7 @@ instance MonadEval StubStoreEval where
     Left other -> Left other
     Right val -> Right (Right val)
   onEvalError (StubStoreEval action) _ = StubStoreEval action
+  addErrorTrace _ action = action
 
   -- The stub keeps no call depth: it exists to answer store questions,
   -- and the ceiling is tested on the evaluators that enforce it.
@@ -14779,6 +14879,7 @@ runSuite = do
           testImportPure,
           testImportIO,
           testBlackholeRecoveryIO,
+          testDerivationTraceIO,
           testPathFilterIO,
           testPathSymlinkIO,
           testBatchA,
