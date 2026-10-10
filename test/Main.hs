@@ -17,6 +17,7 @@ import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as BL
+import Data.Char (isDigit)
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (intercalate, isPrefixOf, sort)
@@ -35,7 +36,7 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Foreign.Storable (sizeOf)
 import qualified GHC.Foreign as GHCForeign
-import GHC.IO.Encoding (getFileSystemEncoding)
+import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEncoding)
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
@@ -70,9 +71,10 @@ import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), d
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
-import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
+import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathPrefix, platformStoreDir, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
@@ -93,6 +95,7 @@ import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
 import System.IO.Error (ioeGetErrorString, mkIOError, resourceVanishedErrorType)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
+import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
 import qualified Test.QuickCheck as QC
@@ -4520,8 +4523,9 @@ testSubstituter = do
         pure $ case (outcome :: Either SomeException ()) of
           Right () -> Pass
           Left e -> Fail ("threw: " <> T.pack (show e)),
-      -- unpackNarEntry: traversal-shaped entry names from an untrusted
-      -- cache are rejected before anything is written
+      -- unpackNarEntry: what the archive grammar refuses (traversal
+      -- shapes, a NUL) is refused on every host before anything is
+      -- written
       runTestM "unpackNarEntry rejects unsafe entry names" $ do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-unsafe"
@@ -4532,34 +4536,104 @@ testSubstituter = do
             unpackFresh name = do
               Subst.clearStaleDestination dest
               unpackNarEntry tmpSensitivity dest (evil name)
-        results <- mapM unpackFresh ["..", ".", "", "a/b", "a\\b"]
+        results <- mapM unpackFresh ["..", ".", "", "a/b", "a\NULb"]
         Subst.clearStaleDestination dest
         pure $
-          if all (\case Left err -> "unsafe NAR directory entry name" `T.isInfixOf` err; Right () -> False) results
+          if all (\case Left err -> "NAR directory entry name" `T.isInfixOf` err; Right () -> False) results
             then Pass
             else Fail ("accepted an unsafe name: " <> T.pack (show results)),
-      -- unpackNarEntry: names and targets arrive as the raw bytes the
-      -- wire carries; the store materializes only valid-Unicode names,
-      -- so a byte name with no Unicode reading refuses the unpack
-      -- before anything is written
-      runTestM "unpackNarEntry refuses a non-UTF-8 entry name" $ do
+      -- Names upstream's restore writes on POSIX as it finds them
+      -- (posixOnlyTree, compared against nix-store --restore 2.33.2)
+      -- materialize byte for byte through both unpack paths there, and
+      -- the tree re-serialises to the NAR it came from.  Windows refuses
+      -- the first such name before writing any entry.
+      runTestM "names upstream restores on POSIX materialize as their bytes" $ do
         tmpBase <- getTemporaryDirectory
-        let dest = tmpBase </> "nova-nix-test-unpack-rawname"
-            tree = NAR.NarDirectory [(BS.pack [0xFF], NAR.NarRegular False "x")]
-        result <- unpackNarEntry tmpSensitivity dest tree
-        Subst.clearStaleDestination dest
-        pure $ case result of
-          Left err -> if "not valid UTF-8" `T.isInfixOf` err then Pass else Fail ("wrong error: " <> err)
-          Right () -> Fail "accepted a non-UTF-8 entry name",
-      runTestM "unpackNarEntry refuses a non-UTF-8 symlink target" $ do
+        let refusal = "NAR directory entry name 'COM1' is a Windows device name"
+        outcomes <- unpackedBothWays tmpSensitivity (tmpBase </> "nova-nix-test-unpack-posix-names") posixOnlyTree
+        pure $
+          if SI.os == "mingw32"
+            then assertEqual "Windows refusals (strict, streamed)" (Left refusal, Left refusal) outcomes
+            else assertEqual "trees read back (strict, streamed)" (Right posixOnlyTree, Right posixOnlyTree) outcomes,
+      -- The same tree substituted into a temp store: the strict pipeline
+      -- unpacks and seals it, then re-serialises the store path from disk
+      -- against the narinfo's hash before it registers anything, so a
+      -- success means the path's bytes reproduce the NAR.  Windows
+      -- refuses it before writing.
+      runTestM "a store path holding names upstream restores on POSIX substitutes" $ do
         tmpBase <- getTemporaryDirectory
-        let dest = tmpBase </> "nova-nix-test-unpack-rawtarget"
-            tree = NAR.NarDirectory [("link", NAR.NarSymlink (BS.pack [0xFF]))]
-        result <- unpackNarEntry tmpSensitivity dest tree
-        Subst.clearStaleDestination dest
-        pure $ case result of
-          Left err -> if "not valid UTF-8" `T.isInfixOf` err then Pass else Fail ("wrong error: " <> err)
-          Right () -> Fail "accepted a non-UTF-8 symlink target",
+        let tmpStore = tmpBase </> "nova-nix-test-unpack-posix-store"
+            sp = StorePath (T.replicate 32 "c") "posix-names"
+            rawNar = NAR.serialise posixOnlyTree
+            info = (streamTestNarInfo rawNar) {NarInfo.niStorePath = storePathToText defaultStoreDir sp}
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        result <- Subst.unpackAndVerify store sp info rawNar
+        onDisk <- case result of
+          Subst.SubstSuccess _ lock -> do
+            releasePathLock lock
+            Right <$> NAR.serialiseFromPath (storePathToFilePath (stDir store) sp)
+          other -> pure (Left (T.pack (show other)))
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure $ case onDisk of
+          Left shown
+            | SI.os == "mingw32" && "is a Windows device name" `T.isInfixOf` shown -> Pass
+          _ -> assertEqual "store path read back" (Right posixOnlyTree) onDisk,
+      -- A name and a link target with no UTF-8 reading.  Linux holds
+      -- both as bytes, as upstream restores them; a macOS volume cannot
+      -- hold the name (APFS refuses it, HFS+ rewrites it) but keeps the
+      -- target's bytes; Windows holds neither.
+      runTestM "bytes with no UTF-8 reading materialize where the host holds them" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-raw-bytes"
+            nameTree = NAR.NarDirectory [("caf\xE9", NAR.NarDirectory [("\xFF", NAR.NarRegular True "x")])]
+            targetTree = NAR.NarDirectory [("link", NAR.NarSymlink "caf\xE9")]
+            nameRefusal reason = "NAR directory entry name \"caf\\233\" is not valid UTF-8, " <> reason
+            targetRefusal = "NAR symlink target \"caf\\233\" is not valid UTF-8, so it has no UTF-16 form for Windows"
+            both outcome = (outcome, outcome)
+        named <- unpackedBothWays tmpSensitivity dest nameTree
+        targeted <- unpackedBothWays tmpSensitivity dest targetTree
+        pure $ case SI.os of
+          "mingw32" ->
+            assertEqual
+              "Windows refusals"
+              (both (Left (nameRefusal "so it has no UTF-16 form for Windows")), both (Left targetRefusal))
+              (named, targeted)
+          "darwin" ->
+            assertEqual
+              "macOS refuses the name and keeps the target"
+              (both (Left (nameRefusal "which a macOS filesystem cannot hold")), both (Right targetTree))
+              (named, targeted)
+          _ ->
+            assertEqual
+              "Linux keeps both"
+              (both (Right nameTree), both (Right targetTree))
+              (named, targeted),
+      -- The bytes reach the filesystem without passing through the
+      -- locale's codec: under an ASCII file-system encoding (a C locale)
+      -- or a Latin-1 one a UTF-8 name still lands as its UTF-8 bytes.
+      -- Spelled through 'FilePath', the first cannot encode the name and
+      -- the second writes other bytes.
+      runTestM "names land as their bytes whatever the file-system encoding" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-codec"
+            tree =
+              NAR.NarDirectory
+                [ ("caf\xC3\xA9", NAR.NarRegular False "e"),
+                  ("link", NAR.NarSymlink "\xE2\x9C\x93"),
+                  ("\xE2\x9C\x93", NAR.NarRegular False "check")
+                ]
+            under encodingName = do
+              encoding <- mkTextEncoding encodingName
+              bracket getFileSystemEncoding setFileSystemEncoding $ \_ -> do
+                setFileSystemEncoding encoding
+                unpackedBothWays tmpSensitivity dest tree
+        if SI.os == "mingw32"
+          then Pass <$ putStrLn "  SKIP  a Windows path is UTF-16 and no locale codec spells it"
+          else do
+            outcomes <- mapM under ["ASCII//ROUNDTRIP", "ISO-8859-1//ROUNDTRIP"]
+            pure (assertEqual "trees read back under ASCII and Latin-1 (strict, streamed)" (replicate 2 (Right tree, Right tree)) outcomes),
       -- unpackNarEntry: a NAR symlink materializes as a REAL link or fails
       -- loudly - never as a regular file holding the target text, which
       -- would silently diverge from the signed NAR hash
@@ -4744,14 +4818,13 @@ testSubstituter = do
           && onDiskNameKey CaseInsensitive "Makefile" == onDiskNameKey CaseInsensitive "makefile"
           then Pass
           else Fail "the key does not follow the probed sensitivity",
-      -- The Win32 path layer strips trailing dots and spaces on create
-      -- whatever a directory's case sensitivity, so names differing
-      -- only there share a key behind it and nowhere else.
-      runTest "onDiskNameKey strips trailing dots and spaces only behind Win32" $
+      -- A name with no UTF-8 reading has no characters to fold, so it
+      -- keys as its bytes even on a folding volume.
+      runTest "onDiskNameKey keys a name with no UTF-8 reading as its bytes" $
         assertEqual
-          "trailing rule"
-          (SI.os == "mingw32")
-          (onDiskNameKey CaseSensitive "x" == onDiskNameKey CaseSensitive "x. "),
+          "keys of a Latin-1 and a UTF-8 spelling"
+          ("caf\xE9", "CAF\xC3\x89")
+          (onDiskNameKey CaseInsensitive "caf\xE9", onDiskNameKey CaseInsensitive "caf\xC3\xA9"),
       -- The probe against the filesystem's own answer: two sibling
       -- names differing only by case are two entries on a sensitive
       -- volume and one on a folding one.
@@ -4892,6 +4965,25 @@ testSubstituter = do
     ]
   where
     chainCache url = Subst.CacheConfig url ["unused-key"] 10
+    -- A tree unpacked into a fresh destination through the strict and
+    -- the streaming path, each read back from disk, or the unpack's
+    -- refusal.  The read-back tree carries every name and link target
+    -- as the bytes on disk, so equal trees serialise to the same NAR.
+    unpackedBothWays sensitivity dest tree = do
+      let raw = NAR.serialise tree
+          streamed = do
+            source <- chunkReader [raw]
+            outcome <- Subst.consumeNarStream sensitivity dest (streamTestNarInfo raw) (CHash.hashBytes raw) source
+            pure (either (Left . Subst.attemptFailureMessage) (const (Right ())) outcome)
+          readBack unpack = do
+            Subst.clearStaleDestination dest
+            result <- unpack
+            onDisk <- either (pure . Left) (const (Right <$> NAR.serialiseFromPath dest)) result
+            Subst.clearStaleDestination dest
+            pure onDisk
+      strict <- readBack (unpackNarEntry sensitivity dest tree)
+      viaStream <- readBack streamed
+      pure (strict, viaStream)
     -- A real held lock for tests that construct 'SubstSuccess' by hand:
     -- the constructor carries the path's lock, so a fabricated success
     -- needs a genuine one, taken in a scratch directory.
@@ -9814,51 +9906,56 @@ testLinkOrdering :: IO [Bool]
 testLinkOrdering = do
   putStrLn "store/link-ordering"
   let root = "out"
+      -- The fixtures are ASCII: one path unit per character, both ways,
+      -- on every platform.
+      osPath = OP.pack . map OP.unsafeFromChar
+      fromOsPath = map OP.toChar . OP.unpack
+      orderedLinks pending = map (fromOsPath . fst) (orderLinks [(osPath link, osPath target) | (link, target) <- pending])
   sequence
     [ runTest "chain orders targets first" $
         let pending = [(root </> "l1", "l2"), (root </> "l2", "l3"), (root </> "l3", "real")]
          in assertEqual
               "chain"
               [root </> "l3", root </> "l2", root </> "l1"]
-              (map fst (orderLinks pending)),
+              (orderedLinks pending),
       runTest "already-ordered chain is stable" $
         let pending = [(root </> "l3", "real"), (root </> "l2", "l3"), (root </> "l1", "l2")]
          in assertEqual
               "stable"
               [root </> "l3", root </> "l2", root </> "l1"]
-              (map fst (orderLinks pending)),
+              (orderedLinks pending),
       runTest "link through a linked directory follows it" $
         let pending = [(root </> "a", "dirlink/x"), (root </> "dirlink", "realdir")]
          in assertEqual
               "through-dir"
               [root </> "dirlink", root </> "a"]
-              (map fst (orderLinks pending)),
+              (orderedLinks pending),
       runTest "parent-relative target orders after its link" $
         let pending = [(root </> "sub" </> "l", "../other"), (root </> "other", "real")]
          in assertEqual
               "dotdot"
               [root </> "other", root </> "sub" </> "l"]
-              (map fst (orderLinks pending)),
+              (orderedLinks pending),
       runTest "cycle members keep input order at the end" $
         let pending = [(root </> "a", "b"), (root </> "b", "a"), (root </> "c", "real")]
          in assertEqual
               "cycle"
               [root </> "c", root </> "a", root </> "b"]
-              (map fst (orderLinks pending)),
+              (orderedLinks pending),
       runTest "self-target link survives to the fallback" $
         assertEqual
           "self"
           [root </> "x"]
-          (map fst (orderLinks [(root </> "x", "x")])),
+          (orderedLinks [(root </> "x", "x")]),
       runTestM "long chain orders in linear time" $ do
         -- 20000 links each targeting the next: the ready-set rounds
         -- this replaced were quadratic here.
         let chain =
-              [ (root </> ("l" <> show i), T.pack ("l" <> show (i + 1)))
+              [ (root </> ("l" <> show i), "l" <> show (i + 1))
               | i <- [1 :: Int .. 20000]
               ]
                 ++ [(root </> "l20001", "real")]
-            complete = length (orderLinks chain) == length chain
+            complete = length (orderedLinks chain) == length chain
         outcome <- timeout walkWatchdogMicros (evaluate complete)
         pure $ case outcome of
           Just True -> Pass
@@ -12205,42 +12302,158 @@ testStoreNameSinks = do
         failsWith "fetchurl-dotdot" "builtins.fetchurl \"http://e/..\"" "invalid store path name"
     ]
 
--- | The NAR entry-name check: rejects what escapes the tree and what the
--- Win32 path layer silently rewrites (stream colons, device stems,
--- trailing dot or space); ordinary names pass, including ones Windows
--- merely refuses loudly.
+-- | Which entry names and link targets each host's rules admit
+-- ("Nix.Store.EntryName").  The decision is pure, so every host's answer
+-- is checked on any host: the grammar's refusals hold everywhere, POSIX
+-- holds every other name as bytes, macOS needs UTF-8 without a
+-- noncharacter, and Windows refuses what Win32 reserves or rewrites.
 testNarNameSafety :: IO [Bool]
 testNarNameSafety = do
-  putStrLn "store/nar-name-safety"
-  let rejects name = if isSafeNarName name then Fail ("expected rejection: " <> T.pack (show name)) else Pass
-      accepts name = if isSafeNarName name then Pass else Fail ("expected acceptance: " <> T.pack (show name))
-      allOf = foldr keepFirstFail Pass
-      keepFirstFail Pass acc = acc
-      keepFirstFail failure _ = failure
+  putStrLn "store/entry-name-rules"
+  let admitted rules names = [(name, admits rules name) | name <- names]
+      admits rules name = either (const False) (const True) (checkEntryName rules name)
+      allAdmit rules names = assertEqual (T.pack (show rules) <> " verdicts") [(name, True) | name <- names] (admitted rules names)
+      allRefuse rules names = assertEqual (T.pack (show rules) <> " verdicts") [(name, False) | name <- names] (admitted rules names)
+      everyHost = [PosixNames, DarwinNames, WindowsNames]
+      grammarRefused = ["", ".", "..", "a/b", "/", "a\NULb"]
+      posixOnlyNames = [name | (name, _) <- posixOnlyEntries]
+      notUtf8 = ["caf\xE9", "\xFF", "\xC0\xAF", "\xED\xA0\x80", "\xF4\x90\x80\x80"]
+      noncharacters = ["n\xEF\xB7\x90", "n\xEF\xB7\xAF", "n\xEF\xBF\xBE", "n\xEF\xBF\xBF", "n\xF0\x9F\xBF\xBE", "n\xF4\x8F\xBF\xBF"]
   sequence
-    [ runTest "empty and dot names are rejected" $
-        allOf [rejects "", rejects ".", rejects ".."],
-      runTest "separators are rejected" $
-        allOf [rejects "a/b", rejects "a\\b"],
-      runTest "an embedded NUL is rejected" $
-        rejects "a\NULb",
-      runTest "colons are rejected (drive prefix and stream form)" $
-        allOf [rejects "C:evil", rejects "a:b", rejects ":"],
-      runTest "reserved device stems are rejected case-insensitively" $
-        allOf [rejects "NUL", rejects "nul.txt", rejects "CON", rejects "com3", rejects "COM0.log", rejects "lpt9"],
-      runTest "a space-padded device stem is rejected" $
-        rejects "Nul .txt",
-      runTest "a superscript-digit device stem is rejected" $
-        rejects "COM\185",
-      runTest "a trailing dot or space is rejected" $
-        allOf [rejects "x.", rejects "x "],
-      runTest "ordinary names pass" $
-        allOf [accepts "a", accepts ".hidden", accepts "a.b", accepts "a b", accepts " a"],
-      runTest "near-miss device names pass" $
-        allOf [accepts "com10", accepts "COM", accepts "NULx", accepts "xNUL.txt"],
-      runTest "a loud-refuse character stays allowed" $
-        accepts "a\"b"
+    [ runTest "the grammar's refusals hold on every host" $
+        foldr (keepFirstFail . (`allRefuse` grammarRefused)) Pass everyHost,
+      runTest "POSIX holds every other name as its bytes" $
+        allAdmit PosixNames (posixOnlyNames <> notUtf8 <> noncharacters <> ["caf\xC3\xA9", "a\x7F"]),
+      runTest "macOS holds a name upstream restores there" $
+        allAdmit DarwinNames (posixOnlyNames <> ["caf\xC3\xA9", "n\xEE\x80\x80", "n\xEF\xBF\xBD", "n\xEF\xBB\xBF"]),
+      runTest "macOS refuses a name that is not UTF-8 or holds a noncharacter" $
+        allRefuse DarwinNames (notUtf8 <> noncharacters),
+      runTest "Windows refuses device names, trailing dots and spaces, and reserved characters" $
+        allRefuse
+          WindowsNames
+          ( filter (not . BS.isPrefixOf "link-") posixOnlyNames
+              <> ["nul.txt", "Nul .txt", "COM0.log", "com3", "lpt9", "COM\xC2\xB2", "COM\xC2\xB3", "C:evil", "a*b", "a?b", "a<b", "a>b", "a|b", "ctl\x1F"]
+          ),
+      runTest "Windows refuses a name with no UTF-16 form" $
+        allRefuse WindowsNames notUtf8,
+      runTest "Windows holds ordinary and near-miss names" $
+        allAdmit
+          WindowsNames
+          ["a", ".hidden", "a.b", "a b", " a", "com10", "COM", "NULx", "xNUL.txt", "caf\xC3\xA9", "LPT\xE2\x81\xB9", "a~b", "a\x7F", "n\xEF\xBF\xBE"],
+      runTest "a refusal names the entry and the reason" $
+        assertEqual
+          "refusals"
+          [ Left "NAR directory entry name 'aux.c' is a Windows device name",
+            Left "NAR directory entry name 'x.' ends in a dot or a space, which Windows strips",
+            Left "NAR directory entry name 'a:b' holds a character Windows does not allow in a name",
+            Left "NAR directory entry name \"caf\\233\" is not valid UTF-8, which a macOS filesystem cannot hold",
+            Left "unsafe NAR directory entry name: \"a/b\""
+          ]
+          [ checkEntryName WindowsNames "aux.c",
+            checkEntryName WindowsNames "x.",
+            checkEntryName WindowsNames "a:b",
+            checkEntryName DarwinNames "caf\xE9",
+            checkEntryName PosixNames "a/b"
+          ],
+      runTest "a link target is bytes on POSIX and macOS and UTF-16 on Windows" $
+        assertEqual
+          "target verdicts"
+          [Right (), Right (), Left "NAR symlink target \"caf\\233\" is not valid UTF-8, so it has no UTF-16 form for Windows", Right ()]
+          [ checkLinkTarget PosixNames "caf\xE9",
+            checkLinkTarget DarwinNames "caf\xE9",
+            checkLinkTarget WindowsNames "caf\xE9",
+            checkLinkTarget WindowsNames "../a b/c:d"
+          ],
+      -- The Windows rules check a name's bytes, where the check they
+      -- replace read it as text; on every name both could judge (UTF-8
+      -- without a character the old check let through and Windows
+      -- refuses at the create) they must agree.
+      runTestM "the Windows rules refuse what the text check they replace refused" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False, QC.maxSuccess = 5000} $
+            QC.forAll genDeviceLikeName $ \name ->
+              either (const False) (const True) (checkEntryName WindowsNames (TE.encodeUtf8 name))
+                QC.=== legacyTextNameSafety name
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
+  where
+    keepFirstFail Pass acc = acc
+    keepFirstFail failure _ = failure
+
+-- | The text-form name check the Windows rules replaced, kept verbatim as
+-- the oracle their byte-form port is tested against.
+legacyTextNameSafety :: Text -> Bool
+legacyTextNameSafety name =
+  not (T.null name)
+    && name /= ".."
+    && name /= "."
+    && not (T.any escapesTree name)
+    && not (trailingRewritten name)
+    && not (reservedDeviceStem name)
+  where
+    escapesTree c = c == '/' || c == '\\' || c == ':' || c == '\0'
+    trailingRewritten n = case T.unsnoc n of
+      Just (_, end) -> end == '.' || end == ' '
+      Nothing -> False
+    reservedDeviceStem n =
+      let stem = T.toUpper (T.dropWhileEnd (== ' ') (T.takeWhile (/= '.') n))
+       in stem == "CON"
+            || stem == "PRN"
+            || stem == "AUX"
+            || stem == "NUL"
+            || numberedDeviceStem stem
+    numberedDeviceStem stem = case T.unpack stem of
+      [a, b, c, digit] -> ([a, b, c] == "COM" || [a, b, c] == "LPT") && deviceDigit digit
+      _ -> False
+    deviceDigit c = isDigit c || c == '\185' || c == '\178' || c == '\179'
+
+-- | Names shaped like a Windows device: a stem in mixed case or a near
+-- miss, then a digit (plain, superscript, or a superscript nine that is
+-- not a device digit), spaces, and nothing, an extension, or more
+-- pieces, among them separators, dots and letters whose uppercase is
+-- longer than themselves.  About one name in twenty is refused by the
+-- device rule alone.
+genDeviceLikeName :: QC.Gen Text
+genDeviceLikeName = do
+  stem <- QC.elements ["con", "CON", "Prn", "aux", "AUX", "nul", "NuL", "com", "COM", "lpt", "LpT", "x", "\305", "\329"]
+  digit <- QC.elements ["", "0", "1", "9", "10", "\185", "\178", "\179", "\8313", "\233"]
+  spaces <- QC.elements ["", " ", "  "]
+  rest <- QC.frequency [(3, pure ""), (3, ("." <>) <$> pieces), (2, pieces)]
+  pure (stem <> digit <> spaces <> rest)
+  where
+    pieces =
+      T.concat
+        <$> QC.resize 4 (QC.listOf (QC.elements [".", "..", " ", "x", "txt", "\233", "\223", "\64256", ":", "\\", "/", "\NUL", "con", "1"]))
+
+-- | Entry names upstream's restore writes on POSIX as it finds them and
+-- Windows cannot hold, each as compared against @nix-store --restore@
+-- 2.33.2: device stems (one with a superscript digit), trailing dots and
+-- spaces, colons (perl's man pages carry them), a backslash, the
+-- punctuation Win32 reserves, a control character, and links pointing
+-- at such names.
+posixOnlyEntries :: [(BS.ByteString, NAR.NarEntry)]
+posixOnlyEntries =
+  [ ("COM1", NAR.NarRegular False "com1"),
+    ("ExtUtils::MakeMaker.3", NAR.NarRegular False "man"),
+    ("LPT\xC2\xB9.txt", NAR.NarRegular False "lpt"),
+    ("NUL", NAR.NarRegular False "nul"),
+    ("a:b", NAR.NarRegular False "colon"),
+    ("a\\b", NAR.NarRegular False "backslash"),
+    ("aux.c", NAR.NarRegular False "aux"),
+    ("con.h", NAR.NarRegular False "con"),
+    ("ctl\x01", NAR.NarRegular False "control"),
+    ("dir.", NAR.NarDirectory [("prn", NAR.NarRegular True "prn")]),
+    ("link-aux", NAR.NarSymlink "aux.c"),
+    ("link-colon", NAR.NarSymlink "a:b"),
+    ("link-dot", NAR.NarSymlink "x."),
+    ("q\"*?<>|", NAR.NarRegular False "reserved"),
+    ("x.", NAR.NarRegular False "dot"),
+    ("y ", NAR.NarRegular False "space")
+  ]
+
+-- | 'posixOnlyEntries' as one directory.
+posixOnlyTree :: NAR.NarEntry
+posixOnlyTree = NAR.NarDirectory posixOnlyEntries
 
 -- | IO-evaluator write sinks reject an invalid name BEFORE any write:
 -- every case here errors out against a scratch dir with no store traffic.

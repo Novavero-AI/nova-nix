@@ -15,7 +15,9 @@
 --
 -- @base@ has no exclusive open, so the platform's own call is made
 -- through @unix@ or @Win32@ and the descriptor is handed to the I\/O
--- library as an ordinary 'Handle'.
+-- library as an ordinary 'Handle'.  The path is an 'OsPath', so a POSIX
+-- name reaches @open@ as the bytes it was spelled from, and an error
+-- names the path as base names one it opened.
 module Nix.Store.Exclusive
   ( -- * Creation
     openNewBinaryFile,
@@ -30,6 +32,7 @@ where
 
 import Data.Text (Text)
 import qualified Data.Text as T
+import System.OsPath (OsPath, decodeFS)
 
 #if defined(mingw32_HOST_OS)
 
@@ -56,16 +59,19 @@ import System.Win32.Types (hANDLEToHandle)
 #else
 
 import Control.Exception (bracketOnError)
+import qualified Data.ByteString.Char8 as BS8
 import GHC.IO.Handle.FD (fdToHandle')
 import System.IO (Handle, IOMode (WriteMode))
+import System.IO.Error (ioeSetFileName, modifyIOError)
+import qualified System.OsPath as OP
 import System.Posix.Files (stdFileMode)
 import System.Posix.IO
   ( OpenFileFlags (cloexec, creat, exclusive),
     OpenMode (WriteOnly),
     closeFd,
     defaultFileFlags,
-    openFd,
   )
+import System.Posix.IO.ByteString (openFd)
 import System.Posix.Types (Fd (..))
 
 #endif
@@ -83,21 +89,24 @@ import System.Posix.Types (Fd (..))
 -- (2.33.2), and what @base@ requests for a write under its
 -- descriptor-based I\/O manager; the overlapped flag is what the
 -- native I\/O manager needs from a handle it adopts.
-openNewBinaryFile :: FilePath -> IO Handle
-openNewBinaryFile path = modifyIOError (`ioeSetFileName` path) $ do
-  target <- win32FilePath path
-  bracketOnError
-    ( createFile
-        target
-        (gENERIC_READ .|. gENERIC_WRITE)
-        (fILE_SHARE_READ .|. fILE_SHARE_WRITE)
-        Nothing
-        cREATE_NEW
-        attributes
-        Nothing
-    )
-    closeHandle
-    hANDLEToHandle
+openNewBinaryFile :: OsPath -> IO Handle
+openNewBinaryFile osPath = do
+  -- A Windows 'OsPath' is UTF-16, so decoding it is exact.
+  path <- decodeFS osPath
+  modifyIOError (`ioeSetFileName` path) $ do
+    target <- win32FilePath path
+    bracketOnError
+      ( createFile
+          target
+          (gENERIC_READ .|. gENERIC_WRITE)
+          (fILE_SHARE_READ .|. fILE_SHARE_WRITE)
+          Nothing
+          cREATE_NEW
+          attributes
+          Nothing
+      )
+      closeHandle
+      hANDLEToHandle
   where
     attributes = case ioSubSystem of
       IoPOSIX -> fILE_ATTRIBUTE_NORMAL
@@ -130,13 +139,18 @@ win32FilePath path
 -- by the umask), and the handle is named by the path, as @base@ names
 -- the handles it opens.  Close-on-exec keeps a concurrently spawned
 -- builder from inheriting the descriptor, as upstream's restore does.
-openNewBinaryFile :: FilePath -> IO Handle
-openNewBinaryFile path =
-  bracketOnError
-    (openFd path WriteOnly newFileFlags)
-    closeFd
-    (\(Fd fd) -> fdToHandle' fd Nothing False path WriteMode True)
+openNewBinaryFile :: OsPath -> IO Handle
+openNewBinaryFile path = do
+  shown <- decodeFS path
+  modifyIOError (`ioeSetFileName` shown) $
+    bracketOnError
+      (openFd (rawPath path) WriteOnly newFileFlags)
+      closeFd
+      (\(Fd fd) -> fdToHandle' fd Nothing False shown WriteMode True)
   where
+    -- A POSIX path unit is a byte, and 'OP.toChar' reads it as the
+    -- character of that code, so the round trip through 'BS8' is exact.
+    rawPath = BS8.pack . map OP.toChar . OP.unpack
     newFileFlags =
       defaultFileFlags
         { creat = Just stdFileMode,
