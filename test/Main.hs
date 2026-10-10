@@ -2572,6 +2572,38 @@ testBatch5 = do
         assertEval "fromJSON-rt" "let x = builtins.fromJSON (builtins.toJSON { a = 1; b = [ 2 3 ]; }); in x.a == 1 && x.b == [ 2 3 ]" (VBool True),
       runTest "fromJSON invalid" $
         assertEvalFail "fromJSON-bad" "builtins.fromJSON \"not json\"",
+      -- nlohmann's grammar (json-to-value.cc at 2.24.9), strict RFC 8259:
+      -- each case below is refused or read as nix-instantiate reads it.
+      runTest "fromJSON reads the backspace and form feed escapes" $
+        assertEval "fromJSON-bf" "builtins.fromJSON ''\"a\\bb\\fc\"''" (mkStr "a\bb\fc"),
+      runTest "fromJSON reads a surrogate pair" $
+        assertEval "fromJSON-pair" "builtins.fromJSON ''\"\\ud83d\\ude00\"''" (mkStr "\128512"),
+      runTest "fromJSON skips a leading byte order mark" $
+        assertEval "fromJSON-bom" "builtins.fromJSON \"\65279 1\"" (VInt 1),
+      runTest "fromJSON refuses an unterminated string" $
+        assertEvalError "fromJSON-unterminated" "builtins.fromJSON ''\"abc''" "unterminated string",
+      runTest "fromJSON refuses a trailing comma in an array" $
+        assertEvalError "fromJSON-array-comma" "builtins.fromJSON \"[1,]\"" "unexpected ']', expected a JSON value",
+      runTest "fromJSON refuses a trailing comma in an object" $
+        assertEvalError "fromJSON-object-comma" "builtins.fromJSON ''{\"a\":1,}''" "unexpected '}' in an object, expected a member name",
+      runTest "fromJSON refuses a leading zero" $
+        assertEvalError "fromJSON-leading-zero" "builtins.fromJSON \"01\"" "unexpected content after the JSON value: '1'",
+      runTest "fromJSON refuses a raw control character in a string" $
+        assertEvalError "fromJSON-raw-tab" "builtins.fromJSON \"\\\"a\\tb\\\"\"" "control character U+0009 must be escaped",
+      runTest "fromJSON refuses a \\u escape short of four hex digits" $
+        assertEvalError "fromJSON-short-u" "builtins.fromJSON ''\"\\u12\"''" "invalid \\u escape '12\"'",
+      runTest "fromJSON refuses a lone high surrogate" $
+        assertEvalError "fromJSON-lone-high" "builtins.fromJSON ''\"\\ud800\"''" "a high surrogate must be followed by a low surrogate",
+      runTest "fromJSON refuses a lone low surrogate" $
+        assertEvalError "fromJSON-lone-low" "builtins.fromJSON ''\"\\udc00\"''" "a low surrogate must follow a high surrogate",
+      runTest "fromJSON refuses an unknown escape" $
+        assertEvalError "fromJSON-bad-escape" "builtins.fromJSON ''\"a\\x\"''" "invalid escape \\x",
+      runTest "fromJSON refuses a number past the double range" $
+        assertEvalError "fromJSON-overflow" "builtins.fromJSON \"1e400\"" "number overflow parsing '1e400'",
+      runTest "fromJSON refuses whitespace JSON does not define" $
+        assertEvalError "fromJSON-nbsp" "builtins.fromJSON \"\160 1\"" "unexpected '\160 1', expected a JSON value",
+      runTest "fromJSON refuses a vertical tab around a value" $
+        assertEvalError "fromJSON-vt" "builtins.fromJSON \"\v1\"" "unexpected '\v1', expected a JSON value",
       -- hashString
       runTest "hashString sha256" $
         assertEval "hash-sha256" "builtins.hashString \"sha256\" \"hello\"" (mkStr "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"),
