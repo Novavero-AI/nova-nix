@@ -296,11 +296,12 @@ signedExponent e
       | n < 10 = '0' : show n
       | otherwise = show n
 
--- | Format a float as upstream @toXML@ renders one - C++ @operator<<@ on a
--- default-format ostream: 6 significant digits, trailing zeros stripped,
--- plain decimal only for decimal exponents in [-4, 5], otherwise
--- @d.ddde+XX@ with a signed exponent of at least two digits.  Rounding is
--- half-even on the exact binary value, matching a correctly-rounded printf.
+-- | Format a float as upstream @toXML@ and @printValue@ render one - C++
+-- @operator<<@ on a default-format ostream: 6 significant digits, trailing
+-- zeros stripped, plain decimal only for decimal exponents in [-4, 5],
+-- otherwise @d.ddde+XX@ with a signed exponent of at least two digits.
+-- Rounding is half-even on the exact binary value, matching a
+-- correctly-rounded printf.
 formatXmlFloat :: Double -> Text
 formatXmlFloat d
   | isNaN d = "nan"

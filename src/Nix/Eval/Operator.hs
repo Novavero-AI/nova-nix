@@ -6,6 +6,7 @@
 module Nix.Eval.Operator
   ( evalBinary,
     evalUnary,
+    evalUpdate,
     nixCompare,
     nixEqual,
     checkedAdd,
@@ -19,6 +20,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.CAttrSet (cattrsetUnion)
 import Nix.Eval.CList (clistFromThunks, clistLen, clistThunks)
+import Nix.Eval.Print (PrintOptions (..), printValue)
 import Nix.Eval.Types
   ( AttrSet (..),
     MonadEval (..),
@@ -59,7 +61,7 @@ evalBinary forceFn op left right = case op of
   OpGt -> VBool <$> nixCompare forceFn right left
   OpGte -> VBool . not <$> nixCompare forceFn left right
   OpConcat -> evalConcat left right
-  OpUpdate -> evalUpdate left right
+  OpUpdate -> evalUpdate (pure left) (pure right)
   -- Short-circuit ops must be handled by the caller
   OpAnd -> throwEvalError "internal error: OpAnd should be handled by eval"
   OpOr -> throwEvalError "internal error: OpOr should be handled by eval"
@@ -316,10 +318,23 @@ evalConcat left right =
 
 -- | Attribute set merge (//).  Right-biased: keys in the right
 -- operand shadow keys in the left.
-evalUpdate :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-evalUpdate (VAttrs as) (VAttrs bs) = pure (VAttrs (mergeAttrSets as bs))
-evalUpdate left right =
-  throwEvalError ("cannot merge " <> typeName left <> " and " <> typeName right)
+--
+-- Each operand is evaluated and checked for a set in turn, the left
+-- first, as @ExprOpUpdate::eval@ calls @evalAttrs@ on each (eval.cc at
+-- 2.24.9): a non-set left fails before the right is evaluated at all, and
+-- the refusal is @evalAttrs@'s message.  2.33.2 checks the right first;
+-- 2.24.9 is followed.  Upstream adds a trace line naming the operand ("in
+-- the left operand of the update (//) operator") above the message;
+-- nova-nix's errors carry no trace, so only the final line is reproduced.
+evalUpdate :: (MonadEval m) => m NixValue -> m NixValue -> m NixValue
+evalUpdate evalLeft evalRight = do
+  leftSet <- evalLeft >>= expectSet
+  rightSet <- evalRight >>= expectSet
+  pure (VAttrs (mergeAttrSets leftSet rightSet))
+  where
+    expectSet (VAttrs set) = pure set
+    expectSet other =
+      throwEvalError ("expected a set but found " <> typeName other <> ": " <> printValue PrintForError other)
 
 -- | Merge two 'AttrSet's, right-biased (@//@).
 -- Delegates to C-side @nn_attrset_union@ which performs a linear merge

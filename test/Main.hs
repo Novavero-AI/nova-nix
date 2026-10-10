@@ -55,6 +55,7 @@ import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
+import Nix.Eval.Print (PrintOptions (..), printValue)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
 import Nix.Eval.Types (allocCSlots, buildCSlots, emptyCList)
 import Nix.Expr.Resolve (staticGlobalNames)
@@ -88,6 +89,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
 import qualified System.Process as Proc
 import System.Timeout (timeout)
+import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
 -- Test harness
@@ -182,6 +184,16 @@ assertEvalFail label source = case evalNix source of
     | parseErrorTag `T.isPrefixOf` err ->
         Fail (label <> ": expected an eval error but the source did not parse: " <> err)
     | otherwise -> Pass
+  Right val -> Fail (label <> ": expected eval failure but got: " <> T.pack (show val))
+
+-- | Assert that a Nix expression parses and fails to evaluate with exactly
+-- the given message, for errors whose wording is upstream's.
+assertEvalError :: Text -> Text -> Text -> TestResult
+assertEvalError label source expected = case evalNix source of
+  Left err
+    | parseErrorTag `T.isPrefixOf` err ->
+        Fail (label <> ": expected an eval error but the source did not parse: " <> err)
+    | otherwise -> assertEqual label expected err
   Right val -> Fail (label <> ": expected eval failure but got: " <> T.pack (show val))
 
 -- | Assert that a Nix expression fails at PARSE time.
@@ -564,8 +576,94 @@ testEvalAttrs = do
       runTest "has-attr false" $
         assertEval "has-false" "{ a = 1; } ? b" (VBool False),
       runTest "nested attr path" $
-        assertEval "dot-path" "{ a.b.c = 1; }.a.b.c" (VInt 1)
+        assertEval "dot-path" "{ a.b.c = 1; }.a.b.c" (VInt 1),
+      -- A non-set operand of // fails with upstream's evalAttrs message
+      -- (eval.cc at 2.24.9), checked against nix-instantiate 2.33.2's
+      -- final error line.  tryEval does not catch it.
+      runTest "update with a null left operand" $
+        assertEvalError "update-null-left" "null // {}" "expected a set but found null: null",
+      runTest "update with a null right operand" $
+        assertEvalError "update-null-right" "{} // null" "expected a set but found null: null",
+      runTest "update with an integer left operand" $
+        assertEvalError "update-int-left" "1 // {}" "expected a set but found an integer: 1",
+      runTest "update with a string right operand" $
+        assertEvalError "update-string-right" "{} // \"x\"" "expected a set but found a string: \"x\"",
+      -- 2.24.9's ExprOpUpdate::eval evaluates and checks the left operand
+      -- before it evaluates the right; 2.33.2 does the right first.
+      runTest "update with two non-set operands reports the left" $
+        assertEvalError "update-both" "1 // \"x\"" "expected a set but found an integer: 1",
+      runTest "update refuses a non-set left before evaluating the right" $
+        assertEvalError "update-left-first" "builtins.tryEval (null // throw \"b\")" "expected a set but found null: null",
+      runTest "update with a set left evaluates a throwing right" $
+        assertEval "update-right-throws" "(builtins.tryEval ({} // throw \"b\")).success" (VBool False),
+      runTest "update evaluates a throwing left first" $
+        assertEvalError "update-left-throws" "throw \"a\" // null" "a",
+      runTest "tryEval does not catch the update error" $
+        assertEvalError "update-tryEval" "builtins.tryEval (null // {})" "expected a set but found null: null"
     ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval - Value printer
+-- ---------------------------------------------------------------------------
+
+testValuePrinter :: IO [Bool]
+testValuePrinter = do
+  putStrLn "eval/print"
+  let stringFound body = "expected a set but found a string: " <> body
+      runOfA n = "builtins.concatStringsSep \"\" (builtins.genList (x: \"a\") " <> T.pack (show (n :: Int)) <> ")"
+      elided what = " \x00AB" <> what <> " elided\x00BB"
+  sequence
+    [ -- Values print as upstream's printValue prints them under
+      -- errorPrintOptions (print.cc and print-options.hh at 2.24.9), each
+      -- checked against nix-instantiate 2.33.2's final error line.
+      runTest "a path prints bare" $
+        assertEvalError "print-path" "{} // /foo/bar" "expected a set but found a path: /foo/bar",
+      runTest "a float prints with six significant digits" $
+        assertEvalError "print-float" "{} // 1234567.0" "expected a set but found a float: 1.23457e+06",
+      runTest "a string prints quoted with the lexer's escapes" $
+        assertEvalError
+          "print-escapes"
+          "{} // \"a\\nb\\\"c$d\\${e}\\t\\r\""
+          (stringFound "\"a\\nb\\\"c$d\\${e}\\t\\r\""),
+      runTest "a string of 1024 bytes prints whole" $
+        assertEvalError
+          "print-1024"
+          ("{} // " <> runOfA 1024)
+          (stringFound ("\"" <> T.replicate 1024 "a" <> "\"")),
+      runTest "a longer string is cut after 1024 bytes" $
+        assertEvalError
+          "print-1025"
+          ("{} // " <> runOfA 1025)
+          (stringFound ("\"" <> T.replicate 1024 "a" <> "\"" <> elided "1 byte")),
+      runTest "the bytes cut are counted" $
+        assertEvalError
+          "print-1100"
+          ("{} // " <> runOfA 1100)
+          (stringFound ("\"" <> T.replicate 1024 "a" <> "\"" <> elided "76 bytes")),
+      runTest "a dollar shown last is escaped when the brace after it was cut" $
+        assertEvalError
+          "print-cut-dollar"
+          ("{} // (" <> runOfA 1023 <> " + \"\\${\")")
+          (stringFound ("\"" <> T.replicate 1023 "a" <> "\\$\"" <> elided "1 byte")),
+      -- builtins.trace prints a non-string through the same printer with
+      -- upstream's default options.
+      runTest "a float prints in full as trace prints it" $
+        assertEqual "print-full-float" "1.23457e+06" (printValue PrintInFull (VFloat 1234567.0)),
+      runTestM "a string printed in full reads back as itself" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genEscapable $ \text ->
+              evalNix (printValue PrintInFull (mkStr text)) QC.=== Right (mkStr text)
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    ]
+
+-- | Text built from what the string printer escapes (quotes, backslashes,
+-- the escaped control characters, a dollar before a brace) among plain and
+-- multi-byte characters.  @${@ is a piece of its own so the escape that
+-- needs lookahead comes up often.
+genEscapable :: QC.Gen Text
+genEscapable =
+  T.concat <$> QC.listOf (QC.elements ["\"", "\\", "\n", "\r", "\t", "$", "{", "}", "${", "a", " ", "\233", "\128512"])
 
 -- ---------------------------------------------------------------------------
 -- Tests: Eval - Recursive attribute sets
@@ -1768,6 +1866,7 @@ testBatch2 = do
 testBatch3 :: IO [Bool]
 testBatch3 = do
   putStrLn "eval/builtins-batch3"
+  let functionArgsError = "'functionArgs' requires a function"
   sequence
     [ -- mapAttrs
       runTest "mapAttrs basic" $
@@ -1785,8 +1884,18 @@ testBatch3 = do
         assertEval "funcArgs-nodef" "(builtins.functionArgs ({ a, b ? 1 }: a)).a" (VBool False),
       runTest "functionArgs simple lambda" $
         assertEval "funcArgs-simple" "builtins.functionArgs (x: x)" (VAttrs (attrSetFromMap Map.empty)),
-      runTest "functionArgs type error" $
-        assertEvalFail "funcArgs-err" "builtins.functionArgs 42",
+      -- Upstream's prim_functionArgs message (primops.cc at 2.24.9), the
+      -- same whatever the argument, and tryEval does not catch it.
+      runTest "functionArgs of a set is upstream's error" $
+        assertEvalError "funcArgs-set" "builtins.functionArgs {}" functionArgsError,
+      runTest "functionArgs of a path is upstream's error" $
+        assertEvalError "funcArgs-path" "builtins.functionArgs ./foo" functionArgsError,
+      runTest "functionArgs of an integer is upstream's error" $
+        assertEvalError "funcArgs-int" "builtins.functionArgs 42" functionArgsError,
+      runTest "functionArgs of a string is upstream's error" $
+        assertEvalError "funcArgs-string" "builtins.functionArgs \"s\"" functionArgsError,
+      runTest "tryEval does not catch the functionArgs error" $
+        assertEvalError "funcArgs-tryEval" "builtins.tryEval (builtins.functionArgs {})" functionArgsError,
       -- The builtins set is observable (hasAttr/attrNames), so it must
       -- match upstream's primop set exactly: no mod/min/max/
       -- setFunctionArgs extensions (nixpkgs lib defines those in Nix),
@@ -12509,6 +12618,7 @@ runSuite = do
           testEvalIfAssert,
           testEvalLet,
           testEvalAttrs,
+          testValuePrinter,
           testEvalRecAttrs,
           testEvalLists,
           testEvalLambda,
