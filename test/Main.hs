@@ -13,7 +13,7 @@ import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
 import Control.Monad (filterM, unless, void, when)
-import Data.Bits (shiftR, (.&.))
+import Data.Bits (shiftR, xor, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
@@ -72,7 +72,7 @@ import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternByte
 import Nix.Eval.Types (AttrSet (..), Env (..), allocCSlots, attrSetKeys, buildCSlots, emptyCList, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
-import Nix.Hash (hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
+import Nix.Hash (compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
@@ -387,8 +387,23 @@ testStorePaths = do
           ( map
               isCanonicalStoreText
               ["/nix/store", "/nix/store/x", "/nix/store\\x", "/nix/storefoo", "C:\\nix\\store\\x"]
-          )
+          ),
+      runTestM "compressHash XORs byte i into position i mod the length" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genCompressCase $ \(len, bytes) ->
+              BS.unpack (compressHash len (BS.pack bytes)) QC.=== compressHashModel len bytes
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
+  where
+    -- Lengths on both sides of the input's, so the last chunk is short,
+    -- whole or absent, and below one, where there is nothing to fold into.
+    genCompressCase = (,) <$> QC.choose (-1, 40) <*> QC.resize 70 (QC.listOf QC.arbitrary)
+
+-- | Upstream's @compressHash@ loop (hash.cc), one byte at a time.
+compressHashModel :: Int -> [Word8] -> [Word8]
+compressHashModel len bytes =
+  [foldl' xor 0 [b | (i, b) <- zip [0 :: Int ..] bytes, i `mod` len == j] | j <- [0 .. len - 1]]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Derivation (existing)

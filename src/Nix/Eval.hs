@@ -501,14 +501,21 @@ evalShortCircuitImpl env leftIdx rightIdx = do
         _ -> throwEvalError ("second operand of -> must be a Boolean, got " <> typeName rightVal)
     _ -> throwEvalError ("first operand of -> must be a Boolean, got " <> typeName leftVal)
 
--- | Evaluate a string literal from bytecode data buffer.
+-- | Evaluate a string literal from bytecode data buffer.  A string with no
+-- interpolation is one literal part, since the lexer joins a run of
+-- characters and escapes into one chunk, and its value is that part's
+-- bytes: upstream's parser makes it an @ExprString@ holding the value
+-- (parser.y), where an interpolated string is an @ExprConcatStrings@.
 evalBcStr :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcStr env bcIdx0 = do
-  let (count, dataOff) =
-        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
-  chunks <- evalBcStringParts env count dataOff
-  let (text, ctx) = concatChunks chunks
-  pure (VStr text ctx)
+evalBcStr env bcIdx0 =
+  case unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0) of
+    (1, dataOff)
+      | unsafePerformIO (cbcData dataOff) == strpartLit ->
+          pure (VStr (symbolBytes (Symbol (unsafePerformIO (cbcData (dataOff + 1))))) emptyContext)
+    (count, dataOff) -> do
+      chunks <- evalBcStringParts env count dataOff
+      let (text, ctx) = concatChunks chunks
+      pure (VStr text ctx)
 
 -- | Evaluate an indented string literal from bytecode data buffer.  The
 -- common indentation is stripped before concatenation, part by part as
@@ -1137,6 +1144,13 @@ matchFormalSet closureEnv formals allowExtra argVal atThunk =
     VAttrs attrs -> do
       checkExtraKeys formals allowExtra attrs
       checkMissingFormals attrs formals
+      -- A knot, and its laziness is load-bearing: formalEnv is built from
+      -- the slots, and a default's thunk in the slots holds formalEnv, the
+      -- env a default is evaluated in (it may name another formal or the
+      -- @-pattern), as upstream's callFunction allocates env2 before it
+      -- fills the values (eval.cc).  'mkThunkBc' keeps that env unforced
+      -- behind a StablePtr; 'cheapThunkBc' would look a variable default
+      -- up in formalEnv while formalEnv is being built, and fail <<loop>>.
       let formalEnv = envFromSlots formalSlotsPtr formalSlotCount closureEnv
           (formalSlotsPtr, formalSlotCount) = buildCSlots formalThunks
           formalThunks = case atThunk of
@@ -4568,7 +4582,7 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- composition (drvName <> ".drv", drvName-output past the length cap),
   -- which only the constructors see.
   let drvContext = "derivation \"" <> drvName <> "\""
-  (drvPathText, drvSP, outPaths, completeDrv) <- case mFixed of
+  (outPaths, completeDrv, moduloHash) <- case mFixed of
     Just (foAlgo, foMode, foDigest) -> do
       foPath <- storePathOrThrow drvContext (makeFixedOutputPath drvName foAlgo foMode foDigest)
       let foPathText = storePathToText defaultStoreDir foPath
@@ -4581,10 +4595,7 @@ builtinDerivationStrict (VAttrs attrs) = do
             mkDrv
               [DerivationOutput "out" foPath algoField foHashHex]
               (Map.insert "out" (TE.encodeUtf8 foPathText) baseEnv)
-      drvSp <- storePathOrThrow drvContext (makeTextPath drvFileName (sha256Digest (toATerm contents)) drvRefs)
-      let drvText = storePathToText defaultStoreDir drvSp
-      cacheDrvHash drvText (bytesToHexText foModulo)
-      pure (drvText, drvSp, [("out", foPathText)], contents)
+      pure ([("out", foPathText)], contents, foModulo)
     Nothing -> do
       inputSubst <- mapM resolveInputModulo (Map.toList inputDrvs)
       let maskedEnv = foldr (`Map.insert` "") baseEnv outputNames
@@ -4601,16 +4612,18 @@ builtinDerivationStrict (VAttrs attrs) = do
           -- Unmasked modulo hash (real outputs, inputs substituted) cached for
           -- when this derivation is itself an input to another.
           moduloUnmasked = sha256Digest (toATermForHash False (Just inputSubst) contents)
-      drvSp <- storePathOrThrow drvContext (makeTextPath drvFileName (sha256Digest (toATerm contents)) drvRefs)
-      let drvText = storePathToText defaultStoreDir drvSp
-      cacheDrvHash drvText (bytesToHexText moduloUnmasked)
-      pure (drvText, drvSp, outPathTexts, contents)
+      pure (outPathTexts, contents, moduloUnmasked)
 
-  -- Record this derivation's full .drv ATerm (the exact bytes whose hash is its
-  -- store path) so the build driver can materialize the entire input-.drv
-  -- closure before building.  Bottom-up eval guarantees every transitive input
-  -- is recorded by the time a dependent is.
-  recordDrvAterm drvPathText (toATerm completeDrv)
+  -- The .drv's bytes are rendered once, as upstream's writeDerivation hashes
+  -- and writes the one unparse.  They are recorded whole so the build driver
+  -- can materialize the entire input-.drv closure before building; bottom-up
+  -- eval guarantees every transitive input is recorded by the time a
+  -- dependent is.
+  let aterm = toATerm completeDrv
+  drvSP <- storePathOrThrow drvContext (makeTextPath drvFileName (sha256Digest aterm) drvRefs)
+  let drvPathText = storePathToText defaultStoreDir drvSP
+  cacheDrvHash drvPathText (bytesToHexText moduloHash)
+  recordDrvAterm drvPathText aterm
 
   -- drvPath carries the whole derivation (upstream's DrvDeep); an output
   -- path carries that one output of it.

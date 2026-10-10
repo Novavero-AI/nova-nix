@@ -1,0 +1,1 @@
+- **`Nix.Hash.compressHash` takes and returns a `ByteString`,** the digest it folds and the bytes it folds it to, where both were `[Word8]`. (#48)
