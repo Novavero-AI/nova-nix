@@ -4252,15 +4252,19 @@ derivationModuloHex drv = case drvOutputs drv of
 -- source, so a dependent carrying an all-outputs reference errors there,
 -- consistent with dependent-derivation hashing being an IO-evaluator capability.
 resolveAllOutputNames :: (MonadEval m) => StorePath -> m [Text]
-resolveAllOutputNames sp = do
+resolveAllOutputNames sp = map doName . drvOutputs <$> derivationAt sp
+
+-- | The derivation a @.drv@ path names, from this session or the store.
+derivationAt :: (MonadEval m) => StorePath -> m Derivation
+derivationAt sp = do
   let drvPathText = storePathToText defaultStoreDir sp
   session <- lookupSessionDrv drvPathText
   case session of
-    Just drv -> pure (outputNamesOf drv)
+    Just drv -> pure drv
     Nothing -> do
       onDisk <- readStoreDerivation sp
       case onDisk of
-        Just drv -> pure (outputNamesOf drv)
+        Just drv -> pure drv
         Nothing ->
           throwEvalError
             ( "derivation: cannot resolve the output names of the all-outputs reference "
@@ -4268,8 +4272,24 @@ resolveAllOutputNames sp = do
                 <> " - it was not evaluated in this session and its .drv is not "
                 <> "readable from the store (all-outputs references need the IO evaluator)"
             )
+
+-- | The filesystem closure of the @.drv@ files an all-outputs context
+-- names, as upstream's derivationStrict takes it for each
+-- (@computeFSClosure@, primops.cc:1382 at 2.24.9): every @.drv@ reachable
+-- through @inputDrvs@, every source in their @inputSrcs@, and the
+-- references this session recorded for a source it wrote.
+allOutputsClosure :: (MonadEval m) => [StorePath] -> m (Set.Set StorePath)
+allOutputsClosure = go Set.empty
   where
-    outputNamesOf = map doName . drvOutputs
+    go !seen [] = pure seen
+    go !seen (sp : rest)
+      | Set.member sp seen = go seen rest
+      | ".drv" `T.isSuffixOf` spName sp = do
+          drv <- derivationAt sp
+          go (Set.insert sp seen) (Map.keys (drvInputDrvs drv) ++ drvInputSrcs drv ++ rest)
+      | otherwise = do
+          refs <- fromMaybe [] <$> lookupSessionReferences sp
+          go (Set.insert sp seen) (refs ++ rest)
 
 -- | Eager derivation computation - @builtins.derivationStrict@.  Forces all
 -- input attrs into env vars, content-hashes, and returns upstream's result
@@ -4425,16 +4445,19 @@ builtinDerivationStrict (VAttrs attrs) = do
 
   let fullContext = envContext <> argsContext
       builtInputDrvs = extractInputDrvs fullContext
-      inputSrcs = extractInputSrcs fullContext
       allOutputRefs = extractAllOutputRefs fullContext
-  -- All-outputs (DrvDeep) references - e.g. an embedded @dep.drvPath@ - add the
-  -- referenced .drv to inputDrvs with ALL its output names, as upstream's
-  -- derivationStrict does.  Merged in BEFORE drvRefs and the modulo
+  -- All-outputs (DrvDeep) references - e.g. an embedded @dep.drvPath@ - add
+  -- the referenced .drv's whole closure, as upstream's derivationStrict
+  -- does: every path in it to inputSrcs, every .drv in it to inputDrvs with
+  -- ALL its output names.  Merged in BEFORE drvRefs and the modulo
   -- substitution so both the dependent's own .drv hash and its output paths
   -- account for the reference.
+  deepClosure <- allOutputsClosure allOutputRefs
   deepInputDrvs <-
-    Map.fromList <$> mapM (\drvSp -> (,) drvSp <$> resolveAllOutputNames drvSp) allOutputRefs
+    Map.fromList
+      <$> mapM (\drvSp -> (,) drvSp <$> resolveAllOutputNames drvSp) (filter ((".drv" `T.isSuffixOf`) . spName) (Set.toList deepClosure))
   let inputDrvs = Map.unionWith (++) builtInputDrvs deepInputDrvs
+      inputSrcs = Set.toList (Set.fromList (extractInputSrcs fullContext) <> deepClosure)
       platform = textToPlatform system
       baseEnv = Map.fromList drvEnvPairs
       drvRefs = inputSrcs ++ Map.keys inputDrvs

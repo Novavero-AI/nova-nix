@@ -13,6 +13,7 @@ dependent        import ./dependent.nix
 
 # What evaluation itself writes or fetches.
 tofile           import ./tofile.nix
+deepContext      import ./deep-context.nix
 fetchgit         import ./fetchgit.nix
 
 # Other stdenv layers: no C compiler, the i686 and musl bootstraps, and
