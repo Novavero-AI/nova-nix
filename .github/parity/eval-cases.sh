@@ -116,6 +116,10 @@ check "a primop" 'builtins.map'
 check "a partially applied primop" 'builtins.map (x: x)'
 echo
 
+echo "== what + makes of a path it coerces =="
+check "an outPath left of + is its own text, not a store copy" 'let s = { outPath = ./data.txt; } + "x"; in builtins.toJSON [ s (builtins.getContext s) ]'
+echo
+
 echo "== whitespace an indented string strips =="
 check "blank line then a spaces-only line" 'import ./ind-blank-then-spaces.nix'
 check "spaces-only line" 'import ./ind-spaces-only.nix'
