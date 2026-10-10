@@ -63,7 +63,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Pa
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
-import Nix.Store (copyPathInto, unpackNarEntry)
+import Nix.Store (unpackNarEntry)
 import Nix.Store.CaseSensitive (probeCaseSensitivity)
 import qualified Nix.Store.ExecBit as ExecBit
 import qualified Nix.Store.Path as SP
@@ -522,7 +522,10 @@ instance MonadEval EvalIO where
     sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
     destFilePath <- evalFilePath sp
     let destPath = canonicalStorePathText sp
-    wrapIO (copyToStoreVerified resolvedSource destFilePath (takeDirectory destFilePath) narDigest)
+    -- Restored from the entry just hashed, not copied from the source:
+    -- the store's volume may fold a pair the source's keeps apart, and
+    -- the tree that lands is exactly the one the address names.
+    wrapIO (unpackToStoreVerified destFilePath entry narDigest) >>= either throwEvalError pure
     recordStoreWrite destPath [] SP.WriteRecursive
     allowPath destPath
     pure destPath
@@ -601,25 +604,9 @@ instance MonadEval EvalIO where
         sp <- storePathOrThrow "builtins.path" (makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes))
         destFilePath <- evalFilePath sp
         let destPath = canonicalStorePathText sp
-        unpacked <- wrapIO $ do
-          Dir.createDirectoryIfMissing True (takeDirectory destFilePath)
-          -- Adopt an existing tree only when it serialises to exactly
-          -- these NAR bytes; an interrupted earlier unpack is cleared
-          -- and unpacked afresh.
-          onDiskNar <- narBytesIfPresent destFilePath
-          if onDiskNar == Just narBytes
-            then pure (Right ())
-            else do
-              Dir.removePathForcibly destFilePath
-              -- Probed per write rather than carried in 'EvalState': the
-              -- store directory need not exist when evaluation starts, and
-              -- the probe answers for a path on disk.  It was created just
-              -- above, and the cost is one pathconf call per tree.
-              sensitivity <- probeCaseSensitivity (takeDirectory destFilePath)
-              unpackNarEntry sensitivity destFilePath entry
         -- Raised here rather than inside 'wrapIO', which would render
         -- the refusal through an exception's own text ("user error (...)").
-        either throwEvalError pure unpacked
+        wrapIO (unpackToStoreVerified destFilePath entry (sha256Digest narBytes)) >>= either throwEvalError pure
         recordStoreWrite destPath [] SP.WriteRecursive
         allowPath destPath
         pure destPath
@@ -1154,21 +1141,25 @@ runEvalIO st (EvalIO action) = do
 -- Store copy helpers
 -- ---------------------------------------------------------------------------
 
--- | Copy a source path (file or directory) to the store if not already
--- present.  The copy is 'copyPathInto', which replicates symlinks as
--- symlinks: the destination's name came from a NAR hash computed by
--- 'NovaCache.NAR.serialiseFromPath', which treats links as leaves, so a
--- dereferencing copy would store bytes that do not match their own
--- content address (and would not terminate on a link cycle).
--- | Copy a tree to its content-addressed destination.  An existing
--- destination is adopted only when its recursive NAR digest matches
--- the expected one - same content means same path, so a matching tree
--- is byte-identical by construction; anything else (an interrupted
--- earlier copy, a squatter) is cleared and re-copied.
-copyToStoreVerified :: FilePath -> FilePath -> FilePath -> BS.ByteString -> IO ()
-copyToStoreVerified src dest storeDir expectedDigest = do
-  Dir.createDirectoryIfMissing True storeDir
+-- | Unpack a NAR entry at its content-addressed destination.  An
+-- existing destination is adopted only when its NAR digest is the
+-- expected one - same content means same path, so a matching tree is
+-- byte-identical by construction; anything else (an interrupted
+-- earlier unpack, a squatter) is cleared and unpacked afresh.  The
+-- entry is the one evaluation hashed to name the path, so the tree
+-- that lands is the one the address names, with the store volume's
+-- own sibling-name handling.
+unpackToStoreVerified :: FilePath -> NAR.NarEntry -> BS.ByteString -> IO (Either Text ())
+unpackToStoreVerified dest entry expectedDigest = do
+  Dir.createDirectoryIfMissing True (takeDirectory dest)
   onDiskNar <- narBytesIfPresent dest
-  unless ((sha256Digest <$> onDiskNar) == Just expectedDigest) $ do
-    Dir.removePathForcibly dest
-    copyPathInto src dest
+  if (sha256Digest <$> onDiskNar) == Just expectedDigest
+    then pure (Right ())
+    else do
+      Dir.removePathForcibly dest
+      -- Probed per write rather than carried in 'EvalState': the store
+      -- directory need not exist when evaluation starts, and the probe
+      -- answers for a path on disk.  It was created just above, and the
+      -- cost is one pathconf call per tree.
+      sensitivity <- probeCaseSensitivity (takeDirectory dest)
+      unpackNarEntry sensitivity dest entry

@@ -103,14 +103,13 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
-import Nix.Store (CaseSensitivity, PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarEvent, unpackNarEntry)
+import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarStream, unpackNarEntry)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
 import qualified NovaCache.Bzip2 as Bzip2
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
-import qualified NovaCache.NAR.Stream as Stream
 import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Validate as Validate
@@ -785,64 +784,46 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
 consumeNarStream :: CaseSensitivity -> FilePath -> NarInfo.NarInfo -> Hash.NixHash -> IO BS.ByteString -> IO (Either AttemptFailure Int)
 consumeNarStream sensitivity destPath narInfo declaredDigest narSource = do
   sink <- newNarUnpackSink sensitivity destPath
-  go sink Hash.hashInit 0 Stream.narStream `onException` abortNarUnpack sink
-  where
-    go sink !ctx !narBytes step = case step of
-      Stream.NarAwait continue -> do
-        chunk <- narSource
-        go sink (Hash.hashUpdate ctx chunk) (narBytes + BS.length chunk) (continue chunk)
-      Stream.NarYield event next -> do
-        sunk <- sinkNarEvent sink event
-        case sunk of
-          Left err -> do
-            abortNarUnpack sink
-            -- A name or shape the store refuses is a property of the
-            -- archive, not of this transfer.
-            pure (Left (FatalFailure err))
-          Right () -> go sink ctx narBytes next
-      Stream.NarFail msg -> do
-        abortNarUnpack sink
-        -- A truncated body and a torn transfer parse-fail the same
-        -- way, so the retry budget applies.
-        pure (Left (TransientFailure ("NAR stream parse failed: " <> T.pack msg)))
-      Stream.NarDone -> do
-        let digest = Hash.hashFinalize ctx
-        if toInteger narBytes /= NarInfo.niNarSize narInfo
-          then do
-            abortNarUnpack sink
-            -- The grammar completed, so the transfer was whole: a
-            -- size that still disagrees is the narinfo misdeclaring.
-            pure
-              ( Left
-                  ( FatalFailure
-                      ( "NAR size mismatch: narinfo declares "
-                          <> T.pack (show (NarInfo.niNarSize narInfo))
-                          <> " bytes but the stream carried "
-                          <> T.pack (show narBytes)
-                      )
-                  )
-              )
-          else
-            if digest /= declaredDigest
-              then do
-                abortNarUnpack sink
-                -- Size matched, so the transfer completed; wrong
-                -- bytes are deterministic corruption, not a hiccup.
-                pure
-                  ( Left
-                      ( FatalFailure
-                          ( "NAR hash mismatch: narinfo declares "
-                              <> NarInfo.niNarHash narInfo
-                              <> " but downloaded bytes hash to "
-                              <> Hash.formatNixHash digest
-                          )
-                      )
-                  )
-              else do
-                finished <- finishNarUnpack sink
-                case finished of
-                  Left err -> pure (Left (FatalFailure err))
-                  Right () -> pure (Right narBytes)
+  streamed <- sinkNarStream sink narSource
+  case streamed of
+    -- A name or shape the store refuses is a property of the archive,
+    -- not of this transfer.
+    Left (NarStreamRefused err) -> pure (Left (FatalFailure err))
+    -- A truncated body and a torn transfer parse-fail the same way, so
+    -- the retry budget applies.
+    Left (NarStreamMalformed msg) -> pure (Left (TransientFailure ("NAR stream parse failed: " <> msg)))
+    Right (digest, narBytes)
+      | toInteger narBytes /= NarInfo.niNarSize narInfo -> do
+          abortNarUnpack sink
+          -- The grammar completed, so the transfer was whole: a size
+          -- that still disagrees is the narinfo misdeclaring.
+          pure
+            ( Left
+                ( FatalFailure
+                    ( "NAR size mismatch: narinfo declares "
+                        <> T.pack (show (NarInfo.niNarSize narInfo))
+                        <> " bytes but the stream carried "
+                        <> T.pack (show narBytes)
+                    )
+                )
+            )
+      | digest /= declaredDigest -> do
+          abortNarUnpack sink
+          -- Size matched, so the transfer completed; wrong bytes are
+          -- deterministic corruption, not a hiccup.
+          pure
+            ( Left
+                ( FatalFailure
+                    ( "NAR hash mismatch: narinfo declares "
+                        <> NarInfo.niNarHash narInfo
+                        <> " but downloaded bytes hash to "
+                        <> Hash.formatNixHash digest
+                    )
+                )
+            )
+      | otherwise -> do
+          finished <- finishNarUnpack sink
+          pure (either (Left . FatalFailure) (const (Right narBytes)) finished)
 
 -- | Stream an HTTP body as a chunk source bounded by the download cap
 -- 'downloadCapFor' derived from the signed NarSize -
