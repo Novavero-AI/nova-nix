@@ -121,7 +121,7 @@ import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
 import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
-import Nix.Eval.CList (CList (..), clistGet)
+import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
@@ -1683,21 +1683,41 @@ isFunctionVal _ = False
 
 builtinLength :: (MonadEval m) => NixValue -> m NixValue
 builtinLength (VList cl) = pure (VInt (fromIntegral (clistLen cl)))
-builtinLength other = throwEvalError ("builtins.length: expected a list, got " <> typeName other)
+builtinLength other = throwEvalError (expectedList other)
 
+-- | 2.24.9's @prim_head@ is its @elemAt@ at index 0, so an empty list
+-- fails as an index past the end does.  From 2.26.0 upstream says
+-- @'builtins.head' called on an empty list@ instead.
 builtinHead :: (MonadEval m) => NixValue -> m NixValue
-builtinHead (VList cl)
-  | clistLen cl == 0 = throwEvalError "builtins.head: empty list"
-  | otherwise = case clistThunks cl of
-      (p : _) -> force (Thunk p)
-      [] -> throwEvalError "builtins.head: empty list" -- unreachable: clistLen > 0
-builtinHead other = throwEvalError ("builtins.head: expected a list, got " <> typeName other)
+builtinHead (VList cl) = listElemAt cl 0
+builtinHead other = throwEvalError (expectedList other)
 
+-- | The result shares the argument's C array where upstream's
+-- @prim_tail@ copies the elements after the first: a copy costs time and
+-- arena memory in the list's length on every call, and sharing cannot be
+-- observed because a list is never written after construction.  The
+-- empty-list message is 2.24.9's; from 2.26.0 upstream says
+-- @'builtins.tail' called on an empty list@.
 builtinTail :: (MonadEval m) => NixValue -> m NixValue
 builtinTail (VList cl)
-  | clistLen cl == 0 = throwEvalError "builtins.tail: empty list"
-  | otherwise = pure (VList (clistFromThunks (drop 1 (clistThunks cl))))
-builtinTail other = throwEvalError ("builtins.tail: expected a list, got " <> typeName other)
+  | clistLen cl == 0 = throwEvalError "'tail' called on an empty list"
+  | otherwise = pure (VList (clistDrop 1 cl))
+builtinTail other = throwEvalError (expectedList other)
+
+-- | Upstream's @forceList@ failure (eval-inline.hh at 2.24.9).
+expectedList :: NixValue -> Text
+expectedList other =
+  "expected a list but found " <> typeName other <> ": " <> printValue PrintForError other
+
+-- | The element at an index, failing as the @elemAt@ helper behind
+-- @prim_elemAt@ and @prim_head@ does (primops.cc at 2.24.9).  That helper
+-- takes the index as a C @int@, so an index past 32 bits wraps there
+-- before its bounds check; the whole index is checked here, as 2.33.2
+-- checks it.  2.26.0 replaced the message with
+-- @'builtins.elemAt' called with index N on a list of size M@.
+listElemAt :: (MonadEval m) => CList -> Int64 -> m NixValue
+listElemAt cl idx =
+  maybe (throwEvalError ("list index " <> T.pack (show idx) <> " is out of bounds")) (force . Thunk) (clistIndex cl (fromIntegral idx))
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - string (arity 1)
@@ -2006,25 +2026,13 @@ elemCheck needle (thunk : rest) = do
   eq <- nixEqual force needle val
   if eq then pure True else elemCheck needle rest
 
+-- | The index is checked before the list: @prim_elemAt@ forces it with
+-- @forceInt@ (eval.cc) before its @elemAt@ forces the list.
 builtinElemAt :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinElemAt (VList cl) (VInt idx)
-  | idx < 0 || fromIntegral idx >= clistLen cl = elemAtOOB idx cl
-  | otherwise =
-      -- O(1) direct C array access instead of materializing the whole list
-      let ptr = unsafePerformIO (clistGet (unCList cl) (fromIntegral idx))
-       in force (Thunk ptr)
-  where
-    elemAtOOB i c =
-      throwEvalError
-        ( "builtins.elemAt: index "
-            <> T.pack (show i)
-            <> " out of bounds for list of length "
-            <> T.pack (show (clistLen c))
-        )
-builtinElemAt (VList _) other =
-  throwEvalError ("builtins.elemAt: expected an integer, got " <> typeName other)
-builtinElemAt other _ =
-  throwEvalError ("builtins.elemAt: expected a list, got " <> typeName other)
+builtinElemAt (VList cl) (VInt idx) = listElemAt cl idx
+builtinElemAt other (VInt _) = throwEvalError (expectedList other)
+builtinElemAt _ other =
+  throwEvalError ("expected an integer but found " <> typeName other <> ": " <> printValue PrintForError other)
 
 builtinPartition :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinPartition predFn (VList cl) = do

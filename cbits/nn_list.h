@@ -11,6 +11,8 @@
  *
  * Lists are immutable after construction: allocate with nn_list_new,
  * fill via nn_list_set, then read with nn_list_get/nn_list_count.
+ * nn_list_drop builds a suffix over its source's items array, which
+ * that immutability makes safe to share.
  *
  * Lifecycle: constructed during evaluation, freed via nn_list_free_all()
  * at arena teardown.  Not thread-safe - single-threaded evaluation only.
@@ -39,6 +41,13 @@ typedef struct nn_list {
  * The header is malloc'd and tracked for bulk cleanup.
  * Returns NULL on allocation failure or if count is 0. */
 nn_list_t *nn_list_new(uint32_t count);
+
+/* The elements of `list` from index `n` on, as a new tracked header over
+ * the same items array: O(1) whatever the length, where a copy would
+ * add count - n slots to pages nothing frees before evaluation end.
+ * Returns NULL if no element remains (n >= count) or on allocation
+ * failure. */
+nn_list_t *nn_list_drop(const nn_list_t *list, uint32_t n);
 
 /* Free all tracked list headers at once (arena-style cleanup).
  * Items arrays are freed by nn_env_destroy (page allocator).

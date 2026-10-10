@@ -18,6 +18,8 @@ module Nix.Eval.CList
     clistFromThunks,
     clistThunks,
     clistLen,
+    clistIndex,
+    clistDrop,
 
     -- * Lifecycle
     clistNew,
@@ -64,6 +66,9 @@ foreign import ccall unsafe "nn_list_get"
 
 foreign import ccall unsafe "nn_list_set"
   c_nn_list_set :: CListPtr -> Word32 -> CThunkPtr -> IO ()
+
+foreign import ccall unsafe "nn_list_drop"
+  c_nn_list_drop :: CListPtr -> Word32 -> IO CListPtr
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
@@ -166,3 +171,22 @@ clistLen :: CList -> Int
 clistLen (CList p)
   | p == nullPtr = 0
   | otherwise = fromIntegral (unsafePerformIO (clistCount p))
+
+-- | The element at an index, or 'Nothing' outside the list, read from the
+-- C array without materializing the list.  Pure because a list is never
+-- written after construction.
+clistIndex :: CList -> Int -> Maybe CThunkPtr
+clistIndex cl@(CList p) i
+  | i < 0 || i >= clistLen cl = Nothing
+  | otherwise = Just $! unsafePerformIO (clistGet p (fromIntegral i))
+
+-- | The list without its first @n@ elements, as 'drop' is on lists.  The
+-- result is a new header over this list's C array (@nn_list_drop@), so it
+-- costs the same whatever the length.  Allocating it under
+-- 'unsafePerformIO' is safe because the array is immutable: a header
+-- built twice or shared between calls describes the same elements.
+clistDrop :: Int -> CList -> CList
+clistDrop n cl@(CList p)
+  | n <= 0 = cl
+  | n >= clistLen cl = emptyCList
+  | otherwise = CList (unsafePerformIO (checkedCPtr "nn_list_drop" =<< c_nn_list_drop p (fromIntegral n)))
