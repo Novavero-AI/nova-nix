@@ -69,6 +69,7 @@ library
     Nix.Eval.Policy
     Nix.Eval.Operator
     Nix.Eval.Print
+    Nix.Eval.SourceError
     Nix.Eval.StringInterp
     Nix.Eval.Symbol
     Nix.Eval.CAttrSet
