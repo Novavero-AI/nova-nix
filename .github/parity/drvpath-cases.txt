@@ -1,0 +1,41 @@
+# drvPath cases for drvpath-cases.sh: a label, then an expression for a
+# derivation.  `pkgs` is the pinned nixpkgs for x86_64-linux with no user
+# config or overlays, and a relative path resolves against this directory.
+#
+# A drvPath covers its whole build-time closure, so a case earns its place
+# by reaching nixpkgs code the others do not, and nova-nix's evaluation is
+# the cost to weigh it against.
+
+# The original oracle pair: the stdenv bootstrap under hello, and
+# input-derivation-modulo substitution through a multi-output input.
+hello            pkgs.hello
+dependent        import ./dependent.nix
+
+# What evaluation itself writes or fetches.
+tofile           import ./tofile.nix
+fetchgit         import ./fetchgit.nix
+
+# Other stdenv layers: no C compiler, the i686 and musl bootstraps, and
+# the LLVM toolchain.
+stdenvNoCC       pkgs.stdenvNoCC
+i686-hello       pkgs.pkgsi686Linux.hello
+musl-hello       pkgs.pkgsMusl.hello
+clang            pkgs.clang
+
+# Cross-compiled, to another Linux and to Windows.
+aarch64-hello    pkgs.pkgsCross.aarch64-multiplatform.hello
+mingwW64-hello   pkgs.pkgsCross.mingwW64.hello
+
+# Inputs selected by output name, across many multi-output packages.
+curl             pkgs.curl
+systemd          pkgs.systemd
+
+# Fixed-output fetchers past fetchurl: fetchgit, fetchFromGitHub with a
+# vendored cargo tree, a vendored Go module tree, fetchPypi.
+sbsigntool       pkgs.sbsigntool
+ripgrep          pkgs.ripgrep
+fzf              pkgs.fzf
+python-requests  pkgs.python3Packages.requests
+
+# A NixOS module evaluation, down to the initrd it assembles.
+nixos-initrd     (import <nixpkgs/nixos> { system = "x86_64-linux"; configuration = { fileSystems."/".device = "/dev/sda1"; boot.loader.grub.device = "/dev/sda"; system.stateVersion = "24.11"; }; }).config.system.build.initialRamdisk

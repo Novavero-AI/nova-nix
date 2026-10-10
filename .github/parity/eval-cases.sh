@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Diff nova-nix's evaluation against upstream Nix's, one expression at a time.
 #
-# The drvPath oracle beside this proves the two agree on one large real
-# closure.  What it cannot do is say WHERE a disagreement lives, and it only
-# exercises whatever nixpkgs' hello happens to use.  This runs a small set of
-# expressions through both evaluators and names the ones that differ, so a
-# divergence arrives as the expression that demonstrates it.
+# The drvPath cases beside this prove the two agree on whole closures.  What
+# they cannot do is say WHERE inside one a disagreement lives.  This runs a
+# small set of expressions through both evaluators and names the ones that
+# differ, so a divergence arrives as the expression that demonstrates it.
 #
 # NOVA_NIX_BIN names the executable under test; nix-instantiate comes from
 # PATH.  Portable to bash 3.2, which is what macOS ships: no mapfile, no

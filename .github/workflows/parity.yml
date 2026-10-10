@@ -1,6 +1,7 @@
 name: Parity
 
-# Proves the EVALUATOR is correct: nova-nix's computed hello.drvPath must
+# Proves the EVALUATOR is correct: for every case in
+# .github/parity/drvpath-cases.txt, nova-nix's computed drvPath must
 # byte-match what upstream Nix (nix-instantiate) computes from the SAME
 # nixpkgs tree.  A derivation store-path hash transitively encodes the hash
 # of every input derivation, so one matching path validates the whole
@@ -38,6 +39,9 @@ jobs:
   parity:
     name: drvPath vs upstream Nix
     runs-on: ubuntu-latest
+    # An evaluator that loops on one case would otherwise hold the runner
+    # for GitHub's six-hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -96,73 +100,25 @@ jobs:
             || { echo "unexpected untracked files in nixpkgs" >&2; exit 1; }
           echo "NIXPKGS=$PWD/nixpkgs-ref" >> "$GITHUB_ENV"
 
-      - name: Upstream Nix drvPath (the oracle)
-        run: |
-          REF=$(nix-instantiate \
-            -E '(import <nixpkgs> { system = "x86_64-linux"; config = {}; overlays = []; }).hello' \
-            -I nixpkgs="$NIXPKGS")
-          echo "upstream: $REF"
-          echo "REF=$REF" >> "$GITHUB_ENV"
-
       - name: Build nova-nix
+        id: build
         run: cabal build exe:nova-nix
 
-      - name: nova-nix drvPath
+      # One row per case, both evaluators reading the tree verified above;
+      # any mismatch or failure in either evaluator fails the step.  The
+      # fetchgit case fetches a pinned rev from GitHub during evaluation,
+      # the host this job already depends on for the checkout and nixpkgs.
+      - name: drvPath cases vs upstream Nix
         run: |
-          RAW=$(cabal run -v0 nova-nix -- eval \
-            --expr '(import <nixpkgs> { system = "x86_64-linux"; config = {}; overlays = []; }).hello.drvPath' \
-            --nix-path nixpkgs="$NIXPKGS" --nix-path nix="$PWD/data/nix")
-          NOVA=$(printf '%s' "$RAW" | tr -d '"' | tail -n1)
-          echo "nova-nix: $NOVA"
-          echo "NOVA=$NOVA" >> "$GITHUB_ENV"
+          NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/drvpath-cases.sh
 
-      # A dependent derivation with a multi-output input: anchors the
-      # input-derivation-modulo substitution (and output-name sorting)
-      # against upstream, which run-to-run determinism alone cannot - a
-      # consistently wrong hash would also be deterministic.
-      - name: Upstream Nix dependent drvPath (the oracle)
-        run: |
-          DEPREF=$(nix-instantiate "$PWD/.github/parity/dependent.nix")
-          echo "upstream dependent: $DEPREF"
-          echo "DEPREF=$DEPREF" >> "$GITHUB_ENV"
-
-      - name: nova-nix dependent drvPath
-        run: |
-          RAW=$(cabal run -v0 nova-nix -- eval \
-            --expr "(import $PWD/.github/parity/dependent.nix).drvPath")
-          DEPNOVA=$(printf '%s' "$RAW" | tr -d '"' | tail -n1)
-          echo "nova-nix dependent: $DEPNOVA"
-          echo "DEPNOVA=$DEPNOVA" >> "$GITHUB_ENV"
-
-      - name: Compare
-        run: |
-          echo "upstream nix : $REF"
-          echo "nova-nix     : $NOVA"
-          echo "upstream dep : $DEPREF"
-          echo "nova-nix dep : $DEPNOVA"
-          FAIL=0
-          if [ "$REF" = "$NOVA" ]; then
-            echo "::notice title=Parity OK::nova-nix hello.drvPath byte-matches upstream Nix"
-          else
-            echo "::error title=Parity mismatch::nova-nix and upstream Nix disagree on hello.drvPath"
-            FAIL=1
-          fi
-          if [ "$DEPREF" = "$DEPNOVA" ]; then
-            echo "::notice title=Parity OK::dependent drvPath byte-matches upstream Nix"
-          else
-            echo "::error title=Parity mismatch::nova-nix and upstream Nix disagree on the dependent drvPath"
-            FAIL=1
-          fi
-          if [ "$FAIL" = "1" ]; then
-            exit 1
-          fi
-
-      # The drvPath oracle above agrees or it does not; what it cannot do is
-      # say WHERE a disagreement lives, and it only exercises whatever
-      # nixpkgs' hello happens to reach.  This runs a case set through both
-      # evaluators and names the expressions that differ, so the next
-      # divergence arrives as the expression that demonstrates it rather
-      # than as a hash that is off by everything.
+      # The drvPath cases agree or they do not; what they cannot do is say
+      # WHERE inside a closure a disagreement lives.  This runs a case set
+      # through both evaluators and names the expressions that differ, so
+      # the next divergence arrives as the expression that demonstrates it
+      # rather than as a hash that is off by everything.  It runs when the
+      # drvPath cases fail, which is when it is needed.
       - name: Evaluation case set vs upstream Nix
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/eval-cases.sh

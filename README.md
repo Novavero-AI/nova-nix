@@ -18,11 +18,16 @@ it.
 ## Status
 
 - **Evaluation matches upstream Nix on the cases CI checks.** On a pinned
-  nixpkgs 24.11 revision, `hello.drvPath` and a dependent derivation evaluate
-  to the same store paths as Nix 2.24.9, and 23 smaller evaluation cases
-  produce the same output. CI runs this comparison on every change. A matching
-  `drvPath` means the whole build-time closure behind it matches too. How much
-  of the rest of nixpkgs evaluates has not been measured yet ([#29]).
+  nixpkgs 24.11 revision, 17 derivations evaluate to the same store paths as
+  Nix 2.24.9. They span the native, i686 and musl stdenv bootstraps,
+  cross-compilation to aarch64 Linux and Windows, multi-output packages such
+  as curl and systemd, sources fetched through git, GitHub, PyPI and the
+  cargo and Go vendoring fetchers, a NixOS initrd, and fixtures for
+  derivation inputs, `builtins.toFile` and `builtins.fetchGit`. 30 smaller
+  evaluation cases produce the same output. CI runs this comparison on every
+  change. A matching `drvPath` means the whole build-time closure behind it
+  matches too. How much of the rest of nixpkgs evaluates has not been
+  measured yet ([#29]).
 - **Windows builds run natively.** CI builds GNU Hello on a Windows runner
   through a stage-1 stdenv. Its toolchain is 17 MinGW-w64 packages and 22
   MSYS2 packages, each fetched as a fixed-output derivation pinned by SHA-256
