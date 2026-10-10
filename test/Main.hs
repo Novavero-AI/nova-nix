@@ -52,7 +52,8 @@ import Nix.Eval.AttrPath (parseAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
-import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
+import Nix.Eval.CList (clistDrop, clistFromThunks, clistIndex, clistLen, clistThunks)
+import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkPayload, cthunkSetComputed, cthunkState)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcBinding (..), compileExpr, decodeBcBindings)
@@ -850,8 +851,69 @@ testEvalLists = do
       runTest "list length" $
         assertEval "length" "builtins.length [ 1 2 3 ]" (VInt 3),
       runTest "list concat" $
-        assertEval "concat" "builtins.length ([ 1 ] ++ [ 2 3 ])" (VInt 3)
+        assertEval "concat" "builtins.length ([ 1 ] ++ [ 2 3 ])" (VInt 3),
+      runTest "head forces only the first element" $
+        assertEval "head-lazy" "builtins.head [ 1 (throw \"x\") ]" (VInt 1),
+      runTest "tail keeps every element after the first" $
+        assertEval "tail" "builtins.tail [ 1 2 3 ] == [ 2 3 ]" (VBool True),
+      runTest "tail of a tail" $
+        assertEval "tail-tail" "builtins.tail (builtins.tail [ 1 2 3 ]) == [ 3 ]" (VBool True),
+      runTest "tail of a one-element list is empty" $
+        assertEval "tail-one" "builtins.tail [ 1 ] == [ ]" (VBool True),
+      runTest "tail forces none of the elements" $
+        assertEval "tail-lazy" "builtins.length (builtins.tail [ (throw \"a\") (throw \"b\") ])" (VInt 1),
+      runTest "head of a tail" $
+        assertEval "head-tail" "builtins.head (builtins.tail [ 1 2 3 ])" (VInt 2),
+      -- The messages 2.24.9 raises: head is its elemAt at index 0 and
+      -- tail has its own (primops.cc), a non-list fails in forceList
+      -- (eval-inline.hh), and tryEval catches neither.  2.26.0 reworded
+      -- both empty-list messages, so nix-instantiate 2.33.2 prints
+      -- "'builtins.head' called on an empty list" and the same for tail.
+      runTest "head of an empty list" $
+        assertEvalError "head-empty" "builtins.head [ ]" "list index 0 is out of bounds",
+      runTest "tail of an empty list" $
+        assertEvalError "tail-empty" "builtins.tail [ ]" "'tail' called on an empty list",
+      runTest "head of the empty list tail returns" $
+        assertEvalError "head-tail-empty" "builtins.head (builtins.tail [ 1 ])" "list index 0 is out of bounds",
+      runTest "tail of the empty list tail returns" $
+        assertEvalError "tail-tail-empty" "builtins.tail (builtins.tail [ 1 ])" "'tail' called on an empty list",
+      runTest "head of an integer" $
+        assertEvalError "head-int" "builtins.head 1" "expected a list but found an integer: 1",
+      runTest "head of a string" $
+        assertEvalError "head-string" "builtins.head \"x\"" "expected a list but found a string: \"x\"",
+      runTest "tail of null" $
+        assertEvalError "tail-null" "builtins.tail null" "expected a list but found null: null",
+      runTest "tail of a Boolean" $
+        assertEvalError "tail-bool" "builtins.tail true" "expected a list but found a Boolean: true",
+      runTest "tryEval does not catch head of an empty list" $
+        assertEvalError "head-empty-tryeval" "builtins.tryEval (builtins.head [ ])" "list index 0 is out of bounds",
+      runTest "tryEval does not catch tail of a non-list" $
+        assertEvalError "tail-int-tryeval" "builtins.tryEval (builtins.tail 1)" "expected a list but found an integer: 1",
+      runTest "length of an integer" $
+        assertEvalError "length-int" "builtins.length 1" "expected a list but found an integer: 1",
+      runTest "length of null" $
+        assertEvalError "length-null" "builtins.length null" "expected a list but found null: null",
+      runTestM "drop and index on a C list agree with the materialized list" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genCase $ \(values, drops, index) ->
+              QC.ioProperty $ do
+                ptrs <- mapM cthunkNewComputedInt values
+                let dropped = foldl' (flip clistDrop) (clistFromThunks ptrs) drops
+                    model = foldl' (flip drop) ptrs drops
+                    modelAt i
+                      | i < 0 = Nothing
+                      | otherwise = listToMaybe (drop i model)
+                pure $
+                  (clistThunks dropped, clistLen dropped, clistIndex dropped index)
+                    QC.=== (model, length model, modelAt index)
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
+  where
+    -- Short lists and a few drops, so the drops and the index land on
+    -- both sides of the bounds, negatives included.
+    genCount = QC.choose (-2, 12)
+    genCase = (,,) <$> QC.resize 10 (QC.listOf QC.arbitrary) <*> QC.resize 4 (QC.listOf genCount) <*> genCount
 
 -- ---------------------------------------------------------------------------
 -- Tests: Eval - Lambda
@@ -1133,8 +1195,25 @@ testEvalHigherOrder = do
       -- elemAt
       runTest "elemAt valid" $
         assertEval "elemAt" "builtins.elemAt [ 10 20 30 ] 1" (VInt 20),
-      runTest "elemAt out of bounds" $
-        assertEvalFail "elemAt-oob" "builtins.elemAt [ 1 2 ] 5",
+      -- The messages 2.24.9 raises (elemAt in primops.cc, forceInt in
+      -- eval.cc, forceList in eval-inline.hh).  The index is forced and
+      -- checked before the list.  2.26.0 reworded the bounds message;
+      -- 2.33.2 prints "'builtins.elemAt' called with index 5 on a list of
+      -- size 2".
+      runTest "elemAt past the end" $
+        assertEvalError "elemAt-oob" "builtins.elemAt [ 1 2 ] 5" "list index 5 is out of bounds",
+      runTest "elemAt at the length" $
+        assertEvalError "elemAt-length" "builtins.elemAt [ 1 2 ] 2" "list index 2 is out of bounds",
+      runTest "elemAt negative index" $
+        assertEvalError "elemAt-negative" "builtins.elemAt [ 1 2 ] (-1)" "list index -1 is out of bounds",
+      runTest "elemAt on an empty list" $
+        assertEvalError "elemAt-empty" "builtins.elemAt [ ] 0" "list index 0 is out of bounds",
+      runTest "elemAt of a non-list" $
+        assertEvalError "elemAt-int" "builtins.elemAt 1 0" "expected a list but found an integer: 1",
+      runTest "elemAt with a string index" $
+        assertEvalError "elemAt-string-index" "builtins.elemAt [ 1 2 ] \"x\"" "expected an integer but found a string: \"x\"",
+      runTest "elemAt checks the index before the list" $
+        assertEvalError "elemAt-index-first" "builtins.elemAt 1 \"x\"" "expected an integer but found a string: \"x\"",
       -- partition
       runTest "partition right" $
         assertEval "partition-right" "(builtins.partition (x: x > 2) [ 1 2 3 4 ]).right == [ 3 4 ]" (VBool True),

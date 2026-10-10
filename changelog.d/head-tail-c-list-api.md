@@ -1,0 +1,1 @@
+- **`Nix.Eval.CList` exports `clistIndex` and `clistDrop`,** a bounds-checked read of one element and the list without its first elements, which shares the source's C array through the C layer's new `nn_list_drop`.

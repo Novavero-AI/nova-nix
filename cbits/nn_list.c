@@ -60,6 +60,20 @@ nn_list_new(uint32_t count)
     return list;
 }
 
+nn_list_t *
+nn_list_drop(const nn_list_t *list, uint32_t n)
+{
+    if (n >= list->count) return NULL;
+
+    nn_list_t *rest = (nn_list_t *)malloc(sizeof(nn_list_t));
+    if (!rest) return NULL;
+
+    rest->items = list->items + n;
+    rest->count = list->count - n;
+    nn_list_track(rest);
+    return rest;
+}
+
 void
 nn_list_free_all(void)
 {
