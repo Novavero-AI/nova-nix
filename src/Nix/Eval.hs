@@ -2425,10 +2425,13 @@ parseContextAttrs attrs = do
 -- (eval's base dir can be a native Windows path), so the split is
 -- separator-aware via 'canonBaseName'.
 builtinBaseNameOf :: (MonadEval m) => NixValue -> m NixValue
-builtinBaseNameOf (VStr s ctx) = pure (VStr (lastComponentBytes s) ctx)
 builtinBaseNameOf (VPath p) = pure (mkStr (canonBaseName p))
-builtinBaseNameOf other =
-  throwEvalError ("builtins.baseNameOf: expected a string or path, got " <> typeName other)
+-- Anything else is coerced to a string without a copy, as upstream's
+-- prim_baseNameOf coerces it (primops.cc at 2.24.9): an outPath or a
+-- __toString answers, an integer does not.
+builtinBaseNameOf other = do
+  (s, ctx) <- coerceToString False force applyValue coercePathVerbatim other
+  pure (VStr (lastComponentBytes s) ctx)
 
 -- | Byte-level last component for string operands ('/' is a single byte
 -- in UTF-8 and never occurs inside a multi-byte sequence).
@@ -2441,10 +2444,13 @@ lastComponentBytes t = case reverse (filter (not . BS.null) (BC.split '/' t)) of
 -- ('dirComponentBytes'); path operands may be native-spelled and split
 -- separator-aware via 'canonDirName'.
 builtinDirOf :: (MonadEval m) => NixValue -> m NixValue
-builtinDirOf (VStr s ctx) = pure (VStr (dirComponentBytes s) ctx)
 builtinDirOf (VPath p) = pure (VPath (canonDirName p))
-builtinDirOf other =
-  throwEvalError ("builtins.dirOf: expected a string or path, got " <> typeName other)
+-- Only a path value stays a path (prim_dirOf); anything else is coerced
+-- to a string without a copy, so a set whose outPath is a path gives a
+-- string.
+builtinDirOf other = do
+  (s, ctx) <- coerceToString False force applyValue coercePathVerbatim other
+  pure (VStr (dirComponentBytes s) ctx)
 
 -- | Byte-level dir component for string operands: everything before the
 -- last '/' byte, with upstream's "." / "/" edge results.
@@ -3118,14 +3124,28 @@ keyInList key (seen : rest) = do
 -- IO builtins (delegate to MonadEval methods)
 -- ---------------------------------------------------------------------------
 
--- | Coerce a value to a path 'Text'.  Accepts 'VPath' and 'VStr';
--- throws a type error for anything else.  A string operand is a byte
--- string naming a filesystem path, so it decodes strictly.
+-- | Upstream's @coerceToPath@ (eval.cc at 2.24.9), which every builtin
+-- taking a path runs its argument through: a path is itself, an attribute
+-- set's @__toString@ result is coerced again (it may be a path), and any
+-- other value is coerced to a string without a copy, which must spell an
+-- absolute path.  The string's bytes name a filesystem path, so they
+-- decode strictly, the label naming the builtin if they cannot.  The
+-- context the coercion gathers comes back with the path.
+coerceToPathWithContext :: (MonadEval m) => Text -> NixValue -> m (Text, StringContext)
+coerceToPathWithContext _ (VPath p) = pure (p, emptyContext)
+coerceToPathWithContext label val@(VAttrs attrs)
+  | Just toStringThunk <- attrSetLookup "__toString" attrs = do
+      toStringFn <- force toStringThunk
+      coerceToPathWithContext label =<< applyValue toStringFn val
+coerceToPathWithContext label val = do
+  (bytes, ctx) <- coerceToString False force applyValue coercePathVerbatim val
+  path <- absolutePathString =<< decodedText label bytes
+  pure (path, ctx)
+
+-- | 'coerceToPathWithContext' for a builtin that reads the path and keeps
+-- no string.
 coerceToPath :: (MonadEval m) => Text -> NixValue -> m Text
-coerceToPath _ (VPath p) = pure p
-coerceToPath name (VStr s _) = absolutePathString =<< decodedText ("builtins." <> name) s
-coerceToPath name other =
-  throwEvalError ("builtins." <> name <> ": expected a path or string, got " <> typeName other)
+coerceToPath label val = fst <$> coerceToPathWithContext label val
 
 -- | Upstream @coerceToPath@'s rule for a string operand: it must spell an
 -- absolute path, which is then canonicalized like any path value
@@ -3141,14 +3161,11 @@ absolutePathString s
     canonical = canonPathValue s
 
 builtinImport :: (MonadEval m) => NixValue -> m NixValue
-builtinImport (VPath p) = importFile p
-builtinImport (VStr s _) = importFile =<< absolutePathString =<< decodedText "import" s
-builtinImport other =
-  throwEvalError ("import: expected a path or string, got " <> typeName other)
+builtinImport val = importFile =<< coerceToPath "import" val
 
 builtinReadFile :: (MonadEval m) => NixValue -> m NixValue
 builtinReadFile val = do
-  p <- coerceToPath "readFile" val
+  p <- coerceToPath "builtins.readFile" val
   bytes <- readFileBytes p
   -- The value is the file's RAW BYTES, as upstream: no BOM stripping, no
   -- UTF-16 transcoding, no replacement characters (the auto-decode stays
@@ -3165,7 +3182,7 @@ builtinReadFile val = do
 -- canonicalization would otherwise erase.
 builtinPathExists :: (MonadEval m) => NixValue -> m NixValue
 builtinPathExists val = do
-  p <- coerceToPath "pathExists" val
+  p <- coerceToPath "builtins.pathExists" val
   VBool <$> doesPathExist (existenceQuery val) p
   where
     existenceQuery (VStr s _)
@@ -3174,7 +3191,7 @@ builtinPathExists val = do
 
 builtinReadDir :: (MonadEval m) => NixValue -> m NixValue
 builtinReadDir val = do
-  p <- coerceToPath "readDir" val
+  p <- coerceToPath "builtins.readDir" val
   entries <- listDirectory p
   pure (VAttrs (attrSetFromMap (Map.fromList [(name, evaluated (mkStr fileType)) | (name, fileType) <- entries])))
 
@@ -3187,17 +3204,12 @@ builtinGetEnv (VStr name _) = mkStrBytes <$> getEnvVar name
 builtinGetEnv other =
   throwEvalError ("builtins.getEnv: expected a string, got " <> typeName other)
 
+-- | Upstream's @prim_toPath@ returns the coerced path as a string, with
+-- its context, not as a path value (primops.cc at 2.24.9).
 builtinToPath :: (MonadEval m) => NixValue -> m NixValue
-builtinToPath (VPath p) = pure (VPath p)
-builtinToPath (VStr rawBytes _) = do
-  s <- decodedText "builtins.toPath" rawBytes
-  case T.uncons s of
-    Nothing -> throwEvalError "builtins.toPath: empty path"
-    -- Canonicalized like every other path production site, as upstream.
-    Just ('/', _) -> pure (VPath (canonPathValue s))
-    Just _ -> throwEvalError ("builtins.toPath: path must be absolute, got " <> s)
-builtinToPath other =
-  throwEvalError ("builtins.toPath: expected a string or path, got " <> typeName other)
+builtinToPath val = do
+  (path, ctx) <- coerceToPathWithContext "builtins.toPath" val
+  pure (VStr (TE.encodeUtf8 path) ctx)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - store path operations
@@ -3218,10 +3230,7 @@ builtinStorePath val = do
   policy <- evalPolicy
   if epPureEval policy
     then throwEvalError "'builtins.storePath' is not allowed in pure evaluation mode"
-    else case val of
-      VPath p -> validateStorePath p
-      VStr s _ -> validateStorePath =<< absolutePathString =<< decodedText "builtins.storePath" s
-      other -> throwEvalError ("builtins.storePath: expected a path or string, got " <> typeName other)
+    else validateStorePath =<< coerceToPath "builtins.storePath" val
 
 -- | @builtins.storePath@ - mark an already-in-store path as such.  Upstream
 -- returns a STRING carrying an Opaque (SCPlain) context entry for the enclosing
@@ -3355,7 +3364,7 @@ toFileRefs (StringContext elems) = mapM refOf (Set.toAscList elems)
 
 builtinScopedImport :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinScopedImport (VAttrs attrs) pathVal = do
-  p <- coerceToPath "scopedImport" pathVal
+  p <- coerceToPath "builtins.scopedImport" pathVal
   let scope = Map.toList (attrSetToMap attrs)
   scopedImportFile scope p
 builtinScopedImport other _ =
@@ -4711,17 +4720,10 @@ expectDerivationBool other = throwEvalError ("expected a Boolean but found " <> 
 -- | @builtins.hashFile algo path@ - hash raw bytes of a file on disk.
 -- Returns base-16 hex string, matching @builtins.hashString@ output format.
 builtinHashFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHashFile (VStr algo _) (VPath path) = do
+builtinHashFile (VStr algo _) pathVal = do
   algoName <- decodedText "builtins.hashFile" algo
-  bytes <- readFileBytes path
+  bytes <- readFileBytes =<< coerceToPath "builtins.hashFile" pathVal
   hashBytesWithAlgo "hashFile" algoName bytes
-builtinHashFile (VStr algo _) (VStr path _) = do
-  algoName <- decodedText "builtins.hashFile" algo
-  filePath <- absolutePathString =<< decodedText "builtins.hashFile" path
-  bytes <- readFileBytes filePath
-  hashBytesWithAlgo "hashFile" algoName bytes
-builtinHashFile (VStr _ _) other =
-  throwEvalError ("builtins.hashFile: expected a path, got " <> typeName other)
 builtinHashFile other _ =
   throwEvalError ("builtins.hashFile: expected a string, got " <> typeName other)
 
@@ -4737,12 +4739,7 @@ hashBytesWithAlgo ctx algo bytes = case algo of
 -- | @builtins.readFileType path@ - classify a filesystem entry.
 -- Returns @"regular"@, @"directory"@, @"symlink"@, or @"unknown"@.
 builtinReadFileType :: (MonadEval m) => NixValue -> m NixValue
-builtinReadFileType (VPath path) = mkStr <$> getFileType path
-builtinReadFileType (VStr path _) = do
-  filePath <- absolutePathString =<< decodedText "builtins.readFileType" path
-  mkStr <$> getFileType filePath
-builtinReadFileType other =
-  throwEvalError ("builtins.readFileType: expected a path, got " <> typeName other)
+builtinReadFileType val = mkStr <$> (getFileType =<< coerceToPath "builtins.readFileType" val)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - convertHash
@@ -5578,7 +5575,11 @@ xmlAttr (name, value) = " " <> BB.byteString name <> "=\"" <> BC.foldr (\c rest 
 -- accepted but not yet applied (copies everything).
 builtinPath :: (MonadEval m) => NixValue -> m NixValue
 builtinPath (VAttrs attrs) = do
-  pathStr <- forceAttrStr "builtins.path" "path" attrs
+  -- prim_path coerces the attribute with coerceToPath and checks for it
+  -- once its attribute loop is done (primops.cc at 2.24.9).
+  pathStr <- case attrSetLookup "path" attrs of
+    Nothing -> throwEvalError "missing required 'path' attribute in the first argument to builtins.path"
+    Just thunk -> coerceToPath "builtins.path" =<< force thunk
   nameOverride <- forceOptionalAttrStr attrs "name"
   expectedDigest <- case attrSetLookup "sha256" attrs of
     Nothing -> pure Nothing
@@ -5674,11 +5675,7 @@ filteredSourceNar filterFn rawRoot = do
 -- or @"unknown"@.  Equivalent to @builtins.path@ with a filter and the
 -- source's basename as the store name.
 builtinFilterSource :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinFilterSource filterFn (VPath path) = filterSourceInto filterFn path
-builtinFilterSource filterFn (VStr path _) =
-  filterSourceInto filterFn =<< absolutePathString =<< decodedText "builtins.filterSource" path
-builtinFilterSource _ other =
-  throwEvalError ("builtins.filterSource: expected a path, got " <> typeName other)
+builtinFilterSource filterFn pathVal = filterSourceInto filterFn =<< coerceToPath "builtins.filterSource" pathVal
 
 filterSourceInto :: (MonadEval m) => NixValue -> Text -> m NixValue
 filterSourceInto filterFn path = do
