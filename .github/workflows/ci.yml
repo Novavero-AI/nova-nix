@@ -399,6 +399,28 @@ jobs:
           fi
           grep -q "was not found in the Nix search path" err.txt
 
+      # SIGINT mid-evaluation is upstream's error, exit 1, where it once
+      # ended the process by the signal with nothing said.  POSIX only:
+      # Windows has no SIGINT to send.  set -m starts the job with SIGINT
+      # at its default; a background job in a non-interactive shell would
+      # otherwise ignore it.
+      - name: An interrupt is reported
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          set -m
+          exe=$(cabal list-bin exe:nova-nix)
+          "$exe" eval --expr 'builtins.length (builtins.genericClosure { startSet = [ { key = 0; } ]; operator = item: [ { key = item.key + 1; } ]; })' 2>interrupt.txt &
+          pid=$!
+          sleep 3
+          kill -INT "$pid"
+          status=0
+          wait "$pid" || status=$?
+          cat interrupt.txt
+          [ "$status" -eq 1 ] || { echo "expected exit 1 after SIGINT, got $status" >&2; exit 1; }
+          grep -qx 'error: interrupted by the user' interrupt.txt
+
       # CI is the only place that compiles for all three platforms, and it
       # discarded every result.  Keeping them means a Windows or macOS
       # failure can be reproduced on a real machine without installing a

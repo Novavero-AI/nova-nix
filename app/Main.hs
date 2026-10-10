@@ -12,7 +12,7 @@
 -- this module is in the executable stanza.
 module Main (main) where
 
-import Control.Exception (IOException, displayException, try)
+import Control.Exception (AsyncException (UserInterrupt), IOException, displayException, handleJust, try)
 import Control.Monad (join, mfilter, void, (>=>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -51,7 +51,7 @@ import Paths_nova_nix (getDataDir, version)
 import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, makeAbsolute)
 import qualified System.Directory.OsPath as OsDir
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode (..), exitFailure, exitWith)
 import qualified System.File.OsPath as OsFile
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
@@ -385,7 +385,11 @@ main = do
   opts <- either (failWith . T.pack) pure (parseArgs args)
   config <- loadNixConfig
   storeDir <- chosenStoreDir opts
-  case optCommand opts of
+  -- SIGINT reaches the main thread as UserInterrupt, which uncaught ends
+  -- the process by the signal with nothing said.  Upstream's checkInterrupt
+  -- throws Interrupted, a BaseError its handleExceptions logs and exits 1
+  -- with (libmain/shared.cc at 2.24.9).
+  handleJust userInterrupt (const reportInterrupt) $ case optCommand opts of
     CmdEvalFile filePath -> evalFile config opts storeDir dataDir filePath
     CmdEvalExpr expr
       | optAterm opts -> evalExprAterm config opts storeDir dataDir expr
@@ -397,6 +401,17 @@ main = do
     CmdUsage -> mapM_ (hPutStrLn stderr) usageLines >> exitFailure
     CmdHelp -> mapM_ putStrLn usageLines
     CmdVersion -> putStrLn versionLine
+
+-- | 'UserInterrupt' alone: every other asynchronous exception keeps
+-- propagating.
+userInterrupt :: AsyncException -> Maybe ()
+userInterrupt UserInterrupt = Just ()
+userInterrupt _ = Nothing
+
+reportInterrupt :: IO a
+reportInterrupt = do
+  hPutStrLn stderr "error: interrupted by the user"
+  exitWith (ExitFailure 1)
 
 -- | What @--version@ reports.  Cabal's version, which is the one the publish
 -- workflow's tag guard checks a tag against, so a downloaded binary names
