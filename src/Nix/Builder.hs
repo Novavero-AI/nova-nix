@@ -72,7 +72,7 @@ import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, isJust)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -85,6 +85,7 @@ import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimi
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
 import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fromATerm, platformToText)
+import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
@@ -181,6 +182,17 @@ envSourceDateEpoch = "SOURCE_DATE_EPOCH"
 -- build may read, upstream's carve-out for fetchers that need proxies.
 envImpureEnvVars :: Text
 envImpureEnvVars = "impureEnvVars"
+
+-- | The variables naming a structured derivation's two attribute files.
+envNixAttrsJsonFile, envNixAttrsShFile :: Text
+envNixAttrsJsonFile = "NIX_ATTRS_JSON_FILE"
+envNixAttrsShFile = "NIX_ATTRS_SH_FILE"
+
+-- | Where in the build directory a structured derivation's attributes
+-- land, under upstream's names.
+attrsJsonFileName, attrsShellFileName :: FilePath
+attrsJsonFileName = ".attrs.json"
+attrsShellFileName = ".attrs.sh"
 
 -- | The fixed build timestamp handed to every builder: 1980-01-01 UTC.
 -- Determinism-aware tools (binutils @ld@ writes it into the PE header
@@ -503,7 +515,6 @@ runPlannedBuild config store drv buildDir plans = do
                 -- rewritten a second time.
                 rewrite = rewritePlaceholders outputDirs . onStore config
                 builderPath = T.unpack (onStore config builderText)
-                environ = buildEnvironment config (rewriteEnv rewrite decodedEnv) builderPath buildDir outputDirs
                 builderArgs = map (T.unpack . rewrite) argTexts
                 -- Env still names the real builder - a launcher only
                 -- changes what's spawned, not what the derivation says.
@@ -515,12 +526,17 @@ runPlannedBuild config store drv buildDir plans = do
                 -- derivation type being non-sandboxed, which for us is
                 -- exactly the fixed-output case.
                 carriesHash out = not (T.null (doHashAlgo out))
-                impureVars
-                  | any carriesHash (drvOutputs drv) =
-                      T.words (Map.findWithDefault "" envImpureEnvVars decodedEnv)
-                  | otherwise = []
-             in -- 5. Run the builder
-                runBuilder spawnPath spawnArgs environ impureVars buildDir
+                impureVars delivery
+                  | any carriesHash (drvOutputs drv) = adImpureEnvVars delivery
+                  | otherwise = Right []
+             in case attrsDelivery rewrite buildDir outputDirs decodedEnv of
+                  Left err -> pure (Left (1, "cannot process " <> structuredAttrsKey <> " attribute of '" <> formatDrvName drv <> "': " <> err))
+                  Right delivery -> case impureVars delivery of
+                    Left err -> pure (Left (1, err))
+                    Right passed -> do
+                      for_ (adFiles delivery) (uncurry BS.writeFile)
+                      -- 5. Run the builder
+                      runBuilder spawnPath spawnArgs (buildEnvironment config (adEnv delivery) builderPath buildDir) passed buildDir
       case exitResult of
         Left (exitCode, stderrText) -> do
           -- Whatever the builder wrote is in the store now, so failure has
@@ -679,7 +695,57 @@ rewriteEnv rewrite = Map.fromList . map rewritePair . Map.toList
   where
     rewritePair (name, value) = (rewrite name, rewrite value)
 
--- | Build the process environment from the derivation env + standard vars.
+-- | What a builder receives of its derivation beyond the builder path and
+-- arguments.
+data AttrsDelivery = AttrsDelivery
+  { -- | Variables the derivation contributes to the environment.
+    adEnv :: !(Map Text Text),
+    -- | Files written into the build directory before the builder starts.
+    adFiles :: ![(FilePath, BS.ByteString)],
+    -- | The @impureEnvVars@ attribute, which matters only to a fixed-output
+    -- derivation, so a malformed one fails only such a build, as upstream.
+    adImpureEnvVars :: !(Either Text [Text])
+  }
+
+-- | How the derivation's attributes reach the builder: as environment
+-- variables, outputs included, or for a derivation carrying structured
+-- attributes, as @.attrs.json@ and @.attrs.sh@ in the build directory
+-- named by two variables, with no attribute and no output in the
+-- environment (upstream's @initTmpDir@ and @writeStructuredAttrs@,
+-- local-derivation-goal.cc at 2.24.9).
+--
+-- @rewrite@ is the build's rewrite of store paths and placeholders.  It
+-- applies to the shell file's text as upstream applies it, after
+-- rendering; the JSON file's strings take it before they are escaped, so
+-- a store directory holding backslashes still yields JSON.
+attrsDelivery :: (Text -> Text) -> FilePath -> [(Text, FilePath)] -> Map Text Text -> Either Text AttrsDelivery
+attrsDelivery rewrite buildDir outputDirs decodedEnv = case Map.lookup structuredAttrsKey decodedEnv of
+  Nothing ->
+    Right
+      AttrsDelivery
+        { adEnv = unionEnvs [outputEnv, rewriteEnv rewrite decodedEnv],
+          adFiles = [],
+          adImpureEnvVars = Right (T.words (Map.findWithDefault "" envImpureEnvVars decodedEnv))
+        }
+  Just encoded -> do
+    attrs <- decodeStructuredAttrs encoded
+    let prepared = withOutputPlaceholders (map fst outputDirs) attrs
+        jsonFile = buildDir </> attrsJsonFileName
+        shellFile = buildDir </> attrsShellFileName
+    Right
+      AttrsDelivery
+        { adEnv = Map.fromList [(envNixAttrsJsonFile, T.pack jsonFile), (envNixAttrsShFile, T.pack shellFile)],
+          adFiles =
+            [ (jsonFile, renderAttrsJson rewrite prepared),
+              (shellFile, TE.encodeUtf8 (rewrite (renderAttrsShell prepared)))
+            ],
+          adImpureEnvVars = fromMaybe [] <$> stringsAttr envImpureEnvVars attrs
+        }
+  where
+    outputEnv = Map.fromList [(name, T.pack path) | (name, path) <- outputDirs]
+
+-- | Build the process environment from the derivation's contribution
+-- ('adEnv') + standard vars.
 -- The builder path is used to derive PATH entries - the builder's own
 -- directory and its sibling @usr\/bin@ are included so that coreutils
 -- shipped alongside the builder (e.g. Git for Windows' MSYS2 tools)
@@ -690,15 +756,9 @@ buildEnvironment ::
   Map Text Text ->
   FilePath ->
   FilePath ->
-  [(Text, FilePath)] ->
   Map Text Text
-buildEnvironment config decodedEnv builderPath buildDir outputDirs =
-  let -- Start with the derivation environment (values decoded at the
-      -- spawn boundary by 'decodeBuilderStrings')
-      baseEnv = decodedEnv
-      -- Add output paths: $out, $dev, etc.
-      outputEnv = Map.fromList [(name, T.pack path) | (name, path) <- outputDirs]
-      -- Standard build variables
+buildEnvironment config derivationEnv builderPath buildDir =
+  let -- Standard build variables
       standardEnv =
         Map.fromList
           [ (envNixBuildTop, T.pack buildDir),
@@ -711,8 +771,8 @@ buildEnvironment config decodedEnv builderPath buildDir outputDirs =
             (envPath, buildPath builderPath),
             (envSourceDateEpoch, sourceDateEpochValue)
           ]
-   in -- Priority: output paths > derivation env > standard env
-      unionEnvs [outputEnv, baseEnv, standardEnv]
+   in -- Priority: derivation env (output paths first) > standard env
+      unionEnvs [derivationEnv, standardEnv]
 
 -- | Union environment maps left to right (an earlier map's variable wins).
 -- On Windows environment names are one case-insensitive namespace, so

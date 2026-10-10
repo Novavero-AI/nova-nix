@@ -119,17 +119,18 @@ import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
+import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
 import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
-import Nix.Eval.Context (extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
+import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
 import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, evalUpdate, nixCompare, nixEqual)
 import Nix.Eval.Policy (isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), printValue)
-import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatJsonFloat, formatNixFloat, formatXmlFloat, stripIndentedChunks)
+import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, formatXmlFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
 import Nix.Eval.Types
   ( AttrSet (..),
@@ -200,6 +201,7 @@ import Nix.Expr.Types
     UnaryOp (..),
   )
 import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
+import Nix.Json (Json (..), renderJson)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathNameErrorText, storePathNameReasonText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
@@ -2976,88 +2978,56 @@ findVersionDash t idx = case BC.uncons (BS.drop idx t) of
 builtinToJSON :: (MonadEval m) => NixValue -> m NixValue
 builtinToJSON val = do
   (json, ctx) <- valueToJSON val
-  pure (VStr (TE.encodeUtf8 json) ctx)
+  pure (VStr (renderJson json) ctx)
 
--- | JSON is built as 'Text' and encoded once at the top: upstream's
--- serializer (nlohmann) REJECTS invalid UTF-8, so string payloads decode
--- strictly here and invalid bytes are an eval error, matching upstream.
-valueToJSON :: (MonadEval m) => NixValue -> m (Text, StringContext)
-valueToJSON VNull = pure ("null", emptyContext)
-valueToJSON (VBool True) = pure ("true", emptyContext)
-valueToJSON (VBool False) = pure ("false", emptyContext)
-valueToJSON (VInt n) = pure (T.pack (show n), emptyContext)
-valueToJSON (VFloat f)
-  -- upstream's serializer (nlohmann dump) writes a non-finite float as null
-  | isNaN f || isInfinite f = pure ("null", emptyContext)
-  | otherwise = pure (formatJsonFloat f, emptyContext)
+-- | The JSON of a value, with the context of every string it holds.
+-- Strings decode strictly: upstream's serializer (nlohmann) REJECTS
+-- invalid UTF-8, so invalid bytes are an eval error, matching upstream.
+-- 'Nix.Json.renderJson' writes the result; @builtins.toJSON@ and a
+-- structured-attributes derivation's @__json@ share both halves, as
+-- upstream's share @printValueAsJSON@.
+valueToJSON :: (MonadEval m) => NixValue -> m (Json, StringContext)
+valueToJSON VNull = pure (JsonNull, emptyContext)
+valueToJSON (VBool b) = pure (JsonBool b, emptyContext)
+valueToJSON (VInt n) = pure (JsonInt (toInteger n), emptyContext)
+valueToJSON (VFloat f) = pure (JsonFloat f, emptyContext)
 valueToJSON (VStr s ctx) = do
   decoded <- decodedText "builtins.toJSON" s
-  pure (jsonEscapeString decoded, ctx)
+  pure (JsonString decoded, ctx)
 valueToJSON (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   vals <- mapM force thunks
   results <- mapM valueToJSON vals
-  let jsonVals = map fst results
-      ctx = mconcat (map snd results)
-  pure ("[" <> T.intercalate "," jsonVals <> "]", ctx)
-valueToJSON (VAttrs attrs) =
-  -- C++ Nix serializes an attrset via __toString first, then outPath, and only
-  -- falls back to an object when neither is present.
-  case (attrSetLookup "__toString" attrs, attrSetLookup "outPath" attrs) of
-    (Nothing, Nothing) -> do
-      let m = attrSetToMap attrs
-          sortedKeys = Map.keys m
-      results <- mapM (jsonPair m) sortedKeys
-      let pairs = map fst results
-          ctx = mconcat (map snd results)
-      pure ("{" <> T.intercalate "," pairs <> "}", ctx)
-    _ -> do
-      (s, ctx) <- coerceToString True force applyValue coercePathToStore (VAttrs attrs)
+  pure (JsonArray (map fst results), mconcat (map snd results))
+-- An attrset is upstream's three-way choice (value-to-json.cc at 2.24.9):
+-- a __toString result coerced as tryAttrsToString is called there, with
+-- coerceMore and copyToStore both off, so the result must already be a
+-- string or a path and a path stays its own absolute text; otherwise the
+-- outPath value, converted as any value is, so it need not be a string;
+-- otherwise an object.
+valueToJSON (VAttrs attrs)
+  | Just _ <- attrSetLookup "__toString" attrs = do
+      (s, ctx) <- coerceToString False force applyValue coercePathVerbatim (VAttrs attrs)
       decoded <- decodedText "builtins.toJSON" s
-      pure (jsonEscapeString decoded, ctx)
+      pure (JsonString decoded, ctx)
+  | Just outPathThunk <- attrSetLookup "outPath" attrs = force outPathThunk >>= valueToJSON
+  | otherwise = do
+      results <- mapM jsonMember (Map.toAscList (attrSetToMap attrs))
+      pure (JsonObject (Map.fromAscList [(key, json) | (key, json, _) <- results]), mconcat [ctx | (_, _, ctx) <- results])
   where
-    jsonPair attrMap key = case Map.lookup key attrMap of
-      Nothing -> pure ("", emptyContext)
-      Just thunk -> do
-        val <- force thunk
-        (jsonVal, ctx) <- valueToJSON val
-        pure (jsonEscapeString key <> ":" <> jsonVal, ctx)
+    jsonMember (key, thunk) = do
+      val <- force thunk
+      (json, ctx) <- valueToJSON val
+      pure (key, json, ctx)
 -- A path serializes as its source store path, with context - the same
 -- copy-to-store coercion as interpolation (upstream value-to-json.cc
 -- serializes paths with copyToStore = true).
 valueToJSON (VPath p) = do
   (spText, ctx) <- sourcePathWithContext p
-  pure (jsonEscapeString spText, ctx)
+  pure (JsonString spText, ctx)
 valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VCompiledRegex _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
-
-jsonEscapeString :: Text -> Text
-jsonEscapeString s = "\"" <> T.concatMap escapeChar s <> "\""
-  where
-    escapeChar '"' = "\\\""
-    escapeChar '\\' = "\\\\"
-    escapeChar '\n' = "\\n"
-    escapeChar '\r' = "\\r"
-    escapeChar '\t' = "\\t"
-    escapeChar c
-      | ord c < 0x20 = "\\u" <> T.pack (padHex 4 (showHex' (ord c)))
-      | otherwise = T.singleton c
-    padHex n str = replicate (n - length str) '0' ++ str
-    showHex' 0 = "0"
-    showHex' num = go num ""
-      where
-        go 0 acc = acc
-        go v acc =
-          let (q, r) = quotRem v 16
-           in go q (hexDigit r : acc)
-
--- | Safe hex digit lookup (total for 0-15).
-hexDigit :: Int -> Char
-hexDigit n
-  | n >= 0 && n <= 9 = chr (ord '0' + n)
-  | n >= 10 && n <= 15 = chr (ord 'a' + n - 10)
-  | otherwise = '?' -- unreachable for valid hex
 
 builtinFromJSON :: (MonadEval m) => NixValue -> m NixValue
 builtinFromJSON (VStr s _) = do
@@ -4466,8 +4436,17 @@ builtinDerivationStrict (VAttrs attrs) = do
       throwEvalError
         ("derivation: invalid derivation name '" <> drvName <> "': " <> storePathNameReasonText (spneReason err))
     Right () -> pure ()
-  system <- forceAttrStr ("derivation \"" <> drvName <> "\"") "system" attrs
-  builder <- forceAttrBytes ("derivation \"" <> drvName <> "\"") "builder" attrs
+  passing <- attrPassingOf attrs
+  let fieldContext = "derivation \"" <> drvName <> "\""
+  -- A structured derivation's builder and system are read as strings
+  -- (upstream's forceString and forceStringNoCtx) rather than coerced.
+  (system, builder) <- case passing of
+    PassAsEnvironment ->
+      (,) <$> forceAttrStr fieldContext "system" attrs <*> forceAttrBytes fieldContext "builder" attrs
+    PassAsStructuredAttrs ->
+      (,)
+        <$> (decodedText fieldContext =<< structuredString RefuseContext fieldContext "system" attrs)
+        <*> structuredString AllowContext fieldContext "builder" attrs
 
   -- __ignoreNulls: when true, null-valued attrs are dropped from the
   -- derivation env (stdenv.mkDerivation sets it); when absent or false,
@@ -4486,7 +4465,9 @@ builtinDerivationStrict (VAttrs attrs) = do
     Just thunk -> do
       val <- force thunk
       case val of
-        VList cl -> mapM (forceToText . Thunk) (clistThunks cl)
+        VList cl -> case passing of
+          PassAsEnvironment -> mapM (forceToText . Thunk) (clistThunks cl)
+          PassAsStructuredAttrs -> mapM (structuredOutputName fieldContext . Thunk) (clistThunks cl)
         -- A null outputs attr is dropped by __ignoreNulls, falling back to
         -- the default output set; without it, null is an error as upstream.
         VNull | ignoreNulls -> pure ["out"]
@@ -4537,10 +4518,21 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- Materialize once, reuse for both env collection and result merge
   let materialized = attrSetToMap attrs
 
-  -- Collect string-coercible attrs into the build env, EXCLUDING "args"
-  -- (C++ Nix puts args in the Derive() args field, never the env).  The
-  -- per-output env vars ($out, ...) are added below.  Carries merged context.
-  (drvEnvPairs, envContext) <- collectDrvEnvWithContext ignoreNulls (Map.delete "__ignoreNulls" (Map.delete "args" materialized))
+  -- Collect the attrs into the build env, EXCLUDING "args" (C++ Nix puts
+  -- args in the Derive() args field, never the env): one string-coerced
+  -- entry each, or one JSON object under __json for a structured
+  -- derivation.  The per-output env vars ($out, ...) are added below in
+  -- both modes.  Carries merged context.
+  let envAttrs = Map.delete "__ignoreNulls" (Map.delete "args" materialized)
+  (drvEnvPairs, envContext) <- case passing of
+    PassAsEnvironment -> collectDrvEnvWithContext ignoreNulls envAttrs
+    PassAsStructuredAttrs -> do
+      (members, ctx) <- collectStructuredAttrs ignoreNulls (Map.delete structuredAttrsFlag envAttrs)
+      forM_ (Map.keys (Map.restrictKeys members structuredPlainStrings)) $ \key ->
+        structuredString RefuseContext fieldContext key attrs
+      forM_ (Map.keys (Map.restrictKeys members structuredDisabledChecks)) $
+        traceMessage . disabledByStructuredAttrs drvName
+      pure ([(structuredAttrsKey, encodeStructuredAttrs (StructuredAttrs members))], ctx)
 
   let fullContext = envContext <> argsContext
       builtInputDrvs = extractInputDrvs fullContext
@@ -4737,6 +4729,102 @@ collectDrvEnvWithContext ignoreNulls attrs = do
         _ -> do
           (s, ctx) <- coerceToStoreString val
           pure (Just (key, s, ctx))
+
+-- | How a derivation hands its attributes to the builder.
+data AttrPassing
+  = -- | One environment variable per attribute, each coerced to a string.
+    PassAsEnvironment
+  | -- | @__structuredAttrs = true@: one JSON object under @__json@, so an
+    -- attribute may be a set or a list (upstream's @jsonObject@ branch of
+    -- @derivationStrictInternal@, primops.cc at 2.24.9).
+    PassAsStructuredAttrs
+
+-- | The attribute choosing structured attributes.  It is not itself one of
+-- them: upstream leaves it out of the JSON object.
+structuredAttrsFlag :: Text
+structuredAttrsFlag = "__structuredAttrs"
+
+-- | Upstream reads @__structuredAttrs@ before any other attribute and as a
+-- boolean, whatever @__ignoreNulls@ says.
+attrPassingOf :: (MonadEval m) => AttrSet -> m AttrPassing
+attrPassingOf attrs = case attrSetLookup structuredAttrsFlag attrs of
+  Nothing -> pure PassAsEnvironment
+  Just thunk -> do
+    val <- force thunk
+    case val of
+      VBool True -> pure PassAsStructuredAttrs
+      VBool False -> pure PassAsEnvironment
+      other -> throwEvalError ("derivation: '" <> structuredAttrsFlag <> "' must be a boolean, got " <> typeName other)
+
+-- | Whether a structured derivation's string field may carry context:
+-- the builder may (upstream's forceString), the fields upstream reads with
+-- forceStringNoCtx may not.
+data StringContextRule = AllowContext | RefuseContext
+
+-- | A string field of a structured derivation, as upstream reads it:
+-- a string, never a value coerced to one.
+structuredString :: (MonadEval m) => StringContextRule -> Text -> Text -> AttrSet -> m BS.ByteString
+structuredString rule fieldContext key attrs = case attrSetLookup key attrs of
+  Nothing -> throwEvalError (fieldContext <> ": missing required attribute '" <> key <> "'")
+  Just thunk -> force thunk >>= structuredStringValue rule
+
+-- | 'structuredString' of a value already in hand.
+structuredStringValue :: (MonadEval m) => StringContextRule -> NixValue -> m BS.ByteString
+structuredStringValue rule val = case (val, rule) of
+  (VStr s ctx, RefuseContext)
+    | not (contextIsEmpty ctx) ->
+        throwEvalError ("the string '" <> bytesToTextLossy s <> "' is not allowed to refer to a store path")
+  (VStr s _, _) -> pure s
+  (other, _) ->
+    throwEvalError ("expected a string but found " <> typeName other <> ": " <> printValue PrintForError other)
+
+-- | An element of a structured derivation's @outputs@ list: a string
+-- without context, where the environment would coerce it.
+structuredOutputName :: (MonadEval m) => Text -> Thunk -> m Text
+structuredOutputName fieldContext thunk =
+  force thunk >>= structuredStringValue RefuseContext >>= decodedText fieldContext
+
+-- | The attributes a structured derivation reads as plain strings, past
+-- @system@ and the outputs list, which are read where they are used.
+structuredPlainStrings :: Set.Set Text
+structuredPlainStrings = Set.fromList ["outputHash", "outputHashAlgo", "outputHashMode"]
+
+-- | Reference and size checks that a structured derivation takes from
+-- @outputChecks@ instead; upstream warns when one is set at the top level.
+structuredDisabledChecks :: Set.Set Text
+structuredDisabledChecks =
+  Set.fromList
+    ["allowedReferences", "allowedRequisites", "disallowedReferences", "disallowedRequisites", "maxSize", "maxClosureSize"]
+
+-- | Upstream's warning for a 'structuredDisabledChecks' attribute.
+disabledByStructuredAttrs :: Text -> Text -> Text
+disabledByStructuredAttrs drvName key =
+  "warning: In a derivation named '"
+    <> drvName
+    <> "', 'structuredAttrs' disables the effect of the derivation attribute '"
+    <> key
+    <> "'; use 'outputChecks.<output>."
+    <> key
+    <> "' instead"
+
+-- | Collect a structured derivation's attributes into the members of its
+-- @__json@ object, each converted as @builtins.toJSON@ converts it (upstream
+-- calls the same @printValueAsJSON@), with the merged context of every
+-- string they hold.  Null attributes are dropped only under
+-- @__ignoreNulls@, as in 'collectDrvEnvWithContext'.
+collectStructuredAttrs :: (MonadEval m) => Bool -> Map Text Thunk -> m (Map Text Json, StringContext)
+collectStructuredAttrs ignoreNulls attrs = do
+  results <- mapM member (Map.toAscList attrs)
+  let members = catMaybes results
+  pure (Map.fromAscList [(key, json) | (key, json, _) <- members], mconcat [ctx | (_, _, ctx) <- members])
+  where
+    member (key, thunk) = do
+      val <- force thunk
+      case val of
+        VNull | ignoreNulls -> pure Nothing
+        _ -> do
+          (json, ctx) <- valueToJSON val
+          pure (Just (key, json, ctx))
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - hashFile, readFileType

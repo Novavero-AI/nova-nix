@@ -96,6 +96,7 @@ library
     Nix.Store.ExecBit
     Nix.DependencyGraph
     Nix.Derivation
+    Nix.Derivation.StructuredAttrs
     Nix.Builder
     Nix.Builder.Unpack
     Nix.Compression
@@ -106,6 +107,7 @@ library
     Nix.Builtins
     Nix.Hash
     Nix.Http
+    Nix.Json
 
   autogen-modules:  Paths_nova_nix
   other-modules:

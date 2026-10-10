@@ -20,6 +20,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Char (isDigit)
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.Int (Int64)
 import Data.List (intercalate, isPrefixOf, sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
@@ -30,7 +31,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import qualified Database.SQLite.Simple as SQL
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
@@ -47,6 +48,7 @@ import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
+import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
 import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath)
@@ -69,6 +71,7 @@ import Nix.Expr.Types
 import Nix.Hash (hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
+import Nix.Json (Json (..), parseJson, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
@@ -3505,6 +3508,236 @@ testContextHelpers = do
             (txt, ctx) = Context.concatStrings [("a", ctx1), ("b", ctx2), ("c", mempty)]
          in if txt == "abc" && Set.size (unStringContext ctx) == 2 then Pass else Fail "bad concat"
     ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: structured attributes and the JSON they travel as
+-- ---------------------------------------------------------------------------
+
+-- | @__structuredAttrs@ end to end on the evaluation side, and the JSON
+-- rules the evaluator and builder share.  Every drvPath, rendering and
+-- @.attrs.sh@ expected here was read off Nix 2.33.2 (nix-instantiate and
+-- a build on aarch64-darwin), whose code for each is 2.24.9's.
+testStructuredAttrs :: IO [Bool]
+testStructuredAttrs = do
+  putStrLn "derivation/structured-attrs"
+  tmpBase <- getTemporaryDirectory
+  let base = "name = \"sa\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; __structuredAttrs = true; "
+      structured attrs = "(derivation { " <> base <> attrs <> " })"
+      withoutContext expr = "builtins.unsafeDiscardStringContext " <> expr
+      drvPathIs label attrs expected =
+        runTest label (assertEval label (withoutContext (structured attrs <> ".drvPath")) (mkStr expected))
+      dependency = "let d = derivation { name = \"d\"; system = \"x\"; builder = \"b\"; }; in "
+  envResult <- evalDerivationIO tmpBase (structured "outputs = [ \"out\" \"dev\" \"lib\" ];")
+  -- A file for the outPath that is a path, copied to the store as upstream
+  -- copies it: "hello\n" named x is m5zd3qj7...-x there.
+  let jsonDir = tmpBase </> "nova-nix-test-json-outpath"
+  createDirectoryIfMissing True jsonDir
+  BS.writeFile (jsonDir </> "x") "hello\n"
+  copiedOutPath <- evalNixIO jsonDir "builtins.unsafeDiscardStringContext (builtins.toJSON { outPath = ./x; })"
+  copiedContext <- evalNixIO jsonDir "builtins.attrNames (builtins.getContext (builtins.toJSON { outPath = ./x; })) == [ \"/nix/store/m5zd3qj7c4bs4g5d8hqvs5pc5xicclfg-x\" ]"
+  -- The IO evaluator, because it is the one with a store to copy into.
+  uncopiedPath <- evalNixIO jsonDir "builtins.toJSON { __toString = s: ./x; }"
+  uncopiedNested <- evalNixIO jsonDir "builtins.toJSON { __toString = s: { outPath = ./x; }; }"
+  removeDirectoryRecursive jsonDir
+  let jsonDirPath = mkStr ("\"" <> canonPathValue (T.pack (jsonDir </> "x")) <> "\"")
+  sequence
+    [ drvPathIs
+        "a nested set and a mixed list are one JSON object"
+        "nested = { a = 1; b = { c = [ \"x\" \"y\" ]; }; \"with space\" = true; }; list = [ \"a\" \"b c\" 1 2.5 null true false ];"
+        "/nix/store/rkxyljjwm2miccr3ffbkvgm7fzmjqddg-sa.drv",
+      drvPathIs
+        "scalars render as nlohmann renders them"
+        "i = 42; neg = -7; f = 1.0; f2 = 0.1; big = 1.0e20; small = 1.0e-7; b = true; n = null; s = \"str\\n\\t\\\"q\\\"\\\\\";"
+        "/nix/store/hgzhpjmp6cpjj0r768xp982an303rh2q-sa.drv",
+      drvPathIs
+        "member names order by their bytes"
+        "\"\233\" = 1; \"Z\" = 2; \"a\" = 3; \"_\" = 4; \"1x\" = 5;"
+        "/nix/store/s2aaxxxqvmdh95wqq3sa75fqal0nv2vf-sa.drv",
+      drvPathIs "a kept null is a JSON null" "n = null;" "/nix/store/r3880xygjwsqk8a4xiq8zrbhpanlf9a3-sa.drv",
+      drvPathIs
+        "__ignoreNulls leaves a null out of the object"
+        "n = null; __ignoreNulls = true;"
+        "/nix/store/cms7b67rf9bn7b376f64i05v1cw2chrh-sa.drv",
+      drvPathIs
+        "a placeholder stays a placeholder in the object"
+        "here = builtins.placeholder \"out\";"
+        "/nix/store/2iqn1i3rl4x9ll8a6j46k1rkk9c3fkd5-sa.drv",
+      drvPathIs
+        "a fixed-output derivation keeps its hash fields in the object"
+        "outputHash = \"sha256-47DEQpj8HBSKTXA6xJbgU1CNMmz7W08F06XOTYP1hmM=\"; outputHashMode = \"flat\"; outputHashAlgo = \"sha256\";"
+        "/nix/store/dp6sib5psffrm1krca5l9wn9nshspn7f-sa.drv",
+      drvPathIs
+        "a set under outputChecks is passed as it is"
+        "outputChecks.out = { allowedReferences = [ ]; maxSize = 100; };"
+        "/nix/store/xzkk2dxqm69akjjshlvk45s8yd6y1dbn-sa.drv",
+      runTest "__structuredAttrs = false keeps one variable per attribute" $
+        assertEval
+          "sa-false"
+          (withoutContext "(derivation { name = \"sa\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; __structuredAttrs = false; x = [ \"a\" \"b\" ]; }).drvPath")
+          (mkStr "/nix/store/i9rm0fa7pbzrbrsaakninfa4232wmj7c-sa.drv"),
+      runTest "every output of a structured derivation gets upstream's path" $
+        assertEval
+          "sa-outputs"
+          (withoutContext (structured "outputs = [ \"out\" \"dev\" \"lib\" ];" <> ".dev.outPath"))
+          (mkStr "/nix/store/jfnikb9k7953srg5mlp3mccmqaijvxyy-sa-dev"),
+      runTest "the environment holds __json and the outputs, nothing else" $
+        assertRight "sa-env" envResult $ \drv ->
+          assertEqual
+            "sa-env"
+            [ ("__json", "{\"builder\":\"/bin/sh\",\"name\":\"sa\",\"outputs\":[\"out\",\"dev\",\"lib\"],\"system\":\"x86_64-linux\"}"),
+              ("dev", "/nix/store/jfnikb9k7953srg5mlp3mccmqaijvxyy-sa-dev"),
+              ("lib", "/nix/store/zpjd7d2l5jqzynv3377a36nk6rzb5il4-sa-lib"),
+              ("out", "/nix/store/bs6ppbphi38qlbjfz67pfk86sx7l4vks-sa")
+            ]
+            (Map.toList (drvEnv drv)),
+      -- toJSON's rules for a set, which the object above shares.
+      runTest "toJSON of a set with outPath converts the outPath value, not its string" $
+        assertEval "json-outpath-int" "builtins.toJSON { outPath = 1; }" (mkStr "1")
+          `andThen` assertEval "json-outpath-set" "builtins.toJSON { outPath = { a = 1; }; }" (mkStr "{\"a\":1}")
+          `andThen` assertEval "json-outpath-list" "builtins.toJSON { outPath = [ 1 { outPath = 2; } ]; }" (mkStr "[1,2]")
+          `andThen` assertEval "json-outpath-null" "builtins.toJSON { outPath = null; }" (mkStr "null"),
+      runTest "toJSON of a set whose outPath is a path copies it to the store, with context" $
+        assertRight "json-outpath-path" copiedOutPath (assertEqual "json-outpath-path" (mkStr "\"/nix/store/m5zd3qj7c4bs4g5d8hqvs5pc5xicclfg-x\""))
+          `andThen` assertRight "json-outpath-path-context" copiedContext (assertEqual "json-outpath-path-context" (VBool True)),
+      runTest "toJSON of a __toString set returning a path keeps the path's own text, uncopied" $
+        assertRight "json-tostring-path" uncopiedPath (assertEqual "json-tostring-path" jsonDirPath)
+          `andThen` assertRight "json-tostring-nested" uncopiedNested (assertEqual "json-tostring-nested" jsonDirPath),
+      runTest "toJSON of a __toString set returning a string keeps its context" $
+        let json = "(builtins.toJSON { __toString = s: \"${d}\"; })"
+         in assertEval "json-tostring-string" (dependency <> withoutContext json) (mkStr "\"/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d\"")
+              `andThen` assertEval
+                "json-tostring-context"
+                (dependency <> "builtins.getContext " <> json <> " == { \"/nix/store/nzvhjdd45mdh8mkqm4vz4hdqsjrvkm8j-d.drv\" = { outputs = [ \"out\" ]; }; }")
+                (VBool True),
+      runTest "toJSON of a __toString set returning an integer is an error, not a coercion" $
+        assertEvalFail "json-tostring-int" "builtins.toJSON { __toString = s: 1; }",
+      drvPathIs
+        "a structured attribute's outPath and __toString follow toJSON's rules"
+        "o = { outPath = { inner = 1; }; }; i = { outPath = 1; }; t = { __toString = s: \"str\"; };"
+        "/nix/store/rz7pfawzsr1a5ig11s1xssbsc2mxys9b-sa.drv",
+      runTest "toJSON escapes backspace and form feed by name" $
+        assertEval
+          "json-bf"
+          "builtins.toJSON (builtins.fromJSON \"\\\"\\\\u0008\\\\u000c\\\\u0001\\\"\")"
+          (mkStr "\"\\b\\f\\u0001\""),
+      runTest "__structuredAttrs must be a boolean" $
+        assertEvalFail "sa-flag" "(derivation { name = \"sa\"; system = \"x\"; builder = \"b\"; __structuredAttrs = \"yes\"; }).drvPath",
+      runTest "a structured system may not refer to a store path" $
+        assertEvalError
+          "sa-system-ctx"
+          (dependency <> "(derivation { name = \"sa\"; builder = \"/bin/sh\"; __structuredAttrs = true; system = \"${d}\"; }).drvPath")
+          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path",
+      runTest "a structured output name may not refer to a store path" $
+        assertEvalError
+          "sa-output-ctx"
+          (dependency <> structured "outputs = [ \"out\" \"${d}\" ];" <> ".drvPath")
+          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path",
+      runTest "a structured builder must be a string, not a value coerced to one" $
+        assertEvalError
+          "sa-builder"
+          "(derivation { name = \"sa\"; system = \"x\"; __structuredAttrs = true; builder = 1; }).drvPath"
+          "expected a string but found an integer: 1",
+      runTest "a structured outputHash must be a string" $
+        assertEvalError "sa-outputhash" (structured "outputHash = 1;" <> ".drvPath") "expected a string but found an integer: 1",
+      runTest "a function cannot become JSON" $
+        assertEvalFail "sa-function" (structured "f = x: x;" <> ".drvPath"),
+      -- The JSON both halves share.
+      runTest "JSON escapes control characters as nlohmann does" $
+        assertEqual
+          "json-escape"
+          (TE.encodeUtf8 "\"a\\b\\f\\n\\r\\t\\u0001\\u001f\127/\\\"\\\\\233\"")
+          (renderJson (JsonString "a\b\f\n\r\t\1\31\127/\"\\\233")),
+      runTest "JSON numbers render as nlohmann renders them" $
+        assertEqual
+          "json-numbers"
+          "[1.0,1e+20,1e-07,0.1,null,null,-7,18446744073709551615]"
+          (renderJson (JsonArray [JsonFloat 1, JsonFloat 1e20, JsonFloat 1e-7, JsonFloat 0.1, JsonFloat (1 / 0), JsonFloat (0 / 0), JsonInt (-7), JsonInt 18446744073709551615])),
+      runTest "upstream's .attrs.json reads back and renders to the same bytes" $
+        assertRight "json-upstream" (decodeStructuredAttrs upstreamAttrsJson) $ \attrs ->
+          assertEqual "json-upstream" (TE.encodeUtf8 upstreamAttrsJson) (encodeStructuredAttrs attrs),
+      runTest "the .attrs.sh renderer writes what upstream writes" $
+        assertRight "attrs-sh" (decodeStructuredAttrs upstreamAttrsJson) $ \attrs ->
+          assertEqual "attrs-sh" upstreamAttrsShell (renderAttrsShell attrs),
+      runTest "outputs become an object of placeholders" $
+        assertEqual
+          "outputs-object"
+          (StructuredAttrs (Map.fromList [("outputs", JsonObject (Map.fromList [("dev", JsonString (hashPlaceholder "dev")), ("out", JsonString (hashPlaceholder "out"))]))]))
+          (withOutputPlaceholders ["out", "dev"] (StructuredAttrs (Map.fromList [("outputs", JsonArray [JsonString "out", JsonString "dev"])]))),
+      runTest "a null __json is an empty object, another non-object an error" $
+        assertEqual "decode-shape" (Right (StructuredAttrs Map.empty)) (decodeStructuredAttrs "null")
+          `andThen` assertLeft "decode-array" (decodeStructuredAttrs "[1]"),
+      runTest "a list-of-strings attribute is read strictly" $
+        let attrs = StructuredAttrs (Map.fromList [("good", JsonArray [JsonString "a", JsonString "b"]), ("mixed", JsonArray [JsonString "a", JsonInt 1]), ("scalar", JsonString "a b")])
+         in assertEqual "strings-good" (Right (Just ["a", "b"])) (stringsAttr "good" attrs)
+              `andThen` assertEqual "strings-absent" (Right Nothing) (stringsAttr "absent" attrs)
+              `andThen` assertLeft "strings-mixed" (stringsAttr "mixed" attrs)
+              `andThen` assertLeft "strings-scalar" (stringsAttr "scalar" attrs),
+      runTest "JSON parsing decodes every escape, surrogate pairs included" $
+        assertEqual
+          "parse-escapes"
+          (Right (JsonString "\"\\/\b\f\n\r\t\233\128512"))
+          (parseJson "\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u00E9\\ud83d\\ude00\""),
+      runTest "JSON parsing keeps integers apart from floats, as nlohmann's lexer does" $
+        assertEqual
+          "parse-numbers"
+          (Right (JsonArray [JsonInt 18446744073709551615, JsonFloat 18446744073709551616, JsonInt (-9223372036854775808), JsonFloat (-9223372036854775809), JsonInt 0, JsonFloat 1, JsonFloat 100]))
+          (parseJson "[18446744073709551615,18446744073709551616,-9223372036854775808,-9223372036854775809,-0,1.0,1E2]"),
+      runTest "JSON parsing takes the last of a repeated name, whitespace and a byte order mark around" $
+        assertEqual
+          "parse-object"
+          (Right (JsonObject (Map.fromList [("a", JsonArray [JsonInt 2, JsonNull])])))
+          (parseJson "\65279 \n{ \"a\" : 1 , \"a\":[ 2 ,null ] }\r\n"),
+      runTest "JSON parsing refuses what nlohmann refuses" $
+        foldr
+          (\bad acc -> assertLeft ("parse-refuses " <> bad) (parseJson bad) `andThen` acc)
+          Pass
+          ["\"a\tb\"", "01", "[1,]", "1e400", "{\"a\" 1}", "tru", "1 2", "\"\\ud800\"", "\"\\udc00\"", "\"\\x\"", "1.", "-", "\"unterminated", ""],
+      runTestM "rendered JSON parses back to the value it came from" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll (genJson 3) $ \json ->
+              (parseJson =<< either (Left . T.pack . show) Right (TE.decodeUtf8' (renderJson json))) QC.=== Right json
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    ]
+
+-- | A subset of the @.attrs.json@ a Nix 2.33.2 build handed its builder
+-- (the members holding no store path), byte for byte.
+upstreamAttrsJson :: Text
+upstreamAttrsJson =
+  "{\"1x\":\"skipped\",\"badList\":[\"a\",[\"nested\"]],\"badObj\":{\"k\":{\"nested\":1}},\"big\":1099511627776,\"ctl\":\"a\\b\\f\\u0001\\u001f\127/\\\"\\\\z\",\"emptyList\":[],\"emptyObj\":{},\"f\":1.5,\"fbig\":1e+20,\"fi\":3.0,\"fl\":false,\"fltList\":[1.5],\"fltObj\":{\"a\":1,\"b\":2.5},\"fneg\":-1e+20,\"fneg2\":-2.5,\"fsmall\":0.1,\"ftrunc\":16777217.5,\"huge\":9223372036854775807,\"int\":42,\"list\":[\"a\",\"b c\",1,2.0,true,false,null],\"n\":null,\"neg\":-7,\"obj\":{\"b\":false,\"k\":\"v\",\"key with space\":1,\"q\":\"'\"},\"str\":\"it's a \\\"test\\\"\\n\",\"t\":true,\"uni\":\"\233\8364\128512\",\"with space\":\"skipped\"}"
+
+-- | The lines of that build's @.attrs.sh@ for the members of
+-- 'upstreamAttrsJson'.  Missing ones (a non-integral number, a nested
+-- array or object, a name bash cannot hold) are upstream's omissions;
+-- @fbig@ and @fneg@ are aarch64's saturating float conversion.
+upstreamAttrsShell :: Text
+upstreamAttrsShell =
+  "declare big=0\ndeclare ctl='a\8\12\1\31\127/\"\\z'\ndeclare -a emptyList=()\ndeclare -A emptyObj=()\ndeclare fbig=2147483647\ndeclare fi=3\ndeclare fl=\ndeclare fneg=-2147483648\ndeclare ftrunc=16777217\ndeclare huge=-1\ndeclare int=42\ndeclare -a list=('a' 'b c' 1 2 1  '' )\ndeclare n=''\ndeclare neg=-7\ndeclare -A obj=(['b']= ['k']='v' ['key with space']=1 ['q']=''\\''' )\ndeclare str='it'\\''s a \"test\"\n'\ndeclare t=1\ndeclare uni='\233\8364\128512'\n"
+
+-- | JSON values up to a nesting depth, strings drawn from what the
+-- renderer escapes and what it passes through as UTF-8, numbers across
+-- both integer types and finite floats.
+genJson :: Int -> QC.Gen Json
+genJson depth = QC.oneof (scalars <> [nested | depth > 0])
+  where
+    scalars =
+      [ pure JsonNull,
+        JsonBool <$> QC.arbitrary,
+        JsonInt . toInteger <$> (QC.arbitrary :: QC.Gen Int64),
+        JsonInt . toInteger <$> (QC.arbitrary :: QC.Gen Word64),
+        JsonFloat <$> (QC.arbitrary `QC.suchThat` (\d -> not (isNaN d || isInfinite d))),
+        JsonString <$> genJsonText
+      ]
+    nested =
+      QC.oneof
+        [ JsonArray <$> QC.resize 4 (QC.listOf (genJson (depth - 1))),
+          JsonObject . Map.fromList <$> QC.resize 4 (QC.listOf ((,) <$> genJsonText <*> genJson (depth - 1)))
+        ]
+
+-- | Text mixing the characters JSON escapes with plain and multi-byte ones.
+genJsonText :: QC.Gen Text
+genJsonText =
+  T.pack <$> QC.listOf (QC.elements ['"', '\\', '/', '\b', '\f', '\n', '\r', '\t', '\0', '\31', '\127', 'a', ' ', '\233', '\8364', '\128512'])
 
 -- ---------------------------------------------------------------------------
 -- Tests: Derivation context + new builtins (Phase 3, Batch 4)
@@ -10543,6 +10776,63 @@ testBuilder = do
             | null leftovers -> Pass
             | otherwise -> Fail ("build dir leaked: " <> T.pack (show leftovers))
           BuildSuccess _ -> Fail "expected failure for a nonexistent builder",
+      -- A derivation carrying __json is built as upstream builds one: its
+      -- attributes, outputs included, arrive as .attrs.json and .attrs.sh
+      -- and none of them as a variable.  The builder copies both files
+      -- out, finding $out where a structured builder must, in the files.
+      runTestM "structured attributes reach the builder as .attrs.json and .attrs.sh" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-structured"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "ssssssssssssssssssssssssssssssss" "structured"
+            outText = T.pack (storePathToFilePath (stDir store) outSP)
+            attrs =
+              "{\"greeting\":\"it's\",\"list\":[\"a\",1,true,null],\"nested\":{\"k\":\"v\"},\"outputs\":[\"out\"],\"self\":\""
+                <> hashPlaceholder "out"
+                <> "/bin\"}"
+            script =
+              T.unlines
+                [ "probe=\"${out-unset}|${__json-unset}|${greeting-unset}\"",
+                  "out=$(sed -n \"/^declare -A outputs=/s/.*\\['out'\\]='\\([^']*\\)'.*/\\1/p\" \"$NIX_ATTRS_SH_FILE\")",
+                  "mkdir \"$out\" && cp \"$NIX_ATTRS_JSON_FILE\" \"$out/attrs.json\" && cp \"$NIX_ATTRS_SH_FILE\" \"$out/attrs.sh\" && printf '%s' \"$probe\" > \"$out/env\""
+                ]
+            drv =
+              (mkTestBuildDrv shell outSP script)
+                { drvEnv = Map.fromList [("__json", TE.encodeUtf8 attrs), ("out", "/nix/store/ssssssssssssssssssssssssssssssss-structured")]
+                }
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-structured-tmp"}
+            jsonPath = "\"" <> T.replace "\\" "\\\\" outText <> "\""
+            expectedJson =
+              "{\"greeting\":\"it's\",\"list\":[\"a\",1,true,null],\"nested\":{\"k\":\"v\"},\"outputs\":{\"out\":"
+                <> jsonPath
+                <> "},\"self\":"
+                <> T.dropEnd 1 jsonPath
+                <> "/bin\"}"
+            expectedShell =
+              T.concat
+                [ "declare greeting='it'\\''s'\n",
+                  "declare -a list=('a' 1 1 '' )\n",
+                  "declare -A nested=(['k']='v' )\n",
+                  "declare -A outputs=(['out']='" <> outText <> "' )\n",
+                  "declare self='" <> outText <> "/bin'\n"
+                ]
+        result <- buildDerivation config store drv
+        ret <- case result of
+          BuildSuccess _ -> do
+            let outDir = storePathToFilePath (stDir store) outSP
+            json <- BS.readFile (outDir </> "attrs.json")
+            shellText <- BS.readFile (outDir </> "attrs.sh")
+            probe <- BS.readFile (outDir </> "env")
+            pure $
+              assertEqual "attrs.json" (TE.encodeUtf8 expectedJson) json
+                `andThen` assertEqual "attrs.sh" (TE.encodeUtf8 expectedShell) shellText
+                `andThen` assertEqual "no attribute is a variable" "unset|unset|unset" probe
+          BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure ret,
       -- Output at expected path
       runTestM "output at expected store path" $ do
         tmpBase <- getTemporaryDirectory
@@ -14195,6 +14485,7 @@ runSuite = do
           testContextHelpers,
           testContextPropagation,
           testDrvContext,
+          testStructuredAttrs,
           testDepGraph,
           testSubstituter,
           testCaseSensitiveVolumeIO,
