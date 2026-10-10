@@ -55,6 +55,7 @@ module Nix.Store.Path
     validStorePathName,
     storePathNameErrorText,
     storePathNameReasonText,
+    storePathNameUpstreamText,
 
     -- * Constants
     storePathHashLen,
@@ -281,6 +282,20 @@ storePathNameReasonText reason = case reason of
       <> " maximum"
   NameIllegalChar c -> "contains the illegal character " <> T.pack (show c)
   NameDotSegment seg -> "the first dash-separated component may not be '" <> seg <> "'"
+
+-- | Upstream's own text for a rejected name, the message of the
+-- @BadStorePathName@ its @checkName@ throws (path.cc at 2.24.9), which its
+-- callers embed in theirs.
+storePathNameUpstreamText :: StorePathNameError -> Text
+storePathNameUpstreamText (StorePathNameError name reason) = case reason of
+  NameEmpty -> "name must not be empty"
+  NameTooLong _ -> quoted <> " must be no longer than " <> T.pack (show maxStorePathNameLen) <> " characters"
+  NameIllegalChar c -> quoted <> " contains illegal character '" <> T.singleton c <> "'"
+  NameDotSegment segment
+    | segment == name -> quoted <> " is not valid"
+    | otherwise -> quoted <> " is not valid: first dash-separated component must not be '" <> segment <> "'"
+  where
+    quoted = "name '" <> name <> "'"
 
 -- | Upstream's maximum store path name length.
 maxStorePathNameLen :: Int

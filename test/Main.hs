@@ -2798,6 +2798,58 @@ runTestIOFail label baseDir source = do
 nixQuotedPath :: FilePath -> Text
 nixQuotedPath p = T.pack (show p)
 
+-- | The name, builder and system of a derivation, read as upstream's
+-- derivationStrict reads them (primops.cc at 2.24.9): the name with
+-- forceStringNoCtx, the builder and system as their environment entries
+-- coerce, each checked for presence once all are read.  Every expected
+-- message is nix-instantiate 2.24.9's final error line.
+testDerivationFields :: IO [Bool]
+testDerivationFields = do
+  putStrLn "eval/derivation-fields"
+  let drvWith fields = "(derivation { " <> fields <> " }).drvPath"
+      plain = "system = \"x\"; builder = \"/bin/sh\";"
+      withDep body = "let d = derivation { name = \"d\"; " <> plain <> " }; in " <> body
+      fails label source expected = runTest label (assertEvalError label source expected)
+      depOut = "/nix/store/simq0c07kvm2wyvasl0k1f619wishj4y-d"
+      depDrv = "wwk71dy0w17kn5spjd8hbsrk6520xs11-d.drv"
+  sequence
+    [ fails "a name that is not a string is refused" (drvWith ("name = 1; " <> plain)) "expected a string but found an integer: 1",
+      fails "a name with an output's context names it" (withDep (drvWith ("name = \"x${d}\"; " <> plain))) ("the string 'x" <> depOut <> "' is not allowed to refer to a store path (such as '!out!" <> depDrv <> "')"),
+      fails "a name with a drvPath's context names it" (withDep (drvWith ("name = \"x${d.drvPath}\"; " <> plain))) ("the string 'x/nix/store/" <> depDrv <> "' is not allowed to refer to a store path (such as '=" <> depDrv <> "')"),
+      fails "a plain path comes first among a name's context" (withDep (drvWith ("name = builtins.appendContext \"x${d}\" { \"/nix/store/00000000000000000000000000000000-a\" = { path = true; }; }; " <> plain))) ("the string 'x" <> depOut <> "' is not allowed to refer to a store path (such as '00000000000000000000000000000000-a')"),
+      fails "all outputs come before one among a name's context" (withDep (drvWith ("name = \"x${d}${d.drvPath}\"; " <> plain))) ("the string 'x" <> depOut <> "/nix/store/" <> depDrv <> "' is not allowed to refer to a store path (such as '=" <> depDrv <> "')"),
+      fails "an absent name is getAttr's error" (drvWith plain) "attribute 'name' missing",
+      fails "an absent builder is refused" (drvWith "name = \"a\"; system = \"x\";") "required attribute 'builder' missing",
+      fails "an empty builder is refused as absent" (drvWith "name = \"a\"; system = \"x\"; builder = \"\";") "required attribute 'builder' missing",
+      fails "an empty system is refused as absent" (drvWith "name = \"a\"; system = \"\"; builder = \"/bin/sh\";") "required attribute 'system' missing",
+      fails "the builder is checked before the system" (drvWith "name = \"a\";") "required attribute 'builder' missing",
+      fails "an empty name is invalid" (drvWith ("name = \"\"; " <> plain)) "invalid derivation name: name must not be empty. Please pass a different 'name'.",
+      fails "a dot name is invalid" (drvWith ("name = \".\"; " <> plain)) "invalid derivation name: name '.' is not valid. Please pass a different 'name'.",
+      fails "a dot component is invalid" (drvWith ("name = \".-a\"; " <> plain)) "invalid derivation name: name '.-a' is not valid: first dash-separated component must not be '.'. Please pass a different 'name'.",
+      fails "an illegal character is named" (drvWith ("name = \"a b\"; " <> plain)) "invalid derivation name: name 'a b' contains illegal character ' '. Please pass a different 'name'."
+    ]
+
+-- | A path as a derivation's builder or system is copied to the store, as
+-- its environment entry is, so the .drv's builder and platform fields hold
+-- the store path.  Each drvPath is nix-instantiate 2.24.9's.
+testDerivationPathFieldsIO :: IO [Bool]
+testDerivationPathFieldsIO = do
+  putStrLn "eval/derivation-path-fields-io"
+  tmpBase <- getTemporaryDirectory
+  let dir = tmpBase </> "nova-nix-test-derivation-path-fields"
+      drvPathOf fields = "builtins.unsafeDiscardStringContext (derivation { name = \"a\"; " <> fields <> " }).drvPath"
+      script = "/. + " <> nixQuotedPath (dir </> "b.sh")
+  Dir.removePathForcibly dir
+  createDirectoryIfMissing True dir
+  BS.writeFile (dir </> "b.sh") "echo hi\n"
+  results <-
+    sequence
+      [ runTestIO "a path builder is copied to the store" dir (drvPathOf ("system = \"x\"; builder = " <> script <> ";")) (mkStr "/nix/store/gz23n4381jlqwn1gvjqgs3411vr3w4nx-a.drv"),
+        runTestIO "a path system is copied to the store" dir (drvPathOf ("system = " <> script <> "; builder = \"/bin/sh\";")) (mkStr "/nix/store/382y120pp033h5kx5zfw02q0pglf297l-a.drv")
+      ]
+  Dir.removePathForcibly dir
+  pure results
+
 -- | The lines of context a failure gathers on its way out of
 -- derivationStrict, and how the CLI reports them (#221).  Only the IO
 -- evaluator keeps them.
@@ -2858,7 +2910,7 @@ testDerivationTraceIO = do
         ),
       runTestM
         "a missing attribute is refused without a line naming it"
-        (derivationFailure "name = \"x\";" (EvalFailure [] "derivation \"x\": missing required attribute 'system'")),
+        (derivationFailure "name = \"x\";" (EvalFailure [] "required attribute 'system' missing")),
       runTestM "a failure in a dependency is traced through each derivation, outermost first" $ do
         tmpBase <- getTemporaryDirectory
         result <-
@@ -4130,12 +4182,12 @@ testStructuredAttrs = do
         assertEvalError
           "sa-system-ctx"
           (dependency <> "(derivation { name = \"sa\"; builder = \"/bin/sh\"; __structuredAttrs = true; system = \"${d}\"; }).drvPath")
-          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path",
+          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path (such as '!out!nzvhjdd45mdh8mkqm4vz4hdqsjrvkm8j-d.drv')",
       runTest "a structured output name may not refer to a store path" $
         assertEvalError
           "sa-output-ctx"
           (dependency <> structured "outputs = [ \"out\" \"${d}\" ];" <> ".drvPath")
-          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path",
+          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path (such as '!out!nzvhjdd45mdh8mkqm4vz4hdqsjrvkm8j-d.drv')",
       runTest "a structured builder must be a string, not a value coerced to one" $
         assertEvalError
           "sa-builder"
@@ -13631,11 +13683,11 @@ testStoreNameSinks = do
       runTest "derivation name with a drive colon is rejected" $
         failsWith "name-colon" (drvWith "\"C:x\"") "invalid derivation name",
       runTest "empty derivation name is rejected" $
-        failsWith "name-empty" (drvWith "\"\"") "the name is empty",
+        failsWith "name-empty" (drvWith "\"\"") "name must not be empty",
       runTest "212-character derivation name is rejected" $
-        failsWith "name-long" (drvWith ("\"" <> T.replicate 212 "a" <> "\"")) "above the 211 maximum",
+        failsWith "name-long" (drvWith ("\"" <> T.replicate 212 "a" <> "\"")) "must be no longer than 211 characters",
       runTest "derivation name '..' is rejected" $
-        failsWith "name-dotdot" (drvWith "\"..\"") "dash-separated component",
+        failsWith "name-dotdot" (drvWith "\"..\"") "name '..' is not valid",
       runTest "derivation name '.-x' is rejected" $
         failsWith "name-dotdash" (drvWith "\".-x\"") "dash-separated component",
       runTest "dotfile derivation name stays valid" $
@@ -15371,6 +15423,8 @@ runSuite = do
           testImportIO,
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
+          testDerivationFields,
+          testDerivationPathFieldsIO,
           testPathFilterIO,
           testPathSymlinkIO,
           testInterpolatedSymlinkIO,
