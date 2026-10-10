@@ -4426,7 +4426,15 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- Extract required attributes.  The name and system are Text (they feed
   -- store-path and platform machinery); the builder stays raw bytes - it
   -- lands byte-exact in the ATerm's builder field.
-  drvName <- forceAttrStr "derivation" "name" attrs
+  -- prim_derivationStrict names the attribute outside the line its
+  -- forceStringNoCtx adds.
+  let nameTrace =
+        traceIfPresent attrs "name" "while evaluating the derivation attribute 'name'"
+          . traceIfPresent attrs "name" "while evaluating the `name` attribute passed to builtins.derivationStrict"
+  drvName <- nameTrace (forceAttrStr "derivation" "name" attrs)
+  -- Upstream processes every other attribute inside a catch that names it
+  -- (derivationStrictInternal); an absent one has nothing to name.
+  let traceAttr key = traceIfPresent attrs key (derivationAttrTrace drvName key)
   -- The name becomes the store-path name of the .drv and of every output,
   -- so it must satisfy the store-path name rules.  The path constructors
   -- re-check what they build; this early check reports the offending
@@ -4436,31 +4444,34 @@ builtinDerivationStrict (VAttrs attrs) = do
       throwEvalError
         ("derivation: invalid derivation name '" <> drvName <> "': " <> storePathNameReasonText (spneReason err))
     Right () -> pure ()
-  passing <- attrPassingOf attrs
+  passing <-
+    addErrorTrace "while evaluating the `__structuredAttrs` attribute passed to builtins.derivationStrict" $
+      attrPassingOf attrs
   let fieldContext = "derivation \"" <> drvName <> "\""
   -- A structured derivation's builder and system are read as strings
   -- (upstream's forceString and forceStringNoCtx) rather than coerced.
   (system, builder) <- case passing of
     PassAsEnvironment ->
-      (,) <$> forceAttrStr fieldContext "system" attrs <*> forceAttrBytes fieldContext "builder" attrs
+      (,)
+        <$> traceAttr "system" (forceAttrStr fieldContext "system" attrs)
+        <*> traceAttr "builder" (forceAttrBytes fieldContext "builder" attrs)
     PassAsStructuredAttrs ->
       (,)
-        <$> (decodedText fieldContext =<< structuredString RefuseContext fieldContext "system" attrs)
-        <*> structuredString AllowContext fieldContext "builder" attrs
+        <$> traceAttr "system" (decodedText fieldContext =<< structuredString RefuseContext fieldContext "system" attrs)
+        <*> traceAttr "builder" (structuredString AllowContext fieldContext "builder" attrs)
 
   -- __ignoreNulls: when true, null-valued attrs are dropped from the
   -- derivation env (stdenv.mkDerivation sets it); when absent or false,
   -- null coerces to "" like any other coerceMore value - C++ Nix semantics.
   ignoreNulls <- case attrSetLookup "__ignoreNulls" attrs of
     Nothing -> pure False
-    Just thunk -> do
-      val <- force thunk
-      case val of
-        VBool b -> pure b
-        other -> throwEvalError ("derivation: '__ignoreNulls' must be a boolean, got " <> typeName other)
+    Just thunk ->
+      addErrorTrace "while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict" $
+        force thunk >>= expectDerivationBool
 
-  -- Extract optional outputs (default ["out"])
-  outputNames <- case attrSetLookup "outputs" attrs of
+  -- Extract optional outputs (default ["out"]).  Each refusal below names
+  -- the attribute, as upstream's handleOutputs runs inside its catch.
+  outputNames <- traceAttr "outputs" $ case attrSetLookup "outputs" attrs of
     Nothing -> pure ["out"]
     Just thunk -> do
       val <- force thunk
@@ -4477,7 +4488,7 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- and names the on-disk location the builder later clears and moves
   -- onto, so it must satisfy the same store-path name rules (the
   -- composed length is re-checked at construction).
-  forM_ outputNames $ \outName ->
+  traceAttr "outputs" $ forM_ outputNames $ \outName ->
     case checkStorePathName outName of
       Left err ->
         throwEvalError
@@ -4498,13 +4509,14 @@ builtinDerivationStrict (VAttrs attrs) = do
         | Set.member outName seen = throwEvalError ("duplicate derivation output '" <> outName <> "'")
         | outName == "drvPath" = throwEvalError "invalid derivation output name 'drvPath'"
         | otherwise = pure (Set.insert outName seen)
-  foldM_ checkOutputName Set.empty outputNames
-  when (null outputNames) (throwEvalError "derivation cannot have an empty set of outputs")
+  traceAttr "outputs" $ do
+    foldM_ checkOutputName Set.empty outputNames
+    when (null outputNames) (throwEvalError "derivation cannot have an empty set of outputs")
 
   -- Extract optional args (default []).  Path literals in args (e.g. stdenv's
   -- ./default-builder.sh) are copied into the store; their source paths flow
   -- into inputSrcs via the returned context.
-  (builderArgs, argsContext) <- case attrSetLookup "args" attrs of
+  (builderArgs, argsContext) <- traceAttr "args" $ case attrSetLookup "args" attrs of
     Nothing -> pure ([], mempty)
     Just thunk -> do
       val <- force thunk
@@ -4525,11 +4537,11 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- both modes.  Carries merged context.
   let envAttrs = Map.delete "__ignoreNulls" (Map.delete "args" materialized)
   (drvEnvPairs, envContext) <- case passing of
-    PassAsEnvironment -> collectDrvEnvWithContext ignoreNulls envAttrs
+    PassAsEnvironment -> collectDrvEnvWithContext drvName ignoreNulls envAttrs
     PassAsStructuredAttrs -> do
-      (members, ctx) <- collectStructuredAttrs ignoreNulls (Map.delete structuredAttrsFlag envAttrs)
+      (members, ctx) <- collectStructuredAttrs drvName ignoreNulls (Map.delete structuredAttrsFlag envAttrs)
       forM_ (Map.keys (Map.restrictKeys members structuredPlainStrings)) $ \key ->
-        structuredString RefuseContext fieldContext key attrs
+        traceAttr key (structuredString RefuseContext fieldContext key attrs)
       forM_ (Map.keys (Map.restrictKeys members structuredDisabledChecks)) $
         traceMessage . disabledByStructuredAttrs drvName
       pure ([(structuredAttrsKey, encodeStructuredAttrs (StructuredAttrs members))], ctx)
@@ -4714,15 +4726,15 @@ forceToText thunk = do
 -- a seed derivation with 17 failed src attrs into an empty no-input drv that
 -- "built" successfully.  Null attrs are dropped only under __ignoreNulls;
 -- otherwise null coerces to @""@ like any other coerceMore value.
-collectDrvEnvWithContext :: (MonadEval m) => Bool -> Map Text Thunk -> m ([(Text, BS.ByteString)], StringContext)
-collectDrvEnvWithContext ignoreNulls attrs = do
+collectDrvEnvWithContext :: (MonadEval m) => Text -> Bool -> Map Text Thunk -> m ([(Text, BS.ByteString)], StringContext)
+collectDrvEnvWithContext drvName ignoreNulls attrs = do
   let pairs = Map.toList attrs
   results <- mapM coerceEnvAttr pairs
   let envPairs = catMaybes [fmap (\(k, v, _) -> (k, v)) r | r <- results]
       mergedCtx = mconcat [ctx | Just (_, _, ctx) <- results]
   pure (envPairs, mergedCtx)
   where
-    coerceEnvAttr (key, thunk) = do
+    coerceEnvAttr (key, thunk) = addErrorTrace (derivationAttrTrace drvName key) $ do
       val <- force thunk
       case val of
         VNull | ignoreNulls -> pure Nothing
@@ -4745,16 +4757,14 @@ structuredAttrsFlag :: Text
 structuredAttrsFlag = "__structuredAttrs"
 
 -- | Upstream reads @__structuredAttrs@ before any other attribute and as a
--- boolean, whatever @__ignoreNulls@ says.
+-- boolean, whatever @__ignoreNulls@ says, refusing anything else with
+-- @forceBool@'s message.
 attrPassingOf :: (MonadEval m) => AttrSet -> m AttrPassing
 attrPassingOf attrs = case attrSetLookup structuredAttrsFlag attrs of
   Nothing -> pure PassAsEnvironment
   Just thunk -> do
-    val <- force thunk
-    case val of
-      VBool True -> pure PassAsStructuredAttrs
-      VBool False -> pure PassAsEnvironment
-      other -> throwEvalError ("derivation: '" <> structuredAttrsFlag <> "' must be a boolean, got " <> typeName other)
+    structured <- force thunk >>= expectDerivationBool
+    pure (if structured then PassAsStructuredAttrs else PassAsEnvironment)
 
 -- | Whether a structured derivation's string field may carry context:
 -- the builder may (upstream's forceString), the fields upstream reads with
@@ -4812,19 +4822,39 @@ disabledByStructuredAttrs drvName key =
 -- calls the same @printValueAsJSON@), with the merged context of every
 -- string they hold.  Null attributes are dropped only under
 -- @__ignoreNulls@, as in 'collectDrvEnvWithContext'.
-collectStructuredAttrs :: (MonadEval m) => Bool -> Map Text Thunk -> m (Map Text Json, StringContext)
-collectStructuredAttrs ignoreNulls attrs = do
+collectStructuredAttrs :: (MonadEval m) => Text -> Bool -> Map Text Thunk -> m (Map Text Json, StringContext)
+collectStructuredAttrs drvName ignoreNulls attrs = do
   results <- mapM member (Map.toAscList attrs)
   let members = catMaybes results
   pure (Map.fromAscList [(key, json) | (key, json, _) <- members], mconcat [ctx | (_, _, ctx) <- members])
   where
-    member (key, thunk) = do
+    member (key, thunk) = addErrorTrace (derivationAttrTrace drvName key) $ do
       val <- force thunk
       case val of
         VNull | ignoreNulls -> pure Nothing
         _ -> do
           (json, ctx) <- valueToJSON val
           pure (Just (key, json, ctx))
+
+-- | Upstream's line of context for a failure processing one attribute of
+-- a derivation's argument set (derivationStrictInternal, primops.cc at
+-- 2.24.9).
+derivationAttrTrace :: Text -> Text -> Text
+derivationAttrTrace drvName key = "while evaluating attribute '" <> key <> "' of derivation '" <> drvName <> "'"
+
+-- | Run the action with a line of context when the attribute is present,
+-- and as it is when it is absent, which leaves a missing attribute's
+-- refusal unadorned.
+traceIfPresent :: (MonadEval m) => AttrSet -> Text -> Text -> m a -> m a
+traceIfPresent attrs key line action
+  | attrSetMember key attrs = addErrorTrace line action
+  | otherwise = action
+
+-- | A derivation's Boolean switch, refused with upstream's @forceBool@
+-- message.
+expectDerivationBool :: (MonadEval m) => NixValue -> m Bool
+expectDerivationBool (VBool b) = pure b
+expectDerivationBool other = throwEvalError ("expected a Boolean but found " <> typeName other <> ": " <> printValue PrintForError other)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - hashFile, readFileType

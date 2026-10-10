@@ -36,7 +36,7 @@ import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
+import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIOTraced)
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
@@ -548,10 +548,10 @@ evalFile config opts storeDir dataDir rawFilePath = do
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir (takeDirectory filePath)
-      result <- runEvalIO st (eval env expr >>= finalize (optStrict opts))
+      result <- runEvalIOTraced st (eval env expr >>= finalize (optStrict opts))
       case result of
-        Left err -> do
-          TIO.hPutStrLn stderr ("error: " <> err)
+        Left failure -> do
+          TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
         Right forced -> printResult forced
 
@@ -563,10 +563,10 @@ evalExpr config opts storeDir dataDir source = do
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
-      result <- runEvalIO st (eval env expr >>= finalize (optStrict opts))
+      result <- runEvalIOTraced st (eval env expr >>= finalize (optStrict opts))
       case result of
-        Left err -> do
-          TIO.hPutStrLn stderr ("error: " <> err)
+        Left failure -> do
+          TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
         Right forced -> printResult forced
 
@@ -579,13 +579,13 @@ evalExprAterm config opts storeDir dataDir source = do
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
-      result <- runEvalIO st $ do
+      result <- runEvalIOTraced st $ do
         val <- eval env expr
         forceDerivationAttrs val
         pure val
       case result of
-        Left err -> do
-          TIO.hPutStrLn stderr ("error: " <> err)
+        Left failure -> do
+          TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
         Right val -> do
           drvSP <- derivationPath val
@@ -635,7 +635,7 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir baseDir
-      result <- runEvalIO st $ do
+      result <- runEvalIOTraced st $ do
         root <- eval env expr
         selected <- case attrPath of
           Nothing -> pure (Right root)
@@ -645,8 +645,8 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
         -- then reports a real derivation as not being one.
         either (pure . Left) (\val -> Right val <$ forceDerivationAttrs val) selected
       case result of
-        Left err -> do
-          TIO.hPutStrLn stderr ("eval error: " <> err)
+        Left failure -> do
+          TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
         Right (Left selectionErr) -> do
           TIO.hPutStrLn stderr ("error: " <> selectionErr)

@@ -17,6 +17,7 @@ module Nix.Eval.IO
   ( -- * Evaluator
     EvalIO,
     runEvalIO,
+    runEvalIOTraced,
 
     -- * State
     EvalState (..),
@@ -25,12 +26,14 @@ module Nix.Eval.IO
 
     -- * Errors
     EvalErrorKind (..),
+    EvalFailure (..),
+    renderEvalFailure,
     NixEvalError (..),
     NixAbortError (..),
   )
 where
 
-import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, displayException, fromException, onException, throwIO, try)
+import Control.Exception (Exception, Handler (..), IOException, SomeAsyncException, SomeException, catches, displayException, fromException, onException, throwIO, try)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
@@ -86,17 +89,50 @@ import qualified System.Process as Proc
 data EvalErrorKind = ErrorThrown | ErrorUncatchable
   deriving (Eq, Show)
 
+-- | A failure's message and the lines of context it gathered unwinding
+-- ('addErrorTrace'), outermost first: upstream's @ErrorInfo@ message and
+-- traces, without positions.
+data EvalFailure = EvalFailure
+  { failureTrace :: ![Text],
+    failureMessage :: !Text
+  }
+  deriving (Eq, Show)
+
+-- | A failure with nothing gathered yet.
+untracedFailure :: Text -> EvalFailure
+untracedFailure = EvalFailure []
+
 -- | Evaluation error surfaced as an IO exception.
-data NixEvalError = NixEvalError !EvalErrorKind !Text
+data NixEvalError = NixEvalError !EvalErrorKind !EvalFailure
   deriving (Show)
 
 instance Exception NixEvalError
 
 -- | Abort error - NOT catchable by tryEval (matches real Nix semantics).
-newtype NixAbortError = NixAbortError Text
+newtype NixAbortError = NixAbortError EvalFailure
   deriving (Show)
 
 instance Exception NixAbortError
+
+-- | A failure as upstream's @showErrorInfo@ prints it (error.cc at
+-- 2.24.9) when no line has a position: each line of context after an
+-- ellipsis and a blank line, then the message after an @error:@ of its
+-- own.  The report is upstream's @indent@: the first line follows
+-- @error: @, every later line is indented to align with it, and each line
+-- loses its trailing whitespace.
+renderEvalFailure :: EvalFailure -> Text
+renderEvalFailure (EvalFailure trace msg) =
+  T.intercalate "\n" (zipWith indentLine (errorPrefix : repeat continuation) (T.splitOn "\n" (chomp report)))
+  where
+    report = foldMap traceLine trace <> (if null trace then "" else "\n" <> errorPrefix) <> msg
+    traceLine line = "\n\x2026 " <> line <> "\n"
+    indentLine prefix line = chomp (prefix <> line)
+    continuation = T.replicate (T.length errorPrefix) " "
+    chomp = T.dropWhileEnd (`elem` [' ', '\n', '\r', '\t'])
+
+-- | What upstream prints before an error's message.
+errorPrefix :: Text
+errorPrefix = "error: "
 
 -- ---------------------------------------------------------------------------
 -- State
@@ -225,9 +261,9 @@ newtype EvalIO a = EvalIO {unEvalIO :: ReaderT EvalState IO a}
 -- ---------------------------------------------------------------------------
 
 instance MonadEval EvalIO where
-  throwEvalError msg = EvalIO (liftIO (throwIO (NixEvalError ErrorUncatchable msg)))
-  throwCatchableError msg = EvalIO (liftIO (throwIO (NixEvalError ErrorThrown msg)))
-  abortEvaluation msg = EvalIO (liftIO (throwIO (NixAbortError msg)))
+  throwEvalError msg = EvalIO (liftIO (throwIO (NixEvalError ErrorUncatchable (untracedFailure msg))))
+  throwCatchableError msg = EvalIO (liftIO (throwIO (NixEvalError ErrorThrown (untracedFailure msg))))
+  abortEvaluation msg = EvalIO (liftIO (throwIO (NixAbortError (untracedFailure msg))))
 
   -- tryEval semantics: recover from a throw/assert only; an uncatchable
   -- eval error is rethrown (aborts are a separate exception type and
@@ -236,7 +272,7 @@ instance MonadEval EvalIO where
     st <- ask
     result <- liftIO (try (runReaderT action st))
     case result of
-      Left (NixEvalError ErrorThrown msg) -> pure (Left msg)
+      Left (NixEvalError ErrorThrown failure) -> pure (Left (failureMessage failure))
       Left err@(NixEvalError ErrorUncatchable _) -> liftIO (throwIO err)
       Right val -> pure (Right val)
 
@@ -245,6 +281,17 @@ instance MonadEval EvalIO where
   onEvalError (EvalIO action) (EvalIO cleanup) = EvalIO $ do
     st <- ask
     liftIO (runReaderT action st `onException` runReaderT cleanup st)
+
+  addErrorTrace line (EvalIO action) = EvalIO $ do
+    st <- ask
+    liftIO
+      ( runReaderT action st
+          `catches` [ Handler (\(NixEvalError kind failure) -> throwIO (NixEvalError kind (traced failure))),
+                      Handler (\(NixAbortError failure) -> throwIO (NixAbortError (traced failure)))
+                    ]
+      )
+    where
+      traced (EvalFailure trace msg) = EvalFailure (line : trace) msg
 
   withCallFrame (EvalIO action) = EvalIO $ do
     depth <- asks esCallDepth
@@ -1138,22 +1185,29 @@ wrapIO action = EvalIO $ liftIO $ do
       | Just (_ :: SomeAsyncException) <- fromException err -> throwIO err
       | Just abortErr <- fromException err -> throwIO (abortErr :: NixAbortError)
       | Just nixErr <- fromException err -> throwIO (nixErr :: NixEvalError)
-      | otherwise -> throwIO (NixEvalError ErrorUncatchable (T.pack (displayException err)))
+      | otherwise -> throwIO (NixEvalError ErrorUncatchable (untracedFailure (T.pack (displayException err))))
 
--- | Run an IO evaluation, returning @Left@ on error.
+-- | Run an IO evaluation, returning @Left@ with the failure's message on
+-- error.
+runEvalIO :: EvalState -> EvalIO a -> IO (Either Text a)
+runEvalIO st action = either (Left . failureMessage) Right <$> runEvalIOTraced st action
+
+-- | Run an IO evaluation, returning @Left@ with the whole failure on
+-- error, its lines of context included, for a caller that reports it
+-- ('renderEvalFailure').
 --
 -- Catches 'NixEvalError' (throw) and 'NixAbortError' (abort).
 -- Async exceptions (@StackOverflow@, @ThreadKilled@, etc.) propagate uncaught.
-runEvalIO :: EvalState -> EvalIO a -> IO (Either Text a)
-runEvalIO st (EvalIO action) = do
+runEvalIOTraced :: EvalState -> EvalIO a -> IO (Either EvalFailure a)
+runEvalIOTraced st (EvalIO action) = do
   result <- try (runReaderT action st)
   case result of
     Right val -> pure (Right val)
     Left (err :: SomeException)
       | Just (_ :: SomeAsyncException) <- fromException err -> throwIO err
-      | Just (NixEvalError _ msg) <- fromException err -> pure (Left msg)
-      | Just (NixAbortError msg) <- fromException err -> pure (Left msg)
-      | otherwise -> pure (Left (T.pack (displayException err)))
+      | Just (NixEvalError _ failure) <- fromException err -> pure (Left failure)
+      | Just (NixAbortError failure) <- fromException err -> pure (Left failure)
+      | otherwise -> pure (Left (untracedFailure (T.pack (displayException err))))
 
 -- ---------------------------------------------------------------------------
 -- Store copy helpers
