@@ -341,9 +341,32 @@ jobs:
           hdiutil attach "$RUNNER_TEMP/nova-cs.dmg" -mountpoint "$RUNNER_TEMP/nova-cs" -nobrowse
           echo "NOVA_NIX_TEST_CASE_SENSITIVE_DIR=$RUNNER_TEMP/nova-cs" >> "$GITHUB_ENV"
 
+      # The suite runs directly rather than through cabal test, which
+      # reports a suite killed by a signal as a bare FAIL: its exit status
+      # survives, so a crash names its signal (128 + the number on POSIX).
       - name: Test
         timeout-minutes: 15
-        run: cabal test
+        shell: bash
+        run: |
+          set -u
+          suite=$(cabal list-bin test:nova-nix-test)
+          "$suite"
+          status=$?
+          if [ "$status" -gt 128 ]; then
+            echo "::error::the test suite was killed by signal $((status - 128))"
+          fi
+          exit "$status"
+
+      # A crash or a memory-pressure kill on macOS leaves a report the
+      # runner keeps; print this job's, since the runner is discarded.
+      - name: Crash reports (macOS)
+        if: failure() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          for dir in "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports; do
+            find "$dir" -maxdepth 1 -newer "$GITHUB_WORKSPACE/nova-nix.cabal" \
+              \( -name 'nova-nix-test*' -o -name 'JetsamEvent*' \) -print -exec head -c 200000 {} \; 2>/dev/null || true
+          done
 
       # A released binary is a copied binary, and Cabal's datadir is baked in
       # at configure time, naming the machine that built it.  Both fallbacks
