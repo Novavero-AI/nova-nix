@@ -236,3 +236,108 @@ jobs:
             exit 1
           fi
           gh release edit "v${VERSION}" --draft=false
+
+  # The release as a user's workflow gets it: installed by the published
+  # Novavero-AI/install-nova-nix@v1 at the version just released, with
+  # nothing checked out.  An asset name, the archive layout, SHA256SUMS or a
+  # recipe path changed here breaks that action with no push there to test
+  # it.  After the release job, since the action downloads the published
+  # release: a failure turns this run red and undoes nothing.  The checks and
+  # their shell mirror install-nova-nix's own test.yml.
+  install-action:
+    name: Install with install-nova-nix@v1 (${{ matrix.os }})
+    needs: [check-tag, release]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: Novavero-AI/install-nova-nix@v1
+        id: nova
+        with:
+          version: ${{ needs.check-tag.outputs.version }}
+
+      # Separate steps on purpose: a PATH entry written to GITHUB_PATH takes
+      # effect only in the steps after the one that wrote it, so running the
+      # executable inside the action would prove nothing about the export.
+      - name: nova-nix is on PATH and evaluates
+        shell: bash
+        run: |
+          set -euo pipefail
+          got=$(nova-nix eval --expr '1 + 2')
+          [ "$got" = 3 ] || { echo "expected 3, got $got" >&2; exit 1; }
+
+      # The archive ships its own share/, and resolving through it is what
+      # separates a binary that can build from one that can only evaluate.
+      - name: The bundled search path resolves
+        shell: bash
+        run: |
+          set -euo pipefail
+          got=$(nova-nix eval --expr 'builtins.typeOf (import <nix/fetchurl.nix>)')
+          [ "$got" = '"lambda"' ] || { echo "expected a lambda, got $got" >&2; exit 1; }
+
+      - name: The bundled recipes came with it
+        shell: bash
+        env:
+          BIN_DIR: ${{ steps.nova.outputs.bin-dir }}
+        run: |
+          set -euo pipefail
+          [ -f "${BIN_DIR}/../pkgs/windows/hello.nix" ] \
+            || { echo "no pkgs/ beside ${BIN_DIR}" >&2; exit 1; }
+
+      # GITHUB_PATH is written from bash, where RUNNER_TEMP is a Windows path
+      # and the entry ends up mixed-separator.  Windows accepts that and MSYS
+      # bash would accept anything, so a shell that is neither is the one that
+      # can tell.
+      - name: nova-nix is on PATH outside bash (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $got = nova-nix eval --expr '1 + 2'
+          if ($got -ne '3') { Write-Error "expected 3, got $got"; exit 1 }
+
+  # The installer's build check, with its 0.7.0.0 layout branch dropped: a
+  # release cut from this tree builds GNU Hello through stdenv.  It
+  # substitutes from the public cache as the installer's does, and builds
+  # whatever the cache lacks.
+  build-action:
+    name: Build a package with install-nova-nix@v1
+    needs: [check-tag, release]
+    runs-on: windows-latest
+    steps:
+      - uses: Novavero-AI/install-nova-nix@v1
+        id: nova
+        with:
+          version: ${{ needs.check-tag.outputs.version }}
+
+      - name: Build hello from the bundled recipes
+        shell: bash
+        env:
+          BIN: ${{ steps.nova.outputs.bin-dir }}
+        run: |
+          set -euo pipefail
+          out=$(nova-nix build "$BIN/../pkgs/windows/hello.nix" \
+            --substituter https://cache.novavero.ai \
+            --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ= \
+            | tail -n1)
+          echo "built: $out"
+          [ -n "$out" ] || { echo "no store path on stdout" >&2; exit 1; }
+          echo "out=$out" >> "$GITHUB_ENV"
+
+      - name: The built program runs
+        shell: pwsh
+        env:
+          LC_ALL: C
+        run: |
+          $hello = Join-Path $env:out "bin/hello.exe"
+          $expected = "Hello, world!"
+          if (-not (Test-Path -PathType Leaf $hello)) {
+            Write-Error "no bin/hello.exe in $env:out"; exit 1
+          }
+          $got = (& $hello) -join "`n"
+          if ($LASTEXITCODE -ne 0) { Write-Error "hello failed with exit code $LASTEXITCODE"; exit 1 }
+          Write-Host "output: $got"
+          if ($got -cne $expected) {
+            Write-Error "expected '$expected', got '$got'"; exit 1
+          }
