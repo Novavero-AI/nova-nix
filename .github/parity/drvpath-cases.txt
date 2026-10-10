@@ -38,8 +38,15 @@ fzf              pkgs.fzf
 python-requests  pkgs.python3Packages.requests
 
 # Structured attributes: one __json object in place of a variable per
-# attribute, with the four outputs it names.
+# attribute, with the four outputs it names.  qtbase and neovim reach it
+# below themselves, through postgresql and the lua modules (#221).
 libxo            pkgs.libxo
+qtbase           pkgs.qt6.qtbase
+neovim           pkgs.neovim
 
 # A NixOS module evaluation, down to the initrd it assembles.
 nixos-initrd     (import <nixpkgs/nixos> { system = "x86_64-linux"; configuration = { fileSystems."/".device = "/dev/sda1"; boot.loader.grub.device = "/dev/sda"; system.stateVersion = "24.11"; }; }).config.system.build.initialRamdisk
+
+# The whole system that evaluation builds, its GRUB installer configured
+# through builtins.toXML.
+nixos-toplevel   (import <nixpkgs/nixos> { system = "x86_64-linux"; configuration = { fileSystems."/".device = "/dev/sda1"; boot.loader.grub.device = "/dev/sda"; system.stateVersion = "24.11"; }; }).config.system.build.toplevel
