@@ -37,5 +37,9 @@ ripgrep          pkgs.ripgrep
 fzf              pkgs.fzf
 python-requests  pkgs.python3Packages.requests
 
+# Structured attributes: one __json object in place of a variable per
+# attribute, with the four outputs it names.
+libxo            pkgs.libxo
+
 # A NixOS module evaluation, down to the initrd it assembles.
 nixos-initrd     (import <nixpkgs/nixos> { system = "x86_64-linux"; configuration = { fileSystems."/".device = "/dev/sda1"; boot.loader.grub.device = "/dev/sda"; system.stateVersion = "24.11"; }; }).config.system.build.initialRamdisk

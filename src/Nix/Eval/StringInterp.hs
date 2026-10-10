@@ -12,7 +12,6 @@ module Nix.Eval.StringInterp
     CoercePath,
     coerceToString,
     formatNixFloat,
-    formatJsonFloat,
     formatXmlFloat,
   )
 where
@@ -24,7 +23,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Eval.Types (MonadEval (..), NixValue (..), StringContext, Thunk, attrSetLookup, emptyContext, typeName)
-import Numeric (floatToDigits, showFFloat)
+import Numeric (showFFloat)
 
 -- | Force a thunk to a value.
 type Force m = Thunk -> m NixValue
@@ -235,58 +234,9 @@ formatNixFloat n
     dropDot ('.' : rest) = rest
     dropDot xs = xs
 
--- | Format a finite float exactly as the JSON serializer upstream links
--- (nlohmann @to_chars@): shortest round-trip digits, laid out as plain
--- decimal only while the decimal point lands within positions
--- 'jsonMinPointPos'..'jsonMaxPointPos', a @.0@ suffix on integral values,
--- and otherwise @d.ddde+XX@ with a signed exponent of at least two digits.
--- Zero is @0.0@ (sign preserved).  Digits come from 'floatToDigits', which
--- is always shortest; nlohmann's grisu2 can emit a longer-than-shortest
--- form for rare values, an accepted divergence.  Non-finite input is the
--- caller's concern (JSON spells it @null@).
-formatJsonFloat :: Double -> Text
-formatJsonFloat d
-  | isNegativeZero d = "-0.0"
-  | d == 0 = "0.0"
-  | d < 0 = "-" <> formatJsonFloat (negate d)
-  | otherwise =
-      let (digitList, pointPos) = floatToDigits 10 d
-          digits = concatMap show digitList
-       in T.pack (jsonFloatLayout digits (length digits) pointPos)
-
--- | Positional layout of shortest digits with the decimal point at
--- @pointPos@, replicating nlohmann's @format_buffer@ branch by branch.
-jsonFloatLayout :: String -> Int -> Int -> String
-jsonFloatLayout digits digitCount pointPos
-  -- Integral value with the point in plain range: digits, zeros, ".0".
-  | digitCount <= pointPos && pointPos <= jsonMaxPointPos =
-      digits <> replicate (pointPos - digitCount) '0' <> ".0"
-  -- Point falls inside the digit run.
-  | 0 < pointPos && pointPos <= jsonMaxPointPos =
-      take pointPos digits <> "." <> drop pointPos digits
-  -- Small magnitude: leading "0." and padding zeros.
-  | jsonMinPointPos < pointPos && pointPos <= 0 =
-      "0." <> replicate (negate pointPos) '0' <> digits
-  -- Scientific notation.
-  | otherwise = mantissa <> "e" <> signedExponent (pointPos - 1)
-  where
-    mantissa = case digits of
-      [single] -> [single]
-      lead : rest -> lead : '.' : rest
-      [] -> "0" -- unreachable: a positive double yields at least one digit
-
--- | nlohmann @format_buffer@ bounds (@kMaxExp@ = double's @digits10@,
--- @kMinExp@): plain decimal only while the decimal point position is in
--- (-4, 15]; everything else is scientific.
-jsonMaxPointPos :: Int
-jsonMaxPointPos = 15
-
--- | Lower point-position bound, exclusive.  See 'jsonMaxPointPos'.
-jsonMinPointPos :: Int
-jsonMinPointPos = -4
-
--- | Exponent suffix shared by the JSON and XML float layouts: sign always
--- present, magnitude zero-padded to at least two digits (@+05@, @-21@).
+-- | Exponent suffix of the XML float layout, as printf writes it: sign
+-- always present, magnitude zero-padded to at least two digits (@+05@,
+-- @-21@).
 signedExponent :: Int -> String
 signedExponent e
   | e < 0 = '-' : padded (negate e)
