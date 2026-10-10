@@ -126,6 +126,15 @@ check "tabs are content" 'import ./ind-tabs.nix'
 check "spaces before the opener's newline" 'import ./ind-opener-spaces.nix'
 echo
 
+echo "== what builtins.toXML writes =="
+check "nesting and the escapes of a value" 'builtins.toXML { s = "a<b>&\"q\n\tz"; l = [ 1 2.5 null true [ ] { } ]; }'
+check "argument patterns and primops" 'builtins.toXML [ (x: x) (args@{ z, ... }: 1) ({ b, a ? 1 }: a) ({ ... }: 1) builtins.map (builtins.map (x: x)) builtins.derivation ]'
+check "a derivation in full once, then repeated" 'let d = derivation { name = "x"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "out" "dev" ]; }; in builtins.toXML { inherit d; again = d; dev = [ d.dev ]; }'
+# The ${ is Nix's interpolation, not the shell's.
+# shellcheck disable=SC2016
+check "the contexts of the strings it writes" 'let d = derivation { name = "x"; system = "x86_64-linux"; builder = "/bin/sh"; }; in builtins.getContext (builtins.toXML { s = "${d}"; inherit d; })'
+echo
+
 echo "== Nova's mirror interface preserves fixed-output identity =="
 for caseName in legacy sha256 sri order invalidUrls invalidHashes escapedUrl unicodeUrl; do
   check "fetchurl $caseName" "(import ./fetchurl-cases.nix).$caseName"

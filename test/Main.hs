@@ -7478,6 +7478,7 @@ testDependentBuildIO = do
 testUpstreamConformance :: IO [Bool]
 testUpstreamConformance = do
   putStrLn "eval/conformance"
+  let xmlDocument body = mkStr ("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n" <> body <> "</expr>\n")
   sequence
     [ -- Hash decode is length-keyed per algorithm, never first-format-wins:
       -- a 52-char all-hex-digit string is a nix32 sha256 hash (64 hex chars
@@ -7597,27 +7598,76 @@ testUpstreamConformance = do
         assertEval
           "xml-float-third"
           "builtins.toXML (1.0 / 3.0)"
-          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"0.333333\" />\n</expr>\n"),
+          (xmlDocument "  <float value=\"0.333333\" />\n"),
       runTest "toXML float plain decimal" $
         assertEval
           "xml-float-centi"
           "builtins.toXML 0.01"
-          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"0.01\" />\n</expr>\n"),
+          (xmlDocument "  <float value=\"0.01\" />\n"),
       runTest "toXML integral float drops the point" $
         assertEval
           "xml-float-integral"
           "builtins.toXML 100.0"
-          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"100\" />\n</expr>\n"),
+          (xmlDocument "  <float value=\"100\" />\n"),
       runTest "toXML float large exponent" $
         assertEval
           "xml-float-e21"
           "builtins.toXML 1.0e21"
-          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"1e+21\" />\n</expr>\n"),
+          (xmlDocument "  <float value=\"1e+21\" />\n"),
       runTest "toXML float small exponent" $
         assertEval
           "xml-float-e-5"
           "builtins.toXML 2.5e-5"
-          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n<float value=\"2.5e-05\" />\n</expr>\n"),
+          (xmlDocument "  <float value=\"2.5e-05\" />\n"),
+      -- The document is upstream's XMLWriter output (value-to-xml.cc and
+      -- xml-writer.cc at 2.24.9): every element two spaces deeper than the
+      -- one around it, a newline in a value written as a character
+      -- reference.  Each expected document is nix-instantiate 2.24.9's and
+      -- 2.33.2's (#221).
+      runTest "toXML indents each element under the one around it" $
+        assertEval
+          "xml-nesting"
+          "builtins.toXML { s = \"a<b>&\\\"q'\\n\\tz\"; l = [ 1 { } ]; }"
+          ( xmlDocument
+              ( "  <attrs>\n    <attr name=\"l\">\n      <list>\n        <int value=\"1\" />\n"
+                  <> "        <attrs>\n        </attrs>\n      </list>\n    </attr>\n"
+                  <> "    <attr name=\"s\">\n      <string value=\"a&lt;b&gt;&amp;&quot;q'&#xA;\tz\" />\n"
+                  <> "    </attr>\n  </attrs>\n"
+              )
+          ),
+      runTest "toXML writes a lambda's argument pattern and leaves a primop unevaluated" $
+        assertEval
+          "xml-functions"
+          "builtins.toXML [ (x: x) (args@{ z, ... }: 1) ({ b, a }: a) builtins.map (builtins.map (x: x)) ]"
+          ( xmlDocument
+              ( "  <list>\n    <function>\n      <varpat name=\"x\" />\n    </function>\n"
+                  <> "    <function>\n      <attrspat ellipsis=\"1\" name=\"args\">\n        <attr name=\"z\" />\n"
+                  <> "      </attrspat>\n    </function>\n"
+                  <> "    <function>\n      <attrspat>\n        <attr name=\"a\" />\n        <attr name=\"b\" />\n"
+                  <> "      </attrspat>\n    </function>\n"
+                  <> "    <unevaluated />\n    <unevaluated />\n  </list>\n"
+              )
+          ),
+      runTest "toXML writes a derivation in full once and repeated after" $
+        assertEval
+          "xml-derivations"
+          "builtins.toXML [ { type = \"derivation\"; drvPath = \"/p\"; outPath = \"/o\"; a = 1; } { type = \"derivation\"; drvPath = \"/p\"; } { type = \"derivation\"; outPath = 2; } ]"
+          ( xmlDocument
+              ( "  <list>\n    <derivation drvPath=\"/p\" outPath=\"/o\">\n"
+                  <> "      <attr name=\"a\">\n        <int value=\"1\" />\n      </attr>\n"
+                  <> "      <attr name=\"drvPath\">\n        <string value=\"/p\" />\n      </attr>\n"
+                  <> "      <attr name=\"outPath\">\n        <string value=\"/o\" />\n      </attr>\n"
+                  <> "      <attr name=\"type\">\n        <string value=\"derivation\" />\n      </attr>\n"
+                  <> "    </derivation>\n"
+                  <> "    <derivation drvPath=\"/p\">\n      <repeated />\n    </derivation>\n"
+                  <> "    <derivation>\n      <repeated />\n    </derivation>\n  </list>\n"
+              )
+          ),
+      runTest "toXML keeps the contexts of the strings it writes" $
+        assertEval
+          "xml-context"
+          "let d = derivation { name = \"x\"; system = \"s\"; builder = \"b\"; }; in builtins.getContext (builtins.toXML { s = \"${d}\"; }) == builtins.getContext \"${d}\""
+          (VBool True),
       -- fromTOML integers: 64-bit signed range enforced, no silent wrap.
       runTest "fromTOML rejects past-64-bit integer" $
         assertEvalFail "toml-int-overflow" "builtins.fromTOML \"v = 99999999999999999999\"",

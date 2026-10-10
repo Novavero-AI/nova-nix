@@ -97,11 +97,13 @@ import qualified Data.Array as Array
 import Data.Bits (complement, xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
+import qualified Data.ByteString.Lazy as BL
 import Data.Char (chr, digitToInt, intToDigit, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, isOctDigit, ord, toUpper)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
-import Data.List (partition, sort)
+import Data.List (partition, sort, sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
@@ -5539,65 +5541,155 @@ insertArrayTable (k : ks) m =
 -- Builtin implementations - toXML
 -- ---------------------------------------------------------------------------
 
--- | @builtins.toXML val@ - convert a Nix value to its XML representation.
--- Matches the format defined by the Nix manual: strings, ints, floats,
--- bools, nulls, lists, and attrsets map to their XML counterparts.
--- Built over BYTES: upstream's serializer copies string payloads into the
--- output with only the four ASCII escapes, so invalid UTF-8 passes
--- through raw rather than erroring (unlike toJSON, whose upstream
--- serializer validates).
+-- | @builtins.toXML val@ - the value as upstream's @prim_toXML@ writes it:
+-- @printValueAsXML@ forcing every value and recording no positions
+-- (value-to-xml.cc and xml-writer.cc at 2.24.9).  The result keeps the
+-- contexts of the strings written into it, so a derivation built from the
+-- document depends on the store paths it names, as upstream's does.
+--
+-- Built over BYTES: upstream's writer copies a string into an attribute
+-- value with only its five escapes, so invalid UTF-8 passes through raw
+-- rather than erroring (unlike toJSON, whose upstream serializer
+-- validates).
 builtinToXML :: (MonadEval m) => NixValue -> m NixValue
 builtinToXML val = do
-  xml <- valueToXML 0 val
-  pure (mkStrBytes ("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n" <> xml <> "</expr>\n"))
+  (body, XmlWritten ctx _) <- valueToXML 1 (XmlWritten emptyContext Set.empty) val
+  let document =
+        "<?xml version='1.0' encoding='utf-8'?>\n"
+          <> xmlOpen 0 "expr" []
+          <> body
+          <> xmlClose 0 "expr"
+  pure (VStr (BL.toStrict (BB.toLazyByteString document)) ctx)
 
-valueToXML :: (MonadEval m) => Int -> NixValue -> m BS.ByteString
-valueToXML depth val = case val of
-  VStr s _ ->
-    pure (indent depth <> "<string value=" <> xmlQuote s <> " />\n")
-  VInt n ->
-    pure (indent depth <> "<int value=\"" <> BC.pack (show n) <> "\" />\n")
-  VFloat d ->
-    pure (indent depth <> "<float value=\"" <> TE.encodeUtf8 (formatXmlFloat d) <> "\" />\n")
-  VBool True ->
-    pure (indent depth <> "<bool value=\"true\" />\n")
-  VBool False ->
-    pure (indent depth <> "<bool value=\"false\" />\n")
-  VNull ->
-    pure (indent depth <> "<null />\n")
-  VPath p ->
-    pure (indent depth <> "<path value=" <> xmlQuote (TE.encodeUtf8 p) <> " />\n")
-  VList cl -> do
-    let thunks = map Thunk (clistThunks cl)
-    items <- mapM (force >=> valueToXML (depth + 1)) thunks
-    pure (indent depth <> "<list>\n" <> BS.concat items <> indent depth <> "</list>\n")
+-- | What writing a document has gathered so far: the contexts of the
+-- strings written, and the drvPaths of the derivations written in full,
+-- each of which a later occurrence writes as @<repeated />@ (upstream's
+-- @drvsSeen@).  That is also what ends the cycle every derivation's
+-- @all@ and output attributes close.
+data XmlWritten = XmlWritten !StringContext !(Set.Set BS.ByteString)
+
+-- | One XML attribute: its name and its unescaped value.
+type XmlAttr = (BS.ByteString, BS.ByteString)
+
+-- | Write one value as the element upstream writes for it, at the given
+-- depth (an element's depth is the number of elements open around it, and
+-- each level indents two spaces).
+valueToXML :: (MonadEval m) => Int -> XmlWritten -> NixValue -> m (BB.Builder, XmlWritten)
+valueToXML depth written val = case val of
+  VInt n -> leaf "int" [("value", BC.pack (show n))]
+  VBool b -> leaf "bool" [("value", if b then "true" else "false")]
+  VStr s ctx ->
+    let XmlWritten seenCtx seenDrvs = written
+     in pure (xmlEmpty depth "string" [("value", s)], XmlWritten (seenCtx <> ctx) seenDrvs)
+  VPath p -> leaf "path" [("value", TE.encodeUtf8 p)]
+  VNull -> leaf "null" []
+  VFloat d -> leaf "float" [("value", TE.encodeUtf8 (formatXmlFloat d))]
+  VList cl ->
+    xmlElement depth "list" [] $
+      foldM (writeChild (\thunk inner -> force thunk >>= valueToXML (depth + 1) inner)) (mempty, written) (map Thunk (clistThunks cl))
   VAttrs attrs -> do
-    let pairs = attrSetToAscList attrs
-    items <- mapM (attrToXML (depth + 1)) pairs
-    pure (indent depth <> "<attrs>\n" <> BS.concat items <> indent depth <> "</attrs>\n")
-  VLambda {} ->
-    pure (indent depth <> "<function />\n")
-  VBuiltin _ _ ->
-    pure (indent depth <> "<function />\n")
-  VCompiledRegex _ ->
-    pure (indent depth <> "<function />\n")
+    identity <- xmlDerivationIdentity attrs
+    case identity of
+      Nothing -> xmlElement depth "attrs" [] (attrsToXML (depth + 1) written attrs)
+      Just (drvAttrs, drvPath) ->
+        let XmlWritten seenCtx seenDrvs = written
+         in xmlElement depth "derivation" drvAttrs $
+              if BS.null drvPath || Set.member drvPath seenDrvs
+                then pure (xmlEmpty (depth + 1) "repeated" [], written)
+                else attrsToXML (depth + 1) (XmlWritten seenCtx (Set.insert drvPath seenDrvs)) attrs
+  VLambda _ formals _ -> xmlElement depth "function" [] (pure (formalsToXML (depth + 1) formals, written))
+  -- A primop, applied in part or not at all, is not a lambda, which
+  -- upstream writes as unevaluated (its FIXME: primops are not serialized).
+  VBuiltin _ _ -> leaf "unevaluated" []
+  VCompiledRegex _ -> leaf "unevaluated" []
   where
-    attrToXML d (name, thunk) = do
-      v <- force thunk
-      inner <- valueToXML d v
-      pure (indent d <> "<attr name=" <> xmlQuote (TE.encodeUtf8 name) <> ">\n" <> inner <> indent d <> "</attr>\n")
+    leaf name attrs = pure (xmlEmpty depth name attrs, written)
 
-indent :: Int -> BS.ByteString
-indent n = BC.replicate (n * 2) ' '
-
-xmlQuote :: BS.ByteString -> BS.ByteString
-xmlQuote s = "\"" <> BC.concatMap escapeChar s <> "\""
+-- | Each attribute of a set, in name order, as an @attr@ element holding
+-- its value.
+attrsToXML :: (MonadEval m) => Int -> XmlWritten -> AttrSet -> m (BB.Builder, XmlWritten)
+attrsToXML depth written attrs =
+  foldM (writeChild attrToXML) (mempty, written) (attrSetToAscList attrs)
   where
+    attrToXML (name, thunk) inner =
+      xmlElement depth "attr" [("name", TE.encodeUtf8 name)] (force thunk >>= valueToXML (depth + 1) inner)
+
+-- | Append one child's output to what its siblings wrote, threading what
+-- the document has gathered from one to the next.
+writeChild :: (Monad m) => (a -> XmlWritten -> m (BB.Builder, XmlWritten)) -> (BB.Builder, XmlWritten) -> a -> m (BB.Builder, XmlWritten)
+writeChild write (before, written) child = do
+  (out, next) <- write child written
+  pure (before <> out, next)
+
+-- | The XML attributes of a derivation's element and the drvPath that
+-- identifies it, or 'Nothing' for a set that is not a derivation: upstream's
+-- @isDerivation@, a @type@ attribute that is the string @"derivation"@.
+-- @drvPath@ and @outPath@ are written only when they are strings, and their
+-- contexts are not gathered here: a derivation written in full gathers them
+-- as attributes, and a repeated one adds none.
+xmlDerivationIdentity :: (MonadEval m) => AttrSet -> m (Maybe ([XmlAttr], BS.ByteString))
+xmlDerivationIdentity attrs = do
+  typeVal <- traverse force (attrSetLookup "type" attrs)
+  case typeVal of
+    Just (VStr "derivation" _) -> do
+      drvPath <- stringAttr "drvPath"
+      outPath <- stringAttr "outPath"
+      let present = [(key, s) | (key, Just s) <- [("drvPath", drvPath), ("outPath", outPath)]]
+      pure (Just (present, fromMaybe "" drvPath))
+    _ -> pure Nothing
+  where
+    stringAttr key = do
+      found <- traverse force (attrSetLookup key attrs)
+      pure $ case found of
+        Just (VStr s _) -> Just s
+        _ -> Nothing
+
+-- | A lambda's argument pattern: @varpat@ for a plain argument, otherwise
+-- @attrspat@ naming the formals in name order, with the @\@@ binding and
+-- the ellipsis as its attributes.
+formalsToXML :: Int -> EvalFormals -> BB.Builder
+formalsToXML depth formals = case formals of
+  EFName name -> xmlEmpty depth "varpat" [("name", TE.encodeUtf8 name)]
+  EFSet entries ellipsis -> attrsPattern (ellipsisAttr ellipsis) entries
+  EFNamedSet name entries ellipsis -> attrsPattern (ellipsisAttr ellipsis <> [("name", TE.encodeUtf8 name)]) entries
+  where
+    ellipsisAttr ellipsis = [("ellipsis", "1") | ellipsis]
+    attrsPattern attrs entries =
+      xmlOpen depth "attrspat" attrs
+        <> foldMap (\formal -> xmlEmpty (depth + 1) "attr" [("name", TE.encodeUtf8 (efName formal))]) (sortOn efName entries)
+        <> xmlClose depth "attrspat"
+
+-- | An element with children: the opening tag, what the children write one
+-- level deeper, and the closing tag.
+xmlElement :: (Monad m) => Int -> BS.ByteString -> [XmlAttr] -> m (BB.Builder, XmlWritten) -> m (BB.Builder, XmlWritten)
+xmlElement depth name attrs children = do
+  (inner, written) <- children
+  pure (xmlOpen depth name attrs <> inner <> xmlClose depth name, written)
+
+-- | Upstream's @XMLWriter@ lines.  The attributes are written in the order
+-- given, which callers keep sorted by name as upstream's @std::map@ is.
+xmlOpen, xmlEmpty :: Int -> BS.ByteString -> [XmlAttr] -> BB.Builder
+xmlOpen depth name attrs = xmlIndent depth <> "<" <> BB.byteString name <> foldMap xmlAttr attrs <> ">\n"
+xmlEmpty depth name attrs = xmlIndent depth <> "<" <> BB.byteString name <> foldMap xmlAttr attrs <> " />\n"
+
+xmlClose :: Int -> BS.ByteString -> BB.Builder
+xmlClose depth name = xmlIndent depth <> "</" <> BB.byteString name <> ">\n"
+
+xmlIndent :: Int -> BB.Builder
+xmlIndent depth = BB.byteString (BC.replicate (2 * depth) ' ')
+
+-- | One attribute with upstream's escapes.  A newline is written as a
+-- character reference because an XML parser normalizes a literal one in an
+-- attribute value to a space (XML 1.0, section 3.3.3).
+xmlAttr :: XmlAttr -> BB.Builder
+xmlAttr (name, value) = " " <> BB.byteString name <> "=\"" <> BC.foldr (\c rest -> escapeChar c <> rest) mempty value <> "\""
+  where
+    escapeChar '"' = "&quot;"
     escapeChar '<' = "&lt;"
     escapeChar '>' = "&gt;"
     escapeChar '&' = "&amp;"
-    escapeChar '"' = "&quot;"
-    escapeChar c = BC.singleton c
+    escapeChar '\n' = "&#xA;"
+    escapeChar c = BB.char8 c
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - builtins.path
