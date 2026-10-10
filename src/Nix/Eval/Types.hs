@@ -1395,6 +1395,13 @@ class (Monad m) => MonadEval m where
   -- not on disk during evaluation.
   lookupSessionDrv :: Text -> m (Maybe Derivation)
 
+  -- | The references recorded when this session wrote a store path (a
+  -- @builtins.toFile@'s text with context, a copied source's none), or
+  -- 'Nothing' if this session did not write it.  The walk of a
+  -- @drvPath@'s closure follows them as upstream's @computeFSClosure@
+  -- follows its database's.  Pure evaluators write nothing.
+  lookupSessionReferences :: StorePath -> m (Maybe [StorePath])
+
   -- | Compute the store path a source file/directory gets when copied into
   -- the store (recursive NAR sha256 to a @source@ fixed-output path), WITHOUT
   -- performing the copy.  Used when a path literal is coerced in a derivation
@@ -1517,6 +1524,7 @@ instance MonadEval PureEval where
   -- Pure eval keeps no session drv closure, so an all-outputs reference's
   -- output names are never recoverable here either.
   lookupSessionDrv _ = pure Nothing
+  lookupSessionReferences _ = pure Nothing
 
   -- Pure eval cannot read files: a path coerces to itself (no store copy);
   -- the real copy-to-store happens only under 'EvalIO'.

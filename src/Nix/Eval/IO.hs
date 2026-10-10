@@ -408,6 +408,11 @@ instance MonadEval EvalIO where
     closure <- liftIO (readIORef ref)
     pure (Map.lookup drvPathText closure >>= either (const Nothing) Just . fromATerm)
 
+  lookupSessionReferences sp = EvalIO $ do
+    ref <- asks esStoreWriteCache
+    writes <- liftIO (readIORef ref)
+    pure (fst <$> Map.lookup (canonicalStorePathText sp) writes)
+
   storeSourcePath rawPath = do
     ref <- EvalIO (asks esSourcePathCache)
     cached <- EvalIO (liftIO (Map.lookup rawPath <$> readIORef ref))

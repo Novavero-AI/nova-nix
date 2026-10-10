@@ -12962,6 +12962,25 @@ testStorePathLinksIO = do
       Dir.removePathForcibly dir
       pure results
 
+-- | A derivation attribute carrying another's drvPath brings that .drv's
+-- whole closure into inputSrcs and inputDrvs, as upstream's
+-- derivationStrict does (primops.cc at 2.24.9).  Each drvPath is
+-- nix-instantiate 2.24.9's.
+testDeepContextClosureIO :: IO [Bool]
+testDeepContextClosureIO = do
+  putStrLn "eval/deep-context-closure-io"
+  tmpBase <- getTemporaryDirectory
+  let plain name rest = "derivation { name = \"" <> name <> "\"; system = \"x\"; builder = \"/bin/sh\"; " <> rest <> "}"
+      drvPathOf bindings body = "builtins.unsafeDiscardStringContext (let " <> bindings <> " in " <> body <> ").drvPath"
+      a = "a = " <> plain "a" "" <> ";"
+      m = "m = " <> plain "m" "dep = a; " <> ";"
+      t = "t = " <> plain "t" "dep = m; " <> ";"
+  sequence
+    [ runTestIO "a drvPath brings its own .drv into inputSrcs" tmpBase (drvPathOf a (plain "b" "x = \"${a.drvPath}\"; ")) (mkStr "/nix/store/r3pz4ykyxg5s9f08fafcksw6bxfds40r-b.drv"),
+      runTestIO "a drvPath brings the .drv files it depends on" tmpBase (drvPathOf (a <> " " <> m) (plain "b" "x = \"${m.drvPath}\"; ")) (mkStr "/nix/store/00pfjcd57v5dd5j4w4zmsp3s8lcpv6wg-b.drv"),
+      runTestIO "the closure is followed to its end" tmpBase (drvPathOf (a <> " " <> m <> " " <> t) (plain "b" "x = \"${t.drvPath}\"; ")) (mkStr "/nix/store/f480ldqci72g5miaywmhljjlw1fg1y4i-b.drv")
+    ]
+
 -- | Run as a child, evaluate one expression under the IO evaluator, which
 -- writes traces and warnings to stderr as it goes, then write its failure
 -- to the same stream, so the parent reads them in the order they came.
@@ -13538,6 +13557,7 @@ instance MonadEval StubStoreEval where
   readStoreDerivation sp =
     StubStoreEval $ \env -> Right (Map.lookup (storePathToText defaultStoreDir sp) (seDrvs env))
   lookupSessionDrv _ = pure Nothing
+  lookupSessionReferences _ = pure Nothing
   storeSourcePath = pure
   evalPolicy = pure unrestrictedPolicy
   checkUri _ = pure ()
@@ -15673,6 +15693,7 @@ runSuite = do
           testDerivationTraceIO,
           testFirstArgumentOrderIO,
           testStorePathLinksIO,
+          testDeepContextClosureIO,
           testDerivationFields,
           testDerivationPathFieldsIO,
           testPathArguments,
