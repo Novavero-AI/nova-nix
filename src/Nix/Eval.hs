@@ -3237,13 +3237,17 @@ builtinTrace msgVal result = do
   pure result
 
 -- | @builtins.warn msg val@ - print warning to stderr, return @val@.
+--
+-- The message must be a string: upstream's @prim_warn@ forces it with
+-- @forceString@ (primops.cc at 2.24.9), leaving room to extend the
+-- argument later, where @builtins.trace@ prints any value.
 builtinWarn :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinWarn msgVal result = do
-  msg <- case msgVal of
-    VStr s _ -> pure (bytesToTextLossy s)
-    other -> pure (printValue PrintInFull other)
-  traceMessage ("warning: " <> msg)
-  pure result
+builtinWarn msgVal result = case msgVal of
+  VStr s _ -> do
+    traceMessage ("warning: " <> bytesToTextLossy s)
+    pure result
+  other ->
+    throwEvalError ("expected a string but found " <> typeName other <> ": " <> printValue PrintForError other)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - graph traversal

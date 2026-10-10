@@ -599,6 +599,21 @@ testEvalAttrs = do
         assertEval "update-right-throws" "(builtins.tryEval ({} // throw \"b\")).success" (VBool False),
       runTest "update evaluates a throwing left first" $
         assertEvalError "update-left-throws" "throw \"a\" // null" "a",
+      -- builtins.warn forces its message with forceString (prim_warn,
+      -- primops.cc at 2.24.9); final lines as nix-instantiate 2.33.2
+      -- prints them, and tryEval does not catch the refusal.
+      runTest "warn refuses an integer message" $
+        assertEvalError "warn-int" "builtins.warn 1 2" "expected a string but found an integer: 1",
+      runTest "warn refuses a Boolean message" $
+        assertEvalError "warn-bool" "builtins.warn true 2" "expected a string but found a Boolean: true",
+      runTest "warn refuses a null message" $
+        assertEvalError "warn-null" "builtins.warn null 2" "expected a string but found null: null",
+      runTest "warn refuses a float message" $
+        assertEvalError "warn-float" "builtins.warn 1.5 2" "expected a string but found a float: 1.5",
+      runTest "warn's refusal is not caught by tryEval" $
+        assertEvalError "warn-tryeval" "builtins.tryEval (builtins.warn 1 2)" "expected a string but found an integer: 1",
+      runTest "warn with a string message returns its value" $
+        assertEval "warn-string" "builtins.warn \"m\" 2" (VInt 2),
       runTest "tryEval does not catch the update error" $
         assertEvalError "update-tryEval" "builtins.tryEval (null // {})" "expected a set but found null: null"
     ]
