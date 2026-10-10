@@ -2148,11 +2148,6 @@ deferApplyThunk fnThunk argThunk =
       env = newMinimalEnv sp sc
    in mkSyntheticThunk env reservedApply1
 
--- | Permissive coercion used by @builtins.toString@.
---
--- Like 'coerceToString' but additionally handles lists: elements are
--- recursively coerced and joined with spaces, matching real Nix semantics.
--- @toString [1 2 3]@ gives @"1 2 3"@.
 -- | The non-copying path coercion: the path text verbatim, no context -
 -- upstream's @coerceToString@ with @copyToStore = false@.
 coercePathVerbatim :: (MonadEval m) => Text -> m (BS.ByteString, StringContext)
@@ -2169,30 +2164,18 @@ coercePathToStore p = do
   (spText, ctx) <- sourcePathWithContext p
   pure (TE.encodeUtf8 spText, ctx)
 
+-- | @builtins.toString@'s coercion: permissive, a path verbatim
+-- (upstream's @coerceMore@ without @copyToStore@).
 coerceToStringPermissive :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
-coerceToStringPermissive (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  parts <- mapM coerceThunk thunks
-  let texts = map fst parts
-      ctx = mconcat (map snd parts)
-  pure (BS.intercalate " " texts, ctx)
-  where
-    coerceThunk thunk = do
-      val <- force thunk
-      coerceToStringPermissive val
-coerceToStringPermissive other = coerceToString True force applyValue coercePathVerbatim other
+coerceToStringPermissive = coerceToString True force applyValue coercePathVerbatim
 
 -- | Coerce a value to a string for a DERIVATION field (an env value or an
--- arg).  Like 'coerceToStringPermissive', but a path literal is copied into
+-- arg).  Like 'coerceToStringPermissive', but a path is copied into
 -- the store: it becomes its source store path, with that path added to the
 -- string context so it lands in the derivation's @inputSrcs@ - matching C++
 -- Nix's copy-to-store coercion of paths in derivation arguments/environment.
 coerceToStoreString :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
-coerceToStoreString (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  parts <- mapM (force >=> coerceToStoreString) thunks
-  pure (BS.intercalate " " (map fst parts), mconcat (map snd parts))
-coerceToStoreString other = coerceToString True force applyValue coercePathToStore other
+coerceToStoreString = coerceToString True force applyValue coercePathToStore
 
 -- | Coerce a value for string interpolation (@"${...}"@).  Like
 -- 'coerceToString', but a path literal is copied into the store and replaced by

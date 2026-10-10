@@ -1,6 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | The nova-nix test suite.  One executable runs every group, prints each
 -- failing case, and exits non-zero unless every case passes.
@@ -71,6 +72,7 @@ import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalStat
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printValue)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
+import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternBytes, symbolLen, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), allocCSlots, attrSetKeys, buildCSlots, emptyCList, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
@@ -1442,6 +1444,42 @@ testEvalBuiltins = do
         assertEval "ind-opener-only" "''  \n''" (mkStr ""),
       runTest "toString int" $
         assertEval "toStr" "builtins.toString 42" (mkStr "42")
+    ]
+
+-- | A list coerced to a string, as upstream's @coerceToString@ joins one
+-- under @coerceMore@ (eval.cc at 2.24.9).  Each expected string is
+-- nix-instantiate 2.24.9's.
+testListCoercion :: IO [Bool]
+testListCoercion = do
+  putStrLn "eval/list-coercion"
+  let joins label source expected = runTest label (assertEval label ("builtins.toString " <> source) (mkStr expected))
+      bytes = BS.pack <$> QC.listOf QC.arbitrary
+      quickCheckPasses property = do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+  sequence
+    [ joins "elements are joined with spaces" "[ 1 \"a\" 2 ]" "1 a 2",
+      joins "an empty list element takes no space after it" "[ [ ] 1 ]" "1",
+      joins "an empty list between two elements leaves one space" "[ 1 [ ] 2 ]" "1 2",
+      joins "an element before an empty list keeps its space" "[ 1 [ ] ]" "1 ",
+      joins "a list holding an empty list is not empty" "[ [ [ ] ] 1 ]" " 1",
+      joins "an empty string element keeps its space" "[ \"\" 1 ]" " 1",
+      joins "nested lists flatten through the same join" "[ [ 1 [ 2 3 ] ] 4 ]" "1 2 3 4",
+      joins "a __toString may return a list" "{ __toString = s: [ 1 2 ]; }" "1 2",
+      joins "an outPath may be a list" "{ outPath = [ 1 2 ]; }" "1 2",
+      joins "an element whose __toString is an empty list keeps its space" "[ { __toString = s: [ ]; } 1 ]" " 1",
+      runTest "interpolation still refuses a list" $
+        assertEvalError "interp-list" "\"${[ 1 2 ]}\"" "cannot coerce a list to a string: [ 1 2 ]",
+      runTestM "without empty lists the join is intercalate" $
+        quickCheckPasses $
+          QC.forAll (QC.listOf bytes) $ \parts ->
+            joinCoercedList [(part, False) | part <- parts] QC.=== BS.intercalate " " parts,
+      runTestM "an empty list before any element changes nothing" $
+        quickCheckPasses $
+          QC.forAll (QC.listOf bytes) $ \before ->
+            QC.forAll (QC.listOf1 bytes) $ \after ->
+              let marked = map (,False)
+               in joinCoercedList (marked before <> [("", True)] <> marked after) QC.=== joinCoercedList (marked (before <> after))
     ]
 
 -- ---------------------------------------------------------------------------
@@ -15515,6 +15553,7 @@ runSuite = do
           testEvalBuiltins,
           testFromTOML,
           testEvalErrors,
+          testListCoercion,
           testEvalHigherOrder,
           testLexer,
           testParserExprs,
