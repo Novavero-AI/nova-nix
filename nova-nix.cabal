@@ -101,6 +101,7 @@ library
     Nix.Compression
     Nix.Config
     Nix.Environment
+    Nix.HostPath
     Nix.Push
     Nix.Substituter
     Nix.Builtins
@@ -195,12 +196,16 @@ executable nova-nix
     OverloadedStrings
   ghc-options:      -Wall -Wcompat -threaded -rtsopts
 
+  -- file-io reads a config file by the bytes of its path.  0.1.1 is the
+  -- first whose read does not create a missing file on Windows, which
+  -- would turn a missing include into an empty one.
   build-depends:
       base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
     , containers          >= 0.6 && < 0.9
-    , directory           >= 1.3 && < 1.4
-    , filepath            >= 1.4 && < 1.6
+    , directory           >= 1.3.8 && < 1.4
+    , file-io             >= 0.1.1 && < 0.2
+    , filepath            >= 1.4.100 && < 1.6
     , nova-nix
     , text                >= 2.0 && < 2.2
 

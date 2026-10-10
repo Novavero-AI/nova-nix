@@ -1,5 +1,3 @@
-{-# LANGUAGE CPP #-}
-
 -- | Which NAR entry names and symlink targets a host's filesystem can
 -- hold, and the host path that spells one.
 --
@@ -43,14 +41,11 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word8)
+import Nix.HostPath (hostPathFromBytes)
 import qualified NovaCache.NAR.Stream as Stream
 import NovaCache.SafeName (hasTrailingDotOrSpace, isReservedDeviceName)
 import qualified System.Info
 import System.OsPath (OsPath)
-import qualified System.OsPath as OP
-#if !defined(mingw32_HOST_OS)
-import qualified Data.ByteString.Char8 as BS8
-#endif
 
 -- ---------------------------------------------------------------------------
 -- Hosts
@@ -183,23 +178,8 @@ linkTargetPath target = case checkLinkTarget hostNameRules target of
   Left refusal -> pure (Left refusal)
   Right () -> spell linkTargetNoun target
 
--- | Spell bytes the host accepted as a host path.
+-- | Spell bytes the host accepted as a host path ('hostPathFromBytes').
+-- Only Windows refuses any, and its checks admit only UTF-8, so this
+-- refusal is theirs, repeated.
 spell :: Text -> ByteString -> IO (Either Text OsPath)
-#if defined(mingw32_HOST_OS)
--- Windows paths are UTF-16: the reading of the UTF-8 bytes, encoded as
--- base encodes every path it hands the Win32 API.  The checks admit
--- only UTF-8 here, so this refusal is theirs, repeated.
-spell noun bytes = case TE.decodeUtf8' bytes of
-  Left _ -> pure (Left (noUtf16Form noun bytes))
-  Right text -> Right <$> OP.encodeFS (T.unpack text)
-#else
--- POSIX paths are bytes, and an 'OsPath' holds them as such: each byte
--- becomes one path unit, so the open receives exactly the NAR's bytes
--- whatever the locale.  'OP.unsafeFromChar' truncates a character to
--- the unit's width, which loses nothing on characters drawn from bytes.
--- Spelling through 'FilePath' would pass the name through the locale's
--- codec and back, which does not return every byte string under the
--- multi-byte encodings (EUC-JP, CP932, GB18030 and Big5-HKSCS through
--- macOS's iconv).
-spell _ = pure . Right . OP.pack . map OP.unsafeFromChar . BS8.unpack
-#endif
+spell noun bytes = pure (maybe (Left (noUtf16Form noun bytes)) Right (hostPathFromBytes bytes))

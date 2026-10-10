@@ -16,6 +16,7 @@ import Control.Monad (filterM, unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (isDigit)
 import Data.Functor.Identity (Identity (..))
@@ -68,6 +69,7 @@ import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVari
 import Nix.Expr.Types
 import Nix.Hash (hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
+import Nix.HostPath (hostPathFromBytes)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
@@ -96,6 +98,7 @@ import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
 import System.IO.Error (ioeGetErrorString, mkIOError, resourceVanishedErrorType)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
+import System.OsPath (OsPath)
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
@@ -2828,10 +2831,11 @@ withEnvBytes label name value check = do
     Nothing -> True <$ putStrLn ("  SKIP  " <> T.unpack label <> ": a Windows environment cannot hold a byte with no UTF-8 reading")
     Just (nameSpelling, valueSpelling) -> runTestM label (withEnvVar nameSpelling valueSpelling check)
 
--- | The 'String' that base's environment setters write as the given
--- bytes: on POSIX they encode with the file-system encoding, whose
--- round-trip escape restores every byte its decoding escaped, and on
--- Windows they write UTF-16.
+-- | The 'String' that base's environment setters and file functions, and
+-- a spawned process's environment, write as the given bytes: on POSIX
+-- they encode with the file-system encoding, whose round-trip escape
+-- restores every byte its decoding escaped, and on Windows they write
+-- UTF-16.
 envSpelling :: BS.ByteString -> IO (Maybe String)
 envSpelling bytes
   | SI.os == "mingw32" = pure (either (const Nothing) (Just . T.unpack) (TE.decodeUtf8' bytes))
@@ -13212,34 +13216,43 @@ testNixConfig = do
       readFrom files path = Identity (maybe (Left Config.ConfigFileMissing) Right (Map.lookup path files))
       resolveWith files paths env = runIdentity (Config.loadConfig (readFrom files) paths env)
       substitutersOf files paths env = ncSubstituters <$> resolveWith files paths env
+      fileMap = Map.mapKeys asciiOsPath . Map.fromList
       -- The same, over the cascade a 'ConfigLocations' computes.
       substitutersAt files locations env = Config.configFilePaths locations >>= \paths -> substitutersOf files paths env
       firstPathOf locations = listToMaybe <$> Config.configFilePaths locations
       -- Successive texts as successive files, weakest first.
       resolveTexts texts =
-        let paths = [root </> "src" </> (show index ++ ".conf") | index <- [1 .. length texts]]
+        let paths = [asciiOsPath (root </> "src" </> (show index ++ ".conf")) | index <- [1 .. length texts]]
          in resolveWith (Map.fromList (zip paths texts)) paths Nothing
       subs = fmap ncSubstituters . resolveTexts
       keys = fmap ncTrustedPublicKeys . resolveTexts
+      uris = fmap ncAllowedUris . resolveTexts
       cascade =
         Config.ConfigLocations
           { Config.clConfDir = Nothing,
-            Config.clSystemConfDir = Just etcNix,
+            Config.clSystemConfDir = Just (asciiOsPath etcNix),
             Config.clUserConfFiles = Nothing,
-            Config.clConfigHome = configHome,
-            Config.clConfigDirs = [etcXdg, etcXdgLocal]
+            Config.clConfigHome = asciiOsPath configHome,
+            Config.clConfigDirs = map asciiOsPath [etcXdg, etcXdgLocal]
           }
       cascadeFiles =
-        Map.fromList
+        fileMap
           [ (systemConf, "substituters = https://system"),
             (xdgConf etcXdgLocal, "substituters = https://xdg-local"),
             (xdgConf etcXdg, "substituters = https://xdg"),
             (xdgConf configHome, "substituters = https://home")
           ]
-      listVar = intercalate [searchPathSeparator]
+      listVar = BS8.pack . intercalate [searchPathSeparator]
       depth = fmap ncMaxCallDepth . resolveTexts
       depthOf value = depth ["max-call-depth = " <> value]
       refused = either (const True) (const False) . depthOf
+      -- Bytes with no UTF-8 reading (0xE9, Latin-1's e-acute).  They are
+      -- a host path on POSIX and none on Windows, whose paths are UTF-16,
+      -- so the cases holding them branch on whether they spell one.
+      latin1 = "caf\xE9" :: BS.ByteString
+      -- What a lossy decode would open instead: U+FFFD's UTF-8.
+      replaced = "caf\xEF\xBF\xBD"
+      nixConfName = asciiOsPath "nix.conf"
   sequence
     [ runTest "parses a whitespace-split substituters list" $
         assertEqual "subs" (Right ["https://a", "https://b"]) (subs ["substituters = https://a https://b"]),
@@ -13268,6 +13281,28 @@ testNixConfig = do
          in assertEqual "syntax" (Left expected) (resolveTexts ["   substituters https://a # comment"]),
       runTest "the default config is empty" $
         assertEqual "default" (Right []) (subs []),
+      -- Tokens, as upstream's tokenizeString splits them: on space, tab,
+      -- CR and LF only, which nix config show 2.33.2 agrees with.
+      runTest "a value splits on space, tab and CR, and not on other spaces" $
+        assertEqual
+          "separators"
+          (Right ["https://a\xA0https://b\vhttps://c\fhttps://d", "https://e", "https://f", "https://g"])
+          (uris ["allowed-uris = https://a\xC2\xA0https://b\vhttps://c\fhttps://d https://e\rhttps://f\thttps://g"]),
+      runTest "a CRLF line ends where its LF does" $
+        assertEqual "crlf" (Right ["https://a"]) (subs ["substituters = https://a\r\n"]),
+      runTest "a Boolean value ending in a no-break space is upstream's invalid-value error" $
+        assertEqual "nbsp-bool" (Left "Boolean setting 'pure-eval' has invalid value 'true\xA0'") (ncPureEval <$> resolveTexts ["pure-eval = true\xC2\xA0"]),
+      -- Bytes with no UTF-8 reading in a setting.
+      runTest "a comment and an unknown setting holding a byte with no UTF-8 reading are never decoded" $
+        assertEqual "bytes-ignored" (Right ["https://a"]) (substitutersOf Map.empty [] (Just ("trusted-users = " <> latin1 <> "\nsubstituters = https://a # " <> latin1))),
+      runTest "a list setting holding a byte with no UTF-8 reading is refused under its own name" $
+        let expected = "setting 'substituters' has invalid value 'https://caf\xFFFD.example': not valid UTF-8"
+         in assertEqual "list-bytes" (Left expected) (substitutersOf Map.empty [] (Just ("extra-binary-caches = https://" <> latin1 <> ".example"))),
+      runTest "a Boolean or integer setting holding such a byte is upstream's invalid-value error" $
+        assertEqual
+          "scalar-bytes"
+          (Left "Boolean setting 'pure-eval' has invalid value 'true\xFFFD'", Left "setting 'max-call-depth' has invalid value '5\xFFFD'")
+          (ncPureEval <$> resolveTexts ["pure-eval = true\xE9"], depthOf "5\xE9"),
       -- max-call-depth: a scalar under upstream's unsigned-integer grammar.
       runTest "max-call-depth defaults to upstream's 10000" $
         assertEqual "depth-default" (Right 10000) (depth []),
@@ -13292,77 +13327,112 @@ testNixConfig = do
       -- Includes.
       runTest "an include is spliced in at its line, resolved against the including file's directory" $
         let files =
-              Map.fromList
+              fileMap
                 [ (systemConf, "substituters = https://a\ninclude site.conf\nextra-substituters = https://c"),
                   (etcNix </> "site.conf", "extra-substituters = https://b")
                 ]
-         in assertEqual "inline" (Right ["https://a", "https://b", "https://c"]) (substitutersOf files [systemConf] Nothing),
+         in assertEqual "inline" (Right ["https://a", "https://b", "https://c"]) (substitutersOf files [asciiOsPath systemConf] Nothing),
       runTest "a nested include resolves against the nested file, with .. collapsed" $
         let files =
-              Map.fromList
+              fileMap
                 [ (systemConf, "include sub/one.conf"),
                   (etcNix </> "sub" </> "one.conf", "include ../two.conf"),
                   (etcNix </> "two.conf", "substituters = https://two")
                 ]
-         in assertEqual "nested" (Right ["https://two"]) (substitutersOf files [systemConf] Nothing),
+         in assertEqual "nested" (Right ["https://two"]) (substitutersOf files [asciiOsPath systemConf] Nothing),
       runTest "!include of a file that cannot be read is skipped" $
-        let files = Map.fromList [(systemConf, "substituters = https://a\n!include missing.conf\nextra-substituters = https://b")]
-         in assertEqual "optional" (Right ["https://a", "https://b"]) (substitutersOf files [systemConf] Nothing),
+        let files = fileMap [(systemConf, "substituters = https://a\n!include missing.conf\nextra-substituters = https://b")]
+         in assertEqual "optional" (Right ["https://a", "https://b"]) (substitutersOf files [asciiOsPath systemConf] Nothing),
       runTest "include of a missing file is an error in upstream's words, naming both files" $
-        let files = Map.fromList [(systemConf, "include missing.conf")]
+        let files = fileMap [(systemConf, "include missing.conf")]
             expected = "nix.conf: file '" <> T.pack (etcNix </> "missing.conf") <> "' included from '" <> T.pack systemConf <> "' not found"
-         in assertEqual "required" (Left expected) (substitutersOf files [systemConf] Nothing),
+         in assertEqual "required" (Left expected) (substitutersOf files [asciiOsPath systemConf] Nothing),
       -- A file that exists but will not open: upstream drops it, here a
       -- required include of it is an error in its own words.
       runTest "include of a file that exists but cannot be read is an error, not a silent drop" $
         let locked = etcNix </> "locked.conf"
-            readLocked path = Identity (if path == locked then Left Config.ConfigFileUnreadable else Right "include locked.conf")
+            readLocked path = Identity (if path == asciiOsPath locked then Left Config.ConfigFileUnreadable else Right "include locked.conf")
             expected = "nix.conf: file '" <> T.pack locked <> "' included from '" <> T.pack systemConf <> "' cannot be read"
-         in assertEqual "unreadable" (Left expected) (ncSubstituters <$> runIdentity (Config.loadConfig readLocked [systemConf] Nothing)),
+         in assertEqual "unreadable" (Left expected) (ncSubstituters <$> runIdentity (Config.loadConfig readLocked [asciiOsPath systemConf] Nothing)),
       runTest "!include of a file that exists but cannot be read is skipped" $
         let locked = etcNix </> "locked.conf"
-            readLocked path = Identity (if path == locked then Left Config.ConfigFileUnreadable else Right "!include locked.conf\nsubstituters = https://a")
-         in assertEqual "unreadable-optional" (Right ["https://a"]) (ncSubstituters <$> runIdentity (Config.loadConfig readLocked [systemConf] Nothing)),
+            readLocked path = Identity (if path == asciiOsPath locked then Left Config.ConfigFileUnreadable else Right "!include locked.conf\nsubstituters = https://a")
+         in assertEqual "unreadable-optional" (Right ["https://a"]) (ncSubstituters <$> runIdentity (Config.loadConfig readLocked [asciiOsPath systemConf] Nothing)),
       runTest "an include cycle is refused rather than followed" $
-        let files = Map.fromList [(systemConf, "include site.conf"), (etcNix </> "site.conf", "include nix.conf")]
-         in assertLeft "cycle" (substitutersOf files [systemConf] Nothing),
+        let files = fileMap [(systemConf, "include site.conf"), (etcNix </> "site.conf", "include nix.conf")]
+         in assertLeft "cycle" (substitutersOf files [asciiOsPath systemConf] Nothing),
       runTest "an include with no path or two paths is a syntax error" $
         assertEqual "arity" [True, True, True] (map (either (const True) (const False) . resolveTexts . pure) ["include", "include a b", "!include"]),
       runTest "a relative include from NIX_CONFIG is refused as not absolute" $
         let expected = "nix.conf: not an absolute path: '" <> T.pack ("." </> "rel.conf") <> "'"
          in assertEqual "env-relative" (Left expected) (substitutersOf Map.empty [] (Just "include rel.conf")),
       runTest "an absolute include from NIX_CONFIG is expanded" $
-        let files = Map.fromList [(etcNix </> "x.conf", "substituters = https://x")]
-         in assertEqual "env-absolute" (Right ["https://x"]) (substitutersOf files [] (Just ("include " <> T.pack (etcNix </> "x.conf")))),
+        let files = fileMap [(etcNix </> "x.conf", "substituters = https://x")]
+         in assertEqual "env-absolute" (Right ["https://x"]) (substitutersOf files [] (Just ("include " <> BS8.pack (etcNix </> "x.conf")))),
+      -- An include target is bytes from the line to the open (#244): the
+      -- file its bytes name is read, never the one a lossy decode names.
+      runTest "an include target with no UTF-8 reading opens the file its bytes name" $
+        let target = latin1 <> ".conf"
+            including = fileMap [(systemConf, "include " <> target)]
+            decoy = maybe including (\name -> Map.insert (asciiOsPath etcNix OP.</> name) "substituters = https://replacement" including) (hostPathFromBytes (replaced <> ".conf"))
+         in case hostPathFromBytes target of
+              Just name ->
+                let files = Map.insert (asciiOsPath etcNix OP.</> name) "substituters = https://latin1" decoy
+                 in assertEqual "include-bytes" (Right ["https://latin1"]) (substitutersOf files [asciiOsPath systemConf] Nothing)
+              Nothing ->
+                let expected = "nix.conf: file 'caf\xFFFD.conf' included from '" <> T.pack systemConf <> "' is not valid UTF-8, so it names no Windows file"
+                 in assertEqual "include-bytes-windows" (Left expected) (substitutersOf decoy [asciiOsPath systemConf] Nothing),
+      runTest "!include of a target with no UTF-8 reading that names nothing goes on without it" $
+        let files = fileMap [(systemConf, "!include " <> latin1 <> ".conf\nsubstituters = https://a")]
+         in assertEqual "optional-bytes" (Right ["https://a"]) (substitutersOf files [asciiOsPath systemConf] Nothing),
+      -- The directories a cascade names keep their bytes too, so the
+      -- system file under such a NIX_CONF_DIR, and an include beside a
+      -- file under such a config home, are the files those bytes name.
+      runTest "NIX_CONF_DIR holding a byte with no UTF-8 reading names the system file by its bytes" $
+        let confDir = BS8.pack (etcNix ++ "-") <> latin1
+            located = cascade {Config.clConfDir = Just confDir, Config.clUserConfFiles = Just ""}
+         in case hostPathFromBytes confDir of
+              Just dir ->
+                let files = Map.fromList [(dir OP.</> nixConfName, "include site.conf"), (dir OP.</> asciiOsPath "site.conf", "substituters = https://conf-dir")]
+                 in assertEqual "conf-dir-bytes" (Right (Just (dir OP.</> nixConfName)), Right ["https://conf-dir"]) (firstPathOf located, substitutersAt files located Nothing)
+              Nothing -> assertLeft "conf-dir-bytes-windows" (firstPathOf located),
+      runTest "an include beside a user file under a config home holding such a byte resolves beneath it" $
+        case hostPathFromBytes (BS8.pack (configHome ++ "-") <> latin1) of
+          Just home ->
+            let located = cascade {Config.clSystemConfDir = Nothing, Config.clConfigHome = home, Config.clConfigDirs = []}
+                userDir = home OP.</> asciiOsPath "nix"
+                files = Map.fromList [(userDir OP.</> nixConfName, "include more.conf"), (userDir OP.</> asciiOsPath "more.conf", "substituters = https://home-bytes")]
+             in assertEqual "home-bytes" (Right ["https://home-bytes"]) (substitutersAt files located Nothing)
+          Nothing -> assertEqual "home-bytes-windows" "mingw32" SI.os,
       -- The cascade: which files, in which order, and who wins.
       runTest "the cascade is the system file, XDG_CONFIG_DIRS back to front, then the config home" $
-        assertEqual "order" (Right [systemConf, xdgConf etcXdgLocal, xdgConf etcXdg, xdgConf configHome]) (Config.configFilePaths cascade),
+        assertEqual "order" (Right (map asciiOsPath [systemConf, xdgConf etcXdgLocal, xdgConf etcXdg, xdgConf configHome])) (Config.configFilePaths cascade),
       runTest "the config home beats XDG_CONFIG_DIRS beats the system file" $
         assertEqual "home-wins" (Right ["https://home"]) (substitutersAt cascadeFiles cascade Nothing),
       runTest "the first XDG_CONFIG_DIRS entry beats the later ones" $
-        assertEqual "xdg-first" (Right ["https://xdg"]) (substitutersAt (Map.delete (xdgConf configHome) cascadeFiles) cascade Nothing),
+        assertEqual "xdg-first" (Right ["https://xdg"]) (substitutersAt (Map.delete (asciiOsPath (xdgConf configHome)) cascadeFiles) cascade Nothing),
       runTest "a listed file that cannot be read is absent, not an error" $
-        assertEqual "absent" (Right ["https://system"]) (substitutersAt (Map.filterWithKey (\path _ -> path == systemConf) cascadeFiles) cascade Nothing),
+        assertEqual "absent" (Right ["https://system"]) (substitutersAt (Map.filterWithKey (\path _ -> path == asciiOsPath systemConf) cascadeFiles) cascade Nothing),
       runTest "extra- in a stronger file widens what a weaker file set" $
-        let files = Map.fromList [(systemConf, "trusted-public-keys = k1"), (xdgConf configHome, "extra-trusted-public-keys = k2")]
+        let files = fileMap [(systemConf, "trusted-public-keys = k1"), (xdgConf configHome, "extra-trusted-public-keys = k2")]
          in assertEqual "widen-across-files" (Right ["k1", "k2"]) (fmap ncTrustedPublicKeys (Config.configFilePaths cascade >>= \paths -> resolveWith files paths Nothing)),
       runTest "NIX_CONFIG beats every file" $
         assertEqual "env-wins" (Right ["https://env"]) (substitutersAt cascadeFiles cascade (Just "substituters = https://env")),
       runTest "NIX_USER_CONF_FILES replaces the XDG files, first listed strongest" $
         let listed = cascade {Config.clUserConfFiles = Just (listVar [etcNix </> "a.conf", etcNix </> "b.conf"])}
-         in assertEqual "listed" (Right [systemConf, etcNix </> "b.conf", etcNix </> "a.conf"]) (Config.configFilePaths listed),
+         in assertEqual "listed" (Right (map asciiOsPath [systemConf, etcNix </> "b.conf", etcNix </> "a.conf"])) (Config.configFilePaths listed),
       runTest "an empty NIX_USER_CONF_FILES names no user files" $
-        assertEqual "none" (Right [systemConf]) (Config.configFilePaths cascade {Config.clUserConfFiles = Just ""}),
+        assertEqual "none" (Right [asciiOsPath systemConf]) (Config.configFilePaths cascade {Config.clUserConfFiles = Just ""}),
       runTest "empty NIX_USER_CONF_FILES entries are dropped" $
-        assertEqual "empties" (Right [systemConf, etcNix </> "a.conf"]) (Config.configFilePaths cascade {Config.clUserConfFiles = Just (listVar ["", etcNix </> "a.conf", ""])}),
+        assertEqual "empties" (Right (map asciiOsPath [systemConf, etcNix </> "a.conf"])) (Config.configFilePaths cascade {Config.clUserConfFiles = Just (listVar ["", etcNix </> "a.conf", ""])}),
       runTest "NIX_CONF_DIR moves the system file" $
-        assertEqual "conf-dir" (Right (Just (etcXdg </> "nix.conf"))) (firstPathOf cascade {Config.clConfDir = Just etcXdg}),
+        assertEqual "conf-dir" (Right (Just (asciiOsPath (etcXdg </> "nix.conf")))) (firstPathOf cascade {Config.clConfDir = Just (BS8.pack etcXdg)}),
       runTest "an empty NIX_CONF_DIR is unset" $
-        assertEqual "conf-dir-empty" (Right (Just systemConf)) (firstPathOf cascade {Config.clConfDir = Just ""}),
+        assertEqual "conf-dir-empty" (Right (Just (asciiOsPath systemConf))) (firstPathOf cascade {Config.clConfDir = Just ""}),
       runTest "a relative NIX_CONF_DIR is refused with upstream's complaint" $
         assertEqual "conf-dir-relative" (Left "nix.conf: not an absolute path: 'rel'") (firstPathOf cascade {Config.clConfDir = Just "rel"}),
       runTest "dot and dot-dot in NIX_CONF_DIR collapse, so the system file is named canonically" $
-        assertEqual "conf-dir-canonical" (Right (Just systemConf)) (firstPathOf cascade {Config.clConfDir = Just (root </> "etc" </> "x" </> ".." </> "." </> "nix")}),
+        assertEqual "conf-dir-canonical" (Right (Just (asciiOsPath systemConf))) (firstPathOf cascade {Config.clConfDir = Just (BS8.pack (root </> "etc" </> "x" </> ".." </> "." </> "nix"))}),
       -- A UNC directory keeps its server on Windows, where System.FilePath
       -- and std::filesystem both read it as the drive; a doubled POSIX
       -- root is one root, as upstream's canonPath folds it.
@@ -13372,16 +13442,22 @@ testNixConfig = do
                 then ("\\\\server\\share", "\\\\server\\share\\nix.conf")
                 else ("//server/share", "/server/share/nix.conf")
             uncConf = takeDirectory expected </> "site.conf"
-            files = Map.fromList [(expected, "include site.conf"), (uncConf, "substituters = https://unc")]
-            unc = cascade {Config.clConfDir = Just dir, Config.clUserConfFiles = Just ""}
-         in assertEqual "unc" (Right (Just expected), Right ["https://unc"]) (firstPathOf unc, substitutersAt files unc Nothing),
+            files = fileMap [(expected, "include site.conf"), (uncConf, "substituters = https://unc")]
+            unc = cascade {Config.clConfDir = Just (BS8.pack dir), Config.clUserConfFiles = Just ""}
+         in assertEqual "unc" (Right (Just (asciiOsPath expected)), Right ["https://unc"]) (firstPathOf unc, substitutersAt files unc Nothing),
       runTest "a platform with no machine-wide directory has no system file" $
-        assertEqual "no-system-dir" (Right [xdgConf etcXdgLocal, xdgConf etcXdg, xdgConf configHome]) (Config.configFilePaths cascade {Config.clSystemConfDir = Nothing}),
+        assertEqual "no-system-dir" (Right (map asciiOsPath [xdgConf etcXdgLocal, xdgConf etcXdg, xdgConf configHome])) (Config.configFilePaths cascade {Config.clSystemConfDir = Nothing}),
       runTest "NIX_CONF_DIR names a system file even where the platform has no directory for one" $
-        assertEqual "conf-dir-no-default" (Right (Just (etcXdg </> "nix.conf"))) (firstPathOf cascade {Config.clSystemConfDir = Nothing, Config.clConfDir = Just etcXdg})
+        assertEqual "conf-dir-no-default" (Right (Just (asciiOsPath (etcXdg </> "nix.conf")))) (firstPathOf cascade {Config.clSystemConfDir = Nothing, Config.clConfDir = Just (BS8.pack etcXdg)})
     ]
   where
     rejects = ["-1", "1.5", "0x10", "5X", "", "5 6"]
+
+-- | A test path as the config expander names it.  Test paths spelled
+-- this way are ASCII, which 'OP.unsafeFromChar' narrows to one path unit
+-- exactly on every platform.
+asciiOsPath :: FilePath -> OsPath
+asciiOsPath = OP.pack . map OP.unsafeFromChar
 
 -- | Narinfo field validation gates the pipeline ahead of the signed
 -- fingerprint: a malformed field must fail as a parse error before its
@@ -14043,7 +14119,8 @@ runSuite = do
           testEvalPolicyRules,
           testEvalPolicyIO,
           testEvalPolicyCLI,
-          testResultPrinterCLI
+          testResultPrinterCLI,
+          testConfigBytesCLI
         ]
   let total = length results
       passed = length (filter id results)
@@ -14124,7 +14201,7 @@ testEvalPolicyRules = do
       -- Successive nix.conf texts, weakest first, served to the expander
       -- as files.
       config texts =
-        let paths = ["/policy/" ++ show index ++ ".conf" | index <- [1 .. length texts]]
+        let paths = [asciiOsPath ("/policy/" ++ show index ++ ".conf") | index <- [1 .. length texts]]
             files = Map.fromList (zip paths texts)
             readFrom path = Identity (maybe (Left Config.ConfigFileMissing) Right (Map.lookup path files))
          in runIdentity (Config.loadConfig readFrom paths Nothing)
@@ -14508,4 +14585,120 @@ testResultPrinterCLI = do
               pure $ case code of
                 ExitSuccess -> assertEqual "cli-result" ("\"" <> notUtf8 <> "\"\n") printed
                 ExitFailure _ -> Fail ("CLI: " <> T.pack (show code))
+      ]
+
+-- | nix.conf bytes through the binary (#244): an include target, the
+-- system directory and NIX_CONFIG reach the file system and the settings
+-- as the bytes they hold.  Each case reads whether pure-eval came on,
+-- which hides currentSystem.  A name that is not UTF-8 exists only on a
+-- volume that holds one, so a case needing such a name makes it first
+-- and skips, with the reason, where the temp volume refuses it: APFS
+-- refuses the name, and HFS+ holds it but opens no path beneath a
+-- directory so named.  A Windows name or variable is UTF-16 and holds no
+-- such byte at all.  The decoy cases need no such name: a file named by
+-- U+FFFD's UTF-8, which a lossy decode of the byte would open instead,
+-- must stay unread, as it does under nix-instantiate 2.33.2.
+testConfigBytesCLI :: IO [Bool]
+testConfigBytesCLI = do
+  putStrLn "cli/config-bytes"
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-config-bytes"
+      confDir = root </> "etc"
+      noConfDir = root </> "none"
+      configVars = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "XDG_CONFIG_DIRS"]
+      -- An empty NIX_USER_CONF_FILES names no user files, so only the
+      -- system file under NIX_CONF_DIR and NIX_CONFIG are read.
+      runCLI dir nixConfig =
+        Proc.readCreateProcessWithExitCode
+          ( (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "eval", "--expr", "builtins ? currentSystem"])
+              { Proc.env = Just (("NIX_CONF_DIR", dir) : ("NIX_USER_CONF_FILES", "") : ("NIX_CONFIG", nixConfig) : filter ((`notElem` configVars) . fst) ambient)
+              }
+          )
+          ""
+      expectAnswer label expected dir nixConfig = do
+        (code, out, err) <- runCLI dir nixConfig
+        pure $ case (code, lines out) of
+          (ExitSuccess, line : _) -> assertEqual label expected line
+          _ -> Fail ("CLI: " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err)
+      expectPure label = expectAnswer label "false"
+      expectImpure label = expectAnswer label "true"
+      expectRefusal nixConfig needle = do
+        (code, _, err) <- runCLI noConfDir nixConfig
+        pure $
+          if code /= ExitSuccess && needle `T.isInfixOf` T.pack err
+            then Pass
+            else Fail ("expected a failure mentioning " <> needle <> ", got " <> T.pack (show (code, err)))
+      -- A case whose name or value holds bytes, spelled as the
+      -- platform's strings carry them.
+      spelledCase label bytes check = do
+        spelled <- envSpelling bytes
+        case spelled of
+          Nothing -> True <$ putStrLn ("  SKIP  " <> T.unpack label <> ": a Windows name or variable cannot hold a byte with no UTF-8 reading")
+          Just spelling -> check spelling
+      envCase label bytes check = spelledCase label bytes (runTestM label . check)
+      -- A case over a file whose name holds bytes, made before the case
+      -- runs and skipped where the temp volume refuses it.
+      -- A decoy's name is UTF-8, which every volume holds.
+      decoyCase label bytes make check = spelledCase label bytes $ \name -> make name >> runTestM label (check name)
+      fileCase label bytes make check = spelledCase label bytes $ \name -> do
+        made <- try (make name)
+        case made of
+          -- The error string alone: the path in the full message holds
+          -- the very byte stdout's encoding cannot write.
+          Left (err :: IOException) -> True <$ putStrLn ("  SKIP  " <> T.unpack label <> ": the temp volume cannot hold a name that is not UTF-8 (" <> ioeGetErrorString err <> ")")
+          Right () -> runTestM label (check name)
+      latin1 = "caf\xE9" :: BS.ByteString
+      -- The name a lossy decode of latin1 spells: U+FFFD's UTF-8.
+      decoy = "caf\xEF\xBF\xBD" :: BS.ByteString
+      decoyDir = root </> "decoy"
+  bracket_
+    (forceRemoveIfExists root >> createDirectoryIfMissing True confDir >> createDirectoryIfMissing True decoyDir)
+    (forceRemoveIfExists root)
+    $ sequence
+      [ fileCase
+          "CLI an include target with no UTF-8 reading opens the file it names"
+          (latin1 <> ".conf")
+          ( \name -> do
+              BS.writeFile (confDir </> name) "pure-eval = true\n"
+              BS.writeFile (confDir </> "nix.conf") ("include " <> latin1 <> ".conf\n")
+          )
+          (const (expectPure "include-bytes" confDir "")),
+        fileCase
+          "CLI a NIX_CONF_DIR holding a byte with no UTF-8 reading names the system file"
+          latin1
+          ( \name -> do
+              createDirectoryIfMissing True (root </> name)
+              BS.writeFile (root </> name </> "nix.conf") "pure-eval = true\n"
+          )
+          (\name -> expectPure "conf-dir-bytes" (root </> name) ""),
+        decoyCase
+          "CLI an !include target with no UTF-8 reading leaves the U+FFFD-named file unread"
+          (decoy <> ".conf")
+          ( \name -> do
+              BS.writeFile (decoyDir </> name) "pure-eval = true\n"
+              BS.writeFile (decoyDir </> "nix.conf") ("!include " <> latin1 <> ".conf\n")
+          )
+          (const (expectImpure "include-decoy" decoyDir "")),
+        spelledCase "CLI a NIX_CONF_DIR holding such a byte leaves the U+FFFD-named directory unread" latin1 $ \confName ->
+          decoyCase
+            "CLI a NIX_CONF_DIR holding such a byte leaves the U+FFFD-named directory unread"
+            decoy
+            ( \name -> do
+                createDirectoryIfMissing True (decoyDir </> name)
+                BS.writeFile (decoyDir </> name </> "nix.conf") "pure-eval = true\n"
+            )
+            (const (expectImpure "conf-dir-decoy" (decoyDir </> confName) "")),
+        envCase
+          "CLI NIX_CONFIG holding such a byte in a comment and an unknown setting applies the rest"
+          ("trusted-users = " <> latin1 <> "\npure-eval = true # " <> latin1 <> "\n")
+          (expectPure "env-bytes-ignored" noConfDir),
+        envCase
+          "CLI NIX_CONFIG holding such a byte in a list setting is refused"
+          ("pure-eval = true\nextra-substituters = https://" <> latin1 <> ".example\n")
+          (`expectRefusal` "setting 'substituters' has invalid value"),
+        envCase
+          "CLI a Boolean ending in a no-break space is invalid, as upstream splits the line"
+          "pure-eval = true\xC2\xA0\n"
+          (`expectRefusal` "Boolean setting 'pure-eval' has invalid value")
       ]

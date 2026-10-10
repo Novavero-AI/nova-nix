@@ -30,6 +30,7 @@ import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeName
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
+import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
@@ -40,19 +41,24 @@ import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
+import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
-import System.Directory (Permissions (executable), XdgDirectory (XdgConfig), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, getXdgDirectory, makeAbsolute)
+import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, makeAbsolute)
+import qualified System.Directory.OsPath as OsDir
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure)
-import System.FilePath (isAbsolute, splitSearchPath, takeDirectory, takeFileName, (</>))
+import qualified System.File.OsPath as OsFile
+import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 import System.IO.Error (isDoesNotExistError)
 import qualified System.Info as SI
+import System.OsPath (OsPath)
+import qualified System.OsPath as OP
 
 -- ---------------------------------------------------------------------------
 -- Argument parsing
@@ -288,24 +294,24 @@ nixDataDirVar = "NIX_DATA_DIR"
 
 -- | The environment variable carrying inline nix.conf settings, above the
 -- config files and below the command line in precedence.
-nixConfigVar :: String
+nixConfigVar :: BS.ByteString
 nixConfigVar = "NIX_CONFIG"
 
 -- | The directory holding the system nix.conf, in place of @/etc/nix@.
-nixConfDirVar :: String
+nixConfDirVar :: BS.ByteString
 nixConfDirVar = "NIX_CONF_DIR"
 
 -- | The user config files, first strongest, in place of the XDG cascade.
-nixUserConfFilesVar :: String
+nixUserConfFilesVar :: BS.ByteString
 nixUserConfFilesVar = "NIX_USER_CONF_FILES"
 
 -- | The XDG config dirs, searched for @nix\/nix.conf@ after the config home.
-xdgConfigDirsVar :: String
+xdgConfigDirsVar :: BS.ByteString
 xdgConfigDirsVar = "XDG_CONFIG_DIRS"
 
 -- | Windows' all-users application data directory, the machine-wide
 -- config directory there.
-programDataVar :: String
+programDataVar :: BS.ByteString
 programDataVar = "ProgramData"
 
 -- | Upstream's @sysconfdir@ on Unix, which libstore's meson.build forces
@@ -788,12 +794,36 @@ resolveCaches base mUrl mKey =
 loadNixConfig :: IO NixConfig
 loadNixConfig = do
   locations <- configLocations
-  nixConfigEnv <- lookupEnv nixConfigVar
+  nixConfigBytes <- configVariable nixConfigVar
   paths <- either configError pure (Config.configFilePaths locations)
-  Config.loadConfig readConfigFile paths (T.pack <$> nixConfigEnv)
+  Config.loadConfig readConfigFile paths nixConfigBytes
     >>= either configError pure
   where
     configError = failWith . ("error: " <>)
+
+-- | A variable the configuration reads, as its bytes, the way upstream's
+-- @getEnv@ reads it.  A Windows value holding an unpaired UTF-16
+-- surrogate has no bytes nova-nix can carry, so it is refused, as
+-- @NIX_PATH@ holding one is.
+configVariable :: BS.ByteString -> IO (Maybe BS.ByteString)
+configVariable name = do
+  found <- lookupEnvBytes name
+  case found of
+    EnvUnset -> pure Nothing
+    EnvValue value -> pure (Just value)
+    EnvUnpairedSurrogate ->
+      failWith ("error: " <> TE.decodeLatin1 name <> " holds an unpaired UTF-16 surrogate, which has no UTF-8 form")
+
+-- | A variable naming a directory or a list of them, as a host path.
+configVariablePath :: BS.ByteString -> IO (Maybe OsPath)
+configVariablePath name = configVariable name >>= traverse (variableHostPath name)
+
+-- | A variable's bytes as a host path.  Every value 'configVariable'
+-- answers has one, since a Windows value arrives as UTF-8, so the
+-- refusal is for completeness.
+variableHostPath :: BS.ByteString -> BS.ByteString -> IO OsPath
+variableHostPath name value =
+  maybe (failWith ("error: " <> TE.decodeLatin1 name <> " is not valid UTF-8, so it names no Windows path")) pure (hostPathFromBytes value)
 
 -- | Where the config files are on this machine.  @NIX_CONF_DIR@ and
 -- @XDG_CONFIG_DIRS@ are honoured on every platform; the defaults behind
@@ -816,18 +846,19 @@ loadNixConfig = do
 -- XDG spec says a relative entry is ignored.
 configLocations :: IO Config.ConfigLocations
 configLocations = do
-  confDir <- lookupEnv nixConfDirVar
+  confDir <- configVariable nixConfDirVar
   systemConfDir <- platformSystemConfDir
-  userFiles <- lookupEnv nixUserConfFilesVar
-  home <- getXdgDirectory XdgConfig ""
-  configDirs <- lookupEnv xdgConfigDirsVar
+  userFiles <- configVariable nixUserConfFilesVar
+  home <- OsDir.getXdgDirectory OsDir.XdgConfig mempty
+  configDirs <- configVariablePath xdgConfigDirsVar
+  defaultConfigDirs <- traverse OP.encodeFS platformConfigDirs
   pure
     Config.ConfigLocations
       { Config.clConfDir = confDir,
         Config.clSystemConfDir = systemConfDir,
         Config.clUserConfFiles = userFiles,
         Config.clConfigHome = home,
-        Config.clConfigDirs = maybe platformConfigDirs (filter isAbsolute . splitSearchPath) configDirs
+        Config.clConfigDirs = maybe defaultConfigDirs (filter OP.isAbsolute . OP.splitSearchPath) configDirs
       }
 
 -- | Where the platform's machine-wide config directory comes from, with
@@ -835,7 +866,7 @@ configLocations = do
 -- Unix) or an environment variable naming it (@%ProgramData%@ on
 -- Windows).  One value serves both the lookup and the help text, so the
 -- two cannot disagree.
-data SystemConfDirSource = FixedConfDir !FilePath | EnvConfDir !String
+data SystemConfDirSource = FixedConfDir !FilePath | EnvConfDir !BS.ByteString
 
 platformSystemConfDirSource :: SystemConfDirSource
 platformSystemConfDirSource = case SI.os of
@@ -846,17 +877,21 @@ platformSystemConfDirSource = case SI.os of
 -- @NIX_CONF_DIR@ moves it: upstream's @sysconfdir\/nix@ on Unix;
 -- @%ProgramData%\\nix@ on Windows, or none when that variable is unset or
 -- empty.
-platformSystemConfDir :: IO (Maybe FilePath)
+platformSystemConfDir :: IO (Maybe OsPath)
 platformSystemConfDir = case platformSystemConfDirSource of
-  FixedConfDir dir -> pure (Just (dir </> Config.nixConfDirName))
-  EnvConfDir var -> fmap (</> Config.nixConfDirName) . mfilter (not . null) <$> lookupEnv var
+  FixedConfDir dir -> Just . (OP.</> Config.nixConfDirName) <$> OP.encodeFS dir
+  EnvConfDir var -> do
+    value <- mfilter (not . BS.null) <$> configVariable var
+    traverse (fmap (OP.</> Config.nixConfDirName) . variableHostPath var) value
 
 -- | 'platformSystemConfDir' as the help text names it: the path on Unix,
 -- the variable on Windows.
 systemConfDirName :: String
 systemConfDirName = case platformSystemConfDirSource of
-  FixedConfDir dir -> dir </> Config.nixConfDirName
-  EnvConfDir var -> "%" <> var <> "%" </> Config.nixConfDirName
+  FixedConfDir dir -> dir </> nixDirName
+  EnvConfDir var -> "%" <> BC.unpack var <> "%" </> nixDirName
+  where
+    nixDirName = T.unpack (hostPathText Config.nixConfDirName)
 
 -- | What @XDG_CONFIG_DIRS@ names when it is unset: the spec's default on
 -- Unix, nothing on Windows (see 'configLocations').
@@ -865,14 +900,16 @@ platformConfigDirs = case SI.os of
   "mingw32" -> []
   _ -> posixXdgConfigDirs
 
--- | A config file's text, or why it could not be read: nothing at the
+-- | A config file's bytes, or why it could not be read: nothing at the
 -- path, or something that will not open (a directory, a permission
--- refusal).  Only 'IOException' is caught: an interrupt must abort the
--- run, not read as an absent file.
-readConfigFile :: FilePath -> IO (Either Config.ConfigReadFailure T.Text)
+-- refusal).  The open takes the 'OsPath' itself, so a POSIX name reaches
+-- it as the bytes it was spelled from rather than through the locale's
+-- codec.  Only 'IOException' is caught: an interrupt must abort the run,
+-- not read as an absent file.
+readConfigFile :: OsPath -> IO (Either Config.ConfigReadFailure BS.ByteString)
 readConfigFile path = do
-  result <- try (BS.readFile path) :: IO (Either IOException BS.ByteString)
-  pure (either (Left . classify) (Right . TE.decodeUtf8Lenient) result)
+  result <- try (OsFile.readFile' path) :: IO (Either IOException BS.ByteString)
+  pure (either (Left . classify) Right result)
   where
     classify err
       | isDoesNotExistError err = Config.ConfigFileMissing
