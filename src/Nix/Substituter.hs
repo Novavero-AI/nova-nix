@@ -103,7 +103,7 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
-import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarStream, unpackNarEntry)
+import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarStream, unpackNarEntry, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
@@ -439,7 +439,7 @@ unpackVerifiedNar store sp verified refs deriver =
               -- surface here, before the row exists.  A mismatching tree
               -- is removed - left in place it would be adopted by
               -- existence checks at this path.
-              onDisk <- ExecBit.serialiseFromPath destPath
+              onDisk <- ExecBit.serialiseFromPath (volumeCaseHack (stCaseSensitivity store)) destPath
               if Hash.hashBytes (NAR.serialise onDisk) /= digest
                 then do
                   Dir.removePathForcibly destPath
@@ -756,7 +756,7 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
           -- and a verifier reading the flag back out of the file extension
           -- would reject exactly the paths this representation exists for.
           -- On Unix it is still the streaming hash.
-          onDiskDigest <- ExecBit.narHashOfPath destPath
+          onDiskDigest <- ExecBit.narHashOfPath (volumeCaseHack (stCaseSensitivity store)) destPath
           if onDiskDigest /= declaredDigest
             then do
               Dir.removePathForcibly destPath

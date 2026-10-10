@@ -103,7 +103,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (makeFixedOutputPath, makeTextPath, sha256Digest)
-import Nix.Store.CaseSensitive (CaseSensitivity (..), trySetCaseSensitiveDir)
+import Nix.Store.CaseSensitive (CaseSensitivity (..), processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB
 import Nix.Store.EntryName (checkEntryName, entryNamePath, hostNameRules, linkTargetPath, shownBytes)
 import Nix.Store.Exclusive (Occupant (..), directoryTakenMessage, fileTakenMessage, openNewBinaryFile, symlinkTakenMessage)
@@ -324,7 +324,7 @@ registrationFor store sp deriver refs = do
   -- Compute the NAR hash and size of the final store contents.  The NAR
   -- serialization is canonical (entries sorted, 8-byte padding), so this is
   -- exactly the NarHash/NarSize a binary cache reports for the path.
-  narEntry <- ExecBit.serialiseFromPath destPath
+  narEntry <- ExecBit.serialiseFromPath (volumeCaseHack (stCaseSensitivity store)) destPath
   let narBytes = NAR.serialise narEntry
   pure
     PathRegistration
@@ -663,25 +663,26 @@ firstNameCollision sensitivity = go Map.empty
             Just earlier -> Just (earlier, name)
             Nothing -> go (Map.insert key name seen) rest
 
--- | Whether this platform's NAR serialiser strips the case-hack suffix
--- ('NAR.defaultCaseHack': upstream's per-OS default, not the probed
--- volume).  Where it does, an INCOMING entry name carrying the suffix
--- must be rejected: materialized verbatim it would re-serialise under
--- a different name and fail its own hash recheck.  Upstream's restore
--- accepts such a name and its dump then strips the suffix (archive.cc
--- at 2.24.9), so the tree fails there as well, only later; refusing at
--- the write boundary surfaces the same failure before anything is
--- materialized.
-platformStripsCaseHack :: Bool
-platformStripsCaseHack = NAR.defaultCaseHack == NAR.CaseHackEnabled
+-- | Whether a tree on a volume of the given case sensitivity is read
+-- back with the case-hack suffix stripped ('volumeCaseHack').  Where
+-- it is, an INCOMING entry name carrying the suffix must be rejected:
+-- materialized verbatim it would re-serialise under a different name
+-- and fail its own hash recheck.  Upstream's restore accepts such a
+-- name and its dump then strips the suffix (archive.cc at 2.24.9), so
+-- the tree fails there as well, only later; refusing at the write
+-- boundary surfaces the same failure before anything is materialized.
+-- A volume that keeps names apart reads every name as spelled, so the
+-- name materializes and round-trips there.
+volumeStripsCaseHack :: CaseSensitivity -> Bool
+volumeStripsCaseHack sensitivity = volumeCaseHack sensitivity == NAR.CaseHackEnabled
 
 -- | Refuse an entry name before any sibling is written: one the host
 -- cannot hold ('checkEntryName'), or one carrying the case-hack suffix
--- where the serialiser would strip it.
-admitEntryName :: BS.ByteString -> Either Text ()
-admitEntryName name = do
+-- where the destination volume's serialiser would strip it.
+admitEntryName :: CaseSensitivity -> BS.ByteString -> Either Text ()
+admitEntryName sensitivity name = do
   checkEntryName hostNameRules name
-  when (platformStripsCaseHack && NAR.caseHackSuffix `BS.isInfixOf` name) $
+  when (volumeStripsCaseHack sensitivity && NAR.caseHackSuffix `BS.isInfixOf` name) $
     Left ("NAR entry name contains the case-hack suffix: " <> shownBytes name)
 
 -- | The case-hacked disk name for the given occurrence of a key.
@@ -693,8 +694,9 @@ caseHackName name occurrence = name <> NAR.caseHackSuffix <> BS8.pack (show occu
 -- case-hack where names fold, every name as spelled where they do not.
 -- The first occurrence of each key keeps its spelling; every later
 -- name with the same key gains the reversible suffix and a per-name
--- counter, which the platform serialiser strips on the way back out.
--- Order is preserved; result pairs are (NAR name, on-disk name).
+-- counter, which the serialiser strips on the way back out
+-- ('volumeCaseHack').  Order is preserved; result pairs are (NAR
+-- name, on-disk name).
 caseHackDiskNames :: CaseSensitivity -> [BS.ByteString] -> [(BS.ByteString, BS.ByteString)]
 caseHackDiskNames sensitivity = reverse . snd . foldl' step (Map.empty, [])
   where
@@ -711,7 +713,7 @@ caseHackDiskNames sensitivity = reverse . snd . foldl' step (Map.empty, [])
 -- ('admitEntryName') before the first is written, so a name the host
 -- cannot hold leaves no partial directory behind it.
 unpackChildren :: CaseSensitivity -> OsPath -> [(BS.ByteString, NAR.NarEntry)] -> IO (Either Text [(OsPath, OsPath)])
-unpackChildren sensitivity path entries = case traverse_ (admitEntryName . fst) entries of
+unpackChildren sensitivity path entries = case traverse_ (admitEntryName sensitivity . fst) entries of
   Left err -> pure (Left err)
   Right () -> unpackNamedChildren sensitivity path entries
 
@@ -725,7 +727,7 @@ unpackChildren sensitivity path entries = case traverse_ (admitEntryName . fst) 
 -- per-directory case sensitivity and the tree materializes under its
 -- real names.  Where the flag is unavailable (a non-NTFS store volume,
 -- a folding APFS volume) the collision falls back to upstream's
--- case-hack renaming, which the platform serialiser reverses.  Either
+-- case-hack renaming, which the volume's serialiser reverses.  Either
 -- way a registered path re-serialises to its NAR byte-for-byte - the
 -- substituter's on-disk recheck verifies it.  The name spelled on disk
 -- is the one the host is asked to hold, suffix included.
@@ -936,7 +938,7 @@ applyNarEvent narState event = case event of
     pure (narState {nusFrames = UnpackFrame path Map.empty : nusFrames narState} <$ created)
   Stream.EventEntryBegin name -> case nusFrames narState of
     [] -> pure (Left "NAR stream sink: entry outside a directory")
-    (frame : outer) -> case admitEntryName name of
+    (frame : outer) -> case admitEntryName (nusCaseSensitivity narState) name of
       Left err -> pure (Left err)
       Right () -> do
         -- Sequential case-hack: the disk name of entry N depends only
@@ -1058,7 +1060,7 @@ materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
           unless valid $ do
             let dest = storePathToFilePath (stDir store) sp
             onDisk <- doesPathExist dest
-            adoptable <- if onDisk then adoptedTreeMatches dest sp else pure False
+            adoptable <- if onDisk then adoptedTreeMatches (stCaseSensitivity store) dest sp else pure False
             reg <-
               if adoptable
                 then registrationFor store sp Nothing []
@@ -1076,7 +1078,9 @@ materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
 -- the walk, through the hash and into an unpack sink in one pass, so a
 -- sibling pair the store's volume folds takes the case-hack on the way
 -- in, and no file's contents are ever held whole.  The source is read
--- as evaluation read it to name the path.
+-- as evaluation read it to name the path, under the process's
+-- case-hack setting, and the restored tree as a store path, under its
+-- volume's.
 --
 -- Evaluation hashed the source earlier, so the dump is held to that
 -- address before any link is created: a source that changed in between
@@ -1092,7 +1096,7 @@ restoreSource store src sp = do
     dest = storePathToFilePath (stDir store) sp
     restore = do
       sink <- newNarUnpackSink (stCaseSensitivity store) dest
-      streamed <- ExecBit.withNarSource src (sinkNarStream sink)
+      streamed <- ExecBit.withNarSource processCaseHack src (sinkNarStream sink)
       case streamed of
         Left (NarStreamRefused reason) -> pure (Left reason)
         Left (NarStreamMalformed reason) -> pure (Left ("the dump of " <> T.pack src <> " does not parse: " <> reason))
@@ -1105,7 +1109,7 @@ restoreSource store src sp = do
               either (pure . Left) (const (sealAndRecheck digest size)) finished
     sealAndRecheck digest size = do
       setReadOnly dest
-      onDisk <- ExecBit.narHashOfPath dest
+      onDisk <- ExecBit.narHashOfPath (volumeCaseHack (stCaseSensitivity store)) dest
       pure $
         if onDisk /= digest
           then Left "the restored tree does not reproduce its store path on disk"
@@ -1159,7 +1163,7 @@ materializeEvalStoreWrites store storeWrites = do
                   -- between evaluation and registration, and registering
                   -- it would record a hash its bytes do not have, then
                   -- seal the lie read-only.  Refuse loudly instead.
-                  reproduces <- writeReproducesPath dest sp refs mode
+                  reproduces <- writeReproducesPath (stCaseSensitivity store) dest sp refs mode
                   unless reproduces $
                     throwIO
                       ( userError
@@ -1175,9 +1179,9 @@ materializeEvalStoreWrites store storeWrites = do
 -- | Whether on-disk content re-derives exactly the store path it is
 -- about to be registered under, under the scheme that named the write.
 -- An unreadable destination counts as a mismatch.
-writeReproducesPath :: FilePath -> StorePath -> [StorePath] -> StoreWriteMode -> IO Bool
-writeReproducesPath dest sp refs mode = case mode of
-  WriteRecursive -> adoptedTreeMatches dest sp
+writeReproducesPath :: CaseSensitivity -> FilePath -> StorePath -> [StorePath] -> StoreWriteMode -> IO Bool
+writeReproducesPath sensitivity dest sp refs mode = case mode of
+  WriteRecursive -> adoptedTreeMatches sensitivity dest sp
   WriteFlat ->
     withFileBytes (\bytes -> makeFixedOutputPath (spName sp) "sha256" "flat" (sha256Digest bytes) == Right sp)
   WriteText ->
@@ -1189,10 +1193,12 @@ writeReproducesPath dest sp refs mode = case mode of
 
 -- | Whether an on-disk tree reproduces the source store path it is about to
 -- be registered under: its recursive NAR digest and the path's own name must
--- derive exactly this path.  An unreadable tree counts as a mismatch.
-adoptedTreeMatches :: FilePath -> StorePath -> IO Bool
-adoptedTreeMatches dest sp = do
-  result <- try (ExecBit.serialiseFromPath dest)
+-- derive exactly this path.  An unreadable tree counts as a mismatch.  The
+-- sensitivity is the store volume's, which decides the case-hack mode the
+-- tree is read back under.
+adoptedTreeMatches :: CaseSensitivity -> FilePath -> StorePath -> IO Bool
+adoptedTreeMatches sensitivity dest sp = do
+  result <- try (ExecBit.serialiseFromPath (volumeCaseHack sensitivity) dest)
   pure $ case result of
     Left (_ :: SomeException) -> False
     Right entry -> recursiveDigestNames sp (NAR.narHash entry)

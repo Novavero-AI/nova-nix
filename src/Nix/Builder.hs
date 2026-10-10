@@ -87,7 +87,7 @@ import qualified Nix.DependencyGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fromATerm, platformToText)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
-import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences)
+import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, storePathToFilePath, unStoreDir)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstituteWith)
@@ -1173,7 +1173,7 @@ prepareOutput config store candidates fallbackPairs drvPathText (output, plan) =
             [] -> do
               refs <- dedupStorePaths <$> scanReferences candidates outDir
               reg <- placeInStore store outDir targetSP drvPathText refs
-              fixedCheck <- verifyFixedOutput output targetPath
+              fixedCheck <- verifyFixedOutput (volumeCaseHack (stCaseSensitivity store)) output targetPath
               case fixedCheck of
                 Left err -> do
                   -- Wrong bytes for a declared content address: remove the
@@ -1190,14 +1190,15 @@ prepareOutput config store candidates fallbackPairs drvPathText (output, plan) =
 -- register as valid (upstream: the fixed-output check in its
 -- registerOutputs).  Flat mode hashes the output file's bytes;
 -- recursive (@r:@) mode hashes the canonical NAR of the placed tree.
--- Non-fixed outputs (empty @doHashAlgo@) pass unchecked.
-verifyFixedOutput :: DerivationOutput -> FilePath -> IO (Either Text ())
-verifyFixedOutput out placedPath
+-- Non-fixed outputs (empty @doHashAlgo@) pass unchecked.  The tree is
+-- read back under the store volume's case-hack mode.
+verifyFixedOutput :: NAR.CaseHack -> DerivationOutput -> FilePath -> IO (Either Text ())
+verifyFixedOutput caseHack out placedPath
   | T.null (doHashAlgo out) = pure (Right ())
   | recursive = do
       -- Re-serialises the placed tree: the registration's NAR hash is
       -- always sha256, while the declared algorithm may be any.
-      entry <- ExecBit.serialiseFromPath placedPath
+      entry <- ExecBit.serialiseFromPath caseHack placedPath
       pure (finish (rawHashWithAlgo algo (NAR.serialise entry)))
   | otherwise = do
       isDir <- doesDirectoryExist placedPath

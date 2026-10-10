@@ -64,7 +64,7 @@ import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
 import Nix.Store (unpackNarEntry)
-import Nix.Store.CaseSensitive (probeCaseSensitivity)
+import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
@@ -378,7 +378,10 @@ instance MonadEval EvalIO where
           Right () -> pure ()
         accessPath rawPath
         resolvedSource <- evalStoreTextPath rawPath
-        entry <- wrapIO (ExecBit.serialiseFromPath resolvedSource)
+        -- A path already in the store never reaches here (it coerces to
+        -- itself), so this is a source, read as the build driver's
+        -- restore reads it again.
+        entry <- wrapIO (ExecBit.serialiseFromPath processCaseHack resolvedSource)
         let narDigest = sha256Digest (NAR.serialise entry)
         sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
         let spText = canonicalStorePathText sp
@@ -505,8 +508,10 @@ instance MonadEval EvalIO where
     -- The tree behind the root's symlinks, under the root's own name, as
     -- upstream's copyPathToStore and addPath store path.resolveSymlinks()
     -- under path.baseName(); the walk checks the policy on the way.
-    resolvedSource <- resolveSymlinks srcPath >>= evalStoreTextPath
-    entry <- wrapIO (ExecBit.serialiseFromPath resolvedSource)
+    resolvedText <- resolveSymlinks srcPath
+    caseHack <- readCaseHack resolvedText
+    resolvedSource <- evalStoreTextPath resolvedText
+    entry <- wrapIO (ExecBit.serialiseFromPath caseHack resolvedSource)
     let narDigest = sha256Digest (NAR.serialise entry)
     case expectedSha256 of
       Just (subject, expected)
@@ -532,8 +537,9 @@ instance MonadEval EvalIO where
 
   narHashOfPath path = do
     accessPath path
+    caseHack <- readCaseHack path
     resolved <- evalStoreTextPath path
-    wrapIO (sha256Digest . NAR.serialise <$> ExecBit.serialiseFromPath resolved)
+    wrapIO (sha256Digest . NAR.serialise <$> ExecBit.serialiseFromPath caseHack resolved)
 
   isExecutableFile path = do
     accessPath path
@@ -1007,14 +1013,26 @@ readBytesIfPresent path = do
 -- same walk every producer and verifier uses, so the comparison sees
 -- the executable flags the store's model records, not the platform's
 -- permission guesses.
-narBytesIfPresent :: FilePath -> IO (Maybe BS.ByteString)
-narBytesIfPresent path = do
+narBytesIfPresent :: NAR.CaseHack -> FilePath -> IO (Maybe BS.ByteString)
+narBytesIfPresent caseHack path = do
   onDisk <- Dir.doesPathExist path
   if not onDisk
     then pure Nothing
     else do
-      result <- try (ExecBit.serialiseFromPath path) :: IO (Either IOException NAR.NarEntry)
+      result <- try (ExecBit.serialiseFromPath caseHack path) :: IO (Either IOException NAR.NarEntry)
       pure (either (const Nothing) (Just . NAR.serialise) result)
+
+-- | The case-hack mode a read of path-value text runs under.  Store
+-- text names a tree on the store's volume, read back as the store
+-- reads its own paths ('volumeCaseHack' of the probed volume); any
+-- other path is a source, read under the process's setting
+-- ('processCaseHack').
+readCaseHack :: Text -> EvalIO NAR.CaseHack
+readCaseHack path
+  | SP.isCanonicalStoreText path = do
+      storeRoot <- EvalIO (asks (SP.unStoreDir . esStoreDir))
+      wrapIO (volumeCaseHack <$> probeCaseSensitivity storeRoot)
+  | otherwise = pure processCaseHack
 
 -- | 'storeFilePath' against the store this evaluation was given.
 evalFilePath :: SP.StorePath -> EvalIO FilePath
@@ -1152,14 +1170,14 @@ runEvalIO st (EvalIO action) = do
 unpackToStoreVerified :: FilePath -> NAR.NarEntry -> BS.ByteString -> IO (Either Text ())
 unpackToStoreVerified dest entry expectedDigest = do
   Dir.createDirectoryIfMissing True (takeDirectory dest)
-  onDiskNar <- narBytesIfPresent dest
+  -- Probed per write rather than carried in 'EvalState': the store
+  -- directory need not exist when evaluation starts, and the probe
+  -- answers for a path on disk.  It was created just above, and the
+  -- cost is one pathconf call per tree.
+  sensitivity <- probeCaseSensitivity (takeDirectory dest)
+  onDiskNar <- narBytesIfPresent (volumeCaseHack sensitivity) dest
   if (sha256Digest <$> onDiskNar) == Just expectedDigest
     then pure (Right ())
     else do
       Dir.removePathForcibly dest
-      -- Probed per write rather than carried in 'EvalState': the store
-      -- directory need not exist when evaluation starts, and the probe
-      -- answers for a path on disk.  It was created just above, and the
-      -- cost is one pathconf call per tree.
-      sensitivity <- probeCaseSensitivity (takeDirectory dest)
       unpackNarEntry sensitivity dest entry
