@@ -50,6 +50,11 @@
 #define NN_OP_SEARCH_PATH   23
 #define NN_OP_PATH_STR      24
 
+/* --- App flags (NN_OP_APP) --- */
+
+#define NN_APP_DIRECT    0
+#define NN_APP_DEFERRED  1
+
 /* --- UnaryOp flags (NN_OP_UNARY) --- */
 
 #define NN_UNARY_NOT     0
@@ -119,12 +124,36 @@ typedef struct nn_op {
     uint32_t arg3;       /* Child index, data offset, etc. */
 } nn_op_t;
 
+/* --- Reserved instructions ---
+ *
+ * nn_bytecode_init lays these down at the front of every store, so each
+ * index below names the same code for the store's whole life, and the
+ * next init lays them down again.  They are the code of the application
+ * thunks a builtin makes once per element (map, genList, mapAttrs and
+ * the like): each such thunk runs it against a minimal env of its own,
+ * whose slots hold the function and its arguments.  The store is freed
+ * only by nn_bytecode_destroy, so code compiled per element would grow
+ * it with the element count.
+ *
+ *   0  RESOLVED_VAR  level 0, slot 0
+ *   1  RESOLVED_VAR  level 0, slot 1
+ *   2  APP deferred  0 applied to 1     slot 0 applied to slot 1
+ *   3  RESOLVED_VAR  level 0, slot 2
+ *   4  APP deferred  2 applied to 3     that applied to slot 2
+ */
+
+#define NN_BC_RESERVED_APPLY1  2u
+#define NN_BC_RESERVED_APPLY2  4u
+#define NN_BC_RESERVED_COUNT   5u
+
 /* --- Lifecycle --- */
 
-/* Initialize the global bytecode store.  op_capacity is initial
- * instruction slots (0 = default 65536).  data_capacity is initial
- * data buffer slots (0 = default 131072).  Both grow automatically.
- * Outside the init .. destroy window both emitters return UINT32_MAX. */
+/* Initialize the global bytecode store and lay down the reserved
+ * instructions.  op_capacity is initial instruction slots (0 = default
+ * 65536; never fewer than NN_BC_RESERVED_COUNT).  data_capacity is
+ * initial data buffer slots (0 = default 131072).  Both grow
+ * automatically.  Outside the init .. destroy window both emitters
+ * return UINT32_MAX. */
 void nn_bytecode_init(uint32_t op_capacity, uint32_t data_capacity);
 
 /* Nonzero between nn_bytecode_init and nn_bytecode_destroy. */

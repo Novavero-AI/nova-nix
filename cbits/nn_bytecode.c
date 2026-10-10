@@ -21,6 +21,20 @@
 #define NN_BC_DEFAULT_OP_CAPACITY    65536u
 #define NN_BC_DEFAULT_DATA_CAPACITY 131072u
 
+/* --- Reserved instructions (layout in nn_bytecode.h) --- */
+
+static const nn_op_t g_reserved_ops[] = {
+    { .opcode = NN_OP_RESOLVED_VAR, .arg1 = 0, .arg2 = 0 },
+    { .opcode = NN_OP_RESOLVED_VAR, .arg1 = 0, .arg2 = 1 },
+    { .opcode = NN_OP_APP, .flags = NN_APP_DEFERRED, .arg1 = 0, .arg2 = 1 },
+    { .opcode = NN_OP_RESOLVED_VAR, .arg1 = 0, .arg2 = 2 },
+    { .opcode = NN_OP_APP, .flags = NN_APP_DEFERRED,
+      .arg1 = NN_BC_RESERVED_APPLY1, .arg2 = 3 },
+};
+
+typedef char nn_bc_reserved_count_check_[
+    (sizeof g_reserved_ops / sizeof g_reserved_ops[0] == NN_BC_RESERVED_COUNT) ? 1 : -1];
+
 /* --- Global state --- */
 
 static nn_op_t  *g_ops          = NULL;
@@ -38,11 +52,13 @@ void nn_bytecode_init(uint32_t op_capacity, uint32_t data_capacity)
     if (g_ops) nn_bytecode_destroy();
 
     if (op_capacity == 0)   op_capacity   = NN_BC_DEFAULT_OP_CAPACITY;
+    if (op_capacity < NN_BC_RESERVED_COUNT) op_capacity = NN_BC_RESERVED_COUNT;
     if (data_capacity == 0) data_capacity = NN_BC_DEFAULT_DATA_CAPACITY;
 
     g_ops         = (nn_op_t *)malloc((size_t)op_capacity * sizeof(nn_op_t));
     if (!g_ops) { fprintf(stderr, "nn_bytecode_init: ops alloc failed\n"); abort(); }
-    g_op_count    = 0;
+    memcpy(g_ops, g_reserved_ops, sizeof g_reserved_ops);
+    g_op_count    = NN_BC_RESERVED_COUNT;
     g_op_capacity = op_capacity;
 
     g_data          = (uint32_t *)malloc((size_t)data_capacity * sizeof(uint32_t));

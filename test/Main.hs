@@ -32,7 +32,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
-import Data.Word (Word32, Word64)
+import Data.Word (Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
@@ -54,13 +54,13 @@ import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval 
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
-import Nix.Eval.CBytecode (appDeferred, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcDataCount, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
 import Nix.Eval.CList (clistDrop, clistFromThunks, clistIndex, clistLen, clistThunks)
 import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkPayload, cthunkSetComputed, cthunkState)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
-import Nix.Eval.Compile (BcBinding (..), compileExpr, decodeBcBindings)
+import Nix.Eval.Compile (BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
@@ -12784,6 +12784,100 @@ testClassIFollowupsIO = do
 -- inline maximum (65534) and the first spilled count (65535); the rest
 -- drive each counted-op kind (list, attrs, let, string parts, attr path)
 -- well past the old ceiling.
+-- ---------------------------------------------------------------------------
+-- Bytecode shared across elements
+-- ---------------------------------------------------------------------------
+
+-- | A bytecode instruction as far as the reserved instructions use them: a
+-- resolved variable (level, slot), a deferred application, or anything
+-- else (opcode, flags).
+data CodeShape
+  = SlotRef !Word32 !Word32
+  | DeferredApp !CodeShape !CodeShape
+  | OtherCode !Word8 !Word8
+  deriving (Eq, Show)
+
+-- | Read the code at a bytecode index back as a 'CodeShape'.
+codeShape :: Word32 -> IO CodeShape
+codeShape idx = do
+  op <- cbcOpcode idx
+  flags <- cbcFlags idx
+  arg1 <- cbcArg1 idx
+  arg2 <- cbcArg2 idx
+  case op of
+    OpResolvedVar -> pure (SlotRef arg1 arg2)
+    OpApp | flags == appDeferred -> DeferredApp <$> codeShape arg1 <*> codeShape arg2
+    _ -> pure (OtherCode op flags)
+
+-- | The instructions and data words evaluating a source adds to the
+-- bytecode store, which only 'arenaDestroy' frees.  The source must
+-- evaluate to an integer computed from everything it builds, so each
+-- element has been forced when the counts are read.
+bytecodeGrowth :: Text -> IO (Either Text (Word32, Word32))
+bytecodeGrowth source = do
+  opsBefore <- cbcOpCount
+  dataBefore <- cbcDataCount
+  forced <- case evalNix source of
+    Right (VInt n) -> Right <$> evaluate n
+    Right other -> pure (Left ("expected an integer, got " <> T.pack (show other)))
+    Left err -> pure (Left err)
+  opsAfter <- cbcOpCount
+  dataAfter <- cbcDataCount
+  pure ((opsAfter - opsBefore, dataAfter - dataBefore) <$ forced)
+
+-- | A source builds one element or two hundred, and the bytecode it adds
+-- is the same: the code each element runs is shared, never compiled per
+-- element.  A first run at one element is discarded, so anything compiled
+-- once per process is not counted against either size.
+assertNoPerElementBytecode :: (Text -> Text) -> IO TestResult
+assertNoPerElementBytecode sourceFor = do
+  _ <- bytecodeGrowth (sourceFor "1")
+  one <- bytecodeGrowth (sourceFor "1")
+  many <- bytecodeGrowth (sourceFor "200")
+  pure $ case (one, many) of
+    (Right atOne, Right atMany) ->
+      assertEqual "instructions and data words added at 1 element and at 200" atOne atMany
+    (Left err, _) -> Fail err
+    (_, Left err) -> Fail err
+
+testBytecodePerElement :: IO [Bool]
+testBytecodePerElement = do
+  putStrLn "bytecode/per-element"
+  let summed body n = "builtins.foldl' (a: b: a + b) 0 (" <> body n <> ")"
+      indices n = "builtins.genList (i: i) " <> n
+  sequence
+    [ runTestM "reserved instructions are the deferred applications of the slots" $ do
+        apply1 <- codeShape reservedApply1
+        apply2 <- codeShape reservedApply2
+        apply2Function <- cbcArg1 reservedApply2
+        pure $
+          assertEqual "reservedApply1" (DeferredApp (SlotRef 0 0) (SlotRef 0 1)) apply1
+            `andThen` assertEqual "reservedApply2" (DeferredApp (DeferredApp (SlotRef 0 0) (SlotRef 0 1)) (SlotRef 0 2)) apply2
+            `andThen` assertEqual "reservedApply2's function" reservedApply1 apply2Function,
+      runTestM "map adds no bytecode per element" $
+        assertNoPerElementBytecode (summed (\n -> "builtins.map (x: x + 1) (" <> indices n <> ")")),
+      runTestM "genList adds no bytecode per element" $
+        assertNoPerElementBytecode (summed ("builtins.genList (i: i * 2) " <>)),
+      runTestM "concatMap adds no bytecode per element" $
+        assertNoPerElementBytecode (summed (\n -> "builtins.concatMap (x: [ x x ]) (" <> indices n <> ")")),
+      runTestM "mapAttrs adds no bytecode per attribute" $
+        assertNoPerElementBytecode
+          ( summed
+              (\n -> "builtins.attrValues (builtins.mapAttrs (name: v: v + 1) (builtins.listToAttrs (builtins.genList (i: { name = toString i; value = i; }) " <> n <> ")))")
+          ),
+      runTestM "zipAttrsWith adds no bytecode per attribute" $
+        assertNoPerElementBytecode
+          ( summed
+              (\n -> "builtins.attrValues (builtins.zipAttrsWith (name: vs: builtins.length vs) (builtins.genList (i: { ${toString i} = i; }) " <> n <> "))")
+          ),
+      runTestM "inherit (from) in an attr set adds no bytecode per evaluation" $
+        assertNoPerElementBytecode (summed ("builtins.genList (i: { inherit ({ v = i; }) v; }.v) " <>)),
+      runTestM "inherit (from) in a recursive attr set adds no bytecode per evaluation" $
+        assertNoPerElementBytecode (summed ("builtins.genList (i: rec { inherit ({ v = i; }) v; }.v) " <>)),
+      runTestM "inherit (from) in a let adds no bytecode per evaluation" $
+        assertNoPerElementBytecode (summed ("builtins.genList (i: let inherit ({ v = i; }) v; in v) " <>))
+    ]
+
 testBytecodeCountSpill :: IO [Bool]
 testBytecodeCountSpill = do
   putStrLn "bytecode/count-spill"
@@ -13139,6 +13233,24 @@ testStoreNameSinksIO = do
           "\"${./. + \"/sp ace\"}\""
           "invalid store path name"
       ]
+
+-- | An inherited name and whether its select reads that name, as the one
+-- path segment, from slot 0 of the env it runs in.
+inheritedSelect :: BcInheritedName -> IO (Text, Bool)
+inheritedSelect (BcInheritedName sym selectIdx) = do
+  op <- cbcOpcode selectIdx
+  pathLen <- cbcShortArg selectIdx
+  target <- cbcArg1 selectIdx
+  pathOff <- cbcArg2 selectIdx
+  targetOp <- cbcOpcode target
+  level <- cbcArg1 target
+  slot <- cbcArg2 target
+  keyTag <- cbcData pathOff
+  keySym <- cbcData (pathOff + 1)
+  pure
+    ( symbolText (Symbol sym),
+      op == OpSelect && pathLen == 1 && targetOp == OpResolvedVar && level == 0 && slot == 0 && keyTag == attrkeyStatic && keySym == sym
+    )
 
 testBytecodeCompile :: IO [Bool]
 testBytecodeCompile = do
@@ -13552,11 +13664,12 @@ testBytecodeCompile = do
         count <- cbcShortArg idx
         dataOff <- cbcArg1 idx
         bindings <- decodeBcBindings 1 dataOff
-        pure $ case bindings of
-          [BcInheritFrom _ syms]
-            | op == OpAttrs && count == 1 ->
-                assertEqual "inherited names" ["x", "y"] (map (symbolText . Symbol) syms)
-          _ -> Fail "inherit binding mismatch",
+        case bindings of
+          [BcInheritFrom _ names]
+            | op == OpAttrs && count == 1 -> do
+                selects <- mapM inheritedSelect names
+                pure (assertEqual "inherited names and their selects" [("x", True), ("y", True)] selects)
+          _ -> pure (Fail "inherit binding mismatch"),
       -- A plain inherit has no lookup of its own: it carries the variable,
       -- bound like any other, for the evaluator to read in the outer env.
       runTestM "compile plain inherit with the variable it copies" $ do
@@ -14672,6 +14785,7 @@ runSuite = do
           testArenaGuard,
           testBytecodeCompile,
           testBytecodeCountSpill,
+          testBytecodePerElement,
           testValueCountWidths,
           testStoreNameSinks,
           testNarNameSafety,
