@@ -46,23 +46,27 @@
 module Nix.Parser
   ( -- * Parsing
     parseNix,
+    parseNixWithScope,
     parseNixFile,
 
     -- * Encoding
     readFileAutoEncoding,
 
     -- * Errors
+    SourceError (..),
     ParseError (..),
   )
 where
 
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
+import Data.Set (Set)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Nix.Expr.ClosureTrim (trimClosures)
-import Nix.Expr.Resolve (resolveRelativePaths, resolveVars)
+import Nix.Expr.Resolve (resolveRelativePaths, resolveVars, staticGlobalNames)
 import Nix.Expr.Types (Expr)
 import Nix.Parser.Expr (parseTopLevel)
 import Nix.Parser.Internal (ParseState (..), runParser)
@@ -70,7 +74,20 @@ import Nix.Parser.Lexer (tokenize)
 import Nix.Parser.ParseError (ParseError (..))
 import System.FilePath (takeDirectory)
 
--- | Parse a Nix expression from source text.
+-- | Why source text did not become an expression to evaluate.
+data SourceError
+  = -- | The text is not a Nix expression.
+    SyntaxError !ParseError
+  | -- | A variable that no enclosing scope binds and no enclosing @with@
+    -- could supply.  Upstream raises this while binding variables, before
+    -- evaluating anything, so it fails the expression wherever the
+    -- variable sits, and @builtins.tryEval@ cannot catch it.
+    UndefinedVariable !Text
+  deriving (Eq, Show)
+
+-- | Parse a Nix expression from source text and bind its variables against
+-- the root environment's names under the default policy
+-- ('staticGlobalNames').
 --
 -- The input is the full file contents. The file name is used only for
 -- error messages.  Strips a leading UTF-8 BOM if present - Windows
@@ -85,12 +102,22 @@ import System.FilePath (takeDirectory)
 -- same reason.  Pass the directory holding the file; for source with no file
 -- behind it (@--expr@) pass the working directory, which is what upstream
 -- parses against.
-parseNix :: FilePath -> Text -> Text -> Either ParseError Expr
-parseNix baseDir fileName source = do
-  tokens <- tokenize fileName (stripBOM source)
+parseNix :: FilePath -> Text -> Text -> Either SourceError Expr
+parseNix = parseNixWithScope staticGlobalNames
+
+-- | 'parseNix' against the names the environment the source is evaluated in
+-- binds, which is upstream's @parse@ given a static environment: the root
+-- environment's under the policy in force ('Nix.Builtins.rootScopeNames'),
+-- with a @scopedImport@ scope's attributes over them, which upstream binds
+-- in a static environment of their own over the base one.  Every one binds
+-- like a global, so a @with@ in the source cannot shadow it.
+parseNixWithScope :: Set Text -> FilePath -> Text -> Text -> Either SourceError Expr
+parseNixWithScope scope baseDir fileName source = do
+  tokens <- first SyntaxError (tokenize fileName (stripBOM source))
   let st = ParseState {psTokens = tokens, psFile = fileName}
-  (expr, _remaining) <- runParser parseTopLevel st
-  pure (resolveRelativePaths baseDir (trimClosures (resolveVars expr)))
+  (expr, _remaining) <- first SyntaxError (runParser parseTopLevel st)
+  resolved <- first UndefinedVariable (resolveVars scope expr)
+  pure (resolveRelativePaths baseDir (trimClosures resolved))
 
 -- | Strip a leading UTF-8 byte order mark (U+FEFF) if present.
 stripBOM :: Text -> Text
@@ -100,7 +127,7 @@ stripBOM t = case T.uncons t of
 
 -- | Parse a @.nix@ file from disk.
 -- Uses 'readFileAutoEncoding' to handle UTF-8, UTF-16 LE, and UTF-16 BE.
-parseNixFile :: FilePath -> IO (Either ParseError Expr)
+parseNixFile :: FilePath -> IO (Either SourceError Expr)
 parseNixFile path = do
   source <- readFileAutoEncoding path
   pure $ parseNix (takeDirectory path) (T.pack path) source

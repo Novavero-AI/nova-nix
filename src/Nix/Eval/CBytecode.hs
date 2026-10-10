@@ -106,6 +106,7 @@ module Nix.Eval.CBytecode
     -- * Binding type tags
     bindNamed,
     bindInherit,
+    bindInheritFrom,
 
     -- * CaptureInfo type tags
     captureNone,
@@ -405,10 +406,12 @@ strpartLit = 0
 strpartInterp = 1
 strpartEsc = 2
 
--- | Attribute-binding kinds: a @name = value@ binding or an @inherit@.
-bindNamed, bindInherit :: Word32
+-- | Attribute-binding kinds: a @name = value@ binding, one name of an
+-- @inherit@, or an @inherit (from) ...@.
+bindNamed, bindInherit, bindInheritFrom :: Word32
 bindNamed = 0
 bindInherit = 1
+bindInheritFrom = 2
 
 -- | Closure capture kinds: capture nothing, capture specific slots, or capture
 -- slots plus the enclosing @with@ scopes.

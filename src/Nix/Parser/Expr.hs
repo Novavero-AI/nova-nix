@@ -545,8 +545,8 @@ parseBindings = go [] >>= normalizeBindings
           _ <- advance
           pure (reverse acc)
         TokInherit -> do
-          binding <- parseInherit
-          go (binding : acc)
+          inherited <- parseInherit
+          go (reverse inherited ++ acc)
         _ -> do
           binding <- parseNamedBinding
           go (binding : acc)
@@ -606,9 +606,17 @@ normalizeBindingList bindings = do
             Right (updated, defined)
           Just DefInherit -> Left (duplicateAttr key)
       b@(NamedBinding _ _) -> Right (DynamicEntry b : entries, defined)
-      b@(Inherit _ names) -> do
-        mapM_ (\name -> if Map.member name defined then Left (duplicateAttr name) else Right ()) names
-        Right (InheritEntry b : entries, foldl' (\m name -> Map.insert name DefInherit m) defined names)
+      b@(Inherit name _) -> inheritEntry b [name]
+      b@(InheritFrom _ names) -> inheritEntry b names
+      where
+        -- One name at a time, so a name repeated within the clause is a
+        -- duplicate too, as upstream's per-name dupAttr check makes it.
+        inheritEntry b names = do
+          updated <- foldM defineInherited defined names
+          Right (InheritEntry b : entries, updated)
+        defineInherited acc name
+          | Map.member name acc = Left (duplicateAttr name)
+          | otherwise = Right (Map.insert name DefInherit acc)
 
     -- Replace the existing entry for @key@ with the merged value.
     mergeIntoEntries key newValue entries = case entries of
@@ -651,7 +659,9 @@ parseNamedBinding = do
   expect TokSemicolon
   pure (NamedBinding path val)
 
-parseInherit :: Parser Binding
+-- | An @inherit@ clause: one 'InheritFrom' for @inherit (from) x y;@, one
+-- 'Inherit' per name for @inherit x y;@, each holding the variable it copies.
+parseInherit :: Parser [Binding]
 parseInherit = do
   expect TokInherit
   tok <- peek
@@ -662,11 +672,11 @@ parseInherit = do
       expect TokRParen
       names <- parseInheritNames
       expect TokSemicolon
-      pure (Inherit (Just from) names)
+      pure [InheritFrom from names]
     _ -> do
       names <- parseInheritNames
       expect TokSemicolon
-      pure (Inherit Nothing names)
+      pure [Inherit name (EVar name) | name <- names]
 
 parseInheritNames :: Parser [Text]
 parseInheritNames = go []
@@ -775,8 +785,8 @@ parseLetBindings = go [] >>= normalizeBindings
       case tok of
         TokIn -> pure (reverse acc)
         TokInherit -> do
-          binding <- parseInherit
-          go (binding : acc)
+          inherited <- parseInherit
+          go (reverse inherited ++ acc)
         _ -> do
           binding <- parseNamedBinding
           -- Upstream rejects a dynamic TOP-LEVEL key in a let at parse time;

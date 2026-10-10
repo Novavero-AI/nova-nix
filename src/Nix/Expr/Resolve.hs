@@ -2,13 +2,17 @@
 -- evaluated: variables to positional slots, and relative path literals to
 -- absolute ones.
 --
--- Variable resolution replaces 'EVar' with 'EResolvedVar'
--- for variables bound by lambda formals and let\/rec bindings.
+-- Variable resolution is upstream's bindVars.  Every variable is bound
+-- before anything is evaluated, and one that no enclosing scope binds and
+-- no enclosing @with@ could supply fails the whole expression then, even on
+-- a branch evaluation would never take.
 --
 -- Lambda formals and eligible let\/rec bindings get positional
--- (de Bruijn-style) indices via 'LexicalScope'.  Let\/rec blocks with
--- dynamic keys or nested paths fall back to 'NameBarrier' (name-based
--- lookup at runtime).  With-scopes and builtins remain name-based.
+-- (de Bruijn-style) indices via 'LexicalScope' and become 'EResolvedVar'.
+-- Let\/rec blocks with dynamic keys or nested paths fall back to
+-- 'NameBarrier' (name-based lookup at runtime), as do the names bound
+-- around the whole expression.
+-- A name only a @with@ could supply becomes 'EWithVar'.
 --
 -- Path resolution rewrites a relative path literal to an absolute one, so
 -- what it names is fixed by the file it was written in.
@@ -17,9 +21,11 @@
 module Nix.Expr.Resolve
   ( resolveVars,
     resolveRelativePaths,
+    undefinedVariableMessage,
 
-    -- * Static global names (exported for the sync test)
+    -- * The names bound around every expression
     staticGlobalNames,
+    impureOnlyGlobalNames,
   )
 where
 
@@ -36,83 +42,98 @@ import System.FilePath (isRelative, (</>))
 data ScopeEntry
   = -- | Lambda formals: name -> positional index.
     LexicalScope !(Map Text Int)
-  | -- | Let/rec binding names: blocks resolution (handled by name at runtime).
+  | -- | Names looked up by name at runtime: a let\/rec block's bindings, and
+    -- at the bottom of the stack the names bound around the expression.
     NameBarrier !(Set Text)
   | -- | Marks a with-scope boundary on the stack.
     -- Does NOT increment the de Bruijn level (with doesn't create a
     -- parent env level at runtime).  Variables bound by no 'LexicalScope'
-    -- or 'NameBarrier' anywhere on the stack - and not static globals -
-    -- are upgraded to 'EWithVar' when at least one WithBarrier encloses
-    -- them; lexical bindings and globals always win over with-scopes.
+    -- or 'NameBarrier' anywhere on the stack are upgraded to 'EWithVar'
+    -- when at least one WithBarrier encloses them; lexical bindings and
+    -- globals always win over with-scopes.
     WithBarrier
 
--- | Resolve variables in an expression.  Replaces 'EVar' with
--- 'EResolvedVar' where the variable is lexically bound by a lambda
--- formal or an eligible let\/rec binding.  Variables in with-scopes,
--- builtins, and fallback let\/rec blocks remain as 'EVar'.
-resolveVars :: Expr -> Expr
-resolveVars = resolve []
+-- | Bind every variable in an expression, given the names bound around it:
+-- the root environment's ('staticGlobalNames', less
+-- 'impureOnlyGlobalNames' under @pure-eval@), plus a @scopedImport@
+-- scope's.  Replaces 'EVar' with 'EResolvedVar' where a lambda formal or an
+-- eligible let\/rec binding binds the variable, and with 'EWithVar' where
+-- only an enclosing @with@ could.  'Left' names the first unbound variable
+-- the walk meets: the first in the source, unless attribute paths split
+-- across bindings were merged.
+resolveVars :: Set Text -> Expr -> Either Text Expr
+resolveVars globals = resolve [NameBarrier globals]
+
+-- | Upstream's wording for a variable nothing binds, the same whether
+-- binding finds it before evaluation or a @with@ lookup misses it during
+-- (UndefinedVarError in ExprVar::bindVars and in lookupVar).
+undefinedVariableMessage :: Text -> Text
+undefinedVariableMessage name = "undefined variable '" <> name <> "'"
 
 -- | Walk the AST, maintaining a scope stack.
-resolve :: [ScopeEntry] -> Expr -> Expr
+resolve :: [ScopeEntry] -> Expr -> Either Text Expr
 resolve stack expr = case expr of
-  ELit _ -> expr
-  EStr parts -> EStr (map (resolvePart stack) parts)
-  EIndStr parts -> EIndStr (map (resolvePart stack) parts)
-  EPathStr parts -> EPathStr (map (resolvePart stack) parts)
-  EVar name -> resolveVar stack 0 name
-  EResolvedVar _ _ -> expr
+  ELit _ -> Right expr
+  EStr parts -> EStr <$> traverse (resolvePart stack) parts
+  EIndStr parts -> EIndStr <$> traverse (resolvePart stack) parts
+  EPathStr parts -> EPathStr <$> traverse (resolvePart stack) parts
+  EVar name -> resolveVar stack name
+  EResolvedVar _ _ -> Right expr
   EAttrs True bindings _captureInfo
     | allStaticSingleKey bindings ->
         -- Positional: all bindings are single static keys or inherits.
-        let scope = lexicalScopeFromBindings bindings
-            innerStack = scope : stack
-         in EAttrs True (concatMap (resolveLetBinding stack innerStack) bindings) NoCaptureInfo
+        let innerStack = lexicalScopeFromBindings bindings : stack
+         in recAttrs <$> traverse (resolveLetBinding stack innerStack) bindings
     | otherwise ->
         -- Fallback: dynamic keys or nested paths - use NameBarrier.  Bindings
         -- resolve against newStack (siblings visible), but a plain @inherit x@
         -- must reference the OUTER scope - resolveLetBinding handles that, so
         -- the barrier does not turn @inherit x@ into a self-reference.
-        let names = collectBindingNames bindings
-            newStack = NameBarrier names : stack
-         in EAttrs True (concatMap (resolveLetBinding stack newStack) bindings) NoCaptureInfo
+        let newStack = NameBarrier (collectBindingNames bindings) : stack
+         in recAttrs <$> traverse (resolveLetBinding stack newStack) bindings
   EAttrs False bindings _captureInfo ->
     -- Non-recursive: bindings use the outer scope.
-    EAttrs False (concatMap (resolveBinding stack) bindings) NoCaptureInfo
-  EList elems -> EList (map (resolve stack) elems)
+    (\resolved -> EAttrs False resolved NoCaptureInfo) <$> traverse (resolveBinding stack) bindings
+  EList elems -> EList <$> traverse (resolve stack) elems
   ESelect target path defExpr ->
-    ESelect (resolve stack target) (map (resolveKey stack) path) (fmap (resolve stack) defExpr)
+    ESelect
+      <$> resolve stack target
+      <*> traverse (resolveKey stack) path
+      <*> traverse (resolve stack) defExpr
   EHasAttr target path ->
-    EHasAttr (resolve stack target) (map (resolveKey stack) path)
-  EApp f x -> EApp (resolve stack f) (resolve stack x)
-  EDeferredApp f x -> EDeferredApp (resolve stack f) (resolve stack x)
+    EHasAttr <$> resolve stack target <*> traverse (resolveKey stack) path
+  EApp f x -> EApp <$> resolve stack f <*> resolve stack x
+  EDeferredApp f x -> EDeferredApp <$> resolve stack f <*> resolve stack x
   ELambda formals body _captures ->
-    let scope = lexicalScopeFromFormals formals
-        newStack = scope : stack
-     in ELambda (resolveFormalsDefaults newStack formals) (resolve newStack body) NoCaptureInfo
+    let newStack = lexicalScopeFromFormals formals : stack
+     in (\resolvedFormals resolvedBody -> ELambda resolvedFormals resolvedBody NoCaptureInfo)
+          <$> resolveFormalsDefaults newStack formals
+          <*> resolve newStack body
   ELet bindings body _captureInfo
     | allStaticSingleKey bindings ->
         -- Positional: all bindings are single static keys or inherits.
-        let scope = lexicalScopeFromBindings bindings
-            innerStack = scope : stack
-         in ELet (concatMap (resolveLetBinding stack innerStack) bindings) (resolve innerStack body) NoCaptureInfo
+        let innerStack = lexicalScopeFromBindings bindings : stack
+         in letIn
+              <$> traverse (resolveLetBinding stack innerStack) bindings
+              <*> resolve innerStack body
     | otherwise ->
         -- Fallback: dynamic keys or nested paths - use NameBarrier.  As above,
         -- resolveLetBinding resolves a plain @inherit x@ against the outer scope
         -- so the barrier does not make @x@ self-referential.
-        let names = collectBindingNames bindings
-            newStack = NameBarrier names : stack
-         in ELet (concatMap (resolveLetBinding stack newStack) bindings) (resolve newStack body) NoCaptureInfo
-  EIf c t f -> EIf (resolve stack c) (resolve stack t) (resolve stack f)
-  EWithVar _ -> expr
+        let newStack = NameBarrier (collectBindingNames bindings) : stack
+         in letIn
+              <$> traverse (resolveLetBinding stack newStack) bindings
+              <*> resolve newStack body
+  EIf c t f -> EIf <$> resolve stack c <*> resolve stack t <*> resolve stack f
+  EWithVar _ -> Right expr
   EWith scope body ->
     -- Push WithBarrier for the body so that unresolved names
     -- inside a with-scope are upgraded to EWithVar.
-    EWith (resolve stack scope) (resolve (WithBarrier : stack) body)
+    EWith <$> resolve stack scope <*> resolve (WithBarrier : stack) body
   EAssert cond body ->
-    EAssert (resolve stack cond) (resolve stack body)
-  EUnary op operand -> EUnary op (resolve stack operand)
-  EBinary op l r -> EBinary op (resolve stack l) (resolve stack r)
+    EAssert <$> resolve stack cond <*> resolve stack body
+  EUnary op operand -> EUnary op <$> resolve stack operand
+  EBinary op l r -> EBinary op <$> resolve stack l <*> resolve stack r
   -- Desugar: <name> becomes __findFile __nixPath "name"
   -- Matches C++ Nix's parser desugaring.  __findFile and __nixPath are
   -- in the root scope (Builtins.hs), so they resolve via name-based
@@ -125,78 +146,205 @@ resolve stack expr = case expr of
           (EApp (EVar "__findFile") (EVar "__nixPath"))
           (EStr [StrLit name])
       )
+  where
+    recAttrs resolved = EAttrs True resolved NoCaptureInfo
+    letIn resolved body = ELet resolved body NoCaptureInfo
 
 -- | Resolve a variable by walking the scope stack.
 --
--- @level@ counts how many scope entries we've crossed (each corresponds
+-- The level counts how many scope entries we've crossed (each corresponds
 -- to one parent hop at runtime).  A 'LexicalScope' hit yields
 -- 'EResolvedVar'; a 'NameBarrier' hit yields 'EVar' (name-based lookup at
 -- runtime).  Both are LEXICAL bindings, so a hit ends the walk no matter
 -- how many 'WithBarrier's were crossed on the way out - in Nix a
--- with-scope never shadows a binding introduced by other means.
+-- with-scope never shadows a binding introduced by other means.  That
+-- includes the globals at the bottom of the stack: like C++ Nix's
+-- staticBaseEnv, a global (@map@, @toString@, @builtins@, ...) binds at
+-- parse time, so @with { map = 42; }; map@ is the builtin upstream and
+-- here.
 --
--- Only a name bound by NEITHER becomes a with-variable, and then only if
--- it is not a static global: like C++ Nix's staticBaseEnv, a global
--- (@map@, @toString@, @builtins@, ...) binds at parse time, so
--- @with { map = 42; }; map@ is the builtin upstream and here.
-resolveVar :: [ScopeEntry] -> Int -> Text -> Expr
-resolveVar fullStack startLevel name = go fullStack startLevel False
+-- Only a name bound by NEITHER becomes a with-variable, and only under a
+-- @with@; with none to supply it, the name is undefined.
+resolveVar :: [ScopeEntry] -> Text -> Either Text Expr
+resolveVar fullStack name = go fullStack 0 False
   where
     go [] _ crossedWith
-      | crossedWith && not (Set.member name staticGlobalNames) = EWithVar name
-      | otherwise = EVar name
+      | crossedWith = Right (EWithVar name)
+      | name == curPosName = Right (EVar name)
+      | otherwise = Left name
     go (LexicalScope scope : rest) level crossedWith =
       case Map.lookup name scope of
-        Just idx -> EResolvedVar level idx
+        Just idx -> Right (EResolvedVar level idx)
         Nothing -> go rest (level + 1) crossedWith
     go (NameBarrier names : rest) level crossedWith
-      | Set.member name names = EVar name
+      | Set.member name names = Right (EVar name)
       | otherwise = go rest (level + 1) crossedWith
     -- WithBarrier does NOT increment level (with doesn't create an env
     -- level at runtime); it only records that an enclosing with exists.
     go (WithBarrier : rest) level _ = go rest level True
 
--- | Names statically bound in the root environment
--- ('Nix.Builtins.builtinEnv'): the value constants, @builtins@, the
--- search-path plumbing, and the top-level builtins that upstream Nix also
--- exposes unprefixed (its staticBaseEnv).  A name in this set is never a
--- with-variable - the global binds at parse time and an enclosing @with@
--- cannot shadow it.
+-- | A temporary accommodation.  Upstream's parser reads @__curPos@ as a
+-- position expression, never a variable (parser.y at 2.24.9, expr_simple),
+-- so binding never sees it.  Here it still parses as a variable, because
+-- building the position needs to know whether the source is a file
+-- (upstream's position set) or a string (upstream's null), and 'parseNix'
+-- carries only a name.  Until it does, the name is exempt from the check and
+-- fails when forced, as before binding checked anything; nixpkgs uses it in
+-- files every NixOS evaluation imports.  Delete the exemption when
+-- 'parseNix' carries the file-or-string origin and the parser builds the
+-- position.
+curPosName :: Text
+curPosName = "__curPos"
+
+-- | The names upstream binds in its base environment by default, which is
+-- every name the root environment ('Nix.Builtins.builtinEnv') binds and
+-- every name binding accepts with nothing else in scope.  Upstream installs
+-- each primop and constant under the name it registers (@addPrimOp@ and
+-- @addConstant@, eval.cc at 2.24.9) and under that name less a @__@ prefix
+-- in @builtins@, so @__typeOf@ and @builtins.typeOf@ are one value.  The
+-- set is @createBaseEnv@'s (primops.cc) with every @RegisterPrimOp@ not
+-- gated on an experimental feature, which leaves out @__fetchClosure@,
+-- @__outputOf@, @fetchTree@ and the flake builtins, and with
+-- @__importNative@ and @__exec@, which need
+-- @allow-unsafe-native-code-during-evaluation@, left out too.
+-- 'impureOnlyGlobalNames' are dropped from it under @pure-eval@.
 --
--- @fetchurl@ and @toFile@ are absent on purpose: upstream exposes them
--- only under @builtins.@, and nixpkgs relies on @with pkgs; fetchurl@
--- binding @pkgs.fetchurl@.  The root env matches (they are not bound
--- there either).
+-- A name here is never a with-variable: the global binds at parse time and
+-- an enclosing @with@ cannot shadow it.  @fetchurl@ and @toFile@ are
+-- @__@-prefixed upstream, so nixpkgs' @with pkgs; fetchurl@ binds
+-- @pkgs.fetchurl@.
 --
--- Layering keeps this module from importing 'Nix.Builtins'; a test
--- asserts this set stays in sync with the root env's actual bindings.
+-- Layering keeps this module from importing 'Nix.Builtins', which builds
+-- the root environment from this set; a test checks it against the list
+-- recorded from upstream's source.
 staticGlobalNames :: Set Text
 staticGlobalNames =
-  Set.fromList
-    [ "true",
-      "false",
-      "null",
-      "builtins",
-      "__findFile",
-      "__nixPath",
-      "abort",
-      "baseNameOf",
-      "break",
-      "derivation",
-      "derivationStrict",
-      "dirOf",
-      "fetchGit",
-      "fetchTarball",
-      "fromTOML",
-      "import",
-      "isNull",
-      "map",
-      "placeholder",
-      "removeAttrs",
-      "scopedImport",
-      "throw",
-      "toString"
-    ]
+  Set.fromList (unprefixedGlobals ++ map ("__" <>) prefixedGlobals)
+  where
+    unprefixedGlobals =
+      [ "abort",
+        "baseNameOf",
+        "break",
+        "builtins",
+        "derivation",
+        "derivationStrict",
+        "dirOf",
+        "false",
+        "fetchGit",
+        "fetchMercurial",
+        "fetchTarball",
+        "fromTOML",
+        "import",
+        "isNull",
+        "map",
+        "null",
+        "placeholder",
+        "removeAttrs",
+        "scopedImport",
+        "throw",
+        "toString",
+        "true"
+      ]
+    prefixedGlobals =
+      [ "add",
+        "addDrvOutputDependencies",
+        "addErrorContext",
+        "all",
+        "any",
+        "appendContext",
+        "attrNames",
+        "attrValues",
+        "bitAnd",
+        "bitOr",
+        "bitXor",
+        "catAttrs",
+        "ceil",
+        "compareVersions",
+        "concatLists",
+        "concatMap",
+        "concatStringsSep",
+        "convertHash",
+        "currentSystem",
+        "currentTime",
+        "deepSeq",
+        "div",
+        "elem",
+        "elemAt",
+        "fetchurl",
+        "filter",
+        "filterSource",
+        "findFile",
+        "floor",
+        "foldl'",
+        "fromJSON",
+        "functionArgs",
+        "genList",
+        "genericClosure",
+        "getAttr",
+        "getContext",
+        "getEnv",
+        "groupBy",
+        "hasAttr",
+        "hasContext",
+        "hashFile",
+        "hashString",
+        "head",
+        "intersectAttrs",
+        "isAttrs",
+        "isBool",
+        "isFloat",
+        "isFunction",
+        "isInt",
+        "isList",
+        "isPath",
+        "isString",
+        "langVersion",
+        "length",
+        "lessThan",
+        "listToAttrs",
+        "mapAttrs",
+        "match",
+        "mul",
+        "nixPath",
+        "nixVersion",
+        "parseDrvName",
+        "partition",
+        "path",
+        "pathExists",
+        "readDir",
+        "readFile",
+        "readFileType",
+        "replaceStrings",
+        "seq",
+        "sort",
+        "split",
+        "splitVersion",
+        "storeDir",
+        "storePath",
+        "stringLength",
+        "sub",
+        "substring",
+        "tail",
+        "toFile",
+        "toJSON",
+        "toPath",
+        "toXML",
+        "trace",
+        "traceVerbose",
+        "tryEval",
+        "typeOf",
+        "unsafeDiscardOutputDependency",
+        "unsafeDiscardStringContext",
+        "unsafeGetAttrPos",
+        "warn",
+        "zipAttrsWith"
+      ]
+
+-- | Upstream's @impureOnly@ constants, absent from its base environment
+-- under @pure-eval@ (@addConstant@, eval.cc at 2.24.9), so binding rejects
+-- them there as an undefined variable.
+impureOnlyGlobalNames :: Set Text
+impureOnlyGlobalNames = Set.fromList ["__currentSystem", "__currentTime"]
 
 -- | Build a 'LexicalScope' from lambda formals.
 --
@@ -219,35 +367,29 @@ collectBindingNames = foldl' addNames Set.empty
   where
     addNames acc (NamedBinding (StaticKey name : _) _) = Set.insert name acc
     addNames acc (NamedBinding _ _) = acc
-    addNames acc (Inherit _ names) = foldl' (flip Set.insert) acc names
+    addNames acc (Inherit name _) = Set.insert name acc
+    addNames acc (InheritFrom _ names) = foldl' (flip Set.insert) acc names
 
 -- | Resolve variables inside string parts.
-resolvePart :: [ScopeEntry] -> StringPart -> StringPart
-resolvePart _ p@(StrLit _) = p
-resolvePart _ p@(StrEsc _) = p
-resolvePart stack (StrInterp e) = StrInterp (resolve stack e)
+resolvePart :: [ScopeEntry] -> StringPart -> Either Text StringPart
+resolvePart _ p@(StrLit _) = Right p
+resolvePart _ p@(StrEsc _) = Right p
+resolvePart stack (StrInterp e) = StrInterp <$> resolve stack e
 
 -- | Resolve variables inside attribute keys.
-resolveKey :: [ScopeEntry] -> AttrKey -> AttrKey
-resolveKey _ k@(StaticKey _) = k
-resolveKey stack (DynamicKey e) = DynamicKey (resolve stack e)
+resolveKey :: [ScopeEntry] -> AttrKey -> Either Text AttrKey
+resolveKey _ k@(StaticKey _) = Right k
+resolveKey stack (DynamicKey e) = DynamicKey <$> resolve stack e
 
--- | Resolve variables inside a binding's RHS.
---
--- 'Inherit Nothing' is desugared into 'NamedBinding' entries so that
--- each inherited name goes through normal variable resolution.  This
--- is necessary because @inherit x@ does a name-based lookup at runtime,
--- but lambda formals are stored in positional env slots (no names).
--- Desugaring @inherit x@ to @x = x;@ lets the RHS 'EVar' resolve to
--- 'EResolvedVar' when @x@ is a lambda formal.
-resolveBinding :: [ScopeEntry] -> Binding -> [Binding]
+-- | Resolve variables inside a non-recursive set's binding.  The set adds
+-- no env level, so an inherited variable resolves where the set stands,
+-- like every other value.
+resolveBinding :: [ScopeEntry] -> Binding -> Either Text Binding
 resolveBinding stack (NamedBinding path bodyExpr) =
-  [NamedBinding (map (resolveKey stack) path) (resolve stack bodyExpr)]
-resolveBinding stack (Inherit (Just fromExpr) names) =
-  [Inherit (Just (resolve stack fromExpr)) names]
-resolveBinding stack (Inherit Nothing names) =
-  -- Desugar: inherit x y; becomes x = x; y = y;
-  [NamedBinding [StaticKey name] (resolve stack (EVar name)) | name <- names]
+  NamedBinding <$> traverse (resolveKey stack) path <*> resolve stack bodyExpr
+resolveBinding stack (Inherit name var) = Inherit name <$> resolve stack var
+resolveBinding stack (InheritFrom fromExpr names) =
+  (`InheritFrom` names) <$> resolve stack fromExpr
 
 -- | Check if all bindings are eligible for positional resolution:
 -- each binding must be either a single static key or an inherit.
@@ -258,6 +400,7 @@ allStaticSingleKey = all isEligible
   where
     isEligible (NamedBinding [StaticKey _] _) = True
     isEligible (Inherit _ _) = True
+    isEligible (InheritFrom _ _) = True
     isEligible _ = False
 
 -- | Build a 'LexicalScope' from let\/rec bindings, assigning positional
@@ -271,7 +414,8 @@ lexicalScopeFromBindings bindings =
   where
     names = concatMap bindingNames bindings
     bindingNames (NamedBinding [StaticKey name] _) = [name]
-    bindingNames (Inherit _ inheritNames) = inheritNames
+    bindingNames (Inherit name _) = [name]
+    bindingNames (InheritFrom _ inheritNames) = inheritNames
     -- Unreachable: allStaticSingleKey guards this path.
     bindingNames _ = []
 
@@ -281,41 +425,31 @@ lexicalScopeFromBindings bindings =
 -- entry pushed).
 --
 -- Regular bindings resolve their RHS against @innerStack@ (recursive).
--- @inherit x@ desugars to @x = x@ where the RHS resolves against @outerStack@:
--- the inherited name must reference the enclosing scope, not the block being
--- defined - otherwise the pushed scope\/barrier makes @x@ a self-reference and
--- forcing it recurses forever.
-resolveLetBinding :: [ScopeEntry] -> [ScopeEntry] -> Binding -> [Binding]
+-- An @inherit x@ variable resolves against @outerStack@, and the evaluator
+-- evaluates it in the enclosing env, as upstream's @ExprAttrs::eval@ and
+-- @ExprLet::eval@ evaluate an Inherited attribute (eval.cc at 2.24.9):
+-- the inherited name references the enclosing scope, never the block being
+-- defined, whose own @x@ would make it a self-reference.
+resolveLetBinding :: [ScopeEntry] -> [ScopeEntry] -> Binding -> Either Text Binding
 resolveLetBinding _ innerStack (NamedBinding path bodyExpr) =
-  [NamedBinding (map (resolveKey innerStack) path) (resolve innerStack bodyExpr)]
-resolveLetBinding _ innerStack (Inherit (Just fromExpr) names) =
-  [Inherit (Just (resolve innerStack fromExpr)) names]
-resolveLetBinding outerStack _ (Inherit Nothing names) =
-  -- Desugar @inherit x y;@ becomes @x = x; y = y;@, resolving each RHS against the
-  -- outer scope so it names the enclosing binding, not the one defined here.
-  -- 'shiftInheritLevel' corrects for the inner env the resulting thunk runs in.
-  [NamedBinding [StaticKey name] (shiftInheritLevel (resolve outerStack (EVar name))) | name <- names]
-
--- | A desugared positional @inherit@ RHS is resolved against the outer scope
--- but evaluated in the inner (let\/rec) env - one extra parent-chain hop - so
--- its de Bruijn level is one too shallow.  Bump it.  'EVar'\/'EWithVar' are
--- name-based and need no adjustment.
-shiftInheritLevel :: Expr -> Expr
-shiftInheritLevel (EResolvedVar level idx) = EResolvedVar (level + 1) idx
-shiftInheritLevel other = other
+  NamedBinding <$> traverse (resolveKey innerStack) path <*> resolve innerStack bodyExpr
+resolveLetBinding _ innerStack (InheritFrom fromExpr names) =
+  (`InheritFrom` names) <$> resolve innerStack fromExpr
+resolveLetBinding outerStack _ (Inherit name var) =
+  Inherit name <$> resolve outerStack var
 
 -- | Resolve variables inside formal default expressions.
-resolveFormalsDefaults :: [ScopeEntry] -> Formals -> Formals
-resolveFormalsDefaults _ f@(FormalName _) = f
+resolveFormalsDefaults :: [ScopeEntry] -> Formals -> Either Text Formals
+resolveFormalsDefaults _ f@(FormalName _) = Right f
 resolveFormalsDefaults stack (FormalSet formals ellipsis) =
-  FormalSet (map (resolveFormal stack) formals) ellipsis
+  (`FormalSet` ellipsis) <$> traverse (resolveFormal stack) formals
 resolveFormalsDefaults stack (FormalNamedSet name formals ellipsis) =
-  FormalNamedSet name (map (resolveFormal stack) formals) ellipsis
+  (\resolved -> FormalNamedSet name resolved ellipsis) <$> traverse (resolveFormal stack) formals
 
 -- | Resolve variables inside a single formal's default expression.
-resolveFormal :: [ScopeEntry] -> Formal -> Formal
+resolveFormal :: [ScopeEntry] -> Formal -> Either Text Formal
 resolveFormal stack (Formal name defExpr) =
-  Formal name (fmap (resolve stack) defExpr)
+  Formal name <$> traverse (resolve stack) defExpr
 
 -- ---------------------------------------------------------------------------
 -- Path resolution
@@ -390,7 +524,8 @@ resolveRelativePaths dir = goExpr
 
     goBinding binding = case binding of
       NamedBinding path e -> NamedBinding (map goKey path) (goExpr e)
-      Inherit from names -> Inherit (fmap goExpr from) names
+      Inherit name var -> Inherit name (goExpr var)
+      InheritFrom from names -> InheritFrom (goExpr from) names
 
     goKey key = case key of
       StaticKey _ -> key

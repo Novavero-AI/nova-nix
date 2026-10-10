@@ -124,9 +124,9 @@ trimKey (DynamicKey e) = DynamicKey (trimExpr e)
 trimBinding :: Binding -> Binding
 trimBinding (NamedBinding path bodyExpr) =
   NamedBinding (map trimKey path) (trimExpr bodyExpr)
-trimBinding (Inherit (Just fromExpr) names) =
-  Inherit (Just (trimExpr fromExpr)) names
-trimBinding b@(Inherit Nothing _) = b
+trimBinding (Inherit name var) = Inherit name (trimExpr var)
+trimBinding (InheritFrom fromExpr names) =
+  InheritFrom (trimExpr fromExpr) names
 
 trimFormals :: Formals -> Formals
 trimFormals f@(FormalName _) = f
@@ -196,7 +196,7 @@ collectFreeVars depth expr = case expr of
     | otherwise -> (Set.empty, False, False)
   EAttrs True bindings captureInfo ->
     -- Recursive attrs create a scope (depth + 1)
-    let (vs1, h1, w1) = foldBindings (depth + 1) bindings
+    let (vs1, h1, w1) = foldBindings (depth + 1) (Just depth) bindings
         (vs2, innerWithVar) = case captureInfo of
           NoCaptureInfo -> (Set.empty, False)
           Captures caps ->
@@ -206,7 +206,7 @@ collectFreeVars depth expr = case expr of
      in (Set.union vs1 vs2, h1, w1 || innerWithVar)
   EAttrs False bindings _captureInfo ->
     -- Non-recursive attrs: no new scope
-    foldBindings depth bindings
+    foldBindings depth (Just depth) bindings
   EList elems -> foldExprs depth elems
   ESelect target path defExpr ->
     let (vs1, h1, w1) = collectFreeVars depth target
@@ -237,7 +237,7 @@ collectFreeVars depth expr = case expr of
      in (Set.unions [vs1, vs2, vs3], h1 || h2, w1 || w2 || innerWithVar)
   ELet bindings body_ captureInfo ->
     -- Let creates a scope (depth + 1)
-    let (vs1, h1, w1) = foldBindings (depth + 1) bindings
+    let (vs1, h1, w1) = foldBindings (depth + 1) (Just depth) bindings
         (vs2, h2, w2) = collectFreeVars (depth + 1) body_
         (vs3, innerWithVar) = case captureInfo of
           NoCaptureInfo -> (Set.empty, False)
@@ -291,17 +291,26 @@ foldKeys depth = foldl' combine (Set.empty, False, False)
       let (vs, hv, wv) = collectFreeVars depth e
        in (Set.union acc vs, h || hv, w || wv)
 
-foldBindings :: Int -> [Binding] -> (Set (Int, Int), Bool, Bool)
-foldBindings depth = foldl' combine (Set.empty, False, False)
+-- | Collect free variables from a binding set's values.  A value is
+-- evaluated at @depth@ (inside the set's own frame for a let or rec); an
+-- inherited variable is evaluated in the env around the set, at
+-- @outerDepth@, or outside the analysis altogether ('Nothing') when the
+-- frame being trimmed is the set's own.
+foldBindings :: Int -> Maybe Int -> [Binding] -> (Set (Int, Int), Bool, Bool)
+foldBindings depth outerDepth = foldl' combine (Set.empty, False, False)
   where
     combine (!acc, !h, !w) (NamedBinding path bodyExpr) =
       let (vs1, h1, w1) = foldKeys depth path
           (vs2, h2, w2) = collectFreeVars depth bodyExpr
        in (Set.unions [acc, vs1, vs2], h || h1 || h2, w || w1 || w2)
-    combine (!acc, !h, !w) (Inherit (Just fromExpr) _) =
+    combine (!acc, !h, !w) (Inherit _ var) = case outerDepth of
+      Nothing -> (acc, h, w)
+      Just outer ->
+        let (vs, hv, wv) = collectFreeVars outer var
+         in (Set.union acc vs, h || hv, w || wv)
+    combine (!acc, !h, !w) (InheritFrom fromExpr _) =
       let (vs, hv, wv) = collectFreeVars depth fromExpr
        in (Set.union acc vs, h || hv, w || wv)
-    combine (!acc, !h, !w) (Inherit Nothing _) = (acc, h, w)
 
 foldFormalsDefaults :: Int -> Formals -> (Set (Int, Int), Bool, Bool)
 foldFormalsDefaults _ (FormalName _) = (Set.empty, False, False)
@@ -340,9 +349,9 @@ rewriteBody depth captureMap expr = case expr of
               Nothing -> expr
     | otherwise -> expr
   EAttrs True bindings captureInfo ->
-    EAttrs True (map (rewriteBinding (depth + 1) captureMap) bindings) (rewriteCaptures depth captureMap captureInfo)
+    EAttrs True (map (rewriteBinding (depth + 1) (Just depth) captureMap) bindings) (rewriteCaptures depth captureMap captureInfo)
   EAttrs False bindings captureInfo ->
-    EAttrs False (map (rewriteBinding depth captureMap) bindings) captureInfo
+    EAttrs False (map (rewriteBinding depth (Just depth) captureMap) bindings) captureInfo
   EList elems -> EList (map (rewriteBody depth captureMap) elems)
   ESelect target path defExpr ->
     ESelect
@@ -364,7 +373,7 @@ rewriteBody depth captureMap expr = case expr of
       (rewriteCaptures depth captureMap captures)
   ELet bindings body_ captureInfo ->
     ELet
-      (map (rewriteBinding (depth + 1) captureMap) bindings)
+      (map (rewriteBinding (depth + 1) (Just depth) captureMap) bindings)
       (rewriteBody (depth + 1) captureMap body_)
       (rewriteCaptures depth captureMap captureInfo)
   EIf c t f ->
@@ -392,14 +401,17 @@ rewriteKey _ _ k@(StaticKey _) = k
 rewriteKey depth captureMap (DynamicKey e) =
   DynamicKey (rewriteBody depth captureMap e)
 
-rewriteBinding :: Int -> Map (Int, Int) Int -> Binding -> Binding
-rewriteBinding depth captureMap (NamedBinding path bodyExpr) =
+-- | Rewrite a binding's references, at the depths 'foldBindings' reads
+-- them at; an inherited variable outside the analysis is left as it is.
+rewriteBinding :: Int -> Maybe Int -> Map (Int, Int) Int -> Binding -> Binding
+rewriteBinding depth _ captureMap (NamedBinding path bodyExpr) =
   NamedBinding
     (map (rewriteKey depth captureMap) path)
     (rewriteBody depth captureMap bodyExpr)
-rewriteBinding depth captureMap (Inherit (Just fromExpr) names) =
-  Inherit (Just (rewriteBody depth captureMap fromExpr)) names
-rewriteBinding _ _ b@(Inherit Nothing _) = b
+rewriteBinding _ outerDepth captureMap (Inherit name var) =
+  Inherit name (maybe var (\outer -> rewriteBody outer captureMap var) outerDepth)
+rewriteBinding depth _ captureMap (InheritFrom fromExpr names) =
+  InheritFrom (rewriteBody depth captureMap fromExpr) names
 
 rewriteFormals :: Int -> Map (Int, Int) Int -> Formals -> Formals
 rewriteFormals _ _ f@(FormalName _) = f
@@ -450,7 +462,7 @@ rewriteCaptures depth captureMap (CapturesWithScopes caps) =
 -- Level 1+ = parent chain references (trimmed).
 trimOneLetBlock :: [Binding] -> Expr -> Either ([Binding], Expr) ([(Int, Int)], [Binding], Expr, Bool)
 trimOneLetBlock bindings body =
-  let (bindingVars, bindingHasEVar, bindingHasWithVar) = foldBindings 0 bindings
+  let (bindingVars, bindingHasEVar, bindingHasWithVar) = foldBindings 0 Nothing bindings
       (bodyVars, bodyHasEVar, bodyHasWithVar) = collectFreeVars 0 body
       freeVars = Set.union bindingVars bodyVars
       hasOuterEVar = bindingHasEVar || bodyHasEVar
@@ -460,7 +472,7 @@ trimOneLetBlock bindings body =
         else
           let captureList = sortBy (comparing fst <> comparing snd) (Set.toList freeVars)
               captureMap = Map.fromList (zip captureList [0 ..])
-              rewrittenBindings = map (rewriteBinding 0 captureMap) bindings
+              rewrittenBindings = map (rewriteBinding 0 Nothing captureMap) bindings
               rewrittenBody = rewriteBody 0 captureMap body
            in Right (captureList, rewrittenBindings, rewrittenBody, needsWithScopes)
 
@@ -469,11 +481,11 @@ trimOneLetBlock bindings body =
 -- unchanged if untrimable.
 trimOneRecAttrs :: [Binding] -> Either [Binding] ([(Int, Int)], [Binding], Bool)
 trimOneRecAttrs bindings =
-  let (bindingVars, bindingHasEVar, bindingHasWithVar) = foldBindings 0 bindings
+  let (bindingVars, bindingHasEVar, bindingHasWithVar) = foldBindings 0 Nothing bindings
    in if bindingHasEVar || (Set.null bindingVars && not bindingHasWithVar)
         then Left bindings
         else
           let captureList = sortBy (comparing fst <> comparing snd) (Set.toList bindingVars)
               captureMap = Map.fromList (zip captureList [0 ..])
-              rewrittenBindings = map (rewriteBinding 0 captureMap) bindings
+              rewrittenBindings = map (rewriteBinding 0 Nothing captureMap) bindings
            in Right (captureList, rewrittenBindings, bindingHasWithVar)

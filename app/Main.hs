@@ -26,7 +26,7 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig)
-import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, searchPathRoots)
+import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
@@ -38,7 +38,9 @@ import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
-import Nix.Parser (parseNix, readFileAutoEncoding)
+import Nix.Expr.Resolve (undefinedVariableMessage)
+import Nix.Expr.Types (Expr)
+import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath, storePathToText)
@@ -527,14 +529,17 @@ setUpEval opts config storeDir dataDir baseDir = do
       resolved <- canonicalizePath given
       pure (map (canonPathValue . T.pack) [given, resolved])
 
+-- | Parse and bind source against the names the root environment
+-- 'setUpEval' builds will bind, which depend on the policy.
+parseForEval :: CliOpts -> NixConfig -> FilePath -> T.Text -> T.Text -> Either SourceError Expr
+parseForEval opts config = parseNixWithScope (rootScopeNames (evalPolicyFor opts config))
+
 -- | Evaluate a .nix file and print the result.
 evalFile :: NixConfig -> CliOpts -> StoreDir -> FilePath -> FilePath -> IO ()
 evalFile config opts storeDir dataDir rawFilePath = do
   (filePath, source) <- readSourceFile rawFilePath
-  case parseNix (takeDirectory filePath) (T.pack filePath) source of
-    Left err -> do
-      hPutStrLn stderr ("parse error: " ++ show err)
-      exitFailure
+  case parseForEval opts config (takeDirectory filePath) (T.pack filePath) source of
+    Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir (takeDirectory filePath)
       result <- runEvalIO st (eval env expr >>= finalize (optStrict opts))
@@ -548,10 +553,8 @@ evalFile config opts storeDir dataDir rawFilePath = do
 evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
 evalExpr config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
-  case parseNix cwd exprSourceName source of
-    Left err -> do
-      hPutStrLn stderr ("parse error: " ++ show err)
-      exitFailure
+  case parseForEval opts config cwd exprSourceName source of
+    Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
       result <- runEvalIO st (eval env expr >>= finalize (optStrict opts))
@@ -566,10 +569,8 @@ evalExpr config opts storeDir dataDir source = do
 evalExprAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
 evalExprAterm config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
-  case parseNix cwd exprSourceName source of
-    Left err -> do
-      hPutStrLn stderr ("parse error: " ++ show err)
-      exitFailure
+  case parseForEval opts config cwd exprSourceName source of
+    Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
       result <- runEvalIO st $ do
@@ -624,10 +625,8 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
   let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
   (baseDir, sourceName, source) <- loadBuildSource target
-  case parseNix baseDir sourceName source of
-    Left err -> do
-      hPutStrLn stderr ("parse error: " ++ show err)
-      exitFailure
+  case parseForEval opts config baseDir sourceName source of
+    Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir baseDir
       result <- runEvalIO st $ do
@@ -1051,6 +1050,13 @@ failWith :: T.Text -> IO a
 failWith msg = do
   TIO.hPutStrLn stderr msg
   exitFailure
+
+-- | Fail on source that does not parse or bind.  An unbound variable is an
+-- evaluation error upstream, raised before evaluation starts, and reads as
+-- one here.
+failSource :: SourceError -> IO a
+failSource (SyntaxError err) = failWith ("parse error: " <> T.pack (show err))
+failSource (UndefinedVariable name) = failWith ("error: " <> undefinedVariableMessage name)
 
 -- ---------------------------------------------------------------------------
 -- Output formatting

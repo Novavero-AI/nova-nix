@@ -42,13 +42,14 @@ import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
+import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNames)
 import Nix.Derivation (fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (eval)
@@ -59,8 +60,9 @@ import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
+import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
-import Nix.Parser (parseNix, readFileAutoEncoding)
+import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
 import Nix.Store (copyPathInto, unpackNarEntry)
 import Nix.Store.CaseSensitive (probeCaseSensitivity)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -287,10 +289,8 @@ instance MonadEval EvalIO where
       Nothing -> do
         source <- wrapIO (readFileAutoEncoding ioTarget)
         let fileDir = takeDirectory target
-        case parseNix fileDir (T.pack target) source of
-          Left err ->
-            throwEvalError
-              ("import " <> T.pack target <> ": " <> T.pack (show err))
+        case parseNixWithScope (rootScopeNames policy) fileDir (T.pack target) source of
+          Left err -> rejectSource "import" target err
           Right expr -> do
             -- local sets new base dir for nested imports - pure, exception-safe
             let nested =
@@ -426,10 +426,8 @@ instance MonadEval EvalIO where
     (target, ioTarget) <- resolveImportTarget baseDir rawPath
     source <- wrapIO (readFileAutoEncoding ioTarget)
     let fileDir = takeDirectory target
-    case parseNix fileDir (T.pack target) source of
-      Left err ->
-        throwEvalError
-          ("scopedImport " <> T.pack target <> ": " <> T.pack (show err))
+    case parseNixWithScope (Set.union (Set.fromList (map fst scope)) (rootScopeNames policy)) fileDir (T.pack target) source of
+      Left err -> rejectSource "scopedImport" target err
       Right expr -> do
         -- No import cache for scoped imports (different scopes = different results)
         let scopedEnv = builtinEnvWithScope policy timestamp searchPaths scope
@@ -1047,6 +1045,15 @@ evalStoreTextPath txt = EvalIO (asks ((`SP.storeTextToFilePath` txt) . esStoreDi
 -- never names a location on disk.
 canonicalStorePathText :: SP.StorePath -> Text
 canonicalStorePathText = SP.storePathToText SP.defaultStoreDir
+
+-- | Fail an import whose file does not parse or bind.  Both are uncatchable,
+-- as upstream's ParseError and UndefinedVarError are to @builtins.tryEval@.
+-- An unbound variable reads exactly as upstream's message does; a syntax
+-- error keeps the parser's detail behind the builtin and file it came from.
+rejectSource :: Text -> FilePath -> SourceError -> EvalIO a
+rejectSource builtinName target err = throwEvalError $ case err of
+  SyntaxError syntax -> builtinName <> " " <> T.pack target <> ": " <> T.pack (show syntax)
+  UndefinedVariable name -> undefinedVariableMessage name
 
 -- | Resolve an import's raw path to the value-domain target (the import
 -- cache key, the parse name, and the base dir the file's relative path

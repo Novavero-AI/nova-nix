@@ -41,7 +41,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
-import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, splitNixPath)
+import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
@@ -51,22 +51,23 @@ import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CEnv (cenvLazyScope)
 import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkPayload, cthunkSetComputed, cthunkState)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
-import Nix.Eval.Compile (compileExpr)
+import Nix.Eval.Compile (BcBinding (..), compileExpr, decodeBcBindings)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printValue)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (allocCSlots, buildCSlots, emptyCList)
-import Nix.Expr.Resolve (staticGlobalNames)
+import Nix.Eval.Types (AttrSet (..), Env (..), allocCSlots, attrSetKeys, buildCSlots, emptyCList)
+import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
-import Nix.Parser (ParseError (..), parseNix)
+import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, storePathBasename, stripHashPrefix)
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isSafeNarName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
@@ -133,6 +134,12 @@ assertEqual label expected actual
           <> " but got "
           <> T.pack (show actual)
 
+-- | The first failure of two results, or 'Pass' when both pass.
+andThen :: TestResult -> TestResult -> TestResult
+andThen first second = case first of
+  Pass -> second
+  failed -> failed
+
 -- | Render string-value bytes in a failure message (display-only decode).
 bytesText :: BS.ByteString -> Text
 bytesText = TE.decodeUtf8With lenientDecode
@@ -155,9 +162,18 @@ testBaseDir = "/nova-nix-test"
 
 -- | Helper: parse and check result.
 assertParse :: Text -> Text -> Expr -> TestResult
-assertParse label source expected =
-  assertRight label (parseNix testBaseDir "<test>" source) $ \actual ->
+assertParse = assertParseIn []
+
+-- | 'assertParse' for source whose free variables are bound around it, the
+-- way @scopedImport@ binds its scope: each stays a name-based 'EVar'.
+assertParseIn :: [Text] -> Text -> Text -> Expr -> TestResult
+assertParseIn names label source expected =
+  assertRight label (parseNixWithScope (withGlobals names) testBaseDir "<test>" source) $ \actual ->
     assertEqual label expected actual
+
+-- | The root environment's names with more bound around them.
+withGlobals :: [Text] -> Set.Set Text
+withGlobals names = Set.union (Set.fromList names) staticGlobalNames
 
 -- | Helper: extract just token types from Located list (drop positions and EOF).
 tokenTypes :: [Located] -> [Token]
@@ -167,12 +183,26 @@ tokenTypes = filter (/= TokEOF) . map locToken
 -- are tagged so failure assertions can tell them apart from eval errors.
 evalNix :: Text -> Either Text NixValue
 evalNix source = case parseNix testBaseDir "<test>" source of
-  Left err -> Left (parseErrorTag <> T.pack (show err))
+  Left err -> Left (sourceFailure err)
   Right expr -> runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 
 -- | Prefix marking a parse (not eval) failure in 'evalNix' results.
 parseErrorTag :: Text
 parseErrorTag = "parse error: "
+
+-- | A source failure as an 'evalNix' result: a syntax error carries
+-- 'parseErrorTag'; an unbound variable reads as the evaluation error
+-- upstream raises for it, before evaluating anything.
+sourceFailure :: SourceError -> Text
+sourceFailure (SyntaxError err) = parseErrorTag <> T.pack (show err)
+sourceFailure (UndefinedVariable name) = undefinedVariableMessage name
+
+-- | The syntax error a source fails to parse with.
+syntaxErrorOf :: Text -> Either Text ParseError
+syntaxErrorOf source = case parseNix testBaseDir "<test>" source of
+  Left (SyntaxError err) -> Right err
+  Left other -> Left ("expected a syntax error, got " <> T.pack (show other))
+  Right _ -> Left "parsed unexpectedly"
 
 -- | Assert that a Nix expression evaluates to the expected value.
 assertEval :: Text -> Text -> NixValue -> TestResult
@@ -925,17 +955,17 @@ testEvalWith = do
           (VInt 3),
       -- AST test: parse "with a; b" produces EWithVar
       runTest "parse with produces EWithVar" $
-        assertRight "with-ast" (parseNix testBaseDir "<test>" "with a; b") $ \case
+        assertRight "with-ast" (parseNixWithScope (withGlobals ["a"]) testBaseDir "<test>" "with a; b") $ \case
           EWith (EVar "a") (EWithVar "b") -> Pass
           other -> Fail ("expected EWith (EVar a) (EWithVar b), got: " <> T.pack (show other)),
       -- AST test: formal wins over with
       runTest "parse lambda formal wins over with" $
-        assertRight "formal-wins" (parseNix testBaseDir "<test>" "x: with a; x") $ \case
+        assertRight "formal-wins" (parseNixWithScope (withGlobals ["a"]) testBaseDir "<test>" "x: with a; x") $ \case
           ELambda _ (EWith _ (EResolvedVar 0 0)) _ -> Pass
           other -> Fail ("expected formal to win, got: " <> T.pack (show other)),
       -- Trimming test: lambda inside with gets CapturesWithScopes
       runTest "with lambda trimmed with CapturesWithScopes" $
-        assertRight "with-trim" (parseNix testBaseDir "<test>" "with a; x: b + x") $ \case
+        assertRight "with-trim" (parseNixWithScope (withGlobals ["a"]) testBaseDir "<test>" "with a; x: b + x") $ \case
           EWith _ (ELambda _ _ (CapturesWithScopes _)) -> Pass
           other -> Fail ("expected CapturesWithScopes, got: " <> T.pack (show other))
     ]
@@ -1422,13 +1452,14 @@ testParserExprs = do
       runTest "parse null" $
         assertParse "null" "null" (ELit NixNull),
       runTest "parse var" $
-        assertParse "var" "x" (EVar "x"),
+        assertParseIn ["x"] "var" "x" (EVar "x"),
       runTest "parse empty string" $
         assertParse "empty string" "\"\"" (EStr []),
       runTest "parse string literal" $
         assertParse "string" "\"hello\"" (EStr [StrLit "hello"]),
       runTest "parse string interpolation" $
-        assertParse
+        assertParseIn
+          ["name"]
           "interp"
           "\"hello ${name}\""
           (EStr [StrLit "hello ", StrInterp (EVar "name")]),
@@ -1466,17 +1497,20 @@ testParserExprs = do
         assertParse "lt" "1 < 2" (EBinary OpLt (ELit (NixInt 1)) (ELit (NixInt 2))),
       -- Right-associative
       runTest "parse implication" $
-        assertParse
+        assertParseIn
+          ["a", "b", "c"]
           "impl"
           "a -> b -> c"
           (EBinary OpImpl (EVar "a") (EBinary OpImpl (EVar "b") (EVar "c"))),
       runTest "parse concat right" $
-        assertParse
+        assertParseIn
+          ["a", "b", "c"]
           "concat"
           "a ++ b ++ c"
           (EBinary OpConcat (EVar "a") (EBinary OpConcat (EVar "b") (EVar "c"))),
       runTest "parse update right" $
-        assertParse
+        assertParseIn
+          ["a", "b", "c"]
           "update"
           "a // b // c"
           (EBinary OpUpdate (EVar "a") (EBinary OpUpdate (EVar "b") (EVar "c"))),
@@ -1533,29 +1567,32 @@ testParserExprs = do
           ),
       -- Application
       runTest "parse application" $
-        assertParse "app" "f x" (EApp (EVar "f") (EVar "x")),
+        assertParseIn ["f", "x"] "app" "f x" (EApp (EVar "f") (EVar "x")),
       runTest "parse left-assoc application" $
-        assertParse "app left" "f x y" (EApp (EApp (EVar "f") (EVar "x")) (EVar "y")),
+        assertParseIn ["f", "x", "y"] "app left" "f x y" (EApp (EApp (EVar "f") (EVar "x")) (EVar "y")),
       runTest "parse application with parens" $
-        assertParse
+        assertParseIn
+          ["f"]
           "app parens"
           "f (1 + 2)"
           (EApp (EVar "f") (EBinary OpAdd (ELit (NixInt 1)) (ELit (NixInt 2)))),
       -- Select
       runTest "parse select" $
-        assertParse "select" "a.b" (ESelect (EVar "a") [StaticKey "b"] Nothing),
+        assertParseIn ["a"] "select" "a.b" (ESelect (EVar "a") [StaticKey "b"] Nothing),
       runTest "parse nested select" $
-        assertParse
+        assertParseIn
+          ["a"]
           "nested select"
           "a.b.c"
           (ESelect (EVar "a") [StaticKey "b", StaticKey "c"] Nothing),
       runTest "parse select or default" $
-        assertParse
+        assertParseIn
+          ["a"]
           "select or"
           "a.b or 1"
           (ESelect (EVar "a") [StaticKey "b"] (Just (ELit (NixInt 1)))),
       runTest "parse has-attr" $
-        assertParse "has-attr" "a ? b" (EHasAttr (EVar "a") [StaticKey "b"]),
+        assertParseIn ["a"] "has-attr" "a ? b" (EHasAttr (EVar "a") [StaticKey "b"]),
       -- Attr sets
       runTest "parse empty attrs" $
         assertParse "empty attrs" "{ }" (EAttrs False [] NoCaptureInfo),
@@ -1569,18 +1606,20 @@ testParserExprs = do
           "rec attrs"
           "rec { a = 1; }"
           (EAttrs True [NamedBinding [StaticKey "a"] (ELit (NixInt 1))] NoCaptureInfo),
-      -- inherit x y; is desugared to x = x; y = y; by the resolution pass
-      -- (needed because lambda formals are positional, not name-based).
+      -- inherit x y; is one binding per name, each holding the variable it
+      -- copies, which resolution binds like any other variable.
       runTest "parse inherit" $
-        assertParse
+        assertParseIn
+          ["x", "y"]
           "inherit"
           "{ inherit x y; }"
-          (EAttrs False [NamedBinding [StaticKey "x"] (EVar "x"), NamedBinding [StaticKey "y"] (EVar "y")] NoCaptureInfo),
+          (EAttrs False [Inherit "x" (EVar "x"), Inherit "y" (EVar "y")] NoCaptureInfo),
       runTest "parse inherit from" $
-        assertParse
+        assertParseIn
+          ["a"]
           "inherit from"
           "{ inherit (a) x; }"
-          (EAttrs False [Inherit (Just (EVar "a")) ["x"]] NoCaptureInfo),
+          (EAttrs False [InheritFrom (EVar "a") ["x"]] NoCaptureInfo),
       -- Let/if/with/assert
       runTest "parse let" $
         assertParse
@@ -1593,7 +1632,8 @@ testParserExprs = do
           "if true then 1 else 2"
           (EIf (ELit (NixBool True)) (ELit (NixInt 1)) (ELit (NixInt 2))),
       runTest "parse with" $
-        assertParse
+        assertParseIn
+          ["a"]
           "with"
           "with a; b"
           (EWith (EVar "a") (EWithVar "b")),
@@ -1615,7 +1655,7 @@ testParserExprs = do
         assertParse "parens" "(42)" (ELit (NixInt 42)),
       -- 'or' as identifier
       runTest "or as identifier" $
-        assertParse "or ident" "or" (EVar "or"),
+        assertParseIn ["or"] "or ident" "or" (EVar "or"),
       -- 'or' as attr key
       runTest "or as attr key" $
         assertParse
@@ -1651,32 +1691,27 @@ testParserErrors = do
       -- the attr-set reading and reporting its early stumble (a real
       -- error at line 410 of a nixpkgs file used to surface at line 2).
       runTest "deep formals-lambda body error reports its own line" $
-        case parseNix testBaseDir "<test>" "{ a, b }:\n{\n  x = 1;\n  y = (;\n}" of
-          Left err -> assertEqual "error line" 4 (peLine err)
-          Right _ -> Fail "parsed unexpectedly",
+        assertRight "deep body" (syntaxErrorOf "{ a, b }:\n{\n  x = 1;\n  y = (;\n}") $ \err ->
+          assertEqual "error line" 4 (peLine err),
       runTest "simple-lambda body error reports its own line" $
-        case parseNix testBaseDir "<test>" "x:\n(;" of
-          Left err -> assertEqual "error line" 2 (peLine err)
-          Right _ -> Fail "parsed unexpectedly",
+        assertRight "simple body" (syntaxErrorOf "x:\n(;") $ \err ->
+          assertEqual "error line" 2 (peLine err),
       -- The empty attr set is a successful PREFIX parse of "{ }: body",
       -- so without commitment the outer parser complained at the colon.
       runTest "empty-formals lambda body error reports its own line" $
-        case parseNix testBaseDir "<test>" "{ }:\n(;" of
-          Left err -> assertEqual "error line" 2 (peLine err)
-          Right _ -> Fail "parsed unexpectedly",
+        assertRight "empty formals body" (syntaxErrorOf "{ }:\n(;") $ \err ->
+          assertEqual "error line" 2 (peLine err),
       -- When neither reading parses, the deeper failure wins: the
       -- malformed formal at column 7, not the attr-set branch's
       -- stumble over the first comma at column 4.
       runTest "a malformed formal beats the attr-set branch's earlier error" $
-        case parseNix testBaseDir "<test>" "{ a, b.c }: x" of
-          Left err -> assertEqual "deeper than the attr-set stumble" True ((peLine err, peCol err) > (1, 4))
-          Right _ -> Fail "parsed unexpectedly",
+        assertRight "malformed formal" (syntaxErrorOf "{ a, b.c }: x") $ \err ->
+          assertEqual "deeper than the attr-set stumble" True ((peLine err, peCol err) > (1, 4)),
       -- End-of-input failures carry no position and must rank as the
       -- furthest a branch can get.
       runTest "truncated lambda reports end of input" $
-        case parseNix testBaseDir "<test>" "{ a, b }:" of
-          Left err -> assertEqual "end of input" True ("end of input" `T.isInfixOf` peMessage err)
-          Right _ -> Fail "parsed unexpectedly"
+        assertRight "truncated lambda" (syntaxErrorOf "{ a, b }:") $ \err ->
+          assertEqual "end of input" True ("end of input" `T.isInfixOf` peMessage err)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1739,11 +1774,10 @@ testParserIntegration = do
           -- x: let inherit x; in x
           -- The lambda formal x is at level 0, index 0.
           -- The let scope is level 0 (for the let body).
-          -- inherit x desugars to x = x where RHS resolves against outer
-          -- (the lambda scope), so the let binding's RHS is EResolvedVar 0 0
-          -- (one level up from the let to the lambda).
+          -- The inherited variable resolves against the outer (lambda)
+          -- scope, one level up from the let it is evaluated in.
           -- The body x resolves to level 0, index 0 (the let scope).
-          ELambda _ (ELet [NamedBinding [StaticKey "x"] _rhsExpr] (EResolvedVar 0 0) _) _ -> Pass
+          ELambda _ (ELet [Inherit "x" _rhsExpr] (EResolvedVar 0 0) _) _ -> Pass
           other -> Fail ("expected ELambda with let-inherit, got: " <> T.pack (show other)),
       runTest "nested lambda in let" $
         assertEval
@@ -12648,21 +12682,37 @@ testBytecodeCompile = do
               then Pass
               else Fail "path mismatch"
           ),
-      runTestM "compile Inherit binding" $ do
+      runTestM "compile inherit-from binding" $ do
         idx <-
           compileExpr
             ( EAttrs
                 False
-                [Inherit Nothing ["x", "y"]]
+                [InheritFrom (EVar "s") ["x", "y"]]
                 NoCaptureInfo
             )
         op <- cbcOpcode idx
         count <- cbcShortArg idx
-        pure
-          ( if op == OpAttrs && count == 1
-              then Pass
-              else Fail "inherit binding mismatch"
-          ),
+        dataOff <- cbcArg1 idx
+        bindings <- decodeBcBindings 1 dataOff
+        pure $ case bindings of
+          [BcInheritFrom _ syms]
+            | op == OpAttrs && count == 1 ->
+                assertEqual "inherited names" ["x", "y"] (map (symbolText . Symbol) syms)
+          _ -> Fail "inherit binding mismatch",
+      -- A plain inherit has no lookup of its own: it carries the variable,
+      -- bound like any other, for the evaluator to read in the outer env.
+      runTestM "compile plain inherit with the variable it copies" $ do
+        idx <- compileExpr (EAttrs False [Inherit "x" (EResolvedVar 0 0)] NoCaptureInfo)
+        dataOff <- cbcArg1 idx
+        bindings <- decodeBcBindings 1 dataOff
+        case bindings of
+          [BcInherit sym valIdx] -> do
+            valOp <- cbcOpcode valIdx
+            pure $
+              if symbolText (Symbol sym) == "x" && valOp == OpResolvedVar
+                then Pass
+                else Fail "expected x to carry the resolved variable"
+          _ -> pure (Fail "expected one inherit binding"),
       runTestM "compile ELambda (FormalSet)" $ do
         idx <-
           compileExpr
@@ -13075,19 +13125,338 @@ testNarInfoValidation = do
 -- Tests: resolver static globals stay in sync with the root env
 -- ---------------------------------------------------------------------------
 
--- | Every name the resolver treats as a static global must actually be
--- bound in the root environment: 'Nix.Expr.Resolve.resolveVar' leaves such
--- names as 'EVar' even under a @with@, so an unbound one would surface as
--- an undefined variable.  Layering keeps Resolve from importing Builtins,
--- so this test is the sync guarantee between the two lists.
+-- | The names upstream 2.24.9's base environment binds with default
+-- settings, recorded from its source: every @addConstant@ and @addPrimOp@
+-- in @createBaseEnv@ (src/libexpr/primops.cc) and every @RegisterPrimOp@
+-- in libexpr and libflake not gated on an experimental feature, under the
+-- name it registers.  @__importNative@ and @__exec@ need
+-- @allow-unsafe-native-code-during-evaluation@ and are not here.
+upstreamBaseEnvNames :: Set.Set Text
+upstreamBaseEnvNames =
+  Set.fromList
+    [ "__add",
+      "__addDrvOutputDependencies",
+      "__addErrorContext",
+      "__all",
+      "__any",
+      "__appendContext",
+      "__attrNames",
+      "__attrValues",
+      "__bitAnd",
+      "__bitOr",
+      "__bitXor",
+      "__catAttrs",
+      "__ceil",
+      "__compareVersions",
+      "__concatLists",
+      "__concatMap",
+      "__concatStringsSep",
+      "__convertHash",
+      "__currentSystem",
+      "__currentTime",
+      "__deepSeq",
+      "__div",
+      "__elem",
+      "__elemAt",
+      "__fetchurl",
+      "__filter",
+      "__filterSource",
+      "__findFile",
+      "__floor",
+      "__foldl'",
+      "__fromJSON",
+      "__functionArgs",
+      "__genList",
+      "__genericClosure",
+      "__getAttr",
+      "__getContext",
+      "__getEnv",
+      "__groupBy",
+      "__hasAttr",
+      "__hasContext",
+      "__hashFile",
+      "__hashString",
+      "__head",
+      "__intersectAttrs",
+      "__isAttrs",
+      "__isBool",
+      "__isFloat",
+      "__isFunction",
+      "__isInt",
+      "__isList",
+      "__isPath",
+      "__isString",
+      "__langVersion",
+      "__length",
+      "__lessThan",
+      "__listToAttrs",
+      "__mapAttrs",
+      "__match",
+      "__mul",
+      "__nixPath",
+      "__nixVersion",
+      "__parseDrvName",
+      "__partition",
+      "__path",
+      "__pathExists",
+      "__readDir",
+      "__readFile",
+      "__readFileType",
+      "__replaceStrings",
+      "__seq",
+      "__sort",
+      "__split",
+      "__splitVersion",
+      "__storeDir",
+      "__storePath",
+      "__stringLength",
+      "__sub",
+      "__substring",
+      "__tail",
+      "__toFile",
+      "__toJSON",
+      "__toPath",
+      "__toXML",
+      "__trace",
+      "__traceVerbose",
+      "__tryEval",
+      "__typeOf",
+      "__unsafeDiscardOutputDependency",
+      "__unsafeDiscardStringContext",
+      "__unsafeGetAttrPos",
+      "__warn",
+      "__zipAttrsWith",
+      "abort",
+      "baseNameOf",
+      "break",
+      "builtins",
+      "derivation",
+      "derivationStrict",
+      "dirOf",
+      "false",
+      "fetchGit",
+      "fetchMercurial",
+      "fetchTarball",
+      "fromTOML",
+      "import",
+      "isNull",
+      "map",
+      "null",
+      "placeholder",
+      "removeAttrs",
+      "scopedImport",
+      "throw",
+      "toString",
+      "true"
+    ]
+
+-- | The two @addConstant@ calls marked @impureOnly@, which upstream skips
+-- under @pure-eval@.
+upstreamImpureOnlyNames :: Set.Set Text
+upstreamImpureOnlyNames = Set.fromList ["__currentSystem", "__currentTime"]
+
+-- | Binding accepts exactly the names upstream's base environment holds,
+-- and the root environment binds exactly the names binding accepts, under
+-- each policy, every one of them to a value that forces.
 testStaticGlobalsSync :: IO [Bool]
 testStaticGlobalsSync = do
   putStrLn "resolve/static-globals-sync"
-  mapM checkBound (Set.toList staticGlobalNames)
+  let pureNames = Set.difference upstreamBaseEnvNames upstreamImpureOnlyNames
+  unrestrictedRoot <- rootEnvNames unrestrictedPolicy
+  pureRoot <- rootEnvNames purePolicy
+  sequence
+    [ runTest "binding accepts upstream's base environment" $
+        assertSameNames "static globals" upstreamBaseEnvNames staticGlobalNames,
+      runTest "pure evaluation drops upstream's impure-only constants" $
+        assertEqual "impure-only" upstreamImpureOnlyNames impureOnlyGlobalNames
+          `andThen` assertSameNames "pure scope" pureNames (rootScopeNames purePolicy),
+      runTest "the root env binds exactly those names" $
+        assertSameNames "root env" upstreamBaseEnvNames unrestrictedRoot
+          `andThen` assertSameNames "pure root env" pureNames pureRoot,
+      runTest "every root env name forces" $
+        assertEqual
+          "names that fail to force"
+          []
+          [ name
+          | name <- Set.toList upstreamBaseEnvNames,
+            evalNix ("builtins.seq " <> name <> " true") /= Right (VBool True)
+          ]
+    ]
   where
-    checkBound name =
-      runTest ("static global '" <> name <> "' is bound in the root env") $
-        assertEval ("global-" <> name) ("builtins.seq " <> name <> " true") (VBool True)
+    rootEnvNames policy = case builtinEnv policy 0 [] of
+      Env envPtr -> do
+        scopePtr <- cenvLazyScope envPtr
+        pure (Set.fromList (attrSetKeys (AttrSet (castPtr scopePtr))))
+    assertSameNames label expected actual =
+      assertEqual
+        (label <> ": (missing, extra)")
+        ([], [])
+        (Set.toList (Set.difference expected actual), Set.toList (Set.difference actual expected))
+
+-- ---------------------------------------------------------------------------
+-- Tests: variables are bound before evaluation (upstream's bindVars)
+-- ---------------------------------------------------------------------------
+
+-- | Assert that binding rejects a source for the named variable, before
+-- anything is evaluated.
+assertUnbound :: Text -> Text -> Text -> TestResult
+assertUnbound label source name = case parseNix testBaseDir "<test>" source of
+  Left err -> assertEqual label (UndefinedVariable name) err
+  Right expr -> Fail (label <> ": bound, got " <> T.pack (show expr))
+
+-- | Assert that every variable in a source binds.
+assertBinds :: Text -> Text -> TestResult
+assertBinds label source = assertRight label (parseNix testBaseDir "<test>" source) (const Pass)
+
+-- | Upstream rejects a variable no scope binds and no @with@ could supply
+-- while binding (nixexpr.cc, ExprVar::bindVars), wherever it sits; only a
+-- name under a @with@ waits for evaluation.  Each expectation here is
+-- nix-instantiate 2.33.2's.
+testUndefinedVariables :: IO [Bool]
+testUndefinedVariables = do
+  putStrLn "resolve/undefined-variables"
+  sequence
+    [ runTest "an unbound variable in an unused let binding is rejected" $
+        assertUnbound "unused-let" "let x = y; in 1" "y",
+      runTest "an unbound variable on a branch not taken is rejected" $
+        assertUnbound "untaken-branch" "if true then 1 else y" "y",
+      runTest "tryEval has nothing to catch: binding fails first" $
+        assertUnbound "tryEval" "builtins.tryEval (let x = y; in 1)" "y",
+      runTest "the failure reads as upstream's" $
+        assertEvalError "message" "builtins.tryEval (let x = y; in 1)" "undefined variable 'y'",
+      runTest "the first unbound variable in source order is reported" $
+        assertUnbound "first" "let a = b; c = d; in 1" "b",
+      runTest "a name under a with binds" $
+        assertBinds "with-binds" "with {}; y",
+      runTest "a name no with supplies fails when evaluated" $
+        assertEvalError "with-eval" "with {}; y" "undefined variable 'y'",
+      runTest "an unused binding may read a name only a with could supply" $
+        assertEval "with-unused" "with {}; let x = y; in 1" (VInt 1),
+      runTest "a with supplies a name a let binding reads" $
+        assertEval "with-let" "with { y = 3; }; let x = y; in x" (VInt 3),
+      runTest "a nested let shadows the enclosing one" $
+        assertEval "let-shadow" "let y = 1; in let y = 2; x = y; in x" (VInt 2),
+      runTest "a nested rec reads the enclosing rec" $
+        assertEval "rec-nested" "rec { a = 1; b = rec { c = a; }.c; }.b" (VInt 1),
+      runTest "a rec reading a name it does not define is rejected" $
+        assertUnbound "rec-missing" "rec { a = b; }" "b",
+      runTest "a lambda formal shadows a with" $
+        assertEval "formal-over-with" "(x: with { x = 2; }; x) 1" (VInt 1),
+      runTest "a formal default reads a sibling formal" $
+        assertEval "formal-default" "({ a, b ? a }: b) { a = 3; }" (VInt 3),
+      runTest "an unbound formal default is rejected" $
+        assertUnbound "formal-default-unbound" "{ a ? b }: a" "b",
+      runTest "inherit of an unbound name in a let is rejected" $
+        assertUnbound "let-inherit" "let inherit x; in 1" "x",
+      runTest "inherit of an unbound name in a set is rejected" $
+        assertUnbound "set-inherit" "{ inherit x; }" "x",
+      runTest "inherit of an unbound name in a rec is rejected" $
+        assertUnbound "rec-inherit" "rec { inherit x; }" "x",
+      runTest "inherit reads a name only a with supplies" $
+        assertEval "with-inherit" "with { x = 5; }; rec { inherit x; }.x" (VInt 5),
+      runTest "inherit under an empty with fails only when selected" $
+        assertEvalError "with-inherit-missing" "with {}; { inherit x; }.x" "undefined variable 'x'",
+      runTest "inherit in a rec reads the enclosing binding, not its own" $
+        assertEval "rec-inherit-outer" "(x: rec { inherit x; y = x; }.y) 4" (VInt 4),
+      runTest "inherit from an unbound source is rejected" $
+        assertUnbound "inherit-from-unbound" "{ inherit (s) x; }" "s",
+      runTest "inherit from selects lazily" $
+        assertEval "inherit-from-lazy" "let s = {}; in builtins.attrNames { inherit (s) x; } == [ \"x\" ]" (VBool True),
+      runTest "inherit from fails when the attribute is selected" $
+        assertEvalFail "inherit-from-missing" "let s = {}; in { inherit (s) x; }.x",
+      runTest "an inherit clause cannot repeat a name" $
+        assertParseFail "inherit-repeat" "let x = 1; in { inherit x x; }",
+      runTest "an inherit-from clause cannot repeat a name" $
+        assertParseFail "inherit-from-repeat" "let s = { x = 1; }; in { inherit (s) x x; }",
+      runTest "__curPos is upstream syntax, not a variable" $
+        assertEval "curpos" "if false then __curPos else 1" (VInt 1),
+      runTest "inherit in a static-key rec reads the enclosing rec" $
+        assertEval "rec-inherit-static" "rec { q = 0; x = 1; y = rec { a = 1; inherit x; }; }.y.x" (VInt 1),
+      runTest "a __-prefixed builtin on a branch not taken binds" $
+        assertEval "prefixed-untaken" "if false then __typeOf 1 else 2" (VInt 2),
+      runTest "a __-prefixed builtin is the builtin" $
+        assertEval "prefixed-value" "__typeOf 1 == \"int\"" (VBool True),
+      runTest "a global is not shadowed by a with" $
+        assertEval "prefixed-over-with" "with { __typeOf = 1; }; __typeOf 2 == \"int\"" (VBool True),
+      runTest "fetchMercurial binds as a builtin" $
+        assertEval "fetchMercurial-binds" "builtins.typeOf fetchMercurial == \"lambda\"" (VBool True),
+      runTest "calling fetchMercurial fails as a builtin nova-nix lacks" $
+        assertEvalError "fetchMercurial-call" "fetchMercurial {}" "unknown builtin 'fetchMercurial'",
+      runTest "pure evaluation leaves upstream's impure-only constants unbound" $
+        assertEqual "pure-currentTime" (Left "undefined variable '__currentTime'") (evalNixWith purePolicy "if false then __currentTime else 1"),
+      runTest "pure evaluation binds the other globals" $
+        assertEqual "pure-typeOf" (Right (VInt 1)) (evalNixWith purePolicy "if false then __typeOf else 1")
+    ]
+
+-- | The same check for files: upstream binds each file as it parses it, so
+-- an import fails on an unbound variable the importing code never reaches,
+-- and @scopedImport@ binds its scope's names around the file.  The inherit
+-- cases whose regression is a self-reference run here too.
+testUndefinedVariablesIO :: IO [Bool]
+testUndefinedVariablesIO = do
+  putStrLn "resolve/undefined-variables-io"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-undefined-variables"
+      branchFile = nixQuotedPath (testDir </> "branch.nix")
+      scopedFile = nixQuotedPath (testDir </> "scoped.nix")
+      scopedWithFile = nixQuotedPath (testDir </> "scoped-with.nix")
+      expectError label source expected = do
+        result <- evalNixIO testDir source
+        runTest label $ case result of
+          Left err -> assertEqual label expected err
+          Right val -> Fail (label <> ": expected an error, got " <> T.pack (show val))
+  bracket_
+    ( do
+        createDirectoryIfMissing True testDir
+        TIO.writeFile (testDir </> "branch.nix") "{ flag }:\nif flag then 1 else unboundName\n"
+        TIO.writeFile (testDir </> "scoped.nix") "if false then notInScope else fromScope\n"
+        TIO.writeFile (testDir </> "scoped-with.nix") "with { fromScope = \"with\"; }; fromScope\n"
+    )
+    ( do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+    )
+    $ sequence
+      [ expectError
+          "an import fails on an unbound variable on a branch not taken"
+          ("(import " <> branchFile <> ") { flag = true; }")
+          "undefined variable 'unboundName'",
+        expectError
+          "tryEval cannot catch an import that fails to bind"
+          ("builtins.tryEval (import " <> branchFile <> ")")
+          "undefined variable 'unboundName'",
+        runTestIO
+          "an import that is never forced does not fail"
+          testDir
+          ("let f = import " <> branchFile <> "; in 1")
+          (VInt 1),
+        expectError
+          "scopedImport binds against its scope"
+          ("builtins.scopedImport { fromScope = 7; } " <> scopedFile)
+          "undefined variable 'notInScope'",
+        runTestIO
+          "scopedImport scope names bind"
+          testDir
+          ("builtins.scopedImport { fromScope = 7; notInScope = 1; } " <> scopedFile)
+          (VInt 7),
+        runTestIO
+          "a scopedImport scope name is not shadowed by a with"
+          testDir
+          ("builtins.scopedImport { fromScope = 7; } " <> scopedWithFile)
+          (VInt 7),
+        -- Evaluated where a self-reference is caught as infinite recursion
+        -- rather than looping, which is what reading the inherited name
+        -- from the rec's own scope used to do.
+        runTestIO
+          "inherit in a dynamic-key rec reads the enclosing rec, not its own"
+          testDir
+          "rec { ${\"q\"} = 0; x = 1; y = rec { ${\"a\"} = 1; inherit x; }; }.y.x"
+          (VInt 1),
+        expectError
+          "inherit of a name no with supplies is undefined, not the rec's own"
+          "with {}; rec { ${\"a\"} = 1; inherit x; }.x"
+          "undefined variable 'x'"
+      ]
 
 -- ---------------------------------------------------------------------------
 -- Main
@@ -13305,6 +13674,8 @@ runSuite = do
           testParserErrors,
           testParserIntegration,
           testStaticGlobalsSync,
+          testUndefinedVariables,
+          testUndefinedVariablesIO,
           testBatch1,
           testBatch2,
           testBatch3,
@@ -13443,8 +13814,8 @@ purePolicy = unrestrictedPolicy {epPureEval = True}
 -- | Parse and evaluate in 'PureEval' with the given policy's builtins
 -- table, for the constants the table itself decides.
 evalNixWith :: EvalPolicy -> Text -> Either Text NixValue
-evalNixWith policy source = case parseNix testBaseDir "<test>" source of
-  Left err -> Left (parseErrorTag <> T.pack (show err))
+evalNixWith policy source = case parseNixWithScope (rootScopeNames policy) testBaseDir "<test>" source of
+  Left err -> Left (sourceFailure err)
   Right expr -> runPureEval (eval (builtinEnv policy 0 []) expr)
 
 -- | The pure rules behind the modes, each pinned to upstream's code at
@@ -13584,16 +13955,13 @@ testEvalPolicyRules = do
           fgaAllRefs = False,
           fgaNarHash = Nothing
         }
-    andThen a b = case a of
-      Pass -> b
-      failed -> failed
 
 -- | 'evalNixIO' under a policy: the roots are allowed first, and the
 -- search path is what the caller passes, as the CLI would pass it.
 evalPolicyIO :: EvalPolicy -> [Text] -> [Thunk] -> FilePath -> Text -> IO (Either Text NixValue)
 evalPolicyIO policy roots searchPaths baseDir source = do
   storeDir <- evalNixIOStoreDir
-  case parseNix baseDir "<test>" source of
+  case parseNixWithScope (rootScopeNames policy) baseDir "<test>" source of
     Left err -> pure (Left (T.pack (show err)))
     Right expr -> do
       st0 <- newEvalState storeDir baseDir
