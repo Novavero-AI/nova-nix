@@ -11,10 +11,11 @@ module Nix.Eval.Operator
     addToFloat,
     nixCompare,
     nixEqual,
-    checkedAdd,
-    checkedSub,
-    checkedMul,
-    divisionOverflowMessage,
+    primAdd,
+    primSub,
+    primMul,
+    primDiv,
+    expectInt,
   )
 where
 
@@ -34,6 +35,7 @@ import Nix.Eval.Types
     attrSetLookup,
     thunkSameRef,
     typeName,
+    typeOfValue,
   )
 import Nix.Expr.Types (BinaryOp (..), UnaryOp (..))
 import System.IO.Unsafe (unsafePerformIO)
@@ -51,9 +53,9 @@ type Force m = Thunk -> m NixValue
 -- equality on compound values.
 evalBinary :: (MonadEval m) => Force m -> BinaryOp -> NixValue -> NixValue -> m NixValue
 evalBinary forceFn op left right = case op of
-  OpSub -> evalArith "subtraction" checkedSub (-) left right
-  OpMul -> evalArith "multiplication" checkedMul (*) left right
-  OpDiv -> evalDiv left right
+  OpSub -> primSub left right
+  OpMul -> primMul left right
+  OpDiv -> primDiv left right
   OpEq -> VBool <$> nixEqual forceFn left right
   OpNeq -> VBool . not <$> nixEqual forceFn left right
   OpLt -> VBool <$> nixCompare forceFn left right
@@ -77,16 +79,12 @@ evalUnary :: (MonadEval m) => UnaryOp -> NixValue -> m NixValue
 evalUnary OpNot val = case val of
   VBool b -> pure (VBool (not b))
   other -> throwEvalError ("cannot apply ! to " <> typeName other)
-evalUnary OpNegate val = case val of
-  -- Upstream's parser turns -e into __sub 0 e (parser.y at 2.24.9), so
-  -- negation is builtins.sub with 0 on the left in every respect: minBound
-  -- reports the checked-subtraction overflow, a float zero comes out
-  -- positive (0 - 0.0, where negate would give -0.0), and a non-number
-  -- fails sub's forceInt on its second argument.
-  VInt n -> either throwEvalError (pure . VInt) (checkedSub 0 n)
-  VFloat n -> pure (VFloat (0.0 - n))
-  other ->
-    throwEvalError ("expected an integer but found " <> typeName other <> ": " <> printValue PrintForError other)
+-- Upstream's parser turns -e into __sub 0 e (parser.y at 2.24.9), so
+-- negation is builtins.sub with 0 on the left in every respect: minBound
+-- reports the checked-subtraction overflow, a float zero comes out positive
+-- (0 - 0.0, where negate would give -0.0), and a non-number fails sub's
+-- forceInt on its second argument.
+evalUnary OpNegate val = primSub (VInt 0) val
 
 -- | @+@ once its left operand is an integer, given the right: upstream's
 -- @ExprConcatStrings::eval@ (eval.cc at 2.24.9) adds a number and refuses
@@ -138,56 +136,66 @@ checkedSub = checkedIntOp "subtracting" "-" (-)
 checkedMul :: Int64 -> Int64 -> Either Text Int64
 checkedMul = checkedIntOp "multiplying" "*" (*)
 
--- | Generic arithmetic for subtraction and multiplication.  The integer
--- side is a checked op ('checkedSub' / 'checkedMul').
-evalArith ::
+-- | Upstream's @forceInt@ on a forced value (eval.cc at 2.24.9).
+expectInt :: (MonadEval m) => NixValue -> m Int64
+expectInt (VInt n) = pure n
+expectInt other = throwEvalError (expectedMessage "an integer" other)
+
+-- | Upstream's @forceFloat@ on a forced value: an integer widens.
+expectFloat :: (MonadEval m) => NixValue -> m Double
+expectFloat (VInt n) = pure (fromIntegral n)
+expectFloat (VFloat x) = pure x
+expectFloat other = throwEvalError (expectedMessage "a float" other)
+
+expectedMessage :: Text -> NixValue -> Text
+expectedMessage wanted other =
+  "expected " <> wanted <> " but found " <> typeName other <> ": " <> printValue PrintForError other
+
+isFloat :: NixValue -> Bool
+isFloat (VFloat _) = True
+isFloat _ = False
+
+-- | @-@, @*@, @builtins.add@, @builtins.sub@ and @builtins.mul@: upstream's
+-- @prim_add@, @prim_sub@ and @prim_mul@ (primops.cc at 2.24.9).  A float on
+-- either side sends both operands through @forceFloat@, and otherwise both
+-- go through @forceInt@, the left first.  @+@ is not among them: upstream
+-- evaluates it as @ExprConcatStrings@ ('addToInteger', 'addToFloat').
+primArith ::
   (MonadEval m) =>
-  Text ->
   (Int64 -> Int64 -> Either Text Int64) ->
   (Double -> Double -> Double) ->
   NixValue ->
   NixValue ->
   m NixValue
-evalArith name checkedOp floatOp left right = case (left, right) of
-  (VInt a, VInt b) -> either throwEvalError (pure . VInt) (checkedOp a b)
-  (VInt a, VFloat b) -> pure (VFloat (floatOp (fromIntegral a) b))
-  (VFloat a, VInt b) -> pure (VFloat (floatOp a (fromIntegral b)))
-  (VFloat a, VFloat b) -> pure (VFloat (floatOp a b))
-  _ ->
-    throwEvalError
-      ( "cannot apply "
-          <> name
-          <> " to "
-          <> typeName left
-          <> " and "
-          <> typeName right
-      )
+primArith checkedOp floatOp left right
+  | isFloat left || isFloat right = VFloat <$> (floatOp <$> expectFloat left <*> expectFloat right)
+  | otherwise = either throwEvalError (pure . VInt) =<< (checkedOp <$> expectInt left <*> expectInt right)
 
--- | Division with zero check.  Integer division uses 'quot'
--- (truncation toward zero, matching C++ Nix semantics).
-evalDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-evalDiv left right = case (left, right) of
-  (VInt _, VInt 0) -> throwEvalError "division by zero"
-  (VInt a, VInt b)
-    -- The one overflowing division: |minBound| has no representation.
-    | a == minBound && b == -1 ->
-        throwEvalError divisionOverflowMessage
-    | otherwise -> pure (VInt (quot a b))
-  (VInt a, VFloat b)
-    | b == 0 -> throwEvalError "division by zero"
-    | otherwise -> pure (VFloat (fromIntegral a / b))
-  (VFloat _, VInt 0) -> throwEvalError "division by zero"
-  (VFloat a, VInt b) -> pure (VFloat (a / fromIntegral b))
-  (VFloat a, VFloat b)
-    | b == 0 -> throwEvalError "division by zero"
-    | otherwise -> pure (VFloat (a / b))
-  _ ->
-    throwEvalError
-      ( "cannot divide "
-          <> typeName left
-          <> " by "
-          <> typeName right
-      )
+primAdd, primSub, primMul :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+primAdd = primArith checkedAdd (+)
+primSub = primArith checkedSub (-)
+primMul = primArith checkedMul (*)
+
+-- | @/@ and @builtins.div@, upstream's @prim_div@: the divisor goes through
+-- @forceFloat@ and is checked for zero before the dividend is looked at,
+-- so @{ } / 0@ is a division by zero.  Integer division truncates toward
+-- zero, as C++ does.
+primDiv :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+primDiv left right = expectFloat right >>= divideBy
+  where
+    divideBy divisor
+      | divisor == 0 = throwEvalError divisionByZeroMessage
+      | isFloat left || isFloat right = VFloat . (/ divisor) <$> expectFloat left
+      | otherwise = either throwEvalError (pure . VInt) =<< (checkedDiv <$> expectInt left <*> expectInt right)
+
+checkedDiv :: Int64 -> Int64 -> Either Text Int64
+checkedDiv a b
+  | b == 0 = Left divisionByZeroMessage
+  | a == minBound && b == -1 = Left divisionOverflowMessage
+  | otherwise = Right (quot a b)
+
+divisionByZeroMessage :: Text
+divisionByZeroMessage = "division by zero"
 
 -- ---------------------------------------------------------------------------
 -- Comparison and equality
@@ -206,13 +214,14 @@ nixCompare _ (VPath a) (VPath b) = pure (a < b)
 -- Lists compare lexicographically, element by element (Nix semantics).
 nixCompare forceFn (VList clA) (VList clB) =
   listCompare forceFn (map Thunk (clistThunks clA)) (map Thunk (clistThunks clB))
-nixCompare _ left right =
-  throwEvalError
-    ( "cannot compare "
-        <> typeName left
-        <> " and "
-        <> typeName right
-    )
+-- Upstream's @CompareValues@ (primops.cc at 2.24.9).  2.33.2 appends the
+-- two values; 2.24.9 does not.
+nixCompare _ left right
+  | typeOfValue left == typeOfValue right =
+      throwEvalError (incomparable <> "; values of that type are incomparable")
+  | otherwise = throwEvalError incomparable
+  where
+    incomparable = "cannot compare " <> typeName left <> " with " <> typeName right
 
 -- | Lexicographic comparison of two thunk lists for the @<@ operator:
 -- the first NON-EQUAL element pair decides via @<@ on that pair, as

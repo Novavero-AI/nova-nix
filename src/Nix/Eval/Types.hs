@@ -87,6 +87,7 @@ module Nix.Eval.Types
 
     -- * Display
     typeName,
+    typeOfValue,
 
     -- * C thunk-state and value tags (mirror cbits/nn_thunk.h)
     pattern ThunkPending,
@@ -1146,6 +1147,23 @@ typeName val = case val of
   -- Only ever an argument inside a 'VBuiltin', and carrying no primop
   -- name, so it takes the name upstream gives the function type itself.
   VCompiledRegex _ -> "a function"
+
+-- | @builtins.typeOf@: the name of upstream's @ValueType@, the
+-- classification its type checks compare (a lambda and a primop are both
+-- @nFunction@).
+typeOfValue :: NixValue -> Text
+typeOfValue val = case val of
+  VInt _ -> "int"
+  VFloat _ -> "float"
+  VBool _ -> "bool"
+  VNull -> "null"
+  VStr _ _ -> "string"
+  VPath _ -> "path"
+  VList _ -> "list"
+  VAttrs _ -> "set"
+  VLambda {} -> "lambda"
+  VBuiltin _ _ -> "lambda"
+  VCompiledRegex _ -> "lambda"
 
 -- ---------------------------------------------------------------------------
 -- Evaluation monad
