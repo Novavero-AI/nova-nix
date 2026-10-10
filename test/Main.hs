@@ -2368,11 +2368,24 @@ testBatch1 = do
           "if (builtins.appendContext \"x\" { \"/nix/store/00000000000000000000000000000000-y\" = { path = true; }; }) == \"x\" then \"ok\" else \"no\""
           (mkStr "ok"),
       -- storePath: the hash component is charset-validated like every
-      -- other store-path parse boundary ('E' is outside nix-base32).
+      -- other store-path parse boundary ('E' is outside nix-base32), and
+      -- refused with upstream's StorePath constructor text (path.cc at
+      -- 2.24.9).
       runTest "storePath rejects a non-base32 hash" $
-        assertEvalFail
+        assertEvalError
           "storePath-badhash"
-          "builtins.storePath \"/nix/store/EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE-x\"",
+          "builtins.storePath \"/nix/store/EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE-x\""
+          "store path 'EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE-x' contains illegal base-32 character 'E'",
+      runTest "storePath refuses a path outside the store" $
+        assertEvalError "storePath-outside" "builtins.storePath \"/x\"" "path '/x' is not in the Nix store",
+      runTest "storePath refuses the store directory itself" $
+        assertEvalError "storePath-storedir" "builtins.storePath \"/nix/store/\"" "path '/nix/store' is not in the Nix store",
+      runTest "storePath refuses a component too short for a hash" $
+        assertEvalError "storePath-short" "builtins.storePath \"/nix/store/x\"" "'x' is too short to be a valid store path",
+      runTest "storePath refuses an empty name" $
+        assertEvalError "storePath-empty-name" "builtins.storePath \"/nix/store/00000000000000000000000000000000-\"" "path '00000000000000000000000000000000-' is not a valid store path: name must not be empty",
+      runTest "storePath refuses an illegal name" $
+        assertEvalError "storePath-bad-name" "builtins.storePath \"/nix/store/00000000000000000000000000000000-a b\"" "path '00000000000000000000000000000000-a b' is not a valid store path: name 'a b' contains illegal character ' '",
       runTest "storePath accepts a valid store path" $
         assertEval
           "storePath-ok"
@@ -12922,6 +12935,33 @@ arenaGuardChild name = case [guardAction path | path <- arenaGuardPaths, guardNa
       Right () -> servedLine
   _ -> hPutStrLn stderr ("unknown arena guard path: " ++ name) >> exitWith (ExitFailure 2)
 
+-- | @builtins.storePath@ resolves a path's symlinks unless the path is
+-- itself a store path (primops.cc at 2.24.9), so a link outside the store
+-- into it names its target.  The links dangle on a runner with no store,
+-- which upstream resolves the same way; Windows needs symlink privilege.
+testStorePathLinksIO :: IO [Bool]
+testStorePathLinksIO = do
+  putStrLn "eval/storepath-links-io"
+  canLink <- symlinksAvailable
+  if not canLink || SI.os == "mingw32"
+    then [] <$ putStrLn "  SKIP  needs POSIX symlinks"
+    else do
+      tmpBase <- Dir.canonicalizePath =<< getTemporaryDirectory
+      let dir = tmpBase </> "nova-nix-test-storepath-links"
+          target = "/nix/store/00000000000000000000000000000000-x"
+          through name = "builtins.storePath (/. + " <> nixQuotedPath (dir </> name) <> ")"
+      Dir.removePathForcibly dir
+      createDirectoryIfMissing True dir
+      Dir.createFileLink target (dir </> "path")
+      Dir.createFileLink (target <> "/bin") (dir </> "sub")
+      results <-
+        sequence
+          [ runTestIO "a link into the store names the store path" dir (through "path") (VStr (TE.encodeUtf8 (T.pack target)) (Context.plainContext (StorePath "00000000000000000000000000000000" "x"))),
+            runTestIO "a link to a subpath names the subpath" dir (through "sub") (VStr (TE.encodeUtf8 (T.pack (target <> "/bin"))) (Context.plainContext (StorePath "00000000000000000000000000000000" "x")))
+          ]
+      Dir.removePathForcibly dir
+      pure results
+
 -- | Run as a child, evaluate one expression under the IO evaluator, which
 -- writes traces and warnings to stderr as it goes, then write its failure
 -- to the same stream, so the parent reads them in the order they came.
@@ -15632,6 +15672,7 @@ runSuite = do
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
           testFirstArgumentOrderIO,
+          testStorePathLinksIO,
           testDerivationFields,
           testDerivationPathFieldsIO,
           testPathArguments,

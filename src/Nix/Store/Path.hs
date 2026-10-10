@@ -47,6 +47,7 @@ module Nix.Store.Path
     parseStorePath,
     parseStorePathPrefix,
     parseStorePathBaseName,
+    storePathBaseNameError,
 
     -- * Name validation
     StorePathNameError (..),
@@ -188,6 +189,21 @@ parseStorePathBaseName basename
               | T.all isNixBase32Char hashPart && validStorePathName name ->
                   Just (StorePath hashPart name)
             _ -> Nothing
+
+-- | Why upstream refuses a base name as a store path: the @BadStorePath@
+-- text its @StorePath@ constructor throws (path.cc at 2.24.9), checking
+-- the length, then the hash's alphabet, then the name.  'Nothing' when
+-- none of those fails, which is every base name 'parseStorePathBaseName'
+-- accepts.  Upstream never looks at the character after the hash, so a
+-- base name wrong only there is refused here and read by upstream.
+storePathBaseNameError :: Text -> Maybe Text
+storePathBaseNameError base
+  | T.length base < storePathHashLen + 1 = Just ("'" <> base <> "' is too short to be a valid store path")
+  | Just c <- T.find (not . isNixBase32Char) (T.take storePathHashLen base) =
+      Just ("store path '" <> base <> "' contains illegal base-32 character '" <> T.singleton c <> "'")
+  | Left err <- checkStorePathName (T.drop (storePathHashLen + 1) base) =
+      Just ("path '" <> base <> "' is not a valid store path: " <> storePathNameUpstreamText err)
+  | otherwise = Nothing
 
 -- | The nix-base32 alphabet: @0-9a-z@ without @e o u t@ (chosen upstream
 -- to avoid accidental words).  Hash components may contain nothing else.
