@@ -48,6 +48,7 @@ import Nix.Eval.CBytecode
     binarySub,
     binaryUpdate,
     bindInherit,
+    bindInheritFrom,
     bindNamed,
     captureNone,
     captureSlots,
@@ -332,15 +333,15 @@ compileExpr = go
         [bindNamed, fi (length path)]
           ++ concatMap (\(t, v) -> [t, v]) compiledKeys
           ++ [valIdx]
-    compileOneBinding (Inherit maybeFrom names) = do
-      (hasFrom, fromIdx) <- case maybeFrom of
-        Nothing -> pure (0 :: Word32, 0 :: Word32)
-        Just fromExpr -> do
-          idx <- go fromExpr
-          pure (1, idx)
+    compileOneBinding (Inherit name var) = do
+      sym <- internName name
+      valIdx <- go var
+      pure [bindInherit, sym, valIdx]
+    compileOneBinding (InheritFrom fromExpr names) = do
+      fromIdx <- go fromExpr
       syms <- mapM internName names
       pure $
-        [bindInherit, hasFrom, fromIdx, fi (length names)]
+        [bindInheritFrom, fromIdx, fi (length names)]
           ++ syms
 
     internName :: Text -> IO Word32
@@ -548,8 +549,9 @@ decodePairs n off = do
 data BcBinding
   = -- | @path = expr@ with attr path keys and value bc_idx
     BcNamed ![BcAttrKey] !Word32
-  | -- | @inherit names@ from surrounding scope (symbol ids)
-    BcInherit ![Word32]
+  | -- | One name of @inherit x@: its symbol and the bc_idx of the variable
+    -- it copies, which is evaluated in the env around the binding set
+    BcInherit !Word32 !Word32
   | -- | @inherit (from) names@ with from-expr bc_idx and name symbols
     BcInheritFrom !Word32 ![Word32]
 
@@ -584,16 +586,16 @@ decodeOneBinding off = do
       valBcIdx <- cbcData valOff
       pure (BcNamed keys valBcIdx, valOff + 1)
     1 {- Inherit -} -> do
-      hasFrom <- cbcData (off + 1)
-      fromBcIdx <- cbcData (off + 2)
-      nameCount <- cbcData (off + 3)
-      syms <- decodeSymList (fromIntegral nameCount) (off + 4)
-      let nextOff = off + 4 + nameCount
-      if hasFrom /= 0
-        then pure (BcInheritFrom fromBcIdx syms, nextOff)
-        else pure (BcInherit syms, nextOff)
+      sym <- cbcData (off + 1)
+      valBcIdx <- cbcData (off + 2)
+      pure (BcInherit sym valBcIdx, off + 3)
+    2 {- InheritFrom -} -> do
+      fromBcIdx <- cbcData (off + 1)
+      nameCount <- cbcData (off + 2)
+      syms <- decodeSymList (fromIntegral nameCount) (off + 3)
+      pure (BcInheritFrom fromBcIdx syms, off + 3 + nameCount)
     -- Unreachable: the tag is written only by this module's binding compiler,
-    -- which emits 0 or 1 - both matched above.
+    -- which emits 0, 1 or 2 - all matched above.
     _ -> error "decodeOneBinding: invalid binding type tag"
 
 -- | Decode attr path keys: pairs of (is_expr, key_or_bc_idx).

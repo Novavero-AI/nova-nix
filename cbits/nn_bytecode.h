@@ -87,8 +87,9 @@
 
 /* --- Binding type tags (data buffer) --- */
 
-#define NN_BIND_NAMED    0
-#define NN_BIND_INHERIT  1
+#define NN_BIND_NAMED         0
+#define NN_BIND_INHERIT       1
+#define NN_BIND_INHERIT_FROM  2
 
 /* --- CaptureInfo type tags (data buffer) --- */
 

@@ -76,8 +76,14 @@ type AttrPath = [AttrKey]
 data Binding
   = -- | @path = expr;@
     NamedBinding !AttrPath !Expr
-  | -- | @inherit expr;@ or @inherit (from) attrs;@
-    Inherit !(Maybe Expr) ![Text]
+  | -- | One name of @inherit x y;@: the attribute and the variable it
+    -- copies, which is bound and evaluated in the scope around the binding
+    -- set rather than in the set itself, so @rec { inherit x; }@ does not
+    -- name itself.  Upstream's parser builds the same pair: an attribute of
+    -- kind Inherited holding an ExprVar.
+    Inherit !Text !Expr
+  | -- | @inherit (from) x y;@
+    InheritFrom !Expr ![Text]
   deriving (Eq, Show)
 
 -- | A single formal parameter with optional default.

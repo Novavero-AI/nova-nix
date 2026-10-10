@@ -19,6 +19,7 @@ module Nix.Builtins
   ( -- * Builtin registration
     builtinEnv,
     builtinEnvWithScope,
+    rootScopeNames,
 
     -- * NIX_PATH parsing
     parseNixPath,
@@ -33,22 +34,31 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (isAsciiLower, isAsciiUpper)
 import Data.Int (Int64)
+import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, builtinNames, currentSystemStr, deferApply, evaluated, readThunkValue)
-import Nix.Eval.Types (EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newCEnv, thunkToCPtr)
-import Nix.Parser (parseNix)
+import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newCEnv, thunkToCPtr)
+import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames)
+import Nix.Parser (parseNixWithScope)
 import Nix.Store.Path (defaultStoreDirText)
 
--- | The initial environment containing all builtins.
+-- | The initial environment: every name upstream's base environment binds
+-- under the policy ('rootScopeNames'), each holding the value @builtins@
+-- holds under that name less a @__@ prefix, as upstream's @addPrimOp@ and
+-- @addConstant@ install one value under both (eval.cc at 2.24.9).  So
+-- @__typeOf@ is @builtins.typeOf@, and @map@ is @builtins.map@.
 --
--- Real Nix exposes a subset of builtins at the top level without
--- the @builtins.@ prefix.  These are the functions most commonly
--- used unqualified in nixpkgs and user code.
+-- @fetchMercurial@ is the one name upstream binds by default that nova-nix
+-- does not implement: it is bound as a builtin of that name, so binding
+-- accepts it and a call fails with the evaluator's unknown-builtin error.
+-- @builtins@ does not list it, so feature tests still see it is missing.
 --
 -- @currentTime@ is an integer constant (seconds since epoch),
 -- passed in at startup.  In tests, pass @0@.
@@ -59,51 +69,22 @@ import Nix.Store.Path (defaultStoreDirText)
 -- The policy decides which constants exist: see 'standardEntries'.
 builtinEnv :: EvalPolicy -> Int64 -> [Thunk] -> Env
 builtinEnv policy timestamp searchPaths =
-  let scope =
-        attrSetFromMap
-          $ Map.fromList
-          $
-          -- Values
-          [ ("true", evaluated (VBool True)),
-            ("false", evaluated (VBool False)),
-            ("null", evaluated VNull),
-            ("builtins", evaluated (builtinsAttrSet policy timestamp searchPaths)),
-            ("derivation", derivationWrapper),
-            -- Search path support: <name> desugars to __findFile __nixPath "name"
-            -- (matching C++ Nix's parser desugaring).
-            ("__findFile", evaluated (VBuiltin "findFile" [])),
-            ("__nixPath", evaluated (VList (clistFromThunks (map thunkToCPtr searchPaths))))
-          ]
-            -- Top-level builtin functions (available without builtins. prefix)
-            ++ map topLevelBuiltin topLevelBuiltinNames
+  let builtinsSet = builtinsAttrSet policy timestamp searchPaths
+      bind name
+        | name == "builtins" = evaluated (VAttrs builtinsSet)
+        | otherwise =
+            let unprefixed = fromMaybe name (T.stripPrefix "__" name)
+             in fromMaybe (evaluated (VBuiltin unprefixed [])) (attrSetLookup unprefixed builtinsSet)
+      scope = attrSetFromMap (Map.fromSet bind (rootScopeNames policy))
    in newCEnv nullPtr 0 (Just scope) Nothing nullPtr 0
 
--- | Builtins exposed at the top level (without @builtins.@ prefix).
--- This matches real Nix - nixpkgs uses these unqualified everywhere.
--- Exactly upstream's unprefixed surface: fetchurl and toFile are
--- deliberately NOT here (upstream exposes them only under @builtins.@,
--- and nixpkgs relies on @with pkgs; fetchurl@ binding pkgs.fetchurl).
--- @derivation@ is unprefixed too, but it is a constant ('derivationWrapper'),
--- not a registry entry.
-topLevelBuiltinNames :: [Text]
-topLevelBuiltinNames =
-  [ "abort",
-    "baseNameOf",
-    "break",
-    "derivationStrict",
-    "dirOf",
-    "fetchGit",
-    "fetchTarball",
-    "fromTOML",
-    "import",
-    "isNull",
-    "map",
-    "placeholder",
-    "removeAttrs",
-    "scopedImport",
-    "throw",
-    "toString"
-  ]
+-- | The names the root environment binds under a policy: upstream's base
+-- environment, which leaves out its @impureOnly@ constants under
+-- @pure-eval@.  Source evaluated in 'builtinEnv' is bound against these.
+rootScopeNames :: EvalPolicy -> Set Text
+rootScopeNames policy
+  | epPureEval policy = staticGlobalNames `Set.difference` impureOnlyGlobalNames
+  | otherwise = staticGlobalNames
 
 -- | Create a top-level binding for a builtin function.
 topLevelBuiltin :: Text -> (Text, Thunk)
@@ -118,9 +99,9 @@ builtinEnvWithScope policy timestamp searchPaths scope =
    in newCEnv nullPtr 0 (Just (attrSetFromMap scopeMap)) (Just base) nullPtr 0
 
 -- | The @builtins@ attribute set, derived from the central registry.
-builtinsAttrSet :: EvalPolicy -> Int64 -> [Thunk] -> NixValue
+builtinsAttrSet :: EvalPolicy -> Int64 -> [Thunk] -> AttrSet
 builtinsAttrSet policy timestamp searchPaths =
-  VAttrs $ attrSetFromMap $ Map.union builtinEntries (standardEntries policy timestamp searchPaths)
+  attrSetFromMap $ Map.union builtinEntries (standardEntries policy timestamp searchPaths)
   where
     builtinEntries =
       Map.fromList [(name, evaluated (VBuiltin name [])) | name <- builtinNames]
@@ -196,17 +177,22 @@ derivationWrapperName = "derivation-internal.nix"
 -- | The bindings the wrapper's free variables resolve to.  Upstream evaluates
 -- the file in its base environment; this is the slice of that environment
 -- the wrapper reads, so the constant needs no knot through 'builtinEnv'.
+-- The wrapper is bound against these names too, so it cannot read one the
+-- slice lacks.
+derivationWrapperScope :: Map Text Thunk
+derivationWrapperScope =
+  let builtinsUsed = ["getAttr", "head", "listToAttrs"]
+   in Map.fromList
+        [ ("derivationStrict", evaluated (VBuiltin "derivationStrict" [])),
+          ("map", evaluated (VBuiltin "map" [])),
+          ("builtins", evaluated (VAttrs (attrSetFromMap (Map.fromList (map topLevelBuiltin builtinsUsed)))))
+        ]
+{-# NOINLINE derivationWrapperScope #-}
+
+-- | 'derivationWrapperScope' as the wrapper's environment.
 derivationWrapperEnv :: Env
 derivationWrapperEnv =
-  let builtinsUsed = ["getAttr", "head", "listToAttrs"]
-      scope =
-        attrSetFromMap $
-          Map.fromList
-            [ ("derivationStrict", evaluated (VBuiltin "derivationStrict" [])),
-              ("map", evaluated (VBuiltin "map" [])),
-              ("builtins", evaluated (VAttrs (attrSetFromMap (Map.fromList (map topLevelBuiltin builtinsUsed)))))
-            ]
-   in newCEnv nullPtr 0 (Just scope) Nothing nullPtr 0
+  newCEnv nullPtr 0 (Just (attrSetFromMap derivationWrapperScope)) Nothing nullPtr 0
 {-# NOINLINE derivationWrapperEnv #-}
 
 -- | The @derivation@ constant: the wrapper lambda closed over
@@ -219,7 +205,7 @@ derivationWrapperEnv =
 -- @derivation@ rather than as a crash while the environment is assembled.
 derivationWrapper :: Thunk
 derivationWrapper =
-  case parseNix "/" derivationWrapperName derivationWrapperSource of
+  case parseNixWithScope (Map.keysSet derivationWrapperScope) "/" derivationWrapperName derivationWrapperSource of
     Right expr -> cheapThunk derivationWrapperEnv expr
     Left err -> abortingThunk ("the derivation wrapper does not parse: " <> T.pack (show err))
 {-# NOINLINE derivationWrapper #-}

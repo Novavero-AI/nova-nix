@@ -190,6 +190,7 @@ import Nix.Eval.Types
     unrestrictedPolicy,
     withScopesForCapture,
   )
+import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types
   ( AttrKey (..),
     BinaryOp (..),
@@ -787,7 +788,7 @@ evalBcAttrs env bcIdx0 = do
 -- frame and cannot make the same shortcut.
 evalBcNonRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> m NixValue
 evalBcNonRecAttrs env bindings = do
-  thunkMap <- buildBcThunkMap cheapThunkBc env bindings
+  thunkMap <- buildBcThunkMap cheapThunkBc env env bindings
   pure (VAttrs (attrSetFromMap thunkMap))
 
 -- | Build a let\/rec frame env, sharing the parent-chain and with-scope
@@ -827,9 +828,9 @@ evalBcRecAttrs env bindings captureInfo
       let scopeCset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
           recEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet scopeCset))
           (staticBs, dynBs) = partition bcBindingIsStatic bindings
-      staticThunks <- buildBcThunkMap mkThunkBc recEnv staticBs
+      staticThunks <- buildBcThunkMap mkThunkBc recEnv env staticBs
       let scopeFilled = fillCAttrSetValues scopeCset staticThunks
-      dynThunks <- scopeFilled `seq` buildBcThunkMap mkThunkBc recEnv dynBs
+      dynThunks <- scopeFilled `seq` buildBcThunkMap mkThunkBc recEnv env dynBs
       -- A dynamic key colliding with a static sibling is an eval error
       -- upstream ("dynamic attribute already defined"), never a merge.
       case Map.keys (Map.intersection dynThunks staticThunks) of
@@ -863,7 +864,7 @@ evalBcLet env bcIdx0 = do
       -- resolve in the let env, which the body also sees.
       let cset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
           letEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet cset))
-      thunkMap <- buildBcThunkMap mkThunkBc letEnv bindings
+      thunkMap <- buildBcThunkMap mkThunkBc letEnv env bindings
       let filled = fillCAttrSetValues cset thunkMap
        in filled `seq` evalBytecode letEnv bodyIdx
 
@@ -873,7 +874,7 @@ allBcPositional :: [BcBinding] -> Bool
 allBcPositional = all isEligible
   where
     isEligible (BcNamed [BcStaticKey _] _) = True
-    isEligible (BcInherit _) = True
+    isEligible (BcInherit _ _) = True
     isEligible (BcInheritFrom _ _) = True
     isEligible _ = False
 
@@ -883,18 +884,22 @@ bcBindingSlotCount :: [BcBinding] -> Int
 bcBindingSlotCount = foldl' countOne 0
   where
     countOne !acc (BcNamed [BcStaticKey _] _) = acc + 1
-    countOne !acc (BcInherit syms) = acc + length syms
+    countOne !acc (BcInherit _ _) = acc + 1
     countOne !acc (BcInheritFrom _ syms) = acc + length syms
     countOne !acc _ = acc
 
 -- | Build thunks for positional bytecode bindings in declaration order.
+-- An inherited variable is read from the enclosing env, as upstream's
+-- @ExprAttrs::eval@ and @ExprLet::eval@ evaluate an Inherited attribute
+-- there through @maybeThunk@ (eval.cc at 2.24.9); that env is fully
+-- built, so the variable's own thunk can be shared now.
 buildBcSlotThunks :: Env -> Env -> [BcBinding] -> [Thunk]
 buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
   where
     slotThunk (BcNamed [BcStaticKey _] valBcIdx) =
       [mkThunkBc recEnv valBcIdx]
-    slotThunk (BcInherit syms) =
-      map (inheritLookup outerEnv . symbolText . Symbol) syms
+    slotThunk (BcInherit _ valBcIdx) =
+      [cheapThunkBc outerEnv valBcIdx]
     slotThunk (BcInheritFrom fromBcIdx syms) =
       -- inherit (from) x y z; becomes one thunk per name that selects from the from-expr.
       -- Each thunk gets a minimal env with the from-value at slot 0.
@@ -916,10 +921,8 @@ buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
     go [] _ !acc = acc
     go (BcNamed [BcStaticKey sym] _ : bs) (t : ts) !acc =
       go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
-    go (BcInherit syms : bs) ts !acc =
-      let (used, rest) = splitAt (length syms) ts
-          accMerged = foldl' (\a (sym, t0) -> Map.insert (symbolText (Symbol sym)) t0 a) acc (zip syms used)
-       in go bs rest accMerged
+    go (BcInherit sym _ : bs) (t : ts) !acc =
+      go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
     go (BcInheritFrom _ syms : bs) ts !acc =
       let (used, rest) = splitAt (length syms) ts
           accMerged = foldl' (\a (sym, t0) -> Map.insert (symbolText (Symbol sym)) t0 a) acc (zip syms used)
@@ -933,9 +936,11 @@ buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
 -- How a value becomes a thunk is the caller's decision: a non-recursive
 -- attr set can resolve constants and in-scope variables immediately, while a
 -- frame that is still being tied has to defer everything, since the slots
--- the variables point at are not filled yet.
-buildBcThunkMap :: (MonadEval m) => (Env -> Word32 -> Thunk) -> Env -> [BcBinding] -> m (Map Text Thunk)
-buildBcThunkMap mkValueThunk thunkEnv = foldM addBinding Map.empty
+-- the variables point at are not filled yet.  An inherited variable is read
+-- from @outerEnv@, the env around the binding set, which is always built
+-- (for a non-recursive set it is @thunkEnv@ itself).
+buildBcThunkMap :: (MonadEval m) => (Env -> Word32 -> Thunk) -> Env -> Env -> [BcBinding] -> m (Map Text Thunk)
+buildBcThunkMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
   where
     addBinding acc (BcNamed keys valBcIdx) = do
       resolvedKeys <- mapM (resolveBcKey thunkEnv) keys
@@ -946,8 +951,8 @@ buildBcThunkMap mkValueThunk thunkEnv = foldM addBinding Map.empty
         Just path ->
           let nested = buildBcNestedAttr thunkEnv path valBcIdx
            in foldM (\a (k, t0) -> insertChecked a k t0) acc (Map.toList nested)
-    addBinding acc (BcInherit syms) =
-      foldM (\a sym -> let name = symbolText (Symbol sym) in insertChecked a name (inheritLookup thunkEnv name)) acc syms
+    addBinding acc (BcInherit sym valBcIdx) =
+      insertChecked acc (symbolText (Symbol sym)) (cheapThunkBc outerEnv valBcIdx)
     addBinding acc (BcInheritFrom fromBcIdx syms) =
       -- inherit (from) name selects name from the from-expr.
       -- Create a small env with the from value at slot 0, then a
@@ -996,7 +1001,7 @@ bcBindingStaticKeys = concatMap oneBinding
   where
     oneBinding (BcNamed (BcStaticKey sym : _) _) = [symbolText (Symbol sym)]
     oneBinding (BcNamed _ _) = []
-    oneBinding (BcInherit syms) = map (symbolText . Symbol) syms
+    oneBinding (BcInherit sym _) = [symbolText (Symbol sym)]
     oneBinding (BcInheritFrom _ syms) = map (symbolText . Symbol) syms
 
 -- | True when a binding's top-level key is known statically (a static key or an
@@ -1005,7 +1010,7 @@ bcBindingStaticKeys = concatMap oneBinding
 bcBindingIsStatic :: BcBinding -> Bool
 bcBindingIsStatic (BcNamed (BcStaticKey _ : _) _) = True
 bcBindingIsStatic (BcNamed _ _) = False
-bcBindingIsStatic (BcInherit _) = True
+bcBindingIsStatic (BcInherit _ _) = True
 bcBindingIsStatic (BcInheritFrom _ _) = True
 
 -- ---------------------------------------------------------------------------
@@ -1048,7 +1053,7 @@ evalVar :: (MonadEval m) => Env -> Text -> m NixValue
 evalVar env name =
   case envLookup name env of
     Just thunk -> force thunk
-    Nothing -> throwEvalError ("undefined variable '" <> name <> "'")
+    Nothing -> throwEvalError (undefinedVariableMessage name)
 
 -- | Evaluate a with-scoped variable: check with-scopes first (innermost
 -- to outermost), then fall back to the standard name-based lookup
@@ -1190,14 +1195,6 @@ buildCaptureEnv env (CapturesWithScopes captureList) =
   let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
       (withArr, withCount) = withScopesForCapture env
    in newCEnv slotsPtr slotCount Nothing Nothing withArr withCount
-
--- | Look up a name in the environment and return its thunk.
--- Used by @inherit@ bindings (both bytecode and Expr paths).
-inheritLookup :: Env -> Text -> Thunk
-inheritLookup env name =
-  case envLookup name env of
-    Just thunk -> thunk
-    Nothing -> error ("inheritLookup: undefined variable '" <> T.unpack name <> "' (unreachable)")
 
 -- ---------------------------------------------------------------------------
 -- Builtin registry (single-definition-site for all builtins)
