@@ -207,7 +207,7 @@ test-suite nova-nix-test
   type:             exitcode-stdio-1.0
   main-is:          Main.hs
   hs-source-dirs:   test
-  other-modules:    FetchurlFixture
+  other-modules:    HttpFixture
   default-language: Haskell2010
   default-extensions:
     OverloadedStrings
