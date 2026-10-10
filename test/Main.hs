@@ -15,6 +15,7 @@ import Control.Exception (AsyncException (..), ErrorCall (..), IOException, Some
 import Control.Monad (filterM, unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as BL
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
@@ -55,7 +56,7 @@ import Nix.Eval.Compile (compileExpr)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
-import Nix.Eval.Print (PrintOptions (..), printValue)
+import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printValue)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
 import Nix.Eval.Types (allocCSlots, buildCSlots, emptyCList)
 import Nix.Expr.Resolve (staticGlobalNames)
@@ -680,6 +681,97 @@ testValuePrinter = do
 genEscapable :: QC.Gen Text
 genEscapable =
   T.concat <$> QC.listOf (QC.elements ["\"", "\\", "\n", "\r", "\t", "$", "{", "}", "${", "a", " ", "\233", "\128512"])
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval - Result printer
+-- ---------------------------------------------------------------------------
+
+-- | What @nova-nix eval@ prints for a value.  Each expected value is the
+-- output of @nix-instantiate --eval --readonly-mode -E@ (Nix 2.33.2) for
+-- the same expression, less the newline the command writes after it.
+testResultPrinter :: IO [Bool]
+testResultPrinter = do
+  putStrLn "eval/print-result"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-print-result"
+      notUtf8 = "a" <> BS.singleton 0xfc <> "b"
+      setup = do
+        createDirectoryIfMissing True testDir
+        BS.writeFile (testDir </> "latin1") notUtf8
+      cleanup = do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+      printsIO label source expected = runTestM label $ do
+        result <- evalNixIO testDir source
+        pure (assertRight label result (assertEqual label expected . renderResult))
+      prints label source expected =
+        runTest label (assertRight label (evalNix source) (assertEqual label expected . renderResult))
+      floatPrints (source, expected) =
+        prints ("a float prints in ostream form: " <> source) source expected
+  bracket_ setup cleanup . sequence $
+    [ printsIO
+        "a string prints its bytes, not U+FFFD for one that is not UTF-8"
+        "builtins.readFile ./latin1"
+        ("\"" <> notUtf8 <> "\""),
+      prints
+        "a string escapes each of upstream's characters and a dollar before a brace"
+        "\"\\\" \\\\ \\n \\r \\t \\${ $\""
+        "\"\\\" \\\\ \\n \\r \\t \\${ $\"",
+      prints "a lone dollar prints as it is" "\"$\"" "\"$\"",
+      prints
+        "an attribute name past ASCII prints quoted, as its bytes"
+        "{ \"\233\" = 1; }"
+        ("{ \"" <> BS.pack [0xc3, 0xa9] <> "\" = 1; }"),
+      prints
+        "an attribute name the lexer cannot read bare prints quoted"
+        "{ \"a b\" = 1; \"if\" = 2; \"\" = 3; \"1x\" = 4; or = 5; \"a-b'\" = 6; _x = 7; \"-a\" = 8; \"'a\" = 9; \"x\\\"y\" = 10; }"
+        "{ \"\" = 3; \"'a\" = 9; \"-a\" = 8; \"1x\" = 4; _x = 7; \"a b\" = 1; a-b' = 6; \"if\" = 2; or = 5; \"x\\\"y\" = 10; }",
+      printsIO
+        "nested lists and sets print their strings and names the same way"
+        "let v = [ (builtins.readFile ./latin1) { \"b c\" = [ \"$\" \"\\${\" ]; } ]; in builtins.deepSeq v v"
+        ("[ \"" <> notUtf8 <> "\" { \"b c\" = [ \"$\" \"\\${\" ]; } ]"),
+      prints "an element never forced prints as upstream's thunk marker" "[ (1 + 1) ]" "[ <CODE> ]",
+      prints "a lambda prints as upstream's marker" "x: x" "<LAMBDA>",
+      prints "a primop prints as upstream's marker" "builtins.map" "<PRIMOP>",
+      prints "a partially applied primop prints as upstream's marker" "builtins.map (x: x)" "<PRIMOP-APP>",
+      prints "a regex builtin given its pattern is a partial application" "builtins.match \"a\"" "<PRIMOP-APP>",
+      runTestM "a printed string reads back as itself" $
+        quickCheckPasses $
+          QC.forAll genEscapable $ \text ->
+            readsBack (renderResult (mkStr text)) (mkStr text),
+      runTestM "a printed attribute name reads back as itself" $
+        quickCheckPasses $
+          QC.forAll genAttrName $ \name ->
+            let attrs = VAttrs (attrSetFromMap (Map.singleton name (evaluated (VInt 1))))
+             in readsBack ("builtins.head (builtins.attrNames " <> renderResult attrs <> ")") (mkStr name)
+    ]
+      <> map floatPrints floatCases
+  where
+    renderResult = BL.toStrict . BB.toLazyByteString . printAmbiguous
+    readsBack printed expected = case TE.decodeUtf8' printed of
+      Left _ -> QC.counterexample "the printed bytes are not UTF-8" False
+      Right source -> evalNix source QC.=== Right expected
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    -- Upstream unary minus is 0 - x, so -0.0 written as a literal is
+    -- positive zero there; fromJSON yields a negative one.
+    floatCases =
+      [ ("1.0", "1"),
+        ("1.5", "1.5"),
+        ("0.1", "0.1"),
+        ("1.0e20", "1e+20"),
+        ("1.23456789", "1.23457"),
+        ("builtins.fromJSON \"-0.0\"", "-0"),
+        ("1234567.0", "1.23457e+06")
+      ]
+
+-- | Attribute names built from what decides whether one prints bare: the
+-- identifier characters in and out of first place, the reserved keywords
+-- and @or@, which is not one, and characters only a quoted name holds.
+genAttrName :: QC.Gen Text
+genAttrName =
+  T.concat <$> QC.listOf (QC.elements ["a", "Z", "_", "0", "'", "-", " ", "\"", "\\", "${", ".", "\233", "if", "in", "inherit", "rec", "or"])
 
 -- ---------------------------------------------------------------------------
 -- Tests: Eval - Recursive attribute sets
@@ -13066,6 +13158,7 @@ runSuite = do
           testEvalLet,
           testEvalAttrs,
           testValuePrinter,
+          testResultPrinter,
           testEvalRecAttrs,
           testEvalLists,
           testEvalLambda,
@@ -13152,7 +13245,8 @@ runSuite = do
           testAbsolutePathStrings,
           testEvalPolicyRules,
           testEvalPolicyIO,
-          testEvalPolicyCLI
+          testEvalPolicyCLI,
+          testResultPrinterCLI
         ]
   let total = length results
       passed = length (filter id results)
@@ -13584,4 +13678,40 @@ testEvalPolicyCLI = do
         expectErr "a read outside the roots fails the command" "" ["eval", "--restrict-eval", "--expr", "builtins.readFile \"" ++ outsideFile ++ "\""] "is forbidden in restricted mode",
         expectErr "a channel: search path entry allows nothing" "" ["eval", "--restrict-eval", "--nix-path", "nixpkgs=channel:nova-probe", "--expr", "builtins.readFile \"" ++ cwdChannelEntry ++ "\""] "is forbidden in restricted mode",
         expectOut "build accepts the flag before its target" "" ["build", "--pure-eval", "--help"] "Usage: nova-nix [--nix-path NAME=PATH] <command>"
+      ]
+
+-- | The eval result through the binary: stdout carries the printer's bytes
+-- and a bare newline, with no text encoding or newline translation between.
+testResultPrinterCLI :: IO [Bool]
+testResultPrinterCLI = do
+  putStrLn "cli/eval-result"
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-result"
+      file = root </> "latin1"
+      notUtf8 = "a" <> BS.singleton 0xfc <> "b"
+      -- A string, as in testEvalPolicyCLI: a drive-letter path is no
+      -- path literal.
+      fileString = T.unpack (canonPathValue (T.pack file))
+      isolated =
+        ("XDG_CONFIG_HOME", root </> "config")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+      evalProcess =
+        (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "eval", "--expr", "builtins.readFile \"" ++ fileString ++ "\""])
+          { Proc.env = Just isolated,
+            Proc.std_out = Proc.CreatePipe
+          }
+  bracket_
+    (forceRemoveIfExists root >> createDirectoryIfMissing True root >> BS.writeFile file notUtf8)
+    (forceRemoveIfExists root)
+    $ sequence
+      [ runTestM "CLI eval writes a string's bytes and a bare newline" $
+          Proc.withCreateProcess evalProcess $ \_ stdoutPipe _ process -> case stdoutPipe of
+            Nothing -> pure (Fail "no stdout pipe")
+            Just out -> do
+              printed <- BS.hGetContents out
+              code <- Proc.waitForProcess process
+              pure $ case code of
+                ExitSuccess -> assertEqual "cli-result" ("\"" <> notUtf8 <> "\"\n") printed
+                ExitFailure _ -> Fail ("CLI: " <> T.pack (show code))
       ]

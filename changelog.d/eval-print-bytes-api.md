@@ -1,0 +1,1 @@
+- **`Nix.Eval.Print` exports `printAmbiguous`, the `ByteString` `Builder` for what `nova-nix eval` prints,** after upstream's printer of the same name.

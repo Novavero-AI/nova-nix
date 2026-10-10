@@ -15,6 +15,7 @@ module Main (main) where
 import Control.Exception (IOException, displayException, try)
 import Control.Monad (join, mfilter, void, (>=>))
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (readIORef)
 import Data.List (find)
@@ -29,13 +30,14 @@ import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, searchPathRoo
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
-import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToAscList, attrSetToMap, eval, evaluated, force, readThunkValue)
+import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToMap, eval, evaluated, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, runEvalIO)
-import Nix.Eval.Types (bytesToTextLossy, clistFromThunks, clistThunks, thunkToCPtr)
+import Nix.Eval.Print (printAmbiguous)
+import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
@@ -46,7 +48,7 @@ import System.Directory (Permissions (executable), XdgDirectory (XdgConfig), can
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure)
 import System.FilePath (isAbsolute, splitSearchPath, takeDirectory, takeFileName, (</>))
-import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
+import System.IO (BufferMode (..), hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 import System.IO.Error (isDoesNotExistError)
 import qualified System.Info as SI
 
@@ -363,8 +365,9 @@ main = do
   hSetBuffering stdout LineBuffering
   -- UTF-8 on both output handles regardless of the console code page:
   -- locale encodings THROW on any character they cannot represent, so a
-  -- store path or eval result containing one would otherwise abort the
-  -- whole invocation mid-print on legacy Windows consoles.
+  -- store path or message containing one would otherwise abort the whole
+  -- invocation mid-print on legacy Windows consoles.  An eval result does
+  -- not pass through this: 'printResult' writes it as bytes.
   hSetEncoding stdout utf8
   hSetEncoding stderr utf8
   -- Initialize C data layer (symbol interning, thunk arena, env allocator)
@@ -536,7 +539,7 @@ evalFile config opts storeDir dataDir rawFilePath = do
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
           exitFailure
-        Right forced -> TIO.putStrLn (prettyValue forced)
+        Right forced -> printResult forced
 
 -- | Evaluate an inline expression and print the result.
 evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
@@ -553,7 +556,7 @@ evalExpr config opts storeDir dataDir source = do
         Left err -> do
           TIO.hPutStrLn stderr ("error: " <> err)
           exitFailure
-        Right forced -> TIO.putStrLn (prettyValue forced)
+        Right forced -> printResult forced
 
 -- | Evaluate an inline expression to a derivation and print its ATerm (.drv
 -- contents), for diffing nova-nix's serialization against upstream Nix.
@@ -1075,45 +1078,11 @@ deepForceValue (VAttrs attrs) = do
   pure (VAttrs (attrSetFromMap (Map.map evaluated forced)))
 deepForceValue val = pure val
 
--- | Nix-style pretty-printing of a fully forced value.
-prettyValue :: NixValue -> T.Text
-prettyValue (VInt n) = T.pack (show n)
-prettyValue (VFloat f) = T.pack (show f)
-prettyValue (VBool True) = "true"
-prettyValue (VBool False) = "false"
-prettyValue VNull = "null"
-prettyValue (VStr s _) = "\"" <> escapeNixString (bytesToTextLossy s) <> "\""
-prettyValue (VPath p) = p
-prettyValue (VList cl) =
-  wrapNixSeq "[" "]" (map (prettyThunk . Thunk) (clistThunks cl))
-prettyValue (VAttrs attrs) =
-  let entries = attrSetToAscList attrs
-      rendered = map (\(k, t) -> k <> " = " <> prettyThunk t <> ";") entries
-   in wrapNixSeq "{" "}" rendered
-prettyValue (VLambda {}) = "<lambda>"
-prettyValue (VBuiltin name _) = "<builtin " <> name <> ">"
-prettyValue (VCompiledRegex _) = "<compiled-regex>"
-
--- | Render a bracketed sequence the way upstream prints one: the brackets are
--- separated from the contents by a space, and an empty sequence is @[ ]@ or
--- @{ }@ rather than the two spaces that a bare join of no elements leaves
--- between them.
-wrapNixSeq :: T.Text -> T.Text -> [T.Text] -> T.Text
-wrapNixSeq open close [] = open <> " " <> close
-wrapNixSeq open close parts = open <> " " <> T.intercalate " " parts <> " " <> close
-
--- | Pretty-print a thunk.  After deep-forcing, all thunks should be
--- computed thunks render their value; pending thunks render as a placeholder.
-prettyThunk :: Thunk -> T.Text
-prettyThunk thunk = maybe "<thunk>" prettyValue (readThunkValue thunk)
-
--- | Escape a string for Nix-style output (quotes, backslashes, newlines, tabs, carriage returns).
-escapeNixString :: T.Text -> T.Text
-escapeNixString = T.concatMap escapeChar
-  where
-    escapeChar '\\' = "\\\\"
-    escapeChar '"' = "\\\""
-    escapeChar '\n' = "\\n"
-    escapeChar '\t' = "\\t"
-    escapeChar '\r' = "\\r"
-    escapeChar c = T.singleton c
+-- | Write an eval result and its newline to stdout as bytes.  A string's
+-- payload need not be UTF-8, so nothing on this path decodes or re-encodes
+-- it: the handle is put in binary mode, as hPutBuilder asks, and no
+-- encoding or newline translation applies.
+printResult :: NixValue -> IO ()
+printResult val = do
+  hSetBinaryMode stdout True
+  BB.hPutBuilder stdout (printAmbiguous val <> BB.char7 '\n')

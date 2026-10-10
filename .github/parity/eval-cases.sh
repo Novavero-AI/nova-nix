@@ -43,18 +43,15 @@ printf "''\n  a\n\n    ''\n" >"$fixture/ind-closer-spaces.nix"
 printf "''\n  \${\"v\"}\n   ''\n" >"$fixture/ind-closer-after-interp.nix"
 printf "''\n\t\ta\n\t\tb\n''\n" >"$fixture/ind-tabs.nix"
 printf "''   \n  a\n''\n" >"$fixture/ind-opener-spaces.nix"
+# A string holding a byte that is not UTF-8, and a name past ASCII.
+printf 'a\374b' >"$fixture/latin1.txt"
+printf '\303\251' >"$fixture/e-acute.txt"
 cp "$repoRoot/pkgs/windows/fetchurl.nix" "$fixture/fetchurl.nix"
 cp "$repoRoot/.github/parity/fetchurl-cases.nix" "$fixture/fetchurl-cases.nix"
 
-# Upstream spells an unforced thunk <CODE>, and newer releases spell it with
-# guillemets; this evaluator spells it <thunk>.  The spelling is not what is
-# under test, so all three become one word.  The guillemet form is built with
-# escapes to keep this file ASCII, as the tree requires.
-guillemetThunk=$(printf '\302\253thunk\302\273')
-normalise() {
-  sed -e 's/<CODE>/<thunk>/g' -e "s/${guillemetThunk}/<thunk>/g"
-}
-
+# Outputs are compared byte for byte, markers included: this evaluator
+# prints an unforced element and a function with the markers upstream's
+# printAmbiguous uses (<CODE>, <LAMBDA>, <PRIMOP>, <PRIMOP-APP>).
 checked=0
 failures=0
 
@@ -62,9 +59,9 @@ check() {
   label=$1
   expr=$2
   checked=$((checked + 1))
-  upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1 | normalise)
+  upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1)
   upstreamStatus=$?
-  nova=$(cd "$fixture" && "$novaBin" eval --nix-path "nix=$repoRoot/data/nix" --expr "$expr" 2>&1 | normalise)
+  nova=$(cd "$fixture" && "$novaBin" eval --nix-path "nix=$repoRoot/data/nix" --expr "$expr" 2>&1)
   novaStatus=$?
   if [ "$upstreamStatus" -eq 0 ] && [ "$novaStatus" -eq 0 ] && [ "$upstream" = "$nova" ]; then
     printf '  ok    %s\n' "$label"
@@ -100,6 +97,23 @@ check "a nested list" '[ [ 1 2 ] ]'
 check "an empty list as an element" '[ [ ] ]'
 check "attrset values" '{ a = 1; b = "s"; }'
 check "map over a list" 'builtins.map (x: x * x) [ 1 2 3 ]'
+echo
+
+echo "== what a string and an attribute name print as =="
+check "a byte that is not UTF-8" 'builtins.readFile ./latin1.txt'
+# The ${ is Nix's, escaped in the string under test, not the shell's.
+# shellcheck disable=SC2016
+check "the characters a string escapes" '"\" \\ \n \r \t \${ $"'
+check "names the lexer cannot read bare" '{ "a b" = 1; "if" = 2; "" = 3; "1x" = 4; or = 5; _x = 6; }'
+check "a name past ASCII" 'builtins.listToAttrs [ { name = builtins.readFile ./e-acute.txt; value = 1; } ]'
+echo
+
+echo "== what a float and a function print as =="
+check "floats in a default ostream's six-digit form" '[ 1.0 1.5 0.1 1.0e20 1.23456789 1234567.0 0.00001 ]'
+check "a negative zero" 'builtins.fromJSON "-0.0"'
+check "a lambda" 'x: x'
+check "a primop" 'builtins.map'
+check "a partially applied primop" 'builtins.map (x: x)'
 echo
 
 echo "== whitespace an indented string strips =="
