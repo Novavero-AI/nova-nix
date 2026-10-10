@@ -14,8 +14,8 @@
 -- cthunkInit 0
 -- ptr <- cthunkNew pendingStablePtr
 -- cthunkState ptr  -- 0 (PENDING)
--- cthunkMarkBlackhole ptr  -- 1 (success)
--- cthunkSetComputed ptr valueStablePtr  -- returns old pending ptr
+-- cthunkMarkBlackhole ptr  -- True (was PENDING)
+-- cthunkSetComputed ptr valueStablePtr  -- True (was not yet COMPUTED)
 -- cthunkState ptr  -- 1 (COMPUTED)
 -- cthunkDestroy
 -- @
@@ -33,14 +33,16 @@ module Nix.Eval.CThunk
     cthunkNewComputed,
     cthunkNewComputedInt,
     cthunkNewComputedFloat,
-    cthunkNewComputedBool,
-    cthunkNewComputedNull,
     cthunkNewComputedStr,
     cthunkNewComputedPath,
     cthunkNewComputedList,
     cthunkNewComputedAttrs,
     cthunkNewComputedCtxStr,
     cthunkNewComputedLambda,
+
+    -- * Shared constants
+    cthunkNull,
+    cthunkBool,
 
     -- * State queries
     cthunkState,
@@ -108,7 +110,7 @@ foreign import ccall unsafe "nn_thunk_get_bc_idx"
   c_nn_thunk_get_bc_idx :: CThunkPtr -> IO Word32
 
 foreign import ccall unsafe "nn_thunk_set_payload"
-  c_nn_thunk_set_payload :: CThunkPtr -> Ptr () -> IO ()
+  c_nn_thunk_set_payload :: CThunkPtr -> Ptr () -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_new_computed"
   c_nn_thunk_new_computed :: Ptr () -> IO CThunkPtr
@@ -118,12 +120,6 @@ foreign import ccall unsafe "nn_thunk_new_computed_int"
 
 foreign import ccall unsafe "nn_thunk_new_computed_float"
   c_nn_thunk_new_computed_float :: CDouble -> IO CThunkPtr
-
-foreign import ccall unsafe "nn_thunk_new_computed_bool"
-  c_nn_thunk_new_computed_bool :: Word8 -> IO CThunkPtr
-
-foreign import ccall unsafe "nn_thunk_new_computed_null"
-  c_nn_thunk_new_computed_null :: IO CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_new_computed_str"
   c_nn_thunk_new_computed_str :: Word32 -> IO CThunkPtr
@@ -142,6 +138,17 @@ foreign import ccall unsafe "nn_thunk_new_computed_ctxstr"
 
 foreign import ccall unsafe "nn_thunk_new_computed_lambda"
   c_nn_thunk_new_computed_lambda :: Ptr () -> IO CThunkPtr
+
+-- The shared cells are C statics, one address for the life of the
+-- process, so these imports are pure: no arena window, nor its absence,
+-- changes what they return.
+
+-- | The shared COMPUTED @null@ thunk.
+foreign import ccall unsafe "nn_thunk_null"
+  cthunkNull :: CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_bool"
+  c_nn_thunk_bool :: Word8 -> CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_state"
   c_nn_thunk_state :: CThunkPtr -> IO Word8
@@ -186,37 +193,37 @@ foreign import ccall unsafe "nn_thunk_mark_pending"
   c_nn_thunk_mark_pending :: CThunkPtr -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed"
-  c_nn_thunk_set_computed :: CThunkPtr -> Ptr () -> IO (Ptr ())
+  c_nn_thunk_set_computed :: CThunkPtr -> Ptr () -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_int"
-  c_nn_thunk_set_computed_int :: CThunkPtr -> Int64 -> IO (Ptr ())
+  c_nn_thunk_set_computed_int :: CThunkPtr -> Int64 -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_float"
-  c_nn_thunk_set_computed_float :: CThunkPtr -> CDouble -> IO (Ptr ())
+  c_nn_thunk_set_computed_float :: CThunkPtr -> CDouble -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_bool"
-  c_nn_thunk_set_computed_bool :: CThunkPtr -> Word8 -> IO (Ptr ())
+  c_nn_thunk_set_computed_bool :: CThunkPtr -> Word8 -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_null"
-  c_nn_thunk_set_computed_null :: CThunkPtr -> IO (Ptr ())
+  c_nn_thunk_set_computed_null :: CThunkPtr -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_str"
-  c_nn_thunk_set_computed_str :: CThunkPtr -> Word32 -> IO (Ptr ())
+  c_nn_thunk_set_computed_str :: CThunkPtr -> Word32 -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_path"
-  c_nn_thunk_set_computed_path :: CThunkPtr -> Word32 -> IO (Ptr ())
+  c_nn_thunk_set_computed_path :: CThunkPtr -> Word32 -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_list"
-  c_nn_thunk_set_computed_list :: CThunkPtr -> Ptr () -> IO (Ptr ())
+  c_nn_thunk_set_computed_list :: CThunkPtr -> Ptr () -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_attrs"
-  c_nn_thunk_set_computed_attrs :: CThunkPtr -> Ptr () -> IO (Ptr ())
+  c_nn_thunk_set_computed_attrs :: CThunkPtr -> Ptr () -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_ctxstr"
-  c_nn_thunk_set_computed_ctxstr :: CThunkPtr -> Ptr () -> IO (Ptr ())
+  c_nn_thunk_set_computed_ctxstr :: CThunkPtr -> Ptr () -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_lambda"
-  c_nn_thunk_set_computed_lambda :: CThunkPtr -> Ptr () -> IO (Ptr ())
+  c_nn_thunk_set_computed_lambda :: CThunkPtr -> Ptr () -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_count"
   c_nn_thunk_count :: IO Word32
@@ -257,9 +264,11 @@ cthunkNewBc bcIdx envPtr = checkedCPtr "nn_thunk_new_bc" =<< c_nn_thunk_new_bc b
 cthunkGetBcIdx :: CThunkPtr -> IO Word32
 cthunkGetBcIdx = c_nn_thunk_get_bc_idx
 
--- | Set the payload of a thunk (deferred env fixup for knot-tying).
-cthunkSetPayload :: CThunkPtr -> Ptr () -> IO ()
-cthunkSetPayload = c_nn_thunk_set_payload
+-- | Set the payload of a PENDING thunk (deferred env fixup for
+-- knot-tying).  'False' when the thunk is not PENDING and was left as it
+-- was, which keeps the shared constant cells unwritten.
+cthunkSetPayload :: CThunkPtr -> Ptr () -> IO Bool
+cthunkSetPayload ptr payload = accepted <$> c_nn_thunk_set_payload ptr payload
 
 -- | Allocate a new pre-COMPUTED thunk with StablePtr payload (complex types).
 cthunkNewComputed :: Ptr () -> IO CThunkPtr
@@ -272,14 +281,6 @@ cthunkNewComputedInt n = checkedCPtr "nn_thunk_new_computed_int" =<< c_nn_thunk_
 -- | Allocate a pre-COMPUTED thunk with an inline double (no StablePtr).
 cthunkNewComputedFloat :: Double -> IO CThunkPtr
 cthunkNewComputedFloat d = checkedCPtr "nn_thunk_new_computed_float" =<< c_nn_thunk_new_computed_float (CDouble d)
-
--- | Allocate a pre-COMPUTED thunk with an inline bool (no StablePtr).
-cthunkNewComputedBool :: Word8 -> IO CThunkPtr
-cthunkNewComputedBool b = checkedCPtr "nn_thunk_new_computed_bool" =<< c_nn_thunk_new_computed_bool b
-
--- | Allocate a pre-COMPUTED thunk with null value (no StablePtr).
-cthunkNewComputedNull :: IO CThunkPtr
-cthunkNewComputedNull = checkedCPtr "nn_thunk_new_computed_null" =<< c_nn_thunk_new_computed_null
 
 -- | Allocate a pre-COMPUTED thunk with an interned string symbol (no StablePtr).
 -- For context-free strings only (tag 4).
@@ -307,6 +308,18 @@ cthunkNewComputedCtxStr ctxstr = checkedCPtr "nn_thunk_new_computed_ctxstr" =<< 
 -- For lambda closures (tag 9).
 cthunkNewComputedLambda :: Ptr () -> IO CThunkPtr
 cthunkNewComputedLambda lambda = checkedCPtr "nn_thunk_new_computed_lambda" =<< c_nn_thunk_new_computed_lambda lambda
+
+-- ---------------------------------------------------------------------------
+-- Shared constants
+-- ---------------------------------------------------------------------------
+
+-- | The shared COMPUTED @true@ or @false@ thunk.
+cthunkBool :: Bool -> CThunkPtr
+cthunkBool b = if b then trueCell else falseCell
+
+trueCell, falseCell :: CThunkPtr
+trueCell = c_nn_thunk_bool 1
+falseCell = c_nn_thunk_bool 0
 
 -- ---------------------------------------------------------------------------
 -- State queries
@@ -372,63 +385,67 @@ cthunkGetLambda = c_nn_thunk_get_lambda
 -- | Mark a PENDING thunk as BLACKHOLE (being evaluated).
 -- Returns 'True' on success, 'False' if not PENDING.
 cthunkMarkBlackhole :: CThunkPtr -> IO Bool
-cthunkMarkBlackhole ptr = do
-  result <- c_nn_thunk_mark_blackhole ptr
-  pure (result /= 0)
+cthunkMarkBlackhole ptr = accepted <$> c_nn_thunk_mark_blackhole ptr
 
 -- | Restore a BLACKHOLE thunk to PENDING after a caught throw during its force,
 -- so a later force re-evaluates instead of misreporting infinite recursion.
 -- Returns 'True' on success, 'False' if the thunk was not BLACKHOLE.
 cthunkMarkPending :: CThunkPtr -> IO Bool
-cthunkMarkPending ptr = do
-  result <- c_nn_thunk_mark_pending ptr
-  pure (result /= 0)
+cthunkMarkPending ptr = accepted <$> c_nn_thunk_mark_pending ptr
 
--- | Set a BLACKHOLE thunk to COMPUTED with a StablePtr value (complex types).
--- Returns the old payload (pending StablePtr to free), or 'nullPtr'
--- if the thunk was not in BLACKHOLE state.
-cthunkSetComputed :: CThunkPtr -> Ptr () -> IO (Ptr ())
-cthunkSetComputed = c_nn_thunk_set_computed
+-- The setters below store a value in a thunk that is not yet COMPUTED and
+-- answer 'True', or leave a COMPUTED thunk as it was and answer 'False'.
+-- They do not hand back the pending payload: the forcing caller read it
+-- to evaluate the thunk, and frees that StablePtr itself.
 
--- | Set a BLACKHOLE thunk to COMPUTED with an inline int64 (no StablePtr).
-cthunkSetComputedInt :: CThunkPtr -> Int64 -> IO (Ptr ())
-cthunkSetComputedInt = c_nn_thunk_set_computed_int
+-- | Store a StablePtr value (complex types).
+cthunkSetComputed :: CThunkPtr -> Ptr () -> IO Bool
+cthunkSetComputed ptr value = accepted <$> c_nn_thunk_set_computed ptr value
 
--- | Set a BLACKHOLE thunk to COMPUTED with an inline double (no StablePtr).
-cthunkSetComputedFloat :: CThunkPtr -> Double -> IO (Ptr ())
-cthunkSetComputedFloat ptr d = c_nn_thunk_set_computed_float ptr (CDouble d)
+-- | Store an inline int64 (no StablePtr).
+cthunkSetComputedInt :: CThunkPtr -> Int64 -> IO Bool
+cthunkSetComputedInt ptr n = accepted <$> c_nn_thunk_set_computed_int ptr n
 
--- | Set a BLACKHOLE thunk to COMPUTED with an inline bool (no StablePtr).
-cthunkSetComputedBool :: CThunkPtr -> Word8 -> IO (Ptr ())
-cthunkSetComputedBool = c_nn_thunk_set_computed_bool
+-- | Store an inline double (no StablePtr).
+cthunkSetComputedFloat :: CThunkPtr -> Double -> IO Bool
+cthunkSetComputedFloat ptr d = accepted <$> c_nn_thunk_set_computed_float ptr (CDouble d)
 
--- | Set a BLACKHOLE thunk to COMPUTED with null value (no StablePtr).
-cthunkSetComputedNull :: CThunkPtr -> IO (Ptr ())
-cthunkSetComputedNull = c_nn_thunk_set_computed_null
+-- | Store an inline bool (no StablePtr).
+cthunkSetComputedBool :: CThunkPtr -> Word8 -> IO Bool
+cthunkSetComputedBool ptr b = accepted <$> c_nn_thunk_set_computed_bool ptr b
 
--- | Set a non-COMPUTED thunk to COMPUTED with an interned string symbol.
-cthunkSetComputedStr :: CThunkPtr -> Word32 -> IO (Ptr ())
-cthunkSetComputedStr = c_nn_thunk_set_computed_str
+-- | Store null (no StablePtr).
+cthunkSetComputedNull :: CThunkPtr -> IO Bool
+cthunkSetComputedNull ptr = accepted <$> c_nn_thunk_set_computed_null ptr
 
--- | Set a non-COMPUTED thunk to COMPUTED with an interned path symbol.
-cthunkSetComputedPath :: CThunkPtr -> Word32 -> IO (Ptr ())
-cthunkSetComputedPath = c_nn_thunk_set_computed_path
+-- | Store an interned string symbol.
+cthunkSetComputedStr :: CThunkPtr -> Word32 -> IO Bool
+cthunkSetComputedStr ptr sym = accepted <$> c_nn_thunk_set_computed_str ptr sym
 
--- | Set a non-COMPUTED thunk to COMPUTED with a CList pointer.
-cthunkSetComputedList :: CThunkPtr -> Ptr () -> IO (Ptr ())
-cthunkSetComputedList = c_nn_thunk_set_computed_list
+-- | Store an interned path symbol.
+cthunkSetComputedPath :: CThunkPtr -> Word32 -> IO Bool
+cthunkSetComputedPath ptr sym = accepted <$> c_nn_thunk_set_computed_path ptr sym
 
--- | Set a non-COMPUTED thunk to COMPUTED with a CAttrSet pointer.
-cthunkSetComputedAttrs :: CThunkPtr -> Ptr () -> IO (Ptr ())
-cthunkSetComputedAttrs = c_nn_thunk_set_computed_attrs
+-- | Store a CList pointer.
+cthunkSetComputedList :: CThunkPtr -> Ptr () -> IO Bool
+cthunkSetComputedList ptr list = accepted <$> c_nn_thunk_set_computed_list ptr list
 
--- | Set a non-COMPUTED thunk to COMPUTED with a CCtxStr pointer.
-cthunkSetComputedCtxStr :: CThunkPtr -> Ptr () -> IO (Ptr ())
-cthunkSetComputedCtxStr = c_nn_thunk_set_computed_ctxstr
+-- | Store a CAttrSet pointer.
+cthunkSetComputedAttrs :: CThunkPtr -> Ptr () -> IO Bool
+cthunkSetComputedAttrs ptr attrs = accepted <$> c_nn_thunk_set_computed_attrs ptr attrs
 
--- | Set a non-COMPUTED thunk to COMPUTED with a CLambda pointer.
-cthunkSetComputedLambda :: CThunkPtr -> Ptr () -> IO (Ptr ())
-cthunkSetComputedLambda = c_nn_thunk_set_computed_lambda
+-- | Store a CCtxStr pointer.
+cthunkSetComputedCtxStr :: CThunkPtr -> Ptr () -> IO Bool
+cthunkSetComputedCtxStr ptr ctxstr = accepted <$> c_nn_thunk_set_computed_ctxstr ptr ctxstr
+
+-- | Store a CLambda pointer.
+cthunkSetComputedLambda :: CThunkPtr -> Ptr () -> IO Bool
+cthunkSetComputedLambda ptr lambda = accepted <$> c_nn_thunk_set_computed_lambda ptr lambda
+
+-- | A transition's C answer: 1 when it ran, 0 when the thunk's state
+-- refused it.
+accepted :: CInt -> Bool
+accepted = (/= 0)
 
 -- ---------------------------------------------------------------------------
 -- Arena diagnostics / cleanup

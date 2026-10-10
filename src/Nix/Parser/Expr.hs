@@ -567,10 +567,9 @@ data NormEntry
 -- | How a name was defined, for duplicate checking.
 data DefKind = DefStatic | DefInherit
 
--- | Normalize a binding list the way upstream's parser (@addAttr@) does:
+-- | Normalize a binding list the way upstream's parser (@addAttr@) does,
+-- over bindings 'parseNamedBinding' has already hoisted to one key each:
 --
--- * a nested attrpath (@a.b.c = v@) hoists into nested attrset literals
---   under its first key (@a = { b = { c = v; }; }@);
 -- * two definitions of one key merge recursively when BOTH values are
 --   attrset literals - so @a.b = 1; a.c = 2;@ and @a = { b = 1; }; a.c = 2;@
 --   both work, with inner duplicates checked recursively.  A @rec@ marker
@@ -592,12 +591,12 @@ normalizeBindings bindings =
 -- | Pure core of 'normalizeBindings'; recurses into merged literals.
 normalizeBindingList :: [Binding] -> Either Text [Binding]
 normalizeBindingList bindings = do
-  (entriesRev, _defined) <- foldM step ([], Map.empty) (map canonicalBinding bindings)
+  (entriesRev, _defined) <- foldM step ([], Map.empty) bindings
   pure (map renderEntry (reverse entriesRev))
   where
     step :: ([NormEntry], Map Text DefKind) -> Binding -> Either Text ([NormEntry], Map Text DefKind)
     step (entries, defined) binding = case binding of
-      NamedBinding [StaticKey key] value ->
+      NamedBinding (StaticKey key) value ->
         case Map.lookup key defined of
           Nothing ->
             Right (StaticEntry key value : entries, Map.insert key DefStatic defined)
@@ -638,26 +637,26 @@ normalizeBindingList bindings = do
         <$> normalizeBindingList (existingBindings ++ newBindings)
     mergeAttrValues key _ _ = Left (duplicateAttr key)
 
-    renderEntry (StaticEntry key value) = NamedBinding [StaticKey key] value
+    renderEntry (StaticEntry key value) = NamedBinding (StaticKey key) value
     renderEntry (InheritEntry b) = b
     renderEntry (DynamicEntry b) = b
 
     duplicateAttr key = "attribute '" <> key <> "' already defined"
 
--- | Hoist a nested attrpath under its first key: @a.b.c = v@ becomes
--- @a = { b = { c = v; }; }@, one literal per level.
-canonicalBinding :: Binding -> Binding
-canonicalBinding (NamedBinding (firstKey : rest@(_ : _)) value) =
-  NamedBinding [firstKey] (EAttrs False [canonicalBinding (NamedBinding rest value)] NoCaptureInfo)
-canonicalBinding b = b
-
+-- | @a.b.c = v;@ as one binding under its first key, the rest of the
+-- path hoisted into nested set literals, one per level: @a = { b = { c =
+-- v; }; };@, as upstream's @addAttr@ builds them.
 parseNamedBinding :: Parser Binding
 parseNamedBinding = do
-  path <- parseAttrPath
+  firstKey <- parseAttrKey
+  rest <- pMany (expect TokDot >> parseAttrKey)
   expect TokAssign
   val <- parseExpr
   expect TokSemicolon
-  pure (NamedBinding path val)
+  pure (NamedBinding firstKey (nestUnder rest val))
+  where
+    nestUnder [] value = value
+    nestUnder (key : keys) value = EAttrs False [NamedBinding key (nestUnder keys value)] NoCaptureInfo
 
 -- | An @inherit@ clause: one 'InheritFrom' for @inherit (from) x y;@, one
 -- 'Inherit' per name for @inherit x y;@, each holding the variable it copies.
@@ -793,7 +792,7 @@ parseLetBindings = go [] >>= normalizeBindings
           -- nested dynamic keys (let a.${k} = 1) live in a nested attrset
           -- and are fine.
           case binding of
-            NamedBinding (DynamicKey _ : _) _ ->
+            NamedBinding (DynamicKey _) _ ->
               parseError "dynamic attributes not allowed in let"
             _ -> go (binding : acc)
 

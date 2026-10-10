@@ -7,6 +7,11 @@
 -- Lists are immutable after construction: allocate with 'clistNew',
 -- fill with 'clistSet', then read with 'clistGet'/'clistCount'.
 -- All memory is freed in bulk via 'clistFreeAll' at evaluation end.
+--
+-- 'nullPtr' is the empty list, so the C constructors report failure
+-- through a status of their own rather than a NULL, and every one is
+-- checked here: a list the C side cannot allocate raises
+-- 'Nix.Eval.CStatus.CStatusError', never reads back as empty.
 module Nix.Eval.CList
   ( -- * Opaque handle
     NnList,
@@ -36,9 +41,13 @@ module Nix.Eval.CList
   )
 where
 
+import Control.Monad (unless)
 import Data.Word (Word32)
+import Foreign.C.Types (CInt (..))
+import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, nullPtr)
-import Nix.Eval.CStatus (checkedCPtr)
+import Foreign.Storable (peek)
+import Nix.Eval.CStatus (cStatusFailure)
 import Nix.Eval.CThunk (CThunkPtr)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -53,7 +62,7 @@ type CListPtr = Ptr NnList
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_list_new"
-  c_nn_list_new :: Word32 -> IO CListPtr
+  c_nn_list_new :: Ptr CListPtr -> Word32 -> IO CInt
 
 foreign import ccall unsafe "nn_list_free_all"
   c_nn_list_free_all :: IO ()
@@ -68,16 +77,25 @@ foreign import ccall unsafe "nn_list_set"
   c_nn_list_set :: CListPtr -> Word32 -> CThunkPtr -> IO ()
 
 foreign import ccall unsafe "nn_list_drop"
-  c_nn_list_drop :: CListPtr -> Word32 -> IO CListPtr
+  c_nn_list_drop :: Ptr CListPtr -> CListPtr -> Word32 -> IO CInt
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
--- | Allocate a new list with space for @count@ thunk pointers.
--- Returns 'nullPtr' if count is 0.
+-- | Allocate a new list with space for @count@ thunk pointers, or
+-- 'nullPtr' (the empty list) when count is 0.  Raises
+-- 'Nix.Eval.CStatus.CStatusError' when the C side cannot allocate it.
 clistNew :: Word32 -> IO CListPtr
-clistNew = c_nn_list_new
+clistNew count = alloca $ \out -> do
+  checkedListStatus "nn_list_new" =<< c_nn_list_new out count
+  peek out
+
+-- | Raise the 'Nix.Eval.CStatus.CStatusError' for a list constructor's
+-- failure status.
+checkedListStatus :: String -> CInt -> IO ()
+checkedListStatus site status =
+  unless (status == 0) (cStatusFailure site "list allocation failed")
 
 -- | Free all tracked list headers (arena-style cleanup).
 -- Items arrays are freed by the env page allocator.
@@ -106,16 +124,20 @@ clistSet = c_nn_list_set
 
 -- | Convert a Haskell list of 'CThunkPtr' to a C list.
 -- Allocates a new nn_list_t and fills it with the thunk pointers.
--- Returns 'nullPtr' for empty lists; for a non-empty one a NULL from
--- @nn_list_new@ is an allocation failure, not an empty list.
+-- Returns 'nullPtr' for empty lists.  A list longer than the C count
+-- can hold is refused rather than wrapped to a shorter allocation that
+-- the fill would then run past.
 thunkListToCList :: [CThunkPtr] -> IO CListPtr
 thunkListToCList [] = pure nullPtr
-thunkListToCList ptrs = do
-  let n = fromIntegral (length ptrs)
-  clist <- checkedCPtr "nn_list_new" =<< clistNew n
-  fillList clist 0 ptrs
-  pure clist
+thunkListToCList ptrs
+  | len > fromIntegral (maxBound :: Word32) =
+      cStatusFailure "nn_list_new" ("a list of " ++ show len ++ " elements is past the uint32_t count a C list holds")
+  | otherwise = do
+      clist <- clistNew (fromIntegral len)
+      fillList clist 0 ptrs
+      pure clist
   where
+    len = length ptrs
     fillList _ _ [] = pure ()
     fillList cl !i (p : ps) = do
       clistSet cl i p
@@ -189,4 +211,8 @@ clistDrop :: Int -> CList -> CList
 clistDrop n cl@(CList p)
   | n <= 0 = cl
   | n >= clistLen cl = emptyCList
-  | otherwise = CList (unsafePerformIO (checkedCPtr "nn_list_drop" =<< c_nn_list_drop p (fromIntegral n)))
+  | otherwise = CList (unsafePerformIO (alloca dropInto))
+  where
+    dropInto out = do
+      checkedListStatus "nn_list_drop" =<< c_nn_list_drop out p (fromIntegral n)
+      peek out

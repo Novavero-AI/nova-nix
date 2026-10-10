@@ -9,7 +9,6 @@
 #include "nn_ctxstr.h"
 #include "nn_assert.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,23 +20,23 @@ static nn_ctxstr_t **g_tracked = NULL;
 static uint32_t      g_tracked_count = 0;
 static uint32_t      g_tracked_capacity = 0;
 
-static void
+/* Returns 0, or -1 when the tracking array cannot grow. */
+static int
 track(nn_ctxstr_t *s)
 {
     if (g_tracked_count >= g_tracked_capacity) {
+        if (g_tracked_capacity > UINT32_MAX / 2) return -1;
         uint32_t new_cap = g_tracked_capacity == 0
                                ? NN_CTXSTR_INITIAL_CAPACITY
                                : g_tracked_capacity * 2;
         nn_ctxstr_t **new_arr = (nn_ctxstr_t **)realloc(
             g_tracked, (size_t)new_cap * sizeof(nn_ctxstr_t *));
-        if (!new_arr) {
-            fprintf(stderr, "nn_ctxstr_track: realloc failed\n");
-            abort();
-        }
+        if (!new_arr) return -1;
         g_tracked = new_arr;
         g_tracked_capacity = new_cap;
     }
     g_tracked[g_tracked_count++] = s;
+    return 0;
 }
 
 /* --- Lifecycle --- */
@@ -57,7 +56,10 @@ nn_ctxstr_new(uint32_t text, uint32_t ctx_count)
     s->text = text;
     s->ctx_count = ctx_count;
     memset(s->ctx, 0, (size_t)ctx_count * sizeof(nn_sce_t));
-    track(s);
+    if (track(s) != 0) {
+        free(s);
+        return NULL;
+    }
     return s;
 }
 

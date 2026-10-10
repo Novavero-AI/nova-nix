@@ -9,7 +9,7 @@
 --
 -- Lambda formals and eligible let\/rec bindings get positional
 -- (de Bruijn-style) indices via 'LexicalScope' and become 'EResolvedVar'.
--- Let\/rec blocks with dynamic keys or nested paths fall back to
+-- Let\/rec blocks with dynamic keys fall back to
 -- 'NameBarrier' (name-based lookup at runtime), as do the names bound
 -- around the whole expression.
 -- A name only a @with@ could supply becomes 'EWithVar'.
@@ -85,7 +85,7 @@ resolve stack expr = case expr of
         let innerStack = lexicalScopeFromBindings bindings : stack
          in recAttrs <$> traverse (resolveLetBinding stack innerStack) bindings
     | otherwise ->
-        -- Fallback: dynamic keys or nested paths - use NameBarrier.  Bindings
+        -- Fallback: dynamic keys - use NameBarrier.  Bindings
         -- resolve against newStack (siblings visible), but a plain @inherit x@
         -- must reference the OUTER scope - resolveLetBinding handles that, so
         -- the barrier does not turn @inherit x@ into a self-reference.
@@ -117,7 +117,7 @@ resolve stack expr = case expr of
               <$> traverse (resolveLetBinding stack innerStack) bindings
               <*> resolve innerStack body
     | otherwise ->
-        -- Fallback: dynamic keys or nested paths - use NameBarrier.  As above,
+        -- Fallback: dynamic keys - use NameBarrier.  As above,
         -- resolveLetBinding resolves a plain @inherit x@ against the outer scope
         -- so the barrier does not make @x@ self-referential.
         let newStack = NameBarrier (collectBindingNames bindings) : stack
@@ -365,7 +365,7 @@ lexicalScopeFromFormals (FormalNamedSet name formals _) =
 collectBindingNames :: [Binding] -> Set Text
 collectBindingNames = foldl' addNames Set.empty
   where
-    addNames acc (NamedBinding (StaticKey name : _) _) = Set.insert name acc
+    addNames acc (NamedBinding (StaticKey name) _) = Set.insert name acc
     addNames acc (NamedBinding _ _) = acc
     addNames acc (Inherit name _) = Set.insert name acc
     addNames acc (InheritFrom _ names) = foldl' (flip Set.insert) acc names
@@ -385,20 +385,20 @@ resolveKey stack (DynamicKey e) = DynamicKey <$> resolve stack e
 -- no env level, so an inherited variable resolves where the set stands,
 -- like every other value.
 resolveBinding :: [ScopeEntry] -> Binding -> Either Text Binding
-resolveBinding stack (NamedBinding path bodyExpr) =
-  NamedBinding <$> traverse (resolveKey stack) path <*> resolve stack bodyExpr
+resolveBinding stack (NamedBinding key bodyExpr) =
+  NamedBinding <$> resolveKey stack key <*> resolve stack bodyExpr
 resolveBinding stack (Inherit name var) = Inherit name <$> resolve stack var
 resolveBinding stack (InheritFrom fromExpr names) =
   (`InheritFrom` names) <$> resolve stack fromExpr
 
 -- | Check if all bindings are eligible for positional resolution:
--- each binding must be either a single static key or an inherit.
--- Blocks with dynamic keys (@${expr} = val@) or nested paths
--- (@a.b = val@) are ineligible and fall back to 'NameBarrier'.
+-- each binding must be either a static key or an inherit.  Blocks with
+-- dynamic keys (@${expr} = val@) are ineligible and fall back to
+-- 'NameBarrier'.
 allStaticSingleKey :: [Binding] -> Bool
 allStaticSingleKey = all isEligible
   where
-    isEligible (NamedBinding [StaticKey _] _) = True
+    isEligible (NamedBinding (StaticKey _) _) = True
     isEligible (Inherit _ _) = True
     isEligible (InheritFrom _ _) = True
     isEligible _ = False
@@ -413,7 +413,7 @@ lexicalScopeFromBindings bindings =
   LexicalScope (Map.fromList (zip names [0 ..]))
   where
     names = concatMap bindingNames bindings
-    bindingNames (NamedBinding [StaticKey name] _) = [name]
+    bindingNames (NamedBinding (StaticKey name) _) = [name]
     bindingNames (Inherit name _) = [name]
     bindingNames (InheritFrom _ inheritNames) = inheritNames
     -- Unreachable: allStaticSingleKey guards this path.
@@ -431,8 +431,8 @@ lexicalScopeFromBindings bindings =
 -- the inherited name references the enclosing scope, never the block being
 -- defined, whose own @x@ would make it a self-reference.
 resolveLetBinding :: [ScopeEntry] -> [ScopeEntry] -> Binding -> Either Text Binding
-resolveLetBinding _ innerStack (NamedBinding path bodyExpr) =
-  NamedBinding <$> traverse (resolveKey innerStack) path <*> resolve innerStack bodyExpr
+resolveLetBinding _ innerStack (NamedBinding key bodyExpr) =
+  NamedBinding <$> resolveKey innerStack key <*> resolve innerStack bodyExpr
 resolveLetBinding _ innerStack (InheritFrom fromExpr names) =
   (`InheritFrom` names) <$> resolve innerStack fromExpr
 resolveLetBinding outerStack _ (Inherit name var) =
@@ -523,7 +523,7 @@ resolveRelativePaths dir = goExpr
       StrInterp e -> StrInterp (goExpr e)
 
     goBinding binding = case binding of
-      NamedBinding path e -> NamedBinding (map goKey path) (goExpr e)
+      NamedBinding key e -> NamedBinding (goKey key) (goExpr e)
       Inherit name var -> Inherit name (goExpr var)
       InheritFrom from names -> InheritFrom (goExpr from) names
 

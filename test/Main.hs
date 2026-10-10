@@ -18,6 +18,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (isDigit)
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
@@ -25,7 +26,7 @@ import Data.Int (Int64)
 import Data.List (intercalate, isPrefixOf, sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -34,9 +35,11 @@ import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
 import Data.Word (Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
+import Foreign.C.Types (CChar)
+import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Foreign.Storable (sizeOf)
+import Foreign.Storable (poke, sizeOf)
 import qualified GHC.Foreign as GHCForeign
 import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEncoding)
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
@@ -53,11 +56,11 @@ import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAtt
 import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath)
-import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
+import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcDataCount, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
-import Nix.Eval.CList (clistDrop, clistFromThunks, clistIndex, clistLen, clistThunks)
-import Nix.Eval.CThunk (CThunkPtr, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkPayload, cthunkSetComputed, cthunkState)
+import Nix.Eval.CList (clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkSetPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings)
@@ -65,8 +68,8 @@ import qualified Nix.Eval.Context as Context
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIO, runEvalIOTraced)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printValue)
-import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), allocCSlots, attrSetKeys, buildCSlots, emptyCList)
+import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternBytes, symbolLen, symbolText)
+import Nix.Eval.Types (AttrSet (..), Env (..), allocCSlots, attrSetKeys, buildCSlots, emptyCList, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -307,10 +310,10 @@ testExprTypes = do
         let expr = ELambda (FormalName "x") (EVar "x") NoCaptureInfo
          in assertEqual "ELambda" expr expr,
       runTest "let binding" $
-        let expr = ELet [NamedBinding [StaticKey "x"] (ELit (NixInt 1))] (EVar "x") NoCaptureInfo
+        let expr = ELet [NamedBinding (StaticKey "x") (ELit (NixInt 1))] (EVar "x") NoCaptureInfo
          in assertEqual "ELet" expr expr,
       runTest "attrs" $
-        let expr = EAttrs False [NamedBinding [StaticKey "a"] (ELit (NixInt 1))] NoCaptureInfo
+        let expr = EAttrs False [NamedBinding (StaticKey "a") (ELit (NixInt 1))] NoCaptureInfo
          in assertEqual "EAttrs" expr expr,
       runTest "if-then-else" $
         let expr = EIf (ELit (NixBool True)) (ELit (NixInt 1)) (ELit (NixInt 2))
@@ -1688,12 +1691,12 @@ testParserExprs = do
         assertParse
           "attrs"
           "{ a = 1; }"
-          (EAttrs False [NamedBinding [StaticKey "a"] (ELit (NixInt 1))] NoCaptureInfo),
+          (EAttrs False [NamedBinding (StaticKey "a") (ELit (NixInt 1))] NoCaptureInfo),
       runTest "parse rec attrs" $
         assertParse
           "rec attrs"
           "rec { a = 1; }"
-          (EAttrs True [NamedBinding [StaticKey "a"] (ELit (NixInt 1))] NoCaptureInfo),
+          (EAttrs True [NamedBinding (StaticKey "a") (ELit (NixInt 1))] NoCaptureInfo),
       -- inherit x y; is one binding per name, each holding the variable it
       -- copies, which resolution binds like any other variable.
       runTest "parse inherit" $
@@ -1713,7 +1716,7 @@ testParserExprs = do
         assertParse
           "let"
           "let x = 1; in x"
-          (ELet [NamedBinding [StaticKey "x"] (ELit (NixInt 1))] (EResolvedVar 0 0) NoCaptureInfo),
+          (ELet [NamedBinding (StaticKey "x") (ELit (NixInt 1))] (EResolvedVar 0 0) NoCaptureInfo),
       runTest "parse if-then-else" $
         assertParse
           "if"
@@ -1749,7 +1752,7 @@ testParserExprs = do
         assertParse
           "or attr key"
           "{ or = 1; }"
-          (EAttrs False [NamedBinding [StaticKey "or"] (ELit (NixInt 1))] NoCaptureInfo)
+          (EAttrs False [NamedBinding (StaticKey "or") (ELit (NixInt 1))] NoCaptureInfo)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1819,8 +1822,8 @@ testParserIntegration = do
           "multi-let"
           "let x = 1; y = 2; in x + y"
           ( ELet
-              [ NamedBinding [StaticKey "x"] (ELit (NixInt 1)),
-                NamedBinding [StaticKey "y"] (ELit (NixInt 2))
+              [ NamedBinding (StaticKey "x") (ELit (NixInt 1)),
+                NamedBinding (StaticKey "y") (ELit (NixInt 2))
               ]
               (EBinary OpAdd (EResolvedVar 0 0) (EResolvedVar 0 1))
               NoCaptureInfo
@@ -1835,16 +1838,16 @@ testParserIntegration = do
           ( EAttrs
               False
               [ NamedBinding
-                  [StaticKey "a"]
+                  (StaticKey "a")
                   ( EAttrs
                       False
                       [ NamedBinding
-                          [StaticKey "b"]
-                          (EAttrs False [NamedBinding [StaticKey "c"] (ELit (NixInt 1))] NoCaptureInfo)
+                          (StaticKey "b")
+                          (EAttrs False [NamedBinding (StaticKey "c") (ELit (NixInt 1))] NoCaptureInfo)
                       ]
                       NoCaptureInfo
                   ),
-                NamedBinding [StaticKey "d"] (EAttrs False [NamedBinding [StaticKey "e"] (ELit (NixInt 2))] NoCaptureInfo)
+                NamedBinding (StaticKey "d") (EAttrs False [NamedBinding (StaticKey "e") (ELit (NixInt 2))] NoCaptureInfo)
               ]
               NoCaptureInfo
           ),
@@ -12215,28 +12218,39 @@ testToJSONPathIO = do
 arenaGuardChildFlag :: String
 arenaGuardChildFlag = "--arena-guard-child"
 
--- | One way a library user reaches the C layer, with the entry point
--- expected to refuse it.
+-- | One way a library user reaches the C layer, with what the child must
+-- report for it.
 data ArenaGuardPath = ArenaGuardPath
   { -- | The child's argument.
     guardName :: !String,
     -- | The suite's name for the case.
     guardClaim :: !Text,
-    -- | The C entry point the message must name.
-    guardSite :: !Text,
+    -- | What the child must report.
+    guardOutcome :: !GuardOutcome,
     -- | The child's body, run with no 'arenaInit' of its own.
     guardAction :: !(IO ())
   }
 
+-- | What a guard child must report for its path.
+data GuardOutcome
+  = -- | 'ArenaNotInitialized', naming this C entry point.
+    RefusedAt !Text
+  | -- | No exception: the path needs no arena.
+    Served
+
+-- | The line a guard child prints when its path raised nothing.
+servedLine :: String
+servedLine = "served without an exception"
+
 -- | The paths a library user reaches the C layer by.  The first C call
 -- of each of the first four lands in a different sub-arena, and the
 -- fifth runs a full init .. destroy cycle first, so both ends of the
--- window are covered.  The last shows what a touch before the window
--- costs: GHC updates a thunk whose evaluation raised with that
--- exception, so the shared null thunk keeps raising
--- 'ArenaNotInitialized' inside a later, live arena.  It pins the hazard
--- the "Nix.Eval.Arena" Haddock states, and flips when #19 removes the
--- process-lifetime constants.
+-- window are covered.  The last two read the shared @null@, @true@ and
+-- @false@ thunks, which must be valid in every window: were they arena
+-- cells behind a process-lifetime CAF, forcing one outside the window
+-- would poison it with 'ArenaNotInitialized' for every later arena, and
+-- forcing one inside an arena would leave it pointing into memory the
+-- next 'arenaDestroy' frees, a use-after-free the ASan job reports.
 arenaGuardPaths :: [ArenaGuardPath]
 arenaGuardPaths =
   [ noArena "compile" "nn_bc_emit" evalIssueProgram,
@@ -12245,43 +12259,44 @@ arenaGuardPaths =
     noArena "env" "nn_env_alloc_slots" (void (evaluate (fst (buildCSlots [evaluated (VInt 1)])))),
     noArena "after-destroy" "nn_bc_emit" (bracket_ arenaInit arenaDestroy (pure ()) >> evalIssueProgram),
     ArenaGuardPath
-      { guardName = "poisoned-constant",
-        guardClaim = "a constant forced before arenaInit re-raises inside a later, live arena (#19)",
-        guardSite = "nn_thunk_new_computed_null",
-        guardAction = poisonedConstant
+      { guardName = "constants-outside-window",
+        guardClaim = "the null, true and false thunks read correctly before arenaInit and in a later arena",
+        guardOutcome = Served,
+        guardAction = readConstants >> bracket_ arenaInit arenaDestroy readConstants
+      },
+    ArenaGuardPath
+      { guardName = "constants-across-cycles",
+        guardClaim = "the null, true and false thunks read correctly across two init .. destroy cycles",
+        guardOutcome = Served,
+        guardAction = bracket_ arenaInit arenaDestroy readConstants >> bracket_ arenaInit arenaDestroy readConstants
       }
   ]
   where
-    noArena name site = ArenaGuardPath name ("no arena: " <> T.pack name <> " raises ArenaNotInitialized at " <> site) site
+    noArena name site = ArenaGuardPath name ("no arena: " <> T.pack name <> " raises ArenaNotInitialized at " <> site) (RefusedAt site)
     -- The program from #206, forced to its result.
     evalIssueProgram = case parseNix "/tmp" "<expr>" "let x = 5; in x * 2 + 1" of
       Left err -> throwIO (ErrorCall (show err))
       Right expr -> void (evaluate (runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)))
-    -- Force the shared null thunk with no arena, then again under a
-    -- live one.  Anything but the guard on the first force, or a dead
-    -- arena on the second, is a broken precondition rather than the
-    -- outcome under test, so it leaves the child by another exception.
-    poisonedConstant = do
-      first <- try (evaluate (unThunk (evaluated VNull)))
-      case first of
-        Left (_ :: CStatusError) -> pure ()
-        Right _ -> throwIO (ErrorCall "the force outside the window raised nothing")
-      bracket_ arenaInit arenaDestroy $ do
-        live <- arenaLive
-        unless live (throwIO (ErrorCall "arenaLive is False inside the bracket"))
-        void (evaluate (unThunk (evaluated VNull)))
+    -- Read through the IO accessors: a pure read of a constant is itself
+    -- a constant GHC may share between the cycles, and the second would
+    -- then read nothing.  A wrong cell is a broken outcome rather than the
+    -- guard under test, so it leaves the child by another exception.
+    readConstants = do
+      found <- mapM (readCell . unThunk . evaluated) [VNull, VBool True, VBool False]
+      unless (found == [(ThunkComputed, ValueNull, 0), (ThunkComputed, ValueBool, 1), (ThunkComputed, ValueBool, 0)]) $
+        throwIO (ErrorCall ("the constants read back as " ++ show found))
+    readCell ptr = (,,) <$> cthunkState ptr <*> cthunkValueTag ptr <*> cthunkGetBool ptr
 
--- | Child body: run one path with no arena and report what it raised.
--- Exit 0 with the message on stdout when the guard fired, 3 when nothing
--- was raised.  A segfault or any other exception type surfaces as the
--- process's own exit code instead.
+-- | Child body: run one path with no arena and print what it raised, or
+-- 'servedLine'.  Exit 0 either way; a segfault, a sanitizer report or
+-- any other exception type surfaces as the process's own exit code.
 arenaGuardChild :: String -> IO ()
 arenaGuardChild name = case [guardAction path | path <- arenaGuardPaths, guardName path == name] of
   [action] -> do
     outcome <- try action
-    case outcome of
-      Left (err :: CStatusError) -> putStrLn (displayException err)
-      Right () -> putStrLn "no exception raised" >> exitWith (ExitFailure 3)
+    putStrLn $ case outcome of
+      Left (err :: CStatusError) -> displayException err
+      Right () -> servedLine
   _ -> hPutStrLn stderr ("unknown arena guard path: " ++ name) >> exitWith (ExitFailure 2)
 
 -- | The smallest slot count whose byte size exceeds @UINT32_MAX@.
@@ -12289,6 +12304,21 @@ arenaGuardChild name = case [guardAction path | path <- arenaGuardPaths, guardNa
 -- live arena it fails without exhausting anything.
 slotCountPastUInt32 :: Int
 slotCountPastUInt32 = fromIntegral (maxBound :: Word32) `div` sizeOf (nullPtr :: Ptr ()) + 1
+
+-- | One byte past the longest string the symbol table can hold.
+symbolLengthPastUInt32 :: Int
+symbolLengthPastUInt32 = fromIntegral (maxBound :: Word32) + 1
+
+-- | Intern a ByteString whose length claims 'symbolLengthPastUInt32'
+-- bytes over one real byte, so no 4 GiB buffer is needed.  Sound only
+-- because the interner refuses on the length before reading: an
+-- interner that read would run out of bounds here.
+internOversizedSymbol :: IO Symbol
+internOversizedSymbol =
+  alloca $ \byte -> do
+    poke byte (0 :: CChar)
+    oversized <- BSU.unsafePackCStringLen (byte, symbolLengthPastUInt32)
+    symbolInternBytes oversized
 
 -- | Reaching the C layer outside the 'arenaInit' .. 'arenaDestroy'
 -- window raises 'ArenaNotInitialized' naming the entry point, where
@@ -12304,24 +12334,48 @@ testArenaGuard = do
       ( \path -> runTestM (guardClaim path) $ do
           (code, out, err) <- Proc.readCreateProcessWithExitCode (Proc.proc self [arenaGuardChildFlag, guardName path]) ""
           let message = T.pack out
-              site = guardSite path
-          pure $ case code of
-            ExitSuccess
+          pure $ case (code, guardOutcome path) of
+            (ExitSuccess, RefusedAt site)
               | "arenaInit" `T.isInfixOf` message && site `T.isInfixOf` message -> Pass
               | otherwise -> Fail ("message does not name arenaInit and " <> site <> ": " <> message)
-            ExitFailure n -> Fail ("child exited " <> T.pack (show n) <> " (negative is a signal): " <> T.pack err)
+            (ExitSuccess, Served)
+              | T.strip message == T.pack servedLine -> Pass
+              | otherwise -> Fail ("expected no exception, got: " <> message)
+            (ExitFailure n, _) -> Fail ("child exited " <> T.pack (show n) <> " (negative is a signal): " <> T.pack err)
       )
       arenaGuardPaths
-  liveArena <-
-    runTestM "live arena: a slot array past UINT32_MAX bytes raises CAllocationFailed at nn_env_alloc_slots" $ do
-      live <- arenaLive
-      outcome <- try (evaluate (allocCSlots slotCountPastUInt32))
-      pure $ case (live, outcome) of
-        (True, Left (CAllocationFailed "nn_env_alloc_slots" "C allocation failed")) -> Pass
-        (True, Left err) -> Fail ("expected CAllocationFailed at nn_env_alloc_slots, got " <> T.pack (show err))
-        (True, Right _) -> Fail "no exception raised"
-        (False, _) -> Fail "arenaLive is False inside the suite's bracket"
-  pure (children ++ [liveArena])
+  live <-
+    sequence
+      [ liveRefusal "a slot array past UINT32_MAX bytes" "nn_env_alloc_slots" (void (evaluate (allocCSlots slotCountPastUInt32))),
+        -- The list's items come from the same slot allocator, so the same
+        -- count is refused there and must surface as a list failure, where
+        -- the NULL it used to return read as the empty list.
+        liveRefusal "a list past UINT32_MAX slot bytes" "nn_list_new" (void (clistNew (fromIntegral slotCountPastUInt32))),
+        -- A length the entry's uint32_t cannot hold, refused rather than
+        -- truncated to alias a shorter string.
+        liveRefusal "a symbol longer than UINT32_MAX bytes" "nn_symbol_intern" (void internOversizedSymbol)
+      ]
+  tableIntact <-
+    runTestM "a refused symbol leaves the table unchanged" $ do
+      before <- symbolCount
+      _ <- try internOversizedSymbol :: IO (Either CStatusError Symbol)
+      after <- symbolCount
+      sym <- symbolIntern "after-a-refusal"
+      pure $
+        if before == after && symbolText sym == "after-a-refusal"
+          then Pass
+          else Fail ("count " <> T.pack (show before) <> " -> " <> T.pack (show after) <> ", text " <> symbolText sym)
+  pure (children ++ live ++ [tableIntact])
+  where
+    liveRefusal what site action =
+      runTestM ("live arena: " <> what <> " raises CAllocationFailed at " <> site) $ do
+        alive <- arenaLive
+        outcome <- try action
+        pure $ case (alive, outcome) of
+          (True, Left (CAllocationFailed refused _)) | refused == T.unpack site -> Pass
+          (True, Left err) -> Fail ("expected CAllocationFailed at " <> site <> ", got " <> T.pack (show err))
+          (True, Right ()) -> Fail "no exception raised"
+          (False, _) -> Fail "arenaLive is False inside the suite's bracket"
 
 -- ---------------------------------------------------------------------------
 -- Symbol interning (C FFI)
@@ -12525,6 +12579,23 @@ testCAttrSet = do
           ( if n == 10000 && isJust hit
               then Pass
               else Fail ("size=" <> T.pack (show n))
+          ),
+      -- Grown from the default capacity, so every doubling runs; the
+      -- index of an absent key is the C side's NN_ATTRSET_NOT_FOUND.
+      runTestM "index finds each key at its sorted position and none for an absent key" $ do
+        set <- cattrsetNew 0
+        sp <- newStablePtr (0 :: Int)
+        syms <- mapM (\i -> symbolIntern ("index_" <> T.pack (show (i :: Int)))) [1 .. 100]
+        mapM_ (\sym -> cattrsetInsert set sym (spToCPtr sp)) syms
+        cattrsetFreeze set
+        absent <- symbolIntern "index_absent"
+        found <- mapM (cattrsetIndex set) (sort syms)
+        missing <- cattrsetIndex set absent
+        freeStablePtr sp
+        pure
+          ( if found == map Just [0 .. 99] && isNothing missing
+              then Pass
+              else Fail ("found=" <> T.pack (show found) <> " missing=" <> T.pack (show missing))
           )
     ]
 
@@ -12581,39 +12652,56 @@ testCThunk = do
         _ <- cthunkMarkBlackhole ptr
         ok <- cthunkMarkBlackhole ptr
         pure (if not ok then Pass else Fail "should have failed"),
-      runTestM "set_computed returns old payload" $ do
+      runTestM "set_computed stores into a blackhole" $ do
         pendingSp <- newStablePtr ("old" :: Text)
         ptr <- cthunkNewBc 0 (castStablePtrToPtr pendingSp)
         _ <- cthunkMarkBlackhole ptr
         computedSp <- newStablePtr ("new" :: Text)
-        oldPayload <- cthunkSetComputed ptr (castStablePtrToPtr computedSp)
-        oldVal <- deRefStablePtr (castPtrToStablePtr oldPayload) :: IO Text
+        stored <- cthunkSetComputed ptr (castStablePtrToPtr computedSp)
         state <- cthunkState ptr
         newPayload <- cthunkPayload ptr
         newVal <- deRefStablePtr (castPtrToStablePtr newPayload) :: IO Text
         freeStablePtr pendingSp
         pure
-          ( if oldVal == "old" && newVal == "new" && state == 1
+          ( if stored && newVal == "new" && state == 1
               then Pass
-              else
-                Fail
-                  ( "old="
-                      <> oldVal
-                      <> " new="
-                      <> newVal
-                      <> " state="
-                      <> T.pack (show state)
-                  )
+              else Fail ("stored=" <> T.pack (show stored) <> " new=" <> newVal <> " state=" <> T.pack (show state))
           ),
-      runTestM "set_computed on pending returns old payload" $ do
+      -- set_computed accepts PENDING (direct memoization, no blackhole step)
+      runTestM "set_computed stores into a pending thunk" $ do
         sp <- newStablePtr ("x" :: Text)
         ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
         valSp <- newStablePtr ("v" :: Text)
-        oldPayload <- cthunkSetComputed ptr (castStablePtrToPtr valSp)
-        -- set_computed accepts PENDING (direct memoization, no blackhole step)
-        oldVal <- deRefStablePtr (castPtrToStablePtr oldPayload) :: IO Text
+        stored <- cthunkSetComputed ptr (castStablePtrToPtr valSp)
         freeStablePtr sp
-        pure (assertEqual "old payload" "x" oldVal),
+        pure (if stored then Pass else Fail "refused a PENDING thunk"),
+      runTestM "set_computed refuses a computed thunk and keeps its value" $ do
+        firstSp <- newStablePtr ("first" :: Text)
+        ptr <- cthunkNewComputed (castStablePtrToPtr firstSp)
+        secondSp <- newStablePtr ("second" :: Text)
+        stored <- cthunkSetComputed ptr (castStablePtrToPtr secondSp)
+        payload <- cthunkPayload ptr
+        kept <- deRefStablePtr (castPtrToStablePtr payload) :: IO Text
+        freeStablePtr secondSp
+        pure
+          ( if not stored && kept == "first"
+              then Pass
+              else Fail ("stored=" <> T.pack (show stored) <> " kept=" <> kept)
+          ),
+      -- The shared cells are one static each for the whole process, so a
+      -- transition that ran on one would change every null or boolean.
+      runTestM "the shared null and boolean cells refuse every transition" $ do
+        let cells = [cthunkNull, cthunkBool True, cthunkBool False]
+        marked <- mapM cthunkMarkBlackhole cells
+        stored <- mapM (`cthunkSetComputed` nullPtr) cells
+        repointed <- mapM (`cthunkSetPayload` nullPtr) cells
+        let values = map (readThunkValue . Thunk) cells
+            expected = map Just [VNull, VBool True, VBool False]
+        pure
+          ( if not (or (marked ++ stored ++ repointed)) && values == expected
+              then Pass
+              else Fail ("accepted=" <> T.pack (show (marked, stored, repointed)) <> " values=" <> T.pack (show values))
+          ),
       runTestM "count tracks allocations" $ do
         countBefore <- cthunkCount
         sp <- newStablePtr (0 :: Int)
@@ -13650,7 +13738,7 @@ testBytecodeCompile = do
         idx <-
           compileExpr
             ( ELet
-                [NamedBinding [StaticKey "x"] (ELit (NixInt 42))]
+                [NamedBinding (StaticKey "x") (ELit (NixInt 42))]
                 (EResolvedVar 0 0)
                 NoCaptureInfo
             )
@@ -13674,7 +13762,7 @@ testBytecodeCompile = do
           compileExpr
             ( EAttrs
                 False
-                [NamedBinding [StaticKey "a"] (ELit (NixInt 1))]
+                [NamedBinding (StaticKey "a") (ELit (NixInt 1))]
                 NoCaptureInfo
             )
         op <- cbcOpcode idx
@@ -13690,8 +13778,8 @@ testBytecodeCompile = do
           compileExpr
             ( EAttrs
                 True
-                [ NamedBinding [StaticKey "x"] (ELit (NixInt 1)),
-                  NamedBinding [StaticKey "y"] (EResolvedVar 0 0)
+                [ NamedBinding (StaticKey "x") (ELit (NixInt 1)),
+                  NamedBinding (StaticKey "y") (EResolvedVar 0 0)
                 ]
                 (Captures [(0, 0)])
             )

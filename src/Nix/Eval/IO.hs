@@ -50,19 +50,20 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNames)
 import Nix.Derivation (fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (eval)
 import Nix.Eval.CList (CList (..))
+import Nix.Eval.CStatus (cInvariantViolated)
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
@@ -738,14 +739,14 @@ instance MonadEval EvalIO where
     -- forces itself.
     state <- EvalIO (liftIO (cthunkState ptr))
     case state of
-      1 {- COMPUTED -} ->
+      ThunkComputed ->
         EvalIO (liftIO (readComputed ptr))
-      2 {- BLACKHOLE -} ->
+      ThunkBlackhole ->
         -- Infinite recursion is non-catchable (like abort), matching C++ Nix.
         -- tryEval must NOT catch blackholes - using abortEvaluation ensures
         -- the error propagates through tryEval/catchEvalError.
         abortEvaluation "infinite recursion encountered"
-      _ {- PENDING -} -> do
+      ThunkPending -> do
         -- Bytecode thunks: read bc_idx + StablePtr Env.
         -- The Expr is gone (replaced by bc_idx in the struct).
         -- The Env is still a StablePtr (for knot-tying laziness).
@@ -755,51 +756,69 @@ instance MonadEval EvalIO where
         env <- EvalIO (liftIO (deRefStablePtr pendingSp))
         -- Mark blackhole BEFORE evaluation - any re-entry hits the
         -- BLACKHOLE branch above.
-        _ <- EvalIO (liftIO (cthunkMarkBlackhole ptr))
+        EvalIO . liftIO $ do
+          marked <- cthunkMarkBlackhole ptr
+          unless marked (cInvariantViolated "nn_thunk_mark_blackhole" "a thunk read as PENDING was not PENDING")
         -- If the force throws (a builtins.throw caught by an upstream tryEval,
         -- a type error, a failed import), restore the thunk to PENDING and
         -- rethrow, so a later force of this shared thunk re-evaluates instead of
         -- taking the BLACKHOLE branch above and aborting with a bogus "infinite
         -- recursion".  Mirrors C++ Nix forceValue: catch (...) { restore; throw }.
         -- A genuine self-recursion still rethrows its NixAbortError, which
-        -- escapes tryEval exactly as before.
+        -- escapes tryEval exactly as before.  Storing the value is inside the
+        -- restore too, since interning or marshalling it can fail.  The
+        -- restore's own answer is not needed: it refuses only a thunk that is
+        -- no longer BLACKHOLE, which a later force already handles, and the
+        -- exception in flight is the one to report.
         val <- EvalIO $ do
           st <- ask
           liftIO
-            (runReaderT (unEvalIO (evalFn env bcIdx)) st `onException` cthunkMarkPending ptr)
-        oldPayload <- EvalIO (liftIO (storeComputed ptr val))
-        -- Free the pending env StablePtr.
-        when (oldPayload /= nullPtr) $
-          EvalIO (liftIO (freeStablePtr (castPtrToStablePtr oldPayload)))
+            ( ( do
+                  result <- runReaderT (unEvalIO (evalFn env bcIdx)) st
+                  storeComputed ptr result
+                  pure result
+              )
+                `onException` cthunkMarkPending ptr
+            )
+        -- The value is stored, so nothing reads the pending env again.
+        EvalIO (liftIO (freeStablePtr pendingSp))
         pure val
+      other ->
+        EvalIO (liftIO (cInvariantViolated "nn_thunk_state" ("no thunk has state " ++ show other)))
 
--- | Store a computed NixValue in a C thunk.
+-- | Store a forced thunk's NixValue in its C cell.
 -- Scalars (int, float, bool, null) are stored inline (no StablePtr).
--- Complex values use StablePtr.  Returns old payload for cleanup.
-storeComputed :: CThunkPtr -> NixValue -> IO (Ptr ())
-storeComputed ptr val = case val of
-  VInt n -> cthunkSetComputedInt ptr n
-  VFloat d -> cthunkSetComputedFloat ptr d
-  VBool b -> cthunkSetComputedBool ptr (if b then 1 else 0)
-  VNull -> cthunkSetComputedNull ptr
-  VAttrs (AttrSet cset) -> cthunkSetComputedAttrs ptr (castPtr cset)
-  VPath p -> do
-    Symbol sym <- symbolIntern p
-    cthunkSetComputedPath ptr sym
-  VStr t ctx
-    | ctx == emptyContext -> do
-        Symbol sym <- symbolInternBytes t
-        cthunkSetComputedStr ptr sym
-    | otherwise -> do
-        csptr <- marshalStringContext t ctx
-        cthunkSetComputedCtxStr ptr (castPtr csptr)
-  VList (CList clistPtr) -> cthunkSetComputedList ptr (castPtr clistPtr)
-  VLambda (Env envPtr) formals bodyBcIdx -> do
-    lamPtr <- marshalLambda envPtr formals bodyBcIdx
-    cthunkSetComputedLambda ptr lamPtr
-  _ -> do
-    valSp <- newStablePtr val
-    cthunkSetComputed ptr (castStablePtrToPtr valSp)
+-- Complex values use StablePtr.  The cell is BLACKHOLE while its force
+-- runs, which keeps every other path from computing it, so a setter's
+-- refusal is an invariant violation rather than a value to drop.
+storeComputed :: CThunkPtr -> NixValue -> IO ()
+storeComputed ptr val = do
+  stored <- case val of
+    VInt n -> cthunkSetComputedInt ptr n
+    VFloat d -> cthunkSetComputedFloat ptr d
+    VBool b -> cthunkSetComputedBool ptr (if b then 1 else 0)
+    VNull -> cthunkSetComputedNull ptr
+    VAttrs (AttrSet cset) -> cthunkSetComputedAttrs ptr (castPtr cset)
+    VPath p -> do
+      Symbol sym <- symbolIntern p
+      cthunkSetComputedPath ptr sym
+    VStr t ctx
+      | ctx == emptyContext -> do
+          Symbol sym <- symbolInternBytes t
+          cthunkSetComputedStr ptr sym
+      | otherwise -> do
+          csptr <- marshalStringContext t ctx
+          cthunkSetComputedCtxStr ptr (castPtr csptr)
+    VList (CList clistPtr) -> cthunkSetComputedList ptr (castPtr clistPtr)
+    VLambda (Env envPtr) formals bodyBcIdx -> do
+      lamPtr <- marshalLambda envPtr formals bodyBcIdx
+      cthunkSetComputedLambda ptr lamPtr
+    _ -> do
+      valSp <- newStablePtr val
+      kept <- cthunkSetComputed ptr (castStablePtrToPtr valSp)
+      unless kept (freeStablePtr valSp)
+      pure kept
+  unless stored (cInvariantViolated "nn_thunk_set_computed" "a thunk being forced was already COMPUTED")
 
 -- | Read a computed NixValue from a C thunk.
 -- Dispatches on val_tag: scalars are read inline, complex via StablePtr.

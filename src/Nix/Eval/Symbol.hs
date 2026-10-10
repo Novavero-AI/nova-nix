@@ -79,9 +79,9 @@ foreign import ccall unsafe "nn_symbol_count"
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
--- | Initialize the global symbol table.  Call once before evaluation.
--- @capacity@ is a hint for the expected number of unique symbols.
--- Pass 0 to use the default (4096).
+-- | Initialize the global symbol table, destroying a live one first.
+-- Call once before evaluation.  @capacity@ is a hint for the expected
+-- number of unique symbols.  Pass 0 to use the default (4096).
 symbolInit :: Word32 -> IO ()
 symbolInit = c_nn_symbol_init
 
@@ -116,11 +116,13 @@ symbolInternBytes bs =
     checkedSymbol =<< c_nn_symbol_intern ptr (fromIntegral len)
 
 -- | Reject the interner's failure sentinel before it can become a
--- 'Symbol': the table only answers it outside its init .. destroy
--- window, and wrapped it would read back as the empty string.
+-- 'Symbol': wrapped it would read back as the empty string.  The table
+-- answers it outside its init .. destroy window, and inside it for a
+-- string it cannot hold: one that would take the string arena past its
+-- 4 GiB of uint32 offsets, or a growth the allocator refuses.
 checkedSymbol :: Word32 -> IO Symbol
 checkedSymbol sid
-  | sid == invalidSymbolId = cStatusFailure "nn_symbol_intern" "interning failed"
+  | sid == invalidSymbolId = cStatusFailure "nn_symbol_intern" "the symbol table cannot hold the string (allocation failure or its 4 GiB arena limit)"
   | otherwise = pure (Symbol sid)
 
 -- | Retrieve the text of an interned symbol.
