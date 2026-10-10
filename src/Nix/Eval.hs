@@ -202,7 +202,7 @@ import Nix.Expr.Types
   )
 import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
 import Nix.Json (Json (..), parseJson, renderJson)
-import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
+import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
@@ -3230,7 +3230,17 @@ builtinStorePath val = do
   policy <- evalPolicy
   if epPureEval policy
     then throwEvalError "'builtins.storePath' is not allowed in pure evaluation mode"
-    else validateStorePath =<< coerceToPath "builtins.storePath" val
+    else validateStorePath =<< resolvedUnlessStorePath =<< coerceToPath "builtins.storePath" val
+  where
+    -- prim_storePath resolves the path's symlinks unless the path is itself
+    -- a store path, a link directly in the store (primops.cc:1613 at
+    -- 2.24.9), so a link outside the store into it names its target.
+    resolvedUnlessStorePath path
+      | isBareStorePath path = pure path
+      | otherwise = resolveSymlinks path
+    isBareStorePath path = case T.stripPrefix storeDirPrefix path of
+      Just base -> not (T.any (== '/') base) && isJust (parseStorePathBaseName base)
+      Nothing -> False
 
 -- | @builtins.storePath@ - mark an already-in-store path as such.  Upstream
 -- returns a STRING carrying an Opaque (SCPlain) context entry for the enclosing
@@ -3239,10 +3249,19 @@ builtinStorePath val = do
 -- path.  Returning a context-free path (the old behavior) re-copied the path on
 -- coercion - a wrong store path on Unix, and a file-not-found on Windows, where
 -- the canonical @/nix/store@ text is not the on-disk location.
+--
+-- A path outside the store is upstream's @isInStore@ refusal; one inside
+-- it whose component is no store path is its @StorePath@ constructor's
+-- ('storePathBaseNameError').
 validateStorePath :: (MonadEval m) => Text -> m NixValue
-validateStorePath p = case enclosingStorePath p of
-  Just sp -> pure (VStr (TE.encodeUtf8 p) (plainContext sp))
-  Nothing -> throwEvalError ("builtins.storePath: not a valid store path: " <> p)
+validateStorePath p = case T.stripPrefix storeDirPrefix p of
+  Just rest
+    | not (T.null rest) -> case parseStorePathBaseName base of
+        Just sp -> pure (VStr (TE.encodeUtf8 p) (plainContext sp))
+        Nothing -> throwEvalError (fromMaybe ("store path '" <> base <> "' has no '-' after its hash") (storePathBaseNameError base))
+    where
+      base = T.takeWhile (/= '/') rest
+  _ -> throwEvalError ("path '" <> p <> "' is not in the Nix store")
 
 -- | The store path enclosing an absolute path under the store dir, or
 -- 'Nothing' if the path is not in the store.  Accepts a bare store path and a
