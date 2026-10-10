@@ -92,9 +92,7 @@ sha256Hex bs =
 truncatedBase32 :: BS.ByteString -> Text
 truncatedBase32 bs =
   let digest = CH.hash bs :: CH.Digest CH.SHA256
-      allBytes = BA.unpack digest :: [Word8]
-      compressed = compressHash 20 allBytes
-   in encode (BS.pack compressed)
+   in encode (compressHash 20 (BA.convert digest))
 
 -- | Nix's output placeholder for @builtins.placeholder@: @\/@ followed by the
 -- full SHA-256 of @"nix-output:" <> name@ in Nix base-32 (no truncation, no
@@ -103,15 +101,20 @@ hashPlaceholder :: Text -> Text
 hashPlaceholder name =
   "/" <> encode (sha256Digest (encodeUtf8 ("nix-output:" <> name)))
 
--- | XOR-fold a hash to @targetLen@ bytes, matching C++ Nix @compressHash@.
--- Each source byte is XOR'd into position @i mod targetLen@.
-compressHash :: Int -> [Word8] -> [Word8]
-compressHash targetLen bytes =
-  let arr0 = replicate targetLen 0
-      fold_ acc (i, b) =
-        let pos = i `mod` targetLen
-         in zipWith (\j x -> if j == pos then xor x b else x) [0 :: Int ..] acc
-   in foldl' fold_ arr0 (zip [0 ..] bytes)
+-- | XOR-fold a hash to @targetLen@ bytes, matching C++ Nix @compressHash@
+-- (hash.cc): byte @i@ is XOR'd into position @i mod targetLen@, which is
+-- the hash's @targetLen@-byte chunks XOR'd together, a short last chunk
+-- into the prefix.  Empty for a length below one, which leaves no
+-- position to fold into.
+compressHash :: Int -> BS.ByteString -> BS.ByteString
+compressHash targetLen digest
+  | targetLen < 1 = BS.empty
+  | otherwise = foldl' xorChunk (BS.replicate targetLen 0) (chunks digest)
+  where
+    chunks bytes
+      | BS.null bytes = []
+      | otherwise = let (chunk, rest) = BS.splitAt targetLen bytes in chunk : chunks rest
+    xorChunk acc chunk = BS.packZipWith xor acc chunk <> BS.drop (BS.length chunk) acc
 
 -- | Format a single byte as two lowercase hex digits.
 byteToHex :: Word8 -> String
@@ -254,8 +257,8 @@ makeStorePath (StoreDir dir) typ innerDigest name =
               <> T.pack dir
               <> ":"
               <> name
-          compressed = compressHash storePathHashBytes (BS.unpack (sha256Digest (encodeUtf8 preimage)))
-       in Right (StorePath (encode (BS.pack compressed)) name)
+          compressed = compressHash storePathHashBytes (sha256Digest (encodeUtf8 preimage))
+       in Right (StorePath (encode compressed) name)
 
 -- | Construct a text store path (used for @.drv@ files and @builtins.toFile@).
 -- The references are embedded in the @type@ string - @\"text\"@ followed by
