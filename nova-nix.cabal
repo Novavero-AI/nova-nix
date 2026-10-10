@@ -68,6 +68,7 @@ library
     Nix.Eval.IO
     Nix.Eval.Policy
     Nix.Eval.Operator
+    Nix.Eval.Print
     Nix.Eval.StringInterp
     Nix.Eval.Symbol
     Nix.Eval.CAttrSet
@@ -215,6 +216,7 @@ test-suite nova-nix-test
     , nova-cache:{nova-cache, zstandard} >= 0.11.1.1 && < 0.12
     , nova-nix
     , process             >= 1.6 && < 1.7
+    , QuickCheck          >= 2.12.5 && < 2.19
     , sqlite-simple       >= 0.4 && < 0.5
     , tar                 >= 0.7.1 && < 0.8
     , text                >= 2.0 && < 2.2

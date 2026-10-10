@@ -126,8 +126,9 @@ import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
-import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, nixCompare, nixEqual)
+import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, evalUpdate, nixCompare, nixEqual)
 import Nix.Eval.Policy (isAbsolutePath)
+import Nix.Eval.Print (PrintOptions (..), printValue)
 import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatJsonFloat, formatNixFloat, formatXmlFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
 import Nix.Eval.Types
@@ -393,6 +394,9 @@ evalBcBinary env bcIdx0 = case op of
     leftVal <- evalBytecode env leftIdx
     rightVal <- evalBytecode env rightIdx
     evalAddWithCoercion leftVal rightVal
+  -- Not through 'operate', which forces both operands before either is
+  -- looked at: the left must be checked before the right is evaluated.
+  OpUpdate -> evalUpdate (evalBytecode env leftIdx) (evalBytecode env rightIdx)
   _
     | desugaredToCall op -> withCallFrame operate
     | otherwise -> operate
@@ -2586,8 +2590,7 @@ mapAttrsExpr = EDeferredApp (EDeferredApp (EResolvedVar 0 0) (EResolvedVar 0 1))
 builtinFunctionArgs :: (MonadEval m) => NixValue -> m NixValue
 builtinFunctionArgs (VLambda _ formals _) = pure (formalsToAttrs formals)
 builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs (attrSetFromMap Map.empty))
-builtinFunctionArgs other =
-  throwEvalError ("builtins.functionArgs: expected a function, got " <> typeName other)
+builtinFunctionArgs _ = throwEvalError "'functionArgs' requires a function"
 
 formalsToAttrs :: EvalFormals -> NixValue
 formalsToAttrs (EFName _) = VAttrs (attrSetFromMap Map.empty)
@@ -3229,7 +3232,7 @@ builtinTrace :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinTrace msgVal result = do
   msg <- case msgVal of
     VStr s _ -> pure (bytesToTextLossy s)
-    other -> pure (showValueForTrace other)
+    other -> pure (printValue PrintInFull other)
   traceMessage ("trace: " <> msg)
   pure result
 
@@ -3238,19 +3241,9 @@ builtinWarn :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinWarn msgVal result = do
   msg <- case msgVal of
     VStr s _ -> pure (bytesToTextLossy s)
-    other -> pure (showValueForTrace other)
+    other -> pure (printValue PrintInFull other)
   traceMessage ("warning: " <> msg)
   pure result
-
--- | Pretty-print a value for trace/warn, matching C++ Nix's printValue.
-showValueForTrace :: NixValue -> Text
-showValueForTrace (VInt n) = T.pack (show n)
-showValueForTrace (VFloat f) = formatNixFloat f
-showValueForTrace (VBool True) = "true"
-showValueForTrace (VBool False) = "false"
-showValueForTrace VNull = "null"
-showValueForTrace (VPath p) = p
-showValueForTrace other = "<<" <> typeName other <> ">>"
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - graph traversal
