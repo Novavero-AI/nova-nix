@@ -18,11 +18,13 @@ module Nix.Store.Symlink
   )
 where
 
-import Control.Exception (IOException, SomeException, catch, try)
+import Control.Exception (IOException, catch, try)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Nix.Store.Exclusive (symlinkTakenMessage)
 import qualified System.Directory as Dir
 import System.FilePath (takeDirectory, (</>))
+import System.IO.Error (isAlreadyExistsError)
 
 -- | A node kind for store walks, classified WITHOUT following symlinks:
 -- the link test runs first because 'Dir.doesDirectoryExist' and
@@ -55,8 +57,10 @@ classifyWalkNode path = do
 -- failure is loud rather than approximated: writing the target text as a
 -- regular file once registered a tree whose NAR hash differed from the
 -- signed narinfo's, silent store corruption that a later push refused to
--- publish.  The parent directory is not created here; a caller that
--- wants that does it first.
+-- publish.  A name already taken is refused in upstream's words, as a
+-- folded sibling or a raced root meets it.
+-- The parent directory is not created here; a caller that wants that
+-- does it first.
 createSymlinkOfKind :: FilePath -> FilePath -> IO (Either Text ())
 createSymlinkOfKind linkPath target = do
   targetIsDir <- Dir.doesDirectoryExist (takeDirectory linkPath </> target)
@@ -67,13 +71,15 @@ createSymlinkOfKind linkPath target = do
         else Dir.createFileLink target linkPath
   pure $ case result of
     Right () -> Right ()
-    Left (e :: SomeException) ->
-      Left
-        ( "cannot create symlink "
-            <> T.pack linkPath
-            <> " -> "
-            <> T.pack target
-            <> ": "
-            <> T.pack (show e)
-            <> " (on Windows this needs Developer Mode or elevation)"
-        )
+    Left (e :: IOException)
+      | isAlreadyExistsError e -> Left (symlinkTakenMessage linkPath target)
+      | otherwise ->
+          Left
+            ( "cannot create symlink "
+                <> T.pack linkPath
+                <> " -> "
+                <> T.pack target
+                <> ": "
+                <> T.pack (show e)
+                <> " (on Windows this needs Developer Mode or elevation)"
+            )

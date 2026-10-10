@@ -106,7 +106,9 @@ library
     Nix.Http
 
   autogen-modules:  Paths_nova_nix
-  other-modules:    Paths_nova_nix
+  other-modules:
+    Nix.Store.Exclusive
+    Paths_nova_nix
 
   build-depends:
       base                >= 4.22 && < 5
@@ -131,6 +133,17 @@ library
     , text                >= 2.0 && < 2.2
     , time                >= 1.9 && < 1.17
     , zstd                >= 0.1 && < 0.2
+
+  -- The exclusive create behind NAR unpacking (Nix.Store.Exclusive),
+  -- which base cannot express.  Win32 2.9 is the first whose
+  -- hANDLEToHandle serves the native Windows I/O manager; unix 2.8 is
+  -- the first whose openFd takes creat and cloexec in its flags.
+  if os(windows)
+    build-depends:
+        Win32             >= 2.9 && < 2.15
+  else
+    build-depends:
+        unix              >= 2.8 && < 2.9
 
   c-sources:
     cbits/nn_symbol.c

@@ -11,7 +11,7 @@ import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (cancel, waitCatch, withAsync)
-import Control.Exception (ErrorCall (..), SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, displayException, evaluate, finally, fromException, throwIO, toException, try)
+import Control.Exception (ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, displayException, evaluate, finally, fromException, throwIO, toException, try)
 import Control.Monad (filterM, unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
@@ -85,6 +85,7 @@ import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBuffering, stderr, stdout)
+import System.IO.Error (ioeGetErrorString)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
 import qualified System.Process as Proc
@@ -4257,10 +4258,16 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let dest = tmpBase </> "nova-nix-test-unpack-unsafe"
             evil name = NAR.NarDirectory [(name, NAR.NarRegular False "x")]
-        results <- mapM (unpackNarEntry tmpSensitivity dest . evil) ["..", ".", "", "a/b", "a\\b"]
+            -- Cleared before each: the root is created exclusively, so
+            -- a leftover from the previous name would refuse for a
+            -- different reason than the one under test.
+            unpackFresh name = do
+              Subst.clearStaleDestination dest
+              unpackNarEntry tmpSensitivity dest (evil name)
+        results <- mapM unpackFresh ["..", ".", "", "a/b", "a\\b"]
         Subst.clearStaleDestination dest
         pure $
-          if all (\case Left _ -> True; Right () -> False) results
+          if all (\case Left err -> "unsafe NAR directory entry name" `T.isInfixOf` err; Right () -> False) results
             then Pass
             else Fail ("accepted an unsafe name: " <> T.pack (show results)),
       -- unpackNarEntry: names and targets arrive as the raw bytes the
@@ -4362,6 +4369,92 @@ testSubstituter = do
                     pure (assertEqual "case-hacked name" "lower" lower)
         Subst.clearStaleDestination dest
         pure outcome,
+      -- Every unpack creates exclusively, its root included, as
+      -- upstream's restore does: a destination that already holds an
+      -- entry is refused with upstream's wording and left as it was,
+      -- not truncated or written into.  Callers clear a stale
+      -- destination first.  Any volume answers this, so it is the
+      -- exclusive create's check on every platform, Windows' CREATE_NEW
+      -- included.
+      runTestM "unpack refuses a destination that already exists" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-taken"
+            fileTree = NAR.NarRegular False "new"
+            dirTree = NAR.NarDirectory [("f", NAR.NarRegular False "new")]
+            fileRefusal = "creating file '" <> quotedAsCxx dest <> "': File exists"
+            dirOverFile = "creating directory '" <> T.pack dest <> "': File exists"
+            dirOverDir = "path '" <> T.pack dest <> "' already exists"
+            streamInto tree = do
+              let raw = NAR.serialise tree
+              source <- chunkReader [raw]
+              outcome <- Subst.consumeNarStream tmpSensitivity dest (streamTestNarInfo raw) (CHash.hashBytes raw) source
+              pure (either (Left . Subst.attemptFailureMessage) (const (Right ())) outcome)
+            strictAndStreamed tree = (,) <$> unpackNarEntry tmpSensitivity dest tree <*> streamInto tree
+        Subst.clearStaleDestination dest
+        BS.writeFile dest "old"
+        fileOnFile <- strictAndStreamed fileTree
+        dirOnFile <- strictAndStreamed dirTree
+        keptFile <- BS.readFile dest
+        Subst.clearStaleDestination dest
+        createDirectoryIfMissing True dest
+        dirOnDir <- strictAndStreamed dirTree
+        wroteInto <- Dir.doesPathExist (dest </> "f")
+        Subst.clearStaleDestination dest
+        let verdict
+              | keptFile /= "old" = Fail "the existing file was written over"
+              | wroteInto = Fail "the existing directory was written into"
+              | otherwise =
+                  assertEqual
+                    "refusals, strict and streamed (a file over a file, a directory over a file, a directory over a directory)"
+                    ((Left fileRefusal, Left fileRefusal), (Left dirOverFile, Left dirOverFile), (Left dirOverDir, Left dirOverDir))
+                    (fileOnFile, dirOnFile, dirOnDir)
+        pure verdict,
+      -- std::quoted escapes a double quote and a backslash inside the
+      -- path, so a name holding both pins upstream's exact text.  A
+      -- Windows name can hold neither.
+      runTestM "the file refusal quotes its path as std::quoted does" $ do
+        tmpBase <- getTemporaryDirectory
+        let plain = tmpBase </> "nova-nix-test-unpack-q"
+            dest = plain <> "\"b\\s"
+            expected = "creating file '\"" <> T.pack plain <> "\\\"b\\\\s\"': File exists"
+            tree = NAR.NarRegular False "new"
+            raw = NAR.serialise tree
+        if SI.os == "mingw32"
+          then Pass <$ putStrLn "  SKIP  a Windows name cannot hold a double quote"
+          else do
+            Subst.clearStaleDestination dest
+            BS.writeFile dest "old"
+            strict <- unpackNarEntry tmpSensitivity dest tree
+            source <- chunkReader [raw]
+            streamed <- Subst.consumeNarStream tmpSensitivity dest (streamTestNarInfo raw) (CHash.hashBytes raw) source
+            Subst.clearStaleDestination dest
+            pure (assertEqual "refusals (strict, streamed)" (Left expected, Left expected) (strict, either (Left . Subst.attemptFailureMessage) (const (Right ())) streamed)),
+      -- The exclusive create reaches as far as base's own open on
+      -- Windows, where a raw CreateFileW stops at MAX_PATH (260
+      -- characters) unless the path is spelled in the file namespace.
+      -- Every component here is short; only the whole path is long.
+      runTestM "unpack writes a file whose path is past MAX_PATH" $ do
+        tmpBase <- getTemporaryDirectory
+        let dest = tmpBase </> "nova-nix-test-unpack-long"
+            component = replicate 60 'd'
+            depth = 5 :: Int
+            nest inner = NAR.NarDirectory [(TE.encodeUtf8 (T.pack component), inner)]
+            tree = foldr (const nest) (NAR.NarDirectory [("leaf", NAR.NarRegular False "deep")]) [1 .. depth]
+            leafPath = foldl' (</>) dest (replicate depth component) </> "leaf"
+            raw = NAR.serialise tree
+            readLeaf = either (pure . Left) (const (Right <$> BS.readFile leafPath))
+        Subst.clearStaleDestination dest
+        strict <- unpackNarEntry tmpSensitivity dest tree >>= readLeaf
+        Subst.clearStaleDestination dest
+        source <- chunkReader [raw]
+        streamed <-
+          Subst.consumeNarStream tmpSensitivity dest (streamTestNarInfo raw) (CHash.hashBytes raw) source
+            >>= readLeaf . either (Left . Subst.attemptFailureMessage) (const (Right ()))
+        Subst.clearStaleDestination dest
+        pure $
+          if length leafPath <= 260
+            then Fail "the fixture path is not past MAX_PATH"
+            else assertEqual "leaf contents (strict, streamed)" (Right "deep", Right "deep") (strict, streamed),
       -- The pure case-hack naming is a function of the probed
       -- sensitivity, not of the platform: on a folding volume later
       -- case variants gain the reversible suffix with a per-name
@@ -5308,10 +5401,166 @@ testCaseSensitiveVolumeBody base = do
           result <- Subst.materializeNarFromSource store sp (narInfoFor sp) digest [] Nothing source
           case result of
             Right _ -> trueNames sp
-            Left err -> pure (Fail ("streaming substitution failed: " <> Subst.attemptFailureMessage err))
+            Left err -> pure (Fail ("streaming substitution failed: " <> Subst.attemptFailureMessage err)),
+        -- A source tree copied off this volume into one that folds the
+        -- sharp-s pair: the two names are distinct here and one name
+        -- there, so the copy refuses the second at the write rather
+        -- than landing it on the first (#234).
+        runTestM "a copy into a volume that folds a pair refuses the later name" $ do
+          probed <- tempFoldsSharpS
+          case probed of
+            Left reason -> Pass <$ putStrLn ("  SKIP  " ++ reason)
+            Right tmpBase -> do
+              let src = base </> "nova-nix-test-cs-copy-src"
+                  dest = tmpBase </> "nova-nix-test-cs-copy-dest"
+                  contents = Map.fromList [(T.unpack sharpSUpper, "upper"), (T.unpack sharpSLower, "lower")]
+              forceRemoveIfExists src
+              Subst.clearStaleDestination dest
+              createDirectoryIfMissing True src
+              mapM_ (\(name, bytes) -> BS.writeFile (src </> name) bytes) (Map.toList contents)
+              -- The copy walks the listing's order, which the volume
+              -- chooses, so the refused name is whichever comes second.
+              listed <- Dir.listDirectory src
+              outcome <- try (copyPathInto src dest)
+              landed <- traverse (\name -> (,) name <$> BS.readFile (dest </> name)) (take 1 listed)
+              forceRemoveIfExists src
+              Subst.clearStaleDestination dest
+              pure $ case (listed, outcome) of
+                ([earlier, later], Left (e :: IOException))
+                  | T.pack (ioeGetErrorString e) /= "creating file '" <> quotedAsCxx (dest </> later) <> "': File exists" ->
+                      Fail ("unexpected refusal: " <> T.pack (show e))
+                  | landed /= [(earlier, Map.findWithDefault "" earlier contents)] ->
+                      Fail ("the earlier entry was overwritten: " <> T.pack (show landed))
+                  | otherwise -> Pass
+                (_, Right ()) -> Fail ("the copy succeeded; on disk: " <> T.pack (show landed))
+                other -> Fail ("unexpected listing or outcome: " <> T.pack (show other))
       ]
   closeStore store
   forceRemoveIfExists storeRoot
+  pure results
+
+-- | A path as upstream's formatter streams a @std::filesystem::path@:
+-- through @std::quoted@, in double quotes with a double quote or a
+-- backslash inside escaped by a backslash.
+quotedAsCxx :: FilePath -> Text
+quotedAsCxx path = "\"" <> T.replace "\"" "\\\"" (T.replace "\\" "\\\\" (T.pack path)) <> "\""
+
+-- | U+1E9E (capital sharp s) and U+00DF (small sharp s): a pair APFS
+-- folds to one name and 'onDiskNameKey' keeps apart, since 'toUpper'
+-- leaves U+00DF as it is (#234).  Escaped, as the source is ASCII.
+sharpSUpper, sharpSLower :: Text
+sharpSUpper = "STRA\x1E9E\&E"
+sharpSLower = "stra\xDF\&e"
+
+-- | Whether the volume holding a directory folds the sharp-s pair,
+-- answered by the volume itself: one spelling is created and the other
+-- looked up.  The store's probe says whether a volume folds case at
+-- all, not which pairs its table folds.
+sharpSFolds :: FilePath -> IO Bool
+sharpSFolds dir = do
+  let probeDir = dir </> "nova-nix-test-sharp-s-probe"
+  Subst.clearStaleDestination probeDir
+  createDirectoryIfMissing True probeDir
+  BS.writeFile (probeDir </> T.unpack sharpSUpper) "probe"
+  folds <- Dir.doesFileExist (probeDir </> T.unpack sharpSLower)
+  Subst.clearStaleDestination probeDir
+  pure folds
+
+-- | Whether the suite's temp directory folds the sharp-s pair: the
+-- store's own probe first, then the volume for the pair itself.
+tempFoldsSharpS :: IO (Either String FilePath)
+tempFoldsSharpS = do
+  tmpBase <- getTemporaryDirectory
+  sensitivity <- probeCaseSensitivity tmpBase
+  case sensitivity of
+    CaseSensitive -> pure (Left "the temp directory's volume does not fold case")
+    CaseInsensitive -> do
+      folds <- sharpSFolds tmpBase
+      pure $
+        if folds
+          then Right tmpBase
+          else Left "the temp directory's volume folds case but keeps U+1E9E and U+00DF apart"
+
+-- | A sibling pair the volume folds but 'onDiskNameKey' keeps apart
+-- (#234).  The exclusive create refuses the later entry at the write,
+-- in upstream's wording and naming it, through both unpack paths, and
+-- the earlier entry keeps its own content: nothing lands on it, and
+-- two directories do not merge.  A link needed no new exclusivity
+-- (link creation never replaces a name); its refusal is pinned
+-- alongside.  Skips with the reason where the temp directory's volume
+-- does not fold the pair.
+testFoldingVolumeIO :: IO [Bool]
+testFoldingVolumeIO = do
+  putStrLn "store/folding-volume"
+  probed <- tempFoldsSharpS
+  case probed of
+    Left reason -> do
+      putStrLn ("  SKIP  " ++ reason)
+      pure []
+    Right tmpBase -> testFoldingVolumeBody (tmpBase </> "nova-nix-test-folding")
+
+testFoldingVolumeBody :: FilePath -> IO [Bool]
+testFoldingVolumeBody root = do
+  let upperName = T.unpack sharpSUpper
+      lowerName = T.unpack sharpSLower
+      pair earlier later =
+        NAR.NarDirectory [(TE.encodeUtf8 sharpSUpper, earlier), (TE.encodeUtf8 sharpSLower, later)]
+      filePair = pair (NAR.NarRegular False "upper") (NAR.NarRegular False "lower")
+      linkPair = pair (NAR.NarRegular False "upper") (NAR.NarSymlink "a")
+      dirPair =
+        pair
+          (NAR.NarDirectory [("a", NAR.NarRegular False "upper")])
+          (NAR.NarDirectory [("b", NAR.NarRegular False "lower")])
+      dirOverFilePair = pair (NAR.NarRegular False "upper") (NAR.NarDirectory [("b", NAR.NarRegular False "lower")])
+      fileRefusal dest = "creating file '" <> quotedAsCxx (dest </> lowerName) <> "': File exists"
+      dirRefusal dest = "path '" <> T.pack (dest </> lowerName) <> "' already exists"
+      dirOverFileRefusal dest = "creating directory '" <> T.pack (dest </> lowerName) <> "': File exists"
+      linkRefusal dest = "creating symlink from '" <> T.pack (dest </> lowerName) <> "' -> 'a': File exists"
+      upperFileKept dest = (== "upper") <$> BS.readFile (dest </> upperName)
+      upperDirKept dest = (== ["a"]) <$> Dir.listDirectory (dest </> upperName)
+      narInfoOf raw =
+        NarInfo.NarInfo
+          { NarInfo.niStorePath = "/nix/store/" <> T.replicate 32 "f" <> "-folding",
+            NarInfo.niUrl = "nar/folding.nar",
+            NarInfo.niCompression = "none",
+            NarInfo.niFileHash = Nothing,
+            NarInfo.niFileSize = Nothing,
+            NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes raw),
+            NarInfo.niNarSize = fromIntegral (BS.length raw),
+            NarInfo.niReferences = [],
+            NarInfo.niDeriver = Nothing,
+            NarInfo.niSigs = [],
+            NarInfo.niCA = Nothing
+          }
+      strictly = unpackNarEntry CaseInsensitive
+      streamed dest tree = do
+        let raw = NAR.serialise tree
+        source <- chunkReader [raw]
+        outcome <- Subst.consumeNarStream CaseInsensitive dest (narInfoOf raw) (CHash.hashBytes raw) source
+        pure (either (Left . Subst.attemptFailureMessage) (const (Right ())) outcome)
+      refusedAtWrite label unpack tree refusal kept = runTestM label $ do
+        let dest = root </> "out"
+        Subst.clearStaleDestination dest
+        result <- unpack dest tree
+        earlierKept <- kept dest
+        Subst.clearStaleDestination dest
+        pure $
+          if earlierKept
+            then assertEqual "unpack outcome" (Left (refusal dest)) result
+            else Fail ("the earlier entry was overwritten or merged into; unpack returned " <> T.pack (show result))
+  forceRemoveIfExists root
+  createDirectoryIfMissing True root
+  results <-
+    sequence
+      [ refusedAtWrite "strict unpack refuses the later file of a folded pair" strictly filePair fileRefusal upperFileKept,
+        refusedAtWrite "streaming unpack refuses the later file of a folded pair" streamed filePair fileRefusal upperFileKept,
+        refusedAtWrite "strict unpack refuses the later directory of a folded pair" strictly dirPair dirRefusal upperDirKept,
+        refusedAtWrite "streaming unpack refuses the later directory of a folded pair" streamed dirPair dirRefusal upperDirKept,
+        refusedAtWrite "strict unpack refuses a directory folding onto a file" strictly dirOverFilePair dirOverFileRefusal upperFileKept,
+        refusedAtWrite "streaming unpack refuses a directory folding onto a file" streamed dirOverFilePair dirOverFileRefusal upperFileKept,
+        refusedAtWrite "a link folding onto an earlier file is refused at the link" strictly linkPair linkRefusal upperFileKept
+      ]
+  forceRemoveIfExists root
   pure results
 
 testStoreDB :: IO [Bool]
@@ -12664,6 +12913,7 @@ runSuite = do
           testDepGraph,
           testSubstituter,
           testCaseSensitiveVolumeIO,
+          testFoldingVolumeIO,
           testPathLocks,
           testExecBit,
           testVerifySigs,
