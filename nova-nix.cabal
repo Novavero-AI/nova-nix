@@ -99,6 +99,7 @@ library
     Nix.Builder.Unpack
     Nix.Compression
     Nix.Config
+    Nix.Environment
     Nix.Push
     Nix.Substituter
     Nix.Builtins
@@ -134,10 +135,12 @@ library
     , time                >= 1.9 && < 1.17
     , zstd                >= 0.1 && < 0.2
 
-  -- The exclusive create behind NAR unpacking (Nix.Store.Exclusive),
-  -- which base cannot express.  Win32 2.9 is the first whose
-  -- hANDLEToHandle serves the native Windows I/O manager; unix 2.8 is
-  -- the first whose openFd takes creat and cloexec in its flags.
+  -- Platform calls base cannot express: the exclusive create behind NAR
+  -- unpacking (Nix.Store.Exclusive), and reading the environment as
+  -- bytes on POSIX (Nix.Environment; getenv, as upstream reads it), where
+  -- Windows reads it through base's UTF-16 API.  Win32 2.9 is the first
+  -- whose hANDLEToHandle serves the native Windows I/O manager; unix 2.8
+  -- is the first whose openFd takes creat and cloexec in its flags.
   if os(windows)
     build-depends:
         Win32             >= 2.9 && < 2.15

@@ -50,6 +50,7 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath)
 import Nix.Derivation (fromATerm)
+import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (eval)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
@@ -57,7 +58,7 @@ import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLe
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (parseNix, readFileAutoEncoding)
 import Nix.Store (copyPathInto, unpackNarEntry)
@@ -66,7 +67,6 @@ import qualified Nix.Store.ExecBit as ExecBit
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
-import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, isPathSeparator, isRelative, takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
@@ -158,9 +158,13 @@ data EvalState = EvalState
 
 -- | Create a fresh evaluation state rooted at the given directory, reading
 -- and writing store objects under the given store directory.
--- Reads @NIX_PATH@ from the environment to populate search paths.  The
--- call-depth ceiling starts at upstream's default; a caller with a
--- configured one replaces 'esCallDepth'.
+-- Reads @NIX_PATH@ from the environment to populate search paths, its
+-- bytes unchanged, as upstream's @initGC@ reads it
+-- (src/libexpr/eval-gc.cc at Nix 2.24.9).  The one refusal is a Windows
+-- @NIX_PATH@ holding an unpaired UTF-16 surrogate, which has no UTF-8
+-- form and raises an 'IOException'.  The call-depth ceiling starts at
+-- upstream's default; a caller with a configured one replaces
+-- 'esCallDepth'.
 --
 -- The state is unrestricted.  A restricting policy is set on 'esPolicy',
 -- and the roots it should admit are seeded with 'allowEvalPath' before
@@ -174,10 +178,12 @@ newEvalState storeDir baseDir = do
   storeWriteCache <- newIORef Map.empty
   allowedPaths <- newIORef noAllowedPaths
   now <- floor <$> getPOSIXTime :: IO Int64
-  nixPathStr <- lookupEnvText "NIX_PATH"
-  let searchPaths = case nixPathStr of
-        Just val -> parseNixPath (T.pack val)
-        Nothing -> []
+  nixPath <- lookupEnvBytes nixPathVar
+  searchPaths <- case nixPath of
+    EnvUnset -> pure []
+    EnvValue value -> pure (parseNixPath value)
+    EnvUnpairedSurrogate ->
+      ioError (userError "NIX_PATH holds an unpaired UTF-16 surrogate, which has no UTF-8 form")
   pure
     EvalState
       { esImportCache = cache,
@@ -307,13 +313,18 @@ instance MonadEval EvalIO where
 
   -- Upstream's getEnv answers empty under either setting
   -- (@prim_getEnv@: @restrictEval || pureEval ? "" : getEnv(name)@).
+  -- The read cannot throw, so it needs no wrapIO.
   getEnvVar name = do
     policy <- EvalIO (asks esPolicy)
     if pathsRestricted policy
-      then pure ""
-      else wrapIO $ do
-        mval <- lookupEnvText (T.unpack name)
-        pure (maybe "" T.pack mval)
+      then pure BS.empty
+      else do
+        found <- EvalIO (liftIO (lookupEnvBytes name))
+        case found of
+          EnvUnset -> pure BS.empty
+          EnvValue value -> pure value
+          EnvUnpairedSurrogate ->
+            throwEvalError ("builtins.getEnv: the value of '" <> bytesToTextLossy name <> "' holds an unpaired UTF-16 surrogate, which has no UTF-8 form")
 
   lookupDrvHash key = EvalIO $ do
     ref <- asks esDrvModuloCache
@@ -790,6 +801,10 @@ readComputed ptr = do
 importCacheMaxAttrs :: Int
 importCacheMaxAttrs = 1000
 
+-- | The variable upstream reads its lookup path from.
+nixPathVar :: BS.ByteString
+nixPathVar = "NIX_PATH"
+
 -- | Random bytes in a scratch-dir name suffix (hex-encoded).  128 bits:
 -- unguessable by another local process, collision-free in practice.
 scratchSuffixBytes :: Int
@@ -1127,14 +1142,6 @@ runEvalIO st (EvalIO action) = do
       | Just (NixEvalError _ msg) <- fromException err -> pure (Left msg)
       | Just (NixAbortError msg) <- fromException err -> pure (Left msg)
       | otherwise -> pure (Left (T.pack (displayException err)))
-
--- | Look up an environment variable, returning Nothing if unset.
-lookupEnvText :: String -> IO (Maybe String)
-lookupEnvText name = do
-  result <- try (lookupEnv name)
-  case (result :: Either SomeException (Maybe String)) of
-    Left _ -> pure Nothing
-    Right mval -> pure mval
 
 -- ---------------------------------------------------------------------------
 -- Store copy helpers

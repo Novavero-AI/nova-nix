@@ -19,7 +19,7 @@ import qualified Data.ByteString.Char8 as BC
 import Data.IORef (readIORef)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, mapMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
@@ -352,7 +352,7 @@ resolveDataDir = do
 -- The data dir is appended last so user paths take priority.
 mergeSearchPaths :: [T.Text] -> FilePath -> [Thunk] -> [Thunk]
 mergeSearchPaths extraPaths dataDir envPaths =
-  concatMap parseNixPath extraPaths ++ envPaths ++ parseNixPath (T.pack dataDir)
+  concatMap (parseNixPath . TE.encodeUtf8) extraPaths ++ envPaths ++ parseNixPath (TE.encodeUtf8 (T.pack dataDir))
 
 -- ---------------------------------------------------------------------------
 -- Main
@@ -498,7 +498,7 @@ setUpEval opts config storeDir dataDir baseDir = do
   let policy = evalPolicyFor opts config
   st0 <- newEvalState storeDir baseDir
   let searchPaths
-        | epPureEval policy = parseNixPath (T.pack dataDir)
+        | epPureEval policy = parseNixPath (TE.encodeUtf8 (T.pack dataDir))
         | otherwise = mergeSearchPaths (optNixPaths opts) dataDir (esSearchPaths st0)
       st =
         st0
@@ -511,11 +511,14 @@ setUpEval opts config storeDir dataDir baseDir = do
   -- names a download this evaluator never performs and allows nothing:
   -- upstream allows such an entry's working-directory spelling only by
   -- falling through after a failed download (resolveLookupPathPath), and
-  -- a run that cannot fetch should not widen what it may read.
-  roots <- mapM rootSpellings (filter (not . isNixPathPseudoUrl) (searchPathRoots searchPaths))
+  -- a run that cannot fetch should not widen what it may read.  A root
+  -- with no UTF-8 reading allows nothing: allowed paths are text, so no
+  -- read can name it, and a lossy spelling would allow a different path.
+  roots <- mapM rootSpellings (mapMaybe textRoot (filter (not . isNixPathPseudoUrl) (searchPathRoots searchPaths)))
   mapM_ (allowEvalPath st) (concat roots)
   pure (st, builtinEnv policy (esTimestamp st) searchPaths)
   where
+    textRoot = either (const Nothing) Just . TE.decodeUtf8'
     rootSpellings root = do
       given <- makeAbsolute (T.unpack root)
       resolved <- canonicalizePath given

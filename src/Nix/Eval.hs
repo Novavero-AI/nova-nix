@@ -3375,9 +3375,7 @@ builtinReadDir val = do
 -- ---------------------------------------------------------------------------
 
 builtinGetEnv :: (MonadEval m) => NixValue -> m NixValue
-builtinGetEnv (VStr name _) = do
-  varName <- decodedText "builtins.getEnv" name
-  mkStr <$> getEnvVar varName
+builtinGetEnv (VStr name _) = mkStrBytes <$> getEnvVar name
 builtinGetEnv other =
   throwEvalError ("builtins.getEnv: expected a string, got " <> typeName other)
 
@@ -3446,17 +3444,18 @@ enclosingStorePath p = do
 
 builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinFindFile (VList cl) (VStr name _) = do
-  fileName <- decodedText "builtins.findFile" name
-  let searchPath = map Thunk (clistThunks cl)
-  entries <- mapM forceSearchEntry searchPath
-  findFirst entries fileName
+  entries <- mapM (forceSearchEntry . Thunk) (clistThunks cl)
+  findFirst entries name
 builtinFindFile (VList _) other =
   throwEvalError ("builtins.findFile: expected a string, got " <> typeName other)
 builtinFindFile other _ =
   throwEvalError ("builtins.findFile: expected a list, got " <> typeName other)
 
--- | Extract {prefix, path} from a search path entry thunk.
-forceSearchEntry :: (MonadEval m) => Thunk -> m (Text, Text)
+-- | Extract {prefix, path} from a search path entry thunk, as the bytes
+-- the entry holds.  Upstream keeps both as byte strings, so an entry
+-- whose prefix or path has no UTF-8 reading is still an entry, and one
+-- that names something else does not stop the lookup.
+forceSearchEntry :: (MonadEval m) => Thunk -> m (BS.ByteString, BS.ByteString)
 forceSearchEntry thunk = do
   val <- force thunk
   case val of
@@ -3470,11 +3469,11 @@ forceSearchEntry thunk = do
       prefixVal <- force prefixThunk
       pathVal <- force pathThunk
       prefix <- case prefixVal of
-        VStr s _ -> decodedText "builtins.findFile" s
+        VStr s _ -> pure s
         _ -> throwEvalError "builtins.findFile: 'prefix' must be a string"
       path <- case pathVal of
-        VStr s _ -> decodedText "builtins.findFile" s
-        VPath s -> pure s
+        VStr s _ -> pure s
+        VPath s -> pure (TE.encodeUtf8 s)
         _ -> throwEvalError "builtins.findFile: 'path' must be a string or path"
       pure (prefix, path)
     _ -> throwEvalError "builtins.findFile: search path entry must be a set"
@@ -3485,25 +3484,30 @@ forceSearchEntry thunk = do
 -- the oracle (2.24.9 probes outside its accessor and would hand the path
 -- back) and quieter than 2.33.2 (which refuses from here), and which
 -- gives no caller an existence oracle over paths it may not read.
-findFirst :: (MonadEval m) => [(Text, Text)] -> Text -> m NixValue
-findFirst [] name = searchPathMiss name
-findFirst ((prefix, path) : rest) name
-  | prefix == name || (not (T.null prefix) && (prefix <> "/") `T.isPrefixOf` name) =
-      let suffix = if prefix == name then "" else T.drop (T.length prefix + 1) name
-          candidate = canonPathValue (if T.null suffix then path else path <> "/" <> suffix)
-       in do
-            exists <- doesPathExist ExistsAsEntry candidate
-            if exists
-              then pure (VPath candidate)
-              else findFirst rest name
-  | T.null prefix =
-      let candidate = canonPathValue (path <> "/" <> name)
-       in do
-            exists <- doesPathExist ExistsAsEntry candidate
-            if exists
-              then pure (VPath candidate)
-              else findFirst rest name
-  | otherwise = findFirst rest name
+--
+-- A matching entry's candidate becomes a path value, which is text, so
+-- one with no UTF-8 reading is an error where upstream would probe the
+-- bytes; a lossy spelling would probe a different file.
+findFirst :: (MonadEval m) => [(BS.ByteString, BS.ByteString)] -> BS.ByteString -> m NixValue
+findFirst [] name = searchPathMiss (bytesToTextLossy name)
+findFirst ((prefix, path) : rest) name = case searchPathSuffix prefix name of
+  Nothing -> findFirst rest name
+  Just suffix -> do
+    candidate <- canonPathValue <$> decodedText "builtins.findFile" (if BS.null suffix then path else path <> "/" <> suffix)
+    exists <- doesPathExist ExistsAsEntry candidate
+    if exists
+      then pure (VPath candidate)
+      else findFirst rest name
+
+-- | The part of a looked-up name below a search path prefix that names
+-- it, compared byte for byte: upstream's
+-- @LookupPath::Prefix::suffixIfPotentialMatch@ (src/libexpr/search-path.cc
+-- at Nix 2.24.9).  An empty prefix names every lookup.
+searchPathSuffix :: BS.ByteString -> BS.ByteString -> Maybe BS.ByteString
+searchPathSuffix prefix name
+  | BS.null prefix = Just name
+  | prefix == name = Just BS.empty
+  | otherwise = BS.stripPrefix (prefix <> "/") name
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - store file creation
