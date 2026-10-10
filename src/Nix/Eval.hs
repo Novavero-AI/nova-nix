@@ -129,10 +129,10 @@ import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, plainContext)
-import Nix.Eval.Operator (checkedAdd, checkedMul, checkedSub, evalBinary, evalUnary, evalUpdate, nixCompare, nixEqual)
+import Nix.Eval.Operator (addToFloat, addToInteger, checkedAdd, checkedMul, checkedSub, divisionOverflowMessage, evalBinary, evalUnary, evalUpdate, nixCompare, nixEqual)
 import Nix.Eval.Policy (isAbsolutePath)
-import Nix.Eval.Print (PrintOptions (..), printValue)
-import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, formatXmlFloat, stripIndentedChunks)
+import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printValue)
+import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
 import Nix.Eval.Types
   ( AttrSet (..),
@@ -392,10 +392,7 @@ evalBcBinary env bcIdx0 = case op of
   OpAnd -> evalShortCircuitAnd env leftIdx rightIdx
   OpOr -> evalShortCircuitOr env leftIdx rightIdx
   OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
-  OpAdd -> do
-    leftVal <- evalBytecode env leftIdx
-    rightVal <- evalBytecode env rightIdx
-    evalAddWithCoercion leftVal rightVal
+  OpAdd -> evalAddition (evalBytecode env leftIdx) (evalBytecode env rightIdx)
   -- Not through 'operate', which forces both operands before either is
   -- looked at: the left must be checked before the right is evaluated.
   OpUpdate -> evalUpdate (evalBytecode env leftIdx) (evalBytecode env rightIdx)
@@ -412,55 +409,42 @@ evalBcBinary env bcIdx0 = case op of
       rightVal <- evalBytecode env rightIdx
       evalBinary force op leftVal rightVal
 
--- | Addition with string coercion fallback, matching C++ Nix behavior.
--- C++ Nix's ExprOpAdd falls through to concatStrings when operands
--- are not both numeric and neither is a path.  concatStrings calls
--- coerceToString on each part, which handles attrsets via outPath.
-evalAddWithCoercion :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-evalAddWithCoercion left right = case (left, right) of
-  -- Numeric: direct arithmetic (matches C++ Nix priority)
-  (VFloat _, _) -> evalBinary force OpAdd left right
-  (_, VFloat _) -> evalBinary force OpAdd left right
-  (VInt _, VInt _) -> evalBinary force OpAdd left right
-  -- Path + path: text concatenation, canonicalized - the joined spelling
-  -- (dot segments, doubled separators) never survives into the value, as
-  -- upstream (CanonPath on the concatenated text).
-  (VPath a, VPath b) -> pure (VPath (canonPathValue (a <> b)))
-  -- Path + coercible: the result stays a path, the right side coerces
-  -- WITHOUT a store copy, and a right side carrying string context is an
-  -- error, as upstream (a store-path reference cannot survive inside a
-  -- path value).  Paths are Text in nova, so the appended bytes must
-  -- decode; invalid UTF-8 cannot form a filesystem path here.
-  (VPath a, _) -> do
-    (rightStr, rightCtx) <- coerceAddOperand right
-    if rightCtx == emptyContext
-      then do
-        appended <- decodedText "path concatenation" rightStr
-        pure (VPath (canonPathValue (a <> appended)))
-      else throwEvalError "cannot append a string with context (a store-path reference) to a path"
-  -- Strings: direct concat.
-  (VStr {}, VStr {}) -> evalBinary force OpAdd left right
-  -- Otherwise: string concatenation with STRICT coercion (Nix coerceMore=false)
-  -- - only strings, sets with __toString/outPath, and paths coerce; numbers,
-  -- bools, null, lists, and functions are type errors, matching C++ Nix's `+`.
-  -- A path on the right of a string is COPIED to the store (upstream
-  -- copyToStore=true), so "x" + ./src concatenates the source's store path
-  -- and carries it in the result's context.
-  _ -> do
-    (leftStr, leftCtx) <- coerceAddOperand left
-    (rightStr, rightCtx) <- coerceAddOperand right
-    pure (VStr (leftStr <> rightStr) (leftCtx <> rightCtx))
-
--- | Strict string coercion for the @+@ operator (Nix @coerceMore = false@):
--- strings, sets with @__toString@\/@outPath@, and paths (copied to the
--- store, carrying context) coerce; numbers, booleans, null, lists, and
--- functions are type errors.
-coerceAddOperand :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
-coerceAddOperand v@(VStr {}) = coerceToString False force applyValue coercePathToStore v
-coerceAddOperand v@(VAttrs {}) = coerceToString False force applyValue coercePathToStore v
-coerceAddOperand v@(VPath _) = coerceToStoreString v
-coerceAddOperand v =
-  throwEvalError ("cannot coerce " <> typeName v <> " to a string with the + operator")
+-- | @+@, as upstream's @ExprConcatStrings::eval@ runs it over two operands
+-- (eval.cc at 2.24.9, the same in 2.33.2).  The left operand is evaluated
+-- and dealt with before the right is evaluated, and its type alone decides
+-- what @+@ means: an integer or float makes it arithmetic, a path makes the
+-- result a path, and anything else makes it string concatenation, each
+-- operand coerced strictly (no numbers, Booleans, null or lists), with
+-- upstream's message for a value that does not coerce.  So @{} + throw
+-- "b"@ fails on the set without evaluating the throw, and @true + 1@ is a
+-- coercion failure, not a refused addition.
+--
+-- Only a string on the left copies a path into the store, as upstream
+-- copies only when the first operand is a string: @"x" + ./src@ carries
+-- the source's store path in its context, while @{ outPath = ./src; } +
+-- "x"@ is the path's own text with no context.  A path on the left
+-- appends the right operand's text without a copy, and a right operand
+-- carrying string context is refused, since a path value cannot keep the
+-- reference.  Paths are Text here, so the appended bytes must decode.
+evalAddition :: (MonadEval m) => m NixValue -> m NixValue -> m NixValue
+evalAddition evalLeft evalRight =
+  evalLeft >>= \case
+    VInt a -> evalRight >>= addToInteger a
+    VFloat a -> evalRight >>= addToFloat a
+    VPath base -> do
+      (appended, context) <- evalRight >>= coerceToString False force applyValue coercePathVerbatim
+      unless (contextIsEmpty context) $
+        throwEvalError "a string that refers to a store path cannot be appended to a path"
+      text <- decodedText "path concatenation" appended
+      pure (VPath (canonPathValue (base <> text)))
+    left -> do
+      let coercePath = case left of
+            VStr {} -> coercePathToStore
+            _ -> coercePathVerbatim
+          coerce = coerceToString False force applyValue coercePath
+      (leftStr, leftCtx) <- coerce left
+      (rightStr, rightCtx) <- evalRight >>= coerce
+      pure (VStr (leftStr <> rightStr) (leftCtx <> rightCtx))
 
 -- | Bytecode short-circuit &&
 evalShortCircuitAnd :: (MonadEval m) => Env -> Word32 -> Word32 -> m NixValue
@@ -540,32 +524,32 @@ evalBcPathStr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcPathStr env bcIdx0 = do
   let (count, dataOff) =
         unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
-  chunks <- evalBcPathParts env count dataOff
-  text <- decodedText "path literal" (BS.concat chunks)
+  parts <- evalBcPathParts env count dataOff
+  unless (all (contextIsEmpty . snd) parts) $
+    throwEvalError "a string that refers to a store path cannot be appended to a path"
+  text <- decodedText "path literal" (BS.concat (map fst parts))
   VPath <$> resolvePathLiteral text
 
 -- | The path-segment walk under 'evalBcPathStr': literal pieces pass
 -- through; an interpolated value coerces with upstream's path-segment
--- rules - a context-free string passes, a path contributes its text
--- WITHOUT a store copy (unlike string interpolation, which copies),
--- and a string carrying store-path context is refused, since a path
--- value has nowhere to keep the context that holds a store reference
--- alive.  All three observed from nix-instantiate 2.33.2.
-evalBcPathParts :: (MonadEval m) => Env -> Int -> Word32 -> m [BS.ByteString]
+-- rules - a context-free string passes, and a path contributes its text
+-- WITHOUT a store copy (unlike string interpolation, which copies).  The
+-- context comes back with each piece, because a string carrying it is
+-- refused only once every piece has coerced: a path value has nowhere to
+-- keep the context that holds a store reference alive, and upstream's
+-- @ExprConcatStrings::eval@ checks for one after its loop, so a later
+-- piece that fails to coerce is the error reported.  Observed from
+-- nix-instantiate 2.33.2.
+evalBcPathParts :: (MonadEval m) => Env -> Int -> Word32 -> m [(BS.ByteString, StringContext)]
 evalBcPathParts _ 0 _ = pure []
 evalBcPathParts env n off = do
   let tag = unsafePerformIO (cbcData off)
       val = unsafePerformIO (cbcData (off + 1))
-  chunk <- case tag of
-    0 -> pure (symbolBytes (Symbol val))
-    _ -> do
-      v <- evalBytecode env val
-      (txt, ctx) <- coerceToString False force applyValue coercePathVerbatim v
-      unless (ctx == emptyContext) $
-        throwEvalError "a string that refers to a store path cannot be appended to a path"
-      pure txt
+  part <- case tag of
+    0 -> pure (symbolBytes (Symbol val), emptyContext)
+    _ -> evalBytecode env val >>= coerceToString False force applyValue coercePathVerbatim
   rest <- evalBcPathParts env (n - 1) (off + 2)
-  pure (chunk : rest)
+  pure (part : rest)
 
 -- | Evaluate string parts from the bytecode data buffer.  Each part is two
 -- words: (tag, value), a symbol under 'strpartLit' or 'strpartEsc' and a
@@ -2545,8 +2529,7 @@ builtinDiv _ (VInt 0) = throwEvalError "builtins.div: division by zero"
 builtinDiv (VInt a) (VInt b)
   -- The one overflowing division: |minBound| has no representation.
   | a == minBound && b == -1 =
-      throwEvalError
-        ("integer overflow in dividing " <> T.pack (show a) <> " and " <> T.pack (show b))
+      throwEvalError divisionOverflowMessage
   | otherwise = pure (VInt (quot a b))
 builtinDiv _ (VFloat 0) = throwEvalError "builtins.div: division by zero"
 builtinDiv (VInt a) (VFloat b) = pure (VFloat (fromIntegral a / b))

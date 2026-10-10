@@ -7,11 +7,14 @@ module Nix.Eval.Operator
   ( evalBinary,
     evalUnary,
     evalUpdate,
+    addToInteger,
+    addToFloat,
     nixCompare,
     nixEqual,
     checkedAdd,
     checkedSub,
     checkedMul,
+    divisionOverflowMessage,
   )
 where
 
@@ -41,12 +44,13 @@ type Force m = Thunk -> m NixValue
 
 -- | Evaluate a binary operator on two forced values.
 --
--- The caller must handle short-circuit operators ('OpAnd', 'OpOr',
--- 'OpImpl') before calling this.  The @Force@ function is used only
--- for deep structural equality on compound values.
+-- The caller must handle 'OpAdd' and the short-circuit operators
+-- ('OpAnd', 'OpOr', 'OpImpl') before calling this: each looks at its left
+-- operand before the right is evaluated, and @+@ coerces through the
+-- evaluator.  The @Force@ function is used only for deep structural
+-- equality on compound values.
 evalBinary :: (MonadEval m) => Force m -> BinaryOp -> NixValue -> NixValue -> m NixValue
 evalBinary forceFn op left right = case op of
-  OpAdd -> evalAdd left right
   OpSub -> evalArith "subtraction" checkedSub (-) left right
   OpMul -> evalArith "multiplication" checkedMul (*) left right
   OpDiv -> evalDiv left right
@@ -62,7 +66,8 @@ evalBinary forceFn op left right = case op of
   OpGte -> VBool . not <$> nixCompare forceFn left right
   OpConcat -> evalConcat left right
   OpUpdate -> evalUpdate (pure left) (pure right)
-  -- Short-circuit ops must be handled by the caller
+  -- Left-first ops must be handled by the caller
+  OpAdd -> throwEvalError "internal error: OpAdd should be handled by eval"
   OpAnd -> throwEvalError "internal error: OpAnd should be handled by eval"
   OpOr -> throwEvalError "internal error: OpOr should be handled by eval"
   OpImpl -> throwEvalError "internal error: OpImpl should be handled by eval"
@@ -73,51 +78,65 @@ evalUnary OpNot val = case val of
   VBool b -> pure (VBool (not b))
   other -> throwEvalError ("cannot apply ! to " <> typeName other)
 evalUnary OpNegate val = case val of
-  -- negate minBound has no Int64 representation; upstream desugars unary
-  -- minus to 0 - n, so it reports the same checked-subtraction overflow.
+  -- Upstream's parser turns -e into __sub 0 e (parser.y at 2.24.9), so
+  -- negation is builtins.sub with 0 on the left in every respect: minBound
+  -- reports the checked-subtraction overflow, a float zero comes out
+  -- positive (0 - 0.0, where negate would give -0.0), and a non-number
+  -- fails sub's forceInt on its second argument.
   VInt n -> either throwEvalError (pure . VInt) (checkedSub 0 n)
-  VFloat n -> pure (VFloat (negate n))
-  other -> throwEvalError ("cannot negate " <> typeName other)
+  VFloat n -> pure (VFloat (0.0 - n))
+  other ->
+    throwEvalError ("expected an integer but found " <> typeName other <> ": " <> printValue PrintForError other)
 
--- | Addition: int/float arithmetic and string concatenation.  Path
--- operands never reach here - @Nix.Eval.evalAddWithCoercion@ handles them
--- (store-copy coercion for @string + path@, context checks for
--- @path + string@) before delegating.
-evalAdd :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-evalAdd (VInt a) (VInt b) = either throwEvalError (pure . VInt) (checkedAdd a b)
-evalAdd (VInt a) (VFloat b) = pure (VFloat (fromIntegral a + b))
-evalAdd (VFloat a) (VInt b) = pure (VFloat (a + fromIntegral b))
-evalAdd (VFloat a) (VFloat b) = pure (VFloat (a + b))
-evalAdd (VStr a ctxA) (VStr b ctxB) = pure (VStr (a <> b) (ctxA <> ctxB))
-evalAdd left right =
-  throwEvalError ("cannot add " <> typeName left <> " and " <> typeName right)
+-- | @+@ once its left operand is an integer, given the right: upstream's
+-- @ExprConcatStrings::eval@ (eval.cc at 2.24.9) adds a number and refuses
+-- anything else, naming the right operand's type.  A float on the right
+-- makes the sum a float.
+addToInteger :: (MonadEval m) => Int64 -> NixValue -> m NixValue
+addToInteger a right = case right of
+  VInt b -> either throwEvalError (pure . VInt) (checkedAdd a b)
+  VFloat b -> pure (VFloat (fromIntegral a + b))
+  other -> throwEvalError ("cannot add " <> typeName other <> " to an integer")
 
--- | Checked Int64 arithmetic: integer overflow is an eval error (Nix
--- 2.24 semantics), never a two's-complement wrap.  Computed in Integer
--- and bounds-checked.
-checkedIntOp :: Text -> (Integer -> Integer -> Integer) -> Int64 -> Int64 -> Either Text Int64
-checkedIntOp verb op a b
+-- | @+@ once its left operand is a float, as 'addToInteger'.
+addToFloat :: (MonadEval m) => Double -> NixValue -> m NixValue
+addToFloat a right = case right of
+  VInt b -> pure (VFloat (a + fromIntegral b))
+  VFloat b -> pure (VFloat (a + b))
+  other -> throwEvalError ("cannot add " <> typeName other <> " to a float")
+
+-- | Checked Int64 arithmetic: integer overflow is an eval error, never a
+-- two's-complement wrap.  Computed in Integer and bounds-checked.  2.24.9
+-- leaves overflow to C++ signed arithmetic, which is undefined; upstream
+-- checks it from 2.25, and its message is followed.  Division is the
+-- exception, see 'divisionOverflowMessage'.
+checkedIntOp :: Text -> Text -> (Integer -> Integer -> Integer) -> Int64 -> Int64 -> Either Text Int64
+checkedIntOp verb symbol op a b
   | wide < toInteger (minBound :: Int64) || wide > toInteger (maxBound :: Int64) =
-      Left
-        ( "integer overflow in "
-            <> verb
-            <> " "
-            <> T.pack (show a)
-            <> " and "
-            <> T.pack (show b)
-        )
+      Left (overflowMessage verb symbol a b)
   | otherwise = Right (fromInteger wide)
   where
     wide = op (toInteger a) (toInteger b)
 
+-- | Upstream's overflow message: @integer overflow in adding a + b@.
+overflowMessage :: Text -> Text -> Int64 -> Int64 -> Text
+overflowMessage verb symbol a b =
+  "integer overflow in " <> verb <> " " <> T.pack (show a) <> " " <> symbol <> " " <> T.pack (show b)
+
+-- | @minBound / -1@, the one overflowing division.  2.24.9 checks it
+-- itself (prim_div), so its message wins over 2.25's
+-- @integer overflow in dividing a / b@.
+divisionOverflowMessage :: Text
+divisionOverflowMessage = "overflow in integer division"
+
 checkedAdd :: Int64 -> Int64 -> Either Text Int64
-checkedAdd = checkedIntOp "adding" (+)
+checkedAdd = checkedIntOp "adding" "+" (+)
 
 checkedSub :: Int64 -> Int64 -> Either Text Int64
-checkedSub = checkedIntOp "subtracting" (-)
+checkedSub = checkedIntOp "subtracting" "-" (-)
 
 checkedMul :: Int64 -> Int64 -> Either Text Int64
-checkedMul = checkedIntOp "multiplying" (*)
+checkedMul = checkedIntOp "multiplying" "*" (*)
 
 -- | Generic arithmetic for subtraction and multiplication.  The integer
 -- side is a checked op ('checkedSub' / 'checkedMul').
@@ -152,8 +171,7 @@ evalDiv left right = case (left, right) of
   (VInt a, VInt b)
     -- The one overflowing division: |minBound| has no representation.
     | a == minBound && b == -1 ->
-        throwEvalError
-          ("integer overflow in dividing " <> T.pack (show a) <> " and " <> T.pack (show b))
+        throwEvalError divisionOverflowMessage
     | otherwise -> pure (VInt (quot a b))
   (VInt a, VFloat b)
     | b == 0 -> throwEvalError "division by zero"

@@ -55,7 +55,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), cu
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
 import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
-import Nix.Eval.AttrPath (parseAttrPath)
+import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcDataCount, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
@@ -243,6 +243,16 @@ assertEvalError label source expected = case evalNix source of
         Fail (label <> ": expected an eval error but the source did not parse: " <> err)
     | otherwise -> assertEqual label expected err
   Right val -> Fail (label <> ": expected eval failure but got: " <> T.pack (show val))
+
+-- | 'assertEvalError' under the IO evaluator, which keeps a forced
+-- thunk's value and marks one while it is being forced, as upstream's
+-- evaluator does; the pure one does neither.
+assertEvalErrorIO :: FilePath -> Text -> Text -> Text -> IO TestResult
+assertEvalErrorIO baseDir label source expected = do
+  result <- evalNixIO baseDir source
+  pure $ case result of
+    Left err -> assertEqual label expected err
+    Right val -> Fail (label <> ": expected eval failure but got: " <> T.pack (show val))
 
 -- | Assert that a Nix expression fails at PARSE time.
 assertParseFail :: Text -> Text -> TestResult
@@ -475,18 +485,28 @@ testEvalArithmetic = do
         assertEval "div" "10 / 3" (VInt 3),
       runTest "float add" $
         assertEval "float-add" "1.5 + 2.5" (VFloat 4.0),
-      -- Integer overflow is an eval error (Nix 2.24 semantics), never a
-      -- two's-complement wrap; the boundary itself still computes.
+      -- Integer overflow is an eval error, never a two's-complement wrap;
+      -- the boundary itself still computes.  The messages are upstream's
+      -- from 2.25 on, as nix-instantiate 2.33.2 prints them (2.24.9 leaves
+      -- overflow to undefined C++ signed arithmetic), except division's,
+      -- which 2.24.9 checks itself and 2.25 rewords.
       runTest "add overflow fails" $
-        assertEvalFail "add-overflow" "9223372036854775807 + 1",
+        assertEvalError "add-overflow" "9223372036854775807 + 1" "integer overflow in adding 9223372036854775807 + 1",
       runTest "sub overflow fails" $
-        assertEvalFail "sub-overflow" "(-9223372036854775807) - 2",
+        assertEvalError "sub-overflow" "(-9223372036854775807) - 2" "integer overflow in subtracting -9223372036854775807 - 2",
       runTest "mul overflow fails" $
-        assertEvalFail "mul-overflow" "builtins.mul 9223372036854775807 2",
+        assertEvalError "mul-overflow" "builtins.mul 9223372036854775807 2" "integer overflow in multiplying 9223372036854775807 * 2",
       runTest "div minBound by -1 overflows" $
-        assertEvalFail "div-overflow" "((-9223372036854775807) - 1) / (-1)",
-      runTest "negate minBound overflows" $
-        assertEvalFail "neg-overflow" "-((-9223372036854775807) - 1)",
+        assertEvalError "div-overflow" "((-9223372036854775807) - 1) / (-1)" "overflow in integer division",
+      runTest "builtins.div minBound by -1 overflows" $
+        assertEvalError "builtin-div-overflow" "builtins.div ((-9223372036854775807) - 1) (-1)" "overflow in integer division",
+      runTest "negate minBound overflows as 0 - n" $
+        assertEvalError "neg-overflow" "-((-9223372036854775807) - 1)" "integer overflow in subtracting 0 - -9223372036854775808",
+      -- Unary minus is __sub 0 e upstream (parser.y at 2.24.9).
+      runTest "negating a float zero gives positive zero" $
+        assertEval "neg-zero" "builtins.toJSON [ (-(0.0)) (-(-0.0)) ]" (mkStr "[0.0,0.0]"),
+      runTest "negating a non-number fails as builtins.sub does" $
+        assertEvalError "neg-set" "-{ }" "expected an integer but found a set: { }",
       runTest "add at the boundary still works" $
         assertEval "add-boundary" "9223372036854775806 + 1 == 9223372036854775807" (VBool True),
       runTest "int-float promotion" $
@@ -687,9 +707,34 @@ testEvalAttrs = do
 testValuePrinter :: IO [Bool]
 testValuePrinter = do
   putStrLn "eval/print"
+  tmpBase <- getTemporaryDirectory
   let stringFound body = "expected a set but found a string: " <> body
+      setFound body = "cannot coerce a set to a string: " <> body
+      listFound body = "cannot coerce a list to a string: " <> body
       runOfA n = "builtins.concatStringsSep \"\" (builtins.genList (x: \"a\") " <> T.pack (show (n :: Int)) <> ")"
       elided what = " \x00AB" <> what <> " elided\x00BB"
+      marker inner = "\x00AB" <> inner <> "\x00BB"
+      interpolated source = "\"${" <> source <> "}\""
+      deeplyForced source = "let x = " <> source <> "; in builtins.seq (builtins.deepSeq x null) \"${x}\""
+      ints n = map (T.pack . show) [1 .. n :: Int]
+      listOfInts n = "[ " <> T.concat (map (<> " ") (ints n)) <> "]"
+      attrsOfInts n = "{ " <> T.concat [name <> " = " <> value <> "; " | (name, value) <- zip letters (ints n)] <> "}"
+      letters = map T.singleton ['a' ..]
+      shownInts = T.unwords [name <> " = " <> value <> ";" | (name, value) <- zip letters (ints 10)]
+      paddedName i = T.pack ('a' : if i < 10 then '0' : show i else show i)
+      paddedAttrs n = "{ " <> T.concat [paddedName i <> " = " <> T.pack (show i) <> "; " | i <- [1 .. n]] <> "}"
+      boundedList n = bounded "[" "]" (ints (min n 10)) (n - 10) "item" "items"
+      boundedAttrs n =
+        bounded "{" "}" [paddedName i <> " = " <> T.pack (show i) <> ";" | i <- [1 .. min n 10]] (n - 10) "attribute" "attributes"
+      bounded open close shown left single plural =
+        open <> " " <> T.concat (map (<> " ") shown) <> leftOut left single plural <> close
+      leftOut left single plural
+        | left <= 0 = ""
+        | left == 1 = marker ("1 " <> single <> " elided") <> " "
+        | otherwise = marker (T.pack (show left) <> " " <> plural <> " elided") <> " "
+      quickCheckPasses property = do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
   sequence
     [ -- Values print as upstream's printValue prints them under
       -- errorPrintOptions (print.cc and print-options.hh at 2.24.9), each
@@ -723,6 +768,102 @@ testValuePrinter = do
           "print-cut-dollar"
           ("{} // (" <> runOfA 1023 <> " + \"\\${\")")
           (stringFound ("\"" <> T.replicate 1023 "a" <> "\\$\"" <> elided "1 byte")),
+      -- A set or list prints its entries, nothing forced, and is cut
+      -- once the print has shown ten attributes or ten items in all.
+      runTest "a set prints its attributes by name" $
+        assertEvalError "print-set" "\"${{ b = \"s\"; a = 1; }}\"" (setFound "{ a = 1; b = \"s\"; }"),
+      runTest "an empty set prints as a pair of braces" $
+        assertEvalError "print-empty-set" "\"${{}}\"" (setFound "{ }"),
+      runTest "_type and type print ahead of the other attributes" $
+        assertEvalError
+          "print-important-first"
+          "\"${{ z = 1; type = 2; _type = 3; a = 4; }}\""
+          (setFound "{ _type = 3; type = 2; a = 4; z = 1; }"),
+      runTest "an attribute name the lexer cannot read bare prints quoted" $
+        assertEvalError
+          "print-quoted-names"
+          "\"${{ \"a b\" = 1; \"if\" = 2; \"\" = 3; }}\""
+          (setFound "{ \"\" = 3; \"a b\" = 1; \"if\" = 2; }"),
+      runTest "an attribute never forced prints as upstream's thunk marker" $
+        assertEvalError "print-thunk" "\"${{ a = 1 + 1; }}\"" (setFound ("{ a = " <> marker "thunk" <> "; }")),
+      runTest "an eleventh attribute is counted, not shown" $
+        assertEvalError
+          "print-11-attrs"
+          (interpolated (attrsOfInts 11))
+          (setFound ("{ " <> shownInts <> " " <> marker "1 attribute elided" <> " }")),
+      runTest "attributes past the tenth are counted together" $
+        assertEvalError
+          "print-12-attrs"
+          (interpolated (attrsOfInts 12))
+          (setFound ("{ " <> shownInts <> " " <> marker "2 attributes elided" <> " }")),
+      runTest "an empty list prints as a pair of brackets" $
+        assertEvalError "print-empty-list" "\"${[ ]}\"" (listFound "[ ]"),
+      runTest "an eleventh item is counted, not shown" $
+        assertEvalError
+          "print-11-items"
+          (interpolated (listOfInts 11))
+          (listFound ("[ 1 2 3 4 5 6 7 8 9 10 " <> marker "1 item elided" <> " ]")),
+      runTest "items past the tenth are counted together" $
+        assertEvalError
+          "print-12-items"
+          (interpolated (listOfInts 12))
+          (listFound ("[ 1 2 3 4 5 6 7 8 9 10 " <> marker "2 items elided" <> " ]")),
+      runTestM "a list shows ten items and counts the rest" $
+        quickCheckPasses $
+          QC.forAll (QC.chooseInt (0, 25)) $ \n ->
+            evalNix (interpolated (listOfInts n)) QC.=== Left (listFound (boundedList n)),
+      runTestM "a set shows ten attributes and counts the rest" $
+        quickCheckPasses $
+          QC.forAll (QC.chooseInt (0, 25)) $ \n ->
+            evalNix (interpolated (paddedAttrs n)) QC.=== Left (setFound (boundedAttrs n)),
+      -- Forced values need the IO evaluator, which keeps them.
+      runTestM "a nested set's attributes count before the attribute holding it" $
+        assertEvalErrorIO
+          tmpBase
+          "print-nested-count"
+          (deeplyForced "{ a = { b = 1; c = 2; d = 3; e = 4; f = 5; g = 6; }; h = 7; i = 8; j = 9; k = 10; l = 11; }")
+          (setFound ("{ a = { b = 1; c = 2; d = 3; e = 4; f = 5; g = 6; }; h = 7; i = 8; j = 9; " <> marker "2 attributes elided" <> " }")),
+      runTestM "list items count over the whole print" $
+        assertEvalErrorIO
+          tmpBase
+          "print-items-across-lists"
+          (deeplyForced "{ a = [ 1 2 3 4 5 6 7 8 9 ]; b = [ 10 11 12 ]; }")
+          (setFound ("{ a = [ 1 2 3 4 5 6 7 8 9 ]; b = [ 10 " <> marker "2 items elided" <> " ]; }")),
+      runTestM "a set nested ten deep prints as an ellipsis" $
+        assertEvalErrorIO
+          tmpBase
+          "print-deep-set"
+          (deeplyForced (T.replicate 12 "{ a = " <> "1" <> T.replicate 12 "; }"))
+          (setFound (T.replicate 10 "{ a = " <> "{ ... }" <> T.replicate 10 "; }")),
+      runTestM "a list nested ten deep prints as an ellipsis" $
+        assertEvalErrorIO
+          tmpBase
+          "print-deep-list"
+          (deeplyForced (T.replicate 12 "[ " <> "1" <> T.replicate 12 " ]"))
+          (listFound (T.replicate 10 "[ " <> "[ ... ]" <> T.replicate 10 " ]")),
+      runTestM "an attribute being forced prints as upstream's recursion marker" $
+        assertEvalErrorIO
+          tmpBase
+          "print-blackhole"
+          "let x = { a = \"${x}\"; }; in x.a"
+          (setFound ("{ a = " <> marker "potential infinite recursion" <> "; }")),
+      runTest "a primop prints as upstream's primop marker" $
+        assertEvalError
+          "print-primop"
+          "{} // builtins.map"
+          ("expected a set but found the built-in function 'map': " <> marker "primop map"),
+      runTest "a partially applied primop prints as upstream's marker" $
+        assertEvalError
+          "print-primop-app"
+          "{} // builtins.map (x: x)"
+          ("expected a set but found the partially applied built-in function 'map': " <> marker "partially applied primop map"),
+      -- builtins.trace's defaults bound nothing and sort only by name.
+      runTest "a set prints in full by name as trace prints it"
+        $ assertRight "print-full-set" (evalNix "{ type = 1; a = 2; }")
+        $ assertEqual "print-full-set" "{ a = 2; type = 1; }" . printValue PrintInFull,
+      runTest "a long list prints in full as trace prints it"
+        $ assertRight "print-full-list" (evalNix (listOfInts 12))
+        $ assertEqual "print-full-list" "[ 1 2 3 4 5 6 7 8 9 10 11 12 ]" . printValue PrintInFull,
       -- builtins.trace prints a non-string through the same printer with
       -- upstream's default options.
       runTest "a float prints in full as trace prints it" $
@@ -742,6 +883,114 @@ testValuePrinter = do
 genEscapable :: QC.Gen Text
 genEscapable =
   T.concat <$> QC.listOf (QC.elements ["\"", "\\", "\n", "\r", "\t", "$", "{", "}", "${", "a", " ", "\233", "\128512"])
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval - + and string coercion errors
+-- ---------------------------------------------------------------------------
+
+-- | @+@ and string coercion fail with upstream's messages, those of
+-- @ExprConcatStrings::eval@ and @coerceToString@ (eval.cc at 2.24.9): the
+-- type as @showType@ names it, and after a failed coercion the value as
+-- @errorPrintOptions@ prints it.  Each expected message is nix-instantiate
+-- 2.33.2's final error line for the same expression.
+testCoercionErrors :: IO [Bool]
+testCoercionErrors = do
+  putStrLn "eval/coercion"
+  tmpBase <- getTemporaryDirectory
+  let testDir = tmpBase </> "nova-nix-test-coercion"
+      setup = createDirectoryIfMissing True (testDir </> "d")
+      cleanup = do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+      withContext = "\"${builtins.toFile \"a\" \"b\"}\""
+      primopMarker = "\x00ABprimop map\x00BB"
+      failsIO label source expected = runTestM label (assertEvalErrorIO testDir label source expected)
+  bracket_ setup cleanup . sequence $
+    [ -- An integer or float on the left makes + arithmetic, and a right
+      -- operand that is no number is named.
+      runTest "an integer plus a string cannot be added" $
+        assertEvalError "add-int-string" "1 + \"a\"" "cannot add a string to an integer",
+      runTest "a float plus a string cannot be added" $
+        assertEvalError "add-float-string" "1.0 + \"a\"" "cannot add a string to a float",
+      runTest "an integer plus null cannot be added" $
+        assertEvalError "add-int-null" "1 + null" "cannot add null to an integer",
+      failsIO "an integer plus a string with context names the context" ("1 + " <> withContext) "cannot add a string with context to an integer",
+      runTest "an integer plus a primop names the primop" $
+        assertEvalError "add-int-primop" "1 + builtins.map" "cannot add the built-in function 'map' to an integer",
+      runTest "an integer plus a partial application names its primop" $
+        assertEvalError
+          "add-int-primop-app"
+          "1 + builtins.map (x: x)"
+          "cannot add the partially applied built-in function 'map' to an integer",
+      -- Anything else on the left makes + concatenation, each operand
+      -- coerced as interpolation coerces it.
+      runTest "a primop on the left does not coerce" $
+        assertEvalError "add-primop-int" "builtins.map + 1" ("cannot coerce the built-in function 'map' to a string: " <> primopMarker),
+      failsIO "a string with context plus an integer refuses the integer" (withContext <> " + 1") "cannot coerce an integer to a string: 1",
+      runTest "a Boolean on the left fails to coerce rather than to add" $
+        assertEvalError "add-bool-int" "true + 1" "cannot coerce a Boolean to a string: true",
+      runTest "a string plus a float refuses the float" $
+        assertEvalError "add-string-float" "\"a\" + 1.5" "cannot coerce a float to a string: 1.5",
+      runTest "a string plus a list refuses the list" $
+        assertEvalError "add-string-list" "\"a\" + [ ]" "cannot coerce a list to a string: [ ]",
+      runTest "a path plus an integer refuses the integer" $
+        assertEvalError "add-path-int" "./d + 1" "cannot coerce an integer to a string: 1",
+      failsIO
+        "a path plus a string with context is refused"
+        ("./d + " <> withContext)
+        "a string that refers to a store path cannot be appended to a path",
+      -- The left operand is dealt with before the right is evaluated.
+      runTest "a set on the left fails before the right is evaluated" $
+        assertEvalError "add-left-first" "{} + throw \"b\"" "cannot coerce a set to a string: { }",
+      runTest "tryEval does not catch a failed coercion" $
+        assertEvalError "add-tryEval" "builtins.tryEval ({} + throw \"b\")" "cannot coerce a set to a string: { }",
+      -- Upstream copies a path into the store only when the left operand
+      -- is a string, so a set's outPath on the left is its own text.
+      runTestM "a set on the left contributes its path without a store copy" $ do
+        result <- evalNixIO testDir "let s = { outPath = ./d; } + \"x\"; in builtins.getContext s == {} && s == toString ./d + \"x\""
+        pure (assertRight "add-set-path" result (assertEqual "add-set-path" (VBool True))),
+      -- Interpolation, toString and concatStringsSep coerce the same way.
+      runTest "an interpolated set without outPath prints the set" $
+        assertEvalError "interp-set" "\"${{ a = 1; b = \"s\"; }}\"" "cannot coerce a set to a string: { a = 1; b = \"s\"; }",
+      runTest "an interpolated integer is refused" $
+        assertEvalError "interp-int" "\"v${1}\"" "cannot coerce an integer to a string: 1",
+      runTest "toString of a primop is refused" $
+        assertEvalError "tostring-primop" "builtins.toString builtins.map" ("cannot coerce the built-in function 'map' to a string: " <> primopMarker),
+      runTest "toString of a partial application is refused" $
+        assertEvalError
+          "tostring-primop-app"
+          "builtins.toString (builtins.map (x: x))"
+          "cannot coerce the partially applied built-in function 'map' to a string: \x00ABpartially applied primop map\x00BB",
+      -- Upstream prints a lambda's source position after the word, which
+      -- a nova-nix function value does not carry.
+      runTest "toString of a lambda is refused" $
+        assertEvalError "tostring-lambda" "builtins.toString (x: x)" "cannot coerce a function to a string: \x00ABlambda\x00BB",
+      runTest "toString of a set without outPath is refused" $
+        assertEvalError "tostring-set" "builtins.toString { }" "cannot coerce a set to a string: { }",
+      runTest "concatStringsSep refuses an integer element" $
+        assertEvalError "concatsep-int" "builtins.concatStringsSep \",\" [ 1 ]" "cannot coerce an integer to a string: 1",
+      -- An interpolated path literal concatenates as + does with a path
+      -- first, and refuses a context only after every piece coerced.
+      runTest "a path segment refuses a set" $
+        assertEvalError "path-segment-set" "./a${{}}" "cannot coerce a set to a string: { }",
+      failsIO
+        "a later path segment that fails to coerce is reported over an earlier one's context"
+        ("./a${" <> withContext <> "}${1}")
+        "cannot coerce an integer to a string: 1",
+      -- A selection path names the type it cannot index as showType does
+      -- (attr-path.cc at 2.24.9).
+      runTest "a selection path through a function names it" $
+        assertRight "attrpath-functions" (evalNix "{ a = builtins.map; b = builtins.map (x: x); c = x: x; }") $ \root ->
+          assertEqual
+            "attrpath-functions"
+            ( Right
+                [ Left "the expression selected by the selection path 'a.x' should be a set but is the built-in function 'map'",
+                  Left "the expression selected by the selection path 'b.x' should be a set but is the partially applied built-in function 'map'",
+                  Left "the expression selected by the selection path 'c.x' should be a set but is a function"
+                ]
+            )
+            (runPureEval (mapM (`selectAttrPath` root) ["a.x", "b.x", "c.x"]))
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Eval - Result printer
@@ -2478,7 +2727,7 @@ testDerivationTraceIO = do
         "a failing derivation attribute is named in the failure's trace"
         ( derivationFailure
             "system = \"s\"; name = \"x\"; foo = { };"
-            (EvalFailure ["while evaluating attribute 'foo' of derivation 'x'"] "cannot coerce a set to a string (missing __toString or outPath)")
+            (EvalFailure ["while evaluating attribute 'foo' of derivation 'x'"] "cannot coerce a set to a string: { }")
         ),
       runTestM
         "a structured attribute with no JSON form is named in the failure's trace"
@@ -14960,6 +15209,7 @@ runSuite = do
           testEvalLet,
           testEvalAttrs,
           testValuePrinter,
+          testCoercionErrors,
           testResultPrinter,
           testEvalRecAttrs,
           testEvalLists,

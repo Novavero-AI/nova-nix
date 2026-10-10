@@ -12,7 +12,6 @@ module Nix.Eval.StringInterp
     CoercePath,
     coerceToString,
     formatNixFloat,
-    formatXmlFloat,
   )
 where
 
@@ -22,6 +21,7 @@ import qualified Data.ByteString.Char8 as BC
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Nix.Eval.Print (PrintOptions (..), printValue)
 import Nix.Eval.Types (MonadEval (..), NixValue (..), StringContext, Thunk, attrSetLookup, emptyContext, typeName)
 import Numeric (showFFloat)
 
@@ -202,10 +202,17 @@ coerceToString coerceMore forceFn applyFn coercePathFn (VAttrs attrs) =
       Just outPathThunk -> do
         outPathVal <- forceFn outPathThunk
         coerceToString coerceMore forceFn applyFn coercePathFn outPathVal
-      Nothing ->
-        throwEvalError "cannot coerce a set to a string (missing __toString or outPath)"
-coerceToString _ _ _ _ other =
-  throwEvalError ("cannot coerce " <> typeName other <> " to a string")
+      Nothing -> uncoercible (VAttrs attrs)
+coerceToString _ _ _ _ other = uncoercible other
+
+-- | Upstream's refusal of a value no coercion takes (@coerceToString@,
+-- eval.cc at 2.24.9): its type, then the value as an error prints it.
+-- The message is built before it is thrown, so a thunk it shows reads as
+-- it is at the failure, not as it is once the force around the failure
+-- has been unwound.
+uncoercible :: (MonadEval m) => NixValue -> m a
+uncoercible val =
+  throwEvalError $! "cannot coerce " <> typeName val <> " to a string: " <> printValue PrintForError val
 
 -- | Format a float the way C++ Nix's coerceToString does -
 -- @std::to_string@, i.e. FIXED 6 decimal places with no trimming:
@@ -233,79 +240,3 @@ formatNixFloat n
       | otherwise = s
     dropDot ('.' : rest) = rest
     dropDot xs = xs
-
--- | Exponent suffix of the XML float layout, as printf writes it: sign
--- always present, magnitude zero-padded to at least two digits (@+05@,
--- @-21@).
-signedExponent :: Int -> String
-signedExponent e
-  | e < 0 = '-' : padded (negate e)
-  | otherwise = '+' : padded e
-  where
-    padded n
-      | n < 10 = '0' : show n
-      | otherwise = show n
-
--- | Format a float as upstream @toXML@ and @printValue@ render one - C++
--- @operator<<@ on a default-format ostream: 6 significant digits, trailing
--- zeros stripped, plain decimal only for decimal exponents in [-4, 5],
--- otherwise @d.ddde+XX@ with a signed exponent of at least two digits.
--- Rounding is half-even on the exact binary value, matching a
--- correctly-rounded printf.
-formatXmlFloat :: Double -> Text
-formatXmlFloat d
-  | isNaN d = "nan"
-  | isInfinite d = if d > 0 then "inf" else "-inf"
-  | d == 0 = if isNegativeZero d then "-0" else "0"
-  | d < 0 = "-" <> formatXmlFloat (negate d)
-  | otherwise = T.pack (xmlFloatPositive d)
-
--- | 6-significant-digit @%g@ layout of a positive finite double.
-xmlFloatPositive :: Double -> String
-xmlFloatPositive d =
-  let exact = toRational d
-      roughExp = decimalExponentOf exact
-      rounded = round (exact * 10 ^^ (xmlSigDigits - 1 - roughExp)) :: Integer
-      -- Rounding can carry into a new leading digit (999999.9 -> 1000000).
-      (sigDigits, pointExp) =
-        if rounded >= 10 ^ xmlSigDigits
-          then (rounded `div` 10, roughExp + 1)
-          else (rounded, roughExp)
-      digits = show sigDigits
-   in if xmlMinFixedExp <= pointExp && pointExp < xmlSigDigits
-        then fixedForm digits pointExp
-        else sciForm digits pointExp
-  where
-    fixedForm digits pointExp
-      | pointExp >= 0 =
-          let (intPart, fracPart) = splitAt (pointExp + 1) digits
-           in joinFraction intPart (stripTrailingZeros fracPart)
-      | otherwise =
-          joinFraction "0" (stripTrailingZeros (replicate (negate pointExp - 1) '0' <> digits))
-    sciForm digits pointExp =
-      joinFraction (take 1 digits) (stripTrailingZeros (drop 1 digits))
-        <> "e"
-        <> signedExponent pointExp
-    joinFraction intPart fracPart
-      | null fracPart = intPart
-      | otherwise = intPart <> "." <> fracPart
-    stripTrailingZeros = reverse . dropWhile (== '0') . reverse
-
--- | @%g@ default precision: 6 significant digits.
-xmlSigDigits :: Int
-xmlSigDigits = 6
-
--- | @%g@ switches to scientific below a decimal exponent of -4.
-xmlMinFixedExp :: Int
-xmlMinFixedExp = -4
-
--- | The decimal exponent @e@ of a positive rational: the unique @e@ with
--- @10^e <= r < 10^(e+1)@.  A float log gives the estimate; the exact
--- comparisons correct it, since the log is off by one near powers of ten.
-decimalExponentOf :: Rational -> Int
-decimalExponentOf r = correct (floor (logBase 10 (fromRational r :: Double)))
-  where
-    correct e
-      | 10 ^^ e > r = correct (e - 1)
-      | 10 ^^ (e + 1) <= r = correct (e + 1)
-      | otherwise = e

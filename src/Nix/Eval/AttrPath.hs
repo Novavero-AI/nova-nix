@@ -33,7 +33,7 @@ where
 
 import Data.Text (Text)
 import qualified Data.Text as T
-import Nix.Eval (MonadEval, NixValue (..), attrSetLookup, force)
+import Nix.Eval (MonadEval, NixValue (..), attrSetLookup, force, typeName)
 
 -- ---------------------------------------------------------------------------
 -- Tokenizing
@@ -100,27 +100,7 @@ selectAttrPath path root = case parseAttrPath path of
             Just thunk -> force thunk >>= walk rest
       -- Ordered as upstream orders it: the type of what is being indexed
       -- is reported before an empty component is complained about.
-      _ -> pure (Left (notASetMessage path (describe val)))
-
--- | How a value is named in a selection error.
---
--- Deliberately not 'typeOfValue', which answers @builtins.typeOf@ and so
--- says @int@ and @lambda@.  These are upstream's @showType@ words, article
--- included, so the message reads as upstream's does; @null@ is the one
--- that takes no article.  Verified against @nix-instantiate@ 2.33.2.
-describe :: NixValue -> Text
-describe val = case val of
-  VInt _ -> "an integer"
-  VFloat _ -> "a float"
-  VBool _ -> "a Boolean"
-  VNull -> "null"
-  VStr _ _ -> "a string"
-  VPath _ -> "a path"
-  VList _ -> "a list"
-  VAttrs _ -> "a set"
-  VLambda {} -> "a function"
-  VBuiltin _ _ -> "a function"
-  VCompiledRegex _ -> "a function"
+      _ -> pure (Left (notASetMessage path (typeName val)))
 
 -- ---------------------------------------------------------------------------
 -- Messages

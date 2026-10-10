@@ -12,6 +12,7 @@ module Nix.Eval.Types
     CompiledRegex (..),
     Thunk (..),
     readThunkValue,
+    thunkUnderEvaluation,
 
     -- * Attribute sets (C-backed sorted arrays)
     AttrSet (..),
@@ -273,6 +274,13 @@ pattern ValueList = 6
 pattern ValueAttrs = 7
 pattern ValueCtxStr = 8
 pattern ValueLambda = 9
+
+-- | Whether a thunk is being forced right now, so it holds no value yet:
+-- the cell's BLACKHOLE state.  Pure for the reason 'readThunkValue' is,
+-- and like it an answer about this moment: the state changes when the
+-- force finishes or is unwound.
+thunkUnderEvaluation :: Thunk -> Bool
+thunkUnderEvaluation (Thunk ptr) = unsafePerformIO (cthunkState ptr) == ThunkBlackhole
 
 -- | Read a COMPUTED thunk's value without forcing.
 -- Returns 'Nothing' for PENDING or BLACKHOLE thunks.
@@ -1114,20 +1122,30 @@ fillCSlots arr thunks = unsafePerformIO (go 0 thunks)
       pokeElemOff arr i (thunkToCPtr t)
       go (i + 1) ts
 
--- | Human-readable type name for error messages.
+-- | A value's type as an error message names it: upstream's @showType@ on
+-- a value (eval.cc at 2.24.9, the same in 2.33.2), which every type error
+-- there uses.  It names a primop and the string context the type alone
+-- does not show.  Upstream's other cases (a thunk, a black hole, a
+-- function application, an external value) have no 'NixValue': a value
+-- here is always forced, and there are no plugins.
 typeName :: NixValue -> Text
 typeName val = case val of
   VInt _ -> "an integer"
   VFloat _ -> "a float"
   VBool _ -> "a Boolean"
   VNull -> "null"
-  VStr _ _ -> "a string"
+  VStr _ ctx
+    | ctx == emptyContext -> "a string"
+    | otherwise -> "a string with context"
   VPath _ -> "a path"
   VList _ -> "a list"
   VAttrs _ -> "a set"
   VLambda {} -> "a function"
-  VBuiltin _ _ -> "a built-in function"
-  VCompiledRegex _ -> "a built-in function"
+  VBuiltin name [] -> "the built-in function '" <> name <> "'"
+  VBuiltin name _ -> "the partially applied built-in function '" <> name <> "'"
+  -- Only ever an argument inside a 'VBuiltin', and carrying no primop
+  -- name, so it takes the name upstream gives the function type itself.
+  VCompiledRegex _ -> "a function"
 
 -- ---------------------------------------------------------------------------
 -- Evaluation monad
