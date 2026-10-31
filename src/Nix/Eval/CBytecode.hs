@@ -378,9 +378,9 @@ pattern OpPathStr = 24
 
 -- | @OpApp@ flag values: a source application ('Nix.Expr.Types.EApp')
 -- evaluates its function before the call frame opens; a deferred one
--- ('Nix.Expr.Types.EDeferredApp') forces it inside the frame.  Must stay
--- in lockstep with @NN_APP_*@ in @cbits\/nn_bytecode.h@, whose reserved
--- instructions are deferred applications.
+-- forces it inside the frame.  Must stay in lockstep with @NN_APP_*@ in
+-- @cbits\/nn_bytecode.h@, whose reserved instructions are the deferred
+-- applications.
 appDirect, appDeferred :: Word8
 appDirect = 0
 appDeferred = 1

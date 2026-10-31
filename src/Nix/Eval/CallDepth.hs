@@ -14,23 +14,14 @@
 -- into builtin calls (@-@, @*@, @/@, @<@, @<=@, @>@, @>=@ and unary @-@).
 -- Forcing a thunk costs nothing, so a value forced inside a frame is
 -- evaluated at that frame's depth.  A builtin's deferred application
--- ('Nix.Expr.Types.EDeferredApp', upstream's app value as @map@,
--- @genList@, @mapAttrs@ and @zipAttrsWith@ build it) is applied where its
--- result is forced, and the frame opens before its function is forced, so
+-- (upstream's app value, as @map@, @genList@, @mapAttrs@ and
+-- @zipAttrsWith@ build it) is applied where its result is forced, and the
+-- frame opens before its function is forced, so
 -- @mapAttrs@'s @f name value@, two nested app values upstream, runs the
 -- name application a frame below the value application.  A
 -- @builtins.sort@ whose comparator is @builtins.lessThan@ itself opens no
 -- frame per comparison: upstream's @prim_sort@ bypasses @callFunction@
 -- for it.
---
--- One divergence, by choice: upstream's @derivation@ is a Nix-language
--- wrapper (derivation.nix) whose body reaches an output through
--- @builtins.head@ over a @map@, three frames, and whose @outPath@ is a
--- @getAttr@ over @derivationStrict@, two; here @derivation@ is a builtin,
--- one frame, and @outPath@ selects from the one @derivationStrict@
--- application, one.  Those calls are the wrapper's implementation, not
--- the language, and upstream has already rewritten it once since 2.24,
--- so they are not imitated.
 --
 -- The count is evaluator state, carried per frame by each 'Nix.Eval.Types.MonadEval'
 -- instance; this module holds the rule and the setting's default so the
