@@ -29,24 +29,38 @@ on:
 permissions:
   contents: read
 
-# Preserve the oracle from the last passing main run (33095182332).
-# Bump these deliberately, independently of changes to the evaluator.
-env:
-  NIX_VERSION: "2.24.9"
-  NIXPKGS_REV: "50ab793786d9de88ee30ec4e4c24fb4236fc2674"
-
 jobs:
   parity:
-    name: drvPath vs upstream Nix
+    name: Nix ${{ matrix.nix }}, nixpkgs ${{ matrix.channel }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest pairing held, the current stable channel with the Nix
+        # it defaults to, and the newest of both.  Bump a row deliberately,
+        # independently of changes to the evaluator, so that a red row
+        # means nova-nix changed.
+        include:
+          - channel: "24.11"
+            nix: "2.24.9"
+            rev: 50ab793786d9de88ee30ec4e4c24fb4236fc2674
+          - channel: "26.05"
+            nix: "2.34.9"
+            rev: 6f06d204d8f2d8761d9da78778745974a3216381
+          - channel: unstable
+            nix: "2.35.4"
+            rev: 1c89083e451e891152365b799595cf7790a43325
     # An evaluator that loops on one case would otherwise hold the runner
     # for GitHub's six-hour default.
     timeout-minutes: 30
+    env:
+      NIX_VERSION: ${{ matrix.nix }}
+      NIXPKGS_REV: ${{ matrix.rev }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v30
+        uses: cachix/install-nix-action@v31
         with:
           install_url: https://releases.nixos.org/nix/nix-${{ env.NIX_VERSION }}/install
 
