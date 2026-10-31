@@ -231,6 +231,11 @@ assertEval label source expected =
 -- | Assert that a Nix expression parses but fails to EVALUATE.  A parse
 -- failure fails the assertion: a test documenting a runtime error must
 -- not keep passing after a regression stops the construct from parsing.
+-- | The bytes of a string value, and nothing for any other value.
+stringBytes :: NixValue -> BS.ByteString
+stringBytes (VStr bytes _) = bytes
+stringBytes _ = BS.empty
+
 assertEvalFail :: Text -> Text -> TestResult
 assertEvalFail label source = case evalNix source of
   Left err
@@ -1390,6 +1395,18 @@ testEvalBuiltins = do
         assertEval "isNull-f" "builtins.isNull 1" (VBool False),
       runTest "stringLength" $
         assertEval "strlen" "builtins.stringLength \"hello\"" (VInt 5),
+      runTest "a builtin taking a string coerces a set as upstream's coerceToString" $
+        assertEval "strlen-outpath" "builtins.stringLength { outPath = \"abc\"; }" (VInt 3)
+          `andThen` assertEval "strlen-tostring" "builtins.stringLength { __toString = s: \"ab\"; }" (VInt 2)
+          `andThen` assertEval "substring-outpath" "builtins.substring 1 1 { outPath = \"abc\"; }" (mkStr "b")
+          `andThen` assertEval "discard-outpath" "builtins.unsafeDiscardStringContext { outPath = \"abc\"; }" (mkStr "abc")
+          `andThen` assertEval "discard-output-outpath" "builtins.unsafeDiscardOutputDependency { outPath = \"abc\"; }" (mkStr "abc"),
+      runTest "a builtin taking a string refuses what coerceToString refuses" $
+        assertEvalError "strlen-int" "builtins.stringLength 1" "cannot coerce an integer to a string: 1"
+          `andThen` assertEvalError "substring-int" "builtins.substring 0 1 1" "cannot coerce an integer to a string: 1"
+          `andThen` assertEvalError "discard-int" "builtins.unsafeDiscardStringContext 1" "cannot coerce an integer to a string: 1"
+          `andThen` assertEvalError "discard-output-int" "builtins.unsafeDiscardOutputDependency 1" "cannot coerce an integer to a string: 1"
+          `andThen` assertEvalError "add-output-int" "builtins.addDrvOutputDependencies 1" "cannot coerce an integer to a string: 1",
       -- Lexer edge cases pinned to upstream: $${ is literal, ''' escapes to '', \q -> q.
       runTest "$${ does not interpolate (double dollar is literal)" $
         assertEval "dollar-dollar-str" "builtins.stringLength \"a$${b}c\"" (VInt 7),
@@ -4276,6 +4293,11 @@ testStructuredAttrs = do
   createDirectoryIfMissing True jsonDir
   BS.writeFile (jsonDir </> "x") "hello\n"
   copiedOutPath <- evalNixIO jsonDir "builtins.unsafeDiscardStringContext (builtins.toJSON { outPath = ./x; })"
+  lengthOfPath <- evalNixIO jsonDir "builtins.stringLength ./x"
+  substringOfPath <- evalNixIO jsonDir "builtins.substring 11 32 ./x"
+  substringContext <- evalNixIO jsonDir "builtins.hasContext (builtins.substring 11 32 ./x)"
+  discardedPath <- evalNixIO jsonDir "builtins.unsafeDiscardStringContext ./x"
+  discardedContext <- evalNixIO jsonDir "builtins.hasContext (builtins.unsafeDiscardStringContext ./x)"
   copiedContext <- evalNixIO jsonDir "builtins.attrNames (builtins.getContext (builtins.toJSON { outPath = ./x; })) == [ \"/nix/store/m5zd3qj7c4bs4g5d8hqvs5pc5xicclfg-x\" ]"
   -- The IO evaluator, because it is the one with a store to copy into.
   uncopiedPath <- evalNixIO jsonDir "builtins.toJSON { __toString = s: ./x; }"
@@ -4341,6 +4363,12 @@ testStructuredAttrs = do
       runTest "toJSON of a set whose outPath is a path copies it to the store, with context" $
         assertRight "json-outpath-path" copiedOutPath (assertEqual "json-outpath-path" (mkStr "\"/nix/store/m5zd3qj7c4bs4g5d8hqvs5pc5xicclfg-x\""))
           `andThen` assertRight "json-outpath-path-context" copiedContext (assertEqual "json-outpath-path-context" (VBool True)),
+      runTest "a builtin taking a string copies a path to the store first" $
+        assertRight "strlen-path" lengthOfPath (assertEqual "strlen-path" (VInt 45))
+          `andThen` assertRight "substring-path" substringOfPath (assertEqual "substring-path-text" "m5zd3qj7c4bs4g5d8hqvs5pc5xicclfg" . stringBytes)
+          `andThen` assertRight "substring-path-context" substringContext (assertEqual "substring-path-context" (VBool True))
+          `andThen` assertRight "discard-path" discardedPath (assertEqual "discard-path" (mkStr "/nix/store/m5zd3qj7c4bs4g5d8hqvs5pc5xicclfg-x"))
+          `andThen` assertRight "discard-path-context" discardedContext (assertEqual "discard-path-context" (VBool False)),
       runTest "toJSON of a __toString set returning a path keeps the path's own text, uncopied" $
         assertRight "json-tostring-path" uncopiedPath (assertEqual "json-tostring-path" jsonDirPath)
           `andThen` assertRight "json-tostring-nested" uncopiedNested (assertEqual "json-tostring-nested" jsonDirPath),
@@ -13601,6 +13629,17 @@ testClassIFollowups = do
           "csep-path"
           ("builtins.concatStringsSep \":\" [ " <> storeA <> "-x \"y\" ]")
           (VStr (TE.encodeUtf8 (storeA <> "-x:y")) enclosingCtx),
+      runTest "substring and unsafeDiscardOutputDependency keep a coerced path's context" $
+        assertEval "substring-store-path" ("builtins.substring 0 10 " <> storeA <> "-x") (VStr "/nix/store" enclosingCtx)
+          `andThen` assertEval
+            "discard-output-store-path"
+            ("builtins.unsafeDiscardOutputDependency " <> storeA <> "-x")
+            (VStr (TE.encodeUtf8 (storeA <> "-x")) enclosingCtx),
+      runTest "addDrvOutputDependencies judges a coerced path by its context" $
+        assertEvalError
+          "add-output-store-path"
+          ("builtins.addDrvOutputDependencies " <> storeA <> "-x")
+          ("builtins.addDrvOutputDependencies: path " <> storeA <> "-x is not a derivation"),
       -- the same in-store short-circuit for general interpolation, on a
       -- SUBPATH: the text is the subpath, the context the enclosing path
       runTest "interpolating an in-store subpath keeps text, contexts the enclosing path" $

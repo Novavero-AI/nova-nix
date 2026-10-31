@@ -1704,9 +1704,7 @@ listElemAt cl idx =
 
 -- | Byte length, as upstream: stringLength of a 2-byte character is 2, not 1.
 builtinStringLength :: (MonadEval m) => NixValue -> m NixValue
-builtinStringLength (VStr s _) = pure (VInt (fromIntegral (BS.length s)))
-builtinStringLength other =
-  throwEvalError ("builtins.stringLength: expected a string, got " <> typeName other)
+builtinStringLength value = VInt . fromIntegral . BS.length . fst <$> coerceToStringInterp value
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - control
@@ -2111,9 +2109,10 @@ foldlStrict op acc (thunk : rest) = do
 -- | Byte-indexed slicing, as upstream: offsets and lengths count bytes,
 -- and a slice may fall mid-codepoint (the resulting bytes are the value).
 builtinSubstring :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
-builtinSubstring (VInt start) (VInt len) (VStr s ctx)
+builtinSubstring (VInt start) (VInt len) value
   | start < 0 = throwEvalError "builtins.substring: negative start position"
-  | otherwise =
+  | otherwise = do
+      (s, ctx) <- coerceToStringInterp value
       let startPos = fromIntegral start
           -- Nix clamps len to available length (negative len means rest of string)
           available = BS.length s - startPos
@@ -2121,12 +2120,10 @@ builtinSubstring (VInt start) (VInt len) (VStr s ctx)
             if len < 0
               then available
               else min (fromIntegral len) available
-       in -- Context is preserved through substring (matching real Nix).
-          pure (VStr (BS.take clampedLen (BS.drop startPos s)) ctx)
-builtinSubstring _ _ (VStr _ _) =
+      -- Context is preserved through substring (matching real Nix).
+      pure (VStr (BS.take clampedLen (BS.drop startPos s)) ctx)
+builtinSubstring _ _ _ =
   throwEvalError "builtins.substring: start and length must be integers"
-builtinSubstring _ _ other =
-  throwEvalError ("builtins.substring: expected a string, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
 -- Builtin helpers
@@ -2177,10 +2174,12 @@ coerceToStringPermissive = coerceToString True force applyValue coercePathVerbat
 coerceToStoreString :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
 coerceToStoreString = coerceToString True force applyValue coercePathToStore
 
--- | Coerce a value for string interpolation (@"${...}"@).  Like
--- 'coerceToString', but a path literal is copied into the store and replaced by
--- its source store path (with context) - matching C++ Nix, where interpolation
--- uses @copyToStore = true@, unlike 'builtins.toString', which does not copy.
+-- | Upstream's @coerceToString@ at its default arguments (@coerceMore =
+-- false@, @copyToStore = true@): what string interpolation (@"${...}"@) and
+-- every builtin taking a string that calls it without overrides use.  Like
+-- 'coerceToString', but a path literal is copied into the store and replaced
+-- by its source store path (with context), unlike 'builtins.toString', which
+-- does not copy.
 coerceToStringInterp :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
 coerceToStringInterp = coerceToString False force applyValue coercePathToStore
 
@@ -2246,9 +2245,7 @@ intFromDouble ctx rounder f
     rounded = rounder f
 
 builtinDiscardContext :: (MonadEval m) => NixValue -> m NixValue
-builtinDiscardContext (VStr s _) = pure (mkStrBytes s)
-builtinDiscardContext other =
-  throwEvalError ("builtins.unsafeDiscardStringContext: expected a string, got " <> typeName other)
+builtinDiscardContext value = mkStrBytes . fst <$> coerceToStringInterp value
 
 -- | @builtins.unsafeDiscardOutputDependency@ - downgrade all-outputs (DrvDeep)
 -- references to a plain (Opaque) reference on the same @.drv@ path, and KEEP
@@ -2257,13 +2254,12 @@ builtinDiscardContext other =
 -- @.drv@ reference the downgrade must preserve.  'Set.map' also folds a
 -- downgraded element into an existing plain reference on the same path.
 builtinDiscardOutputDep :: (MonadEval m) => NixValue -> m NixValue
-builtinDiscardOutputDep (VStr s (StringContext ctx)) =
+builtinDiscardOutputDep value = do
+  (s, StringContext ctx) <- coerceToStringInterp value
   pure (VStr s (StringContext (Set.map downgrade ctx)))
   where
     downgrade (SCAllOutputs sp) = SCPlain sp
     downgrade other = other
-builtinDiscardOutputDep other =
-  throwEvalError ("builtins.unsafeDiscardOutputDependency: expected a string, got " <> typeName other)
 
 -- | @builtins.addDrvOutputDependencies@ - the inverse of the
 -- 'builtinDiscardOutputDep' downgrade for a single element: upgrade a plain
@@ -2271,7 +2267,8 @@ builtinDiscardOutputDep other =
 -- Upstream requires the string's context to have exactly one element and
 -- errors on a derivation-output (Built) element or a non-@.drv@ plain path.
 builtinAddDrvOutputDeps :: (MonadEval m) => NixValue -> m NixValue
-builtinAddDrvOutputDeps (VStr s (StringContext ctx)) =
+builtinAddDrvOutputDeps value = do
+  (s, StringContext ctx) <- coerceToStringInterp value
   case Set.toList ctx of
     [only] -> VStr s . StringContext . Set.singleton <$> upgrade only
     _ ->
@@ -2296,8 +2293,6 @@ builtinAddDrvOutputDeps (VStr s (StringContext ctx)) =
             <> "on a derivation output such as "
             <> outName
         )
-builtinAddDrvOutputDeps other =
-  throwEvalError ("builtins.addDrvOutputDependencies: expected a string, got " <> typeName other)
 
 -- | Check whether a string has any context elements.
 builtinHasContext :: (MonadEval m) => NixValue -> m NixValue
