@@ -75,6 +75,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Pairs the SDK GHC links against with its own ld; the step of this
+      # name in ci.yml says why and when to drop it.
+      - name: Use the Command Line Tools linker
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+
       - uses: haskell-actions/setup@v2
         with:
           ghc-version: "9.14.1"
