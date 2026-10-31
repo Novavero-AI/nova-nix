@@ -117,7 +117,7 @@ import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.Read as TR
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
-import Data.Word (Word32, Word64, Word8)
+import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
@@ -201,7 +201,7 @@ import Nix.Expr.Types
     UnaryOp (..),
   )
 import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
-import Nix.Json (Json (..), parseJson, renderJson)
+import Nix.Json (IntegerRange (..), Json (..), parseJsonWith, renderJson)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
@@ -2942,15 +2942,15 @@ valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a fun
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VCompiledRegex _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 
--- | Upstream reads the string with nlohmann's parser (json-to-value.cc at
--- 2.24.9), which is what 'parseJson' implements for the builder's
--- @__json@: strict RFC 8259, so a trailing comma, a raw control
--- character or a lone surrogate is refused.
+-- | Upstream reads the string with nlohmann's parser (json-to-value.cc),
+-- which is what 'parseJsonWith' implements for the builder's @__json@ too:
+-- strict RFC 8259, so a trailing comma, a raw control character or a lone
+-- surrogate is refused.  'NixRange' keeps every integer a 'VInt' can hold.
 builtinFromJSON :: (MonadEval m) => NixValue -> m NixValue
 builtinFromJSON (VStr s _) = do
   -- JSON input must be valid UTF-8 (upstream's parser rejects it too).
   decoded <- decodedText "builtins.fromJSON" s
-  either throwEvalError (pure . jsonToValue) (parseJson decoded)
+  either throwEvalError (pure . jsonToValue) (parseJsonWith NixRange decoded)
 builtinFromJSON other =
   throwEvalError ("builtins.fromJSON: expected a string, got " <> typeName other)
 
@@ -2966,21 +2966,11 @@ parseHex4 t
 readHex4 :: Text -> Int
 readHex4 = T.foldl' (\acc c -> acc * 16 + digitToInt c) 0
 
--- | Nix value for a JSON integer literal, as upstream's nlohmann-based
--- parser produces it: a value in int64 range is an int; a positive value
--- that fits only uint64 still arrives as an int (nlohmann hands it over
--- unsigned, upstream stores it into the signed NixInt, two's-complement);
--- anything wider than 64 bits falls back to a float.
-jsonInteger :: Integer -> NixValue
-jsonInteger n
-  | n >= toInteger (minBound :: Int64) && n <= toInteger (maxBound :: Word64) = VInt (fromInteger n)
-  | otherwise = VFloat (fromInteger n)
-
 jsonToValue :: Json -> NixValue
 jsonToValue json = case json of
   JsonNull -> VNull
   JsonBool b -> VBool b
-  JsonInt n -> jsonInteger n
+  JsonInt n -> VInt (fromInteger n)
   JsonFloat d -> VFloat d
   JsonString str -> mkStr str
   JsonArray items -> VList (clistFromThunks (map (thunkToCPtr . evaluated . jsonToValue) items))
