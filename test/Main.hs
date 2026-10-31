@@ -14614,15 +14614,6 @@ testBytecodeCompile = do
               then Pass
               else Fail ("expected OpApp, got op=" <> T.pack (show op))
           ),
-      runTestM "compile EDeferredApp flags the OpApp as deferred" $ do
-        idx <- compileExpr (EDeferredApp (EVar "f") (ELit (NixInt 1)))
-        op <- cbcOpcode idx
-        flags <- cbcFlags idx
-        pure
-          ( if op == OpApp && flags == appDeferred
-              then Pass
-              else Fail ("expected a deferred OpApp, got op=" <> T.pack (show op) <> " flags=" <> T.pack (show flags))
-          ),
       runTestM "op_count grows after compilation" $ do
         before <- cbcOpCount
         _ <- compileExpr (EApp (EVar "f") (ELit (NixInt 1)))

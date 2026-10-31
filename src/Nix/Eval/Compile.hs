@@ -29,8 +29,7 @@ import Data.Text (Text)
 import Data.Word (Word16, Word32, Word64, Word8)
 import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 import Nix.Eval.CBytecode
-  ( appDeferred,
-    appDirect,
+  ( appDirect,
     attrkeyDynamic,
     attrkeyStatic,
     binaryAdd,
@@ -127,8 +126,7 @@ compileExpr = go
     go (ESelect target path defExpr) =
       compileSelect target path defExpr
     go (EHasAttr target path) = compileHasAttr target path
-    go (EApp func arg) = compileApp appDirect func arg
-    go (EDeferredApp func arg) = compileApp appDeferred func arg
+    go (EApp func arg) = compileApp func arg
     go (ELambda formals body captureInfo) =
       compileLambda formals body captureInfo
     go (ELet bindings body captureInfo) =
@@ -180,14 +178,14 @@ compileExpr = go
       cbcEmit op 0 0 sym 0 0
 
     -- -----------------------------------------------------------------
-    -- Applications (EApp / EDeferredApp)
+    -- Applications (EApp)
     -- -----------------------------------------------------------------
 
-    compileApp :: Word8 -> Expr -> Expr -> IO Word32
-    compileApp flags func arg = do
+    compileApp :: Expr -> Expr -> IO Word32
+    compileApp func arg = do
       funcIdx <- go func
       argIdx <- go arg
-      cbcEmit OpApp flags 0 funcIdx argIdx 0
+      cbcEmit OpApp appDirect 0 funcIdx argIdx 0
 
     -- -----------------------------------------------------------------
     -- Strings (EStr / EIndStr)

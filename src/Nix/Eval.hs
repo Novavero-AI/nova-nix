@@ -589,9 +589,10 @@ evalBcList env bcIdx0 =
 -- ('EApp') evaluates the function position outside the call frame and
 -- everything after it inside, as upstream's @ExprCall::eval@ evaluates
 -- @fun@ before @callFunction@ opens the frame.  A builtin's deferred
--- application ('EDeferredApp') opens the frame first and forces the
--- function inside it, as upstream's @forceValue@ on an app value is a
--- @callFunction@ that forces the function after the depth check.
+-- application, one of the reserved instructions in @cbits\/nn_bytecode.c@,
+-- opens the frame first and forces the function inside it, as upstream's
+-- @forceValue@ on an app value is a @callFunction@ that forces the
+-- function after the depth check.
 evalBcApp :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcApp env bcIdx0
   | flags_ == appDeferred = withCallFrame (evalBytecode env funcIdx >>= callBc env argIdx)

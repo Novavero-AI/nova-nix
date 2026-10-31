@@ -103,7 +103,6 @@ resolve stack expr = case expr of
   EHasAttr target path ->
     EHasAttr <$> resolve stack target <*> traverse (resolveKey stack) path
   EApp f x -> EApp <$> resolve stack f <*> resolve stack x
-  EDeferredApp f x -> EDeferredApp <$> resolve stack f <*> resolve stack x
   ELambda formals body _captures ->
     let newStack = lexicalScopeFromFormals formals : stack
      in (\resolvedFormals resolvedBody -> ELambda resolvedFormals resolvedBody NoCaptureInfo)
@@ -507,7 +506,6 @@ resolveRelativePaths dir = goExpr
         ESelect (goExpr target) (map goKey path) (fmap goExpr mDef)
       EHasAttr target path -> EHasAttr (goExpr target) (map goKey path)
       EApp f x -> EApp (goExpr f) (goExpr x)
-      EDeferredApp f x -> EDeferredApp (goExpr f) (goExpr x)
       ELambda formals body captures -> ELambda (goFormals formals) (goExpr body) captures
       ELet bindings body captureInfo -> ELet (map goBinding bindings) (goExpr body) captureInfo
       EIf c t f -> EIf (goExpr c) (goExpr t) (goExpr f)
