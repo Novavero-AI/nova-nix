@@ -5,15 +5,16 @@ synopsis:           Windows-native Nix implementation in Haskell and C99
 description:
   An implementation of Nix for Windows, written in Haskell with a C99
   data layer that keeps evaluation data off the GHC heap.  It also runs
-  on macOS and Linux.  It has its own parser, lazy evaluator,
-  content-addressed store, derivation builder and binary-cache
-  substituter, and does not need an existing Nix installation.
+  on macOS and Linux.  It has its own parser, lazy evaluator, store,
+  derivation builder and binary-cache substituter, and does not need an
+  existing Nix installation.
 
-  On the pinned nixpkgs revision its CI checks, the derivation paths it
-  computes match upstream Nix 2.24.9.  On Windows it builds packages from
-  source through a stage-1 stdenv over a store-pinned MinGW-w64
-  toolchain.  The project is experimental; see the README for what is
-  not implemented yet.
+  On the 22 derivations its CI checks, over pinned pairs of Nix and
+  nixpkgs from 2.24.9 with nixpkgs 24.11 to 2.35.4 with nixpkgs unstable,
+  the derivation paths it computes match upstream.  On Windows it builds
+  packages from source through a stage-1 stdenv over a store-pinned
+  MinGW-w64 toolchain.  The project is experimental; see the README for
+  what is not implemented yet.
 
   Evaluation needs the C data layer, so library code must run it between
   @Nix.Eval.Arena.arenaInit@ and @Nix.Eval.Arena.arenaDestroy@.

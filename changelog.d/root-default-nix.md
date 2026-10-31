@@ -1,0 +1,1 @@
+- **The `default.nix` at the repository root is removed.** It pinned nixpkgs 24.11, whose newest GHC cannot satisfy this package's `base >= 4.22`, so it could not build nova-nix, and nothing used it.

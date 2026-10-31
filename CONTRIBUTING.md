@@ -7,14 +7,15 @@ and pull requests are welcome.
 
 - Keep PRs focused; one change per PR.
 - Code must build warning-clean and pass the test suite. CI runs
-  `cabal build --enable-tests --ghc-options="-Werror"`, then `cabal test`.
+  `cabal build --enable-tests --ghc-options="-Werror"`, then the test suite
+  (`cabal test` locally).
 - Match the existing style: ormolu 0.9.0.0 and hlint 3.10, the versions CI
   pins.
 
 ## Commit messages
 
-- Subject is `Area: summary`, such as `Eval:`, `Store:`, `Parser:`, `Builder:`,
-  `Pkgs:`, `CI:`, `Toolchain:`, and so on.
+- The subject is `Area: summary`, such as `Eval:`, `Store:`, `Parser:`,
+  `Builder:`, `Pkgs:`, `CI:` or `Toolchain:`.
 - The body says why, not what. What changed is in the diff; the message is for
   whoever reads `git log` later asking why a line looks the way it does.
 
@@ -44,10 +45,10 @@ contribution intentionally submitted for inclusion in this project is licensed
 under Apache-2.0, without additional terms or conditions. You keep the
 copyright to your work. Submit only work you have the right to license.
 
+This is the standard inbound=outbound arrangement: you contribute under the
+same terms you received the project under, nothing more.
+
 Tooling does not change this. AI-assisted work is fine here, and noting it in
 a commit is optional; you are responsible for what you submit either way.
 Code is judged on review, and how it was written is not evidence in either
 direction.
-
-This is the standard inbound=outbound arrangement: you contribute under the
-same terms you received the project under, nothing more.

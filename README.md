@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 nova-nix exists to make [Nix](https://nixos.org) work natively on Windows:
-the same language, the same store paths and the same binary caches as
+the same language, the same `/nix/store` paths and the same binary caches as
 upstream Nix, without WSL or an existing Nix installation.
 
 It is an implementation of Nix in Haskell with a C99 data layer, and it has
@@ -41,8 +41,8 @@ it.
   local nova-cache server and substituted into a second empty store with
   signature verification on: a small tree whose two copies must serialize
   to the same NAR, and a 320 MiB tree that must substitute under a 128 MiB
-  heap cap. On every push to main, the Windows job publishes the Hello
-  closure it just built and ran to the public cache at
+  heap cap. On every push to main, a Windows job builds the Hello closure,
+  runs Hello and publishes the closure to the public cache at
   [cache.novavero.ai](https://cache.novavero.ai), and a second Windows job
   builds the same closure into an empty store with that cache as its only
   substituter, fails if any path is built locally, and runs the result.
@@ -50,6 +50,11 @@ it.
 ### Limitations
 
 - No flakes, no `nix-shell` or `nix develop`, and no daemon or multi-user mode.
+- Evaluation is slower than upstream's. CI's 22 `drvPath` cases take 10 to 13
+  times as long in total, and a full NixOS system takes 22 to 30 times as long.
+- `build --substituter` works through a package's build closure from the
+  leaves up, so a package a cache holds still downloads its build-time
+  dependencies ([#307]).
 - Garbage collection has no runtime roots: `nova-nix store gc` keeps what
   `build --out-link` registered and what the operator roots under the store's
   `.nova-nix/gcroots`, not what a running program has open. `keep-derivations`
@@ -62,11 +67,16 @@ it.
   store path is not allowed along with it, and the bundled `<nix/*>` directory
   stays listed in `builtins.nixPath` under `--pure-eval`, where upstream
   shows an empty list.
+- The Windows store is `C:\nix\store`, where upstream's Windows default is
+  `%PROGRAMDATA%\nix\store`, so the two do not share store paths on Windows
+  ([#309]).
 - On Windows a build's process tree runs in a job object, so stopping a build
-  stops everything it started. There is no filesystem or network isolation
-  yet ([#25]).
+  stops everything it started. No platform has filesystem or network
+  isolation yet ([#25]).
 - nova-nix itself needs neither WSL nor Cygwin, but the current Windows stdenv
   runs its build scripts with MSYS2's bash.
+- `builtins.fetchurl` runs `curl`, `builtins.fetchTarball` runs `sh`, `curl` and
+  `tar`, and `builtins.fetchGit` runs `git`, each from `PATH`.
 - Store paths that contain symlinks need Windows Developer Mode or an elevated
   shell. nova-nix creates native symlinks and fails rather than falling back
   to a copy.
@@ -110,7 +120,7 @@ $ nova-nix build FILE.nix -A ATTR                 # build an attribute of it
 $ nova-nix build FILE.nix --substituter URL --trusted-key KEY  # try a cache first
 $ nova-nix build FILE.nix --out-link result       # link the result and root it
 $ nova-nix store gc                               # delete everything unrooted
-$ nova-nix push --cache URL --key-file KEY --all  # upload every path except derivations
+$ nova-nix push --cache URL --key-file FILE --all  # upload every path except derivations
 $ nova-nix --help
 ```
 
@@ -145,7 +155,7 @@ builds only what it lacks:
 ## How it works
 
 - **Parser** (`Nix.Parser`): a hand-written recursive-descent parser for the
-  Nix 2.24 language.
+  Nix language.
 - **Evaluator** (`Nix.Eval`): the AST compiles to a small bytecode that a lazy
   evaluator runs, memoizing thunks and detecting infinite recursion. The
   evaluator is generic over `MonadEval`, with a pure instance for tests and an
@@ -157,11 +167,11 @@ builds only what it lacks:
   symbols, context strings, lambdas and bytecode are C99 structures outside
   the GHC heap, freed together when an evaluation session ends. Haskell calls
   into C, and C never calls back.
-- **Store** (`Nix.Store`): a content-addressed store at `/nix/store`, or
-  `C:\nix\store` on Windows, with SQLite metadata, reference scanning and
-  per-path locks that follow upstream's protocol.
-- **Builder** (`Nix.Builder`): orders derivations by their dependencies, tries
-  substitution first, and runs each builder in a scrubbed environment.
+- **Store** (`Nix.Store`): a store at `/nix/store`, or `C:\nix\store` on
+  Windows, with SQLite metadata, reference scanning and per-path locks.
+- **Builder** (`Nix.Builder`): orders derivations by their dependencies,
+  substitutes each one a cache holds, and runs the rest in a scrubbed
+  environment.
 - **Substituter** (`Nix.Substituter`): the HTTP binary-cache protocol, with
   Ed25519 signature checks and xz, zstd and bzip2 decompression, built on
   [nova-cache](https://github.com/Novavero-AI/nova-cache).
@@ -181,6 +191,7 @@ import Control.Exception (bracket_)
 import Nix.Builtins (builtinEnv)
 import Nix.Eval (eval, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
+import Nix.Eval.Policy (unrestrictedPolicy)
 import Nix.Parser (parseNix)
 
 main :: IO ()
@@ -188,7 +199,7 @@ main = bracket_ arenaInit arenaDestroy $
   -- The first argument is what relative path literals resolve against.
   case parseNix "/tmp" "<expr>" "let x = 5; in x * 2 + 1" of
     Left err -> print err
-    Right expr -> print (runPureEval (eval (builtinEnv 0 []) expr))
+    Right expr -> print (runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr))
 ```
 
 This prints `Right (VInt 11)`. Evaluation needs the C data layer, so it must
@@ -222,3 +233,5 @@ Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 [#25]: https://github.com/Novavero-AI/nova-nix/issues/25
 [#26]: https://github.com/Novavero-AI/nova-nix/issues/26
 [#29]: https://github.com/Novavero-AI/nova-nix/issues/29
+[#307]: https://github.com/Novavero-AI/nova-nix/issues/307
+[#309]: https://github.com/Novavero-AI/nova-nix/issues/309
