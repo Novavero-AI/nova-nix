@@ -74,6 +74,36 @@ check() {
   fi
 }
 
+# An expression both evaluators must refuse, on the same final line.  What
+# comes before it is upstream's trace, which nova-nix does not reproduce.
+refused() {
+  label=$1
+  expr=$2
+  checked=$((checked + 1))
+  upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1)
+  upstreamStatus=$?
+  nova=$(cd "$fixture" && "$novaBin" eval --nix-path "nix=$repoRoot/data/nix" --expr "$expr" 2>&1)
+  novaStatus=$?
+  upstreamError=$(printf '%s\n' "$upstream" | tail -n1 | sed 's/^ *//')
+  novaError=$(printf '%s\n' "$nova" | tail -n1 | sed 's/^ *//')
+  if [ "$upstreamStatus" -ne 0 ] && [ "$novaStatus" -ne 0 ] && [ "$upstreamError" = "$novaError" ]; then
+    printf '  ok    %s\n' "$label"
+  else
+    failures=$((failures + 1))
+    printf '  DIFF  %s\n' "$label"
+    printf '          expression  %s\n' "$expr"
+    printf '          upstream    (exit %s) %s\n' "$upstreamStatus" "$upstreamError"
+    printf '          nova-nix    (exit %s) %s\n' "$novaStatus" "$novaError"
+  fi
+}
+
+# Whether the Nix under comparison is at least the named release, for a
+# behaviour upstream changed and nova-nix follows.
+upstreamVersion=$(nix-instantiate --version 2>&1 | head -n1 | sed 's/.* //')
+upstreamAtLeast() {
+  [ "$(printf '%s\n%s\n' "$1" "$upstreamVersion" | sort -V | head -n1)" = "$1" ]
+}
+
 echo "fixture: $fixture"
 echo "upstream: $(nix-instantiate --version 2>&1 | head -n1)"
 echo
@@ -128,7 +158,13 @@ echo
 
 echo "== what fromJSON reads =="
 check "every escape JSON defines" 'builtins.toJSON (builtins.fromJSON "\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u00e9\\ud83d\\ude00\"")'
-check "numbers at nlohmann's integer bounds" 'builtins.fromJSON "[ -0, 1E2, -9223372036854775808, 18446744073709551615, 18446744073709551616, 1.5e-3 ]"'
+check "numbers at the Nix integer bounds" 'builtins.fromJSON "[ -0, 1E2, -9223372036854775808, 9223372036854775807, 18446744073709551616, 1.5e-3 ]"'
+# 2.24.9 wraps these to negative ints.
+if upstreamAtLeast 2.25.0; then
+  refused "an unsigned number past the Nix integer range" 'builtins.fromJSON "18446744073709551615"'
+  refused "the first such number in the document, not in key order" 'builtins.fromJSON "{ \"b\": 18446744073709551615, \"a\": 9223372036854775808 }"'
+  refused "such a number ahead of a later syntax error" 'builtins.fromJSON "[ 18446744073709551615, nonsense"'
+fi
 echo
 
 echo "== whitespace an indented string strips =="

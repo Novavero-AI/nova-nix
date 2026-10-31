@@ -2643,6 +2643,23 @@ testBatch5 = do
         assertEval "fromJSON-rt" "let x = builtins.fromJSON (builtins.toJSON { a = 1; b = [ 2 3 ]; }); in x.a == 1 && x.b == [ 2 3 ]" (VBool True),
       runTest "fromJSON invalid" $
         assertEvalFail "fromJSON-bad" "builtins.fromJSON \"not json\"",
+      -- The integer range as json-to-value.cc has it at 2.25 and after.
+      runTest "fromJSON reads the largest int" $
+        assertEval "fromJSON-int-max" "builtins.fromJSON \"9223372036854775807\"" (VInt 9223372036854775807),
+      runTest "fromJSON reads the smallest int" $
+        assertEval "fromJSON-int-min" "builtins.fromJSON \"-9223372036854775808\"" (VInt (-9223372036854775808)),
+      runTest "fromJSON refuses one past the largest int" $
+        assertEvalError "fromJSON-past-int" "builtins.fromJSON \"9223372036854775808\"" "unsigned json number 9223372036854775808 outside of Nix integer range",
+      runTest "fromJSON refuses the largest unsigned" $
+        assertEvalError "fromJSON-uint-max" "builtins.fromJSON \"18446744073709551615\"" "unsigned json number 18446744073709551615 outside of Nix integer range",
+      runTest "fromJSON refuses an unsigned number inside a list" $
+        assertEvalError "fromJSON-uint-list" "builtins.fromJSON \"[1,[18446744073709551615]]\"" "unsigned json number 18446744073709551615 outside of Nix integer range",
+      runTest "fromJSON refuses an unsigned number inside a set" $
+        assertEvalError "fromJSON-uint-set" "builtins.fromJSON ''{\"a\":18446744073709551615}''" "unsigned json number 18446744073709551615 outside of Nix integer range",
+      runTest "fromJSON names the first such number in the document, not in key order" $
+        assertEvalError "fromJSON-uint-order" "builtins.fromJSON ''{\"b\":18446744073709551615,\"a\":9223372036854775808}''" "unsigned json number 18446744073709551615 outside of Nix integer range",
+      runTest "fromJSON refuses such a number ahead of a later syntax error" $
+        assertEvalError "fromJSON-uint-syntax" "builtins.fromJSON \"[18446744073709551615,nonsense\"" "unsigned json number 18446744073709551615 outside of Nix integer range",
       -- nlohmann's grammar (json-to-value.cc at 2.24.9), strict RFC 8259:
       -- each case below is refused or read as nix-instantiate reads it.
       runTest "fromJSON reads the backspace and form feed escapes" $
@@ -13653,12 +13670,6 @@ testClassIFollowups = do
           "storepath-sub"
           ("builtins.storePath " <> storeA <> "-x/sub/file")
           (VStr (TE.encodeUtf8 (storeA <> "-x/sub/file")) enclosingCtx),
-      -- fromJSON integers in the (int64 max, uint64 max] band arrive
-      -- two's-complement wrapped, as upstream's nlohmann handoff
-      runTest "fromJSON wraps int64 max + 1" $
-        assertEval "fromjson-wrap-min" "builtins.fromJSON \"9223372036854775808\"" (VInt minBound),
-      runTest "fromJSON wraps uint64 max" $
-        assertEval "fromjson-wrap-neg1" "builtins.fromJSON \"18446744073709551615\"" (VInt (-1)),
       runTest "fromJSON falls to float past uint64" $
         assertEval "fromjson-float" "builtins.fromJSON \"18446744073709551616\"" (VFloat 18446744073709551616.0),
       -- the input-derivation-modulo STORE-READ arm: a dependent whose

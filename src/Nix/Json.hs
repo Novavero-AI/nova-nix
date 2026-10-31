@@ -17,7 +17,9 @@ module Nix.Json
     formatJsonFloat,
 
     -- * Parsing
+    IntegerRange (..),
     parseJson,
+    parseJsonWith,
   )
 where
 
@@ -49,8 +51,8 @@ import Text.Read (readMaybe)
 data Json
   = JsonNull
   | JsonBool !Bool
-  | -- | Rendered in decimal.  'parseJson' produces one only in nlohmann's
-    -- integer range, signed 64-bit below zero and unsigned 64-bit above.
+  | -- | Rendered in decimal.  A parse produces one only in its
+    -- 'IntegerRange', signed 64-bit below zero in both.
     JsonInt !Integer
   | -- | A non-finite float renders as @null@, as nlohmann writes one.
     JsonFloat !Double
@@ -182,14 +184,31 @@ exponentDigits e
 -- Parsing
 -- ---------------------------------------------------------------------------
 
+-- | Which integers a parse keeps past the signed 64-bit range.
+data IntegerRange
+  = -- | nlohmann's own, unsigned 64-bit above zero: what upstream's DOM
+    -- parser reads a builder's @__json@ into.
+    NlohmannRange
+  | -- | The Nix integer range, as @builtins.fromJSON@ reads a document
+    -- (json-to-value.cc at 2.25 and after).  Upstream's SAX consumer throws
+    -- on reaching a number that fits only unsigned 64 bits, so the error is
+    -- the first such number in the document, ahead of any later syntax
+    -- error.
+    NixRange
+  deriving (Eq, Show)
+
 -- | Read one JSON document as nlohmann's @parse@ does: a single value with
 -- optional whitespace around it, a leading byte order mark skipped, and
 -- nothing after it.  A member name given twice keeps its last value, as
 -- nlohmann's DOM parser assigns it.  The input is 'Text' because nlohmann
 -- rejects a document that is not UTF-8; decoding it is that check.
 parseJson :: Text -> Either Text Json
-parseJson input = do
-  (value, rest) <- parseValue (skipSpace (dropByteOrderMark input))
+parseJson = parseJsonWith NlohmannRange
+
+-- | 'parseJson' over a chosen 'IntegerRange'.
+parseJsonWith :: IntegerRange -> Text -> Either Text Json
+parseJsonWith range input = do
+  (value, rest) <- parseValue range (skipSpace (dropByteOrderMark input))
   let trailing = skipSpace rest
   if T.null trailing
     then Right value
@@ -216,11 +235,11 @@ excerptLength :: Int
 excerptLength = 20
 
 -- | One value, its leading whitespace already skipped.
-parseValue :: Text -> Either Text (Json, Text)
-parseValue t = case T.uncons t of
+parseValue :: IntegerRange -> Text -> Either Text (Json, Text)
+parseValue range t = case T.uncons t of
   Nothing -> Left "unexpected end of input, expected a JSON value"
-  Just ('{', rest) -> parseObject (skipSpace rest)
-  Just ('[', rest) -> parseArray (skipSpace rest)
+  Just ('{', rest) -> parseObject range (skipSpace rest)
+  Just ('[', rest) -> parseArray range (skipSpace rest)
   Just ('"', rest) -> do
     (s, afterString) <- parseString rest
     pure (JsonString s, afterString)
@@ -228,7 +247,7 @@ parseValue t = case T.uncons t of
   Just ('f', _) -> literal "false" (JsonBool False)
   Just ('n', _) -> literal "null" JsonNull
   Just (c, _)
-    | c == '-' || isDigit c -> parseNumber t
+    | c == '-' || isDigit c -> parseNumber range t
   Just _ -> Left ("unexpected " <> excerpt t <> ", expected a JSON value")
   where
     literal word value = case T.stripPrefix word t of
@@ -236,13 +255,13 @@ parseValue t = case T.uncons t of
       Nothing -> Left ("invalid literal " <> excerpt t)
 
 -- | The elements of an array, after its @[@ and any whitespace.
-parseArray :: Text -> Either Text (Json, Text)
-parseArray t = case T.uncons t of
+parseArray :: IntegerRange -> Text -> Either Text (Json, Text)
+parseArray range t = case T.uncons t of
   Just (']', rest) -> Right (JsonArray [], rest)
   _ -> elements [] t
   where
     elements !acc s = do
-      (value, rest) <- parseValue s
+      (value, rest) <- parseValue range s
       let after = skipSpace rest
       case T.uncons after of
         Just (',', more) -> elements (value : acc) (skipSpace more)
@@ -250,8 +269,8 @@ parseArray t = case T.uncons t of
         _ -> Left ("unexpected " <> excerpt after <> " in an array, expected ',' or ']'")
 
 -- | The members of an object, after its @{@ and any whitespace.
-parseObject :: Text -> Either Text (Json, Text)
-parseObject t = case T.uncons t of
+parseObject :: IntegerRange -> Text -> Either Text (Json, Text)
+parseObject range t = case T.uncons t of
   Just ('}', rest) -> Right (JsonObject Map.empty, rest)
   _ -> members Map.empty t
   where
@@ -261,7 +280,7 @@ parseObject t = case T.uncons t of
         let beforeColon = skipSpace afterName
         case T.uncons beforeColon of
           Just (':', afterColon) -> do
-            (value, afterValue) <- parseValue (skipSpace afterColon)
+            (value, afterValue) <- parseValue range (skipSpace afterColon)
             let updated = Map.insert name value acc
                 after = skipSpace afterValue
             case T.uncons after of
@@ -350,8 +369,8 @@ codeUnit t =
 -- back; any other is a float (strtod, which 'readMaybe' matches: correctly
 -- rounded, infinite past the double range).  An infinite one is an error,
 -- nlohmann's out_of_range 406.
-parseNumber :: Text -> Either Text (Json, Text)
-parseNumber t = do
+parseNumber :: IntegerRange -> Text -> Either Text (Json, Text)
+parseNumber range t = do
   let (sign, afterSign) = case T.stripPrefix "-" t of
         Just rest -> ("-", rest)
         Nothing -> ("", t)
@@ -367,7 +386,10 @@ parseNumber t = do
   if T.null fraction && T.null exponentText
     then case readMaybe (T.unpack lexeme) of
       Just n
-        | n >= toInteger (minBound :: Int64) && n <= toInteger (maxBound :: Word64) -> Right (JsonInt n, afterExponent)
+        | n >= toInteger (minBound :: Int64) && n <= toInteger (maxBound :: Int64) -> Right (JsonInt n, afterExponent)
+        | n > toInteger (maxBound :: Int64) && n <= toInteger (maxBound :: Word64) -> case range of
+            NlohmannRange -> Right (JsonInt n, afterExponent)
+            NixRange -> Left ("unsigned json number " <> T.pack (show n) <> " outside of Nix integer range")
       _ -> asFloat
     else asFloat
   where
