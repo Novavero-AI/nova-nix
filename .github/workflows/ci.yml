@@ -306,6 +306,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # GHC's macOS bindist names the Command Line Tools SDK as a library
+      # directory of its rts, so every link reads that SDK's .tbd stubs
+      # whichever toolchain is selected.  A runner image can ship Command
+      # Line Tools newer than its default Xcode, and that Xcode's ld then
+      # fails on the stubs with "tapi error: malformed file" before
+      # anything of ours is linked.  Selecting the Command Line Tools pairs
+      # the SDK with its own ld.  The step precedes GHC's setup so that the
+      # install sees the same toolchain as every build after it.  Drop it
+      # once the pinned GHC's rts package config no longer names that SDK.
+      - name: Use the Command Line Tools linker
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+
       - uses: haskell-actions/setup@v2
         id: setup
         with:
