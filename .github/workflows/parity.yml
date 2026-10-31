@@ -43,7 +43,7 @@ jobs:
     # for GitHub's six-hour default.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Nix
         uses: cachix/install-nix-action@v30
@@ -65,7 +65,7 @@ jobs:
           cabal-version: "latest"
 
       - name: Cache Cabal store
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
@@ -73,7 +73,7 @@ jobs:
 
       - name: Cache the pinned nixpkgs tree
         id: nixpkgs-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: nixpkgs-ref
           key: parity-nixpkgs-${{ runner.os }}-${{ env.NIXPKGS_REV }}

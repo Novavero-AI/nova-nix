@@ -52,7 +52,7 @@ jobs:
     name: ASCII source
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Source must be ASCII-only
         run: |
           if git grep -nP '[^\x00-\x7F]' -- '*.hs' '*.c' '*.h' '*.nix' '*.sh' '*.cabal' '*.md'; then
@@ -73,7 +73,7 @@ jobs:
     env:
       ACTIONLINT_VERSION: "1.7.12"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Lint the workflows
         run: |
           set -euo pipefail
@@ -88,7 +88,7 @@ jobs:
     name: Changelog fragments
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Fragments are well-formed
         run: |
           status=0
@@ -110,7 +110,7 @@ jobs:
     needs: [ascii]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: haskell-actions/hlint-setup@v2
         with:
           version: "3.10"
@@ -124,7 +124,7 @@ jobs:
     needs: [ascii]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Pinned to the version the repo is formatted with: formatting is
       # not stable across ormolu releases, and a floating version would
@@ -141,7 +141,7 @@ jobs:
       # a released run-ormolu points at.
       - name: Cache formatter binary
         id: formatter-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.local/bin/ormolu
           key: ormolu-0.9.0.0-${{ runner.os }}
@@ -164,7 +164,7 @@ jobs:
     needs: [ascii]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Compile C99 with strict warnings
         run: |
           for f in cbits/*.c; do
@@ -177,7 +177,7 @@ jobs:
     needs: [hlint, ormolu, c99-lint]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: haskell-actions/setup@v2
         with:
           ghc-version: "9.14.1"
@@ -198,7 +198,7 @@ jobs:
     needs: [cabal-check]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: haskell-actions/setup@v2
         id: setup
@@ -207,7 +207,7 @@ jobs:
           cabal-version: "latest"
 
       - name: Cache Cabal store
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-sdist-${{ hashFiles('nova-nix.cabal') }}
@@ -235,7 +235,7 @@ jobs:
     needs: [cabal-check]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: haskell-actions/setup@v2
         id: setup
@@ -246,7 +246,7 @@ jobs:
       # Dependencies build unsanitized (the flags below are scoped to this
       # package), so the plain Linux dependency cache applies as-is.
       - name: Cache Cabal store
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
@@ -304,7 +304,7 @@ jobs:
             name: Windows
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # GHC's macOS bindist names the Command Line Tools SDK as a library
       # directory of its rts, so every link reads that SDK's .tbd stubs
@@ -326,7 +326,7 @@ jobs:
           cabal-version: "latest"
 
       - name: Cache Cabal store
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
@@ -474,7 +474,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: haskell-actions/setup@v2
         id: setup
@@ -483,7 +483,7 @@ jobs:
           cabal-version: "latest"
 
       - name: Cache Cabal store
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
@@ -564,7 +564,7 @@ jobs:
       name: cache
       url: ${{ env.CACHE_URL }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: haskell-actions/setup@v2
         id: setup
@@ -573,7 +573,7 @@ jobs:
           cabal-version: "latest"
 
       - name: Cache Cabal store
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
@@ -639,7 +639,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: haskell-actions/setup@v2
         id: setup
@@ -648,7 +648,7 @@ jobs:
           cabal-version: "latest"
 
       - name: Cache Cabal store
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
@@ -707,7 +707,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: haskell-actions/setup@v2
         id: setup
@@ -721,7 +721,7 @@ jobs:
       # file changing - the run_id suffix makes every run save its store,
       # and the restore-keys pick up the newest previous one.
       - name: Cache Cabal store
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-e2e-loop-${{ hashFiles('nova-nix.cabal') }}-${{ github.run_id }}
