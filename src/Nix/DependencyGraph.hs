@@ -1,9 +1,8 @@
 -- | Dependency graph construction and topological sorting.
 --
 -- Given a root derivation, builds a graph of all transitive
--- dependencies by reading .drv files from the store.  The graph
--- is then topologically sorted so dependencies are built before
--- their dependents.
+-- dependencies by reading .drv files from the store.  'topoSort' orders it
+-- leaves first and refuses a cycle.
 module Nix.DependencyGraph
   ( -- * Types
     DepNode (..),

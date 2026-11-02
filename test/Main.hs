@@ -14,6 +14,7 @@ import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
 import Control.Monad (filterM, unless, void, when)
+import Control.Monad.State.Strict (State, gets, modify', runState)
 import Data.Bits (shiftR, xor, (.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -48,7 +49,7 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, trySubstituteOutputs, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
 import Nix.Config (NixConfig (..))
@@ -85,6 +86,7 @@ import Nix.Json (Json (..), parseJson, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, pushPaths, storePathBasename, stripHashPrefix)
+import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
@@ -4667,6 +4669,290 @@ testDrvContext = do
           "drv-det-ctx"
           (evalNix "let d1 = derivation { name = \"a\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; d2 = derivation { name = \"a\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d1.outPath == d2.outPath")
         $ \val -> assertEqual "deterministic" (VBool True) val
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Realise
+-- ---------------------------------------------------------------------------
+
+-- | What the fake store and caches record, in order.
+data RealiseEvent
+  = EvQueried StorePath
+  | EvFetched [StorePath]
+  | EvBuilt Text
+  | EvReported Realise.Realised Text
+  deriving (Eq, Show)
+
+-- | A fake store and cache.  A cache entry maps a path to its references, a
+-- fetch refuses a path whose references are not valid, as the database's
+-- unregistered-referent guard does, and a build makes its outputs valid.
+data FakeWorld = FakeWorld
+  { fwValid :: !(Set.Set StorePath),
+    fwCache :: !(Map.Map StorePath [StorePath]),
+    fwEvents :: ![RealiseEvent]
+  }
+
+fakeEvent :: RealiseEvent -> State FakeWorld ()
+fakeEvent event = modify' (\world -> world {fwEvents = event : fwEvents world})
+
+fakeSubst :: Realise.SubstEffects (State FakeWorld)
+fakeSubst =
+  Realise.SubstEffects
+    { Realise.seValid = \sp -> gets (Set.member sp . fwValid),
+      Realise.seReferences = \sp -> do
+        fakeEvent (EvQueried sp)
+        gets (Map.lookup sp . fwCache),
+      Realise.seFetch = \paths -> do
+        valid <- gets fwValid
+        cache <- gets fwCache
+        let incoming = Set.fromList paths
+            landed sp = Set.member sp valid || Set.member sp incoming
+            refused = not (all (all landed . flip (Map.findWithDefault []) cache) paths)
+        if refused
+          then pure False
+          else do
+            fakeEvent (EvFetched paths)
+            modify' (\world -> world {fwValid = fwValid world <> incoming})
+            pure True
+    }
+
+fakeRealiseEffects :: Set.Set Text -> Realise.RealiseEffects (State FakeWorld)
+fakeRealiseEffects failing =
+  Realise.RealiseEffects
+    { Realise.reSubst = fakeSubst,
+      Realise.reAllValid = \drv -> gets (\world -> all (\out -> Set.member (doPath out) (fwValid world)) (drvOutputs drv)),
+      Realise.reBuild = \drv -> do
+        let name = fakeDrvName drv
+        if Set.member name failing
+          then pure (Left ("building " <> name <> " failed"))
+          else do
+            fakeEvent (EvBuilt name)
+            modify' (\world -> world {fwValid = fwValid world <> Set.fromList (map doPath (drvOutputs drv))})
+            pure (Right ()),
+      Realise.reReport = \status drv -> fakeEvent (EvReported status (fakeDrvName drv))
+    }
+
+fakeDrvName :: Derivation -> Text
+fakeDrvName drv = case drvOutputs drv of
+  (out : _) -> spName (doPath out)
+  [] -> ""
+
+-- | A store path with a name-derived hash, so a failure reads as names.
+fakePath :: Text -> StorePath
+fakePath name = StorePath (T.take 32 (T.replicate 32 (T.take 1 name))) name
+
+-- | A derivation with one output per name, depending on the named nodes.
+fakeNode :: Text -> [Text] -> [Text] -> (StorePath, DepGraph.DepNode)
+fakeNode name outputs deps =
+  ( drvPath,
+    DepGraph.DepNode
+      { DepGraph.dnDrvPath = drvPath,
+        DepGraph.dnDerivation =
+          Derivation
+            { drvOutputs = [DerivationOutput out (fakePath out) "" "" | out <- outputs],
+              drvInputDrvs = Map.empty,
+              drvInputSrcs = [],
+              drvPlatform = X86_64_Linux,
+              drvBuilder = "/bin/sh",
+              drvArgs = [],
+              drvEnv = Map.empty
+            },
+        DepGraph.dnDeps = map (fakePath . (<> ".drv")) deps
+      }
+  )
+  where
+    drvPath = fakePath (name <> ".drv")
+
+-- | Run 'Realise.realise' from a root over a graph and a cache, returning the
+-- result, the events in order, and the final valid set.
+runRealise ::
+  Set.Set Text ->
+  [(StorePath, DepGraph.DepNode)] ->
+  [(Text, [Text])] ->
+  [Text] ->
+  Text ->
+  (Either Text (), [RealiseEvent], Set.Set StorePath)
+runRealise failing nodes cache valid root =
+  let world =
+        FakeWorld
+          { fwValid = Set.fromList (map fakePath valid),
+            fwCache = Map.fromList [(fakePath p, map fakePath refs) | (p, refs) <- cache],
+            fwEvents = []
+          }
+      (result, final) =
+        runState
+          (Realise.realise (fakeRealiseEffects failing) (DepGraph.DepGraph (Map.fromList nodes)) (fakePath (root <> ".drv")))
+          world
+   in (result, reverse (fwEvents final), fwValid final)
+
+-- | Only the fetches and builds of a run, the part that costs anything.
+realiseWork :: [RealiseEvent] -> [RealiseEvent]
+realiseWork = filter isWork
+  where
+    isWork (EvFetched _) = True
+    isWork (EvBuilt _) = True
+    isWork _ = False
+
+-- | A random reference graph: each node references only lower nodes, so the
+-- graph is acyclic, and some nodes are absent from the cache.
+genClosureCase :: QC.Gen (Map.Map Int [Int], [Int])
+genClosureCase = do
+  size <- QC.chooseInt (1, 12)
+  references <- traverse (\node -> (,) node <$> QC.sublistOf [0 .. node - 1]) [0 .. size - 1]
+  absent <- QC.sublistOf [0 .. size - 1]
+  pure (Map.fromList references, absent)
+
+testRealise :: IO [Bool]
+testRealise = do
+  putStrLn "realise"
+  sequence
+    [ -- hello is on the cache, so nothing it was built from is touched, only
+      -- what it references at runtime.
+      runTest "a root on the cache fetches its runtime closure and nothing else" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [("hello-out", ["glibc-out"]), ("glibc-out", []), ("gcc-out", [])]
+                []
+                "hello"
+         in assertEqual
+              "realise"
+              (Right (), [EvFetched [fakePath "glibc-out"], EvFetched [fakePath "hello-out"]], False)
+              (result, realiseWork events, EvQueried (fakePath "gcc-out") `elem` events),
+      runTest "a root the cache lacks realises its inputs, then builds" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [("gcc-out", [])]
+                []
+                "hello"
+         in assertEqual "realise" (Right (), [EvFetched [fakePath "gcc-out"], EvBuilt "hello-out"]) (result, realiseWork events),
+      runTest "a reference the cache lacks fails the substitution and builds" $
+        let (result, events, valid) =
+              runRealise
+                Set.empty
+                [fakeNode "hello" ["hello-out"] []]
+                [("hello-out", ["gone-out"])]
+                []
+                "hello"
+         in assertEqual
+              "realise"
+              (Right (), [EvBuilt "hello-out"], False)
+              (result, realiseWork events, Set.member (fakePath "gone-out") valid),
+      -- Upstream's retrySubstitution: the closure's hole is an input built
+      -- here, and then the substitute is good, so hello is not built.
+      runTest "an input that fills the closure's hole lets the substitute through" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [fakeNode "hello" ["hello-out"] ["lib"], fakeNode "lib" ["lib-out"] []]
+                [("hello-out", ["lib-out"])]
+                []
+                "hello"
+         in assertEqual "realise" (Right (), [EvBuilt "lib-out", EvFetched [fakePath "hello-out"]]) (result, realiseWork events),
+      runTest "a root with a missing output is not retried when no reference was at fault" $
+        let (_, events, _) =
+              runRealise Set.empty [fakeNode "hello" ["hello-out"] []] [] [] "hello"
+         in assertEqual "narinfo queries" (1 :: Int) (length [() | EvQueried _ <- events]),
+      runTest "outputs arrive together, and one referencing another is no hole" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [fakeNode "pkg" ["pkg-bin", "pkg-lib"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [("pkg-bin", ["pkg-lib"]), ("pkg-lib", [])]
+                []
+                "pkg"
+         in assertEqual "realise" (Right (), [EvFetched [fakePath "pkg-bin", fakePath "pkg-lib"]]) (result, realiseWork events),
+      runTest "one missing output of two builds rather than half substituting" $
+        let (result, events, valid) =
+              runRealise
+                Set.empty
+                [fakeNode "pkg" ["pkg-bin", "pkg-lib"] []]
+                [("pkg-bin", [])]
+                []
+                "pkg"
+         in assertEqual
+              "realise"
+              (Right (), [EvBuilt "pkg-bin"], True)
+              (result, realiseWork events, Set.member (fakePath "pkg-lib") valid),
+      runTest "a self-reference is no hole" $
+        let (result, events, _) =
+              runRealise Set.empty [fakeNode "hello" ["hello-out"] []] [("hello-out", ["hello-out"])] [] "hello"
+         in assertEqual "realise" (Right (), [EvFetched [fakePath "hello-out"]]) (result, realiseWork events),
+      runTest "a reference cycle a cache declares ends, and falls back to building" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [fakeNode "hello" ["hello-out"] []]
+                [("hello-out", ["a-out"]), ("a-out", ["b-out"]), ("b-out", ["a-out"])]
+                []
+                "hello"
+         in assertEqual "realise" (Right (), [EvBuilt "hello-out"]) (result, realiseWork events),
+      runTest "a substitution is retried once after the inputs, and not again" $
+        let (_, events, _) =
+              runRealise Set.empty [fakeNode "hello" ["hello-out"] []] [("hello-out", ["gone-out"])] [] "hello"
+         in assertEqual "narinfo queries" (2 :: Int) (length [() | EvQueried sp <- events, sp == fakePath "hello-out"]),
+      runTest "a reference that landed before another failed stays valid" $
+        let (result, events, valid) =
+              runRealise
+                Set.empty
+                [fakeNode "hello" ["hello-out"] []]
+                [("hello-out", ["a-out", "z-out"]), ("a-out", [])]
+                []
+                "hello"
+         in assertEqual
+              "realise"
+              (Right (), [EvFetched [fakePath "a-out"], EvBuilt "hello-out"], True)
+              (result, realiseWork events, Set.member (fakePath "a-out") valid),
+      runTestM "a closure lands exactly when all of it is cached, and stays closed" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genClosureCase $ \(references, absent) ->
+              let paths = Map.keys references
+                  root = maximum (0 : paths)
+                  closure seen node
+                    | Set.member node seen = seen
+                    | otherwise = foldl closure (Set.insert node seen) (Map.findWithDefault [] node references)
+                  path = fakePath . ("p" <>) . T.pack . show
+                  cache = Map.fromList [(path node, map path refs) | (node, refs) <- Map.toList references, node `notElem` absent]
+                  (outcome, final) =
+                    runState (Realise.substituteClosure fakeSubst [path root]) (FakeWorld Set.empty cache [])
+                  valid = fwValid final
+                  closed = all (\sp -> all (`Set.member` valid) (Map.findWithDefault [] sp cache)) valid
+                  wholeOnCache = all (`notElem` absent) (closure Set.empty root)
+               in (outcome == Realise.ClosureComplete, closed) QC.=== (wholeOnCache, True)
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTest "valid outputs need no cache at all" $
+        let (result, events, _) =
+              runRealise Set.empty [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []] [] ["hello-out"] "hello"
+         in assertEqual "realise" (Right (), [EvReported Realise.AlreadyValid "hello-out"]) (result, events),
+      runTest "a dependency two others share is realised once" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [ fakeNode "top" ["top-out"] ["left", "right"],
+                  fakeNode "left" ["left-out"] ["base"],
+                  fakeNode "right" ["right-out"] ["base"],
+                  fakeNode "base" ["base-out"] []
+                ]
+                []
+                []
+                "top"
+         in assertEqual
+              "realise"
+              (Right (), [EvBuilt "base-out", EvBuilt "left-out", EvBuilt "right-out", EvBuilt "top-out"])
+              (result, realiseWork events),
+      runTest "a failed input stops the build of what depends on it" $
+        let (result, events, _) =
+              runRealise
+                (Set.singleton "gcc-out")
+                [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                []
+                []
+                "hello"
+         in assertEqual "realise" (Left "building gcc-out failed", []) (result, realiseWork events)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -9522,8 +9808,29 @@ testSubstituterRetry = do
                       config = (defaultBuildConfig (StoreDir root)) {bcCaches = [Subst.CacheConfig base [] 40]}
                   bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
                     bracket (openStore (StoreDir root)) closeStore $ \store -> do
-                      _ <- trySubstituteOutputs config store drv
+                      _ <- substitutePaths config store (map doPath (drvOutputs drv))
                       assertEqual "narinfo requests" (map (\h -> "/" <> TE.encodeUtf8 h <> ".narinfo") [low, high]) <$> requests,
+              runTestM "a reference query believes a signed narinfo for the path" $
+                withHttpServer (route (const narInfoOk) (const narOk)) $ \base _ _ ->
+                  assertEqual "references" (Just [])
+                    <$> Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry [Subst.CacheConfig base [publicKey] 40] sp,
+              runTestM "a reference query refuses a narinfo no trusted key signed" $
+                withHttpServer (route (const (Send (httpResponse "200 OK" (TE.encodeUtf8 (NarInfo.renderNarInfo unsigned))))) (const narOk)) $ \base _ _ ->
+                  assertEqual "references" Nothing
+                    <$> Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry [Subst.CacheConfig base [publicKey] 40] sp,
+              runTestM "a reference query refuses a narinfo for another path" $
+                withHttpServer (\_ _ -> narInfoOk) $ \base _ _ ->
+                  assertEqual "references" Nothing
+                    <$> Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry [Subst.CacheConfig base [publicKey] 40] (StorePath (T.replicate 32 "c") "retry"),
+              runTestM "a reference query falls through a failing cache to the next" $
+                withHttpServer (route (const unavailable) (const narOk)) $ \failing _ _ ->
+                  withHttpServer (route (const narInfoOk) (const narOk)) $ \working _ _ ->
+                    assertEqual "references" (Just [])
+                      <$> Subst.queryReferencesWith
+                        defaultFetchRetryPolicy
+                        quietRetry
+                        [Subst.CacheConfig failing [publicKey] 10, Subst.CacheConfig working [publicKey] 40]
+                        sp,
               runTestM "a narinfo that fails once with a 503 is fetched on the retry" $ do
                 (base, outcome, seen, sleeps, warnings) <-
                   substitute "narinfo-503" (\earlier -> if earlier == 0 then unavailable else narInfoOk) (const narOk)
@@ -9588,6 +9895,7 @@ testSubstituterRetry = do
     notInCache :: [Text]
     notInCache = ["404 Not Found", "410 Gone", "401 Unauthorized", "403 Forbidden", "407 Proxy Authentication Required"]
     statusCode = T.unpack . T.take 3
+    quietRetry = RetryEffects {reSleepMs = const (pure ()), reJitter = pure 0, reWarn = const (pure ())}
     hash = T.replicate 32 "b"
     sp = StorePath hash "retry"
     narInfoPath = "/" <> TE.encodeUtf8 hash <> ".narinfo"
@@ -15869,6 +16177,7 @@ runSuite = do
           testDrvContext,
           testStructuredAttrs,
           testDepGraph,
+          testRealise,
           testSubstituter,
           testCaseSensitiveVolumeIO,
           testFoldingVolumeIO,

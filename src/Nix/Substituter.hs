@@ -44,6 +44,7 @@ module Nix.Substituter
     SubstResult (..),
     trySubstitute,
     trySubstituteWith,
+    queryReferencesWith,
 
     -- * Cache configuration
     CacheConfig (..),
@@ -90,6 +91,7 @@ where
 import Control.Applicative ((<|>))
 import Control.Exception (Exception, Handler (..), SomeException, catch, catches, onException, throwIO)
 import Control.Monad (void)
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (sortBy)
@@ -97,6 +99,7 @@ import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.IO as TIO
 import Data.Word (Word64)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
@@ -106,7 +109,7 @@ import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferEr
 import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarStream, unpackNarEntry, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StoreDir, StorePath (spHash), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
+import Nix.Store.Path (StoreDir, StorePath (spHash, spName), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
 import qualified NovaCache.Bzip2 as Bzip2
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
@@ -116,6 +119,7 @@ import qualified NovaCache.Validate as Validate
 import qualified NovaCache.Xz as Xz
 import qualified NovaCache.Zstd as Zstd
 import qualified System.Directory as Dir
+import System.IO (stderr)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -218,6 +222,48 @@ trySubstituteWith policy effects store caches sp = do
             other -> do
               releasePathLock lock
               pure other
+
+-- | The references the first willing cache declares for a path, or
+-- 'Nothing' when no cache will serve it.  References arrive before the path
+-- that names them ('Nix.Realise'), so this runs ahead of any download, and a
+-- narinfo has to pass the same identity and signature checks as a
+-- substitution before its references are believed.  A cache that fails falls
+-- through to the next and says so: the caller goes on to build what no cache
+-- serves, and that should not happen in silence.
+queryReferencesWith :: FetchRetryPolicy -> RetryEffects IO -> [CacheConfig] -> StorePath -> IO (Maybe [StorePath])
+queryReferencesWith _ _ [] _ = pure Nothing
+queryReferencesWith policy effects caches sp = do
+  manager <- HTTPS.getGlobalManager
+  firstAnswer manager (sortCaches caches)
+  where
+    firstAnswer _ [] = pure Nothing
+    firstAnswer manager (cache : rest) = do
+      answer <-
+        queryReferencesAt (Retrying policy effects) manager cache sp
+          `catchSync` \err -> pure (Left (Just ("query exception: " <> T.pack (show err))))
+      case answer of
+        Right references -> pure (Just references)
+        Left Nothing -> firstAnswer manager rest
+        Left (Just failure) -> do
+          TIO.hPutStrLn stderr ("  [subst] " <> ccUrl cache <> ": " <> spName sp <> ": " <> failure)
+          firstAnswer manager rest
+
+-- | One cache's answer for a path's references: 'Left' 'Nothing' when it does
+-- not hold the path, and a message when it fails or may not serve it.
+queryReferencesAt :: Retrying -> HTTP.Manager -> CacheConfig -> StorePath -> IO (Either (Maybe Text) [StorePath])
+queryReferencesAt retry mgr cache sp = do
+  fetched <- fetchNarInfo retry mgr cache sp
+  pure $ case fetched of
+    Right narInfo -> first Just (referencesServedFor cache sp narInfo)
+    Left (SubstError err) -> Left (Just err)
+    Left _ -> Left Nothing
+
+-- | The references of a narinfo, once it passes the checks a substitution
+-- would make of it.
+referencesServedFor :: CacheConfig -> StorePath -> NarInfo.NarInfo -> Either Text [StorePath]
+referencesServedFor cache sp narInfo
+  | not (narInfoMatchesPath sp narInfo) = Left ("narinfo names " <> NarInfo.niStorePath narInfo)
+  | otherwise = narInfoPreflight cache narInfo >> parseReferences (NarInfo.niReferences narInfo)
 
 -- | Fold per-cache attempts in priority order.  The first success wins and
 -- stops the scan.  An erroring cache falls through to the remaining ones -

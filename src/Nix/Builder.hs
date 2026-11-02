@@ -38,7 +38,7 @@ module Nix.Builder
     BuildResult (..),
     buildDerivation,
     buildWithDeps,
-    trySubstituteOutputs,
+    substitutePaths,
 
     -- * Build configuration
     BuildConfig (..),
@@ -84,16 +84,16 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
-import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, topoSort)
-import qualified Nix.DependencyGraph
+import Nix.DependencyGraph (TopoResult (..), buildDepGraph, topoSort)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fromATerm, platformToText)
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
+import Nix.Realise (RealiseEffects (..), Realised (..), SubstEffects (..), realise)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, rewriteStoreHashes, scanReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, storePathToFilePath, unStoreDir)
-import Nix.Substituter (CacheConfig, SubstResult (..), trySubstituteWith)
+import Nix.Substituter (CacheConfig, SubstResult (..), queryReferencesWith, trySubstituteWith)
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
 import qualified System.Environment
@@ -332,7 +332,7 @@ lockOrder = sort
 -- Every output, never just the first: a partially valid multi-output
 -- derivation still has to build, and treating it as finished would leave
 -- the missing outputs missing.  Both the lock-held re-check and the gate
--- in 'resolveDep' ask this one question, so the two cannot disagree.
+-- in 'realiseEffects' ask this one question, so the two cannot disagree.
 allOutputsValid :: Store -> Derivation -> IO (Maybe StorePath)
 allOutputsValid store drv = case map doPath (drvOutputs drv) of
   [] -> pure Nothing
@@ -616,9 +616,9 @@ onStore config
 -- Input sources must be valid.  For input derivations, the artifacts a build
 -- actually reads are their realized OUTPUT paths, not the @.drv@ recipe files,
 -- so we resolve each requested output (by reading the input @.drv@ the build
--- driver materialized) and validate those outputs.  Dependencies are realized
--- in topological order, so a dependency's outputs are present by the time a
--- dependent is validated.
+-- driver materialized) and validate those outputs.  'Nix.Realise' realizes a
+-- derivation's inputs before it builds, so their outputs are present by the
+-- time it is validated.
 validateInputs :: BuildConfig -> Store -> Derivation -> IO (Either Text ())
 validateInputs config store drv = do
   -- Check input sources
@@ -1311,15 +1311,13 @@ collectAllCandidates drv =
 -- Dependency-aware build orchestration
 -- ---------------------------------------------------------------------------
 
--- | Build a derivation and all its transitive dependencies.
+-- | Realise a derivation and what it needs, root first ("Nix.Realise").
 --
 -- 1. Build the dependency graph by reading .drv files from the store.
--- 2. Topologically sort: leaves (no deps) first.
--- 3. For each dependency in build order:
---    a. Already in store? Skip.
---    b. Available in a binary cache? Substitute.
---    c. Otherwise: build locally.
--- 4. Build the root derivation last.
+-- 2. Refuse a cycle.
+-- 3. Try each derivation's outputs before its inputs, so a substituted
+--    derivation needs only its runtime closure.  What no cache supplies
+--    builds locally, leaves first.
 --
 -- Returns 'BuildSuccess' with the root output path on success, or
 -- 'BuildFailure' if any dependency fails to build or substitute.
@@ -1332,20 +1330,14 @@ buildWithDeps config store rootDrv rootDrvPath = do
       case topoSort depGraph of
         TopoCycle _ ->
           pure (BuildFailure "dependency cycle detected" 1)
-        TopoSorted buildOrder -> do
-          let drvMap = Map.fromList [(sp, drv) | sp <- buildOrder, Just drv <- [lookupDrv depGraph sp]]
-          result <- buildInOrder config store drvMap buildOrder
+        TopoSorted _ -> do
+          result <- realise (realiseEffects config store) depGraph rootDrvPath
           case result of
             Left err -> pure (BuildFailure err 1)
             Right () ->
               case drvOutputs rootDrv of
                 (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
                 [] -> pure (BuildFailure "no outputs defined" 1)
-
--- | Look up a derivation in the dependency graph.
-lookupDrv :: DepGraph -> StorePath -> Maybe Derivation
-lookupDrv (Nix.DependencyGraph.DepGraph g) sp =
-  Nix.DependencyGraph.dnDerivation <$> Map.lookup sp g
 
 -- | Read and parse a .drv file from the store, as bytes (no locale
 -- decode, no newline translation).
@@ -1358,73 +1350,59 @@ readDrvFromStore config sp = do
     Right bytes -> fromATerm bytes
 
 -- ---------------------------------------------------------------------------
--- Build in topological order
+-- Realisation effects
 -- ---------------------------------------------------------------------------
 
--- | Status tag for dependency resolution status messages.
-data DepStatus = Cached | Substituted | Building
+-- | The store, caches and builder that "Nix.Realise" drives.
+realiseEffects :: BuildConfig -> Store -> RealiseEffects IO
+realiseEffects config store =
+  RealiseEffects
+    { reSubst =
+        SubstEffects
+          { seValid = isValid store,
+            seReferences = queryReferencesWith (bcFetchRetry config) ioRetryEffects (bcCaches config),
+            seFetch = substitutePaths config store
+          },
+      -- Every output, not just the first: a derivation whose first output is
+      -- valid and whose second was deleted would otherwise be logged cached
+      -- and skipped, and the missing output would stay missing.  Upstream
+      -- skips a build only when all of them are valid.
+      reAllValid = fmap isJust . allOutputsValid store,
+      reBuild = buildReporting config store,
+      reReport = logRealised
+    }
+
+-- | Build one derivation, naming it in any failure.
+buildReporting :: BuildConfig -> Store -> Derivation -> IO (Either Text ())
+buildReporting config store drv = do
+  result <- buildDerivation config store drv
+  pure $ case result of
+    BuildSuccess _ -> Right ()
+    BuildFailure msg code ->
+      Left ("building " <> formatDrvName drv <> " failed: exit " <> T.pack (show code) <> ": " <> msg)
 
 -- | Format a status tag for display.
-statusTag :: DepStatus -> Text
-statusTag Cached = "[cached]"
+statusTag :: Realised -> Text
+statusTag AlreadyValid = "[cached]"
 statusTag Substituted = "[subst] "
-statusTag Building = "[build] "
+statusTag Built = "[build] "
 
--- | Build dependencies in topological order.
--- Skips paths already in the store, tries substitution, then builds.
-buildInOrder :: BuildConfig -> Store -> Map StorePath Derivation -> [StorePath] -> IO (Either Text ())
-buildInOrder _ _ _ [] = pure (Right ())
-buildInOrder config store drvMap (sp : rest) =
-  case Map.lookup sp drvMap of
-    Nothing ->
-      -- Not a derivation we know about - might be a source path.  Skip.
-      buildInOrder config store drvMap rest
-    Just drv -> do
-      status <- resolveDep config store drv
-      case status of
-        Right depStatus -> do
-          logDepStatus depStatus drv
-          buildInOrder config store drvMap rest
-        Left err ->
-          pure (Left ("building " <> formatDrvName drv <> " failed: " <> err))
-
--- | Resolve a single dependency: check cache, try substitution, or build.
-resolveDep :: BuildConfig -> Store -> Derivation -> IO (Either Text DepStatus)
-resolveDep config store drv = do
-  -- Every output, not just the first: a derivation whose first output is
-  -- valid and whose second was deleted would otherwise be logged cached
-  -- and skipped, and the missing output would stay missing.  Upstream
-  -- skips a build only when all of them are valid.
-  cached <- isJust <$> allOutputsValid store drv
-  if cached
-    then pure (Right Cached)
-    else do
-      substituted <- trySubstituteOutputs config store drv
-      if substituted
-        then pure (Right Substituted)
-        else do
-          result <- buildDerivation config store drv
-          case result of
-            BuildSuccess _ -> pure (Right Building)
-            BuildFailure msg code ->
-              pure (Left ("exit " <> T.pack (show code) <> ": " <> msg))
-
--- | Log dependency resolution status to stderr.
-logDepStatus :: DepStatus -> Derivation -> IO ()
-logDepStatus status drv =
+-- | Log how a dependency was realised to stderr.
+logRealised :: Realised -> Derivation -> IO ()
+logRealised status drv =
   TIO.hPutStrLn System.IO.stderr ("  " <> statusTag status <> " " <> formatDrvName drv)
 
--- | Try to substitute all outputs of a derivation from binary caches.
--- Returns True if every output was substituted or already valid.
+-- | Try to substitute paths from binary caches.  Returns True if every path
+-- was substituted or already valid.
 --
--- Registration is all-or-nothing and batched: every output is verified
--- and unpacked first, then recorded in one 'registerPaths' transaction,
--- so cross-output reference edges land after both endpoints' rows exist
--- and a partial substitution registers nothing (the subsequent build
--- starts from unregistered outputs and 'prepareOutput' replaces the
--- leftover unpacked trees).
+-- Registration is all-or-nothing and batched: every path is verified and
+-- unpacked first, then recorded in one 'registerPaths' transaction, so
+-- reference edges between the outputs of one derivation land after both
+-- endpoints' rows exist and a partial substitution registers nothing (the
+-- subsequent build starts from unregistered outputs and 'prepareOutput'
+-- replaces the leftover unpacked trees).
 --
--- Each substituted output arrives with its path lock STILL HELD (see
+-- Each substituted path arrives with its path lock STILL HELD (see
 -- 'Nix.Substituter.SubstSuccess'), and the exclusion must survive until
 -- the registration transaction commits - released earlier, another
 -- process could meet the unpacked-but-unregistered window and delete
@@ -1436,8 +1414,8 @@ logDepStatus status drv =
 -- reachable only through cache-declared references this store has never
 -- seen - is a substitution failure like any other: the transaction
 -- recorded nothing, so report it and fall back to building locally.
-trySubstituteOutputs :: BuildConfig -> Store -> Derivation -> IO Bool
-trySubstituteOutputs config store drv
+substitutePaths :: BuildConfig -> Store -> [StorePath] -> IO Bool
+substitutePaths config store paths
   | null (bcCaches config) = pure False
   | otherwise = do
       heldLocks <- newIORef []
@@ -1446,7 +1424,7 @@ trySubstituteOutputs config store drv
   where
     registerSubstituted :: IORef [PathLock] -> IO Bool
     registerSubstituted heldLocks = do
-      results <- mapM (substituteOne heldLocks) (lockOrder (map doPath (drvOutputs drv)))
+      results <- mapM (substituteOne heldLocks) (lockOrder paths)
       case traverse substOutcome results of
         Nothing -> pure False
         Just outcomes -> do
@@ -1459,15 +1437,15 @@ trySubstituteOutputs config store drv
                 ("  [subst] registration refused, building instead: " <> T.pack (displayException e))
               pure False
     -- Record a returned lock the moment it exists, so the enclosing
-    -- finally owns it even when a later output's attempt fails or
-    -- throws.
+    -- finally owns it even when a later path's attempt fails or throws.
     substituteOne heldLocks sp = do
       result <- trySubstituteWith (bcFetchRetry config) ioRetryEffects store (bcCaches config) sp
       case result of
         SubstSuccess _ lock -> atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
+        SubstError err -> TIO.hPutStrLn System.IO.stderr ("  [subst] " <> spName sp <> ": " <> err)
         _ -> pure ()
       pure result
-    -- An already-valid output counts as substituted but contributes no
+    -- An already-valid path counts as substituted but contributes no
     -- registration row (and holds no lock).
     substOutcome (SubstSuccess reg _) = Just (Just reg)
     substOutcome SubstAlreadyValid = Just Nothing
