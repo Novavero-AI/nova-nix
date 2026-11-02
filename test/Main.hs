@@ -48,7 +48,7 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, tryFetchUrlsWith, trySubstituteOutputs, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
 import Nix.Config (NixConfig (..))
@@ -9497,7 +9497,34 @@ testSubstituterRetry = do
                     other -> pure (Left other)
                   (,,,,) base outcome <$> requests <*> readIORef sleeps <*> readIORef warnings
        in sequence $
-            [ runTestM "a narinfo that fails once with a 503 is fetched on the retry" $ do
+            [ -- The order two processes meet the locks in decides whether they
+              -- can deadlock, and each path's narinfo is requested under its
+              -- lock, so the requests show the order without a race to observe.
+              runTestM "a substitution takes its output locks in the order a build does" $
+                withHttpServer (\_ _ -> Send (httpResponse "404 Not Found" "")) $ \base requests _ -> do
+                  tmpBase <- getTemporaryDirectory
+                  let root = tmpBase </> "nova-nix-test-substitute-lock-order"
+                      low = T.replicate 32 "a"
+                      high = T.replicate 32 "z"
+                      drv =
+                        Derivation
+                          { drvOutputs =
+                              [ DerivationOutput "bin" (StorePath high "lock-order-bin") "" "",
+                                DerivationOutput "lib" (StorePath low "lock-order-lib") "" ""
+                              ],
+                            drvInputDrvs = Map.empty,
+                            drvInputSrcs = [],
+                            drvPlatform = X86_64_Linux,
+                            drvBuilder = "/bin/sh",
+                            drvArgs = [],
+                            drvEnv = Map.empty
+                          }
+                      config = (defaultBuildConfig (StoreDir root)) {bcCaches = [Subst.CacheConfig base [] 40]}
+                  bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
+                    bracket (openStore (StoreDir root)) closeStore $ \store -> do
+                      _ <- trySubstituteOutputs config store drv
+                      assertEqual "narinfo requests" (map (\h -> "/" <> TE.encodeUtf8 h <> ".narinfo") [low, high]) <$> requests,
+              runTestM "a narinfo that fails once with a 503 is fetched on the retry" $ do
                 (base, outcome, seen, sleeps, warnings) <-
                   substitute "narinfo-503" (\earlier -> if earlier == 0 then unavailable else narInfoOk) (const narOk)
                 pure
