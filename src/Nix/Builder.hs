@@ -38,6 +38,7 @@ module Nix.Builder
     BuildResult (..),
     buildDerivation,
     buildWithDeps,
+    trySubstituteOutputs,
 
     -- * Build configuration
     BuildConfig (..),
@@ -295,12 +296,12 @@ buildDerivationInner config store drv =
 -- single tree, and each registered it as valid.  Nothing failed; the
 -- registered output was simply not what either build produced.
 --
--- Outputs are locked in 'StorePath' order so two processes racing the
--- same multi-output derivation request them in the same sequence.  A
+-- Outputs are locked in 'lockOrder', so two processes racing the same
+-- multi-output derivation request them in the same sequence and neither
+-- can hold a lock the other needs while waiting on one it holds.  A
 -- build holds locks for its own outputs only - dependencies are
 -- resolved before 'buildDerivation' is called, never underneath it - so
--- no process holds one lock while waiting on another, and there is no
--- cycle to deadlock on.
+-- that sequence is the only one there is to agree on.
 --
 -- The validity re-check happens under the locks, not before them:
 -- checked earlier it would answer about a moment that has already
@@ -312,11 +313,18 @@ withOutputLocks config store drv act = do
         lock <- acquirePathLock (bcStoreDir config) sp
         atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
   ( do
-      mapM_ takeLock (sort (map doPath (drvOutputs drv)))
+      mapM_ takeLock (lockOrder (map doPath (drvOutputs drv)))
       finishedElsewhere <- allOutputsValid store drv
       act finishedElsewhere
     )
     `finally` (readIORef heldLocks >>= mapM_ releasePathLock)
+
+-- | The order a process takes more than one path lock in.  Substitution
+-- holds each lock until its batch registers, and a build until it finishes,
+-- so both have to use this order: the blocking lock has no timeout, and two
+-- processes taking the same paths in different orders would wait forever.
+lockOrder :: [StorePath] -> [StorePath]
+lockOrder = sort
 
 -- | The derivation's first output path when EVERY output is already
 -- registered, otherwise 'Nothing'.
@@ -1458,7 +1466,7 @@ trySubstituteOutputs config store drv
   where
     registerSubstituted :: IORef [PathLock] -> IO Bool
     registerSubstituted heldLocks = do
-      results <- mapM (substituteOne heldLocks . doPath) (drvOutputs drv)
+      results <- mapM (substituteOne heldLocks) (lockOrder (map doPath (drvOutputs drv)))
       case traverse substOutcome results of
         Nothing -> pure False
         Just outcomes -> do
