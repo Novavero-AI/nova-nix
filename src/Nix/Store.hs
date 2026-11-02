@@ -51,8 +51,9 @@ module Nix.Store
     registrationFor,
     materializeEvalSources,
     materializeEvalStoreWrites,
+    rewriteBytes,
+    rewriteStoreHashes,
     scanReferences,
-    scanTempReferences,
     setReadOnly,
     unpackNarEntry,
     writeDrv,
@@ -85,7 +86,7 @@ module Nix.Store
   )
 where
 
-import Control.Exception (IOException, bracket, catch, onException, throwIO, try, tryJust)
+import Control.Exception (IOException, bracket, catch, finally, onException, throwIO, try, tryJust)
 import Control.Monad (guard, join, unless, when)
 import Data.Bool (bool)
 import qualified Data.ByteString as BS
@@ -93,7 +94,7 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.Char (toUpper)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.List (inits)
+import Data.List (inits, stripPrefix)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
@@ -374,31 +375,93 @@ scanReferences candidates dir = do
     pure (Set.union acc (Set.fromList [h | (needle, h) <- needles, needle `BS.isInfixOf` contents]))
   pure [sp | (h, sp) <- Set.toList candidateSet, Set.member h foundHashes]
 
--- | Scan an output for references to build-temp output locations.
---
--- The builder runs under a temp directory, so an output that embeds its own or
--- a sibling output's path embeds the TEMP path - which 'scanReferences' does
--- not look for.  Given @(tempDir, storePath)@ for every output of
--- the derivation, returns the store paths whose temp location is referenced
--- from the scanned output, capturing self- and cross-output references.
---
--- This records the dependency edge; it does not rewrite the embedded bytes
--- (self-reference hash rewriting is a separate, future concern).
-scanTempReferences :: [(FilePath, StorePath)] -> FilePath -> IO [StorePath]
-scanTempReferences tempPairs dir = do
-  let needles = [(TE.encodeUtf8 (T.pack tempDir), sp) | (tempDir, sp) <- tempPairs]
-  units <- collectScanUnits dir
-  foundHashes <- foldlIO Set.empty units $ \acc unit -> do
-    contents <- scanUnitBytes unit
-    pure (Set.union acc (Set.fromList [spHash sp | (needle, sp) <- needles, needle `BS.isInfixOf` contents]))
-  pure [sp | (_, sp) <- tempPairs, Set.member (spHash sp) foundHashes]
+-- | Replace store path hashes across a tree: file bytes, symlink targets and
+-- entry names, every place a NAR carries one.  Upstream rewrites the serialized
+-- NAR and so reaches all three (@rewriteOutput@ in
+-- @local-derivation-goal.cc@ at 2.24.9).  A store path hash has one length, so
+-- no offset inside a file moves.
+rewriteStoreHashes :: [(Text, Text)] -> FilePath -> IO ()
+rewriteStoreHashes [] _ = pure ()
+rewriteStoreHashes rewrites root = rewriteAt id root
+  where
+    byteRewrites = [(TE.encodeUtf8 from, TE.encodeUtf8 to) | (from, to) <- rewrites]
+    nameRewrites = [(T.unpack from, T.unpack to) | (from, to) <- rewrites]
+    rewriteName name = foldl' (\acc (from, to) -> replaceInName from to acc) name nameRewrites
+    -- Replacing a link edits its parent, so the guard for a read-only parent
+    -- comes from the caller: the root's parent is the store, not the output.
+    rewriteAt parentGuard path = do
+      node <- classifyWalkNode path
+      case node of
+        WalkSymlink -> do
+          target <- Dir.getSymbolicLinkTarget path
+          let updated = rewriteName target
+          unless (updated == target) (parentGuard (replaceLink path updated))
+        WalkDirectory -> do
+          entries <- listDirectory path
+          mapM_ (rewriteEntry path) entries
+        WalkRegular -> do
+          bytes <- BS.readFile path
+          let updated = rewriteBytes byteRewrites bytes
+          unless (updated == bytes) (whileWritable path (BS.writeFile path updated))
+        WalkAbsent -> pure ()
+    rewriteEntry dir entry = do
+      rewriteAt (whileWritable dir) (dir </> entry)
+      let renamed = rewriteName entry
+      unless (renamed == entry) $ do
+        taken <- doesPathExist (dir </> renamed)
+        when taken (ioError (userError ("rewriting a store hash would overwrite " <> (dir </> renamed))))
+        whileWritable dir (renamePath (dir </> entry) (dir </> renamed))
+
+-- | Point a symlink somewhere else.  'Dir.removePathForcibly' removes a file
+-- link or a directory link alike, which differ on Windows.
+replaceLink :: FilePath -> FilePath -> IO ()
+replaceLink path target = do
+  linkOs <- OP.encodeFS path
+  targetOs <- OP.encodeFS target
+  Dir.removePathForcibly path
+  created <- createSymlinkOfKind linkOs targetOs
+  either (ioError . userError . T.unpack) pure created
+
+-- | Run an action on a path with write permission, then put its permissions
+-- back.  A builder may mark its output read-only before registration does.
+whileWritable :: FilePath -> IO a -> IO a
+whileWritable path action = do
+  permissions <- Dir.getPermissions path
+  setPermissions path (Dir.setOwnerWritable True permissions)
+  action `finally` setPermissions path permissions
+
+-- | Apply each replacement to bytes, in order.  An empty needle matches
+-- nothing.
+rewriteBytes :: [(BS.ByteString, BS.ByteString)] -> BS.ByteString -> BS.ByteString
+rewriteBytes rewrites bytes = foldl' (\acc (from, to) -> replaceInBytes from to acc) bytes rewrites
+
+replaceInBytes :: BS.ByteString -> BS.ByteString -> BS.ByteString -> BS.ByteString
+replaceInBytes from to bytes
+  | BS.null from = bytes
+  | otherwise = BS.concat (pieces bytes)
+  where
+    pieces remaining = case BS.breakSubstring from remaining of
+      (before, rest)
+        | BS.null rest -> [before]
+        | otherwise -> before : to : pieces (BS.drop (BS.length from) rest)
+
+-- | 'replaceInBytes' on a path component.  The rest of the name is left as
+-- the operating system spelled it, so no decoding step can damage it.
+replaceInName :: String -> String -> String -> String
+replaceInName from to name = case name of
+  _ | null from -> name
+  [] -> []
+  c : rest -> case stripPrefix from name of
+    Just after -> to ++ replaceInName from to after
+    Nothing -> c : replaceInName from to rest
 
 -- | One scannable unit of a walked tree: a regular file's bytes read
--- from disk, or a symlink's target string.  The NAR serialization
--- carries both, so reference scanning covers both - a link into a
--- dependency (@bin\/tool -> \/nix\/store\/\<hash\>-dep\/tool@)
--- references the dependency even when no file byte does.
-data ScanUnit = ScanFile !FilePath | ScanLinkTarget !BS.ByteString
+-- from disk, a symlink's target string, or an entry's name.  The NAR
+-- serialization carries all three and upstream scans that serialization,
+-- so reference scanning covers all three - a link into a dependency
+-- (@bin\/tool -> \/nix\/store\/\<hash\>-dep\/tool@) references the
+-- dependency even when no file byte does.
+data ScanUnit = ScanFile !FilePath | ScanText !BS.ByteString
 
 -- | Collect the scannable units under a path: regular files and symlink
 -- targets, links never followed.  A path that is itself a regular file
@@ -409,17 +472,18 @@ collectScanUnits path = do
   case node of
     WalkSymlink -> do
       target <- Dir.getSymbolicLinkTarget path
-      pure [ScanLinkTarget (TE.encodeUtf8 (T.pack target))]
+      pure [ScanText (TE.encodeUtf8 (T.pack target))]
     WalkDirectory -> do
       entries <- listDirectory path
-      concat <$> mapM (collectScanUnits . (path </>)) entries
+      nested <- concat <$> mapM (collectScanUnits . (path </>)) entries
+      pure (map (ScanText . TE.encodeUtf8 . T.pack) entries ++ nested)
     WalkRegular -> pure [ScanFile path]
     WalkAbsent -> pure []
 
 -- | The bytes a 'ScanUnit' contributes to the scan.
 scanUnitBytes :: ScanUnit -> IO BS.ByteString
 scanUnitBytes (ScanFile path) = BS.readFile path
-scanUnitBytes (ScanLinkTarget target) = pure target
+scanUnitBytes (ScanText text) = pure text
 
 -- | Strict left fold over a list in IO.  The accumulator is forced to
 -- WHNF each step - without it, the scan retains every scanned file's

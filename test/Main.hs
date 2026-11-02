@@ -85,7 +85,7 @@ import Nix.Json (Json (..), parseJson, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, pushPaths, storePathBasename, stripHashPrefix)
-import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, scanReferences, scanTempReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
@@ -11052,31 +11052,88 @@ testStoreOps = do
           refs <- scanReferences [candidate] scanDir
           removeIfExists scanDir
           pure (assertEqual "no partial refs" [] refs),
-        -- scanTempReferences records the self/cross-output edges that the
-        -- store-prefix scan cannot see (outputs embedding their TEMP path)
-        runTestM "scanTempReferences finds temp-dir embedding" $ do
+        runTestM "rewriteBytes agrees with a substring replacement model" $ do
+          result <-
+            QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+              QC.forAll (QC.listOf (QC.elements [97, 98, 99])) $ \bytes ->
+                let input = BS.pack bytes
+                    model = T.replace "bc" "aa" (T.replace "ab" "cc" (TE.decodeUtf8 input))
+                 in TE.decodeUtf8 (rewriteBytes [("ab", "cc"), ("bc", "aa")] input) QC.=== model
+          pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+        runTest "rewriteBytes leaves bytes alone when nothing matches" $
+          assertEqual "no match" "clean bytes" (rewriteBytes [("zz", "yy")] "clean bytes"),
+        runTest "rewriteBytes ignores an empty needle" $
+          assertEqual "empty needle" "bytes" (rewriteBytes [("", "x")] "bytes"),
+        runTestM "rewriteStoreHashes reaches contents, entry names and read-only files" $ do
           tmpBase <- getTemporaryDirectory
-          let scanDir = tmpBase </> "nova-nix-test-scan-temp"
-              fakeTempOut = tmpBase </> "nova-nix-build" </> "fake-out"
-          removeIfExists scanDir
-          createDirectoryIfMissing True scanDir
-          let selfSp = StorePath "cccccccccccccccccccccccccccccccc" "self"
-          BS.writeFile
-            (scanDir </> "wrapper.sh")
-            (TE.encodeUtf8 (T.pack ("exec " <> fakeTempOut <> "/bin/tool")))
-          found <- scanTempReferences [(fakeTempOut, selfSp)] scanDir
-          removeIfExists scanDir
-          pure (assertEqual "self-ref found" [selfSp] found),
-        runTestM "scanTempReferences negative" $ do
+          let dir = tmpBase </> "nova-nix-test-rewrite-tree"
+          forceRemoveIfExists dir
+          createDirectoryIfMissing True (dir </> "sub")
+          BS.writeFile (dir </> "sub" </> "file") "path /nix/store/aaaa-dep/bin"
+          BS.writeFile (dir </> "clean") "nothing here"
+          BS.writeFile (dir </> "aaaa-named") "x"
+          readOnly <- Dir.getPermissions (dir </> "sub" </> "file")
+          Dir.setPermissions (dir </> "sub" </> "file") (Dir.setOwnerWritable False readOnly)
+          rewriteStoreHashes [("aaaa", "bbbb")] dir
+          contents <- BS.readFile (dir </> "sub" </> "file")
+          stillReadOnly <- not . Dir.writable <$> Dir.getPermissions (dir </> "sub" </> "file")
+          renamed <- Dir.doesFileExist (dir </> "bbbb-named")
+          oldName <- Dir.doesFileExist (dir </> "aaaa-named")
+          forceRemoveIfExists dir
+          pure (assertEqual "rewrite" ("path /nix/store/bbbb-dep/bin", True, True, False) (contents, stillReadOnly, renamed, oldName)),
+        runTestM "rewriteStoreHashes reaches a directory named for a hash" $ do
           tmpBase <- getTemporaryDirectory
-          let scanDir = tmpBase </> "nova-nix-test-scan-temp-neg"
-          removeIfExists scanDir
-          createDirectoryIfMissing True scanDir
-          let selfSp = StorePath "cccccccccccccccccccccccccccccccc" "self"
-          BS.writeFile (scanDir </> "clean.txt") "no temp paths embedded here"
-          found <- scanTempReferences [(tmpBase </> "nova-nix-build" </> "fake-out", selfSp)] scanDir
-          removeIfExists scanDir
-          pure (assertEqual "no refs" [] found),
+          let dir = tmpBase </> "nova-nix-test-rewrite-named-dir"
+          forceRemoveIfExists dir
+          createDirectoryIfMissing True (dir </> "aaaa-sub")
+          BS.writeFile (dir </> "aaaa-sub" </> "file") "see aaaa"
+          rewriteStoreHashes [("aaaa", "bbbb")] dir
+          contents <- BS.readFile (dir </> "bbbb-sub" </> "file")
+          forceRemoveIfExists dir
+          pure (assertEqual "nested contents" "see bbbb" contents),
+        runTestM "rewriteStoreHashes refuses to overwrite an entry" $ do
+          tmpBase <- getTemporaryDirectory
+          let dir = tmpBase </> "nova-nix-test-rewrite-collision"
+          forceRemoveIfExists dir
+          createDirectoryIfMissing True dir
+          BS.writeFile (dir </> "aaaa-x") "scratch"
+          BS.writeFile (dir </> "bbbb-x") "final"
+          outcome <- try (rewriteStoreHashes [("aaaa", "bbbb")] dir)
+          survivor <- BS.readFile (dir </> "bbbb-x")
+          forceRemoveIfExists dir
+          pure $ case (outcome :: Either IOException (), survivor) of
+            (Left _, "final") -> Pass
+            other -> Fail (T.pack (show other)),
+        runTestM "scanReferences finds a hash held only in an entry name" $ do
+          tmpBase <- getTemporaryDirectory
+          let dir = tmpBase </> "nova-nix-test-scan-entry-name"
+              candidate = StorePath "cccccccccccccccccccccccccccccccc" "dep"
+          forceRemoveIfExists dir
+          createDirectoryIfMissing True (dir </> "share")
+          BS.writeFile (dir </> "share" </> "cccccccccccccccccccccccccccccccc-dep") ""
+          refs <- scanReferences [candidate] dir
+          forceRemoveIfExists dir
+          pure (assertEqual "entry name" [candidate] refs),
+        -- A relative target: Windows normalises the separators of a rooted one.
+        runTestM "rewriteStoreHashes rewrites a symlink target, in a read-only directory too" $ do
+          canLink <- symlinksAvailable
+          if not canLink
+            then pure Pass
+            else do
+              tmpBase <- getTemporaryDirectory
+              let dir = tmpBase </> "nova-nix-test-rewrite-link"
+              forceRemoveIfExists dir
+              createDirectoryIfMissing True (dir </> "sub")
+              Dir.createFileLink "aaaa-dep" (dir </> "sub" </> "link")
+              frozen <- Dir.getPermissions (dir </> "sub")
+              Dir.setPermissions (dir </> "sub") (Dir.setOwnerWritable False frozen)
+              outcome <- try (rewriteStoreHashes [("aaaa", "bbbb")] dir)
+              target <- Dir.getSymbolicLinkTarget (dir </> "sub" </> "link")
+              Dir.setPermissions (dir </> "sub") (Dir.setOwnerWritable True frozen)
+              forceRemoveIfExists dir
+              pure $ case outcome :: Either IOException () of
+                Left err -> Fail (T.pack (show err))
+                Right () -> assertEqual "link target" "bbbb-dep" target,
         -- addToStore moves dir + registers in DB
         runTestM "addToStore moves + registers" $ do
           tmpBase <- getTemporaryDirectory
@@ -11969,9 +12026,9 @@ testBuilder = do
           (_, BuildFailure msg _) -> Fail ("a builder writing both outputs failed the rebuild: " <> msg)
           _ -> Fail "partial rebuild test setup did not reach the expected states",
       -- The scratch path is discarded after the build, so an output that
-      -- records it would be registered with a reference to nothing.  We do
-      -- not rewrite the contents the way upstream does; we refuse.
-      runTestM "an output recording a valid sibling's scratch path fails the build" $ do
+      -- records it would be left naming nothing.  The hash is rewritten to
+      -- the sibling's final one, as upstream rewrites it.
+      runTestM "an output recording a valid sibling's scratch path names the sibling" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-scratch-leak"
         forceRemoveIfExists tmpStore
@@ -11993,27 +12050,30 @@ testBuilder = do
                 }
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-scratch-leak-tmp"}
             devPath = storePathToFilePath (stDir store) devSP
+            outPath = storePathToFilePath (stDir store) outSP
         initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo first > $out/value && echo first > $dev/value")
         deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
         -- \$dev now names a scratch path, and the builder bakes it into $out
         -- the way a compiler driver or a libtool archive would.
         rebuilt <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo $dev > $out/recorded && echo first > $dev/value")
         devContents <- T.strip <$> TIO.readFile (devPath </> "value")
+        recorded <- T.strip <$> TIO.readFile (outPath </> "recorded")
         devValid <- isValid store devSP
         outValid <- isValid store outSP
+        references <- queryReferences (stDB store) outSP
         closeStore store
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
         let deletedFirst = either (const False) (\outcome -> doRowRemoved outcome && doTreeRemoved outcome) deleted
         pure $ case (initial, rebuilt) of
-          (BuildSuccess _, BuildFailure msg _)
+          (BuildSuccess _, BuildSuccess _)
             | not deletedFirst -> Fail "scratch-leak setup did not delete the first output"
-            | not ("scratch path" `T.isInfixOf` msg) -> Fail ("expected a scratch-path refusal, got: " <> msg)
-            -- The refusal must not cost the sibling that was already valid.
-            | not devValid || devContents /= "first" -> Fail "the refusal disturbed the valid sibling"
-            | outValid -> Fail "the refused output registered anyway"
+            | not (outValid && devValid) -> Fail "both outputs should be valid after the rebuild"
+            | devContents /= "first" -> Fail ("valid sibling was overwritten: " <> devContents)
+            | recorded /= T.pack devPath -> Fail ("the output did not name the sibling: " <> recorded)
+            | map (T.takeEnd (T.length (spName devSP))) references /= [spName devSP] -> Fail ("expected only the sibling as a reference: " <> T.pack (show references))
             | otherwise -> Pass
-          (_, BuildSuccess _) -> Fail "an output naming a discarded scratch path was accepted"
+          (_, BuildFailure msg _) -> Fail ("the rebuild failed: " <> msg)
           _ -> Fail "scratch-leak test setup did not reach the expected states",
       -- Builder succeeds but doesn't create $out, so the build fails
       runTestM "missing output fails build" $ do

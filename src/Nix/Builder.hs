@@ -90,7 +90,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, current
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
-import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, scanReferences, scanTempReferences, volumeCaseHack)
+import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, rewriteStoreHashes, scanReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, storePathToFilePath, unStoreDir)
 import Nix.Substituter (CacheConfig, SubstResult (..), trySubstituteWith)
@@ -1161,19 +1161,16 @@ registerOutputs config store drv _buildDir plans = do
       -- the caller (buildWithDeps) would need to pass it through.
       -- Register with no deriver for now - queryDeriver will return Nothing.
       drvPathText = Nothing
-      -- (fallback dir, the output it stood in for) for every already-valid
-      -- output.  Nothing may reference one: the tree is discarded after the
-      -- build, so a reference to it is a dangling edge, and upstream avoids
-      -- the same thing by rewriting the hashes back out of the contents.
-      -- Scanning for it and failing is louder and needs no rewriting.
-      fallbackPairs =
-        [ (storePathToFilePath (bcStoreDir config) (opScratch p), opFinal p)
-        | p <- plans,
-          opValid p
-        ]
-  -- Phase 1: scan references and move each output into the store, collecting a
-  -- PathRegistration (no DB writes yet).  Already-valid outputs are skipped.
-  prepared <- mapM (prepareOutput config store allCandidates fallbackPairs drvPathText) (zip (drvOutputs drv) plans)
+      -- An output may record an already-valid sibling, whose build wrote to
+      -- a scratch path that is about to stop existing, so each scratch hash
+      -- becomes the final one.  Upstream scans first and translates its hits;
+      -- rewriting first lets the scan see final hashes and needs no
+      -- translation, and the references come out the same.
+      scratchRewrites = [(spHash (opScratch p), spHash (opFinal p)) | p <- plans, opValid p]
+  -- Phase 1: rewrite scratch hashes, scan references and move each output into
+  -- the store, collecting a PathRegistration (no DB writes yet).  Already-valid
+  -- outputs are skipped.
+  prepared <- mapM (prepareOutput config store allCandidates scratchRewrites drvPathText) (zip (drvOutputs drv) plans)
   case sequence prepared of
     Left errMsg -> pure (BuildFailure errMsg 1)
     Right regs -> do
@@ -1184,18 +1181,18 @@ registerOutputs config store drv _buildDir plans = do
         [] -> pure (BuildFailure "no outputs defined" 1)
 
 -- | Prepare a single output for registration: skip if already valid in the DB,
--- otherwise scan references (input refs plus self/cross-output temp refs) and
--- place it in the store, returning its 'PathRegistration'.  Returns @Nothing@
+-- otherwise rewrite scratch hashes, scan references (inputs and this
+-- derivation's outputs) and place it in the store, returning its 'PathRegistration'.  Returns @Nothing@
 -- for an output already registered as valid.
 prepareOutput ::
   BuildConfig ->
   Store ->
   [StorePath] ->
-  [(FilePath, StorePath)] ->
+  [(Text, Text)] ->
   Maybe Text ->
   (DerivationOutput, OutputPlan) ->
   IO (Either Text (Maybe PathRegistration))
-prepareOutput config store candidates fallbackPairs drvPathText (output, plan) = do
+prepareOutput config store candidates scratchRewrites drvPathText (output, plan) = do
   let targetSP = doPath output
       targetPath = storePathToFilePath (bcStoreDir config) targetSP
       outDir = storePathToFilePath (bcStoreDir config) (opScratch plan)
@@ -1222,34 +1219,17 @@ prepareOutput config store candidates fallbackPairs drvPathText (output, plan) =
           -- One scan, not two: 'candidates' already carries this
           -- derivation's own outputs, and outDir is the final path, so a
           -- self- or cross-output reference is an ordinary hit.
-          leaked <- scanTempReferences fallbackPairs outDir
-          case leaked of
-            _ : _ -> do
-              -- A fallback path is about to stop existing, so a produced
-              -- output naming one would be registered with a dangling
-              -- reference.  Fail loudly instead, and take the tree back
-              -- out so no later run meets it.
-              removePathForcibly outDir
-              pure
-                ( Left
-                    ( "output "
-                        <> doName output
-                        <> " refers to the scratch path of an already-valid output ("
-                        <> T.intercalate ", " [spName sp <> "@" <> spHash sp | sp <- leaked]
-                        <> "); rebuild every output of this derivation instead"
-                    )
-                )
-            [] -> do
-              refs <- dedupStorePaths <$> scanReferences candidates outDir
-              reg <- placeInStore store outDir targetSP drvPathText refs
-              fixedCheck <- verifyFixedOutput (volumeCaseHack (stCaseSensitivity store)) output targetPath
-              case fixedCheck of
-                Left err -> do
-                  -- Wrong bytes for a declared content address: remove the
-                  -- placed tree so a later run cannot meet it on disk.
-                  removePathForcibly targetPath
-                  pure (Left err)
-                Right () -> pure (Right (Just reg))
+          rewriteStoreHashes scratchRewrites outDir
+          refs <- dedupStorePaths <$> scanReferences candidates outDir
+          reg <- placeInStore store outDir targetSP drvPathText refs
+          fixedCheck <- verifyFixedOutput (volumeCaseHack (stCaseSensitivity store)) output targetPath
+          case fixedCheck of
+            Left err -> do
+              -- Wrong bytes for a declared content address: remove the
+              -- placed tree so a later run cannot meet it on disk.
+              removePathForcibly targetPath
+              pure (Left err)
+            Right () -> pure (Right (Just reg))
 
 -- | Re-check a placed fixed-output output against its declared hash.
 -- A fixed-output derivation declares both its store path and, via the
