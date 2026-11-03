@@ -11491,7 +11491,7 @@ testStage0Pe32Chain = do
               ]
         )
     fetchNames :: [Text]
-    fetchNames = sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-13e57eb.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "mescc-tools-extra-d1d8146.tar.gz", "stage0-pe32-ed943c2.tar.gz"]
+    fetchNames = sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-13e57eb.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "mescc-tools-extra-d1d8146.tar.gz", "stage0-pe32-ff1c2ad.tar.gz"]
     -- The steps that build a C program on M2libc's POSIX layer, named for
     -- stem: the file each writes, the program it runs and its arguments.
     cProgram :: Text -> Text -> [Text] -> [(Text, [Text], [Text])]
