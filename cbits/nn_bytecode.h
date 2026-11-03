@@ -7,7 +7,8 @@
  * referenced by their index in the instruction array (post-order
  * traversal guarantees children < parent).  Variable-length data
  * (string parts, bindings, formals, capture info, attr paths) is
- * stored in the data buffer, referenced by offset from instructions.
+ * stored in the data buffer, referenced by offset from instructions,
+ * and so are the source positions bindings refer to.
  *
  * Goal: eliminate StablePtr (Expr, Env) in pending thunks.  After
  * compilation, pending thunks hold (bc_idx, nn_env_t*) -- both

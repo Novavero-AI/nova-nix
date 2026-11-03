@@ -6,7 +6,8 @@
 -- bytecode indices are always less than parent indices.  Variable-length
 -- data (string parts, bindings, formals, capture info, attr paths) goes
 -- into a separate @uint32_t[]@ data buffer, referenced by offset from
--- instructions.
+-- instructions; a binding refers to its position there by the index
+-- "Nix.Eval.SourcePos" records it at.
 --
 -- Must be called after 'cbcInit' and 'symbolInit'.
 module Nix.Eval.Compile
@@ -92,6 +93,7 @@ import Nix.Eval.CBytecode
     pattern OpWithVar,
   )
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
+import Nix.Eval.SourcePos (PosIdx (..), PosRecorder, newPosRecorder, recordPos)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Expr.Types
   ( AttrKey (..),
@@ -101,7 +103,9 @@ import Nix.Expr.Types
     Expr (..),
     Formal (..),
     Formals (..),
+    InheritedName (..),
     NixAtom (..),
+    SrcPos,
     StringPart (..),
     UnaryOp (..),
   )
@@ -109,7 +113,13 @@ import Nix.Expr.Types
 -- | Compile an 'Expr' tree to bytecode, returning the root instruction index.
 -- The bytecode is stored in the global @nn_bytecode@ arena.
 compileExpr :: Expr -> IO Word32
-compileExpr = go
+compileExpr expr = do
+  recorder <- newPosRecorder
+  compileWith recorder expr
+
+-- | 'compileExpr' recording positions with one recorder for the whole tree.
+compileWith :: PosRecorder -> Expr -> IO Word32
+compileWith recorder = go
   where
     go :: Expr -> IO Word32
     go (ELit atom) = compileLit atom
@@ -325,14 +335,16 @@ compileExpr = go
     compileBindingWords bindings = concat <$> mapM compileOneBinding bindings
 
     compileOneBinding :: Binding -> IO [Word32]
-    compileOneBinding (NamedBinding key expr) = do
+    compileOneBinding (NamedBinding pos key expr) = do
       (keyKind, keyWord) <- compileAttrKey key
       valIdx <- go expr
-      pure [bindNamed, keyKind, keyWord, valIdx]
-    compileOneBinding (Inherit name var) = do
+      posWord <- positionWord pos
+      pure [bindNamed, keyKind, keyWord, valIdx, posWord]
+    compileOneBinding (Inherit pos name var) = do
       sym <- internName name
       valIdx <- go var
-      pure [bindInherit, sym, valIdx]
+      posWord <- positionWord pos
+      pure [bindInherit, sym, valIdx, posWord]
     compileOneBinding (InheritFrom fromExpr names) = do
       fromIdx <- go fromExpr
       inherited <- mapM compileInheritedName names
@@ -342,19 +354,24 @@ compileExpr = go
 
     -- \| One name of @inherit (from) names@: its symbol, then the select
     -- that reads it from slot 0 of the env the evaluator puts the
-    -- from-value in.  Compiled here with the binding, as upstream's parser
-    -- makes an @ExprSelect@ per name, rather than each time the binding
-    -- is evaluated, which would add a copy to a store that only grows.
-    compileInheritedName :: Text -> IO [Word32]
-    compileInheritedName name = do
+    -- from-value in, then its position.  Compiled here with the binding,
+    -- as upstream's parser makes an @ExprSelect@ per name, rather than
+    -- each time the binding is evaluated, which would add a copy to a
+    -- store that only grows.
+    compileInheritedName :: InheritedName -> IO [Word32]
+    compileInheritedName (InheritedName pos name) = do
       sym <- internName name
       selectIdx <- go (ESelect (EResolvedVar 0 0) [StaticKey name] Nothing)
-      pure [sym, selectIdx]
+      posWord <- positionWord pos
+      pure [sym, selectIdx, posWord]
 
     internName :: Text -> IO Word32
     internName name = do
       Symbol sym <- symbolIntern name
       pure sym
+
+    positionWord :: SrcPos -> IO Word32
+    positionWord pos = unPosIdx <$> recordPos recorder pos
 
     -- -----------------------------------------------------------------
     -- CaptureInfo (shared by EAttrs, ELet, ELambda)
@@ -552,20 +569,22 @@ decodePairs n off = do
 -- Binding decoding (for evalBcAttrs / evalBcLet)
 -- ---------------------------------------------------------------------------
 
--- | A decoded binding from the bytecode data buffer.
+-- | A decoded binding from the bytecode data buffer, each name at the
+-- position it was defined at.
 data BcBinding
-  = -- | @key = expr@: the key and the value's bc_idx
-    BcNamed !BcAttrKey !Word32
-  | -- | One name of @inherit x@: its symbol and the bc_idx of the variable
-    -- it copies, which is evaluated in the env around the binding set
-    BcInherit !Word32 !Word32
+  = -- | @key = expr@: its position, the key and the value's bc_idx
+    BcNamed !PosIdx !BcAttrKey !Word32
+  | -- | One name of @inherit x@: its position, its symbol and the bc_idx
+    -- of the variable it copies, which is evaluated in the env around the
+    -- binding set
+    BcInherit !PosIdx !Word32 !Word32
   | -- | @inherit (from) names@ with from-expr bc_idx and the names
     BcInheritFrom !Word32 ![BcInheritedName]
 
--- | One name of an @inherit (from) names@ binding: its symbol and the
--- bc_idx of the select that reads it from slot 0 of an env holding the
--- from-value.
-data BcInheritedName = BcInheritedName !Word32 !Word32
+-- | One name of an @inherit (from) names@ binding: its position, its
+-- symbol and the bc_idx of the select that reads it from slot 0 of an env
+-- holding the from-value.
+data BcInheritedName = BcInheritedName !PosIdx !Word32 !Word32
 
 -- | A binding's attribute key.
 data BcAttrKey
@@ -592,16 +611,18 @@ decodeOneBinding off = do
     0 {- NamedBinding -} -> do
       key <- decodeAttrKey (off + 1)
       valBcIdx <- cbcData (off + 3)
-      pure (BcNamed key valBcIdx, off + 4)
+      pos <- cbcData (off + 4)
+      pure (BcNamed (PosIdx pos) key valBcIdx, off + 5)
     1 {- Inherit -} -> do
       sym <- cbcData (off + 1)
       valBcIdx <- cbcData (off + 2)
-      pure (BcInherit sym valBcIdx, off + 3)
+      pos <- cbcData (off + 3)
+      pure (BcInherit (PosIdx pos) sym valBcIdx, off + 4)
     2 {- InheritFrom -} -> do
       fromBcIdx <- cbcData (off + 1)
       nameCount <- cbcData (off + 2)
       names <- decodeInheritedNames (fromIntegral nameCount) (off + 3)
-      pure (BcInheritFrom fromBcIdx names, off + 3 + 2 * nameCount)
+      pure (BcInheritFrom fromBcIdx names, off + 3 + 3 * nameCount)
     -- Unreachable: the tag is written only by this module's binding compiler,
     -- which emits 0, 1 or 2 - all matched above.
     _ -> error "decodeOneBinding: invalid binding type tag"
@@ -613,14 +634,15 @@ decodeAttrKey off = do
   val <- cbcData (off + 1)
   pure (if isExpr /= 0 then BcDynamicKey val else BcStaticKey val)
 
--- | Decode inherited names: pairs of (name_sym, select_bc_idx).
+-- | Decode inherited names: triples of (name_sym, select_bc_idx, pos).
 decodeInheritedNames :: Int -> Word32 -> IO [BcInheritedName]
 decodeInheritedNames 0 _ = pure []
 decodeInheritedNames n off = do
   sym <- cbcData off
   selectBcIdx <- cbcData (off + 1)
-  rest <- decodeInheritedNames (n - 1) (off + 2)
-  pure (BcInheritedName sym selectBcIdx : rest)
+  pos <- cbcData (off + 2)
+  rest <- decodeInheritedNames (n - 1) (off + 3)
+  pure (BcInheritedName (PosIdx pos) sym selectBcIdx : rest)
 
 -- ---------------------------------------------------------------------------
 -- Numeric reassembly (from two uint32 halves)

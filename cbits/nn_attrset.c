@@ -1,17 +1,21 @@
 /*
  * nn_attrset.c - Sorted symbol-keyed attribute set.
  *
- * Two contiguous arrays: keys (nn_symbol_t) and values (void*),
- * sorted by symbol ID after freeze.  Binary search for lookup.
+ * Three parallel arrays: keys (nn_symbol_t), positions (uint32_t) and
+ * values (void*), sorted by symbol ID after freeze.  Binary search for
+ * lookup.  Keys and positions share one allocation, the keys first and
+ * the positions after `capacity` of them, so carrying a position costs
+ * no allocation of its own.
  *
- * Memory layout after freeze (example with 4 entries):
- *   keys:   [ 3, 7, 12, 45 ]    (sorted symbol IDs)
- *   values: [ p0, p1, p2, p3 ]  (parallel opaque pointers)
+ * Memory layout after freeze (example with 4 entries, capacity 4):
+ *   keys:      [ 3, 7, 12, 45 ]    (sorted symbol IDs)
+ *   positions: [ 9, 0, 13, 17 ]    (parallel, in the same block)
+ *   values:    [ p0, p1, p2, p3 ]  (parallel opaque pointers)
  *
  * This replaces Haskell's Map.Bin tree:
  *   Map.Bin: ~48 bytes/node (constructor + key + value + size + left + right)
- *   nn_attrset: ~12 bytes/entry (4-byte key + 8-byte pointer)
- *   For 30k entries: 1.4 MB down to 360 KB (4x reduction, plus cache-friendly)
+ *   nn_attrset: ~16 bytes/entry (4-byte key + 4-byte position + 8-byte pointer)
+ *   For 30k entries: 1.4 MB down to 480 KB (3x reduction, plus cache-friendly)
  */
 
 #include "nn_attrset.h"
@@ -57,7 +61,8 @@ void nn_attrset_free_all(void)
 /* --- Internal representation --- */
 
 struct nn_attrset {
-    nn_symbol_t *keys;
+    nn_symbol_t *keys;       /* the shared block: capacity keys, then positions */
+    uint32_t    *positions;  /* keys + capacity */
     void       **values;
     uint32_t     count;     /* entries used */
     uint32_t     capacity;  /* entries allocated */
@@ -69,6 +74,7 @@ struct nn_attrset {
 typedef struct {
     nn_symbol_t key;
     uint32_t    idx;
+    uint32_t    pos;
     void       *value;
 } nn_tagged_entry_t;
 
@@ -78,10 +84,18 @@ static int cmp_tagged(const void *a, const void *b);
 
 /* --- Helpers --- */
 
+/* Bytes of the block holding `capacity` keys and as many positions. */
+static size_t names_block_bytes(uint32_t capacity)
+{
+    return (size_t)capacity * (sizeof(nn_symbol_t) + sizeof(uint32_t));
+}
+
 /* Double the capacity, stopping at NN_ATTRSET_MAX_ENTRIES; the doubling
  * is computed in uint64_t so it cannot wrap.  Returns 0, or -1 with the
  * capacity unchanged when the set is at the ceiling or an allocation
- * fails (an array that did grow is kept, only larger). */
+ * fails.  The values grow first: a values array that grew is kept, only
+ * larger, and the shared block, whose positions sit at the capacity,
+ * changes only once nothing else can fail. */
 static int grow(nn_attrset_t *set)
 {
     if (set->capacity >= NN_ATTRSET_MAX_ENTRIES) return -1;
@@ -89,15 +103,18 @@ static int grow(nn_attrset_t *set)
     uint32_t new_cap = doubled > NN_ATTRSET_MAX_ENTRIES
                            ? NN_ATTRSET_MAX_ENTRIES : (uint32_t)doubled;
 
-    nn_symbol_t *new_keys = (nn_symbol_t *)realloc(
-        set->keys, (size_t)new_cap * sizeof(nn_symbol_t));
-    if (!new_keys) return -1;
-    set->keys = new_keys;
-
     void **new_values = (void **)realloc(
         set->values, (size_t)new_cap * sizeof(void *));
     if (!new_values) return -1;
     set->values = new_values;
+
+    nn_symbol_t *new_keys = (nn_symbol_t *)realloc(
+        set->keys, names_block_bytes(new_cap));
+    if (!new_keys) return -1;
+    memmove(new_keys + new_cap, new_keys + set->capacity,
+            (size_t)set->count * sizeof(uint32_t));
+    set->keys = new_keys;
+    set->positions = new_keys + new_cap;
 
     set->capacity = new_cap;
     return 0;
@@ -131,7 +148,8 @@ nn_attrset_t *nn_attrset_new(uint32_t capacity)
 
     if (capacity == 0) capacity = 8;
 
-    set->keys = (nn_symbol_t *)malloc((size_t)capacity * sizeof(nn_symbol_t));
+    set->keys = (nn_symbol_t *)malloc(names_block_bytes(capacity));
+    set->positions = set->keys ? set->keys + capacity : NULL;
     set->values = (void **)malloc((size_t)capacity * sizeof(void *));
     set->count = 0;
     set->capacity = capacity;
@@ -156,10 +174,11 @@ void nn_attrset_free(nn_attrset_t *set)
 
 /* --- Construction --- */
 
-int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value)
+int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value, uint32_t pos)
 {
     if (set->count >= set->capacity && grow(set) != 0) return -1;
     set->keys[set->count] = key;
+    set->positions[set->count] = pos;
     set->values[set->count] = value;
     set->count++;
     return 0;
@@ -187,14 +206,17 @@ void nn_attrset_freeze(nn_attrset_t *set)
         uint32_t i, j;
         for (i = 1; i < set->count; i++) {
             nn_symbol_t tmpk = set->keys[i];
+            uint32_t tmpp = set->positions[i];
             void *tmpv = set->values[i];
             j = i;
             while (j > 0 && set->keys[j - 1] > tmpk) {
                 set->keys[j] = set->keys[j - 1];
+                set->positions[j] = set->positions[j - 1];
                 set->values[j] = set->values[j - 1];
                 j--;
             }
             set->keys[j] = tmpk;
+            set->positions[j] = tmpp;
             set->values[j] = tmpv;
         }
     } else {
@@ -209,14 +231,17 @@ void nn_attrset_freeze(nn_attrset_t *set)
              * fails.  Falls through to the dedup block below. */
             for (uint32_t i = 1; i < set->count; i++) {
                 nn_symbol_t key = set->keys[i];
+                uint32_t pos = set->positions[i];
                 void *val = set->values[i];
                 uint32_t j = i;
                 while (j > 0 && set->keys[j-1] > key) {
                     set->keys[j] = set->keys[j-1];
+                    set->positions[j] = set->positions[j-1];
                     set->values[j] = set->values[j-1];
                     j--;
                 }
                 set->keys[j] = key;
+                set->positions[j] = pos;
                 set->values[j] = val;
             }
         } else {
@@ -224,6 +249,7 @@ void nn_attrset_freeze(nn_attrset_t *set)
             for (i = 0; i < set->count; i++) {
                 tagged[i].key = set->keys[i];
                 tagged[i].idx = i;
+                tagged[i].pos = set->positions[i];
                 tagged[i].value = set->values[i];
             }
 
@@ -232,6 +258,7 @@ void nn_attrset_freeze(nn_attrset_t *set)
 
             for (i = 0; i < set->count; i++) {
                 set->keys[i] = tagged[i].key;
+                set->positions[i] = tagged[i].pos;
                 set->values[i] = tagged[i].value;
             }
             free(tagged);
@@ -251,6 +278,7 @@ void nn_attrset_freeze(nn_attrset_t *set)
             }
             if (write != read) {
                 set->keys[write] = set->keys[read];
+                set->positions[write] = set->positions[read];
                 set->values[write] = set->values[read];
             }
             write++;
@@ -293,6 +321,12 @@ nn_symbol_t nn_attrset_get_key(const nn_attrset_t *set, uint32_t idx)
     return set->keys[idx];
 }
 
+uint32_t nn_attrset_get_pos(const nn_attrset_t *set, uint32_t idx)
+{
+    NN_ASSERT(idx < set->count, "nn_attrset_get_pos: idx out of bounds");
+    return set->positions[idx];
+}
+
 uint32_t nn_attrset_size(const nn_attrset_t *set)
 {
     return set->count;
@@ -325,25 +359,25 @@ nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b)
     while (ia < a->count && ib < b->count) {
         int status;
         if (a->keys[ia] < b->keys[ib]) {
-            status = nn_attrset_insert(result, a->keys[ia], a->values[ia]);
+            status = nn_attrset_insert(result, a->keys[ia], a->values[ia], a->positions[ia]);
             ia++;
         } else if (a->keys[ia] > b->keys[ib]) {
-            status = nn_attrset_insert(result, b->keys[ib], b->values[ib]);
+            status = nn_attrset_insert(result, b->keys[ib], b->values[ib], b->positions[ib]);
             ib++;
         } else {
-            /* Same key - b wins (right-biased //). */
-            status = nn_attrset_insert(result, b->keys[ib], b->values[ib]);
+            /* Same key - b wins (right-biased //), its position too. */
+            status = nn_attrset_insert(result, b->keys[ib], b->values[ib], b->positions[ib]);
             ia++;
             ib++;
         }
         if (status != 0) return NULL;
     }
     while (ia < a->count) {
-        if (nn_attrset_insert(result, a->keys[ia], a->values[ia]) != 0) return NULL;
+        if (nn_attrset_insert(result, a->keys[ia], a->values[ia], a->positions[ia]) != 0) return NULL;
         ia++;
     }
     while (ib < b->count) {
-        if (nn_attrset_insert(result, b->keys[ib], b->values[ib]) != 0) return NULL;
+        if (nn_attrset_insert(result, b->keys[ib], b->values[ib], b->positions[ib]) != 0) return NULL;
         ib++;
     }
 
@@ -372,7 +406,7 @@ nn_attrset_t *nn_attrset_remove_keys(
                 break;
             }
         }
-        if (!skip && nn_attrset_insert(result, set->keys[i], set->values[i]) != 0) {
+        if (!skip && nn_attrset_insert(result, set->keys[i], set->values[i], set->positions[i]) != 0) {
             return NULL;
         }
     }

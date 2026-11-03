@@ -71,6 +71,7 @@ library
     Nix.Eval.Operator
     Nix.Eval.Print
     Nix.Eval.SourceError
+    Nix.Eval.SourcePos
     Nix.Eval.StringInterp
     Nix.Eval.Symbol
     Nix.Eval.CAttrSet

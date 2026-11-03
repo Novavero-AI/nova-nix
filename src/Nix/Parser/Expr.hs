@@ -557,8 +557,9 @@ parseBindings = go [] >>= normalizeBindings
 
 -- | Accumulated definition while normalizing one binding list.
 data NormEntry
-  = -- | @name = value@ - mergeable when the value is a plain attrset literal.
-    StaticEntry !Text !Expr
+  = -- | @name = value@ at its first definition's position - mergeable when
+    -- the value is a plain attrset literal.
+    StaticEntry !SrcPos !Text !Expr
   | -- | An @inherit@ - its names are never mergeable.
     InheritEntry !Binding
   | -- | A dynamic-key binding - collisions surface at eval time.
@@ -574,7 +575,8 @@ data DefKind = DefStatic | DefInherit
 --   attrset literals - so @a.b = 1; a.c = 2;@ and @a = { b = 1; }; a.c = 2;@
 --   both work, with inner duplicates checked recursively.  A @rec@ marker
 --   on the existing set governs the merged result; one on the new set is
---   discarded, exactly as upstream;
+--   discarded, exactly as upstream.  The key keeps its first definition's
+--   position and each merged binding its own, as upstream's do;
 -- * any other duplicate definition is a parse error, as upstream
 --   (@a = 1; a = 2;@, an @inherit@ name reused, merging into a
 --   non-literal value).
@@ -596,17 +598,17 @@ normalizeBindingList bindings = do
   where
     step :: ([NormEntry], Map Text DefKind) -> Binding -> Either Text ([NormEntry], Map Text DefKind)
     step (entries, defined) binding = case binding of
-      NamedBinding (StaticKey key) value ->
+      NamedBinding pos (StaticKey key) value ->
         case Map.lookup key defined of
           Nothing ->
-            Right (StaticEntry key value : entries, Map.insert key DefStatic defined)
+            Right (StaticEntry pos key value : entries, Map.insert key DefStatic defined)
           Just DefStatic -> do
             updated <- mergeIntoEntries key value entries
             Right (updated, defined)
           Just DefInherit -> Left (duplicateAttr key)
-      b@(NamedBinding _ _) -> Right (DynamicEntry b : entries, defined)
-      b@(Inherit name _) -> inheritEntry b [name]
-      b@(InheritFrom _ names) -> inheritEntry b names
+      b@(NamedBinding {}) -> Right (DynamicEntry b : entries, defined)
+      b@(Inherit _ name _) -> inheritEntry b [name]
+      b@(InheritFrom _ names) -> inheritEntry b [name | InheritedName _ name <- names]
       where
         -- One name at a time, so a name repeated within the clause is a
         -- duplicate too, as upstream's per-name dupAttr check makes it.
@@ -620,10 +622,10 @@ normalizeBindingList bindings = do
     -- Replace the existing entry for @key@ with the merged value.
     mergeIntoEntries key newValue entries = case entries of
       [] -> Left (duplicateAttr key)
-      (StaticEntry existingKey existingValue : rest)
+      (StaticEntry existingPos existingKey existingValue : rest)
         | existingKey == key -> do
             merged <- mergeAttrValues key existingValue newValue
-            Right (StaticEntry existingKey merged : rest)
+            Right (StaticEntry existingPos existingKey merged : rest)
       (entry : rest) -> (entry :) <$> mergeIntoEntries key newValue rest
 
     -- Upstream's addAttr (parser-state.hh) merges ANY two attrset
@@ -637,7 +639,7 @@ normalizeBindingList bindings = do
         <$> normalizeBindingList (existingBindings ++ newBindings)
     mergeAttrValues key _ _ = Left (duplicateAttr key)
 
-    renderEntry (StaticEntry key value) = NamedBinding (StaticKey key) value
+    renderEntry (StaticEntry pos key value) = NamedBinding pos (StaticKey key) value
     renderEntry (InheritEntry b) = b
     renderEntry (DynamicEntry b) = b
 
@@ -645,21 +647,23 @@ normalizeBindingList bindings = do
 
 -- | @a.b.c = v;@ as one binding under its first key, the rest of the
 -- path hoisted into nested set literals, one per level: @a = { b = { c =
--- v; }; };@, as upstream's @addAttr@ builds them.
+-- v; }; };@, as upstream's @addAttr@ builds them, every level at the
+-- path's position.
 parseNamedBinding :: Parser Binding
 parseNamedBinding = do
+  pos <- currentPos
   firstKey <- parseAttrKey
   rest <- pMany (expect TokDot >> parseAttrKey)
   expect TokAssign
   val <- parseExpr
   expect TokSemicolon
-  pure (NamedBinding firstKey (nestUnder rest val))
-  where
-    nestUnder [] value = value
-    nestUnder (key : keys) value = EAttrs False [NamedBinding key (nestUnder keys value)] NoCaptureInfo
+  let nestUnder [] value = value
+      nestUnder (key : keys) value = EAttrs False [NamedBinding pos key (nestUnder keys value)] NoCaptureInfo
+  pure (NamedBinding pos firstKey (nestUnder rest val))
 
 -- | An @inherit@ clause: one 'InheritFrom' for @inherit (from) x y;@, one
 -- 'Inherit' per name for @inherit x y;@, each holding the variable it copies.
+-- Each name is at its own position, as upstream's parser.y records them.
 parseInherit :: Parser [Binding]
 parseInherit = do
   expect TokInherit
@@ -675,26 +679,27 @@ parseInherit = do
     _ -> do
       names <- parseInheritNames
       expect TokSemicolon
-      pure [Inherit name (EVar name) | name <- names]
+      pure [Inherit pos name (EVar name) | InheritedName pos name <- names]
 
-parseInheritNames :: Parser [Text]
+parseInheritNames :: Parser [InheritedName]
 parseInheritNames = go []
   where
     go acc = do
+      pos <- currentPos
       tok <- peek
       case tok of
         TokIdent name -> do
           _ <- advance
-          go (name : acc)
+          go (InheritedName pos name : acc)
         -- Keywords are valid as inherit names: inherit if then else;
         _ | Just name <- keywordToText tok -> do
           _ <- advance
-          go (name : acc)
+          go (InheritedName pos name : acc)
         -- Quoted strings for keywords used as attribute names: inherit "or";
         TokStringOpen -> do
           _ <- advance
           name <- parseQuotedInheritName
-          go (name : acc)
+          go (InheritedName pos name : acc)
         _ -> pure (reverse acc)
 
 -- | Parse a quoted inherit name: a simple string literal (no interpolation).
@@ -792,7 +797,7 @@ parseLetBindings = go [] >>= normalizeBindings
           -- nested dynamic keys (let a.${k} = 1) live in a nested attrset
           -- and are fine.
           case binding of
-            NamedBinding (DynamicKey _) _ ->
+            NamedBinding _ (DynamicKey _) _ ->
               parseError "dynamic attributes not allowed in let"
             _ -> go (binding : acc)
 

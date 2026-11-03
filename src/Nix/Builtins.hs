@@ -46,7 +46,7 @@ import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, builtinNames, currentSystemStr, deferApply, evaluated, readThunkValue)
 import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newCEnv, thunkToCPtr)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames)
-import Nix.Parser (parseNixWithScope)
+import Nix.Parser (SourceOrigin (..), parseNixWithScope)
 import Nix.Store.Path (defaultStoreDirText)
 
 -- | The initial environment: every name upstream's base environment binds
@@ -141,13 +141,15 @@ targetNixVersion = "2.24.9"
 -- The derivation constant
 -- ---------------------------------------------------------------------------
 
--- | Upstream's @src\/libexpr\/primops\/derivation.nix@ at 2.24.9, without its
--- documentation comment.  @derivation@ is this lambda, not a primop, so the
--- result set has upstream's shape by construction: every output attribute
--- is the complete derivation set for that output, @all@ lists them,
--- @drvAttrs@ is the argument set, and @derivationStrict@ is reached only
--- through @outPath@ and @drvPath@, which is what keeps forcing a derivation
--- to WHNF from forcing any of its inputs.
+-- | The expression of upstream's @src\/libexpr\/primops\/derivation.nix@ at
+-- 2.24.9, without the file's comments.  @derivation@ is this lambda, not a
+-- primop, so the result set has upstream's shape by construction: every
+-- output attribute is the complete derivation set for that output, @all@
+-- lists them, @drvAttrs@ is the argument set, and @derivationStrict@ is
+-- reached only through @outPath@ and @drvPath@, which is what keeps forcing
+-- a derivation to WHNF from forcing any of its inputs.  The attributes it
+-- defines are at this text's lines, which differ from upstream's, where the
+-- file's comments come first.
 derivationWrapperSource :: Text
 derivationWrapperSource =
   T.unlines
@@ -177,9 +179,12 @@ derivationWrapperSource =
       "in (builtins.head outputsList).value"
     ]
 
--- | The name upstream gives the wrapper's source in error positions.
-derivationWrapperName :: Text
-derivationWrapperName = "derivation-internal.nix"
+-- | Where the wrapper's source is: upstream evaluates it as the file
+-- @derivation-internal.nix@ of an in-memory accessor (@derivationInternal@,
+-- eval.cc at 2.24.9), and a position in it reports the file as its path
+-- there.
+derivationWrapperOrigin :: SourceOrigin
+derivationWrapperOrigin = SourceFile "/derivation-internal.nix"
 
 -- | The bindings the wrapper's free variables resolve to.  Upstream evaluates
 -- the file in its base environment; this is the slice of that environment
@@ -212,7 +217,7 @@ derivationWrapperEnv =
 -- @derivation@ rather than as a crash while the environment is assembled.
 derivationWrapper :: Thunk
 derivationWrapper =
-  case parseNixWithScope (Map.keysSet derivationWrapperScope) "/" derivationWrapperName derivationWrapperSource of
+  case parseNixWithScope (Map.keysSet derivationWrapperScope) "/" derivationWrapperOrigin derivationWrapperSource of
     Right expr -> cheapThunk derivationWrapperEnv expr
     Left err -> abortingThunk ("the derivation wrapper does not parse: " <> T.pack (show err))
 {-# NOINLINE derivationWrapper #-}

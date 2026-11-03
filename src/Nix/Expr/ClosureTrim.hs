@@ -121,9 +121,9 @@ trimKey k@(StaticKey _) = k
 trimKey (DynamicKey e) = DynamicKey (trimExpr e)
 
 trimBinding :: Binding -> Binding
-trimBinding (NamedBinding key bodyExpr) =
-  NamedBinding (trimKey key) (trimExpr bodyExpr)
-trimBinding (Inherit name var) = Inherit name (trimExpr var)
+trimBinding (NamedBinding pos key bodyExpr) =
+  NamedBinding pos (trimKey key) (trimExpr bodyExpr)
+trimBinding (Inherit pos name var) = Inherit pos name (trimExpr var)
 trimBinding (InheritFrom fromExpr names) =
   InheritFrom (trimExpr fromExpr) names
 
@@ -297,11 +297,11 @@ foldKeys depth = foldl' combine (Set.empty, False, False)
 foldBindings :: Int -> Maybe Int -> [Binding] -> (Set (Int, Int), Bool, Bool)
 foldBindings depth outerDepth = foldl' combine (Set.empty, False, False)
   where
-    combine (!acc, !h, !w) (NamedBinding key bodyExpr) =
+    combine (!acc, !h, !w) (NamedBinding _ key bodyExpr) =
       let (vs1, h1, w1) = foldKeys depth [key]
           (vs2, h2, w2) = collectFreeVars depth bodyExpr
        in (Set.unions [acc, vs1, vs2], h || h1 || h2, w || w1 || w2)
-    combine (!acc, !h, !w) (Inherit _ var) = case outerDepth of
+    combine (!acc, !h, !w) (Inherit _ _ var) = case outerDepth of
       Nothing -> (acc, h, w)
       Just outer ->
         let (vs, hv, wv) = collectFreeVars outer var
@@ -400,12 +400,13 @@ rewriteKey depth captureMap (DynamicKey e) =
 -- | Rewrite a binding's references, at the depths 'foldBindings' reads
 -- them at; an inherited variable outside the analysis is left as it is.
 rewriteBinding :: Int -> Maybe Int -> Map (Int, Int) Int -> Binding -> Binding
-rewriteBinding depth _ captureMap (NamedBinding key bodyExpr) =
+rewriteBinding depth _ captureMap (NamedBinding pos key bodyExpr) =
   NamedBinding
+    pos
     (rewriteKey depth captureMap key)
     (rewriteBody depth captureMap bodyExpr)
-rewriteBinding _ outerDepth captureMap (Inherit name var) =
-  Inherit name (maybe var (\outer -> rewriteBody outer captureMap var) outerDepth)
+rewriteBinding _ outerDepth captureMap (Inherit pos name var) =
+  Inherit pos name (maybe var (\outer -> rewriteBody outer captureMap var) outerDepth)
 rewriteBinding depth _ captureMap (InheritFrom fromExpr names) =
   InheritFrom (rewriteBody depth captureMap fromExpr) names
 

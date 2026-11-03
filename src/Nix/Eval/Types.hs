@@ -18,10 +18,13 @@ module Nix.Eval.Types
     -- * Attribute sets (C-backed sorted arrays)
     AttrSet (..),
     CAttrSet,
+    AttrEntry (..),
     attrSetLookup,
+    attrSetLookupEntry,
     attrSetKeys,
     attrSetToMap,
     attrSetFromMap,
+    attrSetFromEntries,
     attrSetMember,
     attrSetNull,
     attrSetSize,
@@ -136,7 +139,7 @@ import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Float (castWord64ToDouble)
 import Nix.Derivation (Derivation)
-import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
+import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
@@ -149,6 +152,7 @@ import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.Policy (EvalPolicy (..), unrestrictedPolicy)
+import Nix.Eval.SourcePos (PosIdx, noPos)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
 import Nix.Store.Path (BadStorePath, StorePath, badStorePathText)
@@ -381,6 +385,13 @@ instance Show AttrSet where
     let n = unsafePerformIO (cattrsetSize cset)
      in "<attrset " ++ show n ++ " entries>"
 
+-- | An attribute's value and the position it was defined at, as a set
+-- holds them.
+data AttrEntry = AttrEntry
+  { entryPos :: {-# UNPACK #-} !PosIdx,
+    entryThunk :: {-# UNPACK #-} !Thunk
+  }
+
 -- | Look up a single key via symbol interning + C binary search.
 -- Uses 'unsafePerformIO' - safe because symbolIntern and cattrsetLookup
 -- are idempotent (same key always yields same symbol and same result).
@@ -390,6 +401,16 @@ attrSetLookup key (AttrSet cset) =
     sym <- symbolIntern key
     mptr <- cattrsetLookup cset sym
     pure (fmap Thunk mptr)
+
+-- | 'attrSetLookup' with the attribute's position.  'unsafePerformIO' is
+-- safe for the reason it is in 'attrSetLookup': the same key reads the
+-- same entry every time.
+attrSetLookupEntry :: Text -> AttrSet -> Maybe AttrEntry
+attrSetLookupEntry key (AttrSet cset) =
+  unsafePerformIO $ do
+    sym <- symbolIntern key
+    midx <- cattrsetIndex cset sym
+    traverse (\idx -> AttrEntry <$> cattrsetGetPos cset idx <*> (Thunk <$> cattrsetGetValue cset idx)) midx
 
 -- | All keys in sorted order (symbol text from C).
 attrSetKeys :: AttrSet -> [Text]
@@ -459,34 +480,49 @@ attrSetRemoveKeys keys (AttrSet cset) = unsafePerformIO $ do
 attrSetUnionWith :: (Thunk -> Thunk -> Thunk) -> AttrSet -> AttrSet -> AttrSet
 attrSetUnionWith f a b = attrSetFromMap (Map.unionWith f (attrSetToMap a) (attrSetToMap b))
 
--- | Build a CAttrSet from a Haskell 'Map'.  Interns all keys as symbols,
--- inserts key-value pairs, freezes (sort + dedup).  The canonical entry
--- point for all attribute set construction.
+-- | Build a CAttrSet from a Haskell 'Map' of attributes defined nowhere in
+-- source, as those of a set a builtin makes from scratch are; a builtin
+-- that copies attributes keeps their positions with 'attrSetFromEntries'.
+-- Interns all keys as symbols, inserts key-value pairs, freezes (sort +
+-- dedup).
 --
 -- Uses 'unsafePerformIO' with @NOINLINE@ - safe because C allocation
 -- is idempotent and the resulting CAttrSet is referentially transparent.
 {-# NOINLINE attrSetFromMap #-}
 attrSetFromMap :: Map Text Thunk -> AttrSet
-attrSetFromMap m = m `seq` unsafePerformIO $ do
-  let pairs = Map.toList m
-  cset <- cattrsetNew (length pairs)
-  forM_ pairs $ \(key, Thunk ptr) -> do
-    sym <- symbolIntern key
-    cattrsetInsert cset sym ptr
-  cattrsetFreeze cset
-  pure (AttrSet cset)
+attrSetFromMap m = m `seq` AttrSet (unsafePerformIO (newFrozenAttrSet (const noPos) id m))
 
--- | Allocate a CAttrSet skeleton with keys only (NULL values).
+-- | 'attrSetFromMap' for attributes that keep the positions they were
+-- defined at, as an attribute set literal's and a copied attribute's do.
+{-# NOINLINE attrSetFromEntries #-}
+attrSetFromEntries :: Map Text AttrEntry -> AttrSet
+attrSetFromEntries m = m `seq` AttrSet (unsafePerformIO (newFrozenAttrSet entryPos entryThunk m))
+
+-- | Insert every entry of a map into a new set, at the position and with
+-- the thunk the projections give it, and freeze it.
+{-# INLINE newFrozenAttrSet #-}
+newFrozenAttrSet :: (a -> PosIdx) -> (a -> Thunk) -> Map Text a -> IO CAttrSet
+newFrozenAttrSet posOf thunkOf m = do
+  cset <- cattrsetNew (Map.size m)
+  forM_ (Map.toList m) $ \(key, entry) -> do
+    sym <- symbolIntern key
+    cattrsetInsert cset sym (posOf entry) (unThunk (thunkOf entry))
+  cattrsetFreeze cset
+  pure cset
+
+-- | Allocate a CAttrSet skeleton with keys only (NULL values), for an
+-- environment's name table.
 -- Used for two-phase construction in @rec {}@ and @let@ (knot-tying):
 -- keys are known before thunks, so the CAttrSet is built first, then
--- values are filled via 'fillCAttrSetValues'.
+-- values are filled via 'fillCAttrSetValues'.  The table is never a
+-- value, so its entries carry no position.
 {-# NOINLINE buildCAttrSetKeys #-}
 buildCAttrSetKeys :: [Text] -> CAttrSet
 buildCAttrSetKeys keys = unsafePerformIO $ do
   cset <- cattrsetNew (length keys)
   forM_ keys $ \key -> do
     sym <- symbolIntern key
-    cattrsetInsert cset sym nullPtr
+    cattrsetInsert cset sym noPos nullPtr
   cattrsetFreeze cset
   pure cset
 

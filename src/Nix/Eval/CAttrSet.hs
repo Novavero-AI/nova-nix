@@ -1,9 +1,10 @@
 -- | C-backed sorted attribute set via FFI.
 --
 -- Wraps @cbits/nn_attrset.c@ - a contiguous sorted array of
--- @(nn_symbol_t, void*)@ pairs.  Replaces Haskell's @Data.Map.Strict@
--- for attribute sets, cutting per-entry overhead from ~48 bytes
--- (Map.Bin node) to ~12 bytes (4-byte symbol + 8-byte pointer).
+-- @(nn_symbol_t, position, void*)@ entries.  Replaces Haskell's
+-- @Data.Map.Strict@ for attribute sets, cutting per-entry overhead from
+-- ~48 bytes (Map.Bin node) to ~16 bytes (4-byte symbol + 4-byte position
+-- + 8-byte pointer).
 --
 -- Construction is two-phase: insert entries, then freeze (sort + dedup).
 -- After freeze, lookup is O(log n) binary search over contiguous memory.
@@ -34,6 +35,7 @@ module Nix.Eval.CAttrSet
     cattrsetGetValue,
     cattrsetSetValue,
     cattrsetGetKey,
+    cattrsetGetPos,
 
     -- * Bulk access
     cattrsetSize,
@@ -52,6 +54,7 @@ import Foreign.Marshal.Array (peekArray, withArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Nix.Eval.CStatus (cStatusFailure, checkedCPtr)
 import Nix.Eval.CThunk (CThunkPtr)
+import Nix.Eval.SourcePos (PosIdx (..))
 import Nix.Eval.Symbol (Symbol (..))
 
 -- | Opaque handle to a C-allocated attribute set.
@@ -69,7 +72,7 @@ foreign import ccall unsafe "nn_attrset_new"
   c_nn_attrset_new :: Word32 -> IO CAttrSet
 
 foreign import ccall unsafe "nn_attrset_insert"
-  c_nn_attrset_insert :: CAttrSet -> Word32 -> Ptr () -> IO CInt
+  c_nn_attrset_insert :: CAttrSet -> Word32 -> Ptr () -> Word32 -> IO CInt
 
 foreign import ccall unsafe "nn_attrset_freeze"
   c_nn_attrset_freeze :: CAttrSet -> IO ()
@@ -88,6 +91,9 @@ foreign import ccall unsafe "nn_attrset_get_value"
 
 foreign import ccall unsafe "nn_attrset_get_key"
   c_nn_attrset_get_key :: CAttrSet -> Word32 -> IO Word32
+
+foreign import ccall unsafe "nn_attrset_get_pos"
+  c_nn_attrset_get_pos :: CAttrSet -> Word32 -> IO Word32
 
 foreign import ccall unsafe "nn_attrset_size"
   c_nn_attrset_size :: CAttrSet -> IO Word32
@@ -123,11 +129,11 @@ cattrsetNew expected = checkedCPtr "nn_attrset_new" =<< c_nn_attrset_new capacit
 -- Construction
 -- ---------------------------------------------------------------------------
 
--- | Insert a key-value pair.  Call before freeze.
+-- | Insert a key-value pair defined at a position.  Call before freeze.
 -- The value is a CThunkPtr cast to Ptr () - C never dereferences it.
-cattrsetInsert :: CAttrSet -> Symbol -> CThunkPtr -> IO ()
-cattrsetInsert set (Symbol sym) ptr = do
-  status <- c_nn_attrset_insert set sym (castPtr ptr)
+cattrsetInsert :: CAttrSet -> Symbol -> PosIdx -> CThunkPtr -> IO ()
+cattrsetInsert set (Symbol sym) (PosIdx pos) ptr = do
+  status <- c_nn_attrset_insert set sym (castPtr ptr) pos
   unless (status == 0) $
     cStatusFailure "nn_attrset_insert" "the attribute set cannot grow (allocation failure or its 4294967295-entry ceiling)"
 
@@ -163,6 +169,10 @@ cattrsetSetValue set idx ptr = c_nn_attrset_set_value set idx (castPtr ptr)
 -- | Get the key symbol at a known index.
 cattrsetGetKey :: CAttrSet -> Word32 -> IO Symbol
 cattrsetGetKey set idx = Symbol <$> c_nn_attrset_get_key set idx
+
+-- | Get the position of the entry at a known index.
+cattrsetGetPos :: CAttrSet -> Word32 -> IO PosIdx
+cattrsetGetPos set idx = PosIdx <$> c_nn_attrset_get_pos set idx
 
 -- ---------------------------------------------------------------------------
 -- Bulk access

@@ -135,10 +135,12 @@ import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs,
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printValue)
+import Nix.Eval.SourcePos (RecordedPos (..), lookupPos)
 import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
 import Nix.Eval.Types
-  ( AttrSet (..),
+  ( AttrEntry (..),
+    AttrSet (..),
     BuiltinArg (..),
     CAttrSet,
     CompiledRegex (..),
@@ -155,9 +157,11 @@ import Nix.Eval.Types
     Thunk (..),
     allocCSlots,
     attrSetElems,
+    attrSetFromEntries,
     attrSetFromMap,
     attrSetKeys,
     attrSetLookup,
+    attrSetLookupEntry,
     attrSetMapWithKey,
     attrSetMember,
     attrSetNull,
@@ -784,8 +788,8 @@ evalBcAttrs env bcIdx0 = do
 -- frame and cannot make the same shortcut.
 evalBcNonRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> m NixValue
 evalBcNonRecAttrs env bindings = do
-  thunkMap <- buildBcThunkMap cheapThunkBc env env bindings
-  pure (VAttrs (attrSetFromMap thunkMap))
+  entries <- buildBcEntryMap cheapThunkBc env env bindings
+  pure (VAttrs (attrSetFromEntries entries))
 
 -- | Build a let\/rec frame env, sharing the parent-chain and with-scope
 -- plumbing otherwise repeated across the positional and dynamic paths.  The
@@ -811,8 +815,8 @@ evalBcRecAttrs env bindings captureInfo
           recEnv = newFrameEnv env captureInfo slotsPtr slotCount Nothing
           thunkList = buildBcSlotThunks recEnv env bindings
           filled = fillCSlots slotsPtr thunkList
-          attrMap = buildBcAttrMapFromSlots bindings thunkList
-       in filled `seq` pure (VAttrs (attrSetFromMap attrMap))
+          entries = buildBcEntryMapFromSlots bindings thunkList
+       in filled `seq` pure (VAttrs (attrSetFromEntries entries))
   | otherwise = do
       -- Dynamic-key path: the set has a ${dynamic} key, so names are not all
       -- known at compile time.  Not a corner-cutting fallback:
@@ -824,18 +828,14 @@ evalBcRecAttrs env bindings captureInfo
       let scopeCset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
           recEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet scopeCset))
           (staticBs, dynBs) = partition bcBindingIsStatic bindings
-      staticThunks <- buildBcThunkMap mkThunkBc recEnv env staticBs
-      let scopeFilled = fillCAttrSetValues scopeCset staticThunks
-      dynThunks <- scopeFilled `seq` buildBcThunkMap mkThunkBc recEnv env dynBs
+      staticEntries <- buildBcEntryMap mkThunkBc recEnv env staticBs
+      let scopeFilled = fillCAttrSetValues scopeCset (Map.map entryThunk staticEntries)
+      dynEntries <- scopeFilled `seq` buildBcEntryMap mkThunkBc recEnv env dynBs
       -- A dynamic key colliding with a static sibling is an eval error
       -- upstream ("dynamic attribute already defined"), never a merge.
-      case Map.keys (Map.intersection dynThunks staticThunks) of
+      case Map.keys (Map.intersection dynEntries staticEntries) of
         (dupKey : _) -> throwEvalError ("dynamic attribute '" <> dupKey <> "' already defined")
-        [] ->
-          let allThunks = Map.union dynThunks staticThunks
-              resultCset = buildCAttrSetKeys (Map.keys allThunks)
-              filled = fillCAttrSetValues resultCset allThunks
-           in filled `seq` pure (VAttrs (AttrSet resultCset))
+        [] -> pure (VAttrs (attrSetFromEntries (Map.union dynEntries staticEntries)))
 
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -861,8 +861,8 @@ evalBcLet env bcIdx0 = do
       -- the body also sees.
       let cset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
           letEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet cset))
-      thunkMap <- buildBcThunkMap mkThunkBc letEnv env bindings
-      let filled = fillCAttrSetValues cset thunkMap
+      entries <- buildBcEntryMap mkThunkBc letEnv env bindings
+      let filled = fillCAttrSetValues cset (Map.map entryThunk entries)
        in filled `seq` evalBytecode letEnv bodyIdx
 
 -- | Check if all bytecode bindings are static keys (eligible for positional).
@@ -870,8 +870,8 @@ evalBcLet env bcIdx0 = do
 allBcPositional :: [BcBinding] -> Bool
 allBcPositional = all isEligible
   where
-    isEligible (BcNamed (BcStaticKey _) _) = True
-    isEligible (BcInherit _ _) = True
+    isEligible (BcNamed _ (BcStaticKey _) _) = True
+    isEligible (BcInherit {}) = True
     isEligible (BcInheritFrom _ _) = True
     isEligible _ = False
 
@@ -880,8 +880,8 @@ allBcPositional = all isEligible
 bcBindingSlotCount :: [BcBinding] -> Int
 bcBindingSlotCount = foldl' countOne 0
   where
-    countOne !acc (BcNamed (BcStaticKey _) _) = acc + 1
-    countOne !acc (BcInherit _ _) = acc + 1
+    countOne !acc (BcNamed _ (BcStaticKey _) _) = acc + 1
+    countOne !acc (BcInherit {}) = acc + 1
     countOne !acc (BcInheritFrom _ names) = acc + length names
     countOne !acc _ = acc
 
@@ -893,15 +893,15 @@ bcBindingSlotCount = foldl' countOne 0
 buildBcSlotThunks :: Env -> Env -> [BcBinding] -> [Thunk]
 buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
   where
-    slotThunk (BcNamed (BcStaticKey _) valBcIdx) =
+    slotThunk (BcNamed _ (BcStaticKey _) valBcIdx) =
       [mkThunkBc recEnv valBcIdx]
-    slotThunk (BcInherit _ valBcIdx) =
+    slotThunk (BcInherit _ _ valBcIdx) =
       [cheapThunkBc outerEnv valBcIdx]
     slotThunk (BcInheritFrom fromBcIdx names) =
       -- inherit (from) x y z; becomes one thunk per name that selects from the from-expr.
       -- Each thunk gets a minimal env with the from-value at slot 0.
       let fromThunk = mkThunkBc recEnv fromBcIdx
-          mkInheritThunk (BcInheritedName _ selectBcIdx) =
+          mkInheritThunk (BcInheritedName _ _ selectBcIdx) =
             let (sp, sc) = buildCSlots [fromThunk]
                 fromEnv = newMinimalEnv sp sc
              in mkSyntheticThunk fromEnv selectBcIdx
@@ -909,24 +909,25 @@ buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
     -- Unreachable: allBcPositional guards this path.
     slotThunk _ = []
 
--- | Build attr map from slots for positional bytecode bindings.
-buildBcAttrMapFromSlots :: [BcBinding] -> [Thunk] -> Map Text Thunk
-buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
+-- | Build the attribute map from slots for positional bytecode bindings,
+-- each at its binding's position.
+buildBcEntryMapFromSlots :: [BcBinding] -> [Thunk] -> Map Text AttrEntry
+buildBcEntryMapFromSlots bindings thunks = go bindings thunks Map.empty
   where
     go [] _ !acc = acc
-    go (BcNamed (BcStaticKey sym) _ : bs) (t : ts) !acc =
-      go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
-    go (BcInherit sym _ : bs) (t : ts) !acc =
-      go bs ts (Map.insert (symbolText (Symbol sym)) t acc)
+    go (BcNamed pos (BcStaticKey sym) _ : bs) (t : ts) !acc =
+      go bs ts (Map.insert (symbolText (Symbol sym)) (AttrEntry pos t) acc)
+    go (BcInherit pos sym _ : bs) (t : ts) !acc =
+      go bs ts (Map.insert (symbolText (Symbol sym)) (AttrEntry pos t) acc)
     go (BcInheritFrom _ names : bs) ts !acc =
       let (used, rest) = splitAt (length names) ts
-          accMerged = foldl' (\a (name, t0) -> Map.insert (inheritedNameText name) t0 a) acc (zip names used)
-       in go bs rest accMerged
+          insertName a (inherited@(BcInheritedName pos _ _), t0) = Map.insert (inheritedNameText inherited) (AttrEntry pos t0) a
+       in go bs rest (foldl' insertName acc (zip names used))
     -- Unreachable: allBcPositional guards this path.
     go (_ : bs) ts !acc = go bs ts acc
 
--- | Build thunk map for bytecode attrs (non-rec or fallback rec path).
--- | Build the name-to-thunk map for a set of bindings.
+-- | Build the name-to-attribute map for a set of bindings, each at its
+-- binding's position.
 --
 -- How a value becomes a thunk is the caller's decision: a non-recursive
 -- attr set can resolve constants and in-scope variables immediately, while a
@@ -934,32 +935,32 @@ buildBcAttrMapFromSlots bindings thunks = go bindings thunks Map.empty
 -- the variables point at are not filled yet.  An inherited variable is read
 -- from @outerEnv@, the env around the binding set, which is always built
 -- (for a non-recursive set it is @thunkEnv@ itself).
-buildBcThunkMap :: (MonadEval m) => (Env -> Word32 -> Thunk) -> Env -> Env -> [BcBinding] -> m (Map Text Thunk)
-buildBcThunkMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
+buildBcEntryMap :: (MonadEval m) => (Env -> Word32 -> Thunk) -> Env -> Env -> [BcBinding] -> m (Map Text AttrEntry)
+buildBcEntryMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
   where
-    addBinding acc (BcNamed bcKey valBcIdx) = do
+    addBinding acc (BcNamed pos bcKey valBcIdx) = do
       resolved <- resolveBcKey thunkEnv bcKey
       case resolved of
         Nothing -> pure acc -- null key -> skip
-        Just key -> insertChecked acc key (mkValueThunk thunkEnv valBcIdx)
-    addBinding acc (BcInherit sym valBcIdx) =
-      insertChecked acc (symbolText (Symbol sym)) (cheapThunkBc outerEnv valBcIdx)
+        Just key -> insertChecked acc key (AttrEntry pos (mkValueThunk thunkEnv valBcIdx))
+    addBinding acc (BcInherit pos sym valBcIdx) =
+      insertChecked acc (symbolText (Symbol sym)) (AttrEntry pos (cheapThunkBc outerEnv valBcIdx))
     addBinding acc (BcInheritFrom fromBcIdx names) =
       -- inherit (from) name selects name from the from-expr.
       -- Create a small env with the from value at slot 0, then run the
       -- select the compiler made for name against it.
-      let addInheritFrom a inherited@(BcInheritedName _ selectBcIdx) =
+      let addInheritFrom a inherited@(BcInheritedName pos _ selectBcIdx) =
             let (sp, sc) = buildCSlots [mkThunkBc thunkEnv fromBcIdx]
                 fromEnv = newMinimalEnv sp sc
-             in insertChecked a (inheritedNameText inherited) (mkSyntheticThunk fromEnv selectBcIdx)
+             in insertChecked a (inheritedNameText inherited) (AttrEntry pos (mkSyntheticThunk fromEnv selectBcIdx))
        in foldM addInheritFrom acc names
 
     -- The parser normalizes static keys to appear exactly once, so a
     -- collision here means an evaluated DYNAMIC key hit an existing
     -- attr - an eval error upstream, never a silent merge.
-    insertChecked acc key thunk =
+    insertChecked acc key entry =
       case Map.lookup key acc of
-        Nothing -> pure (Map.insert key thunk acc)
+        Nothing -> pure (Map.insert key entry acc)
         Just _ -> throwEvalError ("dynamic attribute '" <> key <> "' already defined")
 
 -- | Resolve a bytecode attr key to text.
@@ -980,22 +981,22 @@ resolveBcKey env (BcDynamicKey bcIdx0) = do
 bcBindingStaticKeys :: [BcBinding] -> [Text]
 bcBindingStaticKeys = concatMap oneBinding
   where
-    oneBinding (BcNamed (BcStaticKey sym) _) = [symbolText (Symbol sym)]
-    oneBinding (BcNamed _ _) = []
-    oneBinding (BcInherit sym _) = [symbolText (Symbol sym)]
+    oneBinding (BcNamed _ (BcStaticKey sym) _) = [symbolText (Symbol sym)]
+    oneBinding (BcNamed {}) = []
+    oneBinding (BcInherit _ sym _) = [symbolText (Symbol sym)]
     oneBinding (BcInheritFrom _ names) = map inheritedNameText names
 
 -- | The attribute name an @inherit (from)@ binds.
 inheritedNameText :: BcInheritedName -> Text
-inheritedNameText (BcInheritedName sym _) = symbolText (Symbol sym)
+inheritedNameText (BcInheritedName _ sym _) = symbolText (Symbol sym)
 
 -- | True when a binding's top-level key is known statically (a static key or an
 -- inherit).  These bindings populate the rec env's name table (C++ Nix's env2);
 -- a binding with a dynamic top-level key does not - it is added to the value.
 bcBindingIsStatic :: BcBinding -> Bool
-bcBindingIsStatic (BcNamed (BcStaticKey _) _) = True
-bcBindingIsStatic (BcNamed _ _) = False
-bcBindingIsStatic (BcInherit _ _) = True
+bcBindingIsStatic (BcNamed _ (BcStaticKey _) _) = True
+bcBindingIsStatic (BcNamed {}) = False
+bcBindingIsStatic (BcInherit {}) = True
 bcBindingIsStatic (BcInheritFrom _ _) = True
 
 -- ---------------------------------------------------------------------------
@@ -1432,8 +1433,8 @@ builtinRegistry =
       builtin1 "derivationStrict" builtinDerivationStrict,
       -- Error context (pass-through - context only matters on error)
       builtin2 "addErrorContext" (\_ val -> pure val),
-      -- Attr position (return null - nixpkgs handles this gracefully)
-      builtin2 "unsafeGetAttrPos" (\_ _ -> pure VNull),
+      -- Attr position
+      builtinShaped "unsafeGetAttrPos" (onUseSecond builtinUnsafeGetAttrPos),
       -- Debugging
       builtinShaped "traceVerbose" (onUse2 builtinTraceVerbose),
       builtin1 "break" pure,
@@ -1675,8 +1676,8 @@ executeBuiltin name args = case name of
   "derivationStrict" -> apply1 builtinDerivationStrict
   -- Error context (pass-through - context only matters on error)
   "addErrorContext" -> apply2 (\_ val -> pure val)
-  -- Attr position (return null - nixpkgs handles this gracefully)
-  "unsafeGetAttrPos" -> apply2 (\_ _ -> pure VNull)
+  -- Attr position
+  "unsafeGetAttrPos" -> run (onUseSecond builtinUnsafeGetAttrPos)
   -- Debugging
   "traceVerbose" -> run (onUse2 builtinTraceVerbose)
   "break" -> apply1 pure
@@ -1830,12 +1831,14 @@ builtinListToAttrs (VList cl) = do
   pairs <- mapM listToAttrsPair thunks
   -- Nix listToAttrs uses first-wins: if duplicate name, first element wins.
   let firstWins = Map.fromListWith (\_ kept -> kept) pairs
-  pure (VAttrs (attrSetFromMap firstWins))
+  pure (VAttrs (attrSetFromEntries firstWins))
 builtinListToAttrs other =
   throwEvalError ("builtins.listToAttrs: expected a list, got " <> typeName other)
 
--- | Extract { name, value } from a thunk for listToAttrs.
-listToAttrsPair :: (MonadEval m) => Thunk -> m (Text, Thunk)
+-- | Extract { name, value } from a thunk for listToAttrs.  The attribute
+-- is at the position of the element's @value@, as upstream's
+-- @prim_listToAttrs@ inserts it (primops.cc at 2.24.9).
+listToAttrsPair :: (MonadEval m) => Thunk -> m (Text, AttrEntry)
 listToAttrsPair thunk = do
   val <- force thunk
   case val of
@@ -1846,10 +1849,10 @@ listToAttrsPair thunk = do
       nameVal <- force nameThunk
       case nameVal of
         VStr keyName _ ->
-          case attrSetLookup "value" attrs of
-            Just valueThunk -> do
+          case attrSetLookupEntry "value" attrs of
+            Just valueEntry -> do
               key <- decodedText "builtins.listToAttrs: attribute name" keyName
-              pure (key, valueThunk)
+              pure (key, valueEntry)
             Nothing -> throwEvalError "builtins.listToAttrs: element missing 'value'"
         _ -> throwEvalError "builtins.listToAttrs: 'name' must be a string"
     _ -> throwEvalError "builtins.listToAttrs: element must be a set"
@@ -1878,6 +1881,32 @@ builtinGetAttr (VStr _ _) other =
 builtinGetAttr other _ =
   throwEvalError ("builtins.getAttr: expected a string, got " <> typeName other)
 
+-- | Where an attribute was defined, as upstream's @prim_unsafeGetAttrPos@
+-- and @EvalState::mkPos@ give it (primops.cc and eval.cc at 2.24.9):
+-- @{ column; file; line; }@ for one defined in a file, and null for a
+-- missing attribute, one no source defines (a builtin's, or one a builtin
+-- made), and one defined in text with no file behind it.  The name is read
+-- as upstream's @forceStringNoCtx@ reads it, and checked before the set is
+-- forced.
+builtinUnsafeGetAttrPos :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinUnsafeGetAttrPos nameVal setArg = do
+  nameBytes <- structuredStringValue RefuseContext nameVal
+  setVal <- argValue setArg
+  attrs <- case setVal of
+    VAttrs attrs -> pure attrs
+    other -> throwEvalError ("expected a set but found " <> typeName other <> ": " <> printValue PrintForError other)
+  name <- decodedText "builtins.unsafeGetAttrPos" nameBytes
+  pure (maybe VNull positionValue (lookupPos . entryPos =<< attrSetLookupEntry name attrs))
+  where
+    positionValue (PosInFile file line column) =
+      VAttrs . attrSetFromMap $
+        Map.fromList
+          [ ("column", evaluated (VInt (fromIntegral column))),
+            ("file", evaluated (mkStr file)),
+            ("line", evaluated (VInt (fromIntegral line)))
+          ]
+    positionValue (PosInText _ _) = VNull
+
 builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinRemoveAttrs (VAttrs attrs) (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
@@ -1898,10 +1927,11 @@ builtinIntersectAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinIntersectAttrs (VAttrs a) (VAttrs b) =
   -- Iterate keys of 'a' (typically the smaller set, e.g. functionArgs)
   -- and point-lookup each in 'b' (typically the large set, e.g. nixpkgs).
-  -- This avoids materializing all thunks in 'b'.
+  -- This avoids materializing all thunks in 'b'.  Each attribute is b's,
+  -- position included, as upstream copies it.
   let keysA = attrSetKeys a
-      result = Map.fromList [(k, thunk) | k <- keysA, Just thunk <- [attrSetLookup k b]]
-   in pure (VAttrs (attrSetFromMap result))
+      result = Map.fromList [(k, entry) | k <- keysA, Just entry <- [attrSetLookupEntry k b]]
+   in pure (VAttrs (attrSetFromEntries result))
 builtinIntersectAttrs (VAttrs _) other =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 builtinIntersectAttrs other _ =

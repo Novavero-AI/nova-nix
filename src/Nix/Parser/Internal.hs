@@ -26,6 +26,9 @@ module Nix.Parser.Internal
     -- * Specific expects
     expectIdent,
 
+    -- * Positions
+    currentPos,
+
     -- * Errors
     parseError,
 
@@ -36,14 +39,20 @@ where
 
 import Data.Text (Text)
 import qualified Data.Text as T
+import Nix.Expr.Types (SourceOrigin, SrcPos (..), sourceName)
 import Nix.Parser.Lexer (Located (..), Token (..))
 import Nix.Parser.ParseError (ParseError (..))
 
--- | Remaining tokens plus file name for error messages.
+-- | Remaining tokens plus where they came from, for error messages and
+-- the positions the parser records.
 data ParseState = ParseState
   { psTokens :: ![Located],
-    psFile :: !Text
+    psOrigin :: !SourceOrigin
   }
+
+-- | The name errors give the source being parsed.
+psFile :: ParseState -> Text
+psFile = sourceName . psOrigin
 
 -- | A parser that consumes tokens and produces a value or an error.
 newtype Parser a = Parser
@@ -200,6 +209,15 @@ expectIdent = Parser $ \st -> case psTokens st of
           peCol = 0,
           peMessage = "expected identifier but got end of input"
         }
+
+-- | The position of the next token, without consuming it.  Upstream
+-- records a construct at its first token's start (@ParserState::at@,
+-- parser-state.hh at 2.24.9), so taking this before a construct's first
+-- token gives the position upstream gives it.
+currentPos :: Parser SrcPos
+currentPos = Parser $ \st -> case psTokens st of
+  (Located ln col _ : _) -> Right (SrcPos (psOrigin st) ln col, st)
+  [] -> Left (makeEOF st)
 
 -- ---------------------------------------------------------------------------
 -- Helpers

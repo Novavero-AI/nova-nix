@@ -184,14 +184,13 @@ resolveVar fullStack name = go fullStack 0 False
 
 -- | A temporary accommodation.  Upstream's parser reads @__curPos@ as a
 -- position expression, never a variable (parser.y at 2.24.9, expr_simple),
--- so binding never sees it.  Here it still parses as a variable, because
--- building the position needs to know whether the source is a file
--- (upstream's position set) or a string (upstream's null), and 'parseNix'
--- carries only a name.  Until it does, the name is exempt from the check and
--- fails when forced, as before binding checked anything; nixpkgs uses it in
--- files every NixOS evaluation imports.  Delete the exemption when
--- 'parseNix' carries the file-or-string origin and the parser builds the
--- position.
+-- so binding never sees it.  Here it still parses as a variable: 'parseNix'
+-- takes the source's origin, which decides between upstream's position set
+-- (a file) and its null (a string), but no expression builds a position
+-- from it.  Until one does, the name is exempt from the check and fails
+-- when forced, as before binding checked anything; nixpkgs uses it in files
+-- every NixOS evaluation imports.  Delete the exemption when the parser
+-- builds the position.
 curPosName :: Text
 curPosName = "__curPos"
 
@@ -364,10 +363,10 @@ lexicalScopeFromFormals (FormalNamedSet name formals _) =
 collectBindingNames :: [Binding] -> Set Text
 collectBindingNames = foldl' addNames Set.empty
   where
-    addNames acc (NamedBinding (StaticKey name) _) = Set.insert name acc
-    addNames acc (NamedBinding _ _) = acc
-    addNames acc (Inherit name _) = Set.insert name acc
-    addNames acc (InheritFrom _ names) = foldl' (flip Set.insert) acc names
+    addNames acc (NamedBinding _ (StaticKey name) _) = Set.insert name acc
+    addNames acc (NamedBinding {}) = acc
+    addNames acc (Inherit _ name _) = Set.insert name acc
+    addNames acc (InheritFrom _ names) = foldl' (flip Set.insert) acc [name | InheritedName _ name <- names]
 
 -- | Resolve variables inside string parts.
 resolvePart :: [ScopeEntry] -> StringPart -> Either Text StringPart
@@ -384,9 +383,9 @@ resolveKey stack (DynamicKey e) = DynamicKey <$> resolve stack e
 -- no env level, so an inherited variable resolves where the set stands,
 -- like every other value.
 resolveBinding :: [ScopeEntry] -> Binding -> Either Text Binding
-resolveBinding stack (NamedBinding key bodyExpr) =
-  NamedBinding <$> resolveKey stack key <*> resolve stack bodyExpr
-resolveBinding stack (Inherit name var) = Inherit name <$> resolve stack var
+resolveBinding stack (NamedBinding pos key bodyExpr) =
+  NamedBinding pos <$> resolveKey stack key <*> resolve stack bodyExpr
+resolveBinding stack (Inherit pos name var) = Inherit pos name <$> resolve stack var
 resolveBinding stack (InheritFrom fromExpr names) =
   (`InheritFrom` names) <$> resolve stack fromExpr
 
@@ -397,8 +396,8 @@ resolveBinding stack (InheritFrom fromExpr names) =
 allStaticSingleKey :: [Binding] -> Bool
 allStaticSingleKey = all isEligible
   where
-    isEligible (NamedBinding (StaticKey _) _) = True
-    isEligible (Inherit _ _) = True
+    isEligible (NamedBinding _ (StaticKey _) _) = True
+    isEligible (Inherit {}) = True
     isEligible (InheritFrom _ _) = True
     isEligible _ = False
 
@@ -412,9 +411,9 @@ lexicalScopeFromBindings bindings =
   LexicalScope (Map.fromList (zip names [0 ..]))
   where
     names = concatMap bindingNames bindings
-    bindingNames (NamedBinding (StaticKey name) _) = [name]
-    bindingNames (Inherit name _) = [name]
-    bindingNames (InheritFrom _ inheritNames) = inheritNames
+    bindingNames (NamedBinding _ (StaticKey name) _) = [name]
+    bindingNames (Inherit _ name _) = [name]
+    bindingNames (InheritFrom _ inheritNames) = [name | InheritedName _ name <- inheritNames]
     -- Unreachable: allStaticSingleKey guards this path.
     bindingNames _ = []
 
@@ -430,12 +429,12 @@ lexicalScopeFromBindings bindings =
 -- the inherited name references the enclosing scope, never the block being
 -- defined, whose own @x@ would make it a self-reference.
 resolveLetBinding :: [ScopeEntry] -> [ScopeEntry] -> Binding -> Either Text Binding
-resolveLetBinding _ innerStack (NamedBinding key bodyExpr) =
-  NamedBinding <$> resolveKey innerStack key <*> resolve innerStack bodyExpr
+resolveLetBinding _ innerStack (NamedBinding pos key bodyExpr) =
+  NamedBinding pos <$> resolveKey innerStack key <*> resolve innerStack bodyExpr
 resolveLetBinding _ innerStack (InheritFrom fromExpr names) =
   (`InheritFrom` names) <$> resolve innerStack fromExpr
-resolveLetBinding outerStack _ (Inherit name var) =
-  Inherit name <$> resolve outerStack var
+resolveLetBinding outerStack _ (Inherit pos name var) =
+  Inherit pos name <$> resolve outerStack var
 
 -- | Resolve variables inside formal default expressions.
 resolveFormalsDefaults :: [ScopeEntry] -> Formals -> Either Text Formals
@@ -521,8 +520,8 @@ resolveRelativePaths dir = goExpr
       StrInterp e -> StrInterp (goExpr e)
 
     goBinding binding = case binding of
-      NamedBinding key e -> NamedBinding (goKey key) (goExpr e)
-      Inherit name var -> Inherit name (goExpr var)
+      NamedBinding pos key e -> NamedBinding pos (goKey key) (goExpr e)
+      Inherit pos name var -> Inherit pos name (goExpr var)
       InheritFrom from names -> InheritFrom (goExpr from) names
 
     goKey key = case key of
