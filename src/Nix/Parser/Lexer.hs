@@ -1,7 +1,21 @@
--- | Lexer for the Nix language: 'Text' to @['Located']@.
+-- | Lexer for the Nix language: source bytes to @['Located']@.
 --
 -- Handles all Nix tokens including string interpolation via a mode stack.
 -- Entirely pure - no IO.
+--
+-- The source is bytes, as upstream's flex scanner reads it (lexer.l at
+-- 2.24.9).  Every token class is ASCII, as upstream's are, so a byte
+-- outside ASCII never continues an identifier, number, path, URI or run of
+-- whitespace, while string literals and comments hold whatever bytes they
+-- hold: a string chunk is the source's bytes with its escapes resolved,
+-- which is what the eval string gets.  Bytes are matched as Latin-1
+-- 'Char's through "Data.ByteString.Char8" so the grammar reads as
+-- character literals, which is why no predicate here is one of
+-- "Data.Char"'s Unicode classes: 'Data.Char.isAlpha' calls the byte 0xE9
+-- a letter.
+--
+-- A column counts characters: a byte that continues a UTF-8 sequence does
+-- not advance it, so valid UTF-8 advances one column per character.
 module Nix.Parser.Lexer
   ( -- * Tokens
     Token (..),
@@ -12,14 +26,16 @@ module Nix.Parser.Lexer
   )
 where
 
-import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BC
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit, ord)
 import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Text.Foreign (lengthWord8)
-import qualified Data.Text.Lazy as TL
-import qualified Data.Text.Lazy.Builder as TB
+import qualified Data.Text.Encoding as TE
 import Nix.Parser.ParseError (ParseError (..))
+import Numeric (showHex)
 
 -- | A positioned token.
 data Located = Located
@@ -64,14 +80,15 @@ data Token
   | TokStringClose
   | TokIndStringOpen
   | TokIndStringClose
-  | TokStringLit !Text
+  | -- | A literal chunk of a string: the source's bytes, escapes resolved.
+    TokStringLit !ByteString
   | -- | Resolved escape text inside an indented string (@'''@, @''$@,
     -- @''${@, @''\x@).  Kept apart from 'TokStringLit' because upstream's
     -- lexer.l emits an escape without the hasIndentation mark: the
     -- indentation scan skips it (it ends a line's leading whitespace
     -- without being measured) while the strip runs over it as over any
     -- literal.
-    TokStringEsc !Text
+    TokStringEsc !ByteString
   | TokInterpOpen
   | TokInterpClose
   | -- Operators
@@ -132,7 +149,7 @@ data LexMode
 -- Without the stack, a nested interpolated string inside braces zeroes the
 -- enclosing count and the outer attrset's @}@ mislexes as TokInterpClose.
 data LexState = LexState
-  { lsInput :: !Text,
+  { lsInput :: !ByteString,
     lsFile :: !Text,
     lsLine :: !Int,
     lsCol :: !Int,
@@ -159,7 +176,7 @@ data LexState = LexState
 -- ---------------------------------------------------------------------------
 
 -- | Tokenize a Nix source file. Returns tokens or a lex error.
-tokenize :: Text -> Text -> Either ParseError [Located]
+tokenize :: Text -> ByteString -> Either ParseError [Located]
 tokenize fileName source =
   let initialState =
         LexState
@@ -188,7 +205,7 @@ lexLoop st acc = case lsModes st of
   _ -> lexNormalMode st acc
 
 lexNormalMode :: LexState -> [Located] -> Either ParseError [Located]
-lexNormalMode st acc = case T.uncons (lsInput st) of
+lexNormalMode st acc = case BC.uncons (lsInput st) of
   Nothing -> Right (reverse (Located (lsLine st) (lsCol st) TokEOF : acc))
   Just (c, rest) ->
     -- Lazy: forced only by the three path guards below.  Branches taken
@@ -201,13 +218,13 @@ lexNormalMode st acc = case T.uncons (lsInput st) of
 -- | The normal-mode dispatch, after the path lookahead has been prepared.
 -- @st@ is the incoming state; @flooredSt@ carries the advanced path
 -- watermark for the continuations that bypassed a path reading.
-lexNormalModeAt :: LexState -> LexState -> Bool -> Char -> Text -> [Located] -> Either ParseError [Located]
+lexNormalModeAt :: LexState -> LexState -> Bool -> Char -> ByteString -> [Located] -> Either ParseError [Located]
 lexNormalModeAt st flooredSt startsPath c rest acc = case c of
-  _ | isSpace c -> lexNormalMode (skipWhitespace st) acc
+  _ | isNixSpace c -> lexNormalMode (skipWhitespace st) acc
   '#' -> lexNormalMode (skipLineComment st) acc
   '/'
     | Just '*' <- safeHead rest ->
-        case skipBlockComment (advanceCol 2 st {lsInput = T.drop 2 (lsInput st)}) of
+        case skipBlockComment (advanceCol 2 st {lsInput = BS.drop 2 (lsInput st)}) of
           Left err -> Left err
           Right newSt -> lexNormalMode newSt acc
   '"' ->
@@ -217,11 +234,11 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
   '\''
     | Just '\'' <- safeHead rest ->
         let tok = Located (lsLine st) (lsCol st) TokIndStringOpen
-            opened = advanceCol 2 st {lsInput = T.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
+            opened = advanceCol 2 st {lsInput = BS.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
          in lexLoop (skipIndStringOpenerLine opened) (tok : acc)
   '.'
     | Just '.' <- safeHead rest,
-      Just '.' <- safeHead (T.drop 1 rest) ->
+      Just '.' <- safeHead (BS.drop 1 rest) ->
         emit3 st TokEllipsis acc
   '.'
     -- Maximal munch, as upstream's PATH regex: a dot-led path-char run
@@ -286,7 +303,7 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
   '=' -> emit1 st TokAssign acc
   '<' | Just '=' <- safeHead rest -> emit2 st TokLte acc
   '<'
-    | maybe False (\ch -> isAlpha ch || ch == '_') (safeHead rest) ->
+    | maybe False (\ch -> isAsciiAlpha ch || ch == '_') (safeHead rest) ->
         lexSearchPath st acc
   '<' -> emit1 st TokLt acc
   '>' | Just '=' <- safeHead rest -> emit2 st TokGte acc
@@ -306,7 +323,7 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
         -- interpolation like "${env.${name}}" prematurely ends the
         -- outer interpolation.
         let tok = Located (lsLine st) (lsCol st) TokInterpOpen
-            newSt = advanceCol 2 st {lsInput = T.drop 1 rest, lsBraceDepth = lsBraceDepth st + 1}
+            newSt = advanceCol 2 st {lsInput = BS.drop 1 rest, lsBraceDepth = lsBraceDepth st + 1}
          in lexNormalMode newSt (tok : acc)
   '~'
     | Just '/' <- safeHead rest ->
@@ -322,15 +339,35 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
         { peFile = lsFile st,
           peLine = lsLine st,
           peCol = lsCol st,
-          peMessage = "unexpected character: " <> T.singleton c
+          peMessage = unexpectedInput c rest
         }
+
+-- | What a parse error says of input that starts no token: the character
+-- there when its bytes are one (ASCII, or a whole UTF-8 sequence), and
+-- otherwise the byte, which shown as a Latin-1 character would name a
+-- character the source does not hold.
+unexpectedInput :: Char -> ByteString -> Text
+unexpectedInput c rest =
+  case TE.decodeUtf8' (BC.cons c (BS.take (utf8TrailLength c) rest)) of
+    Right character -> "unexpected character: " <> character
+    Left _ -> "unexpected byte 0x" <> T.pack (showHex (ord c) "")
+
+-- | How many bytes after a UTF-8 lead byte its sequence takes, by the
+-- lead's high bits; 0 for any other byte.  The decode that reads them
+-- decides whether they form a character.
+utf8TrailLength :: Char -> Int
+utf8TrailLength c
+  | c >= '\xF0' = 3
+  | c >= '\xE0' = 2
+  | c >= '\xC0' = 1
+  | otherwise = 0
 
 -- ---------------------------------------------------------------------------
 -- String modes
 -- ---------------------------------------------------------------------------
 
 lexStringMode :: LexState -> [Located] -> Either ParseError [Located]
-lexStringMode st acc = case T.uncons (lsInput st) of
+lexStringMode st acc = case BC.uncons (lsInput st) of
   Nothing ->
     Left
       ParseError
@@ -351,7 +388,7 @@ lexStringMode st acc = case T.uncons (lsInput st) of
                 advanceCol
                   2
                   st
-                    { lsInput = T.drop 1 rest,
+                    { lsInput = BS.drop 1 rest,
                       lsModes = ModeNormal : lsModes st,
                       -- Fresh count for the interpolation body; the
                       -- enclosing context's count is restored at the
@@ -370,13 +407,13 @@ lexStringMode st acc = case T.uncons (lsInput st) of
 -- newline.
 skipIndStringOpenerLine :: LexState -> LexState
 skipIndStringOpenerLine st =
-  case T.uncons (T.dropWhile (== ' ') (lsInput st)) of
+  case BC.uncons (BC.dropWhile (== ' ') (lsInput st)) of
     Just ('\n', rest) -> st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
     _ -> st
 
 lexIndStringMode :: LexState -> [Located] -> Either ParseError [Located]
 lexIndStringMode st acc
-  | T.null (lsInput st) =
+  | BS.null (lsInput st) =
       Left
         ParseError
           { peFile = lsFile st,
@@ -386,10 +423,10 @@ lexIndStringMode st acc
           }
   | otherwise =
       let input = lsInput st
-       in case T.uncons input of
-            Just ('\'', rest1) | Just ('\'', rest2) <- T.uncons rest1 ->
+       in case BC.uncons input of
+            Just ('\'', rest1) | Just ('\'', rest2) <- BC.uncons rest1 ->
               -- Check for escape sequences: ''', ''$, ''\x, ''${
-              case T.uncons rest2 of
+              case BC.uncons rest2 of
                 Just ('\'', rest3) ->
                   -- ''' escapes a literal '' (two quotes) - Nix's escape for the
                   -- indented-string terminator, not a single quote.
@@ -397,7 +434,7 @@ lexIndStringMode st acc
                       newSt = advanceCol 3 st {lsInput = rest3}
                    in lexIndStringMode newSt (escTok : acc)
                 Just ('$', rest3)
-                  | Just ('{', rest4) <- T.uncons rest3 ->
+                  | Just ('{', rest4) <- BC.uncons rest3 ->
                       -- ''${ is a literal ${
                       let escTok = Located (lsLine st) (lsCol st) (TokStringEsc "${")
                           newSt = advanceCol 4 st {lsInput = rest4}
@@ -409,17 +446,10 @@ lexIndStringMode st acc
                    in lexIndStringMode newSt (escTok : acc)
                 Just ('\\', rest3) ->
                   -- ''\x is an escape sequence
-                  case T.uncons rest3 of
-                    Just (ec, rest4) ->
-                      let escaped = case ec of
-                            'n' -> "\n"
-                            't' -> "\t"
-                            'r' -> "\r"
-                            '\\' -> "\\"
-                            -- Unknown escape: Nix drops the backslash (''\q -> q).
-                            _ -> T.singleton ec
-                          escTok = Located (lsLine st) (lsCol st) (TokStringEsc escaped)
-                          newSt = advanceCol 4 st {lsInput = rest4}
+                  case BC.uncons rest3 of
+                    Just (escaped, rest4) ->
+                      let escTok = Located (lsLine st) (lsCol st) (TokStringEsc (escapedBytes escaped))
+                          newSt = advanceEscaped escaped (advanceCol 3 st {lsInput = rest4})
                        in lexIndStringMode newSt (escTok : acc)
                     Nothing ->
                       Left
@@ -435,7 +465,7 @@ lexIndStringMode st acc
                       newSt = advanceCol 2 st {lsInput = rest2, lsModes = safeTail (lsModes st)}
                    in lexLoop newSt (tok : acc)
             Just ('$', rest1)
-              | Just ('{', rest2) <- T.uncons rest1 ->
+              | Just ('{', rest2) <- BC.uncons rest1 ->
                   -- \${ in indented string is interpolation
                   let tok = Located (lsLine st) (lsCol st) TokInterpOpen
                       newSt =
@@ -452,131 +482,131 @@ lexIndStringMode st acc
                    in lexLoop newSt (tok : acc)
             _ -> lexIndStringLiteral st acc
 
--- | Lex a literal segment inside a regular string.
--- Uses 'TB.Builder' for O(1) amortized append instead of O(n) 'T.snoc'.
+-- | Lex a literal segment inside a regular string.  A run of bytes the
+-- string grammar gives no meaning is taken whole, and the pieces are
+-- joined once when the chunk ends, so a chunk that is one such run is a
+-- slice of the source.
 lexStringLiteral :: LexState -> [Located] -> Either ParseError [Located]
-lexStringLiteral st0 acc = go st0 mempty
+lexStringLiteral st0 acc = go st0 []
   where
-    go st !builder = case T.uncons (lsInput st) of
-      Nothing ->
-        Left
-          ParseError
-            { peFile = lsFile st,
-              peLine = lsLine st,
-              peCol = lsCol st,
-              peMessage = "unterminated string"
-            }
-      Just (c, rest) -> case c of
-        '"' -> finishChunk st builder
-        -- \$$ is two literal dollars (maximal munch): the second $ cannot begin an
-        -- interpolation, so $${ does not interpolate (documented Nix behavior).
-        '$'
-          | Just '$' <- safeHead rest ->
-              go (advanceCol 2 st {lsInput = T.drop 1 rest}) (builder <> TB.singleton '$' <> TB.singleton '$')
-        '$' | Just '{' <- safeHead rest -> finishChunk st builder
-        '\\' -> case T.uncons rest of
-          Just (ec, rest2) ->
-            let escaped = case ec of
-                  'n' -> TB.singleton '\n'
-                  't' -> TB.singleton '\t'
-                  'r' -> TB.singleton '\r'
-                  '\\' -> TB.singleton '\\'
-                  '"' -> TB.singleton '"'
-                  '$' -> TB.singleton '$'
-                  -- Unknown escape: Nix drops the backslash (\q -> q).
-                  _ -> TB.singleton ec
-                newSt = advanceBy ec (advanceCol 1 st {lsInput = rest2})
-             in go newSt (builder <> escaped)
-          Nothing ->
-            Left
-              ParseError
-                { peFile = lsFile st,
-                  peLine = lsLine st,
-                  peCol = lsCol st,
-                  peMessage = "unterminated escape in string"
-                }
-        '\n' ->
-          let newSt = st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
-           in go newSt (builder <> TB.singleton '\n')
-        -- Raw CR and CRLF normalize to LF, matching upstream unescapeStr
-        -- (lexer.l).  Only double-quoted strings do this: indented-string
-        -- chunks bypass unescapeStr upstream and keep CR verbatim.  An
-        -- ESCAPED CR (backslash before it) stays literal via the escape
-        -- branch above, also matching upstream.
-        '\r' ->
-          let afterEol = case T.uncons rest of
-                Just ('\n', afterCrlf) -> afterCrlf
-                _ -> rest
-              newSt = st {lsInput = afterEol, lsLine = lsLine st + 1, lsCol = 1}
-           in go newSt (builder <> TB.singleton '\n')
-        _ ->
-          let newSt = advanceCol 1 st {lsInput = rest}
-           in go newSt (builder <> TB.singleton c)
-    finishChunk st builder
-      | builderIsEmpty = lexStringMode st acc
+    go st pieces =
+      let (run, afterRun) = BC.break endsStringRun (lsInput st)
+          runSt = advanceCols run st {lsInput = afterRun}
+          withRun = run : pieces
+       in case BC.uncons afterRun of
+            Nothing ->
+              Left
+                ParseError
+                  { peFile = lsFile runSt,
+                    peLine = lsLine runSt,
+                    peCol = lsCol runSt,
+                    peMessage = "unterminated string"
+                  }
+            Just (c, rest) -> case c of
+              '"' -> finishChunk runSt withRun
+              -- \$$ is two literal dollars (maximal munch): the second $ cannot begin an
+              -- interpolation, so $${ does not interpolate (documented Nix behavior).
+              '$'
+                | Just '$' <- safeHead rest ->
+                    go (advanceCol 2 runSt {lsInput = BS.drop 1 rest}) ("$$" : withRun)
+                | Just '{' <- safeHead rest -> finishChunk runSt withRun
+                | otherwise -> go (advanceCol 1 runSt {lsInput = rest}) ("$" : withRun)
+              '\\' -> case BC.uncons rest of
+                Just (escaped, rest2) ->
+                  let newSt = advanceEscaped escaped (advanceCol 1 runSt {lsInput = rest2})
+                   in go newSt (escapedBytes escaped : withRun)
+                Nothing ->
+                  Left
+                    ParseError
+                      { peFile = lsFile runSt,
+                        peLine = lsLine runSt,
+                        peCol = lsCol runSt,
+                        peMessage = "unterminated escape in string"
+                      }
+              '\n' ->
+                let newSt = runSt {lsInput = rest, lsLine = lsLine runSt + 1, lsCol = 1}
+                 in go newSt ("\n" : withRun)
+              -- The carriage return, the run's one other end.  Raw CR and
+              -- CRLF normalize to LF, matching upstream unescapeStr
+              -- (lexer.l).  Only double-quoted strings do this:
+              -- indented-string chunks bypass unescapeStr upstream and keep
+              -- CR verbatim.  An ESCAPED CR (backslash before it) stays
+              -- literal via the escape branch above, also matching upstream.
+              _ ->
+                let afterEol = case BC.uncons rest of
+                      Just ('\n', afterCrlf) -> afterCrlf
+                      _ -> rest
+                    newSt = runSt {lsInput = afterEol, lsLine = lsLine runSt + 1, lsCol = 1}
+                 in go newSt ("\n" : withRun)
+    finishChunk st pieces
+      | BS.null chunk = lexStringMode st acc
       | otherwise =
-          let chunk = TL.toStrict (TB.toLazyText builder)
-              tok = Located (lsLine st0) (lsCol st0) (TokStringLit chunk)
+          let tok = Located (lsLine st0) (lsCol st0) (TokStringLit chunk)
            in lexStringMode st (tok : acc)
       where
-        builderIsEmpty = TL.null (TB.toLazyText builder)
+        chunk = BS.concat (reverse pieces)
+
+-- | The bytes that end a plain run in a double-quoted string, each of
+-- which means something there.
+endsStringRun :: Char -> Bool
+endsStringRun c = c == '"' || c == '$' || c == '\\' || c == '\n' || c == '\r'
+
+-- | What an escaped byte stands for, as upstream's unescapeStr reads it
+-- (lexer.l): @n@, @r@ and @t@ name control characters, and any other byte
+-- stands for itself, the backslash dropped (@\\q@ is @q@).
+escapedBytes :: Char -> ByteString
+escapedBytes 'n' = "\n"
+escapedBytes 'r' = "\r"
+escapedBytes 't' = "\t"
+escapedBytes other = BC.singleton other
 
 -- | Lex a literal segment inside an indented string.
 -- No escape sequences here (those are handled by 'lexIndStringMode'),
--- so the chunk is identical to the source text - count chars, then slice
--- once at the end.  This avoids O(n^2) 'T.snoc' allocation.
+-- so the chunk is identical to the source bytes - scan runs, then slice
+-- once at the end.
 --
 -- Raw CR\/CRLF is deliberately NOT normalized here: upstream's indented
 -- string chunks bypass unescapeStr (lexer.l), and stripIndentation treats
 -- CR as ordinary content, so only double-quoted strings normalize line
 -- endings.
 lexIndStringLiteral :: LexState -> [Located] -> Either ParseError [Located]
-lexIndStringLiteral st0 acc = go st0 0
+lexIndStringLiteral st0 acc = go st0
   where
     startInput = lsInput st0
-    go st !consumed
-      | T.null (lsInput st) =
-          Left
-            ParseError
-              { peFile = lsFile st,
-                peLine = lsLine st,
-                peCol = lsCol st,
-                peMessage = "unterminated indented string"
-              }
+    go st =
+      let (run, afterRun) = BC.break endsIndStringRun (lsInput st)
+          runSt = advanceCols run st {lsInput = afterRun}
+       in case BC.uncons afterRun of
+            Nothing ->
+              Left
+                ParseError
+                  { peFile = lsFile runSt,
+                    peLine = lsLine runSt,
+                    peCol = lsCol runSt,
+                    peMessage = "unterminated indented string"
+                  }
+            Just ('\'', rest)
+              | Just '\'' <- safeHead rest -> finishChunk runSt
+              | otherwise -> go (advanceCol 1 runSt {lsInput = rest})
+            Just ('$', rest)
+              -- \$$ is two literal dollars; the second cannot begin an
+              -- interpolation (matches lexStringLiteral and Nix).
+              | Just '$' <- safeHead rest -> go (advanceCol 2 runSt {lsInput = BS.drop 1 rest})
+              | Just '{' <- safeHead rest -> finishChunk runSt
+              | otherwise -> go (advanceCol 1 runSt {lsInput = rest})
+            -- The newline, the run's one other end.
+            Just (_, rest) -> go runSt {lsInput = rest, lsLine = lsLine runSt + 1, lsCol = 1}
+    finishChunk st
+      | BS.null chunk = lexIndStringMode st acc
       | otherwise =
-          let input = lsInput st
-           in case T.uncons input of
-                Just ('\'', rest1)
-                  | Just ('\'', _) <- T.uncons rest1 ->
-                      finishChunk st consumed
-                Just ('$', rest1)
-                  | Just ('$', _) <- T.uncons rest1 ->
-                      -- \$$ is two literal dollars; the second cannot begin an
-                      -- interpolation (matches lexStringLiteral and Nix).
-                      go (advanceCol 2 st {lsInput = T.drop 1 rest1}) (consumed + 2)
-                Just ('$', rest1)
-                  | Just ('{', _) <- T.uncons rest1 ->
-                      finishChunk st consumed
-                Just ('\n', rest1) ->
-                  let newSt = st {lsInput = rest1, lsLine = lsLine st + 1, lsCol = 1}
-                   in go newSt (consumed + 1)
-                Just (_c, rest1) ->
-                  let newSt = advanceCol 1 st {lsInput = rest1}
-                   in go newSt (consumed + 1)
-                Nothing ->
-                  Left
-                    ParseError
-                      { peFile = lsFile st,
-                        peLine = lsLine st,
-                        peCol = lsCol st,
-                        peMessage = "unterminated indented string"
-                      }
-    finishChunk st consumed
-      | consumed == 0 = lexIndStringMode st acc
-      | otherwise =
-          let chunk = T.take consumed startInput
-              tok = Located (lsLine st0) (lsCol st0) (TokStringLit chunk)
+          let tok = Located (lsLine st0) (lsCol st0) (TokStringLit chunk)
            in lexIndStringMode st (tok : acc)
+      where
+        chunk = BS.take (BS.length startInput - BS.length (lsInput st)) startInput
+
+-- | The bytes that end a plain run in an indented string.
+endsIndStringRun :: Char -> Bool
+endsIndStringRun c = c == '\'' || c == '$' || c == '\n'
 
 -- ---------------------------------------------------------------------------
 -- Numbers
@@ -584,17 +614,18 @@ lexIndStringLiteral st0 acc = go st0 0
 
 lexNumber :: LexState -> [Located] -> Either ParseError [Located]
 lexNumber st acc =
-  let (digits, after) = T.span isDigit (lsInput st)
-      len = T.length digits
-   in case T.uncons after of
+  let (digitBytes, after) = BC.span isDigit (lsInput st)
+      digits = asciiText digitBytes
+      len = BS.length digitBytes
+   in case BC.uncons after of
         -- A '.' after the integer part starts a float even with no fractional
         -- digits or with only an exponent - Nix's grammar is [0-9]+\.[0-9]*(exp)?,
         -- so 12. and 12.e5 are floats, not an integer followed by a dot.
         Just ('.', after2) ->
-          let (decimals, after3) = T.span isDigit after2
+          let (decimals, after3) = BC.span isDigit after2
               (expVal, after4, expLen) = lexExponent after3
-              fullLen = T.length digits + 1 + T.length decimals + expLen
-              val = readDouble digits decimals expVal
+              fullLen = len + 1 + BS.length decimals + expLen
+              val = readDouble digits (asciiText decimals) expVal
               tok = Located (lsLine st) (lsCol st) (TokFloat val)
               newSt = advanceCol fullLen st {lsInput = after4}
            in lexNormalMode newSt (tok : acc)
@@ -703,19 +734,19 @@ positiveInfinity = 1 / 0
 -- Returns the signed exponent, the remaining input, and the characters
 -- consumed.  An @e@ not followed by digits is not an exponent (consumes 0), so
 -- e.g. @1.5e@ lexes as the float @1.5@ followed by the identifier @e@.
-lexExponent :: Text -> (Integer, Text, Int)
+lexExponent :: ByteString -> (Integer, ByteString, Int)
 lexExponent input =
-  case T.uncons input of
+  case BC.uncons input of
     Just (e, afterE)
       | e == 'e' || e == 'E' ->
-          let (sign, afterSign, signLen) = case T.uncons afterE of
+          let (sign, afterSign, signLen) = case BC.uncons afterE of
                 Just ('+', rest) -> (1, rest, 1)
                 Just ('-', rest) -> (-1, rest, 1)
                 _ -> (1, afterE, 0)
-              (expDigits, afterExp) = T.span isDigit afterSign
-           in if T.null expDigits
+              (expDigits, afterExp) = BC.span isDigit afterSign
+           in if BS.null expDigits
                 then (0, input, 0)
-                else (sign * exponentMagnitude expDigits, afterExp, 1 + signLen + T.length expDigits)
+                else (sign * exponentMagnitude (asciiText expDigits), afterExp, 1 + signLen + BS.length expDigits)
     _ -> (0, input, 0)
 
 -- | The magnitude of an exponent's digit run.  Reading n digits builds
@@ -745,11 +776,11 @@ saturatedExponent = 10 ^ (18 :: Int)
 -- The current input begins with the @.@.
 lexLeadingDotFloat :: LexState -> [Located] -> Either ParseError [Located]
 lexLeadingDotFloat st acc =
-  let afterDot = T.drop 1 (lsInput st)
-      (decimals, after3) = T.span isDigit afterDot
+  let afterDot = BS.drop 1 (lsInput st)
+      (decimals, after3) = BC.span isDigit afterDot
       (expVal, after4, expLen) = lexExponent after3
-      fullLen = 1 + T.length decimals + expLen
-      val = readDouble "" decimals expVal
+      fullLen = 1 + BS.length decimals + expLen
+      val = readDouble "" (asciiText decimals) expVal
       tok = Located (lsLine st) (lsCol st) (TokFloat val)
       newSt = advanceCol fullLen st {lsInput = after4}
    in lexNormalMode newSt (tok : acc)
@@ -769,7 +800,7 @@ zeroOrd = fromEnum '0'
 lexIdentOrKeyword :: LexState -> [Located] -> Either ParseError [Located]
 lexIdentOrKeyword st acc =
   let input = lsInput st
-      (ident, after) = T.span isIdentChar input
+      (ident, after) = BC.span isIdentChar input
       (uriReading, advancedFloor) = uriSpanFrom (lsNoColonFloor st) input
    in case uriReading of
         -- Flex maximal munch: the URI rule beats identifiers AND keywords
@@ -777,19 +808,19 @@ lexIdentOrKeyword st acc =
         -- (the classic reason the identity function must be written
         -- @x: x@) and @mailto:a\@b.com@ needs no @//@.
         Just (uri, afterUri)
-          | T.length uri > T.length ident ->
-              let tok = Located (lsLine st) (lsCol st) (TokUri uri)
-                  newSt = advanceCol (T.length uri) st {lsInput = afterUri}
+          | BS.length uri > BS.length ident ->
+              let tok = Located (lsLine st) (lsCol st) (TokUri (asciiText uri))
+                  newSt = advanceCol (BS.length uri) st {lsInput = afterUri}
                in lexNormalMode newSt (tok : acc)
         _ ->
           let tok = Located (lsLine st) (lsCol st) (identToToken ident)
-              newSt = advanceCol (T.length ident) st {lsInput = after, lsNoColonFloor = advancedFloor}
+              newSt = advanceCol (BS.length ident) st {lsInput = after, lsNoColonFloor = advancedFloor}
            in lexNormalMode newSt (tok : acc)
 
 -- | Match upstream's URI token at the start of the input:
 -- @[a-zA-Z][a-zA-Z0-9+.-]*:[uri-char]+@ (lexer.l).  The scheme starts
 -- with a letter (never @_@), and one URI char after the colon suffices -
--- scheme-only URIs like @mailto:x@ count.  Returns the URI text and the
+-- scheme-only URIs like @mailto:x@ count.  Returns the URI bytes and the
 -- remaining input.
 --
 -- Threads the 'lsNoColonFloor' watermark: when the scheme-char run ends
@@ -797,23 +828,23 @@ lexIdentOrKeyword st acc =
 -- of the run spans to the same terminator), so the run's end is recorded
 -- and later positions inside it answer Nothing in O(1).  A run ending at
 -- @:@ records nothing - a shorter suffix of it may itself be a URI.
-uriSpanFrom :: Int -> Text -> (Maybe (Text, Text), Int)
+uriSpanFrom :: Int -> ByteString -> (Maybe (ByteString, ByteString), Int)
 uriSpanFrom noColonFloor input
-  | lengthWord8 input > noColonFloor = (Nothing, noColonFloor)
-  | otherwise = case T.uncons input of
+  | BS.length input > noColonFloor = (Nothing, noColonFloor)
+  | otherwise = case BC.uncons input of
       Just (schemeStart, _)
-        | isAlpha schemeStart ->
-            let (scheme, afterScheme) = T.span isSchemeChar input
-             in case T.stripPrefix ":" afterScheme of
+        | isAsciiAlpha schemeStart ->
+            let (scheme, afterScheme) = BC.span isSchemeChar input
+             in case BS.stripPrefix ":" afterScheme of
                   Just afterColon
-                    | (body, afterUri) <- T.span isUriChar afterColon,
-                      not (T.null body) ->
-                        (Just (scheme <> ":" <> body, afterUri), noColonFloor)
+                    | (body, afterUri) <- BC.span isUriChar afterColon,
+                      not (BS.null body) ->
+                        (Just (BS.take (BS.length input - BS.length afterUri) input, afterUri), noColonFloor)
                   Just _ -> (Nothing, noColonFloor)
-                  Nothing -> (Nothing, lengthWord8 input - lengthWord8 scheme)
+                  Nothing -> (Nothing, BS.length input - BS.length scheme)
       _ -> (Nothing, noColonFloor)
 
-identToToken :: Text -> Token
+identToToken :: ByteString -> Token
 identToToken "if" = TokIf
 identToToken "then" = TokThen
 identToToken "else" = TokElse
@@ -826,7 +857,7 @@ identToToken "inherit" = TokInherit
 identToToken "true" = TokTrue
 identToToken "false" = TokFalse
 identToToken "null" = TokNull
-identToToken name = TokIdent name
+identToToken name = TokIdent (asciiText name)
 
 -- ---------------------------------------------------------------------------
 -- Paths and search paths
@@ -834,10 +865,10 @@ identToToken name = TokIdent name
 
 lexPath :: LexState -> [Located] -> Either ParseError [Located]
 lexPath st acc =
-  let (pathText, after) = T.span isPathChar (lsInput st)
-      len = T.length pathText
-      newSt = advanceCol len st {lsInput = after}
-   in if "${" `T.isPrefixOf` after
+  let (pathBytes, after) = BC.span isPathChar (lsInput st)
+      pathText = asciiText pathBytes
+      newSt = advanceCol (BS.length pathBytes) st {lsInput = after}
+   in if "${" `BS.isPrefixOf` after
         then
           -- The literal continues through an interpolation: the head
           -- piece opens and 'lexPathMode' carries on, upstream's
@@ -845,7 +876,7 @@ lexPath st acc =
           let tok = Located (lsLine st) (lsCol st) (TokPathInterpStart pathText)
            in lexPathMode (newSt {lsModes = ModePath : lsModes newSt}) (tok : acc)
         else
-          if T.isSuffixOf "/" pathText
+          if "/" `BS.isSuffixOf` pathBytes
             then pathTrailingSlashError st
             else
               let tok = Located (lsLine st) (lsCol st) (TokPath pathText)
@@ -859,13 +890,13 @@ lexPath st acc =
 -- trailing slash" parse error.
 lexPathMode :: LexState -> [Located] -> Either ParseError [Located]
 lexPathMode st acc
-  | "${" `T.isPrefixOf` lsInput st =
+  | "${" `BS.isPrefixOf` lsInput st =
       let tok = Located (lsLine st) (lsCol st) TokInterpOpen
           newSt =
             advanceCol
               2
               st
-                { lsInput = T.drop 2 (lsInput st),
+                { lsInput = BS.drop 2 (lsInput st),
                   lsModes = ModeNormal : lsModes st,
                   -- Fresh count for the interpolation body; the
                   -- enclosing context's count is restored at the
@@ -875,25 +906,24 @@ lexPathMode st acc
                 }
        in lexLoop newSt (tok : acc)
   | otherwise =
-      let (chunk, after) = T.span isPathChar (lsInput st)
-          len = T.length chunk
-          newSt = advanceCol len st {lsInput = after}
+      let (chunk, after) = BC.span isPathChar (lsInput st)
+          newSt = advanceCol (BS.length chunk) st {lsInput = after}
           endTok = Located (lsLine newSt) (lsCol newSt) TokPathEnd
           popped = newSt {lsModes = safeTail (lsModes newSt)}
-       in if T.null chunk
+       in if BS.null chunk
             then -- The character after an interpolation is not a path
             -- character: the literal ends right there.
               lexNormalMode popped (endTok : acc)
             else
-              if "${" `T.isPrefixOf` after
+              if "${" `BS.isPrefixOf` after
                 then
-                  let tok = Located (lsLine st) (lsCol st) (TokPathLit chunk)
+                  let tok = Located (lsLine st) (lsCol st) (TokPathLit (asciiText chunk))
                    in lexPathMode newSt (tok : acc)
                 else
-                  if T.isSuffixOf "/" chunk
+                  if "/" `BS.isSuffixOf` chunk
                     then pathTrailingSlashError st
                     else
-                      let tok = Located (lsLine st) (lsCol st) (TokPathLit chunk)
+                      let tok = Located (lsLine st) (lsCol st) (TokPathLit (asciiText chunk))
                        in lexNormalMode popped (endTok : tok : acc)
 
 -- | Upstream's INPATH_SLASH error, verbatim: a path literal may not end
@@ -911,12 +941,12 @@ pathTrailingSlashError st =
 lexSearchPath :: LexState -> [Located] -> Either ParseError [Located]
 lexSearchPath st acc =
   -- st is at '<', skip it
-  let after = T.drop 1 (lsInput st)
-      (name, after2) = T.span isSearchPathChar after
-   in case T.uncons after2 of
+  let after = BS.drop 1 (lsInput st)
+      (name, after2) = BC.span isSearchPathChar after
+   in case BC.uncons after2 of
         Just ('>', after3) ->
-          let tok = Located (lsLine st) (lsCol st) (TokSearchPath name)
-              totalLen = T.length name + 2 -- < + name + >
+          let tok = Located (lsLine st) (lsCol st) (TokSearchPath (asciiText name))
+              totalLen = BS.length name + 2 -- < + name + >
               newSt = advanceCol totalLen st {lsInput = after3}
            in lexNormalMode newSt (tok : acc)
         _ ->
@@ -928,47 +958,58 @@ lexSearchPath st acc =
 -- ---------------------------------------------------------------------------
 
 skipWhitespace :: LexState -> LexState
-skipWhitespace st = case T.uncons (lsInput st) of
-  Just ('\n', rest) -> skipWhitespace st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
-  Just (c, rest) | isSpace c -> skipWhitespace (advanceCol 1 st {lsInput = rest})
-  _ -> st
+skipWhitespace st =
+  let (spaces, rest) = BC.span isNixSpace (lsInput st)
+   in advanceOver spaces st {lsInput = rest}
 
 skipLineComment :: LexState -> LexState
-skipLineComment st =
-  let (_, after) = T.break (== '\n') (lsInput st)
-   in case T.uncons after of
-        Just ('\n', rest) -> st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
-        _ -> st {lsInput = after}
+skipLineComment st = case BC.elemIndex '\n' (lsInput st) of
+  Just newline -> st {lsInput = BS.drop (newline + 1) (lsInput st), lsLine = lsLine st + 1, lsCol = 1}
+  Nothing -> st {lsInput = BS.empty}
 
+-- | Skip a block comment's body and its @*\/@, the opening @\/*@ already
+-- consumed.  The comment ends at the first @*\/@, as upstream's rule
+-- (lexer.l) ends it.
 skipBlockComment :: LexState -> Either ParseError LexState
-skipBlockComment st = case T.uncons (lsInput st) of
-  Nothing ->
-    Left
-      ParseError
-        { peFile = lsFile st,
-          peLine = lsLine st,
-          peCol = lsCol st,
-          peMessage = "unterminated block comment"
-        }
-  Just (c, rest) -> case c of
-    '*'
-      | Just '/' <- safeHead rest ->
-          Right (advanceCol 2 st {lsInput = T.drop 1 rest})
-    '\n' -> skipBlockComment st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
-    _ -> skipBlockComment (advanceCol 1 st {lsInput = rest})
+skipBlockComment st =
+  let (body, after) = BS.breakSubstring "*/" (lsInput st)
+      bodySt = advanceOver body st {lsInput = after}
+   in if BS.null after
+        then
+          Left
+            ParseError
+              { peFile = lsFile bodySt,
+                peLine = lsLine bodySt,
+                peCol = lsCol bodySt,
+                peMessage = "unterminated block comment"
+              }
+        else Right (advanceCol 2 bodySt {lsInput = BS.drop 2 after})
 
 -- ---------------------------------------------------------------------------
 -- Character predicates
 -- ---------------------------------------------------------------------------
 
+-- | Upstream's whitespace class, @[ \\t\\r\\n]@ (lexer.l).  A vertical tab,
+-- a form feed and every non-ASCII space start no token there.
+isNixSpace :: Char -> Bool
+isNixSpace c = c == ' ' || c == '\t' || c == '\r' || c == '\n'
+
+-- | An ASCII letter, upstream's @[a-zA-Z]@.
+isAsciiAlpha :: Char -> Bool
+isAsciiAlpha c = isAsciiUpper c || isAsciiLower c
+
+-- | An ASCII letter or digit, upstream's @[a-zA-Z0-9]@.
+isAsciiAlphaNum :: Char -> Bool
+isAsciiAlphaNum c = isAsciiAlpha c || isDigit c
+
 isIdentStart :: Char -> Bool
-isIdentStart c = isAlpha c || c == '_'
+isIdentStart c = isAsciiAlpha c || c == '_'
 
 isIdentChar :: Char -> Bool
-isIdentChar c = isAlphaNum c || c == '_' || c == '\'' || c == '-'
+isIdentChar c = isAsciiAlphaNum c || c == '_' || c == '\'' || c == '-'
 
 isPathChar :: Char -> Bool
-isPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
+isPathChar c = isAsciiAlphaNum c || c `elem` ("/.~_-+" :: [Char])
 
 -- | Does the maximal path-char run at the start of the input contain a
 -- @/@-segment (a slash followed by a non-slash path char)?  If so it lexes
@@ -982,41 +1023,50 @@ isPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
 -- a path, since the run's characters and its terminator are the same
 -- bytes every later check would rescan).  A run that CONTAINS a slash
 -- records nothing: a later position inside it can legitimately answer
--- differently (@a//b.c/d@ is update-then-path).  'lengthWord8' is the
--- O(1) position measure; byte counts, so it is monotone under suffixing.
-looksLikePathFrom :: Int -> Text -> (Bool, Int)
+-- differently (@a//b.c/d@ is update-then-path).  The remaining input's
+-- length is the O(1) position measure, monotone under suffixing.
+looksLikePathFrom :: Int -> ByteString -> (Bool, Int)
 looksLikePathFrom noSlashFloor input
-  | lengthWord8 input > noSlashFloor = (False, noSlashFloor)
+  | BS.length input > noSlashFloor = (False, noSlashFloor)
   | otherwise =
-      let run = T.takeWhile isPathChar input
-          (_, slashAndRest) = T.break (== '/') run
+      let run = BC.takeWhile isPathChar input
+          (_, slashAndRest) = BC.break (== '/') run
           -- Upstream's PATH_SEG rule: a run ending in @/@ immediately
           -- followed by @${@ opens an interpolated path (@./${v}@,
           -- @/${v}@, @a/${v}@), even though the slash has no segment
           -- after it yet - the segment arrives at eval.  Such runs
           -- contain a slash, so the slash-free watermark is untouched.
           interpFollows =
-            T.isSuffixOf "/" run
-              && "${" `T.isPrefixOf` T.drop (T.length run) input
-       in if T.null slashAndRest
-            then (False, lengthWord8 input - lengthWord8 run)
-            else case T.uncons (T.drop 1 slashAndRest) of
+            "/" `BS.isSuffixOf` run
+              && "${" `BS.isPrefixOf` BS.drop (BS.length run) input
+       in if BS.null slashAndRest
+            then (False, BS.length input - BS.length run)
+            else case BC.uncons (BS.drop 1 slashAndRest) of
               Just (afterSlash, _) -> (interpFollows || (isPathChar afterSlash && afterSlash /= '/'), noSlashFloor)
               Nothing -> (interpFollows, noSlashFloor)
 
 isSearchPathChar :: Char -> Bool
-isSearchPathChar c = isAlphaNum c || c `elem` ("/.~_-+" :: [Char])
+isSearchPathChar c = isAsciiAlphaNum c || c `elem` ("/.~_-+" :: [Char])
 
 -- | Chars allowed in a URI scheme after the leading letter, per upstream
 -- lexer.l: @[a-zA-Z][a-zA-Z0-9+.-]*@.
 isSchemeChar :: Char -> Bool
-isSchemeChar c = isAlphaNum c || c `elem` ("+.-" :: [Char])
+isSchemeChar c = isAsciiAlphaNum c || c `elem` ("+.-" :: [Char])
 
 -- | Chars allowed after the scheme colon, exactly upstream lexer.l's URI
 -- class @[a-zA-Z0-9%\/?:\@&=+$,-_.!~*']@.  Notably @#@ is NOT a URI char
 -- (it starts a comment mid-URI upstream), while @*@ and @'@ are.
 isUriChar :: Char -> Bool
-isUriChar c = isAlphaNum c || c `elem` ("%/?:@&=+$,-_.!~*'" :: [Char])
+isUriChar c = isAsciiAlphaNum c || c `elem` ("%/?:@&=+$,-_.!~*'" :: [Char])
+
+-- | A byte that continues a UTF-8 sequence, @10xxxxxx@.
+isContinuationByte :: Char -> Bool
+isContinuationByte c = c >= '\x80' && c < '\xC0'
+
+-- | The text of bytes an ASCII class matched.  Latin-1 agrees with ASCII
+-- on every byte such a class admits, and 'TE.decodeLatin1' is total.
+asciiText :: ByteString -> Text
+asciiText = TE.decodeLatin1
 
 -- ---------------------------------------------------------------------------
 -- Emit helpers
@@ -1025,19 +1075,19 @@ isUriChar c = isAlphaNum c || c `elem` ("%/?:@&=+$,-_.!~*'" :: [Char])
 emit1 :: LexState -> Token -> [Located] -> Either ParseError [Located]
 emit1 st tok acc =
   let located = Located (lsLine st) (lsCol st) tok
-      newSt = advanceCol 1 st {lsInput = T.drop 1 (lsInput st)}
+      newSt = advanceCol 1 st {lsInput = BS.drop 1 (lsInput st)}
    in lexNormalMode newSt (located : acc)
 
 emit2 :: LexState -> Token -> [Located] -> Either ParseError [Located]
 emit2 st tok acc =
   let located = Located (lsLine st) (lsCol st) tok
-      newSt = advanceCol 2 st {lsInput = T.drop 2 (lsInput st)}
+      newSt = advanceCol 2 st {lsInput = BS.drop 2 (lsInput st)}
    in lexNormalMode newSt (located : acc)
 
 emit3 :: LexState -> Token -> [Located] -> Either ParseError [Located]
 emit3 st tok acc =
   let located = Located (lsLine st) (lsCol st) tok
-      newSt = advanceCol 3 st {lsInput = T.drop 3 (lsInput st)}
+      newSt = advanceCol 3 st {lsInput = BS.drop 3 (lsInput st)}
    in lexNormalMode newSt (located : acc)
 
 -- ---------------------------------------------------------------------------
@@ -1047,14 +1097,37 @@ emit3 st tok acc =
 advanceCol :: Int -> LexState -> LexState
 advanceCol n st = st {lsCol = lsCol st + n}
 
-advanceBy :: Char -> LexState -> LexState
-advanceBy '\n' st = st {lsLine = lsLine st + 1, lsCol = 1}
-advanceBy _ st = st {lsCol = lsCol st + 1}
+-- | The columns a run of bytes with no newline in it takes: one per byte
+-- that does not continue a UTF-8 sequence, so one per character of valid
+-- UTF-8.
+charColumns :: ByteString -> Int
+charColumns = BC.foldl' (\n c -> if isContinuationByte c then n else n + 1) 0
 
-safeHead :: Text -> Maybe Char
-safeHead t = case T.uncons t of
-  Just (c, _) -> Just c
-  Nothing -> Nothing
+-- | Advance over a run of bytes with no newline in it.
+advanceCols :: ByteString -> LexState -> LexState
+advanceCols run st = st {lsCol = lsCol st + charColumns run}
+
+-- | Advance over a run of bytes that may hold newlines.
+advanceOver :: ByteString -> LexState -> LexState
+advanceOver run st = case BC.elemIndexEnd '\n' run of
+  Nothing -> advanceCols run st
+  Just lastNewline ->
+    st
+      { lsLine = lsLine st + BC.count '\n' run,
+        lsCol = 1 + charColumns (BS.drop (lastNewline + 1) run)
+      }
+
+-- | Advance past the byte an escape names: a newline starts a line, a byte
+-- continuing a UTF-8 sequence stays in its character's column, and any
+-- other byte takes one.
+advanceEscaped :: Char -> LexState -> LexState
+advanceEscaped c st
+  | c == '\n' = st {lsLine = lsLine st + 1, lsCol = 1}
+  | isContinuationByte c = st
+  | otherwise = st {lsCol = lsCol st + 1}
+
+safeHead :: ByteString -> Maybe Char
+safeHead = fmap fst . BC.uncons
 
 safeTail :: [a] -> [a]
 safeTail [] = []

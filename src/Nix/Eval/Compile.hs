@@ -27,6 +27,7 @@ where
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Int (Int64)
 import Data.Text (Text)
+import qualified Data.Text.Encoding as TE
 import Data.Word (Word16, Word32, Word64, Word8)
 import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 import Nix.Eval.CBytecode
@@ -94,7 +95,7 @@ import Nix.Eval.CBytecode
   )
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.SourcePos (PosIdx (..), PosRecorder, newPosRecorder, recordPos)
-import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
+import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types
   ( AttrKey (..),
     BinaryOp (..),
@@ -125,7 +126,7 @@ compileWith recorder = go
     go (ELit atom) = compileLit atom
     go (EStr parts) = compileStringParts OpStr parts
     go (EIndStr parts) = compileStringParts OpIndStr parts
-    go (EPathStr parts) = compileStringParts OpPathStr parts
+    go (EPathStr headPiece parts) = compileStringParts OpPathStr (StrLit (TE.encodeUtf8 headPiece) : parts)
     go (EVar name) = compileSymbolOp OpVar name
     go (EWithVar name) = compileSymbolOp OpWithVar name
     go (EResolvedVar level idx) =
@@ -208,11 +209,11 @@ compileWith recorder = go
       cbcEmit op 0 partCount dataOff 0 0
 
     compileOnePart :: StringPart -> IO (Word32, Word32)
-    compileOnePart (StrLit t) = do
-      Symbol sym <- symbolIntern t
+    compileOnePart (StrLit bytes) = do
+      Symbol sym <- symbolInternBytes bytes
       pure (strpartLit, sym)
-    compileOnePart (StrEsc t) = do
-      Symbol sym <- symbolIntern t
+    compileOnePart (StrEsc bytes) = do
+      Symbol sym <- symbolInternBytes bytes
       pure (strpartEsc, sym)
     compileOnePart (StrInterp expr) = do
       idx <- go expr

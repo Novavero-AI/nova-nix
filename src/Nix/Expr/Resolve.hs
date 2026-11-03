@@ -35,6 +35,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Nix.Expr.Types
 import System.FilePath (isRelative, (</>))
 
@@ -76,7 +77,7 @@ resolve stack expr = case expr of
   ELit _ -> Right expr
   EStr parts -> EStr <$> traverse (resolvePart stack) parts
   EIndStr parts -> EIndStr <$> traverse (resolvePart stack) parts
-  EPathStr parts -> EPathStr <$> traverse (resolvePart stack) parts
+  EPathStr headPiece parts -> EPathStr headPiece <$> traverse (resolvePart stack) parts
   EVar name -> resolveVar stack name
   EResolvedVar _ _ -> Right expr
   EAttrs True bindings _captureInfo
@@ -143,7 +144,7 @@ resolve stack expr = case expr of
       stack
       ( EApp
           (EApp (EVar "__findFile") (EVar "__nixPath"))
-          (EStr [StrLit name])
+          (EStr [StrLit (TE.encodeUtf8 name)])
       )
   where
     recAttrs resolved = EAttrs True resolved NoCaptureInfo
@@ -491,11 +492,11 @@ resolveRelativePaths dir = goExpr
       -- The head piece of an interpolated path is static text and gets
       -- the same absolutization as a plain literal, for the same
       -- closure-capture reason; the interpolated pieces only recurse.
-      EPathStr (StrLit headPiece : rest)
+      EPathStr headPiece rest
         | not (homeRelative headPiece),
           isRelative (T.unpack headPiece) ->
-            EPathStr (StrLit (T.pack (dir </> T.unpack headPiece)) : map goPart rest)
-      EPathStr parts -> EPathStr (map goPart parts)
+            EPathStr (T.pack (dir </> T.unpack headPiece)) (map goPart rest)
+      EPathStr headPiece parts -> EPathStr headPiece (map goPart parts)
       EVar _ -> expr
       EWithVar _ -> expr
       EResolvedVar _ _ -> expr

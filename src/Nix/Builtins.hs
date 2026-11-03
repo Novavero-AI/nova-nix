@@ -150,9 +150,9 @@ targetNixVersion = "2.24.9"
 -- a derivation to WHNF from forcing any of its inputs.  The attributes it
 -- defines are at this text's lines, which differ from upstream's, where the
 -- file's comments come first.
-derivationWrapperSource :: Text
+derivationWrapperSource :: ByteString
 derivationWrapperSource =
-  T.unlines
+  BC.unlines
     [ "drvAttrs @ { outputs ? [ \"out\" ], ... }:",
       "",
       "let",

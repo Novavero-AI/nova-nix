@@ -39,6 +39,7 @@ module Nix.Expr.Types
   )
 where
 
+import Data.ByteString (ByteString)
 import Data.Int (Int64)
 import Data.Text (Text)
 
@@ -54,15 +55,16 @@ data NixAtom
 
 -- | A part of an interpolated string (@"hello ${name}"@).
 data StringPart
-  = -- | Literal text.
-    StrLit !Text
-  | -- | Resolved escape text inside an indented string (@'''@, @''$@,
+  = -- | Literal bytes, the source's with escapes resolved, which are the
+    -- bytes the value holds whether or not they are UTF-8.
+    StrLit !ByteString
+  | -- | Resolved escape bytes inside an indented string (@'''@, @''$@,
     -- @''${@, @''\x@).  Kept apart from 'StrLit' because upstream's lexer
     -- emits an escape without the hasIndentation mark: the indentation
     -- scan skips it (it only ends a line's leading whitespace) while the
     -- strip runs over it as over any literal, so an escaped newline
     -- starts a line whose spaces are stripped but were never measured.
-    StrEsc !Text
+    StrEsc !ByteString
   | -- | Interpolated expression (@${expr}@).
     StrInterp !Expr
   deriving (Eq, Show)
@@ -201,14 +203,16 @@ data Expr
     EStr ![StringPart]
   | -- | Indented string (double single-quoted).
     EIndStr ![StringPart]
-  | -- | Path literal with interpolations (@.\/${v}\/x@).  The first
-    -- part is always the literal head piece.  Evaluates to a path:
-    -- the pieces concatenate with no separator, each interpolation
-    -- coerced as a path segment (a path contributes its text without
-    -- a store copy; a string carrying store-path context is refused),
-    -- and the whole is canonicalized - the same semantics as the
-    -- @+@ chain @head + s1 + s2@, which upstream desugars it to.
-    EPathStr ![StringPart]
+  | -- | Path literal with interpolations (@.\/${v}\/x@): the literal
+    -- head piece, text because a relative one is joined to the base
+    -- directory ('Nix.Expr.Resolve.resolveRelativePaths'), and the pieces
+    -- after it.  Evaluates to a path: the pieces concatenate with
+    -- no separator, each interpolation coerced as a path segment (a path
+    -- contributes its text without a store copy; a string carrying
+    -- store-path context is refused), and the whole is canonicalized -
+    -- the same semantics as the @+@ chain @head + s1 + s2@, which
+    -- upstream desugars it to.
+    EPathStr !Text ![StringPart]
   | -- | Variable reference.
     EVar !Text
   | -- | Attribute set: @{ bindings }@ or @rec { bindings }@.

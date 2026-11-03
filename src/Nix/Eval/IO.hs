@@ -67,7 +67,7 @@ import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternByte
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
-import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope, readFileAutoEncoding)
+import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Store (unpackNarEntry)
 import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -344,7 +344,7 @@ instance MonadEval EvalIO where
     case Map.lookup target cache of
       Just cached -> pure cached
       Nothing -> do
-        source <- sourceIO ReadFile (T.pack target) (readFileAutoEncoding ioTarget)
+        source <- sourceIO ReadFile (T.pack target) (BS.readFile ioTarget)
         let fileDir = takeDirectory target
         case parseNixWithScope (rootScopeNames policy) fileDir (SourceFile (T.pack target)) source of
           Left err -> rejectSource "import" target err
@@ -492,7 +492,7 @@ instance MonadEval EvalIO where
     searchPaths <- EvalIO (asks esSearchPaths)
     policy <- EvalIO (asks esPolicy)
     (target, ioTarget) <- resolveImportTarget baseDir rawPath
-    source <- sourceIO ReadFile (T.pack target) (readFileAutoEncoding ioTarget)
+    source <- sourceIO ReadFile (T.pack target) (BS.readFile ioTarget)
     let fileDir = takeDirectory target
     case parseNixWithScope (Set.union (Set.fromList (map fst scope)) (rootScopeNames policy)) fileDir (SourceFile (T.pack target)) source of
       Left err -> rejectSource "scopedImport" target err
