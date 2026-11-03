@@ -73,7 +73,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word8)
-import Nix.Store.Path (StoreDir (..), StorePath, StorePathNameError, checkStorePathName, defaultStoreDir, storePathToText)
+import Nix.Store.Path (BadStorePath (BadStorePath), StoreDir (..), StorePath, checkStorePathName, defaultStoreDir, storePathToText)
 import Nix.Store.Path.Internal (StorePath (StorePath))
 import NovaCache.Base32 (encode)
 import NovaCache.Hash (formatNixHash, hashBytes, parseNixHash)
@@ -239,26 +239,27 @@ base64HashLen n = 4 * ((n + 2) `div` 3)
 -- for recursive fixed-output paths.
 --
 -- 'Left' when the name breaks the store-path name rules
--- ('checkStorePathName').  Construction validates like the parse boundary
--- does, so every 'StorePath' that exists has a clean name: the write sinks
--- downstream (store copies, the builder's delete-and-move) never see a
--- path that resolves outside the store root, and no sink needs its own
--- ad hoc name check.
-makeStorePath :: StoreDir -> Text -> BS.ByteString -> Text -> Either StorePathNameError StorePath
+-- ('checkStorePathName'), carrying the hash part the path would have had:
+-- upstream hashes before it checks the name, and its refusal names both.
+-- Construction validates like the parse boundary does, so every
+-- 'StorePath' that exists has a clean name: the write sinks downstream
+-- (store copies, the builder's delete-and-move) never see a path that
+-- resolves outside the store root, and no sink needs its own ad hoc name
+-- check.
+makeStorePath :: StoreDir -> Text -> BS.ByteString -> Text -> Either BadStorePath StorePath
 makeStorePath (StoreDir dir) typ innerDigest name =
-  case checkStorePathName name of
-    Left err -> Left err
-    Right () ->
-      let preimage =
-            typ
-              <> ":sha256:"
-              <> bytesToHexText innerDigest
-              <> ":"
-              <> T.pack dir
-              <> ":"
-              <> name
-          compressed = compressHash storePathHashBytes (sha256Digest (encodeUtf8 preimage))
-       in Right (StorePath (encode compressed) name)
+  let preimage =
+        typ
+          <> ":sha256:"
+          <> bytesToHexText innerDigest
+          <> ":"
+          <> T.pack dir
+          <> ":"
+          <> name
+      hashPart = encode (compressHash storePathHashBytes (sha256Digest (encodeUtf8 preimage)))
+   in case checkStorePathName name of
+        Left err -> Left (BadStorePath hashPart err)
+        Right () -> Right (StorePath hashPart name)
 
 -- | Construct a text store path (used for @.drv@ files and @builtins.toFile@).
 -- The references are embedded in the @type@ string - @\"text\"@ followed by
@@ -266,7 +267,7 @@ makeStorePath (StoreDir dir) typ innerDigest name =
 -- on the paths of all its inputs.  @contentsDigest@ is the SHA-256 of the file
 -- contents (the ATerm, for a @.drv@).  'Left' on an invalid name, as
 -- 'makeStorePath'.
-makeTextPath :: Text -> BS.ByteString -> [StorePath] -> Either StorePathNameError StorePath
+makeTextPath :: Text -> BS.ByteString -> [StorePath] -> Either BadStorePath StorePath
 makeTextPath name contentsDigest refs =
   let sortedRefs = Set.toAscList (Set.fromList refs)
       typ = "text" <> T.concat [":" <> storePathToText defaultStoreDir r | r <- sortedRefs]
@@ -280,7 +281,7 @@ makeTextPath name contentsDigest refs =
 -- * otherwise, @makeStorePath \"output:out\" sha256(\"fixed:out:\" prefix algo \":\" hex \":\") name@
 --
 -- 'Left' on an invalid name, as 'makeStorePath'.
-makeFixedOutputPath :: Text -> Text -> Text -> BS.ByteString -> Either StorePathNameError StorePath
+makeFixedOutputPath :: Text -> Text -> Text -> BS.ByteString -> Either BadStorePath StorePath
 makeFixedOutputPath name algo mode foHashDigest
   | algo == "sha256" && mode == "recursive" =
       makeStorePath defaultStoreDir "source" foHashDigest name
@@ -296,7 +297,7 @@ makeFixedOutputPath name algo mode foHashDigest
 -- composed name is what gets validated - a name and output each clean on
 -- their own can still compose past the length limit, so the check belongs
 -- here, after composition.  'Left' as 'makeStorePath'.
-makeOutputPath :: Text -> BS.ByteString -> Text -> Either StorePathNameError StorePath
+makeOutputPath :: Text -> BS.ByteString -> Text -> Either BadStorePath StorePath
 makeOutputPath outName moduloDigest drvName =
   let pathName = if outName == "out" then drvName else drvName <> "-" <> outName
    in makeStorePath defaultStoreDir ("output:" <> outName) moduloDigest pathName

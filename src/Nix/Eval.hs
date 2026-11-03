@@ -4470,11 +4470,11 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- Path construction returns Left on a name the store rules reject; the
   -- early field checks above make that unreachable here except through
   -- composition (drvName <> ".drv", drvName-output past the length cap),
-  -- which only the constructors see.
-  let drvContext = "derivation \"" <> drvName <> "\""
+  -- which only the constructors see, and which they refuse in upstream's
+  -- words, naming the path.
   (outPaths, completeDrv, moduloHash) <- case mFixed of
     Just (foAlgo, foMode, foDigest) -> do
-      foPath <- storePathOrThrow drvContext (makeFixedOutputPath drvName foAlgo foMode foDigest)
+      foPath <- storePathOrThrow (makeFixedOutputPath drvName foAlgo foMode foDigest)
       let foPathText = storePathToText defaultStoreDir foPath
           algoField = (if foMode == "recursive" then "r:" else "") <> foAlgo
           foHashHex = bytesToHexText foDigest
@@ -4492,10 +4492,12 @@ builtinDerivationStrict (VAttrs attrs) = do
           maskedDrv = mkDrv (map maskedOutput outputNames) maskedEnv
           -- Masked modulo hash yields this derivation's own output paths.
           moduloMasked = sha256Digest (toATermForHash True (Just inputSubst) maskedDrv)
+      -- In name order, as upstream walks its output set, so a refusal
+      -- names the output upstream's names.
       outStorePaths <-
         mapM
-          (\n -> (,) n <$> storePathOrThrow drvContext (makeOutputPath n moduloMasked drvName))
-          outputNames
+          (\n -> (,) n <$> storePathOrThrow (makeOutputPath n moduloMasked drvName))
+          (sort outputNames)
       let outPathTexts = [(n, storePathToText defaultStoreDir sp) | (n, sp) <- outStorePaths]
           realEnv = foldr (\(n, t) e -> Map.insert n (TE.encodeUtf8 t) e) baseEnv outPathTexts
           contents = mkDrv [DerivationOutput n sp "" "" | (n, sp) <- outStorePaths] realEnv
@@ -4510,7 +4512,7 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- eval guarantees every transitive input is recorded by the time a
   -- dependent is.
   let aterm = toATerm completeDrv
-  drvSP <- storePathOrThrow drvContext (makeTextPath drvFileName (sha256Digest aterm) drvRefs)
+  drvSP <- storePathOrThrow (makeTextPath drvFileName (sha256Digest aterm) drvRefs)
   let drvPathText = storePathToText defaultStoreDir drvSP
   cacheDrvHash drvPathText (bytesToHexText moduloHash)
   recordDrvAterm drvPathText aterm
@@ -5618,13 +5620,19 @@ builtinPath (VAttrs attrs) = do
           pinText <- decodedText "builtins.path" pin
           Just <$> decodeSha256Pin "builtins.path" pinText
         other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
+  filterFn <- traverse force (attrSetLookup "filter" attrs)
   let name = fromMaybe (canonBaseName pathStr) nameOverride
       pinSubject = "builtins.path: " <> pathStr
-  storePathText <- case attrSetLookup "filter" attrs of
+  -- A pinned copy's path follows from the pin.  Upstream's addPath builds
+  -- it once prim_path has forced every argument and before it reads the
+  -- tree (primops.cc at 2.24.9), so a name it refuses is refused under the
+  -- pinned hash, before the filter is applied.
+  forM_ expectedDigest $ \expected ->
+    storePathOrThrow (makeFixedOutputPath name "sha256" "recursive" expected)
+  storePathText <- case filterFn of
     Nothing -> copyPathToStore pathStr name (fmap (pinSubject,) expectedDigest)
-    Just filterThunk -> do
-      filterFn <- force filterThunk
-      narBytes <- filteredSourceNar filterFn pathStr
+    Just keep -> do
+      narBytes <- filteredSourceNar keep pathStr
       -- The sha256 pin applies to the FILTERED tree, as upstream.
       let filteredDigest = sha256Digest narBytes
       case expectedDigest of

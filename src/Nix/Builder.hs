@@ -95,7 +95,7 @@ import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, c
 import Nix.Realise (RealiseEffects (..), Realised (..), SubstEffects (..), realise)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryReferences, registerPaths, releasePathLock, rewriteStoreHashes, scanReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, unStoreDir)
+import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, unStoreDir)
 import Nix.Substituter (CacheConfig, SubstResult (..), queryReferencesWith, trySubstituteWith)
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
@@ -393,7 +393,7 @@ data OutputPlan = OutputPlan
   }
 
 -- | Plan one output, given whether its final path is already valid.
-outputPlan :: (DerivationOutput, Bool) -> Either StorePathNameError OutputPlan
+outputPlan :: (DerivationOutput, Bool) -> Either BadStorePath OutputPlan
 outputPlan (out, valid)
   | not valid = Right (OutputPlan (doName out) (doPath out) (doPath out) False)
   | otherwise = do
@@ -410,7 +410,7 @@ outputPlan (out, valid)
 -- Upstream also keys on the @.drv@ path; that is not reachable here, and
 -- the output path already names one output of one derivation, so the
 -- result is just as unique.
-fallbackOutputPath :: StorePath -> Either StorePathNameError StorePath
+fallbackOutputPath :: StorePath -> Either BadStorePath StorePath
 fallbackOutputPath sp =
   makeStorePath
     defaultStoreDir

@@ -421,15 +421,13 @@ instance MonadEval EvalIO where
       Nothing -> do
         -- Upstream names the copy baseNameOf(canonicalized path); path
         -- values arrive canonicalized, so the last segment is the name.
-        -- The name is checked before the tree read: it derives from the
-        -- path alone, and the tree behind it can be arbitrarily large.
+        -- A root, which has none, is refused before its tree is read.
+        -- A name the store-path rules refuse is refused only once the tree
+        -- is hashed, as upstream's is: the refusal names the path the copy
+        -- would have had.
         let name = canonBaseName rawPath
-            copyContext = "cannot copy '" <> rawPath <> "' to the store"
         when (T.null name) $
-          throwEvalError (copyContext <> ": the path has no base name")
-        case SP.checkStorePathName name of
-          Left err -> throwEvalError (copyContext <> ": " <> SP.storePathNameErrorText err)
-          Right () -> pure ()
+          throwEvalError ("cannot copy '" <> rawPath <> "' to the store: the path has no base name")
         accessPath rawPath
         -- The tree behind the path's symlinks, under the path's own name:
         -- upstream's copyPathToStore stores path.resolveSymlinks() under
@@ -442,7 +440,7 @@ instance MonadEval EvalIO where
         -- restore reads it again.
         entry <- serialiseSource resolvedText processCaseHack resolvedSource
         let narDigest = sha256Digest (NAR.serialise entry)
-        sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
+        sp <- storePathOrThrow (makeFixedOutputPath name "sha256" "recursive" narDigest)
         let spText = canonicalStorePathText sp
         EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath spText)))
         -- The copy is readable afterwards, as upstream's copyPathToStore
@@ -461,7 +459,7 @@ instance MonadEval EvalIO where
     -- hashed and written as-is: no encoding step, and no text-mode IO
     -- (which would CRLF-translate on Windows and store bytes that no
     -- longer match the hash that named the path).
-    sp <- storePathOrThrow "builtins.toFile" (makeTextPath name (sha256Digest contents) refs)
+    sp <- storePathOrThrow (makeTextPath name (sha256Digest contents) refs)
     filePath <- evalFilePath sp
     let storePath = canonicalStorePathText sp
     wrapIO $ do
@@ -553,17 +551,10 @@ instance MonadEval EvalIO where
   removeScratchDir dir = wrapIO (Dir.removePathForcibly (T.unpack dir))
 
   copyPathToStore srcPath name expectedSha256 = do
-    -- The name is checked before the tree read: it arrives independently
-    -- of the source, and the tree can be arbitrarily large.
-    let copyContext = "cannot copy '" <> srcPath <> "' to the store"
-    case SP.checkStorePathName name of
-      Left err -> throwEvalError (copyContext <> ": " <> SP.storePathNameErrorText err)
-      Right () -> pure ()
     -- Content-addressed like upstream addToStore: recursive NAR sha256
     -- under the caller's name.  Same content means same path, so the
-    -- existence check in copyToStoreIfMissing is sound - changed source
-    -- content can never serve stale bytes from an earlier copy (the old
-    -- scheme hashed the path STRING, so it did exactly that).
+    -- existence check in 'unpackToStoreVerified' is sound: changed source
+    -- content can never serve stale bytes from an earlier copy.
     -- The tree behind the root's symlinks, under the root's own name, as
     -- upstream's copyPathToStore and addPath store path.resolveSymlinks()
     -- under path.baseName(); the walk checks the policy on the way.
@@ -583,7 +574,9 @@ instance MonadEval EvalIO where
                   <> bytesToHexText narDigest
               )
       _ -> pure ()
-    sp <- storePathOrThrow copyContext (makeFixedOutputPath name "sha256" "recursive" narDigest)
+    -- The name is refused only once the tree is hashed, as upstream's is:
+    -- the refusal names the path the copy would have had.
+    sp <- storePathOrThrow (makeFixedOutputPath name "sha256" "recursive" narDigest)
     destFilePath <- evalFilePath sp
     let destPath = canonicalStorePathText sp
     -- Restored from the entry just hashed, not copied from the source:
@@ -666,7 +659,7 @@ instance MonadEval EvalIO where
       -- boundary rather than trusting the round trip.
       Left err -> throwEvalError ("builtins.path: internal NAR round-trip error: " <> T.pack err)
       Right entry -> do
-        sp <- storePathOrThrow "builtins.path" (makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes))
+        sp <- storePathOrThrow (makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes))
         destFilePath <- evalFilePath sp
         let destPath = canonicalStorePathText sp
         -- Raised here rather than inside 'wrapIO', which would render
@@ -679,7 +672,7 @@ instance MonadEval EvalIO where
   addFixedOutputFile name bytes = do
     -- Canonical fixed-output path: a sha256-pinned fetch must land at the same
     -- store path C++ Nix computes, so it stays reproducible and cache-compatible.
-    sp <- storePathOrThrow "builtins.fetchurl" (makeFixedOutputPath name "sha256" "flat" (sha256Digest bytes))
+    sp <- storePathOrThrow (makeFixedOutputPath name "sha256" "flat" (sha256Digest bytes))
     filePath <- evalFilePath sp
     let storePath = canonicalStorePathText sp
     wrapIO $ do
