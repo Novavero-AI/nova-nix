@@ -10537,7 +10537,7 @@ testStage0Pe32Chain = do
           runTest "the chain's leaves are the seed and the four source archives, all fixed-output" $
             assertEqual
               "leaves"
-              (sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-f0b1726.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "stage0-pe32-4b5915c.tar.gz"], True)
+              (sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-f0b1726.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "stage0-pe32-28ec2d2.tar.gz"], True)
               ( sort (map nameOf leaves),
                 all (\drv -> drvBuilder drv == fetchurlBuilder && isFixedOutput drv) leaves
               ),
