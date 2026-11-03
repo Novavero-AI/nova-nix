@@ -45,6 +45,8 @@ module Nix.Builder
     defaultBuildConfig,
 
     -- * Pure pieces (exported for tests)
+    AttrsDelivery (..),
+    attrsDelivery,
     BuilderSpawn (..),
     buildPath,
     closureUnder,
@@ -75,7 +77,7 @@ import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust)
+import Data.Maybe (catMaybes, fromMaybe, isJust, maybeToList)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -90,13 +92,14 @@ import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimi
 import Nix.DependencyGraph (TopoResult (..), buildDepGraph, topoSort)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fromATerm, platformToText)
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
-import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
+import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Realise (RealiseEffects (..), Realised (..), SubstEffects (..), realise)
-import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryReferences, registerPaths, releasePathLock, rewriteStoreHashes, scanReferences, volumeCaseHack)
+import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, unStoreDir)
 import Nix.Substituter (CacheConfig, SubstResult (..), queryReferencesWith, trySubstituteWith)
+import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
 import qualified System.Environment
@@ -197,6 +200,23 @@ envNixAttrsShFile = "NIX_ATTRS_SH_FILE"
 attrsJsonFileName, attrsShellFileName :: FilePath
 attrsJsonFileName = ".attrs.json"
 attrsShellFileName = ".attrs.sh"
+
+-- | The attribute listing the attributes a derivation passes as files.
+envPassAsFile :: Text
+envPassAsFile = "passAsFile"
+
+-- | What upstream adds to an attribute's name to name the variable holding
+-- the path of its file, and what it puts before the hash of that name to
+-- name the file.
+passedFileVarSuffix, passedFilePrefix :: Text
+passedFileVarSuffix = "Path"
+passedFilePrefix = ".attr-"
+
+-- | The bytes upstream's @tokenizeString@ splits a list attribute at by
+-- default (@src\/libutil\/util.hh@ at 2.24.9).  Not 'isSpace': a form feed,
+-- a vertical tab or a non-ASCII space does not separate there.
+tokenSeparators :: BS.ByteString
+tokenSeparators = " \t\n\r"
 
 -- | The fixed build timestamp handed to every builder: 1980-01-01 UTC.
 -- Determinism-aware tools (binutils @ld@ writes it into the PE header
@@ -504,8 +524,10 @@ runPlannedBuild config store drv inputPaths buildDir plans = do
       -- 4. Decode builder/args/env for the spawn boundary.  Derivation
       --    strings are BYTES (identity); spawning a process needs real
       --    text, so invalid UTF-8 in any of them is a clean build
-      --    failure, never a mojibake spawn.  The builtin builders skip
-      --    this - they read the byte fields directly.
+      --    failure, never a mojibake spawn.  An attribute that reaches
+      --    the builder as a file stays bytes ('attrsDelivery').  The
+      --    builtin builders skip this - they read the byte fields
+      --    directly.
       exitResult <- case drvBuilder drv of
         b
           | b == builtinFetchurlBuilder -> runBuiltinFetchurl (bcFetchRetry config) drv outputDirs
@@ -523,12 +545,9 @@ runPlannedBuild config store drv inputPaths buildDir plans = do
                   )
               )
           (_, Left errMsg) -> pure (Left (1, errMsg))
-          (spawn, Right (builderText, argTexts, decodedEnv)) ->
-            let -- onStore first, so nothing a placeholder expands to gets
-                -- rewritten a second time.
-                rewrite = rewritePlaceholders outputDirs . onStore config
-                builderPath = T.unpack (onStore config builderText)
-                builderArgs = map (T.unpack . rewrite) argTexts
+          (spawn, Right (builderText, argTexts)) ->
+            let builderPath = T.unpack (onStore config builderText)
+                builderArgs = map (T.unpack . buildRewrite config outputDirs) argTexts
                 -- Env still names the real builder - a launcher only
                 -- changes what's spawned, not what the derivation says.
                 (spawnPath, spawnArgs) = case spawn of
@@ -542,8 +561,8 @@ runPlannedBuild config store drv inputPaths buildDir plans = do
                 impureVars delivery
                   | any carriesHash (drvOutputs drv) = adImpureEnvVars delivery
                   | otherwise = Right []
-             in case attrsDelivery rewrite buildDir outputDirs decodedEnv of
-                  Left err -> pure (Left (1, "cannot process " <> structuredAttrsKey <> " attribute of '" <> formatDrvName drv <> "': " <> err))
+             in case attrsDelivery config drv buildDir outputDirs of
+                  Left err -> pure (Left (1, err))
                   Right delivery -> case impureVars delivery of
                     Left err -> pure (Left (1, err))
                     Right passed -> do
@@ -585,22 +604,26 @@ runPlannedBuild config store drv inputPaths buildDir plans = do
     )
     `onException` cleanupUnlessCommitted
 
--- | Decode a derivation's builder path, arguments, and env values from
--- their identity bytes to the 'Text' the process-spawn boundary needs.
--- @Left@ names the offending field.
-decodeBuilderStrings :: Derivation -> Either Text (Text, [Text], Map Text Text)
+-- | Decode a derivation's builder path and arguments from their identity
+-- bytes to the 'Text' the process-spawn boundary needs.  @Left@ names the
+-- offending field.  The environment is decoded where 'attrsDelivery'
+-- decides what of it reaches the builder as variables.
+decodeBuilderStrings :: Derivation -> Either Text (Text, [Text])
 decodeBuilderStrings drv = do
-  builderText <- decodeField "the builder path" (drvBuilder drv)
-  argTexts <- traverse (decodeField "a builder argument") (drvArgs drv)
-  envTexts <-
-    Map.traverseWithKey
-      (\key val -> decodeField ("environment variable '" <> key <> "'") val)
-      (drvEnv drv)
-  pure (builderText, argTexts, envTexts)
-  where
-    decodeField what bytes = case TE.decodeUtf8' bytes of
-      Right t -> Right t
-      Left _ -> Left ("cannot spawn builder: " <> what <> " contains invalid UTF-8")
+  builderText <- decodeSpawnField "the builder path" (drvBuilder drv)
+  argTexts <- traverse (decodeSpawnField "a builder argument") (drvArgs drv)
+  pure (builderText, argTexts)
+
+-- | Decode one derivation string for the spawn, @what@ naming it in the
+-- failure.
+decodeSpawnField :: Text -> BS.ByteString -> Either Text Text
+decodeSpawnField what bytes = case TE.decodeUtf8' bytes of
+  Right t -> Right t
+  Left _ -> Left ("cannot spawn builder: " <> what <> " contains invalid UTF-8")
+
+-- | 'decodeSpawnField' for an environment variable.
+decodeVariable :: Text -> BS.ByteString -> Either Text Text
+decodeVariable name = decodeSpawnField ("environment variable '" <> name <> "'")
 
 -- ---------------------------------------------------------------------------
 -- Input validation
@@ -610,9 +633,13 @@ decodeBuilderStrings drv = do
 -- canonical @\/nix\/store@ spelling) to where this machine actually keeps
 -- them, at the spawn boundary. A no-op when the two coincide.
 onStore :: BuildConfig -> Text -> Text
-onStore config
-  | storeDirText == defaultStoreDirText = id
-  | otherwise = T.replace (defaultStoreDirText <> "/") (storeDirText <> "/")
+onStore config = maybe id (uncurry T.replace) (storeRewrite config)
+
+-- | The replacement 'onStore' makes, when the two spellings differ.
+storeRewrite :: BuildConfig -> Maybe (Text, Text)
+storeRewrite config
+  | storeDirText == defaultStoreDirText = Nothing
+  | otherwise = Just (defaultStoreDirText <> "/", storeDirText <> "/")
   where
     storeDirText = T.pack (unStoreDir (bcStoreDir config))
 
@@ -731,9 +758,30 @@ cleanupBuildDir dir = do
 -- only @drv->args@ (local-derivation-goal.cc:2170,2176).
 rewritePlaceholders :: [(Text, FilePath)] -> Text -> Text
 rewritePlaceholders outputDirs value =
-  foldr substitute value outputDirs
-  where
-    substitute (name, path) = T.replace (hashPlaceholder name) (T.pack path)
+  foldr (uncurry T.replace) value (placeholderRewrites outputDirs)
+
+-- | The replacements 'rewritePlaceholders' makes, one per output.
+placeholderRewrites :: [(Text, FilePath)] -> [(Text, Text)]
+placeholderRewrites outputDirs = [(hashPlaceholder name, T.pack path) | (name, path) <- outputDirs]
+
+-- | The build's rewrite of a derivation string: store paths to where this
+-- machine keeps them, then each output's placeholder to its build-time
+-- path.  'onStore' goes first, so nothing a placeholder expands to is
+-- rewritten a second time.
+buildRewrite :: BuildConfig -> [(Text, FilePath)] -> Text -> Text
+buildRewrite config outputDirs = rewritePlaceholders outputDirs . onStore config
+
+-- | 'buildRewrite' over bytes, for an attribute that reaches the builder
+-- as a file and so need not be text.  The replacements go in the order
+-- 'buildRewrite' makes them ('rewritePlaceholders' folds from the right),
+-- and on UTF-8 the two agree: an encoded needle matches only at a
+-- character boundary.
+buildRewriteBytes :: BuildConfig -> [(Text, FilePath)] -> BS.ByteString -> BS.ByteString
+buildRewriteBytes config outputDirs =
+  rewriteBytes
+    [ (TE.encodeUtf8 from, TE.encodeUtf8 to)
+    | (from, to) <- maybeToList (storeRewrite config) <> reverse (placeholderRewrites outputDirs)
+    ]
 
 -- | Apply a build-time rewrite to an environment's names as well as its
 -- values.  Upstream rewrites the whole @name=value@ string
@@ -756,6 +804,7 @@ data AttrsDelivery = AttrsDelivery
     -- derivation, so a malformed one fails only such a build, as upstream.
     adImpureEnvVars :: !(Either Text [Text])
   }
+  deriving (Eq, Show)
 
 -- | How the derivation's attributes reach the builder: as environment
 -- variables, outputs included, or for a derivation carrying structured
@@ -764,21 +813,38 @@ data AttrsDelivery = AttrsDelivery
 -- environment (upstream's @initTmpDir@ and @writeStructuredAttrs@,
 -- local-derivation-goal.cc at 2.24.9).
 --
--- @rewrite@ is the build's rewrite of store paths and placeholders.  It
--- applies to the shell file's text as upstream applies it, after
--- rendering; the JSON file's strings take it before they are escaped, so
--- a store directory holding backslashes still yields JSON.
-attrsDelivery :: (Text -> Text) -> FilePath -> [(Text, FilePath)] -> Map Text Text -> Either Text AttrsDelivery
-attrsDelivery rewrite buildDir outputDirs decodedEnv = case Map.lookup structuredAttrsKey decodedEnv of
-  Nothing ->
+-- Without structured attributes, each attribute @passAsFile@ names
+-- ('splitPassAsFile') is written to a file in the build directory instead,
+-- holding the bytes its variable would have held, and @\<name\>Path@
+-- names the file.  An attribute that is itself called @\<name\>Path@
+-- keeps its own value, as it does upstream, where it is assigned later.
+-- The variable joins the build directory and the file name with the
+-- platform's separator where upstream writes @\/@, so on Windows it is
+-- spelled as @NIX_BUILD_TOP@ is.  Structured attributes need no such
+-- escape from the environment, and upstream ignores @passAsFile@ there.
+--
+-- The build's rewrite ('buildRewrite') applies to the shell file's text
+-- as upstream applies it, after rendering; the JSON file's strings take it
+-- before they are escaped, so a store directory holding backslashes still
+-- yields JSON.
+attrsDelivery :: BuildConfig -> Derivation -> FilePath -> [(Text, FilePath)] -> Either Text AttrsDelivery
+attrsDelivery config drv buildDir outputDirs = case Map.lookup structuredAttrsKey env of
+  Nothing -> do
+    let (variables, passed) = splitPassAsFile env
+        passedPath name = buildDir </> passedFileName name
+        pathVars = Map.fromList [(name <> passedFileVarSuffix, T.pack (passedPath name)) | name <- Map.keys passed]
+    decoded <- Map.traverseWithKey decodeVariable variables
     Right
       AttrsDelivery
-        { adEnv = unionEnvs [outputEnv, rewriteEnv rewrite decodedEnv],
-          adFiles = [],
-          adImpureEnvVars = Right (T.words (Map.findWithDefault "" envImpureEnvVars decodedEnv))
+        { adEnv = unionEnvs [Map.withoutKeys outputEnv (Map.keysSet passed), rewriteEnv rewrite (unionEnvs [decoded, pathVars])],
+          adFiles = [(passedPath name, passedContents name value) | (name, value) <- Map.toList passed],
+          -- Read from the whole environment, as upstream's getStringsAttr
+          -- reads it, so passing the attribute as a file does not drop it.
+          adImpureEnvVars = T.words <$> decodeVariable envImpureEnvVars (Map.findWithDefault "" envImpureEnvVars env)
         }
-  Just encoded -> do
-    attrs <- decodeStructuredAttrs encoded
+  Just encodedBytes -> do
+    encoded <- decodeVariable structuredAttrsKey encodedBytes
+    attrs <- first (("cannot process " <> structuredAttrsKey <> " attribute of '" <> formatDrvName drv <> "': ") <>) (decodeStructuredAttrs encoded)
     let prepared = withOutputPlaceholders (map fst outputDirs) attrs
         jsonFile = buildDir </> attrsJsonFileName
         shellFile = buildDir </> attrsShellFileName
@@ -792,7 +858,36 @@ attrsDelivery rewrite buildDir outputDirs decodedEnv = case Map.lookup structure
           adImpureEnvVars = fromMaybe [] <$> stringsAttr envImpureEnvVars attrs
         }
   where
+    env = drvEnv drv
+    rewrite = buildRewrite config outputDirs
     outputEnv = Map.fromList [(name, T.pack path) | (name, path) <- outputDirs]
+    -- An output's variable is the path it is written to, which is not
+    -- the derivation's value when that output is already valid, so its
+    -- file holds the same path.
+    passedContents name value =
+      maybe (buildRewriteBytes config outputDirs value) (TE.encodeUtf8 . T.pack) (lookup name outputDirs)
+
+-- | Upstream's @passAsFile@: split off the attributes the @passAsFile@
+-- attribute names, as files rather than variables, leaving the rest.  A
+-- name with no attribute behind it is ignored, and @passAsFile@ itself
+-- stays a variable unless it names itself.  Names are compared as bytes,
+-- as upstream compares them.
+splitPassAsFile :: Map Text BS.ByteString -> (Map Text BS.ByteString, Map Text BS.ByteString)
+splitPassAsFile env = (variables, passed)
+  where
+    named = Set.fromList (attrTokens (Map.findWithDefault "" envPassAsFile env))
+    (passed, variables) = Map.partitionWithKey (\name _ -> Set.member (TE.encodeUtf8 name) named) env
+
+-- | Upstream's @tokenizeString@ with its default separators: the
+-- non-empty runs between 'tokenSeparators'.
+attrTokens :: BS.ByteString -> [BS.ByteString]
+attrTokens = filter (not . BS.null) . BS.splitWith (`BS.elem` tokenSeparators)
+
+-- | The file an attribute passed as a file is written to: upstream's
+-- @.attr-@ and the SHA-256 of the attribute's name in Nix base-32, so
+-- whatever the name holds, the file is one entry of the build directory.
+passedFileName :: Text -> FilePath
+passedFileName name = T.unpack (passedFilePrefix <> Nix32.encode (sha256Digest (TE.encodeUtf8 name)))
 
 -- | Build the process environment from the derivation's contribution
 -- ('adEnv') + standard vars.
