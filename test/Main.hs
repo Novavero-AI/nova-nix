@@ -49,7 +49,7 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
 import Nix.Config (NixConfig (..))
@@ -8544,6 +8544,101 @@ testDependentBuildIO = do
               Fail ("dependency-aware build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
 
+-- | A random reference graph over a few nodes, cycles and self-references
+-- included, with roots drawn from it.
+genReferenceGraph :: QC.Gen (Map.Map Int [Int], [Int])
+genReferenceGraph = do
+  size <- QC.chooseInt (1, 12)
+  references <- traverse (\node -> (,) node <$> QC.sublistOf [0 .. size - 1]) [0 .. size - 1]
+  roots <- QC.sublistOf [0 .. size - 1]
+  pure (Map.fromList references, roots)
+
+-- | Reference scanning covers the closure of a build's inputs, upstream's
+-- @inputPaths@: an output records a path its inputs reach only through
+-- their references, from an input derivation's output or from an input
+-- source, and a collection keeps that path while the output is rooted.  A
+-- valid path outside the closure is not recorded, and neither is the input
+-- derivation's @.drv@.
+testReferenceClosureIO :: IO [Bool]
+testReferenceClosureIO = do
+  putStrLn "builder/reference-closure"
+  shell <- findTestShell
+  buildTmp <- (</> "nova-nix-test-reference-closure-tmp") <$> getTemporaryDirectory
+  closureLaw <-
+    runTestM "closureUnder is the least set holding the roots and closed under references" $ do
+      result <-
+        QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+          QC.forAll genReferenceGraph $ \(references, roots) ->
+            let referencesOf node = Map.findWithDefault [] node references
+                fixpoint reached
+                  | next == reached = reached
+                  | otherwise = fixpoint next
+                  where
+                    next = reached <> Set.fromList (concatMap referencesOf (Set.toList reached))
+             in runIdentity (closureUnder (Identity . referencesOf) roots) QC.=== fixpoint (Set.fromList roots)
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+  built <- withTempStore $ \store -> do
+    let sd = stDir store
+        onDisk = storePathToFilePath sd
+        pathText = T.pack . onDisk
+        plant sp = do
+          createDirectoryIfMissing True (onDisk sp)
+          BS.writeFile (onDisk sp </> "data") (TE.encodeUtf8 (spName sp))
+        registration sp = PathRegistration sp ("sha256:" <> T.replicate 52 "0") 1 Nothing
+        -- The input derivation's output records libRuntime, and the input
+        -- source records srcRuntime.
+        lib = StorePath (T.replicate 32 "k") "closure-lib"
+        libRuntime = StorePath (T.replicate 32 "l") "closure-lib-runtime"
+        libDrvPath = StorePath (T.replicate 32 "m") "closure-lib.drv"
+        src = StorePath (T.replicate 32 "n") "closure-src"
+        srcRuntime = StorePath (T.replicate 32 "p") "closure-src-runtime"
+        stray = StorePath (T.replicate 32 "q") "closure-stray"
+        outSP = StorePath (T.replicate 32 "r") "closure-out"
+        libDrv = mkTestBuildDrv shell lib "mkdir -p \"$out\""
+        script =
+          "mkdir -p \"$out\" && printf '%s\\n' "
+            <> T.unwords ["'" <> pathText sp <> "'" | sp <- [libRuntime, srcRuntime, stray, libDrvPath]]
+            <> " > \"$out/paths\""
+        drv = (mkTestBuildDrv shell outSP script) {drvInputDrvs = Map.singleton libDrvPath ["out"], drvInputSrcs = [src]}
+        config = (defaultBuildConfig sd) {bcTmpDir = buildTmp}
+        rootFile = gcRootsDir sd </> T.unpack (spHash outSP <> "-" <> spName outSP)
+    mapM_ plant [lib, libRuntime, src, srcRuntime, stray]
+    registerPaths
+      (stDB store)
+      [ registration libRuntime [],
+        registration lib [libRuntime],
+        registration srcRuntime [],
+        registration src [srcRuntime],
+        registration stray []
+      ]
+    writeDrv store libDrv libDrvPath
+    result <- buildDerivation config store drv
+    recorded <- Set.fromList <$> queryReferences (stDB store) outSP
+    createDirectoryIfMissing True (gcRootsDir sd)
+    BS.writeFile rootFile ""
+    collected <- collectGarbage store
+    validity <- mapM (isValid store) [outSP, libRuntime, srcRuntime, stray]
+    runtimesOnDisk <- mapM (Dir.doesPathExist . (</> "data") . onDisk) [libRuntime, srcRuntime]
+    forceRemoveIfExists buildTmp
+    let recordedAmong = filter (\sp -> Set.member (pathText sp) recorded)
+    case result of
+      BuildFailure msg code ->
+        sequence
+          [ runTest "an output records a path its inputs reach through their references" $
+              Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+          ]
+      BuildSuccess _ ->
+        sequence
+          [ runTest "an output records a path its inputs reach through their references" $
+              assertEqual "recorded" [libRuntime, srcRuntime] (recordedAmong [libRuntime, srcRuntime]),
+            runTest "a collection keeps a dependency of a dependency while the output is rooted" $
+              assertRight "collectGarbage" collected $ \_ ->
+                assertEqual "out, libRuntime, srcRuntime, stray valid; runtimes on disk" ([True, True, True, False], [True, True]) (validity, runtimesOnDisk),
+            runTest "a path outside the input closure is not recorded" $
+              assertEqual "recorded" [] (recordedAmong [stray, libDrvPath])
+          ]
+  pure (closureLaw : built)
+
 -- | Upstream value-conformance tests: each pins exact output bytes (hash
 -- decode, number formatting) that must match what upstream Nix computes for
 -- the same input, because these values can reach names, derivations, and
@@ -16090,6 +16185,7 @@ runSuite = do
           testScrubbedBuildEnvIO,
           testUnpackBuildIO,
           testDependentBuildIO,
+          testReferenceClosureIO,
           testEvalFidelity,
           testUpstreamConformance,
           testHashHelpers,

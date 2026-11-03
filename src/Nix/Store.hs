@@ -536,8 +536,8 @@ writeDrvAterm store sp aterm = do
 -- | Serialize a derivation to ATerm, write it to the store, and register
 -- it: a @.drv@ is a store object like any other, so it gets a ValidPaths
 -- row with its NAR hash and its references.  Reference scans may name a
--- @.drv@ (an output that embeds an input drv hash), and an unregistered
--- referent fails the whole registration batch.
+-- @.drv@ (one in a build's input closure, where a @drvPath@'s context puts
+-- it), and an unregistered referent fails the whole registration batch.
 writeDrv :: Store -> Derivation -> StorePath -> IO ()
 writeDrv store drv sp = do
   writeDrvAterm store sp (toATerm drv)

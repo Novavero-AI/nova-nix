@@ -47,6 +47,7 @@ module Nix.Builder
     -- * Pure pieces (exported for tests)
     BuilderSpawn (..),
     buildPath,
+    closureUnder,
     execWrapperConfig,
     execWrapperFor,
     spawnFor,
@@ -63,10 +64,10 @@ where
 import Control.Exception (IOException, catch, catches, displayException, finally, onException, try)
 import Control.Monad (filterM, unless, when)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT)
+import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Data.Char (isAscii, isSpace, toLower, toUpper)
-import Data.Either (fromRight)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
@@ -75,6 +76,8 @@ import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -90,9 +93,9 @@ import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, r
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Realise (RealiseEffects (..), Realised (..), SubstEffects (..), realise)
-import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, registerPaths, releasePathLock, rewriteStoreHashes, scanReferences, volumeCaseHack)
+import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryReferences, registerPaths, releasePathLock, rewriteStoreHashes, scanReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, storePathToFilePath, unStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath (spHash, spName), StorePathNameError, defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, unStoreDir)
 import Nix.Substituter (CacheConfig, SubstResult (..), queryReferencesWith, trySubstituteWith)
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
@@ -343,11 +346,13 @@ allOutputsValid store drv = case map doPath (drvOutputs drv) of
 -- | The build itself, with every output's lock already held.
 buildUnderLock :: BuildConfig -> Store -> Derivation -> IO BuildResult
 buildUnderLock config store drv = do
-  -- 1. Validate inputs (sources + input-derivation outputs) exist
-  inputsOk <- validateInputs config store drv
-  case inputsOk of
+  -- 1. Validate inputs (sources + input-derivation outputs) exist, and
+  --    take their closure: what an output may reference besides the
+  --    derivation's own outputs.
+  inputs <- validateInputs config store drv >>= either (pure . Left) (inputClosure store)
+  case inputs of
     Left errMsg -> pure (BuildFailure errMsg 1)
-    Right () -> do
+    Right inputPaths -> do
       -- 2. Create temp build directory.  The location is deterministic
       --    (computeBuildDir), so a crashed earlier run may have left stale
       --    contents that builtin:unpack would misread as an archive
@@ -366,7 +371,7 @@ buildUnderLock config store drv = do
         outputValidity <- mapM (isValid store . doPath) (drvOutputs drv)
         case traverse outputPlan (zip (drvOutputs drv) outputValidity) of
           Left nameErr -> pure (BuildFailure ("output name is not a store path name: " <> T.pack (show nameErr)) 1)
-          Right plans -> runPlannedBuild config store drv buildDir plans
+          Right plans -> runPlannedBuild config store drv inputPaths buildDir plans
 
 -- | Where the builder writes each output, and where that has to end up.
 --
@@ -475,9 +480,9 @@ spawnFor host config drv
     system = platformToText platform
 
 -- | The build, once every output knows where it is written and where it
--- belongs.
-runPlannedBuild :: BuildConfig -> Store -> Derivation -> FilePath -> [OutputPlan] -> IO BuildResult
-runPlannedBuild config store drv buildDir plans = do
+-- belongs, and the closure of the inputs is known.
+runPlannedBuild :: BuildConfig -> Store -> Derivation -> Set StorePath -> FilePath -> [OutputPlan] -> IO BuildResult
+runPlannedBuild config store drv inputPaths buildDir plans = do
   let scratchDir p = storePathToFilePath (bcStoreDir config) (opScratch p)
       outputDirs = [(opName p, scratchDir p) | p <- plans]
       -- Every scratch path is the build's to use: the ones that are final
@@ -567,7 +572,7 @@ runPlannedBuild config store drv buildDir plans = do
               clearScratch
               pure (BuildFailure ("builder succeeded but outputs missing: " <> names) 1)
             [] -> do
-              result <- registerOutputs config store drv buildDir plans
+              result <- registerOutputs config store drv inputPaths plans
               case result of
                 BuildSuccess _ -> do
                   writeIORef committed True
@@ -611,7 +616,9 @@ onStore config
   where
     storeDirText = T.pack (unStoreDir (bcStoreDir config))
 
--- | Check that all inputs needed to build a derivation are present in the store.
+-- | Check that all inputs needed to build a derivation are present in the
+-- store, and return them: the input sources, then the input derivations'
+-- requested outputs.
 --
 -- Input sources must be valid.  For input derivations, the artifacts a build
 -- actually reads are their realized OUTPUT paths, not the @.drv@ recipe files,
@@ -619,7 +626,7 @@ onStore config
 -- driver materialized) and validate those outputs.  'Nix.Realise' realizes a
 -- derivation's inputs before it builds, so their outputs are present by the
 -- time it is validated.
-validateInputs :: BuildConfig -> Store -> Derivation -> IO (Either Text ())
+validateInputs :: BuildConfig -> Store -> Derivation -> IO (Either Text [StorePath])
 validateInputs config store drv = do
   -- Check input sources
   srcResults <- mapM (isValid store) (drvInputSrcs drv)
@@ -635,7 +642,7 @@ validateInputs config store drv = do
           let missingOutputs = [sp | (sp, valid) <- zip requiredOutputs outResults, not valid]
           if not (null missingOutputs)
             then pure (Left ("missing input derivation outputs: " <> T.intercalate ", " (map formatSP missingOutputs)))
-            else pure (Right ())
+            else pure (Right (drvInputSrcs drv ++ requiredOutputs))
 
 -- | Resolve each input derivation's requested output names to their store
 -- paths by reading the input @.drv@ from the store.  @Left@ if an input @.drv@
@@ -653,6 +660,40 @@ resolveInputOutputs config drv =
         Just sp -> Right sp
         Nothing ->
           Left ("input derivation " <> formatSP inputDrvPath <> " has no output '" <> name <> "'")
+
+-- | The closure of a build's inputs under the references the store records:
+-- the paths besides its own outputs that an output may reference.  This is
+-- upstream's @inputPaths@, the closures of the requested input outputs and
+-- of the input sources (derivation-goal.cc:601-613 at 2.24.9).  An output
+-- that embeds a dependency of a dependency must record it, or a collection
+-- deletes it while the output still uses it.  As in upstream's, an input
+-- derivation's @.drv@ is in it only when an input source reaches it.
+--
+-- A recorded reference that does not parse is a corrupt database, and fails
+-- the build rather than dropping out of the scan.
+inputClosure :: Store -> [StorePath] -> IO (Either Text (Set StorePath))
+inputClosure store = runExceptT . closureUnder recorded
+  where
+    recorded :: StorePath -> ExceptT Text IO [StorePath]
+    recorded sp = do
+      referenceTexts <- liftIO (queryReferences (stDB store) sp)
+      liftEither (traverse parseRecorded referenceTexts)
+    parseRecorded text = case parseStorePath (stDir store) text of
+      Just sp -> Right sp
+      Nothing -> Left ("unparseable reference in store DB: " <> text)
+
+-- | Every node reachable from the roots through the references lookup, the
+-- roots included.  Each node is looked up once, so a reference cycle (the
+-- outputs of one derivation may reference each other) ends.
+closureUnder :: (Monad m, Ord a) => (a -> m [a]) -> [a] -> m (Set a)
+closureUnder references = go Set.empty
+  where
+    go !seen [] = pure seen
+    go !seen (node : pending)
+      | Set.member node seen = go seen pending
+      | otherwise = do
+          referenced <- references node
+          go (Set.insert node seen) (referenced ++ pending)
 
 -- | Format a StorePath for error messages.
 formatSP :: StorePath -> Text
@@ -1149,14 +1190,14 @@ registerOutputs ::
   BuildConfig ->
   Store ->
   Derivation ->
-  FilePath ->
+  Set StorePath ->
   [OutputPlan] ->
   IO BuildResult
-registerOutputs config store drv _buildDir plans = do
-  -- Candidates for reference scanning: input sources, the input
-  -- derivations' realized OUTPUT paths, and this derivation's own outputs.
-  inputOutputs <- fromRight [] <$> resolveInputOutputs config drv
-  let allCandidates = collectAllCandidates drv ++ inputOutputs
+registerOutputs config store drv inputPaths plans = do
+  let -- Candidates for reference scanning: the input closure and this
+      -- derivation's own outputs, upstream's @referenceablePaths@
+      -- (local-derivation-goal.cc:2275-2278 at 2.24.9).
+      allCandidates = Set.toList inputPaths ++ map doPath (drvOutputs drv)
       -- Deriver path is not available from the Derivation type alone;
       -- the caller (buildWithDeps) would need to pass it through.
       -- Register with no deriver for now - queryDeriver will return Nothing.
@@ -1181,8 +1222,8 @@ registerOutputs config store drv _buildDir plans = do
         [] -> pure (BuildFailure "no outputs defined" 1)
 
 -- | Prepare a single output for registration: skip if already valid in the DB,
--- otherwise rewrite scratch hashes, scan references (inputs and this
--- derivation's outputs) and place it in the store, returning its 'PathRegistration'.  Returns @Nothing@
+-- otherwise rewrite scratch hashes, scan references (the input closure and
+-- this derivation's outputs) and place it in the store, returning its 'PathRegistration'.  Returns @Nothing@
 -- for an output already registered as valid.
 prepareOutput ::
   BuildConfig ->
@@ -1297,15 +1338,6 @@ fixedOutputHashChunk = 65536
 -- | Deduplicate store paths by their (unique) hash.
 dedupStorePaths :: [StorePath] -> [StorePath]
 dedupStorePaths = Map.elems . Map.fromList . map (\sp -> (spHash sp, sp))
-
--- | Collect all candidate store paths from the derivation's inputs.
--- Used for reference scanning.
-collectAllCandidates :: Derivation -> [StorePath]
-collectAllCandidates drv =
-  let inputSrcs = drvInputSrcs drv
-      inputDrvPaths = Map.keys (drvInputDrvs drv)
-      outputPaths = map doPath (drvOutputs drv)
-   in inputSrcs ++ inputDrvPaths ++ outputPaths
 
 -- ---------------------------------------------------------------------------
 -- Dependency-aware build orchestration
