@@ -42,7 +42,7 @@ import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
-import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope, readFileAutoEncoding)
+import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
 import Nix.Realise (Fallback (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
@@ -494,11 +494,11 @@ usageLines =
 -- a directory, no permission) is a clean CLI error, never an uncaught
 -- exception.  Only 'IOException' is caught: an interrupt or any other
 -- async exception must abort the run, not print as a read failure.
-readSourceFile :: FilePath -> IO (FilePath, T.Text)
+readSourceFile :: FilePath -> IO (FilePath, BS.ByteString)
 readSourceFile rawPath = do
   attempt <- try $ do
     path <- canonicalizePath rawPath
-    source <- readFileAutoEncoding path
+    source <- BS.readFile path
     pure (path, source)
   case attempt of
     Left (e :: IOException) ->
@@ -575,7 +575,7 @@ setUpEval opts config storeDir dataDir baseDir = do
 
 -- | Parse and bind source against the names the root environment
 -- 'setUpEval' builds will bind, which depend on the policy.
-parseForEval :: CliOpts -> NixConfig -> FilePath -> SourceOrigin -> T.Text -> Either SourceError Expr
+parseForEval :: CliOpts -> NixConfig -> FilePath -> SourceOrigin -> BS.ByteString -> Either SourceError Expr
 parseForEval opts config = parseNixWithScope (rootScopeNames (evalPolicyFor opts config))
 
 -- | Evaluate a .nix file and print the result.
@@ -597,7 +597,7 @@ evalFile config opts storeDir dataDir rawFilePath = do
 evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
 evalExpr config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
-  case parseForEval opts config cwd exprOrigin source of
+  case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
@@ -613,7 +613,7 @@ evalExpr config opts storeDir dataDir source = do
 evalExprAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
 evalExprAterm config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
-  case parseForEval opts config cwd exprOrigin source of
+  case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
@@ -638,13 +638,13 @@ evalExprAterm config opts storeDir dataDir source = do
 -- The file argument is canonicalized for the same reason as in 'evalFile'.
 -- | Where a build reads its expression, and the directory relative paths
 -- inside it resolve against.
-loadBuildSource :: BuildTarget -> IO (FilePath, SourceOrigin, T.Text)
+loadBuildSource :: BuildTarget -> IO (FilePath, SourceOrigin, BS.ByteString)
 loadBuildSource (TargetFile rawFilePath) = do
   (filePath, source) <- readSourceFile rawFilePath
   pure (takeDirectory filePath, SourceFile (T.pack filePath), source)
 loadBuildSource (TargetExpr source) = do
   cwd <- getCurrentDirectory
-  pure (cwd, exprOrigin, source)
+  pure (cwd, exprOrigin, TE.encodeUtf8 source)
 
 -- | Force the attributes 'derivationPath' goes on to read.  @derivation@
 -- is a lazy wrapper, and 'readThunkValue' answers 'Nothing' for a thunk that

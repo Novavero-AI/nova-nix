@@ -202,7 +202,7 @@ assertParse = assertParseIn []
 -- way @scopedImport@ binds its scope: each stays a name-based 'EVar'.
 assertParseIn :: [Text] -> Text -> Text -> Expr -> TestResult
 assertParseIn names label source expected =
-  assertRight label (parseNixWithScope (withGlobals names) testBaseDir testOrigin source) $ \actual ->
+  assertRight label (parseNixWithScope (withGlobals names) testBaseDir testOrigin (TE.encodeUtf8 source)) $ \actual ->
     assertEqual label expected actual
 
 -- | The root environment's names with more bound around them.
@@ -216,7 +216,11 @@ tokenTypes = filter (/= TokEOF) . map locToken
 -- | Helper: parse Nix source and evaluate with builtinEnv.  Parse errors
 -- are tagged so failure assertions can tell them apart from eval errors.
 evalNix :: Text -> Either Text NixValue
-evalNix source = case parseNix testBaseDir testOrigin source of
+evalNix = evalNixBytes . TE.encodeUtf8
+
+-- | 'evalNix' over source bytes, which need not be UTF-8.
+evalNixBytes :: BS.ByteString -> Either Text NixValue
+evalNixBytes source = case parseNix testBaseDir testOrigin source of
   Left err -> Left (sourceFailure err)
   Right expr -> runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 
@@ -233,7 +237,11 @@ sourceFailure (UndefinedVariable name) = undefinedVariableMessage name
 
 -- | The syntax error a source fails to parse with.
 syntaxErrorOf :: Text -> Either Text ParseError
-syntaxErrorOf source = case parseNix testBaseDir testOrigin source of
+syntaxErrorOf = syntaxErrorOfBytes . TE.encodeUtf8
+
+-- | 'syntaxErrorOf' over source bytes, which need not be UTF-8.
+syntaxErrorOfBytes :: BS.ByteString -> Either Text ParseError
+syntaxErrorOfBytes source = case parseNix testBaseDir testOrigin source of
   Left (SyntaxError err) -> Right err
   Left other -> Left ("expected a syntax error, got " <> T.pack (show other))
   Right _ -> Left "parsed unexpectedly"
@@ -1876,7 +1884,7 @@ testLexer = do
           Just False -> Fail "wrong tokens for a zero mantissa"
           Nothing -> Fail "lexing did not return promptly",
       runTestM "megadigit integer literal rejects promptly" $ do
-        let rejected = case tokenize "<test>" (T.replicate 1000000 "9") of
+        let rejected = case tokenize "<test>" (BS8.replicate 1000000 '9') of
               Left _ -> True
               Right _ -> False
         outcome <- timeout walkWatchdogMicros (evaluate rejected)
@@ -1887,7 +1895,7 @@ testLexer = do
       runTestM "megadigit mantissa still rounds correctly" $ do
         -- 1.999...9e5 sits within half an ulp of 200000.0; the kept-768
         -- digits plus the sticky digit must round it there.
-        let rounded = case tokenize "<test>" ("1." <> T.replicate 1000000 "9" <> "e5") of
+        let rounded = case tokenize "<test>" ("1." <> BS8.replicate 1000000 '9' <> "e5") of
               Right toks -> tokenTypes toks == [TokFloat 200000.0]
               Left _ -> False
         outcome <- timeout walkWatchdogMicros (evaluate rounded)
@@ -2047,8 +2055,29 @@ testLexer = do
           assertEqual
             "tokens"
             [TokStringOpen, TokStringLit "\n\t\\\"", TokStringClose]
-            (tokenTypes toks)
+            (tokenTypes toks),
+      runTest "a string keeps bytes that are not UTF-8" $
+        assertRight "lex invalid UTF-8" (tokenize "<test>" (BS.pack [0x22, 0x61, 0xFF, 0xC3, 0x28, 0x22])) $ \toks ->
+          assertEqual "tokens" [TokStringOpen, TokStringLit (BS.pack [0x61, 0xFF, 0xC3, 0x28]), TokStringClose] (tokenTypes toks),
+      -- The e-acute's two bytes take one column, so x is at 5.
+      runTest "columns count characters" $
+        assertRight "lex columns" (tokenize "<test>" (TE.encodeUtf8 "\"\233\" x")) $ \toks ->
+          assertEqual "x" [(1, 5)] [(locLine tok, locCol tok) | tok <- toks, locToken tok == TokIdent "x"],
+      runTest "an escaped newline in an indented string ends a line" $
+        assertRight "lex escaped newline" (tokenize "<test>" "''a''\\\n'' x") $ \toks ->
+          assertEqual "x" [(2, 4)] [(locLine tok, locCol tok) | tok <- toks, locToken tok == TokIdent "x"],
+      -- Upstream's ID class is ASCII (lexer.l), so a letter outside it is
+      -- the character no rule but the catch-all takes.
+      runTest "a letter outside ASCII starts no token" $
+        assertEqual "message" (Left "unexpected character: \233") (lexOutcome (TE.encodeUtf8 "\233")),
+      runTest "a byte that is no character is named as a byte" $
+        assertEqual "message" (Left "unexpected byte 0xff") (lexOutcome (BS.pack [0xFF])),
+      -- Upstream's whitespace is [ \t\r\n] (lexer.l).
+      runTest "a vertical tab is not whitespace" $
+        assertEqual "message" (Left "unexpected character: \v") (lexOutcome "1\v")
     ]
+  where
+    lexOutcome source = either (Left . peMessage) (Right . length) (tokenize "<test>" source)
 
 -- ---------------------------------------------------------------------------
 -- Tests: Parser expressions
@@ -2331,6 +2360,87 @@ testParserErrors = do
         assertRight "truncated lambda" (syntaxErrorOf "{ a, b }:") $ \err ->
           assertEqual "end of input" True ("end of input" `T.isInfixOf` peMessage err)
     ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Source bytes
+-- ---------------------------------------------------------------------------
+
+-- | A source is bytes, as upstream's lexer reads it (lexer.l at 2.24.9): a
+-- string literal's bytes are its value's whether or not they are UTF-8,
+-- every other token is ASCII, and a byte order mark selects UTF-16, read
+-- as its UTF-8.
+testSourceBytes :: IO [Bool]
+testSourceBytes = do
+  putStrLn "parser/source-bytes"
+  let quickCheckPasses property = do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+      -- NUL is left out: upstream's unescapeStr stops at one (lexer.l), so
+      -- a literal holding it is no round trip there.
+      literalBytes = BS.pack <$> QC.listOf (QC.choose (1, maxBound :: Word8))
+      literalText = T.pack <$> QC.listOf (QC.arbitrary `QC.suchThat` (/= '\NUL'))
+      utf16Le = (BS.pack [0xFF, 0xFE] <>) . TE.encodeUtf16LE
+      utf16Be = (BS.pack [0xFE, 0xFF] <>) . TE.encodeUtf16BE
+      errorAt err = (peLine err, peCol err, peMessage err)
+  sequence
+    [ runTestM "a string literal's bytes are its value's" $
+        quickCheckPasses $
+          QC.forAll literalBytes $ \bytes ->
+            evalNixBytes (stringLiteralBytes bytes) QC.=== Right (VStr bytes emptyContext),
+      runTestM "a UTF-16 source is read as its UTF-8, in either byte order" $
+        quickCheckPasses $
+          QC.forAll literalText $ \text ->
+            let expected = Right (VStr (TE.encodeUtf8 text) emptyContext)
+             in evalNixBytes (utf16Le (stringLiteralText text)) QC.=== expected
+                  QC..&&. evalNixBytes (utf16Be (stringLiteralText text)) QC.=== expected,
+      runTest "an indented string keeps bytes that are not UTF-8" $
+        assertEqual "value" (Right (VStr (BS.pack [0x61, 0xFF, 0x62]) emptyContext)) (evalNixBytes ("''" <> BS.pack [0x61, 0xFF, 0x62] <> "''")),
+      runTest "a comment may hold bytes that are not UTF-8" $
+        assertEqual "value" (Right (VInt 1)) (evalNixBytes ("# " <> BS.pack [0xFF] <> "\n/* " <> BS.pack [0xC3, 0x28] <> " */ 1")),
+      -- Upstream's PATH_CHAR is ASCII (lexer.l): the byte ends the path
+      -- and starts no token of its own.
+      runTest "a byte outside ASCII ends a path" $
+        assertEqual "error" (Right (1, 4, "unexpected byte 0xff")) (errorAt <$> syntaxErrorOfBytes ("./a" <> BS.pack [0xFF] <> "b")),
+      runTest "a string attribute name must be UTF-8" $
+        assertEqual "error" (Right (1, 3, "attribute name is not valid UTF-8")) (errorAt <$> syntaxErrorOfBytes ("{ \"" <> BS.pack [0xFF] <> "\" = 1; }")),
+      -- A dot commits to the key after it, so the key's error is the one
+      -- reported, not a complaint about the dot.
+      runTest "a string attribute name after a dot must be UTF-8" $
+        assertEqual "error" (Right (1, 5, "attribute name is not valid UTF-8")) (errorAt <$> syntaxErrorOfBytes ("{ a.\"" <> BS.pack [0xFF] <> "\" = 1; }")),
+      runTest "a string name after a dot in a has-attribute path must be UTF-8" $
+        assertEqual "error" (Right (1, 9, "attribute name is not valid UTF-8")) (errorAt <$> syntaxErrorOfBytes ("{ } ? a.\"" <> BS.pack [0xFF] <> "\"")),
+      runTest "a quoted inherit name must be UTF-8" $
+        assertEqual "error" (Right (1, 17, "attribute name is not valid UTF-8")) (errorAt <$> syntaxErrorOfBytes ("{ inherit ({ }) \"" <> BS.pack [0xFF] <> "\"; }")),
+      runTest "a UTF-8 byte order mark is dropped" $
+        assertEqual "value" (Right (VInt 1)) (evalNixBytes (BS.pack [0xEF, 0xBB, 0xBF] <> "1")),
+      runTest "an unpaired UTF-16 surrogate is a syntax error where it stands" $
+        assertEqual "error" (Right (2, 3, "unpaired UTF-16 surrogate")) (errorAt <$> syntaxErrorOfBytes (utf16Le "1\n +" <> BS.pack [0x00, 0xD8])),
+      runTest "a UTF-16 source with an odd byte at its end is a syntax error" $
+        assertEqual "error" (Right (1, 2, "UTF-16 source with an odd number of bytes")) (errorAt <$> syntaxErrorOfBytes (utf16Be "1" <> BS.pack [0x41]))
+    ]
+
+-- | Bytes as a double-quoted literal of them: each byte with a meaning
+-- there escaped ('literalEscape'), every other kept as it is.
+stringLiteralBytes :: BS.ByteString -> BS.ByteString
+stringLiteralBytes bytes = "\"" <> BS8.concatMap escaped bytes <> "\""
+  where
+    escaped c = maybe (BS8.singleton c) TE.encodeUtf8 (literalEscape c)
+
+-- | Text as a double-quoted literal of it, escaped as 'stringLiteralBytes'.
+stringLiteralText :: Text -> Text
+stringLiteralText text = "\"" <> T.concatMap escaped text <> "\""
+  where
+    escaped c = fromMaybe (T.singleton c) (literalEscape c)
+
+-- | The escape a character needs in a double-quoted literal: the quote,
+-- the backslash, the dollar, and the carriage return, which a raw literal
+-- reads as a newline (unescapeStr, lexer.l at 2.24.9).
+literalEscape :: Char -> Maybe Text
+literalEscape '"' = Just "\\\""
+literalEscape '\\' = Just "\\\\"
+literalEscape '$' = Just "\\$"
+literalEscape '\r' = Just "\\r"
+literalEscape _ = Nothing
 
 -- ---------------------------------------------------------------------------
 -- Tests: Parser integration
@@ -2992,7 +3102,7 @@ evalNixIO baseDir source = do
 
 -- | 'evalNixIO' keeping a failure whole, its lines of context included.
 evalNixIOTraced :: FilePath -> Text -> IO (Either EvalFailure NixValue)
-evalNixIOTraced baseDir source = case parseNix baseDir testOrigin source of
+evalNixIOTraced baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (EvalFailure [] (T.pack (show err))))
   Right expr -> do
     storeDir <- evalNixIOStoreDir
@@ -3004,7 +3114,7 @@ evalNixIOTraced baseDir source = case parseNix baseDir testOrigin source of
 -- which records the @.drv@ under that path, and the recipe is read back the
 -- way the build driver reads it.  Only the IO evaluator keeps the record.
 evalDerivationIO :: FilePath -> Text -> IO (Either Text Derivation)
-evalDerivationIO baseDir source = case parseNix baseDir testOrigin ("(" <> source <> ").drvPath") of
+evalDerivationIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 ("(" <> source <> ").drvPath")) of
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
     storeDir <- evalNixIOStoreDir
@@ -3642,7 +3752,7 @@ derivationWrapperFile = "/derivation-internal.nix"
 -- | 'evalNix' for source parsed as the file 'positionsFile', so the
 -- positions recorded in it name that file, as upstream's do for a file.
 evalNixInFile :: Text -> Either Text NixValue
-evalNixInFile source = case parseNix testBaseDir (SourceFile positionsFile) source of
+evalNixInFile source = case parseNix testBaseDir (SourceFile positionsFile) (TE.encodeUtf8 source) of
   Left err -> Left (sourceFailure err)
   Right expr -> runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 
@@ -3664,6 +3774,8 @@ testUnsafeGetAttrPos = do
       inFile "a name inherited from a set is at itself" "builtins.unsafeGetAttrPos \"y\" {\n  inherit ({ x = 1; y = 2; }) x y;\n}" (2, 33),
       inFile "a quoted inherited name is at its quote" "builtins.unsafeGetAttrPos \"or\" {\n  inherit ({ or = 1; }) \"or\";\n}" (2, 25),
       inFile "a quoted static name is at its quote" "builtins.unsafeGetAttrPos \"q\" {\n  \"q\" = 1;\n}" (2, 3),
+      -- The e-acute's two bytes take one column, as the lexer counts.
+      inFile "a column counts the characters before it" "builtins.unsafeGetAttrPos \"b\" {\n  a = \"\233\"; b = 1;\n}" (2, 12),
       inFile "a dynamic name is at its interpolation" "builtins.unsafeGetAttrPos \"k\" {\n  ${\"k\"} = 1;\n}" (2, 3),
       inFile "each level of a dotted path is at the path" "builtins.unsafeGetAttrPos \"c\" {\n  a.b.c = 1;\n}.a.b" (2, 3),
       inFile "a merged path's first definition keeps its position" "builtins.unsafeGetAttrPos \"a\" {\n  a.b = 1;\n  a.c = 2;\n}" (2, 3),
@@ -4049,7 +4161,7 @@ expectMaxCallDepth label result = case result of
 
 -- | IO evaluation under an explicit call-depth ceiling.
 evalAtCeiling :: Word32 -> Text -> IO (Either Text NixValue)
-evalAtCeiling limit source = case parseNix "." testOrigin source of
+evalAtCeiling limit source = case parseNix "." testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
     storeDir <- evalNixIOStoreDir
@@ -11062,7 +11174,7 @@ testStage0Pe32Chain = do
             " ])"
           ]
       chainAttrs = ("seed" : links) ++ map extraAttr extras
-  outcome <- case parseNix cwd testOrigin source of
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right expr -> runEvalIO st $ do
       value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
@@ -11469,7 +11581,7 @@ makeGitFixture dir files = do
 -- | 'evalNixIO' against an explicit store directory, for expressions
 -- whose evaluation writes store objects.
 evalNixIOStore :: StoreDir -> FilePath -> Text -> IO (Either Text NixValue)
-evalNixIOStore storeDir baseDir source = case parseNix baseDir testOrigin source of
+evalNixIOStore storeDir baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
     st <- newEvalState storeDir baseDir
@@ -14042,7 +14154,7 @@ reservedNameTarballPath = StorePath "rlwykawmqrmdiq4xmcr4rf2zxf6y9k09" "source"
 -- | End-to-end: eval .nix source, extract derivation, build, verify output.
 evalAndBuild :: StoreDir -> Text -> IO (Either Text (BuildResult, Store))
 evalAndBuild storeDir source = do
-  case parseNix testBaseDir testOrigin source of
+  case parseNix testBaseDir testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left ("parse error: " <> T.pack (show err)))
     Right expr -> do
       -- The SAME store the build below is given.  Evaluating against the
@@ -15482,7 +15594,7 @@ evalNixStub = evalNixStubWith . stubEnv
 
 -- | 'evalNixStub' with the whole stub store spelled out.
 evalNixStubWith :: StubEnv -> Text -> Either Text NixValue
-evalNixStubWith env source = case parseNix testBaseDir testOrigin source of
+evalNixStubWith env source = case parseNix testBaseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> Left (T.pack (show err))
   Right expr -> runStubStoreEvalWith env (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 
@@ -17331,13 +17443,13 @@ testStaticGlobalsSync = do
 -- | Assert that binding rejects a source for the named variable, before
 -- anything is evaluated.
 assertUnbound :: Text -> Text -> Text -> TestResult
-assertUnbound label source name = case parseNix testBaseDir testOrigin source of
+assertUnbound label source name = case parseNix testBaseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> assertEqual label (UndefinedVariable name) err
   Right expr -> Fail (label <> ": bound, got " <> T.pack (show expr))
 
 -- | Assert that every variable in a source binds.
 assertBinds :: Text -> Text -> TestResult
-assertBinds label source = assertRight label (parseNix testBaseDir testOrigin source) (const Pass)
+assertBinds label source = assertRight label (parseNix testBaseDir testOrigin (TE.encodeUtf8 source)) (const Pass)
 
 -- | Upstream rejects a variable no scope binds and no @with@ could supply
 -- while binding (nixexpr.cc, ExprVar::bindVars), wherever it sits; only a
@@ -17642,6 +17754,37 @@ testByteStringSemanticsIO = do
           "builtins.readFile ./nul.bin"
       ]
 
+-- | A file is lexed as its bytes, as upstream reads it (eval.cc,
+-- @parseExprFromFile@ at 2.24.9): a string literal in one keeps a byte
+-- that is not UTF-8.  A byte order mark selects UTF-16, read as its UTF-8,
+-- or marks UTF-8.
+testSourceBytesIO :: IO [Bool]
+testSourceBytesIO = do
+  putStrLn "parser/source-bytes-io"
+  tmpDir <- getTemporaryDirectory
+  let testDir = tmpDir </> "nova-nix-source-bytes-test"
+      invalid = BS.pack [0x61, 0xFF, 0x62]
+      named = "{ name = \"caf\233\"; }"
+      name = VStr (TE.encodeUtf8 "caf\233") emptyContext
+  bracket_
+    ( do
+        createDirectoryIfMissing True testDir
+        BS.writeFile (testDir </> "invalid.nix") ("\"" <> invalid <> "\"")
+        BS.writeFile (testDir </> "utf16le.nix") (BS.pack [0xFF, 0xFE] <> TE.encodeUtf16LE named)
+        BS.writeFile (testDir </> "utf16be.nix") (BS.pack [0xFE, 0xFF] <> TE.encodeUtf16BE named)
+        BS.writeFile (testDir </> "utf8mark.nix") (BS.pack [0xEF, 0xBB, 0xBF] <> TE.encodeUtf8 named)
+    )
+    ( do
+        exists <- doesDirectoryExist testDir
+        when exists (removeDirectoryRecursive testDir)
+    )
+    $ sequence
+      [ runTestIO "a string literal in a file keeps a byte that is not UTF-8" testDir "import ./invalid.nix" (VStr invalid emptyContext),
+        runTestIO "a UTF-16 LE file with a byte order mark is read" testDir "(import ./utf16le.nix).name" name,
+        runTestIO "a UTF-16 BE file with a byte order mark is read" testDir "(import ./utf16be.nix).name" name,
+        runTestIO "a UTF-8 file with a byte order mark is read" testDir "(import ./utf8mark.nix).name" name
+      ]
+
 main :: IO ()
 main =
   getArgs >>= \case
@@ -17730,6 +17873,7 @@ runSuite = do
           testLexer,
           testParserExprs,
           testParserErrors,
+          testSourceBytes,
           testParserIntegration,
           testStaticGlobalsSync,
           testUndefinedVariables,
@@ -17809,6 +17953,7 @@ runSuite = do
           testToJSONPathIO,
           testByteStringSemantics,
           testByteStringSemanticsIO,
+          testSourceBytesIO,
           testSymbol,
           testCAttrSet,
           testCThunk,
@@ -17892,7 +18037,7 @@ purePolicy = unrestrictedPolicy {epPureEval = True}
 -- | Parse and evaluate in 'PureEval' with the given policy's builtins
 -- table, for the constants the table itself decides.
 evalNixWith :: EvalPolicy -> Text -> Either Text NixValue
-evalNixWith policy source = case parseNixWithScope (rootScopeNames policy) testBaseDir testOrigin source of
+evalNixWith policy source = case parseNixWithScope (rootScopeNames policy) testBaseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> Left (sourceFailure err)
   Right expr -> runPureEval (eval (builtinEnv policy 0 []) expr)
 
@@ -18066,7 +18211,7 @@ testEvalPolicyRules = do
 evalPolicyIO :: EvalPolicy -> [Text] -> [Thunk] -> FilePath -> Text -> IO (Either Text NixValue)
 evalPolicyIO policy roots searchPaths baseDir source = do
   storeDir <- evalNixIOStoreDir
-  case parseNixWithScope (rootScopeNames policy) baseDir testOrigin source of
+  case parseNixWithScope (rootScopeNames policy) baseDir testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right expr -> do
       st0 <- newEvalState storeDir baseDir

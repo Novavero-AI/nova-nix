@@ -20,7 +20,6 @@ module Nix.Parser.Internal
     tryParserKeepError,
     deeperError,
     failWithError,
-    pMany,
     atEnd,
 
     -- * Specific expects
@@ -135,11 +134,11 @@ tryParser (Parser p) = Parser $ \st -> case p st of
   Left _ -> Right (Nothing, st)
   Right (val, st2) -> Right (Just val, st2)
 
--- | Backtracking that keeps the failure instead of discarding it.
--- 'tryParser' is right for iteration ('pMany') and wrong for
--- alternation between competing readings, where the discarded error
--- may be the true one: a failure deep in a lambda body used to
--- surface as the attr-set branch's complaint at the top of the file.
+-- | Backtracking that keeps the failure instead of discarding it, for
+-- alternation between competing readings, where the error 'tryParser'
+-- would discard may be the true one: a failure deep in a lambda body
+-- would otherwise surface as the attr-set branch's complaint at the top
+-- of the file.
 tryParserKeepError :: Parser a -> Parser (Either ParseError a)
 tryParserKeepError (Parser p) = Parser $ \st -> case p st of
   Left err -> Right (Left err, st)
@@ -164,16 +163,6 @@ deeperError a b
 -- | Fail with an already-built error, position included.
 failWithError :: ParseError -> Parser a
 failWithError err = Parser $ \_ -> Left err
-
--- | Parse zero or more occurrences.
-pMany :: Parser a -> Parser [a]
-pMany p = go []
-  where
-    go acc = do
-      result <- tryParser p
-      case result of
-        Nothing -> pure (reverse acc)
-        Just val -> go (val : acc)
 
 -- | Check if we've consumed all tokens.
 atEnd :: Parser Bool

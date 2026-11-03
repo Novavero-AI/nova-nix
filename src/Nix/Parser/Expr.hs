@@ -23,12 +23,15 @@ module Nix.Parser.Expr
 where
 
 import Control.Monad (foldM, when)
+import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import qualified Data.Text.Encoding as TE
 import Nix.Expr.Types
 import Nix.Parser.Internal
 import Nix.Parser.Lexer (Token (..))
+import Nix.Parser.ParseError (ParseError (..))
 
 -- ---------------------------------------------------------------------------
 -- Top level
@@ -416,10 +419,7 @@ parseAtom = do
     TokNull -> advance >> pure (ELit NixNull)
     TokUri u -> advance >> pure (ELit (NixUri u))
     TokPath p -> advance >> pure (ELit (NixPath p))
-    TokPathInterpStart headPiece -> do
-      _ <- advance
-      parts <- parsePathParts
-      pure (EPathStr (StrLit headPiece : parts))
+    TokPathInterpStart headPiece -> advance >> EPathStr headPiece <$> parsePathParts
     TokSearchPath p -> advance >> pure (ESearchPath p)
     TokIdent name -> advance >> pure (EVar name)
     TokStringOpen -> parseString
@@ -493,7 +493,7 @@ parsePathParts = go []
           pure (reverse acc)
         TokPathLit txt -> do
           _ <- advance
-          go (StrLit txt : acc)
+          go (StrLit (TE.encodeUtf8 txt) : acc)
         TokInterpOpen -> do
           _ <- advance
           expr <- parseExpr
@@ -653,7 +653,7 @@ parseNamedBinding :: Parser Binding
 parseNamedBinding = do
   pos <- currentPos
   firstKey <- parseAttrKey
-  rest <- pMany (expect TokDot >> parseAttrKey)
+  rest <- dottedKeys
   expect TokAssign
   val <- parseExpr
   expect TokSemicolon
@@ -698,20 +698,21 @@ parseInheritNames = go []
         -- Quoted strings for keywords used as attribute names: inherit "or";
         TokStringOpen -> do
           _ <- advance
-          name <- parseQuotedInheritName
+          name <- parseQuotedInheritName pos
           go (InheritedName pos name : acc)
         _ -> pure (reverse acc)
 
--- | Parse a quoted inherit name: a simple string literal (no interpolation).
--- Used for keywords like @"or"@ in @inherit (self.trivial) "or";@.
-parseQuotedInheritName :: Parser Text
-parseQuotedInheritName = do
+-- | Parse a quoted inherit name: a simple string literal (no interpolation),
+-- the string opening at the position given.  Used for keywords like @"or"@
+-- in @inherit (self.trivial) "or";@.
+parseQuotedInheritName :: SrcPos -> Parser Text
+parseQuotedInheritName pos = do
   tok <- peek
   case tok of
     TokStringLit s -> do
       _ <- advance
       expect TokStringClose
-      pure s
+      attrNameText pos s
     TokStringClose -> do
       _ <- advance
       pure ""
@@ -720,8 +721,24 @@ parseQuotedInheritName = do
 parseAttrPath :: Parser AttrPath
 parseAttrPath = do
   first <- parseAttrKey
-  rest <- pMany (expect TokDot >> parseAttrKey)
+  rest <- dottedKeys
   pure (first : rest)
+
+-- | The keys after an attribute path's first, each after a dot.  A dot
+-- commits to the key after it, as upstream's LR grammar does (the
+-- @attrpath@ rule, parser.y at 2.24.9), so a key that fails to parse
+-- reports its own error, a string key that is not UTF-8 among them,
+-- rather than backtracking to blame the dot.
+dottedKeys :: Parser [AttrKey]
+dottedKeys = go []
+  where
+    go acc = do
+      dotted <- match TokDot
+      if dotted
+        then do
+          key <- parseAttrKey
+          go (key : acc)
+        else pure (reverse acc)
 
 parseAttrKey :: Parser AttrKey
 parseAttrKey = do
@@ -732,11 +749,14 @@ parseAttrKey = do
     -- { if = 1; }, a.then, { else = 2; }, etc.
     _ | Just name <- keywordToText tok -> advance >> pure (StaticKey name)
     TokStringOpen -> do
+      pos <- currentPos
       strExpr <- parseString
       -- A string key with no interpolation is static, as in upstream Nix's
       -- parser (the string becomes a symbol at parse time) - which is also
       -- what makes @let "x" = 1; in x@ legal.
-      pure (maybe (DynamicKey strExpr) StaticKey (literalStringKey strExpr))
+      case literalStringKey strExpr of
+        Just bytes -> StaticKey <$> attrNameText pos bytes
+        Nothing -> pure (DynamicKey strExpr)
     TokInterpOpen -> do
       _ <- advance
       expr <- parseExpr
@@ -746,16 +766,31 @@ parseAttrKey = do
       pure (DynamicKey expr)
     _ -> parseError ("expected attribute key, got " <> showToken tok)
 
--- | The literal text of a string expression that contains no interpolation.
--- Escape handling can split a literal into several 'StrLit' chunks, so the
--- parts are concatenated; any 'StrInterp' makes the key dynamic.
-literalStringKey :: Expr -> Maybe Text
+-- | The bytes of a string expression that contains no interpolation; any
+-- 'StrInterp' makes the key dynamic.
+literalStringKey :: Expr -> Maybe ByteString
 literalStringKey (EStr parts) = mconcat <$> traverse literalPart parts
   where
-    literalPart (StrLit t) = Just t
-    literalPart (StrEsc t) = Just t
+    literalPart (StrLit bytes) = Just bytes
+    literalPart (StrEsc bytes) = Just bytes
     literalPart (StrInterp _) = Nothing
 literalStringKey _ = Nothing
+
+-- | The name a string attribute key spells, the string opening at the
+-- position given.  Attribute names are text here, so a key whose bytes are
+-- not UTF-8 is a syntax error at the string, where upstream makes a symbol
+-- of any bytes (the @attrpath@ and @attrs@ rules, parser.y at 2.24.9).
+attrNameText :: SrcPos -> ByteString -> Parser Text
+attrNameText (SrcPos origin line col) bytes = case TE.decodeUtf8' bytes of
+  Right name -> pure name
+  Left _ ->
+    failWithError
+      ParseError
+        { peFile = sourceName origin,
+          peLine = line,
+          peCol = col,
+          peMessage = "attribute name is not valid UTF-8"
+        }
 
 -- | Convert keyword tokens to their text for use as attribute names.
 -- All Nix keywords are valid as attr keys in binding and select position.

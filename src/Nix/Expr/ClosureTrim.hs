@@ -40,7 +40,7 @@ trimExpr expr = case expr of
   ELit {} -> expr
   EStr parts -> EStr (map trimPart parts)
   EIndStr parts -> EIndStr (map trimPart parts)
-  EPathStr parts -> EPathStr (map trimPart parts)
+  EPathStr headPiece parts -> EPathStr headPiece (map trimPart parts)
   EVar {} -> expr
   EWithVar {} -> expr
   EResolvedVar {} -> expr
@@ -182,7 +182,7 @@ collectFreeVars depth expr = case expr of
   ELit {} -> (Set.empty, False, False)
   EStr parts -> foldParts depth parts
   EIndStr parts -> foldParts depth parts
-  EPathStr parts -> foldParts depth parts
+  EPathStr _ parts -> foldParts depth parts
   EVar _ ->
     -- Any EVar in the body means we need the parent chain for name lookup.
     -- This makes the lambda untrimable.
@@ -335,7 +335,7 @@ rewriteBody depth captureMap expr = case expr of
   ELit {} -> expr
   EStr parts -> EStr (map (rewritePart depth captureMap) parts)
   EIndStr parts -> EIndStr (map (rewritePart depth captureMap) parts)
-  EPathStr parts -> EPathStr (map (rewritePart depth captureMap) parts)
+  EPathStr headPiece parts -> EPathStr headPiece (map (rewritePart depth captureMap) parts)
   EVar {} -> expr
   EWithVar {} -> expr
   EResolvedVar level idx
