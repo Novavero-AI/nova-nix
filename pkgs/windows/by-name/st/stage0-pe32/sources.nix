@@ -1,15 +1,16 @@
-# Everything stage0-pe32's chain reads: the seed, and four repositories at
-# the commits stage0-pe32 pins.  Each repository value is the root of its
-# tree in the store, so a step names a file as "${M2libc}/x86/x86_defs.M1",
-# the path the .cmd reaches it by.
+# Everything stage0-pe32's chain and mescc-tools-extra read: the seed, and
+# five repositories at the commits stage0-pe32 pins.  Each repository value is
+# the root of its tree in the store, so a step names a file as
+# "${M2libc}/x86/x86_defs.M1", the path the .cmd reaches it by.
 #
 # A GitHub archive leaves submodules out, so stage0-pe32's tree has M2-Planet/,
-# M2libc/ and mescc-tools/ as empty directories, and each is fetched at the
-# commit stage0-pe32 records for it (`git submodule status`).  Moving the pin
-# is the stage0-pe32 commit, those submodule commits, the sha256 of each
-# archive and of the seed, the archive names the test suite's stage0-pe32
-# group expects, and the link hashes the Stage0 (Windows) CI job compares
-# against, which stage0-pe32's own CI prints for the new commit.
+# M2libc/, mescc-tools/ and mescc-tools-extra/ as empty directories, and each
+# is fetched at the commit stage0-pe32 records for it (`git submodule
+# status`).  Moving the pin is the stage0-pe32 commit, those submodule commits,
+# the sha256 of each archive and of the seed, the archive names the test
+# suite's stage0-pe32 group expects, and the link hashes the Stage0 (Windows)
+# CI job compares against, which stage0-pe32's own CI prints for the new
+# commit.
 { fetchurl }:
 let
   stage0-pe32Rev = "28ec2d263dc144b674250c9939f2df66d2f67120";
@@ -78,5 +79,15 @@ in
     repo = "mescc-tools";
     rev = "578ac99623d291e2b9eacf03cacc390cfe512661";
     sha256 = "e7539f945f280b615e53183d538c25fdd99f4dc492a7e513ae3d141fe7626a1c";
+  };
+
+  # Upstream's, unforked: stage0-pe32 vendors it with nothing on top.  Its own
+  # M2libc submodule is not fetched; its programs compile against the fork
+  # above, as mescc-tools' do.
+  mescc-tools-extra = fromGitHub {
+    owner = "oriansj";
+    repo = "mescc-tools-extra";
+    rev = "d1d814602d83226c5a5e597e13dc8013a005ce76";
+    sha256 = "285b3c747361ce288f4b5750e1271f633d88e9a7aa722a06887d07c07f307598";
   };
 }

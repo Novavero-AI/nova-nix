@@ -1,19 +1,21 @@
 # stage0-pe32's chain, from a 1,623-byte PE32 seed to hex0, hex1, hex2, catm,
 # M0, cc_x86, M2 (M2-Planet), M1, hex2-new and kaem, each link built by the
-# links below it.
+# links below it, and mescc-tools-extra's programs built by those links.
 #
-# Each step, from hex0 down, is one command of stage0-pe32's
+# Each step of the chain, from hex0 down, is one command of stage0-pe32's
 # x86/mescc-tools-mini.cmd, in the same order, and its derivation is named for
 # the file that command writes, so the two read side by side.  The builder is
 # the program the command runs and the args are its arguments: a file it
 # reads from artifact\ is the output of the step that wrote it, and the file
 # it writes is $out, the step's one output.  A link's attribute is its
-# program's name, and an intermediate file's is its name with the dot
-# spelled as an underscore.
+# program's name, and up to M1 an intermediate file's is its name with the
+# dot spelled as an underscore.  mescc-tools-extra's programs take the steps
+# the .cmd gives kaem.
 #
 # The links are 32-bit PE, which x64 Windows runs through WoW64, so every step
 # is an i686-windows derivation.  Nothing else runs: no cmd.exe, no shell, and
-# nothing from the MSYS2 seed.  The set is the seed and the ten links.
+# nothing from the MSYS2 seed.  The set is the seed, the ten links and
+# mescc-tools-extra.
 { fetchurl }:
 let
   sources = import ./sources.nix { inherit fetchurl; };
@@ -206,105 +208,233 @@ let
     out
   ];
 
-  # Phase-7: hex2 from C, on M2libc's full POSIX layer.
-  hex2_linker_M1 =
-    compile "hex2_linker.M1"
-      [
-        "-D"
-        "__windows__=1"
-      ]
-      [
-        "${M2libc}/sys/types.h"
-        "${M2libc}/stddef.h"
-        "${M2libc}/sys/utsname.h"
-        "${M2libc}/x86/windows/ntdll.c"
-        "${M2libc}/x86/windows/unistd.c"
-        "${M2libc}/x86/windows/process.c"
-        "${M2libc}/x86/windows/fcntl.c"
-        "${M2libc}/fcntl.c"
-        "${M2libc}/x86/windows/sys/stat.c"
-        "${M2libc}/ctype.c"
-        "${M2libc}/stdlib.c"
-        "${M2libc}/stdarg.h"
-        "${M2libc}/stdio.h"
-        "${M2libc}/stdio.c"
-        "${M2libc}/bootstrappable.c"
-        "${mescc-tools}/hex2.h"
-        "${mescc-tools}/hex2_linker.c"
-        "${mescc-tools}/hex2_word.c"
-        "${mescc-tools}/hex2.c"
+  # From Phase-7 on, a program is C on M2libc's full POSIX layer, and becomes
+  # an executable in the same five steps: M2 compiles the C library and the
+  # program's sources in one pass, catm puts the instruction definitions, the
+  # startup, the full library's init and pe-end-shim.M1 around that, M0
+  # assembles it, catm puts the PE header and the ntdll plumbing in front, and
+  # hex2 links it.  The files between are named for stem, as the .cmd names
+  # them, and the executable for name.
+  program =
+    {
+      name,
+      stem ? name,
+      libc,
+      sources,
+    }:
+    let
+      compiled =
+        compile "${stem}.M1"
+          [
+            "-D"
+            "__windows__=1"
+          ]
+          (libc ++ sources);
+      withLibc = join "${stem}-0.M1" [
+        x86Defs
+        libcCore
+        libcFull
+        compiled
+        peEndShim
       ];
-  hex2_linker-0_M1 = join "hex2_linker-0.M1" [
-    x86Defs
-    libcCore
-    libcFull
-    hex2_linker_M1
-    peEndShim
+      assembled = step "${stem}.hex2" M0 [
+        withLibc
+        out
+      ];
+      withHeader = join "${stem}-0.hex2" [
+        peHeader
+        ntdll
+        assembled
+      ];
+    in
+    step "${name}.exe" hex2 [
+      withHeader
+      out
+    ];
+
+  m2libc = map (file: "${M2libc}/${file}");
+
+  # M2libc on its x86/windows target, in the order M2-Planet needs the
+  # declarations.  Without --expand-includes M2-Planet skips every #include
+  # line, so every file a program's #include lines reach is named here
+  # instead.  Under __M2__, <stdio.h> reaches
+  # stdio.c, and through it sys/types.h, stddef.h, stdarg.h, fcntl.h,
+  # unistd.h, sys/stat.h, stdlib.h and ctype.h; where those headers name
+  # x86/linux/ for __i386__, the Windows target's files stand in, its unistd.c
+  # split into ntdll.c, unistd.c and process.c.  That unistd.c calls
+  # bootstrappable.c's int2str, so bootstrappable.c is in every list.
+  libcBase = m2libc [
+    "sys/types.h"
+    "stddef.h"
+    "sys/utsname.h"
+    "x86/windows/ntdll.c"
+    "x86/windows/unistd.c"
+    "x86/windows/process.c"
+    "x86/windows/fcntl.c"
+    "fcntl.c"
+    "x86/windows/sys/stat.c"
+    "ctype.c"
+    "stdlib.c"
   ];
-  hex2_linker_hex2 = step "hex2_linker.hex2" M0 [
-    hex2_linker-0_M1
-    out
-  ];
-  hex2_linker-0_hex2 = join "hex2_linker-0.hex2" [
-    peHeader
-    ntdll
-    hex2_linker_hex2
-  ];
-  hex2-new = step "hex2-new.exe" hex2 [
-    hex2_linker-0_hex2
-    out
+  libcStdio = m2libc [
+    "stdarg.h"
+    "stdio.h"
+    "stdio.c"
+    "bootstrappable.c"
   ];
 
-  # Phase-8: kaem, the shell the stages after this one are written for.  It
-  # compiles like hex2-new, plus string.c.
-  kaem_M1 =
-    compile "kaem.M1"
-      [
-        "-D"
-        "__windows__=1"
-      ]
-      [
-        "${M2libc}/sys/types.h"
-        "${M2libc}/stddef.h"
-        "${M2libc}/sys/utsname.h"
-        "${M2libc}/x86/windows/ntdll.c"
-        "${M2libc}/x86/windows/unistd.c"
-        "${M2libc}/x86/windows/process.c"
-        "${M2libc}/x86/windows/fcntl.c"
-        "${M2libc}/fcntl.c"
-        "${M2libc}/x86/windows/sys/stat.c"
-        "${M2libc}/ctype.c"
-        "${M2libc}/stdlib.c"
-        "${M2libc}/string.c"
-        "${M2libc}/stdarg.h"
-        "${M2libc}/stdio.h"
-        "${M2libc}/stdio.c"
-        "${M2libc}/bootstrappable.c"
-        "${mescc-tools}/Kaem/kaem.h"
-        "${mescc-tools}/Kaem/variable.c"
-        "${mescc-tools}/Kaem/kaem_globals.c"
-        "${mescc-tools}/Kaem/kaem.c"
-      ];
-  kaem-0_M1 = join "kaem-0.M1" [
-    x86Defs
-    libcCore
-    libcFull
-    kaem_M1
-    peEndShim
-  ];
-  kaem_hex2 = step "kaem.hex2" M0 [
-    kaem-0_M1
-    out
-  ];
-  kaem-0_hex2 = join "kaem-0.hex2" [
-    peHeader
-    ntdll
-    kaem_hex2
-  ];
-  kaem = step "kaem.exe" hex2 [
-    kaem-0_hex2
-    out
-  ];
+  # The list for a program whose sources include the M2libc headers in
+  # includes.  Every program here includes <stdio.h>, and of the others they
+  # include only <string.h> reaches a file <stdio.h> does not, string.c,
+  # which comes after the stdlib.c it calls; <stdint.h> and <sys/wait.h> are
+  # empty under __M2__.
+  libcFor =
+    includes:
+    libcBase
+    ++ (if builtins.elem "string.h" includes then m2libc [ "string.c" ] else [ ])
+    ++ libcStdio;
+
+  # Phase-7: hex2 from C.  The .cmd leaves out the string.c that hex2.h's
+  # <string.h> would bring in, and hex2 calls nothing in it.
+  hex2-new = program {
+    name = "hex2-new";
+    stem = "hex2_linker";
+    libc = libcBase ++ libcStdio;
+    sources = [
+      "${mescc-tools}/hex2.h"
+      "${mescc-tools}/hex2_linker.c"
+      "${mescc-tools}/hex2_word.c"
+      "${mescc-tools}/hex2.c"
+    ];
+  };
+
+  # Phase-8: kaem, the shell the stages after this one are written for.
+  kaem = program {
+    name = "kaem";
+    libc = libcFor [
+      "stdio.h"
+      "stdlib.h"
+      "string.h"
+      "unistd.h"
+      "sys/wait.h"
+      "bootstrappable.h"
+    ];
+    sources = [
+      "${mescc-tools}/Kaem/kaem.h"
+      "${mescc-tools}/Kaem/variable.c"
+      "${mescc-tools}/Kaem/kaem_globals.c"
+      "${mescc-tools}/Kaem/kaem.c"
+    ];
+  };
+
+  # The programs upstream's mescc-tools-extra.kaem builds, each from its one C
+  # file, with the M2libc headers its #include lines name.  Upstream compiles
+  # them with M2-Mesoplanet, which has no Windows target.
+  mescc-tools-extra =
+    builtins.mapAttrs
+      (
+        name: includes:
+        program {
+          inherit name;
+          libc = libcFor includes;
+          sources = [ "${sources.mescc-tools-extra}/${name}.c" ];
+        }
+      )
+      {
+        sha256sum = [
+          "string.h"
+          "stdio.h"
+          "stdlib.h"
+          "bootstrappable.h"
+        ];
+        match = [
+          "stdio.h"
+          "string.h"
+          "bootstrappable.h"
+        ];
+        mkdir = [
+          "stdio.h"
+          "string.h"
+          "sys/stat.h"
+          "stdlib.h"
+          "bootstrappable.h"
+        ];
+        untar = [
+          "stdio.h"
+          "stdlib.h"
+          "string.h"
+          "sys/stat.h"
+          "bootstrappable.h"
+        ];
+        ungz = [
+          "stdio.h"
+          "stdlib.h"
+          "string.h"
+          "bootstrappable.h"
+        ];
+        unbz2 = [
+          "stdio.h"
+          "string.h"
+          "stdlib.h"
+          "unistd.h"
+          "fcntl.h"
+          "bootstrappable.h"
+        ];
+        unxz = [
+          "stdio.h"
+          "string.h"
+          "unistd.h"
+          "stdint.h"
+          "stdlib.h"
+          "bootstrappable.h"
+        ];
+        catm = [
+          "stdio.h"
+          "stdlib.h"
+          "unistd.h"
+          "fcntl.h"
+        ];
+        cp = [
+          "stdio.h"
+          "stdlib.h"
+          "string.h"
+          "unistd.h"
+          "fcntl.h"
+          "bootstrappable.h"
+        ];
+        chmod = [
+          "stdio.h"
+          "stdlib.h"
+          "string.h"
+          "unistd.h"
+          "fcntl.h"
+          "sys/stat.h"
+          "bootstrappable.h"
+        ];
+        rm = [
+          "stdio.h"
+          "string.h"
+          "unistd.h"
+          "stdlib.h"
+          "bootstrappable.h"
+        ];
+        replace = [
+          "stdio.h"
+          "stdlib.h"
+          "string.h"
+          "unistd.h"
+          "bootstrappable.h"
+        ];
+        wrap = [
+          "fcntl.h"
+          "stdio.h"
+          "stdlib.h"
+          "string.h"
+          "sys/stat.h"
+          "unistd.h"
+          "bootstrappable.h"
+        ];
+      };
 in
 {
   inherit
@@ -319,5 +449,6 @@ in
     M1
     hex2-new
     kaem
+    mescc-tools-extra
     ;
 }
