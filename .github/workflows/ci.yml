@@ -538,8 +538,9 @@ jobs:
   # Stage0 (Windows): stage0-pe32's chain, from its 1,623-byte seed to kaem,
   # built by the executable this repo ships as one derivation per command of
   # x86/mescc-tools-mini.cmd.  Each link has to be the file stage0-pe32's own
-  # CI builds with cmd.exe, byte for byte, and hex0 has to be the seed.  No
-  # store cache, for the reason E2E (Windows) has none.
+  # CI builds with cmd.exe, byte for byte, and hex0 has to be the seed.  Then
+  # mescc-tools-extra's thirteen programs, built by those links, each run
+  # once.  No store cache, for the reason E2E (Windows) has none.
   # ---------------------------------------------------------------------------
 
   stage0-windows:
@@ -613,6 +614,105 @@ jobs:
           hex2-new 651adcaf8103611d98f64e1aced968e5ba8a515ed7308375655e4615983cf133
           kaem 7f4ddcc3e61bee059b5d1feec9598c0f2b7d8f2b77649dd231f20821390a9c70
           EOF
+          exit "$status"
+
+      - name: Build mescc-tools-extra
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in sha256sum match mkdir untar ungz unbz2 unxz catm cp chmod rm replace wrap; do
+            out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "stage0-pe32.mescc-tools-extra.$name" | tail -n 1)
+            echo "$name $(cygpath -u "$out")" >> "$RUNNER_TEMP/extra.txt"
+          done
+          cat "$RUNNER_TEMP/extra.txt"
+
+      # Each program once, from its store path, on the fixtures in
+      # test/data/mescc-tools-extra: hello.txt, one line, and that line packed
+      # four ways.  They were written on macOS, and the same commands write the
+      # same bytes again (Python 3's tarfile, Apple gzip 487, bzip2 1.0.8, xz
+      # 5.8.4):
+      #   printf 'stage0-pe32 builds mescc-tools-extra\n' > hello.txt
+      #   python3 -c 'import io, tarfile; d = open("hello.txt", "rb").read(); t = tarfile.open("hello.tar", "w", format=tarfile.USTAR_FORMAT); i = tarfile.TarInfo("files"); i.type = tarfile.DIRTYPE; i.mode = 0o755; t.addfile(i); i = tarfile.TarInfo("files/hello.txt"); i.size = len(d); i.mode = 0o644; t.addfile(i, io.BytesIO(d)); t.close()'
+      #   gzip -9n < hello.txt > hello.txt.gz
+      #   bzip2 -9 < hello.txt > hello.txt.bz2
+      #   xz -9 --check=crc64 < hello.txt > hello.txt.xz
+      # Each result is checked against a fixture, hello.txt's known SHA-256 or
+      # bytes the runner's own printf and cat write, never against another
+      # program under test.  rm, mkdir -p and untar exit 0 even when they
+      # fail, so their results are checked on disk.  chmod changes nothing on
+      # Windows and says so by exiting 0; a file that is not there still
+      # fails it.  wrap bind-mounts /dev and /proc into the working directory
+      # to chroot there, so it stops at its first mount, which M2libc's
+      # Windows mount refuses.
+      - name: mescc-tools-extra runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          declare -A tool
+          while read -r name path; do tool[$name]=$path; done < "$RUNNER_TEMP/extra.txt"
+          run() { local name=$1; shift; "${tool[$name]}" "$@"; }
+          status=0
+          pass() { echo "ok    $1"; }
+          fail() { echo "::error::$1"; status=1; }
+          expect_exit() {
+            local want=$1 code=0
+            shift
+            run "$@" || code=$?
+            if [ "$code" = "$want" ]; then pass "$* exits $code"; else fail "$* exits $code, not $want"; fi
+          }
+          same() { if cmp "$1" "$2"; then pass "$3"; else fail "$3: $2 is not $1"; fi; }
+
+          work="$(cygpath -u "$RUNNER_TEMP")/mescc-tools-extra"
+          mkdir "$work"
+          cp test/data/mescc-tools-extra/* "$work"
+          cd "$work" || exit 1
+          hello=1aa502522f8046e4c671fcff6da0e9bb3bbac2526fd653d93a71f98dd389b6ab
+
+          got=$(run sha256sum hello.txt)
+          if [ "$got" = "$hello  hello.txt" ]; then pass "sha256sum: $got"; else fail "sha256sum printed: $got"; fi
+          printf '%s  hello.txt\n' "$hello" > hello.sha256
+          expect_exit 0 sha256sum -c hello.sha256
+          printf '%064d  hello.txt\n' 0 > wrong.sha256
+          expect_exit 1 sha256sum -c wrong.sha256
+
+          expect_exit 0 match same same
+          expect_exit 1 match same other
+
+          expect_exit 0 mkdir -p made/a/b
+          if [ -d made/a/b ]; then pass "mkdir -p made/a/b made it"; else fail "mkdir -p made/a/b made nothing"; fi
+
+          expect_exit 0 cp hello.txt copy.txt
+          same hello.txt copy.txt "cp copies the bytes"
+          expect_exit 0 catm twice.txt hello.txt hello.txt
+          cat hello.txt hello.txt > twice-want.txt
+          same twice-want.txt twice.txt "catm joins the bytes"
+          expect_exit 0 replace --file hello.txt --match-on builds --replace-with built --output replaced.txt
+          printf 'stage0-pe32 built mescc-tools-extra\n' > replaced-want.txt
+          same replaced-want.txt replaced.txt "replace replaces"
+
+          expect_exit 0 chmod 755 copy.txt
+          expect_exit 1 chmod 755 missing.txt
+          expect_exit 0 rm copy.txt
+          if [ ! -e copy.txt ]; then pass "rm removed copy.txt"; else fail "rm left copy.txt"; fi
+
+          expect_exit 0 untar --file hello.tar
+          same hello.txt files/hello.txt "untar extracts files/hello.txt"
+          expect_exit 0 ungz --file hello.txt.gz --output from-gz.txt
+          same hello.txt from-gz.txt "ungz decompresses"
+          expect_exit 0 unbz2 --file hello.txt.bz2 --output from-bz2.txt
+          same hello.txt from-bz2.txt "unbz2 decompresses"
+          expect_exit 0 unxz --file hello.txt.xz --output from-xz.txt
+          same hello.txt from-xz.txt "unxz decompresses"
+
+          mkdir wrapped
+          cd wrapped || exit 1
+          code=0
+          said=$(run wrap "${tool[match]}" same same 2>&1) || code=$?
+          if [ "$code" = 1 ] && [ "$said" = "Failed to mount directory dev/null" ]; then
+            pass "wrap stops at its first mount"
+          else
+            fail "wrap exited $code and said: $said"
+          fi
           exit "$status"
 
   # ---------------------------------------------------------------------------

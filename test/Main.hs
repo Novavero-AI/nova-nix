@@ -10658,13 +10658,16 @@ testPkgsFetchurl = do
       ]
 
 -- | @pkgs/windows@'s stage0-pe32 chain, read back as the build driver reads
--- it: every derivation reachable from the seed and the ten links.  The chain
--- is full-source only if nothing reaches it but the seed and the sources, so
--- the graph's leaves are exactly those five fetches, no derivation takes a
--- plain input source, and each of the thirty commands of stage0-pe32's
--- @x86\/mescc-tools-mini.cmd@ is a step run by a program the graph builds.
--- hex0 carries the seed's hash as its own, so the build itself checks that
--- the seed reproduces itself.
+-- it: every derivation reachable from the seed, the ten links and
+-- mescc-tools-extra's thirteen programs.  The chain is full-source only if
+-- nothing reaches it but the seed and the sources, so the graph's leaves are
+-- exactly those six fetches, no derivation takes a plain input source, and
+-- each of the thirty commands of stage0-pe32's @x86\/mescc-tools-mini.cmd@,
+-- and each of the five steps of every mescc-tools-extra program, is a step run
+-- by a program the graph builds.  Every program built from C, hex2-new and kaem
+-- included, is those five steps with the arguments the .cmd gives kaem.  hex0
+-- carries the seed's hash as its own, so the build itself checks that the
+-- seed reproduces itself.
 testStage0Pe32Chain :: IO [Bool]
 testStage0Pe32Chain = do
   putStrLn "pkgs/stage0-pe32"
@@ -10683,6 +10686,8 @@ testStage0Pe32Chain = do
             chain,
             "; in builtins.concatStringsSep \" \" (map (name: chain.${name}.drvPath) [ ",
             T.unwords (map quoted ("seed" : links)),
+            " ] ++ map (name: chain.mescc-tools-extra.${name}.drvPath) [ ",
+            T.unwords (map quoted extras),
             " ])"
           ]
   outcome <- case parseNix cwd "<test>" source of
@@ -10693,7 +10698,7 @@ testStage0Pe32Chain = do
         VStr bytes _ -> do
           let roots = T.words (bytesText bytes)
           graph <- sessionClosure roots
-          pure (Map.fromList (zip ("seed" : links) roots), graph)
+          pure (Map.fromList (zip (("seed" : links) ++ map extraAttr extras) roots), graph)
         other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
   case outcome of
     Left err -> sequence [runTest instantiates (Fail err)]
@@ -10710,31 +10715,55 @@ testStage0Pe32Chain = do
           builtBy attr = Map.lookup attr rootOf >>= (`Map.lookup` graph)
           builderNamesOf drv = [nameOf input | input <- inputsOf drv, drvBuilder drv `elem` outOf input]
           fixedHashOf drv = [(doHashAlgo o, doHash o) | o <- drvOutputs drv, doName o == "out"]
+          isStep drv = drvBuilder drv `notElem` [fetchurlBuilder, builtinUnpackBuilder]
+          -- A program's steps, last first: each step after the compile has
+          -- one input that is a step and not the program it runs.
+          stepsBack drv = drv : maybe [] stepsBack (listToMaybe [input | input <- inputsOf drv, isStep input, drvBuilder drv `notElem` outOf input])
+          -- An argument as the .cmd spells it: the step's own output, which
+          -- the .drv holds as its placeholder until the build, as $out,
+          -- another step's output by that step's name, and a file in an
+          -- unpacked repository as <repo>/<path>.
+          spell drv arg
+            | bytesText arg == hashPlaceholder "out" = "$out"
+            | otherwise =
+                fromMaybe (bytesText arg) $
+                  listToMaybe ([nameOf input | input <- inputsOf drv, arg `elem` outOf input] ++ mapMaybe (inRepository arg) unpacks)
+          inRepository arg unpack = do
+            root <- listToMaybe (outOf unpack)
+            rest <- BS.stripPrefix (root <> "/") arg
+            let repo = T.dropEnd 1 (fst (T.breakOnEnd "-" (nameOf unpack)))
+            pure (repo <> "/" <> bytesText (BS.drop 1 (BS8.dropWhile (/= '/') rest)))
+          command drv = (nameOf drv, builderNamesOf drv, map (spell drv) (drvArgs drv))
       sequence
         [ runTest instantiates $
-            assertEqual "steps, unpacks, fetches" (30, 4, 5) (length steps, length unpacks, length fetches),
+            assertEqual "steps, unpacks, fetches" (95, 5, 6) (length steps, length unpacks, length fetches),
           runTest "no derivation of the chain takes a plain input source" $
             case [nameOf drv | drv <- derivations, not (null (drvInputSrcs drv))] of
               [] -> Pass
               named -> Fail ("input sources in: " <> T.intercalate ", " named),
-          runTest "the chain's leaves are the seed and the four source archives, all fixed-output" $
+          runTest "the chain's leaves are the seed and the five source archives, all fixed-output" $
             assertEqual
               "leaves"
-              (sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-f0b1726.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "stage0-pe32-28ec2d2.tar.gz"], True)
+              (sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-f0b1726.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "mescc-tools-extra-d1d8146.tar.gz", "stage0-pe32-28ec2d2.tar.gz"], True)
               ( sort (map nameOf leaves),
                 all (\drv -> drvBuilder drv == fetchurlBuilder && isFixedOutput drv) leaves
               ),
           runTest "each source archive is unpacked from its fetch alone" $
-            assertEqual "unpack inputs" (replicate 4 [fetchurlBuilder]) [map drvBuilder (inputsOf drv) | drv <- unpacks],
+            assertEqual "unpack inputs" (replicate 5 [fetchurlBuilder]) [map drvBuilder (inputsOf drv) | drv <- unpacks],
           runTest "every step is an i686-windows derivation" $
             case [nameOf drv | drv <- steps, drvPlatform drv /= I686_Windows] of
               [] -> Pass
               named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
-          runTest "each step is run by an input, the program its .cmd command runs" $
+          runTest "each step is run by an input, the program its command runs" $
             assertEqual
               "file written, program run"
-              (sort [(written, [program]) | (written, program) <- commands])
+              (sort ([(written, [program]) | (written, program) <- commands] ++ [(written, program) | (_, built) <- extraPrograms, (written, program, _) <- built]))
               (sort [(nameOf drv, builderNamesOf drv) | drv <- steps]),
+          runTest "each program built from C is the five steps that build kaem, with their arguments" $
+            assertEqual
+              "file written, program run, arguments"
+              (cmdPrograms ++ extraPrograms)
+              [(attr, maybe [] (map command . reverse . stepsBack) (builtBy attr)) | (attr, _) <- cmdPrograms ++ extraPrograms],
           runTest "hex0 is fixed-output to the seed's own hash" $
             case (fixedHashOf <$> builtBy "seed", fixedHashOf <$> builtBy "hex0") of
               (Just seedHash@[(_, digest)], Just hex0Hash)
@@ -10743,11 +10772,49 @@ testStage0Pe32Chain = do
         ]
   where
     instantiates :: Text
-    instantiates = "the chain instantiates: thirty steps, four unpacks and five fetches"
+    instantiates = "the chain instantiates: ninety-five steps, five unpacks and six fetches"
     fetchurlBuilder :: BS.ByteString
     fetchurlBuilder = "builtin:fetchurl"
     links :: [Text]
     links = ["hex0", "hex1", "hex2", "catm", "M0", "cc_x86", "M2", "M1", "hex2-new", "kaem"]
+    extras :: [Text]
+    extras = ["sha256sum", "match", "mkdir", "untar", "ungz", "unbz2", "unxz", "catm", "cp", "chmod", "rm", "replace", "wrap"]
+    extraAttr :: Text -> Text
+    extraAttr = ("mescc-tools-extra." <>)
+    -- The steps that build a C program on M2libc's POSIX layer, named for
+    -- stem: the file each writes, the program it runs and its arguments.
+    cProgram :: Text -> Text -> [Text] -> [(Text, [Text], [Text])]
+    cProgram executable stem files =
+      [ (stem <> ".M1", ["M2.exe"], ["--architecture", "x86", "-D", "__windows__=1"] ++ concatMap (\file -> ["-f", file]) files ++ ["-o", "$out"]),
+        (stem <> "-0.M1", ["catm.exe"], ["$out", "M2libc/x86/x86_defs.M1", "stage0-pe32/x86/libc-core.M1", "stage0-pe32/x86/libc-full.M1", stem <> ".M1", "stage0-pe32/x86/pe-end-shim.M1"]),
+        (stem <> ".hex2", ["M0.exe"], [stem <> "-0.M1", "$out"]),
+        (stem <> "-0.hex2", ["catm.exe"], ["$out", "stage0-pe32/x86/PE32-i386.hex2", "stage0-pe32/x86/ntdll-i386.hex2", stem <> ".hex2"]),
+        (executable, ["hex2.exe"], [stem <> "-0.hex2", "$out"])
+      ]
+    -- Phase-7's M2libc files, which are what <stdio.h> reaches on the
+    -- x86/windows target and bootstrappable.c, and Phase-8's, which add the
+    -- string.c that <string.h> reaches.  catm is the one program here that
+    -- does not include <string.h>.
+    libcPosix :: [Text]
+    libcPosix = map ("M2libc/" <>) (libcBelowString ++ libcAboveString)
+    libcString :: [Text]
+    libcString = map ("M2libc/" <>) (libcBelowString ++ ["string.c"] ++ libcAboveString)
+    libcBelowString :: [Text]
+    libcBelowString = ["sys/types.h", "stddef.h", "sys/utsname.h", "x86/windows/ntdll.c", "x86/windows/unistd.c", "x86/windows/process.c", "x86/windows/fcntl.c", "fcntl.c", "x86/windows/sys/stat.c", "ctype.c", "stdlib.c"]
+    libcAboveString :: [Text]
+    libcAboveString = ["stdarg.h", "stdio.h", "stdio.c", "bootstrappable.c"]
+    -- The .cmd's two programs built from C and mescc-tools-extra's, by
+    -- attribute, with the steps that build each.
+    cmdPrograms :: [(Text, [(Text, [Text], [Text])])]
+    cmdPrograms =
+      [ ("hex2-new", cProgram "hex2-new.exe" "hex2_linker" (libcPosix ++ map ("mescc-tools/" <>) ["hex2.h", "hex2_linker.c", "hex2_word.c", "hex2.c"])),
+        ("kaem", cProgram "kaem.exe" "kaem" (libcString ++ map ("mescc-tools/Kaem/" <>) ["kaem.h", "variable.c", "kaem_globals.c", "kaem.c"]))
+      ]
+    extraPrograms :: [(Text, [(Text, [Text], [Text])])]
+    extraPrograms =
+      [ (extraAttr name, cProgram (name <> ".exe") name ((if name == "catm" then libcPosix else libcString) ++ ["mescc-tools-extra/" <> name <> ".c"]))
+      | name <- extras
+      ]
     -- Each command of the .cmd: the file it writes and the program it runs.
     commands :: [(Text, Text)]
     commands =
