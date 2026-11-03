@@ -12,7 +12,7 @@
 # against, which stage0-pe32's own CI prints for the new commit.
 { fetchurl }:
 let
-  stage0-pe32Rev = "4b5915ca4fd1c4483cbde8f3c256d67c9570b7b2";
+  stage0-pe32Rev = "28ec2d263dc144b674250c9939f2df66d2f67120";
 
   # GitHub's archive of one commit, fetched and unpacked.  The archive holds a
   # single directory, <repo>-<rev>, which is the value.  The sha256 is of the
@@ -56,7 +56,7 @@ in
     owner = "Novavero-AI";
     repo = "stage0-pe32";
     rev = stage0-pe32Rev;
-    sha256 = "d4df5a63ae7ec695f41e80a7cdf4138ed427cab58682f96d84ab8830b873a988";
+    sha256 = "07f79606425e488b8b50f72fb09014514d331a0d331c789a1e8b0175cdade97e";
   };
 
   M2-Planet = fromGitHub {
