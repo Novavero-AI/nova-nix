@@ -225,8 +225,9 @@ data RealiseEffects m = RealiseEffects
   { reSubst :: !(SubstEffects m),
     -- | Are all of this derivation's outputs valid?
     reAllValid :: !(Derivation -> m Bool),
-    -- | Build one derivation, whose inputs are realised.
-    reBuild :: !(Derivation -> m (Either Text ())),
+    -- | Build one derivation, whose inputs are realised, given its @.drv@
+    -- path.
+    reBuild :: !(Derivation -> StorePath -> m (Either Text ())),
     -- | Report how a derivation was realised.
     reReport :: !(Realised -> Derivation -> m ())
   }
@@ -283,7 +284,7 @@ realiseNode fallback effects graph visited node
             (ClosureComplete, _) -> reported Substituted drv realised
             (_, Just failure) -> pure (Left failure)
             (_, Nothing) -> do
-              built <- reBuild effects drv
+              built <- reBuild effects drv node
               case built of
                 Left err -> pure (Left (BuildFailed err))
                 Right () -> reported Built drv realised

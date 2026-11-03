@@ -24,9 +24,10 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (isDigit)
 import Data.Functor.Identity (Identity (..))
+import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.List (intercalate, isPrefixOf, mapAccumL, sort)
+import Data.List (inits, intercalate, isPrefixOf, mapAccumL, sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
@@ -51,7 +52,7 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
@@ -4805,7 +4806,7 @@ fakeRealiseEffects failing =
   Realise.RealiseEffects
     { Realise.reSubst = fakeSubst,
       Realise.reAllValid = \drv -> gets (\world -> all (\out -> Set.member (doPath out) (fwValid world)) (drvOutputs drv)),
-      Realise.reBuild = \drv -> do
+      Realise.reBuild = \drv _ -> do
         let name = fakeDrvName drv
         if Set.member name failing
           then pure (Left ("building " <> name <> " failed"))
@@ -8224,7 +8225,7 @@ testTrivialBuildIO = do
     forceRemoveIfExists buildTmp
     createDirectoryIfMissing True buildTmp
     let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
-    result <- buildDerivation config store drv
+    result <- buildDerivation config store drv testDrvPath
     forceRemoveIfExists buildTmp
     case result of
       BuildSuccess sp -> do
@@ -8282,7 +8283,7 @@ testBuildLogIO = do
             result <-
               bracket (openStore (StoreDir tmpStore)) closeStore $ \store ->
                 withBinaryFile logFile mode $ \logHandle ->
-                  buildDerivation (defaultBuildConfig (stDir store)) {bcTmpDir = buildTmp, bcBuildLog = logHandle} store drv
+                  buildDerivation (defaultBuildConfig (stDir store)) {bcTmpDir = buildTmp, bcBuildLog = logHandle} store drv testDrvPath
             logged <- BS.readFile logFile
             pure (result, logged)
           )
@@ -8512,7 +8513,7 @@ testSourceDateEpochIO = do
     forceRemoveIfExists buildTmp
     createDirectoryIfMissing True buildTmp
     let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
-    result <- buildDerivation config store drv
+    result <- buildDerivation config store drv testDrvPath
     forceRemoveIfExists buildTmp
     case result of
       BuildFailure msg code ->
@@ -8570,9 +8571,9 @@ testScrubbedBuildEnvIO = do
     createDirectoryIfMissing True buildTmp
     let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
     setEnv "NOVA_NIX_TEST_CANARY" "ambient-leak"
-    canaryResult <- buildDerivation config store canaryDrv
+    canaryResult <- buildDerivation config store canaryDrv testDrvPath
     unsetEnv "NOVA_NIX_TEST_CANARY"
-    quartetResult <- buildDerivation config store quartetDrv
+    quartetResult <- buildDerivation config store quartetDrv testDrvPath
     forceRemoveIfExists buildTmp
     sequence
       [ runTestM "an undeclared ambient variable does not reach a build" $
@@ -8799,21 +8800,21 @@ testUnpackBuildIO = do
       forceRemoveIfExists buildTmp
       createDirectoryIfMissing True buildTmp
       let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
-      seedResult <- buildDerivation config store (mkUnpackDrv seedOut [archiveTools, archiveData])
-      collideResult <- buildDerivation config store (mkUnpackDrv collideOut [archiveTools, archiveCollide])
-      escapeResult <- buildDerivation config store (mkUnpackDrv escapeOut [archiveEscape])
-      rootFileResult <- buildDerivation config store (mkUnpackDrv rootFileOut [archiveRootFile])
-      escapeSymlinkResult <- buildDerivation config store (mkUnpackDrv escapeSymlinkOut [archiveEscapeSymlink])
-      escapeHardlinkResult <- buildDerivation config store (mkUnpackDrv escapeHardlinkOut [archiveEscapeHardlink])
-      dirLinkResult <- buildDerivation config store (mkUnpackDrv dirLinkOut [archiveDirLink])
-      dirLinkCollideResult <- buildDerivation config store (mkUnpackDrv dirLinkCollideOut [archiveDirLinkBase, archiveDirLinkCollide])
-      hardLinkCollideResult <- buildDerivation config store (mkUnpackDrv hardLinkCollideOut [archiveDirLinkBase, archiveHardLinkCollide])
+      seedResult <- buildDerivation config store (mkUnpackDrv seedOut [archiveTools, archiveData]) testDrvPath
+      collideResult <- buildDerivation config store (mkUnpackDrv collideOut [archiveTools, archiveCollide]) testDrvPath
+      escapeResult <- buildDerivation config store (mkUnpackDrv escapeOut [archiveEscape]) testDrvPath
+      rootFileResult <- buildDerivation config store (mkUnpackDrv rootFileOut [archiveRootFile]) testDrvPath
+      escapeSymlinkResult <- buildDerivation config store (mkUnpackDrv escapeSymlinkOut [archiveEscapeSymlink]) testDrvPath
+      escapeHardlinkResult <- buildDerivation config store (mkUnpackDrv escapeHardlinkOut [archiveEscapeHardlink]) testDrvPath
+      dirLinkResult <- buildDerivation config store (mkUnpackDrv dirLinkOut [archiveDirLink]) testDrvPath
+      dirLinkCollideResult <- buildDerivation config store (mkUnpackDrv dirLinkCollideOut [archiveDirLinkBase, archiveDirLinkCollide]) testDrvPath
+      hardLinkCollideResult <- buildDerivation config store (mkUnpackDrv hardLinkCollideOut [archiveDirLinkBase, archiveHardLinkCollide]) testDrvPath
       let tinyBudget bytes entries =
             config {bcUnpackLimits = UnpackLimits {ulMaxBytes = bytes, ulMaxEntries = entries}}
-      manyEntriesResult <- buildDerivation (tinyBudget 1000000 4) store (mkUnpackDrv manyEntriesOut [archiveManyEntries])
-      bigFileResult <- buildDerivation (tinyBudget 64 1000) store (mkUnpackDrv bigFileOut [archiveBigFile])
-      amplifyResult <- buildDerivation (tinyBudget 100 1000) store (mkUnpackDrv amplifyOut [archiveAmplify])
-      gitHubResult <- buildDerivation config store (mkUnpackDrv gitHubOut [archiveGitHub])
+      manyEntriesResult <- buildDerivation (tinyBudget 1000000 4) store (mkUnpackDrv manyEntriesOut [archiveManyEntries]) testDrvPath
+      bigFileResult <- buildDerivation (tinyBudget 64 1000) store (mkUnpackDrv bigFileOut [archiveBigFile]) testDrvPath
+      amplifyResult <- buildDerivation (tinyBudget 100 1000) store (mkUnpackDrv amplifyOut [archiveAmplify]) testDrvPath
+      gitHubResult <- buildDerivation config store (mkUnpackDrv gitHubOut [archiveGitHub]) testDrvPath
       forceRemoveIfExists buildTmp
       seedChecks <- case seedResult of
         BuildFailure msg code ->
@@ -9105,7 +9106,7 @@ testReferenceClosureIO = do
         registration stray []
       ]
     writeDrv store libDrv libDrvPath
-    result <- buildDerivation config store drv
+    result <- buildDerivation config store drv testDrvPath
     recorded <- Set.fromList <$> queryReferences (stDB store) outSP
     createDirectoryIfMissing True (gcRootsDir sd)
     BS.writeFile rootFile ""
@@ -9131,6 +9132,172 @@ testReferenceClosureIO = do
               assertEqual "recorded" [] (recordedAmong [stray, libDrvPath])
           ]
   pure (closureLaw : built)
+
+-- | A random acyclic reference graph over a few nodes, labelled in random
+-- order so that ascending order is not a topological one.  A node
+-- references only nodes before it in that order, and may also reference
+-- itself or a node outside the graph, which 'orderByReferences' ignores.
+genAcyclicReferences :: QC.Gen (Map.Map Int (Set.Set Int))
+genAcyclicReferences = do
+  size <- QC.chooseInt (1, 12)
+  labels <- QC.shuffle [0 .. size - 1]
+  let referencesOf (label, before) = do
+        earlier <- QC.sublistOf before
+        itself <- QC.elements [[], [label]]
+        outside <- QC.sublistOf [size, size + 1]
+        pure (label, Set.fromList (earlier ++ itself ++ outside))
+  Map.fromList <$> traverse referencesOf (zip labels (inits labels))
+
+-- | 'orderByReferences' is upstream's @topoSort@ (topo-sort.hh at 2.24.9)
+-- followed by the reversal @registerOutputs@ applies.  Over generated
+-- graphs it finds a cycle exactly when the references hold one, an order
+-- it returns lists every node once and after each node it references, and
+-- a cycle it reports is closed by a real reference.  The fixed cases are
+-- what upstream's @topoSort@ and that reversal give for the same graphs.
+testOutputOrderIO :: IO [Bool]
+testOutputOrderIO = do
+  putStrLn "builder/output-order"
+  let quickCheckPasses property = do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+      -- A generated graph as the map the walk takes: its roots are the
+      -- nodes, and a reference may name a node outside them.
+      asNodes (references, roots) =
+        Map.fromList [(node, Set.fromList (Map.findWithDefault [] node references)) | node <- roots]
+      -- The references the walk follows: between two distinct nodes.
+      edgesWithin nodes =
+        [(from, to) | (from, references) <- Map.toList nodes, to <- Set.toList references, to /= from, Map.member to nodes]
+      successors nodes node = [to | (from, to) <- edgesWithin nodes, from == node]
+      hasCycle nodes =
+        any cyclic (Graph.stronglyConnComp [(node, node, successors nodes node) | node <- Map.keys nodes])
+      cyclic (Graph.AcyclicSCC _) = False
+      cyclic _ = True
+      orderOf :: Map.Map Int (Set.Set Int) -> Either (ReferenceCycle Int) [(Int, Set.Set Int)]
+      orderOf = orderByReferences id
+      namedOrder :: [(Text, [Text])] -> Either (ReferenceCycle Text) [Text]
+      namedOrder graph = map fst <$> orderByReferences Set.fromList (Map.fromList graph)
+  sequence
+    [ runTestM "orderByReferences finds a cycle exactly when the references hold one" $
+        quickCheckPasses . QC.checkCoverage $
+          QC.forAll (QC.frequency [(2, asNodes <$> genReferenceGraph), (1, genAcyclicReferences)]) $ \nodes ->
+            QC.cover 25 (hasCycle nodes) "with a cycle" . QC.cover 25 (not (hasCycle nodes)) "without one" $
+              either (const True) (const False) (orderOf nodes) QC.=== hasCycle nodes,
+      runTestM "orderByReferences lists every node once, after each node it references" $
+        quickCheckPasses $
+          QC.forAll genAcyclicReferences $ \nodes -> case orderOf nodes of
+            Left found -> QC.counterexample ("reported a cycle in an acyclic graph: " <> show found) False
+            Right order ->
+              let position = Map.fromList (zip (map fst order) [0 :: Int ..])
+                  before from to = (<) <$> Map.lookup to position <*> Map.lookup from position
+               in QC.conjoin
+                    [ sort (map fst order) QC.=== Map.keys nodes,
+                      Map.fromList order QC.=== nodes,
+                      QC.counterexample "a node is listed before a node it references" (all (\(from, to) -> before from to == Just True) (edgesWithin nodes))
+                    ],
+      runTestM "a cycle orderByReferences reports is closed by a real reference" $
+        quickCheckPasses . QC.checkCoverage $
+          QC.forAll (asNodes <$> genReferenceGraph) $ \nodes -> QC.cover 40 (hasCycle nodes) "with a cycle" $ case orderOf nodes of
+            Right _ -> QC.property True
+            Left (ReferenceCycle node referrer) ->
+              let reachable = runIdentity (closureUnder (Identity . successors nodes) [node])
+               in QC.counterexample (show (node, referrer)) $
+                    (referrer, node) `elem` edgesWithin nodes && Set.member referrer reachable,
+      runTest "orderByReferences gives upstream's output order and cycle for fixed graphs" $
+        assertEqual
+          "orders"
+          [ Left (ReferenceCycle "dev" "out"),
+            Left (ReferenceCycle "b" "c"),
+            Right ["c", "a", "b"],
+            Right ["bin", "dev", "out"]
+          ]
+          [ namedOrder [("dev", ["out"]), ("out", ["dev"])],
+            namedOrder [("a", ["b"]), ("b", ["c"]), ("c", ["b"])],
+            namedOrder [("a", ["c"]), ("b", []), ("c", [])],
+            namedOrder [("bin", ["gone"]), ("dev", ["bin"]), ("out", ["dev", "out"])]
+          ]
+    ]
+
+-- | Outputs that reference each other in a cycle fail the build with
+-- upstream's message (local-derivation-goal.cc:2406-2408 at 2.24.9) and
+-- leave nothing registered, while a one-way reference between outputs and
+-- a self-reference build and are recorded.  A rebuilt output referencing a
+-- sibling registered before the build is no cycle even when the sibling's
+-- discarded copy references it back, since upstream treats a registered
+-- output as a leaf.
+testOutputCycleBuildIO :: IO [Bool]
+testOutputCycleBuildIO = do
+  putStrLn "builder/output-cycle"
+  shell <- findTestShell
+  buildTmp <- (</> "nova-nix-test-output-cycle-tmp") <$> getTemporaryDirectory
+  results <- withTempStore $ \store -> do
+    let sd = stDir store
+        config = (defaultBuildConfig sd) {bcTmpDir = buildTmp}
+        pathText = T.pack . storePathToFilePath sd
+        basename sp = spHash sp <> "-" <> spName sp
+        hashOf = T.replicate 32
+        -- A derivation with outputs dev and out, written to the store as
+        -- the build driver writes what it builds, then built.
+        buildTwo drvSP name devSP outSP script = do
+          let drv =
+                Derivation
+                  { drvOutputs = [DerivationOutput "dev" devSP "" "", DerivationOutput "out" outSP "" ""],
+                    drvInputDrvs = Map.empty,
+                    drvInputSrcs = [],
+                    drvPlatform = currentPlatform,
+                    drvBuilder = TE.encodeUtf8 shell,
+                    drvArgs = ["-c", script],
+                    drvEnv = Map.singleton "name" name
+                  }
+          writeDrv store drv drvSP
+          buildWithDeps config store drv drvSP
+        referencesOf sp = Set.fromList <$> queryReferences (stDB store) sp
+        cycleDrv = StorePath (hashOf "s") "cycle.drv"
+        cycleDev = StorePath (hashOf "v") "cycle-dev"
+        cycleOut = StorePath (hashOf "w") "cycle"
+        onewayDrv = StorePath (hashOf "x") "oneway.drv"
+        onewayDev = StorePath (hashOf "y") "oneway-dev"
+        onewayOut = StorePath (hashOf "z") "oneway"
+        leafFirstDrv = StorePath (hashOf "g") "leaf.drv"
+        leafSecondDrv = StorePath (hashOf "h") "leaf.drv"
+        leafDev = StorePath (hashOf "j") "leaf-dev"
+        leafOut = StorePath (hashOf "k") "leaf"
+    cycleResult <- buildTwo cycleDrv "cycle" cycleDev cycleOut "mkdir -p \"$out\" \"$dev\" && echo \"$dev\" > \"$out/dev\" && echo \"$out\" > \"$dev/out\""
+    cycleValid <- mapM (isValid store) [cycleDev, cycleOut]
+    cycleOnDisk <- mapM (Dir.doesPathExist . storePathToFilePath sd) [cycleDev, cycleOut]
+    onewayResult <- buildTwo onewayDrv "oneway" onewayDev onewayOut "mkdir -p \"$out\" \"$dev\" && echo \"$dev\" > \"$out/dev\" && echo \"$out\" > \"$out/self\" && echo \"$dev\" > \"$dev/self\""
+    onewayRefs <- mapM referencesOf [onewayDev, onewayOut]
+    leafFirst <- buildTwo leafFirstDrv "leaf" leafDev leafOut "mkdir -p \"$out\" \"$dev\" && echo first > \"$out/v\" && echo first > \"$dev/v\""
+    deleted <- deleteStorePathRaw store (basename leafOut)
+    leafSecond <- buildTwo leafSecondDrv "leaf" leafDev leafOut "mkdir -p \"$out\" \"$dev\" && echo \"$dev\" > \"$out/dev\" && echo \"$out\" > \"$dev/out\""
+    leafValid <- mapM (isValid store) [leafDev, leafOut]
+    leafRefs <- referencesOf leafOut
+    let succeeded result = case result of
+          BuildSuccess _ -> Pass
+          BuildFailure msg code -> Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+    sequence
+      [ runTest "outputs referencing each other fail the build with upstream's message" $
+          assertEqual
+            "result"
+            (BuildFailure ("building cycle failed: exit 1: cycle detected in build of '/nix/store/" <> hashOf "s" <> "-cycle.drv' in the references of output 'dev' from output 'out'") 1)
+            cycleResult,
+        runTest "outputs referencing each other leave nothing registered or in the store" $
+          assertEqual "valid, on disk" ([False, False], [False, False]) (cycleValid, cycleOnDisk),
+        runTest "a one-way reference between outputs and self-references build" $ succeeded onewayResult,
+        runTest "a one-way reference between outputs and self-references are recorded" $
+          assertEqual
+            "dev's and out's references"
+            [Set.fromList [pathText onewayDev], Set.fromList [pathText onewayDev, pathText onewayOut]]
+            onewayRefs,
+        runTest "a rebuilt output referencing a registered sibling that references it back builds" $
+          case (leafFirst, deleted, leafSecond) of
+            (BuildSuccess _, Right outcome, BuildSuccess _)
+              | not (doRowRemoved outcome) -> Fail "the setup did not unregister out"
+              | otherwise -> assertEqual "valid, out's references" ([True, True], Set.fromList [pathText leafDev]) (leafValid, leafRefs)
+            (_, _, BuildFailure msg code) -> Fail ("the rebuild failed (exit " <> T.pack (show code) <> "): " <> msg)
+            _ -> Fail "the setup did not reach a registered dev and an unregistered out"
+      ]
+  forceRemoveIfExists buildTmp
+  pure results
 
 -- | Upstream value-conformance tests: each pins exact output bytes (hash
 -- decode, number formatting) that must match what upstream Nix computes for
@@ -10282,7 +10449,7 @@ testFetchMirrors = do
           withStore "cancel" $ \store config sp -> do
             let drv = fixtureDrv sp (Map.singleton "urls" (TE.encodeUtf8 (base <> "/slow " <> base <> "/good")))
             outcome <- timeout 10000000 $
-              withAsync (buildDerivation config store drv) $ \worker -> do
+              withAsync (buildDerivation config store drv testDrvPath) $ \worker -> do
                 requested
                 cancel worker
                 waitCatch worker
@@ -10324,7 +10491,7 @@ testFetchMirrors = do
         withStore label $ \store config sp -> do
           let urls = T.unwords (map (base <>) paths)
               env = Map.singleton (if legacy then "url" else "urls") (TE.encodeUtf8 urls)
-          result <- buildDerivation config store (fixtureDrv sp env)
+          result <- buildDerivation config store (fixtureDrv sp env) testDrvPath
           seen <- requests
           valid <- isValid store sp
           present <- Dir.doesPathExist (storePathToFilePath (stDir store) sp)
@@ -12829,6 +12996,11 @@ testFromATerm = do
 -- Tests: Builder (Phase 2, Batch 4)
 -- ---------------------------------------------------------------------------
 
+-- | The @.drv@ path a builder test hands 'buildDerivation'.  Only a failure
+-- message that names the derivation reads it.
+testDrvPath :: StorePath
+testDrvPath = StorePath (T.replicate 32 "d") "test-build.drv"
+
 -- | Create a minimal Derivation for builder tests.
 -- The shell path is discovered once via 'findTestShell' and threaded through.
 -- All scripts are POSIX shell - bash is used on every platform.
@@ -12880,7 +13052,7 @@ testBuilder = do
         let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" "simple-test"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo hello > $out/result.txt"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder1-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         closeStore store
         let ret = case result of
               BuildSuccess sp -> assertEqual "success path" outSP sp
@@ -12897,7 +13069,7 @@ testBuilder = do
         let outSP = StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "content-test"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo 'test content 42' > $out/data.txt"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder2-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
             let dataFile = storePathToFilePath (stDir store) outSP </> "data.txt"
@@ -12929,7 +13101,7 @@ testBuilder = do
                   drvEnv = Map.empty
                 }
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder3-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
@@ -12945,7 +13117,7 @@ testBuilder = do
         let outSP = StorePath "dddddddddddddddddddddddddddddddd" "exitfail"
             drv = mkTestBuildDrv shell outSP "exit 42"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder4-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
@@ -12965,7 +13137,7 @@ testBuilder = do
         let outSP = StorePath "pppppppppppppppppppppppppppppppp" "leaktest"
             drv = mkTestBuildDrv (T.pack (tmpBase </> "no-such-builder.exe")) outSP "unused"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBuild}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         leftovers <- do
           exists <- doesDirectoryExist tmpBuild
           if exists then Dir.listDirectory tmpBuild else pure []
@@ -13018,7 +13190,7 @@ testBuilder = do
                   "declare -A outputs=(['out']='" <> outText <> "' )\n",
                   "declare self='" <> outText <> "/bin'\n"
                 ]
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
             let outDir = storePathToFilePath (stDir store) outSP
@@ -13054,7 +13226,7 @@ testBuilder = do
             drv = base {drvEnv = Map.union (Map.fromList [("foo", value), ("passAsFile", "foo missing")]) (drvEnv base)}
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-passasfile-tmp"}
             fooFile = bcTmpDir config </> T.unpack (spHash outSP) </> ".attr-1bp7cri8hplaz6hbz0v4f0nl44rl84q1sg25kgwqzipzd1mv89ic"
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
             contents <- BS.readFile (outDir </> "foo")
@@ -13076,7 +13248,7 @@ testBuilder = do
         let outSP = StorePath "cccccccccccccccccccccccccccccccc" "pathtest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/marker"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder5-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
             let expectedDir = storePathToFilePath (stDir store) outSP
@@ -13105,7 +13277,7 @@ testBuilder = do
         createDirectoryIfMissing True targetPath
         TIO.writeFile (targetPath </> "data.txt") "stale"
         setReadOnly targetPath
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         content <- TIO.readFile (targetPath </> "data.txt")
         registered <- isValid store outSP
         closeStore store
@@ -13125,7 +13297,7 @@ testBuilder = do
         let outSP = StorePath "ffffffffffffffffffffffffffffffff" "dbtest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/file"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder6-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
             valid <- isValid store outSP
@@ -13157,7 +13329,7 @@ testBuilder = do
                   drvEnv = Map.fromList [("name", "multi")]
                 }
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder7-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
             outExists <- doesDirectoryExist (storePathToFilePath (stDir store) outSP)
@@ -13193,9 +13365,9 @@ testBuilder = do
                 }
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-partial-valid-tmp"}
             devPath = storePathToFilePath (stDir store) devSP
-        initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo main > $out/value && echo keep > $dev/value")
+        initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo main > $out/value && echo keep > $dev/value") testDrvPath
         deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
-        rebuilt <- buildDerivation config store (mkDrv "mkdir -p $out && echo partial > $out/value && exit 1")
+        rebuilt <- buildDerivation config store (mkDrv "mkdir -p $out && echo partial > $out/value && exit 1") testDrvPath
         devOnDisk <- Dir.doesPathExist devPath
         devValid <- isValid store devSP
         devContents <- if devOnDisk then T.strip <$> TIO.readFile (devPath </> "value") else pure ""
@@ -13237,9 +13409,9 @@ testBuilder = do
             outPath = storePathToFilePath (stDir store) outSP
             -- Both outputs, every time, as a real multi-output builder does.
             writeBoth v = "mkdir -p $out $dev && echo " <> v <> " > $out/value && echo " <> v <> " > $dev/value"
-        initial <- buildDerivation config store (mkDrv (writeBoth "first"))
+        initial <- buildDerivation config store (mkDrv (writeBoth "first")) testDrvPath
         deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
-        rebuilt <- buildDerivation config store (mkDrv (writeBoth "second"))
+        rebuilt <- buildDerivation config store (mkDrv (writeBoth "second")) testDrvPath
         outContents <- T.strip <$> TIO.readFile (outPath </> "value")
         devContents <- T.strip <$> TIO.readFile (devPath </> "value")
         devValid <- isValid store devSP
@@ -13285,11 +13457,11 @@ testBuilder = do
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-scratch-leak-tmp"}
             devPath = storePathToFilePath (stDir store) devSP
             outPath = storePathToFilePath (stDir store) outSP
-        initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo first > $out/value && echo first > $dev/value")
+        initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo first > $out/value && echo first > $dev/value") testDrvPath
         deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
         -- \$dev now names a scratch path, and the builder bakes it into $out
         -- the way a compiler driver or a libtool archive would.
-        rebuilt <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo $dev > $out/recorded && echo first > $dev/value")
+        rebuilt <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo $dev > $out/recorded && echo first > $dev/value") testDrvPath
         devContents <- T.strip <$> TIO.readFile (devPath </> "value")
         recorded <- T.strip <$> TIO.readFile (outPath </> "recorded")
         devValid <- isValid store devSP
@@ -13318,7 +13490,7 @@ testBuilder = do
         let outSP = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "nooutput"
             drv = mkTestBuildDrv shell outSP "echo 'forgot to create output'"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-noout-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
@@ -13351,7 +13523,7 @@ testBuilder = do
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-partial-missing-tmp"}
             outPath = storePathToFilePath (stDir store) outSP
             devPath = storePathToFilePath (stDir store) devSP
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         outOnDisk <- Dir.doesPathExist outPath
         devOnDisk <- Dir.doesPathExist devPath
         outValid <- isValid store outSP
@@ -13373,7 +13545,7 @@ testBuilder = do
         let outSP = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "fileout"
             drv = mkTestBuildDrv shell outSP "echo 'I am a file output' > $out"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-fileout-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
@@ -13390,7 +13562,7 @@ testBuilder = do
             drv = mkTestBuildDrv shell outSP "exit 1"
             tmpDir = tmpBase </> "nova-nix-test-builder8-tmp"
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpDir}
-        _ <- buildDerivation config store drv
+        _ <- buildDerivation config store drv testDrvPath
         -- Build dir should be cleaned up
         let buildDir = tmpDir </> T.unpack (spHash outSP)
         buildDirExists <- doesDirectoryExist buildDir
@@ -13409,7 +13581,7 @@ testBuilder = do
             outSP = StorePath "ffffffffffffffffffffffffffffff01" "fo-flat-good"
             drv = mkFixedOutputDrv shell outSP "printf 'fixed output payload\\n' > $out" "sha256" digest
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo1-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         registered <- isValid store outSP
         closeStore store
         forceRemoveIfExists tmpStore
@@ -13437,7 +13609,7 @@ testBuilder = do
             baseDrv = mkFixedOutputDrv shell outSP script "sha256" digest
             drv = baseDrv {drvEnv = Map.insert "impureEnvVars" "NOVA_TEST_IMPURE NOVA_TEST_ABSENT" (drvEnv baseDrv)}
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-impure1-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         unsetEnv "NOVA_TEST_IMPURE"
         closeStore store
         forceRemoveIfExists tmpStore
@@ -13456,7 +13628,7 @@ testBuilder = do
             baseDrv = mkTestBuildDrv shell outSP script
             drv = baseDrv {drvEnv = Map.insert "impureEnvVars" "NOVA_TEST_IMPURE" (drvEnv baseDrv)}
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-impure2-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         unsetEnv "NOVA_TEST_IMPURE"
         closeStore store
         forceRemoveIfExists tmpStore
@@ -13473,7 +13645,7 @@ testBuilder = do
             outSP = StorePath "ffffffffffffffffffffffffffffff02" "fo-flat-bad"
             drv = mkFixedOutputDrv shell outSP "printf 'tampered content\\n' > $out" "sha256" digest
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo2-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         registered <- isValid store outSP
         onDisk <- Dir.doesPathExist (storePathToFilePath (stDir store) outSP)
         closeStore store
@@ -13502,7 +13674,7 @@ testBuilder = do
             outSP = StorePath "ffffffffffffffffffffffffffffff03" "fo-rec-good"
             drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'inner bytes\\n' > $out/data.txt" "r:sha256" digest
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo3-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         registered <- isValid store outSP
         closeStore store
         forceRemoveIfExists tmpStore
@@ -13522,7 +13694,7 @@ testBuilder = do
             outSP = StorePath "ffffffffffffffffffffffffffffff04" "fo-rec-bad"
             drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'other bytes\\n' > $out/data.txt" "r:sha256" digest
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo4-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         registered <- isValid store outSP
         closeStore store
         forceRemoveIfExists tmpStore
@@ -13541,7 +13713,7 @@ testBuilder = do
             outSP = StorePath "ffffffffffffffffffffffffffffff05" "fo-flat-dir"
             drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'x' > $out/f" "sha256" digest
             config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo5-tmp"}
-        result <- buildDerivation config store drv
+        result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
@@ -13610,7 +13782,7 @@ evalAndBuild storeDir source = do
           storeWrites <- readIORef (esStoreWriteCache st)
           materializeEvalSources store sourceCache
           materializeEvalStoreWrites store storeWrites
-          result <- buildDerivation config store drv
+          result <- buildDerivation config store drv testDrvPath
           pure (Right (result, store))
 
 testE2E :: IO [Bool]
@@ -17131,6 +17303,8 @@ runSuite = do
           testUnpackBuildIO,
           testDependentBuildIO,
           testReferenceClosureIO,
+          testOutputOrderIO,
+          testOutputCycleBuildIO,
           testEvalFidelity,
           testUpstreamConformance,
           testHashHelpers,

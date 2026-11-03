@@ -53,6 +53,8 @@ module Nix.Builder
     execWrapperConfig,
     execWrapperFor,
     spawnFor,
+    ReferenceCycle (..),
+    orderByReferences,
     rewriteEnv,
     rewritePlaceholders,
     scrubAmbient,
@@ -64,8 +66,8 @@ module Nix.Builder
 where
 
 import Control.Exception (IOException, bracket, catch, catches, displayException, finally, onException, try)
-import Control.Monad (filterM, unless, when)
-import Control.Monad.Except (ExceptT (..), liftEither, runExceptT)
+import Control.Monad (filterM, foldM, unless, when)
+import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
@@ -77,7 +79,7 @@ import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, maybeToList)
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe, maybeToList)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -98,7 +100,7 @@ import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, c
 import Nix.Realise (Fallback (..), FetchOutcome (..), RealiseEffects (..), Realised (..), SubstEffects (..), realise, realiseFailureMessage)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, unStoreDir)
+import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText, unStoreDir)
 import Nix.Substituter (CacheConfig, SubstResult (..), queryReferencesWith, trySubstituteWith)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.NAR as NAR
@@ -294,29 +296,31 @@ data BuildResult
 -- Build loop
 -- ---------------------------------------------------------------------------
 
--- | Build a derivation: run its builder and capture output.
+-- | Build a derivation, given its @.drv@ path, which names it in a failure
+-- as upstream's do: run its builder and capture output.
 --
 -- 1. Validate all inputs exist in the store
--- 2. Create temp build directory with output subdirs
+-- 2. Create temp build directory
 -- 3. Set up environment from derivation + standard vars
--- 4. Run the builder process
--- 5. On success: scan references, move outputs to store, register
+-- 4. Run the builder process, which writes each output at its store path
+-- 5. On success: scan the outputs for references and register them,
+--    failing on a reference cycle between them ('registerOutputs')
 -- 6. On failure: clean up and report error
 -- 7. Exception safety: synchronous exceptions convert to BuildFailure;
 --    asynchronous exceptions propagate ('catchSync') - an interrupt
 --    must abort the build, never be reported as a build failure.
-buildDerivation :: BuildConfig -> Store -> Derivation -> IO BuildResult
-buildDerivation config store drv =
-  buildDerivationInner config store drv
+buildDerivation :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
+buildDerivation config store drv drvPath =
+  buildDerivationInner config store drv drvPath
     `catchSync` \err -> pure (BuildFailure ("build exception: " <> T.pack (show err)) 1)
 
 -- | Build under the outputs' path locks.  A derivation another process
 -- finished while we waited for them is adopted rather than redone:
 -- rebuilding would delete a registered path out from under whoever is
 -- already using it, which is why substitution adopts a finished path too.
-buildDerivationInner :: BuildConfig -> Store -> Derivation -> IO BuildResult
-buildDerivationInner config store drv =
-  withOutputLocks config store drv (maybe (buildUnderLock config store drv) (pure . BuildSuccess))
+buildDerivationInner :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
+buildDerivationInner config store drv drvPath =
+  withOutputLocks config store drv (maybe (buildUnderLock config store drv drvPath) (pure . BuildSuccess))
 
 -- | Hold every output's path lock for the whole build, and report
 -- whether the derivation was already finished by the time they were
@@ -374,8 +378,8 @@ allOutputsValid store drv = case map doPath (drvOutputs drv) of
     pure (if and validity then Just firstOutput else Nothing)
 
 -- | The build itself, with every output's lock already held.
-buildUnderLock :: BuildConfig -> Store -> Derivation -> IO BuildResult
-buildUnderLock config store drv = do
+buildUnderLock :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
+buildUnderLock config store drv drvPath = do
   -- 1. Validate inputs (sources + input-derivation outputs) exist, and
   --    take their closure: what an output may reference besides the
   --    derivation's own outputs.
@@ -401,7 +405,7 @@ buildUnderLock config store drv = do
         outputValidity <- mapM (isValid store . doPath) (drvOutputs drv)
         case traverse outputPlan (zip (drvOutputs drv) outputValidity) of
           Left nameErr -> pure (BuildFailure ("output name is not a store path name: " <> T.pack (show nameErr)) 1)
-          Right plans -> runPlannedBuild config store drv inputPaths buildDir plans
+          Right plans -> runPlannedBuild config store drv drvPath inputPaths buildDir plans
 
 -- | Where the builder writes each output, and where that has to end up.
 --
@@ -437,9 +441,10 @@ outputPlan (out, valid)
 -- @src/libstore/unix/build/local-derivation-goal.cc@ at 2.24.9) with the
 -- same shape: a bogus @rewrite:@ path type and an all-zeroes inner hash,
 -- keyed on the output path it stands in for.
--- Upstream also keys on the @.drv@ path; that is not reachable here, and
--- the output path already names one output of one derivation, so the
--- result is just as unique.
+-- Upstream's type string also names the @.drv@ path
+-- (@rewrite:\<drv\>:\<path\>@), so the scratch path a builder sees differs
+-- from upstream's.  The output path already names one output of one
+-- derivation, so the result is just as unique.
 fallbackOutputPath :: StorePath -> Either BadStorePath StorePath
 fallbackOutputPath sp =
   makeStorePath
@@ -511,8 +516,8 @@ spawnFor host config drv
 
 -- | The build, once every output knows where it is written and where it
 -- belongs, and the closure of the inputs is known.
-runPlannedBuild :: BuildConfig -> Store -> Derivation -> Set StorePath -> FilePath -> [OutputPlan] -> IO BuildResult
-runPlannedBuild config store drv inputPaths buildDir plans = do
+runPlannedBuild :: BuildConfig -> Store -> Derivation -> StorePath -> Set StorePath -> FilePath -> [OutputPlan] -> IO BuildResult
+runPlannedBuild config store drv drvPath inputPaths buildDir plans = do
   let scratchDir p = storePathToFilePath (bcStoreDir config) (opScratch p)
       outputDirs = [(opName p, scratchDir p) | p <- plans]
       -- Every scratch path is the build's to use: the ones that are final
@@ -603,7 +608,7 @@ runPlannedBuild config store drv inputPaths buildDir plans = do
               clearScratch
               pure (BuildFailure ("builder succeeded but outputs missing: " <> names) 1)
             [] -> do
-              result <- registerOutputs config store drv inputPaths plans
+              result <- registerOutputs config store drv drvPath inputPaths plans
               case result of
                 BuildSuccess _ -> do
                   writeIORef committed True
@@ -1324,95 +1329,185 @@ malformedExpectedHash url = "builtin:fetchurl: malformed expected hash for " <> 
 -- Output registration
 -- ---------------------------------------------------------------------------
 
--- | After a successful build, register every output in the store.
+-- | After a successful build, register every output in the store, in
+-- upstream's two passes (registerOutputs, local-derivation-goal.cc:2288-2751
+-- at 2.24.9).  Every output is scanned first.  Then the outputs are ordered
+-- so that each follows the siblings it references ('orderByReferences'),
+-- and placed in that order.  Outputs that reference each other in a cycle
+-- fail the build before any is placed, so none is registered.
 --
--- Outputs are placed first and registered together (one transaction) so
--- intra-derivation cross-output references survive (see 'registerPaths').
+-- The placed outputs register together in one transaction, so a
+-- cross-output reference finds its referent's row (see 'registerPaths').
 registerOutputs ::
   BuildConfig ->
   Store ->
   Derivation ->
+  StorePath ->
   Set StorePath ->
   [OutputPlan] ->
   IO BuildResult
-registerOutputs config store drv inputPaths plans = do
+registerOutputs config store drv drvPath inputPaths plans = do
   let -- Candidates for reference scanning: the input closure and this
       -- derivation's own outputs, upstream's @referenceablePaths@
       -- (local-derivation-goal.cc:2275-2278 at 2.24.9).
       allCandidates = Set.toList inputPaths ++ map doPath (drvOutputs drv)
-      -- Deriver path is not available from the Derivation type alone;
-      -- the caller (buildWithDeps) would need to pass it through.
-      -- Register with no deriver for now - queryDeriver will return Nothing.
-      drvPathText = Nothing
+      -- Outputs register with no deriver yet, so 'queryDeriver' answers
+      -- Nothing for a built path, where upstream records the @.drv@
+      -- (local-derivation-goal.cc:2738).
+      deriver = Nothing
       -- An output may record an already-valid sibling, whose build wrote to
       -- a scratch path that is about to stop existing, so each scratch hash
       -- becomes the final one.  Upstream scans first and translates its hits;
       -- rewriting first lets the scan see final hashes and needs no
       -- translation, and the references come out the same.
       scratchRewrites = [(spHash (opScratch p), spHash (opFinal p)) | p <- plans, opValid p]
-  -- Phase 1: rewrite scratch hashes, scan references and move each output into
-  -- the store, collecting a PathRegistration (no DB writes yet).  Already-valid
-  -- outputs are skipped.
-  prepared <- mapM (prepareOutput config store allCandidates scratchRewrites drvPathText) (zip (drvOutputs drv) plans)
-  case sequence prepared of
+  scanned <- runExceptT (traverse (scanOutput config store allCandidates scratchRewrites) (zip (drvOutputs drv) plans))
+  case orderByReferences (siblingsReferenced (drvOutputs drv)) . Map.fromList <$> scanned of
     Left errMsg -> pure (BuildFailure errMsg 1)
-    Right regs -> do
-      -- Phase 2: register ALL outputs in one transaction.
-      registerPaths (stDB store) (catMaybes regs)
-      case drvOutputs drv of
-        (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
-        [] -> pure (BuildFailure "no outputs defined" 1)
+    Right (Left cycleEdge) -> pure (BuildFailure (outputCycleMessage drvPath cycleEdge) 1)
+    Right (Right ordered) -> do
+      placed <- runExceptT (traverse (ExceptT . placeOutput store deriver . snd) ordered)
+      case placed of
+        Left errMsg -> pure (BuildFailure errMsg 1)
+        Right regs -> do
+          registerPaths (stDB store) (catMaybes regs)
+          case drvOutputs drv of
+            (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
+            [] -> pure (BuildFailure "no outputs defined" 1)
 
--- | Prepare a single output for registration: skip if already valid in the DB,
--- otherwise rewrite scratch hashes, scan references (the input closure and
--- this derivation's outputs) and place it in the store, returning its 'PathRegistration'.  Returns @Nothing@
--- for an output already registered as valid.
-prepareOutput ::
+-- | Upstream's failure for outputs that reference each other in a cycle
+-- (local-derivation-goal.cc:2406-2408 at 2.24.9), naming the @.drv@ and
+-- the reference that closes the cycle.
+outputCycleMessage :: StorePath -> ReferenceCycle Text -> Text
+outputCycleMessage drvPath (ReferenceCycle node referrer) =
+  "cycle detected in build of '"
+    <> storePathToText defaultStoreDir drvPath
+    <> "' in the references of output '"
+    <> node
+    <> "' from output '"
+    <> referrer
+    <> "'"
+
+-- | One output after the scan and before it is placed: upstream's
+-- @AlreadyRegistered@ and @PerhapsNeedToRegister@.
+data ScannedOutput
+  = -- | Registered before the build, and left as it is.
+    AlreadyRegistered
+  | -- | Built here: the output, where the builder wrote it, and the
+    -- references the scan found in it.
+    NeedsRegistering !DerivationOutput !FilePath ![StorePath]
+
+-- | Scan one output, keyed by its name: skip it if it is already valid in
+-- the DB, otherwise rewrite scratch hashes in it and scan it for
+-- references to the input closure and this derivation's outputs.
+scanOutput ::
   BuildConfig ->
   Store ->
   [StorePath] ->
   [(Text, Text)] ->
-  Maybe Text ->
   (DerivationOutput, OutputPlan) ->
-  IO (Either Text (Maybe PathRegistration))
-prepareOutput config store candidates scratchRewrites drvPathText (output, plan) = do
-  let targetSP = doPath output
-      targetPath = storePathToFilePath (bcStoreDir config) targetSP
-      outDir = storePathToFilePath (bcStoreDir config) (opScratch plan)
+  ExceptT Text IO (Text, ScannedOutput)
+scanOutput config store candidates scratchRewrites (output, plan) = do
+  let outDir = storePathToFilePath (bcStoreDir config) (opScratch plan)
   -- Check the build actually produced the output (file or directory).
-  exists <- doesPathExist outDir
-  if not exists
-    then pure (Left ("output missing: " <> T.pack outDir))
-    else do
-      -- Validity is a DB fact, not mere disk presence: an output left on disk
-      -- by an interrupted run is NOT valid, and build outputs are not
-      -- content-addressed, so a leftover cannot be verified against its path.
-      -- Replace it with the freshly built output (upstream's delete-then-move
-      -- at output registration) rather than adopt unverifiable bytes;
-      -- 'removePathForcibly' clears read-only marks, so a tree an earlier run
-      -- already marked read-only cannot wedge the replacement.
-      valid <- isValid store targetSP
-      if valid
-        then pure (Right Nothing)
-        else do
-          -- The builder wrote straight into the store path, so there is
-          -- nothing to clear: outDir IS targetPath.  A stale tree from an
-          -- interrupted run was removed before the build, not here.
-          --
-          -- One scan, not two: 'candidates' already carries this
-          -- derivation's own outputs, and outDir is the final path, so a
-          -- self- or cross-output reference is an ordinary hit.
-          rewriteStoreHashes scratchRewrites outDir
-          refs <- dedupStorePaths <$> scanReferences candidates outDir
-          reg <- placeInStore store outDir targetSP drvPathText refs
-          fixedCheck <- verifyFixedOutput (volumeCaseHack (stCaseSensitivity store)) output targetPath
-          case fixedCheck of
-            Left err -> do
-              -- Wrong bytes for a declared content address: remove the
-              -- placed tree so a later run cannot meet it on disk.
-              removePathForcibly targetPath
-              pure (Left err)
-            Right () -> pure (Right (Just reg))
+  exists <- liftIO (doesPathExist outDir)
+  unless exists (throwError ("output missing: " <> T.pack outDir))
+  -- Validity is a DB fact, not mere disk presence: an output left on disk
+  -- by an interrupted run is NOT valid, and build outputs are not
+  -- content-addressed, so a leftover cannot be verified against its path.
+  -- 'runPlannedBuild' removed any leftover before the builder ran, so the
+  -- tree here is this build's (upstream's delete-then-move).
+  valid <- liftIO (isValid store (doPath output))
+  if valid
+    then pure (doName output, AlreadyRegistered)
+    else liftIO $ do
+      -- One scan, not two: 'candidates' already carries this
+      -- derivation's own outputs, and outDir is the final path, so a
+      -- self- or cross-output reference is an ordinary hit.
+      rewriteStoreHashes scratchRewrites outDir
+      refs <- dedupStorePaths <$> scanReferences candidates outDir
+      pure (doName output, NeedsRegistering output outDir refs)
+
+-- | The names of the sibling outputs an output's scan found.  An output
+-- registered before the build references none: upstream uses the
+-- registered copy and treats it as a leaf.
+siblingsReferenced :: [DerivationOutput] -> ScannedOutput -> Set Text
+siblingsReferenced outputs = referencedBy
+  where
+    nameByPath = Map.fromList [(doPath o, doName o) | o <- outputs]
+    referencedBy AlreadyRegistered = Set.empty
+    referencedBy (NeedsRegistering _ _ refs) = Set.fromList (mapMaybe (`Map.lookup` nameByPath) refs)
+
+-- | Place a scanned output in the store and check a fixed output's
+-- content, returning its 'PathRegistration'; @Nothing@ for an output
+-- registered before the build.
+placeOutput :: Store -> Maybe Text -> ScannedOutput -> IO (Either Text (Maybe PathRegistration))
+placeOutput store deriver scanned = case scanned of
+  AlreadyRegistered -> pure (Right Nothing)
+  NeedsRegistering output outDir refs -> do
+    -- The builder wrote straight into the store path, so outDir IS the
+    -- target and placing it moves nothing.
+    let targetPath = storePathToFilePath (stDir store) (doPath output)
+    reg <- placeInStore store outDir (doPath output) deriver refs
+    fixedCheck <- verifyFixedOutput (volumeCaseHack (stCaseSensitivity store)) output targetPath
+    case fixedCheck of
+      Left err -> do
+        -- Wrong bytes for a declared content address: remove the placed
+        -- tree so a later run cannot meet it on disk.  'removePathForcibly'
+        -- clears the read-only marks placing set.
+        removePathForcibly targetPath
+        pure (Left err)
+      Right () -> pure (Right (Just reg))
+
+-- | A reference cycle, named by the reference that closes it: the node
+-- reached again while it is still on the walk's path, and the node whose
+-- reference reached it.
+data ReferenceCycle k = ReferenceCycle
+  { cycleNode :: !k,
+    cycleReferrer :: !k
+  }
+  deriving (Eq, Show)
+
+-- | Where the walk in 'orderByReferences' is: the nodes it has entered,
+-- and the ones it has finished, the last finished first.
+data Walk k v = Walk
+  { walkEntered :: !(Set k),
+    walkFinished :: ![(k, v)]
+  }
+
+-- | Order nodes so that each follows every node it references, or report
+-- a cycle among them: upstream's @topoSort@ (src/libutil/topo-sort.hh at
+-- 2.24.9) with the reversal its @registerOutputs@ applies to the result
+-- (local-derivation-goal.cc:2411).
+--
+-- The walk is upstream's depth-first one, so the order and the cycle it
+-- reports are upstream's too: it starts from each node in ascending
+-- order, follows each node's references in ascending order, ignores a
+-- self-reference and a reference to a node not in the map, and lists a
+-- node once everything it references is listed.  The first reference that
+-- leads back to a node still on the path is the cycle reported.
+orderByReferences :: (Ord k) => (v -> Set k) -> Map k v -> Either (ReferenceCycle k) [(k, v)]
+orderByReferences references nodes =
+  reverse . walkFinished <$> foldM (visit Set.empty) (Walk Set.empty []) (Map.toAscList nodes)
+  where
+    visit onPath walk node@(key, value)
+      | Set.member key (walkEntered walk) = Right walk
+      | otherwise = do
+          let referenced =
+                [ (child, childValue)
+                | child <- Set.toAscList (references value),
+                  child /= key,
+                  Just childValue <- [Map.lookup child nodes]
+                ]
+          finished <-
+            foldM
+              (follow (Set.insert key onPath) key)
+              walk {walkEntered = Set.insert key (walkEntered walk)}
+              referenced
+          pure finished {walkFinished = node : walkFinished finished}
+    follow onPath referrer walk child@(key, _)
+      | Set.member key onPath = Left (ReferenceCycle key referrer)
+      | otherwise = visit onPath walk child
 
 -- | Re-check a placed fixed-output output against its declared hash.
 -- A fixed-output derivation declares both its store path and, via the
@@ -1549,9 +1644,9 @@ realiseEffects config store =
     }
 
 -- | Build one derivation, naming it in any failure.
-buildReporting :: BuildConfig -> Store -> Derivation -> IO (Either Text ())
-buildReporting config store drv = do
-  result <- buildDerivation config store drv
+buildReporting :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text ())
+buildReporting config store drv drvPath = do
+  result <- buildDerivation config store drv drvPath
   pure $ case result of
     BuildSuccess _ -> Right ()
     BuildFailure msg code ->
