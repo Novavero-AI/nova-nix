@@ -52,9 +52,6 @@ it.
 - No flakes, no `nix-shell` or `nix develop`, and no daemon or multi-user mode.
 - Evaluation is slower than upstream's. CI's 22 `drvPath` cases take 10 to 13
   times as long in total, and a full NixOS system takes 22 to 30 times as long.
-- `build --substituter` works through a package's build closure from the
-  leaves up, so a package a cache holds still downloads its build-time
-  dependencies ([#307]).
 - Garbage collection has no runtime roots: `nova-nix store gc` keeps what
   `build --out-link` registered and what the operator roots under the store's
   `.nova-nix/gcroots`, not what a running program has open. `keep-derivations`
@@ -72,7 +69,7 @@ it.
   ([#309]).
 - On Windows a build's process tree runs in a job object, so stopping a build
   stops everything it started. No platform has filesystem or network
-  isolation yet ([#25]).
+  isolation yet ([#194]).
 - nova-nix itself needs neither WSL nor Cygwin, but the current Windows stdenv
   runs its build scripts with MSYS2's bash.
 - `builtins.fetchurl` runs `curl`, `builtins.fetchTarball` runs `sh`, `curl` and
@@ -230,8 +227,7 @@ rather than in a public issue.
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-[#25]: https://github.com/Novavero-AI/nova-nix/issues/25
 [#26]: https://github.com/Novavero-AI/nova-nix/issues/26
 [#29]: https://github.com/Novavero-AI/nova-nix/issues/29
-[#307]: https://github.com/Novavero-AI/nova-nix/issues/307
+[#194]: https://github.com/Novavero-AI/nova-nix/issues/194
 [#309]: https://github.com/Novavero-AI/nova-nix/issues/309
