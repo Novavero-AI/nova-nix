@@ -150,7 +150,7 @@ import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.Policy (EvalPolicy (..), unrestrictedPolicy)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
-import Nix.Store.Path (StorePath, StorePathNameError, storePathNameErrorText)
+import Nix.Store.Path (BadStorePath, StorePath, badStorePathText)
 import Nix.Store.Path.Internal (StorePath (StorePath))
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Text.Regex.TDFA as RE
@@ -1422,14 +1422,13 @@ class (Monad m) => MonadEval m where
   checkUri :: Text -> m ()
 
 -- | Unwrap a store-path construction result (the @makeStorePath@ family
--- in "Nix.Hash"), converting a rejected name into an eval error under
--- the given context prefix (e.g. @builtins.toFile@).  Every eval-side
--- path construction goes through this or a bespoke equivalent, so a
--- name rejection always surfaces as a clean eval error rather than an
--- unchecked write path.
-storePathOrThrow :: (MonadEval m) => Text -> Either StorePathNameError StorePath -> m StorePath
-storePathOrThrow context =
-  either (throwEvalError . ((context <> ": ") <>) . storePathNameErrorText) pure
+-- in "Nix.Hash"), raising a refused name as upstream's @BadStorePath@
+-- text.  The message names the path and not the builtin, as upstream's
+-- does: upstream names the builtin in its trace.  Every eval-side path
+-- construction goes through this, so a refused name is an eval error
+-- before anything is written.
+storePathOrThrow :: (MonadEval m) => Either BadStorePath StorePath -> m StorePath
+storePathOrThrow = either (throwEvalError . badStorePathText) pure
 
 -- | Error raised during pure evaluation.  'PThrow' (@builtins.throw@, a
 -- failed @assert@) is the only kind 'tryEval' catches; 'PError' (type

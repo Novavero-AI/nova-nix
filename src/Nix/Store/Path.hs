@@ -57,6 +57,8 @@ module Nix.Store.Path
     storePathNameErrorText,
     storePathNameReasonText,
     storePathNameUpstreamText,
+    BadStorePath (..),
+    badStorePathText,
 
     -- * Constants
     storePathHashLen,
@@ -202,7 +204,7 @@ storePathBaseNameError base
   | Just c <- T.find (not . isNixBase32Char) (T.take storePathHashLen base) =
       Just ("store path '" <> base <> "' contains illegal base-32 character '" <> T.singleton c <> "'")
   | Left err <- checkStorePathName (T.drop (storePathHashLen + 1) base) =
-      Just ("path '" <> base <> "' is not a valid store path: " <> storePathNameUpstreamText err)
+      Just (invalidPathNameText base err)
   | otherwise = Nothing
 
 -- | The nix-base32 alphabet: @0-9a-z@ without @e o u t@ (chosen upstream
@@ -312,6 +314,31 @@ storePathNameUpstreamText (StorePathNameError name reason) = case reason of
     | otherwise -> quoted <> " is not valid: first dash-separated component must not be '" <> segment <> "'"
   where
     quoted = "name '" <> name <> "'"
+
+-- | A store path refused where it is constructed: the hash part it would
+-- have had, and why its name is refused.  Upstream's @StorePath@
+-- constructor checks the name only once the hash exists (path.cc at
+-- 2.24.9), so its refusal names the whole base name.
+data BadStorePath = BadStorePath
+  { -- | The would-be hash part, in nix-base32.
+    bspHashPart :: !Text,
+    -- | Why the name is refused.
+    bspNameError :: !StorePathNameError
+  }
+  deriving (Eq, Show)
+
+-- | Upstream's @BadStorePath@ text for a refused construction:
+-- @path '\<hash\>-\<name\>' is not a valid store path: \<reason\>@.
+badStorePathText :: BadStorePath -> Text
+badStorePathText (BadStorePath hashPart err) =
+  invalidPathNameText (hashPart <> "-" <> spneName err) err
+
+-- | Upstream's @checkPathName@ (path.cc at 2.24.9), which both of its
+-- @StorePath@ constructors raise, so a parsed base name and a constructed
+-- one are refused in the same words.
+invalidPathNameText :: Text -> StorePathNameError -> Text
+invalidPathNameText base err =
+  "path '" <> base <> "' is not a valid store path: " <> storePathNameUpstreamText err
 
 -- | Upstream's maximum store path name length.
 maxStorePathNameLen :: Int

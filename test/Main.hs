@@ -92,7 +92,7 @@ import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, proc
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathPrefix, platformStoreDir, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Base64 as B64
@@ -14600,6 +14600,22 @@ testStoreNameSinks = do
             then Pass
             else Fail (label <> ": expected suffix " <> suffix <> ", got " <> bytesText s)
         Right other -> Fail (label <> ": expected VStr, got " <> T.pack (show other))
+      -- Upstream's BadStorePath text in full for a name refused where its
+      -- path is built from a derivation's hashes, the hash part held only
+      -- to the nix-base32 shape.
+      refusedConstructing label source name reason = case evalNix source of
+        Left err
+          | Just rest <- T.stripPrefix "path '" err,
+            (hashPart, afterHash) <- T.splitAt storePathHashLen rest,
+            Just _ <- parseStorePathBaseName (hashPart <> "-x"),
+            afterHash == "-" <> name <> "' is not a valid store path: name '" <> name <> "' " <> reason ->
+              Pass
+          | otherwise -> Fail (label <> ": wrong error: " <> err)
+        Right val -> Fail (label <> ": expected an eval error, got " <> T.pack (show val))
+      drvNamedWithOutputs nameText outsLit =
+        "(derivation { name = \"" <> nameText <> "\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = " <> outsLit <> "; }).drvPath"
+      longest = T.replicate 211 "a"
+      nearlyLongest = T.replicate 208 "a"
   sequence
     [ runTest "derivation name with a space is rejected" $
         failsWith "name-space" (drvWith "\"a b\"") "invalid derivation name",
@@ -14644,13 +14660,25 @@ testStoreNameSinks = do
       -- crosses the length cap: the construction-side check catches what
       -- the field-level checks cannot.
       runTest "composed name-output past the length cap is rejected" $
-        failsWith
+        refusedConstructing
           "composed-long"
-          ( "(derivation { name = \""
-              <> T.replicate 208 "a"
-              <> "\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ \"dev\" ]; }).drvPath"
-          )
-          "invalid store path name",
+          (drvNamedWithOutputs nearlyLongest "[ \"dev\" ]")
+          (nearlyLongest <> "-dev")
+          "must be no longer than 211 characters",
+      -- Upstream builds the output paths over its sorted output set, so
+      -- of two names past the cap the first by name is the one refused.
+      runTest "of two outputs past the length cap the first by name is refused" $
+        refusedConstructing
+          "composed-order"
+          (drvNamedWithOutputs nearlyLongest "[ \"out\" \"zzz\" \"dev\" ]")
+          (nearlyLongest <> "-dev")
+          "must be no longer than 211 characters",
+      runTest "a name whose .drv name is past the length cap is refused" $
+        refusedConstructing
+          "drv-long"
+          (drvNamedWithOutputs longest "[ \"out\" ]")
+          (longest <> ".drv")
+          "must be no longer than 211 characters",
       -- fetchurl derives the store name from the URL alone, so a bad
       -- basename fails BEFORE the download: under PureEval a reachable
       -- download would surface as "runProcess: not available" instead.
@@ -14814,43 +14842,70 @@ posixOnlyTree :: NAR.NarEntry
 posixOnlyTree = NAR.NarDirectory posixOnlyEntries
 
 -- | IO-evaluator write sinks reject an invalid name BEFORE any write:
--- every case here errors out against a scratch dir with no store traffic.
+-- every case here errors out against a scratch dir with no store traffic,
+-- in upstream's BadStorePath words, naming the path the write would have
+-- had.  The hash parts are computed apart from nova-nix, from the NAR and
+-- store-path formats, and the first two are what nix-instantiate 2.24.9
+-- prints.  The fixtures are written as bytes, so their NARs, and so the
+-- hash parts, are the same on every host.
 testStoreNameSinksIO :: IO [Bool]
 testStoreNameSinksIO = do
   putStrLn "store/name-sinks-io"
   tmpBase <- getTemporaryDirectory
   let testDir = tmpBase </> "nova-nix-test-name-sinks"
-      needleTest label source needle = do
-        result <- evalNixIO testDir source
-        runTest label $ case result of
-          Left err
-            | needle `T.isInfixOf` err -> Pass
-            | otherwise -> Fail (label <> ": wrong error: " <> err)
-          Right val -> Fail (label <> ": expected an eval error, got " <> T.pack (show val))
+      refusedAs label source expected = runTestM label (assertEvalErrorIO testDir label source expected)
   bracket_
     ( do
         createDirectoryIfMissing True (testDir </> "tree")
-        TIO.writeFile (testDir </> "tree" </> "f.txt") "payload\n"
+        BS.writeFile (testDir </> "tree" </> "f.txt") "payload\n"
+        BS.writeFile (testDir </> "sp ace") "payload\n"
     )
     ( do
         exists <- doesDirectoryExist testDir
         when exists (removeDirectoryRecursive testDir)
     )
     $ sequence
-      [ needleTest "toFile rejects a stream-colon name" "builtins.toFile \"a:b\" \"x\"" "invalid store path name",
-        needleTest "toFile rejects a dot-segment name" "builtins.toFile \"..\" \"x\"" "invalid store path name",
-        needleTest
+      [ refusedAs
+          "toFile rejects a name with a space"
+          "builtins.toFile \"a b\" \"x\""
+          "path 'dm85kbl5cy82j2dzvy1874s14y3salv3-a b' is not a valid store path: name 'a b' contains illegal character ' '",
+        refusedAs
+          "toFile rejects an empty name"
+          "builtins.toFile \"\" \"x\""
+          "path '9r1mh2rc3s3i33vpdw86kqqyvy9i1y4w-' is not a valid store path: name must not be empty",
+        refusedAs
+          "toFile rejects a stream-colon name"
+          "builtins.toFile \"a:b\" \"x\""
+          "path '2gs912wpmbp0agwviqp9ymw7ljxlsla0-a:b' is not a valid store path: name 'a:b' contains illegal character ':'",
+        refusedAs
+          "toFile rejects a dot-segment name"
+          "builtins.toFile \"..\" \"x\""
+          "path 'hv29bhyiqgqrrvfwnrc9gg9g9cw83k4b-..' is not a valid store path: name '..' is not valid",
+        -- A copy's name is refused once the tree is hashed, so its hash
+        -- part is that of the tree's NAR.
+        refusedAs
           "path rejects a traversal name override"
           "builtins.path { path = ./tree; name = \"../../evil\"; }"
-          "invalid store path name",
-        needleTest
+          "path '7gzygjfd61wpybnrahsdpkpa1qhcgx55-../../evil' is not a valid store path: name '../../evil' contains illegal character '/'",
+        refusedAs
           "path with a filter rejects a drive-prefixed name"
           "builtins.path { path = ./tree; name = \"C:evil\"; filter = (_: _: true); }"
-          "invalid store path name",
-        needleTest
+          "path 'la26d723gkznrdzhaxknqp0mi025ibi7-C:evil' is not a valid store path: name 'C:evil' contains illegal character ':'",
+        -- A pinned copy's name is refused under the pin, before the pin
+        -- is checked against the tree (which it does not match).
+        refusedAs
+          "a pinned path's name is refused under the pinned hash"
+          ("builtins.path { path = ./tree; name = \"a b\"; sha256 = \"" <> T.replicate 64 "0" <> "\"; }")
+          "path 'mrlc43by4xlm6cr8163bcqrr712bh2k2-a b' is not a valid store path: name 'a b' contains illegal character ' '",
+        -- Every argument is forced before the pinned path is built.
+        refusedAs
+          "a pinned path forces its filter before refusing its name"
+          ("builtins.path { path = ./tree; name = \"a b\"; sha256 = \"" <> T.replicate 64 "0" <> "\"; filter = throw \"filter forced\"; }")
+          "filter forced",
+        refusedAs
           "source coercion rejects a basename outside the name rules"
           "\"${./. + \"/sp ace\"}\""
-          "invalid store path name"
+          "path 'pj9xmn69xsrk8nlx6xsljb0bmsydj4dr-sp ace' is not a valid store path: name 'sp ace' contains illegal character ' '"
       ]
 
 -- | An inherited name and whether its select reads that name, as the one
