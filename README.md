@@ -64,9 +64,11 @@ it.
   store path is not allowed along with it, and the bundled `<nix/*>` directory
   stays listed in `builtins.nixPath` under `--pure-eval`, where upstream
   shows an empty list.
-- The Windows store is `C:\nix\store`, where upstream's Windows default is
-  `%PROGRAMDATA%\nix\store`, so the two do not share store paths on Windows
-  ([#309]).
+- A store path's hash covers the spelling of the store directory. On Windows
+  nova-nix hashes over `/nix/store`, as Linux and macOS do, and by default
+  keeps the files in `C:\nix\store`. Upstream's local store on Windows hashes
+  over its native directory, `%ProgramData%\nix\store` by default since Nix
+  2.35, so the same derivation has a different store path in each ([#309]).
 - On Windows a build's process tree runs in a job object, so stopping a build
   stops everything it started. No platform has filesystem or network
   isolation yet ([#194]).
