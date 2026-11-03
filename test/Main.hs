@@ -49,7 +49,7 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuilderSpawn (..), buildDerivation, buildPath, buildWithDeps, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
 import Nix.Config (NixConfig (..))
@@ -7026,6 +7026,94 @@ testBuildOrchestrator = do
           other -> Fail ("expected dep drvPath and main's derivation, got " <> T.pack (show other))
     ]
 
+-- | @passAsFile@ on the value a build writes and spawns from, upstream's
+-- @initTmpDir@ (local-derivation-goal.cc at 2.24.9).  The file name for
+-- @foo@ is the one upstream's own test pins
+-- (@tests\/functional\/pass-as-file.sh@ at 2.24.9).
+testPassAsFile :: IO [Bool]
+testPassAsFile = do
+  putStrLn "builder/passAsFile"
+  sequence
+    [ runTest "an attribute passAsFile names becomes upstream's file and a Path variable" $
+        assertRight "delivery" (deliver [("foo", "xyzzy"), ("passAsFile", "foo")]) $ \delivery ->
+          assertEqual "files" [(fooFile, "xyzzy")] (adFiles delivery)
+            `andThen` assertEqual "fooPath" (Just (T.pack fooFile)) (Map.lookup "fooPath" (adEnv delivery))
+            `andThen` assertEqual "foo" Nothing (Map.lookup "foo" (adEnv delivery))
+            `andThen` assertEqual "passAsFile" (Just "foo") (Map.lookup "passAsFile" (adEnv delivery)),
+      -- Upstream's tokenizer splits at space, tab, newline and carriage
+      -- return only, so the vertical tab leaves one name, "e\vf", that no
+      -- attribute has.
+      runTest "passAsFile splits at upstream's separators and skips absent names" $
+        let attrs = [(name, "v") | name <- ["a", "b", "c", "d", "e", "f"]]
+         in assertRight "delivery" (deliver (("passAsFile", "a\tb\nc\rd  e\vf missing") : attrs)) $ \delivery ->
+              assertEqual "path variables" ["aPath", "bPath", "cPath", "dPath"] (filter ("Path" `T.isSuffixOf`) (Map.keys (adEnv delivery)))
+                `andThen` assertEqual "files" 4 (length (adFiles delivery))
+                `andThen` assertEqual "kept" [Just "v", Just "v"] (map (`Map.lookup` adEnv delivery) ["e", "f"]),
+      runTest "an attribute called <name>Path keeps its own value" $
+        assertRight "delivery" (deliver [("foo", "x"), ("fooPath", "literal"), ("passAsFile", "foo")]) $ \delivery ->
+          assertEqual "fooPath" (Just "literal") (Map.lookup "fooPath" (adEnv delivery))
+            `andThen` assertEqual "files" [(fooFile, "x")] (adFiles delivery),
+      -- The derivation's out is the final path; the build writes elsewhere
+      -- when that path is already valid, and the file says where.
+      runTest "an output passed as a file leaves the environment for the path it is written to" $
+        assertRight "delivery" (deliver [("out", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-p"), ("passAsFile", "out")]) $ \delivery ->
+          assertEqual "out" Nothing (Map.lookup "out" (adEnv delivery))
+            `andThen` case Map.lookup "outPath" (adEnv delivery) of
+              Just path -> assertEqual "files" [(T.unpack path, TE.encodeUtf8 (T.pack scratchOut))] (adFiles delivery)
+              Nothing -> Fail "no outPath variable",
+      runTest "a value passed as a file stays bytes" $
+        assertRight "as a file" (deliver [("foo", "\xff\xfe"), ("passAsFile", "foo")]) (assertEqual "files" [(fooFile, "\xff\xfe")] . adFiles)
+          `andThen` assertLeft "as a variable" (deliver [("foo", "\xff\xfe")]),
+      runTest "structured attributes ignore passAsFile" $
+        let json = "{\"foo\":\"xyzzy\",\"passAsFile\":[\"foo\"]}"
+         in assertRight "delivery" (deliver [("__json", json), ("foo", "xyzzy"), ("passAsFile", "foo")]) $ \delivery ->
+              assertEqual "files" [buildDir </> ".attrs.json", buildDir </> ".attrs.sh"] (map fst (adFiles delivery))
+                `andThen` assertEqual "variables" ["NIX_ATTRS_JSON_FILE", "NIX_ATTRS_SH_FILE"] (Map.keys (adEnv delivery)),
+      -- The law passAsFile exists for: moving an attribute from the
+      -- environment to a file changes where the builder reads it, not what
+      -- it reads.  The store directories include one ending in /nix/store,
+      -- which a rewrite applied twice would mangle.
+      runTestM "an attribute's file holds the bytes its variable would have held" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll ((,) <$> QC.elements storeDirs <*> genRewritable) $ \(dir, value) ->
+              let config = defaultBuildConfig (StoreDir dir)
+                  bytes = TE.encodeUtf8 value
+               in case (deliverWith config [("foo", bytes)], deliverWith config [("foo", bytes), ("passAsFile", "foo")]) of
+                    (Right variable, Right file) ->
+                      let found = lookup fooFile (adFiles file)
+                       in QC.counterexample "no file" (isJust found)
+                            QC..&&. ((TE.encodeUtf8 <$> Map.lookup "foo" (adEnv variable)) QC.=== found)
+                    _ -> QC.counterexample "delivery failed" False
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    ]
+  where
+    buildDir = "/build"
+    fooFile = buildDir </> ".attr-1bp7cri8hplaz6hbz0v4f0nl44rl84q1sg25kgwqzipzd1mv89ic"
+    scratchOut = "/scratch/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-p"
+    outputDirs = [("out", scratchOut), ("dev", "/scratch/cccccccccccccccccccccccccccccccc-p-dev")]
+    deliverWith config env =
+      attrsDelivery config (mkTestBuildDrv "sh" (StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "p") "") {drvEnv = Map.fromList env} buildDir outputDirs
+    deliver = deliverWith (defaultBuildConfig defaultStoreDir)
+    storeDirs = ["/nix/store", "/home/user/nix/store", "C:\\nix\\store"]
+    genRewritable =
+      T.concat
+        <$> QC.listOf
+          ( QC.elements
+              [ "/nix/store/",
+                "/nix/store/dddddddddddddddddddddddddddddddd-dep",
+                hashPlaceholder "out",
+                hashPlaceholder "dev",
+                hashPlaceholder "lib",
+                "/",
+                " ",
+                "\\",
+                "a",
+                "\233",
+                "\128512"
+              ]
+          )
+
 -- ---------------------------------------------------------------------------
 -- Tests: Store.DB (Phase 2, Batch 1)
 -- ---------------------------------------------------------------------------
@@ -12236,6 +12324,39 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         forceRemoveIfExists (bcTmpDir config)
         pure ret,
+      -- An attribute passAsFile names arrives as upstream's file in the
+      -- build directory, named by fooPath: its store path and placeholder
+      -- rewritten as a variable's would be, its other bytes as they are,
+      -- invalid UTF-8 included.  Neither it nor a name with no attribute
+      -- behind it is a variable.
+      runTestM "passAsFile attributes reach the builder as files in the build directory" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-passasfile"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "gggggggggggggggggggggggggggggggg" "passasfile"
+            outDir = storePathToFilePath (stDir store) outSP
+            dep = "/dddddddddddddddddddddddddddddddd-dep"
+            value = "\xff " <> TE.encodeUtf8 ("/nix/store" <> dep <> " " <> hashPlaceholder "out")
+            expected = "\xff " <> TE.encodeUtf8 (T.pack (unStoreDir (stDir store)) <> dep <> " " <> T.pack outDir)
+            script = "mkdir \"$out\" && cp \"$fooPath\" \"$out/foo\" && printf '%s|%s|%s' \"${foo-unset}\" \"${missingPath-unset}\" \"$fooPath\" > \"$out/env\""
+            base = mkTestBuildDrv shell outSP script
+            drv = base {drvEnv = Map.union (Map.fromList [("foo", value), ("passAsFile", "foo missing")]) (drvEnv base)}
+            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-passasfile-tmp"}
+            fooFile = bcTmpDir config </> T.unpack (spHash outSP) </> ".attr-1bp7cri8hplaz6hbz0v4f0nl44rl84q1sg25kgwqzipzd1mv89ic"
+        result <- buildDerivation config store drv
+        ret <- case result of
+          BuildSuccess _ -> do
+            contents <- BS.readFile (outDir </> "foo")
+            probe <- BS.readFile (outDir </> "env")
+            pure $
+              assertEqual "file contents" expected contents
+                `andThen` assertEqual "variables" (TE.encodeUtf8 ("unset|unset|" <> T.pack fooFile)) probe
+          BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+        closeStore store
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists (bcTmpDir config)
+        pure ret,
       -- Output at expected path
       runTestM "output at expected store path" $ do
         tmpBase <- getTemporaryDirectory
@@ -16285,6 +16406,7 @@ runSuite = do
           testPushPure,
           testPushClosureIO,
           testBuildOrchestrator,
+          testPassAsFile,
           testStoreDB,
           testParseStorePath,
           testStoreOps,
