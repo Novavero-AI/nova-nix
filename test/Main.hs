@@ -3916,9 +3916,9 @@ testUnsafeGetAttrPos = do
       noPosition "a builtin has none" "builtins.unsafeGetAttrPos \"map\" builtins",
       -- A derivation's own attributes are on the wrapper's lines
       -- ('derivationWrapperSource'), under upstream's file name.
-      inWrapper "a derivation's type is in the wrapper" "type" (17, 9),
-      inWrapper "a derivation's output is at the wrapper's listToAttrs value" "out" (14, 7),
-      inWrapper "a derivation's inherited drvAttrs is at the name" "drvAttrs" (9, 15),
+      inWrapper "a derivation's type is in the wrapper" "type" (7, 7),
+      inWrapper "a derivation's output is at the wrapper's listToAttrs value" "out" (6, 5),
+      inWrapper "a derivation's inherited drvAttrs is at the name" "drvAttrs" (17, 15),
       inFile "a derivation keeps its argument's positions" (derivationAttrPos "name") (2, 3),
       -- Text with no file behind it records positions that name none,
       -- as upstream's Pos::String origin makes mkPos answer null.
@@ -4597,9 +4597,8 @@ testBatchH = do
       runTest "derivation deterministic" $
         assertRight "drv-det" (evalNix "let d1 = derivation { name = \"a\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; d2 = derivation { name = \"a\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }; in d1.drvPath == d2.drvPath") $ \val ->
           assertEqual "deterministic" (VBool True) val,
-      -- The result is upstream's derivation.nix wrapper evaluated as the
-      -- builtin, so its shape is the wrapper's: every row below was read
-      -- from nix-instantiate 2.33.2 (#217).
+      -- The result has the shape of upstream's wrapper: every row below
+      -- was read from nix-instantiate 2.33.2.
       runTest "derivation result carries exactly upstream's attributes" $
         assertEval
           "drv-attrnames"
@@ -4638,6 +4637,58 @@ testBatchH = do
           (VBool True),
       runTest "derivation is a lambda with upstream's formals" $
         assertEval "drv-functionargs" "builtins.functionArgs derivation == { outputs = true; }" (VBool True)
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: what a program can observe of the derivation wrapper
+-- ---------------------------------------------------------------------------
+
+-- | What a program can observe of @derivation@ beyond the attributes
+-- 'testBatchH' reads, each expected value written out: the name the
+-- pattern binds, which builtin forces @outputs@ and in what order, how the
+-- layers of the result replace each other, and the arguments' own values
+-- in the result.  The parity job probes the same things against upstream's
+-- nix-instantiate (test/data/derivation-probes.txt).
+testDerivationWrapper :: IO [Bool]
+testDerivationWrapper = do
+  putStrLn "derivation/wrapper"
+  tmpBase <- getTemporaryDirectory
+  let required = "name = \"w\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; "
+      drv fields = "derivation { " <> required <> fields <> " }"
+      atWhnf fields = "builtins.seq (" <> drv fields <> ") null"
+      throwing = drv "outputs = [ \"out\" \"dev\" ]; x = throw \"forced\";"
+  sequence
+    [ runTest "toXML shows the name the pattern binds" $
+        assertEval
+          "xml"
+          "builtins.toXML derivation"
+          (mkStr "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n  <function>\n    <attrspat ellipsis=\"1\" name=\"drvAttrs\">\n      <attr name=\"outputs\" />\n    </attrspat>\n  </function>\n</expr>\n"),
+      -- map's error rather than head's: map forces outputs first.
+      runTest "map forces outputs before head does" $
+        assertEvalError "map" (atWhnf "outputs = \"out\";") "builtins.map: expected a list, got a string",
+      runTest "listToAttrs forces the output names first to last" $
+        assertEvalError "first" (atWhnf "outputs = [ (throw \"the first\") \"out\" (throw \"the last\") ];") "the first",
+      runTest "every output name is forced with the derivation" $
+        assertEvalError "last" (atWhnf "outputs = [ \"out\" (throw \"the last\") ];") "the last",
+      runTest "an argument that throws stays unforced through the result's attributes" $
+        assertEval
+          "spine"
+          ("let d = " <> throwing <> "; in builtins.toJSON [ (builtins.attrNames d) (map (o: o.outputName) d.all) d.dev.type (builtins.attrNames d.drvAttrs) ]")
+          (mkStr "[[\"all\",\"builder\",\"dev\",\"drvAttrs\",\"drvPath\",\"name\",\"out\",\"outPath\",\"outputName\",\"outputs\",\"system\",\"type\",\"x\"],[\"out\",\"dev\"],\"derivation\",[\"builder\",\"name\",\"outputs\",\"system\",\"x\"]]"),
+      -- == forces both sides, then takes one value as equal to itself, so a
+      -- function is equal only to itself.  Under the IO evaluator, which
+      -- keeps a forced binding's value as upstream's does, where the pure
+      -- one evaluates args again at each use.
+      runTestIO
+        "the arguments' values reach the result unchanged"
+        tmpBase
+        ("let args = { " <> required <> "f = y: y; }; d = derivation args; in builtins.intersectAttrs { f = null; } d == builtins.intersectAttrs { f = null; } args")
+        (VBool True),
+      runTest "the result's own attributes replace the outputs' and the arguments'" $
+        assertEval
+          "layers"
+          ("let d = " <> drv "outputs = [ \"out\" \"all\" ]; type = \"t\"; all = 1; out = 6;" <> "; in builtins.toJSON [ d.type (builtins.isList d.all) d.out.outputName d.drvAttrs.type d.drvAttrs.all ]")
+          (mkStr "[\"derivation\",true,\"out\",\"t\",1]")
     ]
 
 -- ---------------------------------------------------------------------------
@@ -16147,8 +16198,8 @@ testStoreNameSinks = do
       runTest "repeated derivation output name is rejected" $
         failsWith "out-duplicate" (drvWithOutputs "[ \"out\" \"out\" ]") "duplicate derivation output 'out'",
       -- The wrapper never calls derivationStrict with an empty list (its
-      -- builtins.head fails on the empty outputsList first), so the primop
-      -- is called directly.
+      -- builtins.head fails on the empty list of outputs first), so the
+      -- primop is called directly.
       runTest "empty derivation output list is rejected" $
         failsWith
           "out-empty"
@@ -18056,6 +18107,7 @@ runSuite = do
           testBatchF,
           testBatchG,
           testBatchH,
+          testDerivationWrapper,
           testStringContext,
           testContextHelpers,
           testContextPropagation,

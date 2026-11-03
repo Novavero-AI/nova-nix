@@ -4,8 +4,8 @@
 -- ~100 functions.  This module assembles the initial 'Env' from the
 -- central registry in "Nix.Eval" and adds standard constants
 -- (@true@, @false@, @null@, @storeDir@, @currentTime@,
--- @currentSystem@, etc.), among them @derivation@: upstream's wrapper
--- lambda around the @derivationStrict@ primop, evaluated from its source.
+-- @currentSystem@, etc.), among them @derivation@: a Nix lambda over the
+-- @derivationStrict@ primop, evaluated from its source.
 -- The impure constants follow the evaluation policy: under @pure-eval@
 -- upstream installs neither @currentTime@ nor @currentSystem@
 -- (@addConstant@ skips an @impureOnly@ constant), so neither exists here
@@ -141,53 +141,68 @@ targetNixVersion = "2.24.9"
 -- The derivation constant
 -- ---------------------------------------------------------------------------
 
--- | The expression of upstream's @src\/libexpr\/primops\/derivation.nix@ at
--- 2.24.9, without the file's comments.  @derivation@ is this lambda, not a
--- primop, so the result set has upstream's shape by construction: every
--- output attribute is the complete derivation set for that output, @all@
--- lists them, @drvAttrs@ is the argument set, and @derivationStrict@ is
--- reached only through @outPath@ and @drvPath@, which is what keeps forcing
--- a derivation to WHNF from forcing any of its inputs.  The attributes it
--- defines are at this text's lines, which differ from upstream's, where the
--- file's comments come first.
+-- | The source of @derivation@, a lambda over the @derivationStrict@ primop.
+-- Its value is the set for the first output: the arguments, then one
+-- attribute per output holding that output's set, then @all@ (the output
+-- sets in the order @outputs@ lists them) and @drvAttrs@ (the arguments),
+-- then the output's own @type@, @outputName@, @drvPath@ and @outPath@, a
+-- later layer's attribute replacing an earlier one's of the same name.
+-- @derivationStrict@ runs only when a @drvPath@ or @outPath@ is forced, so
+-- forcing a derivation to WHNF forces the argument set and @outputs@ with
+-- each name in it, and none of the other attributes.
+--
+-- The rest is fixed by what a program can observe of upstream's wrapper,
+-- which the parity job compares this one with: the formals, which
+-- @functionArgs@ shows, and the name the @\@@ binds, which @toXML@ shows
+-- too; @outputs@ forced by @map@, then @head@, then @listToAttrs@ over every
+-- name, which decides the error a malformed list raises; and the arguments'
+-- own values in the result, which @==@ shows for a function: upstream's
+-- forces both sides, then takes one value as equal to itself (@eqValues@,
+-- eval.cc at 2.24.9).  nova-nix's @==@ takes a shared thunk as equal
+-- without forcing it, which shows more of the sharing, so the wrapper also
+-- shares what upstream's does: an output's set is one value in @all@,
+-- under its name and as the result, and each output has a @drvPath@ of
+-- its own.  The attributes it defines are at this text's lines, which
+-- differ from upstream's.  Its identifiers differ too, and compiling it
+-- interns them before any file a program imports, as upstream's startup
+-- interns its wrapper's: an error that names attributes in interning order
+-- (an unexpected argument, the keys of a set missing an attribute) can
+-- name another first than upstream's identifiers would make it.
 derivationWrapperSource :: ByteString
 derivationWrapperSource =
   BC.unlines
-    [ "drvAttrs @ { outputs ? [ \"out\" ], ... }:",
-      "",
+    [ "{ outputs ? [ \"out\" ], ... }@drvAttrs:",
       "let",
-      "",
-      "  strict = derivationStrict drvAttrs;",
-      "",
-      "  commonAttrs = drvAttrs // (builtins.listToAttrs outputsList) //",
-      "    { all = map (x: x.value) outputsList;",
+      "  paths = derivationStrict drvAttrs;",
+      "  entries = map (outputName: {",
+      "    name = outputName;",
+      "    value = shared // {",
+      "      type = \"derivation\";",
+      "      inherit outputName;",
+      "      drvPath = paths.drvPath;",
+      "      outPath = builtins.getAttr outputName paths;",
+      "    };",
+      "  }) outputs;",
+      "  shared =",
+      "    drvAttrs",
+      "    // builtins.listToAttrs entries",
+      "    // {",
       "      inherit drvAttrs;",
+      "      all = map (entry: entry.value) entries;",
       "    };",
-      "",
-      "  outputToAttrListElement = outputName:",
-      "    { name = outputName;",
-      "      value = commonAttrs // {",
-      "        outPath = builtins.getAttr outputName strict;",
-      "        drvPath = strict.drvPath;",
-      "        type = \"derivation\";",
-      "        inherit outputName;",
-      "      };",
-      "    };",
-      "",
-      "  outputsList = map outputToAttrListElement outputs;",
-      "",
-      "in (builtins.head outputsList).value"
+      "in",
+      "(builtins.head entries).value"
     ]
 
--- | Where the wrapper's source is: upstream evaluates it as the file
--- @derivation-internal.nix@ of an in-memory accessor (@derivationInternal@,
--- eval.cc at 2.24.9), and a position in it reports the file as its path
--- there.
+-- | Where the wrapper's source is: upstream evaluates its wrapper as the
+-- file @derivation-internal.nix@ of an in-memory accessor
+-- (@derivationInternal@, eval.cc at 2.24.9), and a position in this one
+-- reports the same file, as its path there.
 derivationWrapperOrigin :: SourceOrigin
 derivationWrapperOrigin = SourceFile "/derivation-internal.nix"
 
 -- | The bindings the wrapper's free variables resolve to.  Upstream evaluates
--- the file in its base environment; this is the slice of that environment
+-- its wrapper in its base environment; this is the slice of that environment
 -- the wrapper reads, so the constant needs no knot through 'builtinEnv'.
 -- The wrapper is bound against these names too, so it cannot read one the
 -- slice lacks.
