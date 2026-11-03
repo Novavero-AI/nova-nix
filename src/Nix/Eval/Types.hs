@@ -1434,6 +1434,13 @@ class (Monad m) => MonadEval m where
   -- Every fetcher calls it before anything is spawned or downloaded.
   checkUri :: Text -> m ()
 
+  -- | A path named on the drive this evaluation reads it on
+  -- ('Nix.Store.Path.qualifyPathText' against its store directory): on
+  -- Windows a rooted path with no drive gains the store's.  For a
+  -- fetcher handing a local path to another program, which would
+  -- otherwise read it on whatever drive that program has current.
+  qualifyPath :: Text -> m Text
+
 -- | Unwrap a store-path construction result (the @makeStorePath@ family
 -- in "Nix.Hash"), raising a refused name as upstream's @BadStorePath@
 -- text.  The message names the path and not the builtin, as upstream's
@@ -1543,6 +1550,9 @@ instance MonadEval PureEval where
   storeSourcePath = pure
   evalPolicy = pure unrestrictedPolicy
   checkUri _ = pure ()
+
+  -- No filesystem, so no drive to read on: a path names itself.
+  qualifyPath = pure
   resolvePathLiteral = pure . canonPathValue
   forceThunk evalFn (Thunk ptr) =
     -- Read the C thunk via unsafePerformIO - safe because reads are

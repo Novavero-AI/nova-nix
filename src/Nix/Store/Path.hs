@@ -44,6 +44,7 @@ module Nix.Store.Path
     storePathToText,
     isCanonicalStoreText,
     storeTextToFilePath,
+    qualifyPathText,
     parseStorePath,
     parseStorePathPrefix,
     parseStorePathBaseName,
@@ -69,7 +70,7 @@ import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Store.Path.Internal (StorePath (..))
-import System.FilePath ((</>))
+import System.FilePath (isPathSeparator, (</>))
 import qualified System.Info
 
 -- | The base directory of the Nix store.
@@ -127,10 +128,11 @@ isCanonicalStoreText txt = case T.stripPrefix defaultStoreDirText txt of
 
 -- | Resolve path-value text to the filesystem location it names: text
 -- under the canonical store dir resolves into the given store dir, and
--- every other path is taken as written.  Writers emit the canonical
--- spelling into eval values, so every reader that performs IO on a path
--- value must resolve through this - on Windows the rooted @\/nix@ prefix
--- would otherwise resolve against the working drive.
+-- every other path is 'qualifyPathText' of it.  Writers emit the
+-- canonical spelling into eval values, so every reader that performs IO
+-- on a path value must resolve through this - on Windows the rooted
+-- @\/nix@ prefix, and any other rooted path with no drive, would
+-- otherwise resolve against the working drive.
 --
 -- The store dir is a parameter rather than 'platformStoreDir' because a
 -- caller may have been given one: resolving reads against the platform
@@ -140,7 +142,40 @@ storeTextToFilePath :: StoreDir -> Text -> FilePath
 storeTextToFilePath storeDir txt
   | isCanonicalStoreText txt =
       unStoreDir storeDir <> T.unpack (T.drop (T.length defaultStoreDirText) txt)
-  | otherwise = T.unpack txt
+  | otherwise = T.unpack (qualifyPathText storeDir txt)
+
+-- | Path-value text named on the drive the file system reads it on, in
+-- the value's own spelling: a rooted path with no drive of its own
+-- (@\/src\/f.nix@) gains the store directory's drive designator, so the
+-- same value names the same file whatever drive is current.  Store text
+-- is returned as it is: it names the store directory, not the store
+-- drive's @\\nix\\store@ (under @--store D:\\s@, @\/nix\/store\/...@ is
+-- under @D:\\s@ and @\/nix@ is @D:\/nix@).  A store directory with no
+-- drive (every POSIX one) leaves every path as it is, as does a path
+-- that is relative or already names a drive, and one that leads with two
+-- separators, which Windows reads as a UNC or device path naming its own
+-- root (a path value never does: canonicalization collapses them).
+--
+-- The access policy checks this text and the reads open
+-- 'storeTextToFilePath' of it, so the path checked is the path opened.
+qualifyPathText :: StoreDir -> Text -> Text
+qualifyPathText storeDir txt
+  | isCanonicalStoreText txt = txt
+  | Just (lead, rest) <- T.uncons txt,
+    isPathSeparator lead,
+    not (maybe False (isPathSeparator . fst) (T.uncons rest)),
+    Just drive <- storeDirDrive storeDir =
+      drive <> txt
+  | otherwise = txt
+
+-- | The drive designator (@C:@) a store directory begins with, if any.
+-- 'Nix.Store.Handle.canonicalStoreDir' makes the directory absolute, so a
+-- store on a Windows drive always spells one, and a POSIX store, rooted
+-- at @\/@, never does.
+storeDirDrive :: StoreDir -> Maybe Text
+storeDirDrive (StoreDir dir) = case dir of
+  letter : ':' : _ | isAsciiUpper letter || isAsciiLower letter -> Just (T.pack [letter, ':'])
+  _ -> Nothing
 
 -- | Length of the Nix base-32 hash component in store paths (32 chars).
 storePathHashLen :: Int

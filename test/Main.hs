@@ -61,7 +61,7 @@ import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
-import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
+import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
@@ -96,7 +96,7 @@ import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, proc
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
+import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
 import qualified NovaCache.Base64 as B64
@@ -381,10 +381,64 @@ testStorePaths = do
           "mapped-backslash"
           (unStoreDir platformStoreDir <> "\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y")
           (storeTextToFilePath platformStoreDir "/nix/store\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y"),
-      runTest "non-store text is the path as written" $
-        assertEqual "unmapped" "/etc/hosts" (storeTextToFilePath platformStoreDir "/etc/hosts"),
+      runTest "non-store text under a store with no drive is the path as written" $
+        assertEqual "unmapped" "/etc/hosts" (storeTextToFilePath defaultStoreDir "/etc/hosts"),
       runTest "a store-prefix-like name does not map" $
-        assertEqual "unmapped-like" "/nix/storefoo" (storeTextToFilePath platformStoreDir "/nix/storefoo"),
+        assertEqual "unmapped-like" "/nix/storefoo" (storeTextToFilePath defaultStoreDir "/nix/storefoo")
+          `andThen` assertEqual "on-the-store-drive" "C:/nix/storefoo" (storeTextToFilePath windowsStoreDir "/nix/storefoo"),
+      -- A rooted path with no drive names the store's drive, fixed by
+      -- configuration rather than by the drive that is current.
+      runTest "a rooted path with no drive opens on the store's drive" $
+        assertEqual "default" "C:/probe/f.txt" (storeTextToFilePath windowsStoreDir "/probe/f.txt")
+          `andThen` assertEqual "redirected" "D:/probe/f.txt" (storeTextToFilePath (StoreDir "D:\\s") "/probe/f.txt")
+          `andThen` assertEqual "root" "C:/" (storeTextToFilePath windowsStoreDir "/"),
+      -- A backslash roots a path only where it is a separator.
+      runTest "a backslash-rooted path gains the drive on Windows and is a name on POSIX" $
+        assertEqual
+          "backslash"
+          (if SI.os == "mingw32" then "C:\\probe\\f.txt" else "\\probe\\f.txt")
+          (storeTextToFilePath windowsStoreDir "\\probe\\f.txt"),
+      runTest "a drive-qualified, relative or UNC path opens as written" $
+        assertEqual "other-drive" "C:/probe/f.txt" (storeTextToFilePath (StoreDir "D:\\s") "C:/probe/f.txt")
+          `andThen` assertEqual "relative" "probe/f.txt" (storeTextToFilePath windowsStoreDir "probe/f.txt")
+          `andThen` assertEqual "unc" "//server/share/f.txt" (storeTextToFilePath windowsStoreDir "//server/share/f.txt")
+          `andThen` assertEqual "unc-backslash" "\\\\server\\share\\f.txt" (storeTextToFilePath windowsStoreDir "\\\\server\\share\\f.txt"),
+      -- Store text names the store directory, not the store drive's
+      -- \nix\store, and the logical store's parent is a plain path there.
+      runTest "store text under a redirected Windows store resolves through the store dir" $
+        assertEqual "store" "D:\\s/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x/f" (storeTextToFilePath (StoreDir "D:\\s") "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x/f")
+          `andThen` assertEqual "store-root" "D:\\s" (storeTextToFilePath (StoreDir "D:\\s") "/nix/store")
+          `andThen` assertEqual "parent" "D:/nix" (storeTextToFilePath (StoreDir "D:\\s") "/nix")
+          `andThen` assertEqual "value" "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x" (qualifyPathText (StoreDir "D:\\s") "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"),
+      runTest "on this platform's store a rooted path with no drive gains C: on Windows only" $
+        assertEqual
+          "platform"
+          (if SI.os == "mingw32" then "C:/probe/f.txt" else "/probe/f.txt")
+          (storeTextToFilePath platformStoreDir "/probe/f.txt"),
+      runTestM "a drive-qualified path opens as written under every store dir" $
+        property $
+          QC.forAll ((,) <$> genStoreDir <*> genDriveQualified) $ \(sd, path) ->
+            storeTextToFilePath sd path QC.=== T.unpack path,
+      runTestM "a rooted path outside the store gains the store's drive" $
+        property $
+          QC.forAll ((,,) <$> genDrive <*> genDriveDirTail <*> genOutsideStore) $ \(drive, dirTail, path) ->
+            storeTextToFilePath (StoreDir (T.unpack (drive <> dirTail))) path QC.=== T.unpack (drive <> path),
+      runTestM "under a store with no drive every path outside the store opens as written" $
+        property $
+          QC.forAll ((,) <$> genPosixStoreDir <*> QC.oneof [genOutsideStore, genDriveQualified]) $ \(sd, path) ->
+            storeTextToFilePath sd path QC.=== T.unpack path,
+      runTestM "store text resolves through the store dir under every store dir" $
+        property $
+          QC.forAll ((,) <$> genStoreDir <*> genStoreTail) $ \(sd, rest) ->
+            storeTextToFilePath sd (defaultStoreDirText <> rest) QC.=== (unStoreDir sd <> T.unpack rest),
+      runTestM "a path outside the store opens as the text the policy checks" $
+        property $
+          QC.forAll ((,) <$> genStoreDir <*> QC.oneof [genOutsideStore, genDriveQualified]) $ \(sd, path) ->
+            storeTextToFilePath sd path QC.=== T.unpack (qualifyPathText sd path),
+      runTestM "qualifying a path twice is qualifying it once" $
+        property $
+          QC.forAll ((,) <$> genStoreDir <*> QC.oneof [genOutsideStore, genDriveQualified, (defaultStoreDirText <>) <$> genStoreTail]) $ \(sd, path) ->
+            qualifyPathText sd (qualifyPathText sd path) QC.=== qualifyPathText sd path,
       -- The reason this takes a store dir at all: a caller given one must
       -- read from it, not from the platform default.
       runTest "store text maps into a redirected store dir" $
@@ -425,6 +479,23 @@ testStorePaths = do
     -- Lengths on both sides of the input's, so the last chunk is short,
     -- whole or absent, and below one, where there is nothing to fold into.
     genCompressCase = (,) <$> QC.choose (-1, 40) <*> QC.resize 70 (QC.listOf QC.arbitrary)
+    property :: (QC.Testable prop) => prop -> IO TestResult
+    property prop = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} prop
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    genDrive = QC.elements ["C:", "D:", "z:"]
+    -- What follows the drive in a Windows store directory, either spelling.
+    genDriveDirTail = QC.elements ["\\nix\\store", "\\s", "/s/store"]
+    genPosixStoreDir = StoreDir <$> QC.elements ["/nix/store", "/tmp/scratch-store", "/s"]
+    genStoreDir = QC.oneof [genPosixStoreDir, (\drive dirTail -> StoreDir (T.unpack (drive <> dirTail))) <$> genDrive <*> genDriveDirTail]
+    -- Segments that spell the store, and its lookalikes, when they lead.
+    genSegments = QC.listOf (QC.elements ["a", "src", "f.txt", "nix", "store", "storefoo", "x y"])
+    genDriveQualified = (\drive segments -> drive <> "/" <> T.intercalate "/" segments) <$> genDrive <*> genSegments
+    -- Rooted paths with no drive that are not store text, @/@ and @/nix@
+    -- among them.
+    genOutsideStore = ((\segments -> "/" <> T.intercalate "/" segments) <$> genSegments) `QC.suchThat` (not . isCanonicalStoreText)
+    -- What follows @/nix/store@ in store text.
+    genStoreTail = QC.oneof [pure "", (\sep segments -> sep <> T.intercalate "/" segments) <$> QC.elements ["/", "\\"] <*> genSegments]
 
 -- | Upstream's @compressHash@ loop (hash.cc), one byte at a time.
 compressHashModel :: Int -> [Word8] -> [Word8]
@@ -15164,12 +15235,15 @@ data StubEnv = StubEnv
     -- answer as 'doesPathExist', which is 'False' throughout: on disk and
     -- registered are different facts, and a test where the two coincide
     -- cannot tell which one the code under test asked about.
-    seAdoptable :: !(Set.Set Text)
+    seAdoptable :: !(Set.Set Text),
+    -- | The store directory 'qualifyPath' names paths against.
+    seStoreDir :: !StoreDir
   }
 
--- | A stub store holding nothing but the given derivations.
+-- | A stub store holding nothing but the given derivations, at the
+-- default store directory.
 stubEnv :: Map.Map Text Derivation -> StubEnv
-stubEnv drvs = StubEnv {seDrvs = drvs, seFetchCache = Map.empty, seAdoptable = Set.empty}
+stubEnv drvs = StubEnv {seDrvs = drvs, seFetchCache = Map.empty, seAdoptable = Set.empty, seStoreDir = defaultStoreDir}
 
 runStubStoreEvalWith :: StubEnv -> StubStoreEval a -> Either Text a
 runStubStoreEvalWith env (StubStoreEval action) = case action env of
@@ -15237,6 +15311,7 @@ instance MonadEval StubStoreEval where
   storeSourcePath = pure
   evalPolicy = pure unrestrictedPolicy
   checkUri _ = pure ()
+  qualifyPath path = StubStoreEval $ \env -> Right (qualifyPathText (seStoreDir env) path)
   resolvePathLiteral = pure . canonPath
   forceThunk evalFn thunk@(Thunk ptr) = case readThunkValue thunk of
     Just val -> pure val
@@ -17547,6 +17622,7 @@ runSuite = do
           testAbsolutePathStrings,
           testEvalPolicyRules,
           testEvalPolicyIO,
+          testDrivelessPathsIO,
           testEvalPolicyCLI,
           testResultPrinterCLI,
           testConfigBytesCLI,
@@ -17684,18 +17760,26 @@ testEvalPolicyRules = do
           `andThen` assertEqual "http:" False (isAllowedUri ["https:"] "http://x"),
       -- checkURI
       runTest "nothing is checked unless restrict-eval is on" $
-        assertEqual "off" (Right ()) (uriAccess purePolicy noAllowedPaths "https://x"),
+        assertEqual "off" (Right ()) (uriAccess defaultStoreDir purePolicy noAllowedPaths "https://x"),
       runTest "a URI outside the list is refused with upstream's wording" $
-        assertEqual "refused" (Left "access to URI 'https://x/y' is forbidden in restricted mode") (uriAccess restrictedPolicy noAllowedPaths "https://x/y"),
+        assertEqual "refused" (Left "access to URI 'https://x/y' is forbidden in restricted mode") (uriAccess defaultStoreDir restrictedPolicy noAllowedPaths "https://x/y"),
       runTest "a path URI is checked against the allowed paths" $
-        assertEqual "allowed" (Right ()) (uriAccess restrictedPolicy oneRoot "/a/b/f")
-          `andThen` assertEqual "refused" (Left "access to absolute path '/etc/passwd' is forbidden in restricted mode") (uriAccess restrictedPolicy oneRoot "/etc/passwd"),
+        assertEqual "allowed" (Right ()) (uriAccess defaultStoreDir restrictedPolicy oneRoot "/a/b/f")
+          `andThen` assertEqual "refused" (Left "access to absolute path '/etc/passwd' is forbidden in restricted mode") (uriAccess defaultStoreDir restrictedPolicy oneRoot "/etc/passwd"),
       runTest "a file URL is checked as its path, rooted" $
-        assertEqual "allowed" (Right ()) (uriAccess restrictedPolicy oneRoot "file:///a/b/f")
-          `andThen` assertEqual "rooted" (Left "access to absolute path '/etc/passwd' is forbidden in restricted mode") (uriAccess restrictedPolicy oneRoot "file://etc/passwd"),
+        assertEqual "allowed" (Right ()) (uriAccess defaultStoreDir restrictedPolicy oneRoot "file:///a/b/f")
+          `andThen` assertEqual "rooted" (Left "access to absolute path '/etc/passwd' is forbidden in restricted mode") (uriAccess defaultStoreDir restrictedPolicy oneRoot "file://etc/passwd"),
       runTest "a file URL with a drive is checked as that drive's path" $
-        assertEqual "allowed" (Right ()) (uriAccess restrictedPolicy driveRoot "file://C:/a/b/f")
-          `andThen` assertEqual "refused" (Left "access to absolute path 'C:/a/c' is forbidden in restricted mode") (uriAccess restrictedPolicy driveRoot "file://C:/a/c"),
+        assertEqual "allowed" (Right ()) (uriAccess defaultStoreDir restrictedPolicy driveRoot "file://C:/a/b/f")
+          `andThen` assertEqual "refused" (Left "access to absolute path 'C:/a/c' is forbidden in restricted mode") (uriAccess defaultStoreDir restrictedPolicy driveRoot "file://C:/a/c"),
+      -- The path a file URL names with no drive is checked on the store's
+      -- drive, where the fetch reads it, not on the current one.
+      runTest "a path or file URL with no drive is checked on the store's drive" $
+        assertEqual "path" (Right ()) (uriAccess windowsStoreDir restrictedPolicy driveRoot "/a/b/f")
+          `andThen` assertEqual "url" (Right ()) (uriAccess windowsStoreDir restrictedPolicy driveRoot "file:///a/b/f")
+          `andThen` assertEqual "rootless" (Right ()) (uriAccess windowsStoreDir restrictedPolicy driveRoot "file://a/b/f")
+          `andThen` assertEqual "named" (Left "access to absolute path 'C:/etc/passwd' is forbidden in restricted mode") (uriAccess windowsStoreDir restrictedPolicy driveRoot "file:///etc/passwd")
+          `andThen` assertEqual "other-drive" (Left "access to absolute path 'D:/a/b/f' is forbidden in restricted mode") (uriAccess (StoreDir "D:\\s") restrictedPolicy driveRoot "/a/b/f"),
       runTest "the path refusal names pure mode when it is on" $
         assertEqual "pure" "access to absolute path '/etc' is forbidden in pure evaluation mode (use '--impure' to override)" (forbiddenPathMessage purePolicy "/etc")
           `andThen` assertEqual "both" "access to absolute path '/etc' is forbidden in pure evaluation mode (use '--impure' to override)" (forbiddenPathMessage purePolicy {epRestrictEval = True} "/etc"),
@@ -17719,6 +17803,23 @@ testEvalPolicyRules = do
         assertEqual "git" "git://h/r?exportIgnore=1" (gitInputUrl (gitInput "git://h/r")),
       runTest "a path is percent-encoded as upstream encodes it" $
         assertEqual "space" "git+file:///p/my%20repo?exportIgnore=1" (gitInputUrl (gitInput "/p/my repo")),
+      -- What a fetch hands curl and git: a local path on the drive the
+      -- evaluator reads it on, in the file://C:/ form the URI gate reads.
+      runTest "a file URL with no drive reaches the tool on the store's drive" $
+        assertEqual "file" (Right "file://C:/probe/f.txt") (onWindowsStore (localFileUrl "file:///probe/f.txt"))
+          `andThen` assertEqual "drive" (Right "file://D:/probe/f.txt") (onWindowsStore (localFileUrl "file://D:/probe/f.txt"))
+          `andThen` assertEqual "rootless" (Right "file://probe/f.txt") (onWindowsStore (localFileUrl "file://probe/f.txt"))
+          `andThen` assertEqual "store" (Right "file:///nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x") (onWindowsStore (localFileUrl "file:///nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"))
+          `andThen` assertEqual "https" (Right "https://h/x") (onWindowsStore (localFileUrl "https://h/x"))
+          `andThen` assertEqual "posix" (Right "file:///probe/f.txt") (onPosixStore (localFileUrl "file:///probe/f.txt")),
+      runTest "a local git remote with no drive reaches git on the store's drive" $
+        assertEqual "bare" (Right "C:/probe/repo") (onWindowsStore (gitRemote "/probe/repo"))
+          `andThen` assertEqual "file" (Right "file://C:/probe/repo") (onWindowsStore (gitRemote "file:///probe/repo"))
+          `andThen` assertEqual "scp" (Right "git@github.com:NixOS/patchelf.git") (onWindowsStore (gitRemote "git@github.com:NixOS/patchelf.git"))
+          `andThen` assertEqual "unc" (Right "//server/share/repo") (onWindowsStore (gitRemote "//server/share/repo"))
+          `andThen` assertEqual "unc-url" (Right "file:////server/share/repo") (onWindowsStore (gitRemote "file:////server/share/repo"))
+          `andThen` assertEqual "https" (Right "https://h/r") (onWindowsStore (gitRemote "https://h/r"))
+          `andThen` assertEqual "posix" (Right "/probe/repo") (onPosixStore (gitRemote "/probe/repo")),
       -- nix.conf
       runTest "pure-eval and restrict-eval parse upstream's Boolean spellings" $
         assertEqual "true" (Right True) (cfgPure ["pure-eval = true"])
@@ -17743,6 +17844,8 @@ testEvalPolicyRules = do
           `andThen` assertEqual "time-default" (Right (VBool True)) (evalNixWith unrestrictedPolicy "builtins ? currentSystem")
     ]
   where
+    onWindowsStore = runStubStoreEvalWith (stubEnv Map.empty) {seStoreDir = windowsStoreDir}
+    onPosixStore = runStubStoreEvalWith (stubEnv Map.empty)
     gitInput url =
       FetchGitArgs
         { fgaUrl = url,
@@ -17924,6 +18027,66 @@ testEvalPolicyIO = do
           ]
       maybe (unsetEnv "XDG_CACHE_HOME") (setEnv "XDG_CACHE_HOME") savedCacheHome
       pure results
+
+-- | A rooted path with no drive opens what its drive-qualified spelling
+-- opens when the store is on that drive, at every site a path value
+-- reaches the filesystem and under the access policy.  The suite's store
+-- is under the temporary directory, so it shares that directory's drive,
+-- and on Windows CI the working directory is on another (D:), so a path
+-- resolved on the current drive misses.  On POSIX the two spellings are
+-- one path.
+testDrivelessPathsIO :: IO [Bool]
+testDrivelessPathsIO = do
+  putStrLn "eval/driveless-paths-io"
+  tmpBase <- Dir.canonicalizePath =<< getTemporaryDirectory
+  let dir = tmpBase </> "nova-nix-test-driveless"
+      qualified = canonPathValue (T.pack dir)
+      driveless = canonPathValue (T.pack ("/" <> dropDrive dir))
+      quoted = nixQuotedPath . T.unpack
+      -- A fixture by its drive-less spelling, as a string and as a path.
+      str name = quoted (driveless <> "/" <> name)
+      pathOf name = "(/. + " <> str name <> ")"
+      gives label = runTestIO label dir
+      -- The drive-qualified side is a relative literal, which resolves
+      -- against the fixture directory with its drive, or a string that
+      -- spells the drive where a fetch takes no path.
+      same label drivelessSide qualifiedSide = gives label ("(" <> drivelessSide <> ") == (" <> qualifiedSide <> ")") (VBool True)
+      restricted roots = evalPolicyIO restrictedPolicy roots [] dir
+      readsUnder label roots source =
+        runTestM label $ (\r -> assertRight label r (assertEqual label (mkStr "probe"))) <$> restricted roots source
+  bracket_
+    ( do
+        forceRemoveIfExists dir
+        createDirectoryIfMissing True (dir </> "repo")
+        createDirectoryIfMissing True (dir </> "sub")
+        BS.writeFile (dir </> "f.txt") "probe"
+        BS.writeFile (dir </> "g.nix") "7\n"
+        BS.writeFile (dir </> "sub" </> "h.txt") "inner\n"
+        BS.writeFile (dir </> "repo" </> "r.txt") "in repo\n"
+        _ <- fixtureGit (dir </> "repo") ["init", "--quiet"]
+        _ <- fixtureGit (dir </> "repo") ["add", "-A"]
+        _ <- fixtureGit (dir </> "repo") ["commit", "--quiet", "-m", "init"]
+        pure ()
+    )
+    (forceRemoveIfExists dir)
+    $ sequence
+      [ gives "pathExists of a string" ("builtins.pathExists " <> str "f.txt") (VBool True),
+        gives "pathExists of a path" ("builtins.pathExists " <> pathOf "f.txt") (VBool True),
+        gives "readFile" ("builtins.readFile " <> str "f.txt") (mkStr "probe"),
+        gives "readDir" ("builtins.attrNames (builtins.readDir " <> quoted driveless <> ") == [ \"f.txt\" \"g.nix\" \"repo\" \"sub\" ]") (VBool True),
+        gives "readFileType" ("builtins.readFileType " <> str "f.txt") (mkStr "regular"),
+        gives "import" ("import " <> str "g.nix") (VInt 7),
+        gives "scopedImport" ("builtins.scopedImport { } " <> str "g.nix") (VInt 7),
+        gives "findFile" ("builtins.readFile (builtins.findFile [ { prefix = \"d\"; path = " <> quoted driveless <> "; } ] \"d/f.txt\")") (mkStr "probe"),
+        same "hashFile" ("builtins.hashFile \"sha256\" " <> str "f.txt") "builtins.hashFile \"sha256\" ./f.txt",
+        same "a copy by interpolation" ("\"${" <> pathOf "f.txt" <> "}\"") "\"${./f.txt}\"",
+        same "builtins.path" ("builtins.path { path = " <> pathOf "sub" <> "; }") "builtins.path { path = ./sub; }",
+        same "filterSource" ("builtins.filterSource (p: t: true) " <> pathOf "sub") "builtins.filterSource (p: t: true) ./sub",
+        same "fetchurl of a file URL" ("builtins.fetchurl \"file://" <> driveless <> "/f.txt\"") ("builtins.fetchurl \"file://" <> qualified <> "/f.txt\""),
+        same "fetchGit of a local path" ("(builtins.fetchGit " <> str "repo" <> ").outPath") ("(builtins.fetchGit " <> quoted (qualified <> "/repo") <> ").outPath"),
+        readsUnder "a root allowed with no drive admits its drive-qualified spelling" [driveless] ("builtins.readFile " <> quoted (qualified <> "/f.txt")),
+        readsUnder "a root allowed with its drive admits the drive-less spelling" [qualified] ("builtins.readFile " <> str "f.txt")
+      ]
 
 -- | The flags and settings through the binary: the modes and
 -- @trace-verbose@ select themselves from the command line and from

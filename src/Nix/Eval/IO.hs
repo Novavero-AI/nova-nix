@@ -245,11 +245,18 @@ newEvalState storeDir baseDir = do
 -- caller seeds the search path roots before evaluation, and the instance
 -- adds every store object the evaluation produces.  Like upstream's, this
 -- is a no-op when nothing restricts access, so an unrestricted evaluation
--- does not accumulate a set it never consults.
+-- does not accumulate a set it never consults.  The prefix is allowed on
+-- the drive its reads open ('locatedPath'), the form every check uses.
 allowEvalPath :: EvalState -> Text -> IO ()
 allowEvalPath st path =
   when (pathsRestricted (esPolicy st)) $
-    modifyIORef' (esAllowedPaths st) (allowPathIn path)
+    modifyIORef' (esAllowedPaths st) (allowPathIn (locatedPath st path))
+
+-- | Path-value text as the policy checks it: canonical, and on the drive
+-- this evaluation's store directory puts it on ('SP.qualifyPathText'),
+-- so a check and the read it guards ('evalStoreTextPath') name one file.
+locatedPath :: EvalState -> Text -> Text
+locatedPath st = SP.qualifyPathText (esStoreDir st) . canonPathValue
 
 -- ---------------------------------------------------------------------------
 -- EvalIO newtype
@@ -318,7 +325,7 @@ instance MonadEval EvalIO where
   listDirectory path = do
     accessPath path
     dir <- evalStoreTextPath path
-    sourceIOWith ReadDirectory (resolvedForMessage path) $ do
+    sourceIOWith ReadDirectory (resolvedForMessage path dir) $ do
       entries <- Dir.listDirectory dir
       mapM (classifyEntry dir) entries
 
@@ -500,7 +507,7 @@ instance MonadEval EvalIO where
 
   readFileBytes path = do
     accessPath path
-    evalStoreTextPath path >>= \resolved -> sourceIOWith ReadFile (resolvedForMessage path) (BS.readFile resolved)
+    evalStoreTextPath path >>= \resolved -> sourceIOWith ReadFile (resolvedForMessage path resolved) (BS.readFile resolved)
 
   -- An lstat of the path itself, no symlink walk: upstream's readFileType
   -- realises its argument without resolution, the allow list checks the
@@ -696,17 +703,19 @@ instance MonadEval EvalIO where
   checkUri uri = do
     st <- EvalIO ask
     allowed <- EvalIO (liftIO (readIORef (esAllowedPaths st)))
-    either throwEvalError pure (uriAccess (esPolicy st) allowed uri)
+    either throwEvalError pure (uriAccess (esStoreDir st) (esPolicy st) allowed uri)
+
+  qualifyPath path = EvalIO (asks ((`SP.qualifyPathText` path) . esStoreDir))
 
   -- Store text stays canonical in the value domain, as it does for an
   -- import target ('resolveImportTarget' says why); every other path
-  -- resolves as a platform path, the policy walk having followed the
-  -- same links first.
+  -- resolves as the platform path it opens, the policy walk having
+  -- followed the same links first.
   resolveSymlinks path = do
     accessPath path
     if SP.isCanonicalStoreText path
       then pure (canonPath path)
-      else wrapIO (canonPathValue . T.pack <$> Dir.canonicalizePath (T.unpack path))
+      else evalStoreTextPath path >>= \native -> wrapIO (canonPathValue . T.pack <$> Dir.canonicalizePath native)
 
   resolvePathLiteral path = do
     baseDir <- EvalIO (asks esBaseDir)
@@ -910,7 +919,7 @@ accessPathDirect path = do
   st <- EvalIO ask
   when (pathsRestricted (esPolicy st)) $ do
     allowed <- EvalIO (liftIO (readIORef (esAllowedPaths st)))
-    let canonical = canonPathValue path
+    let canonical = locatedPath st path
     unless (isAbsolutePath canonical) $ throwEvalError (relativePathMessage path)
     unless (isAllowedPath allowed canonical) $
       throwEvalError (forbiddenPathMessage (esPolicy st) canonical)
@@ -989,13 +998,15 @@ data SymlinkResolution = ResolveFull | ResolveAncestors
 -- restarts at the root).  'Left' carries the refusal for the first
 -- prefix outside the allow list.  Under 'ResolveAncestors' the last
 -- component's own symlink is left alone, as upstream consults
--- @maybeLstat@ only while something remains to resolve.
+-- @maybeLstat@ only while something remains to resolve.  The path is
+-- walked on the drive its read opens ('locatedPath'), the form the allow
+-- list holds.
 walkAllowed :: SymlinkResolution -> EvalState -> AllowedPaths -> Text -> EvalIO (Either Text ())
 walkAllowed mode st allowed path
   | not (isAbsolutePath canonical) = pure (Left (relativePathMessage path))
   | otherwise = go symlinkFollowLimit [] (pathComponents canonical)
   where
-    canonical = canonPathValue path
+    canonical = locatedPath st path
     policy = esPolicy st
     go _ _ [] = pure (Right ())
     go linksLeft done (component : rest)
@@ -1144,8 +1155,8 @@ rejectSource builtinName target err = throwEvalError $ case err of
 -- would attach the working drive to the rooted @/nix@ prefix on Windows,
 -- so store text gets lexical canonicalization ('canonPath') only, and
 -- its reads resolve through 'evalStoreTextPath'.  Every other path
--- resolves and canonicalizes as a platform path, where the two returned
--- forms coincide.
+-- resolves and canonicalizes as the platform path 'evalStoreTextPath'
+-- gives it, where the two returned forms coincide.
 resolveImportTarget :: FilePath -> Text -> EvalIO (FilePath, FilePath)
 resolveImportTarget baseDir rawPath = do
   accessPath rawPath
@@ -1163,8 +1174,8 @@ resolveImportTarget baseDir rawPath = do
           resolvedTarget <- evalStoreTextPath (T.pack valueTarget)
           pure (valueTarget, resolvedTarget)
       | otherwise = do
-          let raw = T.unpack rawPath
-              resolved = if isRelative raw then baseDir </> raw else raw
+          raw <- evalStoreTextPath rawPath
+          let resolved = if isRelative raw then baseDir </> raw else raw
           canonical <- wrapIO (Dir.canonicalizePath resolved)
           -- Directory import: append /default.nix if target is a
           -- directory, which upstream's resolveExprPath learns from an
@@ -1228,13 +1239,14 @@ sourceIOWith access shownPath action =
       throwIO (NixEvalError ErrorUncatchable (untracedFailure (sourceErrorMessage access shown err)))
 
 -- | A path with its symlinks resolved, as upstream names one it reached
--- through realisePath (readFile, hashFile and readDir resolve fully).
--- A path the resolution itself cannot walk keeps the spelling given.
-resolvedForMessage :: Text -> IO Text
-resolvedForMessage path
+-- through realisePath (readFile, hashFile and readDir resolve fully),
+-- given the value and the native path it opens.  A path the resolution
+-- itself cannot walk keeps the spelling given.
+resolvedForMessage :: Text -> FilePath -> IO Text
+resolvedForMessage path native
   | SP.isCanonicalStoreText path = pure (canonPath path)
   | otherwise =
-      (canonPathValue . T.pack <$> Dir.canonicalizePath (T.unpack path))
+      (canonPathValue . T.pack <$> Dir.canonicalizePath native)
         `catch` \(_ :: IOException) -> pure path
 
 -- | An lstat that raises for an absent path: 'Dir.pathIsSymbolicLink' is

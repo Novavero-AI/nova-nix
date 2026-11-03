@@ -46,7 +46,7 @@ import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
 import Nix.Realise (Fallback (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
-import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath, storePathToText)
+import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
 import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, makeAbsolute)
@@ -554,8 +554,10 @@ setUpEval opts config storeDir dataDir baseDir = do
             esCallDepth = topLevelCallDepth (ncMaxCallDepth config)
           }
   -- A relative root resolves against the working directory, as upstream's
-  -- absPath does.  A pseudo-URL entry (channel:, flake:, a listed scheme)
-  -- names a download this evaluator never performs and allows nothing:
+  -- absPath does, and a rooted one with no drive lands on the store's
+  -- drive, where its lookups read ('qualifyPathText').  A pseudo-URL
+  -- entry (channel:, flake:, a listed scheme) names a download this
+  -- evaluator never performs and allows nothing:
   -- upstream allows such an entry's working-directory spelling only by
   -- falling through after a failed download (resolveLookupPathPath), and
   -- a run that cannot fetch should not widen what it may read.  A root
@@ -567,7 +569,7 @@ setUpEval opts config storeDir dataDir baseDir = do
   where
     textRoot = either (const Nothing) Just . TE.decodeUtf8'
     rootSpellings root = do
-      given <- makeAbsolute (T.unpack root)
+      given <- makeAbsolute (T.unpack (qualifyPathText storeDir root))
       resolved <- canonicalizePath given
       pure (map (canonPathValue . T.pack) [given, resolved])
 
