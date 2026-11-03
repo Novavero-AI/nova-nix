@@ -29,7 +29,7 @@ import Data.Int (Int64)
 import Data.List (intercalate, isPrefixOf, sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -10104,6 +10104,147 @@ testPkgsFetchurl = do
         "https://ftp.gnu.org/pub/gnu/"
       ]
 
+-- | @pkgs/windows@'s stage0-pe32 chain, read back as the build driver reads
+-- it: every derivation reachable from the seed and the ten links.  The chain
+-- is full-source only if nothing reaches it but the seed and the sources, so
+-- the graph's leaves are exactly those five fetches, no derivation takes a
+-- plain input source, and each of the thirty commands of stage0-pe32's
+-- @x86\/mescc-tools-mini.cmd@ is a step run by a program the graph builds.
+-- hex0 carries the seed's hash as its own, so the build itself checks that
+-- the seed reproduces itself.
+testStage0Pe32Chain :: IO [Bool]
+testStage0Pe32Chain = do
+  putStrLn "pkgs/stage0-pe32"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  -- The package set's fetchurl hands a single URL to <nix/fetchurl.nix>,
+  -- which resolves against the checkout's data directory as the installed
+  -- binary resolves it against its own.
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      chain = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ").stage0-pe32"
+      quoted name = "\"" <> name <> "\""
+      source =
+        T.concat
+          [ "let chain = ",
+            chain,
+            "; in builtins.concatStringsSep \" \" (map (name: chain.${name}.drvPath) [ ",
+            T.unwords (map quoted ("seed" : links)),
+            " ])"
+          ]
+  outcome <- case parseNix cwd "<test>" source of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> do
+          let roots = T.words (bytesText bytes)
+          graph <- sessionClosure roots
+          pure (Map.fromList (zip ("seed" : links) roots), graph)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, graph) -> do
+      let derivations = Map.elems graph
+          fetches = filter ((== fetchurlBuilder) . drvBuilder) derivations
+          unpacks = filter ((== builtinUnpackBuilder) . drvBuilder) derivations
+          steps = filter (\drv -> drvBuilder drv `notElem` [fetchurlBuilder, builtinUnpackBuilder]) derivations
+          leaves = filter (Map.null . drvInputDrvs) derivations
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          outOf drv = [TE.encodeUtf8 (storePathToText defaultStoreDir (doPath o)) | o <- drvOutputs drv, doName o == "out"]
+          inputsOf drv = mapMaybe ((`Map.lookup` graph) . storePathToText defaultStoreDir) (Map.keys (drvInputDrvs drv))
+          builtBy attr = Map.lookup attr rootOf >>= (`Map.lookup` graph)
+          builderNamesOf drv = [nameOf input | input <- inputsOf drv, drvBuilder drv `elem` outOf input]
+          fixedHashOf drv = [(doHashAlgo o, doHash o) | o <- drvOutputs drv, doName o == "out"]
+      sequence
+        [ runTest instantiates $
+            assertEqual "steps, unpacks, fetches" (30, 4, 5) (length steps, length unpacks, length fetches),
+          runTest "no derivation of the chain takes a plain input source" $
+            case [nameOf drv | drv <- derivations, not (null (drvInputSrcs drv))] of
+              [] -> Pass
+              named -> Fail ("input sources in: " <> T.intercalate ", " named),
+          runTest "the chain's leaves are the seed and the four source archives, all fixed-output" $
+            assertEqual
+              "leaves"
+              (sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-f0b1726.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "stage0-pe32-4b5915c.tar.gz"], True)
+              ( sort (map nameOf leaves),
+                all (\drv -> drvBuilder drv == fetchurlBuilder && isFixedOutput drv) leaves
+              ),
+          runTest "each source archive is unpacked from its fetch alone" $
+            assertEqual "unpack inputs" (replicate 4 [fetchurlBuilder]) [map drvBuilder (inputsOf drv) | drv <- unpacks],
+          runTest "every step is an i686-windows derivation" $
+            case [nameOf drv | drv <- steps, drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "each step is run by an input, the program its .cmd command runs" $
+            assertEqual
+              "file written, program run"
+              (sort [(written, [program]) | (written, program) <- commands])
+              (sort [(nameOf drv, builderNamesOf drv) | drv <- steps]),
+          runTest "hex0 is fixed-output to the seed's own hash" $
+            case (fixedHashOf <$> builtBy "seed", fixedHashOf <$> builtBy "hex0") of
+              (Just seedHash@[(_, digest)], Just hex0Hash)
+                | not (T.null digest) -> assertEqual "hex0's output hash" seedHash hex0Hash
+              other -> Fail ("expected the seed's fixed-output hash on hex0: " <> T.pack (show other))
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the chain instantiates: thirty steps, four unpacks and five fetches"
+    fetchurlBuilder :: BS.ByteString
+    fetchurlBuilder = "builtin:fetchurl"
+    links :: [Text]
+    links = ["hex0", "hex1", "hex2", "catm", "M0", "cc_x86", "M2", "M1", "hex2-new", "kaem"]
+    -- Each command of the .cmd: the file it writes and the program it runs.
+    commands :: [(Text, Text)]
+    commands =
+      [ ("hex0.exe", "hex0-seed.exe"),
+        ("hex1.exe", "hex0.exe"),
+        ("hex2.exe", "hex1.exe"),
+        ("catm.exe", "hex2.exe"),
+        ("M0.hex2", "catm.exe"),
+        ("M0.exe", "hex2.exe"),
+        ("cc_x86-0.hex2", "M0.exe"),
+        ("cc_x86.hex2", "catm.exe"),
+        ("cc_x86.exe", "hex2.exe"),
+        ("M2-0.c", "catm.exe"),
+        ("M2-0.M1", "cc_x86.exe"),
+        ("M2-0-0.M1", "catm.exe"),
+        ("M2-0.hex2", "M0.exe"),
+        ("M2-0-0.hex2", "catm.exe"),
+        ("M2.exe", "hex2.exe"),
+        ("M1-macro.M1", "M2.exe"),
+        ("M1-macro-0.M1", "catm.exe"),
+        ("M1-macro.hex2", "M0.exe"),
+        ("M1-macro-0.hex2", "catm.exe"),
+        ("M1.exe", "hex2.exe"),
+        ("hex2_linker.M1", "M2.exe"),
+        ("hex2_linker-0.M1", "catm.exe"),
+        ("hex2_linker.hex2", "M0.exe"),
+        ("hex2_linker-0.hex2", "catm.exe"),
+        ("hex2-new.exe", "hex2.exe"),
+        ("kaem.M1", "M2.exe"),
+        ("kaem-0.M1", "catm.exe"),
+        ("kaem.hex2", "M0.exe"),
+        ("kaem-0.hex2", "catm.exe"),
+        ("kaem.exe", "hex2.exe")
+      ]
+
+-- | Every derivation reachable from @roots@ through input derivations, keyed
+-- by @.drv@ path, as the evaluation session recorded them.
+sessionClosure :: (MonadEval m) => [Text] -> m (Map.Map Text Derivation)
+sessionClosure = go Map.empty
+  where
+    go seen [] = pure seen
+    go seen (path : rest)
+      | Map.member path seen = go seen rest
+      | otherwise = do
+          recorded <- lookupSessionDrv path
+          case recorded of
+            Nothing -> throwEvalError ("no .drv was recorded for " <> path)
+            Just drv ->
+              go (Map.insert path drv seen) (map (storePathToText defaultStoreDir) (Map.keys (drvInputDrvs drv)) ++ rest)
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -16229,6 +16370,7 @@ runSuite = do
           testFetchMirrors,
           testSubstituterRetry,
           testPkgsFetchurl,
+          testStage0Pe32Chain,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,

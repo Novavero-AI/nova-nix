@@ -535,6 +535,87 @@ jobs:
           }
 
   # ---------------------------------------------------------------------------
+  # Stage0 (Windows): stage0-pe32's chain, from its 1,623-byte seed to kaem,
+  # built by the executable this repo ships as one derivation per command of
+  # x86/mescc-tools-mini.cmd.  Each link has to be the file stage0-pe32's own
+  # CI builds with cmd.exe, byte for byte, and hex0 has to be the seed.  No
+  # store cache, for the reason E2E (Windows) has none.
+  # ---------------------------------------------------------------------------
+
+  stage0-windows:
+    name: Stage0 (Windows)
+    needs: [cabal-check]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Cache Cabal store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
+          restore-keys: cabal-${{ runner.os }}-
+
+      - name: Install nova-nix
+        run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # build prints the out path as its last stdout line.  Building a link
+      # builds the links below it, so each later build finds them valid.
+      - name: Build the chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in hex0 hex1 hex2 catm M0 cc_x86 M2 M1 hex2-new kaem; do
+            out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "stage0-pe32.$attr" | tail -n 1)
+            path=$(cygpath -u "$out")
+            echo "$attr $path" >> "$RUNNER_TEMP/links.txt"
+          done
+          cat "$RUNNER_TEMP/links.txt"
+
+      # Each link's SHA-256 as stage0-pe32's CI prints it for 4b5915c, the
+      # commit pkgs/windows/by-name/st/stage0-pe32/sources.nix pins.  hex0's
+      # is the seed's own: the build already refuses any other hex0, since
+      # hex0 is fixed-output to it, and this checks the bytes from outside.
+      - name: Each link is the one stage0-pe32 builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          while read -r attr want; do
+            path=$(awk -v attr="$attr" '$1 == attr { print $2 }' "$RUNNER_TEMP/links.txt")
+            got=$(sha256sum "$path" | cut -d ' ' -f 1)
+            if [ "$got" = "$want" ]; then
+              echo "$got  $attr"
+            else
+              echo "::error::$attr is $got, stage0-pe32 builds $want"
+              status=1
+            fi
+          done <<'EOF'
+          hex0 b9db7be0fed7770be9fca46b7aa551b611fc60eaf1112a053531aae14aa46742
+          hex1 889d18f1de1ffba70b2a8fa3915ed67b8ccff874fb20e63841cc5c301f890929
+          hex2 5b74721141d8788e8334d68016d9360928e5e17e8364485a7b69279b0c2f657d
+          catm b45fa38c731889344b37f91b124fddc643eb975b0d3b68bf6efbba07ed2e8c24
+          M0 0130c6a0195ce9da46262ff4016c5429897f7feb1259af435dfd8580eafaa8dd
+          cc_x86 b9d143bc9037cf8fee342a948bcc4f7f84baca2d2a6d4145beb6ee2c081dc939
+          M2 2e16d036ac4e65eb45d0f0d59e3fdda6f55ce4620fd003632f895b99a259f1b1
+          M1 6f332f30c52ead5d39dcbbe762cc6e9dc4c2f14a720bd70c1c4653c17acd3ac9
+          hex2-new 16ef9d9f5e48f8dec6c3823728239a153a068dfbf37be44a1d70b76c13ecb072
+          kaem ad7dee286fe44e19392894a659962dbd79ad3b147f3e1c75430d8217e5e53e4a
+          EOF
+          exit "$status"
+
+  # ---------------------------------------------------------------------------
   # Publish (public cache): refresh the public cache with the closure main
   # builds, so it serves the current one rather than whatever was pushed by
   # hand last.  A job of its own rather than a step of e2e-windows: the
