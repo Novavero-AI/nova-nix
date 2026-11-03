@@ -11627,6 +11627,137 @@ sessionClosure = go Map.empty
             Just drv ->
               go (Map.insert path drv seen) (map (storePathToText defaultStoreDir) (Map.keys (drvInputDrvs drv)) ++ rest)
 
+-- | @pkgs/windows@'s Mes, read back as the build driver reads it: what its
+-- source tree, libraries, compiler and C library sources, and
+-- @test\/data\/mes.nix@'s checks, add to the closure of the stage0 tools
+-- they run on.  The rung is full-source only if the leaves it adds are the
+-- Mes and NYACC archives and it reads no input source but the scripts
+-- evaluation writes.  The builder spells a store path with a backslash,
+-- which starts an escape in a C or Scheme string, so no script writes a path
+-- into Mes's source with replace, and every script that runs Mes sets the
+-- paths and sizes it reads in its environment instead.
+testMesWindows :: IO [Bool]
+testMesWindows = do
+  putStrLn "pkgs/mes"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mes.nix")
+      quoted name = "\"" <> name <> "\""
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" ([ pkgs.mes.srcPrefix ] ++ map (name: pkgs.stage0-pe32.${name}.drvPath) [ ",
+            T.unwords (map quoted tools),
+            " ] ++ map (name: pkgs.mes.${name}.drvPath) [ ",
+            T.unwords (map quoted mesAttrs),
+            " ] ++ map (name: checks.${name}.drvPath) [ ",
+            T.unwords (map quoted checkAttrs),
+            " ])"
+          ]
+      roots = tools ++ map ("mes." <>) mesAttrs ++ map ("checks." <>) checkAttrs
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> case T.words (bytesText bytes) of
+          prefix : paths -> do
+            let rootOf = Map.fromList (zip roots paths)
+            toolGraph <- sessionClosure (mapMaybe (`Map.lookup` rootOf) tools)
+            full <- sessionClosure (Map.elems rootOf)
+            pure (prefix, rootOf, toolGraph, full)
+          [] -> throwEvalError "expected srcPrefix and the drvPaths"
+        other -> throwEvalError ("expected srcPrefix and the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (prefix, rootOf, toolGraph, full) -> do
+      let added = Map.elems (Map.difference full toolGraph)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          outOf drv = [storePathToText defaultStoreDir (doPath o) | o <- drvOutputs drv, doName o == "out"]
+          outText attr = T.concat (maybe [] outOf (Map.lookup attr rootOf >>= (`Map.lookup` full)))
+          inputsOf drv = mapMaybe ((`Map.lookup` full) . storePathToText defaultStoreDir) (Map.keys (drvInputDrvs drv))
+          scriptOf drv = listToMaybe [variableOf "text" input | input <- inputsOf drv, nameOf input == nameOf drv <> "-builder"]
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          runsMes script = any (`T.isInfixOf` script) ["/bin/mes-m2.exe ", "/bin/mes.exe "]
+          runners = [drv | drv <- added, Just script <- [scriptOf drv], runsMes script]
+          quote dir = "\"" <> dir <> "\""
+          mesEnv =
+            [ ("MES_ARENA", "20000000"),
+              ("MES_MAX_ARENA", "20000000"),
+              ("MES_STACK", "6000000"),
+              ("MES_PREFIX", prefix),
+              ("GUILE_LOAD_PATH", T.intercalate ":" (map quote [prefix <> "/mes/module", prefix <> "/module", outText "mes.nyacc" <> "/share/nyacc-1.09.1/module"])),
+              ("M1", outText "mescc-tools" <> "/bin/M1.exe"),
+              ("HEX2", outText "mescc-tools" <> "/bin/hex2.exe")
+            ]
+          -- What each replace line of a script writes into the file it edits.
+          replacements script = [snd (T.breakOn "--replace-with" line) | line <- T.lines script, "replace " `T.isPrefixOf` T.stripStart line]
+          written = concatMap replacements (mapMaybe scriptOf added)
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the two fetches is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the leaves it adds are the Mes and NYACC archives, both fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              (sort ["mes-cf55470.tar.gz", "nyacc-1.09.1.tar.gz"], True)
+              (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text" $
+            assertEqual "input sources not written as text" [] [nameOf drv | drv <- added, not (all wroteAsText (drvInputSrcs drv))],
+          runTest "every script that runs Mes sets its arena, MES_PREFIX, GUILE_LOAD_PATH, M1 and HEX2" $
+            assertEqual
+              "derivation and its environment"
+              [(name, mesEnv) | name <- sort mesRunners]
+              (sort [(nameOf drv, [(var, variableOf var drv) | (var, _) <- mesEnv]) | drv <- runners]),
+          runTest "no script writes a path into Mes's source with replace" $
+            assertEqual
+              "replacements, and those that name a path"
+              (3, [])
+              (length written, filter (\with -> "/" `T.isInfixOf` with || "${" `T.isInfixOf` with) written)
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the Mes derivations instantiate, adding twenty-nine to the stage0 tools'"
+    tools :: [Text]
+    tools = ["kaem", "mescc-tools", "mescc-tools-extra"]
+    mesAttrs :: [Text]
+    mesAttrs = ["nyacc", "srcPost", "libs", "compiler", "libc"]
+    checkAttrs :: [Text]
+    checkAttrs = ["mes-m2", "mes", "hello"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder; mes-libc-0.27.1 is both the libc MesCC compiles and
+    -- the sources for TinyCC, as in nixpkgs.
+    addedNames :: [Text]
+    addedNames =
+      ["mes-cf55470.tar.gz", "nyacc-1.09.1.tar.gz", "hello.c"]
+        ++ concat [[name, name <> "-builder"] | name <- mesRunners ++ ["nyacc-1.09.1", "mes-src-0.27.1", "mes-m2-libs-0.27.1", "mes-libc-0.27.1"]]
+    mesRunners :: [Text]
+    mesRunners =
+      [ "mes-crt1-0.27.1",
+        "mes-libc-mini-0.27.1",
+        "mes-libmescc-0.27.1",
+        "mes-libc-0.27.1",
+        "mes-libc+tcc-0.27.1",
+        "mes-0.27.1",
+        "mes-m2-get-version",
+        "mes-get-version",
+        "mes-hello"
+      ]
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -18027,6 +18158,7 @@ runSuite = do
           testSubstituterRetry,
           testPkgsFetchurl,
           testStage0Pe32Chain,
+          testMesWindows,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,
