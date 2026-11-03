@@ -41,10 +41,9 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
-import qualified Data.Text as T
 import Nix.DependencyGraph (DepGraph (..), DepNode (..), directDeps)
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
-import Nix.Store.Path (StoreDir, StorePath, storePathToFilePath)
+import Nix.Store.Path (StorePath, defaultStoreDir, storePathToText)
 
 -- ---------------------------------------------------------------------------
 -- Substituting a closure
@@ -201,13 +200,16 @@ data RealiseFailure
 
 -- | A failure as the build reports it.  A failed substitute reads as
 -- upstream's (@DerivationGoal::outputsSubstitutionTried@ at 2.24.9), less
--- the space its format string ends in.
-realiseFailureMessage :: StoreDir -> RealiseFailure -> Text
-realiseFailureMessage _ (BuildFailed report) = report
-realiseFailureMessage _ (CacheQueryFailed failure) = failure
-realiseFailureMessage storeDir (SubstitutesFailed drvPath) =
+-- the space its format string ends in.  The @.drv@ is named under the
+-- logical store directory, wherever the store's files live, as upstream's
+-- @printStorePath@ names it: a store kept elsewhere still has @/nix/store@
+-- as its @storeDir@ and only its @realStoreDir@ moves.
+realiseFailureMessage :: RealiseFailure -> Text
+realiseFailureMessage (BuildFailed report) = report
+realiseFailureMessage (CacheQueryFailed failure) = failure
+realiseFailureMessage (SubstitutesFailed drvPath) =
   "some substitutes for the outputs of derivation '"
-    <> T.pack (storePathToFilePath storeDir drvPath)
+    <> storePathToText defaultStoreDir drvPath
     <> "' failed (usually happens due to networking issues); try '--fallback' to build derivation from source"
 
 -- | How one derivation came to be realised.

@@ -1604,7 +1604,7 @@ buildWithDeps config store rootDrv rootDrvPath = do
         TopoSorted _ -> do
           result <- realise (bcFallback config) (realiseEffects config store) depGraph rootDrvPath
           case result of
-            Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) 1)
+            Left failure -> pure (BuildFailure (realiseFailureMessage failure) 1)
             Right () ->
               case drvOutputs rootDrv of
                 (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
