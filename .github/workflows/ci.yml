@@ -660,7 +660,19 @@ jobs:
             run "$@" || code=$?
             if [ "$code" = "$want" ]; then pass "$* exits $code"; else fail "$* exits $code, not $want"; fi
           }
-          same() { if cmp "$1" "$2"; then pass "$3"; else fail "$3: $2 is not $1"; fi; }
+          # cmp names the first byte that differs; the dumps show both files'
+          # sizes and leading bytes, so a failure shows its cause.
+          same() {
+            if cmp "$1" "$2"; then
+              pass "$3"
+            else
+              fail "$3: $2 is not $1"
+              for file in "$1" "$2"; do
+                echo "$file, $(wc -c < "$file") bytes:"
+                od -A d -t x1 "$file" | head -n 8
+              done
+            fi
+          }
 
           work="$(cygpath -u "$RUNNER_TEMP")/mescc-tools-extra"
           mkdir "$work"
