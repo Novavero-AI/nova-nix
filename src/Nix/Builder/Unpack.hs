@@ -4,12 +4,14 @@
 --
 -- == Why this is a builtin
 --
--- The Windows stdenv bootstrap fetches pre-built toolchain tarballs (MSYS2
--- @.pkg.tar.zst@ packages) into the store before any toolchain exists there.
--- Nothing in the store can unpack them - the unpacker is the thing being
--- bootstrapped - and ambient @tar.exe@ is unpinned and may lack zstd support.
--- So, like 'Nix.Builder.runBuiltinFetchurl', extraction runs in-process:
--- a derivation whose @builder@ is @builtin:unpack@ is handled by this module
+-- The Windows bootstrap fetches archives into the store before any tool
+-- exists there: pre-built toolchain tarballs (MSYS2 @.pkg.tar.zst@
+-- packages) for the stdenv, and GitHub's @.tar.gz@ archives of the sources
+-- the full-source chain assembles.  Nothing in the store can unpack them -
+-- the unpacker is the thing being bootstrapped - and ambient @tar.exe@ is
+-- unpinned and may lack zstd support.  So, like
+-- 'Nix.Builder.runBuiltinFetchurl', extraction runs in-process: a
+-- derivation whose @builder@ is @builtin:unpack@ is handled by this module
 -- instead of being spawned as a subprocess.
 --
 -- == Derivation interface
@@ -54,6 +56,7 @@ where
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
+import qualified Codec.Compression.GZip as GZip
 import qualified Codec.Compression.Zstd.Lazy as Zstd
 import Control.Exception (ErrorCall, Handler (..), IOException, catches)
 import Control.Monad (when)
@@ -215,16 +218,18 @@ unpackAll outDir budget (archive : rest) = do
 -- archives after it.  The decompressor is chosen by file extension; the
 -- tar stream is decoded (GNU + pax long names) and extracted entry by
 -- entry.  The archive is read lazily and decoded as the entries are
--- forced, so a failure surfaces mid-extraction as one of two exceptions,
--- and the whole extraction is wrapped to turn either into a clean
--- failure: an 'IOException' reading the archive or writing the tree, or
--- the 'ErrorCall' the zstd decoder raises for a corrupt frame (its lazy
--- API reports every decoding error with 'error').
+-- forced, so a failure surfaces mid-extraction as an exception, and the
+-- whole extraction is wrapped to turn each kind into a clean failure: an
+-- 'IOException' reading the archive or writing the tree, the 'ErrorCall'
+-- the zstd decoder raises for a corrupt frame (its lazy API reports every
+-- decoding error with 'error'), or the 'GZip.DecompressError' the gzip
+-- decoder throws for a corrupt or truncated stream.
 unpackArchive :: FilePath -> UnpackLimits -> FilePath -> IO (Either Text UnpackLimits)
 unpackArchive outDir budget archivePath =
   run
     `catches` [ Handler (\(e :: IOException) -> failed e),
-                Handler (\(e :: ErrorCall) -> failed e)
+                Handler (\(e :: ErrorCall) -> failed e),
+                Handler (\(e :: GZip.DecompressError) -> failed e)
               ]
   where
     failed e = pure (Left (T.pack archivePath <> ": " <> T.pack (show e)))
@@ -235,12 +240,14 @@ unpackArchive outDir budget archivePath =
         extractEntries outDir budget (Tar.decodeLongNames (Tar.read (decoder raw)))
 
 -- | Choose a decompressor from the archive file name.  @.tar.zst@ (MSYS2
--- packages) and plain @.tar@ are supported.  MSYS2's zstd frames do not
--- pledge a content size, so the lazy (streaming) zstd decoder is required -
--- the strict single-shot API rejects them.
+-- packages), @.tar.gz@ (GitHub's archive of a commit) and plain @.tar@ are
+-- supported.  MSYS2's zstd frames do not pledge a content size, so the lazy
+-- (streaming) zstd decoder is required - the strict single-shot API rejects
+-- them.
 decoderFor :: FilePath -> Maybe (BL.ByteString -> BL.ByteString)
 decoderFor path
   | ".tar.zst" `isSuffixOf` lowered = Just Zstd.decompress
+  | ".tar.gz" `isSuffixOf` lowered = Just GZip.decompress
   | ".tar" `isSuffixOf` lowered = Just id
   | otherwise = Nothing
   where

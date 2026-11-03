@@ -9,6 +9,7 @@ module Main (main) where
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
+import qualified Codec.Compression.GZip as GZip
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
@@ -8173,6 +8174,12 @@ tarSymLink :: FilePath -> FilePath -> TarEntry.Entry
 tarSymLink p target =
   TarEntry.simpleEntry (tarPathOrDie False p) (Tar.SymbolicLink (linkOrDie target))
 
+-- | A pax global header (type @g@) holding @records@, the entry
+-- @git archive@ opens GitHub's archives with to carry the commit id.
+tarPaxGlobalHeader :: BL.ByteString -> TarEntry.Entry
+tarPaxGlobalHeader records =
+  TarEntry.simpleEntry (tarPathOrDie False "pax_global_header") (Tar.OtherEntryType 'g' records (BL.length records))
+
 -- | Step 3 of the ladder: @builtin:unpack@, the stage-0 seed extractor.
 -- Two zstd-compressed tar archives sharing a top-level prefix (the MSYS2
 -- @mingw64\/@ shape) are extracted into ONE output: regular files, an
@@ -8213,6 +8220,7 @@ testUnpackBuildIO = do
           archiveManyEntries = archiveFile "pkg-many-entries.tar.zst"
           archiveBigFile = archiveFile "pkg-big-file.tar.zst"
           archiveAmplify = archiveFile "pkg-amplify.tar.zst"
+          archiveGitHub = archiveFile "repo-0123456.tar.gz"
       BL.writeFile archiveTools $
         compressArchive
           [ tarDir "pkg",
@@ -8285,6 +8293,15 @@ testUnpackBuildIO = do
             tarSymLink "dup1" "base",
             tarSymLink "dup2" "base"
           ]
+      -- GitHub's archive of a commit: gzip over a tar that opens with a pax
+      -- global header naming the commit, then one directory named for the
+      -- repository and the commit.
+      BL.writeFile archiveGitHub . GZip.compress . Tar.write $
+        [ tarPaxGlobalHeader "52 comment=0123456789abcdef0123456789abcdef01234567\n",
+          tarDir "repo-0123456",
+          tarDir "repo-0123456/src",
+          tarFile "repo-0123456/src/main.c" "int main;"
+        ]
       let -- srcs carries the canonical /nix/store spelling, as eval writes
           -- it; the physical archives live under the temp store dir.
           canonicalSrc file = case parseStorePath storeDir (T.pack file) of
@@ -8321,6 +8338,7 @@ testUnpackBuildIO = do
           manyEntriesOut = StorePath (T.replicate 30 "0" <> "11") "unpack-entry-budget"
           bigFileOut = StorePath (T.replicate 30 "0" <> "12") "unpack-size-budget"
           amplifyOut = StorePath (T.replicate 30 "0" <> "13") "unpack-amplify-budget"
+          gitHubOut = StorePath (T.replicate 30 "0" <> "14") "unpack-github-archive"
       buildTmp <- (</> "nova-nix-test-unpack-build-tmp") <$> getTemporaryDirectory
       forceRemoveIfExists buildTmp
       createDirectoryIfMissing True buildTmp
@@ -8339,6 +8357,7 @@ testUnpackBuildIO = do
       manyEntriesResult <- buildDerivation (tinyBudget 1000000 4) store (mkUnpackDrv manyEntriesOut [archiveManyEntries])
       bigFileResult <- buildDerivation (tinyBudget 64 1000) store (mkUnpackDrv bigFileOut [archiveBigFile])
       amplifyResult <- buildDerivation (tinyBudget 100 1000) store (mkUnpackDrv amplifyOut [archiveAmplify])
+      gitHubResult <- buildDerivation config store (mkUnpackDrv gitHubOut [archiveGitHub])
       forceRemoveIfExists buildTmp
       seedChecks <- case seedResult of
         BuildFailure msg code ->
@@ -8471,7 +8490,25 @@ testUnpackBuildIO = do
             runTest "unpack guard: rooted hardlink target rejected" $
               assertLeft "rooted hardlink" (entryComponents "/planted-hardlink-target.txt")
           ]
-      pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ dirLinkChecks ++ collisionGuardChecks ++ budgetChecks ++ guardChecks)
+      gitHubChecks <- case gitHubResult of
+        BuildFailure msg code ->
+          sequence
+            [ runTest "unpack: a gzip archive in GitHub's shape extracts" $
+                Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+            ]
+        BuildSuccess sp -> do
+          let outRoot = storePathToFilePath storeDir sp
+              source = outRoot </> "repo-0123456" </> "src" </> "main.c"
+          sourceExists <- Dir.doesFileExist source
+          content <- if sourceExists then Just <$> TIO.readFile source else pure Nothing
+          topLevel <- Dir.listDirectory outRoot
+          sequence
+            [ runTest "unpack: a gzip archive in GitHub's shape extracts" $
+                assertEqual "main.c" (Just "int main;") content,
+              runTest "unpack: the pax global header is not extracted" $
+                assertEqual "top level" ["repo-0123456"] topLevel
+            ]
+      pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ dirLinkChecks ++ collisionGuardChecks ++ budgetChecks ++ guardChecks ++ gitHubChecks)
 
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
 -- derivation depends on a leaf; both @.drv@ files are pre-written to the store
@@ -17035,18 +17072,26 @@ testInterruptsPropagate = do
           outcome <- withStalledFifo (inStore input) (interruptedAfterStall (buildWithDeps config store rootDrv (StorePath (T.replicate 32 "h") "root.drv")))
           pure (interruptPropagated outcome),
         -- The failures the unpacker does catch: the zstd decoder reports a
-        -- corrupt frame with 'error', and a missing archive is an
-        -- IOException.  Each is the archive's failure, not an escape.
-        runTestM "a corrupt zstd archive and a missing one fail the unpack" $ do
+        -- corrupt frame with 'error', the gzip decoder throws a
+        -- DecompressError, and a missing archive is an IOException.  Each
+        -- is the archive's failure, not an escape.
+        runTestM "a corrupt zstd or gzip archive and a missing one fail the unpack" $ do
           let corrupt = StorePath (T.replicate 32 "i") "corrupt.tar.zst"
+              corruptGzip = StorePath (T.replicate 32 "k") "corrupt.tar.gz"
               missing = StorePath (T.replicate 32 "j") "missing.tar"
           BS.writeFile (inStore corrupt) "not a zstd frame"
+          BS.writeFile (inStore corruptGzip) "not a gzip stream"
           corruptOutcome <- runBuiltinUnpack storeDir defaultUnpackLimits (unpacking corrupt) [("out", root </> "corrupt-out")]
+          corruptGzipOutcome <- runBuiltinUnpack storeDir defaultUnpackLimits (unpacking corruptGzip) [("out", root </> "corrupt-gzip-out")]
           missingOutcome <- runBuiltinUnpack storeDir defaultUnpackLimits (unpacking missing) [("out", root </> "missing-out")]
-          pure $ case (corruptOutcome, missingOutcome) of
-            (Left (1, corruptMsg), Left (1, missingMsg))
-              | "corrupt.tar.zst" `T.isInfixOf` corruptMsg && "missing.tar" `T.isInfixOf` missingMsg -> Pass
-            other -> Fail ("expected both unpacks to fail: " <> T.pack (show other))
+          pure $ case (corruptOutcome, corruptGzipOutcome, missingOutcome) of
+            (Left (1, corruptMsg), Left (1, corruptGzipMsg), Left (1, missingMsg))
+              | "corrupt.tar.zst" `T.isInfixOf` corruptMsg
+                  && "corrupt.tar.gz" `T.isInfixOf` corruptGzipMsg
+                  && not ("unsupported archive format" `T.isInfixOf` corruptGzipMsg)
+                  && "missing.tar" `T.isInfixOf` missingMsg ->
+                  Pass
+            other -> Fail ("expected all three unpacks to fail: " <> T.pack (show other))
       ]
   forceRemoveIfExists root
   pure results

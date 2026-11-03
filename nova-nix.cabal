@@ -140,6 +140,9 @@ library
     , tar                 >= 0.7.1 && < 0.8
     , text                >= 2.0 && < 2.2
     , time                >= 1.9 && < 1.17
+    -- 0.7 is the first whose Codec.Compression.GZip exports the
+    -- DecompressError a corrupt stream throws, which builtin:unpack catches.
+    , zlib                >= 0.7 && < 0.8
     , zstd                >= 0.1 && < 0.2
 
   -- Platform calls base cannot express: the exclusive create behind NAR
@@ -248,6 +251,7 @@ test-suite nova-nix-test
     , sqlite-simple       >= 0.4 && < 0.5
     , tar                 >= 0.7.1 && < 0.8
     , text                >= 2.0 && < 2.2
+    , zlib                >= 0.7 && < 0.8
     , zstd                >= 0.1 && < 0.2
 
 source-repository head
