@@ -1664,6 +1664,65 @@ testEvalHigherOrder = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: Eval - Builtin argument order
+-- ---------------------------------------------------------------------------
+
+-- | A primop that forces an argument later than it is applied takes it
+-- unforced and forces it where upstream does.  Each expectation follows
+-- upstream's primops.cc and eval.cc at 2.24.9: with only the first
+-- argument throwing, a collection that is empty never forces it, and
+-- with both throwing, the argument upstream forces first is the error.
+testBuiltinArgumentOrder :: IO [Bool]
+testBuiltinArgumentOrder = do
+  putStrLn "eval/builtin-argument-order"
+  let yields source expected = runTest source (assertEval source source expected)
+      fails source expected = runTest (source <> " fails with " <> expected) (assertEvalError source source expected)
+  sequence $
+    [ yields "map (throw \"a\") [ ]" (VList emptyCList),
+      yields "builtins.filter (throw \"a\") [ ]" (VList emptyCList),
+      yields "builtins.sort (throw \"a\") [ ]" (VList emptyCList),
+      yields "builtins.mapAttrs (throw \"a\") { } == { }" (VBool True),
+      yields "builtins.elem (throw \"a\") [ ]" (VBool False)
+    ]
+      <> [ fails source "b"
+         | source <-
+             [ "map (throw \"a\") (throw \"b\")",
+               "builtins.filter (throw \"a\") (throw \"b\")",
+               "builtins.genList (throw \"a\") (throw \"b\")",
+               "builtins.sort (throw \"a\") (throw \"b\")",
+               "builtins.mapAttrs (throw \"a\") (throw \"b\")",
+               "builtins.elem (throw \"a\") (throw \"b\")",
+               "builtins.elemAt (throw \"a\") (throw \"b\")",
+               "builtins.filterSource (throw \"a\") (throw \"b\")",
+               "builtins.scopedImport (throw \"a\") (throw \"b\")"
+             ]
+         ]
+      <> [ -- genList forces its function even for no elements, and elem
+           -- forces the needle before the element it compares.
+           fails "builtins.genList (throw \"a\") 0" "a",
+           fails "builtins.elem (throw \"a\") [ (throw \"b\") ]" "a",
+           -- mapAttrs never forces its function itself.
+           yields "builtins.attrNames (builtins.mapAttrs (throw \"a\") { x = 1; }) == [ \"x\" ]" (VBool True),
+           -- Forced where upstream forces it, a function argument is
+           -- checked there as forceFunction checks it, functors included.
+           fails "builtins.length (map 1 [ 1 ])" "expected a function but found an integer: 1",
+           fails "builtins.length (builtins.genList 1 1)" "expected a function but found an integer: 1",
+           yields "map { __functor = self: x: x + 1; } [ 1 ] == [ 2 ]" (VBool True),
+           -- foldl' hands its initial accumulator to the first step
+           -- unforced, and forces it itself only for an empty list.
+           yields "builtins.foldl' (acc: x: x) (throw \"a\") [ 1 ]" (VInt 1),
+           fails "builtins.foldl' (acc: x: x) (throw \"a\") (throw \"c\")" "c",
+           fails "builtins.foldl' (acc: x: x) (throw \"a\") [ ]" "a",
+           -- A partial application holds the argument unforced however it
+           -- is applied: from source, by a higher-order builtin with an
+           -- unforced element, or with a value already forced.
+           yields "builtins.typeOf (map (throw \"a\"))" (mkStr "lambda"),
+           yields "builtins.elemAt (map (map (throw \"a\")) [ [ ] ]) 0 == [ ]" (VBool True),
+           yields "builtins.all (builtins.elem (throw \"a\")) [ [ ] ]" (VBool False),
+           yields "builtins.foldl' builtins.elem 1 [ [ 1 ] [ true ] ]" (VBool True)
+         ]
+
+-- ---------------------------------------------------------------------------
 -- Tests: Lexer
 -- ---------------------------------------------------------------------------
 
@@ -9171,7 +9230,7 @@ testEvalFidelity = do
       -- PureEval tryEval must NOT catch abort - it propagates (matches C++ Nix)
       runTest "tryEval does not catch abort" $
         assertEvalFail "tryeval-abort" "(builtins.tryEval (builtins.abort \"x\")).success",
-      -- every builtin in the registry (the source of builtinNames/builtinArity)
+      -- every builtin in the registry (the source of builtinNames/builtinArgModes)
       -- is actually exposed in the builtins set - guards against builtinRegistry
       -- drifting from the exposed builtins
       runTest "every registered builtin is exposed" $
@@ -16610,6 +16669,7 @@ runSuite = do
           testEvalErrors,
           testListCoercion,
           testEvalHigherOrder,
+          testBuiltinArgumentOrder,
           testLexer,
           testParserExprs,
           testParserErrors,
@@ -17152,6 +17212,9 @@ testEvalPolicyCLI = do
         expectRun "trace-verbose from NIX_CONFIG makes traceVerbose trace" "trace-verbose = true\n" traceVerboseHi (ExitSuccess, ["1"], ["trace: hi"]),
         expectRun "under --trace-verbose traceVerbose forces its first argument" "" ["eval", "--trace-verbose", "--expr", "builtins.traceVerbose (throw \"a\") 1"] (ExitFailure 1, [], ["error: a"]),
         expectRun "under --trace-verbose traceVerbose prints before its second argument fails" "" ["eval", "--trace-verbose", "--expr", "builtins.traceVerbose \"hi\" (throw \"b\")"] (ExitFailure 1, [], ["trace: hi", "error: b"]),
+        -- prim_trace runs only once it has both arguments (callFunction,
+        -- eval.cc at 2.24.9), so a partial application forces nothing.
+        expectRun "under --trace-verbose a partial traceVerbose leaves its argument unforced" "" ["eval", "--trace-verbose", "--expr", "builtins.seq (builtins.traceVerbose (throw \"a\")) 1"] (ExitSuccess, ["1"], []),
         expectOut "build accepts --trace-verbose before its target" "" ["build", "--trace-verbose", "--help"] "Usage: nova-nix [--nix-path NAME=PATH] <command>"
       ]
 

@@ -22,6 +22,7 @@
 module Nix.Eval
   ( -- * Values (re-exported from Types)
     NixValue (..),
+    BuiltinArg (..),
     CompiledRegex (..),
     Thunk (..),
 
@@ -83,6 +84,7 @@ module Nix.Eval
 
     -- * Builtin registry
     BuiltinDef (..),
+    ArgMode (..),
     builtinRegistry,
     builtinNames,
 
@@ -104,6 +106,7 @@ import Data.Char (chr, digitToInt, intToDigit, isAsciiLower, isAsciiUpper, isDig
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
 import Data.List (partition, sort, sortOn)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
@@ -136,6 +139,7 @@ import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, fo
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
 import Nix.Eval.Types
   ( AttrSet (..),
+    BuiltinArg (..),
     CAttrSet,
     CompiledRegex (..),
     Env (..),
@@ -604,21 +608,17 @@ evalBcApp env bcIdx0
 
 -- | Apply an evaluated function to the argument at a bytecode index,
 -- inside the caller's frame.  The argument stays a thunk for a lambda
--- (the normal laziness) and is forced for a builtin, which forces anyway,
--- except for the first argument of a @traceVerbose@ that does not trace.
+-- (the normal laziness).  A builtin takes it evaluated, without a thunk,
+-- or as a thunk, by its mode for the position.
 callBc :: (MonadEval m) => Env -> Word32 -> NixValue -> m NixValue
 callBc env argIdx funcVal = case funcVal of
   VLambda closureEnv formals bodyBcIdx -> do
     let argThunk = cheapThunkBc env argIdx
     extEnv <- matchFormals closureEnv formals argThunk
     evalBytecode extEnv bodyBcIdx
-  VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
-  VBuiltin "traceVerbose" [] -> traceVerboseFirst (evalBytecode env argIdx)
-  VBuiltin name [first]
-    | Just finishFirst <- beforeSecondArgument name first -> finishFirst >> evalBytecode env argIdx
-  VBuiltin name accArgs -> do
-    argVal <- evalBytecode env argIdx
-    applyBuiltin name accArgs argVal
+  VBuiltin name taken -> applyBuiltin name taken $ \case
+    ForceOnApply -> ArgForced <$> evalBytecode env argIdx
+    ForceOnUse -> pure (ArgDeferred (cheapThunkBc env argIdx))
   VAttrs attrs
     | Just functorThunk <- attrSetLookup "__functor" attrs -> do
         functor <- force functorThunk
@@ -630,17 +630,15 @@ callBc env argIdx funcVal = case funcVal of
         withCallFrame (callBc env argIdx partiallyApplied)
   _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
 
--- | @builtins.tryEval@ over an argument's evaluation: @{ success, value }@
--- with catchable errors (throw, failed assert - the only kinds
--- 'catchEvalError' recovers) mapped to @success = false@.  The catch must
--- wrap the ARGUMENT'S EVALUATION: an application path that forces the
--- argument before dispatching here has already let the throw escape.
--- Callers holding an already-forced value pass @pure val@ - nothing left
--- to catch, so it success-wraps, exactly as upstream treats a value in
--- WHNF.
-tryEvalAction :: (MonadEval m) => m NixValue -> m NixValue
-tryEvalAction act = do
-  result <- catchEvalError act
+-- | @builtins.tryEval e@: @{ success, value }@ with catchable errors
+-- (throw, failed assert - the only kinds 'catchEvalError' recovers)
+-- mapped to @success = false@.  The catch must wrap the argument's
+-- forcing, so the argument is taken unforced.  One that arrives already
+-- forced has nothing left to catch and is success-wrapped, as upstream
+-- treats a value in WHNF.
+builtinTryEval :: (MonadEval m) => BuiltinArg -> m NixValue
+builtinTryEval arg = do
+  result <- catchEvalError (argValue arg)
   pure $ case result of
     Right val ->
       VAttrs
@@ -1194,20 +1192,107 @@ buildCaptureEnv env (CapturesWithScopes captureList) =
 -- Builtin registry (single-definition-site for all builtins)
 -- ---------------------------------------------------------------------------
 
--- | A builtin function definition: its arity and implementation.
+-- | How a builtin takes the argument at one position.
+data ArgMode
+  = -- | Forced as it is applied, for a primop that forces it before
+    -- anything it does can be observed.  That matches upstream once the
+    -- primop has every argument; a partial application forces it sooner
+    -- than upstream, which forces nothing before the last argument.
+    ForceOnApply
+  | -- | Held as a thunk, for a primop that forces it later than that:
+    -- after a later argument, around a catch, or only on some paths.
+    -- The builtin forces it where upstream does.
+    ForceOnUse
+  deriving (Eq, Show)
+
+-- | A builtin's shape: how it takes each argument, first to last (the
+-- arity is the length), and its implementation over the arguments taken.
+-- Each shape below defines both together, and its implementation type
+-- marks a 'ForceOnUse' position with a 'BuiltinArg' parameter, so an
+-- implementation's type picks the same shape in the registry and in
+-- 'executeBuiltin'.
 data BuiltinDef m = BuiltinDef
-  { bdArity :: !Int,
-    bdApply :: [NixValue] -> m NixValue
+  { bdArgs :: !(NonEmpty ArgMode),
+    bdApply :: [BuiltinArg] -> m NixValue
   }
+
+-- | The value of an argument a builtin has taken, forcing it if it was
+-- held unforced.
+argValue :: (MonadEval m) => BuiltinArg -> m NixValue
+argValue (ArgForced val) = pure val
+argValue (ArgDeferred thunk) = force thunk
+
+-- | An argument a builtin has taken, as a thunk to share, such as the
+-- function every element of @map@'s result applies.
+argAsThunk :: BuiltinArg -> Thunk
+argAsThunk (ArgForced val) = evaluated val
+argAsThunk (ArgDeferred thunk) = thunk
+
+-- | The failure of a builtin run with arguments that do not fit its
+-- shape, which 'applyBuiltin' never builds: it runs a builtin at its last
+-- position, and every caller supplies a 'ForceOnApply' position as
+-- 'ArgForced'.
+arityError :: (MonadEval m) => Text -> m a
+arityError name = throwEvalError ("builtins." <> name <> ": internal arity error")
+
+-- | One argument, forced as it is applied.
+forced1 :: (MonadEval m) => (NixValue -> m NixValue) -> Text -> BuiltinDef m
+forced1 f name = BuiltinDef (ForceOnApply :| []) $ \case
+  [ArgForced a] -> f a
+  _ -> arityError name
+
+-- | Two arguments, each forced as it is applied.
+forced2 :: (MonadEval m) => (NixValue -> NixValue -> m NixValue) -> Text -> BuiltinDef m
+forced2 f name = BuiltinDef (ForceOnApply :| [ForceOnApply]) $ \case
+  [ArgForced a, ArgForced b] -> f a b
+  _ -> arityError name
+
+-- | Three arguments, each forced as it is applied.
+forced3 :: (MonadEval m) => (NixValue -> NixValue -> NixValue -> m NixValue) -> Text -> BuiltinDef m
+forced3 f name = BuiltinDef (ForceOnApply :| [ForceOnApply, ForceOnApply]) $ \case
+  [ArgForced a, ArgForced b, ArgForced c] -> f a b c
+  _ -> arityError name
+
+-- | One argument, held unforced.
+onUse1 :: (MonadEval m) => (BuiltinArg -> m NixValue) -> Text -> BuiltinDef m
+onUse1 f name = BuiltinDef (ForceOnUse :| []) $ \case
+  [a] -> f a
+  _ -> arityError name
+
+-- | Two arguments, both held unforced.
+onUse2 :: (MonadEval m) => (BuiltinArg -> BuiltinArg -> m NixValue) -> Text -> BuiltinDef m
+onUse2 f name = BuiltinDef (ForceOnUse :| [ForceOnUse]) $ \case
+  [a, b] -> f a b
+  _ -> arityError name
+
+-- | Two arguments, the first held unforced and the second forced as it
+-- is applied.
+onUseFirst :: (MonadEval m) => (BuiltinArg -> NixValue -> m NixValue) -> Text -> BuiltinDef m
+onUseFirst f name = BuiltinDef (ForceOnUse :| [ForceOnApply]) $ \case
+  [a, ArgForced b] -> f a b
+  _ -> arityError name
+
+-- | Two arguments, the first forced as it is applied and the second held
+-- unforced.
+onUseSecond :: (MonadEval m) => (NixValue -> BuiltinArg -> m NixValue) -> Text -> BuiltinDef m
+onUseSecond f name = BuiltinDef (ForceOnApply :| [ForceOnUse]) $ \case
+  [ArgForced a, b] -> f a b
+  _ -> arityError name
+
+-- | Three arguments, the middle one held unforced and the others forced
+-- as they are applied.
+onUseMiddle :: (MonadEval m) => (NixValue -> BuiltinArg -> NixValue -> m NixValue) -> Text -> BuiltinDef m
+onUseMiddle f name = BuiltinDef (ForceOnApply :| [ForceOnUse, ForceOnApply]) $ \case
+  [ArgForced a, b, ArgForced c] -> f a b c
+  _ -> arityError name
+
+-- | A registry entry of the given shape.
+builtinShaped :: Text -> (Text -> BuiltinDef m) -> (Text, BuiltinDef m)
+builtinShaped name shape = (name, shape name)
 
 -- | Define an arity-1 builtin.
 builtin1 :: (MonadEval m) => Text -> (NixValue -> m NixValue) -> (Text, BuiltinDef m)
-builtin1 name f =
-  ( name,
-    BuiltinDef 1 $ \case
-      [a] -> f a
-      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
-  )
+builtin1 name = builtinShaped name . forced1
 
 -- | Define an arity-2 builtin.
 builtin2 ::
@@ -1215,12 +1300,7 @@ builtin2 ::
   Text ->
   (NixValue -> NixValue -> m NixValue) ->
   (Text, BuiltinDef m)
-builtin2 name f =
-  ( name,
-    BuiltinDef 2 $ \case
-      [a, b] -> f a b
-      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
-  )
+builtin2 name = builtinShaped name . forced2
 
 -- | Define an arity-3 builtin.
 builtin3 ::
@@ -1228,15 +1308,11 @@ builtin3 ::
   Text ->
   (NixValue -> NixValue -> NixValue -> m NixValue) ->
   (Text, BuiltinDef m)
-builtin3 name f =
-  ( name,
-    BuiltinDef 3 $ \case
-      [a, b, c] -> f a b c
-      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
-  )
+builtin3 name = builtinShaped name . forced3
 
--- | Central registry of all builtins.  Adding a new builtin is a single
--- entry here plus its implementation function - no other files need changes.
+-- | Central registry of all builtins: the source of 'builtinNames' and of
+-- each builtin's argument modes.  A new builtin is an entry here and a
+-- case in 'executeBuiltin' that uses the same shape.
 builtinRegistry :: (MonadEval m) => Map Text (BuiltinDef m)
 builtinRegistry =
   Map.fromList
@@ -1271,29 +1347,29 @@ builtinRegistry =
       builtin2 "intersectAttrs" builtinIntersectAttrs,
       builtin2 "catAttrs" builtinCatAttrs,
       -- List higher-order (arity 2)
-      builtin2 "map" builtinMap,
-      builtin2 "filter" builtinFilter,
-      builtin2 "genList" builtinGenList,
-      builtin2 "sort" builtinSort,
+      builtinShaped "map" (onUseFirst builtinMap),
+      builtinShaped "filter" (onUseFirst builtinFilter),
+      builtinShaped "genList" (onUseFirst builtinGenList),
+      builtinShaped "sort" (onUseFirst builtinSort),
       builtin2 "concatMap" builtinConcatMap,
       builtin2 "any" builtinAny,
       builtin2 "all" builtinAll,
-      builtin2 "elem" builtinElem,
-      builtin2 "elemAt" builtinElemAt,
+      builtinShaped "elem" (onUseFirst builtinElem),
+      builtinShaped "elemAt" (onUseFirst builtinElemAt),
       builtin2 "partition" builtinPartition,
       builtin2 "groupBy" builtinGroupBy,
       -- String operations (arity 2)
       builtin2 "concatStringsSep" builtinConcatStringsSep,
       -- Arity 3
-      builtin3 "foldl'" builtinFoldl,
+      builtinShaped "foldl'" (onUseMiddle builtinFoldl),
       builtin3 "substring" builtinSubstring,
       -- Numeric
       builtin1 "isPath" (pure . VBool . isPathVal),
       builtin1 "ceil" builtinCeil,
       builtin1 "floor" builtinFloor,
       builtin2 "seq" builtinSeq,
-      builtin2 "trace" builtinTrace,
-      builtin2 "warn" builtinWarn,
+      builtinShaped "trace" (onUseSecond builtinTrace),
+      builtinShaped "warn" (onUseSecond builtinWarn),
       builtin1 "unsafeDiscardStringContext" builtinDiscardContext,
       builtin1 "unsafeDiscardOutputDependency" builtinDiscardOutputDep,
       builtin1 "addDrvOutputDependencies" builtinAddDrvOutputDeps,
@@ -1314,7 +1390,7 @@ builtinRegistry =
       builtin2 "bitOr" (bitwise (.|.)),
       builtin2 "bitXor" (bitwise xor),
       -- Attr set higher-order
-      builtin2 "mapAttrs" builtinMapAttrs,
+      builtinShaped "mapAttrs" (onUseFirst builtinMapAttrs),
       builtin1 "functionArgs" builtinFunctionArgs,
       builtin2 "zipAttrsWith" builtinZipAttrsWith,
       -- String manipulation
@@ -1329,11 +1405,8 @@ builtinRegistry =
       builtin1 "fromJSON" builtinFromJSON,
       builtin2 "hashString" builtinHashString,
       -- Error handling + sequencing
-      -- An argument reaching here is already forced (any throw happened
-      -- before tryEval saw it), so it success-wraps; the catching paths
-      -- are evalBcApp and applyValueLazy.
-      builtin1 "tryEval" (tryEvalAction . pure),
-      builtin2 "deepSeq" builtinDeepSeq,
+      builtinShaped "tryEval" (onUse1 builtinTryEval),
+      builtinShaped "deepSeq" (onUseSecond builtinDeepSeq),
       -- Graph traversal
       builtin1 "genericClosure" builtinGenericClosure,
       -- IO builtins (delegate to MonadEval methods)
@@ -1348,7 +1421,7 @@ builtinRegistry =
       builtin1 "storePath" builtinStorePath,
       builtin2 "findFile" builtinFindFile,
       builtin2 "toFile" builtinToFile,
-      builtin2 "scopedImport" builtinScopedImport,
+      builtinShaped "scopedImport" (onUseFirst builtinScopedImport),
       -- Network fetchers
       builtin1 "fetchurl" builtinFetchurl,
       builtin1 "fetchTarball" builtinFetchTarball,
@@ -1362,7 +1435,7 @@ builtinRegistry =
       -- Attr position (return null - nixpkgs handles this gracefully)
       builtin2 "unsafeGetAttrPos" (\_ _ -> pure VNull),
       -- Debugging
-      builtin2 "traceVerbose" builtinTraceVerbose,
+      builtinShaped "traceVerbose" (onUse2 builtinTraceVerbose),
       builtin1 "break" pure,
       -- IO: file hashing + type detection
       builtin2 "hashFile" builtinHashFile,
@@ -1375,7 +1448,7 @@ builtinRegistry =
       builtin1 "toXML" builtinToXML,
       -- Source filtering + path import
       builtin1 "path" builtinPath,
-      builtin2 "filterSource" builtinFilterSource,
+      builtinShaped "filterSource" (onUseFirst builtinFilterSource),
       -- Experimental feature stubs
       builtin2 "outputOf" builtinOutputOf,
       builtin1 "fetchTree" builtinFetchTree,
@@ -1390,19 +1463,30 @@ builtinNames = Map.keys (builtinRegistry :: Map Text (BuiltinDef PureEval))
 -- Builtin dispatch (partial application via accumulated args)
 -- ---------------------------------------------------------------------------
 
--- | Arity of a builtin (how many arguments before execution).
-builtinArity :: Text -> Int
-builtinArity name = maybe 1 bdArity (Map.lookup name (builtinRegistry :: Map Text (BuiltinDef PureEval)))
+-- | How a builtin takes each argument, first to last.  A name the
+-- registry does not hold takes one argument, so applying it runs it and
+-- 'executeBuiltin' reports it unknown.
+builtinArgModes :: Text -> NonEmpty ArgMode
+builtinArgModes name = maybe (ForceOnApply :| []) bdArgs (Map.lookup name (builtinRegistry :: Map Text (BuiltinDef PureEval)))
 
--- | Apply a builtin with accumulated args.  If we have enough args,
--- execute; otherwise return a partially applied builtin.
-applyBuiltin :: (MonadEval m) => Text -> [NixValue] -> NixValue -> m NixValue
-applyBuiltin name accArgs arg =
-  let allArgs = accArgs ++ [arg]
-      arity = builtinArity name
-   in if length allArgs < arity
-        then pure (VBuiltin name (precompileArgs name allArgs))
-        else executeBuiltin name allArgs
+-- | Apply a builtin, holding the arguments it has taken, to one more.
+-- The caller supplies the argument as the builtin's mode for its
+-- position asks: forced, or as a thunk.  The last position runs the
+-- builtin; an earlier one makes the partial application.  Inlined into
+-- each application site, which measurably cuts allocation on this path.
+applyBuiltin :: (MonadEval m) => Text -> [BuiltinArg] -> (ArgMode -> m BuiltinArg) -> m NixValue
+applyBuiltin name taken takeArg = case builtinArgModes name of
+  first :| later -> nextPosition taken first later
+  where
+    nextPosition [] mode later = do
+      arg <- takeArg mode
+      let held = taken ++ [arg]
+      if null later
+        then executeBuiltin name held
+        else pure (VBuiltin name (precompileArgs name held))
+    nextPosition (_ : before) _ (mode : later) = nextPosition before mode later
+    nextPosition (_ : _) _ [] = arityError name
+{-# INLINE applyBuiltin #-}
 
 -- | Pre-compile regex patterns at partial application time.
 -- When builtins.match or builtins.split receives its first argument
@@ -1413,17 +1497,17 @@ applyBuiltin name accArgs arg =
 -- the RAW pattern: match's whole-string requirement is a span check at
 -- match time, not textual @^...$@ anchoring, which would misparse a
 -- top-level alternation (@^a|b$@ is @(^a)|(b$)@).
-precompileArgs :: Text -> [NixValue] -> [NixValue]
-precompileArgs "match" [VStr pat _] = compiledRegexArg pat
-precompileArgs "split" [VStr pat _] = compiledRegexArg pat
+precompileArgs :: Text -> [BuiltinArg] -> [BuiltinArg]
+precompileArgs "match" [ArgForced (VStr pat _)] = compiledRegexArg pat
+precompileArgs "split" [ArgForced (VStr pat _)] = compiledRegexArg pat
 precompileArgs _ args = args
 
 -- | The single-element arg list for a regex builtin: the compiled pattern
 -- if valid, the raw string otherwise (the error surfaces at execute time).
-compiledRegexArg :: BS.ByteString -> [NixValue]
+compiledRegexArg :: BS.ByteString -> [BuiltinArg]
 compiledRegexArg pat = case cachedCompileRegex pat of
-  Just compiled -> [VCompiledRegex (CompiledRegex pat compiled)]
-  Nothing -> [VStr pat emptyContext]
+  Just compiled -> [ArgForced (VCompiledRegex (CompiledRegex pat compiled))]
+  Nothing -> [ArgForced (VStr pat emptyContext)]
 
 -- | Apply a function value (lambda or builtin) to one argument, in a call
 -- frame of its own.  Used by higher-order builtins to invoke
@@ -1436,8 +1520,8 @@ applyForced :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 applyForced (VLambda closureEnv formals bodyBcIdx) arg = do
   extEnv <- matchFormals closureEnv formals (evaluated arg)
   evalBytecode extEnv bodyBcIdx
-applyForced (VBuiltin name accArgs) arg =
-  applyBuiltin name accArgs arg
+applyForced (VBuiltin name taken) arg =
+  applyBuiltin name taken (const (pure (ArgForced arg)))
 applyForced other _ =
   throwEvalError ("attempt to call " <> typeName other <> ", which is not a function")
 
@@ -1445,9 +1529,8 @@ applyForced other _ =
 -- higher-order list builtins (filter, any, all, partition, groupBy,
 -- foldl') pass elements as unforced values, so an element the function
 -- never inspects may contain a throw without failing the call.  A
--- builtin callee still receives a forced value (builtins force their
--- arguments regardless), and set-pattern formals force on destructuring
--- exactly as upstream does.
+-- builtin callee takes it by its mode for the position, and set-pattern
+-- formals force on destructuring exactly as upstream does.
 applyValueLazy :: (MonadEval m) => NixValue -> Thunk -> m NixValue
 applyValueLazy fun argThunk = withCallFrame (applyUnforced fun argThunk)
 
@@ -1456,24 +1539,27 @@ applyUnforced :: (MonadEval m) => NixValue -> Thunk -> m NixValue
 applyUnforced (VLambda closureEnv formals bodyBcIdx) argThunk = do
   extEnv <- matchFormals closureEnv formals argThunk
   evalBytecode extEnv bodyBcIdx
--- tryEval's catch must wrap the argument's forcing (see 'tryEvalAction'):
--- map/filter passing a throwing element to tryEval yields success = false,
--- not an escaped error.
-applyUnforced (VBuiltin "tryEval" []) argThunk = tryEvalAction (force argThunk)
-applyUnforced (VBuiltin "traceVerbose" []) argThunk = traceVerboseFirst (force argThunk)
-applyUnforced (VBuiltin name [first]) argThunk
-  | Just finishFirst <- beforeSecondArgument name first = finishFirst >> force argThunk
+applyUnforced (VBuiltin name taken) argThunk = applyBuiltin name taken $ \case
+  ForceOnApply -> ArgForced <$> force argThunk
+  ForceOnUse -> pure (ArgDeferred argThunk)
 applyUnforced other argThunk = do
   val <- force argThunk
   applyForced other val
+
+-- | Apply a function value to an argument a builtin has taken: forced,
+-- or as the thunk it was held as.
+applyArg :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+applyArg fun (ArgForced val) = applyValue fun val
+applyArg fun (ArgDeferred thunk) = applyValueLazy fun thunk
 
 -- | Execute a builtin once all arguments are collected.
 --
 -- Direct case dispatch avoids rebuilding the polymorphic 'builtinRegistry'
 -- Map on every call.  'builtinRegistry' is polymorphic in @m@ so GHC
 -- cannot cache it as a CAF - it gets reconstructed on every use.
--- Pattern matching on the name is zero-allocation.
-executeBuiltin :: (MonadEval m) => Text -> [NixValue] -> m NixValue
+-- Pattern matching on the name is zero-allocation.  Each case runs the
+-- shape its registry entry uses, which the implementation's type fixes.
+executeBuiltin :: (MonadEval m) => Text -> [BuiltinArg] -> m NixValue
 executeBuiltin name args = case name of
   -- Type checking (arity 1)
   "typeOf" -> apply1 (pure . mkStr . typeOfValue)
@@ -1506,29 +1592,29 @@ executeBuiltin name args = case name of
   "intersectAttrs" -> apply2 builtinIntersectAttrs
   "catAttrs" -> apply2 builtinCatAttrs
   -- List higher-order (arity 2)
-  "map" -> apply2 builtinMap
-  "filter" -> apply2 builtinFilter
-  "genList" -> apply2 builtinGenList
-  "sort" -> apply2 builtinSort
+  "map" -> run (onUseFirst builtinMap)
+  "filter" -> run (onUseFirst builtinFilter)
+  "genList" -> run (onUseFirst builtinGenList)
+  "sort" -> run (onUseFirst builtinSort)
   "concatMap" -> apply2 builtinConcatMap
   "any" -> apply2 builtinAny
   "all" -> apply2 builtinAll
-  "elem" -> apply2 builtinElem
-  "elemAt" -> apply2 builtinElemAt
+  "elem" -> run (onUseFirst builtinElem)
+  "elemAt" -> run (onUseFirst builtinElemAt)
   "partition" -> apply2 builtinPartition
   "groupBy" -> apply2 builtinGroupBy
   -- String operations (arity 2)
   "concatStringsSep" -> apply2 builtinConcatStringsSep
   -- Arity 3
-  "foldl'" -> apply3 builtinFoldl
+  "foldl'" -> run (onUseMiddle builtinFoldl)
   "substring" -> apply3 builtinSubstring
   -- Numeric
   "isPath" -> apply1 (pure . VBool . isPathVal)
   "ceil" -> apply1 builtinCeil
   "floor" -> apply1 builtinFloor
   "seq" -> apply2 builtinSeq
-  "trace" -> apply2 builtinTrace
-  "warn" -> apply2 builtinWarn
+  "trace" -> run (onUseSecond builtinTrace)
+  "warn" -> run (onUseSecond builtinWarn)
   "unsafeDiscardStringContext" -> apply1 builtinDiscardContext
   "unsafeDiscardOutputDependency" -> apply1 builtinDiscardOutputDep
   "addDrvOutputDependencies" -> apply1 builtinAddDrvOutputDeps
@@ -1549,7 +1635,7 @@ executeBuiltin name args = case name of
   "bitOr" -> apply2 (bitwise (.|.))
   "bitXor" -> apply2 (bitwise xor)
   -- Attr set higher-order
-  "mapAttrs" -> apply2 builtinMapAttrs
+  "mapAttrs" -> run (onUseFirst builtinMapAttrs)
   "functionArgs" -> apply1 builtinFunctionArgs
   "zipAttrsWith" -> apply2 builtinZipAttrsWith
   -- String manipulation
@@ -1564,9 +1650,8 @@ executeBuiltin name args = case name of
   "fromJSON" -> apply1 builtinFromJSON
   "hashString" -> apply2 builtinHashString
   -- Error handling + sequencing
-  -- Already-forced argument: success-wrap (see the registry entry).
-  "tryEval" -> apply1 (tryEvalAction . pure)
-  "deepSeq" -> apply2 builtinDeepSeq
+  "tryEval" -> run (onUse1 builtinTryEval)
+  "deepSeq" -> run (onUseSecond builtinDeepSeq)
   -- Graph traversal
   "genericClosure" -> apply1 builtinGenericClosure
   -- IO builtins (delegate to MonadEval methods)
@@ -1581,7 +1666,7 @@ executeBuiltin name args = case name of
   "storePath" -> apply1 builtinStorePath
   "findFile" -> apply2 builtinFindFile
   "toFile" -> apply2 builtinToFile
-  "scopedImport" -> apply2 builtinScopedImport
+  "scopedImport" -> run (onUseFirst builtinScopedImport)
   -- Network fetchers
   "fetchurl" -> apply1 builtinFetchurl
   "fetchTarball" -> apply1 builtinFetchTarball
@@ -1593,7 +1678,7 @@ executeBuiltin name args = case name of
   -- Attr position (return null - nixpkgs handles this gracefully)
   "unsafeGetAttrPos" -> apply2 (\_ _ -> pure VNull)
   -- Debugging
-  "traceVerbose" -> apply2 builtinTraceVerbose
+  "traceVerbose" -> run (onUse2 builtinTraceVerbose)
   "break" -> apply1 pure
   -- IO: file hashing + type detection
   "hashFile" -> apply2 builtinHashFile
@@ -1606,22 +1691,17 @@ executeBuiltin name args = case name of
   "toXML" -> apply1 builtinToXML
   -- Source filtering + path import
   "path" -> apply1 builtinPath
-  "filterSource" -> apply2 builtinFilterSource
+  "filterSource" -> run (onUseFirst builtinFilterSource)
   -- Experimental feature stubs
   "outputOf" -> apply2 builtinOutputOf
   "fetchTree" -> apply1 builtinFetchTree
   "fetchClosure" -> apply1 builtinFetchClosure
   _ -> throwEvalError ("unknown builtin '" <> name <> "'")
   where
-    apply1 f = case args of
-      [a] -> f a
-      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
-    apply2 f = case args of
-      [a, b] -> f a b
-      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
-    apply3 f = case args of
-      [a, b, c] -> f a b c
-      _ -> throwEvalError ("builtins." <> name <> ": internal arity error")
+    run shape = bdApply (shape name) args
+    apply1 = run . forced1
+    apply2 = run . forced2
+    apply3 = run . forced3
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - type checking
@@ -1857,19 +1937,41 @@ catAttrsCollect key = go []
 -- Builtin implementations - list higher-order (arity 2)
 -- ---------------------------------------------------------------------------
 
-builtinMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMap func (VList cl) =
-  -- Lazy: each element is a deferred application, forced only on demand.
-  let thunks = map Thunk (clistThunks cl)
-   in pure (VList (clistFromThunks (map (thunkToCPtr . deferApply func) thunks)))
+-- | Force a builtin's function argument, failing unless it is a lambda, a
+-- builtin, or a set with @__functor@, as upstream's @forceFunction@ does
+-- (eval.cc at 2.24.9).
+forceFunctionArg :: (MonadEval m) => BuiltinArg -> m NixValue
+forceFunctionArg arg = do
+  val <- argValue arg
+  case val of
+    VLambda {} -> pure val
+    VBuiltin _ _ -> pure val
+    VAttrs attrs | attrSetMember "__functor" attrs -> pure val
+    other -> throwEvalError ("expected a function but found " <> typeName other <> ": " <> printValue PrintForError other)
+
+-- | @prim_map@ forces the list, returns an empty one as it is, and only
+-- then forces the function (primops.cc at 2.24.9), so
+-- @map (throw "a") [ ]@ is @[ ]@.  Each element is a deferred
+-- application, forced only on demand.
+builtinMap :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
+builtinMap funcArg (VList cl)
+  | clistLen cl == 0 = pure (VList cl)
+  | otherwise = do
+      _ <- forceFunctionArg funcArg
+      let fnThunk = argAsThunk funcArg
+      pure (VList (clistFromThunks (map (thunkToCPtr . deferApplyThunk fnThunk . Thunk) (clistThunks cl))))
 builtinMap _ other =
   throwEvalError ("builtins.map: expected a list, got " <> typeName other)
 
-builtinFilter :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinFilter predFn (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  filtered <- filterThunks predFn thunks
-  pure (VList (clistFromThunks (map thunkToCPtr filtered)))
+-- | @prim_filter@, like @prim_map@, forces its function only once the
+-- list is known not to be empty (primops.cc at 2.24.9).
+builtinFilter :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
+builtinFilter predArg (VList cl)
+  | clistLen cl == 0 = pure (VList cl)
+  | otherwise = do
+      predFn <- forceFunctionArg predArg
+      filtered <- filterThunks predFn (map Thunk (clistThunks cl))
+      pure (VList (clistFromThunks (map thunkToCPtr filtered)))
 builtinFilter _ other =
   throwEvalError ("builtins.filter: expected a list, got " <> typeName other)
 
@@ -1882,26 +1984,33 @@ filterThunks predFn (thunk : rest) = do
     VBool False -> filterThunks predFn rest
     _ -> throwEvalError "builtins.filter: predicate must return a bool"
 
-builtinGenList :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinGenList func (VInt n)
+-- | @prim_genList@ forces the length, then the function, even for a
+-- length of zero (primops.cc at 2.24.9).
+builtinGenList :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
+builtinGenList funcArg (VInt n)
   | n < 0 = throwEvalError "builtins.genList: length must be non-negative"
-  | otherwise =
+  | otherwise = do
+      _ <- forceFunctionArg funcArg
       -- Lazy: each element is a deferred @f i@, forced only on demand.
       -- The index is an argument value, as upstream's @prim_genList@
       -- allocates an int and an app per element, so every element runs
       -- the same code.
-      let fnThunk = evaluated func
+      let fnThunk = argAsThunk funcArg
           mkIndexThunk = thunkToCPtr . deferApplyThunk fnThunk . evaluated . VInt
-       in pure (VList (clistFromThunks (map mkIndexThunk [0 .. n - 1])))
+      pure (VList (clistFromThunks (map mkIndexThunk [0 .. n - 1])))
 builtinGenList _ other =
   throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
 
-builtinSort :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinSort comparator (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  vals <- mapM force thunks
-  sorted <- mergeSort (sortComparison comparator) vals
-  pure (VList (clistFromThunks (map (thunkToCPtr . evaluated) sorted)))
+-- | @prim_sort@ forces the list, returns an empty one as it is, and forces
+-- the comparator before the elements (primops.cc at 2.24.9).
+builtinSort :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
+builtinSort cmpArg (VList cl)
+  | clistLen cl == 0 = pure (VList cl)
+  | otherwise = do
+      comparator <- forceFunctionArg cmpArg
+      vals <- mapM (force . Thunk) (clistThunks cl)
+      sorted <- mergeSort (sortComparison comparator) vals
+      pure (VList (clistFromThunks (map (thunkToCPtr . evaluated) sorted)))
 builtinSort _ other =
   throwEvalError ("builtins.sort: expected a list, got " <> typeName other)
 
@@ -1992,11 +2101,16 @@ allThunk predFn (thunk : rest) = do
     VBool False -> pure False
     _ -> throwEvalError "builtins.all: predicate must return a bool"
 
-builtinElem :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinElem needle (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  found <- elemCheck needle thunks
-  pure (VBool found)
+-- | @prim_elem@ forces the list, then compares the needle with each
+-- element through @eqValues@, which forces the needle before the element
+-- (primops.cc and eval.cc at 2.24.9), so an empty list never forces it.
+builtinElem :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
+builtinElem needleArg (VList cl) =
+  VBool <$> case map Thunk (clistThunks cl) of
+    [] -> pure False
+    thunks -> do
+      needle <- argValue needleArg
+      elemCheck needle thunks
 builtinElem _ other =
   throwEvalError ("builtins.elem: expected a list, got " <> typeName other)
 
@@ -2007,11 +2121,15 @@ elemCheck needle (thunk : rest) = do
   eq <- nixEqual force needle val
   if eq then pure True else elemCheck needle rest
 
--- | The index is checked before the list: @prim_elemAt@ forces it with
--- @forceInt@ (eval.cc) before its @elemAt@ forces the list.
-builtinElemAt :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinElemAt (VList cl) (VInt idx) = listElemAt cl idx
-builtinElemAt other (VInt _) = throwEvalError (expectedList other)
+-- | The index is forced and checked before the list: @prim_elemAt@ forces
+-- it with @forceInt@ before its @elemAt@ forces the list (primops.cc at
+-- 2.24.9).
+builtinElemAt :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
+builtinElemAt listArg (VInt idx) = do
+  list <- argValue listArg
+  case list of
+    VList cl -> listElemAt cl idx
+    other -> throwEvalError (expectedList other)
 builtinElemAt _ other =
   throwEvalError ("expected an integer but found " <> typeName other <> ": " <> printValue PrintForError other)
 
@@ -2094,21 +2212,25 @@ builtinConcatStringsSep other _ =
 -- Builtin implementations - arity 3
 -- ---------------------------------------------------------------------------
 
-builtinFoldl :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
+-- | @prim_foldlStrict@ passes the initial accumulator to the first call
+-- of the operator unforced, and forces it itself only when the list is
+-- empty (primops.cc at 2.24.9), so it is taken unforced.
+builtinFoldl :: (MonadEval m) => NixValue -> BuiltinArg -> NixValue -> m NixValue
 builtinFoldl op initial (VList cl) =
   foldlStrict op initial (map Thunk (clistThunks cl))
 builtinFoldl _ _ other =
   throwEvalError ("builtins.foldl': expected a list, got " <> typeName other)
 
--- | Strict left fold: apply @op acc elem@ for each element.  The
--- accumulator is forced each step (upstream foldl' strictness); the
--- element is passed as an unforced thunk, as upstream does.
-foldlStrict :: (MonadEval m) => NixValue -> NixValue -> [Thunk] -> m NixValue
-foldlStrict _ acc [] = pure acc
+-- | Strict left fold: apply @op acc elem@ for each element.  Each step's
+-- result is forced (upstream foldl' strictness), the initial accumulator
+-- reaches the first step as it was taken, and the element is passed as an
+-- unforced thunk, as upstream does.
+foldlStrict :: (MonadEval m) => NixValue -> BuiltinArg -> [Thunk] -> m NixValue
+foldlStrict _ acc [] = argValue acc
 foldlStrict op acc (thunk : rest) = do
-  partial <- applyValue op acc
+  partial <- applyArg op acc
   stepped <- applyValueLazy partial thunk
-  foldlStrict op stepped rest
+  foldlStrict op (ArgForced stepped) rest
 
 -- | Byte-indexed slicing, as upstream: offsets and lengths count bytes,
 -- and a slice may fall mid-codepoint (the resulting bytes are the value).
@@ -2491,16 +2613,18 @@ bitwise op a b = VInt <$> (op <$> expectInt a <*> expectInt b)
 -- Builtin implementations - attr set higher-order
 -- ---------------------------------------------------------------------------
 
-builtinMapAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMapAttrs func (VAttrs attrs) =
+-- | @prim_mapAttrs@ forces only the set: the function is applied in each
+-- attribute's deferred application and never forced by the primop itself
+-- (primops.cc at 2.24.9), so @mapAttrs (throw "a") { }@ is @{ }@.
+builtinMapAttrs :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
+builtinMapAttrs funcArg (VAttrs attrs) =
   -- Each attr value is a deferred @f key val@, forced only on demand.
   -- Eagerly builds all thunks via attrSetMapWithKey - with C arena thunks
-  -- (~16 bytes each), this is cheaper than the former MappedAttrs overhead
-  -- and keeps all data off the GHC heap.
+  -- (~16 bytes each), this keeps all data off the GHC heap.
   -- Slot 0 = function, slot 1 = key, slot 2 = value.
   pure (VAttrs (attrSetMapWithKey deferAttr attrs))
   where
-    fnThunk = evaluated func
+    fnThunk = argAsThunk funcArg
     deferAttr key valThunk =
       let (sp, sc) = buildCSlots [fnThunk, evaluated (mkStr key), valThunk]
           env = newMinimalEnv sp sc
@@ -2998,23 +3122,13 @@ digestToHex = bytesToHexText . BA.convert
 -- Builtin implementations - deep evaluation
 -- ---------------------------------------------------------------------------
 
-builtinDeepSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinDeepSeq first second = deepForce first >> pure second
-
--- | What a builtin returning its second argument does with its first
--- before it forces that second: @prim_deepSeq@ forces the first deeply,
--- @prim_trace@ prints it and @prim_warn@ warns with it, and only then does
--- each force the second (primops.cc at 2.24.9).  @traceVerbose@ is
--- @prim_trace@ under @trace-verbose@ and otherwise @prim_second@, which
--- does nothing first.  A builtin's arguments are forced before it runs,
--- so an application that has the second still unforced does this first.
-beforeSecondArgument :: (MonadEval m) => Text -> NixValue -> Maybe (m ())
-beforeSecondArgument name first = case name of
-  "deepSeq" -> Just (deepForce first)
-  "trace" -> Just (emitTrace first)
-  "traceVerbose" -> Just (whenTraceVerbose (emitTrace first))
-  "warn" -> Just (emitWarning first)
-  _ -> Nothing
+-- | @builtins.deepSeq a b@.  @prim_deepSeq@ forces the first argument
+-- deeply before it forces the second (primops.cc at 2.24.9), so the
+-- second is taken unforced.  'builtinTrace' and 'builtinWarn' take theirs
+-- unforced for the same reason: @prim_trace@ prints and @prim_warn@ warns
+-- before forcing the second.
+builtinDeepSeq :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinDeepSeq first second = deepForce first >> argValue second
 
 deepForce :: (MonadEval m) => NixValue -> m ()
 deepForce (VList cl) = mapM_ ((force >=> deepForce) . Thunk) (clistThunks cl)
@@ -3025,55 +3139,35 @@ deepForce _ = pure ()
 builtinSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSeq !_first = pure
 
--- | @builtins.trace msg val@ - print @msg@ to stderr, return @val@.
-builtinTrace :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinTrace msgVal result = emitTrace msgVal >> pure result
+-- | @builtins.trace msg val@ - print @msg@ to stderr, then force and
+-- return @val@.
+builtinTrace :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinTrace msgVal result = emitTrace msgVal >> argValue result
+
+-- | @builtins.traceVerbose msg val@: @builtins.trace@ under
+-- @trace-verbose@, and otherwise @val@ alone.  Upstream binds the name to
+-- @prim_trace@ or to @prim_second@ by the setting (primops.cc at 2.24.9),
+-- and @prim_second@ never forces its first argument, so both are taken
+-- unforced and @traceVerbose (throw "a") 1@ is @1@ without the setting.
+builtinTraceVerbose :: (MonadEval m) => BuiltinArg -> BuiltinArg -> m NixValue
+builtinTraceVerbose msgArg result = do
+  policy <- evalPolicy
+  when (epTraceVerbose policy) (argValue msgArg >>= emitTrace)
+  argValue result
 
 emitTrace :: (MonadEval m) => NixValue -> m ()
 emitTrace msgVal = traceMessage . ("trace: " <>) $ case msgVal of
   VStr s _ -> bytesToTextLossy s
   other -> printValue PrintInFull other
 
--- | @builtins.traceVerbose msg val@: @builtins.trace@ under
--- @trace-verbose@, and otherwise @val@ alone.  Upstream binds the name to
--- @prim_trace@ or to @prim_second@ by the setting (primops.cc at 2.24.9).
-builtinTraceVerbose :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinTraceVerbose msgVal result = whenTraceVerbose (emitTrace msgVal) >> pure result
-
--- | Run the action only under @trace-verbose@.
-whenTraceVerbose :: (MonadEval m) => m () -> m ()
-whenTraceVerbose action = do
-  policy <- evalPolicy
-  when (epTraceVerbose policy) action
-
--- | @builtins.traceVerbose@ taking its first argument, given the action
--- that forces it.  Under @trace-verbose@ the argument is forced, as
--- @prim_trace@ forces it.  Otherwise it is not: @prim_second@ never
--- forces its first argument (primops.cc at 2.24.9), so
--- @traceVerbose (throw "a") 1@ is @1@.  A partial application holds
--- forced values, so that one holds 'discardedArgument' in its place.
-traceVerboseFirst :: (MonadEval m) => m NixValue -> m NixValue
-traceVerboseFirst forceFirst = do
-  policy <- evalPolicy
-  if epTraceVerbose policy
-    then forceFirst >>= applyBuiltin "traceVerbose" []
-    else pure (VBuiltin "traceVerbose" [discardedArgument])
-
--- | What a partial application of @prim_second@ holds for the first
--- argument it never forces.  Nothing reads it: the policy is fixed for an
--- evaluation, so the application that takes the second argument does not
--- trace either.  It only counts the argument as taken, so the application
--- prints as upstream's partially applied primop.
-discardedArgument :: NixValue
-discardedArgument = VNull
-
--- | @builtins.warn msg val@ - print warning to stderr, return @val@.
+-- | @builtins.warn msg val@ - print warning to stderr, then force and
+-- return @val@.
 --
 -- The message must be a string: upstream's @prim_warn@ forces it with
 -- @forceString@ (primops.cc at 2.24.9), leaving room to extend the
 -- argument later, where @builtins.trace@ prints any value.
-builtinWarn :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinWarn msgVal result = emitWarning msgVal >> pure result
+builtinWarn :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinWarn msgVal result = emitWarning msgVal >> argValue result
 
 -- | Upstream logs the message as a warning from an expression, which its
 -- logger prefixes @evaluation warning:@.
@@ -3405,13 +3499,16 @@ toFileRefs (StringContext elems) = mapM refOf (Set.toAscList elems)
 -- Builtin implementations - scoped import
 -- ---------------------------------------------------------------------------
 
-builtinScopedImport :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinScopedImport (VAttrs attrs) pathVal = do
+-- | Upstream's @import@ helper behind @scopedImport@ realises the path
+-- before it forces the scope (primops.cc at 2.24.9), so the scope is
+-- taken unforced.
+builtinScopedImport :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
+builtinScopedImport scopeArg pathVal = do
   p <- coerceToPath "builtins.scopedImport" pathVal
-  let scope = Map.toList (attrSetToMap attrs)
-  scopedImportFile scope p
-builtinScopedImport other _ =
-  throwEvalError ("builtins.scopedImport: expected a set, got " <> typeName other)
+  scopeVal <- argValue scopeArg
+  case scopeVal of
+    VAttrs attrs -> scopedImportFile (Map.toList (attrSetToMap attrs)) p
+    other -> throwEvalError ("builtins.scopedImport: expected a set, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - network fetchers
@@ -5747,9 +5844,14 @@ filteredSourceNar filterFn rawRoot = do
 -- filtering entries via a predicate.  The filter function receives
 -- @(path, type)@ where type is @"regular"@, @"directory"@, @"symlink"@,
 -- or @"unknown"@.  Equivalent to @builtins.path@ with a filter and the
--- source's basename as the store name.
-builtinFilterSource :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinFilterSource filterFn pathVal = filterSourceInto filterFn =<< coerceToPath "builtins.filterSource" pathVal
+-- source's basename as the store name.  @prim_filterSource@ coerces the
+-- path before it forces the filter (primops.cc at 2.24.9), so the filter
+-- is taken unforced.
+builtinFilterSource :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
+builtinFilterSource filterArg pathVal = do
+  path <- coerceToPath "builtins.filterSource" pathVal
+  filterFn <- forceFunctionArg filterArg
+  filterSourceInto filterFn path
 
 filterSourceInto :: (MonadEval m) => NixValue -> Text -> m NixValue
 filterSourceInto filterFn path = do
