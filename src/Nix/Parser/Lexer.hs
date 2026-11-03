@@ -15,7 +15,11 @@
 -- a letter.
 --
 -- A column counts characters: a byte that continues a UTF-8 sequence does
--- not advance it, so valid UTF-8 advances one column per character.
+-- not advance it, so valid UTF-8 advances one column per character.  A
+-- line ends at an LF, a CRLF or a bare CR, as upstream's position table
+-- splits a source (@Pos::LinesIterator@, position.cc).  Every byte the
+-- lexer takes passes through 'consume', which holds that rule, so no
+-- token, comment or string counts lines its own way.
 module Nix.Parser.Lexer
   ( -- * Tokens
     Token (..),
@@ -23,9 +27,13 @@ module Nix.Parser.Lexer
 
     -- * Tokenizing
     tokenize,
+
+    -- * Positions
+    positionAfter,
   )
 where
 
+import Control.Applicative ((<|>))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -177,21 +185,30 @@ data LexState = LexState
 
 -- | Tokenize a Nix source file. Returns tokens or a lex error.
 tokenize :: Text -> ByteString -> Either ParseError [Located]
-tokenize fileName source =
-  let initialState =
-        LexState
-          { lsInput = source,
-            lsFile = fileName,
-            lsLine = 1,
-            lsCol = 1,
-            lsModes = [ModeNormal],
-            lsBraceDepth = 0,
-            lsBraceStack = [],
-            -- No runs scanned yet: nothing may shortcut.
-            lsNoSlashFloor = maxBound,
-            lsNoColonFloor = maxBound
-          }
-   in lexLoop initialState []
+tokenize fileName source = lexLoop (initialState fileName source) []
+
+-- | The line and column just past a source's last byte, counted as
+-- 'tokenize' counts them.
+positionAfter :: ByteString -> (Int, Int)
+positionAfter source =
+  let atEnd = consume (BS.length source) (initialState T.empty source)
+   in (lsLine atEnd, lsCol atEnd)
+
+-- | The state at the start of a source.
+initialState :: Text -> ByteString -> LexState
+initialState fileName source =
+  LexState
+    { lsInput = source,
+      lsFile = fileName,
+      lsLine = 1,
+      lsCol = 1,
+      lsModes = [ModeNormal],
+      lsBraceDepth = 0,
+      lsBraceStack = [],
+      -- No runs scanned yet: nothing may shortcut.
+      lsNoSlashFloor = maxBound,
+      lsNoColonFloor = maxBound
+    }
 
 -- ---------------------------------------------------------------------------
 -- Main loop
@@ -224,17 +241,17 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
   '#' -> lexNormalMode (skipLineComment st) acc
   '/'
     | Just '*' <- safeHead rest ->
-        case skipBlockComment (advanceCol 2 st {lsInput = BS.drop 2 (lsInput st)}) of
+        case skipBlockComment (consume 2 st) of
           Left err -> Left err
           Right newSt -> lexNormalMode newSt acc
   '"' ->
     let tok = Located (lsLine st) (lsCol st) TokStringOpen
-        newSt = advanceCol 1 st {lsInput = rest, lsModes = ModeString : lsModes st}
+        newSt = consume 1 st {lsModes = ModeString : lsModes st}
      in lexLoop newSt (tok : acc)
   '\''
     | Just '\'' <- safeHead rest ->
         let tok = Located (lsLine st) (lsCol st) TokIndStringOpen
-            opened = advanceCol 2 st {lsInput = BS.drop 2 (lsInput st), lsModes = ModeIndString : lsModes st}
+            opened = consume 2 st {lsModes = ModeIndString : lsModes st}
          in lexLoop (skipIndStringOpenerLine opened) (tok : acc)
   '.'
     | Just '.' <- safeHead rest,
@@ -261,7 +278,7 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
   ']' -> emit1 st TokRBracket acc
   '{' ->
     let tok = Located (lsLine st) (lsCol st) TokLBrace
-        newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = lsBraceDepth st + 1}
+        newSt = consume 1 st {lsBraceDepth = lsBraceDepth st + 1}
      in lexNormalMode newSt (tok : acc)
   '}' ->
     case lsModes st of
@@ -275,11 +292,10 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
                   (saved : outerSaved) -> (saved, outerSaved)
                   [] -> (0, [])
                 newSt =
-                  advanceCol
+                  consume
                     1
                     st
-                      { lsInput = rest,
-                        lsModes = outerMode : restModes,
+                      { lsModes = outerMode : restModes,
                         lsBraceDepth = restoredDepth,
                         lsBraceStack = restoredStack
                       }
@@ -288,7 +304,7 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
         let depth = lsBraceDepth st
             newDepth = if depth > 0 then depth - 1 else 0
             tok = Located (lsLine st) (lsCol st) TokRBrace
-            newSt = advanceCol 1 st {lsInput = rest, lsBraceDepth = newDepth}
+            newSt = consume 1 st {lsBraceDepth = newDepth}
          in lexNormalMode newSt (tok : acc)
   '+' | Just '+' <- safeHead rest -> emit2 st TokConcat acc
   '+' -> emit1 st TokPlus acc
@@ -323,7 +339,7 @@ lexNormalModeAt st flooredSt startsPath c rest acc = case c of
         -- interpolation like "${env.${name}}" prematurely ends the
         -- outer interpolation.
         let tok = Located (lsLine st) (lsCol st) TokInterpOpen
-            newSt = advanceCol 2 st {lsInput = BS.drop 1 rest, lsBraceDepth = lsBraceDepth st + 1}
+            newSt = consume 2 st {lsBraceDepth = lsBraceDepth st + 1}
          in lexNormalMode newSt (tok : acc)
   '~'
     | Just '/' <- safeHead rest ->
@@ -379,17 +395,16 @@ lexStringMode st acc = case BC.uncons (lsInput st) of
   Just (c, rest) -> case c of
     '"' ->
       let tok = Located (lsLine st) (lsCol st) TokStringClose
-          newSt = advanceCol 1 st {lsInput = rest, lsModes = safeTail (lsModes st)}
+          newSt = consume 1 st {lsModes = safeTail (lsModes st)}
        in lexLoop newSt (tok : acc)
     '$'
       | Just '{' <- safeHead rest ->
           let tok = Located (lsLine st) (lsCol st) TokInterpOpen
               newSt =
-                advanceCol
+                consume
                   2
                   st
-                    { lsInput = BS.drop 1 rest,
-                      lsModes = ModeNormal : lsModes st,
+                    { lsModes = ModeNormal : lsModes st,
                       -- Fresh count for the interpolation body; the
                       -- enclosing context's count is restored at the
                       -- matching TokInterpClose.
@@ -404,12 +419,14 @@ lexStringMode st acc = case BC.uncons (lsInput st) of
 -- @\'\'(\ *\n)?@), so content starts on the next line and the opening
 -- line's trailing spaces never reach the indentation scan.  Only spaces
 -- qualify: a tab after @''@ is content, as are spaces not followed by a
--- newline.
+-- newline.  The newline is an LF alone, so a line that ends in CRLF or a
+-- bare CR is content too, from its spaces on.
 skipIndStringOpenerLine :: LexState -> LexState
-skipIndStringOpenerLine st =
-  case BC.uncons (BC.dropWhile (== ' ') (lsInput st)) of
-    Just ('\n', rest) -> st {lsInput = rest, lsLine = lsLine st + 1, lsCol = 1}
-    _ -> st
+skipIndStringOpenerLine st
+  | "\n" `BS.isPrefixOf` afterSpaces = consume (BS.length spaces + 1) st
+  | otherwise = st
+  where
+    (spaces, afterSpaces) = BC.span (== ' ') (lsInput st)
 
 lexIndStringMode :: LexState -> [Located] -> Either ParseError [Located]
 lexIndStringMode st acc
@@ -427,30 +444,26 @@ lexIndStringMode st acc
             Just ('\'', rest1) | Just ('\'', rest2) <- BC.uncons rest1 ->
               -- Check for escape sequences: ''', ''$, ''\x, ''${
               case BC.uncons rest2 of
-                Just ('\'', rest3) ->
+                Just ('\'', _) ->
                   -- ''' escapes a literal '' (two quotes) - Nix's escape for the
                   -- indented-string terminator, not a single quote.
                   let escTok = Located (lsLine st) (lsCol st) (TokStringEsc "''")
-                      newSt = advanceCol 3 st {lsInput = rest3}
-                   in lexIndStringMode newSt (escTok : acc)
+                   in lexIndStringMode (consume 3 st) (escTok : acc)
                 Just ('$', rest3)
-                  | Just ('{', rest4) <- BC.uncons rest3 ->
+                  | Just ('{', _) <- BC.uncons rest3 ->
                       -- ''${ is a literal ${
                       let escTok = Located (lsLine st) (lsCol st) (TokStringEsc "${")
-                          newSt = advanceCol 4 st {lsInput = rest4}
-                       in lexIndStringMode newSt (escTok : acc)
-                Just ('$', rest3) ->
+                       in lexIndStringMode (consume 4 st) (escTok : acc)
+                Just ('$', _) ->
                   -- ''$ (without brace) is a literal $
                   let escTok = Located (lsLine st) (lsCol st) (TokStringEsc "$")
-                      newSt = advanceCol 3 st {lsInput = rest3}
-                   in lexIndStringMode newSt (escTok : acc)
+                   in lexIndStringMode (consume 3 st) (escTok : acc)
                 Just ('\\', rest3) ->
                   -- ''\x is an escape sequence
                   case BC.uncons rest3 of
-                    Just (escaped, rest4) ->
+                    Just (escaped, _) ->
                       let escTok = Located (lsLine st) (lsCol st) (TokStringEsc (escapedBytes escaped))
-                          newSt = advanceEscaped escaped (advanceCol 3 st {lsInput = rest4})
-                       in lexIndStringMode newSt (escTok : acc)
+                       in lexIndStringMode (consume 4 st) (escTok : acc)
                     Nothing ->
                       Left
                         ParseError
@@ -462,18 +475,17 @@ lexIndStringMode st acc
                 _ ->
                   -- '' followed by non-escape closes the indented string
                   let tok = Located (lsLine st) (lsCol st) TokIndStringClose
-                      newSt = advanceCol 2 st {lsInput = rest2, lsModes = safeTail (lsModes st)}
+                      newSt = consume 2 st {lsModes = safeTail (lsModes st)}
                    in lexLoop newSt (tok : acc)
             Just ('$', rest1)
-              | Just ('{', rest2) <- BC.uncons rest1 ->
+              | Just ('{', _) <- BC.uncons rest1 ->
                   -- \${ in indented string is interpolation
                   let tok = Located (lsLine st) (lsCol st) TokInterpOpen
                       newSt =
-                        advanceCol
+                        consume
                           2
                           st
-                            { lsInput = rest2,
-                              lsModes = ModeNormal : lsModes st,
+                            { lsModes = ModeNormal : lsModes st,
                               -- Fresh count; enclosing context restored at
                               -- the matching TokInterpClose.
                               lsBraceDepth = 0,
@@ -491,7 +503,7 @@ lexStringLiteral st0 acc = go st0 []
   where
     go st pieces =
       let (run, afterRun) = BC.break endsStringRun (lsInput st)
-          runSt = advanceCols run st {lsInput = afterRun}
+          runSt = consume (BS.length run) st
           withRun = run : pieces
        in case BC.uncons afterRun of
             Nothing ->
@@ -507,14 +519,11 @@ lexStringLiteral st0 acc = go st0 []
               -- \$$ is two literal dollars (maximal munch): the second $ cannot begin an
               -- interpolation, so $${ does not interpolate (documented Nix behavior).
               '$'
-                | Just '$' <- safeHead rest ->
-                    go (advanceCol 2 runSt {lsInput = BS.drop 1 rest}) ("$$" : withRun)
+                | Just '$' <- safeHead rest -> go (consume 2 runSt) ("$$" : withRun)
                 | Just '{' <- safeHead rest -> finishChunk runSt withRun
-                | otherwise -> go (advanceCol 1 runSt {lsInput = rest}) ("$" : withRun)
+                | otherwise -> go (consume 1 runSt) ("$" : withRun)
               '\\' -> case BC.uncons rest of
-                Just (escaped, rest2) ->
-                  let newSt = advanceEscaped escaped (advanceCol 1 runSt {lsInput = rest2})
-                   in go newSt (escapedBytes escaped : withRun)
+                Just (escaped, _) -> go (consume 2 runSt) (escapedBytes escaped : withRun)
                 Nothing ->
                   Left
                     ParseError
@@ -523,21 +532,15 @@ lexStringLiteral st0 acc = go st0 []
                         peCol = lsCol runSt,
                         peMessage = "unterminated escape in string"
                       }
-              '\n' ->
-                let newSt = runSt {lsInput = rest, lsLine = lsLine runSt + 1, lsCol = 1}
-                 in go newSt ("\n" : withRun)
-              -- The carriage return, the run's one other end.  Raw CR and
-              -- CRLF normalize to LF, matching upstream unescapeStr
+              -- A line ending, the run's one other end.  LF, CRLF and a
+              -- raw CR each read as one LF, matching upstream unescapeStr
               -- (lexer.l).  Only double-quoted strings do this:
               -- indented-string chunks bypass unescapeStr upstream and keep
               -- CR verbatim.  An ESCAPED CR (backslash before it) stays
               -- literal via the escape branch above, also matching upstream.
               _ ->
-                let afterEol = case BC.uncons rest of
-                      Just ('\n', afterCrlf) -> afterCrlf
-                      _ -> rest
-                    newSt = runSt {lsInput = afterEol, lsLine = lsLine runSt + 1, lsCol = 1}
-                 in go newSt ("\n" : withRun)
+                let ending = if "\r\n" `BS.isPrefixOf` afterRun then 2 else 1
+                 in go (consume ending runSt) ("\n" : withRun)
     finishChunk st pieces
       | BS.null chunk = lexStringMode st acc
       | otherwise =
@@ -575,7 +578,7 @@ lexIndStringLiteral st0 acc = go st0
     startInput = lsInput st0
     go st =
       let (run, afterRun) = BC.break endsIndStringRun (lsInput st)
-          runSt = advanceCols run st {lsInput = afterRun}
+          runSt = consume (BS.length run) st
        in case BC.uncons afterRun of
             Nothing ->
               Left
@@ -585,17 +588,16 @@ lexIndStringLiteral st0 acc = go st0
                     peCol = lsCol runSt,
                     peMessage = "unterminated indented string"
                   }
-            Just ('\'', rest)
-              | Just '\'' <- safeHead rest -> finishChunk runSt
-              | otherwise -> go (advanceCol 1 runSt {lsInput = rest})
             Just ('$', rest)
               -- \$$ is two literal dollars; the second cannot begin an
               -- interpolation (matches lexStringLiteral and Nix).
-              | Just '$' <- safeHead rest -> go (advanceCol 2 runSt {lsInput = BS.drop 1 rest})
+              | Just '$' <- safeHead rest -> go (consume 2 runSt)
               | Just '{' <- safeHead rest -> finishChunk runSt
-              | otherwise -> go (advanceCol 1 runSt {lsInput = rest})
-            -- The newline, the run's one other end.
-            Just (_, rest) -> go runSt {lsInput = rest, lsLine = lsLine runSt + 1, lsCol = 1}
+              | otherwise -> go (consume 1 runSt)
+            -- The quote, the run's one other end.
+            Just (_, rest)
+              | Just '\'' <- safeHead rest -> finishChunk runSt
+              | otherwise -> go (consume 1 runSt)
     finishChunk st
       | BS.null chunk = lexIndStringMode st acc
       | otherwise =
@@ -606,7 +608,7 @@ lexIndStringLiteral st0 acc = go st0
 
 -- | The bytes that end a plain run in an indented string.
 endsIndStringRun :: Char -> Bool
-endsIndStringRun c = c == '\'' || c == '$' || c == '\n'
+endsIndStringRun c = c == '\'' || c == '$'
 
 -- ---------------------------------------------------------------------------
 -- Numbers
@@ -623,12 +625,11 @@ lexNumber st acc =
         -- so 12. and 12.e5 are floats, not an integer followed by a dot.
         Just ('.', after2) ->
           let (decimals, after3) = BC.span isDigit after2
-              (expVal, after4, expLen) = lexExponent after3
+              (expVal, expLen) = lexExponent after3
               fullLen = len + 1 + BS.length decimals + expLen
               val = readDouble digits (asciiText decimals) expVal
               tok = Located (lsLine st) (lsCol st) (TokFloat val)
-              newSt = advanceCol fullLen st {lsInput = after4}
-           in lexNormalMode newSt (tok : acc)
+           in lexNormalMode (consume fullLen st) (tok : acc)
         _
           -- C++ Nix rejects out-of-range integer literals rather than
           -- silently wrapping modulo 2^64.  Range is decided by digit
@@ -645,8 +646,7 @@ lexNumber st acc =
           | otherwise ->
               let val = fromIntegral (readInteger digits) :: Int64
                   tok = Located (lsLine st) (lsCol st) (TokInt val)
-                  newSt = advanceCol len st {lsInput = after}
-               in lexNormalMode newSt (tok : acc)
+               in lexNormalMode (consume len st) (tok : acc)
 
 -- | Read an integer from text without using the partial 'read'.
 readInteger :: Text -> Integer
@@ -731,10 +731,10 @@ positiveInfinity :: Double
 positiveInfinity = 1 / 0
 
 -- | Consume an optional exponent @[eE][+-]?[0-9]+@ after a float's digits.
--- Returns the signed exponent, the remaining input, and the characters
--- consumed.  An @e@ not followed by digits is not an exponent (consumes 0), so
--- e.g. @1.5e@ lexes as the float @1.5@ followed by the identifier @e@.
-lexExponent :: ByteString -> (Integer, ByteString, Int)
+-- Returns the signed exponent and the characters consumed.  An @e@ not
+-- followed by digits is not an exponent (consumes 0), so e.g. @1.5e@ lexes
+-- as the float @1.5@ followed by the identifier @e@.
+lexExponent :: ByteString -> (Integer, Int)
 lexExponent input =
   case BC.uncons input of
     Just (e, afterE)
@@ -743,11 +743,11 @@ lexExponent input =
                 Just ('+', rest) -> (1, rest, 1)
                 Just ('-', rest) -> (-1, rest, 1)
                 _ -> (1, afterE, 0)
-              (expDigits, afterExp) = BC.span isDigit afterSign
+              expDigits = BC.takeWhile isDigit afterSign
            in if BS.null expDigits
-                then (0, input, 0)
-                else (sign * exponentMagnitude (asciiText expDigits), afterExp, 1 + signLen + BS.length expDigits)
-    _ -> (0, input, 0)
+                then (0, 0)
+                else (sign * exponentMagnitude (asciiText expDigits), 1 + signLen + BS.length expDigits)
+    _ -> (0, 0)
 
 -- | The magnitude of an exponent's digit run.  Reading n digits builds
 -- an n-digit bignum quadratically, so runs past 'exponentDigitBound'
@@ -778,12 +778,11 @@ lexLeadingDotFloat :: LexState -> [Located] -> Either ParseError [Located]
 lexLeadingDotFloat st acc =
   let afterDot = BS.drop 1 (lsInput st)
       (decimals, after3) = BC.span isDigit afterDot
-      (expVal, after4, expLen) = lexExponent after3
+      (expVal, expLen) = lexExponent after3
       fullLen = 1 + BS.length decimals + expLen
       val = readDouble "" (asciiText decimals) expVal
       tok = Located (lsLine st) (lsCol st) (TokFloat val)
-      newSt = advanceCol fullLen st {lsInput = after4}
-   in lexNormalMode newSt (tok : acc)
+   in lexNormalMode (consume fullLen st) (tok : acc)
 
 -- | Base for decimal digit accumulation.
 decimalBase :: Integer
@@ -800,35 +799,33 @@ zeroOrd = fromEnum '0'
 lexIdentOrKeyword :: LexState -> [Located] -> Either ParseError [Located]
 lexIdentOrKeyword st acc =
   let input = lsInput st
-      (ident, after) = BC.span isIdentChar input
+      ident = BC.takeWhile isIdentChar input
       (uriReading, advancedFloor) = uriSpanFrom (lsNoColonFloor st) input
    in case uriReading of
         -- Flex maximal munch: the URI rule beats identifiers AND keywords
         -- whenever it matches more characters, so @x:y@ is the URI "x:y"
         -- (the classic reason the identity function must be written
         -- @x: x@) and @mailto:a\@b.com@ needs no @//@.
-        Just (uri, afterUri)
+        Just uri
           | BS.length uri > BS.length ident ->
               let tok = Located (lsLine st) (lsCol st) (TokUri (asciiText uri))
-                  newSt = advanceCol (BS.length uri) st {lsInput = afterUri}
-               in lexNormalMode newSt (tok : acc)
+               in lexNormalMode (consume (BS.length uri) st) (tok : acc)
         _ ->
           let tok = Located (lsLine st) (lsCol st) (identToToken ident)
-              newSt = advanceCol (BS.length ident) st {lsInput = after, lsNoColonFloor = advancedFloor}
+              newSt = consume (BS.length ident) st {lsNoColonFloor = advancedFloor}
            in lexNormalMode newSt (tok : acc)
 
 -- | Match upstream's URI token at the start of the input:
 -- @[a-zA-Z][a-zA-Z0-9+.-]*:[uri-char]+@ (lexer.l).  The scheme starts
 -- with a letter (never @_@), and one URI char after the colon suffices -
--- scheme-only URIs like @mailto:x@ count.  Returns the URI bytes and the
--- remaining input.
+-- scheme-only URIs like @mailto:x@ count.  Returns the URI bytes.
 --
 -- Threads the 'lsNoColonFloor' watermark: when the scheme-char run ends
 -- at a NON-colon, no position inside that run can start a URI (a suffix
 -- of the run spans to the same terminator), so the run's end is recorded
 -- and later positions inside it answer Nothing in O(1).  A run ending at
 -- @:@ records nothing - a shorter suffix of it may itself be a URI.
-uriSpanFrom :: Int -> ByteString -> (Maybe (ByteString, ByteString), Int)
+uriSpanFrom :: Int -> ByteString -> (Maybe ByteString, Int)
 uriSpanFrom noColonFloor input
   | BS.length input > noColonFloor = (Nothing, noColonFloor)
   | otherwise = case BC.uncons input of
@@ -839,7 +836,7 @@ uriSpanFrom noColonFloor input
                   Just afterColon
                     | (body, afterUri) <- BC.span isUriChar afterColon,
                       not (BS.null body) ->
-                        (Just (BS.take (BS.length input - BS.length afterUri) input, afterUri), noColonFloor)
+                        (Just (BS.take (BS.length input - BS.length afterUri) input), noColonFloor)
                   Just _ -> (Nothing, noColonFloor)
                   Nothing -> (Nothing, BS.length input - BS.length scheme)
       _ -> (Nothing, noColonFloor)
@@ -867,7 +864,7 @@ lexPath :: LexState -> [Located] -> Either ParseError [Located]
 lexPath st acc =
   let (pathBytes, after) = BC.span isPathChar (lsInput st)
       pathText = asciiText pathBytes
-      newSt = advanceCol (BS.length pathBytes) st {lsInput = after}
+      newSt = consume (BS.length pathBytes) st
    in if "${" `BS.isPrefixOf` after
         then
           -- The literal continues through an interpolation: the head
@@ -893,11 +890,10 @@ lexPathMode st acc
   | "${" `BS.isPrefixOf` lsInput st =
       let tok = Located (lsLine st) (lsCol st) TokInterpOpen
           newSt =
-            advanceCol
+            consume
               2
               st
-                { lsInput = BS.drop 2 (lsInput st),
-                  lsModes = ModeNormal : lsModes st,
+                { lsModes = ModeNormal : lsModes st,
                   -- Fresh count for the interpolation body; the
                   -- enclosing context's count is restored at the
                   -- matching TokInterpClose.
@@ -907,7 +903,7 @@ lexPathMode st acc
        in lexLoop newSt (tok : acc)
   | otherwise =
       let (chunk, after) = BC.span isPathChar (lsInput st)
-          newSt = advanceCol (BS.length chunk) st {lsInput = after}
+          newSt = consume (BS.length chunk) st
           endTok = Located (lsLine newSt) (lsCol newSt) TokPathEnd
           popped = newSt {lsModes = safeTail (lsModes newSt)}
        in if BS.null chunk
@@ -944,11 +940,10 @@ lexSearchPath st acc =
   let after = BS.drop 1 (lsInput st)
       (name, after2) = BC.span isSearchPathChar after
    in case BC.uncons after2 of
-        Just ('>', after3) ->
+        Just ('>', _) ->
           let tok = Located (lsLine st) (lsCol st) (TokSearchPath (asciiText name))
               totalLen = BS.length name + 2 -- < + name + >
-              newSt = advanceCol totalLen st {lsInput = after3}
-           in lexNormalMode newSt (tok : acc)
+           in lexNormalMode (consume totalLen st) (tok : acc)
         _ ->
           -- Not a search path, just '<'
           emit1 st TokLt acc
@@ -958,14 +953,13 @@ lexSearchPath st acc =
 -- ---------------------------------------------------------------------------
 
 skipWhitespace :: LexState -> LexState
-skipWhitespace st =
-  let (spaces, rest) = BC.span isNixSpace (lsInput st)
-   in advanceOver spaces st {lsInput = rest}
+skipWhitespace st = consume (BS.length (BC.takeWhile isNixSpace (lsInput st))) st
 
+-- | Skip a line comment, which ends before the first CR or LF, as
+-- upstream's @\#[^\\r\\n]*@ rule (lexer.l) ends it: the line ending is
+-- whitespace.
 skipLineComment :: LexState -> LexState
-skipLineComment st = case BC.elemIndex '\n' (lsInput st) of
-  Just newline -> st {lsInput = BS.drop (newline + 1) (lsInput st), lsLine = lsLine st + 1, lsCol = 1}
-  Nothing -> st {lsInput = BS.empty}
+skipLineComment st = consume (BS.length (BC.takeWhile (not . isLineEndingByte) (lsInput st))) st
 
 -- | Skip a block comment's body and its @*\/@, the opening @\/*@ already
 -- consumed.  The comment ends at the first @*\/@, as upstream's rule
@@ -973,7 +967,7 @@ skipLineComment st = case BC.elemIndex '\n' (lsInput st) of
 skipBlockComment :: LexState -> Either ParseError LexState
 skipBlockComment st =
   let (body, after) = BS.breakSubstring "*/" (lsInput st)
-      bodySt = advanceOver body st {lsInput = after}
+      bodySt = consume (BS.length body) st
    in if BS.null after
         then
           Left
@@ -983,7 +977,7 @@ skipBlockComment st =
                 peCol = lsCol bodySt,
                 peMessage = "unterminated block comment"
               }
-        else Right (advanceCol 2 bodySt {lsInput = BS.drop 2 after})
+        else Right (consume 2 bodySt)
 
 -- ---------------------------------------------------------------------------
 -- Character predicates
@@ -993,6 +987,10 @@ skipBlockComment st =
 -- a form feed and every non-ASCII space start no token there.
 isNixSpace :: Char -> Bool
 isNixSpace c = c == ' ' || c == '\t' || c == '\r' || c == '\n'
+
+-- | A byte a line ending is made of, CR or LF.
+isLineEndingByte :: Char -> Bool
+isLineEndingByte c = c == '\r' || c == '\n'
 
 -- | An ASCII letter, upstream's @[a-zA-Z]@.
 isAsciiAlpha :: Char -> Bool
@@ -1075,56 +1073,58 @@ asciiText = TE.decodeLatin1
 emit1 :: LexState -> Token -> [Located] -> Either ParseError [Located]
 emit1 st tok acc =
   let located = Located (lsLine st) (lsCol st) tok
-      newSt = advanceCol 1 st {lsInput = BS.drop 1 (lsInput st)}
+      newSt = consume 1 st
    in lexNormalMode newSt (located : acc)
 
 emit2 :: LexState -> Token -> [Located] -> Either ParseError [Located]
 emit2 st tok acc =
   let located = Located (lsLine st) (lsCol st) tok
-      newSt = advanceCol 2 st {lsInput = BS.drop 2 (lsInput st)}
+      newSt = consume 2 st
    in lexNormalMode newSt (located : acc)
 
 emit3 :: LexState -> Token -> [Located] -> Either ParseError [Located]
 emit3 st tok acc =
   let located = Located (lsLine st) (lsCol st) tok
-      newSt = advanceCol 3 st {lsInput = BS.drop 3 (lsInput st)}
+      newSt = consume 3 st
    in lexNormalMode newSt (located : acc)
 
 -- ---------------------------------------------------------------------------
 -- State helpers
 -- ---------------------------------------------------------------------------
 
-advanceCol :: Int -> LexState -> LexState
-advanceCol n st = st {lsCol = lsCol st + n}
+-- | Take the next @n@ bytes of input, moving the position past them.
+consume :: Int -> LexState -> LexState
+consume n st =
+  let (taken, rest) = BS.splitAt n (lsInput st)
+   in advanceOver taken rest st {lsInput = rest}
 
--- | The columns a run of bytes with no newline in it takes: one per byte
--- that does not continue a UTF-8 sequence, so one per character of valid
--- UTF-8.
+-- | The position past bytes taken from the input, @rest@ being the input
+-- after them: each line that ends in them moves it to the start of the
+-- next line, and the bytes after the last ending add their columns.
+advanceOver :: ByteString -> ByteString -> LexState -> LexState
+advanceOver taken rest !st = case afterLineEnding rest taken of
+  Just nextLine -> advanceOver nextLine rest st {lsLine = lsLine st + 1, lsCol = 1}
+  Nothing -> st {lsCol = lsCol st + charColumns taken}
+
+-- | The bytes after the first line ending in bytes taken from the input,
+-- @rest@ being the input after them.  A line ends at an LF, and at a CR
+-- that no LF follows, so a CRLF is one ending, as upstream's
+-- @Pos::LinesIterator@ (position.cc at 2.24.9) splits a source: at the
+-- first CR or LF, a CRLF there taken whole.  A CR the bytes end with
+-- reads the byte after it from @rest@, so a CRLF that two calls of
+-- 'consume' take apart (an escaped CR, then its LF) is still one ending.
+afterLineEnding :: ByteString -> ByteString -> Maybe ByteString
+afterLineEnding rest bytes = case BC.uncons (BC.dropWhile (not . isLineEndingByte) bytes) of
+  Just ('\r', afterCr)
+    | (safeHead afterCr <|> safeHead rest) == Just '\n' -> afterLineEnding rest afterCr
+  Just (_, afterEnding) -> Just afterEnding
+  Nothing -> Nothing
+
+-- | The columns a run of bytes with no line ending in it takes: one per
+-- byte that does not continue a UTF-8 sequence, so one per character of
+-- valid UTF-8.
 charColumns :: ByteString -> Int
 charColumns = BC.foldl' (\n c -> if isContinuationByte c then n else n + 1) 0
-
--- | Advance over a run of bytes with no newline in it.
-advanceCols :: ByteString -> LexState -> LexState
-advanceCols run st = st {lsCol = lsCol st + charColumns run}
-
--- | Advance over a run of bytes that may hold newlines.
-advanceOver :: ByteString -> LexState -> LexState
-advanceOver run st = case BC.elemIndexEnd '\n' run of
-  Nothing -> advanceCols run st
-  Just lastNewline ->
-    st
-      { lsLine = lsLine st + BC.count '\n' run,
-        lsCol = 1 + charColumns (BS.drop (lastNewline + 1) run)
-      }
-
--- | Advance past the byte an escape names: a newline starts a line, a byte
--- continuing a UTF-8 sequence stays in its character's column, and any
--- other byte takes one.
-advanceEscaped :: Char -> LexState -> LexState
-advanceEscaped c st
-  | c == '\n' = st {lsLine = lsLine st + 1, lsCol = 1}
-  | isContinuationByte c = st
-  | otherwise = st {lsCol = lsCol st + 1}
 
 safeHead :: ByteString -> Maybe Char
 safeHead = fmap fst . BC.uncons
