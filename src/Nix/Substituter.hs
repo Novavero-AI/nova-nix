@@ -17,8 +17,13 @@
 --    then re-verify the materialized tree from disk
 -- 7. Register in the store DB with references from narinfo
 --
--- If the cache doesn't have it (404, or another status upstream reads
--- as the file not being there), fall through to building locally.
+-- A cache that lacks the path (404, or another status upstream reads as
+-- the file not being there) is passed over, and what no cache holds
+-- builds locally.  A cache that fails is told apart from one that lacks
+-- the path, as upstream tells them apart: a failed narinfo query and a
+-- substitute that fails to arrive stop the build, unless
+-- 'Nix.Realise.BuildFromSource' (upstream's @fallback@) says to build
+-- instead ("Nix.Realise").
 --
 -- The whole sequence runs under an exclusive per-path lock
 -- ('Nix.Store.Lock'), upstream's pathlocks protocol: taken before any
@@ -69,7 +74,8 @@ module Nix.Substituter
     sortCaches,
     tryCachesWith,
     validateNarInfoFields,
-    narInfoPreflight,
+    NarInfoAnswer (..),
+    judgeNarInfo,
     verifySigs,
     verifyNarHash,
     verifyNarSize,
@@ -91,7 +97,6 @@ where
 import Control.Applicative ((<|>))
 import Control.Exception (Exception, Handler (..), SomeException, catch, catches, onException, throwIO)
 import Control.Monad (void)
-import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (sortBy)
@@ -106,6 +111,7 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
+import Nix.Realise (Fallback (..), Offer (..))
 import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarStream, unpackNarEntry, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
@@ -166,9 +172,14 @@ data SubstResult
     -- is needed.  The caller treats this as success.  No lock rides
     -- along; it was released before returning.
     SubstAlreadyValid
-  | -- | Cache doesn't have this path.
+  | -- | No cache supplied the path, and none failed to.  A cache without
+    -- its narinfo counts, as do one whose narinfo names another path or
+    -- carries no trusted signature, and one whose NAR is gone: upstream
+    -- passes over all of them without failing the substitution.
     SubstNotFound
-  | -- | Download or verification failed.
+  | -- | A cache failed to deliver the path and no cache supplied it, with
+    -- the first failure: the narinfo query, the download, or its
+    -- verification.  Upstream's failed substitution.
     SubstError !Text
   deriving (Eq, Show)
 
@@ -223,54 +234,53 @@ trySubstituteWith policy effects store caches sp = do
               releasePathLock lock
               pure other
 
--- | The references the first willing cache declares for a path, or
--- 'Nothing' when no cache will serve it.  References arrive before the path
--- that names them ('Nix.Realise'), so this runs ahead of any download, and a
--- narinfo has to pass the same identity and signature checks as a
--- substitution before its references are believed.  A cache that fails falls
--- through to the next and says so: the caller goes on to build what no cache
--- serves, and that should not happen in silence.
-queryReferencesWith :: FetchRetryPolicy -> RetryEffects IO -> [CacheConfig] -> StorePath -> IO (Maybe [StorePath])
-queryReferencesWith _ _ [] _ = pure Nothing
-queryReferencesWith policy effects caches sp = do
+-- | What the caches say about a path's references, from the first cache
+-- whose narinfo may be used.  References arrive before the path that names
+-- them ('Nix.Realise'), so this runs ahead of any download, and a narinfo
+-- passes the same checks as a substitution before its references are
+-- believed.
+--
+-- The caches are asked in priority order, as upstream's substitution goal
+-- asks them (@PathSubstitutionGoal::init@ at 2.24.9).  One without the
+-- path is passed over.  So is one whose narinfo names another path or no
+-- trusted key signed, and the scan says why.  A query that fails, once its
+-- retries are spent or on a narinfo that does not validate, ends the scan
+-- with 'QueryFailed' under 'NoFallback', as upstream rethrows it.  Under
+-- 'BuildFromSource' it is reported and passed over, as upstream logs it
+-- and asks the next cache.
+queryReferencesWith :: FetchRetryPolicy -> RetryEffects IO -> Fallback -> [CacheConfig] -> StorePath -> IO Offer
+queryReferencesWith _ _ _ [] _ = pure NotOffered
+queryReferencesWith policy effects fallback caches sp = do
   manager <- HTTPS.getGlobalManager
   firstAnswer manager (sortCaches caches)
   where
-    firstAnswer _ [] = pure Nothing
+    firstAnswer _ [] = pure NotOffered
     firstAnswer manager (cache : rest) = do
       answer <-
-        queryReferencesAt (Retrying policy effects) manager cache sp
-          `catchSync` \err -> pure (Left (Just ("query exception: " <> T.pack (show err))))
+        queryNarInfo (Retrying policy effects) manager cache sp
+          `catchSync` \err -> pure (NarInfoFailed ("query exception: " <> T.pack (show err)))
+      let next = firstAnswer manager rest
+          failed failure = case fallback of
+            NoFallback -> pure (QueryFailed (ccUrl cache <> ": " <> spName sp <> ": " <> failure))
+            BuildFromSource -> reportCache cache sp failure >> next
       case answer of
-        Right references -> pure (Just references)
-        Left Nothing -> firstAnswer manager rest
-        Left (Just failure) -> do
-          TIO.hPutStrLn stderr ("  [subst] " <> ccUrl cache <> ": " <> spName sp <> ": " <> failure)
-          firstAnswer manager rest
+        NarInfoUsable narInfo -> either failed (pure . Offered) (parseReferences (NarInfo.niReferences narInfo))
+        NarInfoAbsent -> next
+        NarInfoPassedOver reason -> reportCache cache sp reason >> next
+        NarInfoFailed failure -> failed failure
 
--- | One cache's answer for a path's references: 'Left' 'Nothing' when it does
--- not hold the path, and a message when it fails or may not serve it.
-queryReferencesAt :: Retrying -> HTTP.Manager -> CacheConfig -> StorePath -> IO (Either (Maybe Text) [StorePath])
-queryReferencesAt retry mgr cache sp = do
-  fetched <- fetchNarInfo retry mgr cache sp
-  pure $ case fetched of
-    Right narInfo -> first Just (referencesServedFor cache sp narInfo)
-    Left (SubstError err) -> Left (Just err)
-    Left _ -> Left Nothing
-
--- | The references of a narinfo, once it passes the checks a substitution
--- would make of it.
-referencesServedFor :: CacheConfig -> StorePath -> NarInfo.NarInfo -> Either Text [StorePath]
-referencesServedFor cache sp narInfo
-  | not (narInfoMatchesPath sp narInfo) = Left ("narinfo names " <> NarInfo.niStorePath narInfo)
-  | otherwise = narInfoPreflight cache narInfo >> parseReferences (NarInfo.niReferences narInfo)
+-- | Say on stderr what one cache did with a path.
+reportCache :: CacheConfig -> StorePath -> Text -> IO ()
+reportCache cache sp message =
+  TIO.hPutStrLn stderr ("  [subst] " <> ccUrl cache <> ": " <> spName sp <> ": " <> message)
 
 -- | Fold per-cache attempts in priority order.  The first success wins and
 -- stops the scan.  An erroring cache falls through to the remaining ones -
 -- a transient failure (DNS, TLS, HTTP 500, unsupported compression) from a
 -- higher-priority cache must not mask a hit in the next - and the first
 -- error, tagged with its cache URL, is reported only when no cache has the
--- path.
+-- path, as upstream's goal fails only once every substituter has been
+-- tried.
 tryCachesWith :: (Monad m) => (CacheConfig -> m SubstResult) -> [CacheConfig] -> m SubstResult
 tryCachesWith attempt = go Nothing
   where
@@ -303,50 +313,72 @@ tryOneCache retry mgr store cache sp lock =
   substituteFromCache retry mgr store cache sp lock
     `catchSync` \err -> pure (SubstError ("substitution exception: " <> T.pack (show err)))
 
--- | Substitution pipeline for a single cache.
---
--- Each step is a pure or IO action that produces @Either@ on failure.
--- The pipeline short-circuits on the first error via early return.
+-- | Substitution pipeline for a single cache: the narinfo, judged
+-- ('queryNarInfo'), then the NAR, streamed ('streamWithRetry').  A narinfo
+-- this build passes over is a miss here without a word, because the
+-- reference query asks every path first and has said why
+-- ('queryReferencesWith').
 substituteFromCache :: Retrying -> HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
 substituteFromCache retry mgr store cache sp lock = do
-  -- 1. Fetch narinfo
-  narInfoResult <- fetchNarInfo retry mgr cache sp
-  case narInfoResult of
-    Left notFoundOrErr -> pure notFoundOrErr
-    Right narInfo
-      -- 1b. The served narinfo must describe the requested path.  A
-      -- misconfigured or hostile cache could return a validly-signed narinfo
-      -- for a DIFFERENT path under this hash's URL.
-      | not (narInfoMatchesPath sp narInfo) ->
-          pure
-            ( SubstError
-                ( "narinfo identity mismatch: requested "
-                    <> spHash sp
-                    <> ", narinfo names "
-                    <> NarInfo.niStorePath narInfo
-                )
-            )
-      | otherwise ->
-          -- 2-4. The pure preflight, then stream: download,
-          -- decompress, hash, parse, and materialize in one bounded
-          -- pass ('streamNarIntoStore').
-          case narInfoPreflight cache narInfo of
-            Left err -> pure (SubstError err)
-            Right () -> streamWithRetry retry mgr store cache sp narInfo lock
+  answer <- queryNarInfo retry mgr cache sp
+  case answer of
+    -- Unsupported compression rejects before the download: the value is
+    -- known from the narinfo, and a multi-hundred-MB download that can
+    -- only fail in decompression is pure waste.  It is still a failed
+    -- substitute, as upstream's decompressor fails one.  The strict
+    -- 'decompressorFor' encodes the same support set; the suite pins
+    -- their agreement.
+    NarInfoUsable narInfo -> case streamingDecompressionSupported (NarInfo.niCompression narInfo) of
+      Left err -> pure (SubstError err)
+      Right () -> streamWithRetry retry mgr store cache sp narInfo lock
+    NarInfoAbsent -> pure SubstNotFound
+    NarInfoPassedOver _ -> pure SubstNotFound
+    NarInfoFailed failure -> pure (SubstError failure)
 
--- | The pure preflight the pipeline runs before any download is paid
--- for, everything decided from the narinfo alone: field validation
--- FIRST - above all before 'verifySigs' builds the signed fingerprint
--- from the fields - then the signature, then streaming decompression
--- support.  Unsupported compression rejects here: the value is known
--- from the narinfo, and a multi-hundred-MB download that can only
--- fail in decompression is pure waste.  The strict 'decompressorFor'
--- encodes the same support set; the suite pins their agreement.
-narInfoPreflight :: CacheConfig -> NarInfo.NarInfo -> Either Text ()
-narInfoPreflight cache narInfo = do
-  validateNarInfoFields narInfo
-  verifySigs cache narInfo
-  streamingDecompressionSupported (NarInfo.niCompression narInfo)
+-- | One cache's narinfo for a path, judged before anything is downloaded.
+data NarInfoAnswer
+  = -- | A narinfo for the path that validates and that a trusted key
+    -- signed.
+    NarInfoUsable !NarInfo.NarInfo
+  | -- | The cache does not hold the path.
+    NarInfoAbsent
+  | -- | A narinfo this build passes over, and why: one naming another
+    -- path, which upstream reads as the path not being in that cache, or
+    -- one no trusted key signed, which it warns about and skips.
+    NarInfoPassedOver !Text
+  | -- | The query failed: the transfer once its retries are spent, a body
+    -- that does not parse or validate, or a trusted key that does not
+    -- parse.
+    NarInfoFailed !Text
+  deriving (Eq, Show)
+
+-- | Fetch a narinfo from a cache under the substitution's retry policy
+-- ('trySubstituteWith') and judge it ('judgeNarInfo').
+queryNarInfo :: Retrying -> HTTP.Manager -> CacheConfig -> StorePath -> IO NarInfoAnswer
+queryNarInfo retry mgr cache sp = do
+  fetched <- retrying retry (fetchNarInfoOnce mgr url)
+  pure $ case fetched of
+    Left failure -> NarInfoFailed (attemptFailureMessage failure)
+    Right Nothing -> NarInfoAbsent
+    Right (Just narInfo) -> judgeNarInfo cache sp narInfo
+  where
+    url = ccUrl cache <> "/" <> spHash sp <> ".narinfo"
+
+-- | Whether a served narinfo may be used, decided from the narinfo alone, in
+-- upstream's order.  The fields validate first, standing in for upstream's
+-- narinfo parser, and above all before 'verifySigs' builds the signed
+-- fingerprint from them.  The narinfo must then describe the requested path
+-- (@goodStorePath@ in @Store::queryPathInfo@ at 2.24.9): a misconfigured or
+-- hostile cache could return a validly signed narinfo for a different path
+-- under this hash's URL.  Last come the trusted keys, which upstream parses
+-- when it checks the signature, and a signature one of them verifies
+-- (@PathSubstitutionGoal::init@).
+judgeNarInfo :: CacheConfig -> StorePath -> NarInfo.NarInfo -> NarInfoAnswer
+judgeNarInfo cache sp narInfo
+  | Left err <- validateNarInfoFields narInfo = NarInfoFailed err
+  | not (narInfoMatchesPath sp narInfo) = NarInfoPassedOver ("narinfo names " <> NarInfo.niStorePath narInfo)
+  | Left err <- trustedKeys cache = NarInfoFailed err
+  | otherwise = either NarInfoPassedOver (const (NarInfoUsable narInfo)) (verifySigs cache narInfo)
 
 -- | Validate narinfo field syntax before anything consumes the fields -
 -- above all before 'verifySigs' builds the signed fingerprint from them.
@@ -594,20 +626,6 @@ readBodyCapped cap reader = go [] 0
                 then pure Nothing
                 else go (chunk : chunks) newTotal
 
--- | Fetch a narinfo from a cache, each request under the substitution's
--- retry policy ('trySubstituteWith').  Returns @Left SubstNotFound@ when
--- the cache does not hold it, @Left (SubstError msg)@ on any other
--- failure, a transient one once the policy has spent its attempts.
-fetchNarInfo :: Retrying -> HTTP.Manager -> CacheConfig -> StorePath -> IO (Either SubstResult NarInfo.NarInfo)
-fetchNarInfo retry mgr cache sp = do
-  fetched <- retrying retry (fetchNarInfoOnce mgr url)
-  pure $ case fetched of
-    Left failure -> Left (SubstError (attemptFailureMessage failure))
-    Right Nothing -> Left SubstNotFound
-    Right (Just narInfo) -> Right narInfo
-  where
-    url = ccUrl cache <> "/" <> spHash sp <> ".narinfo"
-
 -- | One narinfo request: @Right Nothing@ when the cache does not hold
 -- it.  A 'NotFound' or 'Forbidden' answer (404, 410, 401, 403, 407) is
 -- the cache saying so, not a failure to retry: upstream's transfer layer
@@ -653,7 +671,7 @@ fetchNarInfoOnce mgr url = fetch `catches` transferFailureHandlers url
 -- transfer that verifies wrong, a body past its signed ceiling, a
 -- status upstream never retries, a write the disk refused - ends the
 -- attempt at once: retrying a deterministic failure only delays the
--- local-build fallback.  Every attempt starts from a clean slate
+-- outcome.  Every attempt starts from a clean slate
 -- ('streamNarIntoStore' clears the destination first, and every
 -- failure path, exceptions included, removes what it wrote), so a retry
 -- restarts the NAR from its first byte, where upstream resumes from the
@@ -661,17 +679,20 @@ fetchNarInfoOnce mgr url = fetch `catches` transferFailureHandlers url
 -- only a transfer that wrote nothing yet.  A NAR the narinfo named and
 -- the cache answers 'NotFound' or 'Forbidden' for is gone: one request,
 -- as upstream's @SubstituteGone@ (@BinaryCacheStore::narFromPath@ at
--- 2.24.9), and an error the cache scan falls through to the next cache
--- and then to a local build, as upstream's substitution goal treats a
--- gone substitute like one that never existed.  A narinfo the cache does
--- not hold is a miss handled earlier in 'fetchNarInfo' and never reaches
+-- 2.24.9), reported and then a miss the cache scan passes over, because
+-- upstream's substitution goal treats a gone substitute like one that
+-- never existed rather than as a failure.  A narinfo the cache does not
+-- hold is a miss handled earlier in 'queryNarInfo' and never reaches
 -- here.
 streamWithRetry :: Retrying -> HTTP.Manager -> Store -> CacheConfig -> StorePath -> NarInfo.NarInfo -> PathLock -> IO SubstResult
 streamWithRetry retry mgr store cache sp narInfo lock = do
   outcome <- retrying retry (streamNarIntoStore mgr cache store sp narInfo)
-  pure $ case outcome of
-    Right registration -> SubstSuccess registration lock
-    Left failure -> SubstError (attemptFailureMessage failure)
+  case outcome of
+    Right (Just registration) -> pure (SubstSuccess registration lock)
+    Right Nothing -> do
+      reportCache cache sp ("file '" <> NarInfo.niUrl narInfo <> "' does not exist in the binary cache")
+      pure SubstNotFound
+    Left failure -> pure (SubstError (attemptFailureMessage failure))
 
 -- | Thrown inside the streaming pipeline where a chunk convention has
 -- no error channel (the capped body source); converted back to the
@@ -707,8 +728,9 @@ tryAttempt url action =
 -- classifies what escapes it).  The narinfo metadata registration
 -- needs (declared hash, references, deriver) still parses BEFORE the
 -- first byte downloads: a malformed narinfo must not leave an
--- unpacked-but-unregistered path behind.
-streamNarIntoStore :: HTTP.Manager -> CacheConfig -> Store -> StorePath -> NarInfo.NarInfo -> IO (Either AttemptFailure PathRegistration)
+-- unpacked-but-unregistered path behind.  'Nothing' when the cache no
+-- longer holds the NAR ('streamWithRetry').
+streamNarIntoStore :: HTTP.Manager -> CacheConfig -> Store -> StorePath -> NarInfo.NarInfo -> IO (Either AttemptFailure (Maybe PathRegistration))
 streamNarIntoStore mgr cache store sp narInfo = case preflight of
   Left err -> pure (Left (FatalFailure err))
   Right (declaredDigest, refs, deriver, downloadCap) -> do
@@ -720,10 +742,10 @@ streamNarIntoStore mgr cache store sp narInfo = case preflight of
       withTransfer request mgr $ \response -> do
         let status = HTTP.responseStatus response
         if status /= HTTP.status200
-          then pure (Left (fetchStatusFailure narUrl status))
+          then pure (unservedNar narUrl status)
           else do
             source <- cappedBodySource downloadCap (HTTP.responseBody response)
-            materializeNarFromSource store sp narInfo declaredDigest refs deriver source
+            fmap Just <$> materializeNarFromSource store sp narInfo declaredDigest refs deriver source
   where
     preflight = do
       declaredDigest <- case Hash.parseNixHash (NarInfo.niNarHash narInfo) of
@@ -733,6 +755,17 @@ streamNarIntoStore mgr cache store sp narInfo = case preflight of
       deriver <- parseDeriver (stDir store) (NarInfo.niDeriver narInfo)
       downloadCap <- downloadCapFor narInfo
       pure (declaredDigest, refs, deriver, downloadCap)
+
+-- | A NAR response that is not a success.  'NotFound' and 'Forbidden' mean
+-- the cache no longer holds the NAR, as upstream's binary cache store
+-- reads both (@HttpBinaryCacheStore::getFile@ at 2.24.9); any other status
+-- is a failure, retried when upstream retries it.
+unservedNar :: Text -> HTTP.Status -> Either AttemptFailure (Maybe PathRegistration)
+unservedNar narUrl status = case statusError status of
+  NotFound -> Right Nothing
+  Forbidden -> Right Nothing
+  Misc -> Left (fetchStatusFailure narUrl status)
+  Transient -> Left (fetchStatusFailure narUrl status)
 
 -- | The byte cap on the compressed NAR body, derived from the SIGNED
 -- NarSize: the Ed25519 fingerprint covers StorePath, NarHash, NarSize,
@@ -961,18 +994,22 @@ sortCaches = sortBy (comparing ccPriority)
 
 -- | Verify narinfo signatures against the cache's trusted public keys.
 -- Accepts when at least one signature verifies under at least one key,
--- upstream's any-trusted-key rule.  A malformed key is an error rather
--- than a silently skipped one: upstream rejects the configuration, so a
--- typo cannot quietly narrow the trusted set to the keys that parsed.
+-- upstream's any-trusted-key rule.
 verifySigs :: CacheConfig -> NarInfo.NarInfo -> Either Text ()
 verifySigs cache narInfo =
   case NarInfo.niSigs narInfo of
     [] -> Left "narinfo has no signatures"
     sigs -> do
-      keys <- traverse parseKey (ccPublicKeys cache)
+      keys <- trustedKeys cache
       if any (\key -> any (Signing.verify key narInfo) sigs) keys
         then Right ()
         else Left "no valid signature found"
+
+-- | The cache's trusted public keys.  A malformed key is an error rather
+-- than a silently skipped one: upstream rejects the configuration, so a
+-- typo cannot quietly narrow the trusted set to the keys that parsed.
+trustedKeys :: CacheConfig -> Either Text [Signing.PublicKey]
+trustedKeys = traverse parseKey . ccPublicKeys
   where
     parseKey raw = case Signing.parsePublicKey raw of
       Left err -> Left ("invalid public key: " <> T.pack err)

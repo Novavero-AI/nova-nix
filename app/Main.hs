@@ -44,6 +44,7 @@ import Nix.Expr.Types (Expr)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
+import Nix.Realise (Fallback (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
@@ -84,6 +85,8 @@ data CliOpts = CliOpts
     optPureEval :: !Bool,
     -- | @--trace-verbose@: upstream's trace-verbose, turned on for this run.
     optTraceVerbose :: !Bool,
+    -- | @--fallback@: upstream's fallback, turned on for this run.
+    optFallback :: !Bool,
     optCommand :: !Command
   }
 
@@ -140,7 +143,7 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing False []
 -- silent drop: an unknown or typo'd flag once ended parsing and quietly
 -- discarded everything after it (e.g. a requested @--substituter@).
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False False CmdUsage)
+parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False False False CmdUsage)
   where
     go opts [] = Right opts
     -- Answered before anything else is looked at, and the rest of the line
@@ -168,6 +171,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       go (opts {optPureEval = True}) rest
     go opts ("--trace-verbose" : rest) =
       go (opts {optTraceVerbose = True}) rest
+    go opts ("--fallback" : rest) =
+      go (opts {optFallback = True}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : rest) = goBuild opts emptyBuildArgs rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
@@ -192,6 +197,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       goEval (opts {optPureEval = True}) rest
     goEval opts ("--trace-verbose" : rest) =
       goEval (opts {optTraceVerbose = True}) rest
+    goEval opts ("--fallback" : rest) =
+      goEval (opts {optFallback = True}) rest
     goEval opts ("--expr" : expr : rest) =
       go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
     goEval _ [flag]
@@ -224,6 +231,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       goBuild (opts {optPureEval = True}) buildArgs rest
     goBuild opts buildArgs ("--trace-verbose" : rest) =
       goBuild (opts {optTraceVerbose = True}) buildArgs rest
+    goBuild opts buildArgs ("--fallback" : rest) =
+      goBuild (opts {optFallback = True}) buildArgs rest
     goBuild opts buildArgs ("--expr" : expr : rest) =
       withTarget opts buildArgs (TargetExpr (T.pack expr)) rest
     goBuild opts buildArgs (flag : path : rest)
@@ -458,6 +467,7 @@ usageLines =
     "  --store DIR            Use DIR as the store (default: the platform store)",
     "  --substituter URL      Try this binary cache before building",
     "  --trusted-key K        Public key (name:base64) for the substituter",
+    "  --fallback             Build from source if substitution fails",
     "  --restrict-eval        Confine reads to the search path roots and what the",
     "                         evaluation itself writes; fetch only allowed-uris",
     "  --pure-eval            Confine reads as --restrict-eval does, with no search",
@@ -467,9 +477,9 @@ usageLines =
     "  --trace-verbose        Make builtins.traceVerbose behave as builtins.trace;",
     "                         without it, the first argument is never forced",
     "",
-    "  substituters, trusted-public-keys, max-call-depth, restrict-eval,",
-    "  pure-eval, allowed-uris and trace-verbose also read from nix.conf, in",
-    "  upstream's order: $NIX_CONF_DIR (default " <> systemConfDirName <> "),",
+    "  substituters, trusted-public-keys, fallback, max-call-depth,",
+    "  restrict-eval, pure-eval, allowed-uris and trace-verbose also read from",
+    "  nix.conf, in upstream's order: $NIX_CONF_DIR (default " <> systemConfDirName <> "),",
     "  the XDG nix/nix.conf files or $NIX_USER_CONF_FILES, then $NIX_CONFIG;",
     "  the flags above add to whatever those configure.",
     "",
@@ -700,7 +710,7 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
           -- builtins.toFile wrote these during evaluation but could not
           -- register them; a derivation naming one needs them valid first.
           materializeEvalStoreWrites store storeWrites
-          buildResult <- buildAndRegister store caches wrappers drvClosure drv drvSP
+          buildResult <- buildAndRegister store caches (fallbackFor opts config) wrappers drvClosure drv drvSP
           -- The root is registered before the handle closes: the handle's
           -- lease is what keeps a concurrent collection from running
           -- between the build's end and the link's creation.  The path
@@ -799,6 +809,13 @@ configToCaches config =
       }
   | url <- ncSubstituters config
   ]
+
+-- | What a failed substitute leads to on this run.  The flag only turns
+-- fallback on, as upstream's does, so it adds to the config's setting.
+fallbackFor :: CliOpts -> NixConfig -> Fallback
+fallbackFor opts config
+  | optFallback opts || ncFallback config = BuildFromSource
+  | otherwise = NoFallback
 
 -- | The caches from the resolved config plus the CLI flags.  The CLI
 -- @--substituter@ and @--trusted-key@ append on top, the highest
@@ -965,8 +982,8 @@ checkExecWrappers = Map.traverseWithKey check
 -- | Write the .drv file to the store and build with dependency resolution.
 -- The drvPath is the store path of the .drv file itself, extracted from
 -- the evaluation result alongside the Derivation struct.
-buildAndRegister :: Store -> [CacheConfig] -> Map.Map T.Text FilePath -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
-buildAndRegister store caches wrappers drvClosure drv drvSP = do
+buildAndRegister :: Store -> [CacheConfig] -> Fallback -> Map.Map T.Text FilePath -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
+buildAndRegister store caches fallback wrappers drvClosure drv drvSP = do
   -- Materialize the full input-.drv closure (every transitive dependency's
   -- recipe) to the store.  buildWithDeps reads these back to construct the
   -- dependency graph; without them it cannot realize any non-leaf derivation.
@@ -980,6 +997,7 @@ buildAndRegister store caches wrappers drvClosure drv drvSP = do
         (defaultBuildConfig (stDir store))
           { bcTmpDir = tmpDir,
             bcCaches = caches,
+            bcFallback = fallback,
             bcExecWrappers = wrappers
           }
   buildWithDeps config store drv drvSP
