@@ -179,6 +179,12 @@ builder is started. NTFS has no executable bit, so nova-nix keeps it in an
 alternate data stream. A store path therefore serializes to the same NAR, with
 the same hash, as it does on other platforms.
 
+On Windows a path with a root but no drive, such as `/src/default.nix`, names
+that path on the store's drive: `C:` for the default `C:\nix\store`, or the
+drive of the directory `--store` names, whatever drive is current. It keeps its
+spelling as a value, so `toString /src/default.nix` is `"/src/default.nix"`. A
+`/nix/store` path names the store directory itself.
+
 ## Library
 
 ```haskell

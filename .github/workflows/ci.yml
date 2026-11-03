@@ -495,6 +495,43 @@ jobs:
       - name: Install nova-nix
         run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
 
+      # A rooted path with no drive names the store's drive, C: for the
+      # default C:\nix\store, so it reads the same file from every current
+      # drive.  The file exists on C: only, so a pass from D:\ cannot come
+      # from D:.
+      - name: A path with no drive reads from the store's drive
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\bin\nova-nix.exe"
+          $fixture = 'C:\probe\f.txt'
+          [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fixture)) | Out-Null
+          [IO.File]::WriteAllText($fixture, 'probe')
+          if (-not [IO.File]::Exists($fixture)) { Write-Error "fixture $fixture was not created"; exit 1 }
+          if ([IO.File]::Exists('D:\probe\f.txt')) { Write-Error "D:\probe\f.txt exists, so D: would answer too"; exit 1 }
+          $exprs = @(
+            'builtins.pathExists "/probe/f.txt"',
+            'builtins.pathExists /probe/f.txt',
+            'builtins.readFile "/probe/f.txt" == "probe"',
+            'builtins.pathExists "C:/probe/f.txt"',
+            'builtins.pathExists "C:\\probe\\f.txt"'
+          )
+          foreach ($dir in 'C:\', 'D:\') {
+            foreach ($expr in $exprs) {
+              Push-Location $dir
+              try {
+                $got = (& $exe eval --expr $expr) -join "`n"
+                $code = $LASTEXITCODE
+              } finally {
+                Pop-Location
+              }
+              Write-Host "from ${dir}: $expr -> $got"
+              if ($code -ne 0 -or $got -ne 'true') {
+                Write-Error "from ${dir}, $expr gave '$got' (exit $code), expected true"
+                exit 1
+              }
+            }
+          }
+
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null

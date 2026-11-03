@@ -39,6 +39,7 @@ module Nix.Eval.Policy
     -- * Allowed URIs
     isAllowedUri,
     uriAccess,
+    fileUrlPrefix,
     forbiddenUriMessage,
   )
 where
@@ -50,6 +51,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.CanonPath (canonPathValue)
+import Nix.Store.Path (StoreDir, qualifyPathText)
 
 -- ---------------------------------------------------------------------------
 -- Policy
@@ -152,7 +154,10 @@ driveDesignatorLength = 2
 -- | Whether a path's text is rooted: a leading @/@, or a drive designator
 -- (a canonical Windows path value spells @C:/...@).  The gates refuse
 -- anything else, since a relative path would be checked against one
--- location and opened at another.
+-- location and opened at another.  A leading @/@ with no drive is fixed
+-- in place too: on Windows it names the store directory's drive
+-- ('Nix.Store.Path.qualifyPathText'), which the gates check and the
+-- reads open.
 isAbsolutePath :: Text -> Bool
 isAbsolutePath path = T.isPrefixOf "/" path || hasDrive
   where
@@ -213,9 +218,11 @@ schemePunctuation = "+.-"
 -- a @file://@ URL, is checked against the allowed paths instead
 -- (upstream passes the remainder through @CanonPath@, so a rootless
 -- remainder is rooted, and one that spells a drive, @file://C:/...@, is
--- rooted already); anything else is refused.
-uriAccess :: EvalPolicy -> AllowedPaths -> Text -> Either Text ()
-uriAccess policy allowed uri
+-- rooted already); anything else is refused.  The path is checked on the
+-- drive the given store directory puts it on ('qualifyPathText'), the
+-- one the fetch reads it from.
+uriAccess :: StoreDir -> EvalPolicy -> AllowedPaths -> Text -> Either Text ()
+uriAccess storeDir policy allowed uri
   | not (epRestrictEval policy) = Right ()
   | isAllowedUri (epAllowedUris policy) uri = Right ()
   | T.isPrefixOf "/" uri = pathAccess uri
@@ -224,9 +231,10 @@ uriAccess policy allowed uri
   where
     rooted rest = if isAbsolutePath rest then rest else "/" <> rest
     pathAccess path =
-      let canonical = canonPathValue path
+      let canonical = qualifyPathText storeDir (canonPathValue path)
        in if isAllowedPath allowed canonical then Right () else Left (forbiddenPathMessage policy canonical)
 
+-- | What a local file URL begins with, its path or its drive after it.
 fileUrlPrefix :: Text
 fileUrlPrefix = "file://"
 

@@ -76,6 +76,10 @@ module Nix.Eval
     checkGitRev,
     gitInputUrl,
 
+    -- * What a fetch hands its tool (exported for tests)
+    localFileUrl,
+    gitRemote,
+
     -- * Remembered fetches (pure, exported for tests)
     FetchCache (..),
     fetchCacheKey,
@@ -133,7 +137,7 @@ import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
-import Nix.Eval.Policy (isAbsolutePath)
+import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printValue)
 import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
@@ -3551,6 +3555,7 @@ fetchAndExtractTarball :: (MonadEval m) => Text -> Maybe Text -> Text -> m NixVa
 fetchAndExtractTarball url mSha256 name = do
   checkUri url
   requireFetchPin "fetchTarball" mSha256
+  toolUrl <- localFileUrl url
   extractDir <- createScratchDir "nova-nix-tarball-"
   -- The -- separator prevents argument injection from the URL.
   (code, _, errOut) <-
@@ -3559,7 +3564,7 @@ fetchAndExtractTarball url mSha256 name = do
       [ "-c",
         "curl -sSfL -- \"$1\" | tar -xz -C \"$2\" --strip-components=1",
         "--",
-        url,
+        toolUrl,
         extractDir
       ]
       ""
@@ -3979,8 +3984,9 @@ fetchGitInClone args checkedRef checkedRev cloneDir = do
         (Just pinned, _, _) -> pinned
         (Nothing, True, Just ref) -> ref
         _ -> fetchHeadRef
+  remote <- gitRemote url
   _ <- git ["init", "--quiet", "."]
-  _ <- git ["remote", "add", "origin", "--", url]
+  _ <- git ["remote", "add", "origin", "--", remote]
   -- @--@ before the remote: git keeps parsing options after it, so
   -- without a separator a refspec is indistinguishable from a flag.
   _ <- git (["fetch", "--quiet"] ++ depthArgs ++ updateHeadArgs ++ ["--", "origin", fetchTarget])
@@ -4154,6 +4160,16 @@ gitRun ctx cloneDir args = do
     then pure (T.strip out)
     else throwEvalError (ctx <> ": git " <> T.unwords args <> " failed: " <> err)
 
+-- | The remote git is handed for a fetch's url: a local path, bare or as
+-- a file URL, named on the drive the evaluator reads it on, where git,
+-- run in the scratch clone, would read it on that directory's drive.  A
+-- url with any other scheme, or an scp-like remote, is handed over as
+-- given.
+gitRemote :: (MonadEval m) => Text -> m Text
+gitRemote url
+  | T.isInfixOf "://" url = localFileUrl url
+  | otherwise = qualifyPath url
+
 -- | Strip every @.git@ entry (clone's own, and each submodule's) before the
 -- tree is copied to the store.  Walked directly, not shelled out to
 -- @find@\/@rm@: no @sh@ on a bare Windows install.
@@ -4204,7 +4220,8 @@ fetchUrlSimple url mSha256 = do
 downloadInto :: (MonadEval m) => Text -> Text -> m BS.ByteString
 downloadInto scratch url = do
   let tmpFile = scratch <> "/" <> downloadFileName
-  (code, _, stderr) <- runProcess "curl" ["-sSfL", "-o", tmpFile, "--", url] ""
+  toolUrl <- localFileUrl url
+  (code, _, stderr) <- runProcess "curl" ["-sSfL", "-o", tmpFile, "--", toolUrl] ""
   if code /= 0
     then throwEvalError ("builtins.fetchurl: fetch failed: " <> stderr)
     else readFileBytes tmpFile
@@ -4212,6 +4229,16 @@ downloadInto scratch url = do
 -- | The downloaded file's name inside its scratch directory.
 downloadFileName :: Text
 downloadFileName = "download"
+
+-- | The URL a fetch hands its tool: a @file://@ URL's path named on the
+-- drive the evaluator reads it on ('qualifyPath'), so the tool reads the
+-- file 'checkUri' checked rather than one on its own current drive.  A
+-- drive it gains is spelled @file://C:/...@, the form 'checkUri' reads as
+-- that drive's path.  Any other URL is handed over as given.
+localFileUrl :: (MonadEval m) => Text -> m Text
+localFileUrl url = case T.stripPrefix fileUrlPrefix url of
+  Just path -> (fileUrlPrefix <>) <$> qualifyPath path
+  Nothing -> pure url
 
 -- | Upstream's pure-mode rule for @fetchurl@ and @fetchTarball@
 -- (fetchTree.cc): without a @sha256@ the fetch is refused, since its
