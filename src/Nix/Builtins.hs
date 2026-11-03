@@ -122,13 +122,20 @@ standardEntries policy timestamp searchPaths =
       -- /nix/store spelling on every platform, and storeDir must agree
       -- with them (upstream returns the store dir its paths are under).
       ("storeDir", evaluated (mkStr defaultStoreDirText)),
-      ("nixVersion", evaluated (mkStr "2.24.0")),
+      ("nixVersion", evaluated (mkStr targetNixVersion)),
       ("langVersion", evaluated (VInt 6)),
       ("nixPath", evaluated (VList (clistFromThunks (map thunkToCPtr searchPaths)))),
       ("derivation", derivationWrapper)
     ]
       ++ [("currentTime", evaluated (VInt timestamp)) | not (epPureEval policy)]
       ++ [("currentSystem", evaluated (mkStr currentSystemStr)) | not (epPureEval policy)]
+
+-- | The Nix release whose behaviour the evaluator matches, reported as
+-- @builtins.nixVersion@.  Upstream reports its own build's version
+-- (@nixVersion@, globals.cc at 2.24.9), so an expression that branches on
+-- the value takes the branch it takes on that release.
+targetNixVersion :: Text
+targetNixVersion = "2.24.9"
 
 -- ---------------------------------------------------------------------------
 -- The derivation constant

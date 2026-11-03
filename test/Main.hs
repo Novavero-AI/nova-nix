@@ -2439,7 +2439,7 @@ testBatch1 = do
       runTest "storeDir" $
         assertEval "storeDir" "builtins.storeDir" (mkStr defaultStoreDirText),
       runTest "nixVersion" $
-        assertEval "nixVersion" "builtins.nixVersion" (mkStr "2.24.0"),
+        assertEval "nixVersion" "builtins.nixVersion" (mkStr "2.24.9"),
       runTest "langVersion" $
         assertEval "langVersion" "builtins.langVersion" (VInt 6),
       runTest "nixPath" $
