@@ -452,11 +452,11 @@ checkRecordedNarHash recorded narHash sp = case recorded of
           )
     | otherwise -> Right ()
 
--- | Recorded and computed NAR hashes match when their decoded digests
--- agree, so any valid spelling of one digest matches (a foreign cache
--- may record base16 where local hashing renders nix-base32).  A
--- recorded value no spelling parses falls back to exact text equality,
--- keeping legacy rows comparable rather than un-checkable.
+-- | Recorded and computed NAR hashes match when both parse as
+-- @sha256:@ and nix-base32 and their decoded digests agree.  A recorded
+-- value that does not parse, such as a foreign cache's base16, falls
+-- back to exact text equality, keeping legacy rows comparable rather
+-- than un-checkable.
 narHashMatches :: Text -> Text -> Bool
 narHashMatches recorded computed =
   case (Hash.parseNixHash recorded, Hash.parseNixHash computed) of

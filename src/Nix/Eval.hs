@@ -5599,8 +5599,8 @@ xmlAttr (name, value) = " " <> BB.byteString name <> "=\"" <> BC.foldr (\c rest 
 -- | @builtins.path { path; name?; filter?; sha256?; recursive?; }@
 --
 -- Copy a path to the store and return the store path as a string with
--- context.  @name@ defaults to the basename of @path@.  @filter@ is
--- accepted but not yet applied (copies everything).
+-- context.  @name@ defaults to the basename of @path@.  @filter@, when
+-- given, decides which entries are copied ('filteredSourceNar').
 builtinPath :: (MonadEval m) => NixValue -> m NixValue
 builtinPath (VAttrs attrs) = do
   -- prim_path coerces the attribute with coerceToPath and checks for it
