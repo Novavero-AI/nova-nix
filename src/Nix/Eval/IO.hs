@@ -184,8 +184,9 @@ data EvalState = EvalState
     -- with nothing to restore.
     esCallDepth :: !CallDepth,
     -- | What this evaluation may reach: upstream's @restrict-eval@ and
-    -- @pure-eval@ settings and the @allowed-uris@ list.  Unrestricted
-    -- unless the caller says otherwise, as upstream's defaults are.
+    -- @pure-eval@ settings and the @allowed-uris@ list, and its
+    -- @trace-verbose@ setting.  Unrestricted unless the caller says
+    -- otherwise, as upstream's defaults are.
     esPolicy :: !EvalPolicy,
     -- | The allowed path prefixes under a restricting policy: the search
     -- path roots the caller seeded with 'allowEvalPath', plus every store

@@ -1,5 +1,7 @@
 -- | The evaluation policy: upstream's @restrict-eval@ and @pure-eval@
--- settings, the @allowed-uris@ list, and the pure decisions they drive.
+-- settings, the @allowed-uris@ list, and the pure decisions they drive,
+-- plus the @trace-verbose@ setting, which decides what
+-- @builtins.traceVerbose@ does.
 --
 -- Upstream gates evaluation in two layers (@src/libexpr/eval.cc@ at
 -- 2.24.9).  Under either setting the root filesystem is wrapped in an
@@ -53,10 +55,11 @@ import Nix.Eval.CanonPath (canonPathValue)
 -- Policy
 -- ---------------------------------------------------------------------------
 
--- | What an evaluation may reach.  The two flags are independent, as
--- upstream's settings are: @pure-eval@ does not imply the URI check
--- (@checkURI@ consults @restrictEval@ alone), and @restrict-eval@ does
--- not hide the impure constants or empty the search path.
+-- | What an evaluation may reach, and whether @builtins.traceVerbose@
+-- traces.  The two modes are independent, as upstream's settings are:
+-- @pure-eval@ does not imply the URI check (@checkURI@ consults
+-- @restrictEval@ alone), and @restrict-eval@ does not hide the impure
+-- constants or empty the search path.
 data EvalPolicy = EvalPolicy
   { -- | Upstream @restrict-eval@: filesystem reads are confined to the
     -- allowed prefixes, @getEnv@ answers empty, and a fetch must match
@@ -68,13 +71,17 @@ data EvalPolicy = EvalPolicy
     epPureEval :: !Bool,
     -- | Upstream @allowed-uris@: prefixes a fetch may reach under
     -- @restrict-eval@.
-    epAllowedUris :: ![Text]
+    epAllowedUris :: ![Text],
+    -- | Upstream @trace-verbose@: @builtins.traceVerbose@ traces as
+    -- @builtins.trace@ does, where otherwise it returns its second
+    -- argument without forcing its first.
+    epTraceVerbose :: !Bool
   }
   deriving (Eq, Show)
 
--- | Upstream's default: both settings off, nothing listed.
+-- | Upstream's default: every setting off, nothing listed.
 unrestrictedPolicy :: EvalPolicy
-unrestrictedPolicy = EvalPolicy {epRestrictEval = False, epPureEval = False, epAllowedUris = []}
+unrestrictedPolicy = EvalPolicy {epRestrictEval = False, epPureEval = False, epAllowedUris = [], epTraceVerbose = False}
 
 -- | Whether filesystem access goes through the allow list: upstream wraps
 -- the root filesystem when either setting is on.

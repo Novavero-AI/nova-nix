@@ -13826,6 +13826,14 @@ evalChild source = do
   result <- evalNixIO "." (T.pack source)
   either (\err -> hPutStrLn stderr ("error: " <> T.unpack err)) (const (pure ())) result
 
+-- | Evaluate the source in a child process running 'evalChild' and
+-- compare the lines it wrote to stderr with the expected ones.
+emits :: Text -> Text -> [Text] -> IO Bool
+emits label source expected = runTestM label $ do
+  self <- getExecutablePath
+  (_, _, err) <- Proc.readCreateProcessWithExitCode (Proc.proc self [evalChildFlag, T.unpack source]) ""
+  pure (assertEqual label expected (T.lines (T.pack err)))
+
 -- | @deepSeq@, @trace@ and @warn@ finish with their first argument before
 -- they force their second (primops.cc at 2.24.9), however the second
 -- arrives.  Each expected stream is nix-instantiate 2.24.9's: its trace
@@ -13833,10 +13841,6 @@ evalChild source = do
 testFirstArgumentOrderIO :: IO [Bool]
 testFirstArgumentOrderIO = do
   putStrLn "eval/first-argument-order-io"
-  self <- getExecutablePath
-  let emits label source expected = runTestM label $ do
-        (_, _, err) <- Proc.readCreateProcessWithExitCode (Proc.proc self [evalChildFlag, T.unpack source]) ""
-        pure (assertEqual label expected (T.lines (T.pack err)))
   sequence
     [ emits "trace prints before its second argument fails" "builtins.trace \"hi\" (throw \"b\")" ["trace: hi", "error: b"],
       emits "warn warns before its second argument fails" "builtins.warn \"w\" (throw \"b\")" ["evaluation warning: w", "error: b"],
@@ -13844,6 +13848,34 @@ testFirstArgumentOrderIO = do
       emits "deepSeq applied to one argument first forces it on the second" "let f = builtins.deepSeq { a = throw \"a\"; }; in f (throw \"b\")" ["error: a"],
       emits "deepSeq mapped over a list forces its first argument first" "builtins.elemAt (map (builtins.deepSeq { a = throw \"a\"; }) [ (throw \"b\") ]) 0" ["error: a"],
       emits "trace inside deepSeq sees the forced value" "let x = { a = 1 + 1; }; in builtins.deepSeq x (builtins.trace x 1)" ["trace: { a = 2; }"]
+    ]
+
+-- | Without @trace-verbose@, upstream binds @builtins.traceVerbose@ to
+-- @prim_second@ (primops.cc at 2.24.9), which forces and returns its
+-- second argument and never forces its first, whether it is applied
+-- directly, through a partial application, or to an element a
+-- higher-order builtin passes unforced.  The pure cases evaluate under
+-- the default policy; the streams are what an IO evaluation writes to
+-- stderr, where a trace would go.
+testTraceVerboseOff :: IO [Bool]
+testTraceVerboseOff = do
+  putStrLn "eval/trace-verbose-off"
+  sequence
+    [ runTest "traceVerbose returns its second argument without forcing its first" $
+        assertEval "direct" "builtins.traceVerbose (throw \"a\") 1" (VInt 1),
+      runTest "traceVerbose applied to one argument is a partial application, its argument unforced" $
+        assertEvalError
+          "partial"
+          "{} // builtins.traceVerbose (throw \"a\")"
+          "expected a set but found the partially applied built-in function 'traceVerbose': \x00ABpartially applied primop traceVerbose\x00BB",
+      runTest "traceVerbose's partial application mapped over a list leaves its argument unforced" $
+        assertEval "mapped" "builtins.elemAt (map (builtins.traceVerbose (throw \"a\")) [ 1 ]) 0" (VInt 1),
+      runTest "traceVerbose given an unforced list element as its first argument leaves it unforced" $
+        assertEval "unforced-element" "builtins.foldl' (acc: builtins.traceVerbose) 0 [ (throw \"a\") ] 5" (VInt 5),
+      runTest "traceVerbose forces its second argument" $
+        assertEvalError "second" "builtins.traceVerbose 1 (throw \"b\")" "b",
+      emits "traceVerbose prints nothing" "builtins.traceVerbose \"hi\" 1" [],
+      emits "traceVerbose prints nothing before its second argument fails" "builtins.traceVerbose \"hi\" (throw \"b\")" ["error: b"]
     ]
 
 -- | The smallest slot count whose byte size exceeds @UINT32_MAX@.
@@ -16597,6 +16629,7 @@ runSuite = do
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
           testFirstArgumentOrderIO,
+          testTraceVerboseOff,
           testStorePathLinksIO,
           testDeepContextClosureIO,
           testDerivationFields,
@@ -17052,9 +17085,11 @@ testEvalPolicyIO = do
       maybe (unsetEnv "XDG_CACHE_HOME") (setEnv "XDG_CACHE_HOME") savedCacheHome
       pure results
 
--- | The flags and settings through the binary: the modes select
--- themselves from the command line and from NIX_CONFIG, and a refusal
--- surfaces as the eval error it is.
+-- | The flags and settings through the binary: the modes and
+-- @trace-verbose@ select themselves from the command line and from
+-- NIX_CONFIG, and a refusal surfaces as the eval error it is.  Under
+-- @trace-verbose@, @builtins.traceVerbose@ is upstream's @prim_trace@
+-- (primops.cc at 2.24.9).
 testEvalPolicyCLI :: IO [Bool]
 testEvalPolicyCLI = do
   putStrLn "cli/eval-policy"
@@ -17090,6 +17125,12 @@ testEvalPolicyCLI = do
             if code /= ExitSuccess && needle `T.isInfixOf` T.pack err
               then Pass
               else Fail ("expected a failure mentioning " <> needle <> ", got " <> T.pack (show (code, err)))
+      -- The whole run: the exit code, then stdout and stderr line by line.
+      expectRun label extraConfig args expected =
+        runTestM ("CLI " <> label) $ do
+          (code, out, err) <- runCLI extraConfig args
+          pure (assertEqual label expected (code, lines out, lines err))
+      traceVerboseHi = ["eval", "--expr", "builtins.traceVerbose \"hi\" 1"]
   bracket_
     ( do
         forceRemoveIfExists root
@@ -17105,7 +17146,13 @@ testEvalPolicyCLI = do
         expectOut "a --nix-path root is readable under --restrict-eval" "" ["eval", "--restrict-eval", "--nix-path", "allowed=" ++ allowed, "--expr", "builtins.readFile <allowed/data.txt>"] "\"hello\\n\"",
         expectErr "a read outside the roots fails the command" "" ["eval", "--restrict-eval", "--expr", "builtins.readFile \"" ++ outsideFile ++ "\""] "is forbidden in restricted mode",
         expectErr "a channel: search path entry allows nothing" "" ["eval", "--restrict-eval", "--nix-path", "nixpkgs=channel:nova-probe", "--expr", "builtins.readFile \"" ++ cwdChannelEntry ++ "\""] "is forbidden in restricted mode",
-        expectOut "build accepts the flag before its target" "" ["build", "--pure-eval", "--help"] "Usage: nova-nix [--nix-path NAME=PATH] <command>"
+        expectOut "build accepts the flag before its target" "" ["build", "--pure-eval", "--help"] "Usage: nova-nix [--nix-path NAME=PATH] <command>",
+        expectRun "traceVerbose prints nothing by default" "" traceVerboseHi (ExitSuccess, ["1"], []),
+        expectRun "--trace-verbose makes traceVerbose trace" "" ("--trace-verbose" : traceVerboseHi) (ExitSuccess, ["1"], ["trace: hi"]),
+        expectRun "trace-verbose from NIX_CONFIG makes traceVerbose trace" "trace-verbose = true\n" traceVerboseHi (ExitSuccess, ["1"], ["trace: hi"]),
+        expectRun "under --trace-verbose traceVerbose forces its first argument" "" ["eval", "--trace-verbose", "--expr", "builtins.traceVerbose (throw \"a\") 1"] (ExitFailure 1, [], ["error: a"]),
+        expectRun "under --trace-verbose traceVerbose prints before its second argument fails" "" ["eval", "--trace-verbose", "--expr", "builtins.traceVerbose \"hi\" (throw \"b\")"] (ExitFailure 1, [], ["trace: hi", "error: b"]),
+        expectOut "build accepts --trace-verbose before its target" "" ["build", "--trace-verbose", "--help"] "Usage: nova-nix [--nix-path NAME=PATH] <command>"
       ]
 
 -- | The eval result through the binary: stdout carries the printer's bytes

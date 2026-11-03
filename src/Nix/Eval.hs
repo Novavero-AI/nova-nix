@@ -604,7 +604,8 @@ evalBcApp env bcIdx0
 
 -- | Apply an evaluated function to the argument at a bytecode index,
 -- inside the caller's frame.  The argument stays a thunk for a lambda
--- (the normal laziness) and is forced for a builtin, which forces anyway.
+-- (the normal laziness) and is forced for a builtin, which forces anyway,
+-- except for the first argument of a @traceVerbose@ that does not trace.
 callBc :: (MonadEval m) => Env -> Word32 -> NixValue -> m NixValue
 callBc env argIdx funcVal = case funcVal of
   VLambda closureEnv formals bodyBcIdx -> do
@@ -612,6 +613,7 @@ callBc env argIdx funcVal = case funcVal of
     extEnv <- matchFormals closureEnv formals argThunk
     evalBytecode extEnv bodyBcIdx
   VBuiltin "tryEval" [] -> tryEvalAction (evalBytecode env argIdx)
+  VBuiltin "traceVerbose" [] -> traceVerboseFirst (evalBytecode env argIdx)
   VBuiltin name [first]
     | Just finishFirst <- beforeSecondArgument name first -> finishFirst >> evalBytecode env argIdx
   VBuiltin name accArgs -> do
@@ -1359,8 +1361,8 @@ builtinRegistry =
       builtin2 "addErrorContext" (\_ val -> pure val),
       -- Attr position (return null - nixpkgs handles this gracefully)
       builtin2 "unsafeGetAttrPos" (\_ _ -> pure VNull),
-      -- Debugging (traceVerbose: same as trace for now, --trace-verbose not yet gated)
-      builtin2 "traceVerbose" builtinTrace,
+      -- Debugging
+      builtin2 "traceVerbose" builtinTraceVerbose,
       builtin1 "break" pure,
       -- IO: file hashing + type detection
       builtin2 "hashFile" builtinHashFile,
@@ -1458,6 +1460,7 @@ applyUnforced (VLambda closureEnv formals bodyBcIdx) argThunk = do
 -- map/filter passing a throwing element to tryEval yields success = false,
 -- not an escaped error.
 applyUnforced (VBuiltin "tryEval" []) argThunk = tryEvalAction (force argThunk)
+applyUnforced (VBuiltin "traceVerbose" []) argThunk = traceVerboseFirst (force argThunk)
 applyUnforced (VBuiltin name [first]) argThunk
   | Just finishFirst <- beforeSecondArgument name first = finishFirst >> force argThunk
 applyUnforced other argThunk = do
@@ -1589,8 +1592,8 @@ executeBuiltin name args = case name of
   "addErrorContext" -> apply2 (\_ val -> pure val)
   -- Attr position (return null - nixpkgs handles this gracefully)
   "unsafeGetAttrPos" -> apply2 (\_ _ -> pure VNull)
-  -- Debugging (traceVerbose: same as trace for now)
-  "traceVerbose" -> apply2 builtinTrace
+  -- Debugging
+  "traceVerbose" -> apply2 builtinTraceVerbose
   "break" -> apply1 pure
   -- IO: file hashing + type detection
   "hashFile" -> apply2 builtinHashFile
@@ -3001,13 +3004,15 @@ builtinDeepSeq first second = deepForce first >> pure second
 -- | What a builtin returning its second argument does with its first
 -- before it forces that second: @prim_deepSeq@ forces the first deeply,
 -- @prim_trace@ prints it and @prim_warn@ warns with it, and only then does
--- each force the second (primops.cc at 2.24.9).  A builtin's arguments
--- are forced before it runs, so an application that has the second still
--- unforced does this first.
+-- each force the second (primops.cc at 2.24.9).  @traceVerbose@ is
+-- @prim_trace@ under @trace-verbose@ and otherwise @prim_second@, which
+-- does nothing first.  A builtin's arguments are forced before it runs,
+-- so an application that has the second still unforced does this first.
 beforeSecondArgument :: (MonadEval m) => Text -> NixValue -> Maybe (m ())
 beforeSecondArgument name first = case name of
   "deepSeq" -> Just (deepForce first)
   "trace" -> Just (emitTrace first)
+  "traceVerbose" -> Just (whenTraceVerbose (emitTrace first))
   "warn" -> Just (emitWarning first)
   _ -> Nothing
 
@@ -3028,6 +3033,39 @@ emitTrace :: (MonadEval m) => NixValue -> m ()
 emitTrace msgVal = traceMessage . ("trace: " <>) $ case msgVal of
   VStr s _ -> bytesToTextLossy s
   other -> printValue PrintInFull other
+
+-- | @builtins.traceVerbose msg val@: @builtins.trace@ under
+-- @trace-verbose@, and otherwise @val@ alone.  Upstream binds the name to
+-- @prim_trace@ or to @prim_second@ by the setting (primops.cc at 2.24.9).
+builtinTraceVerbose :: (MonadEval m) => NixValue -> NixValue -> m NixValue
+builtinTraceVerbose msgVal result = whenTraceVerbose (emitTrace msgVal) >> pure result
+
+-- | Run the action only under @trace-verbose@.
+whenTraceVerbose :: (MonadEval m) => m () -> m ()
+whenTraceVerbose action = do
+  policy <- evalPolicy
+  when (epTraceVerbose policy) action
+
+-- | @builtins.traceVerbose@ taking its first argument, given the action
+-- that forces it.  Under @trace-verbose@ the argument is forced, as
+-- @prim_trace@ forces it.  Otherwise it is not: @prim_second@ never
+-- forces its first argument (primops.cc at 2.24.9), so
+-- @traceVerbose (throw "a") 1@ is @1@.  A partial application holds
+-- forced values, so that one holds 'discardedArgument' in its place.
+traceVerboseFirst :: (MonadEval m) => m NixValue -> m NixValue
+traceVerboseFirst forceFirst = do
+  policy <- evalPolicy
+  if epTraceVerbose policy
+    then forceFirst >>= applyBuiltin "traceVerbose" []
+    else pure (VBuiltin "traceVerbose" [discardedArgument])
+
+-- | What a partial application of @prim_second@ holds for the first
+-- argument it never forces.  Nothing reads it: the policy is fixed for an
+-- evaluation, so the application that takes the second argument does not
+-- trace either.  It only counts the argument as taken, so the application
+-- prints as upstream's partially applied primop.
+discardedArgument :: NixValue
+discardedArgument = VNull
 
 -- | @builtins.warn msg val@ - print warning to stderr, return @val@.
 --

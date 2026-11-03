@@ -1410,9 +1410,10 @@ class (Monad m) => MonadEval m where
 
   -- | The policy this evaluation runs under.  The builtins whose behaviour
   -- upstream changes by setting consult it: @storePath@ is refused and the
-  -- fetchers demand a hash or revision under @pure-eval@, and a search path
-  -- miss is worded for the mode.  The filesystem and URI gates are not
-  -- decided here; they live in the instance, where the allowed set is.
+  -- fetchers demand a hash or revision under @pure-eval@, a search path
+  -- miss is worded for the mode, and @traceVerbose@ traces only under
+  -- @trace-verbose@.  The filesystem and URI gates are not decided here;
+  -- they live in the instance, where the allowed set is.
   evalPolicy :: m EvalPolicy
 
   -- | Upstream @checkURI@: refuse a fetch of this URI under @restrict-eval@

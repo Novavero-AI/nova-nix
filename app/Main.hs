@@ -82,6 +82,8 @@ data CliOpts = CliOpts
     optRestrictEval :: !Bool,
     -- | @--pure-eval@: upstream's pure-eval, turned on for this run.
     optPureEval :: !Bool,
+    -- | @--trace-verbose@: upstream's trace-verbose, turned on for this run.
+    optTraceVerbose :: !Bool,
     optCommand :: !Command
   }
 
@@ -138,7 +140,7 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing False []
 -- silent drop: an unknown or typo'd flag once ended parsing and quietly
 -- discarded everything after it (e.g. a requested @--substituter@).
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False CmdUsage)
+parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False False CmdUsage)
   where
     go opts [] = Right opts
     -- Answered before anything else is looked at, and the rest of the line
@@ -164,6 +166,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Cm
       go (opts {optRestrictEval = True}) rest
     go opts ("--pure-eval" : rest) =
       go (opts {optPureEval = True}) rest
+    go opts ("--trace-verbose" : rest) =
+      go (opts {optTraceVerbose = True}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : rest) = goBuild opts emptyBuildArgs rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
@@ -186,6 +190,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Cm
       goEval (opts {optRestrictEval = True}) rest
     goEval opts ("--pure-eval" : rest) =
       goEval (opts {optPureEval = True}) rest
+    goEval opts ("--trace-verbose" : rest) =
+      goEval (opts {optTraceVerbose = True}) rest
     goEval opts ("--expr" : expr : rest) =
       go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
     goEval _ [flag]
@@ -216,6 +222,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Cm
       goBuild (opts {optRestrictEval = True}) buildArgs rest
     goBuild opts buildArgs ("--pure-eval" : rest) =
       goBuild (opts {optPureEval = True}) buildArgs rest
+    goBuild opts buildArgs ("--trace-verbose" : rest) =
+      goBuild (opts {optTraceVerbose = True}) buildArgs rest
     goBuild opts buildArgs ("--expr" : expr : rest) =
       withTarget opts buildArgs (TargetExpr (T.pack expr)) rest
     goBuild opts buildArgs (flag : path : rest)
@@ -456,12 +464,14 @@ usageLines =
     "                         path, no currentTime, currentSystem or storePath, and",
     "                         pinned fetches only (allowed-uris applies only under",
     "                         --restrict-eval)",
+    "  --trace-verbose        Make builtins.traceVerbose behave as builtins.trace;",
+    "                         without it, the first argument is never forced",
     "",
     "  substituters, trusted-public-keys, max-call-depth, restrict-eval,",
-    "  pure-eval and allowed-uris also read from nix.conf, in upstream's",
-    "  order: $NIX_CONF_DIR (default " <> systemConfDirName <> "), the XDG",
-    "  nix/nix.conf files or $NIX_USER_CONF_FILES, then $NIX_CONFIG; the",
-    "  flags above add to whatever those configure.",
+    "  pure-eval, allowed-uris and trace-verbose also read from nix.conf, in",
+    "  upstream's order: $NIX_CONF_DIR (default " <> systemConfDirName <> "),",
+    "  the XDG nix/nix.conf files or $NIX_USER_CONF_FILES, then $NIX_CONFIG;",
+    "  the flags above add to whatever those configure.",
     "",
     "  --help                 Print this text and exit",
     "  --version              Print the version and exit"
@@ -491,15 +501,16 @@ exprSourceName :: T.Text
 exprSourceName = "<expr>"
 
 -- | The evaluation policy for this run: the config cascade's settings,
--- with either flag turning its mode on.  A flag only turns a mode on, so
--- a machine configured for pure evaluation stays that way whatever the
+-- with each flag turning its setting on.  A flag only turns a setting on,
+-- so a machine configured for pure evaluation stays that way whatever the
 -- command line says, which is the direction a confinement should fail in.
 evalPolicyFor :: CliOpts -> NixConfig -> EvalPolicy
 evalPolicyFor opts config =
   EvalPolicy
     { epRestrictEval = optRestrictEval opts || ncRestrictEval config,
       epPureEval = optPureEval opts || ncPureEval config,
-      epAllowedUris = ncAllowedUris config
+      epAllowedUris = ncAllowedUris config,
+      epTraceVerbose = optTraceVerbose opts || ncTraceVerbose config
     }
 
 -- | The evaluation state and root environment for one command.  Upstream's
