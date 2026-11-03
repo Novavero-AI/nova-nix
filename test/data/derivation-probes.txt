@@ -1,0 +1,171 @@
+# What a program can observe of `derivation`, probed with nova-nix and
+# with upstream Nix by .github/parity/derivation-cases.sh, which also reads
+# the rows known to differ from derivation-divergences.txt.  Each line is a
+# kind, an id the divergence list names the row by, then Nix source:
+#
+#   argument  an argument for derivation
+#   probe     an expression of `w` (derivation itself), `args` (an argument)
+#             and `d` (w applied to args), evaluated for every argument
+#   imported  a whole expression, evaluated from a file of its own
+#
+# The probes read the pattern and the name it binds, which builtin forces
+# `outputs` and in what order, each attribute forced alone, the paths and
+# their contexts, and equality between the output sets and with the
+# arguments.  Upstream's `==` forces both sides before it takes one value
+# as equal to itself, where nova-nix's takes a shared thunk as equal
+# without forcing it; the equality probes show both.  Each leaves out the
+# attributes that differ by design, so its result does not depend on the
+# order attribute names were interned in.
+#
+# The first arguments cover one kind each.  The rest mix the same
+# ingredients: names the wrapper defines or lists as outputs, values that
+# throw or are functions, structured attributes, and an `outputs` that is
+# absent, well formed or malformed.
+
+# One kind each.
+argument a001 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; }
+argument a002 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "dev" "out" "lib" ]; }
+argument a003 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; outputs = [ "out" "dev" ]; xs = [ 1 "a" ]; }
+argument a004 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "out" "dev" ]; x = throw "unforced"; }
+argument a005 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "out" "all" ]; type = "t"; all = 1; drvAttrs = 2; drvPath = 3; outPath = 4; outputName = 5; out = 6; }
+argument a006 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; f = x: x; }
+argument a007 { name = "w"; system = "x86_64-linux"; }
+argument a008 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "out" "out" ]; }
+argument a009 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "out" 1 ]; }
+argument a010 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ (throw "the first") "out" (throw "the last") ]; }
+argument a011 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "out" "name" ]; }
+argument a012 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ ]; }
+argument a013 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = "out"; }
+argument a014 42
+
+# Mixed.
+argument a015 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "name" ]; __structuredAttrs = false; }
+argument a016 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvAttrs" (builtins.appendContext "doc" { "/nix/store/00000000000000000000000000000000-a" = { path = true; }; }) "dev" ]; all = true; drvAttrs = "v"; drvPath = (throw "unforced drvPath"); outPath = true; outputName = null; dev = { a = 1; }; x = "v"; }
+argument a017 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvAttrs" "all" "outPath" ]; __structuredAttrs = false; drvAttrs = "v"; drvPath = [ "a" "b" ]; outPath = { a = 1; }; type = true; out = 1; dev = null; }
+argument a018 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "type" ]; __structuredAttrs = false; drvAttrs = true; drvPath = null; outputName = true; out = "v"; x = (x: x); }
+argument a019 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvAttrs" "name" "lib" ]; __structuredAttrs = true; all = (x: x); drvAttrs = true; drvPath = [ "a" "b" ]; out = (x: x); x = (throw "unforced x"); }
+argument a020 { name = "w"; builder = "/bin/sh"; __structuredAttrs = true; drvAttrs = [ "a" "b" ]; drvPath = true; dev = true; x = (x: x); }
+argument a021 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "lib" ]; __structuredAttrs = false; drvAttrs = { a = 1; }; drvPath = [ "a" "b" ]; x = (x: x); }
+argument a022 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ (builtins.appendContext "doc" { "/nix/store/00000000000000000000000000000000-a" = { path = true; }; }) "lib" "outputName" ]; __ignoreNulls = true; all = "v"; drvAttrs = 1; type = [ "a" "b" ]; out = "v"; dev = "v"; x = 1; }
+argument a023 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvAttrs" "out" "drvAttrs" ]; drvAttrs = (x: x); outputName = true; dev = "v"; }
+argument a024 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "name" "all" ]; __structuredAttrs = true; drvAttrs = { a = 1; }; type = { a = 1; }; dev = { a = 1; }; x = true; }
+argument a025 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outputName" "dev" ]; all = (x: x); outputName = [ "a" "b" ]; out = true; x = null; }
+argument a026 { system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "type" "dev" ]; drvPath = { a = 1; }; outPath = null; outputName = "v"; type = null; dev = null; }
+argument a027 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outPath" "type" "out" "outPath" ]; __ignoreNulls = true; drvAttrs = [ "a" "b" ]; drvPath = 1; outPath = [ "a" "b" ]; outputName = (throw "unforced outputName"); out = 1; dev = "v"; }
+argument a028 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "name" ]; outPath = null; type = true; dev = "v"; x = [ "a" "b" ]; }
+argument a029 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "bin" "name" "drvPath" ]; __ignoreNulls = true; drvAttrs = null; type = "v"; out = "v"; }
+argument a030 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = throw "the outputs"; __structuredAttrs = false; all = (x: x); drvAttrs = (throw "unforced drvAttrs"); drvPath = true; outPath = (x: x); outputName = (x: x); out = null; }
+argument a031 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "bin" ]; drvAttrs = (x: x); drvPath = [ "a" "b" ]; outPath = true; type = (throw "unforced type"); out = "v"; dev = [ "a" "b" ]; }
+argument a032 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = "out"; __structuredAttrs = false; __ignoreNulls = true; all = null; drvAttrs = "v"; drvPath = 1; outPath = null; outputName = 1; dev = [ "a" "b" ]; }
+argument a033 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outPath" "type" "bin" ]; __structuredAttrs = false; drvAttrs = 1; outPath = [ "a" "b" ]; outputName = { a = 1; }; type = 1; out = "v"; dev = (x: x); x = "v"; }
+argument a034 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ (builtins.appendContext "doc" { "/nix/store/00000000000000000000000000000000-a" = { path = true; }; }) (builtins.appendContext "doc" { "/nix/store/00000000000000000000000000000000-a" = { path = true; }; }) "out" ]; drvAttrs = "v"; outputName = true; type = 1; dev = (throw "unforced dev"); x = [ "a" "b" ]; }
+argument a035 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; drvPath = "v"; outPath = null; outputName = true; type = (x: x); dev = 1; x = 1; }
+argument a036 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = "out"; all = "v"; drvAttrs = null; outPath = 1; type = (x: x); out = (x: x); x = true; }
+argument a037 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = throw "the outputs"; __structuredAttrs = true; all = "v"; drvAttrs = 1; drvPath = null; type = "v"; out = null; dev = (x: x); x = "v"; }
+argument a038 { name = "w"; system = "x86_64-linux"; outputs = [ "dev" "type" "outputName" ]; drvPath = [ "a" "b" ]; outputName = 1; type = 1; out = "v"; x = [ "a" "b" ]; }
+argument a039 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "type" "bin" "drvAttrs" ]; drvAttrs = "v"; outPath = 1; outputName = null; dev = [ "a" "b" ]; x = true; }
+argument a040 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; all = (x: x); drvPath = (throw "unforced drvPath"); outPath = [ "a" "b" ]; type = 1; out = (throw "unforced out"); dev = true; x = { a = 1; }; }
+argument a041 { name = "w"; system = "x86_64-linux"; outputs = [ "outPath" "drvPath" ]; drvAttrs = { a = 1; }; drvPath = true; outPath = (x: x); type = { a = 1; }; out = 1; }
+argument a042 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvPath" "out" ]; drvAttrs = true; type = (throw "unforced type"); dev = null; x = true; }
+argument a043 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "dev" "lib" ]; __structuredAttrs = true; all = { a = 1; }; out = 1; dev = 1; }
+argument a044 { name = "w"; system = "x86_64-linux"; __structuredAttrs = true; all = 1; drvAttrs = "v"; type = [ "a" "b" ]; out = true; dev = 1; }
+argument a045 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; drvPath = true; outputName = (x: x); type = 1; out = { a = 1; }; dev = { a = 1; }; }
+argument a046 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = false; __ignoreNulls = true; drvAttrs = [ "a" "b" ]; dev = (x: x); }
+argument a047 { system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvPath" "type" "drvAttrs" ]; __structuredAttrs = false; drvAttrs = (throw "unforced drvAttrs"); drvPath = null; outPath = (x: x); outputName = null; type = 1; x = [ "a" "b" ]; }
+argument a048 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; drvPath = true; type = true; x = "v"; }
+argument a049 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "lib" "out" "lib" ]; drvAttrs = (x: x); outPath = null; outputName = (x: x); type = (x: x); x = { a = 1; }; }
+argument a050 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ 1 "name" "type" ]; drvPath = { a = 1; }; outputName = "v"; out = 1; x = (throw "unforced x"); }
+argument a051 { name = "w"; system = "x86_64-linux"; outputs = [ "drvAttrs" "bin" ]; outPath = [ "a" "b" ]; type = { a = 1; }; out = null; x = (throw "unforced x"); }
+argument a052 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "out" ]; __structuredAttrs = false; all = (throw "unforced all"); drvAttrs = (throw "unforced drvAttrs"); drvPath = (x: x); outputName = (throw "unforced outputName"); type = 1; out = [ "a" "b" ]; dev = (x: x); }
+argument a053 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvAttrs" "lib" "outPath" ]; outPath = (throw "unforced outPath"); type = "v"; dev = (x: x); x = { a = 1; }; }
+argument a054 { name = "w"; system = "x86_64-linux"; outputs = [ ]; __structuredAttrs = false; drvAttrs = (x: x); drvPath = [ "a" "b" ]; outPath = [ "a" "b" ]; outputName = (throw "unforced outputName"); out = (throw "unforced out"); dev = null; }
+argument a055 { name = "w"; builder = "/bin/sh"; outputs = [ "drvPath" ]; __ignoreNulls = true; all = true; drvPath = { a = 1; }; outputName = [ "a" "b" ]; type = (x: x); out = [ "a" "b" ]; dev = (throw "unforced dev"); x = [ "a" "b" ]; }
+argument a056 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "name" "name" ]; all = null; drvAttrs = (throw "unforced drvAttrs"); drvPath = { a = 1; }; outputName = { a = 1; }; out = null; x = true; }
+argument a057 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "lib" "all" "out" "lib" ]; __structuredAttrs = true; all = "v"; drvAttrs = { a = 1; }; drvPath = "v"; outputName = null; type = null; }
+argument a058 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "name" ]; __structuredAttrs = false; __ignoreNulls = true; drvAttrs = true; drvPath = (throw "unforced drvPath"); outPath = 1; outputName = null; type = "v"; dev = 1; x = true; }
+argument a059 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "dev" "outputName" ]; __structuredAttrs = false; __ignoreNulls = true; all = null; drvPath = true; outPath = null; outputName = (x: x); type = null; dev = true; x = (throw "unforced x"); }
+argument a060 { system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; out = (throw "unforced out"); }
+argument a061 { name = "w"; builder = "/bin/sh"; __structuredAttrs = false; all = (throw "unforced all"); drvAttrs = (x: x); out = null; dev = 1; x = 1; }
+argument a062 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvPath" "drvAttrs" "all" ]; all = true; drvAttrs = 1; outPath = (x: x); outputName = 1; out = (x: x); x = 1; }
+argument a063 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "lib" "name" "all" ]; __ignoreNulls = true; all = { a = 1; }; drvAttrs = (throw "unforced drvAttrs"); drvPath = (throw "unforced drvPath"); outputName = (throw "unforced outputName"); out = [ "a" "b" ]; }
+argument a064 { name = "w"; builder = "/bin/sh"; outputs = [ "bin" ]; __structuredAttrs = true; all = (x: x); drvAttrs = "v"; drvPath = { a = 1; }; outputName = 1; out = 1; x = 1; }
+argument a065 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvPath" ]; __structuredAttrs = true; all = 1; outPath = "v"; outputName = "v"; type = null; out = [ "a" "b" ]; x = 1; }
+argument a066 { system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; all = true; drvAttrs = (x: x); outPath = null; outputName = { a = 1; }; type = true; }
+argument a067 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "name" ]; outPath = true; type = true; }
+argument a068 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvPath" "out" "bin" ]; __structuredAttrs = false; __ignoreNulls = true; drvPath = (x: x); outPath = null; outputName = (x: x); type = (x: x); out = (throw "unforced out"); }
+argument a069 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outputName" "type" (builtins.appendContext "doc" { "/nix/store/00000000000000000000000000000000-a" = { path = true; }; }) "out" ]; all = 1; dev = 1; x = (throw "unforced x"); }
+argument a070 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; all = { a = 1; }; drvAttrs = "v"; drvPath = 1; outPath = { a = 1; }; type = (throw "unforced type"); }
+argument a071 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = false; all = null; drvAttrs = [ "a" "b" ]; drvPath = (x: x); outPath = null; out = [ "a" "b" ]; dev = (x: x); x = 1; }
+argument a072 throw "the argument"
+argument a073 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; __ignoreNulls = true; all = [ "a" "b" ]; drvAttrs = true; out = null; x = true; }
+argument a074 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __ignoreNulls = true; drvAttrs = null; drvPath = [ "a" "b" ]; outPath = { a = 1; }; type = { a = 1; }; dev = (x: x); }
+argument a075 { system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outPath" "drvAttrs" "outPath" ]; all = null; outPath = (throw "unforced outPath"); type = [ "a" "b" ]; }
+argument a076 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvAttrs" "name" ]; __structuredAttrs = true; drvPath = { a = 1; }; outputName = true; dev = true; x = (throw "unforced x"); }
+argument a077 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outputName" "outPath" ]; __structuredAttrs = true; drvAttrs = (x: x); drvPath = 1; dev = (throw "unforced dev"); x = 1; }
+argument a078 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "bin" "type" "drvAttrs" ]; outPath = { a = 1; }; outputName = "v"; type = [ "a" "b" ]; out = "v"; dev = null; x = (throw "unforced x"); }
+argument a079 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = throw "the outputs"; __structuredAttrs = false; __ignoreNulls = true; drvPath = [ "a" "b" ]; out = null; dev = [ "a" "b" ]; }
+argument a080 { system = "x86_64-linux"; builder = "/bin/sh"; drvPath = null; outPath = (throw "unforced outPath"); outputName = (x: x); type = [ "a" "b" ]; out = null; dev = { a = 1; }; x = true; }
+argument a081 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "lib" ]; drvAttrs = null; outputName = (throw "unforced outputName"); type = (throw "unforced type"); out = "v"; }
+argument a082 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "type" "outputName" ]; drvPath = "v"; type = true; out = (x: x); dev = true; x = 1; }
+argument a083 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "bin" "type" ]; all = null; out = (throw "unforced out"); }
+argument a084 { name = "w"; builder = "/bin/sh"; outputs = [ "dev" ]; all = 1; drvAttrs = "v"; drvPath = { a = 1; }; outPath = 1; type = null; out = "v"; dev = null; x = true; }
+argument a085 { name = "w"; outputs = [ "out" "outputName" ]; __ignoreNulls = true; drvAttrs = 1; outPath = true; type = true; out = true; x = null; }
+argument a086 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "all" ]; drvPath = true; outPath = (x: x); out = (x: x); dev = true; }
+argument a087 { name = "w"; builder = "/bin/sh"; outputs = [ "outputName" "dev" "drvPath" ]; __structuredAttrs = true; all = (throw "unforced all"); out = true; dev = null; }
+argument a088 null
+argument a089 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; drvAttrs = [ "a" "b" ]; outPath = 1; out = 1; dev = (throw "unforced dev"); x = "v"; }
+argument a090 42
+argument a091 { name = "w"; builder = "/bin/sh"; outputs = [ "outPath" "type" ]; drvAttrs = 1; drvPath = (x: x); outPath = "v"; type = null; }
+argument a092 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "drvAttrs" ]; drvAttrs = true; outPath = { a = 1; }; outputName = (throw "unforced outputName"); dev = { a = 1; }; }
+argument a093 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; all = null; drvPath = true; out = 1; dev = true; }
+argument a094 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ (builtins.appendContext "doc" { "/nix/store/00000000000000000000000000000000-a" = { path = true; }; }) "type" ]; x = { a = 1; }; }
+argument a095 { system = "x86_64-linux"; outputs = [ "all" ]; __ignoreNulls = true; drvPath = { a = 1; }; outPath = 1; type = { a = 1; }; dev = "v"; x = "v"; }
+argument a096 { name = "w"; builder = "/bin/sh"; all = { a = 1; }; drvAttrs = "v"; outputName = 1; }
+argument a097 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outputName" ]; __structuredAttrs = false; all = (throw "unforced all"); drvPath = (throw "unforced drvPath"); outputName = (throw "unforced outputName"); type = { a = 1; }; out = [ "a" "b" ]; dev = 1; }
+argument a098 [ ]
+argument a099 { name = "w"; builder = "/bin/sh"; outputs = [ "type" ]; __structuredAttrs = false; all = true; drvAttrs = (throw "unforced drvAttrs"); outPath = true; outputName = "v"; out = "v"; dev = [ "a" "b" ]; x = 1; }
+argument a100 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outputName" "drvAttrs" ]; __structuredAttrs = false; __ignoreNulls = true; drvAttrs = null; drvPath = "v"; outputName = true; }
+argument a101 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; drvAttrs = null; drvPath = 1; type = (x: x); out = 1; x = "v"; }
+argument a102 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = false; drvAttrs = "v"; drvPath = [ "a" "b" ]; outPath = (throw "unforced outPath"); dev = (x: x); x = "v"; }
+argument a103 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "type" ]; all = { a = 1; }; drvAttrs = (x: x); drvPath = (throw "unforced drvPath"); x = { a = 1; }; }
+argument a104 { name = "w"; builder = "/bin/sh"; outputs = [ "dev" ]; __structuredAttrs = false; all = (x: x); drvAttrs = [ "a" "b" ]; drvPath = 1; dev = [ "a" "b" ]; x = [ "a" "b" ]; }
+argument a105 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = false; drvPath = { a = 1; }; outputName = null; type = 1; out = (throw "unforced out"); }
+argument a106 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "all" ]; __structuredAttrs = false; outPath = null; type = (x: x); dev = "v"; x = true; }
+argument a107 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "type" ]; __structuredAttrs = true; drvAttrs = (x: x); drvPath = 1; outPath = (x: x); outputName = (x: x); type = 1; out = null; }
+argument a108 [ ]
+argument a109 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ 1 1 "outPath" "bin" ]; __structuredAttrs = true; drvAttrs = 1; outPath = { a = 1; }; }
+argument a110 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ null "type" "drvAttrs" ]; __structuredAttrs = false; __ignoreNulls = true; all = true; drvAttrs = (x: x); outPath = "v"; out = (x: x); dev = { a = 1; }; x = null; }
+argument a111 42
+argument a112 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outputName" "lib" ]; __structuredAttrs = true; drvPath = (x: x); outPath = [ "a" "b" ]; outputName = true; x = { a = 1; }; }
+argument a113 { name = "w"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "outputName" ]; __structuredAttrs = false; __ignoreNulls = true; all = (throw "unforced all"); drvAttrs = "v"; drvPath = "v"; outPath = [ "a" "b" ]; type = 1; dev = { a = 1; }; }
+argument a114 { name = "w"; builder = "/bin/sh"; __structuredAttrs = true; drvPath = null; type = 1; }
+
+probe pattern builtins.functionArgs w
+probe pattern-xml builtins.toXML w
+probe whnf builtins.seq d null
+probe names builtins.attrNames d
+probe types map (o: [ o.type o.outputName ]) d.all
+probe output-names map builtins.attrNames d.all
+probe by-name map (o: d.${o.outputName}.outputName) d.all
+probe drvattrs-names builtins.attrNames d.drvAttrs
+probe paths map (o: { drv = builtins.unsafeDiscardStringContext o.drvPath; drvContext = builtins.getContext o.drvPath; out = builtins.unsafeDiscardStringContext o.outPath; outContext = builtins.getContext o.outPath; }) d.all
+probe coerced "${d}"
+probe xml builtins.toXML d
+probe eq-by-name map (o: o == d.${o.outputName}) d.all
+probe eq-without-paths map (o: builtins.removeAttrs o [ "outPath" "outputName" ] == builtins.removeAttrs d [ "outPath" "outputName" ]) d.all
+probe eq-arguments let kept = builtins.removeAttrs args [ "out" "dev" "lib" "bin" "all" "type" "outPath" "drvAttrs" "drvPath" "outputName" "name" ]; in builtins.intersectAttrs kept d == kept
+probe force-all builtins.seq d.all null
+probe force-bin builtins.seq d.bin null
+probe force-dev builtins.seq d.dev null
+probe force-drvAttrs builtins.seq d.drvAttrs null
+probe force-drvPath builtins.seq d.drvPath null
+probe force-lib builtins.seq d.lib null
+probe force-name builtins.seq d.name null
+probe force-out builtins.seq d.out null
+probe force-outPath builtins.seq d.outPath null
+probe force-outputName builtins.seq d.outputName null
+probe force-type builtins.seq d.type null
+probe force-x builtins.seq d.x null
+
+# Which of two unexpected arguments a closed pattern names.
+imported unexpected-arguments ({ }: null) { zzz = 1; x = 2; }

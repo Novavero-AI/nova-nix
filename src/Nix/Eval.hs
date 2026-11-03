@@ -1432,7 +1432,7 @@ builtinRegistry =
       builtin1 "fetchTarball" builtinFetchTarball,
       builtin1 "fetchGit" builtinFetchGit,
       -- Derivation construction.  The lazy 'derivation' wrapper is not a
-      -- primop: it is upstream's derivation.nix, bound as a constant by
+      -- primop: it is a Nix lambda over this one, bound as a constant by
       -- "Nix.Builtins".
       builtin1 "derivationStrict" builtinDerivationStrict,
       -- Error context (pass-through - context only matters on error)

@@ -136,3 +136,13 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/eval-cases.sh
+
+      # What a program can observe of `derivation`, which nova-nix defines
+      # in Nix source of its own: every probe in test/data's corpus for
+      # every argument, through both evaluators.  It runs when the drvPath
+      # cases fail too, since a wrapper that differs fails those first and
+      # this names how.
+      - name: derivation probes vs upstream Nix
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/derivation-cases.sh
