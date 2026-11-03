@@ -63,7 +63,7 @@ module Nix.Builder
   )
 where
 
-import Control.Exception (IOException, catch, catches, displayException, finally, onException, try)
+import Control.Exception (IOException, bracket, catch, catches, displayException, finally, onException, try)
 import Control.Monad (filterM, unless, when)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT)
 import Control.Monad.IO.Class (liftIO)
@@ -88,6 +88,7 @@ import qualified Data.Text.IO as TIO
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
+import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
 import Nix.DependencyGraph (TopoResult (..), buildDepGraph, topoSort)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fromATerm, platformToText)
@@ -253,7 +254,12 @@ data BuildConfig = BuildConfig
     -- derivation itself - and its store paths - stay identical to a native
     -- build's. A foreign system with no entry here is refused rather than
     -- spawned natively; see 'execWrapperFor'.
-    bcExecWrappers :: !(Map Text FilePath)
+    bcExecWrappers :: !(Map Text FilePath),
+    -- | Where a builder's output goes, a line at a time as each line
+    -- completes ("Nix.Builder.Log").  Upstream's default logger prints
+    -- every build-log line to standard error, which is where
+    -- 'defaultBuildConfig' points this.
+    bcBuildLog :: !System.IO.Handle
   }
   deriving (Eq, Show)
 
@@ -269,7 +275,8 @@ defaultBuildConfig dir =
       bcCaches = [],
       bcExecWrappers = Map.empty,
       bcUnpackLimits = defaultUnpackLimits,
-      bcFetchRetry = defaultFetchRetryPolicy
+      bcFetchRetry = defaultFetchRetryPolicy,
+      bcBuildLog = System.IO.stderr
     }
 
 -- | Result of a build attempt.
@@ -530,21 +537,23 @@ runPlannedBuild config store drv inputPaths buildDir plans = do
       --    directly.
       exitResult <- case drvBuilder drv of
         b
-          | b == builtinFetchurlBuilder -> runBuiltinFetchurl (bcFetchRetry config) drv outputDirs
-          | b == builtinUnpackBuilder -> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
+          | b == builtinFetchurlBuilder -> first (uncurry BuilderRefused) <$> runBuiltinFetchurl (bcFetchRetry config) drv outputDirs
+          | b == builtinUnpackBuilder -> first (uncurry BuilderRefused) <$> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
         _ -> case (execWrapperFor config drv, decodeBuilderStrings drv) of
           (SpawnUnsupported system, _) ->
             pure
               ( Left
-                  ( 1,
-                    "no way to run a "
-                      <> system
-                      <> " builder on this machine; pass --exec-wrapper "
-                      <> system
-                      <> "=PATH to name a launcher for it"
+                  ( BuilderRefused
+                      1
+                      ( "no way to run a "
+                          <> system
+                          <> " builder on this machine; pass --exec-wrapper "
+                          <> system
+                          <> "=PATH to name a launcher for it"
+                      )
                   )
               )
-          (_, Left errMsg) -> pure (Left (1, errMsg))
+          (_, Left errMsg) -> pure (Left (BuilderRefused 1 errMsg))
           (spawn, Right (builderText, argTexts)) ->
             let builderPath = T.unpack (onStore config builderText)
                 builderArgs = map (T.unpack . buildRewrite config outputDirs) argTexts
@@ -562,20 +571,20 @@ runPlannedBuild config store drv inputPaths buildDir plans = do
                   | any carriesHash (drvOutputs drv) = adImpureEnvVars delivery
                   | otherwise = Right []
              in case attrsDelivery config drv buildDir outputDirs of
-                  Left err -> pure (Left (1, err))
+                  Left err -> pure (Left (BuilderRefused 1 err))
                   Right delivery -> case impureVars delivery of
-                    Left err -> pure (Left (1, err))
+                    Left err -> pure (Left (BuilderRefused 1 err))
                     Right passed -> do
                       for_ (adFiles delivery) (uncurry BS.writeFile)
                       -- 5. Run the builder
-                      runBuilder spawnPath spawnArgs (buildEnvironment config (adEnv delivery) builderPath buildDir) passed buildDir
+                      runBuilder (bcBuildLog config) spawnPath spawnArgs (buildEnvironment config (adEnv delivery) builderPath buildDir) passed buildDir
       case exitResult of
-        Left (exitCode, stderrText) -> do
+        Left failure -> do
           -- Whatever the builder wrote is in the store now, so failure has
           -- to take it back out: an unregistered tree there is invisible to
           -- the database and would only confuse the next run.
           clearScratch
-          pure (BuildFailure ("builder failed: " <> stderrText) exitCode)
+          pure (builderFailureResult failure)
         Right () -> do
           -- 6. Success: validate that the builder created all expected
           --    outputs.  Outputs may be files or directories - both are
@@ -603,6 +612,25 @@ runPlannedBuild config store drv inputPaths buildDir plans = do
               pure result
     )
     `onException` cleanupUnlessCommitted
+
+-- | Why the builder step of a build failed, with the exit code the
+-- build reports.
+data BuilderFailure
+  = -- | The builder ran and exited unsuccessfully.  What it wrote is
+    -- already in the build log, which upstream's default logger does not
+    -- repeat in the failure: it shows the log's last lines there only
+    -- when it has not been printing them (@log-lines@, derivation-goal.cc
+    -- at 2.24.9).
+    BuilderExited !Int
+  | -- | The builder did not run, or a builtin builder refused, for the
+    -- reason given.
+    BuilderRefused !Int !Text
+
+-- | The build result a failed builder step reports.
+builderFailureResult :: BuilderFailure -> BuildResult
+builderFailureResult failure = case failure of
+  BuilderExited code -> BuildFailure "builder failed" code
+  BuilderRefused code reason -> BuildFailure ("builder failed: " <> reason) code
 
 -- | Decode a derivation's builder path and arguments from their identity
 -- bytes to the 'Text' the process-spawn boundary needs.  @Left@ names the
@@ -1002,13 +1030,17 @@ homeEnvVar =
 -- Process execution
 -- ---------------------------------------------------------------------------
 
--- | Run the builder process, returning either (exitCode, stderr) on failure
--- or () on success.
+-- | Run the builder process, copying what it writes to @buildLog@, and
+-- report how it exited.
+--
+-- Its standard output and standard error are one pipe ('openLogPipe'),
+-- so the log holds both in the order the builder wrote them, as
+-- upstream's does.  Its standard input is a pipe this process closes
+-- as soon as the builder is spawned, so a read sees end-of-file.
 --
 -- The child's environment is exactly the build environment plus
 -- 'scrubAmbient''s allowance - the ambient environment does not flow
--- through.  Filesystem and process isolation remain future work; the
--- environment no longer waits on them.
+-- through.  Filesystem and process isolation remain future work.
 --
 -- @impureVars@ is the impureEnvVars carve-out: the caller passes the
 -- names a fixed-output derivation listed (empty otherwise), and each
@@ -1017,13 +1049,14 @@ homeEnvVar =
 -- Upstream writes these last in initEnv, so they win even over the
 -- derivation's own values.  Names match exactly, as upstream's do.
 runBuilder ::
+  System.IO.Handle ->
   FilePath ->
   [String] ->
   Map Text Text ->
   [Text] ->
   FilePath ->
-  IO (Either (Int, Text) ())
-runBuilder builderPath builderArgs buildEnv impureVars workDir = do
+  IO (Either BuilderFailure ())
+runBuilder buildLog builderPath builderArgs buildEnv impureVars workDir = do
   systemEnv <- System.Environment.getEnvironment
   let systemMap = Map.fromList [(T.pack k, T.pack v) | (k, v) <- systemEnv]
       impureAllowance =
@@ -1032,12 +1065,16 @@ runBuilder builderPath builderArgs buildEnv impureVars workDir = do
       -- on Windows; the scrubbed ambient allowance fills underneath.
       mergedEnv = unionEnvs [impureAllowance, buildEnv, scrubAmbient systemMap]
       envList = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList mergedEnv]
-      cp =
+      spawnWith toLog =
         (mkBuilderProcess builderPath builderArgs)
           { Proc.cwd = Just workDir,
             Proc.env = Just envList,
-            Proc.std_out = Proc.CreatePipe,
-            Proc.std_err = Proc.CreatePipe,
+            Proc.std_in = Proc.CreatePipe,
+            -- The spawn closes this process's copy of the write end, so
+            -- the builder's tree holds the only ones and its exit ends
+            -- the log.
+            Proc.std_out = Proc.UseHandle toLog,
+            Proc.std_err = Proc.UseHandle toLog,
             -- Wrap the builder's whole process tree in a Win32 job with
             -- kill-on-job-close.  Without it, a builder's grandchildren
             -- (bash -> make -> cc, or anything cmd.exe spawns) outlive an
@@ -1045,16 +1082,23 @@ runBuilder builderPath builderArgs buildEnv impureVars workDir = do
             -- so the tree is orphaned and keeps running.  With the job,
             -- terminateProcess becomes TerminateJobObject and reaps the
             -- tree, and waitForProcess waits for all of it.  Ignored on
-            -- POSIX, where a process group already scopes the children.
+            -- POSIX, where terminateProcess signals the builder alone and
+            -- leaves its descendants running.
             -- A deliberately daemonizing grandchild changes from leaking
             -- to blocking the build until it exits; that is the correct
             -- trade for a build, which owns everything it spawned.
             Proc.use_process_jobs = True
           }
-  (exitCode, _stdout, stderrText) <- Proc.readCreateProcessWithExitCode cp ""
-  case exitCode of
-    ExitSuccess -> pure (Right ())
-    ExitFailure code -> pure (Left (code, T.pack stderrText))
+      closePipe (fromBuilder, toLog) = System.IO.hClose fromBuilder *> System.IO.hClose toLog
+  exitCode <-
+    bracket openLogPipe closePipe $ \(fromBuilder, toLog) ->
+      Proc.withCreateProcess (spawnWith toLog) $ \stdinEnd _ _ process -> do
+        for_ stdinEnd System.IO.hClose
+        streamBuildLog fromBuilder buildLog
+        Proc.waitForProcess process
+  pure $ case exitCode of
+    ExitSuccess -> Right ()
+    ExitFailure code -> Left (BuilderExited code)
 
 -- | Create the appropriate process spec for the builder.
 --

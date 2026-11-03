@@ -26,16 +26,17 @@ import Data.Char (isDigit)
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.List (intercalate, isPrefixOf, sort)
+import Data.List (intercalate, isPrefixOf, mapAccumL, sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
+import Data.Tuple (swap)
 import Data.Word (Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
 import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
@@ -51,6 +52,7 @@ import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
 import Nix.Config (NixConfig (..))
@@ -8109,6 +8111,227 @@ testTrivialBuildIO = do
           [ runTest "trivial build succeeds" $
               Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
+
+-- | A builder's standard output and standard error reach the build log
+-- together, a line at a time, as upstream's do: one channel for both
+-- (local-derivation-goal.cc and child.cc at 2.24.9) and upstream's line
+-- discipline over it (@DerivationGoal::handleChildOutput@,
+-- derivation-goal.cc).
+testBuildLogIO :: IO [Bool]
+testBuildLogIO = do
+  putStrLn "builder/build-log"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  let outPath = StorePath (T.replicate 31 "0" <> "2") "build-log"
+      tmpStore = tmpBase </> "nova-nix-test-build-log-store"
+      buildTmp = tmpBase </> "nova-nix-test-build-log-tmp"
+      logFile = tmpBase </> "nova-nix-test-build-log.txt"
+      daemonPidFile = tmpBase </> "nova-nix-test-build-log-daemon.pid"
+      -- Build in a fresh store with the log a file opened in the given
+      -- mode, and return the result with the file's bytes.
+      buildLogged mode drv = do
+        forceRemoveIfExists tmpStore
+        forceRemoveIfExists buildTmp
+        BS.writeFile logFile ""
+        ( do
+            result <-
+              bracket (openStore (StoreDir tmpStore)) closeStore $ \store ->
+                withBinaryFile logFile mode $ \logHandle ->
+                  buildDerivation (defaultBuildConfig (stDir store)) {bcTmpDir = buildTmp, bcBuildLog = logHandle} store drv
+            logged <- BS.readFile logFile
+            pure (result, logged)
+          )
+          `finally` (forceRemoveIfExists tmpStore *> forceRemoveIfExists buildTmp *> Dir.removePathForcibly logFile)
+      -- Whether or not the build waited for it.
+      stopDaemon = do
+        recorded <- Dir.doesFileExist daemonPidFile
+        when recorded $ do
+          pid <- BS.readFile daemonPidFile
+          void (Proc.readProcessWithExitCode "kill" [BS8.unpack (BS8.strip pid)] "")
+          Dir.removeFile daemonPidFile
+      -- The host's own shell, so on Windows the lines come from a native
+      -- program, which ends each one in CRLF.
+      (nativeBuilder, nativeArgs)
+        | SI.os == "mingw32" = ("cmd.exe", ["/c", "echo one&echo two>&2&echo three&echo done>%out%"])
+        | otherwise = ("/bin/sh", ["-c", "echo one; echo two >&2; echo three; echo done > $out"])
+      nativeDrv = (mkTestBuildDrv shell outPath "") {drvBuilder = nativeBuilder, drvArgs = nativeArgs}
+      failingDrv =
+        mkTestBuildDrv
+          shell
+          outPath
+          "printf 'out-line\\n'; printf 'err-line\\r\\n' >&2; printf '10%%\\r20%%\\n'; printf 'tail'; exit 3"
+      -- Records the daemon's PID, so the test can stop it.
+      daemonDrv =
+        mkTestBuildDrv
+          shell
+          outPath
+          ( "sleep "
+              <> T.pack (show daemonLifetimeSeconds)
+              <> " >/dev/null 2>&1 & echo $! > '"
+              <> T.pack daemonPidFile
+              <> "'; mkdir -p $out"
+          )
+      -- Colour, a tab, a screen clear and a bell.
+      escapesDrv =
+        mkTestBuildDrv
+          shell
+          outPath
+          "printf 'a\\033[31mred\\033[0m\\tb\\033[2Jc\\a\\n'; mkdir -p $out"
+  sequence
+    [ runTest "a line feed ends a build-log line" $
+        assertEqual "lines" ["one", "", "two"] (logLinesOf ["one\n\ntwo\n"]),
+      runTest "a CRLF ends a build-log line without its CR" $
+        assertEqual "lines" ["one", "two"] (logLinesOf ["one\r\ntwo\r\n"]),
+      runTest "a carriage return redraws the build-log line from its start" $
+        assertEqual "lines" ["30%", "xycdef"] (logLinesOf ["10%\r20%\r30%\n", "abcdef\rxy\n"]),
+      runTest "an unterminated last build-log line is flushed when output ends" $
+        assertEqual "lines" ["done now"] (logLinesOf ["done", " now"]),
+      runTest "output ending in a bare carriage return adds no build-log line" $
+        assertEqual "lines" [] (logLinesOf ["\r"]),
+      runTestM "build-log lines are upstream's, however the output is split into reads" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genLogChunks $ \chunks ->
+              map BS.unpack (logLinesOf chunks) QC.=== upstreamLogLines (concatMap BS.unpack chunks)
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTest "a terminal's build log keeps colour escapes and drops the rest" $
+        assertEqual "line" "\ESC[1;31mred\ESC[0mx0;t" (filterLogLine KeepColour "\ESC[1;31mred\ESC[0m\ESC[2J\ESC[Hx\ESC]0;t\a"),
+      runTest "a build log that is not a terminal drops every escape" $
+        assertEqual "line" "redx0;t" (filterLogLine DropEscapes "\ESC[1;31mred\ESC[0m\ESC[2J\ESC[Hx\ESC]0;t\a"),
+      runTest "a tab in a build-log line expands to the next tab stop, a UTF-8 character one column" $
+        assertEqual
+          "line"
+          ("a" <> BS8.replicate 7 ' ' <> "b" <> BS8.replicate 15 ' ' <> "c\xc3\xa9" <> BS8.replicate 6 ' ' <> "d")
+          (filterLogLine DropEscapes "a\tb\t\tc\xc3\xa9\td"),
+      runTestM "build-log lines are filtered as upstream's logger filters them" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genEscapeFilter $ \escapes ->
+              QC.forAll (QC.listOf genEscapeByte) $ \bytes ->
+                BS.unpack (filterLogLine escapes (BS.pack bytes)) QC.=== upstreamFilterEscapes escapes bytes
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTestM "a builder's escapes reach a build log that is not a terminal filtered" $ do
+        (result, logged) <- buildLogged WriteMode escapesDrv
+        pure $ case result of
+          BuildSuccess _ -> assertEqual "log" "ared    bc\n" logged
+          BuildFailure msg code -> Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg),
+      runTestM "a builder's stdout and stderr reach the build log in the order written" $ do
+        (result, logged) <- buildLogged WriteMode nativeDrv
+        pure $ case result of
+          BuildSuccess _ -> assertEqual "log" "one\ntwo\nthree\n" logged
+          BuildFailure msg code -> Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg),
+      runTestM "a failed builder's output is in the build log, not its failure" $ do
+        (result, logged) <- buildLogged WriteMode failingDrv
+        pure $ case result of
+          BuildFailure msg code ->
+            assertEqual "failure and log" ("builder failed", 3, "out-line\nerr-line\n20%\ntail\n") (msg, code, logged)
+          BuildSuccess _ -> Fail "expected the builder's exit 3 to fail the build",
+      -- A handle open only for reading refuses every write, as a standard
+      -- error whose reader has gone does.
+      runTestM "a build log that refuses its lines does not fail the build" $ do
+        (result, _) <- buildLogged ReadMode nativeDrv
+        pure $ case result of
+          BuildSuccess _ -> Pass
+          BuildFailure msg code -> Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg),
+      -- The daemon outlives the deadline, so the build times out if it
+      -- waits for the daemon, which it would if the builder inherited the
+      -- pipe beside its standard output and standard error.
+      runTestM "a daemon that closes stdout and stderr lets the build finish" $
+        if SI.os == "mingw32"
+          then Pass <$ putStrLn "  SKIP  a Windows build waits for its whole job, a daemon included"
+          else do
+            outcome <- timeout daemonDeadlineMicros (buildLogged WriteMode daemonDrv) `finally` stopDaemon
+            pure $ case outcome of
+              Nothing -> Fail "the build waited for the daemon to exit"
+              Just (BuildSuccess _, _) -> Pass
+              Just (BuildFailure msg code, _) -> Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+    ]
+  where
+    daemonLifetimeSeconds = 60 :: Int
+    daemonDeadlineMicros = 10 * 1000 * 1000
+    genLogChunks = QC.listOf (BS.pack <$> QC.listOf genLogByte)
+    genLogByte = QC.frequency [(3, QC.elements [logLineFeed, logCarriageReturn]), (5, QC.elements [0x61, 0x62, 0x63]), (1, QC.arbitrary)]
+    genEscapeFilter = QC.elements [KeepColour, DropEscapes]
+    -- Weighted to the bytes escape sequences, tabs and UTF-8 are read by.
+    genEscapeByte =
+      QC.frequency
+        [ (4, QC.elements [logEscape, logCsi, logSgrFinal, 0x3B, 0x31, 0x4A, 0x5D, 0x20, 0x2F]),
+          (2, QC.elements [logTab, logBell, logCarriageReturn]),
+          (2, QC.elements [0xC3, 0xE2, 0xF0, 0x80, 0xA9, 0xFF]),
+          (3, QC.elements [0x61, 0x62]),
+          (1, QC.arbitrary)
+        ]
+
+-- | The lines a builder's output makes when it is read in the chunks
+-- given.
+logLinesOf :: [BS.ByteString] -> [BS.ByteString]
+logLinesOf chunks =
+  let (pending, completed) = mapAccumL (\partial chunk -> swap (feedBuildLog partial chunk)) emptyPendingLine chunks
+   in concat completed <> maybeToList (endBuildLog pending)
+
+-- | Upstream's build-log line discipline, transcribed byte for byte from
+-- @DerivationGoal::handleChildOutput@ and @handleEOF@ (derivation-goal.cc
+-- at 2.24.9): the oracle the builder's line splitting is held to.
+upstreamLogLines :: [Word8] -> [[Word8]]
+upstreamLogLines = go [] 0
+  where
+    go line _ [] = [line | not (null line)]
+    go line pos (byte : rest)
+      | byte == logCarriageReturn = go line 0 rest
+      | byte == logLineFeed = line : go [] 0 rest
+      | otherwise = go (take pos line <> [byte] <> drop (pos + 1) line) (pos + 1) rest
+
+-- | Upstream's terminal filter, transcribed from @filterANSIEscapes@
+-- (terminal.cc at 2.24.9) at the unlimited width its logger passes: the
+-- oracle the build log's filter is held to.
+upstreamFilterEscapes :: EscapeFilter -> [Word8] -> [Word8]
+upstreamFilterEscapes escapes = go 0
+  where
+    filterAll = escapes == DropEscapes
+    go :: Int -> [Word8] -> [Word8]
+    go _ [] = []
+    go w (byte : rest)
+      | byte == logEscape =
+          let (escapeBytes, final, after) = escape rest
+           in (if not filterAll && final == Just logSgrFinal then byte : escapeBytes else []) <> go w after
+      | byte == logTab =
+          let spaces = 1 + (8 - (w + 1) `mod` 8) `mod` 8
+           in replicate spaces 0x20 <> go (w + spaces) rest
+      | byte == logCarriageReturn || byte == logBell = go w rest
+      | otherwise =
+          let (character, after) = utf8Character byte rest
+           in character <> go (w + 1) after
+    escape (next : rest)
+      | next == logCsi =
+          let (parameters, afterParameters) = span (\b -> b >= 0x30 && b <= 0x3F) rest
+              (intermediates, afterIntermediates) = span (\b -> b >= 0x20 && b <= 0x2F) afterParameters
+           in case afterIntermediates of
+                final : after
+                  | final >= 0x40 && final <= 0x7E -> (next : parameters <> intermediates <> [final], Just final, after)
+                _ -> (next : parameters <> intermediates, Nothing, afterIntermediates)
+      | next >= 0x40 && next <= 0x5F = ([next], Nothing, rest)
+    escape rest = ([], Nothing, rest)
+    utf8Character lead rest
+      | lead .&. 0xE0 == 0xC0 = continued 1
+      | lead .&. 0xF0 == 0xE0 = continued 2
+      | lead .&. 0xF8 == 0xF0 = continued 3
+      | otherwise = ([lead], rest)
+      where
+        continued count =
+          let taken = takeWhile (\b -> b .&. 0xC0 == 0x80) (take count rest)
+           in (lead : taken, drop (length taken) rest)
+
+-- | The control bytes the build-log tests write and read: line feed,
+-- carriage return, escape, tab, bell, and the @[@ and @m@ a colour
+-- sequence opens and ends with.
+logLineFeed, logCarriageReturn, logEscape, logTab, logBell, logCsi, logSgrFinal :: Word8
+logLineFeed = 0x0A
+logCarriageReturn = 0x0D
+logEscape = 0x1B
+logTab = 0x09
+logBell = 0x07
+logCsi = 0x5B
+logSgrFinal = 0x6D
 
 -- | The builder hands every build a fixed SOURCE_DATE_EPOCH (1980-01-01),
 -- the reproducible-builds.org convention that determinism-aware tools
@@ -16567,6 +16790,7 @@ runSuite = do
           testStorePaths,
           testDerivation,
           testTrivialBuildIO,
+          testBuildLogIO,
           testSourceDateEpochIO,
           testScrubbedBuildEnvIO,
           testUnpackBuildIO,
