@@ -1,6 +1,8 @@
 # stage0-pe32's chain, from a 1,623-byte PE32 seed to hex0, hex1, hex2, catm,
 # M0, cc_x86, M2 (M2-Planet), M1, hex2-new and kaem, each link built by the
-# links below it, and mescc-tools-extra's programs built by those links.
+# links below it, mescc-tools-extra's programs built by those links, and the
+# bin directories and kaem.runCommand that the stages after it run on, as
+# nixpkgs' stage0-posix gives them to its own.
 #
 # Each step of the chain, from hex0 down, is one command of stage0-pe32's
 # x86/mescc-tools-mini.cmd, in the same order, and its derivation is named for
@@ -8,14 +10,16 @@
 # the program the command runs and the args are its arguments: a file it
 # reads from artifact\ is the output of the step that wrote it, and the file
 # it writes is $out, the step's one output.  A link's attribute is its
-# program's name, and up to M1 an intermediate file's is its name with the
-# dot spelled as an underscore.  mescc-tools-extra's programs take the steps
-# the .cmd gives kaem.
+# program's name, except kaem's, which is kaem-unwrapped as nixpkgs names it,
+# and up to M1 an intermediate file's is its name with the dot spelled as an
+# underscore.  mescc-tools-extra's programs take the steps the .cmd gives
+# kaem.
 #
-# The links are 32-bit PE, which x64 Windows runs through WoW64, so every step
-# is an i686-windows derivation.  Nothing else runs: no cmd.exe, no shell, and
-# nothing from the MSYS2 seed.  The set is the seed, the ten links and
-# mescc-tools-extra.
+# The links are 32-bit PE, which x64 Windows runs through WoW64, so every
+# derivation that runs one is i686-windows.  Nothing else runs: no cmd.exe,
+# no shell but kaem, and nothing from the MSYS2 seed.  The set is the seed,
+# the ten links, the bin directories kaem, mescc-tools and mescc-tools-extra,
+# each with the programs it holds as attributes, and writeText.
 { fetchurl }:
 let
   sources = import ./sources.nix { inherit fetchurl; };
@@ -23,7 +27,6 @@ let
     seed
     M2-Planet
     M2libc
-    mescc-tools
     ;
   x86 = "${sources.stage0-pe32}/x86";
 
@@ -184,8 +187,8 @@ let
   M1-macro_M1 = compile "M1-macro.M1" [ "--bootstrap-mode" ] [
     "${M2libc}/x86/windows/bootstrap.c"
     "${M2libc}/bootstrappable.c"
-    "${mescc-tools}/stringify.c"
-    "${mescc-tools}/M1-macro.c"
+    "${sources.mescc-tools}/stringify.c"
+    "${sources.mescc-tools}/M1-macro.c"
   ];
   M1-macro-0_M1 = join "M1-macro-0.M1" [
     x86Defs
@@ -301,15 +304,15 @@ let
     stem = "hex2_linker";
     libc = libcBase ++ libcStdio;
     sources = [
-      "${mescc-tools}/hex2.h"
-      "${mescc-tools}/hex2_linker.c"
-      "${mescc-tools}/hex2_word.c"
-      "${mescc-tools}/hex2.c"
+      "${sources.mescc-tools}/hex2.h"
+      "${sources.mescc-tools}/hex2_linker.c"
+      "${sources.mescc-tools}/hex2_word.c"
+      "${sources.mescc-tools}/hex2.c"
     ];
   };
 
   # Phase-8: kaem, the shell the stages after this one are written for.
-  kaem = program {
+  kaem-unwrapped = program {
     name = "kaem";
     libc = libcFor [
       "stdio.h"
@@ -320,17 +323,17 @@ let
       "bootstrappable.h"
     ];
     sources = [
-      "${mescc-tools}/Kaem/kaem.h"
-      "${mescc-tools}/Kaem/variable.c"
-      "${mescc-tools}/Kaem/kaem_globals.c"
-      "${mescc-tools}/Kaem/kaem.c"
+      "${sources.mescc-tools}/Kaem/kaem.h"
+      "${sources.mescc-tools}/Kaem/variable.c"
+      "${sources.mescc-tools}/Kaem/kaem_globals.c"
+      "${sources.mescc-tools}/Kaem/kaem.c"
     ];
   };
 
   # The programs upstream's mescc-tools-extra.kaem builds, each from its one C
   # file, with the M2libc headers its #include lines name.  Upstream compiles
   # them with M2-Mesoplanet, which has no Windows target.
-  mescc-tools-extra =
+  extraPrograms =
     builtins.mapAttrs
       (
         name: includes:
@@ -435,6 +438,138 @@ let
           "bootstrappable.h"
         ];
       };
+
+  # kaem's ${var}, which kaem substitutes when the script runs.
+  variable = var: "\${${var}}";
+
+  # programs installed as bin/<name>.exe, each under its attribute's name: the
+  # layout nixpkgs' stage0-posix gives kaem, mescc-tools and
+  # mescc-tools-extra.  kaem lays the directory out with mescc-tools-extra's
+  # mkdir and cp, as nixpkgs' kaem/default.nix lays out its own, and names
+  # them by store path, since these directories are where PATH would find
+  # them.  A script from builtins.toFile may not name a derivation, so each
+  # program reaches it as the variable of its name.  nixpkgs follows each cp
+  # with chmod 555, and nothing does here: M2libc's Windows chmod does
+  # nothing, and Windows runs a PE image whatever its mode.
+  binDirectory =
+    name: programs:
+    let
+      bin = "${variable "out"}/bin";
+    in
+    derivation (
+      programs
+      // {
+        inherit name;
+        inherit (extraPrograms) mkdir cp;
+        system = "i686-windows";
+        builder = "${kaem-unwrapped}";
+        args = [
+          "--verbose"
+          "--strict"
+          "--file"
+          (builtins.toFile "${name}-bin.kaem" (
+            builtins.concatStringsSep "" (
+              [
+                ''
+                  ${variable "mkdir"} -p ${bin}
+                ''
+              ]
+              ++ map (program: ''
+                ${variable "cp"} ${variable program} ${bin}/${program}.exe
+              '') (builtins.attrNames programs)
+            )
+          ))
+        ];
+      }
+    );
+
+  # kaem-unwrapped installed, as nixpkgs' kaem is, with runCommand.
+  kaem = binDirectory "kaem" { kaem = kaem-unwrapped; } // {
+    inherit runCommand;
+  };
+
+  # The link M2 as M2-Planet, the name Mes's kaem scripts call it by, and
+  # hex2-new, the linker from C, as hex2.  nixpkgs' mescc-tools has M2 under
+  # its own name and installs as M2-Planet the one M2 rebuilds, a step
+  # stage0-pe32's .cmd does not take.
+  mescc-tools = binDirectory "mescc-tools" {
+    M2-Planet = M2;
+    inherit M1;
+    hex2 = hex2-new;
+  };
+
+  mescc-tools-extra = binDirectory "mescc-tools-extra" extraPrograms;
+
+  # PATH for the bin directories of dirs, joined with ';', which kaem built
+  # for Windows splits PATH on, since a Windows path holds a colon of its own.
+  binPath = dirs: builtins.concatStringsSep ";" (map (dir: "${dir}/bin") dirs);
+
+  # nixpkgs' writeText (minimal-bootstrap/utils.nix): a file holding text.
+  # The text reaches kaem through passAsFile, as nixpkgs passes it, and not
+  # through the environment, where kaem refuses an entry of 4,096 bytes or
+  # more.
+  writeText =
+    name: text:
+    derivation {
+      inherit name text;
+      system = "i686-windows";
+      passAsFile = [ "text" ];
+      builder = "${kaem}/bin/kaem.exe";
+      args = [
+        "--verbose"
+        "--strict"
+        "--file"
+        (builtins.toFile "write-text.kaem" ''
+          cp ''${textPath} ''${out}
+        '')
+      ];
+      PATH = binPath [ mescc-tools-extra ];
+    };
+
+  # nixpkgs' kaem.runCommand (minimal-bootstrap/stage0-posix/kaem/default.nix):
+  # a derivation called name, with env's attributes, that kaem builds by
+  # running buildCommand strict, so the first command that fails fails the
+  # build.  PATH holds kaem's, mescc-tools' and mescc-tools-extra's bin
+  # directories, in each of which kaem tries a bare name as it is and then
+  # with .exe.  env reaches the derivation as it stands: nixpkgs' handling of
+  # nativeBuildInputs, meta and passthru is not here, since nothing passes
+  # them.
+  #
+  # The builder spells the store C:\nix\store, and kaem reads a backslash in
+  # a script as an escape, so a store path written into buildCommand would
+  # reach its command as C:, a newline and ixstore.  Each one is spelled from
+  # ${NIX_STORE} instead.  kaem substitutes a variable as it stands, so a path
+  # in one of env's attributes, or an output named as ${out}, as nixpkgs'
+  # scripts name it, needs nothing.
+  #
+  # mescc-tools-extra takes Windows paths its own way.  cp is given the file
+  # it writes, never a directory: it takes a destination that does not begin
+  # with '/' as relative to the working directory, so it never finds a C:
+  # directory there.  mkdir -p makes the parents a path names before a '/'
+  # only, and exits 0 even when it fails, as rm does.
+  runCommand =
+    name: env: buildCommand:
+    derivation (
+      {
+        inherit name;
+        system = "i686-windows";
+        builder = "${kaem}/bin/kaem.exe";
+        args = [
+          "--verbose"
+          "--strict"
+          "--file"
+          (writeText "${name}-builder" (
+            builtins.replaceStrings [ "${builtins.storeDir}/" ] [ "${variable "NIX_STORE"}/" ] buildCommand
+          ))
+        ];
+        PATH = binPath [
+          kaem
+          mescc-tools
+          mescc-tools-extra
+        ];
+      }
+      // env
+    );
 in
 {
   inherit
@@ -448,7 +583,10 @@ in
     M2
     M1
     hex2-new
+    kaem-unwrapped
     kaem
+    mescc-tools
     mescc-tools-extra
+    writeText
     ;
 }
