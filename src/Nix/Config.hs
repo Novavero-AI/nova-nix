@@ -1,7 +1,8 @@
 -- | Nix configuration: the @nix.conf@ / @NIX_CONFIG@ settings that decide
 -- which binary caches a machine substitutes from, which public keys it
--- trusts, how deep function calls may nest, how far an evaluation may
--- reach (@restrict-eval@, @pure-eval@, @allowed-uris@), and whether
+-- trusts, whether a failed substitute builds from source (@fallback@), how
+-- deep function calls may nest, how far an evaluation may reach
+-- (@restrict-eval@, @pure-eval@, @allowed-uris@), and whether
 -- @builtins.traceVerbose@ traces (@trace-verbose@).
 --
 -- == The format
@@ -145,6 +146,8 @@ import qualified System.OsPath as OP
 data NixConfig = NixConfig
   { ncSubstituters :: ![Text],
     ncTrustedPublicKeys :: ![Text],
+    -- | Upstream @fallback@: build from source when a substitute fails.
+    ncFallback :: !Bool,
     -- | Upstream's @max-call-depth@: how many function calls may be
     -- active around a new one before evaluation refuses it.
     ncMaxCallDepth :: !Word32,
@@ -160,9 +163,9 @@ data NixConfig = NixConfig
   deriving (Eq, Show)
 
 -- | The baseline the fold starts from: no substituters, no trusted keys,
--- upstream's call-depth ceiling, no allowed URIs, both evaluation modes
--- off, and @trace-verbose@ off.  The empty substituter list is
--- nova-nix's existing default (nothing is substituted unless
+-- no fallback, upstream's call-depth ceiling, no allowed URIs, both
+-- evaluation modes off, and @trace-verbose@ off.  The empty substituter
+-- list is nova-nix's existing default (nothing is substituted unless
 -- configured), a deliberate divergence from upstream's cache.nixos.org
 -- default: turning a cache on for every machine is the operator's
 -- decision to make in a config file, not a built-in.  The other defaults
@@ -172,6 +175,7 @@ defaultNixConfig =
   NixConfig
     { ncSubstituters = [],
       ncTrustedPublicKeys = [],
+      ncFallback = False,
       ncMaxCallDepth = defaultMaxCallDepth,
       ncAllowedUris = [],
       ncRestrictEval = False,
@@ -538,7 +542,8 @@ unitBase = 1024
 
 -- | Apply one assignment to the accumulated config.  The name is resolved
 -- through the aliases (@binary-caches@ -> @substituters@,
--- @binary-cache-public-keys@ -> @trusted-public-keys@) and the @extra-@
+-- @binary-cache-public-keys@ -> @trusted-public-keys@,
+-- @build-fallback@ -> @fallback@) and the @extra-@
 -- prefix (append rather than replace, list settings only).  A name
 -- outside the known set is ignored, not an error: upstream warns and
 -- continues, and refusing every unknown key would reject a config that
@@ -588,6 +593,7 @@ resolveName name =
       | n == substitutersKey || n == substitutersAlias = Just (ListSetting SubstitutersField)
       | n == trustedKeysKey || n == trustedKeysAlias = Just (ListSetting TrustedKeysField)
       | n == allowedUrisKey = Just (ListSetting AllowedUrisField)
+      | n == fallbackKey || n == fallbackAlias = Just (BoolSetting FallbackField)
       | n == restrictEvalKey = Just (BoolSetting RestrictEvalField)
       | n == pureEvalKey = Just (BoolSetting PureEvalField)
       | n == traceVerboseKey = Just (BoolSetting TraceVerboseField)
@@ -603,7 +609,7 @@ data ListField = SubstitutersField | TrustedKeysField | AllowedUrisField
   deriving (Eq, Show)
 
 -- | The Boolean settings.
-data BoolField = RestrictEvalField | PureEvalField | TraceVerboseField
+data BoolField = FallbackField | RestrictEvalField | PureEvalField | TraceVerboseField
   deriving (Eq, Show)
 
 -- | The scalar settings, which only ever replace.
@@ -630,6 +636,7 @@ listFieldKey TrustedKeysField = trustedKeysKey
 listFieldKey AllowedUrisField = allowedUrisKey
 
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
+setBool FallbackField v config = config {ncFallback = v}
 setBool RestrictEvalField v config = config {ncRestrictEval = v}
 setBool PureEvalField v config = config {ncPureEval = v}
 setBool TraceVerboseField v config = config {ncTraceVerbose = v}
@@ -681,6 +688,10 @@ substitutersAlias = "binary-caches"
 trustedKeysKey, trustedKeysAlias :: ByteString
 trustedKeysKey = "trusted-public-keys"
 trustedKeysAlias = "binary-cache-public-keys"
+
+fallbackKey, fallbackAlias :: ByteString
+fallbackKey = "fallback"
+fallbackAlias = "build-fallback"
 
 allowedUrisKey, maxCallDepthKey, pureEvalKey, restrictEvalKey, traceVerboseKey :: ByteString
 allowedUrisKey = "allowed-uris"

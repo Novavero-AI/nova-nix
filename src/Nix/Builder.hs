@@ -95,7 +95,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, current
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
-import Nix.Realise (RealiseEffects (..), Realised (..), SubstEffects (..), realise)
+import Nix.Realise (Fallback (..), FetchOutcome (..), RealiseEffects (..), Realised (..), SubstEffects (..), realise, realiseFailureMessage)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, unStoreDir)
@@ -240,6 +240,8 @@ data BuildConfig = BuildConfig
     bcTmpDir :: !FilePath,
     -- | Binary caches to try before building (checked in priority order).
     bcCaches :: ![CacheConfig],
+    -- | What a failed substitute leads to: upstream's @fallback@.
+    bcFallback :: !Fallback,
     -- | Extraction budget for @builtin:unpack@ builds.
     bcUnpackLimits :: !UnpackLimits,
     -- | How a download is retried: each URL of a @builtin:fetchurl@
@@ -273,6 +275,7 @@ defaultBuildConfig dir =
           then "C:\\Temp\\nova-nix-build"
           else "/tmp/nova-nix-build",
       bcCaches = [],
+      bcFallback = NoFallback,
       bcExecWrappers = Map.empty,
       bcUnpackLimits = defaultUnpackLimits,
       bcFetchRetry = defaultFetchRetryPolicy,
@@ -1488,10 +1491,12 @@ dedupStorePaths = Map.elems . Map.fromList . map (\sp -> (spHash sp, sp))
 -- 2. Refuse a cycle.
 -- 3. Try each derivation's outputs before its inputs, so a substituted
 --    derivation needs only its runtime closure.  What no cache supplies
---    builds locally, leaves first.
+--    builds locally, leaves first, and so does what a cache fails to
+--    deliver when 'bcFallback' allows it.
 --
 -- Returns 'BuildSuccess' with the root output path on success, or
--- 'BuildFailure' if any dependency fails to build or substitute.
+-- 'BuildFailure' with exit code 1 if a derivation fails to build, a
+-- substitute fails under 'NoFallback', or a cache cannot be asked.
 buildWithDeps :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
 buildWithDeps config store rootDrv rootDrvPath = do
   graph <- buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
@@ -1502,9 +1507,9 @@ buildWithDeps config store rootDrv rootDrvPath = do
         TopoCycle _ ->
           pure (BuildFailure "dependency cycle detected" 1)
         TopoSorted _ -> do
-          result <- realise (realiseEffects config store) depGraph rootDrvPath
+          result <- realise (bcFallback config) (realiseEffects config store) depGraph rootDrvPath
           case result of
-            Left err -> pure (BuildFailure err 1)
+            Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) 1)
             Right () ->
               case drvOutputs rootDrv of
                 (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
@@ -1531,7 +1536,7 @@ realiseEffects config store =
     { reSubst =
         SubstEffects
           { seValid = isValid store,
-            seReferences = queryReferencesWith (bcFetchRetry config) ioRetryEffects (bcCaches config),
+            seReferences = queryReferencesWith (bcFetchRetry config) ioRetryEffects (bcFallback config) (bcCaches config),
             seFetch = substitutePaths config store
           },
       -- Every output, not just the first: a derivation whose first output is
@@ -1563,8 +1568,8 @@ logRealised :: Realised -> Derivation -> IO ()
 logRealised status drv =
   TIO.hPutStrLn System.IO.stderr ("  " <> statusTag status <> " " <> formatDrvName drv)
 
--- | Try to substitute paths from binary caches.  Returns True if every path
--- was substituted or already valid.
+-- | Try to substitute paths from binary caches, every one of them or none
+-- ('FetchOutcome').
 --
 -- Registration is all-or-nothing and batched: every path is verified and
 -- unpacked first, then recorded in one 'registerPaths' transaction, so
@@ -1583,30 +1588,29 @@ logRealised status drv =
 --
 -- A registration the database REFUSES - its unregistered-referent guard,
 -- reachable only through cache-declared references this store has never
--- seen - is a substitution failure like any other: the transaction
--- recorded nothing, so report it and fall back to building locally.
-substitutePaths :: BuildConfig -> Store -> [StorePath] -> IO Bool
+-- seen - is a failed substitution like any other: the transaction
+-- recorded nothing, so report it ('FetchFailed').  Upstream's copy of the
+-- path fails the same way when a reference is not valid.
+substitutePaths :: BuildConfig -> Store -> [StorePath] -> IO FetchOutcome
 substitutePaths config store paths
-  | null (bcCaches config) = pure False
+  | null (bcCaches config) = pure FetchMissed
   | otherwise = do
       heldLocks <- newIORef []
       registerSubstituted heldLocks
         `finally` (readIORef heldLocks >>= mapM_ releasePathLock)
   where
-    registerSubstituted :: IORef [PathLock] -> IO Bool
+    registerSubstituted :: IORef [PathLock] -> IO FetchOutcome
     registerSubstituted heldLocks = do
       results <- mapM (substituteOne heldLocks) (lockOrder paths)
-      case traverse substOutcome results of
-        Nothing -> pure False
-        Just outcomes -> do
-          registered <- try (registerPaths (stDB store) (catMaybes outcomes))
+      case batchRegistrations results of
+        Left outcome -> pure outcome
+        Right rows -> do
+          registered <- try (registerPaths (stDB store) rows)
           case registered of
-            Right () -> pure True
+            Right () -> pure Fetched
             Left (e :: IOException) -> do
-              TIO.hPutStrLn
-                System.IO.stderr
-                ("  [subst] registration refused, building instead: " <> T.pack (displayException e))
-              pure False
+              TIO.hPutStrLn System.IO.stderr ("  [subst] registration refused: " <> T.pack (displayException e))
+              pure FetchFailed
     -- Record a returned lock the moment it exists, so the enclosing
     -- finally owns it even when a later path's attempt fails or throws.
     substituteOne heldLocks sp = do
@@ -1616,12 +1620,23 @@ substitutePaths config store paths
         SubstError err -> TIO.hPutStrLn System.IO.stderr ("  [subst] " <> spName sp <> ": " <> err)
         _ -> pure ()
       pure result
-    -- An already-valid path counts as substituted but contributes no
+
+-- | What one batch's results come to: the rows to register when every path
+-- arrived, or why not.  One failed path fails the batch whatever the others
+-- did, as one failed output fails upstream's derivation goal.
+batchRegistrations :: [SubstResult] -> Either FetchOutcome [PathRegistration]
+batchRegistrations results
+  | any failed results = Left FetchFailed
+  | otherwise = maybe (Left FetchMissed) (Right . catMaybes) (traverse arrived results)
+  where
+    failed (SubstError _) = True
+    failed _ = False
+    -- An already-valid path counts as arrived but contributes no
     -- registration row (and holds no lock).
-    substOutcome (SubstSuccess reg _) = Just (Just reg)
-    substOutcome SubstAlreadyValid = Just Nothing
-    substOutcome SubstNotFound = Nothing
-    substOutcome (SubstError _) = Nothing
+    arrived (SubstSuccess reg _) = Just (Just reg)
+    arrived SubstAlreadyValid = Just Nothing
+    arrived SubstNotFound = Nothing
+    arrived (SubstError _) = Nothing
 
 -- | Format a derivation name for status output (display-only, so the
 -- byte-string env value decodes lossily).
