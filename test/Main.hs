@@ -10518,9 +10518,10 @@ testSubstituterRetry = do
           unsignedNarInfo = Send (httpResponse "200 OK" (TE.encodeUtf8 (NarInfo.renderNarInfo unsigned)))
           trustingCache base = Subst.CacheConfig base [publicKey]
           -- Realise a derivation whose one output is the fixture's path,
-          -- from the caches given, under the adjusted config.  Returns the
-          -- result, whether the output is the substitute's tree or the
-          -- builder's file, and the .drv's path as a failure names it.
+          -- from the caches given, under the adjusted config, in a store
+          -- kept under the temporary directory rather than at /nix/store.
+          -- Returns the result and whether the output is the substitute's
+          -- tree or the builder's file.
           realiseFrom label caches adjust = do
             tmpBase <- getTemporaryDirectory
             let root = tmpBase </> ("nova-nix-test-subst-fallback-" ++ label)
@@ -10554,7 +10555,7 @@ testSubstituterRetry = do
                 result <- buildWithDeps config store drv drvSP
                 substituted <- Dir.doesFileExist (outPath </> "data")
                 built <- Dir.doesFileExist outPath
-                pure (result, substituted, built, storePathToFilePath storeDir drvSP)
+                pure (result, substituted, built)
           substitute label narInfoReply narReply =
             withHttpServer (route narInfoReply narReply) $ \base requests _ -> do
               tmpBase <- getTemporaryDirectory
@@ -10633,16 +10634,19 @@ testSubstituterRetry = do
               -- The whole realisation, against upstream's outcomes: a cache
               -- that fails stops the build unless fallback is on, and one
               -- that lacks the path or offers an untrusted narinfo does not.
+              -- The .drv is named under the logical store directory, as
+              -- upstream's printStorePath names it, though the store's files
+              -- are kept elsewhere.
               runTestM "a NAR that fails after its retries stops the build and names --fallback" $
                 withHttpServer (route (const narInfoOk) (const unavailable)) $ \base _ _ -> do
-                  (result, substituted, built, drvFile) <- realiseFrom "nar-down" [trustingCache base 40] id
+                  (result, substituted, built) <- realiseFrom "nar-down" [trustingCache base 40] id
                   pure
                     ( assertEqual
                         "stopped"
                         ( BuildFailure
-                            ( "some substitutes for the outputs of derivation '"
-                                <> T.pack drvFile
-                                <> "' failed (usually happens due to networking issues); try '--fallback' to build derivation from source"
+                            ( "some substitutes for the outputs of derivation '/nix/store/"
+                                <> T.replicate 32 "d"
+                                <> "-retry.drv' failed (usually happens due to networking issues); try '--fallback' to build derivation from source"
                             )
                             1,
                           False,
@@ -10652,16 +10656,16 @@ testSubstituterRetry = do
                     ),
               runTestM "under fallback a NAR that fails builds from source instead" $
                 withHttpServer (route (const narInfoOk) (const unavailable)) $ \base _ _ -> do
-                  (result, substituted, built, _) <- realiseFrom "nar-down-fallback" [trustingCache base 40] (\config -> config {bcFallback = Realise.BuildFromSource})
+                  (result, substituted, built) <- realiseFrom "nar-down-fallback" [trustingCache base 40] (\config -> config {bcFallback = Realise.BuildFromSource})
                   pure (assertEqual "built" (BuildSuccess sp, False, True) (result, substituted, built)),
               runTestM "a narinfo the cache lacks builds, with no flag" $
                 withHttpServer (\_ _ -> Send (httpResponse "404 Not Found" "")) $ \base requests _ -> do
-                  (result, substituted, built, _) <- realiseFrom "narinfo-404" [trustingCache base 40] id
+                  (result, substituted, built) <- realiseFrom "narinfo-404" [trustingCache base 40] id
                   seen <- requests
                   pure (assertEqual "built" (BuildSuccess sp, False, True, [narInfoPath]) (result, substituted, built, seen)),
               runTestM "a narinfo that fails after its retries stops the build with the failure" $
                 withHttpServer (route (const unavailable) (const narOk)) $ \base requests _ -> do
-                  (result, substituted, built, _) <- realiseFrom "narinfo-down" [trustingCache base 40] id
+                  (result, substituted, built) <- realiseFrom "narinfo-down" [trustingCache base 40] id
                   seen <- requests
                   pure
                     ( assertEqual
@@ -10671,17 +10675,17 @@ testSubstituterRetry = do
                     ),
               runTestM "under fallback a narinfo that fails builds from source instead" $
                 withHttpServer (route (const unavailable) (const narOk)) $ \base _ _ -> do
-                  (result, substituted, built, _) <- realiseFrom "narinfo-down-fallback" [trustingCache base 40] (\config -> config {bcFallback = Realise.BuildFromSource})
+                  (result, substituted, built) <- realiseFrom "narinfo-down-fallback" [trustingCache base 40] (\config -> config {bcFallback = Realise.BuildFromSource})
                   pure (assertEqual "built" (BuildSuccess sp, False, True) (result, substituted, built)),
               runTestM "an unsigned narinfo is passed over for the next cache" $
                 withHttpServer (route (const unsignedNarInfo) (const narOk)) $ \untrusted untrustedRequests _ ->
                   withHttpServer (route (const narInfoOk) (const narOk)) $ \trusted _ _ -> do
-                    (result, substituted, built, _) <- realiseFrom "unsigned-then-signed" [trustingCache untrusted 10, trustingCache trusted 40] id
+                    (result, substituted, built) <- realiseFrom "unsigned-then-signed" [trustingCache untrusted 10, trustingCache trusted 40] id
                     seen <- untrustedRequests
                     pure (assertEqual "substituted" (BuildSuccess sp, True, False, False) (result, substituted, built, narPath `elem` seen)),
               runTestM "an unsigned narinfo alone builds, with no flag" $
                 withHttpServer (route (const unsignedNarInfo) (const narOk)) $ \base requests _ -> do
-                  (result, substituted, built, _) <- realiseFrom "unsigned" [trustingCache base 40] id
+                  (result, substituted, built) <- realiseFrom "unsigned" [trustingCache base 40] id
                   seen <- requests
                   pure (assertEqual "built" (BuildSuccess sp, False, True, False) (result, substituted, built, narPath `elem` seen)),
               runTestM "a narinfo that fails once with a 503 is fetched on the retry" $ do
