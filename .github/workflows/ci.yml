@@ -541,10 +541,19 @@ jobs:
   # CI builds with cmd.exe, byte for byte, and hex0 has to be the seed.  Then
   # mescc-tools-extra's thirteen programs, built by those links, each run
   # once.  No store cache, for the reason E2E (Windows) has none.
+  #
+  # x64 and ARM64 Windows each run all of it, as stage0-pe32's CI runs its
+  # chain on both: the links are i686, which x64 Windows runs through WoW64
+  # and ARM64 Windows through its x86 emulator, and either can fail where the
+  # other does not.  Both run the one x64 nova-nix that Stage0 (nova-nix)
+  # builds, the build a release ships for Windows, since the ARM64 image has
+  # no GHC.  ARM64 Windows runs it through its x64 emulator, and its system is
+  # still the x86_64-windows compiled into it, so it builds the i686
+  # derivations there as it does on x64.
   # ---------------------------------------------------------------------------
 
-  stage0-windows:
-    name: Stage0 (Windows)
+  stage0-nova-nix:
+    name: Stage0 (nova-nix)
     needs: [cabal-check]
     runs-on: windows-latest
     timeout-minutes: 45
@@ -564,8 +573,53 @@ jobs:
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
           restore-keys: cabal-${{ runner.os }}-
 
-      - name: Install nova-nix
-        run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
+      # bin/ beside share/, the layout a release archive ships: the data dir
+      # Cabal compiles in is in this runner's Cabal store, which the runners
+      # below do not have, and the chain's sources are fetched through
+      # <nix/fetchurl.nix>.  nova-nix.exe needs no DLL beyond Windows' own, so
+      # these two files are all of it.
+      - name: Stage nova-nix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cabal install exe:nova-nix --install-method=copy --installdir=staged/bin --overwrite-policy=always
+          mkdir -p staged/share/nova-nix/nix
+          cp data/nix/fetchurl.nix staged/share/nova-nix/nix/
+
+      # Kept for the 30 days a run can be re-run in: a re-run of the failed
+      # Stage0 legs alone does not run this job again.
+      - name: Upload nova-nix
+        uses: actions/upload-artifact@v7
+        with:
+          name: stage0-nova-nix
+          path: staged/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  stage0-windows:
+    name: Stage0 (${{ matrix.name }})
+    needs: [stage0-nova-nix]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+          - os: windows-11-arm
+            name: Windows ARM64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # Into the temp root, so the executable is $RUNNER_TEMP/bin/nova-nix.exe
+      # with share/ beside bin/.
+      - name: Download nova-nix
+        uses: actions/download-artifact@v8
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
 
       - name: Provision the store root
         shell: pwsh
