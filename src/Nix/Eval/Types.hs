@@ -9,6 +9,7 @@
 module Nix.Eval.Types
   ( -- * Values
     NixValue (..),
+    BuiltinArg (..),
     CompiledRegex (..),
     Thunk (..),
     readThunkValue,
@@ -340,12 +341,23 @@ data NixValue
     VAttrs !AttrSet
   | -- | Lambda closure: captures environment, formals, body bytecode index.
     VLambda !Env !EvalFormals !Word32
-  | -- | Built-in function, dispatched by name.
-    -- Accumulated args support curried partial application.
-    VBuiltin !Text ![NixValue]
+  | -- | Built-in function, dispatched by name, with the arguments a
+    -- partial application has taken so far, first to last.
+    VBuiltin !Text ![BuiltinArg]
   | -- | Pre-compiled regex carried in a partially-applied builtin.
     -- Internal only - never exposed to Nix code directly.
     VCompiledRegex !CompiledRegex
+  deriving (Eq, Show)
+
+-- | An argument a builtin has taken.  A primop that forces an argument
+-- before anything it does can be observed has it forced as it is
+-- applied.  One that forces it later, after another argument or only on
+-- some paths, has it held as the thunk it arrived as, and forces it where
+-- upstream does.  An argument that arrives already forced is held forced
+-- either way.
+data BuiltinArg
+  = ArgForced !NixValue
+  | ArgDeferred !Thunk
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
