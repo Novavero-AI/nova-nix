@@ -2080,6 +2080,122 @@ testLexer = do
     lexOutcome source = either (Left . peMessage) (Right . length) (tokenize "<test>" source)
 
 -- ---------------------------------------------------------------------------
+-- Tests: Line endings
+-- ---------------------------------------------------------------------------
+
+-- | A line ends at an LF, a CRLF or a bare CR, as upstream's position
+-- table splits a source (@Pos::LinesIterator@, position.cc at 2.24.9), and
+-- a line comment ends before the first CR or LF (@\#[^\\r\\n]*@, lexer.l).
+testLineEndings :: IO [Bool]
+testLineEndings = do
+  putStrLn "parser/line-endings"
+  let quickCheckPasses property = do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+      positionsIn label source expected =
+        assertRight label (tokenize "<test>" source) $ \toks ->
+          assertEqual label expected [(locLine tok, locCol tok) | tok <- toks, locToken tok /= TokEOF]
+      xAt label source expected =
+        assertRight label (tokenize "<test>" source) $ \toks ->
+          assertEqual label [expected] [(locLine tok, locCol tok) | tok <- toks, locToken tok == TokIdent "x"]
+  sequence
+    [ runTest "a line comment ends at a carriage return" $
+        assertEval "comment" "# c\r1" (VInt 1),
+      runTest "a line comment's CRLF ends one line" $
+        xAt "comment crlf" "# c\r\nx" (2, 1),
+      runTest "an LF, a CRLF and a bare CR each end one line" $
+        positionsIn "endings" "a\nb\r\nc\rd" [(1, 1), (2, 1), (3, 1), (4, 1)],
+      runTest "an LF before a CR ends a line of its own" $
+        xAt "lf cr" "\n\rx" (3, 1),
+      runTest "a bare CR ends a line in a block comment" $
+        xAt "block comment" "/* a\r */ x" (2, 5),
+      runTest "a bare CR ends a line in a double-quoted string" $
+        xAt "string" "\"a\rb\" x" (2, 4),
+      runTest "a bare CR ends a line in an indented string" $
+        xAt "indented string" "''a\rb'' x" (2, 5),
+      runTest "an escaped bare CR ends a line" $
+        xAt "escaped cr" "\"\\\r\" x" (2, 3),
+      -- The escape takes the CR and the string's next run its LF; the two
+      -- are still one line ending.
+      runTest "an escaped CR and the LF after it end one line" $
+        xAt "escaped crlf" "\"\\\r\n\" x" (2, 3),
+      runTest "an indented string's escaped CR and the LF after it end one line" $
+        xAt "indented escaped crlf" "''a''\\\r\n'' x" (2, 4),
+      -- Upstream's opener is @''(\ *\n)?@ (lexer.l): its newline is an LF,
+      -- so after a CR the opening line is content.
+      runTest "a CRLF after an indented string's opener is content" $
+        assertRight "opener crlf" (tokenize "<test>" "''\r\na''") $ \toks ->
+          assertEqual "tokens" [TokIndStringOpen, TokStringLit "\r\na", TokIndStringClose] (tokenTypes toks),
+      -- Upstream puts an end-of-file syntax error at the end of the input
+      -- (yyerror, parser.y at 2.24.9), which a trailing comment runs to.
+      runTest "the end of input after a line comment is past the comment" $
+        assertRight "eof after comment" (syntaxErrorOf "(\n# c") $ \err ->
+          assertEqual "position" (2, 4) (peLine err, peCol err),
+      runTestM "a source's tokens stand on the same lines whichever line endings it uses" $
+        quickCheckPasses $
+          QC.forAll genLineEndingSource $ \pieces ->
+            case tokensOutsideStrings (renderSource (map withLf pieces)) of
+              Left err -> QC.counterexample (show err) False
+              Right expected -> tokensOutsideStrings (renderSource pieces) QC.=== Right expected
+    ]
+  where
+    -- A string's content is not compared: an indented string keeps its
+    -- CRs, and the content after an opener starts on the opening line
+    -- unless an LF ends it.
+    tokensOutsideStrings source = do
+      toks <- tokenize "<test>" source
+      pure [(locToken tok, locLine tok, locCol tok) | tok <- toks, not (isStringContent (locToken tok))]
+    isStringContent (TokStringLit _) = True
+    isStringContent (TokStringEsc _) = True
+    isStringContent _ = False
+    withLf (SourceLineEnding _) = SourceLineEnding Lf
+    withLf piece = piece
+
+-- | A line ending of the kind upstream's position table splits at.
+data LineEnding = Lf | CrLf | Cr
+  deriving (Show)
+
+-- | A piece of a generated source: bytes, or a line ending.
+data SourcePiece = SourceBytes !BS.ByteString | SourceLineEnding !LineEnding
+  deriving (Show)
+
+-- | The bytes of a generated source.
+renderSource :: [SourcePiece] -> BS.ByteString
+renderSource = BS.concat . map pieceBytes
+  where
+    pieceBytes (SourceBytes bytes) = bytes
+    pieceBytes (SourceLineEnding Lf) = "\n"
+    pieceBytes (SourceLineEnding CrLf) = "\r\n"
+    pieceBytes (SourceLineEnding Cr) = "\r"
+
+-- | Sources whose line endings sit wherever the lexer can meet one:
+-- between tokens, at a line comment's end, in a block comment, in a
+-- double-quoted and an indented string, after an indented string's
+-- opener, and escaped in either string.  Each fragment ends at a space,
+-- so no two fragments run together into another token, and a byte other
+-- than LF follows each line ending, so no bare CR and the LF after it
+-- read as one CRLF.
+genLineEndingSource :: QC.Gen [SourcePiece]
+genLineEndingSource = concat <$> QC.listOf (QC.oneof (map sequence fragments))
+  where
+    ending = SourceLineEnding <$> QC.elements [Lf, CrLf, Cr]
+    bytes = pure . SourceBytes
+    fragments =
+      [ [bytes "x "],
+        [bytes "1 "],
+        [bytes "+ "],
+        [bytes "\"\195\169\" "],
+        [ending, bytes " "],
+        [bytes "# c", ending, bytes " "],
+        [bytes "/* c", ending, bytes "c */ "],
+        [bytes "\"s", ending, bytes "s\" "],
+        [bytes "\"\\", ending, bytes "\" "],
+        [bytes "''", ending, bytes "s'' "],
+        [bytes "''s", ending, bytes "s'' "],
+        [bytes "''s''\\", ending, bytes "'' "]
+      ]
+
+-- ---------------------------------------------------------------------------
 -- Tests: Parser expressions
 -- ---------------------------------------------------------------------------
 
@@ -2415,6 +2531,8 @@ testSourceBytes = do
         assertEqual "value" (Right (VInt 1)) (evalNixBytes (BS.pack [0xEF, 0xBB, 0xBF] <> "1")),
       runTest "an unpaired UTF-16 surrogate is a syntax error where it stands" $
         assertEqual "error" (Right (2, 3, "unpaired UTF-16 surrogate")) (errorAt <$> syntaxErrorOfBytes (utf16Le "1\n +" <> BS.pack [0x00, 0xD8])),
+      runTest "a bare CR ends a line for a UTF-16 source's error" $
+        assertEqual "error" (Right (2, 3, "unpaired UTF-16 surrogate")) (errorAt <$> syntaxErrorOfBytes (utf16Le "1\r +" <> BS.pack [0x00, 0xD8])),
       runTest "a UTF-16 source with an odd byte at its end is a syntax error" $
         assertEqual "error" (Right (1, 2, "UTF-16 source with an odd number of bytes")) (errorAt <$> syntaxErrorOfBytes (utf16Be "1" <> BS.pack [0x41]))
     ]
@@ -3779,6 +3897,11 @@ testUnsafeGetAttrPos = do
       inFile "a dynamic name is at its interpolation" "builtins.unsafeGetAttrPos \"k\" {\n  ${\"k\"} = 1;\n}" (2, 3),
       inFile "each level of a dotted path is at the path" "builtins.unsafeGetAttrPos \"c\" {\n  a.b.c = 1;\n}.a.b" (2, 3),
       inFile "a merged path's first definition keeps its position" "builtins.unsafeGetAttrPos \"a\" {\n  a.b = 1;\n  a.c = 2;\n}" (2, 3),
+      -- A line ends at an LF, a CRLF or a bare CR (Pos::LinesIterator,
+      -- position.cc), so the file spelled with each gives one line.
+      inFile "a line ends at an LF" (afterCommentLine "\n") (3, 3),
+      inFile "a line ends at a CRLF" (afterCommentLine "\r\n") (3, 3),
+      inFile "a line ends at a bare CR" (afterCommentLine "\r") (3, 3),
       inFile "a path merged into keeps each definition's own" "builtins.unsafeGetAttrPos \"c\" {\n  a.b = 1;\n  a.c = 2;\n}.a" (3, 3),
       inFile "a set merged into a path keeps its bindings' own" "builtins.unsafeGetAttrPos \"b\" {\n  a.c = 1;\n  a = {\n    b = 2;\n  };\n}.a" (4, 5),
       inFile "a rec set's binding is at its name" "builtins.unsafeGetAttrPos \"b\" rec {\n  a = 1;\n  b = a;\n}" (3, 3),
@@ -3829,6 +3952,8 @@ testUnsafeGetAttrPos = do
       "{\"column\":" <> T.pack (show (column :: Int)) <> ",\"file\":\"" <> file <> "\",\"line\":" <> T.pack (show (line :: Int)) <> "}"
     derivationAttrPos name =
       "builtins.unsafeGetAttrPos \"" <> name <> "\" (derivation {\n  name = \"n\";\n  builder = \"b\";\n  system = \"s\";\n})"
+    afterCommentLine ending =
+      T.intercalate ending ["builtins.unsafeGetAttrPos \"b\" {", "  # a comment", "  b = 1;", "}"]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch A - getEnv, currentTime, toPath
@@ -17871,6 +17996,7 @@ runSuite = do
           testEvalHigherOrder,
           testBuiltinArgumentOrder,
           testLexer,
+          testLineEndings,
           testParserExprs,
           testParserErrors,
           testSourceBytes,

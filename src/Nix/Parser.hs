@@ -74,7 +74,7 @@ import Nix.Expr.Resolve (resolveRelativePaths, resolveVars, staticGlobalNames)
 import Nix.Expr.Types (Expr, SourceOrigin (..), sourceName)
 import Nix.Parser.Expr (parseTopLevel)
 import Nix.Parser.Internal (ParseState (..), runParser)
-import Nix.Parser.Lexer (tokenize)
+import Nix.Parser.Lexer (positionAfter, tokenize)
 import Nix.Parser.ParseError (ParseError (..))
 import System.FilePath (takeDirectory)
 
@@ -166,23 +166,22 @@ data ByteOrder = LittleEndian | BigEndian
 
 -- | A UTF-16 body as UTF-8.  An unpaired surrogate and an odd final byte
 -- have no UTF-8 spelling, and replacing either would change the source, so
--- each is a parse error at the character it stands at, the line and column
--- counted as the lexer counts them.
+-- each is a parse error at the character it stands at: the end of the
+-- UTF-8 before it, positioned by the lexer ('positionAfter').
 utf16ToUtf8 :: ByteOrder -> Text -> ByteString -> Either ParseError ByteString
-utf16ToUtf8 order name = go mempty 1 1
+utf16ToUtf8 order name = go mempty
   where
-    go !built !line !col units = case codeUnit units of
+    go !built units = case codeUnit units of
       Nothing
-        | BS.null units -> Right (BL.toStrict (BB.toLazyByteString built))
-        | otherwise -> malformed line col "UTF-16 source with an odd number of bytes"
+        | BS.null units -> Right (utf8Of built)
+        | otherwise -> malformed built "UTF-16 source with an odd number of bytes"
       Just (unit, rest)
         | isHighSurrogate unit,
           Just (low, afterPair) <- codeUnit rest,
           isLowSurrogate low ->
-            go (built <> utf8CodePoint (surrogatePair unit low)) line (col + 1) afterPair
-        | isSurrogate unit -> malformed line col "unpaired UTF-16 surrogate"
-        | unit == lineFeed -> go (built <> utf8CodePoint unit) (line + 1) 1 rest
-        | otherwise -> go (built <> utf8CodePoint unit) line (col + 1) rest
+            go (built <> utf8CodePoint (surrogatePair unit low)) afterPair
+        | isSurrogate unit -> malformed built "unpaired UTF-16 surrogate"
+        | otherwise -> go (built <> utf8CodePoint unit) rest
     codeUnit bytes = do
       (leading, afterLeading) <- BS.uncons bytes
       (trailing, afterTrailing) <- BS.uncons afterLeading
@@ -191,9 +190,10 @@ utf16ToUtf8 order name = go mempty 1 1
         BigEndian -> (widen leading `shiftL` 8 .|. widen trailing, afterTrailing)
     widen :: Word8 -> Word32
     widen = fromIntegral
-    malformed line col message =
-      Left ParseError {peFile = name, peLine = line, peCol = col, peMessage = message}
-    lineFeed = 0x0A
+    utf8Of = BL.toStrict . BB.toLazyByteString
+    malformed built message =
+      let (line, col) = positionAfter (utf8Of built)
+       in Left ParseError {peFile = name, peLine = line, peCol = col, peMessage = message}
 
 -- | UTF-16 surrogates: a high one (D800-DBFF) followed by a low one
 -- (DC00-DFFF) spells one code point past U+FFFF.
