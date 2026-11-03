@@ -577,9 +577,9 @@ jobs:
   # x86/mescc-tools-mini.cmd.  Each link has to be the file stage0-pe32's own
   # CI builds with cmd.exe, byte for byte, and hex0 has to be the seed.  Then
   # mescc-tools-extra's thirteen programs, built by those links, each run
-  # once, and kaem, mescc-tools and mescc-tools-extra as bin directories,
-  # with kaem.runCommand running scripts from them.  No store cache, for the
-  # reason E2E (Windows) has none.
+  # once, and kaem, mescc-tools and mescc-tools-extra as bin directories
+  # whose programs are executable in their NARs, with kaem.runCommand running
+  # scripts from them.  No store cache, for the reason E2E (Windows) has none.
   #
   # x64 and ARM64 Windows each run all of it, as stage0-pe32's CI runs its
   # chain on both: the links are i686, which x64 Windows runs through WoW64
@@ -677,7 +677,7 @@ jobs:
           done
           cat "$RUNNER_TEMP/links.txt"
 
-      # Each link's SHA-256 as stage0-pe32's CI prints it for 28ec2d2, the
+      # Each link's SHA-256 as stage0-pe32's CI prints it for ed943c2, the
       # commit pkgs/windows/by-name/st/stage0-pe32/sources.nix pins.  hex0's
       # is the seed's own: the build already refuses any other hex0, since
       # hex0 is fixed-output to it, and this checks the bytes from outside.
@@ -704,8 +704,8 @@ jobs:
           cc_x86 b9d143bc9037cf8fee342a948bcc4f7f84baca2d2a6d4145beb6ee2c081dc939
           M2 6b3472763f8560faad83492b6aab6b20c00d4dffa5c3364b8dd8bf5692bb8075
           M1 10283f7d2409eff34f16788f12759bcb5526295c2dc36e0ed891c87e47595cd0
-          hex2-new 651adcaf8103611d98f64e1aced968e5ba8a515ed7308375655e4615983cf133
-          kaem-unwrapped 7f4ddcc3e61bee059b5d1feec9598c0f2b7d8f2b77649dd231f20821390a9c70
+          hex2-new 5ca129599fc2c28dcb21a4f3ab5b15c1b4c7b2497131270184ccbbc9c0e60f84
+          kaem-unwrapped ded0aaaf5b487095d5796f7afcd5d09a4c4575dc137ddabaae8a556d6715fc5d
           EOF
           exit "$status"
 
@@ -732,11 +732,12 @@ jobs:
       # Each result is checked against a fixture, hello.txt's known SHA-256 or
       # bytes the runner's own printf and cat write, never against another
       # program under test.  rm, mkdir -p and untar exit 0 even when they
-      # fail, so their results are checked on disk.  chmod changes nothing on
-      # Windows and says so by exiting 0; a file that is not there still
-      # fails it.  wrap bind-mounts /dev and /proc into the working directory
-      # to chroot there, so it stops at its first mount, which M2libc's
-      # Windows mount refuses.
+      # fail, so their results are checked on disk.  chmod's exit status says
+      # only whether the file is there, since it ignores what chmod returns;
+      # what it does to a file is checked by the marks build below.  wrap
+      # bind-mounts /dev and /proc into the working directory to chroot
+      # there, so it stops at its first mount, which M2libc's Windows mount
+      # refuses.
       - name: mescc-tools-extra runs
         shell: bash
         run: |
@@ -821,7 +822,8 @@ jobs:
           exit "$status"
 
       # kaem-unwrapped laying out kaem, mescc-tools and mescc-tools-extra as
-      # bin directories with mescc-tools-extra's mkdir and cp.
+      # bin directories with mescc-tools-extra's mkdir, cp and chmod.  Each
+      # path is kept as Windows spells it too, for PowerShell.
       - name: Build the bin directories
         shell: bash
         run: |
@@ -829,6 +831,7 @@ jobs:
           for attr in kaem mescc-tools mescc-tools-extra; do
             out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "stage0-pe32.$attr" | tail -n 1)
             echo "$attr $(cygpath -u "$out")" >> "$RUNNER_TEMP/bins.txt"
+            echo "$attr $out" >> "$RUNNER_TEMP/bins-windows.txt"
           done
           cat "$RUNNER_TEMP/bins.txt"
 
@@ -859,6 +862,36 @@ jobs:
             holds mescc-tools-extra "$name.exe" "mescc-tools-extra.$name"
           done
           exit "$status"
+
+      # chmod 555 marks each program executable as the nova.exec stream
+      # beside it, which nova-nix reads as the bit.  PowerShell reads streams
+      # through Win32, and the step above has already found every program.
+      - name: Each bin directory marks its programs executable
+        shell: pwsh
+        run: |
+          $failed = 0
+          foreach ($line in Get-Content -LiteralPath "$env:RUNNER_TEMP/bins-windows.txt") {
+            $attr, $path = $line -split ' ', 2
+            foreach ($file in Get-ChildItem -LiteralPath (Join-Path $path 'bin') -File) {
+              if (Get-Item -LiteralPath $file.FullName -Stream nova.exec -ErrorAction SilentlyContinue) {
+                "ok    $attr/bin/$($file.Name) is marked executable"
+              } else {
+                "::error::$attr/bin/$($file.Name) is not marked executable"
+                $failed++
+              }
+            }
+          }
+          if ($failed) { exit 1 }
+
+      # test/data/run-command.nix's marks is fixed-output to the NAR hash its
+      # tree has on POSIX, with bin/hello executable and hello.txt not, so it
+      # builds only if what chmod 555 marked registers as executable and what
+      # chmod 755 and then 644 left registers as not.
+      - name: A file the build marks is executable in its NAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/run-command.nix -A marks
 
       # test/data/run-command.nix: hello, written by writeText, and copies, a
       # runCommand script that calls mkdir, cp and catm by bare name on

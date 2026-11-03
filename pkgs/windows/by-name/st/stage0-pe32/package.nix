@@ -445,12 +445,13 @@ let
   # programs installed as bin/<name>.exe, each under its attribute's name: the
   # layout nixpkgs' stage0-posix gives kaem, mescc-tools and
   # mescc-tools-extra.  kaem lays the directory out with mescc-tools-extra's
-  # mkdir and cp, as nixpkgs' kaem/default.nix lays out its own, and names
-  # them by store path, since these directories are where PATH would find
-  # them.  A script from builtins.toFile may not name a derivation, so each
-  # program reaches it as the variable of its name.  nixpkgs follows each cp
-  # with chmod 555, and nothing does here: M2libc's Windows chmod does
-  # nothing, and Windows runs a PE image whatever its mode.
+  # mkdir, cp and chmod, following each cp with chmod 555 as nixpkgs'
+  # kaem/default.nix lays out its own, and names them by store path, since
+  # these directories are where PATH would find them.  A script from
+  # builtins.toFile may not name a derivation, so each program reaches it as
+  # the variable of its name.  cp writes a file that is not executable, and
+  # M2libc's Windows chmod sets the stream nova-nix reads the executable bit
+  # from, so the NAR records each program as executable, as nixpkgs' does.
   binDirectory =
     name: programs:
     let
@@ -460,7 +461,7 @@ let
       programs
       // {
         inherit name;
-        inherit (extraPrograms) mkdir cp;
+        inherit (extraPrograms) mkdir cp chmod;
         system = "i686-windows";
         builder = "${kaem-unwrapped}";
         args = [
@@ -476,6 +477,7 @@ let
               ]
               ++ map (program: ''
                 ${variable "cp"} ${variable program} ${bin}/${program}.exe
+                ${variable "chmod"} 555 ${bin}/${program}.exe
               '') (builtins.attrNames programs)
             )
           ))
