@@ -10839,6 +10839,13 @@ testPkgsFetchurl = do
 -- included, is those five steps with the arguments the .cmd gives kaem.  hex0
 -- carries the seed's hash as its own, so the build itself checks that the
 -- seed reproduces itself.
+--
+-- The bin directories and @test\/data\/run-command.nix@'s writeText and
+-- runCommand builds add derivations kaem builds and no leaf, and read nothing
+-- but the scripts evaluation writes.  Each bin directory's script copies the
+-- programs its variables name to @bin\/\<name\>.exe@, runCommand runs its
+-- script from those directories on a PATH joined with @;@, and a store path
+-- in that script is spelled from @NIX_STORE@.
 testStage0Pe32Chain :: IO [Bool]
 testStage0Pe32Chain = do
   putStrLn "pkgs/stage0-pe32"
@@ -10850,30 +10857,38 @@ testStage0Pe32Chain = do
   -- binary resolves it against its own.
   let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
       chain = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ").stage0-pe32"
+      runCommandTests = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "run-command.nix")
       quoted name = "\"" <> name <> "\""
       source =
         T.concat
           [ "let chain = ",
             chain,
+            "; runs = ",
+            runCommandTests,
             "; in builtins.concatStringsSep \" \" (map (name: chain.${name}.drvPath) [ ",
-            T.unwords (map quoted ("seed" : links)),
+            T.unwords (map quoted ("seed" : links ++ bins)),
             " ] ++ map (name: chain.mescc-tools-extra.${name}.drvPath) [ ",
             T.unwords (map quoted extras),
+            " ] ++ map (name: runs.${name}.drvPath) [ ",
+            T.unwords (map quoted runs),
             " ])"
           ]
+      chainAttrs = ("seed" : links) ++ map extraAttr extras
   outcome <- case parseNix cwd "<test>" source of
     Left err -> pure (Left (T.pack (show err)))
     Right expr -> runEvalIO st $ do
       value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
       case value of
         VStr bytes _ -> do
-          let roots = T.words (bytesText bytes)
-          graph <- sessionClosure roots
-          pure (Map.fromList (zip (("seed" : links) ++ map extraAttr extras) roots), graph)
+          let rootOf = Map.fromList (zip (("seed" : links ++ bins) ++ map extraAttr extras ++ map runAttr runs) (T.words (bytesText bytes)))
+          graph <- sessionClosure (mapMaybe (`Map.lookup` rootOf) chainAttrs)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, graph, full)
         other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
   case outcome of
     Left err -> sequence [runTest instantiates (Fail err)]
-    Right (rootOf, graph) -> do
+    Right (rootOf, graph, full) -> do
       let derivations = Map.elems graph
           fetches = filter ((== fetchurlBuilder) . drvBuilder) derivations
           unpacks = filter ((== builtinUnpackBuilder) . drvBuilder) derivations
@@ -10882,8 +10897,8 @@ testStage0Pe32Chain = do
           nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
           isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
           outOf drv = [TE.encodeUtf8 (storePathToText defaultStoreDir (doPath o)) | o <- drvOutputs drv, doName o == "out"]
-          inputsOf drv = mapMaybe ((`Map.lookup` graph) . storePathToText defaultStoreDir) (Map.keys (drvInputDrvs drv))
-          builtBy attr = Map.lookup attr rootOf >>= (`Map.lookup` graph)
+          inputsOf drv = mapMaybe ((`Map.lookup` full) . storePathToText defaultStoreDir) (Map.keys (drvInputDrvs drv))
+          builtBy attr = Map.lookup attr rootOf >>= (`Map.lookup` full)
           builderNamesOf drv = [nameOf input | input <- inputsOf drv, drvBuilder drv `elem` outOf input]
           fixedHashOf drv = [(doHashAlgo o, doHash o) | o <- drvOutputs drv, doName o == "out"]
           isStep drv = drvBuilder drv `notElem` [fetchurlBuilder, builtinUnpackBuilder]
@@ -10905,6 +10920,21 @@ testStage0Pe32Chain = do
             let repo = T.dropEnd 1 (fst (T.breakOnEnd "-" (nameOf unpack)))
             pure (repo <> "/" <> bytesText (BS.drop 1 (BS8.dropWhile (/= '/') rest)))
           command drv = (nameOf drv, builderNamesOf drv, map (spell drv) (drvArgs drv))
+          -- What the bin directories and run-command.nix add to the chain.
+          added = Map.elems (Map.difference full graph)
+          fullLeaves = filter (Map.null . drvInputDrvs) (Map.elems full)
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          outText attr = maybe "" bytesText (builtBy attr >>= listToMaybe . outOf)
+          -- Each variable of a bin directory that names a program, with the
+          -- name of the program's derivation.
+          installs drv = sort [(var, nameOf input) | (var, value) <- Map.toList (drvEnv drv), var /= "builder", input <- inputsOf drv, value `elem` outOf input]
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          runsWith drv = (bytesText (drvBuilder drv), map (spell drv) (drvArgs drv), variableOf "PATH" drv)
+          scriptOf drv = listToMaybe [input | input <- inputsOf drv, nameOf input == nameOf drv <> "-builder"]
+          textFile drv = (bytesText (drvBuilder drv), variableOf "PATH" drv, variableOf "passAsFile" drv, variableOf "text" drv, sort (map nameOf (inputsOf drv)))
+          kaemExe = outText "kaem" <> "/bin/kaem.exe"
+          extraPath = outText "mescc-tools-extra" <> "/bin"
+          hello = "${NIX_STORE}/" <> T.drop (T.length defaultStoreDirText + 1) (outText (runAttr "hello"))
       sequence
         [ runTest instantiates $
             assertEqual "steps, unpacks, fetches" (95, 5, 6) (length steps, length unpacks, length fetches),
@@ -10915,7 +10945,7 @@ testStage0Pe32Chain = do
           runTest "the chain's leaves are the seed and the five source archives, all fixed-output" $
             assertEqual
               "leaves"
-              (sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-f0b1726.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "mescc-tools-extra-d1d8146.tar.gz", "stage0-pe32-28ec2d2.tar.gz"], True)
+              (fetchNames, True)
               ( sort (map nameOf leaves),
                 all (\drv -> drvBuilder drv == fetchurlBuilder && isFixedOutput drv) leaves
               ),
@@ -10939,7 +10969,68 @@ testStage0Pe32Chain = do
             case (fixedHashOf <$> builtBy "seed", fixedHashOf <$> builtBy "hex0") of
               (Just seedHash@[(_, digest)], Just hex0Hash)
                 | not (T.null digest) -> assertEqual "hex0's output hash" seedHash hex0Hash
-              other -> Fail ("expected the seed's fixed-output hash on hex0: " <> T.pack (show other))
+              other -> Fail ("expected the seed's fixed-output hash on hex0: " <> T.pack (show other)),
+          runTest "the bin directories and run-command.nix add eight derivations" $
+            assertEqual
+              "derivations added"
+              (sort ["kaem", "mescc-tools", "mescc-tools-extra", "hello.txt", "run-command-copies", "run-command-copies-builder", "run-command-fails", "run-command-fails-builder"])
+              (sort (map nameOf added)),
+          runTest "with them the leaves are still the seed and the five source archives" $
+            assertEqual "leaves" fetchNames (sort (map nameOf fullLeaves)),
+          runTest "they read no input source but the scripts evaluation writes as text" $
+            assertEqual
+              "derivation and its sources, all written as text"
+              ( [ ("hello.txt", ["write-text.kaem"]),
+                  ("kaem", ["kaem-bin.kaem"]),
+                  ("mescc-tools", ["mescc-tools-bin.kaem"]),
+                  ("mescc-tools-extra", ["mescc-tools-extra-bin.kaem"]),
+                  ("run-command-copies-builder", ["write-text.kaem"]),
+                  ("run-command-fails-builder", ["write-text.kaem"])
+                ],
+                True
+              )
+              ( sort [(nameOf drv, sort (map spName (drvInputSrcs drv))) | drv <- added, not (null (drvInputSrcs drv))],
+                all (all wroteAsText . drvInputSrcs) added
+              ),
+          runTest "every derivation they add is i686-windows" $
+            case [nameOf drv | drv <- added, drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "kaem lays out each bin directory from the programs its variables name" $
+            assertEqual
+              "bin directory, program run, variable and program"
+              [ ("kaem", ["kaem.exe"], sort [("cp", "cp.exe"), ("kaem", "kaem.exe"), ("mkdir", "mkdir.exe")]),
+                ("mescc-tools", ["kaem.exe"], sort [("M1", "M1.exe"), ("M2-Planet", "M2.exe"), ("cp", "cp.exe"), ("hex2", "hex2-new.exe"), ("mkdir", "mkdir.exe")]),
+                ("mescc-tools-extra", ["kaem.exe"], sort [(name, name <> ".exe") | name <- extras])
+              ]
+              [(attr, maybe [] builderNamesOf (builtBy attr), maybe [] installs (builtBy attr)) | attr <- bins],
+          runTestM "each bin directory's script copies its programs to bin/<name>.exe, and writeText's copies the text" $ do
+            let scriptsOf drv = map (storePathToFilePath storeDir) (drvInputSrcs drv)
+            scripts <- traverse (traverse BS.readFile . maybe [] scriptsOf . builtBy) (bins ++ [runAttr "hello"])
+            pure $
+              assertEqual
+                "scripts"
+                [[installScript ["kaem"]], [installScript ["M1", "M2-Planet", "hex2"]], [installScript extras], ["cp ${textPath} ${out}\n"]]
+                (map (map bytesText) scripts),
+          runTest "runCommand runs its script with kaem from the bin directories, on PATH joined with ';'" $
+            assertEqual
+              "builder, arguments, PATH"
+              [ (kaemExe, ["--verbose", "--strict", "--file", name <> "-builder"], T.intercalate ";" [outText attr <> "/bin" | attr <- bins])
+              | name <- ["run-command-copies", "run-command-fails"]
+              ]
+              (mapMaybe (fmap runsWith . builtBy . runAttr) ["copies", "fails"]),
+          runTest "writeText passes its text as a file, and runCommand's script spells a store path from NIX_STORE" $
+            assertEqual
+              "builder, PATH, passAsFile, text and inputs"
+              [ (kaemExe, extraPath, "text", "stage0-pe32 runs a kaem script\n", ["kaem", "mescc-tools-extra"]),
+                ( kaemExe,
+                  extraPath,
+                  "text",
+                  T.unlines ["mkdir -p ${out}/a/b", "cp " <> hello <> " ${out}/a/b/hello.txt", "catm ${out}/twice.txt " <> hello <> " " <> hello],
+                  ["hello.txt", "kaem", "mescc-tools-extra"]
+                )
+              ]
+              (map textFile (catMaybes [builtBy (runAttr "hello"), builtBy (runAttr "copies") >>= scriptOf]))
         ]
   where
     instantiates :: Text
@@ -10947,11 +11038,22 @@ testStage0Pe32Chain = do
     fetchurlBuilder :: BS.ByteString
     fetchurlBuilder = "builtin:fetchurl"
     links :: [Text]
-    links = ["hex0", "hex1", "hex2", "catm", "M0", "cc_x86", "M2", "M1", "hex2-new", "kaem"]
+    links = ["hex0", "hex1", "hex2", "catm", "M0", "cc_x86", "M2", "M1", "hex2-new", "kaem-unwrapped"]
     extras :: [Text]
     extras = ["sha256sum", "match", "mkdir", "untar", "ungz", "unbz2", "unxz", "catm", "cp", "chmod", "rm", "replace", "wrap"]
     extraAttr :: Text -> Text
     extraAttr = ("mescc-tools-extra." <>)
+    bins :: [Text]
+    bins = ["kaem", "mescc-tools", "mescc-tools-extra"]
+    runs :: [Text]
+    runs = ["hello", "copies", "fails"]
+    runAttr :: Text -> Text
+    runAttr = ("run-command." <>)
+    -- The script kaem runs to lay out a bin directory of the programs named.
+    installScript :: [Text] -> Text
+    installScript names = T.unlines ("${mkdir} -p ${out}/bin" : ["${cp} ${" <> name <> "} ${out}/bin/" <> name <> ".exe" | name <- sort names])
+    fetchNames :: [Text]
+    fetchNames = sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-f0b1726.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "mescc-tools-extra-d1d8146.tar.gz", "stage0-pe32-28ec2d2.tar.gz"]
     -- The steps that build a C program on M2libc's POSIX layer, named for
     -- stem: the file each writes, the program it runs and its arguments.
     cProgram :: Text -> Text -> [Text] -> [(Text, [Text], [Text])]
@@ -10979,7 +11081,7 @@ testStage0Pe32Chain = do
     cmdPrograms :: [(Text, [(Text, [Text], [Text])])]
     cmdPrograms =
       [ ("hex2-new", cProgram "hex2-new.exe" "hex2_linker" (libcPosix ++ map ("mescc-tools/" <>) ["hex2.h", "hex2_linker.c", "hex2_word.c", "hex2.c"])),
-        ("kaem", cProgram "kaem.exe" "kaem" (libcString ++ map ("mescc-tools/Kaem/" <>) ["kaem.h", "variable.c", "kaem_globals.c", "kaem.c"]))
+        ("kaem-unwrapped", cProgram "kaem.exe" "kaem" (libcString ++ map ("mescc-tools/Kaem/" <>) ["kaem.h", "variable.c", "kaem_globals.c", "kaem.c"]))
       ]
     extraPrograms :: [(Text, [(Text, [Text], [Text])])]
     extraPrograms =

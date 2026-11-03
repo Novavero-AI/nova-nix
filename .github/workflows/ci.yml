@@ -540,7 +540,9 @@ jobs:
   # x86/mescc-tools-mini.cmd.  Each link has to be the file stage0-pe32's own
   # CI builds with cmd.exe, byte for byte, and hex0 has to be the seed.  Then
   # mescc-tools-extra's thirteen programs, built by those links, each run
-  # once.  No store cache, for the reason E2E (Windows) has none.
+  # once, and kaem, mescc-tools and mescc-tools-extra as bin directories,
+  # with kaem.runCommand running scripts from them.  No store cache, for the
+  # reason E2E (Windows) has none.
   #
   # x64 and ARM64 Windows each run all of it, as stage0-pe32's CI runs its
   # chain on both: the links are i686, which x64 Windows runs through WoW64
@@ -631,7 +633,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for attr in hex0 hex1 hex2 catm M0 cc_x86 M2 M1 hex2-new kaem; do
+          for attr in hex0 hex1 hex2 catm M0 cc_x86 M2 M1 hex2-new kaem-unwrapped; do
             out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "stage0-pe32.$attr" | tail -n 1)
             path=$(cygpath -u "$out")
             echo "$attr $path" >> "$RUNNER_TEMP/links.txt"
@@ -666,7 +668,7 @@ jobs:
           M2 6b3472763f8560faad83492b6aab6b20c00d4dffa5c3364b8dd8bf5692bb8075
           M1 10283f7d2409eff34f16788f12759bcb5526295c2dc36e0ed891c87e47595cd0
           hex2-new 651adcaf8103611d98f64e1aced968e5ba8a515ed7308375655e4615983cf133
-          kaem 7f4ddcc3e61bee059b5d1feec9598c0f2b7d8f2b77649dd231f20821390a9c70
+          kaem-unwrapped 7f4ddcc3e61bee059b5d1feec9598c0f2b7d8f2b77649dd231f20821390a9c70
           EOF
           exit "$status"
 
@@ -779,6 +781,95 @@ jobs:
           else
             fail "wrap exited $code and said: $said"
           fi
+          exit "$status"
+
+      # kaem-unwrapped laying out kaem, mescc-tools and mescc-tools-extra as
+      # bin directories with mescc-tools-extra's mkdir and cp.
+      - name: Build the bin directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in kaem mescc-tools mescc-tools-extra; do
+            out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "stage0-pe32.$attr" | tail -n 1)
+            echo "$attr $(cygpath -u "$out")" >> "$RUNNER_TEMP/bins.txt"
+          done
+          cat "$RUNNER_TEMP/bins.txt"
+
+      # Each file of each bin directory is the program it was copied from,
+      # byte for byte.
+      - name: Each bin directory holds its programs
+        shell: bash
+        run: |
+          set -uo pipefail
+          declare -A store
+          while read -r attr path; do store[$attr]=$path; done < "$RUNNER_TEMP/links.txt"
+          while read -r name path; do store[mescc-tools-extra.$name]=$path; done < "$RUNNER_TEMP/extra.txt"
+          while read -r attr path; do store[$attr]=$path; done < "$RUNNER_TEMP/bins.txt"
+          status=0
+          holds() {
+            if cmp "${store[$1]}/bin/$2" "${store[$3]}"; then
+              echo "ok    $1/bin/$2 is $3"
+            else
+              echo "::error::$1/bin/$2 is not $3"
+              status=1
+            fi
+          }
+          holds kaem kaem.exe kaem-unwrapped
+          holds mescc-tools M2-Planet.exe M2
+          holds mescc-tools M1.exe M1
+          holds mescc-tools hex2.exe hex2-new
+          for name in sha256sum match mkdir untar ungz unbz2 unxz catm cp chmod rm replace wrap; do
+            holds mescc-tools-extra "$name.exe" "mescc-tools-extra.$name"
+          done
+          exit "$status"
+
+      # test/data/run-command.nix: hello, written by writeText, and copies, a
+      # runCommand script that calls mkdir, cp and catm by bare name on
+      # hello's store path.  Each output is checked against bytes the
+      # runner's own printf and cat write.
+      - name: runCommand runs a kaem script
+        shell: bash
+        run: |
+          set -euo pipefail
+          build() { "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/run-command.nix -A "$1" | tail -n 1; }
+          hello=$(cygpath -u "$(build hello)")
+          copies=$(cygpath -u "$(build copies)")
+          work="$(cygpath -u "$RUNNER_TEMP")/run-command"
+          mkdir "$work"
+          printf 'stage0-pe32 runs a kaem script\n' > "$work/hello.txt"
+          cat "$work/hello.txt" "$work/hello.txt" > "$work/twice.txt"
+          status=0
+          same() {
+            if cmp "$1" "$2"; then
+              echo "ok    $3"
+            else
+              echo "::error::$3: $2 is not $1"
+              status=1
+            fi
+          }
+          same "$work/hello.txt" "$hello" "writeText writes the text"
+          same "$work/hello.txt" "$copies/a/b/hello.txt" "mkdir -p and cp copy it into a/b"
+          same "$work/twice.txt" "$copies/twice.txt" "catm joins it twice"
+          exit "$status"
+
+      # kaem runs the script strict, so cp's failure stops it before the mkdir
+      # that would make the output, and the build fails with kaem's reason.
+      # --verbose echoes each command kaem runs, so the mkdir is never echoed.
+      - name: A failing command fails runCommand
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/fails.log"
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/run-command.nix -A fails > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          status=0
+          fail() { echo "::error::$1"; status=1; }
+          [ "$code" != 0 ] || fail "fails built"
+          grep -Fqx 'Error opening source file missing.txt' "$log" || fail "cp did not report missing.txt"
+          grep -Fqx 'Subprocess error 1' "$log" || fail "kaem did not report cp's exit status"
+          grep -Fqx 'ABORTING HARD' "$log" || fail "kaem did not abort"
+          if grep -Fq ' +> mkdir' "$log"; then fail "kaem ran the mkdir after cp failed"; fi
           exit "$status"
 
   # ---------------------------------------------------------------------------
