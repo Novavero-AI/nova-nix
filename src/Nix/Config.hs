@@ -1,7 +1,8 @@
 -- | Nix configuration: the @nix.conf@ / @NIX_CONFIG@ settings that decide
 -- which binary caches a machine substitutes from, which public keys it
--- trusts, how deep function calls may nest, and how far an evaluation
--- may reach (@restrict-eval@, @pure-eval@, @allowed-uris@).
+-- trusts, how deep function calls may nest, how far an evaluation may
+-- reach (@restrict-eval@, @pure-eval@, @allowed-uris@), and whether
+-- @builtins.traceVerbose@ traces (@trace-verbose@).
 --
 -- == The format
 --
@@ -152,17 +153,20 @@ data NixConfig = NixConfig
     -- | Upstream @restrict-eval@.
     ncRestrictEval :: !Bool,
     -- | Upstream @pure-eval@.
-    ncPureEval :: !Bool
+    ncPureEval :: !Bool,
+    -- | Upstream @trace-verbose@.
+    ncTraceVerbose :: !Bool
   }
   deriving (Eq, Show)
 
 -- | The baseline the fold starts from: no substituters, no trusted keys,
--- upstream's call-depth ceiling, no allowed URIs, and both evaluation
--- modes off.  The empty substituter list is nova-nix's existing default
--- (nothing is substituted unless configured), a deliberate divergence
--- from upstream's cache.nixos.org default: turning a cache on for every
--- machine is the operator's decision to make in a config file, not a
--- built-in.  The other defaults are upstream's own.
+-- upstream's call-depth ceiling, no allowed URIs, both evaluation modes
+-- off, and @trace-verbose@ off.  The empty substituter list is
+-- nova-nix's existing default (nothing is substituted unless
+-- configured), a deliberate divergence from upstream's cache.nixos.org
+-- default: turning a cache on for every machine is the operator's
+-- decision to make in a config file, not a built-in.  The other defaults
+-- are upstream's own.
 defaultNixConfig :: NixConfig
 defaultNixConfig =
   NixConfig
@@ -171,7 +175,8 @@ defaultNixConfig =
       ncMaxCallDepth = defaultMaxCallDepth,
       ncAllowedUris = [],
       ncRestrictEval = False,
-      ncPureEval = False
+      ncPureEval = False,
+      ncTraceVerbose = False
     }
 
 -- ---------------------------------------------------------------------------
@@ -585,6 +590,7 @@ resolveName name =
       | n == allowedUrisKey = Just (ListSetting AllowedUrisField)
       | n == restrictEvalKey = Just (BoolSetting RestrictEvalField)
       | n == pureEvalKey = Just (BoolSetting PureEvalField)
+      | n == traceVerboseKey = Just (BoolSetting TraceVerboseField)
       | n == maxCallDepthKey = Just (ScalarSetting MaxCallDepthField)
       | otherwise = Nothing
 
@@ -597,7 +603,7 @@ data ListField = SubstitutersField | TrustedKeysField | AllowedUrisField
   deriving (Eq, Show)
 
 -- | The Boolean settings.
-data BoolField = RestrictEvalField | PureEvalField
+data BoolField = RestrictEvalField | PureEvalField | TraceVerboseField
   deriving (Eq, Show)
 
 -- | The scalar settings, which only ever replace.
@@ -626,6 +632,7 @@ listFieldKey AllowedUrisField = allowedUrisKey
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool RestrictEvalField v config = config {ncRestrictEval = v}
 setBool PureEvalField v config = config {ncPureEval = v}
+setBool TraceVerboseField v config = config {ncTraceVerbose = v}
 
 -- | Upstream's Boolean spellings (@BaseSetting\<bool\>::parse@): anything
 -- else is an error with upstream's wording, which names the setting alone,
@@ -675,11 +682,12 @@ trustedKeysKey, trustedKeysAlias :: ByteString
 trustedKeysKey = "trusted-public-keys"
 trustedKeysAlias = "binary-cache-public-keys"
 
-allowedUrisKey, maxCallDepthKey, pureEvalKey, restrictEvalKey :: ByteString
+allowedUrisKey, maxCallDepthKey, pureEvalKey, restrictEvalKey, traceVerboseKey :: ByteString
 allowedUrisKey = "allowed-uris"
 maxCallDepthKey = "max-call-depth"
 pureEvalKey = "pure-eval"
 restrictEvalKey = "restrict-eval"
+traceVerboseKey = "trace-verbose"
 
 extraPrefix :: ByteString
 extraPrefix = "extra-"
