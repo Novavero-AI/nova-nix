@@ -64,7 +64,7 @@ import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAtt
 import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
-import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetSize, cattrsetUnion)
+import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcDataCount, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
 import Nix.Eval.CList (clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks)
@@ -77,6 +77,7 @@ import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalStat
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printValue)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
+import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecorder, noPos, recordPos)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternBytes, symbolLen, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), allocCSlots, attrSetKeys, buildCSlots, emptyCList, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
@@ -184,6 +185,15 @@ assertLeft label (Right val) = Fail (label <> ": expected error but got: " <> T.
 testBaseDir :: FilePath
 testBaseDir = "/nova-nix-test"
 
+-- | Where a test expression's source comes from: text with no file, as an
+-- @--expr@ argument is.
+testOrigin :: SourceOrigin
+testOrigin = SourceText "<test>"
+
+-- | A position in a test expression's source.
+testPos :: Int -> Int -> SrcPos
+testPos = SrcPos testOrigin
+
 -- | Helper: parse and check result.
 assertParse :: Text -> Text -> Expr -> TestResult
 assertParse = assertParseIn []
@@ -192,7 +202,7 @@ assertParse = assertParseIn []
 -- way @scopedImport@ binds its scope: each stays a name-based 'EVar'.
 assertParseIn :: [Text] -> Text -> Text -> Expr -> TestResult
 assertParseIn names label source expected =
-  assertRight label (parseNixWithScope (withGlobals names) testBaseDir "<test>" source) $ \actual ->
+  assertRight label (parseNixWithScope (withGlobals names) testBaseDir testOrigin source) $ \actual ->
     assertEqual label expected actual
 
 -- | The root environment's names with more bound around them.
@@ -206,7 +216,7 @@ tokenTypes = filter (/= TokEOF) . map locToken
 -- | Helper: parse Nix source and evaluate with builtinEnv.  Parse errors
 -- are tagged so failure assertions can tell them apart from eval errors.
 evalNix :: Text -> Either Text NixValue
-evalNix source = case parseNix testBaseDir "<test>" source of
+evalNix source = case parseNix testBaseDir testOrigin source of
   Left err -> Left (sourceFailure err)
   Right expr -> runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 
@@ -223,7 +233,7 @@ sourceFailure (UndefinedVariable name) = undefinedVariableMessage name
 
 -- | The syntax error a source fails to parse with.
 syntaxErrorOf :: Text -> Either Text ParseError
-syntaxErrorOf source = case parseNix testBaseDir "<test>" source of
+syntaxErrorOf source = case parseNix testBaseDir testOrigin source of
   Left (SyntaxError err) -> Right err
   Left other -> Left ("expected a syntax error, got " <> T.pack (show other))
   Right _ -> Left "parsed unexpectedly"
@@ -336,10 +346,10 @@ testExprTypes = do
         let expr = ELambda (FormalName "x") (EVar "x") NoCaptureInfo
          in assertEqual "ELambda" expr expr,
       runTest "let binding" $
-        let expr = ELet [NamedBinding (StaticKey "x") (ELit (NixInt 1))] (EVar "x") NoCaptureInfo
+        let expr = ELet [NamedBinding (testPos 1 5) (StaticKey "x") (ELit (NixInt 1))] (EVar "x") NoCaptureInfo
          in assertEqual "ELet" expr expr,
       runTest "attrs" $
-        let expr = EAttrs False [NamedBinding (StaticKey "a") (ELit (NixInt 1))] NoCaptureInfo
+        let expr = EAttrs False [NamedBinding (testPos 1 3) (StaticKey "a") (ELit (NixInt 1))] NoCaptureInfo
          in assertEqual "EAttrs" expr expr,
       runTest "if-then-else" $
         let expr = EIf (ELit (NixBool True)) (ELit (NixInt 1)) (ELit (NixInt 2))
@@ -1439,17 +1449,17 @@ testEvalWith = do
           (VInt 3),
       -- AST test: parse "with a; b" produces EWithVar
       runTest "parse with produces EWithVar" $
-        assertRight "with-ast" (parseNixWithScope (withGlobals ["a"]) testBaseDir "<test>" "with a; b") $ \case
+        assertRight "with-ast" (parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "with a; b") $ \case
           EWith (EVar "a") (EWithVar "b") -> Pass
           other -> Fail ("expected EWith (EVar a) (EWithVar b), got: " <> T.pack (show other)),
       -- AST test: formal wins over with
       runTest "parse lambda formal wins over with" $
-        assertRight "formal-wins" (parseNixWithScope (withGlobals ["a"]) testBaseDir "<test>" "x: with a; x") $ \case
+        assertRight "formal-wins" (parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "x: with a; x") $ \case
           ELambda _ (EWith _ (EResolvedVar 0 0)) _ -> Pass
           other -> Fail ("expected formal to win, got: " <> T.pack (show other)),
       -- Trimming test: lambda inside with gets CapturesWithScopes
       runTest "with lambda trimmed with CapturesWithScopes" $
-        assertRight "with-trim" (parseNixWithScope (withGlobals ["a"]) testBaseDir "<test>" "with a; x: b + x") $ \case
+        assertRight "with-trim" (parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "with a; x: b + x") $ \case
           EWith _ (ELambda _ _ (CapturesWithScopes _)) -> Pass
           other -> Fail ("expected CapturesWithScopes, got: " <> T.pack (show other))
     ]
@@ -2208,12 +2218,12 @@ testParserExprs = do
         assertParse
           "attrs"
           "{ a = 1; }"
-          (EAttrs False [NamedBinding (StaticKey "a") (ELit (NixInt 1))] NoCaptureInfo),
+          (EAttrs False [NamedBinding (testPos 1 3) (StaticKey "a") (ELit (NixInt 1))] NoCaptureInfo),
       runTest "parse rec attrs" $
         assertParse
           "rec attrs"
           "rec { a = 1; }"
-          (EAttrs True [NamedBinding (StaticKey "a") (ELit (NixInt 1))] NoCaptureInfo),
+          (EAttrs True [NamedBinding (testPos 1 7) (StaticKey "a") (ELit (NixInt 1))] NoCaptureInfo),
       -- inherit x y; is one binding per name, each holding the variable it
       -- copies, which resolution binds like any other variable.
       runTest "parse inherit" $
@@ -2221,19 +2231,19 @@ testParserExprs = do
           ["x", "y"]
           "inherit"
           "{ inherit x y; }"
-          (EAttrs False [Inherit "x" (EVar "x"), Inherit "y" (EVar "y")] NoCaptureInfo),
+          (EAttrs False [Inherit (testPos 1 11) "x" (EVar "x"), Inherit (testPos 1 13) "y" (EVar "y")] NoCaptureInfo),
       runTest "parse inherit from" $
         assertParseIn
           ["a"]
           "inherit from"
           "{ inherit (a) x; }"
-          (EAttrs False [InheritFrom (EVar "a") ["x"]] NoCaptureInfo),
+          (EAttrs False [InheritFrom (EVar "a") [InheritedName (testPos 1 15) "x"]] NoCaptureInfo),
       -- Let/if/with/assert
       runTest "parse let" $
         assertParse
           "let"
           "let x = 1; in x"
-          (ELet [NamedBinding (StaticKey "x") (ELit (NixInt 1))] (EResolvedVar 0 0) NoCaptureInfo),
+          (ELet [NamedBinding (testPos 1 5) (StaticKey "x") (ELit (NixInt 1))] (EResolvedVar 0 0) NoCaptureInfo),
       runTest "parse if-then-else" $
         assertParse
           "if"
@@ -2269,7 +2279,7 @@ testParserExprs = do
         assertParse
           "or attr key"
           "{ or = 1; }"
-          (EAttrs False [NamedBinding (StaticKey "or") (ELit (NixInt 1))] NoCaptureInfo)
+          (EAttrs False [NamedBinding (testPos 1 3) (StaticKey "or") (ELit (NixInt 1))] NoCaptureInfo)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -2281,19 +2291,19 @@ testParserErrors = do
   putStrLn "parser/errors"
   sequence
     [ runTest "empty input" $
-        assertLeft "empty" (parseNix testBaseDir "<test>" ""),
+        assertLeft "empty" (parseNix testBaseDir testOrigin ""),
       runTest "unclosed paren" $
-        assertLeft "unclosed paren" (parseNix testBaseDir "<test>" "(1"),
+        assertLeft "unclosed paren" (parseNix testBaseDir testOrigin "(1"),
       runTest "unclosed string" $
-        assertLeft "unclosed string" (parseNix testBaseDir "<test>" "\"hello"),
+        assertLeft "unclosed string" (parseNix testBaseDir testOrigin "\"hello"),
       runTest "unclosed brace" $
-        assertLeft "unclosed brace" (parseNix testBaseDir "<test>" "{ a = 1;"),
+        assertLeft "unclosed brace" (parseNix testBaseDir testOrigin "{ a = 1;"),
       runTest "missing semicolon" $
-        assertLeft "missing semi" (parseNix testBaseDir "<test>" "{ a = 1 }"),
+        assertLeft "missing semi" (parseNix testBaseDir testOrigin "{ a = 1 }"),
       runTest "unclosed bracket" $
-        assertLeft "unclosed bracket" (parseNix testBaseDir "<test>" "[ 1 2"),
+        assertLeft "unclosed bracket" (parseNix testBaseDir testOrigin "[ 1 2"),
       runTest "unexpected token" $
-        assertLeft "unexpected" (parseNix testBaseDir "<test>" ")"),
+        assertLeft "unexpected" (parseNix testBaseDir testOrigin ")"),
       -- A failure deep in a lambda body is reported where it happened:
       -- a parsed lambda header commits, instead of backtracking into
       -- the attr-set reading and reporting its early stumble (a real
@@ -2331,7 +2341,7 @@ testParserIntegration = do
   putStrLn "parser/integration"
   sequence
     [ runTest "shell.nix pattern" $
-        assertRight "shell.nix" (parseNix testBaseDir "<test>" "{ pkgs ? import <nixpkgs> {} }: pkgs.mkShell { buildInputs = [ pkgs.ghc ]; }") $ \case
+        assertRight "shell.nix" (parseNix testBaseDir testOrigin "{ pkgs ? import <nixpkgs> {} }: pkgs.mkShell { buildInputs = [ pkgs.ghc ]; }") $ \case
           ELambda {} -> Pass
           other -> Fail ("expected ELambda, got: " <> T.pack (show other)),
       runTest "let with multiple bindings" $
@@ -2339,8 +2349,8 @@ testParserIntegration = do
           "multi-let"
           "let x = 1; y = 2; in x + y"
           ( ELet
-              [ NamedBinding (StaticKey "x") (ELit (NixInt 1)),
-                NamedBinding (StaticKey "y") (ELit (NixInt 2))
+              [ NamedBinding (testPos 1 5) (StaticKey "x") (ELit (NixInt 1)),
+                NamedBinding (testPos 1 12) (StaticKey "y") (ELit (NixInt 2))
               ]
               (EBinary OpAdd (EResolvedVar 0 0) (EResolvedVar 0 1))
               NoCaptureInfo
@@ -2348,44 +2358,46 @@ testParserIntegration = do
       runTest "nested attr set" $
         -- Normalization hoists a nested attrpath into nested literal sets
         -- (upstream parser.y addAttr), so a.b.c = 1 parses like
-        -- a = { b = { c = 1; }; }.
+        -- a = { b = { c = 1; }; }, every level at the path's position.
         assertParse
           "nested attrs"
           "{ a.b.c = 1; d = { e = 2; }; }"
           ( EAttrs
               False
               [ NamedBinding
+                  (testPos 1 3)
                   (StaticKey "a")
                   ( EAttrs
                       False
                       [ NamedBinding
+                          (testPos 1 3)
                           (StaticKey "b")
-                          (EAttrs False [NamedBinding (StaticKey "c") (ELit (NixInt 1))] NoCaptureInfo)
+                          (EAttrs False [NamedBinding (testPos 1 3) (StaticKey "c") (ELit (NixInt 1))] NoCaptureInfo)
                       ]
                       NoCaptureInfo
                   ),
-                NamedBinding (StaticKey "d") (EAttrs False [NamedBinding (StaticKey "e") (ELit (NixInt 2))] NoCaptureInfo)
+                NamedBinding (testPos 1 14) (StaticKey "d") (EAttrs False [NamedBinding (testPos 1 20) (StaticKey "e") (ELit (NixInt 2))] NoCaptureInfo)
               ]
               NoCaptureInfo
           ),
       runTest "indented string" $
-        assertRight "ind string" (parseNix testBaseDir "<test>" "''hello''") $ \case
+        assertRight "ind string" (parseNix testBaseDir testOrigin "''hello''") $ \case
           EIndStr _ -> Pass
           other -> Fail ("expected EIndStr, got: " <> T.pack (show other)),
       runTest "indented string escape is its own part" $
-        assertRight "ind string esc" (parseNix testBaseDir "<test>" "''a'''b''") $ \case
+        assertRight "ind string esc" (parseNix testBaseDir testOrigin "''a'''b''") $ \case
           EIndStr [StrLit "a", StrEsc "''", StrLit "b"] -> Pass
           other -> Fail ("expected literal, escape, literal, got: " <> T.pack (show other)),
       -- Positional let/rec resolution tests
       runTest "let inherit from outer lambda" $
-        assertRight "let-inherit-lambda" (parseNix testBaseDir "<test>" "x: let inherit x; in x") $ \case
+        assertRight "let-inherit-lambda" (parseNix testBaseDir testOrigin "x: let inherit x; in x") $ \case
           -- x: let inherit x; in x
           -- The lambda formal x is at level 0, index 0.
           -- The let scope is level 0 (for the let body).
           -- The inherited variable resolves against the outer (lambda)
           -- scope, one level up from the let it is evaluated in.
           -- The body x resolves to level 0, index 0 (the let scope).
-          ELambda _ (ELet [Inherit "x" _rhsExpr] (EResolvedVar 0 0) _) _ -> Pass
+          ELambda _ (ELet [Inherit _ "x" _rhsExpr] (EResolvedVar 0 0) _) _ -> Pass
           other -> Fail ("expected ELambda with let-inherit, got: " <> T.pack (show other)),
       runTest "nested lambda in let" $
         assertEval
@@ -2980,7 +2992,7 @@ evalNixIO baseDir source = do
 
 -- | 'evalNixIO' keeping a failure whole, its lines of context included.
 evalNixIOTraced :: FilePath -> Text -> IO (Either EvalFailure NixValue)
-evalNixIOTraced baseDir source = case parseNix baseDir "<test>" source of
+evalNixIOTraced baseDir source = case parseNix baseDir testOrigin source of
   Left err -> pure (Left (EvalFailure [] (T.pack (show err))))
   Right expr -> do
     storeDir <- evalNixIOStoreDir
@@ -2992,7 +3004,7 @@ evalNixIOTraced baseDir source = case parseNix baseDir "<test>" source of
 -- which records the @.drv@ under that path, and the recipe is read back the
 -- way the build driver reads it.  Only the IO evaluator keeps the record.
 evalDerivationIO :: FilePath -> Text -> IO (Either Text Derivation)
-evalDerivationIO baseDir source = case parseNix baseDir "<test>" ("(" <> source <> ").drvPath") of
+evalDerivationIO baseDir source = case parseNix baseDir testOrigin ("(" <> source <> ").drvPath") of
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
     storeDir <- evalNixIOStoreDir
@@ -3545,6 +3557,7 @@ testImportIO = do
         TIO.writeFile (testDir </> "nested-outer.nix") "import ./nested-inner.nix"
         TIO.writeFile (testDir </> "attrset.nix") "{ x = 1; y = 2; }"
         TIO.writeFile (testDir </> "uses-arg.nix") "let f = x: x + 10; in f 5"
+        TIO.writeFile (testDir </> "positions.nix") "{\n  a = 1;\n}\n"
         TIO.writeFile (subDir </> "from-sub.nix") "7"
       cleanup = do
         exists <- doesDirectoryExist testDir
@@ -3564,6 +3577,18 @@ testImportIO = do
         runTestIOFail "import nonexistent -> error" testDir "import ./nonexistent.nix",
         runTestIO "import attrset + select" testDir "(import ./attrset.nix).x" (VInt 1),
         runTestIO "import let/lambda" testDir "import ./uses-arg.nix" (VInt 15),
+        -- A position in an imported file names the file the import read.
+        -- The import runs from the directory's canonical spelling, where
+        -- the path as written (upstream's) and the path with its symlinks
+        -- resolved (the one the import reads here) are the same.
+        do
+          canonicalDir <- Dir.canonicalizePath testDir
+          file <- Dir.canonicalizePath (canonicalDir </> "positions.nix")
+          runTestIO
+            "unsafeGetAttrPos names the imported file"
+            canonicalDir
+            "let p = builtins.unsafeGetAttrPos \"a\" (import ./positions.nix); in \"${p.file}:${toString p.line}:${toString p.column}\""
+            (mkStr (T.pack file <> ":2:3")),
         -- A string is coerced to a path only when it spells an absolute
         -- one; upstream refuses a relative string outright.
         runTestIOFail "import refuses a relative string" testDir "import \"./literal.nix\"",
@@ -3600,6 +3625,98 @@ testImportIO = do
           ("builtins.getAttr \"literal.nix\" (builtins.readDir " <> nixQuotedPath testDir <> ")")
           (mkStr "regular")
       ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: builtins.unsafeGetAttrPos
+-- ---------------------------------------------------------------------------
+
+-- | The file 'evalNixInFile' parses its source as.
+positionsFile :: Text
+positionsFile = "/nova-nix-test/positions.nix"
+
+-- | The file the derivation wrapper's positions name, upstream's name for
+-- its wrapper.
+derivationWrapperFile :: Text
+derivationWrapperFile = "/derivation-internal.nix"
+
+-- | 'evalNix' for source parsed as the file 'positionsFile', so the
+-- positions recorded in it name that file, as upstream's do for a file.
+evalNixInFile :: Text -> Either Text NixValue
+evalNixInFile source = case parseNix testBaseDir (SourceFile positionsFile) source of
+  Left err -> Left (sourceFailure err)
+  Right expr -> runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)
+
+-- | Each expected position is derived from upstream's source at 2.24.9:
+-- @prim_unsafeGetAttrPos@ (primops.cc) answers @EvalState::mkPos@ of the
+-- attribute's position, a set of @file@, @line@ and @column@ for one in a
+-- file and null for none; the parser records a binding at its attribute
+-- path's first token and an inherited name at itself (parser.y,
+-- parser-state.hh); and the builtins that copy an attribute copy its
+-- position.  The expressions put every attribute under test past line 1,
+-- so the @builtins.toJSON (@ the helper prefixes moves no column.
+testUnsafeGetAttrPos :: IO [Bool]
+testUnsafeGetAttrPos = do
+  putStrLn "eval/unsafeGetAttrPos"
+  sequence
+    [ inFile "a binding is at its name" "builtins.unsafeGetAttrPos \"a\" {\n  a = 1;\n}" (2, 3),
+      noPosition "a missing attribute has none" "builtins.unsafeGetAttrPos \"b\" {\n  a = 1;\n}",
+      inFile "an inherited name is at itself" "let x = 1; in builtins.unsafeGetAttrPos \"x\" {\n  inherit x;\n}" (2, 11),
+      inFile "a name inherited from a set is at itself" "builtins.unsafeGetAttrPos \"y\" {\n  inherit ({ x = 1; y = 2; }) x y;\n}" (2, 33),
+      inFile "a quoted inherited name is at its quote" "builtins.unsafeGetAttrPos \"or\" {\n  inherit ({ or = 1; }) \"or\";\n}" (2, 25),
+      inFile "a quoted static name is at its quote" "builtins.unsafeGetAttrPos \"q\" {\n  \"q\" = 1;\n}" (2, 3),
+      inFile "a dynamic name is at its interpolation" "builtins.unsafeGetAttrPos \"k\" {\n  ${\"k\"} = 1;\n}" (2, 3),
+      inFile "each level of a dotted path is at the path" "builtins.unsafeGetAttrPos \"c\" {\n  a.b.c = 1;\n}.a.b" (2, 3),
+      inFile "a merged path's first definition keeps its position" "builtins.unsafeGetAttrPos \"a\" {\n  a.b = 1;\n  a.c = 2;\n}" (2, 3),
+      inFile "a path merged into keeps each definition's own" "builtins.unsafeGetAttrPos \"c\" {\n  a.b = 1;\n  a.c = 2;\n}.a" (3, 3),
+      inFile "a set merged into a path keeps its bindings' own" "builtins.unsafeGetAttrPos \"b\" {\n  a.c = 1;\n  a = {\n    b = 2;\n  };\n}.a" (4, 5),
+      inFile "a rec set's binding is at its name" "builtins.unsafeGetAttrPos \"b\" rec {\n  a = 1;\n  b = a;\n}" (3, 3),
+      inFile "a rec set's dynamic name is at its interpolation" "builtins.unsafeGetAttrPos \"b\" rec {\n  a = \"b\";\n  ${a} = 2;\n}" (3, 3),
+      inFile "a rec set with a dynamic name keeps its static names'" "builtins.unsafeGetAttrPos \"a\" rec {\n  a = \"b\";\n  ${a} = 2;\n}" (2, 3),
+      inFile "an update keeps the left side's position" "builtins.unsafeGetAttrPos \"a\" ({\n  a = 1;\n  b = 2;\n} // {\n  b = 3;\n})" (2, 3),
+      inFile "an update takes the right side's position with its value" "builtins.unsafeGetAttrPos \"b\" ({\n  a = 1;\n  b = 2;\n} // {\n  b = 3;\n})" (5, 3),
+      inFile "removeAttrs keeps the positions it keeps" "builtins.unsafeGetAttrPos \"b\" (builtins.removeAttrs {\n  a = 1;\n  b = 2;\n} [ \"a\" ])" (3, 3),
+      inFile "intersectAttrs keeps the right set's position" "builtins.unsafeGetAttrPos \"a\" (builtins.intersectAttrs { a = null; } {\n  a = 1;\n})" (2, 3),
+      inFile "listToAttrs is at the element's value" "builtins.unsafeGetAttrPos \"k\" (builtins.listToAttrs [ {\n  name = \"k\";\n  value = 1;\n} ])" (3, 3),
+      noPosition "mapAttrs makes attributes with none" "builtins.unsafeGetAttrPos \"a\" (builtins.mapAttrs (n: v: v) {\n  a = 1;\n})",
+      noPosition "a builtin has none" "builtins.unsafeGetAttrPos \"map\" builtins",
+      -- A derivation's own attributes are on the wrapper's lines
+      -- ('derivationWrapperSource'), under upstream's file name.
+      inWrapper "a derivation's type is in the wrapper" "type" (17, 9),
+      inWrapper "a derivation's output is at the wrapper's listToAttrs value" "out" (14, 7),
+      inWrapper "a derivation's inherited drvAttrs is at the name" "drvAttrs" (9, 15),
+      inFile "a derivation keeps its argument's positions" (derivationAttrPos "name") (2, 3),
+      -- Text with no file behind it records positions that name none,
+      -- as upstream's Pos::String origin makes mkPos answer null.
+      runTest "text with no file gives no position" $
+        assertEval "text origin" "builtins.unsafeGetAttrPos \"a\" {\n  a = 1;\n}" VNull,
+      runTest "the name must be a string" $
+        assertEvalError "name" "builtins.unsafeGetAttrPos 1 { }" "expected a string but found an integer: 1",
+      -- The set throws when forced, so only a name checked before the set
+      -- is forced reports the name.
+      runTest "the name is checked before the set is forced" $
+        assertEvalError "name first" "builtins.unsafeGetAttrPos 1 (throw \"the set\")" "expected a string but found an integer: 1",
+      runTest "the name may not carry context" $
+        assertEvalError
+          "name context"
+          "builtins.unsafeGetAttrPos (builtins.appendContext \"x\" { \"/nix/store/00000000000000000000000000000000-a\" = { path = true; }; }) { }"
+          "the string 'x' is not allowed to refer to a store path (such as '00000000000000000000000000000000-a')",
+      runTest "the second argument must be a set" $
+        assertEvalError "set" "builtins.unsafeGetAttrPos \"a\" 1" "expected a set but found an integer: 1"
+    ]
+  where
+    inFile label source (line, column) = position label source (positionJson positionsFile line column)
+    inWrapper label name (line, column) = position label (derivationAttrPos name) (positionJson derivationWrapperFile line column)
+    noPosition label source = position label source "null"
+    -- toJSON pins the set mkPos builds: these three attributes only, the
+    -- file a string and the line and column integers.
+    position label source expected =
+      runTest label $
+        assertRight label (evalNixInFile ("builtins.toJSON (" <> source <> ")")) $ \actual ->
+          assertEqual label (mkStr expected) actual
+    positionJson file line column =
+      "{\"column\":" <> T.pack (show (column :: Int)) <> ",\"file\":\"" <> file <> "\",\"line\":" <> T.pack (show (line :: Int)) <> "}"
+    derivationAttrPos name =
+      "builtins.unsafeGetAttrPos \"" <> name <> "\" (derivation {\n  name = \"n\";\n  builder = \"b\";\n  system = \"s\";\n})"
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch A - getEnv, currentTime, toPath
@@ -3932,7 +4049,7 @@ expectMaxCallDepth label result = case result of
 
 -- | IO evaluation under an explicit call-depth ceiling.
 evalAtCeiling :: Word32 -> Text -> IO (Either Text NixValue)
-evalAtCeiling limit source = case parseNix "." "<test>" source of
+evalAtCeiling limit source = case parseNix "." testOrigin source of
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
     storeDir <- evalNixIOStoreDir
@@ -10945,7 +11062,7 @@ testStage0Pe32Chain = do
             " ])"
           ]
       chainAttrs = ("seed" : links) ++ map extraAttr extras
-  outcome <- case parseNix cwd "<test>" source of
+  outcome <- case parseNix cwd testOrigin source of
     Left err -> pure (Left (T.pack (show err)))
     Right expr -> runEvalIO st $ do
       value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
@@ -11352,7 +11469,7 @@ makeGitFixture dir files = do
 -- | 'evalNixIO' against an explicit store directory, for expressions
 -- whose evaluation writes store objects.
 evalNixIOStore :: StoreDir -> FilePath -> Text -> IO (Either Text NixValue)
-evalNixIOStore storeDir baseDir source = case parseNix baseDir "<test>" source of
+evalNixIOStore storeDir baseDir source = case parseNix baseDir testOrigin source of
   Left err -> pure (Left (T.pack (show err)))
   Right expr -> do
     st <- newEvalState storeDir baseDir
@@ -13925,7 +14042,7 @@ reservedNameTarballPath = StorePath "rlwykawmqrmdiq4xmcr4rf2zxf6y9k09" "source"
 -- | End-to-end: eval .nix source, extract derivation, build, verify output.
 evalAndBuild :: StoreDir -> Text -> IO (Either Text (BuildResult, Store))
 evalAndBuild storeDir source = do
-  case parseNix testBaseDir "<test>" source of
+  case parseNix testBaseDir testOrigin source of
     Left err -> pure (Left ("parse error: " <> T.pack (show err)))
     Right expr -> do
       -- The SAME store the build below is given.  Evaluating against the
@@ -14625,7 +14742,7 @@ arenaGuardPaths =
   where
     noArena name site = ArenaGuardPath name ("no arena: " <> T.pack name <> " raises ArenaNotInitialized at " <> site) (RefusedAt site)
     -- The program from #206, forced to its result.
-    evalIssueProgram = case parseNix "/tmp" "<expr>" "let x = 5; in x * 2 + 1" of
+    evalIssueProgram = case parseNix "/tmp" (SourceText "<expr>") "let x = 5; in x * 2 + 1" of
       Left err -> throwIO (ErrorCall (show err))
       Right expr -> void (evaluate (runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)))
     -- Read through the IO accessors: a pure read of a constant is itself
@@ -14912,8 +15029,8 @@ testCAttrSet = do
         kVer <- symbolIntern "version"
         valName <- newStablePtr ("hello" :: Text)
         valVer <- newStablePtr ("1.0" :: Text)
-        cattrsetInsert set kName (spToCPtr valName)
-        cattrsetInsert set kVer (spToCPtr valVer)
+        cattrsetInsert set kName noPos (spToCPtr valName)
+        cattrsetInsert set kVer noPos (spToCPtr valVer)
         cattrsetFreeze set
         result <- cattrsetLookup set kName
         case result of
@@ -14933,7 +15050,7 @@ testCAttrSet = do
         kFoo <- symbolIntern "foo"
         kBar <- symbolIntern "bar"
         sp <- newStablePtr ("x" :: Text)
-        cattrsetInsert set kFoo (spToCPtr sp)
+        cattrsetInsert set kFoo noPos (spToCPtr sp)
         cattrsetFreeze set
         result <- cattrsetLookup set kBar
         -- set freed by arenaDestroy via nn_attrset_free_all
@@ -14945,9 +15062,9 @@ testCAttrSet = do
         k2 <- symbolIntern "b"
         k3 <- symbolIntern "c"
         sp <- newStablePtr (42 :: Int)
-        cattrsetInsert set k1 (spToCPtr sp)
-        cattrsetInsert set k2 (spToCPtr sp)
-        cattrsetInsert set k3 (spToCPtr sp)
+        cattrsetInsert set k1 noPos (spToCPtr sp)
+        cattrsetInsert set k2 noPos (spToCPtr sp)
+        cattrsetInsert set k3 noPos (spToCPtr sp)
         cattrsetFreeze set
         n <- cattrsetSize set
         -- set freed by arenaDestroy via nn_attrset_free_all
@@ -14958,8 +15075,8 @@ testCAttrSet = do
         kName <- symbolIntern "name"
         sp1 <- newStablePtr ("first" :: Text)
         sp2 <- newStablePtr ("second" :: Text)
-        cattrsetInsert set kName (spToCPtr sp1)
-        cattrsetInsert set kName (spToCPtr sp2)
+        cattrsetInsert set kName noPos (spToCPtr sp1)
+        cattrsetInsert set kName noPos (spToCPtr sp2)
         cattrsetFreeze set
         n <- cattrsetSize set
         result <- cattrsetLookup set kName
@@ -14981,9 +15098,9 @@ testCAttrSet = do
         k2 <- symbolIntern "aaa"
         k3 <- symbolIntern "mmm"
         sp <- newStablePtr (0 :: Int)
-        cattrsetInsert set k1 (spToCPtr sp)
-        cattrsetInsert set k2 (spToCPtr sp)
-        cattrsetInsert set k3 (spToCPtr sp)
+        cattrsetInsert set k1 noPos (spToCPtr sp)
+        cattrsetInsert set k2 noPos (spToCPtr sp)
+        cattrsetInsert set k3 noPos (spToCPtr sp)
         cattrsetFreeze set
         keys <- cattrsetKeys set
         -- set freed by arenaDestroy via nn_attrset_free_all
@@ -15001,10 +15118,10 @@ testCAttrSet = do
         spA <- newStablePtr ("fromA" :: Text)
         spB <- newStablePtr ("fromB" :: Text)
         spZ <- newStablePtr ("onlyA" :: Text)
-        cattrsetInsert setA kX (spToCPtr spA)
-        cattrsetInsert setA kZ (spToCPtr spZ)
-        cattrsetInsert setB kX (spToCPtr spB)
-        cattrsetInsert setB kY (spToCPtr spB)
+        cattrsetInsert setA kX noPos (spToCPtr spA)
+        cattrsetInsert setA kZ noPos (spToCPtr spZ)
+        cattrsetInsert setB kX noPos (spToCPtr spB)
+        cattrsetInsert setB kY noPos (spToCPtr spB)
         cattrsetFreeze setA
         cattrsetFreeze setB
         merged <- cattrsetUnion setA setB
@@ -15026,7 +15143,7 @@ testCAttrSet = do
         set <- cattrsetNew 1024
         sp <- newStablePtr (0 :: Int)
         syms <- mapM (\i -> symbolIntern ("key_" <> T.pack (show (i :: Int)))) [1 .. 10000]
-        mapM_ (\sym -> cattrsetInsert set sym (spToCPtr sp)) syms
+        mapM_ (\sym -> cattrsetInsert set sym noPos (spToCPtr sp)) syms
         cattrsetFreeze set
         n <- cattrsetSize set
         -- Spot-check a lookup from the middle of the key range
@@ -15046,7 +15163,7 @@ testCAttrSet = do
         set <- cattrsetNew 0
         sp <- newStablePtr (0 :: Int)
         syms <- mapM (\i -> symbolIntern ("index_" <> T.pack (show (i :: Int)))) [1 .. 100]
-        mapM_ (\sym -> cattrsetInsert set sym (spToCPtr sp)) syms
+        mapM_ (\sym -> cattrsetInsert set sym noPos (spToCPtr sp)) syms
         cattrsetFreeze set
         absent <- symbolIntern "index_absent"
         found <- mapM (cattrsetIndex set) (sort syms)
@@ -15056,8 +15173,44 @@ testCAttrSet = do
           ( if found == map Just [0 .. 99] && isNothing missing
               then Pass
               else Fail ("found=" <> T.pack (show found) <> " missing=" <> T.pack (show missing))
-          )
+          ),
+      -- A position travels with its entry: through both sorts freeze uses
+      -- (insertion up to 64 entries, the tagged sort past that), the dedup
+      -- that keeps a key's last insert, the growth from the default
+      -- capacity that moves the positions within their block, a union
+      -- that keeps the right side's on a clash, and a key removal.  The
+      -- pool is small enough that inserts repeat keys and large enough to
+      -- pass the 64-entry switch.
+      runTestM "positions follow their entries through freeze, union and removal" $ do
+        pool <- mapM (\i -> symbolIntern ("pos_" <> T.pack (show (i :: Int)))) [1 .. 100]
+        sp <- newStablePtr (0 :: Int)
+        let genInserts = QC.listOf ((,) <$> QC.elements pool <*> QC.arbitrary)
+            build inserts = do
+              set <- cattrsetNew 0
+              mapM_ (\(key, pos) -> cattrsetInsert set key (PosIdx pos) (spToCPtr sp)) inserts
+              cattrsetFreeze set
+              pure set
+            property =
+              QC.forAll (QC.resize 200 ((,,) <$> genInserts <*> genInserts <*> QC.sublistOf pool)) $ \(left, right, removed) ->
+                QC.ioProperty $ do
+                  leftSet <- build left
+                  rightSet <- build right
+                  merged <- cattrsetUnion leftSet rightSet
+                  kept <- cattrsetRemoveKeys leftSet removed
+                  actual <- mapM entryPositions [leftSet, merged, kept]
+                  let leftModel = Map.fromList left
+                      rightModel = Map.fromList right
+                  pure (actual QC.=== [leftModel, Map.union rightModel leftModel, Map.withoutKeys leftModel (Set.fromList removed)])
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+        -- sets freed by arenaDestroy via nn_attrset_free_all
+        freeStablePtr sp
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
+  where
+    entryPositions set = do
+      n <- cattrsetSize set
+      entries <- mapM (\i -> (,) <$> cattrsetGetKey set i <*> (unPosIdx <$> cattrsetGetPos set i)) (takeWhile (< n) [0 ..])
+      pure (Map.fromList entries)
 
 -- ---------------------------------------------------------------------------
 -- C thunk arena (FFI)
@@ -15329,7 +15482,7 @@ evalNixStub = evalNixStubWith . stubEnv
 
 -- | 'evalNixStub' with the whole stub store spelled out.
 evalNixStubWith :: StubEnv -> Text -> Either Text NixValue
-evalNixStubWith env source = case parseNix testBaseDir "<test>" source of
+evalNixStubWith env source = case parseNix testBaseDir testOrigin source of
   Left err -> Left (T.pack (show err))
   Right expr -> runStubStoreEvalWith env (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 
@@ -16006,7 +16159,7 @@ testStoreNameSinksIO = do
 -- | An inherited name and whether its select reads that name, as the one
 -- path segment, from slot 0 of the env it runs in.
 inheritedSelect :: BcInheritedName -> IO (Text, Bool)
-inheritedSelect (BcInheritedName sym selectIdx) = do
+inheritedSelect (BcInheritedName _ sym selectIdx) = do
   op <- cbcOpcode selectIdx
   pathLen <- cbcShortArg selectIdx
   target <- cbcArg1 selectIdx
@@ -16265,7 +16418,7 @@ testBytecodeCompile = do
         idx <-
           compileExpr
             ( ELet
-                [NamedBinding (StaticKey "x") (ELit (NixInt 42))]
+                [NamedBinding (testPos 1 5) (StaticKey "x") (ELit (NixInt 42))]
                 (EResolvedVar 0 0)
                 NoCaptureInfo
             )
@@ -16289,7 +16442,7 @@ testBytecodeCompile = do
           compileExpr
             ( EAttrs
                 False
-                [NamedBinding (StaticKey "a") (ELit (NixInt 1))]
+                [NamedBinding (testPos 1 3) (StaticKey "a") (ELit (NixInt 1))]
                 NoCaptureInfo
             )
         op <- cbcOpcode idx
@@ -16305,8 +16458,8 @@ testBytecodeCompile = do
           compileExpr
             ( EAttrs
                 True
-                [ NamedBinding (StaticKey "x") (ELit (NixInt 1)),
-                  NamedBinding (StaticKey "y") (EResolvedVar 0 0)
+                [ NamedBinding (testPos 1 7) (StaticKey "x") (ELit (NixInt 1)),
+                  NamedBinding (testPos 1 14) (StaticKey "y") (EResolvedVar 0 0)
                 ]
                 (Captures [(0, 0)])
             )
@@ -16417,7 +16570,7 @@ testBytecodeCompile = do
           compileExpr
             ( EAttrs
                 False
-                [InheritFrom (EVar "s") ["x", "y"]]
+                [InheritFrom (EVar "s") [InheritedName (testPos 1 15) "x", InheritedName (testPos 1 17) "y"]]
                 NoCaptureInfo
             )
         op <- cbcOpcode idx
@@ -16433,17 +16586,66 @@ testBytecodeCompile = do
       -- A plain inherit has no lookup of its own: it carries the variable,
       -- bound like any other, for the evaluator to read in the outer env.
       runTestM "compile plain inherit with the variable it copies" $ do
-        idx <- compileExpr (EAttrs False [Inherit "x" (EResolvedVar 0 0)] NoCaptureInfo)
+        idx <- compileExpr (EAttrs False [Inherit (testPos 1 11) "x" (EResolvedVar 0 0)] NoCaptureInfo)
         dataOff <- cbcArg1 idx
         bindings <- decodeBcBindings 1 dataOff
         case bindings of
-          [BcInherit sym valIdx] -> do
+          [BcInherit _ sym valIdx] -> do
             valOp <- cbcOpcode valIdx
             pure $
               if symbolText (Symbol sym) == "x" && valOp == OpResolvedVar
                 then Pass
                 else Fail "expected x to carry the resolved variable"
           _ -> pure (Fail "expected one inherit binding"),
+      -- Every kind of binding carries the position it was parsed at
+      -- through the bytecode, and reads it back with its file.
+      runTestM "compile records each binding's position" $ do
+        let at = SrcPos (SourceFile "/positions/set.nix")
+        idx <-
+          compileExpr
+            ( EAttrs
+                False
+                [ NamedBinding (at 2 3) (StaticKey "a") (ELit (NixInt 1)),
+                  Inherit (at 3 11) "x" (EResolvedVar 0 0),
+                  InheritFrom (EResolvedVar 0 0) [InheritedName (at 4 22) "y"]
+                ]
+                NoCaptureInfo
+            )
+        dataOff <- cbcArg1 idx
+        bindings <- decodeBcBindings 3 dataOff
+        let positionsOf binding = case binding of
+              BcNamed pos _ _ -> [pos]
+              BcInherit pos _ _ -> [pos]
+              BcInheritFrom _ names -> [pos | BcInheritedName pos _ _ <- names]
+        pure $
+          assertEqual
+            "positions read back"
+            (map Just [PosInFile "/positions/set.nix" 2 3, PosInFile "/positions/set.nix" 3 11, PosInFile "/positions/set.nix" 4 22])
+            (map lookupPos (concatMap positionsOf bindings)),
+      -- Recording a position and reading it back keeps its file, line and
+      -- column, text with no file reads back as such, and a line or
+      -- column past 32 bits is unrecordable, as it is in upstream's table.
+      -- One recorder sees every case, so the origin it remembers changes
+      -- under it as a compilation's never does.
+      runTestM "a recorded position reads back as it was recorded" $ do
+        recorder <- newPosRecorder
+        let wordCeiling = fromIntegral (maxBound :: Word32)
+            genOrigin =
+              QC.oneof
+                [ SourceFile <$> QC.elements ["/a.nix", "/nix/store/00000000000000000000000000000000-s/default.nix", "C:\\work\\f.nix", "/caf\233.nix"],
+                  pure testOrigin
+                ]
+            genCoordinate = QC.oneof [QC.chooseInt (1, 4096), QC.chooseInt (1, wordCeiling), QC.chooseInt (wordCeiling + 1, maxBound)]
+            expected (SrcPos origin line column)
+              | line > wordCeiling || column > wordCeiling = Nothing
+              | otherwise = Just $ case origin of
+                  SourceFile path -> PosInFile path line column
+                  SourceText _ -> PosInText line column
+            property =
+              QC.forAll (SrcPos <$> genOrigin <*> genCoordinate <*> genCoordinate) $ \pos ->
+                QC.ioProperty ((\idx -> lookupPos idx QC.=== expected pos) <$> recordPos recorder pos)
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       runTestM "compile ELambda (FormalSet)" $ do
         idx <-
           compileExpr
@@ -17129,13 +17331,13 @@ testStaticGlobalsSync = do
 -- | Assert that binding rejects a source for the named variable, before
 -- anything is evaluated.
 assertUnbound :: Text -> Text -> Text -> TestResult
-assertUnbound label source name = case parseNix testBaseDir "<test>" source of
+assertUnbound label source name = case parseNix testBaseDir testOrigin source of
   Left err -> assertEqual label (UndefinedVariable name) err
   Right expr -> Fail (label <> ": bound, got " <> T.pack (show expr))
 
 -- | Assert that every variable in a source binds.
 assertBinds :: Text -> Text -> TestResult
-assertBinds label source = assertRight label (parseNix testBaseDir "<test>" source) (const Pass)
+assertBinds label source = assertRight label (parseNix testBaseDir testOrigin source) (const Pass)
 
 -- | Upstream rejects a variable no scope binds and no @with@ could supply
 -- while binding (nixexpr.cc, ExprVar::bindVars), wherever it sits; only a
@@ -17541,6 +17743,7 @@ runSuite = do
           testBatch7,
           testImportPure,
           testImportIO,
+          testUnsafeGetAttrPos,
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
           testFirstArgumentOrderIO,
@@ -17689,7 +17892,7 @@ purePolicy = unrestrictedPolicy {epPureEval = True}
 -- | Parse and evaluate in 'PureEval' with the given policy's builtins
 -- table, for the constants the table itself decides.
 evalNixWith :: EvalPolicy -> Text -> Either Text NixValue
-evalNixWith policy source = case parseNixWithScope (rootScopeNames policy) testBaseDir "<test>" source of
+evalNixWith policy source = case parseNixWithScope (rootScopeNames policy) testBaseDir testOrigin source of
   Left err -> Left (sourceFailure err)
   Right expr -> runPureEval (eval (builtinEnv policy 0 []) expr)
 
@@ -17863,7 +18066,7 @@ testEvalPolicyRules = do
 evalPolicyIO :: EvalPolicy -> [Text] -> [Thunk] -> FilePath -> Text -> IO (Either Text NixValue)
 evalPolicyIO policy roots searchPaths baseDir source = do
   storeDir <- evalNixIOStoreDir
-  case parseNixWithScope (rootScopeNames policy) baseDir "<test>" source of
+  case parseNixWithScope (rootScopeNames policy) baseDir testOrigin source of
     Left err -> pure (Left (T.pack (show err)))
     Right expr -> do
       st0 <- newEvalState storeDir baseDir

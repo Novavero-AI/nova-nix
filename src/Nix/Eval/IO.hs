@@ -67,7 +67,7 @@ import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternByte
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
-import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
+import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope, readFileAutoEncoding)
 import Nix.Store (unpackNarEntry)
 import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -346,7 +346,7 @@ instance MonadEval EvalIO where
       Nothing -> do
         source <- sourceIO ReadFile (T.pack target) (readFileAutoEncoding ioTarget)
         let fileDir = takeDirectory target
-        case parseNixWithScope (rootScopeNames policy) fileDir (T.pack target) source of
+        case parseNixWithScope (rootScopeNames policy) fileDir (SourceFile (T.pack target)) source of
           Left err -> rejectSource "import" target err
           Right expr -> do
             -- local sets new base dir for nested imports - pure, exception-safe
@@ -494,7 +494,7 @@ instance MonadEval EvalIO where
     (target, ioTarget) <- resolveImportTarget baseDir rawPath
     source <- sourceIO ReadFile (T.pack target) (readFileAutoEncoding ioTarget)
     let fileDir = takeDirectory target
-    case parseNixWithScope (Set.union (Set.fromList (map fst scope)) (rootScopeNames policy)) fileDir (T.pack target) source of
+    case parseNixWithScope (Set.union (Set.fromList (map fst scope)) (rootScopeNames policy)) fileDir (SourceFile (T.pack target)) source of
       Left err -> rejectSource "scopedImport" target err
       Right expr -> do
         -- No import cache for scoped imports (different scopes = different results)

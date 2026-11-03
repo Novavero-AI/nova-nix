@@ -14,8 +14,14 @@ module Nix.Expr.Types
     AttrPath,
     AttrKey (..),
 
+    -- * Source positions
+    SourceOrigin (..),
+    sourceName,
+    SrcPos (..),
+
     -- * Bindings
     Binding (..),
+    InheritedName (..),
 
     -- * Formals (function parameters)
     Formals (..),
@@ -72,21 +78,57 @@ data AttrKey
 -- | Attribute path: @a.b.c@ is @[StaticKey "a", StaticKey "b", StaticKey "c"]@.
 type AttrPath = [AttrKey]
 
--- | A binding in an attribute set or let expression.
+-- | Where parsed source came from, which decides what a position in it
+-- reports: upstream's positions make the same split (@Pos::Origin@,
+-- position.hh at 2.24.9), and only one in a file names a file.
+data SourceOrigin
+  = -- | A file, by the path it was read from.
+    SourceFile !Text
+  | -- | Text with no file behind it (an @--expr@ argument), by the name
+    -- its parse errors give it.
+    SourceText !Text
+  deriving (Eq, Show)
+
+-- | The name a parse error in the source gives it.
+sourceName :: SourceOrigin -> Text
+sourceName (SourceFile path) = path
+sourceName (SourceText name) = name
+
+-- | A point in parsed source: where the source came from, and the 1-based
+-- line and column (in characters) the lexer gives the token there.
+data SrcPos
+  = SrcPos
+      -- | Where the source came from.
+      !SourceOrigin
+      -- | The line.
+      {-# UNPACK #-} !Int
+      -- | The column.
+      {-# UNPACK #-} !Int
+  deriving (Eq, Show)
+
+-- | A binding in an attribute set or let expression, at the position of
+-- the attribute path or name that defines it.
 data Binding
   = -- | @key = expr;@.  One key, as upstream's @ExprAttrs@ holds one name
     -- per definition (nixexpr.hh at 2.24.9): the parser hoists a dotted
     -- @a.b.c = v;@ into @a = { b = { c = v; }; };@ the way upstream's
     -- @addAttr@ does (parser-state.hh), so no binding carries a path.
-    NamedBinding !AttrKey !Expr
+    -- Every level of the hoisted path is at the path's first key, as
+    -- upstream gives each the position of the whole path.
+    NamedBinding !SrcPos !AttrKey !Expr
   | -- | One name of @inherit x y;@: the attribute and the variable it
     -- copies, which is bound and evaluated in the scope around the binding
     -- set rather than in the set itself, so @rec { inherit x; }@ does not
     -- name itself.  Upstream's parser builds the same pair: an attribute of
     -- kind Inherited holding an ExprVar.
-    Inherit !Text !Expr
+    Inherit !SrcPos !Text !Expr
   | -- | @inherit (from) x y;@
-    InheritFrom !Expr ![Text]
+    InheritFrom !Expr ![InheritedName]
+  deriving (Eq, Show)
+
+-- | One name of an @inherit (from) ...@ clause, at the position it is
+-- written.
+data InheritedName = InheritedName !SrcPos !Text
   deriving (Eq, Show)
 
 -- | A single formal parameter with optional default.

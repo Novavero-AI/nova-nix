@@ -42,7 +42,7 @@ import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
-import Nix.Parser (SourceError (..), parseNixWithScope, readFileAutoEncoding)
+import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope, readFileAutoEncoding)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
 import Nix.Realise (Fallback (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
@@ -505,10 +505,10 @@ readSourceFile rawPath = do
       failWith ("cannot read " <> T.pack rawPath <> ": " <> T.pack (displayException e))
     Right ok -> pure ok
 
--- | What a parse error names when the source came from @--expr@ and there is
--- no file to point at.
-exprSourceName :: T.Text
-exprSourceName = "<expr>"
+-- | Where @--expr@ source comes from: text with no file to point at, which
+-- its parse errors name @<expr>@ and its positions name no file.
+exprOrigin :: SourceOrigin
+exprOrigin = SourceText "<expr>"
 
 -- | The evaluation policy for this run: the config cascade's settings,
 -- with each flag turning its setting on.  A flag only turns a setting on,
@@ -575,14 +575,14 @@ setUpEval opts config storeDir dataDir baseDir = do
 
 -- | Parse and bind source against the names the root environment
 -- 'setUpEval' builds will bind, which depend on the policy.
-parseForEval :: CliOpts -> NixConfig -> FilePath -> T.Text -> T.Text -> Either SourceError Expr
+parseForEval :: CliOpts -> NixConfig -> FilePath -> SourceOrigin -> T.Text -> Either SourceError Expr
 parseForEval opts config = parseNixWithScope (rootScopeNames (evalPolicyFor opts config))
 
 -- | Evaluate a .nix file and print the result.
 evalFile :: NixConfig -> CliOpts -> StoreDir -> FilePath -> FilePath -> IO ()
 evalFile config opts storeDir dataDir rawFilePath = do
   (filePath, source) <- readSourceFile rawFilePath
-  case parseForEval opts config (takeDirectory filePath) (T.pack filePath) source of
+  case parseForEval opts config (takeDirectory filePath) (SourceFile (T.pack filePath)) source of
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir (takeDirectory filePath)
@@ -597,7 +597,7 @@ evalFile config opts storeDir dataDir rawFilePath = do
 evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
 evalExpr config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
-  case parseForEval opts config cwd exprSourceName source of
+  case parseForEval opts config cwd exprOrigin source of
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
@@ -613,7 +613,7 @@ evalExpr config opts storeDir dataDir source = do
 evalExprAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
 evalExprAterm config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
-  case parseForEval opts config cwd exprSourceName source of
+  case parseForEval opts config cwd exprOrigin source of
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
@@ -638,13 +638,13 @@ evalExprAterm config opts storeDir dataDir source = do
 -- The file argument is canonicalized for the same reason as in 'evalFile'.
 -- | Where a build reads its expression, and the directory relative paths
 -- inside it resolve against.
-loadBuildSource :: BuildTarget -> IO (FilePath, T.Text, T.Text)
+loadBuildSource :: BuildTarget -> IO (FilePath, SourceOrigin, T.Text)
 loadBuildSource (TargetFile rawFilePath) = do
   (filePath, source) <- readSourceFile rawFilePath
-  pure (takeDirectory filePath, T.pack filePath, source)
+  pure (takeDirectory filePath, SourceFile (T.pack filePath), source)
 loadBuildSource (TargetExpr source) = do
   cwd <- getCurrentDirectory
-  pure (cwd, exprSourceName, source)
+  pure (cwd, exprOrigin, source)
 
 -- | Force the attributes 'derivationPath' goes on to read.  @derivation@
 -- is a lazy wrapper, and 'readThunkValue' answers 'Nothing' for a thunk that
@@ -668,8 +668,8 @@ buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> M
 buildCommand config opts storeDir dataDir target attrPath outLink = do
   let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
-  (baseDir, sourceName, source) <- loadBuildSource target
-  case parseForEval opts config baseDir sourceName source of
+  (baseDir, origin, source) <- loadBuildSource target
+  case parseForEval opts config baseDir origin source of
     Left err -> failSource err
     Right expr -> do
       (st, env) <- setUpEval opts config storeDir dataDir baseDir

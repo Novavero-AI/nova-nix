@@ -52,6 +52,9 @@ module Nix.Parser
     -- * Encoding
     readFileAutoEncoding,
 
+    -- * Origins
+    SourceOrigin (..),
+
     -- * Errors
     SourceError (..),
     ParseError (..),
@@ -67,7 +70,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Nix.Expr.ClosureTrim (trimClosures)
 import Nix.Expr.Resolve (resolveRelativePaths, resolveVars, staticGlobalNames)
-import Nix.Expr.Types (Expr)
+import Nix.Expr.Types (Expr, SourceOrigin (..), sourceName)
 import Nix.Parser.Expr (parseTopLevel)
 import Nix.Parser.Internal (ParseState (..), runParser)
 import Nix.Parser.Lexer (tokenize)
@@ -89,8 +92,11 @@ data SourceError
 -- the root environment's names under the default policy
 -- ('staticGlobalNames').
 --
--- The input is the full file contents. The file name is used only for
--- error messages.  Strips a leading UTF-8 BOM if present - Windows
+-- The input is the full file contents.  The origin names the source in
+-- error messages and decides what the positions recorded in it report: a
+-- 'SourceFile' position names the file, as upstream's do for a file it
+-- parses, and a 'SourceText' one names none, as upstream's do for an
+-- @--expr@ string.  Strips a leading UTF-8 BOM if present - Windows
 -- editors (Notepad, PowerShell) commonly add one.
 --
 -- The base directory is what relative path literals resolve against, and it
@@ -102,7 +108,7 @@ data SourceError
 -- same reason.  Pass the directory holding the file; for source with no file
 -- behind it (@--expr@) pass the working directory, which is what upstream
 -- parses against.
-parseNix :: FilePath -> Text -> Text -> Either SourceError Expr
+parseNix :: FilePath -> SourceOrigin -> Text -> Either SourceError Expr
 parseNix = parseNixWithScope staticGlobalNames
 
 -- | 'parseNix' against the names the environment the source is evaluated in
@@ -111,10 +117,10 @@ parseNix = parseNixWithScope staticGlobalNames
 -- with a @scopedImport@ scope's attributes over them, which upstream binds
 -- in a static environment of their own over the base one.  Every one binds
 -- like a global, so a @with@ in the source cannot shadow it.
-parseNixWithScope :: Set Text -> FilePath -> Text -> Text -> Either SourceError Expr
-parseNixWithScope scope baseDir fileName source = do
-  tokens <- first SyntaxError (tokenize fileName (stripBOM source))
-  let st = ParseState {psTokens = tokens, psFile = fileName}
+parseNixWithScope :: Set Text -> FilePath -> SourceOrigin -> Text -> Either SourceError Expr
+parseNixWithScope scope baseDir origin source = do
+  tokens <- first SyntaxError (tokenize (sourceName origin) (stripBOM source))
+  let st = ParseState {psTokens = tokens, psOrigin = origin}
   (expr, _remaining) <- first SyntaxError (runParser parseTopLevel st)
   resolved <- first UndefinedVariable (resolveVars scope expr)
   pure (resolveRelativePaths baseDir (trimClosures resolved))
@@ -130,7 +136,7 @@ stripBOM t = case T.uncons t of
 parseNixFile :: FilePath -> IO (Either SourceError Expr)
 parseNixFile path = do
   source <- readFileAutoEncoding path
-  pure $ parseNix (takeDirectory path) (T.pack path) source
+  pure $ parseNix (takeDirectory path) (SourceFile (T.pack path)) source
 
 -- ---------------------------------------------------------------------------
 -- Encoding detection

@@ -2,8 +2,9 @@
  * nn_attrset.h - Sorted symbol-keyed attribute set for nova-nix.
  *
  * Replaces Haskell's Data.Map.Strict (48 bytes per Bin node, pointer-
- * chasing balanced tree) with a contiguous sorted array of (symbol, slot)
- * pairs.  Binary search for O(log n) lookup; linear scan for iteration.
+ * chasing balanced tree) with a contiguous sorted array of (symbol,
+ * position, slot) entries.  Binary search for O(log n) lookup; linear
+ * scan for iteration.
  *
  * Construction is two-phase:
  *   1. nn_attrset_new(cap) + nn_attrset_insert() - append unsorted
@@ -15,6 +16,12 @@
  *
  * Values are opaque void* - Haskell passes StablePtr Thunk.  The C
  * side never dereferences them.
+ *
+ * Each entry also carries the position it was defined at, an opaque
+ * uint32_t the evaluator assigns and resolves, as each attribute of
+ * upstream's Bindings carries a PosIdx (attr-set.hh at 2.24.9).
+ * Positions travel with their entries through freeze, union and key
+ * removal.
  *
  * Lifecycle: arena-managed.  Every set is tracked at creation and bulk-freed
  * by nn_attrset_free_all at evaluation teardown; nn_attrset_free is that
@@ -59,13 +66,13 @@ void nn_attrset_free(nn_attrset_t *set);
 
 /* --- Construction (before freeze) --- */
 
-/* Append a key-value pair.  Keys need not be sorted or unique at this
- * stage - duplicates are resolved at freeze time (last insert wins,
- * matching Nix // merge semantics).
+/* Append a key-value pair defined at `pos`.  Keys need not be sorted or
+ * unique at this stage - duplicates are resolved at freeze time (last
+ * insert wins, position included, matching Nix // merge semantics).
  * Grows the internal arrays if capacity is exceeded.  Returns 0, or -1
  * with the set unchanged when it already holds NN_ATTRSET_MAX_ENTRIES
  * entries or cannot grow. */
-int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value);
+int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value, uint32_t pos);
 
 /* Sort entries by symbol ID and deduplicate (last writer wins).
  * Must be called exactly once before any lookup/keys/values access.
@@ -92,6 +99,9 @@ void *nn_attrset_get_value(const nn_attrset_t *set, uint32_t idx);
 /* Return the key at a known index. */
 nn_symbol_t nn_attrset_get_key(const nn_attrset_t *set, uint32_t idx);
 
+/* Return the position of the entry at a known index. */
+uint32_t nn_attrset_get_pos(const nn_attrset_t *set, uint32_t idx);
+
 /* --- Bulk access --- */
 
 /* Number of entries (after freeze: unique keys). */
@@ -111,7 +121,8 @@ void nn_attrset_free_all(void);
 /* --- Set operations --- */
 
 /* Create a new set that is the right-biased union of `a` and `b`
- * (keys in `b` override `a`).  Both inputs must be frozen.
+ * (keys in `b` override `a`, positions with them).  Both inputs must be
+ * frozen.
  * The result is returned frozen and is arena-tracked (freed by
  * nn_attrset_free_all) - do NOT pass it to nn_attrset_free.  Returns
  * NULL when the union would pass NN_ATTRSET_MAX_ENTRIES or an
