@@ -1,4 +1,4 @@
--- | Lexer for the Nix language: source bytes to @['Located']@.
+-- | Lexer for the Nix language: source bytes to @[t'Located']@.
 --
 -- Handles all Nix tokens including string interpolation via a mode stack.
 -- Entirely pure - no IO.

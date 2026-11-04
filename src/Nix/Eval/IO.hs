@@ -5,7 +5,7 @@
 
 -- | IO-based Nix evaluator.
 --
--- Provides 'EvalIO', a concrete 'MonadEval' instance that performs
+-- Provides t'EvalIO', a concrete 'MonadEval' instance that performs
 -- real file-system access.  The @import@ builtin reads, parses, and
 -- evaluates @.nix@ files with a per-process import cache.
 --
@@ -154,11 +154,11 @@ errorPrefix = "error: "
 data EvalState = EvalState
   { esImportCache :: !(IORef (Map FilePath NixValue)),
     -- | Cache of derivation modulo-hashes (drv store path to hex), populated
-    -- bottom-up by 'builtinDerivationStrict' so input derivations can be
+    -- bottom-up by @builtinDerivationStrict@ so input derivations can be
     -- substituted by their content hashes when computing output paths.
     esDrvModuloCache :: !(IORef (Map Text Text)),
     -- | Accumulated @.drv@ closure (drv store path text to its ATerm bytes),
-    -- recorded bottom-up by 'builtinDerivationStrict'.  The build driver reads
+    -- recorded bottom-up by @builtinDerivationStrict@.  The build driver reads
     -- this after evaluation to write every input @.drv@ to the store before
     -- building.
     esDrvClosure :: !(IORef (Map Text BS.ByteString)),
@@ -1074,7 +1074,7 @@ storeFilePath = SP.storePathToFilePath
 -- registers it before a derivation naming it is built.  Every eval-time
 -- writer goes through this: a write that skips it lands in
 -- @drvInputSrcs@ with no registration row and fails the build with
--- \"path '...' is not valid\".  The mode names the scheme that
+-- \"path \'...\' is not valid\".  The mode names the scheme that
 -- constructed the path, so materialization can verify the on-disk
 -- content reproduces it before registering.
 recordStoreWrite :: Text -> [SP.StorePath] -> SP.StoreWriteMode -> EvalIO ()
@@ -1211,7 +1211,7 @@ classifyEntry parentDir name = do
 
 -- | Convert IO exceptions to eval errors.
 -- Guards against double-wrapping: if the exception is already a
--- 'NixEvalError', it is re-thrown as-is.
+-- t'NixEvalError', it is re-thrown as-is.
 wrapIO :: IO a -> EvalIO a
 wrapIO action = EvalIO $ liftIO $ do
   result <- try action
@@ -1275,7 +1275,7 @@ runEvalIO st action = either (Left . failureMessage) Right <$> runEvalIOTraced s
 -- error, its lines of context included, for a caller that reports it
 -- ('renderEvalFailure').
 --
--- Catches 'NixEvalError' (throw) and 'NixAbortError' (abort).
+-- Catches t'NixEvalError' (throw) and t'NixAbortError' (abort).
 -- Async exceptions (@StackOverflow@, @ThreadKilled@, etc.) propagate uncaught.
 runEvalIOTraced :: EvalState -> EvalIO a -> IO (Either EvalFailure a)
 runEvalIOTraced st (EvalIO action) = do

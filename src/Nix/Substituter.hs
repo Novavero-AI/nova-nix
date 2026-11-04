@@ -26,7 +26,7 @@
 -- instead ("Nix.Realise").
 --
 -- The whole sequence runs under an exclusive per-path lock
--- ('Nix.Store.Lock'), upstream's pathlocks protocol: taken before any
+-- ("Nix.Store.Lock"), upstream's pathlocks protocol: taken before any
 -- deletion or download, validity re-checked under it (another process's
 -- finished path is adopted without touching disk), and held until the
 -- caller's registration transaction commits.
@@ -158,13 +158,13 @@ defaultCacheConfig =
 data SubstResult
   = -- | Verified and unpacked on disk, NOT yet registered: the carried
     -- registration is recorded by the caller, which batches every output
-    -- of a derivation into one 'registerPaths' transaction so
+    -- of a derivation into one 'Nix.Store.DB.registerPaths' transaction so
     -- cross-output reference edges are never dropped.  The path's lock
     -- rides along STILL HELD, because the exclusion must survive until
     -- that transaction commits - released earlier, another process could
     -- meet the unpacked-but-unregistered window and delete the tree the
     -- row is about to describe.  The caller releases it after
-    -- registration, on every exit path ('Nix.Builder').
+    -- registration, on every exit path ("Nix.Builder").
     SubstSuccess !PathRegistration !PathLock
   | -- | The path was already valid under its lock - another process
     -- registered it while this one waited - so its work is adopted:
@@ -201,7 +201,7 @@ data SubstResult
 -- Caches are checked in priority order; the first success stops the
 -- scan and a failing cache falls through to the remaining ones.  On
 -- success the path is unpacked and read-only on disk but NOT
--- registered - the caller records the returned 'PathRegistration'.
+-- registered - the caller records the returned t'PathRegistration'.
 -- Every narinfo and NAR request runs under upstream's retry policy,
 -- 'defaultFetchRetryPolicy'.
 trySubstitute :: Store -> [CacheConfig] -> StorePath -> IO SubstResult
@@ -209,7 +209,7 @@ trySubstitute = trySubstituteWith defaultFetchRetryPolicy ioRetryEffects
 
 -- | 'trySubstitute' under a given retry policy and effects: a build
 -- passes the policy its @builtin:fetchurl@ downloads run under
--- ('Nix.Builder'), and a test passes effects that record rather than
+-- ("Nix.Builder"), and a test passes effects that record rather than
 -- sleep.
 trySubstituteWith :: FetchRetryPolicy -> RetryEffects IO -> Store -> [CacheConfig] -> StorePath -> IO SubstResult
 trySubstituteWith _ _ _ [] _ = pure SubstNotFound
@@ -236,7 +236,7 @@ trySubstituteWith policy effects store caches sp = do
 
 -- | What the caches say about a path's references, from the first cache
 -- whose narinfo may be used.  References arrive before the path that names
--- them ('Nix.Realise'), so this runs ahead of any download, and a narinfo
+-- them ("Nix.Realise"), so this runs ahead of any download, and a narinfo
 -- passes the same checks as a substitution before its references are
 -- believed.
 --
@@ -439,7 +439,7 @@ verifiedNarBytes (VerifiedNar bytes _) = bytes
 verifiedNarDigest :: VerifiedNar -> Hash.NixHash
 verifiedNarDigest (VerifiedNar _ digest) = digest
 
--- | The only constructor of a 'VerifiedNar': the hash check, then the
+-- | The only constructor of a t'VerifiedNar': the hash check, then the
 -- size check, with the decoded declared digest carried out.  The NAR
 -- hash is the content-addressed integrity contract; the signature only
 -- attests to the narinfo, not the body, so network corruption or a
@@ -470,7 +470,7 @@ unpackAndVerify store sp narInfo rawNar =
       deriver <- parseDeriver (stDir store) (NarInfo.niDeriver narInfo)
       pure (verified, refs, deriver)
 
--- | The strict pipeline's unpack sink: deserialize a 'VerifiedNar',
+-- | The strict pipeline's unpack sink: deserialize a t'VerifiedNar',
 -- materialize it at the store path, seal it read-only, and recheck the
 -- tree on disk against the carried digest before building its
 -- registration from the references and deriver.  Follows the same
@@ -705,7 +705,7 @@ instance Exception StreamAbort
 -- | Convert what one download attempt throws into the pipeline's
 -- failure channel, so the retry budget governs it and the caller's
 -- cleanup contract holds on every exit: the transfer layer's
--- classification ('transferFailureHandlers'), and a 'StreamAbort'.
+-- classification ('transferFailureHandlers'), and a t'StreamAbort'.
 -- Nothing else is caught, so an interrupt is never spent as retry
 -- budget.
 tryAttempt :: Text -> IO (Either AttemptFailure a) -> IO (Either AttemptFailure a)
@@ -906,8 +906,8 @@ consumeNarStream sensitivity destPath narInfo declaredDigest narSource = do
 
 -- | Stream an HTTP body as a chunk source bounded by the download cap
 -- 'downloadCapFor' derived from the signed NarSize -
--- 'readBodyCapped''s discipline without the buffering.  Exceeding the
--- cap throws 'StreamAbort'; the attempt boundary converts it back to
+-- 'readBodyCapped'\'s discipline without the buffering.  Exceeding the
+-- cap throws t'StreamAbort'; the attempt boundary converts it back to
 -- the pipeline's error channel.
 cappedBodySource :: Int -> HTTP.BodyReader -> IO (IO BS.ByteString)
 cappedBodySource cap reader = do
@@ -968,7 +968,7 @@ xzFailure xzErr = case xzErr of
   where
     rendered = renderXzError xzErr
 
--- | 'xzFailure''s zstd counterpart, under the same taxonomy.
+-- | 'xzFailure'\'s zstd counterpart, under the same taxonomy.
 zstdFailure :: Zstd.ZstdError -> AttemptFailure
 zstdFailure zstdErr = case zstdErr of
   Zstd.ZstdStreamError _ -> TransientFailure rendered
@@ -976,7 +976,7 @@ zstdFailure zstdErr = case zstdErr of
   where
     rendered = renderZstdError zstdErr
 
--- | 'xzFailure''s bzip2 counterpart, under the same taxonomy.
+-- | 'xzFailure'\'s bzip2 counterpart, under the same taxonomy.
 bzip2Failure :: Bzip2.Bzip2Error -> AttemptFailure
 bzip2Failure bzip2Err = case bzip2Err of
   Bzip2.Bzip2StreamError _ -> TransientFailure rendered
@@ -1132,7 +1132,7 @@ unknownDeriverSentinel = "unknown-deriver"
 
 -- | Parse a narinfo Deriver - a store path basename on the wire, or the
 -- @unknown-deriver@ sentinel - into the full path text the store DB
--- records (the form 'Nix.Push' parses back with 'parseStorePath').
+-- records (the form "Nix.Push" parses back with 'Nix.Store.Path.parseStorePath').
 parseDeriver :: StoreDir -> Maybe Text -> Either Text (Maybe Text)
 parseDeriver _ Nothing = Right Nothing
 parseDeriver storeDir (Just txt)

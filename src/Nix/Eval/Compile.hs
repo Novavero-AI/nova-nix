@@ -9,7 +9,7 @@
 -- instructions; a binding refers to its position there by the index
 -- "Nix.Eval.SourcePos" records it at.
 --
--- Must be called after 'cbcInit' and 'symbolInit'.
+-- Must be called after 'Nix.Eval.CBytecode.cbcInit' and 'Nix.Eval.Symbol.symbolInit'.
 module Nix.Eval.Compile
   ( compileExpr,
     compileFormalsToEval,

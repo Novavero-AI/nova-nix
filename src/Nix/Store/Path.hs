@@ -104,12 +104,12 @@ platformStoreDirText = T.pack (unStoreDir platformStoreDir)
 windowsStoreDir :: StoreDir
 windowsStoreDir = StoreDir "C:\\nix\\store"
 
--- | Convert a 'StorePath' to a full filesystem path under a 'StoreDir'.
+-- | Convert a t'StorePath' to a full filesystem path under a t'StoreDir'.
 storePathToFilePath :: StoreDir -> StorePath -> FilePath
 storePathToFilePath (StoreDir dir) sp =
   dir </> T.unpack (spHash sp <> "-" <> spName sp)
 
--- | Convert a 'StorePath' to canonical 'Text' with forward slashes.
+-- | Convert a t'StorePath' to canonical 'Text' with forward slashes.
 -- Unlike 'storePathToFilePath', this always uses @\/@ as the separator,
 -- making it safe for ATerm serialization and cross-platform round-trips.
 storePathToText :: StoreDir -> StorePath -> Text
@@ -182,7 +182,7 @@ storePathHashLen :: Int
 storePathHashLen = 32
 
 -- | Parse a full store path string like @\/nix\/store\/abc...-name@ into
--- a 'StorePath'.  Returns 'Nothing' if the path doesn't match the
+-- a t'StorePath'.  Returns 'Nothing' if the path doesn't match the
 -- expected format: store dir prefix + separator + 32-char hash + dash + name.
 -- Accepts both @\/@ and @\\@ as the separator after the store dir,
 -- so paths round-trip correctly regardless of which OS serialized them.
@@ -208,7 +208,7 @@ parseStorePathPrefix (StoreDir dir) path =
 
 -- | Parse a store path basename like @abc...-name@ - the form narinfo
 -- @References@ and @Deriver@ fields carry on the wire - into a
--- 'StorePath': 32 nix-base32 hash chars, dash, valid non-empty name.
+-- t'StorePath': 32 nix-base32 hash chars, dash, valid non-empty name.
 --
 -- Both components are charset-checked, as upstream does at its parse
 -- boundary: parsed text can come from a cache, and an unchecked
@@ -290,7 +290,7 @@ data StorePathNameReason
 --
 -- Enforced at BOTH boundaries: parse ('parseStorePathBaseName') and
 -- construction (the @makeStorePath@ family in "Nix.Hash"), so an unclean
--- name cannot become a 'StorePath' from either side - in particular, no
+-- name cannot become a t'StorePath' from either side - in particular, no
 -- write sink can be handed a path that resolves outside the store root.
 checkStorePathName :: Text -> Either StorePathNameError ()
 checkStorePathName name

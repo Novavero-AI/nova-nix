@@ -1,4 +1,4 @@
--- | Source positions as the evaluator keeps them: a 'PosIdx' stored beside
+-- | Source positions as the evaluator keeps them: a t'PosIdx' stored beside
 -- an attribute, read back as a file, line and column on demand.
 --
 -- A position is recorded when the construct it belongs to is compiled, as

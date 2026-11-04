@@ -3,7 +3,7 @@
 --
 -- == The lease
 --
--- Every open 'Store' holds @.nova-nix\/gc.lock@ shared from 'openStore'
+-- Every open t'Store' holds @.nova-nix\/gc.lock@ shared from 'openStore'
 -- to 'closeStore'.  A collector needs that lock exclusively, so a
 -- collection runs only while no other process has the store open, and a
 -- process opening the store while one runs waits for it to finish.

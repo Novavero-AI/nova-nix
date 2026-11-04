@@ -2,7 +2,7 @@
 --
 -- Every Nix source file parses into an 'Expr'. The AST is a direct
 -- representation of the language grammar - no desugaring at parse time.
--- The evaluator ('Nix.Eval') reduces expressions to values.
+-- The evaluator ("Nix.Eval") reduces expressions to values.
 module Nix.Expr.Types
   ( -- * Expressions
     Expr (..),
@@ -154,15 +154,16 @@ data Formals
 --
 -- After 'Nix.Expr.ClosureTrim.trimClosures', lambdas that only reference
 -- a subset of their outer scope carry a 'Captures' list.  At eval time
--- this drives extraction of exactly those thunks into a flat 'Env',
+-- this drives extraction of exactly those thunks into a flat t'Nix.Eval.Types.Env',
 -- breaking the retention chain to the full parent scope.
 data CaptureInfo
   = -- | No capture analysis performed (lambda untrimmed).
     NoCaptureInfo
   | -- | Sorted list of @(level, index)@ pairs to extract from the parent env.
     Captures ![(Int, Int)]
-  | -- | Like 'Captures', but the trimmed env must preserve 'envWithScopes'
-    -- (with builtins appended) so that 'EWithVar' references can still be resolved.
+  | -- | Like 'Captures', but the trimmed env must preserve its with-scopes
+    -- ('Nix.Eval.Types.envWithScopesRaw'), with builtins appended, so that
+    -- 'EWithVar' references can still be resolved.
     CapturesWithScopes ![(Int, Int)]
   deriving (Eq, Show)
 
@@ -263,6 +264,7 @@ data Expr
   | -- | Variable resolved via with-scopes (not lexical).
     -- Produced by 'Nix.Expr.Resolve.resolveVars' for names inside
     -- a @with@ body that are not found in any lexical scope.
-    -- At runtime, looked up in 'envWithScopes' (with builtins fallback).
+    -- At runtime, looked up in the env's with-scopes
+    -- ('Nix.Eval.Types.envWithScopesRaw'), with builtins as the fallback.
     EWithVar !Text
   deriving (Eq, Show)

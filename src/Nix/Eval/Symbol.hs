@@ -86,7 +86,7 @@ symbolInit :: Word32 -> IO ()
 symbolInit = c_nn_symbol_init
 
 -- | Destroy the global symbol table, freeing all C-side memory.
--- All 'Symbol' values become invalid after this call.
+-- All t'Symbol' values become invalid after this call.
 symbolDestroy :: IO ()
 symbolDestroy = c_nn_symbol_destroy
 
@@ -94,7 +94,7 @@ symbolDestroy = c_nn_symbol_destroy
 -- Core operations
 -- ---------------------------------------------------------------------------
 
--- | Intern a 'Text' value, returning its 'Symbol'.
+-- | Intern a 'Text' value, returning its t'Symbol'.
 -- If the string was already interned, returns the existing symbol.
 -- This is the canonical entry point for Text to C conversion; the table
 -- stores the UTF-8 bytes, so a 'Text' and its 'Data.Text.Encoding.encodeUtf8'
@@ -104,7 +104,7 @@ symbolIntern txt =
   TF.withCStringLen txt $ \(ptr, len) ->
     checkedSymbol =<< c_nn_symbol_intern ptr (fromIntegral len)
 
--- | Intern raw bytes, returning their 'Symbol'.  The C table is
+-- | Intern raw bytes, returning their t'Symbol'.  The C table is
 -- length-prefixed bytes with no encoding assumption, so arbitrary
 -- (even invalid-UTF-8) byte strings intern losslessly.  The canonical
 -- entry point for string VALUES, whose payload is a byte string.
@@ -116,7 +116,7 @@ symbolInternBytes bs =
     checkedSymbol =<< c_nn_symbol_intern ptr (fromIntegral len)
 
 -- | Reject the interner's failure sentinel before it can become a
--- 'Symbol': wrapped it would read back as the empty string.  The table
+-- t'Symbol': wrapped it would read back as the empty string.  The table
 -- answers it outside its init .. destroy window, and inside it for a
 -- string it cannot hold: one that would take the string arena past its
 -- 4 GiB of uint32 offsets, or a growth the allocator refuses.

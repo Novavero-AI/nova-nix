@@ -3,9 +3,9 @@
 
 -- | Shared types for the Nix evaluator.
 --
--- Extracted into its own module so that 'Nix.Eval.Operator',
--- 'Nix.Eval.StringInterp', and 'Nix.Builtins' can all reference
--- 'NixValue', 'Thunk', and 'Env' without creating import cycles.
+-- Extracted into its own module so that "Nix.Eval.Operator",
+-- "Nix.Eval.StringInterp", and "Nix.Builtins" can all reference
+-- 'NixValue', t'Thunk', and t'Env' without creating import cycles.
 module Nix.Eval.Types
   ( -- * Values
     NixValue (..),
@@ -232,7 +232,7 @@ bytesToTextLossy = TE.decodeUtf8With lenientDecode
 --
 -- The C thunk is allocated via 'unsafePerformIO' in 'mkThunk' (same
 -- pattern as the former IORef-based approach) so that knot-tying works
--- unchanged.  Arena pointers remain valid until 'cthunkDestroy'.
+-- unchanged.  Arena pointers remain valid until 'Nix.Eval.CThunk.cthunkDestroy'.
 newtype Thunk = Thunk {unThunk :: CThunkPtr}
 
 instance Show Thunk where
@@ -572,7 +572,7 @@ instance Show Env where
           ++ " withs}"
 
 -- | Empty environment (no variables in scope).
--- Points to a static global C struct - valid until 'arenaDestroy'.
+-- Points to a static global C struct - valid until 'Nix.Eval.Arena.arenaDestroy'.
 {-# NOINLINE emptyEnv #-}
 emptyEnv :: Env
 emptyEnv = Env (unsafePerformIO cenvEmpty)
@@ -634,8 +634,8 @@ envLookup name (Env envPtr) = lexicalLookup envPtr
 
 -- | Walk with-scopes (C array) innermost to outermost.
 -- Skips tagged lazy entries (bit 0 set) - those are thunk pointers
--- that can only be resolved by 'evalWithVarScopes' which has monadic
--- 'force'.  Defensive: an 'EVar' under a with is either a lexical
+-- that can only be resolved by @evalWithVarScopes@ which has monadic
+-- 'Nix.Eval.force'.  Defensive: an 'EVar' under a with is either a lexical
 -- (barrier) binding or a static global, both found on the parent chain
 -- before this fallback fires ('EVar' also blocks closure trimming, so
 -- the chain is always intact) - but keep it for safety.
@@ -765,7 +765,7 @@ cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
 cheapThunk env expr = mkThunk env expr
 
 -- | Create a pending thunk from a bytecode index (no compilation needed).
--- Used inside 'evalBytecode' where the bc_idx is already known.
+-- Used inside 'Nix.Eval.evalBytecode' where the bc_idx is already known.
 -- The Env is captured LAZILY (for knot-tying in rec attrs / let / matchFormalSet).
 mkThunkBc :: Env -> Word32 -> Thunk
 mkThunkBc env bcIdx =
@@ -1129,7 +1129,7 @@ newComputedAttrsPtr cset =
     $ cset
     `seq` cthunkNewComputedAttrs (castPtr cset)
 
--- | Build a C-allocated slot array from a list of 'Thunk' values.
+-- | Build a C-allocated slot array from a list of t'Thunk' values.
 -- Each thunk is converted to 'CThunkPtr' via 'thunkToCPtr'.
 -- Returns the C array pointer and the slot count.
 -- Uses 'unsafePerformIO' - safe because allocation is idempotent.
@@ -1233,7 +1233,7 @@ data PathExistence
   deriving (Eq, Show)
 
 -- | Effect class for Nix evaluation.  Core logic is polymorphic in @m@
--- so the same evaluator composes into 'PureEval' for tests or @IO@ for
+-- so the same evaluator composes into t'PureEval' for tests or @IO@ for
 -- real file-system access (e.g. @import@, @readFile@).
 class (Monad m) => MonadEval m where
   -- | Raise an evaluation error (type error, missing attribute, IO
@@ -1376,7 +1376,7 @@ class (Monad m) => MonadEval m where
   -- still on disk, and recorded as this evaluation's own store write in
   -- that case. Reusing a path instead of rewriting it must still leave the
   -- registration behind, or the build driver never registers it and a
-  -- derivation naming it fails with \"path '...' is not valid\".
+  -- derivation naming it fails with \"path \'...\' is not valid\".
   adoptStorePath :: Text -> m Bool
 
   -- | Record a fetch under that key. Failing to record is not an error -
@@ -1488,7 +1488,7 @@ storePathOrThrow :: (MonadEval m) => Either BadStorePath StorePath -> m StorePat
 storePathOrThrow = either (throwEvalError . badStorePathText) pure
 
 -- | Error raised during pure evaluation.  'PThrow' (@builtins.throw@, a
--- failed @assert@) is the only kind 'tryEval' catches; 'PError' (type
+-- failed @assert@) is the only kind @tryEval@ catches; 'PError' (type
 -- errors, missing attributes) and 'PAbort' (@abort@, infinite recursion)
 -- escape it, exactly as in C++ Nix.
 data PureError = PThrow !Text | PError !Text | PAbort !Text
@@ -1508,7 +1508,7 @@ pureFailure :: PureError -> PureEval a
 pureFailure = PureEval . lift . Left
 
 -- | Run a pure evaluation, flattening the internal error into 'Text'.  An abort
--- is prefixed @\"evaluation aborted: \"@, matching 'EvalIO'.
+-- is prefixed @\"evaluation aborted: \"@, matching t'Nix.Eval.IO.EvalIO'.
 runPureEval :: PureEval a -> Either Text a
 runPureEval (PureEval action) =
   case runReaderT action (topLevelCallDepth defaultMaxCallDepth) of

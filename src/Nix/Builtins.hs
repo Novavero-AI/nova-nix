@@ -1,7 +1,7 @@
 -- | Built-in function environment for the Nix evaluator.
 --
 -- Every Nix expression has access to a @builtins@ attribute set containing
--- ~100 functions.  This module assembles the initial 'Env' from the
+-- ~100 functions.  This module assembles the initial t'Env' from the
 -- central registry in "Nix.Eval" and adds standard constants
 -- (@true@, @false@, @null@, @storeDir@, @currentTime@,
 -- @currentSystem@, etc.), among them @derivation@: a Nix lambda over the

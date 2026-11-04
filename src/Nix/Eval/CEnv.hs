@@ -136,7 +136,7 @@ cenvDestroy = c_nn_env_destroy
 -- ---------------------------------------------------------------------------
 
 -- | Allocate a C array of @count@ 'CThunkPtr' slots.  O(1) amortized.
--- Returns 'nullPtr' if count is 0.  All slots are zero-initialized.
+-- Returns 'Foreign.Ptr.nullPtr' if count is 0.  All slots are zero-initialized.
 cenvAllocSlots :: Word32 -> IO (Ptr CThunkPtr)
 cenvAllocSlots = c_nn_env_alloc_slots
 

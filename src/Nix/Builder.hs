@@ -686,7 +686,7 @@ storeRewrite config
 -- Input sources must be valid.  For input derivations, the artifacts a build
 -- actually reads are their realized OUTPUT paths, not the @.drv@ recipe files,
 -- so we resolve each requested output (by reading the input @.drv@ the build
--- driver materialized) and validate those outputs.  'Nix.Realise' realizes a
+-- driver materialized) and validate those outputs.  "Nix.Realise" realizes a
 -- derivation's inputs before it builds, so their outputs are present by the
 -- time it is validated.
 validateInputs :: BuildConfig -> Store -> Derivation -> IO (Either Text [StorePath])
@@ -1047,7 +1047,7 @@ homeEnvVar =
 -- as soon as the builder is spawned, so a read sees end-of-file.
 --
 -- The child's environment is exactly the build environment plus
--- 'scrubAmbient''s allowance - the ambient environment does not flow
+-- 'scrubAmbient'\'s allowance - the ambient environment does not flow
 -- through.  Filesystem and process isolation remain future work.
 --
 -- @impureVars@ is the impureEnvVars carve-out: the caller passes the
@@ -1670,7 +1670,7 @@ logRealised status drv =
 -- unpacked first, then recorded in one 'registerPaths' transaction, so
 -- reference edges between the outputs of one derivation land after both
 -- endpoints' rows exist and a partial substitution registers nothing (the
--- subsequent build starts from unregistered outputs and 'prepareOutput'
+-- subsequent build starts from unregistered outputs and 'runPlannedBuild'
 -- replaces the leftover unpacked trees).
 --
 -- Each substituted path arrives with its path lock STILL HELD (see

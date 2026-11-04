@@ -6,7 +6,7 @@
 -- strings with non-empty context.
 --
 -- This module provides raw FFI bindings only.  The higher-level
--- marshalling between 'StringContext' and C is in 'Nix.Eval.Types'
+-- marshalling between t'Nix.Eval.Types.StringContext' and C is in "Nix.Eval.Types"
 -- (to avoid circular imports).
 module Nix.Eval.CCtxStr
   ( -- * Opaque handle

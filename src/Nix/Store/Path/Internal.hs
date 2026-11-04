@@ -1,4 +1,4 @@
--- | The bare 'StorePath' representation.  Importing this module is an
+-- | The bare t'StorePath' representation.  Importing this module is an
 -- assertion: every value constructed here satisfies the store-path
 -- invariants (32 nix-base32 hash characters; a name
 -- 'Nix.Store.Path.checkStorePathName' accepts) - or is
@@ -31,7 +31,7 @@ data StorePath = StorePath
 -- | The empty output-path placeholder that derivation-hash masking
 -- renders: upstream computes a derivation's modulo hash over an ATerm
 -- whose output path fields are empty strings, and this value exists
--- only to carry that rendering through 'DerivationOutput'.  It is
+-- only to carry that rendering through t'Nix.Derivation.DerivationOutput'.  It is
 -- never a real store identity and must never reach the store, the
 -- builder, or a context element.
 maskedOutputPath :: StorePath

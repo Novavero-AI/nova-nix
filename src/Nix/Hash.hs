@@ -242,7 +242,7 @@ base64HashLen n = 4 * ((n + 2) `div` 3)
 -- ('checkStorePathName'), carrying the hash part the path would have had:
 -- upstream hashes before it checks the name, and its refusal names both.
 -- Construction validates like the parse boundary does, so every
--- 'StorePath' that exists has a clean name: the write sinks downstream
+-- t'StorePath' that exists has a clean name: the write sinks downstream
 -- (store copies, the builder's delete-and-move) never see a path that
 -- resolves outside the store root, and no sink needs its own ad hoc name
 -- check.
