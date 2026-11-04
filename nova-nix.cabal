@@ -9,12 +9,12 @@ description:
   derivation builder and binary-cache substituter, and does not need an
   existing Nix installation.
 
-  On the 22 derivations its CI checks, over pinned pairs of Nix and
-  nixpkgs from 2.24.9 with nixpkgs 24.11 to 2.35.4 with nixpkgs unstable,
-  the derivation paths it computes match upstream.  On Windows it builds
-  packages from source through a stage-1 stdenv over a store-pinned
-  MinGW-w64 toolchain.  The project is experimental; see the README for
-  what is not implemented yet.
+  On the derivations its CI checks, over pinned pairs of Nix and nixpkgs,
+  the derivation paths it computes match upstream's.  On Windows it builds
+  packages from source through a stage-1 stdenv over prebuilt MinGW-w64
+  and MSYS2 packages pinned by SHA-256, and builds GNU Mes from a
+  1,623-byte seed.  The project is experimental; see the README for what
+  is not implemented.
 
   Evaluation needs the C data layer, so library code must run it between
   @Nix.Eval.Arena.arenaInit@ and @Nix.Eval.Arena.arenaDestroy@.

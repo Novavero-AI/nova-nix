@@ -11,6 +11,15 @@ and pull requests are welcome.
   (`cabal test` locally).
 - Match the existing style: ormolu 0.9.0.0 and hlint 3.10, the versions CI
   pins.
+- Source is ASCII only: CI rejects any other byte in a tracked `.hs`, `.c`,
+  `.h`, `.nix`, `.sh`, `.cabal` or `.md` file.
+- C in `cbits/` compiles under `gcc -std=c99 -Wall -Wextra -pedantic
+  -Werror`, and CI also runs the test suite with it built under ASan and
+  UBSan.
+- The README says what nova-nix is and how to use it, and links to what
+  owns each detail rather than repeating it: Haddock for the library,
+  `nova-nix --help` for the CLI, the parity case lists for what CI checks.
+  A copy drifts from its source; a link cannot.
 
 ## Commit messages
 
@@ -28,15 +37,18 @@ obvious approach does not work) in full sentences.
 
 The bold lead is what someone scanning a release reads. Everything after it is
 for whoever needs the reasoning, and it is worth the space. Match the entries
-already in `CHANGELOG.md`; they are the specification.
+already in `CHANGELOG.md`; they are the specification. A change to the
+library API gets a second bullet in the same file, led by `**Library API:**`,
+naming what a library user has to change.
 
 One file per entry rather than one shared section, because every branch
 appending to the same section collides there and nowhere else. Two branches
 adding entries touch two different files, so they cannot conflict.
 
-`CHANGELOG.md` stays the record of what shipped. At release the fragments are
-assembled under the new version heading with `scripts/assemble-changelog.sh`
-and removed, so nothing is written twice.
+`CHANGELOG.md` stays the record of what shipped. At release,
+`scripts/assemble-changelog.sh` prints the fragments in the order they were
+added, they go under the new version heading, and the fragments are deleted,
+so nothing is written twice.
 
 ## Licensing of contributions
 

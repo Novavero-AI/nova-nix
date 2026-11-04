@@ -23,7 +23,7 @@
 -- The key difference is process creation.  Upstream on Linux uses
 -- @fork\/exec@ with namespace isolation.  nova-nix spawns builders through
 -- "System.Process", which reaches @CreateProcess@ on Windows with no POSIX
--- layer, and does not sandbox them yet (#25).
+-- layer, and runs them without filesystem or network isolation.
 --
 -- The builder's process tree runs inside a Win32 job object with
 -- kill-on-job-close ('Proc.use_process_jobs'), so an interrupt or a

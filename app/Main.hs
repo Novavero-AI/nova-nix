@@ -6,10 +6,9 @@
 -- The command and flag tables are deliberately not repeated here.
 -- 'usageLines' is the one place they live, and both @--help@ and the
 -- usage-error path print it, so the flag that adds itself to the parser
--- documents itself in the same edit.  A second copy in this header went
--- nine flags and two commands stale before anyone noticed, because
--- nothing renders it: Haddock builds library targets by default, and
--- this module is in the executable stanza.
+-- documents itself in the same edit.  A copy here would go stale
+-- unnoticed: Haddock builds library targets by default, and this module
+-- is in the executable stanza, so nothing renders it.
 module Main (main) where
 
 import Control.Exception (AsyncException (UserInterrupt), IOException, displayException, handleJust, try)

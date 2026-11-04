@@ -432,6 +432,41 @@ jobs:
           [ "$status" -eq 1 ] || { echo "expected exit 1 after SIGINT, got $status" >&2; exit 1; }
           grep -qx 'error: interrupted by the user' interrupt.txt
 
+      # The README links to what owns each detail rather than copying it
+      # (CONTRIBUTING.md).  What can drift mechanically is checked here: a
+      # relative link, which Hackage renders as /package/<target> and 404s,
+      # and a command or flag in a README console block that --help does not
+      # list.
+      - name: The README's links and commands are current
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=$(cabal list-bin exe:nova-nix)
+          help=$("$exe" --help)
+          failed=0
+          links=$(grep -noE '\]\([^)]*\)|^\[[^]]+\]:[[:space:]]+[^[:space:]]+' README.md || true)
+          relative=$(grep -vE '\]\((https?://|#)|\]:[[:space:]]+https?://' <<<"$links" || true)
+          if [ -n "$relative" ]; then
+            printf '%s\n' "$relative"
+            echo "::error file=README.md::the relative link above 404s on Hackage; link to the file on GitHub"
+            failed=1
+          fi
+          commands=$(awk '/^```console/ { inside = 1; next } /^```/ { inside = 0 } inside && /nova-nix/' README.md)
+          while read -r flag; do
+            if ! grep -qE -- "(^| )${flag}( |,|$)" <<<"$help"; then
+              echo "::error file=README.md::the README passes ${flag}, which nova-nix --help does not list"
+              failed=1
+            fi
+          done < <(grep -oE '(^| )(-[A-Za-z]|--[a-z][a-z-]*)' <<<"$commands" | tr -d ' ' | sort -u)
+          while read -r command; do
+            if ! grep -qE "^  ${command}( |$)" <<<"$help"; then
+              echo "::error file=README.md::the README runs nova-nix ${command}, which nova-nix --help does not list"
+              failed=1
+            fi
+          done < <(sed -E 's/.*nova-nix(\.exe)? //' <<<"$commands" | awk '{ print ($1 == "store" ? $1 " " $2 : $1) }' | sort -u)
+          exit "$failed"
+
       # CI is the only place that compiles for all three platforms, and it
       # discarded every result.  Keeping them means a Windows or macOS
       # failure can be reproduced on a real machine without installing a
