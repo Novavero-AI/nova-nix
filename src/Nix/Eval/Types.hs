@@ -412,7 +412,8 @@ attrSetLookupEntry key (AttrSet cset) =
     midx <- cattrsetIndex cset sym
     traverse (\idx -> AttrEntry <$> cattrsetGetPos cset idx <*> (Thunk <$> cattrsetGetValue cset idx)) midx
 
--- | All keys in sorted order (symbol text from C).
+-- | All keys, as symbol text from C, in the C array's order: by interned
+-- symbol, not by name.
 attrSetKeys :: AttrSet -> [Text]
 attrSetKeys (AttrSet cset) =
   map symbolText (unsafePerformIO (cattrsetKeys cset))

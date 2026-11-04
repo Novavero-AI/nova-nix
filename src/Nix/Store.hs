@@ -357,13 +357,13 @@ moveOutput src dest
 
 -- | Byte-scan a tree for store path references.
 --
--- Searches each scan unit ('collectScanUnits': regular file bytes and
--- symlink target strings) for each candidate's bare 32-character hash -
--- the same needle upstream Nix scans for.  Matching the hash rather
--- than a store-dir-prefixed path keeps the scan independent of the
--- spelling the builder embedded (canonical @\/nix\/store\/...@,
--- @C:\\nix\\store\\...@, MSYS2 forms): eval injects canonical
--- forward-slash text into builder environments, which a
+-- Searches each scan unit ('collectScanUnits': regular file bytes,
+-- symlink target strings and entry names) for each candidate's bare
+-- 32-character hash - the same needle upstream Nix scans for.  Matching
+-- the hash rather than a store-dir-prefixed path keeps the scan
+-- independent of the spelling the builder embedded (canonical
+-- @\/nix\/store\/...@, @C:\\nix\\store\\...@, MSYS2 forms): eval injects
+-- canonical forward-slash text into builder environments, which a
 -- platform-store-dir prefix never matches on Windows.
 scanReferences :: [StorePath] -> FilePath -> IO [StorePath]
 scanReferences candidates dir = do
@@ -463,9 +463,9 @@ replaceInName from to name = case name of
 -- dependency even when no file byte does.
 data ScanUnit = ScanFile !FilePath | ScanText !BS.ByteString
 
--- | Collect the scannable units under a path: regular files and symlink
--- targets, links never followed.  A path that is itself a regular file
--- or link is its own single unit.
+-- | Collect the scannable units under a path: regular files, symlink
+-- targets and the names of a directory's entries, links never followed.
+-- A path that is itself a regular file or link is its own single unit.
 collectScanUnits :: FilePath -> IO [ScanUnit]
 collectScanUnits path = do
   node <- classifyWalkNode path
