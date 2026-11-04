@@ -1376,7 +1376,7 @@ class (Monad m) => MonadEval m where
   -- still on disk, and recorded as this evaluation's own store write in
   -- that case. Reusing a path instead of rewriting it must still leave the
   -- registration behind, or the build driver never registers it and a
-  -- derivation naming it fails with \"references unregistered path\".
+  -- derivation naming it fails with \"path '...' is not valid\".
   adoptStorePath :: Text -> m Bool
 
   -- | Record a fetch under that key. Failing to record is not an error -

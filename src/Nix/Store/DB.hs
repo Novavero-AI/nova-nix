@@ -54,6 +54,8 @@ module Nix.Store.DB
 where
 
 import Control.Exception (throwIO)
+import Data.List (sortOn)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Database.SQLite.Simple
@@ -68,7 +70,7 @@ import Database.SQLite.Simple
     query,
     withTransaction,
   )
-import Nix.Store.Path (StoreDir (..), StorePath, storePathToFilePath)
+import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, storePathToFilePath, storePathToText)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 
@@ -196,10 +198,23 @@ registerPath db reg = registerPaths db [reg]
 -- Re-registering an existing path refreshes its metadata (NAR hash, size,
 -- deriver) via @ON CONFLICT DO UPDATE@, so a path first registered with a
 -- placeholder hash is corrected on a later real registration.
+--
+-- A reference to a path neither registered nor in the batch refuses the
+-- whole batch, recording nothing, with an 'IOError' carrying upstream's
+-- message, @path \'\/nix\/store\/\<hash\>-\<name\>\' is not valid@
+-- (@queryValidPathId@, local-store.cc at 2.24.9).  The path is spelled
+-- under the logical store directory, as upstream's @printStorePath@
+-- spells it, wherever the store's files are kept: a relocated store
+-- still has @\/nix\/store@ as its @storeDir@ and only its @realStoreDir@
+-- moves (local-fs-store.hh).  The edges go in upstream's order, the batch
+-- by path and each path's references as a sorted set, so of several
+-- unregistered references the one named is the one upstream names.  The
+-- sort is stable, so of two registrations of one path in a batch the
+-- later's edges still win.
 registerPaths :: StoreDB -> [PathRegistration] -> IO ()
 registerPaths db regs = withTransaction (sdbConn db) $ do
   mapM_ (insertPathRow db) regs
-  mapM_ (insertPathRefs db) regs
+  mapM_ (insertPathRefs db) (sortOn prPath regs)
 
 -- | Insert (or refresh) a single ValidPaths row.
 insertPathRow :: StoreDB -> PathRegistration -> IO ()
@@ -238,7 +253,7 @@ insertPathRefs db reg = do
   case referrerRows of
     (Only referrerId : _) -> do
       execute conn "DELETE FROM Refs WHERE referrer = ?" (Only referrerId)
-      mapM_ (insertRef conn referrerId) (prReferences reg)
+      mapM_ (insertRef conn referrerId) (Set.toAscList (Set.fromList (prReferences reg)))
     [] -> pure () -- Should not happen: the row was just inserted above.
   where
     insertRef conn referrerId refPath = do
@@ -248,14 +263,7 @@ insertPathRefs db reg = do
         (Only refId : _) ->
           execute conn "INSERT OR IGNORE INTO Refs (referrer, reference) VALUES (?, ?)" (referrerId, refId)
         [] ->
-          throwIO
-            ( userError
-                ( "registerPaths: "
-                    <> storePathToFilePath (sdbDir db) (prPath reg)
-                    <> " references unregistered path "
-                    <> T.unpack refPathText
-                )
-            )
+          throwIO (userError ("path '" <> T.unpack (storePathToText defaultStoreDir refPath) <> "' is not valid"))
 
 -- ---------------------------------------------------------------------------
 -- Queries

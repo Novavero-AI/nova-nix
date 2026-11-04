@@ -8268,15 +8268,50 @@ testStoreDB = do
               else Fail ("expected only refresh-a after re-register, got: " <> T.pack (show refs)),
         -- A reference to an unregistered path is a loud error: a silently
         -- dropped edge under-reports narinfos and hands a future GC
-        -- permission to delete a live dependency.
-        runTestM "db register with unregistered ref throws" $ do
+        -- permission to delete a live dependency.  The refusal is
+        -- upstream's queryValidPathId message, naming the reference under
+        -- /nix/store though this store is kept elsewhere, and the batch
+        -- records nothing.
+        runTestM "db register with an unregistered ref is refused in upstream's words" $ do
           db <- openStoreDB storeDir
           let ghost = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "ghost"
               sp = StorePath "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk" "orphan-edge"
           outcome <- try (registerPath db (PathRegistration sp "sha256:oe" 13 Nothing [ghost]))
+          recorded <- isValidPath db sp
           closeStoreDB db
-          pure $ case (outcome :: Either SomeException ()) of
-            Left _ -> Pass
+          pure $ case outcome of
+            Left (err :: IOException) ->
+              assertEqual
+                "refusal"
+                ("path '/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-ghost' is not valid", False)
+                (ioeGetErrorString err, recorded)
+            Right () -> Fail "expected registration to throw on an unregistered reference",
+        -- Of several unregistered references the refusal names the one
+        -- upstream's does: the batch in path order, then each path's
+        -- references in path order.  The list order would name ghost-a,
+        -- and so would the least unregistered path overall.
+        runTestM "db refusal names the first unregistered ref in upstream's order" $ do
+          db <- openStoreDB storeDir
+          let ghostA = StorePath "22222222222222222222222222222222" "ghost-a"
+              ghostB = StorePath "33333333333333333333333333333333" "ghost-b"
+              ghostC = StorePath "44444444444444444444444444444444" "ghost-c"
+              early = StorePath "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm" "early"
+              late = StorePath "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" "late"
+          outcome <-
+            try
+              ( registerPaths
+                  db
+                  [ PathRegistration late "sha256:lt" 14 Nothing [ghostA],
+                    PathRegistration early "sha256:er" 15 Nothing [ghostC, ghostB]
+                  ]
+              )
+          closeStoreDB db
+          pure $ case outcome of
+            Left (err :: IOException) ->
+              assertEqual
+                "refusal"
+                "path '/nix/store/33333333333333333333333333333333-ghost-b' is not valid"
+                (ioeGetErrorString err)
             Right () -> Fail "expected registration to throw on an unregistered reference",
         -- queryDeriver nothing
         runTestM "db queryDeriver nothing" $ do
@@ -14566,7 +14601,7 @@ testE2E = do
         pure ret,
       -- Every eval-time store writer must register, not only toFile: an
       -- unrecorded write reaches drvInputSrcs and the build dies with
-      -- "references unregistered path".
+      -- "path '...' is not valid".
       runTestM "e2e eval-time store writes register as derivation inputs" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-e2e-inputs"
