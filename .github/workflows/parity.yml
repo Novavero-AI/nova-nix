@@ -146,3 +146,19 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/derivation-cases.sh
+
+  # The one context branch protection requires of this workflow, so that
+  # bumping a matrix row leaves the required name unchanged.  A required
+  # check that is skipped counts as passed, so this job runs whatever the
+  # rows did and passes only when every row succeeded.
+  gate:
+    name: Parity
+    needs: [parity]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every row passed
+        env:
+          ROWS: ${{ needs.parity.result }}
+        run: test "$ROWS" = success
