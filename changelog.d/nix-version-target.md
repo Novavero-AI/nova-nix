@@ -1,1 +1,0 @@
-- **`builtins.nixVersion` is `"2.24.9"`, where it was `"2.24.0"`.** Upstream reports the version of the Nix evaluating the expression (`nixVersion` in `globals.cc` at 2.24.9), and 2.24.9 is the release nova-nix matches, so an expression that branches on the value now takes the branch it takes there. `nova-nix --version` still names nova-nix's own release.
