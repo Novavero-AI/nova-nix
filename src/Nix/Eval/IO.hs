@@ -1074,7 +1074,7 @@ storeFilePath = SP.storePathToFilePath
 -- registers it before a derivation naming it is built.  Every eval-time
 -- writer goes through this: a write that skips it lands in
 -- @drvInputSrcs@ with no registration row and fails the build with
--- \"references unregistered path\".  The mode names the scheme that
+-- \"path '...' is not valid\".  The mode names the scheme that
 -- constructed the path, so materialization can verify the on-disk
 -- content reproduces it before registering.
 recordStoreWrite :: Text -> [SP.StorePath] -> SP.StoreWriteMode -> EvalIO ()
