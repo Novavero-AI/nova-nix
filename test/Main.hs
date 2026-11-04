@@ -14959,6 +14959,42 @@ testExecWrapperCLI = do
         pure (builds ++ errors)
     )
 
+-- | A failure no command handles prints as upstream's handleExceptions
+-- prints one, a single @error:@ line and exit status 1, not GHC's
+-- "Uncaught exception" report.  A derivation whose context names a path
+-- the store never registered meets the store's refusal while its @.drv@
+-- is written, before anything builds.
+testUncaughtIOFailureCLI :: IO [Bool]
+testUncaughtIOFailureCLI = do
+  putStrLn "cli/uncaught-io-failure"
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-io-failure"
+      missing :: String
+      missing = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone"
+      source =
+        "derivation { name = \"unregistered\"; system = builtins.currentSystem; builder = \"/bin/sh\"; dep = builtins.appendContext \"\" { \""
+          <> missing
+          <> "\" = { path = true; }; }; }"
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+  bracket_
+    (forceRemoveIfExists root >> createDirectoryIfMissing True root)
+    (forceRemoveIfExists root)
+    ( do
+        (code, _, err) <-
+          Proc.readCreateProcessWithExitCode
+            ((Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "build", "--expr", source, "--store", root </> "store"]) {Proc.env = Just isolatedEnv})
+            ""
+        sequence
+          [ runTest "uncaught I/O failure exits 1" (assertEqual "exit code" (ExitFailure 1) code),
+            runTest "uncaught I/O failure prints upstream's error line" $
+              assertEqual "stderr" ["error: path '" <> missing <> "' is not valid"] (map (filter (/= '\r')) (lines err))
+          ]
+    )
+
 -- ---------------------------------------------------------------------------
 -- Tests: Phase 4 - search paths, dynamic keys, directory import
 -- ---------------------------------------------------------------------------
@@ -18328,6 +18364,7 @@ runSuite = do
           testBuilder,
           testE2E,
           testExecWrapperCLI,
+          testUncaughtIOFailureCLI,
           testPhase4,
           testPhase4IO,
           testToJSONPathIO,

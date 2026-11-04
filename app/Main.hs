@@ -12,7 +12,7 @@
 -- this module is in the executable stanza.
 module Main (main) where
 
-import Control.Exception (AsyncException (UserInterrupt), IOException, displayException, handleJust, try)
+import Control.Exception (AsyncException (UserInterrupt), IOException, displayException, handle, handleJust, try)
 import Control.Monad (join, mfilter, void, (>=>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -56,7 +56,7 @@ import System.Exit (ExitCode (..), exitFailure, exitWith)
 import qualified System.File.OsPath as OsFile
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
-import System.IO.Error (isDoesNotExistError)
+import System.IO.Error (ioeGetErrorString, isDoesNotExistError, isUserError)
 import qualified System.Info as SI
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
@@ -403,10 +403,13 @@ main = do
   config <- loadNixConfig
   storeDir <- chosenStoreDir opts
   -- SIGINT reaches the main thread as UserInterrupt, which uncaught ends
-  -- the process by the signal with nothing said.  Upstream's checkInterrupt
-  -- throws Interrupted, a BaseError its handleExceptions logs and exits 1
-  -- with (libmain/shared.cc at 2.24.9).
-  handleJust userInterrupt (const reportInterrupt) $ case optCommand opts of
+  -- the process by the signal with nothing said, and an I/O failure no
+  -- command handles reaches GHC's default handler, which prints an
+  -- "Uncaught exception" report with a backtrace.  Upstream's
+  -- handleExceptions logs either as one error line and exits 1
+  -- (libmain/shared.cc at 2.24.9): checkInterrupt throws Interrupted, a
+  -- BaseError like any other failure.
+  handleJust userInterrupt (const reportInterrupt) . handle reportIOFailure $ case optCommand opts of
     CmdEvalFile filePath -> evalFile config opts storeDir dataDir filePath
     CmdEvalExpr expr
       | optAterm opts -> evalExprAterm config opts storeDir dataDir expr
@@ -429,6 +432,21 @@ reportInterrupt :: IO a
 reportInterrupt = do
   hPutStrLn stderr "error: interrupted by the user"
   exitWith (ExitFailure 1)
+
+-- | An I/O failure no command handled, reported as upstream reports an
+-- error: @error: @ and the message, then exit status 1.
+reportIOFailure :: IOException -> IO a
+reportIOFailure failure = do
+  hPutStrLn stderr ("error: " <> ioFailureMessage failure)
+  exitWith (ExitFailure 1)
+
+-- | A 'userError' is its message alone, which 'show' would wrap in
+-- @user error (...)@; any other 'IOException' also names the operation
+-- and the file that failed.
+ioFailureMessage :: IOException -> String
+ioFailureMessage failure
+  | isUserError failure = ioeGetErrorString failure
+  | otherwise = displayException failure
 
 -- | What @--version@ reports.  Cabal's version, which is the one the publish
 -- workflow's tag guard checks a tag against, so a downloaded binary names
