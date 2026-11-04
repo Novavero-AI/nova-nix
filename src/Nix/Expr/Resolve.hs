@@ -185,7 +185,7 @@ resolveVar fullStack name = go fullStack 0 False
 
 -- | A temporary accommodation.  Upstream's parser reads @__curPos@ as a
 -- position expression, never a variable (parser.y at 2.24.9, expr_simple),
--- so binding never sees it.  Here it still parses as a variable: 'parseNix'
+-- so binding never sees it.  Here it still parses as a variable: 'Nix.Parser.parseNix'
 -- takes the source's origin, which decides between upstream's position set
 -- (a file) and its null (a string), but no expression builds a position
 -- from it.  Until one does, the name is exempt from the check and fails
@@ -213,7 +213,7 @@ curPosName = "__curPos"
 -- @__@-prefixed upstream, so nixpkgs' @with pkgs; fetchurl@ binds
 -- @pkgs.fetchurl@.
 --
--- Layering keeps this module from importing 'Nix.Builtins', which builds
+-- Layering keeps this module from importing "Nix.Builtins", which builds
 -- the root environment from this set; a test checks it against the list
 -- recorded from upstream's source.
 staticGlobalNames :: Set Text

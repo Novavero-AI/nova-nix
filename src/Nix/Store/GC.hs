@@ -89,8 +89,8 @@
 -- @gc.lock@, held exclusively by the collector and shared by every
 -- writer, plus a socket through which a writer registers roots with a
 -- running collector.  nova-nix keeps the lock and drops the socket:
--- every open 'Store' handle holds the shared lock from 'openStore' to
--- 'closeStore' ("Nix.Store.Handle"), and 'collectGarbage' (and
+-- every open t'Store' handle holds the shared lock from 'Nix.Store.Handle.openStore' to
+-- 'Nix.Store.Handle.closeStore' ("Nix.Store.Handle"), and 'collectGarbage' (and
 -- 'withLiveSet', which the checked delete runs under) trades the
 -- handle's shared lease for the exclusive lock for the duration.  A
 -- collection therefore runs only while no other process has the store

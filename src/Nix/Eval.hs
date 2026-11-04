@@ -9,7 +9,7 @@
 -- Function arguments are likewise thunked - @(x: 1) (throw "boom")@
 -- returns @1@ because @x@ is never referenced.
 --
--- The evaluator maintains an environment ('Env') that maps variable
+-- The evaluator maintains an environment, a t'Env', that maps variable
 -- names to thunks.  @let@, @with@, function application, and
 -- recursive attribute sets all extend the environment.
 --
@@ -566,7 +566,7 @@ evalBcPathParts env n off = do
 
 -- | Evaluate string parts from the bytecode data buffer.  Each part is two
 -- words: (tag, value), a symbol under 'strpartLit' or 'strpartEsc' and a
--- bytecode index under 'strpartInterp'.  The kind survives into the chunk
+-- bytecode index under 'Nix.Eval.CBytecode.strpartInterp'.  The kind survives into the chunk
 -- because an indented string strips an escape and an interpolation
 -- differently.
 evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [StringChunk]
@@ -870,7 +870,7 @@ evalBcLet env bcIdx0 = do
        in filled `seq` evalBytecode letEnv bodyIdx
 
 -- | Check if all bytecode bindings are static keys (eligible for positional).
--- Must stay in sync with 'allStaticSingleKey' in 'Nix.Expr.Resolve'.
+-- Must stay in sync with @allStaticSingleKey@ in "Nix.Expr.Resolve".
 allBcPositional :: [BcBinding] -> Bool
 allBcPositional = all isEligible
   where
@@ -880,7 +880,7 @@ allBcPositional = all isEligible
     isEligible _ = False
 
 -- | Count positional slots for bytecode bindings.
--- Must stay in sync with 'lexicalScopeFromBindings' in 'Nix.Expr.Resolve'.
+-- Must stay in sync with @lexicalScopeFromBindings@ in "Nix.Expr.Resolve".
 bcBindingSlotCount :: [BcBinding] -> Int
 bcBindingSlotCount = foldl' countOne 0
   where
@@ -1048,8 +1048,9 @@ evalVar env name =
 -- | Evaluate a with-scoped variable: check with-scopes first (innermost
 -- to outermost), then fall back to the standard name-based lookup
 -- (parent chain to builtins).  For trimmed envs ('CapturesWithScopes'),
--- the root scope is already appended to 'envWithScopes' so the
--- with-scope lookup finds builtins without needing a parent chain.
+-- the root scope is already appended to the env's with-scopes
+-- ('envWithScopesRaw'), so the with-scope lookup finds builtins without
+-- needing a parent chain.
 -- Supports both resolved (CAttrSet*) and lazy (CThunk*, tagged with bit 0)
 -- with-scope entries.  Lazy entries are forced on first lookup and the
 -- pointer is updated in place so subsequent lookups hit the resolved
@@ -3738,7 +3739,7 @@ data FetchGitArgs = FetchGitArgs
 -- | The attributes @builtins.fetchGit@ accepts.  Anything outside the
 -- set is an error rather than a silent drop - an ignored attribute is
 -- exactly how an unhonored pin stays invisible.  Upstream refuses the
--- same way ("input attribute '...' not supported by scheme 'git'",
+-- same way ("input attribute \'...\' not supported by scheme \'git\'",
 -- observed from nix-instantiate 2.33.2).
 fetchGitSupportedAttrs :: [Text]
 fetchGitSupportedAttrs = ["url", "name", "ref", "rev", "submodules", "shallow", "allRefs", "narHash"]
@@ -3977,7 +3978,7 @@ fetchGitUncached args checkedRef checkedRev = do
     `onEvalError` removeScratchDir cloneDir
 
 -- | Every step of an uncached fetch that can throw, run under
--- 'fetchGitUncached''s scratch-dir cleanup.
+-- 'fetchGitUncached'\'s scratch-dir cleanup.
 fetchGitInClone :: (MonadEval m) => FetchGitArgs -> Maybe Text -> Maybe Text -> Text -> m FetchCache
 fetchGitInClone args checkedRef checkedRev cloneDir = do
   let ctx = "builtins.fetchGit"
@@ -4952,7 +4953,7 @@ builtinHashFile (VStr algo _) pathVal = do
 builtinHashFile other _ =
   throwEvalError ("builtins.hashFile: expected a string, got " <> typeName other)
 
--- | Shared hash dispatch for raw 'ByteString' input.
+-- | Shared hash dispatch for raw t'Data.ByteString.ByteString' input.
 hashBytesWithAlgo :: (MonadEval m) => Text -> Text -> BS.ByteString -> m NixValue
 hashBytesWithAlgo ctx algo bytes = case algo of
   "sha256" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA256)))
@@ -5201,7 +5202,7 @@ tomlNeedsMoreLines st =
 
 -- | Scan one physical line, returning the state at end of line and the
 -- line's visible text: a comment outside strings is cut here, where the
--- string context is still known ('#' inside any string form is content).
+-- string context is still known (@#@ inside any string form is content).
 scanTomlLine :: TomlScan -> Text -> (TomlScan, Text)
 scanTomlLine st0 line = go st0 line 0
   where

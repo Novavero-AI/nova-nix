@@ -45,7 +45,7 @@ import System.FilePath (isPathSeparator, pathSeparator)
 -- conditional: on POSIX a backslash is an ordinary file-name character
 -- and passes through untouched - upstream's semantics - while on
 -- Windows it is a separator and folds to @/@.  Every site that
--- produces a 'VPath' from platform-tainted text (literal resolution,
+-- produces a 'Nix.Eval.Types.VPath' from platform-tainted text (literal resolution,
 -- base-dir joins, fetcher scratch dirs, search-path entries) goes
 -- through this gate; store-path text is canonical by construction.
 canonPathValue :: Text -> Text

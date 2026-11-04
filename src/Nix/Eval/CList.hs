@@ -157,7 +157,7 @@ clistToThunkList cl
 -- ---------------------------------------------------------------------------
 
 -- | Opaque wrapper around a C-backed list.  Used as the payload of
--- @VList@ in the 'NixValue' ADT.  The underlying @nn_list_t*@ is
+-- @VList@ in the t'Nix.Eval.Types.NixValue' ADT.  The underlying @nn_list_t*@ is
 -- arena-allocated and valid until evaluation end.
 newtype CList = CList {unCList :: CListPtr}
 
@@ -177,14 +177,14 @@ instance Show CList where
 emptyCList :: CList
 emptyCList = CList nullPtr
 
--- | Convert a Haskell list of 'CThunkPtr' to a 'CList'.
+-- | Convert a Haskell list of 'CThunkPtr' to a t'CList'.
 -- Uses 'unsafePerformIO' - safe because allocation is idempotent
 -- per call (no shared mutable state beyond the tracking array).
 {-# NOINLINE clistFromThunks #-}
 clistFromThunks :: [CThunkPtr] -> CList
 clistFromThunks ptrs = CList (unsafePerformIO (thunkListToCList ptrs))
 
--- | Convert a 'CList' back to a Haskell list of 'CThunkPtr'.
+-- | Convert a t'CList' back to a Haskell list of 'CThunkPtr'.
 clistThunks :: CList -> [CThunkPtr]
 clistThunks (CList p) = unsafePerformIO (clistToThunkList p)
 

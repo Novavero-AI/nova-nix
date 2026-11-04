@@ -2,8 +2,8 @@
 --
 -- Separates the evaluation representation (defaults are bytecode indices)
 -- from the parser representation ('Nix.Expr.Types.Formal', defaults are
--- 'Expr').  This avoids circular dependencies: both 'Nix.Eval.Types'
--- (for 'VLambda') and 'Nix.Eval.Compile' (for encoding\/decoding)
+-- t'Nix.Expr.Types.Expr').  This avoids circular dependencies: both "Nix.Eval.Types"
+-- (for 'Nix.Eval.Types.VLambda') and "Nix.Eval.Compile" (for encoding\/decoding)
 -- import this leaf module.
 module Nix.Eval.EvalFormals
   ( EvalFormals (..),

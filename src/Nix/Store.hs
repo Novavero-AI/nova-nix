@@ -926,7 +926,7 @@ data UnpackFrame = UnpackFrame
     ufSeen :: !(Map BS.ByteString Int)
   }
 
--- | Mutable state behind a 'NarUnpackSink' - the same deliberate IO
+-- | Mutable state behind a t'NarUnpackSink' - the same deliberate IO
 -- boundary as the store's other materializers.  'nusTargets' is the
 -- stack of on-disk paths the NEXT node materializes at: the
 -- destination at the root, plus one pushed per open directory entry.

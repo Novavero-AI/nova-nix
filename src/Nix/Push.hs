@@ -131,12 +131,12 @@ data PushCompression = PushNone | PushZstd
   deriving (Eq, Show)
 
 -- | The accepted @--compression@ spellings, for parser errors and the
--- CLI help line - one rendering of the register in 'Nix.Compression'.
+-- CLI help line - one rendering of the register in "Nix.Compression".
 pushCompressionValues :: Text
 pushCompressionValues = compressionNameNone <> ", " <> compressionNameZstd
 
 -- | Parse the CLI spelling of a push compression.  The spellings are
--- the narinfo @Compression@ names from 'Nix.Compression', so the CLI
+-- the narinfo @Compression@ names from "Nix.Compression", so the CLI
 -- vocabulary and the wire vocabulary cannot drift.
 parsePushCompression :: Text -> Either Text PushCompression
 parsePushCompression name
@@ -313,7 +313,7 @@ mkPushArtifact compression narHash narBytes = case compression of
 
 -- | Construct the narinfo describing a store path.  Every artifact
 -- and NAR field - file hash, file size, compression, object name, NAR
--- hash, NAR size - comes from the one 'PushArtifact', so the narinfo
+-- hash, NAR size - comes from the one t'PushArtifact', so the narinfo
 -- is internally consistent by construction.  The @StorePath@ uses
 -- the canonical @\/nix\/store@ form; references and the deriver are
 -- basenames, matching the wire format.

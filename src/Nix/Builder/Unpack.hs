@@ -140,7 +140,7 @@ chargeBudget label bytes (UnpackLimits remainingBytes remainingEntries)
 ownerExecuteMode :: TarEntry.Permissions
 ownerExecuteMode = 0o100
 
--- | Pax per-file extended header ('x') and global header ('g') type codes.
+-- | Pax per-file extended header (@x@) and global header (@g@) type codes.
 -- 'Tar.decodeLongNames' already applies pax path\/linkpath overrides; any
 -- header entries still present carry only metadata we do not record (mtime,
 -- xattrs), so they are skipped rather than rejected.

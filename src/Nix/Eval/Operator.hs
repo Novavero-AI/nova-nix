@@ -365,7 +365,7 @@ evalUpdate evalLeft evalRight = do
     expectSet other =
       throwEvalError ("expected a set but found " <> typeName other <> ": " <> printValue PrintForError other)
 
--- | Merge two 'AttrSet's, right-biased (@//@).
+-- | Merge two t'AttrSet's, right-biased (@//@).
 -- Delegates to C-side @nn_attrset_union@ which performs a linear merge
 -- of two sorted arrays - O(n+m) on contiguous, cache-friendly memory.
 --

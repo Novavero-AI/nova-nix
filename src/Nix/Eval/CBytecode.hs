@@ -324,7 +324,7 @@ pattern OpLitUri, OpLitPath :: Word8
 pattern OpLitUri = 4
 pattern OpLitPath = 5
 
--- | String opcodes: an ordinary @"..."@ string and an indented @''...''@ string.
+-- | String opcodes: an ordinary @"..."@ string and an indented @\'\'...''@ string.
 pattern OpStr, OpIndStr :: Word8
 pattern OpStr = 6
 pattern OpIndStr = 7

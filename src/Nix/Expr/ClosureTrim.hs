@@ -1,10 +1,10 @@
 -- | Closure trimming pass: rewrites lambdas, let blocks, and recursive
 -- attr sets to capture only the free variables they actually use.
 --
--- Without trimming, every 'VLambda' and every let\/rec binding thunk
--- retains the ENTIRE parent 'Env' chain.  A scope using 3 variables
+-- Without trimming, every 'Nix.Eval.Types.VLambda' and every let\/rec binding thunk
+-- retains the ENTIRE parent t'Nix.Eval.Types.Env' chain.  A scope using 3 variables
 -- retains a 30k-entry nixpkgs scope.  This pass, run after
--- 'resolveVars', attaches a 'Captures' list to each trimmable
+-- 'Nix.Expr.Resolve.resolveVars', attaches a 'Captures' list to each trimmable
 -- 'ELambda', 'ELet', and recursive 'EAttrs' so the evaluator can
 -- build a flat env with @envParent = Nothing@, breaking the retention
 -- chain.
@@ -173,7 +173,8 @@ trimOneLambda formals body =
 --   the outer scope (not shadowed by inner let/rec/lambda scopes)
 -- * @hasOuterWithVar@ is 'True' if there's any 'EWithVar' that needs
 --   with-scope access (doesn't block trimming, but env must preserve
---   'envWithScopes' with builtins appended)
+--   its with-scopes ('Nix.Eval.Types.envWithScopesRaw') with builtins
+--   appended)
 --
 -- @depth@ tracks how many scope-creating constructs we've entered
 -- inside the lambda body (nested lambdas, let, rec attrs).
@@ -328,7 +329,7 @@ foldFormals depth = foldl' combine (Set.empty, False, False)
 --
 -- An outer reference @EResolvedVar level idx@ where @level > depth@
 -- maps to @EResolvedVar (depth + 1) captureIdx@.  The @depth + 1@
--- accounts for the fact that 'matchFormals' creates an argEnv with
+-- accounts for the fact that @matchFormals@ creates an argEnv with
 -- @envParent = trimmedEnv@, so level 0 = formals, level 1 = captures.
 rewriteBody :: Int -> Map (Int, Int) Int -> Expr -> Expr
 rewriteBody depth captureMap expr = case expr of

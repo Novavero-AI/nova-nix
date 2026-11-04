@@ -13,7 +13,7 @@
 -- @allowed-uris@ (@checkURI@).  @pure-eval@ additionally empties the
 -- search path, hides the impure constants, and makes the fetchers demand
 -- a hash or revision; those decisions live with the builtins and consult
--- 'EvalPolicy' through 'Nix.Eval.Types.MonadEval'.
+-- t'EvalPolicy' through 'Nix.Eval.Types.MonadEval'.
 --
 -- Everything here is pure so each rule can be tested on its own.  The
 -- filesystem side (walking a path through its symlinks, prefix by
