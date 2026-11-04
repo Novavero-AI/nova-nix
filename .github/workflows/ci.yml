@@ -948,9 +948,11 @@ jobs:
   # library compiled by MesCC running on mes-m2, and mes.exe compiled by
   # MesCC.  test/data/mes.nix runs mes-m2 and mes with --version in a build,
   # as nixpkgs' get-version test does, and hello, which MesCC compiles and
-  # links with mes, runs here.  x64 and ARM64 Windows each build all of it
-  # from the seed, for the reason Stage0 (Windows) runs on both, with the
-  # nova-nix Stage0 (nova-nix) builds.
+  # links with mes, runs here.  exec-bit runs a program MesCC builds that
+  # marks files with open and chmod, and registers only if nova-nix reads
+  # each file's execute bit as its mode set it.  x64 and ARM64 Windows each
+  # build all of it from the seed, for the reason Stage0 (Windows) runs on
+  # both, with the nova-nix Stage0 (nova-nix) builds.
   #
   # The ARM64 leg takes about 37 minutes, most of them MesCC compiling the
   # libraries and mes under the x86 emulator, and the timeout is twice that.
@@ -1063,6 +1065,17 @@ jobs:
           runs 0 'Hello, Mes!'
           runs 1 'Hello, Windows!' Windows
           exit "$status"
+
+      # test/data/mes.nix's exec-bit is fixed-output to the NAR hash its tree
+      # has on POSIX, with open-0755 and chmod-0755 executable and open-0644
+      # not, so it builds only if what Mes libc's open with mode 0755 and its
+      # chmod 0755 marked registers as executable and what its open with mode
+      # 0644 made registers as not.
+      - name: A file a program MesCC builds marks is executable in its NAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mes.nix -A exec-bit
 
       # The C library's sources for TinyCC.
       - name: Build the Mes C library sources
