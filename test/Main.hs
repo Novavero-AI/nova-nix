@@ -11635,7 +11635,9 @@ sessionClosure = go Map.empty
 -- evaluation writes.  The builder spells a store path with a backslash,
 -- which starts an escape in a C or Scheme string, so no script writes a path
 -- into Mes's source with replace, and every script that runs Mes sets the
--- paths and sizes it reads in its environment instead.
+-- paths and sizes it reads in its environment instead.  exec-bit is
+-- fixed-output to the NAR hash of the files its program makes, with the
+-- execute bits their modes set.
 testMesWindows :: IO [Bool]
 testMesWindows = do
   putStrLn "pkgs/mes"
@@ -11682,7 +11684,9 @@ testMesWindows = do
           nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
           variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
           outOf drv = [storePathToText defaultStoreDir (doPath o) | o <- drvOutputs drv, doName o == "out"]
-          outText attr = T.concat (maybe [] outOf (Map.lookup attr rootOf >>= (`Map.lookup` full)))
+          builtBy attr = Map.lookup attr rootOf >>= (`Map.lookup` full)
+          outText attr = T.concat (maybe [] outOf (builtBy attr))
+          fixedHashOf drv = [(doHashAlgo o, doHash o) | o <- drvOutputs drv, doName o == "out"]
           inputsOf drv = mapMaybe ((`Map.lookup` full) . storePathToText defaultStoreDir) (Map.keys (drvInputDrvs drv))
           scriptOf drv = listToMaybe [variableOf "text" input | input <- inputsOf drv, nameOf input == nameOf drv <> "-builder"]
           isFetch drv = drvBuilder drv == "builtin:fetchurl"
@@ -11714,7 +11718,7 @@ testMesWindows = do
           runTest "the leaves it adds are the Mes and NYACC archives, both fetched fixed-output" $
             assertEqual
               "leaves added"
-              (sort ["mes-cf55470.tar.gz", "nyacc-1.09.1.tar.gz"], True)
+              (sort ["mes-d9ab4ea.tar.gz", "nyacc-1.09.1.tar.gz"], True)
               (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
           runTest "it reads no input source but what evaluation writes as text" $
             assertEqual "input sources not written as text" [] [nameOf drv | drv <- added, not (all wroteAsText (drvInputSrcs drv))],
@@ -11727,23 +11731,28 @@ testMesWindows = do
             assertEqual
               "replacements, and those that name a path"
               (3, [])
-              (length written, filter (\with -> "/" `T.isInfixOf` with || "${" `T.isInfixOf` with) written)
+              (length written, filter (\with -> "/" `T.isInfixOf` with || "${" `T.isInfixOf` with) written),
+          runTest "exec-bit is fixed-output to the NAR hash of the files its program makes, open-0755 and chmod-0755 executable" $
+            assertEqual
+              "output hash"
+              [("r:sha256", Hash.bytesToHexText (sha256Digest (NAR.serialise execBitTree)))]
+              (maybe [] fixedHashOf (builtBy "checks.exec-bit"))
         ]
   where
     instantiates :: Text
-    instantiates = "the Mes derivations instantiate, adding twenty-nine to the stage0 tools'"
+    instantiates = "the Mes derivations instantiate, adding thirty-two to the stage0 tools'"
     tools :: [Text]
     tools = ["kaem", "mescc-tools", "mescc-tools-extra"]
     mesAttrs :: [Text]
     mesAttrs = ["nyacc", "srcPost", "libs", "compiler", "libc"]
     checkAttrs :: [Text]
-    checkAttrs = ["mes-m2", "mes", "hello"]
+    checkAttrs = ["mes-m2", "mes", "hello", "exec-bit"]
     -- Each kaem.runCommand adds its script, written by writeText as
     -- <name>-builder; mes-libc-0.27.1 is both the libc MesCC compiles and
     -- the sources for TinyCC, as in nixpkgs.
     addedNames :: [Text]
     addedNames =
-      ["mes-cf55470.tar.gz", "nyacc-1.09.1.tar.gz", "hello.c"]
+      ["mes-d9ab4ea.tar.gz", "nyacc-1.09.1.tar.gz", "hello.c", "exec-bit.c"]
         ++ concat [[name, name <> "-builder"] | name <- mesRunners ++ ["nyacc-1.09.1", "mes-src-0.27.1", "mes-m2-libs-0.27.1", "mes-libc-0.27.1"]]
     mesRunners :: [Text]
     mesRunners =
@@ -11755,8 +11764,21 @@ testMesWindows = do
         "mes-0.27.1",
         "mes-m2-get-version",
         "mes-get-version",
-        "mes-hello"
+        "mes-hello",
+        "mes-exec-bit"
       ]
+    -- What test/data/mes.nix's exec-bit program makes: three files holding
+    -- one line, the one open creates with mode 0755 and the one chmod
+    -- gives 0755 executable, the one open creates with 0644 not.
+    execBitTree :: NAR.NarEntry
+    execBitTree =
+      NAR.NarDirectory
+        [ ("open-0755", NAR.NarRegular True execBitContents),
+          ("open-0644", NAR.NarRegular False execBitContents),
+          ("chmod-0755", NAR.NarRegular True execBitContents)
+        ]
+    execBitContents :: BS.ByteString
+    execBitContents = "written by Mes libc\n"
 
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
