@@ -213,15 +213,18 @@ jobs:
           See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/CHANGELOG.md)
           for what changed in this release.
 
-          Each archive unpacks to \`bin/\` beside \`share/\` and \`pkgs/\`. Run
-          \`bin/nova-nix\` from anywhere: no toolchain, and nothing to configure.
+          Each archive unpacks to one directory holding \`bin/\`, \`share/\`,
+          \`pkgs/\` and the license files. Run \`bin/nova-nix\` from anywhere: no
+          toolchain, and nothing to configure.
           The bundled recipes build as they stand, so on Windows:
 
           \`\`\`console
           > bin\\nova-nix.exe build pkgs\\windows\\hello.nix
           \`\`\`
 
-          Verify the download with \`sha256sum -c SHA256SUMS\`.
+          Verify the archive you downloaded with
+          \`sha256sum --ignore-missing -c SHA256SUMS\`, which skips the lines for
+          the archives you did not.
           EOF
           gh release create "v${VERSION}" \
             --draft \
