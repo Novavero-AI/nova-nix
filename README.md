@@ -25,16 +25,22 @@ it.
   packages such as curl and systemd, sources fetched through git, GitHub,
   PyPI and the cargo and Go vendoring fetchers, a NixOS initrd and system,
   and fixtures for derivation inputs, `builtins.toFile` and
-  `builtins.fetchGit`. 49 smaller evaluation cases produce the same output.
-  CI runs this comparison on every change. A matching `drvPath` means the
-  whole build-time closure behind it matches too. How much of the rest of
-  nixpkgs evaluates has not been measured yet ([#29]).
+  `builtins.fetchGit`. 49 smaller evaluation cases produce the same output,
+  52 on the two newer releases, and probes of `derivation` over a corpus of
+  calls agree apart from the differences
+  `test/data/derivation-divergences.txt` lists. CI runs this comparison on
+  every change. A matching `drvPath` means the whole build-time closure
+  behind it matches too. How much of the rest of nixpkgs evaluates has not
+  been measured yet ([#29]).
 - **Windows builds run natively.** CI builds GNU Hello on a Windows runner
   through a stage-1 stdenv. Its toolchain is 17 MinGW-w64 packages and 22
   MSYS2 packages, each fetched as a fixed-output derivation pinned by SHA-256
   and unpacked into the store. sed, zlib and a small library-linking example
   also have recipes, but CI does not build them. Replacing these binary seeds
-  with a toolchain built from source is tracked in [#26].
+  with a toolchain built from source is tracked in [#26]. CI builds its
+  first two rungs on x64 and ARM64 Windows from stage0-pe32's 1,623-byte
+  seed: the chain to kaem with mescc-tools-extra, and GNU Mes 0.27.1, whose
+  MesCC compiles Mes itself, its C library, and a program that runs.
 - **Binary caches work in both directions.** `nova-nix push` uploads a
   closure, and `build --substituter` downloads signed NARs instead of
   building. CI checks this two ways. On Linux, two fixtures are pushed to a
@@ -50,8 +56,8 @@ it.
 ### Limitations
 
 - No flakes, no `nix-shell` or `nix develop`, and no daemon or multi-user mode.
-- Evaluation is slower than upstream's. CI's 22 `drvPath` cases take 10 to 13
-  times as long in total, and a full NixOS system takes 22 to 30 times as long.
+- Evaluation is slower than upstream's. In CI, `hello`'s `drvPath` takes 2 to
+  3 times as long, and a full NixOS system 20 to 40 times as long.
 - Garbage collection has no runtime roots: `nova-nix store gc` keeps what
   `build --out-link` registered and what the operator roots under the store's
   `.nova-nix/gcroots`, not what a running program has open. `keep-derivations`
@@ -158,8 +164,8 @@ builds only what it lacks:
 - **Evaluator** (`Nix.Eval`): the AST compiles to a small bytecode that a lazy
   evaluator runs, memoizing thunks and detecting infinite recursion. The
   evaluator is generic over `MonadEval`, with a pure instance for tests and an
-  IO instance for real evaluation. `derivation` is a lazy wrapper over the
-  strict `derivationStrict` primop, as in upstream's
+  IO instance for real evaluation. `derivation` is nova-nix's own lazy
+  wrapper over the strict `derivationStrict` primop, shaped like upstream's
   `src/libexpr/primops/derivation.nix`, so referring to a package does not
   force its build closure.
 - **Data layer** (`cbits/`): attribute sets, lists, thunks, environments,
@@ -197,12 +203,12 @@ import Nix.Builtins (builtinEnv)
 import Nix.Eval (eval, runPureEval)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.Policy (unrestrictedPolicy)
-import Nix.Parser (parseNix)
+import Nix.Parser (SourceOrigin (SourceText), parseNix)
 
 main :: IO ()
 main = bracket_ arenaInit arenaDestroy $
   -- The first argument is what relative path literals resolve against.
-  case parseNix "/tmp" "<expr>" "let x = 5; in x * 2 + 1" of
+  case parseNix "/tmp" (SourceText "<expr>") "let x = 5; in x * 2 + 1" of
     Left err -> print err
     Right expr -> print (runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr))
 ```
