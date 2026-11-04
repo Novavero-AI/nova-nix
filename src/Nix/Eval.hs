@@ -4150,6 +4150,9 @@ encodeFetchCache fields =
       fcNarHash fields
     ]
 
+-- | Read back what 'encodeFetchCache' wrote: 'Nothing' unless there are
+-- exactly five lines, both counts are decimal and the NAR hash is a whole
+-- base64 SHA-256.
 decodeFetchCache :: Text -> Maybe FetchCache
 decodeFetchCache raw = case T.splitOn "\n" raw of
   [storePath, rev, revCount, lastModified, narHash] -> do

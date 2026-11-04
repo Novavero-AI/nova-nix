@@ -369,6 +369,8 @@ pattern OpBinary = 22
 pattern OpSearchPath :: Word8
 pattern OpSearchPath = 23
 
+-- | Interpolated-path opcode: a path holding an antiquotation, such as
+-- @.\/a\/${x}@, whose string parts begin with the path's literal head.
 pattern OpPathStr :: Word8
 pattern OpPathStr = 24
 

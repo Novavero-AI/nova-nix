@@ -171,6 +171,8 @@ primArith checkedOp floatOp left right
   | isFloat left || isFloat right = VFloat <$> (floatOp <$> expectFloat left <*> expectFloat right)
   | otherwise = either throwEvalError (pure . VInt) =<< (checkedOp <$> expectInt left <*> expectInt right)
 
+-- | 'primArith' with 64-bit integer overflow an evaluation error:
+-- @builtins.add@; @-@ and @builtins.sub@; @*@ and @builtins.mul@.
 primAdd, primSub, primMul :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 primAdd = primArith checkedAdd (+)
 primSub = primArith checkedSub (-)

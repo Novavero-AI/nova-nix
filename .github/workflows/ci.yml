@@ -336,6 +336,35 @@ jobs:
       - name: Build
         run: cabal build --enable-tests --ghc-options="-Werror"
 
+      # Haddock is the library's documentation, published to Hackage with
+      # each release, so it is built on every change: an export with no
+      # documentation, or a reference that names no identifier or more than
+      # one, fails here rather than shipping.  A missing link destination in
+      # another package only means its documentation is not installed, and
+      # is not checked.
+      - name: Haddock documents every export and resolves every reference
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          cabal haddock nova-nix:lib:nova-nix 2>&1 | tee haddock.log
+          [ "${PIPESTATUS[0]}" -eq 0 ] || exit 1
+          coverage=$(grep -E '^ *[0-9]+% \( *[0-9]+ / *[0-9]+\) in ' haddock.log || true)
+          if [ -z "$coverage" ]; then
+            echo "::error::haddock printed no coverage report to check"
+            exit 1
+          fi
+          failed=0
+          if grep -vE '^ *100% ' <<<"$coverage"; then
+            echo "::error::the modules above export names with no Haddock"
+            failed=1
+          fi
+          if grep -E 'Warning: .* is (out of scope|ambiguous)' haddock.log; then
+            echo "::error::the references above do not name exactly one identifier"
+            failed=1
+          fi
+          exit "$failed"
+
       # The store probes its volume's case sensitivity, and the one
       # answer the runners cannot give on their own is the sensitive
       # one on macOS: the runner's disk is default APFS, which folds, so
