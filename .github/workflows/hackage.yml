@@ -103,20 +103,11 @@ jobs:
         if: ${{ !inputs.docs_only }}
         run: cabal sdist
 
-      # The token travels via stdin into curl's config, never argv:
-      # command lines are readable process-wide for the upload's duration.
-      - name: Upload to Hackage
-        if: ${{ !inputs.docs_only }}
-        env:
-          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
-        run: |
-          SDIST=$(ls dist-newstyle/sdist/nova-nix-*.tar.gz)
-          curl --fail --silent --show-error \
-            --config - \
-            --form "package=@${SDIST}" \
-            https://hackage.haskell.org/packages/ \
-            <<< "header = \"Authorization: X-ApiKey ${HACKAGE_TOKEN}\""
-
+      # Everything that can fail is built before anything is uploaded, so the
+      # two uploads run back to back: a package published before its
+      # documentation built would stay public without it, since a version
+      # cannot be withdrawn.
+      #
       # The library only: the executable and the test suite have no public
       # API.  cabal writes the tarball Hackage expects, rooted at
       # nova-nix-VERSION-docs/, so it is checked rather than repacked.
@@ -134,6 +125,20 @@ jobs:
             || { echo "unexpected tarball roots: ${ROOTS}" >&2; exit 1; }
           echo "$LISTING" | grep -q "^nova-nix-${VERSION}-docs/Nix-Eval\.html$" \
             || { echo "no module pages in ${DOCS}" >&2; exit 1; }
+
+      # The token travels via stdin into curl's config, never argv:
+      # command lines are readable process-wide for the upload's duration.
+      - name: Upload to Hackage
+        if: ${{ !inputs.docs_only }}
+        env:
+          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
+        run: |
+          SDIST=$(ls dist-newstyle/sdist/nova-nix-*.tar.gz)
+          curl --fail --silent --show-error \
+            --config - \
+            --form "package=@${SDIST}" \
+            https://hackage.haskell.org/packages/ \
+            <<< "header = \"Authorization: X-ApiKey ${HACKAGE_TOKEN}\""
 
       # Not --fail: on rejection Hackage's response body names the offending
       # entry, and that is the only diagnostic there is.
