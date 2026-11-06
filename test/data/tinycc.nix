@@ -1,17 +1,20 @@
 # pkgs/windows' TinyCC, as the TinyCC (Windows) CI jobs build it: boot-mes,
-# bootstrappable and mes, scripts that run tinycc-boot-mes,
-# tinycc-bootstrappable and tinycc-mes with -version, as nixpkgs'
-# get-version test does; hello, bootstrappable-hello and mes-hello, which
-# each of those tccs compiles and links against the library it compiled,
-# and which print their first argument, or TinyCC, and exit with their
-# argument count; bootstrappable-float and mes-float, built the same way,
-# which print the two words of their argument count times 1.25 as a double;
-# mes-printf-float, which prints that double through printf's %f; and
-# arena, tinycc-boot-mes's
-# own derivation with MES_DEBUG=3, which prints the cells Mes keeps across
-# each collection while MesCC compiles and links tcc.
+# bootstrappable, mes and native, scripts that run tinycc-boot-mes,
+# tinycc-bootstrappable, tinycc-mes and tinycc-native with -version, as
+# nixpkgs' get-version test does; hello, bootstrappable-hello, mes-hello
+# and native-hello, which each of those tccs compiles and links against the
+# library it compiled, and which print their first argument, or TinyCC, and
+# exit with their argument count; bootstrappable-float, mes-float and
+# native-float, built the same way, which print the two words of their
+# argument count times 1.25 as a double; mes-printf-float and
+# native-printf-float, which print that double through printf's %f;
+# native-search-dirs, which prints the directories tinycc-native searches;
+# native-mingw32, which compiles only if tinycc-native predefines
+# __MINGW32__; and arena, tinycc-boot-mes's own derivation with
+# MES_DEBUG=3, which prints the cells Mes keeps across each collection
+# while MesCC compiles and links tcc.
 let
-  inherit (import ../../pkgs/windows) stage0-pe32 tinycc tinycc-mes;
+  inherit (import ../../pkgs/windows) stage0-pe32 tinycc tinycc-mes tinycc-native;
   inherit (stage0-pe32) kaem writeText;
 
   helloC = writeText "hello.c" ''
@@ -54,7 +57,7 @@ let
   # part, then the fraction times 1e8 as an integer with its trailing zeros
   # dropped, 1.25, and 2.5 with one argument.  Its cast of the double to
   # long is a call to __fixdfdi, which TinyCC's own libtcc1.c, which
-  # tinycc-mes links, has.
+  # tinycc-mes links, has.  msvcrt's printf prints six decimals.
   printfFloatC = writeText "printf-float.c" ''
     #include <stdio.h>
 
@@ -64,6 +67,14 @@ let
       printf ("%f\n", argc * 1.25);
       return 0;
     }
+  '';
+
+  # Windows sources such as busybox-w32 choose their Windows code by
+  # __MINGW32__, which MinGW's GCC predefines.
+  mingw32C = writeText "mingw32.c" ''
+    #ifndef __MINGW32__
+    #error "tcc does not predefine __MINGW32__"
+    #endif
   '';
 
   getVersion =
@@ -82,6 +93,16 @@ let
       mkdir -p ''${out}/bin
       ${round.compiler}/bin/tcc.exe -nostdlib -o ''${out}/bin/${exe}.exe ${round.libs}/lib/crt1.o ${source} -L ${round.libs}/lib -lc -ltcc1
     '';
+
+  # tinycc-native links its runtime, msvcrt and kernel32 from the -B
+  # directory, and marks nothing it writes executable.
+  nativeProgram =
+    name: round: exe: source:
+    kaem.runCommand name round.env ''
+      mkdir -p ''${out}/bin
+      ${round.compiler}/bin/tcc.exe -B ${round.libs}/lib -o ''${out}/bin/${exe}.exe ${source}
+      chmod 555 ''${out}/bin/${exe}.exe
+    '';
 in
 {
   boot-mes = getVersion "tinycc-boot-mes" tinycc.boot-mes;
@@ -95,6 +116,19 @@ in
   mes-hello = program "tinycc-mes-hello" tinycc-mes "hello" helloC;
   mes-float = program "tinycc-mes-float" tinycc-mes "float" floatC;
   mes-printf-float = program "tinycc-mes-printf-float" tinycc-mes "printf-float" printfFloatC;
+
+  native = getVersion "tinycc-native" tinycc-native;
+  native-search-dirs = kaem.runCommand "tinycc-native-search-dirs" tinycc-native.env ''
+    ${tinycc-native.compiler}/bin/tcc.exe -B ${tinycc-native.libs}/lib -print-search-dirs
+    mkdir ''${out}
+  '';
+  native-mingw32 = kaem.runCommand "tinycc-native-mingw32" tinycc-native.env ''
+    ${tinycc-native.compiler}/bin/tcc.exe -c -o ''${out} ${mingw32C}
+  '';
+  native-hello = nativeProgram "tinycc-native-hello" tinycc-native "hello" helloC;
+  native-float = nativeProgram "tinycc-native-float" tinycc-native "float" floatC;
+  native-printf-float =
+    nativeProgram "tinycc-native-printf-float" tinycc-native "printf-float" printfFloatC;
 
   arena = derivation (
     tinycc.boot-mes.compiler.drvAttrs

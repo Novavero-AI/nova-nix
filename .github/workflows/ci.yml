@@ -1454,6 +1454,134 @@ jobs:
           runs "$printf_float" 0 '2.5' x
           exit "$status"
 
+      # tinycc-native.prev, TinyCC's own source compiled by tinycc-mes as a
+      # native Windows compiler, then tinycc-native, the same source compiled
+      # by that, each round's runtime compiled by its tcc, timed.
+      - name: Build tinycc-native
+        shell: bash
+        run: |
+          set -euo pipefail
+          for round in tinycc-native.prev tinycc-native; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$round.libs"
+            echo "== $round built in $((SECONDS - start)) s"
+          done
+
+      # Both rounds compile the same source with the same command line and
+      # link it against a runtime compiled from the same sources, and tcc
+      # writes no timestamp, so tinycc-native's tcc.exe is
+      # tinycc-native.prev's unless tinycc-mes, which compiled the first,
+      # generated other code than a native tcc does.  The two compiling tccs
+      # differ in what tcc's source does not read: the macros tinycc-mes
+      # predefines from Mes's config.h, and __MINGW32__.  They differ also
+      # in the C library that reads tcc's floating-point literals, strtod,
+      # which is Mes's in tinycc-mes and msvcrt's in a native tcc.
+      - name: tinycc-native reproduces itself
+        shell: bash
+        run: |
+          set -uo pipefail
+          build() {
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$1" | tail -n 1
+          }
+          if ! prev=$(build tinycc-native.prev.compiler) || ! final=$(build tinycc-native.compiler); then
+            echo "::error::tinycc-native.prev or tinycc-native did not build"
+            exit 1
+          fi
+          prev=$(cygpath -u "$prev")/bin/tcc.exe
+          final=$(cygpath -u "$final")/bin/tcc.exe
+          if cmp "$prev" "$final"; then
+            echo "ok    tinycc-native's tcc.exe is tinycc-native.prev's, $(wc -c < "$final") bytes"
+          else
+            echo "::error::tinycc-native's tcc.exe differs from tinycc-native.prev's"
+            exit 1
+          fi
+
+      # The version line, as tinycc-mes's, whose defines are the same; and
+      # the library directories tinycc-native searches, which must be the -B
+      # directory alone: a tcc compiled with _WIN32 adds the Windows system
+      # directory after it, and tinycc-mes's source removes that call.  The
+      # build log ends a line at a carriage return, so msvcrt's CRLF lines
+      # match whole.
+      - name: tinycc-native prints its version and searches no system directory
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/native-version.log"
+          want='tcc version 0.9.28-unstable-2025-12-03 (i386 Windows)'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A native > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tinycc-native -version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::tinycc-native -version did not print $want"; exit 1; fi
+          echo "ok    tinycc-native -version"
+          if ! libs=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc-native.libs | tail -n 1); then
+            echo "::error::tinycc-native.libs did not build"
+            exit 1
+          fi
+          base=${libs##*/}
+          libdir=${base##*\\}/lib
+          log="$RUNNER_TEMP/native-search-dirs.log"
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A native-search-dirs > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tinycc-native -print-search-dirs failed its build"; exit 1; fi
+          dirs=$(sed -n '/^libraries:$/,/^libtcc1:$/p' "$log" | sed '1d;$d')
+          count=$(printf '%s\n' "$dirs" | grep -c .)
+          dir=${dirs#"  "}
+          if [ "$count" != 1 ] || [ "${dir%"$libdir"}" = "$dir" ]; then
+            echo "::error::tinycc-native searches $count library directories, not $libdir alone"
+            exit 1
+          fi
+          echo "ok    tinycc-native searches $dir alone"
+
+      # hello, float and printf-float as tinycc-mes's, linked by
+      # tinycc-native against msvcrt.dll and kernel32.dll, and mingw32, which
+      # compiles only if tinycc-native predefines __MINGW32__.  msvcrt's
+      # stdout is a text stream, which writes each newline as a carriage
+      # return and a newline, and its printf prints %f with six decimals.
+      - name: Programs tinycc-native builds run
+        shell: bash
+        run: |
+          set -uo pipefail
+          build() {
+            "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A "$1" | tail -n 1
+          }
+          if ! build native-mingw32 > /dev/null; then
+            echo "::error::native-mingw32 did not build; the log above says whether tinycc-native lacks __MINGW32__"
+            exit 1
+          fi
+          echo "ok    tinycc-native predefines __MINGW32__"
+          if ! hello=$(build native-hello) || ! float=$(build native-float) || ! printf_float=$(build native-printf-float); then
+            echo "::error::native-hello, native-float or native-printf-float did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$hello")/bin/hello.exe
+          float=$(cygpath -u "$float")/bin/float.exe
+          printf_float=$(cygpath -u "$printf_float")/bin/printf-float.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/tcc-native"
+          mkdir "$work"
+          status=0
+          runs() {
+            local exe=$1 want_code=$2 want_out=$3 code=0
+            shift 3
+            "$exe" "$@" > "$work/out.txt" || code=$?
+            printf '%s\r\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = "$want_code" ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    ${exe##*/}${*:+ $*} prints $want_out and exits $code"
+            else
+              echo "::error::${exe##*/}${*:+ $*} exited $code, not $want_code, and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs "$hello" 0 'Hello, TinyCC!'
+          runs "$hello" 1 'Hello, Windows!' Windows
+          runs "$float" 0 '3ff40000 0'
+          runs "$float" 0 '40040000 0' x
+          runs "$printf_float" 0 '1.250000'
+          runs "$printf_float" 0 '2.500000' x
+          exit "$status"
+
       # The cells Mes keeps across each collection while MesCC compiles and
       # links tcc, in the arena tinycc-boot-mes builds in.  The collector
       # copies them into the tenth past the end of the arena, and Mes does
