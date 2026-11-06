@@ -8,6 +8,8 @@
 # native-float, built the same way, which print the two words of their
 # argument count times 1.25 as a double; mes-printf-float and
 # native-printf-float, which print that double through printf's %f;
+# native-winsock, which tinycc-native links with -lws2_32 and which prints
+# 0x1234 in network byte order through ws2_32.dll's htons;
 # native-search-dirs, which prints the directories tinycc-native searches;
 # native-mingw32, which compiles only if tinycc-native predefines
 # __MINGW32__; and arena, tinycc-boot-mes's own derivation with
@@ -77,6 +79,18 @@ let
     #endif
   '';
 
+  winsockC = writeText "winsock.c" ''
+    #include <stdio.h>
+    #include <winsock2.h>
+
+    int
+    main (void)
+    {
+      printf ("%04x\n", htons (0x1234));
+      return 0;
+    }
+  '';
+
   getVersion =
     name: round:
     kaem.runCommand "${name}-get-version" round.env ''
@@ -95,12 +109,18 @@ let
     '';
 
   # tinycc-native links its runtime, msvcrt and kernel32 from the -B
-  # directory, and marks nothing it writes executable.
+  # directory, and any other import library it is given with -l, and marks
+  # nothing it writes executable.
   nativeProgram =
-    name: round: exe: source:
+    name: round: exe: source: libraries:
+    let
+      inputs = builtins.concatStringsSep " " (
+        [ "${source}" ] ++ map (library: "-l${library}") libraries
+      );
+    in
     kaem.runCommand name round.env ''
       mkdir -p ''${out}/bin
-      ${round.compiler}/bin/tcc.exe -B ${round.libs}/lib -o ''${out}/bin/${exe}.exe ${source}
+      ${round.compiler}/bin/tcc.exe -B ${round.libs}/lib -o ''${out}/bin/${exe}.exe ${inputs}
       chmod 555 ''${out}/bin/${exe}.exe
     '';
 in
@@ -125,10 +145,12 @@ in
   native-mingw32 = kaem.runCommand "tinycc-native-mingw32" tinycc-native.env ''
     ${tinycc-native.compiler}/bin/tcc.exe -c -o ''${out} ${mingw32C}
   '';
-  native-hello = nativeProgram "tinycc-native-hello" tinycc-native "hello" helloC;
-  native-float = nativeProgram "tinycc-native-float" tinycc-native "float" floatC;
+  native-hello = nativeProgram "tinycc-native-hello" tinycc-native "hello" helloC [ ];
+  native-float = nativeProgram "tinycc-native-float" tinycc-native "float" floatC [ ];
   native-printf-float =
-    nativeProgram "tinycc-native-printf-float" tinycc-native "printf-float" printfFloatC;
+    nativeProgram "tinycc-native-printf-float" tinycc-native "printf-float" printfFloatC [ ];
+  native-winsock =
+    nativeProgram "tinycc-native-winsock" tinycc-native "winsock" winsockC [ "ws2_32" ];
 
   arena = derivation (
     tinycc.boot-mes.compiler.drvAttrs

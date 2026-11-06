@@ -10,18 +10,24 @@
 # conftest.c, compiled with C2STR and run, writes from include/tccdefs.h
 # as C strings; nixpkgs appends an include of Mes's config.h to them.
 #
-# nixpkgs makes three edits to the source.  A fourth is made here: tcc.h
-# keys PATHSEP, which splits C_INCLUDE_PATH, -I and -L, on _WIN32, the
-# host's macro, where janneke's keys it on TCC_TARGET_PE, and every round
-# compiles tcc.c with _WIN32 undefined (see common.nix), so an unedited tcc
-# would split a store path at its drive's colon.  A fifth is for
-# tinycc-native, which compiles this source with _WIN32: such a tcc adds
-# the Windows system directory to its library paths, so msvcrt, kernel32
-# and the other import libraries it links by default are read from the
-# DLLs there, which no derivation names, when the directories a script
-# names lack their .def files.  The call that adds it is removed, so such
-# a link fails instead; a tcc compiled without _WIN32, as these rounds
-# are, never makes it.
+# nixpkgs makes three edits to the source, and two of them are made here.
+# The third sets static_link in every TCCState, so that an ELF link writes
+# a static executable, with no program interpreter.  A PE tcc reads the
+# flag only where it resolves -l<name>, which it then makes skip <name>.def
+# and <name>.dll, so tinycc-native's -lkernel32 would miss kernel32.def; a
+# PE tcc clears it itself before it adds its default libraries.
+#
+# Two edits are made here besides.  tcc.h keys PATHSEP, which splits
+# C_INCLUDE_PATH, -I and -L, on _WIN32, the host's macro, where janneke's
+# keys it on TCC_TARGET_PE, and every round compiles tcc.c with _WIN32
+# undefined (see common.nix), so an unedited tcc would split a store path
+# at its drive's colon.  And tinycc-native compiles this source with
+# _WIN32, and such a tcc adds the Windows system directory to its library
+# paths, so msvcrt, kernel32 and the other import libraries it links by
+# default are read from the DLLs there, which no derivation names, when
+# the directories a script names lack their .def files.  The call that
+# adds it is removed, so such a link fails instead; a tcc compiled without
+# _WIN32, as these rounds are, never makes it.
 {
   fetchurl,
   stage0-pe32,
@@ -59,8 +65,6 @@ let
 
       cd tinycc-${rev}
 
-      # Static link by default
-      replace --file libtcc.c --output libtcc.c --match-on "s->ms_extensions = 1;" --replace-with "s->ms_extensions = 1; s->static_link = 1;"
       replace --file i386-asm.c --output i386-asm.c --match-on "switch(size)" --replace-with "if (reg >= 8) { cstr_printf(add_str, \"%%r%d%c\", reg, (size == 1) ? 'b' : ((size == 2) ? 'w' : ((size == 4) ? 'd' : ' '))); return; } switch(size)"
 
       # If performing ptr + (-1) for example, the offset should be ptrdiff_t and not size_t
