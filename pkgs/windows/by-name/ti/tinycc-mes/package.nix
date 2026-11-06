@@ -14,7 +14,14 @@
 # keys PATHSEP, which splits C_INCLUDE_PATH, -I and -L, on _WIN32, the
 # host's macro, where janneke's keys it on TCC_TARGET_PE, and every round
 # compiles tcc.c with _WIN32 undefined (see common.nix), so an unedited tcc
-# would split a store path at its drive's colon.
+# would split a store path at its drive's colon.  A fifth is for
+# tinycc-native, which compiles this source with _WIN32: such a tcc adds
+# the Windows system directory to its library paths, so msvcrt, kernel32
+# and the other import libraries it links by default are read from the
+# DLLs there, which no derivation names, when the directories a script
+# names lack their .def files.  The call that adds it is removed, so such
+# a link fails instead; a tcc compiled without _WIN32, as these rounds
+# are, never makes it.
 {
   fetchurl,
   stage0-pe32,
@@ -61,6 +68,9 @@ let
 
       # A PE tcc on Mes libc splits its paths on the Windows separator.
       replace --file tcc.h --output tcc.h --match-on "# define PATHSEP \":\"" --replace-with "# define PATHSEP \";\""
+
+      # tinycc-native searches no library directory a script does not name.
+      replace --file libtcc.c --output libtcc.c --match-on "tcc_add_systemdir(s);" --replace-with "/* tcc_add_systemdir(s); */"
     '')
     + "/tinycc-${rev}";
 
@@ -156,4 +166,8 @@ buildTinyccMes {
     "-I ${tccdefs}"
     "-D CONFIG_TCC_SEMLOCK=0"
   ];
+}
+// {
+  # The source tinycc-native compiles.
+  inherit src version;
 }

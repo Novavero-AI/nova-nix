@@ -11816,17 +11816,17 @@ testMesWindows = do
     execBitContents = "written by Mes libc\n"
 
 -- | @pkgs/windows@'s TinyCC, read back as the build driver reads it: what
--- the rounds from tinycc-boot-mes to tinycc-mes and @test\/data\/tinycc.nix@'s
--- checks add to the closure of the Mes rung they run on.  The rung is
--- full-source only if the leaves it adds are the two TinyCC archives and it
--- reads no input source but the scripts evaluation writes.  The builder
--- spells a store path with a backslash, which starts an escape in a C
--- string, so no script puts a store path between the escaped quotes a @-D@
--- or a @replace@ turns into a C string literal, and every script that runs
--- tcc names the
--- include directory of the tcc it runs, and Mes's, in @C_INCLUDE_PATH@
--- instead.  arena is tinycc-boot-mes's own derivation with @MES_DEBUG@ set,
--- so the cells it measures are those of the compile that is built.
+-- the rounds from tinycc-boot-mes to tinycc-native and
+-- @test\/data\/tinycc.nix@'s checks add to the closure of the Mes rung they
+-- run on.  The rung is full-source only if the leaves it adds are the two
+-- TinyCC archives and it reads no input source but the scripts evaluation
+-- writes.  The builder spells a store path with a backslash, which starts
+-- an escape in a C string, so no script puts a store path between the
+-- escaped quotes a @-D@ or a @replace@ turns into a C string literal, and
+-- every script that runs tcc names the headers it compiles against in
+-- @C_INCLUDE_PATH@ instead, then Mes's when the tcc it runs is on Mes libc.
+-- arena is tinycc-boot-mes's own derivation with @MES_DEBUG@ set, so the
+-- cells it measures are those of the compile that is built.
 testTinyccWindows :: IO [Bool]
 testTinyccWindows = do
   putStrLn "pkgs/tinycc"
@@ -11904,10 +11904,14 @@ testTinyccWindows = do
               ("M1", outText "mescc-tools" <> "/bin/M1.exe"),
               ("HEX2", outText "mescc-tools" <> "/bin/hex2.exe")
             ]
-          -- The include directory of a TinyCC source tree, then Mes's.
-          includeOf name tree = T.concat [path | drv <- added, nameOf drv == name, path <- outOf drv] <> "/" <> tree <> "/include;" <> prefix <> "/include"
-          jannekeInclude = includeOf ("tinycc-bootstrappable-" <> version <> "-source") ("tinycc-" <> rev)
-          upstreamInclude = includeOf ("tinycc-" <> upstreamVersion <> "-source") ("tinycc-" <> upstreamRev)
+          -- A TinyCC source tree, and its include directory, then Mes's.
+          treeOf name tree = T.concat [path | drv <- added, nameOf drv == name, path <- outOf drv] <> "/" <> tree
+          mesInclude = prefix <> "/include"
+          jannekeInclude = treeOf ("tinycc-bootstrappable-" <> version <> "-source") ("tinycc-" <> rev) <> "/include;" <> mesInclude
+          upstreamTree = treeOf ("tinycc-" <> upstreamVersion <> "-source") ("tinycc-" <> upstreamRev)
+          upstreamInclude = upstreamTree <> "/include;" <> mesInclude
+          -- TinyCC's own headers, the C library's and the Windows API's.
+          win32Include = T.intercalate ";" [upstreamTree <> "/include", upstreamTree <> "/win32/include", upstreamTree <> "/win32/include/winapi"]
           -- The text between each pair of kaem's escaped quotes, which a -D
           -- hands MesCC or tcc, or a replace writes into a source, as a C
           -- string literal.
@@ -11934,18 +11938,24 @@ testTinyccWindows = do
               "derivation and its environment"
               [(name, mesEnv) | name <- sort mesRunners]
               (sort [(nameOf drv, [(var, variableOf var drv) | (var, _) <- mesEnv]) | drv <- runners mesProgram]),
-          runTest "every script that runs tcc names the headers of the tcc it runs and Mes's in C_INCLUDE_PATH" $
+          runTest "every script that runs tcc names the headers it compiles against in C_INCLUDE_PATH, then Mes's for a tcc on Mes libc" $
             assertEqual
               "derivation and its C_INCLUDE_PATH"
-              (sort ([(name, jannekeInclude) | name <- jannekeRunners] ++ [(name, upstreamInclude) | name <- upstreamRunners]))
+              ( sort
+                  ( [(name, jannekeInclude) | name <- jannekeRunners]
+                      ++ [(name, upstreamInclude) | name <- upstreamRunners]
+                      ++ [(name, win32Include <> ";" <> mesInclude) | name <- mesWin32Runners]
+                      ++ [(name, win32Include) | name <- nativeRunners]
+                  )
+              )
               (sort [(nameOf drv, variableOf "C_INCLUDE_PATH" drv) | drv <- runners ["/bin/tcc.exe"]]),
-          -- Nine per round's compile, and three in the edits TinyCC's own
-          -- source gets: the format of nixpkgs' i386-asm.c replacement, and
-          -- the two PATHSEP values.
+          -- Nine per Mes round's compile, five per native round's, and three
+          -- in the edits TinyCC's own source gets: the format of nixpkgs'
+          -- i386-asm.c replacement, and the two PATHSEP values.
           runTest "no C string literal a script passes in a -D or writes with replace names a store path" $
             assertEqual
               "string literals, and those that name a store path"
-              (9 * (length rounds + length mesRounds) + 3, [])
+              (9 * (length rounds + length mesRounds) + 5 * length nativeRounds + 3, [])
               (length strings, filter ("${NIX_STORE}" `T.isInfixOf`) strings),
           runTest "arena is tinycc-boot-mes's derivation with MES_DEBUG=3" $
             assertEqual
@@ -11955,7 +11965,7 @@ testTinyccWindows = do
         ]
   where
     instantiates :: Text
-    instantiates = "the TinyCC derivations instantiate, adding a hundred and twenty-six to Mes's"
+    instantiates = "the TinyCC derivations instantiate, adding a hundred and forty-nine to Mes's"
     version :: Text
     version = "unstable-2024-07-07"
     rev :: Text
@@ -11973,7 +11983,8 @@ testTinyccWindows = do
     mesAttrs :: [Text]
     mesAttrs = ["nyacc", "srcPost", "libs", "compiler", "libc"]
     -- The first round of janneke's source and the last, which is built from
-    -- all the others, and both rounds of TinyCC's own.
+    -- all the others, both rounds of TinyCC's own on Mes libc, and both
+    -- native rounds.
     tinyccPaths :: [Text]
     tinyccPaths =
       [ "tinycc.boot-mes.compiler",
@@ -11983,16 +11994,40 @@ testTinyccWindows = do
         "tinycc-mes.prev.compiler",
         "tinycc-mes.prev.libs",
         "tinycc-mes.compiler",
-        "tinycc-mes.libs"
+        "tinycc-mes.libs",
+        "tinycc-native.prev.compiler",
+        "tinycc-native.prev.libs",
+        "tinycc-native.compiler",
+        "tinycc-native.libs"
       ]
     checkAttrs :: [Text]
-    checkAttrs = ["boot-mes", "hello", "bootstrappable", "bootstrappable-hello", "bootstrappable-float", "mes", "mes-hello", "mes-float", "mes-printf-float", "arena"]
+    checkAttrs =
+      [ "boot-mes",
+        "hello",
+        "bootstrappable",
+        "bootstrappable-hello",
+        "bootstrappable-float",
+        "mes",
+        "mes-hello",
+        "mes-float",
+        "mes-printf-float",
+        "native",
+        "native-search-dirs",
+        "native-mingw32",
+        "native-hello",
+        "native-float",
+        "native-printf-float",
+        "arena"
+      ]
     -- Each round of janneke's source, in the order each compiles the next,
     -- and then each round of TinyCC's own.
     rounds :: [Text]
     rounds = ["tinycc-boot-mes", "tinycc-boot0", "tinycc-boot1", "tinycc-boot2", "tinycc-boot3", "tinycc-bootstrappable"]
     mesRounds :: [Text]
     mesRounds = ["tinycc-mes-boot", "tinycc-mes"]
+    -- The native rounds, the first compiled by tinycc-mes.
+    nativeRounds :: [Text]
+    nativeRounds = ["tinycc-native-boot", "tinycc-native"]
     -- What a round's library is compiled in, each by that round's tcc.
     libraryParts :: [Text]
     libraryParts = ["crt", "libtcc1.a", "libc.a", "libgetopt.a"]
@@ -12000,7 +12035,7 @@ testTinyccWindows = do
     -- <name>-builder; arena runs tinycc-boot-mes's.
     addedNames :: [Text]
     addedNames =
-      ["tinycc-" <> rev <> ".tar.gz", "tinycc-" <> upstreamRev <> ".tar.gz", "hello.c", "float.c", "printf-float.c", "tinycc-boot-mes-arena"]
+      ["tinycc-" <> rev <> ".tar.gz", "tinycc-" <> upstreamRev <> ".tar.gz", "hello.c", "float.c", "printf-float.c", "mingw32.c", "tinycc-boot-mes-arena"]
         ++ concat
           [ [name, name <> "-builder"]
           | name <-
@@ -12011,6 +12046,9 @@ testTinyccWindows = do
                 : ("tccdefs-" <> upstreamVersion)
                 : concat [[pname <> "-" <> upstreamVersion, pname <> "-libs-" <> upstreamVersion] ++ libraryParts | pname <- mesRounds]
                 ++ mesRunnerChecks
+                ++ ("tinycc-mes-win32-libs-" <> upstreamVersion)
+                : concat [[pname <> "-" <> upstreamVersion, pname <> "-libs-" <> upstreamVersion] | pname <- nativeRounds]
+                ++ nativeRunnerChecks
           ]
     mesRunners :: [Text]
     mesRunners = ["tinycc-boot-mes-" <> version, "tinycc-boot-mes-arena"]
@@ -12039,10 +12077,28 @@ testTinyccWindows = do
         ++ [pname <> "-" <> version | pname <- drop 1 rounds]
         ++ tccRunnerChecks
         ++ ["tccdefs-" <> upstreamVersion, "tinycc-mes-boot-" <> upstreamVersion]
-    -- The scripts a tcc of TinyCC's own source runs in: its rounds' library
-    -- parts, tinycc-mes's tcc and the checks.
+    nativeRunnerChecks :: [Text]
+    nativeRunnerChecks =
+      [ "tinycc-native-get-version",
+        "tinycc-native-search-dirs",
+        "tinycc-native-mingw32",
+        "tinycc-native-hello",
+        "tinycc-native-float",
+        "tinycc-native-printf-float"
+      ]
+    -- The scripts a tcc of TinyCC's own source on Mes libc runs in to
+    -- compile against Mes libc: its rounds' library parts, tinycc-mes's tcc
+    -- and the checks.
     upstreamRunners :: [Text]
     upstreamRunners = concatMap (const libraryParts) mesRounds ++ ["tinycc-mes-" <> upstreamVersion] ++ mesRunnerChecks
+    -- The scripts tinycc-mes runs in to compile against the Windows
+    -- headers: the runtime the first native tcc links with, and that tcc.
+    mesWin32Runners :: [Text]
+    mesWin32Runners = ["tinycc-mes-win32-libs-" <> upstreamVersion, "tinycc-native-boot-" <> upstreamVersion]
+    -- The scripts a native tcc runs in: each round's runtime, the second
+    -- round's tcc and the checks.
+    nativeRunners :: [Text]
+    nativeRunners = [pname <> "-libs-" <> upstreamVersion | pname <- nativeRounds] ++ ["tinycc-native-" <> upstreamVersion] ++ nativeRunnerChecks
 
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
