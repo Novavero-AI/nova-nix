@@ -1535,10 +1535,13 @@ jobs:
           echo "ok    tinycc-native searches $dir alone"
 
       # hello, float and printf-float as tinycc-mes's, linked by
-      # tinycc-native against msvcrt.dll and kernel32.dll, and mingw32, which
-      # compiles only if tinycc-native predefines __MINGW32__.  msvcrt's
-      # stdout is a text stream, which writes each newline as a carriage
-      # return and a newline, and its printf prints %f with six decimals.
+      # tinycc-native against msvcrt.dll and kernel32.dll; winsock, which it
+      # links with -lws2_32, so that it fails unless -l finds ws2_32.def,
+      # and which prints 0x1234 through ws2_32.dll's htons, in network byte
+      # order; and mingw32, which compiles only if tinycc-native predefines
+      # __MINGW32__.  msvcrt's stdout is a text stream, which writes each
+      # newline as a carriage return and a newline, and its printf prints %f
+      # with six decimals.
       - name: Programs tinycc-native builds run
         shell: bash
         run: |
@@ -1551,13 +1554,14 @@ jobs:
             exit 1
           fi
           echo "ok    tinycc-native predefines __MINGW32__"
-          if ! hello=$(build native-hello) || ! float=$(build native-float) || ! printf_float=$(build native-printf-float); then
-            echo "::error::native-hello, native-float or native-printf-float did not build"
+          if ! hello=$(build native-hello) || ! float=$(build native-float) || ! printf_float=$(build native-printf-float) || ! winsock=$(build native-winsock); then
+            echo "::error::native-hello, native-float, native-printf-float or native-winsock did not build"
             exit 1
           fi
           hello=$(cygpath -u "$hello")/bin/hello.exe
           float=$(cygpath -u "$float")/bin/float.exe
           printf_float=$(cygpath -u "$printf_float")/bin/printf-float.exe
+          winsock=$(cygpath -u "$winsock")/bin/winsock.exe
           work="$(cygpath -u "$RUNNER_TEMP")/tcc-native"
           mkdir "$work"
           status=0
@@ -1580,6 +1584,7 @@ jobs:
           runs "$float" 0 '40040000 0' x
           runs "$printf_float" 0 '1.250000'
           runs "$printf_float" 0 '2.500000' x
+          runs "$winsock" 0 '3412'
           exit "$status"
 
       # The cells Mes keeps across each collection while MesCC compiles and

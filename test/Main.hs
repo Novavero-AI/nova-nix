@@ -11965,7 +11965,7 @@ testTinyccWindows = do
         ]
   where
     instantiates :: Text
-    instantiates = "the TinyCC derivations instantiate, adding a hundred and forty-nine to Mes's"
+    instantiates = "the TinyCC derivations instantiate, adding a hundred and fifty-two to Mes's"
     version :: Text
     version = "unstable-2024-07-07"
     rev :: Text
@@ -12017,6 +12017,7 @@ testTinyccWindows = do
         "native-hello",
         "native-float",
         "native-printf-float",
+        "native-winsock",
         "arena"
       ]
     -- Each round of janneke's source, in the order each compiles the next,
@@ -12035,7 +12036,7 @@ testTinyccWindows = do
     -- <name>-builder; arena runs tinycc-boot-mes's.
     addedNames :: [Text]
     addedNames =
-      ["tinycc-" <> rev <> ".tar.gz", "tinycc-" <> upstreamRev <> ".tar.gz", "hello.c", "float.c", "printf-float.c", "mingw32.c", "tinycc-boot-mes-arena"]
+      ["tinycc-" <> rev <> ".tar.gz", "tinycc-" <> upstreamRev <> ".tar.gz", "hello.c", "float.c", "printf-float.c", "mingw32.c", "winsock.c", "tinycc-boot-mes-arena"]
         ++ concat
           [ [name, name <> "-builder"]
           | name <-
@@ -12084,7 +12085,8 @@ testTinyccWindows = do
         "tinycc-native-mingw32",
         "tinycc-native-hello",
         "tinycc-native-float",
-        "tinycc-native-printf-float"
+        "tinycc-native-printf-float",
+        "tinycc-native-winsock"
       ]
     -- The scripts a tcc of TinyCC's own source on Mes libc runs in to
     -- compile against Mes libc: its rounds' library parts, tinycc-mes's tcc

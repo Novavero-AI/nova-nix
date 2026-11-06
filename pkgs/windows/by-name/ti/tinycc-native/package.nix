@@ -11,12 +11,12 @@
 # take the directories a script names, as the rounds before them do: the
 # headers in C_INCLUDE_PATH, and the runtime and import libraries with -B,
 # since a store path, spelled with a backslash, cannot be a C string (see
-# tinycc's package.nix).  tinycc-mes's source makes the link search no
-# other directory (see its package.nix).  tcc predefines __MINGW32__, as
-# MinGW's GCC does, since Windows sources test it to choose their Windows
-# code; TinyCC defines it nowhere, and CONFIG_TCC_SWITCHES, the options
-# tcc applies before its command line, is the hook upstream's configure
-# sets from --tcc-switches.
+# tinycc's package.nix).  A link searches no other directory, and -l<name>
+# finds <name>.def there, as upstream's does (see tinycc-mes's
+# package.nix).  tcc predefines __MINGW32__, as MinGW's GCC does, since
+# Windows sources test it to choose their Windows code; TinyCC defines it
+# nowhere, and CONFIG_TCC_SWITCHES, the options tcc applies before its
+# command line, is the hook upstream's configure sets from --tcc-switches.
 {
   stage0-pe32,
   mes,
