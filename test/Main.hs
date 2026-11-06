@@ -11753,7 +11753,7 @@ testMesWindows = do
           runTest "the leaves it adds are the Mes and NYACC archives, both fetched fixed-output" $
             assertEqual
               "leaves added"
-              (sort ["mes-d9ab4ea.tar.gz", "nyacc-1.09.1.tar.gz"], True)
+              (sort ["mes-e25dc84.tar.gz", "nyacc-1.09.1.tar.gz"], True)
               (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
           runTest "it reads no input source but what evaluation writes as text" $
             assertEqual "input sources not written as text" [] [nameOf drv | drv <- added, not (all wroteAsText (drvInputSrcs drv))],
@@ -11787,7 +11787,7 @@ testMesWindows = do
     -- the sources for TinyCC, as in nixpkgs.
     addedNames :: [Text]
     addedNames =
-      ["mes-d9ab4ea.tar.gz", "nyacc-1.09.1.tar.gz", "hello.c", "exec-bit.c"]
+      ["mes-e25dc84.tar.gz", "nyacc-1.09.1.tar.gz", "hello.c", "exec-bit.c"]
         ++ concat [[name, name <> "-builder"] | name <- mesRunners ++ ["nyacc-1.09.1", "mes-src-0.27.1", "mes-m2-libs-0.27.1", "mes-libc-0.27.1"]]
     mesRunners :: [Text]
     mesRunners =

@@ -10,7 +10,10 @@
 # carries nixpkgs' i686 C library fixes (strpbrk, ntoab, ioctl3, vfprintf and
 # vsnprintf) as commits, so none of nixpkgs' replace calls on the library is
 # made here; its others edit lib/linux and x86_64 files the Windows lists do
-# not name.
+# not name.  One differs: nixpkgs replaces va_arg8 with va_arg, which
+# include/stdarg.h defines as reading a long, where the fork's vfprintf and
+# vsnprintf use va_arg only when compiled against a stdarg.h without
+# va_arg8, as TinyCC's is.
 #
 # nixpkgs writes each path Mes reads from the environment into Mes's C and
 # Scheme source.  The builder spells a store path C:\nix\store/..., whose
@@ -23,12 +26,12 @@ let
 
   pname = "mes";
   version = "0.27.1";
-  rev = "d9ab4ea10a921d265794580086c15cfe70da19db";
+  rev = "e25dc84c7798236d0bee990150e9247578161447";
 
   src = fetchurl {
     name = "mes-${builtins.substring 0 7 rev}.tar.gz";
     url = "https://github.com/Novavero-AI/mes/archive/${rev}.tar.gz";
-    sha256 = "392336c0f679c7a54f6da79a2703fedc451362f8f1a2a1880017399760fe00ee";
+    sha256 = "67939c0a3c1e6eeae2db9a23b7ab0df30b2d4a96dc9bea8f6dd324d391c13373";
   };
 
   nyacc = import ./nyacc.nix { inherit fetchurl kaem; };
