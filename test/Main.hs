@@ -11815,6 +11815,180 @@ testMesWindows = do
     execBitContents :: BS.ByteString
     execBitContents = "written by Mes libc\n"
 
+-- | @pkgs/windows@'s TinyCC, read back as the build driver reads it: what
+-- tinycc-boot-mes and @test\/data\/tinycc.nix@'s checks add to the closure
+-- of the Mes rung they run on.  The rung is full-source only if the one leaf
+-- it adds is the TinyCC archive and it reads no input source but the scripts
+-- evaluation writes.  The builder spells a store path with a backslash,
+-- which starts an escape in a C string, so no script puts a store path
+-- between the escaped quotes a @-D@ turns into a C string literal, and every
+-- script that runs tcc names its include directories in @C_INCLUDE_PATH@
+-- instead.  arena is tinycc-boot-mes's own derivation with @MES_DEBUG@ set,
+-- so the cells it measures are those of the compile that is built.
+testTinyccWindows :: IO [Bool]
+testTinyccWindows = do
+  putStrLn "pkgs/tinycc"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "tinycc.nix")
+      quoted name = "\"" <> name <> "\""
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" ([ pkgs.mes.srcPrefix ] ++ map (name: pkgs.stage0-pe32.${name}.drvPath) [ ",
+            T.unwords (map quoted tools),
+            " ] ++ map (name: pkgs.mes.${name}.drvPath) [ ",
+            T.unwords (map quoted mesAttrs),
+            " ] ++ map (name: pkgs.tinycc.boot-mes.${name}.drvPath) [ ",
+            T.unwords (map quoted tinyccAttrs),
+            " ] ++ map (name: checks.${name}.drvPath) [ ",
+            T.unwords (map quoted checkAttrs),
+            " ])"
+          ]
+      mesRoots = tools ++ map ("mes." <>) mesAttrs
+      roots = mesRoots ++ map ("tinycc.boot-mes." <>) tinyccAttrs ++ map ("checks." <>) checkAttrs
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> case T.words (bytesText bytes) of
+          prefix : paths -> do
+            let rootOf = Map.fromList (zip roots paths)
+            mesGraph <- sessionClosure (mapMaybe (`Map.lookup` rootOf) mesRoots)
+            full <- sessionClosure (Map.elems rootOf)
+            pure (prefix, rootOf, mesGraph, full)
+          [] -> throwEvalError "expected srcPrefix and the drvPaths"
+        other -> throwEvalError ("expected srcPrefix and the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (prefix, rootOf, mesGraph, full) -> do
+      let added = Map.elems (Map.difference full mesGraph)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          outOf drv = [storePathToText defaultStoreDir (doPath o) | o <- drvOutputs drv, doName o == "out"]
+          builtBy attr = Map.lookup attr rootOf >>= (`Map.lookup` full)
+          outText attr = T.concat (maybe [] outOf (builtBy attr))
+          byOut = Map.fromList [(path, drv) | drv <- Map.elems full, path <- outOf drv]
+          -- A kaem.runCommand's last argument is its script, which writeText
+          -- writes; arena shares tinycc-boot-mes's.
+          scriptOf drv = do
+            path <- listToMaybe (reverse (drvArgs drv))
+            writer <- Map.lookup (bytesText path) byOut
+            pure (variableOf "text" writer)
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          -- What a script runs: the first word of each of its lines, which
+          -- for a line continuing a command is an argument.
+          commandsOf script = mapMaybe (listToMaybe . T.words) (T.lines script)
+          runners program = [drv | drv <- added, Just script <- [scriptOf drv], any (\command -> any (`T.isSuffixOf` command) program) (commandsOf script)]
+          mesProgram = ["/bin/mes-m2.exe", "/bin/mes.exe"]
+          quote dir = "\"" <> dir <> "\""
+          mesEnv =
+            [ ("MES_ARENA", arena),
+              ("MES_MAX_ARENA", arena),
+              ("MES_STACK", "6000000"),
+              ("MES_PREFIX", prefix),
+              ("GUILE_LOAD_PATH", T.intercalate ":" (map quote [prefix <> "/mes/module", prefix <> "/module", outText "mes.nyacc" <> "/share/nyacc-1.09.1/module"])),
+              ("M1", outText "mescc-tools" <> "/bin/M1.exe"),
+              ("HEX2", outText "mescc-tools" <> "/bin/hex2.exe")
+            ]
+          sourceDir = T.concat [path | drv <- added, nameOf drv == "tinycc-bootstrappable-" <> version <> "-source", path <- outOf drv] <> "/tinycc-" <> rev
+          includePath = sourceDir <> "/include;" <> prefix <> "/include"
+          -- The text between each pair of kaem's escaped quotes, which a -D
+          -- hands MesCC or tcc as a string literal.
+          cStrings script = [text | (i, text) <- zip [0 :: Int ..] (T.splitOn "\\\"" script), odd i]
+          strings = concatMap cStrings (Set.toList (Set.fromList (mapMaybe scriptOf added)))
+          -- What two derivations must share to run the same compile.
+          compile drv = (drvBuilder drv, drvArgs drv, foldr Map.delete (drvEnv drv) ["name", "out", "MES_DEBUG"])
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetch is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the one leaf it adds is the TinyCC archive, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              (["tinycc-" <> rev <> ".tar.gz"], True)
+              (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text" $
+            assertEqual "input sources not written as text" [] [nameOf drv | drv <- added, not (all wroteAsText (drvInputSrcs drv))],
+          runTest "every script that runs Mes sets its arena, MES_PREFIX, GUILE_LOAD_PATH, M1 and HEX2" $
+            assertEqual
+              "derivation and its environment"
+              [(name, mesEnv) | name <- sort mesRunners]
+              (sort [(nameOf drv, [(var, variableOf var drv) | (var, _) <- mesEnv]) | drv <- runners mesProgram]),
+          runTest "every script that runs tcc names the TinyCC and Mes C library headers in C_INCLUDE_PATH" $
+            assertEqual
+              "derivation and its C_INCLUDE_PATH"
+              [(name, includePath) | name <- sort tccRunners]
+              (sort [(nameOf drv, variableOf "C_INCLUDE_PATH" drv) | drv <- runners ["/bin/tcc.exe"]]),
+          runTest "no C string literal a script passes in a -D names a store path" $
+            assertEqual
+              "string literals, and those that name a store path"
+              (9, [])
+              (length strings, filter ("${NIX_STORE}" `T.isInfixOf`) strings),
+          runTest "arena is tinycc-boot-mes's derivation with MES_DEBUG=3" $
+            assertEqual
+              "builder, arguments and environment, and MES_DEBUG"
+              (compile <$> builtBy "tinycc.boot-mes.compiler", Just "3")
+              (compile <$> builtBy "checks.arena", variableOf "MES_DEBUG" <$> builtBy "checks.arena")
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the TinyCC derivations instantiate, adding twenty-one to Mes's"
+    version :: Text
+    version = "unstable-2024-07-07"
+    rev :: Text
+    rev = "ea3900f6d5e71776c5cfabcabee317652e3a19ee"
+    -- Twice mes.env's: Mes keeps more cells compiling tcc.c than that
+    -- arena has room to copy.
+    arena :: Text
+    arena = "40000000"
+    tools :: [Text]
+    tools = ["kaem", "mescc-tools", "mescc-tools-extra"]
+    mesAttrs :: [Text]
+    mesAttrs = ["nyacc", "srcPost", "libs", "compiler", "libc"]
+    tinyccAttrs :: [Text]
+    tinyccAttrs = ["compiler", "libs"]
+    checkAttrs :: [Text]
+    checkAttrs = ["boot-mes", "hello", "arena"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder; arena runs tinycc-boot-mes's.
+    addedNames :: [Text]
+    addedNames =
+      ["tinycc-" <> rev <> ".tar.gz", "hello.c", "tinycc-boot-mes-arena"]
+        ++ concat
+          [ [name, name <> "-builder"]
+          | name <-
+              [ "tinycc-bootstrappable-" <> version <> "-source",
+                "tinycc-boot-mes-" <> version,
+                "crt",
+                "libtcc1.a",
+                "libc.a",
+                "libgetopt.a",
+                "tinycc-boot-mes-libs-" <> version
+              ]
+                ++ tccRunnerChecks
+          ]
+    mesRunners :: [Text]
+    mesRunners = ["tinycc-boot-mes-" <> version, "tinycc-boot-mes-arena"]
+    tccRunnerChecks :: [Text]
+    tccRunnerChecks = ["tinycc-boot-mes-get-version", "tinycc-boot-mes-hello"]
+    tccRunners :: [Text]
+    tccRunners = ["crt", "libtcc1.a", "libc.a", "libgetopt.a"] ++ tccRunnerChecks
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -18252,6 +18426,7 @@ runSuite = do
           testPkgsFetchurl,
           testStage0Pe32Chain,
           testMesWindows,
+          testTinyccWindows,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,

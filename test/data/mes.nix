@@ -31,7 +31,7 @@ let
       -I ${mes.srcPrefix}/include/windows/x86 \
       -L ${mes.libs}/lib \
       -l c+tcc \
-      --base-address 0x400000 \
+      --base-address ${mes.baseAddress} \
       -o ${output} \
       ${source.name}
   '';

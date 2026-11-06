@@ -45,3 +45,7 @@ kaem.runCommand "${pname}-${version}" { inherit pname version; } ''
   # getopt.c
   cp lib/posix/getopt.c ''${out}/lib/libgetopt.c
 ''
+# The flags a tcc compiles these with, which nixpkgs passes through passthru.
+// {
+  CFLAGS = "-std=c11";
+}
