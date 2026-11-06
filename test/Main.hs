@@ -12102,6 +12102,105 @@ testTinyccWindows = do
     nativeRunners :: [Text]
     nativeRunners = [pname <> "-libs-" <> upstreamVersion | pname <- nativeRounds] ++ ["tinycc-native-" <> upstreamVersion] ++ nativeRunnerChecks
 
+-- | @pkgs/windows@'s GNU make, read back as the build driver reads it:
+-- what make and @test\/data\/gnumake.nix@'s checks add to the closure of
+-- tinycc-native, which compiles it.  The rung is full-source only if the
+-- one leaf it adds is make's archive and it reads no input source but the
+-- scripts and the import library evaluation writes.  make's script runs
+-- tinycc-native, so it names the headers that compiler reads in
+-- @C_INCLUDE_PATH@, as tinycc-native's own library script does, and no C
+-- string literal its edits write names a store path.
+testGnumakeWindows :: IO [Bool]
+testGnumakeWindows = do
+  putStrLn "pkgs/gnumake"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gnumake.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          tinyccGraph <- sessionClosure (mapMaybe (`Map.lookup` rootOf) tinyccRoots)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, tinyccGraph, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, tinyccGraph, full) -> do
+      let added = Map.elems (Map.difference full tinyccGraph)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          builtBy attr = Map.lookup attr rootOf >>= (`Map.lookup` full)
+          inputsOf drv = mapMaybe ((`Map.lookup` full) . storePathToText defaultStoreDir) (Map.keys (drvInputDrvs drv))
+          scriptOf drv = listToMaybe [variableOf "text" input | input <- inputsOf drv, nameOf input == nameOf drv <> "-builder"]
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          runsTcc script = "/bin/tcc.exe " `T.isInfixOf` script
+          -- The text between each pair of kaem's escaped quotes, which a
+          -- replace writes into a source as a C string literal.
+          cStrings script = [text | (i, text) <- zip [0 :: Int ..] (T.splitOn "\\\"" script), odd i]
+          strings = concatMap cStrings (mapMaybe scriptOf added)
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetch is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the one leaf it adds is make's archive, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              (["make-" <> version <> ".tar.gz"], True)
+              (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text" $
+            assertEqual "input sources not written as text" [] [nameOf drv | drv <- added, not (all wroteAsText (drvInputSrcs drv))],
+          runTest "make's script runs tinycc-native with the headers its library script names" $
+            assertEqual
+              "derivations that run tcc, and their C_INCLUDE_PATH"
+              [("gnumake-" <> version, variableOf "C_INCLUDE_PATH" <$> builtBy "pkgs.tinycc-native.libs")]
+              [(nameOf drv, Just (variableOf "C_INCLUDE_PATH" drv)) | drv <- added, Just script <- [scriptOf drv], runsTcc script],
+          -- One per include or library directory the edits remove.
+          runTest "no C string literal make's edits write names a store path" $
+            assertEqual
+              "string literals, and those that name a store path"
+              (5, [])
+              (length strings, filter ("${NIX_STORE}" `T.isInfixOf`) strings)
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the make derivations instantiate, adding ten to tinycc-native's"
+    version :: Text
+    version = "4.4.1"
+    tinyccRoots :: [Text]
+    tinyccRoots = ["pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs"]
+    roots :: [Text]
+    roots = tinyccRoots ++ ["pkgs.gnumake", "checks.version", "checks.pattern-rule"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      ["make-" <> version <> ".tar.gz", "pattern-rule.mk", "greeting.in"]
+        ++ concat [[name, name <> "-builder"] | name <- ["gnumake-" <> version, "gnumake-get-version", "gnumake-pattern-rule"]]
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -18540,6 +18639,7 @@ runSuite = do
           testStage0Pe32Chain,
           testMesWindows,
           testTinyccWindows,
+          testGnumakeWindows,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,
