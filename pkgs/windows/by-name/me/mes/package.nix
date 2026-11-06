@@ -26,12 +26,12 @@ let
 
   pname = "mes";
   version = "0.27.1";
-  rev = "e25dc84c7798236d0bee990150e9247578161447";
+  rev = "4ea66eb48dacf3a854ea9aa120a09892d0e3d897";
 
   src = fetchurl {
     name = "mes-${builtins.substring 0 7 rev}.tar.gz";
     url = "https://github.com/Novavero-AI/mes/archive/${rev}.tar.gz";
-    sha256 = "67939c0a3c1e6eeae2db9a23b7ab0df30b2d4a96dc9bea8f6dd324d391c13373";
+    sha256 = "1c73f03b782b88932e067b4f9f08952d36f1969def279835d5bea8963064d386";
   };
 
   nyacc = import ./nyacc.nix { inherit fetchurl kaem; };
