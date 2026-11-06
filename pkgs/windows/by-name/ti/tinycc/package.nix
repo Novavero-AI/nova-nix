@@ -1,14 +1,16 @@
 # TinyCC, as nixpkgs' minimal-bootstrap/tinycc/bootstrappable.nix builds it
 # (nixpkgs 60cbef83e025a167470f66fae093dc9f261cb8fc), on the Windows Mes
 # rung: janneke's bootstrappable fork compiled by MesCC on mes.exe, as
-# tinycc-boot-mes, and the Mes C library compiled by that tcc.  Every
-# derivation is a kaem.runCommand script, i686-windows as Mes's are.
+# tinycc-boot-mes, then by each round's tcc into the next, as boot0 to
+# boot3 and tinycc-bootstrappable, each round compiling the Mes C library
+# the next links with.  Every derivation is a kaem.runCommand script,
+# i686-windows as Mes's are.
 #
-# tcc targets PE32 from this round on.  TCC_TARGET_PE compiles tccpe.c into
-# tcc, which needs the MesCC fixes the Mes fork carries.  This round's tcc
-# is the only one in the chain linked by MesCC rather than written by a
-# tcc, so a tcc that wrote ELF here would leave every round after it with
-# nothing Windows runs.
+# tcc targets PE32 from the first round on.  TCC_TARGET_PE compiles tccpe.c
+# into tcc, which needs the MesCC fixes the Mes fork carries.  The first
+# round's tcc is the only one in the chain linked by MesCC rather than
+# written by a tcc, so a tcc that wrote ELF there would leave every round
+# after it with nothing Windows runs.
 #
 # nixpkgs writes tcc's include directories into it as
 # CONFIG_TCC_SYSINCLUDEPATHS, a C string.  The builder spells a store path
@@ -23,7 +25,7 @@
 }:
 let
   inherit (stage0-pe32) kaem;
-  inherit (import ./common.nix { inherit kaem mes; }) recompileLibc;
+  inherit (import ./common.nix { inherit kaem mes; }) recompileLibc buildTinyccMes;
 
   version = "unstable-2024-07-07";
   rev = "ea3900f6d5e71776c5cfabcabee317652e3a19ee";
@@ -135,8 +137,91 @@ let
       libtccOptions = "${mes.libc.CFLAGS} -DTCC_TARGET_I386=1";
     };
   };
+
+  # Each round's options, from janneke's boot.sh as nixpkgs takes them: each
+  # hands tcc more of C than the round before.  tinycc-bootstrappable repeats
+  # boot3's, so that its floating point is compiled by a tcc that has it.
+  tinycc-boot0 = buildTinyccMes {
+    pname = "tinycc-boot0";
+    inherit src version env;
+    prev = tinycc-boot-mes;
+    buildOptions = [
+      "-D HAVE_LONG_LONG=1"
+      "-D HAVE_SETJMP=1"
+    ];
+    libtccBuildOptions = [
+      "-D HAVE_LONG_LONG=1"
+    ];
+  };
+
+  tinycc-boot1 = buildTinyccMes {
+    pname = "tinycc-boot1";
+    inherit src version env;
+    prev = tinycc-boot0;
+    buildOptions = [
+      "-D HAVE_BITFIELD=1"
+      "-D HAVE_LONG_LONG=1"
+      "-D HAVE_SETJMP=1"
+    ];
+    libtccBuildOptions = [
+      "-D HAVE_LONG_LONG=1"
+    ];
+  };
+
+  tinycc-boot2 = buildTinyccMes {
+    pname = "tinycc-boot2";
+    inherit src version env;
+    prev = tinycc-boot1;
+    buildOptions = [
+      "-D HAVE_BITFIELD=1"
+      "-D HAVE_FLOAT_STUB=1"
+      "-D HAVE_LONG_LONG=1"
+      "-D HAVE_SETJMP=1"
+    ];
+    libtccBuildOptions = [
+      "-D HAVE_FLOAT_STUB=1"
+      "-D HAVE_LONG_LONG=1"
+    ];
+  };
+
+  tinycc-boot3 = buildTinyccMes {
+    pname = "tinycc-boot3";
+    inherit src version env;
+    prev = tinycc-boot2;
+    buildOptions = [
+      "-D HAVE_BITFIELD=1"
+      "-D HAVE_FLOAT=1"
+      "-D HAVE_LONG_LONG=1"
+      "-D HAVE_SETJMP=1"
+    ];
+    libtccBuildOptions = [
+      "-D HAVE_FLOAT=1"
+      "-D HAVE_LONG_LONG=1"
+    ];
+  };
+
+  tinycc-bootstrappable = buildTinyccMes {
+    pname = "tinycc-bootstrappable";
+    inherit src version env;
+    prev = tinycc-boot3;
+    buildOptions = [
+      "-D HAVE_BITFIELD=1"
+      "-D HAVE_FLOAT=1"
+      "-D HAVE_LONG_LONG=1"
+      "-D HAVE_SETJMP=1"
+    ];
+    libtccBuildOptions = [
+      "-D HAVE_FLOAT=1"
+      "-D HAVE_LONG_LONG=1"
+    ];
+  };
 in
 {
   inherit env;
   boot-mes = tinycc-boot-mes;
+  boot0 = tinycc-boot0;
+  boot1 = tinycc-boot1;
+  boot2 = tinycc-boot2;
+  boot3 = tinycc-boot3;
+  bootstrappable = tinycc-bootstrappable;
 }

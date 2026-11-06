@@ -1181,13 +1181,16 @@ jobs:
           echo "ok    at most $kept cells kept, within $room"
 
   # ---------------------------------------------------------------------------
-  # TinyCC (Windows): tinycc-boot-mes, as nixpkgs' minimal-bootstrap/tinycc
-  # builds it: janneke's bootstrappable TinyCC compiled by MesCC on mes into
-  # a tcc that writes PE32, and the Mes C library compiled by that tcc.
-  # test/data/tinycc.nix runs the tcc with -version in a build, as nixpkgs'
-  # get-version test does, and hello, which it compiles and links against
-  # that library, runs here.  x64 and ARM64 Windows each build all of it
-  # from the seed, for the reason Stage0 (Windows) runs on both.
+  # TinyCC (Windows): tinycc-boot-mes to tinycc-bootstrappable, as nixpkgs'
+  # minimal-bootstrap/tinycc builds them: janneke's bootstrappable TinyCC
+  # compiled by MesCC on mes into a tcc that writes PE32, then by each
+  # round's tcc into the next, each round compiling the Mes C library the
+  # next links with.  test/data/tinycc.nix runs the first and last tccs with
+  # -version in a build, as nixpkgs' get-version test does, and the programs
+  # each compiles and links against its library run here: hello for both,
+  # and float, which prints a double, for the last.  x64 and ARM64 Windows
+  # each build all of it from the seed, for the reason Stage0 (Windows) runs
+  # on both.
   #
   # The x64 leg also measures the cells Mes keeps while MesCC compiles and
   # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
@@ -1314,6 +1317,70 @@ jobs:
           }
           runs 0 'Hello, TinyCC!'
           runs 1 'Hello, Windows!' Windows
+          exit "$status"
+
+      # boot0 to boot3 and tinycc-bootstrappable, each tcc compiled by the
+      # round before it with the library that round compiled, timed.
+      - name: Build the bootstrappable rounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          for round in boot0 boot1 boot2 boot3 bootstrappable; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "tinycc.$round.libs"
+            echo "== tinycc.$round built in $((SECONDS - start)) s"
+          done
+
+      - name: tinycc-bootstrappable prints its version
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/bootstrappable-version.log"
+          want='tcc version 0.9.28-unstable-2024-07-07 (i386 Windows)'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A bootstrappable > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tinycc-bootstrappable -version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::tinycc-bootstrappable -version did not print $want"; exit 1; fi
+          echo "ok    tinycc-bootstrappable -version"
+
+      # hello as tinycc-boot-mes's, and float, which prints the two words of
+      # its argument count times 1.25 as a double, so it fails if the tcc
+      # reads the literal, converts the count or multiplies wrongly.  Each
+      # output is checked against bytes the runner's own printf writes.
+      - name: Programs tinycc-bootstrappable builds run
+        shell: bash
+        run: |
+          set -uo pipefail
+          build() {
+            "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A "$1" | tail -n 1
+          }
+          if ! hello=$(build bootstrappable-hello) || ! float=$(build bootstrappable-float); then
+            echo "::error::bootstrappable-hello or bootstrappable-float did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$hello")/bin/hello.exe
+          float=$(cygpath -u "$float")/bin/float.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/tcc-bootstrappable"
+          mkdir "$work"
+          status=0
+          runs() {
+            local exe=$1 want_code=$2 want_out=$3 code=0
+            shift 3
+            "$exe" "$@" > "$work/out.txt" || code=$?
+            printf '%s\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = "$want_code" ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    ${exe##*/}${*:+ $*} prints $want_out and exits $code"
+            else
+              echo "::error::${exe##*/}${*:+ $*} exited $code, not $want_code, and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs "$hello" 0 'Hello, TinyCC!'
+          runs "$hello" 1 'Hello, Windows!' Windows
+          runs "$float" 0 '3ff40000 0'
+          runs "$float" 0 '40040000 0' x
           exit "$status"
 
       # The cells Mes keeps across each collection while MesCC compiles and
