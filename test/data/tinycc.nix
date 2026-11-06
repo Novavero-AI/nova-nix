@@ -1,16 +1,17 @@
-# pkgs/windows' TinyCC, as the TinyCC (Windows) CI jobs build it: boot-mes
-# and bootstrappable, scripts that run tinycc-boot-mes and
-# tinycc-bootstrappable with -version, as nixpkgs' get-version test does;
-# hello and bootstrappable-hello, which each of those tccs compiles and
-# links against the library it compiled, and which print their first
-# argument, or TinyCC, and exit with their argument count;
-# bootstrappable-float, which tinycc-bootstrappable builds the same way, and
-# which prints the two words of its argument count times 1.25 as a double;
-# and arena, tinycc-boot-mes's
+# pkgs/windows' TinyCC, as the TinyCC (Windows) CI jobs build it: boot-mes,
+# bootstrappable and mes, scripts that run tinycc-boot-mes,
+# tinycc-bootstrappable and tinycc-mes with -version, as nixpkgs'
+# get-version test does; hello, bootstrappable-hello and mes-hello, which
+# each of those tccs compiles and links against the library it compiled,
+# and which print their first argument, or TinyCC, and exit with their
+# argument count; bootstrappable-float and mes-float, built the same way,
+# which print the two words of their argument count times 1.25 as a double;
+# mes-printf-float, which prints that double through printf's %f; and
+# arena, tinycc-boot-mes's
 # own derivation with MES_DEBUG=3, which prints the cells Mes keeps across
 # each collection while MesCC compiles and links tcc.
 let
-  inherit (import ../../pkgs/windows) stage0-pe32 tinycc;
+  inherit (import ../../pkgs/windows) stage0-pe32 tinycc tinycc-mes;
   inherit (stage0-pe32) kaem writeText;
 
   helloC = writeText "hello.c" ''
@@ -49,9 +50,25 @@ let
     }
   '';
 
+  # The double printed through printf's %f: Mes's dtoab prints the integer
+  # part, then the fraction times 1e8 as an integer with its trailing zeros
+  # dropped, 1.25, and 2.5 with one argument.  Its cast of the double to
+  # long is a call to __fixdfdi, which TinyCC's own libtcc1.c, which
+  # tinycc-mes links, has.
+  printfFloatC = writeText "printf-float.c" ''
+    #include <stdio.h>
+
+    int
+    main (int argc, char **argv)
+    {
+      printf ("%f\n", argc * 1.25);
+      return 0;
+    }
+  '';
+
   getVersion =
     name: round:
-    kaem.runCommand "${name}-get-version" tinycc.env ''
+    kaem.runCommand "${name}-get-version" round.env ''
       ${round.compiler}/bin/tcc.exe -version
       mkdir ''${out}
     '';
@@ -61,7 +78,7 @@ let
   # each program names crt1.o and the libraries itself.
   program =
     name: round: exe: source:
-    kaem.runCommand name tinycc.env ''
+    kaem.runCommand name round.env ''
       mkdir -p ''${out}/bin
       ${round.compiler}/bin/tcc.exe -nostdlib -o ''${out}/bin/${exe}.exe ${round.libs}/lib/crt1.o ${source} -L ${round.libs}/lib -lc -ltcc1
     '';
@@ -73,6 +90,11 @@ in
   bootstrappable = getVersion "tinycc-bootstrappable" tinycc.bootstrappable;
   bootstrappable-hello = program "tinycc-bootstrappable-hello" tinycc.bootstrappable "hello" helloC;
   bootstrappable-float = program "tinycc-bootstrappable-float" tinycc.bootstrappable "float" floatC;
+
+  mes = getVersion "tinycc-mes" tinycc-mes;
+  mes-hello = program "tinycc-mes-hello" tinycc-mes "hello" helloC;
+  mes-float = program "tinycc-mes-float" tinycc-mes "float" floatC;
+  mes-printf-float = program "tinycc-mes-printf-float" tinycc-mes "printf-float" printfFloatC;
 
   arena = derivation (
     tinycc.boot-mes.compiler.drvAttrs
