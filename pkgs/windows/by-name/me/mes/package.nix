@@ -292,6 +292,7 @@ let
       srcPrefix
       nyacc
       env
+      baseAddress
       ;
     inherit compiler libs;
     libc = import ./libc.nix {

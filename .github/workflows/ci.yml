@@ -1181,6 +1181,171 @@ jobs:
           echo "ok    at most $kept cells kept, within $room"
 
   # ---------------------------------------------------------------------------
+  # TinyCC (Windows): tinycc-boot-mes, as nixpkgs' minimal-bootstrap/tinycc
+  # builds it: janneke's bootstrappable TinyCC compiled by MesCC on mes into
+  # a tcc that writes PE32, and the Mes C library compiled by that tcc.
+  # test/data/tinycc.nix runs the tcc with -version in a build, as nixpkgs'
+  # get-version test does, and hello, which it compiles and links against
+  # that library, runs here.  x64 and ARM64 Windows each build all of it
+  # from the seed, for the reason Stage0 (Windows) runs on both.
+  #
+  # The x64 leg also measures the cells Mes keeps while MesCC compiles and
+  # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
+  # only on Mes and what it compiles, the same i686 code on both legs, so one
+  # leg measures it.
+  #
+  # The ARM64 leg takes about 44 minutes, most of them MesCC compiling the
+  # Mes libraries, mes and tcc under the x86 emulator, and the timeout is
+  # twice that.
+  # ---------------------------------------------------------------------------
+  tinycc-windows:
+    name: TinyCC (${{ matrix.name }})
+    needs: [stage0-nova-nix]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            arena: true
+          - os: windows-11-arm
+            name: Windows ARM64
+            arena: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 88
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@v8
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The stage0 tools and the Mes rung TinyCC builds on, each timed.
+      - name: Build Mes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in stage0-pe32.kaem stage0-pe32.mescc-tools stage0-pe32.mescc-tools-extra mes.nyacc mes.srcPost mes.libs mes.compiler mes.libc; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
+            echo "== $attr built in $((SECONDS - start)) s"
+          done
+
+      - name: Build tinycc-boot-mes
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc.boot-mes.compiler
+          echo "== tinycc.boot-mes.compiler built in $((SECONDS - start)) s"
+
+      # kaem runs the script strict, so a tcc that exits nonzero fails the
+      # build, and the line it printed is in the build's log.  tcc.c prints
+      # i386 Windows for TCC_TARGET_I386 with TCC_TARGET_PE.
+      - name: tcc prints its version
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/tcc-version.log"
+          want='tcc version 0.9.28-unstable-2024-07-07 (i386 Windows)'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A boot-mes > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tcc -version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::tcc -version did not print $want"; exit 1; fi
+          echo "ok    tcc -version"
+
+      # crt1.o, libtcc1.a, libc.a and libgetopt.a, each compiled by
+      # tinycc-boot-mes, timed.
+      - name: Build the libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc.boot-mes.libs | tail -n 1)
+          echo "== tinycc.boot-mes.libs built in $((SECONDS - start)) s"
+          libs=$(cygpath -u "$out")
+          status=0
+          for file in crt1.o libtcc1.a libc.a libgetopt.a; do
+            if [ -s "$libs/lib/$file" ]; then
+              echo "ok    lib/$file, $(wc -c < "$libs/lib/$file") bytes"
+            else
+              echo "::error::lib/$file is missing or empty"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # hello prints its first argument, or TinyCC, and exits with its
+      # argument count, so a run with an argument checks argv and the exit
+      # status crt1 hands back as well as the greeting.  tcc links it with
+      # no import table, as Mes libc reaches ntdll through the PEB.  Each
+      # output is checked against bytes the runner's own printf writes.
+      - name: A program tcc builds runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A hello | tail -n 1); then
+            echo "::error::hello did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$out")/bin/hello.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/tcc-hello"
+          mkdir "$work"
+          status=0
+          runs() {
+            local want_code=$1 want_out=$2 code=0
+            shift 2
+            "$hello" "$@" > "$work/out.txt" || code=$?
+            printf '%s\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = "$want_code" ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    hello.exe${*:+ $*} prints $want_out and exits $code"
+            else
+              echo "::error::hello.exe${*:+ $*} exited $code, not $want_code, and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs 0 'Hello, TinyCC!'
+          runs 1 'Hello, Windows!' Windows
+          exit "$status"
+
+      # The cells Mes keeps across each collection while MesCC compiles and
+      # links tcc, in the arena tinycc-boot-mes builds in.  The collector
+      # copies them into the tenth past the end of the arena, and Mes does
+      # not check that they fit, so they have to come to a tenth of the
+      # arena the derivation sets or fewer.
+      - name: Measure Mes's arena
+        if: matrix.arena
+        shell: bash
+        run: |
+          set -uo pipefail
+          arena=$("$RUNNER_TEMP/bin/nova-nix.exe" eval --expr '(import ./test/data/tinycc.nix).arena.drvAttrs.MES_ARENA' | tr -dc '0-9')
+          if [ -z "$arena" ]; then echo "::error::could not read the arena's MES_ARENA"; exit 1; fi
+          room=$((arena / 10))
+          echo "arena $arena cells, room for $room kept"
+          log="$RUNNER_TEMP/arena.log"
+          code=0
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A arena > /dev/null 2> "$log" || code=$?
+          echo "== arena built in $((SECONDS - start)) s"
+          tail -n 20 "$log"
+          collections=$(grep -c '=> jam' "$log")
+          kept=$(grep -o '=> jam: \[[0-9]*\]' "$log" | tr -dc '0-9\n' | sort -n | tail -n 1)
+          used=$(grep -o ';;; gc: \[[0-9]*\]' "$log" | tr -dc '0-9\n' | sort -n | tail -n 1)
+          echo "arena build exited $code after $collections collections: at most ${used:-none} cells in use at a collection, ${kept:-none} kept"
+          if [ "$code" != 0 ]; then echo "::error::the arena build failed"; exit 1; fi
+          if [ -z "$kept" ]; then echo "::error::the arena build reported no collection"; exit 1; fi
+          if [ "$kept" -gt "$room" ]; then echo "::error::Mes kept $kept cells, more than the $room its arena has room to copy"; exit 1; fi
+          echo "ok    at most $kept cells kept, within $room"
+
+  # ---------------------------------------------------------------------------
   # Publish (public cache): refresh the public cache with the closure main
   # builds, so it serves the current one rather than whatever was pushed by
   # hand last.  A job of its own rather than a step of e2e-windows: the
