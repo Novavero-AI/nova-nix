@@ -1,20 +1,20 @@
-# pkgs/windows' TinyCC, as the TinyCC (Windows) CI jobs build it: boot-mes,
-# bootstrappable, mes and native, scripts that run tinycc-boot-mes,
-# tinycc-bootstrappable, tinycc-mes and tinycc-native with -version, as
-# nixpkgs' get-version test does; hello, bootstrappable-hello, mes-hello
-# and native-hello, which each of those tccs compiles and links against the
-# library it compiled, and which print their first argument, or TinyCC, and
-# exit with their argument count; bootstrappable-float, mes-float and
-# native-float, built the same way, which print the two words of their
-# argument count times 1.25 as a double; mes-printf-float and
+# pkgs/windows' TinyCC, as the Bootstrap (Windows) CI jobs build it:
+# boot-mes, bootstrappable, mes and native, scripts that run
+# tinycc-boot-mes, tinycc-bootstrappable, tinycc-mes and tinycc-native with
+# -version, as nixpkgs' get-version test does; hello, bootstrappable-hello,
+# mes-hello and native-hello, which each of those tccs compiles and links
+# against the library it compiled, and which print their first argument, or
+# TinyCC, and exit with their argument count; bootstrappable-float,
+# mes-float and native-float, built the same way, which print the two words
+# of their argument count times 1.25 as a double; mes-printf-float and
 # native-printf-float, which print that double through printf's %f;
 # native-winsock, which tinycc-native links with -lws2_32 and which prints
 # 0x1234 in network byte order through ws2_32.dll's htons;
 # native-search-dirs, which prints the directories tinycc-native searches;
 # native-mingw32, which compiles only if tinycc-native predefines
-# __MINGW32__; and arena, tinycc-boot-mes's own derivation with
-# MES_DEBUG=3, which prints the cells Mes keeps across each collection
-# while MesCC compiles and links tcc.
+# __MINGW32__; and arena, tinycc-boot-mes's own derivation with MES_DEBUG=3,
+# which prints the cells Mes keeps across each collection while MesCC
+# compiles and links tcc.
 let
   inherit (import ../../pkgs/windows) stage0-pe32 tinycc tinycc-mes tinycc-native;
   inherit (stage0-pe32) kaem writeText;

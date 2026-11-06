@@ -1181,18 +1181,21 @@ jobs:
           echo "ok    at most $kept cells kept, within $room"
 
   # ---------------------------------------------------------------------------
-  # TinyCC (Windows): tinycc-boot-mes to tinycc-mes, as nixpkgs'
-  # minimal-bootstrap/tinycc builds them: janneke's bootstrappable TinyCC
-  # compiled by MesCC on mes into a tcc that writes PE32, then by each
-  # round's tcc into the next, each round compiling the Mes C library the
-  # next links with, and TinyCC's own source compiled by the last of those
-  # rounds and then by itself.  test/data/tinycc.nix runs the first, the
-  # last bootstrappable and the last tcc with -version in a build, as
-  # nixpkgs' get-version test does, and the programs each compiles and links
-  # against its library run here: hello for each, float, which prints the
-  # words of a double, for the last two, and printf-float, which prints a
-  # double through %f, for the last.  x64 and ARM64 Windows each build all
-  # of it from the seed, for the reason Stage0 (Windows) runs on both.
+  # Bootstrap (Windows): the rungs above Mes, from the seed.  TinyCC first,
+  # tinycc-boot-mes to tinycc-mes, as nixpkgs' minimal-bootstrap/tinycc
+  # builds them: janneke's bootstrappable TinyCC compiled by MesCC on mes
+  # into a tcc that writes PE32, then by each round's tcc into the next, each
+  # round compiling the Mes C library the next links with, and TinyCC's own
+  # source compiled by the last of those rounds and then by itself.  Then
+  # tinycc-native, that source as a native Windows compiler on msvcrt,
+  # compiled twice, and GNU make, compiled by it.  test/data/tinycc.nix runs
+  # the tccs with -version in a build, as nixpkgs' get-version test does,
+  # and the programs each compiles and links run here: hello for each,
+  # float, which prints the words of a double, from tinycc-bootstrappable
+  # on, and printf-float, which prints a double through %f, from tinycc-mes
+  # on.  test/data/gnumake.nix runs make with --version and has it build a
+  # target through a pattern rule.  x64 and ARM64 Windows each build all of
+  # it from the seed, for the reason Stage0 (Windows) runs on both.
   #
   # The x64 leg also measures the cells Mes keeps while MesCC compiles and
   # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
@@ -1203,8 +1206,8 @@ jobs:
   # Mes libraries, mes and tcc under the x86 emulator, and the timeout is
   # twice that.
   # ---------------------------------------------------------------------------
-  tinycc-windows:
-    name: TinyCC (${{ matrix.name }})
+  bootstrap-windows:
+    name: Bootstrap (${{ matrix.name }})
     needs: [stage0-nova-nix]
     strategy:
       fail-fast: false
@@ -1586,6 +1589,44 @@ jobs:
           runs "$printf_float" 0 '2.500000' x
           runs "$winsock" 0 '3412'
           exit "$status"
+
+      # GNU make, compiled by tinycc-native, timed.
+      - name: Build GNU make
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A gnumake
+          echo "== gnumake built in $((SECONDS - start)) s"
+
+      # make --version prints its version line, and make builds greeting.txt
+      # from greeting.in through a pattern rule whose recipe is cmd.exe's
+      # copy, which make runs from a batch file, having no sh.exe on PATH.
+      - name: GNU make runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/make-version.log"
+          want='GNU Make 4.4.1'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gnumake.nix -A version > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::make --version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::make --version did not print $want"; exit 1; fi
+          echo "ok    make --version"
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gnumake.nix -A pattern-rule | tail -n 1); then
+            echo "::error::make did not build greeting.txt"
+            exit 1
+          fi
+          greeting=$(cygpath -u "$out")
+          printf 'Hello from make\n' > "$RUNNER_TEMP/greeting-want.txt"
+          if cmp "$RUNNER_TEMP/greeting-want.txt" "$greeting"; then
+            echo "ok    make built greeting.txt through its pattern rule"
+          else
+            echo "::error::greeting.txt is not greeting.in's text:"
+            od -A d -t x1 "$greeting" | head -n 8
+            exit 1
+          fi
 
       # The cells Mes keeps across each collection while MesCC compiles and
       # links tcc, in the arena tinycc-boot-mes builds in.  The collector
