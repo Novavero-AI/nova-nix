@@ -1181,16 +1181,18 @@ jobs:
           echo "ok    at most $kept cells kept, within $room"
 
   # ---------------------------------------------------------------------------
-  # TinyCC (Windows): tinycc-boot-mes to tinycc-bootstrappable, as nixpkgs'
+  # TinyCC (Windows): tinycc-boot-mes to tinycc-mes, as nixpkgs'
   # minimal-bootstrap/tinycc builds them: janneke's bootstrappable TinyCC
   # compiled by MesCC on mes into a tcc that writes PE32, then by each
   # round's tcc into the next, each round compiling the Mes C library the
-  # next links with.  test/data/tinycc.nix runs the first and last tccs with
-  # -version in a build, as nixpkgs' get-version test does, and the programs
-  # each compiles and links against its library run here: hello for both,
-  # and float, which prints a double, for the last.  x64 and ARM64 Windows
-  # each build all of it from the seed, for the reason Stage0 (Windows) runs
-  # on both.
+  # next links with, and TinyCC's own source compiled by the last of those
+  # rounds and then by itself.  test/data/tinycc.nix runs the first, the
+  # last bootstrappable and the last tcc with -version in a build, as
+  # nixpkgs' get-version test does, and the programs each compiles and links
+  # against its library run here: hello for each, float, which prints the
+  # words of a double, for the last two, and printf-float, which prints a
+  # double through %f, for the last.  x64 and ARM64 Windows each build all
+  # of it from the seed, for the reason Stage0 (Windows) runs on both.
   #
   # The x64 leg also measures the cells Mes keeps while MesCC compiles and
   # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
@@ -1381,6 +1383,75 @@ jobs:
           runs "$hello" 1 'Hello, Windows!' Windows
           runs "$float" 0 '3ff40000 0'
           runs "$float" 0 '40040000 0' x
+          exit "$status"
+
+      # tccdefs, tinycc-mes-boot and tinycc-mes, as nixpkgs' mes.nix builds
+      # them: TinyCC's own source compiled by tinycc-bootstrappable, then by
+      # itself, each round's library compiled by its tcc, timed.
+      - name: Build tinycc-mes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for round in tinycc-mes.prev tinycc-mes; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$round.libs"
+            echo "== $round built in $((SECONDS - start)) s"
+          done
+
+      - name: tinycc-mes prints its version
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/mes-version.log"
+          want='tcc version 0.9.28-unstable-2025-12-03 (i386 Windows)'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A mes > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tinycc-mes -version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::tinycc-mes -version did not print $want"; exit 1; fi
+          echo "ok    tinycc-mes -version"
+
+      # hello and float as tinycc-bootstrappable's, and printf-float, which
+      # prints its argument count times 1.25 through printf's %f: Mes's
+      # dtoab casts the double to long, a call to __fixdfdi, which this
+      # round's libtcc1, TinyCC's own, has.  Each output is checked against
+      # bytes the runner's own printf writes.
+      - name: Programs tinycc-mes builds run
+        shell: bash
+        run: |
+          set -uo pipefail
+          build() {
+            "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A "$1" | tail -n 1
+          }
+          if ! hello=$(build mes-hello) || ! float=$(build mes-float) || ! printf_float=$(build mes-printf-float); then
+            echo "::error::mes-hello, mes-float or mes-printf-float did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$hello")/bin/hello.exe
+          float=$(cygpath -u "$float")/bin/float.exe
+          printf_float=$(cygpath -u "$printf_float")/bin/printf-float.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/tcc-mes"
+          mkdir "$work"
+          status=0
+          runs() {
+            local exe=$1 want_code=$2 want_out=$3 code=0
+            shift 3
+            "$exe" "$@" > "$work/out.txt" || code=$?
+            printf '%s\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = "$want_code" ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    ${exe##*/}${*:+ $*} prints $want_out and exits $code"
+            else
+              echo "::error::${exe##*/}${*:+ $*} exited $code, not $want_code, and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs "$hello" 0 'Hello, TinyCC!'
+          runs "$hello" 1 'Hello, Windows!' Windows
+          runs "$float" 0 '3ff40000 0'
+          runs "$float" 0 '40040000 0' x
+          runs "$printf_float" 0 '1.25'
+          runs "$printf_float" 0 '2.5' x
           exit "$status"
 
       # The cells Mes keeps across each collection while MesCC compiles and

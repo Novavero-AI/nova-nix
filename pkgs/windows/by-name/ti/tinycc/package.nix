@@ -89,6 +89,7 @@ let
   # PE tcc, which links through tccpe.c.  MesCC links at the ImageBase of the
   # Mes port's PE header.
   tinycc-boot-mes = rec {
+    inherit env;
     compiler = kaem.runCommand "${pname}-${version}" mesEnv ''
       catm config.h
       ${mes.compiler}/bin/mes.exe --no-auto-compile -e main ${mes.srcPost.bin}/bin/mescc.scm -- \
@@ -217,7 +218,6 @@ let
   };
 in
 {
-  inherit env;
   boot-mes = tinycc-boot-mes;
   boot0 = tinycc-boot0;
   boot1 = tinycc-boot1;

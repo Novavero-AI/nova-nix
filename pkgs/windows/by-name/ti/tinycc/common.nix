@@ -3,6 +3,13 @@
 # compiled by a round's tcc for the round after it to link with, and
 # buildTinyccMes, a round's tcc compiled by the round before it.
 #
+# nixpkgs builds each tcc's include directories into it.  Here a tcc reads
+# them from C_INCLUDE_PATH (see package.nix), so each round carries env,
+# what a script that runs its tcc sets, and a script sets the env of the tcc
+# it runs: the round before's for the compiler, the round's own for its
+# library.  The two differ when a round is built from another source than
+# the round before it, as tinycc-mes-boot is.
+#
 # lib/windows has crt1.c alone of the startup files (Linux's crti.c and
 # crtn.c are empty), so there is no crti.o or crtn.o.  mescc-tools-extra's
 # cp writes the file it is given and takes no directory on Windows, so each
@@ -20,6 +27,14 @@ rec {
       src,
       env,
       libtccOptions,
+      libtccSources ? [
+        "${src}/lib/libtcc1.c"
+        "${src}/lib/va_list.c"
+      ],
+      libtccObjects ? [
+        "libtcc1.o"
+        "va_list.o"
+      ],
     }:
     let
       cc = "${tcc}/bin/tcc.exe";
@@ -37,16 +52,7 @@ rec {
           ${cc} -ar cr ''${out} ${builtins.concatStringsSep " " objs}
         '';
 
-      libtcc1 =
-        library "libtcc1" libtccOptions
-          [
-            "${src}/lib/libtcc1.c"
-            "${src}/lib/va_list.c"
-          ]
-          [
-            "libtcc1.o"
-            "va_list.o"
-          ];
+      libtcc1 = library "libtcc1" libtccOptions libtccSources libtccObjects;
       libcArchive = library "libc" libc.CFLAGS [ "${libc}/lib/libc.c" ] [ "libc.o" ];
       libgetopt = library "libgetopt" libc.CFLAGS [ "${libc}/lib/libgetopt.c" ] [ "libgetopt.o" ];
     in
@@ -78,6 +84,14 @@ rec {
       env,
       prev,
       buildOptions,
+      libtccSources ? [
+        "${src}/lib/libtcc1.c"
+        "${src}/lib/va_list.c"
+      ],
+      libtccObjects ? [
+        "libtcc1.o"
+        "va_list.o"
+      ],
       libtccBuildOptions,
     }:
     let
@@ -90,7 +104,7 @@ rec {
         ]
         ++ libtccBuildOptions
       );
-      compiler = kaem.runCommand "${pname}-${version}" env ''
+      compiler = kaem.runCommand "${pname}-${version}" prev.env ''
         catm config.h
         mkdir -p ''${out}/bin
         ${prev.compiler}/bin/tcc.exe \
@@ -134,11 +148,18 @@ rec {
           src
           env
           libtccOptions
+          libtccSources
+          libtccObjects
           ;
         tcc = compiler;
       };
     in
     {
-      inherit prev compiler libs;
+      inherit
+        prev
+        compiler
+        libs
+        env
+        ;
     };
 }
