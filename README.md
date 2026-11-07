@@ -23,13 +23,15 @@ it.
   results. A matching `drvPath` means the whole build-time closure behind it
   matches too. It also probes `derivation` against upstream's over a corpus of
   calls, apart from the differences [`derivation-divergences.txt`] lists. How
-  much of the rest of nixpkgs evaluates is not measured ([#29]).
+  much of the rest of nixpkgs evaluates is not measured.
 - **Windows builds run natively.** CI builds GNU Hello on Windows through a
   stage-1 stdenv whose toolchain is prebuilt MinGW-w64 and MSYS2 packages,
-  each pinned by SHA-256 ([`pkgs/windows/bootstrap`]). Replacing them with a
-  toolchain built from source is tracked in [#26]. CI builds the start of it
-  on x64 and ARM64 Windows from the 1,623-byte seed of [stage0-pe32]: the
-  chain up to kaem, mescc-tools-extra, and [a Windows port] of GNU Mes 0.27.1.
+  each pinned by SHA-256 ([`pkgs/windows/bootstrap`]). A toolchain built from
+  source is planned to replace them, from the 1,623-byte seed of
+  [stage0-pe32] to a GCC that builds the package set. CI builds its start
+  from that seed on x64 and ARM64 Windows: stage0-pe32's chain,
+  [a Windows port] of GNU Mes, TinyCC as a native Windows compiler, and GNU
+  make, built by that TinyCC.
 - **Binary caches work in both directions.** `nova-nix push` uploads a closure
   to a [nova-cache] server, which signs it, and a build given a substituter
   downloads signed NARs from an HTTP binary cache instead of building. CI
@@ -67,7 +69,7 @@ it.
   in each.
 - On Windows a build's process tree runs in a job object, so stopping a build
   stops everything it started. No platform isolates a build's filesystem or
-  network; a Windows filesystem sandbox is tracked in [#194].
+  network; a filesystem sandbox for Windows builds is planned.
 - nova-nix itself needs neither WSL nor Cygwin, but the Windows stdenv runs its
   build scripts with MSYS2's bash.
 - Store paths that contain symlinks need Windows Developer Mode or an elevated
@@ -184,6 +186,3 @@ Apache-2.0. See [LICENSE] and [NOTICE].
 [CONTRIBUTING.md]: https://github.com/Novavero-AI/nova-nix/blob/main/CONTRIBUTING.md
 [LICENSE]: https://github.com/Novavero-AI/nova-nix/blob/main/LICENSE
 [NOTICE]: https://github.com/Novavero-AI/nova-nix/blob/main/NOTICE
-[#26]: https://github.com/Novavero-AI/nova-nix/issues/26
-[#29]: https://github.com/Novavero-AI/nova-nix/issues/29
-[#194]: https://github.com/Novavero-AI/nova-nix/issues/194
