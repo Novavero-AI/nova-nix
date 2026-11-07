@@ -5,7 +5,11 @@
 #   by-name/<shard>/<pname>/package.nix   one package per directory, shard =
 #                                         the first two characters of <pname>
 #   bootstrap/                            the sha256-pinned MSYS2 seeds
-#   stdenv/                               mkDerivation, setup.sh, cc-wrapper.sh
+#   stdenv/                               the transitional stage-1 stdenv on
+#                                         them: mkDerivation, setup.sh,
+#                                         cc-wrapper.sh
+#   seed-stdenv/                          its replacement, on tools built from
+#                                         the seed: mkDerivation, setup.sh
 #   lib.nix                               callPackage and friends
 #
 # The set is a fixpoint: callPackage reads each package.nix's formal parameters
@@ -49,6 +53,7 @@ let
     inherit lib;
 
     stdenv = import ./stdenv;
+    seedStdenv = callPackage ./seed-stdenv { };
     fetchurl = import ./fetchurl.nix;
   };
 in

@@ -31,7 +31,8 @@ it.
   [stage0-pe32] to a GCC that builds the package set. CI builds its start
   from that seed on x64 and ARM64 Windows: stage0-pe32's chain,
   [a Windows port] of GNU Mes, TinyCC as a native Windows compiler, and GNU
-  make, built by that TinyCC.
+  make and busybox-w32, built by that TinyCC. The stdenv that replaces the
+  stage-1 one is made only of those tools, and builds GNU Hello there too.
 - **Binary caches work in both directions.** `nova-nix push` uploads a closure
   to a [nova-cache] server, which signs it, and a build given a substituter
   downloads signed NARs from an HTTP binary cache instead of building. CI

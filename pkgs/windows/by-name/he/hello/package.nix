@@ -1,5 +1,6 @@
-# GNU hello, built through the stage-1 stdenv.  The whole recipe is now just a
-# name and a source -- setup.sh handles unpack/configure/build/install.
+# GNU hello: a name and a source, with the stdenv's setup.sh doing unpack,
+# configure, build and install.  pkgs/windows builds it with the stage-1
+# stdenv, and test/data/seed-stdenv.nix with the seed stdenv.
 #
 # pkgs/windows/hello.nix points `nova-nix build` at this package: build takes
 # a derivation-valued expression, and this is a function (it takes
