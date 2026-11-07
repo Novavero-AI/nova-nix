@@ -1196,7 +1196,8 @@ jobs:
   # through %f, from tinycc-mes on.  test/data/gnumake.nix runs make with
   # --version and has it build a target through a pattern rule, and
   # test/data/busybox.nix runs busybox --version and has busybox's sh run a
-  # script through the applets configure runs.  x64 and ARM64 Windows each
+  # script through the applets configure runs.  Last, the seed stdenv made
+  # of those builds GNU Hello, which runs here.  x64 and ARM64 Windows each
   # build all of it from the seed, for the reason Stage0 (Windows) runs on
   # both.
   #
@@ -1205,7 +1206,7 @@ jobs:
   # only on Mes and what it compiles, the same i686 code on both legs, so one
   # leg measures it.
   #
-  # The ARM64 leg takes about 44 minutes, most of them MesCC compiling the
+  # The ARM64 leg takes about 49 minutes, most of them MesCC compiling the
   # Mes libraries, mes and tcc under the x86 emulator, and the timeout is
   # twice that.
   # ---------------------------------------------------------------------------
@@ -1223,7 +1224,7 @@ jobs:
             name: Windows ARM64
             arena: false
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 88
+    timeout-minutes: 98
     steps:
       - uses: actions/checkout@v7
 
@@ -1693,6 +1694,65 @@ jobs:
             diff "$expected" "$lines"
             exit 1
           fi
+
+      # The seed stdenv's commands, busybox-w32's applets, and GNU Hello
+      # built with it: pkgs/windows' hello package, configured, compiled
+      # and installed by busybox's sh, its applets, GNU make and
+      # tinycc-native, each timed.
+      - name: Build GNU Hello with the seed stdenv
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A seedStdenv.applets
+          echo "== seedStdenv.applets built in $((SECONDS - start)) s"
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/seed-stdenv.nix -A hello
+          echo "== hello built in $((SECONDS - start)) s"
+
+      # hello prints its greeting, or the one --greeting gives it, and its
+      # version, each line ending in a carriage return, as msvcrt's
+      # text-mode stdout writes it.  Each greeting is checked against bytes
+      # the runner's own printf writes, and the first line of --version
+      # with its carriage return removed.
+      - name: GNU Hello built with the seed stdenv runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/seed-stdenv.nix -A hello | tail -n 1); then
+            echo "::error::hello did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$out")/bin/hello.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/seed-hello"
+          mkdir "$work"
+          status=0
+          runs() {
+            local want_out=$1 code=0
+            shift
+            "$hello" "$@" > "$work/out.txt" || code=$?
+            printf '%s\r\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = 0 ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    hello.exe${*:+ $*} prints $want_out"
+            else
+              echo "::error::hello.exe${*:+ $*} exited $code and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs 'Hello, world!'
+          runs 'Hello from the seed' --greeting='Hello from the seed'
+          code=0
+          out=$("$hello" --version) || code=$?
+          version=${out%%$'\n'*}
+          version=${version%$'\r'}
+          if [ "$code" = 0 ] && [ "$version" = 'hello (GNU Hello) 2.12.3' ]; then
+            echo "ok    hello.exe --version prints $version"
+          else
+            echo "::error::hello.exe --version exited $code and printed $version"
+            status=1
+          fi
+          exit "$status"
 
       # The cells Mes keeps across each collection while MesCC compiles and
       # links tcc, in the arena tinycc-boot-mes builds in.  The collector

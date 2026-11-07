@@ -62,7 +62,16 @@ pkgs/windows/by-name/me/mes/package.nix, libc.nix and nyacc.nix
   OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
   WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pkgs/windows/by-name/bu/busybox-w32/compat
+pkgs/windows/by-name/bu/busybox-w32/compat and
+pkgs/windows/seed-stdenv/include
   Declarations transcribed from the headers of mingw-w64
   (https://www.mingw-w64.org) v14.0.0, mingw-w64-headers, which their
   authors place in the public domain.
+
+This product builds on other work:
+
+pkgs/windows: the seed chain, from stage0-pe32 to the seed stdenv
+  Builds on Gavin John's Windows port of the full-source bootstrap
+  (https://github.com/Pandapip1/stage0-pe32): stage0-pe32 and its seed,
+  the M2libc x86/windows target, the kaem changes, and the GNU Mes Windows
+  port.

@@ -12329,6 +12329,133 @@ testBusyboxWindows = do
         : crtSources
         ++ concat [[name, name <> "-builder"] | name <- ["busybox-w32-" <> version, "busybox-w32-get-version", "busybox-w32-configure-tools"]]
 
+-- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
+-- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
+-- hello, add to the closure of the tools it is made of, busybox-w32, GNU
+-- make and tinycc-native.  The one leaf it adds is hello's archive, and it
+-- reads no input source but the stdenv's own files and what evaluation
+-- writes as text.  The leaves of hello's whole closure are the seed and
+-- the sources the ladder fetches, so no MSYS2 or MinGW-w64 package is in
+-- it; MinGW-w64's files there are the five mingw-w64-crt sources
+-- busybox-w32 compiles and the declarations its compat headers and the
+-- stdenv's sdkddkver.h transcribe.  Neither of the stage-1 stdenv's seeds is in it,
+-- where both are in the closure of the same hello package built with the
+-- stage-1 stdenv, which the test reads too, so that the check is known to
+-- find them.
+testSeedStdenvWindows :: IO [Bool]
+testSeedStdenvWindows = do
+  putStrLn "pkgs/seed-stdenv"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "seed-stdenv.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+              closureOf attrs = sessionClosure (mapMaybe (`Map.lookup` rootOf) attrs)
+          tools <- closureOf toolRoots
+          seed <- closureOf [seedHello]
+          stage1 <- closureOf [stage1Hello]
+          pure (rootOf, tools, seed, stage1)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, tools, seed, stage1) -> do
+      let added = Map.elems (Map.difference seed tools)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          leavesOf = filter (Map.null . drvInputDrvs)
+          addedLeaves = leavesOf added
+          seedLeaves = leavesOf (Map.elems seed)
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          seedsIn closure = [attr | attr <- stage1Seeds, Just path <- [Map.lookup attr rootOf], Map.member path closure]
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetch is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the one leaf it adds is hello's archive, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              ([helloArchive], True)
+              (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text and the stdenv's own files" $
+            assertEqual
+              "input sources not written as text"
+              ["applet.c", "config.site", "include", "setup.sh"]
+              (sort [spName path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]),
+          runTest "the leaves of hello's closure are the seed and the ladder's sources, all fetched fixed-output" $
+            assertEqual
+              "leaves"
+              (sort closureLeaves, True)
+              (sort (map nameOf seedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) seedLeaves),
+          runTest "both stage-1 seeds are in the closure of hello built with the stage-1 stdenv" $
+            assertEqual "stage-1 seeds in it" stage1Seeds (seedsIn stage1),
+          runTest "neither stage-1 seed is in the closure of hello built with the seed stdenv" $
+            assertEqual "stage-1 seeds in it" [] (seedsIn seed)
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the seed stdenv and its hello instantiate, adding three to the closure of their tools"
+    toolRoots :: [Text]
+    toolRoots = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs"]
+    seedHello :: Text
+    seedHello = "checks.hello"
+    stage1Hello :: Text
+    stage1Hello = "pkgs.hello"
+    stage1Seeds :: [Text]
+    stage1Seeds = ["pkgs.stdenv.mingwSeed", "pkgs.stdenv.msysSeed"]
+    roots :: [Text]
+    roots = toolRoots ++ [seedHello, stage1Hello] ++ stage1Seeds
+    helloArchive :: Text
+    helloArchive = "hello-2.12.3.tar.gz"
+    addedNames :: [Text]
+    addedNames = [helloArchive, "busybox-w32-FRP-6354-g5f09fb446-applets", "hello"]
+    -- stage0-pe32's seed and sources, Mes and NYACC, janneke's TinyCC and
+    -- TinyCC's own, GNU make, busybox-w32 and the mingw-w64-crt sources it
+    -- compiles, and hello.
+    closureLeaves :: [Text]
+    closureLeaves =
+      [ "hex0-seed.exe",
+        "stage0-pe32-ff1c2ad.tar.gz",
+        "M2-Planet-ee0bf91.tar.gz",
+        "M2libc-13e57eb.tar.gz",
+        "mescc-tools-578ac99.tar.gz",
+        "mescc-tools-extra-d1d8146.tar.gz",
+        "mes-4ea66eb.tar.gz",
+        "nyacc-1.09.1.tar.gz",
+        "tinycc-ea3900f6d5e71776c5cfabcabee317652e3a19ee.tar.gz",
+        "tinycc-cb41cbfe717e4c00d7bb70035cda5ee5f0ff9341.tar.gz",
+        "make-4.4.1.tar.gz",
+        "busybox-w32-FRP-6354-g5f09fb446.tgz",
+        "getopt.c",
+        "mempcpy.c",
+        "mingw_usleep.c",
+        "strtok_r.c",
+        "msvcr80plus_ftruncate64.c",
+        helloArchive
+      ]
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -18769,6 +18896,7 @@ runSuite = do
           testTinyccWindows,
           testGnumakeWindows,
           testBusyboxWindows,
+          testSeedStdenvWindows,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,

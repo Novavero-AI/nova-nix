@@ -1,14 +1,23 @@
-# nova-nix stage-1 stdenv: mkDerivation.
+# nova-nix stage-1 stdenv: mkDerivation on prebuilt MSYS2 and MinGW-w64
+# packages.
+#
+# Transitional.  The seed stdenv (../seed-stdenv) replaces it, and this
+# directory and ../bootstrap are deleted once the seed ladder builds every
+# package this stdenv builds, which needs GCC on the ladder for C++, x86_64
+# output, MinGW-w64's headers and runtime, and binutils' objdump for the
+# fixup phase's DLL bundling.  Until then it is the package set's stdenv,
+# which CI's E2E (Windows), publish and public-cache jobs build GNU Hello
+# with.
 #
 # Wraps the low-level `derivation` builtin so a Windows package builds with just
 #
 #   { stdenv }:
 #   stdenv.mkDerivation { name = "foo"; src = ...; }
 #
-# callPackage supplies that `stdenv` argument from the package set.
-# instead of a hand-written builder script.  It supplies the seed bash as the
-# builder, runs setup.sh (the genericBuild), and exposes the mingw toolchain via
-# $ccPath.  Package attrs (buildInputs, configureFlags, makeFlags, buildPhase,
+# instead of a hand-written builder script; callPackage supplies that
+# `stdenv` argument from the package set.  It supplies the MSYS2 seed's bash
+# as the builder, runs setup.sh (the genericBuild), and exposes the mingw
+# toolchain via $ccPath.  Package attrs (buildInputs, configureFlags, makeFlags, buildPhase,
 # ...) flow through to setup.sh as $-prefixed environment variables; see its
 # header for the full set it reads.
 let

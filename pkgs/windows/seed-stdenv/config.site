@@ -1,0 +1,14 @@
+# What configure cannot detect under the seed stdenv, read by every
+# autoconf configure script it runs through CONFIG_SITE.
+
+# configure picks PATH's separator by running sh under a PATH split each
+# way (its "The user is always right" block).  busybox's sh runs its own
+# sh applet whatever PATH holds, so both runs succeed and ':' wins, which
+# splits every C: directory in two.  busybox-w32 splits PATH on ';'.
+PATH_SEPARATOR=';'
+
+# configure takes a program it searches PATH for only if test -x passes,
+# trying each name as it is and then with each suffix in
+# ac_executable_extensions.  The commands on PATH are .exe files, and
+# busybox's test, unlike Cygwin's, does not add the suffix itself.
+ac_executable_extensions=.exe

@@ -1,10 +1,10 @@
-# Stage 0 of the native Windows stdenv: the MinGW-w64 toolchain seed.
+# The stage-1 stdenv's MinGW-w64 toolchain seed, transitional with that
+# stdenv: ../stdenv/default.nix says when both are deleted.
 #
-# The bootstrap trust anchor - pre-built MSYS2 packages, pinned by sha256,
-# fetched with builtin:fetchurl and extracted with builtin:unpack into one
-# merged toolchain root (MSYS2 packages share the mingw64/ prefix).  This is
-# the Windows equivalent of nixpkgs' bootstrapTools tarball: everything past
-# this point is built from source by tools that live in the store.
+# Pre-built MSYS2 packages, pinned by sha256, fetched with builtin:fetchurl
+# and extracted with builtin:unpack into one merged toolchain root (MSYS2
+# packages share the mingw64/ prefix), the stage-1 stdenv's counterpart of
+# nixpkgs' bootstrapTools tarball.
 #
 # The pin set is the runtime closure of mingw-w64-x86_64-gcc, resolved and
 # hash-verified against repo.msys2.org on 2026-06-10.  MSYS2 prunes old

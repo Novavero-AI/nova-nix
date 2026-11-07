@@ -1,3 +1,6 @@
+# The stage-1 stdenv's MSYS2 userland seed, transitional with that stdenv:
+# ../stdenv/default.nix says when both are deleted.
+#
 # Stage 1, step 1: the MSYS2 userland seed - a POSIX shell and the build tools
 # the stdenv's setup.sh runs through.  Companion to seed.nix (the compiler):
 # seed.nix is the mingw64 toolchain, this is the msys runtime + shell.
