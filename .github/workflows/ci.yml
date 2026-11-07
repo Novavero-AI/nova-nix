@@ -1188,14 +1188,17 @@ jobs:
   # round compiling the Mes C library the next links with, and TinyCC's own
   # source compiled by the last of those rounds and then by itself.  Then
   # tinycc-native, that source as a native Windows compiler on msvcrt,
-  # compiled twice, and GNU make, compiled by it.  test/data/tinycc.nix runs
-  # the tccs with -version in a build, as nixpkgs' get-version test does,
-  # and the programs each compiles and links run here: hello for each,
-  # float, which prints the words of a double, from tinycc-bootstrappable
-  # on, and printf-float, which prints a double through %f, from tinycc-mes
-  # on.  test/data/gnumake.nix runs make with --version and has it build a
-  # target through a pattern rule.  x64 and ARM64 Windows each build all of
-  # it from the seed, for the reason Stage0 (Windows) runs on both.
+  # compiled twice, and GNU make and busybox-w32, compiled by it.
+  # test/data/tinycc.nix runs the tccs with -version in a build, as nixpkgs'
+  # get-version test does, and the programs each compiles and links run
+  # here: hello for each, float, which prints the words of a double, from
+  # tinycc-bootstrappable on, and printf-float, which prints a double
+  # through %f, from tinycc-mes on.  test/data/gnumake.nix runs make with
+  # --version and has it build a target through a pattern rule, and
+  # test/data/busybox.nix runs busybox --version and has busybox's sh run a
+  # script through the applets configure runs.  x64 and ARM64 Windows each
+  # build all of it from the seed, for the reason Stage0 (Windows) runs on
+  # both.
   #
   # The x64 leg also measures the cells Mes keeps while MesCC compiles and
   # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
@@ -1625,6 +1628,69 @@ jobs:
           else
             echo "::error::greeting.txt is not greeting.in's text:"
             od -A d -t x1 "$greeting" | head -n 8
+            exit 1
+          fi
+
+      # busybox-w32, compiled by tinycc-native, timed.
+      - name: Build busybox-w32
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A busybox-w32
+          echo "== busybox-w32 built in $((SECONDS - start)) s"
+
+      # busybox --version prints its version line, and busybox's sh runs
+      # test/data/busybox.nix's script through the applets configure runs,
+      # writing a line of what each did; a line whose test fails is left
+      # out.  The lines are checked against bytes the runner's own printf
+      # writes.
+      - name: busybox-w32 runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/busybox-version.log"
+          want='BusyBox v1.39.0.git-6354-g5f09fb446 ()'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/busybox.nix -A version > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::busybox --version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::busybox --version did not print $want"; exit 1; fi
+          echo "ok    busybox --version"
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/busybox.nix -A configure-tools | tail -n 1); then
+            echo "::error::busybox sh did not run configure-tools.sh"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          expected="$RUNNER_TEMP/configure-tools-expected.txt"
+          printf '%s\n' \
+            'sh arithmetic 42' \
+            'sh expansion configure igure.ac 12' \
+            'sh case ac' \
+            'sh function hello world' \
+            'sh loop abc' \
+            'sh child child here status 3' \
+            'mkdir -p' \
+            'cat one,two,three,' \
+            'cp mv' \
+            'rm -r' \
+            'printf done 007 ff' \
+            'test' \
+            'sed CC is gcc -O2' \
+            'sed -n two' \
+            'grep -c 2' \
+            'grep -q' \
+            'grep -E two,three,' \
+            'grep -v three' \
+            'awk 14' \
+            'awk -F c 3' \
+            'expr 5 conftest' \
+            'tr ABCDEF' > "$expected"
+          if cmp "$expected" "$lines"; then
+            echo "ok    busybox sh ran configure-tools.sh, $(wc -l < "$lines") lines as expected"
+          else
+            echo "::error::configure-tools.sh's lines differ from those expected:"
+            diff "$expected" "$lines"
             exit 1
           fi
 

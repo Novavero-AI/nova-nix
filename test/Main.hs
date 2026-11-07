@@ -12201,6 +12201,134 @@ testGnumakeWindows = do
       ["make-" <> version <> ".tar.gz", "pattern-rule.mk", "greeting.in"]
         ++ concat [[name, name <> "-builder"] | name <- ["gnumake-" <> version, "gnumake-get-version", "gnumake-pattern-rule"]]
 
+-- | @pkgs/windows@'s busybox-w32, read back as the build driver reads it:
+-- what busybox-w32 and @test\/data\/busybox.nix@'s checks add to the
+-- closure of tinycc-native, which compiles it.  The rung is full-source
+-- only if the leaves it adds are busybox-w32's release archive and the
+-- mingw-w64-crt sources it links, and it reads no input source but what
+-- evaluation writes as text and the package's own compatibility headers
+-- and generators.  Its script runs tinycc-native, so it names the headers
+-- that compiler reads in @C_INCLUDE_PATH@, and no C string literal it
+-- passes names a store path.  replace writes a file unchanged when its
+-- match is missing, so every file an edit writes has a sum the script
+-- checks after the last edit.
+testBusyboxWindows :: IO [Bool]
+testBusyboxWindows = do
+  putStrLn "pkgs/busybox-w32"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "busybox.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          tinyccGraph <- sessionClosure (mapMaybe (`Map.lookup` rootOf) tinyccRoots)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, tinyccGraph, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, tinyccGraph, full) -> do
+      let added = Map.elems (Map.difference full tinyccGraph)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          builtBy attr = Map.lookup attr rootOf >>= (`Map.lookup` full)
+          inputsOf drv = mapMaybe ((`Map.lookup` full) . storePathToText defaultStoreDir) (Map.keys (drvInputDrvs drv))
+          scriptOf drv = listToMaybe [variableOf "text" input | input <- inputsOf drv, nameOf input == nameOf drv <> "-builder"]
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          runsTcc script = "/bin/tcc.exe " `T.isInfixOf` script
+          -- The text between each pair of kaem's escaped quotes, which a
+          -- -D hands tcc as a C string literal.
+          cStrings script = [text | (i, text) <- zip [0 :: Int ..] (T.splitOn "\\\"" script), odd i]
+          strings = concatMap cStrings (mapMaybe scriptOf added)
+          busyboxScript = fromMaybe "" (builtBy "pkgs.busybox-w32" >>= scriptOf)
+          edited = Set.fromList [TE.encodeUtf8 file | line <- T.lines busyboxScript, "replace" : "--file" : file : _ <- [T.words line]]
+          -- The sums reach the build through its script, whose writeText
+          -- derivation reads them as an input source.
+          sumsPath = listToMaybe [path | drv <- added, path <- drvInputSrcs drv, spName path == "busybox-w32-edits.sha256"]
+          numbered = zip [0 :: Int ..] (T.lines busyboxScript)
+          checkedAfterEdits = case [i | (i, line) <- numbered, "sha256sum --check " `T.isPrefixOf` line] of
+            [check] -> all (< check) [i | (i, line) <- numbered, "replace " `T.isPrefixOf` line]
+            _ -> False
+      sums <- traverse (BS.readFile . storePathToFilePath storeDir) sumsPath
+      let summed = Set.fromList [file | bytes <- maybeToList sums, line <- BS8.lines bytes, [_, file] <- [BS8.words line]]
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetches is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the leaves it adds are busybox-w32's archive and the mingw-w64-crt sources, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              (sort (("busybox-w32-" <> version <> ".tgz") : crtSources), True)
+              (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text and the package's own sources" $
+            assertEqual
+              "input sources not written as text"
+              ["compat", "gen_build_files.c", "usage_compressed.c"]
+              (sort [spName path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]),
+          runTest "busybox-w32's script runs tinycc-native with the headers its library script names" $
+            assertEqual
+              "derivations that run tcc, and their C_INCLUDE_PATH"
+              [("busybox-w32-" <> version, variableOf "C_INCLUDE_PATH" <$> builtBy "pkgs.tinycc-native.libs")]
+              [(nameOf drv, Just (variableOf "C_INCLUDE_PATH" drv)) | drv <- added, Just text <- [scriptOf drv], runsTcc text],
+          -- One per busybox-w32 source, the empty MINGW_VER Makefile.flags
+          -- defines.
+          runTest "no C string literal busybox-w32's script passes names a store path" $
+            assertEqual
+              "string literals, and those that name a store path"
+              (sourceCount, [])
+              (length strings, filter ("${NIX_STORE}" `T.isInfixOf`) strings),
+          runTest "every file busybox-w32's edits write is checked against its sum, once they are all made" $
+            assertEqual
+              "files edited, and files summed, and the one check after the last edit"
+              (edited, True, True)
+              (summed, not (Set.null edited), checkedAfterEdits)
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the busybox-w32 derivations instantiate, adding thirteen to tinycc-native's"
+    version :: Text
+    version = "FRP-6354-g5f09fb446"
+    sourceCount :: Int
+    sourceCount = 336
+    crtSources :: [Text]
+    crtSources = ["getopt.c", "mempcpy.c", "mingw_usleep.c", "strtok_r.c", "msvcr80plus_ftruncate64.c"]
+    tinyccRoots :: [Text]
+    tinyccRoots = ["pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs"]
+    roots :: [Text]
+    roots = tinyccRoots ++ ["pkgs.busybox-w32", "checks.version", "checks.configure-tools"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      ("busybox-w32-" <> version <> ".tgz")
+        : "configure-tools.sh"
+        : crtSources
+        ++ concat [[name, name <> "-builder"] | name <- ["busybox-w32-" <> version, "busybox-w32-get-version", "busybox-w32-configure-tools"]]
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -18640,6 +18768,7 @@ runSuite = do
           testMesWindows,
           testTinyccWindows,
           testGnumakeWindows,
+          testBusyboxWindows,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,
