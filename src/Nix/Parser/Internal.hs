@@ -150,7 +150,7 @@ tryParserKeepError (Parser p) = Parser $ \st -> case p st of
 -- backtracking parser comes to that.  End-of-input errors carry
 -- position (0,0) by construction and rank past every positioned
 -- error: end of input is the furthest a branch can get.  Ties keep
--- the second error, matching the old fallback order.
+-- the second error.
 deeperError :: ParseError -> ParseError -> ParseError
 deeperError a b
   | rank a > rank b = a

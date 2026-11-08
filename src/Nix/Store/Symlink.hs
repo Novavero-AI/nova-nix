@@ -56,8 +56,8 @@ classifyWalkNode path = do
 -- kind: the target is resolved relative to the link's directory (an
 -- absolute target resolves to itself) and probed once.  A creation
 -- failure is loud rather than approximated: writing the target text as a
--- regular file once registered a tree whose NAR hash differed from the
--- signed narinfo's, silent store corruption that a later push refused to
+-- regular file would register a tree whose NAR hash differs from the
+-- signed narinfo's, silent store corruption that a later push refuses to
 -- publish.  A name already taken is refused in upstream's words, as a
 -- folded sibling or a raced root meets it.
 -- The parent directory is not created here; a caller that wants that

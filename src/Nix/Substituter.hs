@@ -829,7 +829,7 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
           -- DISK, not merely in the streamed bytes: any divergence the
           -- filesystem introduced between the NAR and the materialized
           -- tree must surface here, before the row exists.  The recheck
-          -- streams too, so its memory no longer scales with the path.
+          -- streams too, so its memory does not scale with the path.
           -- Through 'ExecBit', not nova-cache's walk directly: on Windows
           -- the sink writes the exec bit to a stream that walk cannot see,
           -- and a verifier reading the flag back out of the file extension

@@ -182,7 +182,7 @@ assertLeft _ (Left _) = Pass
 assertLeft label (Right val) = Fail (label <> ": expected error but got: " <> T.pack (show val))
 
 -- | What a test expression's relative path literals resolve against.
--- Absolute, because that is the invariant the parser now establishes: no
+-- Absolute, because that is the invariant the parser establishes: no
 -- relative path literal survives parsing, so nothing downstream has to know
 -- what one would have meant.
 testBaseDir :: FilePath
@@ -1531,7 +1531,7 @@ testEvalBuiltins = do
       runTest "interpolated newline leaves the next chunk mid-line" $
         assertEval "ind-interp-nl" "''\n  ${\"\\n\"}  b''" (mkStr "\n  b"),
       -- The minimum starts at a sentinel, so a string with no measured
-      -- line loses every leading space (#220).
+      -- line loses every leading space.
       runTest "blank line then a spaces-only line strips to the newline" $
         assertEval "ind-blank-spaces" "''\n\n        ''" (mkStr "\n"),
       runTest "spaces-only line strips to nothing" $
@@ -2454,8 +2454,8 @@ testParserErrors = do
         assertLeft "unexpected" (parseNix testBaseDir testOrigin ")"),
       -- A failure deep in a lambda body is reported where it happened:
       -- a parsed lambda header commits, instead of backtracking into
-      -- the attr-set reading and reporting its early stumble (a real
-      -- error at line 410 of a nixpkgs file used to surface at line 2).
+      -- the attr-set reading and reporting its early stumble (which would
+      -- put a real error at line 410 of a nixpkgs file at line 2).
       runTest "deep formals-lambda body error reports its own line" $
         assertRight "deep body" (syntaxErrorOf "{ a, b }:\n{\n  x = 1;\n  y = (;\n}") $ \err ->
           assertEqual "error line" 4 (peLine err),
@@ -3374,7 +3374,7 @@ testPathArgumentsIO = do
   pure results
 
 -- | The lines of context a failure gathers on its way out of
--- derivationStrict, and how the CLI reports them (#221).  Only the IO
+-- derivationStrict, and how the CLI reports them.  Only the IO
 -- evaluator keeps them.
 testDerivationTraceIO :: IO [Bool]
 testDerivationTraceIO = do
@@ -7073,9 +7073,9 @@ testSubstituter = do
     -- filesystems.  Entries in NAR name order.
     -- Both survive a round trip through disk on every platform.  The
     -- executable bit does on Windows because the store keeps it in an
-    -- alternate data stream (#35); the nested symlink target does because
+    -- alternate data stream; the nested symlink target does because
     -- nova-cache 0.11.1.1 normalises a Windows reparse point's separators
-    -- back to the POSIX spelling at the NAR boundary (#112).
+    -- back to the POSIX spelling at the NAR boundary.
     streamTestLinkTarget = "bin/tool"
     streamTestNar =
       NAR.serialise
@@ -7880,7 +7880,7 @@ testCaseSensitiveVolumeBody base = do
         -- Nothing on a volume that keeps names apart is ever hacked, so
         -- a name carrying the suffix is a name like any other: both
         -- pipelines accept it, and their on-disk rechecks read it back
-        -- as spelled (#236).
+        -- as spelled.
         runTestM "a name carrying the case-hack suffix substitutes verbatim, strict" $ do
           let sp = StorePath (T.replicate 32 "e") "suffix-strict"
           result <- Subst.unpackAndVerify store sp (narInfoOf suffixNar sp) suffixNar
@@ -7937,7 +7937,7 @@ testCaseSensitiveVolumeBody base = do
         -- A source tree copied off this volume into one that folds the
         -- sharp-s pair: the two names are distinct here and one name
         -- there, so the copy refuses the second at the write rather
-        -- than landing it on the first (#234).
+        -- than landing it on the first.
         runTestM "a copy into a volume that folds a pair refuses the later name" $ do
           probed <- tempFoldsSharpS
           case probed of
@@ -7969,7 +7969,7 @@ testCaseSensitiveVolumeBody base = do
         -- A source holding a case-only pair, built against a store
         -- whose volume folds: evaluation names the two-file tree, and
         -- the store holds it as upstream's restore does, the later
-        -- name case-hacked, registered under that address (#235).
+        -- name case-hacked, registered under that address.
         runTestM "a coerced source's case-only pair is stored case-hacked on a folding store" $
           caseOnlyPairBuild base canonPathValue,
         runTestM "builtins.path stores a case-only pair case-hacked on a folding store" $
@@ -8064,7 +8064,7 @@ quotedAsCxx path = "\"" <> T.replace "\"" "\\\"" (T.replace "\\" "\\\\" (T.pack 
 
 -- | U+1E9E (capital sharp s) and U+00DF (small sharp s): a pair APFS
 -- folds to one name and 'onDiskNameKey' keeps apart, since 'toUpper'
--- leaves U+00DF as it is (#234).  Escaped, as the source is ASCII.
+-- leaves U+00DF as it is.  Escaped, as the source is ASCII.
 sharpSUpper, sharpSLower :: Text
 sharpSUpper = "STRA\x1E9E\&E"
 sharpSLower = "stra\xDF\&e"
@@ -8098,9 +8098,9 @@ tempFoldsSharpS = do
           then Right tmpBase
           else Left "the temp directory's volume folds case but keeps U+1E9E and U+00DF apart"
 
--- | A sibling pair the volume folds but 'onDiskNameKey' keeps apart
--- (#234).  The exclusive create refuses the later entry at the write,
--- in upstream's wording and naming it, through both unpack paths, and
+-- | A sibling pair the volume folds but 'onDiskNameKey' keeps apart.
+-- The exclusive create refuses the later entry at the write, in
+-- upstream's wording and naming it, through both unpack paths, and
 -- the earlier entry keeps its own content: nothing lands on it, and
 -- two directories do not merge.  A link needed no new exclusivity
 -- (link creation never replaces a name); its refusal is pinned
@@ -8206,9 +8206,9 @@ testStoreDB = do
           closeStoreDB db
           pure (assertEqual "registered" True result),
         -- A peer's held write transaction must be waited out, not died
-        -- on: SQLite's default busy timeout is zero, and registration
-        -- used to crash with an uncaught ErrorBusy SQLError while a
-        -- second process was mid-commit.  Upstream waits
+        -- on: SQLite's default busy timeout is zero, so registration
+        -- would crash with an uncaught ErrorBusy SQLError while a
+        -- second process is mid-commit.  Upstream waits
         -- (sqlite3_busy_timeout, one hour); this pins that we do too.
         runTestM "db registration waits out a busy peer" $ do
           db <- openStoreDB storeDir
@@ -8513,7 +8513,7 @@ testPushPure = do
           ("nar/" <> stripHashPrefix (CHash.formatNixHash (CHash.hashBytes (paBytes artifactZstd))) <> ".nar.zst")
           (NarInfo.niUrl niZstd),
       -- mkNarInfo cannot be handed NAR fields that disagree with the
-      -- artifact: they now come from the artifact itself.
+      -- artifact: they come from the artifact itself.
       runTest "narinfo NAR fields come from the artifact" $
         assertEqual
           "NAR fields"
@@ -8578,7 +8578,7 @@ testPushPure = do
             | "DB recorded" `T.isInfixOf` err -> Pass
             | otherwise -> Fail ("wrong error: " <> err)
           Right () -> Fail "hash mismatch must not be publishable",
-      -- narHashMatches decodes both spellings before comparing.  Today
+      -- narHashMatches decodes both spellings before comparing.
       -- parseNixHash reads only the sha256:nix-base32 spelling, so a
       -- base16-recorded digest (both literals spell the empty-string
       -- sha256) falls back to text equality and refuses - the safe
@@ -9174,7 +9174,7 @@ testUnpackBuildIO = do
       let storeDir = stDir store
       -- Archives live in the temp store under store-path names: the srcs
       -- env is store paths by contract, and runBuiltinUnpack insists on
-      -- that now (#101) - each entry is parsed and rendered through the
+      -- that - each entry is parsed and rendered through the
       -- build's store dir, which for these builds is the temp store.
       let archiveFile name = storePathToFilePath storeDir (StorePath (T.replicate 32 "0") name)
           archiveTools = archiveFile "pkg-tools.tar.zst"
@@ -9965,7 +9965,7 @@ testUpstreamConformance = do
       -- xml-writer.cc at 2.24.9): every element two spaces deeper than the
       -- one around it, a newline in a value written as a character
       -- reference.  Each expected document is nix-instantiate 2.24.9's and
-      -- 2.33.2's (#221).
+      -- 2.33.2's.
       runTest "toXML indents each element under the one around it" $
         assertEval
           "xml-nesting"
@@ -10665,9 +10665,9 @@ sampleFetchCache =
 
 -- | Which derivations this machine will spawn, and how.
 --
--- The distinction that matters is between the two answers that used to be
--- one: a derivation for this platform needs no launcher, and a derivation
--- for another platform with no launcher configured is not the same thing.
+-- The distinction that matters is between two answers: a derivation for
+-- this platform needs no launcher, and a derivation for another platform
+-- with no launcher configured is not the same thing.
 testExecWrapper :: IO [Bool]
 testExecWrapper = do
   putStrLn "builder/exec-wrapper"
@@ -12685,10 +12685,9 @@ testFetchGitShallow = do
   forceRemoveIfExists cacheHome
   pure results
 
--- | The fetchGit completeness remainder (#77): unsupported attributes
--- refuse, a declared narHash pins the tree on hit and fresh paths
--- alike, allRefs widens the fetch, and a failing fetch leaves no
--- scratch clone behind.
+-- | fetchGit's attributes: unsupported attributes refuse, a declared
+-- narHash pins the tree on hit and fresh paths alike, allRefs widens the
+-- fetch, and a failing fetch leaves no scratch clone behind.
 testFetchGitPins :: IO [Bool]
 testFetchGitPins = do
   tmpBase <- getTemporaryDirectory
@@ -12768,7 +12767,7 @@ testFetchGitPins = do
   forceRemoveIfExists cacheHome
   pure results
 
--- | String interpolation inside path literals (#178), the construct
+-- | String interpolation inside path literals, the construct
 -- nixpkgs uses 89 times on modern trees.  Every rule here is pinned to
 -- nix-instantiate 2.33.2's observed behavior: the result is a path,
 -- pieces concatenate with no separator and canonicalize textually, a
@@ -12862,12 +12861,11 @@ testPathInterp = do
 
 -- | A path reached through an attrset's @outPath@ (or a @__toString@
 -- result) coerces exactly as the same path written directly: copied to
--- the store, with the store path in the string context.  The broken
--- shape rendered the raw filesystem path with no copy and no context,
--- so @src = builtins.fetchGit { ... }@ produced empty inputSrcs and a
--- drvPath diverging from upstream, while the @.outPath@ spelling
--- worked.  Verified against nix-instantiate 2.33.2: the attrset form's
--- drvPath now matches upstream byte for byte.
+-- the store, with the store path in the string context.  Rendering the
+-- raw filesystem path, with no copy and no context, would give
+-- @src = builtins.fetchGit { ... }@ empty inputSrcs and a drvPath
+-- diverging from upstream.  Verified against nix-instantiate 2.33.2:
+-- the attrset form's drvPath matches upstream byte for byte.
 testOutPathCoercion :: IO [Bool]
 testOutPathCoercion = do
   tmpBase <- getTemporaryDirectory
@@ -13234,7 +13232,7 @@ testStoreDelete = do
               | otherwise -> Fail ("wrong outcome after release: " <> T.pack (show removed))
             (Nothing, other) ->
               Fail ("delete never completed after release: " <> T.pack (show other)),
-        -- The eval-side materializer joins the same protocol (#21): its
+        -- The eval-side materializer joins the same protocol: its
         -- check-then-act must wait while another handle holds the
         -- path's lock - unlocked, the loser's removePathForcibly could
         -- delete the tree the winner had just registered - and proceed
@@ -13709,7 +13707,7 @@ testStoreOps = do
         -- restores it.  A source edited in between no longer reproduces
         -- the address evaluation gave it, so it is refused and nothing
         -- is left at the path, rather than its new bytes being sealed
-        -- and registered under the old address (#235).
+        -- and registered under the old address.
         runTestM "materializeEvalSources refuses a source changed since evaluation" $ do
           tmpBase <- getTemporaryDirectory
           let srcDir = tmpBase </> "nova-nix-test-changed-src"
@@ -14218,7 +14216,7 @@ complexTestDrv =
       drvInputDrvs =
         Map.fromList
           -- Hash fixtures stay inside the nix-base32 alphabet (no e o u t):
-          -- fromATerm parses these through parseStorePath, which now
+          -- fromATerm parses these through parseStorePath, which
           -- charset-checks the hash component.
           [ (StorePath "cccccccccccccccccccccccccccccccc" "dep1.drv", ["out"]),
             (StorePath "ffffffffffffffffffffffffffffffff" "dep2.drv", ["lib", "out"])
@@ -15018,7 +15016,7 @@ testBuilder = do
             | registered -> Pass
             | otherwise -> Fail "built but not registered valid"
           BuildFailure msg code -> Fail ("expected success (" <> T.pack (show code) <> "): " <> msg),
-      -- The impureEnvVars carve-out (#185): a fixed-output derivation's
+      -- The impureEnvVars carve-out: a fixed-output derivation's
       -- listed ambient variables reach the scrubbed build, an absent
       -- listed name arrives as the EMPTY STRING (present, not omitted,
       -- upstream's value_or("")), and everything else stays scrubbed.
@@ -15301,11 +15299,11 @@ testE2E = do
           [] -> Pass
           errs -> Fail (T.intercalate "; " errs),
       -- POSIX holds names Windows reserves, and upstream stores them as
-      -- their bytes there (#84).  A coerced source and a fetchTarball
+      -- their bytes there.  A coerced source and a fetchTarball
       -- tree holding a device stem, a colon and a trailing dot restore
       -- with exactly those names, under the paths upstream computes
       -- for them ('reservedNameSourcePath'), as the raw copy they
-      -- replace stored them (#235).
+      -- replace stored them.
       runTestM "e2e sources holding names Windows reserves restore with their names" $
         if SI.os == "mingw32"
           then Pass <$ putStrLn "  SKIP  a Windows volume cannot hold these names"
@@ -15369,7 +15367,7 @@ testE2E = do
             pure verdict,
       -- The writer half of the eval-write pair: an interrupted earlier
       -- run's truncated file at a toFile path must be rewritten, not
-      -- adopted on bare existence (adopting it used to register such a file
+      -- adopted on bare existence (adopting it would register such a file
       -- valid under the full content's hash, seal it read-only, and let a
       -- build consume it).
       runTestM "a truncated pre-existing toFile write is rewritten, not adopted" $ do
@@ -15453,8 +15451,8 @@ testE2E = do
             forceRemoveIfExists tmpStore
             forceRemoveIfExists srcDir
             pure outcome,
-      -- The build path joins the per-path lock protocol (#119, #121) that
-      -- delete, materialize and register already used.  Lock files persist
+      -- The build path joins the per-path lock protocol that delete,
+      -- materialize and register use.  Lock files persist
       -- by design, so the one guarding the output is the observable
       -- evidence the build took it; without it two concurrent builds share
       -- a build directory and interleave into one tree.
@@ -16088,7 +16086,7 @@ testToJSONPathIO = do
 -- 'testArenaGuard'.  The child reaches the C layer with no 'arenaInit',
 -- which the suite cannot do in its own process: 'main' brackets every
 -- group, and a destroy-then-reinit cycle would invalidate the arena
--- pointers that process-lifetime CAFs already hold (#19).
+-- pointers that process-lifetime CAFs already hold.
 arenaGuardChildFlag :: String
 arenaGuardChildFlag = "--arena-guard-child"
 
@@ -16147,7 +16145,7 @@ arenaGuardPaths =
   ]
   where
     noArena name site = ArenaGuardPath name ("no arena: " <> T.pack name <> " raises ArenaNotInitialized at " <> site) (RefusedAt site)
-    -- The program from #206, forced to its result.
+    -- A small program forced to its result; its first C call compiles it.
     evalIssueProgram = case parseNix "/tmp" (SourceText "<expr>") "let x = 5; in x * 2 + 1" of
       Left err -> throwIO (ErrorCall (show err))
       Right expr -> void (evaluate (runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)))
@@ -16304,8 +16302,8 @@ internOversizedSymbol =
     symbolInternBytes oversized
 
 -- | Reaching the C layer outside the 'arenaInit' .. 'arenaDestroy'
--- window raises 'ArenaNotInitialized' naming the entry point, where
--- #206 reported a SIGSEGV.  Each such path runs in a child process.
+-- window raises 'ArenaNotInitialized' naming the entry point, rather
+-- than a SIGSEGV.  Each such path runs in a child process.
 -- The live side of the same check runs in this process, under the
 -- suite's bracket: a refusal with the arena up is 'CAllocationFailed'.
 testArenaGuard :: IO [Bool]
@@ -16332,7 +16330,7 @@ testArenaGuard = do
       [ liveRefusal "a slot array past UINT32_MAX bytes" "nn_env_alloc_slots" (void (evaluate (allocCSlots slotCountPastUInt32))),
         -- The list's items come from the same slot allocator, so the same
         -- count is refused there and must surface as a list failure, where
-        -- the NULL it used to return read as the empty list.
+        -- a NULL return would read as the empty list.
         liveRefusal "a list past UINT32_MAX slot bytes" "nn_list_new" (void (clistNew (fromIntegral slotCountPastUInt32))),
         -- A length the entry's uint32_t cannot hold, refused rather than
         -- truncated to alias a shorter string.
@@ -16769,7 +16767,7 @@ testCThunk = do
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
--- Tests: upstream conformance follow-ups (#50)
+-- Tests: upstream conformance cases
 -- ---------------------------------------------------------------------------
 
 -- | Error kind for 'StubStoreEval', mirroring PureEval's split: only a
@@ -16892,9 +16890,8 @@ evalNixStubWith env source = case parseNix testBaseDir testOrigin (TE.encodeUtf8
   Left err -> Left (T.pack (show err))
   Right expr -> runStubStoreEvalWith env (eval (builtinEnv unrestrictedPolicy 0 []) expr)
 
--- | Upstream conformance follow-ups (#50): behaviors that landed
--- with #37 but had no direct test.  Pure cases here; filesystem-touching
--- cases in 'testClassIFollowupsIO'.
+-- | Upstream conformance cases with no direct test elsewhere.  Pure
+-- cases here; filesystem-touching cases in 'testClassIFollowupsIO'.
 testClassIFollowups :: IO [Bool]
 testClassIFollowups = do
   putStrLn "eval/class-i-followups"
@@ -16972,7 +16969,7 @@ testClassIFollowups = do
           other -> Fail ("expected two drvPaths, got: " <> T.pack (show other))
     ]
 
--- | Filesystem-touching conformance follow-ups (#50).
+-- | Filesystem-touching upstream conformance cases.
 testClassIFollowupsIO :: IO [Bool]
 testClassIFollowupsIO = do
   putStrLn "eval/class-i-followups-io"
@@ -17052,11 +17049,11 @@ testClassIFollowupsIO = do
       ]
 
 -- | Bytecode short_arg spill: op-level payload counts at or above the
--- 0xFFFF sentinel move to the first data word, so literals are no longer
+-- 0xFFFF sentinel move to the first data word, so literals are not
 -- capped at 65535 elements.  The two exact-boundary list cases pin the
 -- inline maximum (65534) and the first spilled count (65535); the rest
 -- drive each counted-op kind (list, attrs, let, string parts, attr path)
--- well past the old ceiling.
+-- well past the inline maximum.
 -- ---------------------------------------------------------------------------
 -- Bytecode shared across elements
 -- ---------------------------------------------------------------------------
@@ -17224,14 +17221,14 @@ testValueCountWidths = do
     ]
 
 -- ---------------------------------------------------------------------------
--- Tests: store-path name validation at write sinks (#39)
+-- Tests: store-path name validation at write sinks
 -- ---------------------------------------------------------------------------
 
--- | Name validation at write sinks (#39): the store-path name rules hold
+-- | Name validation at write sinks: the store-path name rules hold
 -- at path CONSTRUCTION, not only at parse.  Derivation names, output names, and
 -- fetchurl basenames reject exactly what the parse boundary rejects,
--- before any write path is built from them - and names the old ad hoc
--- sink checks over-rejected (an interior @..@) are valid again.
+-- before any write path is built from them - so a name with an interior
+-- @..@, which the parse boundary accepts, is valid at a sink too.
 testStoreNameSinks :: IO [Bool]
 testStoreNameSinks = do
   putStrLn "store/name-sinks"
@@ -17404,10 +17401,10 @@ testNarNameSafety = do
             checkLinkTarget WindowsNames "caf\xE9",
             checkLinkTarget WindowsNames "../a b/c:d"
           ],
-      -- The Windows rules check a name's bytes, where the check they
-      -- replace read it as text; on every name both could judge (UTF-8
-      -- without a character the old check let through and Windows
-      -- refuses at the create) they must agree.
+      -- The Windows rules check a name's bytes, where
+      -- 'legacyTextNameSafety' reads it as text; on every name both can
+      -- judge (UTF-8 without a character the text check lets through and
+      -- Windows refuses at the create) they must agree.
       runTestM "the Windows rules refuse what the text check they replace refused" $ do
         result <-
           QC.quickCheckWithResult QC.stdArgs {QC.chatty = False, QC.maxSuccess = 5000} $
@@ -17420,8 +17417,8 @@ testNarNameSafety = do
     keepFirstFail Pass acc = acc
     keepFirstFail failure _ = failure
 
--- | The text-form name check the Windows rules replaced, kept verbatim as
--- the oracle their byte-form port is tested against.
+-- | The text-form name check, verbatim, as the oracle the Windows rules'
+-- byte-form port is tested against.
 legacyTextNameSafety :: Text -> Bool
 legacyTextNameSafety name =
   not (T.null name)
@@ -18419,7 +18416,7 @@ testNixConfig = do
       runTest "an absolute include from NIX_CONFIG is expanded" $
         let files = fileMap [(etcNix </> "x.conf", "substituters = https://x")]
          in assertEqual "env-absolute" (Right ["https://x"]) (substitutersOf files [] (Just ("include " <> BS8.pack (etcNix </> "x.conf")))),
-      -- An include target is bytes from the line to the open (#244): the
+      -- An include target is bytes from the line to the open: the
       -- file its bytes name is read, never the one a lossy decode names.
       runTest "an include target with no UTF-8 reading opens the file its bytes name" $
         let target = latin1 <> ".conf"
@@ -18883,7 +18880,7 @@ testUndefinedVariablesIO = do
           (VInt 7),
         -- Evaluated where a self-reference is caught as infinite recursion
         -- rather than looping, which is what reading the inherited name
-        -- from the rec's own scope used to do.
+        -- from the rec's own scope would do.
         runTestIO
           "inherit in a dynamic-key rec reads the enclosing rec, not its own"
           testDir
@@ -18900,7 +18897,7 @@ testUndefinedVariablesIO = do
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
--- Tests: byte-indexed string semantics (issue #34)
+-- Tests: byte-indexed string semantics
 -- ---------------------------------------------------------------------------
 
 -- | The pinned byte-semantics suite: a Nix string is a byte string, so
@@ -19090,7 +19087,7 @@ main =
 -- | Give the run a temporary root of its own and point the process's
 -- temporary directory at it, so every fixture the suite derives from
 -- 'getTemporaryDirectory' (each under a fixed name) is this run's alone
--- and two suites running at once cannot delete each other's (#254).
+-- and two suites running at once cannot delete each other's.
 -- @TMPDIR@ is what POSIX reads, @TMP@ and @TEMP@ what Windows'
 -- @GetTempPath@ reads; a child process inherits them.  The root is named
 -- for this process, so no live run shares it, and one a crashed run left
@@ -19293,7 +19290,7 @@ runSuite = do
       exitSuccess
 
 -- ---------------------------------------------------------------------------
--- Tests: evaluation policy - restricted and pure modes (#75)
+-- Tests: evaluation policy - restricted and pure modes
 -- ---------------------------------------------------------------------------
 
 -- | A string naming a relative path is refused wherever a path is coerced
@@ -19850,7 +19847,7 @@ testResultPrinterCLI = do
                 ExitFailure _ -> Fail ("CLI: " <> T.pack (show code))
       ]
 
--- | nix.conf bytes through the binary (#244): an include target, the
+-- | nix.conf bytes through the binary: an include target, the
 -- system directory and NIX_CONFIG reach the file system and the settings
 -- as the bytes they hold.  Each case reads whether pure-eval came on,
 -- which hides currentSystem.  A name that is not UTF-8 exists only on a
@@ -19967,7 +19964,7 @@ testConfigBytesCLI = do
       ]
 
 -- ---------------------------------------------------------------------------
--- Tests: an interrupt stops the operation it reaches (#251)
+-- Tests: an interrupt stops the operation it reaches
 -- ---------------------------------------------------------------------------
 
 -- | How long 'interruptedAfterStall' lets an action run before
@@ -20003,9 +20000,9 @@ withStalledFifo path action =
   bracket_ (Proc.callProcess "mkfifo" [path]) (Dir.removePathForcibly path) $
     withBinaryFile path ReadWriteMode (const action)
 
--- | Each of these operations caught every exception and turned an
--- interrupt into its fallback value: an unreadable file, a cache miss, a
--- failed push.  An interrupt now stops it.  A file read is made to stall
+-- | Each of these operations has a fallback value for a failure (an
+-- unreadable file, a cache miss, a failed push), and an interrupt stops
+-- it rather than becoming that value.  A file read is made to stall
 -- on a FIFO ('withStalledFifo') and interrupted there from another
 -- thread, so those cases need POSIX; the request a push makes stalls on
 -- the loopback fixture on every platform.  A fetch cache write never

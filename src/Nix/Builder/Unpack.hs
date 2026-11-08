@@ -177,7 +177,7 @@ type DecodeError = Either Tar.FormatError Tar.DecodeLongNamesError
 -- root may live elsewhere - @C:\\nix\\store@ on Windows, where a bare
 -- \/-rooted path resolves against the current DRIVE - so each entry is
 -- parsed as a store path and rendered through the store dir rather than
--- opened verbatim (#101).  On Unix the rendering is the identity.
+-- opened verbatim.  On Unix the rendering is the identity.
 runBuiltinUnpack :: StoreDir -> UnpackLimits -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
 runBuiltinUnpack storeDir limits drv outputDirs =
   case (Map.lookup envSrcs (drvEnv drv), lookup unpackOutputName outputDirs) of

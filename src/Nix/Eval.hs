@@ -3236,7 +3236,7 @@ builtinGenericClosure other =
   throwEvalError ("builtins.genericClosure: expected a set, got " <> typeName other)
 
 -- | BFS loop for genericClosure.  Uses Data.Sequence for O(1) queue
--- append (the old list-based version was O(n) per operator call).
+-- append (a list would make each append O(n)).
 -- seenKeys is still a linear scan - Nix value equality is monadic so
 -- Set/HashMap is not directly applicable without specialising on key type.
 closureLoop ::
@@ -3399,8 +3399,8 @@ builtinStorePath val = do
 -- returns a STRING carrying an Opaque (SCPlain) context entry for the enclosing
 -- store path, NOT a bare path: the Opaque marker is what stops a later coercion
 -- from re-serialising (re-NARing) the already-present path into a new store
--- path.  Returning a context-free path (the old behavior) re-copied the path on
--- coercion - a wrong store path on Unix, and a file-not-found on Windows, where
+-- path.  A context-free path would be re-copied on coercion - a wrong
+-- store path on Unix, and a file-not-found on Windows, where
 -- the canonical @/nix/store@ text is not the on-disk location.
 --
 -- A path outside the store is upstream's @isInStore@ refusal; one inside

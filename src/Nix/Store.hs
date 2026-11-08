@@ -691,7 +691,7 @@ unpackTree sensitivity path entry = case entry of
 -- real trees carry (@Makefile@\/@makefile@) but not every pair the
 -- volume folds: APFS reads U+00DF and U+1E9E as one name while
 -- 'toUpper' leaves U+00DF unchanged, so that pair takes two keys and
--- the exclusive create refuses the second at the write (#234), as
+-- the exclusive create refuses the second at the write, as
 -- upstream's restore does.  The reverse miss (U+0131 uppercases to
 -- @I@, which APFS keeps distinct) only spells a name with a suffix it
 -- did not need.  A name that is not UTF-8 has no characters to fold

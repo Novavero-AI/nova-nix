@@ -111,7 +111,7 @@ serialiseOptions mode = NAR.defaultSerialiseOptions {NAR.soCaseHack = mode, NAR.
 -- file's permissions.  The walk is nova-cache's own -- name safety,
 -- case-hack folding and entry ordering are subtle and belong there --
 -- and the resolver hook (nova-cache 0.11.1) answers the flag during
--- the walk, replacing the post-hoc rewrite this module used to do.
+-- the walk, so the archive needs no rewrite after it.
 -- The case-hack mode is the reader's: a store path's volume decides
 -- it ('Nix.Store.CaseSensitive.volumeCaseHack'), and the process does
 -- for a source ('Nix.Store.CaseSensitive.processCaseHack').

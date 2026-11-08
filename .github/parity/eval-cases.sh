@@ -34,7 +34,7 @@ printf './data.txt\n' >"$fixture/sub/inner.nix"
 printf '{ p = ./data.txt; }\n' >"$fixture/sub/attrs.nix"
 printf 'p: p\n' >"$fixture/sub/id.nix"
 printf 'builtins.readFile q\n' >"$fixture/sub/readq.nix"
-# Indented strings whose whitespace upstream strips (#220).  Tabs and
+# Indented strings whose whitespace upstream strips.  Tabs and
 # newlines are printf escapes so each fixture's exact bytes are visible.
 printf "''\n\n        ''\n" >"$fixture/ind-blank-then-spaces.nix"
 printf "''\n   ''\n" >"$fixture/ind-spaces-only.nix"

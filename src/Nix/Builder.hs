@@ -326,12 +326,12 @@ buildDerivationInner config store drv drvPath =
 -- whether the derivation was already finished by the time they were
 -- granted.
 --
--- #119 and #121 made delete, materialize and register one critical
--- section under @\<store-path\>.lock@.  The build path never joined it,
--- so two concurrent builds of one derivation shared a build directory
--- ('computeBuildDir' is deterministic), interleaved their writes into a
--- single tree, and each registered it as valid.  Nothing failed; the
--- registered output was simply not what either build produced.
+-- Delete, materialize and register are one critical section under
+-- @\<store-path\>.lock@, and the build path joins it.  Without it, two
+-- concurrent builds of one derivation would share a build directory
+-- ('computeBuildDir' is deterministic), interleave their writes into a
+-- single tree, and each register it as valid.  Nothing would fail; the
+-- registered output would simply not be what either build produced.
 --
 -- Outputs are locked in 'lockOrder', so two processes racing the same
 -- multi-output derivation request them in the same sequence and neither

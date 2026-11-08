@@ -40,7 +40,7 @@ python-requests  pkgs.python3Packages.requests
 
 # Structured attributes: one __json object in place of a variable per
 # attribute, with the four outputs it names.  qtbase and neovim reach it
-# below themselves, through postgresql and the lua modules (#221).
+# below themselves, through postgresql and the lua modules.
 libxo            pkgs.libxo
 qtbase           pkgs.qt6.qtbase
 neovim           pkgs.neovim

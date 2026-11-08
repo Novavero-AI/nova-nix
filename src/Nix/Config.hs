@@ -547,7 +547,7 @@ unitBase = 1024
 -- prefix (append rather than replace, list settings only).  A name
 -- outside the known set is ignored, not an error: upstream warns and
 -- continues, and refusing every unknown key would reject a config that
--- also carries settings this layer does not model yet.  A value that does
+-- also carries settings this layer does not model.  A value that does
 -- not parse for its setting is an error, as upstream's @UsageError@ is:
 -- @pure-eval = ture@ must not pass for off.
 applyAssignment :: NixConfig -> ConfigAssignment -> Either Text NixConfig

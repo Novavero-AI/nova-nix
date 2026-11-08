@@ -110,8 +110,8 @@ tryNamedSetLambdaHeader = do
 -- Same commitment rule as 'parseLambdaOrIdent': @... } :@ and
 -- @... } \@ name :@ never follow an attr set, so a parsed lambda
 -- header commits, and a body failure is reported from its own
--- position (a real error at line 410 of a formals-lambda file used to
--- surface as an attr-set complaint at line 2).  When both readings
+-- position (so a real error at line 410 of a formals-lambda file is not
+-- reported as an attr-set complaint at line 2).  When both readings
 -- fail, the deeper failure wins, so a malformed formal beats the
 -- attr-set branch's earlier stumble over the first comma.
 parseLambdaOrAttrSet :: Parser Expr

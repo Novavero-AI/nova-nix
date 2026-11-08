@@ -1098,7 +1098,7 @@ unmarshalStringContext ptr = do
   count <- cctxstrCtxCount ptr
   let textVal = symbolBytes (Symbol textSym)
   -- count - 1 underflows Word32 at 0 (defensive: marshal sites store
-  -- only non-empty contexts today).
+  -- only non-empty contexts).
   elems <-
     if count == 0
       then pure []

@@ -685,9 +685,9 @@ instance MonadEval EvalIO where
     let storePath = canonicalStorePathText sp
     wrapIO $ do
       Dir.createDirectoryIfMissing True (takeDirectory filePath)
-      -- Same verified adoption as the other writers: this one used to
-      -- write unconditionally, which both adopted nothing (fine) and
-      -- crashed on a sealed leftover (the write hits read-only).
+      -- Same verified adoption as the other writers: an unconditional
+      -- write would crash on a sealed leftover (the write hits
+      -- read-only).
       existing <- readBytesIfPresent filePath
       unless (existing == Just bytes) $ do
         Dir.removePathForcibly filePath

@@ -115,7 +115,7 @@ currentPlatform = case (SI.arch, SI.os) of
 -- @extra-platforms@ lists them: an x86_64 Linux kernel runs i686 binaries,
 -- so upstream adds @i686-linux@ on @x86_64-linux@ (outside WSL1, which
 -- cannot), and 64-bit Windows runs i686 binaries through WoW64, the same
--- rule for the platform upstream has no entry for yet.  Upstream also adds
+-- rule for the platform upstream has no entry for.  Upstream also adds
 -- @x86_64-darwin@ on @aarch64-darwin@ when Rosetta is installed; that is a
 -- filesystem probe, not a property of the platform, and is not modelled
 -- here, so such a build needs a launcher named on the command line.

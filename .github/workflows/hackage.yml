@@ -62,10 +62,10 @@ jobs:
             exit 1
           fi
 
-      # The coupling publish.yml used to get from `needs: [package]`, restated
-      # here because this workflow runs on its own: the reversible half of a
-      # release goes first, so a version whose binaries never built cannot be
-      # spent on Hackage.
+      # This workflow runs on its own, so it restates here the ordering a
+      # `needs: [package]` would give inside publish.yml: the reversible half
+      # of a release goes first, so a version whose binaries never built
+      # cannot be spent on Hackage.
       - name: Its release exists, with every asset attached
         env:
           GH_TOKEN: ${{ github.token }}

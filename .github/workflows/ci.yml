@@ -602,8 +602,8 @@ jobs:
       # builds through the real stdenv (genericBuild, setup.sh) rather than
       # driving cmd.exe directly - the smallest thing that exercises a real
       # mkDerivation package.  The workspace lives on D: while the store is
-      # anchored on C: - building from here is deliberate: it exercises the
-      # #101 fix (canonical /nix/store text rendered through the store dir).
+      # anchored on C: - building from here is deliberate: it exercises
+      # canonical /nix/store text rendered through the store dir.
       - name: Build hello.nix through the real stdenv
         shell: pwsh
         run: |
@@ -1878,7 +1878,7 @@ jobs:
   # A fresh store, the public cache as the only substituter, and the build
   # must come entirely from it: a single [build] line means the cache is
   # missing part of the current closure and the job turns red, instead of
-  # a silent local rebuild hiding the gap (#207).  Main pushes only, after
+  # a silent local rebuild hiding the gap.  Main pushes only, after
   # the publish job above has refreshed the cache from this same tree.
   # ---------------------------------------------------------------------------
   e2e-public-cache:
