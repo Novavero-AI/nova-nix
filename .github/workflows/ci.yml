@@ -114,7 +114,7 @@ jobs:
           version: "3.10"
       - uses: haskell-actions/hlint-run@v2
         with:
-          path: '["src/", "app/", "test/"]'
+          path: '["src/", "cli/", "app/", "test/"]'
           fail-on: warning
 
   ormolu:
