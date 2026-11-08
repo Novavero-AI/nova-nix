@@ -3,12 +3,10 @@
 -- | nova-nix CLI entry point: parse the argument vector, dispatch one
 -- command, map its outcome to an exit code.
 --
--- The command and flag tables are deliberately not repeated here.
--- 'usageLines' is the one place they live, and both @--help@ and the
--- usage-error path print it, so the flag that adds itself to the parser
--- documents itself in the same edit.  A copy here would go stale
--- unnoticed: Haddock builds library targets by default, and this module
--- is in the executable stanza, so nothing renders it.
+-- The commands and flags are documented in "Nix.Cli.Reference" and
+-- parsed by "Nix.Cli.Args", both in the package's @cli@ library, where
+-- the test suite reaches them; @--help@ and the usage-error path print the
+-- reference's 'helpLines'.
 module Main (main) where
 
 import Control.Exception (AsyncException (UserInterrupt), IOException, displayException, handle, handleJust, try)
@@ -26,6 +24,8 @@ import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
+import Nix.Cli.Args (BuildTarget (..), CliOpts (..), Command (..), PushArgs (..), parseArgs)
+import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, systemConfDirSource)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
@@ -40,9 +40,9 @@ import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
-import Nix.HostPath (hostPathFromBytes, hostPathText)
+import Nix.HostPath (hostPathFromBytes)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
-import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushCompressionValues, pushPaths, storePathBasename)
+import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Realise (Fallback (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
@@ -56,252 +56,12 @@ import qualified System.File.OsPath as OsFile
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError, isUserError)
-import qualified System.Info as SI
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
 
 -- ---------------------------------------------------------------------------
--- Argument parsing
+-- Where the data and the configuration are
 -- ---------------------------------------------------------------------------
-
--- | Parsed CLI options.
-data CliOpts = CliOpts
-  { optNixPaths :: ![T.Text],
-    optStrict :: !Bool,
-    optAterm :: !Bool,
-    -- | Store directory override (default: the platform store).
-    optStore :: !(Maybe FilePath),
-    -- | Binary cache URL to substitute from before building.
-    optSubstituter :: !(Maybe String),
-    -- | Trusted public key (@name:base64@) for the substituter.
-    optTrustedKey :: !(Maybe String),
-    -- | @SYSTEM=PATH@ launchers for derivations this machine cannot execute
-    -- directly, e.g. @x86_64-windows=/path/to/wine@.
-    optExecWrappers :: ![String],
-    -- | @--restrict-eval@: upstream's restrict-eval, turned on for this run.
-    optRestrictEval :: !Bool,
-    -- | @--pure-eval@: upstream's pure-eval, turned on for this run.
-    optPureEval :: !Bool,
-    -- | @--trace-verbose@: upstream's trace-verbose, turned on for this run.
-    optTraceVerbose :: !Bool,
-    -- | @--fallback@: upstream's fallback, turned on for this run.
-    optFallback :: !Bool,
-    optCommand :: !Command
-  }
-
-data Command
-  = CmdEvalFile !FilePath
-  | CmdEvalExpr !T.Text
-  | CmdBuild !BuildTarget !(Maybe T.Text) !(Maybe FilePath)
-  | CmdPush !PushArgs
-  | CmdStoreDelete ![String]
-  | -- | @store gc@: collect, or with the flag only list the roots.
-    CmdStoreGc !Bool
-  | -- | No command given.  Usage on stderr, non-zero: a bare invocation is
-    -- a usage error, and a caller testing the exit status must see one.
-    CmdUsage
-  | -- | @--help@.  The same text on stdout, zero: it is a request that
-    -- succeeded, and pipeable without redirecting stderr.
-    CmdHelp
-  | CmdVersion
-
--- | Where a build's expression comes from.
-data BuildTarget
-  = -- | A @.nix@ file.  Relative paths inside it resolve beside the file.
-    TargetFile !FilePath
-  | -- | An inline expression.  Relative paths inside it resolve against the
-    -- working directory, since there is no file to sit beside.
-    TargetExpr !T.Text
-
--- | Arguments to the build command, while the target is still unknown.
-data BuildArgs = BuildArgs
-  { baTarget :: !(Maybe BuildTarget),
-    baAttrPath :: !(Maybe T.Text),
-    -- | Where to create the result symlink, registered as a GC root.
-    baOutLink :: !(Maybe FilePath)
-  }
-
--- | Build arguments before any flag is parsed.
-emptyBuildArgs :: BuildArgs
-emptyBuildArgs = BuildArgs Nothing Nothing Nothing
-
--- | Arguments to the push command.
-data PushArgs = PushArgs
-  { paCacheUrl :: !(Maybe String),
-    paKeyFile :: !(Maybe FilePath),
-    paCompressionArg :: !(Maybe String),
-    paAll :: !Bool,
-    paPaths :: ![String]
-  }
-
--- | Push arguments before any flag is parsed.
-emptyPushArgs :: PushArgs
-emptyPushArgs = PushArgs Nothing Nothing Nothing False []
-
--- | Parse the command line.  A malformed invocation is an error, never a
--- silent drop: an unknown or typo'd flag once ended parsing and quietly
--- discarded everything after it (e.g. a requested @--substituter@).
-parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False False False CmdUsage)
-  where
-    go opts [] = Right opts
-    -- Answered before anything else is looked at, and the rest of the line
-    -- is not parsed: --version must report the build even when the command
-    -- after it is one this build does not have.
-    go opts ("--version" : _) = Right opts {optCommand = CmdVersion}
-    go opts ("--help" : _) = Right opts {optCommand = CmdHelp}
-    go opts ("--nix-path" : val : rest) =
-      go (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
-    go opts ("--strict" : rest) =
-      go (opts {optStrict = True}) rest
-    go opts ("--aterm" : rest) =
-      go (opts {optAterm = True}) rest
-    go opts ("--store" : dir : rest) =
-      go (opts {optStore = Just dir}) rest
-    go opts ("--substituter" : url : rest) =
-      go (opts {optSubstituter = Just url}) rest
-    go opts ("--trusted-key" : key : rest) =
-      go (opts {optTrustedKey = Just key}) rest
-    go opts ("--exec-wrapper" : spec : rest) =
-      go (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) rest
-    go opts ("--restrict-eval" : rest) =
-      go (opts {optRestrictEval = True}) rest
-    go opts ("--pure-eval" : rest) =
-      go (opts {optPureEval = True}) rest
-    go opts ("--trace-verbose" : rest) =
-      go (opts {optTraceVerbose = True}) rest
-    go opts ("--fallback" : rest) =
-      go (opts {optFallback = True}) rest
-    go opts ("eval" : rest) = goEval opts rest
-    go opts ("build" : rest) = goBuild opts emptyBuildArgs rest
-    go opts ("push" : rest) = goPush opts emptyPushArgs rest
-    go opts ("store" : rest) = goStore opts rest
-    go _ [flag]
-      | flag `elem` valueFlags = Left (flag ++ " requires a value")
-    go _ (arg : _) = Left ("unknown argument: " ++ arg ++ " (run nova-nix --help for usage)")
-    -- Sub-parser for eval: handles --strict and --expr interleaved with the file arg.
-    goEval opts [] = Right opts
-    goEval opts ("--strict" : rest) = goEval (opts {optStrict = True}) rest
-    goEval opts ("--aterm" : rest) = goEval (opts {optAterm = True}) rest
-    goEval opts ("--nix-path" : val : rest) =
-      goEval (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
-    -- Accepted here as well as at the top level, like build and push:
-    -- eval-side reads follow the selected store, so the flag means as
-    -- much after the subcommand as before it.
-    goEval opts ("--store" : dir : rest) =
-      goEval (opts {optStore = Just dir}) rest
-    goEval opts ("--restrict-eval" : rest) =
-      goEval (opts {optRestrictEval = True}) rest
-    goEval opts ("--pure-eval" : rest) =
-      goEval (opts {optPureEval = True}) rest
-    goEval opts ("--trace-verbose" : rest) =
-      goEval (opts {optTraceVerbose = True}) rest
-    goEval opts ("--fallback" : rest) =
-      goEval (opts {optFallback = True}) rest
-    goEval opts ("--expr" : expr : rest) =
-      go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
-    goEval _ [flag]
-      | flag `elem` valueFlags = Left (flag ++ " requires a value")
-    goEval _ (arg@('-' : _) : _) = Left ("unknown eval flag: " ++ arg)
-    goEval opts (path : rest) =
-      go (opts {optCommand = CmdEvalFile path}) rest
-    -- Sub-parser for build: the target, -A, and the shared flags in any
-    -- order.  The shared flags are handled here rather than deferred back to
-    -- 'go' so that one can follow the file argument, which is where a caller
-    -- reaches for it, and so that -A is still recognised after it.
-    goBuild opts buildArgs [] = finishBuild opts buildArgs
-    -- Answered here as well as at the top level: a sub-parser that rejected
-    -- them would make 'build --help' a usage error rather than a request.
-    goBuild opts _ ("--help" : _) = Right opts {optCommand = CmdHelp}
-    goBuild opts _ ("--version" : _) = Right opts {optCommand = CmdVersion}
-    goBuild opts buildArgs ("--store" : dir : rest) =
-      goBuild (opts {optStore = Just dir}) buildArgs rest
-    goBuild opts buildArgs ("--substituter" : url : rest) =
-      goBuild (opts {optSubstituter = Just url}) buildArgs rest
-    goBuild opts buildArgs ("--trusted-key" : key : rest) =
-      goBuild (opts {optTrustedKey = Just key}) buildArgs rest
-    goBuild opts buildArgs ("--nix-path" : val : rest) =
-      goBuild (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) buildArgs rest
-    goBuild opts buildArgs ("--exec-wrapper" : spec : rest) =
-      goBuild (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) buildArgs rest
-    goBuild opts buildArgs ("--restrict-eval" : rest) =
-      goBuild (opts {optRestrictEval = True}) buildArgs rest
-    goBuild opts buildArgs ("--pure-eval" : rest) =
-      goBuild (opts {optPureEval = True}) buildArgs rest
-    goBuild opts buildArgs ("--trace-verbose" : rest) =
-      goBuild (opts {optTraceVerbose = True}) buildArgs rest
-    goBuild opts buildArgs ("--fallback" : rest) =
-      goBuild (opts {optFallback = True}) buildArgs rest
-    goBuild opts buildArgs ("--expr" : expr : rest) =
-      withTarget opts buildArgs (TargetExpr (T.pack expr)) rest
-    goBuild opts buildArgs (flag : path : rest)
-      | flag `elem` attrFlags = case baAttrPath buildArgs of
-          Just _ -> Left "build accepts one attribute path"
-          Nothing -> goBuild opts (buildArgs {baAttrPath = Just (T.pack path)}) rest
-      | flag `elem` outLinkFlags = case baOutLink buildArgs of
-          Just _ -> Left "build accepts one --out-link"
-          Nothing -> goBuild opts (buildArgs {baOutLink = Just path}) rest
-    goBuild _ _ [flag]
-      | flag `elem` valueFlags = Left (flag ++ " requires a value")
-    goBuild _ _ (arg@('-' : _) : _) = Left ("unknown build flag: " ++ arg)
-    goBuild opts buildArgs (path : rest) =
-      withTarget opts buildArgs (TargetFile path) rest
-    -- A build evaluates one expression, so a second target is a mistake
-    -- worth naming rather than a silent last-one-wins.
-    withTarget opts buildArgs target rest = case baTarget buildArgs of
-      Just _ -> Left "build takes one FILE.nix or one --expr, not both"
-      Nothing -> goBuild opts (buildArgs {baTarget = Just target}) rest
-    finishBuild opts buildArgs = case baTarget buildArgs of
-      Nothing -> Left "build requires a FILE.nix argument or --expr EXPR"
-      Just target -> Right opts {optCommand = CmdBuild target (baAttrPath buildArgs) (baOutLink buildArgs)}
-    -- Sub-parser for push: flags and explicit store paths in any order.
-    goPush opts pushArgs [] = Right opts {optCommand = CmdPush pushArgs}
-    goPush opts pushArgs ("--store" : dir : rest) =
-      goPush (opts {optStore = Just dir}) pushArgs rest
-    goPush opts pushArgs ("--cache" : url : rest) =
-      goPush opts (pushArgs {paCacheUrl = Just url}) rest
-    goPush opts pushArgs ("--key-file" : path : rest) =
-      goPush opts (pushArgs {paKeyFile = Just path}) rest
-    goPush opts pushArgs ("--compression" : value : rest) =
-      goPush opts (pushArgs {paCompressionArg = Just value}) rest
-    goPush opts pushArgs ("--all" : rest) =
-      goPush opts (pushArgs {paAll = True}) rest
-    goPush _ _ [flag]
-      | flag `elem` valueFlags = Left (flag ++ " requires a value")
-    goPush _ _ (arg@('-' : _) : _) = Left ("unknown push flag: " ++ arg)
-    goPush opts pushArgs (path : rest) =
-      goPush opts (pushArgs {paPaths = paPaths pushArgs ++ [path]}) rest
-    -- Sub-parser for store maintenance verbs.
-    goStore _ [] = Left "store: expected a subcommand (delete, gc)"
-    goStore opts ("delete" : rest) = goStoreDelete opts [] rest
-    goStore opts ("gc" : rest) = goStoreGc opts False rest
-    goStore _ (sub : _) = Left ("unknown store subcommand: " ++ sub ++ " (expected: delete, gc)")
-    goStoreDelete opts paths []
-      | null paths = Left "store delete: name at least one store path"
-      | otherwise = Right opts {optCommand = CmdStoreDelete paths}
-    goStoreDelete opts paths ("--store" : dir : rest) =
-      goStoreDelete (opts {optStore = Just dir}) paths rest
-    goStoreDelete _ _ [flag]
-      | flag `elem` valueFlags = Left (flag ++ " requires a value")
-    goStoreDelete _ _ (arg@('-' : _) : _) = Left ("unknown store delete flag: " ++ arg)
-    goStoreDelete opts paths (path : rest) =
-      goStoreDelete opts (paths ++ [path]) rest
-    goStoreGc opts printRoots [] = Right opts {optCommand = CmdStoreGc printRoots}
-    goStoreGc opts printRoots ("--store" : dir : rest) =
-      goStoreGc (opts {optStore = Just dir}) printRoots rest
-    goStoreGc opts _ ("--print-roots" : rest) = goStoreGc opts True rest
-    goStoreGc _ _ [flag]
-      | flag `elem` valueFlags = Left (flag ++ " requires a value")
-    goStoreGc _ _ (arg : _) = Left ("unknown store gc argument: " ++ arg)
-    -- Flags that consume the following argument as their value.
-    valueFlags =
-      ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--compression"]
-        ++ attrFlags
-        ++ outLinkFlags
-    -- Attribute selection, under both of upstream's spellings.
-    attrFlags = ["-A", "--attr"]
-    -- The result link, under both of nix-build's spellings.
-    outLinkFlags = ["-o", "--out-link"]
 
 -- | Upstream C++ Nix's name for this directory, so an operator who knows
 -- one knows the other.
@@ -324,16 +84,6 @@ nixUserConfFilesVar = "NIX_USER_CONF_FILES"
 -- | The XDG config dirs, searched for @nix\/nix.conf@ after the config home.
 xdgConfigDirsVar :: BS.ByteString
 xdgConfigDirsVar = "XDG_CONFIG_DIRS"
-
--- | Windows' all-users application data directory, the machine-wide
--- config directory there.
-programDataVar :: BS.ByteString
-programDataVar = "ProgramData"
-
--- | Upstream's @sysconfdir@ on Unix, which libstore's meson.build forces
--- absolute, so @\/etc\/nix@ is the compiled-in system directory.
-posixSysconfDir :: FilePath
-posixSysconfDir = "/etc"
 
 -- | The XDG base directory spec's default for @XDG_CONFIG_DIRS@, the
 -- literal upstream's @getConfigDirs@ falls back to.
@@ -417,8 +167,8 @@ main = do
     CmdPush pushArgs -> pushCommand storeDir pushArgs
     CmdStoreDelete paths -> storeDeleteCommand storeDir paths
     CmdStoreGc printRoots -> storeGcCommand storeDir printRoots
-    CmdUsage -> mapM_ (hPutStrLn stderr) usageLines >> exitFailure
-    CmdHelp -> mapM_ putStrLn usageLines
+    CmdUsage -> mapM_ (TIO.hPutStrLn stderr) helpLines >> exitFailure
+    CmdHelp -> mapM_ TIO.putStrLn helpLines
     CmdVersion -> putStrLn versionLine
 
 -- | 'UserInterrupt' alone: every other asynchronous exception keeps
@@ -452,57 +202,6 @@ ioFailureMessage failure
 -- exactly the release it came from and a bug report can say which build.
 versionLine :: String
 versionLine = "nova-nix " <> showVersion version
-
--- | The usage text, returned rather than printed: a bare invocation is a
--- usage error (stderr, non-zero) while @--help@ is a request that succeeded
--- (stdout, zero), and the words are the same either way.
-usageLines :: [String]
-usageLines =
-  [ "Usage: nova-nix [--nix-path NAME=PATH] <command>",
-    "",
-    "Commands:",
-    "  eval FILE.nix          Evaluate a .nix file, print result",
-    "  eval --expr 'EXPR'     Evaluate an inline expression",
-    "  build FILE.nix         Build a derivation from a .nix file",
-    "  build --expr 'EXPR'    Build a derivation from an inline expression",
-    "  push --cache URL       Push store paths (and their closures) to a binary cache",
-    "  store delete PATH...   Remove store paths, refused while a root or another valid path keeps them",
-    "  store gc               Remove every store path not reachable from a root",
-    "",
-    "Flags:",
-    "  --strict               Deep-force all thunks before printing (warning: OOM on large results)",
-    "  --aterm                With eval --expr, print the derivation's .drv ATerm",
-    "  -A, --attr ATTRPATH    With build: select a dotted attribute path (a.b.c)",
-    "  -o, --out-link PATH    With build: create PATH as a symlink to the result and register it as a GC root",
-    "  --print-roots          With store gc: list the roots as LINK -> PATH and delete nothing",
-    "  --nix-path NAME=PATH   Add search path (repeatable, merged with NIX_PATH)",
-    "  --all                  With push: select every valid path except derivations",
-    "  --key-file PATH        With push: file holding the cache API key",
-    "  --compression KIND     With push: artifact packaging (" <> T.unpack pushCompressionValues <> "; default none)",
-    "  --exec-wrapper S=PATH  Run system S's derivations through PATH (repeatable),",
-    "                         e.g. --exec-wrapper x86_64-windows=/usr/bin/wine",
-    "  --store DIR            Use DIR as the store (default: the platform store)",
-    "  --substituter URL      Try this binary cache before building",
-    "  --trusted-key K        Public key (name:base64) for the substituter",
-    "  --fallback             Build from source if substitution fails",
-    "  --restrict-eval        Confine reads to the search path roots and what the",
-    "                         evaluation itself writes; fetch only allowed-uris",
-    "  --pure-eval            Confine reads as --restrict-eval does, with no search",
-    "                         path, no currentTime, currentSystem or storePath, and",
-    "                         pinned fetches only (allowed-uris applies only under",
-    "                         --restrict-eval)",
-    "  --trace-verbose        Make builtins.traceVerbose behave as builtins.trace;",
-    "                         without it, the first argument is never forced",
-    "",
-    "  substituters, trusted-public-keys, fallback, max-call-depth,",
-    "  restrict-eval, pure-eval, allowed-uris and trace-verbose also read from",
-    "  nix.conf, in upstream's order: $NIX_CONF_DIR (default " <> systemConfDirName <> "),",
-    "  the XDG nix/nix.conf files or $NIX_USER_CONF_FILES, then $NIX_CONFIG;",
-    "  the flags above add to whatever those configure.",
-    "",
-    "  --help                 Print this text and exit",
-    "  --version              Print the version and exit"
-  ]
 
 -- | Canonicalize and read a source file.  The canonicalization matters:
 -- relative path literals inside the file resolve against the file's
@@ -923,44 +622,23 @@ configLocations = do
         Config.clConfigDirs = maybe defaultConfigDirs (filter OP.isAbsolute . OP.splitSearchPath) configDirs
       }
 
--- | Where the platform's machine-wide config directory comes from, with
--- @nix@ beneath it either way: a fixed path (upstream's @sysconfdir@ on
--- Unix) or an environment variable naming it (@%ProgramData%@ on
--- Windows).  One value serves both the lookup and the help text, so the
--- two cannot disagree.
-data SystemConfDirSource = FixedConfDir !FilePath | EnvConfDir !BS.ByteString
-
-platformSystemConfDirSource :: SystemConfDirSource
-platformSystemConfDirSource = case SI.os of
-  "mingw32" -> EnvConfDir programDataVar
-  _ -> FixedConfDir posixSysconfDir
-
 -- | The machine-wide config directory the system file is read from unless
 -- @NIX_CONF_DIR@ moves it: upstream's @sysconfdir\/nix@ on Unix;
 -- @%ProgramData%\\nix@ on Windows, or none when that variable is unset or
 -- empty.
 platformSystemConfDir :: IO (Maybe OsPath)
-platformSystemConfDir = case platformSystemConfDirSource of
+platformSystemConfDir = case systemConfDirSource currentHost of
   FixedConfDir dir -> Just . (OP.</> Config.nixConfDirName) <$> OP.encodeFS dir
   EnvConfDir var -> do
     value <- mfilter (not . BS.null) <$> configVariable var
     traverse (fmap (OP.</> Config.nixConfDirName) . variableHostPath var) value
 
--- | 'platformSystemConfDir' as the help text names it: the path on Unix,
--- the variable on Windows.
-systemConfDirName :: String
-systemConfDirName = case platformSystemConfDirSource of
-  FixedConfDir dir -> dir </> nixDirName
-  EnvConfDir var -> "%" <> BC.unpack var <> "%" </> nixDirName
-  where
-    nixDirName = T.unpack (hostPathText Config.nixConfDirName)
-
 -- | What @XDG_CONFIG_DIRS@ names when it is unset: the spec's default on
 -- Unix, nothing on Windows (see 'configLocations').
 platformConfigDirs :: [FilePath]
-platformConfigDirs = case SI.os of
-  "mingw32" -> []
-  _ -> posixXdgConfigDirs
+platformConfigDirs = case currentHost of
+  WindowsHost -> []
+  PosixHost -> posixXdgConfigDirs
 
 -- | A config file's bytes, or why it could not be read: nothing at the
 -- path, or something that will not open (a directory, a permission

@@ -195,6 +195,29 @@ library
     -Wno-pattern-namespace-specifier
 
 -- ---------------------------------------------------------------------------
+-- CLI library: the command line's grammar and reference, which the
+-- executable runs and the test suite checks.  A sublibrary is private, so
+-- none of it is the package's published API.
+-- ---------------------------------------------------------------------------
+library cli
+  exposed-modules:
+    Nix.Cli.Args
+    Nix.Cli.Reference
+  hs-source-dirs:   cli
+  default-language:  Haskell2010
+  default-extensions:
+    OverloadedStrings
+  ghc-options:      -Wall -Wcompat
+
+  build-depends:
+      base                >= 4.22 && < 5
+    , bytestring          >= 0.11 && < 0.13
+    , containers          >= 0.6 && < 0.9
+    , filepath            >= 1.4.100 && < 1.6
+    , nova-nix
+    , text                >= 2.0 && < 2.2
+
+-- ---------------------------------------------------------------------------
 -- CLI executable
 -- ---------------------------------------------------------------------------
 executable nova-nix
@@ -218,6 +241,7 @@ executable nova-nix
     , file-io             >= 0.1.1 && < 0.2
     , filepath            >= 1.4.100 && < 1.6
     , nova-nix
+    , nova-nix:cli
     , text                >= 2.0 && < 2.2
 
 -- ---------------------------------------------------------------------------
@@ -249,6 +273,7 @@ test-suite nova-nix-test
     , network             >= 3.2 && < 3.3
     , nova-cache:{nova-cache, zstandard} >= 0.11.1.1 && < 0.13
     , nova-nix
+    , nova-nix:cli
     , process             >= 1.6.12 && < 1.7
     , QuickCheck          >= 2.12.5 && < 2.19
     , sqlite-simple       >= 0.4 && < 0.5

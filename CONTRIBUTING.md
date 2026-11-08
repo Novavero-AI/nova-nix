@@ -20,6 +20,13 @@ and pull requests are welcome.
   owns each detail rather than repeating it: Haddock for the library,
   `nova-nix --help` for the CLI, the parity case lists for what CI checks.
   A copy drifts from its source; a link cannot.
+- The CLI's commands, flags and nix.conf settings are documented once, in
+  `cli/Nix/Cli/Reference.hs`. `--help` prints that reference, and
+  `docs/cli.json` holds it as JSON for the project's site, which renders
+  it as the command-line reference. The test suite fails while
+  `docs/cli.json` differs from the reference; regenerate it from the
+  repository root with
+  `cabal run --enable-tests -v0 nova-nix-test -- --write-cli-json`.
 
 ## Commit messages
 

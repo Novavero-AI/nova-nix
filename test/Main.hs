@@ -22,7 +22,8 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Unsafe as BSU
-import Data.Char (isDigit)
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
+import Data.Foldable (toList)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
@@ -56,6 +57,8 @@ import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), Buil
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
+import qualified Nix.Cli.Args as Cli
+import qualified Nix.Cli.Reference as Ref
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
@@ -15637,6 +15640,243 @@ testUncaughtIOFailureCLI = do
     )
 
 -- ---------------------------------------------------------------------------
+-- Tests: the CLI reference
+-- ---------------------------------------------------------------------------
+
+-- | Where the reference's JSON is committed, from the repository root.
+cliJsonPath :: FilePath
+cliJsonPath = "docs" </> "cli.json"
+
+-- | The argument that writes 'Ref.referenceJson' to 'cliJsonPath' in place
+-- of running the suite.
+writeCliJsonFlag :: String
+writeCliJsonFlag = "--write-cli-json"
+
+-- | The reference against the parser it documents, the committed JSON
+-- against the reference, and each example that shows output against what
+-- the CLI prints.
+testCliReference :: IO [Bool]
+testCliReference = do
+  putStrLn "cli/reference"
+  committed <- try (BS.readFile cliJsonPath)
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-reference"
+      -- No nix.conf of the machine's is read: each directory the config
+      -- files are looked for in is under the run's own root.
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+          : ("NIX_CONF_DIR", root </> "system")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : ("XDG_CONFIG_DIRS", root </> "config-dirs")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"]) ambient
+      runCLI args =
+        Proc.readCreateProcessWithExitCode
+          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ""
+      shown =
+        [ example
+        | entry <- Ref.globalForm : map Ref.command Ref.commandNames,
+          example <- toList (Ref.commandExamples entry),
+          not (null (Ref.exampleOutput example))
+        ]
+  checks <-
+    sequence
+      [ runTest "docs/cli.json is the reference's JSON" $ case committed of
+          Left (err :: IOException) -> Fail (T.pack (cliJsonPath <> ": " <> displayException err <> "; " <> regenerateCliJson))
+          Right bytes
+            | bytes == Ref.referenceJson -> Pass
+            | otherwise -> Fail (T.pack (cliJsonPath <> " differs from what Nix.Cli.Reference renders; " <> regenerateCliJson)),
+        runTest "every command a flag lists accepts it" $
+          allPass
+            [ case Cli.parseArgs args of
+                Right opts | cliSelects name (Cli.optCommand opts) -> Pass
+                other -> Fail (T.pack (unwords args <> ": " <> show (Cli.optCommand <$> other)))
+            | (flagName, entry) <- referenceFlags,
+              Ref.CommandFlag names <- [Ref.flagScope entry],
+              name <- toList names,
+              spelling <- toList (Ref.flagSpellings entry),
+              let args = cliWords name ++ [T.unpack spelling] ++ cliValue entry ++ cliOperands name flagName
+            ],
+        runTest "a global flag is answered on its own" $
+          allPass
+            [ case Cli.parseArgs [T.unpack spelling] of
+                Right opts | Cli.optCommand opts `elem` [Cli.CmdHelp, Cli.CmdVersion] -> Pass
+                other -> Fail (spelling <> ": " <> T.pack (show (Cli.optCommand <$> other)))
+            | flagName <- Ref.globalFlags,
+              spelling <- toList (Ref.flagSpellings (Ref.flag flagName))
+            ],
+        -- A flag with a value is asked for one when it ends the line; one
+        -- without parses when it ends a complete line, where a clause that
+        -- wanted a value would have nothing to take.
+        runTest "a flag asks for a value exactly when its entry names one" $
+          allPass
+            [ let missing = Left (T.unpack spelling <> " requires a value")
+                  args = prefix ++ [T.unpack spelling]
+                  complete = prefix ++ operands ++ [T.unpack spelling]
+               in case (Ref.flagArgument entry, Cli.optCommand <$> Cli.parseArgs args, Cli.parseArgs complete) of
+                    (Just _, result, _) | result == missing -> Pass
+                    (Nothing, result, Right _) | result /= missing -> Pass
+                    (_, result, completed) -> Fail (T.pack (unwords args <> ": " <> show result <> "; " <> unwords complete <> ": " <> show (Cli.optCommand <$> completed)))
+            | (flagName, entry) <- referenceFlags,
+              (prefix, operands) <- case Ref.flagScope entry of
+                Ref.GlobalFlag -> [([], [])]
+                Ref.CommandFlag names -> [(cliWords name, cliOperands name flagName) | name <- toList names],
+              spelling <- toList (Ref.flagSpellings entry)
+            ],
+        runTest "every example parses as the command it documents" $
+          allPass
+            ( [ exampleParses (`elem` [Cli.CmdHelp, Cli.CmdVersion]) example
+              | example <- toList (Ref.commandExamples Ref.globalForm)
+              ]
+                ++ [ exampleParses (cliSelects name) example
+                   | name <- Ref.commandNames,
+                     example <- toList (Ref.commandExamples (Ref.command name))
+                   ]
+            ),
+        runTest "spellings are well formed and name one flag each" $
+          let spellings = concatMap (toList . Ref.flagSpellings . snd) referenceFlags
+              wellFormed entry =
+                all (\part -> not (T.null part) && T.all isAsciiLower part) (T.splitOn "-" (Ref.flagLong entry))
+                  && maybe True isAsciiLetter (Ref.flagShort entry)
+           in assertEqual "malformed" [] [Ref.flagLong entry | (_, entry) <- referenceFlags, not (wellFormed entry)]
+                `andThen` assertEqual "repeated" [] [spelling | (spelling, count) <- Map.toList (Map.fromListWith (+) [(spelling, 1 :: Int) | spelling <- spellings]), count > 1],
+        runTest "every setting is one nix.conf resolves" $
+          allPass
+            [ case Config.resolveConfig [Config.ConfigAssignment (TE.encodeUtf8 (Ref.settingName setting)) "1"] of
+                Right config | config /= Config.defaultNixConfig -> Pass
+                other -> Fail (Ref.settingName setting <> ": " <> T.pack (show other))
+            | setting <- toList (Ref.configSettings Ref.configuration)
+            ],
+        runTest "marked text closes every code span, and help prints no marks" $
+          let marked =
+                [ text
+                | entry <- Ref.globalForm : map Ref.command Ref.commandNames,
+                  text <-
+                    Ref.commandDescription entry
+                      : map Ref.formSummary (toList (Ref.commandForms entry))
+                      ++ map Ref.exampleDescription (toList (Ref.commandExamples entry))
+                ]
+                  ++ [Ref.flagDescription (Ref.flag name) | name <- Ref.flagNames]
+                  ++ [Ref.settingDescription setting | setting <- toList (Ref.configSettings Ref.configuration)]
+                  ++ [Ref.configDescription Ref.configuration]
+           in assertEqual "unclosed" [] (filter (odd . T.count (T.singleton Ref.codeMark)) marked)
+                `andThen` assertEqual "printed" [] (filter (T.any (== Ref.codeMark)) Ref.helpLines),
+        runTest "help fits its width" $
+          assertEqual "longer" [] (filter ((> Ref.helpWidth) . T.length) Ref.helpLines),
+        runTest "an example reads as it is typed" $
+          assertEqual "shell" "nova-nix eval --expr '1 + 2'" (Ref.exampleCommandLine (Ref.Example "" ("eval" :| ["--expr", "1 + 2"]) []))
+            `andThen` assertEqual "quote" "'it'\\''s'" (Ref.shellQuote "it's")
+            `andThen` assertEqual "empty" "''" (Ref.shellQuote "")
+            `andThen` assertEqual "zsh's equals expansion" "'=ls'" (Ref.shellQuote "=ls"),
+        runTestM "a quoted argument reads back as itself" $ do
+          result <-
+            QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+              QC.forAll genShellText $
+                \text -> readShellWord (Ref.shellQuote text) QC.=== Just text
+          pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+        runTestM "wrapped text keeps its words and fits its width" $ do
+          result <-
+            QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+              QC.forAll ((,) <$> QC.chooseInt (1, 40) <*> genWrapText) $ \(width, text) ->
+                let wrapped = Ref.wrapWords width text
+                 in T.words (T.unwords wrapped) QC.=== T.words text
+                      QC..&&. all (\line -> T.length line <= width || length (T.words line) == 1) wrapped
+          pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+        runTestM "indented JSON parses back to the value it came from" $ do
+          result <-
+            QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+              QC.forAll (genJson 3) $ \json ->
+                (parseJson =<< either (Left . T.pack . show) Right (TE.decodeUtf8' (Ref.renderIndentedJson json))) QC.=== Right json
+          pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+      ]
+  ran <-
+    bracket_
+      (forceRemoveIfExists root >> createDirectoryIfMissing True root)
+      (forceRemoveIfExists root)
+      ( mapM
+          ( \example -> runTestM ("example prints what it shows: " <> Ref.exampleCommandLine example) $ do
+              (code, out, err) <- runCLI (map T.unpack (toList (Ref.exampleArguments example)))
+              pure $ case code of
+                ExitSuccess -> assertEqual "stdout" (Ref.exampleOutput example) (map (T.filter (/= '\r')) (T.lines (T.pack out)))
+                _ -> Fail ("exited " <> T.pack (show code) <> ": " <> T.pack err)
+          )
+          shown
+      )
+  pure (checks ++ ran)
+  where
+    referenceFlags = [(name, Ref.flag name) | name <- Ref.flagNames]
+    regenerateCliJson = "from the repository root, regenerate it with: cabal run --enable-tests -v0 nova-nix-test -- " <> writeCliJsonFlag
+    allPass = foldr andThen Pass
+    isAsciiLetter c = isAsciiLower c || isAsciiUpper c
+    exampleParses accepts example =
+      let args = map T.unpack (toList (Ref.exampleArguments example))
+       in case Cli.parseArgs args of
+            Right opts | accepts (Cli.optCommand opts) -> Pass
+            other -> Fail (T.pack (unwords args <> ": " <> show (Cli.optCommand <$> other)))
+
+-- | The arguments that select a command.
+cliWords :: Ref.CommandName -> [String]
+cliWords = map T.unpack . Ref.commandWords
+
+-- | A value for a flag that takes one, which the parser accepts unchecked.
+cliValue :: Ref.FlagEntry -> [String]
+cliValue entry = ["value" | Just _ <- [Ref.flagArgument entry]]
+
+-- | What completes a command line once a flag is in it: the operands the
+-- command needs, but an expression when the flag is @--expr@, which gives
+-- one.
+cliOperands :: Ref.CommandName -> Ref.FlagName -> [String]
+cliOperands name flagName = case name of
+  Ref.EvalCommand -> expression
+  Ref.BuildCommand -> expression
+  Ref.PushCommand -> ["--cache", "https://cache.example.org", "hash-name"]
+  Ref.StoreDeleteCommand -> ["hash-name"]
+  Ref.StoreGcCommand -> []
+  where
+    expression = concat [["--expr", "1"] | flagName /= Ref.ExprFlag]
+
+-- | Whether a parsed command is the reference's command.
+cliSelects :: Ref.CommandName -> Cli.Command -> Bool
+cliSelects name parsed = case (name, parsed) of
+  (Ref.EvalCommand, Cli.CmdEvalExpr _) -> True
+  (Ref.EvalCommand, Cli.CmdEvalFile _) -> True
+  (Ref.BuildCommand, Cli.CmdBuild {}) -> True
+  (Ref.PushCommand, Cli.CmdPush _) -> True
+  (Ref.StoreDeleteCommand, Cli.CmdStoreDelete _) -> True
+  (Ref.StoreGcCommand, Cli.CmdStoreGc _) -> True
+  _ -> False
+
+-- | One word read back as a POSIX shell reads it, for what
+-- 'Ref.shellQuote' writes: plain characters, single-quoted runs, and a
+-- character escaped by a backslash.  A character the shell would act on
+-- is no reading at all.
+readShellWord :: Text -> Maybe Text
+readShellWord = go ""
+  where
+    go acc rest = case T.uncons rest of
+      Nothing -> Just acc
+      Just ('\'', more) -> case T.break (== '\'') more of
+        (quoted, closing) -> case T.uncons closing of
+          Just (_, after) -> go (acc <> quoted) after
+          Nothing -> Nothing
+      Just ('\\', more) -> case T.uncons more of
+        Just (escaped, after) -> go (T.snoc acc escaped) after
+        Nothing -> Nothing
+      Just (c, more)
+        | c `elem` shellSpecial -> Nothing
+        | otherwise -> go (T.snoc acc c) more
+    shellSpecial = " \t\n\"#$&()*;<>?[]`{|}~!" :: String
+
+-- | Text with the characters a shell acts on mixed among plain ones.
+genShellText :: QC.Gen Text
+genShellText = T.pack <$> QC.listOf (QC.elements "a1_-=:/.,@%+ '\"\\$`;&|<>()*?[]#~{}!\t\n")
+
+-- | Words of a few lengths, runs of spaces between them.
+genWrapText :: QC.Gen Text
+genWrapText = T.pack <$> QC.listOf (QC.elements "abcdefghij        ")
+
+-- ---------------------------------------------------------------------------
 -- Tests: Phase 4 - search paths, dynamic keys, directory import
 -- ---------------------------------------------------------------------------
 
@@ -18844,6 +19084,7 @@ main =
   getArgs >>= \case
     [flag, name] | flag == arenaGuardChildFlag -> arenaGuardChild name
     [flag, source] | flag == evalChildFlag -> bracket_ arenaInit arenaDestroy (evalChild source)
+    [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
     _ -> withRunTempRoot (bracket_ arenaInit arenaDestroy runSuite)
 
 -- | Give the run a temporary root of its own and point the process's
@@ -19010,6 +19251,7 @@ runSuite = do
           testE2E,
           testExecWrapperCLI,
           testUncaughtIOFailureCLI,
+          testCliReference,
           testPhase4,
           testPhase4IO,
           testToJSONPathIO,
@@ -19517,6 +19759,7 @@ testEvalPolicyCLI = do
       -- a native spelling (C:\...) is no token at all; an absolute
       -- string is coerced to a path on every platform.
       outsideFile = T.unpack (canonPathValue (T.pack (root </> "outside.txt")))
+      helpFirstLine = maybe "" T.unpack (listToMaybe Ref.helpLines)
       isolate extraConfig =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> extraConfig)
           : ("XDG_CONFIG_HOME", root </> "config")
@@ -19559,7 +19802,7 @@ testEvalPolicyCLI = do
         expectOut "a --nix-path root is readable under --restrict-eval" "" ["eval", "--restrict-eval", "--nix-path", "allowed=" ++ allowed, "--expr", "builtins.readFile <allowed/data.txt>"] "\"hello\\n\"",
         expectErr "a read outside the roots fails the command" "" ["eval", "--restrict-eval", "--expr", "builtins.readFile \"" ++ outsideFile ++ "\""] "is forbidden in restricted mode",
         expectErr "a channel: search path entry allows nothing" "" ["eval", "--restrict-eval", "--nix-path", "nixpkgs=channel:nova-probe", "--expr", "builtins.readFile \"" ++ cwdChannelEntry ++ "\""] "is forbidden in restricted mode",
-        expectOut "build accepts the flag before its target" "" ["build", "--pure-eval", "--help"] "Usage: nova-nix [--nix-path NAME=PATH] <command>",
+        expectOut "build accepts the flag before its target" "" ["build", "--pure-eval", "--help"] helpFirstLine,
         expectRun "traceVerbose prints nothing by default" "" traceVerboseHi (ExitSuccess, ["1"], []),
         expectRun "--trace-verbose makes traceVerbose trace" "" ("--trace-verbose" : traceVerboseHi) (ExitSuccess, ["1"], ["trace: hi"]),
         expectRun "trace-verbose from NIX_CONFIG makes traceVerbose trace" "trace-verbose = true\n" traceVerboseHi (ExitSuccess, ["1"], ["trace: hi"]),
@@ -19568,7 +19811,7 @@ testEvalPolicyCLI = do
         -- prim_trace runs only once it has both arguments (callFunction,
         -- eval.cc at 2.24.9), so a partial application forces nothing.
         expectRun "under --trace-verbose a partial traceVerbose leaves its argument unforced" "" ["eval", "--trace-verbose", "--expr", "builtins.seq (builtins.traceVerbose (throw \"a\")) 1"] (ExitSuccess, ["1"], []),
-        expectOut "build accepts --trace-verbose before its target" "" ["build", "--trace-verbose", "--help"] "Usage: nova-nix [--nix-path NAME=PATH] <command>"
+        expectOut "build accepts --trace-verbose before its target" "" ["build", "--trace-verbose", "--help"] helpFirstLine
       ]
 
 -- | The eval result through the binary: stdout carries the printer's bytes
