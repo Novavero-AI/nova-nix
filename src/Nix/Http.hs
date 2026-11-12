@@ -64,9 +64,8 @@ import System.Random (randomRIO)
 -- front of a server scores lowest: ftp.gnu.org answers one with 403
 -- outright, and Cloudflare in front of cache.novavero.ai challenged every
 -- request a GitHub runner made without one while passing the same requests
--- carrying this header.  The fetcher sent one; the substituter and push
--- sent none, so the public cache could be read by a person and not by the
--- tool built to read it.  The version comes from Cabal, so the header
+-- carrying this header.  The fetcher, the substituter and push each send
+-- it through 'withUserAgent'.  The version comes from Cabal, so the header
 -- names the build that made the request rather than a spelling that can
 -- drift at release time.
 userAgent :: BS8.ByteString
