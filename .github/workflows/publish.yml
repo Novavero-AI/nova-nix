@@ -34,7 +34,7 @@ jobs:
     outputs:
       version: ${{ steps.tag.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check the tag against the committed version and changelog
         id: tag
         run: |
@@ -73,7 +73,7 @@ jobs:
             ext: zip
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Pairs the SDK GHC links against with its own ld; the step of this
       # name in ci.yml says why and when to drop it.
@@ -81,7 +81,7 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo xcode-select -s /Library/Developer/CommandLineTools
 
-      - uses: haskell-actions/setup@v2
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
         with:
           ghc-version: "9.14.1"
           cabal-version: "latest"
@@ -168,7 +168,7 @@ jobs:
             tar czf "$stem.tar.gz" "$stem"
           fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.name }}
           path: nova-nix-*.${{ matrix.ext }}
@@ -186,9 +186,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-*
           merge-multiple: true
