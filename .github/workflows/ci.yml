@@ -1037,6 +1037,10 @@ jobs:
   mes-windows:
     name: Mes (${{ matrix.name }})
     needs: [stage0-nova-nix]
+    # Not run in the merge queue.  Neither leg is a required check, so the
+    # queue merges without waiting for them, and the push to main that
+    # follows runs both on the same commit.
+    if: github.event_name != 'merge_group'
     strategy:
       fail-fast: false
       matrix:
@@ -1235,6 +1239,10 @@ jobs:
   bootstrap-windows:
     name: Bootstrap (${{ matrix.name }})
     needs: [stage0-nova-nix]
+    # Not run in the merge queue.  Neither leg is a required check, so the
+    # queue merges without waiting for them, and the push to main that
+    # follows runs both on the same commit.
+    if: github.event_name != 'merge_group'
     strategy:
       fail-fast: false
       matrix:
