@@ -635,3 +635,6 @@ kaem.runCommand "${pname}-${version}"
     } -lws2_32 -luser32 ${advapi32} ${kernel32}
     chmod 555 ''${out}/bin/busybox.exe
   ''
+// {
+  srcs = [ tarball ] ++ map fetchMingwCrt mingwCrt;
+}

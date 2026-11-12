@@ -35,8 +35,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The public cache's address and signing key, spelled once: the publish job
-# pushes to it and E2E (public cache) substitutes from it, and the two must
-# agree.  A cache move or a key rotation is one edit here.
+# pushes to it, E2E (public cache) substitutes from it, and every job that
+# builds from pkgs/windows takes its sources from it, and all must agree.
+# A cache move or a key rotation is one edit here.
 env:
   CACHE_URL: https://cache.novavero.ai
   CACHE_PUBLIC_KEY: cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
@@ -598,6 +599,13 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
+      # Every source pkgs/windows fetches, from the public cache where it
+      # holds it, so the builds below fetch none.  They name no substituter
+      # and substitute nothing.
+      - name: Take the sources from the public cache
+        shell: bash
+        run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
       # pkgs/windows/hello.nix points at the by-name hello package, which
       # builds through the real stdenv (genericBuild, setup.sh) rather than
       # driving cmd.exe directly - the smallest thing that exercises a real
@@ -725,6 +733,13 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # Every source pkgs/windows fetches, from the public cache where it
+      # holds it, so the builds below fetch none.  They name no substituter
+      # and substitute nothing.
+      - name: Take the sources from the public cache
+        shell: bash
+        run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
       # build prints the out path as its last stdout line.  Building a link
       # builds the links below it, so each later build finds them valid.
@@ -1045,6 +1060,13 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
+      # Every source pkgs/windows fetches, from the public cache where it
+      # holds it, so the builds below fetch none.  They name no substituter
+      # and substitute nothing.
+      - name: Take the sources from the public cache
+        shell: bash
+        run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
       # The stage0 tools, NYACC, and the source tree with mes-m2 in its bin
       # output, each timed.
       - name: Build mes-m2
@@ -1237,6 +1259,13 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # Every source pkgs/windows fetches, from the public cache where it
+      # holds it, so the builds below fetch none.  They name no substituter
+      # and substitute nothing.
+      - name: Take the sources from the public cache
+        shell: bash
+        run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
       # The stage0 tools and the Mes rung TinyCC builds on, each timed.
       - name: Build Mes
@@ -1835,6 +1864,13 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
+      # Every source pkgs/windows fetches, for --all below to publish: one
+      # the cache holds comes from it, and one it lacks is fetched from its
+      # upstream host here, the once.
+      - name: Take the sources from the public cache
+        shell: bash
+        run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
       # build prints the out path as its last stdout line; the [subst] and
       # [build] lines go to stderr and stay in the job log.  LC_ALL pinned
       # as E2E (public cache) pins it: the greeting is compared literally,
@@ -1855,10 +1891,12 @@ jobs:
           echo "output: $got"
           [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
 
-      # --all is every valid path but the derivations in a store this job filled from empty,
-      # which is exactly the closure; push skips what the cache already
-      # serves and prints both counts itself.  An absent secret arrives as
-      # an empty key file, which push refuses.
+      # --all is every valid path but the derivations in a store this job
+      # filled from empty: the closure, and every source pkgs/windows
+      # fetches, each fixed-output and so the same bytes wherever it was
+      # fetched.  push skips what the cache already serves and prints both
+      # counts itself.  An absent secret arrives as an empty key file, which
+      # push refuses.
       - name: Publish the closure to the public cache
         shell: bash
         env:
@@ -1932,6 +1970,26 @@ jobs:
           got=$("$(cygpath -u "$out")/bin/hello.exe")
           echo "output: $got"
           [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
+
+      # The publish job above pushed every source pkgs/windows fetches, so
+      # each has to come from the cache here.  A [build] line is a source
+      # the cache lacks, which every other job then fetches from its
+      # upstream host on every run.
+      - name: Every source comes from the public cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          store=$(cygpath -w "$RUNNER_TEMP/public-store")
+          log="$RUNNER_TEMP/sources.log"
+          if ! bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe" --store "$store" 2> "$log"; then
+            cat "$log" >&2
+            exit 1
+          fi
+          if grep -F '[build]' "$log"; then
+            echo "the public cache is missing the sources above: each was fetched from its upstream host" >&2
+            exit 1
+          fi
+          echo "$(grep -c -F '[subst]' "$log") sources came from the public cache"
 
       - name: Dump the substitution log on failure
         if: failure()
