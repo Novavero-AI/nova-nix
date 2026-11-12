@@ -12459,6 +12459,79 @@ testSeedStdenvWindows = do
         helloArchive
       ]
 
+-- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
+-- lists: the fetches in the closure of every derivation in the set are the
+-- list's, each fixed-output and listed once.  A package that fetches a
+-- source and leaves it out of its @srcs@ fails here.  CI publishes the list
+-- to the public cache, so a source missing from it is one every run fetches
+-- from its upstream host.  A package's derivations are its value and the
+-- attributes at most two sets below it, as @tinycc.boot0.libs@ is.
+testWindowsSources :: IO [Bool]
+testWindowsSources = do
+  putStrLn "pkgs/sources"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = cwd </> "pkgs" </> "windows"
+      source =
+        T.concat
+          [ "let pkgs = import ",
+            nixQuotedPath windows,
+            "; sources = import ",
+            nixQuotedPath (windows </> "sources.nix"),
+            "; derivationsIn = depth: value:",
+            " if !(builtins.isAttrs value) then [ ]",
+            " else if (value.type or null) == \"derivation\" then [ value.drvPath ]",
+            " else if depth == 0 then [ ]",
+            " else builtins.concatMap (name: derivationsIn (depth - 1) value.${name}) (builtins.attrNames value);",
+            " in builtins.concatStringsSep \" \" (map (source: source.drvPath) sources ++ [ \"",
+            listEnd,
+            "\" ] ++ derivationsIn ",
+            T.pack (show packageDepth),
+            " pkgs)"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> do
+          let (listed, roots) = break (== listEnd) (T.words (bytesText bytes))
+          closure <- sessionClosure (listed ++ drop 1 roots)
+          pure (listed, closure)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  case outcome of
+    Left err -> sequence [runTest lists (Fail err)]
+    Right (listed, closure) -> do
+      let isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          fetches = Map.filter isFetch closure
+          nameOf path = maybe path (maybe path bytesText . Map.lookup "name" . drvEnv) (Map.lookup path closure)
+      sequence
+        [ runTest lists $
+            assertEqual "sources" (sort (map nameOf (Map.keys fetches))) (sort (map nameOf listed)),
+          runTest "it lists the same derivations, not only the same names" $
+            assertEqual "derivations" (Map.keys fetches) (sort listed),
+          runTest "every source is fixed-output" $
+            assertEqual "not fixed-output" [] [nameOf path | (path, drv) <- Map.toList fetches, not (isFixedOutput drv)],
+          runTest "the set fetches the ladder's sources and the stage-1 seeds' packages" $
+            assertEqual "sources missing" [] [name | name <- knownSources, name `notElem` map nameOf listed]
+        ]
+  where
+    lists :: Text
+    lists = "sources.nix lists every source the package set fetches, and no other"
+    -- What ends the list's drvPaths in the string the expression returns: no
+    -- store path is spelled so.
+    listEnd :: Text
+    listEnd = "|"
+    packageDepth :: Int
+    packageDepth = 3
+    -- One source of each kind, so that an empty closure does not pass as an
+    -- empty list: the seed, a rung's archive and a stage-1 seed's package.
+    knownSources :: [Text]
+    knownSources = ["hex0-seed.exe", "busybox-w32-FRP-6354-g5f09fb446.tgz", "bash-5.3.015-1-x86_64.pkg.tar.zst"]
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -19135,6 +19208,7 @@ runSuite = do
           testGnumakeWindows,
           testBusyboxWindows,
           testSeedStdenvWindows,
+          testWindowsSources,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,

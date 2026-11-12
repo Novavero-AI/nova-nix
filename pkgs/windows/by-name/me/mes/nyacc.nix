@@ -20,4 +20,8 @@ let
     untar --file ''${NIX_BUILD_TOP}/nyacc.tar
   '';
 in
-nyacc // { guilePath = "${nyacc}/share/${pname}-${version}/module"; }
+nyacc
+// {
+  inherit src;
+  guilePath = "${nyacc}/share/${pname}-${version}/module";
+}

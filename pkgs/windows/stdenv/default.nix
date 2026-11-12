@@ -29,6 +29,9 @@ in
 {
   inherit msysSeed mingwSeed;
 
+  # The packages the two seeds are unpacked from.
+  srcs = msysSeed.srcs ++ mingwSeed.srcs;
+
   mkDerivation =
     attrs:
     derivation (
@@ -49,5 +52,10 @@ in
         # ahead of the toolchain so every compiler call flows through it.
         ccWrapperSrc = ccWrapper;
       }
-    );
+    )
+    // {
+      # What the package fetches: its src, unless that is a path in the
+      # tree.
+      srcs = if (attrs.src or null) ? outputHash then [ attrs.src ] else [ ];
+    };
 }

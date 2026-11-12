@@ -174,4 +174,5 @@ buildTinyccMes {
 // {
   # The source tinycc-native compiles.
   inherit src version;
+  srcs = [ tarball ];
 }

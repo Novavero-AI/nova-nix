@@ -294,6 +294,10 @@ let
       env
       baseAddress
       ;
+    srcs = [
+      src
+      nyacc.src
+    ];
     inherit compiler libs;
     libc = import ./libc.nix {
       inherit kaem;

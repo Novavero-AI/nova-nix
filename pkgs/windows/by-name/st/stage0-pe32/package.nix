@@ -591,4 +591,5 @@ in
     mescc-tools-extra
     writeText
     ;
+  inherit (sources) srcs;
 }

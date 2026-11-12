@@ -135,3 +135,6 @@ kaem.runCommand "${pname}-${version}" tinycc-native.env ''
   } -luser32 ${advapi32}
   chmod 555 ''${out}/bin/make.exe
 ''
+// {
+  srcs = [ tarball ];
+}

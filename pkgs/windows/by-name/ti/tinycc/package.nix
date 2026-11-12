@@ -224,4 +224,5 @@ in
   boot2 = tinycc-boot2;
   boot3 = tinycc-boot3;
   bootstrappable = tinycc-bootstrappable;
+  srcs = [ tarball ];
 }
