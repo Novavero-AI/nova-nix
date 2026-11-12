@@ -57,10 +57,10 @@ jobs:
       NIX_VERSION: ${{ matrix.nix }}
       NIXPKGS_REV: ${{ matrix.rev }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
         with:
           install_url: https://releases.nixos.org/nix/nix-${{ env.NIX_VERSION }}/install
 
@@ -72,14 +72,14 @@ jobs:
           echo "$actual"
           [ "$actual" = "$expected" ] || { echo "expected $expected" >&2; exit 1; }
 
-      - uses: haskell-actions/setup@v2
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
         id: setup
         with:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
       - name: Cache Cabal store
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
@@ -87,7 +87,7 @@ jobs:
 
       - name: Cache the pinned nixpkgs tree
         id: nixpkgs-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: nixpkgs-ref
           key: parity-nixpkgs-${{ runner.os }}-${{ env.NIXPKGS_REV }}
