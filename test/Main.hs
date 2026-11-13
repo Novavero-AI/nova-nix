@@ -11,6 +11,7 @@ import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.GZip as GZip
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
+import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
@@ -28,7 +29,7 @@ import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.List (find, inits, intercalate, isPrefixOf, mapAccumL, sort)
+import Data.List (find, inits, intercalate, isPrefixOf, mapAccumL, nub, sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
@@ -13378,6 +13379,140 @@ testWindowsSources = do
     knownSources :: [Text]
     knownSources = ["hex0-seed.exe", "busybox-w32-FRP-6354-g5f09fb446.tgz", "bash-5.3.015-1-x86_64.pkg.tar.zst"]
 
+-- | The CI workflow whose Mes and Bootstrap jobs build the seed ladder, from
+-- the repository root.
+ciWorkflowPath :: FilePath
+ciWorkflowPath = ".github" </> "workflows" </> "ci.yml"
+
+-- | The package set's file as a workflow step names it.
+packageSetFile :: Text
+packageSetFile = "pkgs/windows/default.nix"
+
+-- | What precedes the attribute path where a step builds from the set.
+packageSetBuild :: Text
+packageSetBuild = "build " <> packageSetFile <> " -A "
+
+-- | The attribute paths a job's steps build from the package set, in the
+-- order the steps first name them, read from the workflow's lines.  A step
+-- names one outright, or through its loop's variable, alone or inside a
+-- path, the loop being one @for NAME in WORD ...; do@ line.  A build
+-- spelled any other way is an error and not a build passed over, so the
+-- test fails on a step it cannot read where it would otherwise miss a rung.
+jobPackageSetBuilds :: Text -> [Text] -> Either Text [Text]
+jobPackageSetBuilds jobId workflow = case dropWhile (/= jobKey) workflow of
+  [] -> Left ("the workflow has no job " <> jobId)
+  _ : rest -> nub . concat <$> sequence (snd (mapAccumL buildsOn Nothing (takeWhile (not . isJobKey) rest)))
+  where
+    jobKey = "  " <> jobId <> ":"
+    -- Under @jobs:@ a line indented by exactly two spaces is a job's key or
+    -- a comment.
+    isJobKey line = case T.unpack (T.take 3 line) of
+      [' ', ' ', next] -> next /= ' ' && next /= '#'
+      _ -> False
+    -- Each line's builds, with the loop the line is in: the last for line
+    -- at or above it.
+    buildsOn loop line =
+      let current = forLoop line <|> loop
+       in (current, lineBuilds current line)
+    forLoop line = case T.words line of
+      "for" : name : "in" : items
+        | (leading, [final, "do"]) <- break (";" `T.isSuffixOf`) items -> Just (name, leading ++ [T.dropEnd 1 final])
+      _ -> Nothing
+    lineBuilds loop line
+      | "#" `T.isPrefixOf` T.stripStart line = Right []
+      | (_, found) <- T.breakOn packageSetBuild line,
+        not (T.null found) =
+          maybe (unread line) Right (expand loop (T.filter (/= '"') (T.takeWhile isArgumentChar (T.drop (T.length packageSetBuild) found))))
+      | packageSetFile `T.isInfixOf` line = unread line
+      | otherwise = Right []
+    isArgumentChar c = isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("._-$\"" :: String)
+    -- The paths an argument names, or nothing where it is not a path and
+    -- not the loop's variable in one.
+    expand loop argument
+      | T.null argument = Nothing
+      | not ("$" `T.isInfixOf` argument) = Just [argument]
+      | Just (name, items) <- loop,
+        let variable = "$" <> name,
+        variable `T.isInfixOf` argument,
+        not ("$" `T.isInfixOf` T.replace variable "" argument) =
+          Just [T.replace variable item argument | item <- items]
+      | otherwise = Nothing
+    unread line = Left ("a step of " <> jobId <> " builds from " <> packageSetFile <> " in a way this test does not read: " <> T.strip line)
+
+-- | @pkgs\/windows\/rungs.nix@ against the CI jobs whose rungs it lists: each
+-- leg's list is the attributes its job's steps build from the package set,
+-- in the order the steps first name them, and each names a derivation.  In
+-- substitute mode CI realises a leg's list before those steps, and fails on
+-- a listed rung that was built though the public cache holds it, so a rung
+-- a step builds and the list lacks is one that check never sees.
+testWindowsRungs :: IO [Bool]
+testWindowsRungs = do
+  putStrLn "pkgs/rungs"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  workflow <- try (BS.readFile ciWorkflowPath)
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = cwd </> "pkgs" </> "windows"
+      source =
+        T.concat
+          [ "let pkgs = import ",
+            nixQuotedPath windows,
+            "; rungs = import ",
+            nixQuotedPath (windows </> "rungs.nix"),
+            "; legs = builtins.attrNames rungs;",
+            " select = path: builtins.foldl' (set: name: set.${name}) pkgs (builtins.filter builtins.isString (builtins.split \"[.]\" path));",
+            " isDerivation = path: let value = select path; in builtins.isAttrs value && (value.type or null) == \"derivation\";",
+            " in builtins.concatStringsSep \" \" (builtins.concatMap (leg: [ leg ] ++ rungs.${leg} ++ [ \"",
+            legEnd,
+            "\" ]) legs ++ builtins.filter (path: !(isDerivation path)) (builtins.concatMap (leg: rungs.${leg}) legs))"
+          ]
+      built jobId = case workflow of
+        Left (err :: IOException) -> Left (T.pack (ciWorkflowPath <> ": " <> displayException err))
+        Right bytes -> jobPackageSetBuilds jobId (T.lines (bytesText bytes))
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> pure (legLists (T.words (bytesText bytes)))
+        other -> throwEvalError ("expected the legs as one string, got " <> typeName other)
+  case outcome of
+    Left err -> sequence [runTest lists (Fail err)]
+    Right (legs, notDerivations) -> do
+      let rungsOf leg = fromMaybe [] (lookup leg legs)
+      sequence $
+        [ runTest lists $
+            assertEqual "legs" (sort (map fst legJobs)) (map fst legs),
+          runTest "every rung is a derivation of the package set" $
+            assertEqual "not derivations" [] (nub notDerivations),
+          runTest "each leg's list reaches its last rung" $
+            assertEqual "rungs missing" [] [rung | (leg, rung) <- knownRungs, rung `notElem` rungsOf leg]
+        ]
+          ++ [ runTest ("the " <> leg <> " leg's rungs are what " <> jobId <> " builds from the package set, in order") $
+                 either Fail (\named -> assertEqual "rungs" named (rungsOf leg)) (built jobId)
+             | (leg, jobId) <- legJobs
+             ]
+  where
+    lists :: Text
+    lists = "rungs.nix lists the Mes and Bootstrap legs"
+    -- Each leg of rungs.nix with the job that builds its rungs.
+    legJobs :: [(Text, Text)]
+    legJobs = [("mes", "mes-windows"), ("bootstrap", "bootstrap-windows")]
+    -- The rung each leg ends on, so that a workflow read as building nothing
+    -- does not pass against an empty list.
+    knownRungs :: [(Text, Text)]
+    knownRungs = [("mes", "mes.libc"), ("bootstrap", "seedStdenv.applets")]
+    -- What ends a leg's rungs in the string the expression returns: no
+    -- attribute path is spelled so.
+    legEnd :: Text
+    legEnd = "|"
+    -- The legs with their rungs, then the words after the last leg.
+    legLists :: [Text] -> ([(Text, [Text])], [Text])
+    legLists listed = case break (== legEnd) listed of
+      (leg : rungs, _ : rest) -> let (legs, others) = legLists rest in ((leg, rungs) : legs, others)
+      (others, _) -> ([], others)
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -20138,6 +20273,7 @@ runSuite = do
           testSeedStdenvWindows,
           testChecksForbidSubstitutes,
           testWindowsSources,
+          testWindowsRungs,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,

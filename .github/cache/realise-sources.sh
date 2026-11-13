@@ -9,9 +9,10 @@
 # it to, so an outage of the cache is never made up for with downloads from
 # the upstream hosts.
 #
-# A job's builds after this name no substituter.  They substitute nothing,
-# so they build what they are there to build, and they find every source
-# already in the store.
+# A job's builds after this find every source already in the store.  They
+# name no substituter and substitute nothing, so they build what they are
+# there to build, unless the job names one for them, as the Mes and
+# Bootstrap legs do in substitute mode (substitute-rungs.sh).
 #
 # pkgs/windows/sources.nix is a list and nova-nix builds one derivation, so
 # the list is realised an element at a time.
