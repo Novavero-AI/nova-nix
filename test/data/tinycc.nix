@@ -17,7 +17,8 @@
 # compiles and links tcc.
 let
   inherit (import ../../pkgs/windows) stage0-pe32 tinycc tinycc-mes tinycc-native;
-  inherit (stage0-pe32) kaem writeText;
+  inherit (stage0-pe32) writeText;
+  kaem = import ./check.nix stage0-pe32.kaem;
 
   helloC = writeText "hello.c" ''
     #include <stdio.h>
@@ -157,6 +158,7 @@ in
     // {
       name = "tinycc-boot-mes-arena";
       MES_DEBUG = "3";
+      allowSubstitutes = false;
     }
   );
 }

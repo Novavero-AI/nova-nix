@@ -5,7 +5,8 @@
 # script whose chmod calls decide which of its files are executable.
 let
   inherit (import ../../pkgs/windows) stage0-pe32;
-  inherit (stage0-pe32) kaem writeText;
+  inherit (stage0-pe32) writeText;
+  kaem = import ./check.nix stage0-pe32.kaem;
 
   hello = writeText "hello.txt" ''
     stage0-pe32 runs a kaem script
