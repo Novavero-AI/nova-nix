@@ -107,13 +107,14 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (chr, digitToInt, intToDigit, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, isOctDigit, ord, toUpper)
+import Data.Either (partitionEithers)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
 import Data.List (partition, sort, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, maybeToList)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -159,7 +160,6 @@ import Nix.Eval.Types
     StringContext (..),
     StringContextElement (..),
     Thunk (..),
-    allocCSlots,
     attrSetElems,
     attrSetFromEntries,
     attrSetFromMap,
@@ -189,10 +189,8 @@ import Nix.Eval.Types
     envWithScopesRaw,
     evaluated,
     fillCAttrSetValues,
-    fillCSlots,
     mkStr,
     mkStrBytes,
-    mkSyntheticThunk,
     mkThunkBc,
     newCEnv,
     newMinimalEnv,
@@ -200,6 +198,7 @@ import Nix.Eval.Types
     runPureEval,
     storePathOrThrow,
     thunkToCPtr,
+    tieFrame,
     typeName,
     typeOfValue,
     unrestrictedPolicy,
@@ -809,18 +808,24 @@ newFrameEnv env captureInfo slots slotCount scope =
       Captures _ -> (nullPtr, 0)
       CapturesWithScopes _ -> withScopesForCapture env
 
+-- | The positional frame of a recursive attr set or a @let@ in @env@: the
+-- frame's env and the thunks in its slots, in declaration order, tied by
+-- 'tieFrame' as upstream's @ExprAttrs::eval@ and @ExprLet::eval@ tie
+-- @env2@.
+tieBindingFrame :: Env -> [BcBinding] -> CaptureInfo -> (Env, [Thunk])
+tieBindingFrame env bindings captureInfo =
+  tieFrame
+    (bcBindingSlotCount bindings)
+    (\slots slotCount -> newFrameEnv env captureInfo slots slotCount Nothing)
+    (\frame -> buildBcSlotThunks frame env bindings)
+
 -- | Evaluate a recursive attr set from bytecode bindings.
 evalBcRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> CaptureInfo -> m NixValue
 evalBcRecAttrs env bindings captureInfo
   | allBcPositional bindings =
       -- Positional path: slots for variable lookup, CAttrSet for return.
-      let slotCount = bcBindingSlotCount bindings
-          slotsPtr = allocCSlots slotCount
-          recEnv = newFrameEnv env captureInfo slotsPtr slotCount Nothing
-          thunkList = buildBcSlotThunks recEnv env bindings
-          filled = fillCSlots slotsPtr thunkList
-          entries = buildBcEntryMapFromSlots bindings thunkList
-       in filled `seq` pure (VAttrs (attrSetFromEntries entries))
+      let (_, thunkList) = tieBindingFrame env bindings captureInfo
+       in pure (VAttrs (attrSetFromEntries (buildBcEntryMapFromSlots bindings thunkList)))
   | otherwise = do
       -- Dynamic-key path: the set has a ${dynamic} key, so names are not all
       -- known at compile time.  Not a corner-cutting fallback:
@@ -851,13 +856,10 @@ evalBcLet env bcIdx0 = do
       bindings = unsafePerformIO (decodeBcBindings bindCount dataOff)
       captureInfo = unsafePerformIO (decodeBcCaptureInfo captureOff)
   if allBcPositional bindings
-    then do
+    then
       -- Positional path: slots for O(1) lookup.
-      let slotCount = bcBindingSlotCount bindings
-          slotsPtr = allocCSlots slotCount
-          letEnv = newFrameEnv env captureInfo slotsPtr slotCount Nothing
-          filled = fillCSlots slotsPtr (buildBcSlotThunks letEnv env bindings)
-       in filled `seq` evalBytecode letEnv bodyIdx
+      let (letEnv, _) = tieBindingFrame env bindings captureInfo
+       in evalBytecode letEnv bodyIdx
     else do
       -- Dynamic path: a dynamic key, which the parser refuses in a let as
       -- upstream's parser.y does, so only an AST built outside the parser
@@ -908,7 +910,7 @@ buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
           mkInheritThunk (BcInheritedName _ _ selectBcIdx) =
             let (sp, sc) = buildCSlots [fromThunk]
                 fromEnv = newMinimalEnv sp sc
-             in mkSyntheticThunk fromEnv selectBcIdx
+             in mkThunkBc fromEnv selectBcIdx
        in map mkInheritThunk names
     -- Unreachable: allBcPositional guards this path.
     slotThunk _ = []
@@ -956,7 +958,7 @@ buildBcEntryMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
       let addInheritFrom a inherited@(BcInheritedName pos _ selectBcIdx) =
             let (sp, sc) = buildCSlots [mkThunkBc thunkEnv fromBcIdx]
                 fromEnv = newMinimalEnv sp sc
-             in insertChecked a (inheritedNameText inherited) (AttrEntry pos (mkSyntheticThunk fromEnv selectBcIdx))
+             in insertChecked a (inheritedNameText inherited) (AttrEntry pos (mkThunkBc fromEnv selectBcIdx))
        in foldM addInheritFrom acc names
 
     -- The parser normalizes static keys to appear exactly once, so a
@@ -1132,30 +1134,25 @@ matchFormals closureEnv (EFNamedSet _ formals allowExtra) argThunk = do
   matchFormalSet closureEnv formals allowExtra argVal (Just argThunk)
 
 -- | Match destructuring set pattern formals against an attrset value.
+--
+-- The env is a knot: a default is evaluated in it, where it may name
+-- another formal or the @-pattern, and its slots hold the defaults'
+-- thunks.  'tieFrame' builds it as upstream's @callFunction@ builds
+-- @env2@ (eval.cc at 2.24.9).  A default is a 'mkThunkBc' and not a
+-- 'cheapThunkBc', which would read a variable default out of a slot
+-- 'tieFrame' has not filled yet.
 matchFormalSet :: (MonadEval m) => Env -> [EvalFormal] -> Bool -> NixValue -> Maybe Thunk -> m Env
 matchFormalSet closureEnv formals allowExtra argVal atThunk =
   case argVal of
     VAttrs attrs -> do
       checkExtraKeys formals allowExtra attrs
-      checkMissingFormals attrs formals
-      -- A knot, and its laziness is load-bearing: formalEnv is built from
-      -- the slots, and a default's thunk in the slots holds formalEnv, the
-      -- env a default is evaluated in (it may name another formal or the
-      -- @-pattern), as upstream's callFunction allocates env2 before it
-      -- fills the values (eval.cc).  'mkThunkBc' keeps that env unforced
-      -- behind a StablePtr; 'cheapThunkBc' would look a variable default
-      -- up in formalEnv while formalEnv is being built, and fail <<loop>>.
-      let formalEnv = envFromSlots formalSlotsPtr formalSlotCount closureEnv
-          (formalSlotsPtr, formalSlotCount) = buildCSlots formalThunks
-          formalThunks = case atThunk of
-            Nothing -> map resolveOneFormal formals
-            Just at -> at : map resolveOneFormal formals
-          resolveOneFormal (EvalFormal name defBcIdx) =
-            case attrSetLookup name attrs of
-              Just thunk -> thunk
-              Nothing -> case defBcIdx of
-                Just bcIdx -> mkThunkBc formalEnv bcIdx
-                Nothing -> error "matchFormalSet: missing required formal (unreachable)"
+      formalValues <- formalSlots attrs formals
+      let atSlot = maybeToList atThunk
+          (formalEnv, _) =
+            tieFrame
+              (length atSlot + length formalValues)
+              (\slots slotCount -> envFromSlots slots slotCount closureEnv)
+              (\frame -> atSlot ++ map ($ frame) formalValues)
       pure formalEnv
     _ -> throwEvalError ("function expects a set argument, got " <> typeName argVal)
 
@@ -1169,16 +1166,22 @@ checkExtraKeys formals False attrs =
         [] -> pure ()
         (k : _) -> throwEvalError ("unexpected attribute '" <> k <> "' in function argument")
 
-checkMissingFormals :: (MonadEval m) => AttrSet -> [EvalFormal] -> m ()
-checkMissingFormals attrs formals =
-  let allMissing = [efName f | f <- formals, isNothing (efDefault f), not (attrSetMember (efName f) attrs)]
-   in case allMissing of
-        [] -> pure ()
-        (name : _) ->
-          let provided = attrSetKeys attrs
-              provSnippet = T.intercalate ", " (take 20 provided)
-              missSnippet = T.intercalate ", " allMissing
-           in throwEvalError ("missing required attribute '" <> name <> "'; all missing: [" <> missSnippet <> "]; provided keys (" <> T.pack (show (length provided)) <> "): [" <> provSnippet <> "]")
+-- | Each formal's slot as a function of the env its default is evaluated
+-- in: the argument's own thunk, or a thunk of the default there.  A
+-- formal with neither fails the call, naming every such formal.
+formalSlots :: (MonadEval m) => AttrSet -> [EvalFormal] -> m [Env -> Thunk]
+formalSlots attrs formals =
+  case partitionEithers (map formalSlot formals) of
+    ([], slots) -> pure slots
+    (missing@(name : _), _) ->
+      let provided = attrSetKeys attrs
+          provSnippet = T.intercalate ", " (take 20 provided)
+          missSnippet = T.intercalate ", " missing
+       in throwEvalError ("missing required attribute '" <> name <> "'; all missing: [" <> missSnippet <> "]; provided keys (" <> T.pack (show (length provided)) <> "): [" <> provSnippet <> "]")
+  where
+    formalSlot (EvalFormal name defBcIdx) = case attrSetLookup name attrs of
+      Just thunk -> Right (const thunk)
+      Nothing -> maybe (Left name) (Right . flip mkThunkBc) defBcIdx
 
 -- | Build capture environment from capture info.
 -- NoCaptureInfo: no trimming, use env as-is.
@@ -2304,7 +2307,7 @@ deferApplyThunk :: Thunk -> Thunk -> Thunk
 deferApplyThunk fnThunk argThunk =
   let (sp, sc) = buildCSlots [fnThunk, argThunk]
       env = newMinimalEnv sp sc
-   in mkSyntheticThunk env reservedApply1
+   in mkThunkBc env reservedApply1
 
 -- | The non-copying path coercion: the path text verbatim, no context -
 -- upstream's @coerceToString@ with @copyToStore = false@.
@@ -2663,7 +2666,7 @@ builtinMapAttrs funcArg (VAttrs attrs) =
     deferAttr key valThunk =
       let (sp, sc) = buildCSlots [fnThunk, evaluated (mkStr key), valThunk]
           env = newMinimalEnv sp sc
-       in mkSyntheticThunk env reservedApply2
+       in mkThunkBc env reservedApply2
 builtinMapAttrs _ other =
   throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
 
@@ -2710,7 +2713,7 @@ builtinZipAttrsWith func (VList cl) = do
       let valueList = VList (clistFromThunks (map thunkToCPtr thunkList))
           (slots, slotCount) = buildCSlots [fnThunk, evaluated (mkStr key), evaluated valueList]
           env = newMinimalEnv slots slotCount
-       in (key, mkSyntheticThunk env reservedApply2)
+       in (key, mkThunkBc env reservedApply2)
 builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
 

@@ -7,10 +7,10 @@
  * stableptrs), which is O(total) - index-based iteration via nn_thunk_get
  * would be O(total * blocks), since each get re-walks the block list.
  *
- * StablePtr sources (see nn_thunk.c):
- *   1. PENDING/BLACKHOLE: payload = StablePtr Env (knot-tying laziness)
- *   2. COMPUTED with val_tag == NN_VALUE_PTR: StablePtr NixValue
- * All other COMPUTED payloads (inline scalars, C pointers) are NOT freed.
+ * The one StablePtr source (see nn_thunk.c) is a COMPUTED thunk with
+ * val_tag == NN_VALUE_PTR, holding a StablePtr NixValue.  Every other
+ * payload (a pending thunk's env pointer, inline scalars, C pointers)
+ * is NOT freed.
  */
 
 #include "nn_arena.h"

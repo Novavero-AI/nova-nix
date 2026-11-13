@@ -138,7 +138,7 @@ nn_thunk_destroy(void)
 /* --- Allocation --- */
 
 nn_thunk_t *
-nn_thunk_new_bc(uint32_t bc_idx, void *env_ptr)
+nn_thunk_new_bc(uint32_t bc_idx, void *env)
 {
     nn_thunk_t *t = arena_alloc(g_arena);
     if (!t) return NULL;
@@ -146,7 +146,7 @@ nn_thunk_new_bc(uint32_t bc_idx, void *env_ptr)
     t->val_tag = 0;
     t->_pad = 0;
     t->bc_idx = bc_idx;
-    t->payload = env_ptr;
+    t->payload = env;
     return t;
 }
 
@@ -154,14 +154,6 @@ uint32_t
 nn_thunk_get_bc_idx(const nn_thunk_t *thunk)
 {
     return thunk->bc_idx;
-}
-
-int
-nn_thunk_set_payload(nn_thunk_t *thunk, void *payload)
-{
-    if (thunk->state != NN_THUNK_PENDING) return 0;
-    thunk->payload = payload;
-    return 1;
 }
 
 nn_thunk_t *
@@ -533,6 +525,13 @@ nn_thunk_get(uint32_t index)
 
 /* --- Bulk StablePtr collection (single block-list pass, O(total)) --- */
 
+static int
+holds_stableptr(const nn_thunk_t *t)
+{
+    return t->state == NN_THUNK_COMPUTED && t->val_tag == NN_VALUE_PTR
+        && t->payload != NULL;
+}
+
 uint32_t
 nn_thunk_count_stableptrs(void)
 {
@@ -542,12 +541,7 @@ nn_thunk_count_stableptrs(void)
     if (!g_arena) return 0;
     for (block = g_arena->head; block; block = block->next) {
         for (i = 0; i < block->count; i++) {
-            const nn_thunk_t *t = &block->slots[i];
-            if (t->state == NN_THUNK_PENDING || t->state == NN_THUNK_BLACKHOLE) {
-                if (t->payload) count++;
-            } else if (t->state == NN_THUNK_COMPUTED && t->val_tag == NN_VALUE_PTR) {
-                if (t->payload) count++;
-            }
+            if (holds_stableptr(&block->slots[i])) count++;
         }
     }
     return count;
@@ -563,11 +557,7 @@ nn_thunk_collect_stableptrs(void **output, uint32_t max_count)
     for (block = g_arena->head; block && written < max_count; block = block->next) {
         for (i = 0; i < block->count && written < max_count; i++) {
             const nn_thunk_t *t = &block->slots[i];
-            if (t->state == NN_THUNK_PENDING || t->state == NN_THUNK_BLACKHOLE) {
-                if (t->payload) output[written++] = t->payload;
-            } else if (t->state == NN_THUNK_COMPUTED && t->val_tag == NN_VALUE_PTR) {
-                if (t->payload) output[written++] = t->payload;
-            }
+            if (holds_stableptr(t)) output[written++] = t->payload;
         }
     }
     return written;

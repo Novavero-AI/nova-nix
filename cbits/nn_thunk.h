@@ -6,17 +6,17 @@
  * pointer) and transitions to COMPUTED (holding the result value) on
  * first force.  A BLACKHOLE state detects infinite recursion.
  *
- * Replaces Haskell's IORef ThunkCell (~56 bytes on GHC heap, all GC-
- * traced) with a 16-byte C struct in an arena (invisible to GHC GC).
- * For 8M thunks: ~450 MB less GHC heap pressure.
+ * Each thunk is a 16-byte C struct in an arena, invisible to GHC's GC.
  *
  * Arena: chunked bump allocator.  Thunks are never individually freed -
  * the entire arena is destroyed at evaluation end.  Pointers into the
  * arena remain valid until nn_thunk_destroy().
  *
- * PENDING payloads are StablePtr Env (~16 bytes on GHC heap).  The
- * StablePtr is necessary for knot-tying: deferred env construction in
- * recursive lets/attrs requires Haskell laziness.  Freed on force.
+ * PENDING payloads are the nn_env_t * the code runs in, owned by the env
+ * arena, so a pending thunk holds no reference into the GHC heap.  A
+ * recursive frame (rec attrs, let, a formals set) is allocated with its
+ * slot array before the thunks that point at it, and its slots are
+ * filled after, as upstream allocates env2 before filling its values.
  * COMPUTED payloads are either inline scalars (int/float/bool/null via
  * val_tag 0-3), C-native pointers (str/path/list/attrs/ctxstr/lambda
  * via val_tag 4-9), or StablePtrs (for VBuiltin/VDrv via tag 255).
@@ -57,7 +57,7 @@
  * bc_idx(4) + payload(8).  val_tag is valid only when state == COMPUTED.
  *
  * PENDING:   bc_idx = bytecode instruction index
- *            payload = StablePtr Env (Haskell-side, for knot-tying)
+ *            payload = nn_env_t * the code runs in
  * COMPUTED:  val_tag selects interpretation of payload:
  *            INT/BOOL: (intptr_t) cast of scalar
  *            FLOAT: memcpy'd double
@@ -90,8 +90,8 @@ void nn_thunk_init(uint32_t initial_capacity);
 int nn_thunk_live(void);
 
 /* Destroy the global thunk arena, freeing all block memory.
- * Does NOT free payload StablePtrs - caller must iterate and free
- * them first (via nn_thunk_count/nn_thunk_get).
+ * Does NOT free NN_VALUE_PTR StablePtrs - caller collects and frees
+ * them first (via nn_thunk_collect_stableptrs).
  * All nn_thunk_t pointers become invalid after this call. */
 void nn_thunk_destroy(void);
 
@@ -100,19 +100,13 @@ void nn_thunk_destroy(void);
 /* Allocate a new PENDING thunk with a bytecode index + env payload.
  * Returns a pointer into arena memory, valid until nn_thunk_destroy().
  * bc_idx is the root instruction index in the bytecode store.
- * env_ptr is a StablePtr Env from Haskell (required for knot-tying;
- * raw Ptr would force the env at allocation time, breaking laziness). */
-nn_thunk_t *nn_thunk_new_bc(uint32_t bc_idx, void *env_ptr);
+ * env is the nn_env_t * the code runs in.  It must already exist, but
+ * its slots need not be filled yet: nothing reads them until the thunk
+ * is forced. */
+nn_thunk_t *nn_thunk_new_bc(uint32_t bc_idx, void *env);
 
 /* Read the bytecode index from a PENDING thunk. */
 uint32_t nn_thunk_get_bc_idx(const nn_thunk_t *thunk);
-
-/* Set the payload of a PENDING thunk.  Used for deferred env fixup in
- * knot-tying (rec attrs, let, formal defaults): allocate the thunk
- * with NULL payload first, then fill the env pointer once the
- * knot-tied env is constructed.  Returns 1, or 0 with the thunk
- * unchanged if it is not PENDING. */
-int nn_thunk_set_payload(nn_thunk_t *thunk, void *payload);
 
 /* Allocate a new pre-COMPUTED thunk from the arena (StablePtr payload).
  * value is an opaque pointer (StablePtr to Haskell NixValue).
@@ -183,11 +177,10 @@ int nn_thunk_mark_pending(nn_thunk_t *thunk);
 /* Set a non-COMPUTED thunk to COMPUTED, the setter naming the value
  * kind: a StablePtr NixValue (NN_VALUE_PTR), an inline scalar, or a
  * C-native complex value.  Accepts PENDING or BLACKHOLE state (skips
- * blackhole for direct memoization).  The pending payload is overwritten,
- * not handed back: a NULL return could not tell a refusal from a NULL
- * payload, and the caller already read the payload to evaluate the
- * thunk, so it frees the StablePtr itself.  Returns 1, or 0 with the
- * thunk unchanged if it is already COMPUTED. */
+ * blackhole for direct memoization).  The pending payload is overwritten:
+ * it is an env pointer the env arena owns, so there is nothing to hand
+ * back or free.  Returns 1, or 0 with the thunk unchanged if it is
+ * already COMPUTED. */
 int nn_thunk_set_computed(nn_thunk_t *thunk, void *value);
 int nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value);
 int nn_thunk_set_computed_float(nn_thunk_t *thunk, double value);
@@ -205,15 +198,14 @@ int nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda);
 /* Total thunks allocated across all blocks. */
 uint32_t nn_thunk_count(void);
 
-/* Get a thunk by global index (0-based, across all blocks).
- * Used for StablePtr cleanup iteration before nn_thunk_destroy().
- * Index must be < nn_thunk_count(). */
+/* Get a thunk by global index (0-based, across all blocks, in allocation
+ * order), or NULL when index >= nn_thunk_count().  O(blocks) per call. */
 nn_thunk_t *nn_thunk_get(uint32_t index);
 
 /* Single-pass (O(total)) collection of Haskell StablePtr payloads across the
  * whole arena.  Walks the block list directly - nn_thunk_get is O(blocks) per
- * call, so index-based iteration would be O(total * blocks).  StablePtr
- * sources: PENDING/BLACKHOLE payload, and COMPUTED + NN_VALUE_PTR payload.
+ * call, so index-based iteration would be O(total * blocks).  The only
+ * StablePtr payload is a COMPUTED thunk's with val_tag NN_VALUE_PTR.
  * nn_thunk_collect_stableptrs writes up to max_count pointers into `output`
  * and returns the count written.  These back the nn_arena_* teardown helpers. */
 uint32_t nn_thunk_count_stableptrs(void);

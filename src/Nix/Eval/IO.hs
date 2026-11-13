@@ -64,7 +64,7 @@ import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, pendingThunkEnv, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
@@ -748,7 +748,7 @@ instance MonadEval EvalIO where
     -- Blackhole detection: PENDING thunks are marked BLACKHOLE before
     -- evaluation begins.  If evaluation re-enters the same thunk, it
     -- sees BLACKHOLE and reports infinite recursion.  This is safe with
-    -- knot-tying (evalRecAttrs, evalLet, matchFormalSet) because those
+    -- knot-tying (evalBcRecAttrs, evalBcLet, matchFormalSet) because those
     -- patterns create distinct thunks sharing an env - no thunk ever
     -- forces itself.
     state <- EvalIO (liftIO (cthunkState ptr))
@@ -761,13 +761,8 @@ instance MonadEval EvalIO where
         -- the error propagates through tryEval/catchEvalError.
         abortEvaluation "infinite recursion encountered"
       ThunkPending -> do
-        -- Bytecode thunks: read bc_idx + StablePtr Env.
-        -- The Expr is gone (replaced by bc_idx in the struct).
-        -- The Env is still a StablePtr (for knot-tying laziness).
         bcIdx <- EvalIO (liftIO (cthunkGetBcIdx ptr))
-        envSp <- EvalIO (liftIO (cthunkPayload ptr))
-        let pendingSp = castPtrToStablePtr envSp
-        env <- EvalIO (liftIO (deRefStablePtr pendingSp))
+        env <- EvalIO (liftIO (pendingThunkEnv ptr))
         -- Mark blackhole BEFORE evaluation - any re-entry hits the
         -- BLACKHOLE branch above.
         EvalIO . liftIO $ do
@@ -784,7 +779,7 @@ instance MonadEval EvalIO where
         -- restore's own answer is not needed: it refuses only a thunk that is
         -- no longer BLACKHOLE, which a later force already handles, and the
         -- exception in flight is the one to report.
-        val <- EvalIO $ do
+        EvalIO $ do
           st <- ask
           liftIO
             ( ( do
@@ -794,9 +789,6 @@ instance MonadEval EvalIO where
               )
                 `onException` cthunkMarkPending ptr
             )
-        -- The value is stored, so nothing reads the pending env again.
-        EvalIO (liftIO (freeStablePtr pendingSp))
-        pure val
       other ->
         EvalIO (liftIO (cInvariantViolated "nn_thunk_state" ("no thunk has state " ++ show other)))
 

@@ -3,8 +3,8 @@
 -- Initializes and destroys all C sub-arenas (symbol table, thunk arena,
 -- env slot allocator, bytecode store) with a single pair of calls.
 -- Handles StablePtr cleanup on destruction: iterates all thunks,
--- identifies payloads that are Haskell StablePtrs (PENDING +
--- COMPUTED\/PTR), and frees them before tearing down the C memory.
+-- identifies payloads that are Haskell StablePtrs (COMPUTED\/PTR), and
+-- frees them before tearing down the C memory.
 --
 -- Everything that evaluates runs between the two calls:
 --
@@ -113,11 +113,9 @@ arenaDestroy = do
 
 -- | Free all StablePtrs held by thunk payloads.
 -- Uses batch C-side collection to avoid per-thunk FFI crossing.
--- Frees payloads from three thunk states:
---   PENDING:              StablePtr (Expr, Env)
---   BLACKHOLE:            original PENDING StablePtr (eval failed/in-progress)
---   COMPUTED/NN_VALUE_PTR: StablePtr NixValue
--- Inline scalar/C-pointer payloads (INT..CTXSTR) are skipped.
+-- The only StablePtr payload is a COMPUTED\/NN_VALUE_PTR thunk's
+-- NixValue.  A pending or blackholed thunk's env pointer belongs to the
+-- env arena, and inline scalar\/C-pointer payloads are skipped.
 cleanupStablePtrs :: IO ()
 cleanupStablePtrs = do
   count <- c_nn_arena_stableptr_count
