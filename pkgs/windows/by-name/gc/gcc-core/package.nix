@@ -93,8 +93,7 @@
 #   malloc.h, which the two libraries' headers never read.  A macro that
 #   names itself leaves their calls to tcc's alloca; GCC's own sources take
 #   libiberty's C_alloca, which libiberty.h gives every compiler that is
-#   not GCC (include/libiberty.h:649-663).  It also stands in for
-#   configure's default, -g -O2 (see binutils).
+#   not GCC (include/libiberty.h:649-663).
 #
 #   LDFLAGS=-luser32: libiberty's lrealpath.c calls CharLowerBuff, in
 #   user32.dll.  GCC built for MinGW links user32 into every program

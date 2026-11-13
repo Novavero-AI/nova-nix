@@ -73,10 +73,6 @@
 #   add to one in steps, as libtool does past its command length.  The
 #   flag goes once the archiver is this package's own ar.
 #
-#   CFLAGS=: configure's default for a compiler it takes for GCC, which
-#   the stdenv's config.site has it take tcc for, is -g -O2, and tcc's
-#   debugging information names the build directory.
-#
 #   compat/include: alloca as a macro and rpcdce.h, each file naming the
 #   MinGW-w64 lines it follows.
 #
@@ -119,7 +115,6 @@ seedStdenv.mkDerivation {
     "--enable-deterministic-archives"
     "--disable-dependency-tracking"
     "--with-lib-path=:"
-    "CFLAGS="
   ];
 
   makeFlags = [ "MAKEINFO=true" ];

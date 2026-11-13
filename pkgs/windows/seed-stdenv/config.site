@@ -13,12 +13,21 @@
 # under a name of its own and stores the answer in the variables libtool
 # reads, with_gnu_ld and, through config.rpath, libext, so a configure
 # script that runs both needs all three.  A compiler configure takes for
-# GCC gets -g -O2 where CFLAGS is unset and the package's GCC warning
-# options; tcc takes the first and passes over a warning option it does
-# not know.
+# GCC also gets the package's GCC warning options, and tcc passes over one
+# it does not know.
 ac_cv_c_compiler_gnu=yes
 lt_cv_prog_gnu_ld=yes
 acl_cv_prog_gnu_ld=yes
+
+# configure gives a compiler it takes for GCC -g -O2 where neither the
+# package nor the environment sets CFLAGS.  tcc's debugging information
+# names the directory tcc ran in and each file by the path it opened, a
+# header from the store by the store's physical path, so a program built
+# with -g would differ with the store's drive and with the user whose
+# temporary directory the build ran in; and tcc's -O only defines
+# __OPTIMIZE__.  So the default is empty, and a package's own CFLAGS still
+# wins.
+test "${CFLAGS+set}" = set || CFLAGS=
 
 # TinyCC's stdlib.h defines atoll inline, on msvcrt.dll's _atoi64, and
 # msvcrt.dll exports no atoll, so configure's link test, which declares
