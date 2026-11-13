@@ -12,3 +12,20 @@ PATH_SEPARATOR=';'
 # ac_executable_extensions.  The commands on PATH are .exe files, and
 # busybox's test, unlike Cygwin's, does not add the suffix itself.
 ac_executable_extensions=.exe
+
+# libtool takes a Windows compiler that is not GCC for Microsoft's, and then
+# archives with lib, names a static library .lib and passes each source
+# through cygpath; with GCC it does the same unless the linker is GNU ld
+# (_LT_LINKER_SHLIBS in libtool.m4, the cygwin* | mingw* cases).  TinyCC
+# defines no __GNUC__ and prints no "GNU" for -v, so configure finds it
+# neither.  Either of the first two settings alone leaves libtool with
+# Microsoft's tools.  gettext's lib-ld.m4 asks the linker the same question
+# under a name of its own and stores the answer in the variables libtool
+# reads, with_gnu_ld and, through config.rpath, libext, so a configure
+# script that runs both needs all three.  A compiler configure takes for
+# GCC gets -g -O2 where CFLAGS is unset and the package's GCC warning
+# options; tcc takes the first and passes over a warning option it does
+# not know.
+ac_cv_c_compiler_gnu=yes
+lt_cv_prog_gnu_ld=yes
+acl_cv_prog_gnu_ld=yes

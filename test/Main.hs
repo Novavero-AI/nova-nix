@@ -13177,7 +13177,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["busybox.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
+    checkFiles = ["binutils.nix", "busybox.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -13305,6 +13305,111 @@ testSeedStdenvWindows = do
         "msvcr80plus_ftruncate64.c",
         helloArchive
       ]
+
+-- | @pkgs/windows@'s binutils, read back as the build driver reads it: what
+-- binutils and @test\/data\/binutils.nix@'s checks add to the closure of
+-- the seed stdenv's tools and applets, which build it.  The rung is
+-- full-source only if the one leaf it adds is binutils' archive, and it
+-- reads no input source but the stdenv's own files, the package's patch
+-- and compatibility headers, and what evaluation writes as text.  The
+-- stdenv's @setup.sh@ applies the patch and searches the headers only if
+-- the derivation names them in the variables it reads, @patches@ and
+-- @buildInputs@.  The target is the triple GCC is configured for on the
+-- next rung, which finds these tools by its name.
+testBinutilsWindows :: IO [Bool]
+testBinutilsWindows = do
+  putStrLn "pkgs/binutils"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          stdenvGraph <- sessionClosure (mapMaybe (`Map.lookup` rootOf) stdenvRoots)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, stdenvGraph, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, stdenvGraph, full) -> do
+      let added = Map.elems (Map.difference full stdenvGraph)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          binutils = Map.lookup binutilsRoot rootOf >>= (`Map.lookup` full)
+          -- The input sources of binutils' derivation under a name, as its
+          -- environment spells a store path.
+          sourcesNamed name = [storePathToText defaultStoreDir path | drv <- maybeToList binutils, path <- drvInputSrcs drv, spName path == name]
+          wordsOf name = maybe [] (T.words . variableOf name) binutils
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetch is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the one leaf it adds is binutils' archive, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              ([archive], True)
+              (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text, the stdenv's files and the package's patch and headers" $
+            assertEqual
+              "input sources not written as text"
+              ["compat", "config.site", patch, "include", "setup.sh"]
+              (sort [spName path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]),
+          runTest "binutils names its patch and its headers where setup.sh reads them" $
+            assertEqual
+              "patches and buildInputs"
+              (sourcesNamed patch, sourcesNamed "compat", True)
+              (wordsOf "patches", wordsOf "buildInputs", isJust binutils),
+          runTest "binutils is configured for the target GCC is" $
+            assertEqual "target flags" ["--target=" <> target] (filter ("--target=" `T.isPrefixOf`) (wordsOf "configureFlags"))
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the binutils derivations instantiate, adding seven to the closure of the seed stdenv's tools"
+    version :: Text
+    version = "2.41"
+    archive :: Text
+    archive = "binutils-" <> version <> ".tar.xz"
+    patch :: Text
+    patch = "fix-tinycc-attribute.patch"
+    target :: Text
+    target = "i686-w64-mingw32"
+    binutilsRoot :: Text
+    binutilsRoot = "pkgs.binutils"
+    stdenvRoots :: [Text]
+    stdenvRoots = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets"]
+    roots :: [Text]
+    roots = stdenvRoots ++ [binutilsRoot, "checks.version", "checks.answer"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      [archive, "binutils-" <> version, "answer.sh"]
+        ++ concat [[name, name <> "-builder"] | name <- ["binutils-get-version", "binutils-answer"]]
 
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
@@ -20271,6 +20376,7 @@ runSuite = do
           testGnumakeWindows,
           testBusyboxWindows,
           testSeedStdenvWindows,
+          testBinutilsWindows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,
