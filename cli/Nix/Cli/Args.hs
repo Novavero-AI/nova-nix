@@ -41,6 +41,9 @@ data CliOpts = CliOpts
     optTraceVerbose :: !Bool,
     -- | @--fallback@: upstream's fallback, turned on for this run.
     optFallback :: !Bool,
+    -- | @--check@: the build checks its derivation, as @nix-build --check@
+    -- does.
+    optCheck :: !Bool,
     optCommand :: !Command
   }
   deriving (Eq, Show)
@@ -102,7 +105,7 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing False []
 -- silent drop: an unknown or misspelled flag fails the parse, so nothing
 -- after it (a requested @--substituter@, say) is quietly discarded.
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False False False CmdUsage)
+parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False False False False CmdUsage)
   where
     go opts [] = Right opts
     -- Answered before anything else is looked at, and the rest of the line
@@ -192,6 +195,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       goBuild (opts {optTraceVerbose = True}) buildArgs rest
     goBuild opts buildArgs ("--fallback" : rest) =
       goBuild (opts {optFallback = True}) buildArgs rest
+    goBuild opts buildArgs ("--check" : rest) =
+      goBuild (opts {optCheck = True}) buildArgs rest
     goBuild opts buildArgs ("--expr" : expr : rest) =
       withTarget opts buildArgs (TargetExpr (T.pack expr)) rest
     goBuild opts buildArgs (flag : path : rest)

@@ -43,7 +43,7 @@ import Nix.Expr.Types (Expr)
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
-import Nix.Realise (Fallback (..), SubstitutesSetting (..))
+import Nix.Realise (BuildMode (..), Fallback (..), SubstitutesSetting (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
@@ -428,7 +428,7 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
           -- builtins.toFile wrote these during evaluation but could not
           -- register them; a derivation naming one needs them valid first.
           materializeEvalStoreWrites store storeWrites
-          buildResult <- buildAndRegister store caches (fallbackFor opts config) (substitutesFor config) wrappers drvClosure drv drvSP
+          buildResult <- buildAndRegister store caches (fallbackFor opts config) (substitutesFor config) (buildModeFor opts) wrappers drvClosure drv drvSP
           -- The root is registered before the handle closes: the handle's
           -- lease is what keeps a concurrent collection from running
           -- between the build's end and the link's creation.  The path
@@ -439,9 +439,11 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
             BuildFailure _ _ -> pure Nothing
           closeStore store
           case (buildResult, rooted) of
+            -- The status printed is the status exited with: 1, or upstream's
+            -- 104 for a check that found an output different.
             (BuildFailure msg code, _) -> do
               TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
-              exitFailure
+              exitWith (ExitFailure code)
             (BuildSuccess _, Just (Left err)) -> failWith ("build: " <> err)
             (BuildSuccess _, _) ->
               TIO.putStrLn (T.pack (storePathToFilePath (stDir store) outputPath))
@@ -541,6 +543,14 @@ substitutesFor :: NixConfig -> SubstitutesSetting
 substitutesFor config
   | ncAlwaysAllowSubstitutes config = AlwaysAllowSubstitutes
   | otherwise = HeedAllowSubstitutes
+
+-- | What this run does with the derivation it is asked for: with
+-- @--check@ it checks it, as @nix-build --check@ selects upstream's
+-- @bmCheck@.  Upstream has no setting for it, so the flag alone decides.
+buildModeFor :: CliOpts -> BuildMode
+buildModeFor opts
+  | optCheck opts = BuildCheck
+  | otherwise = BuildNormal
 
 -- | The caches from the resolved config plus the CLI flags.  The CLI
 -- @--substituter@ and @--trusted-key@ append on top, the highest
@@ -686,8 +696,8 @@ checkExecWrappers = Map.traverseWithKey check
 -- | Write the .drv file to the store and build with dependency resolution.
 -- The drvPath is the store path of the .drv file itself, extracted from
 -- the evaluation result alongside the Derivation struct.
-buildAndRegister :: Store -> [CacheConfig] -> Fallback -> SubstitutesSetting -> Map.Map T.Text FilePath -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
-buildAndRegister store caches fallback substitutes wrappers drvClosure drv drvSP = do
+buildAndRegister :: Store -> [CacheConfig] -> Fallback -> SubstitutesSetting -> BuildMode -> Map.Map T.Text FilePath -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
+buildAndRegister store caches fallback substitutes mode wrappers drvClosure drv drvSP = do
   -- Materialize the full input-.drv closure (every transitive dependency's
   -- recipe) to the store.  buildWithDeps reads these back to construct the
   -- dependency graph; without them it cannot realize any non-leaf derivation.
@@ -703,6 +713,7 @@ buildAndRegister store caches fallback substitutes wrappers drvClosure drv drvSP
             bcCaches = caches,
             bcFallback = fallback,
             bcSubstitutes = substitutes,
+            bcMode = mode,
             bcExecWrappers = wrappers
           }
   buildWithDeps config store drv drvSP

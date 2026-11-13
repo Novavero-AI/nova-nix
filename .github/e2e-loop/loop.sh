@@ -12,7 +12,10 @@
 #   4. asserts the two trees byte-identical via NAR serialisation compare
 #   5. pushes a fixture that forbids substitutes, and asserts a store that
 #      lacks it builds it, and substitutes it under always-allow-substitutes
-#   6. repeats with a multi-hundred-MB fixture, running the substitution
+#   6. checks a substituted output against a rebuild (build --check): one
+#      that builds the same every time passes, and one that does not fails
+#      with status 104 and leaves the store's copy alone
+#   7. repeats with a multi-hundred-MB fixture, running the substitution
 #      under a hard RTS heap cap so whole-archive retention aborts
 #
 # Required environment:
@@ -45,6 +48,10 @@ RTS_HEAP_CAP="-M128m"
 READY_ATTEMPTS=100
 READY_SLEEP_SECONDS=0.2
 
+# What nova-nix build --check exits with when a rebuilt output differs,
+# upstream's status for it.
+CHECK_MISMATCH_STATUS=104
+
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 fail() {
@@ -59,11 +66,12 @@ WORK=${E2E_WORK_DIR:-$(mktemp -d)}
 STORE_A="$WORK/store-a"
 STORE_B="$WORK/store-b"
 STORE_C="$WORK/store-c"
+STORE_D="$WORK/store-d"
 LOOP_STORE="$WORK/cache-loop"
 DUMP_A_STORE="$WORK/cache-dump-a"
 DUMP_B_STORE="$WORK/cache-dump-b"
 LOG_DIR="$WORK/logs"
-mkdir -p "$STORE_A" "$STORE_B" "$STORE_C" "$LOG_DIR"
+mkdir -p "$STORE_A" "$STORE_B" "$STORE_C" "$STORE_D" "$LOG_DIR"
 
 LOOP_URL="http://127.0.0.1:$LOOP_PORT"
 DUMP_A_URL="http://127.0.0.1:$DUMP_A_PORT"
@@ -265,6 +273,62 @@ OUT_LOCAL_C=$(NIX_CONFIG='always-allow-substitutes = true' substitute_into "$STO
 echo "store C path: $OUT_LOCAL_C"
 cmp "$OUT_LOCAL_A/nonce" "$OUT_LOCAL_C/nonce" \
   || fail "local nonce differs under always-allow-substitutes: store C rebuilt"
+
+# --------------------------------------------------------------------------
+# build --check: a substituted output held to a rebuild
+# --------------------------------------------------------------------------
+
+echo "== stable fixture: push, then substitute and check in one build --check =="
+OUT_STABLE_A=$(build_into "$STORE_A" stable.nix)
+echo "store A path: $OUT_STABLE_A"
+push_from "$STORE_A" "$LOOP_URL" zstd "$OUT_STABLE_A"
+
+# Store D holds nothing, so the check first substitutes the output and
+# then builds it again beside the substituted one: both tags are in the
+# log, and the ordinary build's is not.
+STABLE_LOG="$LOG_DIR/check-stable.nix.log"
+OUT_STABLE_D=$("$NOVA_NIX_BIN" build "$SCRIPT_DIR/stable.nix" --check --store "$STORE_D" \
+  --substituter "$LOOP_URL" --trusted-key "$PUB_KEY" 2> "$STABLE_LOG" | tail -n 1) || {
+  cat "$STABLE_LOG" >&2
+  fail "the check of stable.nix failed in store D"
+}
+echo "store D path: $OUT_STABLE_D"
+grep -Fq '[subst]' "$STABLE_LOG" || {
+  cat "$STABLE_LOG" >&2
+  fail "stable.nix was not substituted before the check"
+}
+grep -Fq '[check]' "$STABLE_LOG" || {
+  cat "$STABLE_LOG" >&2
+  fail "stable.nix was not built again and compared"
+}
+! grep -Fq '[build]' "$STABLE_LOG" || {
+  cat "$STABLE_LOG" >&2
+  fail "stable.nix was built as an ordinary build, not checked"
+}
+[ "$(basename "$OUT_STABLE_A")" = "$(basename "$OUT_STABLE_D")" ] \
+  || fail "the check printed $(basename "$OUT_STABLE_D"), not the output path"
+# The output records its own base name, so the rebuild, which wrote the
+# scratch path's, matched only once the check had rewritten that hash.
+[ "$(cat "$OUT_STABLE_D/self")" = "$(basename "$OUT_STABLE_D")" ] \
+  || fail "stable.nix does not record its own base name in store D"
+
+echo "== small fixture: a check of the substituted output finds the rebuild different =="
+# small.nix reads its nonce from /dev/urandom, so no rebuild reproduces the
+# bytes the cache served store B: the check has to fail with its own
+# status, name the output, and leave store B holding what it substituted.
+SMALL_CHECK_LOG="$LOG_DIR/check-small.nix.log"
+small_check_status=0
+"$NOVA_NIX_BIN" build "$SCRIPT_DIR/small.nix" --check --store "$STORE_B" \
+  > /dev/null 2> "$SMALL_CHECK_LOG" || small_check_status=$?
+[ "$small_check_status" -eq "$CHECK_MISMATCH_STATUS" ] || {
+  cat "$SMALL_CHECK_LOG" >&2
+  fail "the check of small.nix exited $small_check_status, not $CHECK_MISMATCH_STATUS"
+}
+grep -Fq "may not be deterministic: output '$OUT_B' differs" "$SMALL_CHECK_LOG" || {
+  cat "$SMALL_CHECK_LOG" >&2
+  fail "the check of small.nix did not name the output that differs"
+}
+cmp "$OUT_A/nonce" "$OUT_B/nonce" || fail "the check changed the output store B substituted"
 
 # --------------------------------------------------------------------------
 # Memory gate: large fixture under a hard RTS heap cap
