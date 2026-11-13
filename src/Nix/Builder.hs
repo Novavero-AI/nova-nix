@@ -97,7 +97,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, current
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
-import Nix.Realise (Fallback (..), FetchOutcome (..), RealiseEffects (..), Realised (..), SubstEffects (..), realise, realiseFailureMessage)
+import Nix.Realise (Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), SubstEffects (..), SubstitutesSetting (..), realise, realiseFailureMessage)
 import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText, unStoreDir)
@@ -244,6 +244,9 @@ data BuildConfig = BuildConfig
     bcCaches :: ![CacheConfig],
     -- | What a failed substitute leads to: upstream's @fallback@.
     bcFallback :: !Fallback,
+    -- | Whether a derivation's @allowSubstitutes@ attribute is heeded:
+    -- upstream's @always-allow-substitutes@.
+    bcSubstitutes :: !SubstitutesSetting,
     -- | Extraction budget for @builtin:unpack@ builds.
     bcUnpackLimits :: !UnpackLimits,
     -- | How a download is retried: each URL of a @builtin:fetchurl@
@@ -278,6 +281,7 @@ defaultBuildConfig dir =
           else "/tmp/nova-nix-build",
       bcCaches = [],
       bcFallback = NoFallback,
+      bcSubstitutes = HeedAllowSubstitutes,
       bcExecWrappers = Map.empty,
       bcUnpackLimits = defaultUnpackLimits,
       bcFetchRetry = defaultFetchRetryPolicy,
@@ -1587,11 +1591,13 @@ dedupStorePaths = Map.elems . Map.fromList . map (\sp -> (spHash sp, sp))
 -- 3. Try each derivation's outputs before its inputs, so a substituted
 --    derivation needs only its runtime closure.  What no cache supplies
 --    builds locally, leaves first, and so does what a cache fails to
---    deliver when 'bcFallback' allows it.
+--    deliver when 'bcFallback' allows it, and a derivation that forbids
+--    substitutes unless 'bcSubstitutes' overrides it.
 --
 -- Returns 'BuildSuccess' with the root output path on success, or
 -- 'BuildFailure' with exit code 1 if a derivation fails to build, a
--- substitute fails under 'NoFallback', or a cache cannot be asked.
+-- substitute fails under 'NoFallback', a cache cannot be asked, or a
+-- derivation's @allowSubstitutes@ cannot be read.
 buildWithDeps :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
 buildWithDeps config store rootDrv rootDrvPath = do
   graph <- buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
@@ -1602,7 +1608,8 @@ buildWithDeps config store rootDrv rootDrvPath = do
         TopoCycle _ ->
           pure (BuildFailure "dependency cycle detected" 1)
         TopoSorted _ -> do
-          result <- realise (bcFallback config) (realiseEffects config store) depGraph rootDrvPath
+          let settings = RealiseSettings {rsFallback = bcFallback config, rsSubstitutes = bcSubstitutes config}
+          result <- realise settings (realiseEffects config store) depGraph rootDrvPath
           case result of
             Left failure -> pure (BuildFailure (realiseFailureMessage failure) 1)
             Right () ->

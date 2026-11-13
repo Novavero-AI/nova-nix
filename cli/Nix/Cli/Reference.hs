@@ -230,7 +230,7 @@ command name = case name of
           Form "FILE.nix" "Build a derivation from a .nix file"
             :| [Form "--expr 'EXPR'" "Build a derivation from an inline expression"],
         commandDescription =
-          "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. A substituter that fails stops the build unless `fallback` is on. With `--out-link` the output is linked from `PATH` and kept from garbage collection; without it nothing is linked, where `nix-build` links `./result`.",
+          "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--out-link` the output is linked from `PATH` and kept from garbage collection; without it nothing is linked, where `nix-build` links `./result`.",
         commandExamples =
           Example
             "Build GNU Hello for Windows from the directory a release unpacks to, with the public cache as a substituter."
@@ -438,6 +438,7 @@ configuration =
         Setting "substituters" "Binary caches a build substitutes from" (Just SubstituterFlag)
           :| [ Setting "trusted-public-keys" "Public keys, one of whose signatures a substituted path must carry" (Just TrustedKeyFlag),
                Setting "fallback" "Build from source when a substitute fails" (Just FallbackFlag),
+               Setting "always-allow-substitutes" "Substitute a derivation whose `allowSubstitutes` attribute is false" Nothing,
                Setting "max-call-depth" ("How many function calls may be active around a new one before evaluation refuses it (default " <> T.pack (show defaultMaxCallDepth) <> ")") Nothing,
                Setting "restrict-eval" "Turn on restricted evaluation" (Just RestrictEvalFlag),
                Setting "pure-eval" "Turn on pure evaluation" (Just PureEvalFlag),

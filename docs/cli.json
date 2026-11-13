@@ -79,7 +79,7 @@
       ]
     },
     {
-      "description": "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. A substituter that fails stops the build unless `fallback` is on. With `--out-link` the output is linked from `PATH` and kept from garbage collection; without it nothing is linked, where `nix-build` links `./result`.",
+      "description": "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--out-link` the output is linked from `PATH` and kept from garbage collection; without it nothing is linked, where `nix-build` links `./result`.",
       "examples": [
         {
           "arguments": [
@@ -232,6 +232,11 @@
         "description": "Build from source when a substitute fails",
         "flag": "--fallback",
         "name": "fallback"
+      },
+      {
+        "description": "Substitute a derivation whose `allowSubstitutes` attribute is false",
+        "flag": null,
+        "name": "always-allow-substitutes"
       },
       {
         "description": "How many function calls may be active around a new one before evaluation refuses it (default 10000)",

@@ -43,7 +43,7 @@ import Nix.Expr.Types (Expr)
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
-import Nix.Realise (Fallback (..))
+import Nix.Realise (Fallback (..), SubstitutesSetting (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
@@ -428,7 +428,7 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
           -- builtins.toFile wrote these during evaluation but could not
           -- register them; a derivation naming one needs them valid first.
           materializeEvalStoreWrites store storeWrites
-          buildResult <- buildAndRegister store caches (fallbackFor opts config) wrappers drvClosure drv drvSP
+          buildResult <- buildAndRegister store caches (fallbackFor opts config) (substitutesFor config) wrappers drvClosure drv drvSP
           -- The root is registered before the handle closes: the handle's
           -- lease is what keeps a concurrent collection from running
           -- between the build's end and the link's creation.  The path
@@ -534,6 +534,13 @@ fallbackFor :: CliOpts -> NixConfig -> Fallback
 fallbackFor opts config
   | optFallback opts || ncFallback config = BuildFromSource
   | otherwise = NoFallback
+
+-- | Whether a derivation's @allowSubstitutes@ attribute is heeded on this
+-- run: the config's @always-allow-substitutes@.
+substitutesFor :: NixConfig -> SubstitutesSetting
+substitutesFor config
+  | ncAlwaysAllowSubstitutes config = AlwaysAllowSubstitutes
+  | otherwise = HeedAllowSubstitutes
 
 -- | The caches from the resolved config plus the CLI flags.  The CLI
 -- @--substituter@ and @--trusted-key@ append on top, the highest
@@ -679,8 +686,8 @@ checkExecWrappers = Map.traverseWithKey check
 -- | Write the .drv file to the store and build with dependency resolution.
 -- The drvPath is the store path of the .drv file itself, extracted from
 -- the evaluation result alongside the Derivation struct.
-buildAndRegister :: Store -> [CacheConfig] -> Fallback -> Map.Map T.Text FilePath -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
-buildAndRegister store caches fallback wrappers drvClosure drv drvSP = do
+buildAndRegister :: Store -> [CacheConfig] -> Fallback -> SubstitutesSetting -> Map.Map T.Text FilePath -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
+buildAndRegister store caches fallback substitutes wrappers drvClosure drv drvSP = do
   -- Materialize the full input-.drv closure (every transitive dependency's
   -- recipe) to the store.  buildWithDeps reads these back to construct the
   -- dependency graph; without them it cannot realize any non-leaf derivation.
@@ -695,6 +702,7 @@ buildAndRegister store caches fallback wrappers drvClosure drv drvSP = do
           { bcTmpDir = tmpDir,
             bcCaches = caches,
             bcFallback = fallback,
+            bcSubstitutes = substitutes,
             bcExecWrappers = wrappers
           }
   buildWithDeps config store drv drvSP

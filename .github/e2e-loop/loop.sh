@@ -10,7 +10,9 @@
 #   3. substitutes it into fresh scratch store B with signature
 #      verification on
 #   4. asserts the two trees byte-identical via NAR serialisation compare
-#   5. repeats with a multi-hundred-MB fixture, running the substitution
+#   5. pushes a fixture that forbids substitutes, and asserts a store that
+#      lacks it builds it, and substitutes it under always-allow-substitutes
+#   6. repeats with a multi-hundred-MB fixture, running the substitution
 #      under a hard RTS heap cap so whole-archive retention aborts
 #
 # Required environment:
@@ -56,11 +58,12 @@ fail() {
 WORK=${E2E_WORK_DIR:-$(mktemp -d)}
 STORE_A="$WORK/store-a"
 STORE_B="$WORK/store-b"
+STORE_C="$WORK/store-c"
 LOOP_STORE="$WORK/cache-loop"
 DUMP_A_STORE="$WORK/cache-dump-a"
 DUMP_B_STORE="$WORK/cache-dump-b"
 LOG_DIR="$WORK/logs"
-mkdir -p "$STORE_A" "$STORE_B" "$LOG_DIR"
+mkdir -p "$STORE_A" "$STORE_B" "$STORE_C" "$LOG_DIR"
 
 LOOP_URL="http://127.0.0.1:$LOOP_PORT"
 DUMP_A_URL="http://127.0.0.1:$DUMP_A_PORT"
@@ -220,6 +223,48 @@ echo "NAR compare: identical ($(wc -c < "$NAR_A" | tr -d ' ') bytes)"
 cmp "$OUT_A/nonce" "$OUT_B/nonce" || fail "nonce differs: store B rebuilt instead of substituting"
 [ -x "$OUT_B/bin/hello" ] || fail "executable bit lost in substitution"
 [ -L "$OUT_B/bin/link-to-data" ] || fail "symlink lost in substitution"
+
+# --------------------------------------------------------------------------
+# allowSubstitutes = false: built where the cache holds the output
+# --------------------------------------------------------------------------
+
+echo "== local fixture: push, build beside the cache, substitute under always-allow-substitutes =="
+OUT_LOCAL_A=$(build_into "$STORE_A" local.nix)
+echo "store A path: $OUT_LOCAL_A"
+push_from "$STORE_A" "$LOOP_URL" zstd "$OUT_LOCAL_A"
+
+# The cache holds the output and is named as a substituter, and the
+# derivation forbids substitutes, so store B builds it.
+LOCAL_LOG="$LOG_DIR/build-local.nix.log"
+OUT_LOCAL_B=$("$NOVA_NIX_BIN" build "$SCRIPT_DIR/local.nix" --store "$STORE_B" \
+  --substituter "$LOOP_URL" --trusted-key "$PUB_KEY" 2> "$LOCAL_LOG" | tail -n 1) || {
+  cat "$LOCAL_LOG" >&2
+  fail "local.nix failed in store B"
+}
+echo "store B path: $OUT_LOCAL_B"
+grep -Fq '[build]' "$LOCAL_LOG" || {
+  cat "$LOCAL_LOG" >&2
+  fail "local.nix was not built"
+}
+! grep -Fq '[subst]' "$LOCAL_LOG" || {
+  cat "$LOCAL_LOG" >&2
+  fail "local.nix was substituted, and it forbids substitutes"
+}
+# cmp answers "differ" for a file it cannot read, so each nonce is checked
+# to be there before the two are compared.
+for nonce in "$OUT_LOCAL_A/nonce" "$OUT_LOCAL_B/nonce"; do
+  [ -s "$nonce" ] || fail "no nonce at $nonce"
+done
+if cmp -s "$OUT_LOCAL_A/nonce" "$OUT_LOCAL_B/nonce"; then
+  fail "local nonce is the cache's: store B substituted instead of building"
+fi
+
+# The setting overrides the attribute, so a third store takes the output
+# from the cache, which shows the cache did hold it for store B to refuse.
+OUT_LOCAL_C=$(NIX_CONFIG='always-allow-substitutes = true' substitute_into "$STORE_C" local.nix)
+echo "store C path: $OUT_LOCAL_C"
+cmp "$OUT_LOCAL_A/nonce" "$OUT_LOCAL_C/nonce" \
+  || fail "local nonce differs under always-allow-substitutes: store C rebuilt"
 
 # --------------------------------------------------------------------------
 # Memory gate: large fixture under a hard RTS heap cap

@@ -15,6 +15,11 @@
 -- stops the build at once ('QueryFailed'); under 'BuildFromSource' the caller
 -- asks the next cache instead, so that failure never arrives here.
 --
+-- A derivation whose @allowSubstitutes@ attribute is false builds here even
+-- when a cache holds its outputs ('substitutesAllowed').  Its attributes are
+-- read first, as upstream's @ParsedDerivation@ reads them
+-- ('derivationAttrs').
+--
 -- Every effect is a record field, so the decisions run in tests over a fake
 -- cache and store.  "Nix.Builder" supplies the real ones.
 module Nix.Realise
@@ -25,8 +30,16 @@ module Nix.Realise
     ClosureOutcome (..),
     substituteClosure,
 
+    -- * Whether a derivation may be substituted
+    DerivationAttrs (..),
+    derivationAttrs,
+    SubstitutesSetting (..),
+    Substitutes (..),
+    substitutesAllowed,
+
     -- * Realising a graph
     Fallback (..),
+    RealiseSettings (..),
     RealiseEffects (..),
     Realised (..),
     RealiseFailure (..),
@@ -37,13 +50,19 @@ where
 
 import Control.Monad (filterM, void)
 import Control.Monad.Except (ExceptT (..), runExceptT)
+import Data.Bifunctor (first)
+import Data.ByteString (ByteString)
+import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text.Encoding as TE
 import Nix.DependencyGraph (DepGraph (..), DepNode (..), directDeps)
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
-import Nix.Store.Path (StorePath, defaultStoreDir, storePathToText)
+import Nix.Derivation.StructuredAttrs (structuredAttrsKey)
+import Nix.Json (Json (..), parseJson)
+import Nix.Store.Path (StorePath, defaultStoreDir, storePathBasename, storePathToText)
 
 -- ---------------------------------------------------------------------------
 -- Substituting a closure
@@ -175,6 +194,87 @@ referencesFirst effects visited (reference : rest)
         ClosureQueryFailed failure -> pure (ClosureQueryFailed failure, deeper)
 
 -- ---------------------------------------------------------------------------
+-- Whether a derivation may be substituted
+-- ---------------------------------------------------------------------------
+
+-- | Where a derivation's attributes are read from, as upstream's
+-- @ParsedDerivation@ holds them.
+data DerivationAttrs
+  = -- | The structured attributes of a derivation that has them, parsed.
+    AttrsInJson !Json
+  | -- | The environment of a derivation without structured attributes.
+    AttrsInEnvironment !(Map Text ByteString)
+  deriving (Eq, Show)
+
+-- | Upstream's @ParsedDerivation@ constructor at 2.24.9, for the derivation
+-- at a @.drv@ path: structured attributes are parsed as JSON, and ones that
+-- are not JSON are an error naming the derivation.  Upstream constructs one
+-- for every derivation it has a goal for, before it looks at the outputs
+-- (@DerivationGoal::haveDerivation@).
+derivationAttrs :: StorePath -> Derivation -> Either Text DerivationAttrs
+derivationAttrs drvPath drv = case Map.lookup structuredAttrsKey env of
+  Nothing -> Right (AttrsInEnvironment env)
+  Just encoded -> AttrsInJson <$> first unreadable (first (const "invalid UTF-8") (TE.decodeUtf8' encoded) >>= parseJson)
+  where
+    env = drvEnv drv
+    unreadable reason =
+      "cannot process " <> structuredAttrsKey <> " attribute of '" <> storePathBasename drvPath <> "': " <> reason
+
+-- | Upstream's @always-allow-substitutes@ setting.
+data SubstitutesSetting
+  = -- | A derivation's @allowSubstitutes@ attribute decides, upstream's
+    -- default.
+    HeedAllowSubstitutes
+  | -- | Every derivation may be substituted, whatever its attribute says.
+    AlwaysAllowSubstitutes
+  deriving (Eq, Show)
+
+-- | Whether a derivation's own outputs may come from a cache.
+data Substitutes
+  = MaySubstitute
+  | MustBuild
+  deriving (Eq, Show)
+
+-- | The attribute a derivation forbids substitutes with.
+allowSubstitutesAttr :: Text
+allowSubstitutesAttr = "allowSubstitutes"
+
+-- | The one environment value upstream's @getBoolAttr@ reads as true, which
+-- is how evaluation writes @true@; @false@ is written as the empty string.
+environmentTrue :: ByteString
+environmentTrue = "1"
+
+-- | Upstream's @ParsedDerivation::substitutesAllowed@ at 2.24.9, for the
+-- derivation at a @.drv@ path.  Under 'AlwaysAllowSubstitutes' every
+-- derivation may be substituted and the attribute is not read.  Otherwise
+-- @allowSubstitutes@ decides, and a derivation without it may be
+-- substituted.  In structured attributes it is a JSON Boolean, and any
+-- other value there is an error; in the environment only @1@ is true.
+-- Structured attributes that are not a JSON object hold no attribute, as
+-- nlohmann's @find@ finds nothing in such a value.
+--
+-- The rule covers a derivation's own outputs alone.  A path that another
+-- substituted output references is substituted as a path, whichever
+-- derivation built it: upstream's @PathSubstitutionGoal@ never reads the
+-- attribute.
+substitutesAllowed :: SubstitutesSetting -> StorePath -> DerivationAttrs -> Either Text Substitutes
+substitutesAllowed AlwaysAllowSubstitutes _ _ = Right MaySubstitute
+substitutesAllowed HeedAllowSubstitutes _ (AttrsInEnvironment env) =
+  Right (maybe MaySubstitute fromEnvironment (Map.lookup allowSubstitutesAttr env))
+  where
+    fromEnvironment value
+      | value == environmentTrue = MaySubstitute
+      | otherwise = MustBuild
+substitutesAllowed HeedAllowSubstitutes drvPath (AttrsInJson (JsonObject members)) =
+  maybe (Right MaySubstitute) fromJson (Map.lookup allowSubstitutesAttr members)
+  where
+    fromJson (JsonBool True) = Right MaySubstitute
+    fromJson (JsonBool False) = Right MustBuild
+    fromJson _ =
+      Left ("attribute '" <> allowSubstitutesAttr <> "' of derivation '" <> storePathBasename drvPath <> "' must be a Boolean")
+substitutesAllowed HeedAllowSubstitutes _ (AttrsInJson _) = Right MaySubstitute
+
+-- ---------------------------------------------------------------------------
 -- Realising a graph
 -- ---------------------------------------------------------------------------
 
@@ -187,6 +287,13 @@ data Fallback
     BuildFromSource
   deriving (Eq, Show)
 
+-- | The settings that decide how a graph is realised.
+data RealiseSettings = RealiseSettings
+  { rsFallback :: !Fallback,
+    rsSubstitutes :: !SubstitutesSetting
+  }
+  deriving (Eq, Show)
+
 -- | Why realising a graph stopped.
 data RealiseFailure
   = -- | A derivation failed to build, with the builder's report.
@@ -196,6 +303,9 @@ data RealiseFailure
   | -- | A substitute for this derivation's outputs, or for something they
     -- reference, failed under 'NoFallback'.
     SubstitutesFailed !StorePath
+  | -- | A derivation's attributes could not be read ('derivationAttrs',
+    -- 'substitutesAllowed').
+    InvalidDerivation !Text
   deriving (Eq, Show)
 
 -- | A failure as the build reports it.  A failed substitute reads as
@@ -207,6 +317,7 @@ data RealiseFailure
 realiseFailureMessage :: RealiseFailure -> Text
 realiseFailureMessage (BuildFailed report) = report
 realiseFailureMessage (CacheQueryFailed failure) = failure
+realiseFailureMessage (InvalidDerivation problem) = problem
 realiseFailureMessage (SubstitutesFailed drvPath) =
   "some substitutes for the outputs of derivation '"
     <> storePathToText defaultStoreDir drvPath
@@ -238,49 +349,57 @@ data RealiseEffects m = RealiseEffects
 -- takes its inputs out of the work, and what remains builds leaves first.
 --
 -- The graph has to be acyclic ('Nix.DependencyGraph.topoSort' decides that).
-realise :: (Monad m) => Fallback -> RealiseEffects m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
-realise fallback effects graph root = void <$> realiseNode fallback effects graph Set.empty root
+realise :: (Monad m) => RealiseSettings -> RealiseEffects m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
+realise settings effects graph root = void <$> realiseNode settings effects graph Set.empty root
 
 -- | Realise one node, threading the nodes already visited, so a derivation
 -- several others depend on is handled once.
 realiseNode ::
   (Monad m) =>
-  Fallback ->
+  RealiseSettings ->
   RealiseEffects m ->
   DepGraph ->
   Set StorePath ->
   StorePath ->
   m (Either RealiseFailure (Set StorePath))
-realiseNode fallback effects graph visited node
+realiseNode settings effects graph visited node
   | node `Set.member` visited = pure (Right visited)
   | otherwise = case Map.lookup node (unDepGraph graph) of
       -- A node outside the graph has nothing to realise.
       Nothing -> pure (Right visited)
-      Just depNode -> do
+      Just depNode ->
         let drv = dnDerivation depNode
-            seen = Set.insert node visited
-        allValid <- reAllValid effects drv
-        if allValid
-          then reported AlreadyValid drv seen
-          else do
-            firstTry <- substituteOutputs drv
-            case (firstTry, stopFor firstTry) of
-              (ClosureComplete, _) -> reported Substituted drv seen
-              (_, Just failure) -> pure (Left failure)
-              (_, Nothing) -> buildFromInputs firstTry drv seen
+         in either invalid (realiseParsed drv (Set.insert node visited)) (derivationAttrs node drv)
   where
-    stopFor = substitutionStop fallback node
+    stopFor = substitutionStop (rsFallback settings) node
     reported status drv done = Right done <$ reReport effects status drv
-    substituteOutputs drv = substituteClosure (reSubst effects) (map doPath (drvOutputs drv))
-    buildFromInputs firstTry drv seen = do
-      inputs <- realiseAll fallback effects graph seen (directDeps graph node)
+    invalid = pure . Left . InvalidDerivation
+    realiseParsed drv seen attrs = do
+      allValid <- reAllValid effects drv
+      if allValid
+        then reported AlreadyValid drv seen
+        else either invalid (substituteOrBuild drv seen) (substitutesAllowed (rsSubstitutes settings) node attrs)
+    substituteOrBuild drv seen allowed = do
+      let substituteOutputs = outputsFromCaches allowed drv
+      firstTry <- substituteOutputs
+      case (firstTry, stopFor firstTry) of
+        (ClosureComplete, _) -> reported Substituted drv seen
+        (_, Just failure) -> pure (Left failure)
+        (_, Nothing) -> buildFromInputs substituteOutputs firstTry drv seen
+    -- A derivation that must build asks no cache, which leaves it where one
+    -- that no cache holds is: upstream starts no substitution for it and
+    -- goes on to its inputs.
+    outputsFromCaches MustBuild _ = pure ClosureUnavailable
+    outputsFromCaches MaySubstitute drv = substituteClosure (reSubst effects) (map doPath (drvOutputs drv))
+    buildFromInputs substituteOutputs firstTry drv seen = do
+      inputs <- realiseAll settings effects graph seen (directDeps graph node)
       case inputs of
         Left err -> pure (Left err)
         Right realised -> do
           -- The inputs may have supplied what the closure lacked, and then
           -- the substitute is still good (upstream's retrySubstitution).
           retried <- case firstTry of
-            ClosureIncomplete -> substituteOutputs drv
+            ClosureIncomplete -> substituteOutputs
             other -> pure other
           case (retried, stopFor retried) of
             (ClosureComplete, _) -> reported Substituted drv realised
@@ -309,15 +428,15 @@ substitutionStop fallback drvPath outcome = case outcome of
 -- | Realise nodes in order, stopping at the first failure.
 realiseAll ::
   (Monad m) =>
-  Fallback ->
+  RealiseSettings ->
   RealiseEffects m ->
   DepGraph ->
   Set StorePath ->
   [StorePath] ->
   m (Either RealiseFailure (Set StorePath))
 realiseAll _ _ _ visited [] = pure (Right visited)
-realiseAll fallback effects graph visited (node : rest) = do
-  realised <- realiseNode fallback effects graph visited node
+realiseAll settings effects graph visited (node : rest) = do
+  realised <- realiseNode settings effects graph visited node
   case realised of
     Left err -> pure (Left err)
-    Right deeper -> realiseAll fallback effects graph deeper rest
+    Right deeper -> realiseAll settings effects graph deeper rest

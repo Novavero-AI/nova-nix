@@ -80,7 +80,7 @@ import Nix.Http (catchSync, withTransfer, withUserAgent)
 import Nix.Store (Store (..), queryDeriver, queryPathInfo, queryReferences, volumeCaseHack)
 import qualified Nix.Store.DB as DB
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StorePath (spHash, spName), defaultStoreDir, parseStorePath, storePathToFilePath, storePathToText)
+import Nix.Store.Path (StorePath (spHash, spName), defaultStoreDir, parseStorePath, storePathBasename, storePathToFilePath, storePathToText)
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
@@ -248,11 +248,6 @@ outputPathsOnly = filter (not . isDerivationPath)
 -- | The suffix that marks a derivation's store path.
 derivationExtension :: Text
 derivationExtension = ".drv"
-
--- | The basename form used in narinfo @References@ and @Deriver@ fields:
--- @\<hash\>-\<name\>@ with no store dir.
-storePathBasename :: StorePath -> Text
-storePathBasename sp = spHash sp <> "-" <> spName sp
 
 -- | Drop a @\<algo\>:@ prefix from a formatted hash, leaving the digest.
 stripHashPrefix :: Text -> Text

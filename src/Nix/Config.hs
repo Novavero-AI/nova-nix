@@ -1,6 +1,8 @@
 -- | Nix configuration: the @nix.conf@ / @NIX_CONFIG@ settings that decide
 -- which binary caches a machine substitutes from, which public keys it
--- trusts, whether a failed substitute builds from source (@fallback@), how
+-- trusts, whether a failed substitute builds from source (@fallback@),
+-- whether a derivation may forbid substitutes
+-- (@always-allow-substitutes@), how
 -- deep function calls may nest, how far an evaluation may reach
 -- (@restrict-eval@, @pure-eval@, @allowed-uris@), and whether
 -- @builtins.traceVerbose@ traces (@trace-verbose@).
@@ -148,6 +150,9 @@ data NixConfig = NixConfig
     ncTrustedPublicKeys :: ![Text],
     -- | Upstream @fallback@: build from source when a substitute fails.
     ncFallback :: !Bool,
+    -- | Upstream @always-allow-substitutes@: substitute a derivation
+    -- whatever its @allowSubstitutes@ attribute says.
+    ncAlwaysAllowSubstitutes :: !Bool,
     -- | Upstream's @max-call-depth@: how many function calls may be
     -- active around a new one before evaluation refuses it.
     ncMaxCallDepth :: !Word32,
@@ -163,8 +168,8 @@ data NixConfig = NixConfig
   deriving (Eq, Show)
 
 -- | The baseline the fold starts from: no substituters, no trusted keys,
--- no fallback, upstream's call-depth ceiling, no allowed URIs, both
--- evaluation modes off, and @trace-verbose@ off.  The empty substituter
+-- no fallback, @allowSubstitutes@ heeded, upstream's call-depth ceiling,
+-- no allowed URIs, both evaluation modes off, and @trace-verbose@ off.  The empty substituter
 -- list is nova-nix's existing default (nothing is substituted unless
 -- configured), a deliberate divergence from upstream's cache.nixos.org
 -- default: turning a cache on for every machine is the operator's
@@ -176,6 +181,7 @@ defaultNixConfig =
     { ncSubstituters = [],
       ncTrustedPublicKeys = [],
       ncFallback = False,
+      ncAlwaysAllowSubstitutes = False,
       ncMaxCallDepth = defaultMaxCallDepth,
       ncAllowedUris = [],
       ncRestrictEval = False,
@@ -594,6 +600,7 @@ resolveName name =
       | n == trustedKeysKey || n == trustedKeysAlias = Just (ListSetting TrustedKeysField)
       | n == allowedUrisKey = Just (ListSetting AllowedUrisField)
       | n == fallbackKey || n == fallbackAlias = Just (BoolSetting FallbackField)
+      | n == alwaysAllowSubstitutesKey = Just (BoolSetting AlwaysAllowSubstitutesField)
       | n == restrictEvalKey = Just (BoolSetting RestrictEvalField)
       | n == pureEvalKey = Just (BoolSetting PureEvalField)
       | n == traceVerboseKey = Just (BoolSetting TraceVerboseField)
@@ -609,7 +616,12 @@ data ListField = SubstitutersField | TrustedKeysField | AllowedUrisField
   deriving (Eq, Show)
 
 -- | The Boolean settings.
-data BoolField = FallbackField | RestrictEvalField | PureEvalField | TraceVerboseField
+data BoolField
+  = FallbackField
+  | AlwaysAllowSubstitutesField
+  | RestrictEvalField
+  | PureEvalField
+  | TraceVerboseField
   deriving (Eq, Show)
 
 -- | The scalar settings, which only ever replace.
@@ -637,6 +649,7 @@ listFieldKey AllowedUrisField = allowedUrisKey
 
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool FallbackField v config = config {ncFallback = v}
+setBool AlwaysAllowSubstitutesField v config = config {ncAlwaysAllowSubstitutes = v}
 setBool RestrictEvalField v config = config {ncRestrictEval = v}
 setBool PureEvalField v config = config {ncPureEval = v}
 setBool TraceVerboseField v config = config {ncTraceVerbose = v}
@@ -693,8 +706,9 @@ fallbackKey, fallbackAlias :: ByteString
 fallbackKey = "fallback"
 fallbackAlias = "build-fallback"
 
-allowedUrisKey, maxCallDepthKey, pureEvalKey, restrictEvalKey, traceVerboseKey :: ByteString
+allowedUrisKey, alwaysAllowSubstitutesKey, maxCallDepthKey, pureEvalKey, restrictEvalKey, traceVerboseKey :: ByteString
 allowedUrisKey = "allowed-uris"
+alwaysAllowSubstitutesKey = "always-allow-substitutes"
 maxCallDepthKey = "max-call-depth"
 pureEvalKey = "pure-eval"
 restrictEvalKey = "restrict-eval"

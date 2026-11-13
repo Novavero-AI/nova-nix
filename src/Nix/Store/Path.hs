@@ -42,6 +42,7 @@ module Nix.Store.Path
     StoreWriteMode (..),
     storePathToFilePath,
     storePathToText,
+    storePathBasename,
     isCanonicalStoreText,
     storeTextToFilePath,
     qualifyPathText,
@@ -107,14 +108,21 @@ windowsStoreDir = StoreDir "C:\\nix\\store"
 -- | Convert a t'StorePath' to a full filesystem path under a t'StoreDir'.
 storePathToFilePath :: StoreDir -> StorePath -> FilePath
 storePathToFilePath (StoreDir dir) sp =
-  dir </> T.unpack (spHash sp <> "-" <> spName sp)
+  dir </> T.unpack (storePathBasename sp)
 
 -- | Convert a t'StorePath' to canonical 'Text' with forward slashes.
 -- Unlike 'storePathToFilePath', this always uses @\/@ as the separator,
 -- making it safe for ATerm serialization and cross-platform round-trips.
 storePathToText :: StoreDir -> StorePath -> Text
 storePathToText (StoreDir dir) sp =
-  T.pack dir <> "/" <> spHash sp <> "-" <> spName sp
+  T.pack dir <> "/" <> storePathBasename sp
+
+-- | A t'StorePath' with no store directory, @\<hash\>-\<name\>@: what
+-- upstream's @StorePath::to_string@ gives, the form a narinfo's
+-- @References@ and @Deriver@ fields hold, and how upstream's messages name
+-- a derivation where they do not print the whole path.
+storePathBasename :: StorePath -> Text
+storePathBasename sp = spHash sp <> "-" <> spName sp
 
 -- | Whether path text lies under the canonical store dir: exactly
 -- @\/nix\/store@, or @\/nix\/store@ followed by a separator of either
