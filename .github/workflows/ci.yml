@@ -35,9 +35,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The public cache's address and signing key, spelled once: the publish job
-# pushes to it, E2E (public cache) substitutes from it, and every job that
-# builds from pkgs/windows takes its sources from it, and all must agree.
-# A cache move or a key rotation is one edit here.
+# pushes to it, E2E (public cache) substitutes from it, every job that
+# builds from pkgs/windows takes its sources from it, the Mes and Bootstrap
+# legs take the seed ladder's rungs from it in substitute mode, and all
+# must agree.  A cache move or a key rotation is one edit here.
 env:
   CACHE_URL: https://cache.novavero.ai
   CACHE_PUBLIC_KEY: cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
@@ -1020,6 +1021,72 @@ jobs:
           exit "$status"
 
   # ---------------------------------------------------------------------------
+  # Ladder (mode): how this run's Mes and Bootstrap legs come by the seed
+  # ladder, the rungs pkgs/windows builds from its 1,623-byte seed.  Decided
+  # once a run, from the files a pull request changes, by
+  # .github/cache/ladder-mode.sh, which has the rules:
+  #
+  #   skip         documentation alone.  The legs do not run.  Neither is a
+  #                required check, and the Stage0 legs, which are, still
+  #                build their chain from the seed.
+  #   seed         a change to the builder.  The legs build every rung
+  #                from the seed and name no substituter.
+  #   substitute   any other change.  The legs name the public cache as a
+  #                substituter, so a rung the pull request leaves alone is
+  #                downloaded and one it changes builds, its store path
+  #                being one the cache lacks.  A leg fails if a rung the
+  #                cache holds is built all the same
+  #                (.github/cache/substitute-rungs.sh).  The checks under
+  #                test/data build in every mode: each forbids substitutes.
+  #
+  # A run for anything but a pull request is seed.  A push to main publishes
+  # what its legs build, so it has to build all of it.
+  #
+  # The changed files come from git, which needs no token and has no page
+  # limit: a pull_request run checks out the merge commit GitHub makes of
+  # the pull request and its base, and that commit's first parent is the
+  # base.  The diff between the two is what the pull request changes in the
+  # tree the legs build.
+  # ---------------------------------------------------------------------------
+  ladder-mode:
+    name: Ladder (mode)
+    # The merge queue runs neither leg, so it has no mode to decide.
+    if: github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+    steps:
+      # Two commits deep: the merge commit and its parents.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      # A wrong skip is a run that tests nothing and stays green, so the
+      # rules are checked against their cases before they decide anything.
+      - name: The rules decide their cases
+        run: bash .github/cache/ladder-mode-cases.sh
+
+      # --no-renames lists a renamed file under both of its names.  Git's
+      # default lists the new one alone, and a builder file renamed to a
+      # document would pass for documentation.  A checkout that is no merge
+      # commit is refused: its first parent is the commit before it, not the
+      # base, and the diff would be of the last commit alone.
+      - name: Decide the mode
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if ! git rev-parse --verify --quiet HEAD^2 > /dev/null; then
+              echo "::error::the checkout is not a pull request's merge commit, so its first parent is not the base"
+              exit 1
+            fi
+            mode=$(git diff --name-only --no-renames -z HEAD^1 HEAD | bash .github/cache/ladder-mode.sh)
+          else
+            mode=seed
+          fi
+          echo "mode=$mode" | tee -a "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
   # Mes (Windows): GNU Mes 0.27.1 on the Windows stage0 tools, as nixpkgs'
   # minimal-bootstrap/mes builds it: mes-m2 from kaem.windows.run, the Mes C
   # library compiled by MesCC running on mes-m2, and mes.exe compiled by
@@ -1028,19 +1095,23 @@ jobs:
   # links with mes, runs here.  exec-bit runs a program MesCC builds that
   # marks files with open and chmod, and registers only if nova-nix reads
   # each file's execute bit as its mode set it.  x64 and ARM64 Windows each
-  # build all of it from the seed, for the reason Stage0 (Windows) runs on
-  # both, with the nova-nix Stage0 (nova-nix) builds.
+  # run all of it, for the reason Stage0 (Windows) runs on both, with the
+  # nova-nix Stage0 (nova-nix) builds.  Each builds every rung from the seed
+  # unless Ladder (mode) has it take the unchanged ones from the public
+  # cache.
   #
-  # The ARM64 leg takes about 37 minutes, most of them MesCC compiling the
-  # libraries and mes under the x86 emulator, and the timeout is twice that.
+  # From the seed the ARM64 leg takes about 37 minutes, most of them MesCC
+  # compiling the libraries and mes under the x86 emulator, and the timeout
+  # is twice that.
   # ---------------------------------------------------------------------------
   mes-windows:
     name: Mes (${{ matrix.name }})
-    needs: [stage0-nova-nix]
+    needs: [stage0-nova-nix, ladder-mode]
     # Not run in the merge queue.  Neither leg is a required check, so the
     # queue merges without waiting for them, and the push to main that
-    # follows runs both on the same commit.
-    if: github.event_name != 'merge_group'
+    # follows runs both on the same commit.  Not run for a pull request
+    # that changes documentation alone, either.
+    if: github.event_name != 'merge_group' && needs.ladder-mode.outputs.mode != 'skip'
     strategy:
       fail-fast: false
       matrix:
@@ -1065,11 +1136,41 @@ jobs:
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # Every source pkgs/windows fetches, from the public cache where it
-      # holds it, so the builds below fetch none.  They name no substituter
-      # and substitute nothing.
+      # holds it, so the builds below fetch none.  Outside substitute mode
+      # they name no substituter and substitute nothing.
       - name: Take the sources from the public cache
         shell: bash
         run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+      # Substitute mode names the cache for every step below: nova-nix reads
+      # these two settings from NIX_CONFIG, so no build there needs a flag.
+      # A step writes it because the job's own env cannot: the workflow's
+      # env, which holds the address and the key, is not a context that
+      # jobs.<job_id>.env may read.  It comes after the sources step, which
+      # names the cache by flag.
+      - name: Name the public cache as a substituter
+        if: needs.ladder-mode.outputs.mode == 'substitute'
+        shell: bash
+        run: |
+          {
+            echo 'NIX_CONFIG<<END_OF_NIX_CONFIG'
+            echo "substituters = $CACHE_URL"
+            echo "trusted-public-keys = $CACHE_PUBLIC_KEY"
+            echo 'END_OF_NIX_CONFIG'
+          } >> "$GITHUB_ENV"
+
+      # This leg's rungs (pkgs/windows/rungs.nix), each downloaded where the
+      # cache holds it and built where the pull request changes it.  The
+      # script fails if a rung the cache holds is built.  nova-nix passes
+      # over a narinfo that no trusted key signs and builds, so without the
+      # check a key the cache no longer signs with would turn every run
+      # back into a build from the seed and stay green.  The build steps
+      # below then find each rung valid, and the time each prints is the
+      # time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: needs.ladder-mode.outputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" mes
 
       # The stage0 tools, NYACC, and the source tree with mes-m2 in its bin
       # output, each timed.
@@ -1224,25 +1325,27 @@ jobs:
   # test/data/busybox.nix runs busybox --version and has busybox's sh run a
   # script through the applets configure runs.  Last, the seed stdenv made
   # of those builds GNU Hello, which runs here.  x64 and ARM64 Windows each
-  # build all of it from the seed, for the reason Stage0 (Windows) runs on
-  # both.
+  # run all of it, for the reason Stage0 (Windows) runs on both.  Each
+  # builds every rung from the seed unless Ladder (mode) has it take the
+  # unchanged ones from the public cache.
   #
   # The x64 leg also measures the cells Mes keeps while MesCC compiles and
   # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
   # only on Mes and what it compiles, the same i686 code on both legs, so one
   # leg measures it.
   #
-  # The ARM64 leg takes about 49 minutes, most of them MesCC compiling the
-  # Mes libraries, mes and tcc under the x86 emulator, and the timeout is
-  # twice that.
+  # From the seed the ARM64 leg takes about 49 minutes, most of them MesCC
+  # compiling the Mes libraries, mes and tcc under the x86 emulator, and the
+  # timeout is twice that.
   # ---------------------------------------------------------------------------
   bootstrap-windows:
     name: Bootstrap (${{ matrix.name }})
-    needs: [stage0-nova-nix]
+    needs: [stage0-nova-nix, ladder-mode]
     # Not run in the merge queue.  Neither leg is a required check, so the
     # queue merges without waiting for them, and the push to main that
-    # follows runs both on the same commit.
-    if: github.event_name != 'merge_group'
+    # follows runs both on the same commit.  Not run for a pull request
+    # that changes documentation alone, either.
+    if: github.event_name != 'merge_group' && needs.ladder-mode.outputs.mode != 'skip'
     strategy:
       fail-fast: false
       matrix:
@@ -1280,11 +1383,41 @@ jobs:
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # Every source pkgs/windows fetches, from the public cache where it
-      # holds it, so the builds below fetch none.  They name no substituter
-      # and substitute nothing.
+      # holds it, so the builds below fetch none.  Outside substitute mode
+      # they name no substituter and substitute nothing.
       - name: Take the sources from the public cache
         shell: bash
         run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+      # Substitute mode names the cache for every step below: nova-nix reads
+      # these two settings from NIX_CONFIG, so no build there needs a flag.
+      # A step writes it because the job's own env cannot: the workflow's
+      # env, which holds the address and the key, is not a context that
+      # jobs.<job_id>.env may read.  It comes after the sources step, which
+      # names the cache by flag.
+      - name: Name the public cache as a substituter
+        if: needs.ladder-mode.outputs.mode == 'substitute'
+        shell: bash
+        run: |
+          {
+            echo 'NIX_CONFIG<<END_OF_NIX_CONFIG'
+            echo "substituters = $CACHE_URL"
+            echo "trusted-public-keys = $CACHE_PUBLIC_KEY"
+            echo 'END_OF_NIX_CONFIG'
+          } >> "$GITHUB_ENV"
+
+      # This leg's rungs (pkgs/windows/rungs.nix), each downloaded where the
+      # cache holds it and built where the pull request changes it.  The
+      # script fails if a rung the cache holds is built.  nova-nix passes
+      # over a narinfo that no trusted key signs and builds, so without the
+      # check a key the cache no longer signs with would turn every run
+      # back into a build from the seed and stay green.  The build steps
+      # below then find each rung valid, and the time each prints is the
+      # time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: needs.ladder-mode.outputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" bootstrap
 
       # The stage0 tools and the Mes rung TinyCC builds on, each timed.
       - name: Build Mes
@@ -1535,10 +1668,8 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          build() {
-            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$1" | tail -n 1
-          }
-          if ! prev=$(build tinycc-native.prev.compiler) || ! final=$(build tinycc-native.compiler); then
+          if ! prev=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc-native.prev.compiler | tail -n 1) ||
+            ! final=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc-native.compiler | tail -n 1); then
             echo "::error::tinycc-native.prev or tinycc-native did not build"
             exit 1
           fi
