@@ -28,7 +28,7 @@ import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.List (inits, intercalate, isPrefixOf, mapAccumL, sort)
+import Data.List (find, inits, intercalate, isPrefixOf, mapAccumL, sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
@@ -53,7 +53,7 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
@@ -5222,6 +5222,7 @@ data RealiseEvent
   = EvQueried StorePath
   | EvFetched [StorePath]
   | EvBuilt Text
+  | EvChecked Text
   | EvReported Realise.Realised Text
   deriving (Eq, Show)
 
@@ -5229,12 +5230,14 @@ data RealiseEvent
 -- fetch refuses a path whose references are not valid, as the database's
 -- unregistered-referent guard does, and a build makes its outputs valid.
 -- The cache fails to deliver the broken paths it offers, and cannot be
--- asked about the unreachable ones at all.
+-- asked about the unreachable ones at all.  Building a derivation again
+-- gives its unstable outputs other contents, and changes no path.
 data FakeWorld = FakeWorld
   { fwValid :: !(Set.Set StorePath),
     fwCache :: !(Map.Map StorePath [StorePath]),
     fwBroken :: !(Set.Set StorePath),
     fwUnreachable :: !(Set.Set StorePath),
+    fwUnstable :: !(Set.Set StorePath),
     fwEvents :: ![RealiseEvent]
   }
 
@@ -5246,6 +5249,7 @@ fakeWorld cache valid =
       fwCache = Map.fromList [(fakePath p, map fakePath refs) | (p, refs) <- cache],
       fwBroken = Set.empty,
       fwUnreachable = Set.empty,
+      fwUnstable = Set.empty,
       fwEvents = []
     }
 
@@ -5293,6 +5297,14 @@ fakeRealiseEffects failing =
             fakeEvent (EvBuilt name)
             modify' (\world -> world {fwValid = fwValid world <> Set.fromList (map doPath (drvOutputs drv))})
             pure (Right ()),
+      Realise.reCheck = \drv _ -> do
+        let name = fakeDrvName drv
+        fakeEvent (EvChecked name)
+        unstable <- gets fwUnstable
+        pure $
+          if Set.member name failing
+            then Left ("building " <> name <> " failed")
+            else Right (maybe Realise.OutputsMatch Realise.OutputDiffers (find (`Set.member` unstable) (map doPath (drvOutputs drv)))),
       Realise.reReport = \status drv -> fakeEvent (EvReported status (fakeDrvName drv))
     }
 
@@ -5350,7 +5362,27 @@ runRealiseIn ::
   [(StorePath, DepGraph.DepNode)] ->
   Text ->
   (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
-runRealiseIn fallback = runRealiseUnder (Realise.RealiseSettings fallback Realise.HeedAllowSubstitutes)
+runRealiseIn fallback = runRealiseUnder (Realise.RealiseSettings fallback Realise.HeedAllowSubstitutes Realise.BuildNormal)
+
+-- | 'runRealiseIn' checking the root: under 'Realise.BuildCheck'.
+runCheckIn ::
+  Realise.Fallback ->
+  FakeWorld ->
+  Set.Set Text ->
+  [(StorePath, DepGraph.DepNode)] ->
+  Text ->
+  (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
+runCheckIn fallback = runRealiseUnder (Realise.RealiseSettings fallback Realise.HeedAllowSubstitutes Realise.BuildCheck)
+
+-- | 'runCheckIn' under 'Realise.NoFallback', in a world without faults.
+runCheck ::
+  Set.Set Text ->
+  [(StorePath, DepGraph.DepNode)] ->
+  [(Text, [Text])] ->
+  [Text] ->
+  Text ->
+  (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
+runCheck failing nodes cache valid = runCheckIn Realise.NoFallback (fakeWorld cache valid) failing nodes
 
 -- | 'runRealise' in a given world, under given settings.
 runRealiseUnder ::
@@ -5367,13 +5399,183 @@ runRealiseUnder settings world failing nodes root =
           world
    in (result, reverse (fwEvents final), fwValid final)
 
--- | Only the fetches and builds of a run, the part that costs anything.
+-- | Only the fetches, builds and checks of a run, the part that costs
+-- anything.
 realiseWork :: [RealiseEvent] -> [RealiseEvent]
 realiseWork = filter isWork
   where
     isWork (EvFetched _) = True
     isWork (EvBuilt _) = True
+    isWork (EvChecked _) = True
     isWork _ = False
+
+-- | A random derivation graph to check.  Each node has one output or two
+-- and depends only on lower nodes, so the graph is acyclic and the highest
+-- node is the root.  With it: the nodes that forbid substitutes, the
+-- references a cache declares for each output it offers, the outputs that
+-- are valid, the ones a cache fails to deliver and the ones it cannot be
+-- asked about, the nodes whose builder fails, the outputs of the root
+-- that building it again gives other contents, and what a failed
+-- substitute leads to.
+data CheckCase = CheckCase
+  { ccDeps :: !(Map.Map Int [Int]),
+    ccTwoOutputs :: ![Int],
+    ccForbidding :: ![Int],
+    ccCache :: !(Map.Map Text [Text]),
+    ccValid :: ![Text],
+    ccBroken :: ![Text],
+    ccUnreachable :: ![Text],
+    ccFailing :: ![Int],
+    ccUnstable :: ![Text],
+    ccFallback :: !Realise.Fallback
+  }
+  deriving (Show)
+
+-- | The names of a node's outputs, given the nodes that have a second.
+-- The first names the node in an event, as 'fakeDrvName' reads it.
+checkCaseOutputs :: [Int] -> Int -> [Text]
+checkCaseOutputs twoOutputs node = (stem <> "-out") : [stem <> "-dev" | node `elem` twoOutputs]
+  where
+    stem = "n" <> T.pack (show node)
+
+-- | A 'CheckCase'.  A fault is drawn for a third of the cases and absent
+-- from the rest, so that the cases reaching a rebuild are not rare; a
+-- cache's declared references are an output's siblings and the outputs
+-- of lower nodes.
+genCheckCase :: QC.Gen CheckCase
+genCheckCase = do
+  size <- QC.chooseInt (1, 5)
+  let nodes = [0 .. size - 1]
+      root = size - 1
+  deps <- traverse (\node -> (,) node <$> QC.sublistOf [0 .. node - 1]) nodes
+  twoOutputs <- QC.sublistOf nodes
+  let outputsOf = checkCaseOutputs twoOutputs
+      allOutputs = concatMap outputsOf nodes
+      offered node output =
+        QC.frequency
+          [ (1, pure Nothing),
+            (2, Just . (,) output <$> QC.sublistOf (filter (/= output) (outputsOf node) ++ concatMap outputsOf [0 .. node - 1]))
+          ]
+      seldom items = QC.frequency [(2, pure []), (1, QC.sublistOf items)]
+  cache <- catMaybes <$> sequence [offered node output | node <- nodes, output <- outputsOf node]
+  forbidding <- seldom nodes
+  valid <- QC.sublistOf allOutputs
+  broken <- seldom allOutputs
+  unreachable <- seldom allOutputs
+  failing <- seldom nodes
+  unstable <- QC.sublistOf (outputsOf root)
+  fallback <- QC.elements [Realise.NoFallback, Realise.BuildFromSource]
+  pure
+    CheckCase
+      { ccDeps = Map.fromList deps,
+        ccTwoOutputs = twoOutputs,
+        ccForbidding = forbidding,
+        ccCache = Map.fromList cache,
+        ccValid = valid,
+        ccBroken = broken,
+        ccUnreachable = unreachable,
+        ccFailing = failing,
+        ccUnstable = unstable,
+        ccFallback = fallback
+      }
+
+-- | Run a 'CheckCase' from its root under a build mode: the result, the
+-- events, and the outputs that were valid before each event.
+runCheckCase ::
+  Realise.BuildMode ->
+  CheckCase ->
+  (Either Realise.RealiseFailure (), [(Set.Set StorePath, RealiseEvent)])
+runCheckCase mode checkCase = (result, zip (scanl landed (fwValid world) events) events)
+  where
+    name node = "n" <> T.pack (show node)
+    nodes = Map.keys (ccDeps checkCase)
+    root = maximum (0 : nodes)
+    outputsOf = checkCaseOutputs (ccTwoOutputs checkCase)
+    paths = Set.fromList . map fakePath
+    env node
+      | node `elem` ccForbidding checkCase = Map.singleton "allowSubstitutes" ""
+      | otherwise = Map.empty
+    world =
+      (fakeWorld [] (ccValid checkCase))
+        { fwCache = Map.fromList [(fakePath output, map fakePath refs) | (output, refs) <- Map.toList (ccCache checkCase)],
+          fwBroken = paths (ccBroken checkCase),
+          fwUnreachable = paths (ccUnreachable checkCase),
+          fwUnstable = paths (ccUnstable checkCase)
+        }
+    (result, events, _) =
+      runRealiseUnder
+        (Realise.RealiseSettings (ccFallback checkCase) Realise.HeedAllowSubstitutes mode)
+        world
+        (Set.fromList (concatMap (take 1 . outputsOf) (ccFailing checkCase)))
+        [fakeNodeWith (env node) (name node) (outputsOf node) (map name below) | (node, below) <- Map.toList (ccDeps checkCase)]
+        (name root)
+    -- A build makes every output of its derivation valid, and its event
+    -- names the first.
+    builtOutputs = Map.fromList [(first, paths outputs) | node <- nodes, outputs@(first : _) <- [outputsOf node]]
+    landed valid event = case event of
+      EvFetched fetched -> valid <> Set.fromList fetched
+      EvBuilt built -> valid <> Map.findWithDefault Set.empty built builtOutputs
+      _ -> valid
+
+-- | The law of a check, for one 'CheckCase'.  The root is never built in
+-- the ordinary way.  It is built again at most once, and only when every
+-- output of its own and of each derivation it depends on is valid.  The
+-- check's result is that rebuild's, and without a rebuild a failure.  A
+-- root that cannot be checked builds nothing at all.  No output of the
+-- root that was valid is fetched, and a root whose outputs were all valid
+-- is not asked about.  A root that forbids substitutes and is short of an
+-- output cannot be checked, and nothing at all is done for it.  A build
+-- that is no check builds nothing again.
+--
+-- Each class the generator has to reach for those clauses to say anything
+-- is covered: the property fails when one is rarer than its share.  The
+-- shares are about a third of what 'genCheckCase' gives, measured over
+-- 20000 cases (46%, 6%, 15% and 10% in this order).
+checkLaw :: CheckCase -> QC.Property
+checkLaw checkCase =
+  QC.counterexample (show (result, events))
+    . QC.cover 15 checked "the root was built again"
+    . QC.cover 2 (checked && partlyValid) "a root with one output of two valid was built again"
+    . QC.cover 5 (queryFailed result) "a cache could not be asked"
+    . QC.cover 3 mustBuildShort "a root that forbids substitutes was short of an output"
+    $ QC.conjoin
+      [ QC.counterexample "the root was built" (EvBuilt rootName `notElem` events),
+        QC.counterexample "another derivation was checked, or the root twice" ([name | EvChecked name <- events] `elem` [[], [rootName]]),
+        QC.counterexample "checked before its outputs and inputs were valid" (all (needed `Set.isSubsetOf`) checks),
+        QC.counterexample "the result is not the rebuild's" resultIsRebuilds,
+        QC.counterexample "built something for a root it could not check" (not (unbuildable result) || null [() | EvBuilt _ <- events]),
+        QC.counterexample "fetched an output of the root that was valid" (Set.null (Set.fromList (concat [fetched | EvFetched fetched <- events]) `Set.intersection` validAtStart)),
+        QC.counterexample "asked a cache about a root whose outputs were valid" (not allValidAtStart || null [() | EvQueried asked <- events, asked `Set.member` rootOutputs]),
+        QC.counterexample "did something for a root that forbids substitutes and lacks an output" (not mustBuildShort || (result, events) == (Left (Realise.OutputsNotValid rootDrv), [])),
+        QC.counterexample "an ordinary build checked" (null [() | (_, EvChecked _) <- ordinary])
+      ]
+  where
+    root = maximum (0 : Map.keys (ccDeps checkCase))
+    outputsOf = checkCaseOutputs (ccTwoOutputs checkCase)
+    rootDrv = fakePath ("n" <> T.pack (show root) <> ".drv")
+    rootName = T.concat (take 1 (outputsOf root))
+    rootOutputs = Set.fromList (map fakePath (outputsOf root))
+    needed = Set.fromList (map fakePath (concatMap outputsOf (root : Map.findWithDefault [] root (ccDeps checkCase))))
+    validAtStart = rootOutputs `Set.intersection` Set.fromList (map fakePath (ccValid checkCase))
+    allValidAtStart = validAtStart == rootOutputs
+    partlyValid = not (Set.null validAtStart) && not allValidAtStart
+    mustBuildShort = root `elem` ccForbidding checkCase && not allValidAtStart
+    (result, steps) = runCheckCase Realise.BuildCheck checkCase
+    events = map snd steps
+    checks = [valid | (valid, EvChecked _) <- steps]
+    checked = not (null checks)
+    rebuilt
+      | root `elem` ccFailing checkCase = Left (Realise.BuildFailed ("building " <> rootName <> " failed"))
+      | otherwise = maybe (Right ()) (Left . Realise.NotDeterministic rootDrv . fakePath) (find (`elem` ccUnstable checkCase) (outputsOf root))
+    -- Without a rebuild the check can only have failed.
+    resultIsRebuilds
+      | checked = result == rebuilt
+      | otherwise = either (const True) (const False) result
+    unbuildable (Left (Realise.OutputsNotValid _)) = True
+    unbuildable _ = False
+    queryFailed (Left (Realise.CacheQueryFailed _)) = True
+    queryFailed _ = False
+    (_, ordinary) = runCheckCase Realise.BuildNormal checkCase
 
 -- | A random reference graph: each node references only lower nodes, so the
 -- graph is acyclic, and some nodes are absent from the cache.
@@ -5560,7 +5762,7 @@ testRealise = do
                   path = fakePath . ("p" <>) . T.pack . show
                   cache = Map.fromList [(path node, map path refs) | (node, refs) <- Map.toList references, node `notElem` absent]
                   (outcome, final) =
-                    runState (Realise.substituteClosure fakeSubst [path root]) (FakeWorld Set.empty cache Set.empty Set.empty [])
+                    runState (Realise.substituteClosure fakeSubst [path root]) (fakeWorld [] []) {fwCache = cache}
                   valid = fwValid final
                   closed = all (\sp -> all (`Set.member` valid) (Map.findWithDefault [] sp cache)) valid
                   wholeOnCache = all (`notElem` absent) (closure Set.empty root)
@@ -5635,7 +5837,7 @@ testRealise = do
          in assertEqual
               "realise"
               (Left ("attribute 'allowSubstitutes' of derivation '" <> helloDrvName <> "' must be a Boolean"), [])
-              (either (Left . Realise.realiseFailureMessage) Right result, realiseWork events),
+              (either (Left . Realise.realiseFailureMessage defaultStoreDir) Right result, realiseWork events),
       runTest "with several outputs it builds them all and asks no cache about any" $
         let (result, events, valid) =
               runRealise
@@ -5680,7 +5882,7 @@ testRealise = do
       -- always-allow-substitutes says.
       runTest "they stop the build though the outputs are valid, and under always-allow-substitutes" $
         let nodes = [fakeNodeWith (structured "\xff") "hello" ["hello-out"] []]
-            stopped (result, events, _) = (either (Left . Realise.realiseFailureMessage) Right result, events)
+            stopped (result, events, _) = (either (Left . Realise.realiseFailureMessage defaultStoreDir) Right result, events)
             refused = (Left (unreadable <> "invalid UTF-8"), [])
          in assertEqual "valid" refused (stopped (runRealise Set.empty nodes [] ["hello-out"] "hello"))
               `andThen` assertEqual
@@ -5695,14 +5897,164 @@ testRealise = do
       runTestM "always-allow-substitutes allows a derivation whatever its attributes hold" $
         property $
           QC.forAll genAttributes $ \attrs ->
-            Realise.substitutesAllowed Realise.AlwaysAllowSubstitutes helloDrv attrs QC.=== Right Realise.MaySubstitute
+            Realise.substitutesAllowed Realise.AlwaysAllowSubstitutes helloDrv attrs QC.=== Right Realise.MaySubstitute,
+      -- Upstream's bmCheck.  A valid output's substitution goal ends at
+      -- once (PathSubstitutionGoal::init), so the cache that holds hello
+      -- is never asked about it, and gaveUpOnSubstitution gives the input
+      -- an ordinary goal.
+      runTest "a check realises the inputs of a valid root, builds the root again and asks no cache about it" $
+        let (result, events, _) = runCheck Set.empty helloAndGcc [("hello-out", []), ("gcc-out", [])] ["hello-out"] "hello"
+         in assertEqual
+              "check"
+              (Right (), [EvFetched [fakePath "gcc-out"], EvChecked "hello-out"], [EvReported Realise.Substituted "gcc-out", EvReported Realise.Checked "hello-out"], False)
+              (result, realiseWork events, [event | event@(EvReported _ _) <- events], EvQueried helloOut `elem` events),
+      runTest "a check builds an input no cache holds, and never the root" $
+        let (result, events, _) = runCheck Set.empty helloAndGcc [] ["hello-out"] "hello"
+         in assertEqual "check" (Right (), [EvBuilt "gcc-out", EvChecked "hello-out"]) (result, realiseWork events),
+      runTest "an input that is valid is not built again" $
+        let (result, events, _) = runCheck Set.empty helloAndGcc [] ["hello-out", "gcc-out"] "hello"
+         in assertEqual "check" (Right (), [EvChecked "hello-out"]) (result, realiseWork events),
+      -- registerOutputs raises NotDeterministic, and failingExitStatus
+      -- gives the build that ends in it its own status.
+      runTest "a rebuilt output that differs stops the check with upstream's message and status" $
+        let (result, events, _) =
+              runCheckIn Realise.NoFallback (fakeWorld [] ["hello-out"]) {fwUnstable = Set.singleton helloOut} Set.empty [fakeNode "hello" ["hello-out"] []] "hello"
+            differs = Realise.NotDeterministic helloDrv helloOut
+         in assertEqual "check" (Left differs, [EvChecked "hello-out"], []) (result, realiseWork events, [status | EvReported status _ <- events])
+              `andThen` assertEqual
+                "message"
+                ("derivation '" <> helloDrvText <> "' may not be deterministic: output '" <> T.pack (storePathToFilePath defaultStoreDir helloOut) <> "' differs")
+                (Realise.realiseFailureMessage defaultStoreDir differs)
+              `andThen` assertEqual "status" 104 (Realise.realiseFailureStatus differs),
+      -- printStorePath for the derivation, toRealPath for the output.
+      runTest "the output that differs is named where the store's files are, and the derivation under the store's own directory" $
+        assertEqual
+          "message"
+          ("derivation '" <> helloDrvText <> "' may not be deterministic: output '" <> T.pack (storePathToFilePath elsewhere helloOut) <> "' differs")
+          (Realise.realiseFailureMessage elsewhere (Realise.NotDeterministic helloDrv helloOut)),
+      -- Which output a rebuild finds different, and in what order it
+      -- compares them, is the check effect's to say ("builder/check" pins
+      -- the real one); the failure only passes its answer on.
+      runTest "the output the check effect finds different is the one the failure names" $
+        let (result, _, _) =
+              runCheckIn
+                Realise.NoFallback
+                (fakeWorld [] ["pkg-bin", "pkg-lib"]) {fwUnstable = Set.singleton (fakePath "pkg-lib")}
+                Set.empty
+                [fakeNode "pkg" ["pkg-bin", "pkg-lib"] []]
+                "pkg"
+         in assertEqual "check" (Left (Realise.NotDeterministic (fakePath "pkg.drv") (fakePath "pkg-lib"))) result,
+      -- Upstream's goal for a derivation it cannot load fails; a check
+      -- that built nothing again and compared nothing has not passed.
+      runTest "a check of a root the graph does not hold fails, where a build of one realises nothing and succeeds" $
+        let (checked, events, _) = runCheck Set.empty [] [] [] "hello"
+            (built, _, _) = runRealise Set.empty [] [] [] "hello"
+         in assertEqual "check" (Left ("cannot build missing derivation '" <> helloDrvText <> "'"), []) (messageOf checked, events)
+              `andThen` assertEqual "failure" (Left (Realise.MissingDerivation helloDrv)) checked
+              `andThen` assertEqual "build" (Right ()) built,
+      -- haveDerivation starts the substitution goals whatever the mode,
+      -- and the check goes on once they have made the outputs valid.
+      runTest "a check substitutes a root that is not valid, realises its inputs, then builds it again" $
+        let (result, events, _) = runCheck Set.empty helloAndGcc [("hello-out", []), ("gcc-out", [])] [] "hello"
+         in assertEqual
+              "check"
+              (Right (), [EvFetched [helloOut], EvFetched [fakePath "gcc-out"], EvChecked "hello-out"], [Realise.Substituted, Realise.Substituted, Realise.Checked])
+              (result, realiseWork events, [status | EvReported status _ <- events]),
+      runTest "of two outputs only the one that is not valid is fetched before the check" $
+        let (result, events, _) =
+              runCheck Set.empty [fakeNode "pkg" ["pkg-bin", "pkg-lib"] []] [("pkg-bin", []), ("pkg-lib", [])] ["pkg-bin"] "pkg"
+         in assertEqual "check" (Right (), [EvFetched [fakePath "pkg-lib"], EvChecked "pkg-bin"]) (result, realiseWork events),
+      -- outputsSubstitutionTried throws before gaveUpOnSubstitution, so no
+      -- input is looked at.
+      runTest "a root no cache holds cannot be checked, and nothing is asked about its inputs or built" $
+        let (result, events, _) = runCheck Set.empty helloAndGcc [("gcc-out", [])] [] "hello"
+         in assertEqual
+              "check"
+              (Left notValid, [], False)
+              (messageOf result, realiseWork events, EvQueried (fakePath "gcc-out") `elem` events)
+              `andThen` assertEqual "status" (Left 1) (either (Left . Realise.realiseFailureStatus) Right result),
+      runTest "one output of two that no cache holds leaves nothing to check" $
+        let (result, events, _) = runCheck Set.empty [fakeNode "pkg" ["pkg-bin", "pkg-lib"] []] [] ["pkg-bin"] "pkg"
+         in assertEqual "check" (Left (Realise.OutputsNotValid (fakePath "pkg.drv")), []) (result, realiseWork events),
+      runTest "a root that forbids substitutes is not fetched to be checked" $
+        let (result, events, _) =
+              runCheck Set.empty [fakeNodeWith forbidding "hello" ["hello-out"] []] [("hello-out", [])] [] "hello"
+         in assertEqual "check" (Left notValid, []) (messageOf result, events),
+      runTest "a substitute that fails stops a check as it stops a build, and under fallback leaves nothing to check" $
+        let broken = (fakeWorld [("hello-out", [])] []) {fwBroken = Set.singleton helloOut}
+            stopped fallback =
+              let (result, events, _) = runCheckIn fallback broken Set.empty helloAndGcc "hello"
+               in (result, realiseWork events)
+         in assertEqual "no fallback" (Left (Realise.SubstitutesFailed helloDrv), []) (stopped Realise.NoFallback)
+              `andThen` assertEqual "fallback" (Left (Realise.OutputsNotValid helloDrv), []) (stopped Realise.BuildFromSource),
+      runTest "a cache that cannot be asked stops a check" $
+        let unreachable = (fakeWorld [] []) {fwUnreachable = Set.singleton helloOut}
+            (result, events, _) = runCheckIn Realise.NoFallback unreachable Set.empty helloAndGcc "hello"
+         in assertEqual "check" (Left (Realise.CacheQueryFailed (fakeQueryFailure helloOut)), []) (result, realiseWork events),
+      -- The error for outputs that are not valid comes before the inputs,
+      -- so the retry 'realise' makes after them never happens: lib is
+      -- not built to fill the hole, and hello is asked about once.
+      runTest "a substitute with a hole in its closure is not retried after the inputs" $
+        let (result, events, _) =
+              runCheck Set.empty [fakeNode "hello" ["hello-out"] ["lib"], fakeNode "lib" ["lib-out"] []] [("hello-out", ["lib-out"])] [] "hello"
+         in assertEqual
+              "check"
+              (Left (Realise.OutputsNotValid helloDrv), [], 1 :: Int)
+              (result, realiseWork events, length [() | EvQueried path <- events, path == helloOut]),
+      runTest "a failed input stops the check before the root is built again" $
+        let (result, events, _) = runCheck (Set.singleton "gcc-out") helloAndGcc [] ["hello-out"] "hello"
+         in assertEqual "check" (Left (Realise.BuildFailed "building gcc-out failed"), []) (result, realiseWork events),
+      runTest "a rebuild that fails stops the check with the builder's report, and the status of a failed build" $
+        let (result, events, _) = runCheck (Set.singleton "hello-out") helloAndGcc [] ["hello-out", "gcc-out"] "hello"
+            failed = Realise.BuildFailed "building hello-out failed"
+         in assertEqual "check" (Left failed, [EvChecked "hello-out"]) (result, realiseWork events)
+              `andThen` assertEqual "status" 1 (Realise.realiseFailureStatus failed),
+      -- haveDerivation reads substitutesAllowed for a valid derivation
+      -- too once the mode keeps it from returning early.
+      runTest "a check reads allowSubstitutes though the outputs are valid, where a build leaves it unread" $
+        let nodes = [fakeNodeWith mistyped "hello" ["hello-out"] []]
+            (checked, events, _) = runCheck Set.empty nodes [] ["hello-out"] "hello"
+            (built, _, _) = runRealise Set.empty nodes [] ["hello-out"] "hello"
+         in assertEqual
+              "check"
+              (Left ("attribute 'allowSubstitutes' of derivation '" <> helloDrvName <> "' must be a Boolean"), [])
+              (messageOf checked, events)
+              `andThen` assertEqual "build" (Right ()) built,
+      runTest "only a rebuilt output that differs has a status of its own" $
+        assertEqual
+          "statuses"
+          [104, 1, 1, 1, 1, 1, 1]
+          ( map
+              Realise.realiseFailureStatus
+              [ Realise.NotDeterministic helloDrv helloOut,
+                Realise.BuildFailed "",
+                Realise.CacheQueryFailed "",
+                Realise.SubstitutesFailed helloDrv,
+                Realise.InvalidDerivation "",
+                Realise.OutputsNotValid helloDrv,
+                Realise.MissingDerivation helloDrv
+              ]
+          ),
+      -- 'checkLaw', over random graphs of one- and two-output derivations,
+      -- caches, valid sets and faults, with each class of case it speaks
+      -- about held to a share of the cases generated.
+      runTestM "a check builds the root again only once it and its inputs are valid, and never otherwise" $
+        property (QC.checkCoverage (QC.forAll genCheckCase checkLaw))
     ]
   where
     forbidding = Map.singleton "allowSubstitutes" ""
     structured = Map.singleton "__json"
     mistyped = structured "{\"allowSubstitutes\":\"no\"}"
-    alwaysAllowing = Realise.RealiseSettings Realise.NoFallback Realise.AlwaysAllowSubstitutes
+    alwaysAllowing = Realise.RealiseSettings Realise.NoFallback Realise.AlwaysAllowSubstitutes Realise.BuildNormal
     helloDrv = fakePath "hello.drv"
+    helloOut = fakePath "hello-out"
+    helloAndGcc = [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+    helloDrvText = "/nix/store/" <> helloDrvName
+    notValid = "some outputs of '" <> helloDrvText <> "' are not valid, so checking is not possible"
+    messageOf = either (Left . Realise.realiseFailureMessage defaultStoreDir) Right
+    -- Where a store's files are when they are not under its logical
+    -- directory.
+    elsewhere = StoreDir "elsewhere"
     helloDrvName = T.replicate 32 "h" <> "-hello.drv"
     unreadable = "cannot process __json attribute of '" <> helloDrvName <> "': "
     drvWith env = DepGraph.dnDerivation (snd (fakeNodeWith env "hello" ["hello-out"] []))
@@ -9689,6 +10041,311 @@ testDependentBuildIO = do
           [ runTest "dependent build succeeds with root output" $
               Fail ("dependency-aware build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
+
+-- | 'buildWithDeps' under 'Realise.BuildCheck', and 'checkDerivation',
+-- against a real store: the builder runs again beside the valid outputs,
+-- what it writes is compared with them, and the rebuild leaves the store
+-- as it was whatever the comparison finds.  A rebuild that differs is a
+-- derivation with the same output paths and another script, so no case
+-- depends on a builder that is itself nondeterministic.
+testBuildCheckIO :: IO [Bool]
+testBuildCheckIO = do
+  putStrLn "builder/check"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  let inStore :: String -> (Store -> BuildConfig -> IO TestResult) -> IO TestResult
+      inStore label action = do
+        let root = tmpBase </> ("nova-nix-test-check-" <> label)
+        forceRemoveIfExists root
+        createDirectoryIfMissing True root
+        store <- openStore (StoreDir (root </> "store"))
+        action store (defaultBuildConfig (stDir store)) {bcTmpDir = root </> "build"}
+          `finally` (closeStore store >> forceRemoveIfExists root)
+      checking config = config {bcMode = Realise.BuildCheck}
+      -- What a check has to leave as it found it: the store directory's
+      -- entries, where a scratch tree would show, and what the database
+      -- records of the outputs.
+      snapshot store outputs = do
+        entries <- sort <$> Dir.listDirectory (unStoreDir (stDir store))
+        infos <- mapM (queryPathInfo (stDB store)) outputs
+        pure (entries, infos)
+      fixture tag suffix = StorePath (T.replicate 31 tag <> suffix)
+      -- A derivation with two outputs, each under its name.
+      twoOutputs :: BS.ByteString -> (Text, StorePath) -> (Text, StorePath) -> BS.ByteString -> Derivation
+      twoOutputs name (firstName, firstSP) (secondName, secondSP) script =
+        Derivation
+          { drvOutputs = [DerivationOutput firstName firstSP "" "", DerivationOutput secondName secondSP "" ""],
+            drvInputDrvs = Map.empty,
+            drvInputSrcs = [],
+            drvPlatform = currentPlatform,
+            drvBuilder = TE.encodeUtf8 shell,
+            drvArgs = ["-c", script],
+            drvEnv = Map.fromList [("name", name)]
+          }
+      -- Output a records output b's path, and each holds the word.
+      bothWriting word = "mkdir -p $a $b && echo $b > $a/sibling && echo " <> word <> " > $a/value && echo " <> word <> " > $b/value"
+      differs store drvSP output =
+        BuildFailure
+          ( "derivation '"
+              <> storePathToText defaultStoreDir drvSP
+              <> "' may not be deterministic: output '"
+              <> T.pack (storePathToFilePath (stDir store) output)
+              <> "' differs"
+          )
+          104
+  sequence
+    [ -- The rebuild writes the scratch path it was handed into the output,
+      -- so it matches only once that path's hash is rewritten to the
+      -- output's own, as upstream rewrites it before it hashes the tree.
+      runTestM "a check passes for a derivation that builds the same again, its own path in the output included" $
+        inStore "same" $ \store config -> do
+          let outSP = fixture "k" "1" "check-same"
+              drvSP = fixture "k" "2" "check-same.drv"
+              drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo fixed > $out/value && echo $out > $out/self"
+              outPath = storePathToFilePath (stDir store) outSP
+          built <- buildWithDeps config store drv drvSP
+          before <- snapshot store [outSP]
+          checked <- buildWithDeps (checking config) store drv drvSP
+          after <- snapshot store [outSP]
+          self <- T.strip <$> TIO.readFile (outPath </> "self")
+          pure $
+            assertEqual "build" (BuildSuccess outSP) built
+              `andThen` assertEqual "check" (BuildSuccess outSP) checked
+              `andThen` assertEqual "store" before after
+              `andThen` assertEqual "self" (T.pack outPath) self,
+      runTestM "a check fails with upstream's message and status for a derivation that builds differently, and the store keeps what it had" $
+        inStore "differs" $ \store config -> do
+          let outSP = fixture "k" "3" "check-differs"
+              drvSP = fixture "k" "4" "check-differs.drv"
+              writing word = mkTestBuildDrv shell outSP ("mkdir -p $out && echo " <> word <> " > $out/value")
+          built <- buildWithDeps config store (writing "first") drvSP
+          before <- snapshot store [outSP]
+          checked <- buildWithDeps (checking config) store (writing "second") drvSP
+          after <- snapshot store [outSP]
+          value <- T.strip <$> TIO.readFile (storePathToFilePath (stDir store) outSP </> "value")
+          pure $
+            assertEqual "build" (BuildSuccess outSP) built
+              `andThen` assertEqual "check" (differs store drvSP outSP) checked
+              `andThen` assertEqual "store" before after
+              `andThen` assertEqual "value" "first" value,
+      -- The builder's output is where its log goes, so an empty log is a
+      -- builder that never ran.
+      runTestM "a check of a derivation with no valid output fails as upstream's does, and runs no builder" $
+        inStore "not-valid" $ \store config -> do
+          let outSP = fixture "k" "5" "check-not-valid"
+              drvSP = fixture "k" "6" "check-not-valid.drv"
+              drv = mkTestBuildDrv shell outSP "echo ran && mkdir -p $out"
+              logPath = bcTmpDir config <> "-log"
+          before <- snapshot store [outSP]
+          checked <-
+            withBinaryFile logPath WriteMode $ \logHandle ->
+              buildWithDeps (checking config) {bcBuildLog = logHandle} store drv drvSP
+          after <- snapshot store [outSP]
+          logged <- BS.readFile logPath
+          pure $
+            assertEqual
+              "check"
+              (BuildFailure ("some outputs of '" <> storePathToText defaultStoreDir drvSP <> "' are not valid, so checking is not possible") 1)
+              checked
+              `andThen` assertEqual "store" before after
+              `andThen` assertEqual "log" "" logged,
+      runTestM "a check whose rebuild fails reports the builder as a failed build does, and the store keeps what it had" $
+        inStore "fails" $ \store config -> do
+          let outSP = fixture "k" "7" "check-fails"
+              drvSP = fixture "k" "8" "check-fails.drv"
+          built <- buildWithDeps config store (mkTestBuildDrv shell outSP "echo first > $out") drvSP
+          before <- snapshot store [outSP]
+          checked <- buildWithDeps (checking config) store (mkTestBuildDrv shell outSP "exit 3") drvSP
+          after <- snapshot store [outSP]
+          pure $
+            assertEqual "build" (BuildSuccess outSP) built
+              `andThen` assertEqual "check" (BuildFailure "building test-build failed: exit 3: builder failed" 1) checked
+              `andThen` assertEqual "store" before after,
+      -- out records dev's path, which under a check is dev's scratch path
+      -- until it is rewritten, and dev is compared first because out
+      -- references it.
+      runTestM "a check compares every output, one that records its sibling included, and names the one that differs" $
+        inStore "siblings" $ \store config -> do
+          let outSP = fixture "k" "9" "check-main"
+              devSP = fixture "k" "a" "check-dev"
+              drvSP = fixture "k" "b" "check-siblings.drv"
+              writing word =
+                Derivation
+                  { drvOutputs = [DerivationOutput "out" outSP "" "", DerivationOutput "dev" devSP "" ""],
+                    drvInputDrvs = Map.empty,
+                    drvInputSrcs = [],
+                    drvPlatform = currentPlatform,
+                    drvBuilder = TE.encodeUtf8 shell,
+                    drvArgs = ["-c", "mkdir -p $out $dev && echo $dev > $out/sibling && echo " <> word <> " > $dev/value"],
+                    drvEnv = Map.fromList [("name", "check-siblings")]
+                  }
+          built <- buildWithDeps config store (writing "first") drvSP
+          before <- snapshot store [outSP, devSP]
+          same <- buildWithDeps (checking config) store (writing "first") drvSP
+          other <- buildWithDeps (checking config) store (writing "second") drvSP
+          after <- snapshot store [outSP, devSP]
+          pure $
+            assertEqual "build" (BuildSuccess outSP) built
+              `andThen` assertEqual "same" (BuildSuccess outSP) same
+              `andThen` assertEqual "other" (differs store drvSP devSP) other
+              `andThen` assertEqual "store" before after,
+      -- Upstream raises the fixed-output mismatch for a checked fixed
+      -- output, with the status of a failed build, not the check's.
+      runTestM "a checked fixed output is held to its declared hash" $
+        inStore "fixed" $ \store config -> do
+          let outSP = fixture "k" "c" "check-fixed"
+              drvSP = fixture "k" "d" "check-fixed.drv"
+              digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "fixed output payload\n")
+              printing text = mkFixedOutputDrv shell outSP ("printf '" <> text <> "\\n' > $out") "sha256" digest
+          built <- buildWithDeps config store (printing "fixed output payload") drvSP
+          before <- snapshot store [outSP]
+          same <- buildWithDeps (checking config) store (printing "fixed output payload") drvSP
+          other <- buildWithDeps (checking config) store (printing "tampered content") drvSP
+          after <- snapshot store [outSP]
+          pure $
+            assertEqual "build" (BuildSuccess outSP) built
+              `andThen` assertEqual "same" (BuildSuccess outSP) same
+              `andThen` ( case other of
+                            BuildFailure message 1 | "hash mismatch" `T.isInfixOf` message -> Pass
+                            _ -> Fail ("expected the fixed-output mismatch, got " <> T.pack (show other))
+                        )
+              `andThen` assertEqual "store" before after,
+      -- A root that came from a cache has inputs nothing fetched; here
+      -- the input's output is deleted to the same effect.
+      runTestM "a check builds an input that is not valid, then checks the root alone" $
+        inStore "input" $ \store config -> do
+          let depOut = fixture "c" "0" "check-dep"
+              depDrvSP = fixture "c" "1" "check-dep.drv"
+              rootOut = fixture "c" "2" "check-root"
+              rootDrvSP = fixture "c" "3" "check-root.drv"
+              depDrv = mkTestBuildDrv shell depOut "echo leaf > $out"
+              rootDrv = (mkTestBuildDrv shell rootOut "echo root > $out") {drvInputDrvs = Map.singleton depDrvSP ["out"]}
+          writeDrv store depDrv depDrvSP
+          writeDrv store rootDrv rootDrvSP
+          built <- buildWithDeps config store rootDrv rootDrvSP
+          rootBefore <- queryPathInfo (stDB store) rootOut
+          deleted <- deleteStorePathRaw store (storePathBasename depOut)
+          depGone <- not <$> isValid store depOut
+          checked <- buildWithDeps (checking config) store rootDrv rootDrvSP
+          depBack <- isValid store depOut
+          rootAfter <- queryPathInfo (stDB store) rootOut
+          pure $
+            assertEqual "build" (BuildSuccess rootOut) built
+              `andThen` assertEqual "deleted" (True, True) (either (const False) doRowRemoved deleted, depGone)
+              `andThen` assertEqual "check" (BuildSuccess rootOut) checked
+              `andThen` assertEqual "input valid again" True depBack
+              `andThen` assertEqual "root" rootBefore rootAfter,
+      -- Upstream compares the outputs in the order its topological sort
+      -- of their references gives, an output after the ones it references
+      -- (registerOutputs, local-derivation-goal.cc:2381-2415 at 2.24.9),
+      -- and throws at the first that differs.  Output a records b's path,
+      -- so b is compared first though a sorts first by name and comes
+      -- first in the derivation, and both differ.
+      runTestM "of two outputs that differ the one the other references is named, though the other sorts first" $
+        inStore "order" $ \store config -> do
+          let aSP = fixture "k" "f" "check-order-a"
+              bSP = fixture "k" "g" "check-order-b"
+              drvSP = fixture "k" "h" "check-order.drv"
+          built <- buildWithDeps config store (twoOutputs "check-order" ("a", aSP) ("b", bSP) (bothWriting "first")) drvSP
+          before <- snapshot store [aSP, bSP]
+          checked <- buildWithDeps (checking config) store (twoOutputs "check-order" ("a", aSP) ("b", bSP) (bothWriting "second")) drvSP
+          after <- snapshot store [aSP, bSP]
+          pure $
+            assertEqual "build" (BuildSuccess aSP) built
+              `andThen` assertEqual "check" (differs store drvSP bSP) checked
+              `andThen` assertEqual "store" before after,
+      -- The rebuilt outputs are ordered before any is compared, so two
+      -- that record each other fail the check as they would fail a build,
+      -- with upstream's message for the cycle and not for a difference.
+      runTestM "rebuilt outputs that reference each other in a cycle fail the check as they fail a build" $
+        inStore "cycle" $ \store config -> do
+          let devSP = fixture "k" "i" "check-cycle-dev"
+              outSP = fixture "k" "j" "check-cycle"
+              drvSP = fixture "k" "l" "check-cycle.drv"
+              apart = "mkdir -p $out $dev && echo first > $out/value && echo first > $dev/value"
+              entwined = "mkdir -p $out $dev && echo $dev > $out/sibling && echo $out > $dev/sibling"
+          built <- buildWithDeps config store (twoOutputs "check-cycle" ("dev", devSP) ("out", outSP) apart) drvSP
+          before <- snapshot store [devSP, outSP]
+          checked <- buildWithDeps (checking config) store (twoOutputs "check-cycle" ("dev", devSP) ("out", outSP) entwined) drvSP
+          after <- snapshot store [devSP, outSP]
+          pure $
+            assertEqual "build" (BuildSuccess devSP) built
+              `andThen` assertEqual
+                "check"
+                ( BuildFailure
+                    ( "building check-cycle failed: exit 1: cycle detected in build of '"
+                        <> storePathToText defaultStoreDir drvSP
+                        <> "' in the references of output 'dev' from output 'out'"
+                    )
+                    1
+                )
+                checked
+              `andThen` assertEqual "store" before after,
+      -- 'buildWithDeps' reaches the rebuild only once the outputs are
+      -- valid, so the rebuild's own answer for one that is not shows only
+      -- when it is asked directly: upstream's assertPathValidity message,
+      -- with no builder run for it.  It asks under the output's lock, so
+      -- the lock's file is the one thing it leaves in the store.
+      runTestM "checkDerivation fails for an output that is not valid as upstream's does, and runs no builder" $
+        inStore "direct" $ \store config -> do
+          let outSP = fixture "k" "m" "check-direct"
+              drvSP = fixture "k" "n" "check-direct.drv"
+              drv = mkTestBuildDrv shell outSP "echo ran && mkdir -p $out"
+              logPath = bcTmpDir config <> "-log"
+              withoutLocks (entries, infos) = (filter (not . T.isSuffixOf ".lock" . T.pack) entries, infos)
+          before <- snapshot store [outSP]
+          checked <-
+            withBinaryFile logPath WriteMode $ \logHandle ->
+              checkDerivation config {bcBuildLog = logHandle} store drv drvSP
+          after <- snapshot store [outSP]
+          logged <- BS.readFile logPath
+          pure $
+            assertEqual "check" (Left "building test-build failed: exit 1: some outputs are unexpectedly invalid") checked
+              `andThen` assertEqual "store" before (withoutLocks after)
+              `andThen` assertEqual "log" "" logged,
+      runTestM "checkDerivation answers what the rebuild found for a derivation whose outputs are valid" $
+        inStore "direct-valid" $ \store config -> do
+          let outSP = fixture "k" "p" "check-direct-valid"
+              drvSP = fixture "k" "q" "check-direct-valid.drv"
+              writing word = mkTestBuildDrv shell outSP ("echo " <> word <> " > $out")
+          built <- buildDerivation config store (writing "first") drvSP
+          same <- checkDerivation config store (writing "first") drvSP
+          other <- checkDerivation config store (writing "second") drvSP
+          pure $
+            assertEqual "build" (BuildSuccess outSP) built
+              `andThen` assertEqual "same" (Right Realise.OutputsMatch) same
+              `andThen` assertEqual "other" (Right (Realise.OutputDiffers outSP)) other,
+      -- A derivation with no output has nothing to compare, and a check
+      -- that compared nothing has not passed.
+      runTestM "checkDerivation fails for a derivation with no outputs" $
+        inStore "no-outputs" $ \store config -> do
+          let drvSP = fixture "k" "r" "check-empty.drv"
+              drv = (mkTestBuildDrv shell (fixture "k" "s" "unused") "exit 0") {drvOutputs = []}
+          checked <- checkDerivation config store drv drvSP
+          pure (assertEqual "check" (Left "building test-build failed: exit 1: no outputs defined") checked),
+      -- A check hashes the rebuilt tree as a stream, and registration
+      -- hashed the valid one from its whole archive.  The two have to
+      -- agree on everything a NAR holds, or a tree that builds the same
+      -- every time would be found different: here a nested directory, an
+      -- executable and a symlink.
+      runTestM "a check hashes a rebuilt tree to what registration recorded for the same tree" $
+        inStore "hash" $ \store config -> do
+          let outSP = fixture "k" "v" "check-hash"
+              drvSP = fixture "k" "w" "check-hash.drv"
+              script =
+                "mkdir -p $out/bin $out/share/deep && echo data > $out/share/deep/file"
+                  <> " && printf '#!/bin/sh\\necho tool\\n' > $out/bin/tool && chmod +x $out/bin/tool"
+                  <> " && ln -s ../share/deep/file $out/bin/link"
+              drv = mkTestBuildDrv shell outSP script
+          built <- buildWithDeps config store drv drvSP
+          recorded <- fmap piNarHash <$> queryPathInfo (stDB store) outSP
+          streamed <- CHash.formatNixHash <$> ExecBit.narHashOfPath (volumeCaseHack (stCaseSensitivity store)) (storePathToFilePath (stDir store) outSP)
+          checked <- buildWithDeps (checking config) store drv drvSP
+          pure $
+            assertEqual "build" (BuildSuccess outSP) built
+              `andThen` assertEqual "hashes" (Just streamed) recorded
+              `andThen` assertEqual "check" (BuildSuccess outSP) checked
+    ]
 
 -- | A random reference graph over a few nodes, cycles and self-references
 -- included, with roots drawn from it.
@@ -15899,6 +16556,78 @@ testUncaughtIOFailureCLI = do
           ]
     )
 
+-- | @build --check@ through the real CLI, which the tests of the build
+-- itself cannot show: that the flag reaches the build, that a check which
+-- passes prints the path a build prints, and that one which finds a
+-- difference exits with upstream's status for it.
+testCheckCLI :: IO [Bool]
+testCheckCLI = do
+  putStrLn "cli/check"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-check"
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+      runCLI args =
+        Proc.readCreateProcessWithExitCode
+          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ""
+      nixString text = "\"" <> T.replace "${" "\\${" (T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text)) <> "\""
+      expression name script =
+        T.unpack
+          ( "derivation { name = "
+              <> nixString name
+              <> "; system = builtins.currentSystem; builder = "
+              <> nixString shell
+              <> "; args = [ \"-c\" "
+              <> nixString script
+              <> " ]; }"
+          )
+      -- Its output holds its own path, which a rebuild beside the valid
+      -- output writes as the scratch path and the check rewrites.
+      same = expression "check-same" "echo $out > $out"
+      -- Its output holds the hash of its own path cut in two, where no
+      -- rewrite of the whole hash reaches it, so a rebuild at a scratch
+      -- path comes out different.
+      differing =
+        expression
+          "check-differs"
+          "stem=${out%-check-differs}; front=${stem%????????????????}; printf '%s\\n%s\\n' \"$front\" \"${stem#\"$front\"}\" > \"$out\""
+      build source store flags = runCLI (["build", "--expr", source, "--store", root </> store] ++ flags)
+      printed out = listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') out))))
+      outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
+  bracket_
+    (forceRemoveIfExists root >> createDirectoryIfMissing True root)
+    (forceRemoveIfExists root)
+    ( do
+        sameBuilt@(_, sameOut, _) <- build same "same" []
+        sameChecked@(sameCode, sameCheckedOut, sameErr) <- build same "same" ["--check"]
+        unbuilt@(unbuiltCode, _, unbuiltErr) <- build same "unbuilt" ["--check"]
+        differingBuilt@(_, differingOut, _) <- build differing "differing" []
+        differingChecked@(differingCode, _, differingErr) <- build differing "differing" ["--check"]
+        sequence
+          [ runTest "a check that passes exits 0 and prints the path the build printed" $
+              case (printed sameOut, sameCode) of
+                (Just path, ExitSuccess)
+                  | printed sameCheckedOut == Just path && "[check]" `T.isInfixOf` T.pack sameErr -> Pass
+                _ -> Fail ("build: " <> outcome sameBuilt <> "; check: " <> outcome sameChecked),
+            runTest "a check with no valid output exits 1 with upstream's message" $
+              if unbuiltCode == ExitFailure 1 && "are not valid, so checking is not possible" `T.isInfixOf` T.pack unbuiltErr
+                then Pass
+                else Fail (outcome unbuilt),
+            runTest "a check that finds a difference exits 104 with upstream's message" $
+              case printed differingOut of
+                Just path
+                  | differingCode == ExitFailure 104
+                      && ("may not be deterministic: output '" <> T.pack path <> "' differs") `T.isInfixOf` T.pack differingErr ->
+                      Pass
+                _ -> Fail ("build: " <> outcome differingBuilt <> "; check: " <> outcome differingChecked)
+          ]
+    )
+
 -- ---------------------------------------------------------------------------
 -- Tests: the CLI reference
 -- ---------------------------------------------------------------------------
@@ -19391,6 +20120,7 @@ runSuite = do
           testScrubbedBuildEnvIO,
           testUnpackBuildIO,
           testDependentBuildIO,
+          testBuildCheckIO,
           testReferenceClosureIO,
           testOutputOrderIO,
           testOutputCycleBuildIO,
@@ -19520,6 +20250,7 @@ runSuite = do
           testBuilder,
           testE2E,
           testExecWrapperCLI,
+          testCheckCLI,
           testUncaughtIOFailureCLI,
           testCliReference,
           testPhase4,

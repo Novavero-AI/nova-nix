@@ -188,7 +188,7 @@ globalForm =
   CommandEntry
     { commandForms = Form "COMMAND [FLAG...]" "Run one command, with the flags it takes" :| [],
       commandDescription =
-        "nova-nix evaluates Nix expressions, builds derivations, pushes store paths to a binary cache and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr.",
+        "nova-nix evaluates Nix expressions, builds derivations, pushes store paths to a binary cache and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
       commandExamples =
         Example "Print the release this binary was built from." ("--version" :| []) []
           :| [Example "Print the commands, flags and settings." ("--help" :| []) []]
@@ -230,7 +230,7 @@ command name = case name of
           Form "FILE.nix" "Build a derivation from a .nix file"
             :| [Form "--expr 'EXPR'" "Build a derivation from an inline expression"],
         commandDescription =
-          "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--out-link` the output is linked from `PATH` and kept from garbage collection; without it nothing is linked, where `nix-build` links `./result`.",
+          "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--check` the derivation is checked as `nix-build --check` checks one: an output of its that is not valid is first downloaded from a substituter that holds it, the derivations it depends on are built or downloaded as ever, and then it is built again beside its outputs, never downloaded, and each output is compared with the one in the store. The rebuild changes nothing in the store and what it wrote is discarded; the downloads and builds before it add to the store as in any build. An output that comes out different fails the command with status 104, so a path a substituter supplied can be held to a build. With `--out-link` the output is linked from `PATH` and kept from garbage collection; without it nothing is linked, where `nix-build` links `./result`.",
         commandExamples =
           Example
             "Build GNU Hello for Windows from the directory a release unpacks to, with the public cache as a substituter."
@@ -243,6 +243,10 @@ command name = case name of
                  Example
                    "Build a derivation written inline, on Linux or macOS."
                    ("build" :| ["--expr", "derivation { name = \"greeting\"; system = builtins.currentSystem; builder = \"/bin/sh\"; args = [ \"-c\" \"echo hello > $out\" ]; }"])
+                   [],
+                 Example
+                   "Check GNU Hello with the public cache as a substituter: Hello and what it is built from are downloaded where the cache holds them and built where it does not, then Hello is built again, and the command fails if its output comes out different."
+                   ("build" :| ["pkgs/windows/hello.nix", "--check", "--substituter", "https://cache.novavero.ai", "--trusted-key", "cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ="])
                    []
                ]
       }
@@ -301,6 +305,7 @@ data FlagName
   | SubstituterFlag
   | TrustedKeyFlag
   | FallbackFlag
+  | CheckFlag
   | ExecWrapperFlag
   | CacheFlag
   | AllFlag
@@ -381,6 +386,8 @@ flag name = case name of
     long "trusted-key" (Just "KEY") "Trust signatures by this public key (`NAME:BASE64`) from any substituter" buildOnly
   FallbackFlag ->
     long "fallback" Nothing "Build from source if substitution fails" buildOnly
+  CheckFlag ->
+    long "check" Nothing "Build the derivation again beside its valid outputs, and fail with status 104 if an output comes out different" buildOnly
   ExecWrapperFlag ->
     long "exec-wrapper" (Just "S=PATH") "Run system `S`'s derivations through `PATH` (repeatable), e.g. `x86_64-windows=/usr/bin/wine`" buildOnly
   CacheFlag ->

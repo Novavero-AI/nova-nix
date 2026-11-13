@@ -18,6 +18,15 @@
 -- 6. Nix scans the output for references to other store paths
 -- 7. Output is moved to the store and registered
 --
+-- == Checking
+--
+-- Under 'BuildCheck', upstream's @nix-build --check@, 'buildWithDeps'
+-- builds its derivation again beside the valid outputs and compares what
+-- comes out with them ('checkDerivation').  That rebuild registers nothing
+-- and leaves the outputs as they are.  What comes before it adds to the
+-- store as any build does: an output that is not valid is substituted
+-- first, and the inputs are substituted or built.
+--
 -- == On Windows
 --
 -- The key difference is process creation.  Upstream on Linux uses
@@ -37,6 +46,7 @@ module Nix.Builder
   ( -- * Build execution
     BuildResult (..),
     buildDerivation,
+    checkDerivation,
     buildWithDeps,
     substitutePaths,
 
@@ -67,9 +77,9 @@ where
 
 import Control.Exception (IOException, bracket, catch, catches, displayException, finally, onException, try)
 import Control.Monad (filterM, foldM, unless, when)
-import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError)
+import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError, withExceptT)
 import Control.Monad.IO.Class (liftIO)
-import Data.Bifunctor (first)
+import Data.Bifunctor (bimap, first)
 import qualified Data.ByteString as BS
 import Data.Char (isAscii, isSpace, toLower, toUpper)
 import Data.Foldable (for_)
@@ -97,12 +107,14 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, current
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
-import Nix.Realise (Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), SubstEffects (..), SubstitutesSetting (..), realise, realiseFailureMessage)
-import Nix.Store (PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, volumeCaseHack)
+import Nix.Push (narHashMatches)
+import Nix.Realise (BuildMode (..), CheckVerdict (..), Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), SubstEffects (..), SubstitutesSetting (..), realise, realiseFailureMessage, realiseFailureStatus)
+import Nix.Store (PathInfo (..), PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText, unStoreDir)
 import Nix.Substituter (CacheConfig, SubstResult (..), queryReferencesWith, trySubstituteWith)
 import qualified NovaCache.Base32 as Nix32
+import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
 import qualified System.Environment
@@ -247,6 +259,10 @@ data BuildConfig = BuildConfig
     -- | Whether a derivation's @allowSubstitutes@ attribute is heeded:
     -- upstream's @always-allow-substitutes@.
     bcSubstitutes :: !SubstitutesSetting,
+    -- | What 'buildWithDeps' does with the derivation it is given:
+    -- upstream's build mode, which @nix-build --check@ sets.  Nothing
+    -- else reads it, and 'buildDerivation' always builds.
+    bcMode :: !BuildMode,
     -- | Extraction budget for @builtin:unpack@ builds.
     bcUnpackLimits :: !UnpackLimits,
     -- | How a download is retried: each URL of a @builtin:fetchurl@
@@ -282,6 +298,7 @@ defaultBuildConfig dir =
       bcCaches = [],
       bcFallback = NoFallback,
       bcSubstitutes = HeedAllowSubstitutes,
+      bcMode = BuildNormal,
       bcExecWrappers = Map.empty,
       bcUnpackLimits = defaultUnpackLimits,
       bcFetchRetry = defaultFetchRetryPolicy,
@@ -315,16 +332,86 @@ data BuildResult
 --    must abort the build, never be reported as a build failure.
 buildDerivation :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
 buildDerivation config store drv drvPath =
-  buildDerivationInner config store drv drvPath
-    `catchSync` \err -> pure (BuildFailure ("build exception: " <> T.pack (show err)) 1)
+  either stoppedResult BuildSuccess <$> buildOutputs config store drv drvPath
 
--- | Build under the outputs' path locks.  A derivation another process
--- finished while we waited for them is adopted rather than redone:
--- rebuilding would delete a registered path out from under whoever is
--- already using it, which is why substitution adopts a finished path too.
-buildDerivationInner :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
-buildDerivationInner config store drv drvPath =
-  withOutputLocks config store drv (maybe (buildUnderLock config store drv drvPath) (pure . BuildSuccess))
+-- | Why a build stopped short of what it was for: the message and exit
+-- code a 'BuildFailure' reports.
+data BuildStop = BuildStop !Text !Int
+
+-- | The build result a stopped build reports.
+stoppedResult :: BuildStop -> BuildResult
+stoppedResult (BuildStop message code) = BuildFailure message code
+
+-- | A build's synchronous exception as the stop it reports.  An
+-- asynchronous one propagates ('catchSync').
+stoppingOnException :: IO (Either BuildStop a) -> IO (Either BuildStop a)
+stoppingOnException build =
+  build `catchSync` \err -> pure (Left (BuildStop ("build exception: " <> T.pack (show err)) 1))
+
+-- | Build under the outputs' path locks, and answer the first output's
+-- path.  A derivation another process finished while we waited for them is
+-- adopted rather than redone: rebuilding would delete a registered path
+-- out from under whoever is already using it, which is why substitution
+-- adopts a finished path too.
+buildOutputs :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either BuildStop StorePath)
+buildOutputs config store drv drvPath =
+  stoppingOnException $
+    withOutputLocks config store drv (maybe build (pure . Right))
+  where
+    build = buildUnderLock config store drv RedirectValid (registerOutputs config store drv drvPath)
+
+-- | Check a derivation, given its @.drv@ path: build it again beside its
+-- valid outputs and compare what comes out with what the store holds.
+-- This is the build upstream runs under @bmCheck@, without what comes
+-- before it: "Nix.Realise" substitutes an output that is not valid and
+-- realises the inputs, and 'buildWithDeps' under 'BuildCheck' does both.
+--
+-- The rebuild registers nothing, leaves the outputs as they are, and keeps
+-- nothing it wrote.  'Left' is why there was no comparison to answer with,
+-- naming the derivation as 'buildWithDeps' names one that failed to build:
+-- its builder failed, or an output is not valid, so there is nothing to
+-- compare a rebuild with.
+checkDerivation :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text CheckVerdict)
+checkDerivation config store drv drvPath =
+  first (stopReport drv) <$> checkOutputs config store drv drvPath
+
+-- | 'checkDerivation', under the outputs' path locks, which upstream holds
+-- through a check as through any build (@DerivationGoal::tryToBuild@ at
+-- 2.24.9).  The builder writes every output to a scratch path
+-- ('RedirectAll'), so the store's copies stay as they are, and what it
+-- wrote is gone when this returns.
+--
+-- What a check compares with is each output's registration, so that is
+-- what it asks for once the locks are held, and it is the one place that
+-- decides whether the outputs are valid: the rebuild that follows is
+-- handed the recorded hashes and asks the database nothing more.  An
+-- output with no registration fails the check with upstream's message for
+-- that state.  Upstream reaches it after running the builder
+-- (@assertPathValidity@); the builder's work could only replace that
+-- failure with another, so it is not run.
+checkOutputs :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either BuildStop CheckVerdict)
+checkOutputs config store drv drvPath =
+  stoppingOnException $
+    withOutputLocks config store drv (const compareUnderLock)
+  where
+    compareUnderLock = do
+      recorded <- traverse (queryPathInfo (stDB store) . doPath) (drvOutputs drv)
+      case sequence recorded of
+        Nothing -> pure (Left (BuildStop unexpectedlyInvalidMessage 1))
+        -- A check that compared nothing has not passed.
+        Just [] -> pure (Left (BuildStop noOutputsMessage 1))
+        Just registrations ->
+          buildUnderLock config store drv RedirectAll (compareOutputs config store drv drvPath (map piNarHash registrations))
+
+-- | Upstream's failure for a check that finds an output it was to compare
+-- with not valid (@DerivationGoal::assertPathValidity@, derivation-goal.cc
+-- at 2.24.9).
+unexpectedlyInvalidMessage :: Text
+unexpectedlyInvalidMessage = "some outputs are unexpectedly invalid"
+
+-- | The failure for a derivation that defines no output.
+noOutputsMessage :: Text
+noOutputsMessage = "no outputs defined"
 
 -- | Hold every output's path lock for the whole build, and report
 -- whether the derivation was already finished by the time they were
@@ -381,15 +468,30 @@ allOutputsValid store drv = case map doPath (drvOutputs drv) of
     validity <- mapM (isValid store) outputPaths
     pure (if and validity then Just firstOutput else Nothing)
 
+-- | What a build does with the outputs its builder wrote, given the
+-- closure of its inputs and where each output was written: registers them
+-- ('registerOutputs'), or compares them with the store's
+-- ('compareOutputs').
+type Finish a = Set StorePath -> [OutputPlan] -> IO (Either BuildStop a)
+
+-- | Which outputs the builder is handed a scratch path for
+-- ('outputPlan').
+data Redirected
+  = -- | Those that are valid, which a build has to leave as they are.
+    RedirectValid
+  | -- | Every one.  A check's outputs are all valid: 'checkOutputs' has
+    -- their registrations in hand, under the locks this runs under.
+    RedirectAll
+
 -- | The build itself, with every output's lock already held.
-buildUnderLock :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
-buildUnderLock config store drv drvPath = do
+buildUnderLock :: BuildConfig -> Store -> Derivation -> Redirected -> Finish a -> IO (Either BuildStop a)
+buildUnderLock config store drv redirected finish = do
   -- 1. Validate inputs (sources + input-derivation outputs) exist, and
   --    take their closure: what an output may reference besides the
   --    derivation's own outputs.
   inputs <- validateInputs config store drv >>= either (pure . Left) (inputClosure store)
   case inputs of
-    Left errMsg -> pure (BuildFailure errMsg 1)
+    Left errMsg -> pure (Left (BuildStop errMsg 1))
     Right inputPaths -> do
       -- 2. Create temp build directory.  The location is deterministic
       --    (computeBuildDir), so a crashed earlier run may have left stale
@@ -406,10 +508,12 @@ buildUnderLock config store drv drvPath = do
         --    $out is the FINAL store path now, as upstream's is: a temp
         --    path recorded by the build (a compiler driver, a libtool
         --    archive) would otherwise outlive the temp dir it named.
-        outputValidity <- mapM (isValid store . doPath) (drvOutputs drv)
+        outputValidity <- case redirected of
+          RedirectValid -> mapM (isValid store . doPath) (drvOutputs drv)
+          RedirectAll -> pure (map (const True) (drvOutputs drv))
         case traverse outputPlan (zip (drvOutputs drv) outputValidity) of
-          Left nameErr -> pure (BuildFailure ("output name is not a store path name: " <> T.pack (show nameErr)) 1)
-          Right plans -> runPlannedBuild config store drv drvPath inputPaths buildDir plans
+          Left nameErr -> pure (Left (BuildStop ("output name is not a store path name: " <> T.pack (show nameErr)) 1))
+          Right plans -> runPlannedBuild config drv buildDir plans (finish inputPaths plans)
 
 -- | Where the builder writes each output, and where that has to end up.
 --
@@ -418,7 +522,11 @@ buildUnderLock config store drv drvPath = do
 -- that is already valid, which the builder is still handed (a package with
 -- a @dev@ output has one builder writing both) but which must not be
 -- touched: it is registered, its @NarHash@ describes its current bytes,
--- and 'placeInStore' has already sealed it read-only.
+-- and 'placeInStore' has already sealed it read-only.  A check builds a
+-- derivation whose outputs are all valid, so there every output is written
+-- to a scratch path, as upstream writes a valid output wherever it builds
+-- outside a Linux chroot (@startBuilder@, local-derivation-goal.cc:539-554
+-- at 2.24.9).
 data OutputPlan = OutputPlan
   { -- | The derivation output's name, as it reaches the environment.
     opName :: !Text,
@@ -519,9 +627,9 @@ spawnFor host config drv
     system = platformToText platform
 
 -- | The build, once every output knows where it is written and where it
--- belongs, and the closure of the inputs is known.
-runPlannedBuild :: BuildConfig -> Store -> Derivation -> StorePath -> Set StorePath -> FilePath -> [OutputPlan] -> IO BuildResult
-runPlannedBuild config store drv drvPath inputPaths buildDir plans = do
+-- belongs: run the builder, then @finish@ with what it wrote.
+runPlannedBuild :: BuildConfig -> Derivation -> FilePath -> [OutputPlan] -> IO (Either BuildStop a) -> IO (Either BuildStop a)
+runPlannedBuild config drv buildDir plans finish = do
   let scratchDir p = storePathToFilePath (bcStoreDir config) (opScratch p)
       outputDirs = [(opName p, scratchDir p) | p <- plans]
       -- Every scratch path is the build's to use: the ones that are final
@@ -533,8 +641,9 @@ runPlannedBuild config store drv drvPath inputPaths buildDir plans = do
   -- The cleanup contract: the build directory is not where outputs live
   -- any more, so an interrupt or a throw between the builder starting and
   -- registration committing would otherwise strand an unregistered tree at
-  -- a real store path.  Once the registrations are committed there is
-  -- nothing left to take back, and the flag says so.
+  -- a real store path.  Once @finish@ has succeeded there is nothing left
+  -- to take back, and the flag says so: a build's registrations are
+  -- committed, and a check wrote to scratch paths alone.
   committed <- newIORef False
   let cleanupUnlessCommitted = do
         done <- readIORef committed
@@ -596,7 +705,7 @@ runPlannedBuild config store drv drvPath inputPaths buildDir plans = do
           -- to take it back out: an unregistered tree there is invisible to
           -- the database and would only confuse the next run.
           clearScratch
-          pure (builderFailureResult failure)
+          pure (Left (builderStop failure))
         Right () -> do
           -- 6. Success: validate that the builder created all expected
           --    outputs.  Outputs may be files or directories - both are
@@ -610,18 +719,21 @@ runPlannedBuild config store drv drvPath inputPaths buildDir plans = do
               -- another.  None were registered, so take those orphaned
               -- trees back out of the store.
               clearScratch
-              pure (BuildFailure ("builder succeeded but outputs missing: " <> names) 1)
+              pure (Left (BuildStop ("builder succeeded but outputs missing: " <> names) 1))
             [] -> do
-              result <- registerOutputs config store drv drvPath inputPaths plans
-              case result of
-                BuildSuccess _ -> do
+              finished <- finish
+              case finished of
+                Right _ -> do
                   writeIORef committed True
-                  -- Upstream discards a valid output's redirected copy
-                  -- rather than reading it; only the fallbacks go, the
-                  -- registered trees stay.
+                  -- Only the fallbacks go; the registered trees stay.
+                  -- After a build they are the redirected copies of
+                  -- outputs that were already valid, which upstream
+                  -- discards unread.  After a check they are every output
+                  -- the builder wrote, compared by now and not kept,
+                  -- whatever the comparison found.
                   for_ [p | p <- plans, opValid p] (removePathForcibly . scratchDir)
-                _ -> clearScratch
-              pure result
+                Left _ -> clearScratch
+              pure finished
     )
     `onException` cleanupUnlessCommitted
 
@@ -638,11 +750,11 @@ data BuilderFailure
     -- reason given.
     BuilderRefused !Int !Text
 
--- | The build result a failed builder step reports.
-builderFailureResult :: BuilderFailure -> BuildResult
-builderFailureResult failure = case failure of
-  BuilderExited code -> BuildFailure "builder failed" code
-  BuilderRefused code reason -> BuildFailure ("builder failed: " <> reason) code
+-- | The stop a failed builder step reports.
+builderStop :: BuilderFailure -> BuildStop
+builderStop failure = case failure of
+  BuilderExited code -> BuildStop "builder failed" code
+  BuilderRefused code reason -> BuildStop ("builder failed: " <> reason) code
 
 -- | Decode a derivation's builder path and arguments from their identity
 -- bytes to the 'Text' the process-spawn boundary needs.  @Left@ names the
@@ -1349,35 +1461,65 @@ registerOutputs ::
   StorePath ->
   Set StorePath ->
   [OutputPlan] ->
-  IO BuildResult
-registerOutputs config store drv drvPath inputPaths plans = do
-  let -- Candidates for reference scanning: the input closure and this
-      -- derivation's own outputs, upstream's @referenceablePaths@
-      -- (local-derivation-goal.cc:2275-2278 at 2.24.9).
-      allCandidates = Set.toList inputPaths ++ map doPath (drvOutputs drv)
-      -- Outputs register with no deriver yet, so 'queryDeriver' answers
-      -- Nothing for a built path, where upstream records the @.drv@
-      -- (local-derivation-goal.cc:2738).
-      deriver = Nothing
-      -- An output may record an already-valid sibling, whose build wrote to
-      -- a scratch path that is about to stop existing, so each scratch hash
-      -- becomes the final one.  Upstream scans first and translates its hits;
-      -- rewriting first lets the scan see final hashes and needs no
-      -- translation, and the references come out the same.
-      scratchRewrites = [(spHash (opScratch p), spHash (opFinal p)) | p <- plans, opValid p]
-  scanned <- runExceptT (traverse (scanOutput config store allCandidates scratchRewrites) (zip (drvOutputs drv) plans))
-  case orderByReferences (siblingsReferenced (drvOutputs drv)) . Map.fromList <$> scanned of
-    Left errMsg -> pure (BuildFailure errMsg 1)
-    Right (Left cycleEdge) -> pure (BuildFailure (outputCycleMessage drvPath cycleEdge) 1)
-    Right (Right ordered) -> do
-      placed <- runExceptT (traverse (ExceptT . placeOutput store deriver . snd) ordered)
-      case placed of
-        Left errMsg -> pure (BuildFailure errMsg 1)
-        Right regs -> do
-          registerPaths (stDB store) (catMaybes regs)
-          case drvOutputs drv of
-            (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
-            [] -> pure (BuildFailure "no outputs defined" 1)
+  IO (Either BuildStop StorePath)
+registerOutputs config store drv drvPath inputPaths plans = runExceptT $ do
+  scanned <- withExceptT scanStop (traverse (scanOutput config store scan) (zip (drvOutputs drv) plans))
+  ordered <- liftEither (orderScanned drvPath (siblingsReferenced (drvOutputs drv)) scanned)
+  regs <- withExceptT scanStop (traverse (ExceptT . placeOutput store deriver . snd) ordered)
+  liftIO (registerPaths (stDB store) (catMaybes regs))
+  case drvOutputs drv of
+    (firstOut : _) -> pure (doPath firstOut)
+    [] -> throwError (BuildStop noOutputsMessage 1)
+  where
+    scan = outputScan drv inputPaths plans
+    -- Outputs register with no deriver yet, so 'queryDeriver' answers
+    -- Nothing for a built path, where upstream records the @.drv@
+    -- (local-derivation-goal.cc:2738).
+    deriver = Nothing
+
+-- | After a successful rebuild under 'BuildCheck', compare every output
+-- with the NAR hash the store recorded for it, the hashes in the order of
+-- the derivation's outputs: upstream's @registerOutputs@ under @bmCheck@
+-- (local-derivation-goal.cc at 2.24.9).  Every output is scanned and the
+-- outputs ordered as a build's are, so a reference cycle between them
+-- fails a check as it fails a build (:2317, :2381-2411).  Each is then
+-- compared in that order, an output after the siblings it references, and
+-- the first that differs ends the comparison, where upstream's loop throws
+-- (:2415, :2694-2715).
+--
+-- Nothing is registered and no output is moved.  Upstream marks a path it
+-- has checked as ultimately trusted and signs it (:2717-2722); the store
+-- database here records neither.
+compareOutputs ::
+  BuildConfig ->
+  Store ->
+  Derivation ->
+  StorePath ->
+  [Text] ->
+  Set StorePath ->
+  [OutputPlan] ->
+  IO (Either BuildStop CheckVerdict)
+compareOutputs config store drv drvPath recordedHashes inputPaths plans = runExceptT $ do
+  built <- withExceptT scanStop (traverse rebuilt (zip3 (drvOutputs drv) plans recordedHashes))
+  ordered <- liftEither (orderScanned drvPath (siblings . boReferences . fst) built)
+  ExceptT (firstDifference (volumeCaseHack (stCaseSensitivity store)) (map snd ordered))
+  where
+    scan = outputScan drv inputPaths plans
+    siblings = siblingNames (drvOutputs drv)
+    rebuilt (output, plan, recorded) = do
+      outDir <- writtenOutput config (output, plan)
+      scanned <- liftIO (scanBuilt scan output outDir)
+      pure (doName output, (scanned, recorded))
+
+-- | The stop a failed scan or placement reports.
+scanStop :: Text -> BuildStop
+scanStop message = BuildStop message 1
+
+-- | Order scanned outputs so that each follows the siblings it references
+-- ('orderByReferences'), or stop the build at a cycle among them.
+orderScanned :: StorePath -> (v -> Set Text) -> [(Text, v)] -> Either BuildStop [(Text, v)]
+orderScanned drvPath references scanned =
+  first (scanStop . outputCycleMessage drvPath) (orderByReferences references (Map.fromList scanned))
 
 -- | Upstream's failure for outputs that reference each other in a cycle
 -- (local-derivation-goal.cc:2406-2408 at 2.24.9), naming the @.drv@ and
@@ -1392,45 +1534,93 @@ outputCycleMessage drvPath (ReferenceCycle node referrer) =
     <> referrer
     <> "'"
 
+-- | What the scan of a build's outputs rewrites and looks for.
+data OutputScan = OutputScan
+  { -- | Each redirected output's scratch hash and the final one it
+    -- becomes.  An output may record a sibling, or itself, whose build
+    -- wrote to a scratch path that is about to stop existing.  Upstream
+    -- scans first and translates its hits; rewriting first lets the scan
+    -- see final hashes and needs no translation, and the references come
+    -- out the same.
+    osScratchRewrites :: ![(Text, Text)],
+    -- | Candidates for reference scanning: the input closure and this
+    -- derivation's own outputs, upstream's @referenceablePaths@
+    -- (local-derivation-goal.cc:2275-2278 at 2.24.9).
+    osCandidates :: ![StorePath]
+  }
+
+-- | The scan for a derivation's outputs, given the closure of its inputs
+-- and where each output was written.
+outputScan :: Derivation -> Set StorePath -> [OutputPlan] -> OutputScan
+outputScan drv inputPaths plans =
+  OutputScan
+    { osScratchRewrites = [(spHash (opScratch p), spHash (opFinal p)) | p <- plans, opValid p],
+      osCandidates = Set.toList inputPaths ++ map doPath (drvOutputs drv)
+    }
+
 -- | One output after the scan and before it is placed: upstream's
 -- @AlreadyRegistered@ and @PerhapsNeedToRegister@.
 data ScannedOutput
   = -- | Registered before the build, and left as it is.
     AlreadyRegistered
-  | -- | Built here: the output, where the builder wrote it, and the
-    -- references the scan found in it.
-    NeedsRegistering !DerivationOutput !FilePath ![StorePath]
+  | -- | Built here.
+    NeedsRegistering !BuiltOutput
 
--- | Scan one output, keyed by its name: skip it if it is already valid in
--- the DB, otherwise rewrite scratch hashes in it and scan it for
--- references to the input closure and this derivation's outputs.
+-- | An output the builder wrote, after the scan.
+data BuiltOutput = BuiltOutput
+  { boOutput :: !DerivationOutput,
+    -- | Where the builder wrote it.
+    boDir :: !FilePath,
+    -- | The references the scan found in it.
+    boReferences :: ![StorePath]
+  }
+
+-- | Where the builder wrote an output, which has to be there (a file or a
+-- directory).
+writtenOutput :: BuildConfig -> (DerivationOutput, OutputPlan) -> ExceptT Text IO FilePath
+writtenOutput config (_, plan) = do
+  let outDir = storePathToFilePath (bcStoreDir config) (opScratch plan)
+  exists <- liftIO (doesPathExist outDir)
+  unless exists (throwError ("output missing: " <> T.pack outDir))
+  pure outDir
+
+-- | Scan one output of a build, keyed by its name: skip it if it is
+-- already valid in the DB, otherwise scan what the builder wrote
+-- ('scanBuilt').
 scanOutput ::
   BuildConfig ->
   Store ->
-  [StorePath] ->
-  [(Text, Text)] ->
+  OutputScan ->
   (DerivationOutput, OutputPlan) ->
   ExceptT Text IO (Text, ScannedOutput)
-scanOutput config store candidates scratchRewrites (output, plan) = do
-  let outDir = storePathToFilePath (bcStoreDir config) (opScratch plan)
-  -- Check the build actually produced the output (file or directory).
-  exists <- liftIO (doesPathExist outDir)
-  unless exists (throwError ("output missing: " <> T.pack outDir))
+scanOutput config store scan planned@(output, _) = do
+  outDir <- writtenOutput config planned
   -- Validity is a DB fact, not mere disk presence: an output left on disk
   -- by an interrupted run is NOT valid, and build outputs are not
   -- content-addressed, so a leftover cannot be verified against its path.
   -- 'runPlannedBuild' removed any leftover before the builder ran, so the
   -- tree here is this build's (upstream's delete-then-move).
   valid <- liftIO (isValid store (doPath output))
-  if valid
-    then pure (doName output, AlreadyRegistered)
-    else liftIO $ do
-      -- One scan, not two: 'candidates' already carries this
-      -- derivation's own outputs, and outDir is the final path, so a
-      -- self- or cross-output reference is an ordinary hit.
-      rewriteStoreHashes scratchRewrites outDir
-      refs <- dedupStorePaths <$> scanReferences candidates outDir
-      pure (doName output, NeedsRegistering output outDir refs)
+  scanned <- if valid then pure AlreadyRegistered else NeedsRegistering <$> liftIO (scanBuilt scan output outDir)
+  pure (doName output, scanned)
+
+-- | Rewrite scratch hashes in an output the builder wrote, then scan it
+-- for references to the input closure and this derivation's outputs.
+--
+-- One scan, not two: the candidates already carry this derivation's own
+-- outputs, and after the rewrite the tree names them by their final
+-- hashes, so a self- or cross-output reference is an ordinary hit.
+scanBuilt :: OutputScan -> DerivationOutput -> FilePath -> IO BuiltOutput
+scanBuilt scan output outDir = do
+  rewriteStoreHashes (osScratchRewrites scan) outDir
+  refs <- dedupStorePaths <$> scanReferences (osCandidates scan) outDir
+  pure (BuiltOutput output outDir refs)
+
+-- | The names of the sibling outputs among an output's references.
+siblingNames :: [DerivationOutput] -> [StorePath] -> Set Text
+siblingNames outputs = Set.fromList . mapMaybe (`Map.lookup` nameByPath)
+  where
+    nameByPath = Map.fromList [(doPath o, doName o) | o <- outputs]
 
 -- | The names of the sibling outputs an output's scan found.  An output
 -- registered before the build references none: upstream uses the
@@ -1438,9 +1628,38 @@ scanOutput config store candidates scratchRewrites (output, plan) = do
 siblingsReferenced :: [DerivationOutput] -> ScannedOutput -> Set Text
 siblingsReferenced outputs = referencedBy
   where
-    nameByPath = Map.fromList [(doPath o, doName o) | o <- outputs]
+    siblings = siblingNames outputs
     referencedBy AlreadyRegistered = Set.empty
-    referencedBy (NeedsRegistering _ _ refs) = Set.fromList (mapMaybe (`Map.lookup` nameByPath) refs)
+    referencedBy (NeedsRegistering built) = siblings (boReferences built)
+
+-- | Compare rebuilt outputs, each with the NAR hash the store recorded for
+-- it, in order, up to the first that differs or cannot be compared.
+firstDifference :: NAR.CaseHack -> [(BuiltOutput, Text)] -> IO (Either BuildStop CheckVerdict)
+firstDifference _ [] = pure (Right OutputsMatch)
+firstDifference caseHack (rebuilt : rest) = do
+  compared <- compareOutput caseHack rebuilt
+  case compared of
+    Right OutputsMatch -> firstDifference caseHack rest
+    ended -> pure ended
+
+-- | Compare one rebuilt output with the NAR hash the store recorded for
+-- the valid one, which is all upstream compares (@newInfo.narHash !=
+-- oldInfo.narHash@, local-derivation-goal.cc:2698 at 2.24.9).  The rebuilt
+-- tree's hash is 'ExecBit.narHashOfPath', which streams the archive that
+-- registration serialises whole ('Nix.Store.registrationFor'), under the
+-- same case-hack mode and source of the executable bit.
+--
+-- A fixed output is held to its declared hash first, as a build holds it:
+-- upstream raises that mismatch for a checked fixed output and never
+-- reaches the comparison (:2612-2621, :2696, :2757).
+compareOutput :: NAR.CaseHack -> (BuiltOutput, Text) -> IO (Either BuildStop CheckVerdict)
+compareOutput caseHack (built, recorded) = do
+  fixedCheck <- verifyFixedOutput caseHack (boOutput built) (boDir built)
+  case fixedCheck of
+    Left err -> pure (Left (scanStop err))
+    Right () -> do
+      rebuilt <- Hash.formatNixHash <$> ExecBit.narHashOfPath caseHack (boDir built)
+      pure (Right (if narHashMatches recorded rebuilt then OutputsMatch else OutputDiffers (doPath (boOutput built))))
 
 -- | Place a scanned output in the store and check a fixed output's
 -- content, returning its 'PathRegistration'; @Nothing@ for an output
@@ -1448,7 +1667,7 @@ siblingsReferenced outputs = referencedBy
 placeOutput :: Store -> Maybe Text -> ScannedOutput -> IO (Either Text (Maybe PathRegistration))
 placeOutput store deriver scanned = case scanned of
   AlreadyRegistered -> pure (Right Nothing)
-  NeedsRegistering output outDir refs -> do
+  NeedsRegistering (BuiltOutput output outDir refs) -> do
     -- The builder wrote straight into the store path, so outDir IS the
     -- target and placing it moves nothing.
     let targetPath = storePathToFilePath (stDir store) (doPath output)
@@ -1594,10 +1813,17 @@ dedupStorePaths = Map.elems . Map.fromList . map (\sp -> (spHash sp, sp))
 --    deliver when 'bcFallback' allows it, and a derivation that forbids
 --    substitutes unless 'bcSubstitutes' overrides it.
 --
+-- Under 'BuildCheck' ('bcMode') the root is not realised but checked: an
+-- output of its that is not valid is substituted, its inputs are realised
+-- as above, and it is built again beside its valid outputs and compared
+-- with them ('checkDerivation').
+--
 -- Returns 'BuildSuccess' with the root output path on success, or
--- 'BuildFailure' with exit code 1 if a derivation fails to build, a
--- substitute fails under 'NoFallback', a cache cannot be asked, or a
--- derivation's @allowSubstitutes@ cannot be read.
+-- 'BuildFailure' with the status the build exits with
+-- ('realiseFailureStatus'): 104 if a check found an output different, and
+-- 1 if a derivation fails to build, a substitute fails under 'NoFallback',
+-- a cache cannot be asked, a derivation's @allowSubstitutes@ cannot be
+-- read, or a check has no valid output to compare with.
 buildWithDeps :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
 buildWithDeps config store rootDrv rootDrvPath = do
   graph <- buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
@@ -1608,14 +1834,14 @@ buildWithDeps config store rootDrv rootDrvPath = do
         TopoCycle _ ->
           pure (BuildFailure "dependency cycle detected" 1)
         TopoSorted _ -> do
-          let settings = RealiseSettings {rsFallback = bcFallback config, rsSubstitutes = bcSubstitutes config}
+          let settings = RealiseSettings {rsFallback = bcFallback config, rsSubstitutes = bcSubstitutes config, rsMode = bcMode config}
           result <- realise settings (realiseEffects config store) depGraph rootDrvPath
           case result of
-            Left failure -> pure (BuildFailure (realiseFailureMessage failure) 1)
+            Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) (realiseFailureStatus failure))
             Right () ->
               case drvOutputs rootDrv of
                 (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
-                [] -> pure (BuildFailure "no outputs defined" 1)
+                [] -> pure (BuildFailure noOutputsMessage 1)
 
 -- | Read and parse a .drv file from the store, as bytes (no locale
 -- decode, no newline translation).
@@ -1647,23 +1873,26 @@ realiseEffects config store =
       -- skips a build only when all of them are valid.
       reAllValid = fmap isJust . allOutputsValid store,
       reBuild = buildReporting config store,
+      reCheck = checkDerivation config store,
       reReport = logRealised
     }
 
 -- | Build one derivation, naming it in any failure.
 buildReporting :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text ())
-buildReporting config store drv drvPath = do
-  result <- buildDerivation config store drv drvPath
-  pure $ case result of
-    BuildSuccess _ -> Right ()
-    BuildFailure msg code ->
-      Left ("building " <> formatDrvName drv <> " failed: exit " <> T.pack (show code) <> ": " <> msg)
+buildReporting config store drv drvPath =
+  bimap (stopReport drv) (const ()) <$> buildOutputs config store drv drvPath
+
+-- | A stopped build as the realisation reports it, naming the derivation.
+stopReport :: Derivation -> BuildStop -> Text
+stopReport drv (BuildStop message code) =
+  "building " <> formatDrvName drv <> " failed: exit " <> T.pack (show code) <> ": " <> message
 
 -- | Format a status tag for display.
 statusTag :: Realised -> Text
 statusTag AlreadyValid = "[cached]"
 statusTag Substituted = "[subst] "
 statusTag Built = "[build] "
+statusTag Checked = "[check] "
 
 -- | Log how a dependency was realised to stderr.
 logRealised :: Realised -> Derivation -> IO ()

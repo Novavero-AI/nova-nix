@@ -20,6 +20,12 @@
 -- read first, as upstream's @ParsedDerivation@ reads them
 -- ('derivationAttrs').
 --
+-- Under 'BuildCheck' the derivation asked for is not realised but checked:
+-- built again beside its valid outputs, each compared with the one the
+-- store holds ('checkRoot').  This is upstream's @bmCheck@, which
+-- @nix-build --check@ selects, and it covers that derivation alone: its
+-- inputs are realised as under 'BuildNormal'.
+--
 -- Every effect is a record field, so the decisions run in tests over a fake
 -- cache and store.  "Nix.Builder" supplies the real ones.
 module Nix.Realise
@@ -39,11 +45,14 @@ module Nix.Realise
 
     -- * Realising a graph
     Fallback (..),
+    BuildMode (..),
     RealiseSettings (..),
     RealiseEffects (..),
+    CheckVerdict (..),
     Realised (..),
     RealiseFailure (..),
     realiseFailureMessage,
+    realiseFailureStatus,
     realise,
   )
 where
@@ -57,12 +66,13 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.DependencyGraph (DepGraph (..), DepNode (..), directDeps)
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
 import Nix.Derivation.StructuredAttrs (structuredAttrsKey)
 import Nix.Json (Json (..), parseJson)
-import Nix.Store.Path (StorePath, defaultStoreDir, storePathBasename, storePathToText)
+import Nix.Store.Path (StoreDir, StorePath, defaultStoreDir, storePathBasename, storePathToFilePath, storePathToText)
 
 -- ---------------------------------------------------------------------------
 -- Substituting a closure
@@ -287,10 +297,23 @@ data Fallback
     BuildFromSource
   deriving (Eq, Show)
 
+-- | What a build does with the derivation it was asked for: upstream's
+-- @BuildMode@, less @bmRepair@.
+data BuildMode
+  = -- | Make its outputs valid, upstream's @bmNormal@.
+    BuildNormal
+  | -- | Build it again beside its valid outputs and compare each with the
+    -- one the store holds: upstream's @bmCheck@.
+    BuildCheck
+  deriving (Eq, Show)
+
 -- | The settings that decide how a graph is realised.
 data RealiseSettings = RealiseSettings
   { rsFallback :: !Fallback,
-    rsSubstitutes :: !SubstitutesSetting
+    rsSubstitutes :: !SubstitutesSetting,
+    -- | What is done with the root.  Every other derivation in the graph
+    -- is realised as under 'BuildNormal', whatever this says.
+    rsMode :: !BuildMode
   }
   deriving (Eq, Show)
 
@@ -306,22 +329,82 @@ data RealiseFailure
   | -- | A derivation's attributes could not be read ('derivationAttrs',
     -- 'substitutesAllowed').
     InvalidDerivation !Text
+  | -- | Under 'BuildCheck', this derivation has an output that is not
+    -- valid and that no cache supplied, so a rebuild has nothing to be
+    -- compared with.
+    OutputsNotValid !StorePath
+  | -- | Under 'BuildCheck', rebuilding this derivation gave this output
+    -- other contents than the store holds ('OutputDiffers').
+    NotDeterministic !StorePath !StorePath
+  | -- | Under 'BuildCheck', the graph holds no derivation at the root, so
+    -- nothing was built again or compared.
+    MissingDerivation !StorePath
   deriving (Eq, Show)
 
--- | A failure as the build reports it.  A failed substitute reads as
--- upstream's (@DerivationGoal::outputsSubstitutionTried@ at 2.24.9), less
--- the space its format string ends in.  The @.drv@ is named under the
--- logical store directory, wherever the store's files live, as upstream's
--- @printStorePath@ names it: a store kept elsewhere still has @/nix/store@
--- as its @storeDir@ and only its @realStoreDir@ moves.
-realiseFailureMessage :: RealiseFailure -> Text
-realiseFailureMessage (BuildFailed report) = report
-realiseFailureMessage (CacheQueryFailed failure) = failure
-realiseFailureMessage (InvalidDerivation problem) = problem
-realiseFailureMessage (SubstitutesFailed drvPath) =
-  "some substitutes for the outputs of derivation '"
-    <> storePathToText defaultStoreDir drvPath
-    <> "' failed (usually happens due to networking issues); try '--fallback' to build derivation from source"
+-- | A failure as the build reports it, given the directory the store's
+-- files are in.  A failed substitute reads as upstream's
+-- (@DerivationGoal::outputsSubstitutionTried@ at 2.24.9), less the space
+-- its format string ends in, a check that cannot start as that function's
+-- other error, and a check that found a difference as the error upstream's
+-- @registerOutputs@ raises when neither @keep-failed@ nor @run-diff-hook@
+-- is set (local-derivation-goal.cc:2713).  A root the graph does not hold
+-- reads as upstream's goal for a derivation it cannot load
+-- (@DerivationGoal::loadDerivation@).
+--
+-- A @.drv@ is named under the logical store directory, wherever the
+-- store's files live, as upstream's @printStorePath@ names it: a store
+-- kept elsewhere still has @/nix/store@ as its @storeDir@ and only its
+-- @realStoreDir@ moves.  The output that differs is named where its files
+-- are, as upstream's @toRealPath@ names it there, which is also how a
+-- build prints the output it made.
+realiseFailureMessage :: StoreDir -> RealiseFailure -> Text
+realiseFailureMessage realDir failure = case failure of
+  BuildFailed report -> report
+  CacheQueryFailed queryFailure -> queryFailure
+  InvalidDerivation problem -> problem
+  SubstitutesFailed drvPath ->
+    "some substitutes for the outputs of derivation '"
+      <> logical drvPath
+      <> "' failed (usually happens due to networking issues); try '--fallback' to build derivation from source"
+  OutputsNotValid drvPath ->
+    "some outputs of '" <> logical drvPath <> "' are not valid, so checking is not possible"
+  NotDeterministic drvPath output ->
+    "derivation '"
+      <> logical drvPath
+      <> "' may not be deterministic: output '"
+      <> T.pack (storePathToFilePath realDir output)
+      <> "' differs"
+  MissingDerivation drvPath ->
+    "cannot build missing derivation '" <> logical drvPath <> "'"
+  where
+    logical = storePathToText defaultStoreDir
+
+-- | Upstream's exit status for a build whose one failure is a check that
+-- found a difference: the check-mismatch bit and the two bits every status
+-- @Worker::failingExitStatus@ composes carries, @0x08 | 0x60@ (worker.cc at
+-- 2.24.9).
+checkMismatchStatus :: Int
+checkMismatchStatus = 104
+
+-- | The exit status of a build that failed any other way.
+failureStatus :: Int
+failureStatus = 1
+
+-- | The exit status of a build that stopped with this failure.  A check
+-- that found a difference exits with upstream's status for one, so a
+-- caller can tell it from a build that broke.  Every other failure exits
+-- 1, as upstream's does except a failed build's ('BuildFailed'), whose
+-- status there says more: 100 when the builder of a derivation that is not
+-- fixed-output fails, 102 when a fixed output has the wrong hash.
+realiseFailureStatus :: RealiseFailure -> Int
+realiseFailureStatus failure = case failure of
+  NotDeterministic _ _ -> checkMismatchStatus
+  BuildFailed _ -> failureStatus
+  CacheQueryFailed _ -> failureStatus
+  SubstitutesFailed _ -> failureStatus
+  InvalidDerivation _ -> failureStatus
+  OutputsNotValid _ -> failureStatus
+  MissingDerivation _ -> failureStatus
 
 -- | How one derivation came to be realised.
 data Realised
@@ -331,6 +414,18 @@ data Realised
     Substituted
   | -- | The derivation was built here.
     Built
+  | -- | The derivation was built again here, and every output came out as
+    -- the store holds it ('BuildCheck').
+    Checked
+  deriving (Eq, Show)
+
+-- | What building a derivation again beside its valid outputs found.
+data CheckVerdict
+  = -- | Every output came out as the store holds it.
+    OutputsMatch
+  | -- | This output came out with other contents.  It is the first that
+    -- did, in the order the outputs are compared in.
+    OutputDiffers !StorePath
   deriving (Eq, Show)
 
 -- | What realising a graph needs from the outside.
@@ -341,16 +436,79 @@ data RealiseEffects m = RealiseEffects
     -- | Build one derivation, whose inputs are realised, given its @.drv@
     -- path.
     reBuild :: !(Derivation -> StorePath -> m (Either Text ())),
+    -- | Build one derivation, whose outputs are valid and whose inputs are
+    -- realised, again beside those outputs, given its @.drv@ path, and
+    -- compare what comes out with what the store holds.  It registers
+    -- nothing and keeps nothing it built.
+    reCheck :: !(Derivation -> StorePath -> m (Either Text CheckVerdict)),
     -- | Report how a derivation was realised.
     reReport :: !(Realised -> Derivation -> m ())
   }
 
--- | Realise a graph from its root.  A derivation that is valid or substituted
--- takes its inputs out of the work, and what remains builds leaves first.
+-- | Realise a graph from its root, or under 'BuildCheck' check the root
+-- ('checkRoot').  A derivation that is valid or substituted takes its
+-- inputs out of the work, and what remains builds leaves first.
 --
 -- The graph has to be acyclic ('Nix.DependencyGraph.topoSort' decides that).
 realise :: (Monad m) => RealiseSettings -> RealiseEffects m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
-realise settings effects graph root = void <$> realiseNode settings effects graph Set.empty root
+realise settings effects graph root = case rsMode settings of
+  BuildNormal -> void <$> realiseNode settings effects graph Set.empty root
+  BuildCheck -> checkRoot settings effects graph root
+
+-- | Check the root: upstream's @DerivationGoal@ under @bmCheck@ at 2.24.9.
+--
+-- An output that is not valid is substituted first, as under any mode
+-- (@haveDerivation@ starts the substitution goals before it looks at the
+-- mode again), and a derivation still short of an output cannot be checked
+-- (@outputsSubstitutionTried@).  That error comes before any input is
+-- looked at, so a substitute with a hole in its closure is not retried
+-- here as 'realiseNode' retries it.
+--
+-- With every output valid the inputs are realised as under 'BuildNormal'
+-- (@gaveUpOnSubstitution@ gives each input's goal @bmNormal@): the rebuild
+-- needs them, and a root that was substituted never fetched them.  Then
+-- the derivation is built again and compared ('reCheck').
+--
+-- @allowSubstitutes@ is read whether or not the outputs are valid, where
+-- 'realiseNode' leaves it unread for a valid derivation: upstream reads it
+-- before it starts a substitution goal for each output, a valid one
+-- included, and such a goal ends at once.
+--
+-- A root the graph does not hold fails the check, where 'realiseNode' has
+-- nothing to realise for such a node: a check that compared nothing has
+-- not passed.
+checkRoot :: (Monad m) => RealiseSettings -> RealiseEffects m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
+checkRoot settings effects graph root = case Map.lookup root (unDepGraph graph) of
+  Nothing -> pure (Left (MissingDerivation root))
+  Just depNode ->
+    let drv = dnDerivation depNode
+     in either (pure . Left . InvalidDerivation) (checkAllowed drv) $
+          derivationAttrs root drv >>= substitutesAllowed (rsSubstitutes settings) root
+  where
+    checkAllowed drv allowed = do
+      allValid <- reAllValid effects drv
+      if allValid
+        then rebuild drv
+        else do
+          substituted <- outputsFromCaches effects allowed drv
+          case (substituted, substitutionStop (rsFallback settings) root substituted) of
+            (ClosureComplete, _) -> reReport effects Substituted drv *> rebuild drv
+            (_, Just failure) -> pure (Left failure)
+            (_, Nothing) -> pure (Left (OutputsNotValid root))
+    rebuild drv = do
+      inputs <- realiseAll settings effects graph (Set.singleton root) (directDeps graph root)
+      case inputs of
+        Left err -> pure (Left err)
+        Right _ -> reCheck effects drv root >>= either (pure . Left . BuildFailed) (checked drv)
+    checked drv OutputsMatch = Right () <$ reReport effects Checked drv
+    checked _ (OutputDiffers output) = pure (Left (NotDeterministic root output))
+
+-- | Substitute a derivation's own outputs, if it may be substituted.  One
+-- that must build asks no cache, which leaves it where one that no cache
+-- holds is: upstream starts no substitution for it.
+outputsFromCaches :: (Monad m) => RealiseEffects m -> Substitutes -> Derivation -> m ClosureOutcome
+outputsFromCaches _ MustBuild _ = pure ClosureUnavailable
+outputsFromCaches effects MaySubstitute drv = substituteClosure (reSubst effects) (map doPath (drvOutputs drv))
 
 -- | Realise one node, threading the nodes already visited, so a derivation
 -- several others depend on is handled once.
@@ -380,17 +538,12 @@ realiseNode settings effects graph visited node
         then reported AlreadyValid drv seen
         else either invalid (substituteOrBuild drv seen) (substitutesAllowed (rsSubstitutes settings) node attrs)
     substituteOrBuild drv seen allowed = do
-      let substituteOutputs = outputsFromCaches allowed drv
+      let substituteOutputs = outputsFromCaches effects allowed drv
       firstTry <- substituteOutputs
       case (firstTry, stopFor firstTry) of
         (ClosureComplete, _) -> reported Substituted drv seen
         (_, Just failure) -> pure (Left failure)
         (_, Nothing) -> buildFromInputs substituteOutputs firstTry drv seen
-    -- A derivation that must build asks no cache, which leaves it where one
-    -- that no cache holds is: upstream starts no substitution for it and
-    -- goes on to its inputs.
-    outputsFromCaches MustBuild _ = pure ClosureUnavailable
-    outputsFromCaches MaySubstitute drv = substituteClosure (reSubst effects) (map doPath (drvOutputs drv))
     buildFromInputs substituteOutputs firstTry drv seen = do
       inputs <- realiseAll settings effects graph seen (directDeps graph node)
       case inputs of
