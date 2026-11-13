@@ -5307,7 +5307,11 @@ fakePath name = StorePath (T.take 32 (T.replicate 32 (T.take 1 name))) name
 
 -- | A derivation with one output per name, depending on the named nodes.
 fakeNode :: Text -> [Text] -> [Text] -> (StorePath, DepGraph.DepNode)
-fakeNode name outputs deps =
+fakeNode = fakeNodeWith Map.empty
+
+-- | 'fakeNode' with an environment.
+fakeNodeWith :: Map.Map Text BS.ByteString -> Text -> [Text] -> [Text] -> (StorePath, DepGraph.DepNode)
+fakeNodeWith env name outputs deps =
   ( drvPath,
     DepGraph.DepNode
       { DepGraph.dnDrvPath = drvPath,
@@ -5319,7 +5323,7 @@ fakeNode name outputs deps =
               drvPlatform = X86_64_Linux,
               drvBuilder = "/bin/sh",
               drvArgs = [],
-              drvEnv = Map.empty
+              drvEnv = env
             },
         DepGraph.dnDeps = map (fakePath . (<> ".drv")) deps
       }
@@ -5346,10 +5350,20 @@ runRealiseIn ::
   [(StorePath, DepGraph.DepNode)] ->
   Text ->
   (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
-runRealiseIn fallback world failing nodes root =
+runRealiseIn fallback = runRealiseUnder (Realise.RealiseSettings fallback Realise.HeedAllowSubstitutes)
+
+-- | 'runRealise' in a given world, under given settings.
+runRealiseUnder ::
+  Realise.RealiseSettings ->
+  FakeWorld ->
+  Set.Set Text ->
+  [(StorePath, DepGraph.DepNode)] ->
+  Text ->
+  (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
+runRealiseUnder settings world failing nodes root =
   let (result, final) =
         runState
-          (Realise.realise fallback (fakeRealiseEffects failing) (DepGraph.DepGraph (Map.fromList nodes)) (fakePath (root <> ".drv")))
+          (Realise.realise settings (fakeRealiseEffects failing) (DepGraph.DepGraph (Map.fromList nodes)) (fakePath (root <> ".drv")))
           world
    in (result, reverse (fwEvents final), fwValid final)
 
@@ -5580,8 +5594,132 @@ testRealise = do
                 []
                 []
                 "hello"
-         in assertEqual "realise" (Left (Realise.BuildFailed "building gcc-out failed"), []) (result, realiseWork events)
+         in assertEqual "realise" (Left (Realise.BuildFailed "building gcc-out failed"), []) (result, realiseWork events),
+      -- Upstream's ParsedDerivation::substitutesAllowed, read where
+      -- DerivationGoal::haveDerivation reads it: before any cache is asked
+      -- about the derivation's own outputs.
+      runTest "a derivation that forbids substitutes builds though a cache holds its output, and no cache is asked" $
+        let (result, events, _) =
+              runRealise Set.empty [fakeNodeWith forbidding "hello" ["hello-out"] []] [("hello-out", [])] [] "hello"
+         in assertEqual
+              "realise"
+              (Right (), [EvBuilt "hello-out"], [])
+              (result, realiseWork events, [path | EvQueried path <- events]),
+      runTest "its inputs are substituted as any other derivation's are" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [fakeNodeWith forbidding "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [("hello-out", []), ("gcc-out", [])]
+                []
+                "hello"
+         in assertEqual "realise" (Right (), [EvFetched [fakePath "gcc-out"], EvBuilt "hello-out"]) (result, realiseWork events),
+      -- Upstream's PathSubstitutionGoal knows paths, not the derivations
+      -- that built them.
+      runTest "its output is substituted as a path another substituted output references" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [fakeNode "app" ["app-out"] ["lib"], fakeNodeWith forbidding "lib" ["lib-out"] []]
+                [("app-out", ["lib-out"]), ("lib-out", [])]
+                []
+                "app"
+         in assertEqual "realise" (Right (), [EvFetched [fakePath "lib-out"], EvFetched [fakePath "app-out"]]) (result, realiseWork events),
+      runTest "under always-allow-substitutes it is substituted" $
+        let (result, events, _) =
+              runRealiseUnder alwaysAllowing (fakeWorld [("hello-out", [])] []) Set.empty [fakeNodeWith forbidding "hello" ["hello-out"] []] "hello"
+         in assertEqual "realise" (Right (), [EvFetched [fakePath "hello-out"]]) (result, realiseWork events),
+      runTest "a structured allowSubstitutes that is no Boolean stops the build, naming the derivation as upstream does" $
+        let (result, events, _) =
+              runRealise Set.empty [fakeNodeWith mistyped "hello" ["hello-out"] []] [("hello-out", [])] [] "hello"
+         in assertEqual
+              "realise"
+              (Left ("attribute 'allowSubstitutes' of derivation '" <> helloDrvName <> "' must be a Boolean"), [])
+              (either (Left . Realise.realiseFailureMessage) Right result, realiseWork events),
+      runTest "with several outputs it builds them all and asks no cache about any" $
+        let (result, events, valid) =
+              runRealise
+                Set.empty
+                [fakeNodeWith forbidding "pkg" ["pkg-bin", "pkg-lib"] []]
+                [("pkg-bin", ["pkg-lib"]), ("pkg-lib", [])]
+                []
+                "pkg"
+         in assertEqual
+              "realise"
+              (Right (), [EvBuilt "pkg-bin"], [], True)
+              (result, realiseWork events, [path | EvQueried path <- events], Set.member (fakePath "pkg-lib") valid),
+      runTest "it is not read for a derivation whose outputs are valid, nor under always-allow-substitutes" $
+        let nodes = [fakeNodeWith mistyped "hello" ["hello-out"] []]
+            (valid, _, _) = runRealise Set.empty nodes [] ["hello-out"] "hello"
+            (always, _, _) = runRealiseUnder alwaysAllowing (fakeWorld [("hello-out", [])] []) Set.empty nodes "hello"
+         in assertEqual "valid" (Right ()) valid `andThen` assertEqual "always" (Right ()) always,
+      runTest "allowSubstitutes is read as upstream's getBoolAttr reads it" $
+        let cases =
+              [ ("absent", Map.empty, Realise.MaySubstitute),
+                ("true as evaluation writes it", Map.singleton "allowSubstitutes" "1", Realise.MaySubstitute),
+                ("false as evaluation writes it", forbidding, Realise.MustBuild),
+                ("another string", Map.singleton "allowSubstitutes" "true", Realise.MustBuild),
+                ("structured, absent", structured "{}", Realise.MaySubstitute),
+                ("structured true", structured "{\"allowSubstitutes\":true}", Realise.MaySubstitute),
+                ("structured false", structured "{\"allowSubstitutes\":false}", Realise.MustBuild),
+                ("structured null", structured "null", Realise.MaySubstitute),
+                ("structured, no object", structured "[false]", Realise.MaySubstitute),
+                -- Structured attributes are read from the JSON alone.
+                ("structured beside an environment entry", Map.union forbidding (structured "{}"), Realise.MaySubstitute)
+              ] ::
+                [(Text, Map.Map Text BS.ByteString, Realise.Substitutes)]
+         in assertEqual
+              "substitutes"
+              [(label, Right allowed) | (label, _, allowed) <- cases]
+              [(label, heeding env) | (label, env, _) <- cases],
+      runTest "structured attributes that are not JSON are an error naming the derivation" $
+        assertEqual "not-json" (Left True) (either (Left . T.isPrefixOf unreadable) Right (heeding (structured "{")))
+          `andThen` assertEqual "not-utf8" (Left (unreadable <> "invalid UTF-8")) (heeding (structured "\xff")),
+      -- Upstream's ParsedDerivation constructor runs for every derivation
+      -- it has a goal for, before the outputs are looked at and whatever
+      -- always-allow-substitutes says.
+      runTest "they stop the build though the outputs are valid, and under always-allow-substitutes" $
+        let nodes = [fakeNodeWith (structured "\xff") "hello" ["hello-out"] []]
+            stopped (result, events, _) = (either (Left . Realise.realiseFailureMessage) Right result, events)
+            refused = (Left (unreadable <> "invalid UTF-8"), [])
+         in assertEqual "valid" refused (stopped (runRealise Set.empty nodes [] ["hello-out"] "hello"))
+              `andThen` assertEqual
+                "always"
+                refused
+                (stopped (runRealiseUnder alwaysAllowing (fakeWorld [("hello-out", [])] []) Set.empty nodes "hello")),
+      runTestM "in the environment only 1 allows substitutes" $
+        property $
+          QC.forAll (QC.oneof [pure "1", BS.pack <$> QC.listOf QC.arbitrary]) $ \value ->
+            heeding (Map.singleton "allowSubstitutes" value)
+              QC.=== Right (if value == "1" then Realise.MaySubstitute else Realise.MustBuild),
+      runTestM "always-allow-substitutes allows a derivation whatever its attributes hold" $
+        property $
+          QC.forAll genAttributes $ \attrs ->
+            Realise.substitutesAllowed Realise.AlwaysAllowSubstitutes helloDrv attrs QC.=== Right Realise.MaySubstitute
     ]
+  where
+    forbidding = Map.singleton "allowSubstitutes" ""
+    structured = Map.singleton "__json"
+    mistyped = structured "{\"allowSubstitutes\":\"no\"}"
+    alwaysAllowing = Realise.RealiseSettings Realise.NoFallback Realise.AlwaysAllowSubstitutes
+    helloDrv = fakePath "hello.drv"
+    helloDrvName = T.replicate 32 "h" <> "-hello.drv"
+    unreadable = "cannot process __json attribute of '" <> helloDrvName <> "': "
+    drvWith env = DepGraph.dnDerivation (snd (fakeNodeWith env "hello" ["hello-out"] []))
+    heeding env =
+      Realise.derivationAttrs helloDrv (drvWith env) >>= Realise.substitutesAllowed Realise.HeedAllowSubstitutes helloDrv
+    -- Attributes as either kind of derivation holds them: any JSON value,
+    -- or an environment whose allowSubstitutes, when it has one, is any
+    -- bytes.
+    genAttributes =
+      QC.oneof
+        [ Realise.AttrsInJson <$> genJson 3,
+          Realise.AttrsInEnvironment . maybe Map.empty (Map.singleton "allowSubstitutes" . BS.pack) <$> QC.arbitrary
+        ]
+    property :: (QC.Testable prop) => prop -> IO TestResult
+    property prop = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} prop
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
 
 -- ---------------------------------------------------------------------------
 -- Tests: DependencyGraph (Phase 3, Batch 5)
@@ -11031,12 +11169,15 @@ testSubstituterRetry = do
           unavailable = Send (httpResponse "503 Service Unavailable" "")
           unsignedNarInfo = Send (httpResponse "200 OK" (TE.encodeUtf8 (NarInfo.renderNarInfo unsigned)))
           trustingCache base = Subst.CacheConfig base [publicKey]
+          forbidding = Map.singleton "allowSubstitutes" ""
           -- Realise a derivation whose one output is the fixture's path,
           -- from the caches given, under the adjusted config, in a store
           -- kept under the temporary directory rather than at /nix/store.
           -- Returns the result and whether the output is the substitute's
           -- tree or the builder's file.
-          realiseFrom label caches adjust = do
+          realiseFrom label = realiseWithEnv label Map.empty
+          -- 'realiseFrom' for a derivation with more in its environment.
+          realiseWithEnv label extraEnv caches adjust = do
             tmpBase <- getTemporaryDirectory
             let root = tmpBase </> ("nova-nix-test-subst-fallback-" ++ label)
                 storeDir = StoreDir (root </> "store")
@@ -11052,7 +11193,7 @@ testSubstituterRetry = do
                       drvPlatform = currentPlatform,
                       drvBuilder = builder,
                       drvArgs = builderArgs,
-                      drvEnv = Map.singleton "name" "retry"
+                      drvEnv = Map.insert "name" "retry" extraEnv
                     }
                 config =
                   adjust
@@ -11172,6 +11313,18 @@ testSubstituterRetry = do
                 withHttpServer (route (const narInfoOk) (const unavailable)) $ \base _ _ -> do
                   (result, substituted, built) <- realiseFrom "nar-down-fallback" [trustingCache base 40] (\config -> config {bcFallback = Realise.BuildFromSource})
                   pure (assertEqual "built" (BuildSuccess sp, False, True) (result, substituted, built)),
+              -- 'bcSubstitutes' reaches the decision: the cache serves the
+              -- output whole, and is asked for nothing.
+              runTestM "a derivation that forbids substitutes builds beside a cache that serves its output" $
+                withHttpServer (route (const narInfoOk) (const narOk)) $ \base requests _ -> do
+                  (result, substituted, built) <- realiseWithEnv "forbidden" forbidding [trustingCache base 40] id
+                  seen <- requests
+                  pure (assertEqual "built" (BuildSuccess sp, False, True, []) (result, substituted, built, seen)),
+              runTestM "under always-allow-substitutes the same derivation is substituted" $
+                withHttpServer (route (const narInfoOk) (const narOk)) $ \base _ _ -> do
+                  (result, substituted, built) <-
+                    realiseWithEnv "forbidden-always" forbidding [trustingCache base 40] (\config -> config {bcSubstitutes = Realise.AlwaysAllowSubstitutes})
+                  pure (assertEqual "substituted" (BuildSuccess sp, True, False) (result, substituted, built)),
               runTestM "a narinfo the cache lacks builds, with no flag" $
                 withHttpServer (\_ _ -> Send (httpResponse "404 Not Found" "")) $ \base requests _ -> do
                   (result, substituted, built) <- realiseFrom "narinfo-404" [trustingCache base 40] id
@@ -18340,6 +18493,7 @@ testNixConfig = do
       subs = fmap ncSubstituters . resolveTexts
       keys = fmap ncTrustedPublicKeys . resolveTexts
       fallback = fmap ncFallback . resolveTexts
+      alwaysAllowSubstitutes = fmap ncAlwaysAllowSubstitutes . resolveTexts
       uris = fmap ncAllowedUris . resolveTexts
       cascade =
         Config.ConfigLocations
@@ -18392,6 +18546,14 @@ testNixConfig = do
           `andThen` assertEqual "alias" (Right True) (fallback ["build-fallback = yes"])
           `andThen` assertEqual "replaced" (Right False) (fallback ["fallback = true", "fallback = false"])
           `andThen` assertEqual "typo" (Left "Boolean setting 'fallback' has invalid value 'ture'") (fallback ["fallback = ture"]),
+      runTest "always-allow-substitutes is a Boolean, off by default" $
+        assertEqual "default" (Right False) (alwaysAllowSubstitutes [])
+          `andThen` assertEqual "on" (Right True) (alwaysAllowSubstitutes ["always-allow-substitutes = true"])
+          `andThen` assertEqual "replaced" (Right False) (alwaysAllowSubstitutes ["always-allow-substitutes = true", "always-allow-substitutes = no"])
+          `andThen` assertEqual
+            "typo"
+            (Left "Boolean setting 'always-allow-substitutes' has invalid value 'ture'")
+            (alwaysAllowSubstitutes ["always-allow-substitutes = ture"]),
       runTest "an unknown setting is ignored, not an error" $
         assertEqual "unknown" (Right ["https://a"]) (subs ["cores = 4\nsubstituters = https://a"]),
       runTest "blank and comment-only lines are skipped" $
