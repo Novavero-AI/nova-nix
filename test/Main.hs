@@ -12780,7 +12780,7 @@ testTinyccWindows = do
         ]
   where
     instantiates :: Text
-    instantiates = "the TinyCC derivations instantiate, adding a hundred and fifty-two to Mes's"
+    instantiates = "the TinyCC derivations instantiate, adding a hundred and fifty-five to Mes's"
     version :: Text
     version = "unstable-2024-07-07"
     rev :: Text
@@ -12833,6 +12833,7 @@ testTinyccWindows = do
         "native-float",
         "native-printf-float",
         "native-winsock",
+        "native-math",
         "arena"
       ]
     -- Each round of janneke's source, in the order each compiles the next,
@@ -12851,7 +12852,7 @@ testTinyccWindows = do
     -- <name>-builder; arena runs tinycc-boot-mes's.
     addedNames :: [Text]
     addedNames =
-      ["tinycc-" <> rev <> ".tar.gz", "tinycc-" <> upstreamRev <> ".tar.gz", "hello.c", "float.c", "printf-float.c", "mingw32.c", "winsock.c", "tinycc-boot-mes-arena"]
+      ["tinycc-" <> rev <> ".tar.gz", "tinycc-" <> upstreamRev <> ".tar.gz", "hello.c", "float.c", "printf-float.c", "mingw32.c", "winsock.c", "math.c", "tinycc-boot-mes-arena"]
         ++ concat
           [ [name, name <> "-builder"]
           | name <-
@@ -12901,7 +12902,8 @@ testTinyccWindows = do
         "tinycc-native-hello",
         "tinycc-native-float",
         "tinycc-native-printf-float",
-        "tinycc-native-winsock"
+        "tinycc-native-winsock",
+        "tinycc-native-math"
       ]
     -- The scripts a tcc of TinyCC's own source on Mes libc runs in to
     -- compile against Mes libc: its rounds' library parts, tinycc-mes's tcc
@@ -13177,7 +13179,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["binutils.nix", "busybox.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
+    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -13410,6 +13412,156 @@ testBinutilsWindows = do
     addedNames =
       [archive, "binutils-" <> version, "answer.sh"]
         ++ concat [[name, name <> "-builder"] | name <- ["binutils-get-version", "binutils-answer"]]
+
+-- | @pkgs/windows@'s GCC rung, read back as the build driver reads it: what
+-- mingw-w64-headers, mingw-w64-dirent, gcc-core and
+-- @test\/data\/gcc-core.nix@'s checks add to the closure of the seed
+-- stdenv's tools and binutils, which build them.  The rung is full-source
+-- only if the leaves it adds are the six sources it names, and it reads no
+-- input source but the stdenv's own files, gcc-core's patch, the header
+-- mingw-w64-dirent compiles its source against, and what evaluation writes
+-- as text.  The stdenv's @setup.sh@ applies the patch only if the
+-- derivation names it in @patches@, and gcc-core's @preConfigure@ unpacks
+-- gmp, mpfr and mpc from the variables that name their archives.  GCC's
+-- configure is told where the headers, the assembler, the linker and the
+-- dirent library are by flags, so each has to name the output of the
+-- derivation that builds it.  The headers are named with @--with-headers@
+-- and never with @--with-sysroot@: GCC's top level hands its options to
+-- mpc's configure, whose libtool has a @--with-sysroot@ of its own and
+-- stops at a path that begins with a drive letter, as every store path on
+-- Windows does.  @--with-headers@ names the @include@ directory of
+-- mingw-w64-headers' output, where its configure installs them unless a
+-- flag moves them.
+testGccCoreWindows :: IO [Bool]
+testGccCoreWindows = do
+  putStrLn "pkgs/gcc-core"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-core.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          before <- sessionClosure (mapMaybe (`Map.lookup` rootOf) builtBefore)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, before, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, before, full) -> do
+      let added = Map.elems (Map.difference full before)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          gccCore = derivationAt gccCoreRoot
+          headers = derivationAt headersRoot
+          -- The output of a root's derivation, as a flag spells a store
+          -- path, or a word no flag holds where the root is missing.
+          outputOf root = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (derivationAt root >>= listToMaybe . drvOutputs)
+          outputNamed name = [storePathToText defaultStoreDir (doPath out) | drv <- added, nameOf drv == name, out <- drvOutputs drv]
+          sourcesNamed name = [storePathToText defaultStoreDir path | drv <- maybeToList gccCore, path <- drvInputSrcs drv, spName path == name]
+          wordsOf name = maybe [] (T.words . variableOf name)
+          flagsWith prefixes drv = [flag | flag <- wordsOf "configureFlags" drv, any (`T.isPrefixOf` flag) prefixes]
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetches is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the leaves it adds are its six sources, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              (sort archives, True)
+              (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text, the stdenv's files, the patch and the dirent header" $
+            assertEqual
+              "input sources not written as text"
+              ["config.site", "config.site", patch, "include", "include", "include", "setup.sh", "setup.sh"]
+              (sort [spName path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]),
+          runTest "gcc-core names its patch, its build inputs and its three libraries' archives where setup.sh and preConfigure read them" $
+            assertEqual
+              "patches, buildInputs and the archives"
+              (sourcesNamed patch, [outputOf direntRoot, outputOf binutilsRoot], map (outputNamed . snd) mathArchives, True)
+              (wordsOf "patches" gccCore, wordsOf "buildInputs" gccCore, [wordsOf variable gccCore | (variable, _) <- mathArchives], isJust gccCore),
+          runTest "gcc-core's flags name the target binutils is configured for and the outputs of the headers, binutils and the dirent library, and no sysroot" $
+            assertEqual
+              "flags"
+              [ "--target=" <> target,
+                "--with-headers=" <> outputOf headersRoot <> "/include",
+                "--with-as=" <> outputOf binutilsRoot <> "/bin/" <> target <> "-as.exe",
+                "--with-ld=" <> outputOf binutilsRoot <> "/bin/" <> target <> "-ld.exe",
+                "--with-stage1-libs=" <> outputOf direntRoot <> "/lib/libdirent.a"
+              ]
+              (flagsWith ["--target=", "--with-headers", "--with-sysroot", "--with-build-sysroot", "--with-as=", "--with-ld=", "--with-stage1-libs="] gccCore),
+          runTest "gcc-core builds and installs the compiler alone" $
+            assertEqual
+              "phases"
+              ("make all-gcc", "make install-gcc")
+              (maybe "" (variableOf "buildPhase") gccCore, maybe "" (variableOf "installPhase") gccCore),
+          runTest "mingw-w64-headers is configured in its own directory, for msvcrt, with no flag that moves the include directory gcc-core names" $
+            assertEqual
+              "preConfigure and flags"
+              ("cd mingw-w64-headers", ["--with-default-msvcrt=msvcrt"])
+              (maybe "" (variableOf "preConfigure") headers, wordsOf "configureFlags" headers)
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the GCC rung's derivations instantiate, adding fifteen to the closure of the seed stdenv's tools and binutils"
+    version :: Text
+    version = "4.6.4"
+    mingwVersion :: Text
+    mingwVersion = "8.0.3"
+    patch :: Text
+    patch = "fix-tinycc-attribute.patch"
+    target :: Text
+    target = "i686-w64-mingw32"
+    -- The variable gcc-core's preConfigure unpacks each library from, and
+    -- the archive it names.
+    mathArchives :: [(Text, Text)]
+    mathArchives = [("gmpSrc", "gmp-4.3.2.tar.gz"), ("mpfrSrc", "mpfr-2.4.2.tar.gz"), ("mpcSrc", "mpc-1.0.3.tar.gz")]
+    archives :: [Text]
+    archives = ["gcc-core-" <> version <> ".tar.gz", "mingw-w64-v" <> mingwVersion <> ".tar.bz2", "dirent.c"] ++ map snd mathArchives
+    gccCoreRoot :: Text
+    gccCoreRoot = "pkgs.gcc-core"
+    headersRoot :: Text
+    headersRoot = "pkgs.mingw-w64-headers"
+    direntRoot :: Text
+    direntRoot = "pkgs.mingw-w64-dirent"
+    binutilsRoot :: Text
+    binutilsRoot = "pkgs.binutils"
+    builtBefore :: [Text]
+    builtBefore = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets", binutilsRoot]
+    roots :: [Text]
+    roots = builtBefore ++ [headersRoot, direntRoot, gccCoreRoot, "checks.version", "checks.answer"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      archives
+        ++ ["mingw-w64-headers-" <> mingwVersion, "gcc-core-" <> version, "answer.sh"]
+        ++ concat [[name, name <> "-builder"] | name <- ["mingw-w64-dirent-" <> mingwVersion, "gcc-core-get-version", "gcc-core-answer"]]
 
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
@@ -20377,6 +20529,7 @@ runSuite = do
           testBusyboxWindows,
           testSeedStdenvWindows,
           testBinutilsWindows,
+          testGccCoreWindows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,

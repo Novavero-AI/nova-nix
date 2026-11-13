@@ -1,17 +1,7 @@
-# What configure cannot detect under the seed stdenv, read by every
-# autoconf configure script it runs through CONFIG_SITE.
-
-# configure picks PATH's separator by running sh under a PATH split each
-# way (its "The user is always right" block).  busybox's sh runs its own
-# sh applet whatever PATH holds, so both runs succeed and ':' wins, which
-# splits every C: directory in two.  busybox-w32 splits PATH on ';'.
-PATH_SEPARATOR=';'
-
-# configure takes a program it searches PATH for only if test -x passes,
-# trying each name as it is and then with each suffix in
-# ac_executable_extensions.  The commands on PATH are .exe files, and
-# busybox's test, unlike Cygwin's, does not add the suffix itself.
-ac_executable_extensions=.exe
+# What configure cannot detect about the seed stdenv's compiler and
+# linker, read through CONFIG_SITE by each autoconf configure script the
+# stdenv runs, unless the package points CONFIG_SITE elsewhere.  What it
+# cannot detect about PATH, setup.sh exports.
 
 # libtool takes a Windows compiler that is not GCC for Microsoft's, and then
 # archives with lib, names a static library .lib and passes each source
@@ -29,3 +19,10 @@ ac_executable_extensions=.exe
 ac_cv_c_compiler_gnu=yes
 lt_cv_prog_gnu_ld=yes
 acl_cv_prog_gnu_ld=yes
+
+# TinyCC's stdlib.h defines atoll inline, on msvcrt.dll's _atoi64, and
+# msvcrt.dll exports no atoll, so configure's link test, which declares
+# the function itself and links a call, finds none.  A package that
+# reads the answer then defines its own beside the header's, as GCC
+# 4.6.4's read-rtl.c does without HAVE_ATOLL (gcc/configure.ac:1009).
+ac_cv_func_atoll=yes

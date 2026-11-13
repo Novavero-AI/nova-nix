@@ -1,0 +1,166 @@
+	.file	"text.c"
+	.text
+	.p2align 4,,15
+	.globl	_checksum
+	.def	_checksum;	.scl	2;	.type	32;	.endef
+_checksum:
+	pushl	%esi
+	xorl	%eax, %eax
+	pushl	%ebx
+	movl	16(%esp), %ebx
+	movl	12(%esp), %esi
+	testl	%ebx, %ebx
+	je	L2
+	xorl	%edx, %edx
+	.p2align 4,,7
+L3:
+	movl	%eax, %ecx
+	sall	$5, %ecx
+	subl	%eax, %ecx
+	movzbl	(%esi,%edx), %eax
+	addl	$1, %edx
+	addl	%ecx, %eax
+	cmpl	%ebx, %edx
+	jne	L3
+L2:
+	popl	%ebx
+	popl	%esi
+	ret
+	.p2align 4,,15
+	.globl	_classify
+	.def	_classify;	.scl	2;	.type	32;	.endef
+_classify:
+	movl	4(%esp), %edx
+	movl	$-1, %eax
+	cmpl	$6, %edx
+	ja	L8
+	movl	_CSWTCH.3(,%edx,4), %eax
+L8:
+	rep
+	ret
+	.p2align 4,,15
+	.globl	_scale
+	.def	_scale;	.scl	2;	.type	32;	.endef
+_scale:
+	subl	$20, %esp
+	movl	%ebx, 8(%esp)
+	movl	28(%esp), %ebx
+	movl	24(%esp), %ecx
+	movl	%edi, 16(%esp)
+	movl	36(%esp), %edx
+	movl	32(%esp), %edi
+	movl	%esi, 12(%esp)
+	movl	%ebx, %esi
+	movl	%ecx, %eax
+	imull	%ecx, %edx
+	imull	%edi, %esi
+	addl	%edx, %esi
+	mull	%edi
+	movl	16(%esp), %edi
+	addl	%esi, %edx
+	movl	12(%esp), %esi
+	movl	%eax, (%esp)
+	movl	%ecx, %eax
+	movl	%edx, 4(%esp)
+	movl	%ebx, %edx
+	shrdl	$3, %ebx, %eax
+	movl	8(%esp), %ebx
+	sarl	$3, %edx
+	addl	(%esp), %eax
+	adcl	4(%esp), %edx
+	addl	$20, %esp
+	ret
+	.p2align 4,,15
+	.globl	_pack
+	.def	_pack;	.scl	2;	.type	32;	.endef
+_pack:
+	pushl	%esi
+	pushl	%ebx
+	movl	16(%esp), %ecx
+	movl	12(%esp), %ebx
+	movl	%ecx, %eax
+	shrl	$3, %ecx
+	movl	%eax, %edx
+	andl	$31, %ecx
+	andl	$7, %edx
+	leal	0(,%ecx,8), %esi
+	negl	%eax
+	orl	%esi, %edx
+	addl	%eax, %eax
+	movb	%dl, (%ebx)
+	movzbl	1(%ebx), %edx
+	sarb	%al
+	movl	$127, %esi
+	movzbl	%cl, %ecx
+	andl	%eax, %esi
+	movsbl	%al, %eax
+	addl	%ecx, %eax
+	andl	$-128, %edx
+	orl	%esi, %edx
+	movb	%dl, 1(%ebx)
+	popl	%ebx
+	popl	%esi
+	ret
+	.p2align 4,,15
+	.globl	_mean
+	.def	_mean;	.scl	2;	.type	32;	.endef
+_mean:
+	subl	$12, %esp
+	movl	20(%esp), %edx
+	movl	16(%esp), %ecx
+	testl	%edx, %edx
+	jle	L15
+	xorl	%eax, %eax
+	fldz
+	.p2align 4,,7
+L14:
+	faddl	(%ecx,%eax,8)
+	addl	$1, %eax
+	cmpl	%edx, %eax
+	jne	L14
+	movl	%eax, 4(%esp)
+	fildl	4(%esp)
+	fdivrp	%st, %st(1)
+L13:
+	addl	$12, %esp
+	ret
+L15:
+	fldz
+	jmp	L13
+	.globl	_path_max
+	.section .rdata,"dr"
+	.align 4
+_path_max:
+	.long	260
+	.globl	_root
+	.align 4
+_root:
+	.long	1414213
+	.globl	_third
+	.align 8
+_third:
+	.long	1431655765
+	.long	1070945621
+	.globl	_quotient
+	.align 8
+_quotient:
+	.long	1484538312
+	.long	-3
+	.globl	_folded
+	.align 8
+_folded:
+	.long	607820
+	.long	0
+	.align 4
+_CSWTCH.3:
+	.long	7
+	.long	11
+	.long	13
+	.long	17
+	.long	19
+	.long	23
+	.long	29
+read.c: windows.h read
+00000000 T _answer
+00000000 D _rounds
+answer.exe exits 42

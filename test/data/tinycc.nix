@@ -9,7 +9,9 @@
 # of their argument count times 1.25 as a double; mes-printf-float and
 # native-printf-float, which print that double through printf's %f;
 # native-winsock, which tinycc-native links with -lws2_32 and which prints
-# 0x1234 in network byte order through ws2_32.dll's htons;
+# 0x1234 in network byte order through ws2_32.dll's htons; native-math,
+# which tinycc-native links with -lm and which prints the square root of
+# twice its argument count through msvcrt.dll's sqrt;
 # native-search-dirs, which prints the directories tinycc-native searches;
 # native-mingw32, which compiles only if tinycc-native predefines
 # __MINGW32__; and arena, tinycc-boot-mes's own derivation with MES_DEBUG=3,
@@ -92,6 +94,20 @@ let
     }
   '';
 
+  # The argument is computed at run time, so that sqrt is called and not
+  # folded: 1.414214, and 2.000000 with one argument.
+  mathC = writeText "math.c" ''
+    #include <math.h>
+    #include <stdio.h>
+
+    int
+    main (int argc, char **argv)
+    {
+      printf ("%f\n", sqrt (argc * 2.0));
+      return 0;
+    }
+  '';
+
   getVersion =
     name: round:
     kaem.runCommand "${name}-get-version" round.env ''
@@ -152,6 +168,7 @@ in
     nativeProgram "tinycc-native-printf-float" tinycc-native "printf-float" printfFloatC [ ];
   native-winsock =
     nativeProgram "tinycc-native-winsock" tinycc-native "winsock" winsockC [ "ws2_32" ];
+  native-math = nativeProgram "tinycc-native-math" tinycc-native "math" mathC [ "m" ];
 
   arena = derivation (
     tinycc.boot-mes.compiler.drvAttrs
