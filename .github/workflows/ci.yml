@@ -1782,6 +1782,30 @@ jobs:
           runs "$math" 0 '2.000000' x
           exit "$status"
 
+      # A check that cannot fail is a run that tests nothing and stays green,
+      # so the build-path check is run against its cases before it decides
+      # anything.
+      - name: The build-path check decides its cases
+        shell: bash
+        run: bash .github/bootstrap/no-build-path-cases.sh
+
+      # No round's tcc.exe names the store directory or its build directory
+      # (.github/bootstrap/no-build-path.sh says why).
+      - name: No TinyCC round's tcc.exe names the store or its build directory
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for round in tinycc.boot-mes tinycc.boot0 tinycc.boot1 tinycc.boot2 tinycc.boot3 tinycc.bootstrappable tinycc-mes.prev tinycc-mes tinycc-native.prev tinycc-native; do
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$round.compiler" | tail -n 1); then
+              echo "::error::$round.compiler did not build"
+              status=1
+              continue
+            fi
+            bash .github/bootstrap/no-build-path.sh "$round.compiler" "$out" bin/tcc.exe || status=1
+          done
+          exit "$status"
+
       # GNU make, compiled by tinycc-native, timed.
       - name: Build GNU make
         shell: bash
@@ -1941,6 +1965,19 @@ jobs:
             status=1
           fi
           exit "$status"
+
+      # GNU Hello as the seed stdenv builds it, with configure's default
+      # CFLAGS, names neither the store directory nor its build directory
+      # (.github/bootstrap/no-build-path.sh says why).
+      - name: GNU Hello built with the seed stdenv names no store or build directory
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/seed-stdenv.nix -A hello | tail -n 1); then
+            echo "::error::hello did not build"
+            exit 1
+          fi
+          bash .github/bootstrap/no-build-path.sh hello "$out" bin/hello.exe
 
       # GNU binutils for i686-w64-mingw32, configured, compiled and
       # installed in the seed stdenv by tinycc-native, timed.

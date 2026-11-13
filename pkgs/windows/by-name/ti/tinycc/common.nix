@@ -64,7 +64,7 @@ rec {
       cp ${libgetopt} ''${out}/lib/libgetopt.a
     '';
 
-  # nixpkgs' round, with tinycc-boot-mes's changes for PE and three of its
+  # nixpkgs' round, with tinycc-boot-mes's changes for PE and four of its
   # own.
   #
   # A PE tcc predefines _WIN32, which tcc.c reads as a host with the Win32
@@ -76,6 +76,13 @@ rec {
   # msvcrt and kernel32 unless told -nostdlib (tccpe.c's pe_add_runtime), so
   # the round names crt1.o, libc and libtcc1 from the round before it.  Its
   # PE writer marks nothing executable, so the script does.
+  #
+  # The round compiles without nixpkgs' -g.  tcc's debugging information
+  # names the directory tcc ran in and each file by the path it opened, a
+  # source or header from the store by the store's physical path, so a
+  # tcc.exe that carried it would differ with the store's drive and with
+  # the user whose temporary directory the build ran in.  nixpkgs' builds see one store path and,
+  # sandboxed, one build directory.
   buildTinyccMes =
     {
       pname,
@@ -109,7 +116,6 @@ rec {
         mkdir -p ''${out}/bin
         ${prev.compiler}/bin/tcc.exe \
           -B ${prev.libs}/lib \
-          -g \
           -v \
           -o ''${out}/bin/tcc.exe \
           -U _WIN32 \
