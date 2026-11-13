@@ -1,10 +1,10 @@
 -- | C-backed thunk memoization cells via FFI.
 --
 -- Wraps @cbits/nn_thunk.c@ - an arena-allocated mutable cell that
--- holds either a pending expression (StablePtr to (Expr, Env)) or a
--- computed value (StablePtr to NixValue).  Replaces Haskell's
--- @IORef ThunkCell@ (~56 bytes on GHC heap, all GC-traced) with a
--- 16-byte C struct in an arena (invisible to GHC GC).
+-- holds either pending code (a bytecode index and the C env it runs in)
+-- or a computed value (inline, a C pointer, or a StablePtr to a
+-- NixValue).  Each cell is a 16-byte C struct in an arena, invisible to
+-- GHC's GC.
 --
 -- Includes blackhole detection: a thunk being forced is marked
 -- BLACKHOLE; if forced again before completion, infinite recursion
@@ -12,10 +12,10 @@
 --
 -- @
 -- cthunkInit 0
--- ptr <- cthunkNew pendingStablePtr
+-- ptr <- cthunkNewBc bcIdx envPtr
 -- cthunkState ptr  -- 0 (PENDING)
 -- cthunkMarkBlackhole ptr  -- True (was PENDING)
--- cthunkSetComputed ptr valueStablePtr  -- True (was not yet COMPUTED)
+-- cthunkSetComputedInt ptr 42  -- True (was not yet COMPUTED)
 -- cthunkState ptr  -- 1 (COMPUTED)
 -- cthunkDestroy
 -- @
@@ -49,7 +49,6 @@ module Nix.Eval.CThunk
     cthunkPayload,
     cthunkValueTag,
     cthunkGetBcIdx,
-    cthunkSetPayload,
     cthunkGetInt,
     cthunkGetFloat,
     cthunkGetBool,
@@ -108,9 +107,6 @@ foreign import ccall unsafe "nn_thunk_new_bc"
 
 foreign import ccall unsafe "nn_thunk_get_bc_idx"
   c_nn_thunk_get_bc_idx :: CThunkPtr -> IO Word32
-
-foreign import ccall unsafe "nn_thunk_set_payload"
-  c_nn_thunk_set_payload :: CThunkPtr -> Ptr () -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_new_computed"
   c_nn_thunk_new_computed :: Ptr () -> IO CThunkPtr
@@ -257,18 +253,14 @@ cthunkDestroy = c_nn_thunk_destroy
 
 -- | Allocate a new PENDING thunk with a bytecode index + C env pointer.
 -- No Haskell heap references - zero GC pressure for pending thunks.
+-- The pointer is an @nn_env_t *@, untyped here because "Nix.Eval.CEnv"
+-- imports this module for the slots it stores.
 cthunkNewBc :: Word32 -> Ptr () -> IO CThunkPtr
 cthunkNewBc bcIdx envPtr = checkedCPtr "nn_thunk_new_bc" =<< c_nn_thunk_new_bc bcIdx envPtr
 
 -- | Read the bytecode index from a PENDING thunk.
 cthunkGetBcIdx :: CThunkPtr -> IO Word32
 cthunkGetBcIdx = c_nn_thunk_get_bc_idx
-
--- | Set the payload of a PENDING thunk (deferred env fixup for
--- knot-tying).  'False' when the thunk is not PENDING and was left as it
--- was, which keeps the shared constant cells unwritten.
-cthunkSetPayload :: CThunkPtr -> Ptr () -> IO Bool
-cthunkSetPayload ptr payload = accepted <$> c_nn_thunk_set_payload ptr payload
 
 -- | Allocate a new pre-COMPUTED thunk with StablePtr payload (complex types).
 cthunkNewComputed :: Ptr () -> IO CThunkPtr
@@ -395,8 +387,8 @@ cthunkMarkPending ptr = accepted <$> c_nn_thunk_mark_pending ptr
 
 -- The setters below store a value in a thunk that is not yet COMPUTED and
 -- answer 'True', or leave a COMPUTED thunk as it was and answer 'False'.
--- They do not hand back the pending payload: the forcing caller read it
--- to evaluate the thunk, and frees that StablePtr itself.
+-- The pending payload they overwrite is an env pointer the env arena
+-- owns, so nothing is handed back.
 
 -- | Store a StablePtr value (complex types).
 cthunkSetComputed :: CThunkPtr -> Ptr () -> IO Bool
@@ -455,7 +447,7 @@ accepted = (/= 0)
 cthunkCount :: IO Word32
 cthunkCount = c_nn_thunk_count
 
--- | Get a thunk by global index (for cleanup iteration).
+-- | Get a thunk by global index, in allocation order.
 -- Returns 'nullPtr' if index is out of range.
 cthunkGet :: Word32 -> IO CThunkPtr
 cthunkGet = c_nn_thunk_get

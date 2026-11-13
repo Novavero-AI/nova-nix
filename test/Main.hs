@@ -15,7 +15,7 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
-import Control.Monad (filterM, unless, void, when)
+import Control.Monad (filterM, unless, void, when, zipWithM)
 import Control.Monad.State.Strict (State, gets, modify', runState)
 import Data.Bits (shiftR, xor, (.&.))
 import qualified Data.ByteString as BS
@@ -29,7 +29,7 @@ import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.List (find, inits, intercalate, isPrefixOf, mapAccumL, nub, sort)
+import Data.List (find, inits, intercalate, isPrefixOf, mapAccumL, nub, sort, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
@@ -72,7 +72,7 @@ import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrs
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcDataCount, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
 import Nix.Eval.CList (clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkSetPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings)
@@ -84,7 +84,7 @@ import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecorder, noPos, recordPos)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternBytes, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), allocCSlots, attrSetKeys, buildCSlots, emptyCList, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, buildCSlots, emptyCList, envLookupResolved, mkThunkBc, newMinimalEnv, pendingThunkEnv, tieFrame, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -1281,6 +1281,167 @@ testEvalRecAttrs = do
       runTest "dynamic key references a static rec sibling" $
         assertEval "dyn-key-sibling" "(rec { a = \"b\"; ${a} = 1; }).b" (VInt 1)
     ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval - frames tied in C
+-- ---------------------------------------------------------------------------
+
+-- | A binding of a generated frame: its declaration position and value.
+data FrameBinding = FrameBinding
+  { fbPos :: !Int,
+    fbValue :: !FrameValue,
+    -- | The argument a formals set passes for it instead, if any.
+    fbPassed :: !(Maybe Int)
+  }
+  deriving (Show)
+
+-- | A frame binding's value: a constant, another binding of the frame
+-- (by declaration position), or that binding plus a constant.
+data FrameValue = FrameConstant !Int | FrameAlias !Int | FrameOffset !Int !Int
+  deriving (Show)
+
+-- | A pending thunk holds the C pointer of the env its code runs in, and a
+-- recursive frame (a @let@, a @rec@ set, a formals set) is built before
+-- the thunks that point at it and filled after.  A generated binding may
+-- name one declared after it, whose slot is still empty while the
+-- earlier binding's thunk is made, so a frame that read its own slots
+-- while being built would read that hole.
+testFrameKnots :: IO [Bool]
+testFrameKnots = do
+  putStrLn "eval/frame-knots"
+  tmpBase <- getTemporaryDirectory
+  sequence
+    [ runTestM "a pending thunk's payload is its env's pointer, and forcing it reads that env" $
+        quickCheckPasses $
+          QC.forAll genSlotRead $ \(before, value, after) ->
+            QC.ioProperty $ do
+              let (slots, slotCount) = buildCSlots (map (evaluated . VInt) (before ++ value : after))
+                  env@(Env envPtr) = newMinimalEnv slots slotCount
+              bcIdx <- compileExpr (EResolvedVar 0 (length before))
+              let Thunk cell = mkThunkBc env bcIdx
+              payload <- cthunkPayload cell
+              Env stored <- pendingThunkEnv cell
+              pure $
+                (payload, stored, runPureEval (force (Thunk cell)))
+                  QC.=== (castPtr envPtr, envPtr, Right (VInt value)),
+      runTestM "a frame binding may name one declared after it, in a let, a rec set and a formals set" $
+        quickCheckPasses $
+          QC.forAll genFrame $ \frame ->
+            QC.ioProperty $ do
+              let declared = sortOn fbPos frame
+                  cases =
+                    [ (letSource declared, frameText (const Nothing) frame),
+                      (recSource declared, frameText (const Nothing) frame),
+                      (formalsSource declared, frameText fbPassed frame)
+                    ]
+              viaIO <- mapM (evalNixIO tmpBase . fst) cases
+              pure $
+                QC.conjoin
+                  [ QC.counterexample (T.unpack source) ((evalNix source, io) QC.=== (want, want))
+                  | ((source, expected), io) <- zip cases viaIO,
+                    let want = Right (mkStr expected)
+                  ],
+      runTest "a default may name the @-pattern" $
+        assertEval "at-pattern" "(args@{ a ? args.b, b ? 2 }: a) { b = 5; }" (VInt 5),
+      -- A frame whose @-pattern slot and formal slots disagree with the
+      -- resolver's layout reads b's value for a, giving 5.
+      runTest "a default reading the @-pattern finds the argument set in its own slot" $
+        assertEval "at-pattern-slot" "(args@{ a ? args.b + 1, b ? 2 }: a) { b = 5; }" (VInt 6),
+      runTest "a rec set or let binding may name an inherit declared after it" $
+        assertEval "rec-inherit-later" "let x = 1; in (rec { y = x; inherit x; }).y" (VInt 1)
+          `andThen` assertEval "let-inherit-later" "let x = 1; in let y = x; inherit x; in y" (VInt 1),
+      runTest "inherit (from) in a rec set or let may name a binding declared after it" $
+        assertEval "rec-inherit-from-later" "(rec { inherit (s) a; s = { a = 1; }; }).a" (VInt 1)
+          `andThen` assertEval "let-inherit-from-later" "let inherit (s) a; s = { a = 1; }; in a" (VInt 1),
+      runTest "a rec set with a dynamic key may name bindings declared after them" $
+        assertEval
+          "dynamic-rec-later"
+          "let k = \"d\"; s = rec { a = b; ${k} = a; inherit (t) c; b = 1; t = { c = 2; }; }; in toString [ s.a s.d s.c ]"
+          (mkStr "1 1 2"),
+      -- The parser refuses a dynamic key in a let, so only an AST built by
+      -- hand takes the let's dynamic-key path.
+      runTest "a let with a dynamic key may name bindings declared after them" $
+        assertEqual "dynamic-let-later" (Right (mkStr "1 2")) (runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) dynamicLetLater)),
+      -- Functions compare equal only as the same cell, so this holds only
+      -- when the set's attribute and the frame's slot are one cell.  The
+      -- IO evaluator keeps s once forced; the pure one rebuilds it at each
+      -- use, in a new frame.
+      runTestIO
+        "a rec set's attributes are the cells in its frame's slots"
+        tmpBase
+        "let s = rec { f = x: x; l = [ f ]; }; in builtins.attrValues (builtins.removeAttrs s [ \"l\" ]) == s.l"
+        (VBool True),
+      runTestM "tieFrame answers the cells it filled the slots with" $ do
+        codes <- mapM (compileExpr . ELit . NixInt) [1, 2, 3]
+        let (frame, thunks) =
+              tieFrame (length codes) newMinimalEnv (\env -> map (mkThunkBc env) codes)
+            slotted = map (\i -> unThunk (envLookupResolved 0 i frame)) [0 .. length codes - 1]
+        pure (assertEqual "cells" slotted (map unThunk thunks))
+    ]
+  where
+    dynamicLetLater =
+      let at = testPos 1 1
+       in ELet
+            [ NamedBinding at (StaticKey "a") (EVar "b"),
+              NamedBinding at (DynamicKey (EStr [StrLit "d"])) (ELit (NixInt 3)),
+              InheritFrom (EVar "t") [InheritedName at "c"],
+              NamedBinding at (StaticKey "b") (ELit (NixInt 1)),
+              NamedBinding at (StaticKey "t") (EAttrs False [NamedBinding at (StaticKey "c") (ELit (NixInt 2))] NoCaptureInfo)
+            ]
+            (EApp (EVar "toString") (EList [EVar "a", EVar "c"]))
+            NoCaptureInfo
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    genSlotRead = QC.resize 6 ((,,) <$> QC.listOf QC.arbitrary <*> QC.arbitrary <*> QC.listOf QC.arbitrary)
+    -- Bindings come out in dependency order, each naming only bindings
+    -- before it there, so no binding depends on itself; their declaration
+    -- positions are shuffled, so a reference often points forward.
+    genFrame = do
+      count <- QC.chooseInt (1, 8)
+      positions <- QC.shuffle [0 .. count - 1]
+      zipWithM genBinding (inits positions) positions
+    genBinding earlier pos = do
+      value <- case earlier of
+        [] -> FrameConstant <$> genConstant
+        _ ->
+          QC.oneof
+            [ FrameConstant <$> genConstant,
+              FrameAlias <$> QC.elements earlier,
+              FrameOffset <$> QC.elements earlier <*> genConstant
+            ]
+      passed <- QC.frequency [(3, pure Nothing), (1, Just <$> QC.chooseInt (100, 199))]
+      pure (FrameBinding pos value passed)
+    genConstant = QC.chooseInt (0, 99)
+    -- The value each binding takes, keyed by declaration position, with
+    -- the argument @override@ answers in place of its own value.
+    frameValues override = foldl' (settle override) Map.empty
+    settle override known binding =
+      let own = case fbValue binding of
+            FrameConstant k -> k
+            FrameAlias ref -> Map.findWithDefault 0 ref known
+            FrameOffset ref k -> Map.findWithDefault 0 ref known + k
+       in Map.insert (fbPos binding) (fromMaybe own (override binding)) known
+    -- What @toString@ makes of the frame's values listed in declaration
+    -- order.
+    frameText override frame = T.unwords (map (T.pack . show) (Map.elems (frameValues override frame)))
+    bindingName pos = "x" <> T.pack (show pos)
+    valueSource value = case value of
+      FrameConstant k -> T.pack (show k)
+      FrameAlias ref -> bindingName ref
+      FrameOffset ref k -> bindingName ref <> " + " <> T.pack (show k)
+    definitions = T.concat . map (\b -> bindingName (fbPos b) <> " = " <> valueSource (fbValue b) <> "; ")
+    listed qualify declared = "toString [ " <> T.unwords (map (qualify . bindingName . fbPos) declared) <> " ]"
+    letSource declared = "let " <> definitions declared <> "in " <> listed id declared
+    recSource declared = "let s = rec { " <> definitions declared <> "}; in " <> listed ("s." <>) declared
+    formalsSource declared =
+      "(args@{ "
+        <> T.intercalate ", " (map (\b -> bindingName (fbPos b) <> " ? " <> valueSource (fbValue b)) declared)
+        <> " }: "
+        <> listed id declared
+        <> ") { "
+        <> T.concat (mapMaybe (\b -> (\v -> bindingName (fbPos b) <> " = " <> T.pack (show v) <> "; ") <$> fbPassed b) declared)
+        <> "}"
 
 -- ---------------------------------------------------------------------------
 -- Tests: Eval - Lists
@@ -17710,7 +17871,7 @@ testArenaGuard = do
       arenaGuardPaths
   live <-
     sequence
-      [ liveRefusal "a slot array past UINT32_MAX bytes" "nn_env_alloc_slots" (void (evaluate (allocCSlots slotCountPastUInt32))),
+      [ liveRefusal "a slot array past UINT32_MAX bytes" "nn_env_alloc_slots" (void (evaluate (fst (tieFrame slotCountPastUInt32 (\_ _ -> emptyEnv) (const []))))),
         -- The list's items come from the same slot allocator, so the same
         -- count is refused there and must surface as a list failure, where
         -- a NULL return would read as the empty list.
@@ -18010,8 +18171,7 @@ testCThunk = do
   -- Each test uses the shared arena (thunks accumulate - that's fine).
   sequence
     [ runTestM "new pending + state" $ do
-        sp <- newStablePtr ("pending" :: Text)
-        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 pendingEnv
         state <- cthunkState ptr
         pure (assertEqual "state" 0 state),
       runTestM "new computed + state" $ do
@@ -18020,11 +18180,9 @@ testCThunk = do
         state <- cthunkState ptr
         pure (assertEqual "state" 1 state),
       runTestM "payload round-trips (pending)" $ do
-        sp <- newStablePtr ("hello" :: Text)
-        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 pendingEnv
         payload <- cthunkPayload ptr
-        val <- deRefStablePtr (castPtrToStablePtr payload) :: IO Text
-        pure (assertEqual "payload" "hello" val),
+        pure (assertEqual "payload" pendingEnv payload),
       runTestM "payload round-trips (computed)" $ do
         sp <- newStablePtr (42 :: Int)
         ptr <- cthunkNewComputed (castStablePtrToPtr sp)
@@ -18032,8 +18190,7 @@ testCThunk = do
         val <- deRefStablePtr (castPtrToStablePtr payload) :: IO Int
         pure (assertEqual "payload" 42 val),
       runTestM "mark_blackhole succeeds on pending" $ do
-        sp <- newStablePtr ("x" :: Text)
-        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 pendingEnv
         ok <- cthunkMarkBlackhole ptr
         state <- cthunkState ptr
         pure
@@ -18047,21 +18204,18 @@ testCThunk = do
         ok <- cthunkMarkBlackhole ptr
         pure (if not ok then Pass else Fail "should have failed"),
       runTestM "mark_blackhole fails on blackhole" $ do
-        sp <- newStablePtr ("x" :: Text)
-        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 pendingEnv
         _ <- cthunkMarkBlackhole ptr
         ok <- cthunkMarkBlackhole ptr
         pure (if not ok then Pass else Fail "should have failed"),
       runTestM "set_computed stores into a blackhole" $ do
-        pendingSp <- newStablePtr ("old" :: Text)
-        ptr <- cthunkNewBc 0 (castStablePtrToPtr pendingSp)
+        ptr <- cthunkNewBc 0 pendingEnv
         _ <- cthunkMarkBlackhole ptr
         computedSp <- newStablePtr ("new" :: Text)
         stored <- cthunkSetComputed ptr (castStablePtrToPtr computedSp)
         state <- cthunkState ptr
         newPayload <- cthunkPayload ptr
         newVal <- deRefStablePtr (castPtrToStablePtr newPayload) :: IO Text
-        freeStablePtr pendingSp
         pure
           ( if stored && newVal == "new" && state == 1
               then Pass
@@ -18069,11 +18223,9 @@ testCThunk = do
           ),
       -- set_computed accepts PENDING (direct memoization, no blackhole step)
       runTestM "set_computed stores into a pending thunk" $ do
-        sp <- newStablePtr ("x" :: Text)
-        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 pendingEnv
         valSp <- newStablePtr ("v" :: Text)
         stored <- cthunkSetComputed ptr (castStablePtrToPtr valSp)
-        freeStablePtr sp
         pure (if stored then Pass else Fail "refused a PENDING thunk"),
       runTestM "set_computed refuses a computed thunk and keeps its value" $ do
         firstSp <- newStablePtr ("first" :: Text)
@@ -18094,27 +18246,25 @@ testCThunk = do
         let cells = [cthunkNull, cthunkBool True, cthunkBool False]
         marked <- mapM cthunkMarkBlackhole cells
         stored <- mapM (`cthunkSetComputed` nullPtr) cells
-        repointed <- mapM (`cthunkSetPayload` nullPtr) cells
         let values = map (readThunkValue . Thunk) cells
             expected = map Just [VNull, VBool True, VBool False]
         pure
-          ( if not (or (marked ++ stored ++ repointed)) && values == expected
+          ( if not (or (marked ++ stored)) && values == expected
               then Pass
-              else Fail ("accepted=" <> T.pack (show (marked, stored, repointed)) <> " values=" <> T.pack (show values))
+              else Fail ("accepted=" <> T.pack (show (marked, stored)) <> " values=" <> T.pack (show values))
           ),
       runTestM "count tracks allocations" $ do
         countBefore <- cthunkCount
+        _ <- cthunkNewBc 0 pendingEnv
+        _ <- cthunkNewBc 0 pendingEnv
         sp <- newStablePtr (0 :: Int)
-        _ <- cthunkNewBc 0 (castStablePtrToPtr sp)
-        _ <- cthunkNewBc 0 (castStablePtrToPtr sp)
         _ <- cthunkNewComputed (castStablePtrToPtr sp)
         countAfter <- cthunkCount
         let delta = countAfter - countBefore
         pure (assertEqual "delta" 3 delta),
       runTestM "get retrieves by index" $ do
         countBefore <- cthunkCount
-        sp <- newStablePtr ("indexed" :: Text)
-        ptr <- cthunkNewBc 0 (castStablePtrToPtr sp)
+        ptr <- cthunkNewBc 0 pendingEnv
         retrieved <- cthunkGet countBefore
         stateOrig <- cthunkState ptr
         stateRetrieved <- cthunkState retrieved
@@ -18125,8 +18275,7 @@ testCThunk = do
           ),
       runTestM "stress: 100k thunks" $ do
         countBefore <- cthunkCount
-        sp <- newStablePtr (0 :: Int)
-        mapM_ (\_ -> cthunkNewBc 0 (castStablePtrToPtr sp)) [(1 :: Int) .. 100000]
+        mapM_ (\_ -> cthunkNewBc 0 pendingEnv) [(1 :: Int) .. 100000]
         countAfter <- cthunkCount
         let delta = countAfter - countBefore
         -- Spot-check: retrieve one from the middle
@@ -18144,6 +18293,10 @@ testCThunk = do
                   )
           )
     ]
+  where
+    -- These cells are never forced, so the shared empty env serves as the
+    -- env their code would run in.
+    pendingEnv = case emptyEnv of Env envPtr -> castPtr envPtr
 
 -- ---------------------------------------------------------------------------
 -- Bytecode compilation tests
@@ -18259,8 +18412,7 @@ instance MonadEval StubStoreEval where
       2 {- BLACKHOLE -} -> abortEvaluation "infinite recursion encountered"
       _ {- PENDING -} ->
         let bcIdx = unsafePerformIO (cthunkGetBcIdx ptr)
-            envSp = unsafePerformIO (cthunkPayload ptr)
-            env = unsafePerformIO (deRefStablePtr (castPtrToStablePtr envSp))
+            env = unsafePerformIO (pendingThunkEnv ptr)
          in evalFn env bcIdx
 
 -- | Parse and evaluate under the stubbed-store evaluator.
@@ -20556,6 +20708,7 @@ runSuite = do
           testCoercionErrors,
           testResultPrinter,
           testEvalRecAttrs,
+          testFrameKnots,
           testEvalLists,
           testEvalLambda,
           testEvalWith,

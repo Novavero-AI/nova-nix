@@ -74,16 +74,15 @@ module Nix.Eval.Types
 
     -- * Thunk operations
     mkThunk,
-    mkSyntheticThunk,
     cheapThunk,
     cheapThunkBc,
     mkThunkBc,
+    pendingThunkEnv,
     evaluated,
     thunkSameRef,
     thunkToCPtr,
     buildCSlots,
-    allocCSlots,
-    fillCSlots,
+    tieFrame,
 
     -- * Lambda marshalling
     marshalLambda,
@@ -227,12 +226,14 @@ bytesToTextLossy = TE.decodeUtf8With lenientDecode
 --
 -- Each thunk points to an @nn_thunk_t@ in the C arena.
 -- On first force, the cell transitions PENDING to BLACKHOLE to COMPUTED,
--- which detects infinite recursion (BLACKHOLE) and drops the Expr/Env
--- references - matching real Nix which mutates thunks in-place.
+-- which detects infinite recursion (BLACKHOLE) and overwrites the
+-- pending code and env with the value, as upstream mutates a thunk in
+-- place.
 --
--- The C thunk is allocated via 'unsafePerformIO' in 'mkThunk' (same
--- pattern as the former IORef-based approach) so that knot-tying works
--- unchanged.  Arena pointers remain valid until 'Nix.Eval.CThunk.cthunkDestroy'.
+-- A pending cell holds its env as the C pointer, so the env exists before
+-- the cell does: 'mkThunkBc' takes a built t'Env', and 'tieFrame' builds a
+-- frame whose bindings point back at it before filling its slots.  Arena
+-- pointers remain valid until 'Nix.Eval.CThunk.cthunkDestroy'.
 newtype Thunk = Thunk {unThunk :: CThunkPtr}
 
 instance Show Thunk where
@@ -707,32 +708,14 @@ withScopesForCapture (Env envPtr) = unsafePerformIO $ do
       pokeElemOff arr (fromIntegral existingCount) rootPtr
       pure (arr, newCount)
 
--- | Create an unevaluated thunk with a fresh C arena-allocated cell.
---
--- Compiles the Expr to bytecode and stores (bc_idx, env_ptr) in the
--- C thunk - no StablePtr, zero GHC heap pressure for pending thunks.
--- The cell is allocated via 'unsafePerformIO' - safe because C
--- allocation is a pure side effect, and the @NOINLINE@ + @seq@
--- pattern prevents GHC from floating the allocation to a shared
--- top-level CAF.
+-- | Create an unevaluated thunk with a fresh C arena-allocated cell,
+-- compiling the Expr to bytecode first.  Compiling under
+-- 'unsafePerformIO' is safe because it only appends code to the bytecode
+-- store, and every index it answers for the same expression runs the
+-- same code.
 mkThunk :: Env -> Expr -> Thunk
 mkThunk env thunkExpr =
-  Thunk (newBcThunkPtr thunkExpr env)
-
--- | A pending thunk running code that many thunks share, each in an env
--- of its own, such as 'Nix.Eval.CBytecode.reservedApply1' for
--- 'Nix.Eval.deferApply'.  It takes the index rather than an 'Expr'
--- because compiling per thunk adds a copy of the same code to a store
--- that only grows until 'Nix.Eval.Arena.arenaDestroy'.  Uses the env
--- pointer for cell uniqueness instead of the index, which every such
--- thunk shares: keyed on a shared value, GHC's full-laziness transform
--- could float the allocation to a CAF and give every thunk one cell.
---
--- Must only be called with freshly-constructed envs (not knot-tied
--- recursive envs), since it forces the env pointer to WHNF.
-mkSyntheticThunk :: Env -> Word32 -> Thunk
-mkSyntheticThunk env@(Env envPtr) bcIdx =
-  Thunk (newSyntheticBcThunkPtr envPtr bcIdx env)
+  mkThunkBc env (unsafePerformIO (compileExpr thunkExpr))
 
 -- | Like 'mkThunk' but avoids C arena allocation for trivial expressions.
 -- Resolved variables reuse the existing thunk from the env (no wrapper).
@@ -764,12 +747,19 @@ cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
    in evaluated (VLambda trimmedEnv evalFormals bodyBcIdx)
 cheapThunk env expr = mkThunk env expr
 
--- | Create a pending thunk from a bytecode index (no compilation needed).
--- Used inside 'Nix.Eval.evalBytecode' where the bc_idx is already known.
--- The Env is captured LAZILY (for knot-tying in rec attrs / let / matchFormalSet).
+-- | A pending thunk running the code at a bytecode index in an env.  The
+-- cell holds the env's C pointer, so forcing the t'Thunk' forces the
+-- t'Env' first.  The env's slots need not be filled yet: 'tieFrame'
+-- builds a recursive frame's env before the thunks that point at it and
+-- fills its slots after.
 mkThunkBc :: Env -> Word32 -> Thunk
-mkThunkBc env bcIdx =
-  Thunk (newBcThunkPtrLazy bcIdx env)
+mkThunkBc (Env envPtr) bcIdx =
+  Thunk (newBcThunkPtr bcIdx envPtr)
+
+-- | The env a PENDING or BLACKHOLE thunk's code runs in, as 'mkThunkBc'
+-- stored it.
+pendingThunkEnv :: CThunkPtr -> IO Env
+pendingThunkEnv ptr = Env . castPtr <$> cthunkPayload ptr
 
 -- | Like 'cheapThunk' but for bytecode indices (used inside evalBytecode).
 -- Short-circuits for resolved vars and literals without creating a
@@ -858,47 +848,20 @@ literalStrBytes bcIdx =
           let sym = unsafePerformIO (cbcData (off + 1))
            in (symbolBytes (Symbol sym) :) <$> partBytes (n - 1 :: Int) (off + 2)
 
--- | Allocate a fresh C arena thunk cell with bytecode.
+-- | Allocate a fresh PENDING cell holding a bytecode index and an env's C
+-- pointer, neither of them on the GHC heap.
 --
--- @NOINLINE@ prevents inlining so GHC can't see inside or CSE calls.
--- @seq@ on the expr creates a data dependency that prevents float-out
--- to a top-level CAF - without this, GHC would hoist the
--- @unsafePerformIO@ and share ONE cell across ALL thunks.
---
--- Compiles the Expr to bytecode and stores (bc_idx, StablePtr Env)
--- in the C thunk.  The Expr tree is eliminated from the GHC heap -
--- only the StablePtr Env (~16 bytes) remains for knot-tying laziness.
+-- The allocation runs under 'unsafePerformIO', which is safe because the
+-- cell is fresh arena memory nothing else can see until this returns.
+-- @NOINLINE@ keeps the call opaque, so GHC cannot inline the allocation
+-- into a caller and duplicate it there, and the C call uses both
+-- arguments, so no transformation can hoist it out from under them: a
+-- cell can be shared only between thunks over the same code in the same
+-- env.
 {-# NOINLINE newBcThunkPtr #-}
-newBcThunkPtr :: Expr -> Env -> CThunkPtr
-newBcThunkPtr expr env =
-  unsafePerformIO $ expr `seq` do
-    bcIdx <- compileExpr expr
-    sp <- newStablePtr env
-    cthunkNewBc bcIdx (castStablePtrToPtr sp)
-
--- | Like 'newBcThunkPtrLazy' but forces the env's C pointer first, for
--- 'mkSyntheticThunk'.
-{-# NOINLINE newSyntheticBcThunkPtr #-}
-newSyntheticBcThunkPtr :: Ptr NnEnv -> Word32 -> Env -> CThunkPtr
-newSyntheticBcThunkPtr envKey bcIdx env =
-  unsafePerformIO $ envKey `seq` do
-    sp <- newStablePtr env
-    cthunkNewBc bcIdx (castStablePtrToPtr sp)
-
--- | Allocate a fresh C arena thunk cell from a known bytecode index.
--- No compilation needed - the bc_idx is already available.
---
--- Uses StablePtr for the Env so it stays lazy - essential for
--- knot-tying in recursive attrs, let bindings, and matchFormalSet.
--- The StablePtr points to an Env (newtype around Ptr NnEnv) - ~16
--- bytes on the GHC heap, negligible compared to the Expr trees we
--- eliminated.
-{-# NOINLINE newBcThunkPtrLazy #-}
-newBcThunkPtrLazy :: Word32 -> Env -> CThunkPtr
-newBcThunkPtrLazy bcIdx env =
-  unsafePerformIO $ bcIdx `seq` do
-    sp <- newStablePtr env
-    cthunkNewBc bcIdx (castStablePtrToPtr sp)
+newBcThunkPtr :: Word32 -> Ptr NnEnv -> CThunkPtr
+newBcThunkPtr bcIdx envPtr =
+  unsafePerformIO (cthunkNewBc bcIdx (castPtr envPtr))
 
 -- | Wrap an already-computed value as a thunk.
 -- Ints and floats use inline C thunks (no StablePtr); booleans and null
@@ -1149,28 +1112,35 @@ buildCSlots thunks = unsafePerformIO $ do
       pokeElemOff arr i (thunkToCPtr t)
       pokeSlots arr (i + 1) ts
 
--- | Allocate a C slot array of the given size WITHOUT filling it.
--- Returns 'nullPtr' for size 0.  Used by knot-tying sites (rec {},
--- let) where the Env must reference the slot pointer before the
--- thunks are materialized.  Caller MUST fill all slots via 'fillCSlots'
--- before any slot is read (e.g. before forcing any thunk).
-{-# NOINLINE allocCSlots #-}
-allocCSlots :: Int -> Ptr CThunkPtr
-allocCSlots 0 = nullPtr
-allocCSlots n = unsafePerformIO (checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots (fromIntegral n))
+-- | Tie a frame whose slots hold thunks that may point back at it: the
+-- slot array is allocated first, the env built over it next, the thunks
+-- are made against that env, and the slots are filled last, as upstream
+-- allocates @env2@ before it fills the values (@ExprLet::eval@,
+-- @ExprAttrs::eval@ and @EvalState::callFunction@, eval.cc at 2.24.9).
+-- @mkEnv@ receives the slot array and its size; @mkThunks@ answers one
+-- thunk per slot, in slot order, and must not read the frame's own
+-- slots, which are not all filled until this returns ('mkThunkBc' does
+-- not).  Answers the env and those thunks.
+--
+-- The allocations run under 'unsafePerformIO', which is safe because the
+-- slots and the env are fresh arena memory nothing else can see until
+-- this returns.  @NOINLINE@ keeps the call opaque, and it depends on the
+-- functions that build the env and the thunks, so no transformation can
+-- share one frame between calls that build different ones.
+{-# NOINLINE tieFrame #-}
+tieFrame :: Int -> (Ptr CThunkPtr -> Int -> Env) -> (Env -> [Thunk]) -> (Env, [Thunk])
+tieFrame slotCount mkEnv mkThunks = unsafePerformIO $ do
+  slots <- newSlotArray slotCount
+  let !env = mkEnv slots slotCount
+      thunks = mkThunks env
+  forM_ (zip [0 .. slotCount - 1] thunks) $ \(i, thunk) ->
+    pokeElemOff slots i (thunkToCPtr thunk)
+  pure (env, thunks)
 
--- | Fill a pre-allocated C slot array with thunks.  Each thunk is
--- converted to 'CThunkPtr' via 'thunkToCPtr' and poked at its index.
--- The list length MUST equal the allocated array size.
--- Used after 'allocCSlots' in knot-tying contexts.
-{-# NOINLINE fillCSlots #-}
-fillCSlots :: Ptr CThunkPtr -> [Thunk] -> ()
-fillCSlots arr thunks = unsafePerformIO (go 0 thunks)
-  where
-    go _ [] = pure ()
-    go !i (t : ts) = do
-      pokeElemOff arr i (thunkToCPtr t)
-      go (i + 1) ts
+-- | A zeroed C slot array of the given size, or 'nullPtr' for none.
+newSlotArray :: Int -> IO (Ptr CThunkPtr)
+newSlotArray 0 = pure nullPtr
+newSlotArray n = checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots (fromIntegral n)
 
 -- | A value's type as an error message names it: upstream's @showType@ on
 -- a value (eval.cc at 2.24.9, the same in 2.33.2), which every type error
@@ -1633,6 +1603,5 @@ instance MonadEval PureEval where
         abortEvaluation "infinite recursion encountered"
       _ {- PENDING -} ->
         let bcIdx = unsafePerformIO (cthunkGetBcIdx ptr)
-            envSp = unsafePerformIO (cthunkPayload ptr)
-            env = unsafePerformIO (deRefStablePtr (castPtrToStablePtr envSp))
+            env = unsafePerformIO (pendingThunkEnv ptr)
          in evalFn env bcIdx
