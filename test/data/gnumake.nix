@@ -5,7 +5,8 @@
 # make writes to a batch file and runs, having no sh.exe on PATH.
 let
   inherit (import ../../pkgs/windows) stage0-pe32 gnumake;
-  inherit (stage0-pe32) kaem writeText;
+  inherit (stage0-pe32) writeText;
+  kaem = import ./check.nix stage0-pe32.kaem;
 
   # .RECIPEPREFIX keeps the recipe's tab out of this file.
   makefile = writeText "pattern-rule.mk" ''

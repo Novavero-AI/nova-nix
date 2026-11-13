@@ -8,7 +8,8 @@
 # across each collection.
 let
   inherit (import ../../pkgs/windows) mes stage0-pe32;
-  inherit (stage0-pe32) kaem writeText;
+  inherit (stage0-pe32) writeText;
+  kaem = import ./check.nix stage0-pe32.kaem;
 
   getVersion =
     name: program:

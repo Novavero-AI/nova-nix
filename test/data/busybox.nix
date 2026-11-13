@@ -6,7 +6,8 @@
 # compares with the lines it expects.  A line whose test fails is left out.
 let
   inherit (import ../../pkgs/windows) stage0-pe32 busybox-w32;
-  inherit (stage0-pe32) kaem writeText;
+  inherit (stage0-pe32) writeText;
+  kaem = import ./check.nix stage0-pe32.kaem;
 
   script = writeText "configure-tools.sh" ''
     set -e

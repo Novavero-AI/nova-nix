@@ -1250,11 +1250,22 @@ jobs:
           - os: windows-latest
             name: Windows
             arena: true
+            publish: true
           - os: windows-11-arm
             name: Windows ARM64
             arena: false
+            publish: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 98
+    # The x64 leg of a push to main publishes what it built (the last step),
+    # with the token the publish job uses, a secret of the `cache`
+    # environment.  That environment admits main alone, and GitHub refuses a
+    # job that references it from any other ref, so the name is empty
+    # everywhere else and the job references no environment.  One leg
+    # publishes: both build the same store paths, and a cache holding some
+    # from each would not hold the bytes either leg's checks ran on.
+    environment:
+      name: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1819,6 +1830,27 @@ jobs:
           if [ -z "$kept" ]; then echo "::error::the arena build reported no collection"; exit 1; fi
           if [ "$kept" -gt "$room" ]; then echo "::error::Mes kept $kept cells, more than the $room its arena has room to copy"; exit 1; fi
           echo "ok    at most $kept cells kept, within $room"
+
+      # The ladder, as this job built it and its checks ran on it: --all is
+      # every valid path but the derivations in a store this job filled
+      # from empty.  It runs last, so a ladder that fails a check above is
+      # never published.  The checks' own outputs go with it and are never
+      # taken back: each forbids substitutes (test/data/check.nix).  push
+      # skips what the cache already serves, as it does every source, and
+      # an absent secret arrives as an empty key file, which push refuses.
+      - name: Publish the ladder to the public cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: |
+          set -euo pipefail
+          keyfile="$RUNNER_TEMP/cache-key"
+          trap 'rm -f "$keyfile"' EXIT
+          (umask 077; printf '%s' "$NOVA_CACHE_API_KEY" > "$keyfile")
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$CACHE_URL" --key-file "$keyfile" \
+            --compression zstd --all
 
   # ---------------------------------------------------------------------------
   # Publish (public cache): refresh the public cache with the closure main

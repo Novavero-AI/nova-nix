@@ -12073,8 +12073,9 @@ testTinyccWindows = do
           -- string literal.
           cStrings script = [text | (i, text) <- zip [0 :: Int ..] (T.splitOn "\\\"" script), odd i]
           strings = concatMap cStrings (Set.toList (Set.fromList (mapMaybe scriptOf added)))
-          -- What two derivations must share to run the same compile.
-          compile drv = (drvBuilder drv, drvArgs drv, foldr Map.delete (drvEnv drv) ["name", "out", "MES_DEBUG"])
+          -- What two derivations must share to run the same compile.  A
+          -- check forbids substitutes, which the rung it runs does not.
+          compile drv = (drvBuilder drv, drvArgs drv, foldr Map.delete (drvEnv drv) ["name", "out", "MES_DEBUG", "allowSubstitutes"])
       sequence
         [ runTest instantiates $
             assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
@@ -12484,6 +12485,41 @@ testBusyboxWindows = do
         : "configure-tools.sh"
         : crtSources
         ++ concat [[name, name <> "-builder"] | name <- ["busybox-w32-" <> version, "busybox-w32-get-version", "busybox-w32-configure-tools"]]
+
+-- | The checks under @test\/data@ that the ladder's CI jobs build, each of
+-- which has to forbid substitutes: CI publishes what it builds on main, and
+-- a check whose output a cache held would be downloaded where it is meant
+-- to run, and would test nothing while its job stayed green.  The one
+-- attribute that may be substituted is @run-command.nix@'s hello, a file
+-- @writeText@ writes, which takes no attributes.
+testChecksForbidSubstitutes :: IO [Bool]
+testChecksForbidSubstitutes = do
+  putStrLn "pkgs/checks"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      fileOf name = nixQuotedPath (cwd </> "test" </> "data" </> T.unpack name)
+      source =
+        T.concat
+          [ "let substitutable = file: set: map (name: \"${file}:${name}\") (builtins.filter (name: (set.${name}.allowSubstitutes or true) != false) (builtins.attrNames set)); in builtins.concatStringsSep \" \" (",
+            T.intercalate " ++ " ["substitutable \"" <> name <> "\" (import " <> fileOf name <> ")" | name <- checkFiles],
+            ")"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> pure (T.words (bytesText bytes))
+        other -> throwEvalError ("expected the attributes as one string, got " <> typeName other)
+  sequence
+    [ runTest "every check forbids substitutes but the file writeText writes" $
+        either Fail (assertEqual "checks that may be substituted" ["run-command.nix:hello"]) outcome
+    ]
+  where
+    checkFiles :: [Text]
+    checkFiles = ["busybox.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -19370,6 +19406,7 @@ runSuite = do
           testGnumakeWindows,
           testBusyboxWindows,
           testSeedStdenvWindows,
+          testChecksForbidSubstitutes,
           testWindowsSources,
           testNarKnownAnswer,
           testFetchGitTransport,
