@@ -1324,20 +1324,23 @@ jobs:
   # --version and has it build a target through a pattern rule, and
   # test/data/busybox.nix runs busybox --version and has busybox's sh run a
   # script through the applets configure runs.  Last, the seed stdenv made
-  # of those builds GNU Hello, which runs here, and binutils, whose as, ar
-  # and ld test/data/binutils.nix has build a program that runs.  x64 and
-  # ARM64 Windows each run all of it, for the reason Stage0 (Windows) runs
-  # on both.  Each builds every rung from the seed unless Ladder (mode) has
-  # it take the unchanged ones from the public cache.
+  # of those builds GNU Hello, which runs here, binutils, whose as, ar and
+  # ld test/data/binutils.nix has build a program that runs, and GCC
+  # 4.6.4's C compiler over MinGW-w64's headers, which
+  # test/data/gcc-core.nix has compile sources whose assembly is compared
+  # and a program that runs.  x64 and ARM64 Windows each run all of it,
+  # for the reason Stage0 (Windows) runs on both.  Each builds every rung
+  # from the seed unless Ladder (mode) has it take the unchanged ones from
+  # the public cache.
   #
   # The x64 leg also measures the cells Mes keeps while MesCC compiles and
   # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
   # only on Mes and what it compiles, the same i686 code on both legs, so one
   # leg measures it.
   #
-  # From the seed the ARM64 leg takes about 49 minutes, most of them MesCC
-  # compiling the Mes libraries, mes and tcc under the x86 emulator, and the
-  # timeout is twice that.
+  # From the seed the ARM64 leg takes about 116 minutes under the x86
+  # emulator: about 39 of them MesCC compiling the Mes libraries, mes and
+  # tcc, 48 tcc compiling GCC and 16 binutils.  The timeout is twice that.
   # ---------------------------------------------------------------------------
   bootstrap-windows:
     name: Bootstrap (${{ matrix.name }})
@@ -1360,7 +1363,7 @@ jobs:
             arena: false
             publish: false
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 98
+    timeout-minutes: 232
     # The x64 leg of a push to main publishes what it built (the last step),
     # with the token the publish job uses, a secret of the `cache`
     # environment.  That environment admits main alone, and GitHub refuses a
@@ -1725,8 +1728,10 @@ jobs:
       # tinycc-native against msvcrt.dll and kernel32.dll; winsock, which it
       # links with -lws2_32, so that it fails unless -l finds ws2_32.def,
       # and which prints 0x1234 through ws2_32.dll's htons, in network byte
-      # order; and mingw32, which compiles only if tinycc-native predefines
-      # __MINGW32__.  msvcrt's stdout is a text stream, which writes each
+      # order; math, which it links with -lm, so that it fails unless -l
+      # finds the runtime's empty libm.a, and which prints a square root
+      # through msvcrt.dll's sqrt; and mingw32, which compiles only if
+      # tinycc-native predefines __MINGW32__.  msvcrt's stdout is a text stream, which writes each
       # newline as a carriage return and a newline, and its printf prints %f
       # with six decimals.
       - name: Programs tinycc-native builds run
@@ -1741,14 +1746,15 @@ jobs:
             exit 1
           fi
           echo "ok    tinycc-native predefines __MINGW32__"
-          if ! hello=$(build native-hello) || ! float=$(build native-float) || ! printf_float=$(build native-printf-float) || ! winsock=$(build native-winsock); then
-            echo "::error::native-hello, native-float, native-printf-float or native-winsock did not build"
+          if ! hello=$(build native-hello) || ! float=$(build native-float) || ! printf_float=$(build native-printf-float) || ! winsock=$(build native-winsock) || ! math=$(build native-math); then
+            echo "::error::native-hello, native-float, native-printf-float, native-winsock or native-math did not build"
             exit 1
           fi
           hello=$(cygpath -u "$hello")/bin/hello.exe
           float=$(cygpath -u "$float")/bin/float.exe
           printf_float=$(cygpath -u "$printf_float")/bin/printf-float.exe
           winsock=$(cygpath -u "$winsock")/bin/winsock.exe
+          math=$(cygpath -u "$math")/bin/math.exe
           work="$(cygpath -u "$RUNNER_TEMP")/tcc-native"
           mkdir "$work"
           status=0
@@ -1772,6 +1778,8 @@ jobs:
           runs "$printf_float" 0 '1.250000'
           runs "$printf_float" 0 '2.500000' x
           runs "$winsock" 0 '3412'
+          runs "$math" 0 '1.414214'
+          runs "$math" 0 '2.000000' x
           exit "$status"
 
       # GNU make, compiled by tinycc-native, timed.
@@ -1978,6 +1986,58 @@ jobs:
             echo "ok    as, ar and ld built answer.exe, which exits 42"
           else
             echo "::error::answer.sh's lines differ from those expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
+
+      # MinGW-w64's headers, its dirent functions and GCC 4.6.4's C
+      # compiler for i686-w64-mingw32: the headers installed, and the
+      # library and the compiler configured, compiled and installed, in the
+      # seed stdenv by tinycc-native, each timed.
+      - name: Build gcc-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in mingw-w64-headers mingw-w64-dirent gcc-core; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
+            echo "== $attr built in $((SECONDS - start)) s"
+          done
+
+      # The driver prints its version line.  Then busybox's sh runs
+      # test/data/gcc-core.nix's script, in which the compiler compiles
+      # text.c to assembly, reads windows.h, and compiles answer.c to an
+      # object that ld links as a program's entry point and that runs; it
+      # writes the assembly, a line for the headers, what nm reads back of
+      # the object and the program's exit status, and a step that fails
+      # leaves its lines out.  The lines are compared with
+      # test/data/gcc-core-answer.txt, the same sources compiled by GCC
+      # 4.6.4 as another compiler built it: cc1 computes every constant in
+      # text.c and the multiplier answer.c's modulo becomes, so a cc1 that
+      # tcc compiled wrongly writes other lines or a program that does not
+      # exit with 42.
+      - name: gcc-core runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/gcc-version.log"
+          want='i686-w64-mingw32-gcc.exe (GCC) 4.6.4'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc-core.nix -A version > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::gcc --version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::gcc --version did not print $want"; exit 1; fi
+          echo "ok    gcc --version"
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc-core.nix -A answer | tail -n 1); then
+            echo "::error::busybox sh did not run answer.sh"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          expected=test/data/gcc-core-answer.txt
+          if cmp "$expected" "$lines"; then
+            echo "ok    gcc-core wrote the assembly expected of text.c, read windows.h, and built answer.exe, which exits 42"
+          else
+            echo "::error::answer.sh's lines differ from $expected:"
             diff "$expected" "$lines"
             exit 1
           fi

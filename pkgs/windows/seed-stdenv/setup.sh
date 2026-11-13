@@ -10,8 +10,12 @@
 #   $configureFlags / $makeFlags  extra flags for the default phases
 #   $dontConfigure                skip ./configure
 #   $buildPhase / $installPhase   replace the default build / install commands
-# one more, which no package of that stdenv's needs:
+# three more, which no package of that stdenv's needs:
 #   $patches                      patch files applied to the unpacked source
+#   $preConfigure                 commands run in the source tree before
+#                                 configure
+#   $configureScript              the configure script, ./configure unless
+#                                 set
 # and the tools, all built from the seed:
 #   $initialPath     the store paths whose bin directories the build runs
 #   $CC, $LD, $AR    tinycc-native, which finds its runtime with -B
@@ -35,9 +39,12 @@ set -e
 # word sh reads twice, which configure and make both do with these paths,
 # and busybox and every Windows API take '/' as well, so the paths this
 # script hands on, the package's and the tools', are respelled with
-# forward slashes before anything reads them.  A store path a package
-# writes into its flags or phases keeps the builder's spelling, as it does
-# in the stage-1 stdenv.  busybox's sh respells imported variables itself only when its
+# forward slashes before anything reads them.  configureFlags is among
+# them: configure writes a path it is given into Makefiles and C strings,
+# as GCC's does the --with-as and --with-ld it is built with.  A store
+# path a package writes into makeFlags or a phase keeps the builder's
+# spelling, as it does in the stage-1 stdenv.
+# busybox's sh respells imported variables itself only when its
 # environment spells PATH, COMSPEC or PROGRAMDATA in mixed case, as Windows
 # does (win32/mingw.c's windows_env), and a builder's has PATH and COMSPEC
 # in upper case and no PROGRAMDATA.
@@ -58,7 +65,7 @@ toSlashes() {
 
 # The loop variable is not "name", which is the derivation's own and
 # reaches every program the build runs.
-for pathVariable in out src patches buildInputs initialPath CC LD AR C_INCLUDE_PATH CONFIG_SHELL CONFIG_SITE NIX_BUILD_TOP NIX_STORE; do
+for pathVariable in out src patches buildInputs configureFlags initialPath CC LD AR C_INCLUDE_PATH CONFIG_SHELL CONFIG_SITE NIX_BUILD_TOP NIX_STORE; do
   toSlashes "$pathVariable"
 done
 
@@ -68,6 +75,21 @@ PATH=
 for dir in $initialPath; do
   PATH=${PATH:+$PATH;}$dir/bin
 done
+
+# What configure cannot detect about this PATH.  configure picks PATH's
+# separator by running sh under a PATH split each way (its "The user is
+# always right" block); busybox's sh runs its own sh applet whatever PATH
+# holds, so both runs succeed and ':' wins, which splits every C: directory
+# in two.  And configure takes a program it searches PATH for only if
+# test -x passes, trying each name as it is and then with each suffix in
+# ac_executable_extensions; the commands on PATH are .exe files, and
+# busybox's test, unlike Cygwin's, does not add the suffix itself.  Both
+# are in the environment, which every configure reads, and not in
+# config.site: GCC's top level runs the configure of each directory it
+# builds for the build machine, and of each target library, with
+# CONFIG_SITE=no-such-file (its Makefile.in), and in a native build the
+# build machine is this one.
+export PATH_SEPARATOR=';' ac_executable_extensions=.exe
 
 # busybox's sh runs its own applet for a command that names one before it
 # searches PATH, and busybox has a make; the build's make is GNU make.
@@ -122,11 +144,19 @@ for patchFile in $patches; do
 done
 
 # --- configure phase (autotools packages only) ---
+# $preConfigure first, as nixpkgs' configurePhase runs it: it may move to
+# the directory whose configure is the package's, add to the tree what
+# configure looks for there, or move to a build directory of its own and
+# name the source tree's script in $configureScript, as nixpkgs' does.
 # --build, since config.guess cannot name this platform (see default.nix).
 # CONFIG_SHELL runs configure, which writes it into the Makefiles as SHELL;
 # their default, /bin/sh, names a file on the current drive.
-if [ -z "$dontConfigure" ] && [ -x ./configure ]; then
-  "$CONFIG_SHELL" ./configure --prefix="$prefix" --build="$buildTriple" $configureFlags
+if [ -n "$preConfigure" ]; then
+  eval "$preConfigure"
+fi
+configureScript=${configureScript:-./configure}
+if [ -z "$dontConfigure" ] && [ -x "$configureScript" ]; then
+  "$CONFIG_SHELL" "$configureScript" --prefix="$prefix" --build="$buildTriple" $configureFlags
 fi
 
 # --- build phase ---

@@ -65,8 +65,14 @@ let
     "ws2_32.def"
   ];
 
-  # TinyCC's runtime compiled by a round's tcc, and the import libraries:
-  # what a tcc that links without -nostdlib takes from the -B directory.
+  # TinyCC's runtime compiled by a round's tcc, the import libraries, and
+  # an empty libm.a: what a tcc that links without -nostdlib takes from the
+  # -B directory.  -lm is how Unix builds ask for the math functions, which
+  # msvcrt.dll holds, and TinyCC finds a library only by a file
+  # (libtcc.c's tcc_add_library), so the name needs one that adds nothing,
+  # as MinGW-w64's runtime has (mingw-w64-crt/Makefile.am:72-77).  GCC
+  # links its genautomata with -lm (gcc/Makefile.in:3948 at 4.6.4).  tcc
+  # -ar given no object writes an archive with no member.
   buildRuntime =
     pname: round:
     let
@@ -76,6 +82,7 @@ let
       ${builtins.concatStringsSep "\n" (map (source: "${cc} -c ${src}/${source}") runtimeSources)}
       mkdir -p ''${out}/lib
       ${cc} -ar cr ''${out}/lib/libtcc1.a ${builtins.concatStringsSep " " runtimeObjects}
+      ${cc} -ar cr ''${out}/lib/libm.a
       ${builtins.concatStringsSep "\n" (
         map (def: "cp ${src}/win32/lib/${def} \${out}/lib/${def}") importLibraries
       )}

@@ -43,5 +43,8 @@ in
     "busybox-w32"
     "seedStdenv.applets"
     "binutils"
+    "mingw-w64-headers"
+    "mingw-w64-dirent"
+    "gcc-core"
   ];
 }

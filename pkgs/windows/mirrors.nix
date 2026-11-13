@@ -54,4 +54,14 @@
     "ftp://savannah-nongnu-org.ip-connect.vn.ua/mirror/savannah.nongnu.org/"
     "ftp://ftp.mirrorservice.org/sites/download.savannah.gnu.org/releases/"
   ];
+
+  # SourceForge
+  sourceforge = [
+    "https://downloads.sourceforge.net/"
+    "https://prdownloads.sourceforge.net/"
+    "https://netcologne.dl.sourceforge.net/sourceforge/"
+    "https://versaweb.dl.sourceforge.net/sourceforge/"
+    "https://freefr.dl.sourceforge.net/sourceforge/"
+    "https://osdn.dl.sourceforge.net/sourceforge/"
+  ];
 }
