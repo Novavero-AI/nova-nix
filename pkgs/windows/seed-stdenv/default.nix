@@ -93,5 +93,10 @@ in
         # system name is Windows_NT.
         buildTriple = "i686-pc-mingw32";
       }
-    );
+    )
+    // {
+      # What the package fetches, as the stage-1 stdenv states it: its
+      # src, unless that is a path in the tree.
+      srcs = if (attrs.src or null) ? outputHash then [ attrs.src ] else [ ];
+    };
 }

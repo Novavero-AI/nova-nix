@@ -10,6 +10,8 @@
 #   $configureFlags / $makeFlags  extra flags for the default phases
 #   $dontConfigure                skip ./configure
 #   $buildPhase / $installPhase   replace the default build / install commands
+# one more, which no package of that stdenv's needs:
+#   $patches                      patch files applied to the unpacked source
 # and the tools, all built from the seed:
 #   $initialPath     the store paths whose bin directories the build runs
 #   $CC, $LD, $AR    tinycc-native, which finds its runtime with -B
@@ -19,11 +21,12 @@
 #   $buildTriple     the platform configure is told it builds on
 #
 # It is POSIX sh, since busybox's ash is the shell the seed provides, and
-# its phases are the stage-1 stdenv's but the last.  That stdenv's fixup
-# phase copies each DLL an output imports from a build input beside the
-# binary, reading the imports with objdump; nothing built from the seed
-# reads a PE import table, so this stdenv has no fixup phase, and an
-# output that links a DLL from a build input does not carry it.
+# its phases are the stage-1 stdenv's with a patch phase after unpack and
+# without the last.  That stdenv's fixup phase copies each DLL an output
+# imports from a build input beside the binary, reading the imports with
+# objdump; none of this stdenv's tools reads a PE import table, so it has
+# no fixup phase, and an output that links a DLL from a build input does
+# not carry it.
 set -e
 
 # The builder spells the store C:\nix\store, so every store path in the
@@ -55,7 +58,7 @@ toSlashes() {
 
 # The loop variable is not "name", which is the derivation's own and
 # reaches every program the build runs.
-for pathVariable in out src buildInputs initialPath CC LD AR C_INCLUDE_PATH CONFIG_SHELL CONFIG_SITE NIX_BUILD_TOP NIX_STORE; do
+for pathVariable in out src patches buildInputs initialPath CC LD AR C_INCLUDE_PATH CONFIG_SHELL CONFIG_SITE NIX_BUILD_TOP NIX_STORE; do
   toSlashes "$pathVariable"
 done
 
@@ -110,6 +113,14 @@ else
   fi
 fi
 
+# --- patch phase ---
+# nixpkgs' patchPhase with its default flags: each patch applies from the
+# top of the source tree, less the first component of the paths it names.
+# busybox's patch exits non-zero on a hunk it cannot place.
+for patchFile in $patches; do
+  patch -p1 -i "$patchFile"
+done
+
 # --- configure phase (autotools packages only) ---
 # --build, since config.guess cannot name this platform (see default.nix).
 # CONFIG_SHELL runs configure, which writes it into the Makefiles as SHELL;
@@ -126,8 +137,11 @@ else
 fi
 
 # --- install phase ---
+# $makeFlags again, as nixpkgs' installPhase passes them: a variable a
+# package sets for make, as binutils sets MAKEINFO, holds for the rules
+# install runs too.
 if [ -n "$installPhase" ]; then
   eval "$installPhase"
 else
-  make install prefix="$prefix"
+  make $makeFlags install prefix="$prefix"
 fi

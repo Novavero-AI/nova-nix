@@ -42,5 +42,6 @@ in
     "gnumake"
     "busybox-w32"
     "seedStdenv.applets"
+    "binutils"
   ];
 }

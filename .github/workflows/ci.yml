@@ -1324,10 +1324,11 @@ jobs:
   # --version and has it build a target through a pattern rule, and
   # test/data/busybox.nix runs busybox --version and has busybox's sh run a
   # script through the applets configure runs.  Last, the seed stdenv made
-  # of those builds GNU Hello, which runs here.  x64 and ARM64 Windows each
-  # run all of it, for the reason Stage0 (Windows) runs on both.  Each
-  # builds every rung from the seed unless Ladder (mode) has it take the
-  # unchanged ones from the public cache.
+  # of those builds GNU Hello, which runs here, and binutils, whose as, ar
+  # and ld test/data/binutils.nix has build a program that runs.  x64 and
+  # ARM64 Windows each run all of it, for the reason Stage0 (Windows) runs
+  # on both.  Each builds every rung from the seed unless Ladder (mode) has
+  # it take the unchanged ones from the public cache.
   #
   # The x64 leg also measures the cells Mes keeps while MesCC compiles and
   # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
@@ -1932,6 +1933,54 @@ jobs:
             status=1
           fi
           exit "$status"
+
+      # GNU binutils for i686-w64-mingw32, configured, compiled and
+      # installed in the seed stdenv by tinycc-native, timed.
+      - name: Build binutils
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A binutils
+          echo "== binutils built in $((SECONDS - start)) s"
+
+      # ld --version prints its version line.  Then busybox's sh runs
+      # test/data/binutils.nix's script, in which as assembles a function
+      # that returns 42, ar archives the object, ld links it as a program's
+      # entry point and the program runs; it writes what nm, ar and objdump
+      # read back of each file and the program's exit status, a line for
+      # each, and a line whose step fails is left out.  The lines are
+      # checked against bytes the runner's own printf writes.
+      - name: binutils runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/ld-version.log"
+          want='GNU ld (GNU Binutils) 2.41'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/binutils.nix -A version > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::ld --version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::ld --version did not print $want"; exit 1; fi
+          echo "ok    ld --version"
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/binutils.nix -A answer | tail -n 1); then
+            echo "::error::busybox sh did not run answer.sh"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          expected="$RUNNER_TEMP/answer-expected.txt"
+          printf '%s\n' \
+            '00000000 T _answer' \
+            'answer.o' \
+            'answer.exe:     file format pei-i386' \
+            'answer.exe exits 42' > "$expected"
+          if cmp "$expected" "$lines"; then
+            echo "ok    as, ar and ld built answer.exe, which exits 42"
+          else
+            echo "::error::answer.sh's lines differ from those expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
 
       # The cells Mes keeps across each collection while MesCC compiles and
       # links tcc, in the arena tinycc-boot-mes builds in.  The collector
