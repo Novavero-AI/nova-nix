@@ -105,9 +105,10 @@ another directory; no setting or environment variable chooses it.
 
 Give nova-nix a store of its own. `nova-nix store gc` deletes every entry in
 the store directory that its own roots do not keep, the out-links `build -o`
-makes and the entries under the store's `.nova-nix/gcroots`, so in a store
-upstream Nix also uses, it deletes upstream's paths. Where upstream Nix is installed,
-`/nix/store` is its store: give nova-nix another directory with `--store`.
+makes and the entries under the store's `.nova-nix/gcroots`, so `store gc` and
+`store delete` refuse a store directory that upstream Nix's database also
+manages. Where upstream Nix is installed, `/nix/store` is its store: give
+nova-nix another directory with `--store`.
 
 **Linux.** The store is `/nix/store`, which nova-nix creates when `/nix` is
 yours:

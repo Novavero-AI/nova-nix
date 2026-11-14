@@ -97,7 +97,7 @@ import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScop
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, pushPaths, storePathBasename, stripHashPrefix)
 import qualified Nix.Realise as Realise
-import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, withCollectorLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
@@ -15127,7 +15127,12 @@ testGcPure = do
         let name = indirectRootRecordName "/home/u/result"
          in if length name == 52 && all (`elem` nix32Alphabet) name && name /= indirectRootRecordName "/home/u/result-2"
               then Pass
-              else Fail ("unexpected record name: " <> T.pack name)
+              else Fail ("unexpected record name: " <> T.pack name),
+      runTest "upstreamDatabasePath is upstream's database for a nix/store directory, and nothing for another" $
+        assertEqual
+          "databases"
+          (map (fmap splitDirectories) [Just "/nix/var/nix/db/db.sqlite", Just "/home/u/nix/var/nix/db/db.sqlite", Nothing, Nothing])
+          (map (fmap splitDirectories . upstreamDatabasePath) ["/nix/store", "/home/u/nix/store/", "/nix/nova-store", "/home/u/store"])
     ]
 
 -- | Garbage collection end to end against a temp store: a rooted closure
@@ -15449,6 +15454,109 @@ testStoreGC = do
             ]
     Dir.removePathForcibly linkDir
     pure (permanent ++ linked)
+
+-- | A store whose directory upstream Nix's database also manages, laid
+-- out as upstream lays out a store under a root: the collector and the
+-- checked delete refuse it and leave an unregistered tree alone, a
+-- sibling store under the same directory is collected, a link to the
+-- store is refused as the store is, the collector refuses while the
+-- database's directory cannot be searched, and with the database gone
+-- the same tree is swept.
+testStoreGCUpstreamManaged :: IO [Bool]
+testStoreGCUpstreamManaged = do
+  putStrLn "store/gc-upstream-managed"
+  canLink <- symlinksAvailable
+  tmpBase <- getTemporaryDirectory
+  let root = tmpBase </> "nova-nix-test-upstream-root"
+      sd = StoreDir (root </> "nix" </> "store")
+      upstreamDb = root </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite"
+      upstreamPath = StorePath (T.replicate 32 "u") "upstream-hello"
+      tree = storePathToFilePath sd upstreamPath
+      plant dir = do
+        let planted = storePathToFilePath dir upstreamPath
+        createDirectoryIfMissing True planted
+        BS.writeFile (planted </> "data") "upstream's"
+  Dir.removePathForcibly root
+  createDirectoryIfMissing True (takeDirectory upstreamDb)
+  BS.writeFile upstreamDb ""
+  plant sd
+  store <- openStore sd
+  -- The handle's spelling of the directory, which the refusal names and
+  -- the sweep reports in.
+  let opened = stDir store
+  results <-
+    sequence
+      [ runTestM "a collection and a checked delete refuse a store upstream's database manages" $ do
+          collected <- collectGarbage store
+          deleted <- deleteStorePathRaw store (spHash upstreamPath <> "-" <> spName upstreamPath)
+          treeKept <- Dir.doesPathExist (tree </> "data")
+          let names err = all (`T.isInfixOf` err) ["upstream Nix's database", "also manages the store", "db.sqlite", T.pack (unStoreDir opened)]
+          pure $ case (collected, deleted) of
+            (Left gcErr, Left delErr) | names gcErr, names delErr, treeKept -> Pass
+            other -> Fail ("expected both refusals, got: " <> T.pack (show (other, treeKept))),
+        -- Upstream keeps a store only in a directory named nix/store, so
+        -- a store beside it is nova-nix's alone.
+        runTestM "a sibling store under the same directory is collected" $ do
+          let sibling = StoreDir (root </> "nix" </> "nova-store")
+          createDirectoryIfMissing True (unStoreDir sibling)
+          plant sibling
+          other <- openStore sibling
+          collected <- collectGarbage other
+          closeStore other
+          treeGone <- not <$> Dir.doesPathExist (storePathToFilePath sibling upstreamPath)
+          pure $ case collected of
+            Right _ | treeGone -> Pass
+            unexpected -> Fail ("expected the sibling collected, got: " <> T.pack (show (unexpected, treeGone))),
+        -- The link's own name is no upstream store directory; the
+        -- directory it resolves to is.
+        runTestM "a store opened through a link to upstream's store is refused" $
+          if not canLink
+            then Pass <$ putStrLn "  SKIP  symlinks are unavailable here"
+            else do
+              let linkRoot = tmpBase </> "nova-nix-test-upstream-link"
+                  linkedStore = StoreDir (linkRoot </> "nix" </> "store")
+                  link = linkRoot </> "s"
+                  linkedDb = linkRoot </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite"
+              Dir.removePathForcibly linkRoot
+              createDirectoryIfMissing True (takeDirectory linkedDb)
+              BS.writeFile linkedDb ""
+              createDirectoryIfMissing True (unStoreDir linkedStore)
+              plant linkedStore
+              Dir.createDirectoryLink (unStoreDir linkedStore) link
+              viaLink <- openStore (StoreDir link)
+              collected <- collectGarbage viaLink
+              closeStore viaLink
+              treeKept <- Dir.doesPathExist (storePathToFilePath linkedStore upstreamPath </> "data")
+              Dir.removePathForcibly linkRoot
+              pure $ case collected of
+                Left err | "also manages the store" `T.isInfixOf` err, treeKept -> Pass
+                other -> Fail ("expected the refusal, got: " <> T.pack (show (other, treeKept))),
+        -- A directory with no permissions is the reproducible case; one
+        -- that can be searched anyway (root, or Windows, where
+        -- permissions do not forbid it) proves nothing and is skipped.
+        runTestM "a collection refuses while upstream's database cannot be examined" $ do
+          let dbDir = takeDirectory upstreamDb
+              unlock = Dir.setPermissions dbDir (Dir.setOwnerReadable True (Dir.setOwnerSearchable True (Dir.setOwnerWritable True Dir.emptyPermissions)))
+          Dir.setPermissions dbDir Dir.emptyPermissions
+          examinable <- try (Dir.getPermissions upstreamDb) :: IO (Either IOException Dir.Permissions)
+          collected <- collectGarbage store `finally` unlock
+          treeKept <- Dir.doesPathExist (tree </> "data")
+          case examinable of
+            Right _ -> Pass <$ putStrLn "  SKIP  an empty-permission directory can be searched here"
+            Left _ -> pure $ case collected of
+              Left err | "cannot tell whether upstream Nix's database" `T.isInfixOf` err, treeKept -> Pass
+              other -> Fail ("expected the refusal, got: " <> T.pack (show (other, treeKept))),
+        runTestM "without upstream's database the same tree is swept" $ do
+          Dir.removeFile upstreamDb
+          collected <- collectGarbage store
+          treeGone <- not <$> Dir.doesPathExist tree
+          pure $ case collected of
+            Right results | gcrDeleted results == [T.pack (storePathToFilePath opened upstreamPath)], treeGone -> Pass
+            other -> Fail ("expected the tree swept, got: " <> T.pack (show (other, treeGone)))
+      ]
+  closeStore store
+  Dir.removePathForcibly root
+  pure results
 
 testStoreOps :: IO [Bool]
 testStoreOps = do
@@ -21191,6 +21299,7 @@ runSuite = do
           testStoreDelete,
           testGcPure,
           testStoreGC,
+          testStoreGCUpstreamManaged,
           testSymlinkWalksIO,
           testLinkOrdering,
           testFromATerm,

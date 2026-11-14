@@ -268,7 +268,7 @@ command name = case name of
     CommandEntry
       { commandForms = Form "PATH..." "Remove store paths, refused while a root or another valid path keeps them" :| [],
         commandDescription =
-          "Deletes each `PATH`'s registration and its tree on disk, in the order given, and prints each one it deleted. A `PATH` is a store path, in full or as its base name, and an entry with only a registration or only a tree is deleted too. A path a root keeps, or that another valid path references, is refused, and the first refusal stops the command, so a path is named before the paths it references.",
+          "Deletes each `PATH`'s registration and its tree on disk, in the order given, and prints each one it deleted. A `PATH` is a store path, in full or as its base name, and an entry with only a registration or only a tree is deleted too. A path a root keeps, or that another valid path references, is refused, and the first refusal stops the command, so a path is named before the paths it references. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused.",
         commandExamples =
           Example
             "Delete a build's output, here GNU Hello's, so that the next build makes it again; `HASH` stands for the hash in its path."
@@ -280,7 +280,7 @@ command name = case name of
     CommandEntry
       { commandForms = Form "" "Remove every store path not reachable from a root" :| [],
         commandDescription =
-          "Deletes every store path no root keeps, directly or through the paths that reference it, and prints how many it deleted and the space it freed, as `nix-store --gc` does. The roots are the out-links `build --out-link` registered and the links and files under the store's `.nova-nix/gcroots` directory; a path a running program has open is not a root, and a rooted output does not keep the `.drv` that built it. With `--print-roots` it lists the roots and deletes nothing.",
+          "Deletes every store path no root keeps, directly or through the paths that reference it, and prints how many it deleted and the space it freed, as `nix-store --gc` does. The roots are the out-links `build --out-link` registered and the links and files under the store's `.nova-nix/gcroots` directory; a path a running program has open is not a root, and a rooted output does not keep the `.drv` that built it. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused. With `--print-roots` it lists the roots and deletes nothing.",
         commandExamples =
           Example "Delete everything no root keeps." ("store" :| ["gc"]) []
             :| [Example "List the roots, each as the link that names it and the path it keeps." ("store" :| ["gc", "--print-roots"]) []]
