@@ -46,7 +46,7 @@ import Nix.HostPath (hostPathFromBytes)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Realise (BuildMode (..), Fallback (..), SubstitutesSetting (..))
-import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, upstreamManagedRefusal, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
@@ -353,8 +353,6 @@ evalExprAterm config opts storeDir dataDir source = do
           -- printed .drv diffs byte-exactly against upstream's.
           BC.putStrLn aterm
 
--- | Parse, evaluate, extract derivation, build, and print result.
--- The file argument is canonicalized for the same reason as in 'evalFile'.
 -- | Where a build reads its expression, and the directory relative paths
 -- inside it resolve against.
 loadBuildSource :: BuildTarget -> IO (FilePath, SourceOrigin, BS.ByteString)
@@ -383,8 +381,13 @@ forceDerivationAttrs val = case val of
 derivationAttrKeys :: [T.Text]
 derivationAttrKeys = ["type", "drvPath", "outputName"]
 
+-- | Parse, evaluate, extract the derivation, build it, and print its
+-- output path.  A store directory upstream Nix's database also manages
+-- is refused before evaluation, which can write to the store too
+-- ("Nix.Store.Upstream").
 buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> Maybe FilePath -> IO ()
 buildCommand config opts storeDir dataDir target attrPath outLink = do
+  upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("build: " <>))
   let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
   (baseDir, origin, source) <- loadBuildSource target

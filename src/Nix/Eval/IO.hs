@@ -68,7 +68,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Pa
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
-import Nix.Store (unpackNarEntry)
+import Nix.Store (UpstreamHazard (..), unpackNarEntry, upstreamManagedRefusal)
 import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import qualified Nix.Store.Path as SP
@@ -1108,9 +1108,18 @@ readCaseHack path
       wrapIO (volumeCaseHack <$> probeCaseSensitivity storeRoot)
   | otherwise = pure processCaseHack
 
--- | 'storeFilePath' against the store this evaluation was given.
+-- | Where an eval-time store write of a path lands: 'storeFilePath'
+-- against the store this evaluation was given.  Every eval-time writer
+-- asks here before it writes, so a store upstream Nix's database may
+-- also manage is refused at the first write, uncatchably
+-- ("Nix.Store.Upstream"): a writer clears a tree there that does not
+-- reproduce its address, which may be one upstream registered.  An
+-- evaluation that writes nothing never asks.
 evalFilePath :: SP.StorePath -> EvalIO FilePath
-evalFilePath sp = EvalIO (asks ((`storeFilePath` sp) . esStoreDir))
+evalFilePath sp = do
+  storeDir <- EvalIO (asks esStoreDir)
+  refusal <- wrapIO (upstreamManagedRefusal ReplacesUpstreamPaths storeDir)
+  maybe (pure (storeFilePath storeDir sp)) throwEvalError refusal
 
 -- | Resolve path-value text to a filesystem location against the store
 -- this evaluation was given.  The read counterpart of 'evalFilePath':

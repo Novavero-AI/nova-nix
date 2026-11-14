@@ -103,12 +103,16 @@ nova-nix keeps what it builds and downloads in a store directory, with its own
 database inside it under `.nova-nix/`. Every command takes `--store DIR` to use
 another directory; no setting or environment variable chooses it.
 
-Give nova-nix a store of its own. `nova-nix store gc` deletes every entry in
-the store directory that its own roots do not keep, the out-links `build -o`
-makes and the entries under the store's `.nova-nix/gcroots`, so `store gc` and
-`store delete` refuse a store directory that upstream Nix's database also
-manages. Where upstream Nix is installed, `/nix/store` is its store: give
-nova-nix another directory with `--store`.
+Give nova-nix a store of its own. A path upstream Nix registers has no row in
+nova-nix's database, so in a store directory upstream's database also manages,
+`nova-nix store gc` would delete upstream's paths with every other entry its
+own roots do not keep (the out-links `build -o` makes and the entries under the
+store's `.nova-nix/gcroots`), and a build would replace an upstream path it
+builds or downloads. `build`, `store gc` and `store delete` refuse such a
+store, and so does `eval` once the evaluation writes to it, as
+`builtins.toFile`, `builtins.path` and the fetchers do. Where upstream Nix is
+installed, `/nix/store` is its store: give nova-nix another directory with
+`--store`.
 
 **Linux.** The store is `/nix/store`, which nova-nix creates when `/nix` is
 yours:

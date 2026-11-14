@@ -112,7 +112,7 @@ import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWit
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Push (narHashMatches)
 import Nix.Realise (BuildMode (..), CheckVerdict (..), Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), SubstEffects (..), SubstitutesSetting (..), realise, realiseFailureMessage, realiseFailureStatus)
-import Nix.Store (PathInfo (..), PathLock, PathRegistration, Store (..), acquirePathLock, isValid, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, volumeCaseHack)
+import Nix.Store (PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, isValid, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText, unStoreDir)
 import Nix.Substituter (CacheConfig, SubstResult (..), queryReferencesWith, trySubstituteWith)
@@ -346,6 +346,9 @@ data BuildResult
 -- 7. Exception safety: synchronous exceptions convert to BuildFailure;
 --    asynchronous exceptions propagate ('catchSync') - an interrupt
 --    must abort the build, never be reported as a build failure.
+--
+-- A store upstream Nix's database may also manage fails the build before
+-- any of this ("Nix.Store.Upstream").
 buildDerivation :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
 buildDerivation config store drv drvPath =
   either stoppedResult BuildSuccess <$> buildOutputs config store drv drvPath
@@ -385,8 +388,9 @@ buildOutputs config store drv drvPath =
 -- The rebuild registers nothing, leaves the outputs as they are, and keeps
 -- nothing it wrote.  'Left' is why there was no comparison to answer with,
 -- naming the derivation as 'buildWithDeps' names one that failed to build:
--- its builder failed, or an output is not valid, so there is nothing to
--- compare a rebuild with.
+-- its builder failed; an output is not valid, so there is nothing to
+-- compare a rebuild with; or the store is one upstream Nix's database may
+-- also manage, refused before anything is touched ("Nix.Store.Upstream").
 checkDerivation :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text CheckVerdict)
 checkDerivation config store drv drvPath =
   first (stopReport drv) <$> checkOutputs config store drv drvPath
@@ -452,18 +456,26 @@ noOutputsMessage = "no outputs defined"
 -- The validity re-check happens under the locks, not before them:
 -- checked earlier it would answer about a moment that has already
 -- passed by the time the build starts.
-withOutputLocks :: BuildConfig -> Store -> Derivation -> (Maybe StorePath -> IO a) -> IO a
+--
+-- A store upstream Nix's database may also manage is refused before any
+-- lock is taken ("Nix.Store.Upstream"): a build clears each output path
+-- with no row here, and a path upstream registered has none.
+withOutputLocks :: BuildConfig -> Store -> Derivation -> (Maybe StorePath -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
 withOutputLocks config store drv act = do
-  heldLocks <- newIORef []
-  let takeLock sp = do
-        lock <- acquirePathLock (bcStoreDir config) sp
-        atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
-  ( do
-      mapM_ takeLock (lockOrder (map doPath (drvOutputs drv)))
-      finishedElsewhere <- allOutputsValid store drv
-      act finishedElsewhere
-    )
-    `finally` (readIORef heldLocks >>= mapM_ releasePathLock)
+  refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (bcStoreDir config)
+  maybe locked (\reason -> pure (Left (BuildStop reason 1))) refusal
+  where
+    locked = do
+      heldLocks <- newIORef []
+      let takeLock sp = do
+            lock <- acquirePathLock (bcStoreDir config) sp
+            atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
+      ( do
+          mapM_ takeLock (lockOrder (map doPath (drvOutputs drv)))
+          finishedElsewhere <- allOutputsValid store drv
+          act finishedElsewhere
+        )
+        `finally` (readIORef heldLocks >>= mapM_ releasePathLock)
 
 -- | The order a process takes more than one path lock in.  Substitution
 -- holds each lock until its batch registers, and a build until it finishes,
@@ -1823,24 +1835,34 @@ dedupStorePaths = Map.elems . Map.fromList . map (\sp -> (spHash sp, sp))
 -- 1 if a derivation fails to build, a substitute fails under 'NoFallback',
 -- a cache cannot be asked, a derivation's @allowSubstitutes@ cannot be
 -- read, or a check has no valid output to compare with.
+--
+-- A store upstream Nix's database may also manage is refused, with
+-- status 1, before anything is read or any cache asked
+-- ("Nix.Store.Upstream").  Each build and substitution refuses it too,
+-- but by then the realisation has asked the caches, and it reports a
+-- refused substitute as a failed download.
 buildWithDeps :: BuildConfig -> Store -> Derivation -> StorePath -> IO BuildResult
 buildWithDeps config store rootDrv rootDrvPath = do
-  graph <- buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
-  case graph of
-    Left err -> pure (BuildFailure ("dependency graph error: " <> err) 1)
-    Right depGraph ->
-      case topoSort depGraph of
-        TopoCycle _ ->
-          pure (BuildFailure "dependency cycle detected" 1)
-        TopoSorted _ -> do
-          let settings = RealiseSettings {rsFallback = bcFallback config, rsSubstitutes = bcSubstitutes config, rsMode = bcMode config}
-          result <- realise settings (realiseEffects config store) depGraph rootDrvPath
-          case result of
-            Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) (realiseFailureStatus failure))
-            Right () ->
-              case drvOutputs rootDrv of
-                (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
-                [] -> pure (BuildFailure noOutputsMessage 1)
+  refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (bcStoreDir config)
+  maybe realiseRoot (\reason -> pure (BuildFailure reason 1)) refusal
+  where
+    realiseRoot = do
+      graph <- buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
+      case graph of
+        Left err -> pure (BuildFailure ("dependency graph error: " <> err) 1)
+        Right depGraph ->
+          case topoSort depGraph of
+            TopoCycle _ ->
+              pure (BuildFailure "dependency cycle detected" 1)
+            TopoSorted _ -> do
+              let settings = RealiseSettings {rsFallback = bcFallback config, rsSubstitutes = bcSubstitutes config, rsMode = bcMode config}
+              result <- realise settings (realiseEffects config store) depGraph rootDrvPath
+              case result of
+                Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) (realiseFailureStatus failure))
+                Right () ->
+                  case drvOutputs rootDrv of
+                    (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
+                    [] -> pure (BuildFailure noOutputsMessage 1)
 
 -- | Read and parse a .drv file from the store, as bytes (no locale
 -- decode, no newline translation).
