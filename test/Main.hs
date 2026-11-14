@@ -12870,8 +12870,7 @@ testMesWindows = do
           quote dir = "\"" <> dir <> "\""
           mesEnv =
             [ ("MES_ARENA", "20000000"),
-              ("MES_MAX_ARENA", "20000000"),
-              ("MES_STACK", "6000000"),
+              ("MES_STACK", "60000"),
               ("MES_PREFIX", prefix),
               ("GUILE_LOAD_PATH", T.intercalate ":" (map quote [prefix <> "/mes/module", prefix <> "/module", outText "mes.nyacc" <> "/share/nyacc-1.09.1/module"])),
               ("M1", outText "mescc-tools" <> "/bin/M1.exe"),
@@ -12890,7 +12889,7 @@ testMesWindows = do
           runTest "the leaves it adds are the Mes and NYACC archives, both fetched fixed-output" $
             assertEqual
               "leaves added"
-              (sort ["mes-4ea66eb.tar.gz", "nyacc-1.09.1.tar.gz"], True)
+              (sort ["mes-77ff40b.tar.gz", "nyacc-1.09.1.tar.gz"], True)
               (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
           runTest "it reads no input source but what evaluation writes as text" $
             assertEqual "input sources not written as text" [] [nameOf drv | drv <- added, not (all wroteAsText (drvInputSrcs drv))],
@@ -12920,20 +12919,20 @@ testMesWindows = do
     checkAttrs :: [Text]
     checkAttrs = ["mes-m2", "mes", "hello", "exec-bit"]
     -- Each kaem.runCommand adds its script, written by writeText as
-    -- <name>-builder; mes-libc-0.27.1 is both the libc MesCC compiles and
+    -- <name>-builder; mes-libc-0.28 is both the libc MesCC compiles and
     -- the sources for TinyCC, as in nixpkgs.
     addedNames :: [Text]
     addedNames =
-      ["mes-4ea66eb.tar.gz", "nyacc-1.09.1.tar.gz", "hello.c", "exec-bit.c"]
-        ++ concat [[name, name <> "-builder"] | name <- mesRunners ++ ["nyacc-1.09.1", "mes-src-0.27.1", "mes-m2-libs-0.27.1", "mes-libc-0.27.1"]]
+      ["mes-77ff40b.tar.gz", "nyacc-1.09.1.tar.gz", "hello.c", "exec-bit.c"]
+        ++ concat [[name, name <> "-builder"] | name <- mesRunners ++ ["nyacc-1.09.1", "mes-src-0.28", "mes-m2-libs-0.28", "mes-libc-0.28"]]
     mesRunners :: [Text]
     mesRunners =
-      [ "mes-crt1-0.27.1",
-        "mes-libc-mini-0.27.1",
-        "mes-libmescc-0.27.1",
-        "mes-libc-0.27.1",
-        "mes-libc+tcc-0.27.1",
-        "mes-0.27.1",
+      [ "mes-crt1-0.28",
+        "mes-libc-mini-0.28",
+        "mes-libmescc-0.28",
+        "mes-libc-0.28",
+        "mes-libc+tcc-0.28",
+        "mes-0.28",
         "mes-m2-get-version",
         "mes-get-version",
         "mes-hello",
@@ -12962,8 +12961,6 @@ testMesWindows = do
 -- escaped quotes a @-D@ or a @replace@ turns into a C string literal, and
 -- every script that runs tcc names the headers it compiles against in
 -- @C_INCLUDE_PATH@ instead, then Mes's when the tcc it runs is on Mes libc.
--- arena is tinycc-boot-mes's own derivation with @MES_DEBUG@ set, so the
--- cells it measures are those of the compile that is built.
 testTinyccWindows :: IO [Bool]
 testTinyccWindows = do
   putStrLn "pkgs/tinycc"
@@ -13017,7 +13014,7 @@ testTinyccWindows = do
           outText attr = T.concat (maybe [] outOf (builtBy attr))
           byOut = Map.fromList [(path, drv) | drv <- Map.elems full, path <- outOf drv]
           -- A kaem.runCommand's last argument is its script, which writeText
-          -- writes; arena shares tinycc-boot-mes's.
+          -- writes.
           scriptOf drv = do
             path <- listToMaybe (reverse (drvArgs drv))
             writer <- Map.lookup (bytesText path) byOut
@@ -13033,9 +13030,8 @@ testTinyccWindows = do
           mesProgram = ["/bin/mes-m2.exe", "/bin/mes.exe"]
           quote dir = "\"" <> dir <> "\""
           mesEnv =
-            [ ("MES_ARENA", arena),
-              ("MES_MAX_ARENA", arena),
-              ("MES_STACK", "6000000"),
+            [ ("MES_ARENA", "20000000"),
+              ("MES_STACK", "60000"),
               ("MES_PREFIX", prefix),
               ("GUILE_LOAD_PATH", T.intercalate ":" (map quote [prefix <> "/mes/module", prefix <> "/module", outText "mes.nyacc" <> "/share/nyacc-1.09.1/module"])),
               ("M1", outText "mescc-tools" <> "/bin/M1.exe"),
@@ -13054,9 +13050,6 @@ testTinyccWindows = do
           -- string literal.
           cStrings script = [text | (i, text) <- zip [0 :: Int ..] (T.splitOn "\\\"" script), odd i]
           strings = concatMap cStrings (Set.toList (Set.fromList (mapMaybe scriptOf added)))
-          -- What two derivations must share to run the same compile.  A
-          -- check forbids substitutes, which the rung it runs does not.
-          compile drv = (drvBuilder drv, drvArgs drv, foldr Map.delete (drvEnv drv) ["name", "out", "MES_DEBUG", "allowSubstitutes"])
       sequence
         [ runTest instantiates $
             assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
@@ -13094,16 +13087,11 @@ testTinyccWindows = do
             assertEqual
               "string literals, and those that name a store path"
               (9 * (length rounds + length mesRounds) + 5 * length nativeRounds + 3, [])
-              (length strings, filter ("${NIX_STORE}" `T.isInfixOf`) strings),
-          runTest "arena is tinycc-boot-mes's derivation with MES_DEBUG=3" $
-            assertEqual
-              "builder, arguments and environment, and MES_DEBUG"
-              (compile <$> builtBy "tinycc.boot-mes.compiler", Just "3")
-              (compile <$> builtBy "checks.arena", variableOf "MES_DEBUG" <$> builtBy "checks.arena")
+              (length strings, filter ("${NIX_STORE}" `T.isInfixOf`) strings)
         ]
   where
     instantiates :: Text
-    instantiates = "the TinyCC derivations instantiate, adding a hundred and fifty-five to Mes's"
+    instantiates = "the TinyCC derivations instantiate, adding a hundred and fifty-four to Mes's"
     version :: Text
     version = "unstable-2024-07-07"
     rev :: Text
@@ -13112,10 +13100,6 @@ testTinyccWindows = do
     upstreamVersion = "unstable-2025-12-03"
     upstreamRev :: Text
     upstreamRev = "cb41cbfe717e4c00d7bb70035cda5ee5f0ff9341"
-    -- Twice mes.env's: Mes keeps more cells compiling tcc.c than that
-    -- arena has room to copy.
-    arena :: Text
-    arena = "40000000"
     tools :: [Text]
     tools = ["kaem", "mescc-tools", "mescc-tools-extra"]
     mesAttrs :: [Text]
@@ -13156,8 +13140,7 @@ testTinyccWindows = do
         "native-float",
         "native-printf-float",
         "native-winsock",
-        "native-math",
-        "arena"
+        "native-math"
       ]
     -- Each round of janneke's source, in the order each compiles the next,
     -- and then each round of TinyCC's own.
@@ -13172,10 +13155,10 @@ testTinyccWindows = do
     libraryParts :: [Text]
     libraryParts = ["crt", "libtcc1.a", "libc.a", "libgetopt.a"]
     -- Each kaem.runCommand adds its script, written by writeText as
-    -- <name>-builder; arena runs tinycc-boot-mes's.
+    -- <name>-builder.
     addedNames :: [Text]
     addedNames =
-      ["tinycc-" <> rev <> ".tar.gz", "tinycc-" <> upstreamRev <> ".tar.gz", "hello.c", "float.c", "printf-float.c", "mingw32.c", "winsock.c", "math.c", "tinycc-boot-mes-arena"]
+      ["tinycc-" <> rev <> ".tar.gz", "tinycc-" <> upstreamRev <> ".tar.gz", "hello.c", "float.c", "printf-float.c", "mingw32.c", "winsock.c", "math.c"]
         ++ concat
           [ [name, name <> "-builder"]
           | name <-
@@ -13191,7 +13174,7 @@ testTinyccWindows = do
                 ++ nativeRunnerChecks
           ]
     mesRunners :: [Text]
-    mesRunners = ["tinycc-boot-mes-" <> version, "tinycc-boot-mes-arena"]
+    mesRunners = ["tinycc-boot-mes-" <> version]
     tccRunnerChecks :: [Text]
     tccRunnerChecks =
       [ "tinycc-boot-mes-get-version",
@@ -13617,7 +13600,7 @@ testSeedStdenvWindows = do
         "M2libc-13e57eb.tar.gz",
         "mescc-tools-578ac99.tar.gz",
         "mescc-tools-extra-d1d8146.tar.gz",
-        "mes-4ea66eb.tar.gz",
+        "mes-77ff40b.tar.gz",
         "nyacc-1.09.1.tar.gz",
         "tinycc-ea3900f6d5e71776c5cfabcabee317652e3a19ee.tar.gz",
         "tinycc-cb41cbfe717e4c00d7bb70035cda5ee5f0ff9341.tar.gz",

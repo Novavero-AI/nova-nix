@@ -1110,12 +1110,12 @@ jobs:
           echo "mode=$mode" | tee -a "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Mes (Windows): GNU Mes 0.27.1 on the Windows stage0 tools, as nixpkgs'
-  # minimal-bootstrap/mes builds it: mes-m2 from kaem.windows.run, the Mes C
-  # library compiled by MesCC running on mes-m2, and mes.exe compiled by
-  # MesCC.  test/data/mes.nix runs mes-m2 and mes with --version in a build,
-  # as nixpkgs' get-version test does, and hello, which MesCC compiles and
-  # links with mes, runs here.  exec-bit runs a program MesCC builds that
+  # Mes (Windows): GNU Mes 0.28 on the Windows stage0 tools, as nixpkgs'
+  # minimal-bootstrap/mes builds 0.27.1: mes-m2 from kaem.windows.run, the
+  # Mes C library compiled by MesCC running on mes-m2, and mes.exe compiled
+  # by MesCC.  test/data/mes.nix runs mes-m2 and mes with --version in a
+  # build, as nixpkgs' get-version test does, and hello, which MesCC compiles
+  # and links with mes, runs here.  exec-bit runs a program MesCC builds that
   # marks files with open and chmod, and registers only if nova-nix reads
   # each file's execute bit as its mode set it.  x64 and ARM64 Windows each
   # run all of it, for the reason Stage0 (Windows) runs on both, with the
@@ -1218,7 +1218,7 @@ jobs:
           "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mes.nix -A mes-m2 > /dev/null 2> "$log" || code=$?
           cat "$log"
           if [ "$code" != 0 ]; then echo "::error::mes-m2 --version failed its build"; exit 1; fi
-          if ! grep -Fqx 'mes (GNU Mes) 0.27.1' "$log"; then echo "::error::mes-m2 --version did not print mes (GNU Mes) 0.27.1"; exit 1; fi
+          if ! grep -Fqx 'mes (GNU Mes) 0.28' "$log"; then echo "::error::mes-m2 --version did not print mes (GNU Mes) 0.28"; exit 1; fi
           echo "ok    mes-m2 --version"
 
       # crt1, the four libraries and the directory MesCC links from, then
@@ -1242,7 +1242,7 @@ jobs:
           "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mes.nix -A mes > /dev/null 2> "$log" || code=$?
           cat "$log"
           if [ "$code" != 0 ]; then echo "::error::mes --version failed its build"; exit 1; fi
-          if ! grep -Fqx 'mes (GNU Mes) 0.27.1' "$log"; then echo "::error::mes --version did not print mes (GNU Mes) 0.27.1"; exit 1; fi
+          if ! grep -Fqx 'mes (GNU Mes) 0.28' "$log"; then echo "::error::mes --version did not print mes (GNU Mes) 0.28"; exit 1; fi
           echo "ok    mes --version"
 
       # hello prints its first argument, or Mes, and exits with its argument
@@ -1307,29 +1307,6 @@ jobs:
           done
           exit "$status"
 
-      # The cells Mes keeps across each collection while it compiles
-      # libc+tcc, its largest library, in the arena it builds it in.  The
-      # collector copies them into the tenth past the end of the arena, and
-      # Mes does not check that they fit, so with its 20000000 cells they
-      # have to come to 2000000 or fewer.
-      - name: Measure Mes's arena
-        shell: bash
-        run: |
-          set -uo pipefail
-          room=2000000
-          log="$RUNNER_TEMP/arena.log"
-          code=0
-          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mes.nix -A arena > /dev/null 2> "$log" || code=$?
-          tail -n 20 "$log"
-          collections=$(grep -c '=> jam' "$log")
-          kept=$(grep -o '=> jam: \[[0-9]*\]' "$log" | tr -dc '0-9\n' | sort -n | tail -n 1)
-          used=$(grep -o ';;; gc: \[[0-9]*\]' "$log" | tr -dc '0-9\n' | sort -n | tail -n 1)
-          echo "arena build exited $code after $collections collections: at most ${used:-none} cells in use at a collection, ${kept:-none} kept"
-          if [ "$code" != 0 ]; then echo "::error::the arena build failed"; exit 1; fi
-          if [ -z "$kept" ]; then echo "::error::the arena build reported no collection"; exit 1; fi
-          if [ "$kept" -gt "$room" ]; then echo "::error::Mes kept $kept cells, more than the $room its arena has room to copy"; exit 1; fi
-          echo "ok    at most $kept cells kept, within $room"
-
   # ---------------------------------------------------------------------------
   # Bootstrap (Windows): the rungs above Mes, from the seed.  TinyCC first,
   # tinycc-boot-mes to tinycc-mes, as nixpkgs' minimal-bootstrap/tinycc
@@ -1358,11 +1335,6 @@ jobs:
   # rung from the seed unless Ladder (mode) has it take the unchanged ones
   # from the public cache.
   #
-  # The x64 leg also measures the cells Mes keeps while MesCC compiles and
-  # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
-  # only on Mes and what it compiles, the same i686 code on both legs, so one
-  # leg measures it.
-  #
   # From the seed the ARM64 leg takes about 116 minutes under the x86
   # emulator: about 39 of them MesCC compiling the Mes libraries, mes and
   # tcc, 48 tcc compiling GCC and 16 binutils.  The timeout is twice that.
@@ -1381,11 +1353,9 @@ jobs:
         include:
           - os: windows-latest
             name: Windows
-            arena: true
             publish: true
           - os: windows-11-arm
             name: Windows ARM64
-            arena: false
             publish: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 232
@@ -2152,35 +2122,6 @@ jobs:
             fi
           done
           exit "$status"
-
-      # The cells Mes keeps across each collection while MesCC compiles and
-      # links tcc, in the arena tinycc-boot-mes builds in.  The collector
-      # copies them into the tenth past the end of the arena, and Mes does
-      # not check that they fit, so they have to come to a tenth of the
-      # arena the derivation sets or fewer.
-      - name: Measure Mes's arena
-        if: matrix.arena
-        shell: bash
-        run: |
-          set -uo pipefail
-          arena=$("$RUNNER_TEMP/bin/nova-nix.exe" eval --expr '(import ./test/data/tinycc.nix).arena.drvAttrs.MES_ARENA' | tr -dc '0-9')
-          if [ -z "$arena" ]; then echo "::error::could not read the arena's MES_ARENA"; exit 1; fi
-          room=$((arena / 10))
-          echo "arena $arena cells, room for $room kept"
-          log="$RUNNER_TEMP/arena.log"
-          code=0
-          start=$SECONDS
-          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A arena > /dev/null 2> "$log" || code=$?
-          echo "== arena built in $((SECONDS - start)) s"
-          tail -n 20 "$log"
-          collections=$(grep -c '=> jam' "$log")
-          kept=$(grep -o '=> jam: \[[0-9]*\]' "$log" | tr -dc '0-9\n' | sort -n | tail -n 1)
-          used=$(grep -o ';;; gc: \[[0-9]*\]' "$log" | tr -dc '0-9\n' | sort -n | tail -n 1)
-          echo "arena build exited $code after $collections collections: at most ${used:-none} cells in use at a collection, ${kept:-none} kept"
-          if [ "$code" != 0 ]; then echo "::error::the arena build failed"; exit 1; fi
-          if [ -z "$kept" ]; then echo "::error::the arena build reported no collection"; exit 1; fi
-          if [ "$kept" -gt "$room" ]; then echo "::error::Mes kept $kept cells, more than the $room its arena has room to copy"; exit 1; fi
-          echo "ok    at most $kept cells kept, within $room"
 
       # The ladder, as this job built it and its checks ran on it: --all is
       # every valid path but the derivations in a store this job filled

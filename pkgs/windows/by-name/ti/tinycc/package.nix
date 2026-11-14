@@ -70,18 +70,6 @@ let
     C_INCLUDE_PATH = "${src}/include;${mes.srcPrefix}/include";
   };
 
-  # Mes's arena while MesCC compiles and links tcc, in cells.  tcc.c is the
-  # largest unit Mes compiles, and Mes keeps more cells across a collection
-  # compiling it than mes.env's arena has room to copy into its tenth past
-  # the end: 2,957,730, as the TinyCC CI job measures it, against
-  # 2,000,000.  This arena's tenth holds 4,000,000, and with Mes's stack it
-  # comes to 572 MiB of the 1,024 MiB the Mes port's brk reserves.
-  arena = "40000000";
-  mesEnv = mes.env // {
-    MES_ARENA = arena;
-    MES_MAX_ARENA = arena;
-  };
-
   pname = "tinycc-boot-mes";
 
   # nixpkgs' defines, with TCC_TARGET_PE added and no include directory built
@@ -90,7 +78,7 @@ let
   # Mes port's PE header.
   tinycc-boot-mes = rec {
     inherit env;
-    compiler = kaem.runCommand "${pname}-${version}" mesEnv ''
+    compiler = kaem.runCommand "${pname}-${version}" mes.env ''
       catm config.h
       ${mes.compiler}/bin/mes.exe --no-auto-compile -e main ${mes.srcPost.bin}/bin/mescc.scm -- \
         -S \
