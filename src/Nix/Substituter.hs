@@ -112,7 +112,7 @@ import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Realise (Fallback (..), Offer (..))
-import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarStream, unpackNarEntry, volumeCaseHack)
+import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash, spName), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
@@ -179,7 +179,9 @@ data SubstResult
     SubstNotFound
   | -- | A cache failed to deliver the path and no cache supplied it, with
     -- the first failure: the narinfo query, the download, or its
-    -- verification.  Upstream's failed substitution.
+    -- verification.  Upstream's failed substitution.  Or the store is
+    -- one upstream Nix's database may also manage, refused before any
+    -- cache is asked ("Nix.Store.Upstream").
     SubstError !Text
   deriving (Eq, Show)
 
@@ -204,6 +206,12 @@ data SubstResult
 -- registered - the caller records the returned t'PathRegistration'.
 -- Every narinfo and NAR request runs under upstream's retry policy,
 -- 'defaultFetchRetryPolicy'.
+--
+-- Given a cache to ask, a store upstream Nix's database may also manage
+-- is refused ('SubstError') before the lock is taken and before the
+-- cache is asked ("Nix.Store.Upstream"): the destination is cleared
+-- before unpacking, and a path upstream registered has no row here.
+-- With no cache, nothing is written and the answer is 'SubstNotFound'.
 trySubstitute :: Store -> [CacheConfig] -> StorePath -> IO SubstResult
 trySubstitute = trySubstituteWith defaultFetchRetryPolicy ioRetryEffects
 
@@ -214,12 +222,16 @@ trySubstitute = trySubstituteWith defaultFetchRetryPolicy ioRetryEffects
 trySubstituteWith :: FetchRetryPolicy -> RetryEffects IO -> Store -> [CacheConfig] -> StorePath -> IO SubstResult
 trySubstituteWith _ _ _ [] _ = pure SubstNotFound
 trySubstituteWith policy effects store caches sp = do
-  -- Reuse the process-global TLS manager (connection pooling / keep-alive)
-  -- rather than creating a fresh one per call and per output.
-  manager <- HTTPS.getGlobalManager
-  lock <- acquirePathLock (stDir store) sp
-  substituteLocked manager lock `onException` releasePathLock lock
+  refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (stDir store)
+  maybe substitute (pure . SubstError) refusal
   where
+    substitute = do
+      -- Reuse the process-global TLS manager (connection pooling /
+      -- keep-alive) rather than creating a fresh one per call and per
+      -- output.
+      manager <- HTTPS.getGlobalManager
+      lock <- acquirePathLock (stDir store) sp
+      substituteLocked manager lock `onException` releasePathLock lock
     substituteLocked manager lock = do
       valid <- isValid store sp
       if valid
@@ -476,12 +488,18 @@ unpackAndVerify store sp narInfo rawNar =
 -- registration from the references and deriver.  Follows the same
 -- per-path lock protocol as the live pipeline: the lock is taken
 -- before the stale destination is cleared, validity re-checks under
--- it, and a success carries the lock still held.
+-- it, and a success carries the lock still held.  A store upstream
+-- Nix's database may also manage is refused before the lock, as the
+-- live pipeline refuses it.
 unpackVerifiedNar :: Store -> StorePath -> VerifiedNar -> [StorePath] -> Maybe Text -> IO SubstResult
 unpackVerifiedNar store sp verified refs deriver =
   case NAR.deserialise (verifiedNarBytes verified) of
     Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
     Right narEntry -> do
+      refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (stDir store)
+      maybe (unpackUnderLock narEntry) (pure . SubstError) refusal
+  where
+    unpackUnderLock narEntry = do
       lock <- acquirePathLock (stDir store) sp
       result <- unpackLocked narEntry lock `onException` releasePathLock lock
       case result of
@@ -489,7 +507,6 @@ unpackVerifiedNar store sp verified refs deriver =
         other -> do
           releasePathLock lock
           pure other
-  where
     digest = verifiedNarDigest verified
     destPath = storePathToFilePath (stDir store) sp
     unpackLocked narEntry lock = do

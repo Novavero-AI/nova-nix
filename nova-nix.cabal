@@ -97,6 +97,7 @@ library
     Nix.Store.CaseSensitive
     Nix.Store.EntryName
     Nix.Store.ExecBit
+    Nix.Store.Upstream
     Nix.DependencyGraph
     Nix.Derivation
     Nix.Derivation.StructuredAttrs

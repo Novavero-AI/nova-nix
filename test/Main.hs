@@ -15678,6 +15678,184 @@ testStoreGCUpstreamManaged = do
   Dir.removePathForcibly root
   pure results
 
+-- | Builds, substitutions, the restore of evaluation's sources and an
+-- evaluation's own store writes in a store whose directory upstream
+-- Nix's database also manages, laid out as upstream lays out a store
+-- under a root: each refuses before it writes, the tree upstream left
+-- at the path it would write stays, the substitution asks no cache, and
+-- an evaluation that writes nothing still evaluates.  A sibling store
+-- under the same directory is written as before, from the same cache,
+-- over the same leftover trees and by the same expressions, which is
+-- what makes the cache's silence and the unchanged trees mean something.
+testStoreWritesUpstreamManaged :: IO [Bool]
+testStoreWritesUpstreamManaged = do
+  putStrLn "store/writes-upstream-managed"
+  case signedNarInfo of
+    Left err -> (: []) <$> runTest "upstream-managed writes setup" (Fail (T.pack err))
+    Right (publicKey, narInfo) -> do
+      tmpBase <- getTemporaryDirectory
+      let root = tmpBase </> "nova-nix-test-upstream-writes"
+          upstreamDb = root </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite"
+          cache base = Subst.CacheConfig base [publicKey] 40
+          route path _
+            | path == narInfoTarget = Send (httpResponse "200 OK" (TE.encodeUtf8 (NarInfo.renderNarInfo narInfo)))
+            | path == narTarget = Send (httpResponse "200 OK" nar)
+            | otherwise = Send (httpResponse "500 Internal Server Error" "unexpected request")
+          -- A leftover tree at each path a store's operations write, as
+          -- upstream would have registered it, in place of whatever an
+          -- earlier case left there (a substitute or a build output,
+          -- sealed read-only).
+          planted sd = do
+            mapM_
+              ( \sp -> do
+                  Dir.removePathForcibly (storePathToFilePath sd sp)
+                  createDirectoryIfMissing True (storePathToFilePath sd sp)
+                  BS.writeFile (storePathToFilePath sd sp </> "data") upstreamBytes
+              )
+              [substPath, builtPath]
+            pure sd
+          withPlantedStore dir action = do
+            sd <- planted (StoreDir (root </> "nix" </> dir))
+            bracket (openStore sd) closeStore $ \store ->
+              action store (defaultBuildConfig (stDir store))
+          kept store sp = (== Right upstreamBytes) <$> (try (BS.readFile (storePathToFilePath (stDir store) sp </> "data")) :: IO (Either IOException BS.ByteString))
+          -- The refusal names upstream's database and this store's
+          -- directory as the handle spells it, and what a write would do.
+          refuses store msg = all (`T.isInfixOf` msg) ["upstream Nix's database", "db.sqlite", "' also manages the store '" <> T.pack (unStoreDir (stDir store)) <> "'", "nova-nix would replace those paths as unregistered"]
+          releaseHeld result = case result of
+            Subst.SubstSuccess _ lock -> releasePathLock lock
+            _ -> pure ()
+          -- Each expression's relative path names the source directory
+          -- under the root.
+          evalIn store = evalNixIOStore (stDir store) root
+          landsIn store value = case value of
+            Right (VStr bytes _) | Right text <- TE.decodeUtf8' bytes -> Dir.doesPathExist (storeTextToFilePath (stDir store) text)
+            _ -> pure False
+      forceRemoveIfExists root
+      createDirectoryIfMissing True (takeDirectory upstreamDb)
+      BS.writeFile upstreamDb ""
+      createDirectoryIfMissing True (root </> "source")
+      BS.writeFile (root </> "source" </> "hello.txt") "hello"
+      results <-
+        sequence
+          [ -- The realisation is given the cache: refused only where it
+            -- builds, it would ask the cache about the output first.
+            runTestM "a build, a check and a realisation refuse a store upstream's database manages before they ask a cache, and leave its tree" $
+              withHttpServer route $ \base requests _ ->
+                withPlantedStore "store" $ \store config -> do
+                  built <- buildDerivation config store buildDrv testDrvPath
+                  checked <- checkDerivation config store buildDrv testDrvPath
+                  realised <- buildWithDeps config {bcCaches = [cache base]} store buildDrv testDrvPath
+                  seen <- requests
+                  treeKept <- kept store builtPath
+                  pure $ case (built, checked, realised) of
+                    (BuildFailure b 1, Left c, BuildFailure r 1) | all (refuses store) [b, c, r], null seen, treeKept -> Pass
+                    other -> Fail ("expected three refusals and no request, got: " <> T.pack (show (other, seen, treeKept))),
+            runTestM "a substitution refuses a store upstream's database manages before it asks a cache, and leaves its tree" $
+              withHttpServer route $ \base requests _ ->
+                withPlantedStore "store" $ \store _ -> do
+                  -- A substitution that went ahead holds the path's lock,
+                  -- which the next one would wait on forever.
+                  streamed <- Subst.trySubstitute store [cache base] substPath
+                  releaseHeld streamed
+                  unpacked <- Subst.unpackAndVerify store substPath narInfo nar
+                  releaseHeld unpacked
+                  seen <- requests
+                  treeKept <- kept store substPath
+                  pure $ case (streamed, unpacked) of
+                    (Subst.SubstError s, Subst.SubstError u) | refuses store s, refuses store u, null seen, treeKept -> Pass
+                    other -> Fail ("expected two refusals and no request, got: " <> T.pack (show (other, seen, treeKept))),
+            runTestM "restoring evaluation's sources refuses a store upstream's database manages" $
+              withPlantedStore "store" $ \store _ -> do
+                restored <- try (materializeEvalSources store Map.empty)
+                pure $ case restored of
+                  Left (err :: IOException) | refuses store (T.pack (ioeGetErrorString err)) -> Pass
+                  other -> Fail ("expected the refusal, got: " <> T.pack (show other)),
+            runTestM "an evaluation's store writes refuse a store upstream's database manages and write nothing, and one that writes nothing evaluates" $
+              withPlantedStore "store" $ \store _ -> do
+                before <- Dir.listDirectory (unStoreDir (stDir store))
+                written <- mapM (evalIn store) evalWrites
+                computed <- evalIn store writesNothing
+                after <- Dir.listDirectory (unStoreDir (stDir store))
+                pure $ case (written, computed) of
+                  ([Left toFile, Left copied], Right (VStr _ _))
+                    | refuses store toFile, refuses store copied, sort before == sort after -> Pass
+                  other -> Fail ("expected two refusals and the derivation path, got: " <> T.pack (show (other, before, after))),
+            -- Upstream keeps a store only in a directory named nix/store,
+            -- so a store beside it is nova-nix's alone.
+            runTestM "a sibling store under the same directory substitutes and builds over its leftovers" $
+              withHttpServer route $ \base requests _ ->
+                withPlantedStore "nova-store" $ \store config -> do
+                  restored <- try (materializeEvalSources store Map.empty) :: IO (Either IOException ())
+                  substituted <- Subst.trySubstitute store [cache base] substPath
+                  fetched <- case substituted of
+                    Subst.SubstSuccess _ lock -> do
+                      releasePathLock lock
+                      Right <$> BS.readFile (storePathToFilePath (stDir store) substPath </> "data")
+                    other -> pure (Left other)
+                  built <- buildDerivation config store buildDrv testDrvPath
+                  builtFile <- Dir.doesFileExist (storePathToFilePath (stDir store) builtPath)
+                  seen <- requests
+                  pure $ case (restored, fetched, built) of
+                    (Right (), Right bytes, BuildSuccess _)
+                      | bytes == cacheBytes, builtFile, seen == [narInfoTarget, narTarget] -> Pass
+                    other -> Fail ("expected the sibling written, got: " <> T.pack (show (other, builtFile, seen))),
+            runTestM "a sibling store under the same directory takes an evaluation's store writes" $
+              withPlantedStore "nova-store" $ \store _ -> do
+                written <- mapM (evalIn store) evalWrites
+                landed <- mapM (landsIn store) written
+                pure $ if and landed then Pass else Fail ("expected both writes in the sibling, got: " <> T.pack (show written))
+          ]
+      forceRemoveIfExists root
+      pure results
+  where
+    upstreamBytes = "upstream's" :: BS.ByteString
+    cacheBytes = "the cache's" :: BS.ByteString
+    -- The two kinds of eval-time write: text the expression holds, and a
+    -- tree copied from disk.
+    evalWrites = ["builtins.toFile \"greeting\" \"hello\"", "builtins.path { path = ./source; name = \"source\"; }"]
+    -- A derivation's store path, with a source coerced to its own store
+    -- path on the way, which evaluation computes without writing either.
+    writesNothing = "(derivation { name = \"greeting\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; src = ./source; }).drvPath"
+    substHash = T.replicate 32 "w"
+    substPath = StorePath substHash "upstream-hello"
+    builtPath = StorePath (T.replicate 32 "x") "upstream-greeting"
+    narInfoTarget = "/" <> TE.encodeUtf8 substHash <> ".narinfo"
+    narTarget = "/nar/upstream-hello.nar"
+    nar = NAR.serialise (NAR.NarDirectory [("data", NAR.NarRegular False cacheBytes)])
+    signedNarInfo = do
+      secretKey <- Signing.parseSecretKey sigTestKeyText
+      publicKey <- Signing.toPublicKey secretKey
+      let unsigned =
+            NarInfo.NarInfo
+              { NarInfo.niStorePath = "/nix/store/" <> substHash <> "-upstream-hello",
+                NarInfo.niUrl = "nar/upstream-hello.nar",
+                NarInfo.niCompression = "none",
+                NarInfo.niFileHash = Nothing,
+                NarInfo.niFileSize = Nothing,
+                NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes nar),
+                NarInfo.niNarSize = fromIntegral (BS.length nar),
+                NarInfo.niReferences = [],
+                NarInfo.niDeriver = Nothing,
+                NarInfo.niSigs = [],
+                NarInfo.niCA = Nothing
+              }
+      sig <- Signing.sign secretKey unsigned
+      pure (Signing.renderPublicKey publicKey, unsigned {NarInfo.niSigs = [sig]})
+    (builder, builderArgs)
+      | SI.os == "mingw32" = ("cmd.exe", ["/c", "echo built>%out%"])
+      | otherwise = ("/bin/sh", ["-c", "echo built > $out"])
+    buildDrv =
+      Derivation
+        { drvOutputs = [DerivationOutput "out" builtPath "" ""],
+          drvInputDrvs = Map.empty,
+          drvInputSrcs = [],
+          drvPlatform = currentPlatform,
+          drvBuilder = builder,
+          drvArgs = builderArgs,
+          drvEnv = Map.singleton "name" "upstream-greeting"
+        }
+
 testStoreOps :: IO [Bool]
 testStoreOps = do
   putStrLn "store/ops"
@@ -21390,6 +21568,7 @@ runSuite = do
           testGcPure,
           testStoreGC,
           testStoreGCUpstreamManaged,
+          testStoreWritesUpstreamManaged,
           testSymlinkWalksIO,
           testLinkOrdering,
           testFromATerm,

@@ -81,6 +81,7 @@ module Nix.Store
     module Nix.Store.CaseSensitive,
     module Nix.Store.Handle,
     module Nix.Store.GC,
+    module Nix.Store.Upstream,
   )
 where
 
@@ -112,6 +113,7 @@ import Nix.Store.Handle
 import Nix.Store.Lock
 import Nix.Store.Path
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode, createSymlinkOfKind)
+import Nix.Store.Upstream
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NAR.Stream as Stream
@@ -997,9 +999,14 @@ sinkNarStream sink source = go Hash.hashInit 0 Stream.narStream `onException` ab
 -- its @source@ fixed-output store path (text only - eval performs no
 -- store writes).  Each entry not already valid is restored from a dump
 -- of its source ('restoreSource'), made read-only, and registered.  A
--- source carries no references.
+-- source carries no references.  A store upstream Nix's database may
+-- also manage is refused before any entry is looked at, by an
+-- 'IOException' carrying the reason ("Nix.Store.Upstream"): a tree on
+-- disk with no row here is cleared unless it reproduces its address.
 materializeEvalSources :: Store -> Map Text Text -> IO ()
-materializeEvalSources store sourceCache = mapM_ adopt (Map.toList sourceCache)
+materializeEvalSources store sourceCache = do
+  refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (stDir store)
+  maybe (mapM_ adopt (Map.toList sourceCache)) (throwIO . userError . T.unpack) refusal
   where
     -- Each source registers IMMEDIATELY after its restore (sources carry
     -- no cross-references, so there is nothing to batch).  A tree already
