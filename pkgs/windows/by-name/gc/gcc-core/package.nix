@@ -255,4 +255,7 @@ seedStdenv.mkDerivation {
     mpfrSrc
     mpcSrc
   ];
+  # The directories gmpSrc, mpfrSrc and mpcSrc unpack to are named for
+  # these, and gcc46-cxx unpacks the same archives.
+  inherit gmpVersion mpfrVersion mpcVersion;
 }

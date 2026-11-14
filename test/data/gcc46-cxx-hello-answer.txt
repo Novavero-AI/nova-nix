@@ -1,0 +1,12 @@
+hello from g++
+rectangle 12
+square 25
+55 toolchain parts
+caught bottom with 0 frames live
+caught a square of area 4
+hello.exe exits 0
+	DLL Name: KERNEL32.dll
+	DLL Name: msvcrt.dll
+T __Unwind_SjLj_RaiseException
+T ___cxa_throw
+T ___gxx_personality_sj0
