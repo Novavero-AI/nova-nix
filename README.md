@@ -286,8 +286,10 @@ $ nova-nix build -o result --expr '(import ./nixpkgs { }).hello' --substituter h
 $ ./result/bin/hello
 ```
 
-`nova-nix --help` lists the other commands, among them `push`, which uploads
-store paths and their closures to a [nova-cache] server.
+`nova-nix --help` lists the other commands, among them `trust`, which reports
+the fixed-output derivations a build relies on and which of them hold prebuilt
+code, and `push`, which uploads store paths and their closures to a
+[nova-cache] server.
 
 ## What is missing
 

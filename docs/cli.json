@@ -145,6 +145,56 @@
       ]
     },
     {
+      "description": "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, and reports what the closure of the derivation that results relies on. A closure bottoms out in fixed-output derivations, whose outputs are held to the hash their recipe states, whether a builtin fetches them or the closure builds them. First come those a build runs as builders, where a derivation's builder is inside one's output, or inside the tree a builtin such as `builtin:unpack` makes from it and any others; then those whose files hold prebuilt code, each with the files found; then those not fully read, each with what was not. Each says whether a builtin fetched it or the closure built it, and names any other with the same hash. Then come how many hold no prebuilt code, the builders the closure does not contain, such as a program on the host, the builders in its input sources, the builtins nova-nix runs itself, and how many input sources its derivations take, store paths none of them builds. A fixed-output derivation whose builder is a builtin and which has no inputs is fetched first, or downloaded from a substituter, so that its bytes can be read; any other is read only when the store already holds it, since making it would run its builder. The scan finds prebuilt code by its header: a PE image, an ELF or Mach-O file, a COFF object, or an ar archive, whose members it does not read. It looks in a fetched file, in each file of a fetched tree, and in each file of a tar archive, plain or compressed with gzip, bzip2, xz or zstd, that one of those is; it does not open an archive inside another, and it reports a file in another archive format it knows, such as zip, as not read. It reports what the closure relies on, not whether any of it is safe. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is fetched or read.",
+      "examples": [
+        {
+          "arguments": [
+            "trust",
+            "pkgs/windows/hello.nix",
+            "--substituter",
+            "https://cache.novavero.ai",
+            "--trusted-key",
+            "cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ="
+          ],
+          "command": "nova-nix trust pkgs/windows/hello.nix --substituter https://cache.novavero.ai --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=",
+          "description": "Report what GNU Hello for Windows relies on, from the directory a release unpacks to, with the public cache as a substituter.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "trust",
+            "--expr",
+            "derivation { name = \"greeting\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"echo hello > $out\" ]; }"
+          ],
+          "command": "nova-nix trust --expr 'derivation { name = \"greeting\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"echo hello > $out\" ]; }'",
+          "description": "Report what a derivation written inline relies on: its builder, `/bin/sh`, is a program on the host.",
+          "output": [
+            "Fixed-output inputs run as builders: 0",
+            "Fixed-output inputs holding prebuilt code: 0",
+            "Fixed-output inputs not fully read: 0",
+            "Fixed-output inputs holding no prebuilt code: 0",
+            "Builders outside the closure: 1",
+            "  /bin/sh, for 1 derivation",
+            "Builders in input sources: 0",
+            "Builtin builders: 0",
+            "Input sources: 0",
+            "This reports what the closure relies on, not whether any of it is safe."
+          ]
+        }
+      ],
+      "name": "nova-nix trust",
+      "synopsis": [
+        {
+          "summary": "Report what a derivation's closure relies on",
+          "usage": "nova-nix trust FILE.nix"
+        },
+        {
+          "summary": "Report what an inline derivation's closure relies on",
+          "usage": "nova-nix trust --expr 'EXPR'"
+        }
+      ]
+    },
+    {
       "description": "Uploads the closure of each `PATH`, or with `--all` every valid path except derivations, to the nova-cache server at `URL`, which signs what it receives. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, every NAR is uploaded before any narinfo announces it, and a narinfo is read back to check that the server signed it. It prints how many paths it pushed and how many the cache already held.",
       "examples": [
         {
@@ -289,7 +339,8 @@
       "argument": "EXPR",
       "commands": [
         "nova-nix eval",
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix trust"
       ],
       "description": "Evaluate `EXPR` in place of a file; a relative path in it resolves against the working directory",
       "name": "--expr",
@@ -300,7 +351,8 @@
     {
       "argument": "ATTRPATH",
       "commands": [
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix trust"
       ],
       "description": "Select a dotted attribute path (`a.b.c`)",
       "name": "--attr",
@@ -347,7 +399,8 @@
       "argument": "NAME=PATH",
       "commands": [
         "nova-nix eval",
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix trust"
       ],
       "description": "Add search path (repeatable, merged with `NIX_PATH`)",
       "name": "--nix-path",
@@ -359,7 +412,8 @@
       "argument": null,
       "commands": [
         "nova-nix eval",
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix trust"
       ],
       "description": "Confine reads to the search path roots and what the evaluation itself writes; fetch only `allowed-uris`",
       "name": "--restrict-eval",
@@ -371,7 +425,8 @@
       "argument": null,
       "commands": [
         "nova-nix eval",
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix trust"
       ],
       "description": "Confine reads as `--restrict-eval` does, with no search path but the bundled `<nix/*>`, no `currentTime`, `currentSystem` or `storePath`, and pinned fetches only (`allowed-uris` applies only under `--restrict-eval`)",
       "name": "--pure-eval",
@@ -383,7 +438,8 @@
       "argument": null,
       "commands": [
         "nova-nix eval",
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix trust"
       ],
       "description": "Make `builtins.traceVerbose` behave as `builtins.trace`; without it, the first argument is never forced",
       "name": "--trace-verbose",
@@ -394,7 +450,8 @@
     {
       "argument": "URL",
       "commands": [
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix trust"
       ],
       "description": "Try this binary cache before building",
       "name": "--substituter",
@@ -405,7 +462,8 @@
     {
       "argument": "KEY",
       "commands": [
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix trust"
       ],
       "description": "Trust signatures by this public key (`NAME:BASE64`) from any substituter",
       "name": "--trusted-key",
@@ -416,7 +474,8 @@
     {
       "argument": null,
       "commands": [
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix trust"
       ],
       "description": "Build from source if substitution fails",
       "name": "--fallback",
@@ -506,6 +565,7 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix trust",
         "nova-nix push",
         "nova-nix store delete",
         "nova-nix store gc"
@@ -540,7 +600,7 @@
     }
   ],
   "global": {
-    "description": "nova-nix evaluates Nix expressions, builds derivations, pushes store paths to a binary cache and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
+    "description": "nova-nix evaluates Nix expressions, builds derivations, reports what a derivation's closure relies on, pushes store paths to a binary cache and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
     "examples": [
       {
         "arguments": [

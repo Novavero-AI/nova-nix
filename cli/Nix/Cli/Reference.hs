@@ -92,6 +92,7 @@ import qualified System.Info as SI
 data CommandName
   = EvalCommand
   | BuildCommand
+  | TrustCommand
   | PushCommand
   | StoreDeleteCommand
   | StoreGcCommand
@@ -154,6 +155,7 @@ commandWords :: CommandName -> [Text]
 commandWords name = case name of
   EvalCommand -> ["eval"]
   BuildCommand -> ["build"]
+  TrustCommand -> ["trust"]
   PushCommand -> ["push"]
   StoreDeleteCommand -> ["store", "delete"]
   StoreGcCommand -> ["store", "gc"]
@@ -188,7 +190,7 @@ globalForm =
   CommandEntry
     { commandForms = Form "COMMAND [FLAG...]" "Run one command, with the flags it takes" :| [],
       commandDescription =
-        "nova-nix evaluates Nix expressions, builds derivations, pushes store paths to a binary cache and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
+        "nova-nix evaluates Nix expressions, builds derivations, reports what a derivation's closure relies on, pushes store paths to a binary cache and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
       commandExamples =
         Example "Print the release this binary was built from." ("--version" :| []) []
           :| [Example "Print the commands, flags and settings." ("--help" :| []) []]
@@ -248,6 +250,34 @@ command name = case name of
                    "Check GNU Hello with the public cache as a substituter: Hello and what it is built from are downloaded where the cache holds them and built where it does not, then Hello is built again, and the command fails if its output comes out different."
                    ("build" :| ["pkgs/windows/hello.nix", "--check", "--substituter", "https://cache.novavero.ai", "--trusted-key", "cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ="])
                    []
+               ]
+      }
+  TrustCommand ->
+    CommandEntry
+      { commandForms =
+          Form "FILE.nix" "Report what a derivation's closure relies on"
+            :| [Form "--expr 'EXPR'" "Report what an inline derivation's closure relies on"],
+        commandDescription =
+          "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, and reports what the closure of the derivation that results relies on. A closure bottoms out in fixed-output derivations, whose outputs are held to the hash their recipe states, whether a builtin fetches them or the closure builds them. First come those a build runs as builders, where a derivation's builder is inside one's output, or inside the tree a builtin such as `builtin:unpack` makes from it and any others; then those whose files hold prebuilt code, each with the files found; then those not fully read, each with what was not. Each says whether a builtin fetched it or the closure built it, and names any other with the same hash. Then come how many hold no prebuilt code, the builders the closure does not contain, such as a program on the host, the builders in its input sources, the builtins nova-nix runs itself, and how many input sources its derivations take, store paths none of them builds. A fixed-output derivation whose builder is a builtin and which has no inputs is fetched first, or downloaded from a substituter, so that its bytes can be read; any other is read only when the store already holds it, since making it would run its builder. The scan finds prebuilt code by its header: a PE image, an ELF or Mach-O file, a COFF object, or an ar archive, whose members it does not read. It looks in a fetched file, in each file of a fetched tree, and in each file of a tar archive, plain or compressed with gzip, bzip2, xz or zstd, that one of those is; it does not open an archive inside another, and it reports a file in another archive format it knows, such as zip, as not read. It reports what the closure relies on, not whether any of it is safe. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is fetched or read.",
+        commandExamples =
+          Example
+            "Report what GNU Hello for Windows relies on, from the directory a release unpacks to, with the public cache as a substituter."
+            ("trust" :| ["pkgs/windows/hello.nix", "--substituter", "https://cache.novavero.ai", "--trusted-key", "cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ="])
+            []
+            :| [ Example
+                   "Report what a derivation written inline relies on: its builder, `/bin/sh`, is a program on the host."
+                   ("trust" :| ["--expr", "derivation { name = \"greeting\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"echo hello > $out\" ]; }"])
+                   [ "Fixed-output inputs run as builders: 0",
+                     "Fixed-output inputs holding prebuilt code: 0",
+                     "Fixed-output inputs not fully read: 0",
+                     "Fixed-output inputs holding no prebuilt code: 0",
+                     "Builders outside the closure: 1",
+                     "  /bin/sh, for 1 derivation",
+                     "Builders in input sources: 0",
+                     "Builtin builders: 0",
+                     "Input sources: 0",
+                     "This reports what the closure relies on, not whether any of it is safe."
+                   ]
                ]
       }
   PushCommand ->
@@ -363,9 +393,9 @@ globalFlags = filter ((== GlobalFlag) . flagScope . flag) flagNames
 flag :: FlagName -> FlagEntry
 flag name = case name of
   ExprFlag ->
-    long "expr" (Just "EXPR") "Evaluate `EXPR` in place of a file; a relative path in it resolves against the working directory" evalAndBuild
+    long "expr" (Just "EXPR") "Evaluate `EXPR` in place of a file; a relative path in it resolves against the working directory" evalBuildAndTrust
   AttrFlag ->
-    short 'A' "attr" (Just "ATTRPATH") "Select a dotted attribute path (`a.b.c`)" buildOnly
+    short 'A' "attr" (Just "ATTRPATH") "Select a dotted attribute path (`a.b.c`)" buildAndTrust
   OutLinkFlag ->
     short 'o' "out-link" (Just "PATH") "Create `PATH` as a symlink to the result and register it as a GC root" buildOnly
   StrictFlag ->
@@ -373,19 +403,19 @@ flag name = case name of
   AtermFlag ->
     long "aterm" Nothing "With `--expr`, print the derivation's `.drv` ATerm" evalOnly
   NixPathFlag ->
-    long "nix-path" (Just "NAME=PATH") "Add search path (repeatable, merged with `NIX_PATH`)" evalAndBuild
+    long "nix-path" (Just "NAME=PATH") "Add search path (repeatable, merged with `NIX_PATH`)" evalBuildAndTrust
   RestrictEvalFlag ->
-    long "restrict-eval" Nothing "Confine reads to the search path roots and what the evaluation itself writes; fetch only `allowed-uris`" evalAndBuild
+    long "restrict-eval" Nothing "Confine reads to the search path roots and what the evaluation itself writes; fetch only `allowed-uris`" evalBuildAndTrust
   PureEvalFlag ->
-    long "pure-eval" Nothing "Confine reads as `--restrict-eval` does, with no search path but the bundled `<nix/*>`, no `currentTime`, `currentSystem` or `storePath`, and pinned fetches only (`allowed-uris` applies only under `--restrict-eval`)" evalAndBuild
+    long "pure-eval" Nothing "Confine reads as `--restrict-eval` does, with no search path but the bundled `<nix/*>`, no `currentTime`, `currentSystem` or `storePath`, and pinned fetches only (`allowed-uris` applies only under `--restrict-eval`)" evalBuildAndTrust
   TraceVerboseFlag ->
-    long "trace-verbose" Nothing "Make `builtins.traceVerbose` behave as `builtins.trace`; without it, the first argument is never forced" evalAndBuild
+    long "trace-verbose" Nothing "Make `builtins.traceVerbose` behave as `builtins.trace`; without it, the first argument is never forced" evalBuildAndTrust
   SubstituterFlag ->
-    long "substituter" (Just "URL") "Try this binary cache before building" buildOnly
+    long "substituter" (Just "URL") "Try this binary cache before building" buildAndTrust
   TrustedKeyFlag ->
-    long "trusted-key" (Just "KEY") "Trust signatures by this public key (`NAME:BASE64`) from any substituter" buildOnly
+    long "trusted-key" (Just "KEY") "Trust signatures by this public key (`NAME:BASE64`) from any substituter" buildAndTrust
   FallbackFlag ->
-    long "fallback" Nothing "Build from source if substitution fails" buildOnly
+    long "fallback" Nothing "Build from source if substitution fails" buildAndTrust
   CheckFlag ->
     long "check" Nothing "Build the derivation again beside its valid outputs, and fail with status 104 if an output comes out different" buildOnly
   ExecWrapperFlag ->
@@ -401,7 +431,7 @@ flag name = case name of
   PrintRootsFlag ->
     long "print-roots" Nothing "List the roots as `LINK -> PATH` and delete nothing" (CommandFlag (StoreGcCommand :| []))
   StoreFlag ->
-    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, PushCommand, StoreDeleteCommand, StoreGcCommand]))
+    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand]))
   HelpFlag ->
     long "help" Nothing "Print the commands, flags and settings, and exit" GlobalFlag
   VersionFlag ->
@@ -412,7 +442,8 @@ flag name = case name of
     evalOnly = CommandFlag (EvalCommand :| [])
     buildOnly = CommandFlag (BuildCommand :| [])
     pushOnly = CommandFlag (PushCommand :| [])
-    evalAndBuild = CommandFlag (EvalCommand :| [BuildCommand])
+    buildAndTrust = CommandFlag (BuildCommand :| [TrustCommand])
+    evalBuildAndTrust = CommandFlag (EvalCommand :| [BuildCommand, TrustCommand])
 
 -- ---------------------------------------------------------------------------
 -- Configuration
