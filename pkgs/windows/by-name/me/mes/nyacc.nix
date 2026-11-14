@@ -4,8 +4,9 @@
 { fetchurl, kaem }:
 let
   pname = "nyacc";
-  # The version nixpkgs pairs with Mes 0.27.1: Mes's interpreter cannot parse
+  # The version nixpkgs pairs with Mes 0.27.1, whose interpreter cannot parse
   # the block comments outside top level that NYACC 1.09.2 and later have.
+  # Mes 0.28 asks for 0.99 or later (configure).
   version = "1.09.1";
 
   src = fetchurl {

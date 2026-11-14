@@ -13,10 +13,8 @@
 # which tinycc-native links with -lm and which prints the square root of
 # twice its argument count through msvcrt.dll's sqrt;
 # native-search-dirs, which prints the directories tinycc-native searches;
-# native-mingw32, which compiles only if tinycc-native predefines
-# __MINGW32__; and arena, tinycc-boot-mes's own derivation with MES_DEBUG=3,
-# which prints the cells Mes keeps across each collection while MesCC
-# compiles and links tcc.
+# and native-mingw32, which compiles only if tinycc-native predefines
+# __MINGW32__.
 let
   inherit (import ../../pkgs/windows) stage0-pe32 tinycc tinycc-mes tinycc-native;
   inherit (stage0-pe32) writeText;
@@ -169,13 +167,4 @@ in
   native-winsock =
     nativeProgram "tinycc-native-winsock" tinycc-native "winsock" winsockC [ "ws2_32" ];
   native-math = nativeProgram "tinycc-native-math" tinycc-native "math" mathC [ "m" ];
-
-  arena = derivation (
-    tinycc.boot-mes.compiler.drvAttrs
-    // {
-      name = "tinycc-boot-mes-arena";
-      MES_DEBUG = "3";
-      allowSubstitutes = false;
-    }
-  );
 }
