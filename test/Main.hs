@@ -12809,15 +12809,15 @@ testStage0Pe32Chain = do
               ]
         )
     fetchNames :: [Text]
-    fetchNames = sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-13e57eb.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "mescc-tools-extra-d1d8146.tar.gz", "stage0-pe32-ff1c2ad.tar.gz"]
+    fetchNames = sort ["M2-Planet-ee0bf91.tar.gz", "M2libc-ef9dfc2.tar.gz", "hex0-seed.exe", "mescc-tools-578ac99.tar.gz", "mescc-tools-extra-d1d8146.tar.gz", "stage0-pe32-a81c837.tar.gz"]
     -- The steps that build a C program on M2libc's POSIX layer, named for
     -- stem: the file each writes, the program it runs and its arguments.
     cProgram :: Text -> Text -> [Text] -> [(Text, [Text], [Text])]
     cProgram executable stem files =
       [ (stem <> ".M1", ["M2.exe"], ["--architecture", "x86", "-D", "__windows__=1"] ++ concatMap (\file -> ["-f", file]) files ++ ["-o", "$out"]),
-        (stem <> "-0.M1", ["catm.exe"], ["$out", "M2libc/x86/x86_defs.M1", "stage0-pe32/x86/libc-core.M1", "stage0-pe32/x86/libc-full.M1", stem <> ".M1", "stage0-pe32/x86/pe-end-shim.M1"]),
+        (stem <> "-0.M1", ["catm.exe"], ["$out", "M2libc/x86/x86_defs.M1", "M2libc/x86/windows/libc-core.M1", "M2libc/x86/windows/libc-full.M1", stem <> ".M1", "M2libc/x86/windows/pe-end-shim.M1"]),
         (stem <> ".hex2", ["M0.exe"], [stem <> "-0.M1", "$out"]),
-        (stem <> "-0.hex2", ["catm.exe"], ["$out", "stage0-pe32/x86/PE32-i386.hex2", "stage0-pe32/x86/ntdll-i386.hex2", stem <> ".hex2"]),
+        (stem <> "-0.hex2", ["catm.exe"], ["$out", "M2libc/x86/windows/PE32-i386.hex2", "M2libc/x86/windows/ntdll-i386.hex2", stem <> ".hex2"]),
         (executable, ["hex2.exe"], [stem <> "-0.hex2", "$out"])
       ]
     -- Phase-7's M2libc files, which are what <stdio.h> reaches on the
@@ -13690,9 +13690,9 @@ testSeedStdenvWindows = do
     closureLeaves :: [Text]
     closureLeaves =
       [ "hex0-seed.exe",
-        "stage0-pe32-ff1c2ad.tar.gz",
+        "stage0-pe32-a81c837.tar.gz",
         "M2-Planet-ee0bf91.tar.gz",
-        "M2libc-13e57eb.tar.gz",
+        "M2libc-ef9dfc2.tar.gz",
         "mescc-tools-578ac99.tar.gz",
         "mescc-tools-extra-d1d8146.tar.gz",
         "mes-77ff40b.tar.gz",

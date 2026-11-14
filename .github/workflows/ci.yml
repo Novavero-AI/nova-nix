@@ -778,7 +778,7 @@ jobs:
           done
           cat "$RUNNER_TEMP/links.txt"
 
-      # Each link's SHA-256 as stage0-pe32's CI prints it for ff1c2ad, the
+      # Each link's SHA-256 as stage0-pe32's CI prints it for a81c837, the
       # commit pkgs/windows/by-name/st/stage0-pe32/sources.nix pins.  hex0's
       # is the seed's own: the build already refuses any other hex0, since
       # hex0 is fixed-output to it, and this checks the bytes from outside.
@@ -805,8 +805,8 @@ jobs:
           cc_x86 a47b7cef346a2279c3aae684ad21d9316f04187730161997ab1a2a3a27b990e0
           M2 9109ba7e5fb65553aff021eef4152c19c2b774e7972c9e23b0266b21f56d0db2
           M1 ffa56be32281b490070b75ed1817d3d824bea884ae104c00b2052f7a94ec534f
-          hex2-new 53ff3b520806cf0851ee160943580001edd5316fd92073dd4eb714ce8e4ae4aa
-          kaem-unwrapped 044c93802e4eda29d5a98e6c1d3fb4146a228b5d01f30854a344a91238ee16f4
+          hex2-new e6edb0b87c8ca89e3302e141beaf4ef9140f1a90d2362a75d45eb628eebb0c4f
+          kaem-unwrapped 6abd6689a9c5a79f7c4871267cecd3284b897e72701ed71064a5bc9f2cf2fd17
           EOF
           exit "$status"
 
