@@ -152,6 +152,9 @@ module Nix.Store.GC
     gcSummaryLine,
 
     -- * Deleting named paths
+    StoreEntryName,
+    storeEntryName,
+    storeEntryNameText,
     DeleteOutcome (..),
     deleteStorePaths,
     deleteStorePathRaw,
@@ -189,6 +192,7 @@ import Nix.Store.Upstream (UpstreamHazard (..), upstreamManagedRefusal)
 import qualified NovaCache.Base32 as Base32
 import System.Directory (createDirectoryIfMissing, doesPathExist, getFileSize, getSymbolicLinkTarget, listDirectory, makeAbsolute, pathIsSymbolicLink, removePathForcibly, renamePath)
 import System.FilePath (normalise, splitDirectories, takeDirectory, takeFileName, (</>))
+import qualified System.FilePath.Windows as Windows
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorType, isDoesNotExistError, isPermissionError)
 import System.OsPath (encodeFS)
@@ -690,7 +694,38 @@ data DeleteOutcome = DeleteOutcome
   }
   deriving (Eq, Show)
 
--- | Delete store entries by basename in the order given, each as
+-- | The name of one entry of a store directory, which is how a delete
+-- names its target.  Joined to the directory, it names an entry directly
+-- inside it, never the directory itself, a path above it or a path
+-- elsewhere.  'storeEntryName' is the only way to make one.
+newtype StoreEntryName = StoreEntryName Text
+  deriving (Eq, Show)
+
+-- | The store entry a name spells, or why it spells none.  Refused: the
+-- empty name, which joins to the directory itself; a @\/@ or a @\\@,
+-- the separators of either host, refused on both so a name means the
+-- same on every host; a dot-leading name, which covers @.@, @..@ and the
+-- store's own metadata directory and is never a store path, since a
+-- store path's name starts with its hash; a @:@, which on Windows makes
+-- @C:x@ a path on drive C and @name:x@ a stream of the file @name@; and
+-- a NUL, which no file name holds.  The name is not checked as a store
+-- path name: the entries a delete exists to remove are the ones current
+-- name rules reject.
+storeEntryName :: Text -> Either Text StoreEntryName
+storeEntryName name
+  | T.null name = Left "empty store path name"
+  | T.any Windows.isPathSeparator name =
+      Left (name <> ": a path separator is not valid in a store path name")
+  | T.isPrefixOf "." name = Left (name <> ": dot-leading names are not store paths")
+  | T.any (== ':') name = Left (name <> ": ':' is not valid in a store path name")
+  | T.any (== '\NUL') name = Left (name <> ": NUL is not valid in a store path name")
+  | otherwise = Right (StoreEntryName name)
+
+-- | The name as text.
+storeEntryNameText :: StoreEntryName -> Text
+storeEntryNameText (StoreEntryName name) = name
+
+-- | Delete store entries by name in the order given, each as
 -- 'deleteStorePathRaw' deletes one, under one collector lock and one
 -- live set, after upstream's roots line, printed once for the call.
 -- The action reports each deletion as it completes, before the next
@@ -702,15 +737,15 @@ data DeleteOutcome = DeleteOutcome
 -- is checked.  Refused, with nothing deleted or reported, for a store
 -- upstream Nix's database may also manage and over a database keyed
 -- under another spelling of the directory.
-deleteStorePaths :: Store -> [Text] -> (Text -> DeleteOutcome -> IO ()) -> IO (Either Text ())
-deleteStorePaths store basenames report =
-  join <$> withLiveSet store (\live -> runExceptT (traverse_ (deleteAndReport live) basenames))
+deleteStorePaths :: Store -> [StoreEntryName] -> (StoreEntryName -> DeleteOutcome -> IO ()) -> IO (Either Text ())
+deleteStorePaths store names report =
+  join <$> withLiveSet store (\live -> runExceptT (traverse_ (deleteAndReport live) names))
   where
-    deleteAndReport live basename = do
-      removed <- ExceptT (deleteStorePathChecked store live basename)
-      liftIO (report basename removed)
+    deleteAndReport live name = do
+      removed <- ExceptT (deleteStorePathChecked store live name)
+      liftIO (report name removed)
 
--- | Delete one store entry by basename: its registration row and its
+-- | Delete one store entry by name: its registration row and its
 -- on-disk tree, under the collector lock with the live set as it
 -- stands, after upstream's roots line.  Row first, tree second: an
 -- orphan tree left by a failed removal is inert debris, while a
@@ -733,9 +768,9 @@ deleteStorePaths store basenames report =
 -- entries it is given.  Refused, with nothing deleted, for a store
 -- upstream Nix's database may also manage and over a database keyed
 -- under another spelling of the directory.
-deleteStorePathRaw :: Store -> Text -> IO (Either Text DeleteOutcome)
-deleteStorePathRaw store basename =
-  join <$> withLiveSet store (\live -> deleteStorePathChecked store live basename)
+deleteStorePathRaw :: Store -> StoreEntryName -> IO (Either Text DeleteOutcome)
+deleteStorePathRaw store name =
+  join <$> withLiveSet store (\live -> deleteStorePathChecked store live name)
 
 -- | The delete of one entry given the live set, which stands for the
 -- collector lock being held.  Inside the collector lock the sequence
@@ -744,8 +779,8 @@ deleteStorePathRaw store basename =
 -- is not a store handle (nothing in this tool, but nothing forbids one)
 -- still cannot have its delete-materialize-register torn apart by this
 -- delete.
-deleteStorePathChecked :: Store -> LiveSet -> Text -> IO (Either Text DeleteOutcome)
-deleteStorePathChecked store live basename
+deleteStorePathChecked :: Store -> LiveSet -> StoreEntryName -> IO (Either Text DeleteOutcome)
+deleteStorePathChecked store live (StoreEntryName basename)
   | isLive live (T.pack target) = pure (Left (stillAliveMessage (T.pack target)))
   | otherwise = deleteUnderPathLock
   where

@@ -46,7 +46,7 @@ import Nix.HostPath (hostPathFromBytes)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Realise (BuildMode (..), Fallback (..), SubstitutesSetting (..))
-import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, upstreamManagedRefusal, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
@@ -805,7 +805,7 @@ storeDeleteCommand storeDir rawPaths = do
   either (failWith . prefixed) pure result
   where
     prefixed err = "store delete: " <> err
-    reportDeleted basename removed = TIO.putStrLn ("deleted " <> basename <> describeOutcome removed)
+    reportDeleted name removed = TIO.putStrLn ("deleted " <> storeEntryNameText name <> describeOutcome removed)
     describeOutcome removed
       | doRowRemoved removed && doTreeRemoved removed = ""
       | doRowRemoved removed = " (no tree on disk)"

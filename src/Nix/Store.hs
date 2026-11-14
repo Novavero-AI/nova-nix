@@ -128,6 +128,7 @@ import System.Directory
 import qualified System.Directory as Dir
 import qualified System.Directory.OsPath as OsDir
 import System.FilePath ((</>))
+import qualified System.FilePath.Windows as Windows
 import System.IO (Handle, IOMode (ReadMode), hClose, withBinaryFile)
 import System.IO.Error (isAlreadyExistsError)
 import System.OsPath (OsPath)
@@ -145,31 +146,26 @@ pathExists store sp = doesPathExist (storePathToFilePath (stDir store) sp)
 -- Deletion
 -- ---------------------------------------------------------------------------
 
--- | Resolve a @store delete@ argument to the basename it names: a bare
+-- | Resolve a @store delete@ argument to the store entry it names: a bare
 -- @hash-name@ basename, or a full path spelled under the opened store's
--- directory, the platform store, or the canonical store.  The basename is
--- NOT validated as a store path - the entries deletion exists to remove
--- are the ones current name rules reject - so only traversal shapes are
--- refused: separators (excluded by construction), dot-leading names (the
--- store's metadata directory lives at a dot name), and colons (an NTFS
--- alternate-data-stream spelling).  Lock files are refused too, but not
--- here: names like @flake.lock@ are legal store-path names, so telling a
--- lock file from a store object needs the registration rows, and that
--- decision lives in 'deleteStorePathRaw'.
-resolveDeleteTarget :: StoreDir -> Text -> Either Text Text
-resolveDeleteTarget storeDir raw
-  | T.null basename = Left (raw <> ": empty store path name")
-  | T.isPrefixOf "." basename =
-      Left (basename <> ": dot-leading names are not store paths")
-  | T.any (== ':') basename =
-      Left (basename <> ": ':' is not valid in a store path name")
-  | not dirOk = Left (raw <> ": not a path under this store")
-  | otherwise = Right basename
+-- directory, the platform store, or the canonical store, with either
+-- separator.  The name after the last separator is refused as
+-- 'storeEntryName' refuses a library caller's, in its words, so the
+-- command and the library delete refuse the same names; like it, this
+-- does not check the name as a store path name.  Lock files are refused
+-- too, but not here: names like @flake.lock@ are legal store-path names,
+-- so telling a lock file from a store object needs the registration
+-- rows, and that decision lives in 'deleteStorePathRaw'.
+resolveDeleteTarget :: StoreDir -> Text -> Either Text StoreEntryName
+resolveDeleteTarget storeDir raw = storeEntryName basename >>= underThisStore
   where
-    basename = T.takeWhileEnd (\c -> c /= '/' && c /= '\\') raw
+    underThisStore name
+      | dirOk = Right name
+      | otherwise = Left (raw <> ": not a path under this store")
+    basename = T.takeWhileEnd (not . Windows.isPathSeparator) raw
     dirPart =
       normalizeSeps
-        (T.dropWhileEnd (\c -> c == '/' || c == '\\') (T.dropEnd (T.length basename) raw))
+        (T.dropWhileEnd Windows.isPathSeparator (T.dropEnd (T.length basename) raw))
     dirOk =
       T.null dirPart
         || dirPart
