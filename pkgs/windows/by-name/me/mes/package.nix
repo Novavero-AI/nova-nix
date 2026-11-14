@@ -1,16 +1,16 @@
-# GNU Mes 0.27.1, as nixpkgs' minimal-bootstrap/mes/default.nix builds it
-# (nixpkgs 1d060086d60cb76a40cf37109f979d88a5bd6396), on the Windows stage0
-# tools: mes-m2.exe built by kaem.windows.run, the Mes C library compiled by
-# MesCC running on mes-m2, and mes.exe compiled by MesCC.  libc is the
-# library's sources for TinyCC, which nixpkgs builds from libc.nix as
-# mes-libc.  Every derivation is a kaem.runCommand script, i686-windows as
-# stage0-pe32's are.
+# GNU Mes 0.28, built as nixpkgs' minimal-bootstrap/mes/default.nix builds
+# Mes 0.27.1 (nixpkgs 1d060086d60cb76a40cf37109f979d88a5bd6396), on the
+# Windows stage0 tools: mes-m2.exe built by kaem.windows.run, the Mes C
+# library compiled by MesCC running on mes-m2, and mes.exe compiled by MesCC.
+# libc is the library's sources for TinyCC, which nixpkgs builds from
+# libc.nix as mes-libc.  Every derivation is a kaem.runCommand script,
+# i686-windows as stage0-pe32's are.
 #
-# The source is Novavero-AI/mes, GNU Mes 0.27.1 with a Windows port.  It
-# carries nixpkgs' i686 C library fixes (strpbrk, ntoab, ioctl3, vfprintf and
-# vsnprintf) as commits, so none of nixpkgs' replace calls on the library is
-# made here; its others edit lib/linux and x86_64 files the Windows lists do
-# not name.  One differs: nixpkgs replaces va_arg8 with va_arg, which
+# The source is Novavero-AI/mes, GNU Mes master with a Windows port.  Mes
+# fixes strpbrk itself, and the fork carries nixpkgs' other i686 C library
+# fixes (ntoab, ioctl3, vfprintf and vsnprintf) as commits, so none of
+# nixpkgs' replace calls on the library is made here; its others edit
+# lib/linux and x86_64 files the Windows lists do not name.  One differs: nixpkgs replaces va_arg8 with va_arg, which
 # include/stdarg.h defines as reading a long, where the fork's vfprintf and
 # vsnprintf use va_arg only when compiled against a stdarg.h without
 # va_arg8, as TinyCC's is.
@@ -25,13 +25,13 @@ let
   inherit (stage0-pe32) kaem mescc-tools;
 
   pname = "mes";
-  version = "0.27.1";
-  rev = "4ea66eb48dacf3a854ea9aa120a09892d0e3d897";
+  version = "0.28";
+  rev = "77ff40b3a723bf0ee2377ebeddd4b84d645432af";
 
   src = fetchurl {
     name = "mes-${builtins.substring 0 7 rev}.tar.gz";
     url = "https://github.com/Novavero-AI/mes/archive/${rev}.tar.gz";
-    sha256 = "1c73f03b782b88932e067b4f9f08952d36f1969def279835d5bea8963064d386";
+    sha256 = "dd02e967476e0094deb5c3365e74b08b412bc477e1262964148fbc5ec12f4a6f";
   };
 
   nyacc = import ./nyacc.nix { inherit fetchurl kaem; };
@@ -73,19 +73,17 @@ let
     mes_SOURCES
     ;
 
-  # Mes's arena and its maximum, in cells, and its stack, which nixpkgs
-  # writes into src/gc.c as 100000000 and 6000000.  The arena is allocated
-  # with a tenth more, which the collector copies the cells it keeps into,
-  # and then the stack, at 12 bytes a cell on i686: nixpkgs' sizes come to
-  # 1,328 MiB, past the 1,024 MiB lib/windows/brk.c reserves for every
-  # allocation, and these to 320 MiB.  The cells kept across a collection
-  # have to fit in that tenth, which Mes does not check: compiling libc+tcc,
-  # the largest library, Mes keeps about 1,000,000, as the Mes CI job
-  # measures it, against the 2,000,000 there is room for.  The sizes reach
-  # Mes through env, as the paths do, so a build can be given others without
-  # rebuilding Mes.
+  # Mes's arena, in cells, and its stack, in entries, the sizes MesCC's own
+  # script sets (scripts/mescc.in).  A collection starts once a third of the
+  # arena is left and copies the cells it keeps into that third, and Mes
+  # stops with an out-of-memory error if they do not fit.  At 12 bytes a
+  # cell on i686 the arena comes to 229 MiB of the 1,024 MiB
+  # lib/windows/brk.c reserves for every allocation.  The stack has to stay
+  # under 131,072 entries, which src/gc.c asserts, since a frame keeps its
+  # place in it in 16 bits.  The sizes reach Mes through env, as the paths
+  # do, so a build can be given others without rebuilding Mes.
   arena = "20000000";
-  stack = "6000000";
+  stack = "60000";
 
   # The ImageBase lib/m2/x86/PE32-i386.hex2 declares.  MesCC links at
   # 0x1000000 unless told otherwise, Linux's address.
@@ -162,7 +160,6 @@ let
   # hex2 as paths.
   env = {
     MES_ARENA = arena;
-    MES_MAX_ARENA = arena;
     MES_STACK = stack;
     MES_PREFIX = srcPrefix;
     GUILE_LOAD_PATH = builtins.concatStringsSep ":" (
