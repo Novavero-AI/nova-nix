@@ -53,6 +53,9 @@ data Command
   = CmdEvalFile !FilePath
   | CmdEvalExpr !T.Text
   | CmdBuild !BuildTarget !(Maybe T.Text) !(Maybe FilePath)
+  | -- | @trust@: report what the closure of the target's derivation, at
+    -- the attribute path when one is given, relies on.
+    CmdTrust !BuildTarget !(Maybe T.Text)
   | CmdPush !PushArgs
   | CmdStoreDelete ![String]
   | -- | @store gc@: collect, or with the flag only list the roots.
@@ -75,15 +78,29 @@ data BuildTarget
     TargetExpr !T.Text
   deriving (Eq, Show)
 
--- | Arguments to the build command, while the target is still unknown.
+-- | A command that evaluates one target to a derivation.
+data TargetCommand
+  = -- | @build@, which builds it.
+    BuildsTarget
+  | -- | @trust@, which reports what its closure relies on.
+    TrustsTarget
+
+-- | The word that selects a target command.
+targetWord :: TargetCommand -> String
+targetWord kind = case kind of
+  BuildsTarget -> "build"
+  TrustsTarget -> "trust"
+
+-- | Arguments to a target command, while the target is still unknown.
 data BuildArgs = BuildArgs
   { baTarget :: !(Maybe BuildTarget),
     baAttrPath :: !(Maybe T.Text),
     -- | Where to create the result symlink, registered as a GC root.
+    -- Only @build@ takes one.
     baOutLink :: !(Maybe FilePath)
   }
 
--- | Build arguments before any flag is parsed.
+-- | Target command arguments before any flag is parsed.
 emptyBuildArgs :: BuildArgs
 emptyBuildArgs = BuildArgs Nothing Nothing Nothing
 
@@ -136,7 +153,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     go opts ("--fallback" : rest) =
       go (opts {optFallback = True}) rest
     go opts ("eval" : rest) = goEval opts rest
-    go opts ("build" : rest) = goBuild opts emptyBuildArgs rest
+    go opts ("build" : rest) = goTarget BuildsTarget opts emptyBuildArgs rest
+    go opts ("trust" : rest) = goTarget TrustsTarget opts emptyBuildArgs rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
     go opts ("store" : rest) = goStore opts rest
     go _ [flag]
@@ -168,57 +186,60 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     goEval _ (arg@('-' : _) : _) = Left ("unknown eval flag: " ++ arg)
     goEval opts (path : rest) =
       go (opts {optCommand = CmdEvalFile path}) rest
-    -- Sub-parser for build: the target, -A, and the shared flags in any
-    -- order.  The shared flags are handled here rather than deferred back to
-    -- 'go' so that one can follow the file argument, which is where a caller
-    -- reaches for it, and so that -A is still recognised after it.
-    goBuild opts buildArgs [] = finishBuild opts buildArgs
+    -- Sub-parser for build and trust: the target, -A, and the shared flags
+    -- in any order, and for build its own flags.  The shared flags are
+    -- handled here rather than deferred back to 'go' so that one can follow
+    -- the file argument, which is where a caller reaches for it, and so
+    -- that -A is still recognised after it.
+    goTarget kind opts targetArgs [] = finishTarget kind opts targetArgs
     -- Answered here as well as at the top level: a sub-parser that rejected
     -- them would make 'build --help' a usage error rather than a request.
-    goBuild opts _ ("--help" : _) = Right opts {optCommand = CmdHelp}
-    goBuild opts _ ("--version" : _) = Right opts {optCommand = CmdVersion}
-    goBuild opts buildArgs ("--store" : dir : rest) =
-      goBuild (opts {optStore = Just dir}) buildArgs rest
-    goBuild opts buildArgs ("--substituter" : url : rest) =
-      goBuild (opts {optSubstituter = Just url}) buildArgs rest
-    goBuild opts buildArgs ("--trusted-key" : key : rest) =
-      goBuild (opts {optTrustedKey = Just key}) buildArgs rest
-    goBuild opts buildArgs ("--nix-path" : val : rest) =
-      goBuild (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) buildArgs rest
-    goBuild opts buildArgs ("--exec-wrapper" : spec : rest) =
-      goBuild (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) buildArgs rest
-    goBuild opts buildArgs ("--restrict-eval" : rest) =
-      goBuild (opts {optRestrictEval = True}) buildArgs rest
-    goBuild opts buildArgs ("--pure-eval" : rest) =
-      goBuild (opts {optPureEval = True}) buildArgs rest
-    goBuild opts buildArgs ("--trace-verbose" : rest) =
-      goBuild (opts {optTraceVerbose = True}) buildArgs rest
-    goBuild opts buildArgs ("--fallback" : rest) =
-      goBuild (opts {optFallback = True}) buildArgs rest
-    goBuild opts buildArgs ("--check" : rest) =
-      goBuild (opts {optCheck = True}) buildArgs rest
-    goBuild opts buildArgs ("--expr" : expr : rest) =
-      withTarget opts buildArgs (TargetExpr (T.pack expr)) rest
-    goBuild opts buildArgs (flag : path : rest)
-      | flag `elem` attrFlags = case baAttrPath buildArgs of
-          Just _ -> Left "build accepts one attribute path"
-          Nothing -> goBuild opts (buildArgs {baAttrPath = Just (T.pack path)}) rest
-      | flag `elem` outLinkFlags = case baOutLink buildArgs of
+    goTarget _ opts _ ("--help" : _) = Right opts {optCommand = CmdHelp}
+    goTarget _ opts _ ("--version" : _) = Right opts {optCommand = CmdVersion}
+    goTarget kind opts targetArgs ("--store" : dir : rest) =
+      goTarget kind (opts {optStore = Just dir}) targetArgs rest
+    goTarget kind opts targetArgs ("--substituter" : url : rest) =
+      goTarget kind (opts {optSubstituter = Just url}) targetArgs rest
+    goTarget kind opts targetArgs ("--trusted-key" : key : rest) =
+      goTarget kind (opts {optTrustedKey = Just key}) targetArgs rest
+    goTarget kind opts targetArgs ("--nix-path" : val : rest) =
+      goTarget kind (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) targetArgs rest
+    goTarget BuildsTarget opts targetArgs ("--exec-wrapper" : spec : rest) =
+      goTarget BuildsTarget (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) targetArgs rest
+    goTarget kind opts targetArgs ("--restrict-eval" : rest) =
+      goTarget kind (opts {optRestrictEval = True}) targetArgs rest
+    goTarget kind opts targetArgs ("--pure-eval" : rest) =
+      goTarget kind (opts {optPureEval = True}) targetArgs rest
+    goTarget kind opts targetArgs ("--trace-verbose" : rest) =
+      goTarget kind (opts {optTraceVerbose = True}) targetArgs rest
+    goTarget kind opts targetArgs ("--fallback" : rest) =
+      goTarget kind (opts {optFallback = True}) targetArgs rest
+    goTarget BuildsTarget opts targetArgs ("--check" : rest) =
+      goTarget BuildsTarget (opts {optCheck = True}) targetArgs rest
+    goTarget kind opts targetArgs ("--expr" : expr : rest) =
+      withTarget kind opts targetArgs (TargetExpr (T.pack expr)) rest
+    goTarget kind opts targetArgs (flag : path : rest)
+      | flag `elem` attrFlags = case baAttrPath targetArgs of
+          Just _ -> Left (targetWord kind ++ " accepts one attribute path")
+          Nothing -> goTarget kind opts (targetArgs {baAttrPath = Just (T.pack path)}) rest
+    goTarget BuildsTarget opts targetArgs (flag : path : rest)
+      | flag `elem` outLinkFlags = case baOutLink targetArgs of
           Just _ -> Left "build accepts one --out-link"
-          Nothing -> goBuild opts (buildArgs {baOutLink = Just path}) rest
-    goBuild _ _ [flag]
+          Nothing -> goTarget BuildsTarget opts (targetArgs {baOutLink = Just path}) rest
+    goTarget _ _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
-    goBuild _ _ (arg@('-' : _) : _) = Left ("unknown build flag: " ++ arg)
-    goBuild opts buildArgs (path : rest) =
-      withTarget opts buildArgs (TargetFile path) rest
-    -- A build evaluates one expression, so a second target is a mistake
-    -- worth naming rather than a silent last-one-wins.
-    withTarget opts buildArgs target rest = case baTarget buildArgs of
-      Just _ -> Left "build takes one FILE.nix or one --expr, not both"
-      Nothing -> goBuild opts (buildArgs {baTarget = Just target}) rest
-    finishBuild opts buildArgs = case baTarget buildArgs of
-      Nothing -> Left "build requires a FILE.nix argument or --expr EXPR"
-      Just target -> Right opts {optCommand = CmdBuild target (baAttrPath buildArgs) (baOutLink buildArgs)}
+    goTarget kind _ _ (arg@('-' : _) : _) = Left ("unknown " ++ targetWord kind ++ " flag: " ++ arg)
+    goTarget kind opts targetArgs (path : rest) =
+      withTarget kind opts targetArgs (TargetFile path) rest
+    -- A target command evaluates one expression, so a second target is a
+    -- mistake worth naming rather than a silent last-one-wins.
+    withTarget kind opts targetArgs target rest = case baTarget targetArgs of
+      Just _ -> Left (targetWord kind ++ " takes one FILE.nix or one --expr, not both")
+      Nothing -> goTarget kind opts (targetArgs {baTarget = Just target}) rest
+    finishTarget kind opts targetArgs = case (baTarget targetArgs, kind) of
+      (Nothing, _) -> Left (targetWord kind ++ " requires a FILE.nix argument or --expr EXPR")
+      (Just target, BuildsTarget) -> Right opts {optCommand = CmdBuild target (baAttrPath targetArgs) (baOutLink targetArgs)}
+      (Just target, TrustsTarget) -> Right opts {optCommand = CmdTrust target (baAttrPath targetArgs)}
     -- Sub-parser for push: flags and explicit store paths in any order.
     goPush opts pushArgs [] = Right opts {optCommand = CmdPush pushArgs}
     goPush opts pushArgs ("--store" : dir : rest) =

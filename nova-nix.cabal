@@ -113,6 +113,8 @@ library
     Nix.Push
     Nix.Realise
     Nix.Substituter
+    Nix.Trust
+    Nix.Trust.Scan
     Nix.Builtins
     Nix.Hash
     Nix.Http

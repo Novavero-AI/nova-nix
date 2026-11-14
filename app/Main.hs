@@ -9,11 +9,13 @@
 -- reference's 'helpLines'.
 module Main (main) where
 
-import Control.Exception (AsyncException (UserInterrupt), IOException, displayException, handle, handleJust, try)
+import Control.Exception (AsyncException (UserInterrupt), IOException, bracket, displayException, handle, handleJust, try)
 import Control.Monad (mfilter, void, (>=>))
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
+import Data.Functor.Identity (Identity (..))
 import Data.IORef (readIORef)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
@@ -30,6 +32,7 @@ import Nix.Cli.Args (BuildTarget (..), CliOpts (..), Command (..), PushArgs (..)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, systemConfDirSource)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
+import Nix.DependencyGraph (DepNode (..), buildDepGraph)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToMap, eval, evaluated, force, readThunkValue)
@@ -46,9 +49,11 @@ import Nix.HostPath (hostPathFromBytes)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Realise (BuildMode (..), Fallback (..), SubstitutesSetting (..))
-import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
+import Nix.Trust (ContentFacts, fetchedByBuiltin, fixedOutputInputs, renderTrustReport, trustReport)
+import Nix.Trust.Scan (scanFetched)
 import Paths_nova_nix (getDataDir, version)
 import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, makeAbsolute)
 import qualified System.Directory.OsPath as OsDir
@@ -167,6 +172,7 @@ main = do
       | optAterm opts -> evalExprAterm config opts storeDir dataDir expr
       | otherwise -> evalExpr config opts storeDir dataDir expr
     CmdBuild target attrPath outLink -> buildCommand config opts storeDir dataDir target attrPath outLink
+    CmdTrust target attrPath -> trustCommand config opts storeDir dataDir target attrPath
     CmdPush pushArgs -> pushCommand storeDir pushArgs
     CmdStoreDelete paths -> storeDeleteCommand storeDir paths
     CmdStoreGc printRoots -> storeGcCommand storeDir printRoots
@@ -381,15 +387,12 @@ forceDerivationAttrs val = case val of
 derivationAttrKeys :: [T.Text]
 derivationAttrKeys = ["type", "drvPath", "outputName"]
 
--- | Parse, evaluate, extract the derivation, build it, and print its
--- output path.  A store directory upstream Nix's database also manages
--- is refused before evaluation, which can write to the store too
--- ("Nix.Store.Upstream").
-buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> Maybe FilePath -> IO ()
-buildCommand config opts storeDir dataDir target attrPath outLink = do
-  upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("build: " <>))
-  let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
-  wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
+-- | Evaluate a build or trust target and select the attribute path, when
+-- one is given, with the attributes 'derivationPath' reads forced: the
+-- state the evaluation recorded, and the selected value.  A failure is
+-- reported and exits.
+evalTarget :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> IO (EvalState, NixValue)
+evalTarget config opts storeDir dataDir target attrPath = do
   (baseDir, origin, source) <- loadBuildSource target
   case parseForEval opts config baseDir origin source of
     Left err -> failSource err
@@ -411,49 +414,110 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
         Right (Left selectionErr) -> do
           TIO.hPutStrLn stderr ("error: " <> selectionErr)
           exitFailure
-        Right (Right val) -> do
-          drvSP <- derivationPath val
-          outputName <- defaultOutputName drvSP val
-          -- The full .drv closure (root + every transitive input) recorded
-          -- during evaluation; written to the store before building.  The
-          -- root's own recipe is read from the same map, so what is built
-          -- is what its path hashes.
-          drvClosure <- readIORef (esDrvClosure st)
-          drv <- recordedDerivation drvClosure drvSP
-          -- Resolved before the build, as nix-build resolves the output it
-          -- realizes before building anything.
-          outputPath <- namedOutputPath drv outputName
-          sourceCache <- readIORef (esSourcePathCache st)
-          storeWrites <- readIORef (esStoreWriteCache st)
-          store <- openStore storeDir
-          -- Materialize eval-coerced source paths (src = ./file, path
-          -- interpolation): evaluation computes their store paths as text
-          -- only - the parity runner's store is not writable - so the build
-          -- driver performs the copy and registration.
-          materializeEvalSources store sourceCache
-          -- builtins.toFile wrote these during evaluation but could not
-          -- register them; a derivation naming one needs them valid first.
-          materializeEvalStoreWrites store storeWrites
-          cores <- buildCoresFor config
-          buildResult <- buildAndRegister store caches (fallbackFor opts config) (substitutesFor config) (buildModeFor opts) cores wrappers drvClosure drv drvSP
-          -- The root is registered before the handle closes: the handle's
-          -- lease is what keeps a concurrent collection from running
-          -- between the build's end and the link's creation.  The path
-          -- prints after the link exists, as nix-build prints it, so a
-          -- failed link prints nothing a script would take for success.
-          rooted <- case buildResult of
-            BuildSuccess _ -> traverse (\link -> addOutLinkRoot store link outputPath) outLink
-            BuildFailure _ _ -> pure Nothing
-          closeStore store
-          case (buildResult, rooted) of
-            -- The status printed is the status exited with: 1, or upstream's
-            -- 104 for a check that found an output different.
-            (BuildFailure msg code, _) -> do
-              TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
-              exitWith (ExitFailure code)
-            (BuildSuccess _, Just (Left err)) -> failWith ("build: " <> err)
-            (BuildSuccess _, _) ->
-              TIO.putStrLn (T.pack (storePathToFilePath (stDir store) outputPath))
+        Right (Right val) -> pure (st, val)
+
+-- | Parse, evaluate, extract the derivation, build it, and print its
+-- output path.  A store directory upstream Nix's database also manages
+-- is refused before evaluation, which can write to the store too
+-- ("Nix.Store.Upstream").
+buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> Maybe FilePath -> IO ()
+buildCommand config opts storeDir dataDir target attrPath outLink = do
+  upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("build: " <>))
+  let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
+  wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
+  (st, val) <- evalTarget config opts storeDir dataDir target attrPath
+  drvSP <- derivationPath val
+  outputName <- defaultOutputName drvSP val
+  -- The full .drv closure (root + every transitive input) recorded
+  -- during evaluation; written to the store before building.  The
+  -- root's own recipe is read from the same map, so what is built
+  -- is what its path hashes.
+  drvClosure <- readIORef (esDrvClosure st)
+  drv <- recordedDerivation drvClosure drvSP
+  -- Resolved before the build, as nix-build resolves the output it
+  -- realizes before building anything.
+  outputPath <- namedOutputPath drv outputName
+  sourceCache <- readIORef (esSourcePathCache st)
+  storeWrites <- readIORef (esStoreWriteCache st)
+  store <- openStore storeDir
+  -- Materialize eval-coerced source paths (src = ./file, path
+  -- interpolation): evaluation computes their store paths as text
+  -- only - the parity runner's store is not writable - so the build
+  -- driver performs the copy and registration.
+  materializeEvalSources store sourceCache
+  -- builtins.toFile wrote these during evaluation but could not
+  -- register them; a derivation naming one needs them valid first.
+  materializeEvalStoreWrites store storeWrites
+  cores <- buildCoresFor config
+  buildResult <- buildAndRegister store caches (fallbackFor opts config) (substitutesFor config) (buildModeFor opts) cores wrappers drvClosure drv drvSP
+  -- The root is registered before the handle closes: the handle's
+  -- lease is what keeps a concurrent collection from running
+  -- between the build's end and the link's creation.  The path
+  -- prints after the link exists, as nix-build prints it, so a
+  -- failed link prints nothing a script would take for success.
+  rooted <- case buildResult of
+    BuildSuccess _ -> traverse (\link -> addOutLinkRoot store link outputPath) outLink
+    BuildFailure _ _ -> pure Nothing
+  closeStore store
+  case (buildResult, rooted) of
+    -- The status printed is the status exited with: 1, or upstream's
+    -- 104 for a check that found an output different.
+    (BuildFailure msg code, _) -> do
+      TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+      exitWith (ExitFailure code)
+    (BuildSuccess _, Just (Left err)) -> failWith ("build: " <> err)
+    (BuildSuccess _, _) ->
+      TIO.putStrLn (T.pack (storePathToFilePath (stDir store) outputPath))
+
+-- | Evaluate the target, find the fixed-output derivations of its
+-- derivation's closure, fetch each one nova-nix's builtins fetch alone,
+-- scan the outputs the store holds, and print what the closure relies on
+-- ("Nix.Trust").  The graph is read from the recipes evaluation recorded,
+-- so beyond what evaluation itself writes, as @builtins.toFile@ does,
+-- only the fetches write to the store, and a closure with no
+-- fixed-output input does not open it.  A store directory upstream Nix's
+-- database also manages is refused before it is opened, as a build
+-- refuses one ("Nix.Store.Upstream").
+trustCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
+trustCommand config opts storeDir dataDir target attrPath = do
+  (st, val) <- evalTarget config opts storeDir dataDir target attrPath
+  drvSP <- derivationPath val
+  drvClosure <- readIORef (esDrvClosure st)
+  drv <- recordedDerivation drvClosure drvSP
+  graph <- either (failWith . ("error: " <>)) pure (runIdentity (buildDepGraph (Identity . recordedRecipe drvClosure) drv drvSP))
+  facts <- case fixedOutputInputs graph drvSP of
+    [] -> pure Map.empty
+    inputs -> do
+      upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("trust: " <>))
+      bracket (openStore storeDir) closeStore (\store -> fetchAndScan config opts store inputs)
+  mapM_ TIO.putStrLn (renderTrustReport (trustReport facts graph drvSP))
+
+-- | Realise each fixed-output input that nova-nix's builtins fetch with no
+-- input of their own, so that nothing from the closure runs, then scan
+-- every one whose output the store holds.  The first fetch that fails
+-- stops the command, as a build stops; an input not fetched is one the
+-- report names.
+fetchAndScan :: NixConfig -> CliOpts -> Store -> [(DepNode, StorePath)] -> IO (Map.Map StorePath ContentFacts)
+fetchAndScan config opts store inputs = do
+  mapM_ fetch [node | (node, _) <- inputs, fetchedByBuiltin (dnDerivation node)]
+  Map.fromList . catMaybes <$> traverse scan inputs
+  where
+    buildConfig =
+      (defaultBuildConfig (stDir store))
+        { bcCaches = resolveCaches config (optSubstituter opts) (optTrustedKey opts),
+          bcFallback = fallbackFor opts config,
+          bcSubstitutes = substitutesFor config
+        }
+    fetch node = do
+      result <- buildWithDeps buildConfig store (dnDerivation node) (dnDrvPath node)
+      case result of
+        BuildSuccess _ -> pure ()
+        BuildFailure msg _ -> failWith ("trust: " <> msg)
+    scan (_, output) = do
+      held <- isValid store output
+      if held
+        then Just . (,) output <$> scanFetched (storePathToFilePath (stDir store) output)
+        else pure Nothing
 
 -- | The @.drv@ store path of an evaluated derivation value: a set with
 -- @type = "derivation"@ whose @drvPath@ has been forced
@@ -497,17 +561,24 @@ namedOutputPath drv outputName =
 -- bytes whose hash is the path.  Every derivation computed in a session is
 -- recorded when its @drvPath@ is forced ('esDrvClosure'), so an absent entry
 -- means the path was never computed by this evaluation.
-recordedAterm :: Map.Map T.Text BS.ByteString -> StorePath -> IO BS.ByteString
-recordedAterm drvClosure drvSP =
-  case Map.lookup (storePathToText defaultStoreDir drvSP) drvClosure of
-    Just aterm -> pure aterm
-    Nothing -> failWith ("error: no .drv was recorded for " <> storePathToText defaultStoreDir drvSP)
+recordedAtermBytes :: Map.Map T.Text BS.ByteString -> StorePath -> Either T.Text BS.ByteString
+recordedAtermBytes drvClosure drvSP =
+  maybe (Left ("no .drv was recorded for " <> storePathToText defaultStoreDir drvSP)) Right (Map.lookup (storePathToText defaultStoreDir drvSP) drvClosure)
 
--- | The 'Derivation' a recorded ATerm describes ('recordedAterm').
+-- | The 'Derivation' a recorded ATerm describes ('recordedAtermBytes').
+recordedRecipe :: Map.Map T.Text BS.ByteString -> StorePath -> Either T.Text Derivation
+recordedRecipe drvClosure drvSP =
+  recordedAtermBytes drvClosure drvSP
+    >>= first (("the recorded .drv for " <> storePathToText defaultStoreDir drvSP <> " does not parse: ") <>) . fromATerm
+
+-- | 'recordedAtermBytes', failing the command when there is none.
+recordedAterm :: Map.Map T.Text BS.ByteString -> StorePath -> IO BS.ByteString
+recordedAterm drvClosure = either (failWith . ("error: " <>)) pure . recordedAtermBytes drvClosure
+
+-- | 'recordedRecipe', failing the command when there is none or it does
+-- not parse.
 recordedDerivation :: Map.Map T.Text BS.ByteString -> StorePath -> IO Derivation
-recordedDerivation drvClosure drvSP = do
-  aterm <- recordedAterm drvClosure drvSP
-  either (failWith . (("error: the recorded .drv for " <> storePathToText defaultStoreDir drvSP <> " does not parse: ") <>)) pure (fromATerm aterm)
+recordedDerivation drvClosure = either (failWith . ("error: " <>)) pure . recordedRecipe drvClosure
 
 -- | The store directory selected by @--store@, or the platform default,
 -- under the canonical spelling 'openStore' keys the store by, so what
