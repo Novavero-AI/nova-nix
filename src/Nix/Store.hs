@@ -29,19 +29,17 @@
 -- @build --out-link@ creates, or a file the operator drops under the
 -- store's @gcroots@ directory.  The collector walks every root, follows
 -- references transitively, and deletes everything not reachable; a
--- single-path delete refuses a path that walk reaches.  "Nix.Store.GC"
--- holds the roots model, the walk, the sweep, and the lock that keeps a
--- collection and a concurrent writer apart; "Nix.Store.Handle" holds the
--- open handle and its lease on that lock.
+-- delete of named paths refuses a path that walk reaches.
+-- "Nix.Store.GC" holds the roots model, the walk, the sweep, the delete
+-- of named paths, and the lock that keeps a collection and a concurrent
+-- writer apart; "Nix.Store.Handle" holds the open handle and its lease
+-- on that lock.
 module Nix.Store
   ( -- * Queries
     isValid,
     pathExists,
 
     -- * Deletion
-    DeleteOutcome (..),
-    deleteStorePathRaw,
-    deleteStorePathChecked,
     resolveDeleteTarget,
 
     -- * Store operations
@@ -87,7 +85,7 @@ module Nix.Store
 where
 
 import Control.Exception (IOException, bracket, catch, finally, onException, throwIO, try, tryJust)
-import Control.Monad (guard, join, unless, when)
+import Control.Monad (guard, unless, when)
 import Data.Bool (bool)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
@@ -145,15 +143,6 @@ pathExists store sp = doesPathExist (storePathToFilePath (stDir store) sp)
 -- Deletion
 -- ---------------------------------------------------------------------------
 
--- | What 'deleteStorePathRaw' removed.
-data DeleteOutcome = DeleteOutcome
-  { -- | A ValidPaths row (with its outgoing reference edges) was removed.
-    doRowRemoved :: !Bool,
-    -- | An on-disk tree was removed.
-    doTreeRemoved :: !Bool
-  }
-  deriving (Eq, Show)
-
 -- | Resolve a @store delete@ argument to the basename it names: a bare
 -- @hash-name@ basename, or a full path spelled under the opened store's
 -- directory, the platform store, or the canonical store.  The basename is
@@ -187,96 +176,6 @@ resolveDeleteTarget storeDir raw
                    normalizeSeps (T.pack (unStoreDir defaultStoreDir))
                  ]
     normalizeSeps = T.map (\c -> if c == '\\' then '/' else c)
-
--- | Delete one store entry by basename: the registration row (refused
--- while a root keeps it alive, or while other valid paths reference it)
--- and the on-disk tree.  One checked delete under its own collector
--- lock and live set; a batch shares both through 'withLiveSet' and
--- 'deleteStorePathChecked'.
-deleteStorePathRaw :: Store -> Text -> IO (Either Text DeleteOutcome)
-deleteStorePathRaw store basename =
-  join <$> withLiveSet store (\live -> deleteStorePathChecked store live basename)
-
--- | The checked delete of one entry, given the live set, which also
--- stands for the collector lock being held.  Row first, tree second: an
--- orphan tree left by a failed removal is inert debris, while a
--- still-registered row whose tree is gone would be adopted as valid by
--- existence checks.  A row without a tree and a tree without a row both
--- delete (the repair cases); only a target with neither is an error.
---
--- Liveness is upstream's rule for a specific delete: a path reachable
--- from a root is refused with its words.  The referrer refusal that
--- follows is this tool's own in wording and in shape.  Upstream refuses
--- a path with an unrooted referrer with the same still-alive line
--- unless that referrer is named in the same invocation (its
--- @pathsToDelete@ set in 2.24.9's @deleteReferrersClosure@), in which
--- case the named set deletes referrer-first; this delete removes
--- exactly the path named and lists the referrers that stand in the way,
--- so a chain deletes leaf-first in argument order.  Inside the collector
--- lock the sequence also holds the target's per-path lock - the same
--- file a substituter of the path locks, as upstream's deletePath does -
--- so a holder that is not a store handle (nothing in this tool, but
--- nothing forbids one) still cannot have its delete-materialize-register
--- torn apart by this delete.
-deleteStorePathChecked :: Store -> LiveSet -> Text -> IO (Either Text DeleteOutcome)
-deleteStorePathChecked store live basename
-  | isLive live (T.pack target) = pure (Left (stillAliveMessage (T.pack target)))
-  | otherwise = deleteUnderPathLock
-  where
-    target = unStoreDir (stDir store) </> T.unpack basename
-    deleteUnderPathLock = withLockFile (target <> lockFileSuffix) $ \_ -> do
-      -- A holder never deletes a lock file (the 'Nix.Store.Lock'
-      -- header), and neither does this delete.  A target is one when
-      -- stripping the suffix leaves a well-formed store basename AND no
-      -- registration row bears the full name: names like @flake.lock@
-      -- are legal store-path names, so a registered object of this
-      -- exact name deletes normally, and only the rows can tell the two
-      -- apart.  The check precedes the row removal below, which is
-      -- destructive.
-      registered <- case parseStorePathBaseName basename of
-        Just sp -> isValidPath (stDB store) sp
-        Nothing -> pure False
-      case (registered, lockedPathOf basename) of
-        (False, Just guardedPath) ->
-          pure
-            ( Left
-                ( basename
-                    <> ": names the lock file of "
-                    <> guardedPath
-                    <> "; lock files coordinate concurrent store access"
-                    <> " and are never deleted here (store gc removes it,"
-                    <> " and any unregistered store object of this exact"
-                    <> " name, once "
-                    <> guardedPath
-                    <> " is not live)"
-                )
-            )
-        _ -> deleteRowAndTree
-    deleteRowAndTree = do
-      rowResult <- unregisterPathRow (stDB store) (T.pack target)
-      case rowResult of
-        RowReferenced referrers ->
-          pure
-            ( Left
-                ( basename
-                    <> " is referenced by:"
-                    <> T.concat ["\n  " <> r | r <- referrers]
-                )
-            )
-        _ -> do
-          -- 'doesPathExist' follows links, so a dangling top-level symlink
-          -- would read as absent; links are leaves here (as in store walks),
-          -- and leftover link debris must still be removable.
-          treeExisted <- do
-            onDisk <- doesPathExist target
-            if onDisk
-              then pure True
-              else Dir.pathIsSymbolicLink target `catch` \(_ :: IOException) -> pure False
-          when treeExisted (Dir.removePathForcibly target)
-          let rowRemoved = rowResult == RowUnregistered
-          if rowRemoved || treeExisted
-            then pure (Right DeleteOutcome {doRowRemoved = rowRemoved, doTreeRemoved = treeExisted})
-            else pure (Left (basename <> ": not in this store (no registration row, no tree on disk)"))
 
 -- ---------------------------------------------------------------------------
 -- Store operations
