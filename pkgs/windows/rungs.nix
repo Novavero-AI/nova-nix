@@ -55,5 +55,6 @@ in
     "gcc-core"
     "mingw-w64-crt"
     "gcc46"
+    "gcc46-cxx"
   ];
 }

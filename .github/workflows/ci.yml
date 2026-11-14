@@ -1323,17 +1323,19 @@ jobs:
   # through %f, from tinycc-mes on.  test/data/gnumake.nix runs make with
   # --version and has it build a target through a pattern rule, and
   # test/data/busybox.nix runs busybox --version and has busybox's sh run a
-  # script through the applets configure runs.  Last, the seed stdenv made
+  # script through the applets configure runs.  Then the seed stdenv made
   # of those builds GNU Hello, which runs here, binutils, whose as, ar and
   # ld test/data/binutils.nix has build a program that runs, GCC 4.6.4's
   # C compiler and libgcc over MinGW-w64's headers, which
   # test/data/gcc-core.nix has compile sources whose assembly is compared
   # and a program that runs, and MinGW-w64's runtime, which that compiler
   # compiles and gcc46 lays out beside it, so that test/data/gcc46.nix has
-  # gcc46 link a C program that runs.  x64 and ARM64 Windows each run all
-  # of it, for the reason Stage0 (Windows) runs on both.  Each builds every
-  # rung from the seed unless Ladder (mode) has it take the unchanged ones
-  # from the public cache.
+  # gcc46 link a C program that runs.  Last, gcc46 builds GCC 4.6.4 with
+  # C++, gcc46-cxx, whose g++ test/data/gcc46-cxx.nix has link a C++
+  # program that runs.  x64 and ARM64 Windows each run all of it, for the
+  # reason Stage0 (Windows) runs on both.  Each builds every rung from the
+  # seed unless Ladder (mode) has it take the unchanged ones from the
+  # public cache.
   #
   # From the seed the ARM64 leg takes about 116 minutes under the x86
   # emulator: about 39 of them MesCC compiling the Mes libraries, mes and
@@ -2122,6 +2124,44 @@ jobs:
             fi
           done
           exit "$status"
+
+      # GCC 4.6.4 with C and C++ for i686-w64-mingw32, configured,
+      # compiled and installed in the seed stdenv by gcc46, with libgcc and
+      # libstdc++ compiled by the compiler the same make links, timed.
+      - name: Build gcc46-cxx
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A gcc46-cxx
+          echo "== gcc46-cxx built in $((SECONDS - start)) s"
+
+      # busybox's sh runs test/data/gcc46-cxx.nix's script, in which g++
+      # compiles and links a C++ program with no flag naming a directory
+      # and runs it.  It writes what the program prints, through iostream,
+      # of virtual calls, a template, new and delete and two exceptions
+      # caught, and its exit status, the DLLs it imports and three
+      # functions of SJLJ exception handling it links, and the lines are
+      # compared with test/data/gcc46-cxx-hello-answer.txt, which is what
+      # the C++ standard defines the program to print and what the
+      # configuration links.
+      - name: gcc46-cxx links a C++ program that runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          expected=test/data/gcc46-cxx-hello-answer.txt
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc46-cxx.nix -A hello | tail -n 1); then
+            echo "::error::busybox sh did not run hello's script"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          if cmp "$expected" "$lines"; then
+            echo "ok    hello wrote the lines of $expected"
+          else
+            echo "::error::hello's lines differ from $expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
 
       # The ladder, as this job built it and its checks ran on it: --all is
       # every valid path but the derivations in a store this job filled

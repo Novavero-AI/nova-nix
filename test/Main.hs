@@ -13580,7 +13580,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gcc46.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
+    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -14125,6 +14125,175 @@ testGcc46Windows = do
     addedNames =
       ["mingw-w64-crt-8.0.3", "gcc-4.6.4", "crt.sh", "hello.sh"]
         ++ concat [[name, name <> "-builder"] | name <- ["mingw-w64-crt-contents", "gcc46-hello"]]
+
+-- | @pkgs\/windows@'s C++ rung, read back as the build driver reads it: what
+-- gcc46-cxx and @test\/data\/gcc46-cxx.nix@'s check add to the closure of
+-- the rung before it, gcc46, which builds it.  The rung is full-source only
+-- if the one leaf it adds is GCC's g++ archive and it reads no input source
+-- but the stdenv's own files and what evaluation writes as text; the rest
+-- of GCC's tree is gcc-core's four archives, which the stdenv's
+-- @setup.sh@ (@src@) and its @preConfigure@ (the other three) unpack from
+-- the variables that name them.  Its configure is told by
+-- flags where MinGW-w64's headers and runtime, the assembler and the
+-- linker are, and which compiler, archiver, linker and strip the build
+-- runs, so each has to name the output of the derivation that builds it,
+-- or the target's name binutils and gcc46 install their programs under.
+-- Every flag that sets a compiler's options leaves out the @-g@ whose
+-- debugging information would name the build directory.
+testGcc46CxxWindows :: IO [Bool]
+testGcc46CxxWindows = do
+  putStrLn "pkgs/gcc46-cxx"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46-cxx.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          before <- sessionClosure (mapMaybe (`Map.lookup` rootOf) builtBefore)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, before, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, before, full) -> do
+      let added = Map.elems (Map.difference full before)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          gccCxx = derivationAt gccCxxRoot
+          gccCore = derivationAt gccCoreRoot
+          -- The output of a root's derivation, as a flag spells a store
+          -- path, or a word no flag holds where the root is missing.
+          outputOf root = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (derivationAt root >>= listToMaybe . drvOutputs)
+          outputNamed name = [storePathToText defaultStoreDir (doPath out) | drv <- added, nameOf drv == name, out <- drvOutputs drv]
+          wordsOf name = maybe [] (T.words . variableOf name)
+          flagsWith prefixes drv = [flag | flag <- wordsOf "configureFlags" drv, any (`T.isPrefixOf` flag) prefixes]
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetch is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the one leaf it adds is GCC's g++ archive, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              ([cxxArchive], True)
+              (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text and the stdenv's files" $
+            assertEqual
+              "input sources not written as text"
+              ["config.site", "include", "setup.sh"]
+              (sort [spName path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]),
+          runTest "gcc46-cxx names gcc-core's four archives and the g++ archive where setup.sh and preConfigure read them, with gcc46 and binutils as its build inputs and no patch" $
+            assertEqual
+              "the archives, buildInputs and patches"
+              ( [wordsOf variable gccCore | variable <- coreArchives] ++ [outputNamed cxxArchive],
+                [outputOf gcc46Root, outputOf binutilsRoot],
+                [],
+                isJust gccCore
+              )
+              ( [wordsOf variable gccCxx | variable <- coreArchives ++ ["cxxSrc"]],
+                wordsOf "buildInputs" gccCxx,
+                wordsOf "patches" gccCxx,
+                isJust gccCxx
+              ),
+          runTest "gcc46-cxx's flags name the target, the outputs of the headers, the runtime and binutils, and no sysroot" $
+            assertEqual
+              "flags"
+              [ "--target=" <> target,
+                "--with-headers=" <> outputOf headersRoot <> "/include",
+                "--with-libs=" <> outputOf crtRoot <> "/lib",
+                "--with-as=" <> outputOf binutilsRoot <> "/bin/" <> target <> "-as.exe",
+                "--with-ld=" <> outputOf binutilsRoot <> "/bin/" <> target <> "-ld.exe"
+              ]
+              (flagsWith ["--target=", "--with-headers", "--with-libs", "--with-sysroot", "--with-build-sysroot", "--with-as=", "--with-ld="] gccCxx),
+          runTest "gcc46-cxx builds with gcc46's driver and binutils' archiver, linker and strip, by the target's names" $
+            assertEqual
+              "tools"
+              ["CC=" <> target <> "-gcc", "AR=" <> target <> "-ar", "LD=" <> target <> "-ld", "STRIP=" <> target <> "-strip"]
+              (flagsWith ["CC=", "AR=", "LD=", "STRIP=", "CXX=", "RANLIB="] gccCxx),
+          runTest "gcc46-cxx's compiler options carry no -g, and libgcc's debugging flags are -g0" $
+            assertEqual
+              "the options and makeFlags"
+              (["CFLAGS=-O1", "CXXFLAGS=-O1", "CFLAGS_FOR_TARGET=-O0", "CXXFLAGS_FOR_TARGET=-O0"], ["LIBGCC2_DEBUG_CFLAGS=-g0"])
+              (flagsWith ["CFLAGS=", "CXXFLAGS=", "CFLAGS_FOR_TARGET=", "CXXFLAGS_FOR_TARGET="] gccCxx, wordsOf "makeFlags" gccCxx),
+          runTest "gcc46-cxx builds C and C++, static, with no registry lookup" $
+            assertEqual
+              "languages, libraries and registry"
+              ["--enable-languages=c,c++", "--disable-shared", "--disable-win32-registry"]
+              (flagsWith ["--enable-languages=", "--enable-shared", "--disable-shared", "--enable-win32-registry", "--disable-win32-registry"] gccCxx),
+          runTest "gcc46-cxx unsets the stdenv's C_INCLUDE_PATH, and nothing else, before configure" $
+            assertEqual
+              "preConfigure's unset lines"
+              ["unset C_INCLUDE_PATH"]
+              (filter ("unset " `T.isPrefixOf`) (maybe [] (map T.strip . T.lines . variableOf "preConfigure") gccCxx)),
+          runTest "gcc46-cxx builds all with NIX_BUILD_CORES jobs and installs with install-strip" $
+            assertEqual
+              "phases and parallelism"
+              ( "",
+                "make ${enableParallelInstalling:+-j$NIX_BUILD_CORES} $makeFlags install-strip",
+                "1",
+                "1"
+              )
+              ( maybe "" (variableOf "buildPhase") gccCxx,
+                maybe "" (variableOf "installPhase") gccCxx,
+                maybe "" (variableOf "enableParallelBuilding") gccCxx,
+                maybe "" (variableOf "enableParallelInstalling") gccCxx
+              )
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the C++ rung's derivations instantiate, adding five to the closure of gcc46's rung"
+    target :: Text
+    target = "i686-w64-mingw32"
+    cxxArchive :: Text
+    cxxArchive = "gcc-g++-4.6.4.tar.gz"
+    -- The variables gcc-core names its archives in, which gcc46-cxx takes.
+    coreArchives :: [Text]
+    coreArchives = ["src", "gmpSrc", "mpfrSrc", "mpcSrc"]
+    gccCxxRoot :: Text
+    gccCxxRoot = "pkgs.gcc46-cxx"
+    gccCoreRoot :: Text
+    gccCoreRoot = "pkgs.gcc-core"
+    gcc46Root :: Text
+    gcc46Root = "pkgs.gcc46"
+    crtRoot :: Text
+    crtRoot = "pkgs.mingw-w64-crt"
+    headersRoot :: Text
+    headersRoot = "pkgs.mingw-w64-headers"
+    binutilsRoot :: Text
+    binutilsRoot = "pkgs.binutils"
+    builtBefore :: [Text]
+    builtBefore = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets", binutilsRoot, headersRoot, "pkgs.mingw-w64-dirent", gccCoreRoot, crtRoot, gcc46Root]
+    roots :: [Text]
+    roots = builtBefore ++ [gccCxxRoot, "checks.hello"]
+    -- The kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames = [cxxArchive, "gcc-cxx-4.6.4", "hello.sh", "gcc46-cxx-hello", "gcc46-cxx-hello-builder"]
 
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
@@ -21456,6 +21625,7 @@ runSuite = do
           testBinutilsWindows,
           testGccCoreWindows,
           testGcc46Windows,
+          testGcc46CxxWindows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,

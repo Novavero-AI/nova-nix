@@ -1,0 +1,172 @@
+# GCC 4.6.4 with C and C++, as nixpkgs' minimal-bootstrap/gcc/4.6.cxx.nix
+# builds gcc46-cxx with gcc46 (nixpkgs
+# 5eb598da22ce76bc18ec85ecc1de66ca838b3514), for Windows: the C and C++
+# drivers, cc1, cc1plus, cpp, collect2, libgcc and libstdc++, running on
+# i686 Windows and writing assembly for i686-w64-mingw32, configured,
+# compiled and installed in the seed stdenv by gcc46 and binutils, and the
+# target libraries by the compiler the same make links.  GCC is written in
+# C++ from 4.8 on, so the ladder's next GCC needs this one, as nixpkgs'
+# gcc10 is built by its gcc46-cxx.
+#
+# The sources are gcc-core's, with GCC's g++ archive, which adds the C++
+# front end (gcc/cp) and libstdc++-v3 to the same tree, unpacked over it as
+# nixpkgs unpacks both.  As in gcc-core, the stdenv's i686-pc-mingw32 is
+# the build and the host and the target is binutils', so GCC takes itself
+# for a cross compiler and its programs install as
+# bin/i686-w64-mingw32-<name>.exe, i686-w64-mingw32-g++.exe among them; it
+# configures from a build directory beside its source; and --with-as and
+# --with-ld compile in the paths of binutils' assembler and linker.
+# gcc-core says why of each.
+#
+# GCC's installation guide has a cross compiler given its target's headers
+# and libraries before it is configured, with --with-headers and
+# --with-libs (gcc/doc/install.texi:2346-2350; gcc-core says why not
+# --with-sysroot, the guide's other choice).  The top-level configure
+# copies each into this output, MinGW-w64's headers as
+# i686-w64-mingw32/sys-include and mingw-w64-crt's libraries and start
+# files as i686-w64-mingw32/lib (configure.ac:2244-2273 and 2318-2347),
+# where gcc46 has them, and where the build points the compiler it links
+# with -B, -L and -isystem when it compiles and links the target libraries
+# (configure.ac:3110-3115 and 3134-3137).  libstdc++'s configure links its
+# tests for a MinGW target (libstdc++-v3/crossconfig.m4:153-157), so the
+# runtime has to be there before it runs; gcc-core builds libgcc alone,
+# which links nothing.  The runtime's include directory, which holds the
+# twelve uncompiled sources it installs, is not a library directory and is
+# not copied.  libstdc++ installs its library beside the runtime's and its
+# headers in i686-w64-mingw32/include/c++/4.6.4, a cross compiler's places
+# for them (libstdc++-v3/acinclude.m4:758-788, with the --with-cross-host
+# the top level gives a cross compiler's target libraries,
+# configure.ac:3016-3018), so the driver links a C++ program with no flag
+# naming a directory, as gcc46's links a C one.  nixpkgs points its native
+# compiler at musl's headers and libraries instead, with
+# --with-native-system-header-dir, --with-build-sysroot and the
+# C_INCLUDE_PATH, LIBRARY_PATH and -dynamic-linker its build script
+# exports; its no-system-headers.patch and its edit of
+# libstdc++-v3/configure.host are for that compiler and musl too.
+#
+# The build's compiler is gcc46's driver, and its archiver and linker are
+# binutils', each named by the target's name, the only name either puts on
+# PATH: configure, the build being its own host, looks the host's tools up
+# under their bare names (configure.ac:1292 and 3273-3284), and the seed
+# stdenv's CC, AR and LD are tcc's.  STRIP names binutils' strip, which
+# install-strip, nixpkgs' install target, runs on each program it installs
+# (gcc/Makefile.in:4500-4505); under the bare name configure finds none,
+# and install-strip would strip nothing.  preConfigure unsets
+# C_INCLUDE_PATH, which holds TinyCC's headers for tcc, as mingw-w64-crt's
+# does: GCC searches it before its own headers and MinGW-w64's
+# (gcc/incpath.c:455-462).
+#
+# CFLAGS and CXXFLAGS are nixpkgs' -O1, and the target libraries' its -O0
+# without the -dynamic-linker it adds for musl.  The target libraries'
+# flags, given, replace the ones with -g configure gives them otherwise
+# (configure.ac:2212-2241), whose debugging information would name the
+# build directory and the store paths the compiler read, and
+# LIBGCC2_DEBUG_CFLAGS=-g0 removes the -g gcc's Makefile adds to libgcc's
+# compiles, as in gcc-core.
+#
+# --disable-win32-registry is not nixpkgs': a GCC for Windows looks its
+# directories up under HKEY_LOCAL_MACHINE\SOFTWARE\Free Software
+# Foundation\4.6.4 (gcc/prefix.c:44-49 and 88-177) wherever its configure
+# links RegOpenKeyExA (gcc/configure.ac:1582-1590), and here it links
+# MinGW-w64's libadvapi32.a.  nixpkgs' --disable-lib* flags mean here what
+# they mean there, but for --disable-libsanitizer, left out, which names a
+# library later than 4.6.4.  gcc-core's --disable-decimal-float and
+# --disable-plugin, which nixpkgs' 4.6.nix, the GCC tinycc builds, passes,
+# are left out as 4.6.cxx.nix leaves them out: decimal float is on for a
+# MinGW target (config/dfp.m4:21-27), and configure finds neither the
+# objdump nor the dlopen its plugin checks look for and builds no plugin
+# support (gcc/configure.ac:4819-4897).  The thread model is win32 and
+# exceptions are SJLJ, as in gcc-core.  --disable-shared, as in nixpkgs,
+# makes libgcc and libstdc++ static, so a program carries what it uses of
+# them and imports no DLL of GCC's.
+{
+  seedStdenv,
+  fetchurl,
+  binutils,
+  gcc-core,
+  gcc46,
+  mingw-w64-crt,
+  mingw-w64-headers,
+}:
+let
+  pname = "gcc-cxx";
+  inherit (builtins.parseDrvName gcc-core.name) version;
+
+  cxxSrc = fetchurl {
+    url = "mirror://gnu/gcc/gcc-${version}/gcc-g++-${version}.tar.gz";
+    hash = "sha256-aQpdT2ZBgGQNsoB540YUaBksSEw31vZx3eS1On+ZGLs=";
+  };
+
+  target = "i686-w64-mingw32";
+in
+seedStdenv.mkDerivation {
+  name = "${pname}-${version}";
+
+  inherit (gcc-core)
+    src
+    gmpSrc
+    mpfrSrc
+    mpcSrc
+    ;
+  inherit cxxSrc;
+
+  buildInputs = [
+    gcc46
+    binutils
+  ];
+
+  preConfigure = ''
+    tar xf "$cxxSrc" -C ..
+    tar xf "$gmpSrc"
+    mv gmp-${gcc-core.gmpVersion} gmp
+    tar xf "$mpfrSrc"
+    mv mpfr-${gcc-core.mpfrVersion} mpfr
+    tar xf "$mpcSrc"
+    mv mpc-${gcc-core.mpcVersion} mpc
+    unset C_INCLUDE_PATH
+    mkdir ../build
+    cd ../build
+    configureScript=../gcc-${version}/configure
+  '';
+
+  configureFlags = [
+    "--target=${target}"
+    "--with-headers=${mingw-w64-headers}/include"
+    "--with-libs=${mingw-w64-crt}/lib"
+    "--with-as=${binutils}/bin/${target}-as.exe"
+    "--with-ld=${binutils}/bin/${target}-ld.exe"
+    "--enable-languages=c,c++"
+    "--enable-checking=release"
+    "--disable-bootstrap"
+    "--disable-dependency-tracking"
+    "--disable-libgomp"
+    "--disable-libmudflap"
+    "--disable-libquadmath"
+    "--disable-libssp"
+    "--disable-libstdcxx-pch"
+    "--disable-lto"
+    "--disable-multilib"
+    "--disable-nls"
+    "--disable-shared"
+    "--disable-win32-registry"
+    "CC=${target}-gcc"
+    "AR=${target}-ar"
+    "LD=${target}-ld"
+    "STRIP=${target}-strip"
+    "CFLAGS=-O1"
+    "CXXFLAGS=-O1"
+    "CFLAGS_FOR_TARGET=-O0"
+    "CXXFLAGS_FOR_TARGET=-O0"
+  ];
+
+  makeFlags = [ "LIBGCC2_DEBUG_CFLAGS=-g0" ];
+
+  # make runs $NIX_BUILD_CORES jobs and installs with install-strip, as
+  # minimal-bootstrap/gcc/4.6.cxx.nix's make does.
+  enableParallelBuilding = true;
+  installPhase = "make \${enableParallelInstalling:+-j$NIX_BUILD_CORES} $makeFlags install-strip";
+}
+// {
+  # gcc-core lists the archives the two share.
+  srcs = [ cxxSrc ];
+}
