@@ -67,22 +67,28 @@ let
       ]
     );
 
-  # Joined ahead of each program from M0 up before hex2 links it: the PE
-  # header, and the Windows plumbing that finds ntdll's exports and opens
-  # files.
+  # Joined ahead of the hand-written M0 and cc_x86 before hex2 links them:
+  # the PE header, and the Windows plumbing that finds ntdll's exports and
+  # opens files.  stage0-pe32 keeps its own copies, as stage0-posix keeps
+  # its own ELF header.
   peHeader = "${x86}/PE32-i386.hex2";
   ntdll = "${x86}/ntdll-i386.hex2";
 
-  # Joined ahead of each compiled program's M1 before M0 assembles it: the
+  # M2libc's Windows runtime, which every compiled program links against:
+  # the same header and plumbing, joined ahead of each from M2-0 on before
+  # hex2 links it, and, joined ahead of its M1 before M0 assembles it, the
   # instruction definitions, the startup and system calls, and the C library
   # for bootstrap mode or for M2libc's full POSIX layer.
+  windowsRuntime = "${M2libc}/x86/windows";
+  runtimePeHeader = "${windowsRuntime}/PE32-i386.hex2";
+  runtimeNtdll = "${windowsRuntime}/ntdll-i386.hex2";
   x86Defs = "${M2libc}/x86/x86_defs.M1";
-  libcCore = "${x86}/libc-core.M1";
-  libcBootstrap = "${x86}/libc-bootstrap.M1";
-  libcFull = "${x86}/libc-full.M1";
+  libcCore = "${windowsRuntime}/libc-core.M1";
+  libcBootstrap = "${windowsRuntime}/libc-bootstrap.M1";
+  libcFull = "${windowsRuntime}/libc-full.M1";
 
   # Defines :PE_end where M2-Planet's output ends with :ELF_end.
-  peEndShim = "${x86}/pe-end-shim.M1";
+  peEndShim = "${windowsRuntime}/pe-end-shim.M1";
 
   # Phase-0: hex0 from the seed.  This must reproduce the seed byte for byte,
   # so hex0 is fixed-output to the seed's own hash, and a seed that does not
@@ -174,8 +180,8 @@ let
     out
   ];
   M2-0-0_hex2 = join "M2-0-0.hex2" [
-    peHeader
-    ntdll
+    runtimePeHeader
+    runtimeNtdll
     M2-0_hex2
   ];
   M2 = step "M2.exe" hex2 [
@@ -202,8 +208,8 @@ let
     out
   ];
   M1-macro-0_hex2 = join "M1-macro-0.hex2" [
-    peHeader
-    ntdll
+    runtimePeHeader
+    runtimeNtdll
     M1-macro_hex2
   ];
   M1 = step "M1.exe" hex2 [
@@ -245,8 +251,8 @@ let
         out
       ];
       withHeader = join "${stem}-0.hex2" [
-        peHeader
-        ntdll
+        runtimePeHeader
+        runtimeNtdll
         assembled
       ];
     in

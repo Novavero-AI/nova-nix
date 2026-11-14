@@ -21,8 +21,8 @@ let
   inherit (sources) libtcc1_SOURCES libc_gnu1_SOURCES libc_gnu2_SOURCES;
 
   # In two calls to catm, as nixpkgs splits them: a stage0-pe32 program's
-  # argv holds 256 entries (its x86/libc-core.M1), and the two lists are 269
-  # files.
+  # argv has room for 255 arguments (M2libc's x86/windows/libc-core.M1), and
+  # the two lists are 269 files.
   firstLibc = libc_gnu1_SOURCES;
   lastLibc = libc_gnu2_SOURCES;
 in

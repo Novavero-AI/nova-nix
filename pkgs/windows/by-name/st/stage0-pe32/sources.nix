@@ -14,7 +14,7 @@
 # commit.
 { fetchurl }:
 let
-  stage0-pe32Rev = "ff1c2ad86a91d3d7d086722ffed49dfe18dd50d0";
+  stage0-pe32Rev = "a81c8374592e8e897c0863d31c6480ea69669009";
 
   # GitHub's archive of one commit, fetched and unpacked.  The archive holds a
   # single directory, <repo>-<rev>, which is root.  The sha256 is of the
@@ -61,7 +61,7 @@ let
       owner = "Novavero-AI";
       repo = "stage0-pe32";
       rev = stage0-pe32Rev;
-      sha256 = "7f6923711dab4644c3dfbc7eb49a94fd5b7738274cb03bd5b92245845652df80";
+      sha256 = "6e0ef745e313c10d043495ea926727f0309251ce0843c6f55077500cfb931eef";
     };
 
     M2-Planet = fromGitHub {
@@ -74,8 +74,8 @@ let
     M2libc = fromGitHub {
       owner = "Novavero-AI";
       repo = "M2libc";
-      rev = "13e57eb52bd30a6b0296f1cef1c54fc40065f07b";
-      sha256 = "bde242167fe1ffc52a0322cac6e4f24a32a10403df34dad82f40adc0b478c6af";
+      rev = "ef9dfc28b2e2fbc8751def2ec7f736c03f39f30c";
+      sha256 = "fab31a88a91c95aab46f579b293fcc5c5a10e82539a66624c56e4f45dd59ad4f";
     };
 
     mescc-tools = fromGitHub {
