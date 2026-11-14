@@ -10,7 +10,7 @@
 module Main (main) where
 
 import Control.Exception (AsyncException (UserInterrupt), IOException, displayException, handle, handleJust, try)
-import Control.Monad (join, mfilter, void, (>=>))
+import Control.Monad (mfilter, void, (>=>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
@@ -46,7 +46,7 @@ import Nix.HostPath (hostPathFromBytes)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Realise (BuildMode (..), Fallback (..), SubstitutesSetting (..))
-import Nix.Store (DeleteOutcome (..), GcRoot (..), LiveSet, Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePathChecked, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, withLiveSet, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
@@ -789,29 +789,22 @@ pushCommand storeDir pushArgs = do
             )
 
 -- | Delete store paths: registration rows and on-disk trees.  Every
--- argument is resolved before anything is touched; the paths are then
--- deleted in argument order under one collector lock and one live set,
--- with upstream's roots line printed once per invocation as its
--- @--delete@ prints it, and the first failure stops the run, so a
+-- argument is resolved before anything is touched; one
+-- 'deleteStorePaths' call then deletes the paths in argument order
+-- under one collector lock and one live set, printing a line for each
+-- as it goes, with upstream's roots line printed once per invocation as
+-- its @--delete@ prints it, and the first failure stops the run, so a
 -- reference chain deletes leaf-first in one invocation.
 storeDeleteCommand :: StoreDir -> [String] -> IO ()
 storeDeleteCommand storeDir rawPaths = do
   targets <- either (failWith . prefixed) pure (traverse (resolveDeleteTarget storeDir . T.pack) rawPaths)
   store <- openStore storeDir
-  result <- withLiveSet store (\live -> deleteEach store live targets)
+  result <- deleteStorePaths store targets reportDeleted
   closeStore store
-  either (failWith . prefixed) pure (join result)
+  either (failWith . prefixed) pure result
   where
     prefixed err = "store delete: " <> err
-    deleteEach :: Store -> LiveSet -> [T.Text] -> IO (Either T.Text ())
-    deleteEach _ _ [] = pure (Right ())
-    deleteEach store live (basename : rest) = do
-      outcome <- deleteStorePathChecked store live basename
-      case outcome of
-        Left err -> pure (Left err)
-        Right removed -> do
-          TIO.putStrLn ("deleted " <> basename <> describeOutcome removed)
-          deleteEach store live rest
+    reportDeleted basename removed = TIO.putStrLn ("deleted " <> basename <> describeOutcome removed)
     describeOutcome removed
       | doRowRemoved removed && doTreeRemoved removed = ""
       | doRowRemoved removed = " (no tree on disk)"

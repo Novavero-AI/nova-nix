@@ -27,7 +27,7 @@ import Data.Char (intToDigit, isAsciiLower, isAsciiUpper, isDigit)
 import Data.Foldable (toList)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List (find, inits, intercalate, isPrefixOf, mapAccumL, nub, sort, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
@@ -97,7 +97,7 @@ import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScop
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, pushPaths, storePathBasename, stripHashPrefix)
 import qualified Nix.Realise as Realise
-import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
@@ -14871,6 +14871,48 @@ testStoreDelete = do
               | not depValid && not userValid -> Pass
               | otherwise -> Fail "rows survived deletion"
             other -> Fail ("chain deletion failed: " <> T.pack (show other)),
+        -- One call deletes in the order given under one live set: a
+        -- referrer named first clears the way for the path it references,
+        -- each deletion is reported before the next begins, and the first
+        -- entry that cannot be deleted ends the call with the entries
+        -- after it untouched.  The referrer's hash sorts after its
+        -- reference's, so a call that reordered its arguments would fail
+        -- on the reference.
+        runTestM "a batch delete reports each deletion in argument order and stops at the first failure" $ do
+          let batchDep = StorePath (T.replicate 32 "l") "del-batch-dep"
+              batchUser = StorePath (T.replicate 32 "m") "del-batch-user"
+              batchAfter = StorePath (T.replicate 32 "p") "del-batch-after"
+              missing = T.replicate 32 "n" <> "-del-batch-missing"
+              batchPaths = [batchUser, batchDep, batchAfter]
+              plant sp = do
+                createDirectoryIfMissing True (storePathToFilePath sd sp)
+                TIO.writeFile (storePathToFilePath sd sp </> "data.txt") "batch"
+          mapM_ plant batchPaths
+          registerPaths
+            (stDB store)
+            [ PathRegistration batchDep "sha256:bd" 1 Nothing [],
+              PathRegistration batchUser "sha256:bu" 1 Nothing [batchDep],
+              PathRegistration batchAfter "sha256:ba" 1 Nothing []
+            ]
+          reports <- newIORef []
+          let report basename removed = do
+                stillValid <- mapM (isValid store) batchPaths
+                modifyIORef' reports ((basename, removed, stillValid) :)
+          result <- deleteStorePaths store [basenameOf batchUser, basenameOf batchDep, missing, basenameOf batchAfter] report
+          reported <- reverse <$> readIORef reports
+          afterKept <- (&&) <$> isValid store batchAfter <*> Dir.doesPathExist (storePathToFilePath sd batchAfter </> "data.txt")
+          let expected =
+                [ (basenameOf batchUser, DeleteOutcome True True, [False, True, True]),
+                  (basenameOf batchDep, DeleteOutcome True True, [False, False, True])
+                ]
+          pure $ case result of
+            Left err
+              | missing `T.isPrefixOf` err,
+                "not in this store" `T.isInfixOf` err,
+                reported == expected,
+                afterKept ->
+                  Pass
+            other -> Fail ("wrong batch: " <> T.pack (show (other, reported, afterKept))),
         runTestM "a registered row without a tree deletes (repair case)" $ do
           let ghost = StorePath (T.replicate 32 "c") "del-ghost"
           registerPath (stDB store) (PathRegistration ghost "sha256:g" 1 Nothing [])

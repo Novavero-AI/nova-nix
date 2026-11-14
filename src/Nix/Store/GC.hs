@@ -1,4 +1,7 @@
--- | Garbage collection: roots, the reachability walk, and the sweep.
+{-# LANGUAGE ScopedTypeVariables #-}
+
+-- | Garbage collection: roots, the reachability walk, the sweep, and the
+-- checked delete of named paths.
 --
 -- == Roots
 --
@@ -63,7 +66,7 @@
 --
 -- 'collectGarbage' is the IO boundary: dead rows go in one database
 -- transaction ('unregisterPathRows'), then trees one by one.  Rows
--- before trees for the reason 'Nix.Store.deleteStorePathRaw' gives: a
+-- before trees for the reason 'deleteStorePathRaw' gives: a
 -- tree without a row is inert debris, a row without a tree is a lie
 -- existence checks believe.  A dead row with no tree is unregistered
 -- without a line or a count: upstream's sweep walks the directory and
@@ -97,24 +100,35 @@
 -- build configured with another one) and a store reached through a bind
 -- mount are not recognised.
 --
+-- == Deleting named paths
+--
+-- Upstream's @nix-store --delete@ is a collection whose action is
+-- @gcDeleteSpecific@ (@opDelete@ at 2.24.9), and the checked delete
+-- here is one too: it holds the exclusive lock, reads the roots once,
+-- and checks every path it is given against that live set
+-- ('deleteStorePaths' for a batch in argument order,
+-- 'deleteStorePathRaw' for one path).  The live set is made and
+-- consumed inside the call, so a delete always checks the roots of its
+-- own store as they stand under the lock it holds.
+--
 -- == The lock
 --
 -- Upstream serialises collection against writers with a store-wide
 -- @gc.lock@, held exclusively by the collector and shared by every
 -- writer, plus a socket through which a writer registers roots with a
 -- running collector.  nova-nix keeps the lock and drops the socket:
--- every open t'Store' handle holds the shared lock from 'Nix.Store.Handle.openStore' to
--- 'Nix.Store.Handle.closeStore' ("Nix.Store.Handle"), and 'collectGarbage' (and
--- 'withLiveSet', which the checked delete runs under) trades the
--- handle's shared lease for the exclusive lock for the duration.  A
--- collection therefore runs only while no other process has the store
--- open, and a process opening the store while one runs waits for it to
--- finish.  That is coarser than the per-path locks the builder and
--- substituter hold, and deliberately so: a per-path lock covers a path
--- while it is being produced, but not the window between a dependency's
--- registration and the build that consumes it, nor the writers that
--- register without one (the @.drv@ closure, the eval-time store
--- writes).  Under the exclusive lock no writer is active, so the
+-- every open t'Store' handle holds the shared lock from
+-- 'Nix.Store.Handle.openStore' to 'Nix.Store.Handle.closeStore'
+-- ("Nix.Store.Handle"), and 'collectGarbage' and the checked delete
+-- trade the handle's shared lease for the exclusive lock for the
+-- duration.  A collection therefore runs only while no other process has
+-- the store open, and a process opening the store while one runs waits
+-- for it to finish.  That is coarser than the per-path locks the builder
+-- and substituter hold, and deliberately so: a per-path lock covers a
+-- path while it is being produced, but not the window between a
+-- dependency's registration and the build that consumes it, nor the
+-- writers that register without one (the @.drv@ closure, the eval-time
+-- store writes).  Under the exclusive lock no writer is active, so the
 -- collector takes no per-path lock and creates no lock file.
 -- 'findRoots' alone needs only the handle's shared lease: a listing
 -- changes nothing another handle reads, and upstream's @--print-roots@
@@ -134,11 +148,6 @@ module Nix.Store.GC
     referencesMap,
     reachableFrom,
 
-    -- * The live set
-    LiveSet,
-    withLiveSet,
-    isLive,
-
     -- * Collection
     GcResults (..),
     collectGarbage,
@@ -148,6 +157,11 @@ module Nix.Store.GC
     gcSummaryLine,
     upstreamDatabasePath,
 
+    -- * Deleting named paths
+    DeleteOutcome (..),
+    deleteStorePaths,
+    deleteStorePathRaw,
+
     -- * Messages
     findingRootsMessage,
     stillAliveMessage,
@@ -155,8 +169,11 @@ module Nix.Store.GC
 where
 
 import Control.Exception (IOException, catch, displayException, throwIO, try)
-import Control.Monad (when)
+import Control.Monad (join, when)
+import Control.Monad.Except (ExceptT (..), runExceptT)
+import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
+import Data.Foldable (traverse_)
 import Data.List (isPrefixOf, isSuffixOf, sort)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -169,13 +186,13 @@ import qualified Data.Text.Encoding as TE
 import GHC.IO.Exception (IOErrorType (InappropriateType))
 import Nix.Eval.CanonPath (canonPath)
 import Nix.Hash (sha256Digest)
-import Nix.Store.DB (UnregisterResult (..), isValidPath, metaDirName, queryAllReferences, queryAllValidPaths, unregisterPathRows)
+import Nix.Store.DB (UnregisterResult (..), isValidPath, metaDirName, queryAllReferences, queryAllValidPaths, unregisterPathRow, unregisterPathRows)
 import Nix.Store.Handle (Store (..), withCollectorLock)
-import Nix.Store.Lock (lockedPathOf)
+import Nix.Store.Lock (lockFileSuffix, lockedPathOf, withLockFile)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, storePathToFilePath)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode, createSymlinkOfKind)
 import qualified NovaCache.Base32 as Base32
-import System.Directory (canonicalizePath, createDirectoryIfMissing, getFileSize, getPermissions, getSymbolicLinkTarget, listDirectory, makeAbsolute, removePathForcibly, renamePath)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesPathExist, getFileSize, getPermissions, getSymbolicLinkTarget, listDirectory, makeAbsolute, pathIsSymbolicLink, removePathForcibly, renamePath)
 import System.FilePath (dropTrailingPathSeparator, normalise, splitDirectories, takeDirectory, takeFileName, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorType, isDoesNotExistError, isPermissionError)
@@ -526,19 +543,20 @@ reachableFrom refs = go Set.empty
 
 -- | The live set at one moment under the exclusive collector lock: the
 -- roots' closure over the references map.  Only 'withLiveSet' makes
--- one, so a checked delete holding it holds the lock and a set the
--- delete can act on.
+-- one, and no export takes or returns one, so a checked delete holding
+-- it holds the lock it was made under and the roots of its own store.
 newtype LiveSet = LiveSet (Set Text)
 
 -- | Whether the live set holds a path, spelled as the database spells it.
 isLive :: LiveSet -> Text -> Bool
 isLive (LiveSet live) path = Set.member path live
 
--- | Run a checked operation under the exclusive collector lock with the
+-- | Run a checked delete under the exclusive collector lock with the
 -- live set as it stands, after upstream's roots line.  Refused, with
 -- the action not run, for a store upstream Nix's database may also
 -- manage, before the lock is taken, and when the database holds a path
--- outside the opened directory.
+-- outside the opened directory.  Every caller consumes the set inside
+-- the action and returns no part of it.
 withLiveSet :: Store -> (LiveSet -> IO a) -> IO (Either Text a)
 withLiveSet store act = unlessUpstreamManaged store $ withCollectorLock store $ do
   checked <- validPathsUnder store
@@ -627,7 +645,7 @@ data SweepPlan = SweepPlan
 
 -- | The sweep plan over the valid set, the live set and the store
 -- directory's entries.  The lock-file test is the one
--- 'Nix.Store.deleteStorePathRaw' makes: a lock-shaped name with no row
+-- 'deleteStorePathRaw' makes: a lock-shaped name with no row
 -- is a lock file, since only the rows can tell one from a store object
 -- that happens to be called @flake.lock@, so a dead row's tree goes
 -- whatever its name, and an unregistered lock-shaped entry stays only
@@ -722,3 +740,130 @@ gcSummaryLine results =
     <> " store paths deleted, "
     <> showFreedBytes (gcrBytesFreed results)
     <> " freed"
+
+-- ---------------------------------------------------------------------------
+-- Deleting named paths
+-- ---------------------------------------------------------------------------
+
+-- | What deleting one entry removed.
+data DeleteOutcome = DeleteOutcome
+  { -- | A ValidPaths row (with its outgoing reference edges) was removed.
+    doRowRemoved :: !Bool,
+    -- | An on-disk tree was removed.
+    doTreeRemoved :: !Bool
+  }
+  deriving (Eq, Show)
+
+-- | Delete store entries by basename in the order given, each as
+-- 'deleteStorePathRaw' deletes one, under one collector lock and one
+-- live set, after upstream's roots line, printed once for the call.
+-- The action reports each deletion as it completes, before the next
+-- begins, and runs under the collector lock.  The first entry whose
+-- delete returns 'Left' ends the call with that reason: the entries
+-- before it are deleted and reported, and those after it are untouched.
+-- The order is what deletes a reference chain leaf-first in one call: a
+-- referrer named earlier is unregistered before the path it references
+-- is checked.  Refused, with nothing deleted or reported, for a store
+-- upstream Nix's database may also manage and over a database keyed
+-- under another spelling of the directory.
+deleteStorePaths :: Store -> [Text] -> (Text -> DeleteOutcome -> IO ()) -> IO (Either Text ())
+deleteStorePaths store basenames report =
+  join <$> withLiveSet store (\live -> runExceptT (traverse_ (deleteAndReport live) basenames))
+  where
+    deleteAndReport live basename = do
+      removed <- ExceptT (deleteStorePathChecked store live basename)
+      liftIO (report basename removed)
+
+-- | Delete one store entry by basename: its registration row and its
+-- on-disk tree, under the collector lock with the live set as it
+-- stands, after upstream's roots line.  Row first, tree second: an
+-- orphan tree left by a failed removal is inert debris, while a
+-- still-registered row whose tree is gone would be adopted as valid by
+-- existence checks.  A row without a tree and a tree without a row both
+-- delete (the repair cases); only a target with neither is an error.
+-- An unregistered lock file of a store path is refused, since lock
+-- files coordinate concurrent store access.
+--
+-- Liveness is upstream's rule for a specific delete: a path reachable
+-- from a root is refused with its words.  The referrer refusal that
+-- follows is this tool's own in wording and in shape.  Upstream refuses
+-- a path with an unrooted referrer with the same still-alive line
+-- unless that referrer is named in the same invocation (its
+-- @pathsToDelete@ set in 2.24.9's @deleteReferrersClosure@), in which
+-- case the named set deletes referrer-first; this delete removes
+-- exactly the path named and lists the referrers that stand in the way,
+-- so a chain deletes leaf-first in argument order through
+-- 'deleteStorePaths', which shares one lock and one live set among the
+-- entries it is given.  Refused, with nothing deleted, for a store
+-- upstream Nix's database may also manage and over a database keyed
+-- under another spelling of the directory.
+deleteStorePathRaw :: Store -> Text -> IO (Either Text DeleteOutcome)
+deleteStorePathRaw store basename =
+  join <$> withLiveSet store (\live -> deleteStorePathChecked store live basename)
+
+-- | The delete of one entry given the live set, which stands for the
+-- collector lock being held.  Inside the collector lock the sequence
+-- also holds the target's per-path lock - the same file a substituter
+-- of the path locks, as upstream's deletePath does - so a holder that
+-- is not a store handle (nothing in this tool, but nothing forbids one)
+-- still cannot have its delete-materialize-register torn apart by this
+-- delete.
+deleteStorePathChecked :: Store -> LiveSet -> Text -> IO (Either Text DeleteOutcome)
+deleteStorePathChecked store live basename
+  | isLive live (T.pack target) = pure (Left (stillAliveMessage (T.pack target)))
+  | otherwise = deleteUnderPathLock
+  where
+    target = unStoreDir (stDir store) </> T.unpack basename
+    deleteUnderPathLock = withLockFile (target <> lockFileSuffix) $ \_ -> do
+      -- A holder never deletes a lock file (the 'Nix.Store.Lock'
+      -- header), and neither does this delete.  A target is one when
+      -- stripping the suffix leaves a well-formed store basename AND no
+      -- registration row bears the full name: names like @flake.lock@
+      -- are legal store-path names, so a registered object of this
+      -- exact name deletes normally, and only the rows can tell the two
+      -- apart.  The check precedes the row removal below, which is
+      -- destructive.
+      registered <- case parseStorePathBaseName basename of
+        Just sp -> isValidPath (stDB store) sp
+        Nothing -> pure False
+      case (registered, lockedPathOf basename) of
+        (False, Just guardedPath) ->
+          pure
+            ( Left
+                ( basename
+                    <> ": names the lock file of "
+                    <> guardedPath
+                    <> "; lock files coordinate concurrent store access"
+                    <> " and are never deleted here (store gc removes it,"
+                    <> " and any unregistered store object of this exact"
+                    <> " name, once "
+                    <> guardedPath
+                    <> " is not live)"
+                )
+            )
+        _ -> deleteRowAndTree
+    deleteRowAndTree = do
+      rowResult <- unregisterPathRow (stDB store) (T.pack target)
+      case rowResult of
+        RowReferenced referrers ->
+          pure
+            ( Left
+                ( basename
+                    <> " is referenced by:"
+                    <> T.concat ["\n  " <> r | r <- referrers]
+                )
+            )
+        _ -> do
+          -- 'doesPathExist' follows links, so a dangling top-level symlink
+          -- would read as absent; links are leaves here (as in store walks),
+          -- and leftover link debris must still be removable.
+          treeExisted <- do
+            onDisk <- doesPathExist target
+            if onDisk
+              then pure True
+              else pathIsSymbolicLink target `catch` \(_ :: IOException) -> pure False
+          when treeExisted (removePathForcibly target)
+          let rowRemoved = rowResult == RowUnregistered
+          if rowRemoved || treeExisted
+            then pure (Right DeleteOutcome {doRowRemoved = rowRemoved, doTreeRemoved = treeExisted})
+            else pure (Left (basename <> ": not in this store (no registration row, no tree on disk)"))
