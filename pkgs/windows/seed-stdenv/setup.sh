@@ -16,6 +16,12 @@
 #                                 configure
 #   $configureScript              the configure script, ./configure unless
 #                                 set
+# and nixpkgs' two for running make in parallel:
+#   $enableParallelBuilding       run the default build phase's make with
+#                                 -j$NIX_BUILD_CORES, as nixpkgs' does
+#   $enableParallelInstalling     the same for the default install phase,
+#                                 on with parallel building unless the
+#                                 package turns it off (see default.nix)
 # and the tools, all built from the seed:
 #   $initialPath     the store paths whose bin directories the build runs
 #   $CC, $LD, $AR    tinycc-native, which finds its runtime with -B
@@ -95,6 +101,15 @@ export PATH_SEPARATOR=';' ac_executable_extensions=.exe
 # searches PATH, and busybox has a make; the build's make is GNU make.
 export BB_OVERRIDE_APPLETS=make
 
+# NIX_BUILD_CORES as nixpkgs' setup.sh leaves it for make -j: 1 when the
+# builder sets none, and for 0 what nproc counts, or 1 if it counts none.
+NIX_BUILD_CORES=${NIX_BUILD_CORES:-1}
+if [ "$NIX_BUILD_CORES" -le 0 ]; then
+  guess=$(nproc 2>/dev/null || true)
+  NIX_BUILD_CORES=$(( ${guess:-0} <= 0 ? 1 : guess ))
+fi
+export NIX_BUILD_CORES
+
 builddir="$PWD"
 toSlashes builddir
 mkdir -p "$builddir/tmp"
@@ -163,7 +178,7 @@ fi
 if [ -n "$buildPhase" ]; then
   eval "$buildPhase"
 else
-  make $makeFlags
+  make ${enableParallelBuilding:+-j$NIX_BUILD_CORES} $makeFlags
 fi
 
 # --- install phase ---
@@ -173,5 +188,5 @@ fi
 if [ -n "$installPhase" ]; then
   eval "$installPhase"
 else
-  make $makeFlags install prefix="$prefix"
+  make ${enableParallelInstalling:+-j$NIX_BUILD_CORES} $makeFlags install prefix="$prefix"
 fi

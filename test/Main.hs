@@ -13838,11 +13838,24 @@ testGccCoreWindows = do
                 "--with-stage1-libs=" <> outputOf direntRoot <> "/lib/libdirent.a"
               ]
               (flagsWith ["--target=", "--with-headers", "--with-sysroot", "--with-build-sysroot", "--with-as=", "--with-ld=", "--with-stage1-libs="] gccCore),
-          runTest "gcc-core builds and installs the compiler alone" $
+          runTest "gcc-core builds and installs the compiler alone, make running NIX_BUILD_CORES jobs" $
             assertEqual
-              "phases"
-              ("make all-gcc", "make install-gcc")
-              (maybe "" (variableOf "buildPhase") gccCore, maybe "" (variableOf "installPhase") gccCore),
+              "phases and parallelism"
+              ("make ${enableParallelBuilding:+-j$NIX_BUILD_CORES} all-gcc", "make ${enableParallelInstalling:+-j$NIX_BUILD_CORES} install-gcc", "1", "1")
+              ( maybe "" (variableOf "buildPhase") gccCore,
+                maybe "" (variableOf "installPhase") gccCore,
+                maybe "" (variableOf "enableParallelBuilding") gccCore,
+                maybe "" (variableOf "enableParallelInstalling") gccCore
+              ),
+          runTestIO
+            "the seed stdenv installs in parallel where a package builds in parallel and does not turn installing off"
+            cwd
+            ( "let mk = "
+                <> windows
+                <> ".seedStdenv.mkDerivation; installing = d: if d.drvAttrs ? enableParallelInstalling then (if d.drvAttrs.enableParallelInstalling then \"on\" else \"off\") else \"unset\"; in "
+                <> "builtins.concatStringsSep \" \" (map installing [ (mk { name = \"a\"; enableParallelBuilding = true; }) (mk { name = \"b\"; enableParallelBuilding = true; enableParallelInstalling = false; }) (mk { name = \"c\"; }) ])"
+            )
+            (mkStr "on off unset"),
           runTest "mingw-w64-headers is configured in its own directory, for msvcrt, with no flag that moves the include directory gcc-core names" $
             assertEqual
               "preConfigure and flags"

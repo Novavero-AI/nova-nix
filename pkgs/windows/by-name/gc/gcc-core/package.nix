@@ -196,8 +196,11 @@ seedStdenv.mkDerivation {
     "CFLAGS=-Dalloca=alloca"
   ];
 
-  buildPhase = "make all-gcc";
-  installPhase = "make install-gcc";
+  # make runs $NIX_BUILD_CORES jobs, as minimal-bootstrap/gcc/4.6.nix's
+  # make does.
+  enableParallelBuilding = true;
+  buildPhase = "make \${enableParallelBuilding:+-j$NIX_BUILD_CORES} all-gcc";
+  installPhase = "make \${enableParallelInstalling:+-j$NIX_BUILD_CORES} install-gcc";
 }
 // {
   srcs = [

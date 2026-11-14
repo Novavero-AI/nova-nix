@@ -93,6 +93,14 @@ in
         # system name is Windows_NT.
         buildTriple = "i686-pc-mingw32";
       }
+      # Parallel installing follows parallel building unless the package
+      # says otherwise, as nixpkgs' make-derivation.nix sets it.
+      // (
+        if attrs.enableParallelBuilding or false then
+          { enableParallelInstalling = attrs.enableParallelInstalling or true; }
+        else
+          { }
+      )
     )
     // {
       # What the package fetches, as the stage-1 stdenv states it: its

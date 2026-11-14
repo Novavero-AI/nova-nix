@@ -26,13 +26,16 @@
 # here, there being no symbolic link to name true with.  make runs it for
 # bfd's manual, whose stamp the build writes, in the build and again in
 # install, and the manual the archive ships is the one installed; without
-# it the missing script fails the build.  nixpkgs builds ld apart from the
-# rest, for a race over a dependency file when make runs several jobs; the
-# stdenv's make runs one and tracks no dependency.  Its two settings for
-# libtool have nothing to do either: the command length libtool would
-# measure is 8192 on a MinGW build host, unmeasured and many times the
-# longest archive command here, and the edit of ltmain.sh sorts the members
-# libtool unpacks from an archive, where this configuration unpacks none.
+# it the missing script fails the build.  make runs $NIX_BUILD_CORES jobs,
+# as in nixpkgs, in one run.  minimal-bootstrap/binutils builds ld on its
+# own, for a race between jobs over ld/.deps/ldwrite.Po; that file is
+# dependency tracking's (ld/Makefile.in:1581), and with
+# --disable-dependency-tracking the compile rule writes none.  nixpkgs' two
+# settings for libtool have nothing to do either: the command length
+# libtool would measure is 8192 on a MinGW build host, unmeasured and many
+# times the longest archive command here, and the edit of ltmain.sh sorts
+# the members libtool unpacks from an archive, where this configuration
+# unpacks none.
 #
 # nixpkgs' deterministic.patch is not applied.  It sets
 # BFD_DETERMINISTIC_OUTPUT on the linker's output, which the archive and
@@ -133,4 +136,6 @@ seedStdenv.mkDerivation {
   ];
 
   makeFlags = [ "MAKEINFO=true" ];
+
+  enableParallelBuilding = true;
 }
