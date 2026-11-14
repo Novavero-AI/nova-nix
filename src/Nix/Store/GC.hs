@@ -83,6 +83,20 @@
 -- opened directory ('validPathsUnder') rather than sweep a rooted
 -- closure over a text mismatch.
 --
+-- == A store upstream Nix also manages
+--
+-- Upstream registers its paths in its own database and keeps its roots
+-- under its own state directory, so in a directory upstream also uses,
+-- no row or root here keeps an upstream path, and the sweep would take
+-- every one for an unregistered tree.  The collector and the checked
+-- delete refuse a store whose directory, as spelled or as its links
+-- resolve, has upstream's database where upstream's local store keeps it
+-- ('upstreamDatabasePath'): @\/nix\/var\/nix\/db\/db.sqlite@ for
+-- @\/nix\/store@.  They refuse, too, when that path cannot be examined.
+-- An upstream whose state directory is moved (@NIX_STATE_DIR@, or a
+-- build configured with another one) and a store reached through a bind
+-- mount are not recognised.
+--
 -- == The lock
 --
 -- Upstream serialises collection against writers with a store-wide
@@ -132,6 +146,7 @@ module Nix.Store.GC
     sweepPlan,
     showFreedBytes,
     gcSummaryLine,
+    upstreamDatabasePath,
 
     -- * Messages
     findingRootsMessage,
@@ -139,10 +154,10 @@ module Nix.Store.GC
   )
 where
 
-import Control.Exception (IOException, catch, throwIO, try)
+import Control.Exception (IOException, catch, displayException, throwIO, try)
 import Control.Monad (when)
 import qualified Data.ByteString as BS
-import Data.List (isPrefixOf, sort)
+import Data.List (isPrefixOf, isSuffixOf, sort)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, isJust, listToMaybe, mapMaybe)
@@ -160,8 +175,8 @@ import Nix.Store.Lock (lockedPathOf)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, storePathToFilePath)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode, createSymlinkOfKind)
 import qualified NovaCache.Base32 as Base32
-import System.Directory (createDirectoryIfMissing, getFileSize, getSymbolicLinkTarget, listDirectory, makeAbsolute, removePathForcibly, renamePath)
-import System.FilePath (normalise, splitDirectories, takeDirectory, takeFileName, (</>))
+import System.Directory (canonicalizePath, createDirectoryIfMissing, getFileSize, getPermissions, getSymbolicLinkTarget, listDirectory, makeAbsolute, removePathForcibly, renamePath)
+import System.FilePath (dropTrailingPathSeparator, normalise, splitDirectories, takeDirectory, takeFileName, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorType, isDoesNotExistError, isPermissionError)
 import System.OsPath (encodeFS)
@@ -204,6 +219,29 @@ recordStagingPath dir link = unStoreDir dir </> metaDirName </> indirectRootReco
 stagingSuffix :: FilePath
 stagingSuffix = ".tmp"
 
+-- | The database upstream Nix would keep for a store in this directory,
+-- when the directory is one upstream's local store uses.  That store is
+-- @\/nix\/store@, with its state in @nixStateDir@, @\/nix\/var\/nix@
+-- unless @NIX_STATE_DIR@ or the build moves it; or, opened with a root,
+-- @\<root\>\/nix\/store@ with its state in @\<root\>\/nix\/var\/nix@
+-- (@LocalFSStoreConfig@).  The database is @db\/db.sqlite@ in the state
+-- directory (@LocalStore@).
+upstreamDatabasePath :: FilePath -> Maybe FilePath
+upstreamDatabasePath dir
+  | upstreamStoreDirTail `isSuffixOf` splitDirectories trimmed = Just (takeDirectory trimmed </> upstreamDatabaseRelPath)
+  | otherwise = Nothing
+  where
+    trimmed = dropTrailingPathSeparator dir
+
+-- | The last two components of every directory upstream's local store
+-- keeps a store in.
+upstreamStoreDirTail :: [FilePath]
+upstreamStoreDirTail = ["nix", "store"]
+
+-- | Upstream's database, relative to the directory that holds its store.
+upstreamDatabaseRelPath :: FilePath
+upstreamDatabaseRelPath = "var" </> "nix" </> "db" </> "db.sqlite"
+
 -- ---------------------------------------------------------------------------
 -- Messages
 -- ---------------------------------------------------------------------------
@@ -245,6 +283,27 @@ stillAliveMessage path =
   "Cannot delete path '"
     <> path
     <> "' since it is still alive. To find out why, use: nova-nix store gc --print-roots"
+
+-- | The refusal of a store upstream Nix's database also manages.
+upstreamManagedMessage :: FilePath -> FilePath -> Text
+upstreamManagedMessage dir db =
+  "upstream Nix's database '"
+    <> T.pack db
+    <> "' also manages the store '"
+    <> T.pack dir
+    <> "': the paths it registers have no row in this store's database and the roots it keeps are not read, so nova-nix would delete those paths as unregistered"
+
+-- | The refusal of a store when upstream Nix's database cannot be looked
+-- for.
+upstreamUnknownMessage :: FilePath -> FilePath -> IOException -> Text
+upstreamUnknownMessage dir db err =
+  "cannot tell whether upstream Nix's database '"
+    <> T.pack db
+    <> "' manages the store '"
+    <> T.pack dir
+    <> "' ("
+    <> T.pack (displayException err)
+    <> "): if it does, nova-nix would delete the paths it registers as unregistered"
 
 -- | Upstream's refusal of an out-link inside the store, with this tool's
 -- command in the parenthetical.
@@ -477,10 +536,11 @@ isLive (LiveSet live) path = Set.member path live
 
 -- | Run a checked operation under the exclusive collector lock with the
 -- live set as it stands, after upstream's roots line.  Refused, with
--- the action not run, when the database holds a path outside the opened
--- directory ('validPathsUnder').
+-- the action not run, for a store upstream Nix's database may also
+-- manage, before the lock is taken, and when the database holds a path
+-- outside the opened directory.
 withLiveSet :: Store -> (LiveSet -> IO a) -> IO (Either Text a)
-withLiveSet store act = withCollectorLock store $ do
+withLiveSet store act = unlessUpstreamManaged store $ withCollectorLock store $ do
   checked <- validPathsUnder store
   case checked of
     Left err -> pure (Left err)
@@ -495,6 +555,32 @@ liveSetOf store = do
   roots <- findRoots store
   refs <- referencesMap <$> queryAllReferences (stDB store)
   pure (LiveSet (reachableFrom refs (map grPath roots)))
+
+-- | Run a collection or a checked delete unless upstream Nix's database
+-- may also manage the store: it exists for the directory as the handle
+-- spells it or as its links resolve ('upstreamDatabasePath'), or such a
+-- path cannot be examined.  The paths upstream registers have no row
+-- here and the roots it keeps are not read, so every one would be
+-- deleted as an unregistered tree.  The look reads nothing of this
+-- store's, so it runs before the collector lock and a refusal does not
+-- wait behind an open handle.
+unlessUpstreamManaged :: Store -> IO (Either Text a) -> IO (Either Text a)
+unlessUpstreamManaged store act = do
+  let dir = unStoreDir (stDir store)
+  resolved <- canonicalizePath dir
+  found <- traverse (probe dir) (Set.toList (Set.fromList (mapMaybe upstreamDatabasePath [dir, resolved])))
+  maybe act (pure . Left) (listToMaybe (catMaybes found))
+  where
+    -- On POSIX getPermissions stats the path, and on Windows it opens it
+    -- with no access rights, so a database this user cannot read refuses
+    -- the store, as present or as unexaminable.
+    probe dir db = do
+      probed <- try (getPermissions db)
+      pure $ case probed of
+        Left err
+          | isDoesNotExistError err -> Nothing
+          | otherwise -> Just (upstreamUnknownMessage dir db err)
+        Right _ -> Just (upstreamManagedMessage dir db)
 
 -- | Every valid path as the database spells it, refused when one lies
 -- outside the opened directory: the collector and the checked delete
@@ -562,12 +648,13 @@ sweepPlan storeDir valid live entries =
 
 -- | Collect garbage: find the roots, walk the references, remove every
 -- dead row in one transaction, then every dead or unregistered tree.
--- Holds the collector lock throughout, and is refused over a database
--- keyed under another spelling of the directory ('validPathsUnder').
+-- Holds the collector lock throughout.  Refused for a store upstream
+-- Nix's database may also manage, before the lock is taken, and over a
+-- database keyed under another spelling of the directory.
 -- The progress lines are upstream's, on stderr; the summary is the
 -- caller's to print ('gcSummaryLine').
 collectGarbage :: Store -> IO (Either Text GcResults)
-collectGarbage store = withCollectorLock store $ do
+collectGarbage store = unlessUpstreamManaged store $ withCollectorLock store $ do
   checked <- validPathsUnder store
   case checked of
     Left err -> pure (Left err)
