@@ -1,0 +1,8 @@
+hello, world
+1234567890123 / -1000 = -1234567890 remainder 123
+1.250000
+hello.exe exits 0
+	DLL Name: KERNEL32.dll
+	DLL Name: msvcrt.dll
+T ___divdi3
+T ___moddi3

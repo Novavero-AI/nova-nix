@@ -9,9 +9,9 @@
 # And it compiles answer.c to an object, through binutils' as, which ld
 # links as a program's entry point and which runs: the function returns a
 # sum modulo 60, a division cc1 turns into a multiplication by a constant
-# it computes, and the sum makes it 42.  Nothing links against a runtime,
-# there being none yet, so no source calls a library function or divides
-# 64-bit integers, which libgcc would do.
+# it computes, and the sum makes it 42.  ld links the object alone, there
+# being no runtime yet, so no source calls a library function or divides
+# 64-bit integers, which would call libgcc.
 #
 # The script writes the assembly, a line for the headers, what nm reads
 # back of the object and the program's exit status to its output, without

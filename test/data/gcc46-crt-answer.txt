@@ -1,0 +1,481 @@
+./include/agtctl_i.c
+./include/agtsvr_i.c
+./include/cdoex_i.c
+./include/cdoexm_i.c
+./include/cdosys_i.c
+./include/emostore_i.c
+./include/iisext_i.c
+./include/mtsadmin_i.c
+./include/mtxadmin_i.c
+./include/scardssp_i.c
+./include/scardssp_p.c
+./include/tsuserex_i.c
+./lib/CRT_fp10.o
+./lib/CRT_fp8.o
+./lib/CRT_glob.o
+./lib/CRT_noglob.o
+./lib/binmode.o
+./lib/crt1.o
+./lib/crt1u.o
+./lib/crt2.o
+./lib/crt2u.o
+./lib/crtbegin.o
+./lib/crtend.o
+./lib/dllcrt1.o
+./lib/dllcrt2.o
+./lib/gcrt0.o
+./lib/gcrt1.o
+./lib/gcrt2.o
+./lib/libaclui.a
+./lib/libactiveds.a
+./lib/libadsldpc.a
+./lib/libadvapi32.a
+./lib/libamstrmid.a
+./lib/libapcups.a
+./lib/libauthz.a
+./lib/libavicap32.a
+./lib/libavifil32.a
+./lib/libavrt.a
+./lib/libbcrypt.a
+./lib/libbluetoothapis.a
+./lib/libbootvid.a
+./lib/libbrowcli.a
+./lib/libbthprops.a
+./lib/libcabinet.a
+./lib/libcap.a
+./lib/libcfgmgr32.a
+./lib/libclasspnp.a
+./lib/libclfsw32.a
+./lib/libclusapi.a
+./lib/libcmutil.a
+./lib/libcomctl32.a
+./lib/libcomdlg32.a
+./lib/libconnect.a
+./lib/libcredui.a
+./lib/libcrtdll.a
+./lib/libcrypt32.a
+./lib/libcryptnet.a
+./lib/libcryptsp.a
+./lib/libcryptxml.a
+./lib/libcscapi.a
+./lib/libctl3d32.a
+./lib/libd2d1.a
+./lib/libd3d10.a
+./lib/libd3d11.a
+./lib/libd3d12.a
+./lib/libd3d8.a
+./lib/libd3d9.a
+./lib/libd3dcompiler.a
+./lib/libd3dcompiler_33.a
+./lib/libd3dcompiler_34.a
+./lib/libd3dcompiler_35.a
+./lib/libd3dcompiler_36.a
+./lib/libd3dcompiler_37.a
+./lib/libd3dcompiler_38.a
+./lib/libd3dcompiler_39.a
+./lib/libd3dcompiler_40.a
+./lib/libd3dcompiler_41.a
+./lib/libd3dcompiler_42.a
+./lib/libd3dcompiler_43.a
+./lib/libd3dcompiler_46.a
+./lib/libd3dcompiler_47.a
+./lib/libd3dcsx_46.a
+./lib/libd3dcsxd.a
+./lib/libd3dcsxd_43.a
+./lib/libd3dim.a
+./lib/libd3drm.a
+./lib/libd3dx10.a
+./lib/libd3dx10_33.a
+./lib/libd3dx10_34.a
+./lib/libd3dx10_35.a
+./lib/libd3dx10_36.a
+./lib/libd3dx10_37.a
+./lib/libd3dx10_38.a
+./lib/libd3dx10_39.a
+./lib/libd3dx10_40.a
+./lib/libd3dx10_41.a
+./lib/libd3dx10_42.a
+./lib/libd3dx10_43.a
+./lib/libd3dx11.a
+./lib/libd3dx11_42.a
+./lib/libd3dx11_43.a
+./lib/libd3dx8d.a
+./lib/libd3dx9.a
+./lib/libd3dx9_24.a
+./lib/libd3dx9_25.a
+./lib/libd3dx9_26.a
+./lib/libd3dx9_27.a
+./lib/libd3dx9_28.a
+./lib/libd3dx9_29.a
+./lib/libd3dx9_30.a
+./lib/libd3dx9_31.a
+./lib/libd3dx9_32.a
+./lib/libd3dx9_33.a
+./lib/libd3dx9_34.a
+./lib/libd3dx9_35.a
+./lib/libd3dx9_36.a
+./lib/libd3dx9_37.a
+./lib/libd3dx9_38.a
+./lib/libd3dx9_39.a
+./lib/libd3dx9_40.a
+./lib/libd3dx9_41.a
+./lib/libd3dx9_42.a
+./lib/libd3dx9_43.a
+./lib/libd3dx9d.a
+./lib/libd3dxof.a
+./lib/libdavclnt.a
+./lib/libdavhlpr.a
+./lib/libdbgeng.a
+./lib/libdbghelp.a
+./lib/libdcomp.a
+./lib/libddraw.a
+./lib/libdelayimp.a
+./lib/libdevmgr.a
+./lib/libdevobj.a
+./lib/libdevrtl.a
+./lib/libdfscli.a
+./lib/libdhcpcsvc.a
+./lib/libdhcpcsvc6.a
+./lib/libdhcpsapi.a
+./lib/libdinput.a
+./lib/libdinput8.a
+./lib/libdismapi.a
+./lib/libdlcapi.a
+./lib/libdmoguids.a
+./lib/libdnsapi.a
+./lib/libdpapi.a
+./lib/libdplayx.a
+./lib/libdpnaddr.a
+./lib/libdpnet.a
+./lib/libdpnlobby.a
+./lib/libdpvoice.a
+./lib/libdsetup.a
+./lib/libdsound.a
+./lib/libdsrole.a
+./lib/libdssec.a
+./lib/libdwmapi.a
+./lib/libdwrite.a
+./lib/libdxapi.a
+./lib/libdxerr8.a
+./lib/libdxerr9.a
+./lib/libdxgi.a
+./lib/libdxguid.a
+./lib/libdxva2.a
+./lib/libeappcfg.a
+./lib/libeappgnui.a
+./lib/libeapphost.a
+./lib/libeappprxy.a
+./lib/libelscore.a
+./lib/libesent.a
+./lib/libevr.a
+./lib/libfaultrep.a
+./lib/libfwpuclnt.a
+./lib/libgdi32.a
+./lib/libgdiplus.a
+./lib/libglaux.a
+./lib/libglu32.a
+./lib/libglut.a
+./lib/libglut32.a
+./lib/libgmon.a
+./lib/libgpapi.a
+./lib/libgpedit.a
+./lib/libgpprefcl.a
+./lib/libgpscript.a
+./lib/libgptext.a
+./lib/libhal.a
+./lib/libhid.a
+./lib/libhidclass.a
+./lib/libhidparse.a
+./lib/libhtmlhelp.a
+./lib/libhttpapi.a
+./lib/libicmui.a
+./lib/libigmpagnt.a
+./lib/libimagehlp.a
+./lib/libimm32.a
+./lib/libiphlpapi.a
+./lib/libiscsidsc.a
+./lib/libkernel32.a
+./lib/libks.a
+./lib/libksecdd.a
+./lib/libksguid.a
+./lib/libksproxy.a
+./lib/libksuser.a
+./lib/libktmw32.a
+./lib/liblargeint.a
+./lib/liblocationapi.a
+./lib/liblogoncli.a
+./lib/liblz32.a
+./lib/libm.a
+./lib/libmapi32.a
+./lib/libmcd.a
+./lib/libmf.a
+./lib/libmfcuia32.a
+./lib/libmfplat.a
+./lib/libmfreadwrite.a
+./lib/libmfuuid.a
+./lib/libmgmtapi.a
+./lib/libmincore.a
+./lib/libmingw32.a
+./lib/libmingwex.a
+./lib/libmingwthrd.a
+./lib/libmmdevapi.a
+./lib/libmoldname.a
+./lib/libmpr.a
+./lib/libmprapi.a
+./lib/libmqrt.a
+./lib/libmsacm32.a
+./lib/libmscms.a
+./lib/libmsctf.a
+./lib/libmsctfmonitor.a
+./lib/libmsdmo.a
+./lib/libmsdrm.a
+./lib/libmshtml.a
+./lib/libmshtmled.a
+./lib/libmsi.a
+./lib/libmsimg32.a
+./lib/libmsoledbsql.a
+./lib/libmstask.a
+./lib/libmsvcp120_app.a
+./lib/libmsvcp60.a
+./lib/libmsvcr100.a
+./lib/libmsvcr110.a
+./lib/libmsvcr120.a
+./lib/libmsvcr120_app.a
+./lib/libmsvcr120d.a
+./lib/libmsvcr80.a
+./lib/libmsvcr90.a
+./lib/libmsvcr90d.a
+./lib/libmsvcrt-os.a
+./lib/libmsvcrt.a
+./lib/libmsvfw32.a
+./lib/libmswsock.a
+./lib/libncrypt.a
+./lib/libnddeapi.a
+./lib/libndfapi.a
+./lib/libndis.a
+./lib/libnetapi32.a
+./lib/libnetio.a
+./lib/libnetjoin.a
+./lib/libnetutils.a
+./lib/libnewdev.a
+./lib/libnormaliz.a
+./lib/libntdll.a
+./lib/libntdllcrt.a
+./lib/libntdsapi.a
+./lib/libntmsapi.a
+./lib/libntoskrnl.a
+./lib/libodbc32.a
+./lib/libodbccp32.a
+./lib/libole32.a
+./lib/liboleacc.a
+./lib/liboleaut32.a
+./lib/libolecli32.a
+./lib/liboledlg.a
+./lib/libolepro32.a
+./lib/libolesvr32.a
+./lib/libolethk32.a
+./lib/libopengl32.a
+./lib/libp2p.a
+./lib/libp2pcollab.a
+./lib/libp2pgraph.a
+./lib/libpcwum.a
+./lib/libpdh.a
+./lib/libpdhui.a
+./lib/libpenwin32.a
+./lib/libpkpd32.a
+./lib/libportabledeviceguids.a
+./lib/libpowrprof.a
+./lib/libprntvpt.a
+./lib/libpropsys.a
+./lib/libpsapi.a
+./lib/libquartz.a
+./lib/libqutil.a
+./lib/libqwave.a
+./lib/librapi.a
+./lib/librasapi32.a
+./lib/librasdlg.a
+./lib/libresutil.a
+./lib/librpcdce4.a
+./lib/librpcdiag.a
+./lib/librpchttp.a
+./lib/librpcns4.a
+./lib/librpcrt4.a
+./lib/librstrtmgr.a
+./lib/librtm.a
+./lib/librtutils.a
+./lib/libruntimeobject.a
+./lib/libsamcli.a
+./lib/libsapi.a
+./lib/libschannel.a
+./lib/libschedcli.a
+./lib/libscrnsave.a
+./lib/libscrnsavw.a
+./lib/libscsiport.a
+./lib/libsecur32.a
+./lib/libsecurity.a
+./lib/libsensorsapi.a
+./lib/libsetupapi.a
+./lib/libshcore.a
+./lib/libshell32.a
+./lib/libshfolder.a
+./lib/libshlwapi.a
+./lib/libslc.a
+./lib/libslcext.a
+./lib/libslwga.a
+./lib/libsnmpapi.a
+./lib/libspoolss.a
+./lib/libsrvcli.a
+./lib/libsspicli.a
+./lib/libstrmiids.a
+./lib/libsvrapi.a
+./lib/libsxs.a
+./lib/libsynchronization.a
+./lib/libt2embed.a
+./lib/libtapi32.a
+./lib/libtaskschd.a
+./lib/libtbs.a
+./lib/libtdh.a
+./lib/libtdi.a
+./lib/libtxfw32.a
+./lib/libucrt.a
+./lib/libucrtapp.a
+./lib/libucrtbase.a
+./lib/liburl.a
+./lib/liburlmon.a
+./lib/libusbcamd.a
+./lib/libusbcamd2.a
+./lib/libusbd.a
+./lib/libusbport.a
+./lib/libuser32.a
+./lib/libuserenv.a
+./lib/libusp10.a
+./lib/libuuid.a
+./lib/libuxtheme.a
+./lib/libvcruntime140_app.a
+./lib/libvdmdbg.a
+./lib/libversion.a
+./lib/libvfw32.a
+./lib/libvideoprt.a
+./lib/libvirtdisk.a
+./lib/libvss_ps.a
+./lib/libvssapi.a
+./lib/libwbemuuid.a
+./lib/libwdsclient.a
+./lib/libwdsclientapi.a
+./lib/libwdscore.a
+./lib/libwdscsl.a
+./lib/libwdsimage.a
+./lib/libwdstptc.a
+./lib/libwdsupgcompl.a
+./lib/libwdsutil.a
+./lib/libwebsocket.a
+./lib/libwecapi.a
+./lib/libwer.a
+./lib/libwevtapi.a
+./lib/libwevtfwd.a
+./lib/libwiadss.a
+./lib/libwimgapi.a
+./lib/libwin32k.a
+./lib/libwin32spl.a
+./lib/libwindowsapp.a
+./lib/libwindowscodecs.a
+./lib/libwinhttp.a
+./lib/libwininet.a
+./lib/libwinmm.a
+./lib/libwinscard.a
+./lib/libwinspool.a
+./lib/libwinstrm.a
+./lib/libwintrust.a
+./lib/libwinusb.a
+./lib/libwkscli.a
+./lib/libwlanapi.a
+./lib/libwlanui.a
+./lib/libwlanutil.a
+./lib/libwldap32.a
+./lib/libwmcodecdspuuid.a
+./lib/libwmilib.a
+./lib/libwow32.a
+./lib/libws2_32.a
+./lib/libwsdapi.a
+./lib/libwsnmp32.a
+./lib/libwsock32.a
+./lib/libwst.a
+./lib/libwtsapi32.a
+./lib/libx3daudio.a
+./lib/libx3daudio1_2.a
+./lib/libx3daudio1_3.a
+./lib/libx3daudio1_4.a
+./lib/libx3daudio1_5.a
+./lib/libx3daudio1_6.a
+./lib/libx3daudio1_7.a
+./lib/libx3daudiod1_7.a
+./lib/libxapofx.a
+./lib/libxapofx1_0.a
+./lib/libxapofx1_1.a
+./lib/libxapofx1_2.a
+./lib/libxapofx1_3.a
+./lib/libxapofx1_4.a
+./lib/libxapofx1_5.a
+./lib/libxapofxd1_5.a
+./lib/libxaudio2_8.a
+./lib/libxinput.a
+./lib/libxinput1_1.a
+./lib/libxinput1_2.a
+./lib/libxinput1_3.a
+./lib/libxinput1_4.a
+./lib/libxinput9_1_0.a
+./lib/txtmode.o
+00000450 T _WinMainCRTStartup
+         U __MINGW_INSTALL_DEBUG_MATHERR
+         U ___dyn_tls_init_callback
+         U ___getmainargs
+         U ___main
+00000000 B ___mingw_module_is_dll
+         U ___mingw_oldexcpt_handler
+         U ___mingw_setusermatherr
+00000004 C ___mingw_winmain_hInstance
+00000004 C ___mingw_winmain_lpCmdLine
+00000000 D ___mingw_winmain_nShowCmd
+         U ___native_startup_lock
+         U ___native_startup_state
+         U ___p__acmdln
+         U ___p__commode
+         U ___p__fmode
+         U ___set_app_type
+         U ___xc_a
+         U ___xc_z
+         U ___xi_a
+         U ___xi_z
+         U __amsg_exit
+         U __cexit
+         U __commode
+         U __dowildcard
+         U __fmode
+         U __fpreset
+         U __gnu_exception_handler@4
+         U __image_base__
+         U __imp__GetStartupInfoA@4
+         U __imp__SetUnhandledExceptionFilter@4
+         U __imp__Sleep@4
+         U __imp____initenv
+         U __initterm
+         U __matherr
+         U __newmode
+         U __onexit
+         U __pei386_runtime_relocator
+         U __set_invalid_parameter_handler
+         U __setargv
+00000470 T _atexit
+         U _exit
+         U _main
+00000460 T _mainCRTStartup
+         U _malloc
+         U _memcpy
+         U _mingw_app_type
+         U _mingw_initcharmax
+         U _mingw_initltsdrot_force
+         U _mingw_initltsdyn_force
+         U _mingw_initltssuo_force
+00000000 D _mingw_pcinit
+00000000 D _mingw_pcppinit
+         U _strlen

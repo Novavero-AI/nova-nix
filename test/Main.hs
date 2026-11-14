@@ -13502,7 +13502,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
+    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gcc46.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -13754,7 +13754,9 @@ testBinutilsWindows = do
 -- stops at a path that begins with a drive letter, as every store path on
 -- Windows does.  @--with-headers@ names the @include@ directory of
 -- mingw-w64-headers' output, where its configure installs them unless a
--- flag moves them.
+-- flag moves them.  libgcc is built and installed by the same make,
+-- without debugging information, which reaches it through the target
+-- libraries' CFLAGS and through a make variable of GCC's own.
 testGccCoreWindows :: IO [Bool]
 testGccCoreWindows = do
   putStrLn "pkgs/gcc-core"
@@ -13838,10 +13840,14 @@ testGccCoreWindows = do
                 "--with-stage1-libs=" <> outputOf direntRoot <> "/lib/libdirent.a"
               ]
               (flagsWith ["--target=", "--with-headers", "--with-sysroot", "--with-build-sysroot", "--with-as=", "--with-ld=", "--with-stage1-libs="] gccCore),
-          runTest "gcc-core builds and installs the compiler alone, make running NIX_BUILD_CORES jobs" $
+          runTest "gcc-core builds and installs the compiler and libgcc, make running NIX_BUILD_CORES jobs with its makeFlags" $
             assertEqual
               "phases and parallelism"
-              ("make ${enableParallelBuilding:+-j$NIX_BUILD_CORES} all-gcc", "make ${enableParallelInstalling:+-j$NIX_BUILD_CORES} install-gcc", "1", "1")
+              ( "make ${enableParallelBuilding:+-j$NIX_BUILD_CORES} $makeFlags all-gcc all-target-libgcc",
+                "make ${enableParallelInstalling:+-j$NIX_BUILD_CORES} $makeFlags install-gcc install-target-libgcc",
+                "1",
+                "1"
+              )
               ( maybe "" (variableOf "buildPhase") gccCore,
                 maybe "" (variableOf "installPhase") gccCore,
                 maybe "" (variableOf "enableParallelBuilding") gccCore,
@@ -13856,6 +13862,11 @@ testGccCoreWindows = do
                 <> "builtins.concatStringsSep \" \" (map installing [ (mk { name = \"a\"; enableParallelBuilding = true; }) (mk { name = \"b\"; enableParallelBuilding = true; enableParallelInstalling = false; }) (mk { name = \"c\"; }) ])"
             )
             (mkStr "on off unset"),
+          runTest "gcc-core passes configure CFLAGS_FOR_TARGET=-O2 and make LIBGCC2_DEBUG_CFLAGS=-g0, the two settings that keep -g from libgcc" $
+            assertEqual
+              "the target's CFLAGS and makeFlags"
+              (["CFLAGS_FOR_TARGET=-O2"], ["LIBGCC2_DEBUG_CFLAGS=-g0"])
+              (flagsWith ["CFLAGS_FOR_TARGET="] gccCore, wordsOf "makeFlags" gccCore),
           runTest "mingw-w64-headers is configured in its own directory, for msvcrt, with no flag that moves the include directory gcc-core names" $
             assertEqual
               "preConfigure and flags"
@@ -13898,6 +13909,144 @@ testGccCoreWindows = do
       archives
         ++ ["mingw-w64-headers-" <> mingwVersion, "gcc-core-" <> version, "answer.sh"]
         ++ concat [[name, name <> "-builder"] | name <- ["mingw-w64-dirent-" <> mingwVersion, "gcc-core-get-version", "gcc-core-answer"]]
+
+-- | @pkgs/windows@'s rung after GCC's core, read back as the build driver
+-- reads it: what mingw-w64-crt, gcc46 and @test\/data\/gcc46.nix@'s checks
+-- add to the closure of the GCC rung, which builds them.  The rung fetches
+-- nothing: the runtime is compiled from mingw-w64-headers' archive, so it
+-- adds no leaf, and it reads no input source but the stdenv's own files.
+-- The runtime's configure takes the compiler and archiver the environment
+-- names, and the stdenv's are tcc's, so its @preConfigure@ unsets them,
+-- and @C_INCLUDE_PATH@, which GCC reads as well; its flags name the target
+-- as the host and the headers' output as the sysroot, and its CFLAGS leave
+-- out the @-g@ configure would add.  gcc46 compiles nothing: busybox's sh
+-- copies gcc-core's output and the runtime's into one prefix, where the
+-- driver, run from there, finds the start files and libraries every link
+-- names.
+testGcc46Windows :: IO [Bool]
+testGcc46Windows = do
+  putStrLn "pkgs/gcc46"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expr -> runEvalIO st $ do
+      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          before <- sessionClosure (mapMaybe (`Map.lookup` rootOf) builtBefore)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, before, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, before, full) -> do
+      let added = Map.elems (Map.difference full before)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          crt = derivationAt crtRoot
+          gcc46 = derivationAt gcc46Root
+          headers = derivationAt headersRoot
+          -- The output of a root's derivation, as a flag spells a store
+          -- path, or a word no flag holds where the root is missing.
+          outputOf root = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (derivationAt root >>= listToMaybe . drvOutputs)
+          wordsOf name = maybe [] (T.words . variableOf name)
+          -- What preConfigure runs before it moves to the build directory.
+          firstLine = maybe "" (T.takeWhile (/= '\n') . variableOf "preConfigure")
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds is i686-windows" $
+            case [nameOf drv | drv <- added, drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "it adds no leaf: every source it builds from is the GCC rung's" $
+            assertEqual "leaves added" [] (map nameOf addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text and the stdenv's files" $
+            assertEqual
+              "input sources not written as text"
+              ["config.site", "include", "setup.sh"]
+              (sort [spName path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]),
+          runTest "mingw-w64-crt is built from mingw-w64-headers' archive by gcc-core and binutils, with tcc's variables unset" $
+            assertEqual
+              "src, buildInputs and preConfigure's first line"
+              (wordsOf "src" headers, [outputOf gccCoreRoot, outputOf binutilsRoot], "unset CC AR C_INCLUDE_PATH", isJust headers)
+              (wordsOf "src" crt, wordsOf "buildInputs" crt, firstLine crt, isJust crt),
+          runTest "mingw-w64-crt's flags name the target as the host, mingw-w64-headers' output as the sysroot, msvcrt and the 32-bit runtime alone, and CFLAGS with no -g" $
+            assertEqual
+              "flags"
+              [ "--host=" <> target,
+                "--with-sysroot=" <> outputOf headersRoot,
+                "--with-default-msvcrt=msvcrt",
+                "--enable-lib32",
+                "--disable-lib64",
+                "--disable-dependency-tracking",
+                "CFLAGS=-O2"
+              ]
+              (wordsOf "configureFlags" crt),
+          runTest "mingw-w64-crt builds with NIX_BUILD_CORES jobs and installs with one" $
+            assertEqual
+              "parallelism"
+              ("1", "")
+              (maybe "" (variableOf "enableParallelBuilding") crt, maybe "" (variableOf "enableParallelInstalling") crt),
+          runTest "gcc46 compiles nothing: busybox's sh runs its script over gcc-core's output, mingw-w64-crt's and the target's name" $
+            assertEqual
+              "builder, input derivations and the variables its script reads"
+              ( outputOf busyboxRoot <> "/bin/busybox.exe",
+                sort (mapMaybe (`Map.lookup` rootOf) [busyboxRoot, gccCoreRoot, crtRoot]),
+                [outputOf gccCoreRoot, outputOf crtRoot, target]
+              )
+              ( maybe "" (bytesText . drvBuilder) gcc46,
+                maybe [] (sort . map (storePathToText defaultStoreDir) . Map.keys . drvInputDrvs) gcc46,
+                [maybe "" (variableOf name) gcc46 | name <- ["gccCore", "crt", "target"]]
+              )
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the rung's derivations instantiate, adding eight to the closure of the GCC rung"
+    target :: Text
+    target = "i686-w64-mingw32"
+    crtRoot :: Text
+    crtRoot = "pkgs.mingw-w64-crt"
+    gcc46Root :: Text
+    gcc46Root = "pkgs.gcc46"
+    gccCoreRoot :: Text
+    gccCoreRoot = "pkgs.gcc-core"
+    headersRoot :: Text
+    headersRoot = "pkgs.mingw-w64-headers"
+    binutilsRoot :: Text
+    binutilsRoot = "pkgs.binutils"
+    busyboxRoot :: Text
+    busyboxRoot = "pkgs.busybox-w32"
+    builtBefore :: [Text]
+    builtBefore = [busyboxRoot, "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets", binutilsRoot, headersRoot, "pkgs.mingw-w64-dirent", gccCoreRoot]
+    roots :: [Text]
+    roots = builtBefore ++ [crtRoot, gcc46Root, "checks.crt", "checks.hello"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      ["mingw-w64-crt-8.0.3", "gcc-4.6.4", "crt.sh", "hello.sh"]
+        ++ concat [[name, name <> "-builder"] | name <- ["mingw-w64-crt-contents", "gcc46-hello"]]
 
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
@@ -20930,6 +21079,7 @@ runSuite = do
           testSeedStdenvWindows,
           testBinutilsWindows,
           testGccCoreWindows,
+          testGcc46Windows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,

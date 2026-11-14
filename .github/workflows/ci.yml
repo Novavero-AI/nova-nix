@@ -1348,13 +1348,15 @@ jobs:
   # test/data/busybox.nix runs busybox --version and has busybox's sh run a
   # script through the applets configure runs.  Last, the seed stdenv made
   # of those builds GNU Hello, which runs here, binutils, whose as, ar and
-  # ld test/data/binutils.nix has build a program that runs, and GCC
-  # 4.6.4's C compiler over MinGW-w64's headers, which
+  # ld test/data/binutils.nix has build a program that runs, GCC 4.6.4's
+  # C compiler and libgcc over MinGW-w64's headers, which
   # test/data/gcc-core.nix has compile sources whose assembly is compared
-  # and a program that runs.  x64 and ARM64 Windows each run all of it,
-  # for the reason Stage0 (Windows) runs on both.  Each builds every rung
-  # from the seed unless Ladder (mode) has it take the unchanged ones from
-  # the public cache.
+  # and a program that runs, and MinGW-w64's runtime, which that compiler
+  # compiles and gcc46 lays out beside it, so that test/data/gcc46.nix has
+  # gcc46 link a C program that runs.  x64 and ARM64 Windows each run all
+  # of it, for the reason Stage0 (Windows) runs on both.  Each builds every
+  # rung from the seed unless Ladder (mode) has it take the unchanged ones
+  # from the public cache.
   #
   # The x64 leg also measures the cells Mes keeps while MesCC compiles and
   # links tcc, tcc.c being the largest unit Mes compiles.  The count depends
@@ -2054,9 +2056,10 @@ jobs:
           fi
 
       # MinGW-w64's headers, its dirent functions and GCC 4.6.4's C
-      # compiler for i686-w64-mingw32: the headers installed, and the
-      # library and the compiler configured, compiled and installed, in the
-      # seed stdenv by tinycc-native, each timed.
+      # compiler for i686-w64-mingw32 with libgcc: the headers installed,
+      # and the library and the compiler configured, compiled and installed,
+      # in the seed stdenv by tinycc-native, and libgcc by that compiler in
+      # the same build, each timed.
       - name: Build gcc-core
         shell: bash
         run: |
@@ -2104,6 +2107,51 @@ jobs:
             diff "$expected" "$lines"
             exit 1
           fi
+
+      # MinGW-w64's runtime, configured, compiled and installed in the seed
+      # stdenv by gcc-core, and gcc46, gcc-core's tree with the runtime in
+      # its prefix, copied by busybox's sh, each timed.
+      - name: Build gcc46
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in mingw-w64-crt gcc46; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
+            echo "== $attr built in $((SECONDS - start)) s"
+          done
+
+      # busybox's sh runs test/data/gcc46.nix's two scripts.  crt lists
+      # every file the runtime installs and crt2.o's global symbols, which
+      # a configure test decides without failing the build.  hello has gcc46
+      # compile and link a program with no flag naming a directory, runs
+      # it, and writes what it prints and its exit status, the DLLs it
+      # imports, and the two libgcc functions its 64-bit division and
+      # remainder call.  Each output is compared with the file of
+      # test/data named for it, written from the same sources built by GCC
+      # 4.6.4 as another compiler built it.
+      - name: gcc46 links a program that runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in crt hello; do
+            expected=test/data/gcc46-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc46.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
 
       # The cells Mes keeps across each collection while MesCC compiles and
       # links tcc, in the arena tinycc-boot-mes builds in.  The collector
