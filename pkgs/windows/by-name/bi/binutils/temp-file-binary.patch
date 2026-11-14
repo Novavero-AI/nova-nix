@@ -1,0 +1,12 @@
+diff --git a/binutils/bucomm.c b/binutils/bucomm.c
+--- a/binutils/bucomm.c
++++ b/binutils/bucomm.c
+@@ -550,7 +550,7 @@ make_tempname (const char *filename, int *ofd)
+   if (tmpname == NULL)
+     fd = -1;
+   else
+-    fd = open (tmpname, O_RDWR | O_CREAT | O_EXCL, 0600);
++    fd = open (tmpname, O_RDWR | O_CREAT | O_EXCL | O_BINARY, 0600);
+ #endif
+   if (fd == -1)
+     {

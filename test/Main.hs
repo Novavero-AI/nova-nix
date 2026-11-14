@@ -13473,9 +13473,9 @@ testSeedStdenvWindows = do
 -- binutils and @test\/data\/binutils.nix@'s checks add to the closure of
 -- the seed stdenv's tools and applets, which build it.  The rung is
 -- full-source only if the one leaf it adds is binutils' archive, and it
--- reads no input source but the stdenv's own files, the package's patch
+-- reads no input source but the stdenv's own files, the package's patches
 -- and compatibility headers, and what evaluation writes as text.  The
--- stdenv's @setup.sh@ applies the patch and searches the headers only if
+-- stdenv's @setup.sh@ applies the patches and searches the headers only if
 -- the derivation names them in the variables it reads, @patches@ and
 -- @buildInputs@.  The target is the triple GCC is configured for on the
 -- next rung, which finds these tools by its name.
@@ -13537,15 +13537,15 @@ testBinutilsWindows = do
               "leaves added"
               ([archive], True)
               (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
-          runTest "it reads no input source but what evaluation writes as text, the stdenv's files and the package's patch and headers" $
+          runTest "it reads no input source but what evaluation writes as text, the stdenv's files and the package's patches and headers" $
             assertEqual
               "input sources not written as text"
-              ["compat", "config.site", patch, "include", "setup.sh"]
+              (sort (["compat", "config.site", "include", "setup.sh"] ++ patches))
               (sort [spName path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]),
-          runTest "binutils names its patch and its headers where setup.sh reads them" $
+          runTest "binutils names its patches and its headers where setup.sh reads them" $
             assertEqual
               "patches and buildInputs"
-              (sourcesNamed patch, sourcesNamed "compat", True)
+              (concatMap sourcesNamed patches, sourcesNamed "compat", True)
               (wordsOf "patches", wordsOf "buildInputs", isJust binutils),
           runTest "binutils is configured for the target GCC is" $
             assertEqual "target flags" ["--target=" <> target] (filter ("--target=" `T.isPrefixOf`) (wordsOf "configureFlags"))
@@ -13557,8 +13557,8 @@ testBinutilsWindows = do
     version = "2.41"
     archive :: Text
     archive = "binutils-" <> version <> ".tar.xz"
-    patch :: Text
-    patch = "fix-tinycc-attribute.patch"
+    patches :: [Text]
+    patches = ["fix-tinycc-attribute.patch", "temp-file-binary.patch"]
     target :: Text
     target = "i686-w64-mingw32"
     binutilsRoot :: Text
