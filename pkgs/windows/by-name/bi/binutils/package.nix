@@ -51,6 +51,18 @@
 # packed lose their layout the same way.  With the patch tcc reads every
 # attribute, keeps those it knows and passes over the rest.
 #
+# temp-file-binary.patch opens in binary mode the temporary file that ar
+# and ranlib, and objcopy and strip rewriting a file in place, write their
+# output to.  Without mkstemp, which msvcrt.dll lacks, make_tempname opens
+# it with no O_BINARY (binutils/bucomm.c:553), and msvcrt treats the
+# descriptor as text: bfd's writes through it put a CR before each LF, and
+# the copy into place (binutils/rename.c: smart_rename) reads it back
+# through it, which takes those CRs out again but ends at the first 0x1A
+# byte.  An archive of libgcc's objects is cut short, and ranlib then finds
+# no archive in it.  MinGW-w64's runtime supplies a mkstemp that opens in
+# binary (mingw-w64-crt/misc/mkstemp.c), so its builds never reach the
+# open the patch changes.
+#
 # What follows is for TinyCC and its headers:
 #
 #   --disable-nls: the bundled libintl declares alloca as returning char *
@@ -102,7 +114,10 @@ seedStdenv.mkDerivation {
     hash = "sha256-rppXieI0WeWWBuZxRyPy0//DHAMXQZHvDQFb3wYAdFA=";
   };
 
-  patches = [ ./fix-tinycc-attribute.patch ];
+  patches = [
+    ./fix-tinycc-attribute.patch
+    ./temp-file-binary.patch
+  ];
 
   buildInputs = [ ./compat ];
 

@@ -1992,9 +1992,11 @@ jobs:
       # ld --version prints its version line.  Then busybox's sh runs
       # test/data/binutils.nix's script, in which as assembles a function
       # that returns 42, ar archives the object, ld links it as a program's
-      # entry point and the program runs; it writes what nm, ar and objdump
-      # read back of each file and the program's exit status, a line for
-      # each, and a line whose step fails is left out.  The lines are
+      # entry point and the program runs, and ar archives and extracts a
+      # file holding a 0x1A byte and a CR LF; it writes what nm, ar and
+      # objdump read back of each file, the program's exit status and
+      # whether the extracted file is the archived one, a line for each,
+      # and a line whose step fails is left out.  The lines are
       # checked against bytes the runner's own printf writes.
       - name: binutils runs
         shell: bash
@@ -2018,9 +2020,10 @@ jobs:
             '00000000 T _answer' \
             'answer.o' \
             'answer.exe:     file format pei-i386' \
-            'answer.exe exits 42' > "$expected"
+            'answer.exe exits 42' \
+            'ctrlz.bin comes out of its archive whole' > "$expected"
           if cmp "$expected" "$lines"; then
-            echo "ok    as, ar and ld built answer.exe, which exits 42"
+            echo "ok    as, ar and ld built answer.exe, which exits 42, and ar kept a 0x1A byte"
           else
             echo "::error::answer.sh's lines differ from those expected:"
             diff "$expected" "$lines"
