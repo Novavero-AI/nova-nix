@@ -441,6 +441,29 @@ jobs:
           fi
           grep -q "was not found in the Nix search path" err.txt
 
+      # With nothing setting cores, a builder is told of the CPU limit of
+      # the cgroup v2 group nova-nix runs in, as upstream's getMaxCPU reads
+      # it: under a 150% quota, cpu.max is "150000 100000", and that is 2.
+      # The test suite runs the parsing over files it writes; this runs the
+      # reads against the kernel's own.
+      - name: A build in a cgroup with a CPU quota is told of its cores
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=$(cabal list-bin exe:nova-nix)
+          store=$(mktemp -d)
+          out=$(sudo systemd-run --quiet --scope -p CPUQuota=150% \
+            "$exe" --store "$store" build \
+            --expr 'derivation { name = "cores"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo $NIX_BUILD_CORES > $out" ]; }' |
+            tail -n 1)
+          got=$(cat "$out")
+          if [ "$got" != 2 ]; then
+            echo "::error::a builder under a 150% CPU quota was told of $got cores, not 2"
+            exit 1
+          fi
+          echo "ok    a builder under a 150% CPU quota is told of 2 cores"
+
       # SIGINT mid-evaluation is upstream's error, exit 1, where it once
       # ended the process by the signal with nothing said.  POSIX only:
       # Windows has no SIGINT to send.  set -m starts the job with SIGINT

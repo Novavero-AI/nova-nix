@@ -2,9 +2,9 @@
 -- which binary caches a machine substitutes from, which public keys it
 -- trusts, whether a failed substitute builds from source (@fallback@),
 -- whether a derivation may forbid substitutes
--- (@always-allow-substitutes@), how
--- deep function calls may nest, how far an evaluation may reach
--- (@restrict-eval@, @pure-eval@, @allowed-uris@), and whether
+-- (@always-allow-substitutes@), how many cores a builder is told it may
+-- use (@cores@), how deep function calls may nest, how far an evaluation
+-- may reach (@restrict-eval@, @pure-eval@, @allowed-uris@), and whether
 -- @builtins.traceVerbose@ traces (@trace-verbose@).
 --
 -- == The format
@@ -153,6 +153,11 @@ data NixConfig = NixConfig
     -- | Upstream @always-allow-substitutes@: substitute a derivation
     -- whatever its @allowSubstitutes@ attribute says.
     ncAlwaysAllowSubstitutes :: !Bool,
+    -- | Upstream's @cores@, what a builder's @NIX_BUILD_CORES@ says, when
+    -- a source sets it.  Its default is the machine's
+    -- ("Nix.Builder.Cores"), which only IO can find, so unset is
+    -- 'Nothing' rather than a number.
+    ncCores :: !(Maybe Word32),
     -- | Upstream's @max-call-depth@: how many function calls may be
     -- active around a new one before evaluation refuses it.
     ncMaxCallDepth :: !Word32,
@@ -168,13 +173,14 @@ data NixConfig = NixConfig
   deriving (Eq, Show)
 
 -- | The baseline the fold starts from: no substituters, no trusted keys,
--- no fallback, @allowSubstitutes@ heeded, upstream's call-depth ceiling,
--- no allowed URIs, both evaluation modes off, and @trace-verbose@ off.  The empty substituter
--- list is nova-nix's existing default (nothing is substituted unless
--- configured), a deliberate divergence from upstream's cache.nixos.org
--- default: turning a cache on for every machine is the operator's
--- decision to make in a config file, not a built-in.  The other defaults
--- are upstream's own.
+-- no fallback, @allowSubstitutes@ heeded, @cores@ unset so that the
+-- machine's default applies, upstream's call-depth ceiling, no allowed
+-- URIs, both evaluation modes off, and @trace-verbose@ off.  The empty
+-- substituter list is nova-nix's existing default (nothing is substituted
+-- unless configured), a deliberate divergence from upstream's
+-- cache.nixos.org default: turning a cache on for every machine is the
+-- operator's decision to make in a config file, not a built-in.  The
+-- other defaults are upstream's own.
 defaultNixConfig :: NixConfig
 defaultNixConfig =
   NixConfig
@@ -182,6 +188,7 @@ defaultNixConfig =
       ncTrustedPublicKeys = [],
       ncFallback = False,
       ncAlwaysAllowSubstitutes = False,
+      ncCores = Nothing,
       ncMaxCallDepth = defaultMaxCallDepth,
       ncAllowedUris = [],
       ncRestrictEval = False,
@@ -549,8 +556,8 @@ unitBase = 1024
 -- | Apply one assignment to the accumulated config.  The name is resolved
 -- through the aliases (@binary-caches@ -> @substituters@,
 -- @binary-cache-public-keys@ -> @trusted-public-keys@,
--- @build-fallback@ -> @fallback@) and the @extra-@
--- prefix (append rather than replace, list settings only).  A name
+-- @build-fallback@ -> @fallback@, @build-cores@ -> @cores@) and the
+-- @extra-@ prefix (append rather than replace, list settings only).  A name
 -- outside the known set is ignored, not an error: upstream warns and
 -- continues, and refusing every unknown key would reject a config that
 -- also carries settings this layer does not model.  A value that does
@@ -564,8 +571,10 @@ applyAssignment config (ConfigAssignment name value) =
       (\items -> setList field (combine mode (getList field config) items) config) <$> listItems field value
     Just (BoolSetting field, _) ->
       (\flag -> setBool field flag config) <$> parseBool name value
-    Just (ScalarSetting MaxCallDepthField, _) ->
-      (\limit -> config {ncMaxCallDepth = limit}) <$> parseUnsignedSetting name value
+    -- Upstream's integer error names the setting by its own name, not
+    -- the alias it was set through (@BaseSetting\<T\>::parse@).
+    Just (ScalarSetting field, _) ->
+      (\number -> setScalar field number config) <$> parseUnsignedSetting (scalarFieldKey field) value
   where
     combine ReplaceMode _ new = new
     combine AppendMode old new = old ++ new
@@ -605,6 +614,7 @@ resolveName name =
       | n == pureEvalKey = Just (BoolSetting PureEvalField)
       | n == traceVerboseKey = Just (BoolSetting TraceVerboseField)
       | n == maxCallDepthKey = Just (ScalarSetting MaxCallDepthField)
+      | n == coresKey || n == coresAlias = Just (ScalarSetting CoresField)
       | otherwise = Nothing
 
 -- | A setting this layer resolves, by the shape of its value.
@@ -625,7 +635,7 @@ data BoolField
   deriving (Eq, Show)
 
 -- | The scalar settings, which only ever replace.
-data ScalarField = MaxCallDepthField
+data ScalarField = MaxCallDepthField | CoresField
   deriving (Eq, Show)
 
 -- | Whether an assignment replaces the accumulated value or appends to it.
@@ -646,6 +656,14 @@ listFieldKey :: ListField -> ByteString
 listFieldKey SubstitutersField = substitutersKey
 listFieldKey TrustedKeysField = trustedKeysKey
 listFieldKey AllowedUrisField = allowedUrisKey
+
+setScalar :: ScalarField -> Word32 -> NixConfig -> NixConfig
+setScalar MaxCallDepthField v config = config {ncMaxCallDepth = v}
+setScalar CoresField v config = config {ncCores = Just v}
+
+scalarFieldKey :: ScalarField -> ByteString
+scalarFieldKey MaxCallDepthField = maxCallDepthKey
+scalarFieldKey CoresField = coresKey
 
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool FallbackField v config = config {ncFallback = v}
@@ -705,6 +723,10 @@ trustedKeysAlias = "binary-cache-public-keys"
 fallbackKey, fallbackAlias :: ByteString
 fallbackKey = "fallback"
 fallbackAlias = "build-fallback"
+
+coresKey, coresAlias :: ByteString
+coresKey = "cores"
+coresAlias = "build-cores"
 
 allowedUrisKey, alwaysAllowSubstitutesKey, maxCallDepthKey, pureEvalKey, restrictEvalKey, traceVerboseKey :: ByteString
 allowedUrisKey = "allowed-uris"

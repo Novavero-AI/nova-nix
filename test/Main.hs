@@ -23,7 +23,7 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Unsafe as BSU
-import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
+import Data.Char (intToDigit, isAsciiLower, isAsciiUpper, isDigit)
 import Data.Foldable (toList)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
@@ -55,6 +55,7 @@ import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
@@ -125,6 +126,7 @@ import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
 import qualified Test.QuickCheck as QC
+import Text.Read (readMaybe)
 
 -- ---------------------------------------------------------------------------
 -- Test harness
@@ -9696,6 +9698,166 @@ testSourceDateEpochIO = do
                 else Fail ("unexpected content: " <> T.pack (show content))
           ]
 
+-- | A builder is told the configured cores in NIX_BUILD_CORES, and a
+-- derivation attribute of that name wins over the setting, as upstream's
+-- initEnv sets the variable before it copies the derivation's environment.
+-- Proven behaviorally: each build echoes the variable into $out.
+testBuildCoresIO :: IO [Bool]
+testBuildCoresIO = do
+  putStrLn "builder/nix-build-cores"
+  withTempStore $ \store -> do
+    let storeDir = stDir store
+        -- cmd reads a digit just before ">" as a handle to redirect, so
+        -- the redirection comes first.
+        (builder, args)
+          | SI.os == "mingw32" = ("cmd.exe", ["/c", ">%out% echo %NIX_BUILD_CORES%"])
+          | otherwise = ("/bin/sh", ["-c", "echo $NIX_BUILD_CORES > $out"])
+        probe hashTail name env =
+          Derivation
+            { drvOutputs =
+                [ DerivationOutput
+                    { doName = "out",
+                      doPath = StorePath (T.replicate 31 "0" <> hashTail) name,
+                      doHashAlgo = "",
+                      doHash = ""
+                    }
+                ],
+              drvInputDrvs = Map.empty,
+              drvInputSrcs = [],
+              drvPlatform = currentPlatform,
+              drvBuilder = builder,
+              drvArgs = args,
+              drvEnv = env
+            }
+    buildTmp <- (</> "nova-nix-test-build-cores-tmp") <$> getTemporaryDirectory
+    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp, bcCores = 7}
+        echoed drv = do
+          forceRemoveIfExists buildTmp
+          createDirectoryIfMissing True buildTmp
+          result <- buildDerivation config store drv testDrvPath
+          forceRemoveIfExists buildTmp
+          case result of
+            BuildFailure msg code -> pure (Left ("build failed (exit " <> T.pack (show code) <> "): " <> msg))
+            BuildSuccess sp -> Right . T.strip <$> TIO.readFile (storePathToFilePath storeDir sp)
+    configured <- echoed (probe "6" "cores-probe" Map.empty)
+    attribute <- echoed (probe "7" "cores-attr-probe" (Map.singleton "NIX_BUILD_CORES" "3"))
+    sequence
+      [ runTest "a builder's NIX_BUILD_CORES is the configured cores" $
+          assertEqual "configured" (Right "7") configured,
+        runTest "a derivation's own NIX_BUILD_CORES wins over the setting" $
+          assertEqual "attribute" (Right "3") attribute
+      ]
+
+-- | Upstream's default for cores, piece by piece: the three kernel files
+-- as getMaxCPU and glibc's getmntent read them, the reads chained as
+-- getMaxCPU chains them over an in-memory map, and getDefaultCores's
+-- choice.
+testBuildCores :: IO [Bool]
+testBuildCores = do
+  putStrLn "builder/cores"
+  let mountLine dir = "cgroup2 " <> dir <> " cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n"
+      -- How the kernel writes a mount point (seq_path_root in
+      -- show_vfsmnt, fs/proc_namespace.c): each of space, tab, newline
+      -- and backslash as a backslash and three octal digits.
+      kernelEscape = BS.concatMap (\byte -> if byte `BS.elem` " \t\n\\" then octalEscape byte else BS.singleton byte)
+      octalEscape byte = BS8.pack ('\\' : [intToDigit (fromIntegral ((byte `shiftR` bits) .&. 7)) | bits <- [6, 3, 0]])
+      -- Mount points weighted toward the bytes an escape is made of, so
+      -- a literal backslash before octal digits turns up.
+      genMountPoint = BS.pack <$> QC.resize 48 (QC.listOf1 (QC.frequency [(3, QC.choose (1, 255)), (2, QC.elements (BS.unpack " \t\n\\0123467#"))]))
+      property prop = do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} prop
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+      -- A long device name pushes the type toward the end of getmntent's
+      -- 4095-byte line.
+      mountAfter deviceLength = Cores.cgroup2MountPoint (BS.replicate deviceLength 0x61 <> " /m cgroup2 rw 0 0\n")
+      unifiedGroup = "0::/user.slice/build.scope\n"
+      cpuMaxPath = "/sys/fs/cgroup//user.slice/build.scope/cpu.max"
+      machine =
+        Map.fromList
+          [ ("/proc/mounts", "proc /proc proc rw 0 0\n" <> mountLine "/sys/fs/cgroup"),
+            ("/proc/self/cgroup", unifiedGroup),
+            (cpuMaxPath, "300000 100000\n")
+          ]
+      limitOver files = runIdentity (Cores.cgroupCoreLimit (\path -> Identity (Map.lookup path (Map.mapKeys asciiOsPath files))))
+  sequence
+    [ -- /proc/mounts, as getmntent reads it.
+      runTest "the cgroup2 mount point is found among /proc/mounts' lines" $
+        assertEqual "mount" (Just "/sys/fs/cgroup") (Cores.cgroup2MountPoint ("proc /proc proc rw 0 0\ncgroup /sys/fs/cgroup/cpu cgroup rw,cpu 0 0\n" <> mountLine "/sys/fs/cgroup")),
+      runTest "the first of two cgroup2 mounts is the one" $
+        assertEqual "first" (Just "/a") (Cores.cgroup2MountPoint (mountLine "/a" <> mountLine "/b")),
+      runTest "no cgroup2 mount is none, a cgroup v1 mount included" $
+        assertEqual "none" Nothing (Cores.cgroup2MountPoint "cgroup /sys/fs/cgroup/cpu cgroup rw,cpu 0 0\nproc /proc proc rw 0 0\n"),
+      runTest "a mount point's escapes are decoded as glibc decodes them" $
+        assertEqual "escapes" (Just "/a b\tc\nd\\e\\f") (Cores.cgroup2MountPoint (mountLine "/a\\040b\\011c\\012d\\134e\\\\f")),
+      runTest "an escape glibc does not decode stays as written" $
+        assertEqual "unknown-escape" (Just "/a\\043b\\0") (Cores.cgroup2MountPoint (mountLine "/a\\043b\\0")),
+      runTest "comment and blank lines are skipped, and fields split at runs of spaces and tabs" $
+        assertEqual "lines" (Just "/real") (Cores.cgroup2MountPoint " \t# c /commented cgroup2 rw 0 0\n\n \t\n\t cgroup2 \t /real\t\tcgroup2  rw 0 0\n"),
+      runTest "a line is read only as far as the 4095 bytes getmntent holds" $
+        assertEqual "line-limit" (Just "/m", Nothing) (mountAfter 4084, mountAfter 4085),
+      runTestM "decoding inverts the kernel's escaping of a mount point" $
+        property $
+          QC.forAll genMountPoint $
+            \dir -> Cores.cgroup2MountPoint (mountLine (kernelEscape dir)) QC.=== Just dir,
+      -- /proc/self/cgroup, as getCgroups reads it.
+      runTest "a cgroup v2 line is the hierarchy with no name" $
+        assertEqual "v2" (Just (Map.singleton "" "/user.slice/build.scope")) (Cores.parseCgroups unifiedGroup),
+      runTest "each line is keyed by its controllers, a name= prefix dropped" $
+        assertEqual
+          "hybrid"
+          (Just (Map.fromList [("cpu,cpuacct", "/a"), ("systemd", "/b"), ("", "/c")]))
+          (Cores.parseCgroups "4:cpu,cpuacct:/a\n1:name=systemd:/b\n0::/c\n"),
+      runTest "a later line replaces an earlier one of the same name" $
+        assertEqual "later" (Just (Map.singleton "" "/second")) (Cores.parseCgroups "0::/first\n1:name=:/second\n"),
+      runTest "blank lines are skipped, and a path may hold a colon" $
+        assertEqual "colon" (Just (Map.singleton "" "/a:b")) (Cores.parseCgroups "\n0::/a:b\n\n"),
+      runTest "a line the regex does not match makes the whole file unread" $
+        assertEqual
+          "malformed"
+          (replicate 5 Nothing)
+          (map Cores.parseCgroups ["0::/ok\n0:/one-colon\n", "x::/letter\n", "::/no-id\n", "1a::/mixed\n", "0::/carriage\r\n"]),
+      -- cpu.max, as getMaxCPU reads it.
+      runTest "a cpu.max quota of max is no limit" $
+        assertEqual "max" Nothing (Cores.cpuMaxCores "max 100000\n"),
+      runTest "a quota is its periods rounded up" $
+        assertEqual "quota" [Just 2, Just 2, Just 1, Just 0, Just 2148] (map Cores.cpuMaxCores ["200000 100000\n", "150000 100000\n", "50000 100000\n", "0 100000\n", "2147483647 1000000"]),
+      runTest "the division is upstream's single-precision one" $
+        assertEqual "float" (Just 20) (Cores.cpuMaxCores "20000001 1000000\n"),
+      runTest "anything but two decimal tokens, a quota past int and a period of 0 are no limit" $
+        assertEqual
+          "malformed"
+          (replicate 7 Nothing)
+          (map Cores.cpuMaxCores ["", "100000\n", "1 2 3\n", "abc 100000\n", "+5 100000\n", "2147483648 100000\n", "100000 0\n"]),
+      -- The reads, in upstream's order.
+      runTest "the limit is the cpu.max of the unnamed group under the first cgroup2 mount, joined as upstream joins them" $
+        assertEqual "limit" (Just 3) (limitOver machine),
+      runTest "a missing file, an empty group path, no unnamed group, a malformed line and max are each no limit" $
+        assertEqual
+          "steps"
+          (replicate 7 Nothing)
+          [ limitOver (Map.delete "/proc/mounts" machine),
+            limitOver (Map.delete "/proc/self/cgroup" machine),
+            limitOver (Map.delete cpuMaxPath machine),
+            limitOver (Map.insert "/proc/self/cgroup" "0::\n" (Map.insert "/sys/fs/cgroup//cpu.max" "500000 100000\n" machine)),
+            limitOver (Map.insert "/proc/self/cgroup" "1:name=systemd:/user.slice/build.scope\n" machine),
+            limitOver (Map.insert "/proc/self/cgroup" (unifiedGroup <> "garbage\n") machine),
+            limitOver (Map.insert cpuMaxPath "max 100000\n" machine)
+          ],
+      -- getDefaultCores.
+      runTest "the default is a positive limit, else the hardware count raised to 1" $
+        assertEqual "default" [3, 8, 8, 1] [Cores.defaultCores (Just 3) 8, Cores.defaultCores Nothing 8, Cores.defaultCores (Just 0) 8, Cores.defaultCores Nothing 0],
+      hardwareCase
+    ]
+  where
+    -- getconf answers _NPROCESSORS_ONLN by calling sysconf with that name,
+    -- in glibc and on macOS alike.  Windows has neither.
+    hardwareCase
+      | SI.os == "mingw32" = True <$ putStrLn "  SKIP  the hardware count is sysconf's: Windows has no sysconf"
+      | otherwise =
+          runTestM "the hardware count is sysconf's _NPROCESSORS_ONLN, as getconf reports it" $ do
+            reported <- Proc.readProcess "getconf" ["_NPROCESSORS_ONLN"] ""
+            assertEqual "getconf" (readMaybe (filter (/= '\n') reported)) . Just <$> Cores.hardwareConcurrency
+
 -- | The child's environment is the build environment plus the ambient
 -- allowlist, nothing else.  Proven behaviorally at both ends: an ambient
 -- canary set in the test process must not reach a build, and the four
@@ -17181,6 +17343,62 @@ testCheckCLI = do
           ]
     )
 
+-- | nix.conf's cores reaches a builder the CLI runs, and with nothing
+-- setting it the builder is told the machine's count, a positive number.
+testBuildCoresCLI :: IO [Bool]
+testBuildCoresCLI = do
+  putStrLn "cli/build-cores"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-build-cores"
+      configVars = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES"]
+      -- No nix.conf of the machine's is read: the system file is looked
+      -- for under the run's root and an empty NIX_USER_CONF_FILES names
+      -- no user file, so NIX_CONFIG alone sets cores.
+      buildWith nixConfig store =
+        Proc.readCreateProcessWithExitCode
+          ( (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "build", "--expr", expression, "--store", root </> store])
+              { Proc.env =
+                  Just
+                    ( ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> nixConfig)
+                        : ("NIX_CONF_DIR", root </> "system")
+                        : ("NIX_USER_CONF_FILES", "")
+                        : filter ((`notElem` configVars) . fst) ambient
+                    )
+              }
+          )
+          ""
+      nixString text = "\"" <> T.replace "${" "\\${" (T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text)) <> "\""
+      expression =
+        T.unpack
+          ("derivation { name = \"cores-cli\"; system = builtins.currentSystem; builder = " <> nixString shell <> "; args = [ \"-c\" \"echo $NIX_BUILD_CORES > $out\" ]; }")
+      echoed (code, out, err) = case (code, listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') out))))) of
+        (ExitSuccess, Just path) -> Right . T.strip <$> TIO.readFile path
+        _ -> pure (Left ("exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err))
+  bracket_
+    (forceRemoveIfExists root >> createDirectoryIfMissing True root)
+    (forceRemoveIfExists root)
+    ( do
+        configured <- buildWith "cores = 3\n" "configured" >>= echoed
+        unset <- buildWith "" "unset" >>= echoed
+        hardware <- Cores.hardwareConcurrency
+        sequence
+          [ runTest "nix.conf's cores is a CLI build's NIX_BUILD_CORES" $
+              assertEqual "configured" (Right "3") configured,
+            -- Off Linux there is no cgroup limit to read, so the count is
+            -- the hardware's; on Linux the runner's cgroup may limit it.
+            runTest "with nothing setting cores a CLI build is told the machine's count" $
+              case unset of
+                Right value
+                  | Just (count :: Word32) <- readMaybe (T.unpack value),
+                    count > 0,
+                    SI.os == "linux" || count == Cores.defaultCores Nothing hardware ->
+                      Pass
+                other -> Fail ("unset: " <> T.pack (show other) <> "; hardware count " <> T.pack (show hardware))
+          ]
+    )
+
 -- ---------------------------------------------------------------------------
 -- Tests: the CLI reference
 -- ---------------------------------------------------------------------------
@@ -19823,6 +20041,7 @@ testNixConfig = do
       depth = fmap ncMaxCallDepth . resolveTexts
       depthOf value = depth ["max-call-depth = " <> value]
       refused = either (const True) (const False) . depthOf
+      cores = fmap ncCores . resolveTexts
       -- Bytes with no UTF-8 reading (0xE9, Latin-1's e-acute).  They are
       -- a host path on POSIX and none on Windows, whose paths are UTF-16,
       -- so the cases holding them branch on whether they spell one.
@@ -19915,6 +20134,21 @@ testNixConfig = do
         assertEqual "depth-range" True (refused "4294967296" && refused "5G"),
       runTest "extra-max-call-depth is an unknown name, not an append" $
         assertEqual "depth-extra" (Right 10000) (depth ["extra-max-call-depth = 5"]),
+      -- cores: a scalar under the same grammar, unset until a source sets
+      -- it, since its default is the machine's.
+      runTest "cores is unset when no source sets it" $
+        assertEqual "cores-unset" (Right Nothing) (cores []),
+      runTest "cores and its alias build-cores set it, 0 included" $
+        assertEqual "cores-set" (Right [Just 4, Just 6, Just 0, Just 2048]) (traverse (cores . pure) ["cores = 4", "build-cores = 6", "cores = 0", "cores = 2K"]),
+      runTest "a higher source replaces cores, whichever name each uses" $
+        assertEqual "cores-replace" (Right (Just 2)) (cores ["cores = 8", "build-cores = 2"]),
+      runTest "an invalid cores is refused in upstream's words, which name the setting and not the alias" $
+        assertEqual
+          "cores-invalid"
+          (Left "setting 'cores' has invalid value 'all'", Left "setting 'cores' has invalid value '-1'")
+          (cores ["cores = all"], cores ["build-cores = -1"]),
+      runTest "extra-cores and extra-build-cores are unknown names, not appends" $
+        assertEqual "cores-extra" (Right Nothing) (cores ["extra-cores = 4", "extra-build-cores = 4"]),
       -- Includes.
       runTest "an include is spliced in at its line, resolved against the including file's directory" $
         let files =
@@ -20661,6 +20895,7 @@ runSuite = do
           testTrivialBuildIO,
           testBuildLogIO,
           testSourceDateEpochIO,
+          testBuildCoresIO,
           testScrubbedBuildEnvIO,
           testUnpackBuildIO,
           testDependentBuildIO,
@@ -20782,6 +21017,7 @@ runSuite = do
           testVerifySigs,
           testNarInfoValidation,
           testNixConfig,
+          testBuildCores,
           testPushPure,
           testPushClosureIO,
           testBuildOrchestrator,
@@ -20799,6 +21035,7 @@ runSuite = do
           testE2E,
           testExecWrapperCLI,
           testCheckCLI,
+          testBuildCoresCLI,
           testUncaughtIOFailureCLI,
           testCliReference,
           testPhase4,

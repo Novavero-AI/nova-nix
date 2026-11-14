@@ -22,7 +22,9 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
+import Data.Word (Word32)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig)
+import qualified Nix.Builder.Cores as Cores
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
 import Nix.Cli.Args (BuildTarget (..), CliOpts (..), Command (..), PushArgs (..), parseArgs)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, systemConfDirSource)
@@ -56,6 +58,7 @@ import qualified System.File.OsPath as OsFile
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError, isUserError)
+import qualified System.Info
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
 
@@ -428,7 +431,8 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
           -- builtins.toFile wrote these during evaluation but could not
           -- register them; a derivation naming one needs them valid first.
           materializeEvalStoreWrites store storeWrites
-          buildResult <- buildAndRegister store caches (fallbackFor opts config) (substitutesFor config) (buildModeFor opts) wrappers drvClosure drv drvSP
+          cores <- buildCoresFor config
+          buildResult <- buildAndRegister store caches (fallbackFor opts config) (substitutesFor config) (buildModeFor opts) cores wrappers drvClosure drv drvSP
           -- The root is registered before the handle closes: the handle's
           -- lease is what keeps a concurrent collection from running
           -- between the build's end and the link's creation.  The path
@@ -552,6 +556,21 @@ buildModeFor opts
   | optCheck opts = BuildCheck
   | otherwise = BuildNormal
 
+-- | The cores a builder is told of on this run: nix.conf's @cores@, or
+-- when nothing sets it, upstream's default on this machine.
+buildCoresFor :: NixConfig -> IO Word32
+buildCoresFor config = maybe machineCores pure (ncCores config)
+
+-- | Upstream's default for @cores@ on this machine ('Cores.defaultCores'):
+-- the limit of the process's cgroup, which upstream reads on Linux
+-- alone, else the hardware thread count ('Cores.hardwareConcurrency').
+machineCores :: IO Word32
+machineCores = Cores.defaultCores <$> cgroupLimit <*> Cores.hardwareConcurrency
+  where
+    cgroupLimit
+      | System.Info.os == "linux" = Cores.cgroupCoreLimit readKernelFile
+      | otherwise = pure Nothing
+
 -- | The caches from the resolved config plus the CLI flags.  The CLI
 -- @--substituter@ and @--trusted-key@ append on top, the highest
 -- precedence, so a flag adds to the configured set rather than being
@@ -672,6 +691,14 @@ readConfigFile path = do
       | isDoesNotExistError err = Config.ConfigFileMissing
       | otherwise = Config.ConfigFileUnreadable
 
+-- | A kernel file's bytes, or 'Nothing' when it cannot be read, which
+-- upstream's @getMaxCPU@ takes as no limit.  As in 'readConfigFile', the
+-- open takes the path's own bytes, and only 'IOException' is caught.
+readKernelFile :: OsPath -> IO (Maybe BS.ByteString)
+readKernelFile path = do
+  result <- try (OsFile.readFile' path) :: IO (Either IOException BS.ByteString)
+  pure (either (const Nothing) Just result)
+
 -- | Resolve every launcher before any building starts, so a typo'd path is
 -- a configuration error now rather than a build failure after the whole
 -- closure has been realized.  A bare name resolves through @PATH@, the way
@@ -696,8 +723,8 @@ checkExecWrappers = Map.traverseWithKey check
 -- | Write the .drv file to the store and build with dependency resolution.
 -- The drvPath is the store path of the .drv file itself, extracted from
 -- the evaluation result alongside the Derivation struct.
-buildAndRegister :: Store -> [CacheConfig] -> Fallback -> SubstitutesSetting -> BuildMode -> Map.Map T.Text FilePath -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
-buildAndRegister store caches fallback substitutes mode wrappers drvClosure drv drvSP = do
+buildAndRegister :: Store -> [CacheConfig] -> Fallback -> SubstitutesSetting -> BuildMode -> Word32 -> Map.Map T.Text FilePath -> Map.Map T.Text BS.ByteString -> Derivation -> StorePath -> IO BuildResult
+buildAndRegister store caches fallback substitutes mode cores wrappers drvClosure drv drvSP = do
   -- Materialize the full input-.drv closure (every transitive dependency's
   -- recipe) to the store.  buildWithDeps reads these back to construct the
   -- dependency graph; without them it cannot realize any non-leaf derivation.
@@ -714,6 +741,7 @@ buildAndRegister store caches fallback substitutes mode wrappers drvClosure drv 
             bcFallback = fallback,
             bcSubstitutes = substitutes,
             bcMode = mode,
+            bcCores = cores,
             bcExecWrappers = wrappers
           }
   buildWithDeps config store drv drvSP
