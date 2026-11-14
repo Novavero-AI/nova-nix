@@ -6,7 +6,8 @@
 --
 -- When Nix needs to build a derivation (cache miss), it:
 --
--- 1. Creates a temp directory for the build
+-- 1. Creates a directory for the build under the store's state directory
+--    ("Nix.Builder.BuildDir")
 -- 2. Sets up the environment: only store paths from @inputDrvs@ and
 --    @inputSrcs@ are visible.  PATH contains only the builder and
 --    specified dependencies.  No internet access (in sandboxed mode).
@@ -75,8 +76,8 @@ module Nix.Builder
   )
 where
 
-import Control.Exception (IOException, bracket, catch, catches, displayException, finally, onException, try)
-import Control.Monad (filterM, foldM, unless, when)
+import Control.Exception (IOException, bracket, catches, displayException, finally, onException, try)
+import Control.Monad (filterM, foldM, unless)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError, withExceptT)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (bimap, first)
@@ -101,6 +102,7 @@ import Data.Word (Word32)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
+import Nix.Builder.BuildDir (withBuildDir)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
 import Nix.DependencyGraph (TopoResult (..), buildDepGraph, topoSort)
@@ -117,7 +119,7 @@ import Nix.Substituter (CacheConfig, SubstResult (..), queryReferencesWith, tryS
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removeDirectoryRecursive, removePathForcibly)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removePathForcibly)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, takeFileName, (</>))
@@ -253,10 +255,9 @@ sourceDateEpochValue = "315532800"
 
 -- | Configuration for the build environment.
 data BuildConfig = BuildConfig
-  { -- | Store directory (where outputs go).
+  { -- | Store directory: where outputs go, and under whose state
+    -- directory a build runs ("Nix.Builder.BuildDir").
     bcStoreDir :: !StoreDir,
-    -- | Temp directory for builds (cleaned after each build).
-    bcTmpDir :: !FilePath,
     -- | Binary caches to try before building (checked in priority order).
     bcCaches :: ![CacheConfig],
     -- | What a failed substitute leads to: upstream's @fallback@.
@@ -304,10 +305,6 @@ defaultBuildConfig :: StoreDir -> BuildConfig
 defaultBuildConfig dir =
   BuildConfig
     { bcStoreDir = dir,
-      bcTmpDir =
-        if isWindows
-          then "C:\\Temp\\nova-nix-build"
-          else "/tmp/nova-nix-build",
       bcCaches = [],
       bcFallback = NoFallback,
       bcSubstitutes = HeedAllowSubstitutes,
@@ -340,7 +337,7 @@ data BuildResult
 -- as upstream's do: run its builder and capture output.
 --
 -- 1. Validate all inputs exist in the store
--- 2. Create temp build directory
+-- 2. Create the build directory ('withBuildDir')
 -- 3. Set up environment from derivation + standard vars
 -- 4. Run the builder process, which writes each output at its store path
 -- 5. On success: scan the outputs for references and register them,
@@ -438,10 +435,12 @@ noOutputsMessage = "no outputs defined"
 --
 -- Delete, materialize and register are one critical section under
 -- @\<store-path\>.lock@, and the build path joins it.  Without it, two
--- concurrent builds of one derivation would share a build directory
--- ('computeBuildDir' is deterministic), interleave their writes into a
--- single tree, and each register it as valid.  Nothing would fail; the
--- registered output would simply not be what either build produced.
+-- concurrent builds of one derivation would write one output path,
+-- interleave their writes into a single tree, and each register it as
+-- valid.  Nothing would fail; the registered output would simply not be
+-- what either build produced.  The first output's lock is also what
+-- keeps a build directory's name to one build at a time
+-- ("Nix.Builder.BuildDir").
 --
 -- Outputs are locked in 'lockOrder', so two processes racing the same
 -- multi-output derivation request them in the same sequence and neither
@@ -511,22 +510,22 @@ buildUnderLock config store drv redirected finish = do
   inputs <- validateInputs config store drv >>= either (pure . Left) (inputClosure store)
   case inputs of
     Left errMsg -> pure (Left (BuildStop errMsg 1))
-    Right inputPaths -> do
-      -- 2. Create temp build directory.  The location is deterministic
-      --    (computeBuildDir), so a crashed earlier run may have left stale
-      --    contents that builtin:unpack would misread as an archive
-      --    collision - always start from an empty directory, and always
-      --    remove it on the way out (finally), builder exceptions included.
-      let buildDir = computeBuildDir config drv
-      removePathForcibly buildDir
-      createDirectoryIfMissing True buildDir
-      (`finally` cleanupBuildDir buildDir) $ do
+    Right inputPaths -> case drvOutputs drv of
+      -- The build directory is named by the first output, whose lock
+      -- keeps it to one build at a time.  A derivation with no output
+      -- has no lock to name one by, and its build fails whatever its
+      -- builder does ('registerOutputs'), so it fails here, before a
+      -- directory is made or a builder runs.
+      [] -> pure (Left (BuildStop noOutputsMessage 1))
+      -- 2. Create the build directory, empty, and remove it however the
+      --    build ends.
+      firstOutput : _ -> withBuildDir (bcStoreDir config) (doPath firstOutput) $ \buildDir -> do
         -- 3. Compute output paths (but do NOT pre-create them - the builder
         --    is responsible for creating $out, $dev, etc.).
         --
-        --    $out is the FINAL store path now, as upstream's is: a temp
-        --    path recorded by the build (a compiler driver, a libtool
-        --    archive) would otherwise outlive the temp dir it named.
+        --    $out is the final store path, as upstream's is: a
+        --    temporary path recorded by the build (a compiler driver, a
+        --    libtool archive) would outlive the directory it named.
         outputValidity <- case redirected of
           RedirectValid -> mapM (isValid store . doPath) (drvOutputs drv)
           RedirectAll -> pure (map (const True) (drvOutputs drv))
@@ -657,12 +656,13 @@ runPlannedBuild config drv buildDir plans finish = do
       clearScratch = for_ plans (removePathForcibly . scratchDir)
   clearScratch
   createDirectoryIfMissing True (unStoreDir (bcStoreDir config))
-  -- The cleanup contract: the build directory is not where outputs live
-  -- any more, so an interrupt or a throw between the builder starting and
-  -- registration committing would otherwise strand an unregistered tree at
-  -- a real store path.  Once @finish@ has succeeded there is nothing left
-  -- to take back, and the flag says so: a build's registrations are
-  -- committed, and a check wrote to scratch paths alone.
+  -- The cleanup contract: outputs are written at their store paths, not
+  -- in the build directory, so an interrupt or a throw between the
+  -- builder starting and registration committing would otherwise strand
+  -- an unregistered tree at a real store path.  Once @finish@ has
+  -- succeeded there is nothing left to take back, and the flag says so: a
+  -- build's registrations are committed, and a check wrote to scratch
+  -- paths alone.
   committed <- newIORef False
   let cleanupUnlessCommitted = do
         done <- readIORef committed
@@ -896,27 +896,6 @@ closureUnder references = go Set.empty
 -- | Format a StorePath for error messages.
 formatSP :: StorePath -> Text
 formatSP sp = spHash sp <> "-" <> spName sp
-
--- ---------------------------------------------------------------------------
--- Build directory
--- ---------------------------------------------------------------------------
-
--- | Compute a unique build directory path based on the first output hash.
-computeBuildDir :: BuildConfig -> Derivation -> FilePath
-computeBuildDir config drv =
-  let uniqueSuffix = case drvOutputs drv of
-        (out : _) -> T.unpack (spHash (doPath out))
-        [] -> "no-output"
-   in bcTmpDir config </> uniqueSuffix
-
--- | Remove the build directory, ignoring a filesystem failure to remove
--- it.  It runs as the build's 'finally', where a directory that will not
--- go away must not replace the build's own outcome.
-cleanupBuildDir :: FilePath -> IO ()
-cleanupBuildDir dir = do
-  exists <- doesDirectoryExist dir
-  when exists $
-    removeDirectoryRecursive dir `catch` \(_ :: IOException) -> pure ()
 
 -- ---------------------------------------------------------------------------
 -- Environment

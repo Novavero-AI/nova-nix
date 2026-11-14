@@ -101,6 +101,7 @@ library
     Nix.Derivation
     Nix.Derivation.StructuredAttrs
     Nix.Builder
+    Nix.Builder.BuildDir
     Nix.Builder.Cores
     Nix.Builder.Log
     Nix.Builder.Unpack
@@ -151,10 +152,12 @@ library
   -- Platform calls base cannot express: the exclusive create behind NAR
   -- unpacking (Nix.Store.Exclusive), reading the environment as bytes on
   -- POSIX (Nix.Environment; getenv, as upstream reads it), where Windows
-  -- reads it through base's UTF-16 API, and marking a builder's log pipe
-  -- close-on-exec on POSIX (Nix.Builder.Log).  Win32 2.9 is the first
-  -- whose hANDLEToHandle serves the native Windows I/O manager; unix 2.8
-  -- is the first whose openFd takes creat and cloexec in its flags.
+  -- reads it through base's UTF-16 API, marking a builder's log pipe
+  -- close-on-exec on POSIX (Nix.Builder.Log), and creating a build
+  -- directory with mode 0700 on POSIX (Nix.Builder.BuildDir).  Win32 2.9
+  -- is the first whose hANDLEToHandle serves the native Windows I/O
+  -- manager; unix 2.8 is the first whose openFd takes creat and cloexec
+  -- in its flags.
   if os(windows)
     build-depends:
         Win32             >= 2.9 && < 2.15

@@ -50,7 +50,7 @@ import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), addOutLinkRoot, c
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Paths_nova_nix (getDataDir, version)
-import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, getTemporaryDirectory, makeAbsolute)
+import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, makeAbsolute)
 import qualified System.Directory.OsPath as OsDir
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
@@ -733,11 +733,9 @@ buildAndRegister store caches fallback substitutes mode cores wrappers drvClosur
   -- still works if the closure was not captured (e.g. a pre-built store drv).
   writeDrv store drv drvSP
   -- Build with dependency resolution
-  tmpDir <- getTemporaryDirectory
   let config =
         (defaultBuildConfig (stDir store))
-          { bcTmpDir = tmpDir,
-            bcCaches = caches,
+          { bcCaches = caches,
             bcFallback = fallback,
             bcSubstitutes = substitutes,
             bcMode = mode,

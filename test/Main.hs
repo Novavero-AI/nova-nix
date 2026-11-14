@@ -55,6 +55,7 @@ import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder.BuildDir (buildDirFor, createBuildDir)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
@@ -118,7 +119,7 @@ import qualified System.Environment.Blank as Blank
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), IOMode (..), hPutStrLn, hSetBuffering, stderr, stdout, withBinaryFile)
-import System.IO.Error (ioeGetErrorString, mkIOError, resourceVanishedErrorType)
+import System.IO.Error (ioeGetErrorString, isAlreadyExistsError, mkIOError, resourceVanishedErrorType)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
 import System.OsPath (OsPath)
@@ -8184,11 +8185,10 @@ testBuildOrchestrator = do
             drvSP = StorePath "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" "test.drv"
         -- Write .drv to store so buildWithDeps can read it
         writeDrv store drv drvSP
-        let config = (defaultBuildConfig (StoreDir tmpStore)) {bcTmpDir = tmpBase </> "nova-nix-test-orch-tmp"}
+        let config = defaultBuildConfig (StoreDir tmpStore)
         result <- buildWithDeps config store drv drvSP
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         -- Builder will fail (nonexistent) but the graph should resolve
         -- correctly: the failure must come from SPAWNING THE BUILDER, not
         -- from graph resolution or drv reading upstream of it.
@@ -9389,12 +9389,8 @@ testTrivialBuildIO = do
               drvArgs = args,
               drvEnv = Map.empty
             }
-    buildTmp <- (</> "nova-nix-test-trivial-build-tmp") <$> getTemporaryDirectory
-    forceRemoveIfExists buildTmp
-    createDirectoryIfMissing True buildTmp
-    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+    let config = defaultBuildConfig storeDir
     result <- buildDerivation config store drv testDrvPath
-    forceRemoveIfExists buildTmp
     case result of
       BuildSuccess sp -> do
         let outFile = storePathToFilePath storeDir sp
@@ -9426,6 +9422,134 @@ testTrivialBuildIO = do
               Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
 
+-- | Where a build runs ("Nix.Builder.BuildDir"): in a directory under the
+-- store's state directory, named by the first output, that the build
+-- created itself, private to the user on POSIX, and removed when the
+-- build ends.  Builds of one derivation into two stores run in two
+-- directories.
+testBuildDirIO :: IO [Bool]
+testBuildDirIO = do
+  putStrLn "builder/build-dir"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  let scratch label = tmpBase </> ("nova-nix-test-build-dir-" <> label)
+      -- A fresh store, removed when the action ends, however it ends.
+      inStore label action =
+        bracket_ (forceRemoveIfExists (scratch label)) (forceRemoveIfExists (scratch label)) $
+          bracket (openStore (StoreDir (scratch label))) closeStore action
+      outSP = StorePath (T.replicate 31 "b" <> "d") "build-dir"
+      -- Spelled out rather than taken from 'buildDirFor', so the test
+      -- pins the location instead of echoing it.
+      expectedDir store = unStoreDir (stDir store) </> metaDirName </> "builds" </> T.unpack (spHash outSP)
+      -- Records where the builder ran, what its directory held when it
+      -- started, and the directory's own line of a long listing.
+      probe =
+        mkTestBuildDrv shell outSP $
+          T.unwords
+            [ "mkdir \"$out\" &&",
+              "printf '%s' \"$NIX_BUILD_TOP\" > \"$out/top\" &&",
+              "ls -A . > \"$out/entries\" &&",
+              "ls -ld . > \"$out/mode\""
+            ]
+      recorded store name = BS.readFile (storePathToFilePath (stDir store) outSP </> name)
+      built result check = case result of
+        BuildSuccess _ -> check
+        BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+      -- msys reports a mode Windows does not have, so only POSIX checks it.
+      privateOnPosix listing
+        | SI.os == "mingw32" = Pass
+        | otherwise = assertEqual "mode" "drwx------" (BS.take 10 listing)
+      refused :: Text -> Either IOException () -> TestResult
+      refused label outcome = case outcome of
+        Left err
+          | isAlreadyExistsError err -> Pass
+          | otherwise -> Fail (label <> ": expected an already-exists error, got: " <> T.pack (show err))
+        Right () -> Fail (label <> ": created a directory where one exists")
+  sequence
+    [ runTestM "a build runs in a directory under the store's state directory, removed when it ends" $
+        inStore "location" $ \store -> do
+          result <- buildDerivation (defaultBuildConfig (stDir store)) store probe testDrvPath
+          built result $ do
+            top <- recorded store "top"
+            remains <- Dir.doesPathExist (expectedDir store)
+            pure $
+              assertEqual "NIX_BUILD_TOP" (BS8.pack (expectedDir store)) top
+                `andThen` assertEqual "the directory after the build" False remains,
+      -- What a killed build leaves: a directory of the default mode,
+      -- holding a tree sealed read-only, as one copied out of the store
+      -- is.  The build removes it and runs in a directory of its own.
+      runTestM "a build removes what an interrupted build left and runs in a directory it made, mode 0700 on POSIX" $
+        inStore "fresh" $ \store -> do
+          let sealed = expectedDir store </> "sealed"
+          createDirectoryIfMissing True sealed
+          BS.writeFile (sealed </> "file") "stale"
+          setReadOnly sealed
+          result <- buildDerivation (defaultBuildConfig (stDir store)) store probe testDrvPath
+          built result $ do
+            entries <- recorded store "entries"
+            listing <- recorded store "mode"
+            pure (assertEqual "entries when the builder started" "" entries `andThen` privateOnPosix listing),
+      -- The window between removing a leftover and creating the directory
+      -- is where another writer could put one there first; the creation
+      -- fails then rather than taking it over.  A dangling symlink is
+      -- refused without the directory being made where it points.
+      runTestM "a build directory is never created where something already answers to the name" $ do
+        let dir = scratch "exclusive"
+            occupied = dir </> "occupied"
+            target = dir </> "elsewhere"
+        bracket_ (forceRemoveIfExists dir) (forceRemoveIfExists dir) $ do
+          createDirectoryIfMissing True occupied
+          BS.writeFile (occupied </> "theirs") "theirs"
+          overDirectory <- try (createBuildDir occupied)
+          theirs <- BS.readFile (occupied </> "theirs")
+          overLink <-
+            if SI.os == "mingw32"
+              then pure Pass
+              else do
+                Dir.createFileLink target (dir </> "link")
+                outcome <- try (createBuildDir (dir </> "link"))
+                followed <- Dir.doesPathExist target
+                pure (refused "over a dangling symlink" outcome `andThen` assertEqual "the link's target" False followed)
+          pure $
+            refused "over a directory" overDirectory
+              `andThen` assertEqual "the directory's contents" "theirs" theirs
+              `andThen` overLink,
+      runTestM "builds of one derivation into two stores run in two directories" $
+        inStore "store-a" $ \storeA ->
+          inStore "store-b" $ \storeB -> do
+            resultA <- buildDerivation (defaultBuildConfig (stDir storeA)) storeA probe testDrvPath
+            resultB <- buildDerivation (defaultBuildConfig (stDir storeB)) storeB probe testDrvPath
+            built resultA . built resultB $ do
+              topA <- recorded storeA "top"
+              topB <- recorded storeB "top"
+              pure $
+                assertEqual "store a's" (BS8.pack (expectedDir storeA)) topA
+                  `andThen` assertEqual "store b's" (BS8.pack (expectedDir storeB)) topB
+                  `andThen` assertEqual "one directory for both" False (topA == topB),
+      -- The builder's output is where its log goes, so an empty log is a
+      -- builder that never ran.
+      runTestM "a derivation with no output fails before a build directory is made or its builder runs" $
+        inStore "no-output" $ \store -> do
+          let logPath = unStoreDir (stDir store) </> "build.log"
+              drv = (mkTestBuildDrv shell outSP "echo ran") {drvOutputs = []}
+          result <-
+            withBinaryFile logPath WriteMode $ \logHandle ->
+              buildDerivation (defaultBuildConfig (stDir store)) {bcBuildLog = logHandle} store drv testDrvPath
+          logged <- BS.readFile logPath
+          made <- Dir.doesPathExist (unStoreDir (stDir store) </> metaDirName </> "builds")
+          pure $
+            assertEqual "result" (BuildFailure "no outputs defined" 1) result
+              `andThen` assertEqual "the builder's log" "" logged
+              `andThen` assertEqual "a directory for builds" False made,
+      runTestM "a build directory holding a read-only tree is removed when the build ends" $
+        inStore "read-only" $ \store -> do
+          let drv = mkTestBuildDrv shell outSP "mkdir \"$out\" sealed && echo x > sealed/file && chmod 555 sealed"
+          result <- buildDerivation (defaultBuildConfig (stDir store)) store drv testDrvPath
+          built result $ do
+            remains <- Dir.doesPathExist (expectedDir store)
+            pure (assertEqual "the directory after the build" False remains)
+    ]
+
 -- | A builder's standard output and standard error reach the build log
 -- together, a line at a time, as upstream's do: one channel for both
 -- (local-derivation-goal.cc and child.cc at 2.24.9) and upstream's line
@@ -9438,24 +9562,22 @@ testBuildLogIO = do
   tmpBase <- getTemporaryDirectory
   let outPath = StorePath (T.replicate 31 "0" <> "2") "build-log"
       tmpStore = tmpBase </> "nova-nix-test-build-log-store"
-      buildTmp = tmpBase </> "nova-nix-test-build-log-tmp"
       logFile = tmpBase </> "nova-nix-test-build-log.txt"
       daemonPidFile = tmpBase </> "nova-nix-test-build-log-daemon.pid"
       -- Build in a fresh store with the log a file opened in the given
       -- mode, and return the result with the file's bytes.
       buildLogged mode drv = do
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists buildTmp
         BS.writeFile logFile ""
         ( do
             result <-
               bracket (openStore (StoreDir tmpStore)) closeStore $ \store ->
                 withBinaryFile logFile mode $ \logHandle ->
-                  buildDerivation (defaultBuildConfig (stDir store)) {bcTmpDir = buildTmp, bcBuildLog = logHandle} store drv testDrvPath
+                  buildDerivation (defaultBuildConfig (stDir store)) {bcBuildLog = logHandle} store drv testDrvPath
             logged <- BS.readFile logFile
             pure (result, logged)
           )
-          `finally` (forceRemoveIfExists tmpStore *> forceRemoveIfExists buildTmp *> Dir.removePathForcibly logFile)
+          `finally` (forceRemoveIfExists tmpStore *> Dir.removePathForcibly logFile)
       -- Whether or not the build waited for it.
       stopDaemon = do
         recorded <- Dir.doesFileExist daemonPidFile
@@ -9677,12 +9799,8 @@ testSourceDateEpochIO = do
               drvArgs = args,
               drvEnv = Map.empty
             }
-    buildTmp <- (</> "nova-nix-test-sde-build-tmp") <$> getTemporaryDirectory
-    forceRemoveIfExists buildTmp
-    createDirectoryIfMissing True buildTmp
-    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+    let config = defaultBuildConfig storeDir
     result <- buildDerivation config store drv testDrvPath
-    forceRemoveIfExists buildTmp
     case result of
       BuildFailure msg code ->
         sequence
@@ -9729,13 +9847,9 @@ testBuildCoresIO = do
               drvArgs = args,
               drvEnv = env
             }
-    buildTmp <- (</> "nova-nix-test-build-cores-tmp") <$> getTemporaryDirectory
-    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp, bcCores = 7}
+    let config = (defaultBuildConfig storeDir) {bcCores = 7}
         echoed drv = do
-          forceRemoveIfExists buildTmp
-          createDirectoryIfMissing True buildTmp
           result <- buildDerivation config store drv testDrvPath
-          forceRemoveIfExists buildTmp
           case result of
             BuildFailure msg code -> pure (Left ("build failed (exit " <> T.pack (show code) <> "): " <> msg))
             BuildSuccess sp -> Right . T.strip <$> TIO.readFile (storePathToFilePath storeDir sp)
@@ -9894,15 +10008,11 @@ testScrubbedBuildEnvIO = do
             if SI.os == "mingw32"
               then ("cmd.exe", ["/c", "if \"%TMPDIR%\"==\"%TEMPDIR%\" if \"%TMPDIR%\"==\"%TMP%\" if \"%TMPDIR%\"==\"%TEMP%\" if not \"%TMPDIR%\"==\"\" echo quartet-ok>%out%"])
               else ("/bin/sh", ["-c", "[ -n \"$TMPDIR\" ] && [ \"$TMPDIR\" = \"$TEMPDIR\" ] && [ \"$TMPDIR\" = \"$TMP\" ] && [ \"$TMPDIR\" = \"$TEMP\" ] && echo quartet-ok > $out"])
-    buildTmp <- (</> "nova-nix-test-scrub-build-tmp") <$> getTemporaryDirectory
-    forceRemoveIfExists buildTmp
-    createDirectoryIfMissing True buildTmp
-    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+    let config = defaultBuildConfig storeDir
     setEnv "NOVA_NIX_TEST_CANARY" "ambient-leak"
     canaryResult <- buildDerivation config store canaryDrv testDrvPath
     unsetEnv "NOVA_NIX_TEST_CANARY"
     quartetResult <- buildDerivation config store quartetDrv testDrvPath
-    forceRemoveIfExists buildTmp
     sequence
       [ runTestM "an undeclared ambient variable does not reach a build" $
           case canaryResult of
@@ -10124,10 +10234,7 @@ testUnpackBuildIO = do
           bigFileOut = StorePath (T.replicate 30 "0" <> "12") "unpack-size-budget"
           amplifyOut = StorePath (T.replicate 30 "0" <> "13") "unpack-amplify-budget"
           gitHubOut = StorePath (T.replicate 30 "0" <> "14") "unpack-github-archive"
-      buildTmp <- (</> "nova-nix-test-unpack-build-tmp") <$> getTemporaryDirectory
-      forceRemoveIfExists buildTmp
-      createDirectoryIfMissing True buildTmp
-      let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+      let config = defaultBuildConfig storeDir
       seedResult <- buildDerivation config store (mkUnpackDrv seedOut [archiveTools, archiveData]) testDrvPath
       collideResult <- buildDerivation config store (mkUnpackDrv collideOut [archiveTools, archiveCollide]) testDrvPath
       escapeResult <- buildDerivation config store (mkUnpackDrv escapeOut [archiveEscape]) testDrvPath
@@ -10143,7 +10250,6 @@ testUnpackBuildIO = do
       bigFileResult <- buildDerivation (tinyBudget 64 1000) store (mkUnpackDrv bigFileOut [archiveBigFile]) testDrvPath
       amplifyResult <- buildDerivation (tinyBudget 100 1000) store (mkUnpackDrv amplifyOut [archiveAmplify]) testDrvPath
       gitHubResult <- buildDerivation config store (mkUnpackDrv gitHubOut [archiveGitHub]) testDrvPath
-      forceRemoveIfExists buildTmp
       seedChecks <- case seedResult of
         BuildFailure msg code ->
           sequence
@@ -10342,14 +10448,10 @@ testDependentBuildIO = do
     -- that here by writing both recipes to the store.
     writeDrv store depDrv depDrvSP
     writeDrv store rootDrv rootDrvSP
-    buildTmp <- (</> "nova-nix-test-dep-build-tmp") <$> getTemporaryDirectory
-    forceRemoveIfExists buildTmp
-    createDirectoryIfMissing True buildTmp
-    let config = (defaultBuildConfig storeDir) {bcTmpDir = buildTmp}
+    let config = defaultBuildConfig storeDir
     result <- buildWithDeps config store rootDrv rootDrvSP
     depValid <- isValid store depOut
     rootValid <- isValid store rootOut
-    forceRemoveIfExists buildTmp
     case result of
       BuildSuccess sp ->
         sequence
@@ -10383,7 +10485,7 @@ testBuildCheckIO = do
         forceRemoveIfExists root
         createDirectoryIfMissing True root
         store <- openStore (StoreDir (root </> "store"))
-        action store (defaultBuildConfig (stDir store)) {bcTmpDir = root </> "build"}
+        action store (defaultBuildConfig (stDir store))
           `finally` (closeStore store >> forceRemoveIfExists root)
       checking config = config {bcMode = Realise.BuildCheck}
       -- What a check has to leave as it found it: the store directory's
@@ -10459,7 +10561,7 @@ testBuildCheckIO = do
           let outSP = fixture "k" "5" "check-not-valid"
               drvSP = fixture "k" "6" "check-not-valid.drv"
               drv = mkTestBuildDrv shell outSP "echo ran && mkdir -p $out"
-              logPath = bcTmpDir config <> "-log"
+              logPath = unStoreDir (stDir store) <> "-log"
           before <- snapshot store [outSP]
           checked <-
             withBinaryFile logPath WriteMode $ \logHandle ->
@@ -10615,7 +10717,7 @@ testBuildCheckIO = do
           let outSP = fixture "k" "m" "check-direct"
               drvSP = fixture "k" "n" "check-direct.drv"
               drv = mkTestBuildDrv shell outSP "echo ran && mkdir -p $out"
-              logPath = bcTmpDir config <> "-log"
+              logPath = unStoreDir (stDir store) <> "-log"
               withoutLocks (entries, infos) = (filter (not . T.isSuffixOf ".lock" . T.pack) entries, infos)
           before <- snapshot store [outSP]
           checked <-
@@ -10690,7 +10792,6 @@ testReferenceClosureIO :: IO [Bool]
 testReferenceClosureIO = do
   putStrLn "builder/reference-closure"
   shell <- findTestShell
-  buildTmp <- (</> "nova-nix-test-reference-closure-tmp") <$> getTemporaryDirectory
   closureLaw <-
     runTestM "closureUnder is the least set holding the roots and closed under references" $ do
       result <-
@@ -10727,7 +10828,7 @@ testReferenceClosureIO = do
             <> T.unwords ["'" <> pathText sp <> "'" | sp <- [libRuntime, srcRuntime, stray, libDrvPath]]
             <> " > \"$out/paths\""
         drv = (mkTestBuildDrv shell outSP script) {drvInputDrvs = Map.singleton libDrvPath ["out"], drvInputSrcs = [src]}
-        config = (defaultBuildConfig sd) {bcTmpDir = buildTmp}
+        config = defaultBuildConfig sd
         rootFile = gcRootsDir sd </> T.unpack (spHash outSP <> "-" <> spName outSP)
     mapM_ plant [lib, libRuntime, src, srcRuntime, stray]
     registerPaths
@@ -10746,7 +10847,6 @@ testReferenceClosureIO = do
     collected <- collectGarbage store
     validity <- mapM (isValid store) [outSP, libRuntime, srcRuntime, stray]
     runtimesOnDisk <- mapM (Dir.doesPathExist . (</> "data") . onDisk) [libRuntime, srcRuntime]
-    forceRemoveIfExists buildTmp
     let recordedAmong = filter (\sp -> Set.member (pathText sp) recorded)
     case result of
       BuildFailure msg code ->
@@ -10861,10 +10961,9 @@ testOutputCycleBuildIO :: IO [Bool]
 testOutputCycleBuildIO = do
   putStrLn "builder/output-cycle"
   shell <- findTestShell
-  buildTmp <- (</> "nova-nix-test-output-cycle-tmp") <$> getTemporaryDirectory
-  results <- withTempStore $ \store -> do
+  withTempStore $ \store -> do
     let sd = stDir store
-        config = (defaultBuildConfig sd) {bcTmpDir = buildTmp}
+        config = defaultBuildConfig sd
         pathText = T.pack . storePathToFilePath sd
         basename sp = spHash sp <> "-" <> spName sp
         hashOf = T.replicate 32
@@ -10929,8 +11028,6 @@ testOutputCycleBuildIO = do
             (_, _, BuildFailure msg code) -> Fail ("the rebuild failed (exit " <> T.pack (show code) <> "): " <> msg)
             _ -> Fail "the setup did not reach a registered dev and an unregistered out"
       ]
-  forceRemoveIfExists buildTmp
-  pure results
 
 -- | Upstream value-conformance tests: each pins exact output bytes (hash
 -- decode, number formatting) that must match what upstream Nix computes for
@@ -12104,7 +12201,7 @@ testFetchMirrors = do
       tmpBase <- getTemporaryDirectory
       let root = tmpBase </> ("nova-nix-test-mirrors-" ++ label)
           dir = StoreDir (root </> "store")
-          config = (defaultBuildConfig dir) {bcTmpDir = root </> "build", bcFetchRetry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}}
+          config = (defaultBuildConfig dir) {bcFetchRetry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}}
       sp <- either (fail . show) pure (makeFixedOutputPath "mirrors" "sha256" "flat" (sha256Digest "hello"))
       bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
         bracket (openStore dir) closeStore $
@@ -12179,14 +12276,12 @@ testSubstituterRetry = do
                 config =
                   adjust
                     (defaultBuildConfig storeDir)
-                      { bcTmpDir = root </> "build",
-                        bcCaches = caches,
+                      { bcCaches = caches,
                         bcFetchRetry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}
                       }
                 outPath = storePathToFilePath storeDir sp
             bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
               bracket (openStore storeDir) closeStore $ \store -> do
-                createDirectoryIfMissing True (root </> "build")
                 writeDrv store drv drvSP
                 result <- buildWithDeps config store drv drvSP
                 substituted <- Dir.doesFileExist (outPath </> "data")
@@ -16405,14 +16500,13 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" "simple-test"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo hello > $out/result.txt"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder1-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         closeStore store
         let ret = case result of
               BuildSuccess sp -> assertEqual "success path" outSP sp
               BuildFailure msg code -> Fail ("build failed (" <> T.pack (show code) <> "): " <> msg)
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure ret,
       -- Build with specific file content
       runTestM "build writes file content" $ do
@@ -16422,7 +16516,7 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "content-test"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo 'test content 42' > $out/data.txt"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder2-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
@@ -16435,7 +16529,6 @@ testBuilder = do
           BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure ret,
       -- Missing builder fails
       runTestM "missing builder fails" $ do
@@ -16454,11 +16547,10 @@ testBuilder = do
                   drvArgs = [],
                   drvEnv = Map.empty
                 }
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder3-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildFailure _ _ -> Pass
           BuildSuccess _ -> Fail "expected failure for missing builder",
@@ -16470,34 +16562,30 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "dddddddddddddddddddddddddddddddd" "exitfail"
             drv = mkTestBuildDrv shell outSP "exit 42"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder4-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildFailure _ code -> if code == 42 then Pass else Fail ("expected code 42, got " <> T.pack (show code))
           BuildSuccess _ -> Fail "expected failure",
-      -- A builder that THROWS (nonexistent executable) must not leak the
-      -- deterministic build dir: stale contents would fake an archive
-      -- collision on the next builtin:unpack run of the same drv.
+      -- A builder that throws (a nonexistent executable) leaves nothing
+      -- in the directory that holds the store's build directories.
       runTestM "crashed build removes its build dir" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-leak"
-            tmpBuild = tmpBase </> "nova-nix-test-builder-leak-tmp"
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists tmpBuild
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "pppppppppppppppppppppppppppppppp" "leaktest"
             drv = mkTestBuildDrv (T.pack (tmpBase </> "no-such-builder.exe")) outSP "unused"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBuild}
+            config = defaultBuildConfig (stDir store)
+            buildsRoot = takeDirectory (buildDirFor (stDir store) outSP)
         result <- buildDerivation config store drv testDrvPath
         leftovers <- do
-          exists <- doesDirectoryExist tmpBuild
-          if exists then Dir.listDirectory tmpBuild else pure []
+          exists <- doesDirectoryExist buildsRoot
+          if exists then Dir.listDirectory buildsRoot else pure []
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists tmpBuild
         pure $ case result of
           BuildFailure _ _
             | null leftovers -> Pass
@@ -16528,7 +16616,7 @@ testBuilder = do
               (mkTestBuildDrv shell outSP script)
                 { drvEnv = Map.fromList [("__json", TE.encodeUtf8 attrs), ("out", "/nix/store/ssssssssssssssssssssssssssssssss-structured")]
                 }
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-structured-tmp"}
+            config = defaultBuildConfig (stDir store)
             jsonPath = "\"" <> T.replace "\\" "\\\\" outText <> "\""
             expectedJson =
               "{\"greeting\":\"it's\",\"list\":[\"a\",1,true,null],\"nested\":{\"k\":\"v\"},\"outputs\":{\"out\":"
@@ -16558,7 +16646,6 @@ testBuilder = do
           BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure ret,
       -- An attribute passAsFile names arrives as upstream's file in the
       -- build directory, named by fooPath: its store path and placeholder
@@ -16578,8 +16665,8 @@ testBuilder = do
             script = "mkdir \"$out\" && cp \"$fooPath\" \"$out/foo\" && printf '%s|%s|%s' \"${foo-unset}\" \"${missingPath-unset}\" \"$fooPath\" > \"$out/env\""
             base = mkTestBuildDrv shell outSP script
             drv = base {drvEnv = Map.union (Map.fromList [("foo", value), ("passAsFile", "foo missing")]) (drvEnv base)}
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-passasfile-tmp"}
-            fooFile = bcTmpDir config </> T.unpack (spHash outSP) </> ".attr-1bp7cri8hplaz6hbz0v4f0nl44rl84q1sg25kgwqzipzd1mv89ic"
+            config = defaultBuildConfig (stDir store)
+            fooFile = buildDirFor (stDir store) outSP </> ".attr-1bp7cri8hplaz6hbz0v4f0nl44rl84q1sg25kgwqzipzd1mv89ic"
         result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
@@ -16591,7 +16678,6 @@ testBuilder = do
           BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure ret,
       -- Output at expected path
       runTestM "output at expected store path" $ do
@@ -16601,7 +16687,7 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "cccccccccccccccccccccccccccccccc" "pathtest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/marker"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder5-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
@@ -16611,7 +16697,6 @@ testBuilder = do
           BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure ret,
       -- A leftover tree at the output path that is NOT valid in the DB has
       -- unknowable integrity (interrupted earlier run); the build replaces
@@ -16624,7 +16709,7 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" "staletest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo fresh > $out/data.txt"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-stale-tmp"}
+            config = defaultBuildConfig (stDir store)
             targetPath = storePathToFilePath (stDir store) outSP
         -- Fake the interrupted run: stale read-only content at the output's
         -- store location, never registered.
@@ -16636,7 +16721,6 @@ testBuilder = do
         registered <- isValid store outSP
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildSuccess _
             | T.strip content == "fresh" && registered -> Pass
@@ -16650,7 +16734,7 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "ffffffffffffffffffffffffffffffff" "dbtest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/file"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder6-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
@@ -16659,7 +16743,6 @@ testBuilder = do
           BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure ret,
       -- Multiple outputs
       runTestM "multiple outputs" $ do
@@ -16682,7 +16765,7 @@ testBuilder = do
                   drvArgs = ["-c", "mkdir -p $out && echo lib > $out/lib.txt && mkdir -p $dev && echo headers > $dev/include.h"],
                   drvEnv = Map.fromList [("name", "multi")]
                 }
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder7-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         ret <- case result of
           BuildSuccess _ -> do
@@ -16695,7 +16778,6 @@ testBuilder = do
           BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure ret,
       runTestM "partial rebuild failure preserves a valid sibling output" $ do
         tmpBase <- getTemporaryDirectory
@@ -16717,7 +16799,7 @@ testBuilder = do
                   drvArgs = ["-c", script],
                   drvEnv = Map.fromList [("name", "partial-valid")]
                 }
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-partial-valid-tmp"}
+            config = defaultBuildConfig (stDir store)
             devPath = storePathToFilePath (stDir store) devSP
         initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo main > $out/value && echo keep > $dev/value") testDrvPath
         deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
@@ -16727,7 +16809,6 @@ testBuilder = do
         devContents <- if devOnDisk then T.strip <$> TIO.readFile (devPath </> "value") else pure ""
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         let deletedFirst = either (const False) (\outcome -> doRowRemoved outcome && doTreeRemoved outcome) deleted
         pure $ case (initial, rebuilt) of
           (BuildSuccess _, BuildFailure _ _)
@@ -16758,7 +16839,7 @@ testBuilder = do
                   drvArgs = ["-c", script],
                   drvEnv = Map.fromList [("name", "partial-both")]
                 }
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-partial-both-tmp"}
+            config = defaultBuildConfig (stDir store)
             devPath = storePathToFilePath (stDir store) devSP
             outPath = storePathToFilePath (stDir store) outSP
             -- Both outputs, every time, as a real multi-output builder does.
@@ -16772,7 +16853,6 @@ testBuilder = do
         outValid <- isValid store outSP
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         let deletedFirst = either (const False) (\outcome -> doRowRemoved outcome && doTreeRemoved outcome) deleted
         pure $ case (initial, rebuilt) of
           (BuildSuccess _, BuildSuccess _)
@@ -16808,7 +16888,7 @@ testBuilder = do
                   drvArgs = ["-c", script],
                   drvEnv = Map.fromList [("name", "scratch-leak")]
                 }
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-scratch-leak-tmp"}
+            config = defaultBuildConfig (stDir store)
             devPath = storePathToFilePath (stDir store) devSP
             outPath = storePathToFilePath (stDir store) outSP
         initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo first > $out/value && echo first > $dev/value") testDrvPath
@@ -16823,7 +16903,6 @@ testBuilder = do
         references <- queryReferences (stDB store) outSP
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         let deletedFirst = either (const False) (\outcome -> doRowRemoved outcome && doTreeRemoved outcome) deleted
         pure $ case (initial, rebuilt) of
           (BuildSuccess _, BuildSuccess _)
@@ -16843,11 +16922,10 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "nooutput"
             drv = mkTestBuildDrv shell outSP "echo 'forgot to create output'"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-noout-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildFailure msg _ ->
             if T.isInfixOf "outputs missing" msg
@@ -16874,7 +16952,7 @@ testBuilder = do
                   drvArgs = ["-c", "mkdir -p $out && echo orphan > $out/value"],
                   drvEnv = Map.fromList [("name", "partial-missing")]
                 }
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-partial-missing-tmp"}
+            config = defaultBuildConfig (stDir store)
             outPath = storePathToFilePath (stDir store) outSP
             devPath = storePathToFilePath (stDir store) devSP
         result <- buildDerivation config store drv testDrvPath
@@ -16884,7 +16962,6 @@ testBuilder = do
         devValid <- isValid store devSP
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildFailure msg _
             | "outputs missing" `T.isInfixOf` msg && not outOnDisk && not devOnDisk && not outValid && not devValid -> Pass
@@ -16898,11 +16975,10 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "fileout"
             drv = mkTestBuildDrv shell outSP "echo 'I am a file output' > $out"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-builder-fileout-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildSuccess sp -> assertEqual "file output path" outSP sp
           BuildFailure msg code -> Fail ("file output build failed (" <> T.pack (show code) <> "): " <> msg),
@@ -16914,15 +16990,11 @@ testBuilder = do
         store <- openStore (StoreDir tmpStore)
         let outSP = StorePath "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh" "cleantest"
             drv = mkTestBuildDrv shell outSP "exit 1"
-            tmpDir = tmpBase </> "nova-nix-test-builder8-tmp"
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpDir}
+            config = defaultBuildConfig (stDir store)
         _ <- buildDerivation config store drv testDrvPath
-        -- Build dir should be cleaned up
-        let buildDir = tmpDir </> T.unpack (spHash outSP)
-        buildDirExists <- doesDirectoryExist buildDir
+        buildDirExists <- doesDirectoryExist (buildDirFor (stDir store) outSP)
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists tmpDir
         pure $ if not buildDirExists then Pass else Fail "build dir not cleaned up after failure",
       -- Fixed-output: registration re-checks the placed bytes
       runTestM "fixed-output flat output verifies and registers" $ do
@@ -16934,12 +17006,11 @@ testBuilder = do
             digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" payload)
             outSP = StorePath "ffffffffffffffffffffffffffffff01" "fo-flat-good"
             drv = mkFixedOutputDrv shell outSP "printf 'fixed output payload\\n' > $out" "sha256" digest
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo1-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         registered <- isValid store outSP
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildSuccess _
             | registered -> Pass
@@ -16962,12 +17033,11 @@ testBuilder = do
             script = "[ \"$NOVA_TEST_IMPURE\" = \"proxy-ok\" ] && [ \"${NOVA_TEST_ABSENT+set}\" = \"set\" ] && [ -z \"$NOVA_TEST_ABSENT\" ] && printf 'fixed output payload\\n' > $out"
             baseDrv = mkFixedOutputDrv shell outSP script "sha256" digest
             drv = baseDrv {drvEnv = Map.insert "impureEnvVars" "NOVA_TEST_IMPURE NOVA_TEST_ABSENT" (drvEnv baseDrv)}
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-impure1-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         unsetEnv "NOVA_TEST_IMPURE"
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildSuccess _ -> Pass
           BuildFailure msg code -> Fail ("carve-out did not reach the build (" <> T.pack (show code) <> "): " <> msg),
@@ -16981,12 +17051,11 @@ testBuilder = do
             script = "[ -z \"${NOVA_TEST_IMPURE-}\" ] && echo ok > $out"
             baseDrv = mkTestBuildDrv shell outSP script
             drv = baseDrv {drvEnv = Map.insert "impureEnvVars" "NOVA_TEST_IMPURE" (drvEnv baseDrv)}
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-impure2-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         unsetEnv "NOVA_TEST_IMPURE"
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildSuccess _ -> Pass
           BuildFailure msg code -> Fail ("ambient leaked into a non-fixed-output build (" <> T.pack (show code) <> "): " <> msg),
@@ -16998,13 +17067,12 @@ testBuilder = do
         let digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "expected content\n")
             outSP = StorePath "ffffffffffffffffffffffffffffff02" "fo-flat-bad"
             drv = mkFixedOutputDrv shell outSP "printf 'tampered content\\n' > $out" "sha256" digest
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo2-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         registered <- isValid store outSP
         onDisk <- Dir.doesPathExist (storePathToFilePath (stDir store) outSP)
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildFailure msg _
             | "hash mismatch" `T.isInfixOf` msg && not registered && not onDisk -> Pass
@@ -17027,12 +17095,11 @@ testBuilder = do
             digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (NAR.serialise tree))
             outSP = StorePath "ffffffffffffffffffffffffffffff03" "fo-rec-good"
             drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'inner bytes\\n' > $out/data.txt" "r:sha256" digest
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo3-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         registered <- isValid store outSP
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildSuccess _
             | registered -> Pass
@@ -17047,12 +17114,11 @@ testBuilder = do
             digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (NAR.serialise tree))
             outSP = StorePath "ffffffffffffffffffffffffffffff04" "fo-rec-bad"
             drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'other bytes\\n' > $out/data.txt" "r:sha256" digest
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo4-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         registered <- isValid store outSP
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildFailure msg _
             | "hash mismatch" `T.isInfixOf` msg && not registered -> Pass
@@ -17066,11 +17132,10 @@ testBuilder = do
         let digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "whatever\n")
             outSP = StorePath "ffffffffffffffffffffffffffffff05" "fo-flat-dir"
             drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'x' > $out/f" "sha256" digest
-            config = (defaultBuildConfig (stDir store)) {bcTmpDir = tmpBase </> "nova-nix-test-fo5-tmp"}
+            config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         closeStore store
         forceRemoveIfExists tmpStore
-        forceRemoveIfExists (bcTmpDir config)
         pure $ case result of
           BuildFailure msg _
             | "directory" `T.isInfixOf` msg -> Pass
@@ -17126,8 +17191,7 @@ evalAndBuild storeDir source = do
         Right Nothing -> pure (Left "result is not a derivation")
         Right (Just drv) -> do
           store <- openStore storeDir
-          tmpBase <- getTemporaryDirectory
-          let config = (defaultBuildConfig storeDir) {bcTmpDir = tmpBase </> "nova-nix-e2e-tmp"}
+          let config = defaultBuildConfig storeDir
           -- What the CLI driver does before building, in the same
           -- order: eval has no store DB handle, so anything it wrote
           -- is registered here or not at all.  Skipping it made this
@@ -21188,6 +21252,7 @@ runSuite = do
           testStorePaths,
           testDerivation,
           testTrivialBuildIO,
+          testBuildDirIO,
           testBuildLogIO,
           testSourceDateEpochIO,
           testBuildCoresIO,
@@ -22176,7 +22241,7 @@ testInterruptsPropagate = do
         fifoCase "an interrupt reading an input derivation is not an unreadable one" $ do
           let input = StorePath (T.replicate 32 "g") "stalled-input.drv"
               rootDrv = plainDrv {drvInputDrvs = Map.singleton input ["out"]}
-              config = (defaultBuildConfig storeDir) {bcTmpDir = root </> "build"}
+              config = defaultBuildConfig storeDir
           outcome <- withStalledFifo (inStore input) (interruptedAfterStall (buildWithDeps config store rootDrv (StorePath (T.replicate 32 "h") "root.drv")))
           pure (interruptPropagated outcome),
         -- The failures the unpacker does catch: the zstd decoder reports a
