@@ -446,6 +446,7 @@ configuration =
           :| [ Setting "trusted-public-keys" "Public keys, one of whose signatures a substituted path must carry" (Just TrustedKeyFlag),
                Setting "fallback" "Build from source when a substitute fails" (Just FallbackFlag),
                Setting "always-allow-substitutes" "Substitute a derivation whose `allowSubstitutes` attribute is false" Nothing,
+               Setting "cores" "The `NIX_BUILD_CORES` a builder is given, `0` asking it to use every core (default: the CPU limit of the process's cgroup on Linux, otherwise the hardware threads)" Nothing,
                Setting "max-call-depth" ("How many function calls may be active around a new one before evaluation refuses it (default " <> T.pack (show defaultMaxCallDepth) <> ")") Nothing,
                Setting "restrict-eval" "Turn on restricted evaluation" (Just RestrictEvalFlag),
                Setting "pure-eval" "Turn on pure evaluation" (Just PureEvalFlag),

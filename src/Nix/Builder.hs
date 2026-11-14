@@ -97,6 +97,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
+import Data.Word (Word32)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
@@ -148,6 +149,10 @@ envTemp = "TEMP"
 -- | Environment variable for the Nix store path.
 envNixStore :: Text
 envNixStore = "NIX_STORE"
+
+-- | Environment variable for the cores a builder may use ('bcCores').
+envNixBuildCores :: Text
+envNixBuildCores = "NIX_BUILD_CORES"
 
 -- | Ambient variables a Windows builder may inherit, by uppercase-folded
 -- name.  SystemRoot is a hard execution requirement - the CLR's crypto
@@ -263,6 +268,12 @@ data BuildConfig = BuildConfig
     -- upstream's build mode, which @nix-build --check@ sets.  Nothing
     -- else reads it, and 'buildDerivation' always builds.
     bcMode :: !BuildMode,
+    -- | What a builder's @NIX_BUILD_CORES@ says: upstream's @cores@, 0
+    -- meaning every core.  Where a derivation's attributes reach the
+    -- environment, which they do not under @__structuredAttrs@, an
+    -- attribute of that name wins, as upstream sets the variable before it
+    -- copies the derivation's environment (@LocalDerivationGoal::initEnv@).
+    bcCores :: !Word32,
     -- | Extraction budget for @builtin:unpack@ builds.
     bcUnpackLimits :: !UnpackLimits,
     -- | How a download is retried: each URL of a @builtin:fetchurl@
@@ -286,7 +297,9 @@ data BuildConfig = BuildConfig
   }
   deriving (Eq, Show)
 
--- | Default build configuration.
+-- | Default build configuration.  A builder is told of one core
+-- ('baselineCores'), where upstream's default is the machine's count,
+-- which takes IO to find ("Nix.Builder.Cores").
 defaultBuildConfig :: StoreDir -> BuildConfig
 defaultBuildConfig dir =
   BuildConfig
@@ -299,11 +312,17 @@ defaultBuildConfig dir =
       bcFallback = NoFallback,
       bcSubstitutes = HeedAllowSubstitutes,
       bcMode = BuildNormal,
+      bcCores = baselineCores,
       bcExecWrappers = Map.empty,
       bcUnpackLimits = defaultUnpackLimits,
       bcFetchRetry = defaultFetchRetryPolicy,
       bcBuildLog = System.IO.stderr
     }
+
+-- | The cores 'defaultBuildConfig' tells a builder of: one, which is what
+-- nixpkgs' setup.sh takes an unset @NIX_BUILD_CORES@ to mean.
+baselineCores :: Word32
+baselineCores = 1
 
 -- | Result of a build attempt.
 data BuildResult
@@ -1065,6 +1084,7 @@ buildEnvironment config derivationEnv builderPath buildDir =
             (envTemp, T.pack buildDir),
             (homeEnvVar, T.pack buildDir),
             (envNixStore, T.pack (unStoreDir (bcStoreDir config))),
+            (envNixBuildCores, T.pack (show (bcCores config))),
             (envPath, buildPath builderPath),
             (envSourceDateEpoch, sourceDateEpochValue)
           ]

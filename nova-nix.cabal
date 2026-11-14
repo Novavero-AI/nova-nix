@@ -101,6 +101,7 @@ library
     Nix.Derivation
     Nix.Derivation.StructuredAttrs
     Nix.Builder
+    Nix.Builder.Cores
     Nix.Builder.Log
     Nix.Builder.Unpack
     Nix.Compression
@@ -173,6 +174,7 @@ library
     cbits/nn_lambda.c
     cbits/nn_winfs.c
     cbits/nn_darwinfs.c
+    cbits/nn_cpus.c
   include-dirs:     cbits
   -- -Werror deliberately NOT baked in: a future gcc/clang adding a new
   -- -Wall diagnostic must not retroactively break installing published
@@ -230,9 +232,10 @@ executable nova-nix
     OverloadedStrings
   ghc-options:      -Wall -Wcompat -threaded -rtsopts
 
-  -- file-io reads a config file by the bytes of its path.  0.1.1 is the
-  -- first whose read does not create a missing file on Windows, which
-  -- would turn a missing include into an empty one.
+  -- file-io reads a config file, and on Linux /proc/mounts,
+  -- /proc/self/cgroup and a cgroup's cpu.max, by the bytes of its path.  0.1.1 is the first whose read does not create a
+  -- missing file on Windows, which would turn a missing include into an
+  -- empty one.
   build-depends:
       base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
