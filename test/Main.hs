@@ -24,6 +24,7 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (intToDigit, isAsciiLower, isAsciiUpper, isDigit)
+import Data.Either (isLeft, isRight)
 import Data.Foldable (toList)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
@@ -98,7 +99,7 @@ import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScop
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, pushPaths, storePathBasename, stripHashPrefix)
 import qualified Nix.Realise as Realise
-import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
@@ -9336,6 +9337,11 @@ withTempStore action = do
   forceRemoveIfExists tmpStore
   pure results
 
+-- | 'deleteStorePathRaw' of a name spelled as text, refused as
+-- 'storeEntryName' refuses it.
+deleteNamed :: Store -> Text -> IO (Either Text DeleteOutcome)
+deleteNamed store = either (pure . Left) (deleteStorePathRaw store) . storeEntryName
+
 -- | Recursively restore writable permissions then remove.
 -- Needed because addToStore/setReadOnly makes paths read-only.
 forceRemoveIfExists :: FilePath -> IO ()
@@ -10650,7 +10656,7 @@ testBuildCheckIO = do
           writeDrv store rootDrv rootDrvSP
           built <- buildWithDeps config store rootDrv rootDrvSP
           rootBefore <- queryPathInfo (stDB store) rootOut
-          deleted <- deleteStorePathRaw store (storePathBasename depOut)
+          deleted <- deleteNamed store (storePathBasename depOut)
           depGone <- not <$> isValid store depOut
           checked <- buildWithDeps (checking config) store rootDrv rootDrvSP
           depBack <- isValid store depOut
@@ -10999,7 +11005,7 @@ testOutputCycleBuildIO = do
     onewayResult <- buildTwo onewayDrv "oneway" onewayDev onewayOut "mkdir -p \"$out\" \"$dev\" && echo \"$dev\" > \"$out/dev\" && echo \"$out\" > \"$out/self\" && echo \"$dev\" > \"$dev/self\""
     onewayRefs <- mapM referencesOf [onewayDev, onewayOut]
     leafFirst <- buildTwo leafFirstDrv "leaf" leafDev leafOut "mkdir -p \"$out\" \"$dev\" && echo first > \"$out/v\" && echo first > \"$dev/v\""
-    deleted <- deleteStorePathRaw store (basename leafOut)
+    deleted <- deleteNamed store (basename leafOut)
     leafSecond <- buildTwo leafSecondDrv "leaf" leafDev leafOut "mkdir -p \"$out\" \"$dev\" && echo \"$dev\" > \"$out/dev\" && echo \"$out\" > \"$dev/out\""
     leafValid <- mapM (isValid store) [leafDev, leafOut]
     leafRefs <- referencesOf leafOut
@@ -14922,6 +14928,17 @@ testStoreDelete = do
         basenameOf sp = spHash sp <> "-" <> spName sp
         dep = StorePath (T.replicate 32 "a") "del-dep"
         user = StorePath (T.replicate 32 "b") "del-user"
+        quickCheckPasses property = do
+          result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+          pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+        -- Store directories in either host's spelling, the root among
+        -- them, and no other with a trailing separator, as an opened
+        -- store's has none.
+        genEntryDir = QC.elements ["/nix/store", "/tmp/scratch-store", "/", "C:\\nix\\store", "D:\\s", "C:/s/store"]
+        -- Short names, so a generated name is accepted about as often as
+        -- one holds a separator, a colon, a NUL or a leading dot.
+        genEntryText =
+          T.pack <$> QC.resize 12 (QC.listOf (QC.frequency [(6, QC.elements "az09-+_?=~ .\233"), (1, QC.elements "./\\:\NUL")]))
     sequence
       [ runTestM "referenced path is refused with its referrers listed" $ do
           registerPaths
@@ -14929,7 +14946,7 @@ testStoreDelete = do
             [ PathRegistration dep "sha256:d" 1 Nothing [],
               PathRegistration user "sha256:u" 1 Nothing [dep]
             ]
-          outcome <- deleteStorePathRaw store (basenameOf dep)
+          outcome <- deleteNamed store (basenameOf dep)
           stillValid <- isValid store dep
           pure $ case outcome of
             Left err
@@ -14940,8 +14957,8 @@ testStoreDelete = do
               | otherwise -> Fail ("wrong refusal: " <> err)
             Right removed -> Fail ("deleted a referenced path: " <> T.pack (show removed)),
         runTestM "a reference chain deletes leaf-first" $ do
-          userGone <- deleteStorePathRaw store (basenameOf user)
-          depGone <- deleteStorePathRaw store (basenameOf dep)
+          userGone <- deleteNamed store (basenameOf user)
+          depGone <- deleteNamed store (basenameOf dep)
           depValid <- isValid store dep
           userValid <- isValid store user
           pure $ case (userGone, depGone) of
@@ -14973,10 +14990,14 @@ testStoreDelete = do
               PathRegistration batchAfter "sha256:ba" 1 Nothing []
             ]
           reports <- newIORef []
-          let report basename removed = do
+          let report name removed = do
                 stillValid <- mapM (isValid store) batchPaths
-                modifyIORef' reports ((basename, removed, stillValid) :)
-          result <- deleteStorePaths store [basenameOf batchUser, basenameOf batchDep, missing, basenameOf batchAfter] report
+                modifyIORef' reports ((storeEntryNameText name, removed, stillValid) :)
+          result <-
+            either
+              (pure . Left)
+              (\names -> deleteStorePaths store names report)
+              (traverse storeEntryName [basenameOf batchUser, basenameOf batchDep, missing, basenameOf batchAfter])
           reported <- reverse <$> readIORef reports
           afterKept <- (&&) <$> isValid store batchAfter <*> Dir.doesPathExist (storePathToFilePath sd batchAfter </> "data.txt")
           let expected =
@@ -14994,7 +15015,7 @@ testStoreDelete = do
         runTestM "a registered row without a tree deletes (repair case)" $ do
           let ghost = StorePath (T.replicate 32 "c") "del-ghost"
           registerPath (stDB store) (PathRegistration ghost "sha256:g" 1 Nothing [])
-          outcome <- deleteStorePathRaw store (basenameOf ghost)
+          outcome <- deleteNamed store (basenameOf ghost)
           pure $ case outcome of
             Right removed
               | doRowRemoved removed && not (doTreeRemoved removed) -> Pass
@@ -15005,7 +15026,7 @@ testStoreDelete = do
               treePath = unStoreDir sd </> T.unpack strayBase
           createDirectoryIfMissing True treePath
           TIO.writeFile (treePath </> "junk.txt") "stray"
-          outcome <- deleteStorePathRaw store strayBase
+          outcome <- deleteNamed store strayBase
           gone <- not <$> Dir.doesPathExist treePath
           pure $ case outcome of
             Right removed
@@ -15019,7 +15040,7 @@ testStoreDelete = do
           createDirectoryIfMissing True treePath
           TIO.writeFile (treePath </> "data.txt") "content"
           setReadOnly treePath
-          outcome <- deleteStorePathRaw store (basenameOf solid)
+          outcome <- deleteNamed store (basenameOf solid)
           gone <- not <$> Dir.doesPathExist treePath
           stillValid <- isValid store solid
           pure $ case outcome of
@@ -15030,10 +15051,10 @@ testStoreDelete = do
         runTestM "a self-referencing path deletes" $ do
           let selfp = StorePath (T.replicate 32 "f") "del-self"
           registerPath (stDB store) (PathRegistration selfp "sha256:f" 1 Nothing [selfp])
-          outcome <- deleteStorePathRaw store (basenameOf selfp)
+          outcome <- deleteNamed store (basenameOf selfp)
           pure (assertEqual "self delete" (Right (DeleteOutcome True False)) outcome),
         runTestM "a target with neither row nor tree is an error" $ do
-          outcome <- deleteStorePathRaw store (T.replicate 32 "9" <> "-del-nothing")
+          outcome <- deleteNamed store (T.replicate 32 "9" <> "-del-nothing")
           pure $ case outcome of
             Left err | "not in this store" `T.isInfixOf` err -> Pass
             other -> Fail ("expected not-in-store, got: " <> T.pack (show other)),
@@ -15066,7 +15087,7 @@ testStoreDelete = do
                   T.pack (unStoreDir platformStoreDir) <> "\\" <> nameBase,
                   defaultStoreDirText <> "/" <> nameBase
                 ]
-           in assertEqual "all resolve" (replicate 4 (Right nameBase)) (map (resolveDeleteTarget sd) spellings),
+           in assertEqual "all resolve" (replicate 4 (Right nameBase)) (map (fmap storeEntryNameText . resolveDeleteTarget sd) spellings),
         runTest "resolveDeleteTarget refuses traversal shapes" $
           let refused =
                 [ ".nova-nix",
@@ -15075,11 +15096,89 @@ testStoreDelete = do
                   "",
                   T.pack (unStoreDir sd) <> "/",
                   "/somewhere/else/" <> T.replicate 32 "h" <> "-name",
-                  T.replicate 32 "h" <> "-na:me"
+                  T.replicate 32 "h" <> "-na:me",
+                  T.replicate 32 "h" <> "-na\NULme"
                 ]
            in case [t | t <- refused, either (const False) (const True) (resolveDeleteTarget sd t)] of
                 [] -> Pass
                 accepted -> Fail ("accepted: " <> T.pack (show accepted)),
+        -- A name that is not one entry of the store directory is refused
+        -- before a delete takes its path lock or looks for a tree.  Joined
+        -- to the directory, an absolute path or one climbing out names a
+        -- file outside the store, the empty name names the store directory
+        -- itself, "." everything in it, ".." the directory above it, and
+        -- the metadata directory's name the store's database and roots.  A
+        -- delete that got that far would leave its lock file beside what
+        -- it named: in the store, beside it, or beside the file outside.
+        -- The store sits two levels into a directory of its own, so none
+        -- of these forms reaches outside that directory if it is not
+        -- refused.
+        runTestM "a delete of a name that is not one store entry is refused and creates nothing" $ do
+          sandbox <- (</> "nova-nix-test-delete-escape") <$> getTemporaryDirectory
+          let root = sandbox </> "root"
+              outsideDir = root </> "outside"
+              planted = outsideDir </> "planted"
+              forms =
+                [ T.pack planted,
+                  T.pack (".." </> takeFileName outsideDir </> takeFileName planted),
+                  "a/b",
+                  "a\\b",
+                  ".",
+                  "..",
+                  "",
+                  T.pack metaDirName,
+                  "C:x",
+                  T.replicate 32 "q" <> "-del\NULname"
+                ]
+              deleteOne escapeStore form =
+                either (pure . Left) (\name -> deleteStorePaths escapeStore [name] (\_ _ -> pure ())) (storeEntryName form)
+              -- A delete's refusal, or what it did instead, so every form
+              -- runs and the listings below see all that reached the disk.
+              refusalOf delete = do
+                result <- try delete
+                pure $ case result of
+                  Left (e :: IOException) -> Left ("raised " <> T.pack (show e))
+                  Right (Left refusal) -> Right refusal
+                  Right (Right _) -> Left "deleted"
+              -- A directory's entries, or Nothing once a delete removed it.
+              listing dir = do
+                found <- try (Dir.listDirectory dir)
+                pure (either (\(_ :: IOException) -> Nothing) (Just . sort) found)
+          forceRemoveIfExists sandbox
+          createDirectoryIfMissing True (root </> "store")
+          createDirectoryIfMissing True outsideDir
+          TIO.writeFile planted "outside the store"
+          flip finally (forceRemoveIfExists sandbox) $
+            bracket (openStore (StoreDir (root </> "store"))) closeStore $ \escapeStore -> do
+              let storeRoot = unStoreDir (stDir escapeStore)
+              rootBefore <- listing root
+              storeBefore <- listing storeRoot
+              single <- mapM (refusalOf . deleteNamed escapeStore) forms
+              batch <- mapM (refusalOf . deleteOne escapeStore) forms
+              rootAfter <- listing root
+              storeAfter <- listing storeRoot
+              outsideAfter <- listing outsideDir
+              pure $
+                if all isRight single
+                  && batch == single
+                  && rootAfter == rootBefore
+                  && storeAfter == storeBefore
+                  && outsideAfter == Just [takeFileName planted]
+                  then Pass
+                  else Fail ("delete reached the filesystem: " <> T.pack (show (zip forms single, batch, rootAfter, storeBefore, storeAfter, outsideAfter))),
+        runTestM "a name storeEntryName accepts joins a store directory as one entry in it" $
+          quickCheckPasses . QC.checkCoverage $
+            QC.forAll ((,) <$> genEntryDir <*> genEntryText) $ \(dir, text) ->
+              let accepted = storeEntryName text
+               in QC.cover 20 (isRight accepted) "accepted" . QC.cover 20 (isLeft accepted) "refused" $ case accepted of
+                    Left _ -> QC.property True
+                    Right name ->
+                      let joined = dir </> T.unpack (storeEntryNameText name)
+                       in (takeFileName joined, takeDirectory joined) QC.=== (T.unpack text, dir),
+        runTestM "resolveDeleteTarget gives a bare name storeEntryName's answer" $
+          quickCheckPasses $
+            QC.forAll (genEntryText `QC.suchThat` (not . T.any (`elem` ['/', '\\']))) $ \text ->
+              resolveDeleteTarget sd text QC.=== storeEntryName text,
         -- Lock files are never deleted (the Nix.Store.Lock design), but
         -- names like flake.lock are legal store-path names, so only the
         -- registration rows can tell a lock file from a store object:
@@ -15091,7 +15190,7 @@ testStoreDelete = do
               lockBase = basenameOf guarded <> ".lock"
               lockPath = storePathToFilePath sd guarded <> ".lock"
           TIO.writeFile lockPath ""
-          outcome <- deleteStorePathRaw store lockBase
+          outcome <- deleteNamed store lockBase
           survived <- Dir.doesPathExist lockPath
           pure $ case outcome of
             Left err
@@ -15104,7 +15203,7 @@ testStoreDelete = do
               objectPath = storePathToFilePath sd object
           registerPath (stDB store) (PathRegistration object "sha256:m" 1 Nothing [])
           TIO.writeFile objectPath "pinned inputs"
-          outcome <- deleteStorePathRaw store (basenameOf object)
+          outcome <- deleteNamed store (basenameOf object)
           gone <- not <$> Dir.doesPathExist objectPath
           pure $ case outcome of
             Right removed
@@ -15115,7 +15214,7 @@ testStoreDelete = do
           let junkName = "not-a-store-path.lock"
               junkPath = unStoreDir sd </> T.unpack junkName
           TIO.writeFile junkPath "debris"
-          outcome <- deleteStorePathRaw store junkName
+          outcome <- deleteNamed store junkName
           gone <- not <$> Dir.doesPathExist junkPath
           pure $ case outcome of
             Right removed
@@ -15135,7 +15234,7 @@ testStoreDelete = do
           TIO.writeFile (treePath </> "data.txt") "guarded"
           holder <- acquirePathLock sd guarded
           done <- newEmptyMVar
-          _ <- forkIO (deleteStorePathRaw store (basenameOf guarded) >>= putMVar done)
+          _ <- forkIO (deleteNamed store (basenameOf guarded) >>= putMVar done)
           early <- timeout deleteLockProbeMicros (takeMVar done)
           releasePathLock holder
           outcome <- timeout raceWatchdogMicros (takeMVar done)
@@ -15312,7 +15411,7 @@ testStoreGC = do
                 then Pass
                 else Fail ("wrong sweep: " <> T.pack (show (results, validity, orphanGone, topKept))),
           runTestM "delete refuses the rooted path with upstream's words" $ do
-            outcome <- deleteStorePathRaw store (basenameOf top)
+            outcome <- deleteNamed store (basenameOf top)
             stillValid <- isValid store top
             pure $ case outcome of
               Left err
@@ -15320,7 +15419,7 @@ testStoreGC = do
                 | otherwise -> Fail ("wrong refusal: " <> err)
               Right removed -> Fail ("deleted a rooted path: " <> T.pack (show removed)),
           runTestM "delete refuses a path the root reaches through references" $ do
-            outcome <- deleteStorePathRaw store (basenameOf dep)
+            outcome <- deleteNamed store (basenameOf dep)
             pure $ case outcome of
               Left err | "since it is still alive" `T.isInfixOf` err -> Pass
               other -> Fail ("expected the liveness refusal, got: " <> T.pack (show other)),
@@ -15358,7 +15457,7 @@ testStoreGC = do
               "INSERT INTO ValidPaths (path, hash, registrationTime, deriver, narSize) VALUES (?, ?, 0, NULL, 0)"
               (foreignRow, "sha256:z" :: T.Text)
             collected <- collectGarbage store
-            deleted <- deleteStorePathRaw store (basenameOf dep)
+            deleted <- deleteNamed store (basenameOf dep)
             SQL.execute conn "DELETE FROM ValidPaths WHERE path = ?" (SQL.Only foreignRow)
             SQL.close conn
             validity <- mapM (isValid store) [dep, top, orphan]
@@ -15608,7 +15707,7 @@ testStoreGCUpstreamManaged = do
     sequence
       [ runTestM "a collection and a checked delete refuse a store upstream's database manages" $ do
           collected <- collectGarbage store
-          deleted <- deleteStorePathRaw store (spHash upstreamPath <> "-" <> spName upstreamPath)
+          deleted <- deleteNamed store (spHash upstreamPath <> "-" <> spName upstreamPath)
           treeKept <- Dir.doesPathExist (tree </> "data")
           let names err = all (`T.isInfixOf` err) ["upstream Nix's database", "also manages the store", "db.sqlite", T.pack (unStoreDir opened)]
           pure $ case (collected, deleted) of
@@ -16980,7 +17079,7 @@ testBuilder = do
             config = defaultBuildConfig (stDir store)
             devPath = storePathToFilePath (stDir store) devSP
         initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo main > $out/value && echo keep > $dev/value") testDrvPath
-        deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
+        deleted <- deleteNamed store (spHash outSP <> "-" <> spName outSP)
         rebuilt <- buildDerivation config store (mkDrv "mkdir -p $out && echo partial > $out/value && exit 1") testDrvPath
         devOnDisk <- Dir.doesPathExist devPath
         devValid <- isValid store devSP
@@ -17023,7 +17122,7 @@ testBuilder = do
             -- Both outputs, every time, as a real multi-output builder does.
             writeBoth v = "mkdir -p $out $dev && echo " <> v <> " > $out/value && echo " <> v <> " > $dev/value"
         initial <- buildDerivation config store (mkDrv (writeBoth "first")) testDrvPath
-        deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
+        deleted <- deleteNamed store (spHash outSP <> "-" <> spName outSP)
         rebuilt <- buildDerivation config store (mkDrv (writeBoth "second")) testDrvPath
         outContents <- T.strip <$> TIO.readFile (outPath </> "value")
         devContents <- T.strip <$> TIO.readFile (devPath </> "value")
@@ -17070,7 +17169,7 @@ testBuilder = do
             devPath = storePathToFilePath (stDir store) devSP
             outPath = storePathToFilePath (stDir store) outSP
         initial <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo first > $out/value && echo first > $dev/value") testDrvPath
-        deleted <- deleteStorePathRaw store (spHash outSP <> "-" <> spName outSP)
+        deleted <- deleteNamed store (spHash outSP <> "-" <> spName outSP)
         -- \$dev now names a scratch path, and the builder bakes it into $out
         -- the way a compiler driver or a libtool archive would.
         rebuilt <- buildDerivation config store (mkDrv "mkdir -p $out $dev && echo $dev > $out/recorded && echo first > $dev/value") testDrvPath
