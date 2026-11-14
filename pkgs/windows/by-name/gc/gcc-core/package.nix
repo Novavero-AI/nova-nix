@@ -1,13 +1,17 @@
-# GCC 4.6.4's C compiler, as nixpkgs' minimal-bootstrap/gcc/4.6.nix builds
-# GCC with tinycc (nixpkgs 5eb598da22ce76bc18ec85ecc1de66ca838b3514), for
-# Windows: the driver, cc1, cpp, collect2, the specs and GCC's own headers,
-# running on i686 Windows and writing assembly for i686-w64-mingw32,
-# configured, compiled and installed in the seed stdenv by tinycc-native.
-# It is what make all-gcc builds and make install-gcc installs, the compiler
-# MinGW-w64's build guide installs before the runtime exists
-# (mingw-w64-doc/howto-build, "Building the GCC core cross-compiler").
-# libgcc and MinGW-w64's runtime are the next rung's, which this compiler
-# compiles, so nothing it compiles links yet.
+# GCC 4.6.4's C compiler and libgcc, as nixpkgs' minimal-bootstrap/gcc/
+# 4.6.nix builds GCC with tinycc (nixpkgs
+# 5eb598da22ce76bc18ec85ecc1de66ca838b3514), for Windows: the driver, cc1,
+# cpp, collect2 and GCC's own headers, running on i686 Windows and writing
+# assembly for i686-w64-mingw32, configured, compiled and installed in the
+# seed stdenv by tinycc-native, and libgcc, compiled by that compiler in
+# the same make, as nixpkgs' make builds it.  The compiler is what make
+# all-gcc builds and make install-gcc installs, the one MinGW-w64's build
+# guide installs before the runtime exists (mingw-w64-doc/howto-build,
+# "Building the GCC core cross-compiler"); libgcc is the guide's make
+# all-target-libgcc and make install-target-libgcc (howto-build-adv.txt,
+# "Build libgcc").  MinGW-w64's runtime is the next rung, which this
+# compiler compiles, and gcc46 lays the two out in one prefix, where the
+# driver links a program.
 #
 # The stdenv's triple, i686-pc-mingw32, is the build and the host, and the
 # target is binutils', so GCC takes itself for a cross compiler.  That is
@@ -67,16 +71,55 @@
 # Of nixpkgs' other flags, those passed mean here what they mean there.
 # --enable-checking=release is the default for a release
 # (gcc/configure.ac:356-374).  The --disable-lib* flags name target
-# libraries, which all-gcc never configures, five of them later than 4.6.4.
-# --disable-lto-plugin follows from --disable-lto for a MinGW target (the
-# top-level configure.ac:1757-1762).  The two thread flags choose what
-# libgcc is compiled with, the next rung's choice.  The three configure
-# answers it exports are for the target libraries too.  install-strip has
-# nothing to strip: tcc writes no symbol table into a program.
+# libraries other than libgcc, which the make targets here never
+# configure, five of them later than 4.6.4.  --disable-lto-plugin follows
+# from --disable-lto for a MinGW target (the top-level configure.ac:
+# 1757-1762).  The three configure answers it exports are for link tests
+# after GCC_NO_EXECUTABLES, of which libgcc's configure makes none
+# (libgcc/configure.ac:149).  install-strip has nothing to strip: tcc
+# writes no symbol table into a program, and libgcc carries no debugging
+# information (below).  The two thread flags make libgcc's thread model
+# single; here it is win32, a MinGW target's default
+# (gcc/config.gcc:1567-1570), on the Windows API alone, as nixpkgs'
+# MinGW-w64 has it (pkgs/os-specific/windows/mingw-w64/default.nix).
+# Exceptions are SJLJ, 4.6.4's default for a 32-bit MinGW target
+# (gcc/config/i386/cygming.h:345-359).
 # --disable-win32-registry is not nixpkgs': a GCC on Windows takes its
 # directories from the registry wherever its configure can link advapi32
 # (gcc/configure.ac:1572-1600), which under tcc it cannot only because
 # TinyCC ships no import library for it.
+#
+# libgcc is compiled by the xgcc the same make links, from the gcc
+# directory's generated headers and variables (libgcc/Makefile.in:156).
+# Static, as --disable-shared has it, it links nothing: its configure's one
+# link test fails for want of the runtime, after which a link test would
+# be an error (config/no-executables.m4), and its later tests compile
+# (libgcc/configure.ac:154-251), so it needs MinGW-w64's headers alone.  The guide builds it after the runtime for --enable-shared, under
+# which it also links libgcc's DLL.  The top level runs xgcc with -B on
+# the gcc directory and -isystem on the copy of MinGW-w64's headers
+# (configure.ac:3335 and 3134-3137), and the driver turns the -B into an
+# -isystem for GCC's own headers (gcc/gcc.c:4906-4913): GCC searches both
+# before the directories the seed stdenv's C_INCLUDE_PATH names for tcc
+# (gcc/incpath.c:455-462), and every system header libgcc's sources
+# include for this target is GCC's or MinGW-w64's.
+#
+# libgcc carries no debugging information, which would name the build
+# directory and the store paths it read.  -g reaches its compiles from two
+# places, and a setting removes each:
+#
+#   CFLAGS_FOR_TARGET=-O2: the target libraries' CFLAGS, which the top
+#   level's configure takes from CFLAGS with -g added unless it is given,
+#   -g -Dalloca=alloca here (configure.ac:2218-2228).  -O2 is the
+#   optimization that default means to add, and the alloca macro is for
+#   tcc alone.
+#
+#   LIBGCC2_DEBUG_CFLAGS=-g0: gcc's Makefile adds this variable, -g, to
+#   every libgcc compile (gcc/Makefile.in:662-667); -g0 is the value
+#   GCC's own picochip and arm/netbsd fragments give it.  It is a make
+#   variable, which the top level passes on to the gcc directory only when
+#   it is not empty (Makefile.tpl:670-676).  Only the build reads it, when
+#   the gcc directory writes libgcc.mvars (gcc/Makefile.in:1892); makeFlags
+#   reaches the install phase too, as nixpkgs' installPhase passes it.
 #
 # What follows is for TinyCC and its headers:
 #
@@ -194,13 +237,16 @@ seedStdenv.mkDerivation {
     "--with-stage1-libs=${mingw-w64-dirent}/lib/libdirent.a"
     "LDFLAGS=-luser32"
     "CFLAGS=-Dalloca=alloca"
+    "CFLAGS_FOR_TARGET=-O2"
   ];
+
+  makeFlags = [ "LIBGCC2_DEBUG_CFLAGS=-g0" ];
 
   # make runs $NIX_BUILD_CORES jobs, as minimal-bootstrap/gcc/4.6.nix's
   # make does.
   enableParallelBuilding = true;
-  buildPhase = "make \${enableParallelBuilding:+-j$NIX_BUILD_CORES} all-gcc";
-  installPhase = "make \${enableParallelInstalling:+-j$NIX_BUILD_CORES} install-gcc";
+  buildPhase = "make \${enableParallelBuilding:+-j$NIX_BUILD_CORES} $makeFlags all-gcc all-target-libgcc";
+  installPhase = "make \${enableParallelInstalling:+-j$NIX_BUILD_CORES} $makeFlags install-gcc install-target-libgcc";
 }
 // {
   srcs = [

@@ -53,5 +53,7 @@ in
     "mingw-w64-headers"
     "mingw-w64-dirent"
     "gcc-core"
+    "mingw-w64-crt"
+    "gcc46"
   ];
 }
