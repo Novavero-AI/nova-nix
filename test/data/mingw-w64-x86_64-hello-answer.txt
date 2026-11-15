@@ -1,0 +1,13 @@
+hello from MinGW-w64 14.0.0 for msvcrt.dll 0x600
+gettimeofday returns 0, within a second of time: 1
+_recalloc keeps 1 2 and zeroes 0 0
+_recalloc of an overflowing size returns NULL: 1
+0x1234 swapped is 0x3412
+hello.exe exits 0
+	DLL Name: KERNEL32.dll
+	DLL Name: msvcrt.dll
+T _byteswap_ushort
+T _recalloc
+T gettimeofday
+debugging sections: 0
+hello.exe: machine 0x8664, optional header magic 0x20b
