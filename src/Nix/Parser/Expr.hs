@@ -721,8 +721,7 @@ parseInheritNames = go []
       let inherited name = recordName name >> go (InheritedName pos name : acc)
       case tok of
         TokIdent name -> advance >> inherited name
-        -- Keywords are valid as inherit names: inherit if then else;
-        _ | Just name <- keywordToText tok -> advance >> inherited name
+        _ | Just name <- identifierKeywordText tok -> advance >> inherited name
         _
           | startsStringAttr tok -> do
               key <- parseStringAttr
@@ -762,9 +761,7 @@ parseAttrKey = do
   tok <- peek
   key <- case tok of
     TokIdent name -> StaticKey name <$ advance
-    -- Keywords are valid as attribute names in Nix:
-    -- { if = 1; }, a.then, { else = 2; }, etc.
-    _ | Just name <- keywordToText tok -> StaticKey name <$ advance
+    _ | Just name <- identifierKeywordText tok -> StaticKey name <$ advance
     _ -> parseStringAttr
   key <$ noteStatic key
   where
@@ -838,22 +835,19 @@ failAt (SrcPos origin line col) message =
         peMessage = message
       }
 
--- | Convert keyword tokens to their text for use as attribute names.
--- All Nix keywords are valid as attr keys in binding and select position.
-keywordToText :: Token -> Maybe Text
-keywordToText TokIf = Just "if"
-keywordToText TokThen = Just "then"
-keywordToText TokElse = Just "else"
-keywordToText TokLet = Just "let"
-keywordToText TokIn = Just "in"
-keywordToText TokWith = Just "with"
-keywordToText TokAssert = Just "assert"
-keywordToText TokRec = Just "rec"
-keywordToText TokInherit = Just "inherit"
-keywordToText TokTrue = Just "true"
-keywordToText TokFalse = Just "false"
-keywordToText TokNull = Just "null"
-keywordToText _ = Nothing
+-- | The name of a token this lexer reads as a keyword and upstream's as
+-- an identifier (its @ID@ rule, lexer.l:137 at 2.24.9): @true@, @false@
+-- and @null@, which upstream binds as names in its base environment.  An
+-- attribute name is an identifier, @or@ among them here, or one of
+-- these, as upstream's @attr@ rule takes an @ID@ or @or@
+-- (parser.y:455-458); every other keyword is upstream's own token
+-- (lexer.l:109-117) and no attribute name, so an attribute named like
+-- one is written as a string, @{ \"if\" = 1; }@.
+identifierKeywordText :: Token -> Maybe Text
+identifierKeywordText TokTrue = Just "true"
+identifierKeywordText TokFalse = Just "false"
+identifierKeywordText TokNull = Just "null"
+identifierKeywordText _ = Nothing
 
 parseLet :: Parser Expr
 parseLet = do

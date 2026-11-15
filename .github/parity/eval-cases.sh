@@ -116,6 +116,31 @@ refused() {
   fi
 }
 
+# An expression both evaluators must refuse to parse, at the same line and
+# column.  The two word a syntax error differently, so only its place is
+# compared: upstream prints it as "at <origin>:LINE:COLUMN:" under the
+# message (error.cc), nova-nix in its parse error's peLine and peCol.
+unparsed() {
+  label=$1
+  expr=$2
+  checked=$((checked + 1))
+  upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1)
+  upstreamStatus=$?
+  nova=$(cd "$fixture" && "$novaBin" eval --nix-path "nix=$repoRoot/data/nix" --expr "$expr" 2>&1)
+  novaStatus=$?
+  upstreamAt=$(printf '%s\n' "$upstream" | sed -n 's/^ *at [^ ]*:\([0-9][0-9]*\):\([0-9][0-9]*\):$/\1:\2/p' | head -n1)
+  novaAt=$(printf '%s\n' "$nova" | sed -n 's/^parse error: .*peLine = \([0-9][0-9]*\), peCol = \([0-9][0-9]*\),.*/\1:\2/p' | head -n1)
+  if [ "$upstreamStatus" -ne 0 ] && [ "$novaStatus" -ne 0 ] && [ -n "$upstreamAt" ] && [ "$upstreamAt" = "$novaAt" ]; then
+    printf '  ok    %s\n' "$label"
+  else
+    failures=$((failures + 1))
+    printf '  DIFF  %s\n' "$label"
+    printf '          expression  %s\n' "$expr"
+    printf '          upstream    (exit %s) at %s: %s\n' "$upstreamStatus" "$upstreamAt" "$(printf '%s\n' "$upstream" | head -n1)"
+    printf '          nova-nix    (exit %s) at %s: %s\n' "$novaStatus" "$novaAt" "$(printf '%s\n' "$nova" | head -n1)"
+  fi
+}
+
 # Whether the Nix under comparison is at least the named release, for a
 # behaviour upstream changed and nova-nix follows.
 upstreamVersion=$(nix-instantiate --version 2>&1 | head -n1 | sed 's/.* //')
@@ -169,6 +194,15 @@ echo "== which keys written as a string are names =="
   check "an interpolated plain string is in a rec set's scope" '(rec { ${"a"} = 1; b = a; }).b'
   check "a path through one merges with the name written bare" 'builtins.attrNames { ${"a"}.b = 1; a.c = 2; }.a'
 }
+echo
+
+echo "== which keywords are attribute names =="
+check "true, false and null, which upstream reads as identifiers" 'let s = { true = 1; false = 2; null = 3; }; in s.true + s.false + s.null'
+unparsed "if as a binding's name" '{ if = 1; }'
+unparsed "then after a dot" 'x.then'
+unparsed "else in a has-attribute path" 'x ? else'
+unparsed "rec as an inherited name" '{ inherit rec; }'
+unparsed "inherit in an attribute path" '{ a.inherit = 1; }'
 echo
 
 echo "== what a float and a function print as =="
