@@ -737,6 +737,14 @@ interrupt_scoreboard() {
   exit 130
 }
 
+# Remove the scoreboard's scratch directory.  The stores in it keep each
+# path in the read-only modes a store gives every path it adds, as
+# upstream's does, so the tree is made writable before it is removed.
+remove_scoreboard_scratch() {
+  chmod -R u+w "${SCOREBOARD_SCRATCH:?}"
+  rm -rf "${SCOREBOARD_SCRATCH:?}"
+}
+
 # Check the label and the budget, find the nova-nix build, and set up what
 # both scoreboard modes share: a scratch directory removed on exit, the
 # interrupt handling, a fresh cache, and SCOREBOARD_NOVA, the nova-nix
@@ -757,7 +765,7 @@ scoreboard_prepare() {
     return 2
   fi
   SCOREBOARD_SCRATCH=$(mktemp -d)
-  trap 'rm -rf "${SCOREBOARD_SCRATCH:?}"' EXIT
+  trap remove_scoreboard_scratch EXIT
   trap interrupt_scoreboard INT TERM
   # A fresh cache for each evaluator, so that a fetch during evaluation is
   # a fetch and never a hit an earlier run left.
