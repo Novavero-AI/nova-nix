@@ -16255,7 +16255,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gcc-latest.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
+    checkFiles = ["binutils.nix", "binutils-x86_64.nix", "busybox.nix", "gcc-core.nix", "gcc-latest.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -17517,6 +17517,142 @@ testGccLatestWindows = do
         ++ ["gcc-" <> version, "hello-c.sh", "hello-cxx.sh", "stamps.sh"]
         ++ concat [[name, name <> "-builder"] | name <- ["gcc-latest-hello-c", "gcc-latest-hello-cxx", "gcc-latest-stamps"]]
 
+-- | @pkgs\/windows@'s x86_64 binutils, read back as the build driver reads
+-- it: what binutils-x86_64 and @test\/data\/binutils-x86_64.nix@'s checks
+-- add to the closure of gcc-latest and binutils, which build it.  The
+-- rung is full-source only if the one leaf it adds is the archive nixpkgs
+-- fetches and it reads no input source but the stdenv's own files and
+-- what evaluation writes as text.  Its configure is told the target the
+-- x86_64 compilers are built for, so the tools install under the name
+-- they look them up by; the build runs gcc-latest's compiler and
+-- binutils' archiver and linker by the name of their target, since the
+-- stdenv's CC, AR and LD are tcc's; its CFLAGS leave out the @-g@
+-- configure would add, and every link is told to write no time stamp.
+testBinutilsX8664Windows :: IO [Bool]
+testBinutilsX8664Windows = do
+  putStrLn "pkgs/binutils-x86_64"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils-x86_64.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          before <- sessionClosure (mapMaybe (`Map.lookup` rootOf) builtBefore)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, before, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, before, full) -> do
+      let added = Map.elems (Map.difference full before)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          binutils = derivationAt binutilsX8664Root
+          -- The output of a root's derivation, as a flag spells a store
+          -- path, or a word no flag holds where the root is missing.
+          outputOf root = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (derivationAt root >>= listToMaybe . drvOutputs)
+          outputNamed name = [storePathToText defaultStoreDir (doPath out) | drv <- added, nameOf drv == name, out <- drvOutputs drv]
+          wordsOf name = maybe [] (T.words . variableOf name)
+          linesOf name = maybe [] (map T.strip . T.lines . variableOf name)
+          flagsWith prefixes drv = [flag | flag <- wordsOf "configureFlags" drv, any (`T.isPrefixOf` flag) prefixes]
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetch is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the one leaf it adds is nixpkgs' binutils archive, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              ([archive], True)
+              (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text and the stdenv's files" $
+            assertEqual
+              "input sources not written as text"
+              ["config.site", "include", "setup.sh"]
+              (sort (map spName (nub [path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]))),
+          runTest "binutils-x86_64 names its archive where setup.sh reads it, with gcc-latest and binutils as its build inputs and no patch" $
+            assertEqual
+              "src, buildInputs and patches"
+              (outputNamed archive, [outputOf gccLatestRoot, outputOf binutilsRoot], [])
+              (wordsOf "src" binutils, wordsOf "buildInputs" binutils, wordsOf "patches" binutils),
+          runTest "binutils-x86_64 is configured for x86_64-w64-mingw32 with no sysroot, and builds with gcc-latest's driver and binutils' archiver and linker, by their target's name" $
+            assertEqual
+              "target and tools"
+              ["--target=" <> target, "CC=" <> host <> "-gcc", "AR=" <> host <> "-ar", "LD=" <> host <> "-ld"]
+              (flagsWith ["--target=", "--host=", "--with-sysroot", "CC=", "CXX=", "AR=", "LD=", "RANLIB=", "STRIP="] binutils),
+          runTest "binutils-x86_64's CFLAGS carry no -g, and LDFLAGS gives every link --no-insert-timestamp and nothing else" $
+            assertEqual
+              "CFLAGS and LDFLAGS"
+              ["CFLAGS=-O2", "LDFLAGS=-Wl,--no-insert-timestamp"]
+              (flagsWith ["CFLAGS=", "CXXFLAGS=", "LDFLAGS="] binutils),
+          runTest "binutils-x86_64 unsets the stdenv's C_INCLUDE_PATH, configures from a build directory beside the source, and builds with NIX_BUILD_CORES jobs and nixpkgs' MAKEINFO" $
+            assertEqual
+              "preConfigure, makeFlags and parallelism"
+              ( [ "unset C_INCLUDE_PATH",
+                  "mkdir ../build",
+                  "cd ../build",
+                  "configureScript=../binutils-with-gold-" <> version <> "/configure"
+                ],
+                ["MAKEINFO=true"],
+                "1"
+              )
+              (linesOf "preConfigure" binutils, wordsOf "makeFlags" binutils, maybe "" (variableOf "enableParallelBuilding") binutils)
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the x86_64 binutils derivations instantiate, adding eight to the closure of gcc-latest and binutils"
+    version :: Text
+    version = "2.46"
+    archive :: Text
+    archive = "binutils-with-gold-" <> version <> ".tar.bz2"
+    target :: Text
+    target = "x86_64-w64-mingw32"
+    -- The target of the compiler and tools the build runs.
+    host :: Text
+    host = "i686-w64-mingw32"
+    binutilsX8664Root :: Text
+    binutilsX8664Root = "pkgs.binutils-x86_64"
+    gccLatestRoot :: Text
+    gccLatestRoot = "pkgs.gcc-latest"
+    binutilsRoot :: Text
+    binutilsRoot = "pkgs.binutils"
+    builtBefore :: [Text]
+    builtBefore = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets", binutilsRoot, gccLatestRoot]
+    roots :: [Text]
+    roots = builtBefore ++ [binutilsX8664Root, "checks.link", "checks.stamps"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      [archive, target <> "-binutils-" <> version, "link.sh", "stamps.sh"]
+        ++ concat [[name, name <> "-builder"] | name <- ["binutils-x86_64-link", "binutils-x86_64-stamps"]]
+
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
 -- list's, each fixed-output and listed once.  A package that fetches a
@@ -17719,12 +17855,13 @@ testWindowsRungs = do
         ("gcc46", "gcc46-windows"),
         ("gcc46-cxx", "gcc46-cxx-windows"),
         ("gcc10", "gcc10-windows"),
-        ("gcc-latest", "gcc-latest-windows")
+        ("gcc-latest", "gcc-latest-windows"),
+        ("x86_64", "x86_64-windows")
       ]
     -- The rung each stage ends on, so that a workflow read as building
     -- nothing does not pass against an empty list.
     knownRungs :: [(Text, Text)]
-    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest"), ("gcc-latest", "gcc-latest")]
+    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest"), ("gcc-latest", "gcc-latest"), ("x86_64", "binutils-x86_64")]
     -- What ends a stage's rungs in the string the expression returns: no
     -- attribute path is spelled so.
     stageEnd :: Text
@@ -27242,6 +27379,7 @@ runSuite = do
           testGcc10Windows,
           testMingwW64LatestWindows,
           testGccLatestWindows,
+          testBinutilsX8664Windows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,

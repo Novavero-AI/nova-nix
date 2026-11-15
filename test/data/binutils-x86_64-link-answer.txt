@@ -1,0 +1,10 @@
+GNU ld (GNU Binutils) 2.46
+0000000000000000 T answer
+answer.o
+answer.exe:     file format pei-x86-64
+answer.exe: machine 0x8664, optional header magic 0x20b
+answer.exe exits 42
+00000000 T _answer
+answer32.exe:     file format pei-i386
+answer32.exe: machine 0x14c, optional header magic 0x10b
+answer32.exe exits 42
