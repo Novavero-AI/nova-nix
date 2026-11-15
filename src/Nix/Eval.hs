@@ -213,7 +213,7 @@ import Nix.Expr.Types
     Expr (..),
     UnaryOp (..),
   )
-import Nix.Hash (base64HashLen, base64ToBytes, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
+import Nix.Hash (FileIngestionMethod (..), base64HashLen, base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
 import Nix.Json (IntegerRange (..), Json (..), parseJsonWith, renderJson)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
@@ -4660,10 +4660,10 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- which only the constructors see, and which they refuse in upstream's
   -- words, naming the path.
   (outPaths, completeDrv, moduloHash) <- case mFixed of
-    Just (foAlgo, foMode, foDigest) -> do
-      foPath <- storePathOrThrow (makeFixedOutputPath drvName foAlgo foMode foDigest)
+    Just (foAlgo, foMethod, foDigest) -> do
+      foPath <- storePathOrThrow (makeFixedOutputPath drvName foAlgo foMethod foDigest)
       let foPathText = storePathToText defaultStoreDir foPath
-          algoField = (if foMode == "recursive" then "r:" else "") <> foAlgo
+          algoField = fileIngestionPrefix foMethod <> foAlgo
           foHashHex = bytesToHexText foDigest
           foModulo =
             sha256Digest
@@ -4722,16 +4722,15 @@ builtinDerivationStrict other =
 -- at 2.24.9): its outputs must be @out@ alone, and the hash is read with
 -- 'newHashAllowEmpty' under the algorithm @outputHashAlgo@ names, so the
 -- hash's own tag decides when that names none upstream knows.  Returns the
--- algorithm, the mode (@\"recursive\"@ for an @outputHashMode@ of
--- @recursive@, else @\"flat\"@) and the digest.
-fixedOutputOf :: (MonadEval m) => DrvFields -> BS.ByteString -> m (Text, Text, BS.ByteString)
+-- algorithm, the method the pass read from @outputHashMode@, flat when it
+-- read none (primops.cc:1437), and the digest.
+fixedOutputOf :: (MonadEval m) => DrvFields -> BS.ByteString -> m (Text, FileIngestionMethod, BS.ByteString)
 fixedOutputOf fields rawHash = do
   unless (dfOutputs fields == "out" :| []) $
     throwEvalError "multiple outputs are not supported in fixed-output derivations"
   ohash <- decodedText "derivation: outputHash" rawHash
   (algo, digest) <- newHashAllowEmpty (dfOutputHashAlgo fields) ohash
-  let mode = if dfOutputHashMode fields == Just "recursive" then "recursive" else "flat"
-  pure (algo, mode, digest)
+  pure (algo, fromMaybe FlatIngestion (dfOutputHashMode fields), digest)
 
 -- | Whether a derivation leaves its null attributes out (@__ignoreNulls@).
 data NullAttrs = KeepNullAttrs | IgnoreNullAttrs
@@ -4786,7 +4785,9 @@ drvAttrUse key
 -- string its attribute was read as, an empty one included: a derivation
 -- whose pass reads one is fixed-output, as upstream's is
 -- (primops.cc:1425 at 2.24.9).  The algorithm is one upstream knows, or
--- none.
+-- none.  The mode is the method an @outputHashMode@ names, read in the
+-- pass whether or not the derivation is fixed-output, as upstream's
+-- @handleHashMode@ reads it.
 data DrvFields = DrvFields
   { dfContext :: !StringContext,
     dfBuilder :: !(Maybe BS.ByteString),
@@ -4795,7 +4796,7 @@ data DrvFields = DrvFields
     dfArgs :: ![BS.ByteString],
     dfOutputHash :: !(Maybe BS.ByteString),
     dfOutputHashAlgo :: !(Maybe Text),
-    dfOutputHashMode :: !(Maybe BS.ByteString)
+    dfOutputHashMode :: !(Maybe FileIngestionMethod)
   }
 
 -- | Upstream's one pass over a derivation's attributes (primops.cc:1225-1365
@@ -4852,7 +4853,7 @@ readEnvEntry role _ val fields = do
     OutputsEntry -> do
       outputs <- checkedOutputs =<< traverse (decodedText "derivation") (outputTokens bytes)
       pure entered {dfOutputs = outputs}
-    FixedOutputEntry field -> pure (withFixedOutputField field bytes entered)
+    FixedOutputEntry field -> withFixedOutputField field bytes entered
     PlainEntry -> pure entered
   pure (Just bytes, updated)
 
@@ -4876,7 +4877,7 @@ readStructuredEntry drvName fieldContext role key val fields
             outputs <- checkedOutputs =<< mapM (structuredOutputName fieldContext . Thunk) (clistThunks cl)
             pure entered {dfOutputs = outputs}
           _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
-        FixedOutputEntry field -> (\bytes -> withFixedOutputField field bytes entered) <$> structuredStringValue RefuseContext val
+        FixedOutputEntry field -> structuredStringValue RefuseContext val >>= \bytes -> withFixedOutputField field bytes entered
         PlainEntry -> pure entered
       when (Set.member key structuredDisabledChecks) $
         warn (disabledByStructuredAttrs drvName key)
@@ -4884,12 +4885,37 @@ readStructuredEntry drvName fieldContext role key val fields
 
 -- | A fixed-output field read from its attribute's string.  The algorithm
 -- is read with @parseHashAlgoOpt@ (primops.cc:1320, :1352 at 2.24.9),
--- which gives none for a name it does not know.
-withFixedOutputField :: FixedOutputField -> BS.ByteString -> DrvFields -> DrvFields
+-- which gives none for a name it does not know, and the mode with
+-- 'outputHashModeMethod', which refuses one it does not take.
+withFixedOutputField :: (MonadEval m) => FixedOutputField -> BS.ByteString -> DrvFields -> m DrvFields
 withFixedOutputField field bytes fields = case field of
-  OutputHashField -> fields {dfOutputHash = Just bytes}
-  OutputHashAlgoField -> fields {dfOutputHashAlgo = knownHashAlgo bytes}
-  OutputHashModeField -> fields {dfOutputHashMode = Just bytes}
+  OutputHashField -> pure fields {dfOutputHash = Just bytes}
+  OutputHashAlgoField -> pure fields {dfOutputHashAlgo = knownHashAlgo bytes}
+  OutputHashModeField -> either throwEvalError (\method -> pure fields {dfOutputHashMode = Just method}) (outputHashModeMethod bytes)
+
+-- | The method an @outputHashMode@ names, as upstream's @handleHashMode@
+-- reads it (primops.cc:1230-1245 at 2.24.9) through
+-- @ContentAddressMethod::parse@ (content-address.cc:60-66) and
+-- @parseFileIngestionMethod@ (file-content-address.cc:29-40): @nar@, and
+-- @recursive@ as its older name, hash a NAR, and @flat@ the file's bytes.
+-- @text@ and @git@ parse there too but need the @dynamic-derivations@ and
+-- @git-hashing@ experimental features, which nova-nix does not implement,
+-- so each is refused as upstream refuses it with its feature off.
+outputHashModeMethod :: BS.ByteString -> Either Text FileIngestionMethod
+outputHashModeMethod mode = case mode of
+  "nar" -> Right NarIngestion
+  "recursive" -> Right NarIngestion
+  "flat" -> Right FlatIngestion
+  "text" -> Left (experimentalFeatureDisabled "dynamic-derivations")
+  "git" -> Left (experimentalFeatureDisabled "git-hashing")
+  _ -> Left ("invalid value '" <> bytesToTextLossy mode <> "' for 'outputHashMode' attribute")
+
+-- | Upstream's refusal of what an experimental feature that is off would
+-- allow (@MissingExperimentalFeature@, experimental-features.cc:360-363 at
+-- 2.24.9).
+experimentalFeatureDisabled :: Text -> Text
+experimentalFeatureDisabled feature =
+  "experimental Nix feature '" <> feature <> "' is disabled; add '--extra-experimental-features " <> feature <> "' to enable it"
 
 -- | The algorithm a name names, as upstream's @parseHashAlgoOpt@ reads it
 -- (hash.cc:426-433 at 2.24.9): one of the four it knows, or none.
@@ -5949,7 +5975,7 @@ builtinPath (VAttrs attrs) = do
   -- tree (primops.cc at 2.24.9), so a name it refuses is refused under the
   -- pinned hash, before the filter is applied.
   forM_ expectedDigest $ \expected ->
-    storePathOrThrow (makeFixedOutputPath name "sha256" "recursive" expected)
+    storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion expected)
   storePathText <- case filterFn of
     Nothing -> copyPathToStore pathStr name (fmap (,const mismatch) expectedDigest)
     Just keep -> do

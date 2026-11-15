@@ -239,6 +239,18 @@ refused "a fixed output with a second output" '(derivation { name = "t"; system 
 refused "a fixed output whose one output is not out" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "dev" ]; outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; }).drvPath'
 echo
 
+echo "== what an outputHashMode names =="
+# nar and recursive hash a NAR and flat the bytes.  The mode is read for
+# every derivation, so one with no outputHash refuses a mode too.
+check "nar, recursive and flat" 'builtins.toJSON (map (mode: (derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputHashMode = mode; outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; }).outPath) [ "nar" "recursive" "flat" ])'
+refused "an unknown mode with no outputHash" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputHashMode = "foo"; }).drvPath'
+refused "git, behind its experimental feature" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputHashMode = "git"; }).drvPath'
+# 2.33.0 adds the derivation and its mode to this refusal.
+if ! upstreamAtLeast 2.33.0; then
+  refused "text, behind its experimental feature" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputHashMode = "text"; }).drvPath'
+fi
+echo
+
 echo "== Nova's mirror interface preserves fixed-output identity =="
 for caseName in legacy sha256 sri order invalidUrls invalidHashes escapedUrl unicodeUrl; do
   check "fetchurl $caseName" "(import ./fetchurl-cases.nix).$caseName"

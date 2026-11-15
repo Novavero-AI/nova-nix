@@ -51,6 +51,8 @@ module Nix.Hash
     -- * Store path construction (Nix @makeStorePath@ family)
     makeStorePath,
     makeTextPath,
+    FileIngestionMethod (..),
+    fileIngestionPrefix,
     makeFixedOutputPath,
     makeOutputPath,
     compressHash,
@@ -303,21 +305,40 @@ makeTextPath name contentsDigest refs =
       typ = "text" <> T.concat [":" <> storePathToText defaultStoreDir r | r <- sortedRefs]
    in makeStorePath defaultStoreDir typ contentsDigest name
 
+-- | How a fixed output's contents are hashed: upstream's
+-- @FileIngestionMethod@ (file-content-address.hh:98-124 at 2.24.9)
+-- without the git method its @git-hashing@ experimental feature adds.
+data FileIngestionMethod
+  = -- | The bytes of a single file (upstream's @Flat@).
+    FlatIngestion
+  | -- | The NAR serialisation of a tree (upstream's @NixArchive@).
+    NarIngestion
+  deriving (Eq, Show)
+
+-- | What a method puts before the algorithm in a fixed output's hash
+-- fields and path (upstream's @makeFileIngestionPrefix@,
+-- content-address.cc:7-21 at 2.24.9): @r:@ for a NAR hash, and nothing
+-- for a flat one, which predates the prefix.
+fileIngestionPrefix :: FileIngestionMethod -> Text
+fileIngestionPrefix FlatIngestion = ""
+fileIngestionPrefix NarIngestion = "r:"
+
 -- | Construct a fixed-output store path.  @foHashDigest@ is the raw bytes of
--- the EXPECTED output hash (e.g. a tarball's SHA-256).  @mode@ is @\"flat\"@
--- or @\"recursive\"@.  Mirrors C++ Nix @makeFixedOutputPath@:
+-- the EXPECTED output hash (e.g. a tarball's SHA-256), taken under
+-- @method@.  Mirrors C++ Nix @makeFixedOutputPath@ (store-api.cc:122-141
+-- at 2.24.9):
 --
--- * @sha256@ + @recursive@ yields @makeStorePath \"source\" foHash name@
+-- * @sha256@ under 'NarIngestion' yields @makeStorePath \"source\" foHash name@
 -- * otherwise, @makeStorePath \"output:out\" sha256(\"fixed:out:\" prefix algo \":\" hex \":\") name@
 --
 -- 'Left' on an invalid name, as 'makeStorePath'.
-makeFixedOutputPath :: Text -> Text -> Text -> BS.ByteString -> Either BadStorePath StorePath
-makeFixedOutputPath name algo mode foHashDigest
-  | algo == "sha256" && mode == "recursive" =
+makeFixedOutputPath :: Text -> Text -> FileIngestionMethod -> BS.ByteString -> Either BadStorePath StorePath
+makeFixedOutputPath name algo method foHashDigest
+  | NarIngestion <- method,
+    algo == "sha256" =
       makeStorePath defaultStoreDir "source" foHashDigest name
   | otherwise =
-      let prefix = if mode == "recursive" then "r:" else ""
-          inner = "fixed:out:" <> prefix <> algo <> ":" <> bytesToHexText foHashDigest <> ":"
+      let inner = "fixed:out:" <> fileIngestionPrefix method <> algo <> ":" <> bytesToHexText foHashDigest <> ":"
           innerDigest = sha256Digest (encodeUtf8 inner)
        in makeStorePath defaultStoreDir "output:out" innerDigest name
 
