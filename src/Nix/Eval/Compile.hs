@@ -9,10 +9,19 @@
 -- instructions; a binding refers to its position there by the index
 -- "Nix.Eval.SourcePos" records it at.
 --
+-- The operator, formals, capture and binding decoders answer a tag this
+-- module never writes, which only a corrupt store holds, with a failure
+-- for the evaluator to report.  The store hands each tag back as a whole
+-- byte or word, so no type on the decoding side can rule such a tag out.
+--
 -- Must be called after 'Nix.Eval.CBytecode.cbcInit' and 'Nix.Eval.Symbol.symbolInit'.
 module Nix.Eval.Compile
   ( compileExpr,
     compileFormalsToEval,
+    encodeUnaryOp,
+    decodeUnaryOp,
+    encodeBinaryOp,
+    decodeBinaryOp,
     decodeBcFormals,
     decodeBcCaptureInfo,
     BcBinding (..),
@@ -395,29 +404,8 @@ compileWith recorder = go
           ++ concatMap (\(level, idx) -> [fi level, fi idx]) pairs
 
     -- -----------------------------------------------------------------
-    -- Operator encoding
+    -- Formal type encoding
     -- -----------------------------------------------------------------
-
-    encodeUnaryOp :: UnaryOp -> Word8
-    encodeUnaryOp OpNot = unaryNot
-    encodeUnaryOp OpNegate = unaryNegate
-
-    encodeBinaryOp :: BinaryOp -> Word8
-    encodeBinaryOp OpAdd = binaryAdd
-    encodeBinaryOp OpSub = binarySub
-    encodeBinaryOp OpMul = binaryMul
-    encodeBinaryOp OpDiv = binaryDiv
-    encodeBinaryOp OpAnd = binaryAnd
-    encodeBinaryOp OpOr = binaryOr
-    encodeBinaryOp OpImpl = binaryImpl
-    encodeBinaryOp OpEq = binaryEq
-    encodeBinaryOp OpNeq = binaryNeq
-    encodeBinaryOp OpLt = binaryLt
-    encodeBinaryOp OpLte = binaryLte
-    encodeBinaryOp OpGt = binaryGt
-    encodeBinaryOp OpGte = binaryGte
-    encodeBinaryOp OpConcat = binaryConcat
-    encodeBinaryOp OpUpdate = binaryUpdate
 
     encodeFormalType :: Formals -> Word8
     encodeFormalType (FormalName {}) = formalName
@@ -505,31 +493,87 @@ compileOneFormal (Formal name defExpr) = do
   pure (EvalFormal name defBcIdx)
 
 -- ---------------------------------------------------------------------------
+-- Operator tags (the flags byte of OpUnary and OpBinary)
+-- ---------------------------------------------------------------------------
+
+-- | The flags byte an @OpUnary@ instruction carries for its operator.
+encodeUnaryOp :: UnaryOp -> Word8
+encodeUnaryOp OpNot = unaryNot
+encodeUnaryOp OpNegate = unaryNegate
+
+-- | The operator an @OpUnary@ flags byte names: the inverse of
+-- 'encodeUnaryOp', and 'Nothing' for a byte it never writes.
+decodeUnaryOp :: Word8 -> Maybe UnaryOp
+decodeUnaryOp tag
+  | tag == unaryNot = Just OpNot
+  | tag == unaryNegate = Just OpNegate
+  | otherwise = Nothing
+
+-- | The flags byte an @OpBinary@ instruction carries for its operator.
+encodeBinaryOp :: BinaryOp -> Word8
+encodeBinaryOp OpAdd = binaryAdd
+encodeBinaryOp OpSub = binarySub
+encodeBinaryOp OpMul = binaryMul
+encodeBinaryOp OpDiv = binaryDiv
+encodeBinaryOp OpAnd = binaryAnd
+encodeBinaryOp OpOr = binaryOr
+encodeBinaryOp OpImpl = binaryImpl
+encodeBinaryOp OpEq = binaryEq
+encodeBinaryOp OpNeq = binaryNeq
+encodeBinaryOp OpLt = binaryLt
+encodeBinaryOp OpLte = binaryLte
+encodeBinaryOp OpGt = binaryGt
+encodeBinaryOp OpGte = binaryGte
+encodeBinaryOp OpConcat = binaryConcat
+encodeBinaryOp OpUpdate = binaryUpdate
+
+-- | The operator an @OpBinary@ flags byte names: the inverse of
+-- 'encodeBinaryOp', and 'Nothing' for a byte it never writes.
+decodeBinaryOp :: Word8 -> Maybe BinaryOp
+decodeBinaryOp tag
+  | tag == binaryAdd = Just OpAdd
+  | tag == binarySub = Just OpSub
+  | tag == binaryMul = Just OpMul
+  | tag == binaryDiv = Just OpDiv
+  | tag == binaryAnd = Just OpAnd
+  | tag == binaryOr = Just OpOr
+  | tag == binaryImpl = Just OpImpl
+  | tag == binaryEq = Just OpEq
+  | tag == binaryNeq = Just OpNeq
+  | tag == binaryLt = Just OpLt
+  | tag == binaryLte = Just OpLte
+  | tag == binaryGt = Just OpGt
+  | tag == binaryGte = Just OpGte
+  | tag == binaryConcat = Just OpConcat
+  | tag == binaryUpdate = Just OpUpdate
+  | otherwise = Nothing
+
+-- ---------------------------------------------------------------------------
 -- Bytecode decoding (eval-time: read from C data buffer)
 -- ---------------------------------------------------------------------------
 
--- | Decode formals from the bytecode data buffer.
--- @flags@ is the formal type (0=Name, 1=Set, 2=NamedSet).
--- @dataOff@ is the offset into the data buffer.
-decodeBcFormals :: Word8 -> Word32 -> IO EvalFormals
-decodeBcFormals flags dataOff = case flags of
-  0 {- FormalName -} -> do
-    sym <- cbcData dataOff
-    pure (EFName (symbolText (Symbol sym)))
-  1 {- FormalSet -} -> do
-    count <- cbcData dataOff
-    ellipsis <- cbcData (dataOff + 1)
-    formals <- decodeFormalEntries (fromIntegral count) (dataOff + 2)
-    pure (EFSet formals (ellipsis /= 0))
-  2 {- FormalNamedSet -} -> do
-    nameSym <- cbcData dataOff
-    count <- cbcData (dataOff + 1)
-    ellipsis <- cbcData (dataOff + 2)
-    formals <- decodeFormalEntries (fromIntegral count) (dataOff + 3)
-    pure (EFNamedSet (symbolText (Symbol nameSym)) formals (ellipsis /= 0))
-  -- Unreachable: the flag is written only by this module's formals compiler,
-  -- which emits 0, 1, or 2 - all matched above.
-  _ -> error "decodeBcFormals: invalid formal type flag"
+-- | Decode formals from the bytecode data buffer: @flags@ is the lambda's
+-- formal type ('formalName', 'formalSet' or 'formalNamedSet'), @dataOff@
+-- the offset of its words.  'Nothing' for any other type.  The offset is
+-- strict, though an unknown type never reads it, so a caller passes it
+-- evaluated rather than as a thunk.
+decodeBcFormals :: Word8 -> Word32 -> IO (Maybe EvalFormals)
+decodeBcFormals flags !dataOff
+  | flags == formalName = do
+      sym <- cbcData dataOff
+      pure (Just (EFName (symbolText (Symbol sym))))
+  | flags == formalSet = do
+      count <- cbcData dataOff
+      ellipsis <- cbcData (dataOff + 1)
+      formals <- decodeFormalEntries (fromIntegral count) (dataOff + 2)
+      pure (Just (EFSet formals (ellipsis /= 0)))
+  | flags == formalNamedSet = do
+      nameSym <- cbcData dataOff
+      count <- cbcData (dataOff + 1)
+      ellipsis <- cbcData (dataOff + 2)
+      formals <- decodeFormalEntries (fromIntegral count) (dataOff + 3)
+      pure (Just (EFNamedSet (symbolText (Symbol nameSym)) formals (ellipsis /= 0)))
+  | otherwise = pure Nothing
 
 -- | Decode a list of formal entries from the data buffer.
 -- Each entry is 3 words: [name_sym, has_default, default_bc_idx].
@@ -543,23 +587,20 @@ decodeFormalEntries n off = do
   rest <- decodeFormalEntries (n - 1) (off + 3)
   pure (EvalFormal (symbolText (Symbol nameSym)) defMaybe : rest)
 
--- | Decode capture info from the bytecode data buffer.
-decodeBcCaptureInfo :: Word32 -> IO CaptureInfo
-decodeBcCaptureInfo dataOff = do
-  tag <- cbcData dataOff
-  case tag of
-    0 {- NoCaptureInfo -} -> pure NoCaptureInfo
-    1 {- Captures -} -> do
+-- | Decode capture info from the bytecode data buffer, or answer the tag
+-- at @dataOff@ when it is none of 'captureNone', 'captureSlots' and
+-- 'captureWithScopes'.
+decodeBcCaptureInfo :: Word32 -> IO (Either Word32 CaptureInfo)
+decodeBcCaptureInfo dataOff = cbcData dataOff >>= decodeTagged
+  where
+    decodeTagged tag
+      | tag == captureNone = pure (Right NoCaptureInfo)
+      | tag == captureSlots = Right . Captures <$> capturedPairs
+      | tag == captureWithScopes = Right . CapturesWithScopes <$> capturedPairs
+      | otherwise = pure (Left tag)
+    capturedPairs = do
       count <- cbcData (dataOff + 1)
-      pairs <- decodePairs (fromIntegral count) (dataOff + 2)
-      pure (Captures pairs)
-    2 {- CapturesWithScopes -} -> do
-      count <- cbcData (dataOff + 1)
-      pairs <- decodePairs (fromIntegral count) (dataOff + 2)
-      pure (CapturesWithScopes pairs)
-    -- Unreachable: the tag is written only by this module's capture compiler,
-    -- which emits 0, 1, or 2 - all matched above.
-    _ -> error "decodeBcCaptureInfo: invalid capture type tag"
+      decodePairs (fromIntegral count) (dataOff + 2)
 
 -- | Decode (level, idx) pairs from the data buffer.
 decodePairs :: Int -> Word32 -> IO [(Int, Int)]
@@ -598,39 +639,37 @@ data BcAttrKey
   | -- | Dynamic key (bc_idx of expression to evaluate)
     BcDynamicKey !Word32
 
--- | Decode all bindings from the bytecode data buffer.
--- @bindCount@ is the number of bindings (already resolved through the
--- short_arg spill by the caller), @dataOff@ is the start offset.
-decodeBcBindings :: Int -> Word32 -> IO [BcBinding]
-decodeBcBindings 0 _ = pure []
-decodeBcBindings count dataOff = do
-  (binding, nextOff) <- decodeOneBinding dataOff
-  rest <- decodeBcBindings (count - 1) nextOff
-  pure (binding : rest)
-
--- | Decode a single binding, returning it and the offset past it.
-decodeOneBinding :: Word32 -> IO (BcBinding, Word32)
-decodeOneBinding off = do
-  tag <- cbcData off
-  case tag of
-    0 {- NamedBinding -} -> do
-      key <- decodeAttrKey (off + 1)
-      valBcIdx <- cbcData (off + 3)
-      pos <- cbcData (off + 4)
-      pure (BcNamed (PosIdx pos) key valBcIdx, off + 5)
-    1 {- Inherit -} -> do
-      sym <- cbcData (off + 1)
-      valBcIdx <- cbcData (off + 2)
-      pos <- cbcData (off + 3)
-      pure (BcInherit (PosIdx pos) sym valBcIdx, off + 4)
-    2 {- InheritFrom -} -> do
-      fromBcIdx <- cbcData (off + 1)
-      nameCount <- cbcData (off + 2)
-      names <- decodeInheritedNames (fromIntegral nameCount) (off + 3)
-      pure (BcInheritFrom fromBcIdx names, off + 3 + 3 * nameCount)
-    -- Unreachable: the tag is written only by this module's binding compiler,
-    -- which emits 0, 1 or 2 - all matched above.
-    _ -> error "decodeOneBinding: invalid binding type tag"
+-- | Decode all bindings from the bytecode data buffer, or answer the
+-- first binding tag that is none of 'bindNamed', 'bindInherit' and
+-- 'bindInheritFrom'.  @bindCount@ is the number of bindings (already
+-- resolved through the short_arg spill by the caller), @off@ is the start
+-- offset.
+decodeBcBindings :: Int -> Word32 -> IO (Either Word32 [BcBinding])
+decodeBcBindings 0 _ = pure (Right [])
+decodeBcBindings bindCount off = cbcData off >>= decodeTagged
+  where
+    decodeTagged tag
+      | tag == bindNamed = do
+          key <- decodeAttrKey (off + 1)
+          valBcIdx <- cbcData (off + 3)
+          pos <- cbcData (off + 4)
+          withRest (BcNamed (PosIdx pos) key valBcIdx) (off + 5)
+      | tag == bindInherit = do
+          sym <- cbcData (off + 1)
+          valBcIdx <- cbcData (off + 2)
+          pos <- cbcData (off + 3)
+          withRest (BcInherit (PosIdx pos) sym valBcIdx) (off + 4)
+      | tag == bindInheritFrom = do
+          fromBcIdx <- cbcData (off + 1)
+          nameCount <- cbcData (off + 2)
+          names <- decodeInheritedNames (fromIntegral nameCount) (off + 3)
+          withRest (BcInheritFrom fromBcIdx names) (off + 3 + 3 * nameCount)
+      | otherwise = pure (Left tag)
+    -- Strict in the binding and the result, so each level conses onto
+    -- the decoded rest directly rather than leaving thunks for both.
+    withRest !binding nextOff = do
+      rest <- decodeBcBindings (bindCount - 1) nextOff
+      pure $! (binding :) <$> rest
 
 -- | Decode a binding's key: the pair (is_expr, key_or_bc_idx).
 decodeAttrKey :: Word32 -> IO BcAttrKey

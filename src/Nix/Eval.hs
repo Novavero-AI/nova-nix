@@ -127,7 +127,7 @@ import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.Read as TR
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
-import Data.Word (Word32, Word8)
+import Data.Word (Word32)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
@@ -137,7 +137,7 @@ import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
-import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, reassembleDouble, reassembleInt64)
+import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
@@ -331,52 +331,49 @@ evalBytecode env bcIdx =
         OpUnary ->
           let flags_ = unsafePerformIO (cbcFlags bcIdx)
               operandIdx = unsafePerformIO (cbcArg1 bcIdx)
-              unop = decodeUnaryOp flags_
-              operate = evalBytecode env operandIdx >>= evalUnary unop
-           in case unop of
-                -- Upstream's parser turns @-e@ into @__sub 0 e@, a call
-                -- frame around the operand's forcing.
-                OpNegate -> withCallFrame operate
-                OpNot -> operate
+           in case decodeUnaryOp flags_ of
+                Just unop ->
+                  let operate = evalBytecode env operandIdx >>= evalUnary unop
+                   in case unop of
+                        -- Upstream's parser turns @-e@ into @__sub 0 e@, a
+                        -- call frame around the operand's forcing.
+                        OpNegate -> withCallFrame operate
+                        OpNot -> operate
+                Nothing -> corruptBytecode "unary operator tag" flags_
         OpBinary -> evalBcBinary env bcIdx
         OpSearchPath ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
            in evalSearchPath env (symbolText (Symbol sym))
         OpPos -> pure (positionValue (PosIdx (unsafePerformIO (cbcArg1 bcIdx))))
-        _ -> throwEvalError "evalBytecode: unknown opcode"
+        _ -> corruptBytecode "opcode" opcode
 
 -- ---------------------------------------------------------------------------
 -- Bytecode helpers
 -- ---------------------------------------------------------------------------
 
--- | Decode a UnaryOp from bytecode flags.
-decodeUnaryOp :: Word8 -> UnaryOp
-decodeUnaryOp 0 = OpNot
-decodeUnaryOp 1 = OpNegate
--- Unreachable: the tag is written by Nix.Eval.Compile's encodeUnaryOp, which
--- only emits 0 or 1.
-decodeUnaryOp n = error ("decodeUnaryOp: unknown tag " <> show n)
+-- | The error for a value the compiler never writes where the evaluator
+-- reads one (@what@ names the field), which only a corrupt bytecode store
+-- holds.  It is an eval error, so @builtins.tryEval@ does not catch it.
+corruptBytecode :: (MonadEval m, Show tag) => Text -> tag -> m a
+corruptBytecode what tag = throwEvalError ("corrupt bytecode: unknown " <> what <> " " <> T.pack (show tag))
 
--- | Decode a BinaryOp from bytecode flags.
-decodeBinaryOp :: Word8 -> BinaryOp
-decodeBinaryOp 0 = OpAdd
-decodeBinaryOp 1 = OpSub
-decodeBinaryOp 2 = OpMul
-decodeBinaryOp 3 = OpDiv
-decodeBinaryOp 4 = OpAnd
-decodeBinaryOp 5 = OpOr
-decodeBinaryOp 6 = OpImpl
-decodeBinaryOp 7 = OpEq
-decodeBinaryOp 8 = OpNeq
-decodeBinaryOp 9 = OpLt
-decodeBinaryOp 10 = OpLte
-decodeBinaryOp 11 = OpGt
-decodeBinaryOp 12 = OpGte
-decodeBinaryOp 13 = OpConcat
-decodeBinaryOp 14 = OpUpdate
--- Unreachable: the tag is written by Nix.Eval.Compile's encodeBinaryOp, which
--- only emits 0..14.
-decodeBinaryOp n = error ("decodeBinaryOp: unknown tag " <> show n)
+-- | Continue with the bindings at a data offset, or fail on a binding tag
+-- the compiler never writes.  The read is pure in effect: the store only
+-- appends, so an emitted word answers the same however often it is read.
+-- Inlined, so that each caller's continuation is a known function rather
+-- than a closure allocated every time the instruction runs.
+withBcBindings :: (MonadEval m) => Int -> Word32 -> ([BcBinding] -> m a) -> m a
+withBcBindings count dataOff next =
+  either (corruptBytecode "binding tag") next (unsafePerformIO (decodeBcBindings count dataOff))
+{-# INLINE withBcBindings #-}
+
+-- | Continue with the capture info at a data offset, or fail on a capture
+-- tag the compiler never writes.  Pure in effect and inlined, as
+-- 'withBcBindings' is.
+withBcCaptureInfo :: (MonadEval m) => Word32 -> (CaptureInfo -> m a) -> m a
+withBcCaptureInfo captureOff next =
+  either (corruptBytecode "capture info tag") next (unsafePerformIO (decodeBcCaptureInfo captureOff))
+{-# INLINE withBcCaptureInfo #-}
 
 -- | Whether upstream's parser desugars the operator into a builtin call
 -- (@__sub@, @__mul@, @__div@ or @__lessThan@; parser.y at 2.24.9), which
@@ -403,26 +400,29 @@ desugaredToCall op = case op of
 -- | Evaluate a binary operation from bytecode, with short-circuit
 -- support for &&, ||, ->.
 evalBcBinary :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcBinary env bcIdx0 = case op of
-  OpAnd -> evalShortCircuitAnd env leftIdx rightIdx
-  OpOr -> evalShortCircuitOr env leftIdx rightIdx
-  OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
-  OpAdd -> evalAddition (evalBytecode env leftIdx) (evalBytecode env rightIdx)
-  -- Not through 'operate', which forces both operands before either is
-  -- looked at: the left must be checked before the right is evaluated.
-  OpUpdate -> evalUpdate (evalBytecode env leftIdx) (evalBytecode env rightIdx)
-  _
-    | desugaredToCall op -> withCallFrame operate
-    | otherwise -> operate
+evalBcBinary env bcIdx0 = case decodeBinaryOp flags_ of
+  Just op ->
+    let operate = do
+          leftVal <- evalBytecode env leftIdx
+          rightVal <- evalBytecode env rightIdx
+          evalBinary force op leftVal rightVal
+     in case op of
+          OpAnd -> evalShortCircuitAnd env leftIdx rightIdx
+          OpOr -> evalShortCircuitOr env leftIdx rightIdx
+          OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
+          OpAdd -> evalAddition (evalBytecode env leftIdx) (evalBytecode env rightIdx)
+          -- Not through 'operate', which forces both operands before either
+          -- is looked at: the left must be checked before the right is
+          -- evaluated.
+          OpUpdate -> evalUpdate (evalBytecode env leftIdx) (evalBytecode env rightIdx)
+          _
+            | desugaredToCall op -> withCallFrame operate
+            | otherwise -> operate
+  Nothing -> corruptBytecode "binary operator tag" flags_
   where
     flags_ = unsafePerformIO (cbcFlags bcIdx0)
     leftIdx = unsafePerformIO (cbcArg1 bcIdx0)
     rightIdx = unsafePerformIO (cbcArg2 bcIdx0)
-    op = decodeBinaryOp flags_
-    operate = do
-      leftVal <- evalBytecode env leftIdx
-      rightVal <- evalBytecode env rightIdx
-      evalBinary force op leftVal rightVal
 
 -- | @+@, as upstream's @ExprConcatStrings::eval@ runs it over two operands
 -- (eval.cc at 2.24.9, the same in 2.33.2).  The left operand is evaluated
@@ -667,16 +667,22 @@ builtinTryEval arg = do
               ]
         )
 
--- | Evaluate a lambda literal from bytecode - returns VLambda.
+-- | Evaluate a lambda literal from bytecode - returns VLambda.  Its
+-- formals and capture info are decoded here, so that a corrupt tag fails
+-- the instruction, and the value is built here too, rather than left as a
+-- thunk holding them that would cost more than the value.  Building it
+-- reads the captured slots without forcing them.
 evalBcLambda :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcLambda env bcIdx0 =
   let flags_ = unsafePerformIO (cbcFlags bcIdx0)
       formalsOff = unsafePerformIO (cbcArg1 bcIdx0)
       bodyBcIdx = unsafePerformIO (cbcArg2 bcIdx0)
       captureOff = unsafePerformIO (cbcArg3 bcIdx0)
-      formals = unsafePerformIO (decodeBcFormals flags_ formalsOff)
-      captureInfo = unsafePerformIO (decodeBcCaptureInfo captureOff)
-   in pure (VLambda (buildCaptureEnv env captureInfo) formals bodyBcIdx)
+   in case unsafePerformIO (decodeBcFormals flags_ formalsOff) of
+        Just formals ->
+          withBcCaptureInfo captureOff $ \captureInfo ->
+            pure $! VLambda (buildCaptureEnv env captureInfo) formals bodyBcIdx
+        Nothing -> corruptBytecode "formals type" flags_
 
 -- | Evaluate a select expression from bytecode.
 evalBcSelect :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -768,17 +774,15 @@ hasBcAttrPath env n off val = case val of
 
 -- | Evaluate attribute set from bytecode.
 evalBcAttrs :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcAttrs env bcIdx0 = do
+evalBcAttrs env bcIdx0 =
   let isRec = unsafePerformIO (cbcFlags bcIdx0) /= 0
       (bindCount, dataOff) =
         unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
       captureOff = unsafePerformIO (cbcArg2 bcIdx0)
-      bindings = unsafePerformIO (decodeBcBindings bindCount dataOff)
-  if isRec
-    then do
-      let captureInfo = unsafePerformIO (decodeBcCaptureInfo captureOff)
-      evalBcRecAttrs env bindings captureInfo
-    else evalBcNonRecAttrs env bindings
+   in withBcBindings bindCount dataOff $ \bindings ->
+        if isRec
+          then withBcCaptureInfo captureOff (evalBcRecAttrs env bindings)
+          else evalBcNonRecAttrs env bindings
 
 -- | Evaluate a non-recursive attr set from bytecode bindings.
 --
@@ -847,28 +851,28 @@ evalBcRecAttrs env bindings captureInfo
 
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcLet env bcIdx0 = do
+evalBcLet env bcIdx0 =
   let (bindCount, dataOff) =
         unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
       bodyIdx = unsafePerformIO (cbcArg2 bcIdx0)
       captureOff = unsafePerformIO (cbcArg3 bcIdx0)
-      bindings = unsafePerformIO (decodeBcBindings bindCount dataOff)
-      captureInfo = unsafePerformIO (decodeBcCaptureInfo captureOff)
-  if allBcPositional bindings
-    then
-      -- Positional path: slots for O(1) lookup.
-      let (letEnv, _) = tieBindingFrame env bindings captureInfo
-       in evalBytecode letEnv bodyIdx
-    else do
-      -- Dynamic path: a dynamic key, which the parser refuses in a let as
-      -- upstream's parser.y does, so only an AST built outside the parser
-      -- reaches here.  Keys and values resolve in the let env, which
-      -- the body also sees.
-      let cset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
-          letEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet cset))
-      entries <- buildBcEntryMap mkThunkBc letEnv env bindings
-      let filled = fillCAttrSetValues cset (Map.map entryThunk entries)
-       in filled `seq` evalBytecode letEnv bodyIdx
+   in withBcBindings bindCount dataOff $ \bindings ->
+        withBcCaptureInfo captureOff $ \captureInfo ->
+          if allBcPositional bindings
+            then
+              -- Positional path: slots for O(1) lookup.
+              let (letEnv, _) = tieBindingFrame env bindings captureInfo
+               in evalBytecode letEnv bodyIdx
+            else do
+              -- Dynamic path: a dynamic key, which the parser refuses in a
+              -- let as upstream's parser.y does, so only an AST built
+              -- outside the parser reaches here.  Keys and values resolve
+              -- in the let env, which the body also sees.
+              let cset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
+                  letEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet cset))
+              entries <- buildBcEntryMap mkThunkBc letEnv env bindings
+              let filled = fillCAttrSetValues cset (Map.map entryThunk entries)
+               in filled `seq` evalBytecode letEnv bodyIdx
 
 -- | Check if all bytecode bindings are static keys (eligible for positional).
 -- Must stay in sync with @allStaticSingleKey@ in "Nix.Expr.Resolve".

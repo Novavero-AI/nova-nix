@@ -71,18 +71,19 @@ import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
-import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
+import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
-import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcData, cbcDataCount, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
 import Nix.Eval.CList (clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
-import Nix.Eval.Compile (BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings)
+import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
 import qualified Nix.Eval.Context as Context
+import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIO, runEvalIOTraced)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printValue)
@@ -22137,6 +22138,183 @@ testStoreNameSinksIO = do
           "path 'pj9xmn69xsrk8nlx6xsljb0bmsydj4dr-sp ace' is not a valid store path: name 'sp ace' contains illegal character ' '"
       ]
 
+-- ---------------------------------------------------------------------------
+-- Bytecode tags: what the compiler writes decodes back, and nothing else does
+-- ---------------------------------------------------------------------------
+
+-- | Where an operator's tag pair fails to be inverses: each operator whose
+-- tag decodes to something else, then each byte that decodes to an
+-- operator written as another byte.  Every constructor and every byte is
+-- checked, as both domains are finite.
+operatorTagMismatches :: (Bounded op, Enum op, Eq op, Show op) => (op -> Word8) -> (Word8 -> Maybe op) -> [Text]
+operatorTagMismatches encode decode =
+  [ T.pack (show op) <> " reads back from its tag as " <> T.pack (show (decode (encode op)))
+  | op <- [minBound .. maxBound],
+    decode (encode op) /= Just op
+  ]
+    ++ [ "byte " <> T.pack (show tag) <> " reads as " <> T.pack (show op) <> ", which is written as " <> T.pack (show (encode op))
+       | tag <- [minBound .. maxBound],
+         Just op <- [decode tag],
+         encode op /= tag
+       ]
+
+-- | A compiled child read back as the expression the round trips below
+-- compile it from: an integer literal or a resolved variable.  Any other
+-- opcode reads as a variable naming it, which nothing generated equals.
+childExpr :: Word32 -> IO Expr
+childExpr idx = do
+  op <- cbcOpcode idx
+  lo <- cbcArg1 idx
+  hi <- cbcArg2 idx
+  pure $ case op of
+    OpLitInt -> ELit (NixInt (reassembleInt64 lo hi))
+    OpResolvedVar -> EResolvedVar (fromIntegral lo) (fromIntegral hi)
+    _ -> EVar ("<opcode " <> T.pack (show op) <> ">")
+
+-- | A recorded position read back in the test origin.  One that does not
+-- read back as text reads as line 0, which nothing generated has.
+srcPosBack :: PosIdx -> SrcPos
+srcPosBack idx = case lookupPos idx of
+  Just (PosInText line column) -> testPos line column
+  _ -> testPos 0 0
+
+-- | Decoded formals read back as the parser's formals they compile from.
+formalsBack :: EvalFormals -> IO Formals
+formalsBack formals = case formals of
+  EFName name -> pure (FormalName name)
+  EFSet entries ellipsis -> do
+    back <- traverse formalBack entries
+    pure (FormalSet back ellipsis)
+  EFNamedSet name entries ellipsis -> do
+    back <- traverse formalBack entries
+    pure (FormalNamedSet name back ellipsis)
+  where
+    formalBack (EvalFormal name def) = Formal name <$> traverse childExpr def
+
+-- | A decoded binding read back as the binding it compiles from.  An
+-- inherited name's select is the compiler's own and has no counterpart.
+bindingBack :: BcBinding -> IO Binding
+bindingBack binding = case binding of
+  BcNamed pos key valIdx -> NamedBinding (srcPosBack pos) <$> keyBack key <*> childExpr valIdx
+  BcInherit pos sym valIdx -> Inherit (srcPosBack pos) (symbolText (Symbol sym)) <$> childExpr valIdx
+  BcInheritFrom fromIdx names -> do
+    from <- childExpr fromIdx
+    pure (InheritFrom from [InheritedName (srcPosBack pos) (symbolText (Symbol sym)) | BcInheritedName pos sym _ <- names])
+  where
+    keyBack (BcStaticKey sym) = pure (StaticKey (symbolText (Symbol sym)))
+    keyBack (BcDynamicKey idx) = DynamicKey <$> childExpr idx
+
+testBytecodeTags :: IO [Bool]
+testBytecodeTags = do
+  putStrLn "bytecode/tags"
+  sequence
+    [ runTest "every unary operator's tag reads back as it, and no other byte reads as an operator" $
+        assertEqual "mismatches" [] (operatorTagMismatches encodeUnaryOp decodeUnaryOp),
+      runTest "every binary operator's tag reads back as it, and no other byte reads as an operator" $
+        assertEqual "mismatches" [] (operatorTagMismatches encodeBinaryOp decodeBinaryOp),
+      runTestM "a compiled lambda's formals and capture info read back as compiled" . quickCheckPasses $
+        QC.forAll ((,) <$> genFormals <*> genCaptureInfo) $ \(formals, captures) -> QC.ioProperty $ do
+          idx <- compileExpr (ELambda formals (ELit NixNull) captures)
+          flags <- cbcFlags idx
+          formalsOff <- cbcArg1 idx
+          captureOff <- cbcArg3 idx
+          decodedFormals <- decodeBcFormals flags formalsOff >>= traverse formalsBack
+          decodedCaptures <- decodeBcCaptureInfo captureOff
+          pure ((decodedFormals, decodedCaptures) QC.=== (Just formals, Right captures)),
+      runTestM "a compiled let's bindings and capture info read back as compiled" . quickCheckPasses $
+        QC.forAll ((,) <$> QC.listOf genBinding <*> genCaptureInfo) $ \(bindings, captures) -> QC.ioProperty $ do
+          idx <- compileExpr (ELet bindings (ELit NixNull) captures)
+          (count, dataOff) <- cbcCountedPayload idx =<< cbcArg1 idx
+          captureOff <- cbcArg3 idx
+          decodedBindings <- decodeBcBindings count dataOff >>= traverse (traverse bindingBack)
+          decodedCaptures <- decodeBcCaptureInfo captureOff
+          pure ((decodedBindings, decodedCaptures) QC.=== (Right bindings, Right captures))
+    ]
+  where
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    genName = QC.elements ["a", "b", "x", "self", "args"]
+    genChild =
+      QC.oneof
+        [ ELit . NixInt <$> QC.arbitrary,
+          EResolvedVar <$> QC.chooseInt (0, 8) <*> QC.chooseInt (0, 64)
+        ]
+    genPos = testPos <$> QC.chooseInt (1, 4096) <*> QC.chooseInt (1, 4096)
+    genCaptureInfo =
+      let pairs = QC.listOf ((,) <$> QC.chooseInt (0, 64) <*> QC.chooseInt (0, 4096))
+       in QC.oneof [pure NoCaptureInfo, Captures <$> pairs, CapturesWithScopes <$> pairs]
+    genFormals =
+      let entries = QC.listOf (Formal <$> genName <*> QC.oneof [pure Nothing, Just <$> genChild])
+       in QC.oneof
+            [ FormalName <$> genName,
+              FormalSet <$> entries <*> QC.arbitrary,
+              FormalNamedSet <$> genName <*> entries <*> QC.arbitrary
+            ]
+    genBinding =
+      QC.oneof
+        [ NamedBinding <$> genPos <*> QC.oneof [StaticKey <$> genName, DynamicKey <$> genChild] <*> genChild,
+          Inherit <$> genPos <*> genName <*> genChild,
+          InheritFrom <$> genChild <*> QC.listOf (InheritedName <$> genPos <*> genName)
+        ]
+
+-- | A tag none of the compiler's encoders writes, in any of the fields the
+-- corrupt-bytecode tests put it in.
+unknownTag :: (Num a) => a
+unknownTag = 200
+
+-- | Whether hand-built code at a bytecode index fails to evaluate with the
+-- corrupt-bytecode error for @what@.  The outcome, and a value it holds
+-- (which the failure message shows), are forced inside the action, so an
+-- exception a decoder raises instead, as the evaluator runs or once the
+-- value is inspected, reaches 'runTestM' as a failure rather than
+-- escaping after it.
+assertCorruptBytecode :: Text -> Word32 -> IO TestResult
+assertCorruptBytecode what idx = do
+  outcome <- evaluate (runPureEval (evalBytecode emptyEnv idx))
+  evaluate $ case outcome of
+    Left err -> assertEqual "error" ("corrupt bytecode: unknown " <> what <> " " <> T.pack (show (unknownTag :: Int))) err
+    Right val -> Fail ("expected the corrupt-bytecode error but got: " <> T.pack (show val))
+
+testBytecodeCorrupt :: IO [Bool]
+testBytecodeCorrupt = do
+  putStrLn "bytecode/corrupt"
+  sequence
+    [ runTestM "an unknown opcode is a corrupt-bytecode error" $
+        cbcEmit unknownTag 0 0 0 0 0 >>= assertCorruptBytecode "opcode",
+      runTestM "an unknown unary operator tag is a corrupt-bytecode error" $ do
+        operand <- literalOne
+        cbcEmit OpUnary unknownTag 0 operand 0 0 >>= assertCorruptBytecode "unary operator tag",
+      runTestM "an unknown binary operator tag is a corrupt-bytecode error" $ do
+        left <- literalOne
+        right <- literalOne
+        cbcEmit OpBinary unknownTag 0 left right 0 >>= assertCorruptBytecode "binary operator tag",
+      runTestM "an unknown formals type is a corrupt-bytecode error" $
+        lambdaWith unknownTag captureNone >>= assertCorruptBytecode "formals type",
+      runTestM "an unknown capture info tag in a lambda is a corrupt-bytecode error" $
+        lambdaWith formalName unknownTag >>= assertCorruptBytecode "capture info tag",
+      runTestM "an unknown capture info tag in a recursive attribute set is a corrupt-bytecode error" $ do
+        captureOff <- cbcEmitData unknownTag
+        cbcEmit OpAttrs 1 0 0 captureOff 0 >>= assertCorruptBytecode "capture info tag",
+      runTestM "an unknown binding tag in an attribute set is a corrupt-bytecode error" $ do
+        bindingsOff <- cbcEmitData unknownTag
+        cbcEmit OpAttrs 0 1 bindingsOff 0 0 >>= assertCorruptBytecode "binding tag",
+      runTestM "an unknown binding tag in a let is a corrupt-bytecode error" $ do
+        bindingsOff <- cbcEmitData unknownTag
+        captureOff <- cbcEmitData captureNone
+        body <- literalOne
+        cbcEmit OpLet 0 1 bindingsOff body captureOff >>= assertCorruptBytecode "binding tag"
+    ]
+  where
+    literalOne = cbcEmit OpLitInt 0 0 1 0 0
+    -- @x: 1@, built by hand with the given formals type and capture tag.
+    lambdaWith formalsType captureTag = do
+      Symbol name <- symbolIntern "x"
+      formalsOff <- cbcEmitData name
+      captureOff <- cbcEmitData captureTag
+      body <- literalOne
+      cbcEmit OpLambda formalsType 0 formalsOff body captureOff
+
 -- | An inherited name and whether its select reads that name, as the one
 -- path segment, from slot 0 of the env it runs in.
 inheritedSelect :: BcInheritedName -> IO (Text, Bool)
@@ -22559,7 +22737,7 @@ testBytecodeCompile = do
         dataOff <- cbcArg1 idx
         bindings <- decodeBcBindings 1 dataOff
         case bindings of
-          [BcInheritFrom _ names]
+          Right [BcInheritFrom _ names]
             | op == OpAttrs && count == 1 -> do
                 selects <- mapM inheritedSelect names
                 pure (assertEqual "inherited names and their selects" [("x", True), ("y", True)] selects)
@@ -22571,7 +22749,7 @@ testBytecodeCompile = do
         dataOff <- cbcArg1 idx
         bindings <- decodeBcBindings 1 dataOff
         case bindings of
-          [BcInherit _ sym valIdx] -> do
+          Right [BcInherit _ sym valIdx] -> do
             valOp <- cbcOpcode valIdx
             pure $
               if symbolText (Symbol sym) == "x" && valOp == OpResolvedVar
@@ -22601,8 +22779,8 @@ testBytecodeCompile = do
         pure $
           assertEqual
             "positions read back"
-            (map Just [PosInFile "/positions/set.nix" 2 3, PosInFile "/positions/set.nix" 3 11, PosInFile "/positions/set.nix" 4 22])
-            (map lookupPos (concatMap positionsOf bindings)),
+            (Right (map Just [PosInFile "/positions/set.nix" 2 3, PosInFile "/positions/set.nix" 3 11, PosInFile "/positions/set.nix" 4 22]))
+            (map lookupPos . concatMap positionsOf <$> bindings),
       -- Recording a position and reading it back keeps its file, line and
       -- column, text with no file reads back as such, and a line or
       -- column past 32 bits is unrecordable, as it is in upstream's table.
@@ -23920,6 +24098,8 @@ runSuite = do
           testCThunk,
           testArenaGuard,
           testBytecodeCompile,
+          testBytecodeTags,
+          testBytecodeCorrupt,
           testBytecodeCountSpill,
           testBytecodePerElement,
           testValueCountWidths,

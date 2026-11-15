@@ -171,7 +171,7 @@ data CaptureInfo
 data UnaryOp
   = OpNot
   | OpNegate
-  deriving (Eq, Show)
+  deriving (Bounded, Enum, Eq, Show)
 
 -- | Binary operators.
 data BinaryOp
@@ -190,7 +190,7 @@ data BinaryOp
   | OpGte
   | OpConcat
   | OpUpdate
-  deriving (Eq, Show)
+  deriving (Bounded, Enum, Eq, Show)
 
 -- | The Nix expression AST.
 --
