@@ -2021,6 +2021,7 @@ jobs:
             'cp mv' \
             'rm -r' \
             'printf done 007 ff' \
+            'printf of 200 bytes' \
             'test' \
             'sed CC is gcc -O2' \
             'sed -n two' \
