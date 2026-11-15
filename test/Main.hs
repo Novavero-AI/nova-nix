@@ -1918,6 +1918,21 @@ testEvalHigherOrder = do
       -- listToAttrs
       runTest "listToAttrs" $
         assertEval "listToAttrs" "(builtins.listToAttrs [ { name = \"x\"; value = 1; } { name = \"y\"; value = 2; } ]).x" (VInt 1),
+      -- prim_listToAttrs (primops.cc:2881-2904 at 2.24.9) looks value up
+      -- only for a name it has not seen, and getAttr (primops.cc:641-651)
+      -- words a missing attribute.
+      runTest "listToAttrs reads no value for a name already seen" $
+        assertEval "listToAttrs-repeat" "builtins.listToAttrs [ { name = \"a\"; value = 1; } { name = \"a\"; } ] == { a = 1; }" (VBool True),
+      runTest "listToAttrs reads every element's name" $
+        assertEvalError "listToAttrs-repeat-name" "builtins.listToAttrs [ { name = \"a\"; value = 1; } { name = throw \"n\"; } ]" "n",
+      runTest "listToAttrs refuses an element without a name" $
+        assertEvalError "listToAttrs-no-name" "builtins.listToAttrs [ { name = \"a\"; value = 1; } { value = 2; } ]" "attribute 'name' missing",
+      runTest "listToAttrs refuses a first element of a name without a value" $
+        assertEvalError "listToAttrs-no-value" "builtins.listToAttrs [ { name = \"a\"; } { name = \"a\"; value = 1; } ]" "attribute 'value' missing",
+      runTest "listToAttrs refuses an element that is not a set" $
+        assertEvalError "listToAttrs-element" "builtins.listToAttrs [ 1 ]" "expected a set but found an integer: 1",
+      runTest "listToAttrs refuses an argument that is not a list" $
+        assertEvalError "listToAttrs-argument" "builtins.listToAttrs 1" "expected a list but found an integer: 1",
       -- substring
       runTest "substring basic" $
         assertEval "substr" "builtins.substring 1 2 \"hello\"" (mkStr "el"),
@@ -3653,6 +3668,33 @@ testDerivationTraceIO = do
           (renderEvalFailure (EvalFailure ["while evaluating attribute 'foo' of derivation 'x'"] "a\nb")),
       runTest "a failure with no trace renders on the error line" $
         assertEqual "render-untraced" "error: a\n       b" (renderEvalFailure (EvalFailure [] "a\nb"))
+    ]
+
+-- | The lines of context a failure gathers in listToAttrs, upstream's from
+-- prim_listToAttrs (primops.cc:2881-2904 at 2.24.9): forceList's and
+-- forceAttrs's on their type errors alone, forceStringNoCtx's on any
+-- failure reading the name, and getAttr's on a missing attribute.  Only the
+-- IO evaluator keeps them.
+testListToAttrsTraceIO :: IO [Bool]
+testListToAttrsTraceIO = do
+  putStrLn "eval/listToAttrs-trace"
+  let listToAttrsFailure label argument expected = runTestM label $ do
+        tmpBase <- getTemporaryDirectory
+        result <- evalNixIOTraced tmpBase ("builtins.listToAttrs " <> argument)
+        pure $ case result of
+          Left failure -> assertEqual label expected failure
+          Right val -> Fail ("expected a failure, got " <> T.pack (show val))
+      elementLine = "while evaluating an element of the list passed to builtins.listToAttrs"
+      nameLine = "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs"
+      pairLine = "in a {name=...; value=...;} pair"
+  sequence
+    [ listToAttrsFailure "an argument that is not a list" "1" (EvalFailure ["while evaluating the argument passed to builtins.listToAttrs"] "expected a list but found an integer: 1"),
+      listToAttrsFailure "an element that is not a set" "[ 1 ]" (EvalFailure [elementLine] "expected a set but found an integer: 1"),
+      listToAttrsFailure "an element that fails to evaluate" "[ (throw \"e\") ]" (EvalFailure [] "e"),
+      listToAttrsFailure "an element without a name" "[ { value = 1; } ]" (EvalFailure [pairLine] "attribute 'name' missing"),
+      listToAttrsFailure "a name that is not a string" "[ { name = 1; value = 1; } ]" (EvalFailure [nameLine] "expected a string but found an integer: 1"),
+      listToAttrsFailure "a name that fails to evaluate" "[ { name = throw \"n\"; value = 1; } ]" (EvalFailure [nameLine] "n"),
+      listToAttrsFailure "a first element of a name without a value" "[ { name = \"a\"; } ]" (EvalFailure [pairLine] "attribute 'value' missing")
     ]
 
 -- | Regression: a thunk whose force throws a catchable error (builtins.throw,
@@ -23364,6 +23406,7 @@ runSuite = do
           testAttrNameContext,
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
+          testListToAttrsTraceIO,
           testFirstArgumentOrderIO,
           testTraceVerboseOff,
           testStorePathLinksIO,
