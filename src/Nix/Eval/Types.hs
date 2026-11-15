@@ -1253,9 +1253,12 @@ class (Monad m) => MonadEval m where
   doesPathExist :: PathExistence -> Text -> m Bool
 
   -- | List a directory, returning @(name, fileType)@ pairs.
-  -- @fileType@ is one of @"regular"@, @"directory"@, or @"symlink"@
-  -- (matching Nix's @builtins.readDir@ semantics).
-  listDirectory :: Text -> m [(Text, Text)]
+  -- @fileType@ is one of @"regular"@, @"directory"@, @"symlink"@ or
+  -- @"unknown"@ (matching Nix's @builtins.readDir@ semantics), and
+  -- 'Nothing' for an entry whose lstat is refused with @EACCES@ or
+  -- @EPERM@, which upstream's @readDirectory@ gives no type
+  -- (posix-source-accessor.cc:138-149 at 2.24.9).
+  listDirectory :: Text -> m [(Text, Maybe Text)]
 
   importFile :: Text -> m NixValue
 
