@@ -1,0 +1,20 @@
+error aborted
+drv alias /nix/store/x0sj6ynccvc1a8kxr8fifnlf7qlxw6hd-hello.drv
+fail asserted
+error badName
+error badRecurse
+skip callPackage
+drv hello /nix/store/x0sj6ynccvc1a8kxr8fifnlf7qlxw6hd-hello.drv
+skip lib
+error loop
+skip nameless
+recurse python3Packages
+error python3Packages.missing
+recurse python3Packages.nested
+drv python3Packages.nested.leaf /nix/store/3az60mn68fnc5ws2iln9i9fxm5rfqqym-leaf.drv
+skip python3Packages.nested.recurseForDerivations
+skip python3Packages.recurseForDerivations
+drv python3Packages.requests /nix/store/dp2iaai4vsv5l4gmisc8fw1v8an18d1m-requests.drv
+skip removed
+error typeError
+fail unfree
