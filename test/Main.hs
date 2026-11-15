@@ -3910,7 +3910,89 @@ testDerivationTraceIO = do
           "error:\n       \x2026 while evaluating attribute 'foo' of derivation 'x'\n\n       error: a\n       b"
           (renderEvalFailure (EvalFailure ["while evaluating attribute 'foo' of derivation 'x'"] "a\nb")),
       runTest "a failure with no trace renders on the error line" $
-        assertEqual "render-untraced" "error: a\n       b" (renderEvalFailure (EvalFailure [] "a\nb"))
+        assertEqual "render-untraced" "error: a\n       b" (renderEvalFailure (EvalFailure [] "a\nb")),
+      -- showErrorInfo passes over a trace whose text is empty (error.cc:386).
+      runTest "an empty line of context is left out" $
+        assertEqual
+          "render-empty-line"
+          "error:\n       \x2026 c\n\n       error: x"
+          (renderEvalFailure (EvalFailure ["", "c", ""] "x"))
+    ]
+
+-- | @builtins.addErrorContext@ forces its value and coerces its message
+-- only when that fails, in the catch around the force
+-- (@prim_addErrorContext@, primops.cc:831-844 at 2.24.9).  The pure
+-- evaluator reports a failure's message alone, so these see which
+-- failure escapes, not the line it carries.
+testErrorContext :: IO [Bool]
+testErrorContext = do
+  putStrLn "eval/error-context"
+  let yields source expected = runTest source (assertEval source source expected)
+      fails source expected = runTest (source <> " fails with " <> expected) (assertEvalError source source expected)
+  sequence
+    [ yields "builtins.addErrorContext (throw \"a\") 1" (VInt 1),
+      yields "builtins.addErrorContext \"c\" (1 + 1)" (VInt 2),
+      yields "let f = builtins.addErrorContext (throw \"a\"); in f 1" (VInt 1),
+      yields "builtins.elemAt (map (builtins.addErrorContext (throw \"a\")) [ 1 ]) 0" (VInt 1),
+      fails "builtins.addErrorContext \"ctx-marker\" (throw \"x\")" "x",
+      fails "builtins.addErrorContext (throw \"a\") (throw \"b\")" "a",
+      fails "builtins.addErrorContext 1 (throw \"b\")" "cannot coerce an integer to a string: 1",
+      yields "(builtins.tryEval (builtins.addErrorContext \"c\" (throw \"x\"))).success" (VBool False),
+      -- The type error replaces the throw, and tryEval does not catch it.
+      fails "builtins.tryEval (builtins.addErrorContext 1 (throw \"x\"))" "cannot coerce an integer to a string: 1"
+    ]
+
+-- | The line @builtins.addErrorContext@ adds to a failure's trace under
+-- the IO evaluator, and how the CLI reports it: upstream's @addTrace@ in
+-- @prim_addErrorContext@ (primops.cc:831-844 at 2.24.9), printed by
+-- @showErrorInfo@ (error.cc at 2.24.9) with its positioned lines left
+-- out.
+testErrorContextIO :: IO [Bool]
+testErrorContextIO = do
+  putStrLn "eval/error-context-io"
+  tmpBase <- getTemporaryDirectory
+  let failure source check = do
+        result <- evalNixIOTraced tmpBase source
+        pure $ case result of
+          Left failed -> check failed
+          Right val -> Fail ("expected a failure, got " <> T.pack (show val))
+      failsWith label source expected = runTestM label (failure source (assertEqual label expected))
+      reports label source expected = runTestM label (failure source (assertEqual label expected . renderEvalFailure))
+  sequence
+    [ reports
+        "a failure inside it reports the message as a line of its trace"
+        "builtins.addErrorContext \"ctx-marker\" (throw \"x\")"
+        "error:\n       \x2026 ctx-marker\n\n       error: x",
+      runTestIO "its message is not forced when its value evaluates" tmpBase "builtins.addErrorContext (throw \"a\") 1" (VInt 1),
+      failsWith
+        "nested contexts are listed outermost first"
+        "builtins.addErrorContext \"outer\" (builtins.addErrorContext \"inner\" (throw \"x\"))"
+        (EvalFailure ["outer", "inner"] "x"),
+      failsWith
+        "a context is outside the lines its value's failure gathered"
+        "builtins.addErrorContext \"c\" (derivation { name = \"x\"; system = \"s\"; builder = \"b\"; foo = { }; }).drvPath"
+        (EvalFailure ["c", "while evaluating attribute 'foo' of derivation 'x'"] "cannot coerce a set to a string: { }"),
+      failsWith
+        "a context is outside the line listToAttrs gives an element that is not a set"
+        "builtins.addErrorContext \"c\" (builtins.listToAttrs [ 1 ])"
+        (EvalFailure ["c", "while evaluating an element of the list passed to builtins.listToAttrs"] "expected a set but found an integer: 1"),
+      failsWith
+        "a message coerces as a set with __toString"
+        "builtins.addErrorContext { __toString = _: \"set-ctx\"; } (throw \"x\")"
+        (EvalFailure ["set-ctx"] "x"),
+      failsWith "a message that throws replaces the failure" "builtins.addErrorContext (throw \"a\") (throw \"b\")" (EvalFailure [] "a"),
+      failsWith
+        "a message that does not coerce replaces the failure"
+        "builtins.addErrorContext 1 (throw \"b\")"
+        (EvalFailure [] "cannot coerce an integer to a string: 1"),
+      reports "an empty message adds no line of its own" "builtins.addErrorContext \"\" (throw \"x\")" "error:\n       error: x",
+      runTestIO "a throw inside it stays catchable" tmpBase "(builtins.tryEval (builtins.addErrorContext \"c\" (throw \"x\"))).success" (VBool False),
+      runTestM "an abort inside it gains the line and escapes tryEval" $
+        failure "builtins.tryEval (builtins.addErrorContext \"c\" (builtins.abort \"x\"))" (assertEqual "abort-trace" ["c"] . failureTrace),
+      failsWith
+        "a message that does not coerce escapes tryEval"
+        "builtins.tryEval (builtins.addErrorContext 1 (throw \"x\"))"
+        (EvalFailure [] "cannot coerce an integer to a string: 1")
     ]
 
 -- | The lines of context a failure gathers in listToAttrs, upstream's from
@@ -21918,7 +22000,9 @@ instance MonadEval StubStoreEval where
     Left other -> Left other
     Right val -> Right (Right val)
   onEvalError (StubStoreEval action) _ = StubStoreEval action
-  addErrorTrace _ action = action
+  addErrorTrace (StubStoreEval line) (StubStoreEval action) = StubStoreEval $ \env -> case action env of
+    Left failure -> line env >> Left failure
+    Right val -> Right val
 
   -- The stub keeps no call depth: it exists to answer store questions,
   -- and the ceiling is tested on the evaluators that enforce it.
@@ -24528,6 +24612,8 @@ runSuite = do
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
           testListToAttrsTraceIO,
+          testErrorContext,
+          testErrorContextIO,
           testFirstArgumentOrderIO,
           testTraceVerboseOff,
           testStorePathLinksIO,

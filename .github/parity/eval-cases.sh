@@ -74,11 +74,19 @@ check() {
   fi
 }
 
+# The lines of the input that end in the text given.
+endingIn() {
+  awk -v suffix="$1" 'length($0) >= length(suffix) && substr($0, length($0) - length(suffix) + 1) == suffix'
+}
+
 # An expression both evaluators must refuse, on the same final line.  What
-# comes before it is upstream's trace, which nova-nix does not reproduce.
+# comes before it is upstream's trace, which nova-nix reproduces only for
+# the lines that have no position: given a marker, the line ending in it
+# must be in upstream's output and the same in nova-nix's.
 refused() {
   label=$1
   expr=$2
+  marker=${3-}
   checked=$((checked + 1))
   upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1)
   upstreamStatus=$?
@@ -86,7 +94,14 @@ refused() {
   novaStatus=$?
   upstreamError=$(printf '%s\n' "$upstream" | tail -n1 | sed 's/^ *//')
   novaError=$(printf '%s\n' "$nova" | tail -n1 | sed 's/^ *//')
-  if [ "$upstreamStatus" -ne 0 ] && [ "$novaStatus" -ne 0 ] && [ "$upstreamError" = "$novaError" ]; then
+  upstreamContext=""
+  novaContext=""
+  if [ -n "$marker" ]; then
+    upstreamContext=$(printf '%s\n' "$upstream" | endingIn " $marker")
+    novaContext=$(printf '%s\n' "$nova" | endingIn " $marker")
+  fi
+  if [ "$upstreamStatus" -ne 0 ] && [ "$novaStatus" -ne 0 ] && [ "$upstreamError" = "$novaError" ] &&
+    [ "$upstreamContext" = "$novaContext" ] && { [ -z "$marker" ] || [ -n "$upstreamContext" ]; }; then
     printf '  ok    %s\n' "$label"
   else
     failures=$((failures + 1))
@@ -94,6 +109,10 @@ refused() {
     printf '          expression  %s\n' "$expr"
     printf '          upstream    (exit %s) %s\n' "$upstreamStatus" "$upstreamError"
     printf '          nova-nix    (exit %s) %s\n' "$novaStatus" "$novaError"
+    if [ -n "$marker" ]; then
+      printf '          upstream    context %s\n' "$upstreamContext"
+      printf '          nova-nix    context %s\n' "$novaContext"
+    fi
   fi
 }
 
@@ -154,6 +173,14 @@ echo "== arithmetic and comparison as upstream's primops do them =="
 check "unary minus is 0 - e, so a float zero negates to positive zero" '[ (-(0.0)) (-(-0.0)) ]'
 check "division by a float, and integer division truncating toward zero" '[ (1 / 4.0) (7 / 2) ((-7) / 2) ]'
 check "a list comparison passes over equal elements of an unordered type" '[ ([ { } ] < [ { } ]) ([ { } 1 ] < [ { } 2 ]) ]'
+echo
+
+echo "== when builtins.addErrorContext forces its message =="
+check "not when its value evaluates" 'builtins.addErrorContext (throw "a") 1'
+check "a throw inside it stays catchable" '(builtins.tryEval (builtins.addErrorContext "c" (throw "x"))).success'
+refused "a throw inside it is the failure, with the message a line of its trace" 'builtins.addErrorContext "ctx-marker" (throw "x")' ctx-marker
+refused "a message that throws is the failure in its place" 'builtins.addErrorContext (throw "a") (throw "b")'
+refused "a message that does not coerce escapes tryEval" 'builtins.tryEval (builtins.addErrorContext 1 (throw "x"))'
 echo
 
 echo "== what fromJSON reads =="

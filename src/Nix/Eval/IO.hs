@@ -33,7 +33,7 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, Handler (..), IOException, SomeAsyncException, SomeException, catch, catchJust, catches, displayException, fromException, onException, throwIO, try)
+import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, catch, catchJust, displayException, fromException, onException, throwIO, try)
 import Control.Monad (unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
@@ -121,14 +121,18 @@ instance Exception NixAbortError
 -- | A failure as upstream's @showErrorInfo@ prints it (error.cc at
 -- 2.24.9) when no line has a position: each line of context after an
 -- ellipsis and a blank line, then the message after an @error:@ of its
--- own.  The report is upstream's @indent@: the first line follows
--- @error: @, every later line is indented to align with it, and each line
--- loses its trailing whitespace.
+-- own.  An empty line of context prints nothing, as upstream passes over
+-- a trace whose text is empty (error.cc:386), and the message still
+-- follows an @error:@ of its own, as upstream's follows one whenever the
+-- failure has a trace (error.cc:376, 416).  The report is upstream's
+-- @indent@: the first line follows @error: @, every later line is
+-- indented to align with it, and each line loses its trailing whitespace.
 renderEvalFailure :: EvalFailure -> Text
 renderEvalFailure (EvalFailure trace msg) =
   T.intercalate "\n" (zipWith indentLine (errorPrefix : repeat continuation) (T.splitOn "\n" (chomp report)))
   where
-    report = foldMap traceLine trace <> (if null trace then "" else "\n" <> errorPrefix) <> msg
+    shown = filter (not . T.null) trace
+    report = foldMap traceLine shown <> (if null trace then "" else "\n" <> errorPrefix) <> msg
     traceLine line = "\n\x2026 " <> line <> "\n"
     indentLine prefix line = chomp (prefix <> line)
     continuation = T.replicate (T.length errorPrefix) " "
@@ -294,16 +298,19 @@ instance MonadEval EvalIO where
     st <- ask
     liftIO (runReaderT action st `onException` runReaderT cleanup st)
 
-  addErrorTrace line (EvalIO action) = EvalIO $ do
+  -- The line is made after the failure is caught, not in a handler,
+  -- which would run it with asynchronous exceptions masked.
+  addErrorTrace (EvalIO line) (EvalIO action) = EvalIO $ do
     st <- ask
-    liftIO
-      ( runReaderT action st
-          `catches` [ Handler (\(NixEvalError kind failure) -> throwIO (NixEvalError kind (traced failure))),
-                      Handler (\(NixAbortError failure) -> throwIO (NixAbortError (traced failure)))
-                    ]
-      )
+    result <- liftIO (try (try (runReaderT action st)))
+    case result of
+      Right (Right val) -> pure val
+      Right (Left (NixAbortError failure)) -> retrace (throwIO . NixAbortError) failure
+      Left (NixEvalError kind failure) -> retrace (throwIO . NixEvalError kind) failure
     where
-      traced (EvalFailure trace msg) = EvalFailure (line : trace) msg
+      retrace rethrow (EvalFailure trace msg) = do
+        !context <- line
+        liftIO (rethrow (EvalFailure (context : trace) msg))
 
   withCallFrame (EvalIO action) = EvalIO $ do
     depth <- asks esCallDepth
