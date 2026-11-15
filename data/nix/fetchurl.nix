@@ -53,9 +53,9 @@ derivation (
     # (see Nix.Builder.runBuiltinFetchurl).
     builder = "builtin:fetchurl";
 
-    # An unpacked or executable output is a tree, so its fixed-output
-    # hash must be taken over the NAR serialisation rather than the
-    # flat file bytes.
+    # An unpacked output is a tree, and an executable one a file whose
+    # mode only a NAR records, so the fixed-output hash of either is
+    # taken over the NAR serialisation rather than the flat file bytes.
     outputHashMode = if unpack || executable then "recursive" else "flat";
 
     inherit

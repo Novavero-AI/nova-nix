@@ -11877,8 +11877,8 @@ testHashHelpers = do
           (Hash.rawHashWithAlgo "sha256" BS.empty),
       runTest "rawHashWithAlgo unknown algo rejected" $
         assertEqual "unknown" Nothing (Hash.rawHashWithAlgo "sha3-256" (BS.pack [1, 2, 3])),
-      -- verifyFetchHash: the composed builtin:fetchurl integrity gate that
-      -- guards every fixed-output seed fetch
+      -- verifyFetchHash: a buffered body checked as the flat output file
+      -- it makes, through the comparison builtin:fetchurl makes
       runTest "verifyFetchHash accepts a matching flat hash" $
         assertEqual
           "fetch-hash-ok"
@@ -12629,6 +12629,177 @@ testFetchMirrors = do
                   assertEqual "verified output" "hello" <$> BS.readFile (storePathToFilePath (stDir store) sp)
             BuildFailure msg _ | not succeeds && not valid && not present && seen == expectedRequests && not (T.null msg) -> pure Pass
             _ -> pure (Fail (T.pack (show (result, seen, valid, present))))
+
+-- | @builtin:fetchurl@ with @unpack@ and @executable@, against a loopback
+-- server: the output each makes, its modes once registered, and the
+-- recursive hash upstream's builtin gives it (fetchurl.cc:31-59 at
+-- 2.24.9).  Each expected NAR is encoded here from the format
+-- ('narSpecStr'), the bytes upstream's restore and dump reproduce, so the
+-- restore and the hash are held to bytes nova-cache did not write.
+testFetchurlUnpack :: IO [Bool]
+testFetchurlUnpack = do
+  putStrLn "builder/fetchurl-unpack"
+  case B64.decode treeXzB64 of
+    Left err -> (: []) <$> runTest "fetchurl unpack setup" (Fail (T.pack err))
+    Right treeXz -> do
+      canLink <- symlinksAvailable
+      let served =
+            Map.fromList
+              [ ("/tree.nar", narSpecVector),
+                ("/tree.nar.xz", treeXz),
+                ("/other.nar", narSpecFileVector),
+                ("/plain.nar", fileNar "hello"),
+                ("/link.nar", symlinkNar victimName),
+                ("/dangling.nar", symlinkNar "absent"),
+                ("/tool", "hello")
+              ]
+          route path _ = Send (maybe (httpResponse "404 Not Found" "missing") (httpResponse "200 OK") (Map.lookup path served))
+          -- Run a builtin:fetchurl derivation of the paths and attributes
+          -- given, its output fixed by the sha256 of the declared bytes in
+          -- the mode given, in a store of its own.  The check gets the
+          -- store's directory and output path before the build, and the
+          -- build, which answers its result, the requests the server saw
+          -- and the NAR hash the store registered.
+          fetchIn label paths@(firstPath :| _) attrs (mode, algo) declared check =
+            withHttpServer route $ \base requests _ -> do
+              tmpBase <- getTemporaryDirectory
+              let root = tmpBase </> ("nova-nix-test-fetchurl-" ++ label)
+                  dir = StoreDir (root </> "store")
+                  config = (defaultBuildConfig dir) {bcFetchRetry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}}
+                  digest = sha256Digest declared
+                  env =
+                    Map.fromList
+                      ( [ ("url", TE.encodeUtf8 (base <> firstPath)),
+                          ("urls", TE.encodeUtf8 (T.unwords (map (base <>) (toList paths))))
+                        ]
+                          ++ attrs
+                      )
+              case makeFixedOutputPath (T.pack label) "sha256" mode digest of
+                Left err -> pure (Fail (T.pack (show err)))
+                Right sp ->
+                  bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
+                    bracket (openStore dir) closeStore $ \store -> do
+                      let drv =
+                            Derivation
+                              { drvOutputs = [DerivationOutput "out" sp algo (Hash.bytesToHexText digest)],
+                                drvInputDrvs = Map.empty,
+                                drvInputSrcs = [],
+                                drvPlatform = currentPlatform,
+                                drvBuilder = "builtin:fetchurl",
+                                drvArgs = [],
+                                drvEnv = env
+                              }
+                          build = do
+                            result <- buildDerivation config store drv testDrvPath
+                            seen <- requests
+                            info <- queryPathInfo (stDB store) sp
+                            pure (result, seen, piNarHash <$> info)
+                      check dir sp build
+          -- 'fetchIn' for a fetch that builds: check the requests, the
+          -- registered NAR hash and the tree on disk.
+          fetchCase label paths attrs hashMode declared expectedNar checkTree =
+            fetchIn label paths attrs hashMode declared $ \dir sp build -> do
+              (result, seen, narHash) <- build
+              case result of
+                BuildSuccess built | built == sp -> do
+                  tree <- checkTree (storePathToFilePath dir sp)
+                  pure
+                    ( assertEqual "requests" (map TE.encodeUtf8 (toList paths)) seen
+                        `andThen` assertEqual "NAR hash" (Just (CHash.formatNixHash (CHash.hashBytes expectedNar))) narHash
+                        `andThen` tree
+                    )
+                other -> pure (Fail ("build: " <> T.pack (show other)))
+          -- 'fetchIn' for a fetch upstream refuses with the error given,
+          -- once the store's directory is prepared: nothing is
+          -- registered, and nothing is left at the output path.
+          refusedCase label paths attrs hashMode declared prepare expected =
+            fetchIn label paths attrs hashMode declared $ \dir sp build -> do
+              () <- prepare dir
+              (result, _, narHash) <- build
+              present <- Dir.doesPathExist (storePathToFilePath dir sp)
+              pure $ case result of
+                BuildFailure msg _
+                  | expected `T.isInfixOf` msg -> assertEqual "registered, present" (Nothing, False) (narHash, present)
+                other -> Fail ("expected a refusal naming " <> expected <> ", got: " <> T.pack (show other))
+          -- An executable unpack fetch whose first URL serves a NAR whose
+          -- root is a symlink beside the output: the file the link names
+          -- is left as it was, and the next URL's plain file is made the
+          -- executable the hash names.
+          executableAfterLink label linkPath =
+            fetchIn label (linkPath :| ["/plain.nar"]) (("executable", "1") : unpackAttrs) recursiveHash toolNar $ \dir sp build -> do
+              let victim = victimIn dir
+              BS.writeFile victim "a file outside the output"
+              (result, seen, narHash) <- build
+              victimExecutable <- ExecBit.isExecutable victim
+              pure
+                ( assertEqual "build" (BuildSuccess sp) result
+                    `andThen` assertEqual "requests" (map TE.encodeUtf8 [linkPath, "/plain.nar"]) seen
+                    `andThen` assertEqual "NAR hash" (Just (CHash.formatNixHash (CHash.hashBytes toolNar))) narHash
+                    `andThen` assertEqual "the linked file made executable" False victimExecutable
+                )
+      unpacked <-
+        if canLink
+          then
+            sequence
+              [ runTestM "an unpack fetch restores the NAR it downloads, under that NAR's hash" $
+                  fetchCase "unpack" ("/tree.nar" :| []) unpackAttrs recursiveHash narSpecVector narSpecVector restoredTree,
+                runTestM "an unpack fetch of a .xz URL restores the NAR it decompresses" $
+                  fetchCase "unpack-xz" ("/tree.nar.xz" :| []) unpackAttrs recursiveHash narSpecVector narSpecVector restoredTree,
+                runTestM "an unpack fetch whose tree has another hash moves to the next URL" $
+                  fetchCase "unpack-mirror" ("/other.nar" :| ["/tree.nar"]) unpackAttrs recursiveHash narSpecVector narSpecVector restoredTree,
+                runTestM "an executable unpack fetch leaves alone the file a symlink root names, and moves to the next URL" $
+                  executableAfterLink "exec-link" "/link.nar",
+                runTestM "an executable unpack fetch of a dangling symlink root moves to the next URL" $
+                  executableAfterLink "exec-dangling" "/dangling.nar",
+                runTestM "a flat unpack fetch of a symlink root is refused with upstream's error, not hashed as the file it names" $
+                  refusedCase "flat-link" ("/link.nar" :| []) unpackAttrs flatHash "hello" (\dir -> BS.writeFile (victimIn dir) "hello") flatOutputRefusal
+              ]
+          else [] <$ putStrLn "  SKIP  the unpacked trees hold symlinks, which need symlink privilege"
+      others <-
+        sequence
+          [ runTestM "an executable fetch makes an executable file, under the hash of its NAR" $
+              fetchCase "executable" ("/tool" :| []) [("executable", "1")] recursiveHash toolNar toolNar $ \outPath -> do
+                mode <- canonicalAs 0o555 outPath
+                executable <- ExecBit.isExecutable outPath
+                contents <- BS.readFile outPath
+                pure (mode `andThen` assertEqual "file" ("hello", True) (contents, executable)),
+            runTestM "a fetch of a .xz URL without unpack keeps the bytes it downloads" $
+              fetchCase "xz-kept" ("/tree.nar.xz" :| []) [] flatHash treeXz (fileNar treeXz) $ \outPath -> do
+                mode <- canonicalAs 0o444 outPath
+                contents <- BS.readFile outPath
+                pure (mode `andThen` assertEqual "contents" treeXz contents),
+            runTestM "an executable fetch under a flat hash is refused with upstream's error" $
+              refusedCase "flat-executable" ("/tool" :| []) [("executable", "1")] flatHash "hello" (const (pure ())) flatOutputRefusal
+          ]
+      pure (unpacked ++ others)
+  where
+    unpackAttrs = [("unpack", "1")]
+    recursiveHash = ("recursive", "r:sha256")
+    flatHash = ("flat", "sha256")
+    -- The NAR of a regular file holding the given bytes, and of the
+    -- executable file the executable case fetches.
+    fileNar contents = BS.concat (map narSpecStr ["nix-archive-1", "(", "type", "regular", "contents", contents, ")"])
+    toolNar = BS.concat (map narSpecStr ["nix-archive-1", "(", "type", "regular", "executable", "", "contents", "hello", ")"])
+    -- The NAR of a symlink to the given target.  A relative target
+    -- resolves beside the output, in the store's directory, where a test
+    -- plants the file 'victimIn' names, outside every output.
+    symlinkNar target = BS.concat (map narSpecStr ["nix-archive-1", "(", "type", "symlink", "target", target, ")"])
+    victimName = "victim"
+    victimIn dir = unStoreDir dir </> BS8.unpack victimName
+    -- 'narSpecVector' restored and registered: every directory and the
+    -- executable 0555, the plain file 0444, and the symlink as it was.
+    restoredTree outPath = do
+      let tool = outPath </> "bin" </> "tool"
+          plain = outPath </> "data.txt"
+      modes <- traverse (uncurry canonicalAs) [(0o555, outPath), (0o555, outPath </> "bin"), (0o555, tool), (0o444, plain)]
+      flags <- traverse ExecBit.isExecutable [tool, plain]
+      contents <- traverse BS.readFile [tool, plain]
+      target <- Dir.getSymbolicLinkTarget (outPath </> "link")
+      pure (foldr andThen Pass modes `andThen` assertEqual "tree" ([True, False], ["#!x", "hello\n"], "data.txt") (flags, contents, target))
+    -- 'narSpecVector' compressed with xz 5.8.4 at -9 (244 bytes),
+    -- embedded as base64 so the test source stays ASCII.
+    treeXzB64 =
+      "/Td6WFoAAATm1rRGBMC0AegGIQEcAAAAAAAAAECWtWrgA2cArF0ABoA2H++mzr92uhp6TyvqpFMk7aEjBHH/W7+XabrzKb4lenEr6bTaDX6aj51eJG3iFAbZDd8GA2XaYJrrkAHWgeGGgmFdILNyZZxSeSX3iaFCjpuwFBhssFJc2PhwJiJi0g8PV0XUxS/A206A1s9Roe9EEHR69sTLQiQYEFLSL17xYPIJsVKtCwROwCBJbpmdSTKWs6h14bbSSD5mKx99dPudGvwbMcpAf7NyGABJYU2iEzNN3AAB0AHoBgAAJ/RN+7HEZ/sCAAAAAARZWg==" :: Text
 
 -- | The substituter's narinfo and NAR requests under the transfer
 -- layer's retry policy, against a loopback cache.  The policy's effects
@@ -18278,10 +18449,51 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         pure $ case result of
           BuildFailure msg _
-            | "directory" `T.isInfixOf` msg -> Pass
+            | flatOutputRefusal `T.isInfixOf` msg -> Pass
             | otherwise -> Fail ("wrong failure: " <> msg)
           BuildSuccess _ -> Fail "directory output passed a flat fixed-output check"
     ]
+
+-- | The tail of upstream's refusal of an output under a flat hash that is
+-- not a regular file its owner may not execute (@registerOutputs@,
+-- local-derivation-goal.cc:2505-2507 at 2.24.9); the message opens with
+-- the output's path.
+flatOutputRefusal :: Text
+flatOutputRefusal = "should be a non-executable regular file since recursive hashing is not enabled (one of outputHashMode={flat,text} is true)"
+
+-- | A builder's output under a flat hash is held to upstream's form, read
+-- without following a symlink: each output here carries the bytes the
+-- hash names, so only its form refuses it.  POSIX only: the Windows
+-- shell's @chmod@ sets no exec stream, and its @ln -s@ copies.
+testFlatOutputFormIO :: IO [Bool]
+testFlatOutputFormIO = do
+  putStrLn "builder/flat-output-form"
+  if SI.os == "mingw32"
+    then [] <$ putStrLn "  SKIP  these outputs are made with a POSIX shell's chmod and ln -s"
+    else do
+      shell <- findTestShell
+      sequence
+        [ runTestM "a builder's executable output under a flat hash is refused with upstream's error" $
+            refused shell "fo-flat-exec" "printf hello > $out && chmod +x $out",
+          runTestM "a builder's symlink output under a flat hash is refused, not hashed as the file it names" $
+            refused shell "fo-flat-link" "printf hello > $out.target && ln -s $out.target $out"
+        ]
+  where
+    refused shell name script = do
+      tmpBase <- getTemporaryDirectory
+      let tmpStore = tmpBase </> ("nova-nix-test-" ++ T.unpack name)
+          digest = sha256Digest "hello"
+      case makeFixedOutputPath name "sha256" "flat" digest of
+        Left err -> pure (Fail (T.pack (show err)))
+        Right outSP ->
+          bracket_ (forceRemoveIfExists tmpStore) (forceRemoveIfExists tmpStore) $
+            bracket (openStore (StoreDir tmpStore)) closeStore $ \store -> do
+              let drv = mkFixedOutputDrv shell outSP script "sha256" (Hash.bytesToHexText digest)
+              result <- buildDerivation (defaultBuildConfig (stDir store)) store drv testDrvPath
+              registered <- isValid store outSP
+              pure $ case result of
+                BuildFailure msg _ | flatOutputRefusal `T.isInfixOf` msg && not registered -> Pass
+                other -> Fail ("expected upstream's refusal, got: " <> T.pack (show other))
 
 -- ---------------------------------------------------------------------------
 -- Tests: CLI Integration (Phase 2, Batch 5)
@@ -23291,6 +23503,7 @@ runSuite = do
           testUpstreamConformance,
           testHashHelpers,
           testFetchMirrors,
+          testFetchurlUnpack,
           testSubstituterRetry,
           testSubstituteFromCaches,
           testPkgsFetchurl,
@@ -23428,6 +23641,7 @@ runSuite = do
           testLinkOrdering,
           testFromATerm,
           testBuilder,
+          testFlatOutputFormIO,
           testE2E,
           testExecWrapperCLI,
           testCheckCLI,

@@ -35,10 +35,14 @@
 --
 -- 'metadataChanges' decides what one node needs from what it reads of
 -- it, without touching the filesystem, and 'canonicalizeMetadata' walks
--- a tree and makes the changes.
+-- a tree and makes the changes.  'isPlainFile' reads the form upstream
+-- requires of an output with a flat hash.
 module Nix.Store.Metadata
   ( -- * Canonicalizing a tree
     canonicalizeMetadata,
+
+    -- * Reading a node
+    isPlainFile,
 
     -- * The canonical form
     NodeKind (..),
@@ -61,10 +65,12 @@ import Data.Word (Word32)
 import Control.Exception (bracket)
 import Data.Bits (testBit, (.|.))
 import Data.Foldable (traverse_)
+import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
 import Nix.Store.Win32Path (win32FilePath)
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
+import System.IO.Error (doesNotExistErrorType, mkIOError)
 import System.Win32.File
   ( FileAttributeOrFlag,
     closeHandle,
@@ -193,7 +199,24 @@ storeModificationTime = 1
 -- with the 'Control.Exception.IOException' the system call raised.
 canonicalizeMetadata :: FilePath -> IO ()
 
+-- | Whether a node is a regular file its owner may not execute, read
+-- without following a symlink: what upstream requires of an output with
+-- a flat hash, a node whose @lstat@ has @S_ISREG@ and no @S_IXUSR@
+-- (@registerOutputs@, local-derivation-goal.cc:2326 and :2501-2507 at
+-- 2.24.9).  On Windows, which has no mode, the owner may execute a file
+-- that carries the exec stream ("Nix.Store.ExecBit").  A node that is
+-- not there fails with the 'Control.Exception.IOException' raised.
+isPlainFile :: FilePath -> IO Bool
+
 #if defined(mingw32_HOST_OS)
+
+isPlainFile path = do
+  node <- classifyWalkNode path
+  case node of
+    WalkRegular -> not <$> ExecBit.isExecutable path
+    WalkDirectory -> pure False
+    WalkSymlink -> pure False
+    WalkAbsent -> ioError (mkIOError doesNotExistErrorType "isPlainFile" Nothing (Just path))
 
 -- A directory is done after its entries, so nothing done to them comes
 -- after its own time is set.
@@ -248,6 +271,10 @@ fileFlagOpenReparsePoint :: FileAttributeOrFlag
 fileFlagOpenReparsePoint = 0x00200000
 
 #else
+
+isPlainFile path = do
+  status <- getSymbolicLinkStatus path
+  pure (isRegularFile status && not (testBit (fileMode status) ownerExecuteBit))
 
 -- A directory is changed before its entries are read, as upstream
 -- changes it, so one its owner may execute but not read becomes
