@@ -14,12 +14,16 @@
 -- "Data.Char"'s Unicode classes: 'Data.Char.isAlpha' calls the byte 0xE9
 -- a letter.
 --
--- A column counts characters: a byte that continues a UTF-8 sequence does
--- not advance it, so valid UTF-8 advances one column per character.  A
--- line ends at an LF, a CRLF or a bare CR, as upstream's position table
--- splits a source (@Pos::LinesIterator@, position.cc).  Every byte the
--- lexer takes passes through 'consume', which holds that rule, so no
--- token, comment or string counts lines its own way.
+-- A column counts bytes, as upstream's do: its lexer advances a location
+-- by the length in bytes of everything it matches (@adjustLoc@,
+-- lexer-helpers.cc at 2.24.9), and its position table makes a column from
+-- a position's byte offset past the start of its line
+-- (@PosTable::operator[]@, nixexpr.cc), so a character UTF-8 spells in two
+-- bytes takes two columns.  A line
+-- ends at an LF, a CRLF or a bare CR, as that table splits a source
+-- (@Pos::LinesIterator@, position.cc).  Every byte the lexer takes passes
+-- through 'consume', which holds both rules, so no token, comment or
+-- string counts lines or columns its own way.
 module Nix.Parser.Lexer
   ( -- * Tokens
     Token (..),
@@ -1057,10 +1061,6 @@ isSchemeChar c = isAsciiAlphaNum c || c `elem` ("+.-" :: [Char])
 isUriChar :: Char -> Bool
 isUriChar c = isAsciiAlphaNum c || c `elem` ("%/?:@&=+$,-_.!~*'" :: [Char])
 
--- | A byte that continues a UTF-8 sequence, @10xxxxxx@.
-isContinuationByte :: Char -> Bool
-isContinuationByte c = c >= '\x80' && c < '\xC0'
-
 -- | The text of bytes an ASCII class matched.  Latin-1 agrees with ASCII
 -- on every byte such a class admits, and 'TE.decodeLatin1' is total.
 asciiText :: ByteString -> Text
@@ -1100,11 +1100,11 @@ consume n st =
 
 -- | The position past bytes taken from the input, @rest@ being the input
 -- after them: each line that ends in them moves it to the start of the
--- next line, and the bytes after the last ending add their columns.
+-- next line, and each byte after the last ending adds a column.
 advanceOver :: ByteString -> ByteString -> LexState -> LexState
 advanceOver taken rest !st = case afterLineEnding rest taken of
   Just nextLine -> advanceOver nextLine rest st {lsLine = lsLine st + 1, lsCol = 1}
-  Nothing -> st {lsCol = lsCol st + charColumns taken}
+  Nothing -> st {lsCol = lsCol st + BS.length taken}
 
 -- | The bytes after the first line ending in bytes taken from the input,
 -- @rest@ being the input after them.  A line ends at an LF, and at a CR
@@ -1119,12 +1119,6 @@ afterLineEnding rest bytes = case BC.uncons (BC.dropWhile (not . isLineEndingByt
     | (safeHead afterCr <|> safeHead rest) == Just '\n' -> afterLineEnding rest afterCr
   Just (_, afterEnding) -> Just afterEnding
   Nothing -> Nothing
-
--- | The columns a run of bytes with no line ending in it takes: one per
--- byte that does not continue a UTF-8 sequence, so one per character of
--- valid UTF-8.
-charColumns :: ByteString -> Int
-charColumns = BC.foldl' (\n c -> if isContinuationByte c then n else n + 1) 0
 
 safeHead :: ByteString -> Maybe Char
 safeHead = fmap fst . BC.uncons
