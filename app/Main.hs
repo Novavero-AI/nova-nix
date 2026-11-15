@@ -17,7 +17,7 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (readIORef)
-import Data.List (find)
+import Data.List (find, partition)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, mapMaybe)
 import qualified Data.Text as T
@@ -27,7 +27,7 @@ import Data.Version (showVersion)
 import Data.Word (Word32)
 import Foreign.C.Error (Errno (..), ePIPE)
 import GHC.IO.Exception (IOException (..))
-import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig)
+import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
 import Nix.Cli.Args (BuildTarget (..), CliOpts (..), Command (..), PushArgs (..), parseArgs)
@@ -50,7 +50,7 @@ import Nix.Expr.Types (Expr)
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
-import Nix.Realise (BuildMode (..), Fallback (..), SubstitutesSetting (..))
+import Nix.Realise (BuildMode (..), ClosureOutcome (..), Fallback (..), SubstitutesSetting (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
@@ -497,10 +497,11 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
 
 -- | Evaluate the target, find the fixed-output derivations of its
 -- derivation's closure, fetch each one nova-nix's builtins fetch alone,
--- scan the outputs the store holds, and print what the closure relies on
--- ("Nix.Trust").  The graph is read from the recipes evaluation recorded,
--- so beyond what evaluation itself writes, as @builtins.toFile@ does,
--- only the fetches write to the store, and a closure with no
+-- substitute the others from the configured caches, scan the outputs the
+-- store holds, and print what the closure relies on ("Nix.Trust").  The
+-- graph is read from the recipes evaluation recorded, so beyond what
+-- evaluation itself writes, as @builtins.toFile@ does, only the fetches
+-- and substitutions write to the store, and a closure with no
 -- fixed-output input does not open it.  A store directory upstream Nix's
 -- database also manages is refused before it is opened, as a build
 -- refuses one ("Nix.Store.Upstream").
@@ -518,16 +519,27 @@ trustCommand config opts storeDir dataDir target attrPath = do
       bracket (openStore storeDir) closeStore (\store -> fetchAndScan config opts store inputs)
   toStdout (mapM_ TIO.putStrLn (renderTrustReport (trustReport facts graph drvSP)))
 
--- | Realise each fixed-output input that nova-nix's builtins fetch with no
--- input of their own, so that nothing from the closure runs, then scan
--- every one whose output the store holds.  The first fetch that fails
--- stops the command, as a build stops; an input not fetched is one the
--- report names.
+-- | Make each fixed-output input's output valid in a way that runs
+-- nothing from the closure, then scan every one the store holds.  An
+-- input that nova-nix's builtins fetch with no input of their own is
+-- realised, which substitutes or fetches it; any other is only
+-- substituted, with what it references, since making it would run its
+-- builder.  That substitution leaves the derivation's @allowSubstitutes@
+-- unread: the attribute chooses between building and substituting, and
+-- there is no build here to choose.  The first fetch that fails stops
+-- the command, as a build stops, and so does the first substitution that
+-- fails, as upstream's goal for substituting a path fails when a
+-- substituter fails, whatever @fallback@ says (@PathSubstitutionGoal::init@,
+-- substitution-goal.cc:142-159 at 2.24.9): @--fallback@ passes over only
+-- a cache that cannot be asked, there (:91-94) and here.  An input no
+-- cache holds is one the report names as not read.
 fetchAndScan :: NixConfig -> CliOpts -> Store -> [(DepNode, StorePath)] -> IO (Map.Map StorePath ContentFacts)
 fetchAndScan config opts store inputs = do
-  mapM_ fetch [node | (node, _) <- inputs, fetchedByBuiltin (dnDerivation node)]
+  mapM_ (fetch . fst) fetched
+  mapM_ (substitute . snd) others
   Map.fromList . catMaybes <$> traverse scan inputs
   where
+    (fetched, others) = partition (fetchedByBuiltin . dnDerivation . fst) inputs
     buildConfig =
       (defaultBuildConfig (stDir store))
         { bcCaches = resolveCaches config (optSubstituter opts) (optTrustedKey opts),
@@ -539,6 +551,14 @@ fetchAndScan config opts store inputs = do
       case result of
         BuildSuccess _ -> pure ()
         BuildFailure msg _ -> failWith ("trust: " <> msg)
+    substitute output = do
+      outcome <- substituteFromCaches buildConfig store [output]
+      case outcome of
+        ClosureComplete -> pure ()
+        ClosureUnavailable -> pure ()
+        ClosureIncomplete -> pure ()
+        ClosureFailed -> failWith ("trust: a substitute for '" <> storePathToText defaultStoreDir output <> "' or a path it references failed")
+        ClosureQueryFailed failure -> failWith ("trust: " <> failure)
     scan (_, output) = do
       held <- isValid store output
       if held

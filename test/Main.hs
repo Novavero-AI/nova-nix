@@ -55,7 +55,7 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substituteFromCaches, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.BuildDir (buildDirFor, createBuildDir)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
@@ -12702,6 +12702,50 @@ testSubstituterRetry = do
       | path == narPath = narReply earlier
       | otherwise = Send (httpResponse "500 Internal Server Error" "unexpected request")
 
+-- | 'substituteFromCaches' against a loopback cache holding a path and
+-- the one path it references: the reference arrives first, so the path's
+-- registration finds it valid.  'substitutePaths' fetches only the paths
+-- it is given, and the store refuses to register a path whose reference
+-- is not valid.
+testSubstituteFromCaches :: IO [Bool]
+testSubstituteFromCaches = do
+  putStrLn "builder/substitute-from-caches"
+  tmpBase <- getTemporaryDirectory
+  let dep = StorePath (T.replicate 32 "c") "dep"
+      top = StorePath (T.replicate 32 "d") "top"
+      depNar = NAR.serialise (NAR.NarRegular False "dep\n")
+      topNar = NAR.serialise (NAR.NarRegular False "top\n")
+      narInfoTarget out = "/" <> TE.encodeUtf8 (spHash out) <> ".narinfo"
+  case (,) <$> signedTestNarInfo dep [] "nar/dep.nar" depNar <*> signedTestNarInfo top [dep] "nar/top.nar" topNar of
+    Left err -> (: []) <$> runTest "substitute-from-caches setup" (Fail (T.pack err))
+    Right ((key, depNarInfo), (_, topNarInfo)) -> do
+      let route target _
+            | target == narInfoTarget dep = Send (httpResponse "200 OK" (TE.encodeUtf8 depNarInfo))
+            | target == "/nar/dep.nar" = Send (httpResponse "200 OK" depNar)
+            | target == narInfoTarget top = Send (httpResponse "200 OK" (TE.encodeUtf8 topNarInfo))
+            | target == "/nar/top.nar" = Send (httpResponse "200 OK" topNar)
+            | otherwise = Send (httpResponse "404 Not Found" "")
+          -- What a substitution returns, and whether each path is valid
+          -- after it, in a store of its own.
+          substituted :: String -> (BuildConfig -> Store -> IO outcome) -> IO (outcome, [Bool])
+          substituted label substitute =
+            withHttpServer route $ \base _ _ -> do
+              let root = tmpBase </> ("nova-nix-test-substitute-from-caches-" ++ label)
+                  config = (defaultBuildConfig (StoreDir root)) {bcCaches = [Subst.CacheConfig base [key] 40]}
+              bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
+                bracket (openStore (StoreDir root)) closeStore $ \store -> do
+                  outcome <- substitute config store
+                  valid <- mapM (isValid store) [dep, top]
+                  pure (outcome, valid)
+      sequence
+        [ runTestM "substituting a path from the caches fetches what it references first" $
+            assertEqual "outcome and validity" (Realise.ClosureComplete, [True, True])
+              <$> substituted "closure" (\config store -> substituteFromCaches config store [top]),
+          runTestM "substituting the path alone is refused, since what it references is not valid" $
+            assertEqual "outcome and validity" (Realise.FetchFailed, [False, False])
+              <$> substituted "alone" (\config store -> substitutePaths config store [top])
+        ]
+
 -- | @pkgs/windows/fetchurl.nix@ evaluated from the checkout.  The
 -- @mirror://@ expansion is what a source derivation records, so a
 -- mirrors.nix refresh or a regex edit moves every drvPath built on it;
@@ -19013,8 +19057,10 @@ testTrustScanIO = do
 -- | @trust@ end to end: a derivation built by a seed a loopback server
 -- serves, taking an archive it serves too, both fetched by
 -- builtin:fetchurl into a store of the run's own, scanned, and reported,
--- and a fixed-output derivation whose builder is a host program, which
--- trust must not build.
+-- and two fixed-output derivations whose builder is a host program, which
+-- trust must not build: one the server holds as a binary cache, which is
+-- substituted and scanned, and one it does not, which is not read.  Each
+-- host program fails if it runs, and a failed build stops the command.
 testTrustCLI :: IO [Bool]
 testTrustCLI = do
   putStrLn "cli/trust"
@@ -19023,10 +19069,8 @@ testTrustCLI = do
   let root = tmpBase </> "nova-nix-test-cli-trust"
       archive = BL.toStrict (GZip.compress (Tar.write [tarFile "tool/bin/tool.exe" (BL.fromStrict trustPe), tarFile "tool/bin/run.sh" "#!/bin/sh\necho hi\n"]))
       madeBytes = "what a host program would make\n" :: BS.ByteString
-      route target _ = case target of
-        "/seed" -> Send (httpResponse "200 OK" trustPe)
-        "/archive" -> Send (httpResponse "200 OK" archive)
-        _ -> Send (httpResponse "404 Not Found" "missing")
+      unheldBytes = "what no cache holds\n" :: BS.ByteString
+      madeNar = NAR.serialise (NAR.NarRegular False madeBytes)
       isolatedEnv =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
           : ("NIX_CONF_DIR", root </> "system")
@@ -19035,26 +19079,42 @@ testTrustCLI = do
       fixedAttrs bytes = "outputHashMode = \"flat\"; outputHashAlgo = \"sha256\"; outputHash = \"" <> Hash.bytesToHexText (sha256Digest bytes) <> "\";"
       fetch base name target bytes =
         "derivation { name = \"" <> name <> "\"; url = \"" <> base <> target <> "\"; system = \"builtin\"; builder = \"builtin:fetchurl\"; " <> fixedAttrs bytes <> " }"
+      hostBuilt name bytes =
+        "derivation { name = \"" <> name <> "\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"exit 1\" ]; " <> fixedAttrs bytes <> " }"
       expression base =
         "let seed = "
           <> fetch base "seed.exe" "/seed" trustPe
           <> "; archive = "
           <> fetch base "tool.tar.gz" "/archive" archive
-          <> "; made = derivation { name = \"made.txt\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"exit 1\" ]; "
-          <> fixedAttrs madeBytes
-          <> " }; in derivation { name = \"tool\"; system = \"x86_64-linux\"; builder = \"${seed}\"; args = [ \"${archive}\" \"${made}\" ]; }"
+          <> "; made = "
+          <> hostBuilt "made.txt" madeBytes
+          <> "; unheld = "
+          <> hostBuilt "unheld.txt" unheldBytes
+          <> "; in derivation { name = \"tool\"; system = \"x86_64-linux\"; builder = \"${seed}\"; args = [ \"${archive}\" \"${made}\" \"${unheld}\" ]; }"
+      narInfoTarget out = "/" <> TE.encodeUtf8 (spHash out) <> ".narinfo"
   seedOut <- either (fail . show) pure (makeFixedOutputPath "seed.exe" "sha256" "flat" (sha256Digest trustPe))
   archiveOut <- either (fail . show) pure (makeFixedOutputPath "tool.tar.gz" "sha256" "flat" (sha256Digest archive))
   madeOut <- either (fail . show) pure (makeFixedOutputPath "made.txt" "sha256" "flat" (sha256Digest madeBytes))
-  (code, out, err) <-
+  unheldOut <- either (fail . show) pure (makeFixedOutputPath "unheld.txt" "sha256" "flat" (sha256Digest unheldBytes))
+  (trustedKey, madeNarInfo) <- either fail pure (signedTestNarInfo madeOut [] "nar/made.nar" madeNar)
+  let route target _
+        | target == "/seed" = Send (httpResponse "200 OK" trustPe)
+        | target == "/archive" = Send (httpResponse "200 OK" archive)
+        | target == narInfoTarget madeOut = Send (httpResponse "200 OK" (TE.encodeUtf8 madeNarInfo))
+        | target == "/nar/made.nar" = Send (httpResponse "200 OK" madeNar)
+        | otherwise = Send (httpResponse "404 Not Found" "missing")
+  (code, out, err, seen) <-
     bracket_ (forceRemoveIfExists root >> createDirectoryIfMissing True root) (forceRemoveIfExists root) $
-      withHttpServer route $ \base _ _ ->
-        Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "trust", "--store", root </> "store", "--expr", T.unpack (expression base)]) {Proc.env = Just isolatedEnv})
-          ""
+      withHttpServer route $ \base requests _ -> do
+        (code, out, err) <-
+          Proc.readCreateProcessWithExitCode
+            ((Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "trust", "--store", root </> "store", "--substituter", T.unpack base, "--trusted-key", T.unpack trustedKey, "--expr", T.unpack (expression base)]) {Proc.env = Just isolatedEnv})
+            ""
+        (,,,) code out err <$> requests
   let path = storePathToText defaultStoreDir
+      asked = [narInfoTarget madeOut, "/nar/made.nar", narInfoTarget unheldOut]
   sequence
-    [ runTest "trust fetches what a builtin fetches, scans it, reports the seed run as a builder, and builds nothing else" $
+    [ runTest "trust fetches what a builtin fetches, substitutes what a cache holds, scans both, and builds nothing" $
         case code of
           ExitSuccess ->
             assertEqual
@@ -19069,12 +19129,12 @@ testTrustCLI = do
                 "    fetched by builtin:fetchurl",
                 "    PE image: tool/bin/tool.exe",
                 "Fixed-output inputs not fully read: 1",
-                "  " <> path madeOut,
+                "  " <> path unheldOut,
                 "    built in the closure by /bin/sh, its bytes pinned by its hash",
                 "    not read: the store does not hold it",
-                "Fixed-output inputs holding no prebuilt code: 0",
+                "Fixed-output inputs holding no prebuilt code: 1",
                 "Builders outside the closure: 1",
-                "  /bin/sh, for 1 derivation",
+                "  /bin/sh, for 2 derivations",
                 "Builders in input sources: 0",
                 "Builtin builders: 1",
                 "  builtin:fetchurl, for 2 derivations",
@@ -19082,7 +19142,9 @@ testTrustCLI = do
                 "This reports what the closure relies on, not whether any of it is safe."
               ]
               (map (T.filter (/= '\r')) (T.lines (T.pack out)))
-          _ -> Fail ("exited " <> T.pack (show code) <> ": " <> T.pack err)
+          _ -> Fail ("exited " <> T.pack (show code) <> ": " <> T.pack err),
+      runTest "trust asks the caches for each input no builtin fetches before it reports one as not read" $
+        assertEqual "requests" (sort asked) (sort (nub (filter (`elem` asked) seen)))
     ]
 
 -- | The closures of @pkgs/windows@'s stage0-pe32 kaem and GNU Hello as
@@ -21718,6 +21780,31 @@ sigTestKeyText, sigTestWrongKeyText :: Text
 sigTestKeyText = "test-key-1:" <> B64.encode (BS.pack ([1 .. 32] ++ replicate 32 0))
 sigTestWrongKeyText = "test-key-1:" <> B64.encode (BS.pack ([101 .. 132] ++ replicate 32 0))
 
+-- | The narinfo of a path whose NAR is these bytes, served uncompressed
+-- at this URL and naming these references, signed by 'sigTestKeyText',
+-- with the public key that verifies it.  Left on any setup failure.
+signedTestNarInfo :: StorePath -> [StorePath] -> Text -> BS.ByteString -> Either String (Text, Text)
+signedTestNarInfo path references url nar = do
+  secretKey <- Signing.parseSecretKey sigTestKeyText
+  publicKey <- Signing.toPublicKey secretKey
+  sig <- Signing.sign secretKey unsigned
+  pure (Signing.renderPublicKey publicKey, NarInfo.renderNarInfo unsigned {NarInfo.niSigs = [sig]})
+  where
+    unsigned =
+      NarInfo.NarInfo
+        { NarInfo.niStorePath = storePathToText defaultStoreDir path,
+          NarInfo.niUrl = url,
+          NarInfo.niCompression = "none",
+          NarInfo.niFileHash = Nothing,
+          NarInfo.niFileSize = Nothing,
+          NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes nar),
+          NarInfo.niNarSize = fromIntegral (BS.length nar),
+          NarInfo.niReferences = map storePathBasename references,
+          NarInfo.niDeriver = Nothing,
+          NarInfo.niSigs = [],
+          NarInfo.niCA = Nothing
+        }
+
 -- | Derive (trusted cache, signature by the trusted key, signature by an
 -- impostor key with the same name).  Left on any setup failure.
 sigTestSetup :: Either String (Subst.CacheConfig, Text, Text)
@@ -22691,6 +22778,7 @@ runSuite = do
           testHashHelpers,
           testFetchMirrors,
           testSubstituterRetry,
+          testSubstituteFromCaches,
           testPkgsFetchurl,
           testStage0Pe32Chain,
           testTrustWindowsGraphs,
