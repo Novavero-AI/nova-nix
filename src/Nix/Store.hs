@@ -9,8 +9,9 @@
 -- 1. Builder runs in a temp directory, produces output files
 -- 2. Output is scanned for references to other store paths
 -- 3. Output is moved to @\/nix\/store\/\<hash\>-\<name\>@
--- 4. Path is registered in the SQLite DB with its references
--- 5. Directory permissions set to read-only (immutability)
+-- 4. Its files' modes and times are made canonical: read-only, and one
+--    modification time ("Nix.Store.Metadata")
+-- 5. Path is registered in the SQLite DB with its references
 --
 -- When Nix SUBSTITUTES (downloads from a binary cache):
 --
@@ -18,8 +19,9 @@
 -- 2. Fetch the @.nar.xz@ file
 -- 3. Verify file hash matches narinfo
 -- 4. Decompress and unpack NAR into store path
--- 5. Verify NAR hash matches narinfo
--- 6. Register path in DB with references from narinfo
+-- 5. Make its files' modes and times canonical, as a build's
+-- 6. Verify NAR hash matches narinfo
+-- 7. Register path in DB with references from narinfo
 --
 -- Both paths end the same way: a registered, immutable store path.
 --
@@ -52,7 +54,7 @@ module Nix.Store
     rewriteBytes,
     rewriteStoreHashes,
     scanReferences,
-    setReadOnly,
+    canonicalizeMetadata,
     unpackNarEntry,
     writeDrv,
     writeDrvAterm,
@@ -111,6 +113,7 @@ import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.GC
 import Nix.Store.Handle
 import Nix.Store.Lock
+import Nix.Store.Metadata (canonicalizeMetadata)
 import Nix.Store.Path
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode, createSymlinkOfKind)
 import Nix.Store.Upstream
@@ -179,8 +182,8 @@ resolveDeleteTarget storeDir raw = storeEntryName basename >>= underThisStore
 -- Store operations
 -- ---------------------------------------------------------------------------
 
--- | Move a build output (file or directory) to the store path, set read-only,
--- and register.
+-- | Move a build output (file or directory) to the store path, make its
+-- metadata canonical ('canonicalizeMetadata'), and register.
 --
 -- If @renamePath@ fails (cross-device move), falls back to copy + remove.
 addToStore ::
@@ -194,8 +197,9 @@ addToStore store srcPath sp deriver refs = do
   reg <- placeInStore store srcPath sp deriver refs
   registerPath (stDB store) reg
 
--- | Move a build output into the store (read-only) and compute its
--- registration (NAR hash, size, references) WITHOUT writing to the database.
+-- | Move a build output into the store, make its metadata canonical
+-- ('canonicalizeMetadata'), and compute its registration (NAR hash, size,
+-- references) WITHOUT writing to the database.
 --
 -- Splitting placement from registration lets a multi-output build place every
 -- output first and then register them together, so intra-derivation
@@ -210,7 +214,7 @@ placeInStore ::
 placeInStore store srcPath sp deriver refs = do
   let destPath = storePathToFilePath (stDir store) sp
   moveOutput srcPath destPath
-  setReadOnly destPath
+  canonicalizeMetadata destPath
   registrationFor store sp deriver refs
 
 -- | Compute the registration metadata for a store path already present on
@@ -392,43 +396,28 @@ foldlIO z (x : xs) f = do
   !acc <- f z x
   foldlIO acc xs f
 
--- | Recursively mark a store path and its contents read-only after a build.
---
--- On Windows the directory read-only attribute does not prevent adding or
--- removing entries - only the per-file read-only attribute protects a file.
--- Immutability here is therefore enforced at FILE granularity (every file is
--- made read-only); hardening the directory itself against entry changes would
--- require ACLs and is deferred.
-setReadOnly :: FilePath -> IO ()
-setReadOnly path = do
-  node <- classifyWalkNode path
-  case node of
-    -- A symlink is a leaf: descending would mark content outside the
-    -- tree (or loop on a link cycle), and a permission change applied
-    -- to the link resolves through to its target.
-    WalkSymlink -> pure ()
-    WalkDirectory -> do
-      entries <- listDirectory path
-      mapM_ (setReadOnly . (path </>)) entries
-      perms <- Dir.getPermissions path
-      Dir.setPermissions path (Dir.setOwnerWritable False perms)
-    WalkRegular -> do
-      perms <- Dir.getPermissions path
-      setPermissions path (Dir.setOwnerWritable False perms)
-    WalkAbsent -> pure ()
-
--- | Write an already-serialized derivation ATerm to its store path.  Used to
+-- | Write an already-serialized derivation ATerm to its store path and make
+-- its metadata canonical ('canonicalizeMetadata'), as upstream's
+-- @writeDerivation@ adds a @.drv@ through @addToStoreFromDump@
+-- (derivations.cc:137-157 and local-store.cc:1342 at 2.24.9).  Used to
 -- materialize the input @.drv@ closure (root plus every transitive input)
 -- before a dependency-aware build: evaluation computes these ATerms but does
--- no store IO, so the build driver writes them here.
+-- no store IO, so the build driver writes them here.  A file that already
+-- holds exactly these bytes is kept as it is, read-only from the write that
+-- made it; one holding anything else, which an interrupted write can leave,
+-- is replaced.
 writeDrvAterm :: Store -> StorePath -> BS.ByteString -> IO ()
 writeDrvAterm store sp aterm = do
   let destPath = storePathToFilePath (stDir store) sp
   createDirectoryIfMissing True (unStoreDir (stDir store))
-  -- Raw bytes, not text-mode IO: the path was computed from exactly these
-  -- bytes, and a locale-dependent or newline-translating write would store
-  -- bytes that no longer match their content address.
-  BS.writeFile destPath aterm
+  existing <- try (BS.readFile destPath)
+  unless (either (\(_ :: IOException) -> False) (== aterm) existing) $ do
+    Dir.removePathForcibly destPath
+    -- Raw bytes, not text-mode IO: the path was computed from exactly these
+    -- bytes, and a locale-dependent or newline-translating write would store
+    -- bytes that no longer match their content address.
+    BS.writeFile destPath aterm
+  canonicalizeMetadata destPath
 
 -- | Serialize a derivation to ATerm, write it to the store, and register
 -- it: a @.drv@ is a store object like any other, so it gets a ValidPaths
@@ -994,9 +983,10 @@ sinkNarStream sink source = go Hash.hashInit 0 Stream.narStream `onException` ab
 -- The evaluator's source-path cache maps each coerced filesystem path to
 -- its @source@ fixed-output store path (text only - eval performs no
 -- store writes).  Each entry not already valid is restored from a dump
--- of its source ('restoreSource'), made read-only, and registered.  A
--- source carries no references.  A store upstream Nix's database may
--- also manage is refused before any entry is looked at, by an
+-- of its source ('restoreSource'), its metadata made canonical
+-- ('canonicalizeMetadata'), and registered.  A source carries no
+-- references.  A store upstream Nix's database may also manage is
+-- refused before any entry is looked at, by an
 -- 'IOException' carrying the reason ("Nix.Store.Upstream"): a tree on
 -- disk with no row here is cleared unless it reproduces its address.
 materializeEvalSources :: Store -> Map Text Text -> IO ()
@@ -1009,9 +999,11 @@ materializeEvalSources store sourceCache = do
     -- on disk is adopted only after verification: its NAR digest must
     -- reproduce the store path being registered - an interrupted earlier
     -- restore leaves a partial tree, and registering it as-is validates
-    -- content that does not match its address.  A verified adoption never
-    -- touches the files (rewriting a read-only tree fails on Windows and
-    -- would wedge the store permanently); a failed one clears and
+    -- content that does not match its address.  A verified adoption keeps
+    -- the files' bytes (rewriting a read-only tree fails on Windows and
+    -- would wedge the store permanently) and has only their metadata made
+    -- canonical, since the tree may be one a restore left before it got
+    -- that far, or one an evaluation wrote; a failed one clears and
     -- restores.  Mirrors the builder's own prepareOutput recovery.
     -- The whole check-then-act runs under the path's cross-process
     -- lock, validity re-checked once held: without it, two processes
@@ -1029,7 +1021,7 @@ materializeEvalSources store sourceCache = do
             adoptable <- if onDisk then adoptedTreeMatches (stCaseSensitivity store) dest sp else pure False
             reg <-
               if adoptable
-                then registrationFor store sp Nothing []
+                then canonicalizeMetadata dest >> registrationFor store sp Nothing []
                 else do
                   when onDisk (Dir.removePathForcibly dest)
                   restoreSource store (T.unpack rawPath) sp >>= either (refuse spText) pure
@@ -1074,7 +1066,7 @@ restoreSource store src sp = do
               finished <- finishNarUnpack sink
               either (pure . Left) (const (sealAndRecheck digest size)) finished
     sealAndRecheck digest size = do
-      setReadOnly dest
+      canonicalizeMetadata dest
       onDisk <- ExecBit.narHashOfPath (volumeCaseHack (stCaseSensitivity store)) dest
       pure $
         if onDisk /= digest
@@ -1095,9 +1087,10 @@ recursiveDigestNames :: StorePath -> Hash.NixHash -> Bool
 recursiveDigestNames sp (Hash.NixHash digest) =
   makeFixedOutputPath (spName sp) "sha256" "recursive" digest == Right sp
 
--- | Register the store objects evaluation wrote: makes each read-only
--- and records it in the DB.  Batched so a write referring to another
--- resolves.  Covers every eval-time writer, not only @builtins.toFile@:
+-- | Register the store objects evaluation wrote: makes each one's
+-- metadata canonical ('canonicalizeMetadata') and records it in the DB.
+-- Batched so a write referring to another resolves.  Covers every
+-- eval-time writer, not only @builtins.toFile@:
 -- an unregistered write reaches @drvInputSrcs@ and fails the build.
 materializeEvalStoreWrites :: Store -> Map Text ([StorePath], StoreWriteMode) -> IO ()
 materializeEvalStoreWrites store storeWrites = do
@@ -1128,7 +1121,7 @@ materializeEvalStoreWrites store storeWrites = do
                   -- write time; a mismatch here means the tree changed
                   -- between evaluation and registration, and registering
                   -- it would record a hash its bytes do not have, then
-                  -- seal the lie read-only.  Refuse loudly instead.
+                  -- seal the lie.  Refuse loudly instead.
                   reproduces <- writeReproducesPath (stCaseSensitivity store) dest sp refs mode
                   unless reproduces $
                     throwIO
@@ -1139,7 +1132,7 @@ materializeEvalStoreWrites store storeWrites = do
                               <> "delete the path and re-evaluate"
                           )
                       )
-                  setReadOnly dest
+                  canonicalizeMetadata dest
                   Just <$> registrationFor store sp Nothing refs
 
 -- | Whether on-disk content re-derives exactly the store path it is
