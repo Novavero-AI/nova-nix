@@ -3463,6 +3463,25 @@ testDerivationFields = do
       fails "an empty builder is refused as absent" (drvWith "name = \"a\"; system = \"x\"; builder = \"\";") "required attribute 'builder' missing",
       fails "an empty system is refused as absent" (drvWith "name = \"a\"; system = \"\"; builder = \"/bin/sh\";") "required attribute 'system' missing",
       fails "the builder is checked before the system" (drvWith "name = \"a\";") "required attribute 'builder' missing",
+      -- Upstream forces every attribute in name order, reading args, the
+      -- builder, the system and the outputs at their keys, and looks for
+      -- the builder and the system only after that pass
+      -- (derivationStrictInternal, primops.cc at 2.24.9), so the first
+      -- attribute by name that fails is the failure.
+      fails "a throw sorting before the system wins over its absence" (drvWith "name = \"w\"; builder = \"b\"; all = throw \"all\";") "all",
+      fails "a throw sorting after the system wins over its absence" (drvWith "name = \"w\"; builder = \"b\"; zz = throw \"zz\";") "zz",
+      fails "a throw sorting before the outputs wins over a repeated output" (drvWith ("name = \"w\"; " <> plain <> " outputs = [ \"out\" \"out\" ]; foo = throw \"foo\";")) "foo",
+      fails "a repeated output wins over a throw sorting after the outputs" (drvWith ("name = \"w\"; " <> plain <> " outputs = [ \"out\" \"out\" ]; zz = throw \"zz\";")) "duplicate derivation output 'out'",
+      fails "a throw sorting before args wins over args" (drvWith ("name = \"w\"; " <> plain <> " aa = throw \"aa\"; args = throw \"args\";")) "aa",
+      fails "args is read at its key, before the outputs" (drvWith ("name = \"w\"; " <> plain <> " args = [ (throw \"arg\") ]; outputs = [ \"out\" \"out\" ];")) "arg",
+      fails "a throwing builder wins over a throwing system" (drvWith "name = \"w\"; builder = throw \"builder\"; system = throw \"system\";") "builder",
+      fails "a structured derivation is read in the same order" (drvWith "name = \"w\"; builder = \"b\"; __structuredAttrs = true; all = throw \"all\";") "all",
+      -- Upstream splits the outputs entry at whitespace (tokenizeString).
+      runTest "an environment's outputs are the words of its entry" $
+        assertEval
+          "outputs-words"
+          "builtins.toJSON (builtins.attrNames (derivationStrict { name = \"w\"; system = \"x\"; builder = \"/bin/sh\"; outputs = \" out\\tdev \"; }))"
+          (mkStr "[\"dev\",\"drvPath\",\"out\"]"),
       fails "an empty name is invalid" (drvWith ("name = \"\"; " <> plain)) "invalid derivation name: name must not be empty. Please pass a different 'name'.",
       fails "a dot name is invalid" (drvWith ("name = \".\"; " <> plain)) "invalid derivation name: name '.' is not valid. Please pass a different 'name'.",
       fails "a dot component is invalid" (drvWith ("name = \".-a\"; " <> plain)) "invalid derivation name: name '.-a' is not valid: first dash-separated component must not be '.'. Please pass a different 'name'.",

@@ -112,6 +112,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
 import Data.List (partition, sort, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, maybeToList)
@@ -4489,9 +4490,6 @@ builtinDerivationStrict (VAttrs attrs) = do
   drvName <- nameTrace $ case attrSetLookup "name" attrs of
     Nothing -> throwEvalError "attribute 'name' missing"
     Just thunk -> decodedText "derivation" =<< structuredStringValue RefuseContext =<< force thunk
-  -- Upstream processes every other attribute inside a catch that names it
-  -- (derivationStrictInternal); an absent one has nothing to name.
-  let traceAttr key = traceIfPresent attrs key (derivationAttrTrace drvName key)
   -- The name becomes the store-path name of the .drv and of every output,
   -- so it must satisfy the store-path name rules.  The path constructors
   -- re-check what they build; this early check reports the offending
@@ -4503,123 +4501,29 @@ builtinDerivationStrict (VAttrs attrs) = do
   passing <-
     addErrorTrace "while evaluating the `__structuredAttrs` attribute passed to builtins.derivationStrict" $
       attrPassingOf attrs
-  let fieldContext = "derivation \"" <> drvName <> "\""
-      optionalCoerced key =
-        traverse (\thunk -> fst <$> (coerceToString True force applyValue coercePathToStore =<< force thunk)) (attrSetLookup key attrs)
-      optionalString rule key = traverse (force >=> structuredStringValue rule) (attrSetLookup key attrs)
-      -- Upstream checks both once its attribute loop is done, the builder
-      -- first, and an empty one counts as absent (primops.cc:1403).
-      requiredFields (systemValue, builderValue) = do
-        builderBytes <- required "builder" builderValue
-        systemBytes <- required "system" systemValue
-        systemText <- decodedText fieldContext systemBytes
-        pure (systemText, builderBytes)
-      required key value = case value of
-        Just bytes | not (BS.null bytes) -> pure bytes
-        _ -> throwEvalError ("required attribute '" <> key <> "' missing")
-  -- A structured derivation's builder and system are read as strings
-  -- (upstream's forceString and forceStringNoCtx) rather than coerced.
-  -- Otherwise they are the strings their environment entries coerce to,
-  -- a path copied to the store (primops.cc:1347 at 2.24.9).
-  (system, builder) <- case passing of
-    PassAsEnvironment ->
-      requiredFields
-        =<< (,)
-          <$> traceAttr "system" (optionalCoerced "system")
-          <*> traceAttr "builder" (optionalCoerced "builder")
-    PassAsStructuredAttrs ->
-      requiredFields
-        =<< (,)
-          <$> traceAttr "system" (optionalString RefuseContext "system")
-          <*> traceAttr "builder" (optionalString AllowContext "builder")
-
   -- __ignoreNulls: when true, null-valued attrs are dropped from the
   -- derivation env (stdenv.mkDerivation sets it); when absent or false,
   -- null coerces to "" like any other coerceMore value - C++ Nix semantics.
-  ignoreNulls <- case attrSetLookup "__ignoreNulls" attrs of
-    Nothing -> pure False
+  nulls <- case attrSetLookup ignoreNullsFlag attrs of
+    Nothing -> pure KeepNullAttrs
     Just thunk ->
-      addErrorTrace "while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict" $
-        force thunk >>= expectDerivationBool
-
-  -- Extract optional outputs (default ["out"]).  Each refusal below names
-  -- the attribute, as upstream's handleOutputs runs inside its catch.
-  outputNames <- traceAttr "outputs" $ case attrSetLookup "outputs" attrs of
-    Nothing -> pure ["out"]
-    Just thunk -> do
-      val <- force thunk
-      case val of
-        VList cl -> case passing of
-          PassAsEnvironment -> mapM (forceToText . Thunk) (clistThunks cl)
-          PassAsStructuredAttrs -> mapM (structuredOutputName fieldContext . Thunk) (clistThunks cl)
-        -- A null outputs attr is dropped by __ignoreNulls, falling back to
-        -- the default output set; without it, null is an error as upstream.
-        VNull | ignoreNulls -> pure ["out"]
-        _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
-
-  -- Each output name composes into a store-path name (drvName-<output>)
-  -- and names the on-disk location the builder later clears and moves
-  -- onto, so it must satisfy the same store-path name rules (the
-  -- composed length is re-checked at construction).
-  traceAttr "outputs" $ forM_ outputNames $ \outName ->
-    case checkStorePathName outName of
-      Left err ->
-        throwEvalError
-          ( "derivation \""
-              <> drvName
-              <> "\": invalid derivation output name '"
-              <> outName
-              <> "': "
-              <> storePathNameReasonText (spneReason err)
-          )
-      Right () -> pure ()
-
-  -- Upstream's derivationStrict walks the output names in order and refuses
-  -- a repeated name and the name drvPath, which its result set already
-  -- carries, then refuses an empty list (primops.cc, handleOutputs in
-  -- derivationStrictInternal).
-  let checkOutputName seen outName
-        | Set.member outName seen = throwEvalError ("duplicate derivation output '" <> outName <> "'")
-        | outName == "drvPath" = throwEvalError "invalid derivation output name 'drvPath'"
-        | otherwise = pure (Set.insert outName seen)
-  traceAttr "outputs" $ do
-    foldM_ checkOutputName Set.empty outputNames
-    when (null outputNames) (throwEvalError "derivation cannot have an empty set of outputs")
-
-  -- Extract optional args (default []).  Path literals in args (e.g. stdenv's
-  -- ./default-builder.sh) are copied into the store; their source paths flow
-  -- into inputSrcs via the returned context.
-  (builderArgs, argsContext) <- traceAttr "args" $ case attrSetLookup "args" attrs of
-    Nothing -> pure ([], mempty)
-    Just thunk -> do
-      val <- force thunk
-      case val of
-        VList cl -> do
-          parts <- mapM (\t -> force (Thunk t) >>= coerceToStoreString) (clistThunks cl)
-          pure (map fst parts, mconcat (map snd parts))
-        VNull | ignoreNulls -> pure ([], mempty)
-        _ -> throwEvalError "derivation: 'args' must be a list of strings"
-
-  -- Materialize once, reuse for both env collection and result merge
-  let materialized = attrSetToMap attrs
-
-  -- Collect the attrs into the build env, EXCLUDING "args" (C++ Nix puts
-  -- args in the Derive() args field, never the env): one string-coerced
-  -- entry each, or one JSON object under __json for a structured
-  -- derivation.  The per-output env vars ($out, ...) are added below in
-  -- both modes.  Carries merged context.
-  let envAttrs = Map.delete "__ignoreNulls" (Map.delete "args" materialized)
-  (drvEnvPairs, envContext) <- case passing of
-    PassAsEnvironment -> collectDrvEnvWithContext drvName ignoreNulls envAttrs
+      addErrorTrace "while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict" $ do
+        ignore <- force thunk >>= expectDerivationBool
+        pure (if ignore then IgnoreNullAttrs else KeepNullAttrs)
+  let fieldContext = "derivation \"" <> drvName <> "\""
+      attrsInOrder = Map.toAscList (Map.delete ignoreNullsFlag (attrSetToMap attrs))
+  -- Each attribute is one environment entry, or one member of a single
+  -- JSON object under __json for a structured derivation.  The per-output
+  -- env vars ($out, ...) are added below in both modes.
+  (drvEnvPairs, fields) <- case passing of
+    PassAsEnvironment -> do
+      (entries, passed) <- derivationPass drvName nulls readEnvEntry attrsInOrder
+      pure (Map.toList entries, passed)
     PassAsStructuredAttrs -> do
-      (members, ctx) <- collectStructuredAttrs drvName ignoreNulls (Map.delete structuredAttrsFlag envAttrs)
-      forM_ (Map.keys (Map.restrictKeys members structuredPlainStrings)) $ \key ->
-        traceAttr key (structuredString RefuseContext fieldContext key attrs)
-      forM_ (Map.keys (Map.restrictKeys members structuredDisabledChecks)) $
-        traceMessage . disabledByStructuredAttrs drvName
-      pure ([(structuredAttrsKey, encodeStructuredAttrs (StructuredAttrs members))], ctx)
+      (members, passed) <- derivationPass drvName nulls (readStructuredEntry drvName fieldContext) attrsInOrder
+      pure ([(structuredAttrsKey, encodeStructuredAttrs (StructuredAttrs members))], passed)
 
-  let fullContext = envContext <> argsContext
+  let fullContext = dfContext fields
       builtInputDrvs = extractInputDrvs fullContext
       allOutputRefs = extractAllOutputRefs fullContext
   -- All-outputs (DrvDeep) references - e.g. an embedded @dep.drvPath@ - add
@@ -4632,7 +4536,16 @@ builtinDerivationStrict (VAttrs attrs) = do
   deepInputDrvs <-
     Map.fromList
       <$> mapM (\drvSp -> (,) drvSp <$> resolveAllOutputNames drvSp) (filter ((".drv" `T.isSuffixOf`) . spName) (Set.toList deepClosure))
-  let inputDrvs = Map.unionWith (++) builtInputDrvs deepInputDrvs
+  -- Upstream checks both once its pass and the closure are done, the
+  -- builder first, and an empty one counts as absent (primops.cc:1402-1411
+  -- at 2.24.9).
+  let requiredField key value = case value of
+        Just bytes | not (BS.null bytes) -> pure bytes
+        _ -> throwEvalError ("required attribute '" <> key <> "' missing")
+  builder <- requiredField builderAttr (dfBuilder fields)
+  system <- decodedText fieldContext =<< requiredField systemAttr (dfSystem fields)
+  let outputNames = NE.toList (dfOutputs fields)
+      inputDrvs = Map.unionWith (++) builtInputDrvs deepInputDrvs
       inputSrcs = Set.toList (Set.fromList (extractInputSrcs fullContext) <> deepClosure)
       platform = textToPlatform system
       baseEnv = Map.fromList drvEnvPairs
@@ -4646,7 +4559,7 @@ builtinDerivationStrict (VAttrs attrs) = do
             drvInputSrcs = inputSrcs,
             drvPlatform = platform,
             drvBuilder = builder,
-            drvArgs = builderArgs,
+            drvArgs = dfArgs fields,
             drvEnv = env
           }
       -- Output carrying only its name; the path is masked at render time.
@@ -4657,8 +4570,26 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- the modulo hashes of their inputs.
   mFixed <- detectFixedOutput attrs
 
+  -- Each output name composes into a store-path name (drvName-<output>)
+  -- and names the on-disk location the builder later clears and moves
+  -- onto, so it must satisfy the same store-path name rules.  Upstream
+  -- refuses such a name when it builds the output's path, past its pass
+  -- and its presence checks.
+  forM_ outputNames $ \outName ->
+    case checkStorePathName outName of
+      Left err ->
+        throwEvalError
+          ( "derivation \""
+              <> drvName
+              <> "\": invalid derivation output name '"
+              <> outName
+              <> "': "
+              <> storePathNameReasonText (spneReason err)
+          )
+      Right () -> pure ()
+
   -- Path construction returns Left on a name the store rules reject; the
-  -- early field checks above make that unreachable here except through
+  -- field checks above make that unreachable here except through
   -- composition (drvName <> ".drv", drvName-output past the length cap),
   -- which only the constructors see, and which they refuse in upstream's
   -- words, naming the path.
@@ -4785,40 +4716,157 @@ normalizeFixedHash ohash ohAlgo = case hashSpelling ohash of
           throwEvalError
             ("derivation: hash '" <> ohash <> "' should have type '" <> ohAlgo <> "', not '" <> embedded <> "'")
 
--- | Force a thunk to a Text string via full Nix coercion (strict decode:
--- used for output names, which are ASCII-shaped identity components).
-forceToText :: (MonadEval m) => Thunk -> m Text
-forceToText thunk = do
-  val <- force thunk
-  (s, _ctx) <- coerceToString True force applyValue coercePathVerbatim val
-  decodedText "derivation" s
+-- | Whether a derivation leaves its null attributes out (@__ignoreNulls@).
+data NullAttrs = KeepNullAttrs | IgnoreNullAttrs
 
--- | Collect all derivation attributes into env pairs via full Nix coercion
--- (__toString, outPath, list-to-space-separated-string), along with the
--- merged string context from all collected values.  Values are RAW BYTES:
--- they flow byte-exact into the ATerm env section (and its hash).
---
--- A coercion failure (a thrown attr value, an uncoercible function, a failed
--- import inside the value) fails the WHOLE derivation, as in C++ Nix.
--- Swallowing it silently produces a wrong .drv - this exact bug once turned
--- a seed derivation with 17 failed src attrs into an empty no-input drv that
--- "built" successfully.  Null attrs are dropped only under __ignoreNulls;
--- otherwise null coerces to @""@ like any other coerceMore value.
-collectDrvEnvWithContext :: (MonadEval m) => Text -> Bool -> Map Text Thunk -> m ([(Text, BS.ByteString)], StringContext)
-collectDrvEnvWithContext drvName ignoreNulls attrs = do
-  let pairs = Map.toList attrs
-  results <- mapM coerceEnvAttr pairs
-  let envPairs = catMaybes [fmap (\(k, v, _) -> (k, v)) r | r <- results]
-      mergedCtx = mconcat [ctx | Just (_, _, ctx) <- results]
-  pure (envPairs, mergedCtx)
+-- | The attribute choosing whether null attributes are left out.  Upstream
+-- reads it before its pass and leaves it out of the pass.
+ignoreNullsFlag :: Text
+ignoreNullsFlag = "__ignoreNulls"
+
+-- | The attributes derivationStrict reads at their keys.
+argsAttr, builderAttr, outputsAttr, systemAttr :: Text
+argsAttr = "args"
+builderAttr = "builder"
+outputsAttr = "outputs"
+systemAttr = "system"
+
+-- | What derivationStrict's pass does with an attribute once it is forced.
+data DrvAttrUse
+  = -- | @args@: the builder's command line, in neither the environment nor
+    -- the JSON object.
+    CommandLine
+  | -- | An environment entry or JSON member, which may also be read as one
+    -- of the derivation's fields.
+    Entry !DrvEntryRole
+
+-- | The field of a derivation an entry is read as, at its key.
+data DrvEntryRole = BuilderEntry | SystemEntry | OutputsEntry | PlainEntry
+
+-- | The use of the attribute at a key.
+drvAttrUse :: Text -> DrvAttrUse
+drvAttrUse key
+  | key == argsAttr = CommandLine
+  | key == builderAttr = Entry BuilderEntry
+  | key == systemAttr = Entry SystemEntry
+  | key == outputsAttr = Entry OutputsEntry
+  | otherwise = Entry PlainEntry
+
+-- | What derivationStrict's pass has read of a derivation's fields: the
+-- context every entry and argument carries, the builder, the system, the
+-- outputs and the builder's arguments.  The outputs are @out@ until an
+-- @outputs@ attribute names others, as upstream's set starts.
+data DrvFields = DrvFields
+  { dfContext :: !StringContext,
+    dfBuilder :: !(Maybe BS.ByteString),
+    dfSystem :: !(Maybe BS.ByteString),
+    dfOutputs :: !(NonEmpty Text),
+    dfArgs :: ![BS.ByteString]
+  }
+
+-- | Upstream's one pass over a derivation's attributes (primops.cc:1225-1365
+-- at 2.24.9), given in name order: each is forced, a null one is left out
+-- under @__ignoreNulls@, @args@ is read as the builder's command line, and
+-- every other one is read by the mode's reader into its entry and any
+-- field it is at the key of.  Each attribute is processed under upstream's
+-- line naming it, and a failure fails the whole derivation, so the first
+-- attribute by name that fails is the failure, whatever a later one holds.
+derivationPass ::
+  (MonadEval m) =>
+  Text ->
+  NullAttrs ->
+  (DrvEntryRole -> Text -> NixValue -> DrvFields -> m (Maybe entry, DrvFields)) ->
+  [(Text, Thunk)] ->
+  m (Map Text entry, DrvFields)
+derivationPass drvName nulls readEntry = foldM step (Map.empty, initial)
   where
-    coerceEnvAttr (key, thunk) = addErrorTrace (derivationAttrTrace drvName key) $ do
+    initial = DrvFields mempty Nothing Nothing ("out" :| []) []
+    step (!entries, !fields) (key, thunk) = addErrorTrace (derivationAttrTrace drvName key) $ do
       val <- force thunk
-      case val of
-        VNull | ignoreNulls -> pure Nothing
-        _ -> do
-          (s, ctx) <- coerceToStoreString val
-          pure (Just (key, s, ctx))
+      case (val, nulls, drvAttrUse key) of
+        (VNull, IgnoreNullAttrs, _) -> pure (entries, fields)
+        (_, _, CommandLine) -> (,) entries <$> readCommandLine val fields
+        (_, _, Entry role) -> do
+          (entry, updated) <- readEntry role key val fields
+          pure (maybe entries (\e -> Map.insert key e entries) entry, updated)
+
+-- | @args@, each element coerced as an environment entry is (primops.cc:1293
+-- at 2.24.9).  A path in it (stdenv's ./default-builder.sh, say) is copied
+-- into the store, and its store path reaches inputSrcs through the
+-- context.
+readCommandLine :: (MonadEval m) => NixValue -> DrvFields -> m DrvFields
+readCommandLine val fields = case val of
+  VList cl -> do
+    parts <- mapM (force . Thunk >=> coerceToStoreString) (clistThunks cl)
+    pure fields {dfArgs = map fst parts, dfContext = dfContext fields <> foldMap snd parts}
+  _ -> throwEvalError "derivation: 'args' must be a list of strings"
+
+-- | An entry of a derivation that passes its attributes through its
+-- environment: the string upstream's @coerceToString@ makes of the value
+-- with @coerceMore@, a path copied to the store, whose bytes flow
+-- byte-exact into the ATerm env section (and its hash).  That string is
+-- the builder, the system or the outputs at those keys, the outputs split
+-- at whitespace (primops.cc:1346-1356 at 2.24.9).
+readEnvEntry :: (MonadEval m) => DrvEntryRole -> Text -> NixValue -> DrvFields -> m (Maybe BS.ByteString, DrvFields)
+readEnvEntry role _ val fields = do
+  (bytes, ctx) <- coerceToStoreString val
+  let entered = fields {dfContext = dfContext fields <> ctx}
+  updated <- case role of
+    BuilderEntry -> pure entered {dfBuilder = Just bytes}
+    SystemEntry -> pure entered {dfSystem = Just bytes}
+    OutputsEntry -> do
+      outputs <- checkedOutputs =<< traverse (decodedText "derivation") (outputTokens bytes)
+      pure entered {dfOutputs = outputs}
+    PlainEntry -> pure entered
+  pure (Just bytes, updated)
+
+-- | An entry of a structured derivation: a member of its JSON object,
+-- converted as @builtins.toJSON@ converts it (upstream calls the same
+-- @printValueAsJSON@), with the builder (and its context), the system,
+-- the outputs and the fixed-output fields read as strings at their keys,
+-- never as values coerced to them (primops.cc:1307-1345 at 2.24.9).  The
+-- attribute that chooses structured attributes has no member.
+readStructuredEntry :: (MonadEval m) => Text -> Text -> DrvEntryRole -> Text -> NixValue -> DrvFields -> m (Maybe Json, DrvFields)
+readStructuredEntry drvName fieldContext role key val fields
+  | key == structuredAttrsFlag = pure (Nothing, fields)
+  | otherwise = do
+      (json, ctx) <- valueToJSON val
+      let entered = fields {dfContext = dfContext fields <> ctx}
+      updated <- case role of
+        BuilderEntry -> (\bytes -> entered {dfBuilder = Just bytes}) <$> structuredStringValue AllowContext val
+        SystemEntry -> (\bytes -> entered {dfSystem = Just bytes}) <$> structuredStringValue RefuseContext val
+        OutputsEntry -> case val of
+          VList cl -> do
+            outputs <- checkedOutputs =<< mapM (structuredOutputName fieldContext . Thunk) (clistThunks cl)
+            pure entered {dfOutputs = outputs}
+          _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
+        PlainEntry
+          | Set.member key structuredPlainStrings -> entered <$ structuredStringValue RefuseContext val
+          | otherwise -> pure entered
+      when (Set.member key structuredDisabledChecks) $
+        traceMessage (disabledByStructuredAttrs drvName key)
+      pure (Just json, updated)
+
+-- | Upstream's @handleOutputs@ (primops.cc:1247-1269 at 2.24.9): the names
+-- in order, a repeated name and the name drvPath refused, as the result
+-- set already carries a drvPath, then an empty list.
+checkedOutputs :: (MonadEval m) => [Text] -> m (NonEmpty Text)
+checkedOutputs names = do
+  foldM_ checkOutputName Set.empty names
+  maybe (throwEvalError "derivation cannot have an empty set of outputs") pure (NE.nonEmpty names)
+  where
+    checkOutputName seen outName
+      | Set.member outName seen = throwEvalError ("duplicate derivation output '" <> outName <> "'")
+      | outName == "drvPath" = throwEvalError "invalid derivation output name 'drvPath'"
+      | otherwise = pure (Set.insert outName seen)
+
+-- | The output names an environment's @outputs@ entry holds: its bytes
+-- split at the separators of upstream's @tokenizeString@ (util.hh:34 at
+-- 2.24.9), empty pieces dropped.
+outputTokens :: BS.ByteString -> [BS.ByteString]
+outputTokens = filter (not . BS.null) . BS.splitWith (`BS.elem` tokenSeparators)
+  where
+    tokenSeparators = BC.pack " \t\n\r"
 
 -- | How a derivation hands its attributes to the builder.
 data AttrPassing
@@ -4851,12 +4899,6 @@ data StringContextRule = AllowContext | RefuseContext
 
 -- | A string field of a structured derivation, as upstream reads it:
 -- a string, never a value coerced to one.
-structuredString :: (MonadEval m) => StringContextRule -> Text -> Text -> AttrSet -> m BS.ByteString
-structuredString rule fieldContext key attrs = case attrSetLookup key attrs of
-  Nothing -> throwEvalError (fieldContext <> ": missing required attribute '" <> key <> "'")
-  Just thunk -> force thunk >>= structuredStringValue rule
-
--- | 'structuredString' of a value already in hand.
 structuredStringValue :: (MonadEval m) => StringContextRule -> NixValue -> m BS.ByteString
 structuredStringValue rule val = case (val, rule) of
   (VStr s ctx, RefuseContext)
@@ -4902,25 +4944,6 @@ disabledByStructuredAttrs drvName key =
     <> "'; use 'outputChecks.<output>."
     <> key
     <> "' instead"
-
--- | Collect a structured derivation's attributes into the members of its
--- @__json@ object, each converted as @builtins.toJSON@ converts it (upstream
--- calls the same @printValueAsJSON@), with the merged context of every
--- string they hold.  Null attributes are dropped only under
--- @__ignoreNulls@, as in 'collectDrvEnvWithContext'.
-collectStructuredAttrs :: (MonadEval m) => Text -> Bool -> Map Text Thunk -> m (Map Text Json, StringContext)
-collectStructuredAttrs drvName ignoreNulls attrs = do
-  results <- mapM member (Map.toAscList attrs)
-  let members = catMaybes results
-  pure (Map.fromAscList [(key, json) | (key, json, _) <- members], mconcat [ctx | (_, _, ctx) <- members])
-  where
-    member (key, thunk) = addErrorTrace (derivationAttrTrace drvName key) $ do
-      val <- force thunk
-      case val of
-        VNull | ignoreNulls -> pure Nothing
-        _ -> do
-          (json, ctx) <- valueToJSON val
-          pure (Just (key, json, ctx))
 
 -- | Upstream's line of context for a failure processing one attribute of
 -- a derivation's argument set (derivationStrictInternal, primops.cc at
