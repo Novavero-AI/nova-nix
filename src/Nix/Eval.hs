@@ -1505,10 +1505,12 @@ applyBuiltin name taken takeArg = case builtinArgModes name of
 -- subsequent application - zero recompilation.  Both builtins compile
 -- the RAW pattern: match's whole-string requirement is a span check at
 -- match time, not textual @^...$@ anchoring, which would misparse a
--- top-level alternation (@^a|b$@ is @(^a)|(b$)@).
+-- top-level alternation (@^a|b$@ is @(^a)|(b$)@).  A pattern with
+-- context stays a string, which the builtin refuses once it has both
+-- arguments, as upstream's does: compiling it would drop the context.
 precompileArgs :: Text -> [BuiltinArg] -> [BuiltinArg]
-precompileArgs "match" [ArgForced (VStr pat _)] = compiledRegexArg pat
-precompileArgs "split" [ArgForced (VStr pat _)] = compiledRegexArg pat
+precompileArgs "match" [ArgForced (VStr pat ctx)] | contextIsEmpty ctx = compiledRegexArg pat
+precompileArgs "split" [ArgForced (VStr pat ctx)] | contextIsEmpty ctx = compiledRegexArg pat
 precompileArgs _ args = args
 
 -- | The single-element arg list for a regex builtin: the compiled pattern
@@ -2835,22 +2837,24 @@ cachedCompileRegex pat =
 -- Returns @null@ if no match, or a list of capture group strings
 -- (@null@ for non-participating groups).
 builtinMatch :: (MonadEval m) => NixValue -> NixValue -> m NixValue
--- Pre-compiled path: regex was compiled at partial-application time.
-builtinMatch (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
-  matchWithCompiled compiled str
--- Direct 2-arg call: use global compilation cache.
-builtinMatch (VStr regex _) (VStr str _) =
-  case cachedCompileRegex regex of
-    Nothing -> throwEvalError ("builtins.match: invalid regex: " <> bytesToTextLossy regex)
-    Just compiled -> matchWithCompiled compiled str
-builtinMatch (VStr _ _) other =
-  throwEvalError ("builtins.match: expected a string, got " <> typeName other)
-builtinMatch (VCompiledRegex _) other =
-  throwEvalError ("builtins.match: expected a string, got " <> typeName other)
-builtinMatch other _ =
-  throwEvalError ("builtins.match: expected a string (regex), got " <> typeName other)
+builtinMatch patternVal subject = do
+  compiled <- compiledPattern "builtins.match" patternVal
+  case subject of
+    VStr str _ -> matchWithCompiled compiled str
+    other -> throwEvalError ("builtins.match: expected a string, got " <> typeName other)
 
--- | Shared match logic for pre-compiled and freshly-compiled regex paths.
+-- | The pattern of @match@ or @split@, compiled: as 'precompileArgs' left
+-- it, or a string compiled now.  Upstream reads the pattern with
+-- @forceStringNoCtx@ and compiles it before it forces the subject
+-- (primops.cc:4216-4223 and :4293-4300 at 2.24.9), so a pattern with
+-- context is refused.
+compiledPattern :: (MonadEval m) => Text -> NixValue -> m RE.Regex
+compiledPattern _ (VCompiledRegex (CompiledRegex _ compiled)) = pure compiled
+compiledPattern reader patternVal = do
+  pat <- structuredStringValue RefuseContext patternVal
+  maybe (throwEvalError (reader <> ": invalid regex: " <> bytesToTextLossy pat)) pure (cachedCompileRegex pat)
+
+-- | The result of @match@ for a compiled pattern and a subject's bytes.
 --
 -- Whole-string semantics via a span check on the leftmost-longest match:
 -- if any whole-string match exists it starts at 0, and POSIX picks the
@@ -2878,27 +2882,20 @@ matchWithCompiled compiled str =
 -- Returns an alternating list of non-matched strings and match-group lists.
 -- Example: @split "(x)" "axbxc"@ yields @["a" ["x"] "b" ["x"] "c"]@
 builtinSplit :: (MonadEval m) => NixValue -> NixValue -> m NixValue
--- Pre-compiled path: regex was compiled at partial-application time.
-builtinSplit (VCompiledRegex (CompiledRegex _ compiled)) (VStr str _) =
-  splitWithCompiled compiled str
--- Direct 2-arg call: use global compilation cache.
-builtinSplit (VStr regex _) (VStr str _) =
-  case cachedCompileRegex regex of
-    Nothing -> throwEvalError ("builtins.split: invalid regex: " <> bytesToTextLossy regex)
-    Just compiled -> splitWithCompiled compiled str
-builtinSplit (VStr _ _) other =
-  throwEvalError ("builtins.split: expected a string, got " <> typeName other)
-builtinSplit (VCompiledRegex _) other =
-  throwEvalError ("builtins.split: expected a string, got " <> typeName other)
-builtinSplit other _ =
-  throwEvalError ("builtins.split: expected a string (regex), got " <> typeName other)
+builtinSplit patternVal subject = do
+  compiled <- compiledPattern "builtins.split" patternVal
+  case subject of
+    VStr str ctx -> pure (VList (clistFromThunks (map thunkToCPtr (splitPieces compiled str ctx))))
+    other -> throwEvalError ("builtins.split: expected a string, got " <> typeName other)
 
--- | Shared split logic for pre-compiled and freshly-compiled regex paths.
-splitWithCompiled :: (MonadEval m) => RE.Regex -> BS.ByteString -> m NixValue
-splitWithCompiled compiled str =
-  let allMatches = matchAllText compiled str
-      result = buildSplitResult str 0 allMatches
-   in pure (VList (clistFromThunks (map thunkToCPtr result)))
+-- | The elements of @split@'s list for a subject.  A subject the pattern
+-- does not match is the one element, context and all, as upstream
+-- returns its argument there (primops.cc:4309-4312 at 2.24.9); the
+-- pieces of one it matches carry no context, as upstream's do.
+splitPieces :: RE.Regex -> BS.ByteString -> StringContext -> [Thunk]
+splitPieces compiled str ctx = case matchAllText compiled str of
+  [] -> [evaluated (VStr str ctx)]
+  matches -> buildSplitResult str 0 matches
 
 -- | Build the alternating list for builtins.split.  Offsets from the
 -- ByteString regex instance are byte offsets, so slicing is O(1)
@@ -2925,10 +2922,13 @@ buildSplitResult remaining pos (match : rest) =
         : evaluated (VList (clistFromThunks (map thunkToCPtr groupThunks)))
         : buildSplitResult remaining afterPos rest
 
+-- | Upstream reads both versions with @forceStringNoCtx@, the first
+-- before the second (primops.cc:4536-4537 at 2.24.9).
 builtinCompareVersions :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinCompareVersions (VStr a _) (VStr b _) =
+builtinCompareVersions first second = do
+  a <- structuredStringValue RefuseContext first
+  b <- structuredStringValue RefuseContext second
   pure (VInt (compareVersionParts (splitVersionStr a) (splitVersionStr b)))
-builtinCompareVersions _ _ = throwEvalError "builtins.compareVersions: expected two strings"
 
 -- | Convert 'Ordering' to the Nix compareVersions convention: -1, 0, 1.
 ordToNix :: Ordering -> Int64
@@ -3005,10 +3005,9 @@ spanComponent t = case BC.uncons t of
     | otherwise -> (BS.take 1 t, rest)
 
 builtinSplitVersion :: (MonadEval m) => NixValue -> m NixValue
-builtinSplitVersion (VStr s _) =
+builtinSplitVersion val = do
+  s <- structuredStringValue RefuseContext val
   pure (VList (clistFromThunks (map (thunkToCPtr . evaluated . mkStrBytes) (splitVersionComponents s))))
-builtinSplitVersion other =
-  throwEvalError ("builtins.splitVersion: expected a string, got " <> typeName other)
 
 splitVersionComponents :: BS.ByteString -> [BS.ByteString]
 splitVersionComponents t = case BC.uncons t of
@@ -3026,19 +3025,17 @@ splitVersionComponents t = case BC.uncons t of
         splitVersionComponents (BS.drop 1 t)
 
 builtinParseDrvName :: (MonadEval m) => NixValue -> m NixValue
-builtinParseDrvName (VStr s _) =
-  let (name, version) = parseName s
-   in pure
-        ( VAttrs
-            ( attrSetFromMap $
-                Map.fromList
-                  [ ("name", evaluated (mkStrBytes name)),
-                    ("version", evaluated (mkStrBytes version))
-                  ]
-            )
+builtinParseDrvName val = do
+  (name, version) <- parseName <$> structuredStringValue RefuseContext val
+  pure
+    ( VAttrs
+        ( attrSetFromMap $
+            Map.fromList
+              [ ("name", evaluated (mkStrBytes name)),
+                ("version", evaluated (mkStrBytes version))
+              ]
         )
-builtinParseDrvName other =
-  throwEvalError ("builtins.parseDrvName: expected a string, got " <> typeName other)
+    )
 
 parseName :: BS.ByteString -> (BS.ByteString, BS.ByteString)
 parseName t =
@@ -3118,12 +3115,11 @@ valueToJSON (VCompiledRegex _) = throwEvalError "builtins.toJSON: cannot convert
 -- strict RFC 8259, so a trailing comma, a raw control character or a lone
 -- surrogate is refused.  'NixRange' keeps every integer a 'VInt' can hold.
 builtinFromJSON :: (MonadEval m) => NixValue -> m NixValue
-builtinFromJSON (VStr s _) = do
+builtinFromJSON val = do
+  s <- structuredStringValue RefuseContext val
   -- JSON input must be valid UTF-8 (upstream's parser rejects it too).
   decoded <- decodedText "builtins.fromJSON" s
   either throwEvalError (pure . jsonToValue) (parseJsonWith NixRange decoded)
-builtinFromJSON other =
-  throwEvalError ("builtins.fromJSON: expected a string, got " <> typeName other)
 
 parseHex4 :: Text -> Maybe (Int, Text)
 parseHex4 t
@@ -3147,16 +3143,19 @@ jsonToValue json = case json of
   JsonArray items -> VList (clistFromThunks (map (thunkToCPtr . evaluated . jsonToValue) items))
   JsonObject members -> VAttrs (attrSetFromMap (Map.map (evaluated . jsonToValue) members))
 
+-- | Upstream reads the algorithm with @forceStringNoCtx@ before it forces
+-- the string hashed, whose context it discards (primops.cc:4070-4075 at
+-- 2.24.9).
 builtinHashString :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHashString (VStr algo _) (VStr input _) = do
-  -- The payload IS the hashed bytes - no encode step, so a mid-codepoint
-  -- substring hashes to the sha256 of exactly those bytes, as upstream.
-  algoName <- decodedText "builtins.hashString" algo
-  hashBytesWithAlgo algoName input
-builtinHashString (VStr _ _) other =
-  throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
-builtinHashString other _ =
-  throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
+builtinHashString algoVal inputVal = do
+  algo <- structuredStringValue RefuseContext algoVal
+  case inputVal of
+    -- The payload IS the hashed bytes - no encode step, so a mid-codepoint
+    -- substring hashes to the sha256 of exactly those bytes, as upstream.
+    VStr input _ -> do
+      algoName <- decodedText "builtins.hashString" algo
+      hashBytesWithAlgo algoName input
+    other -> throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
 
 digestToHex :: (BA.ByteArrayAccess a) => a -> Text
 digestToHex = bytesToHexText . BA.convert
@@ -3398,9 +3397,7 @@ entryFileType path = maybe (getFileType path) pure
 -- ---------------------------------------------------------------------------
 
 builtinGetEnv :: (MonadEval m) => NixValue -> m NixValue
-builtinGetEnv (VStr name _) = mkStrBytes <$> getEnvVar name
-builtinGetEnv other =
-  throwEvalError ("builtins.getEnv: expected a string, got " <> typeName other)
+builtinGetEnv val = mkStrBytes <$> (getEnvVar =<< structuredStringValue RefuseContext val)
 
 -- | Upstream's @prim_toPath@ returns the coerced path as a string, with
 -- its context, not as a path value (primops.cc at 2.24.9).
@@ -3414,11 +3411,9 @@ builtinToPath val = do
 -- ---------------------------------------------------------------------------
 
 builtinPlaceholder :: (MonadEval m) => NixValue -> m NixValue
-builtinPlaceholder (VStr outputName _) = do
-  name <- decodedText "builtins.placeholder" outputName
+builtinPlaceholder val = do
+  name <- decodedText "builtins.placeholder" =<< structuredStringValue RefuseContext val
   pure (mkStr (hashPlaceholder name))
-builtinPlaceholder other =
-  throwEvalError ("builtins.placeholder: expected a string, got " <> typeName other)
 
 -- | Refused outright under @pure-eval@, before the argument is looked at,
 -- as upstream's @prim_storePath@ is: a dependency on a store path that
@@ -3476,12 +3471,14 @@ enclosingStorePath p = do
 -- Builtin implementations - Nix search path
 -- ---------------------------------------------------------------------------
 
+-- | Upstream reads the looked-up name with @forceStringNoCtx@ once it
+-- has read every entry (primops.cc:1799-1835 at 2.24.9), so an entry's
+-- failure comes ahead of a name's.
 builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinFindFile (VList cl) (VStr name _) = do
+builtinFindFile (VList cl) nameVal = do
   entries <- mapM (forceSearchEntry . Thunk) (clistThunks cl)
+  name <- structuredStringValue RefuseContext nameVal
   findFirst entries name
-builtinFindFile (VList _) other =
-  throwEvalError ("builtins.findFile: expected a string, got " <> typeName other)
 builtinFindFile other _ =
   throwEvalError ("builtins.findFile: expected a list, got " <> typeName other)
 
@@ -3547,20 +3544,22 @@ searchPathSuffix prefix name
 -- Builtin implementations - store file creation
 -- ---------------------------------------------------------------------------
 
+-- | Upstream reads the name with @forceStringNoCtx@ before it forces the
+-- contents (primops.cc:2293-2294 at 2.24.9).
 builtinToFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinToFile (VStr name _) (VStr contents ctx) = do
-  fileName <- decodedText "builtins.toFile" name
-  refs <- toFileRefs ctx
-  -- The contents are stored (and hashed) as their raw bytes.
-  storePath <- writeToStore fileName contents refs
-  -- Upstream returns a STRING whose context is the new path itself; the
-  -- refs travel through the store path computation, not the eval context.
-  let selfContext = maybe emptyContext plainContext (parseStorePath defaultStoreDir storePath)
-  pure (VStr (TE.encodeUtf8 storePath) selfContext)
-builtinToFile (VStr _ _) other =
-  throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
-builtinToFile other _ =
-  throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
+builtinToFile nameVal contentsVal = do
+  name <- structuredStringValue RefuseContext nameVal
+  case contentsVal of
+    VStr contents ctx -> do
+      fileName <- decodedText "builtins.toFile" name
+      refs <- toFileRefs ctx
+      -- The contents are stored (and hashed) as their raw bytes.
+      storePath <- writeToStore fileName contents refs
+      -- Upstream returns a STRING whose context is the new path itself; the
+      -- refs travel through the store path computation, not the eval context.
+      let selfContext = maybe emptyContext plainContext (parseStorePath defaultStoreDir storePath)
+      pure (VStr (TE.encodeUtf8 storePath) selfContext)
+    other -> throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
 
 -- | The store-path references a toFile output may carry: the contents'
 -- plain-path context, in sorted order.  A derivation-output reference is
@@ -4916,13 +4915,16 @@ attrPassingOf attrs = case attrSetLookup structuredAttrsFlag attrs of
     structured <- force thunk >>= expectDerivationBool
     pure (if structured then PassAsStructuredAttrs else PassAsEnvironment)
 
--- | Whether a string field read without coercion may carry context: a
--- structured derivation's builder may (upstream's forceString), the name
--- and the fields upstream reads with forceStringNoCtx may not.
+-- | Whether a string read without coercion may carry context: one
+-- upstream reads with @forceString@, such as a structured derivation's
+-- builder, may; one it reads with @forceStringNoCtx@ (eval.cc:2253-2258 at
+-- 2.24.9), such as a derivation's name or a regex, may not.
 data StringContextRule = AllowContext | RefuseContext
 
--- | A string field of a structured derivation, as upstream reads it:
--- a string, never a value coerced to one.
+-- | A string as upstream's @forceString@ reads it: a string, never a
+-- value coerced to one.  Under 'RefuseContext' it is read as
+-- @forceStringNoCtx@ reads it, and a string with context is refused in
+-- that function's words, which name the first element of the context.
 structuredStringValue :: (MonadEval m) => StringContextRule -> NixValue -> m BS.ByteString
 structuredStringValue rule val = case (val, rule) of
   (VStr s ctx, RefuseContext)
@@ -4995,13 +4997,13 @@ expectDerivationBool other = throwEvalError ("expected a Boolean but found " <> 
 
 -- | @builtins.hashFile algo path@ - hash raw bytes of a file on disk.
 -- Returns base-16 hex string, matching @builtins.hashString@ output format.
+-- The algorithm is read as upstream's @forceStringNoCtx@ reads it
+-- (primops.cc:1977 at 2.24.9).
 builtinHashFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHashFile (VStr algo _) pathVal = do
-  algoName <- decodedText "builtins.hashFile" algo
+builtinHashFile algoVal pathVal = do
+  algoName <- decodedText "builtins.hashFile" =<< structuredStringValue RefuseContext algoVal
   bytes <- readFileBytes =<< coerceToPath "builtins.hashFile" pathVal
   hashBytesWithAlgo algoName bytes
-builtinHashFile other _ =
-  throwEvalError ("builtins.hashFile: expected a string, got " <> typeName other)
 
 -- | Shared hash dispatch for raw t'Data.ByteString.ByteString' input.
 hashBytesWithAlgo :: (MonadEval m) => Text -> BS.ByteString -> m NixValue

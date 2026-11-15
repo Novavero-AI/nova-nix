@@ -167,6 +167,19 @@ if upstreamAtLeast 2.25.0; then
 fi
 echo
 
+echo "== what a builtin reading a plain string makes of string context =="
+withContext='builtins.appendContext "a" { "/nix/store/00000000000000000000000000000000-a" = { path = true; }; }'
+# 2.34.0 names the refused context element by its full store path, where
+# 2.24.9 and nova-nix name it by its base name.
+if ! upstreamAtLeast 2.34.0; then
+  refused "a regex with context" "builtins.match ($withContext) \"a\""
+  refused "a toFile name with context" "builtins.toFile ($withContext) \"x\""
+  refused "a second version with context" "builtins.compareVersions \"1\" ($withContext)"
+fi
+check "split gives back a string its regex does not match, context and all" "builtins.hasContext (builtins.head (builtins.split \"x\" ($withContext)))"
+check "the pieces of a string split matches carry no context" "builtins.toJSON (builtins.map builtins.hasContext (builtins.filter builtins.isString (builtins.split \"a\" ($withContext))))"
+echo
+
 echo "== whitespace an indented string strips =="
 check "blank line then a spaces-only line" 'import ./ind-blank-then-spaces.nix'
 check "spaces-only line" 'import ./ind-spaces-only.nix'
