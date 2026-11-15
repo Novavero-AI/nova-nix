@@ -71,6 +71,7 @@ module Nix.Eval.CBytecode
     pattern OpBinary,
     pattern OpSearchPath,
     pattern OpPathStr,
+    pattern OpPos,
 
     -- * App flags
     appDirect,
@@ -373,6 +374,11 @@ pattern OpSearchPath = 23
 -- @.\/a\/${x}@, whose string parts begin with the path's literal head.
 pattern OpPathStr :: Word8
 pattern OpPathStr = 24
+
+-- | Position opcode: @__curPos@, whose first argument is the index
+-- "Nix.Eval.SourcePos" recorded its position at.
+pattern OpPos :: Word8
+pattern OpPos = 25
 
 -- ---------------------------------------------------------------------------
 -- Sub-type flags

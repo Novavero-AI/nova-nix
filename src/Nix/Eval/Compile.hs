@@ -84,6 +84,7 @@ import Nix.Eval.CBytecode
     pattern OpLitPath,
     pattern OpLitUri,
     pattern OpPathStr,
+    pattern OpPos,
     pattern OpResolvedVar,
     pattern OpSearchPath,
     pattern OpSelect,
@@ -163,6 +164,9 @@ compileWith recorder = go
       rightIdx <- go right
       cbcEmit OpBinary (encodeBinaryOp op) 0 leftIdx rightIdx 0
     go (ESearchPath name) = compileSymbolOp OpSearchPath name
+    go (EPos pos) = do
+      posWord <- positionWord pos
+      cbcEmit OpPos 0 0 posWord 0 0
 
     -- -----------------------------------------------------------------
     -- Literals
