@@ -1779,6 +1779,11 @@ expectedList :: NixValue -> Text
 expectedList other =
   "expected a list but found " <> typeName other <> ": " <> printValue PrintForError other
 
+-- | Upstream's @forceAttrs@ failure (eval-inline.hh at 2.24.9).
+expectedSet :: NixValue -> Text
+expectedSet other =
+  "expected a set but found " <> typeName other <> ": " <> printValue PrintForError other
+
 -- | The element at an index, failing as the @elemAt@ helper behind
 -- @prim_elemAt@ and @prim_head@ does (primops.cc at 2.24.9).  That helper
 -- takes the index as a C @int@, so an index past 32 bits wraps there
@@ -1831,32 +1836,40 @@ builtinAttrValues (VAttrs attrs) =
 builtinAttrValues other =
   throwEvalError ("builtins.attrValues: expected a set, got " <> typeName other)
 
+-- | Upstream's @prim_listToAttrs@ (primops.cc:2881-2904 at 2.24.9): the
+-- elements are read first to last, and the first element with a name
+-- gives its attribute, so a later element with the same name is read only
+-- as far as its name.  Each failure carries the line of context upstream
+-- gives it.
 builtinListToAttrs :: (MonadEval m) => NixValue -> m NixValue
-builtinListToAttrs (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  pairs <- mapM listToAttrsPair thunks
-  -- Nix listToAttrs uses first-wins: if duplicate name, first element wins.
-  let firstWins = Map.fromListWith (\_ kept -> kept) pairs
-  pure (VAttrs (attrSetFromEntries firstWins))
+builtinListToAttrs (VList cl) =
+  VAttrs . attrSetFromEntries <$> foldM addListToAttrsElement Map.empty (map Thunk (clistThunks cl))
 builtinListToAttrs other =
-  throwEvalError ("builtins.listToAttrs: expected a list, got " <> typeName other)
+  addErrorTrace "while evaluating the argument passed to builtins.listToAttrs" (throwEvalError (expectedList other))
 
--- | Extract { name, value } from a thunk for listToAttrs.  The attribute
--- is at the position of the element's @value@, as upstream's
--- @prim_listToAttrs@ inserts it (primops.cc at 2.24.9).
-listToAttrsPair :: (MonadEval m) => Thunk -> m (Text, AttrEntry)
-listToAttrsPair thunk = do
-  val <- force thunk
-  case val of
-    VAttrs attrs -> do
-      nameThunk <-
-        maybe (throwEvalError "builtins.listToAttrs: element missing 'name'") pure $
-          attrSetLookup "name" attrs
-      key <- force nameThunk >>= attrNameOf "builtins.listToAttrs: attribute name"
-      case attrSetLookupEntry "value" attrs of
-        Just valueEntry -> pure (key, valueEntry)
-        Nothing -> throwEvalError "builtins.listToAttrs: element missing 'value'"
-    _ -> throwEvalError "builtins.listToAttrs: element must be a set"
+-- | Add one element of @listToAttrs@'s list to the attributes the elements
+-- before it made, whose names are the names seen.  The element is forced
+-- to a set and its @name@ read; a name already seen keeps its attribute,
+-- and a new one takes the element's @value@, unforced, at that attribute's
+-- position, as upstream inserts it.
+addListToAttrsElement :: (MonadEval m) => Map Text AttrEntry -> Thunk -> m (Map Text AttrEntry)
+addListToAttrsElement !made thunk = do
+  attrs <-
+    force thunk >>= \case
+      VAttrs attrs -> pure attrs
+      other -> addErrorTrace "while evaluating an element of the list passed to builtins.listToAttrs" (throwEvalError (expectedSet other))
+  nameThunk <- maybe (missingPairAttr "name") pure (attrSetLookup "name" attrs)
+  name <-
+    addErrorTrace "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs" $
+      force nameThunk >>= attrNameOf "builtins.listToAttrs: attribute name"
+  let newEntry = maybe (missingPairAttr "value") pure (attrSetLookupEntry "value" attrs)
+  Map.alterF (maybe (Just <$> newEntry) (pure . Just)) name made
+
+-- | A @listToAttrs@ element without the attribute, refused as upstream's
+-- @getAttr@ (primops.cc:641-651 at 2.24.9) refuses it: the message, and a
+-- line of context naming the pair.
+missingPairAttr :: (MonadEval m) => Text -> m a
+missingPairAttr key = addErrorTrace "in a {name=...; value=...;} pair" (throwEvalError ("attribute '" <> key <> "' missing"))
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - attr set (arity 2)
@@ -1892,7 +1905,7 @@ builtinUnsafeGetAttrPos nameVal setArg = do
   setVal <- argValue setArg
   attrs <- case setVal of
     VAttrs attrs -> pure attrs
-    other -> throwEvalError ("expected a set but found " <> typeName other <> ": " <> printValue PrintForError other)
+    other -> throwEvalError (expectedSet other)
   name <- decodedText "builtins.unsafeGetAttrPos" nameBytes
   pure (maybe VNull (positionValue . entryPos) (attrSetLookupEntry name attrs))
 
