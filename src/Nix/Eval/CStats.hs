@@ -54,7 +54,7 @@ module Nix.Eval.CStats
   )
 where
 
-import Control.Exception (evaluate, finally)
+import Control.Exception (finally)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as BL
@@ -411,13 +411,13 @@ nameRoot root = case root of
 
 -- | Count what the data layer holds and mark what the roots reach.  Runs
 -- inside the arena's window, with nothing else using the data layer.
--- The roots are evaluated first: a root whose evaluation allocates its
--- object (a value 'Nix.Eval.Types.evaluated' wraps, say) must exist before
--- the count, which places only what was allocated when it ran.  'Left'
--- when the C side cannot allocate the index or the mark's work stack.
+-- Every root's object exists when the count runs: the C objects a caller
+-- can name are made by actions ("Nix.Eval.CData"), so forcing a root makes
+-- none.
+-- 'Left' when the C side cannot allocate the index or the mark's work
+-- stack.
 takeCensus :: [CRoot] -> IO (Either CStatusError Census)
 takeCensus roots = do
-  mapM_ evaluate roots
   started <- getMonotonicTime
   begun <- c_nn_stats_begin
   if begun /= 0

@@ -47,9 +47,9 @@ import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.Storable (peek)
+import Nix.Eval.CData (MonadCData, cdataIO, inspectForDisplay)
 import Nix.Eval.CStatus (cStatusFailure)
 import Nix.Eval.CThunk (CThunkPtr)
-import System.IO.Unsafe (unsafePerformIO)
 
 -- | Phantom type for C-side @nn_list_t@.
 data NnList
@@ -86,8 +86,8 @@ foreign import ccall unsafe "nn_list_drop"
 -- | Allocate a new list with space for @count@ thunk pointers, or
 -- 'nullPtr' (the empty list) when count is 0.  Raises
 -- 'Nix.Eval.CStatus.CStatusError' when the C side cannot allocate it.
-clistNew :: Word32 -> IO CListPtr
-clistNew count = alloca $ \out -> do
+clistNew :: (MonadCData m) => Word32 -> m CListPtr
+clistNew count = cdataIO $ alloca $ \out -> do
   checkedListStatus "nn_list_new" =<< c_nn_list_new out count
   peek out
 
@@ -107,16 +107,16 @@ clistFreeAll = c_nn_list_free_all
 -- ---------------------------------------------------------------------------
 
 -- | Number of elements in the list.
-clistCount :: CListPtr -> IO Word32
-clistCount = c_nn_list_count
+clistCount :: (MonadCData m) => CListPtr -> m Word32
+clistCount = cdataIO . c_nn_list_count
 
 -- | Get the thunk pointer at the given index.
-clistGet :: CListPtr -> Word32 -> IO CThunkPtr
-clistGet = c_nn_list_get
+clistGet :: (MonadCData m) => CListPtr -> Word32 -> m CThunkPtr
+clistGet list idx = cdataIO (c_nn_list_get list idx)
 
 -- | Set the thunk pointer at the given index (for construction).
-clistSet :: CListPtr -> Word32 -> CThunkPtr -> IO ()
-clistSet = c_nn_list_set
+clistSet :: (MonadCData m) => CListPtr -> Word32 -> CThunkPtr -> m ()
+clistSet list idx ptr = cdataIO (c_nn_list_set list idx ptr)
 
 -- ---------------------------------------------------------------------------
 -- Conversion helpers
@@ -127,11 +127,11 @@ clistSet = c_nn_list_set
 -- Returns 'nullPtr' for empty lists.  A list longer than the C count
 -- can hold is refused rather than wrapped to a shorter allocation that
 -- the fill would then run past.
-thunkListToCList :: [CThunkPtr] -> IO CListPtr
+thunkListToCList :: (MonadCData m) => [CThunkPtr] -> m CListPtr
 thunkListToCList [] = pure nullPtr
 thunkListToCList ptrs
   | len > fromIntegral (maxBound :: Word32) =
-      cStatusFailure "nn_list_new" ("a list of " ++ show len ++ " elements is past the uint32_t count a C list holds")
+      cdataIO (cStatusFailure "nn_list_new" ("a list of " ++ show len ++ " elements is past the uint32_t count a C list holds"))
   | otherwise = do
       clist <- clistNew (fromIntegral len)
       fillList clist 0 ptrs
@@ -145,7 +145,7 @@ thunkListToCList ptrs
 
 -- | Convert a C list back to a Haskell list of 'CThunkPtr'.
 -- Returns @[]@ for 'nullPtr'.
-clistToThunkList :: CListPtr -> IO [CThunkPtr]
+clistToThunkList :: (MonadCData m) => CListPtr -> m [CThunkPtr]
 clistToThunkList cl
   | cl == nullPtr = pure []
   | otherwise = do
@@ -170,7 +170,7 @@ instance Show CList where
   show (CList p)
     | p == nullPtr = "<list 0>"
     | otherwise =
-        let n = unsafePerformIO (clistCount p)
+        let n = inspectForDisplay (clistCount p)
          in "<list " ++ show n ++ ">"
 
 -- | The empty CList (null pointer, zero elements).
@@ -178,40 +178,40 @@ emptyCList :: CList
 emptyCList = CList nullPtr
 
 -- | Convert a Haskell list of 'CThunkPtr' to a t'CList'.
--- Uses 'unsafePerformIO' - safe because allocation is idempotent
--- per call (no shared mutable state beyond the tracking array).
-{-# NOINLINE clistFromThunks #-}
-clistFromThunks :: [CThunkPtr] -> CList
-clistFromThunks ptrs = CList (unsafePerformIO (thunkListToCList ptrs))
+clistFromThunks :: (MonadCData m) => [CThunkPtr] -> m CList
+clistFromThunks ptrs = CList <$> thunkListToCList ptrs
 
 -- | Convert a t'CList' back to a Haskell list of 'CThunkPtr'.
-clistThunks :: CList -> [CThunkPtr]
-clistThunks (CList p) = unsafePerformIO (clistToThunkList p)
+clistThunks :: (MonadCData m) => CList -> m [CThunkPtr]
+clistThunks (CList p) = clistToThunkList p
 
 -- | Number of elements in the list.
-clistLen :: CList -> Int
+clistLen :: (MonadCData m) => CList -> m Int
 clistLen (CList p)
-  | p == nullPtr = 0
-  | otherwise = fromIntegral (unsafePerformIO (clistCount p))
+  | p == nullPtr = pure 0
+  | otherwise = fromIntegral <$> clistCount p
 
 -- | The element at an index, or 'Nothing' outside the list, read from the
--- C array without materializing the list.  Pure because a list is never
--- written after construction.
-clistIndex :: CList -> Int -> Maybe CThunkPtr
-clistIndex cl@(CList p) i
-  | i < 0 || i >= clistLen cl = Nothing
-  | otherwise = Just $! unsafePerformIO (clistGet p (fromIntegral i))
+-- C array without materializing the list.
+clistIndex :: (MonadCData m) => CList -> Int -> m (Maybe CThunkPtr)
+clistIndex cl@(CList p) i = do
+  len <- clistLen cl
+  if i < 0 || i >= len
+    then pure Nothing
+    else Just <$> clistGet p (fromIntegral i)
 
 -- | The list without its first @n@ elements, as 'drop' is on lists.  The
 -- result is a new header over this list's C array (@nn_list_drop@), so it
--- costs the same whatever the length.  Allocating it under
--- 'unsafePerformIO' is safe because the array is immutable: a header
--- built twice or shared between calls describes the same elements.
-clistDrop :: Int -> CList -> CList
+-- costs the same whatever the length; sharing the array cannot be
+-- observed, because a list is never written after construction.
+clistDrop :: (MonadCData m) => Int -> CList -> m CList
 clistDrop n cl@(CList p)
-  | n <= 0 = cl
-  | n >= clistLen cl = emptyCList
-  | otherwise = CList (unsafePerformIO (alloca dropInto))
+  | n <= 0 = pure cl
+  | otherwise = do
+      len <- clistLen cl
+      if n >= len
+        then pure emptyCList
+        else CList <$> cdataIO (alloca dropInto)
   where
     dropInto out = do
       checkedListStatus "nn_list_drop" =<< c_nn_list_drop out p (fromIntegral n)

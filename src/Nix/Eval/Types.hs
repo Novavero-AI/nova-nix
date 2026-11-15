@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | Shared types for the Nix evaluator.
@@ -13,6 +14,7 @@ module Nix.Eval.Types
     CompiledRegex (..),
     Thunk (..),
     readThunkValue,
+    readComputed,
     thunkUnderEvaluation,
 
     -- * Attribute sets (C-backed sorted arrays)
@@ -60,10 +62,12 @@ module Nix.Eval.Types
     envLookup,
     envLookupResolved,
     envFromSlots,
-    lookupWithScopes,
+    pushLazyWithScope,
+    buildCaptureEnv,
+    withScopeAt,
+    resolveWithScopeAt,
     withScopesForCapture,
     envWithScopesRaw,
-    checkedCPtr,
     newCEnv,
     newMinimalEnv,
 
@@ -72,10 +76,13 @@ module Nix.Eval.Types
     EvalFormal (..),
 
     -- * Thunk operations
+    compile,
+    compileSource,
     mkThunk,
     cheapThunk,
     cheapThunkBc,
     mkThunkBc,
+    pendingCode,
     pendingThunkEnv,
     evaluated,
     thunkSameRef,
@@ -117,9 +124,8 @@ module Nix.Eval.Types
   )
 where
 
-import Control.Monad (forM_)
-import Control.Monad.Reader (ReaderT (..), lift)
-import Data.Bits (shiftL, (.&.), (.|.))
+import Control.Monad (forM_, zipWithM_)
+import Data.Bits (complement, shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int64)
@@ -134,7 +140,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word32, Word64, Word8)
-import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr)
+import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, newStablePtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Float (castWord64ToDouble)
@@ -143,22 +149,23 @@ import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
-import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
+import Nix.Eval.CData (CData (..), MonadCData (..), cdataIO, inspectForDisplay, runCDataPure)
+import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaLambdaNameSym, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
-import Nix.Eval.CStatus (checkedCPtr)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CStatus (cInvariantViolated, checkedCPtr)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
+import Nix.Eval.Compile (compileExpr, compileFormalsToEval, compileParsed)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.Policy (EvalPolicy (..), unrestrictedPolicy)
 import Nix.Eval.SourcePos (PosIdx, noPos)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
+import Nix.Parser (ParsedSource)
 import Nix.Store.Path (BadStorePath, StorePath, badStorePathText)
 import Nix.Store.Path.Internal (StorePath (StorePath))
-import System.IO.Unsafe (unsafePerformIO)
 import qualified Text.Regex.TDFA as RE
 
 -- ---------------------------------------------------------------------------
@@ -238,33 +245,34 @@ bytesToTextLossy = TE.decodeUtf8With lenientDecode
 -- pointers remain valid until 'Nix.Eval.CThunk.cthunkDestroy'.
 newtype Thunk = Thunk {unThunk :: CThunkPtr}
 
+-- | The cell's state and, once computed, its value, as they stand when
+-- the string is forced ('inspectForDisplay').
 instance Show Thunk where
   show (Thunk ptr) =
-    case unsafePerformIO (cthunkState ptr) of
-      ThunkComputed -> case readThunkValue (Thunk ptr) of
-        Just val -> "Thunk (" ++ show val ++ ")"
-        Nothing -> "Thunk <computed?>"
+    case inspectForDisplay (cthunkState ptr) of
+      ThunkComputed -> "Thunk (" ++ show (inspectForDisplay (readComputed ptr)) ++ ")"
       ThunkPending -> "Thunk <pending>"
       ThunkBlackhole -> "Thunk <blackhole>"
       _ -> "Thunk <unknown>"
 
 -- | Equality: pointer identity fast path, then value comparison for
--- COMPUTED thunks.  Only used in tests on non-recursive structures.
+-- COMPUTED thunks, as they stand when compared ('inspectForDisplay').
+-- Only used in tests on non-recursive structures.
 instance Eq Thunk where
   (Thunk p1) == (Thunk p2)
     | p1 == p2 = True
-    | otherwise = case (readThunkValue (Thunk p1), readThunkValue (Thunk p2)) of
+    | otherwise = case inspectForDisplay ((,) <$> readThunkValue (Thunk p1) <*> readThunkValue (Thunk p2)) of
         (Just v1, Just v2) -> v1 == v2
         _ -> False
 
 -- | Named constants for the C thunk-state byte and value-tag byte, mirroring
 -- the @NN_THUNK_*@ / @NN_VALUE_*@ macros in @cbits\/nn_thunk.h@.  Bidirectional
 -- pattern synonyms over literals, so a @case@ on a tag keeps the jump-table
--- compilation a bare-literal @case@ gets, while the three thunk-dispatch sites
--- ('readThunkValue', @PureEval@'s 'forceThunk', and @Nix.Eval.IO@'s
--- @readComputed@) share one source of truth instead of triplicating literals.
--- These MUST stay in lockstep with @cbits\/nn_thunk.h@.  The remaining value
--- tag (PTR, a StablePtr payload) is the wildcard at each dispatch site.
+-- compilation a bare-literal @case@ gets, while the state dispatches (the
+-- 'forceThunk' of each evaluator) and the value dispatch ('readComputed')
+-- share one source of truth instead of repeating literals.  These MUST stay
+-- in lockstep with @cbits\/nn_thunk.h@.  The remaining value tag (PTR, a
+-- StablePtr payload) is the wildcard at the value dispatch.
 pattern ThunkPending, ThunkComputed, ThunkBlackhole :: Word8
 pattern ThunkPending = 0
 pattern ThunkComputed = 1
@@ -285,43 +293,41 @@ pattern ValueCtxStr = 8
 pattern ValueLambda = 9
 
 -- | Whether a thunk is being forced right now, so it holds no value yet:
--- the cell's BLACKHOLE state.  Pure for the reason 'readThunkValue' is,
--- and like it an answer about this moment: the state changes when the
--- force finishes or is unwound.
-thunkUnderEvaluation :: Thunk -> Bool
-thunkUnderEvaluation (Thunk ptr) = unsafePerformIO (cthunkState ptr) == ThunkBlackhole
+-- the cell's BLACKHOLE state.  An answer about this moment: the state
+-- changes when the force finishes or is unwound.
+thunkUnderEvaluation :: (MonadCData m) => Thunk -> m Bool
+thunkUnderEvaluation (Thunk ptr) = (== ThunkBlackhole) <$> cthunkState ptr
 
 -- | Read a COMPUTED thunk's value without forcing.
 -- Returns 'Nothing' for PENDING or BLACKHOLE thunks.
--- Uses 'unsafePerformIO' - safe because C reads are idempotent.
-readThunkValue :: Thunk -> Maybe NixValue
-readThunkValue (Thunk ptr) =
-  unsafePerformIO $ do
-    state <- cthunkState ptr
-    if state /= ThunkComputed
-      then pure Nothing
-      else do
-        tag <- cthunkValueTag ptr
-        fmap Just $ case tag of
-          ValueInt -> VInt <$> cthunkGetInt ptr
-          ValueFloat -> VFloat <$> cthunkGetFloat ptr
-          ValueBool -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
-          ValueNull -> pure VNull
-          ValueStr -> (\sym -> VStr (symbolBytes (Symbol sym)) emptyContext) <$> cthunkGetStr ptr
-          ValuePath -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
-          ValueList -> do
-            listPtr <- cthunkGetList ptr
-            pure (VList (CList (castPtr listPtr)))
-          ValueAttrs -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
-          ValueCtxStr -> do
-            csptr <- cthunkGetCtxStr ptr
-            uncurry VStr <$> unmarshalStringContext (castPtr csptr)
-          ValueLambda -> do
-            lamRaw <- cthunkPayload ptr
-            unmarshalLambdaValue (castPtr lamRaw)
-          _ {- PTR -} -> do
-            payload <- cthunkPayload ptr
-            deRefStablePtr (castPtrToStablePtr payload)
+readThunkValue :: (MonadCData m) => Thunk -> m (Maybe NixValue)
+readThunkValue (Thunk ptr) = do
+  state <- cthunkState ptr
+  if state == ThunkComputed
+    then Just <$> readComputed ptr
+    else pure Nothing
+
+-- | The value a COMPUTED cell holds, by its value tag: a scalar or a C
+-- pointer read in place, any other value through its StablePtr.
+readComputed :: (MonadCData m) => CThunkPtr -> m NixValue
+readComputed ptr = do
+  tag <- cthunkValueTag ptr
+  case tag of
+    ValueInt -> VInt <$> cthunkGetInt ptr
+    ValueFloat -> VFloat <$> cthunkGetFloat ptr
+    ValueBool -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
+    ValueNull -> pure VNull
+    ValueStr -> (\sym -> VStr (symbolBytes (Symbol sym)) emptyContext) <$> cthunkGetStr ptr
+    ValuePath -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
+    ValueList -> VList . CList . castPtr <$> cthunkGetList ptr
+    ValueAttrs -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
+    ValueCtxStr -> do
+      csptr <- cthunkGetCtxStr ptr
+      uncurry VStr <$> unmarshalStringContext (castPtr csptr)
+    ValueLambda -> cthunkGetLambda ptr >>= unmarshalLambdaValue
+    _ {- PTR -} -> do
+      payload <- cthunkPayload ptr
+      cdataIO (deRefStablePtr (castPtrToStablePtr payload))
 
 -- | A Nix value - the result of evaluating an expression.
 data NixValue
@@ -380,12 +386,14 @@ data BuiltinArg
 -- the GHC heap, dramatically reducing GC pressure for large evaluations.
 newtype AttrSet = AttrSet {unAttrSet :: CAttrSet}
 
+-- | The same names bound to equal thunks, as the sets stand when compared
+-- ('inspectForDisplay').
 instance Eq AttrSet where
-  a == b = attrSetToMap a == attrSetToMap b
+  a == b = inspectForDisplay ((==) <$> attrSetToMap a <*> attrSetToMap b)
 
 instance Show AttrSet where
   show (AttrSet cset) =
-    let n = unsafePerformIO (cattrsetSize cset)
+    let n = inspectForDisplay (cattrsetSize cset)
      in "<attrset " ++ show n ++ " entries>"
 
 -- | An attribute's value and the position it was defined at, as a set
@@ -396,69 +404,55 @@ data AttrEntry = AttrEntry
   }
 
 -- | Look up a single key via symbol interning + C binary search.
--- Uses 'unsafePerformIO' - safe because symbolIntern and cattrsetLookup
--- are idempotent (same key always yields same symbol and same result).
-attrSetLookup :: Text -> AttrSet -> Maybe Thunk
-attrSetLookup key (AttrSet cset) =
-  unsafePerformIO $ do
-    sym <- symbolIntern key
-    mptr <- cattrsetLookup cset sym
-    pure (fmap Thunk mptr)
+attrSetLookup :: (MonadCData m) => Text -> AttrSet -> m (Maybe Thunk)
+attrSetLookup key (AttrSet cset) = do
+  sym <- symbolIntern key
+  fmap Thunk <$> cattrsetLookup cset sym
 
--- | 'attrSetLookup' with the attribute's position.  'unsafePerformIO' is
--- safe for the reason it is in 'attrSetLookup': the same key reads the
--- same entry every time.
-attrSetLookupEntry :: Text -> AttrSet -> Maybe AttrEntry
-attrSetLookupEntry key (AttrSet cset) =
-  unsafePerformIO $ do
-    sym <- symbolIntern key
-    midx <- cattrsetIndex cset sym
-    traverse (\idx -> AttrEntry <$> cattrsetGetPos cset idx <*> (Thunk <$> cattrsetGetValue cset idx)) midx
+-- | 'attrSetLookup' with the attribute's position.
+attrSetLookupEntry :: (MonadCData m) => Text -> AttrSet -> m (Maybe AttrEntry)
+attrSetLookupEntry key (AttrSet cset) = do
+  sym <- symbolIntern key
+  midx <- cattrsetIndex cset sym
+  traverse (\idx -> AttrEntry <$> cattrsetGetPos cset idx <*> (Thunk <$> cattrsetGetValue cset idx)) midx
 
 -- | All keys, as symbol text from C, in the C array's order: by interned
 -- symbol, not by name.
-attrSetKeys :: AttrSet -> [Text]
-attrSetKeys (AttrSet cset) =
-  map symbolText (unsafePerformIO (cattrsetKeys cset))
+attrSetKeys :: (MonadCData m) => AttrSet -> m [Text]
+attrSetKeys (AttrSet cset) = map symbolText <$> cattrsetKeys cset
 
 -- | The name with the least symbol, the one a set holding them all would
 -- hold first ('attrSetKeys').  A name not yet interned is interned here,
--- as 'attrSetLookup' interns a key it looks up; 'unsafePerformIO' is safe
--- for the same reason: a name keeps the symbol it was first given.
-firstInSymbolOrder :: NonEmpty Text -> Text
-firstInSymbolOrder names =
-  snd (NE.head (NE.sortWith fst (NE.zip (unsafePerformIO (traverse symbolIntern names)) names)))
+-- as 'attrSetLookup' interns a key it looks up.
+firstInSymbolOrder :: (MonadCData m) => NonEmpty Text -> m Text
+firstInSymbolOrder names = do
+  symbols <- traverse symbolIntern names
+  pure (snd (NE.head (NE.sortWith fst (NE.zip symbols names))))
 
 -- | Check key membership without materializing thunks.
-attrSetMember :: Text -> AttrSet -> Bool
-attrSetMember key (AttrSet cset) =
-  unsafePerformIO $ do
-    sym <- symbolIntern key
-    midx <- cattrsetIndex cset sym
-    pure (case midx of Nothing -> False; Just _ -> True)
+attrSetMember :: (MonadCData m) => Text -> AttrSet -> m Bool
+attrSetMember key (AttrSet cset) = do
+  sym <- symbolIntern key
+  midx <- cattrsetIndex cset sym
+  pure (case midx of Nothing -> False; Just _ -> True)
 
 -- | Check if the attribute set is empty.
-attrSetNull :: AttrSet -> Bool
-attrSetNull (AttrSet cset) =
-  unsafePerformIO (cattrsetSize cset) == 0
+attrSetNull :: (MonadCData m) => AttrSet -> m Bool
+attrSetNull (AttrSet cset) = (== 0) <$> cattrsetSize cset
 
 -- | Number of attributes.
-attrSetSize :: AttrSet -> Int
-attrSetSize (AttrSet cset) =
-  fromIntegral (unsafePerformIO (cattrsetSize cset))
+attrSetSize :: (MonadCData m) => AttrSet -> m Int
+attrSetSize (AttrSet cset) = fromIntegral <$> cattrsetSize cset
 
 -- | Full materialization: build a 'Map Text Thunk' from all entries.
 -- Iterates the C array and builds a Haskell Map.  Expensive on large
 -- sets - avoid on the hot path.
-attrSetToMap :: AttrSet -> Map Text Thunk
-attrSetToMap (AttrSet cset) =
-  unsafePerformIO $ do
-    n <- cattrsetSize cset
-    if n == 0
-      then pure Map.empty
-      else do
-        pairs <- mapM materializeEntry [0 .. n - 1]
-        pure (Map.fromList pairs)
+attrSetToMap :: (MonadCData m) => AttrSet -> m (Map Text Thunk)
+attrSetToMap (AttrSet cset) = do
+  n <- cattrsetSize cset
+  if n == 0
+    then pure Map.empty
+    else Map.fromList <$> mapM materializeEntry [0 .. n - 1]
   where
     materializeEntry i = do
       sym <- cattrsetGetKey cset i
@@ -466,27 +460,25 @@ attrSetToMap (AttrSet cset) =
       pure (symbolText sym, Thunk ptr)
 
 -- | All thunk values (materialized).
-attrSetElems :: AttrSet -> [Thunk]
-attrSetElems = Map.elems . attrSetToMap
+attrSetElems :: (MonadCData m) => AttrSet -> m [Thunk]
+attrSetElems attrs = Map.elems <$> attrSetToMap attrs
 
 -- | Sorted key-value pairs (materialized).
-attrSetToAscList :: AttrSet -> [(Text, Thunk)]
-attrSetToAscList = Map.toAscList . attrSetToMap
+attrSetToAscList :: (MonadCData m) => AttrSet -> m [(Text, Thunk)]
+attrSetToAscList attrs = Map.toAscList <$> attrSetToMap attrs
 
--- | Map a function over all key-value pairs, building a new CAttrSet at
--- a site.  Materializes the source set, applies @f@ to each entry, and
+-- | Map an action over all key-value pairs, building a new CAttrSet at a
+-- site.  Materializes the source set, runs @f@ on each entry, and
 -- rebuilds.
-attrSetMapWithKey :: SetSite -> (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
-attrSetMapWithKey site f attrs = attrSetFromMap site (Map.mapWithKey f (attrSetToMap attrs))
+attrSetMapWithKey :: (MonadCData m) => SetSite -> (Text -> Thunk -> m Thunk) -> AttrSet -> m AttrSet
+attrSetMapWithKey site f attrs = attrSetToMap attrs >>= Map.traverseWithKey f >>= attrSetFromMap site
 
 -- | Remove a list of keys, returning a new CAttrSet made at a site.
 -- Uses the C-side @nn_attrset_remove_keys@ for O(n) removal.
-{-# NOINLINE attrSetRemoveKeys #-}
-attrSetRemoveKeys :: SetSite -> [Text] -> AttrSet -> AttrSet
-attrSetRemoveKeys site keys (AttrSet cset) = unsafePerformIO $ do
+attrSetRemoveKeys :: (MonadCData m) => SetSite -> [Text] -> AttrSet -> m AttrSet
+attrSetRemoveKeys site keys (AttrSet cset) = do
   syms <- mapM symbolIntern keys
-  newSet <- cattrsetRemoveKeys site cset syms
-  pure (AttrSet newSet)
+  AttrSet <$> cattrsetRemoveKeys site cset syms
 
 -- | Build a CAttrSet at a site from a Haskell 'Map' of attributes defined
 -- nowhere in source, as those of a set a builtin makes from scratch are;
@@ -494,23 +486,18 @@ attrSetRemoveKeys site keys (AttrSet cset) = unsafePerformIO $ do
 -- 'attrSetFromEntries'.
 -- Interns all keys as symbols, inserts key-value pairs, freezes (sort +
 -- dedup).
---
--- Uses 'unsafePerformIO' with @NOINLINE@ - safe because C allocation
--- is idempotent and the resulting CAttrSet is referentially transparent.
-{-# NOINLINE attrSetFromMap #-}
-attrSetFromMap :: SetSite -> Map Text Thunk -> AttrSet
-attrSetFromMap site m = m `seq` AttrSet (unsafePerformIO (newFrozenAttrSet site (const noPos) id m))
+attrSetFromMap :: (MonadCData m) => SetSite -> Map Text Thunk -> m AttrSet
+attrSetFromMap site m = AttrSet <$> newFrozenAttrSet site (const noPos) id m
 
 -- | 'attrSetFromMap' for attributes that keep the positions they were
 -- defined at, as an attribute set literal's and a copied attribute's do.
-{-# NOINLINE attrSetFromEntries #-}
-attrSetFromEntries :: SetSite -> Map Text AttrEntry -> AttrSet
-attrSetFromEntries site m = m `seq` AttrSet (unsafePerformIO (newFrozenAttrSet site entryPos entryThunk m))
+attrSetFromEntries :: (MonadCData m) => SetSite -> Map Text AttrEntry -> m AttrSet
+attrSetFromEntries site m = AttrSet <$> newFrozenAttrSet site entryPos entryThunk m
 
 -- | Insert every entry of a map into a new set at a site, at the position
 -- and with the thunk the projections give it, and freeze it.
 {-# INLINE newFrozenAttrSet #-}
-newFrozenAttrSet :: SetSite -> (a -> PosIdx) -> (a -> Thunk) -> Map Text a -> IO CAttrSet
+newFrozenAttrSet :: (MonadCData m) => SetSite -> (a -> PosIdx) -> (a -> Thunk) -> Map Text a -> m CAttrSet
 newFrozenAttrSet site posOf thunkOf m = do
   cset <- cattrsetNew site (Map.size m)
   forM_ (Map.toList m) $ \(key, entry) -> do
@@ -525,9 +512,8 @@ newFrozenAttrSet site posOf thunkOf m = do
 -- keys are known before thunks, so the CAttrSet is built first, then
 -- values are filled via 'fillCAttrSetValues'.  The table is never a
 -- value, so its entries carry no position.
-{-# NOINLINE buildCAttrSetKeys #-}
-buildCAttrSetKeys :: [Text] -> CAttrSet
-buildCAttrSetKeys keys = unsafePerformIO $ do
+buildCAttrSetKeys :: (MonadCData m) => [Text] -> m CAttrSet
+buildCAttrSetKeys keys = do
   cset <- cattrsetNew SetScope (length keys)
   forM_ keys $ \key -> do
     sym <- symbolIntern key
@@ -539,9 +525,8 @@ buildCAttrSetKeys keys = unsafePerformIO $ do
 -- Looks up each key's index and writes the CThunkPtr at that position.
 -- Keys not found in the CAttrSet are silently ignored (should not happen
 -- in correct knot-tying code).
-{-# NOINLINE fillCAttrSetValues #-}
-fillCAttrSetValues :: CAttrSet -> Map Text Thunk -> ()
-fillCAttrSetValues cset thunkMap = unsafePerformIO $
+fillCAttrSetValues :: (MonadCData m) => CAttrSet -> Map Text Thunk -> m ()
+fillCAttrSetValues cset thunkMap =
   forM_ (Map.toList thunkMap) $ \(key, Thunk ptr) -> do
     sym <- symbolIntern key
     midx <- cattrsetIndex cset sym
@@ -563,13 +548,13 @@ newtype Env = Env (Ptr NnEnv)
 instance Eq Env where
   Env p1 == Env p2 = p1 == p2
 
--- | Compact show via C accessors.
+-- | Compact show via C accessors ('inspectForDisplay').
 instance Show Env where
   show (Env envPtr) =
-    let sc = unsafePerformIO (cenvSlotCount envPtr)
-        ls = unsafePerformIO (cenvLazyScope envPtr)
-        par = unsafePerformIO (cenvParent envPtr)
-        wc = unsafePerformIO (cenvWithCount envPtr)
+    let sc = inspectForDisplay (cenvSlotCount envPtr)
+        ls = inspectForDisplay (cenvLazyScope envPtr)
+        par = inspectForDisplay (cenvParent envPtr)
+        wc = inspectForDisplay (cenvWithCount envPtr)
      in "Env{"
           ++ show sc
           ++ " slots"
@@ -579,20 +564,17 @@ instance Show Env where
           ++ show wc
           ++ " withs}"
 
--- | Empty environment (no variables in scope).
--- Points to a static global C struct - valid until 'Nix.Eval.Arena.arenaDestroy'.
-{-# NOINLINE emptyEnv #-}
+-- | Empty environment (no variables in scope): a C static, one address
+-- for the life of the process.
 emptyEnv :: Env
-emptyEnv = Env (unsafePerformIO cenvEmpty)
+emptyEnv = Env cenvEmpty
 
 -- | General C-backed env constructor, for an env at a site.
 -- Takes Haskell-level types; converts Maybe to nullPtr internally.
-{-# NOINLINE newCEnv #-}
-newCEnv :: EnvSite -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> Maybe Env -> Ptr (Ptr ()) -> Word32 -> Env
+newCEnv :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> Maybe Env -> Ptr (Ptr ()) -> Word32 -> m Env
 newCEnv site slots slotCount lazyScope parent withs withCount =
   Env
-    ( unsafePerformIO
-        ( checkedCPtr "nn_env_new"
+    <$> ( checked "nn_env_new"
             =<< cenvNew
               site
               slots
@@ -602,45 +584,50 @@ newCEnv site slots slotCount lazyScope parent withs withCount =
               withs
               withCount
         )
-    )
 
 -- | Minimal env at a site: slots only, no parent, no with-scopes, no
 -- lazy scope.
-{-# NOINLINE newMinimalEnv #-}
-newMinimalEnv :: EnvSite -> Ptr CThunkPtr -> Int -> Env
+newMinimalEnv :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Int -> m Env
 newMinimalEnv site slots n =
-  Env (unsafePerformIO (checkedCPtr "nn_env_new_minimal" =<< cenvNewMinimal site slots (fromIntegral n)))
+  Env <$> (checked "nn_env_new_minimal" =<< cenvNewMinimal site slots (fromIntegral n))
 
 -- | Look up a resolved variable by level and index.  Single C call:
--- O(level) parent hops in C, then O(1) array read.
-envLookupResolved :: Int -> Int -> Env -> Thunk
-envLookupResolved level idx (Env envPtr) =
-  Thunk (unsafePerformIO (cenvLookupResolved envPtr level idx))
+-- O(level) parent hops in C, then O(1) array read.  The resolver chose
+-- the level and index for this env's shape, so the NULL the C side
+-- answers for one outside the env, or for a slot a frame has not filled
+-- yet, is a defect in this library, raised rather than handed on as a
+-- thunk the next force would dereference.
+envLookupResolved :: (MonadCData m) => Int -> Int -> Env -> m Thunk
+envLookupResolved level idx (Env envPtr) = do
+  ptr <- cenvLookupResolved envPtr level idx
+  if ptr == nullPtr
+    then cdataIO (cInvariantViolated "nn_env_lookup_resolved" ("no thunk at level " ++ show level ++ ", index " ++ show idx))
+    else pure (Thunk ptr)
 
 -- | Name-based variable lookup: walk the parent chain checking
 -- lazy scopes; fall back to with-scopes (from the starting env).
 --
 -- Positional slots are NOT searched here - used only for
 -- 'EVar' lookups (let\/rec bindings, builtins, with-scopes).
-envLookup :: Text -> Env -> Maybe Thunk
+envLookup :: (MonadCData m) => Text -> Env -> m (Maybe Thunk)
 envLookup name (Env envPtr) = lexicalLookup envPtr
   where
-    -- With-scopes from the STARTING env (C array)
-    startWiths = unsafePerformIO (cenvWithScopes envPtr)
-    startWithCount = unsafePerformIO (cenvWithCount envPtr)
-    lexicalLookup ep =
-      let ls = unsafePerformIO (cenvLazyScope ep)
-          scopeResult =
-            if ls /= nullPtr
-              then attrSetLookup name (AttrSet (castPtr ls))
-              else Nothing
-       in case scopeResult of
-            Just val -> Just val
-            Nothing ->
-              let par = unsafePerformIO (cenvParent ep)
-               in if par /= nullPtr
-                    then lexicalLookup par
-                    else lookupWithScopesC name startWiths startWithCount
+    lexicalLookup ep = do
+      ls <- cenvLazyScope ep
+      scopeResult <-
+        if ls /= nullPtr
+          then attrSetLookup name (AttrSet (castPtr ls))
+          else pure Nothing
+      case scopeResult of
+        Just val -> pure (Just val)
+        Nothing -> do
+          par <- cenvParent ep
+          if par /= nullPtr
+            then lexicalLookup par
+            else do
+              -- With-scopes from the STARTING env (C array)
+              (startWiths, startWithCount) <- envWithScopesRaw (Env envPtr)
+              lookupWithScopesC name startWiths startWithCount
 
 -- | Walk with-scopes (C array) innermost to outermost.
 -- Skips tagged lazy entries (bit 0 set) - those are thunk pointers
@@ -649,154 +636,214 @@ envLookup name (Env envPtr) = lexicalLookup envPtr
 -- (barrier) binding or a static global, both found on the parent chain
 -- before this fallback fires ('EVar' also blocks closure trimming, so
 -- the chain is always intact) - but keep it for safety.
-lookupWithScopesC :: Text -> Ptr (Ptr ()) -> Word32 -> Maybe Thunk
-lookupWithScopesC _ _ 0 = Nothing
-lookupWithScopesC name withArr count = unsafePerformIO $ go 0
+lookupWithScopesC :: (MonadCData m) => Text -> Ptr (Ptr ()) -> Word32 -> m (Maybe Thunk)
+lookupWithScopesC name withArr count = go 0
   where
     go i
       | i >= fromIntegral count = pure Nothing
       | otherwise = do
-          scopePtr <- peekElemOff withArr i
-          if ptrToWordPtr scopePtr .&. 1 /= 0
-            then go (i + 1) -- skip tagged lazy with-scope
-            else case attrSetLookup name (AttrSet (castPtr scopePtr)) of
-              Just val -> pure (Just val)
-              Nothing -> go (i + 1)
-
--- | Walk with-scopes as a Haskell list (backward-compatible signature).
-lookupWithScopes :: Text -> [AttrSet] -> Maybe Thunk
-lookupWithScopes _ [] = Nothing
-lookupWithScopes name (scope : rest) =
-  case attrSetLookup name scope of
-    Just val -> Just val
-    Nothing -> lookupWithScopes name rest
+          entry <- withScopeAt withArr i
+          case entry of
+            Left _ -> go (i + 1)
+            Right scope -> do
+              found <- attrSetLookup name scope
+              case found of
+                Just val -> pure (Just val)
+                Nothing -> go (i + 1)
 
 -- | Create a child env at a site with positional slots (for lambda
 -- formals).  Inherits with-scopes from the parent.  Arena-allocated.
-{-# NOINLINE envFromSlots #-}
-envFromSlots :: EnvSite -> Ptr CThunkPtr -> Int -> Env -> Env
+envFromSlots :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Int -> Env -> m Env
 envFromSlots site slotsPtr slotCount (Env parentPtr) =
-  Env (unsafePerformIO (checkedCPtr "nn_env_from_slots" =<< cenvFromSlots site slotsPtr (fromIntegral slotCount) parentPtr))
+  Env <$> (checked "nn_env_from_slots" =<< cenvFromSlots site slotsPtr (fromIntegral slotCount) parentPtr)
+
+-- | Push a with-scope whose set is not evaluated yet onto the scope chain
+-- (innermost position): the thunk that evaluates to it, tagged lazy
+-- (bit 0 set) so that a lookup forces it on first use
+-- ('resolveWithScopeAt').  Allocates a new C env struct with an extended
+-- with-scopes array.
+pushLazyWithScope :: (MonadCData m) => Thunk -> Env -> m Env
+pushLazyWithScope (Thunk thunkPtr) (Env envPtr) =
+  Env <$> (checked "nn_env_push_with" =<< cenvPushWith EnvWith envPtr (wordPtrToPtr (ptrToWordPtr (castPtr thunkPtr) .|. lazyWithScopeTag)))
+
+-- | The bit that marks a with-scope entry as the thunk of a set not yet
+-- evaluated, rather than the set: a thunk cell is word-aligned, so the
+-- bit is otherwise zero.
+lazyWithScopeTag :: WordPtr
+lazyWithScopeTag = 1
+
+-- | The entry at an index of a with-scopes array ('envWithScopesRaw'):
+-- 'Left' the thunk of a set not yet evaluated ('pushLazyWithScope'), or
+-- 'Right' the set.
+withScopeAt :: (MonadCData m) => Ptr (Ptr ()) -> Int -> m (Either Thunk AttrSet)
+withScopeAt withArr idx = classify . ptrToWordPtr <$> cdataIO (peekElemOff withArr idx)
+  where
+    classify word
+      | word .&. lazyWithScopeTag /= 0 = Left (Thunk (wordPtrToPtr (word .&. complement lazyWithScopeTag)))
+      | otherwise = Right (AttrSet (wordPtrToPtr word))
+
+-- | Replace a lazy with-scope entry with the set its thunk evaluated to,
+-- so later lookups read the set directly.  Every env sharing the array
+-- would evaluate the thunk to the same set.
+resolveWithScopeAt :: (MonadCData m) => Ptr (Ptr ()) -> Int -> AttrSet -> m ()
+resolveWithScopeAt withArr idx (AttrSet cset) = cdataIO (pokeElemOff withArr idx (castPtr cset))
 
 -- | Read with-scopes array pointer and count from a C env.
-{-# NOINLINE envWithScopesRaw #-}
-envWithScopesRaw :: Env -> (Ptr (Ptr ()), Word32)
-envWithScopesRaw (Env envPtr) = unsafePerformIO $ do
-  withs <- cenvWithScopes envPtr
-  count <- cenvWithCount envPtr
-  pure (withs, count)
+envWithScopesRaw :: (MonadCData m) => Env -> m (Ptr (Ptr ()), Word32)
+envWithScopesRaw (Env envPtr) = (,) <$> cenvWithScopes envPtr <*> cenvWithCount envPtr
 
 -- | Build with-scopes for a trimmed env at a site that needs with-scope
 -- access ('CapturesWithScopes').  Appends the root scope (builtins) as
 -- the outermost entry so 'EWithVar' can fall back to builtins without
 -- retaining the parent chain.  Returns C array + count.
-{-# NOINLINE withScopesForCapture #-}
-withScopesForCapture :: EnvSite -> Env -> (Ptr (Ptr ()), Word32)
-withScopesForCapture site (Env envPtr) = unsafePerformIO $ do
+withScopesForCapture :: (MonadCData m) => EnvSite -> Env -> m (Ptr (Ptr ()), Word32)
+withScopesForCapture site (Env envPtr) = do
   rootPtr <- cenvRootScope envPtr
-  existingWiths <- cenvWithScopes envPtr
-  existingCount <- cenvWithCount envPtr
+  (existingWiths, existingCount) <- envWithScopesRaw (Env envPtr)
   if rootPtr == nullPtr
     then pure (existingWiths, existingCount)
     else do
       -- existingCount sits far below 2^32 (the C side caps the array
       -- allocation at UINT32_MAX bytes), so the increment cannot wrap.
       let newCount = existingCount + 1
-      arr <- checkedCPtr "nn_env_alloc_with_scopes" =<< cenvAllocWithScopes site newCount
-      forM_ [0 .. fromIntegral existingCount - 1] $ \i -> do
-        val <- peekElemOff existingWiths i
-        pokeElemOff arr i val
-      -- The root scope goes last: it is the outermost.
-      pokeElemOff arr (fromIntegral existingCount) rootPtr
+      arr <- checked "nn_env_alloc_with_scopes" =<< cenvAllocWithScopes site newCount
+      cdataIO $ do
+        forM_ [0 .. fromIntegral existingCount - 1] $ \i -> do
+          val <- peekElemOff existingWiths i
+          pokeElemOff arr i val
+        -- The root scope goes last: it is the outermost.
+        pokeElemOff arr (fromIntegral existingCount) rootPtr
       pure (arr, newCount)
 
+-- | Compile an expression to bytecode, answering the index of its code.
+-- Appends to the bytecode store; the same expression compiled twice
+-- answers two indices running the same code.
+compile :: (MonadCData m) => Expr -> m Word32
+compile expr = cdataIO (compileExpr expr)
+
+-- | 'compile' for parsed source, whose names are interned first, in the
+-- order upstream's parser interns them ('compileParsed').
+compileSource :: (MonadCData m) => ParsedSource -> m Word32
+compileSource parsed = cdataIO (compileParsed parsed)
+
 -- | Create an unevaluated thunk with a fresh C arena-allocated cell,
--- compiling the Expr to bytecode first.  Compiling under
--- 'unsafePerformIO' is safe because it only appends code to the bytecode
--- store, and every index it answers for the same expression runs the
--- same code.
-mkThunk :: Env -> Expr -> Thunk
-mkThunk env thunkExpr =
-  mkThunkBc env (unsafePerformIO (compileExpr thunkExpr))
+-- compiling the Expr to bytecode first.
+mkThunk :: (MonadCData m) => Env -> Expr -> m Thunk
+mkThunk env thunkExpr = compile thunkExpr >>= mkThunkBc env
 
 -- | Like 'mkThunk' but avoids C arena allocation for trivial expressions.
 -- Resolved variables reuse the existing thunk from the env (no wrapper).
 -- Literals use inline C scalars (no StablePtr).
 -- Lambdas compile formals+body to bytecode and produce VLambda directly.
 -- Everything else falls back to 'mkThunk'.
-cheapThunk :: Env -> Expr -> Thunk
+cheapThunk :: (MonadCData m) => Env -> Expr -> m Thunk
 cheapThunk env (EResolvedVar level idx) = envLookupResolved level idx env
-cheapThunk _ (ELit (NixInt n)) = Thunk (newComputedIntPtr n)
-cheapThunk _ (ELit (NixFloat n)) = Thunk (newComputedFloatPtr n)
-cheapThunk _ (ELit (NixBool b)) = Thunk (cthunkBool b)
-cheapThunk _ (ELit NixNull) = Thunk cthunkNull
-cheapThunk env (ELambda formals body NoCaptureInfo) =
-  let bodyBcIdx = unsafePerformIO (compileExpr body)
-      evalFormals = unsafePerformIO (compileFormalsToEval formals)
-   in evaluated (VLambda env evalFormals bodyBcIdx)
-cheapThunk env (ELambda formals body (Captures captureList)) =
-  let (slotsPtr, slotCount) = buildCSlots EnvClosure [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-      trimmedEnv = newMinimalEnv EnvClosure slotsPtr slotCount
-      bodyBcIdx = unsafePerformIO (compileExpr body)
-      evalFormals = unsafePerformIO (compileFormalsToEval formals)
-   in evaluated (VLambda trimmedEnv evalFormals bodyBcIdx)
-cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
-  let (slotsPtr, slotCount) = buildCSlots EnvClosure [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-      (withArr, withCount) = withScopesForCapture EnvClosure env
-      trimmedEnv = newCEnv EnvClosure slotsPtr slotCount Nothing Nothing withArr withCount
-      bodyBcIdx = unsafePerformIO (compileExpr body)
-      evalFormals = unsafePerformIO (compileFormalsToEval formals)
-   in evaluated (VLambda trimmedEnv evalFormals bodyBcIdx)
+cheapThunk _ (ELit (NixInt n)) = Thunk <$> cthunkNewComputedInt n
+cheapThunk _ (ELit (NixFloat n)) = Thunk <$> cthunkNewComputedFloat n
+cheapThunk _ (ELit (NixBool b)) = pure (Thunk (cthunkBool b))
+cheapThunk _ (ELit NixNull) = pure (Thunk cthunkNull)
+cheapThunk env (ELambda formals body captureInfo) = do
+  closureEnv <- buildCaptureEnv EnvClosure env captureInfo
+  bodyBcIdx <- compile body
+  evalFormals <- cdataIO (compileFormalsToEval formals)
+  evaluated (VLambda closureEnv evalFormals bodyBcIdx)
 cheapThunk env expr = mkThunk env expr
 
--- | A pending thunk running the code at a bytecode index in an env.  The
--- cell holds the env's C pointer, so forcing the t'Thunk' forces the
--- t'Env' first.  The env's slots need not be filled yet: 'tieFrame'
--- builds a recursive frame's env before the thunks that point at it and
--- fills its slots after.
-mkThunkBc :: Env -> Word32 -> Thunk
-mkThunkBc (Env envPtr) bcIdx =
-  Thunk (newBcThunkPtr bcIdx envPtr)
+-- | The env, at a site, that a closure made in an env runs in, by its
+-- capture info: 'NoCaptureInfo' keeps the env as it is, 'Captures' makes
+-- a minimal env of the captured slots, and 'CapturesWithScopes' adds the
+-- with-scopes ('withScopesForCapture').
+buildCaptureEnv :: (MonadCData m) => EnvSite -> Env -> CaptureInfo -> m Env
+buildCaptureEnv _ env NoCaptureInfo = pure env
+buildCaptureEnv site env (Captures captureList) = do
+  (slotsPtr, slotCount) <- capturedSlots site env captureList
+  newMinimalEnv site slotsPtr slotCount
+buildCaptureEnv site env (CapturesWithScopes captureList) = do
+  (slotsPtr, slotCount) <- capturedSlots site env captureList
+  (withArr, withCount) <- withScopesForCapture site env
+  newCEnv site slotsPtr slotCount Nothing Nothing withArr withCount
+
+-- | A slot array, for an env at a site, holding the thunks a closure
+-- captures, read from the env it is made in by their resolved level and
+-- index.
+capturedSlots :: (MonadCData m) => EnvSite -> Env -> [(Int, Int)] -> m (Ptr CThunkPtr, Int)
+capturedSlots site env captureList =
+  mapM (\(lvl, idx) -> envLookupResolved lvl idx env) captureList >>= buildCSlots site
+
+-- | A pending thunk running the code at a bytecode index in an env: a
+-- fresh PENDING cell holding the index and the env's C pointer, neither
+-- of them on the GHC heap.  Forcing the t'Thunk' runs the code in that
+-- env.  The env's slots need not be filled yet: 'tieFrame' builds a
+-- recursive frame's env before the thunks that point at it and fills its
+-- slots after.
+mkThunkBc :: (MonadCData m) => Env -> Word32 -> m Thunk
+mkThunkBc (Env envPtr) bcIdx = Thunk <$> cthunkNewBc bcIdx (castPtr envPtr)
+
+-- | The code a PENDING or BLACKHOLE thunk runs, and the env it runs in, as
+-- 'mkThunkBc' stored them.
+pendingCode :: (MonadCData m) => CThunkPtr -> m (Env, Word32)
+pendingCode ptr = (,) <$> pendingThunkEnv ptr <*> cthunkGetBcIdx ptr
 
 -- | The env a PENDING or BLACKHOLE thunk's code runs in, as 'mkThunkBc'
 -- stored it.
-pendingThunkEnv :: CThunkPtr -> IO Env
+pendingThunkEnv :: (MonadCData m) => CThunkPtr -> m Env
 pendingThunkEnv ptr = Env . castPtr <$> cthunkPayload ptr
 
 -- | Like 'cheapThunk' but for bytecode indices (used inside evalBytecode).
 -- Short-circuits for resolved vars and literals without creating a
 -- pending thunk.  Everything else falls back to 'mkThunkBc'.
-cheapThunkBc :: Env -> Word32 -> Thunk
+cheapThunkBc :: (MonadCData m) => Env -> Word32 -> m Thunk
 cheapThunkBc env bcIdx =
-  case unsafePerformIO (cbcOpcode bcIdx) of
-    OpResolvedVar ->
-      let level = fromIntegral (unsafePerformIO (cbcArg1 bcIdx))
-          idx = fromIntegral (unsafePerformIO (cbcArg2 bcIdx))
-       in envLookupResolved level idx env
-    OpLitInt ->
-      let lo = unsafePerformIO (cbcArg1 bcIdx)
-          hi = unsafePerformIO (cbcArg2 bcIdx)
-          w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
-       in Thunk (newComputedIntPtr (fromIntegral w64 :: Int64))
-    OpLitFloat ->
-      let lo = unsafePerformIO (cbcArg1 bcIdx)
-          hi = unsafePerformIO (cbcArg2 bcIdx)
-          w64 = fromIntegral lo .|. (fromIntegral hi `shiftL` 32) :: Word64
-       in Thunk (newComputedFloatPtr (castWord64ToDouble w64))
-    OpLitBool ->
-      let flag = unsafePerformIO (cbcShortArg bcIdx)
-       in Thunk (cthunkBool (flag /= 0))
-    OpLitNull -> Thunk cthunkNull
-    OpLitUri ->
-      let sym = unsafePerformIO (cbcArg1 bcIdx)
-       in Thunk (newComputedStrPtr (symbolBytes (Symbol sym)))
-    OpStr
-      | Just bytes <- literalStrBytes bcIdx -> Thunk (newComputedStrPtr bytes)
-    OpLitPath
-      | Just resolved <- constantPathValue bcIdx -> Thunk (newComputedPathPtr resolved)
-    OpList
-      | emptyBcList bcIdx -> Thunk (newComputedThunkPtr (VList emptyCList))
+  cbcOpcode bcIdx >>= \case
+    OpResolvedVar -> do
+      level <- cbcArg1 bcIdx
+      idx <- cbcArg2 bcIdx
+      envLookupResolved (fromIntegral level) (fromIntegral idx) env
+    OpLitInt -> do
+      w64 <- literalWord64 bcIdx
+      Thunk <$> cthunkNewComputedInt (fromIntegral w64)
+    OpLitFloat -> do
+      w64 <- literalWord64 bcIdx
+      Thunk <$> cthunkNewComputedFloat (castWord64ToDouble w64)
+    OpLitBool -> do
+      flag <- cbcShortArg bcIdx
+      pure (Thunk (cthunkBool (flag /= 0)))
+    OpLitNull -> pure (Thunk cthunkNull)
+    OpLitUri -> do
+      sym <- cbcArg1 bcIdx
+      Thunk <$> newComputedStrPtr (symbolBytes (Symbol sym))
+    OpStr ->
+      literalStrBytes bcIdx >>= \case
+        Just bytes -> Thunk <$> newComputedStrPtr bytes
+        Nothing -> mkThunkBc env bcIdx
+    OpLitPath ->
+      constantPathValue bcIdx >>= \case
+        Just resolved -> Thunk <$> newComputedPathPtr resolved
+        Nothing -> mkThunkBc env bcIdx
+    OpList -> do
+      empty <- emptyBcList bcIdx
+      if empty
+        then pure emptyListThunk
+        else mkThunkBc env bcIdx
     _ -> mkThunkBc env bcIdx
+
+-- | The one cell every empty list literal evaluates to, for the process,
+-- as upstream's @vEmptyList@ is one value: a cell per evaluation of @[ ]@
+-- would cost arena memory, which nothing frees, each time one is
+-- evaluated.  A process-global value, allocated where the first empty list
+-- literal is evaluated ('runCDataPure'); the allocation writes only the
+-- cell it makes.
+emptyListThunk :: Thunk
+emptyListThunk = runCDataPure (evaluated (VList emptyCList))
+{-# NOINLINE emptyListThunk #-}
+
+-- | The 64 bits of an integer or float literal, split across the
+-- instruction's two 32-bit arguments, low word first.
+literalWord64 :: (MonadCData m) => Word32 -> m Word64
+literalWord64 bcIdx = do
+  lo <- cbcArg1 bcIdx
+  hi <- cbcArg2 bcIdx
+  pure (fromIntegral lo .|. (fromIntegral hi `shiftL` 32))
 
 -- | The value of a path literal, when producing it is not work.
 --
@@ -805,20 +852,21 @@ cheapThunkBc env bcIdx =
 -- absolute and only wants the lexical canonicalisation every path value
 -- carries.  The exception is a home-relative literal, which parsing leaves
 -- alone: expanding it reads @HOME@, and that is an effect this cannot run.
-constantPathValue :: Word32 -> Maybe Text
-constantPathValue bcIdx
-  | T.isPrefixOf "~/" text = Nothing
-  | otherwise = Just (canonPathValue text)
-  where
-    text = symbolText (Symbol (unsafePerformIO (cbcArg1 bcIdx)))
+constantPathValue :: (MonadCData m) => Word32 -> m (Maybe Text)
+constantPathValue bcIdx = do
+  text <- symbolText . Symbol <$> cbcArg1 bcIdx
+  pure $
+    if T.isPrefixOf "~/" text
+      then Nothing
+      else Just (canonPathValue text)
 
 -- | Whether a list expression has no elements, and so is the same empty list
 -- however many times it is written.  Upstream hands back one shared
--- @vEmptyList@ for this rather than a thunk.
-emptyBcList :: Word32 -> Bool
-emptyBcList bcIdx =
-  let (count, _) = unsafePerformIO (cbcCountedPayload bcIdx =<< cbcArg1 bcIdx)
-   in count == 0
+-- @vEmptyList@ for this rather than a thunk; here it is 'emptyListThunk'.
+emptyBcList :: (MonadCData m) => Word32 -> m Bool
+emptyBcList bcIdx = do
+  (count, _) <- cbcCountedPayload bcIdx =<< cbcArg1 bcIdx
+  pure (count == 0)
 
 -- | @NN_STRPART_LIT@ from @cbits/nn_bytecode.h@: a string part that is
 -- literal text rather than an interpolation.
@@ -838,32 +886,19 @@ strPartLiteral = 0
 -- stripped during evaluation rather than in the parser, so its value is not
 -- yet a constant at this point.  Upstream can treat one as a constant
 -- because its parser has already done that stripping.
-literalStrBytes :: Word32 -> Maybe ByteString
-literalStrBytes bcIdx =
-  let (count, dataOff) = unsafePerformIO (cbcCountedPayload bcIdx =<< cbcArg1 bcIdx)
-   in BS.concat <$> partBytes count dataOff
+literalStrBytes :: (MonadCData m) => Word32 -> m (Maybe ByteString)
+literalStrBytes bcIdx = do
+  (count, dataOff) <- cbcCountedPayload bcIdx =<< cbcArg1 bcIdx
+  fmap BS.concat <$> partBytes count dataOff
   where
-    partBytes 0 _ = Just []
-    partBytes n off
-      | unsafePerformIO (cbcData off) /= strPartLiteral = Nothing
-      | otherwise =
-          let sym = unsafePerformIO (cbcData (off + 1))
-           in (symbolBytes (Symbol sym) :) <$> partBytes (n - 1 :: Int) (off + 2)
-
--- | Allocate a fresh PENDING cell holding a bytecode index and an env's C
--- pointer, neither of them on the GHC heap.
---
--- The allocation runs under 'unsafePerformIO', which is safe because the
--- cell is fresh arena memory nothing else can see until this returns.
--- @NOINLINE@ keeps the call opaque, so GHC cannot inline the allocation
--- into a caller and duplicate it there, and the C call uses both
--- arguments, so no transformation can hoist it out from under them: a
--- cell can be shared only between thunks over the same code in the same
--- env.
-{-# NOINLINE newBcThunkPtr #-}
-newBcThunkPtr :: Word32 -> Ptr NnEnv -> CThunkPtr
-newBcThunkPtr bcIdx envPtr =
-  unsafePerformIO (cthunkNewBc bcIdx (castPtr envPtr))
+    partBytes 0 _ = pure (Just [])
+    partBytes n off = do
+      tag <- cbcData off
+      if tag /= strPartLiteral
+        then pure Nothing
+        else do
+          sym <- cbcData (off + 1)
+          fmap (symbolBytes (Symbol sym) :) <$> partBytes (n - 1 :: Int) (off + 2)
 
 -- | Wrap an already-computed value as a thunk.
 -- Ints and floats use inline C thunks (no StablePtr); booleans and null
@@ -871,19 +906,25 @@ newBcThunkPtr bcIdx envPtr =
 -- @vFalse@ and @vNull@ (eval.cc at 2.24.9, @EvalState::getBool@).
 -- Attrs, paths, and context-free strings use C-native tags (no StablePtr).
 -- Other complex values fall back to StablePtr-backed C thunks.
-evaluated :: NixValue -> Thunk
-evaluated (VInt n) = Thunk (newComputedIntPtr n)
-evaluated (VFloat d) = Thunk (newComputedFloatPtr d)
-evaluated (VBool b) = Thunk (cthunkBool b)
-evaluated VNull = Thunk cthunkNull
-evaluated (VAttrs (AttrSet cset)) = Thunk (newComputedAttrsPtr cset)
-evaluated (VPath p) = Thunk (newComputedPathPtr p)
-evaluated (VStr t ctx)
-  | ctx == emptyContext = Thunk (newComputedStrPtr t)
-  | otherwise = Thunk (newComputedCtxStrPtr t ctx)
-evaluated (VList cl) = Thunk (newComputedListPtrC cl)
-evaluated (VLambda env formals bodyBcIdx) = Thunk (newComputedLambdaPtr env formals bodyBcIdx)
-evaluated val = Thunk (newComputedThunkPtr val)
+evaluated :: (MonadCData m) => NixValue -> m Thunk
+evaluated val =
+  Thunk <$> case val of
+    VInt n -> cthunkNewComputedInt n
+    VFloat d -> cthunkNewComputedFloat d
+    VBool b -> pure (cthunkBool b)
+    VNull -> pure cthunkNull
+    VAttrs (AttrSet cset) -> cthunkNewComputedAttrs (castPtr cset)
+    VPath p -> newComputedPathPtr p
+    VStr t ctx
+      | ctx == emptyContext -> newComputedStrPtr t
+      | otherwise -> do
+          ptr <- marshalStringContext t ctx
+          cthunkNewComputedCtxStr (castPtr ptr)
+    VList (CList clistPtr) -> cthunkNewComputedList (castPtr clistPtr)
+    VLambda (Env envPtr) formals bodyBcIdx -> marshalLambda envPtr formals bodyBcIdx >>= cthunkNewComputedLambda
+    _ -> do
+      sp <- cdataIO (newStablePtr val)
+      cthunkNewComputed (castStablePtrToPtr sp)
 
 -- | Check if two thunks share the same memoization cell (C pointer
 -- equality): upstream's test of one @Value@'s address against another's,
@@ -895,82 +936,30 @@ thunkSameRef (Thunk p1) (Thunk p2) = p1 == p2
 thunkToCPtr :: Thunk -> CThunkPtr
 thunkToCPtr (Thunk ptr) = ptr
 
--- | Wrap an already-computed 'NixValue' in a C thunk (StablePtr path).
--- Arena-allocated (O(1)).  Used for complex values (string, list, attrs, etc.).
-{-# NOINLINE newComputedThunkPtr #-}
-newComputedThunkPtr :: NixValue -> CThunkPtr
-newComputedThunkPtr val =
-  unsafePerformIO $ val `seq` do
-    sp <- newStablePtr val
-    cthunkNewComputed (castStablePtrToPtr sp)
-
--- | Wrap an int64 in a pre-computed C thunk (inline, no StablePtr).
-{-# NOINLINE newComputedIntPtr #-}
-newComputedIntPtr :: Int64 -> CThunkPtr
-newComputedIntPtr n = unsafePerformIO (cthunkNewComputedInt n)
-
--- | Wrap a double in a pre-computed C thunk (inline, no StablePtr).
-{-# NOINLINE newComputedFloatPtr #-}
-newComputedFloatPtr :: Double -> CThunkPtr
-newComputedFloatPtr d = unsafePerformIO (cthunkNewComputedFloat d)
-
 -- | Wrap a context-free string in a pre-computed C thunk (interned symbol, no StablePtr).
-{-# NOINLINE newComputedStrPtr #-}
-newComputedStrPtr :: ByteString -> CThunkPtr
-newComputedStrPtr t =
-  unsafePerformIO $ t `seq` do
-    Symbol sym <- symbolInternBytes t
-    cthunkNewComputedStr sym
+newComputedStrPtr :: (MonadCData m) => ByteString -> m CThunkPtr
+newComputedStrPtr t = do
+  Symbol sym <- symbolInternBytes t
+  cthunkNewComputedStr sym
 
 -- | Wrap a path in a pre-computed C thunk (interned symbol, no StablePtr).
-{-# NOINLINE newComputedPathPtr #-}
-newComputedPathPtr :: Text -> CThunkPtr
-newComputedPathPtr p =
-  unsafePerformIO $ p `seq` do
-    Symbol sym <- symbolIntern p
-    cthunkNewComputedPath sym
-
--- | Wrap a CList in a pre-computed C thunk (no conversion needed).
-{-# NOINLINE newComputedListPtrC #-}
-newComputedListPtrC :: CList -> CThunkPtr
-newComputedListPtrC (CList clistPtr) =
-  unsafePerformIO
-    $ clistPtr
-    `seq` cthunkNewComputedList (castPtr clistPtr)
-
--- | Wrap a string with context in a pre-computed C thunk (no StablePtr).
--- Interns the payload bytes and all StorePath fields as symbols, builds nn_ctxstr_t.
-{-# NOINLINE newComputedCtxStrPtr #-}
-newComputedCtxStrPtr :: ByteString -> StringContext -> CThunkPtr
-newComputedCtxStrPtr t ctx =
-  unsafePerformIO $
-    t `seq`
-      ctx `seq` do
-        ptr <- marshalStringContext t ctx
-        cthunkNewComputedCtxStr (castPtr ptr)
-
--- | Wrap a lambda closure in a pre-computed C thunk (no StablePtr).
--- Marshals EvalFormals to nn_lambda_t, stores as tag 9.
-{-# NOINLINE newComputedLambdaPtr #-}
-newComputedLambdaPtr :: Env -> EvalFormals -> Word32 -> CThunkPtr
-newComputedLambdaPtr (Env envPtr) formals bodyBcIdx =
-  unsafePerformIO $
-    formals `seq` do
-      clam <- marshalLambda envPtr formals bodyBcIdx
-      cthunkNewComputedLambda clam
+newComputedPathPtr :: (MonadCData m) => Text -> m CThunkPtr
+newComputedPathPtr p = do
+  Symbol sym <- symbolIntern p
+  cthunkNewComputedPath sym
 
 -- | Marshal Env + EvalFormals + body bc_idx to a C nn_lambda_t.
-marshalLambda :: Ptr NnEnv -> EvalFormals -> Word32 -> IO (Ptr ())
+marshalLambda :: (MonadCData m) => Ptr NnEnv -> EvalFormals -> Word32 -> m (Ptr ())
 marshalLambda envPtr formals bodyBcIdx = case formals of
   EFName name -> do
     Symbol nameSym <- symbolIntern name
-    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 0 nameSym invalidSymbolId 0 0
+    lam <- checked "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 0 nameSym invalidSymbolId 0 0
     pure (castPtr lam)
   EFSet lambdaName entries allowExtra -> do
     lambdaSym <- lambdaNameSymbol lambdaName
     let count = fromIntegral (length entries) :: Word32
         extraFlag = if allowExtra then 1 else 0 :: Word8
-    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 1 0 lambdaSym extraFlag count
+    lam <- checked "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 1 0 lambdaSym extraFlag count
     fillEntries lam 0 entries
     pure (castPtr lam)
   EFNamedSet lambdaName name entries allowExtra -> do
@@ -978,7 +967,7 @@ marshalLambda envPtr formals bodyBcIdx = case formals of
     Symbol nameSym <- symbolIntern name
     let count = fromIntegral (length entries) :: Word32
         extraFlag = if allowExtra then 1 else 0 :: Word8
-    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 2 nameSym lambdaSym extraFlag count
+    lam <- checked "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 2 nameSym lambdaSym extraFlag count
     fillEntries lam 0 entries
     pure (castPtr lam)
   where
@@ -993,7 +982,7 @@ marshalLambda envPtr formals bodyBcIdx = case formals of
 
 -- | Read a C nn_lambda_t back into VLambda.
 -- Reconstructs Env (newtype wrap), EvalFormals (from symbol IDs), body bc_idx.
-unmarshalLambdaValue :: Ptr () -> IO NixValue
+unmarshalLambdaValue :: (MonadCData m) => Ptr () -> m NixValue
 unmarshalLambdaValue rawPtr = do
   let lamPtr = castPtr rawPtr
   envPtr <- clambdaEnv lamPtr
@@ -1033,12 +1022,12 @@ unmarshalLambdaValue rawPtr = do
 -- | Marshal payload bytes + StringContext to a C nn_ctxstr_t.  The
 -- payload interns byte-level ('symbolInternBytes'); the StorePath and
 -- output-name fields are Text and intern as UTF-8.
-marshalStringContext :: ByteString -> StringContext -> IO CCtxStrPtr
+marshalStringContext :: (MonadCData m) => ByteString -> StringContext -> m CCtxStrPtr
 marshalStringContext textVal (StringContext ctxSet) = do
   Symbol textSym <- symbolInternBytes textVal
   let elems = Set.toAscList ctxSet
       count = fromIntegral (length elems) :: Word32
-  ptr <- checkedCPtr "nn_ctxstr_new" =<< cctxstrNew textSym count
+  ptr <- checked "nn_ctxstr_new" =<< cctxstrNew textSym count
   fillElems ptr 0 elems
   pure ptr
   where
@@ -1061,7 +1050,7 @@ marshalStringContext textVal (StringContext ctxSet) = do
       cctxstrSetAllOutputs eptr eidx hashSym nameSym
 
 -- | Unmarshal a C nn_ctxstr_t back to (payload bytes, StringContext).
-unmarshalStringContext :: CCtxStrPtr -> IO (ByteString, StringContext)
+unmarshalStringContext :: (MonadCData m) => CCtxStrPtr -> m (ByteString, StringContext)
 unmarshalStringContext ptr = do
   textSym <- cctxstrText ptr
   count <- cctxstrCtxCount ptr
@@ -1090,33 +1079,15 @@ unmarshalStringContext ptr = do
           pure (SCDrvOutput sp (symbolText (Symbol outSym)))
         _ -> pure (SCAllOutputs sp)
 
--- | Wrap a CAttrSet in a pre-computed C thunk (pointer, no StablePtr).
-{-# NOINLINE newComputedAttrsPtr #-}
-newComputedAttrsPtr :: CAttrSet -> CThunkPtr
-newComputedAttrsPtr cset =
-  unsafePerformIO
-    $ cset
-    `seq` cthunkNewComputedAttrs (castPtr cset)
-
 -- | Build a C-allocated slot array, for an env at a site, from a list of
 -- t'Thunk' values.  Each thunk is converted to 'CThunkPtr' via
 -- 'thunkToCPtr'.  Returns the C array pointer and the slot count.
--- Uses 'unsafePerformIO' - safe because allocation is idempotent.
-{-# NOINLINE buildCSlots #-}
-buildCSlots :: EnvSite -> [Thunk] -> (Ptr CThunkPtr, Int)
-buildCSlots site thunks = unsafePerformIO $ do
+buildCSlots :: (MonadCData m) => EnvSite -> [Thunk] -> m (Ptr CThunkPtr, Int)
+buildCSlots site thunks = do
   let n = length thunks
-  if n == 0
-    then pure (nullPtr, 0)
-    else do
-      arr <- checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots site (fromIntegral n)
-      pokeSlots arr 0 thunks
-      pure (arr, n)
-  where
-    pokeSlots _ _ [] = pure ()
-    pokeSlots arr i (t : ts) = do
-      pokeElemOff arr i (thunkToCPtr t)
-      pokeSlots arr (i + 1) ts
+  arr <- newSlotArray site n
+  fillSlots arr thunks
+  pure (arr, n)
 
 -- | Tie a frame whose slots hold thunks that may point back at it: the
 -- slot array is allocated first, the env built over it next, the thunks
@@ -1124,31 +1095,33 @@ buildCSlots site thunks = unsafePerformIO $ do
 -- allocates @env2@ before it fills the values (@ExprLet::eval@,
 -- @ExprAttrs::eval@ and @EvalState::callFunction@, eval.cc at 2.24.9).
 -- The slots are allocated for an env at the site given, which @mkEnv@
--- builds there too; it receives the slot array and its size.
--- @mkThunks@ answers one thunk per slot, in slot order, and must not read
--- the frame's own slots, which are not all filled until this returns
--- ('mkThunkBc' does not).  Answers the env and those thunks.
---
--- The allocations run under 'unsafePerformIO', which is safe because the
--- slots and the env are fresh arena memory nothing else can see until
--- this returns.  @NOINLINE@ keeps the call opaque, and it depends on the
--- functions that build the env and the thunks, so no transformation can
--- share one frame between calls that build different ones.
-{-# NOINLINE tieFrame #-}
-tieFrame :: EnvSite -> Int -> (Ptr CThunkPtr -> Int -> Env) -> (Env -> [Thunk]) -> (Env, [Thunk])
-tieFrame site slotCount mkEnv mkThunks = unsafePerformIO $ do
+-- builds there too; it receives the slot array and its size.  @mkThunks@
+-- answers one thunk per slot, in slot order, and must not read the
+-- frame's own slots, which are not all filled until this returns
+-- ('mkThunkBc' does not; 'envLookupResolved' refuses an unfilled one).
+-- Answers the env and those thunks.
+tieFrame :: (MonadCData m) => EnvSite -> Int -> (Ptr CThunkPtr -> Int -> m Env) -> (Env -> m [Thunk]) -> m (Env, [Thunk])
+tieFrame site slotCount mkEnv mkThunks = do
   slots <- newSlotArray site slotCount
-  let !env = mkEnv slots slotCount
-      thunks = mkThunks env
-  forM_ (zip [0 .. slotCount - 1] thunks) $ \(i, thunk) ->
-    pokeElemOff slots i (thunkToCPtr thunk)
+  env <- mkEnv slots slotCount
+  thunks <- mkThunks env
+  fillSlots slots (take slotCount thunks)
   pure (env, thunks)
 
 -- | A zeroed C slot array of the given size for an env at a site, or
 -- 'nullPtr' for none.
-newSlotArray :: EnvSite -> Int -> IO (Ptr CThunkPtr)
+newSlotArray :: (MonadCData m) => EnvSite -> Int -> m (Ptr CThunkPtr)
 newSlotArray _ 0 = pure nullPtr
-newSlotArray site n = checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots site (fromIntegral n)
+newSlotArray site n = checked "nn_env_alloc_slots" =<< cenvAllocSlots site (fromIntegral n)
+
+-- | Write thunks into a slot array, first to last from slot 0.
+fillSlots :: (MonadCData m) => Ptr CThunkPtr -> [Thunk] -> m ()
+fillSlots slots thunks = cdataIO (zipWithM_ (\i thunk -> pokeElemOff slots i (thunkToCPtr thunk)) [0 ..] thunks)
+
+-- | Reject the NULL a C constructor answers when it cannot allocate,
+-- raising 'Nix.Eval.CStatus.CStatusError' naming the entry point.
+checked :: (MonadCData m) => String -> Ptr a -> m (Ptr a)
+checked site ptr = cdataIO (checkedCPtr site ptr)
 
 -- | A value's type as an error message names it: upstream's @showType@ on
 -- a value (eval.cc at 2.24.9, the same in 2.33.2), which every type error
@@ -1212,8 +1185,10 @@ data PathExistence
 
 -- | Effect class for Nix evaluation.  Core logic is polymorphic in @m@
 -- so the same evaluator composes into t'PureEval' for tests or @IO@ for
--- real file-system access (e.g. @import@, @readFile@).
-class (Monad m) => MonadEval m where
+-- real file-system access (e.g. @import@, @readFile@).  Every evaluator
+-- runs the C data layer's actions in sequence with its own
+-- ('MonadCData').
+class (MonadCData m) => MonadEval m where
   -- | Raise an evaluation error (type error, missing attribute, IO
   -- failure).  NOT caught by @builtins.tryEval@: upstream Nix catches only
   -- ThrownError\/AssertionError there, and every other EvalError escapes.
@@ -1480,25 +1455,49 @@ storePathOrThrow = either (throwEvalError . badStorePathText) pure
 -- escape it, exactly as in C++ Nix.
 data PureError = PThrow !Text | PError !Text | PAbort !Text
 
--- | Pure evaluation monad - @Either PureError@ under a reader carrying
--- the call depth.  IO builtins ('readFile', 'import') are unavailable;
+-- | Pure evaluation monad: given the call depth, a t'CData' action
+-- answering @Either PureError@, so its only effect is the C data layer.
+-- IO builtins ('readFile', 'import') are unavailable, and
 -- everything else evaluates identically to the IO version, the
 -- @max-call-depth@ ceiling included, at its upstream default.  It carries
 -- no filesystem policy: there is no filesystem, environment or network
 -- behind it to gate, so it reports 'unrestrictedPolicy' and every URI
--- check passes.
-newtype PureEval a = PureEval (ReaderT CallDepth (Either PureError) a)
-  deriving (Functor, Applicative, Monad)
+-- check passes.  It never writes a cell it did not allocate: a force
+-- reads a thunk and evaluates it without memoizing, so it marks no
+-- blackhole either.
+newtype PureEval a = PureEval (CallDepth -> CData (Either PureError a))
+
+instance Functor PureEval where
+  fmap f (PureEval run) = PureEval (fmap (fmap f) . run)
+
+instance Applicative PureEval where
+  pure a = PureEval (\_ -> pure (Right a))
+  PureEval runF <*> PureEval runA = PureEval $ \depth ->
+    runF depth >>= either (pure . Left) (\f -> fmap f <$> runA depth)
+
+instance Monad PureEval where
+  PureEval run >>= k = PureEval $ \depth ->
+    run depth >>= either (pure . Left) (\a -> runPure (k a) depth)
+
+instance MonadCData PureEval where
+  liftCData act = PureEval (\_ -> Right <$> act)
+
+-- | A pure evaluation run at a call depth.
+runPure :: PureEval a -> CallDepth -> CData (Either PureError a)
+runPure (PureEval run) = run
 
 -- | Fail a pure evaluation.
 pureFailure :: PureError -> PureEval a
-pureFailure = PureEval . lift . Left
+pureFailure failure = PureEval (\_ -> pure (Left failure))
 
 -- | Run a pure evaluation, flattening the internal error into 'Text': a
--- failure's message, as t'Nix.Eval.IO.EvalIO' reports it.
+-- failure's message, as t'Nix.Eval.IO.EvalIO' reports it.  The run is a
+-- value ('runCDataPure'): the evaluation writes only cells it allocates
+-- and the with-scope entries it resolves ("Nix.Eval.CData" says what two
+-- runs resolving one entry can show).
 runPureEval :: PureEval a -> Either Text a
-runPureEval (PureEval action) =
-  case runReaderT action (topLevelCallDepth defaultMaxCallDepth) of
+runPureEval action =
+  case runCDataPure (runPure action (topLevelCallDepth defaultMaxCallDepth)) of
     Right a -> Right a
     Left (PThrow t) -> Left t
     Left (PError t) -> Left t
@@ -1511,11 +1510,11 @@ instance MonadEval PureEval where
 
   -- Catch only a throw/assert (tryEval sees the error); eval errors,
   -- aborts, and infinite recursion propagate, matching EvalIO and C++ Nix.
-  catchEvalError (PureEval action) =
-    PureEval $ ReaderT $ \depth -> case runReaderT action depth of
-      Left (PThrow t) -> Right (Left t)
-      Left other -> Left other
-      Right a -> Right (Right a)
+  catchEvalError (PureEval action) = PureEval (fmap caught . action)
+    where
+      caught (Left (PThrow t)) = Right (Left t)
+      caught (Left other) = Left other
+      caught (Right a) = Right (Right a)
 
   -- Pure evaluation has no external state, so there is nothing to
   -- clean up; the failure passes through unchanged.
@@ -1525,14 +1524,15 @@ instance MonadEval PureEval where
   -- has nowhere to go.  The line is still made, since a failure making it
   -- replaces the action's.
   addErrorTrace (PureEval line) (PureEval action) =
-    PureEval $ ReaderT $ \depth -> case runReaderT action depth of
-      Left failure -> runReaderT line depth >> Left failure
-      Right a -> Right a
+    PureEval $ \depth ->
+      action depth >>= \case
+        Left failure -> (>> Left failure) <$> line depth
+        Right a -> pure (Right a)
 
   -- The reader scopes the frame: the action runs one deeper, and whatever
   -- follows it sees the depth it started from, failure or not.
   withCallFrame (PureEval action) =
-    PureEval $ ReaderT $ \depth -> either (Left . PError) (runReaderT action) (enterCallFrame depth)
+    PureEval $ \depth -> either (pure . Left . PError) action (enterCallFrame depth)
   doesPathExist _ _ = pure False
   listDirectory _ = throwEvalError "builtins.readDir: not available in pure evaluation"
   importFile _ = throwEvalError "import: not available in pure evaluation"
@@ -1582,47 +1582,12 @@ instance MonadEval PureEval where
   -- No filesystem, so no drive to read on: a path names itself.
   qualifyPath = pure
   resolvePathLiteral = pure . canonPathValue
+
+  -- Reads the cell and never writes it: no memoization, and no
+  -- blackhole, so PureEval may force the same thunk again.
   forceThunk evalFn (Thunk ptr) =
-    -- Read the C thunk via unsafePerformIO - safe because reads are
-    -- idempotent and PureEval never writes back (no memoization).
-    -- Does NOT mark blackholes - PureEval may re-force the same thunk.
-    -- Dispatches on val_tag for computed scalars (no StablePtr deref).
-    case unsafePerformIO (cthunkState ptr) of
-      ThunkComputed ->
-        let tag = unsafePerformIO (cthunkValueTag ptr)
-         in case tag of
-              ValueInt -> pure (VInt (unsafePerformIO (cthunkGetInt ptr)))
-              ValueFloat -> pure (VFloat (unsafePerformIO (cthunkGetFloat ptr)))
-              ValueBool -> pure (VBool (unsafePerformIO (cthunkGetBool ptr) /= 0))
-              ValueNull -> pure VNull
-              ValueStr ->
-                let sym = unsafePerformIO (cthunkGetStr ptr)
-                 in pure (VStr (symbolBytes (Symbol sym)) emptyContext)
-              ValuePath ->
-                let sym = unsafePerformIO (cthunkGetPath ptr)
-                 in pure (VPath (symbolText (Symbol sym)))
-              ValueList ->
-                let listPtr = unsafePerformIO (cthunkGetList ptr)
-                 in pure (VList (CList (castPtr listPtr)))
-              ValueAttrs ->
-                let p = unsafePerformIO (cthunkGetAttrs ptr)
-                 in pure (VAttrs (AttrSet (castPtr p)))
-              ValueCtxStr ->
-                let csptr = unsafePerformIO (cthunkGetCtxStr ptr)
-                    (t, ctx) = unsafePerformIO (unmarshalStringContext (castPtr csptr))
-                 in pure (VStr t ctx)
-              ValueLambda ->
-                let lamRaw = unsafePerformIO (cthunkPayload ptr)
-                    val = unsafePerformIO (unmarshalLambdaValue lamRaw)
-                 in pure val
-              _ {- PTR -} ->
-                let payload = unsafePerformIO (cthunkPayload ptr)
-                    val = unsafePerformIO (deRefStablePtr (castPtrToStablePtr payload))
-                 in pure val
-      ThunkBlackhole ->
-        -- Non-catchable: must escape tryEval like in C++ Nix
-        abortEvaluation "infinite recursion encountered"
-      _ {- PENDING -} ->
-        let bcIdx = unsafePerformIO (cthunkGetBcIdx ptr)
-            env = unsafePerformIO (pendingThunkEnv ptr)
-         in evalFn env bcIdx
+    cthunkState ptr >>= \case
+      ThunkComputed -> readComputed ptr
+      -- Non-catchable: must escape tryEval like in C++ Nix
+      ThunkBlackhole -> abortEvaluation "infinite recursion encountered"
+      _ {- PENDING -} -> pendingCode ptr >>= uncurry evalFn

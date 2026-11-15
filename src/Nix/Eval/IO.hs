@@ -22,6 +22,8 @@ module Nix.Eval.IO
     -- * State
     EvalState (..),
     newEvalState,
+    newEvalStateWith,
+    nixPathValue,
     allowEvalPath,
 
     -- * Errors
@@ -50,25 +52,27 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Word (Word32)
 import Foreign.C.Error (Errno (..), eACCES, ePERM)
 import Foreign.Ptr (castPtr)
-import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
+import Foreign.StablePtr (castStablePtrToPtr, freeStablePtr, newStablePtr)
 import GHC.Exts (oneShot)
 import GHC.IO.Exception (ioe_errno)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNames)
 import Nix.Derivation (fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.Eval (deepForce, eval, evalParsed)
+import Nix.Eval (deepForce, eval, evalBytecode, evalParsed)
 import Nix.Eval.AttrPath (selectAttrPath)
+import Nix.Eval.CData (MonadCData (..), runCData)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CStatus (cInvariantViolated)
-import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
-import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, pendingThunkEnv, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
+import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolInternBytes)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, pendingCode, readComputed, storePathOrThrow, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -207,20 +211,37 @@ data EvalState = EvalState
   }
 
 -- | Create a fresh evaluation state rooted at the given directory, reading
--- and writing store objects under the given store directory.
--- Reads @NIX_PATH@ from the environment to populate search paths, its
--- bytes unchanged, as upstream's @initGC@ reads it
--- (src/libexpr/eval-gc.cc at Nix 2.24.9).  The one refusal is a Windows
--- @NIX_PATH@ holding an unpaired UTF-16 surrogate, which has no UTF-8
--- form and raises an 'IOException'.  The call-depth ceiling starts at
+-- and writing store objects under the given store directory, with the
+-- search path @NIX_PATH@ gives ('nixPathValue').  The entries are built
+-- in the C data layer, so with @NIX_PATH@ set this runs between
+-- 'Nix.Eval.Arena.arenaInit' and 'Nix.Eval.Arena.arenaDestroy'.
+newEvalState :: SP.StoreDir -> FilePath -> IO EvalState
+newEvalState storeDir baseDir = do
+  searchPaths <- nixPathValue >>= parseNixPath
+  newEvalStateWith searchPaths storeDir baseDir
+
+-- | The bytes of @NIX_PATH@, unchanged, as upstream's @initGC@ reads them
+-- (src/libexpr/eval-gc.cc at Nix 2.24.9), and empty when it is unset.  The
+-- one refusal is a Windows @NIX_PATH@ holding an unpaired UTF-16
+-- surrogate, which has no UTF-8 form and raises an 'IOException'.
+nixPathValue :: IO BS.ByteString
+nixPathValue =
+  lookupEnvBytes nixPathVar >>= \case
+    EnvUnset -> pure BS.empty
+    EnvValue value -> pure value
+    EnvUnpairedSurrogate ->
+      ioError (userError "NIX_PATH holds an unpaired UTF-16 surrogate, which has no UTF-8 form")
+
+-- | 'newEvalState' with the search path given, for a caller that builds
+-- its own from @NIX_PATH@ and more.  The call-depth ceiling starts at
 -- upstream's default; a caller with a configured one replaces
 -- 'esCallDepth'.
 --
 -- The state is unrestricted.  A restricting policy is set on 'esPolicy',
 -- and the roots it should admit are seeded with 'allowEvalPath' before
 -- evaluation starts, as upstream's constructor allows its lookup path.
-newEvalState :: SP.StoreDir -> FilePath -> IO EvalState
-newEvalState storeDir baseDir = do
+newEvalStateWith :: [Thunk] -> SP.StoreDir -> FilePath -> IO EvalState
+newEvalStateWith searchPaths storeDir baseDir = do
   cache <- newIORef Map.empty
   drvCache <- newIORef Map.empty
   drvClosure <- newIORef Map.empty
@@ -228,12 +249,6 @@ newEvalState storeDir baseDir = do
   storeWriteCache <- newIORef Map.empty
   allowedPaths <- newIORef noAllowedPaths
   now <- floor <$> getPOSIXTime :: IO Int64
-  nixPath <- lookupEnvBytes nixPathVar
-  searchPaths <- case nixPath of
-    EnvUnset -> pure []
-    EnvValue value -> pure (parseNixPath value)
-    EnvUnpairedSurrogate ->
-      ioError (userError "NIX_PATH holds an unpaired UTF-16 surrogate, which has no UTF-8 form")
   pure
     EvalState
       { esImportCache = cache,
@@ -319,25 +334,38 @@ instance Monad EvalIO where
 -- each of its binds and class methods is a call through the instance
 -- dictionary.  These compile the entry points a caller runs in EvalIO
 -- (evalParsed for this module's import and scopedImport and for the
--- executable's evaluation, eval for an expression built by hand, and
--- --strict and attribute selection) for EvalIO alone, and the library's
+-- executable's evaluation, evalBytecode for the executable's evaluation
+-- that keeps its root environment for a census, eval for an expression
+-- built by hand, and --strict and attribute selection) for EvalIO alone, and the library's
 -- specialisation flags carry that through everything they reach.  Each
 -- pragma exports a rule that sends a call at EvalIO in any module
 -- importing this one to that code.  The flags alone leave no rule for an
 -- entry point small enough to be inlined here rather than specialised, as
 -- eval is, so a caller in another module, the executable among them, would
 -- run the dictionary-passing evaluator.
-{-# SPECIALIZE evalParsed :: Env -> ParsedSource -> EvalIO NixValue #-}
+{-# SPECIALIZE evalParsed :: EvalIO Env -> ParsedSource -> EvalIO NixValue #-}
 
 {-# SPECIALIZE eval :: Env -> Expr -> EvalIO NixValue #-}
+
+{-# SPECIALIZE evalBytecode :: Env -> Word32 -> EvalIO NixValue #-}
 
 {-# SPECIALIZE deepForce :: NixValue -> EvalIO () #-}
 
 {-# SPECIALIZE selectAttrPath :: Text -> NixValue -> EvalIO (Either Text NixValue) #-}
 
+-- The root environment each import and scopedImport builds, here too:
+-- left to the flags, a piece of it ran on the dictionary-passing code.
+{-# SPECIALIZE builtinEnv :: EvalPolicy -> Int64 -> [Thunk] -> EvalIO Env #-}
+
+{-# SPECIALIZE builtinEnvWithScope :: EvalPolicy -> Int64 -> [Thunk] -> [(Text, Thunk)] -> EvalIO Env #-}
+
 -- ---------------------------------------------------------------------------
 -- MonadEval instance
 -- ---------------------------------------------------------------------------
+
+instance MonadCData EvalIO where
+  liftCData act = EvalIO (liftIO (runCData act))
+  {-# INLINE liftCData #-}
 
 instance MonadEval EvalIO where
   throwEvalError msg = EvalIO (liftIO (throwIO (NixEvalError ErrorUncatchable (untracedFailure msg))))
@@ -433,9 +461,9 @@ instance MonadEval EvalIO where
             -- with 30k+ entries) so GC can reclaim them.  nixpkgs only
             -- imports all-packages.nix once at the top level, so skipping
             -- the cache for it has zero performance cost.
-            let shouldCache = case result of
-                  VAttrs attrs -> attrSetSize attrs < importCacheMaxAttrs
-                  _ -> True
+            shouldCache <- case result of
+              VAttrs attrs -> (< importCacheMaxAttrs) <$> attrSetSize attrs
+              _ -> pure True
             when shouldCache $
               wrapIO (modifyIORef' cacheRef (Map.insert target result))
             pure result
@@ -574,11 +602,10 @@ instance MonadEval EvalIO where
       Left err -> rejectSource "scopedImport" target err
       Right parsed -> do
         -- No import cache for scoped imports (different scopes = different results)
-        let scopedEnv = builtinEnvWithScope policy timestamp searchPaths scope
         EvalIO
           ( local
               (\s -> s {esBaseDir = fileDir})
-              (unEvalIO (evalParsed scopedEnv parsed))
+              (unEvalIO (evalParsed (builtinEnvWithScope policy timestamp searchPaths scope) parsed))
           )
 
   readFileBytes path = do
@@ -826,23 +853,21 @@ instance MonadEval EvalIO where
     -- knot-tying (evalBcRecAttrs, evalBcLet, matchFormalSet) because those
     -- patterns create distinct thunks sharing an env - no thunk ever
     -- forces itself.
-    state <- EvalIO (liftIO (cthunkState ptr))
+    state <- cthunkState ptr
     case state of
-      ThunkComputed ->
-        EvalIO (liftIO (readComputed ptr))
+      ThunkComputed -> readComputed ptr
       ThunkBlackhole ->
         -- Infinite recursion is non-catchable (like abort), matching C++ Nix.
         -- tryEval must NOT catch blackholes - using abortEvaluation ensures
         -- the error propagates through tryEval/catchEvalError.
         abortEvaluation "infinite recursion encountered"
       ThunkPending -> do
-        bcIdx <- EvalIO (liftIO (cthunkGetBcIdx ptr))
-        env <- EvalIO (liftIO (pendingThunkEnv ptr))
+        (env, bcIdx) <- pendingCode ptr
         -- Mark blackhole BEFORE evaluation - any re-entry hits the
         -- BLACKHOLE branch above.
-        EvalIO . liftIO $ do
-          marked <- cthunkMarkBlackhole ptr
-          unless marked (cInvariantViolated "nn_thunk_mark_blackhole" "a thunk read as PENDING was not PENDING")
+        marked <- cthunkMarkBlackhole ptr
+        unless marked $
+          EvalIO (liftIO (cInvariantViolated "nn_thunk_mark_blackhole" "a thunk read as PENDING was not PENDING"))
         -- If the force throws (a builtins.throw caught by an upstream tryEval,
         -- a type error, a failed import), restore the thunk to PENDING and
         -- rethrow, so a later force of this shared thunk re-evaluates instead of
@@ -900,34 +925,6 @@ storeComputed ptr val = do
       unless kept (freeStablePtr valSp)
       pure kept
   unless stored (cInvariantViolated "nn_thunk_set_computed" "a thunk being forced was already COMPUTED")
-
--- | Read a computed NixValue from a C thunk.
--- Dispatches on val_tag: scalars are read inline, complex via StablePtr.
-readComputed :: CThunkPtr -> IO NixValue
-readComputed ptr = do
-  tag <- cthunkValueTag ptr
-  case tag of
-    ValueInt -> VInt <$> cthunkGetInt ptr
-    ValueFloat -> VFloat <$> cthunkGetFloat ptr
-    ValueBool -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
-    ValueNull -> pure VNull
-    ValueStr -> do
-      sym <- cthunkGetStr ptr
-      pure (VStr (symbolBytes (Symbol sym)) emptyContext)
-    ValuePath -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
-    ValueList -> do
-      listPtr <- cthunkGetList ptr
-      pure (VList (CList (castPtr listPtr)))
-    ValueAttrs -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
-    ValueCtxStr -> do
-      csptr <- cthunkGetCtxStr ptr
-      uncurry VStr <$> unmarshalStringContext (castPtr csptr)
-    ValueLambda -> do
-      lamPtr <- cthunkGetLambda ptr
-      unmarshalLambdaValue lamPtr
-    _ {- PTR -} -> do
-      payloadPtr <- cthunkPayload ptr
-      deRefStablePtr (castPtrToStablePtr payloadPtr)
 
 -- ---------------------------------------------------------------------------
 -- Constants

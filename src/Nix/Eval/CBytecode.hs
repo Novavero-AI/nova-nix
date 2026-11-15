@@ -125,6 +125,7 @@ module Nix.Eval.CBytecode
 where
 
 import Data.Word (Word16, Word32, Word8)
+import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CStatus (cStatusFailure)
 
 -- ---------------------------------------------------------------------------
@@ -190,13 +191,13 @@ cbcDestroy = c_nn_bytecode_destroy
 -- ---------------------------------------------------------------------------
 
 -- | Append one instruction.  Returns the instruction index.
-cbcEmit :: Word8 -> Word8 -> Word16 -> Word32 -> Word32 -> Word32 -> IO Word32
+cbcEmit :: (MonadCData m) => Word8 -> Word8 -> Word16 -> Word32 -> Word32 -> Word32 -> m Word32
 cbcEmit opcode flags shortArg arg1 arg2 arg3 =
-  checkedEmit "nn_bc_emit" =<< c_nn_bc_emit opcode flags shortArg arg1 arg2 arg3
+  cdataIO $ checkedEmit "nn_bc_emit" =<< c_nn_bc_emit opcode flags shortArg arg1 arg2 arg3
 
 -- | Append one uint32 to the data buffer.  Returns the data offset.
-cbcEmitData :: Word32 -> IO Word32
-cbcEmitData value = checkedEmit "nn_bc_emit_data" =<< c_nn_bc_emit_data value
+cbcEmitData :: (MonadCData m) => Word32 -> m Word32
+cbcEmitData value = cdataIO (checkedEmit "nn_bc_emit_data" =<< c_nn_bc_emit_data value)
 
 -- | @UINT32_MAX@ from a C emit function signals a failed append (realloc
 -- exhaustion or the uint32 index ceiling), not a valid index.  Must stay
@@ -218,37 +219,37 @@ checkedEmit site idx
 -- ---------------------------------------------------------------------------
 
 -- | The opcode byte of instruction @i@ (one of the @Op*@ constants).
-cbcOpcode :: Word32 -> IO Word8
-cbcOpcode = c_nn_bc_opcode
+cbcOpcode :: (MonadCData m) => Word32 -> m Word8
+cbcOpcode = cdataIO . c_nn_bc_opcode
 
 -- | The flags byte of instruction @i@ - the sub-type selector (e.g. which
 -- unary/binary operator), interpreted via the sub-type-flag constants below.
-cbcFlags :: Word32 -> IO Word8
-cbcFlags = c_nn_bc_flags
+cbcFlags :: (MonadCData m) => Word32 -> m Word8
+cbcFlags = cdataIO . c_nn_bc_flags
 
 -- | The inline 16-bit argument of instruction @i@ (e.g. a de Bruijn slot).
-cbcShortArg :: Word32 -> IO Word16
-cbcShortArg = c_nn_bc_short_arg
+cbcShortArg :: (MonadCData m) => Word32 -> m Word16
+cbcShortArg = cdataIO . c_nn_bc_short_arg
 
 -- | The first 32-bit argument of instruction @i@.
-cbcArg1 :: Word32 -> IO Word32
-cbcArg1 = c_nn_bc_arg1
+cbcArg1 :: (MonadCData m) => Word32 -> m Word32
+cbcArg1 = cdataIO . c_nn_bc_arg1
 
 -- | The second 32-bit argument of instruction @i@.
-cbcArg2 :: Word32 -> IO Word32
-cbcArg2 = c_nn_bc_arg2
+cbcArg2 :: (MonadCData m) => Word32 -> m Word32
+cbcArg2 = cdataIO . c_nn_bc_arg2
 
 -- | The third 32-bit argument of instruction @i@.
-cbcArg3 :: Word32 -> IO Word32
-cbcArg3 = c_nn_bc_arg3
+cbcArg3 :: (MonadCData m) => Word32 -> m Word32
+cbcArg3 = cdataIO . c_nn_bc_arg3
 
 -- ---------------------------------------------------------------------------
 -- Read data
 -- ---------------------------------------------------------------------------
 
 -- | Read entry @i@ of the bytecode data pool (interned literals, symbols).
-cbcData :: Word32 -> IO Word32
-cbcData = c_nn_bc_data
+cbcData :: (MonadCData m) => Word32 -> m Word32
+cbcData = cdataIO . c_nn_bc_data
 
 -- ---------------------------------------------------------------------------
 -- Counted payloads (short_arg spill)
@@ -267,8 +268,8 @@ spilledCountSentinel = 0xFFFF
 -- spill convention.  @dataOff@ is the raw offset stored in the op's arg
 -- word (arg1 for most counted ops, arg2 for select\/hasAttr paths).
 -- The inline case costs one compare.
-cbcCountedPayload :: Word32 -> Word32 -> IO (Int, Word32)
-cbcCountedPayload bcIdx dataOff = do
+cbcCountedPayload :: (MonadCData m) => Word32 -> Word32 -> m (Int, Word32)
+cbcCountedPayload bcIdx dataOff = cdataIO $ do
   inline <- cbcShortArg bcIdx
   if inline == spilledCountSentinel
     then do

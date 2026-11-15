@@ -61,6 +61,7 @@ module Nix.Eval
     -- * Evaluation
     eval,
     evalParsed,
+    compileSource,
     evalBytecode,
     force,
     deepForce,
@@ -102,7 +103,7 @@ where
 import Control.Monad (foldM, foldM_, forM_, unless, void, when, (>=>))
 import qualified Crypto.Hash as CH
 import qualified Data.Array as Array
-import Data.Bits (complement, xor, (.&.), (.|.))
+import Data.Bits (xor, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -117,7 +118,7 @@ import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, maybeToList)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -129,20 +130,19 @@ import qualified Data.Text.Read as TR
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word32)
-import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
-import Foreign.Storable (peekElemOff, pokeElemOff)
+import Foreign.Ptr (Ptr, nullPtr)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, reservedApply1, reservedApply2, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
-import Nix.Eval.CEnv (cenvPushWith)
+import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
-import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, reassembleDouble, reassembleInt64)
+import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
 import Nix.Eval.EvalFormals (LambdaName, lambdaNameText)
-import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
+import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, expectedFailure, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printSymbol, printValue)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos)
@@ -180,12 +180,14 @@ import Nix.Eval.Types
     attrSetToMap,
     buildCAttrSetKeys,
     buildCSlots,
+    buildCaptureEnv,
     bytesToTextLossy,
     cheapThunkBc,
-    checkedCPtr,
     clistFromThunks,
     clistLen,
     clistThunks,
+    compile,
+    compileSource,
     emptyContext,
     emptyEnv,
     envFromSlots,
@@ -200,7 +202,9 @@ import Nix.Eval.Types
     mkThunkBc,
     newCEnv,
     newMinimalEnv,
+    pushLazyWithScope,
     readThunkValue,
+    resolveWithScopeAt,
     runPureEval,
     storePathOrThrow,
     thunkToCPtr,
@@ -208,6 +212,7 @@ import Nix.Eval.Types
     typeName,
     typeOfValue,
     unrestrictedPolicy,
+    withScopeAt,
     withScopesForCapture,
   )
 import Nix.Expr.Resolve (undefinedVariableMessage)
@@ -236,19 +241,20 @@ import Text.Regex.TDFA.ByteString ()
 -- Its names are interned in the order the compiler meets them; source
 -- goes through 'evalParsed', which interns them in upstream's order.
 eval :: (MonadEval m) => Env -> Expr -> m NixValue
-eval env expr =
-  let bcIdx = unsafePerformIO (compileExpr expr)
-   in evalBytecode env bcIdx
+eval env expr = compile expr >>= evalBytecode env
 
--- | Evaluate parsed source in an environment: its names are interned in
--- the order upstream's parser interns them, then it compiles and runs as
--- under 'eval'.  Interning under 'unsafePerformIO' is safe as compiling
--- is: it only appends to the symbol table, and a name already there keeps
--- its symbol, so interning the same names again changes nothing.
-evalParsed :: (MonadEval m) => Env -> ParsedSource -> m NixValue
-evalParsed env parsed =
-  let bcIdx = unsafePerformIO (compileParsed parsed)
-   in evalBytecode env bcIdx
+-- | Evaluate parsed source in the environment the action builds: its
+-- names are interned in the order upstream's parser interns them, it
+-- compiles, and only then is the environment built and the code run as
+-- under 'eval'.  Upstream interns no string, so a program's names keep
+-- their parse order whatever strings its environment binds; building the
+-- environment after the compile keeps the program's names ahead of the
+-- strings and names that building it interns here.
+evalParsed :: (MonadEval m) => m Env -> ParsedSource -> m NixValue
+evalParsed makeEnv parsed = do
+  code <- compileSource parsed
+  env <- makeEnv
+  evalBytecode env code
 
 -- | Force a thunk to a value.
 --
@@ -274,95 +280,83 @@ decodedText what bytes = case TE.decodeUtf8' bytes of
 -- function, never through 'eval' directly.
 evalBytecode :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBytecode env bcIdx =
-  let opcode = unsafePerformIO (cbcOpcode bcIdx)
-   in case opcode of
-        OpLitInt ->
-          let lo = unsafePerformIO (cbcArg1 bcIdx)
-              hi = unsafePerformIO (cbcArg2 bcIdx)
-           in pure (VInt (reassembleInt64 lo hi))
-        OpLitFloat ->
-          let lo = unsafePerformIO (cbcArg1 bcIdx)
-              hi = unsafePerformIO (cbcArg2 bcIdx)
-           in pure (VFloat (reassembleDouble lo hi))
-        OpLitBool ->
-          let flag = unsafePerformIO (cbcShortArg bcIdx)
-           in pure (VBool (flag /= 0))
-        OpLitNull -> pure VNull
-        OpLitUri ->
-          let sym = unsafePerformIO (cbcArg1 bcIdx)
-           in pure (mkStrBytes (symbolBytes (Symbol sym)))
-        OpLitPath ->
-          let sym = unsafePerformIO (cbcArg1 bcIdx)
-           in VPath <$> resolvePathLiteral (symbolText (Symbol sym))
-        OpStr -> evalBcStr env bcIdx
-        OpIndStr -> evalBcIndStr env bcIdx
-        OpPathStr -> evalBcPathStr env bcIdx
-        OpVar ->
-          let sym = unsafePerformIO (cbcArg1 bcIdx)
-           in evalVar env (symbolText (Symbol sym))
-        OpWithVar ->
-          let sym = unsafePerformIO (cbcArg1 bcIdx)
-              name = symbolText (Symbol sym)
-           in evalWithVar env name
-        OpResolvedVar ->
-          let level = fromIntegral (unsafePerformIO (cbcArg1 bcIdx))
-              idx = fromIntegral (unsafePerformIO (cbcArg2 bcIdx))
-           in force (envLookupResolved level idx env)
-        OpAttrs -> evalBcAttrs env bcIdx
-        OpList -> evalBcList env bcIdx
-        OpSelect -> evalBcSelect env bcIdx
-        OpHasAttr -> evalBcHasAttr env bcIdx
-        OpApp -> evalBcApp env bcIdx
-        OpLambda -> evalBcLambda env bcIdx
-        OpLet -> evalBcLet env bcIdx
-        OpIf ->
-          let condIdx = unsafePerformIO (cbcArg1 bcIdx)
-              thenIdx = unsafePerformIO (cbcArg2 bcIdx)
-              elseIdx = unsafePerformIO (cbcArg3 bcIdx)
-           in do
-                condVal <- evalBytecode env condIdx
-                case condVal of
-                  VBool True -> evalBytecode env thenIdx
-                  VBool False -> evalBytecode env elseIdx
-                  _ -> throwEvalError ("'if' condition must be a Boolean, got " <> typeName condVal)
-        OpWith ->
-          let scopeIdx = unsafePerformIO (cbcArg1 bcIdx)
-              bodyIdx = unsafePerformIO (cbcArg2 bcIdx)
-              -- Lazy with: defer forcing the scope until a WITH_VAR lookup
-              -- actually needs it.  This is critical for nixpkgs where
-              -- all-packages.nix uses `with pkgs;` inside a fixpoint -
-              -- eagerly forcing the scope would blackhole.
-              scopeThunk = cheapThunkBc env scopeIdx
-           in evalBytecode (pushLazyWithScope scopeThunk env) bodyIdx
-        OpAssert ->
-          let condIdx = unsafePerformIO (cbcArg1 bcIdx)
-              bodyIdx = unsafePerformIO (cbcArg2 bcIdx)
-           in do
-                condVal <- evalBytecode env condIdx
-                case condVal of
-                  VBool True -> evalBytecode env bodyIdx
-                  -- A failed assert is catchable by tryEval (upstream
-                  -- AssertionError); a non-bool condition is a type error.
-                  VBool False -> throwCatchableError "assertion failed"
-                  _ -> throwEvalError ("assertion condition must be a Boolean, got " <> typeName condVal)
-        OpUnary ->
-          let flags_ = unsafePerformIO (cbcFlags bcIdx)
-              operandIdx = unsafePerformIO (cbcArg1 bcIdx)
-           in case decodeUnaryOp flags_ of
-                Just unop ->
-                  let operate = evalBytecode env operandIdx >>= evalUnary unop
-                   in case unop of
-                        -- Upstream's parser turns @-e@ into @__sub 0 e@, a
-                        -- call frame around the operand's forcing.
-                        OpNegate -> withCallFrame operate
-                        OpNot -> operate
-                Nothing -> corruptBytecode "unary operator tag" flags_
-        OpBinary -> evalBcBinary env bcIdx
-        OpSearchPath ->
-          let sym = unsafePerformIO (cbcArg1 bcIdx)
-           in evalSearchPath env (symbolText (Symbol sym))
-        OpPos -> pure (positionValue (PosIdx (unsafePerformIO (cbcArg1 bcIdx))))
-        _ -> corruptBytecode "opcode" opcode
+  cbcOpcode bcIdx >>= \case
+    OpLitInt -> VInt . uncurry reassembleInt64 <$> literalWords bcIdx
+    OpLitFloat -> VFloat . uncurry reassembleDouble <$> literalWords bcIdx
+    OpLitBool -> VBool . (/= 0) <$> cbcShortArg bcIdx
+    OpLitNull -> pure VNull
+    OpLitUri -> mkStrBytes . symbolBytes . Symbol <$> cbcArg1 bcIdx
+    OpLitPath -> do
+      sym <- cbcArg1 bcIdx
+      VPath <$> resolvePathLiteral (symbolText (Symbol sym))
+    OpStr -> evalBcStr env bcIdx
+    OpIndStr -> evalBcIndStr env bcIdx
+    OpPathStr -> evalBcPathStr env bcIdx
+    OpVar -> do
+      sym <- cbcArg1 bcIdx
+      evalVar env (symbolText (Symbol sym))
+    OpWithVar -> do
+      sym <- cbcArg1 bcIdx
+      evalWithVar env (symbolText (Symbol sym))
+    OpResolvedVar -> do
+      level <- cbcArg1 bcIdx
+      idx <- cbcArg2 bcIdx
+      envLookupResolved (fromIntegral level) (fromIntegral idx) env >>= force
+    OpAttrs -> evalBcAttrs env bcIdx
+    OpList -> evalBcList env bcIdx
+    OpSelect -> evalBcSelect env bcIdx
+    OpHasAttr -> evalBcHasAttr env bcIdx
+    OpApp -> evalBcApp env bcIdx
+    OpLambda -> evalBcLambda env bcIdx
+    OpLet -> evalBcLet env bcIdx
+    OpIf -> do
+      condIdx <- cbcArg1 bcIdx
+      condVal <- evalBytecode env condIdx
+      case condVal of
+        VBool True -> cbcArg2 bcIdx >>= evalBytecode env
+        VBool False -> cbcArg3 bcIdx >>= evalBytecode env
+        _ -> throwEvalError ("'if' condition must be a Boolean, got " <> typeName condVal)
+    OpWith -> do
+      scopeIdx <- cbcArg1 bcIdx
+      bodyIdx <- cbcArg2 bcIdx
+      -- Lazy with: defer forcing the scope until a WITH_VAR lookup
+      -- actually needs it.  This is critical for nixpkgs where
+      -- all-packages.nix uses `with pkgs;` inside a fixpoint -
+      -- eagerly forcing the scope would blackhole.
+      scopeThunk <- cheapThunkBc env scopeIdx
+      withEnv <- pushLazyWithScope scopeThunk env
+      evalBytecode withEnv bodyIdx
+    OpAssert -> do
+      condIdx <- cbcArg1 bcIdx
+      condVal <- evalBytecode env condIdx
+      case condVal of
+        VBool True -> cbcArg2 bcIdx >>= evalBytecode env
+        -- A failed assert is catchable by tryEval (upstream
+        -- AssertionError); a non-bool condition is a type error.
+        VBool False -> throwCatchableError "assertion failed"
+        _ -> throwEvalError ("assertion condition must be a Boolean, got " <> typeName condVal)
+    OpUnary -> do
+      flags_ <- cbcFlags bcIdx
+      operandIdx <- cbcArg1 bcIdx
+      case decodeUnaryOp flags_ of
+        Just unop ->
+          let operate = evalBytecode env operandIdx >>= evalUnary unop
+           in case unop of
+                -- Upstream's parser turns @-e@ into @__sub 0 e@, a
+                -- call frame around the operand's forcing.
+                OpNegate -> withCallFrame operate
+                OpNot -> operate
+        Nothing -> corruptBytecode "unary operator tag" flags_
+    OpBinary -> evalBcBinary env bcIdx
+    OpSearchPath -> do
+      sym <- cbcArg1 bcIdx
+      evalSearchPath env (symbolText (Symbol sym))
+    OpPos -> cbcArg1 bcIdx >>= positionValue . PosIdx
+    opcode -> corruptBytecode "opcode" opcode
+
+-- | The two 32-bit words of an integer or float literal, low word first.
+literalWords :: (MonadCData m) => Word32 -> m (Word32, Word32)
+literalWords bcIdx = (,) <$> cbcArg1 bcIdx <*> cbcArg2 bcIdx
 
 -- ---------------------------------------------------------------------------
 -- Bytecode helpers
@@ -375,21 +369,19 @@ corruptBytecode :: (MonadEval m, Show tag) => Text -> tag -> m a
 corruptBytecode what tag = throwEvalError ("corrupt bytecode: unknown " <> what <> " " <> T.pack (show tag))
 
 -- | Continue with the bindings at a data offset, or fail on a binding tag
--- the compiler never writes.  The read is pure in effect: the store only
--- appends, so an emitted word answers the same however often it is read.
--- Inlined, so that each caller's continuation is a known function rather
--- than a closure allocated every time the instruction runs.
+-- the compiler never writes.  Inlined, so that each caller's continuation
+-- is a known function rather than a closure allocated every time the
+-- instruction runs.
 withBcBindings :: (MonadEval m) => Int -> Word32 -> ([BcBinding] -> m a) -> m a
 withBcBindings count dataOff next =
-  either (corruptBytecode "binding tag") next (unsafePerformIO (decodeBcBindings count dataOff))
+  decodeBcBindings count dataOff >>= either (corruptBytecode "binding tag") next
 {-# INLINE withBcBindings #-}
 
 -- | Continue with the capture info at a data offset, or fail on a capture
--- tag the compiler never writes.  Pure in effect and inlined, as
--- 'withBcBindings' is.
+-- tag the compiler never writes.  Inlined, as 'withBcBindings' is.
 withBcCaptureInfo :: (MonadEval m) => Word32 -> (CaptureInfo -> m a) -> m a
 withBcCaptureInfo captureOff next =
-  either (corruptBytecode "capture info tag") next (unsafePerformIO (decodeBcCaptureInfo captureOff))
+  decodeBcCaptureInfo captureOff >>= either (corruptBytecode "capture info tag") next
 {-# INLINE withBcCaptureInfo #-}
 
 -- | Whether upstream's parser desugars the operator into a builtin call
@@ -417,29 +409,29 @@ desugaredToCall op = case op of
 -- | Evaluate a binary operation from bytecode, with short-circuit
 -- support for &&, ||, ->.
 evalBcBinary :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcBinary env bcIdx0 = case decodeBinaryOp flags_ of
-  Just op ->
-    let operate = do
-          leftVal <- evalBytecode env leftIdx
-          rightVal <- evalBytecode env rightIdx
-          evalBinary force op leftVal rightVal
-     in case op of
-          OpAnd -> evalShortCircuitAnd env leftIdx rightIdx
-          OpOr -> evalShortCircuitOr env leftIdx rightIdx
-          OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
-          OpAdd -> evalAddition (evalBytecode env leftIdx) (evalBytecode env rightIdx)
-          -- Not through 'operate', which forces both operands before either
-          -- is looked at: the left must be checked before the right is
-          -- evaluated.
-          OpUpdate -> evalUpdate (evalBytecode env leftIdx) (evalBytecode env rightIdx)
-          _
-            | desugaredToCall op -> withCallFrame operate
-            | otherwise -> operate
-  Nothing -> corruptBytecode "binary operator tag" flags_
-  where
-    flags_ = unsafePerformIO (cbcFlags bcIdx0)
-    leftIdx = unsafePerformIO (cbcArg1 bcIdx0)
-    rightIdx = unsafePerformIO (cbcArg2 bcIdx0)
+evalBcBinary env bcIdx0 = do
+  flags_ <- cbcFlags bcIdx0
+  leftIdx <- cbcArg1 bcIdx0
+  rightIdx <- cbcArg2 bcIdx0
+  case decodeBinaryOp flags_ of
+    Just op ->
+      let operate = do
+            leftVal <- evalBytecode env leftIdx
+            rightVal <- evalBytecode env rightIdx
+            evalBinary force op leftVal rightVal
+       in case op of
+            OpAnd -> evalShortCircuitAnd env leftIdx rightIdx
+            OpOr -> evalShortCircuitOr env leftIdx rightIdx
+            OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
+            OpAdd -> evalAddition (evalBytecode env leftIdx) (evalBytecode env rightIdx)
+            -- Not through 'operate', which forces both operands before either
+            -- is looked at: the left must be checked before the right is
+            -- evaluated.
+            OpUpdate -> evalUpdate (evalBytecode env leftIdx) (evalBytecode env rightIdx)
+            _
+              | desugaredToCall op -> withCallFrame operate
+              | otherwise -> operate
+    Nothing -> corruptBytecode "binary operator tag" flags_
 
 -- | @+@, as upstream's @ExprConcatStrings::eval@ runs it over two operands
 -- (eval.cc at 2.24.9, the same in 2.33.2).  The left operand is evaluated
@@ -523,15 +515,22 @@ evalShortCircuitImpl env leftIdx rightIdx = do
 -- bytes: upstream's parser makes it an @ExprString@ holding the value
 -- (parser.y), where an interpolated string is an @ExprConcatStrings@.
 evalBcStr :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcStr env bcIdx0 =
-  case unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0) of
-    (1, dataOff)
-      | unsafePerformIO (cbcData dataOff) == strpartLit ->
-          pure (VStr (symbolBytes (Symbol (unsafePerformIO (cbcData (dataOff + 1))))) emptyContext)
-    (count, dataOff) -> do
+evalBcStr env bcIdx0 = do
+  (count, dataOff) <- countedPayload1 bcIdx0
+  -- The first part's tag is read only when there is one: an empty string
+  -- owns no data word at its offset.
+  literal <- if count == 1 then (== strpartLit) <$> cbcData dataOff else pure False
+  if literal
+    then (\sym -> VStr (symbolBytes (Symbol sym)) emptyContext) <$> cbcData (dataOff + 1)
+    else do
       chunks <- evalBcStringParts env count dataOff
       let (text, ctx) = concatChunks chunks
       pure (VStr text ctx)
+
+-- | An instruction's payload count and data offset, from the offset in
+-- its first argument ('cbcCountedPayload').
+countedPayload1 :: (MonadCData m) => Word32 -> m (Int, Word32)
+countedPayload1 bcIdx = cbcCountedPayload bcIdx =<< cbcArg1 bcIdx
 
 -- | Evaluate an indented string literal from bytecode data buffer.  The
 -- common indentation is stripped before concatenation, part by part as
@@ -539,8 +538,7 @@ evalBcStr env bcIdx0 =
 -- computed indent down.
 evalBcIndStr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcIndStr env bcIdx0 = do
-  let (count, dataOff) =
-        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
+  (count, dataOff) <- countedPayload1 bcIdx0
   chunks <- evalBcStringParts env count dataOff
   let (text, ctx) = stripIndentedChunks chunks
   pure (VStr text ctx)
@@ -554,8 +552,7 @@ evalBcIndStr env bcIdx0 = do
 -- 2.33.2: @let v = "a\/.."; in .\/${v}@ is the base directory itself).
 evalBcPathStr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcPathStr env bcIdx0 = do
-  let (count, dataOff) =
-        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
+  (count, dataOff) <- countedPayload1 bcIdx0
   parts <- evalBcPathParts env count dataOff
   unless (all (contextIsEmpty . snd) parts) $
     throwEvalError "a string that refers to a store path cannot be appended to a path"
@@ -575,8 +572,8 @@ evalBcPathStr env bcIdx0 = do
 evalBcPathParts :: (MonadEval m) => Env -> Int -> Word32 -> m [(BS.ByteString, StringContext)]
 evalBcPathParts _ 0 _ = pure []
 evalBcPathParts env n off = do
-  let tag = unsafePerformIO (cbcData off)
-      val = unsafePerformIO (cbcData (off + 1))
+  tag <- cbcData off
+  val <- cbcData (off + 1)
   part <- case tag of
     0 -> pure (symbolBytes (Symbol val), emptyContext)
     _ -> evalBytecode env val >>= coerceToString False force applyValue coercePathVerbatim
@@ -591,8 +588,8 @@ evalBcPathParts env n off = do
 evalBcStringParts :: (MonadEval m) => Env -> Int -> Word32 -> m [StringChunk]
 evalBcStringParts _ 0 _ = pure []
 evalBcStringParts env n off = do
-  let tag = unsafePerformIO (cbcData off)
-      val = unsafePerformIO (cbcData (off + 1))
+  tag <- cbcData off
+  val <- cbcData (off + 1)
   chunk <- decodeChunk tag val
   rest <- evalBcStringParts env (n - 1) (off + 2)
   pure (chunk : rest)
@@ -607,14 +604,10 @@ evalBcStringParts env n off = do
 
 -- | Evaluate a list from bytecode data buffer.
 evalBcList :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcList env bcIdx0 =
-  let (count, dataOff) =
-        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
-      readChildren 0 _ = []
-      readChildren n off =
-        let childIdx = unsafePerformIO (cbcData off)
-         in cheapThunkBc env childIdx : readChildren (n - 1) (off + 1)
-   in pure (VList (clistFromThunks (map thunkToCPtr (readChildren count dataOff))))
+evalBcList env bcIdx0 = do
+  (count, dataOff) <- countedPayload1 bcIdx0
+  children <- mapM (\i -> cbcData (dataOff + fromIntegral i) >>= cheapThunkBc env) [0 .. count - 1]
+  VList <$> clistFromThunks (map thunkToCPtr children)
 
 -- | Evaluate a function application from bytecode.  A source application
 -- ('EApp') evaluates the function position outside the call frame and
@@ -625,13 +618,13 @@ evalBcList env bcIdx0 =
 -- @forceValue@ on an app value is a @callFunction@ that forces the
 -- function after the depth check.
 evalBcApp :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcApp env bcIdx0
-  | flags_ == appDeferred = withCallFrame (evalBytecode env funcIdx >>= callBc env argIdx)
-  | otherwise = evalBytecode env funcIdx >>= withCallFrame . callBc env argIdx
-  where
-    flags_ = unsafePerformIO (cbcFlags bcIdx0)
-    funcIdx = unsafePerformIO (cbcArg1 bcIdx0)
-    argIdx = unsafePerformIO (cbcArg2 bcIdx0)
+evalBcApp env bcIdx0 = do
+  flags_ <- cbcFlags bcIdx0
+  funcIdx <- cbcArg1 bcIdx0
+  argIdx <- cbcArg2 bcIdx0
+  if flags_ == appDeferred
+    then withCallFrame (evalBytecode env funcIdx >>= callBc env argIdx)
+    else evalBytecode env funcIdx >>= withCallFrame . callBc env argIdx
 
 -- | Apply an evaluated function to the argument at a bytecode index,
 -- inside the caller's frame.  The argument stays a thunk for a lambda
@@ -640,14 +633,15 @@ evalBcApp env bcIdx0
 callBc :: (MonadEval m) => Env -> Word32 -> NixValue -> m NixValue
 callBc env argIdx funcVal = case funcVal of
   VLambda closureEnv formals bodyBcIdx -> do
-    let argThunk = cheapThunkBc env argIdx
+    argThunk <- cheapThunkBc env argIdx
     extEnv <- matchFormals closureEnv formals argThunk
     evalBytecode extEnv bodyBcIdx
   VBuiltin name taken -> applyBuiltin name taken $ \case
     ForceOnApply -> ArgForced <$> evalBytecode env argIdx
-    ForceOnUse -> pure (ArgDeferred (cheapThunkBc env argIdx))
-  VAttrs attrs
-    | Just functorThunk <- attrSetLookup "__functor" attrs -> do
+    ForceOnUse -> ArgDeferred <$> cheapThunkBc env argIdx
+  VAttrs attrs ->
+    attrSetLookup "__functor" attrs >>= \case
+      Just functorThunk -> do
         functor <- force functorThunk
         -- Upstream applies the functor to itself and to the argument in
         -- one nested callFunction, so both bodies run a frame below this
@@ -655,7 +649,10 @@ callBc env argIdx funcVal = case funcVal of
         -- and the recursion opens it again for the argument.
         partiallyApplied <- applyValue functor funcVal
         withCallFrame (callBc env argIdx partiallyApplied)
-  _ -> throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
+      Nothing -> notAFunction
+  _ -> notAFunction
+  where
+    notAFunction = throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
 
 -- | @builtins.tryEval e@: @{ success, value }@ with catchable errors
 -- (throw, failed assert - the only kinds 'catchEvalError' recovers)
@@ -666,23 +663,9 @@ callBc env argIdx funcVal = case funcVal of
 builtinTryEval :: (MonadEval m) => BuiltinArg -> m NixValue
 builtinTryEval arg = do
   result <- catchEvalError (argValue arg)
-  pure $ case result of
-    Right val ->
-      VAttrs
-        ( attrSetFromMap SetTryEval $
-            Map.fromList
-              [ ("success", evaluated (VBool True)),
-                ("value", evaluated val)
-              ]
-        )
-    Left _ ->
-      VAttrs
-        ( attrSetFromMap SetTryEval $
-            Map.fromList
-              [ ("success", evaluated (VBool False)),
-                ("value", evaluated (VBool False))
-              ]
-        )
+  valuesSet SetTryEval . Map.fromList $ case result of
+    Right val -> [("success", VBool True), ("value", val)]
+    Left _ -> [("success", VBool False), ("value", VBool False)]
 
 -- | Evaluate a lambda literal from bytecode - returns VLambda.  Its
 -- formals and capture info are decoded here, so that a corrupt tag fails
@@ -690,16 +673,17 @@ builtinTryEval arg = do
 -- thunk holding them that would cost more than the value.  Building it
 -- reads the captured slots without forcing them.
 evalBcLambda :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcLambda env bcIdx0 =
-  let flags_ = unsafePerformIO (cbcFlags bcIdx0)
-      formalsOff = unsafePerformIO (cbcArg1 bcIdx0)
-      bodyBcIdx = unsafePerformIO (cbcArg2 bcIdx0)
-      captureOff = unsafePerformIO (cbcArg3 bcIdx0)
-   in case unsafePerformIO (decodeBcFormals flags_ formalsOff) of
-        Just formals ->
-          withBcCaptureInfo captureOff $ \captureInfo ->
-            pure $! VLambda (buildCaptureEnv EnvClosure env captureInfo) formals bodyBcIdx
-        Nothing -> corruptBytecode "formals type" flags_
+evalBcLambda env bcIdx0 = do
+  flags_ <- cbcFlags bcIdx0
+  formalsOff <- cbcArg1 bcIdx0
+  decodeBcFormals flags_ formalsOff >>= \case
+    Just formals -> do
+      bodyBcIdx <- cbcArg2 bcIdx0
+      captureOff <- cbcArg3 bcIdx0
+      withBcCaptureInfo captureOff $ \captureInfo -> do
+        closureEnv <- buildCaptureEnv EnvClosure env captureInfo
+        pure (VLambda closureEnv formals bodyBcIdx)
+    Nothing -> corruptBytecode "formals type" flags_
 
 -- | Evaluate a select expression from bytecode, as upstream's
 -- @ExprSelect::eval@ does (eval.cc:1364-1411 at 2.24.9): with no default,
@@ -708,25 +692,24 @@ evalBcLambda env bcIdx0 =
 -- ('printSymbol').
 evalBcSelect :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcSelect env bcIdx0 = do
-  let hasDef = unsafePerformIO (cbcFlags bcIdx0) /= 0
-      targetIdx = unsafePerformIO (cbcArg1 bcIdx0)
-      (pathLen, pathOff) =
-        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg2 bcIdx0)
-      defIdx = unsafePerformIO (cbcArg3 bcIdx0)
+  targetIdx <- cbcArg1 bcIdx0
+  (pathLen, pathOff) <- cbcCountedPayload bcIdx0 =<< cbcArg2 bcIdx0
   targetVal <- evalBytecode env targetIdx
   result <- walkBcAttrPath env pathLen pathOff (pure targetVal)
   case result of
     PathFound val -> pure val
-    _ | hasDef -> evalBytecode env defIdx
-    PathMissing name -> throwEvalError ("attribute '" <> printSymbol name <> "' missing")
-    PathNotASet val -> addErrorTrace (pure "while selecting an attribute") (throwEvalError (expectedSet val))
+    PathMissing name -> orDefault (throwEvalError ("attribute '" <> printSymbol name <> "' missing"))
+    PathNotASet val -> orDefault (addErrorTrace (pure "while selecting an attribute") (expectedFailure "a set" val))
+  where
+    orDefault failure = do
+      hasDef <- (/= 0) <$> cbcFlags bcIdx0
+      if hasDef then cbcArg3 bcIdx0 >>= evalBytecode env else failure
 
 -- | Evaluate a hasAttr expression from bytecode.
 evalBcHasAttr :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcHasAttr env bcIdx0 = do
-  let targetIdx = unsafePerformIO (cbcArg1 bcIdx0)
-      (pathLen, pathOff) =
-        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg2 bcIdx0)
+  targetIdx <- cbcArg1 bcIdx0
+  (pathLen, pathOff) <- cbcCountedPayload bcIdx0 =<< cbcArg2 bcIdx0
   targetVal <- evalBytecode env targetIdx
   VBool <$> hasBcAttrPath env pathLen pathOff targetVal
 
@@ -735,8 +718,8 @@ evalBcHasAttr env bcIdx0 = do
 -- (@getName@, eval.cc:210 at 2.24.9), null refused with the rest.
 resolveBcAttrKey :: (MonadEval m) => Env -> Word32 -> m Text
 resolveBcAttrKey env off = do
-  let isExpr = unsafePerformIO (cbcData off)
-      keyVal = unsafePerformIO (cbcData (off + 1))
+  isExpr <- cbcData off
+  keyVal <- cbcData (off + 1)
   if isExpr /= 0
     then evalBytecode env keyVal >>= attrNameOf "dynamic attribute key"
     else pure (symbolText (Symbol keyVal))
@@ -763,9 +746,10 @@ walkBcAttrPath env n off current = do
   key <- resolveBcAttrKey env off
   val <- current
   case val of
-    VAttrs attrs -> case attrSetLookup key attrs of
-      Just thunk -> walkBcAttrPath env (n - 1) (off + 2) (force thunk)
-      Nothing -> pure (PathMissing key)
+    VAttrs attrs ->
+      attrSetLookup key attrs >>= \case
+        Just thunk -> walkBcAttrPath env (n - 1) (off + 2) (force thunk)
+        Nothing -> pure (PathMissing key)
     _ -> pure (PathNotASet val)
 
 -- | Presence walk for has-attr: intermediates force (the walk must reach
@@ -776,7 +760,7 @@ hasBcAttrPath _ 0 _ _ = pure True
 hasBcAttrPath env n off val = case val of
   VAttrs attrs -> do
     key <- resolveBcAttrKey env off
-    case attrSetLookup key attrs of
+    attrSetLookup key attrs >>= \case
       Just thunk
         | n == 1 -> pure True
         | otherwise -> do
@@ -787,15 +771,13 @@ hasBcAttrPath env n off val = case val of
 
 -- | Evaluate attribute set from bytecode.
 evalBcAttrs :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcAttrs env bcIdx0 =
-  let isRec = unsafePerformIO (cbcFlags bcIdx0) /= 0
-      (bindCount, dataOff) =
-        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
-      captureOff = unsafePerformIO (cbcArg2 bcIdx0)
-   in withBcBindings bindCount dataOff $ \bindings ->
-        if isRec
-          then withBcCaptureInfo captureOff (evalBcRecAttrs env bindings)
-          else evalBcNonRecAttrs env bindings
+evalBcAttrs env bcIdx0 = do
+  isRec <- (/= 0) <$> cbcFlags bcIdx0
+  (bindCount, dataOff) <- countedPayload1 bcIdx0
+  withBcBindings bindCount dataOff $ \bindings ->
+    if isRec
+      then cbcArg2 bcIdx0 >>= \captureOff -> withBcCaptureInfo captureOff (evalBcRecAttrs env bindings)
+      else evalBcNonRecAttrs env bindings
 
 -- | Evaluate a non-recursive attr set from bytecode bindings.
 --
@@ -808,7 +790,7 @@ evalBcAttrs env bcIdx0 =
 evalBcNonRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> m NixValue
 evalBcNonRecAttrs env bindings = do
   entries <- buildBcEntryMap cheapThunkBc env env bindings
-  pure (VAttrs (attrSetFromEntries SetLiteral entries))
+  VAttrs <$> attrSetFromEntries SetLiteral entries
 
 -- | The construct a binding frame belongs to.
 data FrameKind = LetFrame | RecFrame
@@ -827,25 +809,24 @@ frameCaptureSite RecFrame = EnvRecCapture
 -- plumbing otherwise repeated across the positional and dynamic paths.  The
 -- frame's own bindings are positional slots (@slots@\/@slotCount@) or a lazy
 -- name-table @scope@; the parent and with-scopes come from the enclosing @env@
--- and @captureInfo@.  Inlined, as 'tieBindingFrame' is, so that each caller's
--- sites are constants and a frame allocates nothing in GHC's heap to name
--- them.
+-- and @captureInfo@.  Inlined, as 'tieBindingFrame' is, so that each
+-- caller's sites are constants.
 {-# INLINE newFrameEnv #-}
-newFrameEnv :: FrameKind -> Env -> CaptureInfo -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> Env
-newFrameEnv kind env captureInfo slots slotCount scope =
-  newCEnv (frameSite kind) slots slotCount scope (Just (buildCaptureEnv (frameCaptureSite kind) env captureInfo)) withArr withCount
-  where
-    (withArr, withCount) = case captureInfo of
-      NoCaptureInfo -> envWithScopesRaw env
-      Captures _ -> (nullPtr, 0)
-      CapturesWithScopes _ -> withScopesForCapture (frameSite kind) env
+newFrameEnv :: (MonadCData m) => FrameKind -> Env -> CaptureInfo -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> m Env
+newFrameEnv kind env captureInfo slots slotCount scope = do
+  parent <- buildCaptureEnv (frameCaptureSite kind) env captureInfo
+  (withArr, withCount) <- case captureInfo of
+    NoCaptureInfo -> envWithScopesRaw env
+    Captures _ -> pure (nullPtr, 0)
+    CapturesWithScopes _ -> withScopesForCapture (frameSite kind) env
+  newCEnv (frameSite kind) slots slotCount scope (Just parent) withArr withCount
 
 -- | The positional frame of a recursive attr set or a @let@ in @env@: the
 -- frame's env and the thunks in its slots, in declaration order, tied by
 -- 'tieFrame' as upstream's @ExprAttrs::eval@ and @ExprLet::eval@ tie
 -- @env2@.
 {-# INLINE tieBindingFrame #-}
-tieBindingFrame :: FrameKind -> Env -> [BcBinding] -> CaptureInfo -> (Env, [Thunk])
+tieBindingFrame :: (MonadCData m) => FrameKind -> Env -> [BcBinding] -> CaptureInfo -> m (Env, [Thunk])
 tieBindingFrame kind env bindings captureInfo =
   tieFrame
     (frameSite kind)
@@ -856,10 +837,10 @@ tieBindingFrame kind env bindings captureInfo =
 -- | Evaluate a recursive attr set from bytecode bindings.
 evalBcRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> CaptureInfo -> m NixValue
 evalBcRecAttrs env bindings captureInfo
-  | allBcPositional bindings =
+  | allBcPositional bindings = do
       -- Positional path: slots for variable lookup, CAttrSet for return.
-      let (_, thunkList) = tieBindingFrame RecFrame env bindings captureInfo
-       in pure (VAttrs (attrSetFromEntries SetRec (buildBcEntryMapFromSlots bindings thunkList)))
+      (_, thunkList) <- tieBindingFrame RecFrame env bindings captureInfo
+      VAttrs <$> attrSetFromEntries SetRec (buildBcEntryMapFromSlots bindings thunkList)
   | otherwise = do
       -- Dynamic-key path: the set has a ${dynamic} key, so names are not all
       -- known at compile time.  Not a corner-cutting fallback:
@@ -868,42 +849,41 @@ evalBcRecAttrs env bindings captureInfo
       -- evaluated against it - so they can see static siblings and enclosing
       -- vars, but not another dynamic key.  The result is the static bindings
       -- plus the dynamic (name -> value) pairs.
-      let scopeCset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
-          recEnv = newFrameEnv RecFrame env captureInfo nullPtr 0 (Just (AttrSet scopeCset))
-          (staticBs, dynBs) = partition bcBindingIsStatic bindings
+      scopeCset <- buildCAttrSetKeys (bcBindingStaticKeys bindings)
+      recEnv <- newFrameEnv RecFrame env captureInfo nullPtr 0 (Just (AttrSet scopeCset))
+      let (staticBs, dynBs) = partition bcBindingIsStatic bindings
       staticEntries <- buildBcEntryMap mkThunkBc recEnv env staticBs
-      let scopeFilled = fillCAttrSetValues scopeCset (Map.map entryThunk staticEntries)
-      dynEntries <- scopeFilled `seq` buildBcEntryMap mkThunkBc recEnv env dynBs
+      fillCAttrSetValues scopeCset (Map.map entryThunk staticEntries)
+      dynEntries <- buildBcEntryMap mkThunkBc recEnv env dynBs
       -- A dynamic key colliding with a static sibling is an eval error
       -- upstream ("dynamic attribute already defined"), never a merge.
       case Map.keys (Map.intersection dynEntries staticEntries) of
         (dupKey : _) -> throwEvalError ("dynamic attribute '" <> dupKey <> "' already defined")
-        [] -> pure (VAttrs (attrSetFromEntries SetRec (Map.union dynEntries staticEntries)))
+        [] -> VAttrs <$> attrSetFromEntries SetRec (Map.union dynEntries staticEntries)
 
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
-evalBcLet env bcIdx0 =
-  let (bindCount, dataOff) =
-        unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg1 bcIdx0)
-      bodyIdx = unsafePerformIO (cbcArg2 bcIdx0)
-      captureOff = unsafePerformIO (cbcArg3 bcIdx0)
-   in withBcBindings bindCount dataOff $ \bindings ->
-        withBcCaptureInfo captureOff $ \captureInfo ->
-          if allBcPositional bindings
-            then
-              -- Positional path: slots for O(1) lookup.
-              let (letEnv, _) = tieBindingFrame LetFrame env bindings captureInfo
-               in evalBytecode letEnv bodyIdx
-            else do
-              -- Dynamic path: a dynamic key, which the parser refuses in a
-              -- let as upstream's parser.y does, so only an AST built
-              -- outside the parser reaches here.  Keys and values resolve
-              -- in the let env, which the body also sees.
-              let cset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
-                  letEnv = newFrameEnv LetFrame env captureInfo nullPtr 0 (Just (AttrSet cset))
-              entries <- buildBcEntryMap mkThunkBc letEnv env bindings
-              let filled = fillCAttrSetValues cset (Map.map entryThunk entries)
-               in filled `seq` evalBytecode letEnv bodyIdx
+evalBcLet env bcIdx0 = do
+  (bindCount, dataOff) <- countedPayload1 bcIdx0
+  bodyIdx <- cbcArg2 bcIdx0
+  captureOff <- cbcArg3 bcIdx0
+  withBcBindings bindCount dataOff $ \bindings ->
+    withBcCaptureInfo captureOff $ \captureInfo ->
+      if allBcPositional bindings
+        then do
+          -- Positional path: slots for O(1) lookup.
+          (letEnv, _) <- tieBindingFrame LetFrame env bindings captureInfo
+          evalBytecode letEnv bodyIdx
+        else do
+          -- Dynamic path: a dynamic key, which the parser refuses in a
+          -- let as upstream's parser.y does, so only an AST built
+          -- outside the parser reaches here.  Keys and values resolve
+          -- in the let env, which the body also sees.
+          cset <- buildCAttrSetKeys (bcBindingStaticKeys bindings)
+          letEnv <- newFrameEnv LetFrame env captureInfo nullPtr 0 (Just (AttrSet cset))
+          entries <- buildBcEntryMap mkThunkBc letEnv env bindings
+          fillCAttrSetValues cset (Map.map entryThunk entries)
+          evalBytecode letEnv bodyIdx
 
 -- | Check if all bytecode bindings are static keys (eligible for positional).
 -- Must stay in sync with @allStaticSingleKey@ in "Nix.Expr.Resolve".
@@ -930,24 +910,28 @@ bcBindingSlotCount = foldl' countOne 0
 -- @ExprAttrs::eval@ and @ExprLet::eval@ evaluate an Inherited attribute
 -- there through @maybeThunk@ (eval.cc at 2.24.9); that env is fully
 -- built, so the variable's own thunk can be shared now.
-buildBcSlotThunks :: Env -> Env -> [BcBinding] -> [Thunk]
-buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
+buildBcSlotThunks :: (MonadCData m) => Env -> Env -> [BcBinding] -> m [Thunk]
+buildBcSlotThunks recEnv outerEnv bindings = concat <$> mapM slotThunk bindings
   where
     slotThunk (BcNamed _ (BcStaticKey _) valBcIdx) =
-      [mkThunkBc recEnv valBcIdx]
+      pure <$> mkThunkBc recEnv valBcIdx
     slotThunk (BcInherit _ _ valBcIdx) =
-      [cheapThunkBc outerEnv valBcIdx]
-    slotThunk (BcInheritFrom fromBcIdx names) =
+      pure <$> cheapThunkBc outerEnv valBcIdx
+    slotThunk (BcInheritFrom fromBcIdx names) = do
       -- inherit (from) x y z; becomes one thunk per name that selects from the from-expr.
       -- Each thunk gets a minimal env with the from-value at slot 0.
-      let fromThunk = mkThunkBc recEnv fromBcIdx
-          mkInheritThunk (BcInheritedName _ _ selectBcIdx) =
-            let (sp, sc) = buildCSlots EnvInheritFrom [fromThunk]
-                fromEnv = newMinimalEnv EnvInheritFrom sp sc
-             in mkThunkBc fromEnv selectBcIdx
-       in map mkInheritThunk names
+      fromThunk <- mkThunkBc recEnv fromBcIdx
+      mapM (inheritedSelect fromThunk) names
     -- Unreachable: allBcPositional guards this path.
-    slotThunk _ = []
+    slotThunk _ = pure []
+
+-- | The thunk that selects an @inherit (from)@ name: its select runs in a
+-- minimal env holding the from-value's thunk at slot 0.
+inheritedSelect :: (MonadCData m) => Thunk -> BcInheritedName -> m Thunk
+inheritedSelect fromThunk (BcInheritedName _ _ selectBcIdx) = do
+  (sp, sc) <- buildCSlots EnvInheritFrom [fromThunk]
+  fromEnv <- newMinimalEnv EnvInheritFrom sp sc
+  mkThunkBc fromEnv selectBcIdx
 
 -- | Build the attribute map from slots for positional bytecode bindings,
 -- each at its binding's position.
@@ -975,25 +959,26 @@ buildBcEntryMapFromSlots bindings thunks = go bindings thunks Map.empty
 -- the variables point at are not filled yet.  An inherited variable is read
 -- from @outerEnv@, the env around the binding set, which is always built
 -- (for a non-recursive set it is @thunkEnv@ itself).
-buildBcEntryMap :: (MonadEval m) => (Env -> Word32 -> Thunk) -> Env -> Env -> [BcBinding] -> m (Map Text AttrEntry)
+buildBcEntryMap :: (MonadEval m) => (Env -> Word32 -> m Thunk) -> Env -> Env -> [BcBinding] -> m (Map Text AttrEntry)
 buildBcEntryMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
   where
     addBinding acc (BcNamed pos bcKey valBcIdx) = do
       resolved <- resolveBcKey thunkEnv bcKey
       case resolved of
         Nothing -> pure acc -- null key -> skip
-        Just key -> insertChecked acc key (AttrEntry pos (mkValueThunk thunkEnv valBcIdx))
+        Just key -> mkValueThunk thunkEnv valBcIdx >>= insertChecked acc key . AttrEntry pos
     addBinding acc (BcInherit pos sym valBcIdx) =
-      insertChecked acc (symbolText (Symbol sym)) (AttrEntry pos (cheapThunkBc outerEnv valBcIdx))
-    addBinding acc (BcInheritFrom fromBcIdx names) =
-      -- inherit (from) name selects name from the from-expr.
-      -- Create a small env with the from value at slot 0, then run the
-      -- select the compiler made for name against it.
-      let addInheritFrom a inherited@(BcInheritedName pos _ selectBcIdx) =
-            let (sp, sc) = buildCSlots EnvInheritFrom [mkThunkBc thunkEnv fromBcIdx]
-                fromEnv = newMinimalEnv EnvInheritFrom sp sc
-             in insertChecked a (inheritedNameText inherited) (AttrEntry pos (mkThunkBc fromEnv selectBcIdx))
-       in foldM addInheritFrom acc names
+      cheapThunkBc outerEnv valBcIdx >>= insertChecked acc (symbolText (Symbol sym)) . AttrEntry pos
+    addBinding acc (BcInheritFrom fromBcIdx names) = do
+      -- inherit (from) name selects name from the from-expr.  One thunk
+      -- of the from-expr serves every name, as upstream's
+      -- ExprAttrs::buildInheritFromEnv makes one (eval.cc at 2.24.9), so
+      -- the from-expr is evaluated once however many names it gives.
+      -- Each name's select runs against a small env holding it at slot 0.
+      fromThunk <- mkThunkBc thunkEnv fromBcIdx
+      let addInheritFrom a inherited@(BcInheritedName pos _ _) =
+            inheritedSelect fromThunk inherited >>= insertChecked a (inheritedNameText inherited) . AttrEntry pos
+      foldM addInheritFrom acc names
 
     -- The parser normalizes static keys to appear exactly once, so a
     -- collision here means an evaluated DYNAMIC key hit an existing
@@ -1052,7 +1037,7 @@ evalSearchPath env name = do
   builtinsVal <- evalVar env "builtins"
   case builtinsVal of
     VAttrs builtinsAttrs ->
-      case attrSetLookup "nixPath" builtinsAttrs of
+      attrSetLookup "nixPath" builtinsAttrs >>= \case
         Just nixPathThunk -> do
           nixPathVal <- force nixPathThunk
           builtinFindFile nixPathVal (mkStr name)
@@ -1078,7 +1063,7 @@ searchPathMiss name = do
 
 evalVar :: (MonadEval m) => Env -> Text -> m NixValue
 evalVar env name =
-  case envLookup name env of
+  envLookup name env >>= \case
     Just thunk -> force thunk
     Nothing -> throwEvalError (undefinedVariableMessage name)
 
@@ -1088,69 +1073,32 @@ evalVar env name =
 -- the root scope is already appended to the env's with-scopes
 -- ('envWithScopesRaw'), so the with-scope lookup finds builtins without
 -- needing a parent chain.
--- Supports both resolved (CAttrSet*) and lazy (CThunk*, tagged with bit 0)
--- with-scope entries.  Lazy entries are forced on first lookup and the
--- pointer is updated in place so subsequent lookups hit the resolved
--- attrset directly.
+-- Supports both resolved and lazy with-scope entries ('withScopeAt').  A
+-- lazy entry is forced on first lookup and replaced in place by its set
+-- ('resolveWithScopeAt'), so subsequent lookups read the set directly.
 evalWithVar :: (MonadEval m) => Env -> Text -> m NixValue
-evalWithVar env name =
-  let (withArr, withCount) = envWithScopesRaw env
-   in evalWithVarScopes env name withArr (fromIntegral withCount) 0
+evalWithVar env name = do
+  (withArr, withCount) <- envWithScopesRaw env
+  evalWithVarScopes env name withArr (fromIntegral withCount) 0
 
 evalWithVarScopes :: (MonadEval m) => Env -> Text -> Ptr (Ptr ()) -> Int -> Int -> m NixValue
 evalWithVarScopes env name withArr count idx
   | idx >= count = evalVar env name
-  | otherwise = do
-      let scopePtr = unsafePerformIO (peekElemOff withArr idx)
-      if isLazyWithScope scopePtr
-        then do
-          -- Lazy with-scope: force the thunk to get the attrset
-          let thunkPtr = untagWithScope scopePtr
-          scopeVal <- force (Thunk thunkPtr)
+  | otherwise =
+      withScopeAt withArr idx >>= \case
+        Left scopeThunk -> do
+          scopeVal <- force scopeThunk
           case scopeVal of
-            VAttrs (AttrSet cset) -> do
-              -- Cache: replace the tagged thunk pointer with the resolved
-              -- attrset pointer so future lookups are fast.
-              let resolvedPtr = castPtr cset
-              seq (unsafePerformIO (pokeElemOff withArr idx resolvedPtr)) (pure ())
-              case attrSetLookup name (AttrSet cset) of
-                Just thunk -> force thunk
-                Nothing -> evalWithVarScopes env name withArr count (idx + 1)
+            VAttrs scope -> do
+              resolveWithScopeAt withArr idx scope
+              lookupIn scope
             _ -> throwEvalError ("'with' requires a set, got " <> typeName scopeVal)
-        else
-          -- Resolved attrset scope (normal path)
-          case attrSetLookup name (AttrSet (castPtr scopePtr)) of
-            Just thunk -> force thunk
-            Nothing -> evalWithVarScopes env name withArr count (idx + 1)
-
--- | Check if a with-scope pointer is tagged as lazy (bit 0 set).
-isLazyWithScope :: Ptr () -> Bool
-isLazyWithScope ptr = ptrToWordPtr ptr .&. 1 /= 0
-
--- | Remove the lazy tag from a with-scope pointer, returning a CThunkPtr.
-untagWithScope :: Ptr () -> CThunkPtr
-untagWithScope ptr =
-  let tagged = ptrToWordPtr ptr
-   in wordPtrToPtr (tagged .&. complement 1)
-
--- | Tag a CThunkPtr as a lazy with-scope (set bit 0).
-tagLazyWithScope :: CThunkPtr -> Ptr ()
-tagLazyWithScope ptr =
-  let raw = ptrToWordPtr (castPtr ptr)
-   in wordPtrToPtr (raw .|. 1)
-
--- | Push a lazy (thunk-based) with-scope onto the environment.
--- The scope is NOT forced until a WITH_VAR lookup actually needs it.
-{-# NOINLINE pushLazyWithScope #-}
-pushLazyWithScope :: Thunk -> Env -> Env
-pushLazyWithScope (Thunk thunkPtr) =
-  pushWithScopeRaw (tagLazyWithScope thunkPtr)
-
--- | Push a raw pointer as a with-scope.
-{-# NOINLINE pushWithScopeRaw #-}
-pushWithScopeRaw :: Ptr () -> Env -> Env
-pushWithScopeRaw ptr (Env envPtr) =
-  Env (unsafePerformIO (checkedCPtr "nn_env_push_with" =<< cenvPushWith EnvWith envPtr ptr))
+        Right scope -> lookupIn scope
+  where
+    lookupIn scope =
+      attrSetLookup name scope >>= \case
+        Just thunk -> force thunk
+        Nothing -> evalWithVarScopes env name withArr count (idx + 1)
 
 -- ---------------------------------------------------------------------------
 -- Formals matching + env helpers (used by evalBcApp, applyValue, etc.)
@@ -1158,9 +1106,9 @@ pushWithScopeRaw ptr (Env envPtr) =
 
 -- | Match a lambda's formals against an argument thunk.
 matchFormals :: (MonadEval m) => Env -> EvalFormals -> Thunk -> m Env
-matchFormals closureEnv (EFName _) argThunk =
-  let (sp, sc) = buildCSlots EnvCall [argThunk]
-   in pure (envFromSlots EnvCall sp sc closureEnv)
+matchFormals closureEnv (EFName _) argThunk = do
+  (sp, sc) <- buildCSlots EnvCall [argThunk]
+  envFromSlots EnvCall sp sc closureEnv
 matchFormals closureEnv (EFSet lambdaName formals allowExtra) argThunk = do
   argVal <- force argThunk
   matchFormalSet closureEnv lambdaName formals allowExtra argVal Nothing
@@ -1186,17 +1134,17 @@ matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
       formalValues <- formalSlots lambdaName attrs formals
       checkExtraKeys lambdaName formals allowExtra attrs
       let atSlot = maybeToList atThunk
-          (formalEnv, _) =
-            tieFrame
-              EnvCallFormals
-              (length atSlot + length formalValues)
-              (\slots slotCount -> envFromSlots EnvCallFormals slots slotCount closureEnv)
-              (\frame -> atSlot ++ map ($ frame) formalValues)
+      (formalEnv, _) <-
+        tieFrame
+          EnvCallFormals
+          (length atSlot + length formalValues)
+          (\slots slotCount -> envFromSlots EnvCallFormals slots slotCount closureEnv)
+          (\frame -> (atSlot ++) <$> mapM ($ frame) formalValues)
       pure formalEnv
     _ ->
       callSiteError
         $ addErrorTrace (pure "while evaluating the value passed for the lambda argument")
-        $ throwEvalError (expectedSet argVal)
+        $ expectedFailure "a set" argVal
 
 -- | A failure of a call to a set pattern, with the line of context
 -- upstream's @callFunction@ adds for the call (eval.cc:1535, 1554, 1580
@@ -1218,12 +1166,11 @@ callSiteError = addErrorTrace (pure "from call site")
 -- as a symbol.
 checkExtraKeys :: (MonadEval m) => LambdaName -> [EvalFormal] -> Bool -> AttrSet -> m ()
 checkExtraKeys _ _ True _ = pure ()
-checkExtraKeys lambdaName formals False attrs =
-  let expected = map efName formals
-      extra = filter (`notElem` expected) (attrSetKeys attrs)
-   in case extra of
-        [] -> pure ()
-        (k : _) -> callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called with unexpected argument '" <> printSymbol k <> "'"))
+checkExtraKeys lambdaName formals False attrs = do
+  actual <- attrSetKeys attrs
+  case filter (`notElem` map efName formals) actual of
+    [] -> pure ()
+    (k : _) -> callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called with unexpected argument '" <> printSymbol k <> "'"))
 
 -- | Each formal's slot as a function of the env its default is evaluated
 -- in: the argument's own thunk, or a thunk of the default there.  A
@@ -1231,30 +1178,19 @@ checkExtraKeys lambdaName formals False attrs =
 -- named, as upstream sorts a set pattern's formals by symbol
 -- (@validateFormals@, parser-state.hh:186-189 at 2.24.9) and stops at the
 -- first it cannot fill (eval.cc:1546-1557).
-formalSlots :: (MonadEval m) => LambdaName -> AttrSet -> [EvalFormal] -> m [Env -> Thunk]
-formalSlots lambdaName attrs formals =
-  case partitionEithers (map formalSlot formals) of
-    ([], slots) -> pure slots
-    (name : names, _) ->
-      callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called without required argument '" <> printSymbol (firstInSymbolOrder (name :| names)) <> "'"))
+formalSlots :: (MonadEval m) => LambdaName -> AttrSet -> [EvalFormal] -> m [Env -> m Thunk]
+formalSlots lambdaName attrs formals = do
+  slots <- mapM formalSlot formals
+  case partitionEithers slots of
+    ([], found) -> pure found
+    (name : names, _) -> do
+      first <- firstInSymbolOrder (name :| names)
+      callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called without required argument '" <> printSymbol first <> "'"))
   where
-    formalSlot (EvalFormal name defBcIdx) = case attrSetLookup name attrs of
-      Just thunk -> Right (const thunk)
-      Nothing -> maybe (Left name) (Right . flip mkThunkBc) defBcIdx
-
--- | Build capture environment from capture info, at a site.
--- NoCaptureInfo: no trimming, use env as-is.
--- Captures: build minimal env from captured slots.
--- CapturesWithScopes: build minimal env + copy with-scopes.
-buildCaptureEnv :: EnvSite -> Env -> CaptureInfo -> Env
-buildCaptureEnv _ env NoCaptureInfo = env
-buildCaptureEnv site env (Captures captureList) =
-  let (slotsPtr, slotCount) = buildCSlots site [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-   in newMinimalEnv site slotsPtr slotCount
-buildCaptureEnv site env (CapturesWithScopes captureList) =
-  let (slotsPtr, slotCount) = buildCSlots site [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-      (withArr, withCount) = withScopesForCapture site env
-   in newCEnv site slotsPtr slotCount Nothing Nothing withArr withCount
+    formalSlot (EvalFormal name defBcIdx) =
+      attrSetLookup name attrs >>= \case
+        Just thunk -> pure (Right (const (pure thunk)))
+        Nothing -> pure (maybe (Left name) (Right . flip mkThunkBc) defBcIdx)
 
 -- ---------------------------------------------------------------------------
 -- Builtin registry (single-definition-site for all builtins)
@@ -1292,9 +1228,26 @@ argValue (ArgDeferred thunk) = force thunk
 
 -- | An argument a builtin has taken, as a thunk to share, such as the
 -- function every element of @map@'s result applies.
-argAsThunk :: BuiltinArg -> Thunk
+argAsThunk :: (MonadCData m) => BuiltinArg -> m Thunk
 argAsThunk (ArgForced val) = evaluated val
-argAsThunk (ArgDeferred thunk) = thunk
+argAsThunk (ArgDeferred thunk) = pure thunk
+
+-- | A set, at a site, of attributes defined nowhere in source, each holding a value
+-- already computed.
+valuesSet :: (MonadCData m) => SetSite -> Map Text NixValue -> m NixValue
+valuesSet site values = VAttrs <$> (traverse evaluated values >>= attrSetFromMap site)
+
+-- | A list of values already computed.
+valuesList :: (MonadCData m) => [NixValue] -> m NixValue
+valuesList values = mapM evaluated values >>= thunksList
+
+-- | A list of thunks.
+thunksList :: (MonadCData m) => [Thunk] -> m NixValue
+thunksList thunks = VList <$> clistFromThunks (map thunkToCPtr thunks)
+
+-- | A list's elements, as thunks.
+listThunks :: (MonadCData m) => CList -> m [Thunk]
+listThunks cl = map Thunk <$> clistThunks cl
 
 -- | The failure of a builtin run with arguments that do not fit its
 -- shape, which 'applyBuiltin' never builds: it runs a builtin at its last
@@ -1543,13 +1496,11 @@ builtinArgModes name = maybe (ForceOnApply :| []) bdArgs (Map.lookup name (built
 -- builtin; an earlier one makes the partial application.  Inlined into
 -- each application site, which measurably cuts allocation on this path.
 --
--- The argument is held evaluated: a value, or the cell of a thunk made as
--- the builtin takes it, as upstream makes a call's argument thunk when it
--- makes the call.  Held unevaluated, it would be a Haskell closure over the
--- caller's env that makes its cell only when something forces it, so the
--- partial application would hold the env where no C pointer shows it, and
--- a census of the data layer ("Nix.Eval.CStats"), which reads what a
--- partial application holds, would make the cell itself.
+-- The argument is held evaluated: a value, or the cell of a thunk the
+-- caller's action made as the builtin takes it, as upstream makes a call's
+-- argument thunk when it makes the call.  The cell exists before this
+-- runs, and the bang holds the argument as a constructor rather than as a
+-- thunk that would build one.
 applyBuiltin :: (MonadEval m) => Text -> [BuiltinArg] -> (ArgMode -> m BuiltinArg) -> m NixValue
 applyBuiltin name taken takeArg = case builtinArgModes name of
   first :| later -> nextPosition taken first later
@@ -1596,7 +1547,7 @@ applyValue fun arg = withCallFrame (applyForced fun arg)
 -- | 'applyValue' inside the caller's frame.
 applyForced :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 applyForced (VLambda closureEnv formals bodyBcIdx) arg = do
-  extEnv <- matchFormals closureEnv formals (evaluated arg)
+  extEnv <- evaluated arg >>= matchFormals closureEnv formals
   evalBytecode extEnv bodyBcIdx
 applyForced (VBuiltin name taken) arg =
   applyBuiltin name taken (const (pure (ArgForced arg)))
@@ -1823,15 +1774,15 @@ isFunctionVal _ = False
 -- ---------------------------------------------------------------------------
 
 builtinLength :: (MonadEval m) => NixValue -> m NixValue
-builtinLength (VList cl) = pure (VInt (fromIntegral (clistLen cl)))
-builtinLength other = throwEvalError (expectedList other)
+builtinLength (VList cl) = VInt . fromIntegral <$> clistLen cl
+builtinLength other = expectedFailure "a list" other
 
 -- | 2.24.9's @prim_head@ is its @elemAt@ at index 0, so an empty list
 -- fails as an index past the end does.  From 2.26.0 upstream says
 -- @'builtins.head' called on an empty list@ instead.
 builtinHead :: (MonadEval m) => NixValue -> m NixValue
 builtinHead (VList cl) = listElemAt cl 0
-builtinHead other = throwEvalError (expectedList other)
+builtinHead other = expectedFailure "a list" other
 
 -- | The result shares the argument's C array where upstream's
 -- @prim_tail@ copies the elements after the first: a copy costs time and
@@ -1840,20 +1791,12 @@ builtinHead other = throwEvalError (expectedList other)
 -- empty-list message is 2.24.9's; from 2.26.0 upstream says
 -- @'builtins.tail' called on an empty list@.
 builtinTail :: (MonadEval m) => NixValue -> m NixValue
-builtinTail (VList cl)
-  | clistLen cl == 0 = throwEvalError "'tail' called on an empty list"
-  | otherwise = pure (VList (clistDrop 1 cl))
-builtinTail other = throwEvalError (expectedList other)
-
--- | Upstream's @forceList@ failure (eval-inline.hh at 2.24.9).
-expectedList :: NixValue -> Text
-expectedList other =
-  "expected a list but found " <> typeName other <> ": " <> printValue PrintForError other
-
--- | Upstream's @forceAttrs@ failure (eval-inline.hh at 2.24.9).
-expectedSet :: NixValue -> Text
-expectedSet other =
-  "expected a set but found " <> typeName other <> ": " <> printValue PrintForError other
+builtinTail (VList cl) = do
+  len <- clistLen cl
+  if len == 0
+    then throwEvalError "'tail' called on an empty list"
+    else VList <$> clistDrop 1 cl
+builtinTail other = expectedFailure "a list" other
 
 -- | The element at an index, failing as the @elemAt@ helper behind
 -- @prim_elemAt@ and @prim_head@ does (primops.cc at 2.24.9).  That helper
@@ -1863,7 +1806,8 @@ expectedSet other =
 -- @'builtins.elemAt' called with index N on a list of size M@.
 listElemAt :: (MonadEval m) => CList -> Int64 -> m NixValue
 listElemAt cl idx =
-  maybe (throwEvalError ("list index " <> T.pack (show idx) <> " is out of bounds")) (force . Thunk) (clistIndex cl (fromIntegral idx))
+  clistIndex cl (fromIntegral idx)
+    >>= maybe (throwEvalError ("list index " <> T.pack (show idx) <> " is out of bounds")) (force . Thunk)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - string (arity 1)
@@ -1913,14 +1857,12 @@ builtinAttrNames (VAttrs attrs) =
   -- Nix returns attribute names lexicographically sorted; the C array is in
   -- interned-symbol order, so sort here (consistent with builtins.attrValues,
   -- which sorts via attrSetElems).
-  let thunks = map (evaluated . mkStr) (sort (attrSetKeys attrs))
-   in pure (VList (clistFromThunks (map thunkToCPtr thunks)))
+  attrSetKeys attrs >>= valuesList . map mkStr . sort
 builtinAttrNames other =
   throwEvalError ("builtins.attrNames: expected a set, got " <> typeName other)
 
 builtinAttrValues :: (MonadEval m) => NixValue -> m NixValue
-builtinAttrValues (VAttrs attrs) =
-  pure (VList (clistFromThunks (map thunkToCPtr (attrSetElems attrs))))
+builtinAttrValues (VAttrs attrs) = attrSetElems attrs >>= thunksList
 builtinAttrValues other =
   throwEvalError ("builtins.attrValues: expected a set, got " <> typeName other)
 
@@ -1931,9 +1873,9 @@ builtinAttrValues other =
 -- gives it.
 builtinListToAttrs :: (MonadEval m) => NixValue -> m NixValue
 builtinListToAttrs (VList cl) =
-  VAttrs . attrSetFromEntries SetListToAttrs <$> foldM addListToAttrsElement Map.empty (map Thunk (clistThunks cl))
+  listThunks cl >>= foldM addListToAttrsElement Map.empty >>= fmap VAttrs . attrSetFromEntries SetListToAttrs
 builtinListToAttrs other =
-  addErrorTrace (pure "while evaluating the argument passed to builtins.listToAttrs") (throwEvalError (expectedList other))
+  addErrorTrace (pure "while evaluating the argument passed to builtins.listToAttrs") (expectedFailure "a list" other)
 
 -- | Add one element of @listToAttrs@'s list to the attributes the elements
 -- before it made, whose names are the names seen.  The element is forced
@@ -1945,12 +1887,12 @@ addListToAttrsElement !made thunk = do
   attrs <-
     force thunk >>= \case
       VAttrs attrs -> pure attrs
-      other -> addErrorTrace (pure "while evaluating an element of the list passed to builtins.listToAttrs") (throwEvalError (expectedSet other))
-  nameThunk <- maybe (missingPairAttr "name") pure (attrSetLookup "name" attrs)
+      other -> addErrorTrace (pure "while evaluating an element of the list passed to builtins.listToAttrs") (expectedFailure "a set" other)
+  nameThunk <- attrSetLookup "name" attrs >>= maybe (missingPairAttr "name") pure
   name <-
     addErrorTrace (pure "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs") $
       force nameThunk >>= attrNameOf "builtins.listToAttrs: attribute name"
-  let newEntry = maybe (missingPairAttr "value") pure (attrSetLookupEntry "value" attrs)
+  let newEntry = attrSetLookupEntry "value" attrs >>= maybe (missingPairAttr "value") pure
   Map.alterF (maybe (Just <$> newEntry) (pure . Just)) name made
 
 -- | A @listToAttrs@ element without the attribute, refused as upstream's
@@ -1969,7 +1911,7 @@ builtinHasAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHasAttr nameVal setVal = do
   name <- attrNameOf "builtins.hasAttr" nameVal
   case setVal of
-    VAttrs attrs -> pure (VBool (attrSetMember name attrs))
+    VAttrs attrs -> VBool <$> attrSetMember name attrs
     other -> throwEvalError ("builtins.hasAttr: expected a set, got " <> typeName other)
 
 -- | Upstream's @prim_getAttr@ (primops.cc:2705 at 2.24.9): the name, read
@@ -1978,9 +1920,10 @@ builtinGetAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGetAttr nameVal setVal = do
   name <- attrNameOf "builtins.getAttr" nameVal
   case setVal of
-    VAttrs attrs -> case attrSetLookup name attrs of
-      Just thunk -> force thunk
-      Nothing -> throwEvalError ("builtins.getAttr: attribute '" <> name <> "' not found")
+    VAttrs attrs ->
+      attrSetLookup name attrs >>= \case
+        Just thunk -> force thunk
+        Nothing -> throwEvalError ("builtins.getAttr: attribute '" <> name <> "' not found")
     other -> throwEvalError ("builtins.getAttr: expected a set, got " <> typeName other)
 
 -- | Where an attribute was defined, as upstream's @prim_unsafeGetAttrPos@
@@ -1993,9 +1936,9 @@ builtinUnsafeGetAttrPos nameVal setArg = do
   setVal <- argValue setArg
   attrs <- case setVal of
     VAttrs attrs -> pure attrs
-    other -> throwEvalError (expectedSet other)
+    other -> expectedFailure "a set" other
   name <- decodedText "builtins.unsafeGetAttrPos" nameBytes
-  pure (maybe VNull (positionValue . entryPos) (attrSetLookupEntry name attrs))
+  attrSetLookupEntry name attrs >>= maybe (pure VNull) (positionValue . entryPos)
 
 -- | The value of a position, as upstream's @EvalState::mkPos@ makes it
 -- (eval.cc at 2.24.9): @{ column; file; line; }@ for one in a file, the
@@ -2003,24 +1946,25 @@ builtinUnsafeGetAttrPos nameVal setArg = do
 -- 'Nix.Eval.SourcePos.noPos', the position of what no source defines.  The
 -- set's own attributes are at 'Nix.Eval.SourcePos.noPos', as @mkPos@
 -- allocates them with none.
-positionValue :: PosIdx -> NixValue
-positionValue idx = case lookupPos idx of
-  Just (PosInFile file line column) ->
-    VAttrs . attrSetFromMap SetPosition $
-      Map.fromList
-        [ ("column", evaluated (VInt (fromIntegral column))),
-          ("file", evaluated (mkStr file)),
-          ("line", evaluated (VInt (fromIntegral line)))
-        ]
-  Just (PosInText _ _) -> VNull
-  Nothing -> VNull
+positionValue :: (MonadCData m) => PosIdx -> m NixValue
+positionValue idx =
+  lookupPos idx >>= \case
+    Just (PosInFile file line column) ->
+      valuesSet SetPosition $
+        Map.fromList
+          [ ("column", VInt (fromIntegral column)),
+            ("file", mkStr file),
+            ("line", VInt (fromIntegral line))
+          ]
+    Just (PosInText _ _) -> pure VNull
+    Nothing -> pure VNull
 
 -- | Upstream's @prim_removeAttrs@ (primops.cc:2844 at 2.24.9): each name
 -- read as an attribute name, first to last.
 builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinRemoveAttrs (VAttrs attrs) (VList cl) = do
-  keys <- mapM (force . Thunk >=> attrNameOf "builtins.removeAttrs") (clistThunks cl)
-  pure (VAttrs (attrSetRemoveKeys SetRemoveAttrs keys attrs))
+  keys <- listThunks cl >>= mapM (force >=> attrNameOf "builtins.removeAttrs")
+  VAttrs <$> attrSetRemoveKeys SetRemoveAttrs keys attrs
 builtinRemoveAttrs (VAttrs _) other =
   throwEvalError ("builtins.removeAttrs: expected a list, got " <> typeName other)
 builtinRemoveAttrs other _ =
@@ -2032,9 +1976,10 @@ builtinIntersectAttrs (VAttrs a) (VAttrs b) =
   -- and point-lookup each in 'b' (typically the large set, e.g. nixpkgs).
   -- This avoids materializing all thunks in 'b'.  Each attribute is b's,
   -- position included, as upstream copies it.
-  let keysA = attrSetKeys a
-      result = Map.fromList [(k, entry) | k <- keysA, Just entry <- [attrSetLookupEntry k b]]
-   in pure (VAttrs (attrSetFromEntries SetIntersectAttrs result))
+  do
+    keysA <- attrSetKeys a
+    found <- mapM (\k -> fmap (k,) <$> attrSetLookupEntry k b) keysA
+    VAttrs <$> attrSetFromEntries SetIntersectAttrs (Map.fromList (catMaybes found))
 builtinIntersectAttrs (VAttrs _) other =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 builtinIntersectAttrs other _ =
@@ -2046,9 +1991,7 @@ builtinCatAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinCatAttrs nameVal listVal = do
   name <- attrNameOf "builtins.catAttrs" nameVal
   case listVal of
-    VList cl -> do
-      vals <- catAttrsCollect name (map Thunk (clistThunks cl))
-      pure (VList (clistFromThunks (map thunkToCPtr vals)))
+    VList cl -> listThunks cl >>= catAttrsCollect name >>= thunksList
     other -> throwEvalError ("builtins.catAttrs: expected a list, got " <> typeName other)
 
 -- | Collect values for a given key from a list of attrsets.
@@ -2061,7 +2004,7 @@ catAttrsCollect key = go []
       val <- force thunk
       case val of
         VAttrs attrs ->
-          case attrSetLookup key attrs of
+          attrSetLookup key attrs >>= \case
             Just found -> go (found : acc) rest
             Nothing -> go acc rest
         _ -> throwEvalError "builtins.catAttrs: list element must be a set"
@@ -2079,32 +2022,37 @@ forceFunctionArg arg = do
   case val of
     VLambda {} -> pure val
     VBuiltin _ _ -> pure val
-    VAttrs attrs | attrSetMember "__functor" attrs -> pure val
-    other -> throwEvalError ("expected a function but found " <> typeName other <> ": " <> printValue PrintForError other)
+    VAttrs attrs -> do
+      isFunctor <- attrSetMember "__functor" attrs
+      if isFunctor then pure val else expectedFailure "a function" val
+    other -> expectedFailure "a function" other
 
 -- | @prim_map@ forces the list, returns an empty one as it is, and only
 -- then forces the function (primops.cc at 2.24.9), so
 -- @map (throw "a") [ ]@ is @[ ]@.  Each element is a deferred
 -- application, forced only on demand.
 builtinMap :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
-builtinMap funcArg (VList cl)
-  | clistLen cl == 0 = pure (VList cl)
-  | otherwise = do
+builtinMap funcArg (VList cl) = do
+  len <- clistLen cl
+  if len == 0
+    then pure (VList cl)
+    else do
       _ <- forceFunctionArg funcArg
-      let fnThunk = argAsThunk funcArg
-      pure (VList (clistFromThunks (map (thunkToCPtr . deferApplyThunk EnvMap fnThunk . Thunk) (clistThunks cl))))
+      fnThunk <- argAsThunk funcArg
+      listThunks cl >>= mapM (deferApplyThunk EnvMap fnThunk) >>= thunksList
 builtinMap _ other =
   throwEvalError ("builtins.map: expected a list, got " <> typeName other)
 
 -- | @prim_filter@, like @prim_map@, forces its function only once the
 -- list is known not to be empty (primops.cc at 2.24.9).
 builtinFilter :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
-builtinFilter predArg (VList cl)
-  | clistLen cl == 0 = pure (VList cl)
-  | otherwise = do
+builtinFilter predArg (VList cl) = do
+  len <- clistLen cl
+  if len == 0
+    then pure (VList cl)
+    else do
       predFn <- forceFunctionArg predArg
-      filtered <- filterThunks predFn (map Thunk (clistThunks cl))
-      pure (VList (clistFromThunks (map thunkToCPtr filtered)))
+      listThunks cl >>= filterThunks predFn >>= thunksList
 builtinFilter _ other =
   throwEvalError ("builtins.filter: expected a list, got " <> typeName other)
 
@@ -2128,22 +2076,22 @@ builtinGenList funcArg (VInt n)
       -- The index is an argument value, as upstream's @prim_genList@
       -- allocates an int and an app per element, so every element runs
       -- the same code.
-      let fnThunk = argAsThunk funcArg
-          mkIndexThunk = thunkToCPtr . deferApplyThunk EnvGenList fnThunk . evaluated . VInt
-      pure (VList (clistFromThunks (map mkIndexThunk [0 .. n - 1])))
+      fnThunk <- argAsThunk funcArg
+      mapM (evaluated . VInt >=> deferApplyThunk EnvGenList fnThunk) [0 .. n - 1] >>= thunksList
 builtinGenList _ other =
   throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
 
 -- | @prim_sort@ forces the list, returns an empty one as it is, and forces
 -- the comparator before the elements (primops.cc at 2.24.9).
 builtinSort :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
-builtinSort cmpArg (VList cl)
-  | clistLen cl == 0 = pure (VList cl)
-  | otherwise = do
+builtinSort cmpArg (VList cl) = do
+  len <- clistLen cl
+  if len == 0
+    then pure (VList cl)
+    else do
       comparator <- forceFunctionArg cmpArg
-      vals <- mapM (force . Thunk) (clistThunks cl)
-      sorted <- mergeSort (sortComparison comparator) vals
-      pure (VList (clistFromThunks (map (thunkToCPtr . evaluated) sorted)))
+      vals <- listThunks cl >>= mapM force
+      mergeSort (sortComparison comparator) vals >>= valuesList
 builtinSort _ other =
   throwEvalError ("builtins.sort: expected a list, got " <> typeName other)
 
@@ -2187,24 +2135,21 @@ builtinConcatMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinConcatMap func (VList cl) = do
   -- Semi-eager: must force each application to discover list structure for
   -- concatenation, but element thunks within those sub-lists stay lazy.
-  let thunks = map Thunk (clistThunks cl)
-      deferredApps = map (deferApply EnvConcatMap func) thunks
-  results <- mapM force deferredApps
+  fnThunk <- evaluated func
+  thunks <- listThunks cl
+  results <- mapM (deferApplyThunk EnvConcatMap fnThunk >=> force) thunks
   concatted <- mapM extractList results
-  pure (VList (clistFromThunks (map thunkToCPtr (concat concatted))))
+  thunksList (concat concatted)
 builtinConcatMap _ other =
   throwEvalError ("builtins.concatMap: expected a list, got " <> typeName other)
 
 extractList :: (MonadEval m) => NixValue -> m [Thunk]
-extractList (VList cl) = pure (map Thunk (clistThunks cl))
+extractList (VList cl) = listThunks cl
 extractList other =
   throwEvalError ("builtins.concatMap: function must return a list, got " <> typeName other)
 
 builtinAny :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAny predFn (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  result <- anyThunk predFn thunks
-  pure (VBool result)
+builtinAny predFn (VList cl) = VBool <$> (listThunks cl >>= anyThunk predFn)
 builtinAny _ other =
   throwEvalError ("builtins.any: expected a list, got " <> typeName other)
 
@@ -2218,10 +2163,7 @@ anyThunk predFn (thunk : rest) = do
     _ -> throwEvalError "builtins.any: predicate must return a bool"
 
 builtinAll :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAll predFn (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  result <- allThunk predFn thunks
-  pure (VBool result)
+builtinAll predFn (VList cl) = VBool <$> (listThunks cl >>= allThunk predFn)
 builtinAll _ other =
   throwEvalError ("builtins.all: expected a list, got " <> typeName other)
 
@@ -2239,11 +2181,12 @@ allThunk predFn (thunk : rest) = do
 -- (primops.cc and eval.cc at 2.24.9), so an empty list never forces it.
 builtinElem :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
 builtinElem needleArg (VList cl) =
-  VBool <$> case map Thunk (clistThunks cl) of
-    [] -> pure False
-    thunks -> do
-      needle <- argValue needleArg
-      elemCheck needle thunks
+  fmap VBool $
+    listThunks cl >>= \case
+      [] -> pure False
+      thunks -> do
+        needle <- argValue needleArg
+        elemCheck needle thunks
 builtinElem _ other =
   throwEvalError ("builtins.elem: expected a list, got " <> typeName other)
 
@@ -2262,23 +2205,16 @@ builtinElemAt listArg (VInt idx) = do
   list <- argValue listArg
   case list of
     VList cl -> listElemAt cl idx
-    other -> throwEvalError (expectedList other)
+    other -> expectedFailure "a list" other
 builtinElemAt _ other =
-  throwEvalError ("expected an integer but found " <> typeName other <> ": " <> printValue PrintForError other)
+  expectedFailure "an integer" other
 
 builtinPartition :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinPartition predFn (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  (rightThunks, wrongThunks) <- partitionThunks predFn thunks
-  pure
-    ( VAttrs
-        ( attrSetFromMap SetPartition $
-            Map.fromList
-              [ ("right", evaluated (VList (clistFromThunks (map thunkToCPtr rightThunks)))),
-                ("wrong", evaluated (VList (clistFromThunks (map thunkToCPtr wrongThunks))))
-              ]
-        )
-    )
+  (rightThunks, wrongThunks) <- listThunks cl >>= partitionThunks predFn
+  right <- thunksList rightThunks
+  wrong <- thunksList wrongThunks
+  valuesSet SetPartition (Map.fromList [("right", right), ("wrong", wrong)])
 builtinPartition _ other =
   throwEvalError ("builtins.partition: expected a list, got " <> typeName other)
 
@@ -2296,9 +2232,9 @@ partitionThunks predFn = go [] []
 
 builtinGroupBy :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGroupBy func (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
+  thunks <- listThunks cl
   groups <- groupByCollect func thunks Map.empty
-  pure (VAttrs (attrSetFromMap SetGroupBy (Map.map (evaluated . VList . clistFromThunks . map thunkToCPtr . reverse) groups)))
+  traverse (thunksList . reverse) groups >>= valuesSet SetGroupBy
 builtinGroupBy _ other =
   throwEvalError ("builtins.groupBy: expected a list, got " <> typeName other)
 
@@ -2319,8 +2255,7 @@ groupByCollect func (thunk : rest) acc = do
 
 builtinConcatStringsSep :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinConcatStringsSep (VStr sep sepCtx) (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  pairs <- mapM forceToStrCtx thunks
+  pairs <- listThunks cl >>= mapM forceToStrCtx
   let texts = map fst pairs
       mergedCtx = sepCtx <> mconcat (map snd pairs)
   pure (VStr (BS.intercalate sep texts) mergedCtx)
@@ -2346,7 +2281,7 @@ builtinConcatStringsSep other _ =
 -- empty (primops.cc at 2.24.9), so it is taken unforced.
 builtinFoldl :: (MonadEval m) => NixValue -> BuiltinArg -> NixValue -> m NixValue
 builtinFoldl op initial (VList cl) =
-  foldlStrict op initial (map Thunk (clistThunks cl))
+  listThunks cl >>= foldlStrict op initial
 builtinFoldl _ _ other =
   throwEvalError ("builtins.foldl': expected a list, got " <> typeName other)
 
@@ -2388,17 +2323,30 @@ builtinSubstring _ _ _ =
 -- the thunk is forced.  Runs the reserved 'reservedApply1' in a
 -- self-contained env, upstream's @mkApp@.  Slot 0 = function, slot 1 =
 -- argument.
-deferApply :: EnvSite -> NixValue -> Thunk -> Thunk
-deferApply site func = deferApplyThunk site (evaluated func)
+deferApply :: (MonadCData m) => EnvSite -> NixValue -> Thunk -> m Thunk
+deferApply site func argThunk = do
+  fnThunk <- evaluated func
+  deferApplyThunk site fnThunk argThunk
+
+-- | A thunk deferring @f name value@, as upstream's @mapAttrs@ and
+-- @zipAttrsWith@ build one from two nested @mkApp@s: the reserved
+-- 'reservedApply2' in a self-contained env at a site holding the
+-- function in slot 0, the name in slot 1 and the value in slot 2.
+deferApply2 :: (MonadCData m) => EnvSite -> Thunk -> Text -> Thunk -> m Thunk
+deferApply2 site fnThunk name valueThunk = do
+  nameThunk <- evaluated (mkStr name)
+  (sp, sc) <- buildCSlots site [fnThunk, nameThunk, valueThunk]
+  env <- newMinimalEnv site sp sc
+  mkThunkBc env reservedApply2
 
 -- | 'deferApply' with the function already a thunk, so a builtin that
 -- makes one application per element shares one function thunk across
 -- them, as upstream's primops share @args[0]@.
-deferApplyThunk :: EnvSite -> Thunk -> Thunk -> Thunk
-deferApplyThunk site fnThunk argThunk =
-  let (sp, sc) = buildCSlots site [fnThunk, argThunk]
-      env = newMinimalEnv site sp sc
-   in mkThunkBc env reservedApply1
+deferApplyThunk :: (MonadCData m) => EnvSite -> Thunk -> Thunk -> m Thunk
+deferApplyThunk site fnThunk argThunk = do
+  (sp, sc) <- buildCSlots site [fnThunk, argThunk]
+  env <- newMinimalEnv site sp sc
+  mkThunkBc env reservedApply1
 
 -- | The non-copying path coercion: the path text verbatim, no context -
 -- upstream's @coerceToString@ with @copyToStore = false@.
@@ -2562,10 +2510,8 @@ builtinHasContext other =
 --   - @allOutputs@: true if there's a SCAllOutputs reference
 --   - @outputs@: list of output names from SCDrvOutput references
 builtinGetContext :: (MonadEval m) => NixValue -> m NixValue
-builtinGetContext (VStr _ (StringContext ctx)) = do
-  let grouped = groupContextByPath (Set.toList ctx)
-      attrMap = Map.map contextEntryToAttrs grouped
-  pure (VAttrs (attrSetFromMap SetGetContext attrMap))
+builtinGetContext (VStr _ (StringContext ctx)) =
+  traverse contextEntryToAttrs (groupContextByPath (Set.toList ctx)) >>= valuesSet SetGetContext
 builtinGetContext other =
   throwEvalError ("builtins.getContext: expected a string, got " <> typeName other)
 
@@ -2598,14 +2544,16 @@ groupContextByPath = foldl' addElement Map.empty
     -- spelling, never the platform file-path mapping.
     spToText = storePathToText defaultStoreDir
 
--- | Convert a ContextEntry to an attrset thunk.
-contextEntryToAttrs :: ContextEntry -> Thunk
-contextEntryToAttrs entry =
-  let fields =
-        [("path", evaluated (VBool True)) | cePath entry]
-          ++ [("allOutputs", evaluated (VBool True)) | ceAllOutputs entry]
-          ++ [("outputs", evaluated (VList (clistFromThunks [thunkToCPtr (evaluated (mkStr o)) | o <- ceOutputs entry]))) | not (null (ceOutputs entry))]
-   in evaluated (VAttrs (attrSetFromMap SetGetContext (Map.fromList fields)))
+-- | Convert a ContextEntry to its attrset.
+contextEntryToAttrs :: (MonadCData m) => ContextEntry -> m NixValue
+contextEntryToAttrs entry = do
+  outputs <- case ceOutputs entry of
+    [] -> pure []
+    names -> (\list -> [("outputs", list)]) <$> valuesList (map mkStr names)
+  valuesSet SetGetContext . Map.fromList $
+    [("path", VBool True) | cePath entry]
+      ++ [("allOutputs", VBool True) | ceAllOutputs entry]
+      ++ outputs
 
 -- | Append context entries to a string from an attrset.
 --
@@ -2613,7 +2561,7 @@ contextEntryToAttrs entry =
 -- context elements to the string.
 builtinAppendContext :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinAppendContext (VStr s ctx) (VAttrs contextAttrs) = do
-  newCtx <- parseContextAttrs (attrSetToMap contextAttrs)
+  newCtx <- attrSetToMap contextAttrs >>= parseContextAttrs
   pure (VStr s (ctx <> newCtx))
 builtinAppendContext (VStr _ _) other =
   throwEvalError ("builtins.appendContext: second argument must be a set, got " <> typeName other)
@@ -2648,21 +2596,23 @@ parseContextAttrs attrs = do
           pure (pathElems ++ allOutElems ++ outElems)
         _ -> throwEvalError "builtins.appendContext: context entry must be a set"
 
-    getBoolAttr key attrs' = case attrSetLookup key attrs' of
-      Nothing -> pure False
-      Just thunk -> do
-        val <- force thunk
-        case val of
-          VBool b -> pure b
-          _ -> pure False
+    getBoolAttr key attrs' =
+      attrSetLookup key attrs' >>= \case
+        Nothing -> pure False
+        Just thunk -> do
+          val <- force thunk
+          case val of
+            VBool b -> pure b
+            _ -> pure False
 
-    getOutputsList attrs' = case attrSetLookup "outputs" attrs' of
-      Nothing -> pure []
-      Just thunk -> do
-        val <- force thunk
-        case val of
-          VList cl -> mapM (forceToOutputName . Thunk) (clistThunks cl)
-          _ -> pure []
+    getOutputsList attrs' =
+      attrSetLookup "outputs" attrs' >>= \case
+        Nothing -> pure []
+        Just thunk -> do
+          val <- force thunk
+          case val of
+            VList cl -> listThunks cl >>= mapM forceToOutputName
+            _ -> pure []
 
     forceToOutputName thunk = do
       val <- force thunk
@@ -2714,14 +2664,13 @@ dirComponentBytes t =
 
 builtinConcatLists :: (MonadEval m) => NixValue -> m NixValue
 builtinConcatLists (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  sublists <- mapM forceThenExtractList thunks
-  pure (VList (clistFromThunks (concat sublists)))
+  sublists <- listThunks cl >>= mapM forceThenExtractList
+  thunksList (concat sublists)
   where
     forceThenExtractList thunk = do
       val <- force thunk
       case val of
-        VList innerCl -> pure (clistThunks innerCl)
+        VList innerCl -> listThunks innerCl
         _ -> throwEvalError "builtins.concatLists: element must be a list"
 builtinConcatLists other =
   throwEvalError ("builtins.concatLists: expected a list, got " <> typeName other)
@@ -2751,13 +2700,9 @@ builtinMapAttrs funcArg (VAttrs attrs) =
   -- Eagerly builds all thunks via attrSetMapWithKey - with C arena thunks
   -- (~16 bytes each), this keeps all data off the GHC heap.
   -- Slot 0 = function, slot 1 = key, slot 2 = value.
-  pure (VAttrs (attrSetMapWithKey SetMapAttrs deferAttr attrs))
-  where
-    fnThunk = argAsThunk funcArg
-    deferAttr key valThunk =
-      let (sp, sc) = buildCSlots EnvMapAttrs [fnThunk, evaluated (mkStr key), valThunk]
-          env = newMinimalEnv EnvMapAttrs sp sc
-       in mkThunkBc env reservedApply2
+  do
+    fnThunk <- argAsThunk funcArg
+    VAttrs <$> attrSetMapWithKey SetMapAttrs (deferApply2 EnvMapAttrs fnThunk) attrs
 builtinMapAttrs _ other =
   throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
 
@@ -2765,46 +2710,39 @@ builtinMapAttrs _ other =
 -- including functor sets: upstream's primop never consults
 -- @__functionArgs@ (nixpkgs lib.functionArgs handles that in Nix).
 builtinFunctionArgs :: (MonadEval m) => NixValue -> m NixValue
-builtinFunctionArgs (VLambda _ formals _) = pure (formalsToAttrs formals)
-builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs (attrSetFromMap SetFunctionArgs Map.empty))
+builtinFunctionArgs (VLambda _ formals _) = formalsToAttrs formals
+builtinFunctionArgs (VBuiltin _ _) = valuesSet SetFunctionArgs Map.empty
 builtinFunctionArgs _ = throwEvalError "'functionArgs' requires a function"
 
-formalsToAttrs :: EvalFormals -> NixValue
-formalsToAttrs (EFName _) = VAttrs (attrSetFromMap SetFunctionArgs Map.empty)
+formalsToAttrs :: (MonadCData m) => EvalFormals -> m NixValue
+formalsToAttrs (EFName _) = valuesSet SetFunctionArgs Map.empty
 formalsToAttrs (EFSet _ formals _) = formalsListToAttrs formals
 formalsToAttrs (EFNamedSet _ _ formals _) = formalsListToAttrs formals
 
-formalsListToAttrs :: [EvalFormal] -> NixValue
+formalsListToAttrs :: (MonadCData m) => [EvalFormal] -> m NixValue
 formalsListToAttrs formals =
-  VAttrs
-    $ attrSetFromMap SetFunctionArgs
-    $ Map.fromList
-      [(efName f, evaluated (VBool (isJust (efDefault f)))) | f <- formals]
+  valuesSet SetFunctionArgs (Map.fromList [(efName f, VBool (isJust (efDefault f))) | f <- formals])
 
 builtinZipAttrsWith :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinZipAttrsWith func (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  attrSets <- mapM forceToAttrSet thunks
-  let merged = mergeAllAttrs attrSets
-      -- Lazy: each result is a deferred f(name)(values) thunk, not eagerly
-      -- evaluated.  Critical for nixpkgs evalModules fixpoint - config is a
-      -- self-referencing lazy attrset that must be COMPUTED (holding the lazy
-      -- result) before any individual attribute thunks are forced.
-      resultPairs = map (deferZip (evaluated func)) (Map.toList merged)
-  pure (VAttrs (attrSetFromMap SetZipAttrsWith (Map.fromList resultPairs)))
+  attrSets <- listThunks cl >>= mapM forceToAttrSet
+  fnThunk <- evaluated func
+  -- Lazy: each result is a deferred f(name)(values) thunk, not eagerly
+  -- evaluated.  Critical for nixpkgs evalModules fixpoint - config is a
+  -- self-referencing lazy attrset that must be COMPUTED (holding the lazy
+  -- result) before any individual attribute thunks are forced.
+  results <- Map.traverseWithKey (deferZip fnThunk) (mergeAllAttrs attrSets)
+  VAttrs <$> attrSetFromMap SetZipAttrsWith results
   where
     forceToAttrSet thunk = do
       val <- force thunk
       case val of
-        VAttrs attrs -> pure (attrSetToMap attrs)
+        VAttrs attrs -> attrSetToMap attrs
         _ -> throwEvalError "builtins.zipAttrsWith: list element must be a set"
     mergeAllAttrs = foldl' (\acc m -> Map.unionWith (++) acc (Map.map (: []) m)) Map.empty
-    -- Slot 0 = function, slot 1 = name, slot 2 = values list.
-    deferZip fnThunk (key, thunkList) =
-      let valueList = VList (clistFromThunks (map thunkToCPtr thunkList))
-          (slots, slotCount) = buildCSlots EnvZipAttrsWith [fnThunk, evaluated (mkStr key), evaluated valueList]
-          env = newMinimalEnv EnvZipAttrsWith slots slotCount
-       in (key, mkThunkBc env reservedApply2)
+    deferZip fnThunk key thunkList = do
+      valueList <- thunksList thunkList >>= evaluated
+      deferApply2 EnvZipAttrsWith fnThunk key valueList
 builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
 
@@ -2815,8 +2753,8 @@ builtinZipAttrsWith _ other =
 builtinReplaceStrings ::
   (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
 builtinReplaceStrings (VList fromCl) (VList toCl) (VStr input inputCtx) = do
-  let fromThunks = map Thunk (clistThunks fromCl)
-      toThunks = map Thunk (clistThunks toCl)
+  fromThunks <- listThunks fromCl
+  toThunks <- listThunks toCl
   when (length fromThunks /= length toThunks) $
     throwEvalError "builtins.replaceStrings: 'from' and 'to' must have the same length"
   froms <- mapM forceStr fromThunks
@@ -2880,8 +2818,10 @@ builtinReplaceStrings _ _ other =
 -- ---------------------------------------------------------------------------
 
 -- | Global regex compilation cache.  Keyed by the raw pattern bytes
--- (match and split share entries).  Idempotent memoization via
--- unsafePerformIO - same rationale as thunk memoization.
+-- (match and split share entries).  A memo of a pure function, so the one
+-- process-wide table is safe to create outside any monad: a pattern
+-- compiles to the same regex whether the cache answers or the compiler
+-- does.  It holds no C memory.
 {-# NOINLINE regexCacheRef #-}
 regexCacheRef :: IORef (Map BS.ByteString RE.Regex)
 regexCacheRef = unsafePerformIO (newIORef Map.empty)
@@ -2897,8 +2837,9 @@ wholeStringCompOpt = RE.defaultCompOpt {RE.multiline = False}
 -- avoid recompilation.  Compiling from bytes makes the PATTERN byte-level
 -- too, matching upstream: a multi-byte character in the pattern is a
 -- sequence of single-byte atoms, so it lines up with byte-level subjects.
--- Returns Nothing for invalid patterns.  NOINLINE prevents GHC from
--- inlining and floating the unsafePerformIO reads.
+-- Returns Nothing for invalid patterns.  Pure for the reason the cache
+-- is ('regexCacheRef'); NOINLINE keeps GHC from inlining and floating
+-- the cache's reads and writes.
 {-# NOINLINE cachedCompileRegex #-}
 cachedCompileRegex :: BS.ByteString -> Maybe RE.Regex
 cachedCompileRegex pat =
@@ -2954,13 +2895,16 @@ matchWithCompiled compiled str =
         BS.null afterMatch ->
           -- match is an Array of (bytes, (offset, len)) pairs.
           -- Index 0 is the full match; indices 1.. are capture groups.
-          let captureGroups = drop 1 (Array.elems match)
-              -- A non-participating capture group has offset (-1); C++ Nix
-              -- yields null for it, not the empty string.
-              toThunk (s, (off, _)) =
-                if off < 0 then evaluated VNull else evaluated (mkStrBytes s)
-           in pure (VList (clistFromThunks (map (thunkToCPtr . toThunk) captureGroups)))
+          valuesList (map captureGroupValue (drop 1 (Array.elems match)))
     _ -> pure VNull
+
+-- | A capture group of a match: its bytes, or null for a group that did
+-- not participate (offset -1), as C++ Nix yields for one rather than the
+-- empty string.
+captureGroupValue :: (BS.ByteString, (Int, Int)) -> NixValue
+captureGroupValue (s, (off, _))
+  | off < 0 = VNull
+  | otherwise = mkStrBytes s
 
 -- | @builtins.split regex str@: split a string by a POSIX ERE.
 -- Returns an alternating list of non-matched strings and match-group lists.
@@ -2969,42 +2913,37 @@ builtinSplit :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSplit patternVal subject = do
   compiled <- compiledPattern "builtins.split" patternVal
   case subject of
-    VStr str ctx -> pure (VList (clistFromThunks (map thunkToCPtr (splitPieces compiled str ctx))))
+    VStr str ctx -> splitPieces compiled str ctx >>= valuesList
     other -> throwEvalError ("builtins.split: expected a string, got " <> typeName other)
 
 -- | The elements of @split@'s list for a subject.  A subject the pattern
 -- does not match is the one element, context and all, as upstream
 -- returns its argument there (primops.cc:4309-4312 at 2.24.9); the
 -- pieces of one it matches carry no context, as upstream's do.
-splitPieces :: RE.Regex -> BS.ByteString -> StringContext -> [Thunk]
+splitPieces :: (MonadCData m) => RE.Regex -> BS.ByteString -> StringContext -> m [NixValue]
 splitPieces compiled str ctx = case matchAllText compiled str of
-  [] -> [evaluated (VStr str ctx)]
+  [] -> pure [VStr str ctx]
   matches -> buildSplitResult str 0 matches
 
 -- | Build the alternating list for builtins.split.  Offsets from the
 -- ByteString regex instance are byte offsets, so slicing is O(1)
 -- 'BS.take'/'BS.drop'.
-buildSplitResult :: BS.ByteString -> Int -> [Array.Array Int (BS.ByteString, (Int, Int))] -> [Thunk]
+buildSplitResult :: (MonadCData m) => BS.ByteString -> Int -> [Array.Array Int (BS.ByteString, (Int, Int))] -> m [NixValue]
 buildSplitResult remaining pos [] =
   -- No more matches - emit the rest of the string.
-  [evaluated (mkStrBytes (BS.drop pos remaining))]
-buildSplitResult remaining pos (match : rest) =
+  pure [mkStrBytes (BS.drop pos remaining)]
+buildSplitResult remaining pos (match : rest) = do
   let elems = Array.elems match
       (_, (matchStart, matchLen)) = case elems of
         (full : _) -> full
         [] -> ("", (pos, 0)) -- defensive: should not happen from matchAllText
         -- Bytes before this match
       before = BS.take (matchStart - pos) (BS.drop pos remaining)
-      -- Capture groups (indices 1..)
-      groups = drop 1 elems
-      -- A non-participating capture group has offset (-1) becomes null (as 'match').
-      groupThunks =
-        map (\(s, (off, _)) -> if off < 0 then evaluated VNull else evaluated (mkStrBytes s)) groups
       -- Continue after this match
       afterPos = matchStart + matchLen
-   in evaluated (mkStrBytes before)
-        : evaluated (VList (clistFromThunks (map thunkToCPtr groupThunks)))
-        : buildSplitResult remaining afterPos rest
+  -- Capture groups (indices 1..), each as 'match' gives it.
+  groups <- valuesList (map captureGroupValue (drop 1 elems))
+  (\later -> mkStrBytes before : groups : later) <$> buildSplitResult remaining afterPos rest
 
 -- | Upstream reads both versions with @forceStringNoCtx@, the first
 -- before the second (primops.cc:4536-4537 at 2.24.9).
@@ -3091,7 +3030,7 @@ spanComponent t = case BC.uncons t of
 builtinSplitVersion :: (MonadEval m) => NixValue -> m NixValue
 builtinSplitVersion val = do
   s <- structuredStringValue RefuseContext val
-  pure (VList (clistFromThunks (map (thunkToCPtr . evaluated . mkStrBytes) (splitVersionComponents s))))
+  valuesList (map mkStrBytes (splitVersionComponents s))
 
 splitVersionComponents :: BS.ByteString -> [BS.ByteString]
 splitVersionComponents t = case BC.uncons t of
@@ -3111,15 +3050,7 @@ splitVersionComponents t = case BC.uncons t of
 builtinParseDrvName :: (MonadEval m) => NixValue -> m NixValue
 builtinParseDrvName val = do
   (name, version) <- parseName <$> structuredStringValue RefuseContext val
-  pure
-    ( VAttrs
-        ( attrSetFromMap SetParseDrvName $
-            Map.fromList
-              [ ("name", evaluated (mkStrBytes name)),
-                ("version", evaluated (mkStrBytes version))
-              ]
-        )
-    )
+  valuesSet SetParseDrvName (Map.fromList [("name", mkStrBytes name), ("version", mkStrBytes version)])
 
 parseName :: BS.ByteString -> (BS.ByteString, BS.ByteString)
 parseName t =
@@ -3160,8 +3091,7 @@ valueToJSON (VStr s ctx) = do
   decoded <- decodedText "builtins.toJSON" s
   pure (JsonString decoded, ctx)
 valueToJSON (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  vals <- mapM force thunks
+  vals <- listThunks cl >>= mapM force
   results <- mapM valueToJSON vals
   pure (JsonArray (map fst results), mconcat (map snd results))
 -- An attrset is upstream's three-way choice (value-to-json.cc at 2.24.9):
@@ -3170,15 +3100,19 @@ valueToJSON (VList cl) = do
 -- string or a path and a path stays its own absolute text; otherwise the
 -- outPath value, converted as any value is, so it need not be a string;
 -- otherwise an object.
-valueToJSON (VAttrs attrs)
-  | Just _ <- attrSetLookup "__toString" attrs = do
+valueToJSON (VAttrs attrs) = do
+  hasToString <- attrSetMember "__toString" attrs
+  if hasToString
+    then do
       (s, ctx) <- coerceToString False force applyValue coercePathVerbatim (VAttrs attrs)
       decoded <- decodedText "builtins.toJSON" s
       pure (JsonString decoded, ctx)
-  | Just outPathThunk <- attrSetLookup "outPath" attrs = force outPathThunk >>= valueToJSON
-  | otherwise = do
-      results <- mapM jsonMember (Map.toAscList (attrSetToMap attrs))
-      pure (JsonObject (Map.fromAscList [(key, json) | (key, json, _) <- results]), mconcat [ctx | (_, _, ctx) <- results])
+    else
+      attrSetLookup "outPath" attrs >>= \case
+        Just outPathThunk -> force outPathThunk >>= valueToJSON
+        Nothing -> do
+          results <- attrSetToAscList attrs >>= mapM jsonMember
+          pure (JsonObject (Map.fromAscList [(key, json) | (key, json, _) <- results]), mconcat [ctx | (_, _, ctx) <- results])
   where
     jsonMember (key, thunk) = do
       val <- force thunk
@@ -3203,7 +3137,7 @@ builtinFromJSON val = do
   s <- structuredStringValue RefuseContext val
   -- JSON input must be valid UTF-8 (upstream's parser rejects it too).
   decoded <- decodedText "builtins.fromJSON" s
-  either throwEvalError (pure . jsonToValue) (parseJsonWith NixRange decoded)
+  either throwEvalError jsonToValue (parseJsonWith NixRange decoded)
 
 parseHex4 :: Text -> Maybe (Int, Text)
 parseHex4 t
@@ -3217,15 +3151,15 @@ parseHex4 t
 readHex4 :: Text -> Int
 readHex4 = T.foldl' (\acc c -> acc * 16 + digitToInt c) 0
 
-jsonToValue :: Json -> NixValue
+jsonToValue :: (MonadCData m) => Json -> m NixValue
 jsonToValue json = case json of
-  JsonNull -> VNull
-  JsonBool b -> VBool b
-  JsonInt n -> VInt (fromInteger n)
-  JsonFloat d -> VFloat d
-  JsonString str -> mkStr str
-  JsonArray items -> VList (clistFromThunks (map (thunkToCPtr . evaluated . jsonToValue) items))
-  JsonObject members -> VAttrs (attrSetFromMap SetFromJSON (Map.map (evaluated . jsonToValue) members))
+  JsonNull -> pure VNull
+  JsonBool b -> pure (VBool b)
+  JsonInt n -> pure (VInt (fromInteger n))
+  JsonFloat d -> pure (VFloat d)
+  JsonString str -> pure (mkStr str)
+  JsonArray items -> mapM jsonToValue items >>= valuesList
+  JsonObject members -> traverse jsonToValue members >>= valuesSet SetFromJSON
 
 -- | Upstream reads the algorithm with @forceStringNoCtx@ before it forces
 -- the string hashed, whose context it discards (primops.cc:4070-4075 at
@@ -3269,8 +3203,8 @@ builtinDeepSeq first second = deepForce first >> argValue second
 deepForce :: (MonadEval m) => NixValue -> m ()
 deepForce = void . forceInside Set.empty
   where
-    forceInside entered (VList cl) = foldM forceCell entered (map Thunk (clistThunks cl))
-    forceInside entered (VAttrs attrs) = foldM forceCell entered (attrSetElems attrs)
+    forceInside entered (VList cl) = listThunks cl >>= foldM forceCell entered
+    forceInside entered (VAttrs attrs) = attrSetElems attrs >>= foldM forceCell entered
     forceInside entered _ = pure entered
     forceCell entered thunk
       | Set.member cell entered = pure entered
@@ -3299,9 +3233,10 @@ builtinTraceVerbose msgArg result = do
   argValue result
 
 emitTrace :: (MonadEval m) => NixValue -> m ()
-emitTrace msgVal = traceMessage . ("trace: " <>) $ case msgVal of
-  VStr s _ -> bytesToTextLossy s
-  other -> printValue PrintInFull other
+emitTrace msgVal =
+  traceMessage . ("trace: " <>) =<< case msgVal of
+    VStr s _ -> pure (bytesToTextLossy s)
+    other -> printValue PrintInFull other
 
 -- | @builtins.warn msg val@ - print warning to stderr, then force and
 -- return @val@.
@@ -3318,7 +3253,7 @@ emitWarning :: (MonadEval m) => NixValue -> m ()
 emitWarning msgVal = case msgVal of
   VStr s _ -> traceMessage ("evaluation warning: " <> bytesToTextLossy s)
   other ->
-    throwEvalError ("expected a string but found " <> typeName other <> ": " <> printValue PrintForError other)
+    expectedFailure "a string" other
 
 -- | Upstream's @warn@ from its own code rather than an expression, which
 -- its logger prefixes @warning:@ (logging.cc:34-37 at 2.24.9).
@@ -3332,18 +3267,17 @@ warn = traceMessage . ("warning: " <>)
 builtinGenericClosure :: (MonadEval m) => NixValue -> m NixValue
 builtinGenericClosure (VAttrs attrs) = do
   startSetThunk <-
-    maybe (throwEvalError "builtins.genericClosure: missing 'startSet'") pure $
-      attrSetLookup "startSet" attrs
+    attrSetLookup "startSet" attrs
+      >>= maybe (throwEvalError "builtins.genericClosure: missing 'startSet'") pure
   operatorThunk <-
-    maybe (throwEvalError "builtins.genericClosure: missing 'operator'") pure $
-      attrSetLookup "operator" attrs
+    attrSetLookup "operator" attrs
+      >>= maybe (throwEvalError "builtins.genericClosure: missing 'operator'") pure
   startSetVal <- force startSetThunk
   operatorVal <- force operatorThunk
   case startSetVal of
     VList cl -> do
-      let items = map Thunk (clistThunks cl)
-      result <- closureLoop operatorVal (Seq.fromList items) [] []
-      pure (VList (clistFromThunks (map (thunkToCPtr . evaluated) result)))
+      items <- listThunks cl
+      closureLoop operatorVal (Seq.fromList items) [] [] >>= valuesList
     _ -> throwEvalError "builtins.genericClosure: 'startSet' must be a list"
 builtinGenericClosure other =
   throwEvalError ("builtins.genericClosure: expected a set, got " <> typeName other)
@@ -3369,13 +3303,14 @@ closureLoop operator (thunk :<| rest) seenKeys acc = do
     else do
       newItems <- applyValue operator item
       case newItems of
-        VList newCl ->
-          closureLoop operator (rest <> Seq.fromList (map Thunk (clistThunks newCl))) (key : seenKeys) (item : acc)
+        VList newCl -> do
+          newThunks <- listThunks newCl
+          closureLoop operator (rest <> Seq.fromList newThunks) (key : seenKeys) (item : acc)
         _ -> throwEvalError "builtins.genericClosure: operator must return a list"
 
 extractKey :: (MonadEval m) => NixValue -> m NixValue
 extractKey (VAttrs attrs) =
-  case attrSetLookup "key" attrs of
+  attrSetLookup "key" attrs >>= \case
     Just thunk -> force thunk
     Nothing -> throwEvalError "builtins.genericClosure: item missing 'key' attribute"
 extractKey _ = throwEvalError "builtins.genericClosure: item must be a set with 'key'"
@@ -3399,11 +3334,18 @@ keyInList key (seen : rest) = do
 -- context the coercion gathers comes back with the path.
 coerceToPathWithContext :: (MonadEval m) => Text -> NixValue -> m (Text, StringContext)
 coerceToPathWithContext _ (VPath p) = pure (p, emptyContext)
-coerceToPathWithContext label val@(VAttrs attrs)
-  | Just toStringThunk <- attrSetLookup "__toString" attrs = do
+coerceToPathWithContext label val@(VAttrs attrs) =
+  attrSetLookup "__toString" attrs >>= \case
+    Just toStringThunk -> do
       toStringFn <- force toStringThunk
       coerceToPathWithContext label =<< applyValue toStringFn val
-coerceToPathWithContext label val = do
+    Nothing -> coerceToStringAsPath label val
+coerceToPathWithContext label val = coerceToStringAsPath label val
+
+-- | The last case of 'coerceToPathWithContext': the value coerced to a
+-- string without a copy, which must spell an absolute path.
+coerceToStringAsPath :: (MonadEval m) => Text -> NixValue -> m (Text, StringContext)
+coerceToStringAsPath label val = do
   (bytes, ctx) <- coerceToString False force applyValue coercePathVerbatim val
   path <- absolutePathString =<< decodedText label bytes
   pure (path, ctx)
@@ -3469,8 +3411,10 @@ builtinReadDir val = do
   -- Resolved only when an entry needs it, so a listing that types every
   -- entry costs nothing more.
   dir <- if any (isNothing . snd) entries then resolveSymlinks p else pure p
-  let entryValue name = maybe (deferApply EnvApply (VBuiltin "readFileType" []) (evaluated (VPath (canonPathValue (dir <> "/" <> name))))) (evaluated . mkStr)
-  pure (VAttrs (attrSetFromMap SetReadDir (Map.fromList [(name, entryValue name fileType) | (name, fileType) <- entries])))
+  let untypedEntry name = evaluated (VPath (canonPathValue (dir <> "/" <> name))) >>= deferApply EnvApply (VBuiltin "readFileType" [])
+      entryValue name = maybe (untypedEntry name) (evaluated . mkStr)
+  values <- Map.traverseWithKey entryValue (Map.fromList entries)
+  VAttrs <$> attrSetFromMap SetReadDir values
 
 -- | A listed entry's type, or for an entry the listing gives no type, the
 -- type an lstat of the entry reads, which fails as @builtins.readFileType@
@@ -3565,7 +3509,7 @@ enclosingStorePath p = do
 -- failure comes ahead of a name's.
 builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinFindFile (VList cl) nameVal = do
-  entries <- mapM (forceSearchEntry . Thunk) (clistThunks cl)
+  entries <- listThunks cl >>= mapM forceSearchEntry
   name <- structuredStringValue RefuseContext nameVal
   findFirst entries name
 builtinFindFile other _ =
@@ -3581,11 +3525,11 @@ forceSearchEntry thunk = do
   case val of
     VAttrs attrs -> do
       prefixThunk <-
-        maybe (throwEvalError "builtins.findFile: entry missing 'prefix'") pure $
-          attrSetLookup "prefix" attrs
+        attrSetLookup "prefix" attrs
+          >>= maybe (throwEvalError "builtins.findFile: entry missing 'prefix'") pure
       pathThunk <-
-        maybe (throwEvalError "builtins.findFile: entry missing 'path'") pure $
-          attrSetLookup "path" attrs
+        attrSetLookup "path" attrs
+          >>= maybe (throwEvalError "builtins.findFile: entry missing 'path'") pure
       prefixVal <- force prefixThunk
       pathVal <- force pathThunk
       prefix <- case prefixVal of
@@ -3675,7 +3619,7 @@ builtinScopedImport scopeArg pathVal = do
   p <- coerceToPath "builtins.scopedImport" pathVal
   scopeVal <- argValue scopeArg
   case scopeVal of
-    VAttrs attrs -> scopedImportFile (Map.toList (attrSetToMap attrs)) p
+    VAttrs attrs -> attrSetToMap attrs >>= \scope -> scopedImportFile (Map.toList scope) p
     other -> throwEvalError ("builtins.scopedImport: expected a set, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
@@ -3894,7 +3838,8 @@ builtinFetchGit (VStr rawUrl _) = do
         fgaNarHash = Nothing
       }
 builtinFetchGit (VAttrs attrs) = do
-  case filter (`notElem` fetchGitSupportedAttrs) (Map.keys (attrSetToMap attrs)) of
+  names <- Map.keys <$> attrSetToMap attrs
+  case filter (`notElem` fetchGitSupportedAttrs) names of
     (unsupported : _) ->
       throwEvalError ("builtins.fetchGit: attribute '" <> unsupported <> "' not supported")
     [] -> pure ()
@@ -3975,7 +3920,7 @@ fetchGit args =
           unless (base64ToBytes (fcNarHash fields) == Just declared) $
             throwEvalError
               ("builtins.fetchGit: NAR hash mismatch in '" <> url <> "', expected 'sha256-" <> fcNarHash fields <> "' but got 'sha256-" <> bytesToBase64 declared <> "'")
-      pure (fetchGitResult submodules fields)
+      fetchGitResult submodules fields
 
 -- | The URL upstream renders a @fetchGit@ input as
 -- (@fetchers::Input::toURLString@ at 2.24.9): the url after @fixGitURL@
@@ -4227,7 +4172,7 @@ data FetchCache = FetchCache
   }
   deriving (Eq, Show)
 
-fetchGitResult :: Bool -> FetchCache -> NixValue
+fetchGitResult :: (MonadCData m) => Bool -> FetchCache -> m NixValue
 fetchGitResult submodules fields =
   let lastModifiedDate =
         T.pack
@@ -4236,19 +4181,17 @@ fetchGitResult submodules fields =
               "%Y%m%d%H%M%S"
               (posixSecondsToUTCTime (fromIntegral (fcLastModified fields)))
           )
-   in VAttrs
-        ( attrSetFromMap SetFetchGit $
-            Map.fromList
-              [ ("outPath", evaluated (VPath (canonPathValue (fcStorePath fields)))),
-                ("rev", evaluated (mkStr (fcRev fields))),
-                ("shortRev", evaluated (mkStr (T.take 7 (fcRev fields)))),
-                ("revCount", evaluated (VInt (fromIntegral (fcRevCount fields)))),
-                ("submodules", evaluated (VBool submodules)),
-                ("lastModified", evaluated (VInt (fromIntegral (fcLastModified fields)))),
-                ("lastModifiedDate", evaluated (mkStr lastModifiedDate)),
-                ("narHash", evaluated (mkStr ("sha256-" <> fcNarHash fields)))
-              ]
-        )
+   in valuesSet SetFetchGit $
+        Map.fromList
+          [ ("outPath", VPath (canonPathValue (fcStorePath fields))),
+            ("rev", mkStr (fcRev fields)),
+            ("shortRev", mkStr (T.take 7 (fcRev fields))),
+            ("revCount", VInt (fromIntegral (fcRevCount fields))),
+            ("submodules", VBool submodules),
+            ("lastModified", VInt (fromIntegral (fcLastModified fields))),
+            ("lastModifiedDate", mkStr lastModifiedDate),
+            ("narHash", mkStr ("sha256-" <> fcNarHash fields))
+          ]
 
 -- | What a remembered fetch is filed under.  Everything that decides what
 -- comes back is in the key, so a hit cannot describe a different fetch: the
@@ -4467,7 +4410,7 @@ forceAttrStr builtin key attrs = do
 -- | Like 'forceAttrStr' but returns the coerced RAW BYTES.
 forceAttrBytes :: (MonadEval m) => Text -> Text -> AttrSet -> m BS.ByteString
 forceAttrBytes builtin key attrs =
-  case attrSetLookup key attrs of
+  attrSetLookup key attrs >>= \case
     Nothing -> throwEvalError (builtin <> ": missing required attribute '" <> key <> "'")
     Just thunk -> do
       val <- force thunk
@@ -4478,7 +4421,7 @@ forceAttrBytes builtin key attrs =
 -- but uncoercible (or throwing) value is an error, not 'Nothing'.
 forceOptionalAttrStr :: (MonadEval m) => AttrSet -> Text -> m (Maybe Text)
 forceOptionalAttrStr attrs key =
-  case attrSetLookup key attrs of
+  attrSetLookup key attrs >>= \case
     Nothing -> pure Nothing
     Just thunk -> do
       val <- force thunk
@@ -4489,7 +4432,7 @@ forceOptionalAttrStr attrs key =
 -- not a silent coercion.
 forceOptionalAttrBool :: (MonadEval m) => Text -> AttrSet -> Text -> Bool -> m Bool
 forceOptionalAttrBool builtin attrs key def =
-  case attrSetLookup key attrs of
+  attrSetLookup key attrs >>= \case
     Nothing -> pure def
     Just thunk -> do
       val <- force thunk
@@ -4618,9 +4561,11 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- Read with forceStringNoCtx (primops.cc:1130 at 2.24.9): a string with
   -- no context, never a value coerced to one.  An absent name is getAttr's
   -- error.
-  drvName <- nameTrace $ case attrSetLookup "name" attrs of
-    Nothing -> throwEvalError "attribute 'name' missing"
-    Just thunk -> decodedText "derivation" =<< structuredStringValue RefuseContext =<< force thunk
+  drvName <-
+    nameTrace $
+      attrSetLookup "name" attrs >>= \case
+        Nothing -> throwEvalError "attribute 'name' missing"
+        Just thunk -> decodedText "derivation" =<< structuredStringValue RefuseContext =<< force thunk
   -- The name becomes the store-path name of the .drv and of every output,
   -- so it must satisfy the store-path name rules.  The path constructors
   -- re-check what they build; this early check reports the offending
@@ -4635,14 +4580,15 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- __ignoreNulls: when true, null-valued attrs are dropped from the
   -- derivation env (stdenv.mkDerivation sets it); when absent or false,
   -- null coerces to "" like any other coerceMore value - C++ Nix semantics.
-  nulls <- case attrSetLookup ignoreNullsFlag attrs of
-    Nothing -> pure KeepNullAttrs
-    Just thunk ->
-      addErrorTrace (pure "while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict") $ do
-        ignore <- force thunk >>= expectBool
-        pure (if ignore then IgnoreNullAttrs else KeepNullAttrs)
+  nulls <-
+    attrSetLookup ignoreNullsFlag attrs >>= \case
+      Nothing -> pure KeepNullAttrs
+      Just thunk ->
+        addErrorTrace (pure "while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict") $ do
+          ignore <- force thunk >>= expectBool
+          pure (if ignore then IgnoreNullAttrs else KeepNullAttrs)
   let fieldContext = "derivation \"" <> drvName <> "\""
-      attrsInOrder = Map.toAscList (Map.delete ignoreNullsFlag (attrSetToMap attrs))
+  attrsInOrder <- Map.toAscList . Map.delete ignoreNullsFlag <$> attrSetToMap attrs
   -- Each attribute is one environment entry, or one member of a single
   -- JSON object under __json for a structured derivation.  The per-output
   -- env vars ($out, ...) are added below in both modes.
@@ -4773,12 +4719,9 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- path carries that one output of it.
   let drvPathCtx = StringContext (Set.singleton (SCAllOutputs drvSP))
       outPathCtx outName = StringContext (Set.singleton (SCDrvOutput drvSP outName))
-      outputEntry (outName, outP) = (outName, evaluated (VStr (TE.encodeUtf8 outP) (outPathCtx outName)))
-      resultAttrs =
-        Map.fromList
-          (("drvPath", evaluated (VStr (TE.encodeUtf8 drvPathText) drvPathCtx)) : map outputEntry outPaths)
-
-  pure (VAttrs (attrSetFromMap SetDerivationStrict resultAttrs))
+      outputEntry (outName, outP) = (outName, VStr (TE.encodeUtf8 outP) (outPathCtx outName))
+  valuesSet SetDerivationStrict . Map.fromList $
+    ("drvPath", VStr (TE.encodeUtf8 drvPathText) drvPathCtx) : map outputEntry outPaths
 builtinDerivationStrict other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
@@ -4897,7 +4840,7 @@ derivationPass drvName nulls readEntry = foldM step (Map.empty, initial)
 readCommandLine :: (MonadEval m) => NixValue -> DrvFields -> m DrvFields
 readCommandLine val fields = case val of
   VList cl -> do
-    parts <- mapM (force . Thunk >=> coerceToStoreString) (clistThunks cl)
+    parts <- listThunks cl >>= mapM (force >=> coerceToStoreString)
     pure fields {dfArgs = map fst parts, dfContext = dfContext fields <> foldMap snd parts}
   _ -> throwEvalError "derivation: 'args' must be a list of strings"
 
@@ -4939,7 +4882,7 @@ readStructuredEntry drvName fieldContext role key val fields
         SystemEntry -> (\bytes -> entered {dfSystem = Just bytes}) <$> structuredStringValue RefuseContext val
         OutputsEntry -> case val of
           VList cl -> do
-            outputs <- checkedOutputs =<< mapM (structuredOutputName fieldContext . Thunk) (clistThunks cl)
+            outputs <- checkedOutputs =<< (listThunks cl >>= mapM (structuredOutputName fieldContext))
             pure entered {dfOutputs = outputs}
           _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
         FixedOutputEntry field -> structuredStringValue RefuseContext val >>= \bytes -> withFixedOutputField field bytes entered
@@ -5026,11 +4969,12 @@ structuredAttrsFlag = "__structuredAttrs"
 -- boolean, whatever @__ignoreNulls@ says, refusing anything else with
 -- @forceBool@'s message.
 attrPassingOf :: (MonadEval m) => AttrSet -> m AttrPassing
-attrPassingOf attrs = case attrSetLookup structuredAttrsFlag attrs of
-  Nothing -> pure PassAsEnvironment
-  Just thunk -> do
-    structured <- force thunk >>= expectBool
-    pure (if structured then PassAsStructuredAttrs else PassAsEnvironment)
+attrPassingOf attrs =
+  attrSetLookup structuredAttrsFlag attrs >>= \case
+    Nothing -> pure PassAsEnvironment
+    Just thunk -> do
+      structured <- force thunk >>= expectBool
+      pure (if structured then PassAsStructuredAttrs else PassAsEnvironment)
 
 -- | Whether a string read without coercion may carry context: one
 -- upstream reads with @forceString@, such as a structured derivation's
@@ -5049,7 +4993,7 @@ structuredStringValue rule val = case (val, rule) of
         throwEvalError ("the string '" <> bytesToTextLossy s <> "' is not allowed to refer to a store path (such as '" <> shown <> "')")
   (VStr s _, _) -> pure s
   (other, _) ->
-    throwEvalError ("expected a string but found " <> typeName other <> ": " <> printValue PrintForError other)
+    expectedFailure "a string" other
 
 -- | An attribute name a program computes, read as upstream reads every
 -- one, with @forceStringNoCtx@ (eval.cc:2253 at 2.24.9): a string, never a
@@ -5093,16 +5037,16 @@ derivationAttrTrace drvName key = "while evaluating attribute '" <> key <> "' of
 -- and as it is when it is absent, which leaves a missing attribute's
 -- refusal unadorned.
 traceIfPresent :: (MonadEval m) => AttrSet -> Text -> Text -> m a -> m a
-traceIfPresent attrs key line action
-  | attrSetMember key attrs = addErrorTrace (pure line) action
-  | otherwise = action
+traceIfPresent attrs key line action = do
+  present <- attrSetMember key attrs
+  if present then addErrorTrace (pure line) action else action
 
 -- | A Boolean as upstream's @forceBool@ reads it, refused with its message
 -- (eval.cc:2176-2193 at 2.24.9): a derivation's switches and the
 -- @recursive@ of @builtins.path@.
 expectBool :: (MonadEval m) => NixValue -> m Bool
 expectBool (VBool b) = pure b
-expectBool other = throwEvalError ("expected a Boolean but found " <> typeName other <> ": " <> printValue PrintForError other)
+expectBool other = expectedFailure "a Boolean" other
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - hashFile, readFileType
@@ -5144,8 +5088,9 @@ builtinConvertHash (VAttrs attrs) = do
   -- hashAlgo, when given, is parsed before the hash and handed to
   -- Hash::parseAny (prim_convertHash, primops.cc:4100-4108 at 2.24.9), so
   -- an unknown one is refused, and a tag naming another algorithm too.
+  hasAlgo <- attrSetMember "hashAlgo" attrs
   expected <-
-    if attrSetMember "hashAlgo" attrs
+    if hasAlgo
       then do
         algo <- requireStrAttr "convertHash" "hashAlgo" attrs
         Just algo <$ either throwEvalError pure (parseHashAlgo algo)
@@ -5296,13 +5241,14 @@ hashSpelling s
 
 -- | Require a string attribute from an attrset.
 requireStrAttr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
-requireStrAttr ctx key attrs = case attrSetLookup key attrs of
-  Just thunk -> do
-    val <- force thunk
-    case val of
-      VStr s _ -> decodedText ("builtins." <> ctx) s
-      _ -> throwEvalError ("builtins." <> ctx <> ": " <> key <> " must be a string")
-  Nothing -> throwEvalError ("builtins." <> ctx <> ": missing required attribute '" <> key <> "'")
+requireStrAttr ctx key attrs =
+  attrSetLookup key attrs >>= \case
+    Just thunk -> do
+      val <- force thunk
+      case val of
+        VStr s _ -> decodedText ("builtins." <> ctx) s
+        _ -> throwEvalError ("builtins." <> ctx <> ": " <> key <> " must be a string")
+    Nothing -> throwEvalError ("builtins." <> ctx <> ": missing required attribute '" <> key <> "'")
 
 -- ---------------------------------------------------------------------------
 -- Base64 encoding - delegates to nova-cache (base64-bytestring under the hood)
@@ -5327,7 +5273,7 @@ builtinFromTOML (VStr s _) = do
   -- TOML is UTF-8 by definition; upstream's parser rejects invalid bytes.
   decoded <- decodedText "builtins.fromTOML" s
   case parseTOML decoded of
-    Right val -> pure val
+    Right toml -> tomlToNix toml
     Left err -> throwEvalError ("builtins.fromTOML: " <> err)
 builtinFromTOML other =
   throwEvalError ("builtins.fromTOML: expected a string, got " <> typeName other)
@@ -5342,21 +5288,19 @@ data TOMLValue
   | TOMLTable !(Map Text TOMLValue)
   deriving (Show)
 
--- | Parse a TOML document into a NixValue.
-parseTOML :: Text -> Either Text NixValue
-parseTOML input = do
-  table <- parseTOMLDoc (T.lines input)
-  pure (tomlToNix (TOMLTable table))
+-- | Parse a TOML document: its top-level table.
+parseTOML :: Text -> Either Text TOMLValue
+parseTOML input = TOMLTable <$> parseTOMLDoc (T.lines input)
 
 -- | Convert a TOMLValue to NixValue.
-tomlToNix :: TOMLValue -> NixValue
+tomlToNix :: (MonadCData m) => TOMLValue -> m NixValue
 tomlToNix val = case val of
-  TOMLStr s -> mkStr s
-  TOMLInt n -> VInt n
-  TOMLFloat d -> VFloat d
-  TOMLBool b -> VBool b
-  TOMLArray xs -> VList (clistFromThunks (map (thunkToCPtr . evaluated . tomlToNix) xs))
-  TOMLTable m -> VAttrs (attrSetFromMap SetFromTOML (Map.map (evaluated . tomlToNix) m))
+  TOMLStr s -> pure (mkStr s)
+  TOMLInt n -> pure (VInt n)
+  TOMLFloat d -> pure (VFloat d)
+  TOMLBool b -> pure (VBool b)
+  TOMLArray xs -> mapM tomlToNix xs >>= valuesList
+  TOMLTable m -> traverse tomlToNix m >>= valuesSet SetFromTOML
 
 -- | Parse all lines of a TOML document into a table.
 parseTOMLDoc :: [Text] -> Either Text (Map Text TOMLValue)
@@ -5899,7 +5843,7 @@ valueToXML depth written val = case val of
   VFloat d -> leaf "float" [("value", TE.encodeUtf8 (formatXmlFloat d))]
   VList cl ->
     xmlElement depth "list" [] $
-      foldM (writeChild (\thunk inner -> force thunk >>= valueToXML (depth + 1) inner)) (mempty, written) (map Thunk (clistThunks cl))
+      listThunks cl >>= foldM (writeChild (\thunk inner -> force thunk >>= valueToXML (depth + 1) inner)) (mempty, written)
   VAttrs attrs -> do
     identity <- xmlDerivationIdentity attrs
     case identity of
@@ -5922,7 +5866,7 @@ valueToXML depth written val = case val of
 -- its value.
 attrsToXML :: (MonadEval m) => Int -> XmlWritten -> AttrSet -> m (BB.Builder, XmlWritten)
 attrsToXML depth written attrs =
-  foldM (writeChild attrToXML) (mempty, written) (attrSetToAscList attrs)
+  attrSetToAscList attrs >>= foldM (writeChild attrToXML) (mempty, written)
   where
     attrToXML (name, thunk) inner =
       xmlElement depth "attr" [("name", TE.encodeUtf8 name)] (force thunk >>= valueToXML (depth + 1) inner)
@@ -5942,7 +5886,7 @@ writeChild write (before, written) child = do
 -- as attributes, and a repeated one adds none.
 xmlDerivationIdentity :: (MonadEval m) => AttrSet -> m (Maybe ([XmlAttr], BS.ByteString))
 xmlDerivationIdentity attrs = do
-  typeVal <- traverse force (attrSetLookup "type" attrs)
+  typeVal <- attrSetLookup "type" attrs >>= traverse force
   case typeVal of
     Just (VStr "derivation" _) -> do
       drvPath <- stringAttr "drvPath"
@@ -5952,7 +5896,7 @@ xmlDerivationIdentity attrs = do
     _ -> pure Nothing
   where
     stringAttr key = do
-      found <- traverse force (attrSetLookup key attrs)
+      found <- attrSetLookup key attrs >>= traverse force
       pure $ case found of
         Just (VStr s _) -> Just s
         _ -> Nothing
@@ -6021,7 +5965,8 @@ builtinPath (VAttrs attrs) = do
   -- refusing one it does not take at its turn, and checks for the path
   -- once that loop is done (primops.cc:2569-2592 at 2.24.9).  The order
   -- is by interned symbol, as upstream's attribute sets are sorted.
-  args <- foldM (readPathArgument attrs) noPathArguments (mapMaybe (\key -> (,) key <$> attrSetLookup key attrs) (attrSetKeys attrs))
+  entries <- attrSetKeys attrs >>= traverse (\key -> fmap (key,) <$> attrSetLookup key attrs)
+  args <- foldM (readPathArgument attrs) noPathArguments (catMaybes entries)
   pathStr <- maybe (throwEvalError "missing required 'path' attribute in the first argument to builtins.path") pure (paPath args)
   let name = fromMaybe (canonBaseName pathStr) (paName args)
       expectedDigest = paPin args

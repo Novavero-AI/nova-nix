@@ -29,9 +29,9 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Word (Word32)
 import Nix.Eval.CBytecode (cbcData, cbcEmitData)
+import Nix.Eval.CData (MonadCData)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Expr.Types (SourceOrigin (..), SrcPos (..))
-import System.IO.Unsafe (unsafePerformIO)
 
 -- | Where something was defined: 'noPos', or the index of a recorded
 -- position.
@@ -96,17 +96,15 @@ data RecordedPos
     PosInText !Int !Int
   deriving (Eq, Show)
 
--- | Read a position back, or 'Nothing' for 'noPos'.  'unsafePerformIO' is
--- safe here: the record was written once, when its index was made, and
--- no later write touches it, so the read answers the same every time.
-lookupPos :: PosIdx -> Maybe RecordedPos
-lookupPos (PosIdx 0) = Nothing
-lookupPos (PosIdx idx) = Just $ unsafePerformIO $ do
+-- | Read a position back, or 'Nothing' for 'noPos'.
+lookupPos :: (MonadCData m) => PosIdx -> m (Maybe RecordedPos)
+lookupPos (PosIdx 0) = pure Nothing
+lookupPos (PosIdx idx) = do
   let offset = idx - 1
   file <- cbcData offset
   line <- fromIntegral <$> cbcData (offset + 1)
   column <- fromIntegral <$> cbcData (offset + 2)
-  pure $
+  pure . Just $
     if file == noFile
       then PosInText line column
       else PosInFile (symbolText (Symbol file)) line column

@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | String coercion and indented-string whitespace stripping.
 --
 -- Provides 'coerceToString' (string interpolation and @builtins.toString@),
@@ -193,29 +195,31 @@ coerceToString True _ _ _ VNull = pure ("", emptyContext)
 coerceToString True _ _ _ (VBool True) = pure ("1", emptyContext)
 coerceToString True _ _ _ (VBool False) = pure ("", emptyContext)
 coerceToString True forceFn applyFn coercePathFn (VList cl) = do
-  parts <- mapM element (clistThunks cl)
+  parts <- clistThunks cl >>= mapM element
   pure (joinCoercedList [(bytes, isEmptyList) | (bytes, _, isEmptyList) <- parts], mconcat [ctx | (_, ctx, _) <- parts])
   where
     element thunk = do
       val <- forceFn (Thunk thunk)
       (bytes, ctx) <- coerceToString True forceFn applyFn coercePathFn val
-      pure (bytes, ctx, emptyList val)
-    emptyList (VList inner) = clistLen inner == 0
-    emptyList _ = False
+      isEmptyList <- emptyList val
+      pure (bytes, ctx, isEmptyList)
+    emptyList (VList inner) = (== 0) <$> clistLen inner
+    emptyList _ = pure False
 -- Attribute sets: try __toString first, then outPath (both modes).
 -- The recursion carries the caller's path coercion, so a path-valued
 -- @outPath@ lands on the caller's path case, not a fixed one.
 coerceToString coerceMore forceFn applyFn coercePathFn (VAttrs attrs) =
-  case attrSetLookup "__toString" attrs of
+  attrSetLookup "__toString" attrs >>= \case
     Just toStrThunk -> do
       toStrFn <- forceFn toStrThunk
       result <- applyFn toStrFn (VAttrs attrs)
       coerceToString coerceMore forceFn applyFn coercePathFn result
-    Nothing -> case attrSetLookup "outPath" attrs of
-      Just outPathThunk -> do
-        outPathVal <- forceFn outPathThunk
-        coerceToString coerceMore forceFn applyFn coercePathFn outPathVal
-      Nothing -> uncoercible (VAttrs attrs)
+    Nothing ->
+      attrSetLookup "outPath" attrs >>= \case
+        Just outPathThunk -> do
+          outPathVal <- forceFn outPathThunk
+          coerceToString coerceMore forceFn applyFn coercePathFn outPathVal
+        Nothing -> uncoercible (VAttrs attrs)
 coerceToString _ _ _ _ other = uncoercible other
 
 -- | The coerced elements of a list joined as upstream's @coerceToString@
@@ -233,12 +237,13 @@ joinCoercedList = BS.concat . pieces
 
 -- | Upstream's refusal of a value no coercion takes (@coerceToString@,
 -- eval.cc at 2.24.9): its type, then the value as an error prints it.
--- The message is built before it is thrown, so a thunk it shows reads as
--- it is at the failure, not as it is once the force around the failure
--- has been unwound.
+-- The value is printed before the error is thrown, so a thunk it shows
+-- reads as it is at the failure, not as it is once the force around the
+-- failure has been unwound.
 uncoercible :: (MonadEval m) => NixValue -> m a
-uncoercible val =
-  throwEvalError $! "cannot coerce " <> typeName val <> " to a string: " <> printValue PrintForError val
+uncoercible val = do
+  shown <- printValue PrintForError val
+  throwEvalError ("cannot coerce " <> typeName val <> " to a string: " <> shown)
 
 -- | Format a float the way C++ Nix's coerceToString does -
 -- @std::to_string@, i.e. FIXED 6 decimal places with no trimming:

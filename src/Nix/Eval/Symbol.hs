@@ -40,8 +40,8 @@ import qualified Data.Text.Foreign as TF
 import Data.Word (Word32)
 import Foreign.C.Types (CChar, CSize (..))
 import Foreign.Ptr (Ptr, nullPtr)
+import Nix.Eval.CData (MonadCData, cdataIO, readImmutable)
 import Nix.Eval.CStatus (cStatusFailure)
-import System.IO.Unsafe (unsafePerformIO)
 
 -- | An interned symbol - a 'Word32' index into the global symbol table.
 -- Two symbols are equal iff their indices are equal (O(1) comparison).
@@ -100,9 +100,9 @@ symbolDestroy = c_nn_symbol_destroy
 -- This is the canonical entry point for Text to C conversion; the table
 -- stores the UTF-8 bytes, so a 'Text' and its 'Data.Text.Encoding.encodeUtf8'
 -- image intern to the SAME symbol.
-symbolIntern :: Text -> IO Symbol
+symbolIntern :: (MonadCData m) => Text -> m Symbol
 symbolIntern txt =
-  TF.withCStringLen txt $ \(ptr, len) ->
+  cdataIO . TF.withCStringLen txt $ \(ptr, len) ->
     checkedSymbol =<< c_nn_symbol_intern ptr (fromIntegral len)
 
 -- | Intern raw bytes, returning their t'Symbol'.  The C table is
@@ -111,9 +111,9 @@ symbolIntern txt =
 -- entry point for string VALUES, whose payload is a byte string.
 -- 'BSU.unsafeUseAsCStringLen' is safe here: @nn_symbol_intern@ copies
 -- the bytes into its own arena and never retains the pointer.
-symbolInternBytes :: ByteString -> IO Symbol
+symbolInternBytes :: (MonadCData m) => ByteString -> m Symbol
 symbolInternBytes bs =
-  BSU.unsafeUseAsCStringLen bs $ \(ptr, len) ->
+  cdataIO . BSU.unsafeUseAsCStringLen bs $ \(ptr, len) ->
     checkedSymbol =<< c_nn_symbol_intern ptr (fromIntegral len)
 
 -- | Reject the interner's failure sentinel before it can become a
@@ -126,6 +126,13 @@ checkedSymbol sid
   | sid == invalidSymbolId = cStatusFailure "nn_symbol_intern" "the symbol table cannot hold the string (allocation failure or its 4 GiB arena limit)"
   | otherwise = pure (Symbol sid)
 
+-- The reads below are pure ('readImmutable'): a symbol's bytes do not
+-- change once interned, until 'symbolDestroy'.  They can move, since the
+-- table grows its byte storage with @realloc@ as later strings are
+-- interned, and a read takes their address before it copies them, so no
+-- intern may run between the two: the layer is used from one thread at a
+-- time.
+
 -- | Retrieve the text of an interned symbol.
 -- Returns the original string.  The result is safe to use - it copies
 -- from the C arena into a fresh 'Text'.  Only valid for symbols interned
@@ -134,7 +141,7 @@ checkedSymbol sid
 symbolText :: Symbol -> Text
 symbolText (Symbol sid)
   | sid == invalidSymbolId = T.empty
-  | otherwise = unsafePerformIO $ do
+  | otherwise = readImmutable . cdataIO $ do
       ptr <- c_nn_symbol_text sid
       if ptr == nullPtr
         then pure T.empty
@@ -147,7 +154,7 @@ symbolText (Symbol sid)
 symbolBytes :: Symbol -> ByteString
 symbolBytes (Symbol sid)
   | sid == invalidSymbolId = BS.empty
-  | otherwise = unsafePerformIO $ do
+  | otherwise = readImmutable . cdataIO $ do
       ptr <- c_nn_symbol_text sid
       if ptr == nullPtr
         then pure BS.empty
@@ -157,7 +164,7 @@ symbolBytes (Symbol sid)
 
 -- | Byte length of a symbol's string.
 symbolLen :: Symbol -> Int
-symbolLen (Symbol sid) = fromIntegral (unsafePerformIO (c_nn_symbol_len sid))
+symbolLen (Symbol sid) = fromIntegral (readImmutable (cdataIO (c_nn_symbol_len sid)))
 
 -- ---------------------------------------------------------------------------
 -- Diagnostics
