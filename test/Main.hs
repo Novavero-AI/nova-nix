@@ -14647,8 +14647,8 @@ testWindowsSources = do
     knownSources :: [Text]
     knownSources = ["hex0-seed.exe", "busybox-w32-FRP-6354-g5f09fb446.tgz", "bash-5.3.015-1-x86_64.pkg.tar.zst"]
 
--- | The CI workflow whose Mes and Bootstrap jobs build the seed ladder, from
--- the repository root.
+-- | The CI workflow whose ladder jobs build the seed ladder, a job for each
+-- stage, from the repository root.
 ciWorkflowPath :: FilePath
 ciWorkflowPath = ".github" </> "workflows" </> "ci.yml"
 
@@ -14708,11 +14708,13 @@ jobPackageSetBuilds jobId workflow = case dropWhile (/= jobKey) workflow of
     unread line = Left ("a step of " <> jobId <> " builds from " <> packageSetFile <> " in a way this test does not read: " <> T.strip line)
 
 -- | @pkgs\/windows\/rungs.nix@ against the CI jobs whose rungs it lists: each
--- leg's list is the attributes its job's steps build from the package set,
--- in the order the steps first name them, and each names a derivation.  In
--- substitute mode CI realises a leg's list before those steps, and fails on
--- a listed rung that was built though the public cache holds it, so a rung
--- a step builds and the list lacks is one that check never sees.
+-- stage's list is the attributes its job's steps build from the package
+-- set, in the order the steps first name them, and each names a
+-- derivation.  CI realises a stage's list before those steps from the
+-- public cache in substitute mode, and in the next stage's job from the
+-- stage's handoff, and fails on a listed rung that was built though the
+-- cache holds it, so a rung a step builds and the list lacks is one those
+-- checks never see.
 testWindowsRungs :: IO [Bool]
 testWindowsRungs = do
   putStrLn "pkgs/rungs"
@@ -14728,12 +14730,12 @@ testWindowsRungs = do
             nixQuotedPath windows,
             "; rungs = import ",
             nixQuotedPath (windows </> "rungs.nix"),
-            "; legs = builtins.attrNames rungs;",
+            "; stages = builtins.attrNames rungs;",
             " select = path: builtins.foldl' (set: name: set.${name}) pkgs (builtins.filter builtins.isString (builtins.split \"[.]\" path));",
             " isDerivation = path: let value = select path; in builtins.isAttrs value && (value.type or null) == \"derivation\";",
-            " in builtins.concatStringsSep \" \" (builtins.concatMap (leg: [ leg ] ++ rungs.${leg} ++ [ \"",
-            legEnd,
-            "\" ]) legs ++ builtins.filter (path: !(isDerivation path)) (builtins.concatMap (leg: rungs.${leg}) legs))"
+            " in builtins.concatStringsSep \" \" (builtins.concatMap (stage: [ stage ] ++ rungs.${stage} ++ [ \"",
+            stageEnd,
+            "\" ]) stages ++ builtins.filter (path: !(isDerivation path)) (builtins.concatMap (stage: rungs.${stage}) stages))"
           ]
       built jobId = case workflow of
         Left (err :: IOException) -> Left (T.pack (ciWorkflowPath <> ": " <> displayException err))
@@ -14743,42 +14745,47 @@ testWindowsRungs = do
     Right expr -> runEvalIO st $ do
       value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
       case value of
-        VStr bytes _ -> pure (legLists (T.words (bytesText bytes)))
-        other -> throwEvalError ("expected the legs as one string, got " <> typeName other)
+        VStr bytes _ -> pure (stageLists (T.words (bytesText bytes)))
+        other -> throwEvalError ("expected the stages as one string, got " <> typeName other)
   case outcome of
     Left err -> sequence [runTest lists (Fail err)]
-    Right (legs, notDerivations) -> do
-      let rungsOf leg = fromMaybe [] (lookup leg legs)
+    Right (stages, notDerivations) -> do
+      let rungsOf stage = fromMaybe [] (lookup stage stages)
       sequence $
         [ runTest lists $
-            assertEqual "legs" (sort (map fst legJobs)) (map fst legs),
+            assertEqual "stages" (sort (map fst stageJobs)) (map fst stages),
           runTest "every rung is a derivation of the package set" $
             assertEqual "not derivations" [] (nub notDerivations),
-          runTest "each leg's list reaches its last rung" $
-            assertEqual "rungs missing" [] [rung | (leg, rung) <- knownRungs, rung `notElem` rungsOf leg]
+          runTest "each stage's list reaches its last rung" $
+            assertEqual "rungs missing" [] [rung | (stage, rung) <- knownRungs, rung `notElem` rungsOf stage]
         ]
-          ++ [ runTest ("the " <> leg <> " leg's rungs are what " <> jobId <> " builds from the package set, in order") $
-                 either Fail (\named -> assertEqual "rungs" named (rungsOf leg)) (built jobId)
-             | (leg, jobId) <- legJobs
+          ++ [ runTest ("the " <> stage <> " stage's rungs are what " <> jobId <> " builds from the package set, in order") $
+                 either Fail (\named -> assertEqual "rungs" named (rungsOf stage)) (built jobId)
+             | (stage, jobId) <- stageJobs
              ]
   where
     lists :: Text
-    lists = "rungs.nix lists the Mes and Bootstrap legs"
-    -- Each leg of rungs.nix with the job that builds its rungs.
-    legJobs :: [(Text, Text)]
-    legJobs = [("mes", "mes-windows"), ("bootstrap", "bootstrap-windows")]
-    -- The rung each leg ends on, so that a workflow read as building nothing
-    -- does not pass against an empty list.
+    lists = "rungs.nix lists the ladder's stages"
+    -- Each stage of rungs.nix with the job that builds its rungs.
+    stageJobs :: [(Text, Text)]
+    stageJobs =
+      [ ("mes", "mes-windows"),
+        ("tinycc", "tinycc-windows"),
+        ("gcc46", "gcc46-windows"),
+        ("gcc46-cxx", "gcc46-cxx-windows")
+      ]
+    -- The rung each stage ends on, so that a workflow read as building
+    -- nothing does not pass against an empty list.
     knownRungs :: [(Text, Text)]
-    knownRungs = [("mes", "mes.libc"), ("bootstrap", "seedStdenv.applets")]
-    -- What ends a leg's rungs in the string the expression returns: no
+    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx")]
+    -- What ends a stage's rungs in the string the expression returns: no
     -- attribute path is spelled so.
-    legEnd :: Text
-    legEnd = "|"
-    -- The legs with their rungs, then the words after the last leg.
-    legLists :: [Text] -> ([(Text, [Text])], [Text])
-    legLists listed = case break (== legEnd) listed of
-      (leg : rungs, _ : rest) -> let (legs, others) = legLists rest in ((leg, rungs) : legs, others)
+    stageEnd :: Text
+    stageEnd = "|"
+    -- The stages with their rungs, then the words after the last stage.
+    stageLists :: [Text] -> ([(Text, [Text])], [Text])
+    stageLists listed = case break (== stageEnd) listed of
+      (stage : rungs, _ : rest) -> let (stages, others) = stageLists rest in ((stage, rungs) : stages, others)
       (others, _) -> ([], others)
 
 testFetchGitTransport :: IO [Bool]

@@ -1,4 +1,4 @@
-# pkgs/windows' GNU make, as the Bootstrap (Windows) CI jobs build it:
+# pkgs/windows' GNU make, as the TinyCC (Windows) CI jobs build it:
 # version, a script that runs make --version, as nixpkgs' get-version test
 # does; and pattern-rule, in which make builds greeting.txt from
 # greeting.in through a pattern rule whose recipe is cmd.exe's copy, which

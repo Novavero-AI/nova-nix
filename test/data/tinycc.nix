@@ -1,4 +1,4 @@
-# pkgs/windows' TinyCC, as the Bootstrap (Windows) CI jobs build it:
+# pkgs/windows' TinyCC, as the TinyCC (Windows) CI jobs build it:
 # boot-mes, bootstrappable, mes and native, scripts that run
 # tinycc-boot-mes, tinycc-bootstrappable, tinycc-mes and tinycc-native with
 # -version, as nixpkgs' get-version test does; hello, bootstrappable-hello,

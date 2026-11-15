@@ -1,4 +1,4 @@
-# pkgs/windows' binutils, as the Bootstrap (Windows) CI jobs build it:
+# pkgs/windows' binutils, as the GCC 4.6.4 (Windows) CI jobs build it:
 # version, a script that runs ld --version, as nixpkgs' get-version test
 # does; and answer, in which busybox's sh has as assemble a function that
 # returns 42, ar archive the object, ld link it as a program's entry point,

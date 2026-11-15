@@ -1,4 +1,4 @@
-# pkgs/windows' busybox-w32, as the Bootstrap (Windows) CI jobs build it:
+# pkgs/windows' busybox-w32, as the TinyCC (Windows) CI jobs build it:
 # version, a script that runs busybox --version; and configure-tools, in
 # which busybox's sh runs configure-tools.sh through the applets configure
 # runs (sh, sed, grep, awk, expr, tr, cat, mkdir, rm, cp, mv, test and

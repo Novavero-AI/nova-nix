@@ -41,9 +41,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The public cache's address and signing key, spelled once: the publish job
-# pushes to it, E2E (public cache) substitutes from it, every job that
-# builds from pkgs/windows takes its sources from it, the Mes and Bootstrap
-# legs take the seed ladder's rungs from it in substitute mode, and all
+# and the ladder's x64 jobs push to it, E2E (public cache) substitutes from
+# it, every job that builds from pkgs/windows takes its sources from it,
+# the ladder's later stages through the first one's handoff, the ladder
+# jobs take the seed ladder's rungs from it in substitute mode, and all
 # must agree.  A cache move or a key rotation is one edit here.
 env:
   CACHE_URL: https://cache.novavero.ai
@@ -1050,25 +1051,26 @@ jobs:
           exit "$status"
 
   # ---------------------------------------------------------------------------
-  # Ladder (mode): how this run's Mes and Bootstrap legs come by the seed
-  # ladder, the rungs pkgs/windows builds from its 1,623-byte seed.  Decided
-  # once a run, from the files a pull request or a push to main changes, by
+  # Ladder (mode): how this run's ladder jobs come by the seed ladder, the
+  # rungs pkgs/windows builds from its 1,623-byte seed.  Decided once a run,
+  # from the files a pull request or a push to main changes, by
   # .github/cache/ladder-mode.sh, which has the rules:
   #
-  #   skip         documentation alone.  The legs do not run.  Neither is a
-  #                required check, and the Stage0 legs, which are, still
-  #                build their chain from the seed.
-  #   seed         a change to the builder.  The legs build every rung
-  #                from the seed and name no substituter.
-  #   substitute   any other change.  The legs name the public cache as a
+  #   skip         documentation alone.  The ladder jobs do not run.  None
+  #                is a required check, and the Stage0 legs, which are,
+  #                still build their chain from the seed.
+  #   seed         a change to the builder.  The jobs build every rung
+  #                from the seed and name no substituter but their own
+  #                handoff.
+  #   substitute   any other change.  The jobs name the public cache as a
   #                substituter, so a rung the change leaves alone is
   #                downloaded and one it changes builds, its store path
-  #                being one the cache lacks.  A leg fails if a rung the
+  #                being one the cache lacks.  A job fails if a rung the
   #                cache holds is built all the same
   #                (.github/cache/substitute-rungs.sh).  The checks under
   #                test/data build in every mode: each forbids substitutes.
   #
-  # A push to main publishes what its x64 Bootstrap leg holds, which in
+  # A push to main publishes what each stage's x64 job holds, which in
   # substitute mode is the rungs it changes, built, and the rest, taken
   # from the cache: a rung's store path, and so what the cache holds for
   # it, is the same however it was built.  A rung that a push left
@@ -1083,11 +1085,11 @@ jobs:
   # the pull request and its base, and that commit's first parent is the
   # base.  A push names the commit main pointed to before it.  The diff
   # from either to the checkout is what the change does to the tree the
-  # legs build.
+  # jobs build.
   # ---------------------------------------------------------------------------
   ladder-mode:
     name: Ladder (mode)
-    # The merge queue runs neither leg, so it has no mode to decide.
+    # The merge queue runs no ladder job, so it has no mode to decide.
     if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     outputs:
@@ -1137,29 +1139,111 @@ jobs:
           echo "mode=$mode" | tee -a "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Mes (Windows): GNU Mes 0.28 on the Windows stage0 tools, as nixpkgs'
-  # minimal-bootstrap/mes builds 0.27.1: mes-m2 from kaem.windows.run, the
-  # Mes C library compiled by MesCC running on mes-m2, and mes.exe compiled
-  # by MesCC.  test/data/mes.nix runs mes-m2 and mes with --version in a
-  # build, as nixpkgs' get-version test does, and hello, which MesCC compiles
-  # and links with mes, runs here.  exec-bit runs a program MesCC builds that
-  # marks files with open and chmod, and registers only if nova-nix reads
-  # each file's execute bit as its mode set it.  x64 and ARM64 Windows each
-  # run all of it, for the reason Stage0 (Windows) runs on both, with the
-  # nova-nix Stage0 (nova-nix) builds.  Each builds every rung from the seed
-  # unless Ladder (mode) has it take the unchanged ones from the public
-  # cache.
+  # The seed ladder on Windows: a chain of jobs, one for each stage that
+  # pkgs/windows/rungs.nix lists, Mes (Windows), TinyCC (Windows), GCC 4.6.4
+  # (Windows) and GCC 4.6.4 C++ (Windows), each a matrix of an x64 leg and
+  # an ARM64 leg, for the reason Stage0 (Windows) runs on both, with the
+  # nova-nix Stage0 (nova-nix) builds.  A stage's job builds its rungs, runs
+  # its checks, and starts from the store paths the job before it built on
+  # the same leg.  Each builds every rung from the seed unless Ladder (mode)
+  # has it take the unchanged ones from the public cache.
   #
-  # From the seed the ARM64 leg takes about 37 minutes, most of them MesCC
-  # compiling the libraries and mes under the x86 emulator, and the timeout
-  # is twice that.
+  # The store paths go from one job to the next as its handoff: a binary
+  # cache that a job serves on its runner's loopback, pushes its store to
+  # and uploads as an artifact, and that the job after it downloads and
+  # serves to its own builds, which take from it what they reach
+  # (.github/cache/handoff-serve.sh says why a binary cache).  The public
+  # cache cannot carry them: its token is a secret of the `cache`
+  # environment, which admits main alone, so a pull request's jobs could not
+  # hand each other the rungs it changes, and a run in seed mode names no
+  # cache holding rungs it did not build.
+  #
+  # Each stage is a matrix job, and a job that needs a matrix job waits for
+  # both of its legs: GitHub gives a job no way to need one leg of one.  So
+  # each stage starts once the stage before has finished on x64 and ARM64,
+  # and a stage that fails on one leg leaves the stages after it unrun on
+  # both.  A chain for each leg would be a reusable workflow called with
+  # the matrix, and a called workflow gets none of the caller's
+  # workflow-level env, where the public cache's address and key are
+  # spelled once.
+  #
+  # The x64 job of each stage on a push to main publishes what it holds to
+  # the public cache once its checks pass, with the token the publish job
+  # uses, a secret of the `cache` environment.  GitHub refuses a job that
+  # references that environment from any other ref, so the name is empty
+  # everywhere else and the job references no environment.  One leg
+  # publishes: both build the same store paths, and a cache holding some
+  # from each would not hold the bytes either leg's checks ran on.
+  # ---------------------------------------------------------------------------
+
+  # Ladder (handoff server): nova-cache-server, which serves each stage's
+  # handoff.  Built on x64 Windows, since the ARM64 image has no GHC; ARM64
+  # Windows runs it through its x64 emulator, as it runs nova-nix.  cabal
+  # resolves it under this project's index-state, as nova-nix's own build
+  # resolves the nova-cache library its push is built with.
+  ladder-server:
+    name: Ladder (handoff server)
+    needs: [ladder-mode]
+    if: github.event_name != 'merge_group' && needs.ladder-mode.outputs.mode != 'skip'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      # A key of its own: the server needs warp and wai-extra, which
+      # nova-nix does not, and a store saved under the key the nova-nix
+      # builds share would hold whichever set was saved first.  That store
+      # is the fallback, as it holds most of what the server needs.
+      - name: Cache Cabal store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-handoff-${{ runner.os }}-${{ steps.setup.outputs.ghc-version }}-${{ hashFiles('cabal.project') }}
+          restore-keys: |
+            cabal-handoff-${{ runner.os }}-${{ steps.setup.outputs.ghc-version }}-
+            cabal-${{ runner.os }}-
+
+      - name: Build nova-cache-server
+        run: cabal install nova-cache -f server --install-method=copy --installdir=staged/bin --overwrite-policy=always
+
+      # Kept for the 30 days a run can be re-run in, as nova-nix is.
+      - name: Upload nova-cache-server
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ladder-handoff-server
+          path: staged/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Mes (Windows), the first stage: GNU Mes 0.28 on the Windows stage0
+  # tools, as nixpkgs' minimal-bootstrap/mes builds 0.27.1: mes-m2 from
+  # kaem.windows.run, the Mes C library compiled by MesCC running on mes-m2,
+  # and mes.exe compiled by MesCC.  test/data/mes.nix runs mes-m2 and mes
+  # with --version in a build, as nixpkgs' get-version test does, and hello,
+  # which MesCC compiles and links with mes, runs here.  exec-bit runs a
+  # program MesCC builds that marks files with open and chmod, and registers
+  # only if nova-nix reads each file's execute bit as its mode set it.  It
+  # takes every source pkgs/windows fetches from the public cache, and its
+  # handoff carries them to the stages after it.
+  #
+  # From the seed this stage's sources, builds and checks take 34 to 35
+  # minutes on the ARM64 leg under the x86 emulator, 27 of them MesCC
+  # compiling the libraries and mes, and the timeout is twice the longer.
   # ---------------------------------------------------------------------------
   mes-windows:
     name: Mes (${{ matrix.name }})
-    needs: [stage0-nova-nix, ladder-mode]
-    # Not run in the merge queue.  Neither leg is a required check, so the
+    needs: [stage0-nova-nix, ladder-mode, ladder-server]
+    # Not run in the merge queue.  No ladder job is a required check, so the
     # queue merges without waiting for them, and the push to main that
-    # follows runs both on the same commit.  Not run for a change to
+    # follows runs them on the same commit.  Not run for a change to
     # documentation alone, either.
     if: github.event_name != 'merge_group' && needs.ladder-mode.outputs.mode != 'skip'
     strategy:
@@ -1168,10 +1252,14 @@ jobs:
         include:
           - os: windows-latest
             name: Windows
+            publish: true
           - os: windows-11-arm
             name: Windows ARM64
+            publish: false
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 74
+    timeout-minutes: 70
+    environment:
+      name: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1180,6 +1268,12 @@ jobs:
         with:
           name: stage0-nova-nix
           path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
 
       - name: Provision the store root
         shell: pwsh
@@ -1192,25 +1286,16 @@ jobs:
         shell: bash
         run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
-      # Substitute mode names the cache for every step below: nova-nix reads
-      # these two settings from NIX_CONFIG, so no build there needs a flag.
-      # A step writes it because the job's own env cannot: the workflow's
-      # env, which holds the address and the key, is not a context that
-      # jobs.<job_id>.env may read.  It comes after the sources step, which
-      # names the cache by flag.
+      # Substitute mode names the cache for every step below, so no build
+      # there needs a flag.  It comes after the sources step, which names
+      # the cache by flag.
       - name: Name the public cache as a substituter
         if: needs.ladder-mode.outputs.mode == 'substitute'
         shell: bash
-        run: |
-          {
-            echo 'NIX_CONFIG<<END_OF_NIX_CONFIG'
-            echo "substituters = $CACHE_URL"
-            echo "trusted-public-keys = $CACHE_PUBLIC_KEY"
-            echo 'END_OF_NIX_CONFIG'
-          } >> "$GITHUB_ENV"
+        run: bash .github/cache/name-substituters.sh "$CACHE_URL" "$CACHE_PUBLIC_KEY"
 
-      # This leg's rungs (pkgs/windows/rungs.nix), each downloaded where the
-      # cache holds it and built where the change alters it.  The
+      # This stage's rungs (pkgs/windows/rungs.nix), each downloaded where
+      # the cache holds it and built where the change alters it.  The
       # script fails if a rung the cache holds is built.  nova-nix passes
       # over a narinfo that no trusted key signs and builds, so without the
       # check a key the cache no longer signs with would turn every run
@@ -1220,7 +1305,7 @@ jobs:
       - name: Take the unchanged rungs from the public cache
         if: needs.ladder-mode.outputs.mode == 'substitute'
         shell: bash
-        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" mes
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" mes build
 
       # The stage0 tools, NYACC, and the source tree with mes-m2 in its bin
       # output, each timed.
@@ -1334,48 +1419,76 @@ jobs:
           done
           exit "$status"
 
+      # The handoff, served for the push below.  Mes is the first stage,
+      # so no step above names one.
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the TinyCC stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-mes-${{ matrix.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
   # ---------------------------------------------------------------------------
-  # Bootstrap (Windows): the rungs above Mes, from the seed.  TinyCC first,
-  # tinycc-boot-mes to tinycc-mes, as nixpkgs' minimal-bootstrap/tinycc
-  # builds them: janneke's bootstrappable TinyCC compiled by MesCC on mes
-  # into a tcc that writes PE32, then by each round's tcc into the next, each
-  # round compiling the Mes C library the next links with, and TinyCC's own
-  # source compiled by the last of those rounds and then by itself.  Then
-  # tinycc-native, that source as a native Windows compiler on msvcrt,
-  # compiled twice, and GNU make and busybox-w32, compiled by it.
-  # test/data/tinycc.nix runs the tccs with -version in a build, as nixpkgs'
-  # get-version test does, and the programs each compiles and links run
-  # here: hello for each, float, which prints the words of a double, from
-  # tinycc-bootstrappable on, and printf-float, which prints a double
-  # through %f, from tinycc-mes on.  test/data/gnumake.nix runs make with
-  # --version and has it build a target through a pattern rule, and
+  # TinyCC (Windows): tinycc-boot-mes to tinycc-mes, as nixpkgs'
+  # minimal-bootstrap/tinycc builds them: janneke's bootstrappable TinyCC
+  # compiled by MesCC on mes into a tcc that writes PE32, then by each
+  # round's tcc into the next, each round compiling the Mes C library the
+  # next links with, and TinyCC's own source compiled by the last of those
+  # rounds and then by itself.  Then tinycc-native, that source as a native
+  # Windows compiler on msvcrt, compiled twice, GNU make and busybox-w32,
+  # compiled by it, and the seed stdenv made of those, which builds GNU
+  # Hello.  test/data/tinycc.nix runs the tccs with -version in a build, as
+  # nixpkgs' get-version test does, and the programs each compiles and
+  # links run here: hello for each, float, which prints the words of a
+  # double, from tinycc-bootstrappable on, and printf-float, which prints a
+  # double through %f, from tinycc-mes on.  test/data/gnumake.nix runs make
+  # with --version and has it build a target through a pattern rule,
   # test/data/busybox.nix runs busybox --version and has busybox's sh run a
-  # script through the applets configure runs.  Then the seed stdenv made
-  # of those builds GNU Hello, which runs here, binutils, whose as, ar and
-  # ld test/data/binutils.nix has build a program that runs, GCC 4.6.4's
-  # C compiler and libgcc over MinGW-w64's headers, which
-  # test/data/gcc-core.nix has compile sources whose assembly is compared
-  # and a program that runs, and MinGW-w64's runtime, which that compiler
-  # compiles and gcc46 lays out beside it, so that test/data/gcc46.nix has
-  # gcc46 link a C program that runs.  Last, gcc46 builds GCC 4.6.4 with
-  # C++, gcc46-cxx, whose g++ test/data/gcc46-cxx.nix has link a C++
-  # program that runs, and whose programs it finds carrying no time
-  # stamp.  x64 and ARM64 Windows each run all of it, for the
-  # reason Stage0 (Windows) runs on both.  Each builds every rung from the
-  # seed unless Ladder (mode) has it take the unchanged ones from the
-  # public cache.
+  # script through the applets configure runs, and GNU Hello runs here.
   #
-  # From the seed the ARM64 leg takes about 116 minutes under the x86
-  # emulator: about 39 of them MesCC compiling the Mes libraries, mes and
-  # tcc, 48 tcc compiling GCC and 16 binutils.  The timeout is twice that.
+  # From the seed this stage's builds and checks take about 12 minutes on
+  # the ARM64 leg under the x86 emulator, 7 of them MesCC compiling
+  # tinycc-boot-mes, and the timeout is twice that.
   # ---------------------------------------------------------------------------
-  bootstrap-windows:
-    name: Bootstrap (${{ matrix.name }})
-    needs: [stage0-nova-nix, ladder-mode]
-    # Not run in the merge queue.  Neither leg is a required check, so the
-    # queue merges without waiting for them, and the push to main that
-    # follows runs both on the same commit.  Not run for a change to
-    # documentation alone, either.
+  tinycc-windows:
+    name: TinyCC (${{ matrix.name }})
+    needs: [ladder-mode, mes-windows]
+    # Not run where Mes (Windows) is not.
     if: github.event_name != 'merge_group' && needs.ladder-mode.outputs.mode != 'skip'
     strategy:
       fail-fast: false
@@ -1388,14 +1501,7 @@ jobs:
             name: Windows ARM64
             publish: false
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 232
-    # The x64 leg of a push to main publishes what it built (the last step),
-    # with the token the publish job uses, a secret of the `cache`
-    # environment.  That environment admits main alone, and GitHub refuses a
-    # job that references it from any other ref, so the name is empty
-    # everywhere else and the job references no environment.  One leg
-    # publishes: both build the same store paths, and a cache holding some
-    # from each would not hold the bytes either leg's checks ran on.
+    timeout-minutes: 24
     environment:
       name: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish && 'cache' || '' }}
     steps:
@@ -1407,57 +1513,59 @@ jobs:
           name: stage0-nova-nix
           path: ${{ runner.temp }}
 
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the Mes stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-mes-${{ matrix.os }}
+          path: ${{ runner.temp }}/handoff
+
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
-      # Every source pkgs/windows fetches, from the public cache where it
-      # holds it, so the builds below fetch none.  Outside substitute mode
-      # they name no substituter and substitute nothing.
-      - name: Take the sources from the public cache
+      - name: Serve the handoff
         shell: bash
-        run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
 
-      # Substitute mode names the cache for every step below: nova-nix reads
-      # these two settings from NIX_CONFIG, so no build there needs a flag.
-      # A step writes it because the job's own env cannot: the workflow's
-      # env, which holds the address and the key, is not a context that
-      # jobs.<job_id>.env may read.  It comes after the sources step, which
-      # names the cache by flag.
-      - name: Name the public cache as a substituter
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the Mes stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" mes fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
         if: needs.ladder-mode.outputs.mode == 'substitute'
         shell: bash
-        run: |
-          {
-            echo 'NIX_CONFIG<<END_OF_NIX_CONFIG'
-            echo "substituters = $CACHE_URL"
-            echo "trusted-public-keys = $CACHE_PUBLIC_KEY"
-            echo 'END_OF_NIX_CONFIG'
-          } >> "$GITHUB_ENV"
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
 
-      # This leg's rungs (pkgs/windows/rungs.nix), each downloaded where the
-      # cache holds it and built where the change alters it.  The
-      # script fails if a rung the cache holds is built.  nova-nix passes
-      # over a narinfo that no trusted key signs and builds, so without the
-      # check a key the cache no longer signs with would turn every run
-      # back into a build from the seed and stay green.  The build steps
-      # below then find each rung valid, and the time each prints is the
-      # time to find it so.
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
       - name: Take the unchanged rungs from the public cache
         if: needs.ladder-mode.outputs.mode == 'substitute'
         shell: bash
-        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" bootstrap
-
-      # The stage0 tools and the Mes rung TinyCC builds on, each timed.
-      - name: Build Mes
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attr in stage0-pe32.kaem stage0-pe32.mescc-tools stage0-pe32.mescc-tools-extra mes.nyacc mes.srcPost mes.libs mes.compiler mes.libc; do
-            start=$SECONDS
-            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
-            echo "== $attr built in $((SECONDS - start)) s"
-          done
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" tinycc build
 
       - name: Build tinycc-boot-mes
         shell: bash
@@ -2004,6 +2112,139 @@ jobs:
           fi
           bash .github/bootstrap/no-build-path.sh hello "$out" bin/hello.exe
 
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the GCC 4.6.4 stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-tinycc-${{ matrix.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # GCC 4.6.4 (Windows): the seed stdenv builds binutils, whose as, ar and
+  # ld test/data/binutils.nix has build a program that runs, GCC 4.6.4's C
+  # compiler and libgcc over MinGW-w64's headers, which
+  # test/data/gcc-core.nix has compile sources whose assembly is compared
+  # and a program that runs, and MinGW-w64's runtime, which that compiler
+  # compiles and gcc46 lays out beside it, so that test/data/gcc46.nix has
+  # gcc46 link a C program that runs.
+  #
+  # From the seed this stage's builds and checks take 35 to 37 minutes on
+  # the ARM64 leg under the x86 emulator, 24 of them tcc compiling GCC and
+  # 8 binutils, and the timeout is twice the longer.
+  # ---------------------------------------------------------------------------
+  gcc46-windows:
+    name: GCC 4.6.4 (${{ matrix.name }})
+    needs: [ladder-mode, tinycc-windows]
+    # Not run where Mes (Windows) is not.
+    if: github.event_name != 'merge_group' && needs.ladder-mode.outputs.mode != 'skip'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            publish: true
+          - os: windows-11-arm
+            name: Windows ARM64
+            publish: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 74
+    environment:
+      name: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the TinyCC stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-tinycc-${{ matrix.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the TinyCC stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" tinycc fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: needs.ladder-mode.outputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: needs.ladder-mode.outputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc46 build
+
       # GNU binutils for i686-w64-mingw32, configured, compiled and
       # installed in the seed stdenv by tinycc-native, timed.
       - name: Build binutils
@@ -2153,6 +2394,135 @@ jobs:
           done
           exit "$status"
 
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the GCC 4.6.4 C++ stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-gcc46-${{ matrix.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # GCC 4.6.4 C++ (Windows): gcc46 builds GCC 4.6.4 with C++, gcc46-cxx,
+  # whose g++ test/data/gcc46-cxx.nix has link a C++ program that runs, and
+  # whose programs it finds carrying no time stamp.
+  #
+  # This stage's builds and checks take 36 to 38 minutes on the ARM64 leg
+  # under the x86 emulator, nearly all of them gcc46 compiling GCC with
+  # C++, and the timeout is twice the longer.
+  # ---------------------------------------------------------------------------
+  gcc46-cxx-windows:
+    name: GCC 4.6.4 C++ (${{ matrix.name }})
+    needs: [ladder-mode, gcc46-windows]
+    # Not run where Mes (Windows) is not.
+    if: github.event_name != 'merge_group' && needs.ladder-mode.outputs.mode != 'skip'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            publish: true
+          - os: windows-11-arm
+            name: Windows ARM64
+            publish: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 76
+    environment:
+      name: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the GCC 4.6.4 stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-gcc46-${{ matrix.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the GCC 4.6.4 stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc46 fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: needs.ladder-mode.outputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: needs.ladder-mode.outputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc46-cxx build
+
       # GCC 4.6.4 with C and C++ for i686-w64-mingw32, configured,
       # compiled and installed in the seed stdenv by gcc46, with libgcc and
       # libstdc++ compiled by the compiler the same make links, timed.
@@ -2215,26 +2585,19 @@ jobs:
             exit 1
           fi
 
-      # The ladder, as this job built it and its checks ran on it: --all is
-      # every valid path but the derivations in a store this job filled
-      # from empty.  It runs last, so a ladder that fails a check above is
-      # never published.  The checks' own outputs go with it and are never
-      # taken back: each forbids substitutes (test/data/check.nix).  push
-      # skips what the cache already serves, as it does every source, and
-      # an absent secret arrives as an empty key file, which push refuses.
-      - name: Publish the ladder to the public cache
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish
         shell: bash
         env:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
-        run: |
-          set -euo pipefail
-          keyfile="$RUNNER_TEMP/cache-key"
-          trap 'rm -f "$keyfile"' EXIT
-          (umask 077; printf '%s' "$NOVA_CACHE_API_KEY" > "$keyfile")
-          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
-            --cache "$CACHE_URL" --key-file "$keyfile" \
-            --compression zstd --all
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
   # ---------------------------------------------------------------------------
   # Publish (public cache): refresh the public cache with the closure main
