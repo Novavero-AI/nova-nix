@@ -1,0 +1,1831 @@
+name: Ladder
+
+# One Windows leg of the seed ladder, the rungs pkgs/windows builds from its
+# 1,623-byte seed, as a chain of jobs: one for each stage
+# pkgs/windows/rungs.nix lists, Mes, TinyCC, GCC 4.6.4, GCC 4.6.4 C++,
+# GCC 10 and GCC 16.  A stage's job builds its rungs, runs its checks, and
+# starts from the store paths the job before it built.  ci.yml calls this
+# workflow once for each leg Ladder (mode) names, so each leg's chain runs
+# on its own: a stage that fails stops the stages after it on its own leg
+# alone.
+#
+# The rungs are i686 programs.  The x64 leg runs them through WoW64 and the
+# ARM64 leg through ARM64 Windows' x86 emulator, where the x64 nova-nix
+# that Stage0 (nova-nix) builds runs through the x64 emulator, since the
+# ARM64 image has no GHC.
+#
+# In seed mode every rung builds from the seed, and the stages name no
+# substituter but the handoff.  In substitute mode each stage takes the
+# rungs the public cache holds from it and builds the ones it lacks, and
+# .github/cache/substitute-rungs.sh fails the stage if a rung the cache
+# holds is built all the same.  The checks under test/data build in either
+# mode: each forbids substitutes.
+#
+# The store paths go from one job to the next as its handoff: a binary
+# cache that a job serves on its runner's loopback, pushes its store to
+# and uploads as an artifact, and that the job after it downloads and
+# serves to its own builds, which take from it what they reach
+# (.github/cache/handoff-serve.sh says why a binary cache).  The public
+# cache cannot carry them: its token is a secret of the `cache`
+# environment, which admits main alone, so a pull request's jobs could not
+# hand each other the rungs it changes, and a run in seed mode names no
+# cache holding rungs it did not build.
+#
+# With publish set, each stage publishes what it holds to the public cache
+# once its checks pass, with that token.  GitHub refuses a job that
+# references the environment from any other ref, so a job names it only
+# with publish set, and ci.yml sets publish for the x64 leg of a push to
+# main alone.  A called workflow's environment secret is empty unless its
+# caller passes it by name, as ci.yml does.
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: The leg's runner image, windows-latest or windows-11-arm
+        type: string
+        required: true
+      mode:
+        description: seed or substitute, as .github/cache/ladder-mode.sh prints it
+        type: string
+        required: true
+      publish:
+        description: Whether each stage publishes what it holds to the public cache
+        type: boolean
+        default: false
+      cache-url:
+        description: The public cache's address
+        type: string
+        required: true
+      cache-public-key:
+        description: The key the public cache signs with
+        type: string
+        required: true
+    secrets:
+      NOVA_CACHE_API_KEY:
+        description: The public cache's write token, used with publish alone
+        required: false
+
+# Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
+permissions:
+  contents: read
+
+# The public cache's address and key, which ci.yml spells once and passes
+# in: every stage takes its sources from the cache, substitute mode its
+# rungs, and publish pushes to it.
+env:
+  CACHE_URL: ${{ inputs.cache-url }}
+  CACHE_PUBLIC_KEY: ${{ inputs.cache-public-key }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Mes, the first stage: GNU Mes 0.28 on the Windows stage0 tools, as
+  # nixpkgs' minimal-bootstrap/mes builds 0.27.1: mes-m2 from
+  # kaem.windows.run, the Mes C library compiled by MesCC running on mes-m2,
+  # and mes.exe compiled by MesCC.  test/data/mes.nix runs mes-m2 and mes
+  # with --version in a build, as nixpkgs' get-version test does, and hello,
+  # which MesCC compiles and links with mes, runs here.  exec-bit runs a
+  # program MesCC builds that marks files with open and chmod, and registers
+  # only if nova-nix reads each file's execute bit as its mode set it.  It
+  # takes every source pkgs/windows fetches from the public cache, and its
+  # handoff carries them to the stages after it.
+  #
+  # From the seed this stage's sources, builds and checks take 34 to 35
+  # minutes on the ARM64 leg under the x86 emulator, 27 of them MesCC
+  # compiling the libraries and mes, and the timeout is twice the longer.
+  # ---------------------------------------------------------------------------
+  mes-windows:
+    name: Mes
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 70
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # Every source pkgs/windows fetches, from the public cache where it
+      # holds it, so the builds below fetch none.  Outside substitute mode
+      # they name no substituter and substitute nothing.
+      - name: Take the sources from the public cache
+        shell: bash
+        run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+      # Substitute mode names the cache for every step below, so no build
+      # there needs a flag.  It comes after the sources step, which names
+      # the cache by flag.
+      - name: Name the public cache as a substituter
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs (pkgs/windows/rungs.nix), each downloaded where
+      # the cache holds it and built where the change alters it.  The
+      # script fails if a rung the cache holds is built.  nova-nix passes
+      # over a narinfo that no trusted key signs and builds, so without the
+      # check a key the cache no longer signs with would turn every run
+      # back into a build from the seed and stay green.  The build steps
+      # below then find each rung valid, and the time each prints is the
+      # time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" mes build
+
+      # The stage0 tools, NYACC, and the source tree with mes-m2 in its bin
+      # output, each timed.
+      - name: Build mes-m2
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in stage0-pe32.kaem stage0-pe32.mescc-tools stage0-pe32.mescc-tools-extra mes.nyacc mes.srcPost; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
+            echo "== $attr built in $((SECONDS - start)) s"
+          done
+
+      # kaem runs the script strict, so a program that exits nonzero fails
+      # the build, and the line it printed is in the build's log.
+      - name: mes-m2 prints its version
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/mes-m2-version.log"
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mes.nix -A mes-m2 > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::mes-m2 --version failed its build"; exit 1; fi
+          if ! grep -Fqx 'mes (GNU Mes) 0.28' "$log"; then echo "::error::mes-m2 --version did not print mes (GNU Mes) 0.28"; exit 1; fi
+          echo "ok    mes-m2 --version"
+
+      # crt1, the four libraries and the directory MesCC links from, then
+      # mes compiled and linked by MesCC on mes-m2, each timed.
+      - name: Build the libraries and mes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in mes.libs mes.compiler; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
+            echo "== $attr built in $((SECONDS - start)) s"
+          done
+
+      - name: mes prints its version
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/mes-version.log"
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mes.nix -A mes > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::mes --version failed its build"; exit 1; fi
+          if ! grep -Fqx 'mes (GNU Mes) 0.28' "$log"; then echo "::error::mes --version did not print mes (GNU Mes) 0.28"; exit 1; fi
+          echo "ok    mes --version"
+
+      # hello prints its first argument, or Mes, and exits with its argument
+      # count, so a run with an argument checks argv and the exit status
+      # crt1 hands back as well as the greeting.  Each output is checked
+      # against bytes the runner's own printf writes.
+      - name: A program MesCC builds runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mes.nix -A hello | tail -n 1); then
+            echo "::error::hello did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$out")/bin/hello.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/mes-hello"
+          mkdir "$work"
+          status=0
+          runs() {
+            local want_code=$1 want_out=$2 code=0
+            shift 2
+            "$hello" "$@" > "$work/out.txt" || code=$?
+            printf '%s\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = "$want_code" ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    hello.exe${*:+ $*} prints $want_out and exits $code"
+            else
+              echo "::error::hello.exe${*:+ $*} exited $code, not $want_code, and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs 0 'Hello, Mes!'
+          runs 1 'Hello, Windows!' Windows
+          exit "$status"
+
+      # test/data/mes.nix's exec-bit is fixed-output to the NAR hash its tree
+      # has on POSIX, with open-0755 and chmod-0755 executable and open-0644
+      # not, so it builds only if what Mes libc's open with mode 0755 and its
+      # chmod 0755 marked registers as executable and what its open with mode
+      # 0644 made registers as not.
+      - name: A file a program MesCC builds marks is executable in its NAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mes.nix -A exec-bit
+
+      # The C library's sources for TinyCC.
+      - name: Build the Mes C library sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A mes.libc | tail -n 1)
+          libc=$(cygpath -u "$out")
+          status=0
+          for file in libc.c crt1.c libtcc1.c libgetopt.c; do
+            if [ -s "$libc/lib/$file" ]; then
+              echo "ok    lib/$file, $(wc -c < "$libc/lib/$file") bytes"
+            else
+              echo "::error::lib/$file is missing or empty"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # The handoff, served for the push below.  Mes is the first stage,
+      # so no step above names one.
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the TinyCC stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-mes-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # TinyCC: tinycc-boot-mes to tinycc-mes, as nixpkgs' minimal-bootstrap/tinycc
+  # builds them: janneke's bootstrappable TinyCC
+  # compiled by MesCC on mes into a tcc that writes PE32, then by each
+  # round's tcc into the next, each round compiling the Mes C library the
+  # next links with, and TinyCC's own source compiled by the last of those
+  # rounds and then by itself.  Then tinycc-native, that source as a native
+  # Windows compiler on msvcrt, compiled twice, GNU make and busybox-w32,
+  # compiled by it, and the seed stdenv made of those, which builds GNU
+  # Hello.  test/data/tinycc.nix runs the tccs with -version in a build, as
+  # nixpkgs' get-version test does, and the programs each compiles and
+  # links run here: hello for each, float, which prints the words of a
+  # double, from tinycc-bootstrappable on, and printf-float, which prints a
+  # double through %f, from tinycc-mes on.  test/data/gnumake.nix runs make
+  # with --version and has it build a target through a pattern rule,
+  # test/data/busybox.nix runs busybox --version and has busybox's sh run a
+  # script through the applets configure runs, and GNU Hello runs here.
+  #
+  # From the seed this stage's builds and checks take about 12 minutes on
+  # the ARM64 leg under the x86 emulator, 7 of them MesCC compiling
+  # tinycc-boot-mes, and the timeout is twice that.
+  # ---------------------------------------------------------------------------
+  tinycc-windows:
+    name: TinyCC
+    needs: [mes-windows]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 24
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the Mes stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-mes-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the Mes stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" mes fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" tinycc build
+
+      - name: Build tinycc-boot-mes
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc.boot-mes.compiler
+          echo "== tinycc.boot-mes.compiler built in $((SECONDS - start)) s"
+
+      # kaem runs the script strict, so a tcc that exits nonzero fails the
+      # build, and the line it printed is in the build's log.  tcc.c prints
+      # i386 Windows for TCC_TARGET_I386 with TCC_TARGET_PE.
+      - name: tcc prints its version
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/tcc-version.log"
+          want='tcc version 0.9.28-unstable-2024-07-07 (i386 Windows)'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A boot-mes > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tcc -version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::tcc -version did not print $want"; exit 1; fi
+          echo "ok    tcc -version"
+
+      # crt1.o, libtcc1.a, libc.a and libgetopt.a, each compiled by
+      # tinycc-boot-mes, timed.
+      - name: Build the libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc.boot-mes.libs | tail -n 1)
+          echo "== tinycc.boot-mes.libs built in $((SECONDS - start)) s"
+          libs=$(cygpath -u "$out")
+          status=0
+          for file in crt1.o libtcc1.a libc.a libgetopt.a; do
+            if [ -s "$libs/lib/$file" ]; then
+              echo "ok    lib/$file, $(wc -c < "$libs/lib/$file") bytes"
+            else
+              echo "::error::lib/$file is missing or empty"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # hello prints its first argument, or TinyCC, and exits with its
+      # argument count, so a run with an argument checks argv and the exit
+      # status crt1 hands back as well as the greeting.  tcc links it with
+      # no import table, as Mes libc reaches ntdll through the PEB.  Each
+      # output is checked against bytes the runner's own printf writes.
+      - name: A program tcc builds runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A hello | tail -n 1); then
+            echo "::error::hello did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$out")/bin/hello.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/tcc-hello"
+          mkdir "$work"
+          status=0
+          runs() {
+            local want_code=$1 want_out=$2 code=0
+            shift 2
+            "$hello" "$@" > "$work/out.txt" || code=$?
+            printf '%s\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = "$want_code" ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    hello.exe${*:+ $*} prints $want_out and exits $code"
+            else
+              echo "::error::hello.exe${*:+ $*} exited $code, not $want_code, and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs 0 'Hello, TinyCC!'
+          runs 1 'Hello, Windows!' Windows
+          exit "$status"
+
+      # boot0 to boot3 and tinycc-bootstrappable, each tcc compiled by the
+      # round before it with the library that round compiled, timed.
+      - name: Build the bootstrappable rounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          for round in boot0 boot1 boot2 boot3 bootstrappable; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "tinycc.$round.libs"
+            echo "== tinycc.$round built in $((SECONDS - start)) s"
+          done
+
+      - name: tinycc-bootstrappable prints its version
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/bootstrappable-version.log"
+          want='tcc version 0.9.28-unstable-2024-07-07 (i386 Windows)'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A bootstrappable > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tinycc-bootstrappable -version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::tinycc-bootstrappable -version did not print $want"; exit 1; fi
+          echo "ok    tinycc-bootstrappable -version"
+
+      # hello as tinycc-boot-mes's, and float, which prints the two words of
+      # its argument count times 1.25 as a double, so it fails if the tcc
+      # reads the literal, converts the count or multiplies wrongly.  Each
+      # output is checked against bytes the runner's own printf writes.
+      - name: Programs tinycc-bootstrappable builds run
+        shell: bash
+        run: |
+          set -uo pipefail
+          build() {
+            "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A "$1" | tail -n 1
+          }
+          if ! hello=$(build bootstrappable-hello) || ! float=$(build bootstrappable-float); then
+            echo "::error::bootstrappable-hello or bootstrappable-float did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$hello")/bin/hello.exe
+          float=$(cygpath -u "$float")/bin/float.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/tcc-bootstrappable"
+          mkdir "$work"
+          status=0
+          runs() {
+            local exe=$1 want_code=$2 want_out=$3 code=0
+            shift 3
+            "$exe" "$@" > "$work/out.txt" || code=$?
+            printf '%s\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = "$want_code" ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    ${exe##*/}${*:+ $*} prints $want_out and exits $code"
+            else
+              echo "::error::${exe##*/}${*:+ $*} exited $code, not $want_code, and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs "$hello" 0 'Hello, TinyCC!'
+          runs "$hello" 1 'Hello, Windows!' Windows
+          runs "$float" 0 '3ff40000 0'
+          runs "$float" 0 '40040000 0' x
+          exit "$status"
+
+      # tccdefs, tinycc-mes-boot and tinycc-mes, as nixpkgs' mes.nix builds
+      # them: TinyCC's own source compiled by tinycc-bootstrappable, then by
+      # itself, each round's library compiled by its tcc, timed.
+      - name: Build tinycc-mes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for round in tinycc-mes.prev tinycc-mes; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$round.libs"
+            echo "== $round built in $((SECONDS - start)) s"
+          done
+
+      - name: tinycc-mes prints its version
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/mes-version.log"
+          want='tcc version 0.9.28-unstable-2025-12-03 (i386 Windows)'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A mes > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tinycc-mes -version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::tinycc-mes -version did not print $want"; exit 1; fi
+          echo "ok    tinycc-mes -version"
+
+      # hello and float as tinycc-bootstrappable's, and printf-float, which
+      # prints its argument count times 1.25 through printf's %f: Mes's
+      # dtoab casts the double to long, a call to __fixdfdi, which this
+      # round's libtcc1, TinyCC's own, has.  Each output is checked against
+      # bytes the runner's own printf writes.
+      - name: Programs tinycc-mes builds run
+        shell: bash
+        run: |
+          set -uo pipefail
+          build() {
+            "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A "$1" | tail -n 1
+          }
+          if ! hello=$(build mes-hello) || ! float=$(build mes-float) || ! printf_float=$(build mes-printf-float); then
+            echo "::error::mes-hello, mes-float or mes-printf-float did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$hello")/bin/hello.exe
+          float=$(cygpath -u "$float")/bin/float.exe
+          printf_float=$(cygpath -u "$printf_float")/bin/printf-float.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/tcc-mes"
+          mkdir "$work"
+          status=0
+          runs() {
+            local exe=$1 want_code=$2 want_out=$3 code=0
+            shift 3
+            "$exe" "$@" > "$work/out.txt" || code=$?
+            printf '%s\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = "$want_code" ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    ${exe##*/}${*:+ $*} prints $want_out and exits $code"
+            else
+              echo "::error::${exe##*/}${*:+ $*} exited $code, not $want_code, and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs "$hello" 0 'Hello, TinyCC!'
+          runs "$hello" 1 'Hello, Windows!' Windows
+          runs "$float" 0 '3ff40000 0'
+          runs "$float" 0 '40040000 0' x
+          runs "$printf_float" 0 '1.25'
+          runs "$printf_float" 0 '2.5' x
+          exit "$status"
+
+      # tinycc-native.prev, TinyCC's own source compiled by tinycc-mes as a
+      # native Windows compiler, then tinycc-native, the same source compiled
+      # by that, each round's runtime compiled by its tcc, timed.
+      - name: Build tinycc-native
+        shell: bash
+        run: |
+          set -euo pipefail
+          for round in tinycc-native.prev tinycc-native; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$round.libs"
+            echo "== $round built in $((SECONDS - start)) s"
+          done
+
+      # Both rounds compile the same source with the same command line and
+      # link it against a runtime compiled from the same sources, and tcc
+      # writes no timestamp, so tinycc-native's tcc.exe is
+      # tinycc-native.prev's unless tinycc-mes, which compiled the first,
+      # generated other code than a native tcc does.  The two compiling tccs
+      # differ in what tcc's source does not read: the macros tinycc-mes
+      # predefines from Mes's config.h, and __MINGW32__.  They differ also
+      # in the C library that reads tcc's floating-point literals, strtod,
+      # which is Mes's in tinycc-mes and msvcrt's in a native tcc.
+      - name: tinycc-native reproduces itself
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! prev=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc-native.prev.compiler | tail -n 1) ||
+            ! final=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc-native.compiler | tail -n 1); then
+            echo "::error::tinycc-native.prev or tinycc-native did not build"
+            exit 1
+          fi
+          prev=$(cygpath -u "$prev")/bin/tcc.exe
+          final=$(cygpath -u "$final")/bin/tcc.exe
+          if cmp "$prev" "$final"; then
+            echo "ok    tinycc-native's tcc.exe is tinycc-native.prev's, $(wc -c < "$final") bytes"
+          else
+            echo "::error::tinycc-native's tcc.exe differs from tinycc-native.prev's"
+            exit 1
+          fi
+
+      # The version line, as tinycc-mes's, whose defines are the same; and
+      # the library directories tinycc-native searches, which must be the -B
+      # directory alone: a tcc compiled with _WIN32 adds the Windows system
+      # directory after it, and tinycc-mes's source removes that call.  The
+      # build log ends a line at a carriage return, so msvcrt's CRLF lines
+      # match whole.
+      - name: tinycc-native prints its version and searches no system directory
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/native-version.log"
+          want='tcc version 0.9.28-unstable-2025-12-03 (i386 Windows)'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A native > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tinycc-native -version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::tinycc-native -version did not print $want"; exit 1; fi
+          echo "ok    tinycc-native -version"
+          if ! libs=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A tinycc-native.libs | tail -n 1); then
+            echo "::error::tinycc-native.libs did not build"
+            exit 1
+          fi
+          base=${libs##*/}
+          libdir=${base##*\\}/lib
+          log="$RUNNER_TEMP/native-search-dirs.log"
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A native-search-dirs > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::tinycc-native -print-search-dirs failed its build"; exit 1; fi
+          dirs=$(sed -n '/^libraries:$/,/^libtcc1:$/p' "$log" | sed '1d;$d')
+          count=$(printf '%s\n' "$dirs" | grep -c .)
+          dir=${dirs#"  "}
+          if [ "$count" != 1 ] || [ "${dir%"$libdir"}" = "$dir" ]; then
+            echo "::error::tinycc-native searches $count library directories, not $libdir alone"
+            exit 1
+          fi
+          echo "ok    tinycc-native searches $dir alone"
+
+      # hello, float and printf-float as tinycc-mes's, linked by
+      # tinycc-native against msvcrt.dll and kernel32.dll; winsock, which it
+      # links with -lws2_32, so that it fails unless -l finds ws2_32.def,
+      # and which prints 0x1234 through ws2_32.dll's htons, in network byte
+      # order; math, which it links with -lm, so that it fails unless -l
+      # finds the runtime's empty libm.a, and which prints a square root
+      # through msvcrt.dll's sqrt; and mingw32, which compiles only if
+      # tinycc-native predefines __MINGW32__.  msvcrt's stdout is a text stream, which writes each
+      # newline as a carriage return and a newline, and its printf prints %f
+      # with six decimals.
+      - name: Programs tinycc-native builds run
+        shell: bash
+        run: |
+          set -uo pipefail
+          build() {
+            "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/tinycc.nix -A "$1" | tail -n 1
+          }
+          if ! build native-mingw32 > /dev/null; then
+            echo "::error::native-mingw32 did not build; the log above says whether tinycc-native lacks __MINGW32__"
+            exit 1
+          fi
+          echo "ok    tinycc-native predefines __MINGW32__"
+          if ! hello=$(build native-hello) || ! float=$(build native-float) || ! printf_float=$(build native-printf-float) || ! winsock=$(build native-winsock) || ! math=$(build native-math); then
+            echo "::error::native-hello, native-float, native-printf-float, native-winsock or native-math did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$hello")/bin/hello.exe
+          float=$(cygpath -u "$float")/bin/float.exe
+          printf_float=$(cygpath -u "$printf_float")/bin/printf-float.exe
+          winsock=$(cygpath -u "$winsock")/bin/winsock.exe
+          math=$(cygpath -u "$math")/bin/math.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/tcc-native"
+          mkdir "$work"
+          status=0
+          runs() {
+            local exe=$1 want_code=$2 want_out=$3 code=0
+            shift 3
+            "$exe" "$@" > "$work/out.txt" || code=$?
+            printf '%s\r\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = "$want_code" ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    ${exe##*/}${*:+ $*} prints $want_out and exits $code"
+            else
+              echo "::error::${exe##*/}${*:+ $*} exited $code, not $want_code, and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs "$hello" 0 'Hello, TinyCC!'
+          runs "$hello" 1 'Hello, Windows!' Windows
+          runs "$float" 0 '3ff40000 0'
+          runs "$float" 0 '40040000 0' x
+          runs "$printf_float" 0 '1.250000'
+          runs "$printf_float" 0 '2.500000' x
+          runs "$winsock" 0 '3412'
+          runs "$math" 0 '1.414214'
+          runs "$math" 0 '2.000000' x
+          exit "$status"
+
+      # A check that cannot fail is a run that tests nothing and stays green,
+      # so the build-path check is run against its cases before it decides
+      # anything.
+      - name: The build-path check decides its cases
+        shell: bash
+        run: bash .github/bootstrap/no-build-path-cases.sh
+
+      # No round's tcc.exe names the store directory or its build directory
+      # (.github/bootstrap/no-build-path.sh says why).
+      - name: No TinyCC round's tcc.exe names the store or its build directory
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for round in tinycc.boot-mes tinycc.boot0 tinycc.boot1 tinycc.boot2 tinycc.boot3 tinycc.bootstrappable tinycc-mes.prev tinycc-mes tinycc-native.prev tinycc-native; do
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$round.compiler" | tail -n 1); then
+              echo "::error::$round.compiler did not build"
+              status=1
+              continue
+            fi
+            bash .github/bootstrap/no-build-path.sh "$round.compiler" "$out" bin/tcc.exe || status=1
+          done
+          exit "$status"
+
+      # GNU make, compiled by tinycc-native, timed.
+      - name: Build GNU make
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A gnumake
+          echo "== gnumake built in $((SECONDS - start)) s"
+
+      # make --version prints its version line, and make builds greeting.txt
+      # from greeting.in through a pattern rule whose recipe is cmd.exe's
+      # copy, which make runs from a batch file, having no sh.exe on PATH.
+      - name: GNU make runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/make-version.log"
+          want='GNU Make 4.4.1'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gnumake.nix -A version > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::make --version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::make --version did not print $want"; exit 1; fi
+          echo "ok    make --version"
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gnumake.nix -A pattern-rule | tail -n 1); then
+            echo "::error::make did not build greeting.txt"
+            exit 1
+          fi
+          greeting=$(cygpath -u "$out")
+          printf 'Hello from make\n' > "$RUNNER_TEMP/greeting-want.txt"
+          if cmp "$RUNNER_TEMP/greeting-want.txt" "$greeting"; then
+            echo "ok    make built greeting.txt through its pattern rule"
+          else
+            echo "::error::greeting.txt is not greeting.in's text:"
+            od -A d -t x1 "$greeting" | head -n 8
+            exit 1
+          fi
+
+      # busybox-w32, compiled by tinycc-native, timed.
+      - name: Build busybox-w32
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A busybox-w32
+          echo "== busybox-w32 built in $((SECONDS - start)) s"
+
+      # busybox --version prints its version line, and busybox's sh runs
+      # test/data/busybox.nix's script through the applets configure runs,
+      # writing a line of what each did; a line whose test fails is left
+      # out.  The lines are checked against bytes the runner's own printf
+      # writes.
+      - name: busybox-w32 runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/busybox-version.log"
+          want='BusyBox v1.39.0.git-6354-g5f09fb446 ()'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/busybox.nix -A version > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::busybox --version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::busybox --version did not print $want"; exit 1; fi
+          echo "ok    busybox --version"
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/busybox.nix -A configure-tools | tail -n 1); then
+            echo "::error::busybox sh did not run configure-tools.sh"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          expected="$RUNNER_TEMP/configure-tools-expected.txt"
+          printf '%s\n' \
+            'sh arithmetic 42' \
+            'sh expansion configure igure.ac 12' \
+            'sh case ac' \
+            'sh function hello world' \
+            'sh loop abc' \
+            'sh child child here status 3' \
+            'mkdir -p' \
+            'cat one,two,three,' \
+            'cp mv' \
+            'rm -r' \
+            'printf done 007 ff' \
+            'printf of 200 bytes' \
+            'test' \
+            'sed CC is gcc -O2' \
+            'sed -n two' \
+            'grep -c 2' \
+            'grep -q' \
+            'grep -E two,three,' \
+            'grep -v three' \
+            'awk 14' \
+            'awk -F c 3' \
+            'expr 5 conftest' \
+            'tr ABCDEF' > "$expected"
+          if cmp "$expected" "$lines"; then
+            echo "ok    busybox sh ran configure-tools.sh, $(wc -l < "$lines") lines as expected"
+          else
+            echo "::error::configure-tools.sh's lines differ from those expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
+
+      # The seed stdenv's commands, busybox-w32's applets, and GNU Hello
+      # built with it: pkgs/windows' hello package, configured, compiled
+      # and installed by busybox's sh, its applets, GNU make and
+      # tinycc-native, each timed.
+      - name: Build GNU Hello with the seed stdenv
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A seedStdenv.applets
+          echo "== seedStdenv.applets built in $((SECONDS - start)) s"
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/seed-stdenv.nix -A hello
+          echo "== hello built in $((SECONDS - start)) s"
+
+      # hello prints its greeting, or the one --greeting gives it, and its
+      # version, each line ending in a carriage return, as msvcrt's
+      # text-mode stdout writes it.  Each greeting is checked against bytes
+      # the runner's own printf writes, and the first line of --version
+      # with its carriage return removed.
+      - name: GNU Hello built with the seed stdenv runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/seed-stdenv.nix -A hello | tail -n 1); then
+            echo "::error::hello did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$out")/bin/hello.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/seed-hello"
+          mkdir "$work"
+          status=0
+          runs() {
+            local want_out=$1 code=0
+            shift
+            "$hello" "$@" > "$work/out.txt" || code=$?
+            printf '%s\r\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = 0 ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    hello.exe${*:+ $*} prints $want_out"
+            else
+              echo "::error::hello.exe${*:+ $*} exited $code and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs 'Hello, world!'
+          runs 'Hello from the seed' --greeting='Hello from the seed'
+          code=0
+          out=$("$hello" --version) || code=$?
+          version=${out%%$'\n'*}
+          version=${version%$'\r'}
+          if [ "$code" = 0 ] && [ "$version" = 'hello (GNU Hello) 2.12.3' ]; then
+            echo "ok    hello.exe --version prints $version"
+          else
+            echo "::error::hello.exe --version exited $code and printed $version"
+            status=1
+          fi
+          exit "$status"
+
+      # GNU Hello as the seed stdenv builds it, with configure's default
+      # CFLAGS, names neither the store directory nor its build directory
+      # (.github/bootstrap/no-build-path.sh says why).
+      - name: GNU Hello built with the seed stdenv names no store or build directory
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/seed-stdenv.nix -A hello | tail -n 1); then
+            echo "::error::hello did not build"
+            exit 1
+          fi
+          bash .github/bootstrap/no-build-path.sh hello "$out" bin/hello.exe
+
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the GCC 4.6.4 stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-tinycc-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # GCC 4.6.4: the seed stdenv builds binutils, whose as, ar and ld
+  # test/data/binutils.nix has build a program that runs, GCC 4.6.4's C
+  # compiler and libgcc over MinGW-w64's headers, which
+  # test/data/gcc-core.nix has compile sources whose assembly is compared
+  # and a program that runs, and MinGW-w64's runtime, which that compiler
+  # compiles and gcc46 lays out beside it, so that test/data/gcc46.nix has
+  # gcc46 link a C program that runs.
+  #
+  # From the seed this stage's builds and checks take 35 to 37 minutes on
+  # the ARM64 leg under the x86 emulator, 24 of them tcc compiling GCC and
+  # 8 binutils, and the timeout is twice the longer.
+  # ---------------------------------------------------------------------------
+  gcc46-windows:
+    name: GCC 4.6.4
+    needs: [tinycc-windows]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 74
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the TinyCC stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-tinycc-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the TinyCC stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" tinycc fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc46 build
+
+      # GNU binutils for i686-w64-mingw32, configured, compiled and
+      # installed in the seed stdenv by tinycc-native, timed.
+      - name: Build binutils
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A binutils
+          echo "== binutils built in $((SECONDS - start)) s"
+
+      # ld --version prints its version line.  Then busybox's sh runs
+      # test/data/binutils.nix's script, in which as assembles a function
+      # that returns 42, ar archives the object, ld links it as a program's
+      # entry point and the program runs, and ar archives and extracts a
+      # file holding a 0x1A byte and a CR LF; it writes what nm, ar and
+      # objdump read back of each file, the program's exit status and
+      # whether the extracted file is the archived one, a line for each,
+      # and a line whose step fails is left out.  The lines are
+      # checked against bytes the runner's own printf writes.
+      - name: binutils runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/ld-version.log"
+          want='GNU ld (GNU Binutils) 2.41'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/binutils.nix -A version > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::ld --version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::ld --version did not print $want"; exit 1; fi
+          echo "ok    ld --version"
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/binutils.nix -A answer | tail -n 1); then
+            echo "::error::busybox sh did not run answer.sh"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          expected="$RUNNER_TEMP/answer-expected.txt"
+          printf '%s\n' \
+            '00000000 T _answer' \
+            'answer.o' \
+            'answer.exe:     file format pei-i386' \
+            'answer.exe exits 42' \
+            'ctrlz.bin comes out of its archive whole' > "$expected"
+          if cmp "$expected" "$lines"; then
+            echo "ok    as, ar and ld built answer.exe, which exits 42, and ar kept a 0x1A byte"
+          else
+            echo "::error::answer.sh's lines differ from those expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
+
+      # MinGW-w64's headers, its dirent functions and GCC 4.6.4's C
+      # compiler for i686-w64-mingw32 with libgcc: the headers installed,
+      # and the library and the compiler configured, compiled and installed,
+      # in the seed stdenv by tinycc-native, and libgcc by that compiler in
+      # the same build, each timed.
+      - name: Build gcc-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in mingw-w64-headers mingw-w64-dirent gcc-core; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
+            echo "== $attr built in $((SECONDS - start)) s"
+          done
+
+      # The driver prints its version line.  Then busybox's sh runs
+      # test/data/gcc-core.nix's script, in which the compiler compiles
+      # text.c to assembly, reads windows.h, and compiles answer.c to an
+      # object that ld links as a program's entry point and that runs; it
+      # writes the assembly, a line for the headers, what nm reads back of
+      # the object and the program's exit status, and a step that fails
+      # leaves its lines out.  The lines are compared with
+      # test/data/gcc-core-answer.txt, the same sources compiled by GCC
+      # 4.6.4 as another compiler built it: cc1 computes every constant in
+      # text.c and the multiplier answer.c's modulo becomes, so a cc1 that
+      # tcc compiled wrongly writes other lines or a program that does not
+      # exit with 42.
+      - name: gcc-core runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/gcc-version.log"
+          want='i686-w64-mingw32-gcc.exe (GCC) 4.6.4'
+          code=0
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc-core.nix -A version > /dev/null 2> "$log" || code=$?
+          cat "$log"
+          if [ "$code" != 0 ]; then echo "::error::gcc --version failed its build"; exit 1; fi
+          if ! grep -Fqx "$want" "$log"; then echo "::error::gcc --version did not print $want"; exit 1; fi
+          echo "ok    gcc --version"
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc-core.nix -A answer | tail -n 1); then
+            echo "::error::busybox sh did not run answer.sh"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          expected=test/data/gcc-core-answer.txt
+          if cmp "$expected" "$lines"; then
+            echo "ok    gcc-core wrote the assembly expected of text.c, read windows.h, and built answer.exe, which exits 42"
+          else
+            echo "::error::answer.sh's lines differ from $expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
+
+      # MinGW-w64's runtime, configured, compiled and installed in the seed
+      # stdenv by gcc-core, and gcc46, gcc-core's tree with the runtime in
+      # its prefix, copied by busybox's sh, each timed.
+      - name: Build gcc46
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in mingw-w64-crt gcc46; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
+            echo "== $attr built in $((SECONDS - start)) s"
+          done
+
+      # busybox's sh runs test/data/gcc46.nix's two scripts.  crt lists
+      # every file the runtime installs and crt2.o's global symbols, which
+      # a configure test decides without failing the build.  hello has gcc46
+      # compile and link a program with no flag naming a directory, runs
+      # it, and writes what it prints and its exit status, the DLLs it
+      # imports, and the two libgcc functions its 64-bit division and
+      # remainder call.  Each output is compared with the file of
+      # test/data named for it, written from the same sources built by GCC
+      # 4.6.4 as another compiler built it.
+      - name: gcc46 links a program that runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in crt hello; do
+            expected=test/data/gcc46-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc46.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the GCC 4.6.4 C++ stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-gcc46-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # GCC 4.6.4 C++: gcc46 builds GCC 4.6.4 with C++, gcc46-cxx, whose g++
+  # test/data/gcc46-cxx.nix has link a C++ program that runs, and whose
+  # programs it finds carrying no time stamp.
+  #
+  # This stage's builds and checks take 36 to 38 minutes on the ARM64 leg
+  # under the x86 emulator, nearly all of them gcc46 compiling GCC with
+  # C++, and the timeout is twice the longer.
+  # ---------------------------------------------------------------------------
+  gcc46-cxx-windows:
+    name: GCC 4.6.4 C++
+    needs: [gcc46-windows]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 76
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the GCC 4.6.4 stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-gcc46-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the GCC 4.6.4 stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc46 fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc46-cxx build
+
+      # GCC 4.6.4 with C and C++ for i686-w64-mingw32, configured,
+      # compiled and installed in the seed stdenv by gcc46, with libgcc and
+      # libstdc++ compiled by the compiler the same make links, timed.
+      - name: Build gcc46-cxx
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A gcc46-cxx
+          echo "== gcc46-cxx built in $((SECONDS - start)) s"
+
+      # busybox's sh runs test/data/gcc46-cxx.nix's script, in which g++
+      # compiles and links a C++ program with no flag naming a directory
+      # and runs it.  It writes what the program prints, through iostream,
+      # of virtual calls, a template, new and delete and two exceptions
+      # caught, and its exit status, the DLLs it imports and three
+      # functions of SJLJ exception handling it links, and the lines are
+      # compared with test/data/gcc46-cxx-hello-answer.txt, which is what
+      # the C++ standard defines the program to print and what the
+      # configuration links.
+      - name: gcc46-cxx links a C++ program that runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          expected=test/data/gcc46-cxx-hello-answer.txt
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc46-cxx.nix -A hello | tail -n 1); then
+            echo "::error::busybox sh did not run hello's script"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          if cmp "$expected" "$lines"; then
+            echo "ok    hello wrote the lines of $expected"
+          else
+            echo "::error::hello's lines differ from $expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
+
+      # busybox's sh runs test/data/gcc46-cxx.nix's stamps script, which
+      # writes every program and DLL gcc46-cxx installs with the time stamp
+      # its PE header carries, and the lines are compared with
+      # test/data/gcc46-cxx-stamps-answer.txt, in which each is 0: ld and
+      # strip write the time there unless the build tells them not to, and
+      # a program that carries it makes two builds of the rung differ.
+      - name: No program gcc46-cxx installs carries the time it was built
+        shell: bash
+        run: |
+          set -uo pipefail
+          expected=test/data/gcc46-cxx-stamps-answer.txt
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc46-cxx.nix -A stamps | tail -n 1); then
+            echo "::error::busybox sh did not run stamps' script"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          if cmp "$expected" "$lines"; then
+            echo "ok    stamps wrote the lines of $expected"
+          else
+            echo "::error::stamps' lines differ from $expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
+
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the GCC 10 stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-gcc46-cxx-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # GCC 10: gcc46-cxx builds GCC 10.4.0 with C and C++, gcc10, with GMP,
+  # MPFR and MPC in its tree, whose gcc and g++
+  # test/data/gcc10.nix has link a C and a C++ program that run, and whose
+  # programs it finds carrying no time stamp.  gcc10 then compiles the
+  # current MinGW-w64's runtime over its headers, whose files and start
+  # file test/data/mingw-w64-latest.nix compares with other builds of the
+  # release, and against which it has gcc10 link a program that runs.
+  #
+  # The timeout is twice an estimate of this stage on the ARM64 leg, about
+  # 65 minutes: the stage took 52 there with gcc10 alone, and on a
+  # 24-thread x64 Windows machine, where gcc10 builds in 13 minutes, the
+  # current MinGW-w64 builds in 3.
+  # ---------------------------------------------------------------------------
+  gcc10-windows:
+    name: GCC 10
+    needs: [gcc46-cxx-windows]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 130
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the GCC 4.6.4 C++ stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-gcc46-cxx-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the GCC 4.6.4 C++ stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc46-cxx fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc10 build
+
+      # GCC 10.4.0 with C and C++ for i686-w64-mingw32, with GMP, MPFR and
+      # MPC built in its tree, configured, compiled and installed in the
+      # seed stdenv by gcc46-cxx, with libgcc and libstdc++ compiled by the
+      # compiler the same make links, timed.
+      - name: Build gcc10
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A gcc10
+          echo "== gcc10 built in $((SECONDS - start)) s"
+
+      # busybox's sh runs test/data/gcc10.nix's two hello scripts, in which
+      # gcc compiles and links a C program and g++ a C++ one, each with no
+      # flag naming a directory, and runs it.  Each writes what its program
+      # prints, of the compiler's version and default standard and of
+      # features GCC 4.6.4 lacks, its exit status, the DLLs it imports, the
+      # functions of libgcc's and libsupc++'s it links and how many
+      # debugging sections it has, and the lines are compared with the file
+      # of test/data named for the check, which is what the C and C++
+      # standards define the programs to print and what the configuration
+      # links.
+      - name: gcc10 links a C and a C++ program that run
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in hello-c hello-cxx; do
+            expected=test/data/gcc10-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc10.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # busybox's sh runs test/data/gcc10.nix's stamps script, which writes
+      # every program and DLL gcc10 installs with the time stamp its PE
+      # header carries, and the lines are compared with
+      # test/data/gcc10-stamps-answer.txt, in which each is 0, for the
+      # reason gcc46-cxx's are.
+      - name: No program gcc10 installs carries the time it was built
+        shell: bash
+        run: |
+          set -uo pipefail
+          expected=test/data/gcc10-stamps-answer.txt
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc10.nix -A stamps | tail -n 1); then
+            echo "::error::busybox sh did not run stamps' script"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          if cmp "$expected" "$lines"; then
+            echo "ok    stamps wrote the lines of $expected"
+          else
+            echo "::error::stamps' lines differ from $expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
+
+      # MinGW-w64 v14.0.0's headers, installed by the seed stdenv, and its
+      # runtime for i686-w64-mingw32, configured, compiled and installed in
+      # the seed stdenv by gcc10, each timed.
+      - name: Build the current MinGW-w64
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in mingw-w64-headers-latest mingw-w64-crt-latest; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
+            echo "== $attr built in $((SECONDS - start)) s"
+          done
+
+      # busybox's sh runs test/data/mingw-w64-latest.nix's two scripts.  crt
+      # lists every file the runtime installs and crt2.o's global symbols,
+      # which a configure test decides without failing the build, and the
+      # lines are compared with what the release's Makefile installs and
+      # with the crt2.o another GCC compiled.  hello has gcc10 compile and
+      # link a program against the runtime, which calls three functions the
+      # runtime compiles with builtins GCC 4.6.4 lacks, runs it, and writes
+      # what it prints and its exit status, the DLLs it imports, the three
+      # functions it links and how many debugging sections it has, and the
+      # lines are compared with what MinGW-w64's headers and sources define
+      # the program to print and what the configuration links.
+      - name: gcc10 links a program against the current MinGW-w64
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in crt hello; do
+            expected=test/data/mingw-w64-latest-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mingw-w64-latest.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the GCC 16 stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-gcc10-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # GCC 16: gcc10 builds GCC 16.2.0 with C and C++, gcc-latest, with GMP,
+  # MPFR and MPC in its tree, against the current MinGW-w64,
+  # whose gcc and g++ test/data/gcc-latest.nix has link a C and a C++
+  # program that run, and whose programs it finds carrying no time stamp.
+  #
+  # The timeout is twice an estimate of this stage on the ARM64 leg, about
+  # 67 minutes: GCC 10 (Windows ARM64) takes 52 there, and on a 24-thread
+  # x64 Windows machine gcc-latest builds in 17 minutes where gcc10 builds
+  # in 13.
+  # ---------------------------------------------------------------------------
+  gcc-latest-windows:
+    name: GCC 16
+    needs: [gcc10-windows]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 135
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the GCC 10 stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-gcc10-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the GCC 10 stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc10 fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc-latest build
+
+      # GCC 16.2.0 with C and C++ for i686-w64-mingw32, with GMP, MPFR and
+      # MPC built in its tree, configured, compiled and installed in the
+      # seed stdenv by gcc10 against MinGW-w64 v14.0.0, with libgcc and
+      # libstdc++ compiled by the compiler the same make links, timed.
+      - name: Build gcc-latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A gcc-latest
+          echo "== gcc-latest built in $((SECONDS - start)) s"
+
+      # busybox's sh runs test/data/gcc-latest.nix's two hello scripts, in
+      # which gcc compiles and links a C program and g++ a C++ one, each
+      # with no flag naming a directory, and runs it.  Each writes what its
+      # program prints, of the compiler's version and default standard, of
+      # the runtime's release and of C23 and C++20 features, its exit
+      # status, the DLLs it imports, the functions of libgcc's, libsupc++'s
+      # and libstdc++'s it links, how many CodeView entries its debug
+      # directory holds, which is the build ID, and how many debugging
+      # sections it has, and the C script also writes the configuration
+      # and thread model gcc -v prints.  The lines are compared with the
+      # file of test/data named for the check, which is what the C and C++
+      # standards define the programs to print and what the configuration
+      # links.
+      - name: gcc-latest links a C and a C++ program that run
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in hello-c hello-cxx; do
+            expected=test/data/gcc-latest-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc-latest.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # busybox's sh runs test/data/gcc-latest.nix's stamps script, which
+      # writes every program and DLL gcc-latest installs with the time
+      # stamp its PE header carries, and the lines are compared with
+      # test/data/gcc-latest-stamps-answer.txt, in which each is 0, for the
+      # reason gcc46-cxx's are.
+      - name: No program gcc-latest installs carries the time it was built
+        shell: bash
+        run: |
+          set -uo pipefail
+          expected=test/data/gcc-latest-stamps-answer.txt
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc-latest.nix -A stamps | tail -n 1); then
+            echo "::error::busybox sh did not run stamps' script"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          if cmp "$expected" "$lines"; then
+            echo "ok    stamps wrote the lines of $expected"
+          else
+            echo "::error::stamps' lines differ from $expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"

@@ -2,13 +2,13 @@ name: PR closed
 
 # Cancels a closed pull request's CI run.  Nothing pushes to a pull request
 # once it merges or closes, so ci.yml's concurrency group never cancels its
-# run, and a run whose change reaches the builder keeps building the seed
-# ladder for hours on the Windows runners the merge queue's runs then wait
-# for.  A run that enters a concurrency group with cancel-in-progress
-# cancels the group's run in progress, whichever workflow it belongs to, so
-# this workflow joins ci.yml's group for the pull request and does nothing
-# else.  It takes no token and checks nothing out, so a pull request from a
-# fork runs it as safely as one from a branch.
+# run, and a run keeps building the ladder on the Windows runners the merge
+# queue's runs then wait for, though the push to main that follows a merge
+# builds it again.  A run that enters a concurrency group with
+# cancel-in-progress cancels the group's run in progress, whichever workflow
+# it belongs to, so this workflow joins ci.yml's group for the pull request
+# and does nothing else.  It takes no token and checks nothing out, so a
+# pull request from a fork runs it as safely as one from a branch.
 on:
   pull_request:
     types: [closed]
