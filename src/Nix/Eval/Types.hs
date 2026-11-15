@@ -1231,12 +1231,16 @@ class (Monad m) => MonadEval m where
   -- failed fetch is an eval error.
   onEvalError :: m a -> m () -> m a
 
-  -- | Run the action; a failure escaping it (a throw, an eval error or an
-  -- abort) gains the given line of context outside the lines it already
-  -- carries, as upstream's @Error::addTrace@ adds one where a @catch@
-  -- rethrows.  Nothing else about the failure changes: its message stays
-  -- the same, and a throw stays catchable by @builtins.tryEval@.
-  addErrorTrace :: Text -> m a -> m a
+  -- | @addErrorTrace line action@ runs the action; a failure escaping it
+  -- (a throw, an eval error or an abort) runs @line@ for a line of context
+  -- and gains that line outside the lines it already carries, as
+  -- upstream's @Error::addTrace@ adds one where a @catch@ rethrows.
+  -- Nothing else about the failure changes: its message stays the same,
+  -- and a throw stays catchable by @builtins.tryEval@.  The line is made
+  -- only on failure, and a failure making it escapes in place of the
+  -- action's, as an exception thrown inside upstream's @catch@ replaces
+  -- the one caught (@prim_addErrorContext@, primops.cc:831-844 at 2.24.9).
+  addErrorTrace :: m Text -> m a -> m a
 
   -- | Run an application one call frame deeper, or refuse it with
   -- upstream's "stack overflow; max-call-depth exceeded" when the frames
@@ -1509,8 +1513,12 @@ instance MonadEval PureEval where
   onEvalError (PureEval action) _ = PureEval action
 
   -- 'runPureEval' reports a failure's message alone, so a line of context
-  -- has nowhere to go.
-  addErrorTrace _ action = action
+  -- has nowhere to go.  The line is still made, since a failure making it
+  -- replaces the action's.
+  addErrorTrace (PureEval line) (PureEval action) =
+    PureEval $ ReaderT $ \depth -> case runReaderT action depth of
+      Left failure -> runReaderT line depth >> Left failure
+      Right a -> Right a
 
   -- The reader scopes the frame: the action runs one deeper, and whatever
   -- follows it sees the depth it started from, failure or not.
