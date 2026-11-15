@@ -44,6 +44,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, builtinNames, currentSystemStr, deferApply, evaluated, readThunkValue)
+import Nix.Eval.AllocSite (EnvSite (EnvApply, EnvRoot), SetSite (SetRoot))
 import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newCEnv, thunkToCPtr)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames)
 import Nix.Parser (SourceOrigin (..), parseNixWithScope, parsedExpr)
@@ -75,8 +76,8 @@ builtinEnv policy timestamp searchPaths =
         | otherwise =
             let unprefixed = fromMaybe name (T.stripPrefix "__" name)
              in fromMaybe (evaluated (VBuiltin unprefixed [])) (attrSetLookup unprefixed builtinsSet)
-      scope = attrSetFromMap (Map.fromSet bind (rootScopeNames policy))
-   in newCEnv nullPtr 0 (Just scope) Nothing nullPtr 0
+      scope = attrSetFromMap SetRoot (Map.fromSet bind (rootScopeNames policy))
+   in newCEnv EnvRoot nullPtr 0 (Just scope) Nothing nullPtr 0
 
 -- | The names the root environment binds under a policy: upstream's base
 -- environment, which leaves out its @impureOnly@ constants under
@@ -96,12 +97,12 @@ builtinEnvWithScope :: EvalPolicy -> Int64 -> [Thunk] -> [(Text, Thunk)] -> Env
 builtinEnvWithScope policy timestamp searchPaths scope =
   let base = builtinEnv policy timestamp searchPaths
       scopeMap = Map.fromList scope
-   in newCEnv nullPtr 0 (Just (attrSetFromMap scopeMap)) (Just base) nullPtr 0
+   in newCEnv EnvRoot nullPtr 0 (Just (attrSetFromMap SetRoot scopeMap)) (Just base) nullPtr 0
 
 -- | The @builtins@ attribute set, derived from the central registry.
 builtinsAttrSet :: EvalPolicy -> Int64 -> [Thunk] -> AttrSet
 builtinsAttrSet policy timestamp searchPaths =
-  attrSetFromMap $ Map.union builtinEntries (standardEntries policy timestamp searchPaths)
+  attrSetFromMap SetRoot $ Map.union builtinEntries (standardEntries policy timestamp searchPaths)
   where
     builtinEntries =
       Map.fromList [(name, evaluated (VBuiltin name [])) | name <- builtinNames]
@@ -212,14 +213,14 @@ derivationWrapperScope =
    in Map.fromList
         [ ("derivationStrict", evaluated (VBuiltin "derivationStrict" [])),
           ("map", evaluated (VBuiltin "map" [])),
-          ("builtins", evaluated (VAttrs (attrSetFromMap (Map.fromList (map topLevelBuiltin builtinsUsed)))))
+          ("builtins", evaluated (VAttrs (attrSetFromMap SetRoot (Map.fromList (map topLevelBuiltin builtinsUsed)))))
         ]
 {-# NOINLINE derivationWrapperScope #-}
 
 -- | 'derivationWrapperScope' as the wrapper's environment.
 derivationWrapperEnv :: Env
 derivationWrapperEnv =
-  newCEnv nullPtr 0 (Just (attrSetFromMap derivationWrapperScope)) Nothing nullPtr 0
+  newCEnv EnvRoot nullPtr 0 (Just (attrSetFromMap SetRoot derivationWrapperScope)) Nothing nullPtr 0
 {-# NOINLINE derivationWrapperEnv #-}
 
 -- | The @derivation@ constant: the wrapper lambda closed over
@@ -243,7 +244,7 @@ derivationWrapper =
 -- | A thunk that aborts evaluation with the message when forced: @abort@
 -- applied to it, deferred the way "Nix.Eval" defers any application.
 abortingThunk :: Text -> Thunk
-abortingThunk message = deferApply (VBuiltin "abort" []) (evaluated (mkStr message))
+abortingThunk message = deferApply EnvApply (VBuiltin "abort" []) (evaluated (mkStr message))
 
 -- ---------------------------------------------------------------------------
 -- NIX_PATH parsing
@@ -272,7 +273,7 @@ parseNixPath raw
               | otherwise -> (before, BS.drop 1 after)
        in evaluated
             ( VAttrs
-                ( attrSetFromMap $
+                ( attrSetFromMap SetRoot $
                     Map.fromList
                       [ ("prefix", evaluated (mkStrBytes prefix)),
                         ("path", evaluated (mkStrBytes path))

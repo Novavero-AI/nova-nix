@@ -32,7 +32,6 @@ module Nix.Eval.Types
     attrSetToAscList,
     attrSetMapWithKey,
     attrSetRemoveKeys,
-    attrSetUnionWith,
     buildCAttrSetKeys,
     fillCAttrSetValues,
 
@@ -60,7 +59,6 @@ module Nix.Eval.Types
     envLookup,
     envLookupResolved,
     envFromSlots,
-    pushWithScope,
     lookupWithScopes,
     withScopesForCapture,
     envWithScopesRaw,
@@ -138,10 +136,11 @@ import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Float (castWord64ToDouble)
 import Nix.Derivation (Derivation)
+import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
-import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
+import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CStatus (checkedCPtr)
@@ -463,49 +462,46 @@ attrSetElems = Map.elems . attrSetToMap
 attrSetToAscList :: AttrSet -> [(Text, Thunk)]
 attrSetToAscList = Map.toAscList . attrSetToMap
 
--- | Map a function over all key-value pairs, building a new CAttrSet.
--- Materializes the source set, applies @f@ to each entry, and rebuilds.
-attrSetMapWithKey :: (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
-attrSetMapWithKey f attrs = attrSetFromMap (Map.mapWithKey f (attrSetToMap attrs))
+-- | Map a function over all key-value pairs, building a new CAttrSet at
+-- a site.  Materializes the source set, applies @f@ to each entry, and
+-- rebuilds.
+attrSetMapWithKey :: SetSite -> (Text -> Thunk -> Thunk) -> AttrSet -> AttrSet
+attrSetMapWithKey site f attrs = attrSetFromMap site (Map.mapWithKey f (attrSetToMap attrs))
 
--- | Remove a list of keys, returning a new CAttrSet.
+-- | Remove a list of keys, returning a new CAttrSet made at a site.
 -- Uses the C-side @nn_attrset_remove_keys@ for O(n) removal.
 {-# NOINLINE attrSetRemoveKeys #-}
-attrSetRemoveKeys :: [Text] -> AttrSet -> AttrSet
-attrSetRemoveKeys keys (AttrSet cset) = unsafePerformIO $ do
+attrSetRemoveKeys :: SetSite -> [Text] -> AttrSet -> AttrSet
+attrSetRemoveKeys site keys (AttrSet cset) = unsafePerformIO $ do
   syms <- mapM symbolIntern keys
-  newSet <- cattrsetRemoveKeys cset syms
+  newSet <- cattrsetRemoveKeys site cset syms
   pure (AttrSet newSet)
 
--- | Union two attribute sets with a combining function.
--- Materializes both to Maps, applies the combining function, rebuilds.
-attrSetUnionWith :: (Thunk -> Thunk -> Thunk) -> AttrSet -> AttrSet -> AttrSet
-attrSetUnionWith f a b = attrSetFromMap (Map.unionWith f (attrSetToMap a) (attrSetToMap b))
-
--- | Build a CAttrSet from a Haskell 'Map' of attributes defined nowhere in
--- source, as those of a set a builtin makes from scratch are; a builtin
--- that copies attributes keeps their positions with 'attrSetFromEntries'.
+-- | Build a CAttrSet at a site from a Haskell 'Map' of attributes defined
+-- nowhere in source, as those of a set a builtin makes from scratch are;
+-- a builtin that copies attributes keeps their positions with
+-- 'attrSetFromEntries'.
 -- Interns all keys as symbols, inserts key-value pairs, freezes (sort +
 -- dedup).
 --
 -- Uses 'unsafePerformIO' with @NOINLINE@ - safe because C allocation
 -- is idempotent and the resulting CAttrSet is referentially transparent.
 {-# NOINLINE attrSetFromMap #-}
-attrSetFromMap :: Map Text Thunk -> AttrSet
-attrSetFromMap m = m `seq` AttrSet (unsafePerformIO (newFrozenAttrSet (const noPos) id m))
+attrSetFromMap :: SetSite -> Map Text Thunk -> AttrSet
+attrSetFromMap site m = m `seq` AttrSet (unsafePerformIO (newFrozenAttrSet site (const noPos) id m))
 
 -- | 'attrSetFromMap' for attributes that keep the positions they were
 -- defined at, as an attribute set literal's and a copied attribute's do.
 {-# NOINLINE attrSetFromEntries #-}
-attrSetFromEntries :: Map Text AttrEntry -> AttrSet
-attrSetFromEntries m = m `seq` AttrSet (unsafePerformIO (newFrozenAttrSet entryPos entryThunk m))
+attrSetFromEntries :: SetSite -> Map Text AttrEntry -> AttrSet
+attrSetFromEntries site m = m `seq` AttrSet (unsafePerformIO (newFrozenAttrSet site entryPos entryThunk m))
 
--- | Insert every entry of a map into a new set, at the position and with
--- the thunk the projections give it, and freeze it.
+-- | Insert every entry of a map into a new set at a site, at the position
+-- and with the thunk the projections give it, and freeze it.
 {-# INLINE newFrozenAttrSet #-}
-newFrozenAttrSet :: (a -> PosIdx) -> (a -> Thunk) -> Map Text a -> IO CAttrSet
-newFrozenAttrSet posOf thunkOf m = do
-  cset <- cattrsetNew (Map.size m)
+newFrozenAttrSet :: SetSite -> (a -> PosIdx) -> (a -> Thunk) -> Map Text a -> IO CAttrSet
+newFrozenAttrSet site posOf thunkOf m = do
+  cset <- cattrsetNew site (Map.size m)
   forM_ (Map.toList m) $ \(key, entry) -> do
     sym <- symbolIntern key
     cattrsetInsert cset sym (posOf entry) (unThunk (thunkOf entry))
@@ -521,7 +517,7 @@ newFrozenAttrSet posOf thunkOf m = do
 {-# NOINLINE buildCAttrSetKeys #-}
 buildCAttrSetKeys :: [Text] -> CAttrSet
 buildCAttrSetKeys keys = unsafePerformIO $ do
-  cset <- cattrsetNew (length keys)
+  cset <- cattrsetNew SetScope (length keys)
   forM_ keys $ \key -> do
     sym <- symbolIntern key
     cattrsetInsert cset sym noPos nullPtr
@@ -578,15 +574,16 @@ instance Show Env where
 emptyEnv :: Env
 emptyEnv = Env (unsafePerformIO cenvEmpty)
 
--- | General C-backed env constructor.
+-- | General C-backed env constructor, for an env at a site.
 -- Takes Haskell-level types; converts Maybe to nullPtr internally.
 {-# NOINLINE newCEnv #-}
-newCEnv :: Ptr CThunkPtr -> Int -> Maybe AttrSet -> Maybe Env -> Ptr (Ptr ()) -> Word32 -> Env
-newCEnv slots slotCount lazyScope parent withs withCount =
+newCEnv :: EnvSite -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> Maybe Env -> Ptr (Ptr ()) -> Word32 -> Env
+newCEnv site slots slotCount lazyScope parent withs withCount =
   Env
     ( unsafePerformIO
         ( checkedCPtr "nn_env_new"
             =<< cenvNew
+              site
               slots
               (fromIntegral slotCount)
               (case lazyScope of Nothing -> nullPtr; Just (AttrSet cset) -> castPtr cset)
@@ -596,11 +593,12 @@ newCEnv slots slotCount lazyScope parent withs withCount =
         )
     )
 
--- | Minimal env: slots only, no parent, no with-scopes, no lazy scope.
+-- | Minimal env at a site: slots only, no parent, no with-scopes, no
+-- lazy scope.
 {-# NOINLINE newMinimalEnv #-}
-newMinimalEnv :: Ptr CThunkPtr -> Int -> Env
-newMinimalEnv slots n =
-  Env (unsafePerformIO (checkedCPtr "nn_env_new_minimal" =<< cenvNewMinimal slots (fromIntegral n)))
+newMinimalEnv :: EnvSite -> Ptr CThunkPtr -> Int -> Env
+newMinimalEnv site slots n =
+  Env (unsafePerformIO (checkedCPtr "nn_env_new_minimal" =<< cenvNewMinimal site slots (fromIntegral n)))
 
 -- | Look up a resolved variable by level and index.  Single C call:
 -- O(level) parent hops in C, then O(1) array read.
@@ -662,19 +660,12 @@ lookupWithScopes name (scope : rest) =
     Just val -> Just val
     Nothing -> lookupWithScopes name rest
 
--- | Create a child env with positional slots (for lambda formals).
--- Inherits with-scopes from the parent.  Arena-allocated.
+-- | Create a child env at a site with positional slots (for lambda
+-- formals).  Inherits with-scopes from the parent.  Arena-allocated.
 {-# NOINLINE envFromSlots #-}
-envFromSlots :: Ptr CThunkPtr -> Int -> Env -> Env
-envFromSlots slotsPtr slotCount (Env parentPtr) =
-  Env (unsafePerformIO (checkedCPtr "nn_env_from_slots" =<< cenvFromSlots slotsPtr (fromIntegral slotCount) parentPtr))
-
--- | Push a with-scope onto the scope chain (innermost position).
--- Allocates a new C env struct with extended with-scopes array.
-{-# NOINLINE pushWithScope #-}
-pushWithScope :: AttrSet -> Env -> Env
-pushWithScope (AttrSet cset) (Env envPtr) =
-  Env (unsafePerformIO (checkedCPtr "nn_env_push_with" =<< cenvPushWith envPtr (castPtr cset)))
+envFromSlots :: EnvSite -> Ptr CThunkPtr -> Int -> Env -> Env
+envFromSlots site slotsPtr slotCount (Env parentPtr) =
+  Env (unsafePerformIO (checkedCPtr "nn_env_from_slots" =<< cenvFromSlots site slotsPtr (fromIntegral slotCount) parentPtr))
 
 -- | Read with-scopes array pointer and count from a C env.
 {-# NOINLINE envWithScopesRaw #-}
@@ -684,13 +675,13 @@ envWithScopesRaw (Env envPtr) = unsafePerformIO $ do
   count <- cenvWithCount envPtr
   pure (withs, count)
 
--- | Build with-scopes for a trimmed env that needs with-scope access
--- ('CapturesWithScopes').  Appends the root scope (builtins) as the
--- outermost entry so 'EWithVar' can fall back to builtins without
+-- | Build with-scopes for a trimmed env at a site that needs with-scope
+-- access ('CapturesWithScopes').  Appends the root scope (builtins) as
+-- the outermost entry so 'EWithVar' can fall back to builtins without
 -- retaining the parent chain.  Returns C array + count.
 {-# NOINLINE withScopesForCapture #-}
-withScopesForCapture :: Env -> (Ptr (Ptr ()), Word32)
-withScopesForCapture (Env envPtr) = unsafePerformIO $ do
+withScopesForCapture :: EnvSite -> Env -> (Ptr (Ptr ()), Word32)
+withScopesForCapture site (Env envPtr) = unsafePerformIO $ do
   rootPtr <- cenvRootScope envPtr
   existingWiths <- cenvWithScopes envPtr
   existingCount <- cenvWithCount envPtr
@@ -700,7 +691,7 @@ withScopesForCapture (Env envPtr) = unsafePerformIO $ do
       -- existingCount sits far below 2^32 (the C side caps the array
       -- allocation at UINT32_MAX bytes), so the increment cannot wrap.
       let newCount = existingCount + 1
-      arr <- checkedCPtr "nn_env_alloc_with_scopes" =<< cenvAllocWithScopes newCount
+      arr <- checkedCPtr "nn_env_alloc_with_scopes" =<< cenvAllocWithScopes site newCount
       forM_ [0 .. fromIntegral existingCount - 1] $ \i -> do
         val <- peekElemOff existingWiths i
         pokeElemOff arr i val
@@ -733,15 +724,15 @@ cheapThunk env (ELambda formals body NoCaptureInfo) =
       evalFormals = unsafePerformIO (compileFormalsToEval formals)
    in evaluated (VLambda env evalFormals bodyBcIdx)
 cheapThunk env (ELambda formals body (Captures captureList)) =
-  let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-      trimmedEnv = newMinimalEnv slotsPtr slotCount
+  let (slotsPtr, slotCount) = buildCSlots EnvClosure [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
+      trimmedEnv = newMinimalEnv EnvClosure slotsPtr slotCount
       bodyBcIdx = unsafePerformIO (compileExpr body)
       evalFormals = unsafePerformIO (compileFormalsToEval formals)
    in evaluated (VLambda trimmedEnv evalFormals bodyBcIdx)
 cheapThunk env (ELambda formals body (CapturesWithScopes captureList)) =
-  let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-      (withArr, withCount) = withScopesForCapture env
-      trimmedEnv = newCEnv slotsPtr slotCount Nothing Nothing withArr withCount
+  let (slotsPtr, slotCount) = buildCSlots EnvClosure [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
+      (withArr, withCount) = withScopesForCapture EnvClosure env
+      trimmedEnv = newCEnv EnvClosure slotsPtr slotCount Nothing Nothing withArr withCount
       bodyBcIdx = unsafePerformIO (compileExpr body)
       evalFormals = unsafePerformIO (compileFormalsToEval formals)
    in evaluated (VLambda trimmedEnv evalFormals bodyBcIdx)
@@ -1092,18 +1083,18 @@ newComputedAttrsPtr cset =
     $ cset
     `seq` cthunkNewComputedAttrs (castPtr cset)
 
--- | Build a C-allocated slot array from a list of t'Thunk' values.
--- Each thunk is converted to 'CThunkPtr' via 'thunkToCPtr'.
--- Returns the C array pointer and the slot count.
+-- | Build a C-allocated slot array, for an env at a site, from a list of
+-- t'Thunk' values.  Each thunk is converted to 'CThunkPtr' via
+-- 'thunkToCPtr'.  Returns the C array pointer and the slot count.
 -- Uses 'unsafePerformIO' - safe because allocation is idempotent.
 {-# NOINLINE buildCSlots #-}
-buildCSlots :: [Thunk] -> (Ptr CThunkPtr, Int)
-buildCSlots thunks = unsafePerformIO $ do
+buildCSlots :: EnvSite -> [Thunk] -> (Ptr CThunkPtr, Int)
+buildCSlots site thunks = unsafePerformIO $ do
   let n = length thunks
   if n == 0
     then pure (nullPtr, 0)
     else do
-      arr <- checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots (fromIntegral n)
+      arr <- checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots site (fromIntegral n)
       pokeSlots arr 0 thunks
       pure (arr, n)
   where
@@ -1117,10 +1108,11 @@ buildCSlots thunks = unsafePerformIO $ do
 -- are made against that env, and the slots are filled last, as upstream
 -- allocates @env2@ before it fills the values (@ExprLet::eval@,
 -- @ExprAttrs::eval@ and @EvalState::callFunction@, eval.cc at 2.24.9).
--- @mkEnv@ receives the slot array and its size; @mkThunks@ answers one
--- thunk per slot, in slot order, and must not read the frame's own
--- slots, which are not all filled until this returns ('mkThunkBc' does
--- not).  Answers the env and those thunks.
+-- The slots are allocated for an env at the site given, which @mkEnv@
+-- builds there too; it receives the slot array and its size.
+-- @mkThunks@ answers one thunk per slot, in slot order, and must not read
+-- the frame's own slots, which are not all filled until this returns
+-- ('mkThunkBc' does not).  Answers the env and those thunks.
 --
 -- The allocations run under 'unsafePerformIO', which is safe because the
 -- slots and the env are fresh arena memory nothing else can see until
@@ -1128,19 +1120,20 @@ buildCSlots thunks = unsafePerformIO $ do
 -- functions that build the env and the thunks, so no transformation can
 -- share one frame between calls that build different ones.
 {-# NOINLINE tieFrame #-}
-tieFrame :: Int -> (Ptr CThunkPtr -> Int -> Env) -> (Env -> [Thunk]) -> (Env, [Thunk])
-tieFrame slotCount mkEnv mkThunks = unsafePerformIO $ do
-  slots <- newSlotArray slotCount
+tieFrame :: EnvSite -> Int -> (Ptr CThunkPtr -> Int -> Env) -> (Env -> [Thunk]) -> (Env, [Thunk])
+tieFrame site slotCount mkEnv mkThunks = unsafePerformIO $ do
+  slots <- newSlotArray site slotCount
   let !env = mkEnv slots slotCount
       thunks = mkThunks env
   forM_ (zip [0 .. slotCount - 1] thunks) $ \(i, thunk) ->
     pokeElemOff slots i (thunkToCPtr thunk)
   pure (env, thunks)
 
--- | A zeroed C slot array of the given size, or 'nullPtr' for none.
-newSlotArray :: Int -> IO (Ptr CThunkPtr)
-newSlotArray 0 = pure nullPtr
-newSlotArray n = checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots (fromIntegral n)
+-- | A zeroed C slot array of the given size for an env at a site, or
+-- 'nullPtr' for none.
+newSlotArray :: EnvSite -> Int -> IO (Ptr CThunkPtr)
+newSlotArray _ 0 = pure nullPtr
+newSlotArray site n = checkedCPtr "nn_env_alloc_slots" =<< cenvAllocSlots site (fromIntegral n)
 
 -- | A value's type as an error message names it: upstream's @showType@ on
 -- a value (eval.cc at 2.24.9, the same in 2.33.2), which every type error

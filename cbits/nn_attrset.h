@@ -31,6 +31,9 @@
  * Values are NOT freed by nn_attrset_free: they are cells of the thunk
  * arena, which frees them.
  *
+ * Every constructor names its site, the construct or builtin that makes
+ * the set (nn_stats.h), under which the census counts it.
+ *
  * Counts and indices are uint32_t.  A set holds at most
  * NN_ATTRSET_MAX_ENTRIES entries, the ceiling upstream's Bindings has
  * (its size_t is uint32_t), so every index is below NN_ATTRSET_NOT_FOUND.
@@ -58,9 +61,10 @@ typedef struct nn_attrset nn_attrset_t;
 
 /* --- Lifecycle --- */
 
-/* Allocate a new empty attribute set with space for `capacity` entries
- * (0 picks a small default).  Returns NULL on allocation failure. */
-nn_attrset_t *nn_attrset_new(uint32_t capacity);
+/* Allocate a new empty attribute set at `site` with space for `capacity`
+ * entries (0 picks a small default).  Returns NULL on allocation
+ * failure. */
+nn_attrset_t *nn_attrset_new(uint32_t capacity, uint32_t site);
 
 /* Free the attribute set structure.  Does NOT free the values, which the
  * thunk arena owns. */
@@ -122,23 +126,26 @@ void nn_attrset_free_all(void);
 
 /* --- Set operations --- */
 
-/* Create a new set that is the right-biased union of `a` and `b`
- * (keys in `b` override `a`, positions with them).  Both inputs must be
- * frozen.
+/* Create a new set at `site` that is the right-biased union of `a` and
+ * `b` (keys in `b` override `a`, positions with them).  Both inputs must
+ * be frozen.
  * The result is returned frozen and is arena-tracked (freed by
  * nn_attrset_free_all) - do NOT pass it to nn_attrset_free.  Returns
  * NULL when the union would pass NN_ATTRSET_MAX_ENTRIES or an
  * allocation fails. */
-nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b);
+nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
+                               uint32_t site);
 
-/* Create a new set with the given keys removed.  Input must be frozen.
+/* Create a new set at `site` with the given keys removed.  Input must be
+ * frozen.
  * The result is returned frozen and is arena-tracked (freed by
  * nn_attrset_free_all) - do NOT pass it to nn_attrset_free.  Returns
  * NULL when an allocation fails. */
 nn_attrset_t *nn_attrset_remove_keys(
     const nn_attrset_t *set,
     const nn_symbol_t *keys,
-    uint32_t key_count);
+    uint32_t key_count,
+    uint32_t site);
 
 /* --- Census (nn_stats.h) --- */
 

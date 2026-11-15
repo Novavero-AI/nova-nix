@@ -2,7 +2,7 @@
  * nn_list.c - Contiguous array of thunk pointers for lists.
  *
  * Each nn_list_t is a small header (malloc'd, tracked) pointing to
- * a contiguous items array (page-allocated via nn_env_alloc_slots).
+ * a contiguous items array (page-allocated via nn_env_alloc_items).
  * Bulk cleanup frees all headers; the page allocator frees items.
  */
 
@@ -46,11 +46,11 @@ nn_list_new(nn_list_t **out, uint32_t count)
     if (!list) return -1;
 
     /* Items array via the env page allocator (O(1) bump allocation).
-     * nn_env_alloc_slots returns void**, which we cast to nn_thunk**.
+     * nn_env_alloc_items returns void**, which we cast to nn_thunk**.
      * All slots are zero-initialized (NULL pointers).  When tracking
      * fails the items array stays in its page, which only nn_env_destroy
      * releases. */
-    list->items = (struct nn_thunk **)nn_env_alloc_slots(count);
+    list->items = (struct nn_thunk **)nn_env_alloc_items(count);
     list->count = count;
 
     if (!list->items || nn_list_track(list) != 0) {

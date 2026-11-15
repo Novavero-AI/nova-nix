@@ -9,6 +9,9 @@
  * from a page-based bump allocator.  Nothing is individually freed -
  * nn_env_destroy() tears down everything at eval end.
  *
+ * Every allocation for an env names its site, the construct or builtin
+ * that makes the env (nn_stats.h), under which the census counts it.
+ *
  * Lifecycle: nn_env_init() before evaluation, nn_env_destroy() after.
  * Not thread-safe - single-threaded evaluation only.
  */
@@ -52,11 +55,16 @@ int nn_env_live(void);
  * All pointers returned by any nn_env_* function become invalid. */
 void nn_env_destroy(void);
 
-/* --- Slot allocation (unchanged from original API) --- */
+/* --- Slot allocation --- */
 
-/* Allocate an array of `count` void* pointers.  O(1) amortized.
- * All slots initialized to NULL.  Returns NULL if count is 0. */
-void **nn_env_alloc_slots(uint32_t count);
+/* Allocate an array of `count` void* pointers for an env at `site`.
+ * O(1) amortized.  All slots initialized to NULL.  Returns NULL if count
+ * is 0. */
+void **nn_env_alloc_slots(uint32_t count, uint32_t site);
+
+/* nn_env_alloc_slots for a list's items array (nn_list.h), which no env
+ * site counts. */
+void **nn_env_alloc_items(uint32_t count);
 
 /* --- Env constructors (all arena-allocated) --- */
 
@@ -64,22 +72,27 @@ void **nn_env_alloc_slots(uint32_t count);
  * Valid until nn_env_destroy().  Do not modify the returned struct. */
 nn_env_t *nn_env_empty(void);
 
+/* Each constructor takes the env's site.  The slots passed to one are
+ * counted as allocated with the env: every caller allocates them for it
+ * at the same site. */
+
 /* Full constructor: set all fields explicitly. */
 nn_env_t *nn_env_new(void **slots, uint32_t slot_count,
                      void *lazy_scope, nn_env_t *parent,
-                     void **with_scopes, uint32_t with_count);
+                     void **with_scopes, uint32_t with_count, uint32_t site);
 
 /* Child env with positional slots, inheriting parent's with-scopes.
  * lazy_scope = NULL. */
 nn_env_t *nn_env_from_slots(void **slots, uint32_t slot_count,
-                            nn_env_t *parent);
+                            nn_env_t *parent, uint32_t site);
 
 /* Copy base env with a new with-scope prepended (innermost position).
- * Allocates a new with-scopes array of size (base->with_count + 1). */
-nn_env_t *nn_env_push_with(nn_env_t *base, void *scope);
+ * Allocates a new with-scopes array of size (base->with_count + 1) and
+ * shares base's slots, so it counts no slots of its own. */
+nn_env_t *nn_env_push_with(nn_env_t *base, void *scope, uint32_t site);
 
 /* Minimal env: slots only, no parent, no with-scopes, no lazy scope. */
-nn_env_t *nn_env_new_minimal(void **slots, uint32_t slot_count);
+nn_env_t *nn_env_new_minimal(void **slots, uint32_t slot_count, uint32_t site);
 
 /* --- Accessors --- */
 
@@ -104,11 +117,11 @@ void *nn_env_root_scope(const nn_env_t *env);
 
 /* --- With-scopes array allocation --- */
 
-/* Allocate an arena array of `count` void* pointers for with-scopes.
- * All entries initialized to NULL.  Returns NULL if count is 0, if the
- * array size would exceed the allocator's uint32 byte limit, or on
- * OOM - the caller must check. */
-void **nn_env_alloc_with_scopes(uint32_t count);
+/* Allocate an arena array of `count` void* pointers for with-scopes of
+ * an env at `site`.  All entries initialized to NULL.  Returns NULL if
+ * count is 0, if the array size would exceed the allocator's uint32 byte
+ * limit, or on OOM - the caller must check. */
+void **nn_env_alloc_with_scopes(uint32_t count, uint32_t site);
 
 /* --- Diagnostics --- */
 

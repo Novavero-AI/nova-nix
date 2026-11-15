@@ -4,8 +4,8 @@
  *
  * The census reads what the allocators keep anyway (the thunk blocks, the
  * env pages, the tracked sets, list headers, lambdas and strings, the
- * symbol table) and adds no work to any allocation, so a process that
- * never takes one pays nothing for it.
+ * symbol table), so a process that never takes one pays nothing for it
+ * beyond the test of nn_stats_counting below.
  *
  * A census is a session.  nn_stats_begin counts what is allocated and
  * indexes every object; the caller names roots and calls nn_stats_mark,
@@ -22,6 +22,12 @@
  *
  * One session at a time, between the arena's init and destroy, with no
  * allocation in the data layer while it is open.  Not thread-safe.
+ *
+ * Every env and attribute set allocation also names its site: the
+ * construct or builtin that makes it, which the evaluator numbers
+ * (Nix.Eval.AllocSite).  Once nn_stats_count_sites turns counting on, the
+ * allocators count each allocation under its site; until then an
+ * allocation reads nn_stats_counting and does nothing more.
  */
 
 #ifndef NN_STATS_H
@@ -41,9 +47,53 @@
 #define NN_STATS_KIND_COUNT 7
 
 /* A count no allocator keeps: the env pages hold env structs and arrays
- * side by side with no record of which is which, so the bytes are known
- * and the number of envs is not. */
+ * side by side with no record of which is which, so without counting by
+ * site from the arena's first allocation the bytes are known and the
+ * number of envs is not. */
 #define NN_STATS_UNCOUNTED UINT64_MAX
+
+/* --- Sites --- */
+
+/* How many sites the evaluator numbers for envs and for attribute sets:
+ * a site is below its bound.  Nix.Eval.AllocSite enumerates exactly
+ * these many. */
+#define NN_STATS_ENV_SITES 16u
+#define NN_STATS_SET_SITES 22u
+
+/* Envs by the slots allocated with them: one bucket for each count below
+ * NN_STATS_ENV_SIZES - 1, and the last for every larger count. */
+#define NN_STATS_ENV_SIZES 33u
+
+/* Nonzero while the allocators count by site. */
+extern int nn_stats_counting;
+
+/* Turn counting by site on, every figure from zero.  The counts cover
+ * every env and set allocated from then on; nn_stats_allocated reports
+ * the number of envs only when counting began before the env pages
+ * handed out their first byte. */
+void nn_stats_count_sites(void);
+
+/* The allocators' half, called only while nn_stats_counting is nonzero.
+ * An env counts once, with the slots allocated with it and its struct's
+ * bytes, and every other byte the env pages hand out for envs (slot and
+ * with-scope arrays) counts under the site it is for; a set counts once
+ * with the bytes it holds once built, and as shareable when it equals a
+ * set that already exists: one with no entries, which equals every empty
+ * set, or a union one of whose operands has none, which equals the
+ * other. */
+void nn_stats_count_env(uint32_t site, uint32_t slots, uint64_t bytes);
+void nn_stats_count_env_bytes(uint32_t site, uint64_t bytes);
+void nn_stats_count_set(uint32_t site, uint64_t bytes, int shareable);
+
+/* What counting has found since nn_stats_count_sites, zero where it has
+ * never run: per env site the envs, their slots and their bytes; per
+ * slot count the envs; per set site the sets, the shareable ones among
+ * them and their bytes.  Each writes its figures for the first `max`
+ * sites or slot counts and returns how many there are
+ * (NN_STATS_ENV_SITES, NN_STATS_ENV_SIZES, NN_STATS_SET_SITES). */
+uint32_t nn_stats_env_sites(uint64_t *envs, uint64_t *slots, uint64_t *bytes, uint32_t max);
+uint32_t nn_stats_env_sizes(uint64_t *envs, uint32_t max);
+uint32_t nn_stats_set_sites(uint64_t *sets, uint64_t *shareable, uint64_t *bytes, uint32_t max);
 
 /* --- Session --- */
 
@@ -58,7 +108,8 @@ void nn_stats_end(void);
 /* --- What is allocated --- */
 
 /* Objects and the bytes they hold, by kind (NN_STATS_KIND_COUNT entries
- * each).  The env count is NN_STATS_UNCOUNTED. */
+ * each).  The env count is NN_STATS_UNCOUNTED unless counting by site
+ * has covered every env (nn_stats_count_sites). */
 void nn_stats_allocated(uint64_t *counts, uint64_t *bytes);
 
 /* Bytes the allocators hold that no object does: block and page headers

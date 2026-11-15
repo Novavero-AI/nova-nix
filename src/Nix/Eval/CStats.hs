@@ -9,6 +9,11 @@
 -- and writes nothing in the data layer, and it adds no work to any
 -- allocation, so a process that never takes a census pays nothing for it.
 --
+-- Once 'countSites' turns counting on, the allocators also count each
+-- environment and attribute set under its site ("Nix.Eval.AllocSite"),
+-- which 'siteCounts' and every census after it read.  With counting off,
+-- an allocation tests one C flag and counts nothing.
+--
 -- What it reaches is exact for the roots it is given, and how close that
 -- is to what the process still uses depends on the roots.  Haskell holds
 -- C pointers in values the C side cannot enumerate, so an object only
@@ -26,6 +31,16 @@ module Nix.Eval.CStats
     -- * Figures
     Figures (..),
     Census (..),
+
+    -- * Counting by site
+    EnvSize (..),
+    EnvSiteFigures (..),
+    SetSiteFigures (..),
+    SiteCounts (..),
+    countSites,
+    siteCounts,
+    envSitesCounted,
+    setSitesCounted,
 
     -- * Roots
     CRoot (..),
@@ -54,6 +69,7 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (castPtrToStablePtr, deRefStablePtr)
 import Foreign.Storable (peek, peekElemOff)
 import GHC.Clock (getMonotonicTime)
+import Nix.Eval.AllocSite (EnvSite, SetSite, envSiteIndex, envSiteName, setSiteIndex, setSiteName)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CStatus (CStatusError (..))
 import Nix.Eval.Types (AttrSet (..), BuiltinArg (..), Env (..), NixValue (..), Thunk (..))
@@ -114,6 +130,21 @@ foreign import ccall unsafe "nn_stats_visited"
 foreign import ccall safe "nn_stats_reached_set_sizes"
   c_nn_stats_reached_set_sizes :: Ptr Word32 -> Ptr Word64 -> Word32 -> Ptr Word32 -> IO CInt
 
+foreign import ccall unsafe "nn_stats_count_sites"
+  c_nn_stats_count_sites :: IO ()
+
+foreign import ccall unsafe "&nn_stats_counting"
+  c_nn_stats_counting :: Ptr CInt
+
+foreign import ccall unsafe "nn_stats_env_sites"
+  c_nn_stats_env_sites :: Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> Word32 -> IO Word32
+
+foreign import ccall unsafe "nn_stats_env_sizes"
+  c_nn_stats_env_sizes :: Ptr Word64 -> Word32 -> IO Word32
+
+foreign import ccall unsafe "nn_stats_set_sites"
+  c_nn_stats_set_sites :: Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> Word32 -> IO Word32
+
 -- ---------------------------------------------------------------------------
 -- Kinds of object
 -- ---------------------------------------------------------------------------
@@ -169,8 +200,9 @@ kindNames = PerKind "thunks" "envs" "attrsets" "lists" "lambdas" "ctxstrs" "symb
 -- | Objects of one kind and the bytes they hold from the allocator.
 data Figures = Figures
   { -- | How many, or 'Nothing' where no allocator keeps a count: the env
-    -- pages hold env structs and arrays side by side, so the envs
-    -- allocated are known in bytes and not in number.
+    -- pages hold env structs and arrays side by side, so unless counting
+    -- by site ('countSites') has covered every env, the envs allocated
+    -- are known in bytes and not in number.
     figuresCount :: !(Maybe Word64),
     figuresBytes :: !Word64
   }
@@ -212,9 +244,126 @@ data Census = Census
     -- included.
     censusMarkSeconds :: !Double,
     -- | The reached attribute sets by their number of entries.
-    censusSetSizes :: !(Map Word32 Word64)
+    censusSetSizes :: !(Map Word32 Word64),
+    -- | What counting by site has found, when it is on.
+    censusSites :: !(Maybe SiteCounts)
   }
   deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- Counting by site
+-- ---------------------------------------------------------------------------
+
+-- | The size of an environment: the slots allocated with it.
+data EnvSize
+  = -- | Exactly this many.
+    EnvSlots !Word32
+  | -- | This many or more: the sizes from @NN_STATS_ENV_SIZES@ - 1 on
+    -- share one count.
+    EnvSlotsAtLeast !Word32
+  deriving (Eq, Ord, Show)
+
+-- | The environments one site allocated.
+data EnvSiteFigures = EnvSiteFigures
+  { -- | How many.
+    envSiteEnvs :: !Word64,
+    -- | The slots allocated with them.
+    envSiteSlots :: !Word64,
+    -- | Every byte of the env pages they took: structs, slot arrays and
+    -- with-scope arrays.
+    envSiteBytes :: !Word64
+  }
+  deriving (Eq, Show)
+
+-- | The attribute sets one site allocated.
+data SetSiteFigures = SetSiteFigures
+  { -- | How many.
+    setSiteSets :: !Word64,
+    -- | Those equal to a set that already existed: one with no entries,
+    -- or a union one of whose operands had none.
+    setSiteShareable :: !Word64,
+    -- | Their bytes once built: headers, keys, positions and values.
+    setSiteBytes :: !Word64
+  }
+  deriving (Eq, Show)
+
+-- | What counting by site has found since 'countSites'.
+data SiteCounts = SiteCounts
+  { -- | Every env site, with what it allocated.
+    sitesEnvs :: !(Map EnvSite EnvSiteFigures),
+    -- | The environments allocated, by size; sizes none had are absent.
+    sitesEnvSizes :: !(Map EnvSize Word64),
+    -- | Every set site, with what it allocated.
+    sitesSets :: !(Map SetSite SetSiteFigures)
+  }
+  deriving (Eq, Show)
+
+-- | @NN_STATS_ENV_SIZES@: the buckets of environments by size, the last
+-- for every size from its index on.
+envSizeBuckets :: Word32
+envSizeBuckets = 33
+
+-- | The size from which environments share one bucket.
+envSizeOpen :: Word32
+envSizeOpen = envSizeBuckets - 1
+
+-- | Turn counting by site on, every count from zero.  Turned on before the
+-- first environment is allocated, it covers every one, and a census then
+-- reports their number.
+countSites :: IO ()
+countSites = c_nn_stats_count_sites
+
+-- | What counting by site has found, or 'Nothing' while it is off.
+siteCounts :: IO (Maybe SiteCounts)
+siteCounts = do
+  counting <- peek c_nn_stats_counting
+  if counting == 0
+    then pure Nothing
+    else do
+      envs <- readSites envSiteCount c_nn_stats_env_sites
+      sizes <- allocaArray (fromIntegral envSizeBuckets) $ \buf -> do
+        buckets <- c_nn_stats_env_sizes buf envSizeBuckets
+        counts <- peekArray (fromIntegral (min buckets envSizeBuckets)) buf
+        pure (Map.fromList [(bucket i, n) | (i, n) <- zip [0 ..] counts, n /= 0])
+      sets <- readSites setSiteCount c_nn_stats_set_sites
+      pure (Just (SiteCounts (siteMap envSiteIndex envFigures envs) sizes (siteMap setSiteIndex setFigures sets)))
+  where
+    bucket i
+      | i < envSizeOpen = EnvSlots i
+      | otherwise = EnvSlotsAtLeast envSizeOpen
+    envFigures (envs, slots, bytes) = EnvSiteFigures envs slots bytes
+    setFigures (sets, shareable, bytes) = SetSiteFigures sets shareable bytes
+    siteMap index figures counted =
+      Map.fromList [(site, figures (Map.findWithDefault (0, 0, 0) (index site) counted)) | site <- [minBound .. maxBound]]
+
+-- | How many env sites the C side counts, which must be every 'EnvSite'.
+envSitesCounted :: IO Word32
+envSitesCounted = c_nn_stats_env_sites nullPtr nullPtr nullPtr 0
+
+-- | How many set sites the C side counts, which must be every 'SetSite'.
+setSitesCounted :: IO Word32
+setSitesCounted = c_nn_stats_set_sites nullPtr nullPtr nullPtr 0
+
+-- | The number of sites the evaluator names.
+envSiteCount, setSiteCount :: Word32
+envSiteCount = fromIntegral (length [minBound .. maxBound :: EnvSite])
+setSiteCount = fromIntegral (length [minBound .. maxBound :: SetSite])
+
+-- | Three figures per site, keyed by site number, from a C function that
+-- fills three arrays for the first @count@ sites and answers how many it
+-- counts.
+readSites ::
+  Word32 ->
+  (Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> Word32 -> IO Word32) ->
+  IO (Map Word32 (Word64, Word64, Word64))
+readSites count fill =
+  allocaArray n $ \first -> allocaArray n $ \second -> allocaArray n $ \third -> do
+    counted <- fill first second third count
+    let k = fromIntegral (min counted count)
+    rows <- zip3 <$> peekArray k first <*> peekArray k second <*> peekArray k third
+    pure (Map.fromList (zip [0 ..] rows))
+  where
+    n = fromIntegral count
 
 -- ---------------------------------------------------------------------------
 -- Roots
@@ -286,6 +435,7 @@ takeCensus roots = do
       reached <- readFigures c_nn_stats_reached
       (objects, bytes, unplaced, stablePtrs) <- readVisited
       sizes <- readSetSizes
+      sites <- siteCounts
       pure $ case (marked, sizes) of
         (False, _) -> Left (CAllocationFailed "nn_stats_mark" "the mark's work stack could not grow")
         (_, Nothing) -> Left (CAllocationFailed "nn_stats_reached_set_sizes" "the set sizes could not be sorted")
@@ -303,7 +453,8 @@ takeCensus roots = do
                 censusUnplaced = unplaced,
                 censusIndexSeconds = indexed - started,
                 censusMarkSeconds = finished - indexed,
-                censusSetSizes = setSizes
+                censusSetSizes = setSizes,
+                censusSites = sites
               }
 
 -- | Mark from the roots, then from what each StablePtr-held value the
@@ -373,7 +524,9 @@ readSetSizes = alloca $ \distinctPtr -> do
 
 -- | A census as lines of a name and a value, each set size a line of its
 -- own with the size and the number of reached sets that have it.  A
--- count no allocator keeps has no line.
+-- count no allocator keeps has no line.  With counting by site on, the
+-- environments' slots and sizes follow, the open size written @N+@, and
+-- then each site's figures, environments first.
 renderCensus :: Census -> BS.ByteString
 renderCensus census =
   BL.toStrict . BB.toLazyByteString $
@@ -388,6 +541,7 @@ renderCensus census =
       <> field "mark.index-seconds" (seconds (censusIndexSeconds census))
       <> field "mark.seconds" (seconds (censusMarkSeconds census))
       <> foldMap setSize (Map.toAscList (censusSetSizes census))
+      <> foldMap siteLines (censusSites census)
   where
     kindLines name allocated reached =
       figureLines (name <> ".allocated") allocated <> figureLines (name <> ".reached") reached
@@ -398,6 +552,25 @@ renderCensus census =
     seconds s = BB.string7 (showFFloat (Just secondsDigits) s "")
     setSize (size, count) =
       field "attrsets.reached.size" (BB.word32Dec size <> BB.char7 ' ' <> BB.word64Dec count)
+    siteLines (SiteCounts envs sizes sets) =
+      field "envs.allocated.slots" (BB.word64Dec (sum (fmap envSiteSlots envs)))
+        <> foldMap envSize (Map.toAscList sizes)
+        <> foldMap envSite (Map.toAscList envs)
+        <> foldMap setSite (Map.toAscList sets)
+    envSize (size, count) =
+      field "envs.allocated.size" (sizeName size <> BB.char7 ' ' <> BB.word64Dec count)
+    sizeName (EnvSlots n) = BB.word32Dec n
+    sizeName (EnvSlotsAtLeast n) = BB.word32Dec n <> BB.char7 '+'
+    envSite (site, EnvSiteFigures envs slots bytes) =
+      let prefix = "envs.site." <> envSiteName site
+       in field (prefix <> ".count") (BB.word64Dec envs)
+            <> field (prefix <> ".slots") (BB.word64Dec slots)
+            <> field (prefix <> ".bytes") (BB.word64Dec bytes)
+    setSite (site, SetSiteFigures sets shareable bytes) =
+      let prefix = "attrsets.site." <> setSiteName site
+       in field (prefix <> ".count") (BB.word64Dec sets)
+            <> field (prefix <> ".shareable") (BB.word64Dec shareable)
+            <> field (prefix <> ".bytes") (BB.word64Dec bytes)
 
 -- | Decimal places of a time in 'renderCensus': microseconds.
 secondsDigits :: Int

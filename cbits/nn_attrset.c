@@ -20,6 +20,7 @@
 
 #include "nn_attrset.h"
 #include "nn_assert.h"
+#include "nn_stats.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -141,7 +142,9 @@ static uint32_t bsearch_key(const nn_symbol_t *keys, uint32_t count, nn_symbol_t
 
 /* --- Lifecycle --- */
 
-nn_attrset_t *nn_attrset_new(uint32_t capacity)
+/* A tracked set with room for `capacity` entries (0 picks a small
+ * default), not yet counted under any site. */
+static nn_attrset_t *attrset_alloc(uint32_t capacity)
 {
     nn_attrset_t *set = (nn_attrset_t *)malloc(sizeof(nn_attrset_t));
     if (!set) return NULL;
@@ -161,6 +164,21 @@ nn_attrset_t *nn_attrset_new(uint32_t capacity)
         free(set);
         return NULL;
     }
+    return set;
+}
+
+/* Count a set just allocated at `site` while the census counts sites
+ * (nn_stats.h).  The evaluator sizes every set for the entries it puts
+ * in, so its bytes now are its bytes once built. */
+static void count_at(uint32_t site, const nn_attrset_t *set, int shareable)
+{
+    if (nn_stats_counting) nn_stats_count_set(site, nn_attrset_bytes(set), shareable);
+}
+
+nn_attrset_t *nn_attrset_new(uint32_t capacity, uint32_t site)
+{
+    nn_attrset_t *set = attrset_alloc(capacity);
+    if (set) count_at(site, set, capacity == 0);
     return set;
 }
 
@@ -339,7 +357,8 @@ const nn_symbol_t *nn_attrset_keys_ptr(const nn_attrset_t *set)
 
 /* --- Set operations --- */
 
-nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b)
+nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
+                               uint32_t site)
 {
     /* The merge-join below assumes both inputs are sorted; every set this
      * module produces is frozen (hence sorted), so guard it in debug. */
@@ -351,8 +370,9 @@ nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b)
     uint64_t total = (uint64_t)a->count + b->count;
     uint32_t cap = total > NN_ATTRSET_MAX_ENTRIES
                        ? NN_ATTRSET_MAX_ENTRIES : (uint32_t)total;
-    nn_attrset_t *result = nn_attrset_new(cap);
+    nn_attrset_t *result = attrset_alloc(cap);
     if (!result) return NULL;
+    count_at(site, result, a->count == 0 || b->count == 0);
     uint32_t ia = 0, ib = 0;
 
     /* A refused result stays tracked, so teardown frees it. */
@@ -388,11 +408,13 @@ nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b)
 nn_attrset_t *nn_attrset_remove_keys(
     const nn_attrset_t *set,
     const nn_symbol_t *keys,
-    uint32_t key_count)
+    uint32_t key_count,
+    uint32_t site)
 {
     NN_ASSERT(set->frozen, "nn_attrset_remove_keys: input must be frozen");
-    nn_attrset_t *result = nn_attrset_new(set->count);
+    nn_attrset_t *result = attrset_alloc(set->count);
     if (!result) return NULL;
+    count_at(site, result, set->count == 0);
     uint32_t i;
 
     for (i = 0; i < set->count; i++) {

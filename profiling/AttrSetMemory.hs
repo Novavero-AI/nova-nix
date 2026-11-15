@@ -36,6 +36,7 @@ import Data.Primitive.PrimArray (PrimArray, newPrimArray, primArrayFromListN, si
 import Data.Primitive.SmallArray (SmallArray, newSmallArray, runSmallArray)
 import Data.Word (Word32, Word64)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
+import Nix.Eval.AllocSite (SetSite (SetLiteral))
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetInsert, cattrsetNew)
 import Nix.Eval.CThunk (cthunkNull)
 import Nix.Eval.SourcePos (PosIdx (..))
@@ -170,8 +171,9 @@ buildC :: [(Int, Int)] -> IO (PrimArray CAttrSet)
 buildC sizes = do
   let each = perSet sizes
   slots <- newPrimArray (length each)
+  -- The benchmark never counts by site, so the site is a placeholder.
   forM_ (zip [0 ..] each) $ \(i, size) -> do
-    set <- cattrsetNew size
+    set <- cattrsetNew SetLiteral size
     forM_ (zip (keysOf size) [0 ..]) $ \(key, pos) ->
       cattrsetInsert set (Symbol key) (PosIdx pos) cthunkNull
     cattrsetFreeze set

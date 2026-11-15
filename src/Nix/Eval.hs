@@ -133,6 +133,7 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
+import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, reservedApply1, reservedApply2, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
@@ -666,7 +667,7 @@ builtinTryEval arg = do
   pure $ case result of
     Right val ->
       VAttrs
-        ( attrSetFromMap $
+        ( attrSetFromMap SetTryEval $
             Map.fromList
               [ ("success", evaluated (VBool True)),
                 ("value", evaluated val)
@@ -674,7 +675,7 @@ builtinTryEval arg = do
         )
     Left _ ->
       VAttrs
-        ( attrSetFromMap $
+        ( attrSetFromMap SetTryEval $
             Map.fromList
               [ ("success", evaluated (VBool False)),
                 ("value", evaluated (VBool False))
@@ -695,7 +696,7 @@ evalBcLambda env bcIdx0 =
    in case unsafePerformIO (decodeBcFormals flags_ formalsOff) of
         Just formals ->
           withBcCaptureInfo captureOff $ \captureInfo ->
-            pure $! VLambda (buildCaptureEnv env captureInfo) formals bodyBcIdx
+            pure $! VLambda (buildCaptureEnv EnvClosure env captureInfo) formals bodyBcIdx
         Nothing -> corruptBytecode "formals type" flags_
 
 -- | Evaluate a select expression from bytecode.
@@ -809,31 +810,49 @@ evalBcAttrs env bcIdx0 =
 evalBcNonRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> m NixValue
 evalBcNonRecAttrs env bindings = do
   entries <- buildBcEntryMap cheapThunkBc env env bindings
-  pure (VAttrs (attrSetFromEntries entries))
+  pure (VAttrs (attrSetFromEntries SetLiteral entries))
+
+-- | The construct a binding frame belongs to.
+data FrameKind = LetFrame | RecFrame
+
+-- | The site of a frame's env.
+frameSite :: FrameKind -> EnvSite
+frameSite LetFrame = EnvLet
+frameSite RecFrame = EnvRec
+
+-- | The site of the env holding what a frame captures from outside it.
+frameCaptureSite :: FrameKind -> EnvSite
+frameCaptureSite LetFrame = EnvLetCapture
+frameCaptureSite RecFrame = EnvRecCapture
 
 -- | Build a let\/rec frame env, sharing the parent-chain and with-scope
 -- plumbing otherwise repeated across the positional and dynamic paths.  The
 -- frame's own bindings are positional slots (@slots@\/@slotCount@) or a lazy
 -- name-table @scope@; the parent and with-scopes come from the enclosing @env@
--- and @captureInfo@.
-newFrameEnv :: Env -> CaptureInfo -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> Env
-newFrameEnv env captureInfo slots slotCount scope =
-  newCEnv slots slotCount scope (Just (buildCaptureEnv env captureInfo)) withArr withCount
+-- and @captureInfo@.  Inlined, as 'tieBindingFrame' is, so that each caller's
+-- sites are constants and a frame allocates nothing in GHC's heap to name
+-- them.
+{-# INLINE newFrameEnv #-}
+newFrameEnv :: FrameKind -> Env -> CaptureInfo -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> Env
+newFrameEnv kind env captureInfo slots slotCount scope =
+  newCEnv (frameSite kind) slots slotCount scope (Just (buildCaptureEnv (frameCaptureSite kind) env captureInfo)) withArr withCount
   where
     (withArr, withCount) = case captureInfo of
       NoCaptureInfo -> envWithScopesRaw env
       Captures _ -> (nullPtr, 0)
-      CapturesWithScopes _ -> withScopesForCapture env
+      CapturesWithScopes _ -> withScopesForCapture (frameSite kind) env
 
 -- | The positional frame of a recursive attr set or a @let@ in @env@: the
 -- frame's env and the thunks in its slots, in declaration order, tied by
 -- 'tieFrame' as upstream's @ExprAttrs::eval@ and @ExprLet::eval@ tie
 -- @env2@.
-tieBindingFrame :: Env -> [BcBinding] -> CaptureInfo -> (Env, [Thunk])
-tieBindingFrame env bindings captureInfo =
+{-# INLINE tieBindingFrame #-}
+tieBindingFrame :: FrameKind -> Env -> [BcBinding] -> CaptureInfo -> (Env, [Thunk])
+tieBindingFrame kind env bindings captureInfo =
   tieFrame
+    (frameSite kind)
     (bcBindingSlotCount bindings)
-    (\slots slotCount -> newFrameEnv env captureInfo slots slotCount Nothing)
+    (\slots slotCount -> newFrameEnv kind env captureInfo slots slotCount Nothing)
     (\frame -> buildBcSlotThunks frame env bindings)
 
 -- | Evaluate a recursive attr set from bytecode bindings.
@@ -841,8 +860,8 @@ evalBcRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> CaptureInfo -> m NixVal
 evalBcRecAttrs env bindings captureInfo
   | allBcPositional bindings =
       -- Positional path: slots for variable lookup, CAttrSet for return.
-      let (_, thunkList) = tieBindingFrame env bindings captureInfo
-       in pure (VAttrs (attrSetFromEntries (buildBcEntryMapFromSlots bindings thunkList)))
+      let (_, thunkList) = tieBindingFrame RecFrame env bindings captureInfo
+       in pure (VAttrs (attrSetFromEntries SetRec (buildBcEntryMapFromSlots bindings thunkList)))
   | otherwise = do
       -- Dynamic-key path: the set has a ${dynamic} key, so names are not all
       -- known at compile time.  Not a corner-cutting fallback:
@@ -852,7 +871,7 @@ evalBcRecAttrs env bindings captureInfo
       -- vars, but not another dynamic key.  The result is the static bindings
       -- plus the dynamic (name -> value) pairs.
       let scopeCset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
-          recEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet scopeCset))
+          recEnv = newFrameEnv RecFrame env captureInfo nullPtr 0 (Just (AttrSet scopeCset))
           (staticBs, dynBs) = partition bcBindingIsStatic bindings
       staticEntries <- buildBcEntryMap mkThunkBc recEnv env staticBs
       let scopeFilled = fillCAttrSetValues scopeCset (Map.map entryThunk staticEntries)
@@ -861,7 +880,7 @@ evalBcRecAttrs env bindings captureInfo
       -- upstream ("dynamic attribute already defined"), never a merge.
       case Map.keys (Map.intersection dynEntries staticEntries) of
         (dupKey : _) -> throwEvalError ("dynamic attribute '" <> dupKey <> "' already defined")
-        [] -> pure (VAttrs (attrSetFromEntries (Map.union dynEntries staticEntries)))
+        [] -> pure (VAttrs (attrSetFromEntries SetRec (Map.union dynEntries staticEntries)))
 
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -875,7 +894,7 @@ evalBcLet env bcIdx0 =
           if allBcPositional bindings
             then
               -- Positional path: slots for O(1) lookup.
-              let (letEnv, _) = tieBindingFrame env bindings captureInfo
+              let (letEnv, _) = tieBindingFrame LetFrame env bindings captureInfo
                in evalBytecode letEnv bodyIdx
             else do
               -- Dynamic path: a dynamic key, which the parser refuses in a
@@ -883,7 +902,7 @@ evalBcLet env bcIdx0 =
               -- outside the parser reaches here.  Keys and values resolve
               -- in the let env, which the body also sees.
               let cset = buildCAttrSetKeys (bcBindingStaticKeys bindings)
-                  letEnv = newFrameEnv env captureInfo nullPtr 0 (Just (AttrSet cset))
+                  letEnv = newFrameEnv LetFrame env captureInfo nullPtr 0 (Just (AttrSet cset))
               entries <- buildBcEntryMap mkThunkBc letEnv env bindings
               let filled = fillCAttrSetValues cset (Map.map entryThunk entries)
                in filled `seq` evalBytecode letEnv bodyIdx
@@ -925,8 +944,8 @@ buildBcSlotThunks recEnv outerEnv = concatMap slotThunk
       -- Each thunk gets a minimal env with the from-value at slot 0.
       let fromThunk = mkThunkBc recEnv fromBcIdx
           mkInheritThunk (BcInheritedName _ _ selectBcIdx) =
-            let (sp, sc) = buildCSlots [fromThunk]
-                fromEnv = newMinimalEnv sp sc
+            let (sp, sc) = buildCSlots EnvInheritFrom [fromThunk]
+                fromEnv = newMinimalEnv EnvInheritFrom sp sc
              in mkThunkBc fromEnv selectBcIdx
        in map mkInheritThunk names
     -- Unreachable: allBcPositional guards this path.
@@ -973,8 +992,8 @@ buildBcEntryMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
       -- Create a small env with the from value at slot 0, then run the
       -- select the compiler made for name against it.
       let addInheritFrom a inherited@(BcInheritedName pos _ selectBcIdx) =
-            let (sp, sc) = buildCSlots [mkThunkBc thunkEnv fromBcIdx]
-                fromEnv = newMinimalEnv sp sc
+            let (sp, sc) = buildCSlots EnvInheritFrom [mkThunkBc thunkEnv fromBcIdx]
+                fromEnv = newMinimalEnv EnvInheritFrom sp sc
              in insertChecked a (inheritedNameText inherited) (AttrEntry pos (mkThunkBc fromEnv selectBcIdx))
        in foldM addInheritFrom acc names
 
@@ -1133,7 +1152,7 @@ pushLazyWithScope (Thunk thunkPtr) =
 {-# NOINLINE pushWithScopeRaw #-}
 pushWithScopeRaw :: Ptr () -> Env -> Env
 pushWithScopeRaw ptr (Env envPtr) =
-  Env (unsafePerformIO (checkedCPtr "nn_env_push_with" =<< cenvPushWith envPtr ptr))
+  Env (unsafePerformIO (checkedCPtr "nn_env_push_with" =<< cenvPushWith EnvWith envPtr ptr))
 
 -- ---------------------------------------------------------------------------
 -- Formals matching + env helpers (used by evalBcApp, applyValue, etc.)
@@ -1142,8 +1161,8 @@ pushWithScopeRaw ptr (Env envPtr) =
 -- | Match a lambda's formals against an argument thunk.
 matchFormals :: (MonadEval m) => Env -> EvalFormals -> Thunk -> m Env
 matchFormals closureEnv (EFName _) argThunk =
-  let (sp, sc) = buildCSlots [argThunk]
-   in pure (envFromSlots sp sc closureEnv)
+  let (sp, sc) = buildCSlots EnvCall [argThunk]
+   in pure (envFromSlots EnvCall sp sc closureEnv)
 matchFormals closureEnv (EFSet formals allowExtra) argThunk = do
   argVal <- force argThunk
   matchFormalSet closureEnv formals allowExtra argVal Nothing
@@ -1168,8 +1187,9 @@ matchFormalSet closureEnv formals allowExtra argVal atThunk =
       let atSlot = maybeToList atThunk
           (formalEnv, _) =
             tieFrame
+              EnvCallFormals
               (length atSlot + length formalValues)
-              (\slots slotCount -> envFromSlots slots slotCount closureEnv)
+              (\slots slotCount -> envFromSlots EnvCallFormals slots slotCount closureEnv)
               (\frame -> atSlot ++ map ($ frame) formalValues)
       pure formalEnv
     _ -> throwEvalError ("function expects a set argument, got " <> typeName argVal)
@@ -1201,19 +1221,19 @@ formalSlots attrs formals =
       Just thunk -> Right (const thunk)
       Nothing -> maybe (Left name) (Right . flip mkThunkBc) defBcIdx
 
--- | Build capture environment from capture info.
+-- | Build capture environment from capture info, at a site.
 -- NoCaptureInfo: no trimming, use env as-is.
 -- Captures: build minimal env from captured slots.
 -- CapturesWithScopes: build minimal env + copy with-scopes.
-buildCaptureEnv :: Env -> CaptureInfo -> Env
-buildCaptureEnv env NoCaptureInfo = env
-buildCaptureEnv env (Captures captureList) =
-  let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-   in newMinimalEnv slotsPtr slotCount
-buildCaptureEnv env (CapturesWithScopes captureList) =
-  let (slotsPtr, slotCount) = buildCSlots [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
-      (withArr, withCount) = withScopesForCapture env
-   in newCEnv slotsPtr slotCount Nothing Nothing withArr withCount
+buildCaptureEnv :: EnvSite -> Env -> CaptureInfo -> Env
+buildCaptureEnv _ env NoCaptureInfo = env
+buildCaptureEnv site env (Captures captureList) =
+  let (slotsPtr, slotCount) = buildCSlots site [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
+   in newMinimalEnv site slotsPtr slotCount
+buildCaptureEnv site env (CapturesWithScopes captureList) =
+  let (slotsPtr, slotCount) = buildCSlots site [envLookupResolved lvl idx env | (lvl, idx) <- captureList]
+      (withArr, withCount) = withScopesForCapture site env
+   in newCEnv site slotsPtr slotCount Nothing Nothing withArr withCount
 
 -- ---------------------------------------------------------------------------
 -- Builtin registry (single-definition-site for all builtins)
@@ -1888,7 +1908,7 @@ builtinAttrValues other =
 -- gives it.
 builtinListToAttrs :: (MonadEval m) => NixValue -> m NixValue
 builtinListToAttrs (VList cl) =
-  VAttrs . attrSetFromEntries <$> foldM addListToAttrsElement Map.empty (map Thunk (clistThunks cl))
+  VAttrs . attrSetFromEntries SetListToAttrs <$> foldM addListToAttrsElement Map.empty (map Thunk (clistThunks cl))
 builtinListToAttrs other =
   addErrorTrace (pure "while evaluating the argument passed to builtins.listToAttrs") (throwEvalError (expectedList other))
 
@@ -1963,7 +1983,7 @@ builtinUnsafeGetAttrPos nameVal setArg = do
 positionValue :: PosIdx -> NixValue
 positionValue idx = case lookupPos idx of
   Just (PosInFile file line column) ->
-    VAttrs . attrSetFromMap $
+    VAttrs . attrSetFromMap SetPosition $
       Map.fromList
         [ ("column", evaluated (VInt (fromIntegral column))),
           ("file", evaluated (mkStr file)),
@@ -1977,7 +1997,7 @@ positionValue idx = case lookupPos idx of
 builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinRemoveAttrs (VAttrs attrs) (VList cl) = do
   keys <- mapM (force . Thunk >=> attrNameOf "builtins.removeAttrs") (clistThunks cl)
-  pure (VAttrs (attrSetRemoveKeys keys attrs))
+  pure (VAttrs (attrSetRemoveKeys SetRemoveAttrs keys attrs))
 builtinRemoveAttrs (VAttrs _) other =
   throwEvalError ("builtins.removeAttrs: expected a list, got " <> typeName other)
 builtinRemoveAttrs other _ =
@@ -1991,7 +2011,7 @@ builtinIntersectAttrs (VAttrs a) (VAttrs b) =
   -- position included, as upstream copies it.
   let keysA = attrSetKeys a
       result = Map.fromList [(k, entry) | k <- keysA, Just entry <- [attrSetLookupEntry k b]]
-   in pure (VAttrs (attrSetFromEntries result))
+   in pure (VAttrs (attrSetFromEntries SetIntersectAttrs result))
 builtinIntersectAttrs (VAttrs _) other =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 builtinIntersectAttrs other _ =
@@ -2049,7 +2069,7 @@ builtinMap funcArg (VList cl)
   | otherwise = do
       _ <- forceFunctionArg funcArg
       let fnThunk = argAsThunk funcArg
-      pure (VList (clistFromThunks (map (thunkToCPtr . deferApplyThunk fnThunk . Thunk) (clistThunks cl))))
+      pure (VList (clistFromThunks (map (thunkToCPtr . deferApplyThunk EnvMap fnThunk . Thunk) (clistThunks cl))))
 builtinMap _ other =
   throwEvalError ("builtins.map: expected a list, got " <> typeName other)
 
@@ -2086,7 +2106,7 @@ builtinGenList funcArg (VInt n)
       -- allocates an int and an app per element, so every element runs
       -- the same code.
       let fnThunk = argAsThunk funcArg
-          mkIndexThunk = thunkToCPtr . deferApplyThunk fnThunk . evaluated . VInt
+          mkIndexThunk = thunkToCPtr . deferApplyThunk EnvGenList fnThunk . evaluated . VInt
       pure (VList (clistFromThunks (map mkIndexThunk [0 .. n - 1])))
 builtinGenList _ other =
   throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
@@ -2145,7 +2165,7 @@ builtinConcatMap func (VList cl) = do
   -- Semi-eager: must force each application to discover list structure for
   -- concatenation, but element thunks within those sub-lists stay lazy.
   let thunks = map Thunk (clistThunks cl)
-      deferredApps = map (deferApply func) thunks
+      deferredApps = map (deferApply EnvConcatMap func) thunks
   results <- mapM force deferredApps
   concatted <- mapM extractList results
   pure (VList (clistFromThunks (map thunkToCPtr (concat concatted))))
@@ -2229,7 +2249,7 @@ builtinPartition predFn (VList cl) = do
   (rightThunks, wrongThunks) <- partitionThunks predFn thunks
   pure
     ( VAttrs
-        ( attrSetFromMap $
+        ( attrSetFromMap SetPartition $
             Map.fromList
               [ ("right", evaluated (VList (clistFromThunks (map thunkToCPtr rightThunks)))),
                 ("wrong", evaluated (VList (clistFromThunks (map thunkToCPtr wrongThunks))))
@@ -2255,7 +2275,7 @@ builtinGroupBy :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGroupBy func (VList cl) = do
   let thunks = map Thunk (clistThunks cl)
   groups <- groupByCollect func thunks Map.empty
-  pure (VAttrs (attrSetFromMap (Map.map (evaluated . VList . clistFromThunks . map thunkToCPtr . reverse) groups)))
+  pure (VAttrs (attrSetFromMap SetGroupBy (Map.map (evaluated . VList . clistFromThunks . map thunkToCPtr . reverse) groups)))
 builtinGroupBy _ other =
   throwEvalError ("builtins.groupBy: expected a list, got " <> typeName other)
 
@@ -2345,16 +2365,16 @@ builtinSubstring _ _ _ =
 -- the thunk is forced.  Runs the reserved 'reservedApply1' in a
 -- self-contained env, upstream's @mkApp@.  Slot 0 = function, slot 1 =
 -- argument.
-deferApply :: NixValue -> Thunk -> Thunk
-deferApply func = deferApplyThunk (evaluated func)
+deferApply :: EnvSite -> NixValue -> Thunk -> Thunk
+deferApply site func = deferApplyThunk site (evaluated func)
 
 -- | 'deferApply' with the function already a thunk, so a builtin that
 -- makes one application per element shares one function thunk across
 -- them, as upstream's primops share @args[0]@.
-deferApplyThunk :: Thunk -> Thunk -> Thunk
-deferApplyThunk fnThunk argThunk =
-  let (sp, sc) = buildCSlots [fnThunk, argThunk]
-      env = newMinimalEnv sp sc
+deferApplyThunk :: EnvSite -> Thunk -> Thunk -> Thunk
+deferApplyThunk site fnThunk argThunk =
+  let (sp, sc) = buildCSlots site [fnThunk, argThunk]
+      env = newMinimalEnv site sp sc
    in mkThunkBc env reservedApply1
 
 -- | The non-copying path coercion: the path text verbatim, no context -
@@ -2522,7 +2542,7 @@ builtinGetContext :: (MonadEval m) => NixValue -> m NixValue
 builtinGetContext (VStr _ (StringContext ctx)) = do
   let grouped = groupContextByPath (Set.toList ctx)
       attrMap = Map.map contextEntryToAttrs grouped
-  pure (VAttrs (attrSetFromMap attrMap))
+  pure (VAttrs (attrSetFromMap SetGetContext attrMap))
 builtinGetContext other =
   throwEvalError ("builtins.getContext: expected a string, got " <> typeName other)
 
@@ -2562,7 +2582,7 @@ contextEntryToAttrs entry =
         [("path", evaluated (VBool True)) | cePath entry]
           ++ [("allOutputs", evaluated (VBool True)) | ceAllOutputs entry]
           ++ [("outputs", evaluated (VList (clistFromThunks [thunkToCPtr (evaluated (mkStr o)) | o <- ceOutputs entry]))) | not (null (ceOutputs entry))]
-   in evaluated (VAttrs (attrSetFromMap (Map.fromList fields)))
+   in evaluated (VAttrs (attrSetFromMap SetGetContext (Map.fromList fields)))
 
 -- | Append context entries to a string from an attrset.
 --
@@ -2708,12 +2728,12 @@ builtinMapAttrs funcArg (VAttrs attrs) =
   -- Eagerly builds all thunks via attrSetMapWithKey - with C arena thunks
   -- (~16 bytes each), this keeps all data off the GHC heap.
   -- Slot 0 = function, slot 1 = key, slot 2 = value.
-  pure (VAttrs (attrSetMapWithKey deferAttr attrs))
+  pure (VAttrs (attrSetMapWithKey SetMapAttrs deferAttr attrs))
   where
     fnThunk = argAsThunk funcArg
     deferAttr key valThunk =
-      let (sp, sc) = buildCSlots [fnThunk, evaluated (mkStr key), valThunk]
-          env = newMinimalEnv sp sc
+      let (sp, sc) = buildCSlots EnvMapAttrs [fnThunk, evaluated (mkStr key), valThunk]
+          env = newMinimalEnv EnvMapAttrs sp sc
        in mkThunkBc env reservedApply2
 builtinMapAttrs _ other =
   throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
@@ -2723,18 +2743,18 @@ builtinMapAttrs _ other =
 -- @__functionArgs@ (nixpkgs lib.functionArgs handles that in Nix).
 builtinFunctionArgs :: (MonadEval m) => NixValue -> m NixValue
 builtinFunctionArgs (VLambda _ formals _) = pure (formalsToAttrs formals)
-builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs (attrSetFromMap Map.empty))
+builtinFunctionArgs (VBuiltin _ _) = pure (VAttrs (attrSetFromMap SetFunctionArgs Map.empty))
 builtinFunctionArgs _ = throwEvalError "'functionArgs' requires a function"
 
 formalsToAttrs :: EvalFormals -> NixValue
-formalsToAttrs (EFName _) = VAttrs (attrSetFromMap Map.empty)
+formalsToAttrs (EFName _) = VAttrs (attrSetFromMap SetFunctionArgs Map.empty)
 formalsToAttrs (EFSet formals _) = formalsListToAttrs formals
 formalsToAttrs (EFNamedSet _ formals _) = formalsListToAttrs formals
 
 formalsListToAttrs :: [EvalFormal] -> NixValue
 formalsListToAttrs formals =
   VAttrs
-    $ attrSetFromMap
+    $ attrSetFromMap SetFunctionArgs
     $ Map.fromList
       [(efName f, evaluated (VBool (isJust (efDefault f)))) | f <- formals]
 
@@ -2748,7 +2768,7 @@ builtinZipAttrsWith func (VList cl) = do
       -- self-referencing lazy attrset that must be COMPUTED (holding the lazy
       -- result) before any individual attribute thunks are forced.
       resultPairs = map (deferZip (evaluated func)) (Map.toList merged)
-  pure (VAttrs (attrSetFromMap (Map.fromList resultPairs)))
+  pure (VAttrs (attrSetFromMap SetZipAttrsWith (Map.fromList resultPairs)))
   where
     forceToAttrSet thunk = do
       val <- force thunk
@@ -2759,8 +2779,8 @@ builtinZipAttrsWith func (VList cl) = do
     -- Slot 0 = function, slot 1 = name, slot 2 = values list.
     deferZip fnThunk (key, thunkList) =
       let valueList = VList (clistFromThunks (map thunkToCPtr thunkList))
-          (slots, slotCount) = buildCSlots [fnThunk, evaluated (mkStr key), evaluated valueList]
-          env = newMinimalEnv slots slotCount
+          (slots, slotCount) = buildCSlots EnvZipAttrsWith [fnThunk, evaluated (mkStr key), evaluated valueList]
+          env = newMinimalEnv EnvZipAttrsWith slots slotCount
        in (key, mkThunkBc env reservedApply2)
 builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
@@ -3070,7 +3090,7 @@ builtinParseDrvName val = do
   (name, version) <- parseName <$> structuredStringValue RefuseContext val
   pure
     ( VAttrs
-        ( attrSetFromMap $
+        ( attrSetFromMap SetParseDrvName $
             Map.fromList
               [ ("name", evaluated (mkStrBytes name)),
                 ("version", evaluated (mkStrBytes version))
@@ -3182,7 +3202,7 @@ jsonToValue json = case json of
   JsonFloat d -> VFloat d
   JsonString str -> mkStr str
   JsonArray items -> VList (clistFromThunks (map (thunkToCPtr . evaluated . jsonToValue) items))
-  JsonObject members -> VAttrs (attrSetFromMap (Map.map (evaluated . jsonToValue) members))
+  JsonObject members -> VAttrs (attrSetFromMap SetFromJSON (Map.map (evaluated . jsonToValue) members))
 
 -- | Upstream reads the algorithm with @forceStringNoCtx@ before it forces
 -- the string hashed, whose context it discards (primops.cc:4070-4075 at
@@ -3426,8 +3446,8 @@ builtinReadDir val = do
   -- Resolved only when an entry needs it, so a listing that types every
   -- entry costs nothing more.
   dir <- if any (isNothing . snd) entries then resolveSymlinks p else pure p
-  let entryValue name = maybe (deferApply (VBuiltin "readFileType" []) (evaluated (VPath (canonPathValue (dir <> "/" <> name))))) (evaluated . mkStr)
-  pure (VAttrs (attrSetFromMap (Map.fromList [(name, entryValue name fileType) | (name, fileType) <- entries])))
+  let entryValue name = maybe (deferApply EnvApply (VBuiltin "readFileType" []) (evaluated (VPath (canonPathValue (dir <> "/" <> name))))) (evaluated . mkStr)
+  pure (VAttrs (attrSetFromMap SetReadDir (Map.fromList [(name, entryValue name fileType) | (name, fileType) <- entries])))
 
 -- | A listed entry's type, or for an entry the listing gives no type, the
 -- type an lstat of the entry reads, which fails as @builtins.readFileType@
@@ -4194,7 +4214,7 @@ fetchGitResult submodules fields =
               (posixSecondsToUTCTime (fromIntegral (fcLastModified fields)))
           )
    in VAttrs
-        ( attrSetFromMap $
+        ( attrSetFromMap SetFetchGit $
             Map.fromList
               [ ("outPath", evaluated (VPath (canonPathValue (fcStorePath fields)))),
                 ("rev", evaluated (mkStr (fcRev fields))),
@@ -4735,7 +4755,7 @@ builtinDerivationStrict (VAttrs attrs) = do
         Map.fromList
           (("drvPath", evaluated (VStr (TE.encodeUtf8 drvPathText) drvPathCtx)) : map outputEntry outPaths)
 
-  pure (VAttrs (attrSetFromMap resultAttrs))
+  pure (VAttrs (attrSetFromMap SetDerivationStrict resultAttrs))
 builtinDerivationStrict other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
@@ -5313,7 +5333,7 @@ tomlToNix val = case val of
   TOMLFloat d -> VFloat d
   TOMLBool b -> VBool b
   TOMLArray xs -> VList (clistFromThunks (map (thunkToCPtr . evaluated . tomlToNix) xs))
-  TOMLTable m -> VAttrs (attrSetFromMap (Map.map (evaluated . tomlToNix) m))
+  TOMLTable m -> VAttrs (attrSetFromMap SetFromTOML (Map.map (evaluated . tomlToNix) m))
 
 -- | Parse all lines of a TOML document into a table.
 parseTOMLDoc :: [Text] -> Either Text (Map Text TOMLValue)
