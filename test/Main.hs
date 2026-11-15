@@ -17,13 +17,13 @@ import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
 import Control.Monad (filterM, unless, void, when, zipWithM)
 import Control.Monad.State.Strict (State, gets, modify', runState)
-import Data.Bits (shiftR, xor, (.&.))
+import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Unsafe as BSU
-import Data.Char (intToDigit, isAsciiLower, isAsciiUpper, isDigit)
+import Data.Char (intToDigit, isAsciiLower, isAsciiUpper, isDigit, ord)
 import Data.Either (isLeft, isRight)
 import Data.Foldable (toList)
 import Data.Functor.Identity (Identity (..))
@@ -11045,6 +11045,7 @@ testUpstreamConformance :: IO [Bool]
 testUpstreamConformance = do
   putStrLn "eval/conformance"
   let xmlDocument body = mkStr ("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n" <> body <> "</expr>\n")
+      toBase16 hash = "builtins.convertHash { hash = \"" <> hash <> "\"; toHashFormat = \"base16\"; }"
   sequence
     [ -- Hash decode is length-keyed per algorithm, never first-format-wins:
       -- a 52-char all-hex-digit string is a nix32 sha256 hash (64 hex chars
@@ -11083,13 +11084,13 @@ testUpstreamConformance = do
       runTest "convertHash rejects a truncated SRI digest" $
         case evalNix "builtins.convertHash { hash = \"sha256-YWJj\"; toHashFormat = \"base16\"; }" of
           Left err
-            | "wrong length" `T.isInfixOf` err -> Pass
+            | "invalid SRI hash 'YWJj'" `T.isInfixOf` err -> Pass
             | otherwise -> Fail ("expected an SRI length error, got: " <> err)
           Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
       runTest "fixed-output outputHash rejects a truncated SRI digest" $
         case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"sha256-YWJj\"; }).drvPath" of
           Left err
-            | "wrong length" `T.isInfixOf` err -> Pass
+            | "invalid SRI hash 'YWJj'" `T.isInfixOf` err -> Pass
             | otherwise -> Fail ("expected an SRI length error, got: " <> err)
           Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
       -- An SRI or prefixed outputHash carries its own algorithm tag; a
@@ -11121,7 +11122,7 @@ testUpstreamConformance = do
       runTest "builtins.path pin rejects a truncated SRI digest" $
         case evalNix "builtins.path { path = ./x; sha256 = \"sha256-YWJj\"; }" of
           Left err
-            | "wrong length" `T.isInfixOf` err -> Pass
+            | "invalid SRI hash 'YWJj'" `T.isInfixOf` err -> Pass
             | otherwise -> Fail ("expected an SRI length error, got: " <> err)
           Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
       runTest "builtins.path pin rejects a non-sha256 SRI digest" $
@@ -11130,6 +11131,68 @@ testUpstreamConformance = do
             | "should have type 'sha256'" `T.isInfixOf` err -> Pass
             | otherwise -> Fail ("expected a hash-type error, got: " <> err)
           Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
+      -- Base64 is read as upstream's base64Decode reads it: up to the
+      -- first '=', newlines skipped, the bits after the last whole byte
+      -- dropped.  Five nixpkgs hashes rely on it: nmgui's, journalist's
+      -- and quintom-cursor-theme's have text after the padding, guake's a
+      -- space, and cosmic-workspaces-epoch's leftover bits that are not
+      -- zero.
+      runTest "an SRI hash with text after its padding decodes (nmgui)" $
+        assertEval "nmgui" (toBase16 "sha256-HS/n40Ng8S5N14DtEH/upwlxdzwCoOEJA40EMdCcLw4=io") (mkStr "1d2fe7e34360f12e4dd780ed107feea70971773c02a0e109038d0431d09c2f0e"),
+      runTest "an SRI hash with a character after its padding decodes to 32 bytes (journalist)" $
+        assertEval "journalist" (toBase16 "sha256-2EJ96dhhU7FZxMkHOmQo79WCHu8U1AGgFf47FIuQdek=s") (mkStr "d8427de9d86153b159c4c9073a6428efd5821eef14d401a015fe3b148b9075e9"),
+      runTest "an SRI hash with an alphabet character after its padding decodes to 32 bytes (quintom-cursor-theme)" $
+        assertEval "quintom-cursor-theme" (toBase16 "sha256-Sec2DSnWYal6wzYzP9W+DDuTKHsFHWdRYyMzliMU5bU=A") (mkStr "49e7360d29d661a97ac336333fd5be0c3b93287b051d6751632333962314e5b5"),
+      runTest "an SRI hash with a space after its padding decodes (guake)" $
+        assertEval "guake" (toBase16 "sha256-RjGRFJDTQX2meAaw3UZi/3OxAtIHbRZVpXTbcJk/scY= ") (mkStr "4631911490d3417da67806b0dd4662ff73b102d2076d1655a574db70993fb1c6"),
+      runTest "an SRI hash whose leftover bits are not zero decodes (cosmic-workspaces-epoch)" $
+        assertEval "cosmic-workspaces-epoch" (toBase16 "sha256-z3xQ6Vgqkm8hYLo2550NbFRkTMRQ0F9zn85iobnykH5=") (mkStr "cf7c50e9582a926f2160ba36e79d0d6c54644cc450d05f739fce62a1b9f2907e"),
+      runTest "a fixed-output hash with text after its padding has the path of its plain spelling" $
+        assertEval
+          "fixed-output-padding"
+          "let out = hash: (derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = hash; }).outPath; in out \"sha256-HS/n40Ng8S5N14DtEH/upwlxdzwCoOEJA40EMdCcLw4=io\" == out \"sha256-HS/n40Ng8S5N14DtEH/upwlxdzwCoOEJA40EMdCcLw4=\""
+          (VBool True),
+      runTest "a newline in a base64 hash is skipped" $
+        assertEval "base64-newline" (toBase16 "sha256-47DEQpj8HBSa+/TImW+5JCeu\\nQeRkm5NMpJWZG3hSuFU=") (mkStr "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+      -- A refused character and a wrong decoded length are one error
+      -- upstream (hash.cc:247-258 at 2.24.9), which drops the decoder's
+      -- own exception.
+      runTest "a carriage return in an SRI hash is refused" $
+        assertEvalError "sri-carriage-return" (toBase16 "sha256-47DEQpj8HBSa+/TImW+5JCeu\\rQeRkm5NMpJWZG3hSuFU=") "invalid SRI hash '47DEQpj8HBSa+/TImW+5JCeu\rQeRkm5NMpJWZG3hSuFU='",
+      runTest "a character outside the base64 alphabet in an SRI hash is refused" $
+        assertEvalError "sri-url-safe" (toBase16 "sha256-47DEQpj8HBSa+_TImW+5JCeuQeRkm5NMpJWZG3hSuFU=") "invalid SRI hash '47DEQpj8HBSa+_TImW+5JCeuQeRkm5NMpJWZG3hSuFU='",
+      runTest "a character outside the base64 alphabet in a prefixed hash is refused" $
+        assertEvalError "base64-url-safe" (toBase16 "sha256:47DEQpj8HBSa+_TImW+5JCeuQeRkm5NMpJWZG3hSuFU=") "invalid base-64 hash '47DEQpj8HBSa+_TImW+5JCeuQeRkm5NMpJWZG3hSuFU='",
+      -- The algorithm tag ends at the first ':', else at the first '-'
+      -- (getParsedTypeAndSRI, hash.cc:150-169 at 2.24.9), so a separator
+      -- after the padding, which the decoder never reads, still decides
+      -- the tag.
+      runTest "a '-' after the padding of a prefixed hash is ignored" $
+        assertEval "prefixed-dash" (toBase16 "md5:AAAAAAAAAAAAAAAAAAAAAA=-") (mkStr "00000000000000000000000000000000"),
+      runTest "a ':' after the padding of an SRI hash makes its tag an unknown algorithm" $
+        assertEvalError "sri-colon" (toBase16 "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:x") "unknown hash algorithm 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='",
+      runTest "a '-' after the padding of an untagged hash makes its start an unknown algorithm" $
+        assertEvalError
+          "untagged-dash"
+          "builtins.convertHash { hash = \"AAAAAAAAAAAAAAAAAAAAAA=-\"; hashAlgo = \"md5\"; toHashFormat = \"base16\"; }"
+          "unknown hash algorithm 'AAAAAAAAAAAAAAAAAAAAAA='",
+      -- Upstream keys a hash's spelling on its length in bytes, so a
+      -- character UTF-8 spells in two bytes after the padding of a 24
+      -- character md5 base64 hash makes it 25 long.
+      runTest "a hash's spelling is keyed on its length in bytes" $
+        assertEvalError "base64-length-bytes" (toBase16 "md5:AAAAAAAAAAAAAAAAAAAAAA=\233") "hash 'AAAAAAAAAAAAAAAAAAAAAA=\233' has wrong length for hash algorithm 'md5'",
+      runTestM "base64 decodes as upstream's base64Decode loop over generated strings" $
+        quickCheckPasses $
+          QC.checkCoverage $
+            QC.forAll genBase64Text $ \text ->
+              let decoded = Hash.base64ToBytes text
+               in QC.cover 20 (isJust decoded) "decoded"
+                    $ QC.cover 20 (isNothing decoded) "refused"
+                    $ decoded QC.=== (BS.pack <$> base64DecodeModel (BS.unpack (TE.encodeUtf8 text))),
+      runTestM "base64 decodes what it encodes" $
+        quickCheckPasses $
+          QC.forAll (BS.pack <$> QC.listOf QC.arbitrary) $ \bytes ->
+            Hash.base64ToBytes (B64.encode bytes) QC.=== Just bytes,
       -- toJSON floats: nlohmann's layout - shortest round-trip digits, .0
       -- kept on integral values, scientific outside point positions (-4, 15].
       runTest "toJSON float shortest digits" $
@@ -11265,6 +11328,54 @@ testUpstreamConformance = do
       runTest "toPath preserves forward-slash root" $
         assertEval "path-canon-topath-root" "builtins.toString (builtins.toPath \"//nix//store\")" (mkStr "/nix/store")
     ]
+  where
+    quickCheckPasses :: (QC.Testable prop) => prop -> IO TestResult
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+
+-- | Strings for the base64 decoder: mostly alphabet characters, with the
+-- two it treats specially (@=@ and newline) and some it refuses (carriage
+-- return, space, base64url's @-@ and @_@, @:@, NUL and one UTF-8 spells in
+-- two bytes).
+genBase64Text :: QC.Gen Text
+genBase64Text =
+  T.pack
+    <$> QC.resize
+      48
+      ( QC.listOf
+          ( QC.frequency
+              [ (12, QC.elements (BS8.unpack base64Alphabet)),
+                (2, pure '='),
+                (2, pure '\n'),
+                (1, QC.elements "\r -_:\0\233")
+              ]
+          )
+      )
+
+-- | The standard base64 alphabet, in digit order (util.cc @base64Chars@).
+base64Alphabet :: BS.ByteString
+base64Alphabet = BS8.pack (['A' .. 'Z'] ++ ['a' .. 'z'] ++ ['0' .. '9'] ++ "+/")
+
+-- | Upstream's @base64Decode@ loop (util.cc:240-275 at 2.24.9), one byte
+-- of the string at a time, its accumulator an unsigned 32-bit integer as
+-- there.  'Nothing' where upstream throws.
+base64DecodeModel :: [Word8] -> Maybe [Word8]
+base64DecodeModel = go 0 0 []
+  where
+    go :: Word32 -> Int -> [Word8] -> [Word8] -> Maybe [Word8]
+    go _ _ out [] = Just (reverse out)
+    go acc bits out (c : rest)
+      | c == byteOf '=' = Just (reverse out)
+      | c == byteOf '\n' = go acc bits out rest
+      | otherwise = do
+          digit <- BS.elemIndex c base64Alphabet
+          let shifted = shiftL acc 6 .|. fromIntegral digit
+              filled = bits + 6
+          if filled >= 8
+            then go shifted (filled - 8) (fromIntegral (shiftR shifted (filled - 8)) : out) rest
+            else go shifted filled out rest
+    byteOf = fromIntegral . ord
 
 -- | Eval-fidelity regression tests: each pins a semantic where the evaluator
 -- must match upstream Nix.  All are parity-safe - none affects a derivation
