@@ -4,10 +4,3 @@
 # on a listed row the corpus lacks, so the list changes when the evaluator
 # does.  A line is an issue, then the row: an argument id and a probe id,
 # or `imported` and an expression id.
-
-
-
-
-# issue-378 (#378): a closed pattern names the unexpected argument nova-nix
-# interned first.
-issue-378 imported unexpected-arguments

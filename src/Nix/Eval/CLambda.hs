@@ -22,11 +22,18 @@ module Nix.Eval.CLambda
     clambdaBody,
     clambdaFormalsType,
     clambdaNameSym,
+    clambdaLambdaNameSym,
     clambdaAllowExtra,
     clambdaFormalCount,
     clambdaEntryName,
     clambdaEntryHasDefault,
     clambdaEntryDefault,
+
+    -- * Shape
+    clambdaShape,
+    clambdaShapeFormalsType,
+    clambdaShapeAllowExtra,
+    clambdaShapeFormalCount,
   )
 where
 
@@ -45,7 +52,7 @@ type CLambdaPtr = Ptr NnLambda
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_lambda_new"
-  c_nn_lambda_new :: Ptr NnEnv -> Word32 -> Word8 -> Word32 -> Word8 -> Word32 -> IO CLambdaPtr
+  c_nn_lambda_new :: Ptr NnEnv -> Word32 -> Word8 -> Word32 -> Word32 -> Word8 -> Word32 -> IO CLambdaPtr
 
 foreign import ccall unsafe "nn_lambda_set_entry"
   c_nn_lambda_set_entry :: CLambdaPtr -> Word32 -> Word32 -> Word32 -> Word32 -> IO ()
@@ -65,6 +72,9 @@ foreign import ccall unsafe "nn_lambda_formals_type"
 foreign import ccall unsafe "nn_lambda_name_sym"
   c_nn_lambda_name_sym :: CLambdaPtr -> IO Word32
 
+foreign import ccall unsafe "nn_lambda_lambda_name_sym"
+  c_nn_lambda_lambda_name_sym :: CLambdaPtr -> IO Word32
+
 foreign import ccall unsafe "nn_lambda_allow_extra"
   c_nn_lambda_allow_extra :: CLambdaPtr -> IO Word8
 
@@ -80,15 +90,31 @@ foreign import ccall unsafe "nn_lambda_entry_has_default"
 foreign import ccall unsafe "nn_lambda_entry_default"
   c_nn_lambda_entry_default :: CLambdaPtr -> Word32 -> IO Word32
 
+-- The shape functions read and write no memory, so they are pure.
+foreign import ccall unsafe "nn_lambda_shape"
+  c_nn_lambda_shape :: Word8 -> Word8 -> Word32 -> Word32
+
+foreign import ccall unsafe "nn_lambda_shape_formals_type"
+  c_nn_lambda_shape_formals_type :: Word32 -> Word8
+
+foreign import ccall unsafe "nn_lambda_shape_allow_extra"
+  c_nn_lambda_shape_allow_extra :: Word32 -> Word8
+
+foreign import ccall unsafe "nn_lambda_shape_formal_count"
+  c_nn_lambda_shape_formal_count :: Word32 -> Word32
+
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
--- | Allocate a new lambda closure with space for @formalCount@ entries.
--- Fill entries via 'clambdaSetEntry' after construction.
--- Returns 'Foreign.Ptr.nullPtr' on allocation failure or if the
--- entries array size would overflow - the caller must check.
-clambdaNew :: Ptr NnEnv -> Word32 -> Word8 -> Word32 -> Word8 -> Word32 -> IO CLambdaPtr
+-- | Allocate a new lambda closure with space for @formalCount@ entries:
+-- its env, body, formals type, binding name symbol, the function's own
+-- name symbol ('Nix.Eval.EvalFormals.lambdaNameSymbol'), ellipsis flag
+-- and formal count.  Fill entries via 'clambdaSetEntry' after
+-- construction.  Returns 'Foreign.Ptr.nullPtr' on allocation failure, for
+-- a formals type or count 'clambdaShape' cannot hold, or if the entries
+-- array size would overflow - the caller must check.
+clambdaNew :: Ptr NnEnv -> Word32 -> Word8 -> Word32 -> Word32 -> Word8 -> Word32 -> IO CLambdaPtr
 clambdaNew = c_nn_lambda_new
 
 -- | Set a formal entry at the given index.
@@ -119,6 +145,11 @@ clambdaFormalsType = c_nn_lambda_formals_type
 clambdaNameSym :: CLambdaPtr -> IO Word32
 clambdaNameSym = c_nn_lambda_name_sym
 
+-- | Read the function's own name symbol (for Set/NamedSet), the one
+-- 'clambdaNew' was given.
+clambdaLambdaNameSym :: CLambdaPtr -> IO Word32
+clambdaLambdaNameSym = c_nn_lambda_lambda_name_sym
+
 -- | Read the ellipsis flag (1 if ... present).
 clambdaAllowExtra :: CLambdaPtr -> IO Word8
 clambdaAllowExtra = c_nn_lambda_allow_extra
@@ -138,3 +169,26 @@ clambdaEntryHasDefault = c_nn_lambda_entry_has_default
 -- | Read a formal entry's default bytecode index.
 clambdaEntryDefault :: CLambdaPtr -> Word32 -> IO Word32
 clambdaEntryDefault = c_nn_lambda_entry_default
+
+-- ---------------------------------------------------------------------------
+-- Shape
+-- ---------------------------------------------------------------------------
+
+-- | The word a closure keeps its formals type, ellipsis flag and formal
+-- count in (@nn_lambda_shape@): the type taken mod 4, any nonzero flag as
+-- 1 and the count mod 2^29, the widths @cbits\/nn_lambda.h@ gives them.
+-- 'clambdaNew' refuses a type or count that does not fit.
+clambdaShape :: Word8 -> Word8 -> Word32 -> Word32
+clambdaShape = c_nn_lambda_shape
+
+-- | The formals type a shape holds.
+clambdaShapeFormalsType :: Word32 -> Word8
+clambdaShapeFormalsType = c_nn_lambda_shape_formals_type
+
+-- | The ellipsis flag a shape holds, 0 or 1.
+clambdaShapeAllowExtra :: Word32 -> Word8
+clambdaShapeAllowExtra = c_nn_lambda_shape_allow_extra
+
+-- | The formal count a shape holds.
+clambdaShapeFormalCount :: Word32 -> Word32
+clambdaShapeFormalCount = c_nn_lambda_shape_formal_count

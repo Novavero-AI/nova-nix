@@ -164,11 +164,14 @@ targetNixVersion = "2.24.9"
 -- shares what upstream's does: an output's set is one value in @all@,
 -- under its name and as the result, and each output has a @drvPath@ of
 -- its own.  The attributes it defines are at this text's lines, which
--- differ from upstream's.  Its identifiers differ too, and compiling it
--- interns them before any file a program imports, as upstream's startup
--- interns its wrapper's: an error that names attributes in interning order
--- (an unexpected argument, the keys of a set missing an attribute) can
--- name another first than upstream's identifiers would make it.
+-- differ from upstream's.  Its identifiers differ too: the names
+-- upstream's wrapper brings are interned as the evaluator starts
+-- ("Nix.Eval.StartupSymbols"), as upstream's are, and the four of this
+-- one's that upstream's lacks (@paths@, @entries@, @shared@ and @entry@)
+-- when it compiles, as the root environment is first built, after the
+-- program's own names.  One of the four that a file imported later, or a
+-- set built at run time, names then comes before the names that file or
+-- set brings first, which upstream puts ahead of it.
 derivationWrapperSource :: ByteString
 derivationWrapperSource =
   BC.unlines
@@ -231,9 +234,9 @@ derivationWrapperEnv =
 -- ("Nix.Eval.Arena").  The source is a constant, so a parse failure is a
 -- defect in this module; it surfaces as an abort at the first use of
 -- @derivation@ rather than as a crash while the environment is assembled.
--- Its names are interned from that first use, as it compiles and runs;
--- upstream interns them as it starts, when @createBaseEnv@ evaluates the
--- wrapper (primops.cc at 2.24.9).
+-- It compiles when 'builtinEnv' first builds @builtins@, which holds it,
+-- interning the names it brings that the evaluator's startup did not
+-- ('derivationWrapperSource').
 derivationWrapper :: Thunk
 derivationWrapper =
   case parseNixWithScope (Map.keysSet derivationWrapperScope) "/" derivationWrapperOrigin derivationWrapperSource of

@@ -104,7 +104,7 @@ import Nix.Eval.CBytecode
     pattern OpWith,
     pattern OpWithVar,
   )
-import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
+import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.SourcePos (PosIdx (..), PosRecorder, newPosRecorder, recordPos)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types
@@ -160,7 +160,7 @@ compileWith recorder = go
     go (EHasAttr target path) = compileHasAttr target path
     go (EApp func arg) = compileApp func arg
     go (ELambda formals body captureInfo) =
-      compileLambda formals body captureInfo
+      compileLambda AnonymousLambda formals body captureInfo
     go (ELet bindings body captureInfo) =
       compileLet bindings body captureInfo
     go (EIf cond thenExpr elseExpr) = do
@@ -302,27 +302,40 @@ compileWith recorder = go
     -- Lambda (ELambda)
     -- -----------------------------------------------------------------
 
-    compileLambda :: Formals -> Expr -> CaptureInfo -> IO Word32
-    compileLambda formals body captureInfo = do
-      bodyIdx <- go body
-      formalsOff <- compileFormals formals
+    -- \| A function and, when its body is a function too, the body under
+    -- the same name, as upstream's @ExprLambda::setName@ names the body
+    -- (nixexpr.cc:573-577 at 2.24.9).
+    compileLambda :: LambdaName -> Formals -> Expr -> CaptureInfo -> IO Word32
+    compileLambda name formals body captureInfo = do
+      bodyIdx <- compileNamed name body
+      formalsOff <- compileFormals name formals
       capOff <- compileCaptureInfo captureInfo
       cbcEmit OpLambda (encodeFormalType formals) 0 formalsOff bodyIdx capOff
 
-    compileFormals :: Formals -> IO Word32
-    compileFormals (FormalName name) = do
+    -- \| An expression whose value a binding names: a function there
+    -- takes the name, anything else compiles as it would anywhere.
+    compileNamed :: LambdaName -> Expr -> IO Word32
+    compileNamed name (ELambda formals body captureInfo) = compileLambda name formals body captureInfo
+    compileNamed _ expr = go expr
+
+    -- \| A set pattern's words start with the function's name
+    -- ('lambdaNameSymbol').
+    compileFormals :: LambdaName -> Formals -> IO Word32
+    compileFormals _ (FormalName name) = do
       Symbol sym <- symbolIntern name
       emitWordList [sym]
-    compileFormals (FormalSet formals ellipsis) = do
+    compileFormals name (FormalSet formals ellipsis) = do
+      nameWord <- lambdaNameSymbol name
       formalWords <- compileFormalEntries formals
       emitWordList $
-        [fi (length formals), if ellipsis then 1 else 0]
+        [nameWord, fi (length formals), if ellipsis then 1 else 0]
           ++ formalWords
-    compileFormals (FormalNamedSet name formals ellipsis) = do
-      Symbol nameSym <- symbolIntern name
+    compileFormals name (FormalNamedSet argName formals ellipsis) = do
+      nameWord <- lambdaNameSymbol name
+      Symbol argSym <- symbolIntern argName
       formalWords <- compileFormalEntries formals
       emitWordList $
-        [nameSym, fi (length formals), if ellipsis then 1 else 0]
+        [nameWord, argSym, fi (length formals), if ellipsis then 1 else 0]
           ++ formalWords
 
     compileFormalEntries :: [Formal] -> IO [Word32]
@@ -359,10 +372,20 @@ compileWith recorder = go
     compileBindingWords :: [Binding] -> IO [Word32]
     compileBindingWords bindings = concat <$> mapM compileOneBinding bindings
 
+    -- \| A function bound to a static name is named by it, as upstream's
+    -- @addAttr@ names the value of an attribute path's last name
+    -- (parser-state.hh:176-177 at 2.24.9).  Upstream names a function
+    -- under a dynamic key too, with the name the key evaluates to, each
+    -- time it evaluates the set (@ExprAttrs::eval@, eval.cc:1270); a
+    -- name the compiler cannot know, so such a function, and one under a
+    -- key @${"f"}@, which upstream's parser makes static and this one
+    -- keeps dynamic, is anonymous here.
     compileOneBinding :: Binding -> IO [Word32]
     compileOneBinding (NamedBinding pos key expr) = do
       (keyKind, keyWord) <- compileAttrKey key
-      valIdx <- go expr
+      valIdx <- case key of
+        StaticKey name -> compileNamed (NamedLambda name) expr
+        DynamicKey _ -> go expr
       posWord <- positionWord pos
       pure [bindNamed, keyKind, keyWord, valIdx, posWord]
     compileOneBinding (Inherit pos name var) = do
@@ -488,13 +511,14 @@ compileWith recorder = go
 -- ---------------------------------------------------------------------------
 
 -- | Compile parser 'Formals' (with 'Maybe Expr' defaults) to eval-time
--- 'EvalFormals' (with 'Maybe Word32' bc_idx defaults).
+-- 'EvalFormals' (with 'Maybe Word32' bc_idx defaults), for a function no
+-- binding names.
 compileFormalsToEval :: Formals -> IO EvalFormals
 compileFormalsToEval (FormalName name) = pure (EFName name)
 compileFormalsToEval (FormalSet formals ellipsis) =
-  EFSet <$> mapM compileOneFormal formals <*> pure ellipsis
+  EFSet AnonymousLambda <$> mapM compileOneFormal formals <*> pure ellipsis
 compileFormalsToEval (FormalNamedSet name formals ellipsis) =
-  EFNamedSet name <$> mapM compileOneFormal formals <*> pure ellipsis
+  EFNamedSet AnonymousLambda name <$> mapM compileOneFormal formals <*> pure ellipsis
 
 compileOneFormal :: Formal -> IO EvalFormal
 compileOneFormal (Formal name defExpr) = do
@@ -574,16 +598,18 @@ decodeBcFormals flags !dataOff
       sym <- cbcData dataOff
       pure (Just (EFName (symbolText (Symbol sym))))
   | flags == formalSet = do
-      count <- cbcData dataOff
-      ellipsis <- cbcData (dataOff + 1)
-      formals <- decodeFormalEntries (fromIntegral count) (dataOff + 2)
-      pure (Just (EFSet formals (ellipsis /= 0)))
-  | flags == formalNamedSet = do
-      nameSym <- cbcData dataOff
+      lambdaSym <- cbcData dataOff
       count <- cbcData (dataOff + 1)
       ellipsis <- cbcData (dataOff + 2)
       formals <- decodeFormalEntries (fromIntegral count) (dataOff + 3)
-      pure (Just (EFNamedSet (symbolText (Symbol nameSym)) formals (ellipsis /= 0)))
+      pure (Just (EFSet (lambdaNameFromSymbol lambdaSym) formals (ellipsis /= 0)))
+  | flags == formalNamedSet = do
+      lambdaSym <- cbcData dataOff
+      nameSym <- cbcData (dataOff + 1)
+      count <- cbcData (dataOff + 2)
+      ellipsis <- cbcData (dataOff + 3)
+      formals <- decodeFormalEntries (fromIntegral count) (dataOff + 4)
+      pure (Just (EFNamedSet (lambdaNameFromSymbol lambdaSym) (symbolText (Symbol nameSym)) formals (ellipsis /= 0)))
   | otherwise = pure Nothing
 
 -- | Decode a list of formal entries from the data buffer.

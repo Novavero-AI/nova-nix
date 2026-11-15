@@ -49,7 +49,8 @@ import Nix.Eval.CLambda (clambdaFreeAll)
 import Nix.Eval.CList (clistFreeAll)
 import Nix.Eval.CStatus (CStatusError (..), arenaLive)
 import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
-import Nix.Eval.Symbol (symbolDestroy, symbolInit)
+import Nix.Eval.StartupSymbols (startupSymbols)
+import Nix.Eval.Symbol (symbolDestroy, symbolInit, symbolIntern)
 
 -- ---------------------------------------------------------------------------
 -- FFI imports for batch StablePtr collection
@@ -73,10 +74,14 @@ foreign import ccall unsafe "nn_attrset_free_all"
 -- ---------------------------------------------------------------------------
 
 -- | Initialize all C data layer arenas.  Call once before evaluation.
--- Initializes: symbol table, thunk arena, env slot allocator, bytecode store.
+-- Initializes: symbol table, thunk arena, env slot allocator, bytecode
+-- store.  The new symbol table interns upstream's startup names
+-- ('startupSymbols') before anything else can, so that a name gets the
+-- symbol upstream's would.
 arenaInit :: IO ()
 arenaInit = do
   symbolInit 0
+  mapM_ symbolIntern startupSymbols
   cthunkInit 0
   cenvInit
   cbcInit 0 0

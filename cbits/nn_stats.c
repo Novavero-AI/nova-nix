@@ -820,9 +820,11 @@ static void enter_list(const nn_list_t *list)
 static void enter_lambda(const nn_lambda_t *lam)
 {
     uint32_t i;
+    uint32_t formals = nn_lambda_formal_count(lam);
     reach(NN_STATS_ENVS, lam->env);
     reach_symbol(lam->name_sym);
-    for (i = 0; i < lam->formal_count && lam->entries; i++) reach_symbol(lam->entries[i].name_sym);
+    reach_symbol(lam->lambda_name_sym);
+    for (i = 0; i < formals && lam->entries; i++) reach_symbol(lam->entries[i].name_sym);
 }
 
 static void enter_ctxstr(const nn_ctxstr_t *s)

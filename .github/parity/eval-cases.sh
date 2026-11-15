@@ -79,28 +79,58 @@ endingIn() {
   awk -v suffix="$1" 'length($0) >= length(suffix) && substr($0, length($0) - length(suffix) + 1) == suffix'
 }
 
+# The final line of an evaluator's output, unindented.
+finalLine() {
+  printf '%s\n' "$1" | tail -n1 | sed 's/^ *//'
+}
+
+# The line of an evaluator's output that states its error: the last that
+# starts with `error: ` once unindented.
+messageLine() {
+  printf '%s\n' "$1" | sed 's/^ *//' | grep '^error: ' | tail -n1
+}
+
 # An expression both evaluators must refuse, on the same final line.  What
 # comes before it is upstream's trace, which nova-nix reproduces only for
 # the lines that have no position: given a marker, the line ending in it
 # must be in upstream's output and the same in nova-nix's.
 refused() {
-  label=$1
-  expr=$2
-  marker=${3-}
+  refusedOn finalLine "$@"
+}
+
+# An expression both evaluators must refuse with the same message, where
+# upstream reports the error at a position: it follows the message with the
+# source there and any suggestion, which nova-nix does not print.  A
+# marker is checked as refused checks it.
+refusedAtPosition() {
+  refusedOn messageLine "$@"
+}
+
+# refused and refusedAtPosition, the first argument naming the function
+# that picks the line the two outputs must agree on.  Upstream runs with
+# show-trace off, its default, whatever nix.conf sets: the installer the
+# parity workflow uses writes show-trace = true, under which upstream adds
+# a line of context for each function call a failure passes through, and
+# nova-nix has no show-trace.
+refusedOn() {
+  pick=$1
+  label=$2
+  expr=$3
+  marker=${4-}
   checked=$((checked + 1))
-  upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1)
+  upstream=$(cd "$fixture" && nix-instantiate --option show-trace false --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1)
   upstreamStatus=$?
   nova=$(cd "$fixture" && "$novaBin" eval --nix-path "nix=$repoRoot/data/nix" --expr "$expr" 2>&1)
   novaStatus=$?
-  upstreamError=$(printf '%s\n' "$upstream" | tail -n1 | sed 's/^ *//')
-  novaError=$(printf '%s\n' "$nova" | tail -n1 | sed 's/^ *//')
+  upstreamError=$("$pick" "$upstream")
+  novaError=$("$pick" "$nova")
   upstreamContext=""
   novaContext=""
   if [ -n "$marker" ]; then
     upstreamContext=$(printf '%s\n' "$upstream" | endingIn " $marker")
     novaContext=$(printf '%s\n' "$nova" | endingIn " $marker")
   fi
-  if [ "$upstreamStatus" -ne 0 ] && [ "$novaStatus" -ne 0 ] && [ "$upstreamError" = "$novaError" ] &&
+  if [ "$upstreamStatus" -ne 0 ] && [ "$novaStatus" -ne 0 ] && [ -n "$upstreamError" ] && [ "$upstreamError" = "$novaError" ] &&
     [ "$upstreamContext" = "$novaContext" ] && { [ -z "$marker" ] || [ -n "$upstreamContext" ]; }; then
     printf '  ok    %s\n' "$label"
   else
@@ -200,6 +230,68 @@ echo "== arithmetic and comparison as upstream's primops do them =="
 check "unary minus is 0 - e, so a float zero negates to positive zero" '[ (-(0.0)) (-(-0.0)) ]'
 check "division by a float, and integer division truncating toward zero" '[ (1 / 4.0) (7 / 2) ((-7) / 2) ]'
 check "a list comparison passes over equal elements of an unordered type" '[ ([ { } ] < [ { } ]) ([ { } 1 ] < [ { } 2 ]) ]'
+echo
+
+echo "== what a call, a select and abort refuse =="
+refusedAtPosition "a missing argument is reported before an unexpected one" '({ a }: a) { b = 1; }' "from call site"
+refusedAtPosition "a missing argument names an anonymous function" '({ a }: a) { }' "from call site"
+refusedAtPosition "a function a let binds is named by its binding" 'let f = { a }: a; in f { }' "from call site"
+refusedAtPosition "a function a set binds names the function its body is too" '{ f = x: { a }: a; }.f 1 { }' "from call site"
+refusedAtPosition "a function under an assert is anonymous" 'let f = assert true; { a }: a; in f { }' "from call site"
+refusedAtPosition "a function a formal defaults to is anonymous" '({ g ? { a }: a }: g { }) { }' "from call site"
+refused "an argument that is not a set" '({ a }: a) 1' "while evaluating the value passed for the lambda argument"
+refusedAtPosition "a select names the attribute its set lacks" '{ a = 1; }.b'
+refused "a select into a value that is not a set" 'let v = 1; in v.a' "while selecting an attribute"
+# The ${ is Nix's interpolation, not the shell's.
+# shellcheck disable=SC2016
+refused "a select reads a name before the value it selects from" '{ a = throw "x"; }.a.${throw "y"}'
+refused "abort reports the message it was given" 'abort "boom"'
+echo
+
+# Upstream prints a function's name as its binding spells it, and an
+# argument's or attribute's name as it prints a symbol: bare when it is an
+# identifier, otherwise as a string literal.  A formal is always an
+# identifier.
+echo "== how a call and a select print a name =="
+refusedAtPosition "a function is named by its binding as written" '{ "a b" = { a }: a; }."a b" { }' "from call site"
+refusedAtPosition "a missing argument prints bare" "({ a'-b }: 1) { }" "from call site"
+refusedAtPosition "an unexpected argument that is not an identifier prints as a string" '({ }: null) { "a b" = 1; }' "from call site"
+refusedAtPosition "an unexpected argument that starts with a digit prints as a string" '({ }: null) { "1x" = 1; }' "from call site"
+refusedAtPosition "an unexpected argument that is a keyword prints as a string" '({ }: null) { "if" = 1; }' "from call site"
+# The \${ is Nix's escaped interpolation, not the shell's.
+# shellcheck disable=SC2016
+refusedAtPosition "an unexpected argument prints with its quote and interpolation escaped" '({ }: null) { "a\"b\${c" = 1; }' "from call site"
+refusedAtPosition "a select names a missing attribute that is not an identifier as a string" '{ a = 1; }."b c"'
+refusedAtPosition "a select names a missing keyword attribute as a string" '{ a = 1; }."if"'
+# shellcheck disable=SC2016
+refusedAtPosition "a select names a missing dynamic attribute as a string" '{ a = 1; }.${"1x"}'
+echo
+
+# The argument a call names is the first of its kind in symbol order, and
+# a name's place there is where the evaluator first interned it: these
+# names at startup, in another order than the source gives them and, but
+# for x and the empty name, than their own.
+echo "== the order upstream interns names as it starts =="
+refusedAtPosition "a name of the derivation wrapper before a program's" '({ }: null) { zzz = 1; x = 2; }' "from call site"
+refusedAtPosition "a static symbol before a primop's name" '({ }: null) { map = 1; outPath = 2; }' "from call site"
+refusedAtPosition "a static symbol of the parser's before a constant's name" '({ }: null) { null = 1; or = 2; }' "from call site"
+refusedAtPosition "primops in the order a file registers them" '({ }: null) { seq = 1; throw = 2; }' "from call site"
+# A file's primops register as its static initializers run.  The release
+# builds of 2.27.0 through 2.34 compile libexpr's files apart and link
+# them under GCC's link-time optimization, which merges every file's
+# initializers into one function that runs them in the reverse of link
+# order (compare_ctor, gcc/ipa.cc): 2.34.9 registers fetchTree.cc's
+# primops, then fetchMercurial.cc's, then context.cc's, then primops.cc's.
+# 2.24.9 links the files without it, and 2.35.0 compiles them as one unity
+# build, both in the order nova-nix follows.
+if ! upstreamAtLeast 2.27.0 || upstreamAtLeast 2.35.0; then
+  refusedAtPosition "primops.cc's primops before primops/context.cc's" '({ }: null) { getContext = 1; toString = 2; }' "from call site"
+  refusedAtPosition "primops/context.cc's primops before fetchMercurial.cc's" '({ }: null) { fetchMercurial = 1; unsafeDiscardStringContext = 2; }' "from call site"
+  refusedAtPosition "fetchMercurial.cc's primop before fetchTree.cc's" '({ }: null) { fetchGit = 1; fetchMercurial = 2; }' "from call site"
+fi
+refusedAtPosition "a primop's name before the derivation wrapper's" '({ }: null) { commonAttrs = 1; toString = 2; }' "from call site"
+refusedAtPosition "the empty name as a static symbol" '({ }: null) { zz = 1; "" = 2; }' "from call site"
+refusedAtPosition "the first missing argument in symbol order" '({ aa, value }: 1) { }' "from call site"
 echo
 
 echo "== when builtins.addErrorContext forces its message =="

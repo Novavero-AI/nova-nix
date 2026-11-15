@@ -79,6 +79,7 @@ import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
+import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
@@ -86,12 +87,13 @@ import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
 import qualified Nix.Eval.Context as Context
-import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
+import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..))
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIO, runEvalIOTraced)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
-import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printValue)
+import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printSymbol, printValue)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecorder, noPos, recordPos)
+import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternBytes, symbolLen, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, buildCSlots, emptyCList, envLookupResolved, mkThunkBc, newMinimalEnv, pendingThunkEnv, tieFrame, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
@@ -1311,7 +1313,11 @@ testResultPrinter = do
         quickCheckPasses $
           QC.forAll genAttrName $ \name ->
             let attrs = VAttrs (attrSetFromMap SetLiteral (Map.singleton name (evaluated (VInt 1))))
-             in readsBack ("builtins.head (builtins.attrNames " <> renderResult attrs <> ")") (mkStr name)
+             in readsBack ("builtins.head (builtins.attrNames " <> renderResult attrs <> ")") (mkStr name),
+      runTestM "a name printed as a symbol reads back as itself" $
+        quickCheckPasses $
+          QC.forAll genAttrName $ \name ->
+            readsBack (TE.encodeUtf8 ("builtins.head (builtins.attrNames { " <> printSymbol name <> " = 1; })")) (mkStr name)
     ]
       <> map floatPrints floatCases
   where
@@ -22567,7 +22573,7 @@ emits label source expected = runTestM label $ do
 -- compiles what it parses, then print each name the compile added to the
 -- symbol table, one a line, in the order it added them.  Symbols are
 -- numbered from 1 in that order (cbits/nn_symbol.c), and the child's
--- table holds nothing a test interned before.
+-- table holds only the startup names 'arenaInit' interned.
 internOrderChildFlag :: String
 internOrderChildFlag = "--intern-order-child"
 
@@ -22620,10 +22626,437 @@ testParseOrderInterningIO = do
       internsInOrder "__curPos is no name (:276-278)" "{ za = __curPos; zb = 1; }" ["za", "zb"],
       -- An evaluation shows the order: the argument an unexpected-argument
       -- error names is the first in symbol order, here as under upstream
-      -- (eval.cc:1566-1576), though the wording is this evaluator's.
-      emits "a let's bindings are interned before its body" "let za = 1; in ({ }: za) { zb = 1; za = 2; }" ["error: unexpected attribute 'za' in function argument"],
-      emits "a function's formals are interned before its body" "({ za ? 1 }: ({ }: null) { zb = 1; za = 2; }) { }" ["error: unexpected attribute 'za' in function argument"],
-      emits "an attribute path is interned before its or default" "{ }.za or (({ }: null) { zb = 1; za = 2; })" ["error: unexpected attribute 'za' in function argument"]
+      -- (eval.cc:1566-1576).
+      emits "a let's bindings are interned before its body" "let za = 1; in ({ }: za) { zb = 1; za = 2; }" ["error: function 'anonymous lambda' called with unexpected argument 'za'"],
+      emits "a function's formals are interned before its body" "({ za ? 1 }: ({ }: null) { zb = 1; za = 2; }) { }" ["error: function 'anonymous lambda' called with unexpected argument 'za'"],
+      emits "an attribute path is interned before its or default" "{ }.za or (({ }: null) { zb = 1; za = 2; })" ["error: function 'anonymous lambda' called with unexpected argument 'za'"]
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: upstream's startup names, and the call, select and abort errors
+-- ---------------------------------------------------------------------------
+
+-- | Run as a child, print every name the symbol table holds once
+-- 'arenaInit' has run, one a line, in symbol order.
+startupSymbolsChildFlag :: String
+startupSymbolsChildFlag = "--startup-symbols-child"
+
+startupSymbolsChild :: IO ()
+startupSymbolsChild = do
+  count <- symbolCount
+  mapM_ (TIO.putStrLn . symbolText . Symbol) [1 .. count]
+
+-- | Run as a child, evaluate one expression under the IO evaluator and
+-- print its failure as 'show' writes it, which escapes what is not ASCII,
+-- so the parent reads it whatever either process's locale.
+failureChildFlag :: String
+failureChildFlag = "--failure-child"
+
+failureChild :: String -> IO ()
+failureChild source = evalNixIOTraced "." (T.pack source) >>= putStrLn . either show (const "no failure")
+
+-- | Evaluate the source in a child process running 'failureChild', whose
+-- symbol table holds the startup names and the source's alone, and
+-- compare its failure with the expected one.
+failsInChild :: Text -> Text -> EvalFailure -> IO Bool
+failsInChild label source expected = runTestM label $ do
+  self <- getExecutablePath
+  (_, out, _) <- Proc.readCreateProcessWithExitCode (Proc.proc self [failureChildFlag, T.unpack source]) ""
+  pure (assertEqual label [show expected] (lines out))
+
+-- | The failure of a call to a set pattern, with the line of context
+-- upstream adds for the call (eval.cc:1550-1556 and :1576-1583 at
+-- 2.24.9).
+callFailure :: Text -> Text -> EvalFailure
+callFailure function what = EvalFailure ["from call site"] ("function '" <> function <> "' called " <> what)
+
+-- | The symbol table once 'arenaInit' has run: the names upstream 2.24.9
+-- interns as it starts with its default settings, each once, in the
+-- order it first interns them.  @EvalState@'s constructor interns its
+-- static symbols in the order eval.hh declares them (eval.hh:173-187,
+-- eval.cc:225-277), the empty name among them.  @createBaseEnv@
+-- (primops.cc:4598-4873) then installs @builtins@, @true@, @false@,
+-- @null@ and the constants @__currentTime@ to @__nixPath@, every
+-- registered primop not gated on an experimental feature in the order it
+-- registers (primops.cc from :249, then primops/context.cc,
+-- fetchMercurial.cc, fetchTree.cc and fromTOML.cc), and @derivation@,
+-- interning each name and then that name less a @__@ prefix
+-- (eval.cc:466-485, :523-549).  Last come the names the @derivation@
+-- wrapper's parser interns that nothing before it did
+-- (primops/derivation.nix, parser.y:179-483).
+upstreamStartupTable :: [Text]
+upstreamStartupTable =
+  [ "<with>",
+    "outPath",
+    "drvPath",
+    "type",
+    "meta",
+    "name",
+    "value",
+    "system",
+    "__overrides",
+    "outputs",
+    "outputName",
+    "__ignoreNulls",
+    "file",
+    "line",
+    "column",
+    "__functor",
+    "__toString",
+    "right",
+    "wrong",
+    "__structuredAttrs",
+    "allowedReferences",
+    "allowedRequisites",
+    "disallowedReferences",
+    "disallowedRequisites",
+    "maxSize",
+    "maxClosureSize",
+    "builder",
+    "args",
+    "__contentAddressed",
+    "__impure",
+    "outputHash",
+    "outputHashAlgo",
+    "outputHashMode",
+    "recurseForDerivations",
+    "description",
+    "self",
+    "",
+    "startSet",
+    "operator",
+    "key",
+    "path",
+    "prefix",
+    "outputSpecified",
+    "__sub",
+    "__lessThan",
+    "__mul",
+    "__div",
+    "or",
+    "__findFile",
+    "__nixPath",
+    "body",
+    "builtins",
+    "true",
+    "false",
+    "null",
+    "__currentTime",
+    "currentTime",
+    "__currentSystem",
+    "currentSystem",
+    "__nixVersion",
+    "nixVersion",
+    "__storeDir",
+    "storeDir",
+    "__langVersion",
+    "langVersion",
+    "__traceVerbose",
+    "traceVerbose",
+    "nixPath",
+    "scopedImport",
+    "import",
+    "__typeOf",
+    "typeOf",
+    "isNull",
+    "__isFunction",
+    "isFunction",
+    "__isInt",
+    "isInt",
+    "__isFloat",
+    "isFloat",
+    "__isString",
+    "isString",
+    "__isBool",
+    "isBool",
+    "__isPath",
+    "isPath",
+    "__genericClosure",
+    "genericClosure",
+    "break",
+    "abort",
+    "throw",
+    "__addErrorContext",
+    "addErrorContext",
+    "__ceil",
+    "ceil",
+    "__floor",
+    "floor",
+    "__tryEval",
+    "tryEval",
+    "__getEnv",
+    "getEnv",
+    "__seq",
+    "seq",
+    "__deepSeq",
+    "deepSeq",
+    "__trace",
+    "trace",
+    "__warn",
+    "warn",
+    "derivationStrict",
+    "placeholder",
+    "__toPath",
+    "toPath",
+    "__storePath",
+    "storePath",
+    "__pathExists",
+    "pathExists",
+    "baseNameOf",
+    "dirOf",
+    "__readFile",
+    "readFile",
+    "findFile",
+    "__hashFile",
+    "hashFile",
+    "__readFileType",
+    "readFileType",
+    "__readDir",
+    "readDir",
+    "__toXML",
+    "toXML",
+    "__toJSON",
+    "toJSON",
+    "__fromJSON",
+    "fromJSON",
+    "__toFile",
+    "toFile",
+    "__filterSource",
+    "filterSource",
+    "__path",
+    "__attrNames",
+    "attrNames",
+    "__attrValues",
+    "attrValues",
+    "__getAttr",
+    "getAttr",
+    "__unsafeGetAttrPos",
+    "unsafeGetAttrPos",
+    "__hasAttr",
+    "hasAttr",
+    "__isAttrs",
+    "isAttrs",
+    "removeAttrs",
+    "__listToAttrs",
+    "listToAttrs",
+    "__intersectAttrs",
+    "intersectAttrs",
+    "__catAttrs",
+    "catAttrs",
+    "__functionArgs",
+    "functionArgs",
+    "__mapAttrs",
+    "mapAttrs",
+    "__zipAttrsWith",
+    "zipAttrsWith",
+    "__isList",
+    "isList",
+    "__elemAt",
+    "elemAt",
+    "__head",
+    "head",
+    "__tail",
+    "tail",
+    "map",
+    "__filter",
+    "filter",
+    "__elem",
+    "elem",
+    "__concatLists",
+    "concatLists",
+    "__length",
+    "length",
+    "__foldl'",
+    "foldl'",
+    "__any",
+    "any",
+    "__all",
+    "all",
+    "__genList",
+    "genList",
+    "__sort",
+    "sort",
+    "__partition",
+    "partition",
+    "__groupBy",
+    "groupBy",
+    "__concatMap",
+    "concatMap",
+    "__add",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "__bitAnd",
+    "bitAnd",
+    "__bitOr",
+    "bitOr",
+    "__bitXor",
+    "bitXor",
+    "lessThan",
+    "toString",
+    "__substring",
+    "substring",
+    "__stringLength",
+    "stringLength",
+    "__hashString",
+    "hashString",
+    "__convertHash",
+    "convertHash",
+    "__match",
+    "match",
+    "__split",
+    "split",
+    "__concatStringsSep",
+    "concatStringsSep",
+    "__replaceStrings",
+    "replaceStrings",
+    "__parseDrvName",
+    "parseDrvName",
+    "__compareVersions",
+    "compareVersions",
+    "__splitVersion",
+    "splitVersion",
+    "__unsafeDiscardStringContext",
+    "unsafeDiscardStringContext",
+    "__hasContext",
+    "hasContext",
+    "__unsafeDiscardOutputDependency",
+    "unsafeDiscardOutputDependency",
+    "__addDrvOutputDependencies",
+    "addDrvOutputDependencies",
+    "__getContext",
+    "getContext",
+    "__appendContext",
+    "appendContext",
+    "fetchMercurial",
+    "__fetchurl",
+    "fetchurl",
+    "fetchTarball",
+    "fetchGit",
+    "fromTOML",
+    "derivation",
+    "strict",
+    "drvAttrs",
+    "commonAttrs",
+    "outputsList",
+    "x",
+    "outputToAttrListElement"
+  ]
+
+-- | The names upstream's evaluator interns as it starts take the first
+-- symbols, in its order, ahead of any name a program brings, and they
+-- hold every name the root environment and @builtins@ hold, but three
+-- that upstream's @builtins@ holds only with an experimental feature on.
+-- The
+-- errors that walk a set in symbol order show the order end to end, in a
+-- child each, whose table holds the startup names and the source's alone.
+-- Under upstream each pair of names is in another order than the source
+-- gives them, and but for @x@ and the empty name in another order than
+-- their own, so the expected name follows from upstream's startup order
+-- and from neither of those.
+testStartupSymbolsIO :: IO [Bool]
+testStartupSymbolsIO = do
+  putStrLn "eval/startup-symbols-io"
+  self <- getExecutablePath
+  let unexpected name = callFailure "anonymous lambda" ("with unexpected argument '" <> name <> "'")
+      unknownTo = filter (`notElem` startupSymbols)
+  sequence
+    [ runTestM "arenaInit interns upstream's startup names first, in upstream's order" $ do
+        (_, out, _) <- Proc.readCreateProcessWithExitCode (Proc.proc self [startupSymbolsChildFlag]) ""
+        pure (assertEqual "symbol table" upstreamStartupTable (T.lines (T.pack out))),
+      runTest "the startup names hold upstream's base environment under both spellings" $
+        assertEqual
+          "missing"
+          []
+          (unknownTo (concatMap (\name -> name : maybeToList (T.stripPrefix "__" name)) (Set.toList upstreamBaseEnvNames))),
+      -- builtins also holds three primops upstream registers only with an
+      -- experimental feature on, whose names its startup leaves out.
+      runTest "builtins holds no name the startup names lack but those gated on an experimental feature" $
+        assertEval
+          "builtins"
+          ("builtins.toJSON (builtins.filter (name: !(builtins.elem name [ " <> T.unwords (map (\name -> "\"" <> name <> "\"") startupSymbols) <> " ])) (builtins.attrNames builtins))")
+          (mkStr "[\"fetchClosure\",\"fetchTree\",\"outputOf\"]"),
+      failsInChild "a name upstream's derivation wrapper brings precedes a program's" "({ }: null) { zzz = 1; x = 2; }" (unexpected "x"),
+      failsInChild "a static symbol precedes a primop's name" "({ }: null) { map = 1; outPath = 2; }" (unexpected "outPath"),
+      failsInChild "an expression symbol precedes a constant's name" "({ }: null) { null = 1; or = 2; }" (unexpected "or"),
+      failsInChild "primops of one file come in the order they register" "({ }: null) { seq = 1; throw = 2; }" (unexpected "throw"),
+      failsInChild "primops.cc's primops precede primops/context.cc's" "({ }: null) { getContext = 1; toString = 2; }" (unexpected "toString"),
+      failsInChild "primops/context.cc's primops precede fetchMercurial.cc's" "({ }: null) { fetchMercurial = 1; unsafeDiscardStringContext = 2; }" (unexpected "unsafeDiscardStringContext"),
+      failsInChild "fetchMercurial.cc's primop precedes fetchTree.cc's" "({ }: null) { fetchGit = 1; fetchMercurial = 2; }" (unexpected "fetchMercurial"),
+      failsInChild "a primop's name precedes the derivation wrapper's" "({ }: null) { commonAttrs = 1; toString = 2; }" (unexpected "toString"),
+      failsInChild "the empty name is a static symbol" "({ }: null) { zz = 1; \"\" = 2; }" (unexpected "\"\""),
+      failsInChild "a missing argument is the first in symbol order" "({ aa, value }: 1) { }" (callFailure "anonymous lambda" "without required argument 'value'")
+    ]
+
+-- | The errors of a call to a set pattern, of a select and of @abort@, as
+-- upstream words them at 2.24.9, with the lines of context it adds less
+-- their positions.  A set pattern checks every formal it lacks before
+-- anything unexpected (eval.cc:1546-1586) and names the function after
+-- the attribute it is bound to (parser-state.hh:176-177,
+-- nixexpr.cc:573-577); a select names the name its set lacks
+-- (eval.cc:1396-1404); @abort@ words its message (primops.cc:808).
+-- Upstream also adds @while calling the 'abort' builtin@ to @abort@'s
+-- failure and @while calling a functor ...@ to a functor's (eval.cc:1641,
+-- :1708), which this evaluator does not add, so the expectations leave
+-- them out.
+testCallErrorsIO :: IO [Bool]
+testCallErrorsIO = do
+  putStrLn "eval/call-errors-io"
+  tmpBase <- getTemporaryDirectory
+  let fails label source expected = runTestM label $ do
+        result <- evalNixIOTraced tmpBase source
+        pure $ case result of
+          Left failed -> assertEqual label expected failed
+          Right val -> Fail ("expected a failure, got " <> T.pack (show val))
+      missing function name = callFailure function ("without required argument '" <> name <> "'")
+      unexpected name = callFailure "anonymous lambda" ("with unexpected argument '" <> name <> "'")
+  sequence
+    [ fails "an argument missing beside an unexpected one is named first" "({ a }: a) { b = 1; }" (missing "anonymous lambda" "a"),
+      fails "a missing argument names the function" "({ a }: a) { }" (missing "anonymous lambda" "a"),
+      fails "a select names the name its set lacks" "{ a = 1; }.b" (EvalFailure [] "attribute 'b' missing"),
+      fails "abort words the message it was given" "abort \"boom\"" (EvalFailure [] "evaluation aborted with the following error message: 'boom'"),
+      runTestM "a call's failure is reported after its line of context" $ do
+        result <- evalNixIOTraced tmpBase "({ a }: a) { }"
+        pure $ case result of
+          Left failed -> assertEqual "report" "error:\n       \x2026 from call site\n\n       error: function 'anonymous lambda' called without required argument 'a'" (renderEvalFailure failed)
+          Right val -> Fail ("expected a failure, got " <> T.pack (show val)),
+      fails "a function bound in a let is named by its binding" "let f = { a }: a; in f { }" (missing "f" "a"),
+      fails "a function bound in a set is named, and the function its body is" "{ f = x: { a }: a; }.f 1 { }" (missing "f" "a"),
+      fails "a function at the end of an attribute path is named by its last name" "{ s.f = { a }: a; }.s.f { }" (missing "f" "a"),
+      fails "an @-pattern's function is named by its binding" "let f = args@{ a }: a; in f { }" (missing "f" "a"),
+      fails "an inherited function keeps its binding's name" "let f = { a }: a; s = { inherit f; }; in s.f { }" (missing "f" "a"),
+      fails "a function read back from a forced binding keeps its name" "let f = { a }: a; in builtins.seq f (f { })" (missing "f" "a"),
+      fails "an @-pattern's function read back from a forced binding keeps its name" "let f = args@{ a }: a; in builtins.seq f (f { })" (missing "f" "a"),
+      fails "a functor is named __functor" "{ __functor = self: { a }: a; } { }" (missing "__functor" "a"),
+      fails "a function a formal defaults to is anonymous" "({ g ? { a }: a }: g { }) { }" (missing "anonymous lambda" "a"),
+      fails "a function under an assert is anonymous" "let f = assert true; { a }: a; in f { }" (missing "anonymous lambda" "a"),
+      fails "an unexpected argument names the function" "let f = { }: 1; in f { a = 1; }" (callFailure "f" "with unexpected argument 'a'"),
+      fails
+        "an argument that is not a set"
+        "({ a }: a) 1"
+        (EvalFailure ["from call site", "while evaluating the value passed for the lambda argument"] "expected a set but found an integer: 1"),
+      fails "a select into a value that is not a set" "let v = 1; in v.a" (EvalFailure ["while selecting an attribute"] "expected a set but found an integer: 1"),
+      fails "a select names the name a set deeper in its path lacks" "{ a = { b = 1; }; }.a.c" (EvalFailure [] "attribute 'c' missing"),
+      fails "a select reads a name before forcing the value it selects from" "{ a = throw \"x\"; }.a.${throw \"y\"}" (EvalFailure [] "y"),
+      fails "a function is named by its binding as written" "{ \"a b\" = { a }: a; }.\"a b\" { }" (missing "a b" "a"),
+      fails "a function bound to the empty name is named by it" "{ \"\" = { a }: a; }.\"\" { }" (missing "" "a"),
+      fails "a missing argument prints bare" "({ a'-b }: 1) { }" (missing "anonymous lambda" "a'-b"),
+      fails "an unexpected identifier prints bare" "({ }: null) { a'-b = 1; }" (unexpected "a'-b"),
+      fails "an unexpected argument that is not an identifier prints as a string" "({ }: null) { \"a b\" = 1; }" (unexpected "\"a b\""),
+      fails "an unexpected argument that starts with a digit prints as a string" "({ }: null) { \"1x\" = 1; }" (unexpected "\"1x\""),
+      fails "an unexpected argument that is a keyword prints as a string" "({ }: null) { \"if\" = 1; }" (unexpected "\"if\""),
+      fails "an unexpected or prints bare, as or is no keyword" "({ }: null) { or = 1; }" (unexpected "or"),
+      fails "an unexpected argument past ASCII prints as a string" "({ }: null) { \"\x00e9\" = 1; }" (unexpected "\"\x00e9\""),
+      fails
+        "an unexpected argument prints with its quote and interpolation escaped"
+        "({ }: null) { \"a\\\"b\\${c\\n\" = 1; }"
+        (unexpected "\"a\\\"b\\${c\\n\""),
+      fails "a select names a missing attribute that is not an identifier as a string" "{ a = 1; }.\"b c\"" (EvalFailure [] "attribute '\"b c\"' missing"),
+      fails "a select names a missing keyword attribute as a string" "{ a = 1; }.\"if\"" (EvalFailure [] "attribute '\"if\"' missing"),
+      fails "a select names the missing empty attribute as a string" "{ a = 1; }.\"\"" (EvalFailure [] "attribute '\"\"' missing"),
+      fails "a select names a missing dynamic attribute as a string" "{ a = 1; }.${\"1x\"}" (EvalFailure [] "attribute '\"1x\"' missing"),
+      runTestIO "a select into a value that is not a set takes its default" tmpBase "{ a = 1; }.a.b or 2" (VInt 2)
     ]
 
 -- | @deepSeq@, @trace@ and @warn@ finish with their first argument before
@@ -23286,7 +23719,7 @@ instance Monad StubStoreEval where
 instance MonadEval StubStoreEval where
   throwEvalError msg = StubStoreEval (const (Left (StubOther msg)))
   throwCatchableError msg = StubStoreEval (const (Left (StubThrow msg)))
-  abortEvaluation msg = StubStoreEval (const (Left (StubOther ("evaluation aborted: " <> msg))))
+  abortEvaluation msg = StubStoreEval (const (Left (StubOther msg)))
   catchEvalError (StubStoreEval action) = StubStoreEval $ \env -> case action env of
     Left (StubThrow msg) -> Right (Left msg)
     Left other -> Left other
@@ -24069,10 +24502,10 @@ srcPosBack idx = case lookupPos idx of
 formalsBack :: EvalFormals -> IO Formals
 formalsBack formals = case formals of
   EFName name -> pure (FormalName name)
-  EFSet entries ellipsis -> do
+  EFSet _ entries ellipsis -> do
     back <- traverse formalBack entries
     pure (FormalSet back ellipsis)
-  EFNamedSet name entries ellipsis -> do
+  EFNamedSet _ name entries ellipsis -> do
     back <- traverse formalBack entries
     pure (FormalNamedSet name back ellipsis)
   where
@@ -24091,6 +24524,43 @@ bindingBack binding = case binding of
     keyBack (BcStaticKey sym) = pure (StaticKey (symbolText (Symbol sym)))
     keyBack (BcDynamicKey idx) = DynamicKey <$> childExpr idx
 
+-- | A closure keeps its formals type, ellipsis flag and formal count in
+-- one word (cbits/nn_lambda.h): the type in the top two bits, the flag
+-- below it and the count in the 29 bits left.  Each field reads back as
+-- packed at both ends of its range, and a type or count the word cannot
+-- hold is refused before anything is allocated.
+testLambdaShape :: IO [Bool]
+testLambdaShape = do
+  putStrLn "cbits/lambda-shape"
+  let maxFormals = clambdaShapeFormalCount maxBound
+      unpack shape = (clambdaShapeFormalsType shape, clambdaShapeAllowExtra shape, clambdaShapeFormalCount shape)
+      fields = [(formalsType, flag, count) | formalsType <- [0, 1, 2], flag <- [0, 1], count <- [0, 1, maxFormals - 1, maxFormals]]
+  sequence
+    [ runTest "the count takes the 29 bits below the flag" $
+        assertEqual "largest count" (2 ^ (29 :: Int) - 1) maxFormals,
+      runTest "every type and flag with a count at either end of its range reads back as packed" $
+        assertEqual "mismatches" [] [packed | packed@(formalsType, flag, count) <- fields, unpack (clambdaShape formalsType flag count) /= packed],
+      runTest "a nonzero flag packs as 1" $
+        assertEqual "flag" 1 (clambdaShapeAllowExtra (clambdaShape 2 255 0)),
+      runTestM "a closure reads back the shape it was made with" $ do
+        lam <- clambdaNew nullPtr 0 2 0 0 1 3
+        if lam == nullPtr
+          then pure (Fail "a closure of three formals was refused")
+          else do
+            formalsType <- clambdaFormalsType lam
+            flag <- clambdaAllowExtra lam
+            count <- clambdaFormalCount lam
+            pure (assertEqual "shape" (2, 1, 3) (formalsType, flag, count)),
+      runTestM "a count or type the shape cannot hold is refused" $ do
+        refused <-
+          sequence
+            [ clambdaNew nullPtr 0 1 0 0 0 (maxFormals + 1),
+              clambdaNew nullPtr 0 1 0 0 0 maxBound,
+              clambdaNew nullPtr 0 3 0 0 0 0
+            ]
+        pure (assertEqual "refused" [True, True, True] (map (== nullPtr) refused))
+    ]
+
 testBytecodeTags :: IO [Bool]
 testBytecodeTags = do
   putStrLn "bytecode/tags"
@@ -24108,6 +24578,38 @@ testBytecodeTags = do
           decodedFormals <- decodeBcFormals flags formalsOff >>= traverse formalsBack
           decodedCaptures <- decodeBcCaptureInfo captureOff
           pure ((decodedFormals, decodedCaptures) QC.=== (Just formals, Right captures)),
+      -- Upstream's addAttr names the function an attribute path's last
+      -- name binds, and ExprLambda::setName the function that is its body
+      -- (parser-state.hh:176-177, nixexpr.cc:573-577 at 2.24.9).
+      runTestM "a set pattern bound to a static name reads back named, as does the one its body is" $ do
+        let inner = ELambda (FormalSet [Formal "a" Nothing] False) (ELit NixNull) NoCaptureInfo
+            outer = ELambda (FormalNamedSet "args" [] True) inner NoCaptureInfo
+            boundBy key = ELet [NamedBinding (testPos 1 1) key outer] (ELit NixNull) NoCaptureInfo
+            -- The two names a binding's lambda and its body decode with.
+            lambdaNames expr = do
+              idx <- compileExpr expr
+              (count, dataOff) <- cbcCountedPayload idx =<< cbcArg1 idx
+              bindings <- decodeBcBindings count dataOff
+              case bindings of
+                Right [BcNamed _ _ outerIdx] -> do
+                  outerFormals <- formalsAt outerIdx
+                  innerFormals <- formalsAt =<< cbcArg2 outerIdx
+                  pure (lambdaNameOf =<< outerFormals, lambdaNameOf =<< innerFormals)
+                _ -> pure (Nothing, Nothing)
+            formalsAt idx = do
+              flags <- cbcFlags idx
+              decodeBcFormals flags =<< cbcArg1 idx
+            lambdaNameOf = \case
+              EFSet name _ _ -> Just name
+              EFNamedSet name _ _ _ -> Just name
+              EFName _ -> Nothing
+        named <- lambdaNames (boundBy (StaticKey "f"))
+        dynamic <- lambdaNames (boundBy (DynamicKey (ELit (NixInt 0))))
+        bare <- formalsAt =<< compileExpr inner
+        pure $
+          assertEqual "static" (Just (NamedLambda "f"), Just (NamedLambda "f")) named
+            `andThen` assertEqual "dynamic" (Just AnonymousLambda, Just AnonymousLambda) dynamic
+            `andThen` assertEqual "unbound" (Just AnonymousLambda) (lambdaNameOf =<< bare),
       runTestM "a compiled let's bindings and capture info read back as compiled" . quickCheckPasses $
         QC.forAll ((,) <$> QC.listOf genBinding <*> genCaptureInfo) $ \(bindings, captures) -> QC.ioProperty $ do
           idx <- compileExpr (ELet bindings (ELit NixNull) captures)
@@ -25777,6 +26279,8 @@ main =
     [flag, name] | flag == arenaGuardChildFlag -> arenaGuardChild name
     [flag, source] | flag == evalChildFlag -> bracket_ arenaInit arenaDestroy (evalChild source)
     [flag, source] | flag == internOrderChildFlag -> bracket_ arenaInit arenaDestroy (internOrderChild source)
+    [flag] | flag == startupSymbolsChildFlag -> bracket_ arenaInit arenaDestroy startupSymbolsChild
+    [flag, source] | flag == failureChildFlag -> bracket_ arenaInit arenaDestroy (failureChild source)
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
     _ -> withRunTempRoot (bracket_ arenaInit arenaDestroy runSuite)
 
@@ -25914,6 +26418,8 @@ runSuite = do
           testErrorContextIO,
           testFirstArgumentOrderIO,
           testParseOrderInterningIO,
+          testStartupSymbolsIO,
+          testCallErrorsIO,
           testTraceVerboseOff,
           testStorePathLinksIO,
           testDeepContextClosureIO,
@@ -26002,6 +26508,7 @@ runSuite = do
           testArenaGuard,
           testBytecodeCompile,
           testBytecodeTags,
+          testLambdaShape,
           testBytecodeCorrupt,
           testBytecodeCountSpill,
           testBytecodePerElement,

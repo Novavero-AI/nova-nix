@@ -141,9 +141,10 @@ import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
+import Nix.Eval.EvalFormals (LambdaName, lambdaNameText)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
-import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printValue)
+import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printSymbol, printValue)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos)
 import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
@@ -193,6 +194,7 @@ import Nix.Eval.Types
     envWithScopesRaw,
     evaluated,
     fillCAttrSetValues,
+    firstInSymbolOrder,
     mkStr,
     mkStrBytes,
     mkThunkBc,
@@ -699,7 +701,11 @@ evalBcLambda env bcIdx0 =
             pure $! VLambda (buildCaptureEnv EnvClosure env captureInfo) formals bodyBcIdx
         Nothing -> corruptBytecode "formals type" flags_
 
--- | Evaluate a select expression from bytecode.
+-- | Evaluate a select expression from bytecode, as upstream's
+-- @ExprSelect::eval@ does (eval.cc:1364-1411 at 2.24.9): with no default,
+-- a value the path goes into fails as one that is not a set, and a set
+-- that lacks the next name fails naming it as a symbol prints
+-- ('printSymbol').
 evalBcSelect :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcSelect env bcIdx0 = do
   let hasDef = unsafePerformIO (cbcFlags bcIdx0) /= 0
@@ -708,17 +714,12 @@ evalBcSelect env bcIdx0 = do
         unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg2 bcIdx0)
       defIdx = unsafePerformIO (cbcArg3 bcIdx0)
   targetVal <- evalBytecode env targetIdx
-  result <- walkBcAttrPath env pathLen pathOff targetVal
+  result <- walkBcAttrPath env pathLen pathOff (pure targetVal)
   case result of
-    Just val -> pure val
-    Nothing
-      | hasDef -> evalBytecode env defIdx
-      | otherwise -> do
-          let pathName = collectBcAttrPathNames pathLen pathOff
-              targetKeys = case targetVal of
-                VAttrs attrs -> T.intercalate ", " (take 20 (attrSetKeys attrs))
-                _ -> ""
-          throwEvalError ("attribute '" <> pathName <> "' not found in " <> typeName targetVal <> " {" <> targetKeys <> "}")
+    PathFound val -> pure val
+    _ | hasDef -> evalBytecode env defIdx
+    PathMissing name -> throwEvalError ("attribute '" <> printSymbol name <> "' missing")
+    PathNotASet val -> addErrorTrace (pure "while selecting an attribute") (throwEvalError (expectedSet val))
 
 -- | Evaluate a hasAttr expression from bytecode.
 evalBcHasAttr :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -728,17 +729,6 @@ evalBcHasAttr env bcIdx0 = do
         unsafePerformIO (cbcCountedPayload bcIdx0 =<< cbcArg2 bcIdx0)
   targetVal <- evalBytecode env targetIdx
   VBool <$> hasBcAttrPath env pathLen pathOff targetVal
-
--- | Collect static attribute path names for error reporting.
-collectBcAttrPathNames :: Int -> Word32 -> Text
-collectBcAttrPathNames pathLen pathOff = T.intercalate "." (go pathLen pathOff)
-  where
-    go 0 _ = []
-    go n off =
-      let isExpr = unsafePerformIO (cbcData off)
-          keyVal = unsafePerformIO (cbcData (off + 1))
-          name = if isExpr /= 0 then "<expr>" else symbolText (Symbol keyVal)
-       in name : go (n - 1) (off + 2)
 
 -- | Resolve one attr-path element (two words at @off@) to its key text.
 -- A dynamic key is read as upstream's select and has-attr read one
@@ -751,24 +741,32 @@ resolveBcAttrKey env off = do
     then evalBytecode env keyVal >>= attrNameOf "dynamic attribute key"
     else pure (symbolText (Symbol keyVal))
 
+-- | Where a select's walk down its attribute path ended.
+data PathWalk
+  = -- | Every name found: the value at the end, forced.
+    PathFound !NixValue
+  | -- | A set the path goes into lacks this name.
+    PathMissing !Text
+  | -- | A value the path goes into is not a set.
+    PathNotASet !NixValue
+
 -- | Walk an attribute path stored in the bytecode data buffer.
--- Each element is two words: (is_expr, key_or_bc_idx).  Every matched
--- element is forced - select needs the terminal value, and the walk
--- needs each intermediate to be a set.
-walkBcAttrPath :: (MonadEval m) => Env -> Int -> Word32 -> NixValue -> m (Maybe NixValue)
-walkBcAttrPath _ 0 _ val = pure (Just val)
-walkBcAttrPath env n off val = case val of
-  VAttrs attrs -> do
-    key <- resolveBcAttrKey env off
-    case attrSetLookup key attrs of
-      Just thunk -> do
-        inner <- force thunk
-        walkBcAttrPath env (n - 1) (off + 2) inner
-      Nothing -> pure Nothing
-  -- Non-attrset: attribute path cannot continue.  Return Nothing so
-  -- that callers with a default (``a.b or def'') can handle it
-  -- gracefully, matching C++ Nix behaviour.
-  _ -> pure Nothing
+-- Each element is two words: (is_expr, key_or_bc_idx).  Each step reads
+-- its name, then forces the value it selects from, then looks the name
+-- up, and the value found is forced at the next step or at the end, the
+-- order upstream's @ExprSelect::eval@ keeps (eval.cc:1383-1411 at
+-- 2.24.9), so a name that fails to evaluate fails before the value it
+-- selects from.
+walkBcAttrPath :: (MonadEval m) => Env -> Int -> Word32 -> m NixValue -> m PathWalk
+walkBcAttrPath _ 0 _ current = PathFound <$> current
+walkBcAttrPath env n off current = do
+  key <- resolveBcAttrKey env off
+  val <- current
+  case val of
+    VAttrs attrs -> case attrSetLookup key attrs of
+      Just thunk -> walkBcAttrPath env (n - 1) (off + 2) (force thunk)
+      Nothing -> pure (PathMissing key)
+    _ -> pure (PathNotASet val)
 
 -- | Presence walk for has-attr: intermediates force (the walk must reach
 -- a set), but the terminal element is a membership check only - upstream
@@ -1163,27 +1161,30 @@ matchFormals :: (MonadEval m) => Env -> EvalFormals -> Thunk -> m Env
 matchFormals closureEnv (EFName _) argThunk =
   let (sp, sc) = buildCSlots EnvCall [argThunk]
    in pure (envFromSlots EnvCall sp sc closureEnv)
-matchFormals closureEnv (EFSet formals allowExtra) argThunk = do
+matchFormals closureEnv (EFSet lambdaName formals allowExtra) argThunk = do
   argVal <- force argThunk
-  matchFormalSet closureEnv formals allowExtra argVal Nothing
-matchFormals closureEnv (EFNamedSet _ formals allowExtra) argThunk = do
+  matchFormalSet closureEnv lambdaName formals allowExtra argVal Nothing
+matchFormals closureEnv (EFNamedSet lambdaName _ formals allowExtra) argThunk = do
   argVal <- force argThunk
-  matchFormalSet closureEnv formals allowExtra argVal (Just argThunk)
+  matchFormalSet closureEnv lambdaName formals allowExtra argVal (Just argThunk)
 
--- | Match destructuring set pattern formals against an attrset value.
+-- | Match destructuring set pattern formals against an attrset value, as
+-- upstream's @callFunction@ does (eval.cc:1531-1586 at 2.24.9): the
+-- argument must be a set, then each formal the set lacks must have a
+-- default, then, with no ellipsis, the set may hold nothing else.
 --
 -- The env is a knot: a default is evaluated in it, where it may name
 -- another formal or the @-pattern, and its slots hold the defaults'
 -- thunks.  'tieFrame' builds it as upstream's @callFunction@ builds
--- @env2@ (eval.cc at 2.24.9).  A default is a 'mkThunkBc' and not a
--- 'cheapThunkBc', which would read a variable default out of a slot
--- 'tieFrame' has not filled yet.
-matchFormalSet :: (MonadEval m) => Env -> [EvalFormal] -> Bool -> NixValue -> Maybe Thunk -> m Env
-matchFormalSet closureEnv formals allowExtra argVal atThunk =
+-- @env2@.  A default is a 'mkThunkBc' and not a 'cheapThunkBc', which
+-- would read a variable default out of a slot 'tieFrame' has not filled
+-- yet.
+matchFormalSet :: (MonadEval m) => Env -> LambdaName -> [EvalFormal] -> Bool -> NixValue -> Maybe Thunk -> m Env
+matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
   case argVal of
     VAttrs attrs -> do
-      checkExtraKeys formals allowExtra attrs
-      formalValues <- formalSlots attrs formals
+      formalValues <- formalSlots lambdaName attrs formals
+      checkExtraKeys lambdaName formals allowExtra attrs
       let atSlot = maybeToList atThunk
           (formalEnv, _) =
             tieFrame
@@ -1192,30 +1193,50 @@ matchFormalSet closureEnv formals allowExtra argVal atThunk =
               (\slots slotCount -> envFromSlots EnvCallFormals slots slotCount closureEnv)
               (\frame -> atSlot ++ map ($ frame) formalValues)
       pure formalEnv
-    _ -> throwEvalError ("function expects a set argument, got " <> typeName argVal)
+    _ ->
+      callSiteError
+        $ addErrorTrace (pure "while evaluating the value passed for the lambda argument")
+        $ throwEvalError (expectedSet argVal)
 
-checkExtraKeys :: (MonadEval m) => [EvalFormal] -> Bool -> AttrSet -> m ()
-checkExtraKeys _ True _ = pure ()
-checkExtraKeys formals False attrs =
+-- | A failure of a call to a set pattern, with the line of context
+-- upstream's @callFunction@ adds for the call (eval.cc:1535, 1554, 1580
+-- at 2.24.9).  Upstream adds it to a non-set argument only when the call
+-- has a position, which every call written in source has; this evaluator
+-- records no call positions and adds it to every such failure.  Upstream
+-- adds it as well where forcing the argument fails, which this does not
+-- do, so that a call that succeeds installs no handler.  It adds it, and
+-- a @while calling@ line, to a failure in the function's body only under
+-- @show-trace@ (eval.cc:1603-1614), which this evaluator does not have.
+callSiteError :: (MonadEval m) => m a -> m a
+callSiteError = addErrorTrace (pure "from call site")
+
+-- | With no ellipsis, the first of the set's attributes in symbol order
+-- that no formal names fails the call, as upstream walks the set's
+-- @Bindings@ (eval.cc:1567-1584 at 2.24.9).  The message names the
+-- function as its binding spells it and the argument as a symbol prints
+-- ('printSymbol'), as upstream passes the one as a string and the other
+-- as a symbol.
+checkExtraKeys :: (MonadEval m) => LambdaName -> [EvalFormal] -> Bool -> AttrSet -> m ()
+checkExtraKeys _ _ True _ = pure ()
+checkExtraKeys lambdaName formals False attrs =
   let expected = map efName formals
-      actual = attrSetKeys attrs
-      extra = filter (`notElem` expected) actual
+      extra = filter (`notElem` expected) (attrSetKeys attrs)
    in case extra of
         [] -> pure ()
-        (k : _) -> throwEvalError ("unexpected attribute '" <> k <> "' in function argument")
+        (k : _) -> callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called with unexpected argument '" <> printSymbol k <> "'"))
 
 -- | Each formal's slot as a function of the env its default is evaluated
 -- in: the argument's own thunk, or a thunk of the default there.  A
--- formal with neither fails the call, naming every such formal.
-formalSlots :: (MonadEval m) => AttrSet -> [EvalFormal] -> m [Env -> Thunk]
-formalSlots attrs formals =
+-- formal with neither fails the call, the first such in symbol order
+-- named, as upstream sorts a set pattern's formals by symbol
+-- (@validateFormals@, parser-state.hh:186-189 at 2.24.9) and stops at the
+-- first it cannot fill (eval.cc:1546-1557).
+formalSlots :: (MonadEval m) => LambdaName -> AttrSet -> [EvalFormal] -> m [Env -> Thunk]
+formalSlots lambdaName attrs formals =
   case partitionEithers (map formalSlot formals) of
     ([], slots) -> pure slots
-    (missing@(name : _), _) ->
-      let provided = attrSetKeys attrs
-          provSnippet = T.intercalate ", " (take 20 provided)
-          missSnippet = T.intercalate ", " missing
-       in throwEvalError ("missing required attribute '" <> name <> "'; all missing: [" <> missSnippet <> "]; provided keys (" <> T.pack (show (length provided)) <> "): [" <> provSnippet <> "]")
+    (name : names, _) ->
+      callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called without required argument '" <> printSymbol (firstInSymbolOrder (name :| names)) <> "'"))
   where
     formalSlot (EvalFormal name defBcIdx) = case attrSetLookup name attrs of
       Just thunk -> Right (const thunk)
@@ -1862,8 +1883,10 @@ builtinThrow :: (MonadEval m) => NixValue -> m NixValue
 builtinThrow (VStr msg _) = throwCatchableError (bytesToTextLossy msg)
 builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <> typeName other)
 
+-- | Upstream's @prim_abort@ words the message it was given
+-- (primops.cc:808 at 2.24.9).
 builtinAbort :: (MonadEval m) => NixValue -> m NixValue
-builtinAbort (VStr msg _) = abortEvaluation (bytesToTextLossy msg)
+builtinAbort (VStr msg _) = abortEvaluation ("evaluation aborted with the following error message: '" <> bytesToTextLossy msg <> "'")
 builtinAbort other = abortEvaluation ("builtins.abort: expected a string, got " <> typeName other)
 
 -- | @builtins.addErrorContext message value@: the value, forced, and when
@@ -2748,8 +2771,8 @@ builtinFunctionArgs _ = throwEvalError "'functionArgs' requires a function"
 
 formalsToAttrs :: EvalFormals -> NixValue
 formalsToAttrs (EFName _) = VAttrs (attrSetFromMap SetFunctionArgs Map.empty)
-formalsToAttrs (EFSet formals _) = formalsListToAttrs formals
-formalsToAttrs (EFNamedSet _ formals _) = formalsListToAttrs formals
+formalsToAttrs (EFSet _ formals _) = formalsListToAttrs formals
+formalsToAttrs (EFNamedSet _ _ formals _) = formalsListToAttrs formals
 
 formalsListToAttrs :: [EvalFormal] -> NixValue
 formalsListToAttrs formals =
@@ -5940,8 +5963,8 @@ xmlDerivationIdentity attrs = do
 formalsToXML :: Int -> EvalFormals -> BB.Builder
 formalsToXML depth formals = case formals of
   EFName name -> xmlEmpty depth "varpat" [("name", TE.encodeUtf8 name)]
-  EFSet entries ellipsis -> attrsPattern (ellipsisAttr ellipsis) entries
-  EFNamedSet name entries ellipsis -> attrsPattern (ellipsisAttr ellipsis <> [("name", TE.encodeUtf8 name)]) entries
+  EFSet _ entries ellipsis -> attrsPattern (ellipsisAttr ellipsis) entries
+  EFNamedSet _ name entries ellipsis -> attrsPattern (ellipsisAttr ellipsis <> [("name", TE.encodeUtf8 name)]) entries
   where
     ellipsisAttr ellipsis = [("ellipsis", "1") | ellipsis]
     attrsPattern attrs entries =
