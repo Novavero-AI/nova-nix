@@ -130,7 +130,7 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
-import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, reservedApply1, reservedApply2, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, reservedApply1, reservedApply2, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CThunk (CThunkPtr)
@@ -140,7 +140,7 @@ import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs,
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printValue)
-import Nix.Eval.SourcePos (RecordedPos (..), lookupPos)
+import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos)
 import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolText)
 import Nix.Eval.Types
@@ -340,6 +340,7 @@ evalBytecode env bcIdx =
         OpSearchPath ->
           let sym = unsafePerformIO (cbcArg1 bcIdx)
            in evalSearchPath env (symbolText (Symbol sym))
+        OpPos -> pure (positionValue (PosIdx (unsafePerformIO (cbcArg1 bcIdx))))
         _ -> throwEvalError "evalBytecode: unknown opcode"
 
 -- ---------------------------------------------------------------------------
@@ -1890,12 +1891,9 @@ builtinGetAttr other _ =
   throwEvalError ("builtins.getAttr: expected a string, got " <> typeName other)
 
 -- | Where an attribute was defined, as upstream's @prim_unsafeGetAttrPos@
--- and @EvalState::mkPos@ give it (primops.cc and eval.cc at 2.24.9):
--- @{ column; file; line; }@ for one defined in a file, and null for a
--- missing attribute, one no source defines (a builtin's, or one a builtin
--- made), and one defined in text with no file behind it.  The name is read
--- as upstream's @forceStringNoCtx@ reads it, and checked before the set is
--- forced.
+-- gives it (primops.cc at 2.24.9): its 'positionValue', and null for a
+-- missing attribute.  The name is read as upstream's @forceStringNoCtx@
+-- reads it, and checked before the set is forced.
 builtinUnsafeGetAttrPos :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
 builtinUnsafeGetAttrPos nameVal setArg = do
   nameBytes <- structuredStringValue RefuseContext nameVal
@@ -1904,16 +1902,25 @@ builtinUnsafeGetAttrPos nameVal setArg = do
     VAttrs attrs -> pure attrs
     other -> throwEvalError ("expected a set but found " <> typeName other <> ": " <> printValue PrintForError other)
   name <- decodedText "builtins.unsafeGetAttrPos" nameBytes
-  pure (maybe VNull positionValue (lookupPos . entryPos =<< attrSetLookupEntry name attrs))
-  where
-    positionValue (PosInFile file line column) =
-      VAttrs . attrSetFromMap $
-        Map.fromList
-          [ ("column", evaluated (VInt (fromIntegral column))),
-            ("file", evaluated (mkStr file)),
-            ("line", evaluated (VInt (fromIntegral line)))
-          ]
-    positionValue (PosInText _ _) = VNull
+  pure (maybe VNull (positionValue . entryPos) (attrSetLookupEntry name attrs))
+
+-- | The value of a position, as upstream's @EvalState::mkPos@ makes it
+-- (eval.cc at 2.24.9): @{ column; file; line; }@ for one in a file, the
+-- file a string, and null for one in text with no file behind it and for
+-- 'Nix.Eval.SourcePos.noPos', the position of what no source defines.  The
+-- set's own attributes are at 'Nix.Eval.SourcePos.noPos', as @mkPos@
+-- allocates them with none.
+positionValue :: PosIdx -> NixValue
+positionValue idx = case lookupPos idx of
+  Just (PosInFile file line column) ->
+    VAttrs . attrSetFromMap $
+      Map.fromList
+        [ ("column", evaluated (VInt (fromIntegral column))),
+          ("file", evaluated (mkStr file)),
+          ("line", evaluated (VInt (fromIntegral line)))
+        ]
+  Just (PosInText _ _) -> VNull
+  Nothing -> VNull
 
 builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinRemoveAttrs (VAttrs attrs) (VList cl) = do

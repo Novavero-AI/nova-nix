@@ -256,6 +256,12 @@ data Expr
     EBinary !BinaryOp !Expr !Expr
   | -- | Search path lookup: @\<nixpkgs\>@ is @ESearchPath "nixpkgs"@.
     ESearchPath !Text
+  | -- | @__curPos@, at the position it is written.  Upstream's parser reads
+    -- that identifier as a position wherever it is an expression, never as
+    -- a variable (@expr_simple@, parser.y at 2.24.9), so no binding of the
+    -- name reaches it.  It evaluates to the set @EvalState::mkPos@ makes of
+    -- the position (@ExprPos::eval@, eval.cc).
+    EPos !SrcPos
   | -- | De Bruijn-style resolved variable: @(level, index)@.
     -- Produced by 'Nix.Expr.Resolve.resolveVars' for variables
     -- bound by lambda formals.  @level@ counts parent-chain hops;

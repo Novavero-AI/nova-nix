@@ -1,8 +1,8 @@
 /*
  * nn_bytecode.h -- Flat bytecode representation for Nix expressions.
  *
- * Compiles the 19-constructor Expr AST into a contiguous instruction
- * array (nn_op_t[]) plus a variable-length data buffer (uint32_t[]).
+ * Compiles the Expr AST into a contiguous instruction array (nn_op_t[])
+ * plus a variable-length data buffer (uint32_t[]).
  * Each Expr node maps to exactly one instruction.  Children are
  * referenced by their index in the instruction array (post-order
  * traversal guarantees children < parent).  Variable-length data
@@ -50,6 +50,7 @@
 #define NN_OP_BINARY        22
 #define NN_OP_SEARCH_PATH   23
 #define NN_OP_PATH_STR      24
+#define NN_OP_POS           25
 
 /* --- App flags (NN_OP_APP) --- */
 

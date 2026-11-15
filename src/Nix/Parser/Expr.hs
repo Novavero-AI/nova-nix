@@ -421,7 +421,9 @@ parseAtom = do
     TokPath p -> advance >> pure (ELit (NixPath p))
     TokPathInterpStart headPiece -> advance >> EPathStr headPiece <$> parsePathParts
     TokSearchPath p -> advance >> pure (ESearchPath p)
-    TokIdent name -> advance >> pure (EVar name)
+    TokIdent name
+      | name == curPosIdentifier -> EPos <$> currentPos <* advance
+      | otherwise -> advance >> pure (EVar name)
     TokStringOpen -> parseString
     TokIndStringOpen -> parseIndString
     TokLParen -> parseParen
@@ -438,6 +440,13 @@ parseAtom = do
     TokWith -> parseWith
     TokAssert -> parseAssert
     _ -> parseError ("unexpected " <> showToken tok)
+
+-- | The identifier upstream's parser reads as the position it is written
+-- at rather than as a variable, wherever it is an expression (the @ID@
+-- rule of @expr_simple@, parser.y at 2.24.9).  Only that rule checks the
+-- name: an @inherit@ copies a variable of any name, @__curPos@ included.
+curPosIdentifier :: Text
+curPosIdentifier = "__curPos"
 
 -- ---------------------------------------------------------------------------
 -- Strings

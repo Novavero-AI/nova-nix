@@ -110,6 +110,7 @@ trimExpr expr = case expr of
   EUnary op operand -> EUnary op (trimExpr operand)
   EBinary op l r -> EBinary op (trimExpr l) (trimExpr r)
   ESearchPath {} -> expr
+  EPos {} -> expr
 
 trimPart :: StringPart -> StringPart
 trimPart p@(StrLit _) = p
@@ -265,6 +266,7 @@ collectFreeVars depth expr = case expr of
         (vs2, h2, w2) = collectFreeVars depth r
      in (Set.union vs1 vs2, h1 || h2, w1 || w2)
   ESearchPath {} -> (Set.empty, False, False)
+  EPos {} -> (Set.empty, False, False)
 
 foldExprs :: Int -> [Expr] -> (Set (Int, Int), Bool, Bool)
 foldExprs depth = foldl' combine (Set.empty, False, False)
@@ -386,6 +388,7 @@ rewriteBody depth captureMap expr = case expr of
   EBinary op l r ->
     EBinary op (rewriteBody depth captureMap l) (rewriteBody depth captureMap r)
   ESearchPath {} -> expr
+  EPos {} -> expr
 
 rewritePart :: Int -> Map (Int, Int) Int -> StringPart -> StringPart
 rewritePart _ _ p@(StrLit _) = p

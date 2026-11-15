@@ -80,6 +80,7 @@ resolve stack expr = case expr of
   EPathStr headPiece parts -> EPathStr headPiece <$> traverse (resolvePart stack) parts
   EVar name -> resolveVar stack name
   EResolvedVar _ _ -> Right expr
+  EPos _ -> Right expr
   EAttrs True bindings _captureInfo
     | allStaticSingleKey bindings ->
         -- Positional: all bindings are single static keys or inherits.
@@ -170,7 +171,6 @@ resolveVar fullStack name = go fullStack 0 False
   where
     go [] _ crossedWith
       | crossedWith = Right (EWithVar name)
-      | name == curPosName = Right (EVar name)
       | otherwise = Left name
     go (LexicalScope scope : rest) level crossedWith =
       case Map.lookup name scope of
@@ -182,18 +182,6 @@ resolveVar fullStack name = go fullStack 0 False
     -- WithBarrier does NOT increment level (with doesn't create an env
     -- level at runtime); it only records that an enclosing with exists.
     go (WithBarrier : rest) level _ = go rest level True
-
--- | A temporary accommodation.  Upstream's parser reads @__curPos@ as a
--- position expression, never a variable (parser.y at 2.24.9, expr_simple),
--- so binding never sees it.  Here it still parses as a variable: 'Nix.Parser.parseNix'
--- takes the source's origin, which decides between upstream's position set
--- (a file) and its null (a string), but no expression builds a position
--- from it.  Until one does, the name is exempt from the check and fails
--- when forced, as before binding checked anything; nixpkgs uses it in files
--- every NixOS evaluation imports.  Delete the exemption when the parser
--- builds the position.
-curPosName :: Text
-curPosName = "__curPos"
 
 -- | The names upstream binds in its base environment by default, which is
 -- every name the root environment ('Nix.Builtins.builtinEnv') binds and
@@ -500,6 +488,7 @@ resolveRelativePaths dir = goExpr
       EVar _ -> expr
       EWithVar _ -> expr
       EResolvedVar _ _ -> expr
+      EPos _ -> expr
       EAttrs isRec bindings captureInfo -> EAttrs isRec (map goBinding bindings) captureInfo
       EList elems -> EList (map goExpr elems)
       ESelect target path mDef ->

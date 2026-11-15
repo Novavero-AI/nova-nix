@@ -3957,6 +3957,7 @@ testImportIO = do
         TIO.writeFile (testDir </> "attrset.nix") "{ x = 1; y = 2; }"
         TIO.writeFile (testDir </> "uses-arg.nix") "let f = x: x + 10; in f 5"
         TIO.writeFile (testDir </> "positions.nix") "{\n  a = 1;\n}\n"
+        TIO.writeFile (testDir </> "curpos.nix") "\n  __curPos\n"
         TIO.writeFile (subDir </> "from-sub.nix") "7"
       cleanup = do
         exists <- doesDirectoryExist testDir
@@ -3987,6 +3988,14 @@ testImportIO = do
             "unsafeGetAttrPos names the imported file"
             canonicalDir
             "let p = builtins.unsafeGetAttrPos \"a\" (import ./positions.nix); in \"${p.file}:${toString p.line}:${toString p.column}\""
+            (mkStr (T.pack file <> ":2:3")),
+        do
+          canonicalDir <- Dir.canonicalizePath testDir
+          file <- Dir.canonicalizePath (canonicalDir </> "curpos.nix")
+          runTestIO
+            "__curPos names the imported file"
+            canonicalDir
+            "let p = import ./curpos.nix; in \"${p.file}:${toString p.line}:${toString p.column}\""
             (mkStr (T.pack file <> ":2:3")),
         -- A string is coerced to a path only when it spells an absolute
         -- one; upstream refuses a relative string outright.
@@ -4110,21 +4119,70 @@ testUnsafeGetAttrPos = do
         assertEvalError "set" "builtins.unsafeGetAttrPos \"a\" 1" "expected a set but found an integer: 1"
     ]
   where
-    inFile label source (line, column) = position label source (positionJson positionsFile line column)
-    inWrapper label name (line, column) = position label (derivationAttrPos name) (positionJson derivationWrapperFile line column)
-    noPosition label source = position label source "null"
-    -- toJSON pins the set mkPos builds: these three attributes only, the
-    -- file a string and the line and column integers.
-    position label source expected =
-      runTest label $
-        assertRight label (evalNixInFile ("builtins.toJSON (" <> source <> ")")) $ \actual ->
-          assertEqual label (mkStr expected) actual
-    positionJson file line column =
-      "{\"column\":" <> T.pack (show (column :: Int)) <> ",\"file\":\"" <> file <> "\",\"line\":" <> T.pack (show (line :: Int)) <> "}"
+    inFile label source (line, column) = jsonInFile label source (positionJson positionsFile line column)
+    inWrapper label name (line, column) = jsonInFile label (derivationAttrPos name) (positionJson derivationWrapperFile line column)
+    noPosition label source = jsonInFile label source "null"
     derivationAttrPos name =
       "builtins.unsafeGetAttrPos \"" <> name <> "\" (derivation {\n  name = \"n\";\n  builder = \"b\";\n  system = \"s\";\n})"
     afterCommentLine ending =
       T.intercalate ending ["builtins.unsafeGetAttrPos \"b\" {", "  # a comment", "  b = 1;", "}"]
+
+-- | Assert that @builtins.toJSON@ of source parsed as 'positionsFile' is
+-- the expected JSON.  toJSON pins the set @EvalState::mkPos@ builds: its
+-- three attributes only, the file a string and the line and column
+-- integers.
+jsonInFile :: Text -> Text -> Text -> IO Bool
+jsonInFile label source expected =
+  runTest label $
+    assertRight label (evalNixInFile ("builtins.toJSON (" <> source <> ")")) $ \actual ->
+      assertEqual label (mkStr expected) actual
+
+-- | The JSON of the position set for a line and column in a file.
+positionJson :: Text -> Int -> Int -> Text
+positionJson file line column =
+  "{\"column\":" <> T.pack (show column) <> ",\"file\":\"" <> file <> "\",\"line\":" <> T.pack (show line) <> "}"
+
+-- ---------------------------------------------------------------------------
+-- Tests: __curPos
+-- ---------------------------------------------------------------------------
+
+-- | Each expected value is derived from upstream's source at 2.24.9: the
+-- parser reads every @__curPos@ its @expr_simple@ rule reaches as an
+-- @ExprPos@ at the identifier, whatever binds the name, while the
+-- variable an @inherit@ copies is an @ExprVar@ built without that check
+-- (parser.y); and @ExprPos::eval@ answers @EvalState::mkPos@ of that
+-- position (eval.cc), the position set in a file and null in text with
+-- no file behind it (@parseExprFromString@'s @Pos::String@).  The
+-- expressions put every @__curPos@ under test past line 1, so the
+-- @builtins.toJSON (@ 'jsonInFile' prefixes moves no column.
+testCurPos :: IO [Bool]
+testCurPos = do
+  putStrLn "parse/curPos"
+  sequence
+    [ runTest "the parser reads __curPos as a position" $
+        assertParse "position node" "__curPos" (EPos (SrcPos testOrigin 1 1)),
+      inFile "a file gives the position it is written at" "\n  __curPos" (2, 3),
+      inFile "a position in a set is at the identifier" "{\n  a = __curPos;\n}.a" (2, 7),
+      inFile "a position in a function body is at the identifier" "(x:\n  __curPos) 1" (2, 3),
+      inFile "a let binding the name does not shadow it" "let __curPos = 1; in\n  __curPos" (2, 3),
+      inFile "a formal of the name does not shadow it" "(__curPos:\n  __curPos) 1" (2, 3),
+      inFile "a with supplying the name does not shadow it" "with { __curPos = 1; };\n  __curPos" (2, 3),
+      -- mkPos fills the set with buildBindings' alloc, whose attributes
+      -- are at noPos, which mkPos answers null for.
+      jsonInFile "a position's attributes have no position" "builtins.unsafeGetAttrPos \"line\" (\n  __curPos)" "null",
+      runTest "text with no file gives null" $
+        assertEval "text" "__curPos" VNull,
+      runTest "a let binding the name in text gives null, not the binding" $
+        assertEval "text let" "let __curPos = 1; in __curPos" VNull,
+      runTest "an inherited __curPos is a variable" $
+        assertEval "inherit" "let __curPos = 1; in { inherit __curPos; }.__curPos" (VInt 1),
+      runTest "an inherited __curPos nothing binds is undefined" $
+        assertUnbound "inherit unbound" "{ inherit __curPos; }" "__curPos",
+      runTest "an attribute may be named __curPos" $
+        assertEval "attribute" "{ __curPos = 1; }.__curPos" (VInt 1)
+    ]
+  where
+    inFile label source (line, column) = jsonInFile label source (positionJson positionsFile line column)
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch A - getEnv, currentTime, toPath
@@ -22506,6 +22564,7 @@ runSuite = do
           testImportPure,
           testImportIO,
           testUnsafeGetAttrPos,
+          testCurPos,
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
           testFirstArgumentOrderIO,
