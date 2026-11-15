@@ -48,13 +48,41 @@
 # binutils', each named by the target's name, the only name either puts on
 # PATH: configure, the build being its own host, looks the host's tools up
 # under their bare names (configure.ac:1292 and 3273-3284), and the seed
-# stdenv's CC, AR and LD are tcc's.  STRIP names binutils' strip, which
-# install-strip, nixpkgs' install target, runs on each program it installs
-# (gcc/Makefile.in:4500-4505); under the bare name configure finds none,
-# and install-strip would strip nothing.  preConfigure unsets
-# C_INCLUDE_PATH, which holds TinyCC's headers for tcc, as mingw-w64-crt's
-# does: GCC searches it before its own headers and MinGW-w64's
+# stdenv's CC, AR and LD are tcc's.  preConfigure unsets C_INCLUDE_PATH,
+# which holds TinyCC's headers for tcc, as mingw-w64-crt's does: GCC
+# searches it before its own headers and MinGW-w64's
 # (gcc/incpath.c:455-462).
+#
+# No program carries the time it was built.  binutils' ld writes the time
+# of the link into a PE image's header unless it is given
+# --no-insert-timestamp (ld/emultempl/pe.em:162 and 1616-1619,
+# bfd/peXXigen.c:838-843), which GCC's link spec for MinGW never passes
+# (gcc/config/i386/mingw32.h:99-105), and the seed stdenv has no compiler
+# wrapper to add it, as the stage-1 stdenv's cc-wrapper.sh does.  LDFLAGS
+# passes it to every link gcc46 makes here: the host's programs take
+# LDFLAGS, and so do the build machine's, the build being the host
+# (configure.ac:3124-3128, gcc/configure.ac:1798-1801).  It replaces the
+# stdenv's LDFLAGS, whose -L flags name gcc46's and binutils' lib
+# directories, from which the build links nothing.  strip writes the time
+# again, over the zero ld wrote, unless it is run with -p
+# (binutils/objcopy.c:2836-2839), as nixpkgs' strip hook runs it
+# (pkgs/build-support/setup-hooks/strip.sh).  The install phase therefore
+# gives make STRIP, binutils' strip by the target's name with -p, which
+# install-strip, nixpkgs' install target, runs on each program it installs
+# (gcc/Makefile.in:4500-4505, fixincludes/Makefile.in:191-193).  It is a
+# make variable on the command line, since the stdenv splits
+# configureFlags and makeFlags at spaces, and it has to be given:
+# configure, looking for strip under its bare name, finds none and
+# records true (configure.ac:3280).
+#
+# Two builds at the output's own path are then the same bytes, but
+# nova-nix build --check, which builds at a scratch path and rewrites its
+# hash in what the builder wrote, finds the five drivers, cc1 and cc1plus
+# differ.  Each names the output, and each carries a sum of its bytes that
+# no rewrite of the hash reaches: the PE checksum ld and strip write
+# (bfd/coffcode.h:3394-3427), and in cc1 and cc1plus the MD5 of the
+# objects they link (gcc/genchecksum.c:97-119), two of which compile the
+# prefix in (gcc/Makefile.in:2200-2204 and 3978-3990).
 #
 # CFLAGS and CXXFLAGS are nixpkgs' -O1, and the target libraries' its -O0
 # without the -dynamic-linker it adds for musl.  The target libraries'
@@ -152,19 +180,20 @@ seedStdenv.mkDerivation {
     "CC=${target}-gcc"
     "AR=${target}-ar"
     "LD=${target}-ld"
-    "STRIP=${target}-strip"
     "CFLAGS=-O1"
     "CXXFLAGS=-O1"
     "CFLAGS_FOR_TARGET=-O0"
     "CXXFLAGS_FOR_TARGET=-O0"
+    "LDFLAGS=-Wl,--no-insert-timestamp"
   ];
 
   makeFlags = [ "LIBGCC2_DEBUG_CFLAGS=-g0" ];
 
   # make runs $NIX_BUILD_CORES jobs and installs with install-strip, as
-  # minimal-bootstrap/gcc/4.6.cxx.nix's make does.
+  # minimal-bootstrap/gcc/4.6.cxx.nix's make does, stripping with -p (see
+  # above).
   enableParallelBuilding = true;
-  installPhase = "make \${enableParallelInstalling:+-j$NIX_BUILD_CORES} $makeFlags install-strip";
+  installPhase = "make \${enableParallelInstalling:+-j$NIX_BUILD_CORES} $makeFlags 'STRIP=${target}-strip -p' install-strip";
 }
 // {
   # gcc-core lists the archives the two share.
