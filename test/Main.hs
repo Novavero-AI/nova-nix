@@ -4035,6 +4035,55 @@ testImportIO = do
       ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: attribute names a program computes
+-- ---------------------------------------------------------------------------
+
+-- | Every reader of a computed attribute name reads it as upstream's
+-- @forceStringNoCtx@ does (eval.cc and primops.cc at 2.24.9): a string,
+-- with a name that has context refused, naming the context's first
+-- element, and the same name with its context discarded read as before.
+testAttrNameContext :: IO [Bool]
+testAttrNameContext = do
+  putStrLn "eval/attr-name-context"
+  let named body =
+        "let c = builtins.appendContext \"a\" { \"/nix/store/00000000000000000000000000000000-a\" = { path = true; }; };"
+          <> " p = builtins.unsafeDiscardStringContext c; in "
+          <> body
+      refusal = "the string 'a' is not allowed to refer to a store path (such as '00000000000000000000000000000000-a')"
+      refused reader body = runTest (reader <> " refuses a name with context") (assertEvalError reader (named body) refusal)
+      kept reader body = runTest (reader <> " reads a name without context") (assertEval reader (named body) (VBool True))
+  sequence
+    [ refused "listToAttrs" "builtins.listToAttrs [ { name = c; value = 1; } ]",
+      kept "listToAttrs" "builtins.listToAttrs [ { name = p; value = 1; } ] == { a = 1; }",
+      refused "a dynamic attribute" "{ ${c} = 1; }",
+      kept "a dynamic attribute" "{ ${p} = 1; } == { a = 1; }",
+      refused "a select" "{ a = 1; }.${c}",
+      kept "a select" "{ a = 1; }.${p} == 1",
+      refused "a has-attr test" "{ a = 1; } ? ${c}",
+      kept "a has-attr test" "{ a = 1; } ? ${p}",
+      refused "getAttr" "builtins.getAttr c { a = 1; }",
+      kept "getAttr" "builtins.getAttr p { a = 1; } == 1",
+      refused "hasAttr" "builtins.hasAttr c { a = 1; }",
+      kept "hasAttr" "builtins.hasAttr p { a = 1; }",
+      refused "removeAttrs" "builtins.removeAttrs { a = 1; } [ c ]",
+      kept "removeAttrs" "builtins.removeAttrs { a = 1; b = 2; } [ p ] == { b = 2; }",
+      refused "catAttrs" "builtins.catAttrs c [ { a = 1; } ]",
+      kept "catAttrs" "builtins.catAttrs p [ { a = 1; } ] == [ 1 ]",
+      refused "groupBy" "builtins.groupBy (x: c) [ 1 ]",
+      kept "groupBy" "builtins.groupBy (x: p) [ 1 ] == { a = [ 1 ]; }",
+      -- The wrapper makes its output attributes with listToAttrs.
+      refused "derivation" "builtins.seq (derivation { name = \"w\"; system = \"x\"; builder = \"/bin/sh\"; outputs = [ \"out\" c ]; }) null",
+      -- forceStringNoCtx is forceString first, whose refusal of a value
+      -- that is not a string is upstream's.
+      runTest "a name that is not a string is refused with forceString's message" $
+        assertEvalError "getAttr-int" "builtins.getAttr 1 { }" "expected a string but found an integer: 1",
+      runTest "a select refuses a null name" $
+        assertEvalError "select-null" "{ a = 1; }.${null}" "expected a string but found null: null",
+      runTest "a dynamic attribute whose name is null binds nothing" $
+        assertEval "dynamic-null" "{ ${null} = 1; } == { }" (VBool True)
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Tests: builtins.unsafeGetAttrPos
 -- ---------------------------------------------------------------------------
 
@@ -20494,7 +20543,9 @@ testClassIFollowups = do
               [ "let dep = ",
                 depSrc,
                 "; in (derivation { name = \"main\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; ",
-                "input = builtins.appendContext \"x\" { \"${dep.drvPath}\" = { outputs = [\"out\"]; }; }; }).drvPath"
+                -- An attribute name may not carry context, so the key
+                -- is the path's text alone, as nixpkgs writes it.
+                "input = builtins.appendContext \"x\" { \"${builtins.unsafeDiscardStringContext dep.drvPath}\" = { outputs = [\"out\"]; }; }; }).drvPath"
               ]
         pure $ case (stubResult, ioResult) of
           (Right (VStr a _), Right (VStr b _))
@@ -22759,6 +22810,7 @@ runSuite = do
           testImportIO,
           testUnsafeGetAttrPos,
           testCurPos,
+          testAttrNameContext,
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
           testFirstArgumentOrderIO,
