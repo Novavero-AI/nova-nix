@@ -185,47 +185,6 @@ issue-376 a094 force-outputName
 issue-376 a094 force-type
 issue-376 a094 force-x
 
-# issue-377 (#377): derivationStrict checks system, builder and
-# outputs before it forces the other attributes.
-issue-377 a027 by-name
-issue-377 a027 paths
-issue-377 a027 coerced
-issue-377 a027 xml
-issue-377 a027 eq-by-name
-issue-377 a027 eq-without-paths
-issue-377 a027 force-drvPath
-issue-377 a027 force-outPath
-issue-377 a055 by-name
-issue-377 a055 paths
-issue-377 a055 coerced
-issue-377 a055 xml
-issue-377 a055 eq-by-name
-issue-377 a055 force-drvPath
-issue-377 a055 force-outPath
-issue-377 a056 paths
-issue-377 a056 coerced
-issue-377 a056 xml
-issue-377 a056 eq-by-name
-issue-377 a056 eq-without-paths
-issue-377 a056 force-drvPath
-issue-377 a056 force-outPath
-issue-377 a061 paths
-issue-377 a061 coerced
-issue-377 a061 xml
-issue-377 a061 force-drvPath
-issue-377 a061 force-outPath
-issue-377 a087 paths
-issue-377 a087 coerced
-issue-377 a087 xml
-issue-377 a087 eq-by-name
-issue-377 a087 eq-without-paths
-issue-377 a087 force-drvPath
-issue-377 a087 force-outPath
-issue-377 a099 paths
-issue-377 a099 coerced
-issue-377 a099 xml
-issue-377 a099 force-drvPath
-issue-377 a099 force-outPath
 
 # issue-378 (#378): a closed pattern names the unexpected argument nova-nix
 # interned first.
