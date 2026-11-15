@@ -61,15 +61,14 @@ module Nix.Eval.Types
     emptyEnv,
     envLookup,
     envLookupResolved,
-    envFromSlots,
+    newEnv,
+    newScopeEnv,
     pushLazyWithScope,
     buildCaptureEnv,
     withScopeAt,
     resolveWithScopeAt,
     withScopesForCapture,
     envWithScopesRaw,
-    newCEnv,
-    newMinimalEnv,
 
     -- * Eval-time formals (re-exported from EvalFormals)
     EvalFormals (..),
@@ -87,7 +86,6 @@ module Nix.Eval.Types
     evaluated,
     thunkSameRef,
     thunkToCPtr,
-    buildCSlots,
     tieFrame,
 
     -- * Lambda marshalling
@@ -150,7 +148,7 @@ import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetP
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CData (CData (..), MonadCData (..), cdataIO, inspectForDisplay, runCDataPure)
-import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
+import Nix.Eval.CEnv (NnEnv, cenvAllocWithScopes, cenvEmpty, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaLambdaNameSym, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CStatus (cInvariantViolated, checkedCPtr)
@@ -536,9 +534,10 @@ fillCAttrSetValues cset thunkMap =
 
 -- | Evaluation environment - C-backed scope chain.
 --
--- Arena-allocated @nn_env_t@ struct (48 bytes, zero GC overhead).
--- All env data (slots, lazy scope, parent, with-scopes) lives in C.
--- Haskell holds only the pointer.  Variable lookup has two paths:
+-- An arena-allocated @nn_env_t@: its slots inline, then its parent when
+-- it has one and its lazy scope and with-scopes when it has them
+-- (@cbits/nn_env.h@).  Haskell holds only the pointer.  Variable lookup
+-- has two paths:
 --
 -- * 'envLookupResolved': single C call for 'EResolvedVar'
 -- * 'envLookup': name-based walk for 'EVar' (lazy scope + with-scopes)
@@ -550,11 +549,11 @@ instance Eq Env where
 
 -- | Compact show via C accessors ('inspectForDisplay').
 instance Show Env where
-  show (Env envPtr) =
+  show env@(Env envPtr) =
     let sc = inspectForDisplay (cenvSlotCount envPtr)
         ls = inspectForDisplay (cenvLazyScope envPtr)
         par = inspectForDisplay (cenvParent envPtr)
-        wc = inspectForDisplay (cenvWithCount envPtr)
+        wc = inspectForDisplay (snd <$> envWithScopesRaw env)
      in "Env{"
           ++ show sc
           ++ " slots"
@@ -569,27 +568,30 @@ instance Show Env where
 emptyEnv :: Env
 emptyEnv = Env cenvEmpty
 
--- | General C-backed env constructor, for an env at a site.
--- Takes Haskell-level types; converts Maybe to nullPtr internally.
-newCEnv :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> Maybe Env -> Ptr (Ptr ()) -> Word32 -> m Env
-newCEnv site slots slotCount lazyScope parent withs withCount =
-  Env
-    <$> ( checked "nn_env_new"
-            =<< cenvNew
-              site
-              slots
-              (fromIntegral slotCount)
-              (case lazyScope of Nothing -> nullPtr; Just (AttrSet cset) -> castPtr cset)
-              (case parent of Nothing -> nullPtr; Just (Env p) -> p)
-              withs
-              withCount
-        )
+-- | An env at a site holding the thunks in its slots, in order, under a
+-- parent or none.  It sees its parent's with-scopes.
+newEnv :: (MonadCData m) => EnvSite -> Maybe Env -> [Thunk] -> m Env
+newEnv site parent thunks = do
+  env <- newBlankEnv site parent (length thunks)
+  fillSlots env thunks
+  pure env
 
--- | Minimal env at a site: slots only, no parent, no with-scopes, no
--- lazy scope.
-newMinimalEnv :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Int -> m Env
-newMinimalEnv site slots n =
-  Env <$> (checked "nn_env_new_minimal" =<< cenvNewMinimal site slots (fromIntegral n))
+-- | An env at a site of empty slots under a parent or none, for
+-- 'tieFrame' to fill.
+newBlankEnv :: (MonadCData m) => EnvSite -> Maybe Env -> Int -> m Env
+newBlankEnv site parent slotCount =
+  Env <$> (checked "nn_env_new" =<< cenvNew site (fromIntegral slotCount) (parentPtr parent))
+
+-- | An env at a site with no slots that binds the names of a lazy scope,
+-- under a parent or none: the root env's builtins, scopedImport's names
+-- over them, or a frame whose names are not all static.
+newScopeEnv :: (MonadCData m) => EnvSite -> Maybe Env -> AttrSet -> m Env
+newScopeEnv site parent (AttrSet cset) =
+  Env <$> (checked "nn_env_new_scoped" =<< cenvNewScoped site 0 (parentPtr parent) (castPtr cset) nullPtr 0)
+
+-- | The C pointer of a parent, NULL for none.
+parentPtr :: Maybe Env -> Ptr NnEnv
+parentPtr = maybe nullPtr (\(Env p) -> p)
 
 -- | Look up a resolved variable by level and index.  Single C call:
 -- O(level) parent hops in C, then O(1) array read.  The resolver chose
@@ -651,17 +653,11 @@ lookupWithScopesC name withArr count = go 0
                 Just val -> pure (Just val)
                 Nothing -> go (i + 1)
 
--- | Create a child env at a site with positional slots (for lambda
--- formals).  Inherits with-scopes from the parent.  Arena-allocated.
-envFromSlots :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Int -> Env -> m Env
-envFromSlots site slotsPtr slotCount (Env parentPtr) =
-  Env <$> (checked "nn_env_from_slots" =<< cenvFromSlots site slotsPtr (fromIntegral slotCount) parentPtr)
-
 -- | Push a with-scope whose set is not evaluated yet onto the scope chain
 -- (innermost position): the thunk that evaluates to it, tagged lazy
 -- (bit 0 set) so that a lookup forces it on first use
--- ('resolveWithScopeAt').  Allocates a new C env struct with an extended
--- with-scopes array.
+-- ('resolveWithScopeAt').  Allocates a copy of the env, with a with-scopes
+-- array one longer than the one it sees.
 pushLazyWithScope :: (MonadCData m) => Thunk -> Env -> m Env
 pushLazyWithScope (Thunk thunkPtr) (Env envPtr) =
   Env <$> (checked "nn_env_push_with" =<< cenvPushWith EnvWith envPtr (wordPtrToPtr (ptrToWordPtr (castPtr thunkPtr) .|. lazyWithScopeTag)))
@@ -688,9 +684,15 @@ withScopeAt withArr idx = classify . ptrToWordPtr <$> cdataIO (peekElemOff withA
 resolveWithScopeAt :: (MonadCData m) => Ptr (Ptr ()) -> Int -> AttrSet -> m ()
 resolveWithScopeAt withArr idx (AttrSet cset) = cdataIO (pokeElemOff withArr idx (castPtr cset))
 
--- | Read with-scopes array pointer and count from a C env.
+-- | The with-scopes an env sees, innermost first, and their count: those
+-- of the first env on its parent chain, itself included, that has
+-- with-scopes of its own (a with's env, or a trimmed closure's), or none.
 envWithScopesRaw :: (MonadCData m) => Env -> m (Ptr (Ptr ()), Word32)
-envWithScopesRaw (Env envPtr) = (,) <$> cenvWithScopes envPtr <*> cenvWithCount envPtr
+envWithScopesRaw (Env envPtr) = do
+  owner <- cenvWithOwner envPtr
+  if owner == nullPtr
+    then pure (nullPtr, 0)
+    else (,) <$> cenvWithScopes owner <*> cenvWithCount owner
 
 -- | Build with-scopes for a trimmed env at a site that needs with-scope
 -- access ('CapturesWithScopes').  Appends the root scope (builtins) as
@@ -751,24 +753,23 @@ cheapThunk env expr = mkThunk env expr
 
 -- | The env, at a site, that a closure made in an env runs in, by its
 -- capture info: 'NoCaptureInfo' keeps the env as it is, 'Captures' makes
--- a minimal env of the captured slots, and 'CapturesWithScopes' adds the
--- with-scopes ('withScopesForCapture').
+-- an env of the captured slots with no parent, and 'CapturesWithScopes'
+-- gives that env the with-scopes as its own ('withScopesForCapture').
 buildCaptureEnv :: (MonadCData m) => EnvSite -> Env -> CaptureInfo -> m Env
 buildCaptureEnv _ env NoCaptureInfo = pure env
-buildCaptureEnv site env (Captures captureList) = do
-  (slotsPtr, slotCount) <- capturedSlots site env captureList
-  newMinimalEnv site slotsPtr slotCount
+buildCaptureEnv site env (Captures captureList) =
+  capturedThunks env captureList >>= newEnv site Nothing
 buildCaptureEnv site env (CapturesWithScopes captureList) = do
-  (slotsPtr, slotCount) <- capturedSlots site env captureList
+  thunks <- capturedThunks env captureList
   (withArr, withCount) <- withScopesForCapture site env
-  newCEnv site slotsPtr slotCount Nothing Nothing withArr withCount
+  trimmed <- Env <$> (checked "nn_env_new_scoped" =<< cenvNewScoped site (fromIntegral (length thunks)) nullPtr nullPtr withArr withCount)
+  fillSlots trimmed thunks
+  pure trimmed
 
--- | A slot array, for an env at a site, holding the thunks a closure
--- captures, read from the env it is made in by their resolved level and
--- index.
-capturedSlots :: (MonadCData m) => EnvSite -> Env -> [(Int, Int)] -> m (Ptr CThunkPtr, Int)
-capturedSlots site env captureList =
-  mapM (\(lvl, idx) -> envLookupResolved lvl idx env) captureList >>= buildCSlots site
+-- | The thunks a closure captures, read from the env it is made in by
+-- their resolved level and index.
+capturedThunks :: (MonadCData m) => Env -> [(Int, Int)] -> m [Thunk]
+capturedThunks env = mapM (\(lvl, idx) -> envLookupResolved lvl idx env)
 
 -- | A pending thunk running the code at a bytecode index in an env: a
 -- fresh PENDING cell holding the index and the env's C pointer, neither
@@ -1079,44 +1080,31 @@ unmarshalStringContext ptr = do
           pure (SCDrvOutput sp (symbolText (Symbol outSym)))
         _ -> pure (SCAllOutputs sp)
 
--- | Build a C-allocated slot array, for an env at a site, from a list of
--- t'Thunk' values.  Each thunk is converted to 'CThunkPtr' via
--- 'thunkToCPtr'.  Returns the C array pointer and the slot count.
-buildCSlots :: (MonadCData m) => EnvSite -> [Thunk] -> m (Ptr CThunkPtr, Int)
-buildCSlots site thunks = do
-  let n = length thunks
-  arr <- newSlotArray site n
-  fillSlots arr thunks
-  pure (arr, n)
-
 -- | Tie a frame whose slots hold thunks that may point back at it: the
--- slot array is allocated first, the env built over it next, the thunks
--- are made against that env, and the slots are filled last, as upstream
--- allocates @env2@ before it fills the values (@ExprLet::eval@,
--- @ExprAttrs::eval@ and @EvalState::callFunction@, eval.cc at 2.24.9).
--- The slots are allocated for an env at the site given, which @mkEnv@
--- builds there too; it receives the slot array and its size.  @mkThunks@
--- answers one thunk per slot, in slot order, and must not read the
--- frame's own slots, which are not all filled until this returns
--- ('mkThunkBc' does not; 'envLookupResolved' refuses an unfilled one).
--- Answers the env and those thunks.
-tieFrame :: (MonadCData m) => EnvSite -> Int -> (Ptr CThunkPtr -> Int -> m Env) -> (Env -> m [Thunk]) -> m (Env, [Thunk])
-tieFrame site slotCount mkEnv mkThunks = do
-  slots <- newSlotArray site slotCount
-  env <- mkEnv slots slotCount
+-- env of @slotCount@ empty slots under the parent, at the site given, is
+-- allocated first, the thunks are made against it, and the slots are
+-- filled last, as upstream allocates @env2@ before it fills the values
+-- (@ExprLet::eval@, @ExprAttrs::eval@ and @EvalState::callFunction@,
+-- eval.cc at 2.24.9).
+-- @mkThunks@ answers one thunk per slot, in slot order, and must not
+-- read the frame's own slots, which are not all filled until this
+-- returns ('mkThunkBc' does not; 'envLookupResolved' refuses an unfilled
+-- one).  Nothing is evaluated in the frame before then, which a with's
+-- env relies on when it copies the slots of the env it is made in
+-- ('pushLazyWithScope').  Answers the env and those thunks.
+tieFrame :: (MonadCData m) => EnvSite -> Maybe Env -> Int -> (Env -> m [Thunk]) -> m (Env, [Thunk])
+tieFrame site parent slotCount mkThunks = do
+  env <- newBlankEnv site parent slotCount
   thunks <- mkThunks env
-  fillSlots slots (take slotCount thunks)
+  fillSlots env (take slotCount thunks)
   pure (env, thunks)
 
--- | A zeroed C slot array of the given size for an env at a site, or
--- 'nullPtr' for none.
-newSlotArray :: (MonadCData m) => EnvSite -> Int -> m (Ptr CThunkPtr)
-newSlotArray _ 0 = pure nullPtr
-newSlotArray site n = checked "nn_env_alloc_slots" =<< cenvAllocSlots site (fromIntegral n)
-
--- | Write thunks into a slot array, first to last from slot 0.
-fillSlots :: (MonadCData m) => Ptr CThunkPtr -> [Thunk] -> m ()
-fillSlots slots thunks = cdataIO (zipWithM_ (\i thunk -> pokeElemOff slots i (thunkToCPtr thunk)) [0 ..] thunks)
+-- | Write thunks into an env's slots, first to last from slot 0.  There
+-- are no more thunks than slots.
+fillSlots :: (MonadCData m) => Env -> [Thunk] -> m ()
+fillSlots (Env envPtr) thunks = do
+  slots <- cenvSlots envPtr
+  cdataIO (zipWithM_ (\i thunk -> pokeElemOff slots i (thunkToCPtr thunk)) [0 ..] thunks)
 
 -- | Reject the NULL a C constructor answers when it cannot allocate,
 -- raising 'Nix.Eval.CStatus.CStatusError' naming the entry point.

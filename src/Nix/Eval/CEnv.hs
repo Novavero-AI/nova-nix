@@ -1,11 +1,15 @@
 -- | C-backed evaluation environments.
 --
--- Wraps @cbits/nn_env.c@ - arena-allocated @nn_env_t@ structs that
--- hold slot arrays, lazy scopes, parent pointers, and with-scopes.
--- All memory is freed in bulk via 'cenvDestroy' at evaluation end.
+-- Wraps @cbits/nn_env.c@ - arena-allocated @nn_env_t@ envs that hold
+-- their slots inline, and a parent, a lazy scope and with-scopes when
+-- they have them.  All memory is freed in bulk via 'cenvDestroy' at
+-- evaluation end.
 --
--- Each @nn_env_t@ is 48 bytes, arena-allocated off the GHC heap.  Every
--- allocation names its 'EnvSite', under which the census counts it.
+-- An env is a header word and its slots, followed by its parent when it
+-- has one and by its scopes when it has them (@cbits/nn_env.h@): a
+-- call's env of one slot takes 24 bytes, none of them on GHC's heap.
+-- Every allocation names its 'EnvSite', under which the census counts
+-- it.
 module Nix.Eval.CEnv
   ( -- * Opaque C type
     NnEnv,
@@ -14,15 +18,11 @@ module Nix.Eval.CEnv
     cenvInit,
     cenvDestroy,
 
-    -- * Slot allocation
-    cenvAllocSlots,
-
     -- * Env constructors
     cenvEmpty,
     cenvNew,
-    cenvFromSlots,
+    cenvNewScoped,
     cenvPushWith,
-    cenvNewMinimal,
 
     -- * Accessors
     cenvSlots,
@@ -35,6 +35,7 @@ module Nix.Eval.CEnv
     -- * Lookup
     cenvLookupResolved,
     cenvRootScope,
+    cenvWithOwner,
 
     -- * With-scopes array
     cenvAllocWithScopes,
@@ -65,38 +66,31 @@ foreign import ccall unsafe "nn_env_init"
 foreign import ccall unsafe "nn_env_destroy"
   c_nn_env_destroy :: IO ()
 
-foreign import ccall unsafe "nn_env_alloc_slots"
-  c_nn_env_alloc_slots :: Word32 -> Word32 -> IO (Ptr CThunkPtr)
-
 -- The empty env is a C static, one address for the life of the process,
 -- so this import is pure, as the null and Boolean cells of
 -- "Nix.Eval.CThunk" are: no arena window, nor its absence, changes what
 -- it returns.
 
--- | The global empty env (all fields zero or NULL).  Not to be modified.
+-- | The global empty env: no slots, no parent, no scopes.  Not to be
+-- modified.
 foreign import ccall unsafe "nn_env_empty"
   cenvEmpty :: Ptr NnEnv
 
 foreign import ccall unsafe "nn_env_new"
-  c_nn_env_new ::
-    Ptr CThunkPtr ->
+  c_nn_env_new :: Word32 -> Ptr NnEnv -> Word32 -> IO (Ptr NnEnv)
+
+foreign import ccall unsafe "nn_env_new_scoped"
+  c_nn_env_new_scoped ::
     Word32 ->
-    Ptr () ->
     Ptr NnEnv ->
+    Ptr () ->
     Ptr (Ptr ()) ->
     Word32 ->
     Word32 ->
     IO (Ptr NnEnv)
 
-foreign import ccall unsafe "nn_env_from_slots"
-  c_nn_env_from_slots ::
-    Ptr CThunkPtr -> Word32 -> Ptr NnEnv -> Word32 -> IO (Ptr NnEnv)
-
 foreign import ccall unsafe "nn_env_push_with"
   c_nn_env_push_with :: Ptr NnEnv -> Ptr () -> Word32 -> IO (Ptr NnEnv)
-
-foreign import ccall unsafe "nn_env_new_minimal"
-  c_nn_env_new_minimal :: Ptr CThunkPtr -> Word32 -> Word32 -> IO (Ptr NnEnv)
 
 foreign import ccall unsafe "nn_env_slots"
   c_nn_env_slots :: Ptr NnEnv -> IO (Ptr CThunkPtr)
@@ -122,6 +116,9 @@ foreign import ccall unsafe "nn_env_lookup_resolved"
 foreign import ccall unsafe "nn_env_root_scope"
   c_nn_env_root_scope :: Ptr NnEnv -> IO (Ptr ())
 
+foreign import ccall unsafe "nn_env_with_owner"
+  c_nn_env_with_owner :: Ptr NnEnv -> IO (Ptr NnEnv)
+
 foreign import ccall unsafe "nn_env_alloc_with_scopes"
   c_nn_env_alloc_with_scopes :: Word32 -> Word32 -> IO (Ptr (Ptr ()))
 
@@ -134,55 +131,46 @@ cenvInit :: IO ()
 cenvInit = c_nn_env_init
 
 -- | Destroy the global env allocator, freeing all page memory.
--- All env and slot array pointers become invalid after this call.
+-- All env and array pointers become invalid after this call.
 cenvDestroy :: IO ()
 cenvDestroy = c_nn_env_destroy
-
--- ---------------------------------------------------------------------------
--- Slot allocation
--- ---------------------------------------------------------------------------
-
--- | Allocate a C array of @count@ 'CThunkPtr' slots for an env at a
--- site.  O(1) amortized.  Returns 'Foreign.Ptr.nullPtr' if count is 0.
--- All slots are zero-initialized.
-cenvAllocSlots :: (MonadCData m) => EnvSite -> Word32 -> m (Ptr CThunkPtr)
-cenvAllocSlots site count = cdataIO (c_nn_env_alloc_slots count (envSiteIndex site))
 
 -- ---------------------------------------------------------------------------
 -- Env constructors
 -- ---------------------------------------------------------------------------
 
--- | Full constructor: set all fields explicitly.  Arena-allocated.
-cenvNew ::
+-- | An env of @count@ empty slots under a parent, or under none for
+-- 'Foreign.Ptr.nullPtr', made at a site.  Arena-allocated;
+-- 'Foreign.Ptr.nullPtr' when it cannot be allocated.
+cenvNew :: (MonadCData m) => EnvSite -> Word32 -> Ptr NnEnv -> m (Ptr NnEnv)
+cenvNew site slotCount parent = cdataIO (c_nn_env_new slotCount parent (envSiteIndex site))
+
+-- | 'cenvNew' for an env with scopes: a lazy scope (or
+-- 'Foreign.Ptr.nullPtr') and with-scopes of its own (or
+-- 'Foreign.Ptr.nullPtr' and 0, to see its parent's).
+-- 'Foreign.Ptr.nullPtr' for a count above 0 without an array.
+cenvNewScoped ::
   (MonadCData m) =>
   EnvSite ->
-  Ptr CThunkPtr ->
   Word32 ->
-  Ptr () ->
   Ptr NnEnv ->
+  Ptr () ->
   Ptr (Ptr ()) ->
   Word32 ->
   m (Ptr NnEnv)
-cenvNew site slots slotCount lazyScope parent withs withCount =
-  cdataIO (c_nn_env_new slots slotCount lazyScope parent withs withCount (envSiteIndex site))
+cenvNewScoped site slotCount parent lazyScope withs withCount =
+  cdataIO (c_nn_env_new_scoped slotCount parent lazyScope withs withCount (envSiteIndex site))
 
--- | Child env with positional slots, inheriting parent's with-scopes.
-cenvFromSlots :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Word32 -> Ptr NnEnv -> m (Ptr NnEnv)
-cenvFromSlots site slots slotCount parent = cdataIO (c_nn_env_from_slots slots slotCount parent (envSiteIndex site))
-
--- | Copy base env with a new with-scope prepended.
+-- | The env a with's body runs in, made at a site: a copy of the base
+-- with a new with-scope prepended to those it sees.
 cenvPushWith :: (MonadCData m) => EnvSite -> Ptr NnEnv -> Ptr () -> m (Ptr NnEnv)
 cenvPushWith site base scope = cdataIO (c_nn_env_push_with base scope (envSiteIndex site))
-
--- | Minimal env: slots only, no parent, no with-scopes.
-cenvNewMinimal :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Word32 -> m (Ptr NnEnv)
-cenvNewMinimal site slots slotCount = cdataIO (c_nn_env_new_minimal slots slotCount (envSiteIndex site))
 
 -- ---------------------------------------------------------------------------
 -- Accessors
 -- ---------------------------------------------------------------------------
 
--- | Read the slot array pointer from a C env.
+-- | The slots of a C env, inline in it.
 cenvSlots :: (MonadCData m) => Ptr NnEnv -> m (Ptr CThunkPtr)
 cenvSlots = cdataIO . c_nn_env_slots
 
@@ -194,15 +182,16 @@ cenvSlotCount = cdataIO . c_nn_env_slot_count
 cenvLazyScope :: (MonadCData m) => Ptr NnEnv -> m (Ptr ())
 cenvLazyScope = cdataIO . c_nn_env_lazy_scope
 
--- | Read the parent pointer from a C env (NULL if root).
+-- | Read the parent pointer from a C env (NULL if none).
 cenvParent :: (MonadCData m) => Ptr NnEnv -> m (Ptr NnEnv)
 cenvParent = cdataIO . c_nn_env_parent
 
--- | Read the with-scopes array pointer from a C env.
+-- | A C env's own with-scopes array (NULL if it has none of its own;
+-- 'cenvWithOwner' finds the env whose with-scopes it sees).
 cenvWithScopes :: (MonadCData m) => Ptr NnEnv -> m (Ptr (Ptr ()))
 cenvWithScopes = cdataIO . c_nn_env_with_scopes
 
--- | Read the with-scope count from a C env.
+-- | The count of a C env's own with-scopes (0 if it has none of its own).
 cenvWithCount :: (MonadCData m) => Ptr NnEnv -> m Word32
 cenvWithCount = cdataIO . c_nn_env_with_count
 
@@ -220,6 +209,11 @@ cenvLookupResolved env level idx =
 -- | Walk parent chain to root, return root's lazy scope (NULL if none).
 cenvRootScope :: (MonadCData m) => Ptr NnEnv -> m (Ptr ())
 cenvRootScope = cdataIO . c_nn_env_root_scope
+
+-- | The env whose with-scopes a C env sees: the first on its parent
+-- chain, itself included, with with-scopes of its own (NULL if none).
+cenvWithOwner :: (MonadCData m) => Ptr NnEnv -> m (Ptr NnEnv)
+cenvWithOwner = cdataIO . c_nn_env_with_owner
 
 -- ---------------------------------------------------------------------------
 -- With-scopes array allocation

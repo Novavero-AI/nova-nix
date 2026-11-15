@@ -1,13 +1,32 @@
 /*
  * nn_env.h - C-native evaluation environments.
  *
- * Nix evaluation creates millions of environments, each with a
- * variable-size array of slot pointers, optional lazy scope (attr set),
- * optional parent pointer, and a with-scopes chain.
+ * Nix evaluation creates millions of environments.  An env is a header
+ * word and its slots, followed by the fields its kind says it has:
  *
- * All nn_env_t structs and their backing arrays are arena-allocated
- * from a page-based bump allocator.  Nothing is individually freed -
- * nn_env_destroy() tears down everything at eval end.
+ *   slot_count, kind     NN_ENV_HEADER_BYTES
+ *   slots[slot_count]    one nn_thunk_t * each
+ *   parent               an nn_env_t *, when kind has NN_ENV_PARENT
+ *   scopes               an nn_env_scopes_t, when kind has NN_ENV_SCOPES
+ *
+ * A call's env, the most common, is the header, its parent and its one
+ * slot.  A trimmed closure's env or a builtin's deferred application has
+ * no parent and pays for none.  Only a root env (the builtins, or
+ * scopedImport's names over them), a frame whose names are not all
+ * static, a with and a trimmed closure under a with have scopes.
+ * Everything an env points to is found from the env alone: the header
+ * gives the slot count and which fields follow them.
+ *
+ * The slots follow the header as a C99 flexible array member, so the
+ * compiler places them at a pointer-aligned offset, which nn_env_t's size
+ * check below pins at NN_ENV_HEADER_BYTES.  Every env starts at an
+ * NN_ENV_ALIGNMENT boundary of its page, and every field after the slots
+ * starts a whole number of pointers past them, so every slot, parent and
+ * scopes field is pointer-aligned.
+ *
+ * Envs, the with-scope arrays and the list items arrays (nn_list.h) are
+ * allocated from a page-based bump allocator.  Nothing is individually
+ * freed - nn_env_destroy() tears down everything at eval end.
  *
  * Every allocation for an env names its site, the construct or builtin
  * that makes the env (nn_stats.h), under which the census counts it.
@@ -19,21 +38,40 @@
 #ifndef NN_ENV_H
 #define NN_ENV_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* --- Env struct --- */
 
-/* 48 bytes on 64-bit (with padding after slot_count and with_count).
- * Could be reduced to 40 bytes by reordering fields, but the current
- * layout groups related fields logically and matches access patterns. */
 typedef struct nn_env {
-    void         **slots;        /* nn_thunk_t* array (or NULL for 0 slots) */
-    uint32_t       slot_count;   /* 4 bytes + 4 pad to align lazy_scope */
-    void          *lazy_scope;   /* nn_attrset_t* or NULL */
-    struct nn_env *parent;       /* nn_env_t* or NULL */
-    void         **with_scopes;  /* with-scope entries (or NULL), innermost first */
-    uint32_t       with_count;   /* 4 bytes + 4 pad to struct alignment */
+    uint32_t slot_count;   /* entries in slots */
+    uint32_t kind;         /* NN_ENV_PARENT and NN_ENV_SCOPES, or neither */
+    void    *slots[];      /* nn_thunk_t *, NULL until the frame is filled */
 } nn_env_t;
+
+/* The fields an env's kind says follow its slots, in this order. */
+#define NN_ENV_PARENT 1u   /* the enclosing env */
+#define NN_ENV_SCOPES 2u   /* an nn_env_scopes_t */
+
+/* What an env with NN_ENV_SCOPES has: a lazy scope, an attribute set
+ * whose names it binds (the root env's builtins, a frame whose names
+ * are not all static), and its own with-scopes, innermost first, which
+ * every env under it that has none of its own sees (nn_env_with_owner).
+ * Either may be absent: NULL, and NULL with a count of 0. */
+typedef struct nn_env_scopes {
+    void     *lazy_scope;   /* nn_attrset_t * or NULL */
+    void    **with_scopes;  /* with-scope entries or NULL */
+    uint32_t  with_count;
+} nn_env_scopes_t;
+
+#define NN_ENV_HEADER_BYTES 8
+#define NN_ENV_SCOPES_BYTES 24
+
+/* C99-compatible compile-time checks of the sizes above, which the
+ * bytes an env takes (nn_env_bytes) and the census's figures rest on. */
+typedef char nn_env_header_size_check_[(sizeof(nn_env_t) == NN_ENV_HEADER_BYTES) ? 1 : -1];
+typedef char nn_env_slots_offset_check_[(offsetof(nn_env_t, slots) == NN_ENV_HEADER_BYTES) ? 1 : -1];
+typedef char nn_env_scopes_size_check_[(sizeof(nn_env_scopes_t) == NN_ENV_SCOPES_BYTES) ? 1 : -1];
 
 /* A with-scope entry is an nn_attrset_t *, or a with-scope not yet forced:
  * the nn_thunk_t * of its expression with this bit set, which the
@@ -55,53 +93,59 @@ int nn_env_live(void);
  * All pointers returned by any nn_env_* function become invalid. */
 void nn_env_destroy(void);
 
-/* --- Slot allocation --- */
+/* --- List items --- */
 
-/* Allocate an array of `count` void* pointers for an env at `site`.
- * O(1) amortized.  All slots initialized to NULL.  Returns NULL if count
- * is 0. */
-void **nn_env_alloc_slots(uint32_t count, uint32_t site);
-
-/* nn_env_alloc_slots for a list's items array (nn_list.h), which no env
- * site counts. */
+/* Allocate an array of `count` void* pointers for a list's items
+ * (nn_list.h), which no env site counts.  O(1) amortized.  All entries
+ * initialized to NULL.  Returns NULL if count is 0, past the allocator's
+ * uint32 byte limit, or on OOM. */
 void **nn_env_alloc_items(uint32_t count);
 
 /* --- Env constructors (all arena-allocated) --- */
 
-/* Return a pointer to the global empty env (all fields zero/NULL).
- * Valid until nn_env_destroy().  Do not modify the returned struct. */
+/* Return a pointer to the global empty env: no slots, no parent, no
+ * scopes.  Valid until nn_env_destroy().  Do not modify it. */
 nn_env_t *nn_env_empty(void);
 
-/* Each constructor takes the env's site.  The slots passed to one are
- * counted as allocated with the env: every caller allocates them for it
- * at the same site. */
+/* An env of `slot_count` NULL slots under `parent`, or under none for a
+ * NULL parent, made at `site`.  Its with-scopes are its parent's.
+ * Returns NULL past the allocator's uint32 byte limit or on OOM. */
+nn_env_t *nn_env_new(uint32_t slot_count, nn_env_t *parent, uint32_t site);
 
-/* Full constructor: set all fields explicitly. */
-nn_env_t *nn_env_new(void **slots, uint32_t slot_count,
-                     void *lazy_scope, nn_env_t *parent,
-                     void **with_scopes, uint32_t with_count, uint32_t site);
+/* nn_env_new for an env with scopes: a lazy scope (or NULL) and its own
+ * with-scopes (or NULL and 0, to see its parent's).  Returns NULL for a
+ * count above 0 without an array. */
+nn_env_t *nn_env_new_scoped(uint32_t slot_count, nn_env_t *parent,
+                            void *lazy_scope,
+                            void **with_scopes, uint32_t with_count,
+                            uint32_t site);
 
-/* Child env with positional slots, inheriting parent's with-scopes.
- * lazy_scope = NULL. */
-nn_env_t *nn_env_from_slots(void **slots, uint32_t slot_count,
-                            nn_env_t *parent, uint32_t site);
-
-/* Copy base env with a new with-scope prepended (innermost position).
- * Allocates a new with-scopes array of size (base->with_count + 1) and
- * shares base's slots, so it counts no slots of its own. */
+/* The env a with's body runs in, made at `site`: base's slots, parent
+ * and lazy scope, with `scope` prepended (innermost) to the with-scopes
+ * base sees.  The slots are copied, so base's must all be filled, as they
+ * are: nothing is evaluated in a frame before tieFrame (Nix.Eval.Types)
+ * fills it.  Allocates a with-scopes array one longer than the one base
+ * sees. */
 nn_env_t *nn_env_push_with(nn_env_t *base, void *scope, uint32_t site);
-
-/* Minimal env: slots only, no parent, no with-scopes, no lazy scope. */
-nn_env_t *nn_env_new_minimal(void **slots, uint32_t slot_count, uint32_t site);
 
 /* --- Accessors --- */
 
-void       **nn_env_slots(const nn_env_t *env);
+/* The env's slots, which the caller fills after construction. */
+void       **nn_env_slots(nn_env_t *env);
 uint32_t     nn_env_slot_count(const nn_env_t *env);
-void        *nn_env_lazy_scope(const nn_env_t *env);
+/* The parent, or NULL for an env without one. */
 nn_env_t    *nn_env_parent(const nn_env_t *env);
+/* The scopes, or NULL for an env without them. */
+const nn_env_scopes_t *nn_env_scopes(const nn_env_t *env);
+/* The lazy scope, or NULL. */
+void        *nn_env_lazy_scope(const nn_env_t *env);
+/* The env's own with-scopes and their count, NULL and 0 when it has
+ * none of its own; nn_env_with_owner finds the ones it sees. */
 void       **nn_env_with_scopes(const nn_env_t *env);
 uint32_t     nn_env_with_count(const nn_env_t *env);
+
+/* The bytes the env takes from its page. */
+uint32_t     nn_env_bytes(const nn_env_t *env);
 
 /* --- Lookup --- */
 
@@ -111,9 +155,15 @@ uint32_t     nn_env_with_count(const nn_env_t *env);
  * the resolution pass). */
 void *nn_env_lookup_resolved(const nn_env_t *env, int level, int idx);
 
-/* Walk parent chain to the root env (parent == NULL), return its
- * lazy_scope.  Returns NULL if the root has no lazy scope. */
+/* Walk parent chain to the root env (one without a parent), return its
+ * lazy scope.  Returns NULL if the root has no lazy scope. */
 void *nn_env_root_scope(const nn_env_t *env);
+
+/* The env whose with-scopes `env` sees: the first on its parent chain,
+ * itself included, with with-scopes of its own, or NULL for none.  An env
+ * made under a parent sees what its parent sees until a with or a trimmed
+ * closure gives it its own. */
+nn_env_t *nn_env_with_owner(nn_env_t *env);
 
 /* --- With-scopes array allocation --- */
 

@@ -130,14 +130,13 @@ import qualified Data.Text.Read as TR
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word32)
-import Foreign.Ptr (Ptr, nullPtr)
+import Foreign.Ptr (Ptr)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, reservedApply1, reservedApply2, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
-import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
@@ -179,7 +178,6 @@ import Nix.Eval.Types
     attrSetToAscList,
     attrSetToMap,
     buildCAttrSetKeys,
-    buildCSlots,
     buildCaptureEnv,
     bytesToTextLossy,
     cheapThunkBc,
@@ -190,7 +188,6 @@ import Nix.Eval.Types
     compileSource,
     emptyContext,
     emptyEnv,
-    envFromSlots,
     envLookup,
     envLookupResolved,
     envWithScopesRaw,
@@ -200,8 +197,8 @@ import Nix.Eval.Types
     mkStr,
     mkStrBytes,
     mkThunkBc,
-    newCEnv,
-    newMinimalEnv,
+    newEnv,
+    newScopeEnv,
     pushLazyWithScope,
     readThunkValue,
     resolveWithScopeAt,
@@ -213,7 +210,6 @@ import Nix.Eval.Types
     typeOfValue,
     unrestrictedPolicy,
     withScopeAt,
-    withScopesForCapture,
   )
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types
@@ -805,34 +801,27 @@ frameCaptureSite :: FrameKind -> EnvSite
 frameCaptureSite LetFrame = EnvLetCapture
 frameCaptureSite RecFrame = EnvRecCapture
 
--- | Build a let\/rec frame env, sharing the parent-chain and with-scope
--- plumbing otherwise repeated across the positional and dynamic paths.  The
--- frame's own bindings are positional slots (@slots@\/@slotCount@) or a lazy
--- name-table @scope@; the parent and with-scopes come from the enclosing @env@
--- and @captureInfo@.  Inlined, as 'tieBindingFrame' is, so that each
--- caller's sites are constants.
-{-# INLINE newFrameEnv #-}
-newFrameEnv :: (MonadCData m) => FrameKind -> Env -> CaptureInfo -> Ptr CThunkPtr -> Int -> Maybe AttrSet -> m Env
-newFrameEnv kind env captureInfo slots slotCount scope = do
+-- | The env of a let\/rec frame whose names are not all static: its
+-- bindings are a lazy name-table @scope@ under the enclosing @env@ as
+-- @captureInfo@ trims it ('buildCaptureEnv'), whose with-scopes the frame
+-- sees.  Inlined, as 'tieBindingFrame' is, so that each caller's sites
+-- are constants.
+{-# INLINE newScopeFrameEnv #-}
+newScopeFrameEnv :: (MonadCData m) => FrameKind -> Env -> CaptureInfo -> AttrSet -> m Env
+newScopeFrameEnv kind env captureInfo scope = do
   parent <- buildCaptureEnv (frameCaptureSite kind) env captureInfo
-  (withArr, withCount) <- case captureInfo of
-    NoCaptureInfo -> envWithScopesRaw env
-    Captures _ -> pure (nullPtr, 0)
-    CapturesWithScopes _ -> withScopesForCapture (frameSite kind) env
-  newCEnv (frameSite kind) slots slotCount scope (Just parent) withArr withCount
+  newScopeEnv (frameSite kind) (Just parent) scope
 
 -- | The positional frame of a recursive attr set or a @let@ in @env@: the
 -- frame's env and the thunks in its slots, in declaration order, tied by
 -- 'tieFrame' as upstream's @ExprAttrs::eval@ and @ExprLet::eval@ tie
--- @env2@.
+-- @env2@.  Its parent is @env@ as @captureInfo@ trims it
+-- ('buildCaptureEnv'), whose with-scopes the frame sees.
 {-# INLINE tieBindingFrame #-}
 tieBindingFrame :: (MonadCData m) => FrameKind -> Env -> [BcBinding] -> CaptureInfo -> m (Env, [Thunk])
-tieBindingFrame kind env bindings captureInfo =
-  tieFrame
-    (frameSite kind)
-    (bcBindingSlotCount bindings)
-    (\slots slotCount -> newFrameEnv kind env captureInfo slots slotCount Nothing)
-    (\frame -> buildBcSlotThunks frame env bindings)
+tieBindingFrame kind env bindings captureInfo = do
+  parent <- buildCaptureEnv (frameCaptureSite kind) env captureInfo
+  tieFrame (frameSite kind) (Just parent) (bcBindingSlotCount bindings) (\frame -> buildBcSlotThunks frame env bindings)
 
 -- | Evaluate a recursive attr set from bytecode bindings.
 evalBcRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> CaptureInfo -> m NixValue
@@ -850,7 +839,7 @@ evalBcRecAttrs env bindings captureInfo
       -- vars, but not another dynamic key.  The result is the static bindings
       -- plus the dynamic (name -> value) pairs.
       scopeCset <- buildCAttrSetKeys (bcBindingStaticKeys bindings)
-      recEnv <- newFrameEnv RecFrame env captureInfo nullPtr 0 (Just (AttrSet scopeCset))
+      recEnv <- newScopeFrameEnv RecFrame env captureInfo (AttrSet scopeCset)
       let (staticBs, dynBs) = partition bcBindingIsStatic bindings
       staticEntries <- buildBcEntryMap mkThunkBc recEnv env staticBs
       fillCAttrSetValues scopeCset (Map.map entryThunk staticEntries)
@@ -880,7 +869,7 @@ evalBcLet env bcIdx0 = do
           -- outside the parser reaches here.  Keys and values resolve
           -- in the let env, which the body also sees.
           cset <- buildCAttrSetKeys (bcBindingStaticKeys bindings)
-          letEnv <- newFrameEnv LetFrame env captureInfo nullPtr 0 (Just (AttrSet cset))
+          letEnv <- newScopeFrameEnv LetFrame env captureInfo (AttrSet cset)
           entries <- buildBcEntryMap mkThunkBc letEnv env bindings
           fillCAttrSetValues cset (Map.map entryThunk entries)
           evalBytecode letEnv bodyIdx
@@ -929,8 +918,7 @@ buildBcSlotThunks recEnv outerEnv bindings = concat <$> mapM slotThunk bindings
 -- minimal env holding the from-value's thunk at slot 0.
 inheritedSelect :: (MonadCData m) => Thunk -> BcInheritedName -> m Thunk
 inheritedSelect fromThunk (BcInheritedName _ _ selectBcIdx) = do
-  (sp, sc) <- buildCSlots EnvInheritFrom [fromThunk]
-  fromEnv <- newMinimalEnv EnvInheritFrom sp sc
+  fromEnv <- newEnv EnvInheritFrom Nothing [fromThunk]
   mkThunkBc fromEnv selectBcIdx
 
 -- | Build the attribute map from slots for positional bytecode bindings,
@@ -1106,9 +1094,8 @@ evalWithVarScopes env name withArr count idx
 
 -- | Match a lambda's formals against an argument thunk.
 matchFormals :: (MonadEval m) => Env -> EvalFormals -> Thunk -> m Env
-matchFormals closureEnv (EFName _) argThunk = do
-  (sp, sc) <- buildCSlots EnvCall [argThunk]
-  envFromSlots EnvCall sp sc closureEnv
+matchFormals closureEnv (EFName _) argThunk =
+  newEnv EnvCall (Just closureEnv) [argThunk]
 matchFormals closureEnv (EFSet lambdaName formals allowExtra) argThunk = do
   argVal <- force argThunk
   matchFormalSet closureEnv lambdaName formals allowExtra argVal Nothing
@@ -1137,8 +1124,8 @@ matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
       (formalEnv, _) <-
         tieFrame
           EnvCallFormals
+          (Just closureEnv)
           (length atSlot + length formalValues)
-          (\slots slotCount -> envFromSlots EnvCallFormals slots slotCount closureEnv)
           (\frame -> (atSlot ++) <$> mapM ($ frame) formalValues)
       pure formalEnv
     _ ->
@@ -2335,8 +2322,7 @@ deferApply site func argThunk = do
 deferApply2 :: (MonadCData m) => EnvSite -> Thunk -> Text -> Thunk -> m Thunk
 deferApply2 site fnThunk name valueThunk = do
   nameThunk <- evaluated (mkStr name)
-  (sp, sc) <- buildCSlots site [fnThunk, nameThunk, valueThunk]
-  env <- newMinimalEnv site sp sc
+  env <- newEnv site Nothing [fnThunk, nameThunk, valueThunk]
   mkThunkBc env reservedApply2
 
 -- | 'deferApply' with the function already a thunk, so a builtin that
@@ -2344,8 +2330,7 @@ deferApply2 site fnThunk name valueThunk = do
 -- them, as upstream's primops share @args[0]@.
 deferApplyThunk :: (MonadCData m) => EnvSite -> Thunk -> Thunk -> m Thunk
 deferApplyThunk site fnThunk argThunk = do
-  (sp, sc) <- buildCSlots site [fnThunk, argThunk]
-  env <- newMinimalEnv site sp sc
+  env <- newEnv site Nothing [fnThunk, argThunk]
   mkThunkBc env reservedApply1
 
 -- | The non-copying path coercion: the path text verbatim, no context -
