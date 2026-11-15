@@ -58,6 +58,8 @@ module Nix.Substituter
     -- * Failure classification
     AttemptFailure (..),
     attemptFailureMessage,
+    narStreamFailure,
+    withXzAttempt,
     catchSync,
     compressedBodyCeiling,
     downloadCapFor,
@@ -882,12 +884,7 @@ consumeNarStream sensitivity destPath narInfo declaredDigest narSource = do
   sink <- newNarUnpackSink sensitivity destPath
   streamed <- sinkNarStream sink narSource
   case streamed of
-    -- A name or shape the store refuses is a property of the archive,
-    -- not of this transfer.
-    Left (NarStreamRefused err) -> pure (Left (FatalFailure err))
-    -- A truncated body and a torn transfer parse-fail the same way, so
-    -- the retry budget applies.
-    Left (NarStreamMalformed msg) -> pure (Left (TransientFailure ("NAR stream parse failed: " <> msg)))
+    Left failure -> pure (Left (narStreamFailure failure))
     Right (digest, narBytes)
       | toInteger narBytes /= NarInfo.niNarSize narInfo -> do
           abortNarUnpack sink
@@ -920,6 +917,16 @@ consumeNarStream sensitivity destPath narInfo declaredDigest narSource = do
       | otherwise -> do
           finished <- finishNarUnpack sink
           pure (either (Left . FatalFailure) (const (Right narBytes)) finished)
+
+-- | Why a streamed NAR stopped, as the attempt's failure.  A name or
+-- shape the store refuses is a property of the archive, not of this
+-- transfer, so no retry can change it.  A truncated body and a torn
+-- transfer parse-fail the same way, so a parse failure spends the retry
+-- budget.
+narStreamFailure :: NarStreamFailure -> AttemptFailure
+narStreamFailure failure = case failure of
+  NarStreamRefused err -> FatalFailure err
+  NarStreamMalformed msg -> TransientFailure ("NAR stream parse failed: " <> msg)
 
 -- | Stream an HTTP body as a chunk source bounded by the download cap
 -- 'downloadCapFor' derived from the signed NarSize -
@@ -960,9 +967,7 @@ withDecompressedSource declaredNarSize compression source consume =
     Right CompressionNone -> consume source
     Right CompressionXz -> case xzLimitsFor declaredNarSize of
       Left err -> pure (Left (FatalFailure err))
-      Right limits ->
-        Xz.withXzSource limits source consume
-          `catch` \xzErr -> pure (Left (xzFailure xzErr))
+      Right limits -> withXzAttempt limits source consume
     Right CompressionZstd -> case zstdLimitsFor declaredNarSize of
       Left err -> pure (Left (FatalFailure err))
       Right limits ->
@@ -973,6 +978,14 @@ withDecompressedSource declaredNarSize compression source consume =
       Right limits ->
         Bzip2.withBzip2Source limits source consume
           `catch` \bzip2Err -> pure (Left (bzip2Failure bzip2Err))
+
+-- | Run a consumer over the xz-decompressed view of a chunk source
+-- ('Xz.withXzSource'), a decoder failure ending the attempt with its
+-- class ('xzFailure') where the decoder throws it.  A failure of the
+-- compressed source itself passes through as it was thrown.
+withXzAttempt :: Xz.XzLimits -> IO BS.ByteString -> (IO BS.ByteString -> IO (Either AttemptFailure a)) -> IO (Either AttemptFailure a)
+withXzAttempt limits source consume =
+  Xz.withXzSource limits source consume `catch` (pure . Left . xzFailure)
 
 -- | Classify a decoder failure: a stream error is how truncation and
 -- torn transfers surface, so it retries; output or memory past the

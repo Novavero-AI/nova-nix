@@ -113,14 +113,17 @@ import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWit
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Push (narHashMatches)
 import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), SubstEffects (..), SubstitutesSetting (..), realise, realiseFailureMessage, realiseFailureStatus, substituteClosure)
-import Nix.Store (PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, isValid, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, upstreamManagedRefusal, volumeCaseHack)
+import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
+import Nix.Store.Metadata (isPlainFile)
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText, unStoreDir)
-import Nix.Substituter (CacheConfig, SubstResult (..), queryReferencesWith, trySubstituteWith)
+import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
+import Nix.Substituter (CacheConfig, SubstResult (..), narStreamFailure, queryReferencesWith, trySubstituteWith, withXzAttempt)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removePathForcibly)
+import qualified NovaCache.Xz as Xz
+import System.Directory (createDirectoryIfMissing, doesPathExist, removePathForcibly)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, takeFileName, (</>))
@@ -195,10 +198,23 @@ builtinFetchurlBuilder :: BS.ByteString
 builtinFetchurlBuilder = "builtin:fetchurl"
 
 -- | Derivation environment keys read by @builtin:fetchurl@.
-envUrl, envUrls, envOut :: Text
+envUrl, envUrls, envOut, envUnpack, envExecutable :: Text
 envUrl = "url"
 envUrls = "urls"
 envOut = "out"
+envUnpack = "unpack"
+envExecutable = "executable"
+
+-- | The value a derivation attribute set to @true@ has in the
+-- environment, and the one upstream's @builtin:fetchurl@ compares
+-- @unpack@ and @executable@ with (fetchurl.cc:31 and :56 at 2.24.9).
+envTrue :: BS.ByteString
+envTrue = "1"
+
+-- | The URL suffix that marks the NAR @builtin:fetchurl@ restores as
+-- xz-compressed (fetchurl.cc:45 at 2.24.9).
+xzUrlSuffix :: Text
+xzUrlSuffix = ".xz"
 
 -- | HTTP success status code.
 httpStatusOk :: Int
@@ -544,7 +560,7 @@ buildUnderLock config store drv redirected finish = do
           RedirectAll -> pure (map (const True) (drvOutputs drv))
         case traverse outputPlan (zip (drvOutputs drv) outputValidity) of
           Left nameErr -> pure (Left (BuildStop ("output name is not a store path name: " <> T.pack (show nameErr)) 1))
-          Right plans -> runPlannedBuild config drv buildDir plans (finish inputPaths plans)
+          Right plans -> runPlannedBuild config (stCaseSensitivity store) drv buildDir plans (finish inputPaths plans)
 
 -- | Where the builder writes each output, and where that has to end up.
 --
@@ -658,9 +674,11 @@ spawnFor host config drv
     system = platformToText platform
 
 -- | The build, once every output knows where it is written and where it
--- belongs: run the builder, then @finish@ with what it wrote.
-runPlannedBuild :: BuildConfig -> Derivation -> FilePath -> [OutputPlan] -> IO (Either BuildStop a) -> IO (Either BuildStop a)
-runPlannedBuild config drv buildDir plans finish = do
+-- belongs: run the builder, then @finish@ with what it wrote.  The store
+-- volume's case sensitivity is what @builtin:fetchurl@ restores a NAR's
+-- names under.
+runPlannedBuild :: BuildConfig -> CaseSensitivity -> Derivation -> FilePath -> [OutputPlan] -> IO (Either BuildStop a) -> IO (Either BuildStop a)
+runPlannedBuild config sensitivity drv buildDir plans finish = do
   let scratchDir p = storePathToFilePath (bcStoreDir config) (opScratch p)
       outputDirs = [(opName p, scratchDir p) | p <- plans]
       -- Every scratch path is the build's to use: the ones that are final
@@ -690,7 +708,7 @@ runPlannedBuild config drv buildDir plans finish = do
       --    directly.
       exitResult <- case drvBuilder drv of
         b
-          | b == builtinFetchurlBuilder -> first (uncurry BuilderRefused) <$> runBuiltinFetchurl (bcFetchRetry config) drv outputDirs
+          | b == builtinFetchurlBuilder -> first (uncurry BuilderRefused) <$> runBuiltinFetchurl (bcFetchRetry config) sensitivity drv outputDirs
           | b == builtinUnpackBuilder -> first (uncurry BuilderRefused) <$> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
         _ -> case (execWrapperFor config drv, decodeBuilderStrings drv) of
           (SpawnUnsupported system, _) ->
@@ -1281,20 +1299,32 @@ isWindows = System.Info.os == "mingw32"
 -- ---------------------------------------------------------------------------
 
 -- | Run a @builtin:fetchurl@ derivation: try URLs in order, each under the
--- retry policy, and verify the written bytes against the derivation's
--- @outputHash@. Nix's bootstrap fetcher is baked into the binary because
--- nothing can be fetched before a fetcher exists.  Returns the same
--- @Either (exit, msg) ()@ shape as 'runBuilder', so the shared
--- output-registration path is reused unchanged.
-runBuiltinFetchurl :: FetchRetryPolicy -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
-runBuiltinFetchurl policy drv outputDirs =
-  case (fetchUrlsFromEnv (drvEnv drv), lookup envOut outputDirs, fixedOutput) of
+-- retry policy, make the output from what each serves, and verify it
+-- against the derivation's @outputHash@.  Nix's bootstrap fetcher is
+-- baked into the binary because nothing can be fetched before a fetcher
+-- exists.  Returns the same @Either (exit, msg) ()@ shape as
+-- 'runBuilder', so the shared output-registration path is reused
+-- unchanged.
+--
+-- The output is made as upstream's builtin makes it (fetchurl.cc:37-60
+-- at 2.24.9): the download is the output file, or, when @unpack@ is
+-- true, a NAR restored as the output ('Unpacking'); then, when
+-- @executable@ is true, the output is made executable ('Marking').  The
+-- hash it is held to is the one the derivation declares, in the mode it
+-- declares whatever made the output, as upstream's @registerOutputs@
+-- holds it ('fixedOutputDigest'): a flat hash needs a regular file its
+-- owner may not execute and is of its bytes, and a recursive one is of
+-- the output's NAR.  @\<nix\/fetchurl.nix\>@ declares a recursive hash
+-- for either attribute.  The store's volume decides how a NAR's names
+-- are written and read back.
+runBuiltinFetchurl :: FetchRetryPolicy -> CaseSensitivity -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
+runBuiltinFetchurl policy sensitivity drv outputDirs =
+  case (fetchUrlsFromEnv env, lookup envOut outputDirs, fixedOutput) of
     (Left err, _, _) -> pure (Left (1, "builtin:fetchurl: " <> err))
     (_, Nothing, _) -> pure (Left (1, "builtin:fetchurl: derivation defines no 'out' output"))
     (_, _, Nothing) -> pure (Left (1, "builtin:fetchurl: 'out' output has no fixed-output hash"))
     (Right urls@(firstUrl :| _), Just outPath, Just out)
       -- Invalid specifications reject before any network traffic.
-      | recursive -> pure (Left (1, recursiveUnsupportedMessage))
       | Nothing <- hexToBytes (doHash out) ->
           pure (Left (1, malformedExpectedHash firstUrl))
       | otherwise -> case hashInitWithAlgo algo of
@@ -1306,8 +1336,15 @@ runBuiltinFetchurl policy drv outputDirs =
               Left err -> Left (1, err)
               Right value -> Right value
       where
-        (recursive, algo) = splitHashMode (doHashAlgo out)
+        algo = snd (splitHashMode (doHashAlgo out))
   where
+    env = drvEnv drv
+    unpacking
+      | attrIsTrue envUnpack env = RestoreNar
+      | otherwise = KeepDownload
+    marking
+      | attrIsTrue envExecutable env = MarkExecutable
+      | otherwise = LeaveMode
     -- builtin:fetchurl derivations are always fixed-output; the expected hash
     -- lives in the canonical output spec (doHashAlgo + doHash), not the env.
     fixedOutput = case drvOutputs drv of
@@ -1315,17 +1352,92 @@ runBuiltinFetchurl policy drv outputDirs =
       _ -> Nothing
     fetchWithRetry outPath out ctx url =
       first attemptFailureMessage <$> retryTransient policy ioRetryEffects (fetchAndVerify outPath out ctx url)
-    -- A download that completed and verifies wrong is the server's bytes,
-    -- not a hiccup: upstream checks the hash after the transfer layer has
-    -- given up retrying, so a mismatch is never retried.
-    fetchAndVerify outPath out ctx url = do
-      downloaded <- downloadUrlTo url outPath ctx
-      pure $ case downloaded of
-        Left failure -> Left (prefixFailure failure)
-        Right digest -> first (FatalFailure . snd) (verifyFetchedDigest url out digest)
+    -- Every attempt makes the output from nothing (a restore creates each
+    -- node exclusively, so what an earlier attempt left would refuse it)
+    -- and hashes from the original context, so a retry never resumes a
+    -- torn transfer: upstream resumes from the written offset when the
+    -- server accepts ranges and otherwise gives up, which this restart
+    -- subsumes.  An output that cannot be marked or that verifies wrong
+    -- is the server's bytes, not a hiccup: upstream checks the hash after
+    -- the transfer layer has given up retrying, so a mismatch is never
+    -- retried.
+    fetchAndVerify outPath out ctx url = runExceptT $ do
+      liftIO (removePathForcibly outPath)
+      writtenDigest <- withExceptT prefixFailure (ExceptT (downloadUrlWith url (makeOutput outPath ctx url)))
+      ExceptT (markOutput outPath)
+      withExceptT FatalFailure (ExceptT (verifyOutput outPath out url writtenDigest))
+    -- Making the output yields the digest of the bytes written when
+    -- they are the output file as it was served.
+    makeOutput outPath ctx url body = case unpacking of
+      KeepDownload -> Right . Just <$> writeBody outPath ctx body
+      RestoreNar -> fmap (const Nothing) <$> restoreNarBody sensitivity outPath (narEncodingOf url) body
+    -- The root is read without following a link ('Marking').
+    markOutput outPath = case marking of
+      LeaveMode -> pure (Right ())
+      MarkExecutable -> do
+        node <- classifyWalkNode outPath
+        case node of
+          WalkRegular -> Right () <$ ExecBit.markExecutable outPath
+          WalkDirectory -> pure (Right ())
+          WalkSymlink -> pure (Left (unmarkable outPath "the output is a symlink"))
+          WalkAbsent -> pure (Left (unmarkable outPath "the output does not exist"))
+    unmarkable outPath reason =
+      FatalFailure ("builtin:fetchurl: making '" <> T.pack outPath <> "' executable: " <> reason)
+    -- A flat hash of a download written as it was served is the digest
+    -- taken as it streamed to disk; any other output is hashed as it now
+    -- is on disk.
+    verifyOutput outPath out url writtenDigest = case (splitHashMode (doHashAlgo out), writtenDigest) of
+      ((False, _), Just digest) -> pure (first snd (verifyFetchedDigest url out digest))
+      _ -> do
+        digest <- fixedOutputDigest (volumeCaseHack sensitivity) out outPath
+        pure (either (Left . ("builtin:fetchurl: " <>)) (first snd . verifyFetchedDigest url out) digest)
     prefixFailure failure = case failure of
       TransientFailure msg -> TransientFailure ("builtin:fetchurl: " <> msg)
       FatalFailure msg -> FatalFailure ("builtin:fetchurl: " <> msg)
+
+-- | What @builtin:fetchurl@ makes its output from: the download as it
+-- is, or the NAR the download holds, restored.  Upstream restores when
+-- the derivation's @unpack@ is true (fetchurl.cc:31 and :50-53 at
+-- 2.24.9).
+data Unpacking = KeepDownload | RestoreNar
+
+-- | Whether @builtin:fetchurl@ makes its output executable once it is
+-- made: upstream does when the derivation's @executable@ is true, with a
+-- @chmod@ to @0755@ that the store's canonical metadata then makes
+-- @0555@ (fetchurl.cc:55-59 at 2.24.9).  Here a regular file is marked
+-- executable ('ExecBit.markExecutable'), on POSIX by its owner's execute
+-- bit, which the canonical metadata makes @0555@ alike.  A directory is
+-- left as it is: a NAR records no mode for one, and canonical metadata
+-- makes every directory @0555@.
+--
+-- A symlink root fails the URL, and the next is tried.  Upstream's
+-- @chmod@ follows the link, in the build's child process: after the
+-- @chroot@ when the build is sandboxed, and as the build user when there
+-- are build users (local-derivation-goal.cc:1954-2027).  There a target
+-- outside the build is absent or not the build user's to change, so the
+-- @chmod@ fails the build; only a build with neither changes the file
+-- the link names.  nova-nix runs every builtin as the invoking user with
+-- neither, so it does not follow the link.
+data Marking = LeaveMode | MarkExecutable
+
+-- | How the NAR a download holds is encoded.
+data NarEncoding = PlainNar | XzNar
+
+-- | The encoding of the NAR a URL serves: xz when the URL ends in
+-- 'xzUrlSuffix', as upstream decides (fetchurl.cc:44-45 at 2.24.9).
+-- Upstream asks it of the derivation's @url@ whatever URL it fetches;
+-- here it is asked of each URL tried, which for a derivation
+-- @\<nix\/fetchurl.nix\>@ writes is that @url@ alone.
+narEncodingOf :: Text -> NarEncoding
+narEncodingOf url
+  | xzUrlSuffix `T.isSuffixOf` url = XzNar
+  | otherwise = PlainNar
+
+-- | Whether a derivation attribute is true as upstream's
+-- @builtin:fetchurl@ reads one: its value is exactly 'envTrue', and
+-- anything else, an absent attribute included, is false.
+attrIsTrue :: Text -> Map Text BS.ByteString -> Bool
+attrIsTrue key env = Map.lookup key env == Just envTrue
 
 -- | Nova's mirror extension uses the ASCII-whitespace-separated @urls@ field.
 -- An absent field preserves the legacy single @url@ interface. An explicit
@@ -1364,23 +1476,17 @@ tryFetchUrlsWith attempt = go []
 -- Download
 -- ---------------------------------------------------------------------------
 
--- | Download a URL to a file using nova-nix's own linked HTTP client
--- (the same 'Network.HTTP.Client' the substituter uses) - no external
--- @curl@, which is what makes this a genuine builtin.  The body streams
--- to disk through the incremental hash chunk by chunk, so memory stays
--- at chunk size no matter the download's size, and the returned digest
--- is of exactly the written bytes. A failure of the transfer or of the
--- write becomes a 'Left' carrying its retry class
--- ('transferFailureHandlers'); cancellation propagates through the shared
--- build cleanup. Every attempt opens the output in WriteMode and starts
--- from the original hash context, so a retry never resumes a torn
--- transfer: upstream resumes from the written offset when the server
--- accepts ranges and otherwise gives up, which this restart subsumes.
-downloadUrlTo :: Text -> FilePath -> IncrementalHash -> IO (Either AttemptFailure BS.ByteString)
-downloadUrlTo url outPath ctx0 =
+-- | Request a URL with nova-nix's own linked HTTP client (the same
+-- 'Network.HTTP.Client' the substituter uses) - no external @curl@,
+-- which is what makes this a genuine builtin - and hand the body of a
+-- success to the consumer.  A status other than 200, or a failure of
+-- the transfer or of the consumer's writes, becomes a 'Left' carrying
+-- its retry class ('transferFailureHandlers'); cancellation propagates
+-- through the shared build cleanup.
+downloadUrlWith :: Text -> (HTTP.BodyReader -> IO (Either AttemptFailure a)) -> IO (Either AttemptFailure a)
+downloadUrlWith url consume =
   fetch `catches` transferFailureHandlers url
   where
-    fetch :: IO (Either AttemptFailure BS.ByteString)
     fetch = do
       manager <- HTTPS.getGlobalManager
       request <- withUserAgent <$> HTTP.parseRequest (T.unpack url)
@@ -1388,25 +1494,67 @@ downloadUrlTo url outPath ctx0 =
         let status = HTTP.responseStatus response
         if HTTP.statusCode status /= httpStatusOk
           then pure (Left (fetchStatusFailure url status))
-          else System.IO.withBinaryFile outPath System.IO.WriteMode $ \handle ->
-            let consume !ctx = do
-                  chunk <- HTTP.brRead (HTTP.responseBody response)
-                  if BS.null chunk
-                    then pure (Right (hashFinalizeBytes ctx))
-                    else do
-                      BS.hPut handle chunk
-                      consume (hashUpdateChunk ctx chunk)
-             in consume ctx0
+          else consume (HTTP.responseBody response)
 
--- | Verify the fetched bytes against the derivation's fixed-output hash, read
--- from the canonical output spec.  @doHashAlgo@ is @sha256@/@sha512@/... (or
--- @r:sha256@ for recursive); @doHash@ is the base-16 digest eval normalized the
--- user's hash into.  Flat mode is fully supported across algorithms; recursive
--- (unpack/executable) fetches are a separate feature - they require unpacking
--- the download - and fail with a clear message rather than a wrong result.
+-- | Write a response body to the output file as it streams, through the
+-- incremental hash chunk by chunk, so memory stays at chunk size no
+-- matter the download's size, and return the digest of exactly the
+-- written bytes.
+writeBody :: FilePath -> IncrementalHash -> HTTP.BodyReader -> IO BS.ByteString
+writeBody outPath ctx0 body =
+  System.IO.withBinaryFile outPath System.IO.WriteMode $ \handle ->
+    let consume !ctx = do
+          chunk <- HTTP.brRead body
+          if BS.null chunk
+            then pure (hashFinalizeBytes ctx)
+            else do
+              BS.hPut handle chunk
+              consume (hashUpdateChunk ctx chunk)
+     in consume ctx0
+
+-- | Restore the NAR a response body holds as the output, through the
+-- store's streaming restore, as the substituter restores one: names are
+-- spelled for the store's volume, and nothing is held whole.  An xz body
+-- is decompressed on the way ('fetchurlXzLimits').  The store refusing
+-- what the archive holds is fatal, and a body that ends short of a whole
+-- archive is transient ('narStreamFailure').  Bytes after the archive's
+-- end fail it as malformed, where upstream's restore stops reading at
+-- that end (@parseDump@, archive.cc:287 at 2.24.9) and never sees them.
+restoreNarBody :: CaseSensitivity -> FilePath -> NarEncoding -> HTTP.BodyReader -> IO (Either AttemptFailure ())
+restoreNarBody sensitivity outPath encoding body = case encoding of
+  PlainNar -> restore (HTTP.brRead body)
+  XzNar -> withXzAttempt fetchurlXzLimits (HTTP.brRead body) restore
+  where
+    restore source = do
+      sink <- newNarUnpackSink sensitivity outPath
+      streamed <- sinkNarStream sink source
+      case streamed of
+        Left failure -> pure (Left (narStreamFailure failure))
+        Right _ -> first FatalFailure <$> finishNarUnpack sink
+
+-- | The bounds on decompressing an @.xz@ download.  The output has none,
+-- as upstream's has none: it streams to disk, never held whole, and the
+-- hash the output is held to vouches for it.  The decoder's memory has
+-- nova-cache's default bound, the hardening the substituter applies,
+-- where upstream's decoder, libarchive's, has none.
+fetchurlXzLimits :: Xz.XzLimits
+fetchurlXzLimits =
+  Xz.XzLimits
+    { Xz.xzMaxOutputBytes = maxBound,
+      Xz.xzMaxDecoderMemoryBytes = Xz.defaultXzDecoderMemoryBytes
+    }
+
+-- | Verify a downloaded body, as the flat output file it makes, against
+-- the derivation's fixed-output hash, read from the canonical output
+-- spec.  @doHashAlgo@ is @sha256@/@sha512@/... (or @r:sha256@ for
+-- recursive); @doHash@ is the base-16 digest eval normalized the user's
+-- hash into.  A recursive hash is of the output's NAR, which the body
+-- alone does not settle (the builtin may restore it, or mark it
+-- executable), so it is refused rather than compared with the body's
+-- flat digest.
 verifyFetchHash :: Text -> DerivationOutput -> BS.ByteString -> Either (Int, Text) ()
 verifyFetchHash url out body
-  | recursive = Left (1, recursiveUnsupportedMessage)
+  | recursive = Left (1, "builtin:fetchurl: a recursive hash is of the output's NAR, not of the downloaded bytes")
   | otherwise = case (hexToBytes (doHash out), rawHashWithAlgo algo body) of
       (Nothing, _) -> Left (1, malformedExpectedHash url)
       (_, Nothing) -> Left (1, "builtin:fetchurl: unsupported hash algorithm '" <> algo <> "'")
@@ -1414,9 +1562,11 @@ verifyFetchHash url out body
   where
     (recursive, algo) = splitHashMode (doHashAlgo out)
 
--- | Compare an already-computed digest of the fetched bytes against the
--- derivation's fixed-output hash - the streaming twin of
--- 'verifyFetchHash', which hashes a buffered body.
+-- | Compare a digest of the output, in its declared algorithm and mode,
+-- with the derivation's fixed-output hash, naming the URL it came from:
+-- the digest of the bytes as they were written, or of the output on
+-- disk ('fixedOutputDigest').  'verifyFetchHash' is its twin over a
+-- buffered body.
 verifyFetchedDigest :: Text -> DerivationOutput -> BS.ByteString -> Either (Int, Text) ()
 verifyFetchedDigest url out got = case hexToBytes (doHash out) of
   Nothing -> Left (1, malformedExpectedHash url)
@@ -1445,10 +1595,6 @@ splitHashMode :: Text -> (Bool, Text)
 splitHashMode algoField = case T.stripPrefix "r:" algoField of
   Just rest -> (True, rest)
   Nothing -> (False, algoField)
-
-recursiveUnsupportedMessage :: Text
-recursiveUnsupportedMessage =
-  "builtin:fetchurl: recursive outputHashMode (unpack/executable) not yet supported; fetch flat and unpack in a build phase"
 
 malformedExpectedHash :: Text -> Text
 malformedExpectedHash url = "builtin:fetchurl: malformed expected hash for " <> url
@@ -1751,29 +1897,17 @@ orderByReferences references nodes =
 -- must carry - but the builder process writes the actual bytes, so the
 -- placed result must reproduce the declared digest before it may
 -- register as valid (upstream: the fixed-output check in its
--- registerOutputs).  Flat mode hashes the output file's bytes;
--- recursive (@r:@) mode hashes the canonical NAR of the placed tree.
--- Non-fixed outputs (empty @doHashAlgo@) pass unchecked.  The tree is
--- read back under the store volume's case-hack mode.
+-- registerOutputs).  Flat mode hashes the bytes of an output that must
+-- be a regular file its owner may not execute; recursive (@r:@) mode
+-- hashes the canonical NAR of the placed tree ('fixedOutputDigest').
+-- Non-fixed outputs (empty @doHashAlgo@) pass unchecked.
 verifyFixedOutput :: NAR.CaseHack -> DerivationOutput -> FilePath -> IO (Either Text ())
 verifyFixedOutput caseHack out placedPath
   | T.null (doHashAlgo out) = pure (Right ())
-  | recursive = do
-      -- Re-serialises the placed tree: the registration's NAR hash is
-      -- always sha256, while the declared algorithm may be any.
-      entry <- ExecBit.serialiseFromPath caseHack placedPath
-      pure (finish (rawHashWithAlgo algo (NAR.serialise entry)))
-  | otherwise = do
-      isDir <- doesDirectoryExist placedPath
-      if isDir
-        then pure (Left (subject <> ": flat outputHashMode, but the output is a directory"))
-        else finish <$> hashFileWithAlgo algo placedPath
+  | otherwise = (>>= matches) <$> fixedOutputDigest caseHack out placedPath
   where
-    (recursive, algo) = splitHashMode (doHashAlgo out)
-    subject = "fixed-output '" <> spName (doPath out) <> "'"
-    finish Nothing =
-      Left (subject <> ": unsupported hash algorithm '" <> algo <> "'")
-    finish (Just got) = case hexToBytes (doHash out) of
+    subject = fixedOutputSubject out
+    matches got = case hexToBytes (doHash out) of
       Nothing -> Left (subject <> ": malformed expected hash")
       Just expected
         | expected == got -> Right ()
@@ -1790,6 +1924,44 @@ verifyFixedOutput caseHack out placedPath
                   <> bytesToHexText got
               )
 
+-- | A fixed output's digest on disk, in its declared algorithm and mode:
+-- of a flat output's file bytes, or of a recursive output's NAR, read
+-- back under the store volume's case-hack mode and through the exec-bit
+-- source of truth registration reads ('ExecBit.withNarSource').  Both
+-- stream.  The NAR is serialised again rather than taken from the
+-- registration, whose NAR hash is always sha256 where the declared
+-- algorithm may be any.
+--
+-- A flat output must first be a regular file its owner may not execute,
+-- read without following a symlink ('isPlainFile'), or it fails with
+-- upstream's words for any other (@registerOutputs@,
+-- local-derivation-goal.cc:2501-2507 at 2.24.9): a directory, a symlink
+-- whose target's bytes would otherwise be hashed, or an executable file,
+-- whose mode a flat hash does not record.
+fixedOutputDigest :: NAR.CaseHack -> DerivationOutput -> FilePath -> IO (Either Text BS.ByteString)
+fixedOutputDigest caseHack out path
+  | recursive = maybe unsupported Right <$> narDigestWithAlgo caseHack algo path
+  | otherwise = do
+      plain <- isPlainFile path
+      if plain
+        then maybe unsupported Right <$> hashFileWithAlgo algo path
+        else
+          pure
+            ( Left
+                ( "output path '"
+                    <> T.pack path
+                    <> "' should be a non-executable regular file since recursive hashing is not enabled (one of outputHashMode={flat,text} is true)"
+                )
+            )
+  where
+    (recursive, algo) = splitHashMode (doHashAlgo out)
+    subject = fixedOutputSubject out
+    unsupported = Left (subject <> ": unsupported hash algorithm '" <> algo <> "'")
+
+-- | How a fixed output's check names it.
+fixedOutputSubject :: DerivationOutput -> Text
+fixedOutputSubject out = "fixed-output '" <> spName (doPath out) <> "'"
+
 -- | Stream a file through the incremental hash without materializing it
 -- (a fixed-output file is input-sized).  'Nothing' for an unsupported
 -- algorithm.
@@ -1797,12 +1969,26 @@ hashFileWithAlgo :: Text -> FilePath -> IO (Maybe BS.ByteString)
 hashFileWithAlgo algo path = case hashInitWithAlgo algo of
   Nothing -> pure Nothing
   Just initialCtx -> System.IO.withBinaryFile path System.IO.ReadMode $ \handle ->
-    let consume !ctx = do
-          chunk <- BS.hGet handle fixedOutputHashChunk
-          if BS.null chunk
-            then pure (Just (hashFinalizeBytes ctx))
-            else consume (hashUpdateChunk ctx chunk)
-     in consume initialCtx
+    Just <$> digestSource initialCtx (BS.hGet handle fixedOutputHashChunk)
+
+-- | Stream a path's NAR through the incremental hash, the exec-bit
+-- source of truth answering each file's flag.  'Nothing' for an
+-- unsupported algorithm.
+narDigestWithAlgo :: NAR.CaseHack -> Text -> FilePath -> IO (Maybe BS.ByteString)
+narDigestWithAlgo caseHack algo path = case hashInitWithAlgo algo of
+  Nothing -> pure Nothing
+  Just initialCtx -> Just <$> ExecBit.withNarSource caseHack path (digestSource initialCtx)
+
+-- | Fold a chunk source through the incremental hash up to its first
+-- empty chunk, which ends it.
+digestSource :: IncrementalHash -> IO BS.ByteString -> IO BS.ByteString
+digestSource initialCtx pull = consume initialCtx
+  where
+    consume !ctx = do
+      chunk <- pull
+      if BS.null chunk
+        then pure (hashFinalizeBytes ctx)
+        else consume (hashUpdateChunk ctx chunk)
 
 -- | Read-chunk size for hashing a placed output file.
 fixedOutputHashChunk :: Int
