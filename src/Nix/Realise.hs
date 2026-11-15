@@ -5,11 +5,13 @@
 -- cache holds never pulls in what it was built from
 -- (@DerivationGoal::haveDerivation@ at 2.24.9).  A substituted path needs its
 -- references instead, and those arrive first, so the store stays closed under
--- references at every step (@PathSubstitutionGoal::init@).
+-- references at every step (@PathSubstitutionGoal::init@).  The references
+-- realised are the ones the cache the path then comes from declares.
 --
 -- A cache that lacks a path and one that fails are told apart, as upstream
 -- tells them apart.  What no cache holds builds.  A substitute that a cache
--- offers and fails to deliver stops the build, unless 'BuildFromSource'
+-- offers and fails to deliver passes the path to the caches after it, and
+-- when none of them delivers it the build stops, unless 'BuildFromSource'
 -- (upstream's @fallback@) says to build instead
 -- (@DerivationGoal::outputsSubstitutionTried@).  A cache that cannot be asked
 -- stops the build at once ('QueryFailed'); under 'BuildFromSource' the caller
@@ -32,7 +34,9 @@ module Nix.Realise
   ( -- * Substituting a closure
     SubstEffects (..),
     Offer (..),
+    Registration (..),
     FetchOutcome (..),
+    Undelivered (..),
     ClosureOutcome (..),
     substituteClosure,
 
@@ -80,20 +84,43 @@ import Nix.Store.Path (StoreDir, StorePath, defaultStoreDir, storePathBasename, 
 -- Substituting a closure
 -- ---------------------------------------------------------------------------
 
--- | What substitution needs from the store and the caches.
-data SubstEffects m = SubstEffects
+-- | What substitution needs from the store and the caches.  A cache that
+-- offers a path hands over a substitute @s@ with the references it
+-- declares, and the path is fetched from that substitute, so what arrives
+-- first and the path that names it are the same cache's account.
+-- Upstream's substitution goal copies a path from the substituter whose
+-- path info it realised the references of (@PathSubstitutionGoal::init@
+-- and @tryToRun@ at 2.24.9).
+data SubstEffects s m = SubstEffects
   { -- | Is this path already valid in the store?
     seValid :: !(StorePath -> m Bool),
-    -- | What the caches say about a path before anything is fetched.
-    seReferences :: !(StorePath -> m Offer),
-    -- | Fetch and register these paths, all of them or none.
-    seFetch :: !([StorePath] -> m FetchOutcome)
+    -- | What the first cache that serves a path says about it, before
+    -- anything is fetched.
+    seReferences :: !(StorePath -> m (Offer s)),
+    -- | What the caches after this substitute's say about the path, asked
+    -- once the substitute did not arrive.  Only caches after the given
+    -- one are asked, so a path runs out of caches.
+    seNextOffer :: !(StorePath -> s -> m (Offer s)),
+    -- | Fetch these paths, each from its substitute, and register them as
+    -- the 'Registration' says.  The paths an outcome names are among these.
+    seFetch :: !(Registration -> NonEmpty (StorePath, s) -> m FetchOutcome)
   }
 
+-- | What a fetch registers of the paths that arrive.
+data Registration
+  = -- | Every one of them if every one arrives, and none otherwise.
+    RegisterAll
+  | -- | None: another path of the batch has no cache left to offer it, so
+    -- the batch cannot land.  The fetch learns which of these a cache
+    -- delivers, which decides whether the substitution failed.
+    RegisterNone
+  deriving (Eq, Show)
+
 -- | What the caches answer for one path, before anything is fetched.
-data Offer
-  = -- | A cache serves the path, with these references.
-    Offered ![StorePath]
+data Offer s
+  = -- | A cache serves the path with these references, and this substitute
+    -- fetches it from that cache.
+    Offered !s ![StorePath]
   | -- | No cache serves it.
     NotOffered
   | -- | A cache could not be asked, and why.  Upstream rethrows a failed
@@ -104,13 +131,22 @@ data Offer
 
 -- | How fetching a batch of paths ended.
 data FetchOutcome
-  = -- | Every path is valid.
+  = -- | Every path arrived, and under 'RegisterAll' is valid.
     Fetched
-  | -- | No cache supplied some path, and none failed to.
-    FetchMissed
-  | -- | A cache that offered a path failed to deliver it, and no other cache
-    -- delivered it: upstream's failed substitution.
-    FetchFailed
+  | -- | Nothing was registered.  These paths did not arrive from their
+    -- substitutes, and the others of the batch did.
+    NotFetched !(NonEmpty (StorePath, Undelivered))
+  deriving (Eq, Show)
+
+-- | Why a path did not arrive from the cache that offered it.
+data Undelivered
+  = -- | The cache no longer holds it.  Upstream treats such a substitute
+    -- as one that never existed (@SubstituteGone@ in
+    -- @PathSubstitutionGoal::tryToRun@ at 2.24.9).
+    Gone
+  | -- | The cache failed to deliver it, or its registration was refused:
+    -- upstream's @substituterFailed@.
+    DeliveryFailed
   deriving (Eq, Show)
 
 -- | How an attempt to substitute a set of paths ended.
@@ -124,7 +160,7 @@ data ClosureOutcome
     -- afterwards.
     ClosureIncomplete
   | -- | A substitute for the paths, or for something they reference, failed
-    -- ('FetchFailed').
+    -- ('DeliveryFailed'), and no later cache delivered it.
     ClosureFailed
   | -- | A cache could not be asked about one of them ('QueryFailed').
     ClosureQueryFailed !Text
@@ -138,7 +174,7 @@ data ClosureOutcome
 -- on its own, as upstream's does: a reference that lands before a later
 -- failure stays, a valid path like any other, and so can leave its own
 -- derivation with only some outputs valid.
-substituteClosure :: (Monad m) => SubstEffects m -> [StorePath] -> m ClosureOutcome
+substituteClosure :: (Monad m) => SubstEffects s m -> [StorePath] -> m ClosureOutcome
 substituteClosure effects paths =
   fst <$> closureOf effects (Set.fromList paths) paths
 
@@ -148,39 +184,152 @@ substituteClosure effects paths =
 -- referent.
 closureOf ::
   (Monad m) =>
-  SubstEffects m ->
+  SubstEffects s m ->
   Set StorePath ->
   [StorePath] ->
   m (ClosureOutcome, Set StorePath)
 closureOf effects visited paths = do
   missing <- filterM (fmap not . seValid effects) paths
-  -- A failed query ends the build, so it is the last one asked.
-  declared <- runExceptT (traverse (ExceptT . fmap offeredReferences . seReferences effects) missing)
-  case (missing, sequence <$> declared) of
-    ([], _) -> pure (ClosureComplete, visited)
-    (_, Left failure) -> pure (ClosureQueryFailed failure, visited)
-    (_, Right Nothing) -> pure (ClosureUnavailable, visited)
-    (_, Right (Just references)) -> do
-      let outside = Set.fromList (concat references) `Set.difference` Set.fromList missing
+  case NE.nonEmpty missing of
+    Nothing -> pure (ClosureComplete, visited)
+    Just batch -> do
+      offered <- offersFor (fmap (\path -> (path, seReferences effects path)) batch)
+      case offered of
+        Left failure -> pure (ClosureQueryFailed failure, visited)
+        Right Nothing -> pure (ClosureUnavailable, visited)
+        Right (Just pending) -> fetchRounds effects visited (fmap (Offering NoneFailed) pending)
+
+-- | One path of a batch with the substitute a cache offered it as, and the
+-- references that cache declares.
+data Pending s = Pending
+  { pendingPath :: !StorePath,
+    pendingSubstitute :: !s,
+    pendingReferences :: ![StorePath]
+  }
+
+-- | Whether a cache has failed to deliver a path, which upstream's goal for
+-- the path records as @substituterFailed@.
+data Attempts = NoneFailed | SomeFailed
+
+-- | Where one path of a batch stands between fetches.
+data Standing s
+  = -- | A cache offers it, and none it was asked of before has delivered it.
+    Offering !Attempts !(Pending s)
+  | -- | It arrived from its substitute, and was not registered.
+    Arrived !Attempts !(Pending s)
+  | -- | No cache is left to offer it: 'DeliveryFailed' when one failed to
+    -- deliver it, and 'Gone' when none did.
+    RanOut !StorePath !Undelivered
+
+-- | The path a standing is about.
+standingPath :: Standing s -> StorePath
+standingPath (Offering _ pending) = pendingPath pending
+standingPath (Arrived _ pending) = pendingPath pending
+standingPath (RanOut path _) = path
+
+-- | Each path's offer, asked in order.  A failed query ends the build, so it
+-- is the last one asked; a path no cache offers does not stop the others
+-- being asked, and makes the answer 'Nothing'.
+offersFor :: (Monad m) => NonEmpty (StorePath, m (Offer s)) -> m (Either Text (Maybe (NonEmpty (Pending s))))
+offersFor asks = fmap sequence <$> runExceptT (traverse (\(path, ask) -> ExceptT (pendingFor path <$> ask)) asks)
+  where
+    pendingFor path (Offered substitute references) = Right (Just (Pending path substitute references))
+    pendingFor _ NotOffered = Right Nothing
+    pendingFor _ (QueryFailed failure) = Left failure
+
+-- | Fetch a batch until it lands or can tell why not.  Each fetch realises
+-- what the paths it takes reference first; a reference that cannot be
+-- realised ends the batch, whatever later caches offer, as upstream's goal
+-- for a path is done once a reference's goal fails
+-- (@PathSubstitutionGoal::tryToRun@ at 2.24.9).
+--
+-- While every path has a cache to offer it, the whole batch is fetched and
+-- registered if it all arrives.  A path that does not arrive is asked of
+-- the caches after the one that offered it, that cache's references come
+-- first, and the batch is fetched again, the paths that arrived included,
+-- since nothing was registered: upstream's goal for each path moves on to
+-- its next substituter (@PathSubstitutionGoal::init@).  Once a path has no
+-- cache left the batch cannot land, and the paths still offered are
+-- fetched, registering nothing, until each arrives or runs out too, as each
+-- of upstream's goals runs its own course.  The batch then failed when a
+-- path ran out after a cache failed to deliver it, and is otherwise
+-- unavailable, as a path no cache delivers and none failed to counts as one
+-- no cache offered: upstream's derivation fails only when a goal failed
+-- other than for want of a substitute or a reference
+-- (@DerivationGoal::outputsSubstitutionTried@, derivation-goal.cc:281).
+fetchRounds ::
+  (Monad m) =>
+  SubstEffects s m ->
+  Set StorePath ->
+  NonEmpty (Standing s) ->
+  m (ClosureOutcome, Set StorePath)
+fetchRounds effects visited standings =
+  case NE.nonEmpty (concatMap fetching standings) of
+    Nothing -> pure (exhaustedOutcome standings, visited)
+    Just batch -> do
+      let outside = Set.fromList (concatMap pendingReferences batch) `Set.difference` Set.fromList (map standingPath (NE.toList standings))
       (held, deeper) <- referencesFirst effects visited (Set.toAscList outside)
       case held of
         ClosureComplete -> do
-          fetched <- seFetch effects missing
-          pure (fetchedClosure fetched, deeper)
+          fetched <- seFetch effects registration (fmap (\each -> (pendingPath each, pendingSubstitute each)) batch)
+          case (registration, fetched) of
+            (RegisterAll, Fetched) -> pure (ClosureComplete, deeper)
+            _ -> do
+              next <- runExceptT (traverse (ExceptT . afterFetch effects (undeliveredIn fetched)) standings)
+              either (\failure -> pure (ClosureQueryFailed failure, deeper)) (fetchRounds effects deeper) next
         _ -> pure (held, deeper)
+  where
+    whole = not (any ranOut standings)
+    registration
+      | whole = RegisterAll
+      | otherwise = RegisterNone
+    fetching (Offering _ pending) = [pending]
+    fetching (Arrived _ pending) = [pending | whole]
+    fetching (RanOut _ _) = []
+    ranOut (RanOut _ _) = True
+    ranOut _ = False
 
--- | An offer's references, 'Nothing' when no cache serves the path, or the
--- failure of a query that could not be asked.
-offeredReferences :: Offer -> Either Text (Maybe [StorePath])
-offeredReferences (Offered references) = Right (Just references)
-offeredReferences NotOffered = Right Nothing
-offeredReferences (QueryFailed failure) = Left failure
+-- | The paths a fetch names as not delivered.
+undeliveredIn :: FetchOutcome -> Map StorePath Undelivered
+undeliveredIn Fetched = Map.empty
+undeliveredIn (NotFetched undelivered) = Map.fromList (NE.toList undelivered)
 
--- | What a batch fetch makes of paths whose references are all valid.
-fetchedClosure :: FetchOutcome -> ClosureOutcome
-fetchedClosure Fetched = ClosureComplete
-fetchedClosure FetchMissed = ClosureUnavailable
-fetchedClosure FetchFailed = ClosureFailed
+-- | Where a path stands after a fetch that registered nothing.  One the fetch
+-- took has arrived unless it is named, and one named is asked of the caches
+-- after its substitute's.  A path the fetch did not take stands as it did.
+afterFetch :: (Monad m) => SubstEffects s m -> Map StorePath Undelivered -> Standing s -> m (Either Text (Standing s))
+afterFetch effects undelivered standing = case standing of
+  Offering attempts pending -> fetched attempts pending
+  Arrived attempts pending -> fetched attempts pending
+  RanOut _ _ -> pure (Right standing)
+  where
+    fetched attempts pending@(Pending path substitute _) = case Map.lookup path undelivered of
+      Nothing -> pure (Right (Arrived attempts pending))
+      Just why -> fromNext path (attemptsAfter why attempts) <$> seNextOffer effects path substitute
+    fromNext path attempts (Offered substitute references) = Right (Offering attempts (Pending path substitute references))
+    fromNext path attempts NotOffered = Right (RanOut path (ranOutBecause attempts))
+    fromNext _ _ (QueryFailed failure) = Left failure
+
+-- | A path's attempts once a cache has not delivered it, for this reason.
+attemptsAfter :: Undelivered -> Attempts -> Attempts
+attemptsAfter DeliveryFailed _ = SomeFailed
+attemptsAfter Gone attempts = attempts
+
+-- | Why a path with no cache left did not arrive.
+ranOutBecause :: Attempts -> Undelivered
+ranOutBecause SomeFailed = DeliveryFailed
+ranOutBecause NoneFailed = Gone
+
+-- | What a batch comes to when it cannot land and nothing is left to fetch:
+-- failed when some path ran out after a cache failed to deliver it, and
+-- otherwise unavailable.
+exhaustedOutcome :: NonEmpty (Standing s) -> ClosureOutcome
+exhaustedOutcome standings
+  | any failedPath standings = ClosureFailed
+  | otherwise = ClosureUnavailable
+  where
+    failedPath (RanOut _ DeliveryFailed) = True
+    failedPath _ = False
 
 -- | Realise references one at a time, stopping at the first that fails.  A
 -- reference no cache supplies is a hole the inputs may fill, so the paths
@@ -189,7 +338,7 @@ fetchedClosure FetchFailed = ClosureFailed
 -- reference's goal does (@PathSubstitutionGoal::tryToRun@ at 2.24.9).
 referencesFirst ::
   (Monad m) =>
-  SubstEffects m ->
+  SubstEffects s m ->
   Set StorePath ->
   [StorePath] ->
   m (ClosureOutcome, Set StorePath)
@@ -438,9 +587,9 @@ data CheckVerdict
   deriving (Eq, Show)
 
 -- | What realising a graph needs from the outside.
-data RealiseEffects m = RealiseEffects
+data RealiseEffects s m = RealiseEffects
   { -- | The store and caches, which also say whether an output is valid.
-    reSubst :: !(SubstEffects m),
+    reSubst :: !(SubstEffects s m),
     -- | Build one derivation, whose inputs are realised, given its @.drv@
     -- path and the outputs the request that led to the build asks of it.
     -- A build makes every output, so the store's builder leaves those
@@ -469,7 +618,7 @@ data RealiseEffects m = RealiseEffects
 -- every output.
 --
 -- The graph has to be acyclic ('Nix.DependencyGraph.topoSort' decides that).
-realise :: (Monad m) => RealiseSettings -> RealiseEffects m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
+realise :: (Monad m) => RealiseSettings -> RealiseEffects s m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
 realise settings effects graph root = case rsMode settings of
   BuildNormal -> void <$> realiseNode settings effects graph Map.empty (root, everyOutput)
   BuildCheck -> checkRoot settings effects graph root
@@ -489,7 +638,7 @@ namedOutputPaths :: Set Text -> Derivation -> [StorePath]
 namedOutputPaths names drv = [doPath output | output <- drvOutputs drv, doName output `Set.member` names]
 
 -- | Whether every one of the paths is valid.
-allValid :: (Monad m) => RealiseEffects m -> [StorePath] -> m Bool
+allValid :: (Monad m) => RealiseEffects s m -> [StorePath] -> m Bool
 allValid effects = fmap and . traverse (seValid (reSubst effects))
 
 -- | Check the root: upstream's @DerivationGoal@ under @bmCheck@ at 2.24.9.
@@ -514,7 +663,7 @@ allValid effects = fmap and . traverse (seValid (reSubst effects))
 -- A root the graph does not hold fails the check, where 'realiseNode' has
 -- nothing to realise for such a node: a check that compared nothing has
 -- not passed.
-checkRoot :: (Monad m) => RealiseSettings -> RealiseEffects m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
+checkRoot :: (Monad m) => RealiseSettings -> RealiseEffects s m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
 checkRoot settings effects graph root = case Map.lookup root (unDepGraph graph) of
   Nothing -> pure (Left (MissingDerivation root))
   Just depNode ->
@@ -546,7 +695,7 @@ checkRoot settings effects graph root = case Map.lookup root (unDepGraph graph) 
 -- | Substitute outputs of a derivation, if it may be substituted.  One
 -- that must build asks no cache, which leaves it where one that no cache
 -- holds is: upstream starts no substitution for it.
-outputsFromCaches :: (Monad m) => RealiseEffects m -> Substitutes -> [StorePath] -> m ClosureOutcome
+outputsFromCaches :: (Monad m) => RealiseEffects s m -> Substitutes -> [StorePath] -> m ClosureOutcome
 outputsFromCaches _ MustBuild _ = pure ClosureUnavailable
 outputsFromCaches effects MaySubstitute outputs = substituteClosure (reSubst effects) outputs
 
@@ -562,7 +711,7 @@ outputsFromCaches effects MaySubstitute outputs = substituteClosure (reSubst eff
 realiseNode ::
   (Monad m) =>
   RealiseSettings ->
-  RealiseEffects m ->
+  RealiseEffects s m ->
   DepGraph ->
   RealisedOutputs ->
   (StorePath, Set Text) ->
@@ -636,7 +785,7 @@ substitutionStop fallback drvPath outcome = case outcome of
 realiseAll ::
   (Monad m) =>
   RealiseSettings ->
-  RealiseEffects m ->
+  RealiseEffects s m ->
   DepGraph ->
   RealisedOutputs ->
   [(StorePath, Set Text)] ->
