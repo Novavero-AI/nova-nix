@@ -17591,10 +17591,10 @@ testWindowsSources = do
     knownSources :: [Text]
     knownSources = ["hex0-seed.exe", "busybox-w32-FRP-6354-g5f09fb446.tgz", "bash-5.3.015-1-x86_64.pkg.tar.zst"]
 
--- | The CI workflow whose ladder jobs build the seed ladder, a job for each
+-- | The workflow whose jobs build one leg of the seed ladder, a job for each
 -- stage, from the repository root.
-ciWorkflowPath :: FilePath
-ciWorkflowPath = ".github" </> "workflows" </> "ci.yml"
+ladderWorkflowPath :: FilePath
+ladderWorkflowPath = ".github" </> "workflows" </> "ladder.yml"
 
 -- | The package set's file as a workflow step names it.
 packageSetFile :: Text
@@ -17665,7 +17665,7 @@ testWindowsRungs = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   fresh <- testEvalState storeDir cwd
-  workflow <- try (BS.readFile ciWorkflowPath)
+  workflow <- try (BS.readFile ladderWorkflowPath)
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
   let st = fresh {esSearchPaths = searchPaths}
       windows = cwd </> "pkgs" </> "windows"
@@ -17683,7 +17683,7 @@ testWindowsRungs = do
             "\" ]) stages ++ builtins.filter (path: !(isDerivation path)) (builtins.concatMap (stage: rungs.${stage}) stages))"
           ]
       built jobId = case workflow of
-        Left (err :: IOException) -> Left (T.pack (ciWorkflowPath <> ": " <> displayException err))
+        Left (err :: IOException) -> Left (T.pack (ladderWorkflowPath <> ": " <> displayException err))
         Right bytes -> jobPackageSetBuilds jobId (T.lines (bytesText bytes))
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))

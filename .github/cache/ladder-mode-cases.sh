@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# The mode ladder-mode.sh prints for lists of changed files, one case per
-# rule and per edge.  CI runs these before it lets the script decide a run's
-# mode, since a wrong skip is a run that tests nothing and stays green.
+# The mode ladder-mode.sh prints for each event and ref, and for a pull
+# request's lists of changed files, one case per rule and per edge.  CI runs
+# these before it lets the script decide a run's mode, since a wrong skip is
+# a run that tests nothing and stays green.
 #
 # Portable to bash 3.2, which is what macOS ships.
 #
@@ -12,6 +13,9 @@ set -uo pipefail
 script=$(dirname "${BASH_SOURCE[0]}")/ladder-mode.sh
 checked=0
 failures=0
+
+readonly MAIN=refs/heads/main
+readonly PULL=refs/pull/1/merge
 
 # report WANT GOT LABEL
 report() {
@@ -24,79 +28,92 @@ report() {
   fi
 }
 
-# expect WANT [PATH ...]: the mode for these paths, each ended by a NUL.
-# The label quotes each path as the shell reads it, so a space or a newline
-# inside one shows.
+# expect WANT EVENT REF [PATH ...]: the mode for an event on a ref with these
+# changed paths, each ended by a NUL.  The label quotes each path as the
+# shell reads it, so a space or a newline inside one shows.
 expect() {
-  local want=$1 got label='(no changed file)'
-  shift
-  if [ $# -gt 0 ]; then label=$(printf '%q ' "$@"); fi
-  got=$(if [ $# -gt 0 ]; then printf '%s\0' "$@"; fi | bash "$script" 2> /dev/null)
+  local want=$1 event=$2 ref=$3 got label
+  shift 3
+  label="$event $ref"
+  if [ $# -gt 0 ]; then label="$label $(printf '%q ' "$@")"; fi
+  got=$(if [ $# -gt 0 ]; then printf '%s\0' "$@"; fi | bash "$script" "$event" "$ref" 2> /dev/null)
   report "$want" "$got" "${label% }"
 }
 
-# Documentation alone.
-expect skip README.md
-expect skip CHANGELOG.md CONTRIBUTING.md
-expect skip changelog.d/seed-stdenv.md
-expect skip LICENSE NOTICE
-expect skip 'READ ME.md'
+# A pull request that changes documentation alone.
+expect skip pull_request "$PULL" README.md
+expect skip pull_request "$PULL" CHANGELOG.md CONTRIBUTING.md
+expect skip pull_request "$PULL" changelog.d/seed-stdenv.md
+expect skip pull_request "$PULL" LICENSE NOTICE
+expect skip pull_request "$PULL" 'READ ME.md'
 
-# Each builder path, alone.
-expect seed src/Nix/Builder.hs
-expect seed cbits/nn_arena.c
-expect seed app/Main.hs
-expect seed cli/Nix/Cli/Args.hs
-expect seed data/nix/fetchurl.nix
-expect seed nova-nix.cabal
-expect seed cabal.project
-expect seed cabal.project.local
-expect seed 'src/Nix/A Module.hs'
+# A pull request that changes anything else takes the rungs from the cache,
+# the builder's sources included.
+expect substitute pull_request "$PULL" src/Nix/Builder.hs
+expect substitute pull_request "$PULL" cbits/nn_arena.c
+expect substitute pull_request "$PULL" app/Main.hs
+expect substitute pull_request "$PULL" cli/Nix/Cli/Args.hs
+expect substitute pull_request "$PULL" data/nix/fetchurl.nix
+expect substitute pull_request "$PULL" nova-nix.cabal
+expect substitute pull_request "$PULL" cabal.project
+expect substitute pull_request "$PULL" 'src/Nix/A Module.hs'
+expect substitute pull_request "$PULL" pkgs/windows/by-name/he/hello/package.nix
+expect substitute pull_request "$PULL" test/Main.hs
+expect substitute pull_request "$PULL" test/data/mes.nix
+expect substitute pull_request "$PULL" .github/workflows/ci.yml
+expect substitute pull_request "$PULL" .github/workflows/ladder.yml
+expect substitute pull_request "$PULL" .github/cache/ladder-mode.sh
+expect substitute pull_request "$PULL" docs/cli.json
+expect substitute pull_request "$PULL" .gitattributes
+expect substitute pull_request "$PULL" scripts/assemble-changelog.sh
+expect substitute pull_request "$PULL" 'pkgs/windows/a file.nix'
 
-# A workflow or one of its scripts is not the builder.
-expect substitute .github/workflows/ci.yml
-expect substitute .github/cache/ladder-mode.sh
+# One file that is not documentation decides, whatever comes with it.
+expect substitute pull_request "$PULL" README.md src/Nix/Eval.hs
+expect substitute pull_request "$PULL" README.md pkgs/windows/rungs.nix
+expect substitute pull_request "$PULL" changelog.d/seed-stdenv.md nova-nix.cabal
 
-# One builder file decides, whatever comes with it.
-expect seed README.md src/Nix/Eval.hs
-expect seed pkgs/windows/rungs.nix test/Main.hs cbits/nn_arena.h
-expect seed changelog.d/seed-stdenv.md nova-nix.cabal
-
-# The package set, the checks and the rest.
-expect substitute pkgs/windows/by-name/he/hello/package.nix
-expect substitute test/Main.hs
-expect substitute test/data/mes.nix
-expect substitute README.md pkgs/windows/rungs.nix
-expect substitute docs/cli.json
-expect substitute .gitattributes
-expect substitute scripts/assemble-changelog.sh
-expect substitute 'pkgs/windows/a file.nix'
-
-# A name that only resembles a builder path or a document.
-expect substitute test/data/run-command.nix
-expect substitute srcs/notes.txt
-expect substitute LICENSE.txt
+# A name that only resembles a document.
+expect substitute pull_request "$PULL" LICENSE.txt
 
 # Markdown is documentation at the root alone.
-expect substitute pkgs/windows/README.md
-expect substitute docs/notes.md
-expect seed src/README.md
-expect substitute .github/pull_request_template.md
+expect substitute pull_request "$PULL" pkgs/windows/README.md
+expect substitute pull_request "$PULL" docs/notes.md
+expect substitute pull_request "$PULL" src/README.md
+expect substitute pull_request "$PULL" .github/pull_request_template.md
 
 # A rename arrives as both names, and the one it leaves counts.
-expect seed NOTES.md src/Notes.md
-expect substitute README.md pkgs/windows/README.md
-expect skip README.md OVERVIEW.md
+expect substitute pull_request "$PULL" NOTES.md src/Notes.md
+expect substitute pull_request "$PULL" README.md pkgs/windows/README.md
+expect skip pull_request "$PULL" README.md OVERVIEW.md
 
-# Nothing changed.
-expect seed
+# A pull request with no changed file runs the ladder.
+expect substitute pull_request "$PULL"
 
-# A path holding a newline is one path: read by lines, its second line
-# would pass for a builder file.
-expect substitute $'pkgs/windows/odd\nsrc/name.nix'
+# A path holding a newline is one path: read by lines, it would pass for two
+# documents.
+expect substitute pull_request "$PULL" $'README.md\nchangelog.d/name.md'
 
 # A last path that no NUL ends is still read.
-report seed "$(printf 'README.md\0src/Nix/Eval.hs' | bash "$script" 2> /dev/null)" 'a last path with no NUL'
+report substitute "$(printf 'README.md\0src/Nix/Eval.hs' | bash "$script" pull_request "$PULL" 2> /dev/null)" 'a last path with no NUL'
+
+# A push to main takes the rungs from the cache, whatever it changes, and
+# documentation alone does not skip it.
+expect substitute push "$MAIN"
+expect substitute push "$MAIN" README.md
+expect substitute push "$MAIN" src/Nix/Eval.hs
+
+# Every other run builds the ladder from the seed: a release's tag, the
+# daily run, a dispatched run on any branch, and an event no rule names.
+expect seed push refs/tags/v0.8.0.0
+expect seed schedule "$MAIN"
+expect seed workflow_dispatch "$MAIN"
+expect seed workflow_dispatch refs/heads/some-branch
+expect seed repository_dispatch "$MAIN"
+
+# Without an event and a ref the script decides nothing.
+report '' "$(bash "$script" 2> /dev/null < /dev/null)" 'no arguments'
+report '' "$(bash "$script" pull_request 2> /dev/null < /dev/null)" 'an event without a ref'
 
 echo "$checked cases, $failures failed"
 [ "$failures" -eq 0 ]
