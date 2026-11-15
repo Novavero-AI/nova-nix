@@ -3,11 +3,11 @@ name: Ladder
 # One Windows leg of the seed ladder, the rungs pkgs/windows builds from its
 # 1,623-byte seed, as a chain of jobs: one for each stage
 # pkgs/windows/rungs.nix lists, Mes, TinyCC, GCC 4.6.4, GCC 4.6.4 C++,
-# GCC 10 and GCC 16.  A stage's job builds its rungs, runs its checks, and
-# starts from the store paths the job before it built.  ci.yml calls this
-# workflow once for each leg Ladder (mode) names, so each leg's chain runs
-# on its own: a stage that fails stops the stages after it on its own leg
-# alone.
+# GCC 10, GCC 16 and x86_64.  A stage's job builds its rungs, runs its
+# checks, and starts from the store paths the job before it built.  ci.yml
+# calls this workflow once for each leg Ladder (mode) names, so each leg's
+# chain runs on its own: a stage that fails stops the stages after it on
+# its own leg alone.
 #
 # The rungs are i686 programs.  The x64 leg runs them through WoW64 and the
 # ARM64 leg through ARM64 Windows' x86 emulator, where the x64 nova-nix
@@ -1815,6 +1815,170 @@ jobs:
             diff "$expected" "$lines"
             exit 1
           fi
+
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the x86_64 stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-gcc-latest-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # x86_64: gcc-latest builds binutils for x86_64-w64-mingw32,
+  # binutils-x86_64, whose assembler, archiver and linker
+  # test/data/binutils-x86_64.nix has build an x86_64 program and an i386
+  # one that run, and whose programs it finds carrying no time stamp.
+  #
+  # The timeout is twice an estimate of this stage on the ARM64 leg, about
+  # 18 minutes: on a 24-thread x64 Windows machine binutils-x86_64 builds
+  # in 4 minutes, where gcc10 builds in 13 and GCC 10 (Windows ARM64) takes
+  # 52, and GCC 4.6.4 C++ (Windows ARM64) spends 2 minutes around its
+  # build.
+  # ---------------------------------------------------------------------------
+  x86_64-windows:
+    name: x86_64
+    needs: [gcc-latest-windows]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 36
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the GCC 16 stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-gcc-latest-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the GCC 16 stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc-latest fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" x86_64 build
+
+      # GNU binutils 2.46 for x86_64-w64-mingw32, configured, compiled and
+      # installed in the seed stdenv by gcc-latest, timed.
+      - name: Build binutils-x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A binutils-x86_64
+          echo "== binutils-x86_64 built in $((SECONDS - start)) s"
+
+      # busybox's sh runs test/data/binutils-x86_64.nix's two scripts.  link
+      # has as assemble a function that returns 42 for x86_64 and for i386,
+      # ar archive one object, ld link each as a program's entry point and
+      # each program run, and writes the version line ld prints, what nm, ar
+      # and objdump read back, each program's exit status, and the machine
+      # and optional header magic od reads from each program's PE header;
+      # stamps writes every program and DLL the rung installs with the time
+      # stamp its PE header carries.  The lines are compared with the file
+      # of test/data named for the check, which is what the formats and the
+      # configuration define them to be, each time stamp 0, for the reason
+      # gcc46-cxx's are.
+      - name: binutils-x86_64 links an x86_64 and an i386 program that run
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in link stamps; do
+            expected=test/data/binutils-x86_64-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/binutils-x86_64.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
 
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server

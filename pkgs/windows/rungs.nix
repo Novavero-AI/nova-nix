@@ -78,4 +78,7 @@
 
   # GCC 16.2.0 with C and C++, the GCC 16 stage.
   gcc-latest = [ "gcc-latest" ];
+
+  # binutils for x86_64-w64-mingw32, the x86_64 stage.
+  x86_64 = [ "binutils-x86_64" ];
 }
