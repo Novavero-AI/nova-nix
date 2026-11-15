@@ -16,6 +16,7 @@ import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
 import Control.Monad (filterM, unless, void, when, zipWithM)
+import Control.Monad.Except (runExceptT)
 import Control.Monad.State.Strict (State, gets, modify', runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
 import qualified Data.ByteString as BS
@@ -97,7 +98,7 @@ import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), d
 import Nix.Json (Json (..), parseJson, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
-import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, pushPaths, storePathBasename, stripHashPrefix)
+import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, preparePath, pushPaths, storePathBasename, stripHashPrefix)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
@@ -17449,6 +17450,42 @@ testBuilder = do
               if outExists && devExists
                 then Pass
                 else Fail ("out exists=" <> T.pack (show outExists) <> " dev exists=" <> T.pack (show devExists))
+          BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure ret,
+      -- Upstream records the .drv as every output's deriver
+      -- (local-derivation-goal.cc:2738 at 2.24.9), and a push names it in
+      -- the narinfo's Deriver field, a basename as on the wire.
+      runTestM "every built output names its .drv as its deriver, and a push's narinfo carries it" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-deriver"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "ggggggggggggggggggggggggggggggg9" "deriver"
+            devSP = StorePath "gggggggggggggggggggggggggggggggb" "deriver-dev"
+            drv =
+              (mkTestBuildDrv shell outSP "mkdir -p $out $dev")
+                { drvOutputs = [DerivationOutput "out" outSP "" "", DerivationOutput "dev" devSP "" ""]
+                }
+            drvText = T.pack (storePathToFilePath (stDir store) testDrvPath)
+        result <- buildDerivation (defaultBuildConfig (stDir store)) store drv testDrvPath
+        ret <- case result of
+          BuildSuccess _ -> do
+            derivers <- traverse (queryDeriver (stDB store)) [outSP, devSP]
+            prepared <- runExceptT (preparePath PushNone store outSP)
+            pure $
+              assertEqual "derivers" [Just drvText, Just drvText] derivers
+                `andThen` assertRight
+                  "push"
+                  prepared
+                  ( \(_, narInfo) ->
+                      assertEqual "Deriver" (Just (storePathBasename testDrvPath)) (NarInfo.niDeriver narInfo)
+                        `andThen` assertEqual
+                          "rendered"
+                          True
+                          (("\nDeriver: " <> storePathBasename testDrvPath <> "\n") `T.isInfixOf` NarInfo.renderNarInfo narInfo)
+                  )
           BuildFailure msg code -> pure (Fail ("build failed (" <> T.pack (show code) <> "): " <> msg))
         closeStore store
         forceRemoveIfExists tmpStore

@@ -41,6 +41,7 @@ module Nix.Push
     -- * Pushing
     pushPaths,
     computeClosure,
+    preparePath,
     loadApiKeyFile,
 
     -- * Pure pieces (exported for tests)
@@ -396,30 +397,38 @@ fetchRemoteHashes manager cfg = do
 -- and upload the bytes.  Returns the narinfo to publish in phase 2.
 uploadNar :: HTTP.Manager -> PushConfig -> Store -> StorePath -> ExceptT Text IO NarInfo
 uploadNar manager cfg store sp = do
+  (artifact, narInfo) <- preparePath (pcCompression cfg) store sp
+  let url = pcCacheUrl cfg <> "/" <> niUrl narInfo
+  logLine
+    ( "[nar]   "
+        <> storePathBasename sp
+        <> " ("
+        <> T.pack (show (paNarSize artifact))
+        <> " bytes)"
+    )
+  response <- httpRequest manager "PUT" url (authHeaders cfg) (Just (paBytes artifact))
+  expectOk ("PUT " <> niUrl narInfo) response
+  pure narInfo
+
+-- | What a push uploads for one store path: its NAR, packaged as the
+-- compression asks, and the narinfo that describes it.  The NAR is
+-- serialized from disk and held to the NAR hash the database recorded
+-- ('checkRecordedNarHash'); the references and the deriver come from the
+-- path's row.
+preparePath :: PushCompression -> Store -> StorePath -> ExceptT Text IO (PushArtifact, NarInfo)
+preparePath compression store sp = do
   let physicalPath = storePathToFilePath (stDir store) sp
   narEntry <- liftIO (ExecBit.serialiseFromPath (volumeCaseHack (stCaseSensitivity store)) physicalPath)
   let narBytes = NAR.serialise narEntry
       narHash = Hash.formatNixHash (Hash.hashBytes narBytes)
-      narSize = BS.length narBytes
   recorded <- liftIO (queryPathInfo (stDB store) sp)
   liftEither (checkRecordedNarHash recorded narHash sp)
   refTexts <- liftIO (queryReferences (stDB store) sp)
   refs <- liftEither (traverse (parseRefText store) refTexts)
   deriverText <- liftIO (queryDeriver (stDB store) sp)
   let deriver = deriverText >>= parseStorePath (stDir store)
-      artifact = mkPushArtifact (pcCompression cfg) narHash narBytes
-      narInfo = mkNarInfo artifact sp refs deriver
-      url = pcCacheUrl cfg <> "/" <> niUrl narInfo
-  logLine
-    ( "[nar]   "
-        <> storePathBasename sp
-        <> " ("
-        <> T.pack (show narSize)
-        <> " bytes)"
-    )
-  response <- httpRequest manager "PUT" url (authHeaders cfg) (Just (paBytes artifact))
-  expectOk ("PUT " <> niUrl narInfo) response
-  pure narInfo
+      artifact = mkPushArtifact compression narHash narBytes
+  pure (artifact, mkNarInfo artifact sp refs deriver)
 
 -- | Pre-upload integrity gate.  The store DB recorded the path's NAR hash
 -- at registration; a mismatch now means the path changed on disk - refuse
