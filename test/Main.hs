@@ -115,6 +115,7 @@ import qualified Nix.Substituter as Subst
 import qualified Nix.Trust as Trust
 import Nix.Trust.Scan (scanFetched)
 import NodeStatus (NodeStatus (..), nodeStatus)
+import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as CHash
 import qualified NovaCache.NAR as NAR
@@ -3722,6 +3723,49 @@ testDerivationPathFieldsIO = do
       ]
   Dir.removePathForcibly dir
   pure results
+
+-- | A derivation whose pass reads an @outputHash@ is fixed-output, an
+-- empty one and one coerced from another type included (primops.cc:1347-1351,
+-- 1425-1437 at 2.24.9): its outputs must be @out@ alone, and the hash is
+-- read with newHashAllowEmpty (hash.cc:271-281), so an empty one is the
+-- all-zero digest of the algorithm @outputHashAlgo@ names.  A fixed
+-- output's path depends on its name, mode and hash alone, so an empty
+-- hash's path is the all-zero hash's.  Each expected message is upstream's
+-- at 2.24.9, read from its source.
+testFixedOutputHash :: IO [Bool]
+testFixedOutputHash = do
+  putStrLn "eval/fixed-output-hash"
+  tmpBase <- getTemporaryDirectory
+  let drv fields = "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; " <> fields <> " })"
+      zeroSri = "sha256-" <> T.replicate 43 "A" <> "="
+      pinned = "outputHash = \"" <> zeroSri <> "\";"
+      samePath attr these those = drv these <> "." <> attr <> " == " <> drv those <> "." <> attr
+      zeroPath fields = samePath "outPath" fields pinned
+      gives label source = runTest label (assertEval label source (VBool True))
+      fails label fields expected = runTest label (assertEvalError label (drv fields <> ".drvPath") expected)
+      multipleOutputs = "multiple outputs are not supported in fixed-output derivations"
+  emptyDrv <- evalDerivationIO tmpBase (drv "outputHash = \"\"; outputHashAlgo = \"sha256\";")
+  sequence
+    [ gives "an empty outputHash is the all-zero hash of outputHashAlgo" (zeroPath "outputHash = \"\"; outputHashAlgo = \"sha256\";"),
+      runTest "an empty outputHash's .drv keeps the empty entry and names the all-zero hash" $
+        assertRight "empty-outputhash-drv" emptyDrv $ \d -> case drvOutputs d of
+          [DerivationOutput "out" _ "sha256" digest] ->
+            assertEqual "empty-outputhash-drv" (T.replicate 64 "0", Just "") (digest, Map.lookup "outputHash" (drvEnv d))
+          other -> Fail ("expected the one fixed output out, got " <> T.pack (show other)),
+      gives "a null outputHash coerces to the empty one" (zeroPath "outputHash = null; outputHashAlgo = \"sha256\";"),
+      gives "under __ignoreNulls a null outputHash is left out" (samePath "drvPath" "__ignoreNulls = true; outputHash = null;" "__ignoreNulls = true;"),
+      gives "a structured empty outputHash is the all-zero hash" (zeroPath "__structuredAttrs = true; outputHash = \"\"; outputHashAlgo = \"sha256\";"),
+      fails "an empty outputHash needs an algorithm" "outputHash = \"\";" "empty hash requires explicit hash algorithm",
+      fails "an algorithm upstream does not know is none" "outputHash = \"\"; outputHashAlgo = \"sha3\";" "empty hash requires explicit hash algorithm",
+      fails "an integer outputHash is its decimal" "outputHash = 5; outputHashAlgo = \"sha256\";" "hash '5' has wrong length for hash algorithm 'sha256'",
+      fails "an integer outputHash with no algorithm has no type" "outputHash = 5;" "hash '5' does not include a type, nor is the type otherwise known from context",
+      fails "a fixed output refuses a second output" ("outputs = [ \"out\" \"dev\" ]; " <> pinned) multipleOutputs,
+      fails "a fixed output refuses an output other than out" ("outputs = [ \"dev\" ]; " <> pinned) multipleOutputs,
+      fails "a fixed output's outputs are refused before their names are checked" ("__structuredAttrs = true; outputs = [ \"a b\" ]; " <> pinned) multipleOutputs,
+      gives "out alone is a fixed output's own output" (samePath "outPath" ("outputs = [ \"out\" ]; " <> pinned) pinned),
+      runTest "a missing builder is refused before the hash is read" $
+        assertEvalError "fixed-output-builder" "(derivation { name = \"t\"; system = \"x\"; outputHash = \"\"; }).drvPath" "required attribute 'builder' missing"
+    ]
 
 -- | A builtin taking a path coerces its argument as upstream's
 -- coerceToPath does (eval.cc at 2.24.9), and baseNameOf and dirOf as
@@ -21110,6 +21154,87 @@ testFirstArgumentOrderIO = do
       emits "trace inside deepSeq sees the forced value" "let x = { a = 1 + 1; }; in builtins.deepSeq x (builtins.trace x 1)" ["trace: { a = 2; }"]
     ]
 
+-- | An empty hash is the all-zero digest of the algorithm its context
+-- gives, which upstream warns of on stderr as it reads the hash
+-- (newHashAllowEmpty, hash.cc:271-281 at 2.24.9): a fixed-output
+-- derivation's, and the sha256 pin of fetchurl, fetchTarball and
+-- builtins.path, whose copy then fails as upstream's does on a pin it
+-- does not match (fetchTree.cc:515-522, primops.cc:2478-2482).  Each
+-- expected stream is read from upstream's source at 2.24.9.
+testEmptyHashIO :: IO [Bool]
+testEmptyHashIO = do
+  putStrLn "eval/empty-hash-io"
+  tmpBase <- getTemporaryDirectory >>= Dir.canonicalizePath
+  environment <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-empty-hash"
+      file = root </> "data.txt"
+      tree = root </> "tree"
+      payload = "payload\n"
+      tarballData = "data\n"
+      pathText = canonPathValue . T.pack
+      fileUrl p = "file://" <> pathText p
+      warning algo zero = "warning: found empty hash, assuming '" <> algo <> "-" <> zero <> "'"
+      sha256Warning = warning "sha256" (T.replicate 43 "A" <> "=")
+      drvPath fields = "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; " <> fields <> " }).drvPath"
+      fetchMismatch url got =
+        [ "error: hash mismatch in file downloaded from '" <> url <> "':",
+          "  specified: sha256:" <> T.replicate 52 "0",
+          "  got:       sha256:" <> Nix32.encode got
+        ]
+      pathMismatch = "error: store path mismatch in (possibly filtered) path added from '" <> pathText tree <> "'"
+      tarballLabel = "an empty fetchTarball pin warns, then the extracted tree's hash is reported"
+      -- Written from the fixture root, so tar is given no drive letter.
+      tarProcess =
+        (Proc.proc "tar" ["-czf", "tree.tar.gz", "-C", "stage", "top"])
+          { Proc.cwd = Just root,
+            Proc.env = Just (("COPYFILE_DISABLE", "1") : environment)
+          }
+      tarballCase
+        | SI.os == "mingw32" = runTest (tarballLabel <> " (skipped: fetchTarball extracts through sh, which nova-nix does not assume on Windows)") Pass
+        | otherwise = do
+            (code, _, err) <- Proc.readCreateProcessWithExitCode tarProcess ""
+            case code of
+              ExitFailure n -> runTest tarballLabel (Fail ("tar exited " <> T.pack (show n) <> ": " <> T.pack err))
+              ExitSuccess ->
+                emits
+                  tarballLabel
+                  ("builtins.fetchTarball { url = \"" <> fileUrl (root </> "tree.tar.gz") <> "\"; sha256 = \"\"; }")
+                  (sha256Warning : fetchMismatch (fileUrl (root </> "tree.tar.gz")) (sha256Digest (NAR.serialise (NAR.NarDirectory [("data", NAR.NarRegular False tarballData)]))))
+  bracket_
+    ( do
+        forceRemoveIfExists root
+        createDirectoryIfMissing True tree
+        createDirectoryIfMissing True (root </> "stage" </> "top")
+        BS.writeFile file payload
+        BS.writeFile (tree </> "f") "tree\n"
+        BS.writeFile (root </> "stage" </> "top" </> "data") tarballData
+    )
+    (forceRemoveIfExists root)
+    $ sequence
+      [ emits "an empty outputHash warns, naming the all-zero hash" (drvPath "outputHash = \"\"; outputHashAlgo = \"sha256\";") [sha256Warning],
+        emits "the all-zero hash is outputHashAlgo's" (drvPath "outputHash = \"\"; outputHashAlgo = \"sha512\";") [warning "sha512" (T.replicate 86 "A" <> "==")],
+        emits "an empty outputHash with no algorithm is refused without a warning" (drvPath "outputHash = \"\";") ["error: empty hash requires explicit hash algorithm"],
+        emits
+          "an empty fetchurl pin warns, then the file's hash is reported"
+          ("builtins.fetchurl { url = \"" <> fileUrl file <> "\"; sha256 = \"\"; }")
+          (sha256Warning : fetchMismatch (fileUrl file) (sha256Digest payload)),
+        tarballCase,
+        emits
+          "an empty builtins.path pin warns, then the copy is refused"
+          ("builtins.path { path = " <> pathText tree <> "; sha256 = \"\"; }")
+          [sha256Warning, pathMismatch],
+        emits
+          "a filtered builtins.path is refused in the same words"
+          ("builtins.path { path = " <> pathText tree <> "; filter = p: t: true; sha256 = \"\"; }")
+          [sha256Warning, pathMismatch],
+        -- The other warning derivationStrict gives, through the same
+        -- logger (primops.cc:1332-1343 at 2.24.9).
+        emits
+          "a structured derivation warns of a check it disables"
+          (drvPath "__structuredAttrs = true; allowedReferences = [ ];")
+          ["warning: In a derivation named 't', 'structuredAttrs' disables the effect of the derivation attribute 'allowedReferences'; use 'outputChecks.<output>.allowedReferences' instead"]
+      ]
+
 -- | Without @trace-verbose@, upstream binds @builtins.traceVerbose@ to
 -- @prim_second@ (primops.cc at 2.24.9), which forces and returns its
 -- second argument and never forces its first, whether it is applied
@@ -24293,6 +24418,8 @@ runSuite = do
           testDeepContextClosureIO,
           testDerivationFields,
           testDerivationPathFieldsIO,
+          testFixedOutputHash,
+          testEmptyHashIO,
           testPathArguments,
           testPathArgumentsIO,
           testPathFilterIO,

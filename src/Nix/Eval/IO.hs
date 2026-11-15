@@ -564,7 +564,7 @@ instance MonadEval EvalIO where
 
   removeScratchDir dir = wrapIO (Dir.removePathForcibly (T.unpack dir))
 
-  copyPathToStore srcPath name expectedSha256 = do
+  copyPathToStore srcPath name pin = do
     -- Content-addressed like upstream addToStore: recursive NAR sha256
     -- under the caller's name.  Same content means same path, so the
     -- existence check in 'unpackToStoreVerified' is sound: changed source
@@ -577,16 +577,8 @@ instance MonadEval EvalIO where
     resolvedSource <- evalStoreTextPath resolvedText
     entry <- serialiseSource resolvedText caseHack resolvedSource
     let narDigest = sha256Digest (NAR.serialise entry)
-    case expectedSha256 of
-      Just (subject, expected)
-        | expected /= narDigest ->
-            throwEvalError
-              ( subject
-                  <> ": hash mismatch: expected sha256:"
-                  <> bytesToHexText expected
-                  <> ", got sha256:"
-                  <> bytesToHexText narDigest
-              )
+    case pin of
+      Just (expected, mismatch) | expected /= narDigest -> throwEvalError (mismatch narDigest)
       _ -> pure ()
     -- The name is refused only once the tree is hashed, as upstream's is:
     -- the refusal names the path the copy would have had.
