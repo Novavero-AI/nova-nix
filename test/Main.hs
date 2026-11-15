@@ -72,7 +72,7 @@ import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
-import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
+import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
@@ -83,7 +83,7 @@ import Nix.Eval.CStats (CRoot (..), Census (..), Figures (..), PerKind (..), ren
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
-import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
+import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIO, runEvalIOTraced)
@@ -101,7 +101,7 @@ import qualified Nix.Hash as Hash
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, ioRetryEffects, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
 import Nix.Json (Json (..), parseJson, renderJson)
-import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
+import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope, parsedExpr)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, preparePath, pushPaths, storePathBasename, stripHashPrefix)
 import qualified Nix.Realise as Realise
@@ -221,7 +221,7 @@ assertParse = assertParseIn []
 -- way @scopedImport@ binds its scope: each stays a name-based 'EVar'.
 assertParseIn :: [Text] -> Text -> Text -> Expr -> TestResult
 assertParseIn names label source expected =
-  assertRight label (parseNixWithScope (withGlobals names) testBaseDir testOrigin (TE.encodeUtf8 source)) $ \actual ->
+  assertRight label (parsedExpr <$> parseNixWithScope (withGlobals names) testBaseDir testOrigin (TE.encodeUtf8 source)) $ \actual ->
     assertEqual label expected actual
 
 -- | The root environment's names with more bound around them.
@@ -241,7 +241,7 @@ evalNix = evalNixBytes . TE.encodeUtf8
 evalNixBytes :: BS.ByteString -> Either Text NixValue
 evalNixBytes source = case parseNix testBaseDir testOrigin source of
   Left err -> Left (sourceFailure err)
-  Right expr -> runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)
+  Right parsed -> runPureEval (evalParsed (builtinEnv unrestrictedPolicy 0 []) parsed)
 
 -- | Prefix marking a parse (not eval) failure in 'evalNix' results.
 parseErrorTag :: Text
@@ -2014,17 +2014,17 @@ testEvalWith = do
           (VInt 3),
       -- AST test: parse "with a; b" produces EWithVar
       runTest "parse with produces EWithVar" $
-        assertRight "with-ast" (parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "with a; b") $ \case
+        assertRight "with-ast" (parsedExpr <$> parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "with a; b") $ \case
           EWith (EVar "a") (EWithVar "b") -> Pass
           other -> Fail ("expected EWith (EVar a) (EWithVar b), got: " <> T.pack (show other)),
       -- AST test: formal wins over with
       runTest "parse lambda formal wins over with" $
-        assertRight "formal-wins" (parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "x: with a; x") $ \case
+        assertRight "formal-wins" (parsedExpr <$> parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "x: with a; x") $ \case
           ELambda _ (EWith _ (EResolvedVar 0 0)) _ -> Pass
           other -> Fail ("expected formal to win, got: " <> T.pack (show other)),
       -- Trimming test: lambda inside with gets CapturesWithScopes
       runTest "with lambda trimmed with CapturesWithScopes" $
-        assertRight "with-trim" (parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "with a; x: b + x") $ \case
+        assertRight "with-trim" (parsedExpr <$> parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "with a; x: b + x") $ \case
           EWith _ (ELambda _ _ (CapturesWithScopes _)) -> Pass
           other -> Fail ("expected CapturesWithScopes, got: " <> T.pack (show other))
     ]
@@ -3158,7 +3158,7 @@ testParserIntegration = do
   putStrLn "parser/integration"
   sequence
     [ runTest "shell.nix pattern" $
-        assertRight "shell.nix" (parseNix testBaseDir testOrigin "{ pkgs ? import <nixpkgs> {} }: pkgs.mkShell { buildInputs = [ pkgs.ghc ]; }") $ \case
+        assertRight "shell.nix" (parsedExpr <$> parseNix testBaseDir testOrigin "{ pkgs ? import <nixpkgs> {} }: pkgs.mkShell { buildInputs = [ pkgs.ghc ]; }") $ \case
           ELambda {} -> Pass
           other -> Fail ("expected ELambda, got: " <> T.pack (show other)),
       runTest "let with multiple bindings" $
@@ -3198,16 +3198,16 @@ testParserIntegration = do
               NoCaptureInfo
           ),
       runTest "indented string" $
-        assertRight "ind string" (parseNix testBaseDir testOrigin "''hello''") $ \case
+        assertRight "ind string" (parsedExpr <$> parseNix testBaseDir testOrigin "''hello''") $ \case
           EIndStr _ -> Pass
           other -> Fail ("expected EIndStr, got: " <> T.pack (show other)),
       runTest "indented string escape is its own part" $
-        assertRight "ind string esc" (parseNix testBaseDir testOrigin "''a'''b''") $ \case
+        assertRight "ind string esc" (parsedExpr <$> parseNix testBaseDir testOrigin "''a'''b''") $ \case
           EIndStr [StrLit "a", StrEsc "''", StrLit "b"] -> Pass
           other -> Fail ("expected literal, escape, literal, got: " <> T.pack (show other)),
       -- Positional let/rec resolution tests
       runTest "let inherit from outer lambda" $
-        assertRight "let-inherit-lambda" (parseNix testBaseDir testOrigin "x: let inherit x; in x") $ \case
+        assertRight "let-inherit-lambda" (parsedExpr <$> parseNix testBaseDir testOrigin "x: let inherit x; in x") $ \case
           -- x: let inherit x; in x
           -- The lambda formal x is at level 0, index 0.
           -- The let scope is level 0 (for the let body).
@@ -3811,21 +3811,21 @@ evalNixIO baseDir source = do
 evalNixIOTraced :: FilePath -> Text -> IO (Either EvalFailure NixValue)
 evalNixIOTraced baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (EvalFailure [] (T.pack (show err))))
-  Right expr -> do
+  Right parsed -> do
     storeDir <- evalNixIOStoreDir
     st <- newEvalState storeDir baseDir
-    runEvalIOTraced st (eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr)
+    runEvalIOTraced st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
 
 -- | 'evalNixIO' as @nova-nix eval --strict@ evaluates: the result, once
 -- everything inside it is forced in place.
 evalStrictIO :: FilePath -> Text -> IO (Either Text NixValue)
 evalStrictIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (T.pack (show err)))
-  Right expr -> do
+  Right parsed -> do
     storeDir <- evalNixIOStoreDir
     st <- newEvalState storeDir baseDir
     runEvalIO st $ do
-      val <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      val <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       val <$ deepForce val
 
 -- | IO eval of a derivation expression to the 'Derivation' the session
@@ -3835,11 +3835,11 @@ evalStrictIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 so
 evalDerivationIO :: FilePath -> Text -> IO (Either Text Derivation)
 evalDerivationIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 ("(" <> source <> ").drvPath")) of
   Left err -> pure (Left (T.pack (show err)))
-  Right expr -> do
+  Right parsed -> do
     storeDir <- evalNixIOStoreDir
     st <- newEvalState storeDir baseDir
     runEvalIO st $ do
-      pathVal <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      pathVal <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case pathVal of
         VStr pathBytes _ -> do
           recorded <- lookupSessionDrv (bytesText pathBytes)
@@ -4948,7 +4948,7 @@ derivationWrapperFile = "/derivation-internal.nix"
 evalNixInFile :: Text -> Either Text NixValue
 evalNixInFile source = case parseNix testBaseDir (SourceFile positionsFile) (TE.encodeUtf8 source) of
   Left err -> Left (sourceFailure err)
-  Right expr -> runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)
+  Right parsed -> runPureEval (evalParsed (builtinEnv unrestrictedPolicy 0 []) parsed)
 
 -- | Each expected position is derived from upstream's source at 2.24.9:
 -- @prim_unsafeGetAttrPos@ (primops.cc) answers @EvalState::mkPos@ of the
@@ -5417,11 +5417,11 @@ expectMaxCallDepth label result = case result of
 evalAtCeiling :: Word32 -> Text -> IO (Either Text NixValue)
 evalAtCeiling limit source = case parseNix "." testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (T.pack (show err)))
-  Right expr -> do
+  Right parsed -> do
     storeDir <- evalNixIOStoreDir
     st0 <- newEvalState storeDir "."
     let st = st0 {esCallDepth = topLevelCallDepth limit}
-    runEvalIO st (eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr)
+    runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
 
 -- | The function-call nesting ceiling, upstream's max-call-depth (10000).
 -- Every boundary here was read off nix-instantiate 2.33.2 and the 2.24.9
@@ -14535,8 +14535,8 @@ testStage0Pe32Chain = do
       chainAttrs = ("seed" : links) ++ map extraAttr extras
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip (("seed" : links ++ bins) ++ map extraAttr extras ++ map runAttr runs) (T.words (bytesText bytes)))
@@ -14848,8 +14848,8 @@ testMesWindows = do
       roots = tools ++ map ("mes." <>) mesAttrs ++ map ("checks." <>) checkAttrs
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> case T.words (bytesText bytes) of
           prefix : paths -> do
@@ -15002,8 +15002,8 @@ testTinyccWindows = do
       roots = mesRoots ++ tinyccPaths ++ map ("checks." <>) checkAttrs
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> case T.words (bytesText bytes) of
           prefix : paths -> do
@@ -15265,8 +15265,8 @@ testGnumakeWindows = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -15367,8 +15367,8 @@ testBusyboxWindows = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -15485,8 +15485,8 @@ testChecksForbidSubstitutes = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> pure (T.words (bytesText bytes))
         other -> throwEvalError ("expected the attributes as one string, got " <> typeName other)
@@ -15532,8 +15532,8 @@ testSeedStdenvWindows = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -15656,8 +15656,8 @@ testBinutilsWindows = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -15772,8 +15772,8 @@ testGccCoreWindows = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -15938,8 +15938,8 @@ testGcc46Windows = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -16078,8 +16078,8 @@ testGcc46CxxWindows = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -16256,8 +16256,8 @@ testGcc10Windows = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -16447,8 +16447,8 @@ testWindowsSources = do
           ]
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let (listed, roots) = break (== listEnd) (T.words (bytesText bytes))
@@ -16581,8 +16581,8 @@ testWindowsRungs = do
         Right bytes -> jobPackageSetBuilds jobId (T.lines (bytesText bytes))
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> pure (stageLists (T.words (bytesText bytes)))
         other -> throwEvalError ("expected the stages as one string, got " <> typeName other)
@@ -16773,9 +16773,9 @@ makeGitFixture dir files = do
 evalNixIOStore :: StoreDir -> FilePath -> Text -> IO (Either Text NixValue)
 evalNixIOStore storeDir baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (T.pack (show err)))
-  Right expr -> do
+  Right parsed -> do
     st <- newEvalState storeDir baseDir
-    runEvalIO st (eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr)
+    runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
 
 testFetchGitShallow :: IO [Bool]
 testFetchGitShallow = do
@@ -20021,13 +20021,13 @@ evalAndBuild :: StoreDir -> Text -> IO (Either Text (BuildResult, Store))
 evalAndBuild storeDir source = do
   case parseNix testBaseDir testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left ("parse error: " <> T.pack (show err)))
-    Right expr -> do
+    Right parsed -> do
       -- The SAME store the build below is given.  Evaluating against the
       -- platform default while building elsewhere is what let a store dir
       -- honored on writes but not on reads pass the whole suite.
       st <- newEvalState storeDir "."
       evalResult <- runEvalIO st $ do
-        val <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+        val <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
         -- What the CLI driver does: force drvPath, which runs
         -- derivationStrict (so a missing required attr surfaces as an eval
         -- error) and records the .drv the build reads back by that path.
@@ -21384,8 +21384,8 @@ testTrustWindowsGraphs = do
       source = "builtins.concatStringsSep \" \" [ " <> windows <> ".stage0-pe32.kaem-unwrapped.drvPath " <> windows <> ".hello.drvPath ]"
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> runEvalIO st $ do
-      value <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case value of
         VStr bytes _ -> do
           let roots = T.words (bytesText bytes)
@@ -21953,11 +21953,11 @@ servedLine = "served without an exception"
 -- next 'arenaDestroy' frees, a use-after-free the ASan job reports.
 arenaGuardPaths :: [ArenaGuardPath]
 arenaGuardPaths =
-  [ noArena "compile" "nn_bc_emit" evalIssueProgram,
+  [ noArena "compile" "nn_bc_emit" evalNamelessProgram,
     noArena "thunk" "nn_thunk_new_computed_int" (void (evaluate (unThunk (evaluated (VInt 1))))),
     noArena "symbol" "nn_symbol_intern" (void (evaluate (unThunk (evaluated (mkStr "a"))))),
     noArena "env" "nn_env_alloc_slots" (void (evaluate (fst (buildCSlots [evaluated (VInt 1)])))),
-    noArena "after-destroy" "nn_bc_emit" (bracket_ arenaInit arenaDestroy (pure ()) >> evalIssueProgram),
+    noArena "after-destroy" "nn_bc_emit" (bracket_ arenaInit arenaDestroy (pure ()) >> evalNamelessProgram),
     ArenaGuardPath
       { guardName = "constants-outside-window",
         guardClaim = "the null, true and false thunks read correctly before arenaInit and in a later arena",
@@ -21973,10 +21973,11 @@ arenaGuardPaths =
   ]
   where
     noArena name site = ArenaGuardPath name ("no arena: " <> T.pack name <> " raises ArenaNotInitialized at " <> site) (RefusedAt site)
-    -- A small program forced to its result; its first C call compiles it.
-    evalIssueProgram = case parseNix "/tmp" (SourceText "<expr>") "let x = 5; in x * 2 + 1" of
+    -- A small program forced to its result.  It names nothing, so its
+    -- first C call compiles it rather than interning a name.
+    evalNamelessProgram = case parseNix "/tmp" (SourceText "<expr>") "5 * 2 + 1" of
       Left err -> throwIO (ErrorCall (show err))
-      Right expr -> void (evaluate (runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) expr)))
+      Right parsed -> void (evaluate (runPureEval (evalParsed (builtinEnv unrestrictedPolicy 0 []) parsed)))
     -- Read through the IO accessors: a pure read of a constant is itself
     -- a constant GHC may share between the cycles, and the second would
     -- then read nothing.  A wrong cell is a broken outcome rather than the
@@ -22063,6 +22064,68 @@ emits label source expected = runTestM label $ do
   self <- getExecutablePath
   (_, _, err) <- Proc.readCreateProcessWithExitCode (Proc.proc self [evalChildFlag, T.unpack source]) ""
   pure (assertEqual label expected (T.lines (T.pack err)))
+
+-- | Run as a child, parse one source and compile it as an evaluation
+-- compiles what it parses, then print each name the compile added to the
+-- symbol table, one a line, in the order it added them.  Symbols are
+-- numbered from 1 in that order (cbits/nn_symbol.c), and the child's
+-- table holds nothing a test interned before.
+internOrderChildFlag :: String
+internOrderChildFlag = "--intern-order-child"
+
+internOrderChild :: String -> IO ()
+internOrderChild source = case parseNix testBaseDir testOrigin (TE.encodeUtf8 (T.pack source)) of
+  Left err -> putStrLn ("error: " <> show err)
+  Right parsed -> do
+    before <- symbolCount
+    _ <- compileParsed parsed
+    after <- symbolCount
+    mapM_ (TIO.putStrLn . symbolText . Symbol) [before + 1 .. after]
+
+-- | Compile the source in a child process running 'internOrderChild' and
+-- compare the names it interned, in order, with the expected ones.
+internsInOrder :: Text -> Text -> [Text] -> IO Bool
+internsInOrder label source expected = runTestM label $ do
+  self <- getExecutablePath
+  (_, out, _) <- Proc.readCreateProcessWithExitCode (Proc.proc self [internOrderChildFlag, T.unpack source]) ""
+  pure (assertEqual label expected (T.lines (T.pack out)))
+
+-- | Names are interned in the order upstream's parser interns them, the
+-- order a set's attributes are stored in.  There is no Nix here to run,
+-- so each expected order is derived from the actions of parser.y at
+-- 2.24.9, cited per case: bison runs a rule's action once the rule's
+-- right-hand side is parsed, so the name an action interns follows the
+-- names inside the rule.  No name whose order a case checks is one
+-- either evaluator interns at startup, and no source holds a string
+-- literal other than a key, which this evaluator also interns.  A name
+-- noted after a function's body is followed by another name, so that the
+-- compiler, which interns a function's argument after its body, cannot
+-- give the order on its own.
+testParseOrderInterningIO :: IO [Bool]
+testParseOrderInterningIO = do
+  putStrLn "eval/parse-order-interning-io"
+  sequence
+    [ internsInOrder "a let's bindings before its body (parser.y:206, :367)" "let za = 1; zb = za; in { zc = zb; }" ["za", "zb", "zc"],
+      internsInOrder "a variable where it is read, before the binding that defines it (:280)" "let zq = zt; zs = 1; zt = 2; in zq" ["zq", "zt", "zs"],
+      internsInOrder "an argument after its body, an inner one first (:179)" "with { }; [ (zx: zw: { zy = 1; }) zv ]" ["zy", "zw", "zx", "zv"],
+      internsInOrder "formals before the body, each after its default (:482-483)" "{ za ? { zb = 1; }, zc }: { zd = za; }" ["zb", "za", "zc", "zd"],
+      internsInOrder "a variable a default reads before the formal it defaults (:280, :483)" "{ zx ? zy, zy }: zx" ["zy", "zx"],
+      internsInOrder "an @-name written first after the formals and the body (:197)" "with { }; [ (zn@{ za }: { zb = za; }) zv ]" ["za", "zb", "zn", "zv"],
+      internsInOrder "an @-name written last after the formals and the body (:190)" "with { }; [ ({ za }@zn: { zb = za; }) zv ]" ["za", "zb", "zn", "zv"],
+      internsInOrder "an attribute path before its or default (:265, :433, :443)" "{ }.za.zb or { zc = 1; }" ["za", "zb", "zc"],
+      internsInOrder "a has-attribute path after its operand (:247)" "{ zc = 1; } ? za.zb" ["zc", "za", "zb"],
+      internsInOrder "an attribute path written in several places in source order (:367, :433, :443)" "{ za.zb = 1; zc = 2; za.zd = 3; }" ["za", "zb", "zc", "zd"],
+      internsInOrder "inherited names in order, after an inherit's source (:394, :416)" "with { }; { inherit ({ zc = 1; }) zb za; inherit zd; ze = 1; }" ["zc", "zb", "za", "zd", "ze"],
+      internsInOrder "a with's scope before its body (:204)" "with { zb = 1; }; { za = zb; }" ["zb", "za"],
+      internsInOrder "a dynamic key's expression in place, and a key of a plain string as a name (:444-452)" "with { }; { ${zk} = 1; ${\"zm\"} = 2; \"zn\" = 3; zl = 4; }" ["zk", "zm", "zn", "zl"],
+      internsInOrder "__curPos is no name (:276-278)" "{ za = __curPos; zb = 1; }" ["za", "zb"],
+      -- An evaluation shows the order: the argument an unexpected-argument
+      -- error names is the first in symbol order, here as under upstream
+      -- (eval.cc:1566-1576), though the wording is this evaluator's.
+      emits "a let's bindings are interned before its body" "let za = 1; in ({ }: za) { zb = 1; za = 2; }" ["error: unexpected attribute 'za' in function argument"],
+      emits "a function's formals are interned before its body" "({ za ? 1 }: ({ }: null) { zb = 1; za = 2; }) { }" ["error: unexpected attribute 'za' in function argument"],
+      emits "an attribute path is interned before its or default" "{ }.za or (({ }: null) { zb = 1; za = 2; })" ["error: unexpected attribute 'za' in function argument"]
+    ]
 
 -- | @deepSeq@, @trace@ and @warn@ finish with their first argument before
 -- they force their second (primops.cc at 2.24.9), however the second
@@ -22790,7 +22853,7 @@ evalNixStub = evalNixStubWith . stubEnv
 evalNixStubWith :: StubEnv -> Text -> Either Text NixValue
 evalNixStubWith env source = case parseNix testBaseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> Left (T.pack (show err))
-  Right expr -> runStubStoreEvalWith env (eval (builtinEnv unrestrictedPolicy 0 []) expr)
+  Right parsed -> runStubStoreEvalWith env (evalParsed (builtinEnv unrestrictedPolicy 0 []) parsed)
 
 -- | Upstream conformance cases with no direct test elsewhere.  Pure
 -- cases here; filesystem-touching cases in 'testClassIFollowupsIO'.
@@ -24869,7 +24932,7 @@ testStaticGlobalsSync = do
 assertUnbound :: Text -> Text -> Text -> TestResult
 assertUnbound label source name = case parseNix testBaseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> assertEqual label (UndefinedVariable name) err
-  Right expr -> Fail (label <> ": bound, got " <> T.pack (show expr))
+  Right parsed -> Fail (label <> ": bound, got " <> T.pack (show (parsedExpr parsed)))
 
 -- | Assert that every variable in a source binds.
 assertBinds :: Text -> Text -> TestResult
@@ -25214,6 +25277,7 @@ main =
   getArgs >>= \case
     [flag, name] | flag == arenaGuardChildFlag -> arenaGuardChild name
     [flag, source] | flag == evalChildFlag -> bracket_ arenaInit arenaDestroy (evalChild source)
+    [flag, source] | flag == internOrderChildFlag -> bracket_ arenaInit arenaDestroy (internOrderChild source)
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
     _ -> withRunTempRoot (bracket_ arenaInit arenaDestroy runSuite)
 
@@ -25347,6 +25411,7 @@ runSuite = do
           testErrorContext,
           testErrorContextIO,
           testFirstArgumentOrderIO,
+          testParseOrderInterningIO,
           testTraceVerboseOff,
           testStorePathLinksIO,
           testDeepContextClosureIO,
@@ -25515,7 +25580,7 @@ purePolicy = unrestrictedPolicy {epPureEval = True}
 evalNixWith :: EvalPolicy -> Text -> Either Text NixValue
 evalNixWith policy source = case parseNixWithScope (rootScopeNames policy) testBaseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> Left (sourceFailure err)
-  Right expr -> runPureEval (eval (builtinEnv policy 0 []) expr)
+  Right parsed -> runPureEval (evalParsed (builtinEnv policy 0 []) parsed)
 
 -- | The pure rules behind the modes, each pinned to upstream's code at
 -- 2.24.9: CanonPath::isAllowed over the allow list, isAllowedURI and
@@ -25689,11 +25754,11 @@ evalPolicyIO policy roots searchPaths baseDir source = do
   storeDir <- evalNixIOStoreDir
   case parseNixWithScope (rootScopeNames policy) baseDir testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
-    Right expr -> do
+    Right parsed -> do
       st0 <- newEvalState storeDir baseDir
       let st = st0 {esPolicy = policy, esSearchPaths = searchPaths}
       mapM_ (allowEvalPath st) roots
-      runEvalIO st (eval (builtinEnv policy (esTimestamp st) searchPaths) expr)
+      runEvalIO st (evalParsed (builtinEnv policy (esTimestamp st) searchPaths) parsed)
 
 -- | The battery the modes were pinned against, run through EvalIO: every
 -- expression here was run through nix-instantiate under restrict-eval and

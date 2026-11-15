@@ -13,6 +13,16 @@
 -- Both only affect mixed expressions that are type errors regardless, so no
 -- program that type-checks parses differently.
 -- Entirely pure. No IO, no Megaparsec, no Parsec.
+--
+-- The parser notes each name ('recordName') where upstream's parser
+-- interns one, in the order it does.  Bison runs a rule's action once
+-- the rule's whole right-hand side is parsed, so a name a rule's own
+-- action interns comes after the names inside it: a function's argument
+-- after its body, a formal after its default.  Upstream's GLR parser
+-- defers the actions of a split stack and runs them in that same order
+-- once one reading survives (glr.c in bison 3.8), so a split never
+-- changes the order.  A reading this parser backtracks out of drops its
+-- names with it.
 module Nix.Parser.Expr
   ( -- * Entry point
     parseTopLevel,
@@ -89,14 +99,17 @@ parseLambdaOrIdent = do
               failWithError (deeperError simpleErr (deeperError namedErr plainErr))
 
 -- | The header of @x: body@; on success, returns the committed body parse.
+-- The argument's name is noted after the body's names, as upstream's
+-- rule interns it (parser.y:179 at 2.24.9).
 trySimpleLambdaHeader :: Parser (Parser Expr)
 trySimpleLambdaHeader = do
   name <- expectIdent
   expect TokColon
-  pure ((\body -> ELambda (FormalName name) body NoCaptureInfo) <$> parseExpr)
+  pure ((\body -> ELambda (FormalName name) body NoCaptureInfo) <$> parseExpr <* recordName name)
 
 -- | The header of @name\@{ formals }: body@; on success, returns the
--- committed body parse.
+-- committed body parse.  The name is noted after the formals' and the
+-- body's names, as upstream's rule interns it (parser.y:197).
 tryNamedSetLambdaHeader :: Parser (Parser Expr)
 tryNamedSetLambdaHeader = do
   name <- expectIdent
@@ -104,7 +117,7 @@ tryNamedSetLambdaHeader = do
   expect TokLBrace
   (formals, hasEllipsis) <- parseFormalsBody
   expect TokColon
-  pure ((\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr)
+  pure ((\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr <* recordName name)
 
 -- | Brace at start: could be @{ formals }: body@, @{ formals }\@name: body@, or attr set.
 -- Same commitment rule as 'parseLambdaOrIdent': @... } :@ and
@@ -127,6 +140,8 @@ parseLambdaOrAttrSet = do
 
 -- | The header of @{ a, b ? default, ... }: body@ or
 -- @{ a, b }\@name: body@; on success, returns the committed body parse.
+-- An \@-name is noted after the formals' and the body's names, as
+-- upstream's rule interns it (parser.y:190).
 trySetLambdaHeader :: Parser (Parser Expr)
 trySetLambdaHeader = do
   expect TokLBrace
@@ -141,7 +156,7 @@ trySetLambdaHeader = do
       _ <- advance
       name <- expectIdent
       expect TokColon
-      pure ((\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr)
+      pure ((\body -> ELambda (FormalNamedSet name formals hasEllipsis) body NoCaptureInfo) <$> parseExpr <* recordName name)
     _ -> parseError ("expected ':' or '@' after formals, got " <> showToken tok)
 
 -- | Parse the inside of @{ ... }@ formals (comma-separated, optional defaults,
@@ -171,6 +186,9 @@ parseFormalsList acc = do
     if hasDefault
       then Just <$> parseExpr
       else pure Nothing
+  -- Upstream interns a formal's name once the formal, its default
+  -- included, is parsed (parser.y:482-483).
+  recordName name
   let formal = Formal {fName = name, fDefault = defVal}
       newAcc = formal : acc
   tok <- peek
@@ -423,7 +441,9 @@ parseAtom = do
     TokSearchPath p -> advance >> pure (ESearchPath p)
     TokIdent name
       | name == curPosIdentifier -> EPos <$> currentPos <* advance
-      | otherwise -> advance >> pure (EVar name)
+      -- Upstream interns a variable's name where it reads it
+      -- (parser.y:280), however the variable is later bound.
+      | otherwise -> advance >> EVar name <$ recordName name
     TokStringOpen -> parseString
     TokIndStringOpen -> parseIndString
     TokLParen -> parseParen
@@ -690,25 +710,23 @@ parseInherit = do
       expect TokSemicolon
       pure [Inherit pos name (EVar name) | InheritedName pos name <- names]
 
+-- | The names of an @inherit@, each noted as upstream's parser interns it
+-- (parser.y:416 and :421).
 parseInheritNames :: Parser [InheritedName]
 parseInheritNames = go []
   where
     go acc = do
       pos <- currentPos
       tok <- peek
+      let inherited name = recordName name >> go (InheritedName pos name : acc)
       case tok of
-        TokIdent name -> do
-          _ <- advance
-          go (InheritedName pos name : acc)
+        TokIdent name -> advance >> inherited name
         -- Keywords are valid as inherit names: inherit if then else;
-        _ | Just name <- keywordToText tok -> do
-          _ <- advance
-          go (InheritedName pos name : acc)
+        _ | Just name <- keywordToText tok -> advance >> inherited name
         -- Quoted strings for keywords used as attribute names: inherit "or";
         TokStringOpen -> do
           _ <- advance
-          name <- parseQuotedInheritName pos
-          go (InheritedName pos name : acc)
+          inherited =<< parseQuotedInheritName pos
         _ -> pure (reverse acc)
 
 -- | Parse a quoted inherit name: a simple string literal (no interpolation),
@@ -749,14 +767,16 @@ dottedKeys = go []
           go (key : acc)
         else pure (reverse acc)
 
+-- | One key of an attribute path, a static one's name noted as upstream's
+-- parser interns it (parser.y:433-452).
 parseAttrKey :: Parser AttrKey
 parseAttrKey = do
   tok <- peek
   case tok of
-    TokIdent name -> advance >> pure (StaticKey name)
+    TokIdent name -> advance >> staticKey name
     -- Keywords are valid as attribute names in Nix:
     -- { if = 1; }, a.then, { else = 2; }, etc.
-    _ | Just name <- keywordToText tok -> advance >> pure (StaticKey name)
+    _ | Just name <- keywordToText tok -> advance >> staticKey name
     TokStringOpen -> do
       pos <- currentPos
       strExpr <- parseString
@@ -764,7 +784,7 @@ parseAttrKey = do
       -- parser (the string becomes a symbol at parse time) - which is also
       -- what makes @let "x" = 1; in x@ legal.
       case literalStringKey strExpr of
-        Just bytes -> StaticKey <$> attrNameText pos bytes
+        Just bytes -> staticKey =<< attrNameText pos bytes
         Nothing -> pure (DynamicKey strExpr)
     TokInterpOpen -> do
       _ <- advance
@@ -772,8 +792,16 @@ parseAttrKey = do
       -- In expression context, the lexer doesn't track interpolation
       -- mode - } is TokRBrace rather than TokInterpClose.
       expect TokRBrace
+      -- Upstream's parser makes a key static when the expression inside
+      -- the braces is a plain string, and interns the string there
+      -- (parser.y:434-452).  This parser keeps such a key dynamic, so it
+      -- notes the name alone.  A string that is not UTF-8 notes nothing:
+      -- the evaluator refuses it as an attribute name.
+      mapM_ recordName (literalStringKey expr >>= either (const Nothing) Just . TE.decodeUtf8')
       pure (DynamicKey expr)
     _ -> parseError ("expected attribute key, got " <> showToken tok)
+  where
+    staticKey name = StaticKey name <$ recordName name
 
 -- | The bytes of a string expression that contains no interpolation; any
 -- 'StrInterp' makes the key dynamic.

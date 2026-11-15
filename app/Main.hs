@@ -38,7 +38,7 @@ import qualified Nix.Config as Config
 import Nix.DependencyGraph (DepNode (..), buildDepGraph)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, deepForce, eval, force, readThunkValue)
+import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, deepForce, evalParsed, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CStats (CRoot (..), renderCensus, takeCensus, valueRoots)
@@ -47,9 +47,8 @@ import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIOTraced)
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Expr.Resolve (undefinedVariableMessage)
-import Nix.Expr.Types (Expr)
 import Nix.HostPath (hostPathFromBytes)
-import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
+import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Realise (BuildMode (..), ClosureOutcome (..), Fallback (..), SubstitutesSetting (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, writeDrv, writeDrvClosure)
@@ -328,7 +327,7 @@ setUpEval opts config storeDir dataDir baseDir = do
 
 -- | Parse and bind source against the names the root environment
 -- 'setUpEval' builds will bind, which depend on the policy.
-parseForEval :: CliOpts -> NixConfig -> FilePath -> SourceOrigin -> BS.ByteString -> Either SourceError Expr
+parseForEval :: CliOpts -> NixConfig -> FilePath -> SourceOrigin -> BS.ByteString -> Either SourceError ParsedSource
 parseForEval opts config = parseNixWithScope (rootScopeNames (evalPolicyFor opts config))
 
 -- | Evaluate a .nix file and print the result.
@@ -337,9 +336,9 @@ evalFile config opts storeDir dataDir rawFilePath = do
   (filePath, source) <- readSourceFile rawFilePath
   case parseForEval opts config (takeDirectory filePath) (SourceFile (T.pack filePath)) source of
     Left err -> failSource err
-    Right expr -> do
+    Right parsed -> do
       (st, env) <- setUpEval opts config storeDir dataDir (takeDirectory filePath)
-      result <- runEvalIOTraced st (eval env expr >>= finalize (optStrict opts))
+      result <- runEvalIOTraced st (evalParsed env parsed >>= finalize (optStrict opts))
       case result of
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
@@ -352,9 +351,9 @@ evalExpr config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
-    Right expr -> do
+    Right parsed -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
-      result <- runEvalIOTraced st (eval env expr >>= finalize (optStrict opts))
+      result <- runEvalIOTraced st (evalParsed env parsed >>= finalize (optStrict opts))
       case result of
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
@@ -402,10 +401,10 @@ evalExprAterm config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
-    Right expr -> do
+    Right parsed -> do
       (st, env) <- setUpEval opts config storeDir dataDir cwd
       result <- runEvalIOTraced st $ do
-        val <- eval env expr
+        val <- evalParsed env parsed
         forceDerivationAttrs val
         pure val
       case result of
@@ -458,10 +457,10 @@ evalTarget config opts storeDir dataDir target attrPath = do
   (baseDir, origin, source) <- loadBuildSource target
   case parseForEval opts config baseDir origin source of
     Left err -> failSource err
-    Right expr -> do
+    Right parsed -> do
       (st, env) <- setUpEval opts config storeDir dataDir baseDir
       result <- runEvalIOTraced st $ do
-        root <- eval env expr
+        root <- evalParsed env parsed
         selected <- case attrPath of
           Nothing -> pure (Right root)
           Just path -> selectAttrPath path root

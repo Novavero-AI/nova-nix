@@ -50,6 +50,11 @@ module Nix.Parser
     parseNixWithScope,
     parseNixFile,
 
+    -- * Parsed source
+    ParsedSource,
+    parsedExpr,
+    parsedNames,
+
     -- * Origins
     SourceOrigin (..),
 
@@ -77,6 +82,26 @@ import Nix.Parser.Internal (ParseState (..), runParser)
 import Nix.Parser.Lexer (positionAfter, tokenize)
 import Nix.Parser.ParseError (ParseError (..))
 import System.FilePath (takeDirectory)
+
+-- | Source the parser has read: its expression, and the names in it in
+-- the order upstream's parser interns them (its @symbols.create@ calls,
+-- parser.y at 2.24.9).  A symbol's order is the order it was interned in,
+-- and a set holds its attributes in symbol order, so interning these
+-- before the expression compiles ('Nix.Eval.evalParsed') stores a set's
+-- attributes in upstream's order.  The compiler alone could not: it never
+-- interns the name of a variable bound in scope, and the parser has merged
+-- the bindings of one attribute path written in several places.
+data ParsedSource = ParsedSource ![Text] !Expr
+  deriving (Show)
+
+-- | The expression the source parsed to, its variables bound.
+parsedExpr :: ParsedSource -> Expr
+parsedExpr (ParsedSource _ expr) = expr
+
+-- | Every name the parse met where upstream's parser interns one, in the
+-- order it interns them, repeats included.
+parsedNames :: ParsedSource -> [Text]
+parsedNames (ParsedSource names _) = names
 
 -- | Why source text did not become an expression to evaluate.
 data SourceError
@@ -110,7 +135,7 @@ data SourceError
 -- same reason.  Pass the directory holding the file; for source with no file
 -- behind it (@--expr@) pass the working directory, which is what upstream
 -- parses against.
-parseNix :: FilePath -> SourceOrigin -> ByteString -> Either SourceError Expr
+parseNix :: FilePath -> SourceOrigin -> ByteString -> Either SourceError ParsedSource
 parseNix = parseNixWithScope staticGlobalNames
 
 -- | 'parseNix' against the names the environment the source is evaluated in
@@ -119,17 +144,17 @@ parseNix = parseNixWithScope staticGlobalNames
 -- with a @scopedImport@ scope's attributes over them, which upstream binds
 -- in a static environment of their own over the base one.  Every one binds
 -- like a global, so a @with@ in the source cannot shadow it.
-parseNixWithScope :: Set Text -> FilePath -> SourceOrigin -> ByteString -> Either SourceError Expr
+parseNixWithScope :: Set Text -> FilePath -> SourceOrigin -> ByteString -> Either SourceError ParsedSource
 parseNixWithScope scope baseDir origin source = do
   utf8 <- first SyntaxError (sourceUtf8 (sourceName origin) source)
   tokens <- first SyntaxError (tokenize (sourceName origin) utf8)
-  let st = ParseState {psTokens = tokens, psOrigin = origin}
-  (expr, _remaining) <- first SyntaxError (runParser parseTopLevel st)
+  let st = ParseState {psTokens = tokens, psOrigin = origin, psNames = []}
+  (expr, final) <- first SyntaxError (runParser parseTopLevel st)
   resolved <- first UndefinedVariable (resolveVars scope expr)
-  pure (resolveRelativePaths baseDir (trimClosures resolved))
+  pure (ParsedSource (reverse (psNames final)) (resolveRelativePaths baseDir (trimClosures resolved)))
 
 -- | Parse a @.nix@ file from disk.
-parseNixFile :: FilePath -> IO (Either SourceError Expr)
+parseNixFile :: FilePath -> IO (Either SourceError ParsedSource)
 parseNixFile path = parseNix (takeDirectory path) (SourceFile (T.pack path)) <$> BS.readFile path
 
 -- ---------------------------------------------------------------------------

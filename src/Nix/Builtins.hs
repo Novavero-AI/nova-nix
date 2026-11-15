@@ -46,7 +46,7 @@ import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, builtinNames, currentSystemStr, deferApply, evaluated, readThunkValue)
 import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newCEnv, thunkToCPtr)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames)
-import Nix.Parser (SourceOrigin (..), parseNixWithScope)
+import Nix.Parser (SourceOrigin (..), parseNixWithScope, parsedExpr)
 import Nix.Store.Path (defaultStoreDirText)
 
 -- | The initial environment: every name upstream's base environment binds
@@ -230,10 +230,13 @@ derivationWrapperEnv =
 -- ("Nix.Eval.Arena").  The source is a constant, so a parse failure is a
 -- defect in this module; it surfaces as an abort at the first use of
 -- @derivation@ rather than as a crash while the environment is assembled.
+-- Its names are interned from that first use, as it compiles and runs;
+-- upstream interns them as it starts, when @createBaseEnv@ evaluates the
+-- wrapper (primops.cc at 2.24.9).
 derivationWrapper :: Thunk
 derivationWrapper =
   case parseNixWithScope (Map.keysSet derivationWrapperScope) "/" derivationWrapperOrigin derivationWrapperSource of
-    Right expr -> cheapThunk derivationWrapperEnv expr
+    Right parsed -> cheapThunk derivationWrapperEnv (parsedExpr parsed)
     Left err -> abortingThunk ("the derivation wrapper does not parse: " <> T.pack (show err))
 {-# NOINLINE derivationWrapper #-}
 

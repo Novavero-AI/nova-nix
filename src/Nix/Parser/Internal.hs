@@ -28,6 +28,9 @@ module Nix.Parser.Internal
     -- * Positions
     currentPos,
 
+    -- * Names
+    recordName,
+
     -- * Errors
     parseError,
 
@@ -43,10 +46,12 @@ import Nix.Parser.Lexer (Located (..), Token (..))
 import Nix.Parser.ParseError (ParseError (..))
 
 -- | Remaining tokens plus where they came from, for error messages and
--- the positions the parser records.
+-- the positions the parser records, and the names the parse has met.
 data ParseState = ParseState
   { psTokens :: ![Located],
-    psOrigin :: !SourceOrigin
+    psOrigin :: !SourceOrigin,
+    -- | The names 'recordName' has noted, latest first.
+    psNames :: ![Text]
   }
 
 -- | The name errors give the source being parsed.
@@ -207,6 +212,13 @@ currentPos :: Parser SrcPos
 currentPos = Parser $ \st -> case psTokens st of
   (Located ln col _ : _) -> Right (SrcPos (psOrigin st) ln col, st)
   [] -> Left (makeEOF st)
+
+-- | Note a name at a point where upstream's parser interns one (a
+-- @symbols.create@ in parser.y at 2.24.9).  The names are parser state,
+-- so a reading the parser backtracks out of takes its names with it, as
+-- the actions of a stack bison's GLR parser drops never run.
+recordName :: Text -> Parser ()
+recordName name = Parser $ \st -> Right ((), st {psNames = name : psNames st})
 
 -- ---------------------------------------------------------------------------
 -- Helpers
