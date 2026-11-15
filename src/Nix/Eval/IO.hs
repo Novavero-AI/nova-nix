@@ -70,7 +70,7 @@ import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternByte
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, pendingThunkEnv, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
-import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
+import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
 import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
@@ -516,7 +516,7 @@ instance MonadEval EvalIO where
         -- restore reads it again.
         entry <- serialiseSource resolvedText processCaseHack resolvedSource
         let narDigest = sha256Digest (NAR.serialise entry)
-        sp <- storePathOrThrow (makeFixedOutputPath name "sha256" "recursive" narDigest)
+        sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion narDigest)
         let spText = canonicalStorePathText sp
         EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath spText)))
         -- The copy is readable afterwards, as upstream's copyPathToStore
@@ -648,7 +648,7 @@ instance MonadEval EvalIO where
       _ -> pure ()
     -- The name is refused only once the tree is hashed, as upstream's is:
     -- the refusal names the path the copy would have had.
-    sp <- storePathOrThrow (makeFixedOutputPath name "sha256" "recursive" narDigest)
+    sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion narDigest)
     destFilePath <- evalFilePath sp
     let destPath = canonicalStorePathText sp
     -- Restored from the entry just hashed, not copied from the source:
@@ -735,7 +735,7 @@ instance MonadEval EvalIO where
       -- boundary rather than trusting the round trip.
       Left err -> throwEvalError ("builtins.path: internal NAR round-trip error: " <> T.pack err)
       Right entry -> do
-        sp <- storePathOrThrow (makeFixedOutputPath name "sha256" "recursive" (sha256Digest narBytes))
+        sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion (sha256Digest narBytes))
         destFilePath <- evalFilePath sp
         let destPath = canonicalStorePathText sp
         -- Raised here rather than inside 'wrapIO', which would render
@@ -748,7 +748,7 @@ instance MonadEval EvalIO where
   addFixedOutputFile name bytes = do
     -- Canonical fixed-output path: a sha256-pinned fetch must land at the same
     -- store path C++ Nix computes, so it stays reproducible and cache-compatible.
-    sp <- storePathOrThrow (makeFixedOutputPath name "sha256" "flat" (sha256Digest bytes))
+    sp <- storePathOrThrow (makeFixedOutputPath name "sha256" FlatIngestion (sha256Digest bytes))
     filePath <- evalFilePath sp
     let storePath = canonicalStorePathText sp
     wrapIO $ do

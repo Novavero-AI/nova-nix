@@ -1372,8 +1372,9 @@ class (Monad m) => MonadEval m where
   addSourceNar :: Text -> ByteString -> m Text
 
   -- | Write raw bytes to the store at a canonical flat fixed-output path
-  -- (@makeFixedOutputPath name "sha256" "flat"@), so a hash-pinned fetch lands
-  -- at the same store path C++ Nix computes - reproducible and cacheable.
+  -- (@makeFixedOutputPath name "sha256" FlatIngestion@), so a hash-pinned
+  -- fetch lands at the same store path C++ Nix computes - reproducible and
+  -- cacheable.
   addFixedOutputFile :: Text -> ByteString -> m Text
 
   -- | Print a trace/warning message.

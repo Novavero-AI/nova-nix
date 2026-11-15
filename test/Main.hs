@@ -95,7 +95,7 @@ import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternByte
 import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, buildCSlots, emptyCList, envLookupResolved, mkThunkBc, newMinimalEnv, pendingThunkEnv, tieFrame, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
-import Nix.Hash (compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
+import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, ioRetryEffects, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
@@ -3768,6 +3768,63 @@ testFixedOutputHash = do
         assertEvalError "fixed-output-builder" "(derivation { name = \"t\"; system = \"x\"; outputHash = \"\"; }).drvPath" "required attribute 'builder' missing"
     ]
 
+-- | An @outputHashMode@ is read as upstream's @handleHashMode@ reads it
+-- (primops.cc:1230-1245 at 2.24.9), in the pass over the attributes, for
+-- every derivation: @nar@ and @recursive@ hash a NAR, @flat@ the bytes,
+-- @text@ and @git@ need experimental features nova-nix does not
+-- implement, and anything else is refused.  Each expected message is
+-- upstream's at 2.24.9, read from its source.
+testOutputHashMode :: IO [Bool]
+testOutputHashMode = do
+  putStrLn "eval/output-hash-mode"
+  tmpBase <- getTemporaryDirectory
+  let drv fields = "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; " <> fields <> " })"
+      pinned = "outputHash = \"sha256-" <> T.replicate 43 "A" <> "=\";"
+      moded mode = "outputHashMode = \"" <> mode <> "\"; " <> pinned
+      comparePaths op these those = drv these <> ".outPath " <> op <> " " <> drv those <> ".outPath"
+      gives label source = runTest label (assertEval label source (VBool True))
+      fails label source expected = runTest label (assertEvalError label source expected)
+      invalid mode = "invalid value '" <> mode <> "' for 'outputHashMode' attribute"
+      disabled feature = "experimental Nix feature '" <> feature <> "' is disabled; add '--extra-experimental-features " <> feature <> "' to enable it"
+      -- The .drv apart from the mode's own environment entry.
+      withoutMode d = d {drvEnv = Map.delete "outputHashMode" (drvEnv d)}
+  narDrv <- evalDerivationIO tmpBase (drv (moded "nar"))
+  recursiveDrv <- evalDerivationIO tmpBase (drv (moded "recursive"))
+  sequence
+    [ gives "nar is the NAR hash recursive names" (comparePaths "==" (moded "nar") (moded "recursive")),
+      gives "nar is not the flat hash" (comparePaths "!=" (moded "nar") (moded "flat")),
+      gives "flat is the hash with no mode" (comparePaths "==" (moded "flat") pinned),
+      gives "a structured nar is the NAR hash" (comparePaths "==" ("__structuredAttrs = true; " <> moded "nar") (moded "recursive")),
+      gives "under __ignoreNulls a null mode is left out" (comparePaths "==" ("__ignoreNulls = true; outputHashMode = null; " <> pinned) pinned),
+      runTest "nar gives recursive's derivation, its output hashed as a NAR" $
+        assertRight "nar-drv" narDrv $ \nar ->
+          assertRight "recursive-drv" recursiveDrv $ \recursive -> case drvOutputs nar of
+            [DerivationOutput "out" _ "r:sha256" _] -> assertEqual "nar-drv" (withoutMode recursive) (withoutMode nar)
+            other -> Fail ("expected the one NAR-hashed output out, got " <> T.pack (show other)),
+      fails "an unknown mode is refused" (drv (moded "foo") <> ".drvPath") (invalid "foo"),
+      fails "a mode is read with no outputHash" (drv "outputHashMode = \"foo\";" <> ".drvPath") (invalid "foo"),
+      fails "a null mode coerces to the empty one, which is refused" (drv "outputHashMode = null;" <> ".drvPath") (invalid ""),
+      fails "a structured unknown mode is refused" (drv "__structuredAttrs = true; outputHashMode = \"foo\";" <> ".drvPath") (invalid "foo"),
+      fails "text needs dynamic-derivations" (drv "outputHashMode = \"text\";" <> ".drvPath") (disabled "dynamic-derivations"),
+      fails "git needs git-hashing" (drv "outputHashMode = \"git\";" <> ".drvPath") (disabled "git-hashing"),
+      fails
+        "the mode is refused before the builder is checked"
+        "(derivation { name = \"t\"; system = \"x\"; outputHashMode = \"foo\"; }).drvPath"
+        (invalid "foo"),
+      fails
+        "the mode is refused before an attribute after it by name is read"
+        (drv "outputHashMode = \"foo\"; zzz = throw \"later\";" <> ".drvPath")
+        (invalid "foo"),
+      fails
+        "an attribute before the mode by name fails first"
+        (drv "outputHashMode = \"foo\"; aaa = throw \"earlier\";" <> ".drvPath")
+        "earlier",
+      fails
+        "tryEval does not catch a refused mode"
+        ("(builtins.tryEval " <> drv "outputHashMode = \"foo\";" <> ".drvPath).success")
+        (invalid "foo")
+    ]
+
 -- | A builtin taking a path coerces its argument as upstream's
 -- coerceToPath does (eval.cc at 2.24.9), and baseNameOf and dirOf as
 -- their coerceToString does.  Each expected value or message is
@@ -3881,6 +3938,12 @@ testDerivationTraceIO = do
         ( derivationFailure
             "system = \"s\"; name = \"x\"; __structuredAttrs = true; outputHash = 1;"
             (EvalFailure ["while evaluating attribute 'outputHash' of derivation 'x'"] "expected a string but found an integer: 1")
+        ),
+      runTestM
+        "a refused outputHashMode is named in the failure's trace"
+        ( derivationFailure
+            "system = \"s\"; name = \"x\"; outputHashMode = \"foo\";"
+            (EvalFailure ["while evaluating attribute 'outputHashMode' of derivation 'x'"] "invalid value 'foo' for 'outputHashMode' attribute")
         ),
       runTestM
         "a missing attribute is refused without a line naming it"
@@ -4155,7 +4218,7 @@ testInterpolatedSymlinkBody = do
   dirEntry <- NAR.serialiseFromPath (dir </> "sub")
   let interpolated name = evalNixIO "." ("\"${/. + " <> nixQuotedPath (dir </> name) <> "}\"")
       copiedAs name entry =
-        either (const Nothing) (Just . storePathToText defaultStoreDir) (makeFixedOutputPath (T.pack name) "sha256" "recursive" (sha256Digest (NAR.serialise entry)))
+        either (const Nothing) (Just . storePathToText defaultStoreDir) (makeFixedOutputPath (T.pack name) "sha256" NarIngestion (sha256Digest (NAR.serialise entry)))
       copies name entry = runTestM ("interpolating " <> T.pack name <> " copies its target") $ do
         result <- interpolated name
         pure $ case (result, copiedAs name entry) of
@@ -4354,7 +4417,7 @@ testPathSymlinkBody = do
   let pathExprFor dir name =
         "builtins.path { path = " <> nixQuotedPath dir <> "; name = \"" <> name <> "\"; }"
       spFor name entry =
-        makeFixedOutputPath name "sha256" "recursive" (sha256Digest (NAR.serialise entry))
+        makeFixedOutputPath name "sha256" NarIngestion (sha256Digest (NAR.serialise entry))
   results <- case (spFor "path-symlink-src" linkEntry, spFor "path-symlink-cycle" cycleEntry) of
     (Right linkSp, Right cycleSp) -> do
       -- The same mapping the evaluator's copy uses for its destination.
@@ -9475,7 +9538,7 @@ testCaseSensitiveVolumeBody base = do
         -- address and registers the NAR upstream dumps for it with
         -- use-case-hack off ('suffixPairNarHash').
         runTestM "a store path naming a file with the case-hack suffix registers under that name" $
-          case makeFixedOutputPath "suffix-write" "sha256" "recursive" (sha256Digest suffixNar) of
+          case makeFixedOutputPath "suffix-write" "sha256" NarIngestion (sha256Digest suffixNar) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
               let dest = storePathToFilePath storeDir sp
@@ -9501,7 +9564,7 @@ testCaseSensitiveVolumeBody base = do
               storeDir
               "."
               ("builtins.path { path = " <> storePathToText defaultStoreDir held <> "; name = \"suffix-copy\"; }")
-          let expected = storePathToText defaultStoreDir <$> makeFixedOutputPath "suffix-copy" "sha256" "recursive" (sha256Digest suffixNar)
+          let expected = storePathToText defaultStoreDir <$> makeFixedOutputPath "suffix-copy" "sha256" NarIngestion (sha256Digest suffixNar)
           case (copied, expected) of
             (Right (VStr pathBytes _), Right expectedPath)
               | bytesText pathBytes /= expectedPath -> pure (Fail ("copied to " <> bytesText pathBytes <> ", expected " <> expectedPath))
@@ -13290,7 +13353,7 @@ testFetchMirrors = do
       let root = tmpBase </> ("nova-nix-test-mirrors-" ++ label)
           dir = StoreDir (root </> "store")
           config = (defaultBuildConfig dir) {bcFetchRetry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}}
-      sp <- either (fail . show) pure (makeFixedOutputPath "mirrors" "sha256" "flat" (sha256Digest "hello"))
+      sp <- either (fail . show) pure (makeFixedOutputPath "mirrors" "sha256" FlatIngestion (sha256Digest "hello"))
       bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
         bracket (openStore dir) closeStore $
           \store -> action store config sp
@@ -13464,8 +13527,8 @@ testFetchurlUnpack = do
       pure (unpacked ++ others)
   where
     unpackAttrs = [("unpack", "1")]
-    recursiveHash = ("recursive", "r:sha256")
-    flatHash = ("flat", "sha256")
+    recursiveHash = (NarIngestion, "r:sha256")
+    flatHash = (FlatIngestion, "sha256")
     -- The NAR of a regular file holding the given bytes, and of the
     -- executable file the executable case fetches.
     fileNar contents = BS.concat (map narSpecStr ["nix-archive-1", "(", "type", "regular", "contents", contents, ")"])
@@ -17330,7 +17393,7 @@ testStoreDelete = do
           -- The address the source's content derives, as evaluation
           -- would name it: a restore refuses any other.
           entry <- NAR.serialiseFromPath srcDir
-          case makeFixedOutputPath "mat-locked" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+          case makeFixedOutputPath "mat-locked" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right guarded -> do
               let spText = storePathToText defaultStoreDir guarded
@@ -18157,7 +18220,7 @@ testStoreOps = do
           createDirectoryIfMissing True srcDir
           TIO.writeFile (srcDir </> "data.txt") "real content"
           entry <- NAR.serialiseFromPath srcDir
-          case makeFixedOutputPath "nova-nix-test-adopt-src" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+          case makeFixedOutputPath "nova-nix-test-adopt-src" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
               let spText = storePathToText defaultStoreDir sp
@@ -18184,7 +18247,7 @@ testStoreOps = do
           createDirectoryIfMissing True srcDir
           TIO.writeFile (srcDir </> "data.txt") "adopted content"
           entry <- NAR.serialiseFromPath srcDir
-          case makeFixedOutputPath "nova-nix-test-adopt-canonical" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+          case makeFixedOutputPath "nova-nix-test-adopt-canonical" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
               let spText = storePathToText defaultStoreDir sp
@@ -18209,7 +18272,7 @@ testStoreOps = do
           createDirectoryIfMissing True srcDir
           TIO.writeFile (srcDir </> "data.txt") "evaluated content"
           entry <- NAR.serialiseFromPath srcDir
-          case makeFixedOutputPath "nova-nix-test-changed-src" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+          case makeFixedOutputPath "nova-nix-test-changed-src" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
               let spText = storePathToText defaultStoreDir sp
@@ -18234,7 +18297,7 @@ testStoreOps = do
         -- do not have and then sealed read-only.
         runTestM "materializeEvalStoreWrites refuses content that does not reproduce its path" $ do
           let goodBytes = TE.encodeUtf8 "the full flat content"
-          case makeFixedOutputPath "flat-verify" "sha256" "flat" (sha256Digest goodBytes) of
+          case makeFixedOutputPath "flat-verify" "sha256" FlatIngestion (sha256Digest goodBytes) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
               let spText = storePathToText defaultStoreDir sp
@@ -18272,7 +18335,7 @@ testStoreOps = do
           createDirectoryIfMissing True srcDir
           TIO.writeFile (srcDir </> "data.txt") "same bytes"
           entry <- NAR.serialiseFromPath srcDir
-          case makeFixedOutputPath "nova-nix-test-adopt-ok" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+          case makeFixedOutputPath "nova-nix-test-adopt-ok" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
               let spText = storePathToText defaultStoreDir sp
@@ -19711,7 +19774,7 @@ testFlatOutputFormIO = do
       tmpBase <- getTemporaryDirectory
       let tmpStore = tmpBase </> ("nova-nix-test-" ++ T.unpack name)
           digest = sha256Digest "hello"
-      case makeFixedOutputPath name "sha256" "flat" digest of
+      case makeFixedOutputPath name "sha256" FlatIngestion digest of
         Left err -> pure (Fail (T.pack (show err)))
         Right outSP ->
           bracket_ (forceRemoveIfExists tmpStore) (forceRemoveIfExists tmpStore) $
@@ -20031,7 +20094,7 @@ testE2E = do
         Dir.createDirectoryIfMissing True srcDir
         BS.writeFile (srcDir </> "f.txt") (TE.encodeUtf8 "real content\n")
         entry <- NAR.serialiseFromPath srcDir
-        case makeFixedOutputPath "sd" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+        case makeFixedOutputPath "sd" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
           Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
           Right sp -> do
             let dest = storePathToFilePath (StoreDir tmpStore) sp
@@ -21042,10 +21105,10 @@ testTrustCLI = do
           <> hostBuilt "unheld.txt" unheldBytes
           <> "; in derivation { name = \"tool\"; system = \"x86_64-linux\"; builder = \"${seed}\"; args = [ \"${archive}\" \"${made}\" \"${unheld}\" ]; }"
       narInfoTarget out = "/" <> TE.encodeUtf8 (spHash out) <> ".narinfo"
-  seedOut <- either (fail . show) pure (makeFixedOutputPath "seed.exe" "sha256" "flat" (sha256Digest trustPe))
-  archiveOut <- either (fail . show) pure (makeFixedOutputPath "tool.tar.gz" "sha256" "flat" (sha256Digest archive))
-  madeOut <- either (fail . show) pure (makeFixedOutputPath "made.txt" "sha256" "flat" (sha256Digest madeBytes))
-  unheldOut <- either (fail . show) pure (makeFixedOutputPath "unheld.txt" "sha256" "flat" (sha256Digest unheldBytes))
+  seedOut <- either (fail . show) pure (makeFixedOutputPath "seed.exe" "sha256" FlatIngestion (sha256Digest trustPe))
+  archiveOut <- either (fail . show) pure (makeFixedOutputPath "tool.tar.gz" "sha256" FlatIngestion (sha256Digest archive))
+  madeOut <- either (fail . show) pure (makeFixedOutputPath "made.txt" "sha256" FlatIngestion (sha256Digest madeBytes))
+  unheldOut <- either (fail . show) pure (makeFixedOutputPath "unheld.txt" "sha256" FlatIngestion (sha256Digest unheldBytes))
   (trustedKey, madeNarInfo) <- either fail pure (signedTestNarInfo madeOut [] "nar/made.nar" madeNar)
   let route target _
         | target == "/seed" = Send (httpResponse "200 OK" trustPe)
@@ -25080,6 +25143,7 @@ runSuite = do
           testDerivationFields,
           testDerivationPathFieldsIO,
           testFixedOutputHash,
+          testOutputHashMode,
           testEmptyHashIO,
           testPathArguments,
           testPathArgumentsIO,

@@ -104,7 +104,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), fromATerm, toATerm)
-import Nix.Hash (makeFixedOutputPath, makeTextPath, sha256Digest)
+import Nix.Hash (FileIngestionMethod (..), makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB
 import Nix.Store.EntryName (checkEntryName, entryNamePath, hostNameRules, linkTargetPath, shownBytes)
@@ -1085,7 +1085,7 @@ restoreSource store src sp = do
 -- exactly that path, as a @source@ path's address is derived.
 recursiveDigestNames :: StorePath -> Hash.NixHash -> Bool
 recursiveDigestNames sp (Hash.NixHash digest) =
-  makeFixedOutputPath (spName sp) "sha256" "recursive" digest == Right sp
+  makeFixedOutputPath (spName sp) "sha256" NarIngestion digest == Right sp
 
 -- | Register the store objects evaluation wrote: makes each one's
 -- metadata canonical ('canonicalizeMetadata') and records it in the DB.
@@ -1142,7 +1142,7 @@ writeReproducesPath :: CaseSensitivity -> FilePath -> StorePath -> [StorePath] -
 writeReproducesPath sensitivity dest sp refs mode = case mode of
   WriteRecursive -> adoptedTreeMatches sensitivity dest sp
   WriteFlat ->
-    withFileBytes (\bytes -> makeFixedOutputPath (spName sp) "sha256" "flat" (sha256Digest bytes) == Right sp)
+    withFileBytes (\bytes -> makeFixedOutputPath (spName sp) "sha256" FlatIngestion (sha256Digest bytes) == Right sp)
   WriteText ->
     withFileBytes (\bytes -> makeTextPath (spName sp) (sha256Digest bytes) refs == Right sp)
   where
