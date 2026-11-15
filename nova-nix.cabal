@@ -205,6 +205,16 @@ library
     -- parse the replacement.  The old spelling stays, warning muted,
     -- until hlint learns it (then: pattern -> data, drop these flags).
     -Wno-pattern-namespace-specifier
+    -- The evaluator in Nix.Eval is written over any MonadEval.  These two
+    -- let the SPECIALIZE pragmas in Nix.Eval.IO compile all of it for
+    -- EvalIO: each function's code is visible to the modules importing
+    -- it, and an overloaded function is specialised to the monad its
+    -- caller knows, not only one marked INLINABLE.  profiling/stress.nix,
+    -- fib 30 and two million selects or elemAts run 1.7 to 2.4 times as
+    -- fast, allocating 40 to 50% less, for a library build about 13%
+    -- longer.
+    -fspecialise-aggressively
+    -fexpose-all-unfoldings
 
 -- ---------------------------------------------------------------------------
 -- CLI library: the command line's grammar and reference, which the
