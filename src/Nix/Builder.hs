@@ -50,6 +50,7 @@ module Nix.Builder
     checkDerivation,
     buildWithDeps,
     substitutePaths,
+    substituteFromCaches,
 
     -- * Build configuration
     BuildConfig (..),
@@ -111,7 +112,7 @@ import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, r
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Push (narHashMatches)
-import Nix.Realise (BuildMode (..), CheckVerdict (..), Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), SubstEffects (..), SubstitutesSetting (..), realise, realiseFailureMessage, realiseFailureStatus)
+import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), SubstEffects (..), SubstitutesSetting (..), realise, realiseFailureMessage, realiseFailureStatus, substituteClosure)
 import Nix.Store (PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, isValid, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText, unStoreDir)
@@ -1883,12 +1884,7 @@ readDrvFromStore config sp = do
 realiseEffects :: BuildConfig -> Store -> RealiseEffects IO
 realiseEffects config store =
   RealiseEffects
-    { reSubst =
-        SubstEffects
-          { seValid = isValid store,
-            seReferences = queryReferencesWith (bcFetchRetry config) ioRetryEffects (bcFallback config) (bcCaches config),
-            seFetch = substitutePaths config store
-          },
+    { reSubst = substEffects config store,
       -- Every output, not just the first: a derivation whose first output is
       -- valid and whose second was deleted would otherwise be logged cached
       -- and skipped, and the missing output would stay missing.  Upstream
@@ -1898,6 +1894,26 @@ realiseEffects config store =
       reCheck = checkDerivation config store,
       reReport = logRealised
     }
+
+-- | The store and caches a substitution uses: 'bcCaches' asked under
+-- 'bcFallback' and 'bcFetchRetry', and what arrives registered in the
+-- store ('substitutePaths').
+substEffects :: BuildConfig -> Store -> SubstEffects IO
+substEffects config store =
+  SubstEffects
+    { seValid = isValid store,
+      seReferences = queryReferencesWith (bcFetchRetry config) ioRetryEffects (bcFallback config) (bcCaches config),
+      seFetch = substitutePaths config store
+    }
+
+-- | Substitute paths from 'bcCaches' with everything they reference,
+-- references first ('substituteClosure'), as a build substitutes a
+-- derivation's outputs, and build nothing.  A path no cache holds, or
+-- one that references a path no cache holds, is left as it is.  A store
+-- upstream Nix's database may also manage refuses each path once its
+-- narinfo is read ('trySubstituteWith'), and the outcome is a failed one.
+substituteFromCaches :: BuildConfig -> Store -> [StorePath] -> IO ClosureOutcome
+substituteFromCaches config = substituteClosure . substEffects config
 
 -- | Build one derivation, naming it in any failure.
 buildReporting :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text ())
