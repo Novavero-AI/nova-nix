@@ -146,6 +146,7 @@ let
     40f35b269f0eae19bea4b6e3a633fc14bb38be72375b8a8e4a55c086ebd8788e  win32/dirname.c
     f435aebacf417af560d38b1b562ba0347341cd0da137237626c2d954e58cecf6  libbb/appletlib.c
     43edcd5ea5d1afa3fed0d5e79db8d1d107539344c26e0e0432c539bbc89e1c3a  win32/mingw.c
+    33b148b9dd17340c641c85f827093c3d4f01b934fdfa82b3752a4586c17a7a9e  win32/winansi.c
   '';
 
   # The objects Kbuild builds for this configuration, from each directory's
@@ -594,6 +595,21 @@ kaem.runCommand "${pname}-${version}"
     #endif
 
     smallint bb_got_signal;"
+
+    # printf clears errno before each directive and exits 1 if the
+    # directive leaves it set, taking it for a conversion's error
+    # (coreutils/printf.c:268-269 and 448-450).  On MinGW it formats each
+    # directive with libbb's vasprintf (my_printf, printf.c:195-217), which
+    # tries a 128-byte buffer first (libbb/platform.c:37-60), through
+    # winansi_vsnprintf (win32/winansi.c:951-971), which fills the buffer
+    # with msvcrt.dll's _vsnprintf, and that sets errno to ERANGE when the
+    # output fills the buffer or overflows it.  Unedited, a printf of an
+    # argument of 128 bytes or more writes it whole and exits 1, and so
+    # does GMP 6.2.1's configure, whose last command writes a summary that
+    # long.  winansi_vsnprintf reports the truncation in what it returns,
+    # and the edit leaves errno as the call found it, so a directive's
+    # errno is its conversion's alone.
+    replace --file win32/winansi.c --output win32/winansi.c --match-on "_vsnprintf(buf, size, format, list);" --replace-with "{ int saved_errno = errno; _vsnprintf(buf, size, format, list); errno = saved_errno; }"
     sha256sum --check ${editedFiles}
 
     cp scripts/kconfig/zconf.tab.c_shipped scripts/kconfig/zconf.tab.c

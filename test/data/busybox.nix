@@ -3,7 +3,10 @@
 # which busybox's sh runs configure-tools.sh through the applets configure
 # runs (sh, sed, grep, awk, expr, tr, cat, mkdir, rm, cp, mv, test and
 # printf) and writes a line of what each did to its output, which CI
-# compares with the lines it expects.  A line whose test fails is left out.
+# compares with the lines it expects.  A line whose test fails is left out:
+# one of them is printf's exit status for an argument of 200 bytes, past
+# the 128 its formatting tries first (see pkgs/windows/by-name/bu/
+# busybox-w32).
 let
   inherit (import ../../pkgs/windows) stage0-pe32 busybox-w32;
   inherit (stage0-pe32) writeText;
@@ -51,6 +54,11 @@ let
     rm -r dir moved.txt
     test ! -e dir && test ! -e moved.txt && record "rm -r"
     record "$(printf 'printf %s %03d %x' done 7 255)"
+    long=
+    while [ "''${#long}" -lt 200 ]; do
+      long=''${long}0123456789
+    done
+    printf '%s\n' "$long" > long.txt && record "printf of ''${#long} bytes"
     [ 3 -lt 10 ] && [ abc != abd ] && [ -n "$v" ] && [ -z "" ] && record "test"
 
     printf 'one\ntwo\nthree\n' > lines.txt
