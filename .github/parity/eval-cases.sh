@@ -157,6 +157,20 @@ check "names the lexer cannot read bare" '{ "a b" = 1; "if" = 2; "" = 3; "1x" = 
 check "a name past ASCII" 'builtins.listToAttrs [ { name = builtins.readFile ./e-acute.txt; value = 1; } ]'
 echo
 
+echo "== which keys written as a string are names =="
+# Each ${ is Nix's, not the shell's.
+# shellcheck disable=SC2016
+{
+  check "a plain string binds in a let" 'let "a" = 1; in a'
+  check "an interpolated plain string binds in a let" 'let ${"a"} = 1; in a'
+  check "a parenthesized plain string binds in a let" 'let ${("a")} = 1; in a'
+  check "a URI binds in a let" 'let ${a:b} = 1; in 2'
+  check "an interpolated plain string is inherited" 'let a = 1; in { inherit ${"a"}; }.a'
+  check "an interpolated plain string is in a rec set's scope" '(rec { ${"a"} = 1; b = a; }).b'
+  check "a path through one merges with the name written bare" 'builtins.attrNames { ${"a"}.b = 1; a.c = 2; }.a'
+}
+echo
+
 echo "== what a float and a function print as =="
 check "floats in a default ostream's six-digit form" '[ 1.0 1.5 0.1 1.0e20 1.23456789 1234567.0 0.00001 ]'
 check "a negative zero" 'builtins.fromJSON "-0.0"'

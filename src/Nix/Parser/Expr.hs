@@ -723,27 +723,15 @@ parseInheritNames = go []
         TokIdent name -> advance >> inherited name
         -- Keywords are valid as inherit names: inherit if then else;
         _ | Just name <- keywordToText tok -> advance >> inherited name
-        -- Quoted strings for keywords used as attribute names: inherit "or";
-        TokStringOpen -> do
-          _ <- advance
-          inherited =<< parseQuotedInheritName pos
+        _
+          | startsStringAttr tok -> do
+              key <- parseStringAttr
+              case key of
+                StaticKey name -> inherited name
+                -- Upstream refuses the key once it is parsed, at its
+                -- start (parser.y:417-428).
+                DynamicKey _ -> failAt pos "dynamic attributes not allowed in inherit"
         _ -> pure (reverse acc)
-
--- | Parse a quoted inherit name: a simple string literal (no interpolation),
--- the string opening at the position given.  Used for keywords like @"or"@
--- in @inherit (self.trivial) "or";@.
-parseQuotedInheritName :: SrcPos -> Parser Text
-parseQuotedInheritName pos = do
-  tok <- peek
-  case tok of
-    TokStringLit s -> do
-      _ <- advance
-      expect TokStringClose
-      attrNameText pos s
-    TokStringClose -> do
-      _ <- advance
-      pure ""
-    _ -> parseError ("expected string literal in inherit, got " <> showToken tok)
 
 parseAttrPath :: Parser AttrPath
 parseAttrPath = do
@@ -772,62 +760,83 @@ dottedKeys = go []
 parseAttrKey :: Parser AttrKey
 parseAttrKey = do
   tok <- peek
-  case tok of
-    TokIdent name -> advance >> staticKey name
+  key <- case tok of
+    TokIdent name -> StaticKey name <$ advance
     -- Keywords are valid as attribute names in Nix:
     -- { if = 1; }, a.then, { else = 2; }, etc.
-    _ | Just name <- keywordToText tok -> advance >> staticKey name
-    TokStringOpen -> do
-      pos <- currentPos
-      strExpr <- parseString
-      -- A string key with no interpolation is static, as in upstream Nix's
-      -- parser (the string becomes a symbol at parse time) - which is also
-      -- what makes @let "x" = 1; in x@ legal.
-      case literalStringKey strExpr of
-        Just bytes -> staticKey =<< attrNameText pos bytes
-        Nothing -> pure (DynamicKey strExpr)
+    _ | Just name <- keywordToText tok -> StaticKey name <$ advance
+    _ -> parseStringAttr
+  key <$ noteStatic key
+  where
+    noteStatic (StaticKey name) = recordName name
+    noteStatic (DynamicKey _) = pure ()
+
+-- | Whether a token opens a key written as a string or as @${ expr }@.
+startsStringAttr :: Token -> Bool
+startsStringAttr TokStringOpen = True
+startsStringAttr TokInterpOpen = True
+startsStringAttr _ = False
+
+-- | A key written as a string or as @${ expr }@ (upstream's @string_attr@,
+-- parser.y:460-463 at 2.24.9).  Upstream's @attrpath@ and @attrs@ rules
+-- make such a key a name when its expression is an @ExprString@, and
+-- dynamic otherwise (parser.y:416-452), so @let ${\"x\"} = 1; in x@ and
+-- @inherit ${\"x\"};@ are legal.  A double-quoted string with no
+-- interpolation is one, and so is a URI (parser.y:301-326), parentheses
+-- around either included, since upstream's parser and this one both make
+-- a parenthesized expression the expression itself (parser.y:310).  An
+-- indented string is one when @stripIndentation@ (parser-state.hh)
+-- leaves it a single piece; such a key stays dynamic here, since an
+-- indented string is held as its unstripped pieces until it is evaluated.
+parseStringAttr :: Parser AttrKey
+parseStringAttr = do
+  pos <- currentPos
+  tok <- peek
+  expr <- case tok of
+    TokStringOpen -> parseString
     TokInterpOpen -> do
       _ <- advance
-      expr <- parseExpr
+      inner <- parseExpr
       -- In expression context, the lexer doesn't track interpolation
       -- mode - } is TokRBrace rather than TokInterpClose.
       expect TokRBrace
-      -- Upstream's parser makes a key static when the expression inside
-      -- the braces is a plain string, and interns the string there
-      -- (parser.y:434-452).  This parser keeps such a key dynamic, so it
-      -- notes the name alone.  A string that is not UTF-8 notes nothing:
-      -- the evaluator refuses it as an attribute name.
-      mapM_ recordName (literalStringKey expr >>= either (const Nothing) Just . TE.decodeUtf8')
-      pure (DynamicKey expr)
+      pure inner
     _ -> parseError ("expected attribute key, got " <> showToken tok)
-  where
-    staticKey name = StaticKey name <$ recordName name
+  case plainStringBytes expr of
+    Just bytes -> StaticKey <$> attrNameText pos bytes
+    Nothing -> pure (DynamicKey expr)
 
--- | The bytes of a string expression that contains no interpolation; any
--- 'StrInterp' makes the key dynamic.
-literalStringKey :: Expr -> Maybe ByteString
-literalStringKey (EStr parts) = mconcat <$> traverse literalPart parts
+-- | The bytes of an expression upstream's parser builds as a plain string
+-- (an @ExprString@): a double-quoted string with no interpolation, whose
+-- parts become one string (parser.y:322-326), or a URI (parser.y:301-309).
+plainStringBytes :: Expr -> Maybe ByteString
+plainStringBytes (EStr parts) = mconcat <$> traverse literalPart parts
   where
     literalPart (StrLit bytes) = Just bytes
     literalPart (StrEsc bytes) = Just bytes
     literalPart (StrInterp _) = Nothing
-literalStringKey _ = Nothing
+plainStringBytes (ELit (NixUri uri)) = Just (TE.encodeUtf8 uri)
+plainStringBytes _ = Nothing
 
--- | The name a string attribute key spells, the string opening at the
+-- | The name a string attribute key spells, the key starting at the
 -- position given.  Attribute names are text here, so a key whose bytes are
--- not UTF-8 is a syntax error at the string, where upstream makes a symbol
--- of any bytes (the @attrpath@ and @attrs@ rules, parser.y at 2.24.9).
+-- not UTF-8 is a syntax error at the key, where upstream makes a symbol of
+-- any bytes (the @attrpath@ and @attrs@ rules, parser.y at 2.24.9).
 attrNameText :: SrcPos -> ByteString -> Parser Text
-attrNameText (SrcPos origin line col) bytes = case TE.decodeUtf8' bytes of
+attrNameText pos bytes = case TE.decodeUtf8' bytes of
   Right name -> pure name
-  Left _ ->
-    failWithError
-      ParseError
-        { peFile = sourceName origin,
-          peLine = line,
-          peCol = col,
-          peMessage = "attribute name is not valid UTF-8"
-        }
+  Left _ -> failAt pos "attribute name is not valid UTF-8"
+
+-- | Fail at a position the parser has already read past.
+failAt :: SrcPos -> Text -> Parser a
+failAt (SrcPos origin line col) message =
+  failWithError
+    ParseError
+      { peFile = sourceName origin,
+        peLine = line,
+        peCol = col,
+        peMessage = message
+      }
 
 -- | Convert keyword tokens to their text for use as attribute names.
 -- All Nix keywords are valid as attr keys in binding and select position.
