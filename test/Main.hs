@@ -15564,7 +15564,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
+    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gcc-latest.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -16619,6 +16619,205 @@ testMingwW64LatestWindows = do
       [archive, "mingw-w64-headers-" <> version, "mingw-w64-crt-" <> version, "crt.sh", "hello.sh"]
         ++ concat [[name, name <> "-builder"] | name <- ["mingw-w64-latest-crt", "mingw-w64-latest-hello"]]
 
+-- | @pkgs\/windows@'s GCC 16 rung, read back as the build driver reads it:
+-- what gcc-latest and @test\/data\/gcc-latest.nix@'s checks add to the
+-- closure of the rungs before it, gcc10, which builds it, and the current
+-- MinGW-w64, its target's headers and runtime.  The rung is full-source
+-- only if the three leaves it adds are the archives of GCC, GMP and MPC,
+-- MPFR's being gcc10's, and it reads no input source but the stdenv's own
+-- files and what evaluation writes as text; the stdenv's @setup.sh@
+-- unpacks GCC's (@src@) and @preConfigure@ the other three, into the
+-- directories of GCC's tree its configure builds them from.  Its
+-- configure is told by flags where MinGW-w64's headers and runtime, the
+-- assembler and the linker are, and which compilers, archiver and linker
+-- the build runs, and its install which strip, so each has to name the
+-- output of the derivation that builds it, or the target's name binutils
+-- and gcc10 install their programs under.  Every flag that sets a
+-- compiler's options leaves out the @-g@ whose debugging information
+-- would name the build directory, libgcc's own @-g@ is stripped after
+-- the install, every link and strip is told to write no time stamp, and
+-- the build leaves the configure arguments, which name store paths, out
+-- of the compiler.
+testGccLatestWindows :: IO [Bool]
+testGccLatestWindows = do
+  putStrLn "pkgs/gcc-latest"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-latest.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          before <- sessionClosure (mapMaybe (`Map.lookup` rootOf) builtBefore)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, before, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, before, full) -> do
+      let added = Map.elems (Map.difference full before)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          gccLatest = derivationAt gccLatestRoot
+          -- The output of a root's derivation, as a flag spells a store
+          -- path, or a word no flag holds where the root is missing.
+          outputOf root = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (derivationAt root >>= listToMaybe . drvOutputs)
+          outputNamed name = [storePathToText defaultStoreDir (doPath out) | drv <- Map.elems full, nameOf drv == name, out <- drvOutputs drv]
+          wordsOf name = maybe [] (T.words . variableOf name)
+          linesOf name = maybe [] (map T.strip . T.lines . variableOf name)
+          flagsWith prefixes drv = [flag | flag <- wordsOf "configureFlags" drv, any (`T.isPrefixOf` flag) prefixes]
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetches is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the three leaves it adds are the archives of GCC, GMP and MPC, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              (sort [archive | (variable, archive) <- archives, variable /= "mpfrSrc"], True)
+              (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text and the stdenv's files" $
+            assertEqual
+              "input sources not written as text"
+              ["config.site", "include", "setup.sh"]
+              (sort (map spName (nub [path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]))),
+          runTest "gcc-latest names its four archives where setup.sh and preConfigure read them, with gcc10 and binutils as its build inputs and no patch" $
+            assertEqual
+              "the archives, buildInputs and patches"
+              ( [outputNamed archive | (_, archive) <- archives],
+                [outputOf gcc10Root, outputOf binutilsRoot],
+                []
+              )
+              ( [wordsOf variable gccLatest | (variable, _) <- archives],
+                wordsOf "buildInputs" gccLatest,
+                wordsOf "patches" gccLatest
+              ),
+          runTest "gcc-latest's preConfigure moves GMP, MPFR and MPC to the directories GCC's configure builds them from" $
+            assertEqual
+              "preConfigure's mv lines"
+              ["mv " <> library <> "-" <> libraryVersion <> " " <> library | (library, libraryVersion, _) <- libraries]
+              (filter ("mv " `T.isPrefixOf`) (linesOf "preConfigure" gccLatest)),
+          runTest "gcc-latest's flags name the target, the outputs of the current MinGW-w64's headers and runtime and of binutils, and no sysroot" $
+            assertEqual
+              "flags"
+              [ "--target=" <> target,
+                "--with-headers=" <> outputOf headersRoot <> "/include",
+                "--with-libs=" <> outputOf crtRoot <> "/lib",
+                "--with-as=" <> outputOf binutilsRoot <> "/bin/" <> target <> "-as.exe",
+                "--with-ld=" <> outputOf binutilsRoot <> "/bin/" <> target <> "-ld.exe"
+              ]
+              (flagsWith ["--target=", "--with-headers", "--with-libs", "--with-sysroot", "--with-build-sysroot", "--with-native-system-header-dir", "--with-as=", "--with-ld="] gccLatest),
+          runTest "gcc-latest builds with gcc10's drivers and binutils' archiver, linker and resource compiler, by the target's names" $
+            assertEqual
+              "tools"
+              ["CC=" <> target <> "-gcc", "CXX=" <> target <> "-g++", "AR=" <> target <> "-ar", "LD=" <> target <> "-ld", "WINDRES=" <> target <> "-windres"]
+              (flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES="] gccLatest),
+          runTest "gcc-latest gives every link it makes --no-insert-timestamp, and LDFLAGS nothing else" $
+            assertEqual
+              "LDFLAGS"
+              ["LDFLAGS=-Wl,--no-insert-timestamp"]
+              (flagsWith ["LDFLAGS=", "LDFLAGS_FOR_BUILD="] gccLatest),
+          runTest "gcc-latest's compiler options carry no -g, and it gives make no flags" $
+            assertEqual
+              "the options and makeFlags"
+              (["CFLAGS=-O1", "CXXFLAGS=-O1", "CFLAGS_FOR_TARGET=-O2", "CXXFLAGS_FOR_TARGET=-O0"], [])
+              (flagsWith ["CFLAGS=", "CXXFLAGS=", "CFLAGS_FOR_TARGET=", "CXXFLAGS_FOR_TARGET="] gccLatest, wordsOf "makeFlags" gccLatest),
+          runTest "gcc-latest builds C and C++, static, with a build ID on every link, no default PIE and no registry lookup" $
+            assertEqual
+              "languages, libraries, links and registry"
+              ["--enable-languages=c,c++", "--enable-linker-build-id", "--disable-shared", "--disable-win32-registry"]
+              (flagsWith ["--enable-languages=", "--enable-linker-build-id", "--enable-default-pie", "--enable-shared", "--disable-shared", "--enable-win32-registry", "--disable-win32-registry"] gccLatest),
+          runTest "gcc-latest unsets the stdenv's C_INCLUDE_PATH, and nothing else, before configure" $
+            assertEqual
+              "preConfigure's unset lines"
+              ["unset C_INCLUDE_PATH"]
+              (filter ("unset " `T.isPrefixOf`) (linesOf "preConfigure" gccLatest)),
+          runTest "gcc-latest drops the configure arguments from the top-level Makefile, builds with NIX_BUILD_CORES jobs, installs with install-strip, whose strip keeps the zero time stamp ld writes, strips libgcc's debugging information, removes what ng.nix removes and libstdc++'s gdb script, and removes the directories that leaves empty" $
+            assertEqual
+              "phases and parallelism"
+              ( [ "sed -e '/TOPLEVEL_CONFIGURE_ARGUMENTS=/d' -i Makefile",
+                  "make ${enableParallelBuilding:+-j$NIX_BUILD_CORES}"
+                ],
+                [ "make ${enableParallelInstalling:+-j$NIX_BUILD_CORES} 'STRIP=" <> target <> "-strip -p' install-strip",
+                  "libgccDir=$out/lib/gcc/" <> target <> "/" <> version,
+                  target <> "-strip -p --strip-debug \"$libgccDir\"/*.a \"$libgccDir\"/*.o",
+                  "rm -r \"$out/libexec/gcc/" <> target <> "/" <> version <> "/install-tools\" \"$libgccDir/install-tools\"",
+                  "rm -rf \"$out/share/gcc-" <> version <> "/python\" \"$out/share/man\" \"$out/share/info\"",
+                  "rm \"$out/" <> target <> "/lib/libstdc++.a-gdb.py\"",
+                  "rmdir \"$out/share/gcc-" <> version <> "\" \"$out/share\""
+                ],
+                "1",
+                "1"
+              )
+              ( linesOf "buildPhase" gccLatest,
+                linesOf "installPhase" gccLatest,
+                maybe "" (variableOf "enableParallelBuilding") gccLatest,
+                maybe "" (variableOf "enableParallelInstalling") gccLatest
+              )
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the GCC 16 rung's derivations instantiate, adding thirteen to the closure of gcc10 and the current MinGW-w64"
+    target :: Text
+    target = "i686-w64-mingw32"
+    version :: Text
+    version = "16.2.0"
+    -- GMP, MPFR and MPC, each with the release of it the rung builds in
+    -- GCC's tree and the compression of its archive.
+    libraries :: [(Text, Text, Text)]
+    libraries = [("gmp", "6.3.0", "xz"), ("mpfr", "4.2.2", "xz"), ("mpc", "1.3.1", "gz")]
+    -- The variable the rung names each archive in, with the archive's
+    -- name.
+    archives :: [(Text, Text)]
+    archives =
+      ("src", "gcc-" <> version <> ".tar.xz")
+        : [(library <> "Src", library <> "-" <> libraryVersion <> ".tar." <> compression) | (library, libraryVersion, compression) <- libraries]
+    gccLatestRoot :: Text
+    gccLatestRoot = "pkgs.gcc-latest"
+    gcc10Root :: Text
+    gcc10Root = "pkgs.gcc10"
+    crtRoot :: Text
+    crtRoot = "pkgs.mingw-w64-crt-latest"
+    headersRoot :: Text
+    headersRoot = "pkgs.mingw-w64-headers-latest"
+    binutilsRoot :: Text
+    binutilsRoot = "pkgs.binutils"
+    builtBefore :: [Text]
+    builtBefore = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets", binutilsRoot, gcc10Root, headersRoot, crtRoot]
+    roots :: [Text]
+    roots = builtBefore ++ [gccLatestRoot, "checks.hello-c", "checks.hello-cxx", "checks.stamps"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      [archive | (variable, archive) <- archives, variable /= "mpfrSrc"]
+        ++ ["gcc-" <> version, "hello-c.sh", "hello-cxx.sh", "stamps.sh"]
+        ++ concat [[name, name <> "-builder"] | name <- ["gcc-latest-hello-c", "gcc-latest-hello-cxx", "gcc-latest-stamps"]]
+
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
 -- list's, each fixed-output and listed once.  A package that fetches a
@@ -16818,12 +17017,13 @@ testWindowsRungs = do
         ("tinycc", "tinycc-windows"),
         ("gcc46", "gcc46-windows"),
         ("gcc46-cxx", "gcc46-cxx-windows"),
-        ("gcc10", "gcc10-windows")
+        ("gcc10", "gcc10-windows"),
+        ("gcc-latest", "gcc-latest-windows")
       ]
     -- The rung each stage ends on, so that a workflow read as building
     -- nothing does not pass against an empty list.
     knownRungs :: [(Text, Text)]
-    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest")]
+    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest"), ("gcc-latest", "gcc-latest")]
     -- What ends a stage's rungs in the string the expression returns: no
     -- attribute path is spelled so.
     stageEnd :: Text
@@ -25551,6 +25751,7 @@ runSuite = do
           testGcc46CxxWindows,
           testGcc10Windows,
           testMingwW64LatestWindows,
+          testGccLatestWindows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,

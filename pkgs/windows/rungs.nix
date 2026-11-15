@@ -74,4 +74,7 @@
     "mingw-w64-headers-latest"
     "mingw-w64-crt-latest"
   ];
+
+  # GCC 16.2.0 with C and C++, GCC 16 (Windows).
+  gcc-latest = [ "gcc-latest" ];
 }

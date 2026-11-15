@@ -1,0 +1,14 @@
+hello from gcc 16.2.0, C 202311
+MinGW-w64 14.0.0 for msvcrt.dll 0x600
+constexpr 42, typeof 42, twice 84, nullptr 1, bool 1, enum 200 of size 1
+1234567890123 / -1000 = -1234567890 remainder 123
+0xffffffffffffffff0000
+hello.exe exits 0
+configured with: []
+Thread model: win32
+	DLL Name: KERNEL32.dll
+	DLL Name: msvcrt.dll
+T ___divmoddi4
+T ___mulbitint3
+CodeView entries: 1
+debugging sections: 0
