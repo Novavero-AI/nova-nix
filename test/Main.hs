@@ -72,14 +72,15 @@ import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
-import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
+import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
-import Nix.Eval.CList (clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
+import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
+import Nix.Eval.CStats (CRoot (..), Census (..), Figures (..), PerKind (..), renderCensus, takeCensus, valueRoots)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
@@ -1489,6 +1490,214 @@ data FrameValue = FrameConstant !Int | FrameAlias !Int | FrameOffset !Int !Int
 -- name one declared after it, whose slot is still empty while the
 -- earlier binding's thunk is made, so a frame that read its own slots
 -- while being built would read that hole.
+-- | A graph of C integers and lists for the census to count: a list's
+-- child either appears once or fills two slots with one cell.
+data CensusTree = CensusLeaf !Int64 | CensusNode ![CensusChild]
+  deriving (Show)
+
+data CensusChild = CensusOnce !CensusTree | CensusTwice !CensusTree
+  deriving (Show)
+
+-- | Bytes of a thunk cell, a list header and a pointer on a 64-bit
+-- target (cbits/nn_thunk.h, cbits/nn_list.h).
+censusCellBytes, censusHeaderBytes, censusPointerBytes :: Word64
+censusCellBytes = 16
+censusHeaderBytes = 16
+censusPointerBytes = 8
+
+genCensusTree :: QC.Gen CensusTree
+genCensusTree = QC.sized grow
+  where
+    grow 0 = CensusLeaf <$> QC.arbitrary
+    grow n =
+      QC.frequency
+        [ (1, CensusLeaf <$> QC.arbitrary),
+          (3, CensusNode <$> QC.resize 4 (QC.listOf (genChild (n `div` 2))))
+        ]
+    genChild n = QC.elements [CensusOnce, CensusTwice] <*> grow n
+
+-- | The cell of a fresh graph: every integer and list a cell of its own.
+buildCensusTree :: CensusTree -> IO CThunkPtr
+buildCensusTree (CensusLeaf n) = cthunkNewComputedInt n
+buildCensusTree (CensusNode children) = do
+  slots <- concat <$> mapM buildChild children
+  list <- thunkListToCList slots
+  cthunkNewComputedList (castPtr list)
+  where
+    buildChild (CensusOnce tree) = pure <$> buildCensusTree tree
+    buildChild (CensusTwice tree) = (\cell -> [cell, cell]) <$> buildCensusTree tree
+
+-- | What a census reaches from a graph's cell: a thunk per node, and per
+-- list with elements a header and an items array of a slot per element.
+censusTreeReach :: CensusTree -> PerKind Figures
+censusTreeReach tree =
+  (pure (Figures (Just 0) 0))
+    { kindThunks = Figures (Just nodes) (nodes * censusCellBytes),
+      kindLists = Figures (Just lists) (lists * censusHeaderBytes + slots * censusPointerBytes)
+    }
+  where
+    (nodes, lists, slots) = shape tree
+    shape (CensusLeaf _) = (1, 0, 0)
+    shape (CensusNode []) = (1, 0, 0)
+    shape (CensusNode children) =
+      let below = map (shape . childTree) children
+          (n, l, s) = foldl' (\(a, b, c) (x, y, z) -> (a + x, b + y, c + z)) (0, 0, 0) below
+       in (n + 1, l + 1, s + sum (map childSlots children))
+    childTree (CensusOnce t) = t
+    childTree (CensusTwice t) = t
+    childSlots (CensusOnce _) = 1
+    childSlots (CensusTwice _) = 2
+
+-- | A census, or the failure the C side reported as text.
+censusOf :: [CRoot] -> IO (Either Text Census)
+censusOf roots = either (Left . T.pack . displayException) Right <$> takeCensus roots
+
+-- | A check of a census, or a failure naming why there is none.
+withCensus :: [CRoot] -> (Census -> TestResult) -> IO TestResult
+withCensus roots check = either (Fail . ("no census: " <>)) check <$> censusOf roots
+
+testCensus :: IO [Bool]
+testCensus = do
+  putStrLn "eval/census"
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  sequence
+    [ runTestM "a census counts each object a graph reaches once, through every slot that holds it" $
+        quickCheckPasses $
+          QC.forAll genCensusTree $ \tree -> QC.ioProperty $ do
+            root <- buildCensusTree tree
+            taken <- censusOf [RootThunk (Thunk root)]
+            pure $ case taken of
+              Left failure -> QC.counterexample (T.unpack failure) False
+              Right census ->
+                (censusReached census, censusUnplaced census, censusVisitedObjects census, censusVisitedBytes census)
+                  QC.=== let reach = censusTreeReach tree
+                          in (reach, 0, sum (fmap (fromMaybe 0 . figuresCount) reach) + lists reach, sum (fmap figuresBytes reach)),
+      runTestM "a census taken twice over the same roots counts the same, so the mark leaves the data layer as it found it" $
+        quickCheckPasses $
+          QC.forAll genCensusTree $ \tree -> QC.ioProperty $ do
+            root <- buildCensusTree tree
+            first <- censusOf [RootThunk (Thunk root)]
+            second <- censusOf [RootThunk (Thunk root)]
+            let figures c = (censusAllocated c, censusReached c, censusVisitedObjects c, censusSetSizes c)
+            pure (fmap figures first QC.=== fmap figures second),
+      runTestM "a census follows a value behind a StablePtr to the cells it holds" $ do
+        inner <- cthunkNewComputedInt 7
+        let Thunk held = evaluated (VBuiltin "map" [ArgDeferred (Thunk inner)])
+        withCensus [RootThunk (Thunk held)] $ \census ->
+          assertEqual "thunks" (Figures (Just 2) (2 * censusCellBytes)) (kindThunks (censusReached census))
+            `andThen` assertEqual "StablePtrs reached" 1 (censusStablePtrsReached census)
+            `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
+      runTestM "a partial application holds its deferred argument as a cell, which a census follows without making one" $ do
+        result <- evalNixIO tmpBase "let f = map (x: x); in builtins.seq f { inherit f; }"
+        case result of
+          Left failure -> pure (Fail failure)
+          Right value -> withCensus (valueRoots value) $ \census ->
+            assertEqual "unplaced" 0 (censusUnplaced census)
+              `andThen` assertEqual "StablePtrs reached" True (censusStablePtrsReached census >= 1),
+      runTestM "a census follows a pending thunk to its env and the env's slots" $ do
+        cells <- mapM cthunkNewComputedInt [1, 2, 3]
+        let (slots, slotCount) = buildCSlots (map Thunk cells)
+            env = newMinimalEnv slots slotCount
+        code <- compileExpr (ELit (NixInt 0))
+        let Thunk pending = mkThunkBc env code
+        withCensus [RootThunk (Thunk pending)] $ \census ->
+          assertEqual "thunks" (Figures (Just 4) (4 * censusCellBytes)) (kindThunks (censusReached census))
+            `andThen` assertEqual "envs" (Figures (Just 1) (envStructBytes + 3 * censusPointerBytes)) (kindEnvs (censusReached census))
+            `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
+      runTestM "a list and its suffix count one items array, whichever is reached first" $ do
+        cells <- mapM cthunkNewComputedInt [1, 2, 3, 4]
+        whole <- CList <$> thunkListToCList cells
+        let suffix = clistDrop 2 whole
+            expected = (Figures (Just 2) (2 * censusHeaderBytes + 4 * censusPointerBytes), Figures (Just 4) (4 * censusCellBytes), 0)
+            listsAndCells c = (kindLists (censusReached c), kindThunks (censusReached c), censusUnplaced c)
+        suffixFirst <- censusOf [RootList suffix, RootList whole]
+        wholeFirst <- censusOf [RootList whole, RootList suffix]
+        pure (assertEqual "suffix first" (Right expected) (listsAndCells <$> suffixFirst) `andThen` assertEqual "whole first" (Right expected) (listsAndCells <$> wholeFirst)),
+      runTestM "a census reaches a set's names and its string values as symbols" $ do
+        let set = attrSetFromMap (Map.fromList [("novaNixCensusName", evaluated (mkStr "nova-nix census value"))])
+        withCensus [RootAttrSet set] $ \census ->
+          assertEqual
+            "sets, thunks and symbols"
+            (Just 1, Just 1, Figures (Just 2) (fromIntegral (T.length "novaNixCensusName" + T.length "nova-nix census value" + 2)))
+            (figuresCount (kindAttrSets (censusReached census)), figuresCount (kindThunks (censusReached census)), kindSymbols (censusReached census))
+            `andThen` assertEqual "set sizes" (Map.fromList [(1, 1)]) (censusSetSizes census)
+            `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
+      runTestM "a census of the builtins reaches no more than is allocated and places every pointer it meets" $
+        withCensus [RootEnv (builtinEnv unrestrictedPolicy 0 [])] $ \census ->
+          let within (Figures allocatedCount allocatedBytes) (Figures reachedCount reachedBytes) =
+                reachedBytes <= allocatedBytes && maybe True (>= fromMaybe 0 reachedCount) allocatedCount
+           in assertEqual "every kind within" (pure True) (within <$> censusAllocated census <*> censusReached census)
+                `andThen` assertEqual "unplaced" 0 (censusUnplaced census)
+                `andThen` assertEqual "some builtins reached" True (fromMaybe 0 (figuresCount (kindThunks (censusReached census))) > 0),
+      runTest "a census renders as a name and a value per line, with no line for a count no allocator keeps" $
+        assertEqual "report" renderedSample (renderCensus sampleCensus),
+      runTestM "eval writes a census to the file NOVA_NIX_C_STATS names, and none when it is empty" $ do
+        let root = tmpBase </> "nova-nix-test-census"
+            target = root </> "census.txt"
+            run value =
+              Proc.readCreateProcessWithExitCode
+                (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "eval", "--strict", "--expr", "builtins.genList (i: { inherit i; }) 3"])
+                  { Proc.env = Just (("NOVA_NIX_C_STATS", value) : filter ((/= "NOVA_NIX_C_STATS") . fst) ambient)
+                  }
+                ""
+        bracket_ (forceRemoveIfExists root >> createDirectoryIfMissing True root) (forceRemoveIfExists root) $ do
+          (code, out, _) <- run target
+          written <- BS8.lines <$> BS.readFile target
+          Dir.removeFile target
+          (emptyCode, emptyOut, _) <- run ""
+          leftOver <- Dir.doesFileExist target
+          -- The result's three sets of one attribute are reached; the
+          -- builtins' sets are bigger.
+          let oneEntrySets = [count | line <- written, ["attrsets.reached.size", "1", count] <- [BS8.words line]]
+          pure $
+            assertEqual "printed" (ExitSuccess, "[ { i = 0; } { i = 1; } { i = 2; } ]\n") (code, out)
+              `andThen` assertEqual "one-attribute sets reached" ["3"] oneEntrySets
+              `andThen` assertEqual "unplaced" True ("mark.unplaced 0" `elem` written)
+              `andThen` assertEqual "with an empty value" (ExitSuccess, out, False) (emptyCode, emptyOut, leftOver)
+    ]
+  where
+    lists reach = fromMaybe 0 (figuresCount (kindLists reach))
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    envStructBytes = 48
+    sampleCensus =
+      Census
+        { censusAllocated = (pure (Figures (Just 3) 48)) {kindEnvs = Figures Nothing 96},
+          censusReached = pure (Figures (Just 1) 16),
+          censusOverheadBytes = 5,
+          censusCodeBytes = 6,
+          censusStablePtrs = 7,
+          censusStablePtrsReached = 8,
+          censusVisitedObjects = 9,
+          censusVisitedBytes = 10,
+          censusUnplaced = 0,
+          censusIndexSeconds = 0.25,
+          censusMarkSeconds = 1.5,
+          censusSetSizes = Map.fromList [(0, 2), (12, 1)]
+        }
+    renderedSample =
+      BS8.unlines
+        ( concat
+            [ [name <> ".allocated.count 3" | name /= "envs"]
+                ++ [name <> ".allocated.bytes " <> (if name == "envs" then "96" else "48"), name <> ".reached.count 1", name <> ".reached.bytes 16"]
+            | name <- ["thunks", "envs", "attrsets", "lists", "lambdas", "ctxstrs", "symbols"]
+            ]
+            ++ [ "overhead.bytes 5",
+                 "code.bytes 6",
+                 "stableptrs.held 7",
+                 "stableptrs.reached 8",
+                 "mark.objects 9",
+                 "mark.bytes 10",
+                 "mark.unplaced 0",
+                 "mark.index-seconds 0.250000",
+                 "mark.seconds 1.500000",
+                 "attrsets.reached.size 0 2",
+                 "attrsets.reached.size 12 1"
+               ]
+        )
+
 testFrameKnots :: IO [Bool]
 testFrameKnots = do
   putStrLn "eval/frame-knots"
@@ -25099,6 +25308,7 @@ runSuite = do
           testRepeatedValues,
           testEvalRecAttrs,
           testFrameKnots,
+          testCensus,
           testEvalLists,
           testEvalLambda,
           testEvalWith,

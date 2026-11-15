@@ -12,10 +12,10 @@
  *   positions: [ 9, 0, 13, 17 ]    (parallel, in the same block)
  *   values:    [ p0, p1, p2, p3 ]  (parallel opaque pointers)
  *
- * This replaces Haskell's Map.Bin tree:
+ * Against Haskell's Map.Bin tree:
  *   Map.Bin: ~48 bytes/node (constructor + key + value + size + left + right)
  *   nn_attrset: ~16 bytes/entry (4-byte key + 4-byte position + 8-byte pointer)
- *   For 30k entries: 1.4 MB down to 480 KB (3x reduction, plus cache-friendly)
+ *   For 30k entries: 480 KB against 1.4 MB, in one contiguous run
  */
 
 #include "nn_attrset.h"
@@ -413,6 +413,21 @@ nn_attrset_t *nn_attrset_remove_keys(
 
     result->frozen = 1;  /* Source was sorted, no removals change order. */
     return result;
+}
+
+/* --- Census --- */
+
+nn_attrset_t *const *nn_attrset_tracked(uint32_t *count, uint32_t *capacity)
+{
+    *count = g_tracked_count;
+    *capacity = g_tracked_cap;
+    return g_tracked;
+}
+
+uint64_t nn_attrset_bytes(const nn_attrset_t *set)
+{
+    return sizeof(*set) + (uint64_t)names_block_bytes(set->capacity)
+         + (uint64_t)set->capacity * sizeof(void *);
 }
 
 /* --- Internal: tagged sort comparator --- */

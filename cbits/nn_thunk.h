@@ -19,7 +19,8 @@
  * filled after, as upstream allocates env2 before filling its values.
  * COMPUTED payloads are either inline scalars (int/float/bool/null via
  * val_tag 0-3), C-native pointers (str/path/list/attrs/ctxstr/lambda
- * via val_tag 4-9), or StablePtrs (for VBuiltin/VDrv via tag 255).
+ * via val_tag 4-9), or StablePtrs (for a builtin and the arguments it
+ * has taken, or a compiled regex, via tag 255).
  *
  * Lifecycle: nn_thunk_init() before evaluation, nn_thunk_destroy()
  * after.  Not thread-safe - single-threaded evaluation only.
@@ -210,5 +211,17 @@ nn_thunk_t *nn_thunk_get(uint32_t index);
  * and returns the count written.  These back the nn_arena_* teardown helpers. */
 uint32_t nn_thunk_count_stableptrs(void);
 uint32_t nn_thunk_collect_stableptrs(void **output, uint32_t max_count);
+
+/* --- Census (nn_stats.h) --- */
+
+/* The arena's blocks, oldest first: for each of the first `max`, its
+ * first slot and the slots it has handed out go to `slots` and `counts`.
+ * Returns the number of blocks, which may exceed `max`; 0 outside the
+ * init .. destroy window. */
+uint32_t nn_thunk_blocks(nn_thunk_t **slots, uint32_t *counts, uint32_t max);
+
+/* Bytes the arena holds from the allocator: every block, header and
+ * unused slots included. */
+uint64_t nn_thunk_reserved_bytes(void);
 
 #endif /* NN_THUNK_H */

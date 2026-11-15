@@ -27,6 +27,7 @@ import Data.Version (showVersion)
 import Data.Word (Word32)
 import Foreign.C.Error (Errno (..), ePIPE)
 import GHC.IO.Exception (IOException (..))
+import GHC.Profiling (requestHeapCensus)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
@@ -40,6 +41,7 @@ import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, deepForce, eval, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
+import Nix.Eval.CStats (CRoot (..), renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIOTraced)
@@ -65,6 +67,7 @@ import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO (BufferMode (..), hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError, isUserError)
 import qualified System.Info
+import System.Mem (performMajorGC)
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
 
@@ -341,7 +344,7 @@ evalFile config opts storeDir dataDir rawFilePath = do
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
-        Right forced -> printResult forced
+        Right forced -> printResult forced >> writeCensus st env forced
 
 -- | Evaluate an inline expression and print the result.
 evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
@@ -356,7 +359,41 @@ evalExpr config opts storeDir dataDir source = do
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
-        Right forced -> printResult forced
+        Right forced -> printResult forced >> writeCensus st env forced
+
+-- | The variable naming the file 'writeCensus' writes.
+censusVar :: BS.ByteString
+censusVar = "NOVA_NIX_C_STATS"
+
+-- | With 'censusVar' set to a path, write a census of the C data layer
+-- ("Nix.Eval.CStats") to it once an evaluation has succeeded.  Its roots
+-- are what the process still holds once the evaluation has returned: the
+-- result, the root environment, the import cache and the search path.
+-- What else holds a C pointer then is a constant of the program, whose
+-- number does not grow with the evaluation.  A census of GHC's heap
+-- follows, which a run under a heap profile (@+RTS -hT@) records as its
+-- last sample: taken after the C census, so that no periodic sample falls
+-- between it and the end however long the mark runs, in the major
+-- collection that leaves nothing in GHC's heap the evaluation has dropped.
+writeCensus :: EvalState -> Env -> NixValue -> IO ()
+writeCensus st env result = do
+  target <- mfilter (not . BS.null) <$> configVariable censusVar
+  case target of
+    Nothing -> pure ()
+    Just bytes -> do
+      path <- variableHostPath censusVar bytes
+      cached <- readIORef (esImportCache st)
+      let roots =
+            valueRoots result
+              ++ [RootEnv env]
+              ++ concatMap valueRoots (Map.elems cached)
+              ++ map RootThunk (esSearchPaths st)
+      census <- takeCensus roots
+      requestHeapCensus
+      performMajorGC
+      case census of
+        Left failure -> failWith ("error: " <> T.pack (displayException failure))
+        Right taken -> OsFile.writeFile' path (renderCensus taken)
 
 -- | Evaluate an inline expression to a derivation and print its ATerm (.drv
 -- contents), for diffing nova-nix's serialization against upstream Nix.
@@ -717,7 +754,7 @@ loadNixConfig = do
   where
     configError = failWith . ("error: " <>)
 
--- | A variable the configuration reads, as its bytes, the way upstream's
+-- | A variable the CLI reads, as its bytes, the way upstream's
 -- @getEnv@ reads it.  A Windows value holding an unpaired UTF-16
 -- surrogate has no bytes nova-nix can carry, so it is refused, as
 -- @NIX_PATH@ holding one is.

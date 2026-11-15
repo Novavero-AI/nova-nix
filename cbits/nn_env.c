@@ -18,7 +18,6 @@
 /* --- Constants --- */
 
 #define NN_ENV_PAGE_SIZE (256u * 1024u)  /* 256 KB per page */
-#define NN_ENV_ALIGN     8u              /* 8-byte alignment */
 
 /* --- Internal types --- */
 
@@ -66,8 +65,8 @@ nn_env_alloc_raw(uint32_t bytes)
 {
     /* align_up would wrap for sizes near UINT32_MAX; such a request can
      * only be corrupt input, so fail it instead of wrapping small. */
-    if (bytes > UINT32_MAX - (NN_ENV_ALIGN - 1)) return NULL;
-    bytes = align_up(bytes, NN_ENV_ALIGN);
+    if (bytes > UINT32_MAX - (NN_ENV_ALIGNMENT - 1)) return NULL;
+    bytes = align_up(bytes, NN_ENV_ALIGNMENT);
 
     /* No pages before nn_env_init or after nn_env_destroy.  Opening a
      * first page here instead would hand out memory the next
@@ -315,4 +314,32 @@ uint64_t
 nn_env_bytes_allocated(void)
 {
     return g_total_bytes;
+}
+
+/* --- Census --- */
+
+uint32_t
+nn_env_pages(char **data, uint32_t *used, uint32_t max)
+{
+    uint32_t n = 0;
+    struct nn_env_page *page;
+    for (page = g_first_page; page; page = page->next) {
+        if (n < max) {
+            data[n] = page->data;
+            used[n] = page->used;
+        }
+        n++;
+    }
+    return n;
+}
+
+uint64_t
+nn_env_reserved_bytes(void)
+{
+    uint64_t bytes = 0;
+    struct nn_env_page *page;
+    for (page = g_first_page; page; page = page->next) {
+        bytes += sizeof(struct nn_env_page) + (uint64_t)page->capacity;
+    }
+    return bytes;
 }

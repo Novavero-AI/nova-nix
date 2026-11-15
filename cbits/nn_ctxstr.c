@@ -167,3 +167,19 @@ nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint32_t idx)
     if (s == NULL || idx >= s->ctx_count) return 0;
     return s->ctx[idx].output;
 }
+
+/* --- Census --- */
+
+nn_ctxstr_t *const *
+nn_ctxstr_tracked(uint32_t *count, uint32_t *capacity)
+{
+    *count = g_tracked_count;
+    *capacity = g_tracked_capacity;
+    return g_tracked;
+}
+
+uint64_t
+nn_ctxstr_bytes(const nn_ctxstr_t *s)
+{
+    return sizeof(*s) + (uint64_t)s->ctx_count * sizeof(nn_sce_t);
+}

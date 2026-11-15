@@ -81,6 +81,7 @@ library
     Nix.Eval.CList
     Nix.Eval.CCtxStr
     Nix.Eval.CBytecode
+    Nix.Eval.CStats
     Nix.Eval.Compile
     Nix.Eval.EvalFormals
     Nix.Eval.Arena
@@ -182,6 +183,7 @@ library
     cbits/nn_arena.c
     cbits/nn_bytecode.c
     cbits/nn_lambda.c
+    cbits/nn_stats.c
     cbits/nn_winfs.c
     cbits/nn_darwinfs.c
     cbits/nn_cpus.c
@@ -311,6 +313,28 @@ test-suite nova-nix-test
   if !os(windows)
     build-depends:
         unix              >= 2.8 && < 2.9
+
+-- ---------------------------------------------------------------------------
+-- Benchmarks
+-- ---------------------------------------------------------------------------
+
+-- What an attribute set costs held in C and held in GHC's heap, for
+-- profiling/bench.sh's memory suite, which says how to run it.
+benchmark attrset-memory
+  type:             exitcode-stdio-1.0
+  main-is:          AttrSetMemory.hs
+  hs-source-dirs:   profiling
+  c-sources:        profiling/heap-in-use.c
+  default-language: Haskell2010
+  -- -threaded: the non-moving collector marks beside the program there,
+  -- as it would beside the evaluator.  -T: the figures are the RTS's.
+  ghc-options:      -Wall -Wcompat -threaded -rtsopts "-with-rtsopts=-T"
+
+  build-depends:
+      base                >= 4.22 && < 5
+    , bytestring          >= 0.11 && < 0.13
+    , nova-nix
+    , primitive           >= 0.9 && < 0.10
 
 source-repository head
   type:     git

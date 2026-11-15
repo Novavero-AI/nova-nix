@@ -1,9 +1,9 @@
 /*
  * nn_list.h - Contiguous array of thunk pointers for nova-nix lists.
  *
- * Replaces Haskell's [Thunk] (linked-list cons cells, ~48 bytes per
- * element on the GHC heap) with a flat C array of nn_thunk_t* pointers
- * (8 bytes per element, cache-friendly layout).
+ * A flat C array of nn_thunk_t* pointers, 8 bytes per element in one
+ * contiguous run, against the ~48 bytes per element of the cons cells a
+ * Haskell [Thunk] takes on the GHC heap.
  *
  * The items array is allocated via nn_env_alloc_slots (page-based bump
  * allocator).  The nn_list_t header is malloc'd and tracked for bulk
@@ -71,5 +71,15 @@ struct nn_thunk *nn_list_get(const nn_list_t *list, uint32_t index);
 /* Set the thunk pointer at the given index (for construction).
  * Index must be < nn_list_count(list). */
 void nn_list_set(nn_list_t *list, uint32_t index, struct nn_thunk *thunk);
+
+/* --- Census (nn_stats.h) --- */
+
+/* The tracked headers, in no particular order: the module's own array,
+ * valid until the next header is created or nn_list_free_all runs.
+ * Writes how many it holds to *count and how many it has room for to
+ * *capacity.  A header nn_list_drop made shares its source's items array
+ * and ends where the source ends, so headers that end at one address
+ * share one array, which the longest of them spans. */
+nn_list_t *const *nn_list_tracked(uint32_t *count, uint32_t *capacity);
 
 #endif /* NN_LIST_H */

@@ -2,9 +2,9 @@
  * nn_lambda.h - Lambda closure structs for nova-nix.
  *
  * Stores lambda closures entirely in C: captured environment (nn_env_t*),
- * body bytecode index, and formal parameter specification.  Replaces
- * StablePtr NixValue for VLambda on the GHC heap (~25% of remaining
- * heap after M6) with a C-native tag 9 in the thunk system.
+ * body bytecode index, and formal parameter specification.  A thunk
+ * holds one under NN_VALUE_LAMBDA, so a closure takes nothing on the GHC
+ * heap.
  *
  * Formals are stored as a type tag (Name/Set/NamedSet) plus an array
  * of (symbol, has_default, default_bc_idx) entries for set patterns.
@@ -96,5 +96,17 @@ uint32_t       nn_lambda_formal_count(const nn_lambda_t *lam);
 uint32_t nn_lambda_entry_name(const nn_lambda_t *lam, uint32_t idx);
 uint32_t nn_lambda_entry_has_default(const nn_lambda_t *lam, uint32_t idx);
 uint32_t nn_lambda_entry_default(const nn_lambda_t *lam, uint32_t idx);
+
+/* --- Census (nn_stats.h) --- */
+
+/* The tracked lambdas, in no particular order: the module's own array,
+ * valid until the next lambda is created or nn_lambda_free_all runs.
+ * Writes how many it holds to *count and how many it has room for to
+ * *capacity. */
+nn_lambda_t *const *nn_lambda_tracked(uint32_t *count, uint32_t *capacity);
+
+/* Bytes a lambda holds from the allocator: its struct and its formal
+ * entries. */
+uint64_t nn_lambda_bytes(const nn_lambda_t *lam);
 
 #endif /* NN_LAMBDA_H */

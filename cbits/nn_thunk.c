@@ -562,3 +562,35 @@ nn_thunk_collect_stableptrs(void **output, uint32_t max_count)
     }
     return written;
 }
+
+/* --- Census --- */
+
+uint32_t
+nn_thunk_blocks(nn_thunk_t **slots, uint32_t *counts, uint32_t max)
+{
+    uint32_t n = 0;
+    struct nn_thunk_block *block;
+    if (!g_arena) return 0;
+    for (block = g_arena->head; block; block = block->next) {
+        if (n < max) {
+            slots[n] = block->slots;
+            counts[n] = block->count;
+        }
+        n++;
+    }
+    return n;
+}
+
+uint64_t
+nn_thunk_reserved_bytes(void)
+{
+    uint64_t bytes = 0;
+    struct nn_thunk_block *block;
+    if (!g_arena) return 0;
+    bytes += sizeof(struct nn_thunk_arena);
+    for (block = g_arena->head; block; block = block->next) {
+        bytes += sizeof(struct nn_thunk_block)
+               + (uint64_t)block->capacity * sizeof(nn_thunk_t);
+    }
+    return bytes;
+}

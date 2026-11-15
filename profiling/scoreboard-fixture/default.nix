@@ -1,5 +1,5 @@
 # A package set shaped like nixpkgs' top level, for checking the scoreboard
-# walk (../scoreboard.nix) without evaluating nixpkgs: one attribute for
+# walk (../walk.nix) without evaluating nixpkgs: one attribute for
 # each way a unit settles.  expected.txt beside this is the walk's result,
 # which both evaluators must produce.
 {

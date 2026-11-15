@@ -279,3 +279,13 @@ uint32_t nn_symbol_count(void)
 {
     return g_sym.count;
 }
+
+/* --- Census --- */
+
+void nn_symbol_footprint(uint64_t *text, uint64_t *reserved)
+{
+    *text = g_sym.arena_used;
+    *reserved = g_sym.arena_cap
+              + (uint64_t)g_sym.entries_cap * sizeof(nn_symbol_entry_t)
+              + (uint64_t)g_sym.slots_cap * sizeof(nn_slot_t);
+}

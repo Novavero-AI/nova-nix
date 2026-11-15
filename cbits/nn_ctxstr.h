@@ -98,4 +98,16 @@ uint32_t nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint32_t idx);
 uint32_t nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint32_t idx);
 uint32_t nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint32_t idx);
 
+/* --- Census (nn_stats.h) --- */
+
+/* The tracked strings, in no particular order: the module's own array,
+ * valid until the next string is created or nn_ctxstr_free_all runs.
+ * Writes how many it holds to *count and how many it has room for to
+ * *capacity. */
+nn_ctxstr_t *const *nn_ctxstr_tracked(uint32_t *count, uint32_t *capacity);
+
+/* Bytes a string holds from the allocator: its header and its context
+ * elements. */
+uint64_t nn_ctxstr_bytes(const nn_ctxstr_t *s);
+
 #endif /* NN_CTXSTR_H */
