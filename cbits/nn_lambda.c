@@ -174,3 +174,19 @@ nn_lambda_entry_default(const nn_lambda_t *lam, uint32_t idx)
     if (lam == NULL || lam->entries == NULL || idx >= lam->formal_count) return 0;
     return lam->entries[idx].default_bc_idx;
 }
+
+/* --- Census --- */
+
+nn_lambda_t *const *
+nn_lambda_tracked(uint32_t *count, uint32_t *capacity)
+{
+    *count = g_tracked_count;
+    *capacity = g_tracked_cap;
+    return g_tracked;
+}
+
+uint64_t
+nn_lambda_bytes(const nn_lambda_t *lam)
+{
+    return sizeof(*lam) + (uint64_t)lam->formal_count * sizeof(nn_formal_entry_t);
+}

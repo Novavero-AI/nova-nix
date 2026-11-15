@@ -28,9 +28,14 @@ typedef struct nn_env {
     uint32_t       slot_count;   /* 4 bytes + 4 pad to align lazy_scope */
     void          *lazy_scope;   /* nn_attrset_t* or NULL */
     struct nn_env *parent;       /* nn_env_t* or NULL */
-    void         **with_scopes;  /* array of nn_attrset_t* (or NULL) */
+    void         **with_scopes;  /* with-scope entries (or NULL), innermost first */
     uint32_t       with_count;   /* 4 bytes + 4 pad to struct alignment */
 } nn_env_t;
+
+/* A with-scope entry is an nn_attrset_t *, or a with-scope not yet forced:
+ * the nn_thunk_t * of its expression with this bit set, which the
+ * evaluator replaces by the set once it forces the thunk. */
+#define NN_ENV_LAZY_WITH ((uintptr_t)1)
 
 /* --- Lifecycle --- */
 
@@ -109,5 +114,21 @@ void **nn_env_alloc_with_scopes(uint32_t count);
 
 /* Total bytes allocated across all pages (for memory tracking). */
 uint64_t nn_env_bytes_allocated(void);
+
+/* --- Census (nn_stats.h) --- */
+
+/* The pages, oldest first: for each of the first `max`, its first byte
+ * and the bytes it has handed out go to `data` and `used`.  Every
+ * allocation starts at an NN_ENV_ALIGNMENT boundary from its page's first
+ * byte.  Returns the number of pages, which may exceed `max`; 0 outside
+ * the init .. destroy window. */
+uint32_t nn_env_pages(char **data, uint32_t *used, uint32_t max);
+
+/* The alignment nn_env_pages promises. */
+#define NN_ENV_ALIGNMENT 8u
+
+/* Bytes the pages hold from the allocator, headers and unused tails
+ * included. */
+uint64_t nn_env_reserved_bytes(void);
 
 #endif /* NN_ENV_H */

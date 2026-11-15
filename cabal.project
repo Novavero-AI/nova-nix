@@ -12,3 +12,8 @@ index-state: 2026-11-01T14:32:22Z
 -- own cabal.project carries (a dependency's flag cannot be set from a
 -- .cabal file).
 constraints: xz -system-xz
+
+-- The benchmarks build with everything else, so that the warning-clean
+-- gate compiles them and the memory suite in profiling/bench.sh finds its
+-- benchmark built.
+benchmarks: True

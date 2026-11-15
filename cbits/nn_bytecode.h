@@ -195,4 +195,8 @@ uint32_t nn_bc_data(uint32_t offset);
 uint32_t nn_bc_op_count(void);
 uint32_t nn_bc_data_count(void);
 
+/* Bytes the store holds from the allocator: the instruction and data
+ * arrays at their capacities (nn_stats.h). */
+uint64_t nn_bc_reserved_bytes(void);
+
 #endif /* NN_BYTECODE_H */

@@ -1,9 +1,9 @@
 /*
  * nn_attrset.h - Sorted symbol-keyed attribute set for nova-nix.
  *
- * Replaces Haskell's Data.Map.Strict (48 bytes per Bin node, pointer-
- * chasing balanced tree) with a contiguous sorted array of (symbol,
- * position, slot) entries.  Binary search for O(log n) lookup; linear
+ * A contiguous sorted array of (symbol, position, slot) entries, against
+ * the 48 bytes per node of the pointer-chasing balanced tree Haskell's
+ * Data.Map.Strict would take.  Binary search for O(log n) lookup; linear
  * scan for iteration.
  *
  * Construction is two-phase:
@@ -14,8 +14,9 @@
  * but keys cannot change).  This matches Nix semantics: attribute sets
  * are constructed once and never gain/lose keys.
  *
- * Values are opaque void* - Haskell passes StablePtr Thunk.  The C
- * side never dereferences them.
+ * Values are the nn_thunk_t * of each attribute, or NULL in a frame's
+ * name table until the frame fills it.  The set never dereferences them;
+ * a census (nn_stats.h) follows them.
  *
  * Each entry also carries the position it was defined at, an opaque
  * uint32_t the evaluator assigns and resolves, as each attribute of
@@ -27,7 +28,8 @@
  * by nn_attrset_free_all at evaluation teardown; nn_attrset_free is that
  * teardown's per-set primitive and must not be called on a tracked set (it
  * would then be double-freed by nn_attrset_free_all).
- * Values (StablePtrs) are NOT freed by nn_attrset_free - Haskell owns them.
+ * Values are NOT freed by nn_attrset_free: they are cells of the thunk
+ * arena, which frees them.
  *
  * Counts and indices are uint32_t.  A set holds at most
  * NN_ATTRSET_MAX_ENTRIES entries, the ceiling upstream's Bindings has
@@ -60,8 +62,8 @@ typedef struct nn_attrset nn_attrset_t;
  * (0 picks a small default).  Returns NULL on allocation failure. */
 nn_attrset_t *nn_attrset_new(uint32_t capacity);
 
-/* Free the attribute set structure.  Does NOT free the value pointers
- * (Haskell owns those via StablePtr). */
+/* Free the attribute set structure.  Does NOT free the values, which the
+ * thunk arena owns. */
 void nn_attrset_free(nn_attrset_t *set);
 
 /* --- Construction (before freeze) --- */
@@ -137,5 +139,17 @@ nn_attrset_t *nn_attrset_remove_keys(
     const nn_attrset_t *set,
     const nn_symbol_t *keys,
     uint32_t key_count);
+
+/* --- Census (nn_stats.h) --- */
+
+/* The tracked sets, in no particular order: the module's own array,
+ * valid until the next set is created or nn_attrset_free_all runs.
+ * Writes how many it holds to *count and how many it has room for to
+ * *capacity. */
+nn_attrset_t *const *nn_attrset_tracked(uint32_t *count, uint32_t *capacity);
+
+/* Bytes a set holds from the allocator: its header, and its keys,
+ * positions and values at its capacity. */
+uint64_t nn_attrset_bytes(const nn_attrset_t *set);
 
 #endif /* NN_ATTRSET_H */

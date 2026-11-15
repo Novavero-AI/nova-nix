@@ -158,3 +158,9 @@ uint32_t nn_bc_data(uint32_t offset)   { NN_ASSERT(offset < g_data_count, "nn_bc
 
 uint32_t nn_bc_op_count(void)   { return g_op_count;   }
 uint32_t nn_bc_data_count(void) { return g_data_count; }
+
+uint64_t nn_bc_reserved_bytes(void)
+{
+    return (uint64_t)g_op_capacity * sizeof(nn_op_t)
+         + (uint64_t)g_data_capacity * sizeof(uint32_t);
+}

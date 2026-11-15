@@ -116,3 +116,13 @@ nn_list_set(nn_list_t *list, uint32_t index, struct nn_thunk *thunk)
     NN_ASSERT(index < list->count, "nn_list_set: index out of bounds");
     list->items[index] = thunk;
 }
+
+/* --- Census --- */
+
+nn_list_t *const *
+nn_list_tracked(uint32_t *count, uint32_t *capacity)
+{
+    *count = g_tracked_count;
+    *capacity = g_tracked_cap;
+    return g_tracked;
+}

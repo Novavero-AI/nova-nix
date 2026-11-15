@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# profiling/bench.sh - Reproducible benchmark runner for nova-nix memory profiling
+# profiling/bench.sh - nova-nix's measurements over a nixpkgs tree
 #
 # Usage:
-#   ./profiling/bench.sh <label> [rts-flags...] [--build] [--full]
 #   ./profiling/bench.sh <label> --scoreboard [-M<cap>] [--build]
 #   ./profiling/bench.sh <label> --resources [-M<cap>] [--build]
+#   ./profiling/bench.sh <label> --memory [-M<cap>] [--build]
 #
 # Requires NIXPKGS_PATH in the environment: the nixpkgs checkout that
 # <nixpkgs> in the eval expression resolves to, in the path spelling the
 # platform's executable expects.
 #
 # The scoreboard walks the attributes `nix-env -qa` visits in the package
-# set (profiling/scoreboard.nix says which) and counts the attributes whose
+# set (profiling/walk.nix says which) and counts the attributes whose
 # drvPath nova-nix evaluates and, of those, the ones whose drvPath is the
 # one upstream Nix computes from the same tree.  The second count needs
 # nix-instantiate on PATH, which walks the set as the reference; without it
@@ -29,36 +29,36 @@
 # memory.max, it reports that bound and the processes the kernel's OOM
 # killer ended during the pass.
 #
+# --memory measures where one evaluation's memory goes, over a slice of the
+# walk: its first MEMORY_SLICE attributes (2000 unless the environment says
+# otherwise).  Both evaluators walk the slice first, as the scoreboard does,
+# to find the attributes that end a process or run out of memory in one;
+# then one process of each visits the slice with those passed over,
+# through profiling/memory.nix,
+# which keeps the package set held when evaluation returns.  nova-nix runs
+# twice: once measured (+RTS -s, /usr/bin/time), and once under a heap
+# profile by closure type (+RTS -hT) with NOVA_NIX_C_STATS set, for a
+# census of GHC's heap and of the C data layer when the slice ends: what
+# the C side holds by kind, what the result, the root environment, the
+# import cache and the search path reach, and what the mark cost.
+# Upstream's pass runs under NIX_SHOW_STATS.  The attrset-memory benchmark
+# then builds the attribute sets the census reached, as C sets and as sets
+# held in GHC's heap, under the copying and the non-moving collector.
+# Upstream's figures need nix-instantiate and jq on PATH.
+#
 # Examples:
-#   ./profiling/bench.sh baseline                        # Just -s stats, -M4G
-#   ./profiling/bench.sh iter6-trim -hT                  # Type-based heap profile
-#   ./profiling/bench.sh iter6-trim -hc                  # Cost-centre (needs -prof build)
-#   ./profiling/bench.sh iter6-trim -hr                  # Retainer (needs -prof build)
-#   ./profiling/bench.sh scaling -M6G                    # Custom heap cap
-#   ./profiling/bench.sh iter6-trim -hT -M8G             # Combine flags
-#   ./profiling/bench.sh iter8 -hT --build               # Auto-build, then -hT
-#   ./profiling/bench.sh iter8 --full                    # Full diagnostic suite
 #   ./profiling/bench.sh nixpkgs-24.11 --scoreboard      # Scoreboard
 #   ./profiling/bench.sh nixpkgs-24.11 --resources       # Its resource pass
+#   ./profiling/bench.sh nixpkgs-24.11 --memory          # The memory suite
 #
 # Flags:
-#   --build       Auto-build before running. Uses standard build for -hT,
-#                 profiling build (-fprof-late) for -hc/-hr/-hd/-hb/-p.
-#   --full        Complete diagnostic suite: -hT (standard build), then
-#                 -hc -p and -hr (profiling build). Produces report.txt.
-#   --scoreboard  The scoreboard, from the standard build.
+#   --build       Build what the mode runs first.
+#   --scoreboard  The scoreboard.
 #   --resources   The resource pass over the scoreboard's walk.
+#   --memory      The memory suite over a slice of the walk.
 #
 # Output:
 #   profiling/results/<label>/
-#     rts-stats.txt    - full +RTS -s output (single-run mode)
-#     summary.txt      - parsed key metrics (single-run mode)
-#     heap-profile.hp  - .hp file (if heap profiling enabled)
-#     heap-top.txt     - top 20 heap categories (if .hp present)
-#     hT/              - type breakdown (--full mode)
-#     hc/              - cost centre heap + .prof (--full mode)
-#     hr/              - retainer profile (--full mode)
-#     report.txt       - combined report (--full mode)
 #     nova-nix/        - nova-nix's walk (--scoreboard): results.txt, one
 #                        attribute per line as "KIND PATH [DRVPATH]";
 #                        errors.txt, "PATH EXIT LAST-LINE" for each failure
@@ -71,21 +71,26 @@
 #     resources/       - the one-process pass (--resources): rts-stats.txt,
 #                        peak-rss.txt, and resources.md, its figures as
 #                        printed
+#     memory/          - the memory suite (--memory): slice/, both walks of
+#                        the slice; settled.txt, the attributes every pass
+#                        passes over; nova-nix/, census/ and upstream/, the
+#                        three passes, each with its output, peak-rss.txt
+#                        and visited.txt, and census/census.txt, the C
+#                        census, census/heap.hp, the heap profile, and
+#                        upstream/nix-stats.json; attrset/, the benchmark's
+#                        runs; memory.md, every figure as printed
 #
-# Every nova-nix run gets the heap cap (-M4G default), and every run the
-# script measures gets +RTS -s.
+# Every nova-nix run gets the heap cap (-M4G default).
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NIXPKGS_PATH="${NIXPKGS_PATH:?set NIXPKGS_PATH to a nixpkgs checkout}"
-EVAL_EXPR='builtins.length (builtins.attrNames (import <nixpkgs> {}))'
 DEFAULT_HEAP_CAP="-M4G"
 HEAP_CAP="$DEFAULT_HEAP_CAP"
-BUILD_MODE="standard"   # tracks current build: "standard" or "profiling"
-LAST_BUILD_MODE=""      # tracks previous build to detect mode switches
 
 SCOREBOARD_WALK="$REPO_ROOT/profiling/scoreboard.nix"
+MEMORY_WALK="$REPO_ROOT/profiling/memory.nix"
 # What builtins.trace makes of the walk's reports, in both evaluators.
 SCOREBOARD_MARKER="trace: nova-nix-scoreboard "
 # Upstream's walk chunk: the attributes nixpkgs' own CI gives one evaluator
@@ -99,6 +104,17 @@ DEFAULT_UPSTREAM_BUDGET=5000
 DEFAULT_NOVA_BUDGET=2000
 UPSTREAM_BUDGET="${SCOREBOARD_BUDGET:-$DEFAULT_UPSTREAM_BUDGET}"
 NOVA_BUDGET="${SCOREBOARD_BUDGET:-$DEFAULT_NOVA_BUDGET}"
+# The memory suite's slice: the attributes one process visits, the number
+# a nova-nix walk chunk holds.
+DEFAULT_MEMORY_SLICE=2000
+MEMORY_SLICE="${MEMORY_SLICE:-$DEFAULT_MEMORY_SLICE}"
+# Seconds between the heap profile's own samples.  Each census traverses
+# the whole heap, gigabytes over a slice of nixpkgs, so a short interval
+# would make the profiled pass mostly censuses.  The census the slice's end
+# requests comes in addition.
+HEAP_SAMPLE_SECONDS=10
+# The closure types the memory report lists, largest first.
+MEMORY_TOP_CLOSURE_TYPES=10
 # GHC's RTS exits with this status when the heap reaches its -M cap.
 EXIT_HEAP_OVERFLOW=251
 # The status bash gives a process SIGKILL ended (128 + 9), which is how the
@@ -108,258 +124,23 @@ EXIT_KILLED=137
 SCOREBOARD_TOP_FAILURES=10
 SCOREBOARD_SCRATCH=""
 SCOREBOARD_UPSTREAM_PID=""
+SCOREBOARD_UPSTREAM_VERSION=""
 SCOREBOARD_NOVA=()
+SCOREBOARD_UPSTREAM=()
 
 # ----------------------------------------------------------------
-# Helpers
+# Build
 # ----------------------------------------------------------------
 
-needs_profiling_build() {
-  # Returns 0 (true) if any flag requires a profiling build
-  for flag in "$@"; do
-    case "$flag" in
-      -hc|-hr|-hd|-hb|-p) return 0 ;;
-    esac
-  done
-  return 1
-}
-
+# Build the executable and, for the memory suite, the attrset benchmark.
+#   do_build <cabal target...>
 do_build() {
-  local mode="$1"  # "standard" or "profiling"
-  BUILD_MODE="$mode"
-  echo ""
-  echo "=== Building ($mode) ==="
-  # cabal doesn't relink the exe when switching between standard/profiling
-  # modes, so we must clean the exe build dir before switching.
-  if [[ "$mode" != "$LAST_BUILD_MODE" ]]; then
-    local exe_build_dir="$REPO_ROOT/dist-newstyle/build/x86_64-windows/ghc-*/nova-nix-*/x/nova-nix"
-    rm -rf $exe_build_dir 2>/dev/null || true
-  fi
-  LAST_BUILD_MODE="$mode"
-  if [[ "$mode" == "profiling" ]]; then
-    (cd "$REPO_ROOT" && cabal build --enable-profiling --ghc-options="-fprof-late")
-  else
-    (cd "$REPO_ROOT" && cabal build)
-  fi
-  echo "Build complete."
-}
-
-# Run the nova-nix executable via cabal run, which ensures the correct
-# build variant (standard vs profiling) is used.
-#   run_exe <args...>
-run_exe() {
-  if [[ "$BUILD_MODE" == "profiling" ]]; then
-    cabal run --enable-profiling nova-nix -- "$@"
-  else
-    cabal run nova-nix -- "$@"
-  fi
-}
-
-# Run a single profile pass.
-#   run_one_profile <output-dir> <rts-flag...>
-# Populates:
-#   <output-dir>/rts-stats.txt, summary.txt, heap-profile.hp, heap-top.txt,
-#   cost-centre.prof, eval-output.txt, meta.txt
-run_one_profile() {
-  local out_dir="$1"
-  shift
-  local rts_extra=("$@")
-
-  mkdir -p "$out_dir"
-
-  # Filter -M flags from extras; use our heap cap
-  local rts_filtered=()
-  for flag in "${rts_extra[@]+"${rts_extra[@]}"}"; do
-    if [[ "$flag" != -M* ]]; then
-      rts_filtered+=("$flag")
-    fi
-  done
-
-  local rts_flags=("-s" "$HEAP_CAP" "${rts_filtered[@]+"${rts_filtered[@]}"}")
-  echo "  RTS flags: ${rts_flags[*]}"
-  echo "  Build mode: $BUILD_MODE"
-  echo "  Output: $out_dir/"
-
-  # Record metadata
-  cat > "$out_dir/meta.txt" <<EOF
-label: $(basename "$out_dir")
-date: $(date -Iseconds)
-build_mode: $BUILD_MODE
-heap_cap: $HEAP_CAP
-rts_flags: ${rts_flags[*]}
-expr: $EVAL_EXPR
-nixpkgs: $NIXPKGS_PATH
-git_commit: $(cd "$REPO_ROOT" && git rev-parse --short HEAD)
-git_dirty: $(cd "$REPO_ROOT" && git diff --quiet && echo "no" || echo "yes")
-EOF
-
-  # Clean stale output files
-  local hp_cwd="$REPO_ROOT/nova-nix.hp"
-  local prof_cwd="$REPO_ROOT/nova-nix.prof"
-  rm -f "$hp_cwd" "$prof_cwd"
-
-  # Run via cabal run (ensures correct standard/profiling binary)
-  cd "$REPO_ROOT"
-  set +e
-  NIX_PATH="nixpkgs=$NIXPKGS_PATH" \
-    run_exe eval --expr "$EVAL_EXPR" \
-    +RTS "${rts_flags[@]}" -RTS \
-    > "$out_dir/eval-output.txt" \
-    2> "$out_dir/rts-stats.txt"
-  local exit_code=$?
-  set -e
-
-  echo "  Exit code: $exit_code"
-
-  # Move .hp file if generated
-  if [[ -f "$hp_cwd" ]]; then
-    mv "$hp_cwd" "$out_dir/heap-profile.hp"
-    echo "  Heap profile saved."
-    "$REPO_ROOT/profiling/parse-hp.sh" "$out_dir/heap-profile.hp" > "$out_dir/heap-top.txt"
-    echo "  Heap top 20 parsed."
-  fi
-
-  # Move .prof file if generated
-  if [[ -f "$prof_cwd" ]]; then
-    mv "$prof_cwd" "$out_dir/cost-centre.prof"
-    echo "  Cost-centre profile saved."
-  fi
-
-  # Parse key metrics from RTS stats
-  local stats_file="$out_dir/rts-stats.txt"
-  {
-    echo "=== Key Metrics ==="
-    echo ""
-
-    local alloc resid prod gc
-    alloc=$(grep -oP '[\d,]+\s+bytes allocated in the heap' "$stats_file" 2>/dev/null | head -1 || true)
-    echo "Allocated: $alloc"
-
-    resid=$(grep -oP '[\d,]+\s+bytes maximum residency' "$stats_file" 2>/dev/null | head -1 || true)
-    echo "Max residency: $resid"
-
-    prod=$(grep -oP 'Productivity\s+[\d.]+%' "$stats_file" 2>/dev/null | head -1 || true)
-    echo "$prod"
-
-    gc=$(grep -oP 'GC\s+time\s+[\d.]+s' "$stats_file" 2>/dev/null | head -1 || true)
-    echo "$gc"
-
-    echo "Exit code: $exit_code"
-
-    if [[ $exit_code -ne 0 ]]; then
-      echo ""
-      echo "=== Error output (last 5 lines) ==="
-      tail -5 "$stats_file"
-    fi
-  } > "$out_dir/summary.txt"
-}
-
-# Parse an RTS stats file for a specific metric, returning a human-readable value.
-#   parse_metric <stats-file> <metric>
-# Metrics: allocated, residency, productivity, gc_time
-parse_metric() {
-  local stats_file="$1"
-  local metric="$2"
-  case "$metric" in
-    allocated)
-      grep -oP '[\d,]+\s+bytes allocated in the heap' "$stats_file" 2>/dev/null | head -1 || true
-      ;;
-    residency)
-      grep -oP '[\d,]+\s+bytes maximum residency' "$stats_file" 2>/dev/null | head -1 || true
-      ;;
-    productivity)
-      grep -oP 'Productivity\s+[\d.]+%' "$stats_file" 2>/dev/null | head -1 || true
-      ;;
-    gc_time)
-      grep -oP 'GC\s+time\s+[\d.]+s' "$stats_file" 2>/dev/null | head -1 || true
-      ;;
-  esac
-}
-
-# Generate a combined report from --full sub-runs.
-#   generate_report <label-dir>
-# Expects subdirs: hT/, hc/, hr/
-generate_report() {
-  local label_dir="$1"
-  local report="$label_dir/report.txt"
-  local git_commit
-  git_commit=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
-
-  {
-    echo "=== nova-nix Profile Report: $(basename "$label_dir") ==="
-    echo "Git: $git_commit"
-    echo "Date: $(date -Iseconds)"
-    echo "Heap cap: $HEAP_CAP"
-    echo ""
-
-    # Use hc stats as the primary metrics source (profiling build, most detailed)
-    local primary_stats="$label_dir/hc/rts-stats.txt"
-    if [[ -f "$primary_stats" ]]; then
-      echo "--- Allocation & GC ---"
-      local val
-      val=$(parse_metric "$primary_stats" allocated)
-      echo "Total allocated: $val"
-      val=$(parse_metric "$primary_stats" residency)
-      echo "Max residency: $val"
-      val=$(parse_metric "$primary_stats" productivity)
-      echo "$val"
-      val=$(parse_metric "$primary_stats" gc_time)
-      echo "$val"
-      local ec
-      ec=$(grep -oP 'Exit code: \d+' "$label_dir/hc/summary.txt" 2>/dev/null | head -1 || echo "Exit code: ?")
-      echo "$ec"
-      echo ""
-    fi
-
-    # Type breakdown from -hT
-    if [[ -f "$label_dir/hT/heap-top.txt" ]]; then
-      echo "--- Type Breakdown (top 15, from -hT) ---"
-      head -15 "$label_dir/hT/heap-top.txt"
-      echo ""
-    fi
-
-    # Cost centre heap from -hc
-    if [[ -f "$label_dir/hc/heap-top.txt" ]]; then
-      echo "--- Cost Centre Heap (top 15, from -hc) ---"
-      head -15 "$label_dir/hc/heap-top.txt"
-      echo ""
-    fi
-
-    # Retainer from -hr
-    if [[ -f "$label_dir/hr/heap-top.txt" ]]; then
-      echo "--- Retainer (top 15, from -hr) ---"
-      head -15 "$label_dir/hr/heap-top.txt"
-      echo ""
-    fi
-
-    # Time/alloc profile from .prof file
-    local prof_file="$label_dir/hc/cost-centre.prof"
-    if [[ -f "$prof_file" ]]; then
-      echo "--- Time/Alloc Profile (top 20, from -p) ---"
-      # GHC .prof files have a cost-centre breakdown table.
-      # Extract lines that look like cost-centre entries (indented, with %time %alloc).
-      # The table starts after a header line containing "COST CENTRE" and a blank line.
-      awk '
-        /^[ \t]*COST CENTRE/ { header = 1; print; next }
-        header == 1 && /^[ \t]*$/ { next }
-        header == 1 && /^[-]+$/ { next }
-        header == 1 {
-          count++
-          if (count <= 20) print
-        }
-      ' "$prof_file"
-      echo ""
-    fi
-
-  } > "$report"
-
-  echo ""
-  echo "=== Combined Report ==="
-  cat "$report"
+  echo "=== Building $* ==="
+  (cd "$REPO_ROOT" && cabal build "$@")
 }
 
 # ----------------------------------------------------------------
-# Scoreboard
+# Walks
 # ----------------------------------------------------------------
 
 # The walk's reports in an evaluator's stderr, without the trace prefix.
@@ -370,8 +151,8 @@ scoreboard_reports() {
 }
 
 # Settled units, "KIND PATH ..." lines from the files named or stdin, as the
-# JSON object scoreboard.nix reads.  Neither a path nor a kind holds a
-# character JSON would escape.
+# JSON object walk.nix reads.  Neither a path nor a kind holds a character
+# JSON would escape.
 settled_json() {
   awk 'BEGIN { printf "{" }
     { printf "%s\"%s\":\"%s\"", (NR > 1 ? "," : ""), $2, $1 }
@@ -424,23 +205,26 @@ memory_exhaustion() {
   fi
 }
 
-# Walk the package set with one evaluator until every unit has settled,
-# starting a new process whenever one spends its budget or dies.  A process
-# that dies after a unit's begin report settles that unit as an error,
-# unless it ran out of memory (memory_exhaustion): a long process can run
-# out on a unit that fits in a fresh one, so the unit is retried once in a
-# fresh process and listed in retried.txt, and settles as <exhausted-kind>
-# only when the fresh process runs out on it too.  A process that runs out
-# between units is resumed when it settled any.
-#   walk_package_set <name> <out-dir> <budget> <exhausted-kind> <evaluator command...>
+# Walk the package set with one evaluator until every unit has settled, or
+# with a limit until that many have, starting a new process whenever one
+# spends its budget or dies.  A process that dies after a unit's begin
+# report settles that unit as an error, unless it ran out of memory
+# (memory_exhaustion): a long process can run out on a unit that fits in a
+# fresh one, so the unit is retried once in a fresh process and listed in
+# retried.txt, and settles as <exhausted-kind> only when the fresh process
+# runs out on it too.  A process that runs out between units is resumed
+# when it settled any.  Each process resumes where the last stopped, so the
+# units settled are always the first ones of the walk, and a process under
+# a limit gets no more budget than the limit leaves.
+#   walk_package_set <name> <out-dir> <budget> <limit-or-empty> <exhausted-kind> <evaluator command...>
 # The walk file follows the command's own arguments.  Returns 1 when the
-# walk stopped before settling every unit.
+# walk stopped before settling every unit, or the limit's worth.
 walk_package_set() {
-  local name="$1" out_dir="$2" budget="$3" exhausted_kind="$4"
-  shift 4
+  local name="$1" out_dir="$2" budget="$3" limit="$4" exhausted_kind="$5"
+  shift 5
   local settled="$out_dir/settled.txt"
   local run=0 started=$SECONDS complete=false retried=""
-  local base status before last culprit reply outcome stop kills_before exhausted message
+  local base status before last culprit reply outcome stop kills_before exhausted message process_budget
   mkdir -p "$out_dir/runs"
   : > "$settled"
   : > "$out_dir/errors.txt"
@@ -452,9 +236,13 @@ walk_package_set() {
     run=$((run + 1))
     base="$out_dir/runs/$run"
     settled_json "$settled" > "$out_dir/settled.json"
+    process_budget=$budget
+    if [[ -n "$limit" && $((limit - $(wc -l < "$settled"))) -lt $process_budget ]]; then
+      process_budget=$((limit - $(wc -l < "$settled")))
+    fi
     kills_before=$(cgroup_oom_kills)
     status=0
-    SCOREBOARD_SETTLED="$out_dir/settled.json" SCOREBOARD_BUDGET="$budget" \
+    SCOREBOARD_SETTLED="$out_dir/settled.json" SCOREBOARD_BUDGET="$process_budget" \
       "$@" "$SCOREBOARD_WALK" < /dev/null > "$base.out" 2> "$base.err" || status=$?
     exhausted=$(memory_exhaustion "$status" "$kills_before")
     scoreboard_reports "$base.err" > "$base.reports"
@@ -503,6 +291,9 @@ walk_package_set() {
         outcome=", error at $culprit"
       fi
     fi
+    if [[ -z "$stop" && -n "$limit" && $(($(wc -l < "$settled"))) -ge $limit ]]; then
+      complete=true
+    fi
     echo "$name: process $run exited $status, $(($(wc -l < "$settled") - before)) settled," \
       "$(($(wc -l < "$settled"))) in all, $((SECONDS - started)) s$outcome"
     if [[ -n "$stop" ]]; then
@@ -517,21 +308,43 @@ walk_package_set() {
   [[ "$complete" == true ]]
 }
 
-# Force every attribute the nova-nix walk evaluated, in one process under
-# +RTS -s and the heap cap: the walk again, with every other unit settled.
-# Inside a cgroup it also records the cgroup's memory.max and the OOM kills
-# during the pass, which it can count only because a kill ends the
-# evaluator and leaves this script running (systemd's OOMPolicy=continue).
-#   resource_pass <walk-dir> <out-dir> <nova-nix command...>
-resource_pass() {
-  local walk_dir="$1" out_dir="$2"
-  shift 2
+# Walk with nova-nix and, with nix-instantiate on PATH, with upstream in
+# the background beside it, into <out-dir>/nova-nix and <out-dir>/upstream:
+# the two are separate processes reading the same tree.
+#   walk_both <out-dir> <limit-or-empty>
+# Returns 1 when either walk stopped early.
+walk_both() {
+  local out="$1" limit="$2" complete=true
+  if [[ ${#SCOREBOARD_UPSTREAM[@]} -gt 0 ]]; then
+    {
+      trap 'exit 143' TERM
+      walk_package_set upstream "$out/upstream" "$UPSTREAM_BUDGET" "$limit" unmeasured "${SCOREBOARD_UPSTREAM[@]}"
+    } &
+    SCOREBOARD_UPSTREAM_PID=$!
+  fi
+  walk_package_set nova-nix "$out/nova-nix" "$NOVA_BUDGET" "$limit" error "${SCOREBOARD_NOVA[@]}" \
+    --store "$SCOREBOARD_SCRATCH/walk-store" +RTS "$HEAP_CAP" -RTS || complete=false
+  if [[ -n "$SCOREBOARD_UPSTREAM_PID" ]]; then
+    wait "$SCOREBOARD_UPSTREAM_PID" || complete=false
+    SCOREBOARD_UPSTREAM_PID=""
+  fi
+  [[ "$complete" == true ]]
+}
+
+# One evaluator process over a walk, measured: the units it visited and
+# the drvPaths it evaluated, its exit status, wall time and OS peak RSS,
+# and inside a cgroup the cgroup's memory.max and the OOM kills during the
+# pass, which it can count only because a kill ends the evaluator and
+# leaves this script running (systemd's OOMPolicy=continue).
+#   measured_pass <out-dir> <settled-json> <budget-or-empty> <walk-file> <evaluator command...>
+measured_pass() {
+  local out_dir="$1" settled="$2" budget="$3" walk="$4"
+  shift 4
   local started=$SECONDS status=0 cgroup kills_before
   local timer=()
   mkdir -p "$out_dir"
-  awk '$1 != "drv"' "$walk_dir/results.txt" | settled_json > "$out_dir/settled.json"
   case "$(uname -s)" in
-    Linux) timer=(/usr/bin/time -f %M -o "$out_dir/peak-rss.txt") ;;
+    Linux) timer=(/usr/bin/time -f '%M %e' -o "$out_dir/peak-rss.txt") ;;
     Darwin) timer=(/usr/bin/time -l -o "$out_dir/peak-rss.txt") ;;
   esac
   cgroup=$(own_cgroup)
@@ -539,19 +352,37 @@ resource_pass() {
     cat "$cgroup/memory.max" > "$out_dir/memory-max.txt"
   fi
   kills_before=$(cgroup_oom_kills)
-  SCOREBOARD_SETTLED="$out_dir/settled.json" SCOREBOARD_BUDGET="" \
-    ${timer[@]+"${timer[@]}"} "$@" +RTS -s"$out_dir/rts-stats.txt" "$HEAP_CAP" -RTS "$SCOREBOARD_WALK" \
-    < /dev/null > "$out_dir/out" 2> "$out_dir/err" || status=$?
+  SCOREBOARD_SETTLED="$settled" SCOREBOARD_BUDGET="$budget" \
+    ${timer[@]+"${timer[@]}"} "$@" "$walk" < /dev/null > "$out_dir/out" 2> "$out_dir/err" || status=$?
   if [[ -n "$kills_before" ]]; then
     echo $(($(cgroup_oom_kills) - kills_before)) > "$out_dir/oom-kills.txt"
   fi
-  scoreboard_reports "$out_dir/err" | awk '$1 == "drv"' > "$out_dir/evaluated.txt"
+  scoreboard_reports "$out_dir/err" > "$out_dir/reports.txt"
+  awk '$1 == "begin" { print $2 }' "$out_dir/reports.txt" > "$out_dir/visited.txt"
+  awk '$1 == "drv"' "$out_dir/reports.txt" > "$out_dir/evaluated.txt"
   echo "$status" > "$out_dir/exit.txt"
   echo $((SECONDS - started)) > "$out_dir/seconds.txt"
-  echo "resources: one process forced $(($(wc -l < "$out_dir/evaluated.txt"))) attributes, exit $status, $((SECONDS - started)) s"
 }
 
-# The OS peak RSS of the resource pass in MiB, from GNU time's %M (KiB) on
+# Force every attribute the nova-nix walk evaluated, in one process under
+# +RTS -s and the heap cap: the walk again, with every other unit settled.
+#   resource_pass <walk-dir> <out-dir> <nova-nix command...>
+resource_pass() {
+  local walk_dir="$1" out_dir="$2"
+  shift 2
+  mkdir -p "$out_dir"
+  awk '$1 != "drv"' "$walk_dir/results.txt" | settled_json > "$out_dir/settled.json"
+  measured_pass "$out_dir" "$out_dir/settled.json" "" "$SCOREBOARD_WALK" \
+    "$@" +RTS -s"$out_dir/rts-stats.txt" "$HEAP_CAP" -RTS
+  echo "resources: one process forced $(($(wc -l < "$out_dir/evaluated.txt"))) attributes," \
+    "exit $(cat "$out_dir/exit.txt"), $(cat "$out_dir/seconds.txt") s"
+}
+
+# ----------------------------------------------------------------
+# Figures
+# ----------------------------------------------------------------
+
+# The OS peak RSS of a measured pass in MiB, from GNU time's %M (KiB) on
 # Linux or BSD time's rusage listing (bytes) on macOS; nothing elsewhere.
 peak_rss_mib() {
   [[ -s "$1" ]] || return 0
@@ -561,13 +392,30 @@ peak_rss_mib() {
   esac
 }
 
-# A figure from a +RTS -s report: residency in MiB, or productivity.
-#   rts_figure <stats-file> residency|productivity
+# The wall time of a measured pass in seconds, from GNU time's %e or BSD
+# time's "real"; nothing elsewhere.
+pass_seconds() {
+  [[ -s "$1" ]] || return 0
+  case "$(uname -s)" in
+    Linux) awk 'END { if ($2 ~ /^[0-9.]+$/) print $2 }' "$1" ;;
+    Darwin) awk '$2 == "real" { print $1 }' "$1" ;;
+  esac
+}
+
+# A figure from a +RTS -s report: residency in MiB, productivity, or the
+# GC's or the whole run's CPU and elapsed seconds ("CPU ELAPSED").
+#   rts_figure <stats-file> residency|productivity|gc|total
 rts_figure() {
   [[ -s "$1" ]] || return 0
   case "$2" in
     residency) awk '/bytes maximum residency/ { gsub(",", "", $1); printf "%.1f\n", $1 / 1048576 }' "$1" ;;
     productivity) awk '$1 == "Productivity" { print $2 }' "$1" ;;
+    gc | total)
+      awk -v phase="$([[ "$2" == gc ]] && echo GC || echo Total)" \
+        '$1 == phase && $2 == "time" {
+          cpu = $3; elapsed = ($4 == "(") ? $5 : $4
+          gsub(/[(s]/, "", cpu); gsub(/[(s]/, "", elapsed); print cpu, elapsed }' "$1"
+      ;;
   esac
 }
 
@@ -602,14 +450,16 @@ write_differences() {
     }' "$1" "$2" | LC_ALL=C sort
 }
 
-# One row of the scoreboard's table: a label and a figure per walk.
-#   scoreboard_row <label> <nova-nix> [<upstream>]
+# One row of a table: a label and a figure per column.
+#   scoreboard_row <label> <figure...>
 scoreboard_row() {
-  if [[ $# -eq 3 ]]; then
-    printf '| %s | %s | %s |\n' "$1" "$2" "$3"
-  else
-    printf '| %s | %s |\n' "$1" "$2"
-  fi
+  local row="| $1 |"
+  shift
+  local figure
+  for figure in "$@"; do
+    row+=" $figure |"
+  done
+  echo "$row"
 }
 
 # A figure with its unit, or the words that say why there is none.
@@ -622,13 +472,31 @@ figure_or() {
   fi
 }
 
+# A process's exit status as a row's figure: the status and why it ended
+# when it did not end well.
+#   exit_figure <pass-dir> <stderr-file>
+exit_figure() {
+  local pass="$1" status kills=0
+  [[ -s "$pass/exit.txt" ]] || { echo "did not run"; return 0; }
+  status=$(cat "$pass/exit.txt")
+  [[ -s "$pass/oom-kills.txt" ]] && kills=$(cat "$pass/oom-kills.txt")
+  if [[ $kills -gt 0 ]]; then
+    echo "$status, ended by the kernel's OOM killer (memory.events counted $kills)"
+  elif [[ $status -eq $EXIT_HEAP_OVERFLOW ]]; then
+    echo "$status, the heap reached its cap"
+  elif [[ $status -ne 0 ]]; then
+    echo "$status, $(last_error_line "$2" | sed 's/|/\\|/g')"
+  else
+    echo "0"
+  fi
+}
+
 # The resource pass's figures as Markdown.  A pass the OOM killer ended
 # has no +RTS -s report, which the RTS writes only on its way out.
 #   write_resources <resources-dir> <attributes-the-walk-evaluated>
 write_resources() {
-  local resources="$1" evaluated="$2" figure pass_status bound="" kills=0
+  local resources="$1" evaluated="$2" figure bound=""
   [[ -s "$resources/memory-max.txt" ]] && bound=$(cat "$resources/memory-max.txt")
-  [[ -s "$resources/oom-kills.txt" ]] && kills=$(cat "$resources/oom-kills.txt")
   echo "## nova-nix resource pass: $LABEL"
   echo
   echo "One nova-nix process forcing the $evaluated attributes that evaluate, under +RTS $HEAP_CAP:"
@@ -639,16 +507,7 @@ write_resources() {
   if [[ "$bound" =~ ^[0-9]+$ ]]; then
     scoreboard_row "memory bound" "$(awk -v bytes="$bound" 'BEGIN { printf "%.1f", bytes / 1048576 }') MiB, the memory.max of its cgroup"
   fi
-  pass_status=$(cat "$resources/exit.txt")
-  if [[ $kills -gt 0 ]]; then
-    scoreboard_row "exit status" "$pass_status, ended by the kernel's OOM killer (memory.events counted $kills)"
-  elif [[ $pass_status -eq $EXIT_HEAP_OVERFLOW ]]; then
-    scoreboard_row "exit status" "$pass_status, the heap reached its cap"
-  elif [[ $pass_status -ne 0 ]]; then
-    scoreboard_row "exit status" "$pass_status, $(last_error_line "$resources/err" | sed 's/|/\\|/g')"
-  else
-    scoreboard_row "exit status" "0"
-  fi
+  scoreboard_row "exit status" "$(exit_figure "$resources" "$resources/err")"
   figure=$(rts_figure "$resources/rts-stats.txt" residency)
   scoreboard_row "max residency" "$(figure_or "$figure" MiB "not reported")"
   figure=$(rts_figure "$resources/rts-stats.txt" productivity)
@@ -659,9 +518,7 @@ write_resources() {
 }
 
 # The scoreboard as Markdown, which a job summary renders as it stands.
-#   write_scoreboard <upstream-version-or-empty>
 write_scoreboard() {
-  local upstream_version="$1"
   local dir="$RESULTS_DIR" walk
   local nova="$dir/nova-nix/results.txt" upstream="$dir/upstream/results.txt"
   local evaluated
@@ -670,8 +527,8 @@ write_scoreboard() {
   echo "## nova-nix scoreboard: $LABEL"
   echo
   echo "nixpkgs \`$NIXPKGS_PATH\`: the attributes \`nix-env -qa\` visits in its top-level set for x86_64-linux."
-  if [[ -n "$upstream_version" ]]; then
-    echo "Reference: $upstream_version, walking the same tree."
+  if [[ -n "$SCOREBOARD_UPSTREAM_VERSION" ]]; then
+    echo "Reference: $SCOREBOARD_UPSTREAM_VERSION, walking the same tree."
     both=("upstream")
   else
     echo "No nix-instantiate on PATH, so nothing is compared with upstream."
@@ -685,7 +542,7 @@ write_scoreboard() {
   done
   echo
   scoreboard_row "Attributes" "nova-nix" ${both[@]+"${both[@]}"}
-  if [[ -n "$upstream_version" ]]; then
+  if [[ -n "$SCOREBOARD_UPSTREAM_VERSION" ]]; then
     scoreboard_row ":--" "--:" "--:"
     scoreboard_row "visited" "$(($(wc -l < "$nova")))" "$(($(wc -l < "$upstream")))"
     scoreboard_row "**evaluate** (produce a drvPath)" "**$evaluated**" "$(count_kind "$upstream" drv)"
@@ -722,8 +579,252 @@ write_scoreboard() {
   fi
 }
 
-# End the scoreboard on an interrupt.  The evaluator in the foreground takes
-# a Ctrl-C itself and exits normally (nova-nix reports it and exits 1), after
+# ----------------------------------------------------------------
+# Memory figures
+# ----------------------------------------------------------------
+
+# The units of a slice a pass over it begins: every unit the slice's walk
+# settled, but for each unit the pass passes over (walk.nix's settled
+# input), that unit and every unit under it.  The first file is told from
+# the second by name, which holds when it is empty too.
+#   pass_budget <passed-over-units> <slice-units>
+pass_budget() {
+  awk 'FILENAME == ARGV[1] { over[$2] = 1; next }
+    {
+      parts = split($2, part, ".")
+      path = ""
+      begun = 1
+      for (i = 1; i <= parts; i++) {
+        path = (i == 1) ? part[1] : path "." part[i]
+        if (path in over) { begun = 0; break }
+      }
+      n += begun
+    }
+    END { print n + 0 }' "$1" "$2"
+}
+
+# A value of a census or a benchmark run: the rest of its "NAME VALUE"
+# line, or nothing.
+#   named_value <file> <name>
+named_value() {
+  [[ -s "$1" ]] || return 0
+  awk -v name="$2" '$1 == name { $1 = ""; sub(/^ /, ""); print; exit }' "$1"
+}
+
+# A field of upstream's NIX_SHOW_STATS report, or nothing.
+#   upstream_stat <nix-stats-json> <jq-path>
+upstream_stat() {
+  [[ -s "$1" ]] && command -v jq > /dev/null 2>&1 || return 0
+  jq -r "($2) // empty" "$1"
+}
+
+# Bytes as MiB, to one decimal, or nothing for no bytes.
+mib() {
+  [[ -n "$1" ]] || return 0
+  awk -v bytes="$1" 'BEGIN { printf "%.1f MiB", bytes / 1048576 }'
+}
+
+# Seconds as milliseconds, to one decimal, or nothing.
+ms() {
+  [[ -n "$1" ]] || return 0
+  awk -v s="$1" 'BEGIN { printf "%.1f ms", s * 1000 }'
+}
+
+# "N objects, X MiB", or "X MiB" without a count; nothing without bytes.
+#   objects_figure <count-or-empty> <bytes-or-empty> <noun>
+objects_figure() {
+  [[ -n "$2" ]] || return 0
+  if [[ -n "$1" ]]; then
+    echo "$1 $3, $(mib "$2")"
+  else
+    mib "$2"
+  fi
+}
+
+# How much of an allocated figure is not reached, in percent of the bytes.
+#   unreached_figure <allocated-bytes> <reached-bytes> <reached-count> <noun>
+unreached_figure() {
+  [[ -n "$1" && -n "$2" ]] || return 0
+  awk -v allocated="$1" -v reached="$2" -v count="$3" -v noun="$4" 'BEGIN {
+    share = allocated > 0 ? 100 * (allocated - reached) / allocated : 0
+    printf "%.1f%% of the bytes; reached: %s %s, %.1f MiB", share, count, noun, reached / 1048576 }'
+}
+
+# A heap profile's last sample, which the census at the slice's end
+# requested, beside the sample with the most bytes: their totals as
+# "END<TAB>PEAK", or each closure type of the last sample as
+# "TYPE<TAB>END<TAB>PEAK", largest at the end first.
+#   heap_figures <hp-file> totals|types
+heap_figures() {
+  [[ -s "$1" ]] || return 0
+  awk -F '\t' -v what="$2" '
+    /^BEGIN_SAMPLE/ { split("", current); total = 0; next }
+    /^END_SAMPLE/ {
+      if (total > 0) { split("", last); for (t in current) last[t] = current[t]; last_total = total }
+      if (total > peak_total) { split("", peak); for (t in current) peak[t] = current[t]; peak_total = total }
+      next
+    }
+    NF == 2 { current[$1] = $2; total += $2 }
+    END {
+      if (what == "totals") printf "%d\t%d\n", last_total, peak_total
+      else for (t in last) printf "%s\t%d\t%d\n", t, last[t], (t in peak) ? peak[t] : 0
+    }' "$1" | LC_ALL=C sort -t "$(printf '\t')" -k2,2nr
+}
+
+# The memory suite's figures as Markdown: one table, nova-nix beside
+# upstream where upstream reports the same thing.
+write_memory() {
+  local dir="$RESULTS_DIR/memory"
+  local census="$dir/census/census.txt" stats="$dir/upstream/nix-stats.json"
+  local figure peak theirs kind noun bound="" shared="" upstream_column="upstream"
+  local allocated_count allocated_bytes reached_count reached_bytes total_allocated=0 total_reached=0
+  local gc_figure objects mark_seconds index_seconds
+  [[ -s "$dir/nova-nix/memory-max.txt" ]] && bound=$(cat "$dir/nova-nix/memory-max.txt")
+  if [[ -s "$dir/upstream/visited.txt" ]]; then
+    upstream_column="upstream: $SCOREBOARD_UPSTREAM_VERSION"
+    shared=$(LC_ALL=C comm -12 <(LC_ALL=C sort "$dir/nova-nix/visited.txt") <(LC_ALL=C sort "$dir/upstream/visited.txt") | wc -l)
+  fi
+  echo "## nova-nix memory: $LABEL"
+  echo
+  echo "One process of each evaluator over the first $MEMORY_SLICE attributes of the scoreboard's walk of" \
+    "\`$NIXPKGS_PATH\`, passing over the $(($(wc -l < "$dir/settled.txt"))) that end a process in either" \
+    "evaluator or ran out of memory in one.  nova-nix runs under +RTS $HEAP_CAP; its census is taken when the slice ends, with the package" \
+    "set still held, from the result, the root environment, the import cache and the search path."
+  if [[ ! -s "$dir/upstream/visited.txt" ]]; then
+    echo "No upstream pass ran, so its column is empty."
+  fi
+  echo
+  scoreboard_row "Figure" "nova-nix" "$upstream_column"
+  scoreboard_row ":--" "--:" "--:"
+  scoreboard_row "attributes the pass visited" "$(($(wc -l < "$dir/nova-nix/visited.txt")))" \
+    "$( [[ -s "$dir/upstream/visited.txt" ]] && echo "$(($(wc -l < "$dir/upstream/visited.txt"))), $shared of them both" )"
+  scoreboard_row "of them evaluating to a drvPath" "$(($(wc -l < "$dir/nova-nix/evaluated.txt")))" \
+    "$( [[ -s "$dir/upstream/evaluated.txt" ]] && echo "$(($(wc -l < "$dir/upstream/evaluated.txt")))" )"
+  if [[ "$bound" =~ ^[0-9]+$ ]]; then
+    scoreboard_row "memory bound" "$(mib "$bound"), the memory.max of the cgroup" ""
+  fi
+  scoreboard_row "exit status" "$(exit_figure "$dir/nova-nix" "$dir/nova-nix/err")" \
+    "$( [[ -d "$dir/upstream" ]] && exit_figure "$dir/upstream" "$dir/upstream/err" )"
+  scoreboard_row "wall time" "$(figure_or "$(pass_seconds "$dir/nova-nix/peak-rss.txt")" s "not measured")" \
+    "$(figure_or "$(pass_seconds "$dir/upstream/peak-rss.txt")" s "")"
+  scoreboard_row "OS peak RSS" "$(figure_or "$(peak_rss_mib "$dir/nova-nix/peak-rss.txt")" MiB "not measured")" \
+    "$(figure_or "$(peak_rss_mib "$dir/upstream/peak-rss.txt")" MiB "")"
+  figure=$(rts_figure "$dir/nova-nix/rts-stats.txt" total)
+  scoreboard_row "CPU time" "$(figure_or "${figure% *}" s "not reported")" \
+    "$(figure_or "$(upstream_stat "$stats" .time.cpu)" s "")"
+  figure=$(rts_figure "$dir/nova-nix/rts-stats.txt" gc)
+  gc_figure=""
+  [[ -n "$figure" ]] && gc_figure="${figure#* } s elapsed, ${figure% *} s CPU"
+  theirs=$(upstream_stat "$stats" '.time.gc // .time.gcNonIncremental')
+  scoreboard_row "GC time" "${gc_figure:-not reported}" "$(figure_or "$theirs" "s in full collections" "")"
+  scoreboard_row "GHC productivity" "$(rts_figure "$dir/nova-nix/rts-stats.txt" productivity)" ""
+  scoreboard_row "GHC max residency" "$(figure_or "$(rts_figure "$dir/nova-nix/rts-stats.txt" residency)" MiB "not reported")" ""
+  theirs=$(upstream_stat "$stats" .gc.heapSize)
+  if [[ -s "$dir/census/heap.hp" ]]; then
+    heap_figures "$dir/census/heap.hp" types > "$dir/census/heap-types.tsv"
+    IFS=$'\t' read -r figure peak < <(heap_figures "$dir/census/heap.hp" totals)
+    scoreboard_row "GHC heap when the slice ends, by -hT (peak sample)" "$(mib "$figure") ($(mib "$peak"))" \
+      "$(figure_or "$(mib "$theirs")" "Boehm heap" "")"
+    head -n "$MEMORY_TOP_CLOSURE_TYPES" "$dir/census/heap-types.tsv" \
+      | while IFS=$'\t' read -r kind figure peak; do
+        scoreboard_row "GHC heap: \`${kind//|/\\|}\`" "$(mib "$figure") ($(mib "$peak"))" ""
+      done
+  else
+    scoreboard_row "GHC heap when the slice ends, by -hT" "not measured" "$(figure_or "$(mib "$theirs")" "Boehm heap" "")"
+  fi
+  if [[ -s "$census" ]]; then
+    for kind in thunks envs attrsets lists lambdas ctxstrs symbols; do
+      allocated_count=$(named_value "$census" "$kind.allocated.count")
+      allocated_bytes=$(named_value "$census" "$kind.allocated.bytes")
+      reached_count=$(named_value "$census" "$kind.reached.count")
+      reached_bytes=$(named_value "$census" "$kind.reached.bytes")
+      total_allocated=$((total_allocated + allocated_bytes))
+      total_reached=$((total_reached + reached_bytes))
+      case "$kind" in
+        thunks) noun="thunk cells"; theirs=$(objects_figure "$(upstream_stat "$stats" .values.number)" "$(upstream_stat "$stats" .values.bytes)" values) ;;
+        envs) noun="environments"; theirs=$(objects_figure "$(upstream_stat "$stats" .envs.number)" "$(upstream_stat "$stats" .envs.bytes)" envs) ;;
+        attrsets) noun="attribute sets"; theirs=$(objects_figure "$(upstream_stat "$stats" .sets.number)" "$(upstream_stat "$stats" .sets.bytes)" sets) ;;
+        lists) noun="list headers"; theirs=$(objects_figure "$(upstream_stat "$stats" .list.elements)" "$(upstream_stat "$stats" .list.bytes)" elements) ;;
+        lambdas) noun="lambdas"; theirs="" ;;
+        ctxstrs) noun="strings with context"; theirs="" ;;
+        symbols) noun="symbols"; theirs=$(objects_figure "$(upstream_stat "$stats" .symbols.number)" "$(upstream_stat "$stats" .symbols.bytes)" symbols) ;;
+      esac
+      scoreboard_row "C $noun: allocated" "$(objects_figure "$allocated_count" "$allocated_bytes" "$noun")" "$theirs"
+      scoreboard_row "C $noun: no root reaches" "$(unreached_figure "$allocated_bytes" "$reached_bytes" "$reached_count" "$noun")" ""
+    done
+    scoreboard_row "C StablePtrs the thunks hold" \
+      "$(named_value "$census" stableptrs.held), $(named_value "$census" stableptrs.reached) reached" ""
+    scoreboard_row "C allocator overhead (headers, unused tails, tracking arrays, symbol tables)" \
+      "$(mib "$(named_value "$census" overhead.bytes)")" ""
+    scoreboard_row "C bytecode" "$(mib "$(named_value "$census" code.bytes)")" \
+      "$(figure_or "$(upstream_stat "$stats" .nrExprs)" expressions "")"
+    scoreboard_row "C objects, all kinds: allocated" "$(mib "$total_allocated")" \
+      "$(figure_or "$(mib "$(upstream_stat "$stats" .gc.totalBytes)")" "allocated by the GC in all" "")"
+    scoreboard_row "**C objects, all kinds: no root reaches (M1)**" \
+      "**$(unreached_figure "$total_allocated" "$total_reached" "" "" | sed 's/; reached:.*//')**" ""
+    objects=$(named_value "$census" mark.objects)
+    mark_seconds=$(named_value "$census" mark.seconds)
+    index_seconds=$(named_value "$census" mark.index-seconds)
+    scoreboard_row "census mark: objects it entered" "$objects objects, $(mib "$(named_value "$census" mark.bytes)")" ""
+    scoreboard_row "census mark: wall time" "$mark_seconds s, after $index_seconds s counting and indexing" ""
+    scoreboard_row "census mark: seconds per million objects" \
+      "$(awk -v s="$mark_seconds" -v n="$objects" 'BEGIN { if (n > 0) printf "%.3f s", s / (n / 1000000) }')" ""
+    scoreboard_row "census mark: pointers it could not place" "$(named_value "$census" mark.unplaced)" ""
+  else
+    scoreboard_row "C census" "not taken: $(exit_figure "$dir/census" "$dir/census/err")" ""
+  fi
+  write_attrset_rows "$dir/attrset" "$census"
+}
+
+# The attrset benchmark's rows of the memory table.  Bytes per entry are
+# the copying run's: under the non-moving collector GHC reports an estimate
+# for its heap.  A non-moving collection here marks inside its pause, where
+# a running program would mark beside it.  The census's figure for the
+# reached sets is the bytes they asked the allocator for, spare room
+# included; the benchmark's is what the allocator holds for sets with none,
+# its own overhead included.
+#   write_attrset_rows <attrset-dir> <census-file>
+write_attrset_rows() {
+  local dir="$1" census="$2" representation collector run name figure bytes
+  if [[ ! -s "$dir/c-copying.txt" ]]; then
+    scoreboard_row "attribute set benchmark" "not run" ""
+    return 0
+  fi
+  scoreboard_row "attribute set benchmark: sets built" \
+    "$(named_value "$dir/c-copying.txt" sets) sets, $(named_value "$dir/c-copying.txt" entries) entries: the census's reached sets" ""
+  scoreboard_row "C sets the census reached: bytes asked for per entry, spare room included" \
+    "$(awk -v bytes="$(named_value "$census" attrsets.reached.bytes)" '{ entries += $1 * $2 }
+      END { if (entries > 0) printf "%.1f", bytes / entries }' "$dir/sizes.txt")" ""
+  for representation in c flat; do
+    case "$representation" in
+      c)
+        name="C sets"
+        bytes="bytes per entry the allocator holds, no spare room"
+        ;;
+      flat)
+        name="GHC-heap sets (SmallArray values, PrimArray keys)"
+        bytes="bytes per entry live in GHC's heap"
+        ;;
+    esac
+    figure=$(named_value "$dir/$representation-copying.txt" bytes-per-entry)
+    scoreboard_row "$name: $bytes" "$(awk -v b="$figure" 'BEGIN { if (b ~ /^[0-9.]+$/) printf "%.1f", b; else print b }')" ""
+    for collector in copying nonmoving; do
+      run="$dir/$representation-$collector.txt"
+      figure="$(ms "$(named_value "$run" gc-pause-seconds)"), $(ms "$(named_value "$run" gc-cpu-seconds)") CPU"
+      if [[ "$collector" == nonmoving ]]; then
+        figure+=", $(ms "$(named_value "$run" mark-seconds)") of it marking"
+      fi
+      scoreboard_row "$name: a major GC under the $(named_value "$run" collector) collector" "$figure" ""
+    done
+  done
+}
+
+# ----------------------------------------------------------------
+# Setup
+# ----------------------------------------------------------------
+
+# End a run on an interrupt.  The evaluator in the foreground takes a
+# Ctrl-C itself and exits normally (nova-nix reports it and exits 1), after
 # which bash would start the walk's next process, and the background walk
 # ignores SIGINT as every asynchronous command of a script does.  The
 # background walk's TERM trap waits for its evaluator, which pkill ends.
@@ -733,26 +834,35 @@ interrupt_scoreboard() {
     kill -TERM "$SCOREBOARD_UPSTREAM_PID" 2> /dev/null || true
     pkill -TERM -P "$SCOREBOARD_UPSTREAM_PID" 2> /dev/null || true
   fi
-  echo "the scoreboard was interrupted" >&2
+  echo "the run was interrupted" >&2
   exit 130
 }
 
-# Remove the scoreboard's scratch directory.  The stores in it keep each
-# path in the read-only modes a store gives every path it adds, as
-# upstream's does, so the tree is made writable before it is removed.
+# Remove the scratch directory.  The stores in it keep each path in the
+# read-only modes a store gives every path it adds, as upstream's does, so
+# the tree is made writable before it is removed.
 remove_scoreboard_scratch() {
   chmod -R u+w "${SCOREBOARD_SCRATCH:?}"
   rm -rf "${SCOREBOARD_SCRATCH:?}"
 }
 
 # Check the label and the budget, find the nova-nix build, and set up what
-# both scoreboard modes share: a scratch directory removed on exit, the
-# interrupt handling, a fresh cache, and SCOREBOARD_NOVA, the nova-nix
-# command every evaluation starts from.
+# every mode shares: a scratch directory removed on exit, the interrupt
+# handling, a fresh cache, SCOREBOARD_NOVA, the nova-nix command every
+# evaluation starts from, and, with nix-instantiate on PATH,
+# SCOREBOARD_UPSTREAM and SCOREBOARD_UPSTREAM_VERSION.
+#
+# Upstream evaluates with --read-write-mode because --eval alone implies
+# read-only mode, in which a drvPath with deep context cannot be computed
+# (the parity job's drvpath-cases.sh says why); import from derivation is
+# off, as nixpkgs' own CI evaluates the set, so that neither evaluator
+# builds during a walk.  An attribute on which a fresh upstream process
+# runs out of memory too is unmeasured, not failed: the reference running
+# out says nothing about the attribute.
 scoreboard_prepare() {
   local nova_bin
   if [[ ! "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-    echo "a scoreboard label is letters, digits, dots, dashes and underscores" >&2
+    echo "a label is letters, digits, dots, dashes and underscores" >&2
     return 2
   fi
   if [[ ! "$UPSTREAM_BUDGET" =~ ^[1-9][0-9]*$ || ! "$NOVA_BUDGET" =~ ^[1-9][0-9]*$ ]]; then
@@ -771,44 +881,30 @@ scoreboard_prepare() {
   # a fetch and never a hit an earlier run left.
   export XDG_CACHE_HOME="$SCOREBOARD_SCRATCH/cache"
   SCOREBOARD_NOVA=("$nova_bin" eval --nix-path "nixpkgs=$NIXPKGS_PATH" --nix-path "nix=$REPO_ROOT/data/nix")
+  if command -v nix-instantiate > /dev/null 2>&1; then
+    SCOREBOARD_UPSTREAM_VERSION=$(nix-instantiate --version)
+    SCOREBOARD_UPSTREAM=(nix-instantiate --eval --read-write-mode
+      --option allow-import-from-derivation false -I "nixpkgs=$NIXPKGS_PATH")
+  fi
 }
+
+# ----------------------------------------------------------------
+# Modes
+# ----------------------------------------------------------------
 
 # The scoreboard: nova-nix's walk and, with nix-instantiate on PATH,
 # upstream's beside it.  Returns 1 when either walk stopped early.
 run_scoreboard() {
-  local upstream_version="" walks_complete=true
-  local upstream=()
+  local walks_complete=true
   scoreboard_prepare || return
   rm -rf "${RESULTS_DIR:?}/nova-nix" "${RESULTS_DIR:?}/upstream" "${RESULTS_DIR:?}/resources"
   mkdir -p "$RESULTS_DIR"
-
-  # Upstream walks beside nova-nix: the two are separate processes reading
-  # the same tree.  --read-write-mode because --eval alone implies read-only
-  # mode, in which a drvPath with deep context cannot be computed (the
-  # parity job's drvpath-cases.sh says why); import from derivation is off,
-  # as nixpkgs' own CI evaluates the set, so that neither evaluator builds
-  # during the walk.  An attribute on which a fresh upstream process runs
-  # out of memory too is unmeasured, not failed: the reference running out
-  # says nothing about the attribute.
-  if command -v nix-instantiate > /dev/null 2>&1; then
-    upstream_version=$(nix-instantiate --version)
-    upstream=(nix-instantiate --eval --read-write-mode
-      --option allow-import-from-derivation false -I "nixpkgs=$NIXPKGS_PATH")
-    {
-      trap 'exit 143' TERM
-      walk_package_set upstream "$RESULTS_DIR/upstream" "$UPSTREAM_BUDGET" unmeasured "${upstream[@]}"
-    } &
-    SCOREBOARD_UPSTREAM_PID=$!
-  fi
-  walk_package_set nova-nix "$RESULTS_DIR/nova-nix" "$NOVA_BUDGET" error "${SCOREBOARD_NOVA[@]}" \
-    --store "$SCOREBOARD_SCRATCH/walk-store" +RTS "$HEAP_CAP" -RTS || walks_complete=false
-  if [[ -n "$SCOREBOARD_UPSTREAM_PID" ]]; then
-    wait "$SCOREBOARD_UPSTREAM_PID" || walks_complete=false
-    SCOREBOARD_UPSTREAM_PID=""
+  walk_both "$RESULTS_DIR" "" || walks_complete=false
+  if [[ -n "$SCOREBOARD_UPSTREAM_VERSION" ]]; then
     write_differences "$RESULTS_DIR/upstream/results.txt" "$RESULTS_DIR/nova-nix/results.txt" \
       > "$RESULTS_DIR/differences.txt"
   fi
-  write_scoreboard "$upstream_version" > "$RESULTS_DIR/scoreboard.md"
+  write_scoreboard > "$RESULTS_DIR/scoreboard.md"
   echo
   cat "$RESULTS_DIR/scoreboard.md"
   [[ "$walks_complete" == true ]]
@@ -838,21 +934,99 @@ run_resources() {
   cat "$resources/resources.md"
 }
 
+# The attrset benchmark over the census's reached sets, under each
+# collector, into <attrset-dir>/<representation>-<collector>.txt.
+#   attrset_benchmark <bench-binary> <census-file> <attrset-dir>
+attrset_benchmark() {
+  local bench="$1" census="$2" dir="$3" representation collector
+  local rts=()
+  mkdir -p "$dir"
+  awk '$1 == "attrsets.reached.size" { print $2, $3 }' "$census" > "$dir/sizes.txt"
+  for representation in c flat; do
+    for collector in copying nonmoving; do
+      rts=()
+      [[ "$collector" == nonmoving ]] && rts=(+RTS -xn -RTS)
+      echo "attrset-memory: $representation sets under the $collector collector"
+      "$bench" "$representation" "$dir/sizes.txt" ${rts[@]+"${rts[@]}"} \
+        > "$dir/$representation-$collector.txt" 2> "$dir/$representation-$collector.err" \
+        || echo "attrset-memory: $representation under $collector exited $?" >&2
+    done
+  done
+}
+
+# The memory suite, its figures written to memory/memory.md.  Returns 1
+# when a walk of the slice stopped, since the passes would then cover
+# attributes the slice does not.
+run_memory() {
+  local dir="$RESULTS_DIR/memory" bench_bin evaluator
+  scoreboard_prepare || return
+  if [[ ! "$MEMORY_SLICE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MEMORY_SLICE must be a positive number of attributes, not '$MEMORY_SLICE'" >&2
+    return 2
+  fi
+  bench_bin=$(cd "$REPO_ROOT" && cabal list-bin -v0 bench:attrset-memory) || bench_bin=""
+  if [[ ! -x "$bench_bin" ]]; then
+    echo "no attrset-memory build at $bench_bin; build it, or pass --build" >&2
+    return 2
+  fi
+  rm -rf "${dir:?}"
+  mkdir -p "$dir"
+  if ! walk_both "$dir/slice" "$MEMORY_SLICE"; then
+    echo "a walk of the slice stopped before it settled $MEMORY_SLICE attributes" >&2
+    return 1
+  fi
+  # Every attribute that ends a process in either evaluator, so that both
+  # passes visit the same attributes wherever the walks agree, and every
+  # one a process ran out of memory at before a fresh one settled it: the
+  # pass carries the whole slice's state to it, more than that process did.
+  for evaluator in nova-nix upstream; do
+    if [[ -s "$dir/slice/$evaluator/settled.txt" ]]; then
+      awk '$1 == "error" || $1 == "unmeasured"' "$dir/slice/$evaluator/settled.txt"
+      awk '{ print "retried", $1 }' "$dir/slice/$evaluator/retried.txt"
+    fi
+  done | LC_ALL=C sort -u -k2,2 > "$dir/settled.txt"
+  settled_json "$dir/settled.txt" > "$dir/settled.json"
+
+  # Stores of their own, as the resource pass's.
+  measured_pass "$dir/nova-nix" "$dir/settled.json" "$(pass_budget "$dir/settled.txt" "$dir/slice/nova-nix/settled.txt")" \
+    "$MEMORY_WALK" "${SCOREBOARD_NOVA[@]}" --store "$SCOREBOARD_SCRATCH/memory-store" \
+    +RTS -s"$dir/nova-nix/rts-stats.txt" "$HEAP_CAP" -RTS
+  echo "memory: nova-nix's pass visited $(($(wc -l < "$dir/nova-nix/visited.txt"))) attributes, exit $(cat "$dir/nova-nix/exit.txt")"
+  measured_pass "$dir/census" "$dir/settled.json" "$(pass_budget "$dir/settled.txt" "$dir/slice/nova-nix/settled.txt")" \
+    "$MEMORY_WALK" env NOVA_NIX_C_STATS="$dir/census/census.txt" "${SCOREBOARD_NOVA[@]}" \
+    --store "$SCOREBOARD_SCRATCH/census-store" \
+    +RTS -hT -i"$HEAP_SAMPLE_SECONDS" -po"$dir/census/heap" "$HEAP_CAP" -RTS
+  echo "memory: nova-nix's census pass exited $(cat "$dir/census/exit.txt")"
+  if [[ ${#SCOREBOARD_UPSTREAM[@]} -gt 0 ]]; then
+    measured_pass "$dir/upstream" "$dir/settled.json" "$(pass_budget "$dir/settled.txt" "$dir/slice/upstream/settled.txt")" \
+      "$MEMORY_WALK" env NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH="$dir/upstream/nix-stats.json" "${SCOREBOARD_UPSTREAM[@]}"
+    echo "memory: upstream's pass visited $(($(wc -l < "$dir/upstream/visited.txt"))) attributes, exit $(cat "$dir/upstream/exit.txt")"
+  fi
+  if [[ -s "$dir/census/census.txt" ]]; then
+    attrset_benchmark "$bench_bin" "$dir/census/census.txt" "$dir/attrset"
+  fi
+  write_memory > "$dir/memory.md"
+  echo
+  cat "$dir/memory.md"
+}
+
 # ----------------------------------------------------------------
 # Argument parsing
 # ----------------------------------------------------------------
 
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <label> [rts-flags...] [--build] [--full]"
-  echo "       $0 <label> --scoreboard [-M<cap>] [--build]"
-  echo "       $0 <label> --resources [-M<cap>] [--build]"
+usage() {
+  echo "Usage: $0 <label> --scoreboard|--resources|--memory [-M<cap>] [--build]"
   echo ""
-  echo "  label:         name for this run (e.g. 'baseline', 'iter6-trim')"
-  echo "  rts-flags:     additional +RTS flags (e.g. -hT, -hc, -hr, -M8G)"
-  echo "  --build:       auto-build before running (standard or profiling as needed)"
-  echo "  --full:        complete diagnostic suite (-hT, -hc -p, -hr) with report"
+  echo "  label:         name for this run (e.g. 'nixpkgs-24.11')"
   echo "  --scoreboard:  walk the package set and count what evaluates and matches upstream"
   echo "  --resources:   force what the label's walk evaluated in one process, for its figures"
+  echo "  --memory:      measure where one process's memory goes over a slice of the walk"
+  echo "  -M<cap>:       nova-nix's heap cap (default $DEFAULT_HEAP_CAP)"
+  echo "  --build:       build what the mode runs first"
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
   exit 1
 fi
 
@@ -860,21 +1034,30 @@ LABEL="$1"
 shift
 
 FLAG_BUILD=false
-FLAG_FULL=false
-FLAG_SCOREBOARD=false
-FLAG_RESOURCES=false
-RTS_EXTRA=()
+MODE=""
 
 for arg in "$@"; do
   case "$arg" in
-    --build)      FLAG_BUILD=true ;;
-    --full)       FLAG_FULL=true ;;
-    --scoreboard) FLAG_SCOREBOARD=true ;;
-    --resources)  FLAG_RESOURCES=true ;;
-    -M*)          HEAP_CAP="$arg" ;;
-    *)            RTS_EXTRA+=("$arg") ;;
+    --build) FLAG_BUILD=true ;;
+    --scoreboard | --resources | --memory)
+      if [[ -n "$MODE" ]]; then
+        echo "one of --scoreboard, --resources and --memory" >&2
+        exit 2
+      fi
+      MODE="${arg#--}"
+      ;;
+    -M*) HEAP_CAP="$arg" ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
   esac
 done
+
+if [[ -z "$MODE" ]]; then
+  usage >&2
+  exit 2
+fi
 
 # ----------------------------------------------------------------
 # Main
@@ -882,73 +1065,17 @@ done
 
 RESULTS_DIR="$REPO_ROOT/profiling/results/$LABEL"
 
-if [[ "$FLAG_SCOREBOARD" == true || "$FLAG_RESOURCES" == true ]]; then
-  if [[ "$FLAG_SCOREBOARD" == "$FLAG_RESOURCES" || "$FLAG_FULL" == true || ${#RTS_EXTRA[@]} -gt 0 ]]; then
-    echo "--scoreboard and --resources each take a heap cap and --build, and no other flag" >&2
-    exit 2
-  fi
-  [[ "$FLAG_BUILD" == true ]] && do_build standard
-  if [[ "$FLAG_SCOREBOARD" == true ]]; then
+case "$MODE" in
+  scoreboard)
+    [[ "$FLAG_BUILD" == true ]] && do_build exe:nova-nix
     run_scoreboard
-  else
+    ;;
+  resources)
+    [[ "$FLAG_BUILD" == true ]] && do_build exe:nova-nix
     run_resources
-  fi
-
-elif [[ "$FLAG_FULL" == true ]]; then
-  # --full mode: run 3 passes (hT, hc+p, hr) with auto-build
-  echo "=== Full Diagnostic Suite: $LABEL ==="
-  echo "Heap cap: $HEAP_CAP"
-  mkdir -p "$RESULTS_DIR"
-
-  # Pass 1: -hT (standard build)
-  echo ""
-  echo "--- Pass 1/3: Type Breakdown (-hT) ---"
-  do_build standard
-  run_one_profile "$RESULTS_DIR/hT" -hT
-
-  # Pass 2: -hc -p (profiling build - cost centres + time/alloc .prof)
-  echo ""
-  echo "--- Pass 2/3: Cost Centres + Time Profile (-hc -p) ---"
-  do_build profiling
-  run_one_profile "$RESULTS_DIR/hc" -hc -p
-
-  # Pass 3: -hr (profiling build - retainers)
-  echo ""
-  echo "--- Pass 3/3: Retainers (-hr) ---"
-  # No rebuild needed - already have profiling build
-  run_one_profile "$RESULTS_DIR/hr" -hr
-
-  # Generate combined report
-  generate_report "$RESULTS_DIR"
-
-  echo ""
-  echo "Full results in: $RESULTS_DIR/"
-
-else
-  # Single-run mode (original behavior)
-
-  # --build: auto-build if requested
-  if [[ "$FLAG_BUILD" == true ]]; then
-    if needs_profiling_build "${RTS_EXTRA[@]+"${RTS_EXTRA[@]}"}"; then
-      do_build profiling
-    else
-      do_build standard
-    fi
-  fi
-
-  run_one_profile "$RESULTS_DIR" "${RTS_EXTRA[@]+"${RTS_EXTRA[@]}"}"
-
-  echo ""
-  echo "=== Results ==="
-  cat "$RESULTS_DIR/summary.txt"
-  echo ""
-
-  # Show heap top if available
-  if [[ -f "$RESULTS_DIR/heap-top.txt" ]]; then
-    echo "=== Heap Top 20 ==="
-    cat "$RESULTS_DIR/heap-top.txt"
-  fi
-
-  echo ""
-  echo "Full results in: $RESULTS_DIR/"
-fi
+    ;;
+  memory)
+    [[ "$FLAG_BUILD" == true ]] && do_build exe:nova-nix bench:attrset-memory
+    run_memory
+    ;;
+esac

@@ -4,31 +4,52 @@ name: Scoreboard
 # upstream Nix: profiling/bench.sh's scoreboard walks each nixpkgs tree the
 # parity job pins with both evaluators, and writes both counts to the job
 # summary, then the resource figures of one memory-bounded nova-nix process
-# over the set that evaluates.  A measurement and not a gate: branch
-# protection does not require it, so it runs only when dispatched or when a
-# pull request changes the scoreboard itself, and never in the merge queue.
+# over the set that evaluates.  Dispatched with the memory measure, it runs
+# bench.sh's memory suite instead, over a slice of one tree's walk.  A
+# measurement and not a gate: branch protection does not require it, so it
+# runs only when dispatched or when a pull request changes the scoreboard
+# itself, and never in the merge queue.
 
 on:
   workflow_dispatch:
+    inputs:
+      measure:
+        description: The scoreboard of every pinned tree, or the memory suite over a slice of one
+        type: choice
+        options:
+          - scoreboard
+          - memory
+        default: scoreboard
+      channel:
+        description: The pinned tree the memory suite walks, by parity.yml's channel
+        type: string
+        default: "24.11"
+      slice:
+        description: The attributes the memory suite's slice holds
+        type: string
+        default: "2000"
   pull_request:
     paths:
       - .github/workflows/scoreboard.yml
       - profiling/bench.sh
       - profiling/scoreboard.nix
+      - profiling/walk.nix
       - profiling/scoreboard-fixture/**
 
 # Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
 permissions:
   contents: read
 
-# A newer push to a pull request supersedes the walk in flight.
+# A newer push to a pull request supersedes the walk in flight.  The two
+# measures queue apart, so that neither waits behind the other.
 concurrency:
-  group: scoreboard-${{ github.ref }}
+  group: scoreboard-${{ inputs.measure || 'scoreboard' }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The pairings are parity.yml's matrix rows, read from it, so the two
   # workflows measure the same trees and a bumped row needs no edit here.
+  # The memory suite takes the one row of the channel dispatched.
   pairings:
     name: Pairings
     runs-on: ubuntu-latest
@@ -40,16 +61,22 @@ jobs:
 
       - name: Read parity.yml's matrix
         id: read
+        env:
+          MEASURE: ${{ inputs.measure }}
+          CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
           include=$(yq -o=json -I=0 '.jobs.parity.strategy.matrix.include' .github/workflows/parity.yml)
+          if [ "$MEASURE" = memory ]; then
+            include=$(jq -c --arg channel "$CHANNEL" 'map(select(.channel == $channel))' <<<"$include")
+          fi
           echo "$include"
-          [ "$(jq 'length' <<<"$include")" -gt 0 ] || { echo "parity.yml lists no pairings" >&2; exit 1; }
+          [ "$(jq 'length' <<<"$include")" -gt 0 ] || { echo "parity.yml lists no pairing to measure" >&2; exit 1; }
           echo "include=$include" >> "$GITHUB_OUTPUT"
 
   scoreboard:
     # Not the parity rows' names, which are check names of their own.
-    name: Walk nixpkgs ${{ matrix.channel }} with Nix ${{ matrix.nix }}
+    name: ${{ inputs.measure == 'memory' && 'Memory over' || 'Walk' }} nixpkgs ${{ matrix.channel }} with Nix ${{ matrix.nix }}
     needs: [pairings]
     runs-on: ubuntu-latest
     strategy:
@@ -141,22 +168,30 @@ jobs:
 
       - name: Build nova-nix
         id: build
-        run: cabal build exe:nova-nix
+        run: cabal build exe:nova-nix bench:attrset-memory
 
       # Minutes, where the walk below takes hours: a walk that misreads
       # either evaluator fails here first.  The budget is below the
       # fixture's attribute count, so each walk resumes after a spent budget
-      # as well as after each failure tryEval cannot catch.
+      # as well as after each failure tryEval cannot catch.  The memory
+      # suite then runs on a slice of the fixture: both evaluators' passes
+      # visit the same attributes, and the census places every pointer it
+      # meets.
       - name: Check the walk on its fixture
         timeout-minutes: 10
         env:
           SCOREBOARD_BUDGET: "4"
+          MEMORY_SLICE: "12"
         run: |
           set -euo pipefail
           NIXPKGS_PATH="$PWD/profiling/scoreboard-fixture" profiling/bench.sh fixture --scoreboard
           for walk in upstream nova-nix; do
             diff profiling/scoreboard-fixture/expected.txt "profiling/results/fixture/$walk/results.txt"
           done
+          NIXPKGS_PATH="$PWD/profiling/scoreboard-fixture" profiling/bench.sh fixture --memory
+          memory=profiling/results/fixture/memory
+          diff <(sort "$memory/nova-nix/visited.txt") <(sort "$memory/upstream/visited.txt")
+          grep -qx 'mark.unplaced 0' "$memory/census/census.txt"
 
       # The two evaluators walk at once, in one bounded scope.  A process
       # the OOM killer ends there is retried at the attribute it was on, as
@@ -164,6 +199,7 @@ jobs:
       # NIX_SSL_CERT_FILE is passed on too, for a fetch upstream makes.
       - name: Walk nixpkgs with both evaluators
         id: walk
+        if: inputs.measure != 'memory'
         timeout-minutes: 180
         run: |
           sudo systemd-run --scope --quiet \
@@ -206,6 +242,7 @@ jobs:
       # pass's result.
       - name: Force what evaluated in one bounded process
         id: resources
+        if: inputs.measure != 'memory'
         timeout-minutes: 120
         run: |
           sudo systemd-run --scope --quiet \
@@ -233,5 +270,45 @@ jobs:
         with:
           name: scoreboard-${{ env.LABEL }}-resources
           path: profiling/results/${{ env.LABEL }}/resources/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # The memory suite's walks and passes run in a bounded scope as the
+      # walk does, MEMORY_SLICE passed on with the rest.
+      - name: Measure memory over a slice of the walk
+        id: memory
+        if: inputs.measure == 'memory'
+        timeout-minutes: 120
+        env:
+          MEMORY_SLICE: ${{ inputs.slice }}
+        run: |
+          sudo systemd-run --scope --quiet \
+            --uid="$(id -un)" --gid="$(id -gn)" \
+            --setenv=PATH="$PATH" --setenv=NIXPKGS_PATH="$NIXPKGS" \
+            --setenv=NIX_SSL_CERT_FILE="$NIX_SSL_CERT_FILE" --setenv=MEMORY_SLICE="$MEMORY_SLICE" \
+            -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0 -p OOMPolicy=continue \
+            profiling/bench.sh "$LABEL" --memory
+
+      - name: Memory summary
+        if: ${{ !cancelled() && steps.memory.outcome != 'skipped' }}
+        run: |
+          {
+            if [ -s "profiling/results/$LABEL/memory/memory.md" ]; then
+              cat "profiling/results/$LABEL/memory/memory.md"
+            else
+              echo "## nova-nix memory: $LABEL"
+              echo
+              echo "The memory suite did not finish; the uploaded results hold its output so far."
+            fi
+            echo
+            echo "nixpkgs revision \`$NIXPKGS_REV\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the memory suite
+        if: ${{ !cancelled() && steps.memory.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scoreboard-${{ env.LABEL }}-memory
+          path: profiling/results/${{ env.LABEL }}/memory/
           if-no-files-found: warn
           retention-days: 14

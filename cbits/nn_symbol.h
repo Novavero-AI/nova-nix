@@ -86,4 +86,11 @@ size_t nn_symbol_len(nn_symbol_t sym);
 /* Return the number of unique symbols currently interned. */
 uint32_t nn_symbol_count(void);
 
+/* --- Census (nn_stats.h) --- */
+
+/* The bytes the table holds: in its string arena, each symbol's text
+ * and terminator (*text), and from the allocator, the arena, entry and
+ * hash tables at their capacities (*reserved). */
+void nn_symbol_footprint(uint64_t *text, uint64_t *reserved);
+
 #endif /* NN_SYMBOL_H */

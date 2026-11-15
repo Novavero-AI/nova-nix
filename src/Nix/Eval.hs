@@ -1487,12 +1487,20 @@ builtinArgModes name = maybe (ForceOnApply :| []) bdArgs (Map.lookup name (built
 -- position asks: forced, or as a thunk.  The last position runs the
 -- builtin; an earlier one makes the partial application.  Inlined into
 -- each application site, which measurably cuts allocation on this path.
+--
+-- The argument is held evaluated: a value, or the cell of a thunk made as
+-- the builtin takes it, as upstream makes a call's argument thunk when it
+-- makes the call.  Held unevaluated, it would be a Haskell closure over the
+-- caller's env that makes its cell only when something forces it, so the
+-- partial application would hold the env where no C pointer shows it, and
+-- a census of the data layer ("Nix.Eval.CStats"), which reads what a
+-- partial application holds, would make the cell itself.
 applyBuiltin :: (MonadEval m) => Text -> [BuiltinArg] -> (ArgMode -> m BuiltinArg) -> m NixValue
 applyBuiltin name taken takeArg = case builtinArgModes name of
   first :| later -> nextPosition taken first later
   where
     nextPosition [] mode later = do
-      arg <- takeArg mode
+      !arg <- takeArg mode
       let held = taken ++ [arg]
       if null later
         then executeBuiltin name held
