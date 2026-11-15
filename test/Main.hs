@@ -3287,8 +3287,34 @@ testParserErrors = do
       -- furthest a branch can get.
       runTest "truncated lambda reports end of input" $
         assertRight "truncated lambda" (syntaxErrorOf "{ a, b }:") $ \err ->
-          assertEqual "end of input" True ("end of input" `T.isInfixOf` peMessage err)
+          assertEqual "end of input" True ("end of input" `T.isInfixOf` peMessage err),
+      -- Upstream's attribute name is an identifier or or (the attr rule,
+      -- parser.y:455-458 at 2.24.9), so its grammar refuses any other
+      -- keyword as one, at the keyword.
+      runTest "a keyword other than or is no attribute name, refused where it stands" $
+        let refusedAt source = (\err -> (peLine err, peCol err)) <$> syntaxErrorOf source
+            cases keyword =
+              [ ("{ a." <> keyword <> " = 1; }", (1, 5)),
+                ("x." <> keyword, (1, 3)),
+                ("x ? " <> keyword, (1, 5)),
+                ("{ inherit " <> keyword <> "; }", (1, 11)),
+                ("{ inherit (x) " <> keyword <> "; }", (1, 15))
+              ]
+                ++ [("{ " <> keyword <> " = 1; }", (1, 3)) | keyword /= "inherit"]
+            sources = concatMap cases refusedAttrKeywords
+         in assertEqual "positions" [(source, Right at) | (source, at) <- sources] [(source, refusedAt source) | (source, _) <- sources],
+      runTest "or, true, false and null are attribute names" $
+        assertEval "names" "let s = { or = 1; true = 2; false = 3; null = 4; }; in s.or + s.true + s.false + s.null" (VInt 10),
+      runTest "or, true, false and null are inherited names" $
+        assertEval "inherited" "let s = { inherit ({ or = 1; true = 2; false = 3; null = 4; }) or true false null; }; in s.or + s.true + s.false + s.null" (VInt 10),
+      runTest "a keyword written as a string is an attribute name" $
+        assertEval "quoted" "let s = { \"if\" = 1; inherit ({ \"rec\" = 2; }) \"rec\"; }; in s.\"if\" + s.\"rec\"" (VInt 3)
     ]
+
+-- | The keywords upstream's lexer makes tokens of their own (lexer.l:109-117
+-- at 2.24.9), none of which its grammar takes as an attribute name.
+refusedAttrKeywords :: [Text]
+refusedAttrKeywords = ["if", "then", "else", "assert", "with", "let", "in", "rec", "inherit"]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Source bytes
