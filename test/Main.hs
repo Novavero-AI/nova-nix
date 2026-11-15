@@ -735,7 +735,32 @@ testEvalComparison = do
       runTest "list comparison reports the first unequal pair" $
         assertEvalError "lt-list" "[ 1 ] < [ \"a\" ]" "cannot compare an integer with a string",
       runTest "equal incomparable elements do not stop a list comparison" $
-        assertEval "lt-list-sets" "[ {} ] < [ {} ]" (VBool False)
+        assertEval "lt-list-sets" "[ {} ] < [ {} ]" (VBool False),
+      -- Upstream's eqValues forces both sides before it takes a value as
+      -- equal to itself (eval.cc at 2.24.9), and a list literal holds a
+      -- variable's own value, so both lists share x.
+      runTest "== forces a list element both sides share" $
+        assertEvalError "eq-shared-elem" "let x = throw \"x\"; in [ x ] == [ x ]" "x",
+      runTest "== forces an attribute both sides share" $
+        assertEvalError "eq-shared-attr" "let x = throw \"x\"; in { a = x; } == { a = x; }" "x",
+      runTest "< forces a list element both sides share" $
+        assertEvalError "lt-shared-elem" "let x = throw \"x\"; in [ x ] < [ x ]" "x",
+      -- Under the IO evaluator, which keeps the output set once it is
+      -- forced, so d and d.out are one set holding one outPath; the pure
+      -- one builds the set again at each use.
+      runTestM "== forces the outPath two derivations share" $ do
+        tmpBase <- getTemporaryDirectory
+        assertEvalErrorIO
+          tmpBase
+          "eq-shared-outpath"
+          "let d = derivation { name = \"w\"; system = \"x\"; builder = \"/bin/sh\"; x = throw \"x\"; }; in d == d.out"
+          "x",
+      runTest "a function both sides share is equal to itself" $
+        assertEval "eq-shared-fn" "let f = y: y; in [ f ] == [ f ]" (VBool True),
+      runTest "two functions are never equal" $
+        assertEval "eq-fns" "[ (y: y) ] == [ (y: y) ]" (VBool False),
+      runTest "a NaN both sides share is equal to itself" $
+        assertEval "eq-shared-nan" "let nan = (1.0e308 * 10) * 0.0; in [ nan ] == [ nan ]" (VBool True)
     ]
 
 -- ---------------------------------------------------------------------------

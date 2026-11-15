@@ -227,23 +227,22 @@ nixCompare _ left right
 
 -- | Lexicographic comparison of two thunk lists for the @<@ operator:
 -- the first NON-EQUAL element pair decides via @<@ on that pair, as
--- upstream does (eqValues, then CompareValues on the first difference).
--- An unequal pair where @<@ holds in neither direction (NaN) therefore
--- decides False rather than being skipped as equal.  A proper prefix is
--- less than the longer list.  Mirrors 'listEqual'.
+-- upstream does (eqValues, then CompareValues on the first difference,
+-- primops.cc:617 at 2.24.9).  An unequal pair where @<@ holds in neither
+-- direction (NaN) therefore decides False rather than being skipped as
+-- equal.  A proper prefix is less than the longer list.  Mirrors
+-- 'listEqual'.
 listCompare :: (MonadEval m) => Force m -> [Thunk] -> [Thunk] -> m Bool
 listCompare _ [] [] = pure False
 listCompare _ [] (_ : _) = pure True
 listCompare _ (_ : _) [] = pure False
-listCompare forceFn (a : as) (b : bs)
-  | thunkSameRef a b = listCompare forceFn as bs
-  | otherwise = do
-      va <- forceFn a
-      vb <- forceFn b
-      equal <- nixEqual forceFn va vb
-      if equal
-        then listCompare forceFn as bs
-        else nixCompare forceFn va vb
+listCompare forceFn (a : as) (b : bs) = do
+  va <- forceFn a
+  vb <- forceFn b
+  equal <- forcedPairEqual forceFn (a, va) (b, vb)
+  if equal
+    then listCompare forceFn as bs
+    else nixCompare forceFn va vb
 
 -- | Deep structural equality.  Forces thunks inside lists and
 -- attribute sets as needed.
@@ -315,24 +314,28 @@ isDerivationSet forceFn attrs =
 -- | Pairwise equality of two thunk lists (for list comparison).
 listEqual :: (MonadEval m) => Force m -> [Thunk] -> [Thunk] -> m Bool
 listEqual _ [] [] = pure True
-listEqual forceFn (a : as) (b : bs)
-  | thunkSameRef a b = listEqual forceFn as bs
-  | otherwise = do
-      va <- forceFn a
-      vb <- forceFn b
-      eq <- nixEqual forceFn va vb
-      if eq then listEqual forceFn as bs else pure False
+listEqual forceFn (a : as) (b : bs) = do
+  eq <- thunkPairEqual forceFn (a, b)
+  if eq then listEqual forceFn as bs else pure False
 listEqual _ _ _ = pure False
 
--- | Compare two thunks for equality by forcing both.
--- Short-circuits on thunk identity (same IORef = same value).
+-- | Upstream's @eqValues@ on two thunks (eval.cc:2719-2727 at 2.24.9):
+-- both are forced, the left first, before one is taken as equal to
+-- itself, so an error in a value both sides share surfaces.
 thunkPairEqual :: (MonadEval m) => Force m -> (Thunk, Thunk) -> m Bool
-thunkPairEqual forceFn (a, b)
+thunkPairEqual forceFn (a, b) = do
+  va <- forceFn a
+  vb <- forceFn b
+  forcedPairEqual forceFn (a, va) (b, vb)
+
+-- | Equality of two thunks already forced, each with its value.  One thunk
+-- is equal to itself whatever its value, as upstream's @&v1 == &v2@ makes
+-- a function or NaN that both sides share equal; two thunks compare their
+-- values.
+forcedPairEqual :: (MonadEval m) => Force m -> (Thunk, NixValue) -> (Thunk, NixValue) -> m Bool
+forcedPairEqual forceFn (a, va) (b, vb)
   | thunkSameRef a b = pure True
-  | otherwise = do
-      va <- forceFn a
-      vb <- forceFn b
-      nixEqual forceFn va vb
+  | otherwise = nixEqual forceFn va vb
 
 -- ---------------------------------------------------------------------------
 -- List / attrset operators

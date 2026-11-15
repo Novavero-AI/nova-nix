@@ -11,9 +11,8 @@
 # The probes read the pattern and the name it binds, which builtin forces
 # `outputs` and in what order, each attribute forced alone, the paths and
 # their contexts, and equality between the output sets and with the
-# arguments.  Upstream's `==` forces both sides before it takes one value
-# as equal to itself, where nova-nix's takes a shared thunk as equal
-# without forcing it; the equality probes show both.  Each leaves out the
+# arguments, whose values both sides share, so `==` forces each before it
+# takes it as equal to itself.  Each equality probe leaves out the
 # attributes that differ by design, so its result does not depend on the
 # order attribute names were interned in.
 #

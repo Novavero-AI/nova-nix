@@ -884,8 +884,8 @@ evaluated (VLambda env formals bodyBcIdx) = Thunk (newComputedLambdaPtr env form
 evaluated val = Thunk (newComputedThunkPtr val)
 
 -- | Check if two thunks share the same memoization cell (C pointer
--- equality).  When true, both thunks will always produce the same value,
--- so deep equality can short-circuit to 'True' without forcing.
+-- equality): upstream's test of one @Value@'s address against another's,
+-- which @==@ makes once both sides are forced.
 thunkSameRef :: Thunk -> Thunk -> Bool
 thunkSameRef (Thunk p1) (Thunk p2) = p1 == p2
 
