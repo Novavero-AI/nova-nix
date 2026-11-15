@@ -169,6 +169,19 @@ echo "== what + makes of a path it coerces =="
 check "an outPath left of + is its own text, not a store copy" 'let s = { outPath = ./data.txt; } + "x"; in builtins.toJSON [ s (builtins.getContext s) ]'
 echo
 
+echo "== what builtins.path copies =="
+# 2.34.0 refuses a directory through another read, in other words.
+if ! upstreamAtLeast 2.34.0; then
+  refused "a directory, flat" 'builtins.path { path = ./sub; recursive = false; }'
+fi
+# An attribute fromJSON makes has no position, so the refusal is the last
+# line in both.  2.26.0 names builtins.path where 2.24.9 and nova-nix name
+# addPath.
+if ! upstreamAtLeast 2.26.0; then
+  refused "an argument it does not take" 'builtins.path ({ path = ./data.txt; } // builtins.fromJSON "{\"foo\": 1}")'
+fi
+echo
+
 echo "== arithmetic and comparison as upstream's primops do them =="
 check "unary minus is 0 - e, so a float zero negates to positive zero" '[ (-(0.0)) (-(-0.0)) ]'
 check "division by a float, and integer division truncating toward zero" '[ (1 / 4.0) (7 / 2) ((-7) / 2) ]'

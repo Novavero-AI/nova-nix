@@ -116,7 +116,7 @@ import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, maybeToList)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
 import Data.Sequence (Seq (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -4574,7 +4574,7 @@ builtinDerivationStrict (VAttrs attrs) = do
     Nothing -> pure KeepNullAttrs
     Just thunk ->
       addErrorTrace (pure "while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict") $ do
-        ignore <- force thunk >>= expectDerivationBool
+        ignore <- force thunk >>= expectBool
         pure (if ignore then IgnoreNullAttrs else KeepNullAttrs)
   let fieldContext = "derivation \"" <> drvName <> "\""
       attrsInOrder = Map.toAscList (Map.delete ignoreNullsFlag (attrSetToMap attrs))
@@ -4964,7 +4964,7 @@ attrPassingOf :: (MonadEval m) => AttrSet -> m AttrPassing
 attrPassingOf attrs = case attrSetLookup structuredAttrsFlag attrs of
   Nothing -> pure PassAsEnvironment
   Just thunk -> do
-    structured <- force thunk >>= expectDerivationBool
+    structured <- force thunk >>= expectBool
     pure (if structured then PassAsStructuredAttrs else PassAsEnvironment)
 
 -- | Whether a string read without coercion may carry context: one
@@ -5032,11 +5032,12 @@ traceIfPresent attrs key line action
   | attrSetMember key attrs = addErrorTrace (pure line) action
   | otherwise = action
 
--- | A derivation's Boolean switch, refused with upstream's @forceBool@
--- message.
-expectDerivationBool :: (MonadEval m) => NixValue -> m Bool
-expectDerivationBool (VBool b) = pure b
-expectDerivationBool other = throwEvalError ("expected a Boolean but found " <> typeName other <> ": " <> printValue PrintForError other)
+-- | A Boolean as upstream's @forceBool@ reads it, refused with its message
+-- (eval.cc:2176-2193 at 2.24.9): a derivation's switches and the
+-- @recursive@ of @builtins.path@.
+expectBool :: (MonadEval m) => NixValue -> m Bool
+expectBool (VBool b) = pure b
+expectBool other = throwEvalError ("expected a Boolean but found " <> typeName other <> ": " <> printValue PrintForError other)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - hashFile, readFileType
@@ -5945,27 +5946,20 @@ xmlAttr (name, value) = " " <> BB.byteString name <> "=\"" <> BC.foldr (\c rest 
 -- | @builtins.path { path; name?; filter?; sha256?; recursive?; }@
 --
 -- Copy a path to the store and return the store path as a string with
--- context.  @name@ defaults to the basename of @path@.  @filter@, when
--- given, decides which entries are copied ('filteredSourceNar').
+-- context.  @name@ defaults to the basename of @path@.  @recursive@,
+-- true unless given, copies the tree at the path as a NAR, and false the
+-- one file at it by its bytes ('flatFileCopy').  @filter@, when given,
+-- decides which entries of a tree are copied ('filteredSourceNar').
 builtinPath :: (MonadEval m) => NixValue -> m NixValue
 builtinPath (VAttrs attrs) = do
-  -- prim_path coerces the attribute with coerceToPath and checks for it
-  -- once its attribute loop is done (primops.cc at 2.24.9).
-  pathStr <- case attrSetLookup "path" attrs of
-    Nothing -> throwEvalError "missing required 'path' attribute in the first argument to builtins.path"
-    Just thunk -> coerceToPath "builtins.path" =<< force thunk
-  nameOverride <- forceOptionalAttrStr attrs "name"
-  expectedDigest <- case attrSetLookup "sha256" attrs of
-    Nothing -> pure Nothing
-    Just thunk -> do
-      pinVal <- force thunk
-      case pinVal of
-        VStr pin _ -> do
-          pinText <- decodedText "builtins.path" pin
-          Just <$> decodeSha256Pin pinText
-        other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
-  filterFn <- traverse force (attrSetLookup "filter" attrs)
-  let name = fromMaybe (canonBaseName pathStr) nameOverride
+  -- prim_path reads the arguments one at a time in the set's own order,
+  -- refusing one it does not take at its turn, and checks for the path
+  -- once that loop is done (primops.cc:2569-2592 at 2.24.9).  The order
+  -- is by interned symbol, as upstream's attribute sets are sorted.
+  args <- foldM (readPathArgument attrs) noPathArguments (mapMaybe (\key -> (,) key <$> attrSetLookup key attrs) (attrSetKeys attrs))
+  pathStr <- maybe (throwEvalError "missing required 'path' attribute in the first argument to builtins.path") pure (paPath args)
+  let name = fromMaybe (canonBaseName pathStr) (paName args)
+      expectedDigest = paPin args
       -- Upstream compares the copy's store path with the one the pin
       -- gives (primops.cc:2478-2482 at 2.24.9); under one name and one
       -- method the two differ exactly when the digests do.
@@ -5975,10 +5969,11 @@ builtinPath (VAttrs attrs) = do
   -- tree (primops.cc at 2.24.9), so a name it refuses is refused under the
   -- pinned hash, before the filter is applied.
   forM_ expectedDigest $ \expected ->
-    storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion expected)
-  storePathText <- case filterFn of
-    Nothing -> copyPathToStore pathStr name (fmap (,const mismatch) expectedDigest)
-    Just keep -> do
+    storePathOrThrow (makeFixedOutputPath name "sha256" (paMethod args) expected)
+  storePathText <- case (paMethod args, paFilter args) of
+    (FlatIngestion, _) -> flatFileCopy pathStr name expectedDigest mismatch
+    (NarIngestion, Nothing) -> copyPathToStore pathStr name (fmap (,const mismatch) expectedDigest)
+    (NarIngestion, Just keep) -> do
       narBytes <- filteredSourceNar keep pathStr
       -- The sha256 pin applies to the FILTERED tree, as upstream.
       case expectedDigest of
@@ -5988,6 +5983,57 @@ builtinPath (VAttrs attrs) = do
   pure (sourceResultString storePathText)
 builtinPath other =
   throwEvalError ("builtins.path: expected an attribute set, got " <> typeName other)
+
+-- | What @builtins.path@ has read of its arguments, as @prim_path@'s
+-- locals hold them (primops.cc:2560-2565 at 2.24.9): a NAR copy until
+-- @recursive@ says otherwise.
+data PathArguments = PathArguments
+  { paPath :: !(Maybe Text),
+    paName :: !(Maybe Text),
+    paFilter :: !(Maybe NixValue),
+    paMethod :: !FileIngestionMethod,
+    paPin :: !(Maybe BS.ByteString)
+  }
+
+-- | The arguments before any is read.
+noPathArguments :: PathArguments
+noPathArguments = PathArguments Nothing Nothing Nothing NarIngestion Nothing
+
+-- | One argument of @builtins.path@, read as @prim_path@ reads the one at
+-- its key (primops.cc:2571-2587 at 2.24.9): @recursive@ as a Boolean
+-- choosing a NAR or a flat copy, and any key it does not take refused
+-- with its message.
+readPathArgument :: (MonadEval m) => AttrSet -> PathArguments -> (Text, Thunk) -> m PathArguments
+readPathArgument attrs args (key, thunk) = case key of
+  "path" -> (\path -> args {paPath = Just path}) <$> (coerceToPath "builtins.path" =<< force thunk)
+  "name" -> (\named -> args {paName = named}) <$> forceOptionalAttrStr attrs key
+  "filter" -> (\keep -> args {paFilter = Just keep}) <$> force thunk
+  "recursive" -> (\recursive -> args {paMethod = if recursive then NarIngestion else FlatIngestion}) <$> (expectBool =<< force thunk)
+  "sha256" -> (\pin -> args {paPin = Just pin}) <$> (pathPin =<< force thunk)
+  _ -> throwEvalError ("unsupported argument '" <> key <> "' to 'addPath'")
+  where
+    pathPin pinVal = case pinVal of
+      VStr pin _ -> decodeSha256Pin =<< decodedText "builtins.path" pin
+      other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
+
+-- | The copy @recursive = false@ makes: the bytes of the file at the
+-- path, its symlinks resolved, at their flat fixed-output path.
+-- Upstream's addPath hands fetchToStore the resolved path
+-- (primops.cc:2470-2477 at 2.24.9), and a flat dump reads the file and
+-- calls no filter (file-content-address.cc:77-80).  That read fails on a
+-- directory with EISDIR (posix-source-accessor.cc:68-73), and this copy
+-- refuses one with the message that read gives.
+flatFileCopy :: (MonadEval m) => Text -> Text -> Maybe BS.ByteString -> Text -> m Text
+flatFileCopy rawPath name pin mismatch = do
+  resolved <- resolveSymlinks rawPath
+  fileType <- getFileType resolved
+  when (fileType == "directory") $
+    throwEvalError ("reading from file '" <> resolved <> "': Is a directory")
+  bytes <- readFileBytes resolved
+  case pin of
+    Just expected | expected /= sha256Digest bytes -> throwEvalError mismatch
+    _ -> pure ()
+  addFixedOutputFile name bytes
 
 -- | The result value both source importers return: the store path as a
 -- string carrying itself as context.
