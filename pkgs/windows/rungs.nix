@@ -66,4 +66,7 @@
 
   # GCC 4.6.4 with C++, GCC 4.6.4 C++ (Windows).
   gcc46-cxx = [ "gcc46-cxx" ];
+
+  # GCC 10.4.0 with C and C++, GCC 10 (Windows).
+  gcc10 = [ "gcc10" ];
 }
