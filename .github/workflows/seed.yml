@@ -1,0 +1,29 @@
+name: Seed
+
+# CI on main once a day, its Mes and Bootstrap legs building every rung of
+# the seed ladder from the seed with no substituter (Ladder (mode) in
+# ci.yml).  A push to main builds only the rungs it changes and takes the
+# rest from the public cache, so this is the run that fails when the chain
+# no longer builds from the seed: under a newer runner image, or with a
+# builder change whose own run was cancelled while it waited.  GitHub sends
+# a scheduled run's notifications to whoever last changed its cron line.
+# A from-seed run on demand is ci.yml dispatched, on any branch.
+#
+# Its own workflow rather than a schedule in ci.yml: GitHub disables a
+# public repository's scheduled workflows after 60 days with no activity in
+# the repository, a disabled workflow is triggered by nothing, and ci.yml
+# carries every required check.
+on:
+  schedule:
+    # Off the hour: GitHub delays scheduled runs at the start of every
+    # hour, its busiest time.
+    - cron: "37 3 * * *"
+
+# Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml

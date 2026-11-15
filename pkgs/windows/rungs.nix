@@ -2,8 +2,8 @@
 # Bootstrap legs build, each leg's in the order its steps build them.
 #
 # A push to main publishes what the Bootstrap leg built to the public cache,
-# and a pull request's legs in substitute mode (Ladder (mode) in
-# .github/workflows/ci.yml) take each rung from there:
+# and the legs of a pull request or a later push in substitute mode (Ladder
+# (mode) in .github/workflows/ci.yml) take each rung from there:
 # .github/cache/substitute-rungs.sh realises a leg's list with the cache as a
 # substituter, and fails the leg when a rung the cache holds was built all
 # the same.  The test suite checks each list against the builds its leg's

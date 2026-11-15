@@ -26,12 +26,18 @@ permissions:
   contents: read
 
 # A newer push to a pull request supersedes the run in flight, so that one
-# is cancelled.  A run on main is never cancelled: it publishes the closure
-# it built to the public cache, and a cancelled publish leaves the cache
-# one run behind until the next push happens to complete.  Merge-group
-# runs are the queue's own evidence and are left alone for the same reason.
+# is cancelled.  A run on main is not cancelled once it starts: it
+# publishes what it built to the public cache, and a cancelled publish
+# leaves the cache one run behind until the next push happens to complete.
+# One still waiting when a newer push arrives is cancelled, as GitHub
+# cancels a group's pending run.  The newer run tests a tree that holds its
+# changes, in the ladder mode its own push gives (Ladder (mode) says what
+# that leaves to the daily run).  Merge-group runs are the queue's own
+# evidence and are left alone for the same reason as main's.  The event is
+# in the group so that a run seed.yml calls on main neither waits behind
+# nor cancels a push's.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The public cache's address and signing key, spelled once: the publish job
@@ -1046,7 +1052,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Ladder (mode): how this run's Mes and Bootstrap legs come by the seed
   # ladder, the rungs pkgs/windows builds from its 1,623-byte seed.  Decided
-  # once a run, from the files a pull request changes, by
+  # once a run, from the files a pull request or a push to main changes, by
   # .github/cache/ladder-mode.sh, which has the rules:
   #
   #   skip         documentation alone.  The legs do not run.  Neither is a
@@ -1055,21 +1061,29 @@ jobs:
   #   seed         a change to the builder.  The legs build every rung
   #                from the seed and name no substituter.
   #   substitute   any other change.  The legs name the public cache as a
-  #                substituter, so a rung the pull request leaves alone is
+  #                substituter, so a rung the change leaves alone is
   #                downloaded and one it changes builds, its store path
   #                being one the cache lacks.  A leg fails if a rung the
   #                cache holds is built all the same
   #                (.github/cache/substitute-rungs.sh).  The checks under
   #                test/data build in every mode: each forbids substitutes.
   #
-  # A run for anything but a pull request is seed.  A push to main publishes
-  # what its legs build, so it has to build all of it.
+  # A push to main publishes what its x64 Bootstrap leg holds, which in
+  # substitute mode is the rungs it changes, built, and the rest, taken
+  # from the cache: a rung's store path, and so what the cache holds for
+  # it, is the same however it was built.  A rung that a push left
+  # unpublished, its run cancelled while it waited, builds in the next
+  # push's run that does not skip, since the cache lacks it.  Every other
+  # run is seed: a release's, a dispatched run's, and the daily one
+  # seed.yml calls, which proves that every rung still builds from the
+  # seed with the builder and the runners of the day.
   #
   # The changed files come from git, which needs no token and has no page
-  # limit: a pull_request run checks out the merge commit GitHub makes of
+  # limit.  A pull_request run checks out the merge commit GitHub makes of
   # the pull request and its base, and that commit's first parent is the
-  # base.  The diff between the two is what the pull request changes in the
-  # tree the legs build.
+  # base.  A push names the commit main pointed to before it.  The diff
+  # from either to the checkout is what the change does to the tree the
+  # legs build.
   # ---------------------------------------------------------------------------
   ladder-mode:
     name: Ladder (mode)
@@ -1079,7 +1093,7 @@ jobs:
     outputs:
       mode: ${{ steps.decide.outputs.mode }}
     steps:
-      # Two commits deep: the merge commit and its parents.
+      # Two commits deep: a pull request's merge commit and its parents.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
@@ -1093,17 +1107,30 @@ jobs:
       # default lists the new one alone, and a builder file renamed to a
       # document would pass for documentation.  A checkout that is no merge
       # commit is refused: its first parent is the commit before it, not the
-      # base, and the diff would be of the last commit alone.
+      # base, and the diff would be of the last commit alone.  A push can
+      # carry several commits, so its diff starts at the commit main pointed
+      # to before it, fetched by itself: the checkout holds two commits.
       - name: Decide the mode
         id: decide
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
+          decide() {
+            git diff --name-only --no-renames -z "$1" HEAD | bash .github/cache/ladder-mode.sh
+          }
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             if ! git rev-parse --verify --quiet HEAD^2 > /dev/null; then
               echo "::error::the checkout is not a pull request's merge commit, so its first parent is not the base"
               exit 1
             fi
-            mode=$(git diff --name-only --no-renames -z HEAD^1 HEAD | bash .github/cache/ladder-mode.sh)
+            mode=$(decide HEAD^1)
+          elif [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            if ! git fetch --no-tags --depth=1 origin "$BEFORE"; then
+              echo "::error::could not fetch $BEFORE, the commit main pointed to before this push"
+              exit 1
+            fi
+            mode=$(decide "$BEFORE")
           else
             mode=seed
           fi
@@ -1132,8 +1159,8 @@ jobs:
     needs: [stage0-nova-nix, ladder-mode]
     # Not run in the merge queue.  Neither leg is a required check, so the
     # queue merges without waiting for them, and the push to main that
-    # follows runs both on the same commit.  Not run for a pull request
-    # that changes documentation alone, either.
+    # follows runs both on the same commit.  Not run for a change to
+    # documentation alone, either.
     if: github.event_name != 'merge_group' && needs.ladder-mode.outputs.mode != 'skip'
     strategy:
       fail-fast: false
@@ -1183,7 +1210,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # This leg's rungs (pkgs/windows/rungs.nix), each downloaded where the
-      # cache holds it and built where the pull request changes it.  The
+      # cache holds it and built where the change alters it.  The
       # script fails if a rung the cache holds is built.  nova-nix passes
       # over a narinfo that no trusted key signs and builds, so without the
       # check a key the cache no longer signs with would turn every run
@@ -1347,8 +1374,8 @@ jobs:
     needs: [stage0-nova-nix, ladder-mode]
     # Not run in the merge queue.  Neither leg is a required check, so the
     # queue merges without waiting for them, and the push to main that
-    # follows runs both on the same commit.  Not run for a pull request
-    # that changes documentation alone, either.
+    # follows runs both on the same commit.  Not run for a change to
+    # documentation alone, either.
     if: github.event_name != 'merge_group' && needs.ladder-mode.outputs.mode != 'skip'
     strategy:
       fail-fast: false
@@ -1409,7 +1436,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # This leg's rungs (pkgs/windows/rungs.nix), each downloaded where the
-      # cache holds it and built where the pull request changes it.  The
+      # cache holds it and built where the change alters it.  The
       # script fails if a rung the cache holds is built.  nova-nix passes
       # over a narinfo that no trusted key signs and builds, so without the
       # check a key the cache no longer signs with would turn every run
