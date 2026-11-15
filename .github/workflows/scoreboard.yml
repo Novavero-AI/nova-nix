@@ -1,0 +1,237 @@
+name: Scoreboard
+
+# How much of nixpkgs nova-nix evaluates, and how much of that matches
+# upstream Nix: profiling/bench.sh's scoreboard walks each nixpkgs tree the
+# parity job pins with both evaluators, and writes both counts to the job
+# summary, then the resource figures of one memory-bounded nova-nix process
+# over the set that evaluates.  A measurement and not a gate: branch
+# protection does not require it, so it runs only when dispatched or when a
+# pull request changes the scoreboard itself, and never in the merge queue.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/scoreboard.yml
+      - profiling/bench.sh
+      - profiling/scoreboard.nix
+      - profiling/scoreboard-fixture/**
+
+# Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes the walk in flight.
+concurrency:
+  group: scoreboard-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The pairings are parity.yml's matrix rows, read from it, so the two
+  # workflows measure the same trees and a bumped row needs no edit here.
+  pairings:
+    name: Pairings
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      include: ${{ steps.read.outputs.include }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read parity.yml's matrix
+        id: read
+        run: |
+          set -euo pipefail
+          include=$(yq -o=json -I=0 '.jobs.parity.strategy.matrix.include' .github/workflows/parity.yml)
+          echo "$include"
+          [ "$(jq 'length' <<<"$include")" -gt 0 ] || { echo "parity.yml lists no pairings" >&2; exit 1; }
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+
+  scoreboard:
+    # Not the parity rows' names, which are check names of their own.
+    name: Walk nixpkgs ${{ matrix.channel }} with Nix ${{ matrix.nix }}
+    needs: [pairings]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.pairings.outputs.include) }}
+    # Six hours is GitHub's ceiling for a hosted job, and a job that reaches
+    # its own limit is cancelled, which skips the summaries and the uploads.
+    # The walk's and the resource pass's own limits leave the job room for
+    # the setup before them, a cold Cabal build included, and for the steps
+    # after each.
+    timeout-minutes: 355
+    env:
+      NIX_VERSION: ${{ matrix.nix }}
+      NIXPKGS_REV: ${{ matrix.rev }}
+      LABEL: nixpkgs-${{ matrix.channel }}
+      # The walk and the resource pass each run in a transient systemd
+      # scope whose MemoryMax keeps them below the 16 GB of RAM a hosted
+      # runner has for a public repository, with 4 GB left for the system,
+      # the runner itself and the Nix daemon: at the bound the kernel's OOM
+      # killer ends an evaluator, and the runner stays up.
+      # OOMPolicy=continue keeps bench.sh, in the same scope, running to
+      # handle the kill, where systemd would otherwise stop the whole scope,
+      # and MemorySwapMax=0 makes the bound one of memory rather than of
+      # memory and swap.  The runner's passwordless sudo creates the scope
+      # and --uid runs bench.sh in it as the runner user.  The runner's
+      # sudoers refuses -E and sudo resets the environment, so --setenv
+      # passes on what the scope's processes read from the step: PATH, for
+      # the toolchain, and NIXPKGS_PATH.
+      MEMORY_MAX: 12G
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+        with:
+          install_url: https://releases.nixos.org/nix/nix-${{ env.NIX_VERSION }}/install
+
+      - name: Verify the oracle version
+        run: |
+          set -euo pipefail
+          actual=$(nix-instantiate --version)
+          expected="nix-instantiate (Nix) $NIX_VERSION"
+          echo "$actual"
+          [ "$actual" = "$expected" ] || { echo "expected $expected" >&2; exit 1; }
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Cache Cabal store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
+          restore-keys: cabal-Linux-
+
+      # The parity job's key, so the two share one cached tree per revision.
+      - name: Cache the pinned nixpkgs tree
+        id: nixpkgs-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: nixpkgs-ref
+          key: parity-nixpkgs-${{ runner.os }}-${{ env.NIXPKGS_REV }}
+
+      - name: Fetch the pinned nixpkgs tree
+        if: steps.nixpkgs-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git init nixpkgs-ref
+          git -C nixpkgs-ref remote add origin https://github.com/NixOS/nixpkgs
+          git -C nixpkgs-ref fetch --depth 1 origin "$NIXPKGS_REV"
+          git -C nixpkgs-ref checkout --detach FETCH_HEAD
+
+      # Validate cache hits too; neither evaluator may silently use another
+      # revision or a modified tracked file from a restored tree.
+      - name: Verify nixpkgs (both evaluators read this same tree)
+        run: |
+          set -euo pipefail
+          actual=$(git -C nixpkgs-ref rev-parse HEAD)
+          echo "nixpkgs rev: $actual"
+          [ "$actual" = "$NIXPKGS_REV" ] || { echo "unexpected nixpkgs revision" >&2; exit 1; }
+          git -C nixpkgs-ref diff --exit-code HEAD --
+          [ -z "$(git -C nixpkgs-ref ls-files --others --exclude-standard)" ] \
+            || { echo "unexpected untracked files in nixpkgs" >&2; exit 1; }
+          echo "NIXPKGS=$PWD/nixpkgs-ref" >> "$GITHUB_ENV"
+
+      - name: Build nova-nix
+        id: build
+        run: cabal build exe:nova-nix
+
+      # Minutes, where the walk below takes hours: a walk that misreads
+      # either evaluator fails here first.  The budget is below the
+      # fixture's attribute count, so each walk resumes after a spent budget
+      # as well as after each failure tryEval cannot catch.
+      - name: Check the walk on its fixture
+        timeout-minutes: 10
+        env:
+          SCOREBOARD_BUDGET: "4"
+        run: |
+          set -euo pipefail
+          NIXPKGS_PATH="$PWD/profiling/scoreboard-fixture" profiling/bench.sh fixture --scoreboard
+          for walk in upstream nova-nix; do
+            diff profiling/scoreboard-fixture/expected.txt "profiling/results/fixture/$walk/results.txt"
+          done
+
+      # The two evaluators walk at once, in one bounded scope.  A process
+      # the OOM killer ends there is retried at the attribute it was on, as
+      # bench.sh retries a heap overflow.  The Nix installer's
+      # NIX_SSL_CERT_FILE is passed on too, for a fetch upstream makes.
+      - name: Walk nixpkgs with both evaluators
+        id: walk
+        timeout-minutes: 180
+        run: |
+          sudo systemd-run --scope --quiet \
+            --uid="$(id -un)" --gid="$(id -gn)" \
+            --setenv=PATH="$PATH" --setenv=NIXPKGS_PATH="$NIXPKGS" \
+            --setenv=NIX_SSL_CERT_FILE="$NIX_SSL_CERT_FILE" \
+            -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0 -p OOMPolicy=continue \
+            profiling/bench.sh "$LABEL" --scoreboard
+
+      - name: Job summary
+        if: ${{ !cancelled() && steps.walk.outcome != 'skipped' }}
+        run: |
+          {
+            if [ -s "profiling/results/$LABEL/scoreboard.md" ]; then
+              cat "profiling/results/$LABEL/scoreboard.md"
+            else
+              echo "## nova-nix scoreboard: $LABEL"
+              echo
+              echo "The walk did not finish; the uploaded results hold what it settled."
+            fi
+            echo
+            echo "nixpkgs revision \`$NIXPKGS_REV\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The fixture's results too, which are what a failed check needs.
+      # Uploaded before the resource pass starts, so that a pass that takes
+      # the runner down costs only its own figures: no step runs on a runner
+      # that has gone.
+      - name: Upload the results
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scoreboard-${{ env.LABEL }}
+          path: profiling/results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # One nova-nix process over every attribute that evaluated, in a
+      # bounded scope of its own; bench.sh reports a kill there as the
+      # pass's result.
+      - name: Force what evaluated in one bounded process
+        id: resources
+        timeout-minutes: 120
+        run: |
+          sudo systemd-run --scope --quiet \
+            --uid="$(id -un)" --gid="$(id -gn)" \
+            --setenv=PATH="$PATH" --setenv=NIXPKGS_PATH="$NIXPKGS" \
+            -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0 -p OOMPolicy=continue \
+            profiling/bench.sh "$LABEL" --resources
+
+      - name: Resource summary
+        if: ${{ !cancelled() && steps.resources.outcome != 'skipped' }}
+        run: |
+          {
+            if [ -s "profiling/results/$LABEL/resources/resources.md" ]; then
+              cat "profiling/results/$LABEL/resources/resources.md"
+            else
+              echo "## nova-nix resource pass: $LABEL"
+              echo
+              echo "The resource pass did not finish; the uploaded resources hold its output so far."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the resource pass
+        if: ${{ !cancelled() && steps.resources.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scoreboard-${{ env.LABEL }}-resources
+          path: profiling/results/${{ env.LABEL }}/resources/
+          if-no-files-found: warn
+          retention-days: 14
