@@ -264,6 +264,11 @@ echo "== arithmetic and comparison as upstream's primops do them =="
 check "unary minus is 0 - e, so a float zero negates to positive zero" '[ (-(0.0)) (-(-0.0)) ]'
 check "division by a float, and integer division truncating toward zero" '[ (1 / 4.0) (7 / 2) ((-7) / 2) ]'
 check "a list comparison passes over equal elements of an unordered type" '[ ([ { } ] < [ { } ]) ([ { } 1 ] < [ { } 2 ]) ]'
+# Two sets of one size compare pair by pair in the order their names were
+# interned, which for these names, interned by neither evaluator at
+# startup, is the order the expression gives them.
+check "a set comparison decides at the pair whose name was interned first" '{ zb = 1; za = throw "a"; } == { zb = 2; za = 1; }'
+refused "a set comparison compares a pair's values before a later pair's names" '{ zq1 = throw "x"; zq2 = 1; } == { zq1 = 1; zq3 = 1; }'
 echo
 
 echo "== what a call, a select and abort refuse =="

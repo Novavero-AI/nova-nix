@@ -791,8 +791,72 @@ testEvalComparison = do
       runTest "two functions are never equal" $
         assertEval "eq-fns" "[ (y: y) ] == [ (y: y) ]" (VBool False),
       runTest "a NaN both sides share is equal to itself" $
-        assertEval "eq-shared-nan" "let nan = (1.0e308 * 10) * 0.0; in [ nan ] == [ nan ]" (VBool True)
+        assertEval "eq-shared-nan" "let nan = (1.0e308 * 10) * 0.0; in [ nan ] == [ nan ]" (VBool True),
+      -- Upstream's eqValues compares two derivations by their outPaths,
+      -- takes sets of different sizes as unequal, and walks two sets of
+      -- one size pair by pair in symbol order, each pair's names and then
+      -- its values, stopping at the first difference (eval.cc:2763-2782
+      -- at 2.24.9).  A symbol's order is the order the table interned the
+      -- name in, so the walk's order is pinned in a child process, whose
+      -- table is new: there, as under upstream, the names below are
+      -- interned in the order the expression gives them, since neither
+      -- evaluator interns them at startup.
+      emits
+        "== compares a pair's values before a later pair's names"
+        "builtins.trace ({ zq1 = throw \"x\"; zq2 = 1; } == { zq1 = 1; zq3 = 1; }) null"
+        ["error: x"],
+      emits
+        "== decides at the pair whose name was interned first"
+        "builtins.trace ({ zb = 1; za = throw \"a\"; } == { zb = 2; za = 1; }) null"
+        ["trace: false"],
+      runTest "== takes a smaller set as unequal without forcing a value" $
+        assertEval "eq-set-smaller" "{ zs1 = throw \"a\"; } == { zs1 = throw \"a\"; zs2 = 1; }" (VBool False),
+      runTest "== takes a larger set as unequal without forcing a value" $
+        assertEval "eq-set-larger" "{ zs1 = throw \"a\"; zs2 = 1; } == { zs1 = throw \"a\"; }" (VBool False),
+      runTest "== compares two derivations by outPath before their sizes or other values" $
+        assertEval
+          "eq-drv-outpath-first"
+          "{ type = \"derivation\"; outPath = \"/a\"; x = throw \"x\"; } == { type = \"derivation\"; outPath = \"/a\"; }"
+          (VBool True),
+      runTestM "== on two sets answers as a comparison of their names, then their values by name, whenever both answer" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genSetPair setEqualityAgrees
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
+  where
+    -- Two sets over a pool of names new to each case, so the left set's
+    -- order of them, shuffled, is their interning order, which is not
+    -- their name order.  The right set has the left's names in another
+    -- order or any others from the pool, so the two can differ in size or
+    -- in a name; a value is 0, 1 or a throw.
+    genSetPair = do
+      tag <- QC.choose (0, maxBound :: Int)
+      let pool = [T.pack ("eqOrder" <> show tag <> "n" <> show i) | i <- [0 .. 5 :: Int]]
+      leftNames <- QC.shuffle =<< QC.sublistOf pool
+      rightNames <- QC.oneof [QC.shuffle leftNames, QC.shuffle =<< QC.sublistOf pool]
+      (,) <$> bindingsOf leftNames <*> bindingsOf rightNames
+    bindingsOf names = zip names <$> QC.vectorOf (length names) genSetValue
+    genSetValue = QC.frequency [(4, QC.elements ["0", "1"]), (1, pure throwingValue)]
+    throwingValue = "throw \"t\""
+    setSource bindings = "{ " <> T.concat [name <> " = " <> value <> "; " | (name, value) <- bindings] <> "}"
+    -- The walk's order decides which failure wins and nothing else: where
+    -- both answer, it answers as a comparison of the names whole and then
+    -- the values in name order does.  With no throwing value, both answer.
+    setEqualityAgrees (left, right) =
+      let walked = evalNix (setSource left <> " == " <> setSource right)
+          byName =
+            evalNix
+              ( "let a = "
+                  <> setSource left
+                  <> "; b = "
+                  <> setSource right
+                  <> "; names = builtins.attrNames a; in names == builtins.attrNames b && builtins.all (n: a.${n} == b.${n}) names"
+              )
+          throws = any ((== throwingValue) . snd) (left ++ right)
+       in QC.counterexample (show (walked, byName)) $ case (walked, byName) of
+            (Right answer, Right expected) -> answer == expected
+            _ -> throws
 
 -- ---------------------------------------------------------------------------
 -- Tests: Eval - Logic

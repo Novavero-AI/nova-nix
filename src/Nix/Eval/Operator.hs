@@ -35,9 +35,9 @@ import Nix.Eval.Types
     MonadEval (..),
     NixValue (..),
     Thunk (..),
-    attrSetElems,
-    attrSetKeys,
+    attrSetAt,
     attrSetLookup,
+    attrSetSize,
     thunkSameRef,
     typeName,
     typeOfValue,
@@ -274,28 +274,41 @@ nixEqual forceFn (VList clA) (VList clB) = do
       as <- map Thunk <$> clistThunks clA
       bs <- map Thunk <$> clistThunks clB
       listEqual forceFn as bs
+-- Upstream's @eqValues@ on two sets (eval.cc:2763-2782 at 2.24.9): two
+-- derivations by their outPaths, then sets of different sizes unequal
+-- with no value forced, then 'attrsEqualFrom'.
 nixEqual forceFn (VAttrs as) (VAttrs bs) = do
   drvOutPaths <- derivationOutPathPair forceFn as bs
   case drvOutPaths of
     Just outPathPair -> thunkPairEqual forceFn outPathPair
     Nothing -> do
-      keysA <- attrSetKeys as
-      keysB <- attrSetKeys bs
-      if keysA /= keysB
-        then pure False
-        else do
-          -- Short-circuit on the first mismatch: later pairs are never
-          -- forced, so errors past the deciding pair cannot surface
-          -- (upstream stops comparing there too).
-          elemsA <- attrSetElems as
-          elemsB <- attrSetElems bs
-          allPairsEqual (zip elemsA elemsB)
-  where
-    allPairsEqual [] = pure True
-    allPairsEqual (pair : rest) = do
-      eq <- thunkPairEqual forceFn pair
-      if eq then allPairsEqual rest else pure False
+      sizeA <- attrSetSize as
+      sizeB <- attrSetSize bs
+      if sizeA /= sizeB then pure False else attrsEqualFrom forceFn as bs 0
 nixEqual _ _ _ = pure False
+
+-- | Upstream's walk over two sets of one size (eval.cc:2776-2781 at
+-- 2.24.9): both in their arrays' order from the index given, each pair's
+-- names compared and then its values, stopping at the first difference,
+-- so no value past it is forced.  Upstream's @Bindings@ are sorted by
+-- @Symbol@, whose id is the order its table interned the name in
+-- (attr-set.hh and symbol-table.hh), and the arrays here are sorted by
+-- symbol id the same way.  Two sets therefore compare in upstream's order,
+-- since this table interns names in the order upstream's does: its startup
+-- names first ('Nix.Eval.StartupSymbols'), then each name where upstream's
+-- parser interns it, and no string value at all.
+attrsEqualFrom :: (MonadEval m) => Force m -> AttrSet -> AttrSet -> Int -> m Bool
+attrsEqualFrom forceFn as bs i = do
+  entryA <- attrSetAt as i
+  entryB <- attrSetAt bs i
+  case (entryA, entryB) of
+    (Just (nameA, a), Just (nameB, b))
+      | nameA /= nameB -> pure False
+      | otherwise -> do
+          eq <- thunkPairEqual forceFn (a, b)
+          if eq then attrsEqualFrom forceFn as bs (i + 1) else pure False
+    (Nothing, Nothing) -> pure True
+    _ -> pure False
 
 -- | When both attr sets are derivations (a @type@ attr forcing to the string
 -- @"derivation"@) and both carry an @outPath@, the pair of outPath thunks.
