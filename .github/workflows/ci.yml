@@ -2630,11 +2630,15 @@ jobs:
   # GCC 10 (Windows): gcc46-cxx builds GCC 10.4.0 with C and C++, gcc10,
   # with GMP, MPFR and MPC in its tree, whose gcc and g++
   # test/data/gcc10.nix has link a C and a C++ program that run, and whose
-  # programs it finds carrying no time stamp.
+  # programs it finds carrying no time stamp.  gcc10 then compiles the
+  # current MinGW-w64's runtime over its headers, whose files and start
+  # file test/data/mingw-w64-latest.nix compares with other builds of the
+  # release, and against which it has gcc10 link a program that runs.
   #
   # The timeout is twice an estimate of this stage on the ARM64 leg, about
-  # 70 minutes: on a 24-thread x64 Windows machine gcc10 builds in 13
-  # minutes where gcc46-cxx builds in 8, which takes about 40 on that leg.
+  # 65 minutes: the stage took 52 there with gcc10 alone, and on a
+  # 24-thread x64 Windows machine, where gcc10 builds in 13 minutes, the
+  # current MinGW-w64 builds in 3.
   # ---------------------------------------------------------------------------
   gcc10-windows:
     name: GCC 10 (${{ matrix.name }})
@@ -2652,7 +2656,7 @@ jobs:
             name: Windows ARM64
             publish: false
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 140
+    timeout-minutes: 130
     environment:
       name: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.publish && 'cache' || '' }}
     steps:
@@ -2785,6 +2789,53 @@ jobs:
             diff "$expected" "$lines"
             exit 1
           fi
+
+      # MinGW-w64 v14.0.0's headers, installed by the seed stdenv, and its
+      # runtime for i686-w64-mingw32, configured, compiled and installed in
+      # the seed stdenv by gcc10, each timed.
+      - name: Build the current MinGW-w64
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attr in mingw-w64-headers-latest mingw-w64-crt-latest; do
+            start=$SECONDS
+            "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A "$attr"
+            echo "== $attr built in $((SECONDS - start)) s"
+          done
+
+      # busybox's sh runs test/data/mingw-w64-latest.nix's two scripts.  crt
+      # lists every file the runtime installs and crt2.o's global symbols,
+      # which a configure test decides without failing the build, and the
+      # lines are compared with what the release's Makefile installs and
+      # with the crt2.o another GCC compiled.  hello has gcc10 compile and
+      # link a program against the runtime, which calls three functions the
+      # runtime compiles with builtins GCC 4.6.4 lacks, runs it, and writes
+      # what it prints and its exit status, the DLLs it imports, the three
+      # functions it links and how many debugging sections it has, and the
+      # lines are compared with what MinGW-w64's headers and sources define
+      # the program to print and what the configuration links.
+      - name: gcc10 links a program against the current MinGW-w64
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in crt hello; do
+            expected=test/data/mingw-w64-latest-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mingw-w64-latest.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
 
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
