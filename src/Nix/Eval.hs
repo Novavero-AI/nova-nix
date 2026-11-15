@@ -211,7 +211,7 @@ import Nix.Expr.Types
     Expr (..),
     UnaryOp (..),
   )
-import Nix.Hash (base64HashLen, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
+import Nix.Hash (base64HashLen, base64ToBytes, bytesToHexText, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
 import Nix.Json (IntegerRange (..), Json (..), parseJsonWith, renderJson)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
@@ -4321,14 +4321,15 @@ verifyFetchPin ctx url bytes expectedStr = do
 -- | Decode a sha256 pin to raw bytes, reusing the convertHash decoders (SRI,
 -- @sha256:@-prefixed, or a bare hex/nix32/base64 digest).
 decodeSha256Pin :: (MonadEval m) => Text -> Text -> m BS.ByteString
-decodeSha256Pin ctx s
-  | Just (algo, b64) <- parseSRI s = do
-      requireSha256 algo
-      decodeSRI ctx algo b64
-  | Just (algo, rest) <- parseAlgoPrefix s = do
-      requireSha256 algo
-      snd <$> decodeWithAlgo algo rest
-  | otherwise = snd <$> decodeWithAlgo "sha256" s
+decodeSha256Pin ctx s = case hashSpelling s of
+  Left unknown -> throwEvalError unknown
+  Right (SriHash algo b64) -> do
+    requireSha256 algo
+    decodeSRI algo b64
+  Right (PrefixedHash algo rest) -> do
+    requireSha256 algo
+    snd <$> decodeWithAlgo algo rest
+  Right UntaggedHash -> snd <$> decodeWithAlgo "sha256" s
   where
     -- The pin names a sha256 digest specifically, so a spelling carrying
     -- its own algorithm tag must carry sha256 - a sha512 pin here is an
@@ -4775,17 +4776,18 @@ optDrvStrAttr key attrs =
 -- the algorithm an SRI or prefixed spelling carries: the enforced
 -- algorithm must be the declared one, never a silent substitute.
 normalizeFixedHash :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
-normalizeFixedHash ohash ohAlgo
-  | Just (algo, b64) <- parseSRI ohash = do
-      requireDeclaredAlgo algo
-      bytes <- decodeSRI "derivation" algo b64
-      pure (algo, bytes)
-  | Just (algo, rest) <- parseAlgoPrefix ohash = do
-      requireDeclaredAlgo algo
-      decodeWithAlgo algo rest
-  | not (T.null ohAlgo) = decodeWithAlgo ohAlgo ohash
-  | otherwise =
-      throwEvalError ("derivation: cannot determine outputHash algorithm for " <> ohash)
+normalizeFixedHash ohash ohAlgo = case hashSpelling ohash of
+  Left unknown -> throwEvalError unknown
+  Right (SriHash algo b64) -> do
+    requireDeclaredAlgo algo
+    (algo,) <$> decodeSRI algo b64
+  Right (PrefixedHash algo rest) -> do
+    requireDeclaredAlgo algo
+    decodeWithAlgo algo rest
+  Right UntaggedHash
+    | not (T.null ohAlgo) -> decodeWithAlgo ohAlgo ohash
+    | otherwise ->
+        throwEvalError ("derivation: cannot determine outputHash algorithm for " <> ohash)
   where
     -- 'decodeSha256Pin's requireSha256 with the expected type supplied by
     -- @outputHashAlgo@ instead of fixed at sha256 (upstream's typed Hash
@@ -5002,36 +5004,37 @@ builtinConvertHash other =
 
 -- | Extract algo + raw bytes from the hash input, handling SRI, prefixed, and plain formats.
 decodeHashInput :: (MonadEval m) => AttrSet -> Text -> m (Text, BS.ByteString)
-decodeHashInput attrs hashStr
-  -- SRI format: algo-base64
-  | Just (algo, b64) <- parseSRI hashStr = do
-      bytes <- decodeSRI "convertHash" algo b64
-      pure (algo, bytes)
-  -- Prefixed format: algo:hex or algo:nix32
-  | Just (algo, rest) <- parseAlgoPrefix hashStr =
-      decodeWithAlgo algo rest
+decodeHashInput attrs hashStr = case hashSpelling hashStr of
+  Left unknown -> throwEvalError unknown
+  Right (SriHash algo b64) -> (algo,) <$> decodeSRI algo b64
+  Right (PrefixedHash algo rest) -> decodeWithAlgo algo rest
   -- Plain hash - need hashAlgo attribute
-  | otherwise = do
-      algo <- requireStrAttr "convertHash" "hashAlgo" attrs
-      decodeWithAlgo algo hashStr
+  Right UntaggedHash -> do
+    algo <- requireStrAttr "convertHash" "hashAlgo" attrs
+    decodeWithAlgo algo hashStr
 
--- | Decode a bare hash string for a known algorithm, keyed by length as
--- upstream (@hash.cc@ @Hash@ parsing): an algorithm's base16, nix32, and
--- base64 spellings have pairwise distinct lengths, so the input length
--- selects the decoder and every other length is an error.  Trying decoders
--- in sequence instead mis-reads edge inputs - an all-hex-digit string of
--- nix32 length is a nix32 hash, and a truncated hash must be rejected, not
--- decoded by whichever shorter format happens to accept it.
+-- | Decode a bare hash string for a known algorithm, keyed by its length
+-- as upstream's @Hash@ constructor keys it (hash.cc:205-262 at 2.24.9):
+-- an algorithm's base16, nix32, and base64 spellings have pairwise
+-- distinct lengths, so the input length selects the decoder and every
+-- other length is an error.  Trying decoders in sequence instead
+-- mis-reads edge inputs - an all-hex-digit string of nix32 length is a
+-- nix32 hash, and a truncated hash must be rejected, not decoded by
+-- whichever shorter format happens to accept it.  The length is counted
+-- in bytes, as upstream counts it, not in characters: base64 decoding
+-- ignores what follows the padding, and a character there that UTF-8
+-- spells in more than one byte must still make the length wrong.
 decodeWithAlgo :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
 decodeWithAlgo algo s = case hashAlgoBytes algo of
   Nothing -> throwEvalError ("unknown hash algorithm '" <> algo <> "'")
   Just size
-    | T.length s == hexHashLen size -> accept size "base16" (hexToBytes s)
-    | T.length s == nix32HashLen size -> accept size "nix32" (rightToMaybe (Nix32.decode s))
-    | T.length s == base64HashLen size -> accept size "base64" (rightToMaybe (decodeBase64Pure s))
+    | len == hexHashLen size -> accept size "base16" (hexToBytes s)
+    | len == nix32HashLen size -> accept size "nix32" (rightToMaybe (Nix32.decode s))
+    | len == base64HashLen size -> (algo,) <$> base64Digest "base-64" size s
     | otherwise ->
         throwEvalError ("hash '" <> s <> "' has wrong length for hash algorithm '" <> algo <> "'")
   where
+    len = BS.length (TE.encodeUtf8 s)
     accept size spelling decoded = case decoded of
       Just bytes | BS.length bytes == size -> pure (algo, bytes)
       _ -> throwEvalError ("hash '" <> s <> "' is not a valid " <> spelling <> " " <> algo <> " hash")
@@ -5042,33 +5045,52 @@ decodeWithAlgo algo s = case hashAlgoBytes algo of
 -- base64 of the wrong byte count is an invalid hash at eval time, not a
 -- short digest that defers failure to fetch or build time.  Shared by
 -- convertHash, the fetch pins, and fixed-output outputHash.
-decodeSRI :: (MonadEval m) => Text -> Text -> Text -> m BS.ByteString
-decodeSRI ctx algo b64 = case hashAlgoBytes algo of
-  -- Unreachable via parseSRI (it admits only known algorithm tags), but
-  -- this helper must not silently skip the check for an unknown one.
+decodeSRI :: (MonadEval m) => Text -> Text -> m BS.ByteString
+decodeSRI algo b64 = case hashAlgoBytes algo of
+  -- Unreachable via 'hashSpelling' (it admits only known algorithm tags),
+  -- but this helper must not silently skip the check for an unknown one.
   Nothing -> throwEvalError ("unknown hash algorithm '" <> algo <> "'")
-  Just size -> do
-    bytes <- decodeBase64E ctx b64
-    when (BS.length bytes /= size) $
-      throwEvalError
-        ("hash '" <> algo <> "-" <> b64 <> "' has wrong length for hash algorithm '" <> algo <> "'")
-    pure bytes
+  Just size -> base64Digest "SRI" size b64
 
--- | Parse @sha256-base64...@ SRI format.
-parseSRI :: Text -> Maybe (Text, Text)
-parseSRI t = case T.breakOn "-" t of
-  (algo, rest)
-    | not (T.null rest) && algo `elem` ["sha256", "sha512", "sha1", "md5"] ->
-        Just (algo, T.drop 1 rest)
-  _ -> Nothing
+-- | Decode a digest spelled in base64, SRI or bare, and check its decoded
+-- length, as the base64 branch of upstream's @Hash@ constructor does
+-- (hash.cc:247-258 at 2.24.9).  A refused character is the same error as
+-- a wrong length there: the constructor catches @base64Decode@'s
+-- exception without rethrowing it, so the length check fails on the empty
+-- result.
+base64Digest :: (MonadEval m) => Text -> Int -> Text -> m BS.ByteString
+base64Digest spelling size encoded = case base64ToBytes encoded of
+  Just bytes | BS.length bytes == size -> pure bytes
+  _ -> throwEvalError ("invalid " <> spelling <> " hash '" <> encoded <> "'")
 
--- | Parse @sha256:value@ prefixed format.
-parseAlgoPrefix :: Text -> Maybe (Text, Text)
-parseAlgoPrefix t = case T.breakOn ":" t of
-  (algo, rest)
-    | not (T.null rest) && algo `elem` ["sha256", "sha512", "sha1", "md5"] ->
-        Just (algo, T.drop 1 rest)
-  _ -> Nothing
+-- | A hash string, its algorithm tag split off.
+data HashSpelling
+  = -- | @algo:digest@, the digest in base16, nix32 or base64 by its length.
+    PrefixedHash !Text !Text
+  | -- | @algo-digest@ (SRI), the digest in base64.
+    SriHash !Text !Text
+  | -- | No tag: the algorithm comes from context.
+    UntaggedHash
+
+-- | Split a hash string's algorithm tag off as upstream's
+-- @getParsedTypeAndSRI@ does (hash.cc:150-169 at 2.24.9): at the first
+-- @:@, else at the first @-@, which marks SRI.  The tag is everything
+-- before the separator, and one that names no known algorithm is an
+-- error.  Base64 decoding ignores what follows the padding, so this split
+-- is what refuses a separator there: @sha256-...=:x@ names the algorithm
+-- @sha256-...=@.
+hashSpelling :: Text -> Either Text HashSpelling
+hashSpelling s
+  | Just (tag, digest) <- splitTag ":" = tagged PrefixedHash tag digest
+  | Just (tag, digest) <- splitTag "-" = tagged SriHash tag digest
+  | otherwise = Right UntaggedHash
+  where
+    splitTag sep = case T.breakOn sep s of
+      (tag, rest) | not (T.null rest) -> Just (tag, T.drop 1 rest)
+      _ -> Nothing
+    tagged spelling tag digest
+      | isJust (hashAlgoBytes tag) = Right (spelling tag digest)
+      | otherwise = Left ("unknown hash algorithm '" <> tag <> "'")
 
 -- | Require a string attribute from an attrset.
 requireStrAttr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
@@ -5081,32 +5103,12 @@ requireStrAttr ctx key attrs = case attrSetLookup key attrs of
   Nothing -> throwEvalError ("builtins." <> ctx <> ": missing required attribute '" <> key <> "'")
 
 -- ---------------------------------------------------------------------------
--- Base64 encode/decode - delegates to nova-cache (base64-bytestring under the hood)
+-- Base64 encoding - delegates to nova-cache (base64-bytestring under the hood)
 -- ---------------------------------------------------------------------------
 
 -- | Encode bytes to base64.
 bytesToBase64 :: BS.ByteString -> Text
 bytesToBase64 = B64.encode
-
--- | Decode base64 text to bytes (pure).
-decodeBase64Pure :: Text -> Either Text BS.ByteString
-decodeBase64Pure t =
-  -- Strip whitespace and any existing padding, then re-pad to a multiple of
-  -- 4.  base64-bytestring's 'decode' requires correct padding, so SRI hashes
-  -- (correctly-padded standard base64, e.g. @sha256-...NQ=@) would otherwise be
-  -- rejected once their trailing @=@ was removed.
-  let stripped = T.filter (\c -> c /= '\n' && c /= '\r' && c /= '=') t
-      padLen = (4 - (T.length stripped `mod` 4)) `mod` 4
-      padded = stripped <> T.replicate padLen "="
-   in case B64.decode padded of
-        Right bytes -> Right bytes
-        Left _ -> Left "invalid base64"
-
--- | Decode base64 with error context for builtins.
-decodeBase64E :: (MonadEval m) => Text -> Text -> m BS.ByteString
-decodeBase64E ctx t = case decodeBase64Pure t of
-  Right bytes -> pure bytes
-  Left _ -> throwEvalError ("builtins." <> ctx <> ": invalid base64 encoding")
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - fromTOML

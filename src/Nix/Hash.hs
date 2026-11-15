@@ -37,6 +37,7 @@ module Nix.Hash
     hashPlaceholder,
     byteToHex,
     hexToBytes,
+    base64ToBytes,
     rawHashWithAlgo,
     IncrementalHash,
     hashInitWithAlgo,
@@ -64,10 +65,10 @@ module Nix.Hash
 where
 
 import qualified Crypto.Hash as CH
-import Data.Bits (xor)
+import Data.Bits (shiftL, shiftR, xor, (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
-import Data.Char (digitToInt, isHexDigit)
+import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -161,6 +162,35 @@ hexToBytes t
     pairs [] = []
     pairs (hi : lo : rest) = fromIntegral (digitToInt hi * 16 + digitToInt lo) : pairs rest
     pairs [_] = [] -- unreachable: even length checked above
+
+-- | Decode base64 as upstream's @base64Decode@ does (util.cc:240-275 at
+-- 2.24.9).  Reading stops at the first @=@, so nothing after it is read;
+-- a newline is skipped; any other character outside the standard
+-- alphabet, a carriage return among them, refuses the input; and the bits
+-- left after the last whole byte are dropped, whatever their value.
+base64ToBytes :: Text -> Maybe BS.ByteString
+base64ToBytes encoded =
+  BS.pack . sextetsToBytes <$> traverse sextet (T.unpack (T.filter (/= '\n') (T.takeWhile (/= '=') encoded)))
+  where
+    sextet :: Char -> Maybe Word8
+    sextet c
+      | isAsciiUpper c = Just (fromIntegral (ord c - ord 'A'))
+      | isAsciiLower c = Just (fromIntegral (ord c - ord 'a' + 26))
+      | isDigit c = Just (fromIntegral (ord c - ord '0' + 52))
+      | c == '+' = Just 62
+      | c == '/' = Just 63
+      | otherwise = Nothing
+    -- Four sextets make three bytes, a final three make two and a final
+    -- two make one; a final one is six bits, short of a byte.  'shiftL'
+    -- on a 'Word8' drops the bits that belong to the previous byte.
+    sextetsToBytes (a : b : c : d : rest) = joinFirst a b : joinSecond b c : joinThird c d : sextetsToBytes rest
+    sextetsToBytes [a, b, c] = [joinFirst a b, joinSecond b c]
+    sextetsToBytes [a, b] = [joinFirst a b]
+    sextetsToBytes [_] = []
+    sextetsToBytes [] = []
+    joinFirst a b = shiftL a 2 .|. shiftR b 4
+    joinSecond b c = shiftL b 4 .|. shiftR c 2
+    joinThird c d = shiftL c 6 .|. d
 
 -- | Raw digest of a 'BS.ByteString' under a named algorithm (@sha256@,
 -- @sha512@, @sha1@, @md5@).  Returns 'Nothing' for an unknown algorithm.
