@@ -35,7 +35,8 @@ permissions:
 # that leaves to the daily run).  Merge-group runs are the queue's own
 # evidence and are left alone for the same reason as main's.  The event is
 # in the group so that a run seed.yml calls on main neither waits behind
-# nor cancels a push's.
+# nor cancels a push's.  pr-closed.yml spells a pull request's group out to
+# cancel its run once it closes, so a change to the group changes it too.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
