@@ -34,6 +34,7 @@ module Nix.Eval.Print
   ( PrintOptions (..),
     printValue,
     printAmbiguous,
+    printSymbol,
     formatXmlFloat,
   )
 where
@@ -146,7 +147,7 @@ printAttrs options depth attrs
   where
     printAttr (name, thunk) = do
       shown <- printThunk options (depth + 1) thunk
-      pure (builderText (printIdentifier (TE.encodeUtf8 name)) <> " = " <> shown <> ";")
+      pure (printSymbol name <> " = " <> shown <> ";")
     countAttr counts = counts {shownAttrs = shownAttrs counts + 1}
     elidedAttrs left = elided left "attribute" "attributes"
 
@@ -390,6 +391,13 @@ bracketed open close items = open <> " " <> foldMap (<> " ") items <> close
 -- upstream's marker for a thunk when it was never forced.
 printElement :: Thunk -> Printer BB.Builder
 printElement thunk = maybe (pure "<CODE>") (printAmbiguousAt (Just thunk)) (readThunkValue thunk)
+
+-- | A name as upstream writes a symbol into a message: its @operator<<@ on
+-- a @SymbolStr@ writes it through @printIdentifier@ (nixexpr.cc:20-24 at
+-- 2.24.9, 2.34.9 and 2.35.4), so a name that is not an identifier, the
+-- empty name or a keyword prints as a string literal.
+printSymbol :: Text -> Text
+printSymbol = builderText . printIdentifier . TE.encodeUtf8
 
 -- | Upstream's @printIdentifier@ (print.cc), which @printAmbiguous@ writes
 -- an attribute name through (nixexpr.cc's @operator<<@ on a symbol): a

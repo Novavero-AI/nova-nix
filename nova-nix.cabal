@@ -72,6 +72,7 @@ library
     Nix.Eval.Print
     Nix.Eval.SourceError
     Nix.Eval.SourcePos
+    Nix.Eval.StartupSymbols
     Nix.Eval.StringInterp
     Nix.Eval.Symbol
     Nix.Eval.AllocSite

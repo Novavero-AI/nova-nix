@@ -22,6 +22,7 @@ module Nix.Eval.Types
     attrSetLookup,
     attrSetLookupEntry,
     attrSetKeys,
+    firstInSymbolOrder,
     attrSetToMap,
     attrSetFromMap,
     attrSetFromEntries,
@@ -122,6 +123,8 @@ import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int64)
+import Data.List.NonEmpty (NonEmpty)
+import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -141,17 +144,17 @@ import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetP
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CEnv (NnEnv, cenvAllocSlots, cenvAllocWithScopes, cenvEmpty, cenvFromSlots, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewMinimal, cenvParent, cenvRootScope, cenvSlotCount, cenvWithCount, cenvWithScopes)
-import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaNameSym, clambdaNew, clambdaSetEntry)
+import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaLambdaNameSym, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CStatus (checkedCPtr)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval)
-import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..))
+import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.Policy (EvalPolicy (..), unrestrictedPolicy)
 import Nix.Eval.SourcePos (PosIdx, noPos)
-import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
+import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
 import Nix.Store.Path (BadStorePath, StorePath, badStorePathText)
 import Nix.Store.Path.Internal (StorePath (StorePath))
@@ -417,6 +420,14 @@ attrSetLookupEntry key (AttrSet cset) =
 attrSetKeys :: AttrSet -> [Text]
 attrSetKeys (AttrSet cset) =
   map symbolText (unsafePerformIO (cattrsetKeys cset))
+
+-- | The name with the least symbol, the one a set holding them all would
+-- hold first ('attrSetKeys').  A name not yet interned is interned here,
+-- as 'attrSetLookup' interns a key it looks up; 'unsafePerformIO' is safe
+-- for the same reason: a name keeps the symbol it was first given.
+firstInSymbolOrder :: NonEmpty Text -> Text
+firstInSymbolOrder names =
+  snd (NE.head (NE.sortWith fst (NE.zip (unsafePerformIO (traverse symbolIntern names)) names)))
 
 -- | Check key membership without materializing thunks.
 attrSetMember :: Text -> AttrSet -> Bool
@@ -953,19 +964,21 @@ marshalLambda :: Ptr NnEnv -> EvalFormals -> Word32 -> IO (Ptr ())
 marshalLambda envPtr formals bodyBcIdx = case formals of
   EFName name -> do
     Symbol nameSym <- symbolIntern name
-    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 0 nameSym 0 0
+    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 0 nameSym invalidSymbolId 0 0
     pure (castPtr lam)
-  EFSet entries allowExtra -> do
+  EFSet lambdaName entries allowExtra -> do
+    lambdaSym <- lambdaNameSymbol lambdaName
     let count = fromIntegral (length entries) :: Word32
         extraFlag = if allowExtra then 1 else 0 :: Word8
-    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 1 0 extraFlag count
+    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 1 0 lambdaSym extraFlag count
     fillEntries lam 0 entries
     pure (castPtr lam)
-  EFNamedSet name entries allowExtra -> do
+  EFNamedSet lambdaName name entries allowExtra -> do
+    lambdaSym <- lambdaNameSymbol lambdaName
     Symbol nameSym <- symbolIntern name
     let count = fromIntegral (length entries) :: Word32
         extraFlag = if allowExtra then 1 else 0 :: Word8
-    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 2 nameSym extraFlag count
+    lam <- checkedCPtr "nn_lambda_new" =<< clambdaNew envPtr bodyBcIdx 2 nameSym lambdaSym extraFlag count
     fillEntries lam 0 entries
     pure (castPtr lam)
   where
@@ -991,16 +1004,18 @@ unmarshalLambdaValue rawPtr = do
       nameSym <- clambdaNameSym lamPtr
       pure (EFName (symbolText (Symbol nameSym)))
     1 {- Set -} -> do
+      lambdaSym <- clambdaLambdaNameSym lamPtr
       count <- clambdaFormalCount lamPtr
       extra <- clambdaAllowExtra lamPtr
       entries <- readLambdaEntries lamPtr count
-      pure (EFSet entries (extra /= 0))
+      pure (EFSet (lambdaNameFromSymbol lambdaSym) entries (extra /= 0))
     _ {- NamedSet -} -> do
+      lambdaSym <- clambdaLambdaNameSym lamPtr
       nameSym <- clambdaNameSym lamPtr
       count <- clambdaFormalCount lamPtr
       extra <- clambdaAllowExtra lamPtr
       entries <- readLambdaEntries lamPtr count
-      pure (EFNamedSet (symbolText (Symbol nameSym)) entries (extra /= 0))
+      pure (EFNamedSet (lambdaNameFromSymbol lambdaSym) (symbolText (Symbol nameSym)) entries (extra /= 0))
   pure (VLambda (Env envPtr) formals bodyIdx)
   where
     -- Zero-formal set patterns ({}:, { ... }:) store count 0 and a NULL
@@ -1479,15 +1494,15 @@ newtype PureEval a = PureEval (ReaderT CallDepth (Either PureError) a)
 pureFailure :: PureError -> PureEval a
 pureFailure = PureEval . lift . Left
 
--- | Run a pure evaluation, flattening the internal error into 'Text'.  An abort
--- is prefixed @\"evaluation aborted: \"@, matching t'Nix.Eval.IO.EvalIO'.
+-- | Run a pure evaluation, flattening the internal error into 'Text': a
+-- failure's message, as t'Nix.Eval.IO.EvalIO' reports it.
 runPureEval :: PureEval a -> Either Text a
 runPureEval (PureEval action) =
   case runReaderT action (topLevelCallDepth defaultMaxCallDepth) of
     Right a -> Right a
     Left (PThrow t) -> Left t
     Left (PError t) -> Left t
-    Left (PAbort t) -> Left ("evaluation aborted: " <> t)
+    Left (PAbort t) -> Left t
 
 instance MonadEval PureEval where
   throwEvalError = pureFailure . PError

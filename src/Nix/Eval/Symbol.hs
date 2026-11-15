@@ -13,6 +13,7 @@
 module Nix.Eval.Symbol
   ( -- * Symbol type
     Symbol (..),
+    invalidSymbolId,
 
     -- * Lifecycle
     symbolInit,
