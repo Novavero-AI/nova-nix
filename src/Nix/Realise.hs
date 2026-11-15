@@ -61,6 +61,8 @@ import Control.Monad (filterM, void)
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
+import Data.List.NonEmpty (NonEmpty)
+import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -68,7 +70,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Nix.DependencyGraph (DepGraph (..), DepNode (..), directDeps)
+import Nix.DependencyGraph (DepGraph (..), DepNode (..))
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
 import Nix.Derivation.StructuredAttrs (structuredAttrsKey)
 import Nix.Json (Json (..), parseJson)
@@ -339,6 +341,9 @@ data RealiseFailure
   | -- | Under 'BuildCheck', the graph holds no derivation at the root, so
     -- nothing was built again or compared.
     MissingDerivation !StorePath
+  | -- | A dependent asked this derivation for outputs it does not have,
+    -- named in order.
+    MissingOutputs !StorePath !(NonEmpty Text)
   deriving (Eq, Show)
 
 -- | A failure as the build reports it, given the directory the store's
@@ -349,7 +354,8 @@ data RealiseFailure
 -- @registerOutputs@ raises when neither @keep-failed@ nor @run-diff-hook@
 -- is set (local-derivation-goal.cc:2713).  A root the graph does not hold
 -- reads as upstream's goal for a derivation it cannot load
--- (@DerivationGoal::loadDerivation@).
+-- (@DerivationGoal::loadDerivation@), and an output asked of a derivation
+-- that does not have it as upstream's @checkPathValidity@ refuses it.
 --
 -- A @.drv@ is named under the logical store directory, wherever the
 -- store's files live, as upstream's @printStorePath@ names it: a store
@@ -376,6 +382,8 @@ realiseFailureMessage realDir failure = case failure of
       <> "' differs"
   MissingDerivation drvPath ->
     "cannot build missing derivation '" <> logical drvPath <> "'"
+  MissingOutputs drvPath names ->
+    "derivation '" <> logical drvPath <> "' does not have wanted outputs " <> T.intercalate ", " ["'" <> name <> "'" | name <- NE.toList names]
   where
     logical = storePathToText defaultStoreDir
 
@@ -405,12 +413,13 @@ realiseFailureStatus failure = case failure of
   InvalidDerivation _ -> failureStatus
   OutputsNotValid _ -> failureStatus
   MissingDerivation _ -> failureStatus
+  MissingOutputs _ _ -> failureStatus
 
 -- | How one derivation came to be realised.
 data Realised
-  = -- | Every output was already valid.
+  = -- | Every output asked of it was already valid.
     AlreadyValid
-  | -- | Every output came from a cache.
+  | -- | Every output asked of it came from a cache.
     Substituted
   | -- | The derivation was built here.
     Built
@@ -430,12 +439,13 @@ data CheckVerdict
 
 -- | What realising a graph needs from the outside.
 data RealiseEffects m = RealiseEffects
-  { reSubst :: !(SubstEffects m),
-    -- | Are all of this derivation's outputs valid?
-    reAllValid :: !(Derivation -> m Bool),
+  { -- | The store and caches, which also say whether an output is valid.
+    reSubst :: !(SubstEffects m),
     -- | Build one derivation, whose inputs are realised, given its @.drv@
-    -- path.
-    reBuild :: !(Derivation -> StorePath -> m (Either Text ())),
+    -- path and the outputs the request that led to the build asks of it.
+    -- A build makes every output, so the store's builder leaves those
+    -- unread; they say what the build was for.
+    reBuild :: !(Derivation -> StorePath -> Set Text -> m (Either Text ())),
     -- | Build one derivation, whose outputs are valid and whose inputs are
     -- realised, again beside those outputs, given its @.drv@ path, and
     -- compare what comes out with what the store holds.  It registers
@@ -449,11 +459,38 @@ data RealiseEffects m = RealiseEffects
 -- ('checkRoot').  A derivation that is valid or substituted takes its
 -- inputs out of the work, and what remains builds leaves first.
 --
+-- Each derivation is realised for the outputs asked of it, as upstream's
+-- goal for it is (@DerivationGoal@'s @wantedOutputs@ at 2.24.9): the root
+-- for every output, and each input for the outputs its dependent names
+-- ('dnDeps').  Only those are checked for validity and substituted
+-- (@checkPathValidity@, @haveDerivation@), so an output nothing asks for
+-- is neither fetched nor a reason to build, and asking for one the
+-- derivation does not have fails ('MissingOutputs').  A build makes
+-- every output.
+--
 -- The graph has to be acyclic ('Nix.DependencyGraph.topoSort' decides that).
 realise :: (Monad m) => RealiseSettings -> RealiseEffects m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
 realise settings effects graph root = case rsMode settings of
-  BuildNormal -> void <$> realiseNode settings effects graph Set.empty root
+  BuildNormal -> void <$> realiseNode settings effects graph Map.empty (root, everyOutput)
   BuildCheck -> checkRoot settings effects graph root
+  where
+    everyOutput = maybe Set.empty (outputNames . dnDerivation) (Map.lookup root (unDepGraph graph))
+
+-- | The outputs of each derivation realised so far: those a request for
+-- them found valid or substituted, and every output of one that was built.
+type RealisedOutputs = Map StorePath (Set Text)
+
+-- | The names of a derivation's outputs.
+outputNames :: Derivation -> Set Text
+outputNames = Set.fromList . map doName . drvOutputs
+
+-- | The paths of a derivation's outputs that have one of the names.
+namedOutputPaths :: Set Text -> Derivation -> [StorePath]
+namedOutputPaths names drv = [doPath output | output <- drvOutputs drv, doName output `Set.member` names]
+
+-- | Whether every one of the paths is valid.
+allValid :: (Monad m) => RealiseEffects m -> [StorePath] -> m Bool
+allValid effects = fmap and . traverse (seValid (reSubst effects))
 
 -- | Check the root: upstream's @DerivationGoal@ under @bmCheck@ at 2.24.9.
 --
@@ -482,86 +519,102 @@ checkRoot settings effects graph root = case Map.lookup root (unDepGraph graph) 
   Nothing -> pure (Left (MissingDerivation root))
   Just depNode ->
     let drv = dnDerivation depNode
-     in either (pure . Left . InvalidDerivation) (checkAllowed drv) $
+     in either (pure . Left . InvalidDerivation) (checkAllowed depNode) $
           derivationAttrs root drv >>= substitutesAllowed (rsSubstitutes settings) root
   where
-    checkAllowed drv allowed = do
-      allValid <- reAllValid effects drv
-      if allValid
-        then rebuild drv
+    checkAllowed depNode allowed = do
+      let drv = dnDerivation depNode
+          outputs = map doPath (drvOutputs drv)
+      valid <- allValid effects outputs
+      if valid
+        then rebuild depNode
         else do
-          substituted <- outputsFromCaches effects allowed drv
+          substituted <- outputsFromCaches effects allowed outputs
           case (substituted, substitutionStop (rsFallback settings) root substituted) of
-            (ClosureComplete, _) -> reReport effects Substituted drv *> rebuild drv
+            (ClosureComplete, _) -> reReport effects Substituted drv *> rebuild depNode
             (_, Just failure) -> pure (Left failure)
             (_, Nothing) -> pure (Left (OutputsNotValid root))
-    rebuild drv = do
-      inputs <- realiseAll settings effects graph (Set.singleton root) (directDeps graph root)
+    rebuild depNode = do
+      let drv = dnDerivation depNode
+      inputs <- realiseAll settings effects graph (Map.singleton root (outputNames drv)) (Map.toList (dnDeps depNode))
       case inputs of
         Left err -> pure (Left err)
         Right _ -> reCheck effects drv root >>= either (pure . Left . BuildFailed) (checked drv)
     checked drv OutputsMatch = Right () <$ reReport effects Checked drv
     checked _ (OutputDiffers output) = pure (Left (NotDeterministic root output))
 
--- | Substitute a derivation's own outputs, if it may be substituted.  One
+-- | Substitute outputs of a derivation, if it may be substituted.  One
 -- that must build asks no cache, which leaves it where one that no cache
 -- holds is: upstream starts no substitution for it.
-outputsFromCaches :: (Monad m) => RealiseEffects m -> Substitutes -> Derivation -> m ClosureOutcome
+outputsFromCaches :: (Monad m) => RealiseEffects m -> Substitutes -> [StorePath] -> m ClosureOutcome
 outputsFromCaches _ MustBuild _ = pure ClosureUnavailable
-outputsFromCaches effects MaySubstitute drv = substituteClosure (reSubst effects) (map doPath (drvOutputs drv))
+outputsFromCaches effects MaySubstitute outputs = substituteClosure (reSubst effects) outputs
 
--- | Realise one node, threading the nodes already visited, so a derivation
--- several others depend on is handled once.
+-- | Realise one node for the outputs asked of it, threading what has been
+-- realised so far.  A request for outputs already realised does nothing,
+-- so a derivation several others ask the same of is realised once.  One
+-- asking for an output not yet realised realises the node again, for the
+-- outputs it asks for: upstream's worker drops a goal once it is done
+-- (@Goal::amDone@ at 2.24.9), so a later request for the derivation starts
+-- a goal of its own (@Worker::makeDerivationGoalCommon@).  A request is
+-- recorded before the inputs are realised, so a cycle, which
+-- 'Nix.DependencyGraph.topoSort' refuses, still ends.
 realiseNode ::
   (Monad m) =>
   RealiseSettings ->
   RealiseEffects m ->
   DepGraph ->
-  Set StorePath ->
-  StorePath ->
-  m (Either RealiseFailure (Set StorePath))
-realiseNode settings effects graph visited node
-  | node `Set.member` visited = pure (Right visited)
-  | otherwise = case Map.lookup node (unDepGraph graph) of
-      -- A node outside the graph has nothing to realise.
-      Nothing -> pure (Right visited)
-      Just depNode ->
-        let drv = dnDerivation depNode
-         in either invalid (realiseParsed drv (Set.insert node visited)) (derivationAttrs node drv)
+  RealisedOutputs ->
+  (StorePath, Set Text) ->
+  m (Either RealiseFailure RealisedOutputs)
+realiseNode settings effects graph realised (node, wanted) = case Map.lookup node (unDepGraph graph) of
+  -- A node outside the graph has nothing to realise.
+  Nothing -> pure (Right realised)
+  Just depNode
+    | wanted `Set.isSubsetOf` Map.findWithDefault Set.empty node realised -> pure (Right realised)
+    | otherwise ->
+        either invalid (realiseParsed depNode (Map.insertWith Set.union node wanted realised)) (derivationAttrs node (dnDerivation depNode))
   where
     stopFor = substitutionStop (rsFallback settings) node
     reported status drv done = Right done <$ reReport effects status drv
     invalid = pure . Left . InvalidDerivation
-    realiseParsed drv seen attrs = do
-      allValid <- reAllValid effects drv
-      if allValid
-        then reported AlreadyValid drv seen
-        else either invalid (substituteOrBuild drv seen) (substitutesAllowed (rsSubstitutes settings) node attrs)
-    substituteOrBuild drv seen allowed = do
-      let substituteOutputs = outputsFromCaches effects allowed drv
+    realiseParsed depNode seen attrs = case NE.nonEmpty (Set.toAscList absent) of
+      Just names -> pure (Left (MissingOutputs node names))
+      Nothing -> do
+        valid <- allValid effects outputs
+        if valid
+          then reported AlreadyValid drv seen
+          else either invalid (substituteOrBuild depNode outputs seen) (substitutesAllowed (rsSubstitutes settings) node attrs)
+      where
+        drv = dnDerivation depNode
+        absent = wanted `Set.difference` outputNames drv
+        outputs = namedOutputPaths wanted drv
+    substituteOrBuild depNode outputs seen allowed = do
+      let substituteOutputs = outputsFromCaches effects allowed outputs
       firstTry <- substituteOutputs
       case (firstTry, stopFor firstTry) of
-        (ClosureComplete, _) -> reported Substituted drv seen
+        (ClosureComplete, _) -> reported Substituted (dnDerivation depNode) seen
         (_, Just failure) -> pure (Left failure)
-        (_, Nothing) -> buildFromInputs substituteOutputs firstTry drv seen
-    buildFromInputs substituteOutputs firstTry drv seen = do
-      inputs <- realiseAll settings effects graph seen (directDeps graph node)
+        (_, Nothing) -> buildFromInputs substituteOutputs firstTry depNode seen
+    buildFromInputs substituteOutputs firstTry depNode seen = do
+      let drv = dnDerivation depNode
+      inputs <- realiseAll settings effects graph seen (Map.toList (dnDeps depNode))
       case inputs of
         Left err -> pure (Left err)
-        Right realised -> do
+        Right done -> do
           -- The inputs may have supplied what the closure lacked, and then
           -- the substitute is still good (upstream's retrySubstitution).
           retried <- case firstTry of
             ClosureIncomplete -> substituteOutputs
             other -> pure other
           case (retried, stopFor retried) of
-            (ClosureComplete, _) -> reported Substituted drv realised
+            (ClosureComplete, _) -> reported Substituted drv done
             (_, Just failure) -> pure (Left failure)
             (_, Nothing) -> do
-              built <- reBuild effects drv node
+              built <- reBuild effects drv node wanted
               case built of
                 Left err -> pure (Left (BuildFailed err))
-                Right () -> reported Built drv realised
+                Right () -> reported Built drv (Map.insert node (outputNames drv) done)
 
 -- | The failure a substitution attempt for a derivation stops the build
 -- with, if it stops it: a failed query always, and a failed substitute
@@ -578,18 +631,19 @@ substitutionStop fallback drvPath outcome = case outcome of
   ClosureUnavailable -> Nothing
   ClosureIncomplete -> Nothing
 
--- | Realise nodes in order, stopping at the first failure.
+-- | Realise nodes in order, each for the outputs asked of it, stopping at
+-- the first failure.
 realiseAll ::
   (Monad m) =>
   RealiseSettings ->
   RealiseEffects m ->
   DepGraph ->
-  Set StorePath ->
-  [StorePath] ->
-  m (Either RealiseFailure (Set StorePath))
-realiseAll _ _ _ visited [] = pure (Right visited)
-realiseAll settings effects graph visited (node : rest) = do
-  realised <- realiseNode settings effects graph visited node
-  case realised of
+  RealisedOutputs ->
+  [(StorePath, Set Text)] ->
+  m (Either RealiseFailure RealisedOutputs)
+realiseAll _ _ _ realised [] = pure (Right realised)
+realiseAll settings effects graph realised (request : rest) = do
+  outcome <- realiseNode settings effects graph realised request
+  case outcome of
     Left err -> pure (Left err)
     Right deeper -> realiseAll settings effects graph deeper rest

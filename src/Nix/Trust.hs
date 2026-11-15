@@ -495,7 +495,7 @@ heldAsPinned walk start
       | Map.member path (walkFixed walk) = go (Set.insert path found) (Set.insert path seen) rest
       | Just node <- Map.lookup path (walkNodes walk),
         isBuiltin (dnDerivation node) =
-          go found (Set.insert path seen) (dnDeps node ++ rest)
+          go found (Set.insert path seen) (Map.keys (dnDeps node) ++ rest)
       | otherwise = go found (Set.insert path seen) rest
 
 -- ---------------------------------------------------------------------------

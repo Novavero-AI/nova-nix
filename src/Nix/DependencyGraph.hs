@@ -39,8 +39,11 @@ data DepNode = DepNode
     dnDrvPath :: !StorePath,
     -- | The parsed derivation.
     dnDerivation :: !Derivation,
-    -- | Direct dependency .drv paths (from drvInputDrvs keys).
-    dnDeps :: ![StorePath]
+    -- | Each direct dependency's .drv path, with the outputs of it this
+    -- derivation names in 'drvInputDrvs': the outputs upstream's goal for
+    -- the dependency wants (@DerivationGoal::gaveUpOnSubstitution@ at
+    -- 2.24.9).
+    dnDeps :: !(Map StorePath (Set Text))
   }
   deriving (Eq, Show)
 
@@ -82,7 +85,7 @@ buildDepGraph readDrv rootDrv rootPath =
       (sp, drv) Seq.:< rest
         | Map.member sp visited -> go visited rest
         | otherwise -> do
-            let deps = Map.keys (drvInputDrvs drv)
+            let deps = Map.map Set.fromList (drvInputDrvs drv)
                 node =
                   DepNode
                     { dnDrvPath = sp,
@@ -90,7 +93,7 @@ buildDepGraph readDrv rootDrv rootPath =
                       dnDeps = deps
                     }
                 visitedWithNode = Map.insert sp node visited
-            newItems <- resolveNewDeps readDrv visitedWithNode deps
+            newItems <- resolveNewDeps readDrv visitedWithNode (Map.keys deps)
             go visitedWithNode (foldl' (|>) rest newItems)
 
 -- | Resolve unvisited dependencies by reading their .drv files.
@@ -126,7 +129,7 @@ topoSort (DepGraph graph) =
 -- | Count how many of a node's dependencies exist in the graph.
 countGraphDeps :: Set StorePath -> DepNode -> Int
 countGraphDeps allNodes node =
-  length (filter (`Set.member` allNodes) (dnDeps node))
+  Set.size (Set.intersection allNodes (Map.keysSet (dnDeps node)))
 
 -- | Build reverse adjacency: maps each dep to the list of nodes that depend on it.
 buildReverseAdj :: Map StorePath DepNode -> Set StorePath -> Map StorePath [StorePath]
@@ -134,7 +137,7 @@ buildReverseAdj graph allNodes =
   Map.foldlWithKey' addReverse (Map.fromSet (const []) allNodes) graph
   where
     addReverse acc sp node =
-      let depsInGraph = filter (`Set.member` allNodes) (dnDeps node)
+      let depsInGraph = filter (`Set.member` allNodes) (Map.keys (dnDeps node))
        in foldl' (flip (Map.adjust (sp :))) acc depsInGraph
 
 -- | Kahn's algorithm main loop.
@@ -188,7 +191,7 @@ transitiveDeps (DepGraph graph) root =
     go !visited queue = case Seq.viewl queue of
       Seq.EmptyL -> visited
       sp Seq.:< rest ->
-        enqueueFresh visited rest (maybe [] dnDeps (Map.lookup sp graph))
+        enqueueFresh visited rest (maybe [] (Map.keys . dnDeps) (Map.lookup sp graph))
     -- Mark and enqueue each dep not yet seen, then continue the walk.
     enqueueFresh !visited !queue deps = case deps of
       [] -> go visited queue
@@ -199,4 +202,4 @@ transitiveDeps (DepGraph graph) root =
 -- | Direct dependencies of a store path.
 directDeps :: DepGraph -> StorePath -> [StorePath]
 directDeps (DepGraph graph) sp =
-  maybe [] dnDeps (Map.lookup sp graph)
+  maybe [] (Map.keys . dnDeps) (Map.lookup sp graph)
