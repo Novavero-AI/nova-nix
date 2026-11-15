@@ -2250,10 +2250,15 @@ testLexer = do
       runTest "a string keeps bytes that are not UTF-8" $
         assertRight "lex invalid UTF-8" (tokenize "<test>" (BS.pack [0x22, 0x61, 0xFF, 0xC3, 0x28, 0x22])) $ \toks ->
           assertEqual "tokens" [TokStringOpen, TokStringLit (BS.pack [0x61, 0xFF, 0xC3, 0x28]), TokStringClose] (tokenTypes toks),
-      -- The e-acute's two bytes take one column, so x is at 5.
-      runTest "columns count characters" $
+      -- Upstream's column is one past a position's byte offset from the
+      -- start of its line (PosTable::operator[], nixexpr.cc at 2.24.9), so
+      -- the e-acute's two bytes take two columns and x is at 6.
+      runTest "columns count bytes" $
         assertRight "lex columns" (tokenize "<test>" (TE.encodeUtf8 "\"\233\" x")) $ \toks ->
-          assertEqual "x" [(1, 5)] [(locLine tok, locCol tok) | tok <- toks, locToken tok == TokIdent "x"],
+          assertEqual "x" [(1, 6)] [(locLine tok, locCol tok) | tok <- toks, locToken tok == TokIdent "x"],
+      runTest "a syntax error's column counts the bytes before it" $
+        assertRight "error column" (syntaxErrorOf "\"\233\" )") $ \err ->
+          assertEqual "position" (1, 6) (peLine err, peCol err),
       runTest "an escaped newline in an indented string ends a line" $
         assertRight "lex escaped newline" (tokenize "<test>" "''a''\\\n'' x") $ \toks ->
           assertEqual "x" [(2, 4)] [(locLine tok, locCol tok) | tok <- toks, locToken tok == TokIdent "x"],
@@ -2686,6 +2691,8 @@ testSourceBytes = do
       -- a literal holding it is no round trip there.
       literalBytes = BS.pack <$> QC.listOf (QC.choose (1, maxBound :: Word8))
       literalText = T.pack <$> QC.listOf (QC.arbitrary `QC.suchThat` (/= '\NUL'))
+      -- An LF would end the line; 'stringLiteralText' escapes a CR.
+      lineText = T.pack <$> QC.listOf (QC.arbitrary `QC.suchThat` (/= '\n'))
       utf16Le = (BS.pack [0xFF, 0xFE] <>) . TE.encodeUtf16LE
       utf16Be = (BS.pack [0xFE, 0xFF] <>) . TE.encodeUtf16BE
       errorAt err = (peLine err, peCol err, peMessage err)
@@ -2725,7 +2732,17 @@ testSourceBytes = do
       runTest "a bare CR ends a line for a UTF-16 source's error" $
         assertEqual "error" (Right (2, 3, "unpaired UTF-16 surrogate")) (errorAt <$> syntaxErrorOfBytes (utf16Le "1\r +" <> BS.pack [0x00, 0xD8])),
       runTest "a UTF-16 source with an odd byte at its end is a syntax error" $
-        assertEqual "error" (Right (1, 2, "UTF-16 source with an odd number of bytes")) (errorAt <$> syntaxErrorOfBytes (utf16Be "1" <> BS.pack [0x41]))
+        assertEqual "error" (Right (1, 2, "UTF-16 source with an odd number of bytes")) (errorAt <$> syntaxErrorOfBytes (utf16Be "1" <> BS.pack [0x41])),
+      runTest "a UTF-16 source's error column counts the UTF-8 bytes before it" $
+        assertEqual "error" (Right (1, 7, "unpaired UTF-16 surrogate")) (errorAt <$> syntaxErrorOfBytes (utf16Le "\"\233\" +" <> BS.pack [0x00, 0xD8])),
+      -- Upstream's column is one past a position's byte offset from the
+      -- start of its line (PosTable::operator[], nixexpr.cc at 2.24.9).
+      runTestM "a token's column is one past the bytes before it on its line" $
+        quickCheckPasses $
+          QC.forAll lineText $ \text ->
+            let literal = TE.encodeUtf8 (stringLiteralText text)
+                columnsOfX = map (\tok -> (locLine tok, locCol tok)) . filter ((== TokIdent "x") . locToken)
+             in (columnsOfX <$> tokenize "<test>" (literal <> " x")) QC.=== Right [(1, BS.length literal + 2)]
     ]
 
 -- | Bytes as a double-quoted literal of them: each byte with a meaning
@@ -4243,8 +4260,9 @@ testUnsafeGetAttrPos = do
       inFile "a name inherited from a set is at itself" "builtins.unsafeGetAttrPos \"y\" {\n  inherit ({ x = 1; y = 2; }) x y;\n}" (2, 33),
       inFile "a quoted inherited name is at its quote" "builtins.unsafeGetAttrPos \"or\" {\n  inherit ({ or = 1; }) \"or\";\n}" (2, 25),
       inFile "a quoted static name is at its quote" "builtins.unsafeGetAttrPos \"q\" {\n  \"q\" = 1;\n}" (2, 3),
-      -- The e-acute's two bytes take one column, as the lexer counts.
-      inFile "a column counts the characters before it" "builtins.unsafeGetAttrPos \"b\" {\n  a = \"\233\"; b = 1;\n}" (2, 12),
+      -- A column counts bytes (PosTable::operator[], nixexpr.cc), so the
+      -- e-acute takes two.
+      inFile "a column counts the bytes before it" "builtins.unsafeGetAttrPos \"b\" {\n  a = \"\233\"; b = 1;\n}" (2, 13),
       inFile "a dynamic name is at its interpolation" "builtins.unsafeGetAttrPos \"k\" {\n  ${\"k\"} = 1;\n}" (2, 3),
       inFile "each level of a dotted path is at the path" "builtins.unsafeGetAttrPos \"c\" {\n  a.b.c = 1;\n}.a.b" (2, 3),
       inFile "a merged path's first definition keeps its position" "builtins.unsafeGetAttrPos \"a\" {\n  a.b = 1;\n  a.c = 2;\n}" (2, 3),
@@ -4338,6 +4356,9 @@ testCurPos = do
       inFile "a let binding the name does not shadow it" "let __curPos = 1; in\n  __curPos" (2, 3),
       inFile "a formal of the name does not shadow it" "(__curPos:\n  __curPos) 1" (2, 3),
       inFile "a with supplying the name does not shadow it" "with { __curPos = 1; };\n  __curPos" (2, 3),
+      -- A column counts bytes (PosTable::operator[], nixexpr.cc), so the
+      -- e-acute takes two.
+      inFile "a column counts the bytes before it" "{\n  a = \"\233\"; b = __curPos;\n}.b" (2, 17),
       -- mkPos fills the set with buildBindings' alloc, whose attributes
       -- are at noPos, which mkPos answers null for.
       jsonInFile "a position's attributes have no position" "builtins.unsafeGetAttrPos \"line\" (\n  __curPos)" "null",

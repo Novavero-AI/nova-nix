@@ -97,7 +97,7 @@ sourceName (SourceFile path) = path
 sourceName (SourceText name) = name
 
 -- | A point in parsed source: where the source came from, and the 1-based
--- line and column (in characters) the lexer gives the token there.
+-- line and column (in bytes) the lexer gives the token there.
 data SrcPos
   = SrcPos
       -- | Where the source came from.
