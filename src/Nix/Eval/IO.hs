@@ -1,4 +1,3 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -53,11 +52,13 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import Foreign.C.Error (Errno (..), eACCES, ePERM)
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
+import GHC.Exts (oneShot)
 import GHC.IO.Exception (ioe_errno)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNames)
 import Nix.Derivation (fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.Eval (eval)
+import Nix.Eval (deepForce, eval)
+import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CStatus (cInvariantViolated)
 import Nix.Eval.CThunk (CThunkPtr, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkMarkPending, cthunkPayload, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState, cthunkValueTag)
@@ -68,6 +69,7 @@ import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.Symbol (Symbol (..), symbolBytes, symbolIntern, symbolInternBytes, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, pendingThunkEnv, storePathOrThrow, unmarshalLambdaValue, unmarshalStringContext, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending, pattern ValueAttrs, pattern ValueBool, pattern ValueCtxStr, pattern ValueFloat, pattern ValueInt, pattern ValueLambda, pattern ValueList, pattern ValueNull, pattern ValuePath, pattern ValueStr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
+import Nix.Expr.Types (Expr)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
@@ -265,8 +267,65 @@ locatedPath st = SP.qualifyPathText (esStoreDir st) . canonPathValue
 -- ---------------------------------------------------------------------------
 
 -- | IO evaluation monad.  Wraps @ReaderT EvalState IO@.
-newtype EvalIO a = EvalIO {unEvalIO :: ReaderT EvalState IO a}
-  deriving (Functor, Applicative, Monad)
+newtype EvalIO a = MkEvalIO (ReaderT EvalState IO a)
+
+-- Every action is built through this pattern, never through MkEvalIO
+-- itself, so that its state argument is marked one-shot: an evaluator
+-- action runs once, so GHC may take the state and the IO world as
+-- arguments together instead of returning a closure that waits for them,
+-- and may move work into the action instead of keeping it outside to share
+-- between runs that never happen.  This is the one-shot state monad trick
+-- GHC's own IOEnv uses (Note [The one-shot state monad trick] in
+-- GHC.Utils.Monad).  A derived instance would bypass the builder, so the
+-- instances below are written out.  Under the specialisation below it
+-- cuts the time of the benchmarks the cabal file names by 8 to 12% and
+-- their allocation by 12 to 13%; on the unspecialised evaluator it
+-- changes nothing, since every bind there is an unknown call through the
+-- instance dictionary.
+pattern EvalIO :: ReaderT EvalState IO a -> EvalIO a
+pattern EvalIO {unEvalIO} <- MkEvalIO unEvalIO
+  where
+    EvalIO (ReaderT run) = MkEvalIO (ReaderT (oneShot run))
+
+{-# COMPLETE EvalIO #-}
+
+instance Functor EvalIO where
+  fmap f (EvalIO m) = EvalIO (fmap f m)
+  a <$ EvalIO m = EvalIO (a <$ m)
+
+instance Applicative EvalIO where
+  pure a = EvalIO (pure a)
+  EvalIO f <*> EvalIO m = EvalIO (f <*> m)
+  EvalIO m *> EvalIO k = EvalIO (m *> k)
+
+instance Monad EvalIO where
+  EvalIO m >>= k = EvalIO (m >>= unEvalIO . k)
+
+  -- Not the default, which goes through '>>=' and loses its one-shot
+  -- marking unless '>>=' is INLINE (Note [INLINE pragmas and (>>)] in
+  -- GHC.Utils.Monad).
+  (>>) = (*>)
+
+-- ---------------------------------------------------------------------------
+-- Specialisation
+-- ---------------------------------------------------------------------------
+
+-- The evaluator is written over any MonadEval and compiled that way, so
+-- each of its binds and class methods is a call through the instance
+-- dictionary.  These compile the entry points a caller runs in EvalIO
+-- (this module's import and scopedImport, the executable's evaluation,
+-- --strict and attribute selection) for EvalIO alone, and the library's
+-- specialisation flags carry that through everything they reach.  Each
+-- pragma exports a rule that sends a call at EvalIO in any module
+-- importing this one to that code.  The flags alone leave no rule for
+-- eval, which is small enough to be inlined here rather than specialised,
+-- so a caller in another module, the executable among them, would run the
+-- dictionary-passing evaluator.
+{-# SPECIALIZE eval :: Env -> Expr -> EvalIO NixValue #-}
+
+{-# SPECIALIZE deepForce :: NixValue -> EvalIO () #-}
+
+{-# SPECIALIZE selectAttrPath :: Text -> NixValue -> EvalIO (Either Text NixValue) #-}
 
 -- ---------------------------------------------------------------------------
 -- MonadEval instance
