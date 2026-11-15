@@ -303,9 +303,6 @@ code, and `push`, which uploads store paths and their closures to a
   build directory and reach the network.
 - Evaluation is slower than upstream's, most of all on large evaluations such
   as a NixOS system.
-- `eval` prints a value it reaches twice in full each time, where upstream
-  prints a marker for the repeat, so printing a derivation, or a nixpkgs
-  package such as `(import ./nixpkgs { }).hello`, does not finish.
 - `eval` and `build` take a file or `--expr`, not a directory or a search-path
   argument such as `<nixpkgs>` (an expression can use one); they take no
   `--arg` or `--argstr`, and do not call a function the file evaluates to.
