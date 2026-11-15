@@ -17,6 +17,14 @@
 --    then re-verify the materialized tree from disk
 -- 7. Register in the store DB with references from narinfo
 --
+-- A build reads a path's narinfo before anything is downloaded, to realise
+-- the references it declares first ('queryReferencesWith'), and then
+-- fetches the path from the cache that served that narinfo, without asking
+-- again ('fetchSubstituteWith').  Each cache is asked about each path once
+-- in a run, so a closure costs one narinfo request a path, and a path that
+-- cache fails to deliver goes to the caches after it, their references
+-- first ('queryNextOfferWith').
+--
 -- A cache that lacks the path (404, or another status upstream reads as
 -- the file not being there) is passed over, and what no cache holds
 -- builds locally.  A cache that fails is told apart from one that lacks
@@ -45,11 +53,16 @@
 -- @nova-cache@ library.  This module orchestrates the HTTP requests
 -- and store registration.
 module Nix.Substituter
-  ( -- * Substitution
+  ( -- * Substituting a closure
     SubstResult (..),
-    trySubstitute,
-    trySubstituteWith,
+    Substitute,
+    substitutePath,
+    substituteCache,
+    NarInfoMemo,
+    emptyNarInfoMemo,
     queryReferencesWith,
+    queryNextOfferWith,
+    fetchSubstituteWith,
 
     -- * Cache configuration
     CacheConfig (..),
@@ -74,7 +87,6 @@ module Nix.Substituter
     maxNarInfoBody,
     readBodyCapped,
     sortCaches,
-    tryCachesWith,
     validateNarInfoFields,
     NarInfoAnswer (..),
     judgeNarInfo,
@@ -96,12 +108,18 @@ module Nix.Substituter
   )
 where
 
-import Control.Applicative ((<|>))
 import Control.Exception (Exception, Handler (..), SomeException, catch, catches, onException, throwIO)
-import Control.Monad (void)
+import Control.Monad (void, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.State.Strict (StateT, gets, modify')
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
+import Data.Either (isRight)
+import Data.Foldable (traverse_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (sortBy)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -112,7 +130,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
-import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
+import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, fetchStatusFailure, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Realise (Fallback (..), Offer (..))
 import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..))
@@ -156,7 +174,8 @@ defaultCacheConfig =
       ccPriority = 40
     }
 
--- | Result of a substitution attempt.
+-- | Result of fetching a path from the cache that offered it
+-- ('fetchSubstituteWith').
 data SubstResult
   = -- | Verified and unpacked on disk, NOT yet registered: the carried
     -- registration is recorded by the caller, which batches every output
@@ -174,16 +193,13 @@ data SubstResult
     -- is needed.  The caller treats this as success.  No lock rides
     -- along; it was released before returning.
     SubstAlreadyValid
-  | -- | No cache supplied the path, and none failed to.  A cache without
-    -- its narinfo counts, as do one whose narinfo names another path or
-    -- carries no trusted signature, and one whose NAR is gone: upstream
-    -- passes over all of them without failing the substitution.
+  | -- | The cache no longer holds the path's NAR, which upstream passes
+    -- over without failing the substitution (@SubstituteGone@).
     SubstNotFound
-  | -- | A cache failed to deliver the path and no cache supplied it, with
-    -- the first failure: the narinfo query, the download, or its
-    -- verification.  Upstream's failed substitution.  Or the store is
-    -- one upstream Nix's database may also manage, refused before any
-    -- cache is asked ("Nix.Store.Upstream").
+  | -- | The cache failed to deliver the path: the download or its
+    -- verification.  Upstream's failed substitution.  Or the store is one
+    -- upstream Nix's database may also manage, refused before the NAR is
+    -- asked for ("Nix.Store.Upstream").
     SubstError !Text
   deriving (Eq, Show)
 
@@ -191,7 +207,49 @@ data SubstResult
 -- Main substitution logic
 -- ---------------------------------------------------------------------------
 
--- | Try to substitute a store path from configured caches.
+-- | A path as one cache offers it: the path, that cache, the narinfo it
+-- served for the path, and the caches after it in priority order.  The
+-- narinfo validated, describes the path and a trusted key signed it
+-- ('judgeNarInfo'), and the references realised before the path arrives are
+-- the ones it declares.  The constructor is not exported: only the reference
+-- queries make one ('queryReferencesWith', 'queryNextOfferWith'), so a fetch
+-- is never handed a narinfo that skipped those checks or one checked for
+-- another path, and the NAR and the references always come from the same
+-- cache, as upstream's substitution goal copies a path from the substituter
+-- whose path info it queried (@PathSubstitutionGoal::tryToRun@ at 2.24.9).
+data Substitute = Substitute !StorePath !CacheConfig !NarInfo.NarInfo ![CacheConfig]
+  deriving (Eq, Show)
+
+-- | The path a t'Substitute' fetches.
+substitutePath :: Substitute -> StorePath
+substitutePath (Substitute sp _ _ _) = sp
+
+-- | The cache a t'Substitute' comes from.
+substituteCache :: Substitute -> CacheConfig
+substituteCache (Substitute _ cache _ _) = cache
+
+-- | What each cache has said about each path in one run, by narinfo URL:
+-- the narinfo it served, which validated, or 'Nothing' when it does not
+-- hold the path.  A query that failed is not remembered, so the next one
+-- asks again.  Upstream's per-store path-info cache keeps the same
+-- (@Store::queryPathInfo@ in store-api.cc at 2.24.9): the info a
+-- substituter returned, a path it lacks included, and never a failure,
+-- which is thrown before the cache is written.  Its entries expire after
+-- @narinfo-cache-positive-ttl@ and @narinfo-cache-negative-ttl@ (a month
+-- and an hour) and are also kept on disk across runs; these last one run.
+newtype NarInfoMemo = NarInfoMemo (Map Text (Maybe NarInfo.NarInfo))
+
+-- | A run that has asked no cache anything.
+emptyNarInfoMemo :: NarInfoMemo
+emptyNarInfoMemo = NarInfoMemo Map.empty
+
+-- | Fetch a path from the cache that offered it, as that cache's narinfo
+-- describes it, asking no cache anything more: the build's half of a
+-- substitution whose reference query already read the narinfo
+-- ('queryReferencesWith').  The path is the one the narinfo was checked
+-- for, which the t'Substitute' carries, and the caller has made what it
+-- references valid first, or the database refuses the registration this
+-- returns.
 --
 -- Upstream's per-path substitution protocol: take the path's exclusive
 -- lock FIRST, before any deletion or download, and re-check validity
@@ -200,30 +258,36 @@ data SubstResult
 -- ('SubstAlreadyValid') rather than deleted and redone.  The lock then
 -- holds across the delete, the download, materialization, and the
 -- on-disk recheck; a successful result carries it still held (see
--- 'SubstSuccess'), and every other exit releases it here.
+-- 'SubstSuccess'), and every other exit releases it here.  On success the
+-- path is unpacked and read-only on disk but NOT registered - the caller
+-- records the returned t'PathRegistration'.  The NAR request runs under
+-- the given retry policy.
 --
--- Caches are checked in priority order; the first success stops the
--- scan and a failing cache falls through to the remaining ones.  On
--- success the path is unpacked and read-only on disk but NOT
--- registered - the caller records the returned t'PathRegistration'.
--- Every narinfo and NAR request runs under upstream's retry policy,
--- 'defaultFetchRetryPolicy'.
---
--- Given a cache to ask, a store upstream Nix's database may also manage
--- is refused ('SubstError') before the lock is taken and before the
--- cache is asked ("Nix.Store.Upstream"): the destination is cleared
--- before unpacking, and a path upstream registered has no row here.
--- With no cache, nothing is written and the answer is 'SubstNotFound'.
-trySubstitute :: Store -> [CacheConfig] -> StorePath -> IO SubstResult
-trySubstitute = trySubstituteWith defaultFetchRetryPolicy ioRetryEffects
+-- A store upstream Nix's database may also manage is refused
+-- ('SubstError') before the lock is taken and before the NAR is asked for
+-- ("Nix.Store.Upstream"): the destination is cleared before unpacking,
+-- and a path upstream registered has no row here.  A NAR the cache no
+-- longer holds is 'SubstNotFound', upstream's @SubstituteGone@.  A failure
+-- is tagged with the cache's URL, and a synchronous exception is one
+-- ('catchSync'), while an asynchronous one propagates: an interrupt
+-- mid-download must abort the substitution, never send the path to the
+-- next cache and from there to a local build.
+fetchSubstituteWith :: FetchRetryPolicy -> RetryEffects IO -> Store -> Substitute -> IO SubstResult
+fetchSubstituteWith policy effects store (Substitute sp cache narInfo _) =
+  underPathLock store sp $ \manager lock -> do
+    result <-
+      streamFromCache (Retrying policy effects) manager store cache sp narInfo lock
+        `catchSync` \err -> pure (SubstError ("substitution exception: " <> T.pack (show err)))
+    pure $ case result of
+      SubstError err -> SubstError (ccUrl cache <> ": " <> err)
+      other -> other
 
--- | 'trySubstitute' under a given retry policy and effects: a build
--- passes the policy its @builtin:fetchurl@ downloads run under
--- ("Nix.Builder"), and a test passes effects that record rather than
--- sleep.
-trySubstituteWith :: FetchRetryPolicy -> RetryEffects IO -> Store -> [CacheConfig] -> StorePath -> IO SubstResult
-trySubstituteWith _ _ _ [] _ = pure SubstNotFound
-trySubstituteWith policy effects store caches sp = do
+-- | Run a substitution of a path under its lock: refuse a store upstream
+-- Nix's database may also manage before the lock is taken, adopt a path
+-- valid under the lock ('SubstAlreadyValid'), and release the lock on
+-- every exit but a success, which carries it still held.
+underPathLock :: Store -> StorePath -> (HTTP.Manager -> PathLock -> IO SubstResult) -> IO SubstResult
+underPathLock store sp substituteLocked = do
   refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (stDir store)
   maybe substitute (pure . SubstError) refusal
   where
@@ -233,15 +297,15 @@ trySubstituteWith policy effects store caches sp = do
       -- output.
       manager <- HTTPS.getGlobalManager
       lock <- acquirePathLock (stDir store) sp
-      substituteLocked manager lock `onException` releasePathLock lock
-    substituteLocked manager lock = do
+      locked manager lock `onException` releasePathLock lock
+    locked manager lock = do
       valid <- isValid store sp
       if valid
         then do
           releasePathLock lock
           pure SubstAlreadyValid
         else do
-          result <- tryCachesWith (\cache -> tryOneCache (Retrying policy effects) manager store cache sp lock) (sortCaches caches)
+          result <- substituteLocked manager lock
           case result of
             SubstSuccess _ _ -> pure result
             other -> do
@@ -249,10 +313,10 @@ trySubstituteWith policy effects store caches sp = do
               pure other
 
 -- | What the caches say about a path's references, from the first cache
--- whose narinfo may be used.  References arrive before the path that names
--- them ("Nix.Realise"), so this runs ahead of any download, and a narinfo
--- passes the same checks as a substitution before its references are
--- believed.
+-- whose narinfo may be used, with the t'Substitute' that fetches the path
+-- from that cache.  References arrive before the path that names them
+-- ("Nix.Realise"), so this runs ahead of any download, and a narinfo passes
+-- the same checks as a substitution before its references are believed.
 --
 -- The caches are asked in priority order, as upstream's substitution goal
 -- asks them (@PathSubstitutionGoal::init@ at 2.24.9).  One without the
@@ -262,52 +326,44 @@ trySubstituteWith policy effects store caches sp = do
 -- with 'QueryFailed' under 'NoFallback', as upstream rethrows it.  Under
 -- 'BuildFromSource' it is reported and passed over, as upstream logs it
 -- and asks the next cache.
-queryReferencesWith :: FetchRetryPolicy -> RetryEffects IO -> Fallback -> [CacheConfig] -> StorePath -> IO Offer
-queryReferencesWith _ _ _ [] _ = pure NotOffered
-queryReferencesWith policy effects fallback caches sp = do
-  manager <- HTTPS.getGlobalManager
-  firstAnswer manager (sortCaches caches)
+--
+-- A cache asked about the path before in this run answers from the run's
+-- t'NarInfoMemo' instead, so a closure requests each narinfo once and a
+-- path no cache holds is looked for once.
+queryReferencesWith :: FetchRetryPolicy -> RetryEffects IO -> Fallback -> [CacheConfig] -> StorePath -> StateT NarInfoMemo IO (Offer Substitute)
+queryReferencesWith policy effects fallback caches = offerFrom (Retrying policy effects) fallback (sortCaches caches)
+
+-- | 'queryReferencesWith' over the caches after the one a t'Substitute'
+-- came from, for a path that substitute did not deliver: upstream's goal
+-- moving on to its next substituter (@PathSubstitutionGoal::init@ at
+-- 2.24.9).
+queryNextOfferWith :: FetchRetryPolicy -> RetryEffects IO -> Fallback -> Substitute -> StateT NarInfoMemo IO (Offer Substitute)
+queryNextOfferWith policy effects fallback (Substitute sp _ _ later) = offerFrom (Retrying policy effects) fallback later sp
+
+-- | The first offer for a path among caches in the order given.
+offerFrom :: Retrying -> Fallback -> [CacheConfig] -> StorePath -> StateT NarInfoMemo IO (Offer Substitute)
+offerFrom _ _ [] _ = pure NotOffered
+offerFrom retry fallback caches sp = do
+  manager <- liftIO HTTPS.getGlobalManager
+  firstAnswer manager caches
   where
     firstAnswer _ [] = pure NotOffered
     firstAnswer manager (cache : rest) = do
-      answer <-
-        queryNarInfo (Retrying policy effects) manager cache sp
-          `catchSync` \err -> pure (NarInfoFailed ("query exception: " <> T.pack (show err)))
+      answer <- askCache retry manager cache sp
       let next = firstAnswer manager rest
           failed failure = case fallback of
             NoFallback -> pure (QueryFailed (ccUrl cache <> ": " <> spName sp <> ": " <> failure))
-            BuildFromSource -> reportCache cache sp failure >> next
+            BuildFromSource -> liftIO (reportCache cache sp failure) >> next
       case answer of
-        NarInfoUsable narInfo -> either failed (pure . Offered) (parseReferences (NarInfo.niReferences narInfo))
+        NarInfoUsable narInfo -> either failed (pure . Offered (Substitute sp cache narInfo rest)) (parseReferences (NarInfo.niReferences narInfo))
         NarInfoAbsent -> next
-        NarInfoPassedOver reason -> reportCache cache sp reason >> next
+        NarInfoPassedOver reason -> liftIO (reportCache cache sp reason) >> next
         NarInfoFailed failure -> failed failure
 
 -- | Say on stderr what one cache did with a path.
 reportCache :: CacheConfig -> StorePath -> Text -> IO ()
 reportCache cache sp message =
   TIO.hPutStrLn stderr ("  [subst] " <> ccUrl cache <> ": " <> spName sp <> ": " <> message)
-
--- | Fold per-cache attempts in priority order.  The first success wins and
--- stops the scan.  An erroring cache falls through to the remaining ones -
--- a transient failure (DNS, TLS, HTTP 500, unsupported compression) from a
--- higher-priority cache must not mask a hit in the next - and the first
--- error, tagged with its cache URL, is reported only when no cache has the
--- path, as upstream's goal fails only once every substituter has been
--- tried.
-tryCachesWith :: (Monad m) => (CacheConfig -> m SubstResult) -> [CacheConfig] -> m SubstResult
-tryCachesWith attempt = go Nothing
-  where
-    go firstErr [] = pure (maybe SubstNotFound SubstError firstErr)
-    go firstErr (cache : rest) = do
-      result <- attempt cache
-      case result of
-        SubstSuccess reg lock -> pure (SubstSuccess reg lock)
-        -- A path found valid mid-scan is terminal like a success:
-        -- there is nothing left to fetch from any cache.
-        SubstAlreadyValid -> pure SubstAlreadyValid
-        SubstNotFound -> go firstErr rest
-        SubstError err -> go (firstErr <|> Just (ccUrl cache <> ": " <> err)) rest
 
 -- | The retry policy and its effects, carried to every request one
 -- substitution makes.
@@ -317,37 +373,18 @@ data Retrying = Retrying !FetchRetryPolicy !(RetryEffects IO)
 retrying :: Retrying -> IO (Either AttemptFailure a) -> IO (Either AttemptFailure a)
 retrying (Retrying policy effects) = retryTransient policy effects
 
--- | Attempt substitution from a single cache.  Synchronous exceptions
--- become 'SubstError', so the scan falls through to the remaining
--- caches; asynchronous exceptions propagate ('catchSync') - an
--- interrupt mid-download must abort the scan, never continue to the
--- next cache and from there to a local build.
-tryOneCache :: Retrying -> HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
-tryOneCache retry mgr store cache sp lock =
-  substituteFromCache retry mgr store cache sp lock
-    `catchSync` \err -> pure (SubstError ("substitution exception: " <> T.pack (show err)))
-
--- | Substitution pipeline for a single cache: the narinfo, judged
--- ('queryNarInfo'), then the NAR, streamed ('streamWithRetry').  A narinfo
--- this build passes over is a miss here without a word, because the
--- reference query asks every path first and has said why
--- ('queryReferencesWith').
-substituteFromCache :: Retrying -> HTTP.Manager -> Store -> CacheConfig -> StorePath -> PathLock -> IO SubstResult
-substituteFromCache retry mgr store cache sp lock = do
-  answer <- queryNarInfo retry mgr cache sp
-  case answer of
-    -- Unsupported compression rejects before the download: the value is
-    -- known from the narinfo, and a multi-hundred-MB download that can
-    -- only fail in decompression is pure waste.  It is still a failed
-    -- substitute, as upstream's decompressor fails one.  The strict
-    -- 'decompressorFor' encodes the same support set; the suite pins
-    -- their agreement.
-    NarInfoUsable narInfo -> case streamingDecompressionSupported (NarInfo.niCompression narInfo) of
-      Left err -> pure (SubstError err)
-      Right () -> streamWithRetry retry mgr store cache sp narInfo lock
-    NarInfoAbsent -> pure SubstNotFound
-    NarInfoPassedOver _ -> pure SubstNotFound
-    NarInfoFailed failure -> pure (SubstError failure)
+-- | Stream a path's NAR from the cache whose narinfo is given
+-- ('streamWithRetry').  Unsupported compression rejects before the
+-- download: the value is known from the narinfo, and a multi-hundred-MB
+-- download that can only fail in decompression is pure waste.  It is
+-- still a failed substitute, as upstream's decompressor fails one.  The
+-- strict 'decompressorFor' encodes the same support set; the suite pins
+-- their agreement.
+streamFromCache :: Retrying -> HTTP.Manager -> Store -> CacheConfig -> StorePath -> NarInfo.NarInfo -> PathLock -> IO SubstResult
+streamFromCache retry mgr store cache sp narInfo lock =
+  case streamingDecompressionSupported (NarInfo.niCompression narInfo) of
+    Left err -> pure (SubstError err)
+    Right () -> streamWithRetry retry mgr store cache sp narInfo lock
 
 -- | One cache's narinfo for a path, judged before anything is downloaded.
 data NarInfoAnswer
@@ -366,17 +403,34 @@ data NarInfoAnswer
     NarInfoFailed !Text
   deriving (Eq, Show)
 
--- | Fetch a narinfo from a cache under the substitution's retry policy
--- ('trySubstituteWith') and judge it ('judgeNarInfo').
-queryNarInfo :: Retrying -> HTTP.Manager -> CacheConfig -> StorePath -> IO NarInfoAnswer
-queryNarInfo retry mgr cache sp = do
-  fetched <- retrying retry (fetchNarInfoOnce mgr url)
-  pure $ case fetched of
-    Left failure -> NarInfoFailed (attemptFailureMessage failure)
-    Right Nothing -> NarInfoAbsent
-    Right (Just narInfo) -> judgeNarInfo cache sp narInfo
+-- | One cache's narinfo for a path, judged ('judgeNarInfo'): from the
+-- t'NarInfoMemo' when the run has had it from that cache, and otherwise
+-- fetched under the substitution's retry policy and remembered unless the
+-- query failed.  A narinfo whose fields do not validate is a failed query,
+-- as upstream's parser throws on one.
+askCache :: Retrying -> HTTP.Manager -> CacheConfig -> StorePath -> StateT NarInfoMemo IO NarInfoAnswer
+askCache retry mgr cache sp = do
+  remembered <- gets (\(NarInfoMemo memo) -> Map.lookup url memo)
+  case remembered of
+    Just held -> pure (heldAnswer held)
+    Nothing -> do
+      fetched <- liftIO (fetchNarInfo retry mgr url)
+      case fetched of
+        Left failure -> pure (NarInfoFailed failure)
+        Right held -> do
+          when (isRight (traverse_ validateNarInfoFields held)) $
+            modify' (\(NarInfoMemo memo) -> NarInfoMemo (Map.insert url held memo))
+          pure (heldAnswer held)
   where
     url = ccUrl cache <> "/" <> spHash sp <> ".narinfo"
+    heldAnswer = maybe NarInfoAbsent (judgeNarInfo cache sp)
+
+-- | A narinfo request under the substitution's retry policy: what the cache
+-- holds, or why the query failed.
+fetchNarInfo :: Retrying -> HTTP.Manager -> Text -> IO (Either Text (Maybe NarInfo.NarInfo))
+fetchNarInfo retry mgr url =
+  (first attemptFailureMessage <$> retrying retry (fetchNarInfoOnce mgr url))
+    `catchSync` \err -> pure (Left ("query exception: " <> T.pack (show err)))
 
 -- | Whether a served narinfo may be used, decided from the narinfo alone, in
 -- upstream's order.  The fields validate first, standing in for upstream's
@@ -679,7 +733,7 @@ fetchNarInfoOnce mgr url = fetch `catches` transferFailureHandlers url
               Right narInfo -> Right (Just narInfo)
 
 -- | Stream one substitution end to end, each attempt under the
--- substitution's retry policy ('trySubstituteWith').
+-- substitution's retry policy ('fetchSubstituteWith').
 --
 -- By the time this runs the narinfo has already been fetched and
 -- signature-verified, so the cache claims to hold this path.  Failures
@@ -701,8 +755,7 @@ fetchNarInfoOnce mgr url = fetch `catches` transferFailureHandlers url
 -- 2.24.9), reported and then a miss the cache scan passes over, because
 -- upstream's substitution goal treats a gone substitute like one that
 -- never existed rather than as a failure.  A narinfo the cache does not
--- hold is a miss handled earlier in 'queryNarInfo' and never reaches
--- here.
+-- hold is a miss handled earlier in 'askCache' and never reaches here.
 streamWithRetry :: Retrying -> HTTP.Manager -> Store -> CacheConfig -> StorePath -> NarInfo.NarInfo -> PathLock -> IO SubstResult
 streamWithRetry retry mgr store cache sp narInfo lock = do
   outcome <- retrying retry (streamNarIntoStore mgr cache store sp narInfo)
@@ -1183,7 +1236,7 @@ parseDeriver storeDir (Just txt)
 -- 'Dir.removePathForcibly' clears read-only marks and accepts a missing
 -- path, so the fresh unpack always starts from a clean slate.
 -- Substitution callers reach this only holding the path's exclusive
--- lock ('trySubstitute', 'unpackVerifiedNar'): unlocked, this deletion is
+-- lock ('underPathLock', 'unpackVerifiedNar'): unlocked, this deletion is
 -- exactly the race that lets one process remove a tree another just
 -- registered.
 clearStaleDestination :: FilePath -> IO ()

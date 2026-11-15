@@ -81,12 +81,13 @@ import Control.Exception (IOException, bracket, catches, displayException, final
 import Control.Monad (filterM, foldM, unless)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError, withExceptT)
 import Control.Monad.IO.Class (liftIO)
+import Control.Monad.State.Strict (StateT, evalStateT)
 import Data.Bifunctor (bimap, first)
 import qualified Data.ByteString as BS
 import Data.Char (isAscii, isSpace, toLower, toUpper)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (sort)
+import Data.List (sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
@@ -112,13 +113,13 @@ import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, r
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Push (narHashMatches)
-import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), SubstEffects (..), SubstitutesSetting (..), realise, realiseFailureMessage, realiseFailureStatus, substituteClosure)
+import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), realise, realiseFailureMessage, realiseFailureStatus, substituteClosure)
 import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (isPlainFile)
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText, unStoreDir)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
-import Nix.Substituter (CacheConfig, SubstResult (..), narStreamFailure, queryReferencesWith, trySubstituteWith, withXzAttempt)
+import Nix.Substituter (CacheConfig, NarInfoMemo, SubstResult (..), Substitute, emptyNarInfoMemo, fetchSubstituteWith, narStreamFailure, queryNextOfferWith, queryReferencesWith, substitutePath, withXzAttempt)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
@@ -488,7 +489,7 @@ withOutputLocks config store drv act = do
             lock <- acquirePathLock (bcStoreDir config) sp
             atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
       ( do
-          mapM_ takeLock (lockOrder (map doPath (drvOutputs drv)))
+          mapM_ takeLock (lockOrder id (map doPath (drvOutputs drv)))
           finishedElsewhere <- allOutputsValid store drv
           act finishedElsewhere
         )
@@ -498,8 +499,8 @@ withOutputLocks config store drv act = do
 -- holds each lock until its batch registers, and a build until it finishes,
 -- so both have to use this order: the blocking lock has no timeout, and two
 -- processes taking the same paths in different orders would wait forever.
-lockOrder :: [StorePath] -> [StorePath]
-lockOrder = sort
+lockOrder :: (a -> StorePath) -> [a] -> [a]
+lockOrder = sortOn
 
 -- | The derivation's first output path when EVERY output is already
 -- registered, otherwise 'Nothing'.
@@ -2050,7 +2051,7 @@ buildWithDeps config store rootDrv rootDrvPath = do
               pure (BuildFailure "dependency cycle detected" 1)
             TopoSorted _ -> do
               let settings = RealiseSettings {rsFallback = bcFallback config, rsSubstitutes = bcSubstitutes config, rsMode = bcMode config}
-              result <- realise settings (realiseEffects config store) depGraph rootDrvPath
+              result <- evalStateT (realise settings (realiseEffects config store) depGraph rootDrvPath) emptyNarInfoMemo
               case result of
                 Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) (realiseFailureStatus failure))
                 Right () ->
@@ -2072,25 +2073,31 @@ readDrvFromStore config sp = do
 -- Realisation effects
 -- ---------------------------------------------------------------------------
 
+-- | A realisation's effects, which carry a t'NarInfoMemo' through the run,
+-- so each cache is asked about each path once.
+type Realising = StateT NarInfoMemo IO
+
 -- | The store, caches and builder that "Nix.Realise" drives.
-realiseEffects :: BuildConfig -> Store -> RealiseEffects IO
+realiseEffects :: BuildConfig -> Store -> RealiseEffects Substitute Realising
 realiseEffects config store =
   RealiseEffects
     { reSubst = substEffects config store,
-      reBuild = \drv drvPath _ -> buildReporting config store drv drvPath,
-      reCheck = checkDerivation config store,
-      reReport = logRealised
+      reBuild = \drv drvPath _ -> liftIO (buildReporting config store drv drvPath),
+      reCheck = \drv drvPath -> liftIO (checkDerivation config store drv drvPath),
+      reReport = \status drv -> liftIO (logRealised status drv)
     }
 
 -- | The store and caches a substitution uses: 'bcCaches' asked under
 -- 'bcFallback' and 'bcFetchRetry', and what arrives registered in the
--- store ('substitutePaths').
-substEffects :: BuildConfig -> Store -> SubstEffects IO
+-- store ('substitutePaths').  A t'Substitute' names the path it was offered
+-- for, which is the path "Nix.Realise" pairs it with.
+substEffects :: BuildConfig -> Store -> SubstEffects Substitute Realising
 substEffects config store =
   SubstEffects
-    { seValid = isValid store,
+    { seValid = liftIO . isValid store,
       seReferences = queryReferencesWith (bcFetchRetry config) ioRetryEffects (bcFallback config) (bcCaches config),
-      seFetch = substitutePaths config store
+      seNextOffer = const (queryNextOfferWith (bcFetchRetry config) ioRetryEffects (bcFallback config)),
+      seFetch = \registration -> liftIO . substitutePaths config store registration . fmap snd
     }
 
 -- | Substitute paths from 'bcCaches' with everything they reference,
@@ -2098,9 +2105,10 @@ substEffects config store =
 -- derivation's outputs, and build nothing.  A path no cache holds, or
 -- one that references a path no cache holds, is left as it is.  A store
 -- upstream Nix's database may also manage refuses each path once its
--- narinfo is read ('trySubstituteWith'), and the outcome is a failed one.
+-- narinfo is read ('fetchSubstituteWith'), and the outcome is a failed one.
 substituteFromCaches :: BuildConfig -> Store -> [StorePath] -> IO ClosureOutcome
-substituteFromCaches config = substituteClosure . substEffects config
+substituteFromCaches config store paths =
+  evalStateT (substituteClosure (substEffects config store) paths) emptyNarInfoMemo
 
 -- | Build one derivation, naming it in any failure.
 buildReporting :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text ())
@@ -2124,8 +2132,9 @@ logRealised :: Realised -> Derivation -> IO ()
 logRealised status drv =
   TIO.hPutStrLn System.IO.stderr ("  " <> statusTag status <> " " <> formatDrvName drv)
 
--- | Try to substitute paths from binary caches, every one of them or none
--- ('FetchOutcome').
+-- | Substitute paths, each from the cache that offered it, every one of
+-- them or none ('FetchOutcome'), or under 'RegisterNone' fetch them and
+-- register nothing, to learn which a cache delivers.
 --
 -- Registration is all-or-nothing and batched: every path is verified and
 -- unpacked first, then recorded in one 'registerPaths' transaction, so
@@ -2145,54 +2154,60 @@ logRealised status drv =
 -- A registration the database REFUSES - its unregistered-referent guard,
 -- reachable only through cache-declared references this store has never
 -- seen - is a failed substitution like any other: the transaction
--- recorded nothing, so report it ('FetchFailed').  Upstream's copy of the
--- path fails the same way when a reference is not valid.
-substitutePaths :: BuildConfig -> Store -> [StorePath] -> IO FetchOutcome
-substitutePaths config store paths
-  | null (bcCaches config) = pure FetchMissed
-  | otherwise = do
-      heldLocks <- newIORef []
-      registerSubstituted heldLocks
-        `finally` (readIORef heldLocks >>= mapM_ releasePathLock)
+-- recorded nothing, so every path of the batch counts as not delivered
+-- ('DeliveryFailed').  Upstream's copy of the path fails the same way when
+-- a reference is not valid.
+--
+-- Each path comes from the cache that offered it, as the narinfo the
+-- reference query read describes it ('fetchSubstituteWith'), and no
+-- narinfo is requested again.
+substitutePaths :: BuildConfig -> Store -> Registration -> NonEmpty Substitute -> IO FetchOutcome
+substitutePaths config store registration offered = do
+  heldLocks <- newIORef []
+  registerSubstituted heldLocks
+    `finally` (readIORef heldLocks >>= mapM_ releasePathLock)
   where
     registerSubstituted :: IORef [PathLock] -> IO FetchOutcome
     registerSubstituted heldLocks = do
-      results <- mapM (substituteOne heldLocks) (lockOrder paths)
-      case batchRegistrations results of
-        Left outcome -> pure outcome
-        Right rows -> do
+      results <- traverse (substituteOne heldLocks) (lockOrder substitutePath (NE.toList offered))
+      case (batchRegistrations results, registration) of
+        (Left outcome, _) -> pure outcome
+        -- The trees stay unpacked and unregistered, as a batch that does
+        -- not land leaves them.
+        (Right _, RegisterNone) -> pure Fetched
+        (Right rows, RegisterAll) -> do
           registered <- try (registerPaths (stDB store) rows)
           case registered of
             Right () -> pure Fetched
             Left (e :: IOException) -> do
               TIO.hPutStrLn System.IO.stderr ("  [subst] registration refused: " <> T.pack (displayException e))
-              pure FetchFailed
+              pure (NotFetched (fmap (\substitute -> (substitutePath substitute, DeliveryFailed)) offered))
     -- Record a returned lock the moment it exists, so the enclosing
     -- finally owns it even when a later path's attempt fails or throws.
-    substituteOne heldLocks sp = do
-      result <- trySubstituteWith (bcFetchRetry config) ioRetryEffects store (bcCaches config) sp
+    substituteOne heldLocks substitute = do
+      let sp = substitutePath substitute
+      result <- fetchSubstituteWith (bcFetchRetry config) ioRetryEffects store substitute
       case result of
         SubstSuccess _ lock -> atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
         SubstError err -> TIO.hPutStrLn System.IO.stderr ("  [subst] " <> spName sp <> ": " <> err)
         _ -> pure ()
-      pure result
+      pure (sp, result)
 
 -- | What one batch's results come to: the rows to register when every path
--- arrived, or why not.  One failed path fails the batch whatever the others
--- did, as one failed output fails upstream's derivation goal.
-batchRegistrations :: [SubstResult] -> Either FetchOutcome [PathRegistration]
-batchRegistrations results
-  | any failed results = Left FetchFailed
-  | otherwise = maybe (Left FetchMissed) (Right . catMaybes) (traverse arrived results)
-  where
-    failed (SubstError _) = True
-    failed _ = False
+-- arrived, or the paths that did not.  Nothing is registered unless every
+-- path arrived, as one failed output fails upstream's derivation goal.
+batchRegistrations :: [(StorePath, SubstResult)] -> Either FetchOutcome [PathRegistration]
+batchRegistrations results =
+  case NE.nonEmpty [(sp, why) | (sp, result) <- results, Just why <- [undelivered result]] of
+    Just short -> Left (NotFetched short)
     -- An already-valid path counts as arrived but contributes no
     -- registration row (and holds no lock).
-    arrived (SubstSuccess reg _) = Just (Just reg)
-    arrived SubstAlreadyValid = Just Nothing
-    arrived SubstNotFound = Nothing
-    arrived (SubstError _) = Nothing
+    Nothing -> Right [reg | (_, SubstSuccess reg _) <- results]
+  where
+    undelivered (SubstSuccess _ _) = Nothing
+    undelivered SubstAlreadyValid = Nothing
+    undelivered SubstNotFound = Just Gone
+    undelivered (SubstError _) = Just DeliveryFailed
 
 -- | Format a derivation name for status output (display-only, so the
 -- byte-string env value decodes lossily).

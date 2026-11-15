@@ -17,7 +17,7 @@ import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
 import Control.Monad (filterM, unless, void, when, zipWithM)
 import Control.Monad.Except (runExceptT)
-import Control.Monad.State.Strict (State, gets, modify', runState)
+import Control.Monad.State.Strict (State, evalStateT, get, gets, modify', runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -33,6 +33,7 @@ import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List (find, inits, intercalate, isPrefixOf, mapAccumL, nub, sort, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
 import qualified Data.Set as Set
@@ -97,7 +98,7 @@ import Nix.Expr.Types
 import Nix.Hash (compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.HostPath (hostPathFromBytes)
-import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
+import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, ioRetryEffects, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
 import Nix.Json (Json (..), parseJson, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
@@ -6073,23 +6074,31 @@ testDrvContext = do
 -- | What the fake store and caches record, in order.
 data RealiseEvent
   = EvQueried StorePath
+  | EvQueriedNext StorePath
   | EvFetched [StorePath]
+  | EvProbed [StorePath]
   | EvBuilt Text
   | EvChecked Text
   | EvReported Realise.Realised Text
   deriving (Eq, Show)
 
--- | A fake store and cache.  A cache entry maps a path to its references, a
--- fetch refuses a path whose references are not valid, as the database's
--- unregistered-referent guard does, and a build makes its outputs valid.
--- The cache fails to deliver the broken paths it offers, and cannot be
--- asked about the unreachable ones at all.  Building a derivation again
--- gives its unstable outputs other contents, and changes no path.  Each
--- build is recorded with the outputs the request that led to it asked.
+-- | A fake store and two caches, asked in order.  A cache entry maps a path
+-- to its references, a fetch refuses a path whose references are not valid,
+-- as the database's unregistered-referent guard does, and a build makes its
+-- outputs valid.  The first cache fails to deliver the broken paths it
+-- offers, no longer holds the gone ones, and cannot be asked about the
+-- unreachable ones at all; the next cache is asked only about a path the
+-- first did not deliver, and delivers what it offers.  A fetch that
+-- registers nothing records what arrived as probed.  Building a derivation
+-- again gives its unstable outputs other contents, and changes no path.
+-- Each build is recorded with the outputs the request that led to it
+-- asked.
 data FakeWorld = FakeWorld
   { fwValid :: !(Set.Set StorePath),
     fwCache :: !(Map.Map StorePath [StorePath]),
+    fwNextCache :: !(Map.Map StorePath [StorePath]),
     fwBroken :: !(Set.Set StorePath),
+    fwGone :: !(Set.Set StorePath),
     fwUnreachable :: !(Set.Set StorePath),
     fwUnstable :: !(Set.Set StorePath),
     fwEvents :: ![RealiseEvent],
@@ -6098,18 +6107,29 @@ data FakeWorld = FakeWorld
     fwBuiltFor :: ![(Text, Set.Set Text)]
   }
 
--- | A world with the given cache entries and valid paths, and no faults.
+-- | Which of the fake's caches offered a path.
+data FakeCache = FirstCache | NextCache
+  deriving (Eq, Show)
+
+-- | A world with the given entries in the first cache and valid paths, and
+-- no faults.
 fakeWorld :: [(Text, [Text])] -> [Text] -> FakeWorld
 fakeWorld cache valid =
   FakeWorld
     { fwValid = Set.fromList (map fakePath valid),
-      fwCache = Map.fromList [(fakePath p, map fakePath refs) | (p, refs) <- cache],
+      fwCache = fakeCache cache,
+      fwNextCache = Map.empty,
       fwBroken = Set.empty,
+      fwGone = Set.empty,
       fwUnreachable = Set.empty,
       fwUnstable = Set.empty,
       fwEvents = [],
       fwBuiltFor = []
     }
+
+-- | Cache entries by name.
+fakeCache :: [(Text, [Text])] -> Map.Map StorePath [StorePath]
+fakeCache cache = Map.fromList [(fakePath p, map fakePath refs) | (p, refs) <- cache]
 
 fakeEvent :: RealiseEvent -> State FakeWorld ()
 fakeEvent event = modify' (\world -> world {fwEvents = event : fwEvents world})
@@ -6118,31 +6138,44 @@ fakeEvent event = modify' (\world -> world {fwEvents = event : fwEvents world})
 fakeQueryFailure :: StorePath -> Text
 fakeQueryFailure sp = "cannot ask about " <> spName sp
 
-fakeSubst :: Realise.SubstEffects (State FakeWorld)
+fakeSubst :: Realise.SubstEffects FakeCache (State FakeWorld)
 fakeSubst =
   Realise.SubstEffects
     { Realise.seValid = \sp -> gets (Set.member sp . fwValid),
       Realise.seReferences = \sp -> do
         fakeEvent (EvQueried sp)
         unreachable <- gets (Set.member sp . fwUnreachable)
-        offer <- gets (maybe Realise.NotOffered Realise.Offered . Map.lookup sp . fwCache)
+        offer <- gets (maybe Realise.NotOffered (Realise.Offered FirstCache) . Map.lookup sp . fwCache)
         pure (if unreachable then Realise.QueryFailed (fakeQueryFailure sp) else offer),
-      Realise.seFetch = \paths -> do
-        valid <- gets fwValid
-        cache <- gets fwCache
-        broken <- gets fwBroken
-        let incoming = Set.fromList paths
-            landed sp = Set.member sp valid || Set.member sp incoming
-            refused = not (all (all landed . flip (Map.findWithDefault []) cache) paths)
-        if refused || any (`Set.member` broken) paths
-          then pure Realise.FetchFailed
-          else do
+      Realise.seNextOffer = \sp offered -> case offered of
+        FirstCache -> do
+          fakeEvent (EvQueriedNext sp)
+          gets (maybe Realise.NotOffered (Realise.Offered NextCache) . Map.lookup sp . fwNextCache)
+        NextCache -> pure Realise.NotOffered,
+      Realise.seFetch = \registration batch -> do
+        world <- get
+        let paths = map fst (NE.toList batch)
+            incoming = Set.fromList paths
+            landed sp = Set.member sp (fwValid world) || Set.member sp incoming
+            declared (sp, FirstCache) = Map.findWithDefault [] sp (fwCache world)
+            declared (sp, NextCache) = Map.findWithDefault [] sp (fwNextCache world)
+            undelivered (sp, FirstCache)
+              | Set.member sp (fwBroken world) = Just Realise.DeliveryFailed
+              | Set.member sp (fwGone world) = Just Realise.Gone
+            undelivered _ = Nothing
+            short = [(sp, why) | each@(sp, _) <- NE.toList batch, Just why <- [undelivered each]]
+            refused = registration == Realise.RegisterAll && not (all (all landed . declared) batch)
+        case (NE.nonEmpty short, registration) of
+          (Just undeliveredPaths, _) -> pure (Realise.NotFetched undeliveredPaths)
+          (Nothing, _) | refused -> pure (Realise.NotFetched (fmap (\(sp, _) -> (sp, Realise.DeliveryFailed)) batch))
+          (Nothing, Realise.RegisterNone) -> Realise.Fetched <$ fakeEvent (EvProbed paths)
+          (Nothing, Realise.RegisterAll) -> do
             fakeEvent (EvFetched paths)
-            modify' (\world -> world {fwValid = fwValid world <> incoming})
+            modify' (\updated -> updated {fwValid = fwValid updated <> incoming})
             pure Realise.Fetched
     }
 
-fakeRealiseEffects :: Set.Set Text -> Realise.RealiseEffects (State FakeWorld)
+fakeRealiseEffects :: Set.Set Text -> Realise.RealiseEffects FakeCache (State FakeWorld)
 fakeRealiseEffects failing =
   Realise.RealiseEffects
     { Realise.reSubst = fakeSubst,
@@ -6647,6 +6680,77 @@ testRealise = do
                 [fakeNode "hello" ["hello-out"] []]
                 "hello"
          in assertEqual "realise" (Left (Realise.SubstitutesFailed (fakePath "hello.drv")), []) (result, realiseWork events),
+      -- Upstream's goal moves on to its next substituter when a copy fails,
+      -- and realises what that substituter's path info references first.
+      runTest "a path the first cache fails to deliver comes from the next, after what that cache says it references" $
+        let (result, events, _) =
+              runRealiseIn
+                Realise.NoFallback
+                (fakeWorld [("hello-out", []), ("lib-out", [])] [])
+                  { fwBroken = Set.singleton (fakePath "hello-out"),
+                    fwNextCache = fakeCache [("hello-out", ["lib-out"])]
+                  }
+                Set.empty
+                [fakeNode "hello" ["hello-out"] []]
+                "hello"
+         in assertEqual
+              "realise"
+              ( Right (),
+                [ EvQueried (fakePath "hello-out"),
+                  EvQueriedNext (fakePath "hello-out"),
+                  EvQueried (fakePath "lib-out"),
+                  EvFetched [fakePath "lib-out"],
+                  EvFetched [fakePath "hello-out"],
+                  EvReported Realise.Substituted "hello-out"
+                ]
+              )
+              (result, events),
+      runTest "only the output a cache failed to deliver is asked of the next cache" $
+        let (result, events, _) =
+              runRealiseIn
+                Realise.NoFallback
+                (fakeWorld [("pkg-bin", []), ("pkg-lib", [])] [])
+                  { fwBroken = Set.singleton (fakePath "pkg-bin"),
+                    fwNextCache = fakeCache [("pkg-bin", []), ("pkg-lib", [])]
+                  }
+                Set.empty
+                [fakeNode "pkg" ["pkg-bin", "pkg-lib"] []]
+                "pkg"
+         in assertEqual
+              "realise"
+              (Right (), [fakePath "pkg-bin"], [EvFetched [fakePath "pkg-bin", fakePath "pkg-lib"]])
+              (result, [sp | EvQueriedNext sp <- events], realiseWork events),
+      -- Upstream's goal for each output runs its own course: dev's ends for
+      -- want of a substitute and out's arrives from the next cache, so no
+      -- goal failed and the derivation builds (derivation-goal.cc:281).
+      runTest "an output whose cache failed and that the next cache delivers fails nothing, though its sibling has no cache left" $
+        let (result, events, _) =
+              runRealiseIn
+                Realise.NoFallback
+                (fakeWorld [("pkg-out", []), ("pkg-dev", [])] [])
+                  { fwBroken = Set.singleton (fakePath "pkg-out"),
+                    fwGone = Set.singleton (fakePath "pkg-dev"),
+                    fwNextCache = fakeCache [("pkg-out", [])]
+                  }
+                Set.empty
+                [fakeNode "pkg" ["pkg-out", "pkg-dev"] []]
+                "pkg"
+         in assertEqual
+              "realise"
+              (Right (), [EvBuilt "pkg-out"], [[fakePath "pkg-out"]])
+              (result, realiseWork events, [probed | EvProbed probed <- events]),
+      runTest "an output whose every cache failed to deliver it stops the build, though its sibling is gone" $
+        let (result, events, _) =
+              runRealiseIn
+                Realise.NoFallback
+                (fakeWorld [("pkg-out", []), ("pkg-dev", [])] [])
+                  { fwBroken = Set.singleton (fakePath "pkg-out"),
+                    fwGone = Set.singleton (fakePath "pkg-dev")
+                  }
+                Set.empty
+                [fakeNode "pkg" ["pkg-out", "pkg-dev"] []]
+                "pkg"
+         in assertEqual "realise" (Left (Realise.SubstitutesFailed (fakePath "pkg.drv")), []) (result, realiseWork events),
       -- Upstream rethrows a failed narinfo query, which ends the build
       -- before any other goal is asked anything.
       runTest "a cache that cannot be asked stops the build, and nothing after it is asked" $
@@ -7883,13 +7987,13 @@ testSubstituter = do
             | NAR.serialise strictTree == NAR.serialise streamedTree -> Pass
             | otherwise -> Fail "strict and streaming trees diverge"
           other -> Fail ("oracle setup failed: " <> T.pack (show other)),
-      -- trySubstitute: empty caches returns SubstNotFound
-      runTestM "trySubstitute no caches" $ do
+      -- With no cache there is nothing to offer, so nothing is fetched.
+      runTestM "a path asked of no cache is not offered, and nothing is fetched" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-subst"
         createDirectoryIfMissing True tmpStore
         store <- openStore (StoreDir tmpStore)
-        result <- Subst.trySubstitute store [] (StorePath "test" "hello")
+        result <- offeredThenFetched defaultFetchRetryPolicy ioRetryEffects store [] (StorePath "test" "hello")
         closeStore store
         removeDirectoryRecursive tmpStore
         pure (assertEqual "no-caches" Subst.SubstNotFound result),
@@ -7944,99 +8048,23 @@ testSubstituter = do
         if Subst.narInfoMatchesPath (StorePath (T.replicate 32 "b") "hello") (sampleNarInfo sampleNarHash)
           then Fail "expected identity mismatch"
           else Pass,
-      -- tryCachesWith: the first success stops the scan (later caches
-      -- are never contacted)
-      runTestM "tryCachesWith success stops scan" $ do
-        calls <- newIORef (0 :: Int)
-        withChainLock "nova-nix-test-chain-stop" $ \lock -> do
-          let hit = PathRegistration (StorePath (T.replicate 32 "d") "hit") "sha256:d" 1 Nothing []
-              attempt cache = do
-                atomicModifyIORef' calls (\n -> (n + 1, ()))
-                pure $
-                  if Subst.ccUrl cache == "https://b"
-                    then Subst.SubstSuccess hit lock
-                    else Subst.SubstNotFound
-          result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b", chainCache "https://c"]
-          made <- readIORef calls
-          pure $
-            if result == Subst.SubstSuccess hit lock && made == 2
-              then Pass
-              else Fail ("got " <> T.pack (show result) <> " after " <> T.pack (show made) <> " attempts"),
-      -- tryCachesWith: an already-valid path found mid-scan is terminal
-      -- like a success - later caches are never contacted
-      runTestM "tryCachesWith already-valid stops scan" $ do
-        calls <- newIORef (0 :: Int)
-        let attempt _ = do
-              atomicModifyIORef' calls (\n -> (n + 1, ()))
-              pure Subst.SubstAlreadyValid
-        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"]
-        made <- readIORef calls
-        pure $
-          if result == Subst.SubstAlreadyValid && made == 1
-            then Pass
-            else Fail ("got " <> T.pack (show result) <> " after " <> T.pack (show made) <> " attempts"),
-      -- tryCachesWith: an erroring cache falls through to a later hit
-      -- instead of aborting the chain
-      runTestM "tryCachesWith error falls through to next cache" $
-        withChainLock "nova-nix-test-chain-fallthrough" $ \lock -> do
-          let hit = PathRegistration (StorePath (T.replicate 32 "f") "hit") "sha256:f" 1 Nothing []
-              attempt cache
-                | Subst.ccUrl cache == "https://a" = pure (Subst.SubstError "transient 500")
-                | otherwise = pure (Subst.SubstSuccess hit lock)
-          result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"]
-          pure (assertEqual "fallthrough" (Subst.SubstSuccess hit lock) result),
-      -- tryCachesWith: all misses stay SubstNotFound
-      runTestM "tryCachesWith all misses" $ do
-        result <- Subst.tryCachesWith (\_ -> pure Subst.SubstNotFound) [chainCache "https://a", chainCache "https://b"]
-        pure (assertEqual "misses" Subst.SubstNotFound result),
-      -- tryCachesWith: with no hit anywhere, the FIRST error is reported,
-      -- tagged with the URL of the cache that produced it
-      runTestM "tryCachesWith reports first error tagged with cache" $ do
-        let attempt cache
-              | Subst.ccUrl cache == "https://a" = pure Subst.SubstNotFound
-              | Subst.ccUrl cache == "https://b" = pure (Subst.SubstError "first")
-              | otherwise = pure (Subst.SubstError "second")
-        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b", chainCache "https://c"]
-        pure $ case result of
-          Subst.SubstError err
-            | "https://b" `T.isPrefixOf` err && "first" `T.isSuffixOf` err -> Pass
-          other -> Fail ("expected tagged first error, got " <> T.pack (show other)),
-      -- catchSync (the split every attempt wraps itself in): a
-      -- synchronous exception folds into SubstError and the scan falls
-      -- through to the next cache
-      runTestM "catchSync folds sync exception into SubstError" $ do
-        let attempt cache =
-              Subst.catchSync
-                ( if Subst.ccUrl cache == "https://a"
-                    then throwIO (ErrorCall "disk full")
-                    else pure Subst.SubstNotFound
-                )
-                (pure . Subst.SubstError . T.pack . show)
-        result <- Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"]
+      -- catchSync, which a fetch and a query wrap each attempt in: a
+      -- synchronous exception becomes the handler's value, and so a failed
+      -- substitute the realisation passes to the next cache.
+      runTestM "catchSync folds a synchronous exception into the handler's value" $ do
+        result <- Subst.catchSync (throwIO (ErrorCall "disk full")) (pure . Subst.SubstError . T.pack . show)
         pure $ case result of
           Subst.SubstError err
             | "disk full" `T.isInfixOf` err -> Pass
           other -> Fail ("expected SubstError from sync exception, got " <> T.pack (show other)),
-      -- catchSync: an asynchronous exception thrown mid-attempt
-      -- propagates out of the cache scan instead of folding into
-      -- SubstError - cancellation must abort substitution, never be
-      -- spent as fallthrough to the next cache or to a local build
-      runTestM "catchSync propagates async exception out of the scan" $ do
-        scanned <- newIORef (0 :: Int)
-        let attempt _ =
-              Subst.catchSync
-                ( do
-                    atomicModifyIORef' scanned (\n -> (n + 1, ()))
-                    throwIO (asyncExceptionToException (ErrorCall "cancelled"))
-                )
-                (pure . Subst.SubstError . T.pack . show)
-        outcome <- try (Subst.tryCachesWith attempt [chainCache "https://a", chainCache "https://b"])
-        made <- readIORef scanned
+      -- catchSync: an asynchronous exception passes through untouched -
+      -- cancellation must abort substitution, never be spent as a failed
+      -- substitute and from there a local build.
+      runTestM "catchSync passes an asynchronous exception through" $ do
+        outcome <- try (Subst.catchSync (throwIO (asyncExceptionToException (ErrorCall "cancelled"))) (pure . Subst.SubstError . T.pack . show))
         pure $ case (outcome :: Either SomeException Subst.SubstResult) of
           Left escaped -> case fromException escaped of
-            Just (SomeAsyncException _)
-              | made == 1 -> Pass
-              | otherwise -> Fail ("scan continued past the interrupt: " <> T.pack (show made) <> " attempts")
+            Just (SomeAsyncException _) -> Pass
             Nothing -> Fail ("wrong exception escaped: " <> T.pack (show escaped))
           Right result -> Fail ("async exception folded into " <> T.pack (show result)),
       -- clearStaleDestination: removes a read-only leftover tree (the
@@ -8538,7 +8566,6 @@ testSubstituter = do
           other -> Fail ("expected two SubstError results, got: " <> T.pack (show other))
     ]
   where
-    chainCache url = Subst.CacheConfig url ["unused-key"] 10
     -- A tree unpacked into a fresh destination through the strict and
     -- the streaming path, each read back from disk, or the unpack's
     -- refusal.  The read-back tree carries every name and link target
@@ -8558,19 +8585,6 @@ testSubstituter = do
       strict <- readBack (unpackNarEntry sensitivity dest tree)
       viaStream <- readBack streamed
       pure (strict, viaStream)
-    -- A real held lock for tests that construct 'SubstSuccess' by hand:
-    -- the constructor carries the path's lock, so a fabricated success
-    -- needs a genuine one, taken in a scratch directory.
-    withChainLock dirName act = do
-      tmpBase <- getTemporaryDirectory
-      let lockRoot = tmpBase </> (dirName :: FilePath)
-      forceRemoveIfExists lockRoot
-      createDirectoryIfMissing True lockRoot
-      lock <- acquirePathLock (StoreDir lockRoot) (StorePath (T.replicate 32 "d") "hit")
-      result <- act lock
-      releasePathLock lock
-      forceRemoveIfExists lockRoot
-      pure result
     sampleNarBytes = "nova-nix nar sample bytes" :: BS.ByteString
     sampleNarHash = CHash.formatNixHash (CHash.hashBytes sampleNarBytes)
     wrongNarHash = CHash.formatNixHash (CHash.hashBytes ("different bytes" :: BS.ByteString))
@@ -8847,35 +8861,40 @@ testPathLocks = do
           (Nothing, Just _) -> Pass
           (Just _, _) -> Fail "a second handle acquired a held lock"
           (Nothing, Nothing) -> Fail "release did not free the lock",
-      -- The already-valid short-circuit: a registered path substitutes
-      -- as SubstAlreadyValid with no network and no disk writes - the
-      -- configured cache is unreachable, so any contact would surface
-      -- as an error result.
-      runTestM "trySubstitute adopts an already-valid path untouched" $ do
-        tmpBase <- getTemporaryDirectory
-        let tmpStore = tmpBase </> "nova-nix-test-lock-valid"
-        forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+      -- The already-valid short-circuit: a path registered by the time
+      -- its substitute is fetched is adopted as SubstAlreadyValid with no
+      -- NAR request and no disk writes, and the lock is released.
+      runTestM "fetching a substitute adopts an already-valid path untouched, asking for no NAR" $ do
         let sp = StorePath (T.replicate 32 "c") "validpath"
-            destPath = storePathToFilePath (StoreDir tmpStore) sp
-        createDirectoryIfMissing True destPath
-        BS.writeFile (destPath </> "payload") "registered bytes"
-        reg <- registrationFor store sp Nothing []
-        registerPath (stDB store) reg
-        result <- Subst.trySubstitute store [unreachableCache] sp
-        survivor <- BS.readFile (destPath </> "payload")
-        -- The short-circuit released the lock, so the path must be
-        -- lockable again at once.
-        reLock <- tryAcquirePathLock (StoreDir tmpStore) sp
-        mapM_ releasePathLock reLock
-        closeStore store
-        forceRemoveIfExists tmpStore
-        pure $ case (result, reLock) of
-          (Subst.SubstAlreadyValid, Just _)
-            | survivor == "registered bytes" -> Pass
-            | otherwise -> Fail "tree touched during already-valid adoption"
-          (Subst.SubstAlreadyValid, Nothing) -> Fail "lock still held after already-valid return"
-          (other, _) -> Fail ("expected SubstAlreadyValid, got: " <> T.pack (show other)),
+        case servedPaths [(sp, [])] of
+          Left err -> pure (Fail (T.pack err))
+          Right (key, serve) ->
+            withHttpServer (\target _ -> serve target) $ \base requests _ -> do
+              tmpBase <- getTemporaryDirectory
+              let tmpStore = tmpBase </> "nova-nix-test-lock-valid"
+                  destPath = storePathToFilePath (StoreDir tmpStore) sp
+              forceRemoveIfExists tmpStore
+              store <- openStore (StoreDir tmpStore)
+              createDirectoryIfMissing True destPath
+              BS.writeFile (destPath </> "payload") "registered bytes"
+              reg <- registrationFor store sp Nothing []
+              registerPath (stDB store) reg
+              result <- offeredThenFetched defaultFetchRetryPolicy ioRetryEffects store [Subst.CacheConfig base [key] 40] sp
+              survivor <- BS.readFile (destPath </> "payload")
+              -- The short-circuit released the lock, so the path must be
+              -- lockable again at once.
+              reLock <- tryAcquirePathLock (StoreDir tmpStore) sp
+              mapM_ releasePathLock reLock
+              closeStore store
+              forceRemoveIfExists tmpStore
+              seen <- requests
+              pure $ case (result, reLock) of
+                (Subst.SubstAlreadyValid, Just _)
+                  | survivor /= "registered bytes" -> Fail "tree touched during already-valid adoption"
+                  | seen /= [narInfoRequest sp] -> Fail ("expected the narinfo request alone, got: " <> T.pack (show seen))
+                  | otherwise -> Pass
+                (Subst.SubstAlreadyValid, Nothing) -> Fail "lock still held after already-valid return"
+                (other, _) -> Fail ("expected SubstAlreadyValid, got: " <> T.pack (show other)),
       -- The strict pipeline honors the same short-circuit: fed a
       -- DIFFERENT (self-consistent) NAR for an already-valid path, it
       -- must adopt the registered tree rather than overwrite it.
@@ -8949,9 +8968,6 @@ testPathLocks = do
           other -> Fail ("a race attempt hung or threw: " <> T.pack (show other))
     ]
   where
-    -- Never contacted when the already-valid short-circuit holds; a
-    -- regression that reaches for the network fails loudly here.
-    unreachableCache = Subst.CacheConfig "http://127.0.0.1:9" ["unused-key"] 10
     lockTestNarInfo sp rawNar =
       NarInfo.NarInfo
         { NarInfo.niStorePath = storePathToText defaultStoreDir sp,
@@ -13475,6 +13491,60 @@ testFetchurlUnpack = do
     treeXzB64 =
       "/Td6WFoAAATm1rRGBMC0AegGIQEcAAAAAAAAAECWtWrgA2cArF0ABoA2H++mzr92uhp6TyvqpFMk7aEjBHH/W7+XabrzKb4lenEr6bTaDX6aj51eJG3iFAbZDd8GA2XaYJrrkAHWgeGGgmFdILNyZZxSeSX3iaFCjpuwFBhssFJc2PhwJiJi0g8PV0XUxS/A206A1s9Roe9EEHR69sTLQiQYEFLSL17xYPIJsVKtCwROwCBJbpmdSTKWs6h14bbSSD5mKx99dPudGvwbMcpAf7NyGABJYU2iEzNN3AAB0AHoBgAAJ/RN+7HEZ/sCAAAAAARZWg==" :: Text
 
+-- | Fetch a path as a build does, from the first cache that offers it: the
+-- reference query, then the fetch from its substitute.  A path no cache
+-- offers is 'Subst.SubstNotFound', and a query that fails is
+-- 'Subst.SubstError' with its message.
+offeredThenFetched :: FetchRetryPolicy -> RetryEffects IO -> Store -> [Subst.CacheConfig] -> StorePath -> IO Subst.SubstResult
+offeredThenFetched policy effects store caches sp = do
+  offer <- evalStateT (Subst.queryReferencesWith policy effects Realise.NoFallback caches sp) Subst.emptyNarInfoMemo
+  case offer of
+    Realise.Offered substitute _ -> Subst.fetchSubstituteWith policy effects store substitute
+    Realise.NotOffered -> pure Subst.SubstNotFound
+    Realise.QueryFailed failure -> pure (Subst.SubstError failure)
+
+-- | An offer with the URL of the cache whose substitute it carries, the
+-- part of a substitute a test can compare.
+offerCache :: Realise.Offer Subst.Substitute -> Realise.Offer Text
+offerCache offer = case offer of
+  Realise.Offered substitute references -> Realise.Offered (Subst.ccUrl (Subst.substituteCache substitute)) references
+  Realise.NotOffered -> Realise.NotOffered
+  Realise.QueryFailed failure -> Realise.QueryFailed failure
+
+-- | The substitute a cache offered, if one did.
+offeredSubstitute :: Realise.Offer s -> Maybe s
+offeredSubstitute (Realise.Offered substitute _) = Just substitute
+offeredSubstitute Realise.NotOffered = Nothing
+offeredSubstitute (Realise.QueryFailed _) = Nothing
+
+-- | What a loopback cache answers for paths with their references: each
+-- one's narinfo, signed by 'sigTestKeyText' and naming them, at
+-- 'narInfoRequest', and its NAR ('servedNar'), uncompressed at
+-- 'narRequest'.  Any other request is a 404.  With the public key that
+-- verifies the narinfos.
+servedPaths :: [(StorePath, [StorePath])] -> Either String (Text, BS.ByteString -> Reply)
+servedPaths entries = do
+  publicKey <- Signing.renderPublicKey <$> (Signing.parseSecretKey sigTestKeyText >>= Signing.toPublicKey)
+  answers <- Map.fromList . concat <$> traverse served entries
+  pure (publicKey, \target -> Send (maybe (httpResponse "404 Not Found" "") (httpResponse "200 OK") (Map.lookup target answers)))
+  where
+    served (path, references) = do
+      (_, narInfo) <- signedTestNarInfo path references (narUrl path) (servedNar path)
+      pure [(narInfoRequest path, TE.encodeUtf8 narInfo), (narRequest path, servedNar path)]
+    narUrl path = "nar/" <> spName path <> ".nar"
+
+-- | The request target of a path's narinfo.
+narInfoRequest :: StorePath -> BS.ByteString
+narInfoRequest path = "/" <> TE.encodeUtf8 (spHash path) <> ".narinfo"
+
+-- | The request target of a path's NAR in 'servedPaths'.
+narRequest :: StorePath -> BS.ByteString
+narRequest path = "/nar/" <> TE.encodeUtf8 (spName path) <> ".nar"
+
+-- | The NAR 'servedPaths' serves for a path: one file holding its name.
+servedNar :: StorePath -> BS.ByteString
+servedNar path = NAR.serialise (NAR.NarRegular False (TE.encodeUtf8 (spName path) <> "\n"))
+
 -- | The substituter's narinfo and NAR requests under the transfer
 -- layer's retry policy, against a loopback cache.  The policy's effects
 -- are recorded rather than slept, so each case states the requests the
@@ -13545,7 +13615,7 @@ testSubstituterRetry = do
                       }
               bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
                 bracket (openStore (StoreDir root)) closeStore $ \store -> do
-                  result <- Subst.trySubstituteWith defaultFetchRetryPolicy effects store [cache] sp
+                  result <- offeredThenFetched defaultFetchRetryPolicy effects store [cache] sp
                   outcome <- case result of
                     Subst.SubstSuccess _ lock -> do
                       releasePathLock lock
@@ -13554,57 +13624,64 @@ testSubstituterRetry = do
                   (,,,,) base outcome <$> requests <*> readIORef sleeps <*> readIORef warnings
        in sequence $
             [ -- The order two processes meet the locks in decides whether they
-              -- can deadlock, and each path's narinfo is requested under its
-              -- lock, so the requests show the order without a race to observe.
-              runTestM "a substitution takes its output locks in the order a build does" $
-                withHttpServer (\_ _ -> Send (httpResponse "404 Not Found" "")) $ \base requests _ -> do
-                  tmpBase <- getTemporaryDirectory
-                  let root = tmpBase </> "nova-nix-test-substitute-lock-order"
-                      low = T.replicate 32 "a"
-                      high = T.replicate 32 "z"
-                      drv =
-                        Derivation
-                          { drvOutputs =
-                              [ DerivationOutput "bin" (StorePath high "lock-order-bin") "" "",
-                                DerivationOutput "lib" (StorePath low "lock-order-lib") "" ""
-                              ],
-                            drvInputDrvs = Map.empty,
-                            drvInputSrcs = [],
-                            drvPlatform = X86_64_Linux,
-                            drvBuilder = "/bin/sh",
-                            drvArgs = [],
-                            drvEnv = Map.empty
-                          }
-                      config = (defaultBuildConfig (StoreDir root)) {bcCaches = [Subst.CacheConfig base [] 40]}
-                  bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
-                    bracket (openStore (StoreDir root)) closeStore $ \store -> do
-                      _ <- substitutePaths config store (map doPath (drvOutputs drv))
-                      assertEqual "narinfo requests" (map (\h -> "/" <> TE.encodeUtf8 h <> ".narinfo") [low, high]) <$> requests,
+              -- can deadlock, and each path's NAR is requested under its lock,
+              -- so the requests show the order without a race to observe.
+              runTestM "a substitution takes its output locks in the order a build does" $ do
+                let low = StorePath (T.replicate 32 "a") "lock-order-lib"
+                    high = StorePath (T.replicate 32 "z") "lock-order-bin"
+                case servedPaths [(high, []), (low, [])] of
+                  Left err -> pure (Fail (T.pack err))
+                  Right (key, serve) ->
+                    withHttpServer (\target _ -> serve target) $ \base requests _ -> do
+                      tmpBase <- getTemporaryDirectory
+                      let root = tmpBase </> "nova-nix-test-substitute-lock-order"
+                          caches = [Subst.CacheConfig base [key] 40]
+                          config = (defaultBuildConfig (StoreDir root)) {bcCaches = caches}
+                      bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
+                        bracket (openStore (StoreDir root)) closeStore $ \store -> do
+                          offers <- evalStateT (traverse (Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry Realise.NoFallback caches) (high :| [low])) Subst.emptyNarInfoMemo
+                          case traverse offeredSubstitute offers of
+                            Nothing -> pure (Fail ("not offered: " <> T.pack (show (fmap offerCache offers))))
+                            Just batch -> do
+                              _ <- substitutePaths config store Realise.RegisterAll batch
+                              assertEqual "NAR requests" (map narRequest [low, high]) . filter (`elem` map narRequest [low, high]) <$> requests,
               runTestM "a reference query believes a signed narinfo for the path" $
                 withHttpServer (route (const narInfoOk) (const narOk)) $ \base _ _ ->
-                  assertEqual "references" (Realise.Offered [])
-                    <$> Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry Realise.NoFallback [trustingCache base 40] sp,
+                  assertEqual "references" (Realise.Offered base [])
+                    <$> queryOffer Realise.NoFallback [trustingCache base 40] sp,
               runTestM "a reference query passes over a narinfo no trusted key signed" $
                 withHttpServer (route (const unsignedNarInfo) (const narOk)) $ \base _ _ ->
                   assertEqual "references" Realise.NotOffered
-                    <$> Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry Realise.NoFallback [trustingCache base 40] sp,
+                    <$> queryOffer Realise.NoFallback [trustingCache base 40] sp,
               runTestM "a reference query passes over a narinfo for another path" $
                 withHttpServer (\_ _ -> narInfoOk) $ \base _ _ ->
                   assertEqual "references" Realise.NotOffered
-                    <$> Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry Realise.NoFallback [trustingCache base 40] (StorePath (T.replicate 32 "c") "retry"),
+                    <$> queryOffer Realise.NoFallback [trustingCache base 40] (StorePath (T.replicate 32 "c") "retry"),
               -- Upstream rethrows a failed narinfo query unless fallback is
               -- set, so a later cache holding the path is never asked.
               runTestM "a reference query stops at a failing cache" $
                 withHttpServer (route (const unavailable) (const narOk)) $ \failing _ _ ->
                   withHttpServer (route (const narInfoOk) (const narOk)) $ \working workingRequests _ -> do
-                    offer <- Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry Realise.NoFallback [trustingCache failing 10, trustingCache working 40] sp
+                    offer <- queryOffer Realise.NoFallback [trustingCache failing 10, trustingCache working 40] sp
                     seen <- workingRequests
                     pure (assertEqual "stopped" (Realise.QueryFailed (failing <> ": retry: HTTP 503 fetching " <> failing <> "/" <> hash <> ".narinfo"), []) (offer, seen)),
+              runTestM "a reference query stops at the first cache that offers the path" $
+                withHttpServer (route (const narInfoOk) (const narOk)) $ \first _ _ ->
+                  withHttpServer (route (const narInfoOk) (const narOk)) $ \later laterRequests _ -> do
+                    offer <- queryOffer Realise.NoFallback [trustingCache first 10, trustingCache later 40] sp
+                    seen <- laterRequests
+                    pure (assertEqual "offered by the first" (Realise.Offered first [], []) (offer, seen)),
+              runTestM "a reference query that no cache answers offers nothing, asking each cache once" $
+                withHttpServer (\_ _ -> Send (httpResponse "404 Not Found" "")) $ \first firstRequests _ ->
+                  withHttpServer (\_ _ -> Send (httpResponse "404 Not Found" "")) $ \later laterRequests _ -> do
+                    offer <- queryOffer Realise.NoFallback [trustingCache first 10, trustingCache later 40] sp
+                    seen <- (,) <$> firstRequests <*> laterRequests
+                    pure (assertEqual "not offered" (Realise.NotOffered, ([narInfoPath], [narInfoPath])) (offer, seen)),
               runTestM "under fallback a reference query falls through a failing cache to the next" $
                 withHttpServer (route (const unavailable) (const narOk)) $ \failing _ _ ->
                   withHttpServer (route (const narInfoOk) (const narOk)) $ \working _ _ ->
-                    assertEqual "references" (Realise.Offered [])
-                      <$> Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry Realise.BuildFromSource [trustingCache failing 10, trustingCache working 40] sp,
+                    assertEqual "references" (Realise.Offered working [])
+                      <$> queryOffer Realise.BuildFromSource [trustingCache failing 10, trustingCache working 40] sp,
               -- The whole realisation, against upstream's outcomes: a cache
               -- that fails stops the build unless fallback is on, and one
               -- that lacks the path or offers an untrusted narinfo does not.
@@ -13688,12 +13765,12 @@ testSubstituterRetry = do
                 pure $ case outcome of
                   Left (Subst.SubstError _) -> assertEqual "attempts" (replicate 5 narInfoPath, [250, 500, 1000, 2000]) (seen, sleeps)
                   other -> Fail ("expected a substitution error, got: " <> T.pack (show other)),
-              runTestM "a NAR download answering 501 stops after one request" $ do
-                (_, outcome, seen, sleeps, _) <-
+              runTestM "a NAR download answering 501 stops after one request and names the cache" $ do
+                (base, outcome, seen, sleeps, _) <-
                   substitute "nar-501" (const narInfoOk) (const (Send (httpResponse "501 Not Implemented" "")))
                 pure $ case outcome of
                   Left (Subst.SubstError err)
-                    | "HTTP 501" `T.isInfixOf` err -> assertEqual "one request" ([narInfoPath, narPath], []) (seen, sleeps)
+                    | (base <> ": ") `T.isPrefixOf` err && "HTTP 501" `T.isInfixOf` err -> assertEqual "one request" ([narInfoPath, narPath], []) (seen, sleeps)
                   other -> Fail ("expected an HTTP 501 substitution error, got: " <> T.pack (show other)),
               -- One attempt follows the client's redirect limit, then stops.
               runTestM "a NAR redirect loop stops after one attempt" $ do
@@ -13738,6 +13815,8 @@ testSubstituterRetry = do
     notInCache = ["404 Not Found", "410 Gone", "401 Unauthorized", "403 Forbidden", "407 Proxy Authentication Required"]
     statusCode = T.unpack . T.take 3
     quietRetry = RetryEffects {reSleepMs = const (pure ()), reJitter = pure 0, reWarn = const (pure ())}
+    queryOffer fallback caches path =
+      offerCache <$> evalStateT (Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry fallback caches path) Subst.emptyNarInfoMemo
     hash = T.replicate 32 "b"
     sp = StorePath hash "retry"
     narInfoPath = "/" <> TE.encodeUtf8 hash <> ".narinfo"
@@ -13768,48 +13847,222 @@ testSubstituterRetry = do
       | path == narPath = narReply earlier
       | otherwise = Send (httpResponse "500 Internal Server Error" "unexpected request")
 
--- | 'substituteFromCaches' against a loopback cache holding a path and
--- the one path it references: the reference arrives first, so the path's
--- registration finds it valid.  'substitutePaths' fetches only the paths
--- it is given, and the store refuses to register a path whose reference
--- is not valid.
+-- | 'substituteFromCaches' against loopback caches.  A path's reference
+-- arrives first, so the path's registration finds it valid; 'substitutePaths'
+-- fetches only the paths it is given, and the store refuses to register a
+-- path whose reference is not valid.  A run asks each cache about each path
+-- once, and a path's NAR comes from the cache whose narinfo gave the
+-- references realised before it, as upstream's substitution goal takes
+-- both from one substituter (@PathSubstitutionGoal@ at 2.24.9).
 testSubstituteFromCaches :: IO [Bool]
 testSubstituteFromCaches = do
   putStrLn "builder/substitute-from-caches"
   tmpBase <- getTemporaryDirectory
+  shell <- findTestShell
   let dep = StorePath (T.replicate 32 "c") "dep"
       top = StorePath (T.replicate 32 "d") "top"
-      depNar = NAR.serialise (NAR.NarRegular False "dep\n")
-      topNar = NAR.serialise (NAR.NarRegular False "top\n")
-      narInfoTarget out = "/" <> TE.encodeUtf8 (spHash out) <> ".narinfo"
-  case (,) <$> signedTestNarInfo dep [] "nar/dep.nar" depNar <*> signedTestNarInfo top [dep] "nar/top.nar" topNar of
+      other = StorePath (T.replicate 32 "r") "other"
+      -- Each link references the next.
+      chain = [StorePath (T.replicate 32 (T.singleton c)) ("link-" <> T.singleton c) | c <- "fghj"]
+      chainEntries = zip chain (map (: []) (drop 1 chain) ++ [[]])
+      notFound = Send (httpResponse "404 Not Found" "")
+      unavailable = Send (httpResponse "503 Service Unavailable" "")
+      multiOut = StorePath (T.replicate 32 "p") "multi"
+      multiDev = StorePath (T.replicate 32 "q") "multi-dev"
+      multiDrvSP = StorePath (T.replicate 31 "p" <> "1") "multi.drv"
+      multiDrv =
+        Derivation
+          { drvOutputs = [DerivationOutput "out" multiOut "" "", DerivationOutput "dev" multiDev "" ""],
+            drvInputDrvs = Map.empty,
+            drvInputSrcs = [],
+            drvPlatform = currentPlatform,
+            drvBuilder = TE.encodeUtf8 shell,
+            drvArgs = ["-c", "echo built > $out && echo built > $dev"],
+            drvEnv = Map.singleton "name" "multi"
+          }
+      -- Realise the derivation with two outputs: the result, then what its
+      -- out holds, which the builder writes and a cache serves otherwise.
+      builtMulti config store = do
+        writeDrv store multiDrv multiDrvSP
+        result <- buildWithDeps config store multiDrv multiDrvSP
+        let outFile = storePathToFilePath (stDir store) multiOut
+        present <- Dir.doesFileExist outFile
+        held <- if present then Just <$> BS.readFile outFile else pure Nothing
+        pure (result, held)
+      -- Run a substitution in a store of its own against caches answering
+      -- as given, in priority order, all trusting the fixture's key and
+      -- retrying without a real wait: what it returns, then the requests
+      -- each cache saw.
+      substitutedFrom :: String -> Text -> [BS.ByteString -> Int -> Reply] -> (BuildConfig -> Store -> IO outcome) -> IO (outcome, [[BS.ByteString]])
+      substitutedFrom label key routes substitute =
+        withCaches routes $ \served -> do
+          let root = tmpBase </> ("nova-nix-test-substitute-from-caches-" ++ label)
+              caches = zipWith (\priority (base, _) -> Subst.CacheConfig base [key] priority) [10, 20 ..] served
+              config = (defaultBuildConfig (StoreDir root)) {bcCaches = caches, bcFetchRetry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}}
+          outcome <-
+            bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
+              bracket (openStore (StoreDir root)) closeStore (substitute config)
+          (,) outcome <$> traverse snd served
+      -- Substitute paths with their closure: the outcome, then whether each
+      -- observed path is valid and the base names of what the store records
+      -- it referencing.
+      substitutedClosure paths observed config store = do
+        outcome <- substituteFromCaches config store paths
+        (,) outcome <$> traverse (registered store) observed
+      registered store path = do
+        valid <- isValid store path
+        references <- queryReferences (stDB store) path
+        pure (valid, map (T.pack . takeFileName . T.unpack) references)
+      baseName path = spHash path <> "-" <> spName path
+      -- The top path's own offer fetched without what it references, then
+      -- whether each path is valid.
+      fetchedAlone config store = do
+        offer <- evalStateT (Subst.queryReferencesWith defaultFetchRetryPolicy ioRetryEffects Realise.NoFallback (bcCaches config) top) Subst.emptyNarInfoMemo
+        outcome <- traverse (substitutePaths config store Realise.RegisterAll . (:| [])) (offeredSubstitute offer)
+        (,) outcome <$> mapM (isValid store) [dep, top]
+      -- The dep path's own substitute: the path it names, then what fetching
+      -- it registering nothing and then registering it gives, each with
+      -- whether the path is valid after.
+      probedThenFetched config store = do
+        offer <- evalStateT (Subst.queryReferencesWith defaultFetchRetryPolicy ioRetryEffects Realise.NoFallback (bcCaches config) dep) Subst.emptyNarInfoMemo
+        let substitute = offeredSubstitute offer
+            fetchAs registration = do
+              outcome <- traverse (substitutePaths config store registration . (:| [])) substitute
+              (,) outcome <$> isValid store dep
+        probed <- fetchAs Realise.RegisterNone
+        fetched <- fetchAs Realise.RegisterAll
+        pure (map Subst.substitutePath (maybeToList substitute), probed, fetched)
+  case (,,,,,) <$> servedPaths [(dep, []), (top, [dep])] <*> servedPaths chainEntries <*> servedPaths [(top, [])] <*> servedPaths [(top, [other]), (other, [])] <*> servedPaths [(multiOut, []), (multiDev, [])] <*> servedPaths [(multiOut, [])] of
     Left err -> (: []) <$> runTest "substitute-from-caches setup" (Fail (T.pack err))
-    Right ((key, depNarInfo), (_, topNarInfo)) -> do
-      let route target _
-            | target == narInfoTarget dep = Send (httpResponse "200 OK" (TE.encodeUtf8 depNarInfo))
-            | target == "/nar/dep.nar" = Send (httpResponse "200 OK" depNar)
-            | target == narInfoTarget top = Send (httpResponse "200 OK" (TE.encodeUtf8 topNarInfo))
-            | target == "/nar/top.nar" = Send (httpResponse "200 OK" topNar)
-            | otherwise = Send (httpResponse "404 Not Found" "")
-          -- What a substitution returns, and whether each path is valid
-          -- after it, in a store of its own.
-          substituted :: String -> (BuildConfig -> Store -> IO outcome) -> IO (outcome, [Bool])
-          substituted label substitute =
-            withHttpServer route $ \base _ _ -> do
-              let root = tmpBase </> ("nova-nix-test-substitute-from-caches-" ++ label)
-                  config = (defaultBuildConfig (StoreDir root)) {bcCaches = [Subst.CacheConfig base [key] 40]}
-              bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
-                bracket (openStore (StoreDir root)) closeStore $ \store -> do
-                  outcome <- substitute config store
-                  valid <- mapM (isValid store) [dep, top]
-                  pure (outcome, valid)
+    Right ((key, withDep), (_, links), (_, bare), (_, naming), (_, bothOutputs), (_, outOnly)) ->
       sequence
         [ runTestM "substituting a path from the caches fetches what it references first" $
             assertEqual "outcome and validity" (Realise.ClosureComplete, [True, True])
-              <$> substituted "closure" (\config store -> substituteFromCaches config store [top]),
+              . (\((outcome, paths), _) -> (outcome, map fst paths))
+              <$> substitutedFrom "closure" key [const . withDep] (substitutedClosure [top] [dep, top]),
           runTestM "substituting the path alone is refused, since what it references is not valid" $
-            assertEqual "outcome and validity" (Realise.FetchFailed, [False, False])
-              <$> substituted "alone" (\config store -> substitutePaths config store [top])
+            assertEqual "outcome and validity" (Just (Realise.NotFetched ((top, Realise.DeliveryFailed) :| [])), [False, False])
+              . fst
+              <$> substitutedFrom "alone" key [const . withDep] fetchedAlone,
+          runTestM "a substitute fetches the path its narinfo was checked for, and registers it only when asked to" $
+            assertEqual "path, then outcome and validity unregistered and registered" ([dep], (Just Realise.Fetched, False), (Just Realise.Fetched, True))
+              . fst
+              <$> substitutedFrom "own-path" key [const . withDep] probedThenFetched,
+          runTestM "a path whose NAR one cache fails to deliver comes from the next cache" $ do
+            let failing target _
+                  | target == narRequest dep = Send (httpResponse "501 Not Implemented" "")
+                  | otherwise = withDep target
+            result <- substitutedFrom "nar-failed" key [failing, const . withDep] (substitutedClosure [dep] [dep])
+            pure $
+              assertEqual
+                "outcome, registration and requests"
+                ((Realise.ClosureComplete, [(True, [])]), [[narInfoRequest dep, narRequest dep], [narInfoRequest dep, narRequest dep]])
+                result,
+          runTestM "a closure of four paths requests each narinfo once" $ do
+            ((outcome, paths), seen) <- substitutedFrom "narinfo-once" key [const . links] (substitutedClosure (take 1 chain) chain)
+            pure $
+              assertEqual
+                "outcome, validity and narinfo requests"
+                (Realise.ClosureComplete, map (const True) chain, sort (map narInfoRequest chain))
+                (outcome, map fst paths, sort (concatMap (filter (".narinfo" `BS.isSuffixOf`)) seen)),
+          -- The first cache stops holding the narinfo once it has served
+          -- it, and the next cache says the path references another.  The
+          -- path comes from the first, as the narinfo its references were
+          -- read from describes it, and the next cache is never asked.
+          runTestM "a path is fetched with the narinfo its references were read from" $ do
+            let once target earlier
+                  | target == narInfoRequest top && earlier > 0 = notFound
+                  | otherwise = bare target
+            result <- substitutedFrom "same-narinfo" key [once, const . naming] (substitutedClosure [top] [top])
+            pure (assertEqual "outcome, registration and requests" ((Realise.ClosureComplete, [(True, [])]), [[narInfoRequest top, narRequest top], []]) result),
+          -- Upstream's goal moves to its next substituter when the NAR is
+          -- gone, and realises what that one's path info references first.
+          runTestM "a path whose NAR is gone from one cache comes from the next, after what that cache says it references" $ do
+            let gone target _
+                  | target == narRequest top = notFound
+                  | otherwise = bare target
+            ((outcome, paths), seen) <- substitutedFrom "nar-gone" key [gone, const . naming] (substitutedClosure [top] [other, top])
+            pure $
+              assertEqual
+                "outcome, registrations and requests"
+                ( Realise.ClosureComplete,
+                  [(True, []), (True, [baseName other])],
+                  [ [narInfoRequest top, narRequest top, narInfoRequest other],
+                    [narInfoRequest top, narInfoRequest other, narRequest other, narRequest top]
+                  ]
+                )
+                (outcome, paths, seen),
+          -- The hole sends each derivation to its inputs and back to its
+          -- outputs, which reference the hole again.
+          runTestM "a path no cache holds is asked about once in a run" $ do
+            let hole = StorePath (T.replicate 32 "z") "hole"
+                midOut = StorePath (T.replicate 32 "m") "mid"
+                topOut = StorePath (T.replicate 32 "k") "top-out"
+                midDrvSP = StorePath (T.replicate 31 "m" <> "1") "mid.drv"
+                topDrvSP = StorePath (T.replicate 31 "k" <> "1") "top.drv"
+                (builder, builderArgs)
+                  | SI.os == "mingw32" = ("cmd.exe", ["/c", "echo built>%out%"])
+                  | otherwise = ("/bin/sh", ["-c", "echo built > $out"])
+                hollowDrv name out inputs =
+                  Derivation
+                    { drvOutputs = [DerivationOutput "out" out "" ""],
+                      drvInputDrvs = inputs,
+                      drvInputSrcs = [],
+                      drvPlatform = currentPlatform,
+                      drvBuilder = builder,
+                      drvArgs = builderArgs,
+                      drvEnv = Map.singleton "name" name
+                    }
+                midDrv = hollowDrv "mid" midOut Map.empty
+                topDrv = hollowDrv "top" topOut (Map.singleton midDrvSP ["out"])
+            case servedPaths [(topOut, [hole]), (midOut, [hole])] of
+              Left err -> pure (Fail (T.pack err))
+              Right (_, holed) -> do
+                result <- substitutedFrom "hole" key [const . holed] $ \config store -> do
+                  writeDrv store midDrv midDrvSP
+                  writeDrv store topDrv topDrvSP
+                  buildWithDeps config store topDrv topDrvSP
+                pure (assertEqual "result and narinfo requests" (BuildSuccess topOut, [map narInfoRequest [topOut, hole, midOut]]) result),
+          -- The first cache no longer holds dev's NAR and fails to deliver
+          -- out's, and the next holds out alone.  Upstream's goal for out
+          -- arrives from the next cache and dev's ends for want of a
+          -- substitute, so no goal failed and the derivation builds
+          -- (derivation-goal.cc:281).  Out is fetched from the next cache to
+          -- learn that, and not registered, since dev cannot arrive.
+          runTestM "an output that fails at one cache and arrives from the next builds its derivation when a sibling has no cache left" $ do
+            let first target _
+                  | target == narRequest multiDev = notFound
+                  | target == narRequest multiOut = unavailable
+                  | otherwise = bothOutputs target
+            result <- substitutedFrom "sibling-out" key [first, const . outOnly] builtMulti
+            pure $
+              assertEqual
+                "result, out's contents and requests"
+                ( (BuildSuccess multiOut, Just "built\n"),
+                  [ map narInfoRequest [multiOut, multiDev] ++ replicate 5 (narRequest multiOut) ++ [narRequest multiDev],
+                    [narInfoRequest multiOut, narInfoRequest multiDev, narRequest multiOut]
+                  ]
+                )
+                result,
+          -- Out fails at the first cache and arrives from the next, and the
+          -- first cache's dev NAR, delivered once, is gone when the batch is
+          -- fetched again.  Out's failure is behind it, so the batch is only
+          -- unavailable, and the derivation builds.
+          runTestM "an output that failed at one cache and arrived from the next fails nothing when its sibling is gone" $ do
+            let first target earlier
+                  | target == narRequest multiOut = unavailable
+                  | target == narRequest multiDev && earlier > 0 = notFound
+                  | otherwise = bothOutputs target
+            result <- substitutedFrom "sibling-gone" key [first, const . outOnly] builtMulti
+            pure $
+              assertEqual
+                "result, out's contents and requests"
+                ( (BuildSuccess multiOut, Just "built\n"),
+                  [ map narInfoRequest [multiOut, multiDev] ++ replicate 5 (narRequest multiOut) ++ [narRequest multiDev, narRequest multiDev],
+                    [narInfoRequest multiOut, narRequest multiOut, narInfoRequest multiDev]
+                  ]
+                )
+                result
         ]
 
 -- | 'buildWithDeps' against a loopback cache, for inputs asked for some
@@ -13907,6 +14160,14 @@ testWantedOutputsIO = do
                 (BuildSuccess appOut, [Just "built\n", Just "cache dev\n", Just "built\n"], True)
                 (result, held, midValid)
         ]
+
+-- | Run an action against loopback servers, one for each route, with each
+-- one's base URL and the requests it saw.
+withCaches :: [BS.ByteString -> Int -> Reply] -> ([(Text, IO [BS.ByteString])] -> IO a) -> IO a
+withCaches [] action = action []
+withCaches (route : rest) action =
+  withHttpServer route $ \base requests _ ->
+    withCaches rest (\others -> action ((base, requests) : others))
 
 -- | @pkgs/windows/fetchurl.nix@ evaluated from the checkout.  The
 -- @mirror://@ expansion is what a source derivation records, so a
@@ -17464,20 +17725,22 @@ testStoreWritesUpstreamManaged = do
                   pure $ case (built, checked, realised) of
                     (BuildFailure b 1, Left c, BuildFailure r 1) | all (refuses store) [b, c, r], null seen, treeKept -> Pass
                     other -> Fail ("expected three refusals and no request, got: " <> T.pack (show (other, seen, treeKept))),
-            runTestM "a substitution refuses a store upstream's database manages before it asks a cache, and leaves its tree" $
+            -- A reference query touches no store, so the narinfo is read;
+            -- the fetch is refused before its request.
+            runTestM "fetching a substitute refuses a store upstream's database manages before it asks for the NAR, and leaves its tree" $
               withHttpServer route $ \base requests _ ->
                 withPlantedStore "store" $ \store _ -> do
                   -- A substitution that went ahead holds the path's lock,
                   -- which the next one would wait on forever.
-                  streamed <- Subst.trySubstitute store [cache base] substPath
+                  streamed <- offeredThenFetched defaultFetchRetryPolicy ioRetryEffects store [cache base] substPath
                   releaseHeld streamed
                   unpacked <- Subst.unpackAndVerify store substPath narInfo nar
                   releaseHeld unpacked
                   seen <- requests
                   treeKept <- kept store substPath
                   pure $ case (streamed, unpacked) of
-                    (Subst.SubstError s, Subst.SubstError u) | refuses store s, refuses store u, null seen, treeKept -> Pass
-                    other -> Fail ("expected two refusals and no request, got: " <> T.pack (show (other, seen, treeKept))),
+                    (Subst.SubstError s, Subst.SubstError u) | refuses store s, refuses store u, seen == [narInfoTarget], treeKept -> Pass
+                    other -> Fail ("expected two refusals and the narinfo request alone, got: " <> T.pack (show (other, seen, treeKept))),
             runTestM "restoring evaluation's sources refuses a store upstream's database manages" $
               withPlantedStore "store" $ \store _ -> do
                 restored <- try (materializeEvalSources store Map.empty)
@@ -17500,7 +17763,7 @@ testStoreWritesUpstreamManaged = do
               withHttpServer route $ \base requests _ ->
                 withPlantedStore "nova-store" $ \store config -> do
                   restored <- try (materializeEvalSources store Map.empty) :: IO (Either IOException ())
-                  substituted <- Subst.trySubstitute store [cache base] substPath
+                  substituted <- offeredThenFetched defaultFetchRetryPolicy ioRetryEffects store [cache base] substPath
                   fetched <- case substituted of
                     Subst.SubstSuccess _ lock -> do
                       releasePathLock lock
