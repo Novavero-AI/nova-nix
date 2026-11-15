@@ -11273,6 +11273,15 @@ testUpstreamConformance = do
   putStrLn "eval/conformance"
   let xmlDocument body = mkStr ("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n" <> body <> "</expr>\n")
       toBase16 hash = "builtins.convertHash { hash = \"" <> hash <> "\"; toHashFormat = \"base16\"; }"
+      emptySha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      emptySri = "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+      unknownSha3 = "unknown hash algorithm 'sha3', expect 'md5', 'sha1', 'sha256', or 'sha512'"
+      badBase16 = T.replicate 63 "0" <> "g"
+      badNix32 = T.replicate 51 "0" <> "e"
+      -- 52 nix32 digits hold 260 bits, four more than a SHA-256 digest,
+      -- and those four are the top of the first digit, one of which '2'
+      -- sets.
+      overflowingNix32 = "2" <> T.replicate 51 "0"
   sequence
     [ -- Hash decode is length-keyed per algorithm, never first-format-wins:
       -- a 52-char all-hex-digit string is a nix32 sha256 hash (64 hex chars
@@ -11296,10 +11305,47 @@ testUpstreamConformance = do
         assertEvalFail
           "hash-truncated"
           "builtins.convertHash { hash = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85\"; hashAlgo = \"sha256\"; toHashFormat = \"base16\"; }",
+      -- An algorithm name upstream does not know is refused with
+      -- parseHashAlgo's message (hash.cc:435-442 at 2.24.9), and
+      -- convertHash parses hashAlgo before the hash (primops.cc:4100-4108).
       runTest "unknown hash algorithm is rejected" $
-        assertEvalFail
+        assertEvalError
           "hash-bad-algo"
-          "builtins.convertHash { hash = \"00\"; hashAlgo = \"sha3\"; toHashFormat = \"base16\"; }",
+          "builtins.convertHash { hash = \"00\"; hashAlgo = \"sha3\"; toHashFormat = \"base16\"; }"
+          unknownSha3,
+      runTest "hashString refuses an unknown algorithm with upstream's message" $
+        assertEvalError "hashString-bad-algo" "builtins.hashString \"sha3\" \"\"" unknownSha3,
+      -- A base16 or nix32 digest that does not decode is refused as the
+      -- Hash constructor refuses it (hash.cc:214, :232, :242 at 2.24.9).
+      runTest "a base16 digest with a character outside its alphabet is refused" $
+        assertEvalError "base16-invalid" (toBase16 ("sha256:" <> badBase16)) ("invalid base-16 hash '" <> badBase16 <> "'"),
+      runTest "a nix32 digest with a character outside its alphabet is refused" $
+        assertEvalError "base32-invalid" (toBase16 ("sha256:" <> badNix32)) ("invalid base-32 hash '" <> badNix32 <> "'"),
+      runTest "a nix32 digest with bits past the end of the digest is refused" $
+        assertEvalError "base32-overflow" (toBase16 ("sha256:" <> overflowingNix32)) ("invalid base-32 hash '" <> overflowingNix32 <> "'"),
+      -- convertHash hands a given hashAlgo to Hash::parseAny
+      -- (primops.cc:4108 at 2.24.9), which refuses a tag that names
+      -- another algorithm and needs one or the other (hash.cc:184-198).
+      runTest "convertHash refuses a tag that names another algorithm than hashAlgo" $
+        assertEvalError
+          "convertHash-tag-mismatch"
+          ("builtins.convertHash { hash = \"" <> emptySri <> "\"; hashAlgo = \"sha512\"; toHashFormat = \"base16\"; }")
+          ("hash '" <> emptySri <> "' should have type 'sha512'"),
+      runTest "convertHash refuses an unknown hashAlgo when the hash carries a tag" $
+        assertEvalError
+          "convertHash-tag-bad-algo"
+          ("builtins.convertHash { hash = \"" <> emptySri <> "\"; hashAlgo = \"sha3\"; toHashFormat = \"base16\"; }")
+          unknownSha3,
+      runTest "convertHash accepts a tag that agrees with hashAlgo" $
+        assertEval
+          "convertHash-tag-agrees"
+          ("builtins.convertHash { hash = \"" <> emptySri <> "\"; hashAlgo = \"sha256\"; toHashFormat = \"base16\"; }")
+          (mkStr emptySha256),
+      runTest "convertHash refuses an untagged hash without hashAlgo" $
+        assertEvalError
+          "convertHash-no-type"
+          ("builtins.convertHash { hash = \"" <> emptySha256 <> "\"; toHashFormat = \"nix32\"; }")
+          ("hash '" <> emptySha256 <> "' does not include a type, nor is the type otherwise known from context"),
       -- SRI digests get the same decoded-length check as every other
       -- spelling (upstream checks SRI too), at all three decode sites:
       -- convertHash, fixed-output outputHash, and the fetch/path pins.
@@ -11320,10 +11366,9 @@ testUpstreamConformance = do
             | "invalid SRI hash 'YWJj'" `T.isInfixOf` err -> Pass
             | otherwise -> Fail ("expected an SRI length error, got: " <> err)
           Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
-      -- An SRI or prefixed outputHash carries its own algorithm tag; a
-      -- non-empty outputHashAlgo must agree with it (hash.cc parseAny
-      -- with an expected type), and an unknown declared algorithm is an
-      -- error even when the spelling carries a valid tag of its own.
+      -- An SRI or prefixed outputHash carries its own algorithm tag, and
+      -- an outputHashAlgo upstream knows must agree with it (hash.cc
+      -- parseAny with an expected type).
       runTest "fixed-output SRI algorithm must match outputHashAlgo" $
         case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"sha1-2jmj7l5rSw0yVb/vlWAYkK/YBwk=\"; outputHashAlgo = \"sha256\"; }).drvPath" of
           Left err
@@ -11340,12 +11385,19 @@ testUpstreamConformance = do
         case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"; outputHashAlgo = \"sha256\"; }).drvPath" of
           Right _ -> Pass
           Left err -> Fail ("expected success, got: " <> err),
-      runTest "fixed-output unknown outputHashAlgo rejected despite SRI tag" $
-        case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"; outputHashAlgo = \"sha3\"; }).drvPath" of
-          Left err
-            | "unknown hash algorithm" `T.isInfixOf` err -> Pass
-            | otherwise -> Fail ("expected an unknown-algorithm error, got: " <> err)
-          Right val -> Fail ("expected failure, got: " <> T.pack (show val)),
+      -- outputHashAlgo is read with parseHashAlgoOpt (primops.cc:1352 at
+      -- 2.24.9), which gives no algorithm for a name it does not know, so
+      -- the hash's own tag decides, and an untagged hash has no type.
+      runTest "fixed-output unknown outputHashAlgo gives way to the SRI tag" $
+        assertEval
+          "fixed-output-unknown-algo"
+          ("let out = attrs: (derivation ({ name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"" <> emptySri <> "\"; } // attrs)).outPath; in out { outputHashAlgo = \"sha3\"; } == out { }")
+          (VBool True),
+      runTest "fixed-output unknown outputHashAlgo leaves an untagged hash with no type" $
+        assertEvalError
+          "fixed-output-unknown-algo-untagged"
+          ("(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"" <> emptySha256 <> "\"; outputHashAlgo = \"sha3\"; }).drvPath")
+          ("hash '" <> emptySha256 <> "' does not include a type, nor is the type otherwise known from context"),
       runTest "builtins.path pin rejects a truncated SRI digest" $
         case evalNix "builtins.path { path = ./x; sha256 = \"sha256-YWJj\"; }" of
           Left err
@@ -11397,12 +11449,12 @@ testUpstreamConformance = do
       runTest "a '-' after the padding of a prefixed hash is ignored" $
         assertEval "prefixed-dash" (toBase16 "md5:AAAAAAAAAAAAAAAAAAAAAA=-") (mkStr "00000000000000000000000000000000"),
       runTest "a ':' after the padding of an SRI hash makes its tag an unknown algorithm" $
-        assertEvalError "sri-colon" (toBase16 "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:x") "unknown hash algorithm 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='",
+        assertEvalError "sri-colon" (toBase16 "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:x") "unknown hash algorithm 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=', expect 'md5', 'sha1', 'sha256', or 'sha512'",
       runTest "a '-' after the padding of an untagged hash makes its start an unknown algorithm" $
         assertEvalError
           "untagged-dash"
           "builtins.convertHash { hash = \"AAAAAAAAAAAAAAAAAAAAAA=-\"; hashAlgo = \"md5\"; toHashFormat = \"base16\"; }"
-          "unknown hash algorithm 'AAAAAAAAAAAAAAAAAAAAAA='",
+          "unknown hash algorithm 'AAAAAAAAAAAAAAAAAAAAAA=', expect 'md5', 'sha1', 'sha256', or 'sha512'",
       -- Upstream keys a hash's spelling on its length in bytes, so a
       -- character UTF-8 spells in two bytes after the padding of a 24
       -- character md5 base64 hash makes it 25 long.
@@ -15216,6 +15268,34 @@ testFetchGitPins = do
                       `andThen` either (Fail . ("the cache hit failed: " <>)) (const Pass) second
                       `andThen` foldr andThen Pass results
                 other -> pure (Fail (T.pack (show other)))
+          [] -> pure (Fail "fixture returned no commits"),
+        -- A declared narHash is read as Input::getNarHash reads it and
+        -- the hashes compared (fetchers.cc:214-222, :324-333 at 2.24.9),
+        -- so text after its padding, which base64 decoding never reads,
+        -- still matches.
+        runTestM "a narHash pin with text after its padding matches" $ case shas of
+          (sha : _) -> do
+            let pinned = "rev = \"" <> sha <> "\"; "
+                fetched = "(builtins.fetchGit { url = \"" <> urlText <> "\"; " <> pinned <> "})"
+            outcome <- fetchWith (pinned <> "narHash = " <> fetched <> ".narHash + \"io\"; ")
+            pure $ case outcome of
+              Right _ -> Pass
+              Left err -> Fail ("a pin of the fetched hash was refused: " <> err)
+          [] -> pure (Fail "fixture returned no commits"),
+        runTestM "a narHash pin that is not SRI is refused" $ case shas of
+          (sha : _) -> do
+            let prefixed = "sha256:" <> T.replicate 64 "0"
+            outcome <- fetchWith ("rev = \"" <> sha <> "\"; narHash = \"" <> prefixed <> "\"; ")
+            pure $ case outcome of
+              Left err -> assertEqual "narHash-not-sri" ("hash '" <> prefixed <> "' is not SRI") err
+              Right _ -> Fail "a narHash pin that is not SRI was accepted"
+          [] -> pure (Fail "fixture returned no commits"),
+        runTestM "a narHash pin that is not SHA-256 is refused" $ case shas of
+          (sha : _) -> do
+            outcome <- fetchWith ("rev = \"" <> sha <> "\"; narHash = \"sha512-" <> T.replicate 86 "A" <> "==\"; ")
+            pure $ case outcome of
+              Left err -> assertEqual "narHash-not-sha256" "narHash must use SHA-256" err
+              Right _ -> Fail "a sha512 narHash pin was accepted"
           [] -> pure (Fail "fixture returned no commits"),
         runTestM "allRefs finds a rev on an unfetched branch" $ do
           outcome <- fetchWith ("rev = \"" <> sideSha <> "\"; allRefs = true; ")
