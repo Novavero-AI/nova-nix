@@ -4090,6 +4090,74 @@ testPathArgumentsIO = do
   Dir.removePathForcibly dir
   pure results
 
+-- | @builtins.path@ reads its arguments as upstream's @prim_path@ does
+-- (primops.cc:2558-2597 at 2.24.9).  @recursive = false@ copies the one
+-- file at the path by its bytes, to the flat fixed-output path of those
+-- bytes, with the pin read as their SHA-256 and the filter never called,
+-- and refuses a directory as upstream's flat read does; an argument it
+-- does not take is refused at its turn.  Each expected message is
+-- upstream's at 2.24.9, read from its source.
+testPathMethodIO :: IO [Bool]
+testPathMethodIO = do
+  putStrLn "eval/path-method-io"
+  -- The flat copy reads the path with its symlinks resolved, and macOS
+  -- keeps the temporary directory under /var, a link, so the refusal of
+  -- a directory names the resolved path.
+  tmpBase <- Dir.canonicalizePath =<< getTemporaryDirectory
+  canLink <- symlinksAvailable
+  let dir = tmpBase </> "nova-nix-test-path-method"
+      contents = "flat\n"
+      quoted name = nixQuotedPath (dir </> name)
+      flatDigest = sha256Digest contents
+      narDigest = sha256Digest (NAR.serialise (NAR.NarRegular False contents))
+      pathOf args = "builtins.unsafeDiscardStringContext (builtins.path { " <> args <> " })"
+      gives label args expected = runTestIO label dir (pathOf args) (mkStr expected)
+      fails label source expected = runTestM label (assertEvalErrorIO dir label source expected)
+      -- A message names the path as a path value, slash-spelled on Windows too.
+      named name = T.replace "\\" "/" (T.pack (dir </> name))
+      mismatch = "store path mismatch in (possibly filtered) path added from '" <> named "f.txt" <> "'"
+      directory = "reading from file '" <> named "d" <> "': Is a directory"
+      unsupported name = "unsupported argument '" <> name <> "' to 'addPath'"
+      storePathText = either (fail . show) (pure . storePathToText defaultStoreDir)
+  flatPath <- storePathText (makeFixedOutputPath "f.txt" "sha256" FlatIngestion flatDigest)
+  narPath <- storePathText (makeFixedOutputPath "f.txt" "sha256" NarIngestion narDigest)
+  linkPath <- storePathText (makeFixedOutputPath "link" "sha256" FlatIngestion flatDigest)
+  scriptPath <- storePathText (makeFixedOutputPath "x.sh" "sha256" FlatIngestion flatDigest)
+  Dir.removePathForcibly dir
+  createDirectoryIfMissing True (dir </> "d")
+  BS.writeFile (dir </> "f.txt") contents
+  BS.writeFile (dir </> "x.sh") contents
+  ExecBit.markExecutable (dir </> "x.sh")
+  BS.writeFile (dir </> "d" </> "g.txt") "inner\n"
+  when canLink $ Dir.createFileLink (dir </> "f.txt") (dir </> "link")
+  results <-
+    sequence $
+      [ gives "recursive = false copies a file by its bytes" ("path = " <> quoted "f.txt" <> "; recursive = false;") flatPath,
+        gives "a pin of the bytes gives the same path" ("path = " <> quoted "f.txt" <> "; recursive = false; sha256 = \"" <> Hash.bytesToHexText flatDigest <> "\";") flatPath,
+        gives "recursive = true copies the NAR, as no recursive does" ("path = " <> quoted "f.txt" <> "; recursive = true;") narPath,
+        gives "no recursive copies the NAR" ("path = " <> quoted "f.txt" <> ";") narPath,
+        gives "an executable file's flat copy is its bytes alone" ("path = " <> quoted "x.sh" <> "; recursive = false;") scriptPath,
+        runTestIO "the flat copy holds the file's bytes" dir ("builtins.readFile (builtins.path { path = " <> quoted "f.txt" <> "; recursive = false; })") (mkStr "flat\n"),
+        gives "the filter is not called on a flat copy" ("path = " <> quoted "f.txt" <> "; recursive = false; filter = p: t: throw \"called\";") flatPath,
+        fails "a pin of the NAR is refused under flat" ("builtins.path { path = " <> quoted "f.txt" <> "; recursive = false; sha256 = \"" <> Hash.bytesToHexText narDigest <> "\"; }") mismatch,
+        fails "a pin of the bytes is refused under NAR" ("builtins.path { path = " <> quoted "f.txt" <> "; sha256 = \"" <> Hash.bytesToHexText flatDigest <> "\"; }") mismatch,
+        fails "a directory is refused under flat" ("builtins.path { path = " <> quoted "d" <> "; recursive = false; }") directory,
+        fails "a directory is refused under flat before a filter is called" ("builtins.path { path = " <> quoted "d" <> "; recursive = false; filter = p: t: throw \"called\"; }") directory,
+        fails "recursive must be a Boolean" ("builtins.path { path = " <> quoted "f.txt" <> "; recursive = 1; }") "expected a Boolean but found an integer: 1",
+        fails "an argument it does not take is refused" ("builtins.path { path = " <> quoted "f.txt" <> "; foo = 1; }") (unsupported "foo"),
+        fails "a misspelt pin is refused, not passed over" ("builtins.path { path = " <> quoted "f.txt" <> "; sha265 = \"\"; }") (unsupported "sha265"),
+        fails "an argument it does not take is refused before the path is looked for" "builtins.path { foo = 1; }" (unsupported "foo"),
+        fails "an argument it does not take is refused before anything is copied" ("builtins.path { path = " <> quoted "missing" <> "; foo = 1; }") (unsupported "foo"),
+        -- The arguments are read in the set's own order, by interned
+        -- symbol, and both evaluators intern path before any name a
+        -- program brings (eval.cc:265 at 2.24.9), so path is read first
+        -- wherever the program writes it.
+        fails "an argument read before the one it does not take fails first" "builtins.path { foo = 1; path = throw \"p\"; }" "p"
+      ]
+        ++ [gives "a symlink is copied flat as the file it names, under its own name" ("path = " <> quoted "link" <> "; recursive = false;") linkPath | canLink]
+  Dir.removePathForcibly dir
+  pure results
+
 -- | The lines of context a failure gathers on its way out of
 -- derivationStrict, and how the CLI reports them.  Only the IO
 -- evaluator keeps them.
@@ -25424,6 +25492,7 @@ runSuite = do
           testPathArgumentsIO,
           testPathFilterIO,
           testPathSymlinkIO,
+          testPathMethodIO,
           testInterpolatedSymlinkIO,
           testSourceErrorMessage,
           testSourceReadErrorsIO,
