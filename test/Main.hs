@@ -4462,6 +4462,120 @@ testAttrNameContext = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: builtins that read a plain string
+-- ---------------------------------------------------------------------------
+
+-- | Source binding @c@ to the text with a plain path in its context and
+-- @p@ to the same text without it, then evaluating the body.
+withPlainStrings :: Text -> Text -> Text
+withPlainStrings text body =
+  "let c = builtins.appendContext \""
+    <> text
+    <> "\" { \"/nix/store/00000000000000000000000000000000-a\" = { path = true; }; };"
+    <> " p = builtins.unsafeDiscardStringContext c; in "
+    <> body
+
+-- | Upstream's refusal of the string 'withPlainStrings' binds to @c@.
+plainStringRefusal :: Text -> Text
+plainStringRefusal text =
+  "the string '" <> text <> "' is not allowed to refer to a store path (such as '00000000000000000000000000000000-a')"
+
+-- | Every builtin that reads a plain string reads it as upstream's
+-- @forceStringNoCtx@ does (eval.cc:2253-2258 and primops.cc at 2.24.9):
+-- a string with context is refused, naming the context's first element,
+-- and the same string with its context discarded is read as before.
+-- @split@ gives back a string its pattern does not match, context and
+-- all, as upstream's returns its argument (primops.cc:4309-4312).
+testPlainStringContext :: IO [Bool]
+testPlainStringContext = do
+  putStrLn "eval/plain-string-context"
+  let refused reader text body =
+        runTest (reader <> " refuses a string with context") $
+          assertEvalError reader (withPlainStrings text body) (plainStringRefusal text)
+      kept reader text body =
+        runTest (reader <> " reads a string without context") $
+          assertEval reader (withPlainStrings text body) (VBool True)
+  sequence
+    [ refused "match" "a" "builtins.match c \"a\"",
+      kept "match" "a" "builtins.match p \"a\" == [ ]",
+      refused "match applied in two steps" "a" "let m = builtins.match c; in m \"a\"",
+      kept "match applied in two steps" "a" "let m = builtins.match p; in m \"a\" == [ ]",
+      runTest "match takes a pattern with context, refusing it only once applied to a subject" $
+        assertEval "match partial" (withPlainStrings "a" "builtins.isFunction (builtins.match c)") (VBool True),
+      refused "split" "a" "builtins.split c \"bab\"",
+      kept "split" "a" "builtins.split p \"bab\" == [ \"b\" [ ] \"b\" ]",
+      refused "split applied in two steps" "a" "let s = builtins.split c; in s \"bab\"",
+      refused "getEnv" "HOME" "builtins.getEnv c",
+      kept "getEnv" "HOME" "builtins.getEnv p == \"\"",
+      refused "toFile" "a" "builtins.toFile c \"x\"",
+      refused "hashString" "sha256" "builtins.hashString c \"\"",
+      kept "hashString" "sha256" "builtins.hashString p \"\" == \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"",
+      refused "hashFile" "sha256" "builtins.hashFile c /nonexistent",
+      refused "fromJSON" "1" "builtins.fromJSON c",
+      kept "fromJSON" "1" "builtins.fromJSON p == 1",
+      refused "placeholder" "out" "builtins.placeholder c",
+      kept "placeholder" "out" "builtins.placeholder p == \"/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9\"",
+      refused "parseDrvName" "a-1" "builtins.parseDrvName c",
+      kept "parseDrvName" "a-1" "builtins.parseDrvName p == { name = \"a\"; version = \"1\"; }",
+      refused "splitVersion" "1.2" "builtins.splitVersion c",
+      kept "splitVersion" "1.2" "builtins.splitVersion p == [ \"1\" \"2\" ]",
+      refused "compareVersions' first argument" "1" "builtins.compareVersions c \"1\"",
+      refused "compareVersions' second argument" "1" "builtins.compareVersions \"1\" c",
+      kept "compareVersions" "1" "builtins.compareVersions p p == 0",
+      refused "findFile" "a" "builtins.findFile [ ] c",
+      -- Upstream reads every entry before the name.
+      runTest "findFile reports a failing entry ahead of a name with context" $
+        assertEvalError "findFile entry first" (withPlainStrings "a" "builtins.findFile [ (throw \"entry\") ] c") "entry",
+      -- forceStringNoCtx is forceString first, whose refusal of a value
+      -- that is not a string is upstream's.
+      runTest "a pattern that is not a string is refused with forceString's message" $
+        assertEvalError "match-int" "builtins.match 1 \"a\"" "expected a string but found an integer: 1",
+      runTest "a second version that is not a string is refused with forceString's message" $
+        assertEvalError "compareVersions-null" "builtins.compareVersions \"1\" null" "expected a string but found null: null",
+      -- The strings read with forceString keep taking context.
+      runTest "match reads a subject with context, its groups carrying none" $
+        assertEval "match subject" (withPlainStrings "a" "builtins.map builtins.hasContext (builtins.match \"(a)\" c) == [ false ]") (VBool True),
+      runTest "hashString hashes a string with context" $
+        assertEval "hashString input" (withPlainStrings "a" "builtins.hashString \"sha256\" c == builtins.hashString \"sha256\" p") (VBool True),
+      runTest "split gives back a string its pattern does not match, context and all" $
+        assertEval
+          "split unmatched"
+          (withPlainStrings "a" "let r = builtins.split \"x\" c; in r == [ c ] && builtins.getContext (builtins.head r) == builtins.getContext c")
+          (VBool True),
+      runTest "split applied in two steps gives back an unmatched string's context" $
+        assertEval "split unmatched partial" (withPlainStrings "a" "let s = builtins.split \"x\"; in builtins.hasContext (builtins.head (s c))") (VBool True),
+      runTest "the pieces of a string split matches carry no context" $
+        assertEval
+          "split matched"
+          (withPlainStrings "a" "let r = builtins.split \"(a)\" c; in builtins.map builtins.hasContext [ (builtins.elemAt r 0) (builtins.head (builtins.elemAt r 1)) (builtins.elemAt r 2) ] == [ false false false ]")
+          (VBool True)
+    ]
+
+-- | The readers of a plain string that reach the store or the
+-- filesystem, with a string without context: each reads it as before.
+testPlainStringContextIO :: IO [Bool]
+testPlainStringContextIO = do
+  putStrLn "eval/plain-string-context-io"
+  tmpBase <- getTemporaryDirectory
+  let dir = tmpBase </> "nova-nix-test-plain-string-context"
+      file = nixQuotedPath (dir </> "f")
+  Dir.removePathForcibly dir
+  createDirectoryIfMissing True dir
+  BS.writeFile (dir </> "f") "contents"
+  results <-
+    sequence
+      [ runTestIO "toFile reads a name without context" dir (withPlainStrings "a" "builtins.toFile p \"x\" == builtins.toFile \"a\" \"x\"") (VBool True),
+        runTestIO "hashFile reads an algorithm without context" dir (withPlainStrings "sha256" ("builtins.hashFile p " <> file)) (mkStr "d1b2a59fbea7e20077af9f91b27e95e865061b270be03ff539ab3b73587882e8"),
+        runTestIO
+          "findFile reads a name without context"
+          dir
+          (withPlainStrings "a" ("builtins.findFile [ { prefix = \"a\"; path = " <> nixQuotedPath dir <> "; } ] p"))
+          (VPath (canonPathValue (T.pack dir)))
+      ]
+  Dir.removePathForcibly dir
+  pure results
+
+-- ---------------------------------------------------------------------------
 -- Tests: builtins.unsafeGetAttrPos
 -- ---------------------------------------------------------------------------
 
@@ -24409,6 +24523,8 @@ runSuite = do
           testUnsafeGetAttrPos,
           testCurPos,
           testAttrNameContext,
+          testPlainStringContext,
+          testPlainStringContextIO,
           testBlackholeRecoveryIO,
           testDerivationTraceIO,
           testListToAttrsTraceIO,
