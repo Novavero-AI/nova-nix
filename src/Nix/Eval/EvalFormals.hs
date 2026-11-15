@@ -17,6 +17,7 @@ where
 
 import Data.Text (Text)
 import Data.Word (Word32)
+import Nix.Eval.CData (MonadCData)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolIntern, symbolText)
 
 -- | A single formal parameter with an optional default (bytecode index).
@@ -47,7 +48,7 @@ lambdaNameText (NamedLambda name) = name
 -- the name's own, or the invalid symbol for an anonymous function, which
 -- no name interns to.  Interning a name a binding has already interned
 -- only reads its symbol.
-lambdaNameSymbol :: LambdaName -> IO Word32
+lambdaNameSymbol :: (MonadCData m) => LambdaName -> m Word32
 lambdaNameSymbol AnonymousLambda = pure invalidSymbolId
 lambdaNameSymbol (NamedLambda name) = unSymbol <$> symbolIntern name
 

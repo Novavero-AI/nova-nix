@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | Attribute-path selection, the machinery behind @build -A@.
 --
 -- An attribute path is a dotted sequence of names selected left to right
@@ -95,9 +97,10 @@ selectAttrPath path root = case parseAttrPath path of
     walk (name : rest) val = case val of
       VAttrs attrs
         | T.null name -> pure (Left (emptyNameMessage path))
-        | otherwise -> case attrSetLookup name attrs of
-            Nothing -> pure (Left (notFoundMessage name path))
-            Just thunk -> force thunk >>= walk rest
+        | otherwise ->
+            attrSetLookup name attrs >>= \case
+              Nothing -> pure (Left (notFoundMessage name path))
+              Just thunk -> force thunk >>= walk rest
       -- Ordered as upstream orders it: the type of what is being indexed
       -- is reported before an empty component is complained about.
       _ -> pure (Left (notASetMessage path (typeName val)))

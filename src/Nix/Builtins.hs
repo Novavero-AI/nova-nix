@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | Built-in function environment for the Nix evaluator.
 --
 -- Every Nix expression has access to a @builtins@ attribute set containing
@@ -12,8 +14,8 @@
 -- then.
 --
 -- The environment is allocated in the C data layer, so 'builtinEnv' must
--- be forced between 'Nix.Eval.Arena.arenaInit' and
--- 'Nix.Eval.Arena.arenaDestroy'; outside that window forcing it raises
+-- run between 'Nix.Eval.Arena.arenaInit' and
+-- 'Nix.Eval.Arena.arenaDestroy'; outside that window it raises
 -- 'Nix.Eval.CStatus.ArenaNotInitialized'.
 module Nix.Builtins
   ( -- * Builtin registration
@@ -36,7 +38,7 @@ import Data.Char (isAsciiLower, isAsciiUpper)
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -45,6 +47,7 @@ import qualified Data.Text.Encoding as TE
 import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, builtinNames, currentSystemStr, deferApply, evaluated, readThunkValue)
 import Nix.Eval.AllocSite (EnvSite (EnvApply, EnvRoot), SetSite (SetRoot))
+import Nix.Eval.CData (MonadCData, runCDataPure)
 import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newCEnv, thunkToCPtr)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames)
 import Nix.Parser (SourceOrigin (..), parseNixWithScope, parsedExpr)
@@ -68,16 +71,16 @@ import Nix.Store.Path (defaultStoreDirText)
 -- by 'parseNixPath'.  In tests, pass @[]@.
 --
 -- The policy decides which constants exist: see 'standardEntries'.
-builtinEnv :: EvalPolicy -> Int64 -> [Thunk] -> Env
-builtinEnv policy timestamp searchPaths =
-  let builtinsSet = builtinsAttrSet policy timestamp searchPaths
-      bind name
+builtinEnv :: (MonadCData m) => EvalPolicy -> Int64 -> [Thunk] -> m Env
+builtinEnv policy timestamp searchPaths = do
+  builtinsSet <- builtinsAttrSet policy timestamp searchPaths
+  let bind name
         | name == "builtins" = evaluated (VAttrs builtinsSet)
-        | otherwise =
+        | otherwise = do
             let unprefixed = fromMaybe name (T.stripPrefix "__" name)
-             in fromMaybe (evaluated (VBuiltin unprefixed [])) (attrSetLookup unprefixed builtinsSet)
-      scope = attrSetFromMap SetRoot (Map.fromSet bind (rootScopeNames policy))
-   in newCEnv EnvRoot nullPtr 0 (Just scope) Nothing nullPtr 0
+            attrSetLookup unprefixed builtinsSet >>= maybe (evaluated (VBuiltin unprefixed [])) pure
+  scope <- sequenceA (Map.fromSet bind (rootScopeNames policy)) >>= attrSetFromMap SetRoot
+  newCEnv EnvRoot nullPtr 0 (Just scope) Nothing nullPtr 0
 
 -- | The names the root environment binds under a policy: upstream's base
 -- environment, which leaves out its @impureOnly@ constants under
@@ -87,25 +90,37 @@ rootScopeNames policy
   | epPureEval policy = staticGlobalNames `Set.difference` impureOnlyGlobalNames
   | otherwise = staticGlobalNames
 
--- | Create a top-level binding for a builtin function.
-topLevelBuiltin :: Text -> (Text, Thunk)
-topLevelBuiltin name = (name, evaluated (VBuiltin name []))
+-- | The value of a builtin function bound under its own name.
+builtinFunction :: (MonadCData m) => Text -> m Thunk
+builtinFunction name = evaluated (VBuiltin name [])
 
 -- | Like 'builtinEnv' but with additional scope bindings overlaid on
 -- the top-level environment.  Used by @scopedImport@.
-builtinEnvWithScope :: EvalPolicy -> Int64 -> [Thunk] -> [(Text, Thunk)] -> Env
-builtinEnvWithScope policy timestamp searchPaths scope =
-  let base = builtinEnv policy timestamp searchPaths
-      scopeMap = Map.fromList scope
-   in newCEnv EnvRoot nullPtr 0 (Just (attrSetFromMap SetRoot scopeMap)) (Just base) nullPtr 0
+builtinEnvWithScope :: (MonadCData m) => EvalPolicy -> Int64 -> [Thunk] -> [(Text, Thunk)] -> m Env
+builtinEnvWithScope policy timestamp searchPaths scope = do
+  base <- builtinEnv policy timestamp searchPaths
+  overlay <- attrSetFromMap SetRoot (Map.fromList scope)
+  newCEnv EnvRoot nullPtr 0 (Just overlay) (Just base) nullPtr 0
 
 -- | The @builtins@ attribute set, derived from the central registry.
-builtinsAttrSet :: EvalPolicy -> Int64 -> [Thunk] -> AttrSet
-builtinsAttrSet policy timestamp searchPaths =
-  attrSetFromMap SetRoot $ Map.union builtinEntries (standardEntries policy timestamp searchPaths)
-  where
-    builtinEntries =
-      Map.fromList [(name, evaluated (VBuiltin name [])) | name <- builtinNames]
+builtinsAttrSet :: (MonadCData m) => EvalPolicy -> Int64 -> [Thunk] -> m AttrSet
+builtinsAttrSet policy timestamp searchPaths = do
+  standard <- standardEntries policy timestamp searchPaths
+  attrSetFromMap SetRoot (Map.union builtinFunctionCells standard)
+
+-- | One cell for each registered builtin, for the process: every
+-- environment 'builtinEnv' builds binds the same ones, as upstream binds
+-- one value per primop in its base environment, so a builtin read in one
+-- file is the same value as the same builtin read in another, which @==@
+-- shows of sets copied out of @builtins@ in two files.  A cell per
+-- environment would also hold a StablePtr apiece, which GHC's collector
+-- scans on every collection, for every imported file.  Like
+-- 'derivationWrapper', a process-global value, allocated where the first
+-- 'builtinEnv' reads it ('runCDataPure'); the allocation writes only the
+-- cells it makes.
+builtinFunctionCells :: Map Text Thunk
+builtinFunctionCells = runCDataPure (sequenceA (Map.fromList [(name, builtinFunction name) | name <- builtinNames]))
+{-# NOINLINE builtinFunctionCells #-}
 
 -- | The constants beside the registry.  @currentTime@ and @currentSystem@
 -- are upstream's @impureOnly@ constants and are absent under @pure-eval@
@@ -113,9 +128,14 @@ builtinsAttrSet policy timestamp searchPaths =
 -- nix-instantiate 2.33.2); @nixPath@ stays, holding whatever search path
 -- the caller passed, which under @pure-eval@ is what upstream leaves of
 -- it.
-standardEntries :: EvalPolicy -> Int64 -> [Thunk] -> Map.Map Text Thunk
+--
+-- The values are made in the order listed, the derivation wrapper among
+-- them: making a string interns it, and compiling the wrapper interns its
+-- identifiers, so a name only the wrapper brings comes before the
+-- @currentSystem@ string, and a set naming both holds them in that order.
+standardEntries :: (MonadCData m) => EvalPolicy -> Int64 -> [Thunk] -> m (Map.Map Text Thunk)
 standardEntries policy timestamp searchPaths =
-  Map.fromList $
+  fmap Map.fromList . traverse sequenceA $
     [ ("true", evaluated (VBool True)),
       ("false", evaluated (VBool False)),
       ("null", evaluated VNull),
@@ -125,8 +145,9 @@ standardEntries policy timestamp searchPaths =
       ("storeDir", evaluated (mkStr defaultStoreDirText)),
       ("nixVersion", evaluated (mkStr targetNixVersion)),
       ("langVersion", evaluated (VInt 6)),
-      ("nixPath", evaluated (VList (clistFromThunks (map thunkToCPtr searchPaths)))),
-      ("derivation", derivationWrapper)
+      ("nixPath", clistFromThunks (map thunkToCPtr searchPaths) >>= evaluated . VList),
+      -- Forced here, in its turn, should no environment have made it yet.
+      ("derivation", pure $! derivationWrapper)
     ]
       ++ [("currentTime", evaluated (VInt timestamp)) | not (epPureEval policy)]
       ++ [("currentSystem", evaluated (mkStr currentSystemStr)) | not (epPureEval policy)]
@@ -210,44 +231,42 @@ derivationWrapperOrigin = SourceFile "/derivation-internal.nix"
 -- the wrapper reads, so the constant needs no knot through 'builtinEnv'.
 -- The wrapper is bound against these names too, so it cannot read one the
 -- slice lacks.
-derivationWrapperScope :: Map Text Thunk
-derivationWrapperScope =
-  let builtinsUsed = ["getAttr", "head", "listToAttrs"]
-   in Map.fromList
-        [ ("derivationStrict", evaluated (VBuiltin "derivationStrict" [])),
-          ("map", evaluated (VBuiltin "map" [])),
-          ("builtins", evaluated (VAttrs (attrSetFromMap SetRoot (Map.fromList (map topLevelBuiltin builtinsUsed)))))
-        ]
-{-# NOINLINE derivationWrapperScope #-}
-
--- | 'derivationWrapperScope' as the wrapper's environment.
-derivationWrapperEnv :: Env
-derivationWrapperEnv =
-  newCEnv EnvRoot nullPtr 0 (Just (attrSetFromMap SetRoot derivationWrapperScope)) Nothing nullPtr 0
-{-# NOINLINE derivationWrapperEnv #-}
+derivationWrapperScope :: (MonadCData m) => m (Map Text Thunk)
+derivationWrapperScope = do
+  builtinsUsed <- sequenceA (Map.fromList [(name, builtinFunction name) | name <- ["getAttr", "head", "listToAttrs"]])
+  builtinsSet <- attrSetFromMap SetRoot builtinsUsed
+  sequenceA $
+    Map.fromList
+      [ ("derivationStrict", builtinFunction "derivationStrict"),
+        ("map", builtinFunction "map"),
+        ("builtins", evaluated (VAttrs builtinsSet))
+      ]
 
 -- | The @derivation@ constant: the wrapper lambda closed over
--- 'derivationWrapperEnv'.  One value bound in both the root scope and
+-- 'derivationWrapperScope'.  One value bound in both the root scope and
 -- @builtins@, as upstream's @addConstant@ binds it.  It is compiled once
 -- for the process rather than once per environment: 'builtinEnv' runs for
 -- every imported file, and the arena the lambda lives in is the process's
--- ("Nix.Eval.Arena").  The source is a constant, so a parse failure is a
+-- ("Nix.Eval.Arena").  So it is a process-global value, allocated where
+-- the first 'builtinEnv' reads it ('runCDataPure'); the allocation writes
+-- only cells it makes.  The source is a constant, so a parse failure is a
 -- defect in this module; it surfaces as an abort at the first use of
 -- @derivation@ rather than as a crash while the environment is assembled.
--- It compiles when 'builtinEnv' first builds @builtins@, which holds it,
--- interning the names it brings that the evaluator's startup did not
--- ('derivationWrapperSource').
+-- It compiles as the first 'builtinEnv' is built, interning the names it
+-- brings that the evaluator's startup did not ('derivationWrapperSource').
 derivationWrapper :: Thunk
-derivationWrapper =
-  case parseNixWithScope (Map.keysSet derivationWrapperScope) "/" derivationWrapperOrigin derivationWrapperSource of
-    Right parsed -> cheapThunk derivationWrapperEnv (parsedExpr parsed)
+derivationWrapper = runCDataPure $ do
+  scope <- derivationWrapperScope
+  env <- attrSetFromMap SetRoot scope >>= \set -> newCEnv EnvRoot nullPtr 0 (Just set) Nothing nullPtr 0
+  case parseNixWithScope (Map.keysSet scope) "/" derivationWrapperOrigin derivationWrapperSource of
+    Right parsed -> cheapThunk env (parsedExpr parsed)
     Left err -> abortingThunk ("the derivation wrapper does not parse: " <> T.pack (show err))
 {-# NOINLINE derivationWrapper #-}
 
 -- | A thunk that aborts evaluation with the message when forced: @abort@
 -- applied to it, deferred the way "Nix.Eval" defers any application.
-abortingThunk :: Text -> Thunk
-abortingThunk message = deferApply EnvApply (VBuiltin "abort" []) (evaluated (mkStr message))
+abortingThunk :: (MonadCData m) => Text -> m Thunk
+abortingThunk message = evaluated (mkStr message) >>= deferApply EnvApply (VBuiltin "abort" [])
 
 -- ---------------------------------------------------------------------------
 -- NIX_PATH parsing
@@ -264,25 +283,20 @@ abortingThunk message = deferApply EnvApply (VBuiltin "abort" []) (evaluated (mk
 --
 -- >>> parseNixPath "nixpkgs=/home/user/nixpkgs:custom=/opt/custom"
 -- [Evaluated (VAttrs {"prefix": "nixpkgs", "path": "/home/user/nixpkgs"}), ...]
-parseNixPath :: ByteString -> [Thunk]
+parseNixPath :: (MonadCData m) => ByteString -> m [Thunk]
 parseNixPath raw
-  | BS.null raw = []
-  | otherwise = map parseEntry (splitNixPath raw)
+  | BS.null raw = pure []
+  | otherwise = mapM parseEntry (splitNixPath raw)
   where
-    parseEntry entry =
+    parseEntry entry = do
       let (prefix, path) = case BC.break (== '=') entry of
             (before, after)
               | BS.null after -> ("", before)
               | otherwise -> (before, BS.drop 1 after)
-       in evaluated
-            ( VAttrs
-                ( attrSetFromMap SetRoot $
-                    Map.fromList
-                      [ ("prefix", evaluated (mkStrBytes prefix)),
-                        ("path", evaluated (mkStrBytes path))
-                      ]
-                )
-            )
+      prefixThunk <- evaluated (mkStrBytes prefix)
+      pathThunk <- evaluated (mkStrBytes path)
+      attrs <- attrSetFromMap SetRoot (Map.fromList [("prefix", prefixThunk), ("path", pathThunk)])
+      evaluated (VAttrs attrs)
 
 -- | The @path@ of every search path entry 'parseNixPath' produced, for the
 -- restricted-mode allow list: upstream allows every lookup path root
@@ -290,17 +304,19 @@ parseNixPath raw
 -- read back from the very list the evaluator will search.  A root is the
 -- bytes the entry holds.  An entry that is not an attribute set with a
 -- string or path @path@ contributes nothing.
-searchPathRoots :: [Thunk] -> [ByteString]
-searchPathRoots = mapMaybe entryRoot
+searchPathRoots :: (MonadCData m) => [Thunk] -> m [ByteString]
+searchPathRoots = fmap catMaybes . mapM entryRoot
   where
-    entryRoot thunk = do
-      VAttrs attrs <- readThunkValue thunk
-      pathThunk <- attrSetLookup "path" attrs
-      pathVal <- readThunkValue pathThunk
-      case pathVal of
-        VStr bytes _ -> Just bytes
-        VPath p -> Just (TE.encodeUtf8 p)
-        _ -> Nothing
+    entryRoot thunk =
+      readThunkValue thunk >>= \case
+        Just (VAttrs attrs) ->
+          attrSetLookup "path" attrs >>= \case
+            Just pathThunk -> (>>= rootBytes) <$> readThunkValue pathThunk
+            Nothing -> pure Nothing
+        _ -> pure Nothing
+    rootBytes (VStr bytes _) = Just bytes
+    rootBytes (VPath p) = Just (TE.encodeUtf8 p)
+    rootBytes _ = Nothing
 
 -- | URL schemes that keep a @NIX_PATH@ entry whole when @://@ follows
 -- them: the allowlist in @EvalSettings::isPseudoUrl@,

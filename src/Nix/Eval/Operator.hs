@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | Binary and unary operator evaluation for Nix.
 --
 -- Short-circuiting operators ('OpAnd', 'OpOr', 'OpImpl') are handled
@@ -16,6 +18,7 @@ module Nix.Eval.Operator
     primMul,
     primDiv,
     expectInt,
+    expectedFailure,
   )
 where
 
@@ -24,6 +27,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.AllocSite (SetSite (SetUpdate))
 import Nix.Eval.CAttrSet (cattrsetUnion)
+import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (clistFromThunks, clistLen, clistThunks)
 import Nix.Eval.Print (PrintOptions (..), printValue)
 import Nix.Eval.Types
@@ -39,7 +43,6 @@ import Nix.Eval.Types
     typeOfValue,
   )
 import Nix.Expr.Types (BinaryOp (..), UnaryOp (..))
-import System.IO.Unsafe (unsafePerformIO)
 
 -- | Force function passed by the caller to break the import cycle.
 -- Needed for deep equality on lists and attribute sets.
@@ -140,17 +143,20 @@ checkedMul = checkedIntOp "multiplying" "*" (*)
 -- | Upstream's @forceInt@ on a forced value (eval.cc at 2.24.9).
 expectInt :: (MonadEval m) => NixValue -> m Int64
 expectInt (VInt n) = pure n
-expectInt other = throwEvalError (expectedMessage "an integer" other)
+expectInt other = expectedFailure "an integer" other
 
 -- | Upstream's @forceFloat@ on a forced value: an integer widens.
 expectFloat :: (MonadEval m) => NixValue -> m Double
 expectFloat (VInt n) = pure (fromIntegral n)
 expectFloat (VFloat x) = pure x
-expectFloat other = throwEvalError (expectedMessage "a float" other)
+expectFloat other = expectedFailure "a float" other
 
-expectedMessage :: Text -> NixValue -> Text
-expectedMessage wanted other =
-  "expected " <> wanted <> " but found " <> typeName other <> ": " <> printValue PrintForError other
+-- | Upstream's refusal of a value of the wrong type: the type wanted, the
+-- type found, and the value as an error prints it.
+expectedFailure :: (MonadEval m) => Text -> NixValue -> m a
+expectedFailure wanted other = do
+  shown <- printValue PrintForError other
+  throwEvalError ("expected " <> wanted <> " but found " <> typeName other <> ": " <> shown)
 
 isFloat :: NixValue -> Bool
 isFloat (VFloat _) = True
@@ -215,8 +221,10 @@ nixCompare _ (VStr a _) (VStr b _) = pure (a < b)
 -- Paths compare as their string representation (Nix semantics).
 nixCompare _ (VPath a) (VPath b) = pure (a < b)
 -- Lists compare lexicographically, element by element (Nix semantics).
-nixCompare forceFn (VList clA) (VList clB) =
-  listCompare forceFn (map Thunk (clistThunks clA)) (map Thunk (clistThunks clB))
+nixCompare forceFn (VList clA) (VList clB) = do
+  as <- map Thunk <$> clistThunks clA
+  bs <- map Thunk <$> clistThunks clB
+  listCompare forceFn as bs
 -- Upstream's @CompareValues@ (primops.cc at 2.24.9).  2.33.2 appends the
 -- two values; 2.24.9 does not.
 nixCompare _ left right
@@ -257,20 +265,31 @@ nixEqual _ VNull VNull = pure True
 -- String equality ignores context (matching real Nix).
 nixEqual _ (VStr a _) (VStr b _) = pure (a == b)
 nixEqual _ (VPath a) (VPath b) = pure (a == b)
-nixEqual forceFn (VList clA) (VList clB)
-  | clistLen clA /= clistLen clB = pure False
-  | otherwise = listEqual forceFn (map Thunk (clistThunks clA)) (map Thunk (clistThunks clB))
+nixEqual forceFn (VList clA) (VList clB) = do
+  lenA <- clistLen clA
+  lenB <- clistLen clB
+  if lenA /= lenB
+    then pure False
+    else do
+      as <- map Thunk <$> clistThunks clA
+      bs <- map Thunk <$> clistThunks clB
+      listEqual forceFn as bs
 nixEqual forceFn (VAttrs as) (VAttrs bs) = do
   drvOutPaths <- derivationOutPathPair forceFn as bs
   case drvOutPaths of
     Just outPathPair -> thunkPairEqual forceFn outPathPair
-    Nothing
-      | attrSetKeys as /= attrSetKeys bs -> pure False
-      | otherwise ->
+    Nothing -> do
+      keysA <- attrSetKeys as
+      keysB <- attrSetKeys bs
+      if keysA /= keysB
+        then pure False
+        else do
           -- Short-circuit on the first mismatch: later pairs are never
           -- forced, so errors past the deciding pair cannot surface
           -- (upstream stops comparing there too).
-          allPairsEqual (zip (attrSetElems as) (attrSetElems bs))
+          elemsA <- attrSetElems as
+          elemsB <- attrSetElems bs
+          allPairsEqual (zip elemsA elemsB)
   where
     allPairsEqual [] = pure True
     allPairsEqual (pair : rest) = do
@@ -294,17 +313,19 @@ derivationOutPathPair forceFn as bs = do
     then pure Nothing
     else do
       rightIsDrv <- isDerivationSet forceFn bs
-      pure $
-        if rightIsDrv
-          then (,) <$> attrSetLookup "outPath" as <*> attrSetLookup "outPath" bs
-          else Nothing
+      if rightIsDrv
+        then do
+          outPathA <- attrSetLookup "outPath" as
+          outPathB <- attrSetLookup "outPath" bs
+          pure ((,) <$> outPathA <*> outPathB)
+        else pure Nothing
 
 -- | Does the set carry @type = "derivation"@?  Forces only the @type@ attr
 -- (as upstream's isDerivation does); a non-string type is simply not a
 -- derivation, not an error.
 isDerivationSet :: (MonadEval m) => Force m -> AttrSet -> m Bool
 isDerivationSet forceFn attrs =
-  case attrSetLookup "type" attrs of
+  attrSetLookup "type" attrs >>= \case
     Nothing -> pure False
     Just typeThunk -> do
       typeVal <- forceFn typeThunk
@@ -344,8 +365,10 @@ forcedPairEqual forceFn (a, va) (b, vb)
 
 -- | List concatenation (++).
 evalConcat :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-evalConcat (VList clA) (VList clB) =
-  pure (VList (clistFromThunks (clistThunks clA ++ clistThunks clB)))
+evalConcat (VList clA) (VList clB) = do
+  as <- clistThunks clA
+  bs <- clistThunks clB
+  VList <$> clistFromThunks (as ++ bs)
 evalConcat left right =
   throwEvalError ("cannot concatenate " <> typeName left <> " and " <> typeName right)
 
@@ -363,22 +386,13 @@ evalUpdate :: (MonadEval m) => m NixValue -> m NixValue -> m NixValue
 evalUpdate evalLeft evalRight = do
   leftSet <- evalLeft >>= expectSet
   rightSet <- evalRight >>= expectSet
-  pure (VAttrs (mergeAttrSets leftSet rightSet))
+  VAttrs <$> mergeAttrSets leftSet rightSet
   where
     expectSet (VAttrs set) = pure set
-    expectSet other =
-      throwEvalError ("expected a set but found " <> typeName other <> ": " <> printValue PrintForError other)
+    expectSet other = expectedFailure "a set" other
 
--- | Merge two t'AttrSet's, right-biased (@//@).
+-- | Merge two t'AttrSet's, right-biased (@//@), into a new set.
 -- Delegates to C-side @nn_attrset_union@ which performs a linear merge
 -- of two sorted arrays - O(n+m) on contiguous, cache-friendly memory.
---
--- 'unsafePerformIO' safety: @nn_attrset_union@ is a pure C function
--- that allocates a new result set from its two inputs without side
--- effects, callbacks to Haskell, or dependency on mutable state
--- beyond the C allocator.  The NOINLINE pragma prevents float-out
--- from sharing results across distinct call sites.
-{-# NOINLINE mergeAttrSets #-}
-mergeAttrSets :: AttrSet -> AttrSet -> AttrSet
-mergeAttrSets (AttrSet a) (AttrSet b) =
-  AttrSet (unsafePerformIO (cattrsetUnion SetUpdate a b))
+mergeAttrSets :: (MonadCData m) => AttrSet -> AttrSet -> m AttrSet
+mergeAttrSets (AttrSet a) (AttrSet b) = AttrSet <$> cattrsetUnion SetUpdate a b

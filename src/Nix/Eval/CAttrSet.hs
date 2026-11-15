@@ -56,6 +56,7 @@ import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Array (peekArray, withArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Nix.Eval.AllocSite (SetSite, setSiteIndex)
+import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CStatus (cStatusFailure, checkedCPtr)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.SourcePos (PosIdx (..))
@@ -124,8 +125,8 @@ indexNotFound = maxBound
 -- number of entries.  The count only sizes the first allocation, so one
 -- past the ceiling is clamped to it: the inserts are what enforce the
 -- ceiling.
-cattrsetNew :: SetSite -> Int -> IO CAttrSet
-cattrsetNew site expected = checkedCPtr "nn_attrset_new" =<< c_nn_attrset_new capacity (setSiteIndex site)
+cattrsetNew :: (MonadCData m) => SetSite -> Int -> m CAttrSet
+cattrsetNew site expected = cdataIO (checkedCPtr "nn_attrset_new" =<< c_nn_attrset_new capacity (setSiteIndex site))
   where
     capacity = fromIntegral (max 0 (min expected entryCeiling))
     entryCeiling = fromIntegral (maxBound :: Word32)
@@ -136,15 +137,15 @@ cattrsetNew site expected = checkedCPtr "nn_attrset_new" =<< c_nn_attrset_new ca
 
 -- | Insert a key-value pair defined at a position.  Call before freeze.
 -- The value is a CThunkPtr cast to Ptr () - C never dereferences it.
-cattrsetInsert :: CAttrSet -> Symbol -> PosIdx -> CThunkPtr -> IO ()
-cattrsetInsert set (Symbol sym) (PosIdx pos) ptr = do
+cattrsetInsert :: (MonadCData m) => CAttrSet -> Symbol -> PosIdx -> CThunkPtr -> m ()
+cattrsetInsert set (Symbol sym) (PosIdx pos) ptr = cdataIO $ do
   status <- c_nn_attrset_insert set sym (castPtr ptr) pos
   unless (status == 0) $
     cStatusFailure "nn_attrset_insert" "the attribute set cannot grow (allocation failure or its 4294967295-entry ceiling)"
 
 -- | Sort and deduplicate.  Must be called once before any queries.
-cattrsetFreeze :: CAttrSet -> IO ()
-cattrsetFreeze = c_nn_attrset_freeze
+cattrsetFreeze :: (MonadCData m) => CAttrSet -> m ()
+cattrsetFreeze = cdataIO . c_nn_attrset_freeze
 
 -- ---------------------------------------------------------------------------
 -- Query
@@ -152,44 +153,44 @@ cattrsetFreeze = c_nn_attrset_freeze
 
 -- | Look up a key.  Returns 'Nothing' if not found.
 -- The returned 'CThunkPtr' is borrowed - the thunk arena owns it.
-cattrsetLookup :: CAttrSet -> Symbol -> IO (Maybe CThunkPtr)
-cattrsetLookup set (Symbol sym) = do
+cattrsetLookup :: (MonadCData m) => CAttrSet -> Symbol -> m (Maybe CThunkPtr)
+cattrsetLookup set (Symbol sym) = cdataIO $ do
   ptr <- c_nn_attrset_lookup set sym
   pure (if ptr == nullPtr then Nothing else Just (castPtr ptr))
 
 -- | Find the index of a key, or 'Nothing' if not found.
-cattrsetIndex :: CAttrSet -> Symbol -> IO (Maybe Word32)
-cattrsetIndex set (Symbol sym) = do
+cattrsetIndex :: (MonadCData m) => CAttrSet -> Symbol -> m (Maybe Word32)
+cattrsetIndex set (Symbol sym) = cdataIO $ do
   idx <- c_nn_attrset_index set sym
   pure (if idx == indexNotFound then Nothing else Just idx)
 
 -- | Get the value at a known index.
-cattrsetGetValue :: CAttrSet -> Word32 -> IO CThunkPtr
-cattrsetGetValue set idx = castPtr <$> c_nn_attrset_get_value set idx
+cattrsetGetValue :: (MonadCData m) => CAttrSet -> Word32 -> m CThunkPtr
+cattrsetGetValue set idx = cdataIO (castPtr <$> c_nn_attrset_get_value set idx)
 
 -- | Update the value at a known index (for two-phase construction).
-cattrsetSetValue :: CAttrSet -> Word32 -> CThunkPtr -> IO ()
-cattrsetSetValue set idx ptr = c_nn_attrset_set_value set idx (castPtr ptr)
+cattrsetSetValue :: (MonadCData m) => CAttrSet -> Word32 -> CThunkPtr -> m ()
+cattrsetSetValue set idx ptr = cdataIO (c_nn_attrset_set_value set idx (castPtr ptr))
 
 -- | Get the key symbol at a known index.
-cattrsetGetKey :: CAttrSet -> Word32 -> IO Symbol
-cattrsetGetKey set idx = Symbol <$> c_nn_attrset_get_key set idx
+cattrsetGetKey :: (MonadCData m) => CAttrSet -> Word32 -> m Symbol
+cattrsetGetKey set idx = cdataIO (Symbol <$> c_nn_attrset_get_key set idx)
 
 -- | Get the position of the entry at a known index.
-cattrsetGetPos :: CAttrSet -> Word32 -> IO PosIdx
-cattrsetGetPos set idx = PosIdx <$> c_nn_attrset_get_pos set idx
+cattrsetGetPos :: (MonadCData m) => CAttrSet -> Word32 -> m PosIdx
+cattrsetGetPos set idx = cdataIO (PosIdx <$> c_nn_attrset_get_pos set idx)
 
 -- ---------------------------------------------------------------------------
 -- Bulk access
 -- ---------------------------------------------------------------------------
 
 -- | Number of entries (unique keys after freeze).
-cattrsetSize :: CAttrSet -> IO Word32
-cattrsetSize = c_nn_attrset_size
+cattrsetSize :: (MonadCData m) => CAttrSet -> m Word32
+cattrsetSize = cdataIO . c_nn_attrset_size
 
 -- | Read all keys as a list of symbols (sorted).
-cattrsetKeys :: CAttrSet -> IO [Symbol]
-cattrsetKeys set = do
+cattrsetKeys :: (MonadCData m) => CAttrSet -> m [Symbol]
+cattrsetKeys set = cdataIO $ do
   n <- cattrsetSize set
   ptr <- c_nn_attrset_keys_ptr set
   raw <- peekArray (fromIntegral n) ptr
@@ -200,12 +201,12 @@ cattrsetKeys set = do
 -- ---------------------------------------------------------------------------
 
 -- | Right-biased union (// semantics) at a site.  Result is frozen.
-cattrsetUnion :: SetSite -> CAttrSet -> CAttrSet -> IO CAttrSet
-cattrsetUnion site a b = checkedCPtr "nn_attrset_union" =<< c_nn_attrset_union a b (setSiteIndex site)
+cattrsetUnion :: (MonadCData m) => SetSite -> CAttrSet -> CAttrSet -> m CAttrSet
+cattrsetUnion site a b = cdataIO (checkedCPtr "nn_attrset_union" =<< c_nn_attrset_union a b (setSiteIndex site))
 
 -- | Remove a list of keys, making the result at a site.  Result is frozen.
-cattrsetRemoveKeys :: SetSite -> CAttrSet -> [Symbol] -> IO CAttrSet
-cattrsetRemoveKeys site set syms = do
+cattrsetRemoveKeys :: (MonadCData m) => SetSite -> CAttrSet -> [Symbol] -> m CAttrSet
+cattrsetRemoveKeys site set syms = cdataIO $ do
   let raw = map unSymbol syms
       n = fromIntegral (length raw)
   withArray raw $ \ptr ->

@@ -45,6 +45,7 @@ import Data.Word (Word32)
 import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr)
 import Nix.Eval.AllocSite (EnvSite, envSiteIndex)
+import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CThunk (CThunkPtr)
 
 -- ---------------------------------------------------------------------------
@@ -67,8 +68,14 @@ foreign import ccall unsafe "nn_env_destroy"
 foreign import ccall unsafe "nn_env_alloc_slots"
   c_nn_env_alloc_slots :: Word32 -> Word32 -> IO (Ptr CThunkPtr)
 
+-- The empty env is a C static, one address for the life of the process,
+-- so this import is pure, as the null and Boolean cells of
+-- "Nix.Eval.CThunk" are: no arena window, nor its absence, changes what
+-- it returns.
+
+-- | The global empty env (all fields zero or NULL).  Not to be modified.
 foreign import ccall unsafe "nn_env_empty"
-  c_nn_env_empty :: IO (Ptr NnEnv)
+  cenvEmpty :: Ptr NnEnv
 
 foreign import ccall unsafe "nn_env_new"
   c_nn_env_new ::
@@ -138,19 +145,16 @@ cenvDestroy = c_nn_env_destroy
 -- | Allocate a C array of @count@ 'CThunkPtr' slots for an env at a
 -- site.  O(1) amortized.  Returns 'Foreign.Ptr.nullPtr' if count is 0.
 -- All slots are zero-initialized.
-cenvAllocSlots :: EnvSite -> Word32 -> IO (Ptr CThunkPtr)
-cenvAllocSlots site count = c_nn_env_alloc_slots count (envSiteIndex site)
+cenvAllocSlots :: (MonadCData m) => EnvSite -> Word32 -> m (Ptr CThunkPtr)
+cenvAllocSlots site count = cdataIO (c_nn_env_alloc_slots count (envSiteIndex site))
 
 -- ---------------------------------------------------------------------------
 -- Env constructors
 -- ---------------------------------------------------------------------------
 
--- | Return a pointer to the global empty env (all fields zero/NULL).
-cenvEmpty :: IO (Ptr NnEnv)
-cenvEmpty = c_nn_env_empty
-
 -- | Full constructor: set all fields explicitly.  Arena-allocated.
 cenvNew ::
+  (MonadCData m) =>
   EnvSite ->
   Ptr CThunkPtr ->
   Word32 ->
@@ -158,49 +162,49 @@ cenvNew ::
   Ptr NnEnv ->
   Ptr (Ptr ()) ->
   Word32 ->
-  IO (Ptr NnEnv)
-cenvNew site slots slotCount scope parent withs withCount =
-  c_nn_env_new slots slotCount scope parent withs withCount (envSiteIndex site)
+  m (Ptr NnEnv)
+cenvNew site slots slotCount lazyScope parent withs withCount =
+  cdataIO (c_nn_env_new slots slotCount lazyScope parent withs withCount (envSiteIndex site))
 
 -- | Child env with positional slots, inheriting parent's with-scopes.
-cenvFromSlots :: EnvSite -> Ptr CThunkPtr -> Word32 -> Ptr NnEnv -> IO (Ptr NnEnv)
-cenvFromSlots site slots slotCount parent = c_nn_env_from_slots slots slotCount parent (envSiteIndex site)
+cenvFromSlots :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Word32 -> Ptr NnEnv -> m (Ptr NnEnv)
+cenvFromSlots site slots slotCount parent = cdataIO (c_nn_env_from_slots slots slotCount parent (envSiteIndex site))
 
 -- | Copy base env with a new with-scope prepended.
-cenvPushWith :: EnvSite -> Ptr NnEnv -> Ptr () -> IO (Ptr NnEnv)
-cenvPushWith site base scope = c_nn_env_push_with base scope (envSiteIndex site)
+cenvPushWith :: (MonadCData m) => EnvSite -> Ptr NnEnv -> Ptr () -> m (Ptr NnEnv)
+cenvPushWith site base scope = cdataIO (c_nn_env_push_with base scope (envSiteIndex site))
 
 -- | Minimal env: slots only, no parent, no with-scopes.
-cenvNewMinimal :: EnvSite -> Ptr CThunkPtr -> Word32 -> IO (Ptr NnEnv)
-cenvNewMinimal site slots slotCount = c_nn_env_new_minimal slots slotCount (envSiteIndex site)
+cenvNewMinimal :: (MonadCData m) => EnvSite -> Ptr CThunkPtr -> Word32 -> m (Ptr NnEnv)
+cenvNewMinimal site slots slotCount = cdataIO (c_nn_env_new_minimal slots slotCount (envSiteIndex site))
 
 -- ---------------------------------------------------------------------------
 -- Accessors
 -- ---------------------------------------------------------------------------
 
 -- | Read the slot array pointer from a C env.
-cenvSlots :: Ptr NnEnv -> IO (Ptr CThunkPtr)
-cenvSlots = c_nn_env_slots
+cenvSlots :: (MonadCData m) => Ptr NnEnv -> m (Ptr CThunkPtr)
+cenvSlots = cdataIO . c_nn_env_slots
 
 -- | Read the slot count from a C env.
-cenvSlotCount :: Ptr NnEnv -> IO Word32
-cenvSlotCount = c_nn_env_slot_count
+cenvSlotCount :: (MonadCData m) => Ptr NnEnv -> m Word32
+cenvSlotCount = cdataIO . c_nn_env_slot_count
 
 -- | Read the lazy scope pointer from a C env (NULL if none).
-cenvLazyScope :: Ptr NnEnv -> IO (Ptr ())
-cenvLazyScope = c_nn_env_lazy_scope
+cenvLazyScope :: (MonadCData m) => Ptr NnEnv -> m (Ptr ())
+cenvLazyScope = cdataIO . c_nn_env_lazy_scope
 
 -- | Read the parent pointer from a C env (NULL if root).
-cenvParent :: Ptr NnEnv -> IO (Ptr NnEnv)
-cenvParent = c_nn_env_parent
+cenvParent :: (MonadCData m) => Ptr NnEnv -> m (Ptr NnEnv)
+cenvParent = cdataIO . c_nn_env_parent
 
 -- | Read the with-scopes array pointer from a C env.
-cenvWithScopes :: Ptr NnEnv -> IO (Ptr (Ptr ()))
-cenvWithScopes = c_nn_env_with_scopes
+cenvWithScopes :: (MonadCData m) => Ptr NnEnv -> m (Ptr (Ptr ()))
+cenvWithScopes = cdataIO . c_nn_env_with_scopes
 
 -- | Read the with-scope count from a C env.
-cenvWithCount :: Ptr NnEnv -> IO Word32
-cenvWithCount = c_nn_env_with_count
+cenvWithCount :: (MonadCData m) => Ptr NnEnv -> m Word32
+cenvWithCount = cdataIO . c_nn_env_with_count
 
 -- ---------------------------------------------------------------------------
 -- Lookup
@@ -208,14 +212,14 @@ cenvWithCount = c_nn_env_with_count
 
 -- | Resolved variable lookup: walk @level@ parent hops, then read
 -- @slots[idx]@.  Single FFI call - O(level) in C.
-cenvLookupResolved :: Ptr NnEnv -> Int -> Int -> IO CThunkPtr
+cenvLookupResolved :: (MonadCData m) => Ptr NnEnv -> Int -> Int -> m CThunkPtr
 cenvLookupResolved env level idx =
   -- C @int@ params: convert at the boundary (CInt), not HsInt (64-bit).
-  c_nn_env_lookup_resolved env (fromIntegral level) (fromIntegral idx)
+  cdataIO $ c_nn_env_lookup_resolved env (fromIntegral level) (fromIntegral idx)
 
 -- | Walk parent chain to root, return root's lazy scope (NULL if none).
-cenvRootScope :: Ptr NnEnv -> IO (Ptr ())
-cenvRootScope = c_nn_env_root_scope
+cenvRootScope :: (MonadCData m) => Ptr NnEnv -> m (Ptr ())
+cenvRootScope = cdataIO . c_nn_env_root_scope
 
 -- ---------------------------------------------------------------------------
 -- With-scopes array allocation
@@ -224,5 +228,5 @@ cenvRootScope = c_nn_env_root_scope
 -- | Allocate an arena array for the with-scopes of an env at a site.
 -- Zero-initialized.  Returns 'Foreign.Ptr.nullPtr' if the count is 0 or
 -- the allocation fails - the caller must check.
-cenvAllocWithScopes :: EnvSite -> Word32 -> IO (Ptr (Ptr ()))
-cenvAllocWithScopes site count = c_nn_env_alloc_with_scopes count (envSiteIndex site)
+cenvAllocWithScopes :: (MonadCData m) => EnvSite -> Word32 -> m (Ptr (Ptr ()))
+cenvAllocWithScopes site count = cdataIO (c_nn_env_alloc_with_scopes count (envSiteIndex site))

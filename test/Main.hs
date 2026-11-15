@@ -15,7 +15,7 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
-import Control.Monad (filterM, unless, void, when, zipWithM)
+import Control.Monad (filterM, foldM, unless, void, when, zipWithM, (>=>))
 import Control.Monad.Except (runExceptT)
 import Control.Monad.State.Strict (State, evalStateT, get, gets, modify', runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
@@ -27,6 +27,7 @@ import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (intToDigit, isAsciiLower, isAsciiUpper, isDigit, ord)
 import Data.Either (isLeft, isRight)
 import Data.Foldable (toList, traverse_)
+import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
@@ -72,23 +73,24 @@ import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
-import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
+import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, currentSystemStr, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvLazyScope)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..))
-import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIO, runEvalIOTraced)
+import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalState, newEvalStateWith, renderEvalFailure, runEvalIO, runEvalIOTraced)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printSymbol, printValue)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
@@ -96,7 +98,7 @@ import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecor
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternBytes, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, buildCSlots, emptyCList, envLookupResolved, mkThunkBc, newMinimalEnv, pendingThunkEnv, tieFrame, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, buildCSlots, emptyCList, envLookupResolved, mkThunkBc, newMinimalEnv, pendingCode, pendingThunkEnv, readComputed, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -135,7 +137,6 @@ import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), IOMode (..), hClose, hPutStrLn, hSetBuffering, stderr, stdout, withBinaryFile)
 import System.IO.Error (ioeGetErrorString, isAlreadyExistsError, mkIOError, resourceVanishedErrorType)
-import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
@@ -196,6 +197,12 @@ assertRight label result check = case result of
   Left err -> Fail (label <> ": got error: " <> T.pack (show err))
   Right val -> check val
 
+-- | 'assertRight' with a check that reads the C data layer.
+assertRightM :: (Show e) => Text -> Either e a -> (a -> IO TestResult) -> IO TestResult
+assertRightM label result check = case result of
+  Left err -> pure (Fail (label <> ": got error: " <> T.pack (show err)))
+  Right val -> check val
+
 assertLeft :: (Show a) => Text -> Either e a -> TestResult
 assertLeft _ (Left _) = Pass
 assertLeft label (Right val) = Fail (label <> ": expected error but got: " <> T.pack (show val))
@@ -245,6 +252,17 @@ evalNixBytes :: BS.ByteString -> Either Text NixValue
 evalNixBytes source = case parseNix testBaseDir testOrigin source of
   Left err -> Left (sourceFailure err)
   Right parsed -> runPureEval (evalParsed (builtinEnv unrestrictedPolicy 0 []) parsed)
+
+-- | Each entry of a parsed @NIX_PATH@ as its prefix and path values, each
+-- 'Nothing' when absent or not computed.
+searchPathEntries :: BS.ByteString -> IO [(Maybe NixValue, Maybe NixValue)]
+searchPathEntries raw = parseNixPath raw >>= mapM entry
+  where
+    entry thunk =
+      readThunkValue thunk >>= \case
+        Just (VAttrs m) -> (,) <$> computed "prefix" m <*> computed "path" m
+        _ -> pure (Nothing, Nothing)
+    computed key m = attrSetLookup key m >>= maybe (pure Nothing) readThunkValue
 
 -- | Prefix marking a parse (not eval) failure in 'evalNix' results.
 parseErrorTag :: Text
@@ -1058,6 +1076,15 @@ testValuePrinter = do
           "print-blackhole"
           "let x = { a = \"${x}\"; }; in x.a"
           (setFound ("{ a = " <> marker "potential infinite recursion" <> "; }")),
+      -- Upstream renders a type error's value as it builds the error
+      -- (HintFmt formats its arguments as it is constructed, fmt.hh at
+      -- 2.24.9), while the attribute is still being forced.
+      runTestM "a type error prints an attribute being forced as upstream's recursion marker" $
+        assertEvalErrorIO
+          tmpBase
+          "print-blackhole-type-error"
+          "let x = { a = builtins.length x; }; in x.a"
+          ("expected a list but found a set: { a = " <> marker "potential infinite recursion" <> "; }"),
       -- A set or list the print reaches again prints as upstream's
       -- repeated marker: a set by its bindings, any empty one among them,
       -- and a list with elements by the cell holding it (print.cc:330-335
@@ -1118,21 +1145,22 @@ testValuePrinter = do
           "{} // builtins.map (x: x)"
           ("expected a set but found the partially applied built-in function 'map': " <> marker "partially applied primop map"),
       -- builtins.trace's defaults bound nothing and sort only by name.
-      runTest "a set prints in full by name as trace prints it"
-        $ assertRight "print-full-set" (evalNix "{ type = 1; a = 2; }")
-        $ assertEqual "print-full-set" "{ a = 2; type = 1; }" . printValue PrintInFull,
-      runTest "a long list prints in full as trace prints it"
-        $ assertRight "print-full-list" (evalNix (listOfInts 12))
-        $ assertEqual "print-full-list" "[ 1 2 3 4 5 6 7 8 9 10 11 12 ]" . printValue PrintInFull,
+      runTestM "a set prints in full by name as trace prints it"
+        $ assertRightM "print-full-set" (evalNix "{ type = 1; a = 2; }")
+        $ fmap (assertEqual "print-full-set" "{ a = 2; type = 1; }") . printValue PrintInFull,
+      runTestM "a long list prints in full as trace prints it"
+        $ assertRightM "print-full-list" (evalNix (listOfInts 12))
+        $ fmap (assertEqual "print-full-list" "[ 1 2 3 4 5 6 7 8 9 10 11 12 ]") . printValue PrintInFull,
       -- builtins.trace prints a non-string through the same printer with
       -- upstream's default options.
-      runTest "a float prints in full as trace prints it" $
-        assertEqual "print-full-float" "1.23457e+06" (printValue PrintInFull (VFloat 1234567.0)),
+      runTestM "a float prints in full as trace prints it" $
+        assertEqual "print-full-float" "1.23457e+06" <$> printValue PrintInFull (VFloat 1234567.0),
       runTestM "a string printed in full reads back as itself" $ do
         result <-
           QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
-            QC.forAll genEscapable $ \text ->
-              evalNix (printValue PrintInFull (mkStr text)) QC.=== Right (mkStr text)
+            QC.forAll genEscapable $ \text -> QC.ioProperty $ do
+              printed <- printValue PrintInFull (mkStr text)
+              pure (evalNix printed QC.=== Right (mkStr text))
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
 
@@ -1273,9 +1301,9 @@ testResultPrinter = do
         when exists (removeDirectoryRecursive testDir)
       printsIO label source expected = runTestM label $ do
         result <- evalNixIO testDir source
-        pure (assertRight label result (assertEqual label expected . renderResult))
+        assertRightM label result (fmap (assertEqual label expected) . renderResult)
       prints label source expected =
-        runTest label (assertRight label (evalNix source) (assertEqual label expected . renderResult))
+        runTestM label (assertRightM label (evalNix source) (fmap (assertEqual label expected) . renderResult))
       floatPrints (source, expected) =
         prints ("a float prints in ostream form: " <> source) source expected
   bracket_ setup cleanup . sequence $
@@ -1307,13 +1335,16 @@ testResultPrinter = do
       prints "a regex builtin given its pattern is a partial application" "builtins.match \"a\"" "<PRIMOP-APP>",
       runTestM "a printed string reads back as itself" $
         quickCheckPasses $
-          QC.forAll genEscapable $ \text ->
-            readsBack (renderResult (mkStr text)) (mkStr text),
+          QC.forAll genEscapable $ \text -> QC.ioProperty $ do
+            printed <- renderResult (mkStr text)
+            pure (readsBack printed (mkStr text)),
       runTestM "a printed attribute name reads back as itself" $
         quickCheckPasses $
-          QC.forAll genAttrName $ \name ->
-            let attrs = VAttrs (attrSetFromMap SetLiteral (Map.singleton name (evaluated (VInt 1))))
-             in readsBack ("builtins.head (builtins.attrNames " <> renderResult attrs <> ")") (mkStr name),
+          QC.forAll genAttrName $ \name -> QC.ioProperty $ do
+            one <- evaluated (VInt 1)
+            attrs <- VAttrs <$> attrSetFromMap SetLiteral (Map.singleton name one)
+            printed <- renderResult attrs
+            pure (readsBack ("builtins.head (builtins.attrNames " <> printed <> ")") (mkStr name)),
       runTestM "a name printed as a symbol reads back as itself" $
         quickCheckPasses $
           QC.forAll genAttrName $ \name ->
@@ -1321,7 +1352,7 @@ testResultPrinter = do
     ]
       <> map floatPrints floatCases
   where
-    renderResult = BL.toStrict . BB.toLazyByteString . printAmbiguous
+    renderResult val = BL.toStrict . BB.toLazyByteString <$> printAmbiguous val
     readsBack printed expected = case TE.decodeUtf8' printed of
       Left _ -> QC.counterexample "the printed bytes are not UTF-8" False
       Right source -> evalNix source QC.=== Right expected
@@ -1395,13 +1426,13 @@ testRepeatedValues :: IO [Bool]
 testRepeatedValues = do
   putStrLn "eval/repeated"
   tmpBase <- getTemporaryDirectory
-  let cutAfter expected = BL.toStrict . BL.take (fromIntegral (BS.length expected) + 1) . BB.toLazyByteString . printAmbiguous
+  let cutAfter expected val = BL.toStrict . BL.take (fromIntegral (BS.length expected) + 1) . BB.toLazyByteString <$> printAmbiguous val
       printsWith evaluator label source expectedText = runTestM label $ finishesInTime label $ do
         let expected = TE.encodeUtf8 expectedText
         result <- evaluator tmpBase source
         case result of
           Left err -> pure (Fail (label <> ": got error: " <> err))
-          Right val -> assertEqual label expected <$> evaluate (cutAfter expected val)
+          Right val -> assertEqual label expected <$> (cutAfter expected val >>= evaluate)
       -- What nova-nix eval prints, and what it prints with --strict.
       prints = printsWith evalNixIO
       printsStrict = printsWith evalStrictIO
@@ -1419,6 +1450,12 @@ testRepeatedValues = do
       -- Identity, not equality, and an empty set or list is never
       -- repeated (print-ambiguous.cc:39, :53).
       printsStrict "a set reached twice prints as repeated the second time" "let a = { x = 1; }; in [ a a ]" ("[ { x = 1; } " <> repeatedMarker <> " ]"),
+      -- Upstream's prim_tryEval builds the result's bindings afresh on
+      -- each call (primops.cc:895-923 at 2.24.9), a failed one included.
+      printsStrict
+        "two failed tryEvals are two sets"
+        "[ (builtins.tryEval (throw \"a\")) (builtins.tryEval (throw \"b\")) ]"
+        "[ { success = false; value = false; } { success = false; value = false; } ]",
       printsStrict "two equal sets made apart both print in full" "let a = { x = 1; }; b = { x = 1; }; in [ a b ]" "[ { x = 1; } { x = 1; } ]",
       printsStrict "an empty set or list reached twice prints in full both times" "let e = { }; l = [ ]; in [ e e l l ]" "[ { } { } [ ] [ ] ]",
       -- Upstream keeps the elements of a list of one or two in the Value
@@ -1439,7 +1476,7 @@ testRepeatedValues = do
           result <- evalNixIO tmpBase "let x = { a = x; }; in builtins.seq x x"
           case result of
             Left err -> pure (Fail ("trace-self: got error: " <> err))
-            Right val -> assertEqual "trace-self" ("{ a = " <> repeatedMarker <> "; }") <$> evaluate (printValue PrintInFull val)
+            Right val -> assertEqual "trace-self" ("{ a = " <> repeatedMarker <> "; }") <$> (printValue PrintInFull val >>= evaluate)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1590,8 +1627,8 @@ testCensus = do
             pure (fmap figures first QC.=== fmap figures second),
       runTestM "a census follows a value behind a StablePtr to the cells it holds" $ do
         inner <- cthunkNewComputedInt 7
-        let Thunk held = evaluated (VBuiltin "map" [ArgDeferred (Thunk inner)])
-        withCensus [RootThunk (Thunk held)] $ \census ->
+        held <- evaluated (VBuiltin "map" [ArgDeferred (Thunk inner)])
+        withCensus [RootThunk held] $ \census ->
           assertEqual "thunks" (Figures (Just 2) (2 * censusCellBytes)) (kindThunks (censusReached census))
             `andThen` assertEqual "StablePtrs reached" 1 (censusStablePtrsReached census)
             `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
@@ -1604,25 +1641,26 @@ testCensus = do
               `andThen` assertEqual "StablePtrs reached" True (censusStablePtrsReached census >= 1),
       runTestM "a census follows a pending thunk to its env and the env's slots" $ do
         cells <- mapM cthunkNewComputedInt [1, 2, 3]
-        let (slots, slotCount) = buildCSlots EnvApply (map Thunk cells)
-            env = newMinimalEnv EnvApply slots slotCount
+        (slots, slotCount) <- buildCSlots EnvApply (map Thunk cells)
+        env <- newMinimalEnv EnvApply slots slotCount
         code <- compileExpr (ELit (NixInt 0))
-        let Thunk pending = mkThunkBc env code
-        withCensus [RootThunk (Thunk pending)] $ \census ->
+        pending <- mkThunkBc env code
+        withCensus [RootThunk pending] $ \census ->
           assertEqual "thunks" (Figures (Just 4) (4 * censusCellBytes)) (kindThunks (censusReached census))
             `andThen` assertEqual "envs" (Figures (Just 1) (envStructBytes + 3 * censusPointerBytes)) (kindEnvs (censusReached census))
             `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
       runTestM "a list and its suffix count one items array, whichever is reached first" $ do
         cells <- mapM cthunkNewComputedInt [1, 2, 3, 4]
         whole <- CList <$> thunkListToCList cells
-        let suffix = clistDrop 2 whole
-            expected = (Figures (Just 2) (2 * censusHeaderBytes + 4 * censusPointerBytes), Figures (Just 4) (4 * censusCellBytes), 0)
+        suffix <- clistDrop 2 whole
+        let expected = (Figures (Just 2) (2 * censusHeaderBytes + 4 * censusPointerBytes), Figures (Just 4) (4 * censusCellBytes), 0)
             listsAndCells c = (kindLists (censusReached c), kindThunks (censusReached c), censusUnplaced c)
         suffixFirst <- censusOf [RootList suffix, RootList whole]
         wholeFirst <- censusOf [RootList whole, RootList suffix]
         pure (assertEqual "suffix first" (Right expected) (listsAndCells <$> suffixFirst) `andThen` assertEqual "whole first" (Right expected) (listsAndCells <$> wholeFirst)),
       runTestM "a census reaches a set's names and its string values as symbols" $ do
-        let set = attrSetFromMap SetLiteral (Map.fromList [("novaNixCensusName", evaluated (mkStr "nova-nix census value"))])
+        value <- evaluated (mkStr "nova-nix census value")
+        set <- attrSetFromMap SetLiteral (Map.fromList [("novaNixCensusName", value)])
         withCensus [RootAttrSet set] $ \census ->
           assertEqual
             "sets, thunks and symbols"
@@ -1630,8 +1668,9 @@ testCensus = do
             (figuresCount (kindAttrSets (censusReached census)), figuresCount (kindThunks (censusReached census)), kindSymbols (censusReached census))
             `andThen` assertEqual "set sizes" (Map.fromList [(1, 1)]) (censusSetSizes census)
             `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
-      runTestM "a census of the builtins reaches no more than is allocated and places every pointer it meets" $
-        withCensus [RootEnv (builtinEnv unrestrictedPolicy 0 [])] $ \census ->
+      runTestM "a census of the builtins reaches no more than is allocated and places every pointer it meets" $ do
+        env <- builtinEnv unrestrictedPolicy 0 []
+        withCensus [RootEnv env] $ \census ->
           let within (Figures allocatedCount allocatedBytes) (Figures reachedCount reachedBytes) =
                 reachedBytes <= allocatedBytes && maybe True (>= fromMaybe 0 reachedCount) allocatedCount
            in assertEqual "every kind within" (pure True) (within <$> censusAllocated census <*> censusReached census)
@@ -1831,10 +1870,9 @@ testAllocSites = do
             added <- sitesAdded (mapM_ allocateSet allocations)
             pure (fmap sitesSets added QC.=== Right (setsExpected allocations)),
       runTestM "a union with an empty operand counts as shareable, and one of two non-empty sets does not" $ do
-        let one = attrSetFromMap SetLiteral (Map.singleton "a" (evaluated VNull))
-            none = attrSetFromMap SetLiteral Map.empty
-        _ <- evaluate one
-        _ <- evaluate none
+        nullCell <- evaluated VNull
+        one <- attrSetFromMap SetLiteral (Map.singleton "a" nullCell)
+        none <- attrSetFromMap SetLiteral Map.empty
         added <-
           sitesAdded $
             mapM_ (\(AttrSet left, AttrSet right) -> void (cattrsetUnion SetUpdate left right)) [(one, none), (none, one), (one, one)]
@@ -1920,10 +1958,12 @@ testAllocSites = do
     genEnvAllocation = EnvAllocation <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (0, 5)
     genSetAllocation = SetAllocation <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (0, 4)
     allocateEnv (EnvAllocation site n) = do
-      let (slots, slotCount) = buildCSlots site (replicate n (evaluated VNull))
-      void (evaluate (newMinimalEnv site slots slotCount))
-    allocateSet (SetAllocation site n) =
-      void (evaluate (attrSetFromMap site (Map.fromList [(T.pack ("k" ++ show i), evaluated VNull) | i <- [1 .. n]])))
+      nullCell <- evaluated VNull
+      (slots, slotCount) <- buildCSlots site (replicate n nullCell)
+      void (newMinimalEnv site slots slotCount)
+    allocateSet (SetAllocation site n) = do
+      nullCell <- evaluated VNull
+      void (attrSetFromMap site (Map.fromList [(T.pack ("k" ++ show i), nullCell) | i <- [1 .. n]]))
     envsExpected allocations =
       ( Map.fromListWith
           addEnv
@@ -1949,10 +1989,10 @@ testFrameKnots = do
         quickCheckPasses $
           QC.forAll genSlotRead $ \(before, value, after) ->
             QC.ioProperty $ do
-              let (slots, slotCount) = buildCSlots EnvApply (map (evaluated . VInt) (before ++ value : after))
-                  env@(Env envPtr) = newMinimalEnv EnvApply slots slotCount
+              (slots, slotCount) <- mapM (evaluated . VInt) (before ++ value : after) >>= buildCSlots EnvApply
+              env@(Env envPtr) <- newMinimalEnv EnvApply slots slotCount
               bcIdx <- compileExpr (EResolvedVar 0 (length before))
-              let Thunk cell = mkThunkBc env bcIdx
+              Thunk cell <- mkThunkBc env bcIdx
               payload <- cthunkPayload cell
               Env stored <- pendingThunkEnv cell
               pure $
@@ -1995,11 +2035,18 @@ testFrameKnots = do
       -- The parser refuses a dynamic key in a let, so only an AST built by
       -- hand takes the let's dynamic-key path.
       runTest "a let with a dynamic key may name bindings declared after them" $
-        assertEqual "dynamic-let-later" (Right (mkStr "1 2")) (runPureEval (eval (builtinEnv unrestrictedPolicy 0 []) dynamicLetLater)),
+        assertEqual "dynamic-let-later" (Right (mkStr "1 2")) (runPureEval (builtinEnv unrestrictedPolicy 0 [] >>= (`eval` dynamicLetLater))),
       -- Functions compare equal only as the same cell, so this holds only
       -- when the set's attribute and the frame's slot are one cell.  The
       -- IO evaluator keeps s once forced; the pure one rebuilds it at each
       -- use, in a new frame.
+      -- One thunk of an inherit's from-expression serves every name it
+      -- gives, as upstream's ExprAttrs::buildInheritFromEnv makes one
+      -- (eval.cc:1179-1189 at 2.24.9), so the expression runs once.
+      emits
+        "an inherit's from-expression is evaluated once for all the names it gives"
+        "builtins.deepSeq { inherit (builtins.trace \"e\" { a = 1; b = 2; }) a b; } null"
+        ["trace: e"],
       runTestIO
         "a rec set's attributes are the cells in its frame's slots"
         tmpBase
@@ -2007,10 +2054,18 @@ testFrameKnots = do
         (VBool True),
       runTestM "tieFrame answers the cells it filled the slots with" $ do
         codes <- mapM (compileExpr . ELit . NixInt) [1, 2, 3]
-        let (frame, thunks) =
-              tieFrame EnvLet (length codes) (newMinimalEnv EnvLet) (\env -> map (mkThunkBc env) codes)
-            slotted = map (\i -> unThunk (envLookupResolved 0 i frame)) [0 .. length codes - 1]
-        pure (assertEqual "cells" slotted (map unThunk thunks))
+        (frame, thunks) <- tieFrame EnvLet (length codes) (newMinimalEnv EnvLet) (\env -> mapM (mkThunkBc env) codes)
+        slotted <- mapM (\i -> unThunk <$> envLookupResolved 0 i frame) [0 .. length codes - 1]
+        pure (assertEqual "cells" slotted (map unThunk thunks)),
+      -- A frame's slots are empty until tieFrame fills them, and C answers
+      -- NULL for an empty one; a thunk made by reading one would fault at
+      -- its first force, so the read itself refuses.
+      runTestM "reading a slot its frame has not filled raises CInvariantViolated" $ do
+        outcome <- try (tieFrame EnvLet 1 (newMinimalEnv EnvLet) (fmap pure . envLookupResolved 0 0))
+        pure $ case outcome of
+          Left (CInvariantViolated site _) -> assertEqual "site" "nn_env_lookup_resolved" site
+          Left other -> Fail ("expected CInvariantViolated, got " <> T.pack (show other))
+          Right _ -> Fail "the unfilled slot was read as a thunk"
     ]
   where
     dynamicLetLater =
@@ -2138,14 +2193,14 @@ testEvalLists = do
             QC.forAll genCase $ \(values, drops, index) ->
               QC.ioProperty $ do
                 ptrs <- mapM cthunkNewComputedInt values
-                let dropped = foldl' (flip clistDrop) (clistFromThunks ptrs) drops
-                    model = foldl' (flip drop) ptrs drops
+                initial <- clistFromThunks ptrs
+                dropped <- foldM (flip clistDrop) initial drops
+                observed <- (,,) <$> clistThunks dropped <*> clistLen dropped <*> clistIndex dropped index
+                let model = foldl' (flip drop) ptrs drops
                     modelAt i
                       | i < 0 = Nothing
                       | otherwise = listToMaybe (drop i model)
-                pure $
-                  (clistThunks dropped, clistLen dropped, clistIndex dropped index)
-                    QC.=== (model, length model, modelAt index)
+                pure (observed QC.=== (model, length model, modelAt index))
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
   where
@@ -3799,7 +3854,7 @@ testBatch3 = do
       runTest "functionArgs no default" $
         assertEval "funcArgs-nodef" "(builtins.functionArgs ({ a, b ? 1 }: a)).a" (VBool False),
       runTest "functionArgs simple lambda" $
-        assertEval "funcArgs-simple" "builtins.functionArgs (x: x)" (VAttrs (attrSetFromMap SetFunctionArgs Map.empty)),
+        assertEqual "funcArgs-simple" (evalNix "{ }") (evalNix "builtins.functionArgs (x: x)"),
       -- Upstream's prim_functionArgs message (primops.cc at 2.24.9), the
       -- same whatever the argument, and tryEval does not catch it.
       runTest "functionArgs of a set is upstream's error" $
@@ -4128,13 +4183,28 @@ evalNixIO baseDir source = do
   storeDir <- evalNixIOStoreDir
   evalNixIOStore storeDir baseDir source
 
+-- | An evaluation state with no search path, whatever @NIX_PATH@ the suite
+-- runs under.  'newEvalState' makes @NIX_PATH@'s entries as it runs,
+-- interning their strings, so a test whose result depends on the order
+-- names were interned in would otherwise depend on the machine; a test of
+-- @NIX_PATH@ itself uses 'evalNixIOWithNixPath'.
+testEvalState :: StoreDir -> FilePath -> IO EvalState
+testEvalState = newEvalStateWith []
+
+-- | 'evalNixIO' with the search path @NIX_PATH@ gives ('newEvalState').
+evalNixIOWithNixPath :: FilePath -> Text -> IO (Either Text NixValue)
+evalNixIOWithNixPath baseDir source = do
+  storeDir <- evalNixIOStoreDir
+  st <- newEvalState storeDir baseDir
+  evalNixIOIn st baseDir source
+
 -- | 'evalNixIO' keeping a failure whole, its lines of context included.
 evalNixIOTraced :: FilePath -> Text -> IO (Either EvalFailure NixValue)
 evalNixIOTraced baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (EvalFailure [] (T.pack (show err))))
   Right parsed -> do
     storeDir <- evalNixIOStoreDir
-    st <- newEvalState storeDir baseDir
+    st <- testEvalState storeDir baseDir
     runEvalIOTraced st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
 
 -- | 'evalNixIO' as @nova-nix eval --strict@ evaluates: the result, once
@@ -4144,7 +4214,7 @@ evalStrictIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 so
   Left err -> pure (Left (T.pack (show err)))
   Right parsed -> do
     storeDir <- evalNixIOStoreDir
-    st <- newEvalState storeDir baseDir
+    st <- testEvalState storeDir baseDir
     runEvalIO st $ do
       val <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       val <$ deepForce val
@@ -4158,7 +4228,7 @@ evalDerivationIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf
   Left err -> pure (Left (T.pack (show err)))
   Right parsed -> do
     storeDir <- evalNixIOStoreDir
-    st <- newEvalState storeDir baseDir
+    st <- testEvalState storeDir baseDir
     runEvalIO st $ do
       pathVal <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
       case pathVal of
@@ -5567,7 +5637,7 @@ testEnvironmentBytes = do
       rest <-
         sequence
           [ withEnvBytes "a lookup passes a NIX_PATH entry whose prefix has no UTF-8 reading" (TE.encodeUtf8 nixPathVarName) ("\xFC=/nonexistent:mypkg=" <> TE.encodeUtf8 (T.pack pkgDir)) $
-              assertEqual "lookup" (Right (VInt 42)) <$> evalNixIO testDir "import <mypkg>",
+              assertEqual "lookup" (Right (VInt 42)) <$> evalNixIOWithNixPath testDir "import <mypkg>",
             withEnvBytes "getEnv looks a name up by its bytes" nonUtf8EnvName "hello" $
               expectBytes "name" "hello" <$> evalNixIO testDir "builtins.getEnv (builtins.readFile ./name.bin)",
             unpairedSurrogateGetEnv testDir,
@@ -5580,7 +5650,7 @@ testEnvironmentBytes = do
         expectBytes "getEnv" bytes <$> evalNixIO dir ("builtins.getEnv \"" <> testEnvVarName <> "\"")
     nixPathCase dir (label, bytes) =
       withEnvBytes ("NIX_PATH carries " <> label <> " into prefix and path") (TE.encodeUtf8 nixPathVarName) (bytes <> "=/x" <> bytes) $
-        expectBytes "nixPath" (bytes <> "|/x" <> bytes) <$> evalNixIO dir "let e = builtins.head builtins.nixPath; in e.prefix + \"|\" + e.path"
+        expectBytes "nixPath" (bytes <> "|/x" <> bytes) <$> evalNixIOWithNixPath dir "let e = builtins.head builtins.nixPath; in e.prefix + \"|\" + e.path"
     expectBytes label expected = \case
       Right (VStr actual _) -> assertEqual label expected actual
       other -> Fail (label <> ": expected a string, got " <> T.pack (show other))
@@ -5809,7 +5879,7 @@ evalAtCeiling limit source = case parseNix "." testOrigin (TE.encodeUtf8 source)
   Left err -> pure (Left (T.pack (show err)))
   Right parsed -> do
     storeDir <- evalNixIOStoreDir
-    st0 <- newEvalState storeDir "."
+    st0 <- testEvalState storeDir "."
     let st = st0 {esCallDepth = topLevelCallDepth limit}
     runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
 
@@ -6610,22 +6680,24 @@ testDrvContext = do
           "builtins.hasContext (builtins.unsafeDiscardStringContext (derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).outPath)"
           (VBool False),
       -- getContext: plain string returns empty attrset
-      runTest "getContext on plain string" $
-        assertRight "getCtx-plain" (evalNix "builtins.getContext \"hello\"") $ \val ->
+      runTestM "getContext on plain string" $
+        assertRightM "getCtx-plain" (evalNix "builtins.getContext \"hello\"") $ \val ->
           case val of
-            VAttrs m -> if attrSetNull m then Pass else Fail "expected empty attrset"
-            _ -> Fail ("expected VAttrs, got " <> T.pack (show val)),
+            VAttrs m -> (\empty -> if empty then Pass else Fail "expected empty attrset") <$> attrSetNull m
+            _ -> pure (Fail ("expected VAttrs, got " <> T.pack (show val))),
       -- getContext: drv outPath has outputs entry
-      runTest "getContext on drv outPath"
-        $ assertRight
+      runTestM "getContext on drv outPath"
+        $ assertRightM
           "getCtx-drv"
           (evalNix "builtins.getContext (derivation { name = \"test\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).outPath")
         $ \val -> case val of
-          VAttrs m ->
-            if attrSetSize m == 1
-              then Pass
-              else Fail ("expected 1 entry, got " <> T.pack (show (attrSetSize m)))
-          _ -> Fail ("expected VAttrs, got " <> T.pack (show val)),
+          VAttrs m -> do
+            size <- attrSetSize m
+            pure $
+              if size == 1
+                then Pass
+                else Fail ("expected 1 entry, got " <> T.pack (show size))
+          _ -> pure (Fail ("expected VAttrs, got " <> T.pack (show val))),
       -- getContext: drvPath has allOutputs
       runTest "getContext on drvPath has allOutputs"
         $ assertRight
@@ -13531,9 +13603,9 @@ testFetchCache = do
       -- here can reach the network: the stub's createScratchDir throws, so
       -- a Right at all proves the fetch was skipped, and every field comes
       -- from the entry rather than from git.
-      runTest "a warm entry answers builtins.fetchGit without fetching" $
+      runTestM "a warm entry answers builtins.fetchGit without fetching" $
         case evalWarmFetchGit sampleFetchCache (Set.singleton (fcStorePath sampleFetchCache)) of
-          Left err -> Fail ("a warm cache still tried to fetch: " <> err)
+          Left err -> pure (Fail ("a warm cache still tried to fetch: " <> err))
           Right val ->
             assertEqual
               "fields"
@@ -13542,7 +13614,7 @@ testFetchCache = do
                 ("revCount", VInt 1234),
                 ("narHash", mkStr ("sha256-" <> fcNarHash sampleFetchCache))
               ]
-              (fetchGitFields val ["outPath", "rev", "revCount", "narHash"]),
+              <$> fetchGitFields val ["outPath", "rev", "revCount", "narHash"],
       -- The guard on the hit, on the axis that matters.  doesPathExist is
       -- False throughout the stub and adoptStorePath is what decides, so a
       -- hit that consulted mere existence would fail this and a hit that
@@ -13608,16 +13680,17 @@ evalWarmFetchGit fields adoptable =
     (warmEnv fields adoptable)
     ("builtins.fetchGit { url = \"https://example.com/r\"; rev = \"" <> warmFetchGitRev <> "\"; }")
 
--- | Read the named attributes off a @fetchGit@ result, in the order asked.
-fetchGitFields :: NixValue -> [Text] -> [(Text, NixValue)]
+-- | Read the named attributes off a @fetchGit@ result, in the order asked:
+-- those present and computed.
+fetchGitFields :: NixValue -> [Text] -> IO [(Text, NixValue)]
 fetchGitFields val names = case val of
-  VAttrs attrs ->
-    [ (name, value)
-    | name <- names,
-      Just thunk <- [attrSetLookup name attrs],
-      Just value <- [readThunkValue thunk]
-    ]
-  _ -> []
+  VAttrs attrs -> catMaybes <$> mapM (computedField attrs) names
+  _ -> pure []
+  where
+    computedField attrs name =
+      attrSetLookup name attrs >>= \case
+        Just thunk -> fmap (name,) <$> readThunkValue thunk
+        Nothing -> pure Nothing
 
 -- | One recorded fetch, with a real 44-character base64 sha256.
 sampleFetchCache :: FetchCache
@@ -14901,11 +14974,12 @@ testStage0Pe32Chain = do
   putStrLn "pkgs/stage0-pe32"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
+  fresh <- testEvalState storeDir cwd
   -- The package set's fetchurl hands a single URL to <nix/fetchurl.nix>,
   -- which resolves against the checkout's data directory as the installed
   -- binary resolves it against its own.
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       chain = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ").stage0-pe32"
       runCommandTests = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "run-command.nix")
       quoted name = "\"" <> name <> "\""
@@ -15217,8 +15291,9 @@ testMesWindows = do
   putStrLn "pkgs/mes"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mes.nix")
       quoted name = "\"" <> name <> "\""
@@ -15368,8 +15443,9 @@ testTinyccWindows = do
   putStrLn "pkgs/tinycc"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "tinycc.nix")
       quoted name = "\"" <> name <> "\""
@@ -15640,8 +15716,9 @@ testGnumakeWindows = do
   putStrLn "pkgs/gnumake"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gnumake.nix")
       source =
@@ -15742,8 +15819,9 @@ testBusyboxWindows = do
   putStrLn "pkgs/busybox-w32"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "busybox.nix")
       source =
@@ -15865,8 +15943,9 @@ testChecksForbidSubstitutes = do
   putStrLn "pkgs/checks"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       fileOf name = nixQuotedPath (cwd </> "test" </> "data" </> T.unpack name)
       source =
         T.concat
@@ -15907,8 +15986,9 @@ testSeedStdenvWindows = do
   putStrLn "pkgs/seed-stdenv"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "seed-stdenv.nix")
       source =
@@ -16031,8 +16111,9 @@ testBinutilsWindows = do
   putStrLn "pkgs/binutils"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils.nix")
       source =
@@ -16147,8 +16228,9 @@ testGccCoreWindows = do
   putStrLn "pkgs/gcc-core"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-core.nix")
       source =
@@ -16313,8 +16395,9 @@ testGcc46Windows = do
   putStrLn "pkgs/gcc46"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46.nix")
       source =
@@ -16453,8 +16536,9 @@ testGcc46CxxWindows = do
   putStrLn "pkgs/gcc46-cxx"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46-cxx.nix")
       source =
@@ -16631,8 +16715,9 @@ testGcc10Windows = do
   putStrLn "pkgs/gcc10"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc10.nix")
       source =
@@ -16821,8 +16906,9 @@ testMingwW64LatestWindows = do
   putStrLn "pkgs/mingw-w64-latest"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mingw-w64-latest.nix")
       source =
@@ -16966,8 +17052,9 @@ testGccLatestWindows = do
   putStrLn "pkgs/gcc-latest"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-latest.nix")
       source =
@@ -17153,8 +17240,9 @@ testWindowsSources = do
   putStrLn "pkgs/sources"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = cwd </> "pkgs" </> "windows"
       source =
         T.concat
@@ -17287,9 +17375,10 @@ testWindowsRungs = do
   putStrLn "pkgs/rungs"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
+  fresh <- testEvalState storeDir cwd
   workflow <- try (BS.readFile ciWorkflowPath)
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = cwd </> "pkgs" </> "windows"
       source =
         T.concat
@@ -17500,11 +17589,15 @@ makeGitFixture dir files = do
 -- | 'evalNixIO' against an explicit store directory, for expressions
 -- whose evaluation writes store objects.
 evalNixIOStore :: StoreDir -> FilePath -> Text -> IO (Either Text NixValue)
-evalNixIOStore storeDir baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
+evalNixIOStore storeDir baseDir source = do
+  st <- testEvalState storeDir baseDir
+  evalNixIOIn st baseDir source
+
+-- | Evaluate the source under the IO evaluator in the given state.
+evalNixIOIn :: EvalState -> FilePath -> Text -> IO (Either Text NixValue)
+evalNixIOIn st baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (T.pack (show err)))
-  Right parsed -> do
-    st <- newEvalState storeDir baseDir
-    runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
+  Right parsed -> runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
 
 testFetchGitShallow :: IO [Bool]
 testFetchGitShallow = do
@@ -17533,17 +17626,17 @@ testFetchGitShallow = do
         runTestM "a shallow fetch reports revCount 0 for the same tree" $ do
           fullOutcome <- evalFetch ""
           shallowOutcome <- evalFetch "shallow = true; "
-          pure $ case (fullOutcome, shallowOutcome) of
-            (Left err, _) -> Fail ("full fetch failed: " <> err)
-            (_, Left err) -> Fail ("shallow fetch failed: " <> err)
-            (Right fullVal, Right shallowVal) ->
-              let fullFields = fetchGitFields fullVal ["revCount", "narHash", "outPath"]
-                  shallowFields = fetchGitFields shallowVal ["revCount", "narHash", "outPath"]
-               in case (fullFields, shallowFields) of
-                    ([("revCount", VInt 3), ("narHash", fullHash), ("outPath", fullPath)], [("revCount", VInt 0), ("narHash", shallowHash), ("outPath", shallowPath)])
-                      | fullHash == shallowHash && fullPath == shallowPath -> Pass
-                      | otherwise -> Fail "shallow and full fetches disagree about the tree"
-                    _ -> Fail (T.pack (show (fullFields, shallowFields))),
+          case (fullOutcome, shallowOutcome) of
+            (Left err, _) -> pure (Fail ("full fetch failed: " <> err))
+            (_, Left err) -> pure (Fail ("shallow fetch failed: " <> err))
+            (Right fullVal, Right shallowVal) -> do
+              fullFields <- fetchGitFields fullVal ["revCount", "narHash", "outPath"]
+              shallowFields <- fetchGitFields shallowVal ["revCount", "narHash", "outPath"]
+              pure $ case (fullFields, shallowFields) of
+                ([("revCount", VInt 3), ("narHash", fullHash), ("outPath", fullPath)], [("revCount", VInt 0), ("narHash", shallowHash), ("outPath", shallowPath)])
+                  | fullHash == shallowHash && fullPath == shallowPath -> Pass
+                  | otherwise -> Fail "shallow and full fetches disagree about the tree"
+                _ -> Fail (T.pack (show (fullFields, shallowFields))),
         -- The rev itself is the refspec, so a depth-1 fetch of a rev
         -- that is not the branch tip still lands on exactly that rev.
         runTestM "a shallow fetch of a pinned rev checks out that rev" $ case shas of
@@ -17551,17 +17644,18 @@ testFetchGitShallow = do
             outcome <- evalFetch ("shallow = true; rev = \"" <> firstSha <> "\"; ")
             case outcome of
               Left err -> pure (Fail err)
-              Right val -> case fetchGitFields val ["rev", "revCount", "outPath"] of
-                [("rev", revVal), ("revCount", VInt 0), ("outPath", VPath outText)]
-                  | revVal == mkStr firstSha -> do
-                      let outDir = storeTextToFilePath (StoreDir tmpStore) outText
-                      firstThere <- Dir.doesFileExist (outDir </> "first.txt")
-                      thirdThere <- Dir.doesFileExist (outDir </> "third.txt")
-                      pure $
-                        if firstThere && not thirdThere
-                          then Pass
-                          else Fail "outPath does not hold the pinned rev's tree"
-                fields -> pure (Fail (T.pack (show fields)))
+              Right val ->
+                fetchGitFields val ["rev", "revCount", "outPath"] >>= \case
+                  [("rev", revVal), ("revCount", VInt 0), ("outPath", VPath outText)]
+                    | revVal == mkStr firstSha -> do
+                        let outDir = storeTextToFilePath (StoreDir tmpStore) outText
+                        firstThere <- Dir.doesFileExist (outDir </> "first.txt")
+                        thirdThere <- Dir.doesFileExist (outDir </> "third.txt")
+                        pure $
+                          if firstThere && not thirdThere
+                            then Pass
+                            else Fail "outPath does not hold the pinned rev's tree"
+                  fields -> pure (Fail (T.pack (show fields)))
           [] -> pure (Fail "fixture returned no commits"),
         -- Pinned and unpinned differ in where counting starts: from the
         -- rev, the root commit counts 1 (upstream 2.33.2 agrees), not
@@ -17569,12 +17663,13 @@ testFetchGitShallow = do
         runTestM "a pinned rev fetch counts from the rev" $ case shas of
           (firstSha : _) -> do
             outcome <- evalFetch ("rev = \"" <> firstSha <> "\"; ")
-            pure $ case outcome of
-              Left err -> Fail err
-              Right val -> case fetchGitFields val ["rev", "revCount"] of
-                [("rev", revVal), ("revCount", VInt 1)]
-                  | revVal == mkStr firstSha -> Pass
-                fields -> Fail (T.pack (show fields))
+            case outcome of
+              Left err -> pure (Fail err)
+              Right val ->
+                fetchGitFields val ["rev", "revCount"] >>= \case
+                  [("rev", revVal), ("revCount", VInt 1)]
+                    | revVal == mkStr firstSha -> pure Pass
+                  fields -> pure (Fail (T.pack (show fields)))
           [] -> pure (Fail "fixture returned no commits")
       ]
   maybe (unsetEnv "XDG_CACHE_HOME") (setEnv "XDG_CACHE_HOME") savedCacheHome
@@ -17633,14 +17728,15 @@ testFetchGitPins = do
             first <- fetchWith ("rev = \"" <> sha <> "\"; ")
             case first of
               Left err -> pure (Fail err)
-              Right val -> case fetchGitFields val ["narHash"] of
-                [("narHash", VStr hashBytes _)] -> do
-                  let hash = TE.decodeUtf8Lenient hashBytes
-                  second <- fetchWith ("rev = \"" <> sha <> "\"; narHash = \"" <> hash <> "\"; ")
-                  pure $ case second of
-                    Right _ -> Pass
-                    Left err -> Fail ("a correct pin was refused: " <> err)
-                other -> pure (Fail (T.pack (show other)))
+              Right val ->
+                fetchGitFields val ["narHash"] >>= \case
+                  [("narHash", VStr hashBytes _)] -> do
+                    let hash = TE.decodeUtf8Lenient hashBytes
+                    second <- fetchWith ("rev = \"" <> sha <> "\"; narHash = \"" <> hash <> "\"; ")
+                    pure $ case second of
+                      Right _ -> Pass
+                      Left err -> Fail ("a correct pin was refused: " <> err)
+                  other -> pure (Fail (T.pack (show other)))
           [] -> pure (Fail "fixture returned no commits"),
         -- A remembered tree on disk with other metadata, as a writer that
         -- left it owner-writable with the time it wrote it would, is made
@@ -17650,22 +17746,23 @@ testFetchGitPins = do
             first <- fetchWith ("rev = \"" <> sha <> "\"; ")
             case first of
               Left err -> pure (Fail err)
-              Right val -> case fetchGitFields val ["outPath"] of
-                [("outPath", VPath outPath)] | Just sp <- parseStorePath defaultStoreDir outPath -> do
-                  let dest = storePathToFilePath (StoreDir tmpStore) sp
-                      file = dest </> "a.txt"
-                  now <- Clock.getCurrentTime
-                  traverse_
-                    (\node -> Dir.getPermissions node >>= Dir.setPermissions node . Dir.setOwnerWritable True >> Dir.setModificationTime node now)
-                    [file, dest]
-                  aged <- traverse nodeStatus [dest, file]
-                  second <- fetchWith ("rev = \"" <> sha <> "\"; ")
-                  results <- traverse (uncurry canonicalAs) [(executablePermissions, dest), (readOnlyPermissions, file)]
-                  pure $
-                    assertEqual "aged" True (all (maybe True (\st -> nsPermissions st `elem` [0o755, 0o644] && nsModificationTime st /= storeModificationTime)) aged)
-                      `andThen` either (Fail . ("the cache hit failed: " <>)) (const Pass) second
-                      `andThen` foldr andThen Pass results
-                other -> pure (Fail (T.pack (show other)))
+              Right val ->
+                fetchGitFields val ["outPath"] >>= \case
+                  [("outPath", VPath outPath)] | Just sp <- parseStorePath defaultStoreDir outPath -> do
+                    let dest = storePathToFilePath (StoreDir tmpStore) sp
+                        file = dest </> "a.txt"
+                    now <- Clock.getCurrentTime
+                    traverse_
+                      (\node -> Dir.getPermissions node >>= Dir.setPermissions node . Dir.setOwnerWritable True >> Dir.setModificationTime node now)
+                      [file, dest]
+                    aged <- traverse nodeStatus [dest, file]
+                    second <- fetchWith ("rev = \"" <> sha <> "\"; ")
+                    results <- traverse (uncurry canonicalAs) [(executablePermissions, dest), (readOnlyPermissions, file)]
+                    pure $
+                      assertEqual "aged" True (all (maybe True (\st -> nsPermissions st `elem` [0o755, 0o644] && nsModificationTime st /= storeModificationTime)) aged)
+                        `andThen` either (Fail . ("the cache hit failed: " <>)) (const Pass) second
+                        `andThen` foldr andThen Pass results
+                  other -> pure (Fail (T.pack (show other)))
           [] -> pure (Fail "fixture returned no commits"),
         -- A declared narHash is read as Input::getNarHash reads it and
         -- the hashes compared (fetchers.cc:214-222, :324-333 at 2.24.9),
@@ -17697,11 +17794,12 @@ testFetchGitPins = do
           [] -> pure (Fail "fixture returned no commits"),
         runTestM "allRefs finds a rev on an unfetched branch" $ do
           outcome <- fetchWith ("rev = \"" <> sideSha <> "\"; allRefs = true; ")
-          pure $ case outcome of
-            Left err -> Fail err
-            Right val -> case fetchGitFields val ["rev"] of
-              [("rev", revVal)] | revVal == mkStr sideSha -> Pass
-              other -> Fail (T.pack (show other)),
+          case outcome of
+            Left err -> pure (Fail err)
+            Right val ->
+              fetchGitFields val ["rev"] >>= \case
+                [("rev", revVal)] | revVal == mkStr sideSha -> pure Pass
+                other -> pure (Fail (T.pack (show other))),
         runTestM "a failing fetch leaves no scratch clone behind" $ do
           before <- filter ("nova-nix-fetchgit-" `T.isPrefixOf`) . map T.pack <$> Dir.listDirectory tmpBase
           outcome <- evalHere ("builtins.fetchGit { url = \"" <> urlText <> "-no-such-repo\"; }")
@@ -17909,7 +18007,7 @@ testOutPathCoercion = do
 testScratchDirs :: IO [Bool]
 testScratchDirs = do
   putStrLn "eval/scratch-dirs"
-  st <- newEvalState platformStoreDir "."
+  st <- testEvalState platformStoreDir "."
   sequence
     [ runTestM "scratch dirs are distinct, real, and removable" $ do
         createdA <- runEvalIO st (createScratchDir "nova-nix-test-scratch-")
@@ -20754,19 +20852,22 @@ evalAndBuild storeDir source = do
       -- The SAME store the build below is given.  Evaluating against the
       -- platform default while building elsewhere is what let a store dir
       -- honored on writes but not on reads pass the whole suite.
-      st <- newEvalState storeDir "."
+      st <- testEvalState storeDir "."
       evalResult <- runEvalIO st $ do
         val <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
         -- What the CLI driver does: force drvPath, which runs
         -- derivationStrict (so a missing required attr surfaces as an eval
         -- error) and records the .drv the build reads back by that path.
-        case val of
-          VAttrs attrs | Just thunk <- attrSetLookup "drvPath" attrs -> do
+        drvPathThunk <- case val of
+          VAttrs attrs -> attrSetLookup "drvPath" attrs
+          _ -> pure Nothing
+        case drvPathThunk of
+          Just thunk -> do
             pathVal <- force thunk
             case pathVal of
               VStr pathBytes _ -> lookupSessionDrv (bytesText pathBytes)
               _ -> pure Nothing
-          _ -> pure Nothing
+          Nothing -> pure Nothing
       case evalResult of
         Left err -> pure (Left ("eval error: " <> err))
         Right Nothing -> pure (Left "result is not a derivation")
@@ -22107,8 +22208,9 @@ testTrustWindowsGraphs = do
   putStrLn "trust/pkgs-windows"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- newEvalState storeDir cwd
-  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+  fresh <- testEvalState storeDir cwd
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  let st = fresh {esSearchPaths = searchPaths}
       windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       source = "builtins.concatStringsSep \" \" [ " <> windows <> ".stage0-pe32.kaem-unwrapped.drvPath " <> windows <> ".hello.drvPath ]"
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
@@ -22440,26 +22542,22 @@ testPhase4 = do
   putStrLn "phase4/search-paths"
   sequence
     [ -- parseNixPath tests
-      runTest "parseNixPath empty" $
-        assertEqual "empty" [] (parseNixPath ""),
-      runTest "parseNixPath single" $
-        let result = parseNixPath "nixpkgs=/home/user/nixpkgs"
-         in case result of
-              [thunk] | Just (VAttrs m) <- readThunkValue thunk ->
-                case (attrSetLookup "prefix" m >>= readThunkValue, attrSetLookup "path" m >>= readThunkValue) of
-                  (Just (VStr "nixpkgs" _), Just (VStr "/home/user/nixpkgs" _)) -> Pass
-                  _ -> Fail "wrong prefix/path"
-              _ -> Fail ("expected one entry, got " <> T.pack (show (length result))),
-      runTest "parseNixPath multiple" $
-        assertEqual "count" 2 (length (parseNixPath "nixpkgs=/nix:custom=/opt")),
-      runTest "parseNixPath channel entry" $
-        let result = parseNixPath "nixpkgs=channel:nixos-24.11"
-         in case result of
-              [thunk] | Just (VAttrs m) <- readThunkValue thunk ->
-                case (attrSetLookup "prefix" m >>= readThunkValue, attrSetLookup "path" m >>= readThunkValue) of
-                  (Just (VStr "nixpkgs" _), Just (VStr "channel:nixos-24.11" _)) -> Pass
-                  _ -> Fail "wrong prefix/path for channel"
-              _ -> Fail ("expected one entry, got " <> T.pack (show (length result))),
+      runTestM "parseNixPath empty" $
+        assertEqual "empty" [] <$> parseNixPath "",
+      runTestM "parseNixPath single" $ do
+        entries <- searchPathEntries "nixpkgs=/home/user/nixpkgs"
+        pure $ case entries of
+          [(Just (VStr "nixpkgs" _), Just (VStr "/home/user/nixpkgs" _))] -> Pass
+          [_] -> Fail "wrong prefix/path"
+          _ -> Fail ("expected one entry, got " <> T.pack (show (length entries))),
+      runTestM "parseNixPath multiple" $
+        assertEqual "count" 2 . length <$> parseNixPath "nixpkgs=/nix:custom=/opt",
+      runTestM "parseNixPath channel entry" $ do
+        entries <- searchPathEntries "nixpkgs=channel:nixos-24.11"
+        pure $ case entries of
+          [(Just (VStr "nixpkgs" _), Just (VStr "channel:nixos-24.11" _))] -> Pass
+          [_] -> Fail "wrong prefix/path for channel"
+          _ -> Fail ("expected one entry, got " <> T.pack (show (length entries))),
       runTest "splitNixPath drive letters and separators" $
         assertEqual
           "split"
@@ -22524,14 +22622,12 @@ testPhase4 = do
           Just True -> Pass
           Just False -> Fail "wrong split for a long entry"
           Nothing -> Fail "split did not return promptly",
-      runTest "parseNixPath plain path" $
-        let result = parseNixPath "/some/path"
-         in case result of
-              [thunk] | Just (VAttrs m) <- readThunkValue thunk ->
-                case (attrSetLookup "prefix" m >>= readThunkValue, attrSetLookup "path" m >>= readThunkValue) of
-                  (Just (VStr "" _), Just (VStr "/some/path" _)) -> Pass
-                  _ -> Fail "wrong prefix/path for plain"
-              _ -> Fail "expected one entry",
+      runTestM "parseNixPath plain path" $ do
+        entries <- searchPathEntries "/some/path"
+        pure $ case entries of
+          [(Just (VStr "" _), Just (VStr "/some/path" _))] -> Pass
+          [_] -> Fail "wrong prefix/path for plain"
+          _ -> Fail "expected one entry",
       -- ESearchPath desugars to __findFile __nixPath "name" during resolution
       runTest "parse <nixpkgs>" $
         assertParse "search path" "<nixpkgs>" (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "nixpkgs"])),
@@ -22595,9 +22691,9 @@ testPhase4IO = do
             Left err -> Fail ("eval error: " <> err),
         -- Search path with --nix-path equivalent (populated nixPath)
         runTestM "search path with populated nixPath" $ do
-          st <- newEvalState platformStoreDir testDir
-          let nixPaths = parseNixPath (TE.encodeUtf8 ("mypkg=" <> T.pack subDir))
-              env = builtinEnv unrestrictedPolicy (esTimestamp st) nixPaths
+          st <- testEvalState platformStoreDir testDir
+          nixPaths <- parseNixPath (TE.encodeUtf8 ("mypkg=" <> T.pack subDir))
+          env <- builtinEnv unrestrictedPolicy (esTimestamp st) nixPaths
           result <- runEvalIO st (eval env (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
           pure $ case result of
             Right (VPath _) -> Pass
@@ -22675,18 +22771,21 @@ servedLine = "served without an exception"
 -- | The paths a library user reaches the C layer by.  The first C call
 -- of each of the first four lands in a different sub-arena, and the
 -- fifth runs a full init .. destroy cycle first, so both ends of the
--- window are covered.  The last two read the shared @null@, @true@ and
+-- window are covered.  The next two read the shared @null@, @true@ and
 -- @false@ thunks, which must be valid in every window: were they arena
 -- cells behind a process-lifetime CAF, forcing one outside the window
 -- would poison it with 'ArenaNotInitialized' for every later arena, and
 -- forcing one inside an arena would leave it pointing into memory the
--- next 'arenaDestroy' frees, a use-after-free the ASan job reports.
+-- next 'arenaDestroy' frees, a use-after-free the ASan job reports.  The
+-- last evaluates an empty string before anything else in a fresh arena:
+-- its payload of no words sits at data offset 0, which the store does
+-- not hold yet, so a read there fails the store's bounds assertion.
 arenaGuardPaths :: [ArenaGuardPath]
 arenaGuardPaths =
   [ noArena "compile" "nn_bc_emit" evalNamelessProgram,
-    noArena "thunk" "nn_thunk_new_computed_int" (void (evaluate (unThunk (evaluated (VInt 1))))),
-    noArena "symbol" "nn_symbol_intern" (void (evaluate (unThunk (evaluated (mkStr "a"))))),
-    noArena "env" "nn_env_alloc_slots" (void (evaluate (fst (buildCSlots EnvApply [evaluated (VInt 1)])))),
+    noArena "thunk" "nn_thunk_new_computed_int" (void (evaluated (VInt 1))),
+    noArena "symbol" "nn_symbol_intern" (void (evaluated (mkStr "a"))),
+    noArena "env" "nn_env_alloc_slots" (void (evaluated VNull >>= \nullCell -> buildCSlots EnvApply [nullCell])),
     noArena "after-destroy" "nn_bc_emit" (bracket_ arenaInit arenaDestroy (pure ()) >> evalNamelessProgram),
     ArenaGuardPath
       { guardName = "constants-outside-window",
@@ -22699,6 +22798,14 @@ arenaGuardPaths =
         guardClaim = "the null, true and false thunks read correctly across two init .. destroy cycles",
         guardOutcome = Served,
         guardAction = bracket_ arenaInit arenaDestroy readConstants >> bracket_ arenaInit arenaDestroy readConstants
+      },
+    ArenaGuardPath
+      { guardName = "empty-string-first",
+        guardClaim = "an empty string evaluated first in a fresh arena reads no data word",
+        guardOutcome = Served,
+        guardAction = bracket_ arenaInit arenaDestroy $ case runPureEval (eval emptyEnv (EStr [])) of
+          Right (VStr bytes _) | BS.null bytes -> pure ()
+          other -> throwIO (ErrorCall ("the empty string evaluated to " ++ show other))
       }
   ]
   where
@@ -22713,7 +22820,7 @@ arenaGuardPaths =
     -- then read nothing.  A wrong cell is a broken outcome rather than the
     -- guard under test, so it leaves the child by another exception.
     readConstants = do
-      found <- mapM (readCell . unThunk . evaluated) [VNull, VBool True, VBool False]
+      found <- mapM (evaluated >=> readCell . unThunk) [VNull, VBool True, VBool False]
       unless (found == [(ThunkComputed, ValueNull, 0), (ThunkComputed, ValueBool, 1), (ThunkComputed, ValueBool, 0)]) $
         throwIO (ErrorCall ("the constants read back as " ++ show found))
     readCell ptr = (,,) <$> cthunkState ptr <*> cthunkValueTag ptr <*> cthunkGetBool ptr
@@ -23457,7 +23564,7 @@ testArenaGuard = do
       arenaGuardPaths
   live <-
     sequence
-      [ liveRefusal "a slot array past UINT32_MAX bytes" "nn_env_alloc_slots" (void (evaluate (fst (tieFrame EnvLet slotCountPastUInt32 (\_ _ -> emptyEnv) (const []))))),
+      [ liveRefusal "a slot array past UINT32_MAX bytes" "nn_env_alloc_slots" (void (tieFrame EnvLet slotCountPastUInt32 (\_ _ -> pure emptyEnv) (const (pure [])))),
         -- The list's items come from the same slot allocator, so the same
         -- count is refused there and must surface as a list failure, where
         -- a NULL return would read as the empty list.
@@ -23832,8 +23939,8 @@ testCThunk = do
         let cells = [cthunkNull, cthunkBool True, cthunkBool False]
         marked <- mapM cthunkMarkBlackhole cells
         stored <- mapM (`cthunkSetComputed` nullPtr) cells
-        let values = map (readThunkValue . Thunk) cells
-            expected = map Just [VNull, VBool True, VBool False]
+        values <- mapM (readThunkValue . Thunk) cells
+        let expected = map Just [VNull, VBool True, VBool False]
         pure
           ( if not (or (marked ++ stored)) && values == expected
               then Pass
@@ -23901,8 +24008,9 @@ data StubErr = StubThrow !Text | StubOther !Text
 -- everything else behaves like 'PureEval'.  Exercises the
 -- input-derivation-modulo STORE-READ arm hermetically - the real arm
 -- reads the platform store, which dev machines and CI runners must not
--- depend on (the build matrix has no writable @/nix/store@).
-newtype StubStoreEval a = StubStoreEval (StubEnv -> Either StubErr a)
+-- depend on (the build matrix has no writable @/nix/store@).  Like
+-- 'PureEval', its one effect is the C data layer.
+newtype StubStoreEval a = StubStoreEval (StubEnv -> CData (Either StubErr a))
 
 -- | What the stubbed store answers from.
 data StubEnv = StubEnv
@@ -23924,36 +24032,52 @@ data StubEnv = StubEnv
 stubEnv :: Map.Map Text Derivation -> StubEnv
 stubEnv drvs = StubEnv {seDrvs = drvs, seFetchCache = Map.empty, seAdoptable = Set.empty, seStoreDir = defaultStoreDir}
 
+-- | Run a stub evaluation as a value, as 'runPureEval' runs a pure one.
 runStubStoreEvalWith :: StubEnv -> StubStoreEval a -> Either Text a
-runStubStoreEvalWith env (StubStoreEval action) = case action env of
+runStubStoreEvalWith env (StubStoreEval action) = case runCDataPure (action env) of
   Left (StubThrow msg) -> Left msg
   Left (StubOther msg) -> Left msg
   Right val -> Right val
 
+-- | An answer read off the stub store.
+stubAnswer :: (StubEnv -> a) -> StubStoreEval a
+stubAnswer answer = StubStoreEval (pure . Right . answer)
+
+-- | A failed stub evaluation.
+stubFailure :: StubErr -> StubStoreEval a
+stubFailure failure = StubStoreEval (const (pure (Left failure)))
+
 instance Functor StubStoreEval where
-  fmap f (StubStoreEval g) = StubStoreEval (fmap f . g)
+  fmap f (StubStoreEval g) = StubStoreEval (fmap (fmap f) . g)
 
 instance Applicative StubStoreEval where
-  pure val = StubStoreEval (const (Right val))
-  StubStoreEval mf <*> StubStoreEval ma = StubStoreEval $ \env -> mf env <*> ma env
+  pure val = stubAnswer (const val)
+  StubStoreEval mf <*> StubStoreEval ma = StubStoreEval $ \env ->
+    mf env >>= either (pure . Left) (\f -> fmap f <$> ma env)
 
 instance Monad StubStoreEval where
-  StubStoreEval ma >>= f = StubStoreEval $ \env -> case ma env of
-    Left err -> Left err
-    Right val -> let StubStoreEval mb = f val in mb env
+  StubStoreEval ma >>= f = StubStoreEval $ \env ->
+    ma env >>= \case
+      Left err -> pure (Left err)
+      Right val -> let StubStoreEval mb = f val in mb env
+
+instance MonadCData StubStoreEval where
+  liftCData act = StubStoreEval (const (Right <$> act))
 
 instance MonadEval StubStoreEval where
-  throwEvalError msg = StubStoreEval (const (Left (StubOther msg)))
-  throwCatchableError msg = StubStoreEval (const (Left (StubThrow msg)))
-  abortEvaluation msg = StubStoreEval (const (Left (StubOther msg)))
-  catchEvalError (StubStoreEval action) = StubStoreEval $ \env -> case action env of
-    Left (StubThrow msg) -> Right (Left msg)
-    Left other -> Left other
-    Right val -> Right (Right val)
+  throwEvalError msg = stubFailure (StubOther msg)
+  throwCatchableError msg = stubFailure (StubThrow msg)
+  abortEvaluation msg = stubFailure (StubOther msg)
+  catchEvalError (StubStoreEval action) = StubStoreEval (fmap caught . action)
+    where
+      caught (Left (StubThrow msg)) = Right (Left msg)
+      caught (Left other) = Left other
+      caught (Right val) = Right (Right val)
   onEvalError (StubStoreEval action) _ = StubStoreEval action
-  addErrorTrace (StubStoreEval line) (StubStoreEval action) = StubStoreEval $ \env -> case action env of
-    Left failure -> line env >> Left failure
-    Right val -> Right val
+  addErrorTrace (StubStoreEval line) (StubStoreEval action) = StubStoreEval $ \env ->
+    action env >>= \case
+      Left failure -> (>> Left failure) <$> line env
+      Right val -> pure (Right val)
 
   -- The stub keeps no call depth: it exists to answer store questions,
   -- and the ceiling is tested on the evaluators that enforce it.
@@ -23973,8 +24097,8 @@ instance MonadEval StubStoreEval where
   copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
   narHashOfPath _ = throwEvalError "builtins.fetchGit: not available in the stub evaluator"
   setExecutableFile _ = throwEvalError "builtins.fetchGit: not available in the stub evaluator"
-  lookupFetchCache key = StubStoreEval $ \env -> Right (Map.lookup key (seFetchCache env))
-  adoptStorePath path = StubStoreEval $ \env -> Right (Set.member path (seAdoptable env))
+  lookupFetchCache key = stubAnswer (Map.lookup key . seFetchCache)
+  adoptStorePath path = stubAnswer (Set.member path . seAdoptable)
   writeFetchCache _ _ = pure ()
   isExecutableFile _ = throwEvalError "builtins.path: not available in the stub evaluator"
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in the stub evaluator"
@@ -23985,23 +24109,19 @@ instance MonadEval StubStoreEval where
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()
   recordDrvAterm _ _ = pure ()
-  readStoreDerivation sp =
-    StubStoreEval $ \env -> Right (Map.lookup (storePathToText defaultStoreDir sp) (seDrvs env))
+  readStoreDerivation sp = stubAnswer (Map.lookup (storePathToText defaultStoreDir sp) . seDrvs)
   lookupSessionDrv _ = pure Nothing
   lookupSessionReferences _ = pure Nothing
   storeSourcePath = pure
   evalPolicy = pure unrestrictedPolicy
   checkUri _ = pure ()
-  qualifyPath path = StubStoreEval $ \env -> Right (qualifyPathText (seStoreDir env) path)
+  qualifyPath path = stubAnswer ((`qualifyPathText` path) . seStoreDir)
   resolvePathLiteral = pure . canonPath
-  forceThunk evalFn thunk@(Thunk ptr) = case readThunkValue thunk of
-    Just val -> pure val
-    Nothing -> case unsafePerformIO (cthunkState ptr) of
-      2 {- BLACKHOLE -} -> abortEvaluation "infinite recursion encountered"
-      _ {- PENDING -} ->
-        let bcIdx = unsafePerformIO (cthunkGetBcIdx ptr)
-            env = unsafePerformIO (pendingThunkEnv ptr)
-         in evalFn env bcIdx
+  forceThunk evalFn (Thunk ptr) =
+    cthunkState ptr >>= \case
+      ThunkComputed -> readComputed ptr
+      ThunkBlackhole -> abortEvaluation "infinite recursion encountered"
+      _ {- PENDING -} -> pendingCode ptr >>= uncurry evalFn
 
 -- | Parse and evaluate under the stubbed-store evaluator.
 evalNixStub :: Map.Map Text Derivation -> Text -> Either Text NixValue
@@ -24719,10 +24839,11 @@ childExpr idx = do
 
 -- | A recorded position read back in the test origin.  One that does not
 -- read back as text reads as line 0, which nothing generated has.
-srcPosBack :: PosIdx -> SrcPos
-srcPosBack idx = case lookupPos idx of
-  Just (PosInText line column) -> testPos line column
-  _ -> testPos 0 0
+srcPosBack :: PosIdx -> IO SrcPos
+srcPosBack idx =
+  lookupPos idx <&> \case
+    Just (PosInText line column) -> testPos line column
+    _ -> testPos 0 0
 
 -- | Decoded formals read back as the parser's formals they compile from.
 formalsBack :: EvalFormals -> IO Formals
@@ -24741,11 +24862,11 @@ formalsBack formals = case formals of
 -- inherited name's select is the compiler's own and has no counterpart.
 bindingBack :: BcBinding -> IO Binding
 bindingBack binding = case binding of
-  BcNamed pos key valIdx -> NamedBinding (srcPosBack pos) <$> keyBack key <*> childExpr valIdx
-  BcInherit pos sym valIdx -> Inherit (srcPosBack pos) (symbolText (Symbol sym)) <$> childExpr valIdx
+  BcNamed pos key valIdx -> NamedBinding <$> srcPosBack pos <*> keyBack key <*> childExpr valIdx
+  BcInherit pos sym valIdx -> Inherit <$> srcPosBack pos <*> pure (symbolText (Symbol sym)) <*> childExpr valIdx
   BcInheritFrom fromIdx names -> do
     from <- childExpr fromIdx
-    pure (InheritFrom from [InheritedName (srcPosBack pos) (symbolText (Symbol sym)) | BcInheritedName pos sym _ <- names])
+    InheritFrom from <$> sequence [(`InheritedName` symbolText (Symbol sym)) <$> srcPosBack pos | BcInheritedName pos sym _ <- names]
   where
     keyBack (BcStaticKey sym) = pure (StaticKey (symbolText (Symbol sym)))
     keyBack (BcDynamicKey idx) = DynamicKey <$> childExpr idx
@@ -25391,11 +25512,12 @@ testBytecodeCompile = do
               BcNamed pos _ _ -> [pos]
               BcInherit pos _ _ -> [pos]
               BcInheritFrom _ names -> [pos | BcInheritedName pos _ _ <- names]
+        readBack <- traverse (mapM lookupPos . concatMap positionsOf) bindings
         pure $
           assertEqual
             "positions read back"
             (Right (map Just [PosInFile "/positions/set.nix" 2 3, PosInFile "/positions/set.nix" 3 11, PosInFile "/positions/set.nix" 4 22]))
-            (map lookupPos . concatMap positionsOf <$> bindings),
+            readBack,
       -- Recording a position and reading it back keeps its file, line and
       -- column, text with no file reads back as such, and a line or
       -- column past 32 bits is unrecordable, as it is in upstream's table.
@@ -25417,7 +25539,7 @@ testBytecodeCompile = do
                   SourceText _ -> PosInText line column
             property =
               QC.forAll (SrcPos <$> genOrigin <*> genCoordinate <*> genCoordinate) $ \pos ->
-                QC.ioProperty ((\idx -> lookupPos idx QC.=== expected pos) <$> recordPos recorder pos)
+                QC.ioProperty (recordPos recorder pos >>= lookupPos <&> (QC.=== expected pos))
         result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       runTestM "compile ELambda (FormalSet)" $ do
@@ -26137,13 +26259,41 @@ testStaticGlobalsSync = do
           [ name
           | name <- Set.toList upstreamBaseEnvNames,
             evalNix ("builtins.seq " <> name <> " true") /= Right (VBool True)
-          ]
+          ],
+      -- A program's names are interned before the strings its root
+      -- environment binds, which upstream never interns, so they keep the
+      -- order the program gives them.  The derivation wrapper, made with
+      -- the root environment, interns the names only it brings before the
+      -- currentSystem string, so a set built at run time holds such a
+      -- name first.  Each runs in a process of its own, whose symbol table
+      -- nothing else has filled.
+      emits
+        "a program's names are interned before the strings its root environment binds"
+        ("({ }: null) { a = 1; \"" <> currentSystemStr <> "\" = 2; }")
+        ["error: function 'anonymous lambda' called with unexpected argument 'a'"],
+      emits
+        "the derivation wrapper's names are interned before the currentSystem string"
+        "({ }: null) (builtins.listToAttrs [ { name = builtins.currentSystem; value = 1; } { name = \"ent\" + \"ry\"; value = 2; } ])"
+        ["error: function 'anonymous lambda' called with unexpected argument 'entry'"],
+      -- Upstream's base environment holds one value per primop, which
+      -- every file reads, so sets copied out of builtins in two files hold
+      -- the same values, and == takes each pair as equal without
+      -- comparing the functions.
+      runTestM "a builtin read in an imported file is the same value as in the importer" $ do
+        tmpBase <- getTemporaryDirectory
+        let dir = tmpBase </> "nova-nix-test-builtin-cells"
+        bracket_
+          (createDirectoryIfMissing True dir >> TIO.writeFile (dir </> "b.nix") "builtins")
+          (removeDirectoryRecursive dir)
+          $ do
+            result <- evalNixIO dir "builtins.intersectAttrs { map = 1; } builtins == builtins.intersectAttrs { map = 1; } (import ./b.nix)"
+            pure (assertRight "builtin-cells" result (assertEqual "builtin-cells" (VBool True)))
     ]
   where
-    rootEnvNames policy = case builtinEnv policy 0 [] of
-      Env envPtr -> do
-        scopePtr <- cenvLazyScope envPtr
-        pure (Set.fromList (attrSetKeys (AttrSet (castPtr scopePtr))))
+    rootEnvNames policy = do
+      Env envPtr <- builtinEnv policy 0 []
+      scopePtr <- cenvLazyScope envPtr
+      Set.fromList <$> attrSetKeys (AttrSet (castPtr scopePtr))
     assertSameNames label expected actual =
       assertEqual
         (label <> ": (missing, extra)")
@@ -26992,7 +27142,7 @@ evalPolicyIO policy roots searchPaths baseDir source = do
   case parseNixWithScope (rootScopeNames policy) baseDir testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> do
-      st0 <- newEvalState storeDir baseDir
+      st0 <- testEvalState storeDir baseDir
       let st = st0 {esPolicy = policy, esSearchPaths = searchPaths}
       mapM_ (allowEvalPath st) roots
       runEvalIO st (evalParsed (builtinEnv policy (esTimestamp st) searchPaths) parsed)
@@ -27090,7 +27240,10 @@ testEvalPolicyIO = do
             expectLeft "import beside the root is refused" (forbidden restrictedPolicy outside) (restricted ("import " <> lit (outside </> "x.nix"))),
             expectRight "pathExists is true under the root" (VBool True) (restricted ("builtins.pathExists " <> lit (allowed </> "data.txt"))),
             expectRight "pathExists is false beside it, not an error" (VBool False) (restricted ("builtins.pathExists " <> lit (outside </> "secret.txt"))),
-            expectRightWith "readDir under the root lists" (\case VAttrs attrs -> assertEqual "entries" True (attrSetSize attrs == 1); other -> Fail (T.pack (show other))) (restricted ("builtins.readDir " <> lit (allowed </> "sub"))),
+            runTestM "readDir under the root lists" $
+              restricted ("builtins.readDir " <> lit (allowed </> "sub")) >>= \case
+                Right (VAttrs attrs) -> assertEqual "entries" 1 <$> attrSetSize attrs
+                other -> pure (Fail (T.pack (show other))),
             expectLeft "readDir beside the root is refused" (forbidden restrictedPolicy outside) (restricted ("builtins.readDir " <> lit outside)),
             expectLeft "readFileType names the path asked for, no walk" (forbidden restrictedPolicy (outside </> "secret.txt")) (restricted ("builtins.readFileType " <> lit (outside </> "secret.txt"))),
             expectLeft "hashFile walks like readFile" (forbidden restrictedPolicy outside) (restricted ("builtins.hashFile \"sha256\" " <> lit (outside </> "secret.txt"))),
@@ -27131,7 +27284,7 @@ testEvalPolicyIO = do
             expectLeft "fetchGit of an allowed path is still a URI, checked in its git+file form" ("access to URI '" <> repoUrl <> "' is forbidden in restricted mode") (restricted ("builtins.fetchGit " <> quoted repo)),
             expectRight "an allowed git+file prefix admits the fetch and its tree is readable afterwards" (mkStr "in repo\n") (withUris ["git+file://" <> pathText allowed] ("builtins.readFile ((builtins.fetchGit " <> quoted repo <> ").outPath + \"/f.txt\")")),
             -- restricted: the search path
-            expectRight "a search path root is where <name> resolves and reads" (VInt 7) (evalPolicyIO restrictedPolicy [pathText allowed] (parseNixPath (TE.encodeUtf8 ("allowed=" <> pathText allowed))) allowed "import <allowed/y.nix>"),
+            expectRight "a search path root is where <name> resolves and reads" (VInt 7) (parseNixPath (TE.encodeUtf8 ("allowed=" <> pathText allowed)) >>= \searchPaths -> evalPolicyIO restrictedPolicy [pathText allowed] searchPaths allowed "import <allowed/y.nix>"),
             expectLeft "a search path miss carries the NIX_PATH hint and is catchable" "file 'nope' was not found in the Nix search path (add it using $NIX_PATH or -I)" (restricted "<nope>"),
             expectRight "tryEval catches the miss" (VBool False) (restricted "(builtins.tryEval <nope>).success"),
             -- pure
@@ -27550,7 +27703,7 @@ testInterruptsPropagate = do
           outcome <- withStalledFifo (inStore sp) (interruptedAfterStall (materializeEvalSources store sources))
           pure (interruptPropagated outcome),
         fifoCase "an interrupt reading a store derivation is not a missing one" $ do
-          st <- newEvalState storeDir root
+          st <- testEvalState storeDir root
           let sp = StorePath (T.replicate 32 "d") "stalled.drv"
           outcome <- withStalledFifo (inStore sp) (interruptedAfterStall (runEvalIO st (readStoreDerivation sp)))
           pure (interruptPropagated outcome),
@@ -27558,7 +27711,7 @@ testInterruptsPropagate = do
         -- by the key's SHA-256 (fetchCacheFile).
         fifoCase "an interrupt reading the fetch cache is not a cache miss" $
           withCacheHome $ do
-            st <- newEvalState storeDir root
+            st <- testEvalState storeDir root
             let key = "stalled-entry"
                 entry = cacheHome </> "nova-nix" </> "fetch" </> T.unpack (Hash.bytesToHexText (sha256Digest (TE.encodeUtf8 key)))
             createDirectoryIfMissing True (takeDirectory entry)
@@ -27567,7 +27720,7 @@ testInterruptsPropagate = do
         -- The entry's text is the interrupt, raised when the write forces it.
         runTestM "an interrupt writing the fetch cache is not an unwritable cache" $
           withCacheHome $ do
-            st <- newEvalState storeDir root
+            st <- testEvalState storeDir root
             outcome <- try (runEvalIO st (writeFetchCache "interrupted-entry" (throw UserInterrupt)))
             pure (interruptPropagated outcome),
         fifoCase "an interrupt unpacking an archive is not a failed unpack" $ do

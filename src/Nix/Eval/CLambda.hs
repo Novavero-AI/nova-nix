@@ -39,6 +39,7 @@ where
 
 import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
+import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CEnv (NnEnv)
 
 -- | Phantom type for C-side @nn_lambda_t@.
@@ -114,12 +115,13 @@ foreign import ccall unsafe "nn_lambda_shape_formal_count"
 -- construction.  Returns 'Foreign.Ptr.nullPtr' on allocation failure, for
 -- a formals type or count 'clambdaShape' cannot hold, or if the entries
 -- array size would overflow - the caller must check.
-clambdaNew :: Ptr NnEnv -> Word32 -> Word8 -> Word32 -> Word32 -> Word8 -> Word32 -> IO CLambdaPtr
-clambdaNew = c_nn_lambda_new
+clambdaNew :: (MonadCData m) => Ptr NnEnv -> Word32 -> Word8 -> Word32 -> Word32 -> Word8 -> Word32 -> m CLambdaPtr
+clambdaNew env body formalsType nameSym lambdaNameSym allowExtra formalCount =
+  cdataIO (c_nn_lambda_new env body formalsType nameSym lambdaNameSym allowExtra formalCount)
 
 -- | Set a formal entry at the given index.
-clambdaSetEntry :: CLambdaPtr -> Word32 -> Word32 -> Word32 -> Word32 -> IO ()
-clambdaSetEntry = c_nn_lambda_set_entry
+clambdaSetEntry :: (MonadCData m) => CLambdaPtr -> Word32 -> Word32 -> Word32 -> Word32 -> m ()
+clambdaSetEntry lam idx nameSym hasDefault defaultIdx = cdataIO (c_nn_lambda_set_entry lam idx nameSym hasDefault defaultIdx)
 
 -- | Free all tracked lambda structs (arena-style cleanup).
 clambdaFreeAll :: IO ()
@@ -130,45 +132,45 @@ clambdaFreeAll = c_nn_lambda_free_all
 -- ---------------------------------------------------------------------------
 
 -- | Read the closure environment pointer.
-clambdaEnv :: CLambdaPtr -> IO (Ptr NnEnv)
-clambdaEnv = c_nn_lambda_env
+clambdaEnv :: (MonadCData m) => CLambdaPtr -> m (Ptr NnEnv)
+clambdaEnv = cdataIO . c_nn_lambda_env
 
 -- | Read the body bytecode index.
-clambdaBody :: CLambdaPtr -> IO Word32
-clambdaBody = c_nn_lambda_body
+clambdaBody :: (MonadCData m) => CLambdaPtr -> m Word32
+clambdaBody = cdataIO . c_nn_lambda_body
 
 -- | Read the formals type (0=Name, 1=Set, 2=NamedSet).
-clambdaFormalsType :: CLambdaPtr -> IO Word8
-clambdaFormalsType = c_nn_lambda_formals_type
+clambdaFormalsType :: (MonadCData m) => CLambdaPtr -> m Word8
+clambdaFormalsType = cdataIO . c_nn_lambda_formals_type
 
 -- | Read the binding name symbol (for Name/NamedSet).
-clambdaNameSym :: CLambdaPtr -> IO Word32
-clambdaNameSym = c_nn_lambda_name_sym
+clambdaNameSym :: (MonadCData m) => CLambdaPtr -> m Word32
+clambdaNameSym = cdataIO . c_nn_lambda_name_sym
 
 -- | Read the function's own name symbol (for Set/NamedSet), the one
 -- 'clambdaNew' was given.
-clambdaLambdaNameSym :: CLambdaPtr -> IO Word32
-clambdaLambdaNameSym = c_nn_lambda_lambda_name_sym
+clambdaLambdaNameSym :: (MonadCData m) => CLambdaPtr -> m Word32
+clambdaLambdaNameSym = cdataIO . c_nn_lambda_lambda_name_sym
 
 -- | Read the ellipsis flag (1 if ... present).
-clambdaAllowExtra :: CLambdaPtr -> IO Word8
-clambdaAllowExtra = c_nn_lambda_allow_extra
+clambdaAllowExtra :: (MonadCData m) => CLambdaPtr -> m Word8
+clambdaAllowExtra = cdataIO . c_nn_lambda_allow_extra
 
 -- | Read the number of formal entries.
-clambdaFormalCount :: CLambdaPtr -> IO Word32
-clambdaFormalCount = c_nn_lambda_formal_count
+clambdaFormalCount :: (MonadCData m) => CLambdaPtr -> m Word32
+clambdaFormalCount = cdataIO . c_nn_lambda_formal_count
 
 -- | Read a formal entry's name symbol.
-clambdaEntryName :: CLambdaPtr -> Word32 -> IO Word32
-clambdaEntryName = c_nn_lambda_entry_name
+clambdaEntryName :: (MonadCData m) => CLambdaPtr -> Word32 -> m Word32
+clambdaEntryName lam idx = cdataIO (c_nn_lambda_entry_name lam idx)
 
 -- | Read whether a formal entry has a default.
-clambdaEntryHasDefault :: CLambdaPtr -> Word32 -> IO Word32
-clambdaEntryHasDefault = c_nn_lambda_entry_has_default
+clambdaEntryHasDefault :: (MonadCData m) => CLambdaPtr -> Word32 -> m Word32
+clambdaEntryHasDefault lam idx = cdataIO (c_nn_lambda_entry_has_default lam idx)
 
 -- | Read a formal entry's default bytecode index.
-clambdaEntryDefault :: CLambdaPtr -> Word32 -> IO Word32
-clambdaEntryDefault = c_nn_lambda_entry_default
+clambdaEntryDefault :: (MonadCData m) => CLambdaPtr -> Word32 -> m Word32
+clambdaEntryDefault lam idx = cdataIO (c_nn_lambda_entry_default lam idx)
 
 -- ---------------------------------------------------------------------------
 -- Shape

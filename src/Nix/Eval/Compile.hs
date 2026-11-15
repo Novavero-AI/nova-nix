@@ -104,6 +104,7 @@ import Nix.Eval.CBytecode
     pattern OpWith,
     pattern OpWithVar,
   )
+import Nix.Eval.CData (MonadCData)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.SourcePos (PosIdx (..), PosRecorder, newPosRecorder, recordPos)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolInternBytes, symbolText)
@@ -592,7 +593,7 @@ decodeBinaryOp tag
 -- the offset of its words.  'Nothing' for any other type.  The offset is
 -- strict, though an unknown type never reads it, so a caller passes it
 -- evaluated rather than as a thunk.
-decodeBcFormals :: Word8 -> Word32 -> IO (Maybe EvalFormals)
+decodeBcFormals :: (MonadCData m) => Word8 -> Word32 -> m (Maybe EvalFormals)
 decodeBcFormals flags !dataOff
   | flags == formalName = do
       sym <- cbcData dataOff
@@ -614,7 +615,7 @@ decodeBcFormals flags !dataOff
 
 -- | Decode a list of formal entries from the data buffer.
 -- Each entry is 3 words: [name_sym, has_default, default_bc_idx].
-decodeFormalEntries :: Int -> Word32 -> IO [EvalFormal]
+decodeFormalEntries :: (MonadCData m) => Int -> Word32 -> m [EvalFormal]
 decodeFormalEntries 0 _ = pure []
 decodeFormalEntries n off = do
   nameSym <- cbcData off
@@ -627,7 +628,7 @@ decodeFormalEntries n off = do
 -- | Decode capture info from the bytecode data buffer, or answer the tag
 -- at @dataOff@ when it is none of 'captureNone', 'captureSlots' and
 -- 'captureWithScopes'.
-decodeBcCaptureInfo :: Word32 -> IO (Either Word32 CaptureInfo)
+decodeBcCaptureInfo :: (MonadCData m) => Word32 -> m (Either Word32 CaptureInfo)
 decodeBcCaptureInfo dataOff = cbcData dataOff >>= decodeTagged
   where
     decodeTagged tag
@@ -640,7 +641,7 @@ decodeBcCaptureInfo dataOff = cbcData dataOff >>= decodeTagged
       decodePairs (fromIntegral count) (dataOff + 2)
 
 -- | Decode (level, idx) pairs from the data buffer.
-decodePairs :: Int -> Word32 -> IO [(Int, Int)]
+decodePairs :: (MonadCData m) => Int -> Word32 -> m [(Int, Int)]
 decodePairs 0 _ = pure []
 decodePairs n off = do
   level <- cbcData off
@@ -681,7 +682,7 @@ data BcAttrKey
 -- 'bindInheritFrom'.  @bindCount@ is the number of bindings (already
 -- resolved through the short_arg spill by the caller), @off@ is the start
 -- offset.
-decodeBcBindings :: Int -> Word32 -> IO (Either Word32 [BcBinding])
+decodeBcBindings :: (MonadCData m) => Int -> Word32 -> m (Either Word32 [BcBinding])
 decodeBcBindings 0 _ = pure (Right [])
 decodeBcBindings bindCount off = cbcData off >>= decodeTagged
   where
@@ -709,14 +710,14 @@ decodeBcBindings bindCount off = cbcData off >>= decodeTagged
       pure $! (binding :) <$> rest
 
 -- | Decode a binding's key: the pair (is_expr, key_or_bc_idx).
-decodeAttrKey :: Word32 -> IO BcAttrKey
+decodeAttrKey :: (MonadCData m) => Word32 -> m BcAttrKey
 decodeAttrKey off = do
   isExpr <- cbcData off
   val <- cbcData (off + 1)
   pure (if isExpr /= 0 then BcDynamicKey val else BcStaticKey val)
 
 -- | Decode inherited names: triples of (name_sym, select_bc_idx, pos).
-decodeInheritedNames :: Int -> Word32 -> IO [BcInheritedName]
+decodeInheritedNames :: (MonadCData m) => Int -> Word32 -> m [BcInheritedName]
 decodeInheritedNames 0 _ = pure []
 decodeInheritedNames n off = do
   sym <- cbcData off

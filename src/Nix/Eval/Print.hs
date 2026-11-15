@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | The value printers upstream writes values with.
 --
 -- @printValue@ (print.cc at Nix 2.24.9) quotes a value in a message.
@@ -39,7 +41,7 @@ module Nix.Eval.Print
   )
 where
 
-import Control.Monad.State.Strict (State, evalState, gets, modify')
+import Control.Monad.State.Strict (StateT, evalStateT, gets, lift, modify')
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -53,6 +55,7 @@ import Data.String (IsString)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (CListPtr)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.Types (AttrSet (..), CAttrSet, CList (..), NixValue (..), Thunk (..), attrSetNull, attrSetToAscList, bytesToTextLossy, clistLen, clistThunks, readThunkValue, thunkUnderEvaluation)
@@ -103,7 +106,8 @@ data Shown = Shown
     shownEntered :: !(Set Entered)
   }
 
-type Printer = State Shown
+-- | A print in progress, reading the C data layer as it goes.
+type Printer m = StateT Shown m
 
 -- | A print that has shown and entered nothing yet.
 nothingShown :: Shown
@@ -111,12 +115,12 @@ nothingShown = Shown 0 0 Set.empty
 
 -- | Render a value as upstream's @printValue@ renders it under the given
 -- options.
-printValue :: PrintOptions -> NixValue -> Text
-printValue options val = evalState (printAt options 0 Nothing val) nothingShown
+printValue :: (MonadCData m) => PrintOptions -> NixValue -> m Text
+printValue options val = evalStateT (printAt options 0 Nothing val) nothingShown
 
 -- | A value at a nesting depth, the top-level value being at 0, with the
 -- cell it was read from.  The top-level value is handed over without one.
-printAt :: PrintOptions -> Int -> Maybe Thunk -> NixValue -> Printer Text
+printAt :: (MonadCData m) => PrintOptions -> Int -> Maybe Thunk -> NixValue -> Printer m Text
 printAt options depth cell val = case val of
   VInt n -> pure (T.pack (show n))
   VFloat f -> pure (formatXmlFloat f)
@@ -125,8 +129,12 @@ printAt options depth cell val = case val of
   VNull -> pure "null"
   VStr bytes _ -> pure (printString options bytes)
   VPath p -> pure p
-  VList cl -> entering repeatedMarker (printedList cell cl) (printList options depth (map Thunk (clistThunks cl)))
-  VAttrs attrs -> entering repeatedMarker (Just (printedSet attrs)) (printAttrs options depth attrs)
+  VList cl -> do
+    key <- lift (printedList cell cl)
+    entering repeatedMarker key (printList options depth cl)
+  VAttrs attrs -> do
+    key <- lift (printedSet attrs)
+    entering repeatedMarker (Just key) (printAttrs options depth attrs)
   -- What upstream prints for a lambda whose expression it cannot reach.
   VLambda {} -> pure (marker "lambda")
   VBuiltin name [] -> pure (marker ("primop " <> name))
@@ -139,10 +147,11 @@ printAt options depth cell val = case val of
 -- | Upstream's @printAttrs@.  A set's attributes count toward the bound
 -- after the attributes of any set inside them, as upstream counts one
 -- only once its value has printed.
-printAttrs :: PrintOptions -> Int -> AttrSet -> Printer Text
+printAttrs :: (MonadCData m) => PrintOptions -> Int -> AttrSet -> Printer m Text
 printAttrs options depth attrs
-  | within depth (depthLimit options) =
-      bracketed "{" "}" <$> printBounded (attrLimit options) shownAttrs countAttr elidedAttrs (map printAttr (orderedAttrs options attrs))
+  | within depth (depthLimit options) = do
+      ordered <- lift (orderedAttrs options attrs)
+      bracketed "{" "}" <$> printBounded (attrLimit options) shownAttrs countAttr elidedAttrs (map printAttr ordered)
   | otherwise = pure "{ ... }"
   where
     printAttr (name, thunk) = do
@@ -151,11 +160,13 @@ printAttrs options depth attrs
     countAttr counts = counts {shownAttrs = shownAttrs counts + 1}
     elidedAttrs left = elided left "attribute" "attributes"
 
--- | Upstream's @printList@.
-printList :: PrintOptions -> Int -> [Thunk] -> Printer Text
-printList options depth thunks
-  | within depth (depthLimit options) =
-      bracketed "[" "]" <$> printBounded (itemLimit options) shownItems countItem elidedItems (map (printThunk options (depth + 1)) thunks)
+-- | Upstream's @printList@.  The elements are read only inside the depth
+-- bound, so a list past it prints as @[ ... ]@ without reading any.
+printList :: (MonadCData m) => PrintOptions -> Int -> CList -> Printer m Text
+printList options depth cl
+  | within depth (depthLimit options) = do
+      thunks <- lift (clistThunks cl)
+      bracketed "[" "]" <$> printBounded (itemLimit options) shownItems countItem elidedItems (map (printThunk options (depth + 1) . Thunk) thunks)
   | otherwise = pure "[ ... ]"
   where
     countItem counts = counts {shownItems = shownItems counts + 1}
@@ -163,30 +174,26 @@ printList options depth thunks
 
 -- | Print the entries of one set or list while the print's running count
 -- is inside the bound, then, in place of the rest, how many were left.
-printBounded :: Limit -> (Shown -> Int) -> (Shown -> Shown) -> (Int -> Text) -> [Printer Text] -> Printer [Text]
-printBounded bound counted count elision = go
-  where
-    go :: [Printer Text] -> Printer [Text]
-    go [] = pure []
-    go entries@(entry : rest) = gets counted >>= continueAt
-      where
-        continueAt sofar
-          | within sofar bound = do
-              shown <- entry
-              modify' count
-              (shown :) <$> go rest
-          | otherwise = pure [elision (length entries)]
+printBounded :: (Monad m) => Limit -> (Shown -> Int) -> (Shown -> Shown) -> (Int -> Text) -> [Printer m Text] -> Printer m [Text]
+printBounded _ _ _ _ [] = pure []
+printBounded bound counted count elision entries@(entry : rest) = do
+  sofar <- gets counted
+  if within sofar bound
+    then do
+      shown <- entry
+      modify' count
+      (shown :) <$> printBounded bound counted count elision rest
+    else pure [elision (length entries)]
 
 -- | A set's attributes in upstream's order: by name, with @_type@ and
 -- @type@ ahead of the rest wherever attributes are bounded (print.cc sorts
 -- by its @ImportantFirstAttrNameCmp@ then).
-orderedAttrs :: PrintOptions -> AttrSet -> [(Text, Thunk)]
-orderedAttrs options attrs = case attrLimit options of
-  Unlimited -> byName
-  AtMost _ -> important <> rest
+orderedAttrs :: (MonadCData m) => PrintOptions -> AttrSet -> m [(Text, Thunk)]
+orderedAttrs options attrs = inOrder <$> attrSetToAscList attrs
   where
-    byName = attrSetToAscList attrs
-    (important, rest) = partition ((`elem` importantAttrNames) . fst) byName
+    inOrder byName = case attrLimit options of
+      Unlimited -> byName
+      AtMost _ -> uncurry (<>) (partition ((`elem` importantAttrNames) . fst) byName)
 
 -- | Upstream's @isImportantAttrName@.
 importantAttrNames :: [Text]
@@ -195,12 +202,13 @@ importantAttrNames = ["_type", "type"]
 -- | An element or attribute value, read without forcing it: its value
 -- once it has one, and otherwise upstream's marker for a thunk, or for a
 -- thunk whose force is still running.
-printThunk :: PrintOptions -> Int -> Thunk -> Printer Text
-printThunk options depth thunk = case readThunkValue thunk of
-  Just val -> printAt options depth (Just thunk) val
-  Nothing
-    | thunkUnderEvaluation thunk -> pure (marker "potential infinite recursion")
-    | otherwise -> pure (marker "thunk")
+printThunk :: (MonadCData m) => PrintOptions -> Int -> Thunk -> Printer m Text
+printThunk options depth thunk =
+  lift (readThunkValue thunk) >>= \case
+    Just val -> printAt options depth (Just thunk) val
+    Nothing -> do
+      underEvaluation <- lift (thunkUnderEvaluation thunk)
+      pure (marker (if underEvaluation then "potential infinite recursion" else "thunk"))
 
 -- | Upstream's @printLiteralString@: quoted and escaped so the lexer reads
 -- the same string back.  The cut and the count of what it left out are in
@@ -287,7 +295,7 @@ data Entered
 
 -- | Print a set or list the first time a print enters it, and the given
 -- marker each time after.  One with no identity prints in full each time.
-entering :: a -> Maybe Entered -> Printer a -> Printer a
+entering :: (Monad m) => a -> Maybe Entered -> Printer m a -> Printer m a
 entering _ Nothing body = body
 entering repeated (Just key) body = gets (Set.member key . shownEntered) >>= enterUnlessSeen
   where
@@ -300,10 +308,10 @@ repeatedMarker = marker "repeated"
 
 -- | What 'printValue' enters a set by (print.cc:332 at 2.24.9): its
 -- bindings, an empty set's included.
-printedSet :: AttrSet -> Entered
-printedSet attrs
-  | attrSetNull attrs = EnteredEmptySet
-  | otherwise = EnteredSet (unAttrSet attrs)
+printedSet :: (MonadCData m) => AttrSet -> m Entered
+printedSet attrs = do
+  empty <- attrSetNull attrs
+  pure (if empty then EnteredEmptySet else EnteredSet (unAttrSet attrs))
 
 -- | What 'printValue' enters a list with elements by (print.cc:410): the
 -- cell holding it.  The top-level value has no cell, so a list there is
@@ -312,18 +320,18 @@ printedSet attrs
 -- nothing else holds either, and for @builtins.trace@ the argument itself
 -- (primops.cc:1018), so a traced list that holds itself prints one level
 -- deeper here before the marker.
-printedList :: Maybe Thunk -> CList -> Maybe Entered
-printedList cell cl
-  | clistLen cl == 0 = Nothing
-  | otherwise = EnteredCell . unThunk <$> cell
+printedList :: (MonadCData m) => Maybe Thunk -> CList -> m (Maybe Entered)
+printedList cell cl = do
+  len <- clistLen cl
+  pure (if len == 0 then Nothing else EnteredCell . unThunk <$> cell)
 
 -- | What 'printAmbiguous' enters a set with attributes by
 -- (print-ambiguous.cc:39 at 2.24.9): its bindings.  An empty set is
 -- entered by nothing and always prints in full.
-resultSet :: AttrSet -> Maybe Entered
-resultSet attrs
-  | attrSetNull attrs = Nothing
-  | otherwise = Just (EnteredSet (unAttrSet attrs))
+resultSet :: (MonadCData m) => AttrSet -> m (Maybe Entered)
+resultSet attrs = do
+  empty <- attrSetNull attrs
+  pure (if empty then Nothing else Just (EnteredSet (unAttrSet attrs)))
 
 -- | What 'printAmbiguous' enters a list with elements by
 -- (print-ambiguous.cc:53): where its elements are.  Upstream keeps a short
@@ -333,13 +341,13 @@ resultSet attrs
 -- top-level value has no cell, and upstream's is nix-instantiate's own
 -- copy (nix-instantiate.cc:50), which nothing else holds, so a short list
 -- there is entered by nothing.
-resultList :: Maybe Thunk -> CList -> Maybe Entered
-resultList cell cl
-  | len == 0 = Nothing
-  | len <= inlineListElements = EnteredCell . unThunk <$> cell
-  | otherwise = Just (EnteredList (unCList cl))
+resultList :: (MonadCData m) => Maybe Thunk -> CList -> m (Maybe Entered)
+resultList cell cl = enteredBy <$> clistLen cl
   where
-    len = clistLen cl
+    enteredBy len
+      | len == 0 = Nothing
+      | len <= inlineListElements = EnteredCell . unThunk <$> cell
+      | otherwise = Just (EnteredList (unCList cl))
 
 -- | The most elements upstream keeps inside a list's @Value@
 -- (@smallList@, value.hh:250 at 2.24.9).
@@ -355,11 +363,15 @@ inlineListElements = 2
 -- newline the command writes after it.  A string prints as its own bytes,
 -- escaped as 'printValue' escapes it and never cut, and a float in a
 -- default ostream's six-digit form, as 'formatXmlFloat' writes it.
-printAmbiguous :: NixValue -> BB.Builder
-printAmbiguous val = evalState (printAmbiguousAt Nothing val) nothingShown
+printAmbiguous :: (MonadCData m) => NixValue -> m BB.Builder
+printAmbiguous val = evalStateT (printAmbiguousAt Nothing val) nothingShown
+-- The executable prints its result in IO, and a result can be the whole
+-- of a large value: left to the library's flags, that print ran on the
+-- dictionary-passing code.
+{-# SPECIALIZE printAmbiguous :: NixValue -> IO BB.Builder #-}
 
 -- | A value with the cell it was read from, as 'printAt' takes one.
-printAmbiguousAt :: Maybe Thunk -> NixValue -> Printer BB.Builder
+printAmbiguousAt :: (MonadCData m) => Maybe Thunk -> NixValue -> Printer m BB.Builder
 printAmbiguousAt cell val = case val of
   VInt n -> pure (BB.int64Dec n)
   VFloat f -> pure (TE.encodeUtf8Builder (formatXmlFloat f))
@@ -368,8 +380,12 @@ printAmbiguousAt cell val = case val of
   VNull -> pure "null"
   VStr bytes _ -> pure (quotedBytes (BS.length bytes) bytes)
   VPath p -> pure (TE.encodeUtf8Builder p)
-  VList cl -> entering repeatedBytes (resultList cell cl) (bracketed "[" "]" <$> traverse (printElement . Thunk) (clistThunks cl))
-  VAttrs attrs -> entering repeatedBytes (resultSet attrs) (bracketed "{" "}" <$> traverse printAttribute (attrSetToAscList attrs))
+  VList cl -> do
+    key <- lift (resultList cell cl)
+    entering repeatedBytes key (lift (clistThunks cl) >>= fmap (bracketed "[" "]") . traverse (printElement . Thunk))
+  VAttrs attrs -> do
+    key <- lift (resultSet attrs)
+    entering repeatedBytes key (lift (attrSetToAscList attrs) >>= fmap (bracketed "{" "}") . traverse printAttribute)
   VLambda {} -> pure "<LAMBDA>"
   VBuiltin _ [] -> pure "<PRIMOP>"
   VBuiltin _ _ -> pure "<PRIMOP-APP>"
@@ -389,8 +405,8 @@ bracketed open close items = open <> " " <> foldMap (<> " ") items <> close
 
 -- | A list element or attribute value: its value when it has one, and
 -- upstream's marker for a thunk when it was never forced.
-printElement :: Thunk -> Printer BB.Builder
-printElement thunk = maybe (pure "<CODE>") (printAmbiguousAt (Just thunk)) (readThunkValue thunk)
+printElement :: (MonadCData m) => Thunk -> Printer m BB.Builder
+printElement thunk = lift (readThunkValue thunk) >>= maybe (pure "<CODE>") (printAmbiguousAt (Just thunk))
 
 -- | A name as upstream writes a symbol into a message: its @operator<<@ on
 -- a @SymbolStr@ writes it through @printIdentifier@ (nixexpr.cc:20-24 at

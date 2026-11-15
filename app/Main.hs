@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | nova-nix CLI entry point: parse the argument vector, dispatch one
@@ -38,13 +39,13 @@ import qualified Nix.Config as Config
 import Nix.DependencyGraph (DepNode (..), buildDepGraph)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, deepForce, evalParsed, force, readThunkValue)
+import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIOTraced)
+import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, newEvalStateWith, nixPathValue, renderEvalFailure, runEvalIOTraced)
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes)
@@ -135,11 +136,15 @@ resolveDataDir = do
       bundledUsable <- doesFileExist (bundled </> dataDirMarker)
       if bundledUsable then pure bundled else getDataDir
 
--- | Merge --nix-path entries, bundled data dir, and NIX_PATH search paths.
--- The data dir is appended last so user paths take priority.
-mergeSearchPaths :: [T.Text] -> FilePath -> [Thunk] -> [Thunk]
-mergeSearchPaths extraPaths dataDir envPaths =
-  concatMap (parseNixPath . TE.encodeUtf8) extraPaths ++ envPaths ++ parseNixPath (TE.encodeUtf8 (T.pack dataDir))
+-- | Merge --nix-path entries, NIX_PATH's (its bytes) and the bundled data
+-- dir, parsed in that order.  The data dir is appended last so user paths
+-- take priority.
+mergeSearchPaths :: [T.Text] -> FilePath -> BS.ByteString -> IO [Thunk]
+mergeSearchPaths extraPaths dataDir nixPath = do
+  extra <- concat <$> mapM (parseNixPath . TE.encodeUtf8) extraPaths
+  envPaths <- parseNixPath nixPath
+  bundled <- parseNixPath (TE.encodeUtf8 (T.pack dataDir))
+  pure (extra ++ envPaths ++ bundled)
 
 -- ---------------------------------------------------------------------------
 -- Main
@@ -279,7 +284,9 @@ evalPolicyFor opts config =
       epTraceVerbose = optTraceVerbose opts || ncTraceVerbose config
     }
 
--- | The evaluation state and root environment for one command.  Upstream's
+-- | The evaluation state for one command, and the action that builds its
+-- root environment, which an evaluation runs once its source has compiled
+-- ('evalParsed').  Upstream's
 -- constructor decides the same things in the same order (eval.cc at
 -- 2.24.9): under pure-eval the lookup path is empty, so neither
 -- @--nix-path@ nor @NIX_PATH@ contributes, and only the bundled @<nix/*>@
@@ -296,17 +303,20 @@ evalPolicyFor opts config =
 -- the resolved spelling; upstream allows only the given one and refuses
 -- the read, which is a mismatch between its own allow list and walk, not
 -- a rule worth keeping.
-setUpEval :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> IO (EvalState, Env)
+setUpEval :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> IO (EvalState, EvalIO Env)
 setUpEval opts config storeDir dataDir baseDir = do
   let policy = evalPolicyFor opts config
-  st0 <- newEvalState storeDir baseDir
-  let searchPaths
-        | epPureEval policy = parseNixPath (TE.encodeUtf8 (T.pack dataDir))
-        | otherwise = mergeSearchPaths (optNixPaths opts) dataDir (esSearchPaths st0)
-      st =
+  -- Read whatever the policy, so a NIX_PATH with no UTF-8 form is refused
+  -- under pure-eval too, but parsed only where it is used.
+  nixPath <- nixPathValue
+  searchPaths <-
+    if epPureEval policy
+      then parseNixPath (TE.encodeUtf8 (T.pack dataDir))
+      else mergeSearchPaths (optNixPaths opts) dataDir nixPath
+  st0 <- newEvalStateWith searchPaths storeDir baseDir
+  let st =
         st0
-          { esSearchPaths = searchPaths,
-            esPolicy = policy,
+          { esPolicy = policy,
             esCallDepth = topLevelCallDepth (ncMaxCallDepth config)
           }
   -- A relative root resolves against the working directory, as upstream's
@@ -319,7 +329,8 @@ setUpEval opts config storeDir dataDir baseDir = do
   -- a run that cannot fetch should not widen what it may read.  A root
   -- with no UTF-8 reading allows nothing: allowed paths are text, so no
   -- read can name it, and a lossy spelling would allow a different path.
-  roots <- mapM rootSpellings (mapMaybe textRoot (filter (not . isNixPathPseudoUrl) (searchPathRoots searchPaths)))
+  rootBytes <- searchPathRoots searchPaths
+  roots <- mapM rootSpellings (mapMaybe textRoot (filter (not . isNixPathPseudoUrl) rootBytes))
   mapM_ (allowEvalPath st) (concat roots)
   pure (st, builtinEnv policy (esTimestamp st) searchPaths)
   where
@@ -341,13 +352,13 @@ evalFile config opts storeDir dataDir rawFilePath = do
   case parseForEval opts config (takeDirectory filePath) (SourceFile (T.pack filePath)) source of
     Left err -> failSource err
     Right parsed -> do
-      (st, env) <- setUpEval opts config storeDir dataDir (takeDirectory filePath)
-      result <- runEvalIOTraced st (evalParsed env parsed >>= finalize (optStrict opts))
+      (st, rootEnv) <- setUpEval opts config storeDir dataDir (takeDirectory filePath)
+      result <- runEvalIOTraced st (evalRooted (optStrict opts) rootEnv parsed)
       case result of
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
-        Right forced -> printResult forced >> writeCensus st env forced
+        Right (env, forced) -> printResult forced >> writeCensus st env forced
 
 -- | Evaluate an inline expression and print the result.
 evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
@@ -356,13 +367,23 @@ evalExpr config opts storeDir dataDir source = do
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
     Right parsed -> do
-      (st, env) <- setUpEval opts config storeDir dataDir cwd
-      result <- runEvalIOTraced st (evalParsed env parsed >>= finalize (optStrict opts))
+      (st, rootEnv) <- setUpEval opts config storeDir dataDir cwd
+      result <- runEvalIOTraced st (evalRooted (optStrict opts) rootEnv parsed)
       case result of
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
-        Right forced -> printResult forced >> writeCensus st env forced
+        Right (env, forced) -> printResult forced >> writeCensus st env forced
+
+-- | Evaluate the source as 'evalParsed' does, compiling it before the root
+-- environment is built, to the result 'finalize' gives, with that
+-- environment, which 'writeCensus' counts as held.
+evalRooted :: Bool -> EvalIO Env -> ParsedSource -> EvalIO (Env, NixValue)
+evalRooted strict rootEnv parsed = do
+  code <- compileSource parsed
+  env <- rootEnv
+  forced <- evalBytecode env code >>= finalize strict
+  pure (env, forced)
 
 -- | The variable naming the file 'writeCensus' writes.
 censusVar :: BS.ByteString
@@ -410,9 +431,9 @@ evalExprAterm config opts storeDir dataDir source = do
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
     Right parsed -> do
-      (st, env) <- setUpEval opts config storeDir dataDir cwd
+      (st, rootEnv) <- setUpEval opts config storeDir dataDir cwd
       result <- runEvalIOTraced st $ do
-        val <- evalParsed env parsed
+        val <- evalParsed rootEnv parsed
         forceDerivationAttrs val
         pure val
       case result of
@@ -447,7 +468,7 @@ forceDerivationAttrs :: (MonadEval m) => NixValue -> m ()
 forceDerivationAttrs val = case val of
   VAttrs attrs ->
     mapM_
-      (\k -> maybe (pure ()) (void . force) (attrSetLookup k attrs))
+      (\k -> attrSetLookup k attrs >>= maybe (pure ()) (void . force))
       derivationAttrKeys
   _ -> pure ()
 
@@ -466,9 +487,9 @@ evalTarget config opts storeDir dataDir target attrPath = do
   case parseForEval opts config baseDir origin source of
     Left err -> failSource err
     Right parsed -> do
-      (st, env) <- setUpEval opts config storeDir dataDir baseDir
+      (st, rootEnv) <- setUpEval opts config storeDir dataDir baseDir
       result <- runEvalIOTraced st $ do
-        root <- evalParsed env parsed
+        root <- evalParsed rootEnv parsed
         selected <- case attrPath of
           Nothing -> pure (Right root)
           Just path -> selectAttrPath path root
@@ -614,13 +635,12 @@ fetchAndScan config opts store inputs = do
 -- decodes strictly.
 derivationPath :: NixValue -> IO StorePath
 derivationPath (VAttrs attrs) = do
-  case attrSetLookup "type" attrs of
-    Just thunk | Just (VStr "derivation" _) <- readThunkValue thunk -> pure ()
+  computedAttr "type" attrs >>= \case
+    Just (VStr "derivation" _) -> pure ()
     _ -> failWith "error: result is not a derivation (no type = \"derivation\")"
-  case attrSetLookup "drvPath" attrs of
-    Just thunk
-      | Just (VStr pathBytes _) <- readThunkValue thunk,
-        Right path <- TE.decodeUtf8' pathBytes ->
+  computedAttr "drvPath" attrs >>= \case
+    Just (VStr pathBytes _)
+      | Right path <- TE.decodeUtf8' pathBytes ->
           maybe (failWith ("error: invalid drvPath: " <> path)) pure (parseStorePath defaultStoreDir path)
     _ -> failWith "error: derivation result missing drvPath"
 derivationPath _ = failWith "error: result is not a derivation"
@@ -630,13 +650,18 @@ derivationPath _ = failWith "error: result is not a derivation"
 -- prints for a derivation (nix-build.cc, @queryOutputName@), with its
 -- message for a set that lacks the attribute.
 defaultOutputName :: StorePath -> NixValue -> IO T.Text
-defaultOutputName drvSP val = case val of
-  VAttrs attrs
-    | Just thunk <- attrSetLookup "outputName" attrs,
-      Just (VStr nameBytes _) <- readThunkValue thunk,
-      Right name <- TE.decodeUtf8' nameBytes ->
-        pure name
-  _ -> failWith ("error: derivation '" <> storePathToText defaultStoreDir drvSP <> "' lacks an 'outputName' attribute")
+defaultOutputName drvSP val = do
+  outputName <- case val of
+    VAttrs attrs -> computedAttr "outputName" attrs
+    _ -> pure Nothing
+  case outputName of
+    Just (VStr nameBytes _)
+      | Right name <- TE.decodeUtf8' nameBytes -> pure name
+    _ -> failWith ("error: derivation '" <> storePathToText defaultStoreDir drvSP <> "' lacks an 'outputName' attribute")
+
+-- | An attribute's value if it has been computed, without forcing it.
+computedAttr :: T.Text -> AttrSet -> IO (Maybe NixValue)
+computedAttr key attrs = attrSetLookup key attrs >>= maybe (pure Nothing) readThunkValue
 
 -- | The path of a named output.  A @.drv@ lists its outputs by name, so
 -- the default output is found here by name, never by position.
@@ -1058,4 +1083,5 @@ finalize False val = pure val
 printResult :: NixValue -> IO ()
 printResult val = toStdout $ do
   hSetBinaryMode stdout True
-  BB.hPutBuilder stdout (printAmbiguous val <> BB.char7 '\n')
+  printed <- printAmbiguous val
+  BB.hPutBuilder stdout (printed <> BB.char7 '\n')
