@@ -101,7 +101,7 @@ import qualified Nix.Hash as Hash
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, ioRetryEffects, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
 import Nix.Json (Json (..), parseJson, renderJson)
-import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope, parsedExpr)
+import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope, parsedExpr, parsedNames)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, preparePath, pushPaths, storePathBasename, stripHashPrefix)
 import qualified Nix.Realise as Realise
@@ -3150,6 +3150,59 @@ literalEscape '\r' = Just "\\r"
 literalEscape _ = Nothing
 
 -- ---------------------------------------------------------------------------
+-- Tests: String attribute keys
+-- ---------------------------------------------------------------------------
+
+-- | A key written as a string or as @${ expr }@ is a name when upstream's
+-- parser builds its expression as a plain string, and dynamic otherwise
+-- (the @attrpath@ and @attrs@ rules, parser.y:416-452 at 2.24.9).
+testStringAttrKeys :: IO [Bool]
+testStringAttrKeys = do
+  putStrLn "parser/string-attr-keys"
+  let quickCheckPasses property = do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+      parsedAs source = (\parsed -> (parsedNames parsed, parsedExpr parsed)) <$> parseNix testBaseDir testOrigin (TE.encodeUtf8 source)
+      keyText = T.pack <$> QC.listOf (QC.arbitrary `QC.suchThat` (/= '\NUL'))
+      errorAt err = (peLine err, peCol err, peMessage err)
+      boundAt name = EAttrs False [NamedBinding (testPos 1 3) (StaticKey name) (ELit (NixInt 1))] NoCaptureInfo
+  sequence
+    [ runTest "a key of an interpolated plain string is a name" $
+        assertParse "plain string" "{ ${\"a\"} = 1; }" (boundAt "a"),
+      runTest "a key of a parenthesized plain string is a name" $
+        assertParse "parenthesized" "{ ${(\"a\")} = 1; }" (boundAt "a"),
+      runTest "a key of an interpolated URI is a name" $
+        assertParse "uri" "{ ${a:b} = 1; }" (boundAt "a:b"),
+      runTestM "a key interpolating a string literal is the key the literal is" $
+        quickCheckPasses $
+          QC.forAll keyText $ \text ->
+            let literal = stringLiteralText text
+             in parsedAs ("{ ${" <> literal <> "} = 1; }") QC.=== parsedAs ("{ " <> literal <> " = 1; }"),
+      runTest "an interpolated name must be UTF-8" $
+        assertEqual "error" (Right (1, 3, "attribute name is not valid UTF-8")) (errorAt <$> syntaxErrorOfBytes ("{ ${\"" <> BS.pack [0xFF] <> "\"} = 1; }")),
+      runTest "a key of an interpolated plain string binds in a let" $
+        assertEval "let" "let ${\"a\"} = 1; in a" (VInt 1),
+      runTest "a key of a URI binds in a let" $
+        assertEval "let uri" "let ${a:b} = 1; in 2" (VInt 2),
+      runTest "a key of an interpolated plain string is inherited" $
+        assertEval "inherit" "let a = 1; in { inherit ${\"a\"}; }.a" (VInt 1),
+      runTest "a key of an interpolated plain string is inherited from a set" $
+        assertEval "inherit from" "{ inherit ({ a = 1; }) ${\"a\"}; }.a" (VInt 1),
+      runTest "a key of an interpolated plain string is in a rec set's scope" $
+        assertEval "rec" "(rec { ${\"a\"} = 1; b = a; }).b" (VInt 1),
+      runTest "a path through an interpolated plain string merges with the name written bare" $
+        assertEval "merge" "{ ${\"a\"}.b = 1; a.c = 2; }.a.b" (VInt 1),
+      runTest "an interpolated plain string naming an attribute twice is a parse error" $
+        assertParseFail "duplicate" "{ b = 1; ${\"b\"} = 2; }",
+      runTest "a key of an interpolated string with interpolation stays dynamic" $
+        assertParseFail "interpolated" "let ${\"${\"a\"}\"} = 1; in a",
+      runTest "an inherited key that is dynamic is refused at its start" $
+        assertEqual "error" (Right (1, 25, "dynamic attributes not allowed in inherit")) (errorAt <$> syntaxErrorOf "let a = 1; in { inherit ${\"a\" + \"\"}; }"),
+      runTest "an inherited string with interpolation is refused at its quote" $
+        assertEqual "error" (Right (1, 11, "dynamic attributes not allowed in inherit")) (errorAt <$> syntaxErrorOf "{ inherit \"${\"a\"}\"; }")
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Tests: Parser integration
 -- ---------------------------------------------------------------------------
 
@@ -5039,7 +5092,8 @@ testUnsafeGetAttrPos = do
       -- A column counts bytes (PosTable::operator[], nixexpr.cc), so the
       -- e-acute takes two.
       inFile "a column counts the bytes before it" "builtins.unsafeGetAttrPos \"b\" {\n  a = \"\233\"; b = 1;\n}" (2, 13),
-      inFile "a dynamic name is at its interpolation" "builtins.unsafeGetAttrPos \"k\" {\n  ${\"k\"} = 1;\n}" (2, 3),
+      inFile "a dynamic name is at its interpolation" "builtins.unsafeGetAttrPos \"k\" {\n  ${\"k\" + \"\"} = 1;\n}" (2, 3),
+      inFile "a name of an interpolated plain string is at its interpolation" "builtins.unsafeGetAttrPos \"k\" {\n  ${\"k\"} = 1;\n}" (2, 3),
       inFile "each level of a dotted path is at the path" "builtins.unsafeGetAttrPos \"c\" {\n  a.b.c = 1;\n}.a.b" (2, 3),
       inFile "a merged path's first definition keeps its position" "builtins.unsafeGetAttrPos \"a\" {\n  a.b = 1;\n  a.c = 2;\n}" (2, 3),
       -- A line ends at an LF, a CRLF or a bare CR (Pos::LinesIterator,
@@ -12796,11 +12850,12 @@ testEvalFidelity = do
       runTest "bare toFile is not a global" $
         assertEvalFail "no-bare-tofile" "toFile",
       -- Dynamic keys colliding with an existing attr are an eval error,
-      -- never a silent last-win merge.
+      -- never a silent last-win merge.  A key of a plain string is a
+      -- name, so each key here concatenates to stay dynamic.
       runTest "dynamic key colliding with static errors" $
-        assertEvalFail "dyn-collide" "{ b = 1; ${\"b\"} = 2; }",
+        assertEvalFail "dyn-collide" "{ b = 1; ${\"b\" + \"\"} = 2; }",
       runTest "rec dynamic key colliding with static errors" $
-        assertEvalFail "dyn-collide-rec" "rec { b = 1; p.q = 1; ${\"b\"} = 2; }",
+        assertEvalFail "dyn-collide-rec" "rec { b = 1; p.q = 1; ${\"b\" + \"\"} = 2; }",
       -- Higher-order list builtins pass elements as unforced thunks: an
       -- element the function never inspects may throw without failing.
       runTest "filter does not force elements" $
@@ -21879,17 +21934,18 @@ testPhase4 = do
       -- ESearchPath eval (should fail in pure mode since no search paths)
       runTest "eval <nixpkgs> fails without path" $
         assertEvalFail "search path not found" "<nixpkgs>",
-      -- Dynamic attribute keys
+      -- Dynamic attribute keys.  A key of a plain string is a name, so
+      -- each key here that is not a variable concatenates to stay dynamic.
       runTest "dynamic key basic" $
-        assertEval "dynamic key" "{ ${\"hello\"} = 42; }.hello" (VInt 42),
+        assertEval "dynamic key" "{ ${\"hello\" + \"\"} = 42; }.hello" (VInt 42),
       runTest "dynamic key from let" $
         assertEval "dynamic key let" "let name = \"x\"; in { ${name} = 1; }.x" (VInt 1),
       runTest "dynamic key in select" $
-        assertEval "dynamic key select" "let s = { x = 10; }; in s.${\"x\"}" (VInt 10),
+        assertEval "dynamic key select" "let s = { x = 10; }; in s.${\"x\" + \"\"}" (VInt 10),
       runTest "dynamic key in hasAttr" $
-        assertEval "dynamic key hasAttr" "let s = { x = 10; }; in s ? ${\"x\"}" (VBool True),
+        assertEval "dynamic key hasAttr" "let s = { x = 10; }; in s ? ${\"x\" + \"\"}" (VBool True),
       runTest "dynamic key hasAttr missing" $
-        assertEval "dynamic key hasAttr missing" "let s = { x = 10; }; in s ? ${\"y\"}" (VBool False),
+        assertEval "dynamic key hasAttr missing" "let s = { x = 10; }; in s ? ${\"y\" + \"\"}" (VBool False),
       -- has-attr checks presence of the terminal attribute without
       -- forcing its value, matching upstream laziness.
       runTest "hasAttr does not force the final attribute" $
@@ -21905,7 +21961,7 @@ testPhase4 = do
       -- inherit inside a rec set with a dynamic key resolves against the
       -- enclosing scope, never the rec set's own binding.
       runTest "inherit in a dynamic-keyed rec set resolves outward" $
-        assertEval "dyn-rec-inherit" "let v = 42; in (rec { ${\"d\"} = 1; inherit v; }).v" (VInt 42),
+        assertEval "dyn-rec-inherit" "let v = 42; in (rec { ${\"d\" + \"\"} = 1; inherit v; }).v" (VInt 42),
       -- Dynamic attr inside string interpolation (the ${name} must not
       -- prematurely close the outer interpolation)
       runTest "dynamic key in string interp" $
@@ -22186,6 +22242,7 @@ testParseOrderInterningIO = do
       internsInOrder "inherited names in order, after an inherit's source (:394, :416)" "with { }; { inherit ({ zc = 1; }) zb za; inherit zd; ze = 1; }" ["zc", "zb", "za", "zd", "ze"],
       internsInOrder "a with's scope before its body (:204)" "with { zb = 1; }; { za = zb; }" ["zb", "za"],
       internsInOrder "a dynamic key's expression in place, and a key of a plain string as a name (:444-452)" "with { }; { ${zk} = 1; ${\"zm\"} = 2; \"zn\" = 3; zl = 4; }" ["zk", "zm", "zn", "zl"],
+      internsInOrder "a key of a URI as a name where it is written (:301-309, :444-452)" "{ ${zu:v} = 1; zl = 2; }" ["zu:v", "zl"],
       internsInOrder "__curPos is no name (:276-278)" "{ za = __curPos; zb = 1; }" ["za", "zb"],
       -- An evaluation shows the order: the argument an unexpected-argument
       -- error names is the first in symbol order, here as under upstream
@@ -25148,11 +25205,11 @@ testUndefinedVariablesIO = do
         runTestIO
           "inherit in a dynamic-key rec reads the enclosing rec, not its own"
           testDir
-          "rec { ${\"q\"} = 0; x = 1; y = rec { ${\"a\"} = 1; inherit x; }; }.y.x"
+          "rec { ${\"q\" + \"\"} = 0; x = 1; y = rec { ${\"a\" + \"\"} = 1; inherit x; }; }.y.x"
           (VInt 1),
         expectError
           "inherit of a name no with supplies is undefined, not the rec's own"
-          "with {}; rec { ${\"a\"} = 1; inherit x; }.x"
+          "with {}; rec { ${\"a\" + \"\"} = 1; inherit x; }.x"
           "undefined variable 'x'"
       ]
 
@@ -25456,6 +25513,7 @@ runSuite = do
           testParserErrors,
           testSourceBytes,
           testParserIntegration,
+          testStringAttrKeys,
           testStaticGlobalsSync,
           testUndefinedVariables,
           testUndefinedVariablesIO,
