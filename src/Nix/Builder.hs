@@ -1483,10 +1483,11 @@ registerOutputs config store drv drvPath inputPaths plans = runExceptT $ do
     [] -> throwError (BuildStop noOutputsMessage 1)
   where
     scan = outputScan drv inputPaths plans
-    -- Outputs register with no deriver yet, so 'queryDeriver' answers
-    -- Nothing for a built path, where upstream records the @.drv@
-    -- (local-derivation-goal.cc:2738).
-    deriver = Nothing
+    -- Every output names the @.drv@ that built it, as upstream's
+    -- @newInfo.deriver = drvPath@ does (local-derivation-goal.cc:2738 at
+    -- 2.24.9), spelled as the store's own rows spell a path, the form a
+    -- substituted path's deriver takes ('Nix.Substituter.parseDeriver').
+    deriver = Just (T.pack (storePathToFilePath (stDir store) drvPath))
 
 -- | After a successful rebuild under 'BuildCheck', compare every output
 -- with the NAR hash the store recorded for it, the hashes in the order of

@@ -39,11 +39,12 @@
 -- of running processes, through @\/proc@ on Linux and @lsof@ elsewhere)
 -- and per-process temporary roots.  Neither exists here: the lock below
 -- covers builds in flight, and a program running out of an unrooted
--- store path is not protected.  Upstream's @keep-derivations@ and
--- @keep-outputs@ are not implemented either: the builder registers
--- outputs with no deriver, so a @.drv@ is kept only while something
--- references it, and an unrooted @.drv@ and the sources only it
--- references are collected.
+-- store path is not protected.  Upstream's @keep-derivations@, on by
+-- default, keeps a @.drv@ while an output that names it as its deriver
+-- is live, and @keep-outputs@ keeps a path while a @.drv@ that outputs
+-- it is live (gc.cc at 2.24.9).  Neither is implemented here, so a
+-- @.drv@ is kept only while something references it, and an unrooted
+-- @.drv@ and the sources only it references are collected.
 --
 -- == Reachability and the sweep
 --
