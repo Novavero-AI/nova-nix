@@ -186,6 +186,19 @@ check "a derivation in full once, then repeated" 'let d = derivation { name = "x
 check "the contexts of the strings it writes" 'let d = derivation { name = "x"; system = "x86_64-linux"; builder = "/bin/sh"; }; in builtins.getContext (builtins.toXML { s = "${d}"; inherit d; })'
 echo
 
+echo "== what makes a derivation fixed-output, and what its hash reads as =="
+# An outputHash makes a derivation fixed-output whatever it holds; an empty
+# one is the all-zero hash of outputHashAlgo's algorithm, with a warning.
+check "an empty outputHash and its warning" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputHash = ""; outputHashAlgo = "sha256"; }).drvPath'
+check "a null outputHash coerced to the empty one" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputHash = null; outputHashAlgo = "sha256"; }).drvPath'
+check "a fixed output whose outputs are out alone" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "out" ]; outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; }).drvPath'
+refused "an empty outputHash with no algorithm" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputHash = ""; }).drvPath'
+refused "an integer outputHash read as its decimal" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputHash = 5; outputHashAlgo = "sha256"; }).drvPath'
+refused "an integer outputHash with no algorithm" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputHash = 5; }).drvPath'
+refused "a fixed output with a second output" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "out" "dev" ]; outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; }).drvPath'
+refused "a fixed output whose one output is not out" '(derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; outputs = [ "dev" ]; outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; }).drvPath'
+echo
+
 echo "== Nova's mirror interface preserves fixed-output identity =="
 for caseName in legacy sha256 sri order invalidUrls invalidHashes escapedUrl unicodeUrl; do
   check "fetchurl $caseName" "(import ./fetchurl-cases.nix).$caseName"

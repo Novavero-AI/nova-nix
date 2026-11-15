@@ -3206,6 +3206,11 @@ emitWarning msgVal = case msgVal of
   other ->
     throwEvalError ("expected a string but found " <> typeName other <> ": " <> printValue PrintForError other)
 
+-- | Upstream's @warn@ from its own code rather than an expression, which
+-- its logger prefixes @warning:@ (logging.cc:34-37 at 2.24.9).
+warn :: (MonadEval m) => Text -> m ()
+warn = traceMessage . ("warning: " <>)
+
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - graph traversal
 -- ---------------------------------------------------------------------------
@@ -3569,7 +3574,9 @@ builtinFetchurl (VStr url _) = do
   fetchUrlSimple urlText Nothing
 builtinFetchurl (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchurl" "url" attrs
-  sha256 <- forceOptionalAttrStr attrs "sha256"
+  -- The pin is read with the arguments, before anything is fetched, as
+  -- upstream's fetch reads it (fetchTree.cc:443-444 at 2.24.9).
+  sha256 <- traverse decodeSha256Pin =<< forceOptionalAttrStr attrs "sha256"
   fetchUrlSimple url sha256
 builtinFetchurl other =
   throwEvalError ("builtins.fetchurl: expected a string or set, got " <> typeName other)
@@ -3580,7 +3587,7 @@ builtinFetchTarball (VStr url _) = do
   fetchAndExtractTarball urlText Nothing tarballSourceName
 builtinFetchTarball (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchTarball" "url" attrs
-  sha256 <- forceOptionalAttrStr attrs "sha256"
+  sha256 <- traverse decodeSha256Pin =<< forceOptionalAttrStr attrs "sha256"
   nameOverride <- forceOptionalAttrStr attrs "name"
   fetchAndExtractTarball url sha256 (fromMaybe tarballSourceName nameOverride)
 builtinFetchTarball other =
@@ -3596,10 +3603,10 @@ tarballSourceName = "source"
 -- extraction share one shell pipeline to avoid binary-as-text encoding
 -- issues.  The scratch dir is exclusively created with an unpredictable
 -- name ('createScratchDir') and removed once the tree reaches the store.
-fetchAndExtractTarball :: (MonadEval m) => Text -> Maybe Text -> Text -> m NixValue
-fetchAndExtractTarball url mSha256 name = do
+fetchAndExtractTarball :: (MonadEval m) => Text -> Maybe BS.ByteString -> Text -> m NixValue
+fetchAndExtractTarball url pin name = do
   checkUri url
-  requireFetchPin "fetchTarball" mSha256
+  requireFetchPin "fetchTarball" pin
   toolUrl <- localFileUrl url
   extractDir <- createScratchDir "nova-nix-tarball-"
   -- The -- separator prevents argument injection from the URL.
@@ -3615,12 +3622,12 @@ fetchAndExtractTarball url mSha256 name = do
       ""
   case code of
     0 -> do
-      pin <- traverse decodeSha256Pin mSha256
       storePath <-
         copyPathToStore
           extractDir
           name
-          (fmap ("builtins.fetchTarball: " <> url,) pin)
+          (fmap (\expected -> (expected, fetchHashMismatch url expected)) pin)
+          `onEvalError` removeScratchDir extractDir
       removeScratchDir extractDir
       pure (VPath storePath)
     _ -> do
@@ -4246,8 +4253,8 @@ decodeDecimal ctx t = case TR.decimal t of
   _ -> throwEvalError (ctx <> ": expected a decimal integer from git, got " <> t)
 
 -- | Fetch a URL and optionally verify its hash.
-fetchUrlSimple :: (MonadEval m) => Text -> Maybe Text -> m NixValue
-fetchUrlSimple url mSha256 = do
+fetchUrlSimple :: (MonadEval m) => Text -> Maybe BS.ByteString -> m NixValue
+fetchUrlSimple url pin = do
   -- Upstream's order (fetchTree.cc, fetch()): the URI gate, then the
   -- name, then pure mode's hash requirement, all before the download.
   checkUri url
@@ -4258,7 +4265,7 @@ fetchUrlSimple url mSha256 = do
   case checkStorePathName name of
     Left err -> throwEvalError ("builtins.fetchurl: " <> storePathNameErrorText err)
     Right () -> pure ()
-  requireFetchPin "fetchurl" mSha256
+  requireFetchPin "fetchurl" pin
   -- Download to a file, not through the text-mode stdout pipe (which mangles
   -- binary), read the raw bytes, verify the pin if one was given, then store at
   -- the canonical fixed-output path.  The file lives in an exclusively
@@ -4266,7 +4273,9 @@ fetchUrlSimple url mSha256 = do
   scratch <- createScratchDir "nova-nix-fetchurl-"
   bytes <- downloadInto scratch url `onEvalError` removeScratchDir scratch
   removeScratchDir scratch
-  mapM_ (verifyFetchPin "builtins.fetchurl" url bytes) mSha256
+  forM_ pin $ \expected ->
+    let got = sha256Digest bytes
+     in when (expected /= got) $ throwEvalError (fetchHashMismatch url expected got)
   storePath <- addFixedOutputFile name bytes
   pure (VPath storePath)
 
@@ -4297,7 +4306,7 @@ localFileUrl url = case T.stripPrefix fileUrlPrefix url of
 -- | Upstream's pure-mode rule for @fetchurl@ and @fetchTarball@
 -- (fetchTree.cc): without a @sha256@ the fetch is refused, since its
 -- result would be whatever the network answers today.
-requireFetchPin :: (MonadEval m) => Text -> Maybe Text -> m ()
+requireFetchPin :: (MonadEval m) => Text -> Maybe BS.ByteString -> m ()
 requireFetchPin who pin = do
   policy <- evalPolicy
   when (epPureEval policy && isNothing pin) $
@@ -4311,29 +4320,24 @@ urlBaseName url =
       base = T.takeWhileEnd (/= '/') stripped
    in if T.null base then "source" else base
 
--- | Verify fetched bytes against a user-supplied sha256 pin, erroring on
--- mismatch.  Accepts SRI, @sha256:@-prefixed, and bare digest forms.
-verifyFetchPin :: (MonadEval m) => Text -> Text -> BS.ByteString -> Text -> m ()
-verifyFetchPin ctx url bytes expectedStr = do
-  expected <- decodeSha256Pin expectedStr
-  let got = sha256Digest bytes
-  when (expected /= got) $
-    throwEvalError
-      ( ctx
-          <> ": hash mismatch for "
-          <> url
-          <> "\n  expected: "
-          <> expectedStr
-          <> "\n  got:      sha256:"
-          <> bytesToHexText got
-      )
+-- | Upstream's refusal of a fetch whose content has another SHA-256 hash
+-- than its pin (fetchTree.cc:515-522 at 2.24.9), each hash in nix32 after
+-- its algorithm.
+fetchHashMismatch :: Text -> BS.ByteString -> BS.ByteString -> Text
+fetchHashMismatch url expected got =
+  "hash mismatch in file downloaded from '"
+    <> url
+    <> "':\n  specified: sha256:"
+    <> Nix32.encode expected
+    <> "\n  got:       sha256:"
+    <> Nix32.encode got
 
 -- | Decode a sha256 pin to raw bytes as upstream's @newHashAllowEmpty@
--- with SHA-256 reads a nonempty one (hash.cc:271-281 at 2.24.9): SRI,
--- prefixed or bare, and a spelling that carries its own tag must name
--- sha256.
+-- with SHA-256 reads it (hash.cc:271-281 at 2.24.9): SRI, prefixed or
+-- bare, a spelling that carries its own tag naming sha256, or empty, the
+-- digest whose every byte is zero, with upstream's warning.
 decodeSha256Pin :: (MonadEval m) => Text -> m BS.ByteString
-decodeSha256Pin s = either throwEvalError (pure . snd) (parseAnyHash (Just "sha256") s)
+decodeSha256Pin s = snd <$> newHashAllowEmpty (Just "sha256") s
 
 -- | Force a required string attribute from an attrset, using full Nix string
 -- coercion (VStr, VPath, VInt, VBool, VAttrs via __toString/outPath).
@@ -4581,7 +4585,7 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- Fixed-output derivations (fetchurl etc.) are content-addressed and hash
   -- via the @fixed:out:@ scheme; input-addressed derivations recurse through
   -- the modulo hashes of their inputs.
-  mFixed <- detectFixedOutput attrs
+  mFixed <- traverse (fixedOutputOf fields) (dfOutputHash fields)
 
   -- Each output name composes into a store-path name (drvName-<output>)
   -- and names the on-disk location the builder later clears and moves
@@ -4664,50 +4668,21 @@ builtinDerivationStrict (VAttrs attrs) = do
 builtinDerivationStrict other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
--- | Detect a fixed-output derivation.  Returns @Just (algo, mode, rawDigest)@
--- when @outputHash@ is present and non-empty (fetchurl, fetchgit, ...), else
--- 'Nothing' for an ordinary input-addressed derivation.  @mode@ is
--- @\"flat\"@ or @\"recursive\"@; @algo@ is e.g. @\"sha256\"@.
-detectFixedOutput :: (MonadEval m) => AttrSet -> m (Maybe (Text, Text, BS.ByteString))
-detectFixedOutput attrs =
-  case attrSetLookup "outputHash" attrs of
-    Nothing -> pure Nothing
-    Just thunk -> do
-      val <- force thunk
-      case val of
-        VStr rawHash _
-          | not (BS.null rawHash) -> do
-              ohash <- decodedText "derivation: outputHash" rawHash
-              ohAlgo <- optDrvStrAttr "outputHashAlgo" attrs
-              ohMode <- optDrvStrAttr "outputHashMode" attrs
-              (algo, digest) <- normalizeFixedHash ohash ohAlgo
-              let mode = if ohMode == "recursive" then "recursive" else "flat"
-              pure (Just (algo, mode, digest))
-        _ -> pure Nothing
-
--- | Read an optional string attribute, defaulting to @\"\"@ when absent or
--- not a string.
-optDrvStrAttr :: (MonadEval m) => Text -> AttrSet -> m Text
-optDrvStrAttr key attrs =
-  case attrSetLookup key attrs of
-    Nothing -> pure ""
-    Just thunk -> do
-      val <- force thunk
-      case val of
-        VStr s _ -> decodedText ("derivation: " <> key) s
-        _ -> pure ""
-
--- | Decode a fixed-output hash to its algorithm name and raw bytes as
--- upstream's derivationStrict does.  @outputHashAlgo@ is read with
--- @parseHashAlgoOpt@ (primops.cc:1352 at 2.24.9), which gives nothing
--- for a name it does not know, the empty name among them, so an unknown
--- one is no algorithm rather than an error.  The hash is then read with
--- @newHashAllowEmpty@ (primops.cc:1435), whose @Hash::parseAny@ takes the
--- algorithm from the hash's own tag when it has one and refuses a known
--- @outputHashAlgo@ that names another.
-normalizeFixedHash :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
-normalizeFixedHash ohash ohAlgo =
-  either throwEvalError pure (parseAnyHash (ohAlgo <$ hashAlgoBytes ohAlgo) ohash)
+-- | The output of a derivation whose pass read an @outputHash@, as
+-- upstream's derivationStrict makes a fixed-output one (primops.cc:1425-1437
+-- at 2.24.9): its outputs must be @out@ alone, and the hash is read with
+-- 'newHashAllowEmpty' under the algorithm @outputHashAlgo@ names, so the
+-- hash's own tag decides when that names none upstream knows.  Returns the
+-- algorithm, the mode (@\"recursive\"@ for an @outputHashMode@ of
+-- @recursive@, else @\"flat\"@) and the digest.
+fixedOutputOf :: (MonadEval m) => DrvFields -> BS.ByteString -> m (Text, Text, BS.ByteString)
+fixedOutputOf fields rawHash = do
+  unless (dfOutputs fields == "out" :| []) $
+    throwEvalError "multiple outputs are not supported in fixed-output derivations"
+  ohash <- decodedText "derivation: outputHash" rawHash
+  (algo, digest) <- newHashAllowEmpty (dfOutputHashAlgo fields) ohash
+  let mode = if dfOutputHashMode fields == Just "recursive" then "recursive" else "flat"
+  pure (algo, mode, digest)
 
 -- | Whether a derivation leaves its null attributes out (@__ignoreNulls@).
 data NullAttrs = KeepNullAttrs | IgnoreNullAttrs
@@ -4718,9 +4693,12 @@ ignoreNullsFlag :: Text
 ignoreNullsFlag = "__ignoreNulls"
 
 -- | The attributes derivationStrict reads at their keys.
-argsAttr, builderAttr, outputsAttr, systemAttr :: Text
+argsAttr, builderAttr, outputHashAttr, outputHashAlgoAttr, outputHashModeAttr, outputsAttr, systemAttr :: Text
 argsAttr = "args"
 builderAttr = "builder"
+outputHashAttr = "outputHash"
+outputHashAlgoAttr = "outputHashAlgo"
+outputHashModeAttr = "outputHashMode"
 outputsAttr = "outputs"
 systemAttr = "system"
 
@@ -4734,7 +4712,10 @@ data DrvAttrUse
     Entry !DrvEntryRole
 
 -- | The field of a derivation an entry is read as, at its key.
-data DrvEntryRole = BuilderEntry | SystemEntry | OutputsEntry | PlainEntry
+data DrvEntryRole = BuilderEntry | SystemEntry | OutputsEntry | FixedOutputEntry !FixedOutputField | PlainEntry
+
+-- | An attribute that says what a fixed-output derivation's output is.
+data FixedOutputField = OutputHashField | OutputHashAlgoField | OutputHashModeField
 
 -- | The use of the attribute at a key.
 drvAttrUse :: Text -> DrvAttrUse
@@ -4743,18 +4724,29 @@ drvAttrUse key
   | key == builderAttr = Entry BuilderEntry
   | key == systemAttr = Entry SystemEntry
   | key == outputsAttr = Entry OutputsEntry
+  | key == outputHashAttr = Entry (FixedOutputEntry OutputHashField)
+  | key == outputHashAlgoAttr = Entry (FixedOutputEntry OutputHashAlgoField)
+  | key == outputHashModeAttr = Entry (FixedOutputEntry OutputHashModeField)
   | otherwise = Entry PlainEntry
 
 -- | What derivationStrict's pass has read of a derivation's fields: the
 -- context every entry and argument carries, the builder, the system, the
--- outputs and the builder's arguments.  The outputs are @out@ until an
--- @outputs@ attribute names others, as upstream's set starts.
+-- outputs, the builder's arguments, and the fixed-output hash, its
+-- algorithm and its mode.  The outputs are @out@ until an @outputs@
+-- attribute names others, as upstream's set starts.  The hash is the
+-- string its attribute was read as, an empty one included: a derivation
+-- whose pass reads one is fixed-output, as upstream's is
+-- (primops.cc:1425 at 2.24.9).  The algorithm is one upstream knows, or
+-- none.
 data DrvFields = DrvFields
   { dfContext :: !StringContext,
     dfBuilder :: !(Maybe BS.ByteString),
     dfSystem :: !(Maybe BS.ByteString),
     dfOutputs :: !(NonEmpty Text),
-    dfArgs :: ![BS.ByteString]
+    dfArgs :: ![BS.ByteString],
+    dfOutputHash :: !(Maybe BS.ByteString),
+    dfOutputHashAlgo :: !(Maybe Text),
+    dfOutputHashMode :: !(Maybe BS.ByteString)
   }
 
 -- | Upstream's one pass over a derivation's attributes (primops.cc:1225-1365
@@ -4773,7 +4765,7 @@ derivationPass ::
   m (Map Text entry, DrvFields)
 derivationPass drvName nulls readEntry = foldM step (Map.empty, initial)
   where
-    initial = DrvFields mempty Nothing Nothing ("out" :| []) []
+    initial = DrvFields mempty Nothing Nothing ("out" :| []) [] Nothing Nothing Nothing
     step (!entries, !fields) (key, thunk) = addErrorTrace (derivationAttrTrace drvName key) $ do
       val <- force thunk
       case (val, nulls, drvAttrUse key) of
@@ -4798,8 +4790,9 @@ readCommandLine val fields = case val of
 -- environment: the string upstream's @coerceToString@ makes of the value
 -- with @coerceMore@, a path copied to the store, whose bytes flow
 -- byte-exact into the ATerm env section (and its hash).  That string is
--- the builder, the system or the outputs at those keys, the outputs split
--- at whitespace (primops.cc:1346-1356 at 2.24.9).
+-- the builder, the system, the outputs or a fixed-output field at those
+-- keys, the outputs split at whitespace (primops.cc:1346-1356 at 2.24.9),
+-- so an @outputHash@ that is not a string is the string it coerces to.
 readEnvEntry :: (MonadEval m) => DrvEntryRole -> Text -> NixValue -> DrvFields -> m (Maybe BS.ByteString, DrvFields)
 readEnvEntry role _ val fields = do
   (bytes, ctx) <- coerceToStoreString val
@@ -4810,6 +4803,7 @@ readEnvEntry role _ val fields = do
     OutputsEntry -> do
       outputs <- checkedOutputs =<< traverse (decodedText "derivation") (outputTokens bytes)
       pure entered {dfOutputs = outputs}
+    FixedOutputEntry field -> pure (withFixedOutputField field bytes entered)
     PlainEntry -> pure entered
   pure (Just bytes, updated)
 
@@ -4833,12 +4827,25 @@ readStructuredEntry drvName fieldContext role key val fields
             outputs <- checkedOutputs =<< mapM (structuredOutputName fieldContext . Thunk) (clistThunks cl)
             pure entered {dfOutputs = outputs}
           _ -> throwEvalError "derivation: 'outputs' must be a list of strings"
-        PlainEntry
-          | Set.member key structuredPlainStrings -> entered <$ structuredStringValue RefuseContext val
-          | otherwise -> pure entered
+        FixedOutputEntry field -> (\bytes -> withFixedOutputField field bytes entered) <$> structuredStringValue RefuseContext val
+        PlainEntry -> pure entered
       when (Set.member key structuredDisabledChecks) $
-        traceMessage (disabledByStructuredAttrs drvName key)
+        warn (disabledByStructuredAttrs drvName key)
       pure (Just json, updated)
+
+-- | A fixed-output field read from its attribute's string.  The algorithm
+-- is read with @parseHashAlgoOpt@ (primops.cc:1320, :1352 at 2.24.9),
+-- which gives none for a name it does not know.
+withFixedOutputField :: FixedOutputField -> BS.ByteString -> DrvFields -> DrvFields
+withFixedOutputField field bytes fields = case field of
+  OutputHashField -> fields {dfOutputHash = Just bytes}
+  OutputHashAlgoField -> fields {dfOutputHashAlgo = knownHashAlgo bytes}
+  OutputHashModeField -> fields {dfOutputHashMode = Just bytes}
+
+-- | The algorithm a name names, as upstream's @parseHashAlgoOpt@ reads it
+-- (hash.cc:426-433 at 2.24.9): one of the four it knows, or none.
+knownHashAlgo :: BS.ByteString -> Maybe Text
+knownHashAlgo bytes = either (const Nothing) (\algo -> algo <$ hashAlgoBytes algo) (TE.decodeUtf8' bytes)
 
 -- | Upstream's @handleOutputs@ (primops.cc:1247-1269 at 2.24.9): the names
 -- in order, a repeated name and the name drvPath refused, as the result
@@ -4915,11 +4922,6 @@ structuredOutputName :: (MonadEval m) => Text -> Thunk -> m Text
 structuredOutputName fieldContext thunk =
   force thunk >>= structuredStringValue RefuseContext >>= decodedText fieldContext
 
--- | The attributes a structured derivation reads as plain strings, past
--- @system@ and the outputs list, which are read where they are used.
-structuredPlainStrings :: Set.Set Text
-structuredPlainStrings = Set.fromList ["outputHash", "outputHashAlgo", "outputHashMode"]
-
 -- | Reference and size checks that a structured derivation takes from
 -- @outputChecks@ instead; upstream warns when one is set at the top level.
 structuredDisabledChecks :: Set.Set Text
@@ -4930,7 +4932,7 @@ structuredDisabledChecks =
 -- | Upstream's warning for a 'structuredDisabledChecks' attribute.
 disabledByStructuredAttrs :: Text -> Text -> Text
 disabledByStructuredAttrs drvName key =
-  "warning: In a derivation named '"
+  "In a derivation named '"
     <> drvName
     <> "', 'structuredAttrs' disables the effect of the derivation attribute '"
     <> key
@@ -5042,6 +5044,20 @@ parseAnyHash expected original =
     agreeing algo decoded = case expected of
       Just want | want /= algo -> Left ("hash '" <> original <> "' should have type '" <> want <> "'")
       _ -> (algo,) <$> decoded
+
+-- | Read a hash as upstream's @newHashAllowEmpty@ does (hash.cc:271-281 at
+-- 2.24.9): an empty one is the digest of @expected@ whose every byte is
+-- zero, which upstream warns of, naming it in SRI, and is refused with no
+-- @expected@; any other is read as 'parseAnyHash' reads it.
+newHashAllowEmpty :: (MonadEval m) => Maybe Text -> Text -> m (Text, BS.ByteString)
+newHashAllowEmpty expected original
+  | T.null original = case expected of
+      Nothing -> throwEvalError "empty hash requires explicit hash algorithm"
+      Just algo -> do
+        zero <- either throwEvalError (\size -> pure (BS.replicate size 0)) (parseHashAlgo algo)
+        warn ("found empty hash, assuming '" <> algo <> "-" <> bytesToBase64 zero <> "'")
+        pure (algo, zero)
+  | otherwise = either throwEvalError pure (parseAnyHash expected original)
 
 -- | Parse an SRI hash as upstream's @Hash::parseSRI@ does (hash.cc:137-147
 -- at 2.24.9): the algorithm before the first @-@ and a base64 digest
@@ -5872,7 +5888,10 @@ builtinPath (VAttrs attrs) = do
         other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
   filterFn <- traverse force (attrSetLookup "filter" attrs)
   let name = fromMaybe (canonBaseName pathStr) nameOverride
-      pinSubject = "builtins.path: " <> pathStr
+      -- Upstream compares the copy's store path with the one the pin
+      -- gives (primops.cc:2478-2482 at 2.24.9); under one name and one
+      -- method the two differ exactly when the digests do.
+      mismatch = "store path mismatch in (possibly filtered) path added from '" <> pathStr <> "'"
   -- A pinned copy's path follows from the pin.  Upstream's addPath builds
   -- it once prim_path has forced every argument and before it reads the
   -- tree (primops.cc at 2.24.9), so a name it refuses is refused under the
@@ -5880,21 +5899,12 @@ builtinPath (VAttrs attrs) = do
   forM_ expectedDigest $ \expected ->
     storePathOrThrow (makeFixedOutputPath name "sha256" "recursive" expected)
   storePathText <- case filterFn of
-    Nothing -> copyPathToStore pathStr name (fmap (pinSubject,) expectedDigest)
+    Nothing -> copyPathToStore pathStr name (fmap (,const mismatch) expectedDigest)
     Just keep -> do
       narBytes <- filteredSourceNar keep pathStr
       -- The sha256 pin applies to the FILTERED tree, as upstream.
-      let filteredDigest = sha256Digest narBytes
       case expectedDigest of
-        Just expected
-          | expected /= filteredDigest ->
-              throwEvalError
-                ( pinSubject
-                    <> ": hash mismatch: expected sha256:"
-                    <> bytesToHexText expected
-                    <> ", got sha256:"
-                    <> bytesToHexText filteredDigest
-                )
+        Just expected | expected /= sha256Digest narBytes -> throwEvalError mismatch
         _ -> pure ()
       addSourceNar name narBytes
   pure (sourceResultString storePathText)

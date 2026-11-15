@@ -1324,10 +1324,11 @@ class (Monad m) => MonadEval m where
   -- | Copy a path (file or directory) to the store, returning the store
   -- path.  Content-addressed like upstream addToStore: recursive NAR
   -- sha256 under the given name.  Arguments: source path, store name,
-  -- and an optional sha256 pin as (error subject, expected digest): a
-  -- digest mismatch fails the copy with the subject heading the message.
-  -- @builtins.path@ and @builtins.fetchTarball@ share this pin.
-  copyPathToStore :: Text -> Text -> Maybe (Text, ByteString) -> m Text
+  -- and an optional sha256 pin as (expected digest, refusal): a copy
+  -- whose digest is another fails before anything is written, with the
+  -- refusal of the digest it has.  @builtins.path@ and
+  -- @builtins.fetchTarball@ share this pin.
+  copyPathToStore :: Text -> Text -> Maybe (ByteString, ByteString -> Text) -> m Text
 
   -- | Recursive NAR sha256 digest of a path, without copying it anywhere.
   -- Used by @builtins.fetchGit@ to report @narHash@.
