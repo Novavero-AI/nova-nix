@@ -74,6 +74,7 @@ library
     Nix.Eval.SourcePos
     Nix.Eval.StringInterp
     Nix.Eval.Symbol
+    Nix.Eval.AllocSite
     Nix.Eval.CAttrSet
     Nix.Eval.CThunk
     Nix.Eval.CEnv

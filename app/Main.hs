@@ -10,7 +10,7 @@
 module Main (main) where
 
 import Control.Exception (AsyncException (UserInterrupt), bracket, displayException, handle, handleJust, try)
-import Control.Monad (mfilter, void)
+import Control.Monad (mfilter, void, when)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -19,7 +19,7 @@ import Data.Functor.Identity (Identity (..))
 import Data.IORef (readIORef)
 import Data.List (find, partition)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, mapMaybe)
+import Data.Maybe (catMaybes, isJust, mapMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
@@ -41,7 +41,7 @@ import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, deepForce, evalParsed, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
-import Nix.Eval.CStats (CRoot (..), renderCensus, takeCensus, valueRoots)
+import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIOTraced)
@@ -157,6 +157,10 @@ main = do
   hSetEncoding stderr utf8
   -- Initialize C data layer (symbol interning, thunk arena, env allocator)
   arenaInit
+  -- Counting by site begins before anything is allocated, so the census
+  -- 'writeCensus' takes covers every environment and attribute set.
+  wantsCensus <- isJust <$> censusTarget
+  when wantsCensus countSites
   args <- getArgs
   dataDir <- resolveDataDir
   opts <- either (failWith . T.pack) pure (parseArgs args)
@@ -364,6 +368,10 @@ evalExpr config opts storeDir dataDir source = do
 censusVar :: BS.ByteString
 censusVar = "NOVA_NIX_C_STATS"
 
+-- | The file 'censusVar' names, when it names one: set and not empty.
+censusTarget :: IO (Maybe BS.ByteString)
+censusTarget = mfilter (not . BS.null) <$> configVariable censusVar
+
 -- | With 'censusVar' set to a path, write a census of the C data layer
 -- ("Nix.Eval.CStats") to it once an evaluation has succeeded.  Its roots
 -- are what the process still holds once the evaluation has returned: the
@@ -376,7 +384,7 @@ censusVar = "NOVA_NIX_C_STATS"
 -- collection that leaves nothing in GHC's heap the evaluation has dropped.
 writeCensus :: EvalState -> Env -> NixValue -> IO ()
 writeCensus st env result = do
-  target <- mfilter (not . BS.null) <$> configVariable censusVar
+  target <- censusTarget
   case target of
     Nothing -> pure ()
     Just bytes -> do

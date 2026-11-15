@@ -128,6 +128,99 @@ static struct {
     uint64_t stableptrs_reached;
 } g;
 
+/* --- Counting by site --- */
+
+int nn_stats_counting = 0;
+
+/* Apart from the session: counting runs for the whole evaluation, and a
+ * census reads it. */
+static struct {
+    int complete;   /* counting began before the env pages' first byte */
+    uint64_t env_count[NN_STATS_ENV_SITES];
+    uint64_t env_slots[NN_STATS_ENV_SITES];
+    uint64_t env_bytes[NN_STATS_ENV_SITES];
+    uint64_t env_sizes[NN_STATS_ENV_SIZES];
+    uint64_t set_count[NN_STATS_SET_SITES];
+    uint64_t set_shareable[NN_STATS_SET_SITES];
+    uint64_t set_bytes[NN_STATS_SET_SITES];
+} sites;
+
+void nn_stats_count_sites(void)
+{
+    memset(&sites, 0, sizeof(sites));
+    sites.complete = nn_env_bytes_allocated() == 0;
+    nn_stats_counting = 1;
+}
+
+/* A site the evaluator never numbers is a defect in it: asserted, and
+ * counted nowhere in a build without asserts. */
+void nn_stats_count_env(uint32_t site, uint32_t slots, uint64_t bytes)
+{
+    NN_ASSERT(site < NN_STATS_ENV_SITES, "nn_stats_count_env: unknown site");
+    if (site >= NN_STATS_ENV_SITES) return;
+    sites.env_count[site]++;
+    sites.env_slots[site] += slots;
+    sites.env_bytes[site] += bytes;
+    sites.env_sizes[slots < NN_STATS_ENV_SIZES - 1 ? slots : NN_STATS_ENV_SIZES - 1]++;
+}
+
+void nn_stats_count_env_bytes(uint32_t site, uint64_t bytes)
+{
+    NN_ASSERT(site < NN_STATS_ENV_SITES, "nn_stats_count_env_bytes: unknown site");
+    if (site >= NN_STATS_ENV_SITES) return;
+    sites.env_bytes[site] += bytes;
+}
+
+void nn_stats_count_set(uint32_t site, uint64_t bytes, int shareable)
+{
+    NN_ASSERT(site < NN_STATS_SET_SITES, "nn_stats_count_set: unknown site");
+    if (site >= NN_STATS_SET_SITES) return;
+    sites.set_count[site]++;
+    sites.set_bytes[site] += bytes;
+    if (shareable) sites.set_shareable[site]++;
+}
+
+/* The first `max` of `n` figures from `from` to `to`.  No copy for none:
+ * memcpy takes no NULL, whatever the length. */
+static void copy_figures(uint64_t *to, const uint64_t *from, uint32_t n, uint32_t max)
+{
+    uint32_t k = max < n ? max : n;
+    if (k > 0) memcpy(to, from, (size_t)k * sizeof(uint64_t));
+}
+
+uint32_t nn_stats_env_sites(uint64_t *envs, uint64_t *slots, uint64_t *bytes, uint32_t max)
+{
+    copy_figures(envs, sites.env_count, NN_STATS_ENV_SITES, max);
+    copy_figures(slots, sites.env_slots, NN_STATS_ENV_SITES, max);
+    copy_figures(bytes, sites.env_bytes, NN_STATS_ENV_SITES, max);
+    return NN_STATS_ENV_SITES;
+}
+
+uint32_t nn_stats_env_sizes(uint64_t *envs, uint32_t max)
+{
+    copy_figures(envs, sites.env_sizes, NN_STATS_ENV_SIZES, max);
+    return NN_STATS_ENV_SIZES;
+}
+
+uint32_t nn_stats_set_sites(uint64_t *sets, uint64_t *shareable, uint64_t *bytes, uint32_t max)
+{
+    copy_figures(sets, sites.set_count, NN_STATS_SET_SITES, max);
+    copy_figures(shareable, sites.set_shareable, NN_STATS_SET_SITES, max);
+    copy_figures(bytes, sites.set_bytes, NN_STATS_SET_SITES, max);
+    return NN_STATS_SET_SITES;
+}
+
+/* Every env, when counting has covered every one; NN_STATS_UNCOUNTED
+ * otherwise. */
+static uint64_t counted_envs(void)
+{
+    uint64_t total = 0;
+    uint32_t i;
+    if (!nn_stats_counting || !sites.complete) return NN_STATS_UNCOUNTED;
+    for (i = 0; i < NN_STATS_ENV_SITES; i++) total += sites.env_count[i];
+    return total;
+}
+
 /* --- Bits --- */
 
 /* A zeroed bitmap of `bits` bits; never a zero-byte request, whose answer
@@ -427,7 +520,7 @@ int nn_stats_begin(void)
      * pages. */
     NN_ASSERT(g.items_bytes <= nn_env_bytes_allocated(),
               "nn_stats_begin: list items arrays outside the env pages");
-    g.allocated_count[NN_STATS_ENVS] = NN_STATS_UNCOUNTED;
+    g.allocated_count[NN_STATS_ENVS] = counted_envs();
     g.allocated_bytes[NN_STATS_ENVS] = nn_env_bytes_allocated() - g.items_bytes;
 
     nn_symbol_footprint(&text, &reserved);

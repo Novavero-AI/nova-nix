@@ -13,6 +13,9 @@
 -- The C side never dereferences them.  Thunk lifetimes are managed by
 -- the thunk arena; attribute set cleanup only frees the key\/value arrays.
 --
+-- Every constructor names its 'SetSite', under which the census counts
+-- the set.
+--
 -- A set holds at most 'maxBound' :: 'Word32' entries, upstream's own
 -- ceiling (its @Bindings@ counts in @uint32_t@).  Every constructor and
 -- insert checks its C result, so a set the C side cannot build raises
@@ -52,6 +55,7 @@ import Data.Word (Word32)
 import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Array (peekArray, withArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Nix.Eval.AllocSite (SetSite, setSiteIndex)
 import Nix.Eval.CStatus (cStatusFailure, checkedCPtr)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.SourcePos (PosIdx (..))
@@ -69,7 +73,7 @@ type CAttrSet = Ptr NnAttrSet
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_attrset_new"
-  c_nn_attrset_new :: Word32 -> IO CAttrSet
+  c_nn_attrset_new :: Word32 -> Word32 -> IO CAttrSet
 
 foreign import ccall unsafe "nn_attrset_insert"
   c_nn_attrset_insert :: CAttrSet -> Word32 -> Ptr () -> Word32 -> IO CInt
@@ -102,10 +106,10 @@ foreign import ccall unsafe "nn_attrset_keys_ptr"
   c_nn_attrset_keys_ptr :: CAttrSet -> IO (Ptr Word32)
 
 foreign import ccall unsafe "nn_attrset_union"
-  c_nn_attrset_union :: CAttrSet -> CAttrSet -> IO CAttrSet
+  c_nn_attrset_union :: CAttrSet -> CAttrSet -> Word32 -> IO CAttrSet
 
 foreign import ccall unsafe "nn_attrset_remove_keys"
-  c_nn_attrset_remove_keys :: CAttrSet -> Ptr Word32 -> Word32 -> IO CAttrSet
+  c_nn_attrset_remove_keys :: CAttrSet -> Ptr Word32 -> Word32 -> Word32 -> IO CAttrSet
 
 -- | @NN_ATTRSET_NOT_FOUND@, the index answer for an absent key.  Must
 -- stay in lockstep with @cbits\/nn_attrset.h@.
@@ -116,11 +120,12 @@ indexNotFound = maxBound
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
--- | Allocate a new empty attribute set sized for the expected number of
--- entries.  The count only sizes the first allocation, so one past the
--- ceiling is clamped to it: the inserts are what enforce the ceiling.
-cattrsetNew :: Int -> IO CAttrSet
-cattrsetNew expected = checkedCPtr "nn_attrset_new" =<< c_nn_attrset_new capacity
+-- | Allocate a new empty attribute set at a site, sized for the expected
+-- number of entries.  The count only sizes the first allocation, so one
+-- past the ceiling is clamped to it: the inserts are what enforce the
+-- ceiling.
+cattrsetNew :: SetSite -> Int -> IO CAttrSet
+cattrsetNew site expected = checkedCPtr "nn_attrset_new" =<< c_nn_attrset_new capacity (setSiteIndex site)
   where
     capacity = fromIntegral (max 0 (min expected entryCeiling))
     entryCeiling = fromIntegral (maxBound :: Word32)
@@ -194,14 +199,14 @@ cattrsetKeys set = do
 -- Set operations
 -- ---------------------------------------------------------------------------
 
--- | Right-biased union (// semantics).  Result is frozen.
-cattrsetUnion :: CAttrSet -> CAttrSet -> IO CAttrSet
-cattrsetUnion a b = checkedCPtr "nn_attrset_union" =<< c_nn_attrset_union a b
+-- | Right-biased union (// semantics) at a site.  Result is frozen.
+cattrsetUnion :: SetSite -> CAttrSet -> CAttrSet -> IO CAttrSet
+cattrsetUnion site a b = checkedCPtr "nn_attrset_union" =<< c_nn_attrset_union a b (setSiteIndex site)
 
--- | Remove a list of keys.  Result is frozen.
-cattrsetRemoveKeys :: CAttrSet -> [Symbol] -> IO CAttrSet
-cattrsetRemoveKeys set syms = do
+-- | Remove a list of keys, making the result at a site.  Result is frozen.
+cattrsetRemoveKeys :: SetSite -> CAttrSet -> [Symbol] -> IO CAttrSet
+cattrsetRemoveKeys site set syms = do
   let raw = map unSymbol syms
       n = fromIntegral (length raw)
   withArray raw $ \ptr ->
-    checkedCPtr "nn_attrset_remove_keys" =<< c_nn_attrset_remove_keys set ptr n
+    checkedCPtr "nn_attrset_remove_keys" =<< c_nn_attrset_remove_keys set ptr n (setSiteIndex site)

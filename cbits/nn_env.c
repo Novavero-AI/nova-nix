@@ -10,6 +10,7 @@
 
 #include "nn_env.h"
 #include "nn_assert.h"
+#include "nn_stats.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,6 +93,38 @@ nn_env_alloc_raw(uint32_t bytes)
     return result;
 }
 
+/* nn_env_alloc_raw for an env at `site`: the bytes count under that site
+ * while the census counts sites (nn_stats.h). */
+static void *
+nn_env_alloc_at(uint32_t bytes, uint32_t site)
+{
+    void *result = nn_env_alloc_raw(bytes);
+    if (result && nn_stats_counting)
+        nn_stats_count_env_bytes(site, align_up(bytes, NN_ENV_ALIGNMENT));
+    return result;
+}
+
+/* An array of `count` pointers, or NULL for none or for one past the
+ * allocator's uint32 byte limit. */
+static void **
+nn_env_alloc_pointers(uint32_t count, uint32_t site)
+{
+    if (count == 0) return NULL;
+    uint64_t bytes64 = (uint64_t)count * sizeof(void *);
+    if (bytes64 > UINT32_MAX) return NULL;
+    return (void **)nn_env_alloc_at((uint32_t)bytes64, site);
+}
+
+/* An env struct at `site`, counted with the slots allocated for it. */
+static nn_env_t *
+nn_env_alloc_struct(uint32_t slots, uint32_t site)
+{
+    nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
+    if (env && nn_stats_counting)
+        nn_stats_count_env(site, slots, align_up((uint32_t)sizeof(nn_env_t), NN_ENV_ALIGNMENT));
+    return env;
+}
+
 /* --- Lifecycle --- */
 
 void
@@ -133,13 +166,18 @@ nn_env_destroy(void)
 /* --- Slot allocation --- */
 
 void **
-nn_env_alloc_slots(uint32_t count)
+nn_env_alloc_slots(uint32_t count, uint32_t site)
+{
+    return nn_env_alloc_pointers(count, site);
+}
+
+void **
+nn_env_alloc_items(uint32_t count)
 {
     if (count == 0) return NULL;
     uint64_t bytes64 = (uint64_t)count * sizeof(void *);
     if (bytes64 > UINT32_MAX) return NULL;
-    uint32_t bytes = (uint32_t)bytes64;
-    return (void **)nn_env_alloc_raw(bytes);
+    return (void **)nn_env_alloc_raw((uint32_t)bytes64);
 }
 
 /* --- Env constructors --- */
@@ -153,9 +191,9 @@ nn_env_empty(void)
 nn_env_t *
 nn_env_new(void **slots, uint32_t slot_count,
            void *lazy_scope, nn_env_t *parent,
-           void **with_scopes, uint32_t with_count)
+           void **with_scopes, uint32_t with_count, uint32_t site)
 {
-    nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
+    nn_env_t *env = nn_env_alloc_struct(slot_count, site);
     if (!env) return NULL;
     env->slots = slots;
     env->slot_count = slot_count;
@@ -168,9 +206,9 @@ nn_env_new(void **slots, uint32_t slot_count,
 
 nn_env_t *
 nn_env_from_slots(void **slots, uint32_t slot_count,
-                  nn_env_t *parent)
+                  nn_env_t *parent, uint32_t site)
 {
-    nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
+    nn_env_t *env = nn_env_alloc_struct(slot_count, site);
     if (!env) return NULL;
     env->slots = slots;
     env->slot_count = slot_count;
@@ -182,14 +220,14 @@ nn_env_from_slots(void **slots, uint32_t slot_count,
 }
 
 nn_env_t *
-nn_env_push_with(nn_env_t *base, void *scope)
+nn_env_push_with(nn_env_t *base, void *scope, uint32_t site)
 {
     /* The increment must not wrap.  Counts anywhere near this bound
      * cannot allocate anyway (the array alloc caps at UINT32_MAX
      * bytes), so this is the formal guard, not a reachable limit. */
     if (base->with_count == UINT32_MAX) return NULL;
     uint32_t new_count = base->with_count + 1;
-    void **new_withs = nn_env_alloc_with_scopes(new_count);
+    void **new_withs = nn_env_alloc_with_scopes(new_count, site);
     if (!new_withs) return NULL;
 
     /* New scope at index 0 (innermost) */
@@ -200,7 +238,8 @@ nn_env_push_with(nn_env_t *base, void *scope)
                (size_t)base->with_count * sizeof(void *));
     }
 
-    nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
+    /* The slots are base's, so none are allocated with this env. */
+    nn_env_t *env = nn_env_alloc_struct(0, site);
     if (!env) return NULL;
     env->slots = base->slots;
     env->slot_count = base->slot_count;
@@ -212,9 +251,9 @@ nn_env_push_with(nn_env_t *base, void *scope)
 }
 
 nn_env_t *
-nn_env_new_minimal(void **slots, uint32_t slot_count)
+nn_env_new_minimal(void **slots, uint32_t slot_count, uint32_t site)
 {
-    nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)sizeof(nn_env_t));
+    nn_env_t *env = nn_env_alloc_struct(slot_count, site);
     if (!env) return NULL;
     env->slots = slots;
     env->slot_count = slot_count;
@@ -299,13 +338,9 @@ nn_env_root_scope(const nn_env_t *env)
 /* --- With-scopes array allocation --- */
 
 void **
-nn_env_alloc_with_scopes(uint32_t count)
+nn_env_alloc_with_scopes(uint32_t count, uint32_t site)
 {
-    if (count == 0) return NULL;
-    uint64_t bytes64 = (uint64_t)count * sizeof(void *);
-    if (bytes64 > UINT32_MAX) return NULL;
-    uint32_t bytes = (uint32_t)bytes64;
-    return (void **)nn_env_alloc_raw(bytes);
+    return nn_env_alloc_pointers(count, site);
 }
 
 /* --- Diagnostics --- */

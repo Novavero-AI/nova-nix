@@ -22,6 +22,7 @@ where
 import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Nix.Eval.AllocSite (SetSite (SetUpdate))
 import Nix.Eval.CAttrSet (cattrsetUnion)
 import Nix.Eval.CList (clistFromThunks, clistLen, clistThunks)
 import Nix.Eval.Print (PrintOptions (..), printValue)
@@ -380,4 +381,4 @@ evalUpdate evalLeft evalRight = do
 {-# NOINLINE mergeAttrSets #-}
 mergeAttrSets :: AttrSet -> AttrSet -> AttrSet
 mergeAttrSets (AttrSet a) (AttrSet b) =
-  AttrSet (unsafePerformIO (cattrsetUnion a b))
+  AttrSet (unsafePerformIO (cattrsetUnion SetUpdate a b))

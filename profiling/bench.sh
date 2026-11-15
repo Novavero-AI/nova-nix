@@ -40,7 +40,8 @@
 # profile by closure type (+RTS -hT) with NOVA_NIX_C_STATS set, for a
 # census of GHC's heap and of the C data layer when the slice ends: what
 # the C side holds by kind, what the result, the root environment, the
-# import cache and the search path reach, and what the mark cost.
+# import cache and the search path reach, and what the mark cost, and the
+# environments and attribute sets each construct or builtin allocated.
 # Upstream's pass runs under NIX_SHOW_STATS.  The attrset-memory benchmark
 # then builds the attribute sets the census reached, as C sets and as sets
 # held in GHC's heap, under the copying and the non-moving collector.
@@ -770,10 +771,57 @@ write_memory() {
     scoreboard_row "census mark: seconds per million objects" \
       "$(awk -v s="$mark_seconds" -v n="$objects" 'BEGIN { if (n > 0) printf "%.3f s", s / (n / 1000000) }')" ""
     scoreboard_row "census mark: pointers it could not place" "$(named_value "$census" mark.unplaced)" ""
+    write_site_rows "$census" "$stats"
   else
     scoreboard_row "C census" "not taken: $(exit_figure "$dir/census" "$dir/census/err")" ""
   fi
   write_attrset_rows "$dir/attrset" "$census"
+}
+
+# The census's environments and attribute sets by the site that allocated
+# them, as rows of the memory table: the environments' slots beside
+# upstream's values in environments, their sizes, then each site that
+# allocated anything, most bytes first.  A set is shareable when it
+# equals one that already existed: an empty one, or a // result with an
+# empty operand.
+#   write_site_rows <census-file> <nix-stats-json>
+write_site_rows() {
+  local census="$1" stats="$2" name count figure bytes
+  if [[ -z "$(named_value "$census" envs.allocated.slots)" ]]; then
+    scoreboard_row "C allocations by site" "not counted" ""
+    return 0
+  fi
+  scoreboard_row "C environments: slots" "$(named_value "$census" envs.allocated.slots)" \
+    "$(figure_or "$(upstream_stat "$stats" .envs.elements)" "values in envs" "")"
+  scoreboard_row "C environments by slots" \
+    "$(awk '$1 == "envs.allocated.size" { printf "%s%s: %s", sep, $2, $3; sep = ", " }' "$census")" ""
+  while read -r name count figure bytes; do
+    scoreboard_row "C environments at \`$name\`" "$count envs, $figure slots, $(mib "$bytes")" ""
+  done < <(site_figures "$census" envs slots)
+  scoreboard_row "C attribute sets: shareable" \
+    "$(awk '{ n = split($1, part, ".") } n == 4 && part[1] == "attrsets" && part[2] == "site" && part[4] == "shareable" { total += $2 }
+      END { print total + 0 }' "$census")" ""
+  while read -r name count figure bytes; do
+    scoreboard_row "C attribute sets at \`$name\`" "$count sets, $figure shareable, $(mib "$bytes")" ""
+  done < <(site_figures "$census" attrsets shareable)
+}
+
+# Each site of one kind that allocated anything, as "NAME COUNT FIGURE
+# BYTES" with the figure named, most bytes first.
+#   site_figures <census-file> <kind> <figure>
+site_figures() {
+  awk -v kind="$2" -v figure="$3" '
+    { n = split($1, part, ".") }
+    n == 4 && part[1] == kind && part[2] == "site" {
+      if (!(part[3] in seen)) { seen[part[3]] = 1; order[++sites] = part[3] }
+      value[part[3], part[4]] = $2
+    }
+    END {
+      for (i = 1; i <= sites; i++) {
+        s = order[i]
+        if (value[s, "count"] > 0) print s, value[s, "count"], value[s, figure], value[s, "bytes"]
+      }
+    }' "$1" | LC_ALL=C sort -k4,4nr
 }
 
 # The attrset benchmark's rows of the memory table.  Bytes per entry are

@@ -29,7 +29,7 @@ import Data.Either (isLeft, isRight)
 import Data.Foldable (toList, traverse_)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
-import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.List (find, inits, intercalate, isPrefixOf, mapAccumL, nub, sort, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
@@ -73,13 +73,14 @@ import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
 import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
+import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CEnv (cenvLazyScope)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
-import Nix.Eval.CStats (CRoot (..), Census (..), Figures (..), PerKind (..), renderCensus, takeCensus, valueRoots)
+import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBcIdx, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
@@ -1309,7 +1310,7 @@ testResultPrinter = do
       runTestM "a printed attribute name reads back as itself" $
         quickCheckPasses $
           QC.forAll genAttrName $ \name ->
-            let attrs = VAttrs (attrSetFromMap (Map.singleton name (evaluated (VInt 1))))
+            let attrs = VAttrs (attrSetFromMap SetLiteral (Map.singleton name (evaluated (VInt 1))))
              in readsBack ("builtins.head (builtins.attrNames " <> renderResult attrs <> ")") (mkStr name)
     ]
       <> map floatPrints floatCases
@@ -1597,8 +1598,8 @@ testCensus = do
               `andThen` assertEqual "StablePtrs reached" True (censusStablePtrsReached census >= 1),
       runTestM "a census follows a pending thunk to its env and the env's slots" $ do
         cells <- mapM cthunkNewComputedInt [1, 2, 3]
-        let (slots, slotCount) = buildCSlots (map Thunk cells)
-            env = newMinimalEnv slots slotCount
+        let (slots, slotCount) = buildCSlots EnvApply (map Thunk cells)
+            env = newMinimalEnv EnvApply slots slotCount
         code <- compileExpr (ELit (NixInt 0))
         let Thunk pending = mkThunkBc env code
         withCensus [RootThunk (Thunk pending)] $ \census ->
@@ -1615,7 +1616,7 @@ testCensus = do
         wholeFirst <- censusOf [RootList whole, RootList suffix]
         pure (assertEqual "suffix first" (Right expected) (listsAndCells <$> suffixFirst) `andThen` assertEqual "whole first" (Right expected) (listsAndCells <$> wholeFirst)),
       runTestM "a census reaches a set's names and its string values as symbols" $ do
-        let set = attrSetFromMap (Map.fromList [("novaNixCensusName", evaluated (mkStr "nova-nix census value"))])
+        let set = attrSetFromMap SetLiteral (Map.fromList [("novaNixCensusName", evaluated (mkStr "nova-nix census value"))])
         withCensus [RootAttrSet set] $ \census ->
           assertEqual
             "sets, thunks and symbols"
@@ -1632,6 +1633,27 @@ testCensus = do
                 `andThen` assertEqual "some builtins reached" True (fromMaybe 0 (figuresCount (kindThunks (censusReached census))) > 0),
       runTest "a census renders as a name and a value per line, with no line for a count no allocator keeps" $
         assertEqual "report" renderedSample (renderCensus sampleCensus),
+      runTest "a census counting by site renders the envs' slots and sizes, then three figures for each site, after the rest" $
+        let rendered = BS8.lines (renderCensus sampleCensus {censusSites = Just sampleSites})
+            before = BS8.lines renderedSample
+            sites = drop (length before) rendered
+            siteCount = length [minBound .. maxBound :: EnvSite] + length [minBound .. maxBound :: SetSite]
+         in assertEqual "the lines without sites" before (take (length before) rendered)
+              `andThen` assertEqual "slots and sizes" ["envs.allocated.slots 6", "envs.allocated.size 2 1", "envs.allocated.size 32+ 1"] (take 3 sites)
+              `andThen` assertEqual "figures" (3 * siteCount) (length sites - 3)
+              `andThen` assertEqual
+                "a site's figures"
+                []
+                ( filter
+                    (`notElem` sites)
+                    [ "envs.site.let.count 2",
+                      "envs.site.let.slots 6",
+                      "envs.site.let.bytes 192",
+                      "attrsets.site.update.count 3",
+                      "attrsets.site.update.shareable 2",
+                      "attrsets.site.update.bytes 184"
+                    ]
+                ),
       runTestM "eval writes a census to the file NOVA_NIX_C_STATS names, and none when it is empty" $ do
         let root = tmpBase </> "nova-nix-test-census"
             target = root </> "census.txt"
@@ -1650,13 +1672,35 @@ testCensus = do
           -- The result's three sets of one attribute are reached; the
           -- builtins' sets are bigger.
           let oneEntrySets = [count | line <- written, ["attrsets.reached.size", "1", count] <- [BS8.words line]]
+              pairs = [(key, n) | [key, value] <- map BS8.words written, Just n <- [wholeNumber value]]
+              named name = [n | (key, n) <- pairs, key == name]
+              siteSum kind figure = [sum [n | (key, n) <- pairs, [k, "site", _, f] <- [BS8.split '.' key], k == kind, f == figure]]
+              sizeSum = [sum [n | ["envs.allocated.size", _, value] <- map BS8.words written, Just n <- [wholeNumber value]]]
           pure $
             assertEqual "printed" (ExitSuccess, "[ { i = 0; } { i = 1; } { i = 2; } ]\n") (code, out)
               `andThen` assertEqual "one-attribute sets reached" ["3"] oneEntrySets
               `andThen` assertEqual "unplaced" True ("mark.unplaced 0" `elem` written)
               `andThen` assertEqual "with an empty value" (ExitSuccess, out, False) (emptyCode, emptyOut, leftOver)
+              -- Counting began with the arena, so the envs have a count,
+              -- and the sites account for every env and set the
+              -- allocators hold: the env pages' bytes, less the lists'
+              -- items, and the tracked sets.
+              `andThen` assertEqual "envs counted by site" (siteSum "envs" "count") (named "envs.allocated.count")
+              `andThen` assertEqual "envs counted by size" sizeSum (named "envs.allocated.count")
+              `andThen` assertEqual "env bytes by site" (siteSum "envs" "bytes") (named "envs.allocated.bytes")
+              `andThen` assertEqual "env slots by site" (siteSum "envs" "slots") (named "envs.allocated.slots")
+              `andThen` assertEqual "sets counted by site" (siteSum "attrsets" "count") (named "attrsets.allocated.count")
+              `andThen` assertEqual "set bytes by site" (siteSum "attrsets" "bytes") (named "attrsets.allocated.bytes")
+              -- genList defers one application per element, each of
+              -- which calls the lambda, which makes one set.
+              `andThen` assertEqual "genList's applications" [3] (named "envs.site.genList.count")
+              `andThen` assertEqual "the lambda's calls" [3] (named "envs.site.call.count")
+              `andThen` assertEqual "the literal sets" [3] (named "attrsets.site.literal.count")
     ]
   where
+    wholeNumber value = case BS8.readInteger value of
+      Just (n, rest) | BS.null rest -> Just n
+      _ -> Nothing
     lists reach = fromMaybe 0 (figuresCount (kindLists reach))
     quickCheckPasses property = do
       result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
@@ -1675,7 +1719,14 @@ testCensus = do
           censusUnplaced = 0,
           censusIndexSeconds = 0.25,
           censusMarkSeconds = 1.5,
-          censusSetSizes = Map.fromList [(0, 2), (12, 1)]
+          censusSetSizes = Map.fromList [(0, 2), (12, 1)],
+          censusSites = Nothing
+        }
+    sampleSites =
+      SiteCounts
+        { sitesEnvs = Map.insert EnvLet (EnvSiteFigures 2 6 192) (Map.fromList [(site, EnvSiteFigures 0 0 0) | site <- [minBound .. maxBound]]),
+          sitesEnvSizes = Map.fromList [(EnvSlots 2, 1), (EnvSlotsAtLeast 32, 1)],
+          sitesSets = Map.insert SetUpdate (SetSiteFigures 3 2 184) (Map.fromList [(site, SetSiteFigures 0 0 0) | site <- [minBound .. maxBound]])
         }
     renderedSample =
       BS8.unlines
@@ -1698,6 +1749,191 @@ testCensus = do
                ]
         )
 
+-- | An env at a site with a number of slots, as a site allocates one.
+data EnvAllocation = EnvAllocation !EnvSite !Int
+  deriving (Show)
+
+-- | A set at a site with a number of entries.
+data SetAllocation = SetAllocation !SetSite !Int
+  deriving (Show)
+
+-- | Bytes of an env struct, a set header and a set entry (its key,
+-- position and value) on a 64-bit target, and the room a set made empty
+-- gets (cbits/nn_env.h, cbits/nn_attrset.c).
+envStructSize, setHeaderSize, setEntrySize, emptySetRoom :: Word64
+envStructSize = 48
+setHeaderSize = 40
+setEntrySize = 16
+emptySetRoom = 8
+
+-- | The figures of each site and size that counting by site adds while
+-- an action runs; a site or size that gains nothing is left out.
+sitesAdded :: IO () -> IO (Either Text SiteCounts)
+sitesAdded action = do
+  before <- siteCounts
+  action
+  after <- siteCounts
+  pure $ case (before, after) of
+    (Just earlier, Just later) ->
+      Right
+        SiteCounts
+          { sitesEnvs = gained envMinus (EnvSiteFigures 0 0 0) (sitesEnvs later) (sitesEnvs earlier),
+            sitesEnvSizes = gained (-) 0 (sitesEnvSizes later) (sitesEnvSizes earlier),
+            sitesSets = gained setMinus (SetSiteFigures 0 0 0) (sitesSets later) (sitesSets earlier)
+          }
+    _ -> Left "counting by site is off"
+  where
+    gained minus none later earlier =
+      Map.filter (/= none) (Map.mapWithKey (\k figures -> maybe figures (minus figures) (Map.lookup k earlier)) later)
+    envMinus (EnvSiteFigures a b c) (EnvSiteFigures x y z) = EnvSiteFigures (a - x) (b - y) (c - z)
+    setMinus (SetSiteFigures a b c) (SetSiteFigures x y z) = SetSiteFigures (a - x) (b - y) (c - z)
+
+-- | What evaluating a source adds at each site but the root's, whose
+-- environment and sets each evaluation builds.  The IO evaluator runs
+-- it, as @nova-nix eval@ does: the pure one evaluates a thunk again each
+-- time it is forced, and so allocates again too.
+sitesOfEval :: FilePath -> Text -> IO (Either Text (Map.Map EnvSite EnvSiteFigures, Map.Map SetSite SetSiteFigures))
+sitesOfEval baseDir source = do
+  outcome <- newIORef (Right ())
+  added <- sitesAdded (evalNixIO baseDir source >>= writeIORef outcome . void)
+  failure <- readIORef outcome
+  pure (failure >> fmap (\counts -> (Map.delete EnvRoot (sitesEnvs counts), Map.delete SetRoot (sitesSets counts))) added)
+
+testAllocSites :: IO [Bool]
+testAllocSites = do
+  putStrLn "eval/alloc-sites"
+  countSites
+  sequence
+    [ runTestM "the evaluator names every site the C side counts, each by a name of its own" $ do
+        envSites <- envSitesCounted
+        setSites <- setSitesCounted
+        let envNames = map envSiteName [minBound .. maxBound]
+            setNames = map setSiteName [minBound .. maxBound]
+        pure $
+          assertEqual "env sites" (fromIntegral envSites) (length envNames)
+            `andThen` assertEqual "set sites" (fromIntegral setSites) (length setNames)
+            `andThen` assertEqual "distinct env names" envNames (nub envNames)
+            `andThen` assertEqual "distinct set names" setNames (nub setNames),
+      runTestM "counting by site counts each env at its site, by size, with its slots and its struct's and slot array's bytes" $
+        quickCheckPasses $
+          QC.forAll (QC.listOf genEnvAllocation) $ \allocations -> QC.ioProperty $ do
+            added <- sitesAdded (mapM_ allocateEnv allocations)
+            pure (fmap (\counts -> (sitesEnvs counts, sitesEnvSizes counts)) added QC.=== Right (envsExpected allocations)),
+      runTestM "counting by site counts each set at its site with its bytes, and an empty one as shareable" $
+        quickCheckPasses $
+          QC.forAll (QC.listOf genSetAllocation) $ \allocations -> QC.ioProperty $ do
+            added <- sitesAdded (mapM_ allocateSet allocations)
+            pure (fmap sitesSets added QC.=== Right (setsExpected allocations)),
+      runTestM "a union with an empty operand counts as shareable, and one of two non-empty sets does not" $ do
+        let one = attrSetFromMap SetLiteral (Map.singleton "a" (evaluated VNull))
+            none = attrSetFromMap SetLiteral Map.empty
+        _ <- evaluate one
+        _ <- evaluate none
+        added <-
+          sitesAdded $
+            mapM_ (\(AttrSet left, AttrSet right) -> void (cattrsetUnion SetUpdate left right)) [(one, none), (none, one), (one, one)]
+        pure (assertEqual "update" (Right (Map.singleton SetUpdate (SetSiteFigures 3 2 (3 * setHeaderSize + 4 * setEntrySize)))) (fmap sitesSets added)),
+      -- Each source's figures are worked out by hand from the evaluator:
+      -- an env is a 48-byte struct with 8 bytes a slot, a set a 40-byte
+      -- header with 16 bytes an entry and room for 8 when made empty.
+      sitesTest
+        "a let makes one env with a slot a binding"
+        "let a = 1; b = 2; in a + b"
+        [(EnvLet, EnvSiteFigures 1 2 64)]
+        [],
+      sitesTest
+        "a call of a lambda with an argument name makes one env of one slot"
+        "(x: x) 1"
+        [(EnvCall, EnvSiteFigures 1 1 56)]
+        [],
+      sitesTest
+        "a curried call makes an env per call, and the inner lambda a closure of what it uses"
+        "(x: y: x) 1 2"
+        [(EnvCall, EnvSiteFigures 2 2 112), (EnvClosure, EnvSiteFigures 1 1 56)]
+        [],
+      sitesTest
+        "a call of a lambda with formals makes one env of a slot a formal"
+        "({ a, b ? 2 }: a + b) { a = 1; }"
+        [(EnvCallFormals, EnvSiteFigures 1 2 64)]
+        [(SetLiteral, SetSiteFigures 1 0 56)],
+      sitesTest
+        "a with makes one env, sharing its scope's slots, with an array of its with-scopes"
+        "with { a = 1; }; a"
+        [(EnvWith, EnvSiteFigures 1 0 56)]
+        [(SetLiteral, SetSiteFigures 1 0 56)],
+      sitesTest
+        "an update with an empty operand makes a set equal to the other, and the empty literal a set of its own"
+        "builtins.deepSeq ({ } // { a = 1; }) null"
+        []
+        [(SetLiteral, SetSiteFigures 2 1 224), (SetUpdate, SetSiteFigures 1 1 56)],
+      sitesTest
+        "map defers an application per element, each of which calls the function"
+        "builtins.deepSeq (builtins.map (x: x) [ 1 2 3 ]) null"
+        [(EnvCall, EnvSiteFigures 3 3 168), (EnvMap, EnvSiteFigures 3 6 192)]
+        [],
+      sitesTest
+        "concatMap defers an application per element before it forces it"
+        "builtins.deepSeq (builtins.concatMap (x: [ x ]) [ 1 2 ]) null"
+        [(EnvCall, EnvSiteFigures 2 2 112), (EnvConcatMap, EnvSiteFigures 2 4 128)]
+        [],
+      sitesTest
+        "each inherit (from) makes an env of one slot"
+        "let s = { a = 1; b = 2; }; in builtins.deepSeq { inherit (s) a; inherit (s) b; } null"
+        [(EnvLet, EnvSiteFigures 1 1 56), (EnvInheritFrom, EnvSiteFigures 2 2 112)]
+        [(SetLiteral, SetSiteFigures 2 0 144)],
+      sitesTest
+        "a let using a variable from outside it makes its frame and a capture of that variable"
+        "(x: let y = x; in y) 1"
+        [(EnvCall, EnvSiteFigures 1 1 56), (EnvLet, EnvSiteFigures 1 1 56), (EnvLetCapture, EnvSiteFigures 1 1 56)]
+        [],
+      sitesTest
+        "a rec set makes one env with a slot a binding and its set"
+        "builtins.deepSeq (rec { a = 1; b = a; }) null"
+        [(EnvRec, EnvSiteFigures 1 2 64)]
+        [(SetRec, SetSiteFigures 1 0 72)],
+      sitesTest
+        "mapAttrs defers an application per attribute, each of which makes two calls"
+        "builtins.deepSeq (builtins.mapAttrs (n: v: v) { a = 1; b = 2; }) null"
+        [(EnvCall, EnvSiteFigures 4 4 224), (EnvMapAttrs, EnvSiteFigures 2 6 144)]
+        [(SetLiteral, SetSiteFigures 1 0 72), (SetMapAttrs, SetSiteFigures 1 0 72)],
+      sitesTest
+        "functionArgs of a lambda without formals makes an empty set"
+        "builtins.deepSeq (builtins.functionArgs (x: x)) null"
+        []
+        [(SetFunctionArgs, SetSiteFigures 1 1 168)]
+    ]
+  where
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    sitesTest name source envs sets =
+      runTestM name $ do
+        tmpBase <- getTemporaryDirectory
+        added <- sitesOfEval tmpBase source
+        pure (assertEqual "envs and sets" (Right (Map.fromList envs, Map.fromList sets)) added)
+    genEnvAllocation = EnvAllocation <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (0, 5)
+    genSetAllocation = SetAllocation <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (0, 4)
+    allocateEnv (EnvAllocation site n) = do
+      let (slots, slotCount) = buildCSlots site (replicate n (evaluated VNull))
+      void (evaluate (newMinimalEnv site slots slotCount))
+    allocateSet (SetAllocation site n) =
+      void (evaluate (attrSetFromMap site (Map.fromList [(T.pack ("k" ++ show i), evaluated VNull) | i <- [1 .. n]])))
+    envsExpected allocations =
+      ( Map.fromListWith
+          addEnv
+          [(site, EnvSiteFigures 1 slots (envStructSize + 8 * slots)) | EnvAllocation site n <- allocations, let slots = fromIntegral n],
+        Map.fromListWith (+) [(EnvSlots (fromIntegral n), 1) | EnvAllocation _ n <- allocations]
+      )
+    setsExpected allocations =
+      Map.fromListWith
+        addSet
+        [ (site, SetSiteFigures 1 (if n == 0 then 1 else 0) (setHeaderSize + setEntrySize * room))
+        | SetAllocation site n <- allocations,
+          let room = if n == 0 then emptySetRoom else fromIntegral n
+        ]
+    addEnv (EnvSiteFigures a b c) (EnvSiteFigures x y z) = EnvSiteFigures (a + x) (b + y) (c + z)
+    addSet (SetSiteFigures a b c) (SetSiteFigures x y z) = SetSiteFigures (a + x) (b + y) (c + z)
+
 testFrameKnots :: IO [Bool]
 testFrameKnots = do
   putStrLn "eval/frame-knots"
@@ -1707,8 +1943,8 @@ testFrameKnots = do
         quickCheckPasses $
           QC.forAll genSlotRead $ \(before, value, after) ->
             QC.ioProperty $ do
-              let (slots, slotCount) = buildCSlots (map (evaluated . VInt) (before ++ value : after))
-                  env@(Env envPtr) = newMinimalEnv slots slotCount
+              let (slots, slotCount) = buildCSlots EnvApply (map (evaluated . VInt) (before ++ value : after))
+                  env@(Env envPtr) = newMinimalEnv EnvApply slots slotCount
               bcIdx <- compileExpr (EResolvedVar 0 (length before))
               let Thunk cell = mkThunkBc env bcIdx
               payload <- cthunkPayload cell
@@ -1766,7 +2002,7 @@ testFrameKnots = do
       runTestM "tieFrame answers the cells it filled the slots with" $ do
         codes <- mapM (compileExpr . ELit . NixInt) [1, 2, 3]
         let (frame, thunks) =
-              tieFrame (length codes) newMinimalEnv (\env -> map (mkThunkBc env) codes)
+              tieFrame EnvLet (length codes) (newMinimalEnv EnvLet) (\env -> map (mkThunkBc env) codes)
             slotted = map (\i -> unThunk (envLookupResolved 0 i frame)) [0 .. length codes - 1]
         pure (assertEqual "cells" slotted (map unThunk thunks))
     ]
@@ -3478,7 +3714,7 @@ testBatch3 = do
       runTest "functionArgs no default" $
         assertEval "funcArgs-nodef" "(builtins.functionArgs ({ a, b ? 1 }: a)).a" (VBool False),
       runTest "functionArgs simple lambda" $
-        assertEval "funcArgs-simple" "builtins.functionArgs (x: x)" (VAttrs (attrSetFromMap Map.empty)),
+        assertEval "funcArgs-simple" "builtins.functionArgs (x: x)" (VAttrs (attrSetFromMap SetFunctionArgs Map.empty)),
       -- Upstream's prim_functionArgs message (primops.cc at 2.24.9), the
       -- same whatever the argument, and tryEval does not catch it.
       runTest "functionArgs of a set is upstream's error" $
@@ -22024,7 +22260,7 @@ arenaGuardPaths =
   [ noArena "compile" "nn_bc_emit" evalNamelessProgram,
     noArena "thunk" "nn_thunk_new_computed_int" (void (evaluate (unThunk (evaluated (VInt 1))))),
     noArena "symbol" "nn_symbol_intern" (void (evaluate (unThunk (evaluated (mkStr "a"))))),
-    noArena "env" "nn_env_alloc_slots" (void (evaluate (fst (buildCSlots [evaluated (VInt 1)])))),
+    noArena "env" "nn_env_alloc_slots" (void (evaluate (fst (buildCSlots EnvApply [evaluated (VInt 1)])))),
     noArena "after-destroy" "nn_bc_emit" (bracket_ arenaInit arenaDestroy (pure ()) >> evalNamelessProgram),
     ArenaGuardPath
       { guardName = "constants-outside-window",
@@ -22367,7 +22603,7 @@ testArenaGuard = do
       arenaGuardPaths
   live <-
     sequence
-      [ liveRefusal "a slot array past UINT32_MAX bytes" "nn_env_alloc_slots" (void (evaluate (fst (tieFrame slotCountPastUInt32 (\_ _ -> emptyEnv) (const []))))),
+      [ liveRefusal "a slot array past UINT32_MAX bytes" "nn_env_alloc_slots" (void (evaluate (fst (tieFrame EnvLet slotCountPastUInt32 (\_ _ -> emptyEnv) (const []))))),
         -- The list's items come from the same slot allocator, so the same
         -- count is refused there and must surface as a list failure, where
         -- a NULL return would read as the empty list.
@@ -22464,11 +22700,11 @@ testCAttrSet = do
   -- Symbol table is initialized by arenaInit in main bracket.
   sequence
     [ runTestM "new/free" $ do
-        _set <- cattrsetNew 16
+        _set <- cattrsetNew SetLiteral 16
         -- set freed by arenaDestroy via nn_attrset_free_all
         pure Pass,
       runTestM "insert + freeze + lookup" $ do
-        set <- cattrsetNew 4
+        set <- cattrsetNew SetLiteral 4
         kName <- symbolIntern "name"
         kVer <- symbolIntern "version"
         valName <- newStablePtr ("hello" :: Text)
@@ -22490,7 +22726,7 @@ testCAttrSet = do
             freeStablePtr valVer
             pure (assertEqual "lookup name" "hello" val),
       runTestM "lookup missing key returns Nothing" $ do
-        set <- cattrsetNew 4
+        set <- cattrsetNew SetLiteral 4
         kFoo <- symbolIntern "foo"
         kBar <- symbolIntern "bar"
         sp <- newStablePtr ("x" :: Text)
@@ -22501,7 +22737,7 @@ testCAttrSet = do
         freeStablePtr sp
         pure (case result of Nothing -> Pass; Just _ -> Fail "expected Nothing"),
       runTestM "size after freeze" $ do
-        set <- cattrsetNew 4
+        set <- cattrsetNew SetLiteral 4
         k1 <- symbolIntern "a"
         k2 <- symbolIntern "b"
         k3 <- symbolIntern "c"
@@ -22515,7 +22751,7 @@ testCAttrSet = do
         freeStablePtr sp
         pure (assertEqual "size" 3 n),
       runTestM "duplicate keys: last writer wins" $ do
-        set <- cattrsetNew 4
+        set <- cattrsetNew SetLiteral 4
         kName <- symbolIntern "name"
         sp1 <- newStablePtr ("first" :: Text)
         sp2 <- newStablePtr ("second" :: Text)
@@ -22536,7 +22772,7 @@ testCAttrSet = do
               else Fail ("size=" <> T.pack (show n) <> " val=" <> val)
           ),
       runTestM "keys returned sorted" $ do
-        set <- cattrsetNew 8
+        set <- cattrsetNew SetLiteral 8
         -- Insert in reverse order; after freeze keys should be sorted by symbol ID
         k1 <- symbolIntern "zzz"
         k2 <- symbolIntern "aaa"
@@ -22554,8 +22790,8 @@ testCAttrSet = do
             sorted = ids == foldl (\acc x -> acc ++ [x]) [] (Set.toAscList (Set.fromList ids))
         pure (if sorted then Pass else Fail ("unsorted: " <> T.pack (show ids))),
       runTestM "union right-biased" $ do
-        setA <- cattrsetNew 4
-        setB <- cattrsetNew 4
+        setA <- cattrsetNew SetLiteral 4
+        setB <- cattrsetNew SetLiteral 4
         kX <- symbolIntern "x"
         kY <- symbolIntern "y"
         kZ <- symbolIntern "z"
@@ -22568,7 +22804,7 @@ testCAttrSet = do
         cattrsetInsert setB kY noPos (spToCPtr spB)
         cattrsetFreeze setA
         cattrsetFreeze setB
-        merged <- cattrsetUnion setA setB
+        merged <- cattrsetUnion SetUpdate setA setB
         n <- cattrsetSize merged
         resultX <- cattrsetLookup merged kX
         valX <- case resultX of
@@ -22584,7 +22820,7 @@ testCAttrSet = do
               else Fail ("size=" <> T.pack (show n) <> " x=" <> valX)
           ),
       runTestM "stress: 10k entries" $ do
-        set <- cattrsetNew 1024
+        set <- cattrsetNew SetLiteral 1024
         sp <- newStablePtr (0 :: Int)
         syms <- mapM (\i -> symbolIntern ("key_" <> T.pack (show (i :: Int)))) [1 .. 10000]
         mapM_ (\sym -> cattrsetInsert set sym noPos (spToCPtr sp)) syms
@@ -22604,7 +22840,7 @@ testCAttrSet = do
       -- Grown from the default capacity, so every doubling runs; the
       -- index of an absent key is the C side's NN_ATTRSET_NOT_FOUND.
       runTestM "index finds each key at its sorted position and none for an absent key" $ do
-        set <- cattrsetNew 0
+        set <- cattrsetNew SetLiteral 0
         sp <- newStablePtr (0 :: Int)
         syms <- mapM (\i -> symbolIntern ("index_" <> T.pack (show (i :: Int)))) [1 .. 100]
         mapM_ (\sym -> cattrsetInsert set sym noPos (spToCPtr sp)) syms
@@ -22630,7 +22866,7 @@ testCAttrSet = do
         sp <- newStablePtr (0 :: Int)
         let genInserts = QC.listOf ((,) <$> QC.elements pool <*> QC.arbitrary)
             build inserts = do
-              set <- cattrsetNew 0
+              set <- cattrsetNew SetLiteral 0
               mapM_ (\(key, pos) -> cattrsetInsert set key (PosIdx pos) (spToCPtr sp)) inserts
               cattrsetFreeze set
               pure set
@@ -22639,8 +22875,8 @@ testCAttrSet = do
                 QC.ioProperty $ do
                   leftSet <- build left
                   rightSet <- build right
-                  merged <- cattrsetUnion leftSet rightSet
-                  kept <- cattrsetRemoveKeys leftSet removed
+                  merged <- cattrsetUnion SetUpdate leftSet rightSet
+                  kept <- cattrsetRemoveKeys SetRemoveAttrs leftSet removed
                   actual <- mapM entryPositions [leftSet, merged, kept]
                   let leftModel = Map.fromList left
                       rightModel = Map.fromList right
@@ -25441,6 +25677,7 @@ runSuite = do
           testEvalRecAttrs,
           testFrameKnots,
           testCensus,
+          testAllocSites,
           testEvalLists,
           testEvalLambda,
           testEvalWith,

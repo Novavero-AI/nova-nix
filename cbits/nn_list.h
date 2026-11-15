@@ -5,7 +5,7 @@
  * contiguous run, against the ~48 bytes per element of the cons cells a
  * Haskell [Thunk] takes on the GHC heap.
  *
- * The items array is allocated via nn_env_alloc_slots (page-based bump
+ * The items array is allocated via nn_env_alloc_items (page-based bump
  * allocator).  The nn_list_t header is malloc'd and tracked for bulk
  * cleanup via nn_list_free_all().  Both are freed at evaluation end.
  *
