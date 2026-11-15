@@ -15564,7 +15564,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
+    checkFiles = ["binutils.nix", "busybox.nix", "gcc-core.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -16481,6 +16481,144 @@ testGcc10Windows = do
         ++ ["gcc-" <> version, "hello-c.sh", "hello-cxx.sh", "stamps.sh"]
         ++ concat [[name, name <> "-builder"] | name <- ["gcc10-hello-c", "gcc10-hello-cxx", "gcc10-stamps"]]
 
+-- | @pkgs\/windows@'s current MinGW-w64, read back as the build driver
+-- reads it: what mingw-w64-headers-latest, mingw-w64-crt-latest and
+-- @test\/data\/mingw-w64-latest.nix@'s checks add to the closure of gcc10,
+-- which compiles the runtime.  The rung is full-source only if the one
+-- leaf it adds is the release's archive and it reads no input source but
+-- the stdenv's own files and what evaluation writes as text.  The headers
+-- install from the archive's own directory, for msvcrt.dll.  The runtime
+-- is compiled from the headers' archive, against the headers' output,
+-- which its flags name as the sysroot; its configure takes the compiler
+-- and archiver the environment names, and the stdenv's are tcc's, so its
+-- @preConfigure@ unsets them, and @C_INCLUDE_PATH@, which GCC reads as
+-- well; and its CFLAGS leave out the @-g@ configure would add.
+testMingwW64LatestWindows :: IO [Bool]
+testMingwW64LatestWindows = do
+  putStrLn "pkgs/mingw-w64-latest"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  fresh <- newEvalState storeDir cwd
+  let st = fresh {esSearchPaths = parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))}
+      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mingw-w64-latest.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          before <- sessionClosure (mapMaybe (`Map.lookup` rootOf) builtBefore)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, before, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, before, full) -> do
+      let added = Map.elems (Map.difference full before)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          headers = derivationAt headersRoot
+          crt = derivationAt crtRoot
+          -- The output of a root's derivation, as a flag spells a store
+          -- path, or a word no flag holds where the root is missing.
+          outputOf root = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (derivationAt root >>= listToMaybe . drvOutputs)
+          wordsOf name = maybe [] (T.words . variableOf name)
+          -- What preConfigure runs before it moves to the build directory.
+          firstLine = maybe "" (T.takeWhile (/= '\n') . variableOf "preConfigure")
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetch is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "the one leaf it adds is MinGW-w64's release archive, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              ([archive], True)
+              (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text and the stdenv's files" $
+            assertEqual
+              "input sources not written as text"
+              ["config.site", "include", "setup.sh"]
+              (sort (map spName (nub [path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]))),
+          runTest "mingw-w64-headers-latest is configured in its own directory, for msvcrt, from the archive" $
+            assertEqual
+              "preConfigure, flags and src"
+              ("cd mingw-w64-headers", ["--with-default-msvcrt=msvcrt"], [archive])
+              ( maybe "" (variableOf "preConfigure") headers,
+                wordsOf "configureFlags" headers,
+                [nameOf drv | drv <- addedLeaves, any ((`elem` wordsOf "src" headers) . storePathToText defaultStoreDir . doPath) (drvOutputs drv)]
+              ),
+          runTest "mingw-w64-crt-latest is built from mingw-w64-headers-latest's archive by gcc10 and binutils, with tcc's variables unset" $
+            assertEqual
+              "src, buildInputs and preConfigure's first line"
+              (wordsOf "src" headers, [outputOf gcc10Root, outputOf binutilsRoot], "unset CC AR C_INCLUDE_PATH", isJust headers)
+              (wordsOf "src" crt, wordsOf "buildInputs" crt, firstLine crt, isJust crt),
+          runTest "mingw-w64-crt-latest's flags name the target as the host, mingw-w64-headers-latest's output as the sysroot, msvcrt and the 32-bit runtime alone, and CFLAGS with no -g" $
+            assertEqual
+              "flags"
+              [ "--host=" <> target,
+                "--with-sysroot=" <> outputOf headersRoot,
+                "--with-default-msvcrt=msvcrt",
+                "--enable-lib32",
+                "--disable-lib64",
+                "--disable-dependency-tracking",
+                "CFLAGS=-O2"
+              ]
+              (wordsOf "configureFlags" crt),
+          runTest "mingw-w64-crt-latest builds and installs with NIX_BUILD_CORES jobs" $
+            assertEqual
+              "parallelism"
+              ("1", "1")
+              (maybe "" (variableOf "enableParallelBuilding") crt, maybe "" (variableOf "enableParallelInstalling") crt)
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the current MinGW-w64's derivations instantiate, adding nine to the closure of gcc10"
+    target :: Text
+    target = "i686-w64-mingw32"
+    version :: Text
+    version = "14.0.0"
+    archive :: Text
+    archive = "mingw-w64-v" <> version <> ".tar.bz2"
+    headersRoot :: Text
+    headersRoot = "pkgs.mingw-w64-headers-latest"
+    crtRoot :: Text
+    crtRoot = "pkgs.mingw-w64-crt-latest"
+    gcc10Root :: Text
+    gcc10Root = "pkgs.gcc10"
+    binutilsRoot :: Text
+    binutilsRoot = "pkgs.binutils"
+    builtBefore :: [Text]
+    builtBefore = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets", binutilsRoot, gcc10Root]
+    roots :: [Text]
+    roots = builtBefore ++ [headersRoot, crtRoot, "checks.crt", "checks.hello"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      [archive, "mingw-w64-headers-" <> version, "mingw-w64-crt-" <> version, "crt.sh", "hello.sh"]
+        ++ concat [[name, name <> "-builder"] | name <- ["mingw-w64-latest-crt", "mingw-w64-latest-hello"]]
+
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
 -- list's, each fixed-output and listed once.  A package that fetches a
@@ -16685,7 +16823,7 @@ testWindowsRungs = do
     -- The rung each stage ends on, so that a workflow read as building
     -- nothing does not pass against an empty list.
     knownRungs :: [(Text, Text)]
-    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "gcc10")]
+    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest")]
     -- What ends a stage's rungs in the string the expression returns: no
     -- attribute path is spelled so.
     stageEnd :: Text
@@ -25412,6 +25550,7 @@ runSuite = do
           testGcc46Windows,
           testGcc46CxxWindows,
           testGcc10Windows,
+          testMingwW64LatestWindows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,

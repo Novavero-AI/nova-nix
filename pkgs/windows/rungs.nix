@@ -67,6 +67,11 @@
   # GCC 4.6.4 with C++, GCC 4.6.4 C++ (Windows).
   gcc46-cxx = [ "gcc46-cxx" ];
 
-  # GCC 10.4.0 with C and C++, GCC 10 (Windows).
-  gcc10 = [ "gcc10" ];
+  # GCC 10.4.0 with C and C++, and the current MinGW-w64 it compiles, GCC
+  # 10 (Windows).
+  gcc10 = [
+    "gcc10"
+    "mingw-w64-headers-latest"
+    "mingw-w64-crt-latest"
+  ];
 }
