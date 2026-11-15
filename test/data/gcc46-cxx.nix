@@ -27,6 +27,18 @@
 # The answer file is derived, not recorded: the program's lines are what
 # the C++ standard defines this program to print, and the DLLs and
 # symbols follow from the configuration.
+#
+# stamps lists every program and DLL gcc46-cxx installs, by its path in
+# the output, with the TimeDateStamp of its COFF file header: the four
+# bytes eight past the PE signature, whose offset is the four bytes at
+# 0x3C (Microsoft's PE format specification, "MS-DOS Stub (Image Only)",
+# "Signature (Image Only)" and "COFF File Header (Object and Image)").
+# ld and strip each write the time there unless the build asks them not
+# to (see pkgs/windows/by-name/gc/gcc46-cxx), so a program that carries
+# it makes two builds of gcc46-cxx differ.  A file with no PE signature
+# at that offset says so in place of its stamp.  CI compares the lines
+# with test/data/gcc46-cxx-stamps-answer.txt, which lists the programs
+# the build installs, each with 0.
 let
   inherit (import ../../pkgs/windows)
     stage0-pe32
@@ -163,9 +175,34 @@ let
       "$bin/i686-w64-mingw32-nm.exe" -p hello.exe | tr -d '\r' | grep -e " T ___cxa_throw$" -e " T ___gxx_personality_sj0$" -e " T __Unwind_SjLj_RaiseException$" | cut -d " " -f 2- | sort
     } | tr -d '\r' > "$out"
   '';
+
+  # od reads an integer in the machine's byte order, which on Windows is
+  # the PE format's little-endian; the signature is the bytes P, E, 0
+  # and 0.
+  stampsScript = writeText "stamps.sh" ''
+    out=$1
+    cd "$2" || exit
+    find . -type f | sort | while read -r file; do
+      case $file in
+        *.exe | *.dll) ;;
+        *) continue ;;
+      esac
+      header=$(( $(od -A n -t u4 -j 60 -N 4 "$file") ))
+      signature=$(od -A n -t x1 -j "$header" -N 4 "$file" | tr -d ' ')
+      if [ "$signature" = 50450000 ]; then
+        echo "$file $(( $(od -A n -t u4 -j $((header + 8)) -N 4 "$file") ))"
+      else
+        echo "$file has no PE signature"
+      fi
+    done > "$out"
+  '';
 in
 {
   hello = kaem.runCommand "gcc46-cxx-hello" { } ''
     ${busybox-w32}/bin/busybox.exe sh ${helloScript} ''${out} ${gcc46-cxx} ${binutils}
+  '';
+
+  stamps = kaem.runCommand "gcc46-cxx-stamps" { } ''
+    ${busybox-w32}/bin/busybox.exe sh ${stampsScript} ''${out} ${gcc46-cxx}
   '';
 }

@@ -1,0 +1,11 @@
+./bin/i686-w64-mingw32-c++.exe 0
+./bin/i686-w64-mingw32-cpp.exe 0
+./bin/i686-w64-mingw32-g++.exe 0
+./bin/i686-w64-mingw32-gcc-4.6.4.exe 0
+./bin/i686-w64-mingw32-gcc.exe 0
+./bin/i686-w64-mingw32-gcov.exe 0
+./libexec/gcc/i686-w64-mingw32/4.6.4/cc1.exe 0
+./libexec/gcc/i686-w64-mingw32/4.6.4/cc1plus.exe 0
+./libexec/gcc/i686-w64-mingw32/4.6.4/collect2.exe 0
+./libexec/gcc/i686-w64-mingw32/4.6.4/install-tools/fixincl.exe 0
+./libexec/gcc/i686-w64-mingw32/4.6.4/lto-wrapper.exe 0

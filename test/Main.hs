@@ -14135,7 +14135,7 @@ testGcc46Windows = do
         ++ concat [[name, name <> "-builder"] | name <- ["mingw-w64-crt-contents", "gcc46-hello"]]
 
 -- | @pkgs\/windows@'s C++ rung, read back as the build driver reads it: what
--- gcc46-cxx and @test\/data\/gcc46-cxx.nix@'s check add to the closure of
+-- gcc46-cxx and @test\/data\/gcc46-cxx.nix@'s checks add to the closure of
 -- the rung before it, gcc46, which builds it.  The rung is full-source only
 -- if the one leaf it adds is GCC's g++ archive and it reads no input source
 -- but the stdenv's own files and what evaluation writes as text; the rest
@@ -14143,11 +14143,12 @@ testGcc46Windows = do
 -- @setup.sh@ (@src@) and its @preConfigure@ (the other three) unpack from
 -- the variables that name them.  Its configure is told by
 -- flags where MinGW-w64's headers and runtime, the assembler and the
--- linker are, and which compiler, archiver, linker and strip the build
--- runs, so each has to name the output of the derivation that builds it,
--- or the target's name binutils and gcc46 install their programs under.
--- Every flag that sets a compiler's options leaves out the @-g@ whose
--- debugging information would name the build directory.
+-- linker are, and which compiler, archiver and linker the build runs, and
+-- its install which strip, so each has to name the output of the
+-- derivation that builds it, or the target's name binutils and gcc46
+-- install their programs under.  Every flag that sets a compiler's options
+-- leaves out the @-g@ whose debugging information would name the build
+-- directory, and every link and strip is told to write no time stamp.
 testGcc46CxxWindows :: IO [Bool]
 testGcc46CxxWindows = do
   putStrLn "pkgs/gcc46-cxx"
@@ -14238,11 +14239,16 @@ testGcc46CxxWindows = do
                 "--with-ld=" <> outputOf binutilsRoot <> "/bin/" <> target <> "-ld.exe"
               ]
               (flagsWith ["--target=", "--with-headers", "--with-libs", "--with-sysroot", "--with-build-sysroot", "--with-as=", "--with-ld="] gccCxx),
-          runTest "gcc46-cxx builds with gcc46's driver and binutils' archiver, linker and strip, by the target's names" $
+          runTest "gcc46-cxx builds with gcc46's driver and binutils' archiver and linker, by the target's names" $
             assertEqual
               "tools"
-              ["CC=" <> target <> "-gcc", "AR=" <> target <> "-ar", "LD=" <> target <> "-ld", "STRIP=" <> target <> "-strip"]
+              ["CC=" <> target <> "-gcc", "AR=" <> target <> "-ar", "LD=" <> target <> "-ld"]
               (flagsWith ["CC=", "AR=", "LD=", "STRIP=", "CXX=", "RANLIB="] gccCxx),
+          runTest "gcc46-cxx gives every link it makes --no-insert-timestamp, and LDFLAGS nothing else" $
+            assertEqual
+              "LDFLAGS"
+              ["LDFLAGS=-Wl,--no-insert-timestamp"]
+              (flagsWith ["LDFLAGS=", "LDFLAGS_FOR_BUILD="] gccCxx),
           runTest "gcc46-cxx's compiler options carry no -g, and libgcc's debugging flags are -g0" $
             assertEqual
               "the options and makeFlags"
@@ -14258,11 +14264,11 @@ testGcc46CxxWindows = do
               "preConfigure's unset lines"
               ["unset C_INCLUDE_PATH"]
               (filter ("unset " `T.isPrefixOf`) (maybe [] (map T.strip . T.lines . variableOf "preConfigure") gccCxx)),
-          runTest "gcc46-cxx builds all with NIX_BUILD_CORES jobs and installs with install-strip" $
+          runTest "gcc46-cxx builds all with NIX_BUILD_CORES jobs and installs with install-strip, whose strip keeps the zero time stamp ld writes" $
             assertEqual
               "phases and parallelism"
               ( "",
-                "make ${enableParallelInstalling:+-j$NIX_BUILD_CORES} $makeFlags install-strip",
+                "make ${enableParallelInstalling:+-j$NIX_BUILD_CORES} $makeFlags 'STRIP=" <> target <> "-strip -p' install-strip",
                 "1",
                 "1"
               )
@@ -14274,7 +14280,7 @@ testGcc46CxxWindows = do
         ]
   where
     instantiates :: Text
-    instantiates = "the C++ rung's derivations instantiate, adding five to the closure of gcc46's rung"
+    instantiates = "the C++ rung's derivations instantiate, adding eight to the closure of gcc46's rung"
     target :: Text
     target = "i686-w64-mingw32"
     cxxArchive :: Text
@@ -14297,11 +14303,13 @@ testGcc46CxxWindows = do
     builtBefore :: [Text]
     builtBefore = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets", binutilsRoot, headersRoot, "pkgs.mingw-w64-dirent", gccCoreRoot, crtRoot, gcc46Root]
     roots :: [Text]
-    roots = builtBefore ++ [gccCxxRoot, "checks.hello"]
-    -- The kaem.runCommand adds its script, written by writeText as
+    roots = builtBefore ++ [gccCxxRoot, "checks.hello", "checks.stamps"]
+    -- Each kaem.runCommand adds its script, written by writeText as
     -- <name>-builder.
     addedNames :: [Text]
-    addedNames = [cxxArchive, "gcc-cxx-4.6.4", "hello.sh", "gcc46-cxx-hello", "gcc46-cxx-hello-builder"]
+    addedNames =
+      [cxxArchive, "gcc-cxx-4.6.4", "hello.sh", "stamps.sh"]
+        ++ concat [[name, name <> "-builder"] | name <- ["gcc46-cxx-hello", "gcc46-cxx-stamps"]]
 
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
