@@ -718,18 +718,14 @@ collectBcAttrPathNames pathLen pathOff = T.intercalate "." (go pathLen pathOff)
        in name : go (n - 1) (off + 2)
 
 -- | Resolve one attr-path element (two words at @off@) to its key text.
--- A dynamic key must produce a string - null included, as upstream's
--- select and has-attr key coercion rejects null with a type error.
+-- A dynamic key is read as upstream's select and has-attr read one
+-- (@getName@, eval.cc:210 at 2.24.9), null refused with the rest.
 resolveBcAttrKey :: (MonadEval m) => Env -> Word32 -> m Text
 resolveBcAttrKey env off = do
   let isExpr = unsafePerformIO (cbcData off)
       keyVal = unsafePerformIO (cbcData (off + 1))
   if isExpr /= 0
-    then do
-      keyResult <- evalBytecode env keyVal
-      case keyResult of
-        VStr s _ -> decodedText "dynamic attribute key" s
-        _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName keyResult)
+    then evalBytecode env keyVal >>= attrNameOf "dynamic attribute key"
     else pure (symbolText (Symbol keyVal))
 
 -- | Walk an attribute path stored in the bytecode data buffer.
@@ -970,15 +966,16 @@ buildBcEntryMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
         Nothing -> pure (Map.insert key entry acc)
         Just _ -> throwEvalError ("dynamic attribute '" <> key <> "' already defined")
 
--- | Resolve a bytecode attr key to text.
+-- | Resolve a bytecode attr key to text.  A dynamic key that is null
+-- binds nothing, and any other is read as an attribute name, as upstream's
+-- @ExprAttrs::eval@ does (eval.cc:1261-1263 at 2.24.9).
 resolveBcKey :: (MonadEval m) => Env -> BcAttrKey -> m (Maybe Text)
 resolveBcKey _env (BcStaticKey sym) = pure (Just (symbolText (Symbol sym)))
 resolveBcKey env (BcDynamicKey bcIdx0) = do
   val <- evalBytecode env bcIdx0
   case val of
-    VStr s _ -> Just <$> decodedText "dynamic attribute key" s
     VNull -> pure Nothing
-    _ -> throwEvalError ("dynamic attribute key must be a string, got " <> typeName val)
+    _ -> Just <$> attrNameOf "dynamic attribute key" val
 
 -- | Top-level keys knowable without evaluating any dynamic key: static keys
 -- and inherited names.  These populate the rec env's name table while the
@@ -1855,40 +1852,35 @@ listToAttrsPair thunk = do
       nameThunk <-
         maybe (throwEvalError "builtins.listToAttrs: element missing 'name'") pure $
           attrSetLookup "name" attrs
-      nameVal <- force nameThunk
-      case nameVal of
-        VStr keyName _ ->
-          case attrSetLookupEntry "value" attrs of
-            Just valueEntry -> do
-              key <- decodedText "builtins.listToAttrs: attribute name" keyName
-              pure (key, valueEntry)
-            Nothing -> throwEvalError "builtins.listToAttrs: element missing 'value'"
-        _ -> throwEvalError "builtins.listToAttrs: 'name' must be a string"
+      key <- force nameThunk >>= attrNameOf "builtins.listToAttrs: attribute name"
+      case attrSetLookupEntry "value" attrs of
+        Just valueEntry -> pure (key, valueEntry)
+        Nothing -> throwEvalError "builtins.listToAttrs: element missing 'value'"
     _ -> throwEvalError "builtins.listToAttrs: element must be a set"
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - attr set (arity 2)
 -- ---------------------------------------------------------------------------
 
+-- | Upstream's @prim_hasAttr@ (primops.cc:2800 at 2.24.9): the name, read
+-- as an attribute name, then the set.
 builtinHasAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHasAttr (VStr key _) (VAttrs attrs) = do
-  name <- decodedText "builtins.hasAttr" key
-  pure (VBool (attrSetMember name attrs))
-builtinHasAttr (VStr _ _) other =
-  throwEvalError ("builtins.hasAttr: expected a set, got " <> typeName other)
-builtinHasAttr other _ =
-  throwEvalError ("builtins.hasAttr: expected a string, got " <> typeName other)
+builtinHasAttr nameVal setVal = do
+  name <- attrNameOf "builtins.hasAttr" nameVal
+  case setVal of
+    VAttrs attrs -> pure (VBool (attrSetMember name attrs))
+    other -> throwEvalError ("builtins.hasAttr: expected a set, got " <> typeName other)
 
+-- | Upstream's @prim_getAttr@ (primops.cc:2705 at 2.24.9): the name, read
+-- as an attribute name, then the set.
 builtinGetAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinGetAttr (VStr key _) (VAttrs attrs) = do
-  name <- decodedText "builtins.getAttr" key
-  case attrSetLookup name attrs of
-    Just thunk -> force thunk
-    Nothing -> throwEvalError ("builtins.getAttr: attribute '" <> name <> "' not found")
-builtinGetAttr (VStr _ _) other =
-  throwEvalError ("builtins.getAttr: expected a set, got " <> typeName other)
-builtinGetAttr other _ =
-  throwEvalError ("builtins.getAttr: expected a string, got " <> typeName other)
+builtinGetAttr nameVal setVal = do
+  name <- attrNameOf "builtins.getAttr" nameVal
+  case setVal of
+    VAttrs attrs -> case attrSetLookup name attrs of
+      Just thunk -> force thunk
+      Nothing -> throwEvalError ("builtins.getAttr: attribute '" <> name <> "' not found")
+    other -> throwEvalError ("builtins.getAttr: expected a set, got " <> typeName other)
 
 -- | Where an attribute was defined, as upstream's @prim_unsafeGetAttrPos@
 -- gives it (primops.cc at 2.24.9): its 'positionValue', and null for a
@@ -1922,17 +1914,12 @@ positionValue idx = case lookupPos idx of
   Just (PosInText _ _) -> VNull
   Nothing -> VNull
 
+-- | Upstream's @prim_removeAttrs@ (primops.cc:2844 at 2.24.9): each name
+-- read as an attribute name, first to last.
 builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinRemoveAttrs (VAttrs attrs) (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  keys <- mapM forceToString thunks
+  keys <- mapM (force . Thunk >=> attrNameOf "builtins.removeAttrs") (clistThunks cl)
   pure (VAttrs (attrSetRemoveKeys keys attrs))
-  where
-    forceToString thunk = do
-      val <- force thunk
-      case val of
-        VStr s _ -> decodedText "builtins.removeAttrs" s
-        _ -> throwEvalError "builtins.removeAttrs: key list must contain strings"
 builtinRemoveAttrs (VAttrs _) other =
   throwEvalError ("builtins.removeAttrs: expected a list, got " <> typeName other)
 builtinRemoveAttrs other _ =
@@ -1952,16 +1939,16 @@ builtinIntersectAttrs (VAttrs _) other =
 builtinIntersectAttrs other _ =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 
+-- | Upstream's @prim_catAttrs@ (primops.cc:3017 at 2.24.9): the name, read
+-- as an attribute name, then the list.
 builtinCatAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinCatAttrs (VStr key _) (VList cl) = do
-  name <- decodedText "builtins.catAttrs" key
-  let thunks = map Thunk (clistThunks cl)
-  vals <- catAttrsCollect name thunks
-  pure (VList (clistFromThunks (map thunkToCPtr vals)))
-builtinCatAttrs (VStr _ _) other =
-  throwEvalError ("builtins.catAttrs: expected a list, got " <> typeName other)
-builtinCatAttrs other _ =
-  throwEvalError ("builtins.catAttrs: expected a string, got " <> typeName other)
+builtinCatAttrs nameVal listVal = do
+  name <- attrNameOf "builtins.catAttrs" nameVal
+  case listVal of
+    VList cl -> do
+      vals <- catAttrsCollect name (map Thunk (clistThunks cl))
+      pure (VList (clistFromThunks (map thunkToCPtr vals)))
+    other -> throwEvalError ("builtins.catAttrs: expected a list, got " <> typeName other)
 
 -- | Collect values for a given key from a list of attrsets.
 -- Tail-recursive with accumulator to avoid stack overflow on large lists.
@@ -2222,12 +2209,8 @@ groupByCollect ::
   m (Map Text [Thunk])
 groupByCollect _ [] acc = pure acc
 groupByCollect func (thunk : rest) acc = do
-  result <- applyValueLazy func thunk
-  case result of
-    VStr key _ -> do
-      name <- decodedText "builtins.groupBy" key
-      groupByCollect func rest (Map.insertWith (++) name [thunk] acc)
-    _ -> throwEvalError "builtins.groupBy: function must return a string"
+  name <- applyValueLazy func thunk >>= attrNameOf "builtins.groupBy"
+  groupByCollect func rest (Map.insertWith (++) name [thunk] acc)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - string (arity 2)
@@ -4880,6 +4863,14 @@ structuredStringValue rule val = case (val, rule) of
   (VStr s _, _) -> pure s
   (other, _) ->
     throwEvalError ("expected a string but found " <> typeName other <> ": " <> printValue PrintForError other)
+
+-- | An attribute name a program computes, read as upstream reads every
+-- one, with @forceStringNoCtx@ (eval.cc:2253 at 2.24.9): a string, never a
+-- value coerced to one, and one with no context.  The text names the
+-- reader in an invalid UTF-8 refusal, which upstream, holding bytes, never
+-- makes.
+attrNameOf :: (MonadEval m) => Text -> NixValue -> m Text
+attrNameOf reader = structuredStringValue RefuseContext >=> decodedText reader
 
 -- | An element of a structured derivation's @outputs@ list: a string
 -- without context, where the environment would coerce it.
