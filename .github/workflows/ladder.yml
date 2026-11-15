@@ -1860,20 +1860,24 @@ jobs:
   # test/data/binutils-x86_64.nix has build an x86_64 program and an i386
   # one that run, and GCC 16.2.0's C compiler and libgcc for that target,
   # gcc-core-x86_64, which test/data/gcc-core-x86_64.nix has compile a
-  # function that ld links with libgcc into a program that runs.  Each
-  # check also finds no program the rung installs carrying a time stamp.
+  # function that ld links with libgcc into a program that runs, and finds
+  # no program either installs carrying a time stamp.  That compiler then
+  # compiles MinGW-w64 v14.0.0's runtime for x86_64, whose files and start
+  # file test/data/mingw-w64-x86_64.nix compares with another build of the
+  # release, and against which it has the compiler link a program that
+  # runs.
   #
   # The timeout is twice an estimate of this stage on the ARM64 leg, about
-  # 82 minutes: on a 24-thread x64 Windows machine binutils-x86_64 builds
-  # in 4 minutes and gcc-core-x86_64 in 16, where gcc10 builds in 13 and
-  # GCC 10 (Windows ARM64) takes 52, and GCC 4.6.4 C++ (Windows ARM64)
-  # spends 2 minutes around its build.
+  # 94 minutes: on a 24-thread x64 Windows machine binutils-x86_64 builds
+  # in 4 minutes, gcc-core-x86_64 in 16 and mingw-w64-crt-x86_64 in 3,
+  # where gcc10 builds in 13 and GCC 10 (Windows ARM64) takes 52, and GCC
+  # 4.6.4 C++ (Windows ARM64) spends 2 minutes around its build.
   # ---------------------------------------------------------------------------
   x86_64-windows:
     name: x86_64
     needs: [gcc-latest-windows]
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 164
+    timeout-minutes: 188
     environment:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
@@ -2014,6 +2018,51 @@ jobs:
           for check in link stamps; do
             expected=test/data/gcc-core-x86_64-$check-answer.txt
             if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc-core-x86_64.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # MinGW-w64 v14.0.0's runtime for x86_64-w64-mingw32, configured,
+      # compiled and installed in the seed stdenv by gcc-core-x86_64, timed.
+      - name: Build mingw-w64-crt-x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A mingw-w64-crt-x86_64
+          echo "== mingw-w64-crt-x86_64 built in $((SECONDS - start)) s"
+
+      # busybox's sh runs test/data/mingw-w64-x86_64.nix's two scripts.  crt
+      # lists every file the runtime installs and crt2.o's global symbols,
+      # which a configure test decides without failing the build, and the
+      # lines are compared with what Homebrew's build of the release installs
+      # for x86_64 and with its crt2.o.  hello has gcc-core-x86_64 compile and
+      # link a program against the runtime, which calls three functions the
+      # runtime compiles, runs it, and writes what it prints and its exit
+      # status, the DLLs it imports, the three functions it links, how many
+      # debugging sections it has and the machine and optional header magic
+      # od reads from its PE header, and the lines are compared with what
+      # MinGW-w64's headers and sources define the program to print and what
+      # the configuration links.
+      - name: gcc-core-x86_64 links a program against the x86_64 runtime
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in crt hello; do
+            expected=test/data/mingw-w64-x86_64-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/mingw-w64-x86_64.nix -A "$check" | tail -n 1); then
               echo "::error::busybox sh did not run $check's script"
               status=1
               continue
