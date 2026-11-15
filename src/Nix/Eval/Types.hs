@@ -26,6 +26,7 @@ module Nix.Eval.Types
     attrSetLookupEntry,
     attrSetKeys,
     firstInSymbolOrder,
+    attrSetAt,
     attrSetToMap,
     attrSetFromMap,
     attrSetFromEntries,
@@ -488,6 +489,20 @@ firstInSymbolOrder :: (MonadCData m) => NonEmpty Text -> m Text
 firstInSymbolOrder names = do
   symbols <- traverse symbolIntern names
   pure (snd (NE.head (NE.sortWith fst (NE.zip symbols names))))
+
+-- | The name and value at an index of the C array, which holds a set's
+-- attributes in interned-symbol order; 'Nothing' outside it.  A walk by
+-- index reads one entry at a time, where 'attrSetToMap' copies them all.
+attrSetAt :: (MonadCData m) => AttrSet -> Int -> m (Maybe (Symbol, Thunk))
+attrSetAt attrs@(AttrSet cset) i = do
+  size <- attrSetSize attrs
+  if i < 0 || i >= size
+    then pure Nothing
+    else do
+      let idx = fromIntegral i
+      name <- cattrsetGetKey cset idx
+      ptr <- cattrsetGetValue cset idx
+      pure (Just (name, Thunk ptr))
 
 -- | Check key membership without materializing thunks.
 attrSetMember :: (MonadCData m) => Text -> AttrSet -> m Bool
