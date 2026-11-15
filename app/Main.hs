@@ -10,7 +10,7 @@
 module Main (main) where
 
 import Control.Exception (AsyncException (UserInterrupt), bracket, displayException, handle, handleJust, try)
-import Control.Monad (mfilter, void, (>=>))
+import Control.Monad (mfilter, void)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -37,14 +37,13 @@ import qualified Nix.Config as Config
 import Nix.DependencyGraph (DepNode (..), buildDepGraph)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetToMap, eval, evaluated, force, readThunkValue)
+import Nix.Eval (Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, deepForce, eval, force, readThunkValue)
 import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.IO (EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIOTraced)
+import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, newEvalState, renderEvalFailure, runEvalIOTraced)
 import Nix.Eval.Print (printAmbiguous)
-import Nix.Eval.Types (clistFromThunks, clistThunks, thunkToCPtr)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.HostPath (hostPathFromBytes)
@@ -997,30 +996,16 @@ failSource (UndefinedVariable name) = failWith ("error: " <> undefinedVariableMe
 -- Output formatting
 -- ---------------------------------------------------------------------------
 
--- | Optionally deep-force a value before printing.
--- With @--strict@, all thunks are recursively materialized.
--- Without it, thunks display as @"thunk"@ - safe for large results.
-finalize :: (MonadEval m) => Bool -> NixValue -> m NixValue
-finalize True = deepForceValue
-finalize False = pure
-
--- ---------------------------------------------------------------------------
--- Deep-force and pretty-print
--- ---------------------------------------------------------------------------
-
--- | Recursively force all thunks in a value, returning the fully
--- materialized tree.  Unlike 'deepForce' (which returns @()@), this
--- rebuilds the value with all thunks replaced by computed C thunks.
-deepForceValue :: (MonadEval m) => NixValue -> m NixValue
-deepForceValue (VList cl) = do
-  let thunks = map Thunk (clistThunks cl)
-  forced <- mapM (force >=> deepForceValue) thunks
-  pure (VList (clistFromThunks (map (thunkToCPtr . evaluated) forced)))
-deepForceValue (VAttrs attrs) = do
-  let m = attrSetToMap attrs
-  forced <- mapM (force >=> deepForceValue) m
-  pure (VAttrs (attrSetFromMap (Map.map evaluated forced)))
-deepForceValue val = pure val
+-- | With @--strict@, force everything inside the result before it prints,
+-- as nix-instantiate does (nix-instantiate.cc:59 at 2.24.9).  The value
+-- itself is what prints: the IO evaluator keeps each forced value in its
+-- cell, where the printer reads it, so a set or list the result holds
+-- twice is still one set or list, and prints as repeated the second
+-- time.  Without @--strict@, an element or attribute never forced prints
+-- as upstream's thunk marker.
+finalize :: Bool -> NixValue -> EvalIO NixValue
+finalize True val = val <$ deepForce val
+finalize False val = pure val
 
 -- | Write an eval result and its newline to stdout as bytes.  A string's
 -- payload need not be UTF-8, so nothing on this path decodes or re-encodes

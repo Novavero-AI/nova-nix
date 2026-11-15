@@ -18,14 +18,18 @@
 -- @~\/@ path, a variable bound to a literal by @let@ or @rec@, a global
 -- such as @map@).  A function value carries neither the name nor
 -- the source position upstream prints after @lambda@, so its marker holds
--- the word alone.  A set or list reached a second time prints again where
--- upstream marks it repeated, which needs value identity this printer
--- does not track.
+-- the word alone.
 --
 -- Upstream's @printAmbiguous@ (print-ambiguous.cc) writes what
 -- @nix-instantiate --eval@ prints, and 'printAmbiguous' writes what
 -- @nova-nix eval@ prints.  It renders to bytes: a string's payload is
 -- bytes that need not be UTF-8, and upstream writes them as they are.
+--
+-- Both printers, like upstream's, print a set or list they reach a second
+-- time as a repeated marker, so a value that holds itself, as every
+-- derivation does through its @all@ and output attributes, prints to an
+-- end.  The same means the same set or list, not an equal one: two sets
+-- made apart with the same attributes both print in full.
 module Nix.Eval.Print
   ( PrintOptions (..),
     printValue,
@@ -42,11 +46,15 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.List (partition)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.String (IsString)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Nix.Eval.Types (AttrSet, NixValue (..), Thunk (..), attrSetToAscList, bytesToTextLossy, clistThunks, readThunkValue, thunkUnderEvaluation)
+import Nix.Eval.CList (CListPtr)
+import Nix.Eval.CThunk (CThunkPtr)
+import Nix.Eval.Types (AttrSet (..), CAttrSet, CList (..), NixValue (..), Thunk (..), attrSetNull, attrSetToAscList, bytesToTextLossy, clistLen, clistThunks, readThunkValue, thunkUnderEvaluation)
 
 -- | Which of upstream's option sets a print follows.
 data PrintOptions
@@ -83,20 +91,32 @@ limitedTo :: Int -> PrintOptions -> Limit
 limitedTo _ PrintInFull = Unlimited
 limitedTo bound PrintForError = AtMost bound
 
--- | How many attributes and list items one print has shown.  Upstream's
--- bounds on them count over the whole print, not per set or list.
-data Shown = Shown {shownAttrs :: !Int, shownItems :: !Int}
+-- | What one print has done so far: how many attributes and list items it
+-- has shown, and which sets and lists it has entered.  Upstream counts
+-- toward its bounds, and remembers what it has entered, over the whole
+-- print, not per set or list.  'printAmbiguous' bounds nothing, so only
+-- what it has entered changes there.
+data Shown = Shown
+  { shownAttrs :: !Int,
+    shownItems :: !Int,
+    shownEntered :: !(Set Entered)
+  }
 
 type Printer = State Shown
+
+-- | A print that has shown and entered nothing yet.
+nothingShown :: Shown
+nothingShown = Shown 0 0 Set.empty
 
 -- | Render a value as upstream's @printValue@ renders it under the given
 -- options.
 printValue :: PrintOptions -> NixValue -> Text
-printValue options val = evalState (printAt options 0 val) (Shown 0 0)
+printValue options val = evalState (printAt options 0 Nothing val) nothingShown
 
--- | A value at a nesting depth, the top-level value being at 0.
-printAt :: PrintOptions -> Int -> NixValue -> Printer Text
-printAt options depth val = case val of
+-- | A value at a nesting depth, the top-level value being at 0, with the
+-- cell it was read from.  The top-level value is handed over without one.
+printAt :: PrintOptions -> Int -> Maybe Thunk -> NixValue -> Printer Text
+printAt options depth cell val = case val of
   VInt n -> pure (T.pack (show n))
   VFloat f -> pure (formatXmlFloat f)
   VBool True -> pure "true"
@@ -104,8 +124,8 @@ printAt options depth val = case val of
   VNull -> pure "null"
   VStr bytes _ -> pure (printString options bytes)
   VPath p -> pure p
-  VList cl -> printList options depth (map Thunk (clistThunks cl))
-  VAttrs attrs -> printAttrs options depth attrs
+  VList cl -> entering repeatedMarker (printedList cell cl) (printList options depth (map Thunk (clistThunks cl)))
+  VAttrs attrs -> entering repeatedMarker (Just (printedSet attrs)) (printAttrs options depth attrs)
   -- What upstream prints for a lambda whose expression it cannot reach.
   VLambda {} -> pure (marker "lambda")
   VBuiltin name [] -> pure (marker ("primop " <> name))
@@ -176,7 +196,7 @@ importantAttrNames = ["_type", "type"]
 -- thunk whose force is still running.
 printThunk :: PrintOptions -> Int -> Thunk -> Printer Text
 printThunk options depth thunk = case readThunkValue thunk of
-  Just val -> printAt options depth val
+  Just val -> printAt options depth (Just thunk) val
   Nothing
     | thunkUnderEvaluation thunk -> pure (marker "potential infinite recursion")
     | otherwise -> pure (marker "thunk")
@@ -235,6 +255,97 @@ builderText :: BB.Builder -> Text
 builderText = bytesToTextLossy . BL.toStrict . BB.toLazyByteString
 
 -- ---------------------------------------------------------------------------
+-- Repeated sets and lists
+-- ---------------------------------------------------------------------------
+
+-- | A set or list a print has entered, by the identity upstream's printers
+-- remember one by.  Each is a C pointer: the C layer frees nothing before
+-- its arena is destroyed, and a print runs inside one evaluation, so a
+-- pointer names one set, list or cell for the whole print.
+data Entered
+  = -- | A set, by its C set, as upstream remembers a set by its
+    -- @Bindings@.
+    EnteredSet !CAttrSet
+  | -- | Every set with no attributes, as one.  Upstream allocates a set
+    -- with room for none as its one @emptyBindings@ (attr-set.cc:16-17 at
+    -- 2.24.9), which is what a @{ }@ literal and every builtin that sizes
+    -- its result by what it holds produce.  Three empty sets are sized by
+    -- more than they hold: @removeAttrs@ of every attribute and
+    -- @intersectAttrs@ of two sets with no name in common, sized by their
+    -- arguments (primops.cc:2852, :2945), and a literal whose every name
+    -- is a null @${...}@, sized by its attributes (eval.cc:1193,
+    -- :1261-1262).  Each of those is a set of its own upstream and one
+    -- with the rest here.
+    EnteredEmptySet
+  | -- | A list, by the cell it was read from, as upstream remembers a list
+    -- by its @Value@.
+    EnteredCell !CThunkPtr
+  | -- | A list, by its C list, which every cell holding the list shares.
+    EnteredList !CListPtr
+  deriving (Eq, Ord)
+
+-- | Print a set or list the first time a print enters it, and the given
+-- marker each time after.  One with no identity prints in full each time.
+entering :: a -> Maybe Entered -> Printer a -> Printer a
+entering _ Nothing body = body
+entering repeated (Just key) body = gets (Set.member key . shownEntered) >>= enterUnlessSeen
+  where
+    enterUnlessSeen True = pure repeated
+    enterUnlessSeen False = modify' (\shown -> shown {shownEntered = Set.insert key (shownEntered shown)}) >> body
+
+-- | Upstream's @printRepeated@.
+repeatedMarker :: Text
+repeatedMarker = marker "repeated"
+
+-- | What 'printValue' enters a set by (print.cc:332 at 2.24.9): its
+-- bindings, an empty set's included.
+printedSet :: AttrSet -> Entered
+printedSet attrs
+  | attrSetNull attrs = EnteredEmptySet
+  | otherwise = EnteredSet (unAttrSet attrs)
+
+-- | What 'printValue' enters a list with elements by (print.cc:410): the
+-- cell holding it.  The top-level value has no cell, so a list there is
+-- entered by nothing.  Upstream's top-level @Value@ is the one its caller
+-- hands over: a temporary for a coercion (eval.cc:2010-2014), which
+-- nothing else holds either, and for @builtins.trace@ the argument itself
+-- (primops.cc:1018), so a traced list that holds itself prints one level
+-- deeper here before the marker.
+printedList :: Maybe Thunk -> CList -> Maybe Entered
+printedList cell cl
+  | clistLen cl == 0 = Nothing
+  | otherwise = EnteredCell . unThunk <$> cell
+
+-- | What 'printAmbiguous' enters a set with attributes by
+-- (print-ambiguous.cc:39 at 2.24.9): its bindings.  An empty set is
+-- entered by nothing and always prints in full.
+resultSet :: AttrSet -> Maybe Entered
+resultSet attrs
+  | attrSetNull attrs = Nothing
+  | otherwise = Just (EnteredSet (unAttrSet attrs))
+
+-- | What 'printAmbiguous' enters a list with elements by
+-- (print-ambiguous.cc:53): where its elements are.  Upstream keeps a short
+-- list's elements inside its @Value@ and a longer one's in an array every
+-- copy of that @Value@ shares (value.hh:407-410), so a short list is
+-- entered by the cell holding it and a longer one by its C list.  The
+-- top-level value has no cell, and upstream's is nix-instantiate's own
+-- copy (nix-instantiate.cc:50), which nothing else holds, so a short list
+-- there is entered by nothing.
+resultList :: Maybe Thunk -> CList -> Maybe Entered
+resultList cell cl
+  | len == 0 = Nothing
+  | len <= inlineListElements = EnteredCell . unThunk <$> cell
+  | otherwise = Just (EnteredList (unCList cl))
+  where
+    len = clistLen cl
+
+-- | The most elements upstream keeps inside a list's @Value@
+-- (@smallList@, value.hh:250 at 2.24.9).
+inlineListElements :: Int
+inlineListElements = 2
+
+-- ---------------------------------------------------------------------------
 -- The eval result
 -- ---------------------------------------------------------------------------
 
@@ -244,25 +355,31 @@ builderText = bytesToTextLossy . BL.toStrict . BB.toLazyByteString
 -- escaped as 'printValue' escapes it and never cut, and a float in a
 -- default ostream's six-digit form, as 'formatXmlFloat' writes it.
 printAmbiguous :: NixValue -> BB.Builder
-printAmbiguous val = case val of
-  VInt n -> BB.int64Dec n
-  VFloat f -> TE.encodeUtf8Builder (formatXmlFloat f)
-  VBool True -> "true"
-  VBool False -> "false"
-  VNull -> "null"
-  VStr bytes _ -> quotedBytes (BS.length bytes) bytes
-  VPath p -> TE.encodeUtf8Builder p
-  VList cl -> bracketed "[" "]" (map (printElement . Thunk) (clistThunks cl))
-  VAttrs attrs -> bracketed "{" "}" (map printAttribute (attrSetToAscList attrs))
-  VLambda {} -> "<LAMBDA>"
-  VBuiltin _ [] -> "<PRIMOP>"
-  VBuiltin _ _ -> "<PRIMOP-APP>"
+printAmbiguous val = evalState (printAmbiguousAt Nothing val) nothingShown
+
+-- | A value with the cell it was read from, as 'printAt' takes one.
+printAmbiguousAt :: Maybe Thunk -> NixValue -> Printer BB.Builder
+printAmbiguousAt cell val = case val of
+  VInt n -> pure (BB.int64Dec n)
+  VFloat f -> pure (TE.encodeUtf8Builder (formatXmlFloat f))
+  VBool True -> pure "true"
+  VBool False -> pure "false"
+  VNull -> pure "null"
+  VStr bytes _ -> pure (quotedBytes (BS.length bytes) bytes)
+  VPath p -> pure (TE.encodeUtf8Builder p)
+  VList cl -> entering repeatedBytes (resultList cell cl) (bracketed "[" "]" <$> traverse (printElement . Thunk) (clistThunks cl))
+  VAttrs attrs -> entering repeatedBytes (resultSet attrs) (bracketed "{" "}" <$> traverse printAttribute (attrSetToAscList attrs))
+  VLambda {} -> pure "<LAMBDA>"
+  VBuiltin _ [] -> pure "<PRIMOP>"
+  VBuiltin _ _ -> pure "<PRIMOP-APP>"
   -- A compiled pattern exists only among the arguments of a partially
   -- applied match or split, so it prints as that application does.
-  VCompiledRegex _ -> "<PRIMOP-APP>"
+  VCompiledRegex _ -> pure "<PRIMOP-APP>"
   where
-    printAttribute (name, thunk) =
-      printIdentifier (TE.encodeUtf8 name) <> " = " <> printElement thunk <> ";"
+    repeatedBytes = TE.encodeUtf8Builder repeatedMarker
+    printAttribute (name, thunk) = do
+      shown <- printElement thunk
+      pure (printIdentifier (TE.encodeUtf8 name) <> " = " <> shown <> ";")
 
 -- | Upstream follows the opening bracket and every item with a space, so
 -- an empty list is @[ ]@.  Both printers bracket this way.
@@ -271,8 +388,8 @@ bracketed open close items = open <> " " <> foldMap (<> " ") items <> close
 
 -- | A list element or attribute value: its value when it has one, and
 -- upstream's marker for a thunk when it was never forced.
-printElement :: Thunk -> BB.Builder
-printElement thunk = maybe "<CODE>" printAmbiguous (readThunkValue thunk)
+printElement :: Thunk -> Printer BB.Builder
+printElement thunk = maybe (pure "<CODE>") (printAmbiguousAt (Just thunk)) (readThunkValue thunk)
 
 -- | Upstream's @printIdentifier@ (print.cc), which @printAmbiguous@ writes
 -- an attribute name through (nixexpr.cc's @operator<<@ on a symbol): a

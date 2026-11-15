@@ -71,7 +71,7 @@ import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
-import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
+import Nix.Eval (EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
@@ -1051,6 +1051,55 @@ testValuePrinter = do
           "print-blackhole"
           "let x = { a = \"${x}\"; }; in x.a"
           (setFound ("{ a = " <> marker "potential infinite recursion" <> "; }")),
+      -- A set or list the print reaches again prints as upstream's
+      -- repeated marker: a set by its bindings, any empty one among them,
+      -- and a list with elements by the cell holding it (print.cc:330-335
+      -- and :408-413 at 2.24.9).  The first two expect nix-instantiate
+      -- 2.24.9's final error lines for the same expressions.
+      runTestM "a set reached twice prints as repeated the second time" $
+        assertEvalErrorIO
+          tmpBase
+          "print-repeated-set"
+          "let x = { a = 1; }; in builtins.seq x \"${{ p = x; q = x; }}\""
+          (setFound ("{ p = { a = 1; }; q = " <> marker "repeated" <> "; }")),
+      runTestM "two equal sets made apart both print in full" $
+        assertEvalErrorIO
+          tmpBase
+          "print-equal-sets"
+          "let a = { x = 1; }; b = { x = 1; }; in builtins.seq a (builtins.seq b \"${{ p = a; q = b; }}\")"
+          (setFound "{ p = { x = 1; }; q = { x = 1; }; }"),
+      runTestM "a second empty set prints as repeated, as upstream's empty sets are one" $
+        assertEvalErrorIO
+          tmpBase
+          "print-empty-sets"
+          "let a = { }; b = { }; in builtins.seq a (builtins.seq b \"${{ p = a; q = b; }}\")"
+          (setFound ("{ p = { }; q = " <> marker "repeated" <> "; }")),
+      runTestM "an empty list reached twice prints in full both times" $
+        assertEvalErrorIO
+          tmpBase
+          "print-empty-lists"
+          "let a = [ ]; in builtins.seq a \"${{ p = a; q = a; }}\""
+          (setFound "{ p = [ ]; q = [ ]; }"),
+      runTestM "a list reached twice through one cell prints as repeated the second time" $
+        assertEvalErrorIO
+          tmpBase
+          "print-repeated-list"
+          "let l = [ 1 2 3 ]; in builtins.seq l \"${{ p = l; q = l; }}\""
+          (setFound ("{ p = [ 1 2 3 ]; q = " <> marker "repeated" <> "; }")),
+      runTestM "a list a function returns twice is in two cells and prints in full both times" $
+        assertEvalErrorIO
+          tmpBase
+          "print-list-two-cells"
+          (deeplyForced "let l = [ 1 2 3 ]; f = y: y; in { p = f l; q = f l; }")
+          (setFound "{ p = [ 1 2 3 ]; q = [ 1 2 3 ]; }"),
+      -- Upstream enters a set before it checks the depth, so one first
+      -- reached past the limit is entered there, and repeated after.
+      runTestM "a set first reached past the depth limit prints as repeated after" $
+        assertEvalErrorIO
+          tmpBase
+          "print-repeated-past-depth"
+          (deeplyForced ("let s = { z = 1; }; in { a = " <> T.replicate 9 "[ " <> "s" <> T.replicate 9 " ]" <> "; b = s; }"))
+          (setFound ("{ a = " <> T.replicate 9 "[ " <> "{ ... }" <> T.replicate 9 " ]" <> "; b = " <> marker "repeated" <> "; }")),
       runTest "a primop prints as upstream's primop marker" $
         assertEvalError
           "print-primop"
@@ -1286,6 +1335,101 @@ testResultPrinter = do
 genAttrName :: QC.Gen Text
 genAttrName =
   T.concat <$> QC.listOf (QC.elements ["a", "Z", "_", "0", "'", "-", " ", "\"", "\\", "${", ".", "\233", "if", "in", "inherit", "rec", "or"])
+
+-- ---------------------------------------------------------------------------
+-- Tests: Eval - Values reached twice
+-- ---------------------------------------------------------------------------
+
+-- | Upstream's repeated marker, @printRepeated@ (print.cc at 2.24.9).
+repeatedMarker :: Text
+repeatedMarker = "\x00ABrepeated\x00BB"
+
+-- | A derivation with one output, which its @all@ and @out@ attributes
+-- hold, so the derivation holds itself.
+selfHoldingDerivation :: Text
+selfHoldingDerivation = "derivation { name = \"a\"; system = \"x\"; builder = \"/bin/sh\"; }"
+
+-- | What @nix-instantiate --eval@ 2.24.9 prints for
+-- 'selfHoldingDerivation', as its wrapper (primops/derivation.nix) and
+-- @printAmbiguous@ make it: forcing the result forces the arguments and
+-- the output's set and neither @all@ nor the paths, and the output
+-- attribute is the result's own set, printed first, so it prints as
+-- repeated.
+selfHoldingPrinted :: Text
+selfHoldingPrinted =
+  "{ all = <CODE>; builder = \"/bin/sh\"; drvAttrs = { builder = \"/bin/sh\"; name = \"a\"; system = \"x\"; }; drvPath = <CODE>; name = \"a\"; out = "
+    <> repeatedMarker
+    <> "; outPath = <CODE>; outputName = \"out\"; system = \"x\"; type = \"derivation\"; }"
+
+-- | What @nix-instantiate --eval --strict@ 2.24.9 prints for
+-- 'selfHoldingDerivation'.  The drvPath is 2.24.9's, and the outPath is
+-- the one that .drv names: the drvPath hashes the .drv's text, which
+-- holds it.
+selfHoldingPrintedStrict :: Text
+selfHoldingPrintedStrict =
+  "{ all = [ "
+    <> repeatedMarker
+    <> " ]; builder = \"/bin/sh\"; drvAttrs = { builder = \"/bin/sh\"; name = \"a\"; system = \"x\"; }; drvPath = \"/nix/store/l9ldjc53ry43x24hvq73jx7dx0489mhj-a.drv\"; name = \"a\"; out = "
+    <> repeatedMarker
+    <> "; outPath = \"/nix/store/0pd4llb3k36fnppfxwp6nlwsxwlv0y2c-a\"; outputName = \"out\"; system = \"x\"; type = \"derivation\"; }"
+
+-- | A value reached twice is entered once: upstream's deep force skips a
+-- value it has forced (@forceValueDeep@, eval.cc:2099-2131 at 2.24.9),
+-- and its printers print a set or list they have printed as repeated
+-- (print-ambiguous.cc:38-66, print.cc:330-446).  A derivation holds
+-- itself through its @all@ and output attributes, so neither ends on one
+-- without that.  Each case runs under 'repeatedWatchdogMicros', and a
+-- print is read only one byte past what is expected.
+testRepeatedValues :: IO [Bool]
+testRepeatedValues = do
+  putStrLn "eval/repeated"
+  tmpBase <- getTemporaryDirectory
+  let cutAfter expected = BL.toStrict . BL.take (fromIntegral (BS.length expected) + 1) . BB.toLazyByteString . printAmbiguous
+      printsWith evaluator label source expectedText = runTestM label $ finishesInTime label $ do
+        let expected = TE.encodeUtf8 expectedText
+        result <- evaluator tmpBase source
+        case result of
+          Left err -> pure (Fail (label <> ": got error: " <> err))
+          Right val -> assertEqual label expected <$> evaluate (cutAfter expected val)
+      -- What nova-nix eval prints, and what it prints with --strict.
+      prints = printsWith evalNixIO
+      printsStrict = printsWith evalStrictIO
+      returns label source expected = runTestM label $ finishesInTime label $ do
+        result <- evalNixIO tmpBase source
+        pure (assertRight label result (assertEqual label expected))
+  sequence
+    [ prints "nova-nix eval prints a derivation once and its output as repeated" selfHoldingDerivation selfHoldingPrinted,
+      printsStrict "nova-nix eval --strict prints a derivation, its outputs in all and out as repeated" selfHoldingDerivation selfHoldingPrintedStrict,
+      returns "deepSeq on a derivation returns" ("builtins.deepSeq (" <> selfHoldingDerivation <> ") 1") (VInt 1),
+      runTestM "deepSeq on a set that holds itself returns under the pure evaluator" $
+        finishesInTime "deepSeq-self-pure" $ do
+          result <- evaluate (evalNix "let x = { a = x; }; in builtins.deepSeq x 1")
+          pure (assertRight "deepSeq-self-pure" result (assertEqual "deepSeq-self-pure" (VInt 1))),
+      -- Identity, not equality, and an empty set or list is never
+      -- repeated (print-ambiguous.cc:39, :53).
+      printsStrict "a set reached twice prints as repeated the second time" "let a = { x = 1; }; in [ a a ]" ("[ { x = 1; } " <> repeatedMarker <> " ]"),
+      printsStrict "two equal sets made apart both print in full" "let a = { x = 1; }; b = { x = 1; }; in [ a b ]" "[ { x = 1; } { x = 1; } ]",
+      printsStrict "an empty set or list reached twice prints in full both times" "let e = { }; l = [ ]; in [ e e l l ]" "[ { } { } [ ] [ ] ]",
+      -- Upstream keeps the elements of a list of one or two in the Value
+      -- that holds it, and a longer list's in an array its copies share
+      -- (value.hh:407-410), so a function's two results are two short
+      -- lists but one long one.
+      printsStrict
+        "a short list is one per cell and a long one is one however many cells hold it"
+        "let f = y: y; s = [ 1 2 ]; l = [ 1 2 3 ]; in [ (f s) (f s) s s (f l) (f l) ]"
+        ("[ [ 1 2 ] [ 1 2 ] [ 1 2 ] " <> repeatedMarker <> " [ 1 2 3 ] " <> repeatedMarker <> " ]"),
+      -- The result itself is nix-instantiate's own copy: a short list
+      -- there is no cell's, and a long one is its array's.
+      printsStrict "a short list holding itself prints one level of itself" "let l = [ l ]; in l" ("[ [ " <> repeatedMarker <> " ] ]"),
+      printsStrict "a long list holding itself prints as repeated inside" "let l = [ 1 2 l ]; in l" ("[ 1 2 " <> repeatedMarker <> " ]"),
+      -- builtins.trace prints a set or list that holds itself to an end.
+      runTestM "the trace printer prints a set that holds itself as repeated inside" $
+        finishesInTime "trace-self" $ do
+          result <- evalNixIO tmpBase "let x = { a = x; }; in builtins.seq x x"
+          case result of
+            Left err -> pure (Fail ("trace-self: got error: " <> err))
+            Right val -> assertEqual "trace-self" ("{ a = " <> repeatedMarker <> "; }") <$> evaluate (printValue PrintInFull val)
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Eval - Recursive attribute sets
@@ -3460,6 +3604,18 @@ evalNixIOTraced baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8
     st <- newEvalState storeDir baseDir
     runEvalIOTraced st (eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr)
 
+-- | 'evalNixIO' as @nova-nix eval --strict@ evaluates: the result, once
+-- everything inside it is forced in place.
+evalStrictIO :: FilePath -> Text -> IO (Either Text NixValue)
+evalStrictIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
+  Left err -> pure (Left (T.pack (show err)))
+  Right expr -> do
+    storeDir <- evalNixIOStoreDir
+    st <- newEvalState storeDir baseDir
+    runEvalIO st $ do
+      val <- eval (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) expr
+      val <$ deepForce val
+
 -- | IO eval of a derivation expression to the 'Derivation' the session
 -- recorded for it: forcing the expression's @drvPath@ runs derivationStrict,
 -- which records the @.drv@ under that path, and the recipe is read back the
@@ -4024,6 +4180,19 @@ testReadDirUntypedEntriesIO = do
 -- forever - and a hung suite is worse than a failed one.
 walkWatchdogMicros :: Int
 walkWatchdogMicros = 30 * 1000 * 1000
+
+-- | Watchdog for a deep force or print that ends because it remembers
+-- the sets and lists it has entered.  One that forgets recurses without
+-- end, its memory growing by hundreds of megabytes a second, so the bound
+-- is short; one that remembers takes milliseconds.
+repeatedWatchdogMicros :: Int
+repeatedWatchdogMicros = 2 * 1000 * 1000
+
+-- | An outcome reached within 'repeatedWatchdogMicros', or a failure
+-- naming the test that did not finish.
+finishesInTime :: Text -> IO TestResult -> IO TestResult
+finishesInTime label action =
+  fromMaybe (Fail (label <> ": did not finish within " <> T.pack (show repeatedWatchdogMicros) <> " microseconds")) <$> timeout repeatedWatchdogMicros action
 
 -- | @builtins.path@ with no filter over a tree that contains a symlink.
 -- The store-path name comes from the NAR serialization, which records
@@ -23418,6 +23587,7 @@ runSuite = do
           testValuePrinter,
           testCoercionErrors,
           testResultPrinter,
+          testRepeatedValues,
           testEvalRecAttrs,
           testFrameKnots,
           testEvalLists,
@@ -24103,24 +24273,34 @@ testResultPrinterCLI = do
       isolated =
         ("XDG_CONFIG_HOME", root </> "config")
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
-      evalProcess =
-        (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "eval", "--expr", "builtins.readFile \"" ++ fileString ++ "\""])
-          { Proc.env = Just isolated,
-            Proc.std_out = Proc.CreatePipe
-          }
+      cliProcess args = (Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolated, Proc.std_out = Proc.CreatePipe}
+      printsThrough label args expected = runTestM label (Proc.withCreateProcess (cliProcess args) (checkPrinted label expected))
+      checkPrinted label expected _ stdoutPipe _ process = case stdoutPipe of
+        Nothing -> pure (Fail "no stdout pipe")
+        Just out -> do
+          printed <- BS.hGetContents out
+          code <- Proc.waitForProcess process
+          pure $ case code of
+            ExitSuccess -> assertEqual label expected printed
+            ExitFailure _ -> Fail ("CLI: " <> T.pack (show code))
+      -- The binary's heap is capped for a derivation, which holds itself:
+      -- an eval that forgets what it has entered then exhausts the cap
+      -- and fails, where it would run until the machine had no memory
+      -- left.  The eval needs a few megabytes.
+      heapCapped args = ["+RTS", "-M64m", "-RTS"] ++ args
   bracket_
     (forceRemoveIfExists root >> createDirectoryIfMissing True root >> BS.writeFile file notUtf8)
     (forceRemoveIfExists root)
     $ sequence
-      [ runTestM "CLI eval writes a string's bytes and a bare newline" $
-          Proc.withCreateProcess evalProcess $ \_ stdoutPipe _ process -> case stdoutPipe of
-            Nothing -> pure (Fail "no stdout pipe")
-            Just out -> do
-              printed <- BS.hGetContents out
-              code <- Proc.waitForProcess process
-              pure $ case code of
-                ExitSuccess -> assertEqual "cli-result" ("\"" <> notUtf8 <> "\"\n") printed
-                ExitFailure _ -> Fail ("CLI: " <> T.pack (show code))
+      [ printsThrough "CLI eval writes a string's bytes and a bare newline" ["eval", "--expr", "builtins.readFile \"" ++ fileString ++ "\""] ("\"" <> notUtf8 <> "\"\n"),
+        printsThrough
+          "CLI eval prints a derivation once and its output as repeated"
+          (heapCapped ["eval", "--expr", T.unpack selfHoldingDerivation])
+          (TE.encodeUtf8 selfHoldingPrinted <> "\n"),
+        printsThrough
+          "CLI eval --strict prints a derivation, its outputs in all and out as repeated"
+          (heapCapped ["eval", "--strict", "--expr", T.unpack selfHoldingDerivation])
+          (TE.encodeUtf8 selfHoldingPrintedStrict <> "\n")
       ]
 
 -- | nix.conf bytes through the binary: an include target, the

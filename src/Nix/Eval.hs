@@ -62,6 +62,7 @@ module Nix.Eval
     eval,
     evalBytecode,
     force,
+    deepForce,
 
     -- * Helpers (for Builtins)
     typeName,
@@ -3172,10 +3173,27 @@ digestToHex = bytesToHexText . BA.convert
 builtinDeepSeq :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
 builtinDeepSeq first second = deepForce first >> argValue second
 
+-- | Force every value inside a value, through its lists and sets, as
+-- upstream's @forceValueDeep@ does for @builtins.deepSeq@ and
+-- @nix-instantiate --eval --strict@ (eval.cc:2099-2131 at 2.24.9).
+-- Upstream enters each @Value@ once, so a value reached twice is forced
+-- once and one that holds itself, as a derivation does through its @all@
+-- and output attributes, is not entered without end.  The cell holding
+-- a value is its identity here: the C layer frees no cell before its
+-- arena is destroyed, so a cell is one value for the whole force.  The
+-- value handed over has no cell, so it is not entered by one; what it
+-- holds is.
 deepForce :: (MonadEval m) => NixValue -> m ()
-deepForce (VList cl) = mapM_ ((force >=> deepForce) . Thunk) (clistThunks cl)
-deepForce (VAttrs attrs) = mapM_ (force >=> deepForce) (attrSetElems attrs)
-deepForce _ = pure ()
+deepForce = void . forceInside Set.empty
+  where
+    forceInside entered (VList cl) = foldM forceCell entered (map Thunk (clistThunks cl))
+    forceInside entered (VAttrs attrs) = foldM forceCell entered (attrSetElems attrs)
+    forceInside entered _ = pure entered
+    forceCell entered thunk
+      | Set.member cell entered = pure entered
+      | otherwise = force thunk >>= forceInside (Set.insert cell entered)
+      where
+        cell = thunkToCPtr thunk
 
 -- | @builtins.seq a b@ - evaluate @a@ to WHNF, then return @b@.
 builtinSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
