@@ -17,6 +17,7 @@
 -- Must be called after 'Nix.Eval.CBytecode.cbcInit' and 'Nix.Eval.Symbol.symbolInit'.
 module Nix.Eval.Compile
   ( compileExpr,
+    compileParsed,
     compileFormalsToEval,
     encodeUnaryOp,
     decodeUnaryOp,
@@ -120,13 +121,23 @@ import Nix.Expr.Types
     StringPart (..),
     UnaryOp (..),
   )
+import Nix.Parser (ParsedSource, parsedExpr, parsedNames)
 
 -- | Compile an 'Expr' tree to bytecode, returning the root instruction index.
--- The bytecode is stored in the global @nn_bytecode@ arena.
+-- The bytecode is stored in the global @nn_bytecode@ arena.  The names in
+-- it are interned in the order this module meets them.
 compileExpr :: Expr -> IO Word32
 compileExpr expr = do
   recorder <- newPosRecorder
   compileWith recorder expr
+
+-- | 'compileExpr' for parsed source, its names interned first in the order
+-- upstream's parser interns them ('parsedNames'), so that compiling, which
+-- meets them in its own order, finds each already in its place.
+compileParsed :: ParsedSource -> IO Word32
+compileParsed parsed = do
+  mapM_ symbolIntern (parsedNames parsed)
+  compileExpr (parsedExpr parsed)
 
 -- | 'compileExpr' recording positions with one recorder for the whole tree.
 compileWith :: PosRecorder -> Expr -> IO Word32

@@ -60,6 +60,7 @@ module Nix.Eval
 
     -- * Evaluation
     eval,
+    evalParsed,
     evalBytecode,
     force,
     deepForce,
@@ -137,7 +138,7 @@ import Nix.Eval.CEnv (cenvPushWith)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CThunk (CThunkPtr)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
-import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, reassembleDouble, reassembleInt64)
+import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
@@ -215,6 +216,7 @@ import Nix.Expr.Types
   )
 import Nix.Hash (FileIngestionMethod (..), base64HashLen, base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
 import Nix.Json (IntegerRange (..), Json (..), parseJsonWith, renderJson)
+import Nix.Parser (ParsedSource)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
@@ -228,9 +230,21 @@ import Text.Regex.TDFA.ByteString ()
 
 -- | Evaluate a Nix expression in an environment.
 -- Compiles the expression to bytecode and dispatches to 'evalBytecode'.
+-- Its names are interned in the order the compiler meets them; source
+-- goes through 'evalParsed', which interns them in upstream's order.
 eval :: (MonadEval m) => Env -> Expr -> m NixValue
 eval env expr =
   let bcIdx = unsafePerformIO (compileExpr expr)
+   in evalBytecode env bcIdx
+
+-- | Evaluate parsed source in an environment: its names are interned in
+-- the order upstream's parser interns them, then it compiles and runs as
+-- under 'eval'.  Interning under 'unsafePerformIO' is safe as compiling
+-- is: it only appends to the symbol table, and a name already there keeps
+-- its symbol, so interning the same names again changes nothing.
+evalParsed :: (MonadEval m) => Env -> ParsedSource -> m NixValue
+evalParsed env parsed =
+  let bcIdx = unsafePerformIO (compileParsed parsed)
    in evalBytecode env bcIdx
 
 -- | Force a thunk to a value.

@@ -6,11 +6,12 @@
 --
 -- Provides t'EvalIO', a concrete 'MonadEval' instance that performs
 -- real file-system access.  The @import@ builtin reads, parses, and
--- evaluates @.nix@ files with a per-process import cache.
+-- evaluates @.nix@ files with a per-process import cache.  Source parsed
+-- by 'Nix.Parser.parseNix' evaluates as:
 --
 -- @
--- st <- newEvalState "/path/to/project"
--- result <- runEvalIO st (eval (builtinEnv unrestrictedPolicy 0 []) expr)
+-- st <- newEvalState storeDir "/path/to/project"
+-- result <- runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy 0 []) parsed)
 -- @
 module Nix.Eval.IO
   ( -- * Evaluator
@@ -57,7 +58,7 @@ import GHC.IO.Exception (ioe_errno)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNames)
 import Nix.Derivation (fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.Eval (deepForce, eval)
+import Nix.Eval (deepForce, eval, evalParsed)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CStatus (cInvariantViolated)
@@ -71,7 +72,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Pa
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
-import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
+import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
 import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -317,14 +318,17 @@ instance Monad EvalIO where
 -- The evaluator is written over any MonadEval and compiled that way, so
 -- each of its binds and class methods is a call through the instance
 -- dictionary.  These compile the entry points a caller runs in EvalIO
--- (this module's import and scopedImport, the executable's evaluation,
+-- (evalParsed for this module's import and scopedImport and for the
+-- executable's evaluation, eval for an expression built by hand, and
 -- --strict and attribute selection) for EvalIO alone, and the library's
 -- specialisation flags carry that through everything they reach.  Each
 -- pragma exports a rule that sends a call at EvalIO in any module
--- importing this one to that code.  The flags alone leave no rule for
--- eval, which is small enough to be inlined here rather than specialised,
--- so a caller in another module, the executable among them, would run the
--- dictionary-passing evaluator.
+-- importing this one to that code.  The flags alone leave no rule for an
+-- entry point small enough to be inlined here rather than specialised, as
+-- eval is, so a caller in another module, the executable among them, would
+-- run the dictionary-passing evaluator.
+{-# SPECIALIZE evalParsed :: Env -> ParsedSource -> EvalIO NixValue #-}
+
 {-# SPECIALIZE eval :: Env -> Expr -> EvalIO NixValue #-}
 
 {-# SPECIALIZE deepForce :: NixValue -> EvalIO () #-}
@@ -416,13 +420,13 @@ instance MonadEval EvalIO where
         let fileDir = takeDirectory target
         case parseNixWithScope (rootScopeNames policy) fileDir (SourceFile (T.pack target)) source of
           Left err -> rejectSource "import" target err
-          Right expr -> do
+          Right parsed -> do
             -- local sets new base dir for nested imports - pure, exception-safe
             let nested =
                   EvalIO
                     ( local
                         (\s -> s {esBaseDir = fileDir})
-                        (unEvalIO (eval (builtinEnv policy timestamp searchPaths) expr))
+                        (unEvalIO (evalParsed (builtinEnv policy timestamp searchPaths) parsed))
                     )
             result <- nested
             -- Skip caching very large attr sets (e.g. all-packages.nix
@@ -568,13 +572,13 @@ instance MonadEval EvalIO where
     let fileDir = takeDirectory target
     case parseNixWithScope (Set.union (Set.fromList (map fst scope)) (rootScopeNames policy)) fileDir (SourceFile (T.pack target)) source of
       Left err -> rejectSource "scopedImport" target err
-      Right expr -> do
+      Right parsed -> do
         -- No import cache for scoped imports (different scopes = different results)
         let scopedEnv = builtinEnvWithScope policy timestamp searchPaths scope
         EvalIO
           ( local
               (\s -> s {esBaseDir = fileDir})
-              (unEvalIO (eval scopedEnv expr))
+              (unEvalIO (evalParsed scopedEnv parsed))
           )
 
   readFileBytes path = do
