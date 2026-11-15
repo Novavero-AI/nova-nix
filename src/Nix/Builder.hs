@@ -91,7 +91,7 @@ import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe, maybeToList)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe, maybeToList)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -506,8 +506,12 @@ lockOrder = sort
 --
 -- Every output, never just the first: a partially valid multi-output
 -- derivation still has to build, and treating it as finished would leave
--- the missing outputs missing.  Both the lock-held re-check and the gate
--- in 'realiseEffects' ask this one question, so the two cannot disagree.
+-- the missing outputs missing.  This is the re-check under the output
+-- locks.  A build reaches it once some output a request wanted was not
+-- valid, and upstream's re-check there asks about the wanted outputs
+-- alone (@DerivationGoal::tryToBuild@ at 2.24.9), so where another
+-- process made those valid during the wait, upstream adopts the
+-- derivation and this builds it.
 allOutputsValid :: Store -> Derivation -> IO (Maybe StorePath)
 allOutputsValid store drv = case map doPath (drvOutputs drv) of
   [] -> pure Nothing
@@ -2007,10 +2011,12 @@ dedupStorePaths = Map.elems . Map.fromList . map (\sp -> (spHash sp, sp))
 -- 1. Build the dependency graph by reading .drv files from the store.
 -- 2. Refuse a cycle.
 -- 3. Try each derivation's outputs before its inputs, so a substituted
---    derivation needs only its runtime closure.  What no cache supplies
---    builds locally, leaves first, and so does what a cache fails to
---    deliver when 'bcFallback' allows it, and a derivation that forbids
---    substitutes unless 'bcSubstitutes' overrides it.
+--    derivation needs only its runtime closure.  The root's outputs are
+--    all wanted, and of each input only those its dependent's @.drv@
+--    names.  What no cache supplies builds locally, leaves first, and so
+--    does what a cache fails to deliver when 'bcFallback' allows it, and
+--    a derivation that forbids substitutes unless 'bcSubstitutes'
+--    overrides it.
 --
 -- Under 'BuildCheck' ('bcMode') the root is not realised but checked: an
 -- output of its that is not valid is substituted, its inputs are realised
@@ -2071,12 +2077,7 @@ realiseEffects :: BuildConfig -> Store -> RealiseEffects IO
 realiseEffects config store =
   RealiseEffects
     { reSubst = substEffects config store,
-      -- Every output, not just the first: a derivation whose first output is
-      -- valid and whose second was deleted would otherwise be logged cached
-      -- and skipped, and the missing output would stay missing.  Upstream
-      -- skips a build only when all of them are valid.
-      reAllValid = fmap isJust . allOutputsValid store,
-      reBuild = buildReporting config store,
+      reBuild = \drv drvPath _ -> buildReporting config store drv drvPath,
       reCheck = checkDerivation config store,
       reReport = logRealised
     }

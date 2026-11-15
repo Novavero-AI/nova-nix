@@ -5844,14 +5844,18 @@ data RealiseEvent
 -- unregistered-referent guard does, and a build makes its outputs valid.
 -- The cache fails to deliver the broken paths it offers, and cannot be
 -- asked about the unreachable ones at all.  Building a derivation again
--- gives its unstable outputs other contents, and changes no path.
+-- gives its unstable outputs other contents, and changes no path.  Each
+-- build is recorded with the outputs the request that led to it asked.
 data FakeWorld = FakeWorld
   { fwValid :: !(Set.Set StorePath),
     fwCache :: !(Map.Map StorePath [StorePath]),
     fwBroken :: !(Set.Set StorePath),
     fwUnreachable :: !(Set.Set StorePath),
     fwUnstable :: !(Set.Set StorePath),
-    fwEvents :: ![RealiseEvent]
+    fwEvents :: ![RealiseEvent],
+    -- | Each build's event name and the outputs its request asked,
+    -- newest first.
+    fwBuiltFor :: ![(Text, Set.Set Text)]
   }
 
 -- | A world with the given cache entries and valid paths, and no faults.
@@ -5863,7 +5867,8 @@ fakeWorld cache valid =
       fwBroken = Set.empty,
       fwUnreachable = Set.empty,
       fwUnstable = Set.empty,
-      fwEvents = []
+      fwEvents = [],
+      fwBuiltFor = []
     }
 
 fakeEvent :: RealiseEvent -> State FakeWorld ()
@@ -5901,14 +5906,13 @@ fakeRealiseEffects :: Set.Set Text -> Realise.RealiseEffects (State FakeWorld)
 fakeRealiseEffects failing =
   Realise.RealiseEffects
     { Realise.reSubst = fakeSubst,
-      Realise.reAllValid = \drv -> gets (\world -> all (\out -> Set.member (doPath out) (fwValid world)) (drvOutputs drv)),
-      Realise.reBuild = \drv _ -> do
+      Realise.reBuild = \drv _ wanted -> do
         let name = fakeDrvName drv
         if Set.member name failing
           then pure (Left ("building " <> name <> " failed"))
           else do
             fakeEvent (EvBuilt name)
-            modify' (\world -> world {fwValid = fwValid world <> Set.fromList (map doPath (drvOutputs drv))})
+            modify' (\world -> world {fwValid = fwValid world <> Set.fromList (map doPath (drvOutputs drv)), fwBuiltFor = (name, wanted) : fwBuiltFor world})
             pure (Right ()),
       Realise.reCheck = \drv _ -> do
         let name = fakeDrvName drv
@@ -5930,12 +5934,13 @@ fakeDrvName drv = case drvOutputs drv of
 fakePath :: Text -> StorePath
 fakePath name = StorePath (T.take 32 (T.replicate 32 (T.take 1 name))) name
 
--- | A derivation with one output per name, depending on the named nodes.
-fakeNode :: Text -> [Text] -> [Text] -> (StorePath, DepGraph.DepNode)
+-- | A derivation with one output per name, depending on the named nodes
+-- for the outputs named with each.
+fakeNode :: Text -> [Text] -> [(Text, [Text])] -> (StorePath, DepGraph.DepNode)
 fakeNode = fakeNodeWith Map.empty
 
 -- | 'fakeNode' with an environment.
-fakeNodeWith :: Map.Map Text BS.ByteString -> Text -> [Text] -> [Text] -> (StorePath, DepGraph.DepNode)
+fakeNodeWith :: Map.Map Text BS.ByteString -> Text -> [Text] -> [(Text, [Text])] -> (StorePath, DepGraph.DepNode)
 fakeNodeWith env name outputs deps =
   ( drvPath,
     DepGraph.DepNode
@@ -5950,7 +5955,7 @@ fakeNodeWith env name outputs deps =
               drvArgs = [],
               drvEnv = env
             },
-        DepGraph.dnDeps = map (fakePath . (<> ".drv")) deps
+        DepGraph.dnDeps = Map.fromList [(fakePath (dep <> ".drv"), Set.fromList wanted) | (dep, wanted) <- deps]
       }
   )
   where
@@ -6006,11 +6011,21 @@ runRealiseUnder ::
   Text ->
   (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
 runRealiseUnder settings world failing nodes root =
-  let (result, final) =
-        runState
-          (Realise.realise settings (fakeRealiseEffects failing) (DepGraph.DepGraph (Map.fromList nodes)) (fakePath (root <> ".drv")))
-          world
+  let (result, final) = runRealiseWorld settings world failing nodes root
    in (result, reverse (fwEvents final), fwValid final)
+
+-- | 'runRealiseUnder', answering the world it ends in.
+runRealiseWorld ::
+  Realise.RealiseSettings ->
+  FakeWorld ->
+  Set.Set Text ->
+  [(StorePath, DepGraph.DepNode)] ->
+  Text ->
+  (Either Realise.RealiseFailure (), FakeWorld)
+runRealiseWorld settings world failing nodes root =
+  runState
+    (Realise.realise settings (fakeRealiseEffects failing) (DepGraph.DepGraph (Map.fromList nodes)) (fakePath (root <> ".drv")))
+    world
 
 -- | Only the fetches, builds and checks of a run, the part that costs
 -- anything.
@@ -6023,15 +6038,16 @@ realiseWork = filter isWork
     isWork _ = False
 
 -- | A random derivation graph to check.  Each node has one output or two
--- and depends only on lower nodes, so the graph is acyclic and the highest
--- node is the root.  With it: the nodes that forbid substitutes, the
--- references a cache declares for each output it offers, the outputs that
--- are valid, the ones a cache fails to deliver and the ones it cannot be
--- asked about, the nodes whose builder fails, the outputs of the root
--- that building it again gives other contents, and what a failed
--- substitute leads to.
+-- and depends only on lower nodes, for some of each one's outputs, so the
+-- graph is acyclic and the highest node is the root.  With it: the nodes
+-- that forbid substitutes, the references a cache declares for each
+-- output it offers, the outputs that are valid, the ones a cache fails to
+-- deliver and the ones it cannot be asked about, the nodes whose builder
+-- fails, the outputs of the root that building it again gives other
+-- contents, and what a failed substitute leads to.
 data CheckCase = CheckCase
-  { ccDeps :: !(Map.Map Int [Int]),
+  { -- | Each node's dependencies, with the outputs it wants of each.
+    ccDeps :: !(Map.Map Int [(Int, [Text])]),
     ccTwoOutputs :: ![Int],
     ccForbidding :: ![Int],
     ccCache :: !(Map.Map Text [Text]),
@@ -6060,16 +6076,17 @@ genCheckCase = do
   size <- QC.chooseInt (1, 5)
   let nodes = [0 .. size - 1]
       root = size - 1
-  deps <- traverse (\node -> (,) node <$> QC.sublistOf [0 .. node - 1]) nodes
   twoOutputs <- QC.sublistOf nodes
   let outputsOf = checkCaseOutputs twoOutputs
       allOutputs = concatMap outputsOf nodes
+      wanting dep = (,) dep <$> (QC.sublistOf (outputsOf dep) `QC.suchThat` (not . null))
       offered node output =
         QC.frequency
           [ (1, pure Nothing),
             (2, Just . (,) output <$> QC.sublistOf (filter (/= output) (outputsOf node) ++ concatMap outputsOf [0 .. node - 1]))
           ]
       seldom items = QC.frequency [(2, pure []), (1, QC.sublistOf items)]
+  deps <- traverse (\node -> (,) node <$> (QC.sublistOf [0 .. node - 1] >>= traverse wanting)) nodes
   cache <- catMaybes <$> sequence [offered node output | node <- nodes, output <- outputsOf node]
   forbidding <- seldom nodes
   valid <- QC.sublistOf allOutputs
@@ -6093,13 +6110,17 @@ genCheckCase = do
       }
 
 -- | Run a 'CheckCase' from its root under a build mode: the result, the
--- events, and the outputs that were valid before each event.
+-- events with the outputs that were valid before each, those valid at the
+-- end, and each build's event name with the outputs its request asked, in
+-- the order of the builds.
 runCheckCase ::
   Realise.BuildMode ->
   CheckCase ->
-  (Either Realise.RealiseFailure (), [(Set.Set StorePath, RealiseEvent)])
-runCheckCase mode checkCase = (result, zip (scanl landed (fwValid world) events) events)
+  (Either Realise.RealiseFailure (), [(Set.Set StorePath, RealiseEvent)], Set.Set StorePath, [(Text, Set.Set Text)])
+runCheckCase mode checkCase = (result, steps, fwValid ended, reverse (fwBuiltFor ended))
   where
+    events = reverse (fwEvents ended)
+    steps = zip (scanl landed (fwValid world) events) events
     name node = "n" <> T.pack (show node)
     nodes = Map.keys (ccDeps checkCase)
     root = maximum (0 : nodes)
@@ -6115,12 +6136,12 @@ runCheckCase mode checkCase = (result, zip (scanl landed (fwValid world) events)
           fwUnreachable = paths (ccUnreachable checkCase),
           fwUnstable = paths (ccUnstable checkCase)
         }
-    (result, events, _) =
-      runRealiseUnder
+    (result, ended) =
+      runRealiseWorld
         (Realise.RealiseSettings (ccFallback checkCase) Realise.HeedAllowSubstitutes mode)
         world
         (Set.fromList (concatMap (take 1 . outputsOf) (ccFailing checkCase)))
-        [fakeNodeWith (env node) (name node) (outputsOf node) (map name below) | (node, below) <- Map.toList (ccDeps checkCase)]
+        [fakeNodeWith (env node) (name node) (outputsOf node) [(name dep, wanted) | (dep, wanted) <- below] | (node, below) <- Map.toList (ccDeps checkCase)]
         (name root)
     -- A build makes every output of its derivation valid, and its event
     -- names the first.
@@ -6132,7 +6153,7 @@ runCheckCase mode checkCase = (result, zip (scanl landed (fwValid world) events)
 
 -- | The law of a check, for one 'CheckCase'.  The root is never built in
 -- the ordinary way.  It is built again at most once, and only when every
--- output of its own and of each derivation it depends on is valid.  The
+-- output of its own and every output it wants of each input is valid.  The
 -- check's result is that rebuild's, and without a rebuild a failure.  A
 -- root that cannot be checked builds nothing at all.  No output of the
 -- root that was valid is fetched, and a root whose outputs were all valid
@@ -6143,7 +6164,7 @@ runCheckCase mode checkCase = (result, zip (scanl landed (fwValid world) events)
 -- Each class the generator has to reach for those clauses to say anything
 -- is covered: the property fails when one is rarer than its share.  The
 -- shares are about a third of what 'genCheckCase' gives, measured over
--- 20000 cases (46%, 6%, 15% and 10% in this order).
+-- 20000 cases (47%, 6%, 14% and 11% in this order).
 checkLaw :: CheckCase -> QC.Property
 checkLaw checkCase =
   QC.counterexample (show (result, events))
@@ -6168,12 +6189,12 @@ checkLaw checkCase =
     rootDrv = fakePath ("n" <> T.pack (show root) <> ".drv")
     rootName = T.concat (take 1 (outputsOf root))
     rootOutputs = Set.fromList (map fakePath (outputsOf root))
-    needed = Set.fromList (map fakePath (concatMap outputsOf (root : Map.findWithDefault [] root (ccDeps checkCase))))
+    needed = Set.fromList (map fakePath (outputsOf root ++ concatMap snd (Map.findWithDefault [] root (ccDeps checkCase))))
     validAtStart = rootOutputs `Set.intersection` Set.fromList (map fakePath (ccValid checkCase))
     allValidAtStart = validAtStart == rootOutputs
     partlyValid = not (Set.null validAtStart) && not allValidAtStart
     mustBuildShort = root `elem` ccForbidding checkCase && not allValidAtStart
-    (result, steps) = runCheckCase Realise.BuildCheck checkCase
+    (result, steps, _, _) = runCheckCase Realise.BuildCheck checkCase
     events = map snd steps
     checks = [valid | (valid, EvChecked _) <- steps]
     checked = not (null checks)
@@ -6188,7 +6209,60 @@ checkLaw checkCase =
     unbuildable _ = False
     queryFailed (Left (Realise.CacheQueryFailed _)) = True
     queryFailed _ = False
-    (_, ordinary) = runCheckCase Realise.BuildNormal checkCase
+    (_, ordinary, _, _) = runCheckCase Realise.BuildNormal checkCase
+
+-- | The law of a build, for one 'CheckCase'.  A derivation builds only
+-- while some output the request that led to the build asks of it is not
+-- valid, and only once every output it wants of each of its inputs is
+-- valid, so an input asked again for an output it has not realised is
+-- realised again for it.  What is fetched is an output some request asks
+-- for, or something such an output references, as the cache declares.  A
+-- build that succeeds leaves every output of the root valid.
+--
+-- An input asked for one output of its two is what the first and third
+-- clauses need to say anything.  An input that two dependents ask for
+-- different outputs is what the second needs, and what the first needs to
+-- tell the request that led to a build from the others made of the same
+-- derivation.  Each is held to about a third of the share 'genCheckCase'
+-- gives it, measured over 20000 cases (about 39% and 15% in this order).
+realiseLaw :: CheckCase -> QC.Property
+realiseLaw checkCase =
+  QC.counterexample (show (result, steps, builtFor))
+    . QC.cover 10 partlyWanted "an input was asked for one output of its two"
+    . QC.cover 5 askedDifferently "an input was asked for different outputs by two dependents"
+    $ QC.conjoin
+      [ QC.counterexample "a build was not recorded with its request" (map fst builtFor == map snd buildSteps),
+        QC.counterexample "built a derivation whose outputs the request asked were valid" (and [not (Set.map fakePath wanted `Set.isSubsetOf` valid) | ((valid, _), (_, wanted)) <- zip buildSteps builtFor]),
+        QC.counterexample "built before the outputs it wants of its inputs were valid" (all inputsValid buildSteps),
+        QC.counterexample "fetched what no request reaches" (all (all (`Set.member` reachable)) [fetched | (_, EvFetched fetched) <- steps]),
+        QC.counterexample "succeeded short of an output of the root" (either (const True) (const (paths (outputsOf root) `Set.isSubsetOf` final)) result)
+      ]
+  where
+    nodes = Map.keys (ccDeps checkCase)
+    root = maximum (0 : nodes)
+    outputsOf = checkCaseOutputs (ccTwoOutputs checkCase)
+    paths = Set.fromList . map fakePath
+    (result, steps, final, builtFor) = runCheckCase Realise.BuildNormal checkCase
+    -- Each build, with the outputs valid before it.
+    buildSteps = [(valid, built) | (valid, EvBuilt built) <- steps]
+    edges = [(dep, wanted) | below <- Map.elems (ccDeps checkCase), (dep, wanted) <- below]
+    -- The root is asked for every output, an input for what each of its
+    -- dependents names.
+    asked node
+      | node == root = outputsOf root
+      | otherwise = concat [wanted | (dep, wanted) <- edges, dep == node]
+    -- A build's event names the node's first output.
+    nodeBuilt = Map.fromList [(first, node) | node <- nodes, first : _ <- [outputsOf node]]
+    wantedOfInputs node = paths (concatMap snd (Map.findWithDefault [] node (ccDeps checkCase)))
+    inputsValid (valid, built) = maybe False ((`Set.isSubsetOf` valid) . wantedOfInputs) (Map.lookup built nodeBuilt)
+    reachable = Set.map fakePath (closeUnder Set.empty (concatMap asked nodes))
+    closeUnder seen pending = case pending of
+      [] -> seen
+      output : rest
+        | Set.member output seen -> closeUnder seen rest
+        | otherwise -> closeUnder (Set.insert output seen) (Map.findWithDefault [] output (ccCache checkCase) ++ rest)
+    partlyWanted = or [length wanted < length (outputsOf dep) | (dep, wanted) <- edges]
+    askedDifferently = or [Set.size (Set.fromList [Set.fromList wanted | (dep, wanted) <- edges, dep == node]) > 1 | node <- nodes]
 
 -- | A random reference graph: each node references only lower nodes, so the
 -- graph is acyclic, and some nodes are absent from the cache.
@@ -6209,7 +6283,7 @@ testRealise = do
         let (result, events, _) =
               runRealise
                 Set.empty
-                [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [fakeNode "hello" ["hello-out"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
                 [("hello-out", ["glibc-out"]), ("glibc-out", []), ("gcc-out", [])]
                 []
                 "hello"
@@ -6221,7 +6295,7 @@ testRealise = do
         let (result, events, _) =
               runRealise
                 Set.empty
-                [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [fakeNode "hello" ["hello-out"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
                 [("gcc-out", [])]
                 []
                 "hello"
@@ -6244,7 +6318,7 @@ testRealise = do
         let (result, events, _) =
               runRealise
                 Set.empty
-                [fakeNode "hello" ["hello-out"] ["lib"], fakeNode "lib" ["lib-out"] []]
+                [fakeNode "hello" ["hello-out"] [("lib", ["lib-out"])], fakeNode "lib" ["lib-out"] []]
                 [("hello-out", ["lib-out"])]
                 []
                 "hello"
@@ -6257,7 +6331,7 @@ testRealise = do
         let (result, events, _) =
               runRealise
                 Set.empty
-                [fakeNode "pkg" ["pkg-bin", "pkg-lib"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [fakeNode "pkg" ["pkg-bin", "pkg-lib"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
                 [("pkg-bin", ["pkg-lib"]), ("pkg-lib", [])]
                 []
                 "pkg"
@@ -6306,7 +6380,7 @@ testRealise = do
                 Realise.NoFallback
                 (fakeWorld [("hello-out", [])] []) {fwBroken = Set.singleton (fakePath "hello-out")}
                 Set.empty
-                [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [fakeNode "hello" ["hello-out"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
                 "hello"
          in assertEqual
               "realise"
@@ -6318,7 +6392,7 @@ testRealise = do
                 Realise.BuildFromSource
                 (fakeWorld [("hello-out", []), ("gcc-out", [])] []) {fwBroken = Set.singleton (fakePath "hello-out")}
                 Set.empty
-                [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [fakeNode "hello" ["hello-out"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
                 "hello"
          in assertEqual
               "realise"
@@ -6341,7 +6415,7 @@ testRealise = do
                 Realise.NoFallback
                 (fakeWorld [("pkg-lib", [])] []) {fwUnreachable = Set.singleton (fakePath "pkg-bin")}
                 Set.empty
-                [fakeNode "pkg" ["pkg-bin", "pkg-lib"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [fakeNode "pkg" ["pkg-bin", "pkg-lib"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
                 "pkg"
          in assertEqual
               "realise"
@@ -6383,15 +6457,15 @@ testRealise = do
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       runTest "valid outputs need no cache at all" $
         let (result, events, _) =
-              runRealise Set.empty [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []] [] ["hello-out"] "hello"
+              runRealise Set.empty [fakeNode "hello" ["hello-out"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []] [] ["hello-out"] "hello"
          in assertEqual "realise" (Right (), [EvReported Realise.AlreadyValid "hello-out"]) (result, events),
       runTest "a dependency two others share is realised once" $
         let (result, events, _) =
               runRealise
                 Set.empty
-                [ fakeNode "top" ["top-out"] ["left", "right"],
-                  fakeNode "left" ["left-out"] ["base"],
-                  fakeNode "right" ["right-out"] ["base"],
+                [ fakeNode "top" ["top-out"] [("left", ["left-out"]), ("right", ["right-out"])],
+                  fakeNode "left" ["left-out"] [("base", ["base-out"])],
+                  fakeNode "right" ["right-out"] [("base", ["base-out"])],
                   fakeNode "base" ["base-out"] []
                 ]
                 []
@@ -6401,11 +6475,91 @@ testRealise = do
               "realise"
               (Right (), [EvBuilt "base-out", EvBuilt "left-out", EvBuilt "right-out", EvBuilt "top-out"])
               (result, realiseWork events),
+      -- An input is realised for the outputs its dependent names, which
+      -- alone are checked and substituted (checkPathValidity and
+      -- haveDerivation, derivation-goal.cc at 2.24.9).
+      runTest "a dependency on one output fetches that output and its closure only" $
+        let (result, events, valid) =
+              runRealise
+                Set.empty
+                [fakeNode "app" ["app-out"] [("lib", ["lib-dev"])], threeOutputLib]
+                [("lib-dev", ["lib-out"]), ("lib-out", []), ("lib-doc", [])]
+                []
+                "app"
+         in assertEqual
+              "realise"
+              (Right (), [EvFetched [fakePath "lib-out"], EvFetched [fakePath "lib-dev"], EvBuilt "app-out"], False)
+              (result, realiseWork events, Set.member (fakePath "lib-doc") valid),
+      runTest "an output nothing wants and no cache holds builds nothing" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [fakeNode "app" ["app-out"] [("lib", ["lib-dev"])], threeOutputLib]
+                [("lib-dev", ["lib-out"]), ("lib-out", [])]
+                []
+                "app"
+         in assertEqual
+              "realise"
+              (Right (), [EvFetched [fakePath "lib-out"], EvFetched [fakePath "lib-dev"], EvBuilt "app-out"])
+              (result, realiseWork events),
+      -- lib.drv sorts before mid.drv, so app asks lib for lib-dev, and mid
+      -- asks it for lib-out after that request is done.
+      runTest "a later request for another output substitutes it" $
+        let (result, events, _) = runRealise Set.empty laterRequest [("lib-dev", []), ("lib-out", [])] [] "app"
+         in assertEqual
+              "realise"
+              (Right (), [EvFetched [fakePath "lib-dev"], EvFetched [fakePath "lib-out"], EvBuilt "mid-out", EvBuilt "app-out"])
+              (result, realiseWork events),
+      runTest "a later request for another output no cache holds builds the derivation" $
+        let (result, events, _) = runRealise Set.empty laterRequest [("lib-dev", [])] [] "app"
+         in assertEqual
+              "realise"
+              (Right (), [EvFetched [fakePath "lib-dev"], EvBuilt "lib-out", EvBuilt "mid-out", EvBuilt "app-out"])
+              (result, realiseWork events),
+      -- checkPathValidity refuses an output name the derivation does not
+      -- have (derivation-goal.cc:1500-1503 at 2.24.9), before anything is
+      -- substituted for it.
+      runTest "an output a derivation does not have fails the request, naming each in order" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [fakeNode "app" ["app-out"] [("lib", ["lib-out", "lib-man", "lib-bin"])], fakeNode "lib" ["lib-out"] []]
+                [("lib-out", [])]
+                []
+                "app"
+         in assertEqual
+              "realise"
+              (Left ("derivation '/nix/store/" <> T.replicate 32 "l" <> "-lib.drv' does not have wanted outputs 'lib-bin', 'lib-man'"), [])
+              (messageOf result, realiseWork events),
+      -- Upstream starts no goal for an input that names no output
+      -- (derivation-goal.cc:352).
+      runTest "an input asked for no output is not realised" $
+        let (result, events, _) =
+              runRealise Set.empty [fakeNode "app" ["app-out"] [("lib", [])], fakeNode "lib" ["lib-out"] []] [] [] "app"
+         in assertEqual
+              "realise"
+              (Right (), [EvReported Realise.Built "app-out"])
+              (result, [event | event@(EvReported _ _) <- events]),
+      runTest "a later request for outputs already realised realises nothing again" $
+        let (result, events, _) =
+              runRealise
+                Set.empty
+                [ fakeNode "app" ["app-out"] [("lib", ["lib-dev"]), ("mid", ["mid-out"])],
+                  fakeNode "mid" ["mid-out"] [("lib", ["lib-dev"])],
+                  fakeNode "lib" ["lib-out", "lib-dev"] []
+                ]
+                [("lib-dev", [])]
+                []
+                "app"
+         in assertEqual
+              "realise"
+              (Right (), [EvReported Realise.Substituted "lib-out", EvReported Realise.Built "mid-out", EvReported Realise.Built "app-out"])
+              (result, [event | event@(EvReported _ _) <- events]),
       runTest "a failed input stops the build of what depends on it" $
         let (result, events, _) =
               runRealise
                 (Set.singleton "gcc-out")
-                [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [fakeNode "hello" ["hello-out"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
                 []
                 []
                 "hello"
@@ -6424,7 +6578,7 @@ testRealise = do
         let (result, events, _) =
               runRealise
                 Set.empty
-                [fakeNodeWith forbidding "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+                [fakeNodeWith forbidding "hello" ["hello-out"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
                 [("hello-out", []), ("gcc-out", [])]
                 []
                 "hello"
@@ -6435,7 +6589,7 @@ testRealise = do
         let (result, events, _) =
               runRealise
                 Set.empty
-                [fakeNode "app" ["app-out"] ["lib"], fakeNodeWith forbidding "lib" ["lib-out"] []]
+                [fakeNode "app" ["app-out"] [("lib", ["lib-out"])], fakeNodeWith forbidding "lib" ["lib-out"] []]
                 [("app-out", ["lib-out"]), ("lib-out", [])]
                 []
                 "app"
@@ -6609,7 +6763,7 @@ testRealise = do
       -- not built to fill the hole, and hello is asked about once.
       runTest "a substitute with a hole in its closure is not retried after the inputs" $
         let (result, events, _) =
-              runCheck Set.empty [fakeNode "hello" ["hello-out"] ["lib"], fakeNode "lib" ["lib-out"] []] [("hello-out", ["lib-out"])] [] "hello"
+              runCheck Set.empty [fakeNode "hello" ["hello-out"] [("lib", ["lib-out"])], fakeNode "lib" ["lib-out"] []] [("hello-out", ["lib-out"])] [] "hello"
          in assertEqual
               "check"
               (Left (Realise.OutputsNotValid helloDrv), [], 1 :: Int)
@@ -6636,7 +6790,7 @@ testRealise = do
       runTest "only a rebuilt output that differs has a status of its own" $
         assertEqual
           "statuses"
-          [104, 1, 1, 1, 1, 1, 1]
+          [104, 1, 1, 1, 1, 1, 1, 1]
           ( map
               Realise.realiseFailureStatus
               [ Realise.NotDeterministic helloDrv helloOut,
@@ -6645,14 +6799,19 @@ testRealise = do
                 Realise.SubstitutesFailed helloDrv,
                 Realise.InvalidDerivation "",
                 Realise.OutputsNotValid helloDrv,
-                Realise.MissingDerivation helloDrv
+                Realise.MissingDerivation helloDrv,
+                Realise.MissingOutputs helloDrv ("dev" :| [])
               ]
           ),
       -- 'checkLaw', over random graphs of one- and two-output derivations,
       -- caches, valid sets and faults, with each class of case it speaks
       -- about held to a share of the cases generated.
       runTestM "a check builds the root again only once it and its inputs are valid, and never otherwise" $
-        property (QC.checkCoverage (QC.forAll genCheckCase checkLaw))
+        property (QC.checkCoverage (QC.forAll genCheckCase checkLaw)),
+      -- 'realiseLaw', over the same graphs, where an input is asked for
+      -- some of its outputs.
+      runTestM "a build waits for the outputs it wants of its inputs and leaves the root's outputs valid" $
+        property (QC.checkCoverage (QC.forAll genCheckCase realiseLaw))
     ]
   where
     forbidding = Map.singleton "allowSubstitutes" ""
@@ -6661,7 +6820,15 @@ testRealise = do
     alwaysAllowing = Realise.RealiseSettings Realise.NoFallback Realise.AlwaysAllowSubstitutes Realise.BuildNormal
     helloDrv = fakePath "hello.drv"
     helloOut = fakePath "hello-out"
-    helloAndGcc = [fakeNode "hello" ["hello-out"] ["gcc"], fakeNode "gcc" ["gcc-out"] []]
+    helloAndGcc = [fakeNode "hello" ["hello-out"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
+    threeOutputLib = fakeNode "lib" ["lib-out", "lib-dev", "lib-doc"] []
+    -- app asks lib for lib-dev, and mid, which app also asks for, asks it
+    -- for lib-out.
+    laterRequest =
+      [ fakeNode "app" ["app-out"] [("lib", ["lib-dev"]), ("mid", ["mid-out"])],
+        fakeNode "mid" ["mid-out"] [("lib", ["lib-out"])],
+        fakeNode "lib" ["lib-out", "lib-dev"] []
+      ]
     helloDrvText = "/nix/store/" <> helloDrvName
     notValid = "some outputs of '" <> helloDrvText <> "' are not valid, so checking is not possible"
     messageOf = either (Left . Realise.realiseFailureMessage defaultStoreDir) Right
@@ -6763,6 +6930,15 @@ testDepGraph = do
               _ -> Fail ("bad diamond order: " <> T.pack (show order))
           DepGraph.TopoCycle cyc -> Fail ("unexpected cycle: " <> T.pack (show cyc))
         Left err -> Fail ("graph build failed: " <> err),
+      runTest "each edge carries the outputs the dependent's .drv names" $
+        let drvWanting = baseDrv {drvInputDrvs = Map.fromList [(spB, ["out", "dev", "out"]), (spC, ["lib"])]}
+         in case pureDepGraph readDiamond drvWanting spD of
+              Right (DepGraph.DepGraph g) ->
+                assertEqual
+                  "edges"
+                  (Just (Map.fromList [(spB, Set.fromList ["dev", "out"]), (spC, Set.singleton "lib")]), Just (Map.singleton spC (Set.singleton "out")))
+                  (DepGraph.dnDeps <$> Map.lookup spD g, DepGraph.dnDeps <$> Map.lookup spB g)
+              Left err -> Fail ("graph build failed: " <> err),
       -- transitiveDeps
       runTest "transitiveDeps diamond" $ case pureDepGraph readDiamond drvD spD of
         Right graph ->
@@ -13396,6 +13572,102 @@ testSubstituteFromCaches = do
               <$> substituted "alone" (\config store -> substitutePaths config store [top])
         ]
 
+-- | 'buildWithDeps' against a loopback cache, for inputs asked for some
+-- of their outputs: each is realised for the outputs its dependent's
+-- @.drv@ names, as upstream's goal for it is (@checkPathValidity@ and
+-- @haveDerivation@, derivation-goal.cc at 2.24.9).  lib has the outputs
+-- out, dev and doc, and the cache never serves doc.
+testWantedOutputsIO :: IO [Bool]
+testWantedOutputsIO = do
+  putStrLn "builder/wanted-outputs"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  let libOut = StorePath (T.replicate 32 "1") "lib"
+      libDev = StorePath (T.replicate 32 "2") "lib-dev"
+      libDoc = StorePath (T.replicate 32 "3") "lib-doc"
+      midOut = StorePath (T.replicate 32 "4") "mid"
+      appOut = StorePath (T.replicate 32 "5") "app"
+      -- lib.drv sorts before mid.drv, so app's request for lib comes
+      -- before mid's.
+      libDrvSP = StorePath (T.replicate 32 "f") "lib.drv"
+      midDrvSP = StorePath (T.replicate 32 "g") "mid.drv"
+      appDrvSP = StorePath (T.replicate 32 "6") "app.drv"
+      outNar = NAR.serialise (NAR.NarRegular False "cache out\n")
+      devNar = NAR.serialise (NAR.NarRegular False "cache dev\n")
+      narInfoTarget sp = "/" <> TE.encodeUtf8 (spHash sp) <> ".narinfo"
+      derivationOf name outputs inputs script =
+        Derivation
+          { drvOutputs = [DerivationOutput outputName sp "" "" | (outputName, sp) <- outputs],
+            drvInputDrvs = Map.fromList inputs,
+            drvInputSrcs = [],
+            drvPlatform = currentPlatform,
+            drvBuilder = TE.encodeUtf8 shell,
+            drvArgs = ["-c", script],
+            drvEnv = Map.singleton "name" name
+          }
+      libDrv = derivationOf "lib" [("out", libOut), ("dev", libDev), ("doc", libDoc)] []
+      midDrv = derivationOf "mid" [("out", midOut)] [(libDrvSP, ["out"])] "echo built > $out"
+      appDrv inputs = derivationOf "app" [("out", appOut)] inputs "echo built > $out"
+      contents store sp = either (const Nothing) Just <$> (try (BS.readFile (storePathToFilePath (stDir store) sp)) :: IO (Either IOException BS.ByteString))
+      -- Build app, over lib and mid as it asks for them, against a cache
+      -- serving these files under a trusted key: the result, the requests
+      -- the cache saw, what lib's three outputs hold, and whether mid's
+      -- output is valid.
+      realised key label served libScript inputs =
+        withHttpServer (\target _ -> maybe (Send (httpResponse "404 Not Found" "")) (Send . httpResponse "200 OK") (lookup target served)) $ \base requests _ -> do
+          let root = tmpBase </> ("nova-nix-test-wanted-outputs-" ++ label)
+              config = (defaultBuildConfig (StoreDir root)) {bcCaches = [Subst.CacheConfig base [key] 40]}
+          bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
+            bracket (openStore (StoreDir root)) closeStore $ \store -> do
+              writeDrv store (libDrv libScript) libDrvSP
+              writeDrv store midDrv midDrvSP
+              writeDrv store (appDrv inputs) appDrvSP
+              result <- buildWithDeps config store (appDrv inputs) appDrvSP
+              seen <- requests
+              held <- mapM (contents store) [libOut, libDev, libDoc]
+              midValid <- isValid store midOut
+              pure (result, seen, held, midValid)
+      signed = do
+        (key, outNarInfo) <- signedTestNarInfo libOut [] "nar/lib.nar" outNar
+        (_, devReferencingOut) <- signedTestNarInfo libDev [libOut] "nar/lib-dev.nar" devNar
+        (_, devAlone) <- signedTestNarInfo libDev [] "nar/lib-dev.nar" devNar
+        pure (key, outNarInfo, devReferencingOut, devAlone)
+  case signed of
+    Left err -> (: []) <$> runTest "wanted-outputs setup" (Fail (T.pack err))
+    Right (key, outNarInfo, devReferencingOut, devAlone) -> do
+      let served narInfos nars = [(narInfoTarget sp, TE.encodeUtf8 narInfo) | (sp, narInfo) <- narInfos] ++ nars
+      sequence
+        [ -- lib's builder fails if it runs.
+          runTestM "a dependency on one output fetches that output and its closure only, and builds nothing for the rest" $ do
+            (result, seen, held, _) <-
+              realised
+                key
+                "one-output"
+                (served [(libDev, devReferencingOut), (libOut, outNarInfo)] [("/nar/lib-dev.nar", devNar), ("/nar/lib.nar", outNar)])
+                "exit 1"
+                [(libDrvSP, ["dev"])]
+            pure $
+              assertEqual
+                "result, lib's outputs, and whether doc was asked for"
+                (BuildSuccess appOut, [Just "cache out\n", Just "cache dev\n", Nothing], False)
+                (result, held, narInfoTarget libDoc `elem` seen),
+          -- lib's dev comes from the cache for app.  mid's request for out,
+          -- which no cache serves, then builds lib beside the dev it has.
+          runTestM "a later request for another output of the same derivation builds it" $ do
+            (result, _, held, midValid) <-
+              realised
+                key
+                "later-request"
+                (served [(libDev, devAlone)] [("/nar/lib-dev.nar", devNar)])
+                "echo built > $out && echo built > $dev && echo built > $doc"
+                [(libDrvSP, ["dev"]), (midDrvSP, ["out"])]
+            pure $
+              assertEqual
+                "result, lib's outputs, and whether mid's is valid"
+                (BuildSuccess appOut, [Just "built\n", Just "cache dev\n", Just "built\n"], True)
+                (result, held, midValid)
+        ]
+
 -- | @pkgs/windows/fetchurl.nix@ evaluated from the checkout.  The
 -- @mirror://@ expansion is what a source derivation records, so a
 -- mirrors.nix refresh or a regex edit moves every drvPath built on it;
@@ -19489,7 +19761,7 @@ trustDrv output fixedHash builder inputs sources =
 
 -- | A graph of these derivations, each under its @.drv@ path.
 trustGraph :: [(StorePath, Derivation)] -> DepGraph.DepGraph
-trustGraph nodes = DepGraph.DepGraph (Map.fromList [(path, DepGraph.DepNode path drv (Map.keys (drvInputDrvs drv))) | (path, drv) <- nodes])
+trustGraph nodes = DepGraph.DepGraph (Map.fromList [(path, DepGraph.DepNode path drv (Map.map Set.fromList (drvInputDrvs drv))) | (path, drv) <- nodes])
 
 -- | A little-endian field of two bytes, and one of four.
 trustLe16 :: Word16 -> BS.ByteString
@@ -19878,7 +20150,7 @@ trustReachable (DepGraph.DepGraph graph) root = go Set.empty [root]
       | Set.member path seen = go seen rest
       | otherwise = case Map.lookup path graph of
           Nothing -> go seen rest
-          Just node -> go (Set.insert path seen) (DepGraph.dnDeps node ++ rest)
+          Just node -> go (Set.insert path seen) (Map.keys (DepGraph.dnDeps node) ++ rest)
 
 -- | What kind of output a generated derivation has.
 data TrustOutputKind = FixedKind | FloatingKind | ImpureKind | InputAddressedKind
@@ -20154,7 +20426,7 @@ testTrustWindowsGraphs = do
     Right ([kaemText, helloText], closure)
       | Just kaem <- parseStorePath defaultStoreDir kaemText,
         Just helloDrv <- parseStorePath defaultStoreDir helloText -> do
-          let graph = DepGraph.DepGraph (Map.fromList [(sp, DepGraph.DepNode sp drv (Map.keys (drvInputDrvs drv))) | (text, drv) <- Map.toList closure, Just sp <- [parseStorePath defaultStoreDir text]])
+          let graph = DepGraph.DepGraph (Map.fromList [(sp, DepGraph.DepNode sp drv (Map.map Set.fromList (drvInputDrvs drv))) | (text, drv) <- Map.toList closure, Just sp <- [parseStorePath defaultStoreDir text]])
               kaemReport = Trust.trustReport Map.empty graph kaem
               helloReport = Trust.trustReport Map.empty graph helloDrv
               ranNames report = sort [spName (Trust.inputOutput input) | input <- Trust.trInputs report, Trust.inputClass input == Trust.RunAsBuilder]
@@ -23941,6 +24213,7 @@ runSuite = do
           testFetchurlUnpack,
           testSubstituterRetry,
           testSubstituteFromCaches,
+          testWantedOutputsIO,
           testPkgsFetchurl,
           testStage0Pe32Chain,
           testTrustWindowsGraphs,
