@@ -3860,6 +3860,62 @@ testSourceReadErrorsBody = do
   Dir.removePathForcibly dir
   pure results
 
+-- | readDir over a directory that can be read but not searched, so that
+-- every entry's lstat is refused.  Upstream's readDirectory gives such an
+-- entry no type and prim_readDir binds it to a deferred readFileType of
+-- its path under the directory with its symlinks resolved
+-- (posix-source-accessor.cc:138-149, primops.cc:2027-2051 at 2.24.9):
+-- the listing names every entry, and only forcing one fails, as
+-- readFileType on it fails.  The owner keeps read permission and loses
+-- search; where that does not refuse the lstat (Windows, where the mode
+-- does not govern a lookup, or root) the group is skipped.
+testReadDirUntypedEntriesIO :: IO [Bool]
+testReadDirUntypedEntriesIO = do
+  putStrLn "eval/readdir-untyped-entries-io"
+  -- The temporary directory's own symlinks resolved (macOS keeps it under
+  -- /var, a link), so the only link in play is the one made below.
+  tmpBase <- Dir.canonicalizePath =<< getTemporaryDirectory
+  let root = tmpBase </> "nova-nix-test-readdir-untyped"
+      locked = root </> "locked"
+      pathValue p = "(/. + " <> nixQuotedPath p <> ")"
+      lockedValue = pathValue locked
+      searchable = Dir.setOwnerReadable True (Dir.setOwnerSearchable True (Dir.setOwnerWritable True Dir.emptyPermissions))
+      unsearchable = Dir.setOwnerReadable True Dir.emptyPermissions
+      refused = "getting status of '" <> T.pack (locked </> "file") <> "': Permission denied"
+      evalHere = evalNixIO tmpBase
+  -- A run that died while the directory was unsearchable left it so, and
+  -- it cannot be emptied until it is searchable again.
+  leftLocked <- Dir.doesDirectoryExist locked
+  when leftLocked (Dir.setPermissions locked searchable)
+  Dir.removePathForcibly root
+  createDirectoryIfMissing True (locked </> "sub")
+  BS.writeFile (locked </> "file") "f"
+  Dir.createDirectoryLink "locked" (root </> "link")
+  let checks =
+        [ runTestM "readDir names every entry of a directory whose entries cannot be stat'ed" $ do
+            outcome <- evalHere ("builtins.attrNames (builtins.readDir " <> lockedValue <> ") == [ \"file\" \"sub\" ]")
+            pure $ case outcome of
+              Right (VBool True) -> Pass
+              Right other -> Fail ("expected the names file and sub, got " <> T.pack (show other))
+              Left err -> Fail ("readDir failed: " <> err),
+          runTestM "forcing an entry readDir could not type fails as readFileType on it does" $ do
+            forced <- evalHere ("(builtins.readDir " <> lockedValue <> ").file")
+            direct <- evalHere ("builtins.readFileType " <> pathValue (locked </> "file"))
+            pure (assertEqual "readdir-forced" (Left refused, Left refused) (void forced, void direct)),
+          runTestM "readDir through a link defers readFileType of the entry under the resolved directory" $ do
+            forced <- evalHere ("(builtins.readDir " <> pathValue (root </> "link") <> ").file")
+            pure (assertEqual "readdir-forced-link" (Left refused) (void forced))
+        ]
+      probeThenCheck = do
+        probe <- try (Dir.pathIsSymbolicLink (locked </> "file")) :: IO (Either IOException Bool)
+        case probe of
+          Right _ -> [] <$ putStrLn "  SKIP  a directory without search permission lets its entries be stat'ed here"
+          Left _ -> sequence checks
+  -- Search permission is restored however the checks end, and the tree
+  -- removed after it.
+  bracket_ (Dir.setPermissions locked unsearchable) (Dir.setPermissions locked searchable) probeThenCheck
+    `finally` Dir.removePathForcibly root
+
 -- | Watchdog for cycle-termination tests: with symlinks as leaves every
 -- walk returns promptly, while a regression to link-following recurses
 -- forever - and a hung suite is worse than a failed one.
@@ -23134,6 +23190,7 @@ runSuite = do
           testInterpolatedSymlinkIO,
           testSourceErrorMessage,
           testSourceReadErrorsIO,
+          testReadDirUntypedEntriesIO,
           testBatchA,
           testBatchAIO,
           testEnvironmentBytes,

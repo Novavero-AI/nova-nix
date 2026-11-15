@@ -33,7 +33,7 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, Handler (..), IOException, SomeAsyncException, SomeException, catch, catches, displayException, fromException, onException, throwIO, try)
+import Control.Exception (Exception, Handler (..), IOException, SomeAsyncException, SomeException, catch, catchJust, catches, displayException, fromException, onException, throwIO, try)
 import Control.Monad (unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
@@ -50,8 +50,10 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Foreign.C.Error (Errno (..), eACCES, ePERM)
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
+import GHC.IO.Exception (ioe_errno)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNames)
 import Nix.Derivation (fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
@@ -1215,11 +1217,20 @@ firstMatch def ((test, label) : rest) =
     True -> pure label
     False -> firstMatch def rest
 
--- | Classify a directory entry (name relative to parent).
-classifyEntry :: FilePath -> FilePath -> IO (Text, Text)
+-- | Classify a directory entry (name relative to parent) as upstream's
+-- @readDirectory@ types one (posix-source-accessor.cc:136-163 at
+-- 2.24.9): an entry whose lstat is refused with @EACCES@ or @EPERM@
+-- (@permission_denied@, @operation_not_permitted@) has no type, and any
+-- other failure fails the listing.  A directory that can be read but not
+-- searched refuses every entry's lstat this way.
+classifyEntry :: FilePath -> FilePath -> IO (Text, Maybe Text)
 classifyEntry parentDir name = do
-  ty <- classifyPath (parentDir </> name)
+  ty <- catchJust refusedStat (Just <$> classifyPath (parentDir </> name)) (\() -> pure Nothing)
   pure (T.pack name, ty)
+  where
+    refusedStat err
+      | fmap Errno (ioe_errno err) `elem` [Just eACCES, Just ePERM] = Just ()
+      | otherwise = Nothing
 
 -- | Convert IO exceptions to eval errors.
 -- Guards against double-wrapping: if the exception is already a

@@ -3335,11 +3335,31 @@ builtinPathExists val = do
       | BS.isSuffixOf "/" s || BS.isSuffixOf "/." s = ExistsAsDirectory
     existenceQuery _ = ExistsAsEntry
 
+-- | @builtins.readDir@.  An entry the listing gives no type is bound to a
+-- deferred @builtins.readFileType@ of its path, as @prim_readDir@ binds
+-- it (primops.cc:2041-2051 at 2.24.9), so only forcing that entry fails,
+-- and it fails as @readFileType@ does.  The path is the entry's under the
+-- directory with its symlinks resolved, as @prim_readDir@ realises the
+-- directory before it reads it, so the lstat @readFileType@ makes meets
+-- no symlink above the entry.
 builtinReadDir :: (MonadEval m) => NixValue -> m NixValue
 builtinReadDir val = do
   p <- coerceToPath "builtins.readDir" val
   entries <- listDirectory p
-  pure (VAttrs (attrSetFromMap (Map.fromList [(name, evaluated (mkStr fileType)) | (name, fileType) <- entries])))
+  -- Resolved only when an entry needs it, so a listing that types every
+  -- entry costs nothing more.
+  dir <- if any (isNothing . snd) entries then resolveSymlinks p else pure p
+  let entryValue name = maybe (deferApply (VBuiltin "readFileType" []) (evaluated (VPath (canonPathValue (dir <> "/" <> name))))) (evaluated . mkStr)
+  pure (VAttrs (attrSetFromMap (Map.fromList [(name, entryValue name fileType) | (name, fileType) <- entries])))
+
+-- | A listed entry's type, or for an entry the listing gives no type, the
+-- type an lstat of the entry reads, which fails as @builtins.readFileType@
+-- fails on it.  Upstream's tree walks lstat every entry they visit (the
+-- path filter's @callPathFilter@, primops.cc:2405-2424 at 2.24.9, and
+-- @dumpPath@, archive.cc:56-59), so an entry the listing cannot type
+-- fails there.
+entryFileType :: (MonadEval m) => Text -> Maybe Text -> m Text
+entryFileType path = maybe (getFileType path) pure
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - environment + paths
@@ -4205,11 +4225,13 @@ removeGitMetadata _ctx = go
   where
     go dir = do
       entries <- listDirectory dir
-      forM_ entries $ \(name, fileType) ->
+      forM_ entries $ \(name, listedType) ->
         let path = dir <> "/" <> name
          in if name == ".git"
               then removeScratchDir path
-              else when (fileType == "directory") $ go path
+              else do
+                fileType <- entryFileType path listedType
+                when (fileType == "directory") $ go path
 
 -- | Parse a decimal from trusted git stdout (@rev-list --count@, @show
 -- --format=%ct@); a failure means git itself misbehaved.
@@ -5887,8 +5909,9 @@ filteredSourceNar filterFn rawRoot = do
         kept <- mapM (keepChild path) children
         pure (NAR.NarDirectory (catMaybes kept))
       other -> throwEvalError ("builtins.path: unsupported file type '" <> other <> "' at " <> path)
-    keepChild parent (name, childType) = do
+    keepChild parent (name, listedType) = do
       let childPath = parent <> "/" <> name
+      childType <- entryFileType childPath listedType
       keep <- filterAccepts childPath childType
       if keep
         then Just . (,) (TE.encodeUtf8 name) <$> buildEntry childPath childType
