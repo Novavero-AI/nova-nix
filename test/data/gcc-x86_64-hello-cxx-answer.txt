@@ -1,0 +1,19 @@
+hello from g++ 16.2.0, C++ 202002
+MinGW-w64 14.0.0 for msvcrt.dll 0x600
+rectangle 12
+square 25
+even squares 16 36, middle of sorted 4 5 6
+twice 42 and 2.5, 16.2.0 after 10.4.0: true
+4 threads added 100
+caught bottom with 0 frames live
+caught a square of area 4
+hello.exe exits 0
+	DLL Name: KERNEL32.dll
+	DLL Name: msvcrt.dll
+T _Unwind_RaiseException
+T _ZNSt6thread15_M_start_threadESt10unique_ptrINS_6_StateESt14default_deleteIS1_EEPFvvE
+T __cxa_throw
+T __gxx_personality_seh0
+CodeView entries: 0
+debugging sections: 0
+hello.exe: machine 0x8664, optional header magic 0x20b

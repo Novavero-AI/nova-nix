@@ -86,4 +86,8 @@
     "gcc-core-x86_64"
     "mingw-w64-crt-x86_64"
   ];
+
+  # GCC 16.2.0 with C and C++ for x86_64-w64-mingw32, the GCC 16
+  # x86_64 stage.
+  gcc-x86_64 = [ "gcc-x86_64" ];
 }
