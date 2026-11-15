@@ -125,11 +125,7 @@ parseArgs :: [String] -> Either String CliOpts
 parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False False False False CmdUsage)
   where
     go opts [] = Right opts
-    -- Answered before anything else is looked at, and the rest of the line
-    -- is not parsed: --version must report the build even when the command
-    -- after it is one this build does not have.
-    go opts ("--version" : _) = Right opts {optCommand = CmdVersion}
-    go opts ("--help" : _) = Right opts {optCommand = CmdHelp}
+    go opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     go opts ("--nix-path" : val : rest) =
       go (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
     go opts ("--strict" : rest) =
@@ -162,6 +158,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     go _ (arg : _) = Left ("unknown argument: " ++ arg ++ " (run nova-nix --help for usage)")
     -- Sub-parser for eval: handles --strict and --expr interleaved with the file arg.
     goEval opts [] = Right opts
+    goEval opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     goEval opts ("--strict" : rest) = goEval (opts {optStrict = True}) rest
     goEval opts ("--aterm" : rest) = goEval (opts {optAterm = True}) rest
     goEval opts ("--nix-path" : val : rest) =
@@ -192,10 +189,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     -- the file argument, which is where a caller reaches for it, and so
     -- that -A is still recognised after it.
     goTarget kind opts targetArgs [] = finishTarget kind opts targetArgs
-    -- Answered here as well as at the top level: a sub-parser that rejected
-    -- them would make 'build --help' a usage error rather than a request.
-    goTarget _ opts _ ("--help" : _) = Right opts {optCommand = CmdHelp}
-    goTarget _ opts _ ("--version" : _) = Right opts {optCommand = CmdVersion}
+    goTarget _ opts _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     goTarget kind opts targetArgs ("--store" : dir : rest) =
       goTarget kind (opts {optStore = Just dir}) targetArgs rest
     goTarget kind opts targetArgs ("--substituter" : url : rest) =
@@ -242,6 +236,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       (Just target, TrustsTarget) -> Right opts {optCommand = CmdTrust target (baAttrPath targetArgs)}
     -- Sub-parser for push: flags and explicit store paths in any order.
     goPush opts pushArgs [] = Right opts {optCommand = CmdPush pushArgs}
+    goPush opts _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     goPush opts pushArgs ("--store" : dir : rest) =
       goPush (opts {optStore = Just dir}) pushArgs rest
     goPush opts pushArgs ("--cache" : url : rest) =
@@ -259,12 +254,14 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       goPush opts (pushArgs {paPaths = paPaths pushArgs ++ [path]}) rest
     -- Sub-parser for store maintenance verbs.
     goStore _ [] = Left "store: expected a subcommand (delete, gc)"
+    goStore opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     goStore opts ("delete" : rest) = goStoreDelete opts [] rest
     goStore opts ("gc" : rest) = goStoreGc opts False rest
     goStore _ (sub : _) = Left ("unknown store subcommand: " ++ sub ++ " (expected: delete, gc)")
     goStoreDelete opts paths []
       | null paths = Left "store delete: name at least one store path"
       | otherwise = Right opts {optCommand = CmdStoreDelete paths}
+    goStoreDelete opts _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     goStoreDelete opts paths ("--store" : dir : rest) =
       goStoreDelete (opts {optStore = Just dir}) paths rest
     goStoreDelete _ _ [flag]
@@ -273,12 +270,21 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     goStoreDelete opts paths (path : rest) =
       goStoreDelete opts (paths ++ [path]) rest
     goStoreGc opts printRoots [] = Right opts {optCommand = CmdStoreGc printRoots}
+    goStoreGc opts _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     goStoreGc opts printRoots ("--store" : dir : rest) =
       goStoreGc (opts {optStore = Just dir}) printRoots rest
     goStoreGc opts _ ("--print-roots" : rest) = goStoreGc opts True rest
     goStoreGc _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goStoreGc _ _ (arg : _) = Left ("unknown store gc argument: " ++ arg)
+    -- What --help and --version answer.  Every parser takes them where a
+    -- flag may stand and leaves the rest of the line unparsed: --version
+    -- must report the build even when the command after it is one this
+    -- build does not have, and a parser that rejected either would make
+    -- 'eval --help' a usage error rather than a request.
+    answered "--help" = Just CmdHelp
+    answered "--version" = Just CmdVersion
+    answered _ = Nothing
     -- Flags that consume the following argument as their value.
     valueFlags =
       ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--compression"]
