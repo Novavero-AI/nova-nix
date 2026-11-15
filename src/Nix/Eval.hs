@@ -3137,7 +3137,7 @@ builtinHashString (VStr algo _) (VStr input _) = do
   -- The payload IS the hashed bytes - no encode step, so a mid-codepoint
   -- substring hashes to the sha256 of exactly those bytes, as upstream.
   algoName <- decodedText "builtins.hashString" algo
-  hashBytesWithAlgo "hashString" algoName input
+  hashBytesWithAlgo algoName input
 builtinHashString (VStr _ _) other =
   throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
 builtinHashString other _ =
@@ -3594,7 +3594,7 @@ fetchAndExtractTarball url mSha256 name = do
       ""
   case code of
     0 -> do
-      pin <- traverse (decodeSha256Pin "builtins.fetchTarball") mSha256
+      pin <- traverse decodeSha256Pin mSha256
       storePath <-
         copyPathToStore
           extractDir
@@ -3799,6 +3799,9 @@ fetchGit args =
       when (epPureEval policy && isNothing checkedRev) $
         throwEvalError ("in pure evaluation mode, 'fetchGit' will not fetch unlocked input '" <> inputUrl <> "'")
       checkUri inputUrl
+      -- A declared narHash is parsed before anything is fetched, as
+      -- fetchToStore reads it first (fetchers.cc:176 at 2.24.9).
+      declaredNarHash <- traverse (either throwEvalError pure . parseNarHash) (fgaNarHash args)
       -- Only a pinned rev is cached: a bare ref means "whatever this branch
       -- points at now", which a note taken earlier cannot answer.
       cached <- case checkedRev of
@@ -3819,16 +3822,17 @@ fetchGit args =
         Just hit -> pure hit
         Nothing -> fetchGitUncached args {fgaUrl = url} checkedRef checkedRev
       -- A declared narHash pins the tree; a mismatch is an error on the
-      -- hit and fresh paths alike, never a silent recompute.  Upstream's
-      -- orientation: "expected" is what the fetch produced, "got" is the
-      -- declared pin (observed from nix-instantiate 2.33.2).
-      case fgaNarHash args of
+      -- hit and fresh paths alike, never a silent recompute.  The hashes
+      -- are compared, not their spellings, as checkLocks compares them
+      -- (fetchers.cc:214-222 at 2.24.9), and the pin is reported in SRI.
+      -- Upstream's orientation: "expected" is what the fetch produced,
+      -- "got" is the declared pin (observed from nix-instantiate 2.33.2).
+      case declaredNarHash of
         Nothing -> pure ()
         Just declared ->
-          let computed = "sha256-" <> fcNarHash fields
-           in unless (declared == computed) $
-                throwEvalError
-                  ("builtins.fetchGit: NAR hash mismatch in '" <> url <> "', expected '" <> computed <> "' but got '" <> declared <> "'")
+          unless (base64ToBytes (fcNarHash fields) == Just declared) $
+            throwEvalError
+              ("builtins.fetchGit: NAR hash mismatch in '" <> url <> "', expected 'sha256-" <> fcNarHash fields <> "' but got 'sha256-" <> bytesToBase64 declared <> "'")
       pure (fetchGitResult submodules fields)
 
 -- | The URL upstream renders a @fetchGit@ input as
@@ -4288,7 +4292,7 @@ urlBaseName url =
 -- mismatch.  Accepts SRI, @sha256:@-prefixed, and bare digest forms.
 verifyFetchPin :: (MonadEval m) => Text -> Text -> BS.ByteString -> Text -> m ()
 verifyFetchPin ctx url bytes expectedStr = do
-  expected <- decodeSha256Pin ctx expectedStr
+  expected <- decodeSha256Pin expectedStr
   let got = sha256Digest bytes
   when (expected /= got) $
     throwEvalError
@@ -4301,25 +4305,12 @@ verifyFetchPin ctx url bytes expectedStr = do
           <> bytesToHexText got
       )
 
--- | Decode a sha256 pin to raw bytes, reusing the convertHash decoders (SRI,
--- @sha256:@-prefixed, or a bare hex/nix32/base64 digest).
-decodeSha256Pin :: (MonadEval m) => Text -> Text -> m BS.ByteString
-decodeSha256Pin ctx s = case hashSpelling s of
-  Left unknown -> throwEvalError unknown
-  Right (SriHash algo b64) -> do
-    requireSha256 algo
-    decodeSRI algo b64
-  Right (PrefixedHash algo rest) -> do
-    requireSha256 algo
-    snd <$> decodeWithAlgo algo rest
-  Right UntaggedHash -> snd <$> decodeWithAlgo "sha256" s
-  where
-    -- The pin names a sha256 digest specifically, so a spelling carrying
-    -- its own algorithm tag must carry sha256 - a sha512 pin here is an
-    -- error at decode time, as upstream's typed Hash parse.
-    requireSha256 "sha256" = pure ()
-    requireSha256 algo =
-      throwEvalError (ctx <> ": hash '" <> s <> "' should have type 'sha256', not '" <> algo <> "'")
+-- | Decode a sha256 pin to raw bytes as upstream's @newHashAllowEmpty@
+-- with SHA-256 reads a nonempty one (hash.cc:271-281 at 2.24.9): SRI,
+-- prefixed or bare, and a spelling that carries its own tag must name
+-- sha256.
+decodeSha256Pin :: (MonadEval m) => Text -> m BS.ByteString
+decodeSha256Pin s = either throwEvalError (pure . snd) (parseAnyHash (Just "sha256") s)
 
 -- | Force a required string attribute from an attrset, using full Nix string
 -- coercion (VStr, VPath, VInt, VBool, VAttrs via __toString/outPath).
@@ -4753,37 +4744,17 @@ optDrvStrAttr key attrs =
         VStr s _ -> decodedText ("derivation: " <> key) s
         _ -> pure ""
 
--- | Decode a fixed-output hash (SRI @algo-base64@, @algo:hash@, or a bare
--- hash plus a separate algorithm) to its algorithm name and raw bytes.
--- A non-empty @outputHashAlgo@ must name a known algorithm and agree with
--- the algorithm an SRI or prefixed spelling carries: the enforced
--- algorithm must be the declared one, never a silent substitute.
+-- | Decode a fixed-output hash to its algorithm name and raw bytes as
+-- upstream's derivationStrict does.  @outputHashAlgo@ is read with
+-- @parseHashAlgoOpt@ (primops.cc:1352 at 2.24.9), which gives nothing
+-- for a name it does not know, the empty name among them, so an unknown
+-- one is no algorithm rather than an error.  The hash is then read with
+-- @newHashAllowEmpty@ (primops.cc:1435), whose @Hash::parseAny@ takes the
+-- algorithm from the hash's own tag when it has one and refuses a known
+-- @outputHashAlgo@ that names another.
 normalizeFixedHash :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
-normalizeFixedHash ohash ohAlgo = case hashSpelling ohash of
-  Left unknown -> throwEvalError unknown
-  Right (SriHash algo b64) -> do
-    requireDeclaredAlgo algo
-    (algo,) <$> decodeSRI algo b64
-  Right (PrefixedHash algo rest) -> do
-    requireDeclaredAlgo algo
-    decodeWithAlgo algo rest
-  Right UntaggedHash
-    | not (T.null ohAlgo) -> decodeWithAlgo ohAlgo ohash
-    | otherwise ->
-        throwEvalError ("derivation: cannot determine outputHash algorithm for " <> ohash)
-  where
-    -- 'decodeSha256Pin's requireSha256 with the expected type supplied by
-    -- @outputHashAlgo@ instead of fixed at sha256 (upstream's typed Hash
-    -- parse, hash.cc parseAny with an expected type).  An unknown declared
-    -- algorithm is an error even when the spelling carries its own tag.
-    requireDeclaredAlgo embedded
-      | T.null ohAlgo = pure ()
-      | Nothing <- hashAlgoBytes ohAlgo =
-          throwEvalError ("unknown hash algorithm '" <> ohAlgo <> "'")
-      | embedded == ohAlgo = pure ()
-      | otherwise =
-          throwEvalError
-            ("derivation: hash '" <> ohash <> "' should have type '" <> ohAlgo <> "', not '" <> embedded <> "'")
+normalizeFixedHash ohash ohAlgo =
+  either throwEvalError pure (parseAnyHash (ohAlgo <$ hashAlgoBytes ohAlgo) ohash)
 
 -- | Force a thunk to a Text string via full Nix coercion (strict decode:
 -- used for output names, which are ASCII-shaped identity components).
@@ -4952,18 +4923,18 @@ builtinHashFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHashFile (VStr algo _) pathVal = do
   algoName <- decodedText "builtins.hashFile" algo
   bytes <- readFileBytes =<< coerceToPath "builtins.hashFile" pathVal
-  hashBytesWithAlgo "hashFile" algoName bytes
+  hashBytesWithAlgo algoName bytes
 builtinHashFile other _ =
   throwEvalError ("builtins.hashFile: expected a string, got " <> typeName other)
 
 -- | Shared hash dispatch for raw t'Data.ByteString.ByteString' input.
-hashBytesWithAlgo :: (MonadEval m) => Text -> Text -> BS.ByteString -> m NixValue
-hashBytesWithAlgo ctx algo bytes = case algo of
+hashBytesWithAlgo :: (MonadEval m) => Text -> BS.ByteString -> m NixValue
+hashBytesWithAlgo algo bytes = case algo of
   "sha256" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA256)))
   "sha512" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA512)))
   "sha1" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA1)))
   "md5" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.MD5)))
-  _ -> throwEvalError ("builtins." <> ctx <> ": unknown hash algorithm '" <> algo <> "'")
+  _ -> throwEvalError (unknownHashAlgo algo)
 
 -- | @builtins.readFileType path@ - classify a filesystem entry.
 -- Returns @"regular"@, @"directory"@, @"symlink"@, or @"unknown"@.
@@ -4979,10 +4950,17 @@ builtinReadFileType val = mkStr <$> (getFileType =<< coerceToPath "builtins.read
 builtinConvertHash :: (MonadEval m) => NixValue -> m NixValue
 builtinConvertHash (VAttrs attrs) = do
   hashVal <- requireStrAttr "convertHash" "hash" attrs
+  -- hashAlgo, when given, is parsed before the hash and handed to
+  -- Hash::parseAny (prim_convertHash, primops.cc:4100-4108 at 2.24.9), so
+  -- an unknown one is refused, and a tag naming another algorithm too.
+  expected <-
+    if attrSetMember "hashAlgo" attrs
+      then do
+        algo <- requireStrAttr "convertHash" "hashAlgo" attrs
+        Just algo <$ either throwEvalError pure (parseHashAlgo algo)
+      else pure Nothing
   toFmt <- requireStrAttr "convertHash" "toHashFormat" attrs
-  -- Detect input format and decode to raw bytes + algo
-  (algo, rawBytes) <- decodeHashInput attrs hashVal
-  -- Encode to target format
+  (algo, rawBytes) <- either throwEvalError pure (parseAnyHash expected hashVal)
   case toFmt of
     "base16" -> pure (mkStr (bytesToHexText rawBytes))
     "nix32" -> pure (mkStr (Nix32.encode rawBytes))
@@ -4993,66 +4971,96 @@ builtinConvertHash (VAttrs attrs) = do
 builtinConvertHash other =
   throwEvalError ("builtins.convertHash: expected a set, got " <> typeName other)
 
--- | Extract algo + raw bytes from the hash input, handling SRI, prefixed, and plain formats.
-decodeHashInput :: (MonadEval m) => AttrSet -> Text -> m (Text, BS.ByteString)
-decodeHashInput attrs hashStr = case hashSpelling hashStr of
-  Left unknown -> throwEvalError unknown
-  Right (SriHash algo b64) -> (algo,) <$> decodeSRI algo b64
-  Right (PrefixedHash algo rest) -> decodeWithAlgo algo rest
-  -- Plain hash - need hashAlgo attribute
-  Right UntaggedHash -> do
-    algo <- requireStrAttr "convertHash" "hashAlgo" attrs
-    decodeWithAlgo algo hashStr
+-- | Upstream's refusal of an algorithm name it does not know
+-- (@parseHashAlgo@, hash.cc:435-442 at 2.24.9).
+unknownHashAlgo :: Text -> Text
+unknownHashAlgo algo = "unknown hash algorithm '" <> algo <> "', expect 'md5', 'sha1', 'sha256', or 'sha512'"
 
--- | Decode a bare hash string for a known algorithm, keyed by its length
--- as upstream's @Hash@ constructor keys it (hash.cc:205-262 at 2.24.9):
--- an algorithm's base16, nix32, and base64 spellings have pairwise
--- distinct lengths, so the input length selects the decoder and every
--- other length is an error.  Trying decoders in sequence instead
--- mis-reads edge inputs - an all-hex-digit string of nix32 length is a
--- nix32 hash, and a truncated hash must be rejected, not decoded by
--- whichever shorter format happens to accept it.  The length is counted
--- in bytes, as upstream counts it, not in characters: base64 decoding
--- ignores what follows the padding, and a character there that UTF-8
--- spells in more than one byte must still make the length wrong.
-decodeWithAlgo :: (MonadEval m) => Text -> Text -> m (Text, BS.ByteString)
-decodeWithAlgo algo s = case hashAlgoBytes algo of
-  Nothing -> throwEvalError ("unknown hash algorithm '" <> algo <> "'")
-  Just size
-    | len == hexHashLen size -> accept size "base16" (hexToBytes s)
-    | len == nix32HashLen size -> accept size "nix32" (rightToMaybe (Nix32.decode s))
-    | len == base64HashLen size -> (algo,) <$> base64Digest "base-64" size s
-    | otherwise ->
-        throwEvalError ("hash '" <> s <> "' has wrong length for hash algorithm '" <> algo <> "'")
+-- | The digest size in bytes of an algorithm upstream knows, or upstream's
+-- refusal of the name (@parseHashAlgo@, hash.cc:435-442 at 2.24.9).
+parseHashAlgo :: Text -> Either Text Int
+parseHashAlgo algo = maybe (Left (unknownHashAlgo algo)) Right (hashAlgoBytes algo)
+
+-- | Parse a hash as upstream's @Hash::parseAny@ does (hash.cc:184-198 at
+-- 2.24.9).  The algorithm is the one the hash's own tag names, else
+-- @expected@; when both are given they must be the same.  @expected@ is a
+-- name 'parseHashAlgo' accepts.
+parseAnyHash :: Maybe Text -> Text -> Either Text (Text, BS.ByteString)
+parseAnyHash expected original =
+  hashSpelling original >>= \case
+    SriHash algo digest -> agreeing algo (sriDigest algo digest)
+    PrefixedHash algo digest -> agreeing algo (digestByLength algo digest)
+    UntaggedHash -> case expected of
+      Just algo -> (algo,) <$> digestByLength algo original
+      Nothing -> Left ("hash '" <> original <> "' does not include a type, nor is the type otherwise known from context")
+  where
+    agreeing algo decoded = case expected of
+      Just want | want /= algo -> Left ("hash '" <> original <> "' should have type '" <> want <> "'")
+      _ -> (algo,) <$> decoded
+
+-- | Parse an SRI hash as upstream's @Hash::parseSRI@ does (hash.cc:137-147
+-- at 2.24.9): the algorithm before the first @-@ and a base64 digest
+-- after it.  A hash in any other spelling is refused.
+parseSriHash :: Text -> Either Text (Text, BS.ByteString)
+parseSriHash original = case T.breakOn "-" original of
+  (algo, rest) | Just digest <- T.stripPrefix "-" rest -> (algo,) <$> sriDigest algo digest
+  _ -> Left ("hash '" <> original <> "' is not SRI")
+
+-- | A declared @narHash@'s SHA-256 digest, read as upstream's
+-- @Input::getNarHash@ reads it (fetchers.cc:324-333 at 2.24.9): an SRI
+-- hash, which must be SHA-256, or the empty string, which is a digest
+-- whose every byte is zero.
+parseNarHash :: Text -> Either Text BS.ByteString
+parseNarHash declared
+  | T.null declared = Right (BS.replicate sha256DigestSize 0)
+  | otherwise =
+      parseSriHash declared >>= \case
+        ("sha256", digest) -> Right digest
+        _ -> Left "narHash must use SHA-256"
+  where
+    sha256DigestSize = 32
+
+-- | Decode a digest that is not SRI, keyed by its length as upstream's
+-- @Hash@ constructor keys it (hash.cc:205-262 at 2.24.9): an algorithm's
+-- base16, nix32, and base64 spellings have pairwise distinct lengths, so
+-- the input length selects the decoder and every other length is an
+-- error.  Trying decoders in sequence instead mis-reads edge inputs - an
+-- all-hex-digit string of nix32 length is a nix32 hash, and a truncated
+-- hash must be rejected, not decoded by whichever shorter format happens
+-- to accept it.  The length is counted in bytes, as upstream counts it,
+-- not in characters: base64 decoding ignores what follows the padding,
+-- and a character there that UTF-8 spells in more than one byte must
+-- still make the length wrong.
+digestByLength :: Text -> Text -> Either Text BS.ByteString
+digestByLength algo s = parseHashAlgo algo >>= byLength
   where
     len = BS.length (TE.encodeUtf8 s)
-    accept size spelling decoded = case decoded of
-      Just bytes | BS.length bytes == size -> pure (algo, bytes)
-      _ -> throwEvalError ("hash '" <> s <> "' is not a valid " <> spelling <> " " <> algo <> " hash")
-    rightToMaybe = either (const Nothing) Just
+    byLength size
+      | len == hexHashLen size = sizedDigest "base-16" size s (hexToBytes s)
+      | len == nix32HashLen size = sizedDigest "base-32" size s (either (const Nothing) Just (Nix32.decode s))
+      | len == base64HashLen size = sizedDigest "base-64" size s (base64ToBytes s)
+      | otherwise = Left ("hash '" <> s <> "' has wrong length for hash algorithm '" <> algo <> "'")
 
--- | Decode an SRI digest (@algo-base64@) with the decoded-length check
--- every spelling gets upstream (hash.cc checks SRI too): well-formed
--- base64 of the wrong byte count is an invalid hash at eval time, not a
--- short digest that defers failure to fetch or build time.  Shared by
--- convertHash, the fetch pins, and fixed-output outputHash.
-decodeSRI :: (MonadEval m) => Text -> Text -> m BS.ByteString
-decodeSRI algo b64 = case hashAlgoBytes algo of
-  -- Unreachable via 'hashSpelling' (it admits only known algorithm tags),
-  -- but this helper must not silently skip the check for an unknown one.
-  Nothing -> throwEvalError ("unknown hash algorithm '" <> algo <> "'")
-  Just size -> base64Digest "SRI" size b64
+-- | Decode an SRI digest, base64 of whatever length, as the @isSRI@ branch
+-- of upstream's @Hash@ constructor does (hash.cc:247-258 at 2.24.9).
+sriDigest :: Text -> Text -> Either Text BS.ByteString
+sriDigest algo b64 = do
+  size <- parseHashAlgo algo
+  sizedDigest "SRI" size b64 (base64ToBytes b64)
 
--- | Decode a digest spelled in base64, SRI or bare, and check its decoded
--- length, as the base64 branch of upstream's @Hash@ constructor does
--- (hash.cc:247-258 at 2.24.9).  A refused character is the same error as
--- a wrong length there: the constructor catches @base64Decode@'s
--- exception without rethrowing it, so the length check fails on the empty
--- result.
-base64Digest :: (MonadEval m) => Text -> Int -> Text -> m BS.ByteString
-base64Digest spelling size encoded = case base64ToBytes encoded of
-  Just bytes | BS.length bytes == size -> pure bytes
-  _ -> throwEvalError ("invalid " <> spelling <> " hash '" <> encoded <> "'")
+-- | A decoded digest of the algorithm's size, or upstream's refusal of
+-- the spelling it was decoded from: @invalid base-16 hash@ and
+-- @invalid base-32 hash@ for a character outside the alphabet or nix32
+-- bits past the digest's end (hash.cc:214, :232, :242 at 2.24.9), and
+-- @invalid SRI hash@ or @invalid base-64 hash@ for base64 that is refused
+-- or decodes to the wrong length (hash.cc:247-258).  A refused base64
+-- character is the same error as a wrong length there: the constructor
+-- catches @base64Decode@'s exception without rethrowing it, so the length
+-- check fails on the empty result.
+sizedDigest :: Text -> Int -> Text -> Maybe BS.ByteString -> Either Text BS.ByteString
+sizedDigest spelling size encoded decoded = case decoded of
+  Just bytes | BS.length bytes == size -> Right bytes
+  _ -> Left ("invalid " <> spelling <> " hash '" <> encoded <> "'")
 
 -- | A hash string, its algorithm tag split off.
 data HashSpelling
@@ -5079,9 +5087,7 @@ hashSpelling s
     splitTag sep = case T.breakOn sep s of
       (tag, rest) | not (T.null rest) -> Just (tag, T.drop 1 rest)
       _ -> Nothing
-    tagged spelling tag digest
-      | isJust (hashAlgoBytes tag) = Right (spelling tag digest)
-      | otherwise = Left ("unknown hash algorithm '" <> tag <> "'")
+    tagged spelling tag digest = spelling tag digest <$ parseHashAlgo tag
 
 -- | Require a string attribute from an attrset.
 requireStrAttr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
@@ -5817,7 +5823,7 @@ builtinPath (VAttrs attrs) = do
       case pinVal of
         VStr pin _ -> do
           pinText <- decodedText "builtins.path" pin
-          Just <$> decodeSha256Pin "builtins.path" pinText
+          Just <$> decodeSha256Pin pinText
         other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
   filterFn <- traverse force (attrSetLookup "filter" attrs)
   let name = fromMaybe (canonBaseName pathStr) nameOverride
