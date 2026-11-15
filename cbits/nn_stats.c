@@ -515,8 +515,8 @@ int nn_stats_begin(void)
         return -1;
     }
 
-    /* The page bytes handed out are the env structs and arrays and the
-     * list items arrays, every one of which nn_list_new takes from the
+    /* The page bytes handed out are the envs, their with-scope arrays and
+     * the list items arrays, every one of which nn_list_new takes from the
      * pages. */
     NN_ASSERT(g.items_bytes <= nn_env_bytes_allocated(),
               "nn_stats_begin: list items arrays outside the env pages");
@@ -650,7 +650,7 @@ static void reach(int kind, const void *object)
     case NN_STATS_ENVS:
         if (!region_find(&g.pages, p, &bit)) break;
         if (bit_set(g.pages.bits, bit)) {
-            count_reached(kind, sizeof(nn_env_t));
+            count_reached(kind, nn_env_bytes((const nn_env_t *)object));
             work_push((uint8_t)kind, object);
         }
         return;
@@ -703,8 +703,8 @@ static void reach_symbol(uint32_t sym)
     }
 }
 
-/* Reach an env's slot or with-scope array of `n` entries; 1 when it is
- * new and its entries are to be followed. */
+/* Reach an env's with-scope array of `n` entries, which several envs may
+ * share; 1 when it is new and its entries are to be followed. */
 static int reach_array(void *const *array, uint32_t n)
 {
     uint64_t bit;
@@ -769,17 +769,19 @@ static void enter_thunk(const nn_thunk_t *t)
     }
 }
 
+/* An env's slots are part of it, counted in its bytes when it is reached;
+ * its with-scope array is an allocation of its own. */
 static void enter_env(const nn_env_t *env)
 {
     uint32_t i;
-    if (reach_array(env->slots, env->slot_count)) {
-        for (i = 0; i < env->slot_count; i++) reach(NN_STATS_THUNKS, env->slots[i]);
-    }
-    reach(NN_STATS_ATTRSETS, env->lazy_scope);
-    reach(NN_STATS_ENVS, env->parent);
-    if (reach_array(env->with_scopes, env->with_count)) {
-        for (i = 0; i < env->with_count; i++) {
-            uintptr_t entry = (uintptr_t)env->with_scopes[i];
+    const nn_env_scopes_t *scopes = nn_env_scopes(env);
+    for (i = 0; i < env->slot_count; i++) reach(NN_STATS_THUNKS, env->slots[i]);
+    reach(NN_STATS_ENVS, nn_env_parent(env));
+    if (!scopes) return;
+    reach(NN_STATS_ATTRSETS, scopes->lazy_scope);
+    if (reach_array(scopes->with_scopes, scopes->with_count)) {
+        for (i = 0; i < scopes->with_count; i++) {
+            uintptr_t entry = (uintptr_t)scopes->with_scopes[i];
             if (entry & NN_ENV_LAZY_WITH)
                 reach(NN_STATS_THUNKS, (const void *)(entry & ~NN_ENV_LAZY_WITH));
             else

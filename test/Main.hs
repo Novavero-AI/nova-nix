@@ -32,7 +32,7 @@ import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
-import Data.List (find, inits, intercalate, isPrefixOf, mapAccumL, nub, sort, sortOn)
+import Data.List (find, genericLength, inits, intercalate, isPrefixOf, mapAccumL, nub, sort, sortOn, unfoldr)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
@@ -51,9 +51,9 @@ import qualified Database.SQLite.Simple as SQL
 import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
 import Foreign.C.Types (CChar)
 import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, ptrToWordPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
-import Foreign.Storable (poke, sizeOf)
+import Foreign.Storable (peekElemOff, poke, sizeOf)
 import qualified GHC.Foreign as GHCForeign
 import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEncoding)
 import GHC.IO.Exception (IOErrorType (..), IOException (..))
@@ -80,7 +80,7 @@ import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
-import Nix.Eval.CEnv (cenvLazyScope)
+import Nix.Eval.CEnv (cenvLazyScope, cenvNewScoped, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
@@ -98,7 +98,7 @@ import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecor
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternBytes, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, buildCSlots, emptyCList, envLookupResolved, mkThunkBc, newMinimalEnv, pendingCode, pendingThunkEnv, readComputed, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, emptyCList, envLookupResolved, envWithScopesRaw, mkThunkBc, newEnv, newScopeEnv, pendingCode, pendingThunkEnv, pushLazyWithScope, readComputed, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -1549,6 +1549,14 @@ censusCellBytes = 16
 censusHeaderBytes = 16
 censusPointerBytes = 8
 
+-- | The bytes of an env's header word and of the scopes an env with a
+-- lazy scope or with-scopes has: @NN_ENV_HEADER_BYTES@ and
+-- @NN_ENV_SCOPES_BYTES@ of @cbits/nn_env.h@.  Its slots and its parent
+-- take a pointer each.
+envHeaderBytes, envScopesBytes :: Word64
+envHeaderBytes = 8
+envScopesBytes = 24
+
 genCensusTree :: QC.Gen CensusTree
 genCensusTree = QC.sized grow
   where
@@ -1641,13 +1649,12 @@ testCensus = do
               `andThen` assertEqual "StablePtrs reached" True (censusStablePtrsReached census >= 1),
       runTestM "a census follows a pending thunk to its env and the env's slots" $ do
         cells <- mapM cthunkNewComputedInt [1, 2, 3]
-        (slots, slotCount) <- buildCSlots EnvApply (map Thunk cells)
-        env <- newMinimalEnv EnvApply slots slotCount
+        env <- newEnv EnvApply Nothing (map Thunk cells)
         code <- compileExpr (ELit (NixInt 0))
         pending <- mkThunkBc env code
         withCensus [RootThunk pending] $ \census ->
           assertEqual "thunks" (Figures (Just 4) (4 * censusCellBytes)) (kindThunks (censusReached census))
-            `andThen` assertEqual "envs" (Figures (Just 1) (envStructBytes + 3 * censusPointerBytes)) (kindEnvs (censusReached census))
+            `andThen` assertEqual "envs" (Figures (Just 1) (envHeaderBytes + 3 * censusPointerBytes)) (kindEnvs (censusReached census))
             `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
       runTestM "a list and its suffix count one items array, whichever is reached first" $ do
         cells <- mapM cthunkNewComputedInt [1, 2, 3, 4]
@@ -1750,7 +1757,6 @@ testCensus = do
     quickCheckPasses property = do
       result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
       pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
-    envStructBytes = 48
     sampleCensus =
       Census
         { censusAllocated = (pure (Figures (Just 3) 48)) {kindEnvs = Figures Nothing 96},
@@ -1802,11 +1808,11 @@ data EnvAllocation = EnvAllocation !EnvSite !Int
 data SetAllocation = SetAllocation !SetSite !Int
   deriving (Show)
 
--- | Bytes of an env struct, a set header and a set entry (its key,
--- position and value) on a 64-bit target, and the room a set made empty
--- gets (cbits/nn_env.h, cbits/nn_attrset.c).
-envStructSize, setHeaderSize, setEntrySize, emptySetRoom :: Word64
-envStructSize = 48
+-- | Bytes of a set header and a set entry (its key, position and value)
+-- on a 64-bit target, and the room a set made empty gets
+-- (cbits/nn_attrset.c).  An env's are 'envHeaderBytes' and a pointer
+-- for each slot.
+setHeaderSize, setEntrySize, emptySetRoom :: Word64
 setHeaderSize = 40
 setEntrySize = 16
 emptySetRoom = 8
@@ -1859,7 +1865,7 @@ testAllocSites = do
             `andThen` assertEqual "set sites" (fromIntegral setSites) (length setNames)
             `andThen` assertEqual "distinct env names" envNames (nub envNames)
             `andThen` assertEqual "distinct set names" setNames (nub setNames),
-      runTestM "counting by site counts each env at its site, by size, with its slots and its struct's and slot array's bytes" $
+      runTestM "counting by site counts each env at its site, by size, with its slots and its bytes" $
         quickCheckPasses $
           QC.forAll (QC.listOf genEnvAllocation) $ \allocations -> QC.ioProperty $ do
             added <- sitesAdded (mapM_ allocateEnv allocations)
@@ -1878,32 +1884,47 @@ testAllocSites = do
             mapM_ (\(AttrSet left, AttrSet right) -> void (cattrsetUnion SetUpdate left right)) [(one, none), (none, one), (one, one)]
         pure (assertEqual "update" (Right (Map.singleton SetUpdate (SetSiteFigures 3 2 (3 * setHeaderSize + 4 * setEntrySize)))) (fmap sitesSets added)),
       -- Each source's figures are worked out by hand from the evaluator:
-      -- an env is a 48-byte struct with 8 bytes a slot, a set a 40-byte
-      -- header with 16 bytes an entry and room for 8 when made empty.
+      -- an env is an 8-byte header with 8 bytes a slot and 8 for a
+      -- parent, a with's env 24 more for its scopes and 8 for each entry
+      -- of its with-scope array, and a set a 40-byte header with 16 bytes
+      -- an entry and room for 8 when made empty.  The root env is each
+      -- evaluation's, and every other env made in it has a parent; a
+      -- trimmed closure's, a capture's, and a builtin's deferred
+      -- application have none.
       sitesTest
         "a let makes one env with a slot a binding"
         "let a = 1; b = 2; in a + b"
-        [(EnvLet, EnvSiteFigures 1 2 64)]
+        [(EnvLet, EnvSiteFigures 1 2 32)]
         [],
       sitesTest
         "a call of a lambda with an argument name makes one env of one slot"
         "(x: x) 1"
-        [(EnvCall, EnvSiteFigures 1 1 56)]
+        [(EnvCall, EnvSiteFigures 1 1 24)]
         [],
       sitesTest
         "a curried call makes an env per call, and the inner lambda a closure of what it uses"
         "(x: y: x) 1 2"
-        [(EnvCall, EnvSiteFigures 2 2 112), (EnvClosure, EnvSiteFigures 1 1 56)]
+        [(EnvCall, EnvSiteFigures 2 2 48), (EnvClosure, EnvSiteFigures 1 1 16)]
         [],
       sitesTest
         "a call of a lambda with formals makes one env of a slot a formal"
         "({ a, b ? 2 }: a + b) { a = 1; }"
-        [(EnvCallFormals, EnvSiteFigures 1 2 64)]
+        [(EnvCallFormals, EnvSiteFigures 1 2 32)]
         [(SetLiteral, SetSiteFigures 1 0 56)],
       sitesTest
-        "a with makes one env, sharing its scope's slots, with an array of its with-scopes"
+        "a with makes one env, a copy of its scope's slots, with an array of its with-scopes"
         "with { a = 1; }; a"
-        [(EnvWith, EnvSiteFigures 1 0 56)]
+        [(EnvWith, EnvSiteFigures 1 0 40)]
+        [(SetLiteral, SetSiteFigures 1 0 56)],
+      -- The with's variable makes closure trimming give the let a capture
+      -- with with-scopes of its own: the builtins scope, one entry.  The
+      -- let's frame sits under that capture, and the with's env copies
+      -- the frame's slot and parent, with an array of its own scope and
+      -- the capture's entry.
+      sitesTest
+        "a with's env holds and counts the slots it copies from the env it is made in"
+        "let b = 2; in with { a = 1; }; a + b"
+        [(EnvLet, EnvSiteFigures 1 1 24), (EnvLetCapture, EnvSiteFigures 1 0 40), (EnvWith, EnvSiteFigures 1 1 64)]
         [(SetLiteral, SetSiteFigures 1 0 56)],
       sitesTest
         "an update with an empty operand makes a set equal to the other, and the empty literal a set of its own"
@@ -1913,32 +1934,32 @@ testAllocSites = do
       sitesTest
         "map defers an application per element, each of which calls the function"
         "builtins.deepSeq (builtins.map (x: x) [ 1 2 3 ]) null"
-        [(EnvCall, EnvSiteFigures 3 3 168), (EnvMap, EnvSiteFigures 3 6 192)]
+        [(EnvCall, EnvSiteFigures 3 3 72), (EnvMap, EnvSiteFigures 3 6 72)]
         [],
       sitesTest
         "concatMap defers an application per element before it forces it"
         "builtins.deepSeq (builtins.concatMap (x: [ x ]) [ 1 2 ]) null"
-        [(EnvCall, EnvSiteFigures 2 2 112), (EnvConcatMap, EnvSiteFigures 2 4 128)]
+        [(EnvCall, EnvSiteFigures 2 2 48), (EnvConcatMap, EnvSiteFigures 2 4 48)]
         [],
       sitesTest
         "each inherit (from) makes an env of one slot"
         "let s = { a = 1; b = 2; }; in builtins.deepSeq { inherit (s) a; inherit (s) b; } null"
-        [(EnvLet, EnvSiteFigures 1 1 56), (EnvInheritFrom, EnvSiteFigures 2 2 112)]
+        [(EnvLet, EnvSiteFigures 1 1 24), (EnvInheritFrom, EnvSiteFigures 2 2 32)]
         [(SetLiteral, SetSiteFigures 2 0 144)],
       sitesTest
         "a let using a variable from outside it makes its frame and a capture of that variable"
         "(x: let y = x; in y) 1"
-        [(EnvCall, EnvSiteFigures 1 1 56), (EnvLet, EnvSiteFigures 1 1 56), (EnvLetCapture, EnvSiteFigures 1 1 56)]
+        [(EnvCall, EnvSiteFigures 1 1 24), (EnvLet, EnvSiteFigures 1 1 24), (EnvLetCapture, EnvSiteFigures 1 1 16)]
         [],
       sitesTest
         "a rec set makes one env with a slot a binding and its set"
         "builtins.deepSeq (rec { a = 1; b = a; }) null"
-        [(EnvRec, EnvSiteFigures 1 2 64)]
+        [(EnvRec, EnvSiteFigures 1 2 32)]
         [(SetRec, SetSiteFigures 1 0 72)],
       sitesTest
         "mapAttrs defers an application per attribute, each of which makes two calls"
         "builtins.deepSeq (builtins.mapAttrs (n: v: v) { a = 1; b = 2; }) null"
-        [(EnvCall, EnvSiteFigures 4 4 224), (EnvMapAttrs, EnvSiteFigures 2 6 144)]
+        [(EnvCall, EnvSiteFigures 4 4 96), (EnvMapAttrs, EnvSiteFigures 2 6 64)]
         [(SetLiteral, SetSiteFigures 1 0 72), (SetMapAttrs, SetSiteFigures 1 0 72)],
       sitesTest
         "functionArgs of a lambda without formals makes an empty set"
@@ -1959,15 +1980,14 @@ testAllocSites = do
     genSetAllocation = SetAllocation <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (0, 4)
     allocateEnv (EnvAllocation site n) = do
       nullCell <- evaluated VNull
-      (slots, slotCount) <- buildCSlots site (replicate n nullCell)
-      void (newMinimalEnv site slots slotCount)
+      void (newEnv site Nothing (replicate n nullCell))
     allocateSet (SetAllocation site n) = do
       nullCell <- evaluated VNull
       void (attrSetFromMap site (Map.fromList [(T.pack ("k" ++ show i), nullCell) | i <- [1 .. n]]))
     envsExpected allocations =
       ( Map.fromListWith
           addEnv
-          [(site, EnvSiteFigures 1 slots (envStructSize + 8 * slots)) | EnvAllocation site n <- allocations, let slots = fromIntegral n],
+          [(site, EnvSiteFigures 1 slots (envHeaderBytes + censusPointerBytes * slots)) | EnvAllocation site n <- allocations, let slots = fromIntegral n],
         Map.fromListWith (+) [(EnvSlots (fromIntegral n), 1) | EnvAllocation _ n <- allocations]
       )
     setsExpected allocations =
@@ -1980,6 +2000,184 @@ testAllocSites = do
     addEnv (EnvSiteFigures a b c) (EnvSiteFigures x y z) = EnvSiteFigures (a + x) (b + y) (c + z)
     addSet (SetSiteFigures a b c) (SetSiteFigures x y z) = SetSiteFigures (a + x) (b + y) (c + z)
 
+-- | One step of a chain of envs ('testEnvLayout'): how the next env is
+-- made from the one before it.
+data EnvStep
+  = -- | An env under the previous one holding this many cells, as a
+    -- call's.
+    StepChild !Int
+  | -- | An env with no parent holding this many cells, as a trimmed
+    -- closure's.
+    StepParentless !Int
+  | -- | An env under the previous one that binds a lazy scope, as a
+    -- frame whose names are not all static.
+    StepScope
+  | -- | The previous env under a with whose set is not evaluated yet.
+    StepWith
+  deriving (Show)
+
+genEnvStep :: QC.Gen EnvStep
+genEnvStep =
+  QC.oneof
+    [ StepChild <$> QC.chooseInt (0, 4),
+      StepParentless <$> QC.chooseInt (0, 4),
+      pure StepScope,
+      pure StepWith
+    ]
+
+-- | An env a chain of steps made, and what @cbits/nn_env.h@ says it
+-- holds.
+data EnvModel = EnvModel
+  { modelEnv :: !Env,
+    -- | Its slots' cells, in order.
+    modelSlots :: ![CThunkPtr],
+    -- | Its parent, when it has one.
+    modelParent :: !(Maybe EnvModel),
+    -- | Its lazy scope, when it has one: the set and the cell of its one
+    -- value.
+    modelScope :: !(Maybe (Ptr (), CThunkPtr)),
+    -- | The cells behind the with-scope entries it sees, innermost first.
+    modelWithCells :: ![CThunkPtr],
+    -- | The cells behind the entries of its own with-scope array, none
+    -- when it has none.
+    modelOwnWithCells :: ![CThunkPtr],
+    -- | The bytes it and its own with-scope array take.
+    modelBytes :: !Word64
+  }
+
+-- | The env a step makes from the previous one, with its model: a child
+-- sees its parent's with-scopes, and a with's env is a copy of the env it
+-- is made in with one more with-scope of its own.
+envStep :: EnvModel -> EnvStep -> IO EnvModel
+envStep prev step = case step of
+  StepChild n -> do
+    cells <- newCells n
+    env <- newEnv EnvCall (Just (modelEnv prev)) (map Thunk cells)
+    pure (EnvModel env cells (Just prev) Nothing (modelWithCells prev) [] (envHeaderBytes + censusPointerBytes * (genericLength cells + 1)))
+  StepParentless n -> parentlessModel n
+  StepScope -> do
+    (set@(AttrSet cset), value) <- oneNameScope
+    env <- newScopeEnv EnvLet (Just (modelEnv prev)) set
+    pure (EnvModel env [] (Just prev) (Just (castPtr cset, value)) (modelWithCells prev) [] (envHeaderBytes + censusPointerBytes + envScopesBytes))
+  StepWith -> do
+    -- Nothing forces the with's set here, so any cell stands for the
+    -- thunk that evaluates to it.
+    cell <- cthunkNewComputedInt 0
+    env <- pushLazyWithScope (Thunk cell) (modelEnv prev)
+    let withs = cell : modelWithCells prev
+        parentBytes = maybe 0 (const censusPointerBytes) (modelParent prev)
+        slotBytes = censusPointerBytes * genericLength (modelSlots prev)
+    pure (EnvModel env (modelSlots prev) (modelParent prev) (modelScope prev) withs withs (envHeaderBytes + slotBytes + parentBytes + envScopesBytes + censusPointerBytes * genericLength withs))
+
+-- | A model of an env with no parent holding this many fresh cells.
+parentlessModel :: Int -> IO EnvModel
+parentlessModel n = do
+  cells <- newCells n
+  env <- newEnv EnvClosure Nothing (map Thunk cells)
+  pure (EnvModel env cells Nothing Nothing [] [] (envHeaderBytes + censusPointerBytes * genericLength cells))
+
+-- | This many fresh integer cells.
+newCells :: Int -> IO [CThunkPtr]
+newCells n = mapM cthunkNewComputedInt (take n [1 ..])
+
+-- | A set binding one name, to stand for a lazy scope, and the cell of
+-- its value.
+oneNameScope :: IO (AttrSet, CThunkPtr)
+oneNameScope = do
+  value <- cthunkNewComputedInt 0
+  set <- attrSetFromMap SetScope (Map.singleton "x" (Thunk value))
+  pure (set, value)
+
+-- | What the C side holds for a modelled env: its slots' cells, its
+-- parent and the with-scope entries it sees.
+observeEnv :: EnvModel -> IO ([CThunkPtr], Maybe Env, [WordPtr])
+observeEnv model = observe (modelEnv model)
+  where
+    observe env@(Env ptr) = do
+      slots <- mapM (\i -> unThunk <$> envLookupResolved 0 i env) [0 .. length (modelSlots model) - 1]
+      parent <- cenvParent ptr
+      (arr, count) <- envWithScopesRaw env
+      withs <- mapM (fmap ptrToWordPtr . peekElemOff arr) [0 .. fromIntegral count - 1]
+      pure (slots, if parent == nullPtr then Nothing else Just (Env parent), withs)
+
+-- | What the model says 'observeEnv' finds: each with-scope entry is its
+-- cell tagged lazy (NN_ENV_LAZY_WITH), since nothing forced it.
+expectedEnv :: EnvModel -> ([CThunkPtr], Maybe Env, [WordPtr])
+expectedEnv model =
+  ( modelSlots model,
+    modelEnv <$> modelParent model,
+    map (\cell -> ptrToWordPtr (castPtr cell) .|. lazyWithTag) (modelWithCells model)
+  )
+  where
+    lazyWithTag = 1
+
+-- | What a census from an env reaches by the model: the envs on its
+-- parent chain and their bytes, the distinct cells in their slots, own
+-- with-scope arrays and lazy scopes, and the distinct lazy scopes.
+expectedReach :: EnvModel -> (Figures, Figures, Maybe Word64)
+expectedReach final = (envs, thunks, Just (fromIntegral (Set.size sets)))
+  where
+    reachable = final : unfoldr (fmap (\parent -> (parent, parent)) . modelParent) final
+    envs = Figures (Just (genericLength reachable)) (sum (map modelBytes reachable))
+    cells = Set.fromList (concatMap (\m -> modelSlots m ++ modelOwnWithCells m ++ maybe [] (pure . snd) (modelScope m)) reachable)
+    thunks = Figures (Just (fromIntegral (Set.size cells))) (fromIntegral (Set.size cells) * censusCellBytes)
+    sets = Set.fromList (mapMaybe (fmap fst . modelScope) reachable)
+
+-- | The layout of @cbits/nn_env.h@: what each kind of env holds, the
+-- with-scopes it sees through its parents, and the bytes it takes, which
+-- the census counts.
+testEnvLayout :: IO [Bool]
+testEnvLayout = do
+  putStrLn "eval/env-layout"
+  sequence
+    [ runTestM "an env of each kind takes the bytes nn_env.h gives it" $ do
+        -- A trimmed closure's: three slots and no parent.
+        trimmed <- parentlessModel 3
+        -- A call's: one slot under a parent, here one of two slots.
+        callParent <- parentlessModel 2
+        call <- envStep callParent (StepChild 1)
+        -- A root's: a lazy scope and no parent.
+        root <- oneNameScope >>= newScopeEnv EnvRoot Nothing . fst
+        -- A with's: a copy of the two slots of the env it is made in and
+        -- a with-scope array of one entry, its own.
+        withEnv <- envStep callParent StepWith
+        reached <- mapM (\env -> fmap (kindEnvs . censusReached) <$> censusOf [RootEnv env]) [modelEnv trimmed, modelEnv call, root, modelEnv withEnv]
+        pure $
+          assertEqual
+            "envs reached"
+            [ Right (Figures (Just 1) (envHeaderBytes + 3 * censusPointerBytes)),
+              -- The call's header, slot and parent, and its parent's
+              -- header and two slots.
+              Right (Figures (Just 2) ((envHeaderBytes + censusPointerBytes + censusPointerBytes) + (envHeaderBytes + 2 * censusPointerBytes))),
+              Right (Figures (Just 1) (envHeaderBytes + envScopesBytes)),
+              -- Its header, two slots, scopes and one-entry array.
+              Right (Figures (Just 1) (envHeaderBytes + 2 * censusPointerBytes + envScopesBytes + censusPointerBytes))
+            ]
+            reached,
+      runTestM "an env holds the slots, parent and with-scopes its making gives it, and a census reaches what they hold and counts the bytes its shape takes" $
+        quickCheckPasses $
+          QC.forAll ((,) <$> QC.chooseInt (0, 4) <*> QC.resize 12 (QC.listOf genEnvStep)) $ \(firstSlots, steps) ->
+            QC.ioProperty $ do
+              first <- parentlessModel firstSlots
+              -- Newest first.
+              chain <- foldM (\built step -> (:| toList built) <$> envStep (NE.head built) step) (first :| []) steps
+              observed <- mapM observeEnv (toList chain)
+              taken <- censusOf [RootEnv (modelEnv (NE.head chain))]
+              let reach census = ((kindEnvs (censusReached census), kindThunks (censusReached census), figuresCount (kindAttrSets (censusReached census))), censusUnplaced census)
+              pure $
+                (observed, reach <$> taken)
+                  QC.=== (map expectedEnv (toList chain), Right (expectedReach (NE.head chain), 0)),
+      -- A count without its array would send a with's copy and every with
+      -- lookup through NULL.
+      runTestM "an env with with-scopes counted and no array is refused" $ do
+        refused <- cenvNewScoped EnvRoot 0 nullPtr nullPtr nullPtr 1
+        pure (assertEqual "env" nullPtr refused)
+    ]
+  where
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+
 testFrameKnots :: IO [Bool]
 testFrameKnots = do
   putStrLn "eval/frame-knots"
@@ -1989,8 +2187,7 @@ testFrameKnots = do
         quickCheckPasses $
           QC.forAll genSlotRead $ \(before, value, after) ->
             QC.ioProperty $ do
-              (slots, slotCount) <- mapM (evaluated . VInt) (before ++ value : after) >>= buildCSlots EnvApply
-              env@(Env envPtr) <- newMinimalEnv EnvApply slots slotCount
+              env@(Env envPtr) <- mapM (evaluated . VInt) (before ++ value : after) >>= newEnv EnvApply Nothing
               bcIdx <- compileExpr (EResolvedVar 0 (length before))
               Thunk cell <- mkThunkBc env bcIdx
               payload <- cthunkPayload cell
@@ -2054,14 +2251,14 @@ testFrameKnots = do
         (VBool True),
       runTestM "tieFrame answers the cells it filled the slots with" $ do
         codes <- mapM (compileExpr . ELit . NixInt) [1, 2, 3]
-        (frame, thunks) <- tieFrame EnvLet (length codes) (newMinimalEnv EnvLet) (\env -> mapM (mkThunkBc env) codes)
+        (frame, thunks) <- tieFrame EnvLet Nothing (length codes) (\env -> mapM (mkThunkBc env) codes)
         slotted <- mapM (\i -> unThunk <$> envLookupResolved 0 i frame) [0 .. length codes - 1]
         pure (assertEqual "cells" slotted (map unThunk thunks)),
       -- A frame's slots are empty until tieFrame fills them, and C answers
       -- NULL for an empty one; a thunk made by reading one would fault at
       -- its first force, so the read itself refuses.
       runTestM "reading a slot its frame has not filled raises CInvariantViolated" $ do
-        outcome <- try (tieFrame EnvLet 1 (newMinimalEnv EnvLet) (fmap pure . envLookupResolved 0 0))
+        outcome <- try (tieFrame EnvLet Nothing 1 (fmap pure . envLookupResolved 0 0))
         pure $ case outcome of
           Left (CInvariantViolated site _) -> assertEqual "site" "nn_env_lookup_resolved" site
           Left other -> Fail ("expected CInvariantViolated, got " <> T.pack (show other))
@@ -22785,7 +22982,7 @@ arenaGuardPaths =
   [ noArena "compile" "nn_bc_emit" evalNamelessProgram,
     noArena "thunk" "nn_thunk_new_computed_int" (void (evaluated (VInt 1))),
     noArena "symbol" "nn_symbol_intern" (void (evaluated (mkStr "a"))),
-    noArena "env" "nn_env_alloc_slots" (void (evaluated VNull >>= \nullCell -> buildCSlots EnvApply [nullCell])),
+    noArena "env" "nn_env_new" (void (evaluated VNull >>= \nullCell -> newEnv EnvApply Nothing [nullCell])),
     noArena "after-destroy" "nn_bc_emit" (bracket_ arenaInit arenaDestroy (pure ()) >> evalNamelessProgram),
     ArenaGuardPath
       { guardName = "constants-outside-window",
@@ -23518,8 +23715,9 @@ testTraceVerboseOff = do
     ]
 
 -- | The smallest slot count whose byte size exceeds @UINT32_MAX@.
--- @nn_env_alloc_slots@ refuses it before touching a page, so inside a
--- live arena it fails without exhausting anything.
+-- The env pages refuse an env or a list's items array of that many
+-- before touching a page, so inside a live arena it fails without
+-- exhausting anything.
 slotCountPastUInt32 :: Int
 slotCountPastUInt32 = fromIntegral (maxBound :: Word32) `div` sizeOf (nullPtr :: Ptr ()) + 1
 
@@ -23564,10 +23762,10 @@ testArenaGuard = do
       arenaGuardPaths
   live <-
     sequence
-      [ liveRefusal "a slot array past UINT32_MAX bytes" "nn_env_alloc_slots" (void (tieFrame EnvLet slotCountPastUInt32 (\_ _ -> pure emptyEnv) (const (pure [])))),
-        -- The list's items come from the same slot allocator, so the same
-        -- count is refused there and must surface as a list failure, where
-        -- a NULL return would read as the empty list.
+      [ liveRefusal "an env whose slots pass UINT32_MAX bytes" "nn_env_new" (void (tieFrame EnvLet Nothing slotCountPastUInt32 (const (pure [])))),
+        -- The list's items come from the same pages, so the same count is
+        -- refused there and must surface as a list failure, where a NULL
+        -- return would read as the empty list.
         liveRefusal "a list past UINT32_MAX slot bytes" "nn_list_new" (void (clistNew (fromIntegral slotCountPastUInt32))),
         -- A length the entry's uint32_t cannot hold, refused rather than
         -- truncated to alias a shorter string.
@@ -26755,6 +26953,7 @@ runSuite = do
           testFrameKnots,
           testCensus,
           testAllocSites,
+          testEnvLayout,
           testEvalLists,
           testEvalLambda,
           testEvalWith,

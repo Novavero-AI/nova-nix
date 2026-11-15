@@ -44,11 +44,10 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Foreign.Ptr (nullPtr)
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, builtinNames, currentSystemStr, deferApply, evaluated, readThunkValue)
 import Nix.Eval.AllocSite (EnvSite (EnvApply, EnvRoot), SetSite (SetRoot))
 import Nix.Eval.CData (MonadCData, runCDataPure)
-import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newCEnv, thunkToCPtr)
+import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newScopeEnv, thunkToCPtr)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames)
 import Nix.Parser (SourceOrigin (..), parseNixWithScope, parsedExpr)
 import Nix.Store.Path (defaultStoreDirText)
@@ -80,7 +79,7 @@ builtinEnv policy timestamp searchPaths = do
             let unprefixed = fromMaybe name (T.stripPrefix "__" name)
             attrSetLookup unprefixed builtinsSet >>= maybe (evaluated (VBuiltin unprefixed [])) pure
   scope <- sequenceA (Map.fromSet bind (rootScopeNames policy)) >>= attrSetFromMap SetRoot
-  newCEnv EnvRoot nullPtr 0 (Just scope) Nothing nullPtr 0
+  newScopeEnv EnvRoot Nothing scope
 
 -- | The names the root environment binds under a policy: upstream's base
 -- environment, which leaves out its @impureOnly@ constants under
@@ -100,7 +99,7 @@ builtinEnvWithScope :: (MonadCData m) => EvalPolicy -> Int64 -> [Thunk] -> [(Tex
 builtinEnvWithScope policy timestamp searchPaths scope = do
   base <- builtinEnv policy timestamp searchPaths
   overlay <- attrSetFromMap SetRoot (Map.fromList scope)
-  newCEnv EnvRoot nullPtr 0 (Just overlay) (Just base) nullPtr 0
+  newScopeEnv EnvRoot (Just base) overlay
 
 -- | The @builtins@ attribute set, derived from the central registry.
 builtinsAttrSet :: (MonadCData m) => EvalPolicy -> Int64 -> [Thunk] -> m AttrSet
@@ -257,7 +256,7 @@ derivationWrapperScope = do
 derivationWrapper :: Thunk
 derivationWrapper = runCDataPure $ do
   scope <- derivationWrapperScope
-  env <- attrSetFromMap SetRoot scope >>= \set -> newCEnv EnvRoot nullPtr 0 (Just set) Nothing nullPtr 0
+  env <- attrSetFromMap SetRoot scope >>= newScopeEnv EnvRoot Nothing
   case parseNixWithScope (Map.keysSet scope) "/" derivationWrapperOrigin derivationWrapperSource of
     Right parsed -> cheapThunk env (parsedExpr parsed)
     Left err -> abortingThunk ("the derivation wrapper does not parse: " <> T.pack (show err))

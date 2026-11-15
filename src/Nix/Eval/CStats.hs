@@ -153,7 +153,7 @@ foreign import ccall unsafe "nn_stats_set_sites"
 data PerKind a = PerKind
   { -- | Thunk cells in the arena's blocks.
     kindThunks :: !a,
-    -- | Env structs, with their slot and with-scope arrays.
+    -- | Envs, with their slots, and their with-scope arrays.
     kindEnvs :: !a,
     -- | Attribute sets: each header with its keys, positions and values.
     kindAttrSets :: !a,
@@ -200,9 +200,9 @@ kindNames = PerKind "thunks" "envs" "attrsets" "lists" "lambdas" "ctxstrs" "symb
 -- | Objects of one kind and the bytes they hold from the allocator.
 data Figures = Figures
   { -- | How many, or 'Nothing' where no allocator keeps a count: the env
-    -- pages hold env structs and arrays side by side, so unless counting
-    -- by site ('countSites') has covered every env, the envs allocated
-    -- are known in bytes and not in number.
+    -- pages hold envs and with-scope arrays side by side, so unless
+    -- counting by site ('countSites') has covered every env, the envs
+    -- allocated are known in bytes and not in number.
     figuresCount :: !(Maybe Word64),
     figuresBytes :: !Word64
   }
@@ -213,9 +213,10 @@ data Figures = Figures
 data Census = Census
   { -- | Everything allocated, by kind.
     censusAllocated :: !(PerKind Figures),
-    -- | What the roots reach, by kind.  An env's arrays count in its
-    -- bytes and not in its count; a list's items array counts once
-    -- whichever header over it is reached.
+    -- | What the roots reach, by kind.  An env's with-scope array counts
+    -- in the bytes of the first env over it reached and not in its count;
+    -- a list's items array counts once whichever header over it is
+    -- reached.
     censusReached :: !(PerKind Figures),
     -- | Bytes the allocators hold that no object does: block and page
     -- headers and unused tails, the tracking arrays, and the symbol
@@ -228,9 +229,9 @@ data Census = Census
     censusStablePtrs :: !Word64,
     -- | Those of them the roots reach.
     censusStablePtrsReached :: !Word64,
-    -- | Objects the mark entered: thunks, env structs, slot and
-    -- with-scope arrays, sets, list headers, items arrays, lambdas and
-    -- strings with context.  Symbols are marked and not entered.
+    -- | Objects the mark entered: thunks, envs, with-scope arrays, sets,
+    -- list headers, items arrays, lambdas and strings with context.
+    -- Symbols are marked and not entered.
     censusVisitedObjects :: !Word64,
     -- | The bytes those objects hold.
     censusVisitedBytes :: !Word64,
@@ -254,7 +255,7 @@ data Census = Census
 -- Counting by site
 -- ---------------------------------------------------------------------------
 
--- | The size of an environment: the slots allocated with it.
+-- | The size of an environment: the slots it holds.
 data EnvSize
   = -- | Exactly this many.
     EnvSlots !Word32
@@ -267,10 +268,10 @@ data EnvSize
 data EnvSiteFigures = EnvSiteFigures
   { -- | How many.
     envSiteEnvs :: !Word64,
-    -- | The slots allocated with them.
+    -- | The slots they hold.
     envSiteSlots :: !Word64,
-    -- | Every byte of the env pages they took: structs, slot arrays and
-    -- with-scope arrays.
+    -- | Every byte of the env pages they took: the envs with their slots,
+    -- and their with-scope arrays.
     envSiteBytes :: !Word64
   }
   deriving (Eq, Show)

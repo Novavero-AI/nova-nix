@@ -38,7 +38,7 @@
 /* --- Kinds: the index of each kind's figures --- */
 
 #define NN_STATS_THUNKS     0  /* thunk cells in the arena's blocks */
-#define NN_STATS_ENVS       1  /* env structs, their slot and with-scope arrays */
+#define NN_STATS_ENVS       1  /* envs with their slots, and with-scope arrays */
 #define NN_STATS_ATTRSETS   2  /* attribute sets: header, keys, positions, values */
 #define NN_STATS_LISTS      3  /* list headers and the items arrays they span */
 #define NN_STATS_LAMBDAS    4  /* lambda closures and their formal entries */
@@ -46,10 +46,10 @@
 #define NN_STATS_SYMBOLS    6  /* interned text: every name and context-free string */
 #define NN_STATS_KIND_COUNT 7
 
-/* A count no allocator keeps: the env pages hold env structs and arrays
- * side by side with no record of which is which, so without counting by
- * site from the arena's first allocation the bytes are known and the
- * number of envs is not. */
+/* A count no allocator keeps: the env pages hold envs and with-scope
+ * arrays side by side with no record of which is which, so without
+ * counting by site from the arena's first allocation the bytes are known
+ * and the number of envs is not. */
 #define NN_STATS_UNCOUNTED UINT64_MAX
 
 /* --- Sites --- */
@@ -60,7 +60,7 @@
 #define NN_STATS_ENV_SITES 16u
 #define NN_STATS_SET_SITES 22u
 
-/* Envs by the slots allocated with them: one bucket for each count below
+/* Envs by the slots they hold: one bucket for each count below
  * NN_STATS_ENV_SIZES - 1, and the last for every larger count. */
 #define NN_STATS_ENV_SIZES 33u
 
@@ -74,9 +74,9 @@ extern int nn_stats_counting;
 void nn_stats_count_sites(void);
 
 /* The allocators' half, called only while nn_stats_counting is nonzero.
- * An env counts once, with the slots allocated with it and its struct's
- * bytes, and every other byte the env pages hand out for envs (slot and
- * with-scope arrays) counts under the site it is for; a set counts once
+ * An env counts once, with the slots it holds and its bytes, and every
+ * other byte the env pages hand out for envs (with-scope arrays) counts
+ * under the site it is for; a set counts once
  * with the bytes it holds once built, and as shareable when it equals a
  * set that already exists: one with no entries, which equals every empty
  * set, or a union one of whose operands has none, which equals the
@@ -146,12 +146,13 @@ uint32_t nn_stats_pending_stableptrs(void);
 uint32_t nn_stats_take_stableptrs(void **out, uint32_t max);
 
 /* Objects the mark has reached and the bytes they hold, by kind.  An
- * env's arrays count in its bytes and not in its count; a list's items
- * array counts in the bytes of the first header over it reached. */
+ * env's with-scope array counts in the bytes of the first env over it
+ * reached and not in its count; a list's items array counts in the bytes
+ * of the first header over it reached. */
 void nn_stats_reached(uint64_t *counts, uint64_t *bytes);
 
-/* The mark's own work: the objects it has entered (thunks, env structs,
- * slot and with-scope arrays, sets, list headers, items arrays, lambdas,
+/* The mark's own work: the objects it has entered (thunks, envs,
+ * with-scope arrays, sets, list headers, items arrays, lambdas,
  * strings with context; symbols are marked and not entered) and their
  * bytes, the pointers it could not place, and the StablePtr payloads it
  * has reached. */
