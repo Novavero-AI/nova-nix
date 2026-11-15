@@ -21604,6 +21604,8 @@ testNixConfig = do
           `andThen` assertEqual "alias" (Right True) (fallback ["build-fallback = yes"])
           `andThen` assertEqual "replaced" (Right False) (fallback ["fallback = true", "fallback = false"])
           `andThen` assertEqual "typo" (Left "Boolean setting 'fallback' has invalid value 'ture'") (fallback ["fallback = ture"]),
+      runTest "an invalid build-fallback is refused naming fallback, as upstream's error names the setting" $
+        assertEqual "alias-typo" (Left "Boolean setting 'fallback' has invalid value 'maybe'") (fallback ["build-fallback = maybe"]),
       runTest "always-allow-substitutes is a Boolean, off by default" $
         assertEqual "default" (Right False) (alwaysAllowSubstitutes [])
           `andThen` assertEqual "on" (Right True) (alwaysAllowSubstitutes ["always-allow-substitutes = true"])

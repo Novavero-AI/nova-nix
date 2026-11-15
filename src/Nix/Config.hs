@@ -569,10 +569,12 @@ applyAssignment config (ConfigAssignment name value) =
     Nothing -> Right config
     Just (ListSetting field, mode) ->
       (\items -> setList field (combine mode (getList field config) items) config) <$> listItems field value
+    -- Upstream's Boolean and integer errors name the setting by its own
+    -- name, not the alias it was set through (@BaseSetting\<T\>::parse@
+    -- throws with @name@, the setting's, which @Config::set@ reaches
+    -- through an alias's entry, config.cc at 2.24.9).
     Just (BoolSetting field, _) ->
-      (\flag -> setBool field flag config) <$> parseBool name value
-    -- Upstream's integer error names the setting by its own name, not
-    -- the alias it was set through (@BaseSetting\<T\>::parse@).
+      (\flag -> setBool field flag config) <$> parseBool (boolFieldKey field) value
     Just (ScalarSetting field, _) ->
       (\number -> setScalar field number config) <$> parseUnsignedSetting (scalarFieldKey field) value
   where
@@ -664,6 +666,13 @@ setScalar CoresField v config = config {ncCores = Just v}
 scalarFieldKey :: ScalarField -> ByteString
 scalarFieldKey MaxCallDepthField = maxCallDepthKey
 scalarFieldKey CoresField = coresKey
+
+boolFieldKey :: BoolField -> ByteString
+boolFieldKey FallbackField = fallbackKey
+boolFieldKey AlwaysAllowSubstitutesField = alwaysAllowSubstitutesKey
+boolFieldKey RestrictEvalField = restrictEvalKey
+boolFieldKey PureEvalField = pureEvalKey
+boolFieldKey TraceVerboseField = traceVerboseKey
 
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool FallbackField v config = config {ncFallback = v}
