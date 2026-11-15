@@ -38,8 +38,8 @@ import System.OsPath (OsPath, decodeFS)
 
 import Control.Exception (bracketOnError)
 import Data.Bits ((.|.))
-import Data.List (isPrefixOf)
 import GHC.IO.SubSystem (IoSubSystem (..), ioSubSystem)
+import Nix.Store.Win32Path (win32FilePath)
 import System.IO (Handle)
 import System.IO.Error (ioeSetFileName, modifyIOError)
 import System.Win32.File
@@ -53,7 +53,6 @@ import System.Win32.File
     gENERIC_READ,
     gENERIC_WRITE,
   )
-import System.Win32.Info (getFullPathName)
 import System.Win32.Types (hANDLEToHandle)
 
 #else
@@ -111,24 +110,6 @@ openNewBinaryFile osPath = do
     attributes = case ioSubSystem of
       IoPOSIX -> fILE_ATTRIBUTE_NORMAL
       IoNative -> fILE_ATTRIBUTE_NORMAL .|. fILE_FLAG_OVERLAPPED
-
--- | The Win32 file-namespace spelling of a path (@\\\\?\\@), which
--- CreateFileW takes past MAX_PATH.  @base@ converts every path it
--- opens to this form, under either I\/O manager
--- (@__hs_create_device_name@ in GHC's utils\/fs\/fs.c), so a raw
--- CreateFileW without it would refuse long paths @base@ accepts.  The
--- namespace form is taken literally, so separators, @.@ and @..@ are
--- resolved first by GetFullPathNameW, as that conversion does.
-win32FilePath :: FilePath -> IO FilePath
-win32FilePath path
-  | any (`isPrefixOf` path) namespacePrefixes = pure path
-  | otherwise = toNamespace <$> getFullPathName path
-  where
-    namespacePrefixes = [fileNamespace, "\\\\.\\", "\\??\\"]
-    toNamespace full = case full of
-      '\\' : '\\' : share -> fileNamespace <> "UNC\\" <> share
-      _ -> fileNamespace <> full
-    fileNamespace = "\\\\?\\"
 
 #else
 

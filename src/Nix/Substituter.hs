@@ -112,7 +112,7 @@ import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Realise (Fallback (..), Offer (..))
-import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, setReadOnly, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
+import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash, spName), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
@@ -526,7 +526,7 @@ unpackVerifiedNar store sp verified refs deriver =
             Left err -> pure (SubstError ("unpack failed: " <> T.pack (show err)))
             Right (Left err) -> pure (SubstError ("unpack failed: " <> err))
             Right (Right ()) -> do
-              setReadOnly destPath
+              canonicalizeMetadata destPath
               -- A path registered valid must match its recorded hash ON
               -- DISK, not merely in the verified bytes: any divergence
               -- the filesystem introduced between the NAR and the
@@ -841,7 +841,7 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
           Dir.removePathForcibly destPath
           pure (Left err)
         Right narByteCount -> do
-          setReadOnly destPath
+          canonicalizeMetadata destPath
           -- A path registered valid must match its recorded hash ON
           -- DISK, not merely in the streamed bytes: any divergence the
           -- filesystem introduced between the NAR and the materialized
@@ -1163,9 +1163,9 @@ parseDeriver storeDir (Just txt)
 -- ---------------------------------------------------------------------------
 
 -- | Remove a leftover destination tree before unpacking.  A crash (or a
--- failed registration) between 'setReadOnly' here and the caller's
--- 'Nix.Store.DB.registerPaths' leaves a read-only, unregistered tree;
--- unpacking over it would then fail with permission-denied on every
+-- failed registration) between 'canonicalizeMetadata' here and the
+-- caller's 'Nix.Store.DB.registerPaths' leaves a read-only, unregistered
+-- tree; unpacking over it would then fail with permission-denied on every
 -- retry, permanently wedging substitution of that path.
 -- 'Dir.removePathForcibly' clears read-only marks and accepts a missing
 -- path, so the fresh unpack always starts from a clean slate.

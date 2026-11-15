@@ -26,7 +26,7 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (intToDigit, isAsciiLower, isAsciiUpper, isDigit, ord)
 import Data.Either (isLeft, isRight)
-import Data.Foldable (toList)
+import Data.Foldable (toList, traverse_)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
@@ -41,6 +41,8 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
+import qualified Data.Time.Clock as Clock
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Tuple (swap)
 import Data.Word (Word16, Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
@@ -100,16 +102,18 @@ import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScop
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, preparePath, pushPaths, storePathBasename, stripHashPrefix)
 import qualified Nix.Realise as Realise
-import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, setReadOnly, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalizeMetadata, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
+import Nix.Store.Metadata (MetadataChange (..), NodeKind (..), NodeMetadata (..), Ownership (..), canonicalPermissions, executablePermissions, metadataChanges, readOnlyPermissions, storeModificationTime)
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
 import qualified Nix.Trust as Trust
 import Nix.Trust.Scan (scanFetched)
+import NodeStatus (NodeStatus (..), nodeStatus)
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as CHash
 import qualified NovaCache.NAR as NAR
@@ -7700,6 +7704,46 @@ testSubstituter = do
               then Pass
               else Fail "registration or on-disk bytes diverge from the declared hash"
           other -> Fail ("unpackAndVerify failed: " <> T.pack (show other)),
+      runTestM "a substituted tree takes upstream's modes and the store's time" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-unpack-canonical"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let sp = StorePath (T.replicate 32 "t") "canonical"
+            dest = storePathToFilePath (stDir store) sp
+            rawNar =
+              NAR.serialise
+                ( NAR.NarDirectory
+                    [ ("data", NAR.NarRegular False "data"),
+                      ("run", NAR.NarRegular True "#!/bin/sh\n")
+                    ]
+                )
+            info =
+              NarInfo.NarInfo
+                { NarInfo.niStorePath = storePathToText defaultStoreDir sp,
+                  NarInfo.niUrl = "nar/canonical.nar",
+                  NarInfo.niCompression = "none",
+                  NarInfo.niFileHash = Nothing,
+                  NarInfo.niFileSize = Nothing,
+                  NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes rawNar),
+                  NarInfo.niNarSize = fromIntegral (BS.length rawNar),
+                  NarInfo.niReferences = [],
+                  NarInfo.niDeriver = Nothing,
+                  NarInfo.niSigs = [],
+                  NarInfo.niCA = Nothing
+                }
+        result <- Subst.unpackAndVerify store sp info rawNar
+        outcome <- case result of
+          Subst.SubstSuccess _ lock -> do
+            releasePathLock lock
+            foldr andThen Pass
+              <$> traverse
+                (uncurry canonicalAs)
+                [(executablePermissions, dest), (readOnlyPermissions, dest </> "data"), (executablePermissions, dest </> "run")]
+          other -> pure (Fail ("unpackAndVerify failed: " <> T.pack (show other)))
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure outcome,
       -- The verify-fails branch of the strict pipeline: bytes that do
       -- not match the narinfo's signed NarHash or NarSize never reach
       -- the unpack sink, so nothing is written at the store path and
@@ -7934,8 +7978,8 @@ testExecBit = do
           (True, False) -> Pass
           (False, _) -> Fail "a marked file did not read back executable"
           (_, True) -> Fail "an unmarked file read back executable",
-      -- copyExecMark out of a sealed store path.  setReadOnly is what
-      -- placeInStore does, and on Windows copyFile propagates that
+      -- copyExecMark out of a sealed store path.  canonicalizeMetadata is
+      -- what placeInStore does, and on Windows copyFile propagates that
       -- attribute to the copy, where a mark cannot be written until it is
       -- cleared again.  The source must also survive read-only.
       runTestM "exec mark survives a copy out of a read-only source" $ do
@@ -7944,7 +7988,7 @@ testExecBit = do
             dest = dir </> "tool-copy"
         BS.writeFile src "#!x"
         ExecBit.markExecutable src
-        setReadOnly src
+        canonicalizeMetadata src
         Dir.copyFile src dest
         ExecBit.copyExecMark src dest
         copied <- ExecBit.isExecutable dest
@@ -9453,7 +9497,7 @@ deleteNamed :: Store -> Text -> IO (Either Text DeleteOutcome)
 deleteNamed store = either (pure . Left) (deleteStorePathRaw store) . storeEntryName
 
 -- | Recursively restore writable permissions then remove.
--- Needed because addToStore/setReadOnly makes paths read-only.
+-- Needed because addToStore/canonicalizeMetadata makes paths read-only.
 forceRemoveIfExists :: FilePath -> IO ()
 forceRemoveIfExists path = do
   exists <- doesDirectoryExist path
@@ -9599,7 +9643,7 @@ testBuildDirIO = do
           let sealed = expectedDir store </> "sealed"
           createDirectoryIfMissing True sealed
           BS.writeFile (sealed </> "file") "stale"
-          setReadOnly sealed
+          canonicalizeMetadata sealed
           result <- buildDerivation (defaultBuildConfig (stDir store)) store probe testDrvPath
           built result $ do
             entries <- recorded store "entries"
@@ -15022,6 +15066,31 @@ testFetchGitPins = do
                     Left err -> Fail ("a correct pin was refused: " <> err)
                 other -> pure (Fail (T.pack (show other)))
           [] -> pure (Fail "fixture returned no commits"),
+        -- A remembered tree on disk with other metadata, as a writer that
+        -- left it owner-writable with the time it wrote it would, is made
+        -- canonical when a cache hit adopts it, as a fresh fetch's is.
+        runTestM "a cache hit makes the remembered tree's metadata canonical" $ case shas of
+          (sha : _) -> do
+            first <- fetchWith ("rev = \"" <> sha <> "\"; ")
+            case first of
+              Left err -> pure (Fail err)
+              Right val -> case fetchGitFields val ["outPath"] of
+                [("outPath", VPath outPath)] | Just sp <- parseStorePath defaultStoreDir outPath -> do
+                  let dest = storePathToFilePath (StoreDir tmpStore) sp
+                      file = dest </> "a.txt"
+                  now <- Clock.getCurrentTime
+                  traverse_
+                    (\node -> Dir.getPermissions node >>= Dir.setPermissions node . Dir.setOwnerWritable True >> Dir.setModificationTime node now)
+                    [file, dest]
+                  aged <- traverse nodeStatus [dest, file]
+                  second <- fetchWith ("rev = \"" <> sha <> "\"; ")
+                  results <- traverse (uncurry canonicalAs) [(executablePermissions, dest), (readOnlyPermissions, file)]
+                  pure $
+                    assertEqual "aged" True (all (maybe True (\st -> nsPermissions st `elem` [0o755, 0o644] && nsModificationTime st /= storeModificationTime)) aged)
+                      `andThen` either (Fail . ("the cache hit failed: " <>)) (const Pass) second
+                      `andThen` foldr andThen Pass results
+                other -> pure (Fail (T.pack (show other)))
+          [] -> pure (Fail "fixture returned no commits"),
         runTestM "allRefs finds a rev on an unfetched branch" $ do
           outcome <- fetchWith ("rev = \"" <> sideSha <> "\"; allRefs = true; ")
           pure $ case outcome of
@@ -15437,7 +15506,7 @@ testStoreDelete = do
           registerPath (stDB store) (PathRegistration solid "sha256:s" 1 Nothing [])
           createDirectoryIfMissing True treePath
           TIO.writeFile (treePath </> "data.txt") "content"
-          setReadOnly treePath
+          canonicalizeMetadata treePath
           outcome <- deleteNamed store (basenameOf solid)
           gone <- not <$> Dir.doesPathExist treePath
           stillValid <- isValid store solid
@@ -16353,6 +16422,104 @@ testStoreWritesUpstreamManaged = do
           drvEnv = Map.singleton "name" "upstream-greeting"
         }
 
+-- | The canonical form a registered path's metadata takes
+-- ("Nix.Store.Metadata"): what one node needs, decided without the
+-- filesystem, and the walk that makes the changes on disk.
+testStoreMetadata :: IO [Bool]
+testStoreMetadata = do
+  putStrLn "store/metadata"
+  sequence
+    [ runTest "a file other users may read and write becomes 0444, and one its owner may execute 0555" $
+        assertEqual "file" [SetPermissions readOnlyPermissions] (metadataChanges (node RegularNode 0o644))
+          `andThen` assertEqual "executable" [SetPermissions executablePermissions] (metadataChanges (node RegularNode 0o744))
+          `andThen` assertEqual "directory" [SetPermissions executablePermissions] (metadataChanges (node DirectoryNode 0o700)),
+      runTest "the setuid, setgid and sticky bits are dropped" $
+        assertEqual "setuid" [SetPermissions executablePermissions] (metadataChanges (node RegularNode 0o4755))
+          `andThen` assertEqual "sticky" [SetPermissions executablePermissions] (metadataChanges (node DirectoryNode 0o1777)),
+      runTest "a canonical node needs nothing, and a symlink's mode is never changed" $
+        assertEqual "file" [] (metadataChanges (node RegularNode 0o444))
+          `andThen` assertEqual "executable" [] (metadataChanges (node RegularNode 0o555))
+          `andThen` assertEqual "symlink" [] (metadataChanges (node SymlinkNode 0o777)),
+      runTest "a node with another time is given the store's, a symlink included" $
+        assertEqual "file" [SetModificationTime] (metadataChanges (node RegularNode 0o444) {nmModificationTime = 0})
+          `andThen` assertEqual "symlink" [SetModificationTime] (metadataChanges (node SymlinkNode 0o777) {nmModificationTime = 1700000000}),
+      runTest "a node another user owns is taken over, after its mode and time" $
+        assertEqual
+          "owned by other"
+          [SetPermissions readOnlyPermissions, SetModificationTime, TakeOwnership]
+          (metadataChanges (node RegularNode 0o644) {nmModificationTime = 0, nmOwnership = OwnedByOther}),
+      -- The law: canonicalizing a canonical node changes nothing, so the
+      -- walk is idempotent and a second registration of a path leaves it
+      -- as the first did.
+      runTestM "once a node's changes are made it needs no more" $
+        property $
+          QC.forAll genNode $ \before ->
+            metadataChanges (foldl' (flip applyChange) before (metadataChanges before)) QC.=== [],
+      -- A NAR records a file as executable by its owner's execute bit, so
+      -- keeping that bit keeps the path's NAR hash.
+      runTestM "a canonical mode is 0444 or 0555 and keeps the owner's execute bit" $
+        property $
+          QC.forAll (QC.choose (0, 0o7777)) $ \perms ->
+            let canonical = canonicalPermissions perms
+             in QC.counterexample (show canonical) (canonical `elem` [readOnlyPermissions, executablePermissions])
+                  QC..&&. (ownerExecutes canonical QC.=== ownerExecutes perms),
+      runTestM "canonicalizeMetadata gives each file and directory upstream's mode and the store's time" $ do
+        tmpBase <- getTemporaryDirectory
+        let tree = tmpBase </> "nova-nix-test-canonical-tree"
+        Dir.removePathForcibly tree
+        createDirectoryIfMissing True (tree </> "sub")
+        BS.writeFile (tree </> "data") "data"
+        BS.writeFile (tree </> "run") "#!/bin/sh\n"
+        ExecBit.markExecutable (tree </> "run")
+        BS.writeFile (tree </> "sub" </> "inner") "inner"
+        canonicalizeMetadata tree
+        results <-
+          traverse
+            (uncurry canonicalAs)
+            [ (executablePermissions, tree),
+              (readOnlyPermissions, tree </> "data"),
+              (executablePermissions, tree </> "run"),
+              (executablePermissions, tree </> "sub"),
+              (readOnlyPermissions, tree </> "sub" </> "inner")
+            ]
+        Dir.removePathForcibly tree
+        pure (foldr andThen Pass results)
+    ]
+  where
+    node kind perms = NodeMetadata kind perms storeModificationTime OwnedByProcess
+    genNode =
+      NodeMetadata
+        <$> QC.elements [RegularNode, DirectoryNode, SymlinkNode]
+        <*> QC.choose (0, 0o7777)
+        <*> QC.oneof [pure storeModificationTime, QC.arbitrary]
+        <*> QC.elements [OwnedByProcess, OwnedByOther]
+    -- What each change does to the node it is made to.
+    applyChange change meta = case change of
+      SetPermissions perms -> meta {nmPermissions = perms}
+      SetModificationTime -> meta {nmModificationTime = storeModificationTime}
+      TakeOwnership -> meta {nmOwnership = OwnedByProcess}
+    ownerExecutes perms = perms .&. 0o100 /= 0
+    property :: (QC.Testable prop) => prop -> IO TestResult
+    property prop = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} prop
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+
+-- | Whether a node has the form 'canonicalizeMetadata' gives it.  On
+-- POSIX that is the given mode and the store's time, as @lstat@ reads
+-- them.  Windows has no mode, so there it is a file or directory that is
+-- read-only and has the store's time.
+canonicalAs :: Word32 -> FilePath -> IO TestResult
+canonicalAs expected path = do
+  status <- nodeStatus path
+  case status of
+    Just found -> pure (assertEqual (T.pack path) (NodeStatus expected storeModificationTime) found)
+    Nothing -> do
+      perms <- getPermissions path
+      time <- Dir.getModificationTime path
+      pure (assertEqual (T.pack path) (False, storeTime) (writable perms, time))
+  where
+    storeTime = posixSecondsToUTCTime (fromIntegral storeModificationTime)
+
 testStoreOps :: IO [Bool]
 testStoreOps = do
   putStrLn "store/ops"
@@ -16402,6 +16569,29 @@ testStoreOps = do
                 if adopted == "real content" && registered
                   then Pass
                   else Fail ("expected re-copied content, got: " <> adopted),
+        -- A tree that reproduces its address is adopted as it is on disk,
+        -- which may be as a restore or an evaluation left it, before its
+        -- metadata was made canonical.
+        runTestM "materializeEvalSources makes an adopted tree's metadata canonical" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-adopt-canonical"
+          Dir.removePathForcibly srcDir
+          createDirectoryIfMissing True srcDir
+          TIO.writeFile (srcDir </> "data.txt") "adopted content"
+          entry <- NAR.serialiseFromPath srcDir
+          case makeFixedOutputPath "nova-nix-test-adopt-canonical" "sha256" "recursive" (sha256Digest (NAR.serialise entry)) of
+            Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
+            Right sp -> do
+              let spText = storePathToText defaultStoreDir sp
+                  dest = storePathToFilePath (stDir store) sp
+              forceRemoveIfExists dest
+              createDirectoryIfMissing True dest
+              TIO.writeFile (dest </> "data.txt") "adopted content"
+              materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+              registered <- isValid store sp
+              results <- traverse (uncurry canonicalAs) [(executablePermissions, dest), (readOnlyPermissions, dest </> "data.txt")]
+              Dir.removePathForcibly srcDir
+              pure (assertEqual "registered" True registered `andThen` foldr andThen Pass results),
         -- Evaluation hashes a source well before the build driver
         -- restores it.  A source edited in between no longer reproduces
         -- the address evaluation gave it, so it is refused and nothing
@@ -16466,10 +16656,11 @@ testStoreOps = do
               materializeEvalStoreWrites store (Map.fromList [(spText, (refs, WriteText))])
               registered <- isValid store sp
               pure (assertEqual "registered" True registered),
-        -- A tree that DOES reproduce its store path is adopted untouched.
-        -- The source is deleted before the call: adoption never reads it,
-        -- so a wrongful re-copy attempt throws and fails the test.
-        runTestM "materializeEvalSources adopts a matching tree untouched" $ do
+        -- A tree that DOES reproduce its store path is adopted with its
+        -- bytes as they are.  The source is deleted before the call:
+        -- adoption never reads it, so a wrongful re-copy attempt throws and
+        -- fails the test.
+        runTestM "materializeEvalSources adopts a matching tree without copying it again" $ do
           tmpBase <- getTemporaryDirectory
           let srcDir = tmpBase </> "nova-nix-test-adopt-ok"
           removeIfExists srcDir
@@ -16656,14 +16847,14 @@ testStoreOps = do
             if not (writable perms)
               then Pass
               else Fail "expected read-only but file is writable",
-        -- setReadOnly works on a plain directory
-        runTestM "setReadOnly makes dir read-only" $ do
+        -- canonicalizeMetadata works on a plain directory
+        runTestM "canonicalizeMetadata makes a directory and its file read-only" $ do
           tmpBase <- getTemporaryDirectory
           let roDir = tmpBase </> "nova-nix-test-readonly"
           removeIfExists roDir
           createDirectoryIfMissing True roDir
           writeFile (roDir </> "f.txt") "content"
-          setReadOnly roDir
+          canonicalizeMetadata roDir
           dirPerms <- getPermissions roDir
           filePerms <- getPermissions (roDir </> "f.txt")
           -- Cleanup: restore writable so removeIfExists works
@@ -16680,6 +16871,31 @@ testStoreOps = do
                       <> " file writable="
                       <> T.pack (show (writable filePerms))
                   ),
+        runTestM "a registered path's files take upstream's modes and the store's time" $ do
+          tmpBase <- getTemporaryDirectory
+          let srcDir = tmpBase </> "nova-nix-test-add-canonical"
+              sp = StorePath (T.replicate 32 "v") "canonical"
+              dest = storePathToFilePath sd sp
+          Dir.removePathForcibly srcDir
+          createDirectoryIfMissing True srcDir
+          BS.writeFile (srcDir </> "data") "data"
+          BS.writeFile (srcDir </> "run") "#!/bin/sh\n"
+          ExecBit.markExecutable (srcDir </> "run")
+          addToStore store srcDir sp Nothing []
+          results <-
+            traverse
+              (uncurry canonicalAs)
+              [(executablePermissions, dest), (readOnlyPermissions, dest </> "data"), (executablePermissions, dest </> "run")]
+          pure (foldr andThen Pass results),
+        -- A .drv is a store object like any other, and the build driver
+        -- writes the root's after the closure that already holds it.
+        runTestM "a written .drv is read-only with the store's time, and writing it again keeps it" $ do
+          let sp = StorePath (T.replicate 32 "u") "canonical.drv"
+          writeDrv store simpleTestDrv sp
+          writeDrv store simpleTestDrv sp
+          contents <- BS.readFile (storePathToFilePath sd sp)
+          sealed <- canonicalAs readOnlyPermissions (storePathToFilePath sd sp)
+          pure (assertEqual "contents" (toATerm simpleTestDrv) contents `andThen` sealed),
         -- pathExists true after addToStore
         runTestM "pathExists after addToStore" $ do
           tmpBase <- getTemporaryDirectory
@@ -16707,13 +16923,15 @@ testSymlinkWalksIO = do
       pure []
     else
       sequence
-        [ -- A link out of the tree must not have the read-only bit
-          -- pushed through to its target.
-          runTestM "setReadOnly does not mark link targets outside the tree" $ do
+        [ -- A link out of the tree must not have the read-only bit or the
+          -- store's time pushed through to its target.  The link's own
+          -- time is the store's, which only lstat reads.
+          runTestM "canonicalizeMetadata does not change link targets outside the tree" $ do
             tmpBase <- getTemporaryDirectory
             let base = tmpBase </> "nova-nix-test-ro-links"
                 outside = base </> "outside"
                 tree = base </> "tree"
+                targets = [outside, outside </> "victim.txt"]
             Dir.removePathForcibly base
             createDirectoryIfMissing True outside
             createDirectoryIfMissing True tree
@@ -16721,29 +16939,34 @@ testSymlinkWalksIO = do
             BS.writeFile (tree </> "inside.txt") "inside"
             Dir.createFileLink (outside </> "victim.txt") (tree </> "file-link")
             Dir.createDirectoryLink outside (tree </> "dir-link")
-            setReadOnly tree
+            targetsBefore <- traverse nodeStatus targets
+            canonicalizeMetadata tree
+            targetsAfter <- traverse nodeStatus targets
+            linkTimes <- traverse (fmap (fmap nsModificationTime) . nodeStatus) [tree </> "file-link", tree </> "dir-link"]
             victimWritable <- writable <$> getPermissions (outside </> "victim.txt")
             insideWritable <- writable <$> getPermissions (tree </> "inside.txt")
             Dir.removePathForcibly base
             pure $
-              if victimWritable && not insideWritable
-                then Pass
-                else
-                  Fail
-                    ( "victim writable="
-                        <> T.pack (show victimWritable)
-                        <> " inside writable="
-                        <> T.pack (show insideWritable)
-                    ),
+              assertEqual "targets' modes and times" targetsBefore targetsAfter
+                `andThen` assertEqual "links' own times" (map (storeModificationTime <$) linkTimes) linkTimes
+                `andThen` if victimWritable && not insideWritable
+                  then Pass
+                  else
+                    Fail
+                      ( "victim writable="
+                          <> T.pack (show victimWritable)
+                          <> " inside writable="
+                          <> T.pack (show insideWritable)
+                      ),
           -- A link cycle must not recurse the walk forever.
-          runTestM "setReadOnly terminates on a link cycle" $ do
+          runTestM "canonicalizeMetadata terminates on a link cycle" $ do
             tmpBase <- getTemporaryDirectory
             let tree = tmpBase </> "nova-nix-test-ro-cycle"
             Dir.removePathForcibly tree
             createDirectoryIfMissing True (tree </> "sub")
             BS.writeFile (tree </> "sub" </> "f.txt") "f"
             Dir.createDirectoryLink tree (tree </> "sub" </> "loop")
-            outcome <- timeout walkWatchdogMicros (setReadOnly tree)
+            outcome <- timeout walkWatchdogMicros (canonicalizeMetadata tree)
             marked <- writable <$> getPermissions (tree </> "sub" </> "f.txt")
             Dir.removePathForcibly tree
             pure $ case outcome of
@@ -17027,14 +17250,14 @@ testFromATerm = do
       runTestM "writeDrv writes correct ATerm" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-writeDrv"
-        removeIfExists tmpStore
+        forceRemoveIfExists tmpStore
         store <- openStore (StoreDir tmpStore)
         let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "test.drv"
             destFile = storePathToFilePath (stDir store) sp
         writeDrv store simpleTestDrv sp
         contents <- BS.readFile destFile
         closeStore store
-        removeIfExists tmpStore
+        forceRemoveIfExists tmpStore
         pure (assertEqual "writeDrv content" (toATerm simpleTestDrv) contents),
       -- The .drv closure registers as store objects: a row for every
       -- recipe plus edges to its input sources and input .drvs, so an
@@ -17044,7 +17267,7 @@ testFromATerm = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-drv-closure"
             sd = StoreDir tmpStore
-        removeIfExists tmpStore
+        forceRemoveIfExists tmpStore
         store <- openStore sd
         let srcSp = StorePath "gggggggggggggggggggggggggggggggg" "source.tar.gz"
             drvASp = StorePath "cccccccccccccccccccccccccccccccc" "dep1.drv"
@@ -17068,7 +17291,7 @@ testFromATerm = do
         validB <- isValid store drvBSp
         refsB <- queryReferences (stDB store) drvBSp
         closeStore store
-        removeIfExists tmpStore
+        forceRemoveIfExists tmpStore
         let expectedRefs =
               sort
                 [ T.pack (storePathToFilePath sd drvASp),
@@ -17390,7 +17613,7 @@ testBuilder = do
         -- store location, never registered.
         createDirectoryIfMissing True targetPath
         TIO.writeFile (targetPath </> "data.txt") "stale"
-        setReadOnly targetPath
+        canonicalizeMetadata targetPath
         result <- buildDerivation config store drv testDrvPath
         content <- TIO.readFile (targetPath </> "data.txt")
         registered <- isValid store outSP
@@ -18068,6 +18291,45 @@ testE2E = do
                     pure (if null problems then Pass else Fail (T.intercalate "; " problems))
             forceRemoveIfExists root
             forceRemoveIfExists tmpStore
+            pure verdict,
+      -- The tree the issue compared with nix-instantiate's: an evaluation
+      -- alone, which registers nothing, leaves it as upstream's
+      -- addToStoreFromDump does, a file 0444 and an executable 0555, each
+      -- with the store's time, whatever modes the archive held.
+      runTestM "an eval-time fetchTarball's tree takes upstream's modes and the store's time" $
+        if SI.os == "mingw32"
+          then Pass <$ putStrLn "  SKIP  the modes the issue compares are POSIX's"
+          else do
+            tmpBase <- getTemporaryDirectory
+            environment <- getEnvironment
+            let root = tmpBase </> "nova-nix-test-eval-tarball"
+                stage = root </> "stage"
+                tarball = root </> "tree.tar.gz"
+                storeDir = StoreDir (root </> "store")
+                nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+                tarProcess =
+                  (Proc.proc "tar" ["-czf", tarball, "-C", stage, "top"])
+                    { Proc.env = Just (("COPYFILE_DISABLE", "1") : environment)
+                    }
+            forceRemoveIfExists root
+            createDirectoryIfMissing True (stage </> "top")
+            BS.writeFile (stage </> "top" </> "data") "data\n"
+            BS.writeFile (stage </> "top" </> "run") "#!/bin/sh\n"
+            ExecBit.markExecutable (stage </> "top" </> "run")
+            (tarCode, _, tarErr) <- Proc.readCreateProcessWithExitCode tarProcess ""
+            verdict <- case tarCode of
+              ExitFailure n -> pure (Fail ("tar exited " <> T.pack (show n) <> ": " <> T.pack tarErr))
+              ExitSuccess -> do
+                fetched <- evalNixIOStore storeDir root ("builtins.fetchTarball \"file://" <> nixEscape (T.pack tarball) <> "\"")
+                case fetched of
+                  Right (VPath pathText) | Just sp <- parseStorePath defaultStoreDir pathText -> do
+                    let dest = storePathToFilePath storeDir sp
+                    foldr andThen Pass
+                      <$> traverse
+                        (uncurry canonicalAs)
+                        [(executablePermissions, dest), (readOnlyPermissions, dest </> "data"), (executablePermissions, dest </> "run")]
+                  other -> pure (Fail ("fetchTarball gave " <> T.pack (show other)))
+            forceRemoveIfExists root
             pure verdict,
       -- The writer half of the eval-write pair: an interrupted earlier
       -- run's truncated file at a toFile path must be rewritten, not
@@ -22902,6 +23164,7 @@ runSuite = do
           testPassAsFile,
           testStoreDB,
           testParseStorePath,
+          testStoreMetadata,
           testStoreOps,
           testStoreDelete,
           testGcPure,

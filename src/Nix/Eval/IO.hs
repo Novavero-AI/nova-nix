@@ -68,7 +68,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Pa
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Hash (bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (SourceError (..), SourceOrigin (..), parseNixWithScope)
-import Nix.Store (UpstreamHazard (..), unpackNarEntry, upstreamManagedRefusal)
+import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
 import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import qualified Nix.Store.Path as SP
@@ -481,6 +481,10 @@ instance MonadEval EvalIO where
       unless (existing == Just contents) $ do
         Dir.removePathForcibly filePath
         BS.writeFile filePath contents
+      -- Adopted or written, the file takes the metadata upstream's
+      -- addToStoreFromDump gives what it adds (local-store.cc:1342 at
+      -- 2.24.9), which builtins.toFile calls (primops.cc:2317).
+      canonicalizeMetadata filePath
     recordStoreWrite storePath refs SP.WriteText
     -- Upstream's toFile returns the path through allowAndSetStorePathString.
     allowPath storePath
@@ -628,6 +632,10 @@ instance MonadEval EvalIO where
     -- re-recording one costs nothing and closes the case where the row is
     -- missing.
     when there $ do
+      -- What is on disk may carry other modes and times than a fetch
+      -- writes, so the remembered tree is made canonical as the uncached
+      -- fetch's copyPathToStore makes the tree it writes.
+      wrapIO (canonicalizeMetadata resolved)
       recordStoreWrite path [] SP.WriteRecursive
       -- A fetch result, whether fetched now or remembered: upstream
       -- allows the store path every fetcher returns.
@@ -692,6 +700,9 @@ instance MonadEval EvalIO where
       unless (existing == Just bytes) $ do
         Dir.removePathForcibly filePath
         BS.writeFile filePath bytes
+      -- The metadata upstream gives a downloaded file it adds
+      -- (LocalStore::addToStore, local-store.cc:1190 at 2.24.9).
+      canonicalizeMetadata filePath
     recordStoreWrite storePath [] SP.WriteFlat
     allowPath storePath
     pure storePath
@@ -1293,10 +1304,12 @@ runEvalIOTraced st (EvalIO action) = do
 -- Store copy helpers
 -- ---------------------------------------------------------------------------
 
--- | Unpack a NAR entry at its content-addressed destination.  An
--- existing destination is adopted only when its NAR digest is the
--- expected one - same content means same path, so a matching tree is
--- byte-identical by construction; anything else (an interrupted
+-- | Unpack a NAR entry at its content-addressed destination and make the
+-- tree's metadata canonical ('canonicalizeMetadata'), as upstream's
+-- @addToStoreFromDump@ does to what it restores (local-store.cc:1342 at
+-- 2.24.9).  An existing destination is adopted only when its NAR digest
+-- is the expected one - same content means same path, so a matching tree
+-- is byte-identical by construction; anything else (an interrupted
 -- earlier unpack, a squatter) is cleared and unpacked afresh.  The
 -- entry is the one evaluation hashed to name the path, so the tree
 -- that lands is the one the address names, with the store volume's
@@ -1310,8 +1323,10 @@ unpackToStoreVerified dest entry expectedDigest = do
   -- cost is one pathconf call per tree.
   sensitivity <- probeCaseSensitivity (takeDirectory dest)
   onDiskNar <- narBytesIfPresent (volumeCaseHack sensitivity) dest
-  if (sha256Digest <$> onDiskNar) == Just expectedDigest
-    then pure (Right ())
-    else do
-      Dir.removePathForcibly dest
-      unpackNarEntry sensitivity dest entry
+  placed <-
+    if (sha256Digest <$> onDiskNar) == Just expectedDigest
+      then pure (Right ())
+      else do
+        Dir.removePathForcibly dest
+        unpackNarEntry sensitivity dest entry
+  traverse (\() -> canonicalizeMetadata dest) placed

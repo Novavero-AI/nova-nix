@@ -97,6 +97,7 @@ library
     Nix.Store.CaseSensitive
     Nix.Store.EntryName
     Nix.Store.ExecBit
+    Nix.Store.Metadata
     Nix.Store.Upstream
     Nix.DependencyGraph
     Nix.Derivation
@@ -156,14 +157,17 @@ library
   -- unpacking (Nix.Store.Exclusive), reading the environment as bytes on
   -- POSIX (Nix.Environment; getenv, as upstream reads it), where Windows
   -- reads it through base's UTF-16 API, marking a builder's log pipe
-  -- close-on-exec on POSIX (Nix.Builder.Log), and creating a build
-  -- directory with mode 0700 on POSIX (Nix.Builder.BuildDir).  Win32 2.9
-  -- is the first whose hANDLEToHandle serves the native Windows I/O
-  -- manager; unix 2.8 is the first whose openFd takes creat and cloexec
-  -- in its flags.
+  -- close-on-exec on POSIX (Nix.Builder.Log), creating a build
+  -- directory with mode 0700 on POSIX (Nix.Builder.BuildDir), and a
+  -- registered path's modes, times and owner (Nix.Store.Metadata).
+  -- Win32 2.12 is the first whose setFileTime leaves a time it is not
+  -- given as it is; unix 2.8 is the first whose openFd takes creat and
+  -- cloexec in its flags.
   if os(windows)
     build-depends:
-        Win32             >= 2.9 && < 2.15
+        Win32             >= 2.12 && < 2.15
+    other-modules:
+        Nix.Store.Win32Path
   else
     build-depends:
         unix              >= 2.8 && < 2.9
@@ -260,7 +264,7 @@ test-suite nova-nix-test
   type:             exitcode-stdio-1.0
   main-is:          Main.hs
   hs-source-dirs:   test
-  other-modules:    HttpFixture
+  other-modules:    HttpFixture, NodeStatus
   default-language: Haskell2010
   default-extensions:
     OverloadedStrings
@@ -288,8 +292,15 @@ test-suite nova-nix-test
     , sqlite-simple       >= 0.4 && < 0.5
     , tar                 >= 0.7.1 && < 0.8
     , text                >= 2.0 && < 2.2
+    , time                >= 1.9 && < 1.17
     , zlib                >= 0.7 && < 0.8
     , zstd                >= 0.1 && < 0.2
+
+  -- lstat for the store metadata tests (NodeStatus): a node's group and
+  -- other bits, and a symlink's own time.
+  if !os(windows)
+    build-depends:
+        unix              >= 2.8 && < 2.9
 
 source-repository head
   type:     git
