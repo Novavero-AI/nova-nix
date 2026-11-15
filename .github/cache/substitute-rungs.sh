@@ -2,14 +2,14 @@
 # Realise a leg's rungs of the seed ladder with the public cache as a
 # substituter, and fail if a rung the cache holds was built all the same.
 #
-# A rung whose derivation a pull request leaves alone has the store path a
-# push to main published, so it is downloaded.  One the pull request changes
-# has a store path the cache lacks, so it builds.  A cache that answers and
-# cannot be used looks like the second case: nova-nix passes over a narinfo
-# no trusted key signs, or one whose archive is gone, and builds, as
-# upstream does.  The job would stay green while every run built the ladder
-# from the seed.  So each rung's narinfo is asked for here, and a rung the
-# cache holds has to arrive with no [build] line.
+# A rung whose derivation a change leaves alone has the store path an
+# earlier push to main published, so it is downloaded.  One the change
+# alters has a store path the cache lacks, so it builds.  A cache that
+# answers and cannot be used looks like the second case: nova-nix passes
+# over a narinfo no trusted key signs, or one whose archive is gone, and
+# builds, as upstream does.  The job would stay green while every run built
+# the ladder from the seed.  So each rung's narinfo is asked for here, and a
+# rung the cache holds has to arrive with no [build] line.
 #
 # The rungs the cache holds are realised first, ahead of any build.  Reached
 # first as the input of a rung that is building, one that could not be

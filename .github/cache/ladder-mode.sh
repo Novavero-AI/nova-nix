@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Decide how a pull request's Mes and Bootstrap legs come by the seed ladder,
-# from the files the pull request changes.
+# Decide how the Mes and Bootstrap legs of a pull request or a push to main
+# come by the seed ladder, from the files it changes.
 #
 # Prints one mode:
 #   skip         every changed file is documentation: the legs do not run
@@ -8,7 +8,7 @@
 #                legs build every rung from the seed and name no substituter
 #   substitute   anything else: the legs take each rung the public cache
 #                holds from it and build the ones it lacks, which are the
-#                ones the pull request changes
+#                ones the change alters
 #
 # A file under a builder path is seed whatever its name ends in, and one
 # such file decides the mode however many others there are.  No changed file
