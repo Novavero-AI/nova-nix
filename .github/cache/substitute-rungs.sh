@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Realise a leg's rungs of the seed ladder with the public cache as a
-# substituter, and fail if a rung the cache holds was built all the same.
+# Realise a stage's rungs of the seed ladder with a cache as a substituter,
+# and fail if a rung the cache holds was built all the same.
 #
-# A rung whose derivation a change leaves alone has the store path an
-# earlier push to main published, so it is downloaded.  One the change
-# alters has a store path the cache lacks, so it builds.  A cache that
-# answers and cannot be used looks like the second case: nova-nix passes
-# over a narinfo no trusted key signs, or one whose archive is gone, and
-# builds, as upstream does.  The job would stay green while every run built
-# the ladder from the seed.  So each rung's narinfo is asked for here, and a
-# rung the cache holds has to arrive with no [build] line.
+# The cache is the public one or a stage's handoff
+# (.github/cache/handoff-serve.sh).  From the public cache, a rung whose
+# derivation a change leaves alone has the store path an earlier push to
+# main published, so it is downloaded.  One the change alters has a store
+# path the cache lacks, so it builds.  A stage's handoff holds every rung
+# of that stage, so a rung it lacks fails.  A cache that answers and cannot
+# be used looks like a rung it lacks: nova-nix passes over a narinfo no
+# trusted key signs, or one whose archive is gone, and builds, as upstream
+# does.  The job would stay green while every run built the ladder from the
+# seed.  So each rung's narinfo is asked for here, and a rung the cache
+# holds has to arrive with no [build] line.
 #
 # The rungs the cache holds are realised first, ahead of any build.  Reached
 # first as the input of a rung that is building, one that could not be
@@ -20,11 +23,14 @@
 # after this one too, so what is checked is the configuration those steps
 # run under.  They find each rung valid and build none.
 #
-# pkgs/windows/rungs.nix lists each leg's rungs.
+# pkgs/windows/rungs.nix lists each stage's rungs.
 #
-# Usage: substitute-rungs.sh NOVA_NIX LEG [ARGUMENT ...]
+# Usage: substitute-rungs.sh NOVA_NIX STAGE LACKING [ARGUMENT ...]
 #   NOVA_NIX   the nova-nix executable
-#   LEG        the leg whose rungs to realise, an attribute of rungs.nix
+#   STAGE      the stage whose rungs to realise, an attribute of rungs.nix
+#   LACKING    what a rung the cache lacks is: build, one the change alters,
+#              built after the held ones; fail, a rung missing from a cache
+#              that holds the stage whole
 #   ARGUMENT   passed to each `nova-nix eval` and `nova-nix build`, as
 #              --store DIR is
 # Required environment:
@@ -36,12 +42,20 @@
 set -euo pipefail
 
 nova_nix=${1:?the nova-nix executable}
-leg=${2:?the leg whose rungs to realise}
-shift 2
+stage=${2:?the stage whose rungs to realise}
+lacking=${3:?what a rung the cache lacks is, build or fail}
+shift 3
 : "${CACHE_URL:?}" "${NIX_CONFIG:?}"
+case $lacking in
+  build | fail) ;;
+  *)
+    echo "::error::LACKING is build or fail, not $lacking" >&2
+    exit 1
+    ;;
+esac
 
 readonly PACKAGES='import ./pkgs/windows/default.nix'
-readonly RUNGS="(import ./pkgs/windows/rungs.nix).$leg"
+readonly RUNGS="(import ./pkgs/windows/rungs.nix).$stage"
 # The hash part of a store path: 32 characters of Nix's base-32 alphabet,
 # which has no e, o, t or u.
 readonly HASH_PATTERN='^[0-9a-df-np-sv-z]{32}$'
@@ -88,7 +102,7 @@ realise() {
 
 count=$(evaluate "builtins.length ($RUNGS)" "$@")
 # An empty list would pass having checked nothing.
-[ "$count" -gt 0 ] || fail "rungs.nix lists no rung for the $leg leg"
+[ "$count" -gt 0 ] || fail "rungs.nix lists no rung for the $stage stage"
 held=0
 # The rungs the cache lacks, each preceded by a space: an attribute path
 # has none.
@@ -100,7 +114,7 @@ for ((index = 0; index < count; index++)); do
   name=${out##*/}
   hash=${name%%-*}
   # A hash misread here would name a narinfo the cache lacks, and the rung
-  # would pass for one the pull request changes.
+  # would pass for one the change alters.
   [[ $hash =~ $HASH_PATTERN ]] || fail "$attr: no store path hash in $out"
 
   narinfo="$CACHE_URL/$hash.narinfo"
@@ -116,13 +130,14 @@ for ((index = 0; index < count; index++)); do
       held=$((held + 1))
       ;;
     404)
+      [ "$lacking" = build ] || fail "$attr: $narinfo is not there, and the cache holds the $stage stage whole"
       echo "== $attr: not held by the cache"
       lacked="$lacked $attr"
       ;;
     *) fail "$attr: $narinfo answered $status" ;;
   esac
 done
-echo "the cache held $held of the $leg leg's $count rungs"
+echo "the cache held $held of the $stage stage's $count rungs"
 
 for attr in $lacked; do
   realise "$attr" "$@"

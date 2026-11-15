@@ -1,4 +1,4 @@
-# pkgs/windows' gcc-core, as the Bootstrap (Windows) CI jobs build it:
+# pkgs/windows' gcc-core, as the GCC 4.6.4 (Windows) CI jobs build it:
 # version, a script that runs the driver with --version, as nixpkgs'
 # get-version test does; and answer, in which busybox's sh has the compiler
 # do three things.  It compiles text.c to assembly: constants cc1 has to

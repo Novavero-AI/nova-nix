@@ -1,4 +1,4 @@
-# pkgs/windows' gcc46-cxx, as the Bootstrap (Windows) CI jobs build it.
+# pkgs/windows' gcc46-cxx, as the GCC 4.6.4 C++ (Windows) CI jobs build it.
 # hello has the C++ driver compile hello.cc and link it, with no flag
 # naming a directory, into a program that runs, and busybox's sh writes
 # lines to its output, without the carriage returns msvcrt's text-mode

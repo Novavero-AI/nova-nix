@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Decide how the Mes and Bootstrap legs of a pull request or a push to main
-# come by the seed ladder, from the files it changes.
+# Decide how the ladder jobs of a pull request or a push to main come by
+# the seed ladder, from the files it changes.
 #
 # Prints one mode:
-#   skip         every changed file is documentation: the legs do not run
-#   seed         a changed file can change the nova-nix the legs run: the
-#                legs build every rung from the seed and name no substituter
-#   substitute   anything else: the legs take each rung the public cache
+#   skip         every changed file is documentation: the jobs do not run
+#   seed         a changed file can change the nova-nix the jobs run: the
+#                jobs build every rung from the seed and name no substituter
+#                but the handoff each stage leaves the next
+#   substitute   anything else: the jobs take each rung the public cache
 #                holds from it and build the ones it lacks, which are the
 #                ones the change alters
 #
@@ -28,9 +29,9 @@
 set -euo pipefail
 
 # What a change to a path can change:
-#   builder   the nova-nix the legs run: its sources, its C data layer, the
+#   builder   the nova-nix the jobs run: its sources, its C data layer, the
 #             files it ships, its package description and build plan
-#   docs      nothing a leg reads: the changelog fragments, the license and
+#   docs      nothing a job reads: the changelog fragments, the license and
 #             its notice, and the Markdown at the repository's root.
 #             Markdown anywhere else is not docs, since a derivation reads
 #             whatever is in a directory it takes as a source.

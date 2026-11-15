@@ -1,4 +1,4 @@
-# pkgs/windows' mingw-w64-crt and gcc46, as the Bootstrap (Windows) CI jobs
+# pkgs/windows' mingw-w64-crt and gcc46, as the GCC 4.6.4 (Windows) CI jobs
 # build them.  In each, busybox's sh runs a script that writes lines to its
 # output, without the carriage returns msvcrt's text-mode files end a line
 # with, which CI compares with a file of this directory written from the
