@@ -9,7 +9,7 @@
 -- reference's 'helpLines'.
 module Main (main) where
 
-import Control.Exception (AsyncException (UserInterrupt), IOException, bracket, displayException, handle, handleJust, try)
+import Control.Exception (AsyncException (UserInterrupt), bracket, displayException, handle, handleJust, try)
 import Control.Monad (mfilter, void, (>=>))
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
@@ -25,6 +25,8 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import Data.Word (Word32)
+import Foreign.C.Error (Errno (..), ePIPE)
+import GHC.IO.Exception (IOException (..))
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
@@ -177,8 +179,8 @@ main = do
     CmdStoreDelete paths -> storeDeleteCommand storeDir paths
     CmdStoreGc printRoots -> storeGcCommand storeDir printRoots
     CmdUsage -> mapM_ (TIO.hPutStrLn stderr) helpLines >> exitFailure
-    CmdHelp -> mapM_ TIO.putStrLn helpLines
-    CmdVersion -> putStrLn versionLine
+    CmdHelp -> toStdout (mapM_ TIO.putStrLn helpLines)
+    CmdVersion -> toStdout (putStrLn versionLine)
 
 -- | 'UserInterrupt' alone: every other asynchronous exception keeps
 -- propagating.
@@ -197,6 +199,30 @@ reportIOFailure :: IOException -> IO a
 reportIOFailure failure = do
   hPutStrLn stderr ("error: " <> ioFailureMessage failure)
   exitWith (ExitFailure 1)
+
+-- | Run a write to stdout, dropping what is left of it once stdout's
+-- reader has gone ('readerGone'), as a write through upstream's
+-- @std::cout@ is dropped: upstream's main thread blocks SIGPIPE
+-- (libutil/unix/signals.cc:136-144 at 2.24.9), so the write fails with
+-- EPIPE, which only sets the stream's error state, and the command goes on
+-- to its own exit status (nix-instantiate.cc:54-62).  A command that
+-- writes as it works, as @store delete@ does, still does all of its work.
+-- GHC's flush of stdout at exit meets the same failure when the write left
+-- bytes in the buffer, and passes it to the finalizer exception handler;
+-- this program sets none, and the default ignores it (@flushStdHandles@ in
+-- ghc-internal at 9.14.1).
+toStdout :: IO () -> IO ()
+toStdout = handleJust readerGone pure
+
+-- | A write to stdout that failed because no process holds the read end
+-- of the pipe it writes to: EPIPE on stdout, the one failure GHC's own
+-- top-level handler also ends quietly.  GHC on Windows reports a write to
+-- a pipe being closed as EPIPE too (@blockingWriteRawBufferPtr@ in
+-- ghc-internal at 9.14.1).
+readerGone :: IOException -> Maybe ()
+readerGone failure
+  | fmap Errno (ioe_errno failure) == Just ePIPE && ioe_handle failure == Just stdout = Just ()
+  | otherwise = Nothing
 
 -- | A 'userError' is its message alone, which 'show' would wrap in
 -- @user error (...)@; any other 'IOException' also names the operation
@@ -357,7 +383,7 @@ evalExprAterm config opts storeDir dataDir source = do
           -- The recorded bytes, not a re-serialization: these are what the
           -- path hashes.  BC.putStrLn bypasses the handle encoding, so the
           -- printed .drv diffs byte-exactly against upstream's.
-          BC.putStrLn aterm
+          toStdout (BC.putStrLn aterm)
 
 -- | Where a build reads its expression, and the directory relative paths
 -- inside it resolve against.
@@ -467,7 +493,7 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
       exitWith (ExitFailure code)
     (BuildSuccess _, Just (Left err)) -> failWith ("build: " <> err)
     (BuildSuccess _, _) ->
-      TIO.putStrLn (T.pack (storePathToFilePath (stDir store) outputPath))
+      toStdout (TIO.putStrLn (T.pack (storePathToFilePath (stDir store) outputPath)))
 
 -- | Evaluate the target, find the fixed-output derivations of its
 -- derivation's closure, fetch each one nova-nix's builtins fetch alone,
@@ -490,7 +516,7 @@ trustCommand config opts storeDir dataDir target attrPath = do
     inputs -> do
       upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("trust: " <>))
       bracket (openStore storeDir) closeStore (\store -> fetchAndScan config opts store inputs)
-  mapM_ TIO.putStrLn (renderTrustReport (trustReport facts graph drvSP))
+  toStdout (mapM_ TIO.putStrLn (renderTrustReport (trustReport facts graph drvSP)))
 
 -- | Realise each fixed-output input that nova-nix's builtins fetch with no
 -- input of their own, so that nothing from the closure runs, then scan
@@ -852,13 +878,12 @@ pushCommand storeDir pushArgs = do
       case result of
         Left err -> failWith ("push failed: " <> err)
         Right summary ->
-          TIO.putStrLn
-            ( "pushed "
-                <> T.pack (show (psPushed summary))
-                <> " path(s), "
-                <> T.pack (show (psSkipped summary))
-                <> " already cached"
-            )
+          toStdout . TIO.putStrLn $
+            "pushed "
+              <> T.pack (show (psPushed summary))
+              <> " path(s), "
+              <> T.pack (show (psSkipped summary))
+              <> " already cached"
 
 -- | Delete store paths: registration rows and on-disk trees.  Every
 -- argument is resolved before anything is touched; one
@@ -876,7 +901,7 @@ storeDeleteCommand storeDir rawPaths = do
   either (failWith . prefixed) pure result
   where
     prefixed err = "store delete: " <> err
-    reportDeleted name removed = TIO.putStrLn ("deleted " <> storeEntryNameText name <> describeOutcome removed)
+    reportDeleted name removed = toStdout (TIO.putStrLn ("deleted " <> storeEntryNameText name <> describeOutcome removed))
     describeOutcome removed
       | doRowRemoved removed && doTreeRemoved removed = ""
       | doRowRemoved removed = " (no tree on disk)"
@@ -895,11 +920,11 @@ storeGcCommand storeDir printRoots = do
     then do
       roots <- findRoots store
       closeStore store
-      mapM_ (\root -> TIO.putStrLn (T.pack (grLink root) <> " -> " <> grPath root)) roots
+      toStdout (mapM_ (\root -> TIO.putStrLn (T.pack (grLink root) <> " -> " <> grPath root)) roots)
     else do
       results <- collectGarbage store
       closeStore store
-      either (failWith . ("store gc: " <>)) (TIO.putStrLn . gcSummaryLine) results
+      either (failWith . ("store gc: " <>)) (toStdout . TIO.putStrLn . gcSummaryLine) results
 
 -- | Resolve push roots: every valid non-derivation path with @--all@, otherwise
 -- each named path.  Named paths may be full store paths in either store-dir
@@ -982,6 +1007,6 @@ deepForceValue val = pure val
 -- it: the handle is put in binary mode, as hPutBuilder asks, and no
 -- encoding or newline translation applies.
 printResult :: NixValue -> IO ()
-printResult val = do
+printResult val = toStdout $ do
   hSetBinaryMode stdout True
   BB.hPutBuilder stdout (printAmbiguous val <> BB.char7 '\n')

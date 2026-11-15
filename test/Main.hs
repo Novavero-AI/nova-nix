@@ -121,7 +121,7 @@ import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv
 import qualified System.Environment.Blank as Blank
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
-import System.IO (BufferMode (..), IOMode (..), hPutStrLn, hSetBuffering, stderr, stdout, withBinaryFile)
+import System.IO (BufferMode (..), IOMode (..), hClose, hPutStrLn, hSetBuffering, stderr, stdout, withBinaryFile)
 import System.IO.Error (ioeGetErrorString, isAlreadyExistsError, mkIOError, resourceVanishedErrorType)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info as SI
@@ -18086,6 +18086,55 @@ testUncaughtIOFailureCLI = do
           ]
     )
 
+-- | Runs whose stdout is a pipe nothing reads, as after @| head -1@ has
+-- read its line.  Upstream's writes through @std::cout@ then fail with
+-- the stream's error state alone, SIGPIPE being blocked
+-- (libutil/unix/signals.cc:136-144 at 2.24.9), so nothing is reported and
+-- the command ends with its own status (nix-instantiate.cc:54-62): an eval
+-- or @--help@ exits 0, and @store delete@, which prints each path as it
+-- deletes it, deletes every path it names.  The read end is closed before
+-- the process starts, so its first write meets it.
+testClosedStdoutCLI :: IO [Bool]
+testClosedStdoutCLI = do
+  putStrLn "cli/closed-stdout"
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-closed-stdout"
+      store = root </> "store"
+      doomed = [T.unpack (T.replicate 32 letter) <> "-doomed" | letter <- ["a", "b"]]
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+      runClosed args =
+        bracket Proc.createPipe (\(readEnd, writeEnd) -> hClose readEnd >> hClose writeEnd) $ \(readEnd, writeEnd) -> do
+          hClose readEnd
+          Proc.withCreateProcess
+            ( (Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args))
+                { Proc.env = Just isolatedEnv,
+                  Proc.std_out = Proc.UseHandle writeEnd,
+                  Proc.std_err = Proc.CreatePipe
+                }
+            )
+            $ \_ _ errPipe process -> do
+              err <- maybe (pure BS.empty) BS.hGetContents errPipe
+              code <- Proc.waitForProcess process
+              pure (code, filter (not . BS.null) (BS8.lines (BS8.filter (/= '\r') err)))
+      quiet label args =
+        runTestM ("CLI " <> label <> " into a closed pipe exits 0 and reports nothing") $
+          assertEqual "status and stderr" (ExitSuccess, []) <$> runClosed args
+  bracket_
+    (forceRemoveIfExists root >> createDirectoryIfMissing True store >> mapM_ (\name -> BS.writeFile (store </> name) "doomed\n") doomed)
+    (forceRemoveIfExists root)
+    $ sequence
+      [ quiet "--help" ["--help"],
+        quiet "eval" ["eval", "--expr", "1 + 2"],
+        runTestM "CLI store delete into a closed pipe deletes every path it names and exits 0" $ do
+          (code, err) <- runClosed (["store", "delete", "--store", store] ++ doomed)
+          left <- filterM (Dir.doesPathExist . (store </>)) doomed
+          pure (assertEqual "status, stderr and what is left" (ExitSuccess, ["finding garbage collector roots..."], []) (code, err, left))
+      ]
+
 -- | @build --check@ through the real CLI, which the tests of the build
 -- itself cannot show: that the flag reaches the build, that a check which
 -- passes prints the path a build prints, and that one which finds a
@@ -18962,6 +19011,11 @@ testCliReference = do
         Proc.readCreateProcessWithExitCode
           ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
           ""
+      printsHelp label args = runTestM label $ do
+        (code, out, err) <- runCLI args
+        pure $ case code of
+          ExitSuccess -> assertEqual "stdout" Ref.helpLines (map (T.filter (/= '\r')) (T.lines (T.pack out)))
+          _ -> Fail ("exited " <> T.pack (show code) <> ": " <> T.pack err)
       shown =
         [ example
         | entry <- Ref.globalForm : map Ref.command Ref.commandNames,
@@ -18993,6 +19047,16 @@ testCliReference = do
                 other -> Fail (spelling <> ": " <> T.pack (show (Cli.optCommand <$> other)))
             | flagName <- Ref.globalFlags,
               spelling <- toList (Ref.flagSpellings (Ref.flag flagName))
+            ],
+        runTest "a global flag is answered after each command's words and after its operands" $
+          allPass
+            [ case Cli.optCommand <$> Cli.parseArgs args of
+                Right answer | Just answer == globalAnswer flagName -> Pass
+                other -> Fail (T.pack (unwords args <> ": " <> show other))
+            | flagName <- Ref.globalFlags,
+              spelling <- toList (Ref.flagSpellings (Ref.flag flagName)),
+              prefix <- nub (concatMap cliPrefixes Ref.commandNames ++ [cliWords name ++ cliOperands name flagName | name <- Ref.commandNames]),
+              let args = prefix ++ [T.unpack spelling]
             ],
         -- A flag with a value is asked for one when it ends the line; one
         -- without parses when it ends a complete line, where a clause that
@@ -19082,14 +19146,21 @@ testCliReference = do
     bracket_
       (forceRemoveIfExists root >> createDirectoryIfMissing True root)
       (forceRemoveIfExists root)
-      ( mapM
-          ( \example -> runTestM ("example prints what it shows: " <> Ref.exampleCommandLine example) $ do
-              (code, out, err) <- runCLI (map T.unpack (toList (Ref.exampleArguments example)))
-              pure $ case code of
-                ExitSuccess -> assertEqual "stdout" (Ref.exampleOutput example) (map (T.filter (/= '\r')) (T.lines (T.pack out)))
-                _ -> Fail ("exited " <> T.pack (show code) <> ": " <> T.pack err)
-          )
-          shown
+      ( do
+          examples <-
+            mapM
+              ( \example -> runTestM ("example prints what it shows: " <> Ref.exampleCommandLine example) $ do
+                  (code, out, err) <- runCLI (map T.unpack (toList (Ref.exampleArguments example)))
+                  pure $ case code of
+                    ExitSuccess -> assertEqual "stdout" (Ref.exampleOutput example) (map (T.filter (/= '\r')) (T.lines (T.pack out)))
+                    _ -> Fail ("exited " <> T.pack (show code) <> ": " <> T.pack err)
+              )
+              shown
+          helps <-
+            mapM
+              (\prefix -> printsHelp ("nova-nix " <> T.pack (unwords prefix) <> " --help prints the help and exits 0") (prefix ++ ["--help"]))
+              (nub (concatMap cliPrefixes Ref.commandNames))
+          pure (examples ++ helps)
       )
   pure (checks ++ ran)
   where
@@ -19106,6 +19177,18 @@ testCliReference = do
 -- | The arguments that select a command.
 cliWords :: Ref.CommandName -> [String]
 cliWords = map T.unpack . Ref.commandWords
+
+-- | The words that start a command: its first word, as @store@, through
+-- all of them.
+cliPrefixes :: Ref.CommandName -> [[String]]
+cliPrefixes = drop 1 . inits . cliWords
+
+-- | The command a global flag selects.
+globalAnswer :: Ref.FlagName -> Maybe Cli.Command
+globalAnswer flagName = case flagName of
+  Ref.HelpFlag -> Just Cli.CmdHelp
+  Ref.VersionFlag -> Just Cli.CmdVersion
+  _ -> Nothing
 
 -- | A value for a flag that takes one, which the parser accepts unchecked.
 cliValue :: Ref.FlagEntry -> [String]
@@ -22575,6 +22658,7 @@ runSuite = do
           testCheckCLI,
           testBuildCoresCLI,
           testUncaughtIOFailureCLI,
+          testClosedStdoutCLI,
           testCliReference,
           testTrustCLI,
           testPhase4,
