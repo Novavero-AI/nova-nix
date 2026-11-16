@@ -945,19 +945,24 @@ buildBcSlotThunks recEnv outerEnv bindings = concat <$> mapM slotThunk bindings
     slotThunk (BcInherit _ _ valBcIdx) =
       pure <$> cheapThunkBc outerEnv valBcIdx
     slotThunk (BcInheritFrom fromBcIdx names) = do
-      -- inherit (from) x y z; becomes one thunk per name that selects from the from-expr.
-      -- Each thunk gets a minimal env with the from-value at slot 0.
-      fromThunk <- mkThunkBc recEnv fromBcIdx
-      mapM (inheritedSelect fromThunk) names
+      -- inherit (from) x y z; becomes one thunk per name that selects
+      -- from the from-expr, each in the clause's env ('inheritFromEnv').
+      fromEnv <- mkThunkBc recEnv fromBcIdx >>= inheritFromEnv
+      mapM (inheritedSelect fromEnv) names
     -- Unreachable: allBcPositional guards this path.
     slotThunk _ = pure []
 
--- | The thunk that selects an @inherit (from)@ name: its select runs in a
--- minimal env holding the from-value's thunk at slot 0.
-inheritedSelect :: (MonadCData m) => Thunk -> BcInheritedName -> m Thunk
-inheritedSelect fromThunk (BcInheritedName _ _ selectBcIdx) = do
-  fromEnv <- newEnv EnvInheritFrom Nothing [fromThunk]
-  mkThunkBc fromEnv selectBcIdx
+-- | The env an @inherit (from)@ clause's selects run in: the from-value's
+-- thunk at slot 0, one env for every name of the clause, as upstream's
+-- @ExprAttrs::buildInheritFromEnv@ makes one env for a binding set's
+-- from-values (eval.cc:1179-1189 at 2.24.9).
+inheritFromEnv :: (MonadCData m) => Thunk -> m Env
+inheritFromEnv fromThunk = newEnv EnvInheritFrom Nothing [fromThunk]
+
+-- | The thunk that selects an @inherit (from)@ name: its select runs in
+-- the clause's env ('inheritFromEnv').
+inheritedSelect :: (MonadCData m) => Env -> BcInheritedName -> m Thunk
+inheritedSelect fromEnv (BcInheritedName _ _ selectBcIdx) = mkThunkBc fromEnv selectBcIdx
 
 -- | Build the attribute map from slots for positional bytecode bindings,
 -- each at its binding's position.
@@ -1000,10 +1005,10 @@ buildBcEntryMap mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
       -- of the from-expr serves every name, as upstream's
       -- ExprAttrs::buildInheritFromEnv makes one (eval.cc at 2.24.9), so
       -- the from-expr is evaluated once however many names it gives.
-      -- Each name's select runs against a small env holding it at slot 0.
-      fromThunk <- mkThunkBc thunkEnv fromBcIdx
+      -- Each name's select runs in the clause's env ('inheritFromEnv').
+      fromEnv <- mkThunkBc thunkEnv fromBcIdx >>= inheritFromEnv
       let addInheritFrom a inherited@(BcInheritedName pos _ _) =
-            inheritedSelect fromThunk inherited >>= insertChecked a (inheritedNameText inherited) . AttrEntry pos
+            inheritedSelect fromEnv inherited >>= insertChecked a (inheritedNameText inherited) . AttrEntry pos
       foldM addInheritFrom acc names
 
     -- The parser normalizes static keys to appear exactly once, so a

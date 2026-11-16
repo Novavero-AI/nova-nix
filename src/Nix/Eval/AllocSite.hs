@@ -43,7 +43,8 @@ data EnvSite
     EnvRec
   | -- | The variables a @rec@ set uses from outside it.
     EnvRecCapture
-  | -- | One name of an @inherit (from)@: the from-expression.
+  | -- | An @inherit (from)@ clause: the from-expression, which each name
+    -- the clause inherits selects from.
     EnvInheritFrom
   | -- | A @with@.
     EnvWith
