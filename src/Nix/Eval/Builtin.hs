@@ -50,11 +50,9 @@ data Builtin
   | Div
   | Elem
   | ElemAt
-  | FetchClosure
   | FetchGit
   | FetchMercurial
   | FetchTarball
-  | FetchTree
   | Fetchurl
   | Filter
   | FilterSource
@@ -93,7 +91,6 @@ data Builtin
   | MapAttrs
   | Match
   | Mul
-  | OutputOf
   | ParseDrvName
   | Partition
   | Path
@@ -161,11 +158,9 @@ builtinName builtin = case builtin of
   Div -> "div"
   Elem -> "elem"
   ElemAt -> "elemAt"
-  FetchClosure -> "fetchClosure"
   FetchGit -> "fetchGit"
   FetchMercurial -> "fetchMercurial"
   FetchTarball -> "fetchTarball"
-  FetchTree -> "fetchTree"
   Fetchurl -> "fetchurl"
   Filter -> "filter"
   FilterSource -> "filterSource"
@@ -204,7 +199,6 @@ builtinName builtin = case builtin of
   MapAttrs -> "mapAttrs"
   Match -> "match"
   Mul -> "mul"
-  OutputOf -> "outputOf"
   ParseDrvName -> "parseDrvName"
   Partition -> "partition"
   Path -> "path"
