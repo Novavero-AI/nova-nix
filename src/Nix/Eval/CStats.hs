@@ -395,8 +395,8 @@ data CRoot
 
 -- | The C objects a value holds.  A value read from a cell is a view of
 -- the cell's C objects; one held in GHC's heap behind a StablePtr (a
--- builtin and the arguments it has taken, a compiled regex) holds them
--- through its arguments.
+-- builtin and the arguments it has taken) holds them through its
+-- arguments.
 valueRoots :: NixValue -> [CRoot]
 valueRoots value = case value of
   VInt _ -> []
@@ -409,7 +409,6 @@ valueRoots value = case value of
   VAttrs set -> [RootAttrSet set]
   VLambda env _ _ -> [RootEnv env]
   VBuiltin _ args -> concatMap argumentRoots args
-  VCompiledRegex _ -> []
   where
     argumentRoots (ArgForced forced) = valueRoots forced
     argumentRoots (ArgDeferred thunk) = [RootThunk thunk]
