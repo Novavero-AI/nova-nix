@@ -24717,10 +24717,8 @@ upstreamStartupTable =
 
 -- | The names upstream's evaluator interns as it starts take the first
 -- symbols, in its order, ahead of any name a program brings, and they
--- hold every name the root environment and @builtins@ hold, but three
--- that upstream's @builtins@ holds only with an experimental feature on.
--- The
--- errors that walk a set in symbol order show the order end to end, in a
+-- hold every name the root environment and @builtins@ hold.  The errors
+-- that walk a set in symbol order show the order end to end, in a
 -- child each, whose table holds the startup names and the source's alone.
 -- Under upstream each pair of names is in another order than the source
 -- gives them, and but for @x@ and the empty name in another order than
@@ -24741,13 +24739,16 @@ testStartupSymbolsIO = do
           "missing"
           []
           (unknownTo (concatMap (\name -> name : maybeToList (T.stripPrefix "__" name)) (Set.toList upstreamBaseEnvNames))),
-      -- builtins also holds three primops upstream registers only with an
-      -- experimental feature on, whose names its startup leaves out.
-      runTest "builtins holds no name the startup names lack but those gated on an experimental feature" $
+      runTest "builtins holds no name the startup names lack" $
         assertEval
           "builtins"
           ("builtins.toJSON (builtins.filter (name: !(builtins.elem name [ " <> T.unwords (map (\name -> "\"" <> name <> "\"") startupSymbols) <> " ])) (builtins.attrNames builtins))")
-          (mkStr "[\"fetchClosure\",\"fetchTree\",\"outputOf\"]"),
+          (mkStr "[]"),
+      -- Upstream registers fetchTree, fetchClosure and outputOf only with
+      -- an experimental feature on, and nova-nix has no experimental
+      -- feature to turn on.
+      runTest "builtins holds no primop upstream registers only behind an experimental feature" $
+        assertEval "gated" "builtins.toJSON (builtins.filter (name: builtins.hasAttr name builtins) [ \"fetchTree\" \"fetchClosure\" \"outputOf\" ])" (mkStr "[]"),
       failsInChild "a name upstream's derivation wrapper brings precedes a program's" "({ }: null) { zzz = 1; x = 2; }" (unexpected "x"),
       failsInChild "a static symbol precedes a primop's name" "({ }: null) { map = 1; outPath = 2; }" (unexpected "outPath"),
       failsInChild "an expression symbol precedes a constant's name" "({ }: null) { null = 1; or = 2; }" (unexpected "or"),

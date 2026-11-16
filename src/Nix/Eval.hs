@@ -1440,10 +1440,6 @@ builtinDef builtin = shape builtin
       -- Source filtering + path import
       Builtin.Path -> forced1 builtinPath
       Builtin.FilterSource -> onUseFirst builtinFilterSource
-      -- Experimental feature stubs
-      Builtin.OutputOf -> forced2 builtinOutputOf
-      Builtin.FetchTree -> forced1 builtinFetchTree
-      Builtin.FetchClosure -> forced1 builtinFetchClosure
       Builtin.FetchMercurial -> forced1 (const (throwEvalError ("unknown builtin '" <> builtinName builtin <> "'")))
 
 -- | The builtins @builtins@ lists: every one but @fetchMercurial@, which
@@ -5935,19 +5931,3 @@ filterSourceInto filterFn path = do
   narBytes <- filteredSourceNar filterFn path
   storePathText <- addSourceNar (canonBaseName path) narBytes
   pure (sourceResultString storePathText)
-
--- ---------------------------------------------------------------------------
--- Builtin stubs - experimental features
--- ---------------------------------------------------------------------------
-
-builtinOutputOf :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinOutputOf _ _ =
-  throwEvalError "builtins.outputOf: requires experimental feature 'dynamic-derivations'"
-
-builtinFetchTree :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchTree _ =
-  throwEvalError "builtins.fetchTree: requires experimental feature 'fetch-tree'"
-
-builtinFetchClosure :: (MonadEval m) => NixValue -> m NixValue
-builtinFetchClosure _ =
-  throwEvalError "builtins.fetchClosure: requires experimental feature 'fetch-closure'"
