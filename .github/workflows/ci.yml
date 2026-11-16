@@ -364,6 +364,15 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo xcode-select -s /Library/Developer/CommandLineTools
 
+      # The GHC installation from the cache, made on this image and saved
+      # by caches.yml (.github/actions/macos-ghc).  Linux and Windows images
+      # carry the version already.
+      - name: Restore the GHC installation (macOS)
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/macos-ghc
+        with:
+          ghc-version: "9.14.1"
+
       - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
         id: setup
         with:

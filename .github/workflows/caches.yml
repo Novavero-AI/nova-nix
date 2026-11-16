@@ -1,13 +1,14 @@
 name: Caches
 
 # The Actions caches CI and Parity restore, saved from main alone: each
-# OS's Cabal store, the sdist build's store, the formatter binary and the
-# nixpkgs trees Parity reads.  A cache saved by a pull request's run or a
-# merge group's run is scoped to that ref, so no other run restores it, and
-# it counts against the repository's 10 GB, where GitHub evicts the entries
-# accessed longest ago to make room, main's among them.  This workflow is
-# what saves these caches, each where main lacks it, and CI's and Parity's
-# jobs restore them, so that a run on any ref finds main's.
+# OS's Cabal store, the sdist build's store, the macOS GHC installation, the
+# formatter binary and the nixpkgs trees Parity reads.  A cache saved by a
+# pull request's run or a merge group's run is scoped to that ref, so no
+# other run restores it, and it counts against the repository's 10 GB,
+# where GitHub evicts the entries accessed longest ago to make room, main's
+# among them.  This workflow is what saves these caches, each where main
+# lacks it, and CI's and Parity's jobs restore them, so that a run on any
+# ref finds main's.
 #
 # Two workflows keep caches apart from these.  Scoreboard restores the
 # nixpkgs trees under the keys this workflow saves them with, and saves
@@ -16,15 +17,18 @@ name: Caches
 # Hackage, dispatched from main, keeps a Cabal store of its own.
 #
 # A cache is keyed by what decides its contents: a Cabal store by the build
-# plan (.github/actions/cabal-store), the formatter by its version, a
-# nixpkgs tree by its revision.  A job here asks for its key without
-# downloading, and on a miss restores the nearest cache, adds what the key
-# needs and saves it.  It runs on a push to main that changes what a key
-# reads, this workflow included, where the GHC and ormolu versions are
+# plan (.github/actions/cabal-store), the GHC installation by the runner
+# image and its version (.github/actions/macos-ghc), the formatter by its
+# version, a nixpkgs tree by its revision.  A job here asks for its key
+# without downloading, and on a miss restores the nearest cache, adds what
+# the key needs and saves it; the GHC installation, which setup here uses,
+# is restored whole.  It runs on a push to main that changes what
+# a key reads, this workflow included, where the GHC and ormolu versions are
 # spelled (test/Main.hs holds them to the other workflows'), as is the
 # haskell-actions/setup pin, whose bundled version list decides the cabal
 # "latest" resolves to; daily, for the Hackage index the sdist build
-# resolves against and for a cache GitHub evicted; and when dispatched.
+# resolves against, for a new macOS image and for a cache GitHub evicted;
+# and when dispatched.
 on:
   push:
     branches: [main]
@@ -32,6 +36,7 @@ on:
       - nova-nix.cabal
       - cabal.project
       - .github/actions/cabal-store/action.yml
+      - .github/actions/macos-ghc/action.yml
       - .github/workflows/caches.yml
       - .github/workflows/parity.yml
   schedule:
@@ -57,7 +62,8 @@ jobs:
   # its tests and its benchmark build with, and on Linux and Windows those
   # nova-cache-server builds with too: E2E (substitute loop) installs the
   # server on Linux and Ladder (handoff server) on Windows, each in this
-  # project, so cabal resolves it under cabal.project's index-state.
+  # project, so cabal resolves it under cabal.project's index-state.  On
+  # macOS, the GHC installation Build (macos-latest) restores as well.
   cabal-store:
     name: Cabal store (${{ matrix.os }})
     if: github.ref == 'refs/heads/main'
@@ -83,11 +89,37 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo xcode-select -s /Library/Developer/CommandLineTools
 
+      # As Build (macos-latest) restores it, so that setup installs GHC here
+      # only where main lacks this image's installation.
+      - name: Restore the GHC installation (macOS)
+        id: ghc
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/macos-ghc
+        with:
+          ghc-version: "9.14.1"
+
       - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
         id: setup
         with:
           ghc-version: "9.14.1"
           cabal-version: "latest"
+
+      # The installation setup made, saved once it links a program, so
+      # that one which does not is never saved.
+      - name: Check the installed GHC (macOS)
+        if: runner.os == 'macOS' && steps.ghc.outputs.key != '' && steps.ghc.outputs.restored != 'true'
+        shell: bash
+        env:
+          INSTALLATION: ${{ steps.ghc.outputs.path }}
+          GHC_VERSION: ${{ steps.setup.outputs.ghc-version }}
+        run: bash .github/cache/ghc-links.sh "$INSTALLATION/bin/ghc-$GHC_VERSION"
+
+      - name: Save the GHC installation (macOS)
+        if: runner.os == 'macOS' && steps.ghc.outputs.key != '' && steps.ghc.outputs.restored != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.ghc.outputs.path }}
+          key: ${{ steps.ghc.outputs.key }}
 
       - name: Plan the build
         run: cabal build --enable-tests --dry-run
