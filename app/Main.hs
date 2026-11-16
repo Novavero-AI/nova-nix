@@ -49,8 +49,9 @@ import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, newEvalStateWith, nix
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes)
+import Nix.Http (defaultFetchRetryPolicy)
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
-import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
+import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), defaultPartSize, isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Realise (BuildMode (..), ClosureOutcome (..), Fallback (..), SubstitutesSetting (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
@@ -961,7 +962,15 @@ pushCommand storeDir pushArgs = do
       closeStore store
       failWith err
     Right roots -> do
-      result <- pushPaths (PushConfig cacheUrl apiKey compression) store roots
+      let config =
+            PushConfig
+              { pcCacheUrl = cacheUrl,
+                pcApiKey = apiKey,
+                pcCompression = compression,
+                pcPartSize = defaultPartSize,
+                pcRetry = defaultFetchRetryPolicy
+              }
+      result <- pushPaths config store roots
       closeStore store
       case result of
         Left err -> failWith ("push failed: " <> err)
