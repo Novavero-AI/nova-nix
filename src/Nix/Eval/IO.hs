@@ -87,7 +87,7 @@ import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLe
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, uriAccess)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetSize, bytesToTextLossy, evaluated, marshalLambda, pathCell, pendingCode, primopCell, readComputed, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetSize, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -925,7 +925,7 @@ instance MonadEval EvalIO where
         -- the error propagates through tryEval/catchEvalError.
         abortEvaluation "infinite recursion encountered"
       ThunkPending -> do
-        (env, bcIdx) <- pendingCode ptr
+        pending <- readPending ptr
         -- Mark blackhole BEFORE evaluation - any re-entry hits the
         -- BLACKHOLE branch above.
         marked <- cthunkMarkBlackhole ptr
@@ -946,7 +946,7 @@ instance MonadEval EvalIO where
           st <- ask
           liftIO
             ( ( do
-                  result <- runReaderT (unEvalIO (evalFn env bcIdx)) st
+                  result <- runReaderT (unEvalIO (evalFn pending)) st
                   storeComputed ptr result
                   pure result
               )

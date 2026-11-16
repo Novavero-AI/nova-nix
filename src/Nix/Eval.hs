@@ -132,7 +132,7 @@ import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAtt
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.Builtin (Builtin, builtinName)
 import qualified Nix.Eval.Builtin as Builtin
-import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, cbcStringText, reservedApply1, reservedApply2, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, cbcStringText, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CStr (cstrText)
@@ -159,6 +159,7 @@ import Nix.Eval.Types
     MonadEval (..),
     NixValue (..),
     PathExistence (..),
+    Pending (..),
     PureEval,
     StringContext (..),
     StringContextElement (..),
@@ -197,6 +198,8 @@ import Nix.Eval.Types
     fillCAttrSetValues,
     firstInSymbolOrder,
     heldString,
+    mkApply2Thunk,
+    mkApplyThunk,
     mkStr,
     mkStrBytes,
     mkThunkBc,
@@ -261,7 +264,19 @@ evalParsed makeEnv parsed = do
 -- allows IO evaluators to implement memoization (caching the result
 -- after the first force) while pure evaluators simply re-evaluate.
 force :: (MonadEval m) => Thunk -> m NixValue
-force = forceThunk evalBytecode
+force = forceThunk runPending
+
+-- | Do what a pending thunk holds: run its code, or make its deferred
+-- application.  An application opens its call frame and forces its
+-- function inside it, as upstream's @forceValue@ on an app value is a
+-- @callFunction@ that forces the function after the depth check.  One
+-- of two arguments applies the function to the first in a second frame,
+-- as the inner of upstream's two nested app values does.
+runPending :: (MonadEval m) => Pending -> m NixValue
+runPending (PendingCode env bcIdx) = evalBytecode env bcIdx
+runPending (PendingApply fn arg) = withCallFrame (force fn >>= callCell arg)
+runPending (PendingApply2 fn first second) =
+  withCallFrame (withCallFrame (force fn >>= callCell first) >>= callCell second)
 
 -- | Strict UTF-8 decode at a Text-typed boundary (attr names, filesystem
 -- paths, algorithm names, ...).  A Nix string is a byte string; where the
@@ -613,34 +628,42 @@ evalBcList env bcIdx0 = do
 -- | Evaluate a function application from bytecode.  A source application
 -- ('EApp') evaluates the function position outside the call frame and
 -- everything after it inside, as upstream's @ExprCall::eval@ evaluates
--- @fun@ before @callFunction@ opens the frame.  A builtin's deferred
--- application, one of the reserved instructions in @cbits\/nn_bytecode.c@,
--- opens the frame first and forces the function inside it, as upstream's
--- @forceValue@ on an app value is a @callFunction@ that forces the
--- function after the depth check.
+-- @fun@ before @callFunction@ opens the frame.
 evalBcApp :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcApp env bcIdx0 = do
-  flags_ <- cbcFlags bcIdx0
   funcIdx <- cbcArg1 bcIdx0
   argIdx <- cbcArg2 bcIdx0
-  if flags_ == appDeferred
-    then withCallFrame (evalBytecode env funcIdx >>= callBc env argIdx)
-    else evalBytecode env funcIdx >>= withCallFrame . callBc env argIdx
+  evalBytecode env funcIdx >>= withCallFrame . callBc env argIdx
 
 -- | Apply an evaluated function to the argument at a bytecode index,
--- inside the caller's frame.  The argument stays a thunk for a lambda
--- (the normal laziness).  A builtin takes it evaluated, without a thunk,
--- or as a thunk, by its mode for the position.
+-- inside the caller's frame ('callWith').
 callBc :: (MonadEval m) => Env -> Word32 -> NixValue -> m NixValue
-callBc env argIdx funcVal = case funcVal of
+callBc env argIdx = callWith (cheapThunkBc env argIdx) (evalBytecode env argIdx) (callBc env argIdx)
+
+-- | Apply an evaluated function to the argument in a cell, inside the
+-- caller's frame ('callWith'): a deferred application's.
+callCell :: (MonadEval m) => Thunk -> NixValue -> m NixValue
+callCell cell = callWith (pure cell) (force cell) (callCell cell)
+
+-- | Apply an evaluated function to an argument inside the caller's frame,
+-- the argument given as its cell, as its value, and as the application of
+-- another function to it, a functor's second call; each is taken only
+-- where the function takes it so.  The argument stays a cell for a lambda
+-- (the normal laziness).  A builtin takes it evaluated, without a cell,
+-- or as a cell, by its mode for the position.  Not recursive, and given
+-- its three arguments by 'callBc' and 'callCell', so that it inlines into
+-- both and their actions are never built as closures.
+{-# INLINE callWith #-}
+callWith :: (MonadEval m) => m Thunk -> m NixValue -> (NixValue -> m NixValue) -> NixValue -> m NixValue
+callWith takeCell takeValue callAgain = \case
   VLambda closureEnv formals bodyBcIdx -> do
-    argThunk <- cheapThunkBc env argIdx
+    argThunk <- takeCell
     extEnv <- matchFormals closureEnv formals argThunk
     evalBytecode extEnv bodyBcIdx
   VBuiltin builtin taken -> applyBuiltin builtin taken $ \case
-    ForceOnApply -> ArgForced <$> evalBytecode env argIdx
-    ForceOnUse -> ArgDeferred <$> cheapThunkBc env argIdx
-  VAttrs attrs ->
+    ForceOnApply -> ArgForced <$> takeValue
+    ForceOnUse -> ArgDeferred <$> takeCell
+  funcVal@(VAttrs attrs) ->
     attrSetLookup "__functor" attrs >>= \case
       Just functorThunk -> do
         functor <- force functorThunk
@@ -649,11 +672,11 @@ callBc env argIdx funcVal = case funcVal of
         -- one: 'applyValue' opens that frame for the self application,
         -- and the recursion opens it again for the argument.
         partiallyApplied <- applyValue functor funcVal
-        withCallFrame (callBc env argIdx partiallyApplied)
-      Nothing -> notAFunction
-  _ -> notAFunction
+        withCallFrame (callAgain partiallyApplied)
+      Nothing -> notAFunction funcVal
+  funcVal -> notAFunction funcVal
   where
-    notAFunction = throwEvalError ("attempt to call " <> typeName funcVal <> ", which is not a function")
+    notAFunction value = throwEvalError ("attempt to call " <> typeName value <> ", which is not a function")
 
 -- | @builtins.tryEval e@: @{ success, value }@ with catchable errors
 -- (throw, failed assert - the only kinds 'catchEvalError' recovers)
@@ -1843,7 +1866,7 @@ builtinMap funcArg (VList cl) = do
     else do
       _ <- forceFunctionArg funcArg
       fnThunk <- argAsThunk funcArg
-      listThunks cl >>= mapM (deferApplyThunk EnvMap fnThunk) >>= thunksList
+      listThunks cl >>= mapM (mkApplyThunk fnThunk) >>= thunksList
 builtinMap _ other =
   throwEvalError ("builtins.map: expected a list, got " <> typeName other)
 
@@ -1878,10 +1901,9 @@ builtinGenList funcArg (VInt n)
       _ <- forceFunctionArg funcArg
       -- Lazy: each element is a deferred @f i@, forced only on demand.
       -- The index is an argument value, as upstream's @prim_genList@
-      -- allocates an int and an app per element, so every element runs
-      -- the same code.
+      -- allocates an int and an app per element.
       fnThunk <- argAsThunk funcArg
-      mapM (evaluated . VInt >=> deferApplyThunk EnvGenList fnThunk) [0 .. n - 1] >>= thunksList
+      mapM (evaluated . VInt >=> mkApplyThunk fnThunk) [0 .. n - 1] >>= thunksList
 builtinGenList _ other =
   throwEvalError ("builtins.genList: expected an integer, got " <> typeName other)
 
@@ -1935,13 +1957,16 @@ mergeSorted isLess (x : xs) (y : ys) = do
     VBool False -> (x :) <$> mergeSorted isLess xs (y : ys)
     _ -> throwEvalError "builtins.sort: comparator must return a bool"
 
+-- | Call the function on each element in turn, each in a call frame of
+-- its own, as @prim_concatMap@ does (primops.cc at 2.24.9), and join the
+-- lists the calls return, whose elements stay as they are.  Upstream
+-- forces the function before any call and checks each result is a list
+-- as its call returns; this checks the results once every call has
+-- returned.
 builtinConcatMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinConcatMap func (VList cl) = do
-  -- Semi-eager: must force each application to discover list structure for
-  -- concatenation, but element thunks within those sub-lists stay lazy.
-  fnThunk <- evaluated func
   thunks <- listThunks cl
-  results <- mapM (deferApplyThunk EnvConcatMap fnThunk >=> force) thunks
+  results <- mapM (\element -> withCallFrame (callCell element func)) thunks
   concatted <- mapM extractList results
   thunksList (concat concatted)
 builtinConcatMap _ other =
@@ -2132,31 +2157,20 @@ builtinSubstring _ _ _ =
 -- ---------------------------------------------------------------------------
 
 -- | Build a thunk that defers @f arg@ - the application only happens when
--- the thunk is forced.  Runs the reserved 'reservedApply1' in a
--- self-contained env, upstream's @mkApp@.  Slot 0 = function, slot 1 =
--- argument.
-deferApply :: (MonadCData m) => EnvSite -> NixValue -> Thunk -> m Thunk
-deferApply site func argThunk = do
+-- the thunk is forced ('mkApplyThunk', upstream's @mkApp@).
+deferApply :: (MonadCData m) => NixValue -> Thunk -> m Thunk
+deferApply func argThunk = do
   fnThunk <- evaluated func
-  deferApplyThunk site fnThunk argThunk
+  mkApplyThunk fnThunk argThunk
 
 -- | A thunk deferring @f name value@, as upstream's @mapAttrs@ and
--- @zipAttrsWith@ build one from two nested @mkApp@s: the reserved
--- 'reservedApply2' in a self-contained env at a site holding the
--- function in slot 0, the name in slot 1 and the value in slot 2.
-deferApply2 :: (MonadCData m) => EnvSite -> Thunk -> Text -> Thunk -> m Thunk
-deferApply2 site fnThunk name valueThunk = do
-  nameThunk <- evaluated (mkStr name)
-  env <- newEnv site Nothing [fnThunk, nameThunk, valueThunk]
-  mkThunkBc env reservedApply2
-
--- | 'deferApply' with the function already a thunk, so a builtin that
--- makes one application per element shares one function thunk across
+-- @zipAttrsWith@ build one from two nested @mkApp@s ('mkApply2Thunk').
+-- A builtin that makes one per attribute shares one function cell across
 -- them, as upstream's primops share @args[0]@.
-deferApplyThunk :: (MonadCData m) => EnvSite -> Thunk -> Thunk -> m Thunk
-deferApplyThunk site fnThunk argThunk = do
-  env <- newEnv site Nothing [fnThunk, argThunk]
-  mkThunkBc env reservedApply1
+deferApply2 :: (MonadCData m) => Thunk -> Text -> Thunk -> m Thunk
+deferApply2 fnThunk name valueThunk = do
+  nameThunk <- evaluated (mkStr name)
+  mkApply2Thunk fnThunk nameThunk valueThunk
 
 -- | The non-copying path coercion: the path text verbatim, no context -
 -- upstream's @coerceToString@ with @copyToStore = false@.
@@ -2509,10 +2523,9 @@ builtinMapAttrs funcArg (VAttrs attrs) =
   -- Each attr value is a deferred @f key val@, forced only on demand.
   -- Eagerly builds all thunks via attrSetMapWithKey - with C arena thunks
   -- (~16 bytes each), this keeps all data off the GHC heap.
-  -- Slot 0 = function, slot 1 = key, slot 2 = value.
   do
     fnThunk <- argAsThunk funcArg
-    VAttrs <$> attrSetMapWithKey SetMapAttrs (deferApply2 EnvMapAttrs fnThunk) attrs
+    VAttrs <$> attrSetMapWithKey SetMapAttrs (deferApply2 fnThunk) attrs
 builtinMapAttrs _ other =
   throwEvalError ("builtins.mapAttrs: expected a set, got " <> typeName other)
 
@@ -2552,7 +2565,7 @@ builtinZipAttrsWith func (VList cl) = do
     mergeAllAttrs = foldl' (\acc m -> Map.unionWith (++) acc (Map.map (: []) m)) Map.empty
     deferZip fnThunk key thunkList = do
       valueList <- thunksList thunkList >>= evaluated
-      deferApply2 EnvZipAttrsWith fnThunk key valueList
+      deferApply2 fnThunk key valueList
 builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
 
@@ -3238,7 +3251,7 @@ builtinReadDir val = do
   -- Resolved only when an entry needs it, so a listing that types every
   -- entry costs nothing more.
   dir <- if any (isNothing . snd) entries then resolveSymlinks p else pure p
-  let untypedEntry name = evaluated (VPath (canonPathValue (dir <> "/" <> name))) >>= deferApply EnvApply (VBuiltin Builtin.ReadFileType [])
+  let untypedEntry name = evaluated (VPath (canonPathValue (dir <> "/" <> name))) >>= deferApply (VBuiltin Builtin.ReadFileType [])
       entryValue name = maybe (untypedEntry name) (evaluated . mkStr)
   values <- Map.traverseWithKey entryValue (Map.fromList entries)
   VAttrs <$> attrSetFromMap SetReadDir values

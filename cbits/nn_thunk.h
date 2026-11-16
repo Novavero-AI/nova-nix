@@ -2,9 +2,10 @@
  * nn_thunk.h - Arena-allocated thunk memoization cells for nova-nix.
  *
  * Thunks are the core memoization mechanism in Nix evaluation.  Each
- * thunk starts as PENDING (holding a bytecode index + C environment
- * pointer) and transitions to COMPUTED (holding the result value) on
- * first force.  A BLACKHOLE state detects infinite recursion.
+ * thunk starts as PENDING (holding a bytecode index and the C environment
+ * it runs in, or a deferred application's cells) and transitions to
+ * COMPUTED (holding the result value) on first force.  A BLACKHOLE state
+ * detects infinite recursion.
  *
  * Each thunk is a 16-byte C struct in an arena, invisible to GHC's GC.
  *
@@ -12,8 +13,11 @@
  * the entire arena is destroyed at evaluation end.  Pointers into the
  * arena remain valid until nn_thunk_destroy().
  *
- * PENDING payloads are the nn_env_t * the code runs in, owned by the env
- * arena, so a pending thunk holds no reference into the GHC heap.  A
+ * A PENDING payload is the nn_env_t * the code runs in, or the cells of
+ * a deferred application, a builtin's per-element application of a
+ * function (map, mapAttrs and the like) as upstream's app value is a
+ * function and its argument (value.hh at 2.24.9); either lives in the env
+ * pages, so a pending thunk holds no reference into the GHC heap.  A
  * recursive frame (rec attrs, let, a formals set) is allocated with its
  * slot array before the thunks that point at it, and its slots are
  * filled after, as upstream allocates env2 before filling its values.
@@ -37,6 +41,17 @@
 #define NN_THUNK_COMPUTED  1
 #define NN_THUNK_BLACKHOLE 2
 
+/* --- Pending forms (valid when state is PENDING or BLACKHOLE) --- */
+
+/* Code: the instruction at bc_idx, run in the env at payload. */
+#define NN_PENDING_CODE   0
+/* A deferred application of a function to one argument, or to two in
+ * turn, as upstream's mapAttrs nests two app values: the payload is the
+ * cells, the function's first, one more than the form's number of
+ * arguments (nn_env_alloc_app_cells). */
+#define NN_PENDING_APPLY1 1
+#define NN_PENDING_APPLY2 2
+
 /* --- Value tags (valid when state == COMPUTED) --- */
 
 #define NN_VALUE_INT     0   /* payload = (void*)(intptr_t)int64_value */
@@ -54,26 +69,35 @@
 
 /* --- Types --- */
 
-/* A thunk: mutable cell holding either a pending expression or a
- * computed value.  16 bytes: state(1) + val_tag(1) + _pad(2) +
- * bc_idx(4) + payload(8).  val_tag is valid only when state == COMPUTED.
+/* A thunk: mutable cell holding either pending work or a computed value.
+ * 16 bytes: state(1) + val_tag(1) + form(1) + _pad(1) + bc_idx(4) +
+ * payload(8).  val_tag is valid only when state == COMPUTED, and form
+ * only when it is PENDING or BLACKHOLE.
  *
- * PENDING:   bc_idx = bytecode instruction index
- *            payload = nn_env_t * the code runs in
+ * PENDING:   form selects interpretation of bc_idx and payload:
+ *            CODE: bc_idx = bytecode instruction index,
+ *                  payload = nn_env_t * the code runs in
+ *            APPLY1, APPLY2: payload = the application's cells,
+ *                  bc_idx unused
  * COMPUTED:  val_tag selects interpretation of payload:
  *            INT/BOOL: (intptr_t) cast of scalar
  *            FLOAT: memcpy'd double
  *            NULL: ignored
  *            PRIMOP: (uintptr_t) cast of the builtin's index
  *            others: a pointer to the C object
- * BLACKHOLE: bc_idx/payload = stale from PENDING (do not dereference) */
+ * BLACKHOLE: form, bc_idx and payload as they were PENDING, kept for
+ *            nn_thunk_mark_pending, which puts the thunk back to work */
 typedef struct nn_thunk {
     uint8_t   state;
     uint8_t   val_tag;
-    uint16_t  _pad;
-    uint32_t  bc_idx;    /* PENDING: bytecode index; otherwise stale (never read) */
+    uint8_t   form;      /* PENDING and BLACKHOLE: an NN_PENDING_* form */
+    uint8_t   _pad;
+    uint32_t  bc_idx;    /* PENDING code: bytecode index; otherwise never read */
     void     *payload;
 } nn_thunk_t;
+
+/* C99-compatible compile-time check of the 16 bytes above. */
+typedef char nn_thunk_size_check_[(sizeof(nn_thunk_t) == 16) ? 1 : -1];
 
 /* Nix integers are int64_t, stored inline via (intptr_t) cast into payload.
  * This requires pointers to be at least 64 bits.  32-bit targets would
@@ -100,16 +124,38 @@ void nn_thunk_destroy(void);
 
 /* --- Allocation --- */
 
+/* No instruction's index, which nn_thunk_get_bc_idx answers for a thunk
+ * that runs none: the bytecode emitters answer it only for an append
+ * that failed (nn_bytecode.h). */
+#define NN_THUNK_NO_CODE UINT32_MAX
+
 /* Allocate a new PENDING thunk with a bytecode index + env payload.
- * Returns a pointer into arena memory, valid until nn_thunk_destroy().
+ * Returns a pointer into arena memory, valid until nn_thunk_destroy(),
+ * or NULL for a bc_idx of NN_THUNK_NO_CODE.
  * bc_idx is the root instruction index in the bytecode store.
  * env is the nn_env_t * the code runs in.  It must already exist, but
  * its slots need not be filled yet: nothing reads them until the thunk
  * is forced. */
 nn_thunk_t *nn_thunk_new_bc(uint32_t bc_idx, void *env);
 
-/* Read the bytecode index from a PENDING thunk. */
+/* Allocate a new PENDING thunk deferring the application of the function
+ * in `fn` to the argument in `arg`, or, for nn_thunk_new_apply2, to
+ * `first` and then the result to `second`.  Returns NULL for a NULL cell,
+ * or when the thunk or its cells cannot be allocated. */
+nn_thunk_t *nn_thunk_new_apply1(nn_thunk_t *fn, nn_thunk_t *arg);
+nn_thunk_t *nn_thunk_new_apply2(nn_thunk_t *fn, nn_thunk_t *first, nn_thunk_t *second);
+
+/* Read the bytecode index of a PENDING or BLACKHOLE code thunk, or
+ * NN_THUNK_NO_CODE for an application, so that one read tells a code
+ * thunk, nearly every thunk forced, from the rest. */
 uint32_t nn_thunk_get_bc_idx(const nn_thunk_t *thunk);
+
+/* Read the form of a PENDING or BLACKHOLE thunk (NN_PENDING_*). */
+uint8_t nn_thunk_pending_form(const nn_thunk_t *thunk);
+
+/* Cell `i` of a PENDING or BLACKHOLE application, the function's at 0,
+ * or NULL for a thunk of another form or `i` past its cells. */
+nn_thunk_t *nn_thunk_apply_cell(const nn_thunk_t *thunk, uint32_t i);
 
 /* Allocate pre-COMPUTED thunks with inline scalar values. */
 nn_thunk_t *nn_thunk_new_computed_int(int64_t value);
@@ -189,7 +235,7 @@ void    *nn_thunk_get_primop_app(const nn_thunk_t *thunk);
 int nn_thunk_mark_blackhole(nn_thunk_t *thunk);
 
 /* Transition BLACKHOLE -> PENDING (a force threw and was caught upstream).
- * Payload + bc_idx are preserved, so the thunk is re-forceable; matches C++
+ * Form, payload and bc_idx are preserved, so the thunk is re-forceable; matches C++
  * Nix restoring a thunk after a caught exception during force.
  * Returns 1 on success, 0 if thunk is not BLACKHOLE. */
 int nn_thunk_mark_pending(nn_thunk_t *thunk);
@@ -197,9 +243,9 @@ int nn_thunk_mark_pending(nn_thunk_t *thunk);
 /* Set a non-COMPUTED thunk to COMPUTED, the setter naming the value
  * kind: an inline scalar, a builtin's index, or a C object.  Accepts PENDING or BLACKHOLE state (skips
  * blackhole for direct memoization).  The pending payload is overwritten:
- * it is an env pointer the env arena owns, so there is nothing to hand
- * back or free.  Returns 1, or 0 with the thunk unchanged if it is
- * already COMPUTED. */
+ * it is an env or an application's cells, which the env pages own, so
+ * there is nothing to hand back or free.  Returns 1, or 0 with the thunk
+ * unchanged if it is already COMPUTED. */
 int nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value);
 int nn_thunk_set_computed_float(nn_thunk_t *thunk, double value);
 int nn_thunk_set_computed_bool(nn_thunk_t *thunk, uint8_t value);

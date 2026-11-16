@@ -14,6 +14,7 @@
  */
 
 #include "nn_thunk.h"
+#include "nn_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,20 +141,81 @@ nn_thunk_destroy(void)
 nn_thunk_t *
 nn_thunk_new_bc(uint32_t bc_idx, void *env)
 {
-    nn_thunk_t *t = arena_alloc(g_arena);
+    nn_thunk_t *t;
+    if (bc_idx == NN_THUNK_NO_CODE) return NULL;
+    t = arena_alloc(g_arena);
     if (!t) return NULL;
     t->state = NN_THUNK_PENDING;
     t->val_tag = 0;
+    t->form = NN_PENDING_CODE;
     t->_pad = 0;
     t->bc_idx = bc_idx;
     t->payload = env;
     return t;
 }
 
+/* A PENDING application of the `count` cells at `cells`, the function's
+ * first, copied into an array of the env pages. */
+static nn_thunk_t *
+new_apply(nn_thunk_t *const *cells, uint32_t count, uint8_t form)
+{
+    uint32_t i;
+    void **held;
+    nn_thunk_t *t;
+    for (i = 0; i < count; i++)
+        if (!cells[i]) return NULL;
+    held = nn_env_alloc_app_cells(count);
+    if (!held) return NULL;
+    t = arena_alloc(g_arena);
+    if (!t) return NULL;
+    for (i = 0; i < count; i++) held[i] = cells[i];
+    t->state = NN_THUNK_PENDING;
+    t->val_tag = 0;
+    t->form = form;
+    t->_pad = 0;
+    t->bc_idx = 0;
+    t->payload = held;
+    return t;
+}
+
+nn_thunk_t *
+nn_thunk_new_apply1(nn_thunk_t *fn, nn_thunk_t *arg)
+{
+    nn_thunk_t *cells[2];
+    cells[0] = fn;
+    cells[1] = arg;
+    return new_apply(cells, 2, NN_PENDING_APPLY1);
+}
+
+nn_thunk_t *
+nn_thunk_new_apply2(nn_thunk_t *fn, nn_thunk_t *first, nn_thunk_t *second)
+{
+    nn_thunk_t *cells[3];
+    cells[0] = fn;
+    cells[1] = first;
+    cells[2] = second;
+    return new_apply(cells, 3, NN_PENDING_APPLY2);
+}
+
 uint32_t
 nn_thunk_get_bc_idx(const nn_thunk_t *thunk)
 {
-    return thunk->bc_idx;
+    return thunk->form == NN_PENDING_CODE ? thunk->bc_idx : NN_THUNK_NO_CODE;
+}
+
+uint8_t
+nn_thunk_pending_form(const nn_thunk_t *thunk)
+{
+    return thunk->form;
+}
+
+nn_thunk_t *
+nn_thunk_apply_cell(const nn_thunk_t *thunk, uint32_t i)
+{
+    if (thunk->state == NN_THUNK_COMPUTED) return NULL;
+    if (thunk->form != NN_PENDING_APPLY1 && thunk->form != NN_PENDING_APPLY2) return NULL;
+    if (i > thunk->form) return NULL;
+    return ((nn_thunk_t *const *)thunk->payload)[i];
 }
 
 nn_thunk_t *
@@ -163,6 +225,7 @@ nn_thunk_new_computed_int(int64_t value)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_INT;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     t->payload = (void *)(intptr_t)value;
@@ -176,6 +239,7 @@ nn_thunk_new_computed_float(double value)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_FLOAT;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     memcpy(&t->payload, &value, sizeof(double));
@@ -189,6 +253,7 @@ nn_thunk_new_computed_primop(uint32_t primop)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_PRIMOP;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     t->payload = (void *)(uintptr_t)primop;
@@ -202,6 +267,7 @@ nn_thunk_new_computed_str(void *str)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_STR;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     t->payload = str;
@@ -215,6 +281,7 @@ nn_thunk_new_computed_path(void *str)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_PATH;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     t->payload = str;
@@ -228,6 +295,7 @@ nn_thunk_new_computed_list(void *list)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_LIST;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     t->payload = list;
@@ -241,6 +309,7 @@ nn_thunk_new_computed_attrs(void *attrset)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_ATTRS;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     t->payload = attrset;
@@ -254,6 +323,7 @@ nn_thunk_new_computed_ctxstr(void *ctxstr)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_CTXSTR;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     t->payload = ctxstr;
@@ -267,6 +337,7 @@ nn_thunk_new_computed_lambda(void *lambda)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_LAMBDA;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     t->payload = lambda;
@@ -280,6 +351,7 @@ nn_thunk_new_computed_primop_app(void *app)
     if (!t) return NULL;
     t->state = NN_THUNK_COMPUTED;
     t->val_tag = NN_VALUE_PRIMOP_APP;
+    t->form = 0;
     t->_pad = 0;
     t->bc_idx = 0;
     t->payload = app;
@@ -288,11 +360,11 @@ nn_thunk_new_computed_primop_app(void *app)
 
 /* --- Shared constants --- */
 
-static nn_thunk_t g_null_cell  = { NN_THUNK_COMPUTED, NN_VALUE_NULL, 0, 0, NULL };
-static nn_thunk_t g_true_cell  = { NN_THUNK_COMPUTED, NN_VALUE_BOOL, 0, 0, (void *)(intptr_t)1 };
-static nn_thunk_t g_false_cell = { NN_THUNK_COMPUTED, NN_VALUE_BOOL, 0, 0, NULL };
+static nn_thunk_t g_null_cell  = { NN_THUNK_COMPUTED, NN_VALUE_NULL, 0, 0, 0, NULL };
+static nn_thunk_t g_true_cell  = { NN_THUNK_COMPUTED, NN_VALUE_BOOL, 0, 0, 0, (void *)(intptr_t)1 };
+static nn_thunk_t g_false_cell = { NN_THUNK_COMPUTED, NN_VALUE_BOOL, 0, 0, 0, NULL };
 /* An empty list is the NULL list (nn_list.h). */
-static nn_thunk_t g_empty_list_cell = { NN_THUNK_COMPUTED, NN_VALUE_LIST, 0, 0, NULL };
+static nn_thunk_t g_empty_list_cell = { NN_THUNK_COMPUTED, NN_VALUE_LIST, 0, 0, 0, NULL };
 
 nn_thunk_t *
 nn_thunk_null(void)

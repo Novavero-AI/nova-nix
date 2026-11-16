@@ -47,19 +47,6 @@ data EnvSite
     EnvInheritFrom
   | -- | A @with@.
     EnvWith
-  | -- | @map@'s application of its function to each element.
-    EnvMap
-  | -- | @genList@'s application of its function to each index.
-    EnvGenList
-  | -- | @concatMap@'s application of its function to each element.
-    EnvConcatMap
-  | -- | @mapAttrs@' application of its function to each name and value.
-    EnvMapAttrs
-  | -- | @zipAttrsWith@'s application of its function to each name and its
-    -- values.
-    EnvZipAttrsWith
-  | -- | Any other builtin's application of a function to an argument.
-    EnvApply
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | The site's number in the C counts, below @NN_STATS_ENV_SITES@.
@@ -79,12 +66,6 @@ envSiteName site = case site of
   EnvRecCapture -> "rec-capture"
   EnvInheritFrom -> "inherit-from"
   EnvWith -> "with"
-  EnvMap -> "map"
-  EnvGenList -> "genList"
-  EnvConcatMap -> "concatMap"
-  EnvMapAttrs -> "mapAttrs"
-  EnvZipAttrsWith -> "zipAttrsWith"
-  EnvApply -> "apply"
 
 -- | What makes an attribute set.
 data SetSite

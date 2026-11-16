@@ -3,9 +3,10 @@
  * what a set of roots reaches.
  *
  * The census reads what the allocators keep anyway (the thunk blocks, the
- * env pages, the tracked sets, list headers, lambdas, builtins' partial
- * applications and strings with context, the string arena's blocks, the
- * symbol table), so a process
+ * env pages and the count of deferred applications' cells in them, the
+ * tracked sets, list headers, lambdas, builtins' partial applications and
+ * strings with context, the string arena's blocks, the symbol table), so
+ * a process
  * that never takes one pays nothing for it beyond the test of
  * nn_stats_counting below.
  *
@@ -42,10 +43,11 @@
 #define NN_STATS_LISTS      3  /* list headers and the items arrays they span */
 #define NN_STATS_LAMBDAS    4  /* lambda closures and their formal entries */
 #define NN_STATS_PRIMOP_APPS 5 /* builtins' partial applications (nn_primop.h) */
-#define NN_STATS_CTXSTRS    6  /* strings with context */
-#define NN_STATS_STRINGS    7  /* string and path bytes in the value arena (nn_str.h) */
-#define NN_STATS_SYMBOLS    8  /* interned names */
-#define NN_STATS_KIND_COUNT 9
+#define NN_STATS_APPS       6  /* deferred applications' cells (nn_thunk.h) */
+#define NN_STATS_CTXSTRS    7  /* strings with context */
+#define NN_STATS_STRINGS    8  /* string and path bytes in the value arena (nn_str.h) */
+#define NN_STATS_SYMBOLS    9  /* interned names */
+#define NN_STATS_KIND_COUNT 10
 
 /* A count no allocator keeps: the env pages hold envs and with-scope
  * arrays side by side with no record of which is which, so without
@@ -58,7 +60,7 @@
 /* How many sites the evaluator numbers for envs and for attribute sets:
  * a site is below its bound.  Nix.Eval.AllocSite enumerates exactly
  * these many. */
-#define NN_STATS_ENV_SITES 16u
+#define NN_STATS_ENV_SITES 10u
 #define NN_STATS_SET_SITES 22u
 
 /* Envs by the slots they hold: one bucket for each count below
@@ -155,9 +157,9 @@ void nn_stats_reached(uint64_t *counts, uint64_t *bytes);
 
 /* The mark's own work: the objects it has entered (thunks, envs,
  * with-scope arrays, sets, list headers, items arrays, lambdas, partial
- * applications, strings with context; strings and symbols hold no
- * pointer, and are marked and not entered) and their bytes, and the
- * pointers it could not place. */
+ * applications, deferred applications' cells, strings with context;
+ * strings and symbols hold no pointer, and are marked and not entered)
+ * and their bytes, and the pointers it could not place. */
 void nn_stats_visited(uint64_t *objects, uint64_t *bytes, uint64_t *unplaced);
 
 /* The reached attribute sets by their number of entries, in ascending

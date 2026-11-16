@@ -41,8 +41,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Word (Word16, Word32, Word64, Word8)
 import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 import Nix.Eval.CBytecode
-  ( appDirect,
-    attrkeyDynamic,
+  ( attrkeyDynamic,
     attrkeyStatic,
     binaryAdd,
     binaryAnd,
@@ -232,7 +231,7 @@ compileWith recorder = go
     compileApp func arg = do
       funcIdx <- go func
       argIdx <- go arg
-      cbcEmit OpApp appDirect 0 funcIdx argIdx 0
+      cbcEmit OpApp 0 0 funcIdx argIdx 0
 
     -- -----------------------------------------------------------------
     -- Strings (EStr / EIndStr)

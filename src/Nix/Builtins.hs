@@ -45,7 +45,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, currentSystemStr, deferApply, evaluated, listedBuiltins, readThunkValue)
-import Nix.Eval.AllocSite (EnvSite (EnvApply, EnvRoot), SetSite (SetRoot))
+import Nix.Eval.AllocSite (EnvSite (EnvRoot), SetSite (SetRoot))
 import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CData (MonadCData, cdataIO)
@@ -253,7 +253,7 @@ derivationWrapper = do
 -- | A thunk that aborts evaluation with the message when forced: @abort@
 -- applied to it, deferred the way "Nix.Eval" defers any application.
 abortingThunk :: (MonadCData m) => Text -> m Thunk
-abortingThunk message = evaluated (mkStr message) >>= deferApply EnvApply (VBuiltin Builtin.Abort [])
+abortingThunk message = evaluated (mkStr message) >>= deferApply (VBuiltin Builtin.Abort [])
 
 -- ---------------------------------------------------------------------------
 -- NIX_PATH parsing

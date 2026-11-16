@@ -86,8 +86,10 @@ module Nix.Eval.Types
     cheapThunk,
     cheapThunkBc,
     mkThunkBc,
-    pendingCode,
-    pendingThunkEnv,
+    mkApplyThunk,
+    mkApply2Thunk,
+    Pending (..),
+    readPending,
     evaluated,
     thunkSameRef,
     thunkToCPtr,
@@ -167,7 +169,7 @@ import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, empty
 import Nix.Eval.CPrimop (CPrimopAppPtr, cprimopAppArg, cprimopAppForced, cprimopAppNew, cprimopAppPrimop, cprimopAppTaken)
 import Nix.Eval.CStatus (cInvariantViolated, checkedCPtr)
 import Nix.Eval.CStr (CStrPtr, cstrBytes, cstrFromText, cstrNew, cstrText)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkEmptyList, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetPrimop, cthunkGetPrimopApp, cthunkGetStr, cthunkNewBc, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedPrimop, cthunkNewComputedPrimopApp, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkApplyCell, cthunkBool, cthunkEmptyList, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetPrimop, cthunkGetPrimopApp, cthunkGetStr, cthunkNewApply1, cthunkNewApply2, cthunkNewBc, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedPrimop, cthunkNewComputedPrimopApp, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkPendingForm, cthunkState, cthunkValueTag, noCode)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval, compileParsed)
@@ -230,13 +232,15 @@ bytesToTextLossy = TE.decodeUtf8With lenientDecode
 -- Each thunk points to an @nn_thunk_t@ in the C arena.
 -- On first force, the cell transitions PENDING to BLACKHOLE to COMPUTED,
 -- which detects infinite recursion (BLACKHOLE) and overwrites the
--- pending code and env with the value, as upstream mutates a thunk in
+-- pending work ('Pending') with the value, as upstream mutates a thunk in
 -- place.
 --
 -- A pending cell holds its env as the C pointer, so the env exists before
 -- the cell does: 'mkThunkBc' takes a built t'Env', and 'tieFrame' builds a
--- frame whose bindings point back at it before filling its slots.  Arena
--- pointers remain valid until 'Nix.Eval.CThunk.cthunkDestroy'.
+-- frame whose bindings point back at it before filling its slots.  A
+-- deferred application's cell ('mkApplyThunk') holds the cells it applies
+-- and no env.  Arena pointers remain valid until
+-- 'Nix.Eval.CThunk.cthunkDestroy'.
 newtype Thunk = Thunk {unThunk :: CThunkPtr}
 
 -- | The cell's state and, once computed, its value, as they stand when
@@ -270,6 +274,14 @@ pattern ThunkPending, ThunkComputed, ThunkBlackhole :: Word8
 pattern ThunkPending = 0
 pattern ThunkComputed = 1
 pattern ThunkBlackhole = 2
+
+-- | The forms of a pending application, mirroring the
+-- @NN_PENDING_APPLY*@ macros in @cbits\/nn_thunk.h@: a function applied
+-- to one argument or to two in turn.  A code thunk is told apart by its
+-- instruction ('noCode').
+pattern PendingApply1Form, PendingApply2Form :: Word8
+pattern PendingApply1Form = 1
+pattern PendingApply2Form = 2
 
 -- | Value-kind tags for the C value layout, mirroring @cbits\/nn_thunk.h@.
 -- The tag selects which payload a computed (VALUE) thunk carries.
@@ -925,15 +937,50 @@ capturedThunks env = mapM (\(lvl, idx) -> envLookupResolved lvl idx env)
 mkThunkBc :: (MonadCData m) => Env -> Word32 -> m Thunk
 mkThunkBc (Env envPtr) bcIdx = Thunk <$> cthunkNewBc bcIdx (castPtr envPtr)
 
--- | The code a PENDING or BLACKHOLE thunk runs, and the env it runs in, as
--- 'mkThunkBc' stored them.
-pendingCode :: (MonadCData m) => CThunkPtr -> m (Env, Word32)
-pendingCode ptr = (,) <$> pendingThunkEnv ptr <*> cthunkGetBcIdx ptr
+-- | A pending thunk applying the function in one cell to the argument in
+-- another when it is forced, as upstream's app value does (@mkApp@,
+-- value.hh at 2.24.9): a fresh PENDING cell holding the two cells, which
+-- live in the env pages, and no env.  Unlike an app value, which upstream
+-- never blackholes, the cell is blackholed while it is forced, as every
+-- pending cell is.
+mkApplyThunk :: (MonadCData m) => Thunk -> Thunk -> m Thunk
+mkApplyThunk (Thunk fn) (Thunk arg) = Thunk <$> cthunkNewApply1 fn arg
 
--- | The env a PENDING or BLACKHOLE thunk's code runs in, as 'mkThunkBc'
--- stored it.
-pendingThunkEnv :: (MonadCData m) => CThunkPtr -> m Env
-pendingThunkEnv ptr = Env . castPtr <$> cthunkPayload ptr
+-- | 'mkApplyThunk' applying the function to a first argument and the
+-- result to a second, as upstream's @mapAttrs@ and @zipAttrsWith@ nest
+-- two app values.  The inner application's result is not kept, where
+-- upstream's inner app value holds it once forced, so a force retried
+-- after a failure applies the function to the first argument again.
+mkApply2Thunk :: (MonadCData m) => Thunk -> Thunk -> Thunk -> m Thunk
+mkApply2Thunk (Thunk fn) (Thunk first) (Thunk second) = Thunk <$> cthunkNewApply2 fn first second
+
+-- | What a pending thunk does when it is forced.
+data Pending
+  = -- | Run the code at a bytecode index in an env ('mkThunkBc').
+    PendingCode !Env !Word32
+  | -- | Apply the function in a cell to the argument in another
+    -- ('mkApplyThunk').
+    PendingApply !Thunk !Thunk
+  | -- | Apply the function to the first argument and the result to the
+    -- second ('mkApply2Thunk').
+    PendingApply2 !Thunk !Thunk !Thunk
+
+-- | What a PENDING or BLACKHOLE thunk does, as 'mkThunkBc' or
+-- 'mkApplyThunk' and 'mkApply2Thunk' stored it.  Its instruction is read
+-- first, so a code thunk, nearly every thunk forced, takes the two reads
+-- it took before applications had a form of their own.
+readPending :: (MonadCData m) => CThunkPtr -> m Pending
+readPending ptr =
+  cthunkGetBcIdx ptr >>= \case
+    bcIdx
+      | bcIdx /= noCode -> (\env -> PendingCode (Env (castPtr env)) bcIdx) <$> cthunkPayload ptr
+      | otherwise ->
+          cthunkPendingForm ptr >>= \case
+            PendingApply1Form -> PendingApply <$> cell 0 <*> cell 1
+            PendingApply2Form -> PendingApply2 <$> cell 0 <*> cell 1 <*> cell 2
+            other -> cdataIO (cInvariantViolated "nn_thunk_pending_form" ("no pending application has form " ++ show other))
+  where
+    cell i = Thunk <$> cthunkApplyCell ptr i
 
 -- | Like 'cheapThunk' but for bytecode indices (used inside evalBytecode).
 -- Short-circuits for resolved vars and literals without creating a
@@ -1537,9 +1584,9 @@ class (MonadCData m) => MonadEval m where
   -- | Force a thunk to a value, with memoization.
   -- IO evaluators should cache results (via per-thunk @IORef@).
   -- Pure evaluators re-evaluate each time.
-  -- The first argument is the bytecode evaluation function (to break
-  -- the Eval.Types to Eval circular dependency).
-  forceThunk :: (Env -> Word32 -> m NixValue) -> Thunk -> m NixValue
+  -- The first argument runs what a pending thunk holds ('readPending'),
+  -- passed in to break the Eval.Types to Eval circular dependency.
+  forceThunk :: (Pending -> m NixValue) -> Thunk -> m NixValue
 
   -- | Look up a cached derivation modulo-hash (hex) by its @.drv@ store
   -- path.  Populated bottom-up as each derivation is computed; used by the
@@ -1760,4 +1807,4 @@ instance MonadEval PureEval where
       ThunkComputed -> readComputed ptr
       -- Non-catchable: must escape tryEval like in C++ Nix
       ThunkBlackhole -> abortEvaluation "infinite recursion encountered"
-      _ {- PENDING -} -> pendingCode ptr >>= uncurry evalFn
+      _ {- PENDING -} -> readPending ptr >>= evalFn

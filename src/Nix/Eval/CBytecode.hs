@@ -48,10 +48,6 @@ module Nix.Eval.CBytecode
     spilledCountSentinel,
     cbcCountedPayload,
 
-    -- * Reserved instructions
-    reservedApply1,
-    reservedApply2,
-
     -- * Diagnostics
     cbcOpCount,
     cbcDataCount,
@@ -83,10 +79,6 @@ module Nix.Eval.CBytecode
     pattern OpSearchPath,
     pattern OpPathStr,
     pattern OpPos,
-
-    -- * App flags
-    appDirect,
-    appDeferred,
 
     -- * UnaryOp flags
     unaryNot,
@@ -201,8 +193,6 @@ foreign import ccall unsafe "nn_bc_data_count"
 
 -- | Initialize the global bytecode store.  Call once before evaluation.
 -- Arguments are capacity hints (0 = defaults: 65536 ops, 131072 data).
--- The store starts with the reserved instructions ('reservedApply1',
--- 'reservedApply2') already in place.
 cbcInit :: Word32 -> Word32 -> IO ()
 cbcInit = c_nn_bytecode_init
 
@@ -343,27 +333,6 @@ cbcCountedPayload bcIdx dataOff = cdataIO $ do
     else pure (fromIntegral inline, dataOff)
 
 -- ---------------------------------------------------------------------------
--- Reserved instructions
--- ---------------------------------------------------------------------------
-
--- | Code that applies slot 0 of its env to slot 1, a deferred call
--- (upstream's @mkApp@).  'cbcInit' lays it down at this index in every
--- store, so a builtin that makes such a thunk per element (@map@,
--- @genList@) points each one here instead of compiling its own copy.
--- Must stay in lockstep with @NN_BC_RESERVED_APPLY1@ in
--- @cbits\/nn_bytecode.h@.
-reservedApply1 :: Word32
-reservedApply1 = 2
-
--- | Code that applies slot 0 to slot 1 and the result to slot 2, both
--- deferred: @f name value@ as upstream's @mapAttrs@ builds it from two
--- nested @mkApp@s, so the name application runs a frame below the value
--- application's.  Its function is 'reservedApply1'.  Must stay in
--- lockstep with @NN_BC_RESERVED_APPLY2@ in @cbits\/nn_bytecode.h@.
-reservedApply2 :: Word32
-reservedApply2 = 4
-
--- ---------------------------------------------------------------------------
 -- Diagnostics
 -- ---------------------------------------------------------------------------
 
@@ -449,15 +418,6 @@ pattern OpPos = 25
 -- ---------------------------------------------------------------------------
 -- Sub-type flags
 -- ---------------------------------------------------------------------------
-
--- | @OpApp@ flag values: a source application ('Nix.Expr.Types.EApp')
--- evaluates its function before the call frame opens; a deferred one
--- forces it inside the frame.  Must stay in lockstep with @NN_APP_*@ in
--- @cbits\/nn_bytecode.h@, whose reserved instructions are the deferred
--- applications.
-appDirect, appDeferred :: Word8
-appDirect = 0
-appDeferred = 1
 
 -- | @OpUnary@ flag values: which unary operator to apply.
 unaryNot, unaryNegate :: Word8
