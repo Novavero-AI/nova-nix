@@ -838,7 +838,8 @@ static void enter_env(const nn_env_t *env)
 {
     uint32_t i;
     const nn_env_scopes_t *scopes = nn_env_scopes(env);
-    for (i = 0; i < env->slot_count; i++) reach(NN_STATS_THUNKS, env->slots[i]);
+    uint32_t slot_count = nn_env_slot_count(env);
+    for (i = 0; i < slot_count; i++) reach(NN_STATS_THUNKS, env->slots[i]);
     reach(NN_STATS_ENVS, nn_env_parent(env));
     if (!scopes) return;
     reach(NN_STATS_ATTRSETS, scopes->lazy_scope);

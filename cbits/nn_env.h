@@ -1,25 +1,29 @@
 /*
  * nn_env.h - C-native evaluation environments.
  *
- * Nix evaluation creates millions of environments.  An env is a header
- * word and its slots, followed by the fields its kind says it has:
+ * Nix evaluation creates millions of environments.  An env is a word and
+ * its slots, followed by the fields its word says it has:
  *
- *   slot_count, kind     NN_ENV_HEADER_BYTES
+ *   word                 the parent and slot count, or a header
  *   slots[slot_count]    one nn_thunk_t * each
- *   parent               an nn_env_t *, when kind has NN_ENV_PARENT
- *   scopes               an nn_env_scopes_t, when kind has NN_ENV_SCOPES
+ *   parent               an nn_env_t *, when a header has NN_ENV_PARENT
+ *   scopes               an nn_env_scopes_t, when a header has NN_ENV_SCOPES
  *
- * A call's env, the most common, is the header, its parent and its one
- * slot.  A trimmed closure's env or a builtin's deferred application has
- * no parent and pays for none.  Only a root env (the builtins, or
- * scopedImport's names over them), a frame whose names are not all
- * static, a with and a trimmed closure under a with have scopes.
- * Everything an env points to is found from the env alone: the header
- * gives the slot count and which fields follow them.
+ * An env of 1 to NN_ENV_SHORT_MAX slots and no scopes is short: its word
+ * is its parent's address, or 0 for none, with the slot count in the low
+ * bits every env's alignment leaves clear, so it takes a word and a
+ * pointer a slot, as upstream's Env is a parent and its values
+ * (eval.hh:135-139 at 2.24.9).  A call's env, the most common, is short,
+ * and so is nearly every frame.  Any other env's word is a header: those
+ * bits clear, which fields follow the slots, and the slot count.  Only a
+ * root env (the builtins, or scopedImport's names over them), a frame
+ * whose names are not all static, a with and a trimmed closure under a
+ * with have scopes.  Everything an env points to is found from the env
+ * alone: its word gives the slot count and which fields follow them.
  *
- * The slots follow the header as a C99 flexible array member, so the
+ * The slots follow the word as a C99 flexible array member, so the
  * compiler places them at a pointer-aligned offset, which nn_env_t's size
- * check below pins at NN_ENV_HEADER_BYTES.  Every env starts at an
+ * check below pins at NN_ENV_WORD_BYTES.  Every env starts at an
  * NN_ENV_ALIGNMENT boundary of its page, and every field after the slots
  * starts a whole number of pointers past them, so every slot, parent and
  * scopes field is pointer-aligned.
@@ -44,14 +48,21 @@
 /* --- Env struct --- */
 
 typedef struct nn_env {
-    uint32_t slot_count;   /* entries in slots */
-    uint32_t kind;         /* NN_ENV_PARENT and NN_ENV_SCOPES, or neither */
-    void    *slots[];      /* nn_thunk_t *, NULL until the frame is filled */
+    uintptr_t word;        /* the parent and slot count, or a header */
+    void     *slots[];     /* nn_thunk_t *, NULL until the frame is filled */
 } nn_env_t;
 
-/* The fields an env's kind says follow its slots, in this order. */
-#define NN_ENV_PARENT 1u   /* the enclosing env */
-#define NN_ENV_SCOPES 2u   /* an nn_env_scopes_t */
+/* The low bits of a word: a short env's slot count, and 0 in a header.
+ * An env's address is a multiple of NN_ENV_ALIGNMENT, which nn_env.c
+ * checks exceeds them, so a parent's address has them clear. */
+#define NN_ENV_SHORT_MASK ((uintptr_t)7)
+#define NN_ENV_SHORT_MAX  7u
+
+/* A header: the fields that follow the slots, in this order, and the
+ * slot count from NN_ENV_COUNT_SHIFT up. */
+#define NN_ENV_PARENT ((uintptr_t)8)    /* the enclosing env */
+#define NN_ENV_SCOPES ((uintptr_t)16)   /* an nn_env_scopes_t */
+#define NN_ENV_COUNT_SHIFT 8
 
 /* What an env with NN_ENV_SCOPES has: a lazy scope, an attribute set
  * whose names it binds (the root env's builtins, a frame whose names
@@ -64,14 +75,16 @@ typedef struct nn_env_scopes {
     uint32_t  with_count;
 } nn_env_scopes_t;
 
-#define NN_ENV_HEADER_BYTES 8
+#define NN_ENV_WORD_BYTES   8
 #define NN_ENV_SCOPES_BYTES 24
 
 /* C99-compatible compile-time checks of the sizes above, which the
- * bytes an env takes (nn_env_bytes) and the census's figures rest on. */
-typedef char nn_env_header_size_check_[(sizeof(nn_env_t) == NN_ENV_HEADER_BYTES) ? 1 : -1];
-typedef char nn_env_slots_offset_check_[(offsetof(nn_env_t, slots) == NN_ENV_HEADER_BYTES) ? 1 : -1];
+ * bytes an env takes (nn_env_bytes) and the census's figures rest on,
+ * and that a header holds any uint32_t slot count. */
+typedef char nn_env_word_size_check_[(sizeof(nn_env_t) == NN_ENV_WORD_BYTES) ? 1 : -1];
+typedef char nn_env_slots_offset_check_[(offsetof(nn_env_t, slots) == NN_ENV_WORD_BYTES) ? 1 : -1];
 typedef char nn_env_scopes_size_check_[(sizeof(nn_env_scopes_t) == NN_ENV_SCOPES_BYTES) ? 1 : -1];
+typedef char nn_env_count_width_check_[(UINTPTR_MAX >> NN_ENV_COUNT_SHIFT >= UINT32_MAX) ? 1 : -1];
 
 /* A with-scope entry is an nn_attrset_t *, or a with-scope not yet forced:
  * the nn_thunk_t * of its expression with this bit set, which the
@@ -109,7 +122,9 @@ nn_env_t *nn_env_empty(void);
 
 /* An env of `slot_count` NULL slots under `parent`, or under none for a
  * NULL parent, made at `site`.  Its with-scopes are its parent's.
- * Returns NULL past the allocator's uint32 byte limit or on OOM. */
+ * Returns NULL past the allocator's uint32 byte limit, on OOM, or for a
+ * parent with any of NN_ENV_SHORT_MASK set in its address, which no env
+ * has. */
 nn_env_t *nn_env_new(uint32_t slot_count, nn_env_t *parent, uint32_t site);
 
 /* nn_env_new for an env with scopes: a lazy scope (or NULL) and its own
