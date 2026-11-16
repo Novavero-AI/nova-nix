@@ -20,7 +20,7 @@
  * COMPUTED payloads are either inline scalars (int/float/bool/null via
  * val_tag 0-3), C-native pointers (str/path/list/attrs/ctxstr/lambda
  * via val_tag 4-9), or StablePtrs (for a builtin and the arguments it
- * has taken, or a compiled regex, via tag 255).
+ * has taken, via tag 255).
  *
  * Lifecycle: nn_thunk_init() before evaluation, nn_thunk_destroy()
  * after.  Not thread-safe - single-threaded evaluation only.

@@ -12,7 +12,6 @@ module Nix.Eval.Types
     NixValue (.., VStr, VPath),
     HeldBytes (..),
     BuiltinArg (..),
-    CompiledRegex (..),
     Thunk (..),
     readThunkValue,
     readComputed,
@@ -173,25 +172,6 @@ import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
 import Nix.Parser (ParsedSource)
 import Nix.Store.Path (BadStorePath, StorePath, badStorePathText)
 import Nix.Store.Path.Internal (StorePath (StorePath))
-import qualified Text.Regex.TDFA as RE
-
--- ---------------------------------------------------------------------------
--- Compiled regex
--- ---------------------------------------------------------------------------
-
--- | Compiled regex with Eq/Show based on the source pattern bytes.
--- Carries the pre-compiled 'RE.Regex' alongside the original pattern
--- so that partial application of @builtins.match@ / @builtins.split@
--- avoids recompiling the same pattern on every invocation.  The pattern
--- is the raw byte string the regex was compiled from: upstream regexes
--- run over bytes, so byte-identical patterns are the sharing key.
-data CompiledRegex = CompiledRegex !ByteString RE.Regex
-
-instance Eq CompiledRegex where
-  CompiledRegex a _ == CompiledRegex b _ = a == b
-
-instance Show CompiledRegex where
-  show (CompiledRegex pat _) = "CompiledRegex " <> show pat
 
 -- ---------------------------------------------------------------------------
 -- String context
@@ -368,9 +348,6 @@ data NixValue
   | -- | Built-in function, dispatched by name, with the arguments a
     -- partial application has taken so far, first to last.
     VBuiltin !Text ![BuiltinArg]
-  | -- | Pre-compiled regex carried in a partially-applied builtin.
-    -- Internal only - never exposed to Nix code directly.
-    VCompiledRegex !CompiledRegex
   deriving (Eq, Show)
 
 -- | A string with dependency context: its bytes and their context.  Built
@@ -388,7 +365,7 @@ pattern VPath path <- VPathHeld path _
   where
     VPath path = VPathHeld path NotHeld
 
-{-# COMPLETE VInt, VFloat, VBool, VNull, VStr, VPath, VList, VAttrs, VLambda, VBuiltin, VCompiledRegex #-}
+{-# COMPLETE VInt, VFloat, VBool, VNull, VStr, VPath, VList, VAttrs, VLambda, VBuiltin #-}
 
 -- | Where a string or path value's bytes already are in the C data
 -- layer.  A value read from a cell, and a literal's value, carry the C
@@ -1232,9 +1209,6 @@ typeName val = case val of
   VLambda {} -> "a function"
   VBuiltin name [] -> "the built-in function '" <> name <> "'"
   VBuiltin name _ -> "the partially applied built-in function '" <> name <> "'"
-  -- Only ever an argument inside a 'VBuiltin', and carrying no primop
-  -- name, so it takes the name upstream gives the function type itself.
-  VCompiledRegex _ -> "a function"
 
 -- | @builtins.typeOf@: the name of upstream's @ValueType@, the
 -- classification its type checks compare (a lambda and a primop are both
@@ -1251,7 +1225,6 @@ typeOfValue val = case val of
   VAttrs _ -> "set"
   VLambda {} -> "lambda"
   VBuiltin _ _ -> "lambda"
-  VCompiledRegex _ -> "lambda"
 
 -- ---------------------------------------------------------------------------
 -- Evaluation monad

@@ -139,10 +139,6 @@ printAt options depth cell val = case val of
   VLambda {} -> pure (marker "lambda")
   VBuiltin name [] -> pure (marker ("primop " <> name))
   VBuiltin name _ -> pure (marker ("partially applied primop " <> name))
-  -- A compiled pattern exists only among the arguments of a partially
-  -- applied match or split and names neither, so it prints as upstream
-  -- prints an application whose primop it cannot name.
-  VCompiledRegex _ -> pure (marker "partially applied primop")
 
 -- | Upstream's @printAttrs@.  A set's attributes count toward the bound
 -- after the attributes of any set inside them, as upstream counts one
@@ -389,9 +385,6 @@ printAmbiguousAt cell val = case val of
   VLambda {} -> pure "<LAMBDA>"
   VBuiltin _ [] -> pure "<PRIMOP>"
   VBuiltin _ _ -> pure "<PRIMOP-APP>"
-  -- A compiled pattern exists only among the arguments of a partially
-  -- applied match or split, so it prints as that application does.
-  VCompiledRegex _ -> pure "<PRIMOP-APP>"
   where
     repeatedBytes = TE.encodeUtf8Builder repeatedMarker
     printAttribute (name, thunk) = do

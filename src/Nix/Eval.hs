@@ -23,7 +23,6 @@ module Nix.Eval
   ( -- * Values (re-exported from Types)
     NixValue (..),
     BuiltinArg (..),
-    CompiledRegex (..),
     Thunk (..),
 
     -- * Attribute sets (re-exported from Types)
@@ -153,7 +152,6 @@ import Nix.Eval.Types
     AttrSet (..),
     BuiltinArg (..),
     CAttrSet,
-    CompiledRegex (..),
     Env (..),
     EvalFormal (..),
     EvalFormals (..),
@@ -1502,33 +1500,10 @@ applyBuiltin name taken takeArg = case builtinArgModes name of
       let held = taken ++ [arg]
       if null later
         then executeBuiltin name held
-        else pure (VBuiltin name (precompileArgs name held))
+        else pure (VBuiltin name held)
     nextPosition (_ : before) _ (mode : later) = nextPosition before mode later
     nextPosition (_ : _) _ [] = arityError name
 {-# INLINE applyBuiltin #-}
-
--- | Pre-compile regex patterns at partial application time.
--- When builtins.match or builtins.split receives its first argument
--- (the pattern string), compile it immediately and store the compiled
--- RE.Regex in a VCompiledRegex, replacing the raw VStr.  The compiled
--- form is carried in VBuiltin's accumulated args and reused on every
--- subsequent application - zero recompilation.  Both builtins compile
--- the RAW pattern: match's whole-string requirement is a span check at
--- match time, not textual @^...$@ anchoring, which would misparse a
--- top-level alternation (@^a|b$@ is @(^a)|(b$)@).  A pattern with
--- context stays a string, which the builtin refuses once it has both
--- arguments, as upstream's does: compiling it would drop the context.
-precompileArgs :: Text -> [BuiltinArg] -> [BuiltinArg]
-precompileArgs "match" [ArgForced (VStr pat ctx)] | contextIsEmpty ctx = compiledRegexArg pat
-precompileArgs "split" [ArgForced (VStr pat ctx)] | contextIsEmpty ctx = compiledRegexArg pat
-precompileArgs _ args = args
-
--- | The single-element arg list for a regex builtin: the compiled pattern
--- if valid, the raw string otherwise (the error surfaces at execute time).
-compiledRegexArg :: BS.ByteString -> [BuiltinArg]
-compiledRegexArg pat = case cachedCompileRegex pat of
-  Just compiled -> [ArgForced (VCompiledRegex (CompiledRegex pat compiled))]
-  Nothing -> [ArgForced (VStr pat emptyContext)]
 
 -- | Apply a function value (lambda or builtin) to one argument, in a call
 -- frame of its own.  Used by higher-order builtins to invoke
@@ -2807,11 +2782,16 @@ builtinReplaceStrings _ _ other =
 -- Regex compilation cache
 -- ---------------------------------------------------------------------------
 
--- | Global regex compilation cache.  Keyed by the raw pattern bytes
--- (match and split share entries).  A memo of a pure function, so the one
--- process-wide table is safe to create outside any monad: a pattern
--- compiles to the same regex whether the cache answers or the compiler
--- does.  It holds no C memory.
+-- | Global regex compilation cache, the one place a compiled pattern
+-- lives: no value holds one, and @match@ and @split@ take their pattern
+-- as a string and compile it here on each call, as upstream keeps its
+-- compiled @std::regex@ in a cache keyed by the pattern rather than in
+-- the value of a partial application (@RegexCache@, primops.cc:4187-4206
+-- at 2.24.9).  Keyed by the raw pattern bytes (match and split share
+-- entries).  A memo of a pure function, so the one process-wide table is
+-- safe to create outside any monad: a pattern compiles to the same regex
+-- whether the cache answers or the compiler does.  It holds no C memory,
+-- so the collector over the C data layer has nothing in it to see.
 {-# NOINLINE regexCacheRef #-}
 regexCacheRef :: IORef (Map BS.ByteString RE.Regex)
 regexCacheRef = unsafePerformIO (newIORef Map.empty)
@@ -2858,13 +2838,11 @@ builtinMatch patternVal subject = do
     VStr str _ -> matchWithCompiled compiled str
     other -> throwEvalError ("builtins.match: expected a string, got " <> typeName other)
 
--- | The pattern of @match@ or @split@, compiled: as 'precompileArgs' left
--- it, or a string compiled now.  Upstream reads the pattern with
--- @forceStringNoCtx@ and compiles it before it forces the subject
--- (primops.cc:4216-4223 and :4293-4300 at 2.24.9), so a pattern with
--- context is refused.
+-- | The pattern of @match@ or @split@, compiled.  Upstream reads the
+-- pattern with @forceStringNoCtx@ and compiles it before it forces the
+-- subject (primops.cc:4216-4223 and :4293-4300 at 2.24.9), so a pattern
+-- with context is refused.
 compiledPattern :: (MonadEval m) => Text -> NixValue -> m RE.Regex
-compiledPattern _ (VCompiledRegex (CompiledRegex _ compiled)) = pure compiled
 compiledPattern reader patternVal = do
   pat <- structuredStringValue RefuseContext patternVal
   maybe (throwEvalError (reader <> ": invalid regex: " <> bytesToTextLossy pat)) pure (cachedCompileRegex pat)
@@ -3116,7 +3094,6 @@ valueToJSON (VPath p) = do
   pure (JsonString spText, ctx)
 valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
-valueToJSON (VCompiledRegex _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 
 -- | Upstream reads the string with nlohmann's parser (json-to-value.cc),
 -- which is what 'parseJsonWith' implements for the builder's @__json@ too:
@@ -5848,7 +5825,6 @@ valueToXML depth written val = case val of
   -- A primop, applied in part or not at all, is not a lambda, which
   -- upstream writes as unevaluated (its FIXME: primops are not serialized).
   VBuiltin _ _ -> leaf "unevaluated" []
-  VCompiledRegex _ -> leaf "unevaluated" []
   where
     leaf name attrs = pure (xmlEmpty depth name attrs, written)
 
