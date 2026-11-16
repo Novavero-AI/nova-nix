@@ -7,6 +7,9 @@
 -- 'renderJson' is identity, not presentation: every byte of it is
 -- nlohmann's.  'parseJson' is the way back, for the builder, which reads
 -- @__json@ out of a @.drv@ the way upstream's @nlohmann::json::parse@ does.
+-- 'parseJsonInto' hands each value to a t'JsonBuilder' as it reads it, an
+-- object's members in document order, for @builtins.fromJSON@, which
+-- upstream reads through nlohmann's SAX interface.
 module Nix.Json
   ( -- * Values
     Json (..),
@@ -18,8 +21,10 @@ module Nix.Json
 
     -- * Parsing
     IntegerRange (..),
+    JsonBuilder (..),
     parseJson,
     parseJsonWith,
+    parseJsonInto,
   )
 where
 
@@ -197,6 +202,41 @@ data IntegerRange
     NixRange
   deriving (Eq, Show)
 
+-- | What a parse makes of each value it reads, as nlohmann's SAX interface
+-- hands each to its consumer: an object's members arrive in the order the
+-- document gives them, a name given twice each time it appears, each with
+-- what its value was made into.
+data JsonBuilder a = JsonBuilder
+  { -- | @null@.
+    buildNull :: !a,
+    -- | @true@ or @false@.
+    buildBool :: !(Bool -> a),
+    -- | A number the parse reads as an integer.
+    buildInt :: !(Integer -> a),
+    -- | A number the parse reads as a float.
+    buildFloat :: !(Double -> a),
+    -- | A string, its escapes decoded.
+    buildString :: !(Text -> a),
+    -- | An array's elements, first to last.
+    buildArray :: !([a] -> a),
+    -- | An object's members, in document order.
+    buildObject :: !([(Text, a)] -> a)
+  }
+
+-- | Makes the 'Json' nlohmann's DOM parser makes: a name given twice
+-- keeps its last value, as the parser assigns each member in turn.
+jsonBuilder :: JsonBuilder Json
+jsonBuilder =
+  JsonBuilder
+    { buildNull = JsonNull,
+      buildBool = JsonBool,
+      buildInt = JsonInt,
+      buildFloat = JsonFloat,
+      buildString = JsonString,
+      buildArray = JsonArray,
+      buildObject = JsonObject . Map.fromList
+    }
+
 -- | Read one JSON document as nlohmann's @parse@ does: a single value with
 -- optional whitespace around it, a leading byte order mark skipped, and
 -- nothing after it.  A member name given twice keeps its last value, as
@@ -207,14 +247,24 @@ parseJson = parseJsonWith NlohmannRange
 
 -- | 'parseJson' over a chosen 'IntegerRange'.
 parseJsonWith :: IntegerRange -> Text -> Either Text Json
-parseJsonWith range input = do
-  (value, rest) <- parseValue range (skipSpace (dropByteOrderMark input))
+parseJsonWith range = parseJsonInto range jsonBuilder
+
+-- | 'parseJsonWith' handing each value it reads to a builder, as
+-- nlohmann's SAX interface does, rather than making a 'Json'.
+parseJsonInto :: IntegerRange -> JsonBuilder a -> Text -> Either Text a
+parseJsonInto range builder input = do
+  (value, rest) <- parseValue range builder (skipSpace (dropByteOrderMark input))
   let trailing = skipSpace rest
   if T.null trailing
     then Right value
     else Left ("unexpected content after the JSON value: " <> excerpt trailing)
   where
     dropByteOrderMark t = fromMaybe t (T.stripPrefix (T.singleton byteOrderMark) t)
+
+-- | A value a parse made and the input after it, the value forced, so a
+-- parse leaves no thunk of a builder's behind it.
+built :: a -> Text -> Either Text (a, Text)
+built !value rest = Right (value, rest)
 
 -- | U+FEFF, which nlohmann skips at the start of a document.
 byteOrderMark :: Char
@@ -235,44 +285,45 @@ excerptLength :: Int
 excerptLength = 20
 
 -- | One value, its leading whitespace already skipped.
-parseValue :: IntegerRange -> Text -> Either Text (Json, Text)
-parseValue range t = case T.uncons t of
+parseValue :: IntegerRange -> JsonBuilder a -> Text -> Either Text (a, Text)
+parseValue range builder t = case T.uncons t of
   Nothing -> Left "unexpected end of input, expected a JSON value"
-  Just ('{', rest) -> parseObject range (skipSpace rest)
-  Just ('[', rest) -> parseArray range (skipSpace rest)
+  Just ('{', rest) -> parseObject range builder (skipSpace rest)
+  Just ('[', rest) -> parseArray range builder (skipSpace rest)
   Just ('"', rest) -> do
     (s, afterString) <- parseString rest
-    pure (JsonString s, afterString)
-  Just ('t', _) -> literal "true" (JsonBool True)
-  Just ('f', _) -> literal "false" (JsonBool False)
-  Just ('n', _) -> literal "null" JsonNull
+    built (buildString builder s) afterString
+  Just ('t', _) -> literal "true" (buildBool builder True)
+  Just ('f', _) -> literal "false" (buildBool builder False)
+  Just ('n', _) -> literal "null" (buildNull builder)
   Just (c, _)
-    | c == '-' || isDigit c -> parseNumber range t
+    | c == '-' || isDigit c -> parseNumber range builder t
   Just _ -> Left ("unexpected " <> excerpt t <> ", expected a JSON value")
   where
     literal word value = case T.stripPrefix word t of
-      Just rest -> Right (value, rest)
+      Just rest -> built value rest
       Nothing -> Left ("invalid literal " <> excerpt t)
 
 -- | The elements of an array, after its @[@ and any whitespace.
-parseArray :: IntegerRange -> Text -> Either Text (Json, Text)
-parseArray range t = case T.uncons t of
-  Just (']', rest) -> Right (JsonArray [], rest)
+parseArray :: IntegerRange -> JsonBuilder a -> Text -> Either Text (a, Text)
+parseArray range builder t = case T.uncons t of
+  Just (']', rest) -> built (buildArray builder []) rest
   _ -> elements [] t
   where
     elements !acc s = do
-      (value, rest) <- parseValue range s
+      (value, rest) <- parseValue range builder s
       let after = skipSpace rest
       case T.uncons after of
         Just (',', more) -> elements (value : acc) (skipSpace more)
-        Just (']', more) -> Right (JsonArray (reverse (value : acc)), more)
+        Just (']', more) -> built (buildArray builder (reverse (value : acc))) more
         _ -> Left ("unexpected " <> excerpt after <> " in an array, expected ',' or ']'")
 
--- | The members of an object, after its @{@ and any whitespace.
-parseObject :: IntegerRange -> Text -> Either Text (Json, Text)
-parseObject range t = case T.uncons t of
-  Just ('}', rest) -> Right (JsonObject Map.empty, rest)
-  _ -> members Map.empty t
+-- | The members of an object, after its @{@ and any whitespace, in
+-- document order, a name given twice each time it appears.
+parseObject :: IntegerRange -> JsonBuilder a -> Text -> Either Text (a, Text)
+parseObject range builder t = case T.uncons t of
+  Just ('}', rest) -> built (buildObject builder []) rest
+  _ -> members [] t
   where
     members !acc s = case T.uncons s of
       Just ('"', afterQuote) -> do
@@ -280,12 +331,12 @@ parseObject range t = case T.uncons t of
         let beforeColon = skipSpace afterName
         case T.uncons beforeColon of
           Just (':', afterColon) -> do
-            (value, afterValue) <- parseValue range (skipSpace afterColon)
-            let updated = Map.insert name value acc
+            (value, afterValue) <- parseValue range builder (skipSpace afterColon)
+            let gathered = (name, value) : acc
                 after = skipSpace afterValue
             case T.uncons after of
-              Just (',', more) -> members updated (skipSpace more)
-              Just ('}', more) -> Right (JsonObject updated, more)
+              Just (',', more) -> members gathered (skipSpace more)
+              Just ('}', more) -> built (buildObject builder (reverse gathered)) more
               _ -> Left ("unexpected " <> excerpt after <> " in an object, expected ',' or '}'")
           _ -> Left ("unexpected " <> excerpt beforeColon <> " after a member name, expected ':'")
       _ -> Left ("unexpected " <> excerpt s <> " in an object, expected a member name")
@@ -369,8 +420,8 @@ codeUnit t =
 -- back; any other is a float (strtod, which 'readMaybe' matches: correctly
 -- rounded, infinite past the double range).  An infinite one is an error,
 -- nlohmann's out_of_range 406.
-parseNumber :: IntegerRange -> Text -> Either Text (Json, Text)
-parseNumber range t = do
+parseNumber :: IntegerRange -> JsonBuilder a -> Text -> Either Text (a, Text)
+parseNumber range builder t = do
   let (sign, afterSign) = case T.stripPrefix "-" t of
         Just rest -> ("-", rest)
         Nothing -> ("", t)
@@ -381,14 +432,14 @@ parseNumber range t = do
       asFloat = case readMaybe (T.unpack lexeme) of
         Just d
           | isInfinite d -> Left ("number overflow parsing '" <> lexeme <> "'")
-          | otherwise -> Right (JsonFloat d, afterExponent)
+          | otherwise -> built (buildFloat builder d) afterExponent
         Nothing -> Left ("invalid number " <> excerpt t)
   if T.null fraction && T.null exponentText
     then case readMaybe (T.unpack lexeme) of
       Just n
-        | n >= toInteger (minBound :: Int64) && n <= toInteger (maxBound :: Int64) -> Right (JsonInt n, afterExponent)
+        | n >= toInteger (minBound :: Int64) && n <= toInteger (maxBound :: Int64) -> built (buildInt builder n) afterExponent
         | n > toInteger (maxBound :: Int64) && n <= toInteger (maxBound :: Word64) -> case range of
-            NlohmannRange -> Right (JsonInt n, afterExponent)
+            NlohmannRange -> built (buildInt builder n) afterExponent
             NixRange -> Left ("unsigned json number " <> T.pack (show n) <> " outside of Nix integer range")
       _ -> asFloat
     else asFloat

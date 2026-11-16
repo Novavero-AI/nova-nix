@@ -147,7 +147,7 @@ import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printSymbol, printValue)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos)
 import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, stripIndentedChunks)
-import Nix.Eval.Symbol (Symbol (..), symbolText)
+import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Eval.Types
   ( AttrEntry (..),
     AttrSet (..),
@@ -169,6 +169,8 @@ import Nix.Eval.Types
     attrSetElems,
     attrSetFromEntries,
     attrSetFromMap,
+    attrSetFromSymbolEntries,
+    attrSetFromSymbols,
     attrSetKeys,
     attrSetLookup,
     attrSetLookupEntry,
@@ -222,7 +224,7 @@ import Nix.Expr.Types
     UnaryOp (..),
   )
 import Nix.Hash (FileIngestionMethod (..), base64HashLen, base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
-import Nix.Json (IntegerRange (..), Json (..), parseJsonWith, renderJson)
+import Nix.Json (IntegerRange (..), Json (..), JsonBuilder (..), parseJsonInto, renderJson)
 import Nix.Parser (ParsedSource)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
@@ -1865,16 +1867,18 @@ builtinAttrValues other =
 -- gives it.
 builtinListToAttrs :: (MonadEval m) => NixValue -> m NixValue
 builtinListToAttrs (VList cl) =
-  listThunks cl >>= foldM addListToAttrsElement Map.empty >>= fmap VAttrs . attrSetFromEntries SetListToAttrs
+  listThunks cl >>= foldM addListToAttrsElement Map.empty >>= fmap VAttrs . attrSetFromSymbolEntries SetListToAttrs
 builtinListToAttrs other =
   addErrorTrace (pure "while evaluating the argument passed to builtins.listToAttrs") (expectedFailure "a list" other)
 
 -- | Add one element of @listToAttrs@'s list to the attributes the elements
 -- before it made, whose names are the names seen.  The element is forced
--- to a set and its @name@ read; a name already seen keeps its attribute,
--- and a new one takes the element's @value@, unforced, at that attribute's
--- position, as upstream inserts it.
-addListToAttrsElement :: (MonadEval m) => Map Text AttrEntry -> Thunk -> m (Map Text AttrEntry)
+-- to a set and its @name@ read and interned, before the next element is
+-- read, as upstream interns it (primops.cc:2896 at 2.24.9), so names new
+-- to the symbol table take their place in list order.  A name already
+-- seen keeps its attribute, and a new one takes the element's @value@,
+-- unforced, at that attribute's position, as upstream inserts it.
+addListToAttrsElement :: (MonadEval m) => Map Symbol AttrEntry -> Thunk -> m (Map Symbol AttrEntry)
 addListToAttrsElement !made thunk = do
   attrs <-
     force thunk >>= \case
@@ -1884,8 +1888,9 @@ addListToAttrsElement !made thunk = do
   name <-
     addErrorTrace (pure "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs") $
       force nameThunk >>= attrNameOf "builtins.listToAttrs: attribute name"
+  sym <- symbolIntern name
   let newEntry = attrSetLookupEntry "value" attrs >>= maybe (missingPairAttr "value") pure
-  Map.alterF (maybe (Just <$> newEntry) (pure . Just)) name made
+  Map.alterF (maybe (Just <$> newEntry) (pure . Just)) sym made
 
 -- | A @listToAttrs@ element without the attribute, refused as upstream's
 -- @getAttr@ (primops.cc:641-651 at 2.24.9) refuses it: the message, and a
@@ -2222,24 +2227,32 @@ partitionThunks predFn = go [] []
         VBool False -> go rs (thunk : ws) rest
         _ -> throwEvalError "builtins.partition: predicate must return a bool"
 
+-- | Upstream's @prim_groupBy@ (primops.cc:3702-3728 at 2.24.9): each
+-- element joins the group its function names, and each group holds its
+-- elements in list order.
 builtinGroupBy :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGroupBy func (VList cl) = do
   thunks <- listThunks cl
   groups <- groupByCollect func thunks Map.empty
-  traverse (thunksList . reverse) groups >>= valuesSet SetGroupBy
+  traverse (thunksList . reverse >=> evaluated) groups >>= fmap VAttrs . attrSetFromSymbols SetGroupBy
 builtinGroupBy _ other =
   throwEvalError ("builtins.groupBy: expected a list, got " <> typeName other)
 
+-- | The groups, each holding its elements last first.  A group's name is
+-- interned before the function is called on the next element, as upstream
+-- interns it (primops.cc:3713), so names new to the symbol table take
+-- their place in list order.
 groupByCollect ::
   (MonadEval m) =>
   NixValue ->
   [Thunk] ->
-  Map Text [Thunk] ->
-  m (Map Text [Thunk])
+  Map Symbol [Thunk] ->
+  m (Map Symbol [Thunk])
 groupByCollect _ [] acc = pure acc
-groupByCollect func (thunk : rest) acc = do
+groupByCollect func (thunk : rest) !acc = do
   name <- applyValueLazy func thunk >>= attrNameOf "builtins.groupBy"
-  groupByCollect func rest (Map.insertWith (++) name [thunk] acc)
+  sym <- symbolIntern name
+  groupByCollect func rest (Map.insertWith (++) sym [thunk] acc)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - string (arity 2)
@@ -3118,16 +3131,17 @@ valueToJSON (VLambda {}) = throwEvalError "builtins.toJSON: cannot convert a fun
 valueToJSON (VBuiltin _ _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 valueToJSON (VCompiledRegex _) = throwEvalError "builtins.toJSON: cannot convert a function to JSON"
 
--- | Upstream reads the string with nlohmann's parser (json-to-value.cc),
--- which is what 'parseJsonWith' implements for the builder's @__json@ too:
--- strict RFC 8259, so a trailing comma, a raw control character or a lone
--- surrogate is refused.  'NixRange' keeps every integer a 'VInt' can hold.
+-- | Upstream reads the string with nlohmann's SAX parser (json-to-value.cc),
+-- whose grammar 'parseJsonInto' implements, as it does for the builder's
+-- @__json@: strict RFC 8259, so a trailing comma, a raw control character
+-- or a lone surrogate is refused.  'NixRange' keeps every integer a 'VInt'
+-- can hold.
 builtinFromJSON :: (MonadEval m) => NixValue -> m NixValue
 builtinFromJSON val = do
   s <- structuredStringValue RefuseContext val
   -- JSON input must be valid UTF-8 (upstream's parser rejects it too).
   decoded <- decodedText "builtins.fromJSON" s
-  either throwEvalError jsonToValue (parseJsonWith NixRange decoded)
+  either throwEvalError id (parseJsonInto NixRange fromJSONBuilder decoded)
 
 parseHex4 :: Text -> Maybe (Int, Text)
 parseHex4 t
@@ -3141,15 +3155,29 @@ parseHex4 t
 readHex4 :: Text -> Int
 readHex4 = T.foldl' (\acc c -> acc * 16 + digitToInt c) 0
 
-jsonToValue :: (MonadCData m) => Json -> m NixValue
-jsonToValue json = case json of
-  JsonNull -> pure VNull
-  JsonBool b -> pure (VBool b)
-  JsonInt n -> pure (VInt (fromInteger n))
-  JsonFloat d -> pure (VFloat d)
-  JsonString str -> pure (mkStr str)
-  JsonArray items -> mapM jsonToValue items >>= valuesList
-  JsonObject members -> traverse jsonToValue members >>= valuesSet SetFromJSON
+-- | The value upstream's SAX consumer, @JSONSax@ (json-to-value.cc at
+-- 2.24.9), makes of each JSON value.  An object interns a member's name as
+-- the parse reaches it, before the names in the member's value (:50-52),
+-- so names new to the symbol table take their place in document order.
+-- A name the object repeats keeps the symbol its first occurrence took
+-- and takes its last value, as @insert_or_assign@ assigns it; the value it
+-- replaces is still made, and the names in it interned.
+fromJSONBuilder :: (MonadCData m) => JsonBuilder (m NixValue)
+fromJSONBuilder =
+  JsonBuilder
+    { buildNull = pure VNull,
+      buildBool = pure . VBool,
+      buildInt = pure . VInt . fromInteger,
+      buildFloat = pure . VFloat,
+      buildString = pure . mkStr,
+      buildArray = sequence >=> valuesList,
+      buildObject = foldM addMember Map.empty >=> fmap VAttrs . attrSetFromSymbols SetFromJSON
+    }
+  where
+    addMember !made (name, makeValue) = do
+      sym <- symbolIntern name
+      thunk <- makeValue >>= evaluated
+      pure (Map.insert sym thunk made)
 
 -- | Upstream reads the algorithm with @forceStringNoCtx@ before it forces
 -- the string hashed, whose context it discards (primops.cc:4070-4075 at

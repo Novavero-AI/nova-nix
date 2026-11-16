@@ -333,6 +333,18 @@ refusedAtPosition "the empty name as a static symbol" '({ }: null) { zz = 1; "" 
 refusedAtPosition "the first missing argument in symbol order" '({ aa, value }: 1) { }' "from call site"
 echo
 
+# listToAttrs, groupBy and fromJSON intern each name of the set they build as
+# they meet it, rather than in name order, so the argument a call names and
+# the pair a set comparison decides at are the first the builtin met.
+# Neither evaluator interns these names at startup.
+echo "== the order a builtin interns the names of a set it builds =="
+refusedAtPosition "listToAttrs in list order" '({ }: null) (builtins.listToAttrs [ { name = "zb"; value = 1; } { name = "za"; value = 2; } ])' "from call site"
+refusedAtPosition "groupBy in the order its function names the groups" '({ }: null) (builtins.groupBy (x: x) [ "zb" "za" ])' "from call site"
+refusedAtPosition "fromJSON in document order" '({ }: null) (builtins.fromJSON "{\"zb\": 1, \"za\": 2}")' "from call site"
+refusedAtPosition "fromJSON a member's name before the names in its value" '({ }: null) (let j = builtins.fromJSON "{\"zb\": {\"za\": 1}}"; in j // builtins.head (builtins.attrValues j))' "from call site"
+refused "a set comparison over two sets listToAttrs built" 'builtins.listToAttrs [ { name = "zb"; value = throw "b"; } { name = "za"; value = 1; } ] == builtins.listToAttrs [ { name = "zb"; value = 1; } { name = "za"; value = throw "a"; } ]'
+echo
+
 echo "== when builtins.addErrorContext forces its message =="
 check "not when its value evaluates" 'builtins.addErrorContext (throw "a") 1'
 check "a throw inside it stays catchable" '(builtins.tryEval (builtins.addErrorContext "c" (throw "x"))).success'

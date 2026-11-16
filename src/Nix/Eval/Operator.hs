@@ -293,10 +293,12 @@ nixEqual _ _ _ = pure False
 -- so no value past it is forced.  Upstream's @Bindings@ are sorted by
 -- @Symbol@, whose id is the order its table interned the name in
 -- (attr-set.hh and symbol-table.hh), and the arrays here are sorted by
--- symbol id the same way.  Two sets therefore compare in upstream's order,
--- since this table interns names in the order upstream's does: its startup
--- names first ('Nix.Eval.StartupSymbols'), then each name where upstream's
--- parser interns it, and no string value at all.
+-- symbol id the same way.  Two sets therefore compare in upstream's order
+-- wherever the two tables interned the sets' names in one order: the
+-- startup names first ('Nix.Eval.StartupSymbols'), each name in source
+-- where upstream's parser interns it, and each name @listToAttrs@,
+-- @groupBy@ and @fromJSON@ make where those builtins intern it upstream.
+-- No string value takes a symbol in either.
 attrsEqualFrom :: (MonadEval m) => Force m -> AttrSet -> AttrSet -> Int -> m Bool
 attrsEqualFrom forceFn as bs i = do
   entryA <- attrSetAt as i

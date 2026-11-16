@@ -107,7 +107,7 @@ import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFi
 import qualified Nix.Hash as Hash
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, ioRetryEffects, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
-import Nix.Json (Json (..), parseJson, renderJson)
+import Nix.Json (IntegerRange (..), Json (..), JsonBuilder (..), parseJson, parseJsonInto, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope, parsedExpr, parsedNames)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), PushSummary (..), checkRecordedNarHash, computeClosure, defaultPartSize, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPartSize, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, partSizeBytes, planMissing, preparePath, pushPaths, splitParts, storePathBasename, stripHashPrefix)
@@ -6937,6 +6937,21 @@ testStructuredAttrs = do
           "parse-object"
           (Right (JsonObject (Map.fromList [("a", JsonArray [JsonInt 2, JsonNull])])))
           (parseJson "\65279 \n{ \"a\" : 1 , \"a\":[ 2 ,null ] }\r\n"),
+      runTest "JSON parsing hands a builder each object's members in document order, a repeated name each time" $
+        let memberNames =
+              JsonBuilder
+                { buildNull = [],
+                  buildBool = const [],
+                  buildInt = const [],
+                  buildFloat = const [],
+                  buildString = const [],
+                  buildArray = concat,
+                  buildObject = concatMap (uncurry (:))
+                }
+         in assertEqual
+              "parse-member-order"
+              (Right ["zb", "zc", "za", "zd", "zb"])
+              (parseJsonInto NixRange memberNames "{\"zb\":{\"zc\":1},\"za\":[{\"zd\":null}],\"zb\":2}"),
       runTest "JSON parsing refuses what nlohmann refuses" $
         foldr
           (\bad acc -> assertLeft ("parse-refuses " <> bad) (parseJson bad) `andThen` acc)
@@ -24208,19 +24223,77 @@ testStringsOffSymbolsIO = do
             ++ ["allOutputs"]
         )
         ["zs", "zi", "zj", "zu", "zp", "zq", "zn", "zl", "zc"],
-      -- Upstream interns the names a set built at run time takes as it
-      -- builds it (prim_listToAttrs, primops.cc:2889-2896 at 2.24.9), so the
-      -- first in symbol order is the first in the list.  The strings
-      -- evaluated before, in the other order, take no symbol.
+      -- Upstream's listToAttrs interns each element's name as it reads it
+      -- (prim_listToAttrs, primops.cc:2896 at 2.24.9), so the first in
+      -- symbol order is the first in the list, here the last by name.  The
+      -- strings evaluated before, in name order, take no symbol.
       emits
         "string values equal to a set's names do not decide its order"
-        "let early = builtins.concatStringsSep \",\" [ (\"z\" + \"b\") (\"z\" + \"a\") ]; in builtins.seq early (({ }: null) (builtins.listToAttrs [ { name = \"z\" + \"a\"; value = 1; } { name = \"z\" + \"b\"; value = 2; } ]))"
-        ["error: function 'anonymous lambda' called with unexpected argument 'za'"],
+        "let early = builtins.concatStringsSep \",\" [ (\"z\" + \"a\") (\"z\" + \"b\") ]; in builtins.seq early (({ }: null) (builtins.listToAttrs [ { name = \"z\" + \"b\"; value = 1; } { name = \"z\" + \"a\"; value = 2; } ]))"
+        ["error: function 'anonymous lambda' called with unexpected argument 'zb'"],
       emits
         "a string literal equal to a set's name does not decide its order"
-        "let early = [ \"zb\" \"za\" ]; in builtins.seq (builtins.deepSeq early early) (({ }: null) (builtins.listToAttrs [ { name = \"z\" + \"a\"; value = 1; } { name = \"z\" + \"b\"; value = 2; } ]))"
-        ["error: function 'anonymous lambda' called with unexpected argument 'za'"]
+        "let early = [ \"za\" \"zb\" ]; in builtins.seq (builtins.deepSeq early early) (({ }: null) (builtins.listToAttrs [ { name = \"z\" + \"b\"; value = 1; } { name = \"z\" + \"a\"; value = 2; } ]))"
+        ["error: function 'anonymous lambda' called with unexpected argument 'zb'"]
     ]
+
+-- | @listToAttrs@, @groupBy@ and @fromJSON@ intern each name of the set
+-- they build where upstream's do, as they meet it: @listToAttrs@ an
+-- element's name before it reads the next element (primops.cc:2896 at
+-- 2.24.9), @groupBy@ the name its function returns before it calls the
+-- function again (:3713), and @fromJSON@ a member's name before its value
+-- (json-to-value.cc:50-52).
+-- The first name in symbol order is the unexpected argument a call names
+-- and the pair @==@ decides at first, so each case runs in a child
+-- process, whose symbol table holds the startup names alone, none of
+-- these.  Each list and document gives its names out of name order.
+testBuilderInterningIO :: IO [Bool]
+testBuilderInterningIO = do
+  putStrLn "eval/builder-interning-io"
+  sequence
+    [ emits
+        "listToAttrs interns names in list order"
+        "({ }: null) (builtins.listToAttrs [ { name = \"zb\"; value = 1; } { name = \"za\"; value = 2; } ])"
+        [unexpected "zb"],
+      -- The second element's name interns za as it evaluates, so zb is
+      -- first only if it was interned when the first element was read.
+      emits
+        "listToAttrs interns a name before it reads the next element"
+        "({ }: null) (builtins.listToAttrs [ { name = \"zb\"; value = 1; } { name = builtins.head (builtins.attrNames (builtins.listToAttrs [ { name = \"za\"; value = 1; } ])); value = 2; } ])"
+        [unexpected "zb"],
+      emits
+        "groupBy interns names in list order"
+        "({ }: null) (builtins.groupBy (x: x) [ \"zb\" \"za\" ])"
+        [unexpected "zb"],
+      emits
+        "groupBy interns a name before it calls its function again"
+        "({ }: null) (builtins.groupBy (x: if x == \"zb\" then x else builtins.head (builtins.attrNames (builtins.listToAttrs [ { name = x; value = 1; } ]))) [ \"zb\" \"za\" ])"
+        [unexpected "zb"],
+      emits
+        "fromJSON interns names in document order"
+        "({ }: null) (builtins.fromJSON \"{\\\"zb\\\": 1, \\\"za\\\": 2}\")"
+        [unexpected "zb"],
+      emits
+        "fromJSON interns a member's name before the names in its value"
+        "({ }: null) (let j = builtins.fromJSON \"{\\\"zb\\\": {\\\"za\\\": 1}}\"; in j // builtins.head (builtins.attrValues j))"
+        [unexpected "zb"],
+      -- The values are read through attrValues, which lists them by name,
+      -- since a name written in source is interned as it parses.
+      emits
+        "fromJSON gives a repeated name its first place and its last value"
+        "let j = builtins.fromJSON \"{\\\"zb\\\": 1, \\\"za\\\": 2, \\\"zb\\\": 3}\"; in builtins.trace (builtins.attrValues j) (({ }: null) j)"
+        ["trace: [ 2 3 ]", unexpected "zb"],
+      emits
+        "fromJSON interns the names in a value a repeated name replaces"
+        "let j = builtins.fromJSON \"{\\\"zc\\\": {\\\"zb\\\": 1}, \\\"zc\\\": 2, \\\"za\\\": 3}\"; in builtins.seq j (({ }: null) (builtins.listToAttrs [ { name = \"za\"; value = 1; } { name = \"zb\"; value = 2; } ]))"
+        [unexpected "zb"],
+      emits
+        "== decides at the pair whose name listToAttrs met first"
+        "builtins.listToAttrs [ { name = \"zb\"; value = throw \"b\"; } { name = \"za\"; value = 1; } ] == builtins.listToAttrs [ { name = \"zb\"; value = 1; } { name = \"za\"; value = throw \"a\"; } ]"
+        ["error: b"]
+    ]
+  where
+    unexpected name = "error: function 'anonymous lambda' called with unexpected argument '" <> name <> "'"
 
 -- | A string's bytes are made once and shared by every cell that holds
 -- the string, as upstream copies a @Value@ with the pointer to its bytes
@@ -28177,6 +28250,7 @@ runSuite = do
           testStartupSymbolsIO,
           testCallErrorsIO,
           testStringsOffSymbolsIO,
+          testBuilderInterningIO,
           testStringSharing,
           testTraceVerboseOff,
           testStorePathLinksIO,
