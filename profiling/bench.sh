@@ -734,7 +734,7 @@ write_memory() {
     scoreboard_row "GHC heap when the slice ends, by -hT" "not measured" "$(figure_or "$(mib "$theirs")" "Boehm heap" "")"
   fi
   if [[ -s "$census" ]]; then
-    for kind in thunks envs attrsets lists lambdas ctxstrs strings symbols; do
+    for kind in thunks envs attrsets lists lambdas primopapps ctxstrs strings symbols; do
       allocated_count=$(named_value "$census" "$kind.allocated.count")
       allocated_bytes=$(named_value "$census" "$kind.allocated.bytes")
       reached_count=$(named_value "$census" "$kind.reached.count")
@@ -747,6 +747,7 @@ write_memory() {
         attrsets) noun="attribute sets"; theirs=$(objects_figure "$(upstream_stat "$stats" .sets.number)" "$(upstream_stat "$stats" .sets.bytes)" sets) ;;
         lists) noun="list headers"; theirs=$(objects_figure "$(upstream_stat "$stats" .list.elements)" "$(upstream_stat "$stats" .list.bytes)" elements) ;;
         lambdas) noun="lambdas"; theirs="" ;;
+        primopapps) noun="partially applied builtins"; theirs="" ;;
         ctxstrs) noun="strings with context"; theirs="" ;;
         strings) noun="strings"; theirs="" ;;
         symbols) noun="symbols"; theirs=$(objects_figure "$(upstream_stat "$stats" .symbols.number)" "$(upstream_stat "$stats" .symbols.bytes)" symbols) ;;
@@ -754,8 +755,6 @@ write_memory() {
       scoreboard_row "C $noun: allocated" "$(objects_figure "$allocated_count" "$allocated_bytes" "$noun")" "$theirs"
       scoreboard_row "C $noun: no root reaches" "$(unreached_figure "$allocated_bytes" "$reached_bytes" "$reached_count" "$noun")" ""
     done
-    scoreboard_row "C StablePtrs the thunks hold" \
-      "$(named_value "$census" stableptrs.held), $(named_value "$census" stableptrs.reached) reached" ""
     scoreboard_row "C allocator overhead (headers, unused tails, tracking arrays, symbol tables)" \
       "$(mib "$(named_value "$census" overhead.bytes)")" ""
     scoreboard_row "C bytecode" "$(mib "$(named_value "$census" code.bytes)")" \

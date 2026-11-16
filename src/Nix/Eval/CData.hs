@@ -31,12 +31,13 @@
 --   with them, and a debugger shows them.
 -- * 'runCDataPure' runs a whole computation as a value: a pure
 --   evaluation ('Nix.Eval.Types.runPureEval'), and the cells made once
---   for the process: the @derivation@ wrapper and the builtin functions'
---   cells in "Nix.Builtins", and the empty list's cell
---   ('Nix.Eval.Types.cheapThunkBc').  Such a computation writes only
---   memory it allocated, and the with-scope array entries it resolves
---   ('Nix.Eval.Types.resolveWithScopeAt'), each from a set's thunk to
---   the set the thunk evaluates to.  Two runs that resolve one entry
+--   for the process: the @derivation@ wrapper in "Nix.Builtins", and the
+--   empty list's cell ('Nix.Eval.Types.cheapThunkBc').  Such a
+--   computation writes only memory it allocated, the with-scope array
+--   entries it resolves ('Nix.Eval.Types.resolveWithScopeAt'), each from
+--   a set's thunk to the set the thunk evaluates to, and the static cell
+--   of a builtin it binds ('Nix.Eval.CThunk.cthunkPrimop'), which it
+--   fills with the one value that cell ever holds.  Two runs that resolve one entry
 --   make two sets with the same contents in different cells, so a value
 --   carried from one run into another can meet the other run's set where
 --   it would have met its own, which the repeated marker and @==@'s
@@ -108,9 +109,9 @@ inspectForDisplay :: CData a -> a
 inspectForDisplay (CData io) = unsafePerformIO io
 
 -- | Run a computation that allocates as a value.  Sound for a computation
--- that writes only memory it allocated, and with-scope entries it
--- resolves, with what two runs resolving one entry can show (see the
--- module header): each run allocates memory of its own, and a run GHC
+-- that writes only memory it allocated, with-scope entries it resolves,
+-- with what two runs resolving one entry can show, and builtins' static
+-- cells, which every run fills alike (see the module header): each run allocates memory of its own, and a run GHC
 -- shares or never makes is not observable except through the addresses
 -- of the values it returns.
 runCDataPure :: CData a -> a

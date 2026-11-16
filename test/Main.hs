@@ -78,7 +78,7 @@ import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
-import Nix.Eval.Builtin (builtinName, builtinNamed)
+import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
@@ -88,7 +88,7 @@ import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsTy
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
 import Nix.Eval.CStr (cstrNew)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBool, cthunkGetCtxStr, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBool, cthunkGetCtxStr, cthunkGetInt, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
@@ -1617,6 +1617,11 @@ censusCellBytes = 16
 censusHeaderBytes = 16
 censusPointerBytes = 8
 
+-- | The bytes of a partial application's header before its argument
+-- cells: @sizeof (nn_primop_app_t)@ of @cbits/nn_primop.h@.
+primopAppHeaderBytes :: Word64
+primopAppHeaderBytes = 8
+
 -- | The bytes of an env's header word and of the scopes an env with a
 -- lazy scope or with-scopes has: @NN_ENV_HEADER_BYTES@ and
 -- @NN_ENV_SCOPES_BYTES@ of @cbits/nn_env.h@.  Its slots and its parent
@@ -1710,12 +1715,17 @@ testCensus = do
             second <- censusOf [RootThunk (Thunk root)]
             let figures c = (censusAllocated c, censusReached c, censusVisitedObjects c, censusSetSizes c)
             pure (fmap figures first QC.=== fmap figures second),
-      runTestM "a census follows a value behind a StablePtr to the cells it holds" $ do
+      runTestM "a census follows a partial application in C to the cells it holds" $ do
         inner <- cthunkNewComputedInt 7
         held <- evaluated (VBuiltin Builtin.Map [ArgDeferred (Thunk inner)])
         withCensus [RootThunk held] $ \census ->
           assertEqual "thunks" (Figures (Just 2) (2 * censusCellBytes)) (kindThunks (censusReached census))
-            `andThen` assertEqual "StablePtrs reached" 1 (censusStablePtrsReached census)
+            `andThen` assertEqual "partial applications" (Figures (Just 1) (primopAppHeaderBytes + censusPointerBytes)) (kindPrimopApps (censusReached census))
+            `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
+      runTestM "a census reaches a builtin's own cell without counting it, as it does the null cell" $ do
+        own <- cthunkPrimop (builtinIndex Builtin.Map)
+        withCensus [RootThunk (Thunk own)] $ \census ->
+          assertEqual "thunks" (Figures (Just 0) 0) (kindThunks (censusReached census))
             `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
       runTestM "a partial application holds its deferred argument as a cell, which a census follows without making one" $ do
         result <- evalNixIO tmpBase "let f = map (x: x); in builtins.seq f { inherit f; }"
@@ -1723,7 +1733,7 @@ testCensus = do
           Left failure -> pure (Fail failure)
           Right value -> withCensus (valueRoots value) $ \census ->
             assertEqual "unplaced" 0 (censusUnplaced census)
-              `andThen` assertEqual "StablePtrs reached" True (censusStablePtrsReached census >= 1),
+              `andThen` assertEqual "partial applications reached" True (figuresCount (kindPrimopApps (censusReached census)) >= Just 1),
       runTestM "a census follows a pending thunk to its env and the env's slots" $ do
         cells <- mapM cthunkNewComputedInt [1, 2, 3]
         env <- newEnv EnvApply Nothing (map Thunk cells)
@@ -1858,8 +1868,6 @@ testCensus = do
           censusReached = pure (Figures (Just 1) 16),
           censusOverheadBytes = 5,
           censusCodeBytes = 6,
-          censusStablePtrs = 7,
-          censusStablePtrsReached = 8,
           censusVisitedObjects = 9,
           censusVisitedBytes = 10,
           censusUnplaced = 0,
@@ -1879,12 +1887,10 @@ testCensus = do
         ( concat
             [ [name <> ".allocated.count 3" | name /= "envs"]
                 ++ [name <> ".allocated.bytes " <> (if name == "envs" then "96" else "48"), name <> ".reached.count 1", name <> ".reached.bytes 16"]
-            | name <- ["thunks", "envs", "attrsets", "lists", "lambdas", "ctxstrs", "strings", "symbols"]
+            | name <- ["thunks", "envs", "attrsets", "lists", "lambdas", "primopapps", "ctxstrs", "strings", "symbols"]
             ]
             ++ [ "overhead.bytes 5",
                  "code.bytes 6",
-                 "stableptrs.held 7",
-                 "stableptrs.reached 8",
                  "mark.objects 9",
                  "mark.bytes 10",
                  "mark.unplaced 0",
@@ -25242,20 +25248,17 @@ testCThunk = do
         state <- cthunkState ptr
         pure (assertEqual "state" 0 state),
       runTestM "new computed + state" $ do
-        sp <- newStablePtr ("computed" :: Text)
-        ptr <- cthunkNewComputed (castStablePtrToPtr sp)
+        ptr <- cthunkNewComputedInt 7
         state <- cthunkState ptr
         pure (assertEqual "state" 1 state),
       runTestM "payload round-trips (pending)" $ do
         ptr <- cthunkNewBc 0 pendingEnv
         payload <- cthunkPayload ptr
         pure (assertEqual "payload" pendingEnv payload),
-      runTestM "payload round-trips (computed)" $ do
-        sp <- newStablePtr (42 :: Int)
-        ptr <- cthunkNewComputed (castStablePtrToPtr sp)
-        payload <- cthunkPayload ptr
-        val <- deRefStablePtr (castPtrToStablePtr payload) :: IO Int
-        pure (assertEqual "payload" 42 val),
+      runTestM "an inline value round-trips (computed)" $ do
+        ptr <- cthunkNewComputedInt 42
+        val <- cthunkGetInt ptr
+        pure (assertEqual "value" 42 val),
       runTestM "mark_blackhole succeeds on pending" $ do
         ptr <- cthunkNewBc 0 pendingEnv
         ok <- cthunkMarkBlackhole ptr
@@ -25266,8 +25269,7 @@ testCThunk = do
               else Fail ("ok=" <> T.pack (show ok) <> " state=" <> T.pack (show state))
           ),
       runTestM "mark_blackhole fails on computed" $ do
-        sp <- newStablePtr ("x" :: Text)
-        ptr <- cthunkNewComputed (castStablePtrToPtr sp)
+        ptr <- cthunkNewComputedInt 1
         ok <- cthunkMarkBlackhole ptr
         pure (if not ok then Pass else Fail "should have failed"),
       runTestM "mark_blackhole fails on blackhole" $ do
@@ -25278,43 +25280,38 @@ testCThunk = do
       runTestM "set_computed stores into a blackhole" $ do
         ptr <- cthunkNewBc 0 pendingEnv
         _ <- cthunkMarkBlackhole ptr
-        computedSp <- newStablePtr ("new" :: Text)
-        stored <- cthunkSetComputed ptr (castStablePtrToPtr computedSp)
+        stored <- cthunkSetComputedInt ptr 5
         state <- cthunkState ptr
-        newPayload <- cthunkPayload ptr
-        newVal <- deRefStablePtr (castPtrToStablePtr newPayload) :: IO Text
+        newVal <- cthunkGetInt ptr
         pure
-          ( if stored && newVal == "new" && state == 1
+          ( if stored && newVal == 5 && state == 1
               then Pass
-              else Fail ("stored=" <> T.pack (show stored) <> " new=" <> newVal <> " state=" <> T.pack (show state))
+              else Fail ("stored=" <> T.pack (show stored) <> " new=" <> T.pack (show newVal) <> " state=" <> T.pack (show state))
           ),
       -- set_computed accepts PENDING (direct memoization, no blackhole step)
       runTestM "set_computed stores into a pending thunk" $ do
         ptr <- cthunkNewBc 0 pendingEnv
-        valSp <- newStablePtr ("v" :: Text)
-        stored <- cthunkSetComputed ptr (castStablePtrToPtr valSp)
+        stored <- cthunkSetComputedInt ptr 3
         pure (if stored then Pass else Fail "refused a PENDING thunk"),
       runTestM "set_computed refuses a computed thunk and keeps its value" $ do
-        firstSp <- newStablePtr ("first" :: Text)
-        ptr <- cthunkNewComputed (castStablePtrToPtr firstSp)
-        secondSp <- newStablePtr ("second" :: Text)
-        stored <- cthunkSetComputed ptr (castStablePtrToPtr secondSp)
-        payload <- cthunkPayload ptr
-        kept <- deRefStablePtr (castPtrToStablePtr payload) :: IO Text
-        freeStablePtr secondSp
+        ptr <- cthunkNewComputedInt 1
+        stored <- cthunkSetComputedInt ptr 2
+        kept <- cthunkGetInt ptr
         pure
-          ( if not stored && kept == "first"
+          ( if not stored && kept == 1
               then Pass
-              else Fail ("stored=" <> T.pack (show stored) <> " kept=" <> kept)
+              else Fail ("stored=" <> T.pack (show stored) <> " kept=" <> T.pack (show kept))
           ),
       -- The shared cells are one static each for the whole process, so a
-      -- transition that ran on one would change every null or boolean.
-      runTestM "the shared null and boolean cells refuse every transition" $ do
-        let cells = [cthunkNull, cthunkBool True, cthunkBool False]
+      -- transition that ran on one would change every null, boolean or
+      -- builtin bound under its own name.
+      runTestM "the shared null, boolean and builtin cells refuse every transition" $ do
+        builtinCells <- mapM (cthunkPrimop . builtinIndex) [Builtin.Abort, Builtin.ZipAttrsWith]
+        let cells = [cthunkNull, cthunkBool True, cthunkBool False] ++ builtinCells
         marked <- mapM cthunkMarkBlackhole cells
-        stored <- mapM (`cthunkSetComputed` nullPtr) cells
+        stored <- mapM cthunkSetComputedNull cells
         values <- mapM (readThunkValue . Thunk) cells
-        let expected = map Just [VNull, VBool True, VBool False]
+        let expected = map Just [VNull, VBool True, VBool False, VBuiltin Builtin.Abort [], VBuiltin Builtin.ZipAttrsWith []]
         pure
           ( if not (or (marked ++ stored)) && values == expected
               then Pass
@@ -25324,8 +25321,7 @@ testCThunk = do
         countBefore <- cthunkCount
         _ <- cthunkNewBc 0 pendingEnv
         _ <- cthunkNewBc 0 pendingEnv
-        sp <- newStablePtr (0 :: Int)
-        _ <- cthunkNewComputed (castStablePtrToPtr sp)
+        _ <- cthunkNewComputedInt 0
         countAfter <- cthunkCount
         let delta = countAfter - countBefore
         pure (assertEqual "delta" 3 delta),
@@ -25358,12 +25354,50 @@ testCThunk = do
                       <> " midState="
                       <> T.pack (show midState)
                   )
-          )
+          ),
+      runTestM "every builtin's own cell holds that builtin, with no argument taken" $ do
+        held <- mapM (\builtin -> (,) builtin <$> (cthunkPrimop (builtinIndex builtin) >>= readThunkValue . Thunk)) [minBound .. maxBound]
+        let wrong = [builtinName builtin | (builtin, value) <- held, value /= Just (VBuiltin builtin [])]
+        pure (if null wrong then Pass else Fail ("wrong cells: " <> T.intercalate ", " wrong)),
+      runTestM "a builtin value a cell holds reads back as itself, each argument as it was taken" $
+        quickCheckPasses $
+          QC.forAll genBuiltinValue $ \(builtin, arguments) -> QC.ioProperty $ do
+            taken <- traverse takenArgument arguments
+            let value = VBuiltin builtin taken
+            stored <- evaluated value >>= readThunkValue
+            pure (stored QC.=== Just value),
+      -- Each binding's thunk memoizes a partial application in its cell:
+      -- f holds a function taken forced, g also an argument held as a
+      -- thunk, m a pattern, and t is a builtin with nothing taken.  Each
+      -- is read back from its cell at every call.
+      runTestM "a partial application a binding memoizes is applied as it was taken" $ do
+        tmpBase <- getTemporaryDirectory
+        result <-
+          evalNixIO
+            tmpBase
+            "let f = builtins.foldl' (a: b: a + b); g = f 10; m = builtins.match \"a(.)\"; t = builtins.tryEval; in [ (g [ 1 2 ]) (g [ ]) (f 0 [ 5 ]) (m \"ab\") (m \"x\") (t (throw \"x\")).success ] == [ 13 10 5 [ \"b\" ] null false ]"
+        pure (assertEqual "result" (Right (VBool True)) result)
     ]
   where
     -- These cells are never forced, so the shared empty env serves as the
     -- env their code would run in.
     pendingEnv = case emptyEnv of Env envPtr -> castPtr envPtr
+    takenArgument (Left n) = pure (ArgForced (VInt n))
+    takenArgument (Right n) = ArgDeferred . Thunk <$> cthunkNewComputedInt n
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+
+-- | A builtin and the arguments a partial application of it holds: each
+-- an integer taken forced ('Left') or held in a cell of its own
+-- ('Right').  Up to two, the most any builtin's partial application
+-- takes, and any builtin, since a cell holds what it is given.
+genBuiltinValue :: QC.Gen (Builtin, [Either Int64 Int64])
+genBuiltinValue = do
+  builtin <- QC.elements [minBound .. maxBound]
+  count <- QC.chooseInt (0, 2)
+  arguments <- QC.vectorOf count (QC.oneof [Left <$> QC.arbitrary, Right <$> QC.arbitrary])
+  pure (builtin, arguments)
 
 -- ---------------------------------------------------------------------------
 -- Bytecode compilation tests

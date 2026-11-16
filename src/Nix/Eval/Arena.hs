@@ -2,10 +2,8 @@
 --
 -- Initializes and destroys all C sub-arenas (symbol table, string arena,
 -- thunk arena, env slot allocator, bytecode store) with a single pair of
--- calls.
--- Handles StablePtr cleanup on destruction: iterates all thunks,
--- identifies payloads that are Haskell StablePtrs (COMPUTED\/PTR), and
--- frees them before tearing down the C memory.
+-- calls.  Every value lives in C, so tearing the arenas down frees an
+-- evaluation's values whole, with nothing in GHC's heap to release.
 --
 -- Everything that evaluates runs between the two calls:
 --
@@ -26,8 +24,8 @@
 -- process, because GHC updates a thunk whose evaluation raised with that
 -- exception: any shared value whose evaluation reached C before the
 -- window re-raises it inside a later, live arena.  The @null@, @true@
--- and @false@ thunks are C statics outside every arena, so forcing one
--- needs no window and survives every cycle.
+-- and @false@ thunks and each builtin's own cell are C statics outside
+-- every arena, so forcing one needs no window and survives every cycle.
 module Nix.Eval.Arena
   ( -- * Lifecycle
     arenaInit,
@@ -39,30 +37,17 @@ module Nix.Eval.Arena
   )
 where
 
-import Data.Word (Word32)
-import Foreign.Marshal.Array (allocaArray, peekArray)
-import Foreign.Ptr (Ptr)
-import Foreign.StablePtr (castPtrToStablePtr, freeStablePtr)
 import Nix.Eval.CBytecode (cbcDestroy, cbcInit)
 import Nix.Eval.CCtxStr (cctxstrFreeAll)
 import Nix.Eval.CEnv (cenvDestroy, cenvInit)
 import Nix.Eval.CLambda (clambdaFreeAll)
 import Nix.Eval.CList (clistFreeAll)
+import Nix.Eval.CPrimop (cprimopAppFreeAll)
 import Nix.Eval.CStatus (CStatusError (..), arenaLive)
 import Nix.Eval.CStr (cstrDestroy, cstrInit)
 import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.Symbol (symbolDestroy, symbolInit, symbolIntern)
-
--- ---------------------------------------------------------------------------
--- FFI imports for batch StablePtr collection
--- ---------------------------------------------------------------------------
-
-foreign import ccall unsafe "nn_arena_stableptr_count"
-  c_nn_arena_stableptr_count :: IO Word32
-
-foreign import ccall unsafe "nn_arena_collect_stableptrs"
-  c_nn_arena_collect_stableptrs :: Ptr (Ptr ()) -> Word32 -> IO Word32
 
 -- ---------------------------------------------------------------------------
 -- FFI import for bulk CAttrSet cleanup
@@ -89,31 +74,23 @@ arenaInit = do
   cenvInit
   cbcInit 0 0
 
--- | Destroy all C arenas, properly freeing StablePtrs first.
+-- | Destroy all C arenas: the tracked objects (strings with context,
+-- lambdas, partial applications, lists, sets), then the bytecode store
+-- with the code's strings, the env pages, the thunk blocks, the string
+-- arena and the symbol table.
 --
 -- This ends the process's use of the evaluator; a second 'arenaInit' does
--- not restore one.  The @derivation@ constant and the builtin function
--- cells "Nix.Builtins" allocates once for the process, and the empty
--- list's cell, keep pointing into the memory freed here, so a
--- 'Nix.Builtins.builtinEnv' built in a second cycle binds dangling ones
--- and an empty list literal evaluates to one; the other entries are built
--- per call, and the static @null@, @true@ and @false@ thunks survive every
--- cycle.
---
--- 1. Collects all StablePtr payloads from thunks (batch C call)
--- 2. Frees each StablePtr from Haskell
--- 3. Frees all tracked CLists (bulk cleanup)
--- 4. Frees all tracked CAttrSets (bulk cleanup)
--- 5. Destroys bytecode store, the code's strings with it
--- 6. Destroys env slot pages
--- 7. Destroys thunk arena blocks
--- 8. Destroys the string arena
--- 9. Destroys symbol table
+-- not restore one.  The @derivation@ constant "Nix.Builtins" allocates
+-- once for the process, and the empty list's cell, keep pointing into the
+-- memory freed here, so a 'Nix.Builtins.builtinEnv' built in a second
+-- cycle binds a dangling one and an empty list literal evaluates to one;
+-- the other entries are built per call, and the static @null@, @true@ and
+-- @false@ thunks and the builtins' own cells survive every cycle.
 arenaDestroy :: IO ()
 arenaDestroy = do
-  cleanupStablePtrs
   cctxstrFreeAll
   clambdaFreeAll
+  cprimopAppFreeAll
   clistFreeAll
   cattrsetFreeAll
   cbcDestroy
@@ -121,18 +98,3 @@ arenaDestroy = do
   cthunkDestroy
   cstrDestroy
   symbolDestroy
-
--- | Free all StablePtrs held by thunk payloads.
--- Uses batch C-side collection to avoid per-thunk FFI crossing.
--- The only StablePtr payload is a COMPUTED\/NN_VALUE_PTR thunk's
--- NixValue.  A pending or blackholed thunk's env pointer belongs to the
--- env arena, and inline scalar\/C-pointer payloads are skipped.
-cleanupStablePtrs :: IO ()
-cleanupStablePtrs = do
-  count <- c_nn_arena_stableptr_count
-  if count == 0
-    then pure ()
-    else allocaArray (fromIntegral count) $ \buf -> do
-      written <- c_nn_arena_collect_stableptrs buf count
-      ptrs <- peekArray (fromIntegral written) buf
-      mapM_ (freeStablePtr . castPtrToStablePtr) ptrs

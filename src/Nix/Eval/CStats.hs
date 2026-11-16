@@ -4,9 +4,9 @@
 -- kind of object, and what a set of roots reaches.
 --
 -- 'takeCensus' counts every object the allocators hold and then marks
--- from the roots it is given, following every C pointer and, through
--- 'valueRoots', every C pointer a StablePtr-held value holds.  It frees
--- and writes nothing in the data layer, and it adds no work to any
+-- from the roots it is given, following every C pointer: every value
+-- lives in C, so the mark runs in C alone.  It frees and writes nothing
+-- in the data layer, and it adds no work to any
 -- allocation, so a process that never takes a census pays nothing for it.
 --
 -- Once 'countSites' turns counting on, the allocators also count each
@@ -67,7 +67,6 @@ import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
-import Foreign.StablePtr (castPtrToStablePtr, deRefStablePtr)
 import Foreign.Storable (peek, peekElemOff)
 import GHC.Clock (getMonotonicTime)
 import Nix.Eval.AllocSite (EnvSite, SetSite, envSiteIndex, envSiteName, setSiteIndex, setSiteName)
@@ -100,9 +99,6 @@ foreign import ccall unsafe "nn_stats_overhead_bytes"
 foreign import ccall unsafe "nn_stats_code_bytes"
   c_nn_stats_code_bytes :: IO Word64
 
-foreign import ccall unsafe "nn_stats_stableptrs"
-  c_nn_stats_stableptrs :: IO Word64
-
 foreign import ccall unsafe "nn_stats_root_thunk"
   c_nn_stats_root_thunk :: Ptr () -> IO ()
 
@@ -124,17 +120,11 @@ foreign import ccall unsafe "nn_stats_root_ctxstr"
 foreign import ccall safe "nn_stats_mark"
   c_nn_stats_mark :: IO CInt
 
-foreign import ccall unsafe "nn_stats_pending_stableptrs"
-  c_nn_stats_pending_stableptrs :: IO Word32
-
-foreign import ccall unsafe "nn_stats_take_stableptrs"
-  c_nn_stats_take_stableptrs :: Ptr (Ptr ()) -> Word32 -> IO Word32
-
 foreign import ccall unsafe "nn_stats_reached"
   c_nn_stats_reached :: Ptr Word64 -> Ptr Word64 -> IO ()
 
 foreign import ccall unsafe "nn_stats_visited"
-  c_nn_stats_visited :: Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> IO ()
+  c_nn_stats_visited :: Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> IO ()
 
 foreign import ccall safe "nn_stats_reached_set_sizes"
   c_nn_stats_reached_set_sizes :: Ptr Word32 -> Ptr Word64 -> Word32 -> Ptr Word32 -> IO CInt
@@ -170,6 +160,8 @@ data PerKind a = PerKind
     kindLists :: !a,
     -- | Lambda closures and their formal entries.
     kindLambdas :: !a,
+    -- | Builtins' partial applications, with their argument cells.
+    kindPrimopApps :: !a,
     -- | Strings with context.
     kindCtxStrs :: !a,
     -- | The bytes of strings and paths, a string with context's text and
@@ -183,19 +175,19 @@ data PerKind a = PerKind
 -- | Kind by kind: 'pure' is the same value for every kind, and '<*>'
 -- applies each kind's function to that kind's value.
 instance Applicative PerKind where
-  pure a = PerKind a a a a a a a a
-  PerKind f1 f2 f3 f4 f5 f6 f7 f8 <*> PerKind a1 a2 a3 a4 a5 a6 a7 a8 =
-    PerKind (f1 a1) (f2 a2) (f3 a3) (f4 a4) (f5 a5) (f6 a6) (f7 a7) (f8 a8)
+  pure a = PerKind a a a a a a a a a
+  PerKind f1 f2 f3 f4 f5 f6 f7 f8 f9 <*> PerKind a1 a2 a3 a4 a5 a6 a7 a8 a9 =
+    PerKind (f1 a1) (f2 a2) (f3 a3) (f4 a4) (f5 a5) (f6 a6) (f7 a7) (f8 a8) (f9 a9)
 
 -- | Each kind's index in the arrays @nn_stats_allocated@ and
 -- @nn_stats_reached@ fill: the @NN_STATS_*@ constants of
 -- @cbits\/nn_stats.h@, which this must match.
 kindIndices :: PerKind Int
-kindIndices = PerKind 0 1 2 3 4 5 6 7
+kindIndices = PerKind 0 1 2 3 4 5 6 7 8
 
 -- | @NN_STATS_KIND_COUNT@: the length of those arrays.
 kindCount :: Int
-kindCount = 8
+kindCount = 9
 
 -- | @NN_STATS_UNCOUNTED@: a count no allocator keeps.
 uncounted :: Word64
@@ -203,7 +195,7 @@ uncounted = maxBound
 
 -- | Each kind's name in 'renderCensus'.
 kindNames :: PerKind BS.ByteString
-kindNames = PerKind "thunks" "envs" "attrsets" "lists" "lambdas" "ctxstrs" "strings" "symbols"
+kindNames = PerKind "thunks" "envs" "attrsets" "lists" "lambdas" "primopapps" "ctxstrs" "strings" "symbols"
 
 -- ---------------------------------------------------------------------------
 -- Figures
@@ -236,13 +228,9 @@ data Census = Census
     censusOverheadBytes :: !Word64,
     -- | Bytes the bytecode store holds.
     censusCodeBytes :: !Word64,
-    -- | The StablePtrs the thunk arena holds, one per thunk whose value
-    -- lives in GHC's heap.
-    censusStablePtrs :: !Word64,
-    -- | Those of them the roots reach.
-    censusStablePtrsReached :: !Word64,
     -- | Objects the mark entered: thunks, envs, with-scope arrays, sets,
-    -- list headers, items arrays, lambdas and strings with context.
+    -- list headers, items arrays, lambdas, partial applications and
+    -- strings with context.
     -- Strings and symbols hold no pointer, and are marked and not entered.
     censusVisitedObjects :: !Word64,
     -- | The bytes those objects hold.
@@ -253,8 +241,7 @@ data Census = Census
     censusUnplaced :: !Word64,
     -- | Wall-clock seconds the count and the index took.
     censusIndexSeconds :: !Double,
-    -- | Wall-clock seconds the mark took, the rounds through StablePtrs
-    -- included.
+    -- | Wall-clock seconds the mark took.
     censusMarkSeconds :: !Double,
     -- | The reached attribute sets by their number of entries.
     censusSetSizes :: !(Map Word32 Word64),
@@ -394,9 +381,8 @@ data CRoot
     RootCtxStr !CCtxStrPtr
 
 -- | The C objects a value holds.  A value read from a cell is a view of
--- the cell's C objects; one held in GHC's heap behind a StablePtr (a
--- builtin and the arguments it has taken) holds them through its
--- arguments.
+-- the cell's C objects; a partial application built in Haskell and not
+-- yet stored holds them through its arguments.
 valueRoots :: NixValue -> [CRoot]
 valueRoots value = case value of
   VInt _ -> []
@@ -449,12 +435,11 @@ takeCensus roots = do
       allocated <- readFigures c_nn_stats_allocated
       overhead <- c_nn_stats_overhead_bytes
       code <- c_nn_stats_code_bytes
-      held <- c_nn_stats_stableptrs
       indexed <- getMonotonicTime
       marked <- markFrom roots
       finished <- getMonotonicTime
       reached <- readFigures c_nn_stats_reached
-      (objects, bytes, unplaced, stablePtrs) <- readVisited
+      (objects, bytes, unplaced) <- readVisited
       sizes <- readSetSizes
       sites <- siteCounts
       pure $ case (marked, sizes) of
@@ -467,8 +452,6 @@ takeCensus roots = do
                 censusReached = reached,
                 censusOverheadBytes = overhead,
                 censusCodeBytes = code,
-                censusStablePtrs = held,
-                censusStablePtrsReached = stablePtrs,
                 censusVisitedObjects = objects,
                 censusVisitedBytes = bytes,
                 censusUnplaced = unplaced,
@@ -478,30 +461,11 @@ takeCensus roots = do
                 censusSites = sites
               }
 
--- | Mark from the roots, then from what each StablePtr-held value the
--- mark reaches holds, until a round reaches no new one.  'False' when the
--- C side ran out of memory.
+-- | Mark from the roots.  'False' when the C side ran out of memory.
 markFrom :: [CRoot] -> IO Bool
-markFrom roots = mapM_ nameRoot roots >> rounds
-  where
-    rounds = do
-      status <- c_nn_stats_mark
-      pending <- c_nn_stats_pending_stableptrs
-      case (status, pending) of
-        (0, 0) -> pure True
-        (0, _) -> do
-          values <- takeStablePtrValues pending
-          mapM_ nameRoot (concatMap valueRoots values)
-          rounds
-        _ -> pure False
-
--- | The values behind the StablePtrs the mark has reached and not yet
--- handed over.
-takeStablePtrValues :: Word32 -> IO [NixValue]
-takeStablePtrValues pending = allocaArray (fromIntegral pending) $ \buf -> do
-  taken <- c_nn_stats_take_stableptrs buf pending
-  ptrs <- peekArray (fromIntegral taken) buf
-  mapM (deRefStablePtr . castPtrToStablePtr) ptrs
+markFrom roots = do
+  mapM_ nameRoot roots
+  (== 0) <$> c_nn_stats_mark
 
 -- | Figures by kind from a C function that fills a count and a byte
 -- array.
@@ -515,12 +479,12 @@ readFigures fill =
       | n == uncounted = Nothing
       | otherwise = Just n
 
--- | The mark's objects, bytes, unplaced pointers and StablePtrs reached.
-readVisited :: IO (Word64, Word64, Word64, Word64)
+-- | The mark's objects, bytes and unplaced pointers.
+readVisited :: IO (Word64, Word64, Word64)
 readVisited =
-  alloca $ \objects -> alloca $ \bytes -> alloca $ \unplaced -> alloca $ \stablePtrs -> do
-    c_nn_stats_visited objects bytes unplaced stablePtrs
-    (,,,) <$> peek objects <*> peek bytes <*> peek unplaced <*> peek stablePtrs
+  alloca $ \objects -> alloca $ \bytes -> alloca $ \unplaced -> do
+    c_nn_stats_visited objects bytes unplaced
+    (,,) <$> peek objects <*> peek bytes <*> peek unplaced
 
 -- | The reached sets by size, or 'Nothing' when C cannot sort them.  The
 -- first call asks how many sizes there are, the second fetches them.
@@ -554,8 +518,6 @@ renderCensus census =
     mconcat (toList (kindLines <$> kindNames <*> censusAllocated census <*> censusReached census))
       <> field "overhead.bytes" (BB.word64Dec (censusOverheadBytes census))
       <> field "code.bytes" (BB.word64Dec (censusCodeBytes census))
-      <> field "stableptrs.held" (BB.word64Dec (censusStablePtrs census))
-      <> field "stableptrs.reached" (BB.word64Dec (censusStablePtrsReached census))
       <> field "mark.objects" (BB.word64Dec (censusVisitedObjects census))
       <> field "mark.bytes" (BB.word64Dec (censusVisitedBytes census))
       <> field "mark.unplaced" (BB.word64Dec (censusUnplaced census))

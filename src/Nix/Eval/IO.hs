@@ -55,7 +55,6 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32)
 import Foreign.C.Error (Errno (..), eACCES, ePERM)
 import Foreign.Ptr (castPtr)
-import Foreign.StablePtr (castStablePtrToPtr, freeStablePtr, newStablePtr)
 import GHC.Exts (oneShot)
 import GHC.IO.Exception (ioe_errno)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNames)
@@ -66,12 +65,12 @@ import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CData (MonadCData (..), runCData)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CStatus (cInvariantViolated)
-import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthunkSetComputed, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedStr, cthunkState)
+import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedPrimop, cthunkSetComputedPrimopApp, cthunkSetComputedStr, cthunkState)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), StringCell (..), Thunk (..), attrSetSize, bytesToTextLossy, marshalLambda, pathCell, pendingCode, readComputed, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetSize, bytesToTextLossy, marshalLambda, pathCell, pendingCode, primopCell, readComputed, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -844,7 +843,7 @@ instance MonadEval EvalIO where
   forceThunk evalFn (Thunk ptr) = do
     -- Force protocol: PENDING to BLACKHOLE to COMPUTED with memoization.
     -- Scalar values (int/float/bool/null) are stored inline in the
-    -- thunk payload (no StablePtr), dispatched via val_tag.
+    -- thunk payload, dispatched via val_tag.
     --
     -- Blackhole detection: PENDING thunks are marked BLACKHOLE before
     -- evaluation begins.  If evaluation re-enters the same thunk, it
@@ -892,11 +891,12 @@ instance MonadEval EvalIO where
         EvalIO (liftIO (cInvariantViolated "nn_thunk_state" ("no thunk has state " ++ show other)))
 
 -- | Store a forced thunk's NixValue in its C cell.
--- Scalars (int, float, bool, null) are stored inline; strings and paths
--- (over the C object their bytes are held in, or a copy), lists, sets and
--- lambdas as their C objects; any other value through a StablePtr.  The cell is BLACKHOLE while its force
--- runs, which keeps every other path from computing it, so a setter's
--- refusal is an invariant violation rather than a value to drop.
+-- Scalars (int, float, bool, null) and a builtin with no argument taken
+-- are stored inline; strings and paths (over the C object their bytes are
+-- held in, or a copy), lists, sets, lambdas and partial applications as
+-- their C objects.  The cell is BLACKHOLE while its force runs, which
+-- keeps every other path from computing it, so a setter's refusal is an
+-- invariant violation rather than a value to drop.
 storeComputed :: CThunkPtr -> NixValue -> IO ()
 storeComputed ptr val = do
   stored <- case val of
@@ -914,12 +914,11 @@ storeComputed ptr val = do
     VLambda (Env envPtr) formals bodyBcIdx -> do
       lamPtr <- marshalLambda envPtr formals bodyBcIdx
       cthunkSetComputedLambda ptr lamPtr
-    _ -> do
-      valSp <- newStablePtr val
-      kept <- cthunkSetComputed ptr (castStablePtrToPtr valSp)
-      unless kept (freeStablePtr valSp)
-      pure kept
-  unless stored (cInvariantViolated "nn_thunk_set_computed" "a thunk being forced was already COMPUTED")
+    VBuiltin builtin args ->
+      primopCell builtin args >>= \case
+        PrimopCell primop -> cthunkSetComputedPrimop ptr primop
+        PrimopAppCell app -> cthunkSetComputedPrimopApp ptr (castPtr app)
+  unless stored (cInvariantViolated "nn_thunk_set_computed_*" "a thunk being forced was already COMPUTED")
 
 -- ---------------------------------------------------------------------------
 -- Constants

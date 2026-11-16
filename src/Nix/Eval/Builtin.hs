@@ -2,7 +2,8 @@
 -- upstream's base environment that nova-nix binds.  A builtin value names
 -- one ('Nix.Eval.Types.VBuiltin'), and "Nix.Eval" gives each its
 -- arguments and implementation in one total definition, so a builtin
--- with no definition does not compile.
+-- with no definition does not compile.  The C data layer holds a builtin
+-- as its index ('builtinIndex'), its constructor's position.
 --
 -- Meant to be imported qualified, its constructors named as
 -- @Builtin.Map@, beside the type imported unqualified.
@@ -10,12 +11,15 @@ module Nix.Eval.Builtin
   ( Builtin (..),
     builtinName,
     builtinNamed,
+    builtinIndex,
+    builtinAtIndex,
   )
 where
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import Data.Word (Word32)
 
 -- | A builtin, by its name less upstream's @__@ prefix.
 data Builtin
@@ -244,3 +248,15 @@ builtinNamed name = Map.lookup name byName
 -- | Every builtin by its name.
 byName :: Map Text Builtin
 byName = Map.fromList [(builtinName builtin, builtin) | builtin <- [minBound .. maxBound]]
+
+-- | A builtin's index in the C data layer: its constructor's position.
+builtinIndex :: Builtin -> Word32
+builtinIndex = fromIntegral . fromEnum
+
+-- | The builtin at an index, if any.
+builtinAtIndex :: Word32 -> Maybe Builtin
+builtinAtIndex index = Map.lookup index byIndex
+
+-- | Every builtin by its index.
+byIndex :: Map Word32 Builtin
+byIndex = Map.fromList [(builtinIndex builtin, builtin) | builtin <- [minBound .. maxBound]]

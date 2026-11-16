@@ -17,10 +17,10 @@
  * recursive frame (rec attrs, let, a formals set) is allocated with its
  * slot array before the thunks that point at it, and its slots are
  * filled after, as upstream allocates env2 before filling its values.
- * COMPUTED payloads are either inline scalars (int/float/bool/null via
- * val_tag 0-3), C-native pointers (str/path/list/attrs/ctxstr/lambda
- * via val_tag 4-9), or StablePtrs (for a builtin and the arguments it
- * has taken, via tag 255).
+ * COMPUTED payloads are inline scalars (int/float/bool/null via val_tag
+ * 0-3), C objects (str/path/list/attrs/ctxstr/lambda via val_tag 4-9, a
+ * builtin's partial application via 11), or a builtin's index (10), so
+ * every value lives in C and holds nothing in GHC's heap.
  *
  * Lifecycle: nn_thunk_init() before evaluation, nn_thunk_destroy()
  * after.  Not thread-safe - single-threaded evaluation only.
@@ -49,7 +49,8 @@
 #define NN_VALUE_ATTRS   7   /* payload = nn_attrset_t* */
 #define NN_VALUE_CTXSTR  8   /* payload = nn_ctxstr_t* (string with context) */
 #define NN_VALUE_LAMBDA  9   /* payload = nn_lambda_t* (lambda closure) */
-#define NN_VALUE_PTR     255 /* payload = StablePtr NixValue (complex types) */
+#define NN_VALUE_PRIMOP  10  /* payload = (void*)(uintptr_t)builtin index */
+#define NN_VALUE_PRIMOP_APP 11 /* payload = nn_primop_app_t* (nn_primop.h) */
 
 /* --- Types --- */
 
@@ -63,7 +64,8 @@
  *            INT/BOOL: (intptr_t) cast of scalar
  *            FLOAT: memcpy'd double
  *            NULL: ignored
- *            PTR: StablePtr to Haskell NixValue (complex types)
+ *            PRIMOP: (uintptr_t) cast of the builtin's index
+ *            others: a pointer to the C object
  * BLACKHOLE: bc_idx/payload = stale from PENDING (do not dereference) */
 typedef struct nn_thunk {
     uint8_t   state;
@@ -90,10 +92,10 @@ void nn_thunk_init(uint32_t initial_capacity);
 /* Nonzero between nn_thunk_init and nn_thunk_destroy. */
 int nn_thunk_live(void);
 
-/* Destroy the global thunk arena, freeing all block memory.
- * Does NOT free NN_VALUE_PTR StablePtrs - caller collects and frees
- * them first (via nn_thunk_collect_stableptrs).
- * All nn_thunk_t pointers become invalid after this call. */
+/* Destroy the global thunk arena, freeing all block memory.  The
+ * objects a cell points to belong to their own allocators.  Every
+ * nn_thunk_t pointer into the arena becomes invalid after this call; the
+ * static cells (below) do not. */
 void nn_thunk_destroy(void);
 
 /* --- Allocation --- */
@@ -109,22 +111,19 @@ nn_thunk_t *nn_thunk_new_bc(uint32_t bc_idx, void *env);
 /* Read the bytecode index from a PENDING thunk. */
 uint32_t nn_thunk_get_bc_idx(const nn_thunk_t *thunk);
 
-/* Allocate a new pre-COMPUTED thunk from the arena (StablePtr payload).
- * value is an opaque pointer (StablePtr to Haskell NixValue).
- * val_tag is set to NN_VALUE_PTR. */
-nn_thunk_t *nn_thunk_new_computed(void *value);
-
-/* Allocate pre-COMPUTED thunks with inline scalar values (no StablePtr). */
+/* Allocate pre-COMPUTED thunks with inline scalar values. */
 nn_thunk_t *nn_thunk_new_computed_int(int64_t value);
 nn_thunk_t *nn_thunk_new_computed_float(double value);
+nn_thunk_t *nn_thunk_new_computed_primop(uint32_t primop);
 
-/* Allocate pre-COMPUTED thunks with C-native complex values (no StablePtr). */
+/* Allocate pre-COMPUTED thunks pointing at C objects. */
 nn_thunk_t *nn_thunk_new_computed_str(void *str);
 nn_thunk_t *nn_thunk_new_computed_path(void *str);
 nn_thunk_t *nn_thunk_new_computed_list(void *list);
 nn_thunk_t *nn_thunk_new_computed_attrs(void *attrset);
 nn_thunk_t *nn_thunk_new_computed_ctxstr(void *ctxstr);
 nn_thunk_t *nn_thunk_new_computed_lambda(void *lambda);
+nn_thunk_t *nn_thunk_new_computed_primop_app(void *app);
 
 /* --- Shared constants --- */
 
@@ -137,6 +136,23 @@ nn_thunk_t *nn_thunk_new_computed_lambda(void *lambda);
  * them.  nn_thunk_bool answers the true cell for any nonzero value. */
 nn_thunk_t *nn_thunk_null(void);
 nn_thunk_t *nn_thunk_bool(uint8_t value);
+
+/* The builtins the static cells can name: one more than the highest
+ * index nn_thunk_primop answers for. */
+#define NN_PRIMOP_CELLS 256u
+
+/* The COMPUTED cell of the builtin at `primop`, as upstream binds one
+ * value per primop (EvalState::addPrimOp at 2.24.9): a static, like the
+ * null and Boolean cells, so the builtin bound in every environment is
+ * the one cell, valid in every init .. destroy window and outside all of
+ * them.  NULL for an index from NN_PRIMOP_CELLS on.  A cell is filled the
+ * first time it is asked for, with values that never change after, so
+ * nothing reads one in another state. */
+nn_thunk_t *nn_thunk_primop(uint32_t primop);
+
+/* Nonzero for a static cell: the null, true and false cells and the
+ * builtins' cells, which no arena holds. */
+int nn_thunk_is_static(const nn_thunk_t *thunk);
 
 /* --- State queries --- */
 
@@ -161,6 +177,8 @@ void    *nn_thunk_get_list(const nn_thunk_t *thunk);
 void    *nn_thunk_get_attrs(const nn_thunk_t *thunk);
 void    *nn_thunk_get_ctxstr(const nn_thunk_t *thunk);
 void    *nn_thunk_get_lambda(const nn_thunk_t *thunk);
+uint32_t nn_thunk_get_primop(const nn_thunk_t *thunk);
+void    *nn_thunk_get_primop_app(const nn_thunk_t *thunk);
 
 /* --- State transitions --- */
 
@@ -176,13 +194,11 @@ int nn_thunk_mark_blackhole(nn_thunk_t *thunk);
 int nn_thunk_mark_pending(nn_thunk_t *thunk);
 
 /* Set a non-COMPUTED thunk to COMPUTED, the setter naming the value
- * kind: a StablePtr NixValue (NN_VALUE_PTR), an inline scalar, or a
- * C-native complex value.  Accepts PENDING or BLACKHOLE state (skips
+ * kind: an inline scalar, a builtin's index, or a C object.  Accepts PENDING or BLACKHOLE state (skips
  * blackhole for direct memoization).  The pending payload is overwritten:
  * it is an env pointer the env arena owns, so there is nothing to hand
  * back or free.  Returns 1, or 0 with the thunk unchanged if it is
  * already COMPUTED. */
-int nn_thunk_set_computed(nn_thunk_t *thunk, void *value);
 int nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value);
 int nn_thunk_set_computed_float(nn_thunk_t *thunk, double value);
 int nn_thunk_set_computed_bool(nn_thunk_t *thunk, uint8_t value);
@@ -193,6 +209,8 @@ int nn_thunk_set_computed_list(nn_thunk_t *thunk, void *list);
 int nn_thunk_set_computed_attrs(nn_thunk_t *thunk, void *attrset);
 int nn_thunk_set_computed_ctxstr(nn_thunk_t *thunk, void *ctxstr);
 int nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda);
+int nn_thunk_set_computed_primop(nn_thunk_t *thunk, uint32_t primop);
+int nn_thunk_set_computed_primop_app(nn_thunk_t *thunk, void *app);
 
 /* --- Arena diagnostics / cleanup iteration --- */
 
@@ -202,15 +220,6 @@ uint32_t nn_thunk_count(void);
 /* Get a thunk by global index (0-based, across all blocks, in allocation
  * order), or NULL when index >= nn_thunk_count().  O(blocks) per call. */
 nn_thunk_t *nn_thunk_get(uint32_t index);
-
-/* Single-pass (O(total)) collection of Haskell StablePtr payloads across the
- * whole arena.  Walks the block list directly - nn_thunk_get is O(blocks) per
- * call, so index-based iteration would be O(total * blocks).  The only
- * StablePtr payload is a COMPUTED thunk's with val_tag NN_VALUE_PTR.
- * nn_thunk_collect_stableptrs writes up to max_count pointers into `output`
- * and returns the count written.  These back the nn_arena_* teardown helpers. */
-uint32_t nn_thunk_count_stableptrs(void);
-uint32_t nn_thunk_collect_stableptrs(void **output, uint32_t max_count);
 
 /* --- Census (nn_stats.h) --- */
 

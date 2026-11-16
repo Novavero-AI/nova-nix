@@ -8,8 +8,8 @@
  * per NN_ENV_ALIGNMENT bytes of page or per NN_STR_ALIGNMENT bytes of
  * strings, so a pointer finds its bit by a binary search over regions;
  * the code's strings are indexed only to be placed, as code is not
- * marked.  Sets, list headers, lambdas and strings with context are each
- * their own allocation: an object index sorts a copy of the module's
+ * marked.  Sets, list headers, lambdas, builtins' partial applications
+ * and strings with context are each their own allocation: an object index sorts a copy of the module's
  * tracking array and gives each object a bit, found by a binary search
  * for its address.
  * Addresses are compared as uintptr_t, since C orders pointers only
@@ -35,6 +35,7 @@
 #include "nn_env.h"
 #include "nn_lambda.h"
 #include "nn_list.h"
+#include "nn_primop.h"
 #include "nn_str.h"
 #include "nn_symbol.h"
 #include "nn_thunk.h"
@@ -90,7 +91,6 @@ typedef struct {
 /* --- Session state --- */
 
 #define NN_STATS_WORK_INITIAL      4096u
-#define NN_STATS_STABLEPTR_INITIAL 256u
 
 static struct {
     int open;
@@ -101,6 +101,7 @@ static struct {
     nn_object_index_t sets;
     nn_object_index_t lists;
     nn_object_index_t lambdas;
+    nn_object_index_t primop_apps;
     nn_object_index_t ctxstrs;
     nn_region_index_t strings;
     nn_region_index_t code_strings;
@@ -117,21 +118,15 @@ static struct {
     size_t     work_count;
     size_t     work_cap;
 
-    void   **stableptrs;
-    uint32_t stableptr_count;
-    uint32_t stableptr_cap;
-
     uint64_t allocated_count[NN_STATS_KIND_COUNT];
     uint64_t allocated_bytes[NN_STATS_KIND_COUNT];
     uint64_t reached_count[NN_STATS_KIND_COUNT];
     uint64_t reached_bytes[NN_STATS_KIND_COUNT];
     uint64_t overhead_bytes;
     uint64_t code_bytes;
-    uint64_t stableptrs_held;
     uint64_t visited_objects;
     uint64_t visited_bytes;
     uint64_t unplaced;
-    uint64_t stableptrs_reached;
 } g;
 
 /* --- Counting by site --- */
@@ -491,6 +486,21 @@ static int index_lambdas(void)
     return 0;
 }
 
+static int index_primop_apps(void)
+{
+    uint32_t count, capacity, i;
+    nn_primop_app_t *const *tracked = nn_primop_app_tracked(&count, &capacity);
+    g.overhead_bytes += (uint64_t)capacity * sizeof(nn_primop_app_t *);
+    g.allocated_count[NN_STATS_PRIMOP_APPS] = count;
+    if (object_alloc(&g.primop_apps, count) != 0) return -1;
+    for (i = 0; i < count; i++) {
+        g.allocated_bytes[NN_STATS_PRIMOP_APPS] += nn_primop_app_bytes(tracked[i]);
+        g.primop_apps.objects[i] = (uintptr_t)tracked[i];
+    }
+    object_sort(&g.primop_apps);
+    return 0;
+}
+
 static int index_ctxstrs(void)
 {
     uint32_t count, capacity, i;
@@ -555,7 +565,8 @@ int nn_stats_begin(void)
     g.open = 1;
 
     if (index_thunks() != 0 || index_pages() != 0 || index_sets() != 0
-        || index_lists() != 0 || index_lambdas() != 0 || index_ctxstrs() != 0
+        || index_lists() != 0 || index_lambdas() != 0 || index_primop_apps() != 0
+        || index_ctxstrs() != 0
         || index_strings() != 0) {
         nn_stats_end();
         return -1;
@@ -583,7 +594,6 @@ int nn_stats_begin(void)
                       + nn_env_reserved_bytes() - nn_env_bytes_allocated()
                       + reserved - text;
     g.code_bytes = nn_bc_reserved_bytes();
-    g.stableptrs_held = nn_thunk_count_stableptrs();
     return 0;
 }
 
@@ -594,6 +604,7 @@ void nn_stats_end(void)
     object_free(&g.sets);
     object_free(&g.lists);
     object_free(&g.lambdas);
+    object_free(&g.primop_apps);
     object_free(&g.ctxstrs);
     region_free(&g.strings);
     region_free(&g.code_strings);
@@ -601,7 +612,6 @@ void nn_stats_end(void)
     free(g.list_items);
     free(g.symbol_bits);
     free(g.work);
-    free(g.stableptrs);
     memset(&g, 0, sizeof(g));
 }
 
@@ -615,7 +625,6 @@ void nn_stats_allocated(uint64_t *counts, uint64_t *bytes)
 
 uint64_t nn_stats_overhead_bytes(void) { return g.overhead_bytes; }
 uint64_t nn_stats_code_bytes(void)     { return g.code_bytes; }
-uint64_t nn_stats_stableptrs(void)     { return g.stableptrs_held; }
 
 /* --- Reaching objects --- */
 
@@ -636,28 +645,6 @@ static void work_push(uint8_t kind, const void *object)
     g.work_count++;
 }
 
-static void stableptr_push(void *payload)
-{
-    g.stableptrs_reached++;
-    if (g.stableptr_count == g.stableptr_cap) {
-        uint32_t cap;
-        void **grown;
-        if (g.stableptr_cap > UINT32_MAX / 2) {
-            g.failed = 1;
-            return;
-        }
-        cap = g.stableptr_cap ? g.stableptr_cap * 2 : NN_STATS_STABLEPTR_INITIAL;
-        grown = (void **)realloc(g.stableptrs, (size_t)cap * sizeof(void *));
-        if (!grown) {
-            g.failed = 1;
-            return;
-        }
-        g.stableptrs = grown;
-        g.stableptr_cap = cap;
-    }
-    g.stableptrs[g.stableptr_count++] = payload;
-}
-
 /* An object reached for the first time: its kind's figures and the
  * mark's own. */
 static void count_reached(int kind, uint64_t bytes)
@@ -668,14 +655,12 @@ static void count_reached(int kind, uint64_t bytes)
     g.visited_bytes += bytes;
 }
 
-/* The null, true and false cells and the empty env are statics, not
- * allocations: reached and neither counted nor entered, as they hold no
- * pointer. */
+/* The null, true and false cells, the builtins' cells and the empty env
+ * are statics, not allocations: reached and neither counted nor entered,
+ * as they hold no pointer. */
 static int is_static(int kind, const void *object)
 {
-    if (kind == NN_STATS_THUNKS)
-        return object == nn_thunk_null() || object == nn_thunk_bool(0)
-            || object == nn_thunk_bool(1);
+    if (kind == NN_STATS_THUNKS) return nn_thunk_is_static((const nn_thunk_t *)object);
     if (kind == NN_STATS_ENVS) return object == nn_env_empty();
     return 0;
 }
@@ -720,6 +705,13 @@ static void reach(int kind, const void *object)
         if (!object_find(&g.lambdas, p, &pos)) break;
         if (bit_set(g.lambdas.bits, pos)) {
             count_reached(kind, nn_lambda_bytes((const nn_lambda_t *)object));
+            work_push((uint8_t)kind, object);
+        }
+        return;
+    case NN_STATS_PRIMOP_APPS:
+        if (!object_find(&g.primop_apps, p, &pos)) break;
+        if (bit_set(g.primop_apps.bits, pos)) {
+            count_reached(kind, nn_primop_app_bytes((const nn_primop_app_t *)object));
             work_push((uint8_t)kind, object);
         }
         return;
@@ -826,8 +818,10 @@ static void enter_thunk(const nn_thunk_t *t)
     case NN_VALUE_LAMBDA:
         reach(NN_STATS_LAMBDAS, nn_thunk_get_lambda(t));
         break;
-    case NN_VALUE_PTR:
-        if (nn_thunk_payload(t)) stableptr_push(nn_thunk_payload(t));
+    case NN_VALUE_PRIMOP:
+        break;
+    case NN_VALUE_PRIMOP_APP:
+        reach(NN_STATS_PRIMOP_APPS, nn_thunk_get_primop_app(t));
         break;
     default:
         g.unplaced++;
@@ -895,6 +889,12 @@ static void enter_lambda(const nn_lambda_t *lam)
     for (i = 0; i < formals && lam->entries; i++) reach_symbol(lam->entries[i].name_sym);
 }
 
+static void enter_primop_app(const nn_primop_app_t *app)
+{
+    uint16_t i;
+    for (i = 0; i < app->taken; i++) reach(NN_STATS_THUNKS, app->args[i]);
+}
+
 static void enter_ctxstr(const nn_ctxstr_t *s)
 {
     uint32_t i;
@@ -926,28 +926,12 @@ int nn_stats_mark(void)
         case NN_STATS_ATTRSETS: enter_attrset((const nn_attrset_t *)item.object); break;
         case NN_STATS_LISTS:    enter_list((const nn_list_t *)item.object); break;
         case NN_STATS_LAMBDAS:  enter_lambda((const nn_lambda_t *)item.object); break;
+        case NN_STATS_PRIMOP_APPS: enter_primop_app((const nn_primop_app_t *)item.object); break;
         case NN_STATS_CTXSTRS:  enter_ctxstr((const nn_ctxstr_t *)item.object); break;
         default: g.unplaced++; break;
         }
     }
     return g.failed ? -1 : 0;
-}
-
-uint32_t nn_stats_pending_stableptrs(void)
-{
-    return g.stableptr_count;
-}
-
-uint32_t nn_stats_take_stableptrs(void **out, uint32_t max)
-{
-    uint32_t n = g.stableptr_count < max ? g.stableptr_count : max;
-    /* No list before the first payload: memcpy takes no NULL source,
-     * whatever the length. */
-    if (n == 0) return 0;
-    /* Hand over from the end, so what is left stays at the front. */
-    memcpy(out, g.stableptrs + (g.stableptr_count - n), (size_t)n * sizeof(void *));
-    g.stableptr_count -= n;
-    return n;
 }
 
 void nn_stats_reached(uint64_t *counts, uint64_t *bytes)
@@ -956,13 +940,11 @@ void nn_stats_reached(uint64_t *counts, uint64_t *bytes)
     memcpy(bytes, g.reached_bytes, sizeof(g.reached_bytes));
 }
 
-void nn_stats_visited(uint64_t *objects, uint64_t *bytes,
-                      uint64_t *unplaced, uint64_t *stableptrs)
+void nn_stats_visited(uint64_t *objects, uint64_t *bytes, uint64_t *unplaced)
 {
     *objects = g.visited_objects;
     *bytes = g.visited_bytes;
     *unplaced = g.unplaced;
-    *stableptrs = g.stableptrs_reached;
 }
 
 int nn_stats_reached_set_sizes(uint32_t *sizes, uint64_t *counts, uint32_t max,
