@@ -81,6 +81,7 @@ library
     Nix.Eval.CThunk
     Nix.Eval.CEnv
     Nix.Eval.CLambda
+    Nix.Eval.CPrimop
     Nix.Eval.CList
     Nix.Eval.CCtxStr
     Nix.Eval.CStr
@@ -189,6 +190,7 @@ library
     cbits/nn_arena.c
     cbits/nn_bytecode.c
     cbits/nn_lambda.c
+    cbits/nn_primop.c
     cbits/nn_stats.c
     cbits/nn_winfs.c
     cbits/nn_darwinfs.c

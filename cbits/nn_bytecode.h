@@ -17,9 +17,8 @@
  * A value a literal evaluates to can point at that string rather than
  * copy it, since the code's strings live as long as the code.
  *
- * Goal: eliminate StablePtr (Expr, Env) in pending thunks.  After
- * compilation, pending thunks hold (bc_idx, nn_env_t*) -- both
- * C-native, zero GHC heap pressure.
+ * A pending thunk holds an instruction's index and the nn_env_t * it
+ * runs in, both C, so pending code takes nothing on GHC's heap.
  *
  * Lifecycle: nn_bytecode_init() before evaluation, nn_bytecode_destroy()
  * after.  Not thread-safe -- single-threaded evaluation only.

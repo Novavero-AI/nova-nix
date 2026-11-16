@@ -157,19 +157,6 @@ nn_thunk_get_bc_idx(const nn_thunk_t *thunk)
 }
 
 nn_thunk_t *
-nn_thunk_new_computed(void *value)
-{
-    nn_thunk_t *t = arena_alloc(g_arena);
-    if (!t) return NULL;
-    t->state = NN_THUNK_COMPUTED;
-    t->val_tag = NN_VALUE_PTR;
-    t->_pad = 0;
-    t->bc_idx = 0;
-    t->payload = value;
-    return t;
-}
-
-nn_thunk_t *
 nn_thunk_new_computed_int(int64_t value)
 {
     nn_thunk_t *t = arena_alloc(g_arena);
@@ -192,6 +179,19 @@ nn_thunk_new_computed_float(double value)
     t->_pad = 0;
     t->bc_idx = 0;
     memcpy(&t->payload, &value, sizeof(double));
+    return t;
+}
+
+nn_thunk_t *
+nn_thunk_new_computed_primop(uint32_t primop)
+{
+    nn_thunk_t *t = arena_alloc(g_arena);
+    if (!t) return NULL;
+    t->state = NN_THUNK_COMPUTED;
+    t->val_tag = NN_VALUE_PRIMOP;
+    t->_pad = 0;
+    t->bc_idx = 0;
+    t->payload = (void *)(uintptr_t)primop;
     return t;
 }
 
@@ -273,6 +273,19 @@ nn_thunk_new_computed_lambda(void *lambda)
     return t;
 }
 
+nn_thunk_t *
+nn_thunk_new_computed_primop_app(void *app)
+{
+    nn_thunk_t *t = arena_alloc(g_arena);
+    if (!t) return NULL;
+    t->state = NN_THUNK_COMPUTED;
+    t->val_tag = NN_VALUE_PRIMOP_APP;
+    t->_pad = 0;
+    t->bc_idx = 0;
+    t->payload = app;
+    return t;
+}
+
 /* --- Shared constants --- */
 
 static nn_thunk_t g_null_cell  = { NN_THUNK_COMPUTED, NN_VALUE_NULL, 0, 0, NULL };
@@ -289,6 +302,34 @@ nn_thunk_t *
 nn_thunk_bool(uint8_t value)
 {
     return value ? &g_true_cell : &g_false_cell;
+}
+
+/* Zero until asked for, which is PENDING: nn_thunk_primop fills a cell
+ * before it hands it out. */
+static nn_thunk_t g_primop_cells[NN_PRIMOP_CELLS];
+
+nn_thunk_t *
+nn_thunk_primop(uint32_t primop)
+{
+    nn_thunk_t *cell;
+    if (primop >= NN_PRIMOP_CELLS) return NULL;
+    cell = &g_primop_cells[primop];
+    if (cell->state != NN_THUNK_COMPUTED) {
+        cell->val_tag = NN_VALUE_PRIMOP;
+        cell->payload = (void *)(uintptr_t)primop;
+        cell->state = NN_THUNK_COMPUTED;
+    }
+    return cell;
+}
+
+int
+nn_thunk_is_static(const nn_thunk_t *thunk)
+{
+    /* Compared as integers: the cell may be in no array of these. */
+    uintptr_t p = (uintptr_t)thunk;
+    uintptr_t cells = (uintptr_t)g_primop_cells;
+    return thunk == &g_null_cell || thunk == &g_true_cell || thunk == &g_false_cell
+        || (p >= cells && p - cells < sizeof(g_primop_cells));
 }
 
 /* --- State queries --- */
@@ -367,6 +408,18 @@ nn_thunk_get_lambda(const nn_thunk_t *thunk)
     return thunk->payload;
 }
 
+uint32_t
+nn_thunk_get_primop(const nn_thunk_t *thunk)
+{
+    return (uint32_t)(uintptr_t)thunk->payload;
+}
+
+void *
+nn_thunk_get_primop_app(const nn_thunk_t *thunk)
+{
+    return thunk->payload;
+}
+
 /* --- State transitions --- */
 
 int
@@ -386,16 +439,6 @@ nn_thunk_mark_pending(nn_thunk_t *thunk)
 {
     if (thunk->state != NN_THUNK_BLACKHOLE) return 0;
     thunk->state = NN_THUNK_PENDING;
-    return 1;
-}
-
-int
-nn_thunk_set_computed(nn_thunk_t *thunk, void *value)
-{
-    if (thunk->state == NN_THUNK_COMPUTED) return 0;
-    thunk->state = NN_THUNK_COMPUTED;
-    thunk->val_tag = NN_VALUE_PTR;
-    thunk->payload = value;
     return 1;
 }
 
@@ -499,6 +542,26 @@ nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda)
     return 1;
 }
 
+int
+nn_thunk_set_computed_primop(nn_thunk_t *thunk, uint32_t primop)
+{
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
+    thunk->state = NN_THUNK_COMPUTED;
+    thunk->val_tag = NN_VALUE_PRIMOP;
+    thunk->payload = (void *)(uintptr_t)primop;
+    return 1;
+}
+
+int
+nn_thunk_set_computed_primop_app(nn_thunk_t *thunk, void *app)
+{
+    if (thunk->state == NN_THUNK_COMPUTED) return 0;
+    thunk->state = NN_THUNK_COMPUTED;
+    thunk->val_tag = NN_VALUE_PRIMOP_APP;
+    thunk->payload = app;
+    return 1;
+}
+
 /* --- Arena diagnostics / cleanup iteration --- */
 
 uint32_t
@@ -521,46 +584,6 @@ nn_thunk_get(uint32_t index)
         block = block->next;
     }
     return NULL;  /* unreachable if index < total */
-}
-
-/* --- Bulk StablePtr collection (single block-list pass, O(total)) --- */
-
-static int
-holds_stableptr(const nn_thunk_t *t)
-{
-    return t->state == NN_THUNK_COMPUTED && t->val_tag == NN_VALUE_PTR
-        && t->payload != NULL;
-}
-
-uint32_t
-nn_thunk_count_stableptrs(void)
-{
-    uint32_t count = 0;
-    struct nn_thunk_block *block;
-    uint32_t i;
-    if (!g_arena) return 0;
-    for (block = g_arena->head; block; block = block->next) {
-        for (i = 0; i < block->count; i++) {
-            if (holds_stableptr(&block->slots[i])) count++;
-        }
-    }
-    return count;
-}
-
-uint32_t
-nn_thunk_collect_stableptrs(void **output, uint32_t max_count)
-{
-    uint32_t written = 0;
-    struct nn_thunk_block *block;
-    uint32_t i;
-    if (!g_arena) return 0;
-    for (block = g_arena->head; block && written < max_count; block = block->next) {
-        for (i = 0; i < block->count && written < max_count; i++) {
-            const nn_thunk_t *t = &block->slots[i];
-            if (holds_stableptr(t)) output[written++] = t->payload;
-        }
-    }
-    return written;
 }
 
 /* --- Census --- */

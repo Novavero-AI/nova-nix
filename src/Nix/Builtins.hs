@@ -47,10 +47,11 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, currentSystemStr, deferApply, evaluated, listedBuiltins, readThunkValue)
 import Nix.Eval.AllocSite (EnvSite (EnvApply, EnvRoot), SetSite (SetRoot))
-import Nix.Eval.Builtin (Builtin, builtinName, builtinNamed)
+import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CData (MonadCData, cdataIO, runCDataPure)
 import Nix.Eval.CStatus (cInvariantViolated)
+import Nix.Eval.CThunk (cthunkPrimop)
 import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newScopeEnv, thunkToCPtr)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames)
 import Nix.Parser (SourceOrigin (..), parseNixWithScope, parsedExpr)
@@ -96,9 +97,16 @@ rootScopeNames policy
   | epPureEval policy = staticGlobalNames `Set.difference` impureOnlyGlobalNames
   | otherwise = staticGlobalNames
 
--- | The value of a builtin function bound under its own name.
+-- | The value of a builtin function bound under its own name: the
+-- builtin's shared cell, so every environment 'builtinEnv' builds binds
+-- the same one, as upstream binds one value per primop in its base
+-- environment (@EvalState::addPrimOp@, eval.cc at 2.24.9).  A builtin
+-- read in one file is then the same value as the same builtin read in
+-- another, which @==@ shows of sets copied out of @builtins@ in two
+-- files.  The cell is a C static ('Nix.Eval.CThunk.cthunkPrimop'), so it
+-- is the same in every arena window.
 builtinFunction :: (MonadCData m) => Builtin -> m Thunk
-builtinFunction builtin = evaluated (VBuiltin builtin [])
+builtinFunction = fmap Thunk . cthunkPrimop . builtinIndex
 
 -- | Like 'builtinEnv' but with additional scope bindings overlaid on
 -- the top-level environment.  Used by @scopedImport@.
@@ -108,25 +116,12 @@ builtinEnvWithScope policy timestamp searchPaths scope = do
   overlay <- attrSetFromMap SetRoot (Map.fromList scope)
   newScopeEnv EnvRoot (Just base) overlay
 
--- | The @builtins@ attribute set, derived from the central registry.
+-- | The @builtins@ attribute set: every builtin it lists and the constants.
 builtinsAttrSet :: (MonadCData m) => EvalPolicy -> Int64 -> [Thunk] -> m AttrSet
 builtinsAttrSet policy timestamp searchPaths = do
   standard <- standardEntries policy timestamp searchPaths
-  attrSetFromMap SetRoot (Map.union builtinFunctionCells standard)
-
--- | One cell for each registered builtin, for the process: every
--- environment 'builtinEnv' builds binds the same ones, as upstream binds
--- one value per primop in its base environment, so a builtin read in one
--- file is the same value as the same builtin read in another, which @==@
--- shows of sets copied out of @builtins@ in two files.  A cell per
--- environment would also hold a StablePtr apiece, which GHC's collector
--- scans on every collection, for every imported file.  Like
--- 'derivationWrapper', a process-global value, allocated where the first
--- 'builtinEnv' reads it ('runCDataPure'); the allocation writes only the
--- cells it makes.
-builtinFunctionCells :: Map Text Thunk
-builtinFunctionCells = runCDataPure (sequenceA (Map.fromList [(builtinName builtin, builtinFunction builtin) | builtin <- listedBuiltins]))
-{-# NOINLINE builtinFunctionCells #-}
+  functions <- sequenceA (Map.fromList [(builtinName builtin, builtinFunction builtin) | builtin <- listedBuiltins])
+  attrSetFromMap SetRoot (Map.union functions standard)
 
 -- | The constants beside the builtin functions.  @currentTime@ and @currentSystem@
 -- are upstream's @impureOnly@ constants and are absent under @pure-eval@

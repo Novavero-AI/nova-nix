@@ -2,8 +2,8 @@
 --
 -- Wraps @cbits/nn_thunk.c@ - an arena-allocated mutable cell that
 -- holds either pending code (a bytecode index and the C env it runs in)
--- or a computed value (inline, a C pointer, or a StablePtr to a
--- NixValue).  Each cell is a 16-byte C struct in an arena, invisible to
+-- or a computed value (an inline scalar or builtin index, or a pointer to
+-- a C object).  Each cell is a 16-byte C struct in an arena, invisible to
 -- GHC's GC.
 --
 -- Includes blackhole detection: a thunk being forced is marked
@@ -30,7 +30,6 @@ module Nix.Eval.CThunk
 
     -- * Allocation
     cthunkNewBc,
-    cthunkNewComputed,
     cthunkNewComputedInt,
     cthunkNewComputedFloat,
     cthunkNewComputedStr,
@@ -39,10 +38,13 @@ module Nix.Eval.CThunk
     cthunkNewComputedAttrs,
     cthunkNewComputedCtxStr,
     cthunkNewComputedLambda,
+    cthunkNewComputedPrimop,
+    cthunkNewComputedPrimopApp,
 
     -- * Shared constants
     cthunkNull,
     cthunkBool,
+    cthunkPrimop,
 
     -- * State queries
     cthunkState,
@@ -58,11 +60,12 @@ module Nix.Eval.CThunk
     cthunkGetAttrs,
     cthunkGetCtxStr,
     cthunkGetLambda,
+    cthunkGetPrimop,
+    cthunkGetPrimopApp,
 
     -- * State transitions
     cthunkMarkBlackhole,
     cthunkMarkPending,
-    cthunkSetComputed,
     cthunkSetComputedInt,
     cthunkSetComputedFloat,
     cthunkSetComputedBool,
@@ -73,6 +76,8 @@ module Nix.Eval.CThunk
     cthunkSetComputedAttrs,
     cthunkSetComputedCtxStr,
     cthunkSetComputedLambda,
+    cthunkSetComputedPrimop,
+    cthunkSetComputedPrimopApp,
 
     -- * Arena diagnostics / cleanup
     cthunkCount,
@@ -83,9 +88,9 @@ where
 import Data.Int (Int64)
 import Data.Word (Word32, Word8)
 import Foreign.C.Types (CDouble (..), CInt (..))
-import Foreign.Ptr (Ptr)
+import Foreign.Ptr (Ptr, nullPtr)
 import Nix.Eval.CData (MonadCData, cdataIO)
-import Nix.Eval.CStatus (checkedCPtr)
+import Nix.Eval.CStatus (cInvariantViolated, checkedCPtr)
 import Nix.Eval.CStr (CStrPtr)
 
 -- | Phantom type for C-side @nn_thunk_t@.
@@ -109,9 +114,6 @@ foreign import ccall unsafe "nn_thunk_new_bc"
 
 foreign import ccall unsafe "nn_thunk_get_bc_idx"
   c_nn_thunk_get_bc_idx :: CThunkPtr -> IO Word32
-
-foreign import ccall unsafe "nn_thunk_new_computed"
-  c_nn_thunk_new_computed :: Ptr () -> IO CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_new_computed_int"
   c_nn_thunk_new_computed_int :: Int64 -> IO CThunkPtr
@@ -137,6 +139,12 @@ foreign import ccall unsafe "nn_thunk_new_computed_ctxstr"
 foreign import ccall unsafe "nn_thunk_new_computed_lambda"
   c_nn_thunk_new_computed_lambda :: Ptr () -> IO CThunkPtr
 
+foreign import ccall unsafe "nn_thunk_new_computed_primop"
+  c_nn_thunk_new_computed_primop :: Word32 -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_computed_primop_app"
+  c_nn_thunk_new_computed_primop_app :: Ptr () -> IO CThunkPtr
+
 -- The shared cells are C statics, one address for the life of the
 -- process, so these imports are pure: no arena window, nor its absence,
 -- changes what they return.
@@ -147,6 +155,10 @@ foreign import ccall unsafe "nn_thunk_null"
 
 foreign import ccall unsafe "nn_thunk_bool"
   c_nn_thunk_bool :: Word8 -> CThunkPtr
+
+-- Fills the static cell the first time it is asked for, so an action.
+foreign import ccall unsafe "nn_thunk_primop"
+  c_nn_thunk_primop :: Word32 -> IO CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_state"
   c_nn_thunk_state :: CThunkPtr -> IO Word8
@@ -184,14 +196,17 @@ foreign import ccall unsafe "nn_thunk_get_ctxstr"
 foreign import ccall unsafe "nn_thunk_get_lambda"
   c_nn_thunk_get_lambda :: CThunkPtr -> IO (Ptr ())
 
+foreign import ccall unsafe "nn_thunk_get_primop"
+  c_nn_thunk_get_primop :: CThunkPtr -> IO Word32
+
+foreign import ccall unsafe "nn_thunk_get_primop_app"
+  c_nn_thunk_get_primop_app :: CThunkPtr -> IO (Ptr ())
+
 foreign import ccall unsafe "nn_thunk_mark_blackhole"
   c_nn_thunk_mark_blackhole :: CThunkPtr -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_mark_pending"
   c_nn_thunk_mark_pending :: CThunkPtr -> IO CInt
-
-foreign import ccall unsafe "nn_thunk_set_computed"
-  c_nn_thunk_set_computed :: CThunkPtr -> Ptr () -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_int"
   c_nn_thunk_set_computed_int :: CThunkPtr -> Int64 -> IO CInt
@@ -223,6 +238,12 @@ foreign import ccall unsafe "nn_thunk_set_computed_ctxstr"
 foreign import ccall unsafe "nn_thunk_set_computed_lambda"
   c_nn_thunk_set_computed_lambda :: CThunkPtr -> Ptr () -> IO CInt
 
+foreign import ccall unsafe "nn_thunk_set_computed_primop"
+  c_nn_thunk_set_computed_primop :: CThunkPtr -> Word32 -> IO CInt
+
+foreign import ccall unsafe "nn_thunk_set_computed_primop_app"
+  c_nn_thunk_set_computed_primop_app :: CThunkPtr -> Ptr () -> IO CInt
+
 foreign import ccall unsafe "nn_thunk_count"
   c_nn_thunk_count :: IO Word32
 
@@ -238,9 +259,9 @@ foreign import ccall unsafe "nn_thunk_get"
 cthunkInit :: Word32 -> IO ()
 cthunkInit = c_nn_thunk_init
 
--- | Destroy the global thunk arena, freeing all C-side memory.
--- Caller must free all payload StablePtrs first.
--- All 'CThunkPtr' values become invalid after this call.
+-- | Destroy the global thunk arena, freeing its blocks.  Every
+-- 'CThunkPtr' into the arena becomes invalid after this call; the shared
+-- cells do not.
 cthunkDestroy :: IO ()
 cthunkDestroy = c_nn_thunk_destroy
 
@@ -264,44 +285,50 @@ cthunkNewBc bcIdx envPtr = cdataIO (checkedCPtr "nn_thunk_new_bc" =<< c_nn_thunk
 cthunkGetBcIdx :: (MonadCData m) => CThunkPtr -> m Word32
 cthunkGetBcIdx = cdataIO . c_nn_thunk_get_bc_idx
 
--- | Allocate a new pre-COMPUTED thunk with StablePtr payload (complex types).
-cthunkNewComputed :: (MonadCData m) => Ptr () -> m CThunkPtr
-cthunkNewComputed value = cdataIO (checkedCPtr "nn_thunk_new_computed" =<< c_nn_thunk_new_computed value)
-
--- | Allocate a pre-COMPUTED thunk with an inline int64 (no StablePtr).
+-- | Allocate a pre-COMPUTED thunk with an inline int64.
 cthunkNewComputedInt :: (MonadCData m) => Int64 -> m CThunkPtr
 cthunkNewComputedInt n = cdataIO (checkedCPtr "nn_thunk_new_computed_int" =<< c_nn_thunk_new_computed_int n)
 
--- | Allocate a pre-COMPUTED thunk with an inline double (no StablePtr).
+-- | Allocate a pre-COMPUTED thunk with an inline double.
 cthunkNewComputedFloat :: (MonadCData m) => Double -> m CThunkPtr
 cthunkNewComputedFloat d = cdataIO (checkedCPtr "nn_thunk_new_computed_float" =<< c_nn_thunk_new_computed_float (CDouble d))
 
--- | Allocate a pre-COMPUTED thunk pointing at a string's bytes (no
--- StablePtr).  For context-free strings only (tag 4).
+-- | Allocate a pre-COMPUTED thunk pointing at a string's bytes.  For
+-- context-free strings only (tag 4).
 cthunkNewComputedStr :: (MonadCData m) => CStrPtr -> m CThunkPtr
 cthunkNewComputedStr str = cdataIO (checkedCPtr "nn_thunk_new_computed_str" =<< c_nn_thunk_new_computed_str str)
 
--- | Allocate a pre-COMPUTED thunk pointing at a path's bytes (no StablePtr).
+-- | Allocate a pre-COMPUTED thunk pointing at a path's bytes.
 cthunkNewComputedPath :: (MonadCData m) => CStrPtr -> m CThunkPtr
 cthunkNewComputedPath str = cdataIO (checkedCPtr "nn_thunk_new_computed_path" =<< c_nn_thunk_new_computed_path str)
 
--- | Allocate a pre-COMPUTED thunk with a CList pointer (no StablePtr).
+-- | Allocate a pre-COMPUTED thunk with a CList pointer.
 cthunkNewComputedList :: (MonadCData m) => Ptr () -> m CThunkPtr
 cthunkNewComputedList list = cdataIO (checkedCPtr "nn_thunk_new_computed_list" =<< c_nn_thunk_new_computed_list list)
 
--- | Allocate a pre-COMPUTED thunk with a CAttrSet pointer (no StablePtr).
+-- | Allocate a pre-COMPUTED thunk with a CAttrSet pointer.
 cthunkNewComputedAttrs :: (MonadCData m) => Ptr () -> m CThunkPtr
 cthunkNewComputedAttrs attrs = cdataIO (checkedCPtr "nn_thunk_new_computed_attrs" =<< c_nn_thunk_new_computed_attrs attrs)
 
--- | Allocate a pre-COMPUTED thunk with a CCtxStr pointer (no StablePtr).
--- For strings with non-empty context (tag 8).
+-- | Allocate a pre-COMPUTED thunk with a CCtxStr pointer.  For strings
+-- with non-empty context (tag 8).
 cthunkNewComputedCtxStr :: (MonadCData m) => Ptr () -> m CThunkPtr
 cthunkNewComputedCtxStr ctxstr = cdataIO (checkedCPtr "nn_thunk_new_computed_ctxstr" =<< c_nn_thunk_new_computed_ctxstr ctxstr)
 
--- | Allocate a pre-COMPUTED thunk with a CLambda pointer (no StablePtr).
--- For lambda closures (tag 9).
+-- | Allocate a pre-COMPUTED thunk with a CLambda pointer.  For lambda
+-- closures (tag 9).
 cthunkNewComputedLambda :: (MonadCData m) => Ptr () -> m CThunkPtr
 cthunkNewComputedLambda lambda = cdataIO (checkedCPtr "nn_thunk_new_computed_lambda" =<< c_nn_thunk_new_computed_lambda lambda)
+
+-- | Allocate a pre-COMPUTED thunk holding a builtin's index inline, for a
+-- builtin with no argument taken (tag 10).
+cthunkNewComputedPrimop :: (MonadCData m) => Word32 -> m CThunkPtr
+cthunkNewComputedPrimop primop = cdataIO (checkedCPtr "nn_thunk_new_computed_primop" =<< c_nn_thunk_new_computed_primop primop)
+
+-- | Allocate a pre-COMPUTED thunk with a CPrimopApp pointer, for a
+-- builtin's partial application (tag 11).
+cthunkNewComputedPrimopApp :: (MonadCData m) => Ptr () -> m CThunkPtr
+cthunkNewComputedPrimopApp app = cdataIO (checkedCPtr "nn_thunk_new_computed_primop_app" =<< c_nn_thunk_new_computed_primop_app app)
 
 -- ---------------------------------------------------------------------------
 -- Shared constants
@@ -315,6 +342,17 @@ trueCell, falseCell :: CThunkPtr
 trueCell = c_nn_thunk_bool 1
 falseCell = c_nn_thunk_bool 0
 
+-- | The shared COMPUTED cell of the builtin at an index: a C static, one
+-- per builtin, the same in every arena window and outside all of them.
+-- An index from @NN_PRIMOP_CELLS@ on has no cell, which only a builtin
+-- table grown past that bound would ask for.
+cthunkPrimop :: (MonadCData m) => Word32 -> m CThunkPtr
+cthunkPrimop primop = cdataIO $ do
+  cell <- c_nn_thunk_primop primop
+  if cell == nullPtr
+    then cInvariantViolated "nn_thunk_primop" ("builtin index " ++ show primop ++ " is past the static cells (NN_PRIMOP_CELLS)")
+    else pure cell
+
 -- ---------------------------------------------------------------------------
 -- State queries
 -- ---------------------------------------------------------------------------
@@ -327,8 +365,8 @@ cthunkState = cdataIO . c_nn_thunk_state
 cthunkPayload :: (MonadCData m) => CThunkPtr -> m (Ptr ())
 cthunkPayload = cdataIO . c_nn_thunk_payload
 
--- | Read the value tag (valid when state == COMPUTED).
--- 0=INT, 1=FLOAT, 2=BOOL, 3=NULL, 255=PTR (StablePtr).
+-- | Read the value tag (valid when state == COMPUTED): the
+-- @NN_VALUE_*@ constants of @cbits\/nn_thunk.h@.
 cthunkValueTag :: (MonadCData m) => CThunkPtr -> m Word8
 cthunkValueTag = cdataIO . c_nn_thunk_value_tag
 
@@ -370,6 +408,14 @@ cthunkGetCtxStr = cdataIO . c_nn_thunk_get_ctxstr
 cthunkGetLambda :: (MonadCData m) => CThunkPtr -> m (Ptr ())
 cthunkGetLambda = cdataIO . c_nn_thunk_get_lambda
 
+-- | Read a builtin's index from a COMPUTED thunk (val_tag == 10).
+cthunkGetPrimop :: (MonadCData m) => CThunkPtr -> m Word32
+cthunkGetPrimop = cdataIO . c_nn_thunk_get_primop
+
+-- | Read a CPrimopApp pointer from a COMPUTED thunk (val_tag == 11).
+cthunkGetPrimopApp :: (MonadCData m) => CThunkPtr -> m (Ptr ())
+cthunkGetPrimopApp = cdataIO . c_nn_thunk_get_primop_app
+
 -- ---------------------------------------------------------------------------
 -- State transitions
 -- ---------------------------------------------------------------------------
@@ -390,23 +436,19 @@ cthunkMarkPending ptr = cdataIO (accepted <$> c_nn_thunk_mark_pending ptr)
 -- The pending payload they overwrite is an env pointer the env arena
 -- owns, so nothing is handed back.
 
--- | Store a StablePtr value (complex types).
-cthunkSetComputed :: (MonadCData m) => CThunkPtr -> Ptr () -> m Bool
-cthunkSetComputed ptr value = cdataIO (accepted <$> c_nn_thunk_set_computed ptr value)
-
--- | Store an inline int64 (no StablePtr).
+-- | Store an inline int64.
 cthunkSetComputedInt :: (MonadCData m) => CThunkPtr -> Int64 -> m Bool
 cthunkSetComputedInt ptr n = cdataIO (accepted <$> c_nn_thunk_set_computed_int ptr n)
 
--- | Store an inline double (no StablePtr).
+-- | Store an inline double.
 cthunkSetComputedFloat :: (MonadCData m) => CThunkPtr -> Double -> m Bool
 cthunkSetComputedFloat ptr d = cdataIO (accepted <$> c_nn_thunk_set_computed_float ptr (CDouble d))
 
--- | Store an inline bool (no StablePtr).
+-- | Store an inline bool.
 cthunkSetComputedBool :: (MonadCData m) => CThunkPtr -> Word8 -> m Bool
 cthunkSetComputedBool ptr b = cdataIO (accepted <$> c_nn_thunk_set_computed_bool ptr b)
 
--- | Store null (no StablePtr).
+-- | Store null.
 cthunkSetComputedNull :: (MonadCData m) => CThunkPtr -> m Bool
 cthunkSetComputedNull ptr = cdataIO (accepted <$> c_nn_thunk_set_computed_null ptr)
 
@@ -433,6 +475,14 @@ cthunkSetComputedCtxStr ptr ctxstr = cdataIO (accepted <$> c_nn_thunk_set_comput
 -- | Store a CLambda pointer.
 cthunkSetComputedLambda :: (MonadCData m) => CThunkPtr -> Ptr () -> m Bool
 cthunkSetComputedLambda ptr lambda = cdataIO (accepted <$> c_nn_thunk_set_computed_lambda ptr lambda)
+
+-- | Store a builtin's index inline.
+cthunkSetComputedPrimop :: (MonadCData m) => CThunkPtr -> Word32 -> m Bool
+cthunkSetComputedPrimop ptr primop = cdataIO (accepted <$> c_nn_thunk_set_computed_primop ptr primop)
+
+-- | Store a CPrimopApp pointer.
+cthunkSetComputedPrimopApp :: (MonadCData m) => CThunkPtr -> Ptr () -> m Bool
+cthunkSetComputedPrimopApp ptr app = cdataIO (accepted <$> c_nn_thunk_set_computed_primop_app ptr app)
 
 -- | A transition's C answer: 1 when it ran, 0 when the thunk's state
 -- refused it.

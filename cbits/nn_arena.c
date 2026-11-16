@@ -1,16 +1,5 @@
 /*
- * nn_arena.c - Batch StablePtr collection from the thunk arena.
- *
- * The Haskell teardown (Nix.Eval.Arena) needs every Haskell StablePtr the C
- * arena holds so it can free them.  These two entry points delegate to the
- * single-pass block-list walk in nn_thunk.c (nn_thunk_{count,collect}_
- * stableptrs), which is O(total) - index-based iteration via nn_thunk_get
- * would be O(total * blocks), since each get re-walks the block list.
- *
- * The one StablePtr source (see nn_thunk.c) is a COMPUTED thunk with
- * val_tag == NN_VALUE_PTR, holding a StablePtr NixValue.  Every other
- * payload (a pending thunk's env pointer, inline scalars, C pointers)
- * is NOT freed.
+ * nn_arena.c - Whether every sub-arena of the C data layer is live.
  */
 
 #include "nn_arena.h"
@@ -25,16 +14,4 @@ nn_arena_live(void)
 {
     return nn_symbol_live() && nn_str_live() && nn_thunk_live()
         && nn_env_live() && nn_bytecode_live();
-}
-
-uint32_t
-nn_arena_stableptr_count(void)
-{
-    return nn_thunk_count_stableptrs();
-}
-
-uint32_t
-nn_arena_collect_stableptrs(void **output, uint32_t max_count)
-{
-    return nn_thunk_collect_stableptrs(output, max_count);
 }

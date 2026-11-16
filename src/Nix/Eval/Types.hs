@@ -119,6 +119,8 @@ module Nix.Eval.Types
     StringCell (..),
     stringCell,
     pathCell,
+    PrimopCell (..),
+    primopCell,
 
     -- * Evaluation monad
     MonadEval (..),
@@ -132,7 +134,7 @@ module Nix.Eval.Types
 where
 
 import Control.Monad (forM_, zipWithM_)
-import Data.Bits (complement, shiftL, (.&.), (.|.))
+import Data.Bits (bit, complement, shiftL, testBit, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int64)
@@ -148,12 +150,11 @@ import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
-import Foreign.StablePtr (castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, newStablePtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Float (castWord64ToDouble)
 import Nix.Derivation (Derivation)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
-import Nix.Eval.Builtin (Builtin, builtinName)
+import Nix.Eval.Builtin (Builtin, builtinAtIndex, builtinIndex, builtinName)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
@@ -161,9 +162,10 @@ import Nix.Eval.CData (CData (..), MonadCData (..), cdataIO, inspectForDisplay, 
 import Nix.Eval.CEnv (NnEnv, cenvAllocWithScopes, cenvEmpty, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaLambdaNameSym, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
+import Nix.Eval.CPrimop (CPrimopAppPtr, cprimopAppArg, cprimopAppForced, cprimopAppNew, cprimopAppPrimop, cprimopAppTaken)
 import Nix.Eval.CStatus (cInvariantViolated, checkedCPtr)
 import Nix.Eval.CStr (CStrPtr, cstrBytes, cstrFromText, cstrNew, cstrText)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetPrimop, cthunkGetPrimopApp, cthunkGetStr, cthunkNewBc, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedPrimop, cthunkNewComputedPrimopApp, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval, compileParsed)
@@ -261,8 +263,7 @@ instance Eq Thunk where
 -- compilation a bare-literal @case@ gets, while the state dispatches (the
 -- 'forceThunk' of each evaluator) and the value dispatch ('readComputed')
 -- share one source of truth instead of repeating literals.  These MUST stay
--- in lockstep with @cbits\/nn_thunk.h@.  The remaining value tag (PTR, a
--- StablePtr payload) is the wildcard at the value dispatch.
+-- in lockstep with @cbits\/nn_thunk.h@.
 pattern ThunkPending, ThunkComputed, ThunkBlackhole :: Word8
 pattern ThunkPending = 0
 pattern ThunkComputed = 1
@@ -270,7 +271,7 @@ pattern ThunkBlackhole = 2
 
 -- | Value-kind tags for the C value layout, mirroring @cbits\/nn_thunk.h@.
 -- The tag selects which payload a computed (VALUE) thunk carries.
-pattern ValueInt, ValueFloat, ValueBool, ValueNull, ValueStr, ValuePath, ValueList, ValueAttrs, ValueCtxStr, ValueLambda :: Word8
+pattern ValueInt, ValueFloat, ValueBool, ValueNull, ValueStr, ValuePath, ValueList, ValueAttrs, ValueCtxStr, ValueLambda, ValuePrimop, ValuePrimopApp :: Word8
 pattern ValueInt = 0
 pattern ValueFloat = 1
 pattern ValueBool = 2
@@ -281,6 +282,8 @@ pattern ValueList = 6
 pattern ValueAttrs = 7
 pattern ValueCtxStr = 8
 pattern ValueLambda = 9
+pattern ValuePrimop = 10
+pattern ValuePrimopApp = 11
 
 -- | Whether a thunk is being forced right now, so it holds no value yet:
 -- the cell's BLACKHOLE state.  An answer about this moment: the state
@@ -297,8 +300,10 @@ readThunkValue (Thunk ptr) = do
     then Just <$> readComputed ptr
     else pure Nothing
 
--- | The value a COMPUTED cell holds, by its value tag: a scalar or a C
--- pointer read in place, any other value through its StablePtr.
+-- | The value a COMPUTED cell holds, by its value tag: a scalar or a
+-- builtin's index read in place, any other value from the C object the
+-- cell points to.  Every value lives in C, so a tag outside the
+-- @NN_VALUE_*@ constants is corrupt memory.
 readComputed :: (MonadCData m) => CThunkPtr -> m NixValue
 readComputed ptr = do
   tag <- cthunkValueTag ptr
@@ -317,9 +322,31 @@ readComputed ptr = do
       csptr <- castPtr <$> cthunkGetCtxStr ptr
       (\(bytes, ctx) -> VStrHeld bytes ctx (HeldCtxStr csptr)) <$> unmarshalStringContext csptr
     ValueLambda -> cthunkGetLambda ptr >>= unmarshalLambdaValue
-    _ {- PTR -} -> do
-      payload <- cthunkPayload ptr
-      cdataIO (deRefStablePtr (castPtrToStablePtr payload))
+    ValuePrimop -> (`VBuiltin` []) <$> (cthunkGetPrimop ptr >>= knownBuiltin)
+    ValuePrimopApp -> cthunkGetPrimopApp ptr >>= readPrimopApp . castPtr
+    other -> cdataIO (cInvariantViolated "nn_thunk_value_tag" ("no value has tag " ++ show other))
+
+-- | The builtin at an index a cell holds.
+knownBuiltin :: (MonadCData m) => Word32 -> m Builtin
+knownBuiltin index = maybe unknown pure (builtinAtIndex index)
+  where
+    unknown = cdataIO (cInvariantViolated "nn_thunk_get_primop" ("no builtin has index " ++ show index))
+
+-- | A builtin's partial application, read from its C object: an argument
+-- taken forced as the value its cell holds, any other as the cell.
+readPrimopApp :: (MonadCData m) => CPrimopAppPtr -> m NixValue
+readPrimopApp app = do
+  builtin <- cprimopAppPrimop app >>= knownBuiltin
+  taken <- cprimopAppTaken app
+  forced <- cprimopAppForced app
+  VBuiltin builtin <$> traverse (argumentAt forced) (take (fromIntegral taken) [0 ..])
+  where
+    argumentAt forced i = do
+      cell <- cprimopAppArg app i
+      if testBit forced (fromIntegral i)
+        then ArgForced <$> (readThunkValue (Thunk cell) >>= maybe notComputed pure)
+        else pure (ArgDeferred (Thunk cell))
+    notComputed = cdataIO (cInvariantViolated "nn_primop_app_arg" "an argument taken forced is not COMPUTED")
 
 -- | A Nix value - the result of evaluating an expression.
 data NixValue
@@ -802,7 +829,7 @@ mkThunk env thunkExpr = compile thunkExpr >>= mkThunkBc env
 
 -- | Like 'mkThunk' but avoids C arena allocation for trivial expressions.
 -- Resolved variables reuse the existing thunk from the env (no wrapper).
--- Literals use inline C scalars (no StablePtr).
+-- Literals use inline C scalars.
 -- Lambdas compile formals+body to bytecode and produce VLambda directly.
 -- Everything else falls back to 'mkThunk'.
 cheapThunk :: (MonadCData m) => Env -> Expr -> m Thunk
@@ -980,12 +1007,13 @@ literalStr bcIdx = do
           fmap (index :) <$> partIndices (n - 1 :: Int) (off + 2)
 
 -- | Wrap an already-computed value as a thunk.
--- Ints and floats use inline C thunks (no StablePtr); booleans and null
--- are the shared static cells, as upstream hands out one @vTrue@,
--- @vFalse@ and @vNull@ (eval.cc at 2.24.9, @EvalState::getBool@).
--- Attrs, paths, and strings use C-native tags (no StablePtr), a string or
--- a path over a copy of its bytes.
--- Other complex values fall back to StablePtr-backed C thunks.
+-- Ints, floats and a builtin with no argument taken are inline in a new
+-- cell; booleans and null are the shared static cells, as upstream hands
+-- out one @vTrue@, @vFalse@ and @vNull@ (eval.cc at 2.24.9,
+-- @EvalState::getBool@).  Every other value is a new cell pointing at its
+-- C object, a string or a path over the bytes it holds or a copy of
+-- them, and a partial application over a new object holding the cells
+-- of its arguments.
 evaluated :: (MonadCData m) => NixValue -> m Thunk
 evaluated val =
   Thunk <$> case val of
@@ -1001,9 +1029,30 @@ evaluated val =
         CtxStrCell csptr -> cthunkNewComputedCtxStr (castPtr csptr)
     VList (CList clistPtr) -> cthunkNewComputedList (castPtr clistPtr)
     VLambda (Env envPtr) formals bodyBcIdx -> marshalLambda envPtr formals bodyBcIdx >>= cthunkNewComputedLambda
-    _ -> do
-      sp <- cdataIO (newStablePtr val)
-      cthunkNewComputed (castStablePtrToPtr sp)
+    VBuiltin builtin args ->
+      primopCell builtin args >>= \case
+        PrimopCell primop -> cthunkNewComputedPrimop primop
+        PrimopAppCell app -> cthunkNewComputedPrimopApp (castPtr app)
+
+-- | What a cell holding a builtin value holds.
+data PrimopCell
+  = -- | A builtin with no argument taken: its index, inline.
+    PrimopCell !Word32
+  | -- | A partial application.
+    PrimopAppCell !CPrimopAppPtr
+
+-- | The C form of a builtin value: its index, or a partial application
+-- holding the cells of the arguments it has taken, an argument taken
+-- forced in a new cell for its value and any other as the cell it is.
+primopCell :: (MonadCData m) => Builtin -> [BuiltinArg] -> m PrimopCell
+primopCell builtin [] = pure (PrimopCell (builtinIndex builtin))
+primopCell builtin args = do
+  cells <- traverse argumentCell args
+  PrimopAppCell <$> cprimopAppNew (builtinIndex builtin) forced cells
+  where
+    argumentCell (ArgForced val) = unThunk <$> evaluated val
+    argumentCell (ArgDeferred (Thunk cell)) = pure cell
+    forced = foldl' (.|.) 0 [bit i | (i, ArgForced _) <- zip [0 ..] args]
 
 -- | Check if two thunks share the same memoization cell (C pointer
 -- equality): upstream's test of one @Value@'s address against another's,

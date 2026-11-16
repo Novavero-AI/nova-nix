@@ -3,8 +3,9 @@
  * what a set of roots reaches.
  *
  * The census reads what the allocators keep anyway (the thunk blocks, the
- * env pages, the tracked sets, list headers, lambdas and strings with
- * context, the string arena's blocks, the symbol table), so a process
+ * env pages, the tracked sets, list headers, lambdas, builtins' partial
+ * applications and strings with context, the string arena's blocks, the
+ * symbol table), so a process
  * that never takes one pays nothing for it beyond the test of
  * nn_stats_counting below.
  *
@@ -14,12 +15,9 @@
  * The mark frees and writes nothing in the data layer: its marks are bits
  * of its own.  It dereferences only a pointer it places at the start of
  * an object the index holds, and counts any other pointer it meets as
- * unplaced, which a graph the mark models in full never holds.
- *
- * A StablePtr payload (a COMPUTED thunk tagged NN_VALUE_PTR) is a Haskell
- * value, which can hold C pointers C cannot see.  The mark keeps each one
- * it reaches for the caller (nn_stats_take_stableptrs), which can name
- * what the value holds as further roots and mark again.
+ * unplaced, which a graph the mark models in full never holds.  Every
+ * value lives in C (nn_thunk.h), so the mark reaches all a root holds
+ * without the caller.
  *
  * One session at a time, between the arena's init and destroy, with no
  * allocation in the data layer while it is open.  Not thread-safe.
@@ -43,10 +41,11 @@
 #define NN_STATS_ATTRSETS   2  /* attribute sets: header, keys, positions, values */
 #define NN_STATS_LISTS      3  /* list headers and the items arrays they span */
 #define NN_STATS_LAMBDAS    4  /* lambda closures and their formal entries */
-#define NN_STATS_CTXSTRS    5  /* strings with context */
-#define NN_STATS_STRINGS    6  /* string and path bytes in the value arena (nn_str.h) */
-#define NN_STATS_SYMBOLS    7  /* interned names */
-#define NN_STATS_KIND_COUNT 8
+#define NN_STATS_PRIMOP_APPS 5 /* builtins' partial applications (nn_primop.h) */
+#define NN_STATS_CTXSTRS    6  /* strings with context */
+#define NN_STATS_STRINGS    7  /* string and path bytes in the value arena (nn_str.h) */
+#define NN_STATS_SYMBOLS    8  /* interned names */
+#define NN_STATS_KIND_COUNT 9
 
 /* A count no allocator keeps: the env pages hold envs and with-scope
  * arrays side by side with no record of which is which, so without
@@ -124,9 +123,6 @@ uint64_t nn_stats_overhead_bytes(void);
  * that a value points at is placed and not counted. */
 uint64_t nn_stats_code_bytes(void);
 
-/* The StablePtrs the arena holds: one per COMPUTED NN_VALUE_PTR thunk. */
-uint64_t nn_stats_stableptrs(void);
-
 /* --- The mark --- */
 
 /* Name a root.  NULL names nothing.  A root the index cannot place is
@@ -139,16 +135,9 @@ void nn_stats_root_string(const void *str);
 void nn_stats_root_ctxstr(const void *ctxstr);
 
 /* Follow every pointer from the roots named since the last call.  Marks
- * accumulate across calls.  Returns 0, or -1 when the work stack or the
- * StablePtr list could not grow, after which the session's figures are
- * incomplete. */
+ * accumulate across calls.  Returns 0, or -1 when the work stack could
+ * not grow, after which the session's figures are incomplete. */
 int nn_stats_mark(void);
-
-/* The StablePtr payloads the mark has reached and not yet handed over:
- * how many there are, and up to `max` of them written to `out`, which
- * hands them over.  Returns the number written. */
-uint32_t nn_stats_pending_stableptrs(void);
-uint32_t nn_stats_take_stableptrs(void **out, uint32_t max);
 
 /* Objects the mark has reached and the bytes they hold, by kind.  An
  * env's with-scope array counts in the bytes of the first env over it
@@ -157,12 +146,11 @@ uint32_t nn_stats_take_stableptrs(void **out, uint32_t max);
 void nn_stats_reached(uint64_t *counts, uint64_t *bytes);
 
 /* The mark's own work: the objects it has entered (thunks, envs,
- * with-scope arrays, sets, list headers, items arrays, lambdas,
- * strings with context; strings and symbols hold no pointer, and are
- * marked and not entered) and their bytes, the pointers it could not
- * place, and the StablePtr payloads it has reached. */
-void nn_stats_visited(uint64_t *objects, uint64_t *bytes,
-                      uint64_t *unplaced, uint64_t *stableptrs);
+ * with-scope arrays, sets, list headers, items arrays, lambdas, partial
+ * applications, strings with context; strings and symbols hold no
+ * pointer, and are marked and not entered) and their bytes, and the
+ * pointers it could not place. */
+void nn_stats_visited(uint64_t *objects, uint64_t *bytes, uint64_t *unplaced);
 
 /* The reached attribute sets by their number of entries, in ascending
  * order of that number: up to `max` distinct sizes go to `sizes`, with
