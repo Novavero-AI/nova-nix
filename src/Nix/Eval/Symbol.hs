@@ -1,8 +1,14 @@
--- | Interned string symbols backed by a C hash table.
+-- | Interned names backed by a C hash table.
 --
 -- Attribute names are the most repeated data in Nix evaluation.
 -- This module interns them via a C-side hash table ('cbits/nn_symbol.c'),
 -- replacing O(n) string comparison with O(1) integer comparison.
+--
+-- The table holds names alone: attribute names, formals, variables and
+-- the names interned at startup, as upstream's symbol table does
+-- (@SymbolTable@, symbol-table.hh at 2.24.9).  A name's place is the order
+-- it was interned in, which decides the order of a set's attributes, so
+-- a string value is never interned: its bytes live in "Nix.Eval.CStr".
 --
 -- @
 -- symbolInit 8192
@@ -21,9 +27,7 @@ module Nix.Eval.Symbol
 
     -- * Core operations
     symbolIntern,
-    symbolInternBytes,
     symbolText,
-    symbolBytes,
     symbolLen,
 
     -- * Diagnostics
@@ -31,9 +35,6 @@ module Nix.Eval.Symbol
   )
 where
 
-import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
-import qualified Data.ByteString.Unsafe as BSU
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Foreign as TF
@@ -95,25 +96,12 @@ symbolDestroy = c_nn_symbol_destroy
 -- Core operations
 -- ---------------------------------------------------------------------------
 
--- | Intern a 'Text' value, returning its t'Symbol'.
--- If the string was already interned, returns the existing symbol.
--- This is the canonical entry point for Text to C conversion; the table
--- stores the UTF-8 bytes, so a 'Text' and its 'Data.Text.Encoding.encodeUtf8'
--- image intern to the SAME symbol.
+-- | Intern a name, returning its t'Symbol'.
+-- If the name was already interned, returns the existing symbol.  The
+-- table stores the name's UTF-8 bytes.
 symbolIntern :: (MonadCData m) => Text -> m Symbol
 symbolIntern txt =
   cdataIO . TF.withCStringLen txt $ \(ptr, len) ->
-    checkedSymbol =<< c_nn_symbol_intern ptr (fromIntegral len)
-
--- | Intern raw bytes, returning their t'Symbol'.  The C table is
--- length-prefixed bytes with no encoding assumption, so arbitrary
--- (even invalid-UTF-8) byte strings intern losslessly.  The canonical
--- entry point for string VALUES, whose payload is a byte string.
--- 'BSU.unsafeUseAsCStringLen' is safe here: @nn_symbol_intern@ copies
--- the bytes into its own arena and never retains the pointer.
-symbolInternBytes :: (MonadCData m) => ByteString -> m Symbol
-symbolInternBytes bs =
-  cdataIO . BSU.unsafeUseAsCStringLen bs $ \(ptr, len) ->
     checkedSymbol =<< c_nn_symbol_intern ptr (fromIntegral len)
 
 -- | Reject the interner's failure sentinel before it can become a
@@ -135,9 +123,7 @@ checkedSymbol sid
 
 -- | Retrieve the text of an interned symbol.
 -- Returns the original string.  The result is safe to use - it copies
--- from the C arena into a fresh 'Text'.  Only valid for symbols interned
--- from 'Text' (attr names, paths, output names); a symbol holding a raw
--- byte-string payload must be read with 'symbolBytes' instead.
+-- from the C arena into a fresh 'Text'.
 symbolText :: Symbol -> Text
 symbolText (Symbol sid)
   | sid == invalidSymbolId = T.empty
@@ -148,19 +134,6 @@ symbolText (Symbol sid)
         else do
           len <- c_nn_symbol_len sid
           TF.peekCStringLen (ptr, fromIntegral len)
-
--- | Retrieve the raw bytes of an interned symbol - the exact bytes that
--- were interned, with no decoding.  The read side of 'symbolInternBytes'.
-symbolBytes :: Symbol -> ByteString
-symbolBytes (Symbol sid)
-  | sid == invalidSymbolId = BS.empty
-  | otherwise = readImmutable . cdataIO $ do
-      ptr <- c_nn_symbol_text sid
-      if ptr == nullPtr
-        then pure BS.empty
-        else do
-          len <- c_nn_symbol_len sid
-          BS.packCStringLen (ptr, fromIntegral len)
 
 -- | Byte length of a symbol's string.
 symbolLen :: Symbol -> Int

@@ -196,7 +196,7 @@ nn_thunk_new_computed_float(double value)
 }
 
 nn_thunk_t *
-nn_thunk_new_computed_str(uint32_t symbol)
+nn_thunk_new_computed_str(void *str)
 {
     nn_thunk_t *t = arena_alloc(g_arena);
     if (!t) return NULL;
@@ -204,12 +204,12 @@ nn_thunk_new_computed_str(uint32_t symbol)
     t->val_tag = NN_VALUE_STR;
     t->_pad = 0;
     t->bc_idx = 0;
-    t->payload = (void *)(intptr_t)symbol;
+    t->payload = str;
     return t;
 }
 
 nn_thunk_t *
-nn_thunk_new_computed_path(uint32_t symbol)
+nn_thunk_new_computed_path(void *str)
 {
     nn_thunk_t *t = arena_alloc(g_arena);
     if (!t) return NULL;
@@ -217,7 +217,7 @@ nn_thunk_new_computed_path(uint32_t symbol)
     t->val_tag = NN_VALUE_PATH;
     t->_pad = 0;
     t->bc_idx = 0;
-    t->payload = (void *)(intptr_t)symbol;
+    t->payload = str;
     return t;
 }
 
@@ -331,16 +331,16 @@ nn_thunk_get_bool(const nn_thunk_t *thunk)
     return (uint8_t)(intptr_t)thunk->payload;
 }
 
-uint32_t
+void *
 nn_thunk_get_str(const nn_thunk_t *thunk)
 {
-    return (uint32_t)(intptr_t)thunk->payload;
+    return thunk->payload;
 }
 
-uint32_t
+void *
 nn_thunk_get_path(const nn_thunk_t *thunk)
 {
-    return (uint32_t)(intptr_t)thunk->payload;
+    return thunk->payload;
 }
 
 void *
@@ -440,22 +440,22 @@ nn_thunk_set_computed_null(nn_thunk_t *thunk)
 }
 
 int
-nn_thunk_set_computed_str(nn_thunk_t *thunk, uint32_t symbol)
+nn_thunk_set_computed_str(nn_thunk_t *thunk, void *str)
 {
     if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_STR;
-    thunk->payload = (void *)(intptr_t)symbol;
+    thunk->payload = str;
     return 1;
 }
 
 int
-nn_thunk_set_computed_path(nn_thunk_t *thunk, uint32_t symbol)
+nn_thunk_set_computed_path(nn_thunk_t *thunk, void *str)
 {
     if (thunk->state == NN_THUNK_COMPUTED) return 0;
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = NN_VALUE_PATH;
-    thunk->payload = (void *)(intptr_t)symbol;
+    thunk->payload = str;
     return 1;
 }
 

@@ -71,8 +71,7 @@ import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLe
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
-import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolInternBytes)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), Thunk (..), attrSetSize, bytesToTextLossy, emptyContext, marshalLambda, marshalStringContext, pendingCode, readComputed, storePathOrThrow, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), StringCell (..), Thunk (..), attrSetSize, bytesToTextLossy, marshalLambda, pathCell, pendingCode, readComputed, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -875,7 +874,7 @@ instance MonadEval EvalIO where
         -- recursion".  Mirrors C++ Nix forceValue: catch (...) { restore; throw }.
         -- A genuine self-recursion still rethrows its NixAbortError, which
         -- escapes tryEval exactly as before.  Storing the value is inside the
-        -- restore too, since interning or marshalling it can fail.  The
+        -- restore too, since copying or marshalling it can fail.  The
         -- restore's own answer is not needed: it refuses only a thunk that is
         -- no longer BLACKHOLE, which a later force already handles, and the
         -- exception in flight is the one to report.
@@ -893,8 +892,9 @@ instance MonadEval EvalIO where
         EvalIO (liftIO (cInvariantViolated "nn_thunk_state" ("no thunk has state " ++ show other)))
 
 -- | Store a forced thunk's NixValue in its C cell.
--- Scalars (int, float, bool, null) are stored inline (no StablePtr).
--- Complex values use StablePtr.  The cell is BLACKHOLE while its force
+-- Scalars (int, float, bool, null) are stored inline; strings and paths
+-- (over the C object their bytes are held in, or a copy), lists, sets and
+-- lambdas as their C objects; any other value through a StablePtr.  The cell is BLACKHOLE while its force
 -- runs, which keeps every other path from computing it, so a setter's
 -- refusal is an invariant violation rather than a value to drop.
 storeComputed :: CThunkPtr -> NixValue -> IO ()
@@ -905,16 +905,11 @@ storeComputed ptr val = do
     VBool b -> cthunkSetComputedBool ptr (if b then 1 else 0)
     VNull -> cthunkSetComputedNull ptr
     VAttrs (AttrSet cset) -> cthunkSetComputedAttrs ptr (castPtr cset)
-    VPath p -> do
-      Symbol sym <- symbolIntern p
-      cthunkSetComputedPath ptr sym
-    VStr t ctx
-      | ctx == emptyContext -> do
-          Symbol sym <- symbolInternBytes t
-          cthunkSetComputedStr ptr sym
-      | otherwise -> do
-          csptr <- marshalStringContext t ctx
-          cthunkSetComputedCtxStr ptr (castPtr csptr)
+    VPathHeld p held -> pathCell p held >>= cthunkSetComputedPath ptr
+    VStrHeld t ctx held ->
+      stringCell t ctx held >>= \case
+        StrCell str -> cthunkSetComputedStr ptr str
+        CtxStrCell csptr -> cthunkSetComputedCtxStr ptr (castPtr csptr)
     VList (CList clistPtr) -> cthunkSetComputedList ptr (castPtr clistPtr)
     VLambda (Env envPtr) formals bodyBcIdx -> do
       lamPtr <- marshalLambda envPtr formals bodyBcIdx

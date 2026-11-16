@@ -3,9 +3,10 @@
  * what a set of roots reaches.
  *
  * The census reads what the allocators keep anyway (the thunk blocks, the
- * env pages, the tracked sets, list headers, lambdas and strings, the
- * symbol table), so a process that never takes one pays nothing for it
- * beyond the test of nn_stats_counting below.
+ * env pages, the tracked sets, list headers, lambdas and strings with
+ * context, the string arena's blocks, the symbol table), so a process
+ * that never takes one pays nothing for it beyond the test of
+ * nn_stats_counting below.
  *
  * A census is a session.  nn_stats_begin counts what is allocated and
  * indexes every object; the caller names roots and calls nn_stats_mark,
@@ -43,8 +44,9 @@
 #define NN_STATS_LISTS      3  /* list headers and the items arrays they span */
 #define NN_STATS_LAMBDAS    4  /* lambda closures and their formal entries */
 #define NN_STATS_CTXSTRS    5  /* strings with context */
-#define NN_STATS_SYMBOLS    6  /* interned text: every name and context-free string */
-#define NN_STATS_KIND_COUNT 7
+#define NN_STATS_STRINGS    6  /* string and path bytes in the value arena (nn_str.h) */
+#define NN_STATS_SYMBOLS    7  /* interned names */
+#define NN_STATS_KIND_COUNT 8
 
 /* A count no allocator keeps: the env pages hold envs and with-scope
  * arrays side by side with no record of which is which, so without
@@ -117,8 +119,9 @@ void nn_stats_allocated(uint64_t *counts, uint64_t *bytes);
  * text. */
 uint64_t nn_stats_overhead_bytes(void);
 
-/* Bytes the bytecode store holds.  Code is never freed, so the mark
- * does not look at it. */
+/* Bytes the bytecode store holds, its strings included.  Code is never
+ * freed, so the mark does not look at it, and a string of the code's
+ * that a value points at is placed and not counted. */
 uint64_t nn_stats_code_bytes(void);
 
 /* The StablePtrs the arena holds: one per COMPUTED NN_VALUE_PTR thunk. */
@@ -132,6 +135,8 @@ void nn_stats_root_thunk(const void *thunk);
 void nn_stats_root_env(const void *env);
 void nn_stats_root_attrset(const void *set);
 void nn_stats_root_list(const void *list);
+void nn_stats_root_string(const void *str);
+void nn_stats_root_ctxstr(const void *ctxstr);
 
 /* Follow every pointer from the roots named since the last call.  Marks
  * accumulate across calls.  Returns 0, or -1 when the work stack or the
@@ -153,9 +158,9 @@ void nn_stats_reached(uint64_t *counts, uint64_t *bytes);
 
 /* The mark's own work: the objects it has entered (thunks, envs,
  * with-scope arrays, sets, list headers, items arrays, lambdas,
- * strings with context; symbols are marked and not entered) and their
- * bytes, the pointers it could not place, and the StablePtr payloads it
- * has reached. */
+ * strings with context; strings and symbols hold no pointer, and are
+ * marked and not entered) and their bytes, the pointers it could not
+ * place, and the StablePtr payloads it has reached. */
 void nn_stats_visited(uint64_t *objects, uint64_t *bytes,
                       uint64_t *unplaced, uint64_t *stableptrs);
 

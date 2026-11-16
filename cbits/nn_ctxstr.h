@@ -3,7 +3,7 @@
  *
  * Nix strings carry a StringContext: a set of store path references
  * that track derivation dependencies.  Context-free strings use
- * nn_thunk tag 4 (bare nn_symbol_t).  Context-bearing strings use
+ * nn_thunk tag 4 (an nn_str_t pointer).  Context-bearing strings use
  * tag 8 (nn_ctxstr_t pointer).
  *
  * Each context element is one of:
@@ -11,7 +11,12 @@
  *   SCDrvOutput  - derivation output (.drv path + output name)
  *   SCAllOutputs - all outputs of a derivation (drvPath itself)
  *
- * StorePaths are represented as two interned symbols (hash + name).
+ * The text, a StorePath's hash and name, and an output name are each an
+ * nn_str_t (nn_str.h), made in the value arena for the string they
+ * belong to, as upstream copies each context element for each value
+ * (encodeContext, eval.cc:833-845 at 2.24.9).  None is a symbol: upstream
+ * interns no string value, and a symbol taken here would move the place
+ * of every name interned after it.
  *
  * Memory: each nn_ctxstr_t is a single contiguous allocation via
  * C99 flexible array member.  Headers are tracked globally for
@@ -23,6 +28,8 @@
 
 #include <stdint.h>
 
+#include "nn_str.h"
+
 /* --- Context element tags --- */
 
 #define NN_SCE_PLAIN        0
@@ -32,27 +39,24 @@
 /* --- Types --- */
 
 /* A single string context element: store path reference with kind tag.
- * sp_hash and sp_name are interned nn_symbol_t values representing
- * the StorePath's hash and name fields.  output is an interned symbol
- * for the derivation output name (only valid when tag == DRV_OUTPUT,
- * 0 otherwise). */
+ * sp_hash and sp_name are the StorePath's hash and name.  output is the
+ * derivation output name when tag == DRV_OUTPUT, and NULL otherwise. */
 typedef struct nn_sce {
     uint8_t     tag;
-    uint32_t    sp_hash;
-    uint32_t    sp_name;
-    uint32_t    output;
+    nn_str_t   *sp_hash;
+    nn_str_t   *sp_name;
+    nn_str_t   *output;
 } nn_sce_t;
 
-/* A string with context.  text is an interned nn_symbol_t for the
- * string content.  ctx_count is the number of context elements; it is
- * a full uint32_t because context sets scale with the evaluated
- * expression (a narrower count would wrap and undersize the array).
- * ctx[] is a C99 flexible array of context elements, sorted by
- * (tag, sp_hash, sp_name, output) for deterministic comparison.
+/* A string with context.  text is the string's bytes.  ctx_count is the
+ * number of context elements; it is a full uint32_t because context sets
+ * scale with the evaluated expression (a narrower count would wrap and
+ * undersize the array).  ctx[] is a C99 flexible array of context
+ * elements, in the order they were set.
  *
  * Single contiguous allocation: header + elements. */
 typedef struct nn_ctxstr {
-    uint32_t    text;
+    nn_str_t   *text;
     uint32_t    ctx_count;
     nn_sce_t    ctx[];
 } nn_ctxstr_t;
@@ -60,11 +64,11 @@ typedef struct nn_ctxstr {
 /* --- Lifecycle --- */
 
 /* Allocate a new nn_ctxstr_t with space for ctx_count elements.
- * Elements are uninitialized - caller must fill via nn_ctxstr_set_*.
+ * Elements are zeroed until the caller fills them via nn_ctxstr_set_*.
  * Tracked globally for bulk cleanup.  Returns NULL on allocation
  * failure or if the element array size would overflow - the caller
  * must check. */
-nn_ctxstr_t *nn_ctxstr_new(uint32_t text, uint32_t ctx_count);
+nn_ctxstr_t *nn_ctxstr_new(nn_str_t *text, uint32_t ctx_count);
 
 /* Free all tracked nn_ctxstr_t allocations.  Called during arena
  * teardown, after thunk iteration but before env/symbol cleanup. */
@@ -77,26 +81,26 @@ void nn_ctxstr_free_all(void);
  * bounds - the bound stays live under NDEBUG. */
 
 void nn_ctxstr_set_plain(nn_ctxstr_t *s, uint32_t idx,
-                         uint32_t sp_hash, uint32_t sp_name);
+                         nn_str_t *sp_hash, nn_str_t *sp_name);
 
 void nn_ctxstr_set_drv_output(nn_ctxstr_t *s, uint32_t idx,
-                              uint32_t sp_hash, uint32_t sp_name,
-                              uint32_t output);
+                              nn_str_t *sp_hash, nn_str_t *sp_name,
+                              nn_str_t *output);
 
 void nn_ctxstr_set_all_outputs(nn_ctxstr_t *s, uint32_t idx,
-                               uint32_t sp_hash, uint32_t sp_name);
+                               nn_str_t *sp_hash, nn_str_t *sp_name);
 
 /* --- Accessors --- */
 
-uint32_t nn_ctxstr_text(const nn_ctxstr_t *s);
-uint32_t nn_ctxstr_ctx_count(const nn_ctxstr_t *s);
+nn_str_t *nn_ctxstr_text(const nn_ctxstr_t *s);
+uint32_t  nn_ctxstr_ctx_count(const nn_ctxstr_t *s);
 
-/* Element reads with idx >= ctx_count return 0 (asserts in debug
+/* Element reads with idx >= ctx_count return 0 or NULL (asserts in debug
  * builds) rather than reading out of bounds. */
-uint8_t  nn_ctxstr_elem_tag(const nn_ctxstr_t *s, uint32_t idx);
-uint32_t nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint32_t idx);
-uint32_t nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint32_t idx);
-uint32_t nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint32_t idx);
+uint8_t   nn_ctxstr_elem_tag(const nn_ctxstr_t *s, uint32_t idx);
+nn_str_t *nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint32_t idx);
+nn_str_t *nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint32_t idx);
+nn_str_t *nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint32_t idx);
 
 /* --- Census (nn_stats.h) --- */
 

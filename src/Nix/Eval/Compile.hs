@@ -68,6 +68,8 @@ import Nix.Eval.CBytecode
     cbcData,
     cbcEmit,
     cbcEmitData,
+    cbcEmitString,
+    cbcEmitText,
     formalName,
     formalNamedSet,
     formalSet,
@@ -107,7 +109,7 @@ import Nix.Eval.CBytecode
 import Nix.Eval.CData (MonadCData)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.SourcePos (PosIdx (..), PosRecorder, newPosRecorder, recordPos)
-import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolInternBytes, symbolText)
+import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Expr.Types
   ( AttrKey (..),
     BinaryOp (..),
@@ -184,7 +186,7 @@ compileWith recorder = go
       leftIdx <- go left
       rightIdx <- go right
       cbcEmit OpBinary (encodeBinaryOp op) 0 leftIdx rightIdx 0
-    go (ESearchPath name) = compileSymbolOp OpSearchPath name
+    go (ESearchPath name) = compileTextOp OpSearchPath name
     go (EPos pos) = do
       posWord <- positionWord pos
       cbcEmit OpPos 0 0 posWord 0 0
@@ -204,14 +206,23 @@ compileWith recorder = go
       cbcEmit OpLitBool 0 (if b then 1 else 0) 0 0 0
     compileLit NixNull =
       cbcEmit OpLitNull 0 0 0 0 0
-    compileLit (NixUri u) = compileSymbolOp OpLitUri u
-    compileLit (NixPath p) = compileSymbolOp OpLitPath p
+    compileLit (NixUri u) = compileTextOp OpLitUri u
+    compileLit (NixPath p) = compileTextOp OpLitPath p
 
     -- \| Emit an instruction whose only operand is an interned symbol.
     compileSymbolOp :: Word8 -> Text -> IO Word32
     compileSymbolOp op name = do
       Symbol sym <- symbolIntern name
       cbcEmit op 0 0 sym 0 0
+
+    -- \| Emit an instruction whose only operand is a string of the code's:
+    -- a URI, a path or a search path, each a value upstream's parser
+    -- makes (an @ExprString@ or an @ExprPath@, parser.y:294-308 and
+    -- :340-357 at 2.24.9), not a name it interns.
+    compileTextOp :: Word8 -> Text -> IO Word32
+    compileTextOp op text = do
+      index <- cbcEmitText text
+      cbcEmit op 0 0 index 0 0
 
     -- -----------------------------------------------------------------
     -- Applications (EApp)
@@ -233,13 +244,16 @@ compileWith recorder = go
       (partCount, dataOff) <- emitCounted "string with parts" (length parts) (pairWords compiled)
       cbcEmit op 0 partCount dataOff 0 0
 
+    -- \| A literal part's bytes are a string of the code's, which a value
+    -- the part makes alone points at, as upstream's @ExprString@ holds
+    -- the value its bytes make (nixexpr.hh:122-129 at 2.24.9).
     compileOnePart :: StringPart -> IO (Word32, Word32)
     compileOnePart (StrLit bytes) = do
-      Symbol sym <- symbolInternBytes bytes
-      pure (strpartLit, sym)
+      index <- cbcEmitString bytes
+      pure (strpartLit, index)
     compileOnePart (StrEsc bytes) = do
-      Symbol sym <- symbolInternBytes bytes
-      pure (strpartEsc, sym)
+      index <- cbcEmitString bytes
+      pure (strpartEsc, index)
     compileOnePart (StrInterp expr) = do
       idx <- go expr
       pure (strpartInterp, idx)

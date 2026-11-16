@@ -82,6 +82,7 @@ library
     Nix.Eval.CLambda
     Nix.Eval.CList
     Nix.Eval.CCtxStr
+    Nix.Eval.CStr
     Nix.Eval.CBytecode
     Nix.Eval.CStats
     Nix.Eval.Compile
@@ -178,6 +179,7 @@ library
 
   c-sources:
     cbits/nn_symbol.c
+    cbits/nn_str.c
     cbits/nn_attrset.c
     cbits/nn_thunk.c
     cbits/nn_env.c

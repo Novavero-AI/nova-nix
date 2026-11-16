@@ -86,6 +86,7 @@ import Foreign.C.Types (CDouble (..), CInt (..))
 import Foreign.Ptr (Ptr)
 import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CStatus (checkedCPtr)
+import Nix.Eval.CStr (CStrPtr)
 
 -- | Phantom type for C-side @nn_thunk_t@.
 data NnThunk
@@ -119,10 +120,10 @@ foreign import ccall unsafe "nn_thunk_new_computed_float"
   c_nn_thunk_new_computed_float :: CDouble -> IO CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_new_computed_str"
-  c_nn_thunk_new_computed_str :: Word32 -> IO CThunkPtr
+  c_nn_thunk_new_computed_str :: CStrPtr -> IO CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_new_computed_path"
-  c_nn_thunk_new_computed_path :: Word32 -> IO CThunkPtr
+  c_nn_thunk_new_computed_path :: CStrPtr -> IO CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_new_computed_list"
   c_nn_thunk_new_computed_list :: Ptr () -> IO CThunkPtr
@@ -166,10 +167,10 @@ foreign import ccall unsafe "nn_thunk_get_bool"
   c_nn_thunk_get_bool :: CThunkPtr -> IO Word8
 
 foreign import ccall unsafe "nn_thunk_get_str"
-  c_nn_thunk_get_str :: CThunkPtr -> IO Word32
+  c_nn_thunk_get_str :: CThunkPtr -> IO CStrPtr
 
 foreign import ccall unsafe "nn_thunk_get_path"
-  c_nn_thunk_get_path :: CThunkPtr -> IO Word32
+  c_nn_thunk_get_path :: CThunkPtr -> IO CStrPtr
 
 foreign import ccall unsafe "nn_thunk_get_list"
   c_nn_thunk_get_list :: CThunkPtr -> IO (Ptr ())
@@ -205,10 +206,10 @@ foreign import ccall unsafe "nn_thunk_set_computed_null"
   c_nn_thunk_set_computed_null :: CThunkPtr -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_str"
-  c_nn_thunk_set_computed_str :: CThunkPtr -> Word32 -> IO CInt
+  c_nn_thunk_set_computed_str :: CThunkPtr -> CStrPtr -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_path"
-  c_nn_thunk_set_computed_path :: CThunkPtr -> Word32 -> IO CInt
+  c_nn_thunk_set_computed_path :: CThunkPtr -> CStrPtr -> IO CInt
 
 foreign import ccall unsafe "nn_thunk_set_computed_list"
   c_nn_thunk_set_computed_list :: CThunkPtr -> Ptr () -> IO CInt
@@ -275,14 +276,14 @@ cthunkNewComputedInt n = cdataIO (checkedCPtr "nn_thunk_new_computed_int" =<< c_
 cthunkNewComputedFloat :: (MonadCData m) => Double -> m CThunkPtr
 cthunkNewComputedFloat d = cdataIO (checkedCPtr "nn_thunk_new_computed_float" =<< c_nn_thunk_new_computed_float (CDouble d))
 
--- | Allocate a pre-COMPUTED thunk with an interned string symbol (no StablePtr).
--- For context-free strings only (tag 4).
-cthunkNewComputedStr :: (MonadCData m) => Word32 -> m CThunkPtr
-cthunkNewComputedStr sym = cdataIO (checkedCPtr "nn_thunk_new_computed_str" =<< c_nn_thunk_new_computed_str sym)
+-- | Allocate a pre-COMPUTED thunk pointing at a string's bytes (no
+-- StablePtr).  For context-free strings only (tag 4).
+cthunkNewComputedStr :: (MonadCData m) => CStrPtr -> m CThunkPtr
+cthunkNewComputedStr str = cdataIO (checkedCPtr "nn_thunk_new_computed_str" =<< c_nn_thunk_new_computed_str str)
 
--- | Allocate a pre-COMPUTED thunk with an interned path symbol (no StablePtr).
-cthunkNewComputedPath :: (MonadCData m) => Word32 -> m CThunkPtr
-cthunkNewComputedPath sym = cdataIO (checkedCPtr "nn_thunk_new_computed_path" =<< c_nn_thunk_new_computed_path sym)
+-- | Allocate a pre-COMPUTED thunk pointing at a path's bytes (no StablePtr).
+cthunkNewComputedPath :: (MonadCData m) => CStrPtr -> m CThunkPtr
+cthunkNewComputedPath str = cdataIO (checkedCPtr "nn_thunk_new_computed_path" =<< c_nn_thunk_new_computed_path str)
 
 -- | Allocate a pre-COMPUTED thunk with a CList pointer (no StablePtr).
 cthunkNewComputedList :: (MonadCData m) => Ptr () -> m CThunkPtr
@@ -345,12 +346,12 @@ cthunkGetFloat ptr = cdataIO $ do
 cthunkGetBool :: (MonadCData m) => CThunkPtr -> m Word8
 cthunkGetBool = cdataIO . c_nn_thunk_get_bool
 
--- | Read an interned string symbol from a COMPUTED thunk (val_tag == 4).
-cthunkGetStr :: (MonadCData m) => CThunkPtr -> m Word32
+-- | Read a string's bytes pointer from a COMPUTED thunk (val_tag == 4).
+cthunkGetStr :: (MonadCData m) => CThunkPtr -> m CStrPtr
 cthunkGetStr = cdataIO . c_nn_thunk_get_str
 
--- | Read an interned path symbol from a COMPUTED thunk (val_tag == 5).
-cthunkGetPath :: (MonadCData m) => CThunkPtr -> m Word32
+-- | Read a path's bytes pointer from a COMPUTED thunk (val_tag == 5).
+cthunkGetPath :: (MonadCData m) => CThunkPtr -> m CStrPtr
 cthunkGetPath = cdataIO . c_nn_thunk_get_path
 
 -- | Read a CList pointer from a COMPUTED thunk (val_tag == 6).
@@ -409,13 +410,13 @@ cthunkSetComputedBool ptr b = cdataIO (accepted <$> c_nn_thunk_set_computed_bool
 cthunkSetComputedNull :: (MonadCData m) => CThunkPtr -> m Bool
 cthunkSetComputedNull ptr = cdataIO (accepted <$> c_nn_thunk_set_computed_null ptr)
 
--- | Store an interned string symbol.
-cthunkSetComputedStr :: (MonadCData m) => CThunkPtr -> Word32 -> m Bool
-cthunkSetComputedStr ptr sym = cdataIO (accepted <$> c_nn_thunk_set_computed_str ptr sym)
+-- | Store a pointer to a string's bytes.
+cthunkSetComputedStr :: (MonadCData m) => CThunkPtr -> CStrPtr -> m Bool
+cthunkSetComputedStr ptr str = cdataIO (accepted <$> c_nn_thunk_set_computed_str ptr str)
 
--- | Store an interned path symbol.
-cthunkSetComputedPath :: (MonadCData m) => CThunkPtr -> Word32 -> m Bool
-cthunkSetComputedPath ptr sym = cdataIO (accepted <$> c_nn_thunk_set_computed_path ptr sym)
+-- | Store a pointer to a path's bytes.
+cthunkSetComputedPath :: (MonadCData m) => CThunkPtr -> CStrPtr -> m Bool
+cthunkSetComputedPath ptr str = cdataIO (accepted <$> c_nn_thunk_set_computed_path ptr str)
 
 -- | Store a CList pointer.
 cthunkSetComputedList :: (MonadCData m) => CThunkPtr -> Ptr () -> m Bool

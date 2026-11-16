@@ -1,9 +1,10 @@
 -- | C-backed context-bearing strings via FFI.
 --
 -- Wraps @cbits/nn_ctxstr.c@ - a string with its StringContext stored
--- as a contiguous C struct.  Context-free strings continue to use
--- thunk tag 4 (bare nn_symbol_t); this module handles tag 8 for
--- strings with non-empty context.
+-- as a contiguous C struct, its text and each store path's hash and name
+-- and output name a string's bytes ("Nix.Eval.CStr").  Context-free
+-- strings use thunk tag 4 (a string's bytes alone); this module handles
+-- tag 8 for strings with non-empty context.
 --
 -- This module provides raw FFI bindings only.  The higher-level
 -- marshalling between t'Nix.Eval.Types.StringContext' and C is in "Nix.Eval.Types"
@@ -35,6 +36,7 @@ where
 import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
 import Nix.Eval.CData (MonadCData, cdataIO)
+import Nix.Eval.CStr (CStrPtr)
 
 -- | Phantom type for C-side @nn_ctxstr_t@.
 data NnCtxStr
@@ -47,22 +49,22 @@ type CCtxStrPtr = Ptr NnCtxStr
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "nn_ctxstr_new"
-  c_nn_ctxstr_new :: Word32 -> Word32 -> IO CCtxStrPtr
+  c_nn_ctxstr_new :: CStrPtr -> Word32 -> IO CCtxStrPtr
 
 foreign import ccall unsafe "nn_ctxstr_free_all"
   c_nn_ctxstr_free_all :: IO ()
 
 foreign import ccall unsafe "nn_ctxstr_set_plain"
-  c_nn_ctxstr_set_plain :: CCtxStrPtr -> Word32 -> Word32 -> Word32 -> IO ()
+  c_nn_ctxstr_set_plain :: CCtxStrPtr -> Word32 -> CStrPtr -> CStrPtr -> IO ()
 
 foreign import ccall unsafe "nn_ctxstr_set_drv_output"
-  c_nn_ctxstr_set_drv_output :: CCtxStrPtr -> Word32 -> Word32 -> Word32 -> Word32 -> IO ()
+  c_nn_ctxstr_set_drv_output :: CCtxStrPtr -> Word32 -> CStrPtr -> CStrPtr -> CStrPtr -> IO ()
 
 foreign import ccall unsafe "nn_ctxstr_set_all_outputs"
-  c_nn_ctxstr_set_all_outputs :: CCtxStrPtr -> Word32 -> Word32 -> Word32 -> IO ()
+  c_nn_ctxstr_set_all_outputs :: CCtxStrPtr -> Word32 -> CStrPtr -> CStrPtr -> IO ()
 
 foreign import ccall unsafe "nn_ctxstr_text"
-  c_nn_ctxstr_text :: CCtxStrPtr -> IO Word32
+  c_nn_ctxstr_text :: CCtxStrPtr -> IO CStrPtr
 
 foreign import ccall unsafe "nn_ctxstr_ctx_count"
   c_nn_ctxstr_ctx_count :: CCtxStrPtr -> IO Word32
@@ -71,24 +73,24 @@ foreign import ccall unsafe "nn_ctxstr_elem_tag"
   c_nn_ctxstr_elem_tag :: CCtxStrPtr -> Word32 -> IO Word8
 
 foreign import ccall unsafe "nn_ctxstr_elem_hash"
-  c_nn_ctxstr_elem_hash :: CCtxStrPtr -> Word32 -> IO Word32
+  c_nn_ctxstr_elem_hash :: CCtxStrPtr -> Word32 -> IO CStrPtr
 
 foreign import ccall unsafe "nn_ctxstr_elem_name"
-  c_nn_ctxstr_elem_name :: CCtxStrPtr -> Word32 -> IO Word32
+  c_nn_ctxstr_elem_name :: CCtxStrPtr -> Word32 -> IO CStrPtr
 
 foreign import ccall unsafe "nn_ctxstr_elem_output"
-  c_nn_ctxstr_elem_output :: CCtxStrPtr -> Word32 -> IO Word32
+  c_nn_ctxstr_elem_output :: CCtxStrPtr -> Word32 -> IO CStrPtr
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
--- | Allocate a new context string with space for @ctxCount@ elements.
--- Elements are uninitialized - caller must fill via set functions.
+-- | Allocate a new context string over its text's bytes with space for
+-- @ctxCount@ elements, which the caller fills via the set functions.
 -- Returns 'Foreign.Ptr.nullPtr' on allocation failure or if the
 -- element array size would overflow - the caller must check.
-cctxstrNew :: (MonadCData m) => Word32 -> Word32 -> m CCtxStrPtr
-cctxstrNew textSym ctxCount = cdataIO (c_nn_ctxstr_new textSym ctxCount)
+cctxstrNew :: (MonadCData m) => CStrPtr -> Word32 -> m CCtxStrPtr
+cctxstrNew text ctxCount = cdataIO (c_nn_ctxstr_new text ctxCount)
 
 -- | Free all tracked nn_ctxstr_t allocations (arena-style cleanup).
 cctxstrFreeAll :: IO ()
@@ -99,26 +101,26 @@ cctxstrFreeAll = c_nn_ctxstr_free_all
 -- ---------------------------------------------------------------------------
 
 -- | Set context element @i@ to a plain store-path reference (@SCPlain@),
--- identified by its name and hash symbols.
-cctxstrSetPlain :: (MonadCData m) => CCtxStrPtr -> Word32 -> Word32 -> Word32 -> m ()
-cctxstrSetPlain ptr idx hashSym nameSym = cdataIO (c_nn_ctxstr_set_plain ptr idx hashSym nameSym)
+-- identified by its hash and name.
+cctxstrSetPlain :: (MonadCData m) => CCtxStrPtr -> Word32 -> CStrPtr -> CStrPtr -> m ()
+cctxstrSetPlain ptr idx hash name = cdataIO (c_nn_ctxstr_set_plain ptr idx hash name)
 
 -- | Set context element @i@ to a derivation-output reference (@SCDrvOutput@):
--- name and hash symbols plus the output-name symbol.
-cctxstrSetDrvOutput :: (MonadCData m) => CCtxStrPtr -> Word32 -> Word32 -> Word32 -> Word32 -> m ()
-cctxstrSetDrvOutput ptr idx hashSym nameSym outSym = cdataIO (c_nn_ctxstr_set_drv_output ptr idx hashSym nameSym outSym)
+-- hash and name plus the output name.
+cctxstrSetDrvOutput :: (MonadCData m) => CCtxStrPtr -> Word32 -> CStrPtr -> CStrPtr -> CStrPtr -> m ()
+cctxstrSetDrvOutput ptr idx hash name output = cdataIO (c_nn_ctxstr_set_drv_output ptr idx hash name output)
 
 -- | Set context element @i@ to an all-outputs reference (@SCAllOutputs@),
--- identified by its name and hash symbols.
-cctxstrSetAllOutputs :: (MonadCData m) => CCtxStrPtr -> Word32 -> Word32 -> Word32 -> m ()
-cctxstrSetAllOutputs ptr idx hashSym nameSym = cdataIO (c_nn_ctxstr_set_all_outputs ptr idx hashSym nameSym)
+-- identified by its hash and name.
+cctxstrSetAllOutputs :: (MonadCData m) => CCtxStrPtr -> Word32 -> CStrPtr -> CStrPtr -> m ()
+cctxstrSetAllOutputs ptr idx hash name = cdataIO (c_nn_ctxstr_set_all_outputs ptr idx hash name)
 
 -- ---------------------------------------------------------------------------
 -- Accessors
 -- ---------------------------------------------------------------------------
 
--- | The interned-symbol id of the context string's text.
-cctxstrText :: (MonadCData m) => CCtxStrPtr -> m Word32
+-- | The context string's text.
+cctxstrText :: (MonadCData m) => CCtxStrPtr -> m CStrPtr
 cctxstrText = cdataIO . c_nn_ctxstr_text
 
 -- | The number of context elements attached to the string.
@@ -129,14 +131,14 @@ cctxstrCtxCount = cdataIO . c_nn_ctxstr_ctx_count
 cctxstrElemTag :: (MonadCData m) => CCtxStrPtr -> Word32 -> m Word8
 cctxstrElemTag ptr idx = cdataIO (c_nn_ctxstr_elem_tag ptr idx)
 
--- | The store-path-hash symbol of context element @i@.
-cctxstrElemHash :: (MonadCData m) => CCtxStrPtr -> Word32 -> m Word32
+-- | The store path's hash of context element @i@.
+cctxstrElemHash :: (MonadCData m) => CCtxStrPtr -> Word32 -> m CStrPtr
 cctxstrElemHash ptr idx = cdataIO (c_nn_ctxstr_elem_hash ptr idx)
 
--- | The store-path-name symbol of context element @i@.
-cctxstrElemName :: (MonadCData m) => CCtxStrPtr -> Word32 -> m Word32
+-- | The store path's name of context element @i@.
+cctxstrElemName :: (MonadCData m) => CCtxStrPtr -> Word32 -> m CStrPtr
 cctxstrElemName ptr idx = cdataIO (c_nn_ctxstr_elem_name ptr idx)
 
--- | The output-name symbol of context element @i@ (drv-output elements only).
-cctxstrElemOutput :: (MonadCData m) => CCtxStrPtr -> Word32 -> m Word32
+-- | The output name of context element @i@ (drv-output elements only).
+cctxstrElemOutput :: (MonadCData m) => CCtxStrPtr -> Word32 -> m CStrPtr
 cctxstrElemOutput ptr idx = cdataIO (c_nn_ctxstr_elem_output ptr idx)

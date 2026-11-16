@@ -1,14 +1,17 @@
 /*
  * nn_stats.c - A census of the C data layer (nn_stats.h).
  *
- * The index places a pointer in one of two ways.  Thunk cells and env
- * page allocations sit in a few large regions (the arena's blocks, the
- * env pages): a region index sorts the regions by address and gives each
- * a run of bits, one per thunk cell or per NN_ENV_ALIGNMENT bytes of
- * page, so a pointer finds its bit by a binary search over regions.  Sets,
- * list headers, lambdas and strings with context are each their own
- * allocation: an object index sorts a copy of the module's tracking array
- * and gives each object a bit, found by a binary search for its address.
+ * The index places a pointer in one of two ways.  Thunk cells, env page
+ * allocations and strings sit in a few large regions (the arena's blocks,
+ * the env pages, the string arenas' blocks): a region index sorts the
+ * regions by address and gives each a run of bits, one per thunk cell,
+ * per NN_ENV_ALIGNMENT bytes of page or per NN_STR_ALIGNMENT bytes of
+ * strings, so a pointer finds its bit by a binary search over regions;
+ * the code's strings are indexed only to be placed, as code is not
+ * marked.  Sets, list headers, lambdas and strings with context are each
+ * their own allocation: an object index sorts a copy of the module's
+ * tracking array and gives each object a bit, found by a binary search
+ * for its address.
  * Addresses are compared as uintptr_t, since C orders pointers only
  * within one object.
  *
@@ -32,6 +35,7 @@
 #include "nn_env.h"
 #include "nn_lambda.h"
 #include "nn_list.h"
+#include "nn_str.h"
 #include "nn_symbol.h"
 #include "nn_thunk.h"
 
@@ -98,6 +102,8 @@ static struct {
     nn_object_index_t lists;
     nn_object_index_t lambdas;
     nn_object_index_t ctxstrs;
+    nn_region_index_t strings;
+    nn_region_index_t code_strings;
 
     nn_items_t *items;
     uint32_t    item_count;
@@ -500,6 +506,45 @@ static int index_ctxstrs(void)
     return 0;
 }
 
+/* Index an arena's strings, a bit per NN_STR_ALIGNMENT bytes its blocks
+ * have handed out, and add those bytes to *used unless it is NULL.
+ * Returns 0 or -1. */
+static int index_str_arena(nn_region_index_t *r, const nn_str_arena_t *arena, uint64_t *used)
+{
+    uint32_t n = nn_str_arena_blocks(arena, NULL, NULL, 0), i;
+    const char **starts = (const char **)malloc((size_t)n * sizeof(char *) + 1);
+    uint64_t *block_used = (uint64_t *)malloc((size_t)n * sizeof(uint64_t) + 1);
+    nn_span_t *spans = (nn_span_t *)malloc((size_t)n * sizeof(nn_span_t) + 1);
+    int status = -1;
+    if (starts && block_used && spans) {
+        nn_str_arena_blocks(arena, starts, block_used, n);
+        for (i = 0; i < n; i++) {
+            spans[i].start = (uintptr_t)starts[i];
+            spans[i].end = spans[i].start + (uintptr_t)block_used[i];
+            if (used) *used += block_used[i];
+        }
+        status = region_build(r, spans, n, NN_STR_ALIGNMENT);
+        spans = NULL;
+    }
+    free(starts);
+    free(block_used);
+    free(spans);
+    return status;
+}
+
+/* The value arena's strings, counted, and the code's, placed only. */
+static int index_strings(void)
+{
+    const nn_str_arena_t *values = nn_str_values();
+    uint64_t used = 0;
+    if (index_str_arena(&g.strings, values, &used) != 0) return -1;
+    if (index_str_arena(&g.code_strings, nn_bc_strings(), NULL) != 0) return -1;
+    g.allocated_count[NN_STATS_STRINGS] = values->count;
+    g.allocated_bytes[NN_STATS_STRINGS] = used;
+    g.overhead_bytes += nn_str_arena_reserved_bytes(values) - used;
+    return 0;
+}
+
 /* --- Session --- */
 
 int nn_stats_begin(void)
@@ -510,7 +555,8 @@ int nn_stats_begin(void)
     g.open = 1;
 
     if (index_thunks() != 0 || index_pages() != 0 || index_sets() != 0
-        || index_lists() != 0 || index_lambdas() != 0 || index_ctxstrs() != 0) {
+        || index_lists() != 0 || index_lambdas() != 0 || index_ctxstrs() != 0
+        || index_strings() != 0) {
         nn_stats_end();
         return -1;
     }
@@ -549,6 +595,8 @@ void nn_stats_end(void)
     object_free(&g.lists);
     object_free(&g.lambdas);
     object_free(&g.ctxstrs);
+    region_free(&g.strings);
+    region_free(&g.code_strings);
     free(g.items);
     free(g.list_items);
     free(g.symbol_bits);
@@ -688,8 +736,7 @@ static void reach(int kind, const void *object)
     g.unplaced++;
 }
 
-/* Reach a symbol.  0 is no symbol (an unnamed formal set, a context
- * element without an output). */
+/* Reach a symbol.  0 is no symbol (an unnamed formal set). */
 static void reach_symbol(uint32_t sym)
 {
     if (sym == NN_SYMBOL_INVALID) return;
@@ -701,6 +748,25 @@ static void reach_symbol(uint32_t sym)
         g.reached_count[NN_STATS_SYMBOLS]++;
         g.reached_bytes[NN_STATS_SYMBOLS] += (uint64_t)nn_symbol_len(sym) + 1;
     }
+}
+
+/* Reach a string.  NULL is no string (a context element without an
+ * output).  The empty string is a static, reached and not counted, and a
+ * string of the code's is placed and not counted, as code is not marked. */
+static void reach_string(const nn_str_t *s)
+{
+    uintptr_t p = (uintptr_t)s;
+    uint64_t bit;
+    if (!s || s == nn_str_empty()) return;
+    if (region_find(&g.strings, p, &bit)) {
+        if (bit_set(g.strings.bits, bit)) {
+            g.reached_count[NN_STATS_STRINGS]++;
+            g.reached_bytes[NN_STATS_STRINGS] += nn_str_object_bytes(s);
+        }
+        return;
+    }
+    if (region_find(&g.code_strings, p, &bit)) return;
+    g.unplaced++;
 }
 
 /* Reach an env's with-scope array of `n` entries, which several envs may
@@ -743,10 +809,10 @@ static void enter_thunk(const nn_thunk_t *t)
     case NN_VALUE_NULL:
         break;
     case NN_VALUE_STR:
-        reach_symbol(nn_thunk_get_str(t));
+        reach_string((const nn_str_t *)nn_thunk_get_str(t));
         break;
     case NN_VALUE_PATH:
-        reach_symbol(nn_thunk_get_path(t));
+        reach_string((const nn_str_t *)nn_thunk_get_path(t));
         break;
     case NN_VALUE_LIST:
         reach(NN_STATS_LISTS, nn_thunk_get_list(t));
@@ -832,11 +898,11 @@ static void enter_lambda(const nn_lambda_t *lam)
 static void enter_ctxstr(const nn_ctxstr_t *s)
 {
     uint32_t i;
-    reach_symbol(s->text);
+    reach_string(s->text);
     for (i = 0; i < s->ctx_count; i++) {
-        reach_symbol(s->ctx[i].sp_hash);
-        reach_symbol(s->ctx[i].sp_name);
-        reach_symbol(s->ctx[i].output);
+        reach_string(s->ctx[i].sp_hash);
+        reach_string(s->ctx[i].sp_name);
+        reach_string(s->ctx[i].output);
     }
 }
 
@@ -846,6 +912,8 @@ void nn_stats_root_thunk(const void *thunk)   { if (g.open) reach(NN_STATS_THUNK
 void nn_stats_root_env(const void *env)       { if (g.open) reach(NN_STATS_ENVS, env); }
 void nn_stats_root_attrset(const void *set)   { if (g.open) reach(NN_STATS_ATTRSETS, set); }
 void nn_stats_root_list(const void *list)     { if (g.open) reach(NN_STATS_LISTS, list); }
+void nn_stats_root_string(const void *str)    { if (g.open) reach_string((const nn_str_t *)str); }
+void nn_stats_root_ctxstr(const void *ctxstr) { if (g.open) reach(NN_STATS_CTXSTRS, ctxstr); }
 
 int nn_stats_mark(void)
 {

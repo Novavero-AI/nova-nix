@@ -1,7 +1,8 @@
 -- | Unified arena lifecycle for the C data layer.
 --
--- Initializes and destroys all C sub-arenas (symbol table, thunk arena,
--- env slot allocator, bytecode store) with a single pair of calls.
+-- Initializes and destroys all C sub-arenas (symbol table, string arena,
+-- thunk arena, env slot allocator, bytecode store) with a single pair of
+-- calls.
 -- Handles StablePtr cleanup on destruction: iterates all thunks,
 -- identifies payloads that are Haskell StablePtrs (COMPUTED\/PTR), and
 -- frees them before tearing down the C memory.
@@ -48,6 +49,7 @@ import Nix.Eval.CEnv (cenvDestroy, cenvInit)
 import Nix.Eval.CLambda (clambdaFreeAll)
 import Nix.Eval.CList (clistFreeAll)
 import Nix.Eval.CStatus (CStatusError (..), arenaLive)
+import Nix.Eval.CStr (cstrDestroy, cstrInit)
 import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.Symbol (symbolDestroy, symbolInit, symbolIntern)
@@ -74,14 +76,15 @@ foreign import ccall unsafe "nn_attrset_free_all"
 -- ---------------------------------------------------------------------------
 
 -- | Initialize all C data layer arenas.  Call once before evaluation.
--- Initializes: symbol table, thunk arena, env slot allocator, bytecode
--- store.  The new symbol table interns upstream's startup names
--- ('startupSymbols') before anything else can, so that a name gets the
--- symbol upstream's would.
+-- Initializes: symbol table, string arena, thunk arena, env slot
+-- allocator, bytecode store.  The new symbol table interns upstream's
+-- startup names ('startupSymbols') before anything else can, so that a
+-- name gets the symbol upstream's would.
 arenaInit :: IO ()
 arenaInit = do
   symbolInit 0
   mapM_ symbolIntern startupSymbols
+  cstrInit
   cthunkInit 0
   cenvInit
   cbcInit 0 0
@@ -101,10 +104,11 @@ arenaInit = do
 -- 2. Frees each StablePtr from Haskell
 -- 3. Frees all tracked CLists (bulk cleanup)
 -- 4. Frees all tracked CAttrSets (bulk cleanup)
--- 5. Destroys bytecode store
+-- 5. Destroys bytecode store, the code's strings with it
 -- 6. Destroys env slot pages
 -- 7. Destroys thunk arena blocks
--- 8. Destroys symbol table + string arena
+-- 8. Destroys the string arena
+-- 9. Destroys symbol table
 arenaDestroy :: IO ()
 arenaDestroy = do
   cleanupStablePtrs
@@ -115,6 +119,7 @@ arenaDestroy = do
   cbcDestroy
   cenvDestroy
   cthunkDestroy
+  cstrDestroy
   symbolDestroy
 
 -- | Free all StablePtrs held by thunk payloads.
