@@ -284,8 +284,10 @@ data EnvSiteFigures = EnvSiteFigures
 data SetSiteFigures = SetSiteFigures
   { -- | How many.
     setSiteSets :: !Word64,
-    -- | Those equal to a set that already existed: one with no entries,
-    -- or a union one of whose operands had none.
+    -- | Those made equal to a set that already existed, which upstream
+    -- would not make: one made with room for no entries or by removal
+    -- from a set with none, or a union one of whose operands had none.
+    -- The evaluator makes none, so a count above 0 is a regression.
     setSiteShareable :: !Word64,
     -- | Their bytes once built: headers, keys, positions and values.
     setSiteBytes :: !Word64

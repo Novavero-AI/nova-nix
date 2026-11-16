@@ -167,6 +167,7 @@ import Nix.Eval.Types
     Thunk (..),
     attrSetElems,
     attrSetFromEntries,
+    attrSetFromEntriesSizedFor,
     attrSetFromMap,
     attrSetFromSymbolEntries,
     attrSetFromSymbols,
@@ -792,7 +793,17 @@ evalBcAttrs env bcIdx0 = do
 evalBcNonRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> m NixValue
 evalBcNonRecAttrs env bindings = do
   entries <- buildBcEntryMap cheapThunkBc env env bindings
-  VAttrs <$> attrSetFromEntries SetLiteral entries
+  VAttrs <$> attrSetFromEntriesSizedFor SetLiteral (literalSetSize bindings) entries
+
+-- | What upstream sizes a literal's set for: one attribute per static name
+-- and one per dynamic binding (@attrs.size() + dynamicAttrs.size()@,
+-- eval.cc:1193 at 2.24.9), so a literal whose every name is a null
+-- @${...}@ makes an empty set of its own.
+literalSetSize :: [BcBinding] -> Int
+literalSetSize = foldl' countOne 0
+  where
+    countOne !acc (BcInheritFrom _ names) = acc + length names
+    countOne !acc _ = acc + 1
 
 -- | The construct a binding frame belongs to.
 data FrameKind = LetFrame | RecFrame
@@ -854,7 +865,7 @@ evalBcRecAttrs env bindings captureInfo
       -- upstream ("dynamic attribute already defined"), never a merge.
       case Map.keys (Map.intersection dynEntries staticEntries) of
         (dupKey : _) -> throwEvalError ("dynamic attribute '" <> dupKey <> "' already defined")
-        [] -> VAttrs <$> attrSetFromEntries SetRec (Map.union dynEntries staticEntries)
+        [] -> VAttrs <$> attrSetFromEntriesSizedFor SetRec (literalSetSize bindings) (Map.union dynEntries staticEntries)
 
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -1761,6 +1772,9 @@ builtinRemoveAttrs (VAttrs _) other =
 builtinRemoveAttrs other _ =
   throwEvalError ("builtins.removeAttrs: expected a set, got " <> typeName other)
 
+-- | Upstream's @prim_intersectAttrs@ (primops.cc:2937-3001 at 2.24.9),
+-- whose result is sized for the smaller argument: two sets with
+-- attributes and no name in common make an empty set of their own.
 builtinIntersectAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinIntersectAttrs (VAttrs a) (VAttrs b) =
   -- Iterate keys of 'a' (typically the smaller set, e.g. functionArgs)
@@ -1770,7 +1784,8 @@ builtinIntersectAttrs (VAttrs a) (VAttrs b) =
   do
     keysA <- attrSetKeys a
     found <- mapM (\k -> fmap (k,) <$> attrSetLookupEntry k b) keysA
-    VAttrs <$> attrSetFromEntries SetIntersectAttrs (Map.fromList (catMaybes found))
+    sizeB <- attrSetSize b
+    VAttrs <$> attrSetFromEntriesSizedFor SetIntersectAttrs (min (length keysA) sizeB) (Map.fromList (catMaybes found))
 builtinIntersectAttrs (VAttrs _) other =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 builtinIntersectAttrs other _ =

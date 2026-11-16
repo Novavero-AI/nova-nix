@@ -14,7 +14,8 @@
 -- the thunk arena; attribute set cleanup only frees the key\/value arrays.
 --
 -- Every constructor names its 'SetSite', under which the census counts
--- the set.
+-- the set.  'cattrsetEmpty' is the one set no constructor makes: the
+-- shared set with no entries.
 --
 -- A set holds at most 'maxBound' :: 'Word32' entries, upstream's own
 -- ceiling (its @Bindings@ counts in @uint32_t@).  Every constructor and
@@ -27,6 +28,7 @@ module Nix.Eval.CAttrSet
 
     -- * Lifecycle
     cattrsetNew,
+    cattrsetEmpty,
 
     -- * Construction
     cattrsetInsert,
@@ -75,6 +77,15 @@ type CAttrSet = Ptr NnAttrSet
 
 foreign import ccall unsafe "nn_attrset_new"
   c_nn_attrset_new :: Word32 -> Word32 -> IO CAttrSet
+
+-- The empty set is a C static, one address for the life of the process,
+-- so this import is pure, as the empty env of "Nix.Eval.CEnv" is: no
+-- arena window, nor its absence, changes what it returns.
+
+-- | The shared set with no entries (@nn_attrset_empty@): frozen, and
+-- refused by every write.
+foreign import ccall unsafe "nn_attrset_empty"
+  cattrsetEmpty :: CAttrSet
 
 foreign import ccall unsafe "nn_attrset_insert"
   c_nn_attrset_insert :: CAttrSet -> Word32 -> Ptr () -> Word32 -> IO CInt
@@ -141,7 +152,7 @@ cattrsetInsert :: (MonadCData m) => CAttrSet -> Symbol -> PosIdx -> CThunkPtr ->
 cattrsetInsert set (Symbol sym) (PosIdx pos) ptr = cdataIO $ do
   status <- c_nn_attrset_insert set sym (castPtr ptr) pos
   unless (status == 0) $
-    cStatusFailure "nn_attrset_insert" "the attribute set cannot grow (allocation failure or its 4294967295-entry ceiling)"
+    cStatusFailure "nn_attrset_insert" "the attribute set is frozen or cannot grow (allocation failure or its 4294967295-entry ceiling)"
 
 -- | Sort and deduplicate.  Must be called once before any queries.
 cattrsetFreeze :: (MonadCData m) => CAttrSet -> m ()

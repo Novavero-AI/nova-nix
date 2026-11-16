@@ -27,10 +27,12 @@ module Nix.Eval.Types
     firstInSymbolOrder,
     attrSetAt,
     attrSetToMap,
+    emptyAttrSet,
     attrSetFromMap,
     attrSetFromEntries,
     attrSetFromSymbols,
     attrSetFromSymbolEntries,
+    attrSetFromEntriesSizedFor,
     attrSetMember,
     attrSetNull,
     attrSetSize,
@@ -155,7 +157,7 @@ import GHC.Float (castWord64ToDouble)
 import Nix.Derivation (Derivation)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.Builtin (Builtin, builtinAtIndex, builtinIndex, builtinName)
-import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
+import Nix.Eval.CAttrSet (CAttrSet, cattrsetEmpty, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CData (CData (..), MonadCData (..), cdataIO, inspectForDisplay, runCDataPure)
@@ -556,11 +558,32 @@ attrSetMapWithKey :: (MonadCData m) => SetSite -> (Text -> Thunk -> m Thunk) -> 
 attrSetMapWithKey site f attrs = attrSetToMap attrs >>= Map.traverseWithKey f >>= attrSetFromMap site
 
 -- | Remove a list of keys, returning a new CAttrSet made at a site.
--- Uses the C-side @nn_attrset_remove_keys@ for O(n) removal.
+-- Uses the C-side @nn_attrset_remove_keys@, which scans the keys for
+-- each attribute.  Upstream
+-- sizes the result for the set it removes from (primops.cc:2852 at
+-- 2.24.9), so removing from an empty set gives 'emptyAttrSet' and
+-- removing every attribute of another gives an empty set of its own.
+-- Every key is interned either way, as upstream interns each name
+-- whatever the set holds.
 attrSetRemoveKeys :: (MonadCData m) => SetSite -> [Text] -> AttrSet -> m AttrSet
 attrSetRemoveKeys site keys (AttrSet cset) = do
   syms <- mapM symbolIntern keys
-  AttrSet <$> cattrsetRemoveKeys site cset syms
+  size <- cattrsetSize cset
+  case size of
+    0 -> pure emptyAttrSet
+    _ -> AttrSet <$> cattrsetRemoveKeys site cset syms
+
+-- | The set with no attributes: a C static ('cattrsetEmpty'), one address
+-- for the life of the process, as upstream's @emptyBindings@ is one for
+-- its evaluator (eval.hh:195 at 2.24.9).  Every set built with no
+-- attributes is this one and is allocated nowhere, as upstream's
+-- @allocBindings@ answers a size of 0 with @emptyBindings@
+-- (attr-set.cc:16-17), except a set upstream sizes before it knows it
+-- holds nothing ('attrSetFromEntriesSizedFor', 'attrSetRemoveKeys').
+-- Upstream's printers enter a set by its bindings, so which empty sets
+-- are this one shows where a value is printed.
+emptyAttrSet :: AttrSet
+emptyAttrSet = AttrSet cattrsetEmpty
 
 -- | Build a CAttrSet at a site from a Haskell 'Map' of attributes defined
 -- nowhere in source, as those of a set a builtin makes from scratch are;
@@ -568,7 +591,8 @@ attrSetRemoveKeys site keys (AttrSet cset) = do
 -- 'attrSetFromEntries'.  The keys are interned in name order, so a name
 -- no symbol holds yet takes its place in every set by name; a builtin
 -- that meets new names in an order of its own interns each where
--- upstream's does and builds with 'attrSetFromSymbols'.
+-- upstream's does and builds with 'attrSetFromSymbols'.  An empty map
+-- gives 'emptyAttrSet'.
 attrSetFromMap :: (MonadCData m) => SetSite -> Map Text Thunk -> m AttrSet
 attrSetFromMap site m = AttrSet <$> newFrozenAttrSet site symbolIntern (const noPos) id m
 
@@ -585,26 +609,52 @@ attrSetFromSymbols site m = AttrSet <$> newFrozenAttrSet site pure (const noPos)
 attrSetFromSymbolEntries :: (MonadCData m) => SetSite -> Map Symbol AttrEntry -> m AttrSet
 attrSetFromSymbolEntries site m = AttrSet <$> newFrozenAttrSet site pure entryPos entryThunk m
 
+-- | 'attrSetFromEntries' for a set upstream sizes, before it knows what
+-- the set holds, for the given number of attributes: a literal for its
+-- names (eval.cc:1193 at 2.24.9), @intersectAttrs@ for the smaller of its
+-- arguments (primops.cc:2945).  Upstream's @allocBindings@ shares its
+-- empty set only for a size of 0 (attr-set.cc:16-17), so such a set
+-- holding nothing is 'emptyAttrSet' when sized for none and an empty set
+-- of its own otherwise.  A set holding attributes is made with room for
+-- those alone, whatever the size.
+attrSetFromEntriesSizedFor :: (MonadCData m) => SetSite -> Int -> Map Text AttrEntry -> m AttrSet
+attrSetFromEntriesSizedFor site size m
+  | Map.null m && size > 0 = ownEmptyAttrSet site
+  | otherwise = attrSetFromEntries site m
+
+-- | An empty set at a site that is not 'emptyAttrSet', made with room for
+-- one entry: room for none asks @nn_attrset_new@ for its default room,
+-- and is what the census counts as a set upstream would share.
+ownEmptyAttrSet :: (MonadCData m) => SetSite -> m AttrSet
+ownEmptyAttrSet site = do
+  cset <- cattrsetNew site 1
+  cattrsetFreeze cset
+  pure (AttrSet cset)
+
 -- | Insert every entry of a map into a new set at a site, under the
 -- symbol, at the position and with the thunk the projections give it,
--- and freeze it.
+-- and freeze it; the shared empty set for an empty map.
 {-# INLINE newFrozenAttrSet #-}
 newFrozenAttrSet :: (MonadCData m) => SetSite -> (k -> m Symbol) -> (a -> PosIdx) -> (a -> Thunk) -> Map k a -> m CAttrSet
-newFrozenAttrSet site symbolOf posOf thunkOf m = do
-  cset <- cattrsetNew site (Map.size m)
-  forM_ (Map.toList m) $ \(key, entry) -> do
-    sym <- symbolOf key
-    cattrsetInsert cset sym (posOf entry) (unThunk (thunkOf entry))
-  cattrsetFreeze cset
-  pure cset
+newFrozenAttrSet site symbolOf posOf thunkOf m
+  | Map.null m = pure cattrsetEmpty
+  | otherwise = do
+      cset <- cattrsetNew site (Map.size m)
+      forM_ (Map.toList m) $ \(key, entry) -> do
+        sym <- symbolOf key
+        cattrsetInsert cset sym (posOf entry) (unThunk (thunkOf entry))
+      cattrsetFreeze cset
+      pure cset
 
 -- | Allocate a CAttrSet skeleton with keys only (NULL values), for an
 -- environment's name table.
 -- Used for two-phase construction in @rec {}@ and @let@ (knot-tying):
 -- keys are known before thunks, so the CAttrSet is built first, then
 -- values are filled via 'fillCAttrSetValues'.  The table is never a
--- value, so its entries carry no position.
+-- value, so its entries carry no position.  A table of no keys is the
+-- shared empty set, which 'fillCAttrSetValues' finds no key in.
 buildCAttrSetKeys :: (MonadCData m) => [Text] -> m CAttrSet
+buildCAttrSetKeys [] = pure cattrsetEmpty
 buildCAttrSetKeys keys = do
   cset <- cattrsetNew SetScope (length keys)
   forM_ keys $ \key -> do

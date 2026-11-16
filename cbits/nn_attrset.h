@@ -34,6 +34,12 @@
  * Every constructor names its site, the construct or builtin that makes
  * the set (nn_stats.h), under which the census counts it.
  *
+ * One set is not allocated: nn_attrset_empty, the set with no entries
+ * the evaluator gives wherever upstream gives its one emptyBindings,
+ * which its allocBindings hands out for a capacity of 0
+ * (attr-set.cc:14-17 at 2.24.9).  The constructors here make a new set
+ * whenever they are called.
+ *
  * Counts and indices are uint32_t.  A set holds at most
  * NN_ATTRSET_MAX_ENTRIES entries, the ceiling upstream's Bindings has
  * (its size_t is uint32_t), so every index is below NN_ATTRSET_NOT_FOUND.
@@ -70,14 +76,21 @@ nn_attrset_t *nn_attrset_new(uint32_t capacity, uint32_t site);
  * thunk arena owns. */
 void nn_attrset_free(nn_attrset_t *set);
 
+/* The shared empty set: frozen, no entries, and no arrays behind it.  A
+ * file-scope static, not tracked and never freed, so it has one address
+ * in every evaluation and outside all of them.  Nothing writes it: it is
+ * frozen, so nn_attrset_insert refuses it, and it has no index for
+ * nn_attrset_set_value to write at. */
+nn_attrset_t *nn_attrset_empty(void);
+
 /* --- Construction (before freeze) --- */
 
 /* Append a key-value pair defined at `pos`.  Keys need not be sorted or
  * unique at this stage - duplicates are resolved at freeze time (last
  * insert wins, position included, matching Nix // merge semantics).
  * Grows the internal arrays if capacity is exceeded.  Returns 0, or -1
- * with the set unchanged when it already holds NN_ATTRSET_MAX_ENTRIES
- * entries or cannot grow. */
+ * with the set unchanged when it is frozen, already holds
+ * NN_ATTRSET_MAX_ENTRIES entries, or cannot grow. */
 int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value, uint32_t pos);
 
 /* Sort entries by symbol ID and deduplicate (last writer wins).
