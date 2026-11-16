@@ -1,3 +1,5 @@
+{-# LANGUAGE ScopedTypeVariables #-}
+
 -- | The executable bit, on a platform that does not have one.
 --
 -- Windows' 'System.Directory.getPermissions' answers from the file
@@ -13,13 +15,14 @@ module Nix.Store.ExecBit
     markExecutableOsPath,
     copyExecMark,
     serialiseFromPath,
+    serialiseIfReadable,
     withNarSource,
     narHashOfPath,
     execStreamName,
   )
 where
 
-import Control.Exception (bracket_)
+import Control.Exception (Handler (..), IOException, bracket_, catches)
 import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
@@ -117,6 +120,19 @@ serialiseOptions mode = NAR.defaultSerialiseOptions {NAR.soCaseHack = mode, NAR.
 -- for a source ('Nix.Store.CaseSensitive.processCaseHack').
 serialiseFromPath :: NAR.CaseHack -> FilePath -> IO NAR.NarEntry
 serialiseFromPath = NAR.serialiseFromPathOpts . serialiseOptions
+
+-- | 'serialiseFromPath', or 'Nothing' when the tree cannot be read into
+-- an archive: an access that failed ('NAR.NarWalkError') or an entry the
+-- walk refuses, such as one of a type a NAR cannot hold (an
+-- 'IOException').  For a caller that treats an unreadable tree as one
+-- that is not there; anything else, an asynchronous exception included,
+-- passes through.
+serialiseIfReadable :: NAR.CaseHack -> FilePath -> IO (Maybe NAR.NarEntry)
+serialiseIfReadable mode path =
+  (Just <$> serialiseFromPath mode path)
+    `catches` [ Handler (\(_ :: NAR.NarWalkError) -> pure Nothing),
+                Handler (\(_ :: IOException) -> pure Nothing)
+              ]
 
 -- | 'NovaCache.NAR.withNarSource' through the same exec-bit source of
 -- truth: the path's NAR as a pull source of chunks, no file's contents

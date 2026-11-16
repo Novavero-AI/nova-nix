@@ -58,6 +58,7 @@ import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath
 import Nix.Substituter (CacheConfig (..))
 import Nix.Trust (ContentFacts, fetchedByBuiltin, fixedOutputInputs, renderTrustReport, trustReport)
 import Nix.Trust.Scan (scanFetched)
+import qualified NovaCache.NAR as NAR
 import Paths_nova_nix (getDataDir, version)
 import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, makeAbsolute)
 import qualified System.Directory.OsPath as OsDir
@@ -174,12 +175,12 @@ main = do
   storeDir <- chosenStoreDir opts
   -- SIGINT reaches the main thread as UserInterrupt, which uncaught ends
   -- the process by the signal with nothing said, and an I/O failure no
-  -- command handles reaches GHC's default handler, which prints an
-  -- "Uncaught exception" report with a backtrace.  Upstream's
-  -- handleExceptions logs either as one error line and exits 1
-  -- (libmain/shared.cc at 2.24.9): checkInterrupt throws Interrupted, a
-  -- BaseError like any other failure.
-  handleJust userInterrupt (const reportInterrupt) . handle reportIOFailure $ case optCommand opts of
+  -- command handles, or a walk of a tree on disk that failed to read an
+  -- entry, reaches GHC's default handler, which prints an "Uncaught
+  -- exception" report with a backtrace.  Upstream's handleExceptions logs
+  -- each as one error line and exits 1 (libmain/shared.cc at 2.24.9):
+  -- checkInterrupt throws Interrupted, a BaseError like any other failure.
+  handleJust userInterrupt (const reportInterrupt) . handle reportIOFailure . handle reportWalkFailure $ case optCommand opts of
     CmdEvalFile filePath -> evalFile config opts storeDir dataDir filePath
     CmdEvalExpr expr
       | optAterm opts -> evalExprAterm config opts storeDir dataDir expr
@@ -209,6 +210,14 @@ reportInterrupt = do
 reportIOFailure :: IOException -> IO a
 reportIOFailure failure = do
   hPutStrLn stderr ("error: " <> ioFailureMessage failure)
+  exitWith (ExitFailure 1)
+
+-- | A walk of a tree on disk that no command handled, reported as
+-- 'reportIOFailure' reports an I/O failure: the entry, the access that
+-- failed on it, and the 'IOException' it raised.
+reportWalkFailure :: NAR.NarWalkError -> IO a
+reportWalkFailure failure = do
+  hPutStrLn stderr ("error: " <> displayException failure)
   exitWith (ExitFailure 1)
 
 -- | Run a write to stdout, dropping what is left of it once stdout's
