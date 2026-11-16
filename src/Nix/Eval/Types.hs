@@ -30,6 +30,8 @@ module Nix.Eval.Types
     attrSetToMap,
     attrSetFromMap,
     attrSetFromEntries,
+    attrSetFromSymbols,
+    attrSetFromSymbolEntries,
     attrSetMember,
     attrSetNull,
     attrSetSize,
@@ -558,25 +560,35 @@ attrSetRemoveKeys site keys (AttrSet cset) = do
 -- | Build a CAttrSet at a site from a Haskell 'Map' of attributes defined
 -- nowhere in source, as those of a set a builtin makes from scratch are;
 -- a builtin that copies attributes keeps their positions with
--- 'attrSetFromEntries'.
--- Interns all keys as symbols, inserts key-value pairs, freezes (sort +
--- dedup).
+-- 'attrSetFromEntries'.  The keys are interned in name order, so a name
+-- no symbol holds yet takes its place in every set by name; a builtin
+-- that meets new names in an order of its own interns each where
+-- upstream's does and builds with 'attrSetFromSymbols'.
 attrSetFromMap :: (MonadCData m) => SetSite -> Map Text Thunk -> m AttrSet
-attrSetFromMap site m = AttrSet <$> newFrozenAttrSet site (const noPos) id m
+attrSetFromMap site m = AttrSet <$> newFrozenAttrSet site symbolIntern (const noPos) id m
 
 -- | 'attrSetFromMap' for attributes that keep the positions they were
 -- defined at, as an attribute set literal's and a copied attribute's do.
 attrSetFromEntries :: (MonadCData m) => SetSite -> Map Text AttrEntry -> m AttrSet
-attrSetFromEntries site m = AttrSet <$> newFrozenAttrSet site entryPos entryThunk m
+attrSetFromEntries site m = AttrSet <$> newFrozenAttrSet site symbolIntern entryPos entryThunk m
 
--- | Insert every entry of a map into a new set at a site, at the position
--- and with the thunk the projections give it, and freeze it.
+-- | 'attrSetFromMap' over names already interned.
+attrSetFromSymbols :: (MonadCData m) => SetSite -> Map Symbol Thunk -> m AttrSet
+attrSetFromSymbols site m = AttrSet <$> newFrozenAttrSet site pure (const noPos) id m
+
+-- | 'attrSetFromEntries' over names already interned.
+attrSetFromSymbolEntries :: (MonadCData m) => SetSite -> Map Symbol AttrEntry -> m AttrSet
+attrSetFromSymbolEntries site m = AttrSet <$> newFrozenAttrSet site pure entryPos entryThunk m
+
+-- | Insert every entry of a map into a new set at a site, under the
+-- symbol, at the position and with the thunk the projections give it,
+-- and freeze it.
 {-# INLINE newFrozenAttrSet #-}
-newFrozenAttrSet :: (MonadCData m) => SetSite -> (a -> PosIdx) -> (a -> Thunk) -> Map Text a -> m CAttrSet
-newFrozenAttrSet site posOf thunkOf m = do
+newFrozenAttrSet :: (MonadCData m) => SetSite -> (k -> m Symbol) -> (a -> PosIdx) -> (a -> Thunk) -> Map k a -> m CAttrSet
+newFrozenAttrSet site symbolOf posOf thunkOf m = do
   cset <- cattrsetNew site (Map.size m)
   forM_ (Map.toList m) $ \(key, entry) -> do
-    sym <- symbolIntern key
+    sym <- symbolOf key
     cattrsetInsert cset sym (posOf entry) (unThunk (thunkOf entry))
   cattrsetFreeze cset
   pure cset
