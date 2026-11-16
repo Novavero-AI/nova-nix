@@ -281,7 +281,7 @@ test-suite nova-nix-test
   type:             exitcode-stdio-1.0
   main-is:          Main.hs
   hs-source-dirs:   test
-  other-modules:    HttpFixture, NodeStatus
+  other-modules:    CacheFixture, HttpFixture, NodeStatus
   default-language: Haskell2010
   default-extensions:
     OverloadedStrings

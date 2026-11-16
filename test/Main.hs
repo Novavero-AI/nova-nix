@@ -7,6 +7,7 @@
 -- failing case, and exits non-zero unless every case passes.
 module Main (main) where
 
+import CacheFixture (CacheSetup (..), Fault (..), Logged (..), Multipart (..), RequestKind (..), cacheSetup, requestLog, storedObject, withModelCache)
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.GZip as GZip
@@ -15,7 +16,7 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
-import Control.Monad (filterM, foldM, replicateM, unless, void, when, zipWithM, (>=>))
+import Control.Monad (filterM, foldM, guard, replicateM, unless, void, when, zipWithM, (>=>))
 import Control.Monad.Except (runExceptT)
 import Control.Monad.State.Strict (State, evalStateT, get, gets, modify', runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
@@ -109,7 +110,7 @@ import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), d
 import Nix.Json (Json (..), parseJson, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope, parsedExpr, parsedNames)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
-import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), checkRecordedNarHash, computeClosure, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, planMissing, preparePath, pushPaths, storePathBasename, stripHashPrefix)
+import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), PushSummary (..), checkRecordedNarHash, computeClosure, defaultPartSize, isDerivationPath, loadApiKeyFile, mkNarInfo, mkPartSize, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, partSizeBytes, planMissing, preparePath, pushPaths, splitParts, storePathBasename, stripHashPrefix)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalizeMetadata, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
@@ -11259,6 +11260,185 @@ testPushClosureIO = do
             Left err | "cannot read key file" `T.isInfixOf` err -> Pass
             other -> Fail ("expected read error, got: " <> T.pack (show other))
       ]
+
+-- | push sends a NAR over its part size through nova-cache's multipart
+-- upload.  Each case pushes one registered path to a fresh
+-- 'withModelCache': nova-cache's write endpoints behind a proxy that
+-- refuses a body over the part size, as Cloudflare refuses one over
+-- 100 MB in front of the public cache.  The cache records each request,
+-- and a case reads back the requests and the NAR the cache stores.
+testPushMultipart :: IO [Bool]
+testPushMultipart = do
+  putStrLn "push/multipart"
+  tmpBase <- getTemporaryDirectory
+  let source = tmpBase </> "nova-nix-test-push-multipart-src"
+      topSource = tmpBase </> "nova-nix-test-push-multipart-top"
+      sp = StorePath (T.replicate 32 "m") "large-output"
+      -- A small path that references the large one, for a closure of two.
+      spTop = StorePath (T.replicate 32 "n") "small-top"
+  forceRemoveIfExists source
+  forceRemoveIfExists topSource
+  createDirectoryIfMissing True source
+  createDirectoryIfMissing True topSource
+  BS.writeFile (source </> "payload") (BS.pack (take payloadBytes (cycle [0 .. 250])))
+  BS.writeFile (topSource </> "payload") "small"
+  results <- withTempStore $ \store -> do
+    addToStore store source sp Nothing []
+    addToStore store topSource spTop Nothing [sp]
+    prepared <- runExceptT (preparePath PushNone store sp)
+    case (prepared, mkPartSize testPartBytes) of
+      (Right (artifact, narInfo), Just partSize) -> multipartCases store sp spTop partSize (paBytes artifact) (TE.encodeUtf8 (NarInfo.niUrl narInfo))
+      (Left err, _) -> sequence [runTest "push/multipart setup" (Fail err)]
+      (Right _, Nothing) -> sequence [runTest "push/multipart setup" (Fail "the test part size is not one")]
+  forceRemoveIfExists source
+  forceRemoveIfExists topSource
+  pure results
+  where
+    -- Large enough for a NAR of at least three parts, so a part has parts
+    -- before and after it.
+    payloadBytes = 3000
+    testPartBytes = 1024
+    multipartCases store sp spTop partSize nar narObject =
+      sequence
+        [ runTest "the test NAR is at least three parts" $
+            assertEqual "parts" True (count >= 3),
+          runTestM "a NAR over the part size goes up in parts under the proxy's limit, each request with the write key, and is completed" $ do
+            outcome <- pushTo behindProxy partSize
+            pure $
+              delivered testPartBytes outcome
+                `andThen` assertEqual "requests" ([HashList] ++ inParts ++ published) (kinds outcome),
+          runTestM "a NAR of one part's size goes in one PUT, and one byte more goes in two parts" $
+            case (mkPartSize (BS.length nar), mkPartSize (BS.length nar - 1)) of
+              (Just whole, Just split) -> do
+                oneRequest <- pushTo (cacheSetup (BS.length nar) key) whole
+                twoParts <- pushTo (cacheSetup (BS.length nar - 1) key) split
+                pure $
+                  delivered (BS.length nar) oneRequest
+                    `andThen` assertEqual "one request" ([HashList, NarPut] ++ published) (kinds oneRequest)
+                    `andThen` delivered (BS.length nar - 1) twoParts
+                    `andThen` assertEqual "two parts" ([HashList, Begin, Part 1, Part 2, Complete] ++ published) (kinds twoParts)
+              _ -> pure (Fail "the NAR's size is no part size"),
+          runTestM "a part whose response is lost is sent again" $ do
+            outcome <- pushTo (once (Part 2) DropResponse) partSize
+            pure $
+              delivered testPartBytes outcome
+                `andThen` assertEqual "requests" ([HashList, Begin, Part 1] ++ map Part (2 : [2 .. count]) ++ [Complete] ++ published) (kinds outcome),
+          runTestM "a part answered 409 begins a new upload" $ do
+            outcome <- pushTo (once (Part 2) LoseParts) partSize
+            pure $
+              delivered testPartBytes outcome
+                `andThen` assertEqual "requests" ([HashList, Begin, Part 1, Part 2] ++ inParts ++ published) (kinds outcome),
+          runTestM "a part answered 404 begins a new upload" $ do
+            outcome <- pushTo (once (Part 3) ForgetUpload) partSize
+            pure $
+              delivered testPartBytes outcome
+                `andThen` assertEqual "requests" ([HashList, Begin, Part 1, Part 2, Part 3] ++ inParts ++ published) (kinds outcome),
+          runTestM "a completion whose response is lost leaves the narinfo to confirm the NAR" $ do
+            outcome <- pushTo (once Complete DropResponse) partSize
+            pure $
+              delivered testPartBytes outcome
+                `andThen` assertEqual "requests" ([HashList] ++ inParts ++ published) (kinds outcome),
+          runTestM "a narinfo refused after a completion that failed uploads the NAR again" $ do
+            outcome <- pushTo (once Complete (Refuse "502 Bad Gateway")) partSize
+            pure $
+              delivered testPartBytes outcome
+                `andThen` assertEqual "requests" ([HashList] ++ inParts ++ [NarInfoPut] ++ inParts ++ published) (kinds outcome),
+          runTestM "a cache that keeps losing parts fails the push after three uploads, naming the request and the server's message" $ do
+            outcome@(result, _) <- pushTo (always (Part 2) LoseParts) partSize
+            pure $
+              assertEqual "uploads begun" 3 (countOf Begin outcome)
+                `andThen` failsWith ["/2 returned HTTP 409: ", "holds 0 parts, so the next is part 1", "(3 uploads begun)"] result,
+          runTestM "a part whose response is always lost fails the push after the retry policy's attempts" $ do
+            outcome@(result, _) <- pushTo (always (Part 1) DropResponse) partSize
+            pure $
+              assertEqual "sends of part 1" (frpAttempts retry) (countOf (Part 1) outcome)
+                `andThen` failsWith ["/1 failed: "] result,
+          runTestM "a narinfo refused after every completion fails the push after three uploads, naming both answers" $ do
+            outcome@(result, _) <- pushTo (always Complete (Refuse "502 Bad Gateway")) partSize
+            pure $
+              assertEqual "uploads begun" 3 (countOf Begin outcome)
+                `andThen` assertEqual "narinfos sent" 3 (countOf NarInfoPut outcome)
+                `andThen` failsWith [".narinfo returned HTTP 400: NAR nar/", "is not stored", "the NAR's last completion: POST nar/", "returned HTTP 502: ", "(3 uploads begun)"] result,
+          runTestM "a cache without multipart upload takes a NAR over the part size in one PUT" $ do
+            outcome <- pushTo ((cacheSetup maxBound key) {csMultipart = WithoutMultipart}) partSize
+            pure $
+              delivered maxBound outcome
+                `andThen` assertEqual "requests" ([HashList, Begin, NarPut] ++ published) (kinds outcome),
+          -- The narinfo that decides an unconfirmed NAR goes with the
+          -- other narinfos, after every NAR: checked as soon as the
+          -- completion went unanswered, it would announce the large path
+          -- before the small one's NAR, and announce a path whose
+          -- references are not all in place in a longer closure.
+          runTestM "the narinfo that confirms a NAR goes after every NAR of the closure, in the closure's order" $ do
+            (result, state) <- withModelCache (once Complete DropResponse) (\base -> pushPaths (config base partSize) store [spTop])
+            pure $
+              assertEqual "push" (Right (PushSummary 2 0)) result
+                `andThen` assertEqual "stored NAR" (Just nar) (storedObject narObject state)
+                `andThen` assertEqual "requests" ([HashList] ++ inParts ++ [NarPut, NarInfoPut, NarInfoPut, NarInfoGet]) (map lgKind (requestLog state)),
+          runTestM "a part answered with a status a retry could outlive is sent again" $ do
+            outcome <- pushTo (once (Part 2) (Refuse "503 Service Unavailable")) partSize
+            pure $
+              delivered testPartBytes outcome
+                `andThen` assertEqual "requests" ([HashList, Begin, Part 1] ++ map Part (2 : [2 .. count]) ++ [Complete] ++ published) (kinds outcome),
+          runTestM "a part refused with a status no retry changes fails the push at once" $ do
+            outcome@(result, _) <- pushTo (always (Part 1) (Refuse "413 Payload Too Large")) partSize
+            pure $
+              assertEqual "sends of part 1" 1 (countOf (Part 1) outcome)
+                `andThen` failsWith ["/1 returned HTTP 413: refused by the fixture"] result,
+          runTestM "an answer the upload does not define fails the push at once" $ do
+            noId@(noIdResult, _) <- pushTo (once Begin (Refuse "201 Created")) partSize
+            noError@(noErrorResult, _) <- pushTo (always (Part 1) (Refuse "204 No Content")) partSize
+            pure $
+              assertEqual "beginnings" 1 (countOf Begin noId)
+                `andThen` failsWith ["/uploads answered with no upload id: refused by the fixture"] noIdResult
+                `andThen` assertEqual "sends of part 1" 1 (countOf (Part 1) noError)
+                `andThen` failsWith ["/1 returned HTTP 204"] noErrorResult,
+          runTest "the default part size is 64 MiB, under the 100 MB a Cloudflare proxy allows" $
+            assertEqual "default" (64 * 1024 * 1024, True) (partSizeBytes defaultPartSize, partSizeBytes defaultPartSize < cloudflareBodyLimit),
+          runTest "a part size is at least one byte" $
+            assertEqual "sizes" [Nothing, Nothing, Just 1] (map (fmap partSizeBytes . mkPartSize) [-1, 0, 1]),
+          runTestM "splitting a NAR into parts keeps every byte in order, each part full but the last" $ do
+            result <-
+              QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+                QC.forAll ((,) <$> QC.choose (1, 40) <*> QC.resize 200 (QC.listOf QC.arbitrary)) $ \(size, bytes) ->
+                  let input = BS.pack bytes
+                      parts = maybe [] (`splitParts` input) (mkPartSize size)
+                      (full, rest) = length bytes `divMod` size
+                   in (BS.concat parts, map BS.length parts) QC.=== (input, replicate full size ++ [rest | rest > 0])
+            pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+        ]
+      where
+        key = TE.encodeUtf8 apiKey
+        count = (BS.length nar + testPartBytes - 1) `div` testPartBytes
+        inParts = [Begin] ++ map Part [1 .. count] ++ [Complete]
+        published = [NarInfoPut, NarInfoGet]
+        config base size =
+          PushConfig
+            { pcCacheUrl = base,
+              pcApiKey = Just apiKey,
+              pcCompression = PushNone,
+              pcPartSize = size,
+              pcRetry = retry
+            }
+        pushTo setup size = withModelCache setup (\base -> pushPaths (config base size) store [sp])
+        behindProxy = cacheSetup testPartBytes key
+        once kind fault = behindProxy {csFault = \seenKind seen -> fault <$ guard (seenKind == kind && seen == 0)}
+        always kind fault = behindProxy {csFault = \seenKind _ -> fault <$ guard (seenKind == kind)}
+        kinds = map lgKind . requestLog . snd
+        countOf kind = length . filter (== kind) . kinds
+        -- The push published the path, the cache holds the NAR it was
+        -- given, and no request carried a body past the proxy.
+        delivered limit (result, state) =
+          assertEqual "push" (Right (PushSummary 1 0)) result
+            `andThen` assertEqual "stored NAR" (Just nar) (storedObject narObject state)
+            `andThen` assertEqual "bodies over the limit" [] (filter ((> limit) . lgBodyBytes) (requestLog state))
+        failsWith fragments result = case result of
+          Left err | all (`T.isInfixOf` err) fragments -> Pass
+          other -> Fail ("expected a failure naming " <> T.pack (show fragments) <> ", got " <> T.pack (show other))
+    apiKey = "test-write-key"
+    retry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}
+    -- Cloudflare's 100 MB, read as the smaller 10^8 bytes.
+    cloudflareBodyLimit = 100 * 1000 * 1000
 
 -- | The case sensitivity of the suite's temp directory, so a test
 -- materializing a NAR there keys sibling names the way a store on that
@@ -27307,6 +27487,7 @@ runSuite = do
           testBuildCores,
           testPushPure,
           testPushClosureIO,
+          testPushMultipart,
           testBuildOrchestrator,
           testPassAsFile,
           testStoreDB,
@@ -28115,7 +28296,14 @@ testInterruptsPropagate = do
       storeDir = StoreDir (root </> "store")
       cacheHome = root </> "cache"
       inStore = storePathToFilePath storeDir
-      pushTo base = PushConfig {pcCacheUrl = base, pcApiKey = Nothing, pcCompression = PushNone}
+      pushTo base =
+        PushConfig
+          { pcCacheUrl = base,
+            pcApiKey = Nothing,
+            pcCompression = PushNone,
+            pcPartSize = defaultPartSize,
+            pcRetry = defaultFetchRetryPolicy
+          }
       plainDrv =
         Derivation
           { drvOutputs = [],

@@ -34,6 +34,7 @@ module Nix.Http
     transferFailureHandlers,
     fetchStatusFailure,
     fetchExceptionFailure,
+    exceptionFailure,
     fetchWriteFailure,
   )
 where
@@ -297,13 +298,19 @@ fetchStatusFailure url status = case statusError status of
 -- prints the whole request record over a dozen lines, and a retry would
 -- repeat it.
 fetchExceptionFailure :: Text -> HTTP.HttpException -> AttemptFailure
-fetchExceptionFailure url err = case err of
-  HTTP.InvalidUrlException _ reason -> FatalFailure (describeFailure url reason)
+fetchExceptionFailure url = exceptionFailure (describeFailure url)
+
+-- | The classification of 'fetchExceptionFailure', with the message made
+-- from the failure's detail by the given function, for a request that is
+-- not a download.
+exceptionFailure :: (String -> Text) -> HTTP.HttpException -> AttemptFailure
+exceptionFailure describe err = case err of
+  HTTP.InvalidUrlException _ reason -> FatalFailure (describe reason)
   HTTP.HttpExceptionRequest _ content -> case content of
-    HTTP.InvalidDestinationHost _ -> FatalFailure (describeFailure url "empty host")
-    HTTP.TlsNotSupported -> FatalFailure (describeFailure url "TLS is not supported")
-    HTTP.TooManyRedirects _ -> FatalFailure (describeFailure url "too many redirects")
-    _ -> TransientFailure (describeFailure url (show content))
+    HTTP.InvalidDestinationHost _ -> FatalFailure (describe "empty host")
+    HTTP.TlsNotSupported -> FatalFailure (describe "TLS is not supported")
+    HTTP.TooManyRedirects _ -> FatalFailure (describe "too many redirects")
+    _ -> TransientFailure (describe (show content))
 
 -- | A failure writing what the transfer delivered: upstream's
 -- @CURLE_WRITE_ERROR@, never retried, since the disk that refused one
