@@ -1,9 +1,9 @@
 -- | C-backed thunk memoization cells via FFI.
 --
 -- Wraps @cbits/nn_thunk.c@ - an arena-allocated mutable cell that
--- holds either pending code (a bytecode index and the C env it runs in)
--- or a computed value (an inline scalar or builtin index, or a pointer to
--- a C object).  Each cell is a 16-byte C struct in an arena, invisible to
+-- holds either pending work (a bytecode index and the C env it runs in,
+-- or a deferred application's cells) or a computed value (an inline
+-- scalar or builtin index, or a pointer to a C object).  Each cell is a 16-byte C struct in an arena, invisible to
 -- GHC's GC.
 --
 -- Includes blackhole detection: a thunk being forced is marked
@@ -30,6 +30,8 @@ module Nix.Eval.CThunk
 
     -- * Allocation
     cthunkNewBc,
+    cthunkNewApply1,
+    cthunkNewApply2,
     cthunkNewComputedInt,
     cthunkNewComputedFloat,
     cthunkNewComputedStr,
@@ -52,6 +54,9 @@ module Nix.Eval.CThunk
     cthunkPayload,
     cthunkValueTag,
     cthunkGetBcIdx,
+    noCode,
+    cthunkPendingForm,
+    cthunkApplyCell,
     cthunkGetInt,
     cthunkGetFloat,
     cthunkGetBool,
@@ -113,8 +118,20 @@ foreign import ccall unsafe "nn_thunk_destroy"
 foreign import ccall unsafe "nn_thunk_new_bc"
   c_nn_thunk_new_bc :: Word32 -> Ptr () -> IO CThunkPtr
 
+foreign import ccall unsafe "nn_thunk_new_apply1"
+  c_nn_thunk_new_apply1 :: CThunkPtr -> CThunkPtr -> IO CThunkPtr
+
+foreign import ccall unsafe "nn_thunk_new_apply2"
+  c_nn_thunk_new_apply2 :: CThunkPtr -> CThunkPtr -> CThunkPtr -> IO CThunkPtr
+
 foreign import ccall unsafe "nn_thunk_get_bc_idx"
   c_nn_thunk_get_bc_idx :: CThunkPtr -> IO Word32
+
+foreign import ccall unsafe "nn_thunk_pending_form"
+  c_nn_thunk_pending_form :: CThunkPtr -> IO Word8
+
+foreign import ccall unsafe "nn_thunk_apply_cell"
+  c_nn_thunk_apply_cell :: CThunkPtr -> Word32 -> IO CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_new_computed_int"
   c_nn_thunk_new_computed_int :: Int64 -> IO CThunkPtr
@@ -279,16 +296,47 @@ cthunkDestroy = c_nn_thunk_destroy
 -- answer the arena gives, and a NULL that flowed on would fault at the
 -- next state read instead of raising 'Nix.Eval.CStatus.ArenaNotInitialized'.
 
--- | Allocate a new PENDING thunk with a bytecode index + C env pointer.
+-- | Allocate a new PENDING thunk with a bytecode index + C env pointer,
+-- refused for 'noCode'.
 -- No Haskell heap references - zero GC pressure for pending thunks.
 -- The pointer is an @nn_env_t *@, untyped here because "Nix.Eval.CEnv"
 -- imports this module for the slots it stores.
 cthunkNewBc :: (MonadCData m) => Word32 -> Ptr () -> m CThunkPtr
 cthunkNewBc bcIdx envPtr = cdataIO (checkedCPtr "nn_thunk_new_bc" =<< c_nn_thunk_new_bc bcIdx envPtr)
 
--- | Read the bytecode index from a PENDING thunk.
+-- | Allocate a new PENDING thunk deferring the application of the
+-- function in one cell to the argument in another, as upstream's app
+-- value holds a function and its argument.  Its cells live in the env
+-- pages, beside no env.
+cthunkNewApply1 :: (MonadCData m) => CThunkPtr -> CThunkPtr -> m CThunkPtr
+cthunkNewApply1 fn arg = cdataIO (checkedCPtr "nn_thunk_new_apply1" =<< c_nn_thunk_new_apply1 fn arg)
+
+-- | 'cthunkNewApply1' applying the function to a first argument, and the
+-- result to a second, as upstream's @mapAttrs@ nests two app values.
+cthunkNewApply2 :: (MonadCData m) => CThunkPtr -> CThunkPtr -> CThunkPtr -> m CThunkPtr
+cthunkNewApply2 fn first second = cdataIO (checkedCPtr "nn_thunk_new_apply2" =<< c_nn_thunk_new_apply2 fn first second)
+
+-- | Read the bytecode index of a PENDING or BLACKHOLE code thunk, or
+-- 'noCode' for an application.
 cthunkGetBcIdx :: (MonadCData m) => CThunkPtr -> m Word32
 cthunkGetBcIdx = cdataIO . c_nn_thunk_get_bc_idx
+
+-- | @NN_THUNK_NO_CODE@ of @cbits/nn_thunk.h@: the index of no
+-- instruction, which 'cthunkGetBcIdx' answers for a thunk that runs
+-- none.
+noCode :: Word32
+noCode = maxBound
+
+-- | Read the form of a PENDING or BLACKHOLE thunk: @NN_PENDING_CODE@,
+-- @NN_PENDING_APPLY1@ or @NN_PENDING_APPLY2@ of @cbits/nn_thunk.h@.
+cthunkPendingForm :: (MonadCData m) => CThunkPtr -> m Word8
+cthunkPendingForm = cdataIO . c_nn_thunk_pending_form
+
+-- | Cell @i@ of a PENDING or BLACKHOLE application, the function's at
+-- 0, or 'Foreign.Ptr.nullPtr' for a thunk of another form or an index
+-- past its cells.
+cthunkApplyCell :: (MonadCData m) => CThunkPtr -> Word32 -> m CThunkPtr
+cthunkApplyCell ptr i = cdataIO (c_nn_thunk_apply_cell ptr i)
 
 -- | Allocate a pre-COMPUTED thunk with an inline int64.
 cthunkNewComputedInt :: (MonadCData m) => Int64 -> m CThunkPtr

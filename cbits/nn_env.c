@@ -1,8 +1,9 @@
 /*
  * nn_env.c - C-native evaluation environments.
  *
- * Arena-allocated envs (nn_env.h), with-scope arrays and list items
- * arrays.  Pages are 256 KB each, allocated on demand as a linked list.
+ * Arena-allocated envs (nn_env.h), with-scope arrays, list items arrays
+ * and deferred applications' cells.  Pages are 256 KB each, allocated on
+ * demand as a linked list.
  * Each allocation bumps a pointer within the current page.
  *
  * All memory is freed in bulk via nn_env_destroy().
@@ -67,6 +68,8 @@ typedef char nn_env_short_max_check_[(NN_ENV_SHORT_MAX == NN_ENV_SHORT_MASK) ? 1
 static struct nn_env_page *g_first_page = NULL;
 static struct nn_env_page *g_current_page = NULL;
 static uint64_t g_total_bytes = 0;
+static uint64_t g_app_count = 0;
+static uint64_t g_app_bytes = 0;
 
 /* Global empty env - initialized in nn_env_init, valid until destroy. */
 static nn_env_t g_empty_env;
@@ -244,6 +247,8 @@ nn_env_init(void)
     if (!g_first_page) { fprintf(stderr, "nn_env_init: page alloc failed\n"); abort(); }
     g_current_page = g_first_page;
     g_total_bytes = 0;
+    g_app_count = 0;
+    g_app_bytes = 0;
 
     /* Initialize global empty env */
     memset(&g_empty_env, 0, sizeof(g_empty_env));
@@ -267,6 +272,8 @@ nn_env_destroy(void)
     g_first_page = NULL;
     g_current_page = NULL;
     g_total_bytes = 0;
+    g_app_count = 0;
+    g_app_bytes = 0;
 }
 
 /* --- List items --- */
@@ -275,6 +282,31 @@ void **
 nn_env_alloc_items(uint32_t count)
 {
     return nn_env_alloc_pointers(count);
+}
+
+/* --- Deferred applications' cells --- */
+
+void **
+nn_env_alloc_app_cells(uint32_t count)
+{
+    void **cells = nn_env_alloc_pointers(count);
+    if (cells) {
+        g_app_count++;
+        g_app_bytes += (uint64_t)count * sizeof(void *);
+    }
+    return cells;
+}
+
+uint64_t
+nn_env_app_count(void)
+{
+    return g_app_count;
+}
+
+uint64_t
+nn_env_app_bytes(void)
+{
+    return g_app_bytes;
 }
 
 /* --- Env constructors --- */

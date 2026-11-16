@@ -28,9 +28,10 @@
  * starts a whole number of pointers past them, so every slot, parent and
  * scopes field is pointer-aligned.
  *
- * Envs, the with-scope arrays and the list items arrays (nn_list.h) are
- * allocated from a page-based bump allocator.  Nothing is individually
- * freed - nn_env_destroy() tears down everything at eval end.
+ * Envs, the with-scope arrays, the list items arrays (nn_list.h) and the
+ * cells of deferred applications (nn_thunk.h) are allocated from a
+ * page-based bump allocator.  Nothing is individually freed -
+ * nn_env_destroy() tears down everything at eval end.
  *
  * Every allocation for an env names its site, the construct or builtin
  * that makes the env (nn_stats.h), under which the census counts it.
@@ -113,6 +114,19 @@ void nn_env_destroy(void);
  * initialized to NULL.  Returns NULL if count is 0, past the allocator's
  * uint32 byte limit, or on OOM. */
 void **nn_env_alloc_items(uint32_t count);
+
+/* --- Deferred applications' cells --- */
+
+/* Allocate an array of `count` void* pointers for the cells of a deferred
+ * application (nn_thunk.h), which no env site counts.  All entries
+ * initialized to NULL.  Returns NULL if count is 0, past the allocator's
+ * uint32 byte limit, or on OOM. */
+void **nn_env_alloc_app_cells(uint32_t count);
+
+/* The cell arrays nn_env_alloc_app_cells has handed out since
+ * nn_env_init, and their bytes. */
+uint64_t nn_env_app_count(void);
+uint64_t nn_env_app_bytes(void);
 
 /* --- Env constructors (all arena-allocated) --- */
 

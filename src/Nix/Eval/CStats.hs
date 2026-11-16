@@ -167,6 +167,9 @@ data PerKind a = PerKind
     kindLambdas :: !a,
     -- | Builtins' partial applications, with their argument cells.
     kindPrimopApps :: !a,
+    -- | Deferred applications' cells, a function's and its arguments',
+    -- which a builtin makes per element as upstream makes an app value.
+    kindApps :: !a,
     -- | Strings with context.
     kindCtxStrs :: !a,
     -- | The bytes of strings and paths, a string with context's text and
@@ -180,19 +183,19 @@ data PerKind a = PerKind
 -- | Kind by kind: 'pure' is the same value for every kind, and '<*>'
 -- applies each kind's function to that kind's value.
 instance Applicative PerKind where
-  pure a = PerKind a a a a a a a a a
-  PerKind f1 f2 f3 f4 f5 f6 f7 f8 f9 <*> PerKind a1 a2 a3 a4 a5 a6 a7 a8 a9 =
-    PerKind (f1 a1) (f2 a2) (f3 a3) (f4 a4) (f5 a5) (f6 a6) (f7 a7) (f8 a8) (f9 a9)
+  pure a = PerKind a a a a a a a a a a
+  PerKind f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 <*> PerKind a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 =
+    PerKind (f1 a1) (f2 a2) (f3 a3) (f4 a4) (f5 a5) (f6 a6) (f7 a7) (f8 a8) (f9 a9) (f10 a10)
 
 -- | Each kind's index in the arrays @nn_stats_allocated@ and
 -- @nn_stats_reached@ fill: the @NN_STATS_*@ constants of
 -- @cbits\/nn_stats.h@, which this must match.
 kindIndices :: PerKind Int
-kindIndices = PerKind 0 1 2 3 4 5 6 7 8
+kindIndices = PerKind 0 1 2 3 4 5 6 7 8 9
 
 -- | @NN_STATS_KIND_COUNT@: the length of those arrays.
 kindCount :: Int
-kindCount = 9
+kindCount = 10
 
 -- | @NN_STATS_UNCOUNTED@: a count no allocator keeps.
 uncounted :: Word64
@@ -200,7 +203,7 @@ uncounted = maxBound
 
 -- | Each kind's name in 'renderCensus'.
 kindNames :: PerKind BS.ByteString
-kindNames = PerKind "thunks" "envs" "attrsets" "lists" "lambdas" "primopapps" "ctxstrs" "strings" "symbols"
+kindNames = PerKind "thunks" "envs" "attrsets" "lists" "lambdas" "primopapps" "apps" "ctxstrs" "strings" "symbols"
 
 -- ---------------------------------------------------------------------------
 -- Figures
@@ -234,8 +237,8 @@ data Census = Census
     -- | Bytes the bytecode store holds.
     censusCodeBytes :: !Word64,
     -- | Objects the mark entered: thunks, envs, with-scope arrays, sets,
-    -- list headers, items arrays, lambdas, partial applications and
-    -- strings with context.
+    -- list headers, items arrays, lambdas, partial applications,
+    -- deferred applications' cells and strings with context.
     -- Strings and symbols hold no pointer, and are marked and not entered.
     censusVisitedObjects :: !Word64,
     -- | The bytes those objects hold.

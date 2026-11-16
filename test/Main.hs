@@ -80,7 +80,7 @@ import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
-import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvLazyScope, cenvNew, cenvNewScoped, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
@@ -104,7 +104,7 @@ import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecor
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), attrSetFromEntries, attrSetFromEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkThunkBc, newEnv, newScopeEnv, pendingCode, pendingThunkEnv, pushLazyWithScope, readComputed, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -1877,13 +1877,43 @@ testCensus = do
               `andThen` assertEqual "partial applications reached" True (figuresCount (kindPrimopApps (censusReached census)) >= Just 1),
       runTestM "a census follows a pending thunk to its env and the env's slots" $ do
         cells <- mapM cthunkNewComputedInt [1, 2, 3]
-        env <- newEnv EnvApply Nothing (map Thunk cells)
+        env <- newEnv EnvClosure Nothing (map Thunk cells)
         code <- compileExpr (ELit (NixInt 0))
         pending <- mkThunkBc env code
         withCensus [RootThunk pending] $ \census ->
           assertEqual "thunks" (Figures (Just 4) (4 * censusCellBytes)) (kindThunks (censusReached census))
             `andThen` assertEqual "envs" (Figures (Just 1) (envWordBytes + 3 * censusPointerBytes)) (kindEnvs (censusReached census))
             `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
+      -- A deferred application's cells are a pointer each beside no env,
+      -- and a blackholed one keeps them for the force that restores it.
+      runTestM "a census follows a deferred application to its cells, a pointer each, pending or blackholed" $ do
+        fn <- Thunk <$> cthunkNewComputedInt 1
+        first <- Thunk <$> cthunkNewComputedInt 2
+        second <- Thunk <$> cthunkNewComputedInt 3
+        one <- mkApplyThunk fn first
+        two <- mkApply2Thunk fn first second
+        blackholed <- mkApplyThunk second first
+        _ <- cthunkMarkBlackhole (unThunk blackholed)
+        withCensus [RootThunk one, RootThunk two, RootThunk blackholed] $ \census ->
+          assertEqual "thunks" (Figures (Just 6) (6 * censusCellBytes)) (kindThunks (censusReached census))
+            `andThen` assertEqual "applications" (Figures (Just 3) ((2 + 3 + 2) * censusPointerBytes)) (kindApps (censusReached census))
+            `andThen` assertEqual "envs" (Figures (Just 0) 0) (kindEnvs (censusReached census))
+            `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
+      runTestM "a deferred application reads back as the cells it was made of, and forcing it applies the function to them" $ do
+        fn <- evaluated (VBuiltin Builtin.Add [])
+        first <- Thunk <$> cthunkNewComputedInt 2
+        second <- Thunk <$> cthunkNewComputedInt 3
+        one <- mkApplyThunk fn first
+        two <- mkApply2Thunk fn first second
+        readOne <- readPending (unThunk one)
+        readTwo <- readPending (unThunk two)
+        let cellsOf pending = case pending of
+              PendingApply f a -> map unThunk [f, a]
+              PendingApply2 f a b -> map unThunk [f, a, b]
+              PendingCode _ _ -> []
+        pure $
+          assertEqual "cells" (map unThunk [fn, first], map unThunk [fn, first, second]) (cellsOf readOne, cellsOf readTwo)
+            `andThen` assertEqual "applied" (Right (VInt 5)) (runPureEval (force two)),
       runTestM "a list and its suffix count one items array, whichever is reached first" $ do
         cells <- mapM cthunkNewComputedInt [1, 2, 3, 4]
         whole <- CList <$> thunkListToCList cells
@@ -1995,9 +2025,10 @@ testCensus = do
               `andThen` assertEqual "env slots by site" (siteSum "envs" "slots") (named "envs.allocated.slots")
               `andThen` assertEqual "sets counted by site" (siteSum "attrsets" "count") (named "attrsets.allocated.count")
               `andThen` assertEqual "set bytes by site" (siteSum "attrsets" "bytes") (named "attrsets.allocated.bytes")
-              -- genList defers one application per element, each of
-              -- which calls the lambda, which makes one set.
-              `andThen` assertEqual "genList's applications" [3] (named "envs.site.genList.count")
+              -- genList defers one application per element, cells of
+              -- its own and no env, each of which calls the lambda,
+              -- which makes one set.
+              `andThen` assertEqual "genList's applications" [3] (named "apps.allocated.count")
               `andThen` assertEqual "the lambda's calls" [3] (named "envs.site.call.count")
               `andThen` assertEqual "the literal sets" [3] (named "attrsets.site.literal.count")
     ]
@@ -2034,7 +2065,7 @@ testCensus = do
         ( concat
             [ [name <> ".allocated.count 3" | name /= "envs"]
                 ++ [name <> ".allocated.bytes " <> (if name == "envs" then "96" else "48"), name <> ".reached.count 1", name <> ".reached.bytes 16"]
-            | name <- ["thunks", "envs", "attrsets", "lists", "lambdas", "primopapps", "ctxstrs", "strings", "symbols"]
+            | name <- ["thunks", "envs", "attrsets", "lists", "lambdas", "primopapps", "apps", "ctxstrs", "strings", "symbols"]
             ]
             ++ [ "overhead.bytes 5",
                  "code.bytes 6",
@@ -2095,6 +2126,17 @@ sitesOfEval baseDir source = do
   added <- sitesAdded (evalNixIO baseDir source >>= writeIORef outcome . void)
   failure <- readIORef outcome
   pure (failure >> fmap (\counts -> (Map.delete EnvRoot (sitesEnvs counts), Map.delete SetRoot (sitesSets counts))) added)
+
+-- | The deferred applications evaluating a source allocates, by the
+-- census's count before and after, under the IO evaluator as
+-- 'sitesOfEval' runs it.
+appsOfEval :: FilePath -> Text -> IO (Either Text Word64)
+appsOfEval baseDir source = do
+  before <- censusOf []
+  outcome <- evalNixIO baseDir source
+  after <- censusOf []
+  let count census = fromMaybe 0 (figuresCount (kindApps (censusAllocated census)))
+  pure (outcome >> ((-) <$> fmap count after <*> fmap count before))
 
 testAllocSites :: IO [Bool]
 testAllocSites = do
@@ -2166,8 +2208,9 @@ testAllocSites = do
       -- array, and a set a 40-byte header with 16 bytes an entry, with
       -- room for one when it is an empty set of its own; the shared empty
       -- set is no allocation.  The root env is each evaluation's, and
-      -- every other env made in it has a parent; a trimmed closure's, a
-      -- capture's, and a builtin's deferred application have none.
+      -- every other env made in it has a parent; a trimmed closure's and a
+      -- capture's have none.  A builtin's deferred application is its
+      -- cells and no env.
       sitesTest
         "a let makes one env with a slot a binding"
         "let a = 1; b = 2; in a + b"
@@ -2238,14 +2281,14 @@ testAllocSites = do
         [(EnvRec, EnvSiteFigures 1 0 40)]
         [(SetRec, SetSiteFigures 1 0 56)],
       sitesTest
-        "map defers an application per element, each of which calls the function"
+        "map defers an application per element, which makes no env, and each calls the function"
         "builtins.deepSeq (builtins.map (x: x) [ 1 2 3 ]) null"
-        [(EnvCall, EnvSiteFigures 3 3 48), (EnvMap, EnvSiteFigures 3 6 72)]
+        [(EnvCall, EnvSiteFigures 3 3 48)]
         [],
       sitesTest
-        "concatMap defers an application per element before it forces it"
+        "concatMap calls the function on each element, making no env but the call's"
         "builtins.deepSeq (builtins.concatMap (x: [ x ]) [ 1 2 ]) null"
-        [(EnvCall, EnvSiteFigures 2 2 32), (EnvConcatMap, EnvSiteFigures 2 4 48)]
+        [(EnvCall, EnvSiteFigures 2 2 32)]
         [],
       sitesTest
         "each inherit (from) makes an env of one slot"
@@ -2263,10 +2306,15 @@ testAllocSites = do
         [(EnvRec, EnvSiteFigures 1 2 24)]
         [(SetRec, SetSiteFigures 1 0 72)],
       sitesTest
-        "mapAttrs defers an application per attribute, each of which makes two calls"
+        "mapAttrs defers an application per attribute, which makes no env, and each makes two calls"
         "builtins.deepSeq (builtins.mapAttrs (n: v: v) { a = 1; b = 2; }) null"
-        [(EnvCall, EnvSiteFigures 4 4 64), (EnvMapAttrs, EnvSiteFigures 2 6 64)]
+        [(EnvCall, EnvSiteFigures 4 4 64)]
         [(SetLiteral, SetSiteFigures 1 0 72), (SetMapAttrs, SetSiteFigures 1 0 72)],
+      appsTest "map defers one application per element" "builtins.deepSeq (builtins.map (x: x) [ 1 2 3 ]) null" 3,
+      appsTest "genList defers one application per index" "builtins.deepSeq (builtins.genList (i: i) 4) null" 4,
+      appsTest "mapAttrs defers one application per attribute" "builtins.deepSeq (builtins.mapAttrs (n: v: v) { a = 1; b = 2; }) null" 2,
+      appsTest "zipAttrsWith defers one application per name" "builtins.deepSeq (builtins.zipAttrsWith (n: vs: vs) [ { a = 1; } { b = 2; } ]) null" 2,
+      appsTest "concatMap calls its function and defers no application" "builtins.deepSeq (builtins.concatMap (x: [ x ]) [ 1 2 ]) null" 0,
       sitesTest
         "functionArgs of a lambda without formals or with no formal is the shared empty set"
         "builtins.deepSeq [ (builtins.functionArgs (x: x)) (builtins.functionArgs ({ }: 1)) ] null"
@@ -2282,6 +2330,11 @@ testAllocSites = do
         tmpBase <- getTemporaryDirectory
         added <- sitesOfEval tmpBase source
         pure (assertEqual "envs and sets" (Right (Map.fromList envs, Map.fromList sets)) added)
+    appsTest name source expected =
+      runTestM name $ do
+        tmpBase <- getTemporaryDirectory
+        added <- appsOfEval tmpBase source
+        pure (assertEqual "applications" (Right expected) added)
     genEnvAllocation = EnvAllocation <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (0, 5)
     genSetAllocation = SetAllocation <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (0, 4)
     allocateEnv (EnvAllocation site n) = do
@@ -2505,14 +2558,17 @@ testFrameKnots = do
         quickCheckPasses $
           QC.forAll genSlotRead $ \(before, value, after) ->
             QC.ioProperty $ do
-              env@(Env envPtr) <- mapM (evaluated . VInt) (before ++ value : after) >>= newEnv EnvApply Nothing
+              env@(Env envPtr) <- mapM (evaluated . VInt) (before ++ value : after) >>= newEnv EnvClosure Nothing
               bcIdx <- compileExpr (EResolvedVar 0 (length before))
               Thunk cell <- mkThunkBc env bcIdx
               payload <- cthunkPayload cell
-              Env stored <- pendingThunkEnv cell
+              stored <- readPending cell
+              let code = case stored of
+                    PendingCode (Env storedEnv) storedIdx -> Just (storedEnv, storedIdx)
+                    _ -> Nothing
               pure $
-                (payload, stored, runPureEval (force (Thunk cell)))
-                  QC.=== (castPtr envPtr, envPtr, Right (VInt value)),
+                (payload, code, runPureEval (force (Thunk cell)))
+                  QC.=== (castPtr envPtr, Just (envPtr, bcIdx), Right (VInt value)),
       runTestM "a frame binding may name one declared after it, in a let, a rec set and a formals set" $
         quickCheckPasses $
           QC.forAll genFrame $ \frame ->
@@ -24211,7 +24267,7 @@ arenaGuardPaths =
     noArena "thunk" "nn_thunk_new_computed_int" (void (evaluated (VInt 1))),
     noArena "string" "nn_str_new" (void (evaluated (mkStr "a"))),
     noArena "symbol" "nn_symbol_intern" (void (symbolIntern "a")),
-    noArena "env" "nn_env_new" (void (evaluated VNull >>= \nullCell -> newEnv EnvApply Nothing [nullCell])),
+    noArena "env" "nn_env_new" (void (evaluated VNull >>= \nullCell -> newEnv EnvClosure Nothing [nullCell])),
     noArena "after-session" "nn_bc_emit" (inTestSession (pure ()) >> evalNamelessProgram),
     ArenaGuardPath
       { guardName = "constants-outside-window",
@@ -25865,7 +25921,7 @@ instance MonadEval StubStoreEval where
     cthunkState ptr >>= \case
       ThunkComputed -> readComputed ptr
       ThunkBlackhole -> abortEvaluation "infinite recursion encountered"
-      _ {- PENDING -} -> pendingCode ptr >>= uncurry evalFn
+      _ {- PENDING -} -> readPending ptr >>= evalFn
 
 -- | Parse and evaluate under the stubbed-store evaluator.
 evalNixStub :: Map.Map Text Derivation -> Text -> Either Text NixValue
@@ -26047,27 +26103,6 @@ testClassIFollowupsIO = do
 -- Bytecode shared across elements
 -- ---------------------------------------------------------------------------
 
--- | A bytecode instruction as far as the reserved instructions use them: a
--- resolved variable (level, slot), a deferred application, or anything
--- else (opcode, flags).
-data CodeShape
-  = SlotRef !Word32 !Word32
-  | DeferredApp !CodeShape !CodeShape
-  | OtherCode !Word8 !Word8
-  deriving (Eq, Show)
-
--- | Read the code at a bytecode index back as a 'CodeShape'.
-codeShape :: Word32 -> IO CodeShape
-codeShape idx = do
-  op <- cbcOpcode idx
-  flags <- cbcFlags idx
-  arg1 <- cbcArg1 idx
-  arg2 <- cbcArg2 idx
-  case op of
-    OpResolvedVar -> pure (SlotRef arg1 arg2)
-    OpApp | flags == appDeferred -> DeferredApp <$> codeShape arg1 <*> codeShape arg2
-    _ -> pure (OtherCode op flags)
-
 -- | The instructions and data words evaluating a source adds to the
 -- bytecode store, which only the session's end frees.  The source must
 -- evaluate to an integer computed from everything it builds, so each
@@ -26105,15 +26140,7 @@ testBytecodePerElement = do
   let summed body n = "builtins.foldl' (a: b: a + b) 0 (" <> body n <> ")"
       indices n = "builtins.genList (i: i) " <> n
   sequence
-    [ runTestM "reserved instructions are the deferred applications of the slots" $ do
-        apply1 <- codeShape reservedApply1
-        apply2 <- codeShape reservedApply2
-        apply2Function <- cbcArg1 reservedApply2
-        pure $
-          assertEqual "reservedApply1" (DeferredApp (SlotRef 0 0) (SlotRef 0 1)) apply1
-            `andThen` assertEqual "reservedApply2" (DeferredApp (DeferredApp (SlotRef 0 0) (SlotRef 0 1)) (SlotRef 0 2)) apply2
-            `andThen` assertEqual "reservedApply2's function" reservedApply1 apply2Function,
-      runTestM "map adds no bytecode per element" $
+    [ runTestM "map adds no bytecode per element" $
         assertNoPerElementBytecode (summed (\n -> "builtins.map (x: x + 1) (" <> indices n <> ")")),
       runTestM "genList adds no bytecode per element" $
         assertNoPerElementBytecode (summed ("builtins.genList (i: i * 2) " <>)),

@@ -573,13 +573,15 @@ int nn_stats_begin(void)
         return -1;
     }
 
-    /* The page bytes handed out are the envs, their with-scope arrays and
-     * the list items arrays, every one of which nn_list_new takes from the
-     * pages. */
-    NN_ASSERT(g.items_bytes <= nn_env_bytes_allocated(),
-              "nn_stats_begin: list items arrays outside the env pages");
+    /* The page bytes handed out are the envs, their with-scope arrays, the
+     * list items arrays, every one of which nn_list_new takes from the
+     * pages, and the deferred applications' cells. */
+    NN_ASSERT(g.items_bytes + nn_env_app_bytes() <= nn_env_bytes_allocated(),
+              "nn_stats_begin: list items or applications outside the env pages");
     g.allocated_count[NN_STATS_ENVS] = counted_envs();
-    g.allocated_bytes[NN_STATS_ENVS] = nn_env_bytes_allocated() - g.items_bytes;
+    g.allocated_bytes[NN_STATS_ENVS] = nn_env_bytes_allocated() - g.items_bytes - nn_env_app_bytes();
+    g.allocated_count[NN_STATS_APPS] = nn_env_app_count();
+    g.allocated_bytes[NN_STATS_APPS] = nn_env_app_bytes();
 
     nn_symbol_footprint(&text, &reserved);
     g.symbol_count = nn_symbol_count();
@@ -782,15 +784,44 @@ static int reach_array(void *const *array, uint32_t n)
     return 1;
 }
 
+/* Reach a deferred application's `n` cells, an array of the env pages
+ * that one thunk holds, and follow them when it is new. */
+static void reach_app(void *const *cells, uint32_t n)
+{
+    uint64_t bit;
+    uint32_t i;
+    if (!region_find(&g.pages, (uintptr_t)cells, &bit)) {
+        g.unplaced++;
+        return;
+    }
+    if (!bit_set(g.pages.bits, bit)) return;
+    count_reached(NN_STATS_APPS, (uint64_t)n * sizeof(void *));
+    for (i = 0; i < n; i++) reach(NN_STATS_THUNKS, cells[i]);
+}
+
 /* --- Entering objects --- */
 
 static void enter_thunk(const nn_thunk_t *t)
 {
     uint8_t state = nn_thunk_state(t);
     if (state == NN_THUNK_PENDING || state == NN_THUNK_BLACKHOLE) {
-        /* A blackhole keeps its pending env (nn_thunk_mark_pending puts it
-         * back to work), so it holds the env as a pending thunk does. */
-        reach(NN_STATS_ENVS, nn_thunk_payload(t));
+        /* A blackhole keeps its pending form and payload
+         * (nn_thunk_mark_pending puts it back to work), so it holds what a
+         * pending thunk does: an env, or an application's cells, one more
+         * than its form's arguments. */
+        uint8_t form = nn_thunk_pending_form(t);
+        switch (form) {
+        case NN_PENDING_CODE:
+            reach(NN_STATS_ENVS, nn_thunk_payload(t));
+            break;
+        case NN_PENDING_APPLY1:
+        case NN_PENDING_APPLY2:
+            reach_app((void *const *)nn_thunk_payload(t), (uint32_t)form + 1);
+            break;
+        default:
+            g.unplaced++;
+            break;
+        }
         return;
     }
     if (state != NN_THUNK_COMPUTED) {
