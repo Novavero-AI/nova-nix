@@ -165,7 +165,7 @@ import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, empty
 import Nix.Eval.CPrimop (CPrimopAppPtr, cprimopAppArg, cprimopAppForced, cprimopAppNew, cprimopAppPrimop, cprimopAppTaken)
 import Nix.Eval.CStatus (cInvariantViolated, checkedCPtr)
 import Nix.Eval.CStr (CStrPtr, cstrBytes, cstrFromText, cstrNew, cstrText)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetPrimop, cthunkGetPrimopApp, cthunkGetStr, cthunkNewBc, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedPrimop, cthunkNewComputedPrimopApp, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkEmptyList, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetPrimop, cthunkGetPrimopApp, cthunkGetStr, cthunkNewBc, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedPrimop, cthunkNewComputedPrimopApp, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.Compile (compileExpr, compileFormalsToEval, compileParsed)
@@ -920,15 +920,11 @@ cheapThunkBc env bcIdx =
         else mkThunkBc env bcIdx
     _ -> mkThunkBc env bcIdx
 
--- | The one cell every empty list literal evaluates to, for the process,
--- as upstream's @vEmptyList@ is one value: a cell per evaluation of @[ ]@
--- would cost arena memory, which nothing frees, each time one is
--- evaluated.  A process-global value, allocated where the first empty list
--- literal is evaluated ('runCDataPure'); the allocation writes only the
--- cell it makes.
+-- | The one cell every empty list literal evaluates to, as upstream's
+-- @vEmptyList@ is one value: a C static, like the @null@ cell, so it is
+-- the same in every arena window.
 emptyListThunk :: Thunk
-emptyListThunk = runCDataPure (evaluated (VList emptyCList))
-{-# NOINLINE emptyListThunk #-}
+emptyListThunk = Thunk cthunkEmptyList
 
 -- | The 64 bits of an integer or float literal, split across the
 -- instruction's two 32-bit arguments, low word first.

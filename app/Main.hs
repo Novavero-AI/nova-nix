@@ -31,7 +31,7 @@ import GHC.IO.Exception (IOException (..))
 import GHC.Profiling (requestHeapCensus)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
 import qualified Nix.Builder.Cores as Cores
-import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
+import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
 import Nix.Cli.Args (BuildTarget (..), CliOpts (..), Command (..), PushArgs (..), parseArgs)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, systemConfDirSource)
 import Nix.Config (NixConfig (..))
@@ -45,7 +45,7 @@ import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, newEvalStateWith, nixPathValue, renderEvalFailure, runEvalIOTraced)
+import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathValue, renderEvalFailure, runEvalIOTraced)
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes)
@@ -323,12 +323,8 @@ setUpEval opts config storeDir dataDir baseDir = do
     if epPureEval policy
       then parseNixPath (TE.encodeUtf8 (T.pack dataDir))
       else mergeSearchPaths (optNixPaths opts) dataDir nixPath
-  st0 <- newEvalStateWith searchPaths storeDir baseDir
-  let st =
-        st0
-          { esPolicy = policy,
-            esCallDepth = topLevelCallDepth (ncMaxCallDepth config)
-          }
+  st0 <- newEvalStateWith policy searchPaths storeDir baseDir
+  let st = st0 {esCallDepth = topLevelCallDepth (ncMaxCallDepth config)}
   -- A relative root resolves against the working directory, as upstream's
   -- absPath does, and a rooted one with no drive lands on the store's
   -- drive, where its lookups read ('qualifyPathText').  A pseudo-URL
@@ -342,7 +338,7 @@ setUpEval opts config storeDir dataDir baseDir = do
   rootBytes <- searchPathRoots searchPaths
   roots <- mapM rootSpellings (mapMaybe textRoot (filter (not . isNixPathPseudoUrl) rootBytes))
   mapM_ (allowEvalPath st) (concat roots)
-  pure (st, builtinEnv policy (esTimestamp st) searchPaths)
+  pure (st, pure (evalBaseEnv st))
   where
     textRoot = either (const Nothing) Just . TE.decodeUtf8'
     rootSpellings root = do
@@ -368,7 +364,7 @@ evalFile config opts storeDir dataDir rawFilePath = do
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
-        Right (env, forced) -> printResult forced >> writeCensus st env forced
+        Right (env, forced) -> printResult forced >> writeCensus env forced
 
 -- | Evaluate an inline expression and print the result.
 evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
@@ -383,7 +379,7 @@ evalExpr config opts storeDir dataDir source = do
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
-        Right (env, forced) -> printResult forced >> writeCensus st env forced
+        Right (env, forced) -> printResult forced >> writeCensus env forced
 
 -- | Evaluate the source as 'evalParsed' does, compiling it before the root
 -- environment is built, to the result 'finalize' gives, with that
@@ -406,27 +402,20 @@ censusTarget = mfilter (not . BS.null) <$> configVariable censusVar
 -- | With 'censusVar' set to a path, write a census of the C data layer
 -- ("Nix.Eval.CStats") to it once an evaluation has succeeded.  Its roots
 -- are what the process still holds once the evaluation has returned: the
--- result, the root environment, the import cache and the search path.
--- What else holds a C pointer then is a constant of the program, whose
--- number does not grow with the evaluation.  A census of GHC's heap
+-- result and the root environment, and every root the session registered
+-- ("Nix.Eval.CRoots"), the import cache's values among them.  A census of GHC's heap
 -- follows, which a run under a heap profile (@+RTS -hT@) records as its
 -- last sample: taken after the C census, so that no periodic sample falls
 -- between it and the end however long the mark runs, in the major
 -- collection that leaves nothing in GHC's heap the evaluation has dropped.
-writeCensus :: EvalState -> Env -> NixValue -> IO ()
-writeCensus st env result = do
+writeCensus :: Env -> NixValue -> IO ()
+writeCensus env result = do
   target <- censusTarget
   case target of
     Nothing -> pure ()
     Just bytes -> do
       path <- variableHostPath censusVar bytes
-      cached <- readIORef (esImportCache st)
-      let roots =
-            valueRoots result
-              ++ [RootEnv env]
-              ++ concatMap valueRoots (Map.elems cached)
-              ++ map RootThunk (esSearchPaths st)
-      census <- takeCensus roots
+      census <- takeCensus (RootRegistered : RootEnv env : valueRoots result)
       requestHeapCensus
       performMajorGC
       case census of

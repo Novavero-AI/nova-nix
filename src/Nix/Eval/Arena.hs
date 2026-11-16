@@ -43,6 +43,7 @@ import Nix.Eval.CEnv (cenvDestroy, cenvInit)
 import Nix.Eval.CLambda (clambdaFreeAll)
 import Nix.Eval.CList (clistFreeAll)
 import Nix.Eval.CPrimop (cprimopAppFreeAll)
+import Nix.Eval.CRoots (crootsClear)
 import Nix.Eval.CStatus (CStatusError (..), arenaLive)
 import Nix.Eval.CStr (cstrDestroy, cstrInit)
 import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
@@ -74,20 +75,22 @@ arenaInit = do
   cenvInit
   cbcInit 0 0
 
--- | Destroy all C arenas: the tracked objects (strings with context,
--- lambdas, partial applications, lists, sets), then the bytecode store
+-- | Destroy all C arenas: the registered roots, the tracked objects
+-- (strings with context, lambdas, partial applications, lists, sets),
+-- then the bytecode store
 -- with the code's strings, the env pages, the thunk blocks, the string
 -- arena and the symbol table.
 --
--- This ends the process's use of the evaluator; a second 'arenaInit' does
--- not restore one.  The @derivation@ constant "Nix.Builtins" allocates
--- once for the process, and the empty list's cell, keep pointing into the
--- memory freed here, so a 'Nix.Builtins.builtinEnv' built in a second
--- cycle binds a dangling one and an empty list literal evaluates to one;
--- the other entries are built per call, and the static @null@, @true@ and
--- @false@ thunks and the builtins' own cells survive every cycle.
+-- A second 'arenaInit' starts the evaluator afresh: no constant of the
+-- program points into the memory freed here, since an evaluation
+-- session builds its base environment and @derivation@ wrapper as it
+-- starts ('Nix.Eval.IO.newEvalState'), and the @null@, @true@, @false@
+-- and empty list cells and the builtins' own cells are C statics that
+-- survive every cycle.  A session's own values do not: one started
+-- before the teardown is not used after it.
 arenaDestroy :: IO ()
 arenaDestroy = do
+  crootsClear
   cctxstrFreeAll
   clambdaFreeAll
   cprimopAppFreeAll

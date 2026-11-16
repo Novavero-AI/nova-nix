@@ -4,7 +4,9 @@
 -- kind of object, and what a set of roots reaches.
 --
 -- 'takeCensus' counts every object the allocators hold and then marks
--- from the roots it is given, following every C pointer: every value
+-- from the roots it is given, the session's registered roots
+-- ("Nix.Eval.CRoots") among them when it is given 'RootRegistered',
+-- following every C pointer: every value
 -- lives in C, so the mark runs in C alone.  It frees and writes nothing
 -- in the data layer, and it adds no work to any
 -- allocation, so a process that never takes a census pays nothing for it.
@@ -116,6 +118,9 @@ foreign import ccall unsafe "nn_stats_root_string"
 
 foreign import ccall unsafe "nn_stats_root_ctxstr"
   c_nn_stats_root_ctxstr :: Ptr () -> IO ()
+
+foreign import ccall unsafe "nn_stats_root_registered"
+  c_nn_stats_root_registered :: IO ()
 
 foreign import ccall safe "nn_stats_mark"
   c_nn_stats_mark :: IO CInt
@@ -379,6 +384,8 @@ data CRoot
     RootString !CStrPtr
   | -- | A string with context.
     RootCtxStr !CCtxStrPtr
+  | -- | Every root the session registered ("Nix.Eval.CRoots").
+    RootRegistered
 
 -- | The C objects a value holds.  A value read from a cell is a view of
 -- the cell's C objects; a partial application built in Haskell and not
@@ -411,6 +418,7 @@ nameRoot root = case root of
   RootList (CList ptr) -> c_nn_stats_root_list (castPtr ptr)
   RootString str -> c_nn_stats_root_string (castPtr str)
   RootCtxStr csptr -> c_nn_stats_root_ctxstr (castPtr csptr)
+  RootRegistered -> c_nn_stats_root_registered
 
 -- ---------------------------------------------------------------------------
 -- Taking a census
