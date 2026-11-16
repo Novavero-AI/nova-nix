@@ -6,19 +6,29 @@
 #
 # link has the driver read windows.h, and with it MinGW-w64's central
 # headers, and compile answer.c to an object that binutils-x86_64's ld
-# links, with libgcc and no runtime, as a program's entry point, and the
-# program run.  The function divides two unsigned 128-bit integers built
-# from values read at run time, which libgcc's __udivti3 computes: the
-# numerator is 42 times the divisor plus 5, so the quotient is 42.  The
-# script writes the target and version the driver reports, its thread
-# model, which is single, the libgcc and text symbols of the object, the
-# machine and optional header magic of the program's PE header, which od
-# reads from the file and not binutils, and the program's exit status.
-# The answer, test/data/gcc-core-x86_64-link-answer.txt, is derived: the
-# lines are the configuration's, x86_64 PE names a C symbol with no
-# underscore (gcc/config/i386/cygming.h:60-61), GCC calls
-# __udivti3 for an unsigned 128-bit division (gcc/optabs.def:146), and
-# 0x8664 and 0x20b are the PE format's IMAGE_FILE_MACHINE_AMD64 and PE32+.
+# links, with libgcc, an import library binutils-x86_64's dlltool makes
+# for kernel32's ExitProcess from a .def file, and no runtime, as a
+# program's entry point, and the program run.  The function divides two
+# unsigned 128-bit integers built from values read at run time, which
+# libgcc's __udivti3 computes: the numerator is 42 times the divisor plus
+# 5, so the quotient is 42.  It exits with the quotient through
+# ExitProcess, as windows.h declares it, because under the x86_64
+# emulation of Windows ARM64 the value a program's entry point returns
+# is not its exit status, as it is on x64.  The script writes the target
+# and version the driver reports, its thread model, which is single, the
+# text and undefined symbols of the object, the machine and optional
+# header magic of the program's PE header, which od reads from the file
+# and not binutils, and the program's exit status.  The answer,
+# test/data/gcc-core-x86_64-link-answer.txt, is derived: the lines are the
+# configuration's, x86_64 PE names a C symbol with no underscore
+# (gcc/config/i386/cygming.h:60-61), GCC calls __udivti3 for an unsigned
+# 128-bit division (gcc/optabs.def:146), it calls a function declared
+# dllimport, as windows.h declares ExitProcess
+# (mingw-w64-headers/include/processthreadsapi.h:28, apisetcconv.h:43,
+# winnt.h:161), through the pointer named __imp_ and the function's name
+# (gcc/config/mingw/winnt-dll.cc:118-120), which the import library
+# defines (binutils/dlltool.c:2420), and 0x8664 and 0x20b are the PE
+# format's IMAGE_FILE_MACHINE_AMD64 and PE32+.
 # nm sorts by the collation of Windows' own locale (see
 # test/data/gcc46.nix), so it lists the symbols unsorted and busybox's
 # sort, which compares bytes, sorts them.
@@ -58,20 +68,28 @@ let
     }
     EOF
     cat > answer.c <<'EOF'
+    #include <windows.h>
+
     volatile unsigned long long numerator_high = 126, numerator_low = 299;
     volatile unsigned long long divisor_high = 3, divisor_low = 7;
 
-    int
+    void
     answer (void)
     {
       unsigned __int128 numerator = (unsigned __int128) numerator_high << 64 | numerator_low;
       unsigned __int128 divisor = (unsigned __int128) divisor_high << 64 | divisor_low;
 
-      return (int) (numerator / divisor);
+      ExitProcess ((UINT) (numerator / divisor));
     }
     EOF
+    cat > kernel32.def <<'EOF'
+    LIBRARY kernel32.dll
+    EXPORTS
+    ExitProcess
+    EOF
+    "''${prefix}dlltool.exe" --input-def kernel32.def --output-lib libkernel32.a
     "$gcc" -O2 -c -o answer.o answer.c
-    "''${prefix}ld.exe" --no-insert-timestamp -e answer -o answer.exe answer.o "$("$gcc" -print-libgcc-file-name)"
+    "''${prefix}ld.exe" --no-insert-timestamp -e answer -o answer.exe answer.o "$("$gcc" -print-libgcc-file-name)" libkernel32.a
     status=0
     ./answer.exe || status=$?
     {

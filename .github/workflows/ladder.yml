@@ -1856,14 +1856,15 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # x86_64: gcc-latest builds binutils for x86_64-w64-mingw32,
-  # binutils-x86_64, whose assembler, archiver and linker
+  # binutils-x86_64, whose assembler, archiver, dlltool and linker
   # test/data/binutils-x86_64.nix has build an x86_64 program and an i386
   # one that run, and GCC 16.2.0's C compiler and libgcc for that target,
   # gcc-core-x86_64, which test/data/gcc-core-x86_64.nix has compile a
-  # function that ld links with libgcc into a program that runs, and finds
-  # no program either installs carrying a time stamp.  That compiler then
-  # compiles MinGW-w64 v14.0.0's runtime for x86_64, whose files and start
-  # file test/data/mingw-w64-x86_64.nix compares with another build of the
+  # function that ld links with libgcc and an import library for
+  # ExitProcess into a program that runs, and finds no program either
+  # installs carrying a time stamp.  That compiler then compiles MinGW-w64
+  # v14.0.0's runtime for x86_64, whose files and start file
+  # test/data/mingw-w64-x86_64.nix compares with another build of the
   # release, and against which it has the compiler link a program that
   # runs.
   #
@@ -1954,16 +1955,17 @@ jobs:
           echo "== binutils-x86_64 built in $((SECONDS - start)) s"
 
       # busybox's sh runs test/data/binutils-x86_64.nix's two scripts.  link
-      # has as assemble a function that returns 42 for x86_64 and for i386,
-      # ar archive one object, ld link each as a program's entry point and
-      # each program run, and writes the version line ld prints, what nm, ar
-      # and objdump read back, each program's exit status, and the machine
-      # and optional header magic od reads from each program's PE header;
-      # stamps writes every program and DLL the rung installs with the time
-      # stamp its PE header carries.  The lines are compared with the file
-      # of test/data named for the check, which is what the formats and the
-      # configuration define them to be, each time stamp 0, for the reason
-      # gcc46-cxx's are.
+      # has dlltool make an import library for ExitProcess, as assemble an
+      # x86_64 function that exits through ExitProcess with 42 and an i386
+      # one that returns 42, ar archive one object, ld link each as a
+      # program's entry point and each program run, and writes the version
+      # line ld prints, what nm, ar and objdump read back, each program's
+      # exit status, and the machine and optional header magic od reads from
+      # each program's PE header; stamps writes every program and DLL the
+      # rung installs with the time stamp its PE header carries.  The lines
+      # are compared with the file of test/data named for the check, which
+      # is what the formats and the configuration define them to be, each
+      # time stamp 0, for the reason gcc46-cxx's are.
       - name: binutils-x86_64 links an x86_64 and an i386 program that run
         shell: bash
         run: |
@@ -2001,15 +2003,17 @@ jobs:
 
       # busybox's sh runs test/data/gcc-core-x86_64.nix's two scripts.  link
       # has the compiler read windows.h and compile a function that divides
-      # two 128-bit integers, which ld links with libgcc and no runtime as a
-      # program's entry point, runs it, and writes the target, version and
-      # thread model the driver reports, the object's symbols, the machine
-      # and optional header magic od reads from the program's PE header and
-      # its exit status; stamps writes every program and DLL the rung
-      # installs with the time stamp its PE header carries.  The lines are
-      # compared with the file of test/data named for the check, which is
-      # what the configuration and the formats define them to be, each time
-      # stamp 0, for the reason gcc46-cxx's are.
+      # two 128-bit integers and exits through ExitProcess with the
+      # quotient, which ld links with libgcc, an import library dlltool
+      # makes and no runtime as a program's entry point, runs it, and
+      # writes the target, version and thread model the driver reports, the
+      # object's symbols, the machine and optional header magic od reads
+      # from the program's PE header and its exit status; stamps writes
+      # every program and DLL the rung installs with the time stamp its PE
+      # header carries.  The lines are compared with the file of test/data
+      # named for the check, which is what the configuration and the formats
+      # define them to be, each time stamp 0, for the reason gcc46-cxx's
+      # are.
       - name: gcc-core-x86_64 links a program that runs
         shell: bash
         run: |
