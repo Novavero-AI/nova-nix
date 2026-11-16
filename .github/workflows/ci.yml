@@ -144,12 +144,13 @@ jobs:
       # vanished from GitHub on 2026-08-20, taking every prebuilt
       # ormolu with it (the action then misreports the 404 as
       # "unformatted files").  The Hackage build depends on nothing but
-      # the package index; the cached binary makes warm runs seconds.
+      # the package index; the binary caches.yml saves from main makes a
+      # run seconds.
       # Undo into the action if prebuilt assets return to a stable home
       # a released run-ormolu points at.
-      - name: Cache formatter binary
+      - name: Restore the formatter binary
         id: formatter-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/bin/ormolu
           key: ormolu-0.9.0.0-${{ runner.os }}
@@ -214,17 +215,29 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-sdist-${{ hashFiles('nova-nix.cabal') }}
-          restore-keys: cabal-sdist-
-
-      - name: Build the tarball a Hackage user gets
+      # Unpacked outside the checkout, where no cabal.project applies, and
+      # planned there, with the plan copied into the checkout for hashFiles,
+      # which reads the workspace alone.  The store's key names this plan
+      # (.github/actions/cabal-store).
+      - name: Unpack and plan the tarball a Hackage user gets
         run: |
           cabal sdist -o "$RUNNER_TEMP/sdist"
           tar -xzf "$RUNNER_TEMP"/sdist/nova-nix-*.tar.gz -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"/nova-nix-*/
+          cabal build --enable-tests --dry-run
+          cp dist-newstyle/cache/plan.json "$GITHUB_WORKSPACE/sdist-plan.json"
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          prefix: cabal-sdist-${{ runner.os }}
+          plan-hash: ${{ hashFiles('sdist-plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
+
+      - name: Build the tarball a Hackage user gets
+        run: |
           cd "$RUNNER_TEMP"/nova-nix-*/
           cabal build --enable-tests
 
@@ -252,13 +265,19 @@ jobs:
           cabal-version: "latest"
 
       # Dependencies build unsanitized (the flags below are scoped to this
-      # package), so the plain Linux dependency cache applies as-is.
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # package), so the Linux store applies as-is.  The plan is made before
+      # the flags are written, as every other Linux job makes it.
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
-          restore-keys: cabal-Linux-
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
       # Scoped via cabal.project.local so only this package's cbits compile
       # instrumented and only its executables link the sanitizer runtimes -
@@ -333,12 +352,18 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The store's key names this plan (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
-          restore-keys: cabal-${{ runner.os }}-
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
       # --enable-tests compiles the test suite under -Werror too (a bare
       # `cabal build` skips test components entirely, so test-code warnings
@@ -577,12 +602,18 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The store's key names this plan (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
-          restore-keys: cabal-${{ runner.os }}-
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
       # Installed rather than run from dist-newstyle: the bundled <nix/*>
       # search-path entry is the cabal data dir, which only exists for an
@@ -707,12 +738,18 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The store's key names this plan (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
-          restore-keys: cabal-${{ runner.os }}-
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
       # bin/ beside share/, the layout a release archive ships: the data dir
       # Cabal compiles in is in this runner's Cabal store, which the runners
@@ -1198,18 +1235,21 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      # A key of its own: the server needs warp and wai-extra, which
-      # nova-nix does not, and a store saved under the key the nova-nix
-      # builds share would hold whichever set was saved first.  That store
-      # is the fallback, as it holds most of what the server needs.
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The Windows store, which caches.yml fills with the packages the
+      # server builds with as well as nova-nix's: warp and wai-extra, which
+      # nova-nix does not need.  The store's key names nova-nix's plan
+      # (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-handoff-${{ runner.os }}-${{ steps.setup.outputs.ghc-version }}-${{ hashFiles('cabal.project') }}
-          restore-keys: |
-            cabal-handoff-${{ runner.os }}-${{ steps.setup.outputs.ghc-version }}-
-            cabal-${{ runner.os }}-
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
       - name: Build nova-cache-server
         run: cabal install nova-cache -f server --install-method=copy --installdir=staged/bin --overwrite-policy=always
@@ -3091,12 +3131,18 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The store's key names this plan (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
-          restore-keys: cabal-${{ runner.os }}-
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
       - name: Install nova-nix
         run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
@@ -3175,12 +3221,18 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The store's key names this plan (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-${{ runner.os }}-${{ hashFiles('nova-nix.cabal') }}
-          restore-keys: cabal-${{ runner.os }}-
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
       - name: Install nova-nix
         run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
@@ -3265,28 +3317,31 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      # Own key family, not the build matrix's: this job adds the server's
-      # dependencies (warp, wai-extra) to the store, and the server is
-      # installed unpinned, so the store can change without any hashed
-      # file changing - the run_id suffix makes every run save its store,
-      # and the restore-keys pick up the newest previous one.
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The Linux store, which caches.yml fills with the packages the
+      # server builds with as well as nova-nix's: warp and wai-extra, which
+      # nova-nix does not need.  The store's key names nova-nix's plan
+      # (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-e2e-loop-${{ hashFiles('nova-nix.cabal') }}-${{ github.run_id }}
-          restore-keys: |
-            cabal-e2e-loop-${{ hashFiles('nova-nix.cabal') }}-
-            cabal-e2e-loop-
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
       # The loop drives the installed executable - the artifact a user
       # gets - not a dist-newstyle build product.
       - name: Install nova-nix
         run: cabal install exe:nova-nix --install-method=copy --installdir="$RUNNER_TEMP/bin" --overwrite-policy=always
 
-      # Deliberately unpinned: half this job's value is cross-repo
-      # interop against the server as released, so a nova-cache release
-      # that breaks the loop fails here first, not in production.
+      # Installed in this project, so cabal resolves it under
+      # cabal.project's index-state and constraints: the loop runs the
+      # nova-cache that nova-nix's own build links, and a newer release
+      # reaches it when the index-state moves.
       - name: Install nova-cache-server from Hackage
         run: cabal install nova-cache -f server --install-method=copy --installdir="$RUNNER_TEMP/bin" --overwrite-policy=always
 

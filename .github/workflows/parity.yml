@@ -78,16 +78,22 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      - name: Cache Cabal store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The store's key names this plan (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-Linux-${{ hashFiles('nova-nix.cabal') }}
-          restore-keys: cabal-Linux-
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
-      - name: Cache the pinned nixpkgs tree
+      - name: Restore the pinned nixpkgs tree
         id: nixpkgs-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: nixpkgs-ref
           key: parity-nixpkgs-${{ runner.os }}-${{ env.NIXPKGS_REV }}

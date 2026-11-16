@@ -1,0 +1,49 @@
+name: Cabal store
+description: >-
+  Restore the Cabal store saved for a build plan, or else the newest one
+  saved for the same GHC, and give the plan's key to save a store under.
+  caches.yml saves the stores, from main alone; CI's and Parity's jobs
+  restore them.  The key is haskell-actions/setup's (its
+  docs/examples.md): what the store holds, the GHC and cabal versions, and
+  a hash of the build plan that `cabal build --dry-run` writes to
+  dist-newstyle/cache/plan.json.
+inputs:
+  path:
+    description: The Cabal store, as haskell-actions/setup's cabal-store output names it
+    required: true
+  prefix:
+    description: What the store holds and on which runner, the key's first part
+    required: true
+  plan-hash:
+    description: >-
+      hashFiles of the plan.json and of cabal.project, whose index-state
+      also pins the packages the jobs install outside the plan
+    required: true
+  ghc-version:
+    description: haskell-actions/setup's ghc-version output
+    required: true
+  cabal-version:
+    description: haskell-actions/setup's cabal-version output
+    required: true
+  lookup-only:
+    description: Only check whether the plan's own store is saved, downloading nothing
+    default: "false"
+outputs:
+  key:
+    description: The plan's key, the one to save its store under
+    value: ${{ steps.restore.outputs.cache-primary-key }}
+  cache-hit:
+    description: Whether the plan's own store is saved
+    value: ${{ steps.restore.outputs.cache-hit }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: restore
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.prefix }}-ghc-${{ inputs.ghc-version }}-cabal-${{ inputs.cabal-version }}-plan-${{ inputs.plan-hash }}
+        restore-keys: |
+          ${{ inputs.prefix }}-ghc-${{ inputs.ghc-version }}-cabal-${{ inputs.cabal-version }}-
+          ${{ inputs.prefix }}-ghc-${{ inputs.ghc-version }}-
+        lookup-only: ${{ inputs.lookup-only }}

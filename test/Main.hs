@@ -17357,6 +17357,68 @@ testWindowsRungs = do
       (stage : rungs, _ : rest) -> let (stages, others) = stageLists rest in ((stage, rungs) : stages, others)
       (others, _) -> ([], others)
 
+-- | The workflows' directory, from the repository root.
+workflowsDir :: FilePath
+workflowsDir = ".github" </> "workflows"
+
+-- | The values the lines of a workflow give a key as literals: @KEY: VALUE@,
+-- the value bare or quoted.  An expression or an empty value is none.
+literalValues :: Text -> [Text] -> [Text]
+literalValues key = mapMaybe value
+  where
+    prefix = key <> ":"
+    value line = T.stripPrefix prefix (T.stripStart line) >>= literal . T.dropAround (`elem` ("\"'" :: String)) . T.strip
+    literal text
+      | T.null text || "${{" `T.isPrefixOf` text = Nothing
+      | otherwise = Just text
+
+-- | The versions a line names as an @ormolu-VERSION@ package id: the digits
+-- and dots after each @ormolu-@ that a digit follows.
+ormoluVersions :: Text -> [Text]
+ormoluVersions line =
+  [ version
+  | (_, after) <- T.breakOnAll ormoluPrefix line,
+    let version = T.takeWhile (\c -> isDigit c || c == '.') (T.drop (T.length ormoluPrefix) after),
+    maybe False (isDigit . fst) (T.uncons version)
+  ]
+  where
+    ormoluPrefix = "ormolu-"
+
+-- | The versions of the tools that workflows spell in more than one place:
+-- GHC in every haskell-actions/setup step, and ormolu in CI's Ormolu job
+-- and in caches.yml.  caches.yml saves the caches the other workflows
+-- restore under keys that name these versions, so a bump that missed it
+-- would leave every one of them unsaved.  Each tool has one version, and
+-- the workflows known to name it are among those found naming it, so a
+-- reading that finds nothing fails.
+testWorkflowVersions :: IO [Bool]
+testWorkflowVersions = do
+  putStrLn "ci/versions"
+  outcome <- try $ do
+    names <- Dir.listDirectory workflowsDir
+    let workflows = sort [name | name <- names, ".yml" `T.isSuffixOf` T.pack name]
+    traverse (\name -> (,) name . T.lines . bytesText <$> BS.readFile (workflowsDir </> name)) workflows
+  case outcome of
+    Left (err :: IOException) -> sequence [runTest "the workflows read" (Fail (T.pack (workflowsDir <> ": " <> displayException err)))]
+    Right workflows ->
+      let code = [(name, line) | (name, ls) <- workflows, line <- ls, not ("#" `T.isPrefixOf` T.stripStart line)]
+          ghc = [(name, version) | (name, line) <- code, version <- literalValues "ghc-version" [line]]
+          ormolu =
+            [(name, version) | (name, line) <- code, version <- ormoluVersions line]
+              ++ [(name, version) | (name, line) <- code, version <- literalValues "ORMOLU_VERSION" [line]]
+       in sequence
+            [ runTest "every workflow names one GHC version, ci.yml and caches.yml among them" $
+                oneVersion "GHC" ["caches.yml", "ci.yml"] ghc,
+              runTest "every workflow names one ormolu version, ci.yml and caches.yml among them" $
+                oneVersion "ormolu" ["caches.yml", "ci.yml"] ormolu
+            ]
+  where
+    oneVersion :: Text -> [FilePath] -> [(FilePath, Text)] -> TestResult
+    oneVersion tool known found = case ([name | name <- known, name `notElem` map fst found], nub (map snd found)) of
+      ([], [_]) -> Pass
+      ([], _) -> Fail (tool <> " is spelled as more than one version: " <> T.pack (show found))
+      (missing, _) -> Fail (tool <> " is named in none of " <> T.pack (show missing))
+
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
   putStrLn "eval/fetchgit-transport"
@@ -26578,6 +26640,7 @@ runSuite = do
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,
+          testWorkflowVersions,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,
