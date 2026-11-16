@@ -4,7 +4,8 @@
 --
 -- Every Nix expression has access to a @builtins@ attribute set containing
 -- ~100 functions.  This module assembles the initial t'Env' from the
--- central registry in "Nix.Eval" and adds standard constants
+-- builtins "Nix.Eval" defines ('Nix.Eval.listedBuiltins') and adds
+-- standard constants
 -- (@true@, @false@, @null@, @storeDir@, @currentTime@,
 -- @currentSystem@, etc.), among them @derivation@: a Nix lambda over the
 -- @derivationStrict@ primop, evaluated from its source.
@@ -44,9 +45,12 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, builtinNames, currentSystemStr, deferApply, evaluated, readThunkValue)
+import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLookup, currentSystemStr, deferApply, evaluated, listedBuiltins, readThunkValue)
 import Nix.Eval.AllocSite (EnvSite (EnvApply, EnvRoot), SetSite (SetRoot))
-import Nix.Eval.CData (MonadCData, runCDataPure)
+import Nix.Eval.Builtin (Builtin, builtinName, builtinNamed)
+import qualified Nix.Eval.Builtin as Builtin
+import Nix.Eval.CData (MonadCData, cdataIO, runCDataPure)
+import Nix.Eval.CStatus (cInvariantViolated)
 import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newScopeEnv, thunkToCPtr)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames)
 import Nix.Parser (SourceOrigin (..), parseNixWithScope, parsedExpr)
@@ -77,7 +81,10 @@ builtinEnv policy timestamp searchPaths = do
         | name == "builtins" = evaluated (VAttrs builtinsSet)
         | otherwise = do
             let unprefixed = fromMaybe name (T.stripPrefix "__" name)
-            attrSetLookup unprefixed builtinsSet >>= maybe (evaluated (VBuiltin unprefixed [])) pure
+            attrSetLookup unprefixed builtinsSet >>= maybe (unlisted unprefixed) pure
+      unlisted unprefixed = case builtinNamed unprefixed of
+        Just builtin -> builtinFunction builtin
+        Nothing -> cdataIO (cInvariantViolated "builtinEnv" ("the root name " ++ show unprefixed ++ " is neither in builtins nor a builtin"))
   scope <- sequenceA (Map.fromSet bind (rootScopeNames policy)) >>= attrSetFromMap SetRoot
   newScopeEnv EnvRoot Nothing scope
 
@@ -90,8 +97,8 @@ rootScopeNames policy
   | otherwise = staticGlobalNames
 
 -- | The value of a builtin function bound under its own name.
-builtinFunction :: (MonadCData m) => Text -> m Thunk
-builtinFunction name = evaluated (VBuiltin name [])
+builtinFunction :: (MonadCData m) => Builtin -> m Thunk
+builtinFunction builtin = evaluated (VBuiltin builtin [])
 
 -- | Like 'builtinEnv' but with additional scope bindings overlaid on
 -- the top-level environment.  Used by @scopedImport@.
@@ -118,10 +125,10 @@ builtinsAttrSet policy timestamp searchPaths = do
 -- 'builtinEnv' reads it ('runCDataPure'); the allocation writes only the
 -- cells it makes.
 builtinFunctionCells :: Map Text Thunk
-builtinFunctionCells = runCDataPure (sequenceA (Map.fromList [(name, builtinFunction name) | name <- builtinNames]))
+builtinFunctionCells = runCDataPure (sequenceA (Map.fromList [(builtinName builtin, builtinFunction builtin) | builtin <- listedBuiltins]))
 {-# NOINLINE builtinFunctionCells #-}
 
--- | The constants beside the registry.  @currentTime@ and @currentSystem@
+-- | The constants beside the builtin functions.  @currentTime@ and @currentSystem@
 -- are upstream's @impureOnly@ constants and are absent under @pure-eval@
 -- (@builtins ? currentTime@ is @false@ there, observed from
 -- nix-instantiate 2.33.2); @nixPath@ stays, holding whatever search path
@@ -232,12 +239,12 @@ derivationWrapperOrigin = SourceFile "/derivation-internal.nix"
 -- slice lacks.
 derivationWrapperScope :: (MonadCData m) => m (Map Text Thunk)
 derivationWrapperScope = do
-  builtinsUsed <- sequenceA (Map.fromList [(name, builtinFunction name) | name <- ["getAttr", "head", "listToAttrs"]])
+  builtinsUsed <- sequenceA (Map.fromList [(builtinName builtin, builtinFunction builtin) | builtin <- [Builtin.GetAttr, Builtin.Head, Builtin.ListToAttrs]])
   builtinsSet <- attrSetFromMap SetRoot builtinsUsed
   sequenceA $
     Map.fromList
-      [ ("derivationStrict", builtinFunction "derivationStrict"),
-        ("map", builtinFunction "map"),
+      [ ("derivationStrict", builtinFunction Builtin.DerivationStrict),
+        ("map", builtinFunction Builtin.Map),
         ("builtins", evaluated (VAttrs builtinsSet))
       ]
 
@@ -265,7 +272,7 @@ derivationWrapper = runCDataPure $ do
 -- | A thunk that aborts evaluation with the message when forced: @abort@
 -- applied to it, deferred the way "Nix.Eval" defers any application.
 abortingThunk :: (MonadCData m) => Text -> m Thunk
-abortingThunk message = evaluated (mkStr message) >>= deferApply EnvApply (VBuiltin "abort" [])
+abortingThunk message = evaluated (mkStr message) >>= deferApply EnvApply (VBuiltin Builtin.Abort [])
 
 -- ---------------------------------------------------------------------------
 -- NIX_PATH parsing

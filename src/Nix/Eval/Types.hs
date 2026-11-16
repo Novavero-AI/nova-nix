@@ -153,6 +153,7 @@ import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Float (castWord64ToDouble)
 import Nix.Derivation (Derivation)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
+import Nix.Eval.Builtin (Builtin, builtinName)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
@@ -347,9 +348,9 @@ data NixValue
     VAttrs !AttrSet
   | -- | Lambda closure: captures environment, formals, body bytecode index.
     VLambda !Env !EvalFormals !Word32
-  | -- | Built-in function, dispatched by name, with the arguments a
-    -- partial application has taken so far, first to last.
-    VBuiltin !Text ![BuiltinArg]
+  | -- | Built-in function, with the arguments a partial application has
+    -- taken so far, first to last.
+    VBuiltin !Builtin ![BuiltinArg]
   deriving (Eq, Show)
 
 -- | A string with dependency context: its bytes and their context.  Built
@@ -1219,8 +1220,8 @@ typeName val = case val of
   VList _ -> "a list"
   VAttrs _ -> "a set"
   VLambda {} -> "a function"
-  VBuiltin name [] -> "the built-in function '" <> name <> "'"
-  VBuiltin name _ -> "the partially applied built-in function '" <> name <> "'"
+  VBuiltin builtin [] -> "the built-in function '" <> builtinName builtin <> "'"
+  VBuiltin builtin _ -> "the partially applied built-in function '" <> builtinName builtin <> "'"
 
 -- | @builtins.typeOf@: the name of upstream's @ValueType@, the
 -- classification its type checks compare (a lambda and a primop are both
