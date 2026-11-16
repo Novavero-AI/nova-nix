@@ -2291,10 +2291,20 @@ testAllocSites = do
         [(EnvCall, EnvSiteFigures 2 2 32)]
         [],
       sitesTest
-        "each inherit (from) makes an env of one slot"
+        "each inherit (from) clause makes an env of one slot"
         "let s = { a = 1; b = 2; }; in builtins.deepSeq { inherit (s) a; inherit (s) b; } null"
         [(EnvLet, EnvSiteFigures 1 1 16), (EnvInheritFrom, EnvSiteFigures 2 2 32)]
         [(SetLiteral, SetSiteFigures 2 0 144)],
+      sitesTest
+        "the names of one inherit (from) clause share its env"
+        "let s = { a = 1; b = 2; c = 3; }; in builtins.deepSeq { inherit (s) a b c; } null"
+        [(EnvLet, EnvSiteFigures 1 1 16), (EnvInheritFrom, EnvSiteFigures 1 1 16)]
+        [(SetLiteral, SetSiteFigures 2 0 176)],
+      sitesTest
+        "the names of an inherit (from) clause in a let share its env"
+        "let s = { a = 1; b = 2; }; in let inherit (s) a b; in a + b"
+        [(EnvLet, EnvSiteFigures 2 3 40), (EnvLetCapture, EnvSiteFigures 1 1 16), (EnvInheritFrom, EnvSiteFigures 1 1 16)]
+        [(SetLiteral, SetSiteFigures 1 0 72)],
       sitesTest
         "a let using a variable from outside it makes its frame and a capture of that variable"
         "(x: let y = x; in y) 1"
