@@ -249,8 +249,8 @@ baseEnvNames =
 -- name the wrapper reads is a static symbol or one the base environment
 -- installs.  @createBaseEnv@ evaluates the file once it has installed
 -- everything (primops.cc:4872).  This evaluator's own wrapper
--- ("Nix.Builtins") names its values otherwise, and compiling it at its
--- first use interns those names then.
+-- ("Nix.Builtins") names its values with these names, so compiling it
+-- interns none.
 derivationWrapperNames :: [Text]
 derivationWrapperNames =
   [ "strict",

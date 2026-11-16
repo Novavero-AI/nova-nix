@@ -24756,6 +24756,13 @@ testStartupSymbolsIO = do
       failsInChild "primops/context.cc's primops precede fetchMercurial.cc's" "({ }: null) { fetchMercurial = 1; unsafeDiscardStringContext = 2; }" (unexpected "unsafeDiscardStringContext"),
       failsInChild "fetchMercurial.cc's primop precedes fetchTree.cc's" "({ }: null) { fetchGit = 1; fetchMercurial = 2; }" (unexpected "fetchMercurial"),
       failsInChild "a primop's name precedes the derivation wrapper's" "({ }: null) { commonAttrs = 1; toString = 2; }" (unexpected "toString"),
+      -- The main program's environment holds the wrapper, so a name only
+      -- this evaluator's wrapper used would be interned before the file
+      -- imported after it names it, and ahead of zz.
+      failsInChild
+        "the derivation wrapper interns no name upstream's startup lacks, so an imported file's names keep its order"
+        "({ }: null) (import (builtins.toFile \"names.nix\" \"{ zz = 1; shared = 2; entries = 3; paths = 4; entry = 5; }\"))"
+        (unexpected "zz"),
       failsInChild "the empty name is a static symbol" "({ }: null) { zz = 1; \"\" = 2; }" (unexpected "\"\""),
       failsInChild "a missing argument is the first in symbol order" "({ aa, value }: 1) { }" (callFailure "anonymous lambda" "without required argument 'value'")
     ]
@@ -27743,19 +27750,12 @@ testStaticGlobalsSync = do
           ],
       -- A program's names are interned before the strings its root
       -- environment binds, which upstream never interns, so they keep the
-      -- order the program gives them.  The derivation wrapper, made with
-      -- the root environment, interns the names only it brings before the
-      -- currentSystem string, so a set built at run time holds such a
-      -- name first.  Each runs in a process of its own, whose symbol table
-      -- nothing else has filled.
+      -- order the program gives them.  It runs in a process of its own,
+      -- whose symbol table nothing else has filled.
       emits
         "a program's names are interned before the strings its root environment binds"
         ("({ }: null) { a = 1; \"" <> currentSystemStr <> "\" = 2; }")
         ["error: function 'anonymous lambda' called with unexpected argument 'a'"],
-      emits
-        "the derivation wrapper's names are interned before the currentSystem string"
-        "({ }: null) (builtins.listToAttrs [ { name = builtins.currentSystem; value = 1; } { name = \"ent\" + \"ry\"; value = 2; } ])"
-        ["error: function 'anonymous lambda' called with unexpected argument 'entry'"],
       -- Upstream's base environment holds one value per primop, which
       -- every file reads, so sets copied out of builtins in two files hold
       -- the same values, and == takes each pair as equal without

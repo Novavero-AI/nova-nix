@@ -129,11 +129,6 @@ builtinsAttrSet policy timestamp searchPaths = do
 -- nix-instantiate 2.33.2); @nixPath@ stays, holding whatever search path
 -- the caller passed, which under @pure-eval@ is what upstream leaves of
 -- it.
---
--- The values are made in the order listed, the derivation wrapper among
--- them: making a string interns it, and compiling the wrapper interns its
--- identifiers, so a name only the wrapper brings comes before the
--- @currentSystem@ string, and a set naming both holds them in that order.
 standardEntries :: (MonadCData m) => EvalPolicy -> Int64 -> [Thunk] -> m (Map.Map Text Thunk)
 standardEntries policy timestamp searchPaths =
   fmap Map.fromList . traverse sequenceA $
@@ -186,38 +181,34 @@ targetNixVersion = "2.24.9"
 -- shares what upstream's does: an output's set is one value in @all@,
 -- under its name and as the result, and each output has a @drvPath@ of
 -- its own.  The attributes it defines are at this text's lines, which
--- differ from upstream's.  Its identifiers differ too: the names
--- upstream's wrapper brings are interned as the evaluator starts
--- ("Nix.Eval.StartupSymbols"), as upstream's are, and the four of this
--- one's that upstream's lacks (@paths@, @entries@, @shared@ and @entry@)
--- when it compiles, as the root environment is first built, after the
--- program's own names.  One of the four that a file imported later, or a
--- set built at run time, names then comes before the names that file or
--- set brings first, which upstream puts ahead of it.
+-- differ from upstream's.  Its identifiers are upstream's (@strict@,
+-- @commonAttrs@, @outputsList@ and @x@), which the evaluator interns as
+-- it starts ("Nix.Eval.StartupSymbols"), so compiling it interns no name,
+-- wherever in an evaluation it compiles.
 derivationWrapperSource :: ByteString
 derivationWrapperSource =
   BC.unlines
     [ "{ outputs ? [ \"out\" ], ... }@drvAttrs:",
       "let",
-      "  paths = derivationStrict drvAttrs;",
-      "  entries = map (outputName: {",
+      "  strict = derivationStrict drvAttrs;",
+      "  outputsList = map (outputName: {",
       "    name = outputName;",
-      "    value = shared // {",
+      "    value = commonAttrs // {",
       "      type = \"derivation\";",
       "      inherit outputName;",
-      "      drvPath = paths.drvPath;",
-      "      outPath = builtins.getAttr outputName paths;",
+      "      drvPath = strict.drvPath;",
+      "      outPath = builtins.getAttr outputName strict;",
       "    };",
       "  }) outputs;",
-      "  shared =",
+      "  commonAttrs =",
       "    drvAttrs",
-      "    // builtins.listToAttrs entries",
+      "    // builtins.listToAttrs outputsList",
       "    // {",
       "      inherit drvAttrs;",
-      "      all = map (entry: entry.value) entries;",
+      "      all = map (x: x.value) outputsList;",
       "    };",
       "in",
-      "(builtins.head entries).value"
+      "(builtins.head outputsList).value"
     ]
 
 -- | Where the wrapper's source is: upstream evaluates its wrapper as the
@@ -253,8 +244,6 @@ derivationWrapperScope = do
 -- only cells it makes.  The source is a constant, so a parse failure is a
 -- defect in this module; it surfaces as an abort at the first use of
 -- @derivation@ rather than as a crash while the environment is assembled.
--- It compiles as the first 'builtinEnv' is built, interning the names it
--- brings that the evaluator's startup did not ('derivationWrapperSource').
 derivationWrapper :: Thunk
 derivationWrapper = runCDataPure $ do
   scope <- derivationWrapperScope
