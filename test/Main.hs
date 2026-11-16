@@ -5324,6 +5324,49 @@ testReadDirUntypedEntriesIO = do
   bracket_ (Dir.setPermissions locked unsearchable) (Dir.setPermissions locked searchable) probeThenCheck
     `finally` Dir.removePathForcibly root
 
+-- | A tree holding a directory the walk cannot list.  The walk fails as a
+-- 'NAR.NarWalkError', not an 'IOException', so a caller that reads an
+-- unreadable tree as no tree must catch both, which
+-- 'ExecBit.serialiseIfReadable' does.  Skipped where a directory without
+-- read permission can still be listed (as root, or on Windows).
+testSerialiseIfReadableIO :: IO [Bool]
+testSerialiseIfReadableIO = do
+  putStrLn "store/serialise-if-readable-io"
+  tmpBase <- getTemporaryDirectory
+  let root = tmpBase </> "nova-nix-test-serialise-if-readable"
+      locked = root </> "locked"
+      listable = Dir.setOwnerReadable True (Dir.setOwnerSearchable True (Dir.setOwnerWritable True Dir.emptyPermissions))
+      unlistable = Dir.setOwnerSearchable True Dir.emptyPermissions
+  -- A run that died while the directory was unlistable left it so, and it
+  -- cannot be emptied until it is listable again.
+  leftLocked <- Dir.doesDirectoryExist locked
+  when leftLocked (Dir.setPermissions locked listable)
+  Dir.removePathForcibly root
+  createDirectoryIfMissing True locked
+  BS.writeFile (locked </> "file") "f"
+  readable <- ExecBit.serialiseIfReadable processCaseHack root
+  let checks =
+        [ runTestM "serialiseIfReadable archives a tree it can read" $
+            pure (if isJust readable then Pass else Fail "a readable tree read as no tree"),
+          runTestM "a directory the walk cannot list fails the walk as a NarWalkError" $ do
+            walked <- try (ExecBit.serialiseFromPath processCaseHack root) :: IO (Either NAR.NarWalkError NAR.NarEntry)
+            pure $ case walked of
+              Left failure -> assertEqual "walk-access" NAR.WalkListDirectory (NAR.nweAccess failure)
+              Right _ -> Fail "the walk archived a directory it cannot list",
+          runTestM "serialiseIfReadable reads a tree it cannot list as no tree" $ do
+            unread <- ExecBit.serialiseIfReadable processCaseHack root
+            pure (if isNothing unread then Pass else Fail "an unlistable tree was archived")
+        ]
+      probeThenCheck = do
+        probe <- try (Dir.listDirectory locked) :: IO (Either IOException [FilePath])
+        case probe of
+          Right _ -> [] <$ putStrLn "  SKIP  a directory without read permission can be listed here"
+          Left _ -> sequence checks
+  -- Read permission is restored however the checks end, and the tree
+  -- removed after it.
+  bracket_ (Dir.setPermissions locked unlistable) (Dir.setPermissions locked listable) probeThenCheck
+    `finally` Dir.removePathForcibly root
+
 -- | Watchdog for cycle-termination tests: with symlinks as leaves every
 -- walk returns promptly, while a regression to link-following recurses
 -- forever - and a hung suite is worse than a failed one.
@@ -28152,6 +28195,7 @@ runSuite = do
           testSourceErrorMessage,
           testSourceReadErrorsIO,
           testReadDirUntypedEntriesIO,
+          testSerialiseIfReadableIO,
           testBatchA,
           testBatchAIO,
           testEnvironmentBytes,
@@ -28984,7 +29028,10 @@ withStalledFifo path action =
 -- it rather than becoming that value.  A file read is made to stall
 -- on a FIFO ('withStalledFifo') and interrupted there from another
 -- thread, so those cases need POSIX; the request a push makes stalls on
--- the loopback fixture on every platform.  A fetch cache write never
+-- the loopback fixture on every platform.  A walk of a tree on disk
+-- refuses a FIFO before it reads one and has no other read that blocks,
+-- so no case interrupts a walk: 'ExecBit.serialiseIfReadable' and the
+-- push's 'catchSync' catch only synchronous exceptions.  A fetch cache write never
 -- blocks, so its interrupt is raised from inside the write.  The removal
 -- behind a build's cleanup neither blocks nor forces anything the caller
 -- supplies, so no case reaches it.
@@ -29034,19 +29081,9 @@ testInterruptsPropagate = do
               throwTo (asyncThreadId pushing) UserInterrupt
               waitCatch pushing
             pure (interruptPropagated outcome),
-        fifoCase "an interrupt serialising a path for a push stops the push" $
-          withHttpServer (\_ _ -> Send (httpResponse "200 OK" "")) $ \base _ _ -> do
-            let sp = StorePath (T.replicate 32 "b") "stalled-output"
-            outcome <- withStalledFifo (inStore sp) (interruptedAfterStall (pushPaths (pushTo base) store [sp]))
-            pure (interruptPropagated outcome),
         fifoCase "an interrupt reading the API key file is not an unreadable key" $ do
           let keyFile = root </> "stalled-key"
           outcome <- withStalledFifo keyFile (interruptedAfterStall (loadApiKeyFile keyFile))
-          pure (interruptPropagated outcome),
-        fifoCase "an interrupt verifying a source tree on disk is not a mismatch" $ do
-          let sp = StorePath (T.replicate 32 "c") "stalled-source"
-              sources = Map.singleton (T.pack (root </> "absent-source")) (storePathToText defaultStoreDir sp)
-          outcome <- withStalledFifo (inStore sp) (interruptedAfterStall (materializeEvalSources store sources))
           pure (interruptPropagated outcome),
         fifoCase "an interrupt reading a store derivation is not a missing one" $ do
           st <- testEvalState storeDir root

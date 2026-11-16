@@ -100,7 +100,7 @@ module Nix.Push
   )
 where
 
-import Control.Exception (IOException, try)
+import Control.Exception (IOException, displayException, try)
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError)
 import Control.Monad.IO.Class (liftIO)
@@ -449,9 +449,9 @@ splitParts size bytes
 pushPaths :: PushConfig -> Store -> [StorePath] -> IO (Either Text PushSummary)
 pushPaths cfg store roots =
   -- Every synchronous exception: the push raises sqlite-simple's from the
-  -- database and IO errors from the serialiser and the log, and each is a
-  -- failed push to report.
-  runExceptT run `catchSync` \e -> pure (Left ("push failed: " <> T.pack (show e)))
+  -- database, walk failures and IO errors from the serialiser, and IO
+  -- errors from the log, and each is a failed push to report.
+  runExceptT run `catchSync` \e -> pure (Left ("push failed: " <> T.pack (displayException e)))
   where
     run :: ExceptT Text IO PushSummary
     run = do

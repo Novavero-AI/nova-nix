@@ -1156,11 +1156,9 @@ writeReproducesPath sensitivity dest sp refs mode = case mode of
 -- sensitivity is the store volume's, which decides the case-hack mode the
 -- tree is read back under.
 adoptedTreeMatches :: CaseSensitivity -> FilePath -> StorePath -> IO Bool
-adoptedTreeMatches sensitivity dest sp = do
-  result <- try (ExecBit.serialiseFromPath (volumeCaseHack sensitivity) dest)
-  pure $ case result of
-    Left (_ :: IOException) -> False
-    Right entry -> recursiveDigestNames sp (NAR.narHash entry)
+adoptedTreeMatches sensitivity dest sp =
+  maybe False (recursiveDigestNames sp . NAR.narHash)
+    <$> ExecBit.serialiseIfReadable (volumeCaseHack sensitivity) dest
 
 -- | Recursively copy a file or directory tree to a destination path.
 -- A symlink is replicated as a symlink: the store path's name came from a

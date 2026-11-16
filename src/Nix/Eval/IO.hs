@@ -1150,7 +1150,7 @@ readBytesIfPresent path = do
   pure (either (const Nothing) Just result)
 
 -- | The NAR serialisation of what is on disk, 'Nothing' when nothing
--- serialisable is there.  Through 'ExecBit.serialiseFromPath', the
+-- serialisable is there.  Through 'ExecBit.serialiseIfReadable', the
 -- same walk every producer and verifier uses, so the comparison sees
 -- the executable flags the store's model records, not the platform's
 -- permission guesses.
@@ -1159,9 +1159,7 @@ narBytesIfPresent caseHack path = do
   onDisk <- Dir.doesPathExist path
   if not onDisk
     then pure Nothing
-    else do
-      result <- try (ExecBit.serialiseFromPath caseHack path) :: IO (Either IOException NAR.NarEntry)
-      pure (either (const Nothing) (Just . NAR.serialise) result)
+    else fmap NAR.serialise <$> ExecBit.serialiseIfReadable caseHack path
 
 -- | The case-hack mode a read of path-value text runs under.  Store
 -- text names a tree on the store's volume, read back as the store
