@@ -78,10 +78,15 @@ void nn_stats_count_sites(void);
  * An env counts once, with the slots it holds and its bytes, and every
  * other byte the env pages hand out for envs (with-scope arrays) counts
  * under the site it is for; a set counts once
- * with the bytes it holds once built, and as shareable when it equals a
- * set that already exists: one with no entries, which equals every empty
- * set, or a union one of whose operands has none, which equals the
- * other. */
+ * with the bytes it holds once built, and as shareable when it is made
+ * equal to a set that already exists, which upstream would not make: one
+ * made with room for no entries or by removal from a set with none,
+ * either of which equals the shared empty set (nn_attrset_empty), or a
+ * union one of whose operands has none, which equals the other.  A set
+ * made with room for entries that ends up holding none is not shareable:
+ * upstream makes that set too.  The evaluator gives the shared set or
+ * the other operand in each of these cases, so a shareable count above 0
+ * is a set it should not have made. */
 void nn_stats_count_env(uint32_t site, uint32_t slots, uint64_t bytes);
 void nn_stats_count_env_bytes(uint32_t site, uint64_t bytes);
 void nn_stats_count_set(uint32_t site, uint64_t bytes, int shareable);

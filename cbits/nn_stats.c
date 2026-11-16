@@ -663,6 +663,8 @@ static int is_static(int kind, const void *object)
 {
     if (kind == NN_STATS_THUNKS) return nn_thunk_is_static((const nn_thunk_t *)object);
     if (kind == NN_STATS_ENVS) return object == nn_env_empty();
+    /* So is the empty set (nn_attrset_empty). */
+    if (kind == NN_STATS_ATTRSETS) return object == nn_attrset_empty();
     return 0;
 }
 

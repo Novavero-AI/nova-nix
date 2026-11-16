@@ -133,9 +133,7 @@ printAt options depth cell val = case val of
   VList cl -> do
     key <- lift (printedList cell cl)
     entering repeatedMarker key (printList options depth cl)
-  VAttrs attrs -> do
-    key <- lift (printedSet attrs)
-    entering repeatedMarker (Just key) (printAttrs options depth attrs)
+  VAttrs attrs -> entering repeatedMarker (Just (printedSet attrs)) (printAttrs options depth attrs)
   -- What upstream prints for a lambda whose expression it cannot reach.
   VLambda {} -> pure (marker "lambda")
   VBuiltin builtin [] -> pure (marker ("primop " <> builtinName builtin))
@@ -270,19 +268,10 @@ builderText = bytesToTextLossy . BL.toStrict . BB.toLazyByteString
 -- pointer names one set, list or cell for the whole print.
 data Entered
   = -- | A set, by its C set, as upstream remembers a set by its
-    -- @Bindings@.
+    -- @Bindings@: every empty set upstream shares is the one
+    -- 'Nix.Eval.Types.emptyAttrSet' here, and an update with an empty
+    -- operand is the other operand's set, as upstream's is.
     EnteredSet !CAttrSet
-  | -- | Every set with no attributes, as one.  Upstream allocates a set
-    -- with room for none as its one @emptyBindings@ (attr-set.cc:16-17 at
-    -- 2.24.9), which is what a @{ }@ literal and every builtin that sizes
-    -- its result by what it holds produce.  Three empty sets are sized by
-    -- more than they hold: @removeAttrs@ of every attribute and
-    -- @intersectAttrs@ of two sets with no name in common, sized by their
-    -- arguments (primops.cc:2852, :2945), and a literal whose every name
-    -- is a null @${...}@, sized by its attributes (eval.cc:1193,
-    -- :1261-1262).  Each of those is a set of its own upstream and one
-    -- with the rest here.
-    EnteredEmptySet
   | -- | A list, by the cell it was read from, as upstream remembers a list
     -- by its @Value@.
     EnteredCell !CThunkPtr
@@ -305,10 +294,8 @@ repeatedMarker = marker "repeated"
 
 -- | What 'printValue' enters a set by (print.cc:332 at 2.24.9): its
 -- bindings, an empty set's included.
-printedSet :: (MonadCData m) => AttrSet -> m Entered
-printedSet attrs = do
-  empty <- attrSetNull attrs
-  pure (if empty then EnteredEmptySet else EnteredSet (unAttrSet attrs))
+printedSet :: AttrSet -> Entered
+printedSet = EnteredSet . unAttrSet
 
 -- | What 'printValue' enters a list with elements by (print.cc:410): the
 -- cell holding it.  The top-level value has no cell, so a list there is

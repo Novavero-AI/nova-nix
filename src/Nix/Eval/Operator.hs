@@ -406,8 +406,17 @@ evalUpdate evalLeft evalRight = do
     expectSet (VAttrs set) = pure set
     expectSet other = expectedFailure "a set" other
 
--- | Merge two t'AttrSet's, right-biased (@//@), into a new set.
--- Delegates to C-side @nn_attrset_union@ which performs a linear merge
--- of two sorted arrays - O(n+m) on contiguous, cache-friendly memory.
+-- | Merge two t'AttrSet's, right-biased (@//@).  An empty operand gives
+-- the other operand's set itself, the left checked first, as upstream's
+-- @ExprOpUpdate::eval@ copies the other operand's @Value@ (eval.cc:1908-1909
+-- at 2.24.9): no set is made, and a printer, which enters a set by its
+-- bindings, finds the operand's.  Otherwise C-side @nn_attrset_union@
+-- merges the two sorted arrays into a new set, O(n+m).
 mergeAttrSets :: (MonadCData m) => AttrSet -> AttrSet -> m AttrSet
-mergeAttrSets (AttrSet a) (AttrSet b) = AttrSet <$> cattrsetUnion SetUpdate a b
+mergeAttrSets left@(AttrSet a) right@(AttrSet b) = do
+  leftSize <- attrSetSize left
+  rightSize <- attrSetSize right
+  case (leftSize, rightSize) of
+    (0, _) -> pure right
+    (_, 0) -> pure left
+    _ -> AttrSet <$> cattrsetUnion SetUpdate a b

@@ -16,7 +16,7 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
-import Control.Monad (filterM, foldM, guard, replicateM, unless, void, when, zipWithM, (>=>))
+import Control.Monad (filterM, foldM, guard, replicateM, replicateM_, unless, void, when, zipWithM, (>=>))
 import Control.Monad.Except (runExceptT)
 import Control.Monad.State.Strict (State, evalStateT, get, gets, modify', runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
@@ -96,6 +96,7 @@ import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), c
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..))
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, evalBaseEnv, newEvalState, newEvalStateWith, renderEvalFailure, runEvalIO, runEvalIOTraced)
+import Nix.Eval.Operator (evalUpdate)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printSymbol, printValue)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
@@ -103,7 +104,7 @@ import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecor
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, cheapThunkBc, emptyCList, envLookupResolved, envWithScopesRaw, mkThunkBc, newEnv, newScopeEnv, pendingCode, pendingThunkEnv, pushLazyWithScope, readComputed, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrSet (..), Env (..), attrSetFromEntries, attrSetFromEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkThunkBc, newEnv, newScopeEnv, pendingCode, pendingThunkEnv, pushLazyWithScope, readComputed, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -998,6 +999,70 @@ testEvalAttrs = do
         assertEvalError "update-tryEval" "builtins.tryEval (null // {})" "expected a set but found null: null"
     ]
 
+-- | One operand of an update: the shared empty set, an empty set of its
+-- own, or a set holding these names.
+data UpdateOperand = SharedEmpty | OwnEmpty | Holding ![Text]
+  deriving (Show)
+
+genUpdateOperand :: QC.Gen UpdateOperand
+genUpdateOperand =
+  QC.oneof
+    [ pure SharedEmpty,
+      pure OwnEmpty,
+      Holding <$> QC.listOf1 (QC.elements ["a", "b", "c", "d"])
+    ]
+
+-- | The shared empty set (cbits/nn_attrset.h) and the identity of the
+-- sets @//@ gives, which upstream's printers show by entering a set by
+-- its bindings.
+testSharedEmptySet :: IO [Bool]
+testSharedEmptySet = do
+  putStrLn "eval/shared-empty-set"
+  sequence
+    [ -- ExprOpUpdate::eval (eval.cc:1908-1911 at 2.24.9): the left
+      -- operand's emptiness is checked first, so two empty operands give
+      -- the right one.
+      runTestM "an update with an empty operand is the other operand's set, the left checked first, and otherwise a new right-biased set" $
+        quickCheckPasses $
+          QC.forAll ((,) <$> genUpdateOperand <*> genUpdateOperand) $ \(leftShape, rightShape) -> QC.ioProperty $ do
+            left <- operandSet 0 leftShape
+            right <- operandSet 1 rightShape
+            leftEntries <- entryCells left
+            rightEntries <- entryCells right
+            outcome <- evaluate (runPureEval (evalUpdate (pure (VAttrs left)) (pure (VAttrs right))))
+            case outcome of
+              Right (VAttrs merged)
+                | Map.null leftEntries -> pure (unAttrSet merged QC.=== unAttrSet right)
+                | Map.null rightEntries -> pure (unAttrSet merged QC.=== unAttrSet left)
+                | otherwise -> do
+                    mergedEntries <- entryCells merged
+                    pure $
+                      (mergedEntries, unAttrSet merged `elem` map unAttrSet [left, right])
+                        QC.=== (Map.union rightEntries leftEntries, False)
+              other -> pure (QC.counterexample ("update gave " <> show other) False),
+      runTestM "the shared empty set holds nothing and refuses an insert" $ do
+        sym <- symbolIntern "a"
+        refused <- try (cattrsetInsert (unAttrSet emptyAttrSet) sym noPos cthunkNull)
+        size <- attrSetSize emptyAttrSet
+        keys <- attrSetKeys emptyAttrSet
+        pure $ case refused of
+          Left (_ :: CStatusError) -> assertEqual "size and keys" (0, []) (size, keys)
+          Right () -> Fail "an insert into the shared empty set was accepted"
+    ]
+  where
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    -- Each side's values are its own integer, so a merged entry shows
+    -- which side it came from.
+    operandSet :: Int64 -> UpdateOperand -> IO AttrSet
+    operandSet _ SharedEmpty = pure emptyAttrSet
+    operandSet _ OwnEmpty = attrSetFromEntriesSizedFor SetLiteral 1 Map.empty
+    operandSet side (Holding names) = do
+      cells <- mapM (\name -> (name,) <$> evaluated (VInt side)) names
+      attrSetFromMap SetLiteral (Map.fromList cells)
+    entryCells set = Map.map unThunk <$> attrSetToMap set
+
 -- ---------------------------------------------------------------------------
 -- Tests: Eval - Value printer
 -- ---------------------------------------------------------------------------
@@ -1171,12 +1236,34 @@ testValuePrinter = do
           "print-equal-sets"
           "let a = { x = 1; }; b = { x = 1; }; in builtins.seq a (builtins.seq b \"${{ p = a; q = b; }}\")"
           (setFound "{ p = { x = 1; }; q = { x = 1; }; }"),
-      runTestM "a second empty set prints as repeated, as upstream's empty sets are one" $
+      runTestM "a second empty literal prints as repeated, as upstream's empty literals are one set" $
         assertEvalErrorIO
           tmpBase
           "print-empty-sets"
           "let a = { }; b = { }; in builtins.seq a (builtins.seq b \"${{ p = a; q = b; }}\")"
           (setFound ("{ p = { }; q = " <> marker "repeated" <> "; }")),
+      -- Upstream gives bindings of their own to removeAttrs of every
+      -- attribute, intersectAttrs of sets with no name in common, and a
+      -- literal whose every name is a null dynamic one (primops.cc:2852,
+      -- :2945, eval.cc:1193 at 2.24.9), and shares the rest, a removal
+      -- from an empty set among them.
+      runTestM "an empty set upstream gives bindings of its own prints in full after the shared one" $
+        assertEvalErrorIO
+          tmpBase
+          "print-own-empty-sets"
+          ( "let e = { }; f = removeAttrs { } [ \"x\" ]; i = builtins.intersectAttrs { x = 1; } { y = 2; }; "
+              <> "n = { ${null} = 1; }; r = removeAttrs { x = 1; } [ \"x\" ]; "
+              <> "in builtins.deepSeq [ e f i n r ] \"${{ inherit e f i n r; }}\""
+          )
+          (setFound ("{ e = { }; f = " <> marker "repeated" <> "; i = { }; n = { }; r = { }; }")),
+      -- ExprOpUpdate::eval copies the other operand's Value when one is
+      -- empty (eval.cc:1908-1909 at 2.24.9), bindings and all.
+      runTestM "an update with an empty operand prints as repeated after the other operand" $
+        assertEvalErrorIO
+          tmpBase
+          "print-update-empty-operand"
+          "let a = { x = 1; }; l = a // { }; r = { } // a; in builtins.deepSeq [ l r ] \"${{ inherit a l r; }}\""
+          (setFound ("{ a = { x = 1; }; l = " <> marker "repeated" <> "; r = " <> marker "repeated" <> "; }")),
       runTestM "an empty list reached twice prints in full both times" $
         assertEvalErrorIO
           tmpBase
@@ -1519,6 +1606,12 @@ testRepeatedValues = do
       -- Identity, not equality, and an empty set or list is never
       -- repeated (print-ambiguous.cc:39, :53).
       printsStrict "a set reached twice prints as repeated the second time" "let a = { x = 1; }; in [ a a ]" ("[ { x = 1; } " <> repeatedMarker <> " ]"),
+      -- An update with an empty operand is the other operand's Value,
+      -- bindings and all (eval.cc:1908-1909 at 2.24.9).
+      printsStrict
+        "an update with an empty operand prints as repeated after the other operand"
+        "let a = { x = 1; }; in [ a (a // { }) ({ } // a) (a // { y = 2; }) ]"
+        ("[ { x = 1; } " <> repeatedMarker <> " " <> repeatedMarker <> " { x = 1; y = 2; } ]"),
       -- Upstream's prim_tryEval builds the result's bindings afresh on
       -- each call (primops.cc:895-923 at 2.24.9), a failed one included.
       printsStrict
@@ -1792,6 +1885,12 @@ testCensus = do
             (figuresCount (kindAttrSets (censusReached census)), figuresCount (kindThunks (censusReached census)), kindStrings (censusReached census), kindSymbols (censusReached census))
             `andThen` assertEqual "set sizes" (Map.fromList [(1, 1)]) (censusSetSizes census)
             `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
+      runTestM "a census places the shared empty set as a static, counting it nowhere" $ do
+        cell <- evaluated (VAttrs emptyAttrSet)
+        withCensus [RootThunk cell, RootAttrSet emptyAttrSet] $ \census ->
+          assertEqual "sets and cells" (Just 0, Just 1) (figuresCount (kindAttrSets (censusReached census)), figuresCount (kindThunks (censusReached census)))
+            `andThen` assertEqual "set sizes" Map.empty (censusSetSizes census)
+            `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
       runTestM "a census reaches a context string's text, store path and output as strings" $ do
         let element = SCDrvOutput (StorePath censusStoreHash "zname") "zout"
         cell <- evaluated (VStr "ztext" (StringContext (Set.singleton element)))
@@ -1940,13 +2039,11 @@ data SetAllocation = SetAllocation !SetSite !Int
   deriving (Show)
 
 -- | Bytes of a set header and a set entry (its key, position and value)
--- on a 64-bit target, and the room a set made empty gets
--- (cbits/nn_attrset.c).  An env's are 'envHeaderBytes' and a pointer
--- for each slot.
-setHeaderSize, setEntrySize, emptySetRoom :: Word64
+-- on a 64-bit target (cbits/nn_attrset.c).  An env's are
+-- 'envHeaderBytes' and a pointer for each slot.
+setHeaderSize, setEntrySize :: Word64
 setHeaderSize = 40
 setEntrySize = 16
-emptySetRoom = 8
 
 -- | The figures of each site and size that counting by site adds while
 -- an action runs; a site or size that gains nothing is left out.
@@ -2001,11 +2098,40 @@ testAllocSites = do
           QC.forAll (QC.listOf genEnvAllocation) $ \allocations -> QC.ioProperty $ do
             added <- sitesAdded (mapM_ allocateEnv allocations)
             pure (fmap (\counts -> (sitesEnvs counts, sitesEnvSizes counts)) added QC.=== Right (envsExpected allocations)),
-      runTestM "counting by site counts each set at its site with its bytes, and an empty one as shareable" $
+      runTestM "counting by site counts each set at its site with its bytes, and an empty one nowhere, as the shared empty set" $
         quickCheckPasses $
           QC.forAll (QC.listOf genSetAllocation) $ \allocations -> QC.ioProperty $ do
             added <- sitesAdded (mapM_ allocateSet allocations)
             pure (fmap sitesSets added QC.=== Right (setsExpected allocations)),
+      -- Upstream's allocBindings answers a size of 0 with its one
+      -- emptyBindings (attr-set.cc:16-17 at 2.24.9).
+      runTestM "every set built with no attributes is the shared empty set, at every site" $
+        quickCheckPasses $
+          QC.forAll ((,) <$> QC.arbitraryBoundedEnum <*> QC.listOf (QC.elements ["a", "b", "c"])) $ \(site, removed) -> QC.ioProperty $ do
+            built <- newIORef []
+            let keep make = make >>= \(AttrSet cset) -> modifyIORef' built (cset :)
+            added <-
+              sitesAdded $ do
+                keep (attrSetFromMap site Map.empty)
+                keep (attrSetFromEntries site Map.empty)
+                keep (attrSetFromEntriesSizedFor site 0 Map.empty)
+                keep (attrSetRemoveKeys site removed emptyAttrSet)
+            sets <- readIORef built
+            pure ((sets, fmap sitesSets added) QC.=== (replicate 4 (unAttrSet emptyAttrSet), Right Map.empty)),
+      -- Upstream sizes a literal and intersectAttrs' result before it
+      -- knows what they hold (eval.cc:1193, primops.cc:2945 at 2.24.9),
+      -- and gives bindings of their own to a size above 0.
+      runTestM "a set sized for attributes that holds none is an empty set of its own, counted and not shareable" $
+        quickCheckPasses $
+          QC.forAll ((,) <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (1, 4)) $ \(site, size) -> QC.ioProperty $ do
+            sets <- newIORef []
+            added <- sitesAdded (replicateM_ 2 (attrSetFromEntriesSizedFor site size Map.empty >>= \set -> modifyIORef' sets (set :)))
+            made <- readIORef sets
+            sizes <- mapM attrSetSize made
+            let pointers = map unAttrSet made
+            pure $
+              (sizes, length (nub pointers), unAttrSet emptyAttrSet `elem` pointers, fmap sitesSets added)
+                QC.=== ([0, 0], 2, False, Right (Map.singleton site (SetSiteFigures 2 0 (2 * (setHeaderSize + setEntrySize))))),
       runTestM "a union with an empty operand counts as shareable, and one of two non-empty sets does not" $ do
         nullCell <- evaluated VNull
         one <- attrSetFromMap SetLiteral (Map.singleton "a" nullCell)
@@ -2018,7 +2144,8 @@ testAllocSites = do
       -- an env is an 8-byte header with 8 bytes a slot and 8 for a
       -- parent, a with's env 24 more for its scopes and 8 for each entry
       -- of its with-scope array, and a set a 40-byte header with 16 bytes
-      -- an entry and room for 8 when made empty.  The root env is each
+      -- an entry, with room for one when it is an empty set of its own;
+      -- the shared empty set is no allocation.  The root env is each
       -- evaluation's, and every other env made in it has a parent; a
       -- trimmed closure's, a capture's, and a builtin's deferred
       -- application have none.
@@ -2058,10 +2185,39 @@ testAllocSites = do
         [(EnvLet, EnvSiteFigures 1 1 24), (EnvLetCapture, EnvSiteFigures 1 0 40), (EnvWith, EnvSiteFigures 1 1 64)]
         [(SetLiteral, SetSiteFigures 1 0 56)],
       sitesTest
-        "an update with an empty operand makes a set equal to the other, and the empty literal a set of its own"
-        "builtins.deepSeq ({ } // { a = 1; }) null"
+        "an update with an empty operand makes no set, and the empty literal is the shared empty set"
+        "builtins.deepSeq [ ({ } // { a = 1; }) ({ b = 2; } // { }) ] null"
         []
-        [(SetLiteral, SetSiteFigures 2 1 224), (SetUpdate, SetSiteFigures 1 1 56)],
+        [(SetLiteral, SetSiteFigures 2 0 112)],
+      sitesTest
+        "an update of two sets with attributes makes one"
+        "builtins.deepSeq ({ a = 1; } // { b = 2; }) null"
+        []
+        [(SetLiteral, SetSiteFigures 2 0 112), (SetUpdate, SetSiteFigures 1 0 72)],
+      sitesTest
+        "removeAttrs of every attribute makes an empty set of its own, and of an empty set none"
+        "builtins.deepSeq [ (builtins.removeAttrs { a = 1; } [ \"a\" ]) (builtins.removeAttrs { } [ \"a\" ]) ] null"
+        []
+        [(SetLiteral, SetSiteFigures 1 0 56), (SetRemoveAttrs, SetSiteFigures 1 0 56)],
+      sitesTest
+        "intersectAttrs of two sets with no name in common makes an empty set of its own, and with an empty one none"
+        "builtins.deepSeq [ (builtins.intersectAttrs { a = 1; } { b = 2; }) (builtins.intersectAttrs { } { b = 2; }) ] null"
+        []
+        [(SetLiteral, SetSiteFigures 3 0 168), (SetIntersectAttrs, SetSiteFigures 1 0 56)],
+      sitesTest
+        "a literal whose every name is a null dynamic one makes an empty set of its own"
+        "builtins.deepSeq { ${null} = 1; } null"
+        []
+        [(SetLiteral, SetSiteFigures 1 0 56)],
+      -- The frame binds its names through a lazy scope: an env of a
+      -- header, a parent and its scopes, 8, 8 and 24 bytes.  Its name
+      -- table holds no static name, so it is the shared empty set and no
+      -- scope set is made.
+      sitesTest
+        "a rec set whose every name is a null dynamic one makes an empty set of its own"
+        "builtins.deepSeq (rec { ${null} = 1; }) null"
+        [(EnvRec, EnvSiteFigures 1 0 40)]
+        [(SetRec, SetSiteFigures 1 0 56)],
       sitesTest
         "map defers an application per element, each of which calls the function"
         "builtins.deepSeq (builtins.map (x: x) [ 1 2 3 ]) null"
@@ -2093,10 +2249,10 @@ testAllocSites = do
         [(EnvCall, EnvSiteFigures 4 4 96), (EnvMapAttrs, EnvSiteFigures 2 6 64)]
         [(SetLiteral, SetSiteFigures 1 0 72), (SetMapAttrs, SetSiteFigures 1 0 72)],
       sitesTest
-        "functionArgs of a lambda without formals makes an empty set"
-        "builtins.deepSeq (builtins.functionArgs (x: x)) null"
+        "functionArgs of a lambda without formals or with no formal is the shared empty set"
+        "builtins.deepSeq [ (builtins.functionArgs (x: x)) (builtins.functionArgs ({ }: 1)) ] null"
         []
-        [(SetFunctionArgs, SetSiteFigures 1 1 168)]
+        []
     ]
   where
     quickCheckPasses property = do
@@ -2124,9 +2280,9 @@ testAllocSites = do
     setsExpected allocations =
       Map.fromListWith
         addSet
-        [ (site, SetSiteFigures 1 (if n == 0 then 1 else 0) (setHeaderSize + setEntrySize * room))
+        [ (site, SetSiteFigures 1 0 (setHeaderSize + setEntrySize * fromIntegral n))
         | SetAllocation site n <- allocations,
-          let room = if n == 0 then emptySetRoom else fromIntegral n
+          n > 0
         ]
     addEnv (EnvSiteFigures a b c) (EnvSiteFigures x y z) = EnvSiteFigures (a + x) (b + y) (c + z)
     addSet (SetSiteFigures a b c) (SetSiteFigures x y z) = SetSiteFigures (a + x) (b + y) (c + z)
@@ -28270,6 +28426,7 @@ runSuite = do
           testEvalIfAssert,
           testEvalLet,
           testEvalAttrs,
+          testSharedEmptySet,
           testValuePrinter,
           testCoercionErrors,
           testResultPrinter,

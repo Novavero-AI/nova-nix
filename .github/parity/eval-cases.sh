@@ -203,6 +203,10 @@ check "attrset values" '{ a = 1; b = "s"; }'
 check "map over a list" 'builtins.map (x: x * x) [ 1 2 3 ]'
 echo
 
+echo "== which sets print as repeated =="
+check "an update with an empty operand is the other operand" 'let a = { x = 1; }; l = [ a (a // { }) ({ } // a) ]; in builtins.deepSeq l l'
+echo
+
 echo "== what a string and an attribute name print as =="
 check "a byte that is not UTF-8" 'builtins.readFile ./latin1.txt'
 # The ${ is Nix's, escaped in the string under test, not the shell's.

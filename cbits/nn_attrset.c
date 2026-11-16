@@ -190,10 +190,18 @@ void nn_attrset_free(nn_attrset_t *set)
     free(set);
 }
 
+static nn_attrset_t g_empty_set = { NULL, NULL, NULL, 0, 0, 1 };
+
+nn_attrset_t *nn_attrset_empty(void)
+{
+    return &g_empty_set;
+}
+
 /* --- Construction --- */
 
 int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value, uint32_t pos)
 {
+    if (set->frozen) return -1;
     if (set->count >= set->capacity && grow(set) != 0) return -1;
     set->keys[set->count] = key;
     set->positions[set->count] = pos;

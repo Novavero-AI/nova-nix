@@ -781,9 +781,10 @@ write_memory() {
 # The census's environments and attribute sets by the site that allocated
 # them, as rows of the memory table: the environments' slots beside
 # upstream's values in environments, their sizes, then each site that
-# allocated anything, most bytes first.  A set is shareable when it
-# equals one that already existed: an empty one, or a // result with an
-# empty operand.
+# allocated anything, most bytes first.  A set is shareable when it was
+# made equal to one that already existed, which upstream would not make
+# (nn_stats_count_set in cbits/nn_stats.h); the evaluator makes none, so
+# the figure is 0 unless that regresses.
 #   write_site_rows <census-file> <nix-stats-json>
 write_site_rows() {
   local census="$1" stats="$2" name count figure bytes
