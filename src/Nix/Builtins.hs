@@ -14,10 +14,9 @@
 -- (@addConstant@ skips an @impureOnly@ constant), so neither exists here
 -- then.
 --
--- The environment is allocated in the C data layer, so 'builtinEnv' must
--- run between 'Nix.Eval.Arena.arenaInit' and
--- 'Nix.Eval.Arena.arenaDestroy'; outside that window it raises
--- 'Nix.Eval.CStatus.ArenaNotInitialized'.
+-- The environment is allocated in the C data layer, so 'builtinEnv' runs
+-- in an evaluation session ('Nix.Eval.IO.withEvalSession'); outside one
+-- it raises 'Nix.Eval.CStatus.ArenaNotInitialized'.
 module Nix.Builtins
   ( -- * Builtin registration
     builtinEnv,
@@ -63,7 +62,7 @@ import Nix.Store.Path (defaultStoreDirText)
 -- @addConstant@ install one value under both (eval.cc at 2.24.9).  So
 -- @__typeOf@ is @builtins.typeOf@, and @map@ is @builtins.map@.
 --
--- An evaluation session builds it once ('Nix.Eval.IO.newEvalState') and
+-- An evaluation session builds it once ('Nix.Eval.IO.withEvalSession') and
 -- evaluates every file it imports in it, as upstream's @createBaseEnv@
 -- builds one base environment per @EvalState@; the @derivation@ wrapper
 -- in it is the session's one.

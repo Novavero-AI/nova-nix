@@ -40,12 +40,11 @@ import Nix.DependencyGraph (DepNode (..), buildDepGraph)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, force, readThunkValue)
-import Nix.Eval.Arena (arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.IO (EvalIO, EvalState (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathValue, renderEvalFailure, runEvalIOTraced)
+import Nix.Eval.IO (EvalIO, EvalState (..), SessionSettings (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, renderEvalFailure, runEvalIOTraced, withEvalSession)
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes)
@@ -162,8 +161,6 @@ main = do
   -- not pass through this: 'printResult' writes it as bytes.
   hSetEncoding stdout utf8
   hSetEncoding stderr utf8
-  -- Initialize C data layer (symbol interning, thunk arena, env allocator)
-  arenaInit
   -- Counting by site begins before anything is allocated, so the census
   -- 'writeCensus' takes covers every environment and attribute set.
   wantsCensus <- isJust <$> censusTarget
@@ -294,11 +291,11 @@ evalPolicyFor opts config =
       epTraceVerbose = optTraceVerbose opts || ncTraceVerbose config
     }
 
--- | The evaluation state for one command, and the action that builds its
--- root environment, which an evaluation runs once its source has compiled
--- ('evalParsed').  Upstream's
--- constructor decides the same things in the same order (eval.cc at
--- 2.24.9): under pure-eval the lookup path is empty, so neither
+-- | Run an action in the evaluation session of one command
+-- ('withEvalSession'), its state's roots allowed.  Every value the
+-- action evaluates is used inside it: the session's end frees them.
+-- Upstream's constructor decides the same things in the same order
+-- (eval.cc at 2.24.9): under pure-eval the lookup path is empty, so neither
 -- @--nix-path@ nor @NIX_PATH@ contributes, and only the bundled @<nix/*>@
 -- directory remains, which upstream serves from an in-memory corepkgs
 -- filesystem and this binary serves from its data directory (so it stays
@@ -313,33 +310,35 @@ evalPolicyFor opts config =
 -- the resolved spelling; upstream allows only the given one and refuses
 -- the read, which is a mismatch between its own allow list and walk, not
 -- a rule worth keeping.
-setUpEval :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> IO (EvalState, EvalIO Env)
-setUpEval opts config storeDir dataDir baseDir = do
+withCliSession :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> (EvalState -> IO a) -> IO a
+withCliSession opts config storeDir dataDir baseDir action = do
   let policy = evalPolicyFor opts config
   -- Read whatever the policy, so a NIX_PATH with no UTF-8 form is refused
   -- under pure-eval too, but parsed only where it is used.
   nixPath <- nixPathValue
-  searchPaths <-
-    if epPureEval policy
-      then parseNixPath (TE.encodeUtf8 (T.pack dataDir))
-      else mergeSearchPaths (optNixPaths opts) dataDir nixPath
-  st0 <- newEvalStateWith policy searchPaths storeDir baseDir
-  let st = st0 {esCallDepth = topLevelCallDepth (ncMaxCallDepth config)}
-  -- A relative root resolves against the working directory, as upstream's
-  -- absPath does, and a rooted one with no drive lands on the store's
-  -- drive, where its lookups read ('qualifyPathText').  A pseudo-URL
-  -- entry (channel:, flake:, a listed scheme) names a download this
-  -- evaluator never performs and allows nothing:
-  -- upstream allows such an entry's working-directory spelling only by
-  -- falling through after a failed download (resolveLookupPathPath), and
-  -- a run that cannot fetch should not widen what it may read.  A root
-  -- with no UTF-8 reading allows nothing: allowed paths are text, so no
-  -- read can name it, and a lossy spelling would allow a different path.
-  rootBytes <- searchPathRoots searchPaths
-  roots <- mapM rootSpellings (mapMaybe textRoot (filter (not . isNixPathPseudoUrl) rootBytes))
-  mapM_ (allowEvalPath st) (concat roots)
-  pure (st, pure (evalBaseEnv st))
+  let searchPath
+        | epPureEval policy = parseNixPath (TE.encodeUtf8 (T.pack dataDir))
+        | otherwise = mergeSearchPaths (optNixPaths opts) dataDir nixPath
+  withEvalSession (SessionSettings policy searchPath storeDir baseDir) $ \st0 -> do
+    let st = st0 {esCallDepth = topLevelCallDepth (ncMaxCallDepth config)}
+    allowSearchPathRoots st
+    action st
   where
+    -- A relative root resolves against the working directory, as
+    -- upstream's absPath does, and a rooted one with no drive lands on
+    -- the store's drive, where its lookups read ('qualifyPathText').  A
+    -- pseudo-URL entry (channel:, flake:, a listed scheme) names a
+    -- download this evaluator never performs and allows nothing:
+    -- upstream allows such an entry's working-directory spelling only by
+    -- falling through after a failed download (resolveLookupPathPath),
+    -- and a run that cannot fetch should not widen what it may read.  A
+    -- root with no UTF-8 reading allows nothing: allowed paths are text,
+    -- so no read can name it, and a lossy spelling would allow a
+    -- different path.
+    allowSearchPathRoots st = do
+      rootBytes <- searchPathRoots (evalSearchPath st)
+      roots <- mapM rootSpellings (mapMaybe textRoot (filter (not . isNixPathPseudoUrl) rootBytes))
+      mapM_ (allowEvalPath st) (concat roots)
     textRoot = either (const Nothing) Just . TE.decodeUtf8'
     rootSpellings root = do
       given <- makeAbsolute (T.unpack (qualifyPathText storeDir root))
@@ -347,7 +346,7 @@ setUpEval opts config storeDir dataDir baseDir = do
       pure (map (canonPathValue . T.pack) [given, resolved])
 
 -- | Parse and bind source against the names the root environment
--- 'setUpEval' builds will bind, which depend on the policy.
+-- 'withCliSession' builds will bind, which depend on the policy.
 parseForEval :: CliOpts -> NixConfig -> FilePath -> SourceOrigin -> BS.ByteString -> Either SourceError ParsedSource
 parseForEval opts config = parseNixWithScope (rootScopeNames (evalPolicyFor opts config))
 
@@ -357,9 +356,8 @@ evalFile config opts storeDir dataDir rawFilePath = do
   (filePath, source) <- readSourceFile rawFilePath
   case parseForEval opts config (takeDirectory filePath) (SourceFile (T.pack filePath)) source of
     Left err -> failSource err
-    Right parsed -> do
-      (st, rootEnv) <- setUpEval opts config storeDir dataDir (takeDirectory filePath)
-      result <- runEvalIOTraced st (evalRooted (optStrict opts) rootEnv parsed)
+    Right parsed -> withCliSession opts config storeDir dataDir (takeDirectory filePath) $ \st -> do
+      result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
       case result of
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
@@ -372,22 +370,19 @@ evalExpr config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
-    Right parsed -> do
-      (st, rootEnv) <- setUpEval opts config storeDir dataDir cwd
-      result <- runEvalIOTraced st (evalRooted (optStrict opts) rootEnv parsed)
+    Right parsed -> withCliSession opts config storeDir dataDir cwd $ \st -> do
+      result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
       case result of
         Left failure -> do
           TIO.hPutStrLn stderr (renderEvalFailure failure)
           exitFailure
         Right (env, forced) -> printResult forced >> writeCensus env forced
 
--- | Evaluate the source as 'evalParsed' does, compiling it before the root
--- environment is built, to the result 'finalize' gives, with that
--- environment, which 'writeCensus' counts as held.
-evalRooted :: Bool -> EvalIO Env -> ParsedSource -> EvalIO (Env, NixValue)
-evalRooted strict rootEnv parsed = do
+-- | Evaluate the source in the root environment to the result 'finalize'
+-- gives, with that environment, which 'writeCensus' counts as held.
+evalRooted :: Bool -> Env -> ParsedSource -> EvalIO (Env, NixValue)
+evalRooted strict env parsed = do
   code <- compileSource parsed
-  env <- rootEnv
   forced <- evalBytecode env code >>= finalize strict
   pure (env, forced)
 
@@ -429,10 +424,9 @@ evalExprAterm config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
-    Right parsed -> do
-      (st, rootEnv) <- setUpEval opts config storeDir dataDir cwd
+    Right parsed -> withCliSession opts config storeDir dataDir cwd $ \st -> do
       result <- runEvalIOTraced st $ do
-        val <- evalParsed rootEnv parsed
+        val <- evalParsed (pure (evalBaseEnv st)) parsed
         forceDerivationAttrs val
         pure val
       case result of
@@ -477,18 +471,19 @@ derivationAttrKeys :: [T.Text]
 derivationAttrKeys = ["type", "drvPath", "outputName"]
 
 -- | Evaluate a build or trust target and select the attribute path, when
--- one is given, with the attributes 'derivationPath' reads forced: the
--- state the evaluation recorded, and the selected value.  A failure is
--- reported and exits.
-evalTarget :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> IO (EvalState, NixValue)
-evalTarget config opts storeDir dataDir target attrPath = do
+-- one is given, with the attributes 'derivationPath' reads forced, and
+-- run an action in the session with the state the evaluation recorded
+-- and the selected value.  The action reads what the command needs out
+-- of them: the session's end frees the value.  A failure is reported and
+-- exits.
+evalTarget :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> (EvalState -> NixValue -> IO a) -> IO a
+evalTarget config opts storeDir dataDir target attrPath action = do
   (baseDir, origin, source) <- loadBuildSource target
   case parseForEval opts config baseDir origin source of
     Left err -> failSource err
-    Right parsed -> do
-      (st, rootEnv) <- setUpEval opts config storeDir dataDir baseDir
+    Right parsed -> withCliSession opts config storeDir dataDir baseDir $ \st -> do
       result <- runEvalIOTraced st $ do
-        root <- evalParsed rootEnv parsed
+        root <- evalParsed (pure (evalBaseEnv st)) parsed
         selected <- case attrPath of
           Nothing -> pure (Right root)
           Just path -> selectAttrPath path root
@@ -503,7 +498,7 @@ evalTarget config opts storeDir dataDir target attrPath = do
         Right (Left selectionErr) -> do
           TIO.hPutStrLn stderr ("error: " <> selectionErr)
           exitFailure
-        Right (Right val) -> pure (st, val)
+        Right (Right val) -> action st val
 
 -- | Parse, evaluate, extract the derivation, build it, and print its
 -- output path.  A store directory upstream Nix's database also manages
@@ -514,20 +509,24 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
   upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("build: " <>))
   let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
-  (st, val) <- evalTarget config opts storeDir dataDir target attrPath
-  drvSP <- derivationPath val
-  outputName <- defaultOutputName drvSP val
-  -- The full .drv closure (root + every transitive input) recorded
-  -- during evaluation; written to the store before building.  The
-  -- root's own recipe is read from the same map, so what is built
-  -- is what its path hashes.
-  drvClosure <- readIORef (esDrvClosure st)
+  -- The session ends before the build starts, freeing the evaluation's
+  -- memory: the build needs only what is read out of it here.  The full
+  -- .drv closure (root + every transitive input) recorded during
+  -- evaluation is written to the store before building, and the root's
+  -- own recipe is read from the same map, so what is built is what its
+  -- path hashes.
+  (drvSP, outputName, drvClosure, sourceCache, storeWrites) <-
+    evalTarget config opts storeDir dataDir target attrPath $ \st val -> do
+      drvSP <- derivationPath val
+      outputName <- defaultOutputName drvSP val
+      (,,,,) drvSP outputName
+        <$> readIORef (esDrvClosure st)
+        <*> readIORef (esSourcePathCache st)
+        <*> readIORef (esStoreWriteCache st)
   drv <- recordedDerivation drvClosure drvSP
   -- Resolved before the build, as nix-build resolves the output it
   -- realizes before building anything.
   outputPath <- namedOutputPath drv outputName
-  sourceCache <- readIORef (esSourcePathCache st)
-  storeWrites <- readIORef (esStoreWriteCache st)
   store <- openStore storeDir
   -- Materialize eval-coerced source paths (src = ./file, path
   -- interpolation): evaluation computes their store paths as text
@@ -570,9 +569,8 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
 -- refuses one ("Nix.Store.Upstream").
 trustCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
 trustCommand config opts storeDir dataDir target attrPath = do
-  (st, val) <- evalTarget config opts storeDir dataDir target attrPath
-  drvSP <- derivationPath val
-  drvClosure <- readIORef (esDrvClosure st)
+  (drvSP, drvClosure) <- evalTarget config opts storeDir dataDir target attrPath $ \st val ->
+    (,) <$> derivationPath val <*> readIORef (esDrvClosure st)
   drv <- recordedDerivation drvClosure drvSP
   graph <- either (failWith . ("error: " <>)) pure (runIdentity (buildDepGraph (Identity . recordedRecipe drvClosure) drv drvSP))
   facts <- case fixedOutputInputs graph drvSP of

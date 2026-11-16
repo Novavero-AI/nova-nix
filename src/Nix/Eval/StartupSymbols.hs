@@ -1,6 +1,7 @@
 -- | The names upstream's evaluator interns as it starts, in the order it
--- interns them, which 'Nix.Eval.Arena.arenaInit' interns before anything
--- else.
+-- interns them, which the C data layer interns before anything else as
+-- the outermost evaluation session sets it up
+-- ('Nix.Eval.IO.withEvalSession').
 --
 -- A set holds its attributes in symbol order, and a symbol's place is the
 -- order its name was interned in, so that order decides which failure
